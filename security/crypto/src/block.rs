@@ -1,10 +1,11 @@
-//! Block buffering and Merkle–Damgård padding shared by SHA-256 and SHA-512
-//! (FIPS 180-4 §5.1, §5.2).
+//! Block buffering shared by SHA-2 and SHA-3, with Merkle–Damgård padding for SHA-256 and
+//! SHA-512 (FIPS 180-4 §5.1, §5.2) and sponge padding for SHA-3 and SHAKE (FIPS 202 §5.1,
+//! Appendix B.2).
 
 /// Copies `min(dst.len(), src.len())` bytes. Unlike `copy_from_slice` it has no panic path:
 /// the release object for the kernel target must reference no panic routine, and LLVM
 /// cannot always prove that two derived lengths are equal. It still lowers to `memcpy`.
-fn copy(dst: &mut [u8], src: &[u8]) {
+pub(crate) fn copy(dst: &mut [u8], src: &[u8]) {
     for (d, s) in dst.iter_mut().zip(src) {
         *d = *s;
     }
@@ -80,5 +81,22 @@ impl<const B: usize> BlockBuffer<B> {
             tail.copy_from_slice(&length_be);
         }
         compress(&self.buf);
+    }
+
+    /// Pads the buffered tail with the FIPS 202 sponge padding and returns the final block.
+    /// `suffix` holds the domain-separation bits and the first bit of pad10*1 (§5.1), first
+    /// bit least significant (Appendix B.2). The last bit of pad10*1 is the top bit of the
+    /// block's last byte; when only one byte of the block is free, both land in it.
+    pub(crate) fn finish_sponge(mut self, suffix: u8) -> [u8; B] {
+        if let Some(rest) = self.buf.get_mut(self.len..) {
+            rest.fill(0);
+        }
+        if let Some(first) = self.buf.get_mut(self.len) {
+            *first = suffix;
+        }
+        if let Some(last) = self.buf.last_mut() {
+            *last |= 0x80;
+        }
+        self.buf
     }
 }
