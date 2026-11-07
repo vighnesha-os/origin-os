@@ -56,6 +56,7 @@
 //! - [`ps2`]: PS/2 set-1 scancode decoding and the US keyboard layout;
 //! - [`raster`]: a 2D software rasterizer (fills, blits, alpha blend) for the UI;
 //! - [`runqueue`]: the per-CPU round-robin run queue (scheduler policy);
+//! - [`semver`]: semantic-version parsing and precedence (package dependency resolution);
 //! - [`serial`]: a polled 16550 UART driver over an abstract register interface;
 //! - [`report`]: the exact console text;
 //! - [`ring`]: a fixed-capacity ring buffer (input/audio/log queues);
@@ -115,6 +116,7 @@ pub mod ring;
 pub mod route;
 pub mod rtc;
 pub mod runqueue;
+pub mod semver;
 pub mod serial;
 pub mod tcp;
 #[cfg(test)]

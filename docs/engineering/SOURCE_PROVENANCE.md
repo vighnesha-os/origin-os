@@ -845,6 +845,15 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Not done:** a serializer, `f64`/decimal interpretation of non-integer numbers (needs a `no_std` float parser), duplicate-key policy, and JSON5/JSONC extensions.
 - **Licensing:** project licence not chosen yet.
 
+### Semantic versioning (semver.org 2.0.0; CLAUDE.md §46 dependency resolution; 2026-11-08)
+
+- **What:** `semver` (library) parses `MAJOR.MINOR.PATCH[-prerelease][+build]` into a `Version` and orders versions by the spec's precedence (§11): the numeric core field by field, a prerelease ranked below the matching normal version, prerelease identifiers compared numerically or lexically (numeric below alphanumeric, a longer equal-prefix set higher), and build metadata ignored for ordering and equality (§10). Pure, no `unsafe`.
+- **Why:** the package manager (§46) must decide which available version satisfies a dependency, which is a version-ordering question; this is the comparator it uses. (A requirement-matcher — `^`, `~`, ranges — builds on this next.)
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the semver.org 2.0.0 specification; no source used (CLAUDE.md §3).
+- **Test evidence (2026-11-08):** 4 `semver` tests — field/prerelease/build parsing with build-metadata equality; rejection of 14 malformed strings (too few/many fields, leading zeros, non-digits, empty/underscore prerelease, a bare `-`, a leading `v`, trailing space); the **canonical semver.org §11 precedence chain** (`1.0.0-alpha` < `-alpha.1` < `-alpha.beta` < `-beta` < `-beta.2` < `-beta.11` < `-rc.1` < `1.0.0`) plus core precedence, prerelease-below-normal, numeric-below-alphanumeric and build-ignored; and sorting a list into precedence order. 253 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the spec chain is the control).
+- **Not done:** a requirement/range matcher (`^1.2`, `~1.2.3`, `>=1.0, <2.0`), and wiring into a package dependency resolver (§46).
+- **Licensing:** project licence not chosen yet.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.
