@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Applies to | `docs/spec/ONBF.md` §7.1–§7.3 |
-| Status | **Proposed. Every item needs the owner's decision (S1–S4)** before the signature-block parser is written. No code depends on it yet. |
+| Status | **S1–S4 decided by the owner on 2026-11-07: the recommended option for each** (integer roles 1–5, integer suites 1–2, integer statement keys 0–6, integer OKC keys 0–10). Normative for the signature-block parser, the host signer and any second implementation. |
 | Follows | The key-registry policy K1–K4 (`docs/spec/ONBF-manifest-keys.md`): integer keys, a shared registry, ascending order, extensions at 1000 and above |
 
 §7.1 names the entry keys 1–8 but leaves four things undefined:
