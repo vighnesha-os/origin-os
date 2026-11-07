@@ -60,3 +60,27 @@ KRN, the Framekernel image, is an ONBF profile (ONBF §6.5), and only the boot l
 - The shell in the Claude Code desktop app is zsh, where `PIPESTATUS` is `pipestatus` and indexed from 1.
 - OVMF's ConOut is mirrored to the serial port with ANSI sequences; `xtask/src/serial.rs` strips them.
 - `-cpu max` under TCG on Apple Silicon. x86-64-v3 code in userspace will need the emulated CPU to expose AVX2: check before M6.
+
+## 5. Later the same day: M1 step 2 and M2 (three-hour run, 17:56–20:56 IST)
+
+Branch `m0/toolchain-verification`, local only (never pushed). Commits, oldest first:
+
+| Commit | What |
+|---|---|
+| 78ea688 … be48ce8 | boot-info contract, loader step 2, ADR-0002, framekernel and SHA-3 merges, provenance |
+| 91334ee | merge `onbf-pack` (agent) |
+| a078db0 | merge Ed25519 (agent); crate docs reconciled (Ed25519 is variable time on public data) |
+| 226eca1 | **first end-to-end boot**: loader → KRN → Framekernel; GDT/TSS/IDT, `int3`, frame allocator, paging library |
+| ae035fa | boot info 0.2 (kernel segment table) and the kernel's own page tables; four #PF probes |
+| 8aff1f3 | x2APIC, PIT-calibrated APIC timer, periodic interrupts |
+| 0fcb16b | kernel heap, `GlobalAlloc`, frame runs, strict frees |
+
+How to see it: `cargo xtask boot-test` (two scenarios, about 4 s) and `cargo xtask check`.
+
+Lessons worth keeping:
+- **Every boot proof needs a negative control.** Breaking the thing on purpose found two real bugs: a timer wait that halted (`hlt`) and so could never reach its own deadline, and a reordered failure message that no longer matched its xtask marker. xtask now matches failure markers in complete lines only, so the failing line's details always reach the log.
+- **QEMU TCG coalesces late APIC timer expiries**: at 1 kHz with `hlt`, 100 interrupts took 125 ms. The proof runs at 100 Hz with an asymmetric bound (≥ 95 %, ≤ 150 %). Tighten it on hardware.
+- **The frame allocator must refuse to free what it never owned.** A test showed `free` on a kernel-image address would have succeeded; fixed.
+- The kernel library stays `forbid(unsafe_code)`: page tables are reached through a safe `TableMemory` that returns `None` for unknown addresses, the heap does address arithmetic only, and hardware access sits behind capability types in the binary (`X2Apic`, `LegacyPorts`).
+
+Still running when this was written: the ML-DSA-65/87 verification agent (its own worktree; no NIST vectors without approval). Next: M3 (SMP and scheduling), starting with an ADR for AP start-up; see `TASKS.md`.

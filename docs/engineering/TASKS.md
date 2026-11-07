@@ -16,29 +16,32 @@
 | ONBF container parser | `onbf-format`: container, OCBOR-1, KRN manifest; owner decisions C1–C14, G2–G5, K1–K4 | `docs/spec/ONBF-errata.md`, `ONBF-manifest-keys.md` |
 | SHA-256 / SHA-512 | `origin-crypto`, FIPS 180-4 | known-answer tests, 310 differential vectors |
 | Merkle-SHA256-4K | `onbf-merkle` | independent Python reference, attack tests |
-| Boot-info v0.1 | `origin-boot-info` (Proposed ABI) | ADR-0002 |
-| Loader, M1 step 2 | reads, verifies, places, relocates and enters KRN | ADR-0002; boot test (see below) |
+| Boot info 0.2 | `origin-boot-info` (Proposed ABI): regions, kernel segment table | ADR-0002 B4 |
+| Loader, M1 step 2 | reads, verifies, places, relocates and enters KRN; rejects a tampered KRN | `cargo xtask boot-test`, both scenarios |
+| `onbf-pack` KRN subset | ELF64 PIE → KRN; RELR; manifest; Merkle; self-verifying output | 61 tests; packs the real kernel |
+| SHA-3 / SHAKE | `origin-crypto`, FIPS 202 | known answers, 304 differential vectors |
+| Ed25519 verification | `origin-crypto`, RFC 8032, strict (errata E1) | RFC vectors, 300 differential, 1,765 negative |
+| Framekernel M1 entry | COM1 report, boot-info validation, relocation probe | boot test |
+| M2: CPU tables | GDT, TSS (IST1 for #DF), IDT, exception dispatch | `int3` handled and resumed |
+| M2: physical memory | bitmap frame allocator, frame runs, strict frees | unit tests; boot proof before and after paging |
+| M2: virtual memory | own page tables: W^X image from the signed segment table, NX direct map, no page 0 | four #PF probes; negative control |
+| M2: interrupts | x2APIC, PIT-calibrated APIC timer, periodic interrupts | 50 at 100 Hz in ~502 ms; two negative controls |
+| M2: kernel heap | slabs + frame runs, `GlobalAlloc`, `alloc` works | leak-free proof; negative control |
 
 ## In progress
 
 | Task | Notes |
 |---|---|
-| Framekernel M1 entry | `framekernel/`: COM1 report, validates boot info, halts |
-| `onbf-pack` KRN subset | ELF64 PIE → KRN; RELR; manifest encoder; Merkle; self-verifying output |
-| SHA-3 / SHAKE (FIPS 202) | `origin-crypto`; needed by ML-DSA |
-| Ed25519 verification (RFC 8032) | `origin-crypto`; strict semantics, recorded for the owner |
+| ML-DSA-65/87 verification (FIPS 204) | `origin-crypto`, an agent's worktree; no NIST vectors yet (download needs approval) |
 
 ## Next, in order
 
-1. **M1 exit:** the QEMU boot test proves loader → kernel. Add the tampered-kernel case to CI once CI exists.
-2. **Signature block (ONBF §7.1):** blocked on owner decisions S1–S4 below.
-3. **ML-DSA-65/87 verification (FIPS 204):** needs SHAKE.
-4. **M2 (CPU and memory):** GDT/IDT/TSS, exceptions, the kernel's own page tables (W^X enforced; KASLR per ADR-0002 B3), the physical page allocator from the boot-info regions.
-5. **CPU-feature CPUID tests** (key registry bits 0–5), verified against the Intel SDM and AMD APM, plus the XCR0 state checks.
-6. **M1 follow-ups:**
-   - A/B deployment and boot-attempt recording (CLAUDE.md §20);
-   - the boot trust anchor (B7);
-   - an executed FFI-bool test (Rosetta).
+1. **M3, SMP and scheduling:** an ADR for AP start-up (INIT-SIPI-SIPI through the x2APIC ICR, a real-mode trampoline below 1 MiB, per-CPU GDT/TSS/stacks), then per-CPU run queues, kernel threads, preemption on the APIC timer. QEMU already runs `-smp 2`.
+2. **Security hardening of the address space:** SMEP/SMAP (with probes), the higher-half layout and KASLR (ADR-0002 B3), reclaiming `LoaderReclaimable` once nothing needs it, guard pages below the kernel stacks.
+3. **Signature block (ONBF §7.1):** blocked on S1–S4; then Ed25519 + ML-DSA in the loader and the trust anchor (B7).
+4. **Formal and concurrency checks:** Loom models for `SpinLock`; Kani bounds for `paging`, `frames` and `heap` (CLAUDE.md §73).
+5. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks.
+6. **M1 follow-ups:** A/B deployment and boot-attempt recording (§20); an executed FFI-bool test (Rosetta); CI.
 
 ## Waiting on the owner
 
@@ -52,5 +55,7 @@
 | S4 | Origin Key Certificate (OKC) key numbers (§7.3) | Certificate chain |
 | G1 | A section kind for SYM's DWARF data | `.osym` (M6) |
 | R1–R5 | Readings applied in the errata (overrule if wanted) | — |
+| P1–P7, E1, L1 | Readings proposed by `onbf-pack`, Ed25519 and the loader (errata) | A second implementation, the host signer |
+| — | Downloads: NIST ACVP (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519) | External known-answer validation (§59) |
 | — | A project licence | Every provenance entry |
 | — | Merge into `main` and push | Sharing the work |

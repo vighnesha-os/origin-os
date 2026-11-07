@@ -72,7 +72,9 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Dependencies:** none. `Cargo.lock` lists only workspace crates.
 - **Licensing:** project licence not chosen yet.
 
-## `boot/uefi/` (`origin-boot-uefi`), the UEFI loader, M1 step 1
+## `boot/uefi/` (`origin-boot-uefi`), the UEFI loader, M1 steps 1 and 2
+
+*Step 1 (the entry below, kept as written) printed a banner and returned. Step 2 follows it.*
 
 - **What:** an EFI application (`origin-boot.efi`, 8.7 KB PE32+). It:
   - validates the system table: null, alignment, signature, revision ≥ 2.0, and `HeaderSize` covering every field read;
@@ -119,7 +121,23 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - QEMU only. No physical hardware yet (CLAUDE.md §74).
 - **Licensing:** project licence not chosen yet.
 
-## `boot/info/` (`origin-boot-info`), the boot-info contract v0.1 (Proposed)
+### Step 2: read, verify, place and enter the Framekernel (ADR-0002, Proposed)
+
+- **What (2026-11-07):**
+  - `protocols`: the UEFI 2.11 boot-services table (offsets of the functions used are pinned), `EFI_LOADED_IMAGE_PROTOCOL`, `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL`, `EFI_FILE_PROTOCOL`, `EFI_FILE_INFO`, the configuration table and the ACPI 2.0 GUID.
+  - `main`: reads `\EFI\ORIGIN\KERNEL.ONBF` from the loader's own volume (B1), verifies it, allocates `EfiLoaderCode` pages for the span and places it, allocates a 64 KiB stack and the boot-info pages (OS types 0x8000_0003 and 0x8000_0002), finds the RSDP, clears the panic console, then `GetMemoryMap` → translate → `ExitBootServices` with one retry (B5), and enters the kernel with `call` on the new stack, RDI = boot info (B6).
+  - `kernel::verify` (B2): parse, KRN profile, no signature block yet (refused unless `developer-mode`), SHA-512 content digest, manifest SHA-256 and decode, `boot_info_abi` equal to the loader's, `cpu_features` = 0, every section's digest or Merkle root, no compression.
+  - `place`: copies SEGMENTs, zero-fills tails, applies RELR with every slot checked to lie in a writable, non-executable segment's content; `kernel_segments` builds the boot-info 0.2 segment table (RELRO drops W).
+  - `memmap`: UEFI → Origin region kinds, sort, overlap check, merge, and `carve` to mark the kernel image by address.
+- **Specifications:** UEFI 2.11 §4.4 (boot services), §7.2 (memory allocation, `GetMemoryMap`), §7.4 (`ExitBootServices`), §9.1 (loaded image), §13.4–§13.5 (simple file system, file protocol), §4.6 (configuration table); ONBF §3–§6, §8.1; boot-info 0.2.
+- **Unsafe inventory (counted by grep, 2026-11-07; reviewed by the author, not independently):** `main.rs` 34 `unsafe` blocks and 2 `unsafe fn`, `uefi.rs` 10 and 2, `console.rs` 2 and 1. `kernel`, `place`, `memmap`, `protocols` and `text` have none. Clippy enforces one operation per block and a SAFETY comment on each.
+- **Test evidence (2026-11-07):**
+  - 29 host unit tests (`cargo test -p origin-boot-uefi --lib`), including RELR decoding and slot checks, the memory-map translation and carve, and the segment-access mapping.
+  - Probe boots: no kernel file → "no Framekernel image" and OVMF reports Not Found; a garbage file → "kernel rejected: … (BadMagic)" and Security Violation.
+  - `cargo xtask boot-test`, both scenarios, QEMU 11.1.3 + OVMF (q35, TCG, `-cpu max`): the loader reads, verifies and places the real KRN (7 sections, 3 segments, 128 relocations at the time of writing) and enters the kernel; a KRN with one byte of its first SEGMENT flipped is rejected with "section 1 does not match its digest" and the kernel never runs.
+  - QEMU only. No physical hardware yet (CLAUDE.md §74).
+
+## `boot/info/` (`origin-boot-info`), the boot-info contract v0.2 (Proposed)
 
 - **What:** the one structure the loader hands the Framekernel (ADR-0002 B4):
   - `BootInfo`: `repr(C)`, 80 bytes, every field explicitly sized, offsets pinned at compile time;
@@ -127,7 +145,8 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `RegionKind`: 13 Origin memory kinds, so the kernel never sees UEFI structures;
   - `BootInfo::check`: validates magic, version, size and region count before anything else is trusted.
 
-  The version is `[compatibility] boot-info = "0.1"` in `origin-version.toml`. Major 0 means unstable until ADR-0002 is accepted.
+  The version is `[compatibility] boot-info` in `origin-version.toml`. Major 0 means unstable until ADR-0002 is accepted.
+- **0.2 (2026-11-07):** `KernelSegment` (rva, pages, R/W/X access, 24 bytes; at most 16) appended to `BootInfo`, now 96 bytes; `check` bounds the count; `check_segments` enforces aligned, non-empty, sorted, disjoint, inside the span, readable, never W and X, no unknown bits, `reserved` zero. 6 unit tests.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code.
 - **Dependencies:** `core` and `origin-version`. `no_std`, `forbid(unsafe_code)`.
 - **Test evidence (2026-11-07):**
@@ -136,7 +155,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - **No panic paths:** the kernel-target object references 0 external symbols.
 - **Licensing:** project licence not chosen yet.
 
-## `framekernel/` (`framekernel`), the Framekernel M1 entry
+## `framekernel/` (`framekernel`), the Framekernel: M1 entry and M2
 
 - **What:** a `no_std`, `no_main` ELF for `x86_64-unknown-none` (24 KB static PIE). The UEFI loader jumps to it after `ExitBootServices`. `_start` (`extern "sysv64"`, boot info in `rdi`):
   - programs COM1 (0x3F8) as a polled 16550 at 115200 8N1, after a bounded wait for the transmitter to drain;
@@ -176,6 +195,25 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - Two clean builds in the same path were byte-identical.
   - Boot evidence is in the `boot/uefi` step 2 entry.
 - **Licensing:** project licence not chosen yet.
+
+### M2: descriptors, frames, paging, interrupts, heap (2026-11-07)
+
+- **What:** after the M1 report, `_start` now:
+  - loads its own GDT (null, code 0x08, data 0x10, TSS 0x18), reloads CS by far return and the data segments, loads a TSS with a 16 KiB IST1 stack for #DF, and an IDT of 32 naked exception stubs plus the timer (0x20) and spurious (0xFF) vectors; proves it with `int3`, which is reported and resumed;
+  - builds the frame allocator (bitmap) and a 256-frame page-table pool in the first fitting `Usable` region;
+  - builds its own address space (`kernel_space`): each kernel segment with its declared access from boot info 0.2, a RW+NX identity direct map of `Usable`, `LoaderReclaimable`, `BootInfo`, `KernelStack` and `AcpiReclaimable` RAM, nothing else (no page 0, no MMIO, no alias of the kernel image); sets EFER.NXE and CR0.WP and loads CR3;
+  - proves the protections with four probes, each a single deliberate access whose #PF at the exact armed RIP is recorded and resumed: write to code (0x3), write to read-only data (0x3), fetch from writable data (0x11), read of page 0 (0x0);
+  - re-proves the frame allocator through the new direct map, then starts the heap (`heap` slabs of 16–2048 bytes plus frame runs, `memory` `GlobalAlloc` behind `sync::SpinLock`) and proves it with a `Vec`, 2000 `Box`es, a `BTreeMap` and a `String`, requiring the heap and frame counts to return exactly to their earlier values;
+  - masks the 8259s, enables x2APIC through the legal transitions, calibrates the APIC timer and the TSC over a 10 ms PIT channel-2 one-shot, takes 50 periodic interrupts at 100 Hz (polling with one-instruction interrupt windows, never `hlt`, so a lost interrupt cannot hang the deadline), checks the time against the TSC (≥ 95 %, ≤ 150 % of nominal), and masks the timer.
+- **Library modules (host-tested, `forbid(unsafe_code)`):** `descriptors`, `frames` (with runs, and frees refused for frames never allocatable), `paging` (4-level, 4 KiB and 2 MiB leaves, structural W^X, atomic entries, safe `TableMemory`/`TablePool`), `kernel_space`, `apic` (x2APIC and PIT encodings, calibration arithmetic), `heap`.
+- **Specifications:** Intel SDM Vol. 3A: segment and system descriptors, the 64-bit TSS, IDT gates and Table 6-1, 4-level paging and the #PF error code, EFER, CR0.WP, CPUID leaves 1 and 8000_0001h, the x2APIC MSR map, LVT timer, divide configuration and SVR, and IA32_APIC_BASE transitions; AMD64 APM Vol. 2 §5.3; Intel 82C54 data sheet (mode 0, 1.193182 MHz on the PC platform).
+- **Unsafe inventory (counted by grep, 2026-11-07; reviewed by the author, not independently):** `main.rs` 23 blocks and 5 `unsafe fn`; `cpu.rs` 18 and 9 (including the naked stubs and probes); `timer.rs` 8 and 2 (capability types `X2Apic` and `LegacyPorts`: the safe methods reach only the ID, version, timer and SVR registers, never the ICR, and only the PIC masks, PIT channel 2 and port 0x61); `memory.rs` 1 block, 2 `unsafe fn` (the `GlobalAlloc` methods) and 1 `unsafe impl`; `sync.rs` 2 blocks and 1 `unsafe impl`. The library has none.
+- **Test evidence (2026-11-07):**
+  - 53 host unit tests (`cargo test -p framekernel --lib`).
+  - `cargo xtask boot-test` passes (QEMU 11.1.3 TCG, `-cpu max`, OVMF): segments R/RX/RW; 13 tables, 505 MiB direct map, 246 2 MiB leaves; the four probes fault with the expected codes at the probed addresses; heap peak 899 KiB in 27 slabs and 200 run pages, then everything freed; x2APIC ID 0, version 0x14; APIC timer about 62.6 MHz at divide 16, TSC about 1 GHz; 50 interrupts in 501–504 ms over three runs.
+  - Negative controls, each restored byte-identical afterwards, each making the boot test fail: read-only segments mapped writable ("page protection violated"); no EOI ("1 interrupts in 2000027 us"); timer at divide 1 after calibrating at 16 ("50 interrupts in 63686 us"); one leaked `Box` ("heap leaked: … 16 bytes, 1 slab").
+  - At 1 kHz with `hlt`, 100 interrupts took 125 ms: QEMU TCG coalesces late expiries. Hence 100 Hz and the asymmetric bound; physical hardware will tighten it.
+  - QEMU only. No physical hardware yet (CLAUDE.md §74). Not done: Loom/Kani for the spin lock and the allocators, an independent review.
 
 ## `origin-version.toml` and `runtime/version/` (`origin-version`), T5
 
@@ -308,7 +346,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - Not done: a second Merkle implementation by a different author (§13 item 6), integration of `verify_block` with `onbf-format` sections, and Kani bounds.
 - **Licensing:** project licence not chosen yet.
 
-## `security/crypto/` (`origin-crypto`), SHA-2, SHA-3 and SHAKE
+## `security/crypto/` (`origin-crypto`), SHA-2, SHA-3, SHAKE and Ed25519
 
 - **What:** streaming and one-shot SHA-256 and SHA-512 (FIPS 180-4 §6.2, §6.4), with the §5.1 padding shared through a generic block buffer. The schedule is a 16-word ring.
   - These are the hashes ONBF needs: SHA-512 for content digests, SHA-256 for section digests and Merkle trees.
@@ -366,6 +404,22 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - **Throughput:** SHA3-256 581 MiB/s and SHAKE256 about 580 MiB/s on the M1 host (aarch64, portable code). Indicative only.
   - Not done: NIST CAVP/ACVP files, and an independent review.
 
+### Ed25519 verification (RFC 8032 §5.1, pure variant; ONBF §7.1), added 2026-11-07
+
+- **What:** `ed25519_verify(public_key, message, signature) -> Result<(), Ed25519Error>`, verification only, strict. In order: A canonical (y < p, a root exists, not x = 0 with the sign bit set) and not small order; the same for R; S < L; then the cofactorless [S]B = R + [k]A, compared projectively. Mixed-order points are accepted. Each failure has its own error variant.
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-07, in its own worktree, merged by the coordinator (a078db0). Original code from the RFC 8032 math: GF(2^255−19) in 5×51-bit limbs with `u128` products; extended twisted Edwards coordinates with the §5.1.4 complete formulas; §5.1.3 square roots by a (p−5)/8 addition chain; bit-serial reduction mod L; a Straus–Shamir double-scalar loop. SHA-512 is the crate's own.
+- **Constants:** not typed from memory. `tools/ed25519_reference.py constants` generates d, 2d, sqrt(−1), B, 4p and L from their definitions, asserting p and L probably prime, d a non-square, and B on the curve with [L]B = identity. `src/tests_ed25519.rs` re-derives every value in Rust.
+- **Side channels:** variable time by design: verification handles only public data (ONBF §7.2). There are no secrets to zeroize.
+- **Test oracle:** `tools/ed25519_reference.py`, an independent pure-Python RFC 8032 implementation (affine big-integer arithmetic, Euler's-criterion square roots, hashlib SHA-512). It shares no formulas with the Rust code, but has the same author.
+- **Test evidence (2026-11-07):** 13 tests, plus 1 ignored benchmark.
+  - **Known answers:** RFC 8032 §7.1 TEST 1, 2, 3 and SHA(abc), each embedded only after the reference reproduced its public key and signature from the seed and message.
+  - **Differential:** 300 reference signatures (`tests/vectors/ed25519-differential.txt`).
+  - **Negative corpus:** `tests/vectors/ed25519-negative.txt`, 1,608 single-bit flips and 157 constructed cases (S + L, S = L, non-canonical y as A and R, the 8 small-order points, check-order cases, a mixed-order key), each with the exact expected error.
+  - **Fault injection:** six deliberate faults, each caught.
+  - **No panic paths:** the `x86_64-unknown-none` release object references only `memcpy`, `memset` and `Formatter::write_str`.
+  - **Throughput:** 16,625 verifications/s on the M1 Max host (aarch64, release, single thread). Indicative only; the target is x86-64.
+  - **Not done:** Wycheproof vectors (downloading them needs the owner's approval); an N-version check by a different author (ONBF §13 item 6); Kani and fuzzing; an x86-64 benchmark; independent review.
+
 ## `developer-tools/xtask/` (`xtask`)
 
 - **What:** host-side build orchestration, with four commands:
@@ -381,6 +435,8 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
       - CLAUDE.md §62: no `version` in the `[package]` or `[workspace.package]` section of any Cargo manifest.
   - `build`.
   - `boot-test`: stages a fresh ESP (`\EFI\BOOT\BOOTX64.EFI`, UEFI 2.11 §3.5.1.1) and a fresh NVRAM copy; boots QEMU with serial on a pipe; requires the loader's lines and OVMF's status line in order; then stops QEMU.
+    - *Since M1 step 2:* builds the Framekernel, packs it with `onbf-pack krn` into `\EFI\ORIGIN\KERNEL.ONBF`, and runs two scenarios: the real kernel (every loader and kernel milestone line in order; any failure marker, matched in complete lines only, fails at once) and a tampered kernel (one SEGMENT byte flipped: the loader must reject it and the kernel must never run). `ORIGIN_QEMU_DEBUG=1` adds QEMU's interrupt log.
+    - `check` also covers the Framekernel (host and kernel-target clippy, tests, release build), the developer-mode loader, and `onbf-pack` (clippy and tests).
   - `run`.
 
   It is not part of the shipping OS.
@@ -392,4 +448,27 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - a timeout below the boot time fails with exit 1 and QEMU is killed;
     - missing firmware is reported by path;
     - an unknown command exits 2.
+- **Licensing:** project licence not chosen yet.
+
+## `developer-tools/onbf-pack/` (`onbf-pack`), ELF64 PIE → KRN
+
+- **What:** the host tool that converts the Framekernel's `rust-lld` output into an unsigned (developer-mode) KRN image (ONBF §6.1.2, §6.5; D1):
+  - `elf`: an ELF64 x86-64 `ET_DYN` parser for the conversion contract. Every field is decoded from bytes, and each hard error has its own typed error. ELFCLASS32, EM_386 and x32 are rejected explicitly (ONBF-R11). PT_GNU_EH_FRAME is accepted and ignored (coordinator amendment, 2026-11-07);
+  - `relr`: the SHT_RELR encoder (greedy, shortest) and decoder;
+  - `ocbor`: a canonical OCBOR-1 encoder (shortest heads, `BTreeMap` keys);
+  - `krn`: MANIFEST (with `boot_info_abi` from `origin-version`), one SEGMENT per PT_LOAD with RELA addends written in, RELOCS, MERKLE; the canonical container (C1–C4, C7, C10, C12, C14, G4, G5); and `verify`, which re-checks the finished image with `onbf-format` and `onbf-merkle` before anything is written;
+  - CLI `onbf-pack krn`: exit 0, 1 or 2; output is written through a temporary file and a rename.
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-07, in its own worktree, merged by the coordinator (91334ee). Original code, written from the ELF gABI (ELF header, program headers, dynamic section, `Elf64_Rela`, SHT_RELR), the x86-64 psABI (`EM_X86_64`, `R_X86_64_RELATIVE`), RFC 8949 §4.2.1, ONBF §3–§6 and the errata.
+- **Architecture decisions:** ADR-0001 D1; errata C1–C14, G2–G5 and R1–R5; manifest keys K1–K4. Its readings of the conversion contract (program-header policy, segment order by page-rounded end, `DT_INIT`/`DT_FINI` rejected, relocation-tag completeness, wrapping addends, `flags_digest` over the exact `--flags` bytes, and others) are listed in its report and await the owner in the errata.
+- **Dependencies:** Rust `std` and the first-party `onbf-format`, `onbf-merkle`, `origin-crypto` and `origin-version`; no third-party crates. `#![forbid(unsafe_code)]`. The library denies the no-panic Clippy lints in non-test builds. At run time it uses `rustc -vV`, unless all three toolchain values are given.
+- **Toolchain:** Rust 1.99.1; clippy-clean on the host.
+- **Test evidence (2026-11-07):** 57 unit tests and 4 integration tests, now part of `cargo xtask check`.
+  - **Negative tests:** each hard error of the contract is rejected with its own error; every strict prefix of a valid ELF is rejected as truncated.
+  - **Valid conversions:** with and without relocations, RELA, RELR and both merged, a bss-only segment, one- and two-level MERKLE sections, and a fixture of the Framekernel's shape, each checked independently with `onbf-format`, `onbf-merkle` and the RELR decoder.
+  - **RELR:** round trips over 2000 generated sets, and a brute-force check that the encoding is minimal on 3000 small sets.
+  - **Integrity and determinism:** flipping any byte of a packed image makes `verify` fail; packing twice, in one process or two, gives identical bytes.
+  - **Integration:** a `no_std` program linked with the Framekernel's flags by the pinned rustc and rust-lld 23.1.1, packed with DT_RELA and with `-zpack-relative-relocs`, and relocated at two bases by a simulated loader.
+  - **Real kernel:** `cargo xtask boot-test` packs the real Framekernel ELF (7 sections, 3 segments, 128 relocations at the time of writing), which the loader verifies and boots.
+  - **Not done:** fuzzing, Kani bounds, an independent second implementation (§13), signatures, EXE/LIB profiles, UNWIND/DEBUG_LINK sections.
+- **Review:** not yet independently reviewed.
 - **Licensing:** project licence not chosen yet.

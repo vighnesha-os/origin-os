@@ -53,6 +53,22 @@ These follow directly from the text, but are written down so that a second, inde
 | R4 | §5; key registry | The KRN `toolchain` text fields (`rustc`, `rustc_commit`, `llvm`) are non-empty printable ASCII (0x20–0x7E). That is stricter than §5's NFC rule, and trivially NFC, so the boot loader needs no Unicode normalization tables. `rustc_commit` is exactly 40 lowercase hex digits. | `onbf-format` (`KrnManifest`) |
 | R5 | §5 | "Items per container ≤ 65,536" counts elements for an array and key/value entries for a map. "Depth ≤ 16" counts nested containers, so the top-level map is depth 1, and an empty container still counts. | `onbf-format` (`ocbor`) |
 
+## Readings proposed by the implementations, awaiting the owner
+
+Applied in code on 2026-11-07, pinned by tests, and **not yet decided**. Each is the reading a second implementation (or the host signer) must match.
+
+| # | Where | Reading |
+|---|---|---|
+| P1 | `onbf-pack`, ELF input | `PT_NULL` and `PT_GNU_PROPERTY` are errors; a second `PT_DYNAMIC` or `PT_GNU_STACK` is an error; a missing `PT_GNU_STACK` is accepted; `PT_PHDR`, `PT_NOTE` and `PT_GNU_EH_FRAME` are ignored. |
+| P2 | `onbf-pack`, segments | Order uses the page-rounded end: the next `p_vaddr` must be at least the previous `p_vaddr + align_up(p_memsz, 4096)`, so two segments never share a page; gaps are allowed; `p_memsz = 0` is rejected (C14). |
+| P3 | `onbf-pack`, span and entry | The page-rounded end of the highest segment is at most 2^31 (ending exactly at 2 GiB is allowed, as in `onbf-format`); `e_entry` lies in the file-backed bytes of an RX segment. |
+| P4 | `onbf-pack`, dynamic table | Read up to the first `DT_NULL` (required); `DT_INIT`, `DT_FINI` and the init, fini and preinit arrays are rejected whatever their size; `DT_RELA`/`RELASZ`/`RELAENT` and `DT_RELR`/`RELRSZ`/`RELRENT` appear all together or not at all; duplicates are errors; each table lies in the file-backed bytes of one PT_LOAD. |
+| P5 | `onbf-pack`, relocations | Only `R_X86_64_RELATIVE` with symbol index 0; identical duplicate RELA entries merge; the same slot with different addends, or in both RELA and RELR, is an error; decoded RELR slots strictly ascend. Addends are written as u64 two's complement, so the loader adds with wrapping. |
+| P6 | `onbf-pack`, manifest | `flags_digest` is SHA-256 over exactly the UTF-8 bytes of `--flags`, with no normalization (the build system owns the canonical form); toolchain fields default to `rustc -vV`, each validated against R4. |
+| P7 | `onbf-pack`, sections | MERKLE sections are REQUIRED only (not MAPPABLE), 8-byte aligned, placed after RELOCS in segment order; RELOCS uses the greedy SHT_RELR encoding, and `verify` rejects any other encoding. |
+| E1 | `origin-crypto`, Ed25519 | Strict RFC 8032 verification, in this order: A canonical (y < p, a root exists, not x = 0 with the sign bit) and not small order ([8]A ≠ identity); the same for R; S < L as a 256-bit integer; then the **cofactorless** equation [S]B = R + [k]A. Mixed-order A and R (order 2L, 4L, 8L) are accepted, with no [L]A check. The host signer must produce only signatures this accepts. |
+| L1 | loader, boot info 0.2 | A RELRO segment is passed to the kernel without write access, because the loader has applied every relocation (ADR-0002 B4). |
+
 ## Open gaps
 
 | # | Spec | Gap | Who needs it |
