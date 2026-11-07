@@ -1,6 +1,6 @@
 [package]
 name = "origin-crypto"
-description = "Origin OS cryptography: SHA-256 and SHA-512 (FIPS 180-4)"
+description = "Origin OS cryptography: SHA-2 (FIPS 180-4) and SHA-3/SHAKE (FIPS 202)"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true

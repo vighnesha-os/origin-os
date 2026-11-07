@@ -119,6 +119,64 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - QEMU only. No physical hardware yet (CLAUDE.md §74).
 - **Licensing:** project licence not chosen yet.
 
+## `boot/info/` (`origin-boot-info`), the boot-info contract v0.1 (Proposed)
+
+- **What:** the one structure the loader hands the Framekernel (ADR-0002 B4):
+  - `BootInfo`: `repr(C)`, 80 bytes, every field explicitly sized, offsets pinned at compile time;
+  - `MemoryRegion`: 24 bytes;
+  - `RegionKind`: 13 Origin memory kinds, so the kernel never sees UEFI structures;
+  - `BootInfo::check`: validates magic, version, size and region count before anything else is trusted.
+
+  The version is `[compatibility] boot-info = "0.1"` in `origin-version.toml`. Major 0 means unstable until ADR-0002 is accepted.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code.
+- **Dependencies:** `core` and `origin-version`. `no_std`, `forbid(unsafe_code)`.
+- **Test evidence (2026-11-07):**
+  - 4 unit tests: magic, header acceptance and rejection, region-kind round trip, version source.
+  - Clippy on the host, UEFI and kernel targets.
+  - **No panic paths:** the kernel-target object references 0 external symbols.
+- **Licensing:** project licence not chosen yet.
+
+## `framekernel/` (`framekernel`), the Framekernel M1 entry
+
+- **What:** a `no_std`, `no_main` ELF for `x86_64-unknown-none` (24 KB static PIE). The UEFI loader jumps to it after `ExitBootServices`. `_start` (`extern "sysv64"`, boot info in `rdi`):
+  - programs COM1 (0x3F8) as a polled 16550 at 115200 8N1, after a bounded wait for the transmitter to drain;
+  - checks that the loader applied the image's relocations, using a static pointer read volatile and compared with its RIP-relative target;
+  - validates the boot info: pointer, `BootInfo::check`, and a region array that is aligned, sorted and non-overlapping;
+  - prints the banner, the boot-info version, the region count, usable MiB, the load address and span, and the ACPI RSDP;
+  - halts with `cli; hlt`.
+
+  The panic handler prints to COM1 and halts. The kernel installs no page tables, GDT or IDT yet (M2).
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-07, in its own worktree, merged by the coordinator. Original code.
+- **Specifications:**
+  - PC16550D UART datasheet: registers and divisor;
+  - the COM1 base, 0x3F8;
+  - System V x86-64 psABI;
+  - Intel SDM: `IN`, `OUT`, `CLI`, `HLT`;
+  - ELF gABI and x86-64 psABI;
+  - ONBF §6.1, §6.1.2 and §6.5;
+  - boot-info v0.1.
+- **Architecture decisions:**
+  - lib + bin split, with the host-testable logic in the library (`forbid(unsafe_code)`);
+  - `build.rs` passes rust-lld `--entry=_start --no-dynamic-linker -ztext -zseparate-loadable-segments -zmax-page-size=4096 -zcommon-page-size=4096 -znorelro -znoexecstack` for the kernel target only;
+  - frame pointers through `.cargo/config.toml` (CLAUDE.md §14).
+- **Dependencies:** `core`, `origin-boot-info` and `origin-version`.
+- **Toolchain:** Rust 1.99.1, `x86_64-unknown-none` (soft-float, kernel code model, PIE), rust-lld (gnu flavour).
+- **Unsafe inventory, reviewed by the author (not independently):**
+  - Five `unsafe fn`, each with a `# Safety` contract: `_start`, `read_boot_info`, `Com1::new`, `outb`, `inb`.
+  - Eleven one-operation `unsafe` blocks.
+  - Port I/O touches only 0x3F8–0x3FD, confirmed in the disassembly.
+- **Test evidence (2026-11-07):**
+  - 20 host unit tests (`cargo test -p framekernel --lib`): boot-info and region validation, usable-MiB rounding, the exact report lines, and the UART init sequence and bounded polling.
+  - Clippy on the host and on the kernel target.
+  - The release ELF, checked with `llvm-readobj --elf-output-style=GNU`:
+    - ET_DYN, with its entry in the RX segment;
+    - PT_LOADs R, RX and RW, all page-aligned;
+    - no INTERP, TLS or GNU_RELRO;
+    - 38 RELATIVE relocations.
+  - Two clean builds in the same path were byte-identical.
+  - Boot evidence is in the `boot/uefi` step 2 entry.
+- **Licensing:** project licence not chosen yet.
+
 ## `origin-version.toml` and `runtime/version/` (`origin-version`), T5
 
 - **What:**
@@ -250,7 +308,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - Not done: a second Merkle implementation by a different author (§13 item 6), integration of `verify_block` with `onbf-format` sections, and Kani bounds.
 - **Licensing:** project licence not chosen yet.
 
-## `security/crypto/` (`origin-crypto`), SHA-256 and SHA-512
+## `security/crypto/` (`origin-crypto`), SHA-2, SHA-3 and SHAKE
 
 - **What:** streaming and one-shot SHA-256 and SHA-512 (FIPS 180-4 §6.2, §6.4), with the §5.1 padding shared through a generic block buffer. The schedule is a 16-word ring.
   - These are the hashes ONBF needs: SHA-512 for content digests, SHA-256 for section digests and Merkle trees.
@@ -281,6 +339,32 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - **Throughput on the M1 Max host (aarch64, portable code, release, single thread):** SHA-256 285 MiB/s, SHA-512 462 MiB/s. This is indicative only: the target is x86-64, and SHA-NI is not used yet.
   - Not done: NIST CAVP/ACVP vector files (downloading them needs the owner's approval), SHA-NI, and an independent review.
 - **Licensing:** project licence not chosen yet.
+
+### SHA-3 and SHAKE (FIPS 202)
+
+- **What:**
+  - Streaming SHA3-256 and SHA3-512.
+  - SHAKE128 and SHAKE256, with `finalize_xof() -> ShakeReader`, whose `squeeze` can be called repeatedly.
+  - Keccak-f[1600] on `[u64; 25]`.
+  - The sponge reuses the SHA-2 block buffer, which gains the FIPS 202 byte-oriented padding: suffix 0x06 or 0x1F, then the last byte `|= 0x80`.
+
+  ML-DSA (FIPS 204), half of every ONBF signature suite, is built on SHAKE (ONBF §7.2).
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-07, in its own worktree, merged by the coordinator. Original code from FIPS 202.
+- **Constants:**
+  - None are typed in. Const fns compute the round constants (Algorithm 5 LFSR, placed per Algorithm 6), the ρ offsets (the §3.2.2 walk) and the π mapping (Algorithm 3).
+  - The tests re-derive all three another way:
+    - the round constants as x^t mod x^8+x^6+x^5+x^4+1 over GF(2);
+    - the ρ positions from the matrix power [[0,1],[2,3]]^t mod 5;
+    - π in the forward form.
+- **Side channels:** the permutation uses fixed lane positions only (ρ compiles to immediate rotates, π to no table loads). Branches depend only on public lengths. State is not zeroized on drop yet.
+- **Test evidence (2026-11-07):** 11 tests, plus 1 ignored benchmark.
+  - **Known answers:** "" and "abc", and SHAKE at 32, 64 and 1000 bytes.
+  - **Differential tests:** 304 lengths, written only where hashlib's OpenSSL 3.5.7 and HACL* backends agree.
+  - **Streaming:** splits around every rate, and SHAKE squeezed in pieces.
+  - **Mutation check:** five planted faults, one at a time; all were caught.
+  - **No panic paths:** the kernel-target object references only `memcpy`, `memset` and `Formatter::write_str`.
+  - **Throughput:** SHA3-256 581 MiB/s and SHAKE256 about 580 MiB/s on the M1 host (aarch64, portable code). Indicative only.
+  - Not done: NIST CAVP/ACVP files, and an independent review.
 
 ## `developer-tools/xtask/` (`xtask`)
 
