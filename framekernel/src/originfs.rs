@@ -304,6 +304,12 @@ impl<'a, D: BlockDevice> Fs<'a, D> {
         if inode.is_dir() {
             return Err(FsError::IsDirectory);
         }
+        // A v0 file addresses at most 12 direct + 512 single-indirect blocks; a size beyond
+        // that is a corrupt inode, refused before it drives an unbounded allocation.
+        let max = (DIRECT as u64 + POINTERS_PER_BLOCK) * BLOCK as u64;
+        if inode.size > max {
+            return Err(FsError::OutOfRange);
+        }
         let mut out = alloc::vec![0u8; inode.size as usize];
         self.read_file(n, 0, &mut out)?;
         Ok(out)
@@ -688,5 +694,36 @@ mod tests {
             got[2 * BLOCK..].iter().all(|&x| x == 0xAB),
             "block 2 intact"
         );
+    }
+
+    #[test]
+    fn mutations_never_panic() {
+        // A valid image with a directory tree and a single-indirect file, then thousands of
+        // mutated copies fed through the whole read path: nothing may panic (CLAUDE.md §72).
+        let mut b = Builder::new();
+        b.add(1, "hello.txt", false, b"hello");
+        let etc = b.add(1, "etc", true, &[]);
+        b.add(etc, "hostname", false, b"origin");
+        let big: alloc::vec::Vec<u8> = (0..15 * BLOCK).map(|i| i as u8).collect();
+        b.add(1, "big.bin", false, &big);
+        let base = b.build();
+
+        let mut rng = crate::testing::Rng::new(0x0516_15F5);
+        for _ in 0..crate::testing::cases(4_000) {
+            let mut data = base.clone();
+            crate::testing::mutate(&mut data, &mut rng);
+            let dev = Image(data);
+            if let Ok(fs) = Fs::open(&dev) {
+                for ino in 0..8u32 {
+                    let _ = fs.entries(ino);
+                    let _ = fs.read_whole(ino);
+                    let mut buf = [0u8; 64];
+                    let _ = fs.read_file(ino, 0, &mut buf);
+                }
+                let _ = fs.resolve("/etc/hostname");
+                let _ = fs.resolve("/big.bin");
+                let _ = fs.resolve("/etc/../hello.txt");
+            }
+        }
     }
 }

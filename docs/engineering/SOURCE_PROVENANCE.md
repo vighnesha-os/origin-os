@@ -752,6 +752,13 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Not done:** a message builder/encoder for sending queries (the test builder is minimal and test-only), EDNS(0), DNSSEC, the full record-type set, and wiring into a resolver with UDP/TCP transport and a cache (§54).
 - **Licensing:** project licence not chosen yet.
 
+### Mutation soaks for the new parsers, and a `read_whole` allocation cap (CLAUDE.md §72; 2026-11-08)
+
+- **What:** seeded "never panics on mutated input" soaks (the existing `crate::testing` `Rng`/`mutate`/`cases` harness, scaled by `ORIGIN_MUTATION_SCALE`) for the untrusted-input parsers added this run: `acpi::srat_and_slit_mutations_never_panic` (SRAT and SLIT, 10 000 cases × 2 bases), `dns::mutations_never_panic` (`parse` and `read_name` over 20 000 mutated messages), and `originfs::mutations_never_panic` (4 000 mutated images through `Fs::open`, `entries`, `read_whole`, `read_file` and `resolve`). All parse paths use `.get`/checked arithmetic, so arbitrary bytes yield `Ok`/`Err`, never a panic.
+- **Hardening found by the soak:** `originfs::Fs::read_whole` allocated `inode.size` bytes from the on-disk inode; a mutated (or malicious) inode with a huge `size` would drive an unbounded allocation (an abort). It now refuses a size beyond what v0 can address (12 direct + 512 single-indirect blocks, ~2 MiB) with `OutOfRange` before allocating. `read_file` was already bounded by the caller's buffer, and `entries` by the 524-block addressing limit.
+- **Test evidence (2026-11-08):** the three soaks pass at scale 1 and at `ORIGIN_MUTATION_SCALE=10` (≈340 000 parser cases); 211 library tests in all; `cargo xtask check`.
+- **Licensing:** project licence not chosen yet.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.

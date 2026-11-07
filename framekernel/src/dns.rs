@@ -369,4 +369,26 @@ mod tests {
         let (name, _) = read_name(&m, prev as usize).unwrap();
         assert_eq!(name, "");
     }
+
+    #[test]
+    fn mutations_never_panic() {
+        // A valid response with a question and both an A and a CNAME, then thousands of
+        // mutated copies through `parse` and `read_name`: nothing may panic, however the
+        // bytes are corrupted, and compression can never loop (CLAUDE.md §72, §54).
+        let mut b = Builder::new(0x1234, 0x8180, 1, 2);
+        b.question("example.com", rtype::A, 1);
+        b.a("example.com", 300, Ipv4([93, 184, 216, 34]));
+        b.cname("www.example.com", 600, "example.com");
+        let base = b.buf;
+
+        let mut rng = crate::testing::Rng::new(0x5D_5D);
+        for _ in 0..crate::testing::cases(20_000) {
+            let mut data = base.clone();
+            crate::testing::mutate(&mut data, &mut rng);
+            let _ = parse(&data);
+            for off in [0usize, 12, data.len() / 2, data.len().saturating_sub(1)] {
+                let _ = read_name(&data, off);
+            }
+        }
+    }
 }

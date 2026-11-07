@@ -998,6 +998,43 @@ mod tests {
     }
 
     #[test]
+    fn srat_and_slit_mutations_never_panic() {
+        // Valid SRAT and SLIT tables, then thousands of mutated copies through the parsers:
+        // nothing may panic, and a mutated locality count can never drive a huge allocation
+        // (CLAUDE.md §72).
+        let base_srat = srat(&[
+            &cpu0(0, 0, true),
+            &cpu0(1, 1, true),
+            &cpu2(300, 1, true),
+            &mem(0, 0, 0x1000_0000, 1),
+            &mem(1, 0x1_0000_0000, 0x1000_0000, 0b111),
+        ]);
+        let base_slit = slit(2, &[10, 21, 21, 10]);
+
+        let mut rng = crate::testing::Rng::new(0x5247_5A54);
+        for _ in 0..crate::testing::cases(10_000) {
+            for base in [&base_srat, &base_slit] {
+                let mut data = base.clone();
+                crate::testing::mutate(&mut data, &mut rng);
+                // Direct calls (the parsers assume a checked table, but must still be
+                // panic-safe on arbitrary bytes).
+                let mut cpus = [CpuAffinity::default(); 16];
+                let _ = srat_cpu_affinities(&data, &mut cpus);
+                let mut mems = [MemoryAffinity::default(); 16];
+                let _ = srat_memory_affinities(&data, &mut mems);
+                if let Ok(s) = parse_slit(&data) {
+                    let n = s.localities().min(8);
+                    for i in 0..n {
+                        for j in 0..n {
+                            let _ = s.distance(i, j);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn slit_rejects_a_truncated_matrix() {
         // Claims 4 localities (16 cells) but carries only 4 bytes of matrix.
         let s = slit(4, &[10, 21, 21, 10]);
