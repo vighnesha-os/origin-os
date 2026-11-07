@@ -16,7 +16,7 @@
 //!    IPI, 200 µs, a second start-up IPI if it is not up yet, and up to 200 ms for its
 //!    handshake. The AP runs the trampoline (real → protected → long mode with the
 //!    kernel's own page tables), then [`ap_entry`]: its own GDT and TSS, the shared IDT,
-//!    its local APIC in x2APIC mode, and the handshake with its APIC ID.
+//!    SMEP and SMAP, its local APIC in x2APIC mode, and the handshake with its APIC ID.
 //! 4. The trampoline page goes back to read/write, never executable.
 //!
 //! Each AP then enters its own scheduler (`sched::run_ap`).
@@ -383,6 +383,8 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     // trampoline ran `cli`), after `cpu::init` on the boot processor; the tables are this
     // AP's alone.
     unsafe { cpu::init_ap(start.tables) };
+    // SAFETY: CPL 0; the kernel has no user mappings. Every processor enforces SMEP and SMAP.
+    let _ = unsafe { cpu::enable_smep_smap() };
     if !cpu::x2apic_supported() {
         start.online.store(u32::MAX, Ordering::Release);
         crate::halt();

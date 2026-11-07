@@ -118,6 +118,8 @@ fn boot_scenario() -> Scenario {
             "origin-kernel: heap: Vec of 100000 u64, 2000 boxes, B-tree of 1000 keys, a string: "
                 .into(),
             "origin-kernel: heap: everything freed; ".into(),
+            "origin-kernel: page protection: SMEP: supervisor fetch from a user page at 0x7fffffffe000 faulted (#PF error 0x11)".into(),
+            "origin-kernel: page protection: SMAP: supervisor read of a user page at 0x7fffffffe000 faulted (#PF error 0x1)".into(),
             "origin-kernel: x2APIC enabled: APIC ID 0, ".into(),
             "origin-kernel: APIC timer calibrated against the PIT: ".into(),
             "origin-kernel: APIC timer: 50 interrupts at 100 Hz in ".into(),
@@ -163,6 +165,8 @@ fn boot_scenario() -> Scenario {
             "origin-kernel: AP start-up not possible",
             ": AP start-up failed",
             ": scheduler failed",
+            "supervisor isolation from user pages incomplete",
+            "origin-kernel: cannot map the user probe page",
         ],
     }
 }

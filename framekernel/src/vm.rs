@@ -55,3 +55,26 @@ pub(crate) fn set_access(page: u64, access: Access) -> Result<(), MapError> {
     unsafe { asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags)) };
     result
 }
+
+/// Maps the 4 KiB page `virt` to `phys` as a **user** page with `access`: only for probes
+/// that prove supervisor protections (SMEP, SMAP); the kernel has no user mappings otherwise.
+pub(crate) fn map_user(virt: u64, phys: u64, access: Access) -> Result<(), MapError> {
+    let mut guard = KERNEL_SPACE.lock();
+    let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
+    let attributes = Attributes {
+        access,
+        user: true,
+        global: false,
+    };
+    k.space.map(&mut k.tables, virt, phys, attributes)
+}
+
+/// Removes the leaf at `virt` and flushes its TLB entry on this processor.
+pub(crate) fn unmap(virt: u64) -> Result<u64, MapError> {
+    let mut guard = KERNEL_SPACE.lock();
+    let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
+    let phys = k.space.unmap(&mut k.tables, virt)?;
+    // SAFETY: as in `set_access`.
+    unsafe { asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)) };
+    Ok(phys)
+}

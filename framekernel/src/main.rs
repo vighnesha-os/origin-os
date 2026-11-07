@@ -139,6 +139,9 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         // `alloc` crate works in the kernel.
         memory::init(alloc);
         heap_ok = prove_heap(&mut com1);
+        if heap_ok {
+            prove_user_isolation(&mut com1);
+        }
     }
 
     // M2, fourth step: interrupts. The local APIC in x2APIC mode, its timer calibrated
@@ -396,6 +399,83 @@ fn prove_heap(com1: &mut Uart16550<Com1>) -> bool {
         (before.1 * memory::FRAME) >> 20
     );
     true
+}
+
+/// Where the SMEP/SMAP probe maps its temporary user page: the top of the lower half.
+const USER_PROBE_PAGE: u64 = 0x0000_7FFF_FFFF_E000;
+
+/// Enables SMEP and SMAP and proves both: a temporary user page holding `mov rax, -1;
+/// ret`, which a supervisor fetch (SMEP) and a supervisor read (SMAP) must both fault on.
+/// The page is removed afterwards.
+fn prove_user_isolation(com1: &mut Uart16550<Com1>) -> bool {
+    use alloc::alloc::{Layout, alloc_zeroed, dealloc};
+    // SAFETY: CPL 0, and the kernel has no user mappings yet.
+    let (smep, smap) = unsafe { cpu::enable_smep_smap() };
+    if !(smep && smap) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: SMEP {smep}, SMAP {smap}: supervisor isolation from user pages incomplete"
+        );
+        return false;
+    }
+    let Ok(layout) = Layout::from_size_align(4096, 4096) else {
+        return false;
+    };
+    // SAFETY: `layout` has a non-zero size.
+    let frame = unsafe { alloc_zeroed(layout) };
+    if frame.is_null() {
+        return false;
+    }
+    // SAFETY: `frame` is a fresh, writable 4 KiB allocation.
+    unsafe {
+        ptr::copy_nonoverlapping(cpu::PROBE_RETURN.as_ptr(), frame, cpu::PROBE_RETURN.len());
+    }
+    let phys = frame.expose_provenance() as u64;
+    let mut ok = true;
+    if vm::map_user(
+        USER_PROBE_PAGE,
+        phys,
+        framekernel::paging::Access::ReadExecute,
+    )
+    .is_err()
+    {
+        let _ = writeln!(com1, "origin-kernel: cannot map the user probe page");
+        ok = false;
+    } else {
+        // SAFETY: the user page holds `PROBE_RETURN`.
+        let fetch = unsafe { cpu::probe_execute(USER_PROBE_PAGE) };
+        // SAFETY: the user page is RAM, not MMIO.
+        let read = unsafe { cpu::probe_read(USER_PROBE_PAGE) };
+        for (what, probe, expected) in [
+            ("SMEP: supervisor fetch from a user page", fetch, 0x11),
+            ("SMAP: supervisor read of a user page", read, 0x1),
+        ] {
+            match probe {
+                cpu::Probe::Faulted { error, address }
+                    if error == expected && address == USER_PROBE_PAGE =>
+                {
+                    let _ = writeln!(
+                        com1,
+                        "origin-kernel: page protection: {what} at {USER_PROBE_PAGE:#x} faulted (#PF error {error:#x})"
+                    );
+                }
+                other => {
+                    ok = false;
+                    let _ = writeln!(
+                        com1,
+                        "origin-kernel: page protection violated: {what}: {other:?}"
+                    );
+                }
+            }
+        }
+        if vm::unmap(USER_PROBE_PAGE).is_err() {
+            ok = false;
+        }
+    }
+    // SAFETY: `frame` came from `alloc_zeroed(layout)` and is no longer mapped as a user
+    // page.
+    unsafe { dealloc(frame, layout) };
+    ok
 }
 
 /// Proves the allocator by allocating, writing, reading back and freeing three frames.

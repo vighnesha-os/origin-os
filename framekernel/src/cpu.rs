@@ -414,7 +414,7 @@ const COMPLETED: u64 = u64::MAX;
 
 /// `mov rax, -1; ret`: executed only if NX fails to stop the fetch, in which case the jump
 /// probe returns [`COMPLETED`]. It is writable data, so it must never be executable.
-static mut PROBE_CODE: [u8; 8] = [0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3];
+static mut PROBE_CODE: [u8; 8] = PROBE_RETURN;
 
 /// What a probe access did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -476,10 +476,62 @@ pub(crate) unsafe fn probe_write(addr: u64, value: u8) -> Probe {
 /// probed address too.
 pub(crate) fn probe_execute_data() -> (u64, Probe) {
     let target = (&raw const PROBE_CODE).addr() as u64;
-    // SAFETY: the fetch at `target` either faults (and resumes at `probe_recover`, which
-    // returns to this caller) or executes `PROBE_CODE`, which only sets RAX and returns.
-    let probe = run_probe(target, || unsafe { jump(target) });
+    // SAFETY: `PROBE_CODE` holds `mov rax, -1; ret`, so the jump either faults or runs it.
+    let probe = unsafe { probe_execute(target) };
     (target, probe)
+}
+
+/// The bytes of `mov rax, -1; ret`, for a probe target that must not be executable.
+pub(crate) const PROBE_RETURN: [u8; 8] = [0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3];
+
+/// Jumps to `target` and reports whether the fetch faulted.
+///
+/// # Safety
+///
+/// If the fetch is allowed, the code at `target` runs: it must be [`PROBE_RETURN`].
+pub(crate) unsafe fn probe_execute(target: u64) -> Probe {
+    // SAFETY: the fetch at `target` either faults (and resumes at `probe_recover`, which
+    // returns to this caller) or runs `PROBE_RETURN` (the caller's contract), which only
+    // sets RAX and returns.
+    run_probe(target, || unsafe { jump(target) })
+}
+
+/// CR4.SMEP: supervisor instruction fetches from user pages fault.
+const CR4_SMEP: u64 = 1 << 20;
+/// CR4.SMAP: supervisor data accesses to user pages fault (unless RFLAGS.AC is set).
+const CR4_SMAP: u64 = 1 << 21;
+
+/// Which of SMEP and SMAP this processor supports (CPUID 7.0 EBX bits 7 and 20).
+pub(crate) fn smep_smap_supported() -> (bool, bool) {
+    if cpuid(0)[0] < 7 {
+        return (false, false);
+    }
+    let ebx = cpuid(7)[1];
+    (ebx & (1 << 7) != 0, ebx & (1 << 20) != 0)
+}
+
+/// Enables SMEP and SMAP on this processor, where supported; returns which were enabled.
+///
+/// # Safety
+///
+/// CPL 0. The kernel must not rely on executing or accessing user pages from supervisor
+/// mode (it has none; a future user-copy path must set RFLAGS.AC around its accesses).
+pub(crate) unsafe fn enable_smep_smap() -> (bool, bool) {
+    let (smep, smap) = smep_smap_supported();
+    let bits = if smep { CR4_SMEP } else { 0 } | if smap { CR4_SMAP } else { 0 };
+    // SAFETY: the caller's contract; setting supported CR4 bits only adds restrictions on
+    // supervisor accesses to user pages.
+    unsafe {
+        asm!(
+            "mov {tmp}, cr4",
+            "or {tmp}, {bits}",
+            "mov cr4, {tmp}",
+            bits = in(reg) bits,
+            tmp = out(reg) _,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (smep, smap)
 }
 
 /// `movzx eax, byte ptr [rdi]` is the first instruction, so a fault has RIP = `read_byte`.
