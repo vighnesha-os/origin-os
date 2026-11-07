@@ -38,6 +38,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "onbf-verify"
+version = "0.0.0"
+dependencies = [
+ "onbf-format",
+ "origin-crypto",
+]
+
+[[package]]
 name = "origin-boot-info"
 version = "0.0.0"
 dependencies = [

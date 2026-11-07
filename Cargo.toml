@@ -19,6 +19,7 @@ members = [
     "framekernel/sync",
     "runtime/onbf/format",
     "runtime/onbf/merkle",
+    "runtime/onbf/verify",
     "runtime/version",
     "security/crypto",
 ]
@@ -31,6 +32,7 @@ default-members = [
     "framekernel/sync",
     "runtime/onbf/format",
     "runtime/onbf/merkle",
+    "runtime/onbf/verify",
     "runtime/version",
     "security/crypto",
 ]

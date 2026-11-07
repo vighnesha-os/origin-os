@@ -47,7 +47,7 @@
 
 1. **M3, scheduling proper** (ADR-0003 K7 is the baseline): wait queues and cross-CPU wake-ups by IPI, priorities and a fairness policy (EEVDF to be evaluated, §26), load balancing, a serialized kernel console for multi-CPU output. Pad the per-worker counters (cache-line sharing showed at 4 CPUs).
 2. **Address-space layout:** the higher-half kernel and KASLR (ADR-0002 B3), which M4's user address spaces need; then M4 (processes, system calls, capabilities, IPC).
-3. **Signature block (ONBF §7.1):** S1–S4 decided (2026-11-07); parser in `onbf-format`, then Ed25519 + ML-DSA verification in the loader, then the trust anchor (B7).
+3. **Signature block (ONBF §7.1):** S1–S4 decided, parser and `onbf-verify` done (2026-11-07); next: `onbf-pack` signing with a host key, the loader requiring a signed KRN outside developer mode, the trust store and OKC chains, then the trust anchor (B7).
 4. **Formal and concurrency checks:** Loom models for `SpinLock`; Kani bounds for `paging`, `frames` and `heap` (CLAUDE.md §73).
 5. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks.
 6. **M1 follow-ups:** A/B deployment and boot-attempt recording (§20); an executed FFI-bool test (Rosetta); CI.

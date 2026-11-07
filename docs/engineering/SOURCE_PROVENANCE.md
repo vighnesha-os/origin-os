@@ -363,6 +363,14 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07, right after the owner decided S1–S4. Original code.
 - **Test evidence:** 6 tests: a two-entry block with the exact statement bytes; framing (magic, version, counts 0 and 9, truncation, trailing data, every strict prefix); each entry rule; each statement rule; duplicates and a non-minimal integer head; every single-bit flip of a valid block is refused or reads a different entry, and nothing panics. The no-panic object check still passes (4 allowed external symbols).
 
+## `runtime/onbf/verify/` (`onbf-verify`), signature-entry verification
+
+- **What:** `verify_entry(entry, key, content_digest, profile)`, in order: the key ID is SHA-256 of the key's canonical encoding (the OCBOR-1 `keys` map, S4); the ML-DSA key length fits the suite; the statement's digest and profile match the image; Ed25519 (strict) over the exact statement bytes; ML-DSA-65 or -87 (strict) over the same bytes with the role's context string. Trust decisions (which keys, certificate chains) are left to the trust store (B7).
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code. `no_std`, no allocation, `forbid(unsafe_code)`, no-panic lints; depends only on `onbf-format` and `origin-crypto`.
+- **Test evidence:** `tools/make_fixture.py` builds a Kernel-role (OSS-1R) block signed by the independent pure-Python references (Ed25519 RFC 8032 and ML-DSA-87 FIPS 204, deterministic keys; byte-identical on every run, SHA-256 `aa9e76c0…2e72`). 3 tests: the block verifies under the Rust verifiers (two implementations agreeing end to end); a wrong digest, profile or key and a flipped byte in either signature fail with their own errors; every single-bit flip inside the statement fails. The no-panic object check passes (6 allowed external symbols).
+- **Not done:** wiring into the loader (B2 step 3), the trust store and OKC chain verification, the host signer, vectors from an independent author.
+- **Licensing:** project licence not chosen yet.
+
 ## `runtime/onbf/merkle/` (`onbf-merkle`), Merkle-SHA256-4K
 
 - **What:** the ONBF §4.6 trees, with the owner's G2 and G3 decisions and readings R1–R3 (`docs/spec/ONBF-errata.md`):

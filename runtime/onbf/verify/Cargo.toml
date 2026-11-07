@@ -1,0 +1,13 @@
+[package]
+name = "onbf-verify"
+description = "Origin OS ONBF signature verification (ONBF §7): both signatures over the statement, digest, profile, key ID"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+onbf-format = { path = "../format" }
+origin-crypto = { path = "../../../security/crypto" }
+
+[lints]
+workspace = true
