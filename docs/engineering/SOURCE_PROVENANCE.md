@@ -646,6 +646,13 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 3 `topology` tests (width decode and ID splitting, the flat fallback, and `analyze`'s package/core/thread counts with a duplicate-ID rejection); 166 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs (and an earlier 8-CPU boot).
 - **Not done:** using the topology for scheduler placement (SMT-aware and cache-aware, §27), the cache hierarchy from leaf 04h, and hybrid-core capacity (§27).
 
+### CPU cache hierarchy from CPUID leaf 04h (CLAUDE.md §24, §27; 2026-11-08)
+
+- **What:** `cache` (library) decodes leaf-04h deterministic-cache sub-leaves into each cache's level, type (data/instruction/unified), size, line size, ways and how many logical processors share it. The size is the product of ways, partitions, line size and sets. Pure, no `unsafe`. The kernel reports the hierarchy in its topology step.
+- **Honest QEMU note:** QEMU's TCG `-cpu max` reports no leaf-04h caches (it is an Intel-specific deterministic-cache leaf the emulator leaves empty), so the kernel line reads "cache: 0 caches; consistent true" under emulation. The decoder is therefore validated by host tests, not a boot proof; on real 2026 hardware (CLAUDE.md §74) leaf 04h is populated and the same code reports the real caches. It is an informational line, not a gated boot marker, for that reason.
+- **Test evidence:** 2 `cache` tests (a typical L1/L2/L3 hierarchy decoded to exact sizes and sharing, and `decode_all` stopping at the terminator with the size-equals-geometry invariant); 168 library tests; `cargo xtask check`.
+- **Not done:** cache-aware scheduler placement (§27), AMD's leaf 8000001Dh, and TLB/prefetch descriptors (leaf 02h).
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.

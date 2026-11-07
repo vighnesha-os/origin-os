@@ -559,6 +559,42 @@ fn prove_topology(com1: &mut console::Console, ids: &[u32]) {
     let topology = Topology::decode(&subs[..n]);
     let mut scratch = [(0u32, 0u32, 0u32); crate::sched::MAX_CPUS];
     let (counts, consistent) = framekernel::topology::analyze(&topology, ids, &mut scratch);
+    // The cache hierarchy from leaf 04h.
+    let mut caches = [framekernel::cache::Cache {
+        level: 0,
+        kind: framekernel::cache::CacheType::Data,
+        size: 0,
+        line_size: 0,
+        ways: 0,
+        shared_by: 0,
+    }; 8];
+    let mut cache_subs = alloc::vec::Vec::new();
+    if cpu::cpuid(0)[0] >= 4 {
+        for i in 0..8u32 {
+            let sub = cpu::cpuid_subleaf(4, i);
+            if sub[0] & 0x1F == 0 {
+                break;
+            }
+            cache_subs.push(sub);
+        }
+    }
+    let n_cache = framekernel::cache::decode_all(&cache_subs, &mut caches);
+    let caches_ok = caches[..n_cache]
+        .iter()
+        .all(|c| c.size > 0 && c.line_size > 0);
+    let _ = write!(com1, "origin-kernel: cache: {n_cache} caches");
+    for c in &caches[..n_cache] {
+        let _ = write!(
+            com1,
+            "; L{} {:?} {} KiB (shared by {})",
+            c.level,
+            c.kind,
+            c.size >> 10,
+            c.shared_by
+        );
+    }
+    let _ = writeln!(com1, "; consistent {caches_ok}");
+
     let _ = writeln!(
         com1,
         "origin-kernel: topology: {} logical, {} cores, {} packages ({} threads/core, {} logical/package); consistent {}{}",
