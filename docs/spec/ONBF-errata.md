@@ -41,6 +41,16 @@ ONBF-R6 requires that a file have exactly one valid reading, and §13 item 6 say
 | G4 | §4.3, §6.1 | Segment `mem_size` alignment, and the order and overlap of segment memory ranges, were not stated. | **Page-multiple, sorted, disjoint.** A SEGMENT's `mem_size`, like its `mem_offset`, is a multiple of 4 KiB. SEGMENT sections appear in ascending `mem_offset` order (table order) and never overlap. Unmapped gaps, such as guard pages, are allowed. Every segment ends within the 2 GiB image span (`mem_offset + mem_size ≤ 2^31`) in EXE, LIB and KRN. The Appendix A limit of 16 segments applies to EXE and LIB. | `onbf-format` (`MemoryLayout`, `SegmentOrder`, `SegmentSpan`, `TooManySegments`) |
 | G5 | §4.3, §4.4 | After C13, REQUIRED no longer changed anything for a v1 reader except on MANIFEST. | **REQUIRED is set on every section.** That is truthful in v1, because every section must be understood, and gives one encoding. Writers (`onbf-pack`, the SDK tools) always set it. The bit keeps its meaning in case a future major version brings optional kinds back. | `onbf-format` (`RequiredNotSet`) |
 
+## Readings applied without a separate decision
+
+These follow directly from the text, but are written down so that a second, independent implementation cannot drift from them. The owner may overrule any of them.
+
+| # | Spec | Reading | Applied in |
+|---|---|---|---|
+| R1 | §4.6 step 3 | `"ONBF-MERKLE-1"` is its 13 ASCII bytes, with no terminator or length prefix. | `onbf-merkle`, `tools/merkle_reference.py` |
+| R2 | §4.6 steps 1–2 | The zero padding of the last data block, and of each level's last hash block, is hashed as part of that block, so leaf and node hash inputs are always a full 4 KiB plus the prefix. | `onbf-merkle` |
+| R3 | §4.6 step 4 | "Highest level first" applies across levels. Within a level, hash blocks are stored in ascending index order. | `onbf-merkle` |
+
 ## Open gaps
 
 | # | Spec | Gap | Who needs it |

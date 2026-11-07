@@ -188,6 +188,41 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - Not done yet: fuzzing (§13 item 3), Kani bounds (item 5) and the N-version check (item 6).
 - **Licensing:** project licence not chosen yet.
 
+## `runtime/onbf/merkle/` (`onbf-merkle`), Merkle-SHA256-4K
+
+- **What:** the ONBF §4.6 trees, with the owner's G2 and G3 decisions and readings R1–R3 (`docs/spec/ONBF-errata.md`):
+  - `Shape`: leaves, levels and MERKLE-section positions, highest level first;
+  - `root`: one streaming pass, for whole-section verification such as the boot loader checking KRN segments;
+  - `build`: writes the MERKLE section, for `onbf-pack`;
+  - `verify_block`: checks one 4 KiB block by walking one hash block per level, stopping at the first hash block a caller-supplied `TrustCache` already trusts. This is the ONBF-R2 page-fault path.
+- **Design:**
+  - Child hashes stream into one SHA-256 state per level (at most 4 levels for 1 TiB), so there are **no 4 KiB buffers**: the stack use is a few hundred bytes, which suits kernel stacks.
+  - Iterative, with no recursion (ONBF-R10).
+  - Hash blocks are marked trusted only after the walk reaches the root or a trusted ancestor.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code written from ONBF §4.6. The design approach is credited in the spec to Fuchsia blobfs and fs-verity; no code from either.
+- **Architecture decisions:** the ONBF §12 contract (`no_std`, no alloc, `forbid(unsafe_code)`, no-panic lints) and ADR-0001.
+- **Dependencies:**
+  - `core` and the first-party `origin-crypto` (SHA-256).
+  - The first-party `onbf-format` as a dev-dependency, to cross-check MERKLE section sizes.
+- **Toolchain:** Rust 1.99.1. Clippy-clean on the host, `x86_64-unknown-uefi` and `x86_64-unknown-none`. `[profile.dev.package.*] opt-level = 3` for `origin-crypto` and `onbf-merkle`, so that the tests (about 200 MB hashed) take 1.1 s instead of 16.7 s.
+- **Test evidence (2026-11-07):** 12 tests, plus 1 ignored benchmark.
+  - **Independent reference:** `tools/merkle_reference.py` implements §4.6 differently (whole levels as lists, materialized blocks) over Python `hashlib` (OpenSSL). For 17 sizes up to 64 MiB + 1 (3 levels), `root`, `build` and `Shape` agree with it on every root and on the SHA-256 of every MERKLE section's bytes.
+  - **Shape:** equals `onbf_format::merkle_hash_blocks` for 606 sizes up to 1 TiB, which has 4 levels. Larger content is rejected.
+  - **Every block verifies:** for 6 sizes across 1–2 levels, and for all 16,385 blocks of a 3-level tree with a warm cache, which ends up trusting all 132 hash blocks exactly.
+  - **Attacks (§13 item 4, "Merkle block swap"):** each fails with the exact expected error.
+    - Tampered data at 0, 1 and 2 levels.
+    - Swapped data blocks (each leaf is bound to its index).
+    - Swapped hash blocks.
+    - Tampered hash-block padding, an upper-level slot and an unused slot.
+    - A wrong root, or the same bytes under a different `content_size`.
+    - A bad index, a bad block length and a bad section length.
+  - **Cache:** after the first verification, a sibling block stops after one lookup. A tampered block fails against a warm cache and adds nothing to it.
+  - **The root binds `content_size`:** a trailing zero byte inside the last block changes the root.
+  - **No panic paths:** the release object for `x86_64-unknown-none` references only `memcpy`, `memset` and `origin_crypto`'s `Sha256::update`/`finalize`, which are themselves checked. A planted latent `split_at` passed Clippy and the tests, and was caught only by the no-panic step (`core::panicking::panic_fmt`).
+  - **Throughput on the M1 Max host, portable SHA-256, release:** `root` 279 MiB/s, against 285 MiB/s for plain SHA-256. That is about 2% tree overhead, as expected from 1 extra hash per 128 blocks.
+  - Not done: a second Merkle implementation by a different author (§13 item 6), integration of `verify_block` with `onbf-format` sections, and Kani bounds.
+- **Licensing:** project licence not chosen yet.
+
 ## `security/crypto/` (`origin-crypto`), SHA-256 and SHA-512
 
 - **What:** streaming and one-shot SHA-256 and SHA-512 (FIPS 180-4 §6.2, §6.4), with the §5.1 padding shared through a generic block buffer. The schedule is a 16-word ring.
@@ -224,9 +259,9 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 
 - **What:** host-side build orchestration, with four commands:
   - `check`:
-    - rustfmt, clippy and tests per crate and target. The freestanding libraries (`onbf-format`, `origin-crypto`) are checked on the host, `x86_64-unknown-uefi` and `x86_64-unknown-none`;
+    - rustfmt, clippy and tests per crate and target. The freestanding libraries (`onbf-format`, `onbf-merkle`, `origin-crypto`) are checked on the host, `x86_64-unknown-uefi` and `x86_64-unknown-none`;
     - the UEFI release build;
-    - a **no-panic step**: each freestanding library is rebuilt for the kernel target in release mode, and its object may reference only `memcpy`, `memmove`, `memset`, `memcmp` or `core::fmt::Formatter::write_str`;
+    - a **no-panic step**: each freestanding library is rebuilt for the kernel target in release mode. Its object may reference only `memcpy`, `memmove`, `memset`, `memcmp`, `core::fmt::Formatter::write_str`, or symbols *defined by another freestanding library's object*, since those pass the same check;
     - two lints:
       - CLAUDE.md §11: no `target_os = "linux"` in any Rust file outside `developer-tools/`;
       - CLAUDE.md §62: no `version` in the `[package]` or `[workspace.package]` section of any Cargo manifest.

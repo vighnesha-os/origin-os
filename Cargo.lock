@@ -11,6 +11,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "onbf-merkle"
+version = "0.0.0"
+dependencies = [
+ "onbf-format",
+ "origin-crypto",
+]
+
+[[package]]
 name = "origin-boot-uefi"
 version = "0.0.0"
 dependencies = [

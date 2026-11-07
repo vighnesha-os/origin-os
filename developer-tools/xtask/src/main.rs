@@ -38,10 +38,11 @@ const LOADER_BIN: &str = "origin-boot";
 const VERSION_PACKAGE: &str = "origin-version";
 const ONBF_FORMAT_PACKAGE: &str = "onbf-format";
 const CRYPTO_PACKAGE: &str = "origin-crypto";
+const MERKLE_PACKAGE: &str = "onbf-merkle";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// `no_std` libraries embedded in the boot loader and the Framekernel. Each must be
 /// clippy-clean on every target and free of panic paths (ONBF §12).
-const FREESTANDING_LIBS: &[&str] = &[ONBF_FORMAT_PACKAGE, CRYPTO_PACKAGE];
+const FREESTANDING_LIBS: &[&str] = &[ONBF_FORMAT_PACKAGE, MERKLE_PACKAGE, CRYPTO_PACKAGE];
 const QEMU: &str = "qemu-system-x86_64";
 const DEFAULT_BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -233,12 +234,61 @@ const NO_PANIC_ALLOWED: &[&str] = &["memcpy", "memmove", "memset", "memcmp"];
 const NO_PANIC_ALLOWED_PARTS: &[&str] = &["4core3fmtNtB5_9Formatter9write_str"];
 
 /// Builds each freestanding library for the kernel target in release mode, as one object,
-/// and fails if it references any symbol outside the allowlist.
+/// and fails if it references any symbol outside the allowlist. A symbol defined by another
+/// freestanding library is allowed, because that library passes this same check.
 fn no_panic_check() -> Result {
     let nm = llvm_tool("llvm-nm")?;
     let out_dir = target_dir().join("xtask").join("no-panic");
     fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
+    let mut objects = Vec::new();
     for &package in FREESTANDING_LIBS {
+        objects.push((package, build_kernel_object(package, &out_dir)?));
+    }
+    let symbols = |obj: &Path, flag: &str| -> Result<Vec<String>> {
+        let out = Command::new(&nm)
+            .arg(flag)
+            .arg(obj)
+            .output()
+            .map_err(|e| format!("cannot run {}: {e}", nm.display()))?;
+        // Lines are "[address] TYPE name"; the name is the last field.
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_whitespace().last().map(str::to_string))
+            .collect())
+    };
+    let mut defined = std::collections::HashSet::new();
+    for (_, obj) in &objects {
+        defined.extend(symbols(obj, "--defined-only")?);
+    }
+    for (package, obj) in &objects {
+        let undefined = symbols(obj, "-u")?;
+        let bad: Vec<&String> = undefined
+            .iter()
+            .filter(|s| {
+                !NO_PANIC_ALLOWED.contains(&s.as_str())
+                    && !NO_PANIC_ALLOWED_PARTS.iter().any(|p| s.contains(p))
+                    && !defined.contains(*s)
+            })
+            .collect();
+        if !bad.is_empty() {
+            let list: Vec<&str> = bad.iter().map(|s| s.as_str()).collect();
+            return Err(format!(
+                "{package}: the release object for {KERNEL_TARGET} references symbols outside the \
+                 no-panic allowlist (ONBF §12):\n  {}",
+                list.join("\n  ")
+            ));
+        }
+        println!(
+            "xtask: no-panic check: {package} ({KERNEL_TARGET}, release) references {} external symbols, all allowed",
+            undefined.len()
+        );
+    }
+    Ok(())
+}
+
+/// Builds `package` for the kernel target in release mode as a single object file.
+fn build_kernel_object(package: &str, out_dir: &Path) -> Result<PathBuf> {
+    {
         let obj = out_dir.join(format!("{package}.o"));
         let _ = fs::remove_file(&obj);
         // Clean only this package for this target and profile, so rustc really runs and
@@ -273,34 +323,8 @@ fn no_panic_check() -> Result {
                 obj.display()
             ));
         }
-        let out = Command::new(&nm)
-            .arg("-u")
-            .arg(&obj)
-            .output()
-            .map_err(|e| format!("cannot run {}: {e}", nm.display()))?;
-        let listing = String::from_utf8_lossy(&out.stdout);
-        let symbols: Vec<&str> = listing.split_whitespace().filter(|s| *s != "U").collect();
-        let bad: Vec<&str> = symbols
-            .iter()
-            .copied()
-            .filter(|s| {
-                !NO_PANIC_ALLOWED.contains(s)
-                    && !NO_PANIC_ALLOWED_PARTS.iter().any(|p| s.contains(p))
-            })
-            .collect();
-        if !bad.is_empty() {
-            return Err(format!(
-                "{package}: the release object for {KERNEL_TARGET} references symbols outside the \
-                 no-panic allowlist (ONBF §12):\n  {}",
-                bad.join("\n  ")
-            ));
-        }
-        println!(
-            "xtask: no-panic check: {package} ({KERNEL_TARGET}, release) references {} external symbols, all allowed",
-            symbols.len()
-        );
+        Ok(obj)
     }
-    Ok(())
 }
 
 /// A tool from the pinned toolchain's `llvm-tools` component.

@@ -14,6 +14,7 @@ members = [
     "boot/uefi",
     "developer-tools/xtask",
     "runtime/onbf/format",
+    "runtime/onbf/merkle",
     "runtime/version",
     "security/crypto",
 ]
@@ -21,6 +22,7 @@ members = [
 default-members = [
     "developer-tools/xtask",
     "runtime/onbf/format",
+    "runtime/onbf/merkle",
     "runtime/version",
     "security/crypto",
 ]
@@ -37,6 +39,7 @@ publish = false
 [workspace.dependencies]
 origin-version = { path = "runtime/version" }
 origin-crypto = { path = "security/crypto" }
+onbf-format = { path = "runtime/onbf/format" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -53,3 +56,12 @@ multiple_unsafe_ops_per_block = "deny"
 # One codegen unit: deterministic output (CLAUDE.md §75) and the same code shape that
 # docs/toolchain/VERIFICATION.md exercised for the §10 regressions.
 codegen-units = 1
+
+# Hashing is the hot path of tests and of developer-mode boot verification; optimize it even
+# in dev and test builds. The code uses explicit wrapping arithmetic, so release and debug
+# semantics are identical.
+[profile.dev.package.origin-crypto]
+opt-level = 3
+
+[profile.dev.package.onbf-merkle]
+opt-level = 3
