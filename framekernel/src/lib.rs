@@ -22,7 +22,6 @@
 //! - [`heap`]: kernel heap bookkeeping (slabs and frame runs), addresses only;
 //! - [`paging`]: 4-level page tables with structural W^X (the `origin-paging` crate,
 //!   shared with the loader);
-//! - [`kernel_space`]: what the kernel's first address space maps, and how;
 //! - [`runqueue`]: the per-CPU round-robin run queue (scheduler policy);
 //! - [`serial`]: a polled 16550 UART driver over an abstract register interface;
 //! - [`report`]: the exact console text.
@@ -42,7 +41,6 @@ pub mod boot;
 pub mod descriptors;
 pub mod frames;
 pub mod heap;
-pub mod kernel_space;
 pub use origin_paging as paging;
 pub mod report;
 pub mod runqueue;

@@ -137,7 +137,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `cargo xtask boot-test`, both scenarios, QEMU 11.1.3 + OVMF (q35, TCG, `-cpu max`): the loader reads, verifies and places the real KRN (7 sections, 3 segments, 128 relocations at the time of writing) and enters the kernel; a KRN with one byte of its first SEGMENT flipped is rejected with "section 1 does not match its digest" and the kernel never runs.
   - QEMU only. No physical hardware yet (CLAUDE.md §74).
 
-## `boot/info/` (`origin-boot-info`), the boot-info contract v0.2 (Proposed)
+## `boot/info/` (`origin-boot-info`), the boot-info contract v0.3 (Proposed)
 
 - **What:** the one structure the loader hands the Framekernel (ADR-0002 B4):
   - `BootInfo`: `repr(C)`, 80 bytes, every field explicitly sized, offsets pinned at compile time;
@@ -195,6 +195,11 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - Two clean builds in the same path were byte-identical.
   - Boot evidence is in the `boot/uefi` step 2 entry.
 - **Licensing:** project licence not chosen yet.
+
+### Higher half and KASLR (ADR-0004, accepted and implemented 2026-11-07)
+
+- **What:** `origin-paging` (the page-table library, now a crate shared with the loader) gains `layout`: the ADR-0004 windows, the KASLR slot arithmetic and the builder (direct map at `base + physical`, the kernel image at its virtual base with its segment permissions, no alias, nothing in the lower half). Boot info 0.3 carries the loader's table root, the direct-map base, the kernel's virtual base and a KASLR flag. The loader takes 64 random bits from RDSEED (else RDRAND; else a fixed placement, reported), relocates the kernel for its virtual base, builds the first tables from a pre-final memory map, and enters through a naked stub (EFER.NXE, CR0.WP, CR3, direct-map stack). The kernel converts every physical address through `phys` (the heap's bookkeeping stays physical and crosses at `GlobalAlloc`), builds its own tables with the same builder, maps the AP trampoline at its identity address only while APs start, and checks at run time that the kernel image has no identity mapping and no direct-map alias.
+- **Test evidence (2026-11-07):** 4 layout tests (the high image with exact access and no lower-half mapping, the direct map's coverage, KASLR windows and alignment over 10,000 draws with more than 9,900 distinct placements, and a segment over the direct map is an error). `cargo xtask boot-matrix` passes at 1, 2 and 4 CPUs with every earlier proof. Three boots chose three different placements (RDSEED); a forced no-entropy boot placed the kernel at 0xffffffff80000000 and the direct map at 0xffff800000000000 and passed. Negative control: an identity mapping of the kernel image left in place gives "higher half: kernel image identity address mapped true ... higher half failed".
 
 ### M2: descriptors, frames, paging, interrupts, heap (2026-11-07)
 

@@ -46,6 +46,9 @@ Memory types:
 *KASLR:* in M1 the physical base is whatever the firmware returns. A randomized base, from `EFI_RNG_PROTOCOL`, belongs with the kernel's own page tables in M2, when the virtual layout becomes the kernel's to choose.
 
 ### B4. The boot-info structure
+
+*0.3 (2026-11-07, ADR-0004 H4):* `page_table_root`, `direct_map_base`, `kernel_virtual_base` and `flags` (KASLR) are appended (128 bytes). The boot-info pointer in RDI and the initial RSP are direct-map addresses; every other address field stays physical. The page below the stack is a guard (not mapped).
+
 `origin-boot-info` defines the structure, at version 0.2 (`origin-version.toml [compatibility] boot-info`); major 0 means unstable, so the kernel accepts only its exact version. It contains:
 - a magic number, the version and the structure's size;
 - the physical memory regions, using Origin's own kinds: the loader translates the UEFI map so the kernel never sees UEFI structures;
@@ -71,6 +74,9 @@ The kernel validates the header before it trusts any other field. The KRN manife
 After that, the loader calls nothing in the firmware.
 
 ### B6. Entering the kernel
+
+*Since 2026-11-07 (ADR-0004 H4):* the loader builds the first higher-half tables with the shared `origin-paging` layout builder (from a memory map taken after every allocation, with no firmware call during the build), relocates the kernel for its KASLR-chosen virtual base, and enters through a naked stub that sets EFER.NXE and CR0.WP, loads CR3, switches to the direct-map stack and calls the virtual entry. The stub's own pages are mapped at their identity address in those tables; the kernel's own tables, built next, drop them. The bullets below describe the original identity-mapped entry.
+
 - `cli`; RSP set to the 16-byte-aligned top of the kernel stack; RBP cleared.
 - Then `call entry`, with RDI holding the boot-info address. That is the System V convention (`extern "sysv64"`), explicit in the assembly because the loader itself is built for the Microsoft x64 ABI.
 - The firmware's identity mapping stays active. The kernel then installs its own page tables (M2, done 2026-11-07): it sets EFER.NXE and CR0.WP and loads CR3, then proves the protections with four deliberate faults: a write to code, a write to read-only data, a fetch from writable data and a read of page 0.

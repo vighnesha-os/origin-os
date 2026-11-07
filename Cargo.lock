@@ -61,6 +61,7 @@ dependencies = [
  "onbf-merkle",
  "origin-boot-info",
  "origin-crypto",
+ "origin-paging",
  "origin-version",
 ]
 
@@ -71,6 +72,9 @@ version = "0.0.0"
 [[package]]
 name = "origin-paging"
 version = "0.0.0"
+dependencies = [
+ "origin-boot-info",
+]
 
 [[package]]
 name = "origin-sync"

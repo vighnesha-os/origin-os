@@ -44,8 +44,16 @@ pub fn write_report<W: Write>(out: &mut W, info: &BootInfo, memory: &MemorySumma
     )?;
     writeln!(
         out,
-        "{PREFIX}loaded at {:#x}, span {:#x} bytes",
-        info.kernel_base, info.kernel_span
+        "{PREFIX}loaded at {:#x} (physical {:#x}), span {:#x} bytes; direct map at {:#x}{}",
+        info.kernel_virtual_base,
+        info.kernel_base,
+        info.kernel_span,
+        info.direct_map_base,
+        if info.flags & origin_boot_info::FLAG_KASLR != 0 {
+            " (KASLR)"
+        } else {
+            ""
+        }
     )?;
     if info.acpi_rsdp == 0 {
         writeln!(out, "{PREFIX}no ACPI RSDP")?;
@@ -88,7 +96,7 @@ mod tests {
             magic: MAGIC,
             version_major: VERSION.0,
             version_minor: VERSION.1,
-            size: 96,
+            size: 128,
             regions: 0x8000,
             region_count: 42,
             kernel_base: 0x7e5_0000,
@@ -99,6 +107,10 @@ mod tests {
             stack_size: 0x1_0000,
             kernel_segments: 0x9000,
             kernel_segment_count: 3,
+            page_table_root: 0x9_0000,
+            direct_map_base: 0xFFFF_8000_0000_0000,
+            kernel_virtual_base: 0xFFFF_FFFF_8000_0000,
+            flags: 1,
         }
     }
 
@@ -112,7 +124,7 @@ mod tests {
         let expected = format!(
             "origin-kernel: {} {} Framekernel (build {})\n\
              origin-kernel: boot info {}.{}, 42 memory regions, 2014 MiB usable\n\
-             origin-kernel: loaded at 0x7e50000, span 0x13000 bytes\n\
+             origin-kernel: loaded at 0xffffffff80000000 (physical 0x7e50000), span 0x13000 bytes; direct map at 0xffff800000000000 (KASLR)\n\
              origin-kernel: ACPI RSDP at 0x7fb7e014\n",
             origin_version::PRODUCT,
             origin_version::VERSION,

@@ -26,9 +26,10 @@ pub(crate) fn root() -> Option<u64> {
     crate::cpu::without_interrupts(|| KERNEL_SPACE.lock().as_ref().map(|k| k.space.root()))
 }
 
-/// Maps, read-only and never executable, every page of `[addr, addr + len)` that is not
-/// mapped yet (identity). Pages already mapped keep their mapping.
-pub(crate) fn map_readonly(addr: u64, len: u64) -> Result<(), MapError> {
+/// Makes physical `[addr, addr + len)` readable at its direct-map address: pages not mapped
+/// yet are mapped read-only and never executable; mapped pages keep their mapping.
+/// Returns the direct-map address of `addr`.
+pub(crate) fn map_firmware(addr: u64, len: u64) -> Result<u64, MapError> {
     crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
@@ -36,29 +37,14 @@ pub(crate) fn map_readonly(addr: u64, len: u64) -> Result<(), MapError> {
         let end = addr.checked_add(len).ok_or(MapError::Overflow)?;
         let mut page = first;
         while page < end {
-            if k.space.translate(&k.tables, page).is_none() {
+            let virt = crate::phys::to_virt(page);
+            if k.space.translate(&k.tables, virt).is_none() {
                 k.space
-                    .map(&mut k.tables, page, page, Attributes::kernel(Access::Read))?;
+                    .map(&mut k.tables, virt, page, Attributes::kernel(Access::Read))?;
             }
             page += PAGE;
         }
-        Ok(())
-    })
-}
-
-/// Gives the 4 KiB identity page at `page` the access `access`, and flushes its TLB entry.
-pub(crate) fn set_access(page: u64, access: Access) -> Result<(), MapError> {
-    crate::cpu::without_interrupts(|| {
-        let mut guard = KERNEL_SPACE.lock();
-        let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
-        let phys = k.space.unmap(&mut k.tables, page)?;
-        let result = k
-            .space
-            .map(&mut k.tables, page, phys, Attributes::kernel(access));
-        // SAFETY: `invlpg` only drops this processor's cached translation for `page`; the next
-        // access walks the tables just edited.
-        unsafe { asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags)) };
-        result
+        Ok(crate::phys::to_virt(addr))
     })
 }
 
@@ -124,7 +110,7 @@ pub(crate) fn unguard(page: u64) -> Result<(), MapError> {
         k.space.map(
             &mut k.tables,
             page,
-            page,
+            crate::phys::to_phys(page),
             Attributes::kernel(Access::ReadWrite),
         )
     })
@@ -151,5 +137,26 @@ pub(crate) fn user_readable(addr: u64, len: u64) -> bool {
             page += PAGE;
         }
         true
+    })
+}
+
+/// Maps the 4 KiB page at physical `page` at its identity address (the lower half) with
+/// `access`: only for the AP trampoline, which runs there while paging comes on.
+pub(crate) fn map_identity(page: u64, access: Access) -> Result<(), MapError> {
+    crate::cpu::without_interrupts(|| {
+        let mut guard = KERNEL_SPACE.lock();
+        let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
+        k.space
+            .map(&mut k.tables, page, page, Attributes::kernel(access))
+    })
+}
+
+/// Whether `virt` is mapped in the live address space.
+pub(crate) fn is_mapped(virt: u64) -> bool {
+    crate::cpu::without_interrupts(|| {
+        KERNEL_SPACE
+            .lock()
+            .as_ref()
+            .is_some_and(|k| k.space.translate(&k.tables, virt).is_some())
     })
 }

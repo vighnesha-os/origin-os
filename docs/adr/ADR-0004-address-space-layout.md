@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-07, as proposed (H1–H5, and the recommended answer to each of the four questions below). Implementation in progress. |
+| Status | **Accepted** by the owner on 2026-11-07, as proposed (H1–H5, and the recommended answer to each of the four questions below). **H1–H4 implemented the same day** (boot info 0.3; loader-built tables; KASLR from RDSEED/RDRAND; the kernel in the higher half with its own tables). H5's global pages and PCIDs are not done yet. |
 | Supersedes | ADR-0003 K2's identity mapping, once implemented |
 | Related | ADR-0002 B3 (KASLR deferred to here), B4 (boot info), ADR-0003 K2, K8 |
 

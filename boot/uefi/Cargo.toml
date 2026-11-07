@@ -27,6 +27,7 @@ origin-boot-info.workspace = true
 onbf-format.workspace = true
 origin-crypto.workspace = true
 onbf-merkle = { path = "../../runtime/onbf/merkle" }
+origin-paging = { path = "../../framekernel/paging" }
 
 [lints]
 workspace = true

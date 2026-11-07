@@ -21,7 +21,7 @@ use core::panic::PanicInfo;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use origin_boot_info::{BootInfo, KernelSegment, MAX_KERNEL_SEGMENTS, MemoryRegion};
+use origin_boot_info::{BootInfo, FLAG_KASLR, KernelSegment, MAX_KERNEL_SEGMENTS, MemoryRegion};
 use origin_boot_uefi::console::ConOut;
 use origin_boot_uefi::protocols::{
     ACPI_20_TABLE, ALLOCATE_ANY_PAGES, BOOT_SERVICES_SIGNATURE, BootServices, ConfigurationTable,
@@ -33,6 +33,8 @@ use origin_boot_uefi::uefi::{
     self, Handle, Revision, SimpleTextOutputProtocol, Status, SystemTable, TableHeader,
 };
 use origin_boot_uefi::{kernel, memmap, place};
+use origin_paging::layout::{self, Placement};
+use origin_paging::{Access, Attributes, Table, TablePool};
 
 /// The console the panic handler writes to. Set once the system table is validated, and
 /// cleared just before `ExitBootServices` (ADR-0002 B5).
@@ -46,6 +48,8 @@ const KERNEL_PATH: &str = "\\EFI\\ORIGIN\\KERNEL.ONBF";
 const MAX_KERNEL_FILE: u64 = 64 << 20;
 /// Kernel stack: 64 KiB.
 const STACK_PAGES: usize = 16;
+/// Frames for the first page tables the loader builds (ADR-0004 H4).
+const TABLE_POOL_PAGES: usize = 256;
 /// Extra memory-map descriptors to allow for allocations made after the size probe.
 const MAP_SLACK: usize = 32;
 const PAGE: usize = 4096;
@@ -185,7 +189,12 @@ fn boot(
             span_bytes,
         )
     };
-    let relocations = place::place(&v.image, dest, base).map_err(|e| {
+    // ADR-0004 H3: the kernel's virtual slot is chosen now, because the relocations depend
+    // on it; the direct-map slot waits for the memory map.
+    let entropy = entropy();
+    let random = entropy.map_or(0, |(r, _)| r);
+    let (_, kernel_virtual) = layout::place(random, 0, span).ok_or(Status::LOAD_ERROR)?;
+    let relocations = place::place(&v.image, dest, kernel_virtual).map_err(|e| {
         fail(
             out,
             Status::LOAD_ERROR,
@@ -194,9 +203,9 @@ fn boot(
     })?;
     let _ = writeln!(
         out,
-        "origin-boot: kernel placed at {base:#x} ({span_pages} pages, {relocations} relocations)"
+        "origin-boot: kernel placed at {base:#x}, virtual {kernel_virtual:#x} ({span_pages} pages, {relocations} relocations)"
     );
-    let entry = base
+    let entry = kernel_virtual
         .checked_add(v.manifest.entry)
         .ok_or(Status::LOAD_ERROR)?;
 
@@ -247,13 +256,9 @@ fn boot(
             format_args!("cannot allocate the memory-map buffer"),
         )
     })?;
+    let pool_phys = allocate(&bs, memory_type::LOADER_DATA, TABLE_POOL_PAGES)
+        .map_err(|s| fail(out, s, format_args!("cannot allocate the page-table pool")))?;
     let rsdp = find_rsdp(st);
-
-    let _ = writeln!(
-        out,
-        "origin-boot: exiting boot services; entering the Framekernel"
-    );
-    PANIC_CONSOLE.store(ptr::null_mut(), Ordering::Release);
 
     // B5: final memory map, translation, ExitBootServices (one retry, UEFI 2.11 §7.4).
     // Layout: BootInfo, then MAX_KERNEL_SEGMENTS segment slots, then the region array.
@@ -287,6 +292,112 @@ fn boot(
     };
     let get_map = bs.get_memory_map.ok_or(Status::UNSUPPORTED)?;
     let exit = bs.exit_boot_services.ok_or(Status::UNSUPPORTED)?;
+
+    // ADR-0004 H4: the first higher-half tables, from a memory map taken now (everything
+    // the kernel needs is already allocated, and building the tables calls no firmware).
+    if !nx_supported() {
+        return Err(fail(
+            out,
+            Status::UNSUPPORTED,
+            format_args!("the processor has no NX bit"),
+        ));
+    }
+    let (root, direct_map_base, table_count) = {
+        let mut size = map.len();
+        let (mut key, mut dsize, mut dversion) = (0usize, 0usize, 0u32);
+        // SAFETY: as for the final `GetMemoryMap` below.
+        let status = unsafe {
+            get_map(
+                &mut size,
+                map.as_mut_ptr(),
+                &mut key,
+                &mut dsize,
+                &mut dversion,
+            )
+        };
+        if status.is_error() {
+            return Err(fail(
+                out,
+                status,
+                format_args!("GetMemoryMap failed: {status:?}"),
+            ));
+        }
+        let raw = map.get(..size).unwrap_or(&[]);
+        let n = memmap::translate(raw, dsize, regions)
+            .and_then(|n| {
+                memmap::carve(
+                    regions,
+                    n,
+                    base,
+                    span_pages as u64,
+                    origin_boot_info::RegionKind::KernelImage,
+                )
+            })
+            .map_err(|e| {
+                fail(
+                    out,
+                    Status::LOAD_ERROR,
+                    format_args!("memory map rejected: {e:?}"),
+                )
+            })?;
+        let regions = regions.get(..n).unwrap_or(&[]);
+        let max_physical = regions
+            .iter()
+            .filter(|r| layout::direct_mapped(r.kind))
+            .map(|r| r.base + r.pages * PAGE as u64)
+            .max()
+            .unwrap_or(0);
+        let (direct, _) =
+            layout::place(random, max_physical, span).ok_or(Status::OUT_OF_RESOURCES)?;
+        // SAFETY: `allocate` zeroed `TABLE_POOL_PAGES` identity-mapped pages at `pool_phys`
+        // that only this pool uses; `Table` is 4 KiB of `AtomicU64`, valid for any bits.
+        let tables = unsafe {
+            core::slice::from_raw_parts(
+                ptr::with_exposed_provenance::<Table>(pool_phys as usize),
+                TABLE_POOL_PAGES,
+            )
+        };
+        let mut pool = TablePool::new(tables, pool_phys);
+        let at = Placement {
+            direct_map_base: direct,
+            kernel_virtual_base: kernel_virtual,
+            kernel_physical_base: base,
+            stack_guard: stack - PAGE as u64,
+        };
+        let (mut space, stats) = layout::build(&mut pool, &at, regions, segments)
+            .map_err(|e| fail(out, Status::LOAD_ERROR, format_args!("page tables: {e:?}")))?;
+        // The entry stub runs its last instructions after loading CR3: map its pages at
+        // their identity address, read/execute, in the new tables.
+        let stub = (enter_kernel as *const ()).addr() as u64 & !(PAGE as u64 - 1);
+        for page in [stub, stub + PAGE as u64] {
+            space
+                .map(
+                    &mut pool,
+                    page,
+                    page,
+                    Attributes::kernel(Access::ReadExecute),
+                )
+                .map_err(|e| fail(out, Status::LOAD_ERROR, format_args!("entry stub: {e:?}")))?;
+        }
+        let _ = writeln!(
+            out,
+            "origin-boot: KASLR: kernel at {kernel_virtual:#x}, direct map at {direct:#x} ({})",
+            entropy.map_or("no entropy source: fixed placement", |(_, src)| src)
+        );
+        let _ = writeln!(
+            out,
+            "origin-boot: page tables built: {} tables, {} MiB direct map",
+            pool.used(),
+            stats.direct_bytes >> 20
+        );
+        (space.root(), direct, pool.used())
+    };
+    let _ = table_count;
+    let _ = writeln!(
+        out,
+        "origin-boot: exiting boot services; entering the Framekernel"
+    );
+    PANIC_CONSOLE.store(ptr::null_mut(), Ordering::Release);
     let mut last = Status::INVALID_PARAMETER;
     for _attempt in 0..2 {
         let mut size = map.len();
@@ -350,6 +461,10 @@ fn boot(
             stack_size: (STACK_PAGES * PAGE) as u64,
             kernel_segments: segments_addr,
             kernel_segment_count: segment_count as u64,
+            page_table_root: root,
+            direct_map_base,
+            kernel_virtual_base: kernel_virtual,
+            flags: if entropy.is_some() { FLAG_KASLR } else { 0 },
         };
         // SAFETY: `info_addr` is the start of this loader's zeroed, 4 KiB-aligned boot-info
         // allocation, large enough for a `BootInfo`.
@@ -358,11 +473,14 @@ fn boot(
         // just obtained; nothing has been allocated since `GetMemoryMap`.
         last = unsafe { exit(image, key) };
         if !last.is_error() {
-            let stack_top = stack + (STACK_PAGES * PAGE) as u64;
-            // SAFETY: boot services have exited; `entry` is the verified entry point inside
-            // the placed RX segment (ADR-0002 B2, B3); `stack_top` is the 16-byte-aligned
-            // top of the kernel stack; `info_addr` holds a complete `BootInfo`.
-            unsafe { enter_kernel(entry, info_addr, stack_top) }
+            let stack_top = direct_map_base + stack + (STACK_PAGES * PAGE) as u64;
+            // SAFETY: boot services have exited; `root` holds complete tables that map the
+            // kernel image at `kernel_virtual` (so `entry`, the verified entry point inside
+            // its RX segment, ADR-0002 B2), the stack and the boot info in the direct map,
+            // and the entry stub at its identity address; `stack_top` is 16-byte aligned.
+            unsafe {
+                enter_kernel(entry, direct_map_base + info_addr, stack_top, root);
+            }
         }
         if last != Status::INVALID_PARAMETER {
             break;
@@ -570,34 +688,99 @@ fn find_rsdp(st: &SystemTable) -> u64 {
     0
 }
 
-/// Enters the kernel: interrupts off, the kernel stack, `call entry` with `rdi` = boot info
-/// (System V, ADR-0002 B6). Halts if the kernel ever returns.
+/// Enters the kernel (ADR-0002 B6, ADR-0004 H4): interrupts off; EFER.NXE and CR0.WP on;
+/// the loader-built tables in CR3; the kernel stack; `call entry` with RDI = boot info
+/// (System V). Halts if the kernel ever returns. Naked, so its whole body is this code,
+/// which the new tables map at its identity address.
 ///
 /// # Safety
 ///
-/// Boot services must have exited. `entry` must be the verified entry point of the placed
-/// kernel, `stack_top` the 16-byte-aligned top of its stack, and `boot_info` the address of
-/// a complete `BootInfo`.
-unsafe fn enter_kernel(entry: u64, boot_info: u64, stack_top: u64) -> ! {
-    // SAFETY: the caller guarantees the preconditions. The sequence never returns: the
-    // stack is replaced, and a `hlt` loop follows the call.
+/// Boot services must have exited and NX must be supported. `cr3` must hold complete tables
+/// that map this function's pages at their identity address, `entry` (the kernel's verified
+/// entry point), `stack_top` (16-byte aligned) and `boot_info` (a complete `BootInfo`).
+#[unsafe(naked)]
+unsafe extern "sysv64" fn enter_kernel(entry: u64, boot_info: u64, stack_top: u64, cr3: u64) -> ! {
+    core::arch::naked_asm!(
+        "cli",
+        "cld",
+        "mov r8, rcx",
+        "mov r9, rdx",
+        "mov r10, rdi",
+        "mov r11, rsi",
+        "mov ecx, 0xC0000080",
+        "rdmsr",
+        "or eax, 0x800",
+        "wrmsr",
+        "mov rax, cr0",
+        "or rax, 0x10000",
+        "mov cr0, rax",
+        "mov cr3, r8",
+        "mov rsp, r9",
+        "xor ebp, ebp",
+        "mov rdi, r11",
+        "call r10",
+        "2:",
+        "cli",
+        "hlt",
+        "jmp 2b",
+    );
+}
+
+/// CPUID `leaf`, sub-leaf 0: `[eax, ebx, ecx, edx]`.
+fn cpuid(leaf: u32) -> [u32; 4] {
+    let (eax, ebx, ecx, edx): (u32, u32, u32, u32);
+    // SAFETY: CPUID is available on every x86-64 processor and reads no memory; RBX is
+    // reserved by LLVM, so it is moved out through another register and restored.
     unsafe {
         core::arch::asm!(
-            "cli",
-            "cld",
-            "mov rsp, {stack}",
-            "xor ebp, ebp",
-            "call {entry}",
-            "2:",
-            "cli",
-            "hlt",
-            "jmp 2b",
-            stack = in(reg) stack_top,
-            entry = in(reg) entry,
-            in("rdi") boot_info,
-            options(noreturn),
-        )
+            "mov {save:r}, rbx",
+            "cpuid",
+            "xchg {save:r}, rbx",
+            save = out(reg) ebx,
+            inout("eax") leaf => eax,
+            inout("ecx") 0u32 => ecx,
+            out("edx") edx,
+            options(nomem, nostack, preserves_flags),
+        );
     }
+    [eax, ebx, ecx, edx]
+}
+
+/// Whether the processor supports the execute-disable bit.
+fn nx_supported() -> bool {
+    cpuid(0x8000_0000)[0] >= 0x8000_0001 && cpuid(0x8000_0001)[3] & (1 << 20) != 0
+}
+
+/// 64 random bits for KASLR (ADR-0004 H3): RDSEED, else RDRAND, else `None` (the kernel is
+/// then placed at the windows' starts and the boot info says so).
+fn entropy() -> Option<(u64, &'static str)> {
+    let rdseed = cpuid(0)[0] >= 7 && cpuid(7)[1] & (1 << 18) != 0;
+    let rdrand = cpuid(1)[2] & (1 << 30) != 0;
+    for _ in 0..64 {
+        if rdseed {
+            let (value, ok): (u64, u8);
+            // SAFETY: RDSEED is supported (checked); it writes only its operand and CF.
+            unsafe {
+                core::arch::asm!("rdseed {v}", "setc {ok}", v = out(reg) value, ok = out(reg_byte) ok, options(nomem, nostack))
+            };
+            if ok == 1 {
+                return Some((value, "RDSEED"));
+            }
+        }
+    }
+    for _ in 0..16 {
+        if rdrand {
+            let (value, ok): (u64, u8);
+            // SAFETY: RDRAND is supported (checked); it writes only its operand and CF.
+            unsafe {
+                core::arch::asm!("rdrand {v}", "setc {ok}", v = out(reg) value, ok = out(reg_byte) ok, options(nomem, nostack))
+            };
+            if ok == 1 {
+                return Some((value, "RDRAND"));
+            }
+        }
+    }
+    None
 }
 
 #[panic_handler]

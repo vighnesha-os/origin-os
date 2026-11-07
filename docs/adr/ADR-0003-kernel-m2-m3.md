@@ -18,6 +18,9 @@ M2 needs the kernel to own its CPU tables, memory and interrupts; M3 needs real 
 *Alternatives:* a single crate with `unsafe` throughout (less testable); a separate HAL crate (premature).
 
 ### K2. Address space: identity mapping with exact permissions, until a higher-half ADR
+
+*Superseded on 2026-11-07 by ADR-0004 (accepted and implemented): the kernel now runs in the higher half with a direct map; the permission rules below carry over unchanged.*
+
 The kernel keeps virtual = physical, but in its own tables: each kernel segment with the access the signed ONBF segment table declares (boot info 0.2), a read/write never-executable direct map of the RAM the kernel may touch, page 0 and everything else unmapped, no alias of kernel code. EFER.NXE, CR0.WP, and on every CPU CR4.SMEP and CR4.SMAP. Guard pages below every thread and AP stack.
 *Alternatives:* higher-half kernel with KASLR now (needs loader-built tables and a virtual layout decision: deferred to its own ADR, ADR-0002 B3); 1 GiB direct-map pages (fewer tables, but coarser holes).
 *Consequence:* user address spaces (M4) must take the lower half away from the identity map; that migration is the higher-half ADR.

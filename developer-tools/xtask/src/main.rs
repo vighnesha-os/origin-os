@@ -113,6 +113,8 @@ fn boot_scenario_markers() -> Scenario {
             "origin-boot: developer mode: unsigned kernel images are accepted".into(),
             "origin-boot: kernel verified: ".into(),
             "origin-boot: kernel placed at ".into(),
+            "origin-boot: KASLR: kernel at 0xffffffff".into(),
+            "origin-boot: page tables built: ".into(),
             "origin-boot: exiting boot services; entering the Framekernel".into(),
             format!("origin-kernel: {PRODUCT} {VERSION} Framekernel (build {BUILD})"),
             format!(
@@ -130,6 +132,7 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: breakpoint handled; resuming".into(),
             "origin-kernel: frame allocator: ".into(),
             "origin-kernel: page tables loaded: ".into(),
+            "origin-kernel: higher half: kernel image identity address mapped false, direct-map alias mapped false".into(),
             "origin-kernel: page protection: write to kernel code at ".into(),
             "faulted (#PF error 0x3)".into(),
             "origin-kernel: page protection: write to read-only kernel data at ".into(),
@@ -150,7 +153,9 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: NMI taken on its own stack (IST2): frame at ".into(),
             // M3: every processor QEMU emulates (`-smp`, see `qemu_cpus`) comes online.
             format!("origin-kernel: ACPI MADT: {cpus} processors, {cpus} enabled"),
-            format!("origin-kernel: SMP: {cpus} of {cpus} enabled processors online"),
+            format!(
+                "origin-kernel: SMP: {cpus} of {cpus} enabled processors online; trampoline identity pages removed true"
+            ),
             "origin-kernel: reclaimed ".into(),
             "origin-kernel: page protection: stack guard page at ".into(),
             // M3: two non-yielding threads per processor, all preempted and all running.
@@ -206,6 +211,7 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: cannot map the user probe page",
             ": user isolation failed",
             ": NMI stack failed",
+            ": higher half failed",
         ],
     }
 }

@@ -287,8 +287,9 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool
             SYSCALLER.len(),
         )
     };
-    let mapped = vm::map_user(CODE, code.expose_provenance() as u64, Access::ReadExecute)
-        .and_then(|()| vm::map_user(STACK, stack.expose_provenance() as u64, Access::ReadWrite));
+    let phys = |p: *mut u8| crate::phys::to_phys(p.expose_provenance() as u64);
+    let mapped = vm::map_user(CODE, phys(code), Access::ReadExecute)
+        .and_then(|()| vm::map_user(STACK, phys(stack), Access::ReadWrite));
     let mut ok = mapped.is_ok();
     if ok {
         let cases: [Case; 3] = [

@@ -117,11 +117,17 @@ pub struct KernelSegment {
 /// Upper bound on `kernel_segment_count`.
 pub const MAX_KERNEL_SEGMENTS: u64 = 16;
 
+/// [`BootInfo::flags`]: the kernel image and direct-map bases were randomized (KASLR,
+/// ADR-0004 H3). Clear when the processor offered no entropy source.
+pub const FLAG_KASLR: u64 = 1;
+
 /// Everything the kernel learns from the loader.
 ///
-/// All addresses are physical. In version 0.x the kernel starts with the firmware's
-/// identity mapping still active, so physical addresses are directly usable until the
-/// kernel installs its own page tables (ADR-0002).
+/// Since 0.3 (ADR-0004) the kernel starts at its higher-half virtual address on page
+/// tables the loader built: `kernel_virtual_base` maps the image, `direct_map_base +
+/// physical` maps the RAM the kernel may touch. The boot-info pointer in RDI and the
+/// initial RSP are direct-map addresses; every address field below is **physical** unless
+/// its documentation says otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct BootInfo {
@@ -155,6 +161,15 @@ pub struct BootInfo {
     pub kernel_segments: u64,
     /// Number of entries at `kernel_segments`, between 1 and [`MAX_KERNEL_SEGMENTS`].
     pub kernel_segment_count: u64,
+    /// Physical address of the PML4 the loader built and loaded into CR3 (0.3).
+    pub page_table_root: u64,
+    /// Virtual address of physical address 0 in the direct map (0.3).
+    pub direct_map_base: u64,
+    /// Virtual address of the kernel image's RVA 0 (0.3); `kernel_base` is its physical
+    /// address.
+    pub kernel_virtual_base: u64,
+    /// [`FLAG_KASLR`] and reserved zero bits (0.3).
+    pub flags: u64,
 }
 
 // The ABI layout; a change here is a boot-info major version change.
@@ -169,7 +184,11 @@ const _: () = {
     assert!(offset_of!(BootInfo, stack_size) == 72);
     assert!(offset_of!(BootInfo, kernel_segments) == 80);
     assert!(offset_of!(BootInfo, kernel_segment_count) == 88);
-    assert!(size_of::<BootInfo>() == 96);
+    assert!(offset_of!(BootInfo, page_table_root) == 96);
+    assert!(offset_of!(BootInfo, direct_map_base) == 104);
+    assert!(offset_of!(BootInfo, kernel_virtual_base) == 112);
+    assert!(offset_of!(BootInfo, flags) == 120);
+    assert!(size_of::<BootInfo>() == 128);
     assert!(size_of::<KernelSegment>() == 24);
 };
 
@@ -275,6 +294,10 @@ mod tests {
             stack_size: 0x1_0000,
             kernel_segments: 0x1060,
             kernel_segment_count: 3,
+            page_table_root: 0x9_0000,
+            direct_map_base: 0xFFFF_8000_0000_0000,
+            kernel_virtual_base: 0xFFFF_FFFF_8000_0000,
+            flags: FLAG_KASLR,
         }
     }
 
@@ -368,6 +391,6 @@ mod tests {
 
     #[test]
     fn version_comes_from_origin_version_toml() {
-        assert_eq!(VERSION, (0, 2));
+        assert_eq!(VERSION, (0, 3));
     }
 }

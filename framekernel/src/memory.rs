@@ -111,14 +111,14 @@ unsafe impl GlobalAlloc for KernelAllocator {
             m.heap.allocate(&mut Frames(&mut m.frames), size, align)
         });
         match addr {
-            Some(addr) => ptr::with_exposed_provenance_mut(addr as usize),
+            Some(addr) => ptr::with_exposed_provenance_mut(crate::phys::to_virt(addr) as usize),
             None => ptr::null_mut(),
         }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let (size, align) = (layout.size() as u64, layout.align() as u64);
-        let addr = ptr.expose_provenance() as u64;
+        let addr = crate::phys::to_phys(ptr.expose_provenance() as u64);
         let result = without_interrupts(|| {
             let mut guard = MEMORY.lock();
             match guard.as_mut() {

@@ -7,8 +7,8 @@
 //!
 //! 1. The processors come from the ACPI MADT (`framekernel::acpi`), so only enabled
 //!    processors are started; nothing is broadcast.
-//! 2. A trampoline is copied to [`TRAMPOLINE`] (frames reserved at boot), whose page is then
-//!    remapped read/execute; its mutable data (a 32/64-bit GDT, CR3, the stack, the entry
+//! 2. A trampoline is copied to [`TRAMPOLINE`] (frames reserved at boot), whose page is
+//!    mapped at its identity address read/execute while APs start; its mutable data (a 32/64-bit GDT, CR3, the stack, the entry
 //!    and its argument) lives in the separate read/write page [`TRAMPOLINE_DATA`]. The GDT
 //!    descriptors are pre-marked accessed, so loading them never writes. So W^X holds even
 //!    while an AP starts.
@@ -232,17 +232,21 @@ pub(crate) fn start(
             }
         }
     }
-    if let Err(e) = vm::set_access(TRAMPOLINE, Access::ReadWrite) {
+    // The identity mappings go: the lower half belongs to user space (ADR-0004 H1).
+    if let Err(e) = vm::unmap(TRAMPOLINE).and_then(|_| vm::unmap(TRAMPOLINE_DATA)) {
         let _ = writeln!(
             com1,
-            "origin-kernel: trampoline page not restored: {e:?}: AP start-up failed"
+            "origin-kernel: trampoline mappings not removed: {e:?}: AP start-up failed"
         );
     }
     online.complete = online.count == enabled;
+    let leftover = vm::is_mapped(TRAMPOLINE) || vm::is_mapped(TRAMPOLINE_DATA);
     let _ = writeln!(
         com1,
-        "origin-kernel: SMP: {} of {enabled} enabled processors online",
-        online.count
+        "origin-kernel: SMP: {} of {enabled} enabled processors online; trampoline identity pages removed {}{}",
+        online.count,
+        !leftover,
+        if leftover { ": AP start-up failed" } else { "" }
     );
     online
 }
@@ -253,12 +257,12 @@ fn firmware_bytes(addr: u64, len: usize) -> Result<&'static [u8], &'static str> 
     if addr == 0 || addr.checked_add(len as u64).is_none() {
         return Err("bad table address");
     }
-    vm::map_readonly(addr, len as u64).map_err(|_| "cannot map an ACPI table")?;
-    // SAFETY: `[addr, addr + len)` is mapped readable (just ensured), does not wrap, and
-    // holds ACPI tables, which the firmware does not change after boot; `u8` has no
-    // alignment or validity requirement.
+    let virt = vm::map_firmware(addr, len as u64).map_err(|_| "cannot map an ACPI table")?;
+    // SAFETY: `[addr, addr + len)` is readable at its direct-map address `virt` (just
+    // ensured), does not wrap, and holds ACPI tables, which the firmware does not change
+    // after boot; `u8` has no alignment or validity requirement.
     Ok(unsafe {
-        core::slice::from_raw_parts(ptr::with_exposed_provenance::<u8>(addr as usize), len)
+        core::slice::from_raw_parts(ptr::with_exposed_provenance::<u8>(virt as usize), len)
     })
 }
 
@@ -286,7 +290,9 @@ fn discover(rsdp_addr: u64, out: &mut [Processor]) -> Result<usize, &'static str
 
 /// Writes `value` at `offset` in the trampoline data page.
 fn poke(offset: u64, value: u64) {
-    let p = ptr::with_exposed_provenance_mut::<u64>((TRAMPOLINE_DATA + offset) as usize);
+    let p = ptr::with_exposed_provenance_mut::<u64>(
+        crate::phys::to_virt(TRAMPOLINE_DATA + offset) as usize
+    );
     // SAFETY: the data page is a frame reserved at boot for this purpose (`prepare`
     // checked it is usable RAM), mapped read/write by the direct map, and no AP is running
     // the trampoline while the boot processor writes it.
@@ -315,17 +321,21 @@ fn prepare(regions: &[MemoryRegion]) -> Result<(), &'static str> {
         .checked_sub(start)
         .filter(|&l| l as u64 <= PAGE)
         .ok_or("trampoline too large")?;
-    // SAFETY: the source is the trampoline's bytes in the kernel's read-only-or-executable
-    // image (readable); the destination is the reserved trampoline frame, mapped read/write
-    // until `set_access` below; they do not overlap.
+    // SAFETY: the source is the trampoline's bytes in the kernel's executable image
+    // (readable); the destination is the reserved trampoline frame at its direct-map
+    // address (read/write, never executable); they do not overlap.
     unsafe {
         ptr::copy_nonoverlapping(
             ptr::with_exposed_provenance::<u8>(start),
-            ptr::with_exposed_provenance_mut::<u8>(TRAMPOLINE as usize),
+            ptr::with_exposed_provenance_mut::<u8>(crate::phys::to_virt(TRAMPOLINE) as usize),
             len,
         );
     }
-    vm::set_access(TRAMPOLINE, Access::ReadExecute).map_err(|_| "cannot remap the trampoline")?;
+    // While APs start, the two frames also appear at their identity addresses, where the
+    // trampoline runs as paging comes on: code read/execute, data read/write.
+    vm::map_identity(TRAMPOLINE, Access::ReadExecute)
+        .and_then(|()| vm::map_identity(TRAMPOLINE_DATA, Access::ReadWrite))
+        .map_err(|_| "cannot map the trampoline")?;
     // Null, 32-bit code, data, 64-bit code; all pre-marked accessed (type 0x9B / 0x93).
     for (i, d) in [
         0,

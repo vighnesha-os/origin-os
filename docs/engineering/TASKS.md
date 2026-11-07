@@ -35,6 +35,7 @@
 | Thread cleanup | exited threads' stacks reaped on their own CPU | heap back to its pre-spawn size; negative control |
 | `origin-sync` | the spin lock as a freestanding, host-stress-tested crate | 3 multi-thread tests; no-panic check |
 | CPU-local area | GS-based per-CPU data; context-switch cost measured at every boot | ~18 % fewer cycles per switch (QEMU) |
+| Higher half and KASLR | ADR-0004 H1–H4: boot info 0.3, loader-built tables, RDSEED/RDRAND slides, kernel in the higher half | boot-matrix; three distinct placements; fallback boot; negative control |
 | M4 groundwork: user mode | ring 3, one DPL-3 system-call gate and `syscall`, RSP0 per switch, user faults end the thread, NMI/#MC on IST | 5 user-program proofs, a self-NMI proof; four negative controls |
 
 ## In progress
@@ -46,7 +47,7 @@
 ## Next, in order
 
 1. **M3, scheduling proper** (ADR-0003 K7 is the baseline): wait queues and cross-CPU wake-ups by IPI, priorities and a fairness policy (EEVDF to be evaluated, §26), load balancing, a serialized kernel console for multi-CPU output. Pad the per-worker counters (cache-line sharing showed at 4 CPUs).
-2. **Address-space layout (ADR-0004, accepted 2026-11-07):** a shared paging crate; boot info 0.3; the loader builds the higher-half tables with KASLR; the kernel runs high with a direct map and drops the identity map; then M4 (per-process address spaces, process objects, capabilities, IPC).
+2. **M4:** per-process address spaces on the higher-half layout (ADR-0004, implemented 2026-11-07: kernel half shared by every PML4, H2), process objects, capabilities, IPC; global kernel pages and PCIDs (H5).
 3. **Signature block (ONBF §7.1):** S1–S4 decided, parser and `onbf-verify` done (2026-11-07); next: `onbf-pack` signing with a host key, the loader requiring a signed KRN outside developer mode, the trust store and OKC chains, then the trust anchor (B7).
 4. **Formal and concurrency checks:** Loom models for `SpinLock`; Kani bounds for `paging`, `frames` and `heap` (CLAUDE.md §73).
 5. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks.

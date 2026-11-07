@@ -31,13 +31,14 @@ use framekernel::report;
 
 mod cpu;
 mod memory;
+mod phys;
 mod sched;
 mod smp;
 mod timer;
 mod user;
 mod vm;
 use framekernel::frames::{self, FrameAllocator};
-use framekernel::kernel_space;
+use framekernel::paging::layout::{self, Placement};
 use framekernel::paging::{PAGE, Table, TablePool};
 use framekernel::serial::{Register, Uart16550, UartRegisters};
 use origin_boot_info::{
@@ -111,7 +112,7 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         let _ = writeln!(
             com1,
             "origin-kernel: kernel segment {i}: {access} at {:#x}, {} pages",
-            info.kernel_base.wrapping_add(s.rva),
+            info.kernel_virtual_base.wrapping_add(s.rva),
             s.pages
         );
     }
@@ -196,13 +197,13 @@ fn init_paging(
     }
     let mut tables = TablePool::new(pool, pool_base);
     let stack_guard = info.stack_base.wrapping_sub(PAGE);
-    let (space, stats) = match kernel_space::build(
-        &mut tables,
-        info.kernel_base,
-        regions,
-        segments,
+    let at = Placement {
+        direct_map_base: info.direct_map_base,
+        kernel_virtual_base: info.kernel_virtual_base,
+        kernel_physical_base: info.kernel_base,
         stack_guard,
-    ) {
+    };
+    let (space, stats) = match layout::build(&mut tables, &at, regions, segments) {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(com1, "origin-kernel: page tables not built: {e:?}");
@@ -226,7 +227,20 @@ fn init_paging(
         stats.small_pages,
         stats.large_pages
     );
-    prove_protections(com1, info, segments)
+    // ADR-0004: nothing of the kernel is left in the lower half, and its physical pages
+    // have no second mapping in the direct map.
+    let identity = vm::is_mapped(info.kernel_base);
+    let alias = vm::is_mapped(phys::to_virt(info.kernel_base));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: higher half: kernel image identity address mapped {identity}, direct-map alias mapped {alias}{}",
+        if identity || alias {
+            ": higher half failed"
+        } else {
+            ""
+        }
+    );
+    !identity && !alias && prove_protections(com1, info, segments)
 }
 
 /// Deliberate accesses that the new tables must refuse: a write to kernel code, a write to
@@ -242,7 +256,7 @@ fn prove_protections(
         segments
             .iter()
             .find(|s| s.access & want == want && s.access & avoid == 0)
-            .map(|s| info.kernel_base + s.rva)
+            .map(|s| info.kernel_virtual_base + s.rva)
     };
     let (Some(text), Some(rodata)) = (
         first(SEGMENT_EXECUTE, SEGMENT_WRITE),
@@ -278,10 +292,10 @@ fn prove_protections(
         ("read of page 0", 0, 0x0, unsafe { cpu::probe_read(0) }),
         (
             "read of the boot stack's guard page",
-            info.stack_base - PAGE,
+            phys::to_virt(info.stack_base - PAGE),
             0x0,
             // SAFETY: the guard is a RAM page of the KernelStack region, not MMIO.
-            unsafe { cpu::probe_read(info.stack_base - PAGE) },
+            unsafe { cpu::probe_read(phys::to_virt(info.stack_base - PAGE)) },
         ),
     ];
     let mut all = true;
@@ -326,7 +340,7 @@ fn init_memory(
         );
         return None;
     };
-    let bitmap_ptr = ptr::with_exposed_provenance_mut::<u64>(home.base as usize);
+    let bitmap_ptr = ptr::with_exposed_provenance_mut::<u64>(phys::to_virt(home.base) as usize);
     // SAFETY: `home` is a `Usable` region from the validated boot info, so nothing else
     // owns it; the firmware's identity mapping is active, so its physical address is
     // directly writable; it holds at least `pages` pages, which cover the bitmap's `words`
@@ -344,7 +358,7 @@ fn init_memory(
     // do not race with them.
     let pool = unsafe {
         slice::from_raw_parts(
-            ptr::with_exposed_provenance::<Table>(pool_base as usize),
+            ptr::with_exposed_provenance::<Table>(phys::to_virt(pool_base) as usize),
             TABLE_POOL_FRAMES as usize,
         )
     };
@@ -482,7 +496,7 @@ fn prove_user_isolation(com1: &mut Uart16550<Com1>) -> bool {
     unsafe {
         ptr::copy_nonoverlapping(cpu::PROBE_RETURN.as_ptr(), frame, cpu::PROBE_RETURN.len());
     }
-    let phys = frame.expose_provenance() as u64;
+    let phys = phys::to_phys(frame.expose_provenance() as u64);
     let mut ok = true;
     if vm::map_user(
         USER_PROBE_PAGE,
@@ -538,7 +552,7 @@ fn prove_frames(com1: &mut Uart16550<Com1>, alloc: &mut FrameAllocator<'_>) {
             let _ = writeln!(com1, "origin-kernel: frame allocator exhausted");
             return;
         };
-        let p = ptr::with_exposed_provenance_mut::<u64>(addr as usize);
+        let p = ptr::with_exposed_provenance_mut::<u64>(phys::to_virt(addr) as usize);
         let pattern = 0x4F52_4947_494E_0000 | i as u64;
         // SAFETY: the allocator just handed out this usable frame, which the kernel's
         // direct map covers read/write, and nothing else uses it; a volatile write and read
@@ -593,7 +607,11 @@ unsafe fn read_boot_info(boot_info: *const BootInfo) -> Result<BootData, Invalid
     // valid value. The header is copied, so no reference into loader memory is kept.
     let info = unsafe { boot_info.read() };
     let array = boot::validate(&info)?;
-    let first = ptr::with_exposed_provenance::<MemoryRegion>(array.addr);
+    // Boot info 0.3: the arrays are given by physical address; read them through the direct
+    // map the loader built.
+    phys::init(&info);
+    let first =
+        ptr::with_exposed_provenance::<MemoryRegion>(phys::to_virt(array.addr as u64) as usize);
     // SAFETY: `validate` checked that the array is non-null, aligned, at most `isize::MAX`
     // bytes long and does not wrap. The caller's contract makes it readable and unchanging
     // while the slice lives. `MemoryRegion` has only integer fields, so every bit pattern
@@ -601,7 +619,9 @@ unsafe fn read_boot_info(boot_info: *const BootInfo) -> Result<BootData, Invalid
     let regions = unsafe { slice::from_raw_parts(first, array.len) };
     let memory = boot::summarize(regions)?;
     let segment_array = boot::segment_array(&info)?;
-    let first = ptr::with_exposed_provenance::<KernelSegment>(segment_array.addr);
+    let first = ptr::with_exposed_provenance::<KernelSegment>(phys::to_virt(
+        segment_array.addr as u64,
+    ) as usize);
     // SAFETY: as for the regions: `segment_array` checked the layout requirements, the
     // caller's contract makes the memory readable and unchanging, and `KernelSegment` has
     // only integer fields.

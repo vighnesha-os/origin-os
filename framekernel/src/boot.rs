@@ -189,6 +189,10 @@ mod tests {
             stack_size: 0x1_0000,
             kernel_segments: 0x9000,
             kernel_segment_count: 2,
+            page_table_root: 0x9_0000,
+            direct_map_base: 0xFFFF_8000_0000_0000,
+            kernel_virtual_base: 0xFFFF_FFFF_8000_0000,
+            flags: 1,
         }
     }
 

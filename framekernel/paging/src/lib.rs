@@ -19,6 +19,8 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod layout;
+
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Size of a 4 KiB page.
