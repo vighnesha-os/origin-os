@@ -193,6 +193,9 @@ fn boot_scenario_markers() -> Scenario {
             // off-diagonal >= 10.
             "origin-kernel: slit: ".into(),
             "; consistent true".into(),
+            // Hardware entropy from RDSEED/RDRAND: a batch of draws, all distinct and non-zero.
+            "origin-kernel: entropy: ".into(),
+            "; consistent true".into(),
             "origin-kernel: page protection: stack guard page at ".into(),
             // M3: two non-yielding threads per processor, all preempted and all running.
             "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted ".into(),
@@ -382,6 +385,7 @@ fn boot_scenario_markers() -> Scenario {
             ": topology failed",
             ": numa failed",
             ": slit failed",
+            ": entropy failed",
             "supervisor isolation from user pages incomplete",
             "origin-kernel: cannot map the user probe page",
             ": user isolation failed",

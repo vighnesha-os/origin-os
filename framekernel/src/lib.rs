@@ -24,6 +24,7 @@
 //!   TSC rate;
 //! - [`descriptors`]: GDT, TSS and IDT descriptor encodings;
 //! - [`editbuffer`]: a gap buffer for editable text (caret, insert/delete);
+//! - [`entropy`]: bounded-retry hardware entropy draw/fill over an abstract source;
 //! - [`features`]: CPUID feature decoding and the x86-64-v3 baseline;
 //! - [`frames`]: the physical frame allocator over the boot-info regions;
 //! - [`gpt`]: GUID Partition Table validation (both copies, CRC-32) and partitions;
@@ -73,6 +74,7 @@ pub mod channel;
 pub mod clock;
 pub mod descriptors;
 pub mod editbuffer;
+pub mod entropy;
 pub mod features;
 pub mod frames;
 pub mod gpt;
