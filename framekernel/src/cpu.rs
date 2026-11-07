@@ -746,6 +746,35 @@ pub(crate) unsafe fn write_cr3(root: u64) {
     unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
 }
 
+/// The furthest a backtrace reads above the starting frame pointer, and the largest single
+/// frame it will step over.
+const BACKTRACE_SPAN: u64 = 256 * 1024;
+const BACKTRACE_MAX_FRAME: u64 = 64 * 1024;
+
+/// Captures the current call stack's return addresses into `out` (innermost first) by
+/// walking the frame-pointer chain, and returns how many it found. It reads only words in
+/// a bounded window above the starting frame, so a corrupt chain cannot make it fault.
+pub(crate) fn capture_backtrace(out: &mut [u64]) -> usize {
+    let rbp: u64;
+    // SAFETY: reads RBP; no memory, no stack, flags preserved.
+    unsafe { asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack, preserves_flags)) };
+    let base = rbp;
+    framekernel::unwind::walk(
+        rbp,
+        BACKTRACE_MAX_FRAME,
+        |addr| {
+            if addr < base || addr > base.saturating_add(BACKTRACE_SPAN) || addr & 7 != 0 {
+                return None;
+            }
+            let p = ptr::with_exposed_provenance::<u64>(addr as usize);
+            // SAFETY: `addr` is 8-aligned and within `BACKTRACE_SPAN` bytes above the
+            // starting frame pointer, so it lies in the running stack, which is mapped.
+            Some(unsafe { p.read_volatile() })
+        },
+        out,
+    )
+}
+
 /// The time-stamp counter.
 pub(crate) fn rdtsc() -> u64 {
     let (low, high): (u32, u32);

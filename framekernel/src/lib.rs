@@ -35,7 +35,8 @@
 //! - [`runqueue`]: the per-CPU round-robin run queue (scheduler policy);
 //! - [`serial`]: a polled 16550 UART driver over an abstract register interface;
 //! - [`report`]: the exact console text;
-//! - [`rtc`]: CMOS RTC decoding and UTC calendar arithmetic.
+//! - [`rtc`]: CMOS RTC decoding and UTC calendar arithmetic;
+//! - [`unwind`]: frame-pointer stack unwinding for panic diagnostics.
 //!
 //! The binary holds the entry point, x86 port I/O, the descriptor tables, exception and
 //! interrupt stubs, MSR access and fault probes (`src/cpu.rs`), the APIC timer bring-up
@@ -69,3 +70,4 @@ pub mod runqueue;
 pub mod serial;
 #[cfg(test)]
 mod testing;
+pub mod unwind;

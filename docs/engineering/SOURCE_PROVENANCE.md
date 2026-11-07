@@ -526,6 +526,19 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 4 `features` tests (a v3 CPU decoded and graded, levels 1 and 2, absent leaves, the XSAVE-size sanity check); 116 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** lazy FPU (deliberately — eager save/restore is used), the AVX upper halves tested separately from the full XSAVE image, AVX-512 (XCR0 leaves it off), and a per-CPU "FPU used" optimization to skip saving an untouched state.
 
+### Panic diagnostics: a frame-pointer backtrace (CLAUDE.md §69; 2026-11-08)
+
+- **What:**
+  - `unwind` (library): `walk` follows the frame-pointer chain (each frame is `[RBP]` = the caller's RBP, `[RBP + 8]` = the return address), through a caller-supplied word accessor that returns `None` to stop, and halts at a null, unaligned or non-increasing RBP or one more than a bound above the last. Pure, host-tested.
+  - `cpu::capture_backtrace`: reads the current RBP and walks it with an accessor bounded to a 256 KiB window above the starting frame, so a corrupt chain cannot fault.
+  - `_start` is now a tiny naked shim that zeroes RBP, aligns the stack and calls `kernel_main`. So every backtrace (a panic's included) terminates cleanly at `kernel_main` instead of reading the loader's leftover frame.
+  - The panic handler prints the kernel base and the backtrace addresses, which the KASLR base turns into image offsets offline.
+- **Proof** (every boot): a three-deep `#[inline(never)]` call chain whose innermost frame captures a backtrace yields at least four return addresses, every one at or above the kernel image's virtual base.
+- **A bug found and fixed on the way:** the first proof required every captured address to be in a `base .. base + 2 GiB` window, but that upper bound wrapped past the top of the address space for a KASLR base near `0xFFFFFFFF80000000`, making the window empty; and the walk stepped into `_start`'s frame and recorded the loader's leftover word (`0x1e093037`) as a return address. The naked `_start` fixed the second (the chain now ends at `kernel_main`), and the check became "at or above the kernel base".
+- **Negative control** (failing the boot test): the walk's frame-step bound set to 0 so it cannot move between frames → only 1 frame → "backtrace failed".
+- **Test evidence:** 5 `unwind` tests (a clean chain, the chain end, the capacity bound, a wild frame pointer, an unreadable word); 121 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** symbol names (addresses are printed for offline symbolization), DWARF `.eh_frame` unwinding for frame-pointer-less code, and a full crash dump (registers plus stack) to storage.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

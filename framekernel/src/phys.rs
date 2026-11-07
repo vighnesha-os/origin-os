@@ -21,6 +21,11 @@ pub(crate) fn to_virt(phys: u64) -> u64 {
     DIRECT.load(Ordering::Relaxed).wrapping_add(phys)
 }
 
+/// The kernel image's virtual base (0 before `init`).
+pub(crate) fn kernel_virtual_base() -> u64 {
+    KERNEL_VIRTUAL.load(Ordering::Relaxed)
+}
+
 /// The physical address behind a direct-map or kernel-image address.
 pub(crate) fn to_phys(virt: u64) -> u64 {
     let kernel = KERNEL_VIRTUAL.load(Ordering::Relaxed);

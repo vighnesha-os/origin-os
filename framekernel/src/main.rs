@@ -73,16 +73,35 @@ static RELOCATION_TARGET: [u8; 8] = *b"ORIGRELO";
 /// loader applied the image's relocations.
 static RELOCATION_PROBE: &[u8; 8] = &RELOCATION_TARGET;
 
-/// Kernel entry point; the ELF entry.
+/// The ELF entry. A tiny naked shim so every backtrace terminates here: it zeroes RBP (so
+/// the frame-pointer chain ends), aligns the stack, and calls [`kernel_main`] with the boot
+/// info the loader left in RDI. It never returns.
 ///
 /// # Safety
 ///
-/// Only the Origin boot loader may call this, once, under the entry contract in the module
-/// documentation. `boot_info` must be null or the address of a readable `BootInfo` whose
-/// region array, if the header is valid, is readable and is not written while the kernel
-/// runs.
+/// Only the Origin boot loader may jump here, once, under the entry contract in the module
+/// documentation.
 #[unsafe(no_mangle)]
-pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
+#[unsafe(naked)]
+pub unsafe extern "sysv64" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor ebp, ebp",
+        "and rsp, -16",
+        "call {main}",
+        "ud2",
+        main = sym kernel_main,
+    );
+}
+
+/// The kernel's Rust entry, called by [`_start`] with RBP zero and the boot-info pointer in
+/// RDI.
+///
+/// # Safety
+///
+/// Called once by `_start`, under the entry contract in the module documentation.
+/// `boot_info` must be null or the address of a readable `BootInfo` whose region array, if
+/// the header is valid, is readable and is not written while the kernel runs.
+unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // The monotonic clock's zero (CLAUDE.md §68).
     time::mark_entry();
     // SAFETY: the entry contract: CPL 0, boot processor only, interrupts disabled. The
@@ -159,6 +178,7 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         cpu::fpu_area_size(),
         xcr0
     );
+    prove_backtrace(&mut com1, &info);
 
     // M2, second step: the physical frame allocator over the boot-info regions, with a
     // pool of frames for page tables beside its bitmap.
@@ -220,6 +240,39 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
 
     let _ = report::write_halt(&mut com1);
     halt()
+}
+
+/// A three-deep call chain whose innermost frame captures a backtrace; `#[inline(never)]`
+/// so the frames really exist.
+#[inline(never)]
+fn backtrace_c(out: &mut [u64]) -> usize {
+    core::hint::black_box(cpu::capture_backtrace(out))
+}
+#[inline(never)]
+fn backtrace_b(out: &mut [u64]) -> usize {
+    core::hint::black_box(backtrace_c(out))
+}
+#[inline(never)]
+fn backtrace_a(out: &mut [u64]) -> usize {
+    core::hint::black_box(backtrace_b(out))
+}
+
+/// Proves the frame-pointer backtrace (CLAUDE.md §69): a known call chain must produce at
+/// least four return addresses, every one inside the kernel image's 2 GiB virtual window.
+fn prove_backtrace(com1: &mut Console, info: &BootInfo) {
+    let mut frames = [0u64; 16];
+    let n = backtrace_a(&mut frames);
+    let base = info.kernel_virtual_base;
+    // The kernel image occupies the top 2 GiB (ADR-0004 H2), so every return address into
+    // kernel code is at or above its virtual base (the image's first byte).
+    let in_kernel = frames.iter().take(n).all(|&a| a >= base);
+    let ok = n >= 4 && in_kernel;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: backtrace: {n} frames from a known call chain, all in the kernel image {}{}",
+        if in_kernel { "true" } else { "false" },
+        if ok { "" } else { ": backtrace failed" }
+    );
 }
 
 /// Builds the kernel's address space, loads it, and proves its protections on the
@@ -762,6 +815,14 @@ fn panic(info: &PanicInfo) -> ! {
         // still reports; before `console::init` it programs COM1 itself.
         let mut out = console::Console::urgent();
         let _ = report::write_panic(&mut out, info);
+        let mut frames = [0u64; 16];
+        let n = cpu::capture_backtrace(&mut frames);
+        let base = crate::phys::kernel_virtual_base();
+        let _ = write!(out, "origin-kernel: backtrace (kernel base {base:#x}):");
+        for addr in frames.iter().take(n) {
+            let _ = write!(out, " {addr:#x}");
+        }
+        let _ = writeln!(out);
     }
     halt()
 }
