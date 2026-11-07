@@ -217,6 +217,16 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: wait queues: ping-pong between CPU 0 and CPU ".into(),
             ": 1000 round trips, ".into(),
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
+            // M5 groundwork: PCIe through the MCFG, the ECAM window uncached, q35's
+            // functions listed with their BARs sized and restored.
+            "origin-kernel: PCIe: ECAM for segment 0, buses 0-255, at 0x".into(),
+            "mapped at 0xffffe00000000000: uncached true, 2 MiB pages".into(),
+            "origin-kernel: PCIe: 00:00.0 8086:29c0 class 06:00:00 host bridge".into(),
+            "origin-kernel: PCIe: 00:01.0 1234:1111 class 03:00:00 VGA-compatible display controller; BAR0 mem32 prefetchable 16 MiB at ".into(),
+            "origin-kernel: PCIe: 00:1f.0 8086:2918 class 06:01:00 ISA bridge".into(),
+            "origin-kernel: PCIe: 00:1f.2 8086:2922 class 01:06:01 SATA controller (AHCI); BAR4 I/O 32 B at ".into(),
+            "; BAR5 mem32 4 KiB at ".into(),
+            "functions on 1 buses; every BAR sized with decoding off and restored: true".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
         failures: vec![
@@ -259,6 +269,7 @@ fn boot_scenario_markers() -> Scenario {
             ": console failed",
             ": TLB failed",
             ": wait queues failed",
+            ": PCIe failed",
         ],
         check: Some(|text| console_lines_intact(text, qemu_cpus() as usize)),
     }

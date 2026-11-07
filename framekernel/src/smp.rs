@@ -392,6 +392,7 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     let _ = unsafe { cpu::enable_smep_smap() };
     // SAFETY: CPL 0; the kernel's tables mark only the kernel half global.
     let _ = unsafe { crate::tlb::enable_global_pages() };
+    cpu::check_pat();
     if !cpu::x2apic_supported() {
         start.online.store(u32::MAX, Ordering::Release);
         crate::halt();

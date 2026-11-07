@@ -38,6 +38,13 @@ const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
 const LARGE: u64 = 1 << 7;
 const GLOBAL: u64 = 1 << 8;
+/// Page-level write-through and cache-disable: with PAT bit 0, they select PAT entry
+/// `PCD << 1 | PWT` (Intel SDM Vol. 3A §11.12.3).
+const PWT: u64 = 1 << 3;
+const PCD: u64 = 1 << 4;
+/// The PAT bit of a 4 KiB leaf, and of a 2 MiB leaf (where bit 7 means "large").
+const PAT_SMALL: u64 = 1 << 7;
+const PAT_LARGE: u64 = 1 << 12;
 const NO_EXECUTE: u64 = 1 << 63;
 /// Physical-address bits 51:12 of an entry.
 const ADDRESS: u64 = 0x000F_FFFF_FFFF_F000;
@@ -55,7 +62,17 @@ pub enum Access {
     ReadExecute,
 }
 
-/// A leaf mapping's attributes. Caching is write-back (PAT index 0) for now.
+/// How a mapping is cached, as a PAT entry. The kernel programs the PAT so entry 0 is
+/// write-back and entry 3 uncached (the architectural reset values) on every processor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cache {
+    /// PAT entry 0: write-back, for RAM.
+    WriteBack,
+    /// PAT entry 3 (PCD and PWT): uncached, for device registers (MMIO).
+    Uncached,
+}
+
+/// A leaf mapping's attributes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Attributes {
     /// Permissions.
@@ -64,6 +81,8 @@ pub struct Attributes {
     pub user: bool,
     /// Kept in the TLB across CR3 loads (kernel mappings every address space shares).
     pub global: bool,
+    /// Memory type.
+    pub cache: Cache,
 }
 
 impl Attributes {
@@ -73,6 +92,7 @@ impl Attributes {
             access,
             user: false,
             global: false,
+            cache: Cache::WriteBack,
         }
     }
 
@@ -84,6 +104,18 @@ impl Attributes {
             access,
             user: false,
             global: true,
+            cache: Cache::WriteBack,
+        }
+    }
+
+    /// Device registers: supervisor-only, read/write, never executable, uncached and
+    /// global (the MMIO window is in the kernel half).
+    pub const fn mmio() -> Self {
+        Self {
+            access: Access::ReadWrite,
+            user: false,
+            global: true,
+            cache: Cache::Uncached,
         }
     }
 
@@ -95,7 +127,11 @@ impl Attributes {
         };
         let user = if self.user { USER } else { 0 };
         let global = if self.global { GLOBAL } else { 0 };
-        PRESENT | access | user | global
+        let cache = match self.cache {
+            Cache::WriteBack => 0,
+            Cache::Uncached => PCD | PWT,
+        };
+        PRESENT | access | user | global | cache
     }
 }
 
@@ -114,6 +150,8 @@ pub struct Translation {
     pub user: bool,
     /// Global: kept in the TLB across CR3 loads while CR4.PGE is set.
     pub global: bool,
+    /// PCD and PWT both set (PAT entry 3, uncached, with the kernel's PAT).
+    pub uncached: bool,
 }
 
 /// Present leaves of an address space, by half and by the global bit.
@@ -322,6 +360,7 @@ impl AddressSpace {
             access,
             user: true,
             global: false,
+            cache: Cache::WriteBack,
         };
         self.map(mem, virt, phys, attributes)
     }
@@ -482,6 +521,7 @@ impl AddressSpace {
             executable: value & NO_EXECUTE == 0,
             user: value & USER != 0,
             global: value & GLOBAL != 0,
+            uncached: value & (PCD | PWT) == PCD | PWT,
         })
     }
 
@@ -513,7 +553,10 @@ impl AddressSpace {
         }
         let value = entry.load(Ordering::Relaxed);
         let base = value & ADDRESS & !(LARGE_PAGE - 1);
-        let flags = value & (PRESENT | WRITABLE | USER | GLOBAL | NO_EXECUTE);
+        // Everything but the address, the large bit and the large page's PAT bit, which a
+        // 4 KiB leaf holds at bit 7 instead: the pieces keep the memory type too.
+        let pat = if value & PAT_LARGE != 0 { PAT_SMALL } else { 0 };
+        let flags = value & (PRESENT | WRITABLE | USER | GLOBAL | NO_EXECUTE | PWT | PCD) | pat;
         let table = mem.allocate_table().ok_or(MapError::OutOfMemory)?;
         let entries = mem.table(table).ok_or(MapError::UnknownTable(table))?;
         for (i, e) in entries.iter().enumerate() {
@@ -590,6 +633,53 @@ mod tests {
         assert_eq!(mem.allocate_table(), Some(ARENA_BASE + 2 * PAGE));
         assert_eq!(mem.allocate_table(), None);
         assert_eq!((mem.used(), mem.remaining()), (3, 0));
+    }
+
+    #[test]
+    fn mmio_mappings_are_uncached_and_keep_it_when_split() {
+        let tables = arena(16);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        let high = 0xFFFF_E000_0000_0000;
+        space
+            .map_large(&mut mem, high, 0xB000_0000, Attributes::mmio())
+            .unwrap();
+        space
+            .map(
+                &mut mem,
+                high + 2 * LARGE_PAGE,
+                0xFEBF_0000,
+                Attributes::mmio(),
+            )
+            .unwrap();
+        for v in [high, high + 2 * LARGE_PAGE] {
+            let t = space.translate(&mem, v).unwrap();
+            assert!(
+                t.uncached && t.writable && !t.executable && t.global && !t.user,
+                "{t:?}"
+            );
+        }
+        space
+            .map(
+                &mut mem,
+                high + 3 * LARGE_PAGE,
+                0x1000,
+                Attributes::kernel_global(Access::Read),
+            )
+            .unwrap();
+        assert!(
+            !space
+                .translate(&mem, high + 3 * LARGE_PAGE)
+                .unwrap()
+                .uncached
+        );
+        // Splitting keeps the memory type in every 4 KiB piece.
+        space.split_large(&mut mem, high).unwrap();
+        for i in [0, 1, 255, 511] {
+            let t = space.translate(&mem, high + i * PAGE).unwrap();
+            assert!(t.uncached && t.size == PAGE, "piece {i}: {t:?}");
+            assert_eq!(t.phys, 0xB000_0000 + i * PAGE);
+        }
     }
 
     #[test]
@@ -817,6 +907,7 @@ mod tests {
             access: Access::Read,
             user: true,
             global: false,
+            cache: Cache::WriteBack,
         };
         space.map(&mut mem, 0x2000, 0x2000, user).unwrap();
         for level in 1..=3 {

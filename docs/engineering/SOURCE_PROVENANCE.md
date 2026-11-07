@@ -359,6 +359,31 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 2 new run-queue tests (blocking and waking; a stale generation and the boot context refused); `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** timed waits (a deadline on the monotonic clock), priority inheritance, the user-visible waiting of ADR-0005 P9, and Loom models of the protocol.
 
+### PCI Express enumeration (M5 groundwork; CLAUDE.md §32; 2026-11-07)
+
+- **What:**
+  - `origin-paging`: a `Cache` memory type (write-back at PAT entry 0, or uncached at entry 3 through PCD and PWT); `Attributes::mmio`; `Translation::uncached`. `split_large` now keeps PCD, PWT and the PAT bit, which moves from bit 12 to bit 7. Before, it dropped PCD and PWT, which would silently have made split device mappings write-back.
+  - `cpu::check_pat`: every processor's IA32_PAT must hold write-back at entry 0 and uncached at entry 3 (the reset values). The kernel then refuses to map device registers rather than reprogramming caches behind the firmware.
+  - `vm::map_mmio`: a bump allocator in the MMIO window (ADR-0004 H2), with 2 MiB pages where the physical alignment allows.
+  - `pci` (library), over an abstract `ConfigSpace`: MCFG allocations, checked (1 MiB-aligned base, no wrap, end bus not below start); ECAM offsets, refused outside the window or misaligned; header decoding; enumeration (functions 1–7 only on multi-function devices, nothing when function 0 is absent); BAR sizing for 32- and 64-bit memory and I/O BARs, including 16-bit I/O decoders. Sizing turns decoding off meanwhile, then restores every BAR and the command register, writing zeros to the status register's write-one-to-clear bits.
+  - `pcie` (binary): MCFG, then segment 0's window (refused if it overlaps RAM in the boot map), mapped uncached; every function listed with its sized BARs; afterwards each BAR and the command register is read back and compared.
+- **Bugs found by the new tests before they reached the kernel:**
+  - An unimplemented BAR (mask 0) was reported as 4 GiB, because the mask was widened to 64 bits before the zero check. The same flaw was in the I/O path.
+  - The PAT bit and PCD/PWT were lost on a split (above).
+- **Specifications:** PCI Firmware Specification 3.3 §4.1.2 (MCFG); PCI Express Base 6.x §7.2.2 (ECAM) and §7.5.1 (configuration headers, BAR sizing); Intel SDM Vol. 3A §11.12 (PAT) and §4.9 (paging memory types).
+- **Proof** (every boot, QEMU q35 under OVMF):
+  - The ECAM is at 0xe0000000 (256 MiB, buses 0–255), mapped at 0xffffe00000000000 with 2 MiB uncached pages; IA32_PAT is 0x0007040600070406 on every processor.
+  - The 5 functions found: host bridge 8086:29c0; VGA 1234:1111 (BAR0 prefetchable 16 MiB, BAR2 4 KiB); ISA bridge 8086:2918; AHCI 8086:2922 (BAR4 I/O 32 B, BAR5 4 KiB); SMBus 8086:2930 (BAR4 I/O 64 B).
+  - Every BAR and command register read back unchanged.
+- **Negative controls**, each failing the boot test:
+  - BARs not restored after sizing → "restored: false".
+  - Uncached mappings encoded without PCD and PWT → "uncached false".
+
+  Whether sizing turns decoding off is invisible in QEMU; a host test checks it on a device model that records any probe made while decoding is on.
+- **A mistake in the boot test, caught by the matrix:** the PCIe markers were first listed before the scheduler's last line, which the boot prints earlier, so every boot would have failed. The controls had failed on their own failure strings, so they did not show it. The markers now follow the boot order. Lesson: run the good path after adding markers, before running controls.
+- **Test evidence:** 4 `pci` tests and 1 more `origin-paging` test; 83 library tests in all; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** bridges' bus numbers and hot-plug, MSI/MSI-X, PCIe capabilities, AER, an IOMMU (no DMA confinement yet), and segments other than 0.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

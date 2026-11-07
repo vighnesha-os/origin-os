@@ -6,9 +6,18 @@
 //! released, so no processor keeps the old translation; changes that only add access need
 //! none. Kernel-half mappings are global; the identity pages of the AP trampoline are not.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use framekernel::paging::{
-    Access, AddressSpace, Attributes, LeafCensus, MapError, PAGE, TablePool,
+    Access, AddressSpace, Attributes, LARGE_PAGE, LeafCensus, MapError, PAGE, TablePool,
+    Translation,
 };
+
+/// The MMIO window (ADR-0004 H2): device registers, mapped uncached on demand.
+const MMIO_BASE: u64 = 0xFFFF_E000_0000_0000;
+const MMIO_END: u64 = 0xFFFF_F000_0000_0000;
+/// The next free address in the MMIO window.
+static MMIO_NEXT: AtomicU64 = AtomicU64::new(MMIO_BASE);
 
 use origin_sync::SpinLock;
 
@@ -85,6 +94,7 @@ pub(crate) fn map_user(virt: u64, phys: u64, access: Access) -> Result<(), MapEr
             access,
             user: true,
             global: false,
+            cache: framekernel::paging::Cache::WriteBack,
         };
         k.space.map(&mut k.tables, virt, phys, attributes)
     })
@@ -128,6 +138,46 @@ fn unmap_guards(pages: &[u64]) -> Result<(), MapError> {
             k.space.unmap(&mut k.tables, page)?;
         }
         Ok(())
+    })
+}
+
+/// Maps the device registers at physical `[phys, phys + len)` uncached, read/write and
+/// never executable into the MMIO window, and returns the virtual address of `phys`. The
+/// window keeps the physical address's offset within 2 MiB, so aligned ranges get 2 MiB
+/// pages. The caller vouches that the range is device memory, not RAM.
+pub(crate) fn map_mmio(phys: u64, len: u64) -> Result<u64, MapError> {
+    let first = phys & !(PAGE - 1);
+    let end = phys
+        .checked_add(len)
+        .and_then(|e| e.checked_next_multiple_of(PAGE))
+        .ok_or(MapError::Overflow)?;
+    let bytes = end - first;
+    let virt = crate::cpu::without_interrupts(|| {
+        let mut guard = KERNEL_SPACE.lock();
+        let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
+        let start = MMIO_NEXT
+            .load(Ordering::Relaxed)
+            .checked_next_multiple_of(LARGE_PAGE)
+            .and_then(|v| v.checked_add(first % LARGE_PAGE))
+            .ok_or(MapError::Overflow)?;
+        let stop = start.checked_add(bytes).ok_or(MapError::Overflow)?;
+        if stop > MMIO_END {
+            return Err(MapError::OutOfMemory);
+        }
+        k.space
+            .map_range(&mut k.tables, start, first, bytes, Attributes::mmio())?;
+        MMIO_NEXT.store(stop, Ordering::Relaxed);
+        Ok(start)
+    })?;
+    Ok(virt + (phys - first))
+}
+
+/// How the live tables translate `virt`.
+pub(crate) fn translate(virt: u64) -> Option<Translation> {
+    crate::cpu::without_interrupts(|| {
+        let guard = KERNEL_SPACE.lock();
+        let k = guard.as_ref()?;
+        k.space.translate(&k.tables, virt)
     })
 }
 

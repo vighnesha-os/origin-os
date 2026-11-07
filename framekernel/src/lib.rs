@@ -26,6 +26,8 @@
 //! - [`heap`]: kernel heap bookkeeping (slabs and frame runs), addresses only;
 //! - [`paging`]: 4-level page tables with structural W^X (the `origin-paging` crate,
 //!   shared with the loader);
+//! - [`pci`]: the MCFG, ECAM addressing, configuration headers, enumeration and BAR
+//!   sizing over an abstract configuration space;
 //! - [`runqueue`]: the per-CPU round-robin run queue (scheduler policy);
 //! - [`serial`]: a polled 16550 UART driver over an abstract register interface;
 //! - [`report`]: the exact console text;
@@ -52,6 +54,7 @@ pub mod frames;
 pub mod handles;
 pub mod heap;
 pub use origin_paging as paging;
+pub mod pci;
 pub mod report;
 pub mod rtc;
 pub mod runqueue;

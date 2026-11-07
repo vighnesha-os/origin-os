@@ -946,6 +946,31 @@ pub(crate) unsafe fn probe_execute(target: u64) -> Probe {
     run_probe(target, || unsafe { jump(target) })
 }
 
+/// IA32_PAT.
+const IA32_PAT: u32 = 0x277;
+/// Processors whose PAT holds the two memory types the page tables use.
+static PAT_READY: AtomicU64 = AtomicU64::new(0);
+
+/// Checks that this processor's PAT has entry 0 write-back (06h) and entry 3 uncached
+/// (00h), the memory types `paging::Cache` selects (Intel SDM Vol. 3A §11.12.2,
+/// Table 11-10), and counts it if so. These are the architectural reset values; a firmware
+/// that changed them would make uncached mappings cacheable, so the kernel then refuses to
+/// map device registers rather than reprogramming caches it cannot see. Returns the PAT.
+pub(crate) fn check_pat() -> u64 {
+    // SAFETY: CPL 0; IA32_PAT exists on every x86-64 processor (CPUID 1 EDX bit 16) and
+    // reading it has no side effect.
+    let pat = unsafe { rdmsr(IA32_PAT) };
+    if pat & 0xFF == 0x06 && (pat >> 24) & 0xFF == 0x00 {
+        PAT_READY.fetch_add(1, Ordering::Relaxed);
+    }
+    pat
+}
+
+/// Processors that passed [`check_pat`].
+pub(crate) fn pat_ready() -> u64 {
+    PAT_READY.load(Ordering::Relaxed)
+}
+
 /// CR4.PGE: global pages (Intel SDM Vol. 3A §4.10.2.4).
 const CR4_PGE: u64 = 1 << 7;
 
