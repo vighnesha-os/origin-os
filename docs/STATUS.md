@@ -12,7 +12,7 @@
 | Milestone | State | What is proven |
 |---|---|---|
 | **M0** toolchain | done | Rust 1.99.1 pinned and verified; QEMU and OVMF; `xtask` check, build, boot-test and run; no-panic object check on the freestanding libraries |
-| **M1** bootable Framekernel | done (developer mode) | UEFI loader reads, verifies (content digest, manifest, every section's digest or Merkle root) and places the KRN image, applies RELR, exits boot services and enters the kernel; a tampered image is rejected. **Unsigned images only**: the signature block is parsed and verifiable (`onbf-verify`) but not yet required by the loader; the trust anchor waits on B7 |
+| **M1** bootable Framekernel | done (developer mode) | UEFI loader reads, verifies (content digest, manifest, every section's digest or Merkle root) and places the KRN image, applies RELR, exits boot services and enters the kernel; a tampered image is rejected. **Unsigned images only**: the signature block is parsed and verifiable (`onbf-verify`) but not yet required by the loader; the trust anchor is decided (B7: a Microsoft-signed first stage by default, Origin-owned machines supported) |
 | **M2** CPU and memory | done (baseline) | Own GDT/TSS/IDT; exceptions; frame allocator; higher-half kernel with KASLR (ADR-0004) and its own page tables (W^X image from the signed segment table, NX direct map, nothing in the lower half, SMEP/SMAP, guard pages below every stack); kernel heap with `alloc`; x2APIC and a PIT-calibrated timer; loader memory reclaimed |
 | **M3** SMP and scheduler | started | All MADT-enabled CPUs started (1–8 tested); per-CPU round-robin with preemption, yield, sleep, exit and stack reaping; GS-based CPU-local data. Not yet: priorities, fairness policy, load balancing, wake-ups across CPUs |
 | **M4** processes and IPC | started | Per-process address spaces sharing the kernel half, with CR3 switched per thread (two processes at the same addresses stay isolated); ring 3 with one DPL-3 gate and `syscall`; user faults end the thread, not the kernel; RSP0 per switch; NMI/#MC on IST; validated, fault-safe copy from user memory (a write system call). Not yet: process objects, handles and capabilities, IPC, loading `.ose` programs |
@@ -24,11 +24,11 @@
 |---|---|
 | ONBF parser (`onbf-format`), Merkle trees (`onbf-merkle`), KRN packer (`onbf-pack`) | done for KRN; EXE/LIB/OSI/OAPP/OD profiles not yet |
 | SHA-2, SHA-3/SHAKE, Ed25519 (strict), ML-DSA-65/87 (strict) in `origin-crypto` | done, verification only; **no NIST ACVP or Wycheproof validation yet** (downloads need approval) |
-| Signature block, certificate chain, trust store | encodings decided (S1–S4); parser (`onbf-format`) and entry verification (`onbf-verify`, both signatures, proven against reference-signed vectors) done; loader wiring, trust store and chains next; trust anchor waits on B7 |
+| Signature block, certificate chain, trust store | encodings decided (S1–S4); parser (`onbf-format`) and entry verification (`onbf-verify`, both signatures, proven against reference-signed vectors) done; loader wiring, trust store and chains next; trust anchor decided (B7) |
 
 ## Waiting on the owner
 
-ADR-0002 and ADR-0003 (Proposed); ADR-0004 was accepted and implemented on 2026-11-07; ADR-0005 (process ABI and IPC) was accepted on 2026-11-07 and is being implemented; B7; G1; the readings P1–P7, E1, M1 and L1 in `docs/spec/ONBF-errata.md`; approval to download NIST ACVP / FIPS 204 errata / Wycheproof vectors and the `loom` crate; a project licence; merging into `main` and pushing. Details: `docs/engineering/TASKS.md`.
+every design decision is now final (ADR-0002 with B7, ADR-0003, G1 and the errata readings were decided on 2026-11-07 under the owner's instruction to finalise with the recommended options; ADR-0004 and ADR-0005 were accepted by the owner). Still the owner's, because they are not design: approval to download NIST ACVP / FIPS 204 errata / Wycheproof vectors and the `loom` crate; a project licence; merging into `main` and pushing. Details: `docs/engineering/TASKS.md`.
 
 ## Where the evidence is
 

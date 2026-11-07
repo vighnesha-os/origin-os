@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Applies to | `docs/spec/ONBF.md` v1.0 (design), accepted 2026-11-07 |
-| Status | **C1–C14 and G2–G5 decided by the owner on 2026-11-07. G1 is open.** |
+| Status | **C1–C14 and G2–G5 decided by the owner on 2026-11-07. G1 and the readings below were decided the same day under the owner's instruction of 2026-11-07 to finalise the design with the recommended options.** |
 | Found by | Implementing `runtime/onbf/format` (`onbf-format`) against §4, 2026-11-07 |
 | Byte layouts | Unchanged. Every item below is a validation rule or a missing definition, not a new field. |
 
@@ -39,11 +39,12 @@ ONBF-R6 requires that a file have exactly one valid reading, and §13 item 6 say
 | G2 | §4.6 step 2 | In `hL[j] = SHA-256(0x01 ‖ le8(L) ‖ le64(j) ‖ hash_block_j)`, it was unclear whether L is the level of the hash being produced or the level of the hashes inside the block. | **L is the level of the hash being produced**, which matches the spec's notation `hL`. Leaf hashes are level 0, so hashing a hash block of level-0 hashes gives `h1[j]` with `L = 1`, and so on upward. `j` is the hash's index within its level. | `onbf-merkle` (next) |
 | G3 | §4.6 step 3 | `le8(levels)` in the root was not defined beyond the single-block case. | **`levels` is the level of the top hash**: `top = h_levels[0]`. It is 0 for empty content or a single 4 KiB block, 1 for 2–128 blocks, 2 for 129–16,384, and so on. It equals the number of hash-block levels stored in the MERKLE section and agrees with `merkle_hash_blocks`. | `onbf-merkle` (next); `onbf-format` sizes MERKLE sections this way |
 | G4 | §4.3, §6.1 | Segment `mem_size` alignment, and the order and overlap of segment memory ranges, were not stated. | **Page-multiple, sorted, disjoint.** A SEGMENT's `mem_size`, like its `mem_offset`, is a multiple of 4 KiB. SEGMENT sections appear in ascending `mem_offset` order (table order) and never overlap. Unmapped gaps, such as guard pages, are allowed. Every segment ends within the 2 GiB image span (`mem_offset + mem_size ≤ 2^31`) in EXE, LIB and KRN. The Appendix A limit of 16 segments applies to EXE and LIB. | `onbf-format` (`MemoryLayout`, `SegmentOrder`, `SegmentSpan`, `TooManySegments`) |
+| G1 | §6.5, §4.4 | The SYM profile holds "DWARF and line tables", but §4.4 had no section kind for them. | **A new kind, `0x00F2 DWARF`, allowed only in SYM.** One section per DWARF section, never MAPPABLE (SYM is never mapped), so it may be compressed; REQUIRED like every section (G5). The SYM manifest's `dwarf_sections` key (25) lists `[section_index, name]` pairs in ascending index order, each name one of `.debug_info`, `.debug_abbrev`, `.debug_line`, `.debug_line_str`, `.debug_str`, `.debug_str_offsets`, `.debug_addr`, `.debug_rnglists`, `.debug_loclists`, `.debug_frame` and `.debug_aranges`, each at most once. ONBF stays 1.0: no SYM image existed before this decision. | `onbf-format` (`Kind::Dwarf`, SYM only) |
 | G5 | §4.3, §4.4 | After C13, REQUIRED no longer changed anything for a v1 reader except on MANIFEST. | **REQUIRED is set on every section.** That is truthful in v1, because every section must be understood, and gives one encoding. Writers (`onbf-pack`, the SDK tools) always set it. The bit keeps its meaning in case a future major version brings optional kinds back. | `onbf-format` (`RequiredNotSet`) |
 
 ## Readings applied without a separate decision
 
-These follow directly from the text, but are written down so that a second, independent implementation cannot drift from them. The owner may overrule any of them.
+These follow directly from the text, but are written down so that a second, independent implementation cannot drift from them. **Accepted as normative on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options.**
 
 | # | Spec | Reading | Applied in |
 |---|---|---|---|
@@ -53,9 +54,9 @@ These follow directly from the text, but are written down so that a second, inde
 | R4 | §5; key registry | The KRN `toolchain` text fields (`rustc`, `rustc_commit`, `llvm`) are non-empty printable ASCII (0x20–0x7E). That is stricter than §5's NFC rule, and trivially NFC, so the boot loader needs no Unicode normalization tables. `rustc_commit` is exactly 40 lowercase hex digits. | `onbf-format` (`KrnManifest`) |
 | R5 | §5 | "Items per container ≤ 65,536" counts elements for an array and key/value entries for a map. "Depth ≤ 16" counts nested containers, so the top-level map is depth 1, and an empty container still counts. | `onbf-format` (`ocbor`) |
 
-## Readings proposed by the implementations, awaiting the owner
+## Readings proposed by the implementations
 
-Applied in code on 2026-11-07, pinned by tests, and **not yet decided**. Each is the reading a second implementation (or the host signer) must match.
+Applied in code on 2026-11-07 and pinned by tests. **Accepted as normative the same day, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options.** Each is the reading a second implementation (or the host signer) must match.
 
 | # | Where | Reading |
 |---|---|---|
@@ -72,9 +73,10 @@ Applied in code on 2026-11-07, pinned by tests, and **not yet decided**. Each is
 
 ## Open gaps
 
+None at present.
+
 | # | Spec | Gap | Who needs it |
 |---|---|---|---|
-| G1 | §6.5, §4.4 | The SYM profile holds "DWARF and line tables", but §4.4 has no section kind for them. A SYM image can currently contain only MANIFEST and MERKLE. Under C13, adding a kind is a format change. | SYM producer and symbolizer (M6) |
 
 ## Observed by the bit-flip sweep
 

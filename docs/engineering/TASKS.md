@@ -56,14 +56,10 @@
 
 ## Waiting on the owner
 
+Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
+
 | # | Decision | Blocks |
 |---|---|---|
-| — | Accept, amend or reject **ADR-0002** (Proposed) | Shipping anything built on the boot path |
-| B7 | Boot trust anchor: Microsoft UEFI CA 2023, or Origin keys enrolled in firmware | Secure Boot |
-| — | Accept, amend or reject **ADR-0003** (kernel memory, interrupts, SMP start-up, first scheduler; Proposed) | Building M4 on it |
-| G1 | A section kind for SYM's DWARF data | `.osym` (M6) |
-| R1–R5 | Readings applied in the errata (overrule if wanted) | — |
-| P1–P7, E1, L1 | Readings proposed by `onbf-pack`, Ed25519 and the loader (errata) | A second implementation, the host signer |
 | — | Downloads: NIST ACVP (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519); the `loom` crate (host-only dev-dependency, §5) | External known-answer validation (§59); concurrency models (§73) |
 | — | A project licence | Every provenance entry |
 | — | Merge into `main` and push | Sharing the work |

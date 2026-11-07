@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Proposed** (2026-11-07). Implemented and boot-tested in QEMU; awaiting the owner. |
+| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options. Implemented and boot-tested in QEMU. |
 | Scope | `framekernel/` from M2 to the first M3 steps |
 | Requires | CLAUDE.md §18 (ADRs for memory allocator, scheduler, locking, kernel architecture) |
 | Related | ADR-0002 (boot; boot info 0.2), ONBF §6.1 (KRN segments) |

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Proposed.** Owner approval is needed before Accepted (CLAUDE.md §84). Development builds follow it; nothing built on it ships until then. |
+| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). |
 | Date | 2026-11-07 |
 | Owner decisions still open | B7, the boot trust anchor (carried over from ADR-0001). The other items are proposals the owner may change. |
 | Implements | CLAUDE.md §19 (UEFI boot chain), §20 (boot manager, later), §58 (Secure Boot), ONBF §8.1 (chain of trust) |
@@ -82,12 +82,14 @@ After that, the loader calls nothing in the firmware.
 - The firmware's identity mapping stays active. The kernel then installs its own page tables (M2, done 2026-11-07): it sets EFER.NXE and CR0.WP and loads CR3, then proves the protections with four deliberate faults: a write to code, a write to read-only data, a fetch from writable data and a read of page 0.
 - If the kernel ever returns, the loader halts the CPU.
 
-### B7. Boot trust anchor (open; carried from ADR-0001)
-There are two options:
-- signing the loader under Microsoft UEFI CA 2023 (with an annual audit);
-- Origin keys enrolled in firmware by the user or OEM.
+### B7. Boot trust anchor (decided 2026-11-07)
+**Both, in this order of preference for shipping:**
+1. **Default: a first stage signed under Microsoft UEFI CA 2023.** A minimal first-stage loader carries the Microsoft signature so Origin boots on stock PCs with Secure Boot on. That stage trusts nothing but Origin's own release keys: it verifies the Origin loader and every later stage with the ONBF hybrid suite (Ed25519 + ML-DSA-87, ADR-0001 D3), so Microsoft's key vouches only for the first stage. The annual audit the CA requires is a cost to plan for.
+2. **Supported: Origin-owned machines.** OEMs and users may enroll Origin's keys in the firmware's `db` (and remove others), which drops the Microsoft link entirely; the same Origin chain applies from the first stage on.
+3. **Developer mode (B8)** stays for unsigned development images and never ships.
 
-This decision is the owner's. Neither changes B1–B6.
+*Alternatives:* Microsoft signing only (no Origin-owned option), or Origin enrollment only (most PCs could then not boot Origin without changing firmware settings).
+*Consequences:* the first stage stays small and changes rarely (each change needs a new Microsoft signature); Secured-core PCs, which may not trust the third-party CA by default, need the Origin-owned path or a firmware setting. Obtaining the signature is a business step outside the code.
 
 ### B8. Developer mode
 A loader built with the `developer-mode` feature accepts an unsigned KRN image and says so on the console. The `xtask` boot test builds this variant.

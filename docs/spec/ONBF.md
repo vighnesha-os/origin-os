@@ -5,7 +5,7 @@
 | Document | `docs/spec/ONBF.md` |
 | Version | 1.0 (design) |
 | Status | **Accepted by the owner on 2026-11-07** (§2; `docs/adr/ADR-0001-onbf.md`). Byte layouts become v1.0 final only after the §13 parser tests pass. Until then, any layout change needs an ADR amendment. |
-| Clarifications | `docs/spec/ONBF-errata.md`. C1–C14 and G2–G5 were decided by the owner on 2026-11-07 and are normative. They narrow §4 and define the §4.6 Merkle level numbering, for example: every unknown section kind is rejected (C13); manifests are never compressed (C12); segments are page-sized, sorted and disjoint (G4); REQUIRED is set on every section (G5). G1 is open. |
+| Clarifications | `docs/spec/ONBF-errata.md`. C1–C14 and G2–G5 were decided by the owner on 2026-11-07 and are normative. They narrow §4 and define the §4.6 Merkle level numbering, for example: every unknown section kind is rejected (C13); manifests are never compressed (C12); segments are page-sized, sorted and disjoint (G4); REQUIRED is set on every section (G5); SYM's DWARF data has its own kind (G1). |
 | Manifest keys | `docs/spec/ONBF-manifest-keys.md`: one shared OCBOR-1 key registry for all profiles. Key 0 is `schema`, CPU features are a bitset, and the KRN keys are assigned (owner decisions K1–K4, 2026-11-07). |
 | Research baseline | 2026-11-07 |
 | Toolchain | Rust 1.99.1 stable, edition 2024 (CLAUDE.md §8) |
@@ -143,6 +143,7 @@ offset 128    Section table: section_count × 128 B
 | `0x0040` | FIRMWARE | DRV | One device-firmware blob |
 | `0x00F0` | MERKLE | any | Merkle hash blocks |
 | `0x00F1` | DEBUG_LINK | EXE, LIB, KRN | Build ID and symbol-file reference |
+| `0x00F2` | DWARF | SYM | One DWARF section of a detached symbol file; the SYM manifest's `dwarf_sections` names it (errata G1) |
 
 A reader MUST reject an unknown kind that has REQUIRED set. It MAY skip an unknown kind without REQUIRED; that kind is still covered by the content digest. ONBF v1 has no vendor-defined section kinds.
 

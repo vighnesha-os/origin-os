@@ -78,6 +78,9 @@ pub enum Kind {
     Merkle,
     /// Build ID and symbol-file reference.
     DebugLink,
+    /// One DWARF section of a detached symbol file (SYM only; errata G1). The SYM
+    /// manifest's `dwarf_sections` key names which DWARF section each one is.
+    Dwarf,
     /// A kind this version does not know. Allowed only without REQUIRED.
     Unknown(u32),
 }
@@ -88,6 +91,7 @@ const APP: u16 = Profile::App.bit();
 const PKG: u16 = Profile::Pkg.bit();
 const DRV: u16 = Profile::Drv.bit();
 const KRN: u16 = Profile::Krn.bit();
+const SYM: u16 = Profile::Sym.bit();
 const ALL: u16 = 0xFFFF;
 
 impl Kind {
@@ -108,6 +112,7 @@ impl Kind {
             0x0040 => Self::Firmware,
             0x00F0 => Self::Merkle,
             0x00F1 => Self::DebugLink,
+            0x00F2 => Self::Dwarf,
             other => Self::Unknown(other),
         }
     }
@@ -123,6 +128,7 @@ impl Kind {
             Self::ImageFs => APP | DRV,
             Self::Payload => PKG,
             Self::Firmware => DRV,
+            Self::Dwarf => SYM,
             Self::Unknown(_) => return None,
         })
     }
@@ -391,5 +397,11 @@ mod tests {
         assert!(in_profile(Kind::Exports, Profile::Krn));
         assert!(!in_profile(Kind::Payload, Profile::Exe));
         assert!(in_profile(Kind::Firmware, Profile::Drv));
+        // Errata G1: DWARF sections exist only in detached symbol files.
+        assert_eq!(Kind::from_raw(0x00F2), Kind::Dwarf);
+        assert!(in_profile(Kind::Dwarf, Profile::Sym));
+        for p in [Profile::Exe, Profile::Lib, Profile::Krn, Profile::App] {
+            assert!(!in_profile(Kind::Dwarf, p), "{p:?}");
+        }
     }
 }

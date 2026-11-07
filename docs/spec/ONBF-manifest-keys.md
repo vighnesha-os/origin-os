@@ -4,7 +4,7 @@
 |---|---|
 | Applies to | `docs/spec/ONBF.md` §5 (OCBOR-1) and §6 (profile manifests) |
 | Resolves | ADR-0001, "Still open": integer key numbers for the OCBOR-1 schemas |
-| Status | **Policy K1–K4 and the KRN keys decided by the owner on 2026-11-07.** Keys for the other profiles are assigned when each profile is implemented, under the same policy. |
+| Status | **Policy K1–K4 and the KRN keys decided by the owner on 2026-11-07; the SYM keys (errata G1) decided the same day under the owner's instruction of 2026-11-07 to finalise the design with the recommended options.** Keys for the other profiles are assigned when each profile is implemented, under the same policy. |
 
 ## Policy (owner decisions, 2026-11-07)
 
@@ -28,14 +28,15 @@
 | Key | Name | Type | Profiles | Meaning |
 |---|---|---|---|---|
 | 0 | `schema` | uint | all | Manifest schema version, `1` (K2). |
-| 1 | `build_id` | bytes, 32 | EXE, LIB, KRN | SHA-256 of the concatenated content of all SEGMENT sections, in table order (§6.1). |
+| 1 | `build_id` | bytes, 32 | EXE, LIB, KRN, SYM | SHA-256 of the concatenated content of all SEGMENT sections, in table order (§6.1). In SYM, the build ID of the image the symbols describe. |
 | 2 | `toolchain` | map | EXE, LIB, KRN | Build provenance; sub-keys below. |
 | 3 | `cpu_features` | uint | EXE, LIB, KRN | Required features beyond the `x86-64-v3` baseline (K3). `0` means the baseline only. |
 | 4 | `cet` | map | EXE, LIB, KRN | CET settings (§6.1.3); sub-keys below. |
 | 5 | `entry` | uint | EXE, KRN | Entry point as an RVA. It must lie inside a SEGMENT that is readable and executable (RX). |
 | 6–23 | — | — | — | Reserved for fields shared by several profiles (for example EXE/LIB `abi`, `kind`, `stack`, `tls`, `deps`). |
 | 24 | `boot_info_abi` | `[major, minor]` | KRN | The boot-info structure version the kernel expects. Its contents are defined by the M1 boot ADR. The loader refuses a major it does not provide. |
-| 25–999 | — | — | — | Reserved for profile-specific fields. |
+| 25 | `dwarf_sections` | array of `[uint, text]` | SYM | One `[section_index, name]` pair per DWARF section (errata G1), in ascending section index; each name from the G1 list, at most once. |
+| 26–999 | — | — | — | Reserved for profile-specific fields. |
 | ≥ 1000 | — | any | all | Optional extensions; skipped by readers (§5). |
 
 ### `toolchain` (key 2) sub-keys
@@ -59,7 +60,8 @@
 | Profile | Required keys | Allowed optional keys |
 |---|---|---|
 | KRN | 0 `schema`, 1 `build_id`, 2 `toolchain`, 3 `cpu_features`, 4 `cet`, 5 `entry`, 24 `boot_info_abi` | keys ≥ 1000 |
-| EXE, LIB, APP, PKG, DRV, SYS, SYM | 0 `schema`; the rest is assigned when the profile is implemented | — |
+| SYM | 0 `schema`, 1 `build_id`, 25 `dwarf_sections` | 2 `toolchain`, keys ≥ 1000 |
+| EXE, LIB, APP, PKG, DRV, SYS | 0 `schema`; the rest is assigned when the profile is implemented | — |
 
 ## CPU feature registry (key 3)
 
