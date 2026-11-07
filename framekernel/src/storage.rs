@@ -1,5 +1,6 @@
 //! The NVMe driver (M5; CLAUDE.md §33: controller discovery, initialization, admin and I/O
-//! queues, namespace discovery, DMA, flushes) and the boot proof of its block I/O.
+//! queues, namespace discovery, DMA, flushes), the boot proof of its block I/O, and the
+//! disk's GUID Partition Table, both copies checked (CLAUDE.md §39).
 //!
 //! A first-party kernel-mode driver (ADR-0001 D2), polled for now: no interrupts until
 //! MSI-X routing exists. It binds to the first NVMe controller (class 01:08:02) that
@@ -23,6 +24,7 @@ use core::fmt::Write;
 use core::ptr;
 use core::sync::atomic::{Ordering, compiler_fence, fence};
 
+use framekernel::gpt;
 use framekernel::nvme::{self, Capabilities, Command, Completion, NamespaceInfo, Queues, register};
 use framekernel::pci::BarKind;
 
@@ -384,7 +386,137 @@ fn bind(com1: &mut Console, dev: &crate::pcie::Device) -> Result<bool, &'static 
     }
     c.io = Some(io);
     let ok = prove_io(com1, &mut c, &data, namespace).map_err(failed)?;
-    Ok(ok)
+    let gpt = prove_gpt(com1, &mut c, &data, namespace).map_err(failed)?;
+    Ok(ok && gpt)
+}
+
+/// Reads whole blocks from `lba` into `out`, a page at a time.
+fn read_blocks(
+    c: &mut Nvme,
+    data: &DmaPage,
+    ns: NamespaceInfo,
+    lba: u64,
+    out: &mut [u8],
+) -> Result<bool, Failure> {
+    let bs = u64::from(ns.block_size);
+    let per_page = (PAGE / bs).max(1);
+    let mut done = 0u64;
+    for chunk in out.chunks_mut(PAGE as usize) {
+        let blocks = (chunk.len() as u64).div_ceil(bs).min(per_page);
+        let prps = nvme::prps(data.phys, blocks * bs, PAGE).unwrap_or((data.phys, 0));
+        let at = lba + done;
+        let r = c.run(true, |cid| {
+            Command::transfer(false, cid, NSID, at, blocks as u32, prps)
+        })?;
+        if !r.status.ok() {
+            return Ok(false);
+        }
+        let n = chunk.len();
+        chunk.copy_from_slice(data.bytes().get(..n).unwrap_or(&[]));
+        done += blocks;
+    }
+    Ok(true)
+}
+
+/// A GPT copy's validated header, and how many of its entries are in use.
+type GptCopy = Result<(gpt::Header, usize), gpt::GptError>;
+
+/// One GPT copy: its header from block `lba` and its entry array, both validated.
+fn read_gpt_copy(
+    c: &mut Nvme,
+    data: &DmaPage,
+    ns: NamespaceInfo,
+    lba: u64,
+    parts: &mut [gpt::Partition],
+) -> Result<GptCopy, Failure> {
+    let mut block = alloc::vec![0u8; ns.block_size as usize];
+    if !read_blocks(c, data, ns, lba, &mut block)? {
+        return Ok(Err(gpt::GptError::Signature));
+    }
+    let header = match gpt::parse_header(&block, lba, ns.blocks) {
+        Ok(h) => h,
+        Err(e) => return Ok(Err(e)),
+    };
+    let bytes = header.array_blocks(u64::from(ns.block_size)) * u64::from(ns.block_size);
+    let mut array = alloc::vec![0u8; bytes as usize];
+    if !read_blocks(c, data, ns, header.entries_lba, &mut array)? {
+        return Ok(Err(gpt::GptError::ArrayCrc));
+    }
+    Ok(gpt::parse_entries(&array, &header, parts).map(|n| (header, n)))
+}
+
+/// A copy's state for the report: `valid`, or why not.
+struct State<'a>(&'a GptCopy);
+
+impl core::fmt::Display for State<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Ok(_) => f.write_str("valid"),
+            Err(e) => write!(f, "invalid ({e:?})"),
+        }
+    }
+}
+
+/// Reads and checks both GPT copies (UEFI 2.11 §5.3.2) and lists the partitions. Both must
+/// be valid and agree; with only one, the disk is reported from it, and the proof fails.
+fn prove_gpt(
+    com1: &mut Console,
+    c: &mut Nvme,
+    data: &DmaPage,
+    ns: NamespaceInfo,
+) -> Result<bool, Failure> {
+    let empty = gpt::Partition {
+        index: 0,
+        kind: gpt::Guid::default(),
+        unique: gpt::Guid::default(),
+        first: 0,
+        last: 0,
+        attributes: 0,
+        name: [0; 36],
+    };
+    let mut parts = [empty; 16];
+    let mut backup_parts = [empty; 16];
+    let primary = read_gpt_copy(c, data, ns, 1, &mut parts)?;
+    let backup_lba = match primary {
+        Ok((h, _)) => h.alternate_lba,
+        Err(_) => ns.blocks - 1,
+    };
+    let backup = read_gpt_copy(c, data, ns, backup_lba, &mut backup_parts)?;
+    let agree = match (&primary, &backup) {
+        (Ok((p, n)), Ok((b, m))) => p.agrees_with(b) && parts.get(..*n) == backup_parts.get(..*m),
+        _ => false,
+    };
+    let _ = writeln!(
+        com1,
+        "origin-kernel: GPT: primary copy {}, backup copy at LBA {backup_lba} {}, the two agree {agree}{}",
+        State(&primary),
+        State(&backup),
+        if agree { "" } else { ": GPT failed" }
+    );
+    let (list, (h, n)) = match (&primary, &backup) {
+        (Ok(p), _) => (&parts, p),
+        (Err(_), Ok(b)) => (&backup_parts, b),
+        _ => return Ok(false),
+    };
+    let _ = writeln!(
+        com1,
+        "origin-kernel: GPT: disk {}, usable blocks {}-{}, {} entries of {} B, {n} in use",
+        h.disk, h.first_usable, h.last_usable, h.entry_count, h.entry_size
+    );
+    for p in list.iter().take(*n) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: GPT: partition {}: \"{}\", type {}, blocks {}-{} ({} MiB), unique {}",
+            p.index + 1,
+            p.name(),
+            p.kind,
+            p.first,
+            p.last,
+            (p.blocks() * u64::from(ns.block_size)) >> 20,
+            p.unique
+        );
+    }
+    Ok(agree)
 }
 
 /// Reads blocks the boot test wrote, writes and reads back one, and checks that a read past

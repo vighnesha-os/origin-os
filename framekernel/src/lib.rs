@@ -22,6 +22,7 @@
 //!   TSC rate;
 //! - [`descriptors`]: GDT, TSS and IDT descriptor encodings;
 //! - [`frames`]: the physical frame allocator over the boot-info regions;
+//! - [`gpt`]: GUID Partition Table validation (both copies, CRC-32) and partitions;
 //! - [`handles`]: per-process handle tables with rights (ADR-0005 P1–P2);
 //! - [`heap`]: kernel heap bookkeeping (slabs and frame runs), addresses only;
 //! - [`nvme`]: NVMe controller registers, queue entries and indexes, Identify data;
@@ -52,6 +53,7 @@ pub mod channel;
 pub mod clock;
 pub mod descriptors;
 pub mod frames;
+pub mod gpt;
 pub mod handles;
 pub mod heap;
 pub mod nvme;

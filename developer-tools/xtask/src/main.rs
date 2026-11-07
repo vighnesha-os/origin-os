@@ -244,6 +244,30 @@ fn boot_scenario_markers() -> Scenario {
                 disk::BLOCKS - 64,
                 disk::BLOCKS
             ),
+            // The disk's GPT, both copies checked, and its partitions as `disk` wrote them.
+            format!(
+                "origin-kernel: GPT: primary copy valid, backup copy at LBA {} valid, the two agree true",
+                disk::BLOCKS - 1
+            ),
+            format!(
+                "origin-kernel: GPT: disk {}, usable blocks 34-{}, 128 entries of 128 B, 2 in use",
+                disk::DISK_GUID,
+                disk::BLOCKS - 34
+            ),
+            format!(
+                "origin-kernel: GPT: partition 1: \"{}\", type {}, blocks {}-{} (",
+                disk::PARTITIONS[0].0,
+                disk::PARTITIONS[0].1,
+                disk::PARTITIONS[0].2,
+                disk::PARTITIONS[0].3
+            ),
+            format!(
+                "origin-kernel: GPT: partition 2: \"{}\", type {}, blocks {}-{} (",
+                disk::PARTITIONS[1].0,
+                disk::PARTITIONS[1].1,
+                disk::PARTITIONS[1].2,
+                disk::PARTITIONS[1].3
+            ),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
         failures: vec![
@@ -288,6 +312,7 @@ fn boot_scenario_markers() -> Scenario {
             ": wait queues failed",
             ": PCIe failed",
             ": NVMe failed",
+            ": GPT failed",
         ],
         check: Some(|text| console_lines_intact(text, qemu_cpus() as usize)),
     }

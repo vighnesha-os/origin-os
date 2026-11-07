@@ -407,6 +407,24 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 7 `nvme` tests (91 library tests in all) and 3 xtask `disk` tests (CRC-32 check value, GUID byte order, a self-consistent GPT); `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** MSI-X interrupts, several I/O queues (one per CPU), PRP lists for transfers over 8 KiB, controller-reset recovery, power states, health logs (SMART), an IOMMU, and a block layer above the driver.
 
+### GUID Partition Tables (CLAUDE.md §39; UEFI 2.11 §5.3; 2026-11-07)
+
+- **What:**
+  - `gpt` (library): a table-driven CRC-32, independent of xtask's bitwise one, with incremental updates; GUIDs in their mixed-endian form, shown in canonical text.
+  - `parse_header` follows UEFI 2.11 §5.3.2: signature, revision 1.0, header size 92 bytes to one block, the header CRC (the CRC field zeroed), and MyLBA. Also a layout check: the usable range lies inside the disk, after the primary structures and before the backup header; the entry array lies inside the disk, outside the usable range, and over neither header; entries are at least 128 bytes and a power of two; the array is at most 64 KiB.
+  - `parse_entries`: the array CRC; every used entry inside the usable range and not ending before it starts; no two entries overlapping; names read as UTF-16LE.
+  - `Header::agrees_with`: the two copies must describe the same disk, entries and CRC, and point at each other.
+  - `storage`: reads both copies over NVMe and checks each and their agreement, then lists the partitions. With only one valid copy, the disk is reported from it and the proof fails.
+- **Proof** (every boot):
+  - Both copies are valid (the backup at LBA 32767) and agree.
+  - The disk is 28a71590-fa80-422c-a428-8dff96984d99, usable blocks 34–32734.
+  - Partition 1 is "Origin system A", type ab846206-03ad-4cf6-b80b-5da764646190, blocks 2048–10239. Partition 2 is "Origin data", type 1a0f3667-a459-431f-b1fb-c1d11e0d699a, blocks 10240–32734.
+  - All of this is exactly what xtask wrote, so two independent GUID and CRC implementations agree.
+- **Firmware finding:** the first control flipped one bit in the primary entry array. It passed, because OVMF had restored the primary copy from the backup before the kernel ran, as UEFI 2.11 §5.3.2 allows. The test image is fresh for every boot, so the repair does not persist. Keep this in mind for the installer and recovery (M9, M12): firmware may rewrite GPT structures on its own.
+- **Negative control** (failing the boot test): both entry arrays corrupted, which the firmware cannot repair → "primary copy invalid (ArrayCrc), backup copy … invalid (ArrayCrc) … GPT failed".
+- **Test evidence:** 5 `gpt` tests: the CRC check value and incremental updates; GUID text; a valid disk with agreeing copies; header checks (signature, revision, size, the CRC and the bytes it does not cover, MyLBA, entry size and count, layout); entry checks (ranges, overlap, capacity, a flipped array bit, a short array). Also `cargo xtask check` and `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** restoring a corrupt copy (the kernel only reports it), MBR-only disks, a block layer and volumes above partitions, and a filesystem.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.
