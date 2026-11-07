@@ -250,9 +250,50 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     prove_net(&mut com1);
     // TCP: a full connection over an in-memory loopback (CLAUDE.md §54).
     prove_tcp(&mut com1);
+    // The monotonic timer queue, driven by the real clock (CLAUDE.md §68).
+    prove_timers(&mut com1);
 
     let _ = report::write_halt(&mut com1);
     halt()
+}
+
+/// Proves the monotonic timer queue against the real clock: three timers armed at
+/// increasing deadlines (plus one cancelled) must fire in order, each close to its
+/// deadline, and the cancelled one never (CLAUDE.md §68).
+fn prove_timers(com1: &mut console::Console) {
+    use framekernel::timers::TimerQueue;
+    let mut q = TimerQueue::new();
+    let base = time::monotonic_nanos();
+    let step = 5_000_000u64; // 5 ms
+    let ids = [10u64, 20, 30];
+    for (i, &id) in ids.iter().enumerate() {
+        q.arm(id, base + (i as u64 + 1) * step);
+    }
+    q.arm(99, base + 2 * step);
+    q.cancel(99); // this one must never fire
+    let mut order = alloc::vec::Vec::new();
+    let mut fired = alloc::vec::Vec::new();
+    let mut worst_late = 0u64;
+    let start = cpu::rdtsc();
+    let tsc_hz = time::tsc_hz();
+    while !q.is_empty() && cpu::rdtsc().wrapping_sub(start) < tsc_hz {
+        let now = time::monotonic_nanos();
+        if q.expire(now, &mut fired) > 0 {
+            for id in fired.drain(..) {
+                let deadline = base + (order.len() as u64 + 1) * step;
+                worst_late = worst_late.max(now.saturating_sub(deadline));
+                order.push(id);
+            }
+        }
+        core::hint::spin_loop();
+    }
+    let ok = order == ids && worst_late < 2_000_000; // within 2 ms
+    let _ = writeln!(
+        com1,
+        "origin-kernel: timers: 3 deadlines (1 cancelled) fired in order {order:?}, worst lateness {} us{}",
+        worst_late / 1000,
+        if ok { "" } else { ": timers failed" }
+    );
 }
 
 /// Proves the TCP connection core on the heap: a loopback connection establishes,
@@ -273,7 +314,7 @@ fn prove_tcp(com1: &mut console::Console) {
 /// to its request with the payload intact and the checksums valid (CLAUDE.md §54).
 fn prove_net(com1: &mut console::Console) {
     use framekernel::net::{
-        EthFrame, IcmpEcho, Ipv4, Ipv4Packet, Mac, ethertype, icmp_type, protocol,
+        EthFrame, IcmpEcho, Ipv4, Ipv4Packet, Mac, Udp, ethertype, icmp_type, protocol,
     };
     let a_mac = Mac([0x52, 0x54, 0, 0, 0, 0x0A]);
     let b_mac = Mac([0x52, 0x54, 0, 0, 0, 0x0B]);
@@ -339,10 +380,16 @@ fn prove_net(com1: &mut console::Console) {
         )
     })()
     .unwrap_or(false);
+    // A UDP datagram round-trip, checksum and all.
+    let mut udp = [0u8; 64];
+    let udp_ok = Udp::write(a_ip, b_ip, 12345, 53, b"origin udp", &mut udp)
+        .and_then(|n| Udp::parse(&udp[..n], a_ip, b_ip))
+        .is_some_and(|d| d.dst_port == 53 && d.payload == b"origin udp");
+    let all = ok && udp_ok;
     let _ = writeln!(
         com1,
-        "origin-kernel: net: {len}-byte Ethernet/IPv4/ICMP echo built, parsed and replied; payload and checksums intact {ok}{}",
-        if ok { "" } else { ": net failed" }
+        "origin-kernel: net: {len}-byte Ethernet/IPv4/ICMP echo built, parsed and replied; a UDP datagram round-tripped {udp_ok}; payload and checksums intact {ok}{}",
+        if all { "" } else { ": net failed" }
     );
 }
 

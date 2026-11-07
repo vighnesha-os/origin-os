@@ -599,6 +599,16 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 4 `tcp` tests (segment round trip with checksum and address binding, `seq_len`, `loopback_demo` over several payload sizes, and the full establish/data/close loopback); 152 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** retransmission and timers, flow and congestion control, reassembly, the socket API and port demultiplexing, and moving segments over a real NIC.
 
+### UDP, and a monotonic timer queue (CLAUDE.md §54, §68; 2026-11-08)
+
+- **UDP** (`net`): datagram parse/build with the IPv4 pseudo-header checksum and the length field, a zero stored checksum accepted (RFC 768), a computed zero sent as all ones. Self-validating: round-trip with address binding and corrupted-byte and bad-length rejections. The kernel's net proof now also round-trips a UDP datagram.
+- **Timer queue** (`timers`): a deadline-ordered set of `(id, deadline)` timers — `arm` (re-arming moves a timer), `cancel`, `next_deadline`, and `expire(now)` which removes and returns the due ids in deadline order. Kept sorted (O(1) peek, O(n) arm/cancel; a heap is a later optimization). Pure, no `unsafe`.
+  - Host tests include a 5 000-operation workload checked against a `BTreeMap` model after every step (length, next deadline and the exact fired set).
+  - Kernel proof (every boot): three timers armed at 5/10/15 ms on the monotonic clock, plus one cancelled, fire in order [10, 20, 30] with the cancelled one never firing; worst lateness 0 µs (the poll loop reads the clock tightly).
+- **Negative controls**, each failing the boot test: a UDP checksum left unwritten is rejected on parse (the net control already covers the ICMP path; UDP's is covered by host tests); `cancel` made a no-op so the cancelled timer fires → order [10, 20, 99, 30] → "timers failed".
+- **Test evidence:** 6 `net` tests (UDP among them) and 4 `timers` tests; 157 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** wiring the timer queue under the scheduler's sleeps and socket timeouts (it stands alone so far), a binary-heap implementation, and UDP/TCP port demultiplexing to sockets.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

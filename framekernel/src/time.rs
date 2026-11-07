@@ -56,6 +56,11 @@ pub(crate) fn monotonic_nanos() -> u64 {
     scale.nanos(rdtsc().saturating_sub(ENTRY_TSC.load(Ordering::Relaxed)))
 }
 
+/// The chosen TSC rate in Hz (1 before the clock is set up), for spin-wait budgets.
+pub(crate) fn tsc_hz() -> u64 {
+    SCALE.get().map_or(1, |s| s.hz())
+}
+
 /// Unix time in nanoseconds, or `None` if the wall clock was never set.
 pub(crate) fn wall_nanos() -> Option<u64> {
     let base = BOOT_WALL.load(Ordering::Relaxed);

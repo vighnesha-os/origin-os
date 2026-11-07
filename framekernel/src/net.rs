@@ -336,6 +336,88 @@ impl Arp {
     }
 }
 
+/// A parsed UDP datagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Udp<'a> {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub payload: &'a [u8],
+}
+
+/// The UDP header length.
+pub const UDP_HEADER: usize = 8;
+
+impl<'a> Udp<'a> {
+    /// Parses a UDP datagram inside an IPv4 packet from `src` to `dst`, checking the length
+    /// field and the checksum (a zero checksum means "not computed" and is accepted, as
+    /// RFC 768 allows).
+    pub fn parse(buf: &'a [u8], src: Ipv4, dst: Ipv4) -> Option<Self> {
+        let header = buf.get(..UDP_HEADER)?;
+        let length = u16::from_be_bytes([header[4], header[5]]) as usize;
+        if length < UDP_HEADER || length > buf.len() {
+            return None;
+        }
+        let datagram = buf.get(..length)?;
+        let stored = u16::from_be_bytes([header[6], header[7]]);
+        if stored != 0 && udp_checksum(src, dst, datagram) != 0 {
+            return None;
+        }
+        Some(Self {
+            src_port: u16::from_be_bytes([header[0], header[1]]),
+            dst_port: u16::from_be_bytes([header[2], header[3]]),
+            payload: buf.get(UDP_HEADER..length)?,
+        })
+    }
+
+    /// Builds a UDP datagram into `out` (header plus `payload`) with its checksum. Returns
+    /// the total length.
+    pub fn write(
+        src: Ipv4,
+        dst: Ipv4,
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Option<usize> {
+        let total = UDP_HEADER.checked_add(payload.len())?;
+        if total > 0xFFFF {
+            return None;
+        }
+        let buf = out.get_mut(..total)?;
+        buf[0..2].copy_from_slice(&src_port.to_be_bytes());
+        buf[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        buf[4..6].copy_from_slice(&(total as u16).to_be_bytes());
+        buf[6..8].copy_from_slice(&[0, 0]); // checksum placeholder
+        buf[UDP_HEADER..].copy_from_slice(payload);
+        let mut c = udp_checksum(src, dst, buf);
+        if c == 0 {
+            c = 0xFFFF; // RFC 768: a computed checksum of zero is sent as all ones
+        }
+        buf[6..8].copy_from_slice(&c.to_be_bytes());
+        Some(total)
+    }
+}
+
+/// The UDP checksum over the IPv4 pseudo-header and the datagram.
+pub fn udp_checksum(src: Ipv4, dst: Ipv4, datagram: &[u8]) -> u16 {
+    let len = (datagram.len() as u16).to_be_bytes();
+    let pseudo = [
+        src.0[0],
+        src.0[1],
+        src.0[2],
+        src.0[3],
+        dst.0[0],
+        dst.0[1],
+        dst.0[2],
+        dst.0[3],
+        0,
+        protocol::UDP,
+        len[0],
+        len[1],
+    ];
+    checksum_parts(&[&pseudo, datagram])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +526,38 @@ mod tests {
         bad[1] = 0;
         assert_eq!(Arp::parse(&bad), None);
         assert_eq!(Arp::parse(&buf[..27]), None, "short");
+    }
+
+    #[test]
+    fn udp_round_trips_and_checks_the_pseudo_header() {
+        let a = Ipv4([192, 168, 1, 2]);
+        let b = Ipv4([192, 168, 1, 1]);
+        let mut buf = [0u8; 64];
+        let payload = b"origin udp";
+        let n = Udp::write(a, b, 12345, 53, payload, &mut buf).unwrap();
+        assert_eq!(n, UDP_HEADER + payload.len());
+        let d = Udp::parse(&buf[..n], a, b).unwrap();
+        assert_eq!(
+            (d.src_port, d.dst_port, d.payload),
+            (12345, 53, &payload[..])
+        );
+        // The checksum binds the addresses and the bytes.
+        assert_eq!(
+            Udp::parse(&buf[..n], a, a),
+            None,
+            "wrong pseudo-header address"
+        );
+        let mut bad = buf;
+        bad[9] ^= 0xFF;
+        assert_eq!(Udp::parse(&bad[..n], a, b), None, "corrupted payload");
+        // A zero stored checksum is accepted (checksum not computed).
+        let mut zero = buf;
+        zero[6..8].copy_from_slice(&[0, 0]);
+        assert!(Udp::parse(&zero[..n], a, b).is_some());
+        // A length field past the buffer is refused.
+        let mut longlen = buf;
+        longlen[4..6].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        assert_eq!(Udp::parse(&longlen[..n], a, b), None);
     }
 
     #[test]

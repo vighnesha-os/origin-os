@@ -30,6 +30,7 @@
 //! - [`hpet`]: the ACPI HPET table and main-counter arithmetic;
 //! - [`net`]: Ethernet/IPv4/ICMP/ARP headers and the Internet checksum;
 //! - [`tcp`]: TCP segments and a minimal connection state machine;
+//! - [`timers`]: a monotonic-deadline timer queue;
 //! - [`nvme`]: NVMe controller registers, queue entries and indexes, Identify data;
 //! - [`paging`]: 4-level page tables with structural W^X (the `origin-paging` crate,
 //!   shared with the loader);
@@ -81,5 +82,6 @@ pub mod serial;
 pub mod tcp;
 #[cfg(test)]
 mod testing;
+pub mod timers;
 pub mod unwind;
 pub mod vfs;
