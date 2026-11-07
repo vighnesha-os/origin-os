@@ -4,8 +4,8 @@ use crate::error::{Error, SectionError};
 use crate::header::{ENTRY_SIZE, HEADER_SIZE, Header, Profile};
 use crate::read::{align_up, slice};
 use crate::section::{
-    Integrity, Kind, MAX_IMAGE_SPAN, MAX_SEGMENTS_EXE_LIB, NO_MERKLE, PAGE_SIZE, SMALL_ALIGN,
-    SectionEntry, merkle_hash_blocks,
+    Compression, Integrity, Kind, MAX_IMAGE_SPAN, MAX_SEGMENTS_EXE_LIB, NO_MERKLE, PAGE_SIZE,
+    SMALL_ALIGN, SectionEntry, merkle_hash_blocks,
 };
 
 /// What the caller vouches for before parsing.
@@ -39,6 +39,23 @@ pub struct Section<'a> {
     pub entry: SectionEntry,
     /// The stored (possibly compressed) bytes, not yet verified against `entry.digest`.
     pub stored: &'a [u8],
+}
+
+impl Section<'_> {
+    /// Checks an uncompressed, SHA-256-protected section (integrity 0), such as the
+    /// MANIFEST, against `entry.digest`, using a caller-supplied SHA-256. Call this before
+    /// decoding the section (ONBF-R1). Merkle-protected sections use `onbf-merkle`.
+    pub fn verify_sha256(&self, sha256: impl FnOnce(&[u8]) -> [u8; 32]) -> Result<(), Error> {
+        if self.entry.integrity != Integrity::Sha256 || self.entry.compression != Compression::None
+        {
+            return Err(Error::NotSha256Section(self.index));
+        }
+        if sha256(self.stored) == self.entry.digest {
+            Ok(())
+        } else {
+            Err(Error::SectionDigestMismatch(self.index))
+        }
+    }
 }
 
 /// Records an error against the section at `index`.

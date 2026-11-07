@@ -1,10 +1,23 @@
 //! `onbf-format`: the Origin Native Binary Format container parser (`docs/spec/ONBF.md`).
 //!
-//! This crate validates the container layer: the 128-byte header (§4.2), the section
-//! table (§4.3, §4.4) and the file layout (§4.1), and exposes the content-digest input
-//! (§4.5). Per ONBF-R1 it reads only the header, the table and the padding between items;
-//! it never interprets section content. OCBOR-1 manifests (§5), the signature block
-//! (§7.1) and Merkle verification (§4.6) are separate layers.
+//! - **Container:** [`Image::parse`] validates the 128-byte header (§4.2), the section
+//!   table (§4.3, §4.4) and the file layout (§4.1), and exposes the content-digest input
+//!   (§4.5). It reads only the header, the table and the padding between items (ONBF-R1).
+//! - **OCBOR-1 (§5):** [`ocbor::validate`] checks a deterministic-CBOR document, and
+//!   [`ocbor::Cursor`] reads one.
+//! - **KRN manifest:** [`KrnManifest::decode`] implements the KRN keys of
+//!   `docs/spec/ONBF-manifest-keys.md`.
+//!
+//! The order a loader follows (ONBF-R1):
+//! 1. `Image::parse`;
+//! 2. `verify_content_digest`;
+//! 3. verify the signatures (not yet implemented);
+//! 4. `Section::verify_sha256` on the manifest;
+//! 5. `KrnManifest::decode`;
+//! 6. `KrnManifest::check_against`.
+//!
+//! The signature block (§7.1) and Merkle verification (§4.6, crate `onbf-merkle`) are
+//! separate layers.
 //!
 //! Parser contract (ONBF §12): `no_std`, no allocation, no `unsafe`, no panics, typed
 //! errors, no partial results. Where the specification allowed more than one reading,
@@ -34,6 +47,8 @@
 mod error;
 mod header;
 mod image;
+mod manifest;
+pub mod ocbor;
 mod read;
 mod section;
 
@@ -43,6 +58,7 @@ pub use header::{
     MAX_SIGNATURE_BLOCK, Profile,
 };
 pub use image::{Image, ParseOptions, Section};
+pub use manifest::{Cet, CpuFeatures, FieldPath, KrnManifest, ManifestError, Toolchain};
 pub use section::{
     Compression, Flags, Integrity, Kind, MAX_IMAGE_SPAN, MAX_MANIFEST, MAX_SECTION_CONTENT,
     MAX_SEGMENTS_EXE_LIB, NO_MERKLE, PAGE_SIZE, SMALL_ALIGN, SectionEntry, merkle_hash_blocks,
@@ -50,3 +66,5 @@ pub use section::{
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_ocbor;

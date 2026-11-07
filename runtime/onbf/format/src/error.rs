@@ -53,6 +53,10 @@ pub enum Error {
     },
     /// The computed content digest differs from the header's `content_digest` (§4.5).
     ContentDigestMismatch,
+    /// `Section::verify_sha256` on a section that is compressed or not SHA-256-protected.
+    NotSha256Section(u16),
+    /// A section's SHA-256 differs from its entry digest.
+    SectionDigestMismatch(u16),
 }
 
 /// Why one section entry was rejected.

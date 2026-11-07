@@ -229,9 +229,16 @@ fn check() -> Result {
 /// above all a `core::panicking`, bounds-check or `copy_from_slice` length routine, is a
 /// panic path, which ONBF §12 forbids. Lints alone cannot show this; the emitted object can.
 const NO_PANIC_ALLOWED: &[&str] = &["memcpy", "memmove", "memset", "memcmp"];
-/// Allowed by substring of the mangled name: `core::fmt::Formatter::write_str`, used by
-/// `Debug` impls.
-const NO_PANIC_ALLOWED_PARTS: &[&str] = &["4core3fmtNtB5_9Formatter9write_str"];
+/// Allowed by substring of the mangled name. Each is a total `core` function that returns
+/// rather than panics:
+/// - `core::fmt::Formatter::write_str`, used by `Debug` impls;
+/// - `core::str::from_utf8`, used by OCBOR-1 text validation. It returns `Err` for any
+///   invalid input, is RFC 3629-strict, and under `forbid(unsafe_code)` it is the only way
+///   to turn checked bytes into `&str`.
+const NO_PANIC_ALLOWED_PARTS: &[&str] = &[
+    "4core3fmtNtB5_9Formatter9write_str",
+    "4core3str8converts9from_utf8",
+];
 
 /// Builds each freestanding library for the kernel target in release mode, as one object,
 /// and fails if it references any symbol outside the allowlist. A symbol defined by another

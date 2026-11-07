@@ -50,6 +50,8 @@ These follow directly from the text, but are written down so that a second, inde
 | R1 | §4.6 step 3 | `"ONBF-MERKLE-1"` is its 13 ASCII bytes, with no terminator or length prefix. | `onbf-merkle`, `tools/merkle_reference.py` |
 | R2 | §4.6 steps 1–2 | The zero padding of the last data block, and of each level's last hash block, is hashed as part of that block, so leaf and node hash inputs are always a full 4 KiB plus the prefix. | `onbf-merkle` |
 | R3 | §4.6 step 4 | "Highest level first" applies across levels. Within a level, hash blocks are stored in ascending index order. | `onbf-merkle` |
+| R4 | §5; key registry | The KRN `toolchain` text fields (`rustc`, `rustc_commit`, `llvm`) are non-empty printable ASCII (0x20–0x7E). That is stricter than §5's NFC rule, and trivially NFC, so the boot loader needs no Unicode normalization tables. `rustc_commit` is exactly 40 lowercase hex digits. | `onbf-format` (`KrnManifest`) |
+| R5 | §5 | "Items per container ≤ 65,536" counts elements for an array and key/value entries for a map. "Depth ≤ 16" counts nested containers, so the top-level map is depth 1, and an empty container still counts. | `onbf-format` (`ocbor`) |
 
 ## Open gaps
 

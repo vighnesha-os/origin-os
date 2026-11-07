@@ -1069,3 +1069,79 @@ fn bit_flips_in_header_and_table_are_rejected_outside_free_fields() {
     );
     assert!(accepted_free > 0);
 }
+
+// ------------------------------------------------------------------ the loader's order (ONBF-R1)
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    origin_crypto::Sha256::digest(bytes)
+}
+
+/// The test kernel image with a real KRN manifest and its true SHA-256 digest.
+fn kernel_with_manifest(doc: Vec<u8>) -> Builder {
+    let mut b = Builder::kernel();
+    b.sections[0].digest = sha256(&doc);
+    b.sections[0].stored = doc;
+    b
+}
+
+#[test]
+fn loader_order_verifies_then_decodes_the_krn_manifest() {
+    let img = kernel_with_manifest(crate::tests_ocbor::krn_manifest_bytes()).build();
+    let image = parse(&img).expect("valid KRN image");
+    assert_eq!(image.verify_content_digest(sha512), Ok(()));
+    let manifest = image.manifest().expect("one manifest");
+    assert_eq!(manifest.verify_sha256(sha256), Ok(()));
+    let krn = KrnManifest::decode(manifest.stored).expect("valid KRN manifest");
+    assert_eq!(krn.check_against(&image), Ok(()));
+    assert_eq!(krn.entry, 0x100);
+
+    // A tampered manifest byte fails its digest before anything decodes it.
+    let mut bad = img.clone();
+    bad[4096 + 3] ^= 1;
+    let image = parse(&bad).unwrap();
+    assert_eq!(
+        image.manifest().unwrap().verify_sha256(sha256),
+        Err(Error::SectionDigestMismatch(0))
+    );
+    // A Merkle-protected section is not a SHA-256 section.
+    let image = parse(&img).unwrap();
+    assert_eq!(
+        image.section(1).unwrap().verify_sha256(sha256),
+        Err(Error::NotSha256Section(1))
+    );
+}
+
+#[test]
+fn krn_entry_must_point_into_executable_code() {
+    // The text segment is RX at RVA 0 with 5000 bytes of content (8192 in memory); the
+    // data segment is RW at 8192.
+    for (entry, ok) in [
+        (0u64, true),
+        (0x100, true),
+        (4999, true),
+        (5000, false), // the zero-filled tail of the RX segment
+        (8191, false),
+        (8192 + 4, false), // the RW segment
+        (1 << 20, false),  // outside every segment
+    ] {
+        let doc = crate::tests_ocbor::krn_manifest_with_entry(entry);
+        let img = kernel_with_manifest(doc).build();
+        let image = parse(&img).unwrap();
+        let krn = KrnManifest::decode(image.manifest().unwrap().stored).unwrap();
+        let want = if ok {
+            Ok(())
+        } else {
+            Err(ManifestError::EntryNotExecutable(entry))
+        };
+        assert_eq!(krn.check_against(&image), want, "entry {entry:#x}");
+    }
+    // The same manifest inside an EXE image is not a kernel.
+    let mut b = Builder::minimal(Profile::Exe as u16);
+    let doc = crate::tests_ocbor::krn_manifest_bytes();
+    b.sections[0].digest = sha256(&doc);
+    b.sections[0].stored = doc;
+    let img = b.build();
+    let image = parse(&img).unwrap();
+    let krn = KrnManifest::decode(image.manifest().unwrap().stored).unwrap();
+    assert_eq!(krn.check_against(&image), Err(ManifestError::NotKrn));
+}

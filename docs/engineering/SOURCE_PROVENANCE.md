@@ -143,14 +143,31 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - a hand-written `version` in a crate manifest fails `xtask check`, naming the file and line.
 - **Licensing:** project licence not chosen yet.
 
-## `runtime/onbf/format/` (`onbf-format`), the ONBF container parser, T9 part 1
+## `runtime/onbf/format/` (`onbf-format`), the ONBF parser: container, OCBOR-1, KRN manifest
 
-- **What:** it validates an ONBF image's container layer:
-  - the header (§4.2), the section table (§4.3) and the kind/profile table (§4.4);
-  - the file layout (§4.1): canonical section offsets, zero padding, and the signature block at EOF;
-  - the Merkle cross-references (sizes and exactly one referrer).
+- **What:**
+  - **Container layer** (T9 part 1). It validates:
+    - the header (§4.2), the section table (§4.3) and the kind/profile table (§4.4);
+    - the file layout (§4.1): canonical section offsets, zero padding, and the signature block at EOF;
+    - the Merkle cross-references (sizes and exactly one referrer).
 
-  It exposes the §4.5 content-digest input and a digest check that takes a caller-supplied SHA-512. Per ONBF-R1 it never interprets section content. Not yet included: OCBOR-1 (§5), the signature block's contents (§7.1), Merkle hashing (§4.6) and profile-level rules.
+    It exposes the §4.5 content-digest input, a digest check that takes a caller-supplied SHA-512, and `Section::verify_sha256` for SHA-256-protected sections. `Image::parse` never interprets section content (ONBF-R1).
+  - **OCBOR-1 (§5), `ocbor` module.** `validate` checks a whole document in one pass with an explicit 16-frame stack and no recursion (ONBF-R10). It enforces:
+    - allowed types only;
+    - shortest integers and lengths;
+    - unsigned, strictly ascending map keys;
+    - depth, item, text and size limits;
+    - strict UTF-8;
+    - no trailing data.
+
+    `Cursor` reads a validated document item by item.
+  - **KRN manifest** (`KrnManifest`), from `docs/spec/ONBF-manifest-keys.md` (K1–K4) and errata R4–R5:
+    - all seven keys are required;
+    - unknown keys below 1000 are rejected, and extensions are skipped, including in nested maps;
+    - field types, lengths and ranges are checked;
+    - reserved feature bits and IBT are rejected;
+    - `check_against(&Image)` confirms the profile is KRN and that `entry` lies in the content of an RX segment.
+  - **Not yet included:** the signature block's contents (§7.1), Merkle verification of sections (crate `onbf-merkle`), and the other profiles' manifests.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code written from `docs/spec/ONBF.md` v1.0.
 - **Architecture decisions:**
   - ADR-0001.
@@ -184,7 +201,17 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - every one of 10,732 padding bytes is checked;
     - all 5,120 single-bit flips of the header and table are rejected, except in fields with other valid values, all of which are digest-covered (errata, "Observed by the bit-flip sweep").
   - Since the SHA-2 work, content digests in the tests are real SHA-512 from `origin-crypto`, a dev-dependency only.
-  - **No panic paths:** the release object for `x86_64-unknown-none` references only `memset` (`xtask check`, no-panic step).
+  - **OCBOR-1 and KRN manifest** (15 more tests, 32 in all, in `tests_ocbor.rs` plus two in `tests.rs`):
+    - **RFC 8949 Appendix A:** 34 examples OCBOR-1 accepts decode to the right items. 13 that the profile excludes (floats, tags including a bignum, `undefined`, simple values, indefinite lengths, text keys) are rejected for the right reason.
+    - **§13 item 4 manifest corpus:**
+      - 10 non-shortest encodings;
+      - 15 malformed items (reserved additional information, a stray break, truncations, trailing data, an overlong NUL, a surrogate);
+      - 6 key-order cases (descending, duplicate, negative, bytes and bool keys, a nested map);
+      - limits at their exact boundaries: depth 16 and 17, 65,536 and 65,537 items, 64 KiB and 64 KiB + 1 of text, 1 MiB + 1 of document.
+    - **KRN schema:** every required key missing; unknown keys 6, 23, 25 and 999; extensions skipped at the top level and in nested maps; 20 invalid-field cases.
+    - **Loader order:** parse, content digest, manifest SHA-256, decode, entry check, end to end with real SHA-256 and SHA-512. A tampered manifest fails its digest before decoding. The entry check is tested at 7 boundaries, plus a KRN manifest inside an EXE image.
+    - **Canonical-encoding property (ONBF-R6):** all 1,208 single-bit flips of a KRN manifest were tried. Every flip the decoder accepts re-encodes to exactly the flipped bytes, so no accepted document has a second reading. Every truncation is rejected.
+  - **No panic paths:** the release object for `x86_64-unknown-none` references only `memset` and `core::str::from_utf8` (`xtask check`, no-panic step). The latter was added to the allowlist with a justification: it is total and RFC 3629-strict, and under `forbid(unsafe_code)` it is the only way to turn bytes into `&str`.
   - Not done yet: fuzzing (§13 item 3), Kani bounds (item 5) and the N-version check (item 6).
 - **Licensing:** project licence not chosen yet.
 
@@ -261,7 +288,10 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `check`:
     - rustfmt, clippy and tests per crate and target. The freestanding libraries (`onbf-format`, `onbf-merkle`, `origin-crypto`) are checked on the host, `x86_64-unknown-uefi` and `x86_64-unknown-none`;
     - the UEFI release build;
-    - a **no-panic step**: each freestanding library is rebuilt for the kernel target in release mode. Its object may reference only `memcpy`, `memmove`, `memset`, `memcmp`, `core::fmt::Formatter::write_str`, or symbols *defined by another freestanding library's object*, since those pass the same check;
+    - a **no-panic step**: each freestanding library is rebuilt for the kernel target in release mode. Its object may reference only:
+      - `memcpy`, `memmove`, `memset` or `memcmp`;
+      - the total `core` functions `Formatter::write_str` and `str::from_utf8`;
+      - symbols *defined by another freestanding library's object*, since those pass the same check;
     - two lints:
       - CLAUDE.md §11: no `target_os = "linux"` in any Rust file outside `developer-tools/`;
       - CLAUDE.md §62: no `version` in the `[package]` or `[workspace.package]` section of any Cargo manifest.
