@@ -198,6 +198,10 @@ The owner asked for the design to be finalised with the recommended options, fol
 | `87bd46a` | Boot proof: extract an embedded ustar initramfs into a VFS (§21) |
 | `5188d53` | DHCP client (build/parse + lease state machine) |
 | `6a7a417` | DEFLATE (RFC 1951) decompression, all three block types |
+| `5649c4f` | zlib and gzip wrappers over DEFLATE, with Adler-32 |
+| `8e6bb84` | Records: STATUS/handoff for the ustar/deflate/dhcp batch |
+| `e6145a5` | Base64 encode/decode (RFC 4648) |
+| `b789c50` | JSON parser (RFC 8259), depth-limited |
 
 (The 2026-11-08 commits use the Claude Opus 4.8 attribution; the run spanned midnight.)
 
@@ -309,3 +313,20 @@ By ~04:55 IST, **238 framekernel host library tests** pass; `cargo xtask check`,
 and `boot-matrix` (1/2/4) pass. The library now carries 46 host-tested modules. Still
 QEMU-only (§74); ADR-0005 (syscalls) and the owner's non-design items (downloads, a licence,
 merge/push) remain.
+
+### Continued (2026-11-08, ~04:55–05:10 IST), and a verification checkpoint
+
+- **Compression stack.** The zlib (RFC 1950, Adler-32) and gzip (RFC 1952, CRC-32 reusing
+  `gpt::crc32`) wrappers now sit over the DEFLATE decoder, so real `.gz`/zlib data decodes;
+  `inflate` reports bytes consumed so the trailer can be located and verified.
+- **Data-format parsers.** `base64` (RFC 4648, whitespace-tolerant, RFC vectors) and `json`
+  (RFC 8259, recursive descent, depth-limited against stack overflow, numbers kept as source
+  text since `core` has no `no_std` float parser) — the config/manifest/SDK and PEM/token
+  paths now have their codecs.
+
+**Verification checkpoint (~05:10 IST):** the full workspace is **490 tests, 0 failures**;
+the 40× mutation soak runs **12 parser suites** with 0 failures (~32 s); `cargo xtask check`,
+`boot-test`, and `boot-matrix` (1/2/4) all pass, with the NUMA, entropy and initramfs boot
+proofs consistent; an 8-CPU boot was confirmed earlier in the run. **249 framekernel host
+library tests across 49 modules.** Everything remains QEMU-only (§74); ADR-0005 and the
+owner's non-design items (downloads, a licence, merge/push) remain.
