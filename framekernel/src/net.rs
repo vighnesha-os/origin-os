@@ -528,6 +528,62 @@ mod tests {
         assert_eq!(Arp::parse(&buf[..27]), None, "short");
     }
 
+    /// Every parser survives arbitrary mutated and random input without panicking, and
+    /// anything it accepts is self-consistent (CLAUDE.md §72).
+    #[test]
+    fn mutations_never_panic_and_accepted_packets_are_consistent() {
+        use crate::testing::{Rng, mutate};
+        let a = Ipv4([10, 0, 0, 1]);
+        let b = Ipv4([10, 0, 0, 2]);
+        let mut ip = [0u8; 128];
+        let ip_len = Ipv4Packet::write(a, b, protocol::ICMP, 64, 1, b"payload", &mut ip).unwrap();
+        let mut icmp = [0u8; 64];
+        let icmp_len = IcmpEcho::write(icmp_type::ECHO_REQUEST, 1, 2, b"abc", &mut icmp).unwrap();
+        let mut udp = [0u8; 64];
+        let udp_len = Udp::write(a, b, 1, 2, b"abc", &mut udp).unwrap();
+        let mut arp = [0u8; 28];
+        Arp {
+            operation: arp_op::REQUEST,
+            sender_mac: Mac([1; 6]),
+            sender_ip: a,
+            target_mac: Mac([0; 6]),
+            target_ip: b,
+        }
+        .write(&mut arp)
+        .unwrap();
+
+        let mut rng = Rng::new(0x4E_4554);
+        let (mut ips, mut udps) = (0u64, 0u64);
+        for case in 0..crate::testing::cases(4000) {
+            let mut v = match case % 5 {
+                0 => ip[..ip_len].to_vec(),
+                1 => icmp[..icmp_len].to_vec(),
+                2 => udp[..udp_len].to_vec(),
+                3 => arp.to_vec(),
+                _ => alloc::vec![rng.byte(); (rng.next() % 40) as usize],
+            };
+            mutate(&mut v, &mut rng);
+            // None of these may panic on any input.
+            let _ = EthFrame::parse(&v);
+            let _ = IcmpEcho::parse(&v);
+            let _ = Arp::parse(&v);
+            if let Some(p) = Ipv4Packet::parse(&v) {
+                ips += 1;
+                // An accepted IPv4 packet: its payload lies within what we fed.
+                assert!(p.payload.len() <= v.len(), "case {case}");
+            }
+            if let Some(d) = Udp::parse(&v, a, b) {
+                udps += 1;
+                assert!(UDP_HEADER + d.payload.len() <= v.len(), "case {case}");
+            }
+        }
+        // The valid seeds, unmutated, still parse (the mutator can also leave them alone).
+        assert!(
+            ips > 0 && udps > 0,
+            "{ips} ipv4, {udps} udp accepted across the run"
+        );
+    }
+
     #[test]
     fn udp_round_trips_and_checks_the_pseudo_header() {
         let a = Ipv4([192, 168, 1, 2]);

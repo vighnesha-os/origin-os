@@ -490,6 +490,42 @@ mod tests {
         );
     }
 
+    /// Segment parsing never panics on mutated or random input, and an accepted segment
+    /// has a payload within the buffer (CLAUDE.md §72).
+    #[test]
+    fn mutations_never_panic() {
+        use crate::testing::{Rng, mutate};
+        let mut buf = [0u8; 80];
+        let n = Segment::write(
+            A_IP,
+            B_IP,
+            1,
+            2,
+            123,
+            456,
+            flag::ACK | flag::PSH,
+            1024,
+            b"payload!!",
+            &mut buf,
+        )
+        .unwrap();
+        let mut rng = Rng::new(0x5443_5020);
+        let mut accepted = 0u64;
+        for case in 0..crate::testing::cases(4000) {
+            let mut v = if case % 3 == 2 {
+                std::vec![rng.byte(); (rng.next() % 40) as usize]
+            } else {
+                buf[..n].to_vec()
+            };
+            mutate(&mut v, &mut rng);
+            if let Some(seg) = Segment::parse(&v, A_IP, B_IP) {
+                accepted += 1;
+                assert!(seg.payload.len() <= v.len(), "case {case}");
+            }
+        }
+        assert!(accepted > 0, "{accepted} segments accepted");
+    }
+
     #[test]
     fn seq_len_counts_syn_and_fin() {
         let mut buf = [0u8; 40];
