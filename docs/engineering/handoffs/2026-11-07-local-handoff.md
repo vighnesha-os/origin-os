@@ -137,3 +137,5 @@ Final state at 20:20: `cargo xtask check` and `cargo xtask boot-matrix` pass; th
 | ceccf62 | the higher-half kernel with KASLR (H1–H4), boot info 0.3 |
 
 **The kernel no longer runs identity-mapped.** RAM is at `direct_map_base + physical` (use `phys::to_virt`/`to_phys`), the image at `kernel_virtual_base`; the lower half is empty and belongs to user space. Next: per-process address spaces sharing the kernel half (M4), then H5 (global pages, PCIDs).
+
+M4 began with per-process address spaces (`process::Process`, CR3 per thread in the scheduler); the next M4 decisions (process ABI, handles, IPC) need an ADR and the owner's approval (§84).

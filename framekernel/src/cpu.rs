@@ -691,6 +691,25 @@ pub(crate) fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// CR3: the physical address of the live PML4 (and, with PCIDs off, nothing else).
+pub(crate) fn read_cr3() -> u64 {
+    let value: u64;
+    // SAFETY: reading CR3 at CPL 0 has no side effect.
+    unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
+/// Loads `root` into CR3, which also flushes every non-global TLB entry.
+///
+/// # Safety
+///
+/// `root` must be a complete PML4 that maps everything the running code touches next (its
+/// code, stack and data): in practice the kernel's, or a process PML4 sharing its half.
+pub(crate) unsafe fn write_cr3(root: u64) {
+    // SAFETY: the caller's contract.
+    unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+}
+
 /// The time-stamp counter.
 pub(crate) fn rdtsc() -> u64 {
     let (low, high): (u32, u32);

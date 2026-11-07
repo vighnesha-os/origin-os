@@ -32,6 +32,7 @@ use framekernel::report;
 mod cpu;
 mod memory;
 mod phys;
+mod process;
 mod sched;
 mod smp;
 mod timer;

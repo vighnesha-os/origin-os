@@ -94,6 +94,21 @@ pub(crate) fn reclaim_loader_memory() -> Option<(u64, u64)> {
     })
 }
 
+/// One free 4 KiB frame (physical address), or `None`.
+pub(crate) fn allocate_frame() -> Option<u64> {
+    without_interrupts(|| MEMORY.lock().as_mut()?.frames.allocate())
+}
+
+/// Returns a frame from [`allocate_frame`]; `false` if the allocator refused it.
+pub(crate) fn free_frame(frame: u64) -> bool {
+    without_interrupts(|| {
+        MEMORY
+            .lock()
+            .as_mut()
+            .is_some_and(|m| m.frames.free(frame).is_ok())
+    })
+}
+
 /// The kernel's global allocator.
 struct KernelAllocator;
 

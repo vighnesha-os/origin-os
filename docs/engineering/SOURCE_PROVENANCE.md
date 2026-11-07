@@ -258,6 +258,14 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Copy from user memory** (system call 2, write): the buffer must lie in the user half and every page must be a user page (a table walk), and the copy runs in a STAC/CLAC window as a probe-armed `rep movsb`, so a fault mid-copy returns EFAULT. The first version checked only the range and leaked eight bytes of kernel memory to a user program, because the kernel is identity-mapped in the lower half; the page-table check fixed it, and that run is the negative control. Proof: "valid buffer -> 17, kernel address -> EFAULT, unmapped user address -> EFAULT".
 - **Not done:** per-process address spaces (the user pages live in the kernel's tables; ADR-0004 comes first), `swapgs`, SYSRET, process objects and capabilities (M4).
 
+### M4: process address spaces (2026-11-07)
+
+- **What:** `origin-paging` gains `upper_half`/`set_upper_half` and `map_user` (lower half only). `process::Process` owns a PML4 whose kernel half (entries 256–511) is copied from the kernel's tables (ADR-0004 H2) and whose lower half holds only its own pages; its page tables come from the frame allocator through a `TableMemory` that answers only for frames it allocated itself; `destroy` frees them. The scheduler records each thread's address space and, on every switch, loads its CR3 (the kernel's for kernel threads) when it differs, next to TSS.RSP0; `spawn_in` starts a thread in a given address space.
+- **Proof** (every boot): two processes run the same program at the same virtual addresses (code 0x400000, data 0x500000, stack 0x600000) at the same time, each storing its own value (11, 22), being preempted while the other stores its own at the same address, then reading back: the reports are exactly bits 11 and 22; the kernel's tables do not map 0x500000; the two PML4s differ. Both are destroyed afterwards and their frames freed.
+- **Control:** both threads in the first address space read back 11 (reports 0x800), and the boot test fails.
+- **Test evidence:** 15 `origin-paging` tests (one for the shared kernel half and per-space user frames); `cargo xtask boot-matrix` passes at 1, 2 and 4 CPUs; `cargo xtask check` passes.
+- **Not done:** process objects with handles and capabilities, a process's user copies checked against its own tables (`copy_from_user` still checks the kernel's), more than 32 table frames per process, PCIDs (H5), loading programs from `.ose` images.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

@@ -226,6 +226,52 @@ impl AddressSpace {
         self.root
     }
 
+    /// The raw PML4 entries 256–511: the kernel half (ADR-0004 H2).
+    pub fn upper_half(&self, mem: &impl TableMemory) -> Option<[u64; ENTRIES / 2]> {
+        let table = mem.table(self.root)?;
+        let mut out = [0u64; ENTRIES / 2];
+        for (o, e) in out.iter_mut().zip(table.iter().skip(ENTRIES / 2)) {
+            *o = e.load(Ordering::Relaxed);
+        }
+        Some(out)
+    }
+
+    /// Installs `entries` as PML4 entries 256–511, so this address space shares the kernel
+    /// half of another (whose tables this one never walks or edits: every address this
+    /// space maps for itself is in the lower half).
+    pub fn set_upper_half(
+        &mut self,
+        mem: &impl TableMemory,
+        entries: &[u64; ENTRIES / 2],
+    ) -> Result<(), MapError> {
+        let table = mem
+            .table(self.root)
+            .ok_or(MapError::UnknownTable(self.root))?;
+        for (e, v) in table.iter().skip(ENTRIES / 2).zip(entries) {
+            e.store(*v, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Maps the 4 KiB **user** page at `virt` (lower half only) to `phys`.
+    pub fn map_user(
+        &mut self,
+        mem: &mut impl TableMemory,
+        virt: u64,
+        phys: u64,
+        access: Access,
+    ) -> Result<(), MapError> {
+        if virt >= 1 << 47 {
+            return Err(MapError::NonCanonical(virt));
+        }
+        let attributes = Attributes {
+            access,
+            user: true,
+            global: false,
+        };
+        self.map(mem, virt, phys, attributes)
+    }
+
     /// The table below the entry for `virt` at `level` of `table`, created if absent.
     fn next_table(
         mem: &mut impl TableMemory,
@@ -644,6 +690,45 @@ mod tests {
         }
         assert!(!space.translate(&mem, 0x1000).unwrap().user);
         assert!(space.translate(&mem, 0x2000).unwrap().user);
+    }
+
+    #[test]
+    fn address_spaces_share_the_kernel_half_and_keep_their_lower_halves() {
+        let tables = arena(16);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut kspace = AddressSpace::new(&mut mem).unwrap();
+        let high = 0xFFFF_FFFF_8000_0000;
+        kspace
+            .map(&mut mem, high, 0x20_0000, kernel(Access::ReadExecute))
+            .unwrap();
+        let half = kspace.upper_half(&mem).unwrap();
+        let mut a = AddressSpace::new(&mut mem).unwrap();
+        let mut b = AddressSpace::new(&mut mem).unwrap();
+        a.set_upper_half(&mem, &half).unwrap();
+        b.set_upper_half(&mem, &half).unwrap();
+        // The kernel's mapping is visible in both.
+        for s in [&a, &b] {
+            assert_eq!(s.translate(&mem, high).map(|t| t.phys), Some(0x20_0000));
+        }
+        // The same user address maps to different frames in each.
+        a.map_user(&mut mem, 0x40_0000, 0x10_0000, Access::ReadWrite)
+            .unwrap();
+        b.map_user(&mut mem, 0x40_0000, 0x11_0000, Access::ReadWrite)
+            .unwrap();
+        let ta = a.translate(&mem, 0x40_0000).unwrap();
+        let tb = b.translate(&mem, 0x40_0000).unwrap();
+        assert_eq!((ta.phys, tb.phys), (0x10_0000, 0x11_0000));
+        assert!(ta.user && tb.user);
+        assert_eq!(
+            kspace.translate(&mem, 0x40_0000),
+            None,
+            "not in the kernel's half"
+        );
+        assert_eq!(
+            a.map_user(&mut mem, high, 0, Access::Read),
+            Err(MapError::NonCanonical(high)),
+            "user mappings stay in the lower half"
+        );
     }
 
     #[test]

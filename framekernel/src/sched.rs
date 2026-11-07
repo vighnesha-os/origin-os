@@ -55,15 +55,33 @@ pub(crate) fn on_tick(interrupted: u64) -> u64 {
     with_queue(interrupted, |q| Some(q.tick(interrupted)))
 }
 
-/// Points TSS.RSP0 at the kernel stack of the thread in `slot` on CPU `id`, so an
-/// interrupt from user mode always lands on the running thread's own stack. The boot or
-/// idle flow (no recorded stack) never runs in user mode, so RSP0 is left as it is.
-fn follow_kernel_stack(id: usize, slot: usize) {
-    if let Some(stack) = THREADS
-        .get(id)
-        .and_then(|t| t.lock().stacks.get(slot).copied().flatten())
-    {
+/// Prepares CPU `id` to resume the thread in `slot`: TSS.RSP0 points at its kernel stack,
+/// so an interrupt from user mode always lands on the running thread's own stack (the boot
+/// or idle flow, with no recorded stack, never runs in user mode), and CR3 holds its
+/// address space (the kernel's for kernel threads), loaded only when it differs.
+fn follow_thread(id: usize, slot: usize) {
+    let Some(threads) = THREADS.get(id) else {
+        return;
+    };
+    let (stack, root) = {
+        let t = threads.lock();
+        (
+            t.stacks.get(slot).copied().flatten(),
+            t.roots.get(slot).copied().unwrap_or(0),
+        )
+    };
+    if let Some(stack) = stack {
         cpu::set_kernel_stack((stack.guard + 4096 + stack.bytes as u64) & !0xF);
+    }
+    let want = if root == 0 {
+        crate::vm::kernel_root()
+    } else {
+        root
+    };
+    if want != 0 && cpu::read_cr3() != want {
+        // SAFETY: `want` is the kernel's PML4 or a process PML4 whose kernel half is the
+        // kernel's, so the code, stacks and data this handler is using stay mapped.
+        unsafe { cpu::write_cr3(want) };
     }
 }
 
@@ -102,12 +120,15 @@ struct ThreadStack {
 struct Threads {
     stacks: [Option<ThreadStack>; framekernel::runqueue::CAPACITY],
     zombies: [Option<ThreadStack>; framekernel::runqueue::CAPACITY],
+    /// Each slot's address space (its PML4); 0 means the kernel's.
+    roots: [u64; framekernel::runqueue::CAPACITY],
 }
 
 static THREADS: [SpinLock<Threads>; MAX_CPUS] = [const {
     SpinLock::new(Threads {
         stacks: [None; framekernel::runqueue::CAPACITY],
         zombies: [None; framekernel::runqueue::CAPACITY],
+        roots: [0; framekernel::runqueue::CAPACITY],
     })
 }; MAX_CPUS];
 
@@ -152,7 +173,7 @@ fn with_queue(interrupted: u64, f: impl FnOnce(&mut RunQueue) -> Option<u64>) ->
         (Some(active), Some(queue)) if active.load(Ordering::Acquire) => {
             let mut q = queue.lock();
             let next = f(&mut q).unwrap_or(interrupted);
-            follow_kernel_stack(id, q.current());
+            follow_thread(id, q.current());
             next
         }
         _ => interrupted,
@@ -179,6 +200,9 @@ pub(crate) fn on_exit(interrupted: u64) -> u64 {
         if let Some(threads) = THREADS.get(id) {
             let mut t = threads.lock();
             let stack = t.stacks.get_mut(slot).and_then(Option::take);
+            if let Some(r) = t.roots.get_mut(slot) {
+                *r = 0;
+            }
             if let Some(free) = t.zombies.iter_mut().find(|z| z.is_none()) {
                 *free = stack;
             }
@@ -234,6 +258,17 @@ pub(crate) fn spawn(
     entry: extern "sysv64" fn(u64) -> !,
     arg: u64,
 ) -> Result<usize, QueueError> {
+    spawn_in(cpu, entry, arg, 0)
+}
+
+/// As [`spawn`], in the address space whose PML4 is `root` (0: the kernel's). The thread
+/// starts in kernel mode; a process thread then enters user mode in that space.
+pub(crate) fn spawn_in(
+    cpu: usize,
+    entry: extern "sysv64" fn(u64) -> !,
+    arg: u64,
+    root: u64,
+) -> Result<usize, QueueError> {
     let queue = QUEUES.get(cpu).ok_or(QueueError::Full)?;
     let (stack, guard) = guarded_stack(THREAD_STACK).ok_or(QueueError::Full)?;
     let _ = FIRST_GUARD.compare_exchange(0, guard, Ordering::Relaxed, Ordering::Relaxed);
@@ -263,10 +298,14 @@ pub(crate) fn spawn(
     };
     without_interrupts(|| {
         let slot = queue.lock().push(frame_at)?;
-        if let Some(threads) = THREADS.get(cpu)
-            && let Some(s) = threads.lock().stacks.get_mut(slot)
-        {
-            *s = Some(record);
+        if let Some(threads) = THREADS.get(cpu) {
+            let mut t = threads.lock();
+            if let Some(s) = t.stacks.get_mut(slot) {
+                *s = Some(record);
+            }
+            if let Some(r) = t.roots.get_mut(slot) {
+                *r = root;
+            }
         }
         Ok(slot)
     })

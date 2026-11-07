@@ -342,6 +342,9 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool
     if ok {
         ok &= copies(com1, bsp, tsc_hz);
     }
+    if ok {
+        ok &= processes(com1, bsp, tsc_hz);
+    }
     let _ = vm::unmap(CODE);
     let _ = vm::unmap(STACK);
     sched::yield_until(|| sched::reap() == 0, tsc_hz, 1);
@@ -354,4 +357,119 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool
         dealloc(stack, layout);
     }
     ok
+}
+
+/// Where every process's program, data and stack live (the same addresses in each).
+const PROCESS_CODE: u64 = 0x40_0000;
+const PROCESS_DATA: u64 = 0x50_0000;
+const PROCESS_STACK: u64 = 0x60_0000;
+
+/// Stores `value` at `PROCESS_DATA`, spins long enough to be preempted (so the other
+/// process runs and stores its own value at the same virtual address), reads the address
+/// back, reports what it read, and exits.
+fn isolation_program(value: u8) -> alloc::vec::Vec<u8> {
+    let data = (PROCESS_DATA as u32).to_le_bytes();
+    let mut p = alloc::vec![0xB8, value, 0, 0, 0]; // mov eax, value
+    p.extend_from_slice(&[0x48, 0x89, 0x04, 0x25]); // mov [data], rax
+    p.extend_from_slice(&data);
+    p.push(0xB9); // mov ecx, SPIN
+    p.extend_from_slice(&SPIN.to_le_bytes());
+    p.extend_from_slice(&[0xFF, 0xC9, 0x75, 0xFC]); // 1: dec ecx; jnz 1b
+    p.extend_from_slice(&[0x48, 0x8B, 0x3C, 0x25]); // mov rdi, [data]
+    p.extend_from_slice(&data);
+    p.extend_from_slice(&[0xB8, 1, 0, 0, 0, 0xCD, 0x80]); // report
+    p.extend_from_slice(&[0x31, 0xFF, 0x31, 0xC0, 0xCD, 0x80, 0xEB, 0xFE]); // exit 0
+    p
+}
+
+/// A thread of a process: the scheduler has loaded the process's CR3 before running it.
+extern "sysv64" fn process_thread(entry: u64) -> ! {
+    match sched::current_stack_top() {
+        Some(top) => {
+            cpu::set_kernel_stack(top);
+            // SAFETY: `entry` and the stack are user pages of this thread's process, whose
+            // address space is live (the scheduler loaded it); RSP0 is this thread's own
+            // kernel stack.
+            unsafe { cpu::enter_user(entry, PROCESS_STACK + 4096, cpu::cpu_local_base()) }
+        }
+        None => sched::exit(),
+    }
+}
+
+/// Two processes run the same program at the same virtual addresses at the same time,
+/// each in its own address space: each must read back only its own value, the kernel's
+/// tables must not map their pages, and their PML4s must differ.
+fn processes(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool {
+    let Ok(layout) = Layout::from_size_align(4096, 4096) else {
+        return false;
+    };
+    let mut frames = [ptr::null_mut::<u8>(); 6];
+    for f in &mut frames {
+        // SAFETY: non-zero size.
+        *f = unsafe { alloc_zeroed(layout) };
+        if f.is_null() {
+            return false;
+        }
+    }
+    let phys = |p: *mut u8| crate::phys::to_phys(p.expose_provenance() as u64);
+    let mut procs = [None, None];
+    let mut ok = true;
+    for (k, value) in [(0usize, 11u8), (1, 22)] {
+        let (code, data, stack) = (frames[3 * k], frames[3 * k + 1], frames[3 * k + 2]);
+        let bytes = isolation_program(value);
+        // SAFETY: the program is under 64 bytes and lands inside the fresh code frame.
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), code, bytes.len()) };
+        let Some(mut p) = crate::process::Process::new() else {
+            return false;
+        };
+        ok &= p.map(PROCESS_CODE, phys(code), Access::ReadExecute).is_ok()
+            && p.map(PROCESS_DATA, phys(data), Access::ReadWrite).is_ok()
+            && p.map(PROCESS_STACK, phys(stack), Access::ReadWrite).is_ok();
+        procs[k] = Some(p);
+    }
+    let roots: [u64; 2] = [
+        procs[0].as_ref().map_or(0, |p| p.root()),
+        procs[1].as_ref().map_or(0, |p| p.root()),
+    ];
+    let in_kernel_space = vm::is_mapped(PROCESS_DATA);
+    let in_each = procs.iter().flatten().all(|p| p.is_mapped(PROCESS_DATA));
+    REPORT_MASK.store(0, Ordering::Relaxed);
+    let ended = ENDED.load(Ordering::Acquire);
+    if ok {
+        for root in roots {
+            if sched::spawn_in(bsp, process_thread, PROCESS_CODE, root).is_err() {
+                ok = false;
+            }
+        }
+        sched::yield_until(|| ENDED.load(Ordering::Acquire) >= ended + 2, tsc_hz, 10);
+    }
+    let mask = REPORT_MASK.load(Ordering::Relaxed);
+    let right = ok
+        && mask == (1 << 11) | (1 << 22)
+        && ENDED.load(Ordering::Acquire) == ended + 2
+        && !in_kernel_space
+        && in_each
+        && roots[0] != roots[1];
+    let _ = writeln!(
+        com1,
+        "origin-kernel: processes: PML4 {:#x} and {:#x} ran the same program at {PROCESS_CODE:#x} at once and read back {mask:#x} from {PROCESS_DATA:#x} (own values only: 0x400800); not mapped in the kernel's tables: {}{}",
+        roots[0],
+        roots[1],
+        !in_kernel_space,
+        if right {
+            ""
+        } else {
+            ": process isolation failed"
+        }
+    );
+    // Both threads have exited, and this boot flow runs on the kernel's CR3 again, so no
+    // processor uses either address space any more.
+    for p in procs.into_iter().flatten() {
+        p.destroy();
+    }
+    for f in frames {
+        // SAFETY: each frame came from `alloc_zeroed(layout)` and is no longer mapped.
+        unsafe { dealloc(f, layout) };
+    }
+    right
 }

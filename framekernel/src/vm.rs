@@ -14,8 +14,26 @@ struct KernelSpace {
 
 static KERNEL_SPACE: SpinLock<Option<KernelSpace>> = SpinLock::new(None);
 
+/// The kernel address space's PML4, for the scheduler's CR3 switches (0 before `install`).
+static KERNEL_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The kernel's PML4 (physical), without taking a lock.
+pub(crate) fn kernel_root() -> u64 {
+    KERNEL_ROOT.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// The kernel half (PML4 entries 256–511) every process address space shares.
+pub(crate) fn kernel_half() -> Option<[u64; 256]> {
+    crate::cpu::without_interrupts(|| {
+        let guard = KERNEL_SPACE.lock();
+        let k = guard.as_ref()?;
+        k.space.upper_half(&k.tables)
+    })
+}
+
 /// Keeps the live address space (`init_paging` calls this right after loading CR3).
 pub(crate) fn install(space: AddressSpace, tables: TablePool<'static>) {
+    KERNEL_ROOT.store(space.root(), core::sync::atomic::Ordering::Release);
     crate::cpu::without_interrupts(|| {
         *KERNEL_SPACE.lock() = Some(KernelSpace { space, tables });
     })

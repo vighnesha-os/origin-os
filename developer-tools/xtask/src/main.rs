@@ -174,6 +174,8 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: user mode: syscall instruction: reported Some(77), exited with Some(0)".into(),
             "origin-kernel: user mode: write: hello from ring 3".into(),
             "origin-kernel: user mode: copy from user: valid buffer -> 17, kernel address -> EFAULT, unmapped user address -> EFAULT; kernel carries on".into(),
+            "origin-kernel: processes: PML4 ".into(),
+            "at once and read back 0x400800 from 0x500000 (own values only: 0x400800); not mapped in the kernel's tables: true".into(),
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
@@ -212,6 +214,7 @@ fn boot_scenario_markers() -> Scenario {
             ": user isolation failed",
             ": NMI stack failed",
             ": higher half failed",
+            ": process isolation failed",
         ],
     }
 }
