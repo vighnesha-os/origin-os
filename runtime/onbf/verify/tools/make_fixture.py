@@ -12,6 +12,8 @@ import importlib.util
 import pathlib
 import sys
 
+sys.dont_write_bytecode = True  # no __pycache__ next to the reference tools
+
 TOOLS = pathlib.Path(__file__).resolve().parents[4] / "security" / "crypto" / "tools"
 
 

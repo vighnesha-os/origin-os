@@ -25,3 +25,4 @@ rustc-ice-*.txt
 
 # Claude Code agent worktrees (temporary, per session)
 .claude/worktrees/
+__pycache__/
