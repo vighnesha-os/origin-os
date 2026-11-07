@@ -31,6 +31,7 @@
 //! - [`hpet`]: the ACPI HPET table and main-counter arithmetic;
 //! - [`ioapic`]: I/O APIC redirection-table encoding;
 //! - [`net`]: Ethernet/IPv4/ICMP/ARP headers and the Internet checksum;
+//! - [`numa`]: a locality map (CPU/address → node, nearest-node order) from the SRAT/SLIT;
 //! - [`originfs`]: a read-only OriginFS on-disk parser and image builder (ADR-0006,
 //!   Proposed; host-tested, not mounted by the kernel pending owner approval, §84);
 //! - [`tcp`]: TCP segments and a minimal connection state machine;
@@ -77,6 +78,7 @@ pub mod heap;
 pub mod hpet;
 pub mod ioapic;
 pub mod net;
+pub mod numa;
 pub mod nvme;
 pub mod originfs;
 pub use origin_paging as paging;

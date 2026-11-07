@@ -713,12 +713,23 @@ fn prove_slit(com1: &mut console::Console, rsdp: u64) {
             }
         }
     }
-    let consistent = n >= 1 && local_ok && off_ok;
-    // The cross-node distance for the first pair, when there is more than one locality.
+    // The locality map derived from this SLIT: every node's nearest node must be itself,
+    // and node 0's nodes in ascending distance.
+    let self_nearest = framekernel::numa::self_is_nearest(&slit);
+    let mut order = [0usize; 64];
+    let k = framekernel::numa::nearest_nodes(&slit, 0, &mut order);
+    let consistent = n >= 1 && local_ok && off_ok && self_nearest;
     let across = slit.distance(0, 1.min(n.saturating_sub(1))).unwrap_or(0);
+    let _ = write!(
+        com1,
+        "origin-kernel: slit: {n} localities, local 10 ({local_ok}), 0->last {across}, self-nearest {self_nearest}, from 0 ["
+    );
+    for (i, node) in order[..k].iter().enumerate() {
+        let _ = write!(com1, "{}{}", if i == 0 { "" } else { ", " }, node);
+    }
     let _ = writeln!(
         com1,
-        "origin-kernel: slit: {n} localities, local 10 ({local_ok}), 0->last {across}; consistent {}{}",
+        "]; consistent {}{}",
         consistent,
         if consistent { "" } else { ": slit failed" }
     );
