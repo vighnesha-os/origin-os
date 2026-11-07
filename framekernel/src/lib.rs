@@ -23,6 +23,7 @@
 //! - [`clock`]: monotonic-clock arithmetic (ticks to nanoseconds and back) and the CPUID
 //!   TSC rate;
 //! - [`descriptors`]: GDT, TSS and IDT descriptor encodings;
+//! - [`editbuffer`]: a gap buffer for editable text (caret, insert/delete);
 //! - [`features`]: CPUID feature decoding and the x86-64-v3 baseline;
 //! - [`frames`]: the physical frame allocator over the boot-info regions;
 //! - [`gpt`]: GUID Partition Table validation (both copies, CRC-32) and partitions;
@@ -71,6 +72,7 @@ pub mod cache;
 pub mod channel;
 pub mod clock;
 pub mod descriptors;
+pub mod editbuffer;
 pub mod features;
 pub mod frames;
 pub mod gpt;
