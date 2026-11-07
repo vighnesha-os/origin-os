@@ -210,6 +210,12 @@ fn boot_scenario_markers() -> Scenario {
                 3 * (cpus - 1),
                 3 * (cpus - 1)
             ),
+            // Kernel wait queues: an in-order producer/consumer transfer between CPUs, and
+            // a cross-CPU ping-pong whose wake-ups go by IPI.
+            "origin-kernel: wait queues: 10000 of 10000 items from CPU ".into(),
+            ", in order true, in ".into(),
+            "origin-kernel: wait queues: ping-pong between CPU 0 and CPU ".into(),
+            ": 1000 round trips, ".into(),
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
@@ -252,6 +258,7 @@ fn boot_scenario_markers() -> Scenario {
             ": clock failed",
             ": console failed",
             ": TLB failed",
+            ": wait queues failed",
         ],
         check: Some(|text| console_lines_intact(text, qemu_cpus() as usize)),
     }

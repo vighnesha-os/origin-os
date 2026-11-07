@@ -114,13 +114,15 @@ pub(crate) unsafe fn init() {
     if let Some(gate) = idt.0.get_mut(usize::from(SYSCALL_VECTOR)) {
         *gate = d::user_interrupt_gate((syscall_stub as *const ()).addr() as u64, KERNEL_CODE);
     }
-    let interrupts: [(u8, extern "sysv64" fn()); 6] = [
+    let interrupts: [(u8, extern "sysv64" fn()); 8] = [
         (TIMER_VECTOR, timer_stub),
         (SPURIOUS_VECTOR, spurious_stub),
         (YIELD_VECTOR, yield_stub),
         (SLEEP_VECTOR, sleep_stub),
         (EXIT_VECTOR, exit_stub),
+        (BLOCK_VECTOR, block_stub),
         (crate::tlb::SHOOTDOWN_VECTOR, shootdown_stub),
+        (RESCHEDULE_VECTOR, reschedule_stub),
     ];
     for (vector, stub) in interrupts {
         if let Some(gate) = idt.0.get_mut(usize::from(vector)) {
@@ -449,6 +451,10 @@ pub(crate) const YIELD_VECTOR: u8 = 0x81;
 pub(crate) const SLEEP_VECTOR: u8 = 0x82;
 /// Software interrupt to end the running thread.
 pub(crate) const EXIT_VECTOR: u8 = 0x83;
+/// Software interrupt: the running kernel thread blocks until woken (`sched::block`).
+pub(crate) const BLOCK_VECTOR: u8 = 0x84;
+/// IPI: a thread queued on this processor was woken by another (`sched::wake`).
+pub(crate) const RESCHEDULE_VECTOR: u8 = 0xF1;
 /// The system-call vector, the only gate user mode may raise (DPL 3). RAX: 0 exit(RDI),
 /// 1 report(RDI); anything else returns `u64::MAX` in RAX.
 pub(crate) const SYSCALL_VECTOR: u8 = 0x80;
@@ -502,6 +508,14 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     if frame.vector == u64::from(SPURIOUS_VECTOR) {
         return here;
     }
+    // Another processor woke a thread queued here: acknowledge, then switch to it now
+    // rather than at the next timer tick.
+    if frame.vector == u64::from(RESCHEDULE_VECTOR) {
+        // SAFETY: as for the timer: only processors with an active scheduler are sent this
+        // vector, so x2APIC mode is on; the write only acknowledges the interrupt.
+        unsafe { wrmsr(X2APIC_EOI, 0) };
+        return crate::sched::on_reschedule(here);
+    }
     // Another processor changed a kernel mapping: invalidate it here, then acknowledge.
     if frame.vector == u64::from(crate::tlb::SHOOTDOWN_VECTOR) {
         crate::tlb::service();
@@ -525,6 +539,9 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     }
     if frame.vector == u64::from(EXIT_VECTOR) {
         return crate::sched::on_exit(here);
+    }
+    if frame.vector == u64::from(BLOCK_VECTOR) {
+        return crate::sched::on_block(here);
     }
     if frame.vector == u64::from(SYSCALL_VECTOR) {
         match frame.rax {
@@ -1125,6 +1142,8 @@ soft_stub!(sleep_stub, SLEEP_VECTOR);
 soft_stub!(exit_stub, EXIT_VECTOR);
 soft_stub!(syscall_stub, SYSCALL_VECTOR);
 soft_stub!(shootdown_stub, crate::tlb::SHOOTDOWN_VECTOR);
+soft_stub!(block_stub, BLOCK_VECTOR);
+soft_stub!(reschedule_stub, RESCHEDULE_VECTOR);
 
 /// Entry stub of the spurious-interrupt vector.
 #[unsafe(naked)]

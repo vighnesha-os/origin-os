@@ -343,6 +343,22 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 16 `origin-paging` tests (the census, and global bits surviving a large-page split); `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** PCIDs for user address spaces (every CR3 switch still drops all non-global entries); shootdowns for user mappings of a process running on several processors (processes are single-threaded so far); INVPCID.
 
+### Kernel wait queues and cross-CPU wake-ups (CLAUDE.md §25, §26, §30; 2026-11-07)
+
+- **What:**
+  - `runqueue` (library): a `Blocked` state; a per-slot generation, bumped by every `push`, so a wake-up names its thread exactly and a stale one never wakes the slot's next thread; and a pending-wake flag, so a wake-up that arrives before its thread has blocked makes the next `block` return at once.
+  - `sched`: `block` (software interrupt 0x84), `current_thread`, `ThreadRef`, and `wake`. Waking a thread blocked on another processor sends that processor a reschedule IPI (vector 0xF1), whose handler acknowledges and switches.
+  - `wait` (binary): `WaitQueue::wait_until(condition)` checks the condition under the queue's lock and registers the thread there before blocking; `wake_one` takes a waiter under the lock, releases it, then wakes it. Lock order: a wait queue's lock, then what its condition reads. These queues are kernel-internal.
+- **Proof** (every boot):
+  - A producer on CPU 1 sends 10 000 numbers through an 8-slot ring to a consumer on CPU 0, each blocking when the ring is full or empty. All arrive in order, in 19–32 ms.
+  - Two threads on CPUs 0 and 1 pass a turn back and forth 1000 times: 44–73 µs per round trip, woken by IPI, against a bound of 2 ms.
+  - On one CPU the producer and consumer alternate exactly (1250 blocks each), and a round trip takes 4 µs.
+- **Negative controls**, each failing the boot test:
+  - No reschedule IPI: the transfer slows from 19 to 180 ms, and the ping-pong does not finish within 5 s (a woken thread waits for its processor's next 10 ms tick).
+  - No pending wake-ups: a wake-up is lost and the transfer stalls at 6202 of 10 000 items. So the race between registering and blocking really happens even in QEMU, and the pending-wake rule is what closes it.
+- **Test evidence:** 2 new run-queue tests (blocking and waking; a stale generation and the boot context refused); `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** timed waits (a deadline on the monotonic clock), priority inheritance, the user-visible waiting of ADR-0005 P9, and Loom models of the protocol.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

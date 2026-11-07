@@ -10,6 +10,12 @@
 //! something to run. Time is counted in this CPU's timer ticks. This is policy only: plain
 //! integers, no `unsafe`, tested on the host. Priorities, fairness accounting and load
 //! balancing come later (an EEVDF-style design is to be evaluated, §26).
+//!
+//! Blocking: a thread [`RunQueue::block`]s until another [`RunQueue::wake`]s it. A wake-up
+//! names its thread by slot and the slot's generation (bumped by every [`RunQueue::push`]),
+//! so a stale one never wakes a later thread in the same slot. A wake-up that arrives
+//! before its thread has blocked (it registered with a wait queue and is about to block) is
+//! kept, and its next `block` returns at once: no wake-up is lost.
 
 /// Contexts one queue holds, its boot context included.
 pub const CAPACITY: usize = 16;
@@ -32,6 +38,8 @@ enum State {
     Ready,
     /// Asleep until this tick.
     Sleeping(u64),
+    /// Waiting for a [`RunQueue::wake`].
+    Blocked,
 }
 
 /// One CPU's run queue.
@@ -39,6 +47,10 @@ enum State {
 pub struct RunQueue {
     saved: [u64; CAPACITY],
     state: [State; CAPACITY],
+    /// Bumped each time a slot gets a new thread.
+    generation: [u32; CAPACITY],
+    /// A wake-up that arrived while the slot's thread was not blocked.
+    wake_pending: [bool; CAPACITY],
     current: usize,
     ticks: u64,
     switches: u64,
@@ -58,6 +70,8 @@ impl RunQueue {
         Self {
             saved: [0; CAPACITY],
             state,
+            generation: [0; CAPACITY],
+            wake_pending: [false; CAPACITY],
             current: 0,
             ticks: 0,
             switches: 0,
@@ -76,7 +90,19 @@ impl RunQueue {
             *saved = context;
             *state = State::Ready;
         }
+        if let (Some(g), Some(w)) = (
+            self.generation.get_mut(slot),
+            self.wake_pending.get_mut(slot),
+        ) {
+            *g = g.wrapping_add(1);
+            *w = false;
+        }
         Ok(slot)
+    }
+
+    /// The generation of the thread in `slot` (0 for slot 0, the boot context).
+    pub fn generation(&self, slot: usize) -> u32 {
+        self.generation.get(slot).copied().unwrap_or(0)
     }
 
     /// Contexts in the queue (ready or asleep), the boot context included.
@@ -146,6 +172,49 @@ impl RunQueue {
             *s = State::Sleeping(until);
         }
         Ok(self.switch(interrupted))
+    }
+
+    /// The running context blocks until [`RunQueue::wake`]. If a wake-up is already
+    /// pending, it is consumed and the running context goes on (`interrupted` is returned).
+    pub fn block(&mut self, interrupted: u64) -> Result<u64, QueueError> {
+        if self.current == 0 {
+            return Err(QueueError::BootContext);
+        }
+        if let Some(pending) = self.wake_pending.get_mut(self.current)
+            && *pending
+        {
+            *pending = false;
+            return Ok(interrupted);
+        }
+        if let Some(s) = self.state.get_mut(self.current) {
+            *s = State::Blocked;
+        }
+        Ok(self.switch(interrupted))
+    }
+
+    /// Wakes the thread in `slot` if it is still the one `generation` names. A blocked
+    /// thread becomes ready, and `true` is returned: the processor running this queue
+    /// should reschedule. Any other live thread keeps the wake-up for its next
+    /// [`RunQueue::block`]. A stale or free slot is left alone.
+    pub fn wake(&mut self, slot: usize, generation: u32) -> bool {
+        if slot == 0 || self.generation.get(slot) != Some(&generation) {
+            return false;
+        }
+        match self.state.get(slot) {
+            Some(State::Blocked) => {
+                if let Some(s) = self.state.get_mut(slot) {
+                    *s = State::Ready;
+                }
+                true
+            }
+            Some(State::Ready | State::Sleeping(_)) => {
+                if let Some(p) = self.wake_pending.get_mut(slot) {
+                    *p = true;
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
     /// The running context ends: its slot is freed (its stack is the caller's to reclaim)
@@ -229,6 +298,59 @@ mod tests {
         assert_eq!(q.push(0xC000), Ok(1), "A's slot is reused");
         assert_eq!(q.tick(0xB100), 0x1000);
         assert_eq!(q.tick(0x1100), 0xC000);
+    }
+
+    #[test]
+    fn a_blocked_thread_runs_only_after_its_wake() {
+        let mut q = RunQueue::new();
+        let slot = q.push(0xA000).unwrap();
+        let generation = q.generation(slot);
+        assert_eq!(q.tick(0x1000), 0xA000);
+        assert_eq!(
+            q.block(0xA100),
+            Ok(0x1000),
+            "A blocks; the boot context runs"
+        );
+        for t in 0..5 {
+            assert_eq!(
+                q.tick(0x1100 + t),
+                0x1100 + t,
+                "ticks do not wake a blocked thread"
+            );
+        }
+        assert_eq!(q.live(), 2);
+        assert!(q.wake(slot, generation), "a blocked thread: reschedule");
+        assert_eq!(q.tick(0x1200), 0xA100, "A resumes where it blocked");
+        assert!(!q.wake(slot, generation), "running: only a pending wake-up");
+        assert_eq!(
+            q.block(0xA200),
+            Ok(0xA200),
+            "the pending wake-up is consumed at once"
+        );
+        assert_eq!(q.block(0xA300), Ok(0x1200), "the next block really blocks");
+    }
+
+    #[test]
+    fn a_stale_wake_never_reaches_a_later_thread_in_the_slot() {
+        let mut q = RunQueue::new();
+        let slot = q.push(0xA000).unwrap();
+        let old = q.generation(slot);
+        assert_eq!(q.tick(0x1000), 0xA000);
+        assert_eq!(q.exit(0xA100), Ok(0x1000));
+        assert!(!q.wake(slot, old), "free slot");
+        assert_eq!(q.push(0xB000), Ok(slot));
+        let new = q.generation(slot);
+        assert_ne!(new, old);
+        assert_eq!(q.tick(0x1100), 0xB000);
+        assert!(!q.wake(slot, old), "the old thread's wake-up");
+        assert_eq!(
+            q.block(0xB100),
+            Ok(0x1100),
+            "and so no pending wake-up either"
+        );
+        assert!(q.wake(slot, new));
+        assert!(!q.wake(0, 0), "the boot context is never blocked");
+        assert_eq!(q.block(0x1200), Err(QueueError::BootContext));
     }
 
     #[test]

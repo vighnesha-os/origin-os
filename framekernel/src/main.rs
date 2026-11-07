@@ -44,6 +44,7 @@ mod timer;
 mod tlb;
 mod user;
 mod vm;
+mod wait;
 use framekernel::frames::{self, FrameAllocator};
 use framekernel::paging::layout::{self, Placement};
 use framekernel::paging::{PAGE, Table, TablePool};

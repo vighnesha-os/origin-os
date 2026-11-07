@@ -189,6 +189,75 @@ pub(crate) fn on_sleep(interrupted: u64, ticks: u64) -> u64 {
     with_queue(interrupted, |q| q.sleep(interrupted, ticks).ok())
 }
 
+/// `BLOCK_VECTOR`: the running thread blocks until [`wake`] (or goes on, if a wake-up is
+/// already pending).
+pub(crate) fn on_block(interrupted: u64) -> u64 {
+    with_queue(interrupted, |q| q.block(interrupted).ok())
+}
+
+/// `RESCHEDULE_VECTOR`: another processor made a thread here ready; switch now.
+pub(crate) fn on_reschedule(interrupted: u64) -> u64 {
+    with_queue(interrupted, |q| Some(q.yield_now(interrupted)))
+}
+
+/// A kernel thread: its processor (x2APIC ID), run-queue slot, and the slot's generation,
+/// so a reference that outlives its thread never names the slot's next one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ThreadRef {
+    cpu: u32,
+    slot: u32,
+    generation: u32,
+}
+
+/// The running kernel thread, or `None` for the boot or idle flow (which cannot block).
+pub(crate) fn current_thread() -> Option<ThreadRef> {
+    let id = this_cpu();
+    let queue = QUEUES.get(id)?;
+    without_interrupts(|| {
+        let q = queue.lock();
+        let slot = q.current();
+        (slot != 0).then(|| ThreadRef {
+            cpu: id as u32,
+            slot: slot as u32,
+            generation: q.generation(slot),
+        })
+    })
+}
+
+/// Blocks the running kernel thread until [`wake`]. Returns at once if a wake-up arrived
+/// first. Use it through `wait::WaitQueue`, which makes sure the wake-up comes.
+pub(crate) fn block() {
+    // SAFETY: as for `yield_now`; the handler saves and restores every register, and this
+    // context resumes here once it is woken.
+    unsafe { asm!("int 0x84") };
+}
+
+/// ICR level bit: assert (the only meaningful level for fixed IPIs).
+const ICR_ASSERT: u32 = 1 << 14;
+
+/// Makes `thread` ready. If it was blocked on another processor, that processor is sent a
+/// reschedule IPI, so it switches to the thread now rather than at its next timer tick.
+pub(crate) fn wake(thread: ThreadRef) {
+    let cpu = thread.cpu as usize;
+    let Some(queue) = QUEUES.get(cpu) else {
+        return;
+    };
+    let woke = without_interrupts(|| queue.lock().wake(thread.slot as usize, thread.generation));
+    if woke && cpu != this_cpu() {
+        // SAFETY: CPL 0; this processor's APIC is in x2APIC mode (it runs kernel threads).
+        let lapic = unsafe { X2Apic::assume_enabled() };
+        // SAFETY: a fixed IPI with the reschedule vector, whose handler acknowledges and
+        // switches through the target's own run queue; the target ran this thread, so its
+        // scheduler is active.
+        unsafe {
+            lapic.send_ipi(
+                thread.cpu,
+                ICR_ASSERT | u32::from(crate::cpu::RESCHEDULE_VECTOR),
+            )
+        };
+    }
+}
+
 /// `EXIT_VECTOR`: the running thread ends. Its stack becomes a zombie, freed later by
 /// [`reap`] on this processor.
 pub(crate) fn on_exit(interrupted: u64) -> u64 {
@@ -611,6 +680,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
     ok &= crate::time::prove_consistent(com1, cpus, bsp, tsc_hz);
     ok &= crate::console::prove(com1, cpus, bsp, tsc_hz);
     ok &= crate::tlb::prove(com1, cpus, bsp, tsc_hz);
+    ok &= crate::wait::prove(com1, cpus, bsp, tsc_hz);
     // Every thread has exited: once each processor has reaped its own, the heap is back
     // exactly where it was before the first spawn.
     let back = || crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before;
