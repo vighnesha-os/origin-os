@@ -167,6 +167,14 @@ The owner asked for the design to be finalised with the recommended options, fol
 | `816158c` | Software rasterizer: fills, blits, alpha blend (CRC cross-check) |
 | `ab39160` | PS/2 keyboard: scancode decoding and i8042 controller bring-up |
 | `0e42e20` | HPET: ACPI discovery and a counter-rate cross-check |
+| `48e7f01` | Network packet layer: Ethernet/IPv4/ICMP/ARP and the Internet checksum |
+| `2335c2d` | TCP: segments and a minimal connection state machine |
+| `7750afb` | UDP datagrams and a monotonic timer queue |
+| `1091e35` | `origin-sync`: a reader-writer spin lock, backing the PCIe device list |
+| `ed14eac` | A live `/sys` tree in the VFS; an 8-CPU + mutation-soak verification pass |
+| `f740193` | Seeded mutation tests for the net and TCP parsers |
+| `b4c3fde` | I/O APIC interrupt routing, proven by routing the PIT's IRQ0 |
+| `6ae2541` | ACPI PM timer: a second time-source cross-check |
 
 (The 2026-11-08 commits use the Claude Opus 4.8 attribution; the run spanned midnight.)
 
@@ -190,8 +198,8 @@ stride scheduling with FPU-state save/restore, kernel wait queues (timed and cro
 a serialized console, TLB shootdown with global pages, PCIe enumeration, a polled and then
 MSI-X interrupt-driven NVMe driver with per-CPU queues, GPT validation, a block cache, the
 in-memory VFS, the software rasterizer and the i8042 keyboard bring-up — each with a boot
-proof and at least one negative control. 143 host library tests pass; `cargo xtask check`
-passes. Everything is QEMU-only; no physical-hardware qualification (CLAUDE.md §74). The
+proof and at least one negative control. By 02:46 IST, 163 host library tests pass (396 across the workspace); `cargo xtask check`
+passes; the system boots on 1–8 processors. Everything is QEMU-only; no physical-hardware qualification (CLAUDE.md §74). The
 ADR-0005 kernel system-call layer is still the one area left untouched (a safety classifier
 stopped it twice earlier); the owner's non-design items (downloads, a licence, merge/push)
 remain.
