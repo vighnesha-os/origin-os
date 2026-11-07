@@ -6,6 +6,7 @@ version = 4
 name = "framekernel"
 version = "0.0.0"
 dependencies = [
+ "origin-abi",
  "origin-boot-info",
  "origin-paging",
  "origin-sync",

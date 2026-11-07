@@ -19,6 +19,7 @@ test = false
 bench = false
 
 [dependencies]
+origin-abi = { path = "../runtime/abi" }
 origin-boot-info.workspace = true
 origin-paging = { path = "paging" }
 origin-sync = { path = "sync" }

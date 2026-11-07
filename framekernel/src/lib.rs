@@ -17,8 +17,10 @@
 //! - [`acpi`]: RSDP, XSDT and MADT parsing (checksummed) for processor discovery;
 //! - [`apic`]: x2APIC and 8254 PIT encodings and timer calibration arithmetic;
 //! - [`boot`]: boot-info validation and the memory summary;
+//! - [`channel`]: one channel's queues, limits and signals (ADR-0005 P8);
 //! - [`descriptors`]: GDT, TSS and IDT descriptor encodings;
 //! - [`frames`]: the physical frame allocator over the boot-info regions;
+//! - [`handles`]: per-process handle tables with rights (ADR-0005 P1–P2);
 //! - [`heap`]: kernel heap bookkeeping (slabs and frame runs), addresses only;
 //! - [`paging`]: 4-level page tables with structural W^X (the `origin-paging` crate,
 //!   shared with the loader);
@@ -35,11 +37,15 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
 pub mod acpi;
 pub mod apic;
 pub mod boot;
+pub mod channel;
 pub mod descriptors;
 pub mod frames;
+pub mod handles;
 pub mod heap;
 pub use origin_paging as paging;
 pub mod report;
