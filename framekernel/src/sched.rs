@@ -353,6 +353,27 @@ pub(crate) fn spawn_in(
     arg: u64,
     root: u64,
 ) -> Result<usize, QueueError> {
+    spawn_with(cpu, entry, arg, root, framekernel::runqueue::DEFAULT_WEIGHT)
+}
+
+/// As [`spawn`], with a scheduling weight (stride scheduling: the thread's share of its
+/// processor is its share of the weights there).
+pub(crate) fn spawn_weighted(
+    cpu: usize,
+    entry: extern "sysv64" fn(u64) -> !,
+    arg: u64,
+    weight: u32,
+) -> Result<usize, QueueError> {
+    spawn_with(cpu, entry, arg, 0, weight)
+}
+
+fn spawn_with(
+    cpu: usize,
+    entry: extern "sysv64" fn(u64) -> !,
+    arg: u64,
+    root: u64,
+    weight: u32,
+) -> Result<usize, QueueError> {
     let queue = QUEUES.get(cpu).ok_or(QueueError::Full)?;
     let (stack, guard) = guarded_stack(THREAD_STACK).ok_or(QueueError::Full)?;
     let _ = FIRST_GUARD.compare_exchange(0, guard, Ordering::Relaxed, Ordering::Relaxed);
@@ -381,7 +402,7 @@ pub(crate) fn spawn_in(
         bytes: THREAD_STACK,
     };
     without_interrupts(|| {
-        let slot = queue.lock().push(frame_at)?;
+        let slot = queue.lock().push_weighted(frame_at, weight)?;
         if let Some(threads) = THREADS.get(cpu) {
             let mut t = threads.lock();
             if let Some(s) = t.stacks.get_mut(slot) {
@@ -405,6 +426,10 @@ pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
     // The boot processor split large pages and unmapped guard pages while this processor
     // waited: from now on it is sent every shootdown, and it drops every older translation.
     crate::tlb::mark_online();
+    // This flow is the processor's idle context: it runs only when no thread is ready.
+    if let Some(queue) = QUEUES.get(this_cpu()) {
+        without_interrupts(|| queue.lock().set_idle(true));
+    }
     if let Some(active) = ACTIVE.get(this_cpu()) {
         active.store(true, Ordering::Release);
     }
@@ -525,6 +550,73 @@ pub(crate) fn yield_until(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) {
         cpu::interrupt_window();
         reap();
     }
+}
+
+/// The weights of the three workers of [`prove_weights`].
+const WEIGHTS: [u32; 3] = [1, 4, 16];
+/// Iterations each weighted worker made.
+static WEIGHTED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static WEIGHTED_STOP: AtomicBool = AtomicBool::new(false);
+static WEIGHTED_EXITED: AtomicU64 = AtomicU64::new(0);
+
+/// A worker that never yields, counting into `WEIGHTED[index]` until told to stop.
+extern "sysv64" fn weighted_worker(index: u64) -> ! {
+    while !WEIGHTED_STOP.load(Ordering::Relaxed) {
+        if let Some(c) = WEIGHTED.get(index as usize) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+        core::hint::spin_loop();
+    }
+    WEIGHTED_EXITED.fetch_add(1, Ordering::Relaxed);
+    exit()
+}
+
+/// Proves proportional shares (stride scheduling): three never-yielding workers with
+/// weights 1, 4 and 16 share one processor for 2 s; each one's share of the work must be
+/// near its share of the weights (1/21, 4/21, 16/21), and the lightest must not starve.
+fn prove_weights(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -> bool {
+    let far = cpus
+        .iter()
+        .map(|&id| id as usize)
+        .find(|&id| id != bsp)
+        .unwrap_or(bsp);
+    for (i, &w) in WEIGHTS.iter().enumerate() {
+        if spawn_weighted(far, weighted_worker, i as u64, w).is_err() {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: scheduler: cannot spawn: scheduler failed"
+            );
+            return false;
+        }
+    }
+    let start = rdtsc();
+    while rdtsc().wrapping_sub(start) < 2 * tsc_hz {
+        yield_now();
+        cpu::interrupt_window();
+    }
+    WEIGHTED_STOP.store(true, Ordering::Relaxed);
+    yield_until(|| WEIGHTED_EXITED.load(Ordering::Relaxed) == 3, tsc_hz, 2);
+    let counts: [u64; 3] = core::array::from_fn(|i| WEIGHTED[i].load(Ordering::Relaxed));
+    let total: u64 = counts.iter().sum();
+    let sum_weights: u32 = WEIGHTS.iter().sum();
+    let mut ok = WEIGHTED_EXITED.load(Ordering::Relaxed) == 3 && total > 0;
+    let mut shares = [0u64; 3];
+    for (i, (&c, &w)) in counts.iter().zip(&WEIGHTS).enumerate() {
+        // Per mille: the share measured, and the share of the weights.
+        let share = c * 1000 / total.max(1);
+        let ideal = u64::from(w) * 1000 / u64::from(sum_weights);
+        shares[i] = share;
+        ok &= c > 0 && share.abs_diff(ideal) <= ideal / 3 + 15;
+    }
+    let _ = writeln!(
+        com1,
+        "origin-kernel: scheduler: weights 1, 4 and 16 on CPU {far} for 2 s: shares {}, {} and {} per mille (ideal 47, 190 and 761){}",
+        shares[0],
+        shares[1],
+        shares[2],
+        if ok { "" } else { ": scheduler failed" }
+    );
+    ok
 }
 
 /// On the boot processor, with its timer running: yields must alternate two threads, a
@@ -691,6 +783,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
             cpus.len()
         );
     }
+    ok &= prove_weights(com1, cpus, bsp, tsc_hz);
     ok &= prove_lifecycle(com1, bsp, tsc_hz);
     ok &= crate::user::prove(com1, bsp, tsc_hz);
     ok &= crate::time::prove_consistent(com1, cpus, bsp, tsc_hz);

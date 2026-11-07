@@ -178,6 +178,9 @@ fn boot_scenario_markers() -> Scenario {
                 "origin-kernel: preemptive multitasking: {} non-yielding threads on {cpus} CPUs all ran",
                 2 * cpus
             ),
+            // Stride scheduling: shares follow the weights 1 : 4 : 16 on one CPU.
+            "origin-kernel: scheduler: weights 1, 4 and 16 on CPU ".into(),
+            " per mille (ideal 47, 190 and 761)".into(),
             "origin-kernel: scheduler: yield alternated ".into(),
             // M4 groundwork: ring 3, the one DPL-3 gate, and crash isolation.
             "origin-kernel: user mode: good program: reported Some(42), exited with Some(0); kernel carries on".into(),

@@ -481,6 +481,25 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 1 more `nvme` assertion group (Set Features encoding and allocation decoding); `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** a block layer that routes requests to the submitting CPU's queue, PRP lists and larger transfers, command timeouts with abort and controller reset, and NUMA placement of queue memory.
 
+### Weighted fair scheduling: stride scheduling and an idle context (CLAUDE.md §26; 2026-11-07)
+
+- **What:** `runqueue` (library) picks the next context by stride scheduling, a deterministic proportional-share policy (Waldspurger and Weihl, MIT LCS/TM-528, 1995; the published algorithm, not anyone's code):
+  - every context has a weight (1–1024, default 8) and a pass value; each quantum it uses (a tick or a yield) advances the pass by 2^20 / weight;
+  - the ready context with the lowest pass runs next, ties going round-robin from the current one, so equal weights are exactly round-robin;
+  - a context that becomes ready (new, woken, or due after a sleep) starts at no less than the lowest pass among the ready ones: sleeping earns no credit;
+  - slot 0 can be the processor's idle context, which runs only when nothing else is ready; each AP's idle loop now is one. Leaving idle mode admits slot 0 at the floor.
+  - `sched::spawn_weighted` sets a thread's weight.
+- **Bugs found by the new host tests:**
+  - A new thread's starting pass was computed with the new slot already counted as ready. The floor then included that slot's stale pass of 0, so the newcomer started 70 quanta behind and took 180 of 300 quanta.
+  - The idle context, which is charged only for quanta nobody else wanted, monopolized the processor when it stopped being idle (20 of 20 ticks).
+
+  Both are fixed. Three test expectations were wrong instead and were corrected: an off-by-one tick, the share arithmetic, and an old test that encoded pure round-robin order.
+- **Proof** (every boot): three never-yielding workers with weights 1, 4 and 16 share one CPU for 2 s. Their shares are 45–50, 185–191 and 758–763 per mille, against ideal 47, 190 and 761 (1, 2 and 4 CPUs). Every earlier scheduler proof still passes.
+- **Measured:** with an idle context on each AP, two workers there now get about 1.6 M iterations each in the 500 ms window, against 1.0 M before. The idle loop no longer takes a third of the processor.
+- **Negative control:** weights ignored (one stride for all) → shares 341, 327 and 331 → "scheduler failed".
+- **Test evidence:** 3 new run-queue tests (exact shares 100 : 400 : 1600 over 2100 quanta, and after a weight change; the idle context; no credit for sleeping and new threads starting level); 106 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** interactive and background classes on top of the weights, load balancing between processors, priority inheritance, and an EEVDF evaluation (§26).
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.
