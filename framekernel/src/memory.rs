@@ -71,6 +71,21 @@ pub(crate) fn stats() -> Option<(HeapStats, u64)> {
         .map(|m| (m.heap.stats(), m.frames.free_frames()))
 }
 
+/// Returns the loader's and the firmware's boot-time memory (`LoaderReclaimable`) to the
+/// frame allocator. Returns the frames added and the free frames after, or `None` before
+/// [`init`].
+///
+/// Call only when nothing there is in use: after the kernel's own page tables replaced the
+/// firmware's, and after every enabled processor has left firmware code (INIT).
+pub(crate) fn reclaim_loader_memory() -> Option<(u64, u64)> {
+    let mut guard = MEMORY.lock();
+    let m = guard.as_mut()?;
+    let added = m
+        .frames
+        .reclaim(origin_boot_info::RegionKind::LoaderReclaimable);
+    Some((added, m.frames.free_frames()))
+}
+
 /// The kernel's global allocator.
 struct KernelAllocator;
 

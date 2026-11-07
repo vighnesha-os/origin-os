@@ -50,6 +50,20 @@ pub fn usable_end(regions: &[MemoryRegion]) -> u64 {
         .unwrap_or(0)
 }
 
+/// End of the highest region the allocator may ever own: `Usable` now, or
+/// `LoaderReclaimable` once [`FrameAllocator::reclaim`] returns it. The bitmap covers this
+/// much, so reclaiming needs no new bitmap.
+pub fn covered_end(regions: &[MemoryRegion]) -> u64 {
+    regions
+        .iter()
+        .filter(|r| {
+            r.kind == RegionKind::Usable as u32 || r.kind == RegionKind::LoaderReclaimable as u32
+        })
+        .map(|r| r.base.saturating_add(r.pages.saturating_mul(FRAME)))
+        .max()
+        .unwrap_or(0)
+}
+
 /// Bitmap words needed to cover memory up to `end`.
 pub const fn words_for(end: u64) -> u64 {
     end.div_ceil(FRAME).div_ceil(BITS)
@@ -60,6 +74,8 @@ pub const fn words_for(end: u64) -> u64 {
 pub struct FrameAllocator<'a> {
     bitmap: &'a mut [u64],
     regions: &'a [MemoryRegion],
+    /// Region kinds, besides `Usable`, returned by [`Self::reclaim`] (bit = kind value).
+    reclaimed: u32,
     reserved: [(u64, u64); MAX_RESERVED],
     frames: u64,
     next: u64,
@@ -82,7 +98,7 @@ impl<'a> FrameAllocator<'a> {
         for (slot, range) in kept.iter_mut().zip(reserved) {
             *slot = *range;
         }
-        let end = usable_end(regions);
+        let end = covered_end(regions);
         let needed = words_for(end);
         let provided = bitmap.len() as u64;
         if provided < needed {
@@ -92,6 +108,7 @@ impl<'a> FrameAllocator<'a> {
         let mut a = Self {
             bitmap,
             regions,
+            reclaimed: 0,
             reserved: kept,
             frames: end / FRAME,
             next: 0,
@@ -173,15 +190,41 @@ impl<'a> FrameAllocator<'a> {
         let inside = |base: u64, pages: u64| {
             addr >= base && addr < base.saturating_add(pages.saturating_mul(FRAME))
         };
+        let owned = |kind: u32| {
+            kind == RegionKind::Usable as u32 || (kind < 32 && self.reclaimed & (1 << kind) != 0)
+        };
         frame != 0
             && self
                 .regions
                 .iter()
-                .any(|r| r.kind == RegionKind::Usable as u32 && inside(r.base, r.pages))
+                .any(|r| owned(r.kind) && inside(r.base, r.pages))
             && !self
                 .reserved
                 .iter()
                 .any(|&(base, pages)| inside(base, pages))
+    }
+
+    /// Takes over every region of `kind` (in practice `LoaderReclaimable`, once nothing the
+    /// loader or the firmware left there is in use): its frames become free, except frame 0
+    /// and the reserved ranges. Returns how many frames were added.
+    pub fn reclaim(&mut self, kind: RegionKind) -> u64 {
+        let raw = kind as u32;
+        if raw == RegionKind::Usable as u32 || raw >= 32 {
+            return 0;
+        }
+        self.reclaimed |= 1 << raw;
+        let regions = self.regions;
+        let mut added = 0;
+        for r in regions.iter().filter(|r| r.kind == raw) {
+            let first = r.base / FRAME;
+            for frame in first..first.saturating_add(r.pages) {
+                if self.allocatable(frame) && !self.is_free(frame) {
+                    self.set_free(frame, true);
+                    added += 1;
+                }
+            }
+        }
+        added
     }
 
     /// Whether `frame` is free.
@@ -389,6 +432,33 @@ mod tests {
         assert_eq!(a.free_run(big, 1), Err(FrameError::DoubleFree(big)));
         assert_eq!(a.allocate_run(0, 1), None);
         assert_eq!(a.allocate_run(before + 1, 1), None);
+    }
+
+    #[test]
+    fn reclaimed_regions_become_allocatable_and_nothing_else_does() {
+        let regions = sample();
+        let mut bitmap = vec![0u64; words_for(covered_end(&regions)) as usize];
+        let mut a = FrameAllocator::new(&mut bitmap, &regions, &[(0x21_0000, 1)]).unwrap();
+        let before = a.free_frames();
+        let loader = 0x21_1000; // inside the LoaderReclaimable region
+        assert_eq!(a.free(loader), Err(FrameError::NotAllocatable(loader)));
+        // 0x200 frames, minus the one reserved.
+        assert_eq!(a.reclaim(RegionKind::LoaderReclaimable), 0x1FF);
+        assert_eq!(a.free_frames(), before + 0x1FF);
+        assert_eq!(a.reclaim(RegionKind::LoaderReclaimable), 0, "idempotent");
+        assert_eq!(a.reclaim(RegionKind::Usable), 0);
+        let mut seen = HashSet::new();
+        while let Some(f) = a.allocate() {
+            assert!(f != 0x21_0000, "the reserved frame stays reserved");
+            assert!(!(0x20_0000..0x21_0000).contains(&f), "kernel image");
+            seen.insert(f);
+        }
+        assert!(seen.contains(&loader));
+        assert_eq!(a.free(loader), Ok(()), "reclaimed frames can be freed");
+        assert_eq!(
+            a.free(0x20_0000),
+            Err(FrameError::NotAllocatable(0x20_0000))
+        );
     }
 
     #[test]

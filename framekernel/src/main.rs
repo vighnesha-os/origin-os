@@ -154,6 +154,18 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         && heap_ok
     {
         let online = smp::start(&mut com1, &info, regions, tsc_hz);
+        // M2 completion: once every enabled processor has left firmware code, the loader's
+        // and the firmware's boot-time memory belongs to the kernel.
+        if online.complete()
+            && let Some((added, free)) = memory::reclaim_loader_memory()
+        {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: reclaimed {} MiB of loader and boot-services memory; {} MiB free",
+                (added * memory::FRAME) >> 20,
+                (free * memory::FRAME) >> 20
+            );
+        }
         // M3, second step: preemptive kernel threads on every online processor.
         sched::prove(&mut com1, online.ids(), tsc_hz);
     }
@@ -284,7 +296,7 @@ fn init_memory(
     com1: &mut Uart16550<Com1>,
     regions: &'static [MemoryRegion],
 ) -> Option<(FrameAllocator<'static>, &'static [Table], u64)> {
-    let words = frames::words_for(frames::usable_end(regions));
+    let words = frames::words_for(frames::covered_end(regions));
     let bitmap_pages = (words * 8).div_ceil(frames::FRAME);
     let pages = bitmap_pages + TABLE_POOL_FRAMES;
     let usable = RegionKind::Usable as u32;

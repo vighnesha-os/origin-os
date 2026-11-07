@@ -136,13 +136,20 @@ struct ApStart {
 pub(crate) struct Online {
     ids: [u32; MAX_CPUS],
     count: usize,
+    /// Every processor the MADT marks enabled is online: none can still be running
+    /// firmware code.
+    complete: bool,
 }
 
 impl Online {
     fn one(bsp: u32) -> Self {
         let mut ids = [0; MAX_CPUS];
         ids[0] = bsp;
-        Self { ids, count: 1 }
+        Self {
+            ids,
+            count: 1,
+            complete: false,
+        }
     }
 
     fn add(&mut self, id: u32) {
@@ -150,6 +157,11 @@ impl Online {
             *slot = id;
             self.count += 1;
         }
+    }
+
+    /// Whether every enabled processor came online.
+    pub(crate) const fn complete(&self) -> bool {
+        self.complete
     }
 
     /// The IDs.
@@ -218,6 +230,7 @@ pub(crate) fn start(
             "origin-kernel: trampoline page not restored: {e:?}: AP start-up failed"
         );
     }
+    online.complete = online.count == enabled;
     let _ = writeln!(
         com1,
         "origin-kernel: SMP: {} of {enabled} enabled processors online",
