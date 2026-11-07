@@ -238,6 +238,8 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         prove_topology(&mut com1, online.ids());
         // NUMA affinities from the ACPI SRAT (CLAUDE.md §24, §28).
         prove_numa(&mut com1, info.acpi_rsdp, online.ids());
+        // Inter-node distances from the ACPI SLIT (CLAUDE.md §27, §28).
+        prove_slit(&mut com1, info.acpi_rsdp);
         // M3, second step: preemptive kernel threads on every online processor.
         sched::prove(&mut com1, online.ids(), tsc_hz);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
@@ -675,6 +677,50 @@ fn prove_numa(com1: &mut console::Console, rsdp: u64, ids: &[u32]) {
         mem_bytes >> 20,
         consistent,
         if consistent { "" } else { ": numa failed" }
+    );
+}
+
+/// Reports inter-node distances from the ACPI SLIT (CLAUDE.md §27 migration cost, §28 NUMA
+/// policies). The diagonal must be the normalized local distance 10 and every off-diagonal
+/// at least 10, or the line reads `consistent false`. A machine with no SLIT (uniform
+/// distance) is reported as such.
+fn prove_slit(com1: &mut console::Console, rsdp: u64) {
+    let Ok(table) = crate::firmware::acpi_table(rsdp, b"SLIT") else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: slit: no SLIT (uniform distance assumed); consistent true"
+        );
+        return;
+    };
+    let Ok(slit) = framekernel::acpi::parse_slit(table) else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: slit: invalid SLIT; consistent false: slit failed"
+        );
+        return;
+    };
+
+    let n = slit.localities();
+    let mut local_ok = true;
+    let mut off_ok = true;
+    for i in 0..n {
+        for j in 0..n {
+            let d = slit.distance(i, j).unwrap_or(0);
+            if i == j {
+                local_ok &= d == 10;
+            } else {
+                off_ok &= d >= 10;
+            }
+        }
+    }
+    let consistent = n >= 1 && local_ok && off_ok;
+    // The cross-node distance for the first pair, when there is more than one locality.
+    let across = slit.distance(0, 1.min(n.saturating_sub(1))).unwrap_or(0);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: slit: {n} localities, local 10 ({local_ok}), 0->last {across}; consistent {}{}",
+        consistent,
+        if consistent { "" } else { ": slit failed" }
     );
 }
 

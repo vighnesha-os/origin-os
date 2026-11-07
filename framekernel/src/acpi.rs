@@ -468,6 +468,46 @@ pub fn srat_memory_affinities(srat: &[u8], out: &mut [MemoryAffinity]) -> Result
     Ok(count)
 }
 
+/// A checked SLIT (ACPI 6.6 §5.2.17): the locality count and the row-major N×N matrix of
+/// relative distances. The diagonal is the normalized local distance 10; 255 means
+/// unreachable.
+#[derive(Clone, Copy, Debug)]
+pub struct Slit<'a> {
+    localities: usize,
+    matrix: &'a [u8],
+}
+
+impl Slit<'_> {
+    /// The number of system localities (proximity domains).
+    pub fn localities(&self) -> usize {
+        self.localities
+    }
+
+    /// The relative distance from locality `i` to locality `j`, or `None` if either index
+    /// is out of range.
+    pub fn distance(&self, i: usize, j: usize) -> Option<u8> {
+        (i < self.localities && j < self.localities)
+            .then(|| self.matrix.get(i * self.localities + j).copied())
+            .flatten()
+    }
+}
+
+/// Parses a checked SLIT (`check_table(b"SLIT")` already passed): the u64 locality count at
+/// offset 36 and the following N×N distance matrix, both of which must fit in the table.
+pub fn parse_slit(table: &[u8]) -> Result<Slit<'_>, AcpiError> {
+    let n = usize::try_from(u64_at(table, 36).ok_or(AcpiError::Length(0))?)
+        .map_err(|_| AcpiError::Length(0))?;
+    let cells = n.checked_mul(n).ok_or(AcpiError::Length(0))?;
+    let end = 44usize.checked_add(cells).ok_or(AcpiError::Length(0))?;
+    let matrix = table
+        .get(44..end)
+        .ok_or(AcpiError::Length(table.len() as u32))?;
+    Ok(Slit {
+        localities: n,
+        matrix,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,5 +963,47 @@ mod tests {
             srat_memory_affinities(&s, &mut mems),
             Err(AcpiError::SratEntry(SRAT_ENTRIES))
         );
+    }
+
+    /// A SLIT table: an 8-byte locality count then the row-major distance matrix.
+    fn slit(n: u64, matrix: &[u8]) -> Vec<u8> {
+        let mut body = n.to_le_bytes().to_vec();
+        body.extend_from_slice(matrix);
+        table(b"SLIT", &body)
+    }
+
+    #[test]
+    fn slit_distance_matrix() {
+        // Two localities, 10 local and 21 across — the usual single-hop ratio.
+        let s = slit(2, &[10, 21, 21, 10]);
+        assert_eq!(check_table(&s, b"SLIT"), Ok(()));
+        let t = parse_slit(&s).unwrap();
+        assert_eq!(t.localities(), 2);
+        assert_eq!(t.distance(0, 0), Some(10));
+        assert_eq!(t.distance(0, 1), Some(21));
+        assert_eq!(t.distance(1, 0), Some(21));
+        assert_eq!(t.distance(1, 1), Some(10));
+        assert_eq!(t.distance(2, 0), None, "out of range");
+        assert_eq!(t.distance(0, 2), None);
+
+        // A 3-locality asymmetric matrix round-trips cell for cell.
+        let m = [10, 16, 32, 16, 10, 20, 32, 20, 10];
+        let s = slit(3, &m);
+        let t = parse_slit(&s).unwrap();
+        for i in 0..3 {
+            for j in 0..3 {
+                assert_eq!(t.distance(i, j), Some(m[i * 3 + j]));
+            }
+        }
+    }
+
+    #[test]
+    fn slit_rejects_a_truncated_matrix() {
+        // Claims 4 localities (16 cells) but carries only 4 bytes of matrix.
+        let s = slit(4, &[10, 21, 21, 10]);
+        assert!(matches!(parse_slit(&s), Err(AcpiError::Length(_))));
+        // A locality count that would overflow the table length is refused, not panicked.
+        let s = slit(u64::MAX, &[10]);
+        assert!(matches!(parse_slit(&s), Err(AcpiError::Length(_))));
     }
 }

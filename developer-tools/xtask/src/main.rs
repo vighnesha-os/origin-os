@@ -189,6 +189,10 @@ fn boot_scenario_markers() -> Scenario {
             // processor is placed in a node and memory is present.
             "origin-kernel: numa: ".into(),
             "; consistent true".into(),
+            // Inter-node distances from the ACPI SLIT (QEMU -numa dist): diagonal 10, every
+            // off-diagonal >= 10.
+            "origin-kernel: slit: ".into(),
+            "; consistent true".into(),
             "origin-kernel: page protection: stack guard page at ".into(),
             // M3: two non-yielding threads per processor, all preempted and all running.
             "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted ".into(),
@@ -377,6 +381,7 @@ fn boot_scenario_markers() -> Scenario {
             ": scheduler failed",
             ": topology failed",
             ": numa failed",
+            ": slit failed",
             "supervisor isolation from user pages incomplete",
             "origin-kernel: cannot map the user probe page",
             ": user isolation failed",
@@ -1168,6 +1173,8 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         .args(["-object", "memory-backend-ram,id=onuma1,size=256M"])
         .args(["-numa", "node,nodeid=0,memdev=onuma0"])
         .args(["-numa", "node,nodeid=1,memdev=onuma1"])
+        // A cross-node distance so the ACPI SLIT is populated too (QEMU mirrors 1->0).
+        .args(["-numa", "dist,src=0,dst=1,val=21"])
         .arg("-drive")
         .arg(drive(
             "if=pflash,format=raw,readonly=on,file=",
