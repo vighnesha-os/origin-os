@@ -67,6 +67,7 @@ Applied in code on 2026-11-07, pinned by tests, and **not yet decided**. Each is
 | P6 | `onbf-pack`, manifest | `flags_digest` is SHA-256 over exactly the UTF-8 bytes of `--flags`, with no normalization (the build system owns the canonical form); toolchain fields default to `rustc -vV`, each validated against R4. |
 | P7 | `onbf-pack`, sections | MERKLE sections are REQUIRED only (not MAPPABLE), 8-byte aligned, placed after RELOCS in segment order; RELOCS uses the greedy SHT_RELR encoding, and `verify` rejects any other encoding. |
 | E1 | `origin-crypto`, Ed25519 | Strict RFC 8032 verification, in this order: A canonical (y < p, a root exists, not x = 0 with the sign bit) and not small order ([8]A ≠ identity); the same for R; S < L as a 256-bit integer; then the **cofactorless** equation [S]B = R + [k]A. Mixed-order A and R (order 2L, 4L, 8L) are accepted, with no [L]A check. The host signer must produce only signatures this accepts. |
+| M1 | `origin-crypto`, ML-DSA | Strict FIPS 204 verification, first failure wins: context > 255 bytes; HintBitUnpack per polynomial (count range, then strictly increasing positions), then non-zero padding; ‖z‖∞ ≥ γ1 − β; c̃ mismatch. SampleInBall uses all λ/4 bytes of c̃; the ExpandA nonce is ρ ‖ column ‖ row; rejection loops are unbounded (no Appendix C bound). The host signer must produce only signatures this accepts. |
 | L1 | loader, boot info 0.2 | A RELRO segment is passed to the kernel without write access, because the loader has applied every relocation (ADR-0002 B4). |
 
 ## Open gaps

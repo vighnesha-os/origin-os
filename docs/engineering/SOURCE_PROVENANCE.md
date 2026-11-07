@@ -215,6 +215,22 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - At 1 kHz with `hlt`, 100 interrupts took 125 ms: QEMU TCG coalesces late expiries. Hence 100 Hz and the asymmetric bound; physical hardware will tighten it.
   - QEMU only. No physical hardware yet (CLAUDE.md §74). Not done: Loom/Kani for the spin lock and the allocators, an independent review.
 
+### M3: processor start-up and preemptive kernel threads (2026-11-07)
+
+- **What:**
+  - `acpi` (library): RSDP, table and XSDT checks (signatures, exact lengths, checksums) and MADT processors (types 0 and 9, each once). Firmware tables are untrusted input.
+  - `smp`: processors from RSDP → XSDT → MADT; only enabled ones are started. A trampoline (AT&T `.code16`/`.code32`/`.code64`, constants only, no relocations) is copied to the reserved frame 0x8000, which is remapped read/execute while APs start and restored to read/write, never executable, afterwards; its GDT (descriptors pre-marked accessed), CR3, stack, entry and argument are in the separate RW frame 0x9000. Each AP in turn: INIT, 10 ms, start-up IPI, 200 µs, a second one if needed, up to 200 ms for the handshake. The AP enters long mode on the kernel's own tables (PAE, CR3, EFER.LME|NXE, CR0.PG|WP with CD/NW cleared), loads its own GDT and TSS (heap `CpuTables`) and the shared IDT, switches its APIC to x2APIC, and answers with its own APIC ID.
+  - `runqueue` (library) and `sched`: a thread's context is its interrupt frame on its own stack; `dispatch` returns the frame to resume and the common stub switches stacks. One round-robin queue per CPU behind its own lock, taken with interrupts disabled outside the timer handler. New threads get a built frame on a 16 KiB heap stack. Each AP runs its own timer and idle loop.
+  - `vm`: the live address space behind a lock (read-only mapping of firmware tables on demand; per-page access changes with `invlpg`).
+- **Specifications:** ACPI 6.6 §5.2.5, §5.2.6, §5.2.8, §5.2.12; Intel SDM Vol. 3A, the MP initialization protocol and "Initializing IA-32e Mode"; the x2APIC ICR.
+- **Unsafe additions (reviewed by the author, not independently):** `smp.rs` (the trampoline's `global_asm!`, the trampoline copy, data-page writes, firmware-table slices, the IPIs, the AP entry), `sched.rs` (RFLAGS save/restore, `sti; hlt` idles, the APIC ID read), `vm.rs` (`invlpg`), and `X2Apic::send_ipi`, kept apart from the safe register methods so ordinary APIC use cannot reach the ICR.
+- **Test evidence (2026-11-07):**
+  - 61 host unit tests in the library (acpi 4, runqueue 4 among them).
+  - `cargo xtask boot-test` (default `-smp 2`) and `ORIGIN_QEMU_SMP=4` and `=8` pass: every enabled processor online 10.0–10.5 ms after its INIT.
+  - Scheduler: on every CPU two never-yielding workers ran there for 500 ms with shares within 3 % of each other and 51 context switches (2 and 4 CPUs).
+  - Negative controls, each restored byte-identical and each failing the boot test: the trampoline left NX (the AP faults at its first fetch with paging on and triple-faults; QEMU stops after the MADT line), and a scheduler that never switches ("counted 0 and 0, 0 context switches").
+  - QEMU only. Not done: priorities, sleeping, thread exit, load balancing, guard pages below thread stacks, Loom models.
+
 ## `origin-version.toml` and `runtime/version/` (`origin-version`), T5
 
 - **What:**
@@ -346,7 +362,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - Not done: a second Merkle implementation by a different author (§13 item 6), integration of `verify_block` with `onbf-format` sections, and Kani bounds.
 - **Licensing:** project licence not chosen yet.
 
-## `security/crypto/` (`origin-crypto`), SHA-2, SHA-3, SHAKE and Ed25519
+## `security/crypto/` (`origin-crypto`), SHA-2, SHA-3, SHAKE, Ed25519 and ML-DSA
 
 - **What:** streaming and one-shot SHA-256 and SHA-512 (FIPS 180-4 §6.2, §6.4), with the §5.1 padding shared through a generic block buffer. The schedule is a 16-word ring.
   - These are the hashes ONBF needs: SHA-512 for content digests, SHA-256 for section digests and Merkle trees.
@@ -419,6 +435,25 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - **No panic paths:** the `x86_64-unknown-none` release object references only `memcpy`, `memset` and `Formatter::write_str`.
   - **Throughput:** 16,625 verifications/s on the M1 Max host (aarch64, release, single thread). Indicative only; the target is x86-64.
   - **Not done:** Wycheproof vectors (downloading them needs the owner's approval); an N-version check by a different author (ONBF §13 item 6); Kani and fuzzing; an x86-64 benchmark; independent review.
+
+### ML-DSA verification (FIPS 204), added 2026-11-07
+
+- **What:** strict `mldsa65_verify` and `mldsa87_verify` (FIPS 204 Algorithm 3, pure ML-DSA with a context string, and Algorithm 8) for the ONBF suites OSS-1 and OSS-1R (ONBF §7.1–§7.2), with `MlDsaError` and the Table 2 lengths. HashML-DSA and ML-DSA-44 are not provided.
+  - Strict semantics, first failure wins: `ContextTooLong` (|ctx| > 255); HintBitUnpack (Algorithm 21) in its own order, `HintCountOutOfRange` and `HintIndexNotIncreasing` per polynomial, then `HintPaddingNonZero`; `ZOutOfRange` (‖z‖∞ ≥ γ1 − β); `ChallengeMismatch`. SampleInBall is seeded with all λ/4 bytes of c̃ (the final standard); the ExpandA nonce is ρ ‖ column ‖ row; rejection loops are unbounded, as written (errata M1, pending).
+  - Â is never materialized: each entry is regenerated by RejNTTPoly and multiplied into its row as it is sampled, and each row of w′1 is fed straight into the SHAKE256 state for c̃′. Peak stack in release: ML-DSA-87 about 15.4 KiB measured on the host and 15,064 bytes from the x86-64 kernel object's frames; ML-DSA-65 about 12.7 KiB and 12,952 bytes (budget 24 KiB; the kernel stack is 64 KiB).
+  - Arithmetic mod q is canonical throughout, with Barrett reduction by ⌊2^64/q⌋ (the bound is argued in `field.rs`).
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-07, in its own worktree, merged by the coordinator (bbdc717). Original code from FIPS 204 (August 2024).
+- **Constants:** only the Table 1 parameters are typed in. The zeta table (ζ^BitRev8(m), ζ = 1753) and 256^−1 are computed at compile time; the tests re-derive them and check ζ^256 = −1 and ζ^512 = 1. Const assertions tie the Table 2 lengths and the encodings to each parameter set.
+- **Side channels:** variable time by design: verification handles only public data (ONBF §7.2), and nothing secret is held.
+- **Oracle:** `tools/mldsa_reference.py`, an independent pure-Python FIPS 204 (KeyGen, deterministic and hedged Sign, Verify) using only hashlib's SHAKE, with a recursive CRT NTT checked against the evaluation definition, big-integer packing and a materialized Â. As a development check only, its `crosscheck` command matched the locally installed OpenSSL 4.1.0 (already on the machine; nothing was downloaded) byte for byte: 26 keys from their seeds and 104 deterministic and fixed-entropy signatures, all of which OpenSSL verified, and it rejected 12 mutations. Nothing in the build or the tests depends on OpenSSL.
+- **Test evidence (2026-11-07):** 19 tests, plus 2 ignored (a calibrated stack measurement and a benchmark).
+  - **Differential:** 104 signatures (52 per set; messages of 0–4,096 bytes; contexts of 0–255 bytes, including the five ONBF role contexts; deterministic and hedged), regenerated byte-identically.
+  - **Negative corpus:** 2,631 cases with exact expected errors: every bit of c̃ and of the hint encoding, z bits, malformed hints of every kind and the order of their checks, the z bound at γ1 − β − 1 and γ1 − β, contexts (256 bytes included), messages, and keys of the other parameter set.
+  - **Properties and internals:** 1,040 random mutations never verify; Decompose and UseHint exhaustively over Z_q; the NTT against its definition, its inverse and schoolbook negacyclic multiplication; Barrett against `%`; SampleInBall; the streamed matrix entries against RejNTTPoly.
+  - **Mutation check:** 13 planted faults, one at a time; 12 caught, and the 13th (accepting ω + 1 hints) cannot change a verdict because the position-slice bound returns the same error.
+  - **No panic paths:** the kernel-target object references only `memcpy`, `memset` and `Formatter::write_str`.
+  - **Throughput:** ML-DSA-65 about 14,000 and ML-DSA-87 about 8,400 verifications/s on the M1 host (aarch64, portable code). Indicative only.
+  - **Not done:** NIST ACVP vectors and the FIPS 204 errata sheet (downloading needs the owner's approval), an AVX2 path, an independent review. The oracle has the same author as the code.
 
 ## `developer-tools/xtask/` (`xtask`)
 
