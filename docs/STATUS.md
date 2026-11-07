@@ -28,7 +28,7 @@
 
 ## Waiting on the owner
 
-ADR-0002 and ADR-0003 (Proposed); ADR-0004 was accepted and implemented on 2026-11-07; ADR-0005 (process ABI and IPC) is decided in part (P1, P2, P8, P10 accepted; the rest Proposed); B7; G1; the readings P1–P7, E1, M1 and L1 in `docs/spec/ONBF-errata.md`; approval to download NIST ACVP / FIPS 204 errata / Wycheproof vectors and the `loom` crate; a project licence; merging into `main` and pushing. Details: `docs/engineering/TASKS.md`.
+ADR-0002 and ADR-0003 (Proposed); ADR-0004 was accepted and implemented on 2026-11-07; ADR-0005 (process ABI and IPC) was accepted on 2026-11-07 and is being implemented; B7; G1; the readings P1–P7, E1, M1 and L1 in `docs/spec/ONBF-errata.md`; approval to download NIST ACVP / FIPS 204 errata / Wycheproof vectors and the `loom` crate; a project licence; merging into `main` and pushing. Details: `docs/engineering/TASKS.md`.
 
 ## Where the evidence is
 

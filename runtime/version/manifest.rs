@@ -36,6 +36,7 @@ pub(crate) struct Manifest {
     pub(crate) security_version: u32,
     pub(crate) onbf_format: (u16, u16),
     pub(crate) boot_info: (u16, u16),
+    pub(crate) user_abi: (u16, u16),
 }
 
 enum Value<'a> {
@@ -46,7 +47,7 @@ enum Value<'a> {
 /// The keys each section must contain, exactly once.
 const SCHEMA: &[(&str, &[&str])] = &[
     ("release", &["version", "build", "security-version"]),
-    ("compatibility", &["onbf-format", "boot-info"]),
+    ("compatibility", &["onbf-format", "boot-info", "user-abi"]),
 ];
 
 /// Parses and validates the whole file. Errors name the 1-based line.
@@ -140,6 +141,9 @@ pub(crate) fn parse(text: &str) -> Result<Manifest, String> {
     let (b, line) = string("compatibility", "boot-info")?;
     let boot_info = parse_major_minor(b)
         .map_err(|e| format!("origin-version.toml:{line}: boot-info {b:?}: {e}"))?;
+    let (u, line) = string("compatibility", "user-abi")?;
+    let user_abi = parse_major_minor(u)
+        .map_err(|e| format!("origin-version.toml:{line}: user-abi {u:?}: {e}"))?;
 
     Ok(Manifest {
         version,
@@ -147,6 +151,7 @@ pub(crate) fn parse(text: &str) -> Result<Manifest, String> {
         security_version,
         onbf_format,
         boot_info,
+        user_abi,
     })
 }
 

@@ -54,7 +54,11 @@ fn generate() -> Result<(), String> {
          /// Boot-info ABI major version (`[compatibility] boot-info`).\n\
          pub const BOOT_INFO_MAJOR: u16 = {bmaj};\n\
          /// Boot-info ABI minor version (`[compatibility] boot-info`).\n\
-         pub const BOOT_INFO_MINOR: u16 = {bmin};\n",
+         pub const BOOT_INFO_MINOR: u16 = {bmin};\n\
+         /// Origin userspace ABI major version (`[compatibility] user-abi`, ADR-0005 P12).\n\
+         pub const USER_ABI_MAJOR: u16 = {umaj};\n\
+         /// Origin userspace ABI minor version (`[compatibility] user-abi`).\n\
+         pub const USER_ABI_MINOR: u16 = {umin};\n",
         version = m.version.text(),
         major = m.version.major,
         minor = m.version.minor,
@@ -66,6 +70,8 @@ fn generate() -> Result<(), String> {
         fmin = m.onbf_format.1,
         bmaj = m.boot_info.0,
         bmin = m.boot_info.1,
+        umaj = m.user_abi.0,
+        umin = m.user_abi.1,
     );
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set")?);

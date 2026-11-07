@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Decided in part** (2026-11-07). The owner answered the four questions below with the recommended option each: P1–P2 (capability handles, shrinking rights), P8 (asynchronous channels, 64 KiB and 64 handles per message) and P10 (exception channels, no POSIX signals) are **accepted**. P3–P7, P9, P11 and P12 remain **Proposed** until the owner accepts the whole ADR. Not implemented. |
+| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. |
 | Scope | Kernel objects and handles, the system-call convention, status codes, process and thread start, memory mapping, IPC, waiting, faults, termination, ABI versioning |
 | Builds on | ONBF §6.1 (EXE/LIB images, syscall-origin pinning, TLS in FS), §8.2 (sealed objects, the Code Integrity Table, mapping rules), §8.3 (the user-mode Loader Service and the start record); ADR-0001 D2 (user-mode drivers); ADR-0004 (address-space layout) |
 | Requires | CLAUDE.md §29 (processes and isolation), §30 (IPC and capabilities), §42 (executable ABI), §44 (runtime), §49 (SDK) |

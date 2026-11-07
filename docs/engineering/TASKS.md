@@ -48,7 +48,7 @@
 ## Next, in order
 
 1. **M3, scheduling proper** (ADR-0003 K7 is the baseline): wait queues and cross-CPU wake-ups by IPI, priorities and a fairness policy (EEVDF to be evaluated, §26), load balancing, a serialized kernel console for multi-CPU output. Pad the per-worker counters (cache-line sharing showed at 4 CPUs).
-2. **M4:** per-process address spaces are done (2026-11-07); next: process objects with handles and capabilities, user copies checked against the calling process's tables, an ADR for the process ABI and IPC (owner approval, §84), then `.ose` loading; global kernel pages and PCIDs (H5).
+2. **M4:** per-process address spaces are done; ADR-0005 (process ABI, handles, IPC) accepted 2026-11-07. Implementing it: the `origin-abi` crate, handle tables, channels, the system-call convention, `wait_one`, user copies against the calling process's tables; then the start record, memory objects, the Loader Service and `.ose` loading; global kernel pages and PCIDs (ADR-0004 H5).
 3. **Signature block (ONBF §7.1):** S1–S4 decided, parser and `onbf-verify` done (2026-11-07); next: `onbf-pack` signing with a host key, the loader requiring a signed KRN outside developer mode, the trust store and OKC chains, then the trust anchor (B7).
 4. **Formal and concurrency checks:** Loom models for `SpinLock`; Kani bounds for `paging`, `frames` and `heap` (CLAUDE.md §73).
 5. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks.
@@ -61,7 +61,6 @@
 | — | Accept, amend or reject **ADR-0002** (Proposed) | Shipping anything built on the boot path |
 | B7 | Boot trust anchor: Microsoft UEFI CA 2023, or Origin keys enrolled in firmware | Secure Boot |
 | — | Accept, amend or reject **ADR-0003** (kernel memory, interrupts, SMP start-up, first scheduler; Proposed) | Building M4 on it |
-| — | **ADR-0005** P3–P7, P9, P11, P12 (object types, syscall convention, status codes, start record, memory, waiting, quotas, versioning; Proposed). P1, P2, P8 and P10 were accepted on 2026-11-07 | M4 process objects and IPC |
 | G1 | A section kind for SYM's DWARF data | `.osym` (M6) |
 | R1–R5 | Readings applied in the errata (overrule if wanted) | — |
 | P1–P7, E1, L1 | Readings proposed by `onbf-pack`, Ed25519 and the loader (errata) | A second implementation, the host signer |
