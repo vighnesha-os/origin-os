@@ -31,7 +31,9 @@ commands:
 environment:
   ORIGIN_OVMF_CODE, ORIGIN_OVMF_VARS  firmware code image and NVRAM template
                                       (default: the EDK2 files installed next to QEMU)
-  ORIGIN_BOOT_TEST_TIMEOUT            boot-test timeout in seconds (default 120)";
+  ORIGIN_BOOT_TEST_TIMEOUT            boot-test timeout in seconds (default 120)
+  ORIGIN_QEMU_DEBUG                   if set, QEMU logs interrupts and resets to
+                                      target/xtask/qemu-debug.log";
 
 const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 const LOADER_PACKAGE: &str = "origin-boot-uefi";
@@ -74,8 +76,8 @@ fn boot_scenario() -> Scenario {
         markers: vec![
             format!("{PRODUCT} {VERSION} UEFI loader (build {BUILD})"),
             "origin-boot: UEFI 2.".into(),
-            "origin-boot: developer mode: unsigned kernel images are accepted".into(),
             "origin-boot: read \\EFI\\ORIGIN\\KERNEL.ONBF (".into(),
+            "origin-boot: developer mode: unsigned kernel images are accepted".into(),
             "origin-boot: kernel verified: ".into(),
             "origin-boot: kernel placed at ".into(),
             "origin-boot: exiting boot services; entering the Framekernel".into(),
@@ -86,6 +88,11 @@ fn boot_scenario() -> Scenario {
                 origin_version::BOOT_INFO_MINOR
             ),
             "origin-kernel: loaded at ".into(),
+            "origin-kernel: GDT, TSS and IDT loaded (32 exception vectors)".into(),
+            "origin-kernel: exception 3 (#BP breakpoint) at rip ".into(),
+            "origin-kernel: breakpoint handled; resuming".into(),
+            "origin-kernel: frame allocator: ".into(),
+            "origin-kernel: allocated, wrote and freed 3 frames at ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
         failures: vec![
@@ -93,6 +100,15 @@ fn boot_scenario() -> Scenario {
             "origin-kernel: panic:",
             "origin-boot: kernel rejected",
             "origin-kernel: invalid boot info",
+            "origin-kernel: invalid image",
+            "(#DF double fault)",
+            "(#GP general protection)",
+            "(#PF page fault)",
+            "(#UD invalid opcode)",
+            "origin-kernel: no usable region can hold",
+            "origin-kernel: frame allocator exhausted",
+            "did not keep its contents",
+            "could not be freed",
         ],
     }
 }
@@ -233,9 +249,20 @@ fn check() -> Result {
             "-D",
             "warnings",
         ],
+        // The KRN packer (a host tool): library, CLI and integration tests.
+        &[
+            "clippy",
+            "--package",
+            PACK_PACKAGE,
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
         &["test", "--package", "xtask"],
         &["test", "--package", LOADER_PACKAGE, "--lib"],
         &["test", "--package", VERSION_PACKAGE],
+        &["test", "--package", PACK_PACKAGE],
     ];
     for step in steps {
         run_step(cargo().args(*step))?;
@@ -775,6 +802,14 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         .arg("-drive")
         .arg(drive("format=raw,file=fat:rw:", &s.esp)?)
         .args(["-net", "none", "-display", "none", "-no-reboot"]);
+    // Opt-in diagnostics: every interrupt and CPU reset, for debugging a triple fault.
+    if env::var_os("ORIGIN_QEMU_DEBUG").is_some() {
+        let log = target_dir().join("xtask").join("qemu-debug.log");
+        c.arg("-d")
+            .arg("int,cpu_reset,guest_errors")
+            .arg("-D")
+            .arg(log);
+    }
     Ok(c)
 }
 

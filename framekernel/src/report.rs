@@ -22,7 +22,8 @@ pub const PANIC: &str = "origin-kernel: panic: ";
 /// to `write_str` as it is.
 pub const RELOCATIONS_NOT_APPLIED: &str = "origin-kernel: invalid image: relocations not applied\n";
 
-/// Prints the banner and the boot-info summary, ending with [`HALT_LINE`].
+/// Prints the banner and the boot-info summary. `_start` prints [`HALT_LINE`] last, after
+/// the CPU tables are loaded and exceptions are proven ([`write_halt`]).
 ///
 /// The release identity is generated from `origin-version.toml` (CLAUDE.md §62).
 pub fn write_report<W: Write>(out: &mut W, info: &BootInfo, memory: &MemorySummary) -> fmt::Result {
@@ -51,6 +52,19 @@ pub fn write_report<W: Write>(out: &mut W, info: &BootInfo, memory: &MemorySumma
     } else {
         writeln!(out, "{PREFIX}ACPI RSDP at {:#x}", info.acpi_rsdp)?;
     }
+    Ok(())
+}
+
+/// Printed once the GDT, TSS and IDT are loaded (the first M2 step).
+pub const CPU_TABLES_LINE: &str = "origin-kernel: GDT, TSS and IDT loaded (32 exception vectors)";
+
+/// Prints [`CPU_TABLES_LINE`].
+pub fn write_cpu_tables<W: Write>(out: &mut W) -> fmt::Result {
+    writeln!(out, "{CPU_TABLES_LINE}")
+}
+
+/// Prints [`HALT_LINE`], the last line of a successful boot.
+pub fn write_halt<W: Write>(out: &mut W) -> fmt::Result {
     writeln!(out, "{HALT_LINE}")
 }
 
@@ -97,8 +111,7 @@ mod tests {
             "origin-kernel: {} {} Framekernel (build {})\n\
              origin-kernel: boot info 0.1, 42 memory regions, 2014 MiB usable\n\
              origin-kernel: loaded at 0x7e50000, span 0x13000 bytes\n\
-             origin-kernel: ACPI RSDP at 0x7fb7e014\n\
-             origin-kernel: M1 entry complete; halting\n",
+             origin-kernel: ACPI RSDP at 0x7fb7e014\n",
             origin_version::PRODUCT,
             origin_version::VERSION,
             origin_version::BUILD
@@ -111,9 +124,12 @@ mod tests {
         let mut out = String::new();
         write_report(&mut out, &info(0), &MemorySummary { usable_pages: 0 }).unwrap();
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 4);
         assert_eq!(lines[3], "origin-kernel: no ACPI RSDP");
-        assert_eq!(lines[4], HALT_LINE);
+        let mut tail = String::new();
+        write_cpu_tables(&mut tail).unwrap();
+        write_halt(&mut tail).unwrap();
+        assert_eq!(tail, format!("{CPU_TABLES_LINE}\n{HALT_LINE}\n"));
         assert!(lines.iter().all(|l| l.starts_with(PREFIX)));
     }
 

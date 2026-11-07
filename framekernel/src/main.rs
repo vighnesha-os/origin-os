@@ -23,8 +23,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use framekernel::boot::{self, InvalidBootInfo, MemorySummary};
 use framekernel::report;
+
+mod cpu;
+use framekernel::frames::{self, FrameAllocator};
 use framekernel::serial::{Register, Uart16550, UartRegisters};
-use origin_boot_info::{BootInfo, MemoryRegion};
+use origin_boot_info::{BootInfo, MemoryRegion, RegionKind};
 
 /// I/O port base of COM1 on PC-compatible platforms.
 const COM1_BASE: u16 = 0x3F8;
@@ -68,11 +71,103 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
 
     // SAFETY: `boot_info` is the loader's pointer, passed on unchanged, and this function's
     // contract is exactly `read_boot_info`'s.
-    let _ = match unsafe { read_boot_info(boot_info) } {
-        Ok((info, memory)) => report::write_report(&mut com1, &info, &memory),
-        Err(err) => report::write_invalid(&mut com1, err),
+    let (info, regions, memory) = match unsafe { read_boot_info(boot_info) } {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = report::write_invalid(&mut com1, err);
+            halt();
+        }
     };
+    let _ = report::write_report(&mut com1, &info, &memory);
+
+    // M2, first step: the kernel's own GDT, TSS and IDT, proven with a breakpoint whose
+    // handler reports it and resumes here.
+    // SAFETY: called once, at CPL 0, on the boot processor, with interrupts disabled (entry
+    // contract), before anything depends on the firmware's tables.
+    unsafe { cpu::init() };
+    let _ = report::write_cpu_tables(&mut com1);
+    cpu::breakpoint();
+
+    // M2, second step: the physical frame allocator over the boot-info regions.
+    init_frames(&mut com1, regions);
+
+    let _ = report::write_halt(&mut com1);
     halt()
+}
+
+/// Builds the frame allocator, with its bitmap at the start of the first usable region
+/// that can hold it, and proves it by allocating, writing, reading back and freeing three
+/// frames.
+fn init_frames(com1: &mut Uart16550<Com1>, regions: &[MemoryRegion]) {
+    let words = frames::words_for(frames::usable_end(regions));
+    let pages = (words * 8).div_ceil(frames::FRAME);
+    let usable = RegionKind::Usable as u32;
+    let Some(home) = regions
+        .iter()
+        .find(|r| r.kind == usable && r.base != 0 && r.pages >= pages)
+    else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: no usable region can hold the {pages}-page frame bitmap"
+        );
+        return;
+    };
+    let bitmap_ptr = ptr::with_exposed_provenance_mut::<u64>(home.base as usize);
+    // SAFETY: `home` is a `Usable` region from the validated boot info, so nothing else
+    // owns it; the firmware's identity mapping is active, so its physical address is
+    // directly writable; it holds at least `pages` pages, which cover `words` words.
+    unsafe { bitmap_ptr.write_bytes(0, words as usize) };
+    // SAFETY: as above; the words were just zeroed, and the bitmap frames are reserved
+    // below, so the allocator never hands them out while the slice lives.
+    let bitmap = unsafe { slice::from_raw_parts_mut(bitmap_ptr, words as usize) };
+    let mut alloc = match FrameAllocator::new(bitmap, regions, &[(home.base, pages)]) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = writeln!(com1, "origin-kernel: frame allocator: {e:?}");
+            return;
+        }
+    };
+    let _ = writeln!(
+        com1,
+        "origin-kernel: frame allocator: {} free frames ({} MiB), bitmap of {} pages at {:#x}",
+        alloc.free_frames(),
+        (alloc.free_frames() * frames::FRAME) >> 20,
+        pages,
+        home.base
+    );
+    let mut got = [0u64; 3];
+    for (i, slot) in got.iter_mut().enumerate() {
+        let Some(addr) = alloc.allocate() else {
+            let _ = writeln!(com1, "origin-kernel: frame allocator exhausted");
+            return;
+        };
+        let p = ptr::with_exposed_provenance_mut::<u64>(addr as usize);
+        let pattern = 0x4F52_4947_494E_0000 | i as u64;
+        // SAFETY: the allocator just handed out this usable, identity-mapped frame, and
+        // nothing else uses it; a volatile write and read prove the RAM really holds it.
+        unsafe { p.write_volatile(pattern) };
+        // SAFETY: as above.
+        let back = unsafe { p.read_volatile() };
+        if back != pattern {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: frame {addr:#x} did not keep its contents"
+            );
+            return;
+        }
+        *slot = addr;
+    }
+    for &addr in &got {
+        if alloc.free(addr).is_err() {
+            let _ = writeln!(com1, "origin-kernel: frame {addr:#x} could not be freed");
+            return;
+        }
+    }
+    let _ = writeln!(
+        com1,
+        "origin-kernel: allocated, wrote and freed 3 frames at {:#x}, {:#x}, {:#x}",
+        got[0], got[1], got[2]
+    );
 }
 
 /// Copies and validates the boot info, then summarizes its region array.
@@ -80,10 +175,11 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
 /// # Safety
 ///
 /// `boot_info` must be null or the address of a readable `BootInfo` whose region array, if
-/// the header is valid, is readable and is not written while the returned value is in use.
+/// the header is valid, is readable and is never written afterwards: the returned slice is
+/// `'static`, which holds because the loader leaves that memory to the kernel for good.
 unsafe fn read_boot_info(
     boot_info: *const BootInfo,
-) -> Result<(BootInfo, MemorySummary), InvalidBootInfo> {
+) -> Result<(BootInfo, &'static [MemoryRegion], MemorySummary), InvalidBootInfo> {
     boot::check_address(boot_info.addr())?;
     // SAFETY: `boot_info` is non-null and aligned (checked above) and readable (the
     // caller's contract). `BootInfo` has only integer fields, so every bit pattern is a
@@ -97,7 +193,7 @@ unsafe fn read_boot_info(
     // is a valid value.
     let regions = unsafe { slice::from_raw_parts(first, array.len) };
     let memory = boot::summarize(regions)?;
-    Ok((info, memory))
+    Ok((info, regions, memory))
 }
 
 /// Whether the loader applied the image's relocations.
@@ -115,7 +211,7 @@ fn relocations_applied() -> bool {
 }
 
 /// Disables interrupts and halts this processor forever.
-fn halt() -> ! {
+pub(crate) fn halt() -> ! {
     loop {
         // SAFETY: the kernel runs at CPL 0 (entry contract). `cli; hlt` touches no memory
         // and needs no stack. An NMI or SMI can still resume the processor, so it halts
@@ -125,7 +221,7 @@ fn halt() -> ! {
 }
 
 /// COM1's registers, reached through x86 port I/O.
-struct Com1(());
+pub(crate) struct Com1(());
 
 impl Com1 {
     /// # Safety
@@ -133,7 +229,7 @@ impl Com1 {
     /// The caller must run at CPL 0, and no other processor or driver may program COM1
     /// while the value is used. Accesses through it reach only COM1's registers
     /// 0x3F8–0x3FD, which cannot affect memory.
-    unsafe fn new() -> Self {
+    pub(crate) unsafe fn new() -> Self {
         Self(())
     }
 }
