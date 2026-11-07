@@ -15,6 +15,7 @@ use core::arch::{asm, naked_asm};
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use framekernel::apic::{SPURIOUS_VECTOR, TIMER_VECTOR, X2APIC_EOI};
 use framekernel::descriptors::{
     self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, TSS, TSS_SIZE,
 };
@@ -104,6 +105,13 @@ pub(crate) unsafe fn init() {
         let ist = if vector == 8 { DOUBLE_FAULT_IST } else { 0 };
         *gate = d::interrupt_gate(*stub as usize as u64, KERNEL_CODE, ist);
     }
+    let interrupts: [(u8, extern "sysv64" fn()); 2] =
+        [(TIMER_VECTOR, timer_stub), (SPURIOUS_VECTOR, spurious_stub)];
+    for (vector, stub) in interrupts {
+        if let Some(gate) = idt.0.get_mut(usize::from(vector)) {
+            *gate = d::interrupt_gate(stub as usize as u64, KERNEL_CODE, 0);
+        }
+    }
     // SAFETY: as above; written before `lidt`.
     unsafe { (&raw mut IDT).write(idt) };
 
@@ -146,6 +154,14 @@ pub(crate) unsafe fn init() {
     let _ = TSS_SIZE; // the limit is encoded by `tss_descriptor`
 }
 
+/// Local APIC timer interrupts taken since boot.
+static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Local APIC timer interrupts taken since boot.
+pub(crate) fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
 /// Executes `int3`; the breakpoint handler reports it and returns here.
 pub(crate) fn breakpoint() {
     // SAFETY: `int3` raises #BP, whose gate `init` installed; the handler returns with
@@ -155,6 +171,18 @@ pub(crate) fn breakpoint() {
 
 /// Called by [`exception_common`] with the saved frame.
 extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) {
+    // Device interrupts: the timer counts and acknowledges; a spurious interrupt needs no
+    // EOI (SDM Vol. 3A, spurious interrupt).
+    if frame.vector == u64::from(TIMER_VECTOR) {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: x2APIC mode is enabled before the timer is unmasked (`timer::init`), and
+        // writing 0 to the EOI register only acknowledges the interrupt in service.
+        unsafe { wrmsr(X2APIC_EOI, 0) };
+        return;
+    }
+    if frame.vector == u64::from(SPURIOUS_VECTOR) {
+        return;
+    }
     // A page fault at the exact instruction a probe armed: record it and resume at
     // `probe_recover`, which returns the error code to the probe's caller.
     if frame.vector == 14 {
@@ -202,41 +230,93 @@ fn read_cr2() -> u64 {
     value
 }
 
-/// Whether the processor supports the execute-disable bit (CPUID 8000_0001h EDX bit 20).
-pub(crate) fn nx_supported() -> bool {
-    let max_extended: u32;
-    // SAFETY: CPUID is available on every x86-64 processor; it reads no memory. RBX is
-    // reserved by LLVM, so it is saved and restored around the instruction.
+/// CPUID `leaf`, sub-leaf 0: `[eax, ebx, ecx, edx]`.
+pub(crate) fn cpuid(leaf: u32) -> [u32; 4] {
+    let (eax, ebx, ecx, edx): (u32, u32, u32, u32);
+    // SAFETY: CPUID is available on every x86-64 processor and reads no memory. RBX is
+    // reserved by LLVM, so it is moved out through another register and restored.
     unsafe {
         asm!(
-            "mov {save}, rbx",
+            "mov {save:r}, rbx",
             "cpuid",
-            "mov rbx, {save}",
-            save = out(reg) _,
-            inout("eax") 0x8000_0000_u32 => max_extended,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    if max_extended < 0x8000_0001 {
-        return false;
-    }
-    let edx: u32;
-    // SAFETY: as above; leaf 8000_0001h exists (checked).
-    unsafe {
-        asm!(
-            "mov {save}, rbx",
-            "cpuid",
-            "mov rbx, {save}",
-            save = out(reg) _,
-            inout("eax") 0x8000_0001_u32 => _,
-            out("ecx") _,
+            "xchg {save:r}, rbx",
+            save = out(reg) ebx,
+            inout("eax") leaf => eax,
+            inout("ecx") 0u32 => ecx,
             out("edx") edx,
             options(nomem, nostack, preserves_flags),
         );
     }
-    edx & (1 << 20) != 0
+    [eax, ebx, ecx, edx]
+}
+
+/// Whether the processor supports the execute-disable bit (CPUID 8000_0001h EDX bit 20).
+pub(crate) fn nx_supported() -> bool {
+    cpuid(0x8000_0000)[0] >= 0x8000_0001 && cpuid(0x8000_0001)[3] & (1 << 20) != 0
+}
+
+/// Whether the processor supports x2APIC mode (CPUID 1 ECX bit 21).
+pub(crate) fn x2apic_supported() -> bool {
+    cpuid(1)[2] & (1 << 21) != 0
+}
+
+/// Reads model-specific register `msr`.
+///
+/// # Safety
+///
+/// CPL 0, and `msr` must exist on this processor (else #GP) and have no read side effects
+/// this code does not expect.
+pub(crate) unsafe fn rdmsr(msr: u32) -> u64 {
+    let (low, high): (u32, u32);
+    // SAFETY: the caller's contract; RDMSR reads no memory.
+    unsafe {
+        asm!("rdmsr", in("ecx") msr, out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags));
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Writes `value` to model-specific register `msr`.
+///
+/// # Safety
+///
+/// CPL 0, `msr` must exist and `value` must be valid for it, and the write's effect on the
+/// processor must be one the caller intends and keeps memory-safe.
+pub(crate) unsafe fn wrmsr(msr: u32, value: u64) {
+    // SAFETY: the caller's contract; WRMSR reads no memory.
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+/// The time-stamp counter.
+pub(crate) fn rdtsc() -> u64 {
+    let (low, high): (u32, u32);
+    // SAFETY: RDTSC is available on every x86-64 processor (CR4.TSD is clear: the kernel
+    // runs at CPL 0 anyway) and reads no memory.
+    unsafe {
+        asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags))
+    };
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Opens a one-instruction window in which a pending interrupt is taken, then disables
+/// interrupts again.
+///
+/// Callers poll with this rather than halting: a halt waits for an interrupt that may never
+/// come (a missing EOI blocks every later one at the same priority), so the caller could
+/// never check its own deadline.
+pub(crate) fn interrupt_window() {
+    // SAFETY: CPL 0. Interrupts are recognized after the instruction that follows STI, so
+    // a pending one is taken after the NOP and before CLI. Every vector that can arrive has
+    // a gate (the timer, the spurious vector and the exceptions), and the 8259 PICs are
+    // masked.
+    unsafe { asm!("sti", "nop", "cli", options(nomem, nostack)) };
 }
 
 /// IA32_EFER.
@@ -403,6 +483,30 @@ extern "sysv64" fn exception_common() {
         "add rsp, 16",
         "iretq",
         dispatch = sym dispatch,
+    );
+}
+
+/// Entry stub of the local APIC timer interrupt: no error code, so push 0, then the vector.
+#[unsafe(naked)]
+extern "sysv64" fn timer_stub() {
+    naked_asm!(
+        "push 0",
+        "push {vector}",
+        "jmp {common}",
+        vector = const TIMER_VECTOR,
+        common = sym exception_common,
+    );
+}
+
+/// Entry stub of the spurious-interrupt vector.
+#[unsafe(naked)]
+extern "sysv64" fn spurious_stub() {
+    naked_asm!(
+        "push 0",
+        "push {vector}",
+        "jmp {common}",
+        vector = const SPURIOUS_VECTOR,
+        common = sym exception_common,
     );
 }
 

@@ -105,6 +105,9 @@ fn boot_scenario() -> Scenario {
             "origin-kernel: page protection: read of page 0 at 0x0 faulted (#PF error 0x0)".into(),
             // After the switch, so this also proves the direct map.
             "origin-kernel: allocated, wrote and freed 3 frames at ".into(),
+            "origin-kernel: x2APIC enabled: APIC ID 0, ".into(),
+            "origin-kernel: APIC timer calibrated against the PIT: ".into(),
+            "origin-kernel: APIC timer: 50 interrupts at 100 Hz in ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
         failures: vec![
@@ -126,6 +129,11 @@ fn boot_scenario() -> Scenario {
             "origin-kernel: the processor has no NX bit",
             "origin-kernel: no code or read-only segment to probe",
             "RWX at",
+            "origin-kernel: the processor has no x2APIC",
+            "origin-kernel: APIC timer calibration failed",
+            ": APIC timer is wrong",
+            "is unusable",
+            "(reserved) at rip",
         ],
     }
 }

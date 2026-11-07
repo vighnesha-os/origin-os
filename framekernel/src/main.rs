@@ -28,6 +28,7 @@ use framekernel::boot::{self, InvalidBootInfo, MemorySummary};
 use framekernel::report;
 
 mod cpu;
+mod timer;
 use framekernel::frames::{self, FrameAllocator};
 use framekernel::kernel_space;
 use framekernel::paging::{PAGE, Table, TablePool};
@@ -127,6 +128,10 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     if init_paging(&mut com1, &info, regions, segments, pool, pool_base) {
         prove_frames(&mut com1, &mut alloc);
     }
+
+    // M2, fourth step: interrupts. The local APIC in x2APIC mode, its timer calibrated
+    // against the PIT and proven by taking periodic interrupts.
+    timer::init(&mut com1);
 
     let _ = report::write_halt(&mut com1);
     halt()
@@ -445,7 +450,7 @@ impl UartRegisters for Com1 {
 /// The processor must be at CPL 0 (or hold I/O permission for `port`), and `port` must be a
 /// device register that this code owns and whose write cannot affect memory safety, such as
 /// a UART register.
-unsafe fn outb(port: u16, value: u8) {
+pub(crate) unsafe fn outb(port: u16, value: u8) {
     // SAFETY: the caller's contract. `out` reads no memory, needs no stack and leaves the
     // flags unchanged.
     unsafe {
@@ -459,7 +464,7 @@ unsafe fn outb(port: u16, value: u8) {
 ///
 /// As for [`outb`]: CPL 0 (or I/O permission), and a register this code owns whose read
 /// cannot affect memory safety.
-unsafe fn inb(port: u16) -> u8 {
+pub(crate) unsafe fn inb(port: u16) -> u8 {
     let value: u8;
     // SAFETY: the caller's contract. `in` writes only `al`, reads no memory, needs no stack
     // and leaves the flags unchanged.
