@@ -16,6 +16,8 @@ pub const RSDP_LENGTH: usize = 36;
 pub const HEADER_LENGTH: usize = 36;
 /// Offset of the first MADT interrupt controller structure.
 const MADT_ENTRIES: usize = 44;
+/// Offset of the first SRAT resource-affinity structure (36-byte header + 12 reserved).
+const SRAT_ENTRIES: usize = 48;
 
 /// Why a table was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +40,11 @@ pub enum AcpiError {
     MadtEntry(usize),
     /// More processors than the caller has room for.
     TooManyProcessors,
+    /// An SRAT structure at this offset is truncated or has a length below 2 (or below the
+    /// minimum for its type).
+    SratEntry(usize),
+    /// More affinity structures than the caller has room for.
+    TooManyEntries,
 }
 
 fn u32_at(b: &[u8], at: usize) -> Option<u32> {
@@ -352,6 +359,115 @@ fn madt_scan<T>(
     Ok(count)
 }
 
+/// One processor's NUMA affinity from the SRAT (ACPI 6.6 §5.2.16): a Processor Local APIC
+/// Affinity structure (type 0) or a Processor Local x2APIC Affinity structure (type 2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuAffinity {
+    /// Local APIC ID (type 0) or x2APIC ID (type 2).
+    pub apic_id: u32,
+    /// The proximity domain (NUMA node) it belongs to.
+    pub proximity_domain: u32,
+    /// Usable now (flags bit 0).
+    pub enabled: bool,
+}
+
+/// One memory range's NUMA affinity from the SRAT (type 1, ACPI 6.6 §5.2.16.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryAffinity {
+    pub proximity_domain: u32,
+    pub base: u64,
+    pub length: u64,
+    /// Usable now (flags bit 0).
+    pub enabled: bool,
+    /// Hot-pluggable (flags bit 1).
+    pub hot_pluggable: bool,
+    /// Non-volatile (flags bit 2).
+    pub non_volatile: bool,
+}
+
+/// The 32-bit proximity domain of a type-0 structure: byte 2 is the low 8 bits, bytes 9..12
+/// the high 24 (ACPI 6.6 §5.2.16.1). The caller guarantees `entry.len() >= 16`.
+fn proximity_type0(entry: &[u8]) -> u32 {
+    let lo = u32::from(entry.get(2).copied().unwrap_or(0));
+    let hi = u32::from(entry.get(9).copied().unwrap_or(0))
+        | u32::from(entry.get(10).copied().unwrap_or(0)) << 8
+        | u32::from(entry.get(11).copied().unwrap_or(0)) << 16;
+    lo | (hi << 8)
+}
+
+/// Lists the processor affinities in a checked SRAT (`check_table(b"SRAT")` already passed)
+/// into `out`, handling type 0 (local APIC) and type 2 (x2APIC); returns how many. Other
+/// structure types are skipped. A known type with a length below its minimum is refused.
+pub fn srat_cpu_affinities(srat: &[u8], out: &mut [CpuAffinity]) -> Result<usize, AcpiError> {
+    let mut count = 0;
+    let mut at = SRAT_ENTRIES;
+    while at < srat.len() {
+        let (Some(&kind), Some(&len)) = (srat.get(at), srat.get(at + 1)) else {
+            return Err(AcpiError::SratEntry(at));
+        };
+        let entry = srat
+            .get(at..at + usize::from(len))
+            .filter(|_| len >= 2)
+            .ok_or(AcpiError::SratEntry(at))?;
+        let affinity = match (kind, len) {
+            (0, 16..) => Some(CpuAffinity {
+                apic_id: u32::from(entry.get(3).copied().unwrap_or(0)),
+                proximity_domain: proximity_type0(entry),
+                enabled: u32_at(entry, 4).unwrap_or(0) & 1 != 0,
+            }),
+            (2, 24..) => Some(CpuAffinity {
+                apic_id: u32_at(entry, 8).unwrap_or(0),
+                proximity_domain: u32_at(entry, 4).unwrap_or(0),
+                enabled: u32_at(entry, 12).unwrap_or(0) & 1 != 0,
+            }),
+            (0 | 2, _) => return Err(AcpiError::SratEntry(at)),
+            _ => None,
+        };
+        if let Some(a) = affinity {
+            *out.get_mut(count).ok_or(AcpiError::TooManyEntries)? = a;
+            count += 1;
+        }
+        at += usize::from(len);
+    }
+    Ok(count)
+}
+
+/// Lists the memory affinities in a checked SRAT (type 1) into `out`; returns how many.
+pub fn srat_memory_affinities(srat: &[u8], out: &mut [MemoryAffinity]) -> Result<usize, AcpiError> {
+    let mut count = 0;
+    let mut at = SRAT_ENTRIES;
+    while at < srat.len() {
+        let (Some(&kind), Some(&len)) = (srat.get(at), srat.get(at + 1)) else {
+            return Err(AcpiError::SratEntry(at));
+        };
+        let entry = srat
+            .get(at..at + usize::from(len))
+            .filter(|_| len >= 2)
+            .ok_or(AcpiError::SratEntry(at))?;
+        if kind == 1 {
+            if len < 40 {
+                return Err(AcpiError::SratEntry(at));
+            }
+            let base = u64::from(u32_at(entry, 8).unwrap_or(0))
+                | u64::from(u32_at(entry, 12).unwrap_or(0)) << 32;
+            let length = u64::from(u32_at(entry, 16).unwrap_or(0))
+                | u64::from(u32_at(entry, 20).unwrap_or(0)) << 32;
+            let flags = u32_at(entry, 28).unwrap_or(0);
+            *out.get_mut(count).ok_or(AcpiError::TooManyEntries)? = MemoryAffinity {
+                proximity_domain: u32_at(entry, 2).unwrap_or(0),
+                base,
+                length,
+                enabled: flags & 1 != 0,
+                hot_pluggable: flags & 2 != 0,
+                non_volatile: flags & 4 != 0,
+            };
+            count += 1;
+        }
+        at += usize::from(len);
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,5 +770,158 @@ mod tests {
         m.push(0);
         let mut out = [Processor::default(); 4];
         assert_eq!(madt_processors(&m, &mut out), Err(AcpiError::MadtEntry(52)));
+    }
+
+    /// Builds an SRAT body: 12 reserved bytes (the first dword is 1 for back-compat) then
+    /// the given affinity structures, wrapped in a checked table header.
+    fn srat(entries: &[&[u8]]) -> Vec<u8> {
+        let mut body = vec![0u8; 12];
+        body[0] = 1;
+        for e in entries {
+            body.extend_from_slice(e);
+        }
+        table(b"SRAT", &body)
+    }
+
+    /// A type-0 Processor Local APIC Affinity structure.
+    fn cpu0(apic: u8, domain: u32, enabled: bool) -> Vec<u8> {
+        let d = domain.to_le_bytes();
+        vec![
+            0,
+            16,
+            d[0],
+            apic, // type, len, domain[7:0], apic id
+            enabled as u8,
+            0,
+            0,
+            0, // flags
+            0, // local SAPIC EID
+            d[1],
+            d[2],
+            d[3], // domain[31:8]
+            0,
+            0,
+            0,
+            0, // clock domain
+        ]
+    }
+
+    /// A type-2 Processor Local x2APIC Affinity structure.
+    fn cpu2(x2apic: u32, domain: u32, enabled: bool) -> Vec<u8> {
+        let mut e = vec![2u8, 24, 0, 0];
+        e.extend_from_slice(&domain.to_le_bytes());
+        e.extend_from_slice(&x2apic.to_le_bytes());
+        e.extend_from_slice(&(enabled as u32).to_le_bytes());
+        e.extend_from_slice(&[0; 8]); // clock domain + reserved
+        e
+    }
+
+    /// A type-1 Memory Affinity structure.
+    fn mem(domain: u32, base: u64, length: u64, flags: u32) -> Vec<u8> {
+        let mut e = vec![1u8, 40];
+        e.extend_from_slice(&domain.to_le_bytes());
+        e.extend_from_slice(&[0, 0]); // reserved
+        e.extend_from_slice(&(base as u32).to_le_bytes());
+        e.extend_from_slice(&((base >> 32) as u32).to_le_bytes());
+        e.extend_from_slice(&(length as u32).to_le_bytes());
+        e.extend_from_slice(&((length >> 32) as u32).to_le_bytes());
+        e.extend_from_slice(&[0, 0, 0, 0]); // reserved
+        e.extend_from_slice(&flags.to_le_bytes());
+        e.extend_from_slice(&[0; 8]); // reserved
+        e
+    }
+
+    #[test]
+    fn srat_lists_cpu_and_memory_affinities() {
+        // Two nodes: cpus 0,2 on node 0 and cpu 1 on node 1 (a 32-bit domain via the high
+        // bytes), an x2APIC cpu on node 1, and a memory range per node. One extra entry of
+        // an unknown type (6) must be skipped.
+        let s = srat(&[
+            &cpu0(0, 0, true),
+            &cpu0(1, 0x0001_0000, true), // high domain bytes exercised
+            &cpu0(2, 0, false),          // present but not enabled
+            &cpu2(300, 0x0001_0000, true),
+            &mem(0, 0, 0x1000_0000, 1), // 256 MiB, enabled
+            &mem(0x0001_0000, 0x1_0000_0000, 0x1000_0000, 0b111), // enabled|hotplug|nv
+            &[6u8, 4, 0, 0][..],        // unknown type, skipped
+        ]);
+        assert_eq!(check_table(&s, b"SRAT"), Ok(()));
+
+        let mut cpus = [CpuAffinity::default(); 8];
+        let n = srat_cpu_affinities(&s, &mut cpus).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(
+            cpus[0],
+            CpuAffinity {
+                apic_id: 0,
+                proximity_domain: 0,
+                enabled: true
+            }
+        );
+        assert_eq!(
+            cpus[1].proximity_domain, 0x0001_0000,
+            "32-bit domain decoded"
+        );
+        assert!(!cpus[2].enabled, "a present-but-disabled cpu");
+        assert_eq!(
+            cpus[3],
+            CpuAffinity {
+                apic_id: 300,
+                proximity_domain: 0x0001_0000,
+                enabled: true
+            },
+            "x2APIC affinity"
+        );
+
+        let mut mems = [MemoryAffinity::default(); 8];
+        let n = srat_memory_affinities(&s, &mut mems).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(mems[0].length, 0x1000_0000);
+        assert_eq!(mems[0].proximity_domain, 0);
+        assert_eq!(mems[1].base, 0x1_0000_0000, "64-bit base decoded");
+        assert!(mems[1].hot_pluggable && mems[1].non_volatile);
+
+        // Distinct nodes across both kinds: {0, 0x10000} = 2.
+        let mut domains = alloc::vec::Vec::new();
+        for c in &cpus[..4] {
+            if c.enabled && !domains.contains(&c.proximity_domain) {
+                domains.push(c.proximity_domain);
+            }
+        }
+        assert_eq!(domains.len(), 2);
+    }
+
+    #[test]
+    fn srat_rejects_malformed_and_overflow() {
+        // A type-0 structure too short for its fixed 16 bytes is refused at its offset.
+        let s = srat(&[&cpu0(0, 0, true), &[0u8, 8, 0, 0, 0, 0, 0, 0][..]]);
+        let mut cpus = [CpuAffinity::default(); 8];
+        assert_eq!(
+            srat_cpu_affinities(&s, &mut cpus),
+            Err(AcpiError::SratEntry(SRAT_ENTRIES + 16))
+        );
+
+        // A structure whose length runs past the table.
+        let s = srat(&[&[0u8, 200, 0, 0][..]]);
+        assert_eq!(
+            srat_cpu_affinities(&s, &mut cpus),
+            Err(AcpiError::SratEntry(SRAT_ENTRIES))
+        );
+
+        // More enabled cpus than the caller's buffer holds.
+        let s = srat(&[&cpu0(0, 0, true), &cpu0(1, 0, true), &cpu0(2, 0, true)]);
+        let mut small = [CpuAffinity::default(); 2];
+        assert_eq!(
+            srat_cpu_affinities(&s, &mut small),
+            Err(AcpiError::TooManyEntries)
+        );
+
+        // A type-1 memory structure below 40 bytes is refused.
+        let s = srat(&[&[1u8, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..]]);
+        let mut mems = [MemoryAffinity::default(); 4];
+        assert_eq!(
+            srat_memory_affinities(&s, &mut mems),
+            Err(AcpiError::SratEntry(SRAT_ENTRIES))
+        );
     }
 }

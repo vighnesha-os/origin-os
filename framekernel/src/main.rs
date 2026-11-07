@@ -236,6 +236,8 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         }
         // CPU topology from CPUID leaf 0Bh (CLAUDE.md §24, §27).
         prove_topology(&mut com1, online.ids());
+        // NUMA affinities from the ACPI SRAT (CLAUDE.md §24, §28).
+        prove_numa(&mut com1, info.acpi_rsdp, online.ids());
         // M3, second step: preemptive kernel threads on every online processor.
         sched::prove(&mut com1, online.ids(), tsc_hz);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
@@ -605,6 +607,74 @@ fn prove_topology(com1: &mut console::Console, ids: &[u32]) {
         topology.logical_per_package(),
         consistent,
         if consistent { "" } else { ": topology failed" }
+    );
+}
+
+/// Reports NUMA proximity domains from the ACPI SRAT (CLAUDE.md §24 NUMA topology, §28 NUMA
+/// policies). When the firmware supplies no SRAT (a uniform-memory machine, or QEMU without
+/// `-numa`), that is reported as a single implicit node. Otherwise every online processor
+/// must appear as an enabled CPU affinity and some memory must be present, or the line reads
+/// `consistent false`.
+fn prove_numa(com1: &mut console::Console, rsdp: u64, ids: &[u32]) {
+    use framekernel::acpi::{self, CpuAffinity, MemoryAffinity};
+
+    let Ok(srat) = crate::firmware::acpi_table(rsdp, b"SRAT") else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: numa: no SRAT (1 node assumed); consistent true"
+        );
+        return;
+    };
+
+    let mut cpus = [CpuAffinity::default(); crate::sched::MAX_CPUS];
+    let mut mems = [MemoryAffinity::default(); 32];
+    let (Ok(ncpu), Ok(nmem)) = (
+        acpi::srat_cpu_affinities(srat, &mut cpus),
+        acpi::srat_memory_affinities(srat, &mut mems),
+    ) else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: numa: invalid SRAT; consistent false: numa failed"
+        );
+        return;
+    };
+    let cpus = &cpus[..ncpu];
+    let mems = &mems[..nmem];
+
+    // Distinct enabled proximity domains across both kinds of affinity.
+    let mut nodes = alloc::vec::Vec::new();
+    for d in cpus
+        .iter()
+        .filter(|c| c.enabled)
+        .map(|c| c.proximity_domain)
+        .chain(
+            mems.iter()
+                .filter(|m| m.enabled)
+                .map(|m| m.proximity_domain),
+        )
+    {
+        if !nodes.contains(&d) {
+            nodes.push(d);
+        }
+    }
+
+    let enabled_cpus = cpus.iter().filter(|c| c.enabled).count();
+    let mem_bytes: u64 = mems.iter().filter(|m| m.enabled).map(|m| m.length).sum();
+    // Every online processor must have an enabled affinity entry.
+    let all_online_placed = ids
+        .iter()
+        .all(|id| cpus.iter().any(|c| c.enabled && c.apic_id == *id));
+    let consistent = !nodes.is_empty() && mem_bytes > 0 && all_online_placed;
+
+    let _ = writeln!(
+        com1,
+        "origin-kernel: numa: {} nodes, {} cpus, {} memory ranges, {} MiB; consistent {}{}",
+        nodes.len(),
+        enabled_cpus,
+        mems.iter().filter(|m| m.enabled).count(),
+        mem_bytes >> 20,
+        consistent,
+        if consistent { "" } else { ": numa failed" }
     );
 }
 

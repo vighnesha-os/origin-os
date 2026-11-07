@@ -185,6 +185,10 @@ fn boot_scenario_markers() -> Scenario {
             // CPU topology from CPUID leaf 0Bh: the online processors decompose consistently.
             "origin-kernel: topology: ".into(),
             "; consistent true".into(),
+            // NUMA from the ACPI SRAT (QEMU is booted with two -numa nodes): every online
+            // processor is placed in a node and memory is present.
+            "origin-kernel: numa: ".into(),
+            "; consistent true".into(),
             "origin-kernel: page protection: stack guard page at ".into(),
             // M3: two non-yielding threads per processor, all preempted and all running.
             "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted ".into(),
@@ -372,6 +376,7 @@ fn boot_scenario_markers() -> Scenario {
             ": AP start-up failed",
             ": scheduler failed",
             ": topology failed",
+            ": numa failed",
             "supervisor isolation from user pages incomplete",
             "origin-kernel: cannot map the user probe page",
             ": user isolation failed",
@@ -1156,6 +1161,13 @@ fn qemu_command(s: &Staged) -> Result<Command> {
     let mut c = Command::new(QEMU);
     c.args(["-machine", "q35", "-cpu", "max", "-m", "512M", "-smp"])
         .arg(qemu_cpus().to_string())
+        // Two NUMA nodes so the ACPI SRAT is populated (CLAUDE.md §24, §28). The 256M
+        // backends sum to -m, and QEMU auto-distributes the vCPUs across the nodes, so this
+        // is valid for any -smp (verified at 1/2/4/8).
+        .args(["-object", "memory-backend-ram,id=onuma0,size=256M"])
+        .args(["-object", "memory-backend-ram,id=onuma1,size=256M"])
+        .args(["-numa", "node,nodeid=0,memdev=onuma0"])
+        .args(["-numa", "node,nodeid=1,memdev=onuma1"])
         .arg("-drive")
         .arg(drive(
             "if=pflash,format=raw,readonly=on,file=",
