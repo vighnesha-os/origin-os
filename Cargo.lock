@@ -7,6 +7,7 @@ name = "framekernel"
 version = "0.0.0"
 dependencies = [
  "origin-boot-info",
+ "origin-sync",
  "origin-version",
 ]
 
@@ -56,6 +57,10 @@ dependencies = [
 
 [[package]]
 name = "origin-crypto"
+version = "0.0.0"
+
+[[package]]
+name = "origin-sync"
 version = "0.0.0"
 
 [[package]]

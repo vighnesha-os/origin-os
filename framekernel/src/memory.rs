@@ -12,7 +12,7 @@ use core::ptr;
 use framekernel::frames::{self, FrameAllocator};
 use framekernel::heap::{Heap, HeapStats, PageSource, Slab};
 
-use crate::sync::SpinLock;
+use origin_sync::SpinLock;
 
 /// Capacity of the slab table: 1024 slabs of 4 KiB, 4 MiB of small blocks.
 const SLABS: usize = 1024;

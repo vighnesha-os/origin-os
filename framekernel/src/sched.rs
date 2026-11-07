@@ -22,8 +22,8 @@ use framekernel::serial::Uart16550;
 
 use crate::Com1;
 use crate::cpu::{self, rdtsc};
-use crate::sync::SpinLock;
 use crate::timer::{self, ApicRead, X2Apic};
+use origin_sync::SpinLock;
 
 /// Processors with a run queue, indexed by x2APIC ID.
 pub(crate) const MAX_CPUS: usize = 64;

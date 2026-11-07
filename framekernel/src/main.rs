@@ -33,7 +33,6 @@ mod cpu;
 mod memory;
 mod sched;
 mod smp;
-mod sync;
 mod timer;
 mod vm;
 use framekernel::frames::{self, FrameAllocator};

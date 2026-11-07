@@ -5,7 +5,7 @@ use core::arch::asm;
 
 use framekernel::paging::{Access, AddressSpace, Attributes, MapError, PAGE, TablePool};
 
-use crate::sync::SpinLock;
+use origin_sync::SpinLock;
 
 struct KernelSpace {
     space: AddressSpace,

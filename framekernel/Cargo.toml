@@ -1,6 +1,6 @@
 [package]
 name = "framekernel"
-description = "Origin OS Framekernel (x86_64-unknown-none), M1 entry"
+description = "Origin OS Framekernel (x86_64-unknown-none)"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
@@ -20,6 +20,7 @@ bench = false
 
 [dependencies]
 origin-boot-info.workspace = true
+origin-sync = { path = "sync" }
 origin-version.workspace = true
 
 [lints]

@@ -53,6 +53,7 @@ const FREESTANDING_LIBS: &[&str] = &[
     ONBF_FORMAT_PACKAGE,
     MERKLE_PACKAGE,
     CRYPTO_PACKAGE,
+    "origin-sync",
 ];
 const QEMU: &str = "qemu-system-x86_64";
 const DEFAULT_BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
