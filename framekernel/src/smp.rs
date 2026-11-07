@@ -22,7 +22,6 @@
 //! Each AP then enters its own scheduler (`sched::run_ap`).
 
 use alloc::boxed::Box;
-use alloc::vec;
 use core::arch::global_asm;
 use core::fmt::Write;
 use core::ptr;
@@ -337,7 +336,8 @@ fn start_one(lapic: &X2Apic, apic_id: u32, tsc_hz: u64) -> Result<u64, &'static 
     // SAFETY: an all-zero `CpuTables` is valid (integers only); `init_ap` writes it before
     // the processor uses it.
     let tables = Box::into_raw(unsafe { Box::<CpuTables>::new_zeroed().assume_init() });
-    let stack = Box::leak(vec![0u8; AP_STACK_BYTES].into_boxed_slice());
+    let (stack, _guard) =
+        crate::sched::guarded_stack(AP_STACK_BYTES).ok_or("no memory for the AP stack")?;
     let stack_top = (stack.as_mut_ptr().addr() + AP_STACK_BYTES) as u64 & !0xF;
     let start: &'static ApStart = Box::leak(Box::new(ApStart {
         online: AtomicU32::new(0),

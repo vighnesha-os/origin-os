@@ -12,7 +12,6 @@
 //! by [`spawn`] from any processor. `spawn` holds it with interrupts disabled, so the
 //! processor's own timer can never spin on a lock it interrupted.
 
-use alloc::vec;
 use core::arch::asm;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -75,6 +74,29 @@ pub(crate) fn on_tick(interrupted: u64) -> u64 {
     }
 }
 
+/// A page-aligned heap allocation of a guard page plus `bytes` of stack. The guard (the
+/// lowest page) is unmapped, so running off the end of the stack faults instead of
+/// overwriting a neighbour. Returns the stack (above the guard) and the guard's address.
+pub(crate) fn guarded_stack(bytes: usize) -> Option<(&'static mut [u8], u64)> {
+    use alloc::alloc::{Layout, alloc_zeroed};
+    let layout = Layout::from_size_align(bytes + 4096, 4096).ok()?;
+    // SAFETY: `layout` has a non-zero size; the allocation is never freed (threads do not
+    // exit yet), so the slice below is `'static`.
+    let base = unsafe { alloc_zeroed(layout) };
+    if base.is_null() {
+        return None;
+    }
+    let guard = base.expose_provenance() as u64;
+    crate::vm::make_guard(guard).ok()?;
+    // SAFETY: `base + 4096 .. base + 4096 + bytes` lies inside the fresh allocation, is
+    // still mapped read/write, and nothing else refers to it.
+    let stack = unsafe { core::slice::from_raw_parts_mut(base.wrapping_add(4096), bytes) };
+    Some((stack, guard))
+}
+
+/// The guard page of the first thread `spawn` created, for the boot proof.
+static FIRST_GUARD: AtomicU64 = AtomicU64::new(0);
+
 /// Creates a kernel thread on processor `cpu` (an x2APIC ID) that runs `entry(arg)`.
 pub(crate) fn spawn(
     cpu: usize,
@@ -82,7 +104,8 @@ pub(crate) fn spawn(
     arg: u64,
 ) -> Result<(), QueueError> {
     let queue = QUEUES.get(cpu).ok_or(QueueError::Full)?;
-    let stack = alloc::boxed::Box::leak(vec![0u8; THREAD_STACK].into_boxed_slice());
+    let (stack, guard) = guarded_stack(THREAD_STACK).ok_or(QueueError::Full)?;
+    let _ = FIRST_GUARD.compare_exchange(0, guard, Ordering::Relaxed, Ordering::Relaxed);
     let base = stack.as_ptr().addr() as u64;
     // The thread starts with RSP = top − 8 holding a zero return address, as if `entry` had
     // been called: RSP + 8 is then 16-byte aligned (System V).
@@ -113,6 +136,9 @@ pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
     while !GO.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
+    // The boot processor split large pages and unmapped guard pages while this processor
+    // waited: drop any stale translation before running threads.
+    crate::vm::flush_tlb();
     if let Some(active) = ACTIVE.get(this_cpu()) {
         active.store(true, Ordering::Release);
     }
@@ -174,6 +200,24 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, cpus: &[u32], tsc_hz: u64) -> bo
         active.store(true, Ordering::Release);
     }
     timer::start_periodic(&lapic);
+    // The first thread's guard page must be unmapped.
+    let guard = FIRST_GUARD.load(Ordering::Relaxed);
+    // SAFETY: the guard is RAM of a heap allocation, not MMIO.
+    match unsafe { cpu::probe_read(guard) } {
+        cpu::Probe::Faulted { error: 0, address } if address == guard => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: page protection: stack guard page at {guard:#x} faulted (#PF error 0x0)"
+            );
+        }
+        other => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: page protection violated: stack guard page at {guard:#x}: {other:?}"
+            );
+            return false;
+        }
+    }
     let workers = 2 * cpus.len();
     let start = rdtsc();
     // A fixed window: 500 ms at 100 Hz is 50 ticks per processor, so each of its three

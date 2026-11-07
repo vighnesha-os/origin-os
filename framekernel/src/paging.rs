@@ -378,6 +378,33 @@ impl AddressSpace {
         })
     }
 
+    /// Splits the 2 MiB leaf covering `virt` into 512 4 KiB leaves with the same physical
+    /// pages and permissions, so one of them can then be changed or removed. Does nothing
+    /// if `virt` is already mapped by a 4 KiB leaf. The caller must flush the TLB on every
+    /// processor that may cache the old 2 MiB translation (the permissions are unchanged,
+    /// so a stale entry only keeps the old granularity).
+    pub fn split_large(&mut self, mem: &mut impl TableMemory, virt: u64) -> Result<(), MapError> {
+        let (entry, level) = self.leaf(mem, virt).ok_or(MapError::NotMapped(virt))?;
+        match level {
+            0 => return Ok(()),
+            1 => {}
+            _ => return Err(MapError::LargePage(virt)),
+        }
+        let value = entry.load(Ordering::Relaxed);
+        let base = value & ADDRESS & !(LARGE_PAGE - 1);
+        let flags = value & (PRESENT | WRITABLE | USER | GLOBAL | NO_EXECUTE);
+        let table = mem.allocate_table().ok_or(MapError::OutOfMemory)?;
+        let entries = mem.table(table).ok_or(MapError::UnknownTable(table))?;
+        for (i, e) in entries.iter().enumerate() {
+            e.store((base + i as u64 * PAGE) | flags, Ordering::Relaxed);
+        }
+        // Re-find the slot: `allocate_table` needed `mem` mutably.
+        let (entry, _) = self.leaf(mem, virt).ok_or(MapError::NotMapped(virt))?;
+        let link = table | PRESENT | WRITABLE | (flags & USER);
+        entry.store(link, Ordering::Release);
+        Ok(())
+    }
+
     /// Removes the leaf at `virt` (a 4 KiB or 2 MiB page base) and returns the physical
     /// address it mapped. The caller must invalidate the TLB entry (`invlpg`) if these
     /// tables are live.
@@ -630,6 +657,43 @@ mod tests {
         assert_eq!(
             space.map(&mut mem, 0x4000_0000, 0, rw),
             Err(MapError::OutOfMemory)
+        );
+    }
+
+    #[test]
+    fn split_large_keeps_every_translation_and_allows_one_hole() {
+        let tables = arena(8);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        let virt = 4 * LARGE_PAGE;
+        let phys = 0x4060_0000;
+        space
+            .map_large(&mut mem, virt, phys, kernel(Access::ReadWrite))
+            .unwrap();
+        let before: Vec<_> = (0..512)
+            .map(|i| space.translate(&mem, virt + i * PAGE + 0x10).unwrap())
+            .collect();
+        space.split_large(&mut mem, virt + 0x5000).unwrap();
+        for (i, b) in before.iter().enumerate() {
+            let t = space
+                .translate(&mem, virt + i as u64 * PAGE + 0x10)
+                .unwrap();
+            assert_eq!(t.size, PAGE);
+            assert_eq!(
+                (t.phys, t.writable, t.executable, t.user),
+                (b.phys, b.writable, b.executable, b.user)
+            );
+        }
+        // Now one page can become a hole (a guard page) and its neighbours stay.
+        assert_eq!(space.unmap(&mut mem, virt + 0x5000), Ok(phys + 0x5000));
+        assert_eq!(space.translate(&mem, virt + 0x5000), None);
+        assert!(space.translate(&mem, virt + 0x4000).is_some());
+        assert!(space.translate(&mem, virt + 0x6000).is_some());
+        // Splitting a 4 KiB page is a no-op; an unmapped address is an error.
+        assert_eq!(space.split_large(&mut mem, virt + 0x4000), Ok(()));
+        assert_eq!(
+            space.split_large(&mut mem, 0x1000),
+            Err(MapError::NotMapped(0x1000))
         );
     }
 

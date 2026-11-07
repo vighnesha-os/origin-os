@@ -127,6 +127,7 @@ fn boot_scenario() -> Scenario {
             format!("origin-kernel: ACPI MADT: {cpus} processors, {cpus} enabled"),
             "origin-kernel: CPU 1 (APIC ID 1) online after ".into(),
             format!("origin-kernel: SMP: {cpus} of {cpus} enabled processors online"),
+            "origin-kernel: page protection: stack guard page at ".into(),
             // M3: two non-yielding threads per processor, all preempted and all running.
             "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted ".into(),
             format!(

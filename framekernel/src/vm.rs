@@ -78,3 +78,28 @@ pub(crate) fn unmap(virt: u64) -> Result<u64, MapError> {
     unsafe { asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)) };
     Ok(phys)
 }
+
+/// Turns the identity page at `page` into a guard page: unmapped, so any access faults.
+/// A 2 MiB leaf covering it is split first. Other processors must flush their TLBs before
+/// relying on the guard (each AP reloads CR3 when its scheduler starts).
+pub(crate) fn make_guard(page: u64) -> Result<(), MapError> {
+    let mut guard = KERNEL_SPACE.lock();
+    let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
+    k.space.split_large(&mut k.tables, page)?;
+    k.space.unmap(&mut k.tables, page)?;
+    drop(guard);
+    // SAFETY: reloading CR3 with its own value flushes this processor's non-global TLB
+    // entries (the kernel uses no global pages), including the old 2 MiB translation.
+    unsafe {
+        asm!("mov {tmp}, cr3", "mov cr3, {tmp}", tmp = out(reg) _, options(nostack, preserves_flags));
+    }
+    Ok(())
+}
+
+/// Flushes this processor's TLB (all non-global entries).
+pub(crate) fn flush_tlb() {
+    // SAFETY: as in `make_guard`.
+    unsafe {
+        asm!("mov {tmp}, cr3", "mov cr3, {tmp}", tmp = out(reg) _, options(nostack, preserves_flags));
+    }
+}
