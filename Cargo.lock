@@ -47,6 +47,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-abi"
+version = "0.0.0"
+dependencies = [
+ "origin-version",
+]
+
+[[package]]
 name = "origin-boot-info"
 version = "0.0.0"
 dependencies = [

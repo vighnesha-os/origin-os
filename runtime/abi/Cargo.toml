@@ -1,0 +1,12 @@
+[package]
+name = "origin-abi"
+description = "Origin OS userspace ABI definitions (ADR-0005): status codes, rights, signals, object types, system-call numbers, the start record"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+origin-version = { path = "../version" }
+
+[lints]
+workspace = true

@@ -58,6 +58,7 @@ const FREESTANDING_LIBS: &[&str] = &[
     "origin-sync",
     "onbf-verify",
     "origin-paging",
+    "origin-abi",
 ];
 const QEMU: &str = "qemu-system-x86_64";
 const DEFAULT_BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
