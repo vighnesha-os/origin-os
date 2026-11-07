@@ -61,7 +61,7 @@
 | — | Accept, amend or reject **ADR-0002** (Proposed) | Shipping anything built on the boot path |
 | B7 | Boot trust anchor: Microsoft UEFI CA 2023, or Origin keys enrolled in firmware | Secure Boot |
 | — | Accept, amend or reject **ADR-0003** (kernel memory, interrupts, SMP start-up, first scheduler; Proposed) | Building M4 on it |
-| Q1–Q4 | **ADR-0005** (Proposed): capability handles, the system-call convention, async channels, faults, message limits | M4 process objects and IPC |
+| — | **ADR-0005** P3–P7, P9, P11, P12 (object types, syscall convention, status codes, start record, memory, waiting, quotas, versioning; Proposed). P1, P2, P8 and P10 were accepted on 2026-11-07 | M4 process objects and IPC |
 | G1 | A section kind for SYM's DWARF data | `.osym` (M6) |
 | R1–R5 | Readings applied in the errata (overrule if wanted) | — |
 | P1–P7, E1, L1 | Readings proposed by `onbf-pack`, Ed25519 and the loader (errata) | A second implementation, the host signer |

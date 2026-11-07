@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Proposed** (2026-11-07). Needs the owner: it fixes the user-visible ABI (CLAUDE.md §42, §84). Not implemented. |
+| Status | **Decided in part** (2026-11-07). The owner answered the four questions below with the recommended option each: P1–P2 (capability handles, shrinking rights), P8 (asynchronous channels, 64 KiB and 64 handles per message) and P10 (exception channels, no POSIX signals) are **accepted**. P3–P7, P9, P11 and P12 remain **Proposed** until the owner accepts the whole ADR. Not implemented. |
 | Scope | Kernel objects and handles, the system-call convention, status codes, process and thread start, memory mapping, IPC, waiting, faults, termination, ABI versioning |
 | Builds on | ONBF §6.1 (EXE/LIB images, syscall-origin pinning, TLS in FS), §8.2 (sealed objects, the Code Integrity Table, mapping rules), §8.3 (the user-mode Loader Service and the start record); ADR-0001 D2 (user-mode drivers); ADR-0004 (address-space layout) |
 | Requires | CLAUDE.md §29 (processes and isolation), §30 (IPC and capabilities), §42 (executable ABI), §44 (runtime), §49 (SDK) |
@@ -76,7 +76,7 @@ The Origin userspace ABI version `{major, minor}` (a new `[compatibility] user-a
 
 The handle-and-rights model follows the capability tradition (KeyKOS, EROS, seL4) and its use in a mainstream system (Zircon's handles and rights). Asynchronous channels with handle transfer and ports follow Zircon and Mach ports. Windows' completion ports show that completion queues scale for asynchronous I/O. These are conceptual references only: no source is used (CLAUDE.md §3).
 
-## Questions for the owner
+## Questions for the owner (answered 2026-11-07: the recommended option for all four)
 
 1. Capability handles with per-handle rights and no ambient authority (P1–P2)?
 2. Asynchronous message channels that move handles, with shared memory objects for bulk data (P8), rather than synchronous rendezvous IPC?
