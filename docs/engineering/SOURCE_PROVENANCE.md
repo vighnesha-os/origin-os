@@ -580,6 +580,15 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 4 `hpet` tests (a valid table, bad addresses and short tables, the counter arithmetic at 100 MHz and 14.318 MHz, rate agreement); 143 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** HPET comparators as timer interrupt sources (one-shot and periodic), using the HPET as the wall-clock reference, and the ACPI PM timer as a further fallback.
 
+### Network packet layer (CLAUDE.md §54; 2026-11-08)
+
+- **What:** `net` (library): header parsing and building for Ethernet II, IPv4 (no options), ICMP echo and ARP (IPv4 over Ethernet), and the Internet checksum (RFC 1071), including a streaming `checksum_parts` for a header plus payload without copying. Every parser is bounds-checked, requires a correct checksum where one applies, and never panics on a short or malformed buffer. Pure, no `unsafe`.
+- **Self-validating proofs:** the checksum is anchored by its defining property — a block carrying its own checksum sums to zero — and by small hand-verifiable cases (one word 0x0001 → 0xFFFE, odd-byte padding), with the streaming form matching the contiguous one across an odd split. IPv4, ICMP and ARP round-trip (build → parse) with their checksums, and corrupting any checksummed byte makes parsing reject. No external vectors are needed.
+- **Kernel proof** (every boot, on the heap): a 65-byte Ethernet/IPv4/ICMP echo request is built from host A to host B, B parses it and builds a reply, and A matches the reply to its request with the 23-byte payload intact and every checksum valid.
+- **Negative control** (failing the boot test): the ICMP checksum left unwritten → the echo request fails its checksum on parse → "payload and checksums intact false: net failed".
+- **Test evidence:** 5 `net` tests (the checksum and its streaming form, an IPv4 round trip with a corrupted-byte rejection and an options rejection, an ICMP echo build/parse/reply, ARP request/reply, and a full Ethernet/IPv4/ICMP loopback echo); 148 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** a NIC driver (so nothing is on a wire yet), TCP and UDP, IP fragmentation and options, routing, DHCP and DNS, and IPv6 (CLAUDE.md §54).
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

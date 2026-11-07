@@ -246,9 +246,89 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     prove_raster(&mut com1);
     // M10 groundwork: the i8042 PS/2 controller bring-up (CLAUDE.md §56).
     i8042::init(&mut com1);
+    // Networking groundwork: build and parse an ICMP echo through a loopback (CLAUDE.md §54).
+    prove_net(&mut com1);
 
     let _ = report::write_halt(&mut com1);
     halt()
+}
+
+/// Proves the network packet layer on the heap: builds an Ethernet/IPv4/ICMP echo request
+/// from host A to host B, has B parse it and build a reply, and checks A matches the reply
+/// to its request with the payload intact and the checksums valid (CLAUDE.md §54).
+fn prove_net(com1: &mut console::Console) {
+    use framekernel::net::{
+        EthFrame, IcmpEcho, Ipv4, Ipv4Packet, Mac, ethertype, icmp_type, protocol,
+    };
+    let a_mac = Mac([0x52, 0x54, 0, 0, 0, 0x0A]);
+    let b_mac = Mac([0x52, 0x54, 0, 0, 0, 0x0B]);
+    let (a_ip, b_ip) = (Ipv4([10, 0, 0, 10]), Ipv4([10, 0, 0, 11]));
+    let payload = b"origin-os over the wire";
+    let mut req = alloc::vec![0u8; 256];
+    let built = (|| {
+        let mut icmp = [0u8; 64];
+        let n = IcmpEcho::write(icmp_type::ECHO_REQUEST, 0x4242, 1, payload, &mut icmp)?;
+        let eth = EthFrame::write_header(b_mac, a_mac, ethertype::IPV4, &mut req)?;
+        let ip = Ipv4Packet::write(
+            a_ip,
+            b_ip,
+            protocol::ICMP,
+            64,
+            1,
+            &icmp[..n],
+            &mut req[eth..],
+        )?;
+        Some(eth + ip)
+    })();
+    let Some(len) = built else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: net: cannot build the request: net failed"
+        );
+        return;
+    };
+    // Host B receives and replies; host A checks the reply.
+    let ok = (|| {
+        let eth = EthFrame::parse(req.get(..len)?)?;
+        if eth.dst != b_mac || eth.ethertype != ethertype::IPV4 {
+            return None;
+        }
+        let packet = Ipv4Packet::parse(eth.payload)?;
+        let echo = IcmpEcho::parse(packet.payload)?;
+        if echo.kind != icmp_type::ECHO_REQUEST {
+            return None;
+        }
+        let mut r_icmp = [0u8; 64];
+        let rn = echo.reply_into(&mut r_icmp)?;
+        let mut r = alloc::vec![0u8; 256];
+        let reth = EthFrame::write_header(a_mac, b_mac, ethertype::IPV4, &mut r)?;
+        let rip = Ipv4Packet::write(
+            b_ip,
+            a_ip,
+            protocol::ICMP,
+            64,
+            2,
+            &r_icmp[..rn],
+            &mut r[reth..],
+        )?;
+        let reply_eth = EthFrame::parse(r.get(..reth + rip)?)?;
+        let reply_ip = Ipv4Packet::parse(reply_eth.payload)?;
+        let reply_echo = IcmpEcho::parse(reply_ip.payload)?;
+        Some(
+            reply_eth.dst == a_mac
+                && reply_ip.src == b_ip
+                && reply_ip.dst == a_ip
+                && reply_echo.kind == icmp_type::ECHO_REPLY
+                && reply_echo.identifier == 0x4242
+                && reply_echo.data == payload,
+        )
+    })()
+    .unwrap_or(false);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: net: {len}-byte Ethernet/IPv4/ICMP echo built, parsed and replied; payload and checksums intact {ok}{}",
+        if ok { "" } else { ": net failed" }
+    );
 }
 
 /// Renders the rasterizer's fixed demonstration scene to a heap surface and checks its

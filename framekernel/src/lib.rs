@@ -28,6 +28,7 @@
 //! - [`handles`]: per-process handle tables with rights (ADR-0005 P1–P2);
 //! - [`heap`]: kernel heap bookkeeping (slabs and frame runs), addresses only;
 //! - [`hpet`]: the ACPI HPET table and main-counter arithmetic;
+//! - [`net`]: Ethernet/IPv4/ICMP/ARP headers and the Internet checksum;
 //! - [`nvme`]: NVMe controller registers, queue entries and indexes, Identify data;
 //! - [`paging`]: 4-level page tables with structural W^X (the `origin-paging` crate,
 //!   shared with the loader);
@@ -66,6 +67,7 @@ pub mod gpt;
 pub mod handles;
 pub mod heap;
 pub mod hpet;
+pub mod net;
 pub mod nvme;
 pub use origin_paging as paging;
 pub mod pci;
