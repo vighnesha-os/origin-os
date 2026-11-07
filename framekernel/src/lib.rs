@@ -34,6 +34,7 @@
 //! - [`handles`]: per-process handle tables with rights (ADR-0005 P1–P2);
 //! - [`heap`]: kernel heap bookkeeping (slabs and frame runs), addresses only;
 //! - [`hpet`]: the ACPI HPET table and main-counter arithmetic;
+//! - [`initramfs`]: extracting a ustar archive into the VFS, with a path-traversal guard;
 //! - [`ioapic`]: I/O APIC redirection-table encoding;
 //! - [`net`]: Ethernet/IPv4/ICMP/ARP headers and the Internet checksum;
 //! - [`numa`]: a locality map (CPU/address → node, nearest-node order) from the SRAT/SLIT;
@@ -91,6 +92,7 @@ pub mod gpt;
 pub mod handles;
 pub mod heap;
 pub mod hpet;
+pub mod initramfs;
 pub mod ioapic;
 pub mod net;
 pub mod numa;

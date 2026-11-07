@@ -795,6 +795,16 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Not done:** a lock-free single-producer/single-consumer variant for the IRQ-handler/consumer split (this one is `&mut`-synchronised by its holder's lock), bulk push/pop, and wiring into the i8042 keyboard IRQ and a kernel log.
 - **Licensing:** project licence not chosen yet.
 
+### initramfs: extracting a ustar archive into the VFS (CLAUDE.md §21; 2026-11-08)
+
+- **What:** `initramfs::extract(archive, vfs)` is the bootstrap step that turns an initial RAM filesystem image (a tar archive, `ustar`) into a live namespace (`vfs`): it creates each directory (and any unlisted parent, via `mkdir_all`), writes each regular file's bytes (truncating a duplicate entry rather than appending), and skips other entry types. Combines two existing modules. Pure, no `unsafe`; returns a typed `Error` wrapping `ustar`/`vfs` failures.
+- **Security — path traversal (§34, §58):** archive names are untrusted, so `safe_path` refuses an absolute name or any name with an empty, `.` or `..` component before anything is written for it (`Error::UnsafePath`). This is the classic tar extraction defense — a crafted `../../etc/…` entry cannot escape the target tree.
+- **Why:** §21 (initial system deployment) needs to load an initial filesystem; this is the mechanism, built on the tar reader and the in-memory VFS and ready to plug a real image into once one is produced.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3).
+- **Test evidence (2026-11-08):** 3 `initramfs` tests — extracting a tree (a file, an explicit directory, a nested file, and a file whose parent directories are *not* listed in the archive — created implicitly), reading each back and checking the implicit parents exist; refusing `../evil`, `a/../../evil`, `/etc/passwd` and `a/./b` as `UnsafePath`, and surfacing a corrupt archive as `Error::Archive` (not a panic); and a duplicate entry overwriting (truncating) rather than leaving a stale tail. 230 library tests in all; `cargo xtask check`. Host-only, so no boot proof (an embedded image and a boot-time extract come with §21).
+- **Not done:** symlink/hardlink/device entries, file permissions and mtimes, streaming extraction for a large image, and extracting a real embedded initramfs at boot into the kernel's VFS.
+- **Licensing:** project licence not chosen yet.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.
