@@ -69,8 +69,18 @@ struct Scenario {
 /// The good path: the loader verifies and enters the kernel, and the kernel reports on
 /// COM1. The banners are built from the same generated constants as the binaries, so the
 /// test also checks that the release identity reached both.
+/// Processors QEMU emulates: `ORIGIN_QEMU_SMP` (1–64), or 2.
+fn qemu_cpus() -> u32 {
+    std::env::var("ORIGIN_QEMU_SMP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| (1..=64).contains(n))
+        .unwrap_or(2)
+}
+
 fn boot_scenario() -> Scenario {
     use origin_version::{BUILD, PRODUCT, VERSION};
+    let cpus = qemu_cpus();
     Scenario {
         label: "kernel boot",
         markers: vec![
@@ -111,6 +121,10 @@ fn boot_scenario() -> Scenario {
             "origin-kernel: x2APIC enabled: APIC ID 0, ".into(),
             "origin-kernel: APIC timer calibrated against the PIT: ".into(),
             "origin-kernel: APIC timer: 50 interrupts at 100 Hz in ".into(),
+            // M3: every processor QEMU emulates (`-smp`, see `qemu_cpus`) comes online.
+            format!("origin-kernel: ACPI MADT: {cpus} processors, {cpus} enabled"),
+            "origin-kernel: CPU 1 (APIC ID 1) online after ".into(),
+            format!("origin-kernel: SMP: {cpus} of {cpus} enabled processors online"),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
         failures: vec![
@@ -139,6 +153,9 @@ fn boot_scenario() -> Scenario {
             "(reserved) at rip",
             "origin-kernel: heap contents are wrong",
             "origin-kernel: heap leaked",
+            "origin-kernel: ACPI processor discovery failed",
+            "origin-kernel: AP start-up not possible",
+            ": AP start-up failed",
         ],
     }
 }
@@ -821,7 +838,8 @@ fn drive(options: &str, path: &Path) -> Result<String> {
 /// supports), x86-64 with every feature TCG can emulate, and no network or display.
 fn qemu_command(s: &Staged) -> Result<Command> {
     let mut c = Command::new(QEMU);
-    c.args(["-machine", "q35", "-cpu", "max", "-m", "512M", "-smp", "2"])
+    c.args(["-machine", "q35", "-cpu", "max", "-m", "512M", "-smp"])
+        .arg(qemu_cpus().to_string())
         .arg("-drive")
         .arg(drive(
             "if=pflash,format=raw,readonly=on,file=",

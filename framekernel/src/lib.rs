@@ -1,4 +1,4 @@
-//! Origin OS Framekernel: M1 entry and the first M2 steps (CLAUDE.md §19, §24, §28).
+//! Origin OS Framekernel: M1 entry, M2, and the first M3 step (CLAUDE.md §19, §24, §28).
 //!
 //! The Origin boot loader jumps to `_start` (`src/main.rs`) after `ExitBootServices`, with
 //! the physical address of an [`origin_boot_info::BootInfo`] in `rdi`. The kernel brings up
@@ -9,10 +9,12 @@
 //! with deliberate faults and the allocator through the new mapping, starts the kernel heap
 //! (so the `alloc` crate works) and proves it leak-free, brings up the local
 //! APIC in x2APIC mode with its timer calibrated against the PIT and proven by taking
-//! periodic interrupts, and halts.
+//! periodic interrupts, then starts every application processor the ACPI MADT lists (M3)
+//! and halts.
 //!
 //! This library holds everything that can be unit-tested on the build host, all of it safe
 //! code (`forbid(unsafe_code)`):
+//! - [`acpi`]: RSDP, XSDT and MADT parsing (checksummed) for processor discovery;
 //! - [`apic`]: x2APIC and 8254 PIT encodings and timer calibration arithmetic;
 //! - [`boot`]: boot-info validation and the memory summary;
 //! - [`descriptors`]: GDT, TSS and IDT descriptor encodings;
@@ -26,11 +28,13 @@
 //! The binary holds the entry point, x86 port I/O, the descriptor tables, exception and
 //! interrupt stubs, MSR access and fault probes (`src/cpu.rs`), the APIC timer bring-up
 //! (`src/timer.rs`), the spin lock (`src/sync.rs`), the global allocator (`src/memory.rs`),
-//! and the panic handler. All of it is original code written for this
+//! the live address space (`src/vm.rs`), AP start-up and its trampoline (`src/smp.rs`), and
+//! the panic handler. All of it is original code written for this
 //! project, with no third-party crates (CLAUDE.md §3, §5).
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod acpi;
 pub mod apic;
 pub mod boot;
 pub mod descriptors;

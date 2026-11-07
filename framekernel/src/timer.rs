@@ -43,7 +43,7 @@ const PIC_SLAVE_DATA: u16 = 0xA1;
 
 /// x2APIC registers this module reads. None has a read side effect.
 #[derive(Clone, Copy)]
-enum ApicRead {
+pub(crate) enum ApicRead {
     Id,
     Version,
     TimerCurrent,
@@ -61,7 +61,7 @@ enum ApicWrite {
 
 /// The local APIC, in x2APIC mode: holding one proves the mode switch happened, so its
 /// register MSRs exist.
-struct X2Apic(());
+pub(crate) struct X2Apic(());
 
 impl X2Apic {
     /// Switches the local APIC to x2APIC mode through the legal transitions and
@@ -71,7 +71,7 @@ impl X2Apic {
     ///
     /// CPL 0, boot processor only, interrupts disabled, and x2APIC supported
     /// ([`cpu::x2apic_supported`]); the spurious vector must have an IDT gate.
-    unsafe fn enable() -> Self {
+    pub(crate) unsafe fn enable() -> Self {
         // SAFETY: the caller's contract; IA32_APIC_BASE exists on every x86-64 processor.
         let current = unsafe { rdmsr(IA32_APIC_BASE) };
         let (writes, count) = apic::x2apic_transition(current);
@@ -85,7 +85,7 @@ impl X2Apic {
         apic
     }
 
-    fn read(&self, reg: ApicRead) -> u64 {
+    pub(crate) fn read(&self, reg: ApicRead) -> u64 {
         let msr = match reg {
             ApicRead::Id => X2APIC_ID,
             ApicRead::Version => X2APIC_VERSION,
@@ -107,6 +107,20 @@ impl X2Apic {
         // local timer and the spurious vector; every vector they can name has an IDT gate
         // whose handler is correct for it.
         unsafe { wrmsr(msr, value) };
+    }
+
+    /// Sends an interprocessor interrupt: writes `command` (delivery mode, level, vector:
+    /// ICR bits 0–19) with `destination` (an x2APIC ID) to the ICR.
+    ///
+    /// # Safety
+    ///
+    /// The IPI's effect on the destination must be one the caller intends and has prepared
+    /// for; an INIT or start-up IPI, for example, needs a ready trampoline.
+    pub(crate) unsafe fn send_ipi(&self, destination: u32, command: u32) {
+        let value = (u64::from(destination) << 32) | u64::from(command & 0xF_FFFF);
+        // SAFETY: x2APIC mode is on (type invariant), so the ICR exists; the caller vouches
+        // for the IPI's effect.
+        unsafe { wrmsr(X2APIC_ICR, value) };
     }
 
     /// Stops the timer: masked, and a zero initial count.
@@ -149,11 +163,15 @@ impl LegacyPorts {
     }
 }
 
-/// Brings up the local APIC and proves its timer. Returns whether every step passed.
-pub(crate) fn init(com1: &mut Uart16550<Com1>) -> bool {
+/// x2APIC interrupt command register.
+const X2APIC_ICR: u32 = 0x830;
+
+/// Brings up the local APIC and proves its timer. Returns the TSC rate in Hz if every step
+/// passed.
+pub(crate) fn init(com1: &mut Uart16550<Com1>) -> Option<u64> {
     if !cpu::x2apic_supported() {
         let _ = writeln!(com1, "origin-kernel: the processor has no x2APIC");
-        return false;
+        return None;
     }
     // SAFETY: CPL 0, boot processor only (entry contract); no other code uses these ports.
     let mut ports = unsafe { LegacyPorts::new() };
@@ -172,7 +190,7 @@ pub(crate) fn init(com1: &mut Uart16550<Com1>) -> bool {
 
     let Some((apic_hz, tsc_hz)) = calibrate(&lapic, &mut ports) else {
         let _ = writeln!(com1, "origin-kernel: APIC timer calibration failed");
-        return false;
+        return None;
     };
     let _ = writeln!(
         com1,
@@ -185,7 +203,7 @@ pub(crate) fn init(com1: &mut Uart16550<Com1>) -> bool {
             com1,
             "origin-kernel: APIC timer rate {apic_hz} Hz is unusable"
         );
-        return false;
+        return None;
     };
 
     let before = cpu::ticks();
@@ -215,14 +233,14 @@ pub(crate) fn init(com1: &mut Uart16550<Com1>) -> bool {
             com1,
             "origin-kernel: {taken} interrupts in {micros} us, expected {PROOF_TICKS} in {expected} us: APIC timer is wrong"
         );
-        return false;
+        return None;
     }
     let _ = writeln!(
         com1,
         "origin-kernel: APIC timer: {taken} interrupts at {HZ} Hz in {} ms (initial count {count})",
         micros / 1000
     );
-    true
+    Some(tsc_hz)
 }
 
 /// Measures the APIC timer and the TSC over a PIT channel-2 one-shot. Returns their rates

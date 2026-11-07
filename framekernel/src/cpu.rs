@@ -43,10 +43,21 @@ struct TablePointer {
     base: u64,
 }
 
-static mut GDT: Gdt = Gdt([0; GDT_ENTRIES]);
-static mut TSS_TABLE: TssImage = TssImage([0; 26]);
+/// One processor's GDT, TSS and double-fault stack. The IDT is shared.
+#[repr(C, align(16))]
+pub(crate) struct CpuTables {
+    gdt: Gdt,
+    tss: TssImage,
+    double_fault_stack: Stack,
+}
+
+/// The boot processor's tables. Application processors get theirs from the heap.
+static mut BSP_TABLES: CpuTables = CpuTables {
+    gdt: Gdt([0; GDT_ENTRIES]),
+    tss: TssImage([0; 26]),
+    double_fault_stack: Stack([0; DOUBLE_FAULT_STACK_SIZE]),
+};
 static mut IDT: Idt = Idt([[0; 2]; 256]);
-static mut DOUBLE_FAULT_STACK: Stack = Stack([0; DOUBLE_FAULT_STACK_SIZE]);
 
 /// Registers saved by [`exception_common`], then the vector and error code the stubs push,
 /// then the frame the processor pushed (SDM Vol. 3A Figure 6-9).
@@ -85,21 +96,6 @@ struct ExceptionFrame {
 /// Call once, at CPL 0, on the boot processor, with interrupts disabled, before anything
 /// else depends on the firmware's GDT or IDT.
 pub(crate) unsafe fn init() {
-    let stack_top = (&raw mut DOUBLE_FAULT_STACK).addr() + DOUBLE_FAULT_STACK_SIZE;
-    // SAFETY: the static is used only here and by the processor through the TSS; this is
-    // the single, single-threaded initialisation (the caller's contract).
-    unsafe { (&raw mut TSS_TABLE).write(TssImage(d::tss_image(stack_top as u64))) };
-    let tss = d::tss_descriptor((&raw const TSS_TABLE).addr() as u64);
-    let gdt = Gdt([
-        0,
-        d::kernel_code_segment(),
-        d::kernel_data_segment(),
-        tss[0],
-        tss[1],
-    ]);
-    // SAFETY: as above; the GDT is written before `lgdt` points the processor at it.
-    unsafe { (&raw mut GDT).write(gdt) };
-
     let mut idt = Idt([[0; 2]; 256]);
     for (vector, (gate, stub)) in idt.0.iter_mut().zip(STUBS.iter()).enumerate() {
         let ist = if vector == 8 { DOUBLE_FAULT_IST } else { 0 };
@@ -112,12 +108,56 @@ pub(crate) unsafe fn init() {
             *gate = d::interrupt_gate(stub as usize as u64, KERNEL_CODE, 0);
         }
     }
-    // SAFETY: as above; written before `lidt`.
+    // SAFETY: the IDT is written once, here, before any `lidt` points a processor at it
+    // (the caller's contract: single-threaded, first).
     unsafe { (&raw mut IDT).write(idt) };
+    // SAFETY: `BSP_TABLES` is used only by the boot processor, and only from here on.
+    unsafe { load_tables(&raw mut BSP_TABLES) };
+}
+
+/// Loads an application processor's own GDT and TSS from `tables`, and the shared IDT.
+///
+/// # Safety
+///
+/// Call once per application processor, at CPL 0 with interrupts disabled, after [`init`]
+/// ran on the boot processor. `tables` must be writable, live for ever, and used by no
+/// other processor.
+pub(crate) unsafe fn init_ap(tables: *mut CpuTables) {
+    // SAFETY: the caller's contract is `load_tables`'s.
+    unsafe { load_tables(tables) };
+}
+
+/// Writes the GDT and TSS in `tables` and loads them, the segment registers and the IDT.
+///
+/// # Safety
+///
+/// As for [`init_ap`]; for the boot processor, `tables` is `BSP_TABLES`.
+unsafe fn load_tables(tables: *mut CpuTables) {
+    // SAFETY: the caller's contract: `tables` is valid, writable and this processor's own.
+    // Projecting to a field creates no reference.
+    let stack = unsafe { &raw mut (*tables).double_fault_stack };
+    // SAFETY: as above.
+    let tss_field = unsafe { &raw mut (*tables).tss };
+    // SAFETY: as above.
+    let gdt_ptr_raw = unsafe { &raw mut (*tables).gdt };
+    let stack_top = stack.addr() + DOUBLE_FAULT_STACK_SIZE;
+    let tss_image = TssImage(d::tss_image(stack_top as u64));
+    // SAFETY: as above; the TSS is written before `ltr` loads it.
+    unsafe { tss_field.write(tss_image) };
+    let tss = d::tss_descriptor(tss_field.addr() as u64);
+    let gdt = Gdt([
+        0,
+        d::kernel_code_segment(),
+        d::kernel_data_segment(),
+        tss[0],
+        tss[1],
+    ]);
+    // SAFETY: as above; the GDT is written before `lgdt` points the processor at it.
+    unsafe { gdt_ptr_raw.write(gdt) };
 
     let gdt_ptr = TablePointer {
         limit: (GDT_ENTRIES * 8 - 1) as u16,
-        base: (&raw const GDT).addr() as u64,
+        base: gdt_ptr_raw.addr() as u64,
     };
     let idt_ptr = TablePointer {
         limit: (256 * 16 - 1) as u16,
@@ -125,7 +165,7 @@ pub(crate) unsafe fn init() {
     };
     // SAFETY: `gdt_ptr` describes the fully written GDT above. After `lgdt`, CS is reloaded
     // with a far return to the next instruction and the data segments with the kernel data
-    // selector, so no register keeps a selector into the firmware's GDT. `ltr` loads the TSS
+    // selector, so no register keeps a selector into an older GDT. `ltr` loads the TSS
     // descriptor written above (type "available"). Interrupts stay disabled throughout.
     unsafe {
         asm!(
@@ -148,8 +188,8 @@ pub(crate) unsafe fn init() {
             tmp = lateout(reg) _,
         );
     }
-    // SAFETY: `idt_ptr` describes the fully written IDT; every present gate points at a stub
-    // below in the kernel code segment just loaded.
+    // SAFETY: `idt_ptr` describes the IDT `init` wrote; every present gate points at a stub
+    // in the kernel code segment just loaded.
     unsafe { asm!("lidt [{idt}]", idt = in(reg) &raw const idt_ptr, options(nostack)) };
     let _ = TSS_SIZE; // the limit is encoded by `tss_descriptor`
 }

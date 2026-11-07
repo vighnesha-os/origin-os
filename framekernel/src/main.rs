@@ -31,8 +31,10 @@ use framekernel::report;
 
 mod cpu;
 mod memory;
+mod smp;
 mod sync;
 mod timer;
+mod vm;
 use framekernel::frames::{self, FrameAllocator};
 use framekernel::kernel_space;
 use framekernel::paging::{PAGE, Table, TablePool};
@@ -129,17 +131,26 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
 
     // M2, third step: the kernel's own page tables, proven with deliberate faults; then
     // the frame allocator is proven again through the new direct map.
+    let mut heap_ok = false;
     if init_paging(&mut com1, &info, regions, segments, pool, pool_base) {
         prove_frames(&mut com1, &mut alloc);
         // M2: the kernel heap, which takes over the frame allocator; from here on the
         // `alloc` crate works in the kernel.
         memory::init(alloc);
-        prove_heap(&mut com1);
+        heap_ok = prove_heap(&mut com1);
     }
 
     // M2, fourth step: interrupts. The local APIC in x2APIC mode, its timer calibrated
     // against the PIT and proven by taking periodic interrupts.
-    timer::init(&mut com1);
+    let tsc_hz = timer::init(&mut com1);
+
+    // M3, first step: start the application processors the ACPI MADT lists. It needs the
+    // heap, the kernel's own tables and the calibrated TSC.
+    if let Some(tsc_hz) = tsc_hz
+        && heap_ok
+    {
+        smp::start(&mut com1, &info, regions, tsc_hz);
+    }
 
     let _ = report::write_halt(&mut com1);
     halt()
@@ -177,10 +188,12 @@ fn init_paging(
     // this table pool (all in direct-mapped regions), and the kernel's statics (the GDT,
     // IDT, TSS and double-fault stack are in the RW segment). COM1 is port I/O.
     unsafe { cpu::load_page_tables(space.root()) };
+    let used = tables.used();
+    vm::install(space, tables);
     let _ = writeln!(
         com1,
         "origin-kernel: page tables loaded: {} tables, {} MiB direct map, {} image pages, {} 4 KiB and {} 2 MiB leaves",
-        tables.used(),
+        used,
         stats.direct_bytes >> 20,
         stats.image_pages,
         stats.small_pages,
@@ -301,7 +314,9 @@ fn init_memory(
             TABLE_POOL_FRAMES as usize,
         )
     };
-    let alloc = match FrameAllocator::new(bitmap, regions, &[(home.base, pages)]) {
+    // The AP trampoline's code and data frames (M3) are never handed out.
+    let trampoline = (smp::TRAMPOLINE, 2);
+    let alloc = match FrameAllocator::new(bitmap, regions, &[(home.base, pages), trampoline]) {
         Ok(a) => a,
         Err(e) => {
             let _ = writeln!(com1, "origin-kernel: frame allocator: {e:?}");
