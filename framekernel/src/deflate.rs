@@ -145,6 +145,12 @@ pub fn inflate(input: &[u8]) -> Option<Vec<u8>> {
 
 /// Inflates a raw DEFLATE stream, refusing (`None`) once the output would exceed `max`.
 pub fn inflate_limit(input: &[u8], max: usize) -> Option<Vec<u8>> {
+    inflate_inner(input, max).map(|(out, _)| out)
+}
+
+/// Inflates, also returning how many input bytes the stream occupied (rounded up to the
+/// next byte boundary), so a wrapper can find a trailing checksum.
+fn inflate_inner(input: &[u8], max: usize) -> Option<(Vec<u8>, usize)> {
     let mut r = BitReader {
         data: input,
         byte: 0,
@@ -163,7 +169,97 @@ pub fn inflate_limit(input: &[u8], max: usize) -> Option<Vec<u8>> {
             _ => return None, // reserved block type 3
         }
         if final_block {
-            return Some(out);
+            let consumed = r.byte + usize::from(r.bit != 0);
+            return Some((out, consumed));
+        }
+    }
+}
+
+/// The Adler-32 checksum (RFC 1950 §9), the zlib trailer's integrity check.
+pub fn adler32(data: &[u8]) -> u32 {
+    const MOD: u32 = 65521;
+    let mut a = 1u32;
+    let mut b = 0u32;
+    for &x in data {
+        a = (a + u32::from(x)) % MOD;
+        b = (b + a) % MOD;
+    }
+    (b << 16) | a
+}
+
+/// Decompresses a zlib stream (RFC 1950): the 2-byte header, a raw DEFLATE body, and a
+/// big-endian Adler-32 trailer, which must match. Capped at [`DEFAULT_MAX_OUTPUT`].
+pub fn zlib_decompress(input: &[u8]) -> Option<Vec<u8>> {
+    zlib_decompress_limit(input, DEFAULT_MAX_OUTPUT)
+}
+
+/// [`zlib_decompress`] with an explicit output cap.
+pub fn zlib_decompress_limit(input: &[u8], max: usize) -> Option<Vec<u8>> {
+    let cmf = *input.first()?;
+    let flg = *input.get(1)?;
+    if cmf & 0x0F != 8 {
+        return None; // CM must be 8 (deflate)
+    }
+    if (u16::from(cmf) << 8 | u16::from(flg)) % 31 != 0 {
+        return None; // the header checksum
+    }
+    if flg & 0x20 != 0 {
+        return None; // FDICT: a preset dictionary is not supported
+    }
+    let (out, consumed) = inflate_inner(input.get(2..)?, max)?;
+    let trailer = input.get(2 + consumed..2 + consumed + 4)?;
+    let stored = u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    (adler32(&out) == stored).then_some(out)
+}
+
+/// Decompresses a gzip stream (RFC 1952): the 10-byte header and its optional fields, a raw
+/// DEFLATE body, and the CRC-32 + ISIZE trailer, both of which must match. Capped at
+/// [`DEFAULT_MAX_OUTPUT`].
+pub fn gzip_decompress(input: &[u8]) -> Option<Vec<u8>> {
+    gzip_decompress_limit(input, DEFAULT_MAX_OUTPUT)
+}
+
+/// [`gzip_decompress`] with an explicit output cap.
+pub fn gzip_decompress_limit(input: &[u8], max: usize) -> Option<Vec<u8>> {
+    if input.get(0..3)? != [0x1F, 0x8B, 0x08] {
+        return None; // magic + CM = deflate
+    }
+    let flg = *input.get(3)?;
+    if flg & 0xE0 != 0 {
+        return None; // reserved flag bits
+    }
+    let mut off = 10; // fixed header
+    if flg & 0x04 != 0 {
+        // FEXTRA: a 2-byte length then that many bytes.
+        let xlen = usize::from(u16::from_le_bytes([*input.get(off)?, *input.get(off + 1)?]));
+        off = off.checked_add(2)?.checked_add(xlen)?;
+    }
+    if flg & 0x08 != 0 {
+        off = skip_cstring(input, off)?; // FNAME
+    }
+    if flg & 0x10 != 0 {
+        off = skip_cstring(input, off)?; // FCOMMENT
+    }
+    if flg & 0x02 != 0 {
+        off = off.checked_add(2)?; // FHCRC
+    }
+    let (out, consumed) = inflate_inner(input.get(off..)?, max)?;
+    let trailer = input.get(off + consumed..off + consumed + 8)?;
+    let crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    let isize = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
+    if crate::gpt::crc32(&out) != crc || out.len() as u32 != isize {
+        return None;
+    }
+    Some(out)
+}
+
+/// Skips a NUL-terminated string starting at `off`; returns the offset just past the NUL.
+fn skip_cstring(input: &[u8], mut off: usize) -> Option<usize> {
+    loop {
+        let b = *input.get(off)?;
+        off += 1;
+        if b == 0 {
+            return Some(off);
         }
     }
 }
@@ -410,6 +506,57 @@ eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
     }
 
     #[test]
+    fn adler32_known_values() {
+        assert_eq!(adler32(b""), 1);
+        assert_eq!(adler32(b"Wikipedia"), 0x11e6_0398);
+    }
+
+    #[test]
+    fn zlib_and_gzip_wrappers() {
+        let zp: Vec<u8> = b"hello, zlib wrapper! "
+            .iter()
+            .cycle()
+            .take(63)
+            .copied()
+            .collect();
+        let zlib_stream: &[u8] = &[
+            0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0xd7, 0x51, 0xa8, 0xca, 0xc9, 0x4c, 0x52,
+            0x28, 0x2f, 0x4a, 0x2c, 0x28, 0x48, 0x2d, 0x52, 0x54, 0xc8, 0x20, 0x5a, 0x10, 0x00,
+            0xd4, 0xe3, 0x16, 0x5a,
+        ];
+        assert_eq!(zlib_decompress(zlib_stream).as_deref(), Some(&zp[..]));
+
+        let gp: Vec<u8> = b"hello, gzip wrapper! "
+            .iter()
+            .cycle()
+            .take(63)
+            .copied()
+            .collect();
+        let gzip_stream: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xcb, 0x48, 0xcd, 0xc9,
+            0xc9, 0xd7, 0x51, 0x48, 0xaf, 0xca, 0x2c, 0x50, 0x28, 0x2f, 0x4a, 0x2c, 0x28, 0x48,
+            0x2d, 0x52, 0x54, 0xc8, 0x20, 0x5a, 0x10, 0x00, 0x32, 0x7a, 0x9a, 0x68, 0x3f, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(gzip_decompress(gzip_stream).as_deref(), Some(&gp[..]));
+
+        // A corrupted Adler-32 trailer is rejected.
+        let mut bad = zlib_stream.to_vec();
+        let n = bad.len();
+        bad[n - 1] ^= 0xFF;
+        assert_eq!(zlib_decompress(&bad), None, "bad adler");
+        // A corrupted gzip CRC/ISIZE trailer is rejected.
+        let mut bad = gzip_stream.to_vec();
+        let n = bad.len();
+        bad[n - 5] ^= 0xFF; // flips a CRC byte
+        assert_eq!(gzip_decompress(&bad), None, "bad crc");
+        // A zlib header that fails the %31 check, and a non-gzip magic.
+        assert_eq!(zlib_decompress(&[0x78, 0x9d, 0x00, 0x00, 0x00, 0x00]), None);
+        assert_eq!(gzip_decompress(&[0x1f, 0x8b, 0x00]), None, "CM must be 8");
+        assert_eq!(gzip_decompress(&[]), None);
+    }
+
+    #[test]
     fn mutations_never_panic() {
         let base: Vec<u8> = (0..64u16).map(|i| i as u8).collect();
         let seeds = vectors();
@@ -424,6 +571,9 @@ eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
             let mut data = base.clone();
             crate::testing::mutate(&mut data, &mut rng);
             let _ = inflate_limit(&data, 1 << 16);
+            // The zlib and gzip wrappers must also never panic on mutated input.
+            let _ = zlib_decompress_limit(&data, 1 << 16);
+            let _ = gzip_decompress_limit(&data, 1 << 16);
         }
     }
 }
