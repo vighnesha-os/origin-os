@@ -18,6 +18,7 @@
 | **M4** processes and IPC | started | Per-process address spaces sharing the kernel half, with CR3 switched per thread (two processes at the same addresses stay isolated); ring 3 with one DPL-3 gate and `syscall`; user faults end the thread, not the kernel; RSP0 per switch; NMI/#MC on IST; validated, fault-safe copy from user memory (a write system call). Not yet: process objects, handles and capabilities, IPC, loading `.ose` programs |
 | **M8/M9** groundwork | started | An in-memory VFS (paths, directories, files); a 2D software rasterizer (fills, blits, alpha blend) cross-checked host↔kernel by CRC. Not wired to syscalls, disk or a framebuffer yet |
 | **M5** storage | started | PCIe enumeration through the ACPI MCFG: the ECAM window mapped uncached (PAT checked on every CPU), every function listed, every BAR sized and restored; a polled NVMe driver (admin and I/O queues, Identify, read, write, flush; an out-of-range read refused), checked against a GPT test disk xtask builds; both GPT copies validated (CRCs, layout, agreement) and the partitions listed; MSI-X interrupt-driven completions for a thread that blocks on a wait queue; one queue pair and vector per CPU, with all CPUs doing I/O at once; a block layer (a 4 KiB page cache over the namespace, LRU eviction and write-back). Not yet: an IOMMU, a filesystem |
+| **M10** groundwork | started | PS/2 scancode decoding (set 1, US layout) and i8042 controller bring-up proven in QEMU; live keystrokes await the keyboard IRQ |
 | **M6** onwards | not started | — |
 
 ## Native formats and cryptography
