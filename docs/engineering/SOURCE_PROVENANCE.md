@@ -759,6 +759,15 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence (2026-11-08):** the three soaks pass at scale 1 and at `ORIGIN_MUTATION_SCALE=10` (≈340 000 parser cases); 211 library tests in all; `cargo xtask check`.
 - **Licensing:** project licence not chosen yet.
 
+### Fixed-size bit allocator (CLAUDE.md §40 allocation bitmap, §29 resource allocation; 2026-11-08)
+
+- **What:** `bitmap` (library) is a dense bit allocator: `Bitmap::new(len)` holds `len` bits; `alloc` returns the lowest free bit (scanning 64-bit words, `(!word).trailing_zeros()` for the lowest clear bit of the first non-full word); `set`/`clear` return whether the bit changed (so a double-set or double-free is reported, not silently miscounted); `get` and `free` report state; an exact free counter is kept. Padding bits past `len` in the final word are permanently set, so they are never handed out. Pure, no `unsafe`; `alloc` for the word vector.
+- **Why:** the OriginFS write path needs a free-space map (§40), and process-id / handle pools need an id allocator (§29); this is the shared primitive. Lowest-free allocation keeps ids and blocks dense and reproducible.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); standard bitmap technique, no source used.
+- **Test evidence (2026-11-08):** 4 `bitmap` tests — lowest-free allocation with reuse after a free; filling exactly `len` bits across a partial final word (every index once, no padding bit, then full); `set`/`get` tracking the free count and out-of-range no-ops; and a model-based test running 60 000 random `alloc`/`set`/`clear`/`get` operations against a `[bool; 200]` oracle (spanning three words with a partial last), asserting `alloc` returns the lowest free index and the free count matches after every op. 215 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the oracle is the control).
+- **Not done:** multi-bit (contiguous run) allocation for extents, a hint/cursor to avoid rescanning from 0, and a two-level summary for very large maps. Wiring into OriginFS's (future) write path and a pid/handle allocator.
+- **Licensing:** project licence not chosen yet.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.
