@@ -14,12 +14,14 @@ members = [
     "boot/info",
     "boot/uefi",
     "developer-tools/xtask",
+    "framekernel",
     "runtime/onbf/format",
     "runtime/onbf/merkle",
     "runtime/version",
     "security/crypto",
 ]
-# Host-buildable crates only. The UEFI loader's binary cannot be built for the host.
+# Host-buildable crates only. The UEFI loader's and the Framekernel's binaries cannot be
+# built for the host.
 default-members = [
     "boot/info",
     "developer-tools/xtask",
