@@ -103,3 +103,16 @@ Still running when this was written: the ML-DSA-65/87 verification agent (its ow
 Lessons: a negative control must be checked to have **rebuilt and booted** (two attempts here proved nothing: one did not compile, one used `timeout`, which macOS lacks). The boot flow runs with IF=0, so any wait in it must open interrupt windows, or time stops.
 
 How to see it all: `cargo xtask boot-test` (default 2 CPUs; `ORIGIN_QEMU_SMP=1..8` also pass) and `cargo xtask check`.
+
+### Continued, 19:55–20:05 IST
+
+| Commit | What |
+|---|---|
+| 515868d | SYSCALL entry on every CPU, through the common dispatch path |
+| 653c93a | NMI and #MC on their own IST stacks (self-NMI proof) |
+| 8220b24, 64ac900 | `docs/STATUS.md`: verified status by milestone |
+| 13c323a | `cargo xtask boot-matrix`: boot-test at 1, 2 and 4 CPUs |
+| 19ccb14 | ADR-0004 (Proposed): higher-half layout and KASLR, four owner questions |
+| ada5edb | heap and address-space locks held with interrupts disabled (found by review) |
+
+Start here next time: `docs/STATUS.md`, then `docs/engineering/TASKS.md`. The next code step after the owner's answers is either the signature block (S1–S4) or the higher-half layout (ADR-0004).
