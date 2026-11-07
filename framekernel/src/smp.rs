@@ -19,7 +19,7 @@
 //!    its local APIC in x2APIC mode, and the handshake with its APIC ID.
 //! 4. The trampoline page goes back to read/write, never executable.
 //!
-//! The APs then halt with interrupts disabled: nothing schedules on them yet (M3 next).
+//! Each AP then enters its own scheduler (`sched::run_ap`).
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -133,20 +133,51 @@ struct ApStart {
     tables: *mut CpuTables,
 }
 
-/// Brings up every enabled AP the MADT lists. Returns how many processors are online,
-/// counting the boot processor.
+/// The x2APIC IDs of the processors online, the boot processor first.
+pub(crate) struct Online {
+    ids: [u32; MAX_CPUS],
+    count: usize,
+}
+
+impl Online {
+    fn one(bsp: u32) -> Self {
+        let mut ids = [0; MAX_CPUS];
+        ids[0] = bsp;
+        Self { ids, count: 1 }
+    }
+
+    fn add(&mut self, id: u32) {
+        if let Some(slot) = self.ids.get_mut(self.count) {
+            *slot = id;
+            self.count += 1;
+        }
+    }
+
+    /// The IDs.
+    pub(crate) fn ids(&self) -> &[u32] {
+        self.ids.get(..self.count).unwrap_or(&[])
+    }
+}
+
+/// Brings up every enabled AP the MADT lists. Returns the processors online, the boot
+/// processor included.
 pub(crate) fn start(
     com1: &mut Uart16550<Com1>,
     info: &BootInfo,
     regions: &[MemoryRegion],
     tsc_hz: u64,
-) -> usize {
+) -> Online {
+    // SAFETY: CPL 0, boot processor, interrupts disabled, x2APIC supported (the timer
+    // bring-up checked it and already switched this APIC; the transition is then a no-op).
+    let lapic = unsafe { X2Apic::enable() };
+    let bsp = lapic.read(ApicRead::Id) as u32;
+    let mut online = Online::one(bsp);
     let mut cpus = [Processor::default(); MAX_CPUS];
     let count = match discover(info.acpi_rsdp, &mut cpus) {
         Ok(n) => n,
         Err(e) => {
             let _ = writeln!(com1, "origin-kernel: ACPI processor discovery failed: {e}");
-            return 1;
+            return online;
         }
     };
     let enabled = cpus.iter().take(count).filter(|p| p.enabled).count();
@@ -154,15 +185,10 @@ pub(crate) fn start(
         com1,
         "origin-kernel: ACPI MADT: {count} processors, {enabled} enabled"
     );
-    // SAFETY: CPL 0, boot processor, interrupts disabled, x2APIC supported (the timer
-    // bring-up checked it and already switched this APIC; the transition is then a no-op).
-    let lapic = unsafe { X2Apic::enable() };
-    let bsp = lapic.read(ApicRead::Id) as u32;
     if let Err(why) = prepare(regions) {
         let _ = writeln!(com1, "origin-kernel: AP start-up not possible: {why}");
-        return 1;
+        return online;
     }
-    let mut online = 1;
     for p in cpus
         .iter()
         .take(count)
@@ -170,11 +196,11 @@ pub(crate) fn start(
     {
         match start_one(&lapic, p.apic_id, tsc_hz) {
             Ok(micros) => {
-                online += 1;
+                online.add(p.apic_id);
                 let _ = writeln!(
                     com1,
                     "origin-kernel: CPU {} (APIC ID {}) online after {micros} us: own GDT, TSS and IDT, x2APIC",
-                    online - 1,
+                    online.count - 1,
                     p.apic_id
                 );
             }
@@ -195,7 +221,8 @@ pub(crate) fn start(
     }
     let _ = writeln!(
         com1,
-        "origin-kernel: SMP: {online} of {enabled} enabled processors online"
+        "origin-kernel: SMP: {} of {enabled} enabled processors online",
+        online.count
     );
     online
 }
@@ -356,14 +383,15 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     // trampoline ran `cli`), after `cpu::init` on the boot processor; the tables are this
     // AP's alone.
     unsafe { cpu::init_ap(start.tables) };
-    let answer = if cpu::x2apic_supported() {
-        // SAFETY: CPL 0, this AP only, interrupts disabled, x2APIC supported, and the
-        // spurious vector has a gate in the shared IDT.
-        let lapic = unsafe { X2Apic::enable() };
-        (lapic.read(ApicRead::Id) as u32).wrapping_add(1)
-    } else {
-        u32::MAX
-    };
+    if !cpu::x2apic_supported() {
+        start.online.store(u32::MAX, Ordering::Release);
+        crate::halt();
+    }
+    // SAFETY: CPL 0, this AP only, interrupts disabled, x2APIC supported, and the spurious
+    // vector has a gate in the shared IDT.
+    let lapic = unsafe { X2Apic::enable() };
+    let answer = (lapic.read(ApicRead::Id) as u32).wrapping_add(1);
     start.online.store(answer, Ordering::Release);
-    crate::halt()
+    // M3: this processor's scheduler.
+    crate::sched::run_ap(&lapic)
 }

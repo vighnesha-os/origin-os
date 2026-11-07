@@ -166,6 +166,35 @@ impl LegacyPorts {
 /// x2APIC interrupt command register.
 const X2APIC_ICR: u32 = 0x830;
 
+/// The calibrated initial count for [`HZ`] interrupts per second, once known (0 before).
+static PERIOD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Starts this processor's APIC timer at the calibrated [`HZ`]. Returns false if the
+/// boot processor has not calibrated it.
+pub(crate) fn start_periodic(lapic: &X2Apic) -> bool {
+    let count = PERIOD.load(core::sync::atomic::Ordering::Acquire);
+    if count == 0 {
+        return false;
+    }
+    lapic.write(
+        ApicWrite::TimerDivide,
+        apic::divide_config(DIVISOR).unwrap_or(0b0011),
+    );
+    lapic.write(
+        ApicWrite::LvtTimer,
+        apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false),
+    );
+    lapic.write(ApicWrite::TimerInitial, u64::from(count));
+    true
+}
+
+impl X2Apic {
+    /// Stops this processor's APIC timer.
+    pub(crate) fn stop(&self) {
+        self.stop_timer();
+    }
+}
+
 /// Brings up the local APIC and proves its timer. Returns the TSC rate in Hz if every step
 /// passed.
 pub(crate) fn init(com1: &mut Uart16550<Com1>) -> Option<u64> {
@@ -240,6 +269,7 @@ pub(crate) fn init(com1: &mut Uart16550<Com1>) -> Option<u64> {
         "origin-kernel: APIC timer: {taken} interrupts at {HZ} Hz in {} ms (initial count {count})",
         micros / 1000
     );
+    PERIOD.store(count, core::sync::atomic::Ordering::Release);
     Some(tsc_hz)
 }
 

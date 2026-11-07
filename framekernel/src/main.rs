@@ -31,6 +31,7 @@ use framekernel::report;
 
 mod cpu;
 mod memory;
+mod sched;
 mod smp;
 mod sync;
 mod timer;
@@ -149,7 +150,9 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     if let Some(tsc_hz) = tsc_hz
         && heap_ok
     {
-        smp::start(&mut com1, &info, regions, tsc_hz);
+        let online = smp::start(&mut com1, &info, regions, tsc_hz);
+        // M3, second step: preemptive kernel threads on every online processor.
+        sched::prove(&mut com1, online.ids(), tsc_hz);
     }
 
     let _ = report::write_halt(&mut com1);

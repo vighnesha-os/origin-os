@@ -13,6 +13,7 @@
 
 use core::arch::{asm, naked_asm};
 use core::fmt::Write;
+use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use framekernel::apic::{SPURIOUS_VECTOR, TIMER_VECTOR, X2APIC_EOI};
@@ -210,7 +211,9 @@ pub(crate) fn breakpoint() {
 }
 
 /// Called by [`exception_common`] with the saved frame.
-extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) {
+extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
+    // The frame to resume: this one, unless the scheduler switches to another thread.
+    let here = ptr::from_mut(frame).addr() as u64;
     // Device interrupts: the timer counts and acknowledges; a spurious interrupt needs no
     // EOI (SDM Vol. 3A, spurious interrupt).
     if frame.vector == u64::from(TIMER_VECTOR) {
@@ -218,10 +221,10 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) {
         // SAFETY: x2APIC mode is enabled before the timer is unmasked (`timer::init`), and
         // writing 0 to the EOI register only acknowledges the interrupt in service.
         unsafe { wrmsr(X2APIC_EOI, 0) };
-        return;
+        return crate::sched::on_tick(here);
     }
     if frame.vector == u64::from(SPURIOUS_VECTOR) {
-        return;
+        return here;
     }
     // A page fault at the exact instruction a probe armed: record it and resume at
     // `probe_recover`, which returns the error code to the probe's caller.
@@ -231,7 +234,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) {
             PROBE_ADDRESS.store(read_cr2(), Ordering::SeqCst);
             frame.rax = frame.error_code;
             frame.rip = (probe_recover as *const ()).addr() as u64;
-            return;
+            return here;
         }
     }
     // SAFETY: COM1 was programmed by `_start` before `init` installed any gate, and only
@@ -248,7 +251,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) {
     );
     if vector == 3 {
         let _ = writeln!(com1, "origin-kernel: breakpoint handled; resuming");
-        return;
+        return here;
     }
     let _ = writeln!(
         com1,
@@ -505,7 +508,9 @@ extern "sysv64" fn probe_recover() {
 }
 
 /// Saves the general-purpose registers, calls [`dispatch`] with a pointer to the frame,
-/// restores them, drops the vector and error code, and returns from the exception.
+/// switches to the frame `dispatch` returns (the same one, or another thread's saved frame
+/// with the same layout), restores its registers, drops the vector and error code, and
+/// returns from the interrupt into it.
 ///
 /// On entry the stack holds, from the top: vector, error code, then the processor's frame.
 /// The processor aligned RSP to 16 bytes before its 40-byte frame; with the 16 bytes of
@@ -518,6 +523,8 @@ extern "sysv64" fn exception_common() {
         "mov rdi, rsp",
         "cld",
         "call {dispatch}",
+        // `dispatch` returns the saved frame to resume: this one, or another thread's.
+        "mov rsp, rax",
         "pop r15", "pop r14", "pop r13", "pop r12", "pop r11", "pop r10", "pop r9", "pop r8",
         "pop rbp", "pop rdi", "pop rsi", "pop rdx", "pop rcx", "pop rbx", "pop rax",
         "add rsp, 16",

@@ -125,6 +125,12 @@ fn boot_scenario() -> Scenario {
             format!("origin-kernel: ACPI MADT: {cpus} processors, {cpus} enabled"),
             "origin-kernel: CPU 1 (APIC ID 1) online after ".into(),
             format!("origin-kernel: SMP: {cpus} of {cpus} enabled processors online"),
+            // M3: two non-yielding threads per processor, all preempted and all running.
+            "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted ".into(),
+            format!(
+                "origin-kernel: preemptive multitasking: {} non-yielding threads on {cpus} CPUs all ran",
+                2 * cpus
+            ),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
         failures: vec![
@@ -156,6 +162,7 @@ fn boot_scenario() -> Scenario {
             "origin-kernel: ACPI processor discovery failed",
             "origin-kernel: AP start-up not possible",
             ": AP start-up failed",
+            ": scheduler failed",
         ],
     }
 }
