@@ -14,6 +14,8 @@ use framekernel::heap::{Heap, HeapStats, PageSource, Slab};
 
 use origin_sync::SpinLock;
 
+use crate::cpu::without_interrupts;
+
 /// Capacity of the slab table: 1024 slabs of 4 KiB, 4 MiB of small blocks.
 const SLABS: usize = 1024;
 
@@ -57,18 +59,22 @@ pub(crate) fn init(frames: FrameAllocator<'static>) {
     let Some(table) = (unsafe { (&raw mut SLAB_TABLE).as_mut() }) else {
         return;
     };
-    *MEMORY.lock() = Some(Memory {
-        frames,
-        heap: Heap::new(table),
+    without_interrupts(|| {
+        *MEMORY.lock() = Some(Memory {
+            frames,
+            heap: Heap::new(table),
+        });
     });
 }
 
 /// Heap totals and free frames, or `None` before [`init`].
 pub(crate) fn stats() -> Option<(HeapStats, u64)> {
-    MEMORY
-        .lock()
-        .as_ref()
-        .map(|m| (m.heap.stats(), m.frames.free_frames()))
+    without_interrupts(|| {
+        MEMORY
+            .lock()
+            .as_ref()
+            .map(|m| (m.heap.stats(), m.frames.free_frames()))
+    })
 }
 
 /// Returns the loader's and the firmware's boot-time memory (`LoaderReclaimable`) to the
@@ -78,12 +84,14 @@ pub(crate) fn stats() -> Option<(HeapStats, u64)> {
 /// Call only when nothing there is in use: after the kernel's own page tables replaced the
 /// firmware's, and after every enabled processor has left firmware code (INIT).
 pub(crate) fn reclaim_loader_memory() -> Option<(u64, u64)> {
-    let mut guard = MEMORY.lock();
-    let m = guard.as_mut()?;
-    let added = m
-        .frames
-        .reclaim(origin_boot_info::RegionKind::LoaderReclaimable);
-    Some((added, m.frames.free_frames()))
+    without_interrupts(|| {
+        let mut guard = MEMORY.lock();
+        let m = guard.as_mut()?;
+        let added = m
+            .frames
+            .reclaim(origin_boot_info::RegionKind::LoaderReclaimable);
+        Some((added, m.frames.free_frames()))
+    })
 }
 
 /// The kernel's global allocator.
@@ -92,30 +100,35 @@ struct KernelAllocator;
 // SAFETY: `alloc` returns null or the address of `layout.size()` bytes aligned to
 // `layout.align()` that no other live allocation overlaps (the heap's contract, tested in the
 // library); the direct map makes those bytes readable and writable. `dealloc` returns them.
-// Interrupt handlers never allocate, so the spin lock cannot deadlock against one.
+// Interrupt handlers never allocate, and the lock is held with interrupts disabled, so it
+// can deadlock neither against a handler nor against a preempted holder on this CPU.
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let mut guard = MEMORY.lock();
-        let Some(m) = guard.as_mut() else {
-            return ptr::null_mut();
-        };
         let (size, align) = (layout.size() as u64, layout.align() as u64);
-        match m.heap.allocate(&mut Frames(&mut m.frames), size, align) {
+        let addr = without_interrupts(|| {
+            let mut guard = MEMORY.lock();
+            let m = guard.as_mut()?;
+            m.heap.allocate(&mut Frames(&mut m.frames), size, align)
+        });
+        match addr {
             Some(addr) => ptr::with_exposed_provenance_mut(addr as usize),
             None => ptr::null_mut(),
         }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let mut guard = MEMORY.lock();
-        if let Some(m) = guard.as_mut() {
-            let (size, align) = (layout.size() as u64, layout.align() as u64);
-            let addr = ptr.expose_provenance() as u64;
-            if let Err(e) = m.heap.free(&mut Frames(&mut m.frames), addr, size, align) {
-                drop(guard);
-                // A bad free means memory safety is already broken somewhere: stop.
-                panic!("heap free of {addr:#x} ({size} bytes) refused: {e:?}");
+        let (size, align) = (layout.size() as u64, layout.align() as u64);
+        let addr = ptr.expose_provenance() as u64;
+        let result = without_interrupts(|| {
+            let mut guard = MEMORY.lock();
+            match guard.as_mut() {
+                Some(m) => m.heap.free(&mut Frames(&mut m.frames), addr, size, align),
+                None => Ok(()),
             }
+        });
+        if let Err(e) = result {
+            // A bad free means memory safety is already broken somewhere: stop.
+            panic!("heap free of {addr:#x} ({size} bytes) refused: {e:?}");
         }
     }
 }

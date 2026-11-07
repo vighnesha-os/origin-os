@@ -635,6 +635,23 @@ pub(crate) unsafe fn wrmsr(msr: u32, value: u64) {
     }
 }
 
+/// Runs `f` with interrupts disabled on this processor, restoring the previous state.
+///
+/// Every lock that a thread can hold while preemptible is taken inside this: otherwise a
+/// thread preempted while holding it makes every other thread on the same processor that
+/// wants it spin away its whole time slice.
+pub(crate) fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
+    let flags: u64;
+    // SAFETY: reads RFLAGS and disables interrupts; CPL 0. Restored below.
+    unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem, preserves_flags)) };
+    let result = f();
+    if flags & (1 << 9) != 0 {
+        // SAFETY: interrupts were enabled on entry, so re-enabling restores that state.
+        unsafe { asm!("sti", options(nomem, nostack)) };
+    }
+    result
+}
+
 /// The time-stamp counter.
 pub(crate) fn rdtsc() -> u64 {
     let (low, high): (u32, u32);

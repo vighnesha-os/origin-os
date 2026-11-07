@@ -47,18 +47,7 @@ fn this_cpu() -> usize {
     usize::try_from(cpu::cpu_id()).unwrap_or(usize::MAX)
 }
 
-/// Runs `f` with interrupts disabled on this processor, restoring the previous state.
-fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
-    let flags: u64;
-    // SAFETY: reads RFLAGS and disables interrupts; CPL 0. Restored below.
-    unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem, preserves_flags)) };
-    let result = f();
-    if flags & (1 << 9) != 0 {
-        // SAFETY: interrupts were enabled on entry, so re-enabling restores that state.
-        unsafe { asm!("sti", options(nomem, nostack)) };
-    }
-    result
-}
+use crate::cpu::without_interrupts;
 
 /// The timer interrupted the context whose frame is at `interrupted`; returns the frame to
 /// resume. Processors without an active queue keep running what they were running.
