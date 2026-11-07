@@ -16,6 +16,7 @@
 //! code (`forbid(unsafe_code)`):
 //! - [`acpi`]: RSDP, XSDT and MADT parsing (checksummed) for processor discovery;
 //! - [`apic`]: x2APIC and 8254 PIT encodings and timer calibration arithmetic;
+//! - [`base64`]: RFC 4648 Base64 encode/decode (whitespace-tolerant), for PEM and tokens;
 //! - [`bitmap`]: a fixed-size bit allocator (free-space, ids) with lowest-free alloc;
 //! - [`boot`]: boot-info validation and the memory summary;
 //! - [`blockcache`]: the block cache's LRU index and write-back bookkeeping;
@@ -77,6 +78,7 @@ extern crate alloc;
 
 pub mod acpi;
 pub mod apic;
+pub mod base64;
 pub mod bitmap;
 pub mod blockcache;
 pub mod boot;

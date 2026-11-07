@@ -826,6 +826,15 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Not done:** a `deflate` *compressor* (the project needs only decompression for reading packages/images), and the eventual Zstandard decoder (§17 names it as the target). CAVP-style NIST validation does not apply (this is not cryptographic); the zlib/gzip differential vectors are the validation.
 - **Licensing:** project licence not chosen yet.
 
+### Base64 encode/decode (RFC 4648; CLAUDE.md §59 PEM/tokens; 2026-11-08)
+
+- **What:** `base64` (library) encodes and decodes standard Base64 (the `+/` alphabet). `encode` pads to a multiple of four; `decode` ignores ASCII whitespace (so a line-wrapped PEM body decodes directly) and is strict otherwise — an out-of-alphabet character, a length not a multiple of four, or padding that is not one or two trailing `=` is rejected, never a panic. Pure, no `unsafe`; `alloc` for the output.
+- **Why:** PEM-wrapped keys and certificates, signed tokens and some config values carry binary as Base64 text; this is the codec the trust-store/credential and config paths need to read them.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 4648; no source used (CLAUDE.md §3).
+- **Test evidence (2026-11-08):** 4 `base64` tests — the **RFC 4648 §10 vectors** (`""`, `f`, `fo`, `foo`, `foob`, `fooba`, `foobar`) encoded and decoded both ways; whitespace tolerance (a PEM-style wrapped body with newlines/spaces/tabs); rejection of a short length, a character after padding, over-padding, an invalid character, misplaced padding, and the URL-safe `-_` alphabet; and a round-trip over arbitrary byte strings of every length 0–199 (output always a multiple of four). 244 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the RFC vectors and the round-trip are the control).
+- **Not done:** the URL-safe alphabet (`-_`) and no-padding variants (RFC 4648 §5), Base32/Base16, and streaming (incremental) codecs.
+- **Licensing:** project licence not chosen yet.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.
