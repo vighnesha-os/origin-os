@@ -103,3 +103,15 @@ pub(crate) fn flush_tlb() {
         asm!("mov {tmp}, cr3", "mov cr3, {tmp}", tmp = out(reg) _, options(nostack, preserves_flags));
     }
 }
+
+/// Maps a guard page back (read/write, never executable) before its memory is freed.
+pub(crate) fn unguard(page: u64) -> Result<(), MapError> {
+    let mut guard = KERNEL_SPACE.lock();
+    let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
+    k.space.map(
+        &mut k.tables,
+        page,
+        page,
+        Attributes::kernel(Access::ReadWrite),
+    )
+}

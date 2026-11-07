@@ -154,6 +154,7 @@ fn boot_scenario_markers() -> Scenario {
                 2 * cpus
             ),
             "origin-kernel: scheduler: yield alternated ".into(),
+            "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
         failures: vec![

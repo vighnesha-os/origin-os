@@ -97,6 +97,61 @@ pub(crate) fn guarded_stack(bytes: usize) -> Option<(&'static mut [u8], u64)> {
 /// The guard page of the first thread `spawn` created, for the boot proof.
 static FIRST_GUARD: AtomicU64 = AtomicU64::new(0);
 
+/// A thread stack from [`guarded_stack`]: its guard page and its usable bytes.
+#[derive(Clone, Copy)]
+struct ThreadStack {
+    guard: u64,
+    bytes: usize,
+}
+
+/// Per CPU: each slot's stack, and the stacks of threads that exited and await
+/// [`reap`]. Locked after the run queue, always with interrupts disabled.
+struct Threads {
+    stacks: [Option<ThreadStack>; framekernel::runqueue::CAPACITY],
+    zombies: [Option<ThreadStack>; framekernel::runqueue::CAPACITY],
+}
+
+static THREADS: [SpinLock<Threads>; MAX_CPUS] = [const {
+    SpinLock::new(Threads {
+        stacks: [None; framekernel::runqueue::CAPACITY],
+        zombies: [None; framekernel::runqueue::CAPACITY],
+    })
+}; MAX_CPUS];
+
+/// Frees the stacks of threads that exited on **this** processor. Only this processor may
+/// do it, and only from thread context: by then its exit handler, which ran on the dead
+/// stack, has certainly switched away. Returns how many stacks were freed.
+pub(crate) fn reap() -> usize {
+    use alloc::alloc::{Layout, dealloc};
+    let Some(threads) = THREADS.get(this_cpu()) else {
+        return 0;
+    };
+    let mut freed = 0;
+    loop {
+        let next = without_interrupts(|| threads.lock().zombies.iter_mut().find_map(Option::take));
+        let Some(stack) = next else {
+            return freed;
+        };
+        let Ok(layout) = Layout::from_size_align(stack.bytes + 4096, 4096) else {
+            continue;
+        };
+        // The guard must be mapped again before its frame returns to the heap.
+        if crate::vm::unguard(stack.guard).is_err() {
+            continue; // leak rather than free memory that is not mapped
+        }
+        // SAFETY: `guard` is the start of a `guarded_stack` allocation with this layout;
+        // its thread exited on this processor and this processor has switched away from
+        // it, so nothing uses the memory any more.
+        unsafe {
+            dealloc(
+                core::ptr::with_exposed_provenance_mut(stack.guard as usize),
+                layout,
+            )
+        };
+        freed += 1;
+    }
+}
+
 /// The running thread's queue request, made with interrupts disabled (the gate cleared IF).
 fn with_queue(interrupted: u64, f: impl FnOnce(&mut RunQueue) -> Option<u64>) -> u64 {
     let id = this_cpu();
@@ -118,9 +173,22 @@ pub(crate) fn on_sleep(interrupted: u64, ticks: u64) -> u64 {
     with_queue(interrupted, |q| q.sleep(interrupted, ticks).ok())
 }
 
-/// `EXIT_VECTOR`: the running thread ends. Its stack is not freed yet (no reaper).
+/// `EXIT_VECTOR`: the running thread ends. Its stack becomes a zombie, freed later by
+/// [`reap`] on this processor.
 pub(crate) fn on_exit(interrupted: u64) -> u64 {
-    with_queue(interrupted, |q| q.exit(interrupted).ok())
+    let id = this_cpu();
+    with_queue(interrupted, |q| {
+        let slot = q.current();
+        let next = q.exit(interrupted).ok()?;
+        if let Some(threads) = THREADS.get(id) {
+            let mut t = threads.lock();
+            let stack = t.stacks.get_mut(slot).and_then(Option::take);
+            if let Some(free) = t.zombies.iter_mut().find(|z| z.is_none()) {
+                *free = stack;
+            }
+        }
+        Some(next)
+    })
 }
 
 /// Gives up the processor to the next ready context on this CPU.
@@ -182,7 +250,19 @@ pub(crate) fn spawn(
             dst.copy_from_slice(&word.to_le_bytes());
         }
     }
-    without_interrupts(|| queue.lock().push(frame_at))
+    let record = ThreadStack {
+        guard,
+        bytes: THREAD_STACK,
+    };
+    without_interrupts(|| {
+        let slot = queue.lock().push(frame_at)?;
+        if let Some(threads) = THREADS.get(cpu)
+            && let Some(s) = threads.lock().stacks.get_mut(slot)
+        {
+            *s = Some(record);
+        }
+        Ok(slot)
+    })
 }
 
 /// An application processor's scheduler: waits until the boot processor has queued its
@@ -200,6 +280,7 @@ pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
     }
     timer::start_periodic(lapic);
     loop {
+        reap();
         // SAFETY: CPL 0; every vector that can arrive has a gate. Halting with interrupts
         // on just waits for the next timer tick, which may switch to a thread.
         unsafe { asm!("sti", "hlt", options(nomem, nostack)) };
@@ -278,6 +359,7 @@ fn yield_until(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) {
     while !done() && rdtsc().wrapping_sub(start) < tsc_hz.saturating_mul(seconds) {
         yield_now();
         cpu::interrupt_window();
+        reap();
     }
 }
 
@@ -338,6 +420,7 @@ fn prove_lifecycle(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool 
 /// within a factor of two, over at least five full rounds of context switches. Returns
 /// whether the proof passed.
 pub(crate) fn prove(com1: &mut Uart16550<Com1>, cpus: &[u32], tsc_hz: u64) -> bool {
+    let heap_before = crate::memory::stats().map(|(h, _)| h.bytes_in_use);
     for (i, &id) in cpus.iter().enumerate() {
         for k in 0..2 {
             if spawn(id as usize, worker, (2 * i + k) as u64).is_err() {
@@ -437,6 +520,20 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, cpus: &[u32], tsc_hz: u64) -> bo
         );
     }
     ok &= prove_lifecycle(com1, bsp, tsc_hz);
+    // Every thread has exited: once each processor has reaped its own, the heap is back
+    // exactly where it was before the first spawn.
+    let back = || crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before;
+    yield_until(back, tsc_hz, 2);
+    let reaped = back();
+    let now = crate::memory::stats().map_or(0, |(h, _)| h.bytes_in_use);
+    ok &= reaped;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap {} KiB, {} KiB before the first spawn{}",
+        now >> 10,
+        heap_before.unwrap_or(0) >> 10,
+        if reaped { "" } else { ": scheduler failed" }
+    );
     lapic.stop();
     if let Some(active) = ACTIVE.get(bsp) {
         active.store(false, Ordering::Release);
