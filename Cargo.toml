@@ -15,9 +15,15 @@ members = [
     "developer-tools/xtask",
     "runtime/onbf/format",
     "runtime/version",
+    "security/crypto",
 ]
 # Host-buildable crates only. The UEFI loader's binary cannot be built for the host.
-default-members = ["developer-tools/xtask", "runtime/onbf/format", "runtime/version"]
+default-members = [
+    "developer-tools/xtask",
+    "runtime/onbf/format",
+    "runtime/version",
+    "security/crypto",
+]
 
 [workspace.package]
 edition = "2024"
@@ -30,6 +36,7 @@ publish = false
 
 [workspace.dependencies]
 origin-version = { path = "runtime/version" }
+origin-crypto = { path = "security/crypto" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

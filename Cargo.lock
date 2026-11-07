@@ -6,6 +6,7 @@ version = 4
 name = "onbf-format"
 version = "0.0.0"
 dependencies = [
+ "origin-crypto",
  "origin-version",
 ]
 
@@ -15,6 +16,10 @@ version = "0.0.0"
 dependencies = [
  "origin-version",
 ]
+
+[[package]]
+name = "origin-crypto"
+version = "0.0.0"
 
 [[package]]
 name = "origin-version"

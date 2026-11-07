@@ -37,7 +37,11 @@ const LOADER_PACKAGE: &str = "origin-boot-uefi";
 const LOADER_BIN: &str = "origin-boot";
 const VERSION_PACKAGE: &str = "origin-version";
 const ONBF_FORMAT_PACKAGE: &str = "onbf-format";
+const CRYPTO_PACKAGE: &str = "origin-crypto";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
+/// `no_std` libraries embedded in the boot loader and the Framekernel. Each must be
+/// clippy-clean on every target and free of panic paths (ONBF §12).
+const FREESTANDING_LIBS: &[&str] = &[ONBF_FORMAT_PACKAGE, CRYPTO_PACKAGE];
 const QEMU: &str = "qemu-system-x86_64";
 const DEFAULT_BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -177,53 +181,156 @@ fn check() -> Result {
             "-D",
             "warnings",
         ],
-        // The ONBF parser on the host (with its tests) and on both freestanding targets that
-        // will embed it: the boot loader and the Framekernel. Its no-panic lints are active
-        // in every non-test build.
-        &[
-            "clippy",
-            "--package",
-            ONBF_FORMAT_PACKAGE,
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ],
-        &[
-            "clippy",
-            "--package",
-            ONBF_FORMAT_PACKAGE,
-            "--lib",
-            "--target",
-            UEFI_TARGET,
-            "--",
-            "-D",
-            "warnings",
-        ],
-        &[
-            "clippy",
-            "--package",
-            ONBF_FORMAT_PACKAGE,
-            "--lib",
-            "--target",
-            KERNEL_TARGET,
-            "--",
-            "-D",
-            "warnings",
-        ],
         &["test", "--package", "xtask"],
         &["test", "--package", LOADER_PACKAGE, "--lib"],
         &["test", "--package", VERSION_PACKAGE],
-        &["test", "--package", ONBF_FORMAT_PACKAGE],
     ];
     for step in steps {
         run_step(cargo().args(*step))?;
     }
+    // Libraries that run inside the boot loader and the Framekernel: clippy on the host
+    // (with tests) and on both freestanding targets, then their tests. Their no-panic lints
+    // are active in every non-test build.
+    for &package in FREESTANDING_LIBS {
+        run_step(cargo().args([
+            "clippy",
+            "--package",
+            package,
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
+        for target in [UEFI_TARGET, KERNEL_TARGET] {
+            run_step(cargo().args([
+                "clippy",
+                "--package",
+                package,
+                "--lib",
+                "--target",
+                target,
+                "--",
+                "-D",
+                "warnings",
+            ]))?;
+        }
+        run_step(cargo().args(["test", "--package", package]))?;
+    }
     build_loader()?;
+    no_panic_check()?;
     linux_cfg_lint()?;
     manifest_version_lint()?;
     println!("xtask: check passed");
     Ok(())
+}
+
+/// External symbols a freestanding library's release object may reference. Anything else,
+/// above all a `core::panicking`, bounds-check or `copy_from_slice` length routine, is a
+/// panic path, which ONBF §12 forbids. Lints alone cannot show this; the emitted object can.
+const NO_PANIC_ALLOWED: &[&str] = &["memcpy", "memmove", "memset", "memcmp"];
+/// Allowed by substring of the mangled name: `core::fmt::Formatter::write_str`, used by
+/// `Debug` impls.
+const NO_PANIC_ALLOWED_PARTS: &[&str] = &["4core3fmtNtB5_9Formatter9write_str"];
+
+/// Builds each freestanding library for the kernel target in release mode, as one object,
+/// and fails if it references any symbol outside the allowlist.
+fn no_panic_check() -> Result {
+    let nm = llvm_tool("llvm-nm")?;
+    let out_dir = target_dir().join("xtask").join("no-panic");
+    fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
+    for &package in FREESTANDING_LIBS {
+        let obj = out_dir.join(format!("{package}.o"));
+        let _ = fs::remove_file(&obj);
+        // Clean only this package for this target and profile, so rustc really runs and
+        // writes a fresh object (Cargo would otherwise consider it up to date).
+        run_step(cargo().args([
+            "clean",
+            "--quiet",
+            "--package",
+            package,
+            "--release",
+            "--target",
+            KERNEL_TARGET,
+        ]))?;
+        let emit = format!("--emit=obj={}", obj.display());
+        run_step(cargo().args([
+            "rustc",
+            "--quiet",
+            "--package",
+            package,
+            "--lib",
+            "--release",
+            "--target",
+            KERNEL_TARGET,
+            "--",
+            &emit,
+            "-C",
+            "codegen-units=1",
+        ]))?;
+        if !obj.is_file() {
+            return Err(format!(
+                "no-panic check: rustc did not write {}",
+                obj.display()
+            ));
+        }
+        let out = Command::new(&nm)
+            .arg("-u")
+            .arg(&obj)
+            .output()
+            .map_err(|e| format!("cannot run {}: {e}", nm.display()))?;
+        let listing = String::from_utf8_lossy(&out.stdout);
+        let symbols: Vec<&str> = listing.split_whitespace().filter(|s| *s != "U").collect();
+        let bad: Vec<&str> = symbols
+            .iter()
+            .copied()
+            .filter(|s| {
+                !NO_PANIC_ALLOWED.contains(s)
+                    && !NO_PANIC_ALLOWED_PARTS.iter().any(|p| s.contains(p))
+            })
+            .collect();
+        if !bad.is_empty() {
+            return Err(format!(
+                "{package}: the release object for {KERNEL_TARGET} references symbols outside the \
+                 no-panic allowlist (ONBF §12):\n  {}",
+                bad.join("\n  ")
+            ));
+        }
+        println!(
+            "xtask: no-panic check: {package} ({KERNEL_TARGET}, release) references {} external symbols, all allowed",
+            symbols.len()
+        );
+    }
+    Ok(())
+}
+
+/// A tool from the pinned toolchain's `llvm-tools` component.
+fn llvm_tool(name: &str) -> Result<PathBuf> {
+    let rustc = |args: &[&str]| -> Result<String> {
+        let out = Command::new("rustc")
+            .args(args)
+            .current_dir(repo_root())
+            .output()
+            .map_err(|e| format!("cannot run rustc: {e}"))?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let sysroot = rustc(&["--print", "sysroot"])?.trim().to_string();
+    let host = rustc(&["-vV"])?
+        .lines()
+        .find_map(|l| l.strip_prefix("host: ").map(str::to_string))
+        .ok_or("cannot read the host triple from `rustc -vV`")?;
+    let path = Path::new(&sysroot)
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin")
+        .join(name);
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(format!(
+            "{} not found; is the llvm-tools component installed?",
+            path.display()
+        ))
+    }
 }
 
 /// CLAUDE.md §62: a version is written by hand only in origin-version.toml. No Cargo

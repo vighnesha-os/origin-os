@@ -10,3 +10,7 @@ origin-version.workspace = true
 
 [lints]
 workspace = true
+
+# Real SHA-512 for content-digest tests; the parser itself takes the hash from its caller.
+[dev-dependencies]
+origin-crypto.workspace = true

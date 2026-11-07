@@ -1,9 +1,9 @@
 //! Container tests: a canonical test-only image builder, the malicious corpus (ONBF §13
 //! item 4, container cases), and exhaustive truncation, padding and bit-flip sweeps.
 //!
-//! The builder is test scaffolding, not `onbf-pack`. `fake_sha512` is a non-cryptographic
-//! stand-in that only exercises the digest plumbing; real SHA-512 comes from
-//! `origin-crypto`.
+//! The builder is test scaffolding, not `onbf-pack`. Content digests are real SHA-512 from
+//! `origin-crypto` (a dev-dependency only; the parser itself takes the hash from its
+//! caller).
 
 use crate::*;
 
@@ -94,20 +94,13 @@ fn align(x: usize, a: usize) -> usize {
     x.div_ceil(a) * a
 }
 
-/// Non-cryptographic stand-in for SHA-512 (FNV-1a lanes).
-fn fake_sha512(parts: &[&[u8]; 3]) -> [u8; 64] {
-    let mut out = [0u8; 64];
-    for (lane, chunk) in out.chunks_mut(8).enumerate() {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ (lane as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        for p in parts {
-            for &b in *p {
-                h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
-            }
-            h = (h ^ 0xFF).wrapping_mul(0x0100_0000_01b3);
-        }
-        chunk.copy_from_slice(&h.to_le_bytes());
+/// SHA-512 over the three content-digest ranges, in order (§4.5).
+fn sha512(parts: &[&[u8]; 3]) -> [u8; 64] {
+    let mut h = origin_crypto::Sha512::new();
+    for part in parts {
+        h.update(part);
     }
-    out
+    h.finalize()
 }
 
 impl Builder {
@@ -186,7 +179,7 @@ impl Builder {
         if let (Some(o), Some(sig)) = (sig_off, &self.signature) {
             out[o..o + sig.len()].copy_from_slice(sig);
         }
-        let digest = fake_sha512(&[&out[0..32], &out[112..128], &out[128..table_end]]);
+        let digest = sha512(&[&out[0..32], &out[112..128], &out[128..table_end]]);
         out[48..112].copy_from_slice(&digest);
         out
     }
@@ -262,14 +255,14 @@ fn content_digest_covers_header_and_table_but_not_signature_location() {
     let image = parse(&img).unwrap();
     let input = image.content_digest_input();
     assert_eq!(input.map(<[u8]>::len), [32, 16, 512]);
-    assert_eq!(image.verify_content_digest(fake_sha512), Ok(()));
+    assert_eq!(image.verify_content_digest(sha512), Ok(()));
 
     // A covered field that still parses: format_minor.
     let mut minor = img.clone();
     put16(&mut minor, 10, 1);
     let image = parse(&minor).expect("a higher minor still parses (§4.2)");
     assert_eq!(
-        image.verify_content_digest(fake_sha512),
+        image.verify_content_digest(sha512),
         Err(Error::ContentDigestMismatch)
     );
 
@@ -279,7 +272,7 @@ fn content_digest_covers_header_and_table_but_not_signature_location() {
         t[at] ^= 1;
         let image = parse(&t).unwrap();
         assert_eq!(
-            image.verify_content_digest(fake_sha512),
+            image.verify_content_digest(sha512),
             Err(Error::ContentDigestMismatch),
             "byte {at}"
         );
