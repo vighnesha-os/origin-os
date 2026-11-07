@@ -143,6 +143,32 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - a hand-written `version` in a crate manifest fails `xtask check`, naming the file and line.
 - **Licensing:** project licence not chosen yet.
 
+## `runtime/onbf/format/` (`onbf-format`), the ONBF container parser, T9 part 1
+
+- **What:** it validates an ONBF image's container layer:
+  - the header (§4.2), the section table (§4.3) and the kind/profile table (§4.4);
+  - the file layout (§4.1): canonical section offsets, zero padding, and the signature block at EOF;
+  - the Merkle cross-references (sizes and exactly one referrer).
+
+  It exposes the §4.5 content-digest input and a digest check that takes a caller-supplied SHA-512. Per ONBF-R1 it never interprets section content. Not yet included: OCBOR-1 (§5), the signature block's contents (§7.1), Merkle hashing (§4.6) and profile-level rules.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code written from `docs/spec/ONBF.md` v1.0.
+- **Architecture decisions:**
+  - ADR-0001.
+  - The ONBF §12 parser contract: `no_std`, no allocation, `forbid(unsafe_code)`, typed errors, no partial results. In non-test builds `clippy::{panic, unwrap_used, expect_used, indexing_slicing, arithmetic_side_effects, unreachable, todo, unimplemented, cast_possible_truncation}` are denied. A planted index and a planted unchecked addition were rejected, which confirms the lints are active.
+  - Where §4 allows more than one reading, the parser implements `docs/spec/ONBF-errata.md` C1–C14 (**Proposed**). **It must not ship until the owner approves those readings** (CLAUDE.md §84).
+  - A compile-time assertion ties the accepted `format_major` to `origin-version.toml`.
+- **Dependencies:** `core`, and the first-party `origin-version` crate.
+- **Toolchain:** Rust 1.99.1. Clippy-clean on the host, `x86_64-unknown-uefi` and `x86_64-unknown-none`.
+- **Test evidence (2026-11-07):** 15 tests.
+  - Valid images: a KRN image with Merkle and bss segments; a minimal image in every profile; unsigned images in developer mode and nested; skippable unknown kinds; `format_minor` > 0; the digest plumbing.
+  - **Malicious corpus, 69 cases** (ONBF §13 item 4, container part), each rejected with the exact expected error. It covers overlapping, misaligned and misplaced sections; counts beyond limits; integer overflow; truncation; trailing data; W+X; reserved fields; Merkle mis-references; and padding.
+  - Sweeps:
+    - every truncation of a 20,648-byte image is rejected;
+    - every one of 10,732 padding bytes is checked;
+    - all 5,120 single-bit flips of the header and table are rejected, except in fields with other valid values, all of which are digest-covered (errata, "Observed by the bit-flip sweep").
+  - Not done yet: fuzzing (§13 item 3), Kani bounds (item 5), the N-version check (item 6), and a real SHA-512.
+- **Licensing:** project licence not chosen yet.
+
 ## `developer-tools/xtask/` (`xtask`)
 
 - **What:** host-side build orchestration, with four commands:

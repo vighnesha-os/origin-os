@@ -1,0 +1,12 @@
+[package]
+name = "onbf-format"
+description = "Origin Native Binary Format container parser (docs/spec/ONBF.md §4)"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+origin-version.workspace = true
+
+[lints]
+workspace = true

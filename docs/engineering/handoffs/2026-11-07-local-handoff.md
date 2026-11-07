@@ -17,8 +17,9 @@
 | T4 workspace | Virtual workspace, strict unsafe lints, `cargo xtask` (check / build / boot-test / run). | `Cargo.toml`, `developer-tools/xtask/` |
 | T8 step 1 | `boot/uefi` (`origin-boot-uefi`): validates the system table, prints to ConOut, returns `EFI_UNSUPPORTED`. `boot-test` passes in 1.8 s, and OVMF confirms it received `Unsupported`. | `SOURCE_PROVENANCE.md` |
 | T5 versioning | `origin-version.toml` plus the generated `origin-version` crate. The loader banner reads `Origin OS 0.1.0-dev UEFI loader (build 0)`. `xtask check` rejects a version in any Cargo manifest. | `SOURCE_PROVENANCE.md` |
+| T9 part 1 | `runtime/onbf/format` (`onbf-format`), the container layer: header, section table, layout, Merkle cross-references and the content-digest input. 69-case malicious corpus plus truncation, padding and bit-flip sweeps. **14 proposed clarifications and 4 spec gaps await the owner.** | `docs/spec/ONBF-errata.md` |
 
-Commits: `b5a446a` (M0), `87f50fd` (workspace + loader), then the T5 commit that adds this file. The owner approved all three.
+Commits: `b5a446a` (M0), `87f50fd` (workspace + loader), `fc4d99e` (T5, which added this file). The owner approved all three. T9 part 1 updates this file.
 
 `cargo xtask check` and `cargo xtask boot-test` pass at the end of the session.
 
@@ -26,7 +27,12 @@ Commits: `b5a446a` (M0), `87f50fd` (workspace + loader), then the T5 commit that
 
 KRN, the Framekernel image, is an ONBF profile (ONBF §6.5), and only the boot loader parses it, through `onbf-format` (ONBF §8.2). An ELF-loading interim loader would contradict ADR-0001 and would be thrown away. The order is therefore:
 
-1. **T9 `onbf-format`** in `runtime/onbf/`. It is host-testable: `no_std`, no alloc, `forbid(unsafe_code)`, and the no-panic lints from ONBF §12. It parses the header, sections, content digest and OCBOR-1, and starts the malicious corpus (§13 item 4). The `origin-crypto` SHA-512 it needs for the content digest is its own task.
+1. **T9 `onbf-format`** in `runtime/onbf/format/`.
+   - **Part 1, the container layer, is done.**
+   - **Remaining:**
+     - the OCBOR-1 validator (§5): generic deterministic CBOR, with no manifest key numbers. Assigning those numbers is a format decision ADR-0001 leaves open for the owner.
+     - the signature-block structure (§7.1).
+   - The `origin-crypto` SHA-512 it needs for the content digest is its own task. `Image::verify_content_digest` already takes the hash function as a parameter.
 2. **A conversion path for KRN**: an `onbf-pack` subset that turns the kernel's ELF linker output into KRN.
 3. **M1 step 2**:
    - a *Proposed* boot ADR covering the boot-info structure and its ABI version (add it to `origin-version.toml [compatibility]` then), KASLR and relocation, and the trust anchor;
@@ -38,6 +44,7 @@ KRN, the Framekernel image, is an ONBF profile (ONBF §6.5), and only the boot l
 
 - Merge `m0/toolchain-verification` into `main`, and push. Both are the owner's call; nothing has been pushed.
 - A project licence. Every provenance entry says "not chosen yet".
+- Approve, amend or reject the ONBF clarifications C1–C14 in `docs/spec/ONBF-errata.md`, and decide gaps G1–G4. `onbf-format` must not ship before that.
 - The boot trust anchor (Microsoft UEFI CA 2023, or Origin keys enrolled in firmware) for the boot ADR.
 - Whether to install Rosetta 2 for the *executed* FFI-bool test (§10). Only the assembly-level check exists so far.
 - The starting release values in `origin-version.toml` (`0.1.0-dev`, build 0, SVN 0) are a development default. Change them if you prefer others.

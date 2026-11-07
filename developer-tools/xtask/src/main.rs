@@ -36,6 +36,8 @@ const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 const LOADER_PACKAGE: &str = "origin-boot-uefi";
 const LOADER_BIN: &str = "origin-boot";
 const VERSION_PACKAGE: &str = "origin-version";
+const ONBF_FORMAT_PACKAGE: &str = "onbf-format";
+const KERNEL_TARGET: &str = "x86_64-unknown-none";
 const QEMU: &str = "qemu-system-x86_64";
 const DEFAULT_BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -175,9 +177,44 @@ fn check() -> Result {
             "-D",
             "warnings",
         ],
+        // The ONBF parser on the host (with its tests) and on both freestanding targets that
+        // will embed it: the boot loader and the Framekernel. Its no-panic lints are active
+        // in every non-test build.
+        &[
+            "clippy",
+            "--package",
+            ONBF_FORMAT_PACKAGE,
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &[
+            "clippy",
+            "--package",
+            ONBF_FORMAT_PACKAGE,
+            "--lib",
+            "--target",
+            UEFI_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &[
+            "clippy",
+            "--package",
+            ONBF_FORMAT_PACKAGE,
+            "--lib",
+            "--target",
+            KERNEL_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ],
         &["test", "--package", "xtask"],
         &["test", "--package", LOADER_PACKAGE, "--lib"],
         &["test", "--package", VERSION_PACKAGE],
+        &["test", "--package", ONBF_FORMAT_PACKAGE],
     ];
     for step in steps {
         run_step(cargo().args(*step))?;
