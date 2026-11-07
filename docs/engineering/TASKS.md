@@ -35,7 +35,7 @@
 | Thread cleanup | exited threads' stacks reaped on their own CPU | heap back to its pre-spawn size; negative control |
 | `origin-sync` | the spin lock as a freestanding, host-stress-tested crate | 3 multi-thread tests; no-panic check |
 | CPU-local area | GS-based per-CPU data; context-switch cost measured at every boot | ~18 % fewer cycles per switch (QEMU) |
-| M4 groundwork: user mode | ring 3, one DPL-3 system-call gate, RSP0 per switch, user faults end the thread | 4 user-program proofs; two negative controls |
+| M4 groundwork: user mode | ring 3, one DPL-3 system-call gate and `syscall`, RSP0 per switch, user faults end the thread, NMI/#MC on IST | 5 user-program proofs, a self-NMI proof; four negative controls |
 
 ## In progress
 

@@ -248,7 +248,9 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Proof** (boot-test, every boot): a good program reports 42 and exits 0; a program that reads a kernel address takes #PF 0x5 (present, read, user) and is ended; a program that executes `hlt` takes #GP(0) and is ended; two compute-bound user programs run at once, preempted many times, and both report correctly with their RSP intact; afterwards every thread stack is reaped.
 - **Controls:** the system-call gate at DPL 0 turns the good program's `int 0x80` into #GP 0x402 (IDT entry 0x80); RSP0 left frozen makes one of the two concurrent threads lose its frames ("reports 0b10"). Both fail the boot test.
 - **Specifications:** Intel SDM Vol. 3A: privilege levels and gates (DPL checks for `int n`), the 64-bit TSS (RSP0), IRET to a lower privilege level (segment-register nulling), #PF and #GP error codes.
-- **Not done:** per-process address spaces (the user pages live in the kernel's tables; the higher-half ADR comes first), `swapgs`, SYSCALL/SYSRET, process objects and capabilities (M4).
+- **SYSCALL entry** (later the same day): EFER.SCE, STAR, LSTAR and FMASK (TF, IF, DF, NT, AC) on every CPU; `syscall_entry` switches to the running thread's kernel stack (kept in the CPU-local area beside TSS.RSP0) and builds the same frame an interrupt from user mode pushes, so `syscall` and `int 0x80` share one dispatch path and return with IRETQ. Proof: a program reports 77 and exits with `syscall`. Control: SCE clear → #UD, the thread ends unreported.
+- **IST stacks for NMI and #MC** (IST2, IST3; 16 KiB each per CPU), so an NMI right after `syscall` never lands on the user stack. Proof: a self-NMI's frame lies inside the boot processor's NMI stack. Control: NMI without IST → the frame is on the interrupted stack.
+- **Not done:** per-process address spaces (the user pages live in the kernel's tables; the higher-half ADR comes first), `swapgs`, SYSRET, process objects and capabilities (M4).
 
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 

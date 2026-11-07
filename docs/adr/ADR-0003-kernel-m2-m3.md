@@ -44,7 +44,8 @@ A thread's saved context is its interrupt frame on its own stack; the timer hand
 
 ### K8. First user mode: one DPL-3 gate, RSP0 per switch, faults end the thread
 Ring-3 code reaches the kernel only through `int 0x80` (DPL 3); every other gate is DPL 0. The kernel enters user mode with every general-purpose register zeroed and DPL-3 data selectors loaded (so the CPL change nulls no segment register and the kernel's GS base survives; user mode cannot read it). The scheduler points TSS.RSP0 at the resumed thread's kernel stack on every switch. An exception in user mode ends the thread, not the kernel.
-*Alternatives:* SYSCALL/SYSRET with `swapgs` (faster, the M4 target; needs STAR/LSTAR/SFMASK and a GS swap discipline); per-CPU RSP0 written only for user threads (cheaper, but easy to get wrong).
+`syscall` enters through the same path (built frame, IRETQ return); NMI and #MC run on IST2 and IST3 so they never use a user stack.
+*Alternatives:* SYSRET for the return and `swapgs` (faster, the M4 target; SYSRET needs a canonical-RCX check); per-CPU RSP0 written only for user threads (cheaper, but easy to get wrong).
 
 ## Evidence
 
