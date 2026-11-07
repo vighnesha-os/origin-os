@@ -46,13 +46,19 @@ Memory types:
 *KASLR:* in M1 the physical base is whatever the firmware returns. A randomized base, from `EFI_RNG_PROTOCOL`, belongs with the kernel's own page tables in M2, when the virtual layout becomes the kernel's to choose.
 
 ### B4. The boot-info structure
-`origin-boot-info` defines the structure, at version 0.1 (`origin-version.toml [compatibility] boot-info`); major 0 means unstable. It contains:
+`origin-boot-info` defines the structure, at version 0.2 (`origin-version.toml [compatibility] boot-info`); major 0 means unstable, so the kernel accepts only its exact version. It contains:
 - a magic number, the version and the structure's size;
 - the physical memory regions, using Origin's own kinds: the loader translates the UEFI map so the kernel never sees UEFI structures;
 - the kernel base and span;
 - the ACPI 2.0 RSDP, from the configuration table;
 - the UEFI system table, for runtime services later;
-- the kernel stack.
+- the kernel stack;
+- *(0.2, 2026-11-07)* the **kernel segment table**: for each SEGMENT, in RVA order, its RVA, its length in pages, and R/W/X access bits taken from the verified ONBF segment table (at most 16). A RELRO segment arrives without W, because the loader has already applied the relocations. The loader checks the list with `origin_boot_info::check_segments` before `ExitBootServices`, and the kernel checks it again: aligned, non-empty, sorted, disjoint, inside the span, readable, never W and X together.
+
+The segment table exists so that the kernel maps its own image with exactly the permissions the signed image declares, instead of trusting linker symbols or re-parsing ELF. The kernel's first address space (`framekernel::kernel_space`) maps:
+- each kernel segment with its declared access;
+- a read/write, never-executable identity direct map of `Usable`, `LoaderReclaimable`, `BootInfo`, `KernelStack` and `AcpiReclaimable` regions;
+- nothing else. Page 0, MMIO, ACPI NVS, runtime services and reserved memory stay unmapped, and the `KernelImage` region is outside the direct map, so there is no writable alias of kernel code.
 
 The kernel validates the header before it trusts any other field. The KRN manifest records the boot-info version the kernel expects (key 24), and the loader refuses a mismatch.
 
@@ -67,7 +73,7 @@ After that, the loader calls nothing in the firmware.
 ### B6. Entering the kernel
 - `cli`; RSP set to the 16-byte-aligned top of the kernel stack; RBP cleared.
 - Then `call entry`, with RDI holding the boot-info address. That is the System V convention (`extern "sysv64"`), explicit in the assembly because the loader itself is built for the Microsoft x64 ABI.
-- The firmware's identity mapping stays active. The kernel installs its own page tables in M2.
+- The firmware's identity mapping stays active. The kernel then installs its own page tables (M2, done 2026-11-07): it sets EFER.NXE and CR0.WP and loads CR3, then proves the protections with four deliberate faults: a write to code, a write to read-only data, a fetch from writable data and a read of page 0.
 - If the kernel ever returns, the loader halts the CPU.
 
 ### B7. Boot trust anchor (open; carried from ADR-0001)

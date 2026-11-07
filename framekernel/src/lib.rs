@@ -4,9 +4,9 @@
 //! the physical address of an [`origin_boot_info::BootInfo`] in `rdi`. The kernel brings up
 //! COM1, checks that the loader applied its relocations, validates the boot info, prints a
 //! summary of it, loads its own GDT, TSS and IDT, proves exception handling with a
-//! breakpoint, starts the physical frame allocator and proves it, and halts. It still runs
-//! on the firmware's page tables; [`paging`] builds the kernel's own, which a later step
-//! loads.
+//! breakpoint, starts the physical frame allocator, switches to its own page tables (W^X
+//! kernel image, no null page, a never-executable direct map), proves those protections
+//! with deliberate faults and the allocator through the new mapping, and halts.
 //!
 //! This library holds everything that can be unit-tested on the build host, all of it safe
 //! code (`forbid(unsafe_code)`):
@@ -14,6 +14,7 @@
 //! - [`descriptors`]: GDT, TSS and IDT descriptor encodings;
 //! - [`frames`]: the physical frame allocator over the boot-info regions;
 //! - [`paging`]: 4-level page tables with structural W^X;
+//! - [`kernel_space`]: what the kernel's first address space maps, and how;
 //! - [`serial`]: a polled 16550 UART driver over an abstract register interface;
 //! - [`report`]: the exact console text.
 //!
@@ -26,6 +27,7 @@
 pub mod boot;
 pub mod descriptors;
 pub mod frames;
+pub mod kernel_space;
 pub mod paging;
 pub mod report;
 pub mod serial;

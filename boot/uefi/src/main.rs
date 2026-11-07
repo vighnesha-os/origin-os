@@ -21,7 +21,7 @@ use core::panic::PanicInfo;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use origin_boot_info::{BootInfo, MemoryRegion};
+use origin_boot_info::{BootInfo, KernelSegment, MAX_KERNEL_SEGMENTS, MemoryRegion};
 use origin_boot_uefi::console::ConOut;
 use origin_boot_uefi::protocols::{
     ACPI_20_TABLE, ALLOCATE_ANY_PAGES, BOOT_SERVICES_SIGNATURE, BootServices, ConfigurationTable,
@@ -200,13 +200,38 @@ fn boot(
         .checked_add(v.manifest.entry)
         .ok_or(Status::LOAD_ERROR)?;
 
+    // B4 (boot info 0.2): the kernel's segment table, so it can map its own image with the
+    // permissions the verified image declares.
+    let mut segments = [KernelSegment {
+        rva: 0,
+        pages: 0,
+        access: 0,
+        reserved: 0,
+    }; MAX_KERNEL_SEGMENTS as usize];
+    let segment_count = place::kernel_segments(&v.image, &mut segments).map_err(|e| {
+        fail(
+            out,
+            Status::LOAD_ERROR,
+            format_args!("kernel segments: {e:?}"),
+        )
+    })?;
+    let segments = segments.get(..segment_count).unwrap_or(&[]);
+    origin_boot_info::check_segments(segments, span).map_err(|e| {
+        fail(
+            out,
+            Status::LOAD_ERROR,
+            format_args!("kernel segments rejected: {e:?}"),
+        )
+    })?;
+
     // B4: stack, boot info and memory-map buffer, all allocated before the final map.
     let stack = allocate(&bs, memory_type::OS_KERNEL_STACK, STACK_PAGES)
         .map_err(|s| fail(out, s, format_args!("cannot allocate the kernel stack")))?;
     let (probe_size, descriptor_size) = probe_memory_map(&bs)
         .map_err(|s| fail(out, s, format_args!("cannot size the memory map: {s:?}")))?;
     let capacity = probe_size / descriptor_size.max(1) + MAP_SLACK;
-    let info_bytes = size_of::<BootInfo>() + capacity * size_of::<MemoryRegion>();
+    let segments_bytes = MAX_KERNEL_SEGMENTS as usize * size_of::<KernelSegment>();
+    let info_bytes = size_of::<BootInfo>() + segments_bytes + capacity * size_of::<MemoryRegion>();
     let info_pages = info_bytes.div_ceil(PAGE);
     let info_addr = allocate(&bs, memory_type::OS_BOOT_INFO, info_pages)
         .map_err(|s| fail(out, s, format_args!("cannot allocate the boot info")))?;
@@ -228,7 +253,20 @@ fn boot(
     PANIC_CONSOLE.store(ptr::null_mut(), Ordering::Release);
 
     // B5: final memory map, translation, ExitBootServices (one retry, UEFI 2.11 §7.4).
-    let regions_addr = info_addr + size_of::<BootInfo>() as u64;
+    // Layout: BootInfo, then MAX_KERNEL_SEGMENTS segment slots, then the region array.
+    let segments_addr = info_addr + size_of::<BootInfo>() as u64;
+    // SAFETY: `allocate` zeroed `info_pages` pages at `info_addr`; the segment slots start
+    // after the `BootInfo`, are 8-byte aligned, and fit in those pages (`info_bytes`).
+    let segment_slots = unsafe {
+        core::slice::from_raw_parts_mut(
+            ptr::with_exposed_provenance_mut::<KernelSegment>(segments_addr as usize),
+            MAX_KERNEL_SEGMENTS as usize,
+        )
+    };
+    for (slot, segment) in segment_slots.iter_mut().zip(segments) {
+        *slot = *segment;
+    }
+    let regions_addr = segments_addr + segments_bytes as u64;
     // SAFETY: `allocate` zeroed `info_pages` pages at `info_addr`; the region array starts
     // after the `BootInfo`, is 8-byte aligned, and `capacity` entries fit in those pages.
     let regions = unsafe {
@@ -307,6 +345,8 @@ fn boot(
             uefi_system_table: system_table as u64,
             stack_base: stack,
             stack_size: (STACK_PAGES * PAGE) as u64,
+            kernel_segments: segments_addr,
+            kernel_segment_count: segment_count as u64,
         };
         // SAFETY: `info_addr` is the start of this loader's zeroed, 4 KiB-aligned boot-info
         // allocation, large enough for a `BootInfo`.

@@ -1,5 +1,5 @@
 //! Validation of the boot info the loader passes, and the memory summary the kernel
-//! reports (boot-info v0.1, Proposed).
+//! reports (boot-info v0.2, Proposed).
 //!
 //! The kernel copies the [`BootInfo`] header out of loader memory, then validates it here
 //! before it reads anything else the header points to. Every check is total: no function in
@@ -7,7 +7,7 @@
 
 use core::mem::{align_of, size_of};
 
-use origin_boot_info::{BootInfo, BootInfoError, MemoryRegion, RegionKind};
+use origin_boot_info::{BootInfo, BootInfoError, KernelSegment, MemoryRegion, RegionKind};
 
 /// Size of the pages [`MemoryRegion::pages`] counts.
 pub const PAGE_SIZE: u64 = 4096;
@@ -31,6 +31,10 @@ pub enum InvalidBootInfo {
     /// The region at this index starts before the previous one ends: the array is not
     /// sorted by `base`, or two regions overlap.
     RegionOrder(usize),
+    /// `kernel_segments` is null or misaligned, or the array would wrap the address space.
+    SegmentArray,
+    /// `kernel_base` is not 4 KiB aligned, or `kernel_base + kernel_span` overflows.
+    KernelImage,
 }
 
 impl From<BootInfoError> for InvalidBootInfo {
@@ -67,18 +71,51 @@ pub struct RegionArray {
 /// which no check can establish.
 pub fn validate(info: &BootInfo) -> Result<RegionArray, InvalidBootInfo> {
     info.check()?;
-    // `check` bounds `region_count` by MAX_REGIONS, so these conversions and products
-    // cannot fail on a 64-bit target; they are checked anyway.
-    let len = usize::try_from(info.region_count).map_err(|_| InvalidBootInfo::RegionArray)?;
-    let addr = usize::try_from(info.regions).map_err(|_| InvalidBootInfo::RegionArray)?;
-    let bytes = len
-        .checked_mul(size_of::<MemoryRegion>())
-        .ok_or(InvalidBootInfo::RegionArray)?;
-    let fits = bytes <= isize::MAX.unsigned_abs() && addr.checked_add(bytes).is_some();
-    if addr == 0 || !addr.is_multiple_of(align_of::<MemoryRegion>()) || !fits {
-        return Err(InvalidBootInfo::RegionArray);
+    let image_end = info.kernel_base.checked_add(info.kernel_span);
+    if !info.kernel_base.is_multiple_of(PAGE_SIZE) || image_end.is_none() {
+        return Err(InvalidBootInfo::KernelImage);
     }
+    // `check` bounds `region_count` by MAX_REGIONS, so the conversions and products in
+    // `locate` cannot fail on a 64-bit target; they are checked anyway.
+    let (addr, len) = locate::<MemoryRegion>(info.regions, info.region_count)
+        .ok_or(InvalidBootInfo::RegionArray)?;
     Ok(RegionArray { addr, len })
+}
+
+/// Where the kernel segment array lives, once [`segment_array`] has accepted it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentArray {
+    /// Address of the first [`KernelSegment`]: non-null and aligned.
+    pub addr: usize,
+    /// Number of entries, between 1 and [`origin_boot_info::MAX_KERNEL_SEGMENTS`].
+    pub len: usize,
+}
+
+/// Locates the kernel segment array of a header that [`validate`] accepted, with the same
+/// layout guarantees as the region array.
+pub fn segment_array(info: &BootInfo) -> Result<SegmentArray, InvalidBootInfo> {
+    let (addr, len) = locate::<KernelSegment>(info.kernel_segments, info.kernel_segment_count)
+        .ok_or(InvalidBootInfo::SegmentArray)?;
+    Ok(SegmentArray { addr, len })
+}
+
+/// Checks the kernel segment list the loader passed (see
+/// [`origin_boot_info::check_segments`]).
+pub fn check_kernel_segments(
+    segments: &[KernelSegment],
+    info: &BootInfo,
+) -> Result<(), InvalidBootInfo> {
+    origin_boot_info::check_segments(segments, info.kernel_span).map_err(InvalidBootInfo::Header)
+}
+
+/// `(addr, len)` of `count` entries of `T` at `addr` if they form a non-null, aligned array
+/// of at most `isize::MAX` bytes that does not wrap the address space.
+fn locate<T>(addr: u64, count: u64) -> Option<(usize, usize)> {
+    let len = usize::try_from(count).ok()?;
+    let addr = usize::try_from(addr).ok()?;
+    let bytes = len.checked_mul(size_of::<T>())?;
+    let fits = bytes <= isize::MAX.unsigned_abs() && addr.checked_add(bytes).is_some();
+    (addr != 0 && addr.is_multiple_of(align_of::<T>()) && fits).then_some((addr, len))
 }
 
 /// What the kernel learned from the region array.
@@ -150,6 +187,8 @@ mod tests {
             uefi_system_table: 0,
             stack_base: 0x40_0000,
             stack_size: 0x1_0000,
+            kernel_segments: 0x9000,
+            kernel_segment_count: 2,
         }
     }
 
@@ -227,6 +266,56 @@ mod tests {
         assert!(validate(&info).is_ok());
         info.regions = last + 8;
         assert_eq!(validate(&info), Err(InvalidBootInfo::RegionArray));
+    }
+
+    #[test]
+    fn validate_checks_the_kernel_image_range() {
+        for (base, span) in [(0x20_0800, 0x3000), (!0xFFF_u64, 0x2000)] {
+            let mut info = header();
+            info.kernel_base = base;
+            info.kernel_span = span;
+            assert_eq!(validate(&info), Err(InvalidBootInfo::KernelImage));
+        }
+    }
+
+    #[test]
+    fn segment_array_is_located_and_checked() {
+        assert_eq!(
+            segment_array(&header()),
+            Ok(SegmentArray {
+                addr: 0x9000,
+                len: 2
+            })
+        );
+        for addr in [0, 0x9004, u64::MAX - 0x10] {
+            let mut info = header();
+            info.kernel_segments = addr;
+            assert_eq!(segment_array(&info), Err(InvalidBootInfo::SegmentArray));
+        }
+        let mut info = header();
+        info.kernel_segment_count = 0;
+        assert_eq!(
+            validate(&info),
+            Err(InvalidBootInfo::Header(BootInfoError::Segments))
+        );
+        let seg = |rva, pages, access| KernelSegment {
+            rva,
+            pages,
+            access,
+            reserved: 0,
+        };
+        let (r, rx) = (
+            origin_boot_info::SEGMENT_READ,
+            origin_boot_info::SEGMENT_READ | origin_boot_info::SEGMENT_EXECUTE,
+        );
+        let ok = [seg(0, 1, r), seg(0x1000, 2, rx)];
+        assert_eq!(check_kernel_segments(&ok, &header()), Ok(()));
+        // Past the 0x3000-byte span.
+        let long = [seg(0, 1, r), seg(0x1000, 3, rx)];
+        assert_eq!(
+            check_kernel_segments(&long, &header()),
+            Err(InvalidBootInfo::Header(BootInfoError::Segment(1)))
+        );
     }
 
     #[test]

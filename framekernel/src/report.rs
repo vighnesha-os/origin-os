@@ -88,7 +88,7 @@ mod tests {
             magic: MAGIC,
             version_major: VERSION.0,
             version_minor: VERSION.1,
-            size: 80,
+            size: 96,
             regions: 0x8000,
             region_count: 42,
             kernel_base: 0x7e5_0000,
@@ -97,6 +97,8 @@ mod tests {
             uefi_system_table: 0,
             stack_base: 0x40_0000,
             stack_size: 0x1_0000,
+            kernel_segments: 0x9000,
+            kernel_segment_count: 3,
         }
     }
 
@@ -109,12 +111,14 @@ mod tests {
         write_report(&mut out, &info(0x7fb7_e014), &memory).unwrap();
         let expected = format!(
             "origin-kernel: {} {} Framekernel (build {})\n\
-             origin-kernel: boot info 0.1, 42 memory regions, 2014 MiB usable\n\
+             origin-kernel: boot info {}.{}, 42 memory regions, 2014 MiB usable\n\
              origin-kernel: loaded at 0x7e50000, span 0x13000 bytes\n\
              origin-kernel: ACPI RSDP at 0x7fb7e014\n",
             origin_version::PRODUCT,
             origin_version::VERSION,
-            origin_version::BUILD
+            origin_version::BUILD,
+            VERSION.0,
+            VERSION.1
         );
         assert_eq!(out, expected);
     }

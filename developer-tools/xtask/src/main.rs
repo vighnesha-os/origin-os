@@ -88,10 +88,22 @@ fn boot_scenario() -> Scenario {
                 origin_version::BOOT_INFO_MINOR
             ),
             "origin-kernel: loaded at ".into(),
+            // Boot info 0.2: the verified segment table, in RVA order (R, RX, RW).
+            "origin-kernel: kernel segment 0: R at ".into(),
+            "origin-kernel: kernel segment 1: RX at ".into(),
+            "origin-kernel: kernel segment 2: RW at ".into(),
             "origin-kernel: GDT, TSS and IDT loaded (32 exception vectors)".into(),
             "origin-kernel: exception 3 (#BP breakpoint) at rip ".into(),
             "origin-kernel: breakpoint handled; resuming".into(),
             "origin-kernel: frame allocator: ".into(),
+            "origin-kernel: page tables loaded: ".into(),
+            "origin-kernel: page protection: write to kernel code at ".into(),
+            "faulted (#PF error 0x3)".into(),
+            "origin-kernel: page protection: write to read-only kernel data at ".into(),
+            "origin-kernel: page protection: instruction fetch from writable data at ".into(),
+            "faulted (#PF error 0x11)".into(),
+            "origin-kernel: page protection: read of page 0 at 0x0 faulted (#PF error 0x0)".into(),
+            // After the switch, so this also proves the direct map.
             "origin-kernel: allocated, wrote and freed 3 frames at ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
@@ -109,6 +121,11 @@ fn boot_scenario() -> Scenario {
             "origin-kernel: frame allocator exhausted",
             "did not keep its contents",
             "could not be freed",
+            "origin-kernel: page tables not built",
+            "origin-kernel: page protection violated",
+            "origin-kernel: the processor has no NX bit",
+            "origin-kernel: no code or read-only segment to probe",
+            "RWX at",
         ],
     }
 }

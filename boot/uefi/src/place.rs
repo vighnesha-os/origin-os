@@ -2,6 +2,7 @@
 //! relocations (ADR-0002 B3; ONBF §6.1).
 
 use onbf_format::{Flags, Image, Kind};
+use origin_boot_info::{KernelSegment, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE};
 
 /// Why an image could not be placed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +26,50 @@ pub enum PlaceError {
     NotWritable(u64),
     /// `slot + base` overflows.
     Overflow(u64),
+    /// The image has more segments than the boot info can describe.
+    TooManySegments,
+}
+
+/// The boot-info access bits for a segment with ONBF `flags`. RELRO drops write access:
+/// the loader has applied every relocation before the kernel maps its image.
+pub const fn segment_access(flags: Flags) -> u32 {
+    let read = if flags.has(Flags::READ) {
+        SEGMENT_READ
+    } else {
+        0
+    };
+    let write = if flags.has(Flags::WRITE) && !flags.has(Flags::RELRO) {
+        SEGMENT_WRITE
+    } else {
+        0
+    };
+    let execute = if flags.has(Flags::EXECUTE) {
+        SEGMENT_EXECUTE
+    } else {
+        0
+    };
+    read | write | execute
+}
+
+/// Writes the image's segments to `out` in section-table order, which `onbf-format` has
+/// checked is sorted by RVA, page-sized and disjoint (errata G4), and returns how many
+/// there are (ADR-0002 B4, boot info 0.2).
+pub fn kernel_segments(image: &Image<'_>, out: &mut [KernelSegment]) -> Result<usize, PlaceError> {
+    let mut count = 0;
+    for s in image.sections().filter(|s| s.entry.kind() == Kind::Segment) {
+        let slot = out.get_mut(count).ok_or(PlaceError::TooManySegments)?;
+        *slot = KernelSegment {
+            rva: s.entry.mem_offset,
+            pages: s.entry.mem_size / 4096,
+            access: segment_access(s.entry.flags),
+            reserved: 0,
+        };
+        count += 1;
+    }
+    if count == 0 {
+        return Err(PlaceError::NoSegments);
+    }
+    Ok(count)
 }
 
 /// The image span: the end of the highest segment, as an RVA.
@@ -174,6 +219,27 @@ mod tests {
     }
 
     const ALL: fn(u64) -> bool = |rva| rva + 8 <= 4096;
+
+    #[test]
+    fn segment_access_follows_the_flags_and_relro_drops_write() {
+        let (r, w, x, relro) = (Flags::READ, Flags::WRITE, Flags::EXECUTE, Flags::RELRO);
+        let cases = [
+            (r, SEGMENT_READ),
+            (r | x, SEGMENT_READ | SEGMENT_EXECUTE),
+            (r | w, SEGMENT_READ | SEGMENT_WRITE),
+            (r | w | relro, SEGMENT_READ),
+            (x, SEGMENT_EXECUTE),
+            (0, 0),
+        ];
+        for (flags, access) in cases {
+            let required = Flags::REQUIRED | Flags::MAPPABLE;
+            assert_eq!(
+                segment_access(Flags(flags | required)),
+                access,
+                "{flags:#x}"
+            );
+        }
+    }
 
     #[test]
     fn address_words_relocate_single_slots() {

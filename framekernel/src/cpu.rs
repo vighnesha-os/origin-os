@@ -6,9 +6,14 @@
 //! entry uses one naked stub per vector, which normalises the frame (pushing a dummy error
 //! code where the processor does not push one, then the vector number), and a common stub
 //! that saves the general-purpose registers and calls [`dispatch`] with System V alignment.
+//!
+//! It also switches to the kernel's own page tables ([`load_page_tables`]) and provides
+//! *probes*: single deliberate accesses that report a page fault instead of taking it, which
+//! prove on the real processor that the page protections hold.
 
 use core::arch::{asm, naked_asm};
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use framekernel::descriptors::{
     self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, TSS, TSS_SIZE,
@@ -150,6 +155,17 @@ pub(crate) fn breakpoint() {
 
 /// Called by [`exception_common`] with the saved frame.
 extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) {
+    // A page fault at the exact instruction a probe armed: record it and resume at
+    // `probe_recover`, which returns the error code to the probe's caller.
+    if frame.vector == 14 {
+        let armed = PROBE_RIP.load(Ordering::SeqCst);
+        if armed != 0 && frame.rip == armed {
+            PROBE_ADDRESS.store(read_cr2(), Ordering::SeqCst);
+            frame.rax = frame.error_code;
+            frame.rip = (probe_recover as *const ()).addr() as u64;
+            return;
+        }
+    }
     // SAFETY: COM1 was programmed by `_start` before `init` installed any gate, and only
     // this processor runs; an exception interrupts `_start` on that same processor.
     let mut com1 = Uart16550::new(unsafe { crate::Com1::new() });
@@ -176,6 +192,196 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) {
     );
     let _ = (frame.r12, frame.r13, frame.r14, frame.r15, frame.ss);
     crate::halt()
+}
+
+/// CR2: the linear address of the last page fault.
+fn read_cr2() -> u64 {
+    let value: u64;
+    // SAFETY: reading CR2 at CPL 0 has no side effects.
+    unsafe { asm!("mov {}, cr2", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
+/// Whether the processor supports the execute-disable bit (CPUID 8000_0001h EDX bit 20).
+pub(crate) fn nx_supported() -> bool {
+    let max_extended: u32;
+    // SAFETY: CPUID is available on every x86-64 processor; it reads no memory. RBX is
+    // reserved by LLVM, so it is saved and restored around the instruction.
+    unsafe {
+        asm!(
+            "mov {save}, rbx",
+            "cpuid",
+            "mov rbx, {save}",
+            save = out(reg) _,
+            inout("eax") 0x8000_0000_u32 => max_extended,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    if max_extended < 0x8000_0001 {
+        return false;
+    }
+    let edx: u32;
+    // SAFETY: as above; leaf 8000_0001h exists (checked).
+    unsafe {
+        asm!(
+            "mov {save}, rbx",
+            "cpuid",
+            "mov rbx, {save}",
+            save = out(reg) _,
+            inout("eax") 0x8000_0001_u32 => _,
+            out("ecx") _,
+            out("edx") edx,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    edx & (1 << 20) != 0
+}
+
+/// IA32_EFER.
+const EFER: u32 = 0xC000_0080;
+/// IA32_EFER.NXE: the NX bit in page-table entries is honoured (and is no longer reserved).
+const EFER_NXE: u64 = 1 << 11;
+/// CR0.WP: supervisor writes honour read-only pages.
+const CR0_WP: u64 = 1 << 16;
+
+/// Enables NX and supervisor write protection, then loads `root` into CR3.
+///
+/// # Safety
+///
+/// Call on the boot processor at CPL 0 with interrupts disabled, after checking
+/// [`nx_supported`]. `root` must be the PML4 of complete tables that map, with the right
+/// permissions, everything the kernel touches from here on: its code, its stack, its data,
+/// the boot info and the memory it allocates from, and the tables themselves.
+pub(crate) unsafe fn load_page_tables(root: u64) {
+    // SAFETY: the caller's contract. EFER is read and written back with only NXE added
+    // (NX is supported, so the bit is defined). WP only restricts supervisor writes to
+    // pages already marked read-only. Loading CR3 switches to tables the caller vouches
+    // for and flushes every non-global TLB entry.
+    unsafe {
+        asm!(
+            "mov ecx, {efer}",
+            "rdmsr",
+            "or eax, {nxe}",
+            "wrmsr",
+            "mov {tmp}, cr0",
+            "or {tmp}, {wp}",
+            "mov cr0, {tmp}",
+            "mov cr3, {root}",
+            efer = const EFER,
+            nxe = const EFER_NXE,
+            wp = const CR0_WP,
+            root = in(reg) root,
+            tmp = out(reg) _,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// The instruction address at which an armed probe expects a page fault, or 0.
+static PROBE_RIP: AtomicU64 = AtomicU64::new(0);
+/// CR2 recorded by the last probe fault.
+static PROBE_ADDRESS: AtomicU64 = AtomicU64::new(0);
+/// What the probe functions return when the access completed (no #PF error code is this).
+const COMPLETED: u64 = u64::MAX;
+
+/// `mov rax, -1; ret`: executed only if NX fails to stop the fetch, in which case the jump
+/// probe returns [`COMPLETED`]. It is writable data, so it must never be executable.
+static mut PROBE_CODE: [u8; 8] = [0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3];
+
+/// What a probe access did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Probe {
+    /// The access completed: the page allowed it.
+    Completed,
+    /// It raised #PF with this error code at this linear address (CR2).
+    Faulted {
+        /// The #PF error code (SDM Vol. 3A §4.7).
+        error: u64,
+        /// CR2.
+        address: u64,
+    },
+}
+
+/// Arms the probe for a fault at `fault_rip`, runs `access`, and disarms it.
+fn run_probe(fault_rip: u64, access: impl FnOnce() -> u64) -> Probe {
+    PROBE_RIP.store(fault_rip, Ordering::SeqCst);
+    let result = access();
+    PROBE_RIP.store(0, Ordering::SeqCst);
+    if result == COMPLETED {
+        Probe::Completed
+    } else {
+        Probe::Faulted {
+            error: result,
+            address: PROBE_ADDRESS.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// Reads the byte at `addr`.
+///
+/// # Safety
+///
+/// Reading `addr` must have no side effect if it succeeds: not MMIO.
+pub(crate) unsafe fn probe_read(addr: u64) -> Probe {
+    // SAFETY: the caller's contract; `read_byte` faults at its first instruction or reads
+    // one byte and returns.
+    run_probe((read_byte as *const ()).addr() as u64, || unsafe {
+        read_byte(addr)
+    })
+}
+
+/// Writes `value` to the byte at `addr`.
+///
+/// # Safety
+///
+/// `value` must be the byte already at `addr` and nothing may change it concurrently, so a
+/// write that completes changes nothing; `addr` must not be MMIO.
+pub(crate) unsafe fn probe_write(addr: u64, value: u8) -> Probe {
+    // SAFETY: the caller's contract; `write_byte` faults at its first instruction or
+    // stores `value` (unchanged memory) and returns.
+    run_probe((write_byte as *const ()).addr() as u64, || unsafe {
+        write_byte(addr, value)
+    })
+}
+
+/// Jumps into [`PROBE_CODE`], writable data, which NX must refuse to execute. Returns the
+/// probed address too.
+pub(crate) fn probe_execute_data() -> (u64, Probe) {
+    let target = (&raw const PROBE_CODE).addr() as u64;
+    // SAFETY: the fetch at `target` either faults (and resumes at `probe_recover`, which
+    // returns to this caller) or executes `PROBE_CODE`, which only sets RAX and returns.
+    let probe = run_probe(target, || unsafe { jump(target) });
+    (target, probe)
+}
+
+/// `movzx eax, byte ptr [rdi]` is the first instruction, so a fault has RIP = `read_byte`.
+#[unsafe(naked)]
+unsafe extern "sysv64" fn read_byte(_addr: u64) -> u64 {
+    naked_asm!("movzx eax, byte ptr [rdi]", "mov rax, -1", "ret");
+}
+
+/// `mov byte ptr [rdi], sil` is the first instruction, so a fault has RIP = `write_byte`.
+#[unsafe(naked)]
+unsafe extern "sysv64" fn write_byte(_addr: u64, _value: u8) -> u64 {
+    naked_asm!("mov byte ptr [rdi], sil", "mov rax, -1", "ret");
+}
+
+/// Jumps to `addr` with the caller's return address on the stack.
+#[unsafe(naked)]
+unsafe extern "sysv64" fn jump(_addr: u64) -> u64 {
+    naked_asm!("jmp rdi");
+}
+
+/// Where a probe fault resumes: the stack holds the probe caller's return address and RAX
+/// holds the error code, so `ret` returns the code to that caller.
+#[unsafe(naked)]
+extern "sysv64" fn probe_recover() {
+    naked_asm!("ret");
 }
 
 /// Saves the general-purpose registers, calls [`dispatch`] with a pointer to the frame,
