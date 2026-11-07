@@ -248,9 +248,24 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     i8042::init(&mut com1);
     // Networking groundwork: build and parse an ICMP echo through a loopback (CLAUDE.md §54).
     prove_net(&mut com1);
+    // TCP: a full connection over an in-memory loopback (CLAUDE.md §54).
+    prove_tcp(&mut com1);
 
     let _ = report::write_halt(&mut com1);
     halt()
+}
+
+/// Proves the TCP connection core on the heap: a loopback connection establishes,
+/// carries a payload and closes (CLAUDE.md §54).
+fn prove_tcp(com1: &mut console::Console) {
+    let payload = b"origin-os tcp loopback payload";
+    let ok = framekernel::tcp::loopback_demo(payload);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: tcp: loopback connection established, {}-byte payload delivered, and closed: {ok}{}",
+        payload.len(),
+        if ok { "" } else { ": tcp failed" }
+    );
 }
 
 /// Proves the network packet layer on the heap: builds an Ethernet/IPv4/ICMP echo request

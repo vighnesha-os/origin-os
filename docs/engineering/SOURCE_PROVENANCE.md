@@ -589,6 +589,16 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 5 `net` tests (the checksum and its streaming form, an IPv4 round trip with a corrupted-byte rejection and an options rejection, an ICMP echo build/parse/reply, ARP request/reply, and a full Ethernet/IPv4/ICMP loopback echo); 148 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** a NIC driver (so nothing is on a wire yet), TCP and UDP, IP fragmentation and options, routing, DHCP and DNS, and IPv6 (CLAUDE.md §54).
 
+### TCP: segments and a minimal connection state machine (CLAUDE.md §54; 2026-11-08)
+
+- **What:** `tcp` (library): TCP header parse/build with the IPv4 pseudo-header checksum, and a `Tcb` connection state machine (RFC 793 states). It drives the three-way handshake, one in-order data exchange and the FIN teardown, returning explicit outgoing segments (owning the send-sequence advance) and what to deliver. Pure, no `unsafe`.
+- **Scope, stated honestly:** the connection core only — no retransmission, congestion control, out-of-order reassembly, window scaling or options beyond ignoring them on receive. It establishes, carries ordered data and closes.
+- **Self-validating proofs:** a segment round-trips through build/parse with the pseudo-header checksum (which binds the IP addresses — parsing with the wrong addresses is rejected, as is a corrupted byte); `seq_len` counts SYN and FIN. `loopback_demo` connects two TCBs through an in-memory pipe: handshake to ESTABLISHED, A sends a payload B receives in full, A closes and B follows, ending with B CLOSED and A in teardown. No external vectors needed.
+- **Kernel proof** (every boot, on the heap): "tcp: loopback connection established, 30-byte payload delivered, and closed: true".
+- **Negative control** (failing the boot test): `connect` sends no SYN flag → the handshake never completes → "closed: false: tcp failed".
+- **Test evidence:** 4 `tcp` tests (segment round trip with checksum and address binding, `seq_len`, `loopback_demo` over several payload sizes, and the full establish/data/close loopback); 152 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** retransmission and timers, flow and congestion control, reassembly, the socket API and port demultiplexing, and moving segments over a real NIC.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.
