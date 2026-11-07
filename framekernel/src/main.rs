@@ -238,8 +238,60 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         sched::stop_boot_processor();
     }
 
+    // M8/M9 groundwork: the in-memory VFS (paths, directories, files).
+    prove_vfs(&mut com1);
+
     let _ = report::write_halt(&mut com1);
     halt()
+}
+
+/// Proves the in-memory VFS on the heap: builds a small tree, writes and reads a file
+/// through `..`, lists and removes, and checks the node count returns to the root alone
+/// (no leak). A failure in any step shows in the reported counts.
+fn prove_vfs(com1: &mut console::Console) {
+    use framekernel::vfs::{Kind, Vfs};
+    let mut fs = Vfs::new(1 << 20, 64);
+    let start = fs.node_count();
+    let steps = [
+        fs.mkdir_all("/etc/origin").is_ok(),
+        fs.create("/etc/origin/hostname").is_ok(),
+        fs.write(
+            "/etc/origin/hostname",
+            0,
+            b"origin-os
+",
+        )
+        .is_ok(),
+        fs.mkdir("/tmp").is_ok(),
+    ];
+    let mut buf = [0u8; 32];
+    let read = fs
+        .read("/etc/origin/../origin/hostname", 0, &mut buf)
+        .unwrap_or(0);
+    let content_ok = &buf[..read]
+        == b"origin-os
+";
+    let listed = fs.list("/etc/origin").unwrap_or_default();
+    let stat_dir = fs.stat("/etc").map(|s| s.kind) == Ok(Kind::Directory);
+    // Remove everything made, and check the tree is back to the root alone.
+    let removed = fs.remove("/etc/origin/hostname").is_ok()
+        && fs.remove("/etc/origin").is_ok()
+        && fs.remove("/etc").is_ok()
+        && fs.remove("/tmp").is_ok();
+    let leaked = fs.node_count() != start;
+    let ok = steps.iter().all(|&s| s)
+        && content_ok
+        && listed == ["hostname"]
+        && stat_dir
+        && removed
+        && !leaked;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: vfs: built /etc/origin/hostname (read back {content_ok}), listed {} entry, removed all back to {} node{}",
+        listed.len(),
+        fs.node_count(),
+        if ok { "" } else { ": vfs failed" }
+    );
 }
 
 /// A three-deep call chain whose innermost frame captures a backtrace; `#[inline(never)]`

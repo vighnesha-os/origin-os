@@ -36,7 +36,8 @@
 //! - [`serial`]: a polled 16550 UART driver over an abstract register interface;
 //! - [`report`]: the exact console text;
 //! - [`rtc`]: CMOS RTC decoding and UTC calendar arithmetic;
-//! - [`unwind`]: frame-pointer stack unwinding for panic diagnostics.
+//! - [`unwind`]: frame-pointer stack unwinding for panic diagnostics;
+//! - [`vfs`]: an in-memory virtual filesystem (paths, directories, files).
 //!
 //! The binary holds the entry point, x86 port I/O, the descriptor tables, exception and
 //! interrupt stubs, MSR access and fault probes (`src/cpu.rs`), the APIC timer bring-up
@@ -71,3 +72,4 @@ pub mod serial;
 #[cfg(test)]
 mod testing;
 pub mod unwind;
+pub mod vfs;

@@ -539,6 +539,17 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 5 `unwind` tests (a clean chain, the chain end, the capacity bound, a wild frame pointer, an unreadable word); 121 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** symbol names (addresses are printed for offline symbolization), DWARF `.eh_frame` unwinding for frame-pointer-less code, and a full crash dump (registers plus stack) to storage.
 
+### In-memory virtual filesystem (CLAUDE.md §39; M8/M9 groundwork; 2026-11-08)
+
+- **What:** `vfs` (library): a tree of directories and files in RAM, with the path handling and node operations the runtime and services will build on. Pure, no `unsafe`.
+  - `components` parses an absolute, `/`-separated, UTF-8 path, skipping empty parts, with `.`/`..` and a per-component length limit.
+  - `create`, `mkdir`, `mkdir_all`, `write` (grow and zero-fill a gap), `read` (offset and partial), `truncate`, `stat`, `list` (sorted), `remove` (a file or an empty directory; never the root). `resolve` follows `.` and `..` (the root's parent is itself). Distinct `FsError`s; a node and file-size limit; freed slots are reused and a failed create leaks nothing.
+  - No on-disk format is decided here: an on-disk filesystem (its own format ADR) will implement the same operations later.
+- **Proof** (every boot, on the heap): builds `/etc/origin/hostname`, writes and reads it back through a `..` path, lists the directory, stats it, removes everything, and checks the node count returns to the root alone (no leak).
+- **Negative control** (failing the boot test): a stray node left after the removals → "removed all back to 2 node: vfs failed".
+- **Test evidence:** 6 `vfs` tests, including path parsing at the length limit, offset/gap read-write, the error taxonomy, the node limit with slot reuse, and a 4000-operation deterministic workload kept consistent; 127 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** an on-disk filesystem and its format ADR, open-file handles and a current-directory, permissions and ownership, symbolic links, mmap, and wiring the VFS to system calls (ADR-0005) and the block cache.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.
