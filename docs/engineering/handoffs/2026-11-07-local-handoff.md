@@ -127,3 +127,13 @@ Start here next time: `docs/STATUS.md`, then `docs/engineering/TASKS.md`. The ne
 | ab4aaa6 | validated, fault-safe copy from user memory; a write system call (closed a kernel-memory leak found by its own test) |
 
 Final state at 20:20: `cargo xtask check` and `cargo xtask boot-matrix` pass; the working tree is clean; nothing pushed.
+
+### After the owner accepted ADR-0004 (20:21–20:35 IST)
+
+| Commit | What |
+|---|---|
+| 008008c | ADR-0004 accepted as proposed |
+| 226346a | `origin-paging`: the page-table library shared by loader and kernel |
+| ceccf62 | the higher-half kernel with KASLR (H1–H4), boot info 0.3 |
+
+**The kernel no longer runs identity-mapped.** RAM is at `direct_map_base + physical` (use `phys::to_virt`/`to_phys`), the image at `kernel_virtual_base`; the lower half is empty and belongs to user space. Next: per-process address spaces sharing the kernel half (M4), then H5 (global pages, PCIDs).
