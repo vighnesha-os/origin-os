@@ -83,6 +83,52 @@ impl WaitQueue {
         }
     }
 
+    /// As [`WaitQueue::wait_until`], but gives up when the monotonic clock reaches
+    /// `deadline` (nanoseconds) with the condition still false: `Err(TimedOut)`. The
+    /// deadline is kept to within one timer tick (10 ms).
+    pub(crate) fn wait_until_deadline(
+        &self,
+        condition: impl Fn() -> bool,
+        deadline: u64,
+    ) -> Result<u64, TimedOut> {
+        let me = sched::current_thread();
+        let mut blocked = 0;
+        loop {
+            let step = cpu::without_interrupts(|| {
+                let mut waiters = self.waiters.lock();
+                let done = condition();
+                if done || crate::time::monotonic_nanos() >= deadline {
+                    if let Some(slot) = waiters.iter_mut().find(|w| **w == me && me.is_some()) {
+                        *slot = None;
+                    }
+                    return Step::Finished(done);
+                }
+                let Some(thread) = me else {
+                    return Step::Poll;
+                };
+                if waiters.contains(&Some(thread)) {
+                    return Step::Block;
+                }
+                match waiters.iter_mut().find(|w| w.is_none()) {
+                    Some(free) => {
+                        *free = Some(thread);
+                        Step::Block
+                    }
+                    None => Step::Poll,
+                }
+            });
+            match step {
+                Step::Finished(true) => return Ok(blocked),
+                Step::Finished(false) => return Err(TimedOut),
+                Step::Block => {
+                    sched::block_until(deadline);
+                    blocked += 1;
+                }
+                Step::Poll => sched::yield_now(),
+            }
+        }
+    }
+
     /// Wakes one waiter, if there is one; returns whether there was.
     pub(crate) fn wake_one(&self) -> bool {
         let thread =
@@ -92,6 +138,18 @@ impl WaitQueue {
         }
         thread.is_some()
     }
+}
+
+/// A timed wait whose deadline passed with its condition still false.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TimedOut;
+
+/// What one round of a timed wait decided.
+enum Step {
+    /// The condition held (`true`), or the deadline passed (`false`).
+    Finished(bool),
+    Block,
+    Poll,
 }
 
 /// The ring the producer fills and the consumer drains.
@@ -196,6 +254,92 @@ extern "sysv64" fn ponger(_: u64) -> ! {
     sched::exit()
 }
 
+/// Nobody signals this queue: a timed wait on it can only time out.
+static NEVER: WaitQueue = WaitQueue::new();
+static NEVER_SET: AtomicBool = AtomicBool::new(false);
+/// Signalled by the boot flow, well before the second waiter's deadline.
+static SOON: WaitQueue = WaitQueue::new();
+static SOON_SET: AtomicBool = AtomicBool::new(false);
+/// Each timed waiter's result: milliseconds waited, plus 1 if it timed out, times 2
+/// (0: not finished).
+static TIMED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+const SHORT_MS: u64 = 50;
+const LONG_MS: u64 = 2000;
+
+extern "sysv64" fn timed_waiter(which: u64) -> ! {
+    let start = crate::time::monotonic_nanos();
+    let (queue, flag, ms) = if which == 0 {
+        (&NEVER, &NEVER_SET, SHORT_MS)
+    } else {
+        (&SOON, &SOON_SET, LONG_MS)
+    };
+    let result = queue.wait_until_deadline(|| flag.load(Ordering::Acquire), start + ms * 1_000_000);
+    let waited = (crate::time::monotonic_nanos() - start) / 1_000_000;
+    if let Some(slot) = TIMED.get(which as usize) {
+        slot.store(
+            2 * waited + u64::from(result.is_err()) + 2,
+            Ordering::Release,
+        );
+    }
+    FINISHED.fetch_add(1, Ordering::AcqRel);
+    sched::exit()
+}
+
+/// A timed wait that nobody ends must time out at its deadline (within two ticks), and one
+/// that is signalled first must return then, long before its deadline.
+fn prove_timed(com1: &mut Console, far: usize, tsc_hz: u64) -> bool {
+    let before = FINISHED.load(Ordering::Acquire);
+    let spawned = [
+        sched::spawn(far, timed_waiter, 0),
+        sched::spawn(far, timed_waiter, 1),
+    ];
+    if spawned.iter().any(Result::is_err) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: wait queues: cannot spawn: wait queues failed"
+        );
+        return false;
+    }
+    // Signal the second waiter after about 20 ms.
+    sched::yield_until(|| false, tsc_hz / 50, 1);
+    SOON_SET.store(true, Ordering::Release);
+    SOON.wake_one();
+    sched::yield_until(|| FINISHED.load(Ordering::Acquire) == before + 2, tsc_hz, 4);
+    let read = |i: usize| TIMED.get(i).map_or(0, |t| t.load(Ordering::Acquire));
+    let (short, long) = (read(0), read(1));
+    let finished = short != 0 && long != 0;
+    let (short_ms, short_timed_out) = (short.saturating_sub(2) / 2, short & 1 == 1);
+    let (long_ms, long_timed_out) = (long.saturating_sub(2) / 2, long & 1 == 1);
+    let ok = finished
+        && short_timed_out
+        && (SHORT_MS..=SHORT_MS + 30).contains(&short_ms)
+        && !long_timed_out
+        && long_ms < LONG_MS / 4;
+    if finished {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: wait queues: an unsignalled {SHORT_MS} ms timed wait timed out {short_timed_out} after {short_ms} ms; a {LONG_MS} ms timed wait signalled early returned in {long_ms} ms, timed out {long_timed_out}{}",
+            if ok { "" } else { ": wait queues failed" }
+        );
+    } else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: wait queues: timed waits did not return within 4 s (the {SHORT_MS} ms one {}, the {LONG_MS} ms one {}): wait queues failed",
+            if short == 0 {
+                "still waiting"
+            } else {
+                "returned"
+            },
+            if long == 0 {
+                "still waiting"
+            } else {
+                "returned"
+            }
+        );
+    }
+    ok
+}
+
 /// Proves the wait queues:
 /// - a producer on one processor sends [`ITEMS`] numbers through an 8-slot ring to a
 ///   consumer on another, each blocking when the ring is full or empty: every item must
@@ -271,5 +415,6 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -
             "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips did not finish within 5 s: wait queues failed"
         );
     }
-    transfer_ok && ping_ok
+    let timed_ok = prove_timed(com1, far, tsc_hz);
+    transfer_ok && ping_ok && timed_ok
 }

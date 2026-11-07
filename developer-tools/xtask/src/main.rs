@@ -217,6 +217,10 @@ fn boot_scenario_markers() -> Scenario {
             ", in order true, in ".into(),
             "origin-kernel: wait queues: ping-pong between CPU 0 and CPU ".into(),
             ": 1000 round trips, ".into(),
+            // Timed waits: one times out at its deadline, one is signalled first.
+            "origin-kernel: wait queues: an unsignalled 50 ms timed wait timed out true after ".into(),
+            "ms; a 2000 ms timed wait signalled early returned in ".into(),
+            " ms, timed out false".into(),
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             // M5 groundwork: PCIe through the MCFG, the ECAM window uncached, q35's
             // functions listed with their BARs sized and restored.

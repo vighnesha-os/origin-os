@@ -191,8 +191,11 @@ pub(crate) fn on_sleep(interrupted: u64, ticks: u64) -> u64 {
 
 /// `BLOCK_VECTOR`: the running thread blocks until [`wake`] (or goes on, if a wake-up is
 /// already pending).
-pub(crate) fn on_block(interrupted: u64) -> u64 {
-    with_queue(interrupted, |q| q.block(interrupted).ok())
+/// RDI holds the most ticks to wait (0: no limit).
+pub(crate) fn on_block(interrupted: u64, ticks: u64) -> u64 {
+    with_queue(interrupted, |q| {
+        q.block_for(interrupted, (ticks != 0).then_some(ticks)).ok()
+    })
 }
 
 /// `RESCHEDULE_VECTOR`: another processor made a thread here ready; switch now.
@@ -228,8 +231,21 @@ pub(crate) fn current_thread() -> Option<ThreadRef> {
 /// first. Use it through `wait::WaitQueue`, which makes sure the wake-up comes.
 pub(crate) fn block() {
     // SAFETY: as for `yield_now`; the handler saves and restores every register, and this
-    // context resumes here once it is woken.
-    unsafe { asm!("int 0x84") };
+    // context resumes here once it is woken. RDI 0: no time limit.
+    unsafe { asm!("int 0x84", in("rdi") 0u64) };
+}
+
+/// Nanoseconds per timer tick.
+const TICK_NANOS: u64 = 1_000_000_000 / crate::timer::HZ;
+
+/// As [`block`], but also returns once the monotonic clock reaches `deadline` (in
+/// nanoseconds), to within one timer tick (10 ms). The caller tells the two apart by
+/// checking what it waited for.
+pub(crate) fn block_until(deadline: u64) {
+    let left = deadline.saturating_sub(crate::time::monotonic_nanos());
+    let ticks = left.div_ceil(TICK_NANOS).max(1);
+    // SAFETY: as in `block`; RDI carries the tick limit and is restored.
+    unsafe { asm!("int 0x84", in("rdi") ticks) };
 }
 
 /// ICR level bit: assert (the only meaningful level for fixed IPIs).

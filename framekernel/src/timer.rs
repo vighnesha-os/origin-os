@@ -27,7 +27,7 @@ use crate::{inb, outb};
 /// Periodic timer rate for the proof. 10 ms periods tolerate an emulator's wake-up latency
 /// (QEMU's TCG coalesces timer expiries that a halted vCPU is late to take, which at 1 kHz
 /// showed as 100 interrupts in 125 ms on the development host).
-const HZ: u64 = 100;
+pub(crate) const HZ: u64 = 100;
 /// Interrupts to take.
 const PROOF_TICKS: u64 = 50;
 /// Calibration window.

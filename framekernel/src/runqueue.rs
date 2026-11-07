@@ -38,8 +38,8 @@ enum State {
     Ready,
     /// Asleep until this tick.
     Sleeping(u64),
-    /// Waiting for a [`RunQueue::wake`].
-    Blocked,
+    /// Waiting for a [`RunQueue::wake`], or until this tick if there is one.
+    Blocked(Option<u64>),
 }
 
 /// One CPU's run queue.
@@ -133,9 +133,11 @@ impl RunQueue {
         }
         let now = self.ticks;
         for s in &mut self.state {
-            if let State::Sleeping(until) = *s
-                && until <= now
-            {
+            let due = match *s {
+                State::Sleeping(until) | State::Blocked(Some(until)) => until <= now,
+                _ => false,
+            };
+            if due {
                 *s = State::Ready;
             }
         }
@@ -177,6 +179,13 @@ impl RunQueue {
     /// The running context blocks until [`RunQueue::wake`]. If a wake-up is already
     /// pending, it is consumed and the running context goes on (`interrupted` is returned).
     pub fn block(&mut self, interrupted: u64) -> Result<u64, QueueError> {
+        self.block_for(interrupted, None)
+    }
+
+    /// As [`RunQueue::block`], but the context also becomes ready after `ticks` timer ticks
+    /// (at least one) if no wake-up came first; `None` waits for ever. The caller tells the
+    /// two apart by checking what it waited for.
+    pub fn block_for(&mut self, interrupted: u64, ticks: Option<u64>) -> Result<u64, QueueError> {
         if self.current == 0 {
             return Err(QueueError::BootContext);
         }
@@ -186,8 +195,9 @@ impl RunQueue {
             *pending = false;
             return Ok(interrupted);
         }
+        let until = ticks.map(|t| self.ticks.saturating_add(t.max(1)));
         if let Some(s) = self.state.get_mut(self.current) {
-            *s = State::Blocked;
+            *s = State::Blocked(until);
         }
         Ok(self.switch(interrupted))
     }
@@ -201,7 +211,7 @@ impl RunQueue {
             return false;
         }
         match self.state.get(slot) {
-            Some(State::Blocked) => {
+            Some(State::Blocked(_)) => {
                 if let Some(s) = self.state.get_mut(slot) {
                     *s = State::Ready;
                 }
@@ -328,6 +338,40 @@ mod tests {
             "the pending wake-up is consumed at once"
         );
         assert_eq!(q.block(0xA300), Ok(0x1200), "the next block really blocks");
+    }
+
+    #[test]
+    fn a_timed_block_ends_at_its_deadline_or_at_a_wake_up() {
+        let mut q = RunQueue::new();
+        let slot = q.push(0xA000).unwrap();
+        let generation = q.generation(slot);
+        assert_eq!(q.tick(0x1000), 0xA000); // tick 1
+        assert_eq!(
+            q.block_for(0xA100, Some(3)),
+            Ok(0x1000),
+            "blocked until tick 4"
+        );
+        assert_eq!(q.tick(0x1100), 0x1100); // tick 2
+        assert_eq!(q.tick(0x1200), 0x1200); // tick 3
+        assert_eq!(q.tick(0x1300), 0xA100, "tick 4: the deadline passed");
+        assert!(
+            !q.wake(slot, generation),
+            "running again: a late wake-up is only kept"
+        );
+        assert_eq!(
+            q.block_for(0xA200, Some(100)),
+            Ok(0xA200),
+            "and consumed by the next block"
+        );
+        assert_eq!(q.block_for(0xA300, Some(100)), Ok(0x1300));
+        assert!(q.wake(slot, generation), "a wake-up before the deadline");
+        assert_eq!(q.tick(0x1400), 0xA300);
+        assert_eq!(
+            q.block_for(0xA400, Some(0)),
+            Ok(0x1400),
+            "zero ticks still waits one"
+        );
+        assert_eq!(q.tick(0x1500), 0xA400);
     }
 
     #[test]

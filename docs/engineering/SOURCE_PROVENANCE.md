@@ -357,7 +357,12 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - No reschedule IPI: the transfer slows from 19 to 180 ms, and the ping-pong does not finish within 5 s (a woken thread waits for its processor's next 10 ms tick).
   - No pending wake-ups: a wake-up is lost and the transfer stalls at 6202 of 10 000 items. So the race between registering and blocking really happens even in QEMU, and the pending-wake rule is what closes it.
 - **Test evidence:** 2 new run-queue tests (blocking and waking; a stale generation and the boot context refused); `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
-- **Not done:** timed waits (a deadline on the monotonic clock), priority inheritance, the user-visible waiting of ADR-0005 P9, and Loom models of the protocol.
+- **Timed waits (added later the same day):**
+  - A blocked slot may carry a deadline tick, and the tick that reaches it makes the thread ready. `sched::block_until` converts a monotonic-clock deadline into ticks (RDI of the block request), and `WaitQueue::wait_until_deadline` returns `TimedOut` once the deadline passes with the condition still false.
+  - Proof: an unsignalled 50 ms wait timed out after 57–58 ms, and a 2 s wait signalled after about 20 ms returned in 8–19 ms, not timed out (1, 2 and 4 CPUs).
+  - Control: deadlines ignored by the run queue → the 50 ms wait never returns → "wait queues failed".
+  - One new run-queue test covers a deadline, a wake-up before it, a late wake-up kept, and the one-tick minimum.
+- **Not done:** sub-tick deadlines (TSC-deadline one-shot timers), priority inheritance, the user-visible waiting of ADR-0005 P9, and Loom models of the protocol.
 
 ### PCI Express enumeration (M5 groundwork; CLAUDE.md §32; 2026-11-07)
 

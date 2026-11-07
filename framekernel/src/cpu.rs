@@ -541,7 +541,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         return crate::sched::on_exit(here);
     }
     if frame.vector == u64::from(BLOCK_VECTOR) {
-        return crate::sched::on_block(here);
+        return crate::sched::on_block(here, frame.rdi);
     }
     if frame.vector == u64::from(SYSCALL_VECTOR) {
         match frame.rax {
