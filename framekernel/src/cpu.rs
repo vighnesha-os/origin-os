@@ -198,6 +198,66 @@ unsafe fn load_tables(tables: *mut CpuTables) {
     // in the kernel code segment just loaded.
     unsafe { asm!("lidt [{idt}]", idt = in(reg) &raw const idt_ptr, options(nostack)) };
     let _ = TSS_SIZE; // the limit is encoded by `tss_descriptor`
+    // GS was just reloaded (base 0): point it at this processor's CPU-local area.
+    init_cpu_local();
+}
+
+/// Processors with a CPU-local area, indexed by x2APIC ID.
+const MAX_LOCAL: usize = 64;
+/// IA32_GS_BASE: the base of GS in 64-bit mode.
+const GS_BASE: u32 = 0xC000_0101;
+
+/// One processor's CPU-local area, reached through GS. A cache line each, so processors
+/// never share one.
+#[repr(C, align(64))]
+struct CpuLocal {
+    /// This processor's x2APIC ID (offset 0, read by [`cpu_id`]).
+    id: AtomicU64,
+}
+
+static CPU_LOCAL: [CpuLocal; MAX_LOCAL] = [const {
+    CpuLocal {
+        id: AtomicU64::new(0),
+    }
+}; MAX_LOCAL];
+/// The area of a processor whose ID is too large for [`CPU_LOCAL`]: its ID reads as
+/// `u64::MAX`, which no queue accepts, so it never schedules.
+static OUT_OF_RANGE: CpuLocal = CpuLocal {
+    id: AtomicU64::new(u64::MAX),
+};
+
+/// This processor's x2APIC ID from CPUID (leaf 0Bh EDX, else leaf 1 EBX bits 31:24), which
+/// does not depend on the local APIC's mode.
+pub(crate) fn cpuid_apic_id() -> u32 {
+    if cpuid(0)[0] >= 0xB {
+        cpuid(0xB)[3]
+    } else {
+        cpuid(1)[1] >> 24
+    }
+}
+
+/// Points IA32_GS_BASE at this processor's [`CpuLocal`].
+fn init_cpu_local() {
+    let id = cpuid_apic_id() as usize;
+    let local = match CPU_LOCAL.get(id) {
+        Some(local) => {
+            local.id.store(id as u64, Ordering::Relaxed);
+            local
+        }
+        None => &OUT_OF_RANGE,
+    };
+    // SAFETY: CPL 0 (every caller loads descriptor tables); IA32_GS_BASE exists on every
+    // x86-64 processor and only sets GS's base, which only `cpu_id` uses.
+    unsafe { wrmsr(GS_BASE, ptr::from_ref(local).addr() as u64) };
+}
+
+/// This processor's x2APIC ID: one GS-relative load from its CPU-local area.
+pub(crate) fn cpu_id() -> u64 {
+    let id: u64;
+    // SAFETY: `load_tables` set GS's base to a live `CpuLocal` on every processor before
+    // any code that calls this runs, and offset 0 is its `id`, a `u64`.
+    unsafe { asm!("mov {}, gs:[0]", out(reg) id, options(nostack, readonly, preserves_flags)) };
+    id
 }
 
 /// Software interrupt a kernel thread raises to yield the processor.

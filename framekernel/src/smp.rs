@@ -183,6 +183,14 @@ pub(crate) fn start(
     let lapic = unsafe { X2Apic::enable() };
     let bsp = lapic.read(ApicRead::Id) as u32;
     let mut online = Online::one(bsp);
+    if cpu::cpu_id() != u64::from(bsp) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: the CPU-local area names CPU {}, not {bsp}: AP start-up failed",
+            cpu::cpu_id()
+        );
+        return online;
+    }
     let mut cpus = [Processor::default(); MAX_CPUS];
     let count = match discover(info.acpi_rsdp, &mut cpus) {
         Ok(n) => n,
@@ -405,7 +413,14 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     // SAFETY: CPL 0, this AP only, interrupts disabled, x2APIC supported, and the spurious
     // vector has a gate in the shared IDT.
     let lapic = unsafe { X2Apic::enable() };
-    let answer = (lapic.read(ApicRead::Id) as u32).wrapping_add(1);
+    let id = lapic.read(ApicRead::Id);
+    // The CPU-local area (GS) must name this processor, or its scheduler would use another
+    // processor's queue: answer with a value the boot processor rejects.
+    let answer = if cpu::cpu_id() == id {
+        (id as u32).wrapping_add(1)
+    } else {
+        u32::MAX - 1
+    };
     start.online.store(answer, Ordering::Release);
     // M3: this processor's scheduler.
     crate::sched::run_ap(&lapic)

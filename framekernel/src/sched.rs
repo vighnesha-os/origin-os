@@ -42,11 +42,9 @@ static ACTIVE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_C
 /// Set by the boot processor once every AP's threads are queued.
 static GO: AtomicBool = AtomicBool::new(false);
 
-/// This processor's x2APIC ID, as a queue index.
+/// This processor's x2APIC ID, as a queue index (from its GS-based CPU-local area).
 fn this_cpu() -> usize {
-    // SAFETY: only called where x2APIC mode is on (timer interrupts and code after the
-    // timer bring-up); the ID register has no read side effect.
-    (unsafe { cpu::rdmsr(framekernel::apic::X2APIC_ID) }) as usize
+    usize::try_from(cpu::cpu_id()).unwrap_or(usize::MAX)
 }
 
 /// Runs `f` with interrupts disabled on this processor, restoring the previous state.
@@ -342,6 +340,40 @@ extern "sysv64" fn sleeper(_: u64) -> ! {
     exit()
 }
 
+/// Tells the benchmark threads to exit.
+static BENCH_STOP: AtomicBool = AtomicBool::new(false);
+/// Yield round trips the boot flow makes in the benchmark (each passes two threads).
+const BENCH_ROUNDS: u64 = 2000;
+
+/// Yields until [`BENCH_STOP`], then exits.
+extern "sysv64" fn bencher(_: u64) -> ! {
+    while !BENCH_STOP.load(Ordering::Relaxed) {
+        yield_now();
+    }
+    FINISHED.fetch_add(1, Ordering::Relaxed);
+    exit()
+}
+
+/// TSC cycles per context switch: the boot flow and two threads that only yield, so each
+/// boot-flow yield is three switches (boot → A → B → boot).
+fn measure_switch(bsp: usize) -> Option<u64> {
+    let before = FINISHED.load(Ordering::Relaxed);
+    spawn(bsp, bencher, 0).ok()?;
+    spawn(bsp, bencher, 1).ok()?;
+    yield_now(); // let both start
+    let start = rdtsc();
+    for _ in 0..BENCH_ROUNDS {
+        yield_now();
+    }
+    let cycles = rdtsc().wrapping_sub(start);
+    BENCH_STOP.store(true, Ordering::Relaxed);
+    while FINISHED.load(Ordering::Relaxed) < before + 2 {
+        yield_now();
+    }
+    reap();
+    Some(cycles / (3 * BENCH_ROUNDS))
+}
+
 /// Exits at once.
 extern "sysv64" fn quitter(_: u64) -> ! {
     FINISHED.fetch_add(1, Ordering::Relaxed);
@@ -398,6 +430,13 @@ fn prove_lifecycle(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool 
         tsc_hz,
         1,
     );
+    if let Some(cycles) = measure_switch(bsp) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: scheduler: {cycles} TSC cycles ({} ns) per context switch, yield ping-pong of 3 contexts",
+            cycles * 1_000_000_000 / tsc_hz.max(1)
+        );
+    }
     let alternations = ALTERNATIONS.load(Ordering::Relaxed);
     let slept = SLEPT.load(Ordering::Relaxed).saturating_sub(1);
     let ok = alternations >= 2 * TURNS - 5
