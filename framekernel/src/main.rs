@@ -1102,6 +1102,22 @@ pub(crate) unsafe fn inb(port: u16) -> u8 {
     value
 }
 
+/// Reads a 32-bit value from I/O port `port`.
+///
+/// # Safety
+///
+/// As for [`inb`]: CPL 0 (or I/O permission), and a register this code owns whose read
+/// cannot affect memory safety.
+pub(crate) unsafe fn ind(port: u16) -> u32 {
+    let value: u32;
+    // SAFETY: the caller's contract. `in eax, dx` writes only `eax`, reads no memory, needs
+    // no stack and leaves the flags unchanged.
+    unsafe {
+        asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     if !PANICKING.swap(true, Ordering::AcqRel) {

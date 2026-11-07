@@ -242,6 +242,7 @@ pub(crate) fn init(com1: &mut Console, calibrated_hz: u64, rsdp: u64) -> bool {
     }
     ok &= set_wall_clock(com1, scale, edge, century, rtc_present);
     ok &= prove_hpet(com1, rsdp, scale);
+    ok &= prove_pm_timer(com1, rsdp, scale);
     ok
 }
 
@@ -325,6 +326,53 @@ fn prove_hpet(com1: &mut Console, rsdp: u64, scale: Scale) -> bool {
         hpet_nanos / 1_000_000,
         tsc_nanos / 1_000_000,
         if agree { "" } else { ": HPET failed" }
+    );
+    agree
+}
+
+/// Cross-checks the ACPI power-management timer (a 3.579545 MHz counter at a fixed I/O
+/// port, from the FADT) against the TSC, like the HPET (CLAUDE.md §68). No PM timer is
+/// reported and passes.
+fn prove_pm_timer(com1: &mut Console, rsdp: u64, scale: Scale) -> bool {
+    let fadt = crate::firmware::acpi_table(rsdp, b"FACP")
+        .ok()
+        .and_then(|t| acpi::parse_fadt(t).ok());
+    let Some((port, wide)) = fadt.map(|f| (f.pm_timer_port, f.pm_timer_32bit)) else {
+        let _ = writeln!(com1, "origin-kernel: PM timer: no FADT");
+        return true;
+    };
+    let Some(port) = port else {
+        let _ = writeln!(com1, "origin-kernel: PM timer: the FADT provides none");
+        return true;
+    };
+    let mask: u32 = if wide { 0xFFFF_FFFF } else { 0x00FF_FFFF };
+    let read = || {
+        // SAFETY: CPL 0, boot processor; `port` is the FADT's PM_TMR_BLK, a read-only
+        // 32-bit timer port that cannot affect memory.
+        (unsafe { crate::ind(port) }) & mask
+    };
+    let c0 = read();
+    let t0 = rdtsc();
+    let window = scale.hz() / 50; // ~20 ms
+    while rdtsc().wrapping_sub(t0) < window {
+        core::hint::spin_loop();
+    }
+    let c1 = read();
+    let t1 = rdtsc();
+    let pm_ticks = c1.wrapping_sub(c0) & mask; // handles a single wrap
+    let pm_nanos =
+        u64::try_from(u128::from(pm_ticks) * 1_000_000_000 / u128::from(acpi::PM_TIMER_HZ))
+            .unwrap_or(u64::MAX);
+    let tsc_nanos = scale.nanos(t1.wrapping_sub(t0));
+    let advanced = pm_ticks != 0;
+    let agree = advanced && hpet::agree(pm_nanos, tsc_nanos, 20);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: PM timer: {}-bit at port {port:#x}, 3.579545 MHz; {} ms elapsed by the PM timer, {} ms by the TSC{}",
+        if wide { 32 } else { 24 },
+        pm_nanos / 1_000_000,
+        tsc_nanos / 1_000_000,
+        if agree { "" } else { ": PM timer failed" }
     );
     agree
 }

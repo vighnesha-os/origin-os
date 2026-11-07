@@ -148,12 +148,23 @@ pub struct Fadt {
     pub century: Option<u8>,
     /// `IAPC_BOOT_ARCH` (offset 109) bit 5: the platform has no CMOS RTC.
     pub cmos_rtc_absent: bool,
+    /// The ACPI power-management timer's I/O port (`PM_TMR_BLK`, offset 76), if the
+    /// firmware provides one (nonzero and `PM_TMR_LEN` is 4).
+    pub pm_timer_port: Option<u16>,
+    /// Whether the PM timer is 32-bit (`FADT.flags` bit 8, `TMR_VAL_EXT`); else 24-bit.
+    pub pm_timer_32bit: bool,
 }
 
 /// Offset of the FADT's `CENTURY` byte.
 const FADT_CENTURY: usize = 108;
 /// Offset of the FADT's 16-bit `IAPC_BOOT_ARCH` flags.
 const FADT_IAPC_BOOT_ARCH: usize = 109;
+/// Offset of `PM_TMR_BLK` (the PM timer's 32-bit I/O port address).
+const FADT_PM_TMR_BLK: usize = 76;
+/// Offset of `PM_TMR_LEN`.
+const FADT_PM_TMR_LEN: usize = 91;
+/// Offset of the `FADT.flags` dword; bit 8 is `TMR_VAL_EXT` (a 32-bit PM timer).
+const FADT_FLAGS: usize = 112;
 /// `IAPC_BOOT_ARCH` bit 5: CMOS RTC not present.
 const CMOS_RTC_NOT_PRESENT: u16 = 1 << 5;
 
@@ -169,11 +180,21 @@ pub fn parse_fadt(fadt: &[u8]) -> Result<Fadt, AcpiError> {
         arch.first().copied().unwrap_or(0),
         arch.get(1).copied().unwrap_or(0),
     ]);
+    let pm_tmr_blk = u32_at(fadt, FADT_PM_TMR_BLK).ok_or_else(short)?;
+    let pm_tmr_len = *fadt.get(FADT_PM_TMR_LEN).ok_or_else(short)?;
+    let flags = u32_at(fadt, FADT_FLAGS).ok_or_else(short)?;
+    let pm_timer_port =
+        (pm_tmr_len == 4 && pm_tmr_blk != 0 && pm_tmr_blk <= 0xFFFF).then_some(pm_tmr_blk as u16);
     Ok(Fadt {
         century: (0x0E..=0x7F).contains(&century).then_some(century),
         cmos_rtc_absent: arch & CMOS_RTC_NOT_PRESENT != 0,
+        pm_timer_port,
+        pm_timer_32bit: flags & (1 << 8) != 0,
     })
 }
+
+/// The ACPI PM timer's fixed frequency (ACPI 6.6 §4.8.3.3).
+pub const PM_TIMER_HZ: u64 = 3_579_545;
 
 /// One processor the MADT lists.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -478,17 +499,18 @@ mod tests {
             body[FADT_CENTURY - 36] = century;
             body[FADT_IAPC_BOOT_ARCH - 36..FADT_IAPC_BOOT_ARCH - 34]
                 .copy_from_slice(&arch.to_le_bytes());
+            body[FADT_PM_TMR_BLK - 36..FADT_PM_TMR_BLK - 32]
+                .copy_from_slice(&0x0608u32.to_le_bytes());
+            body[FADT_PM_TMR_LEN - 36] = 4;
+            body[FADT_FLAGS - 36..FADT_FLAGS - 32].copy_from_slice(&(1u32 << 8).to_le_bytes());
             table(b"FACP", &body)
         };
         let qemu = fadt(0x32, 0);
         assert_eq!(check_table(&qemu, b"FACP"), Ok(()));
-        assert_eq!(
-            parse_fadt(&qemu),
-            Ok(Fadt {
-                century: Some(0x32),
-                cmos_rtc_absent: false
-            })
-        );
+        let f = parse_fadt(&qemu).unwrap();
+        assert_eq!((f.century, f.cmos_rtc_absent), (Some(0x32), false));
+        assert_eq!(f.pm_timer_port, Some(0x0608), "PM_TMR_BLK from the fixture");
+        assert!(f.pm_timer_32bit, "the fixture sets TMR_VAL_EXT");
         for unusable in [0x00, 0x0B, 0x0D, 0x80, 0xFF] {
             assert_eq!(
                 parse_fadt(&fadt(unusable, 0)).unwrap().century,
@@ -499,8 +521,9 @@ mod tests {
         assert_eq!(parse_fadt(&fadt(0x0E, 0)).unwrap().century, Some(0x0E));
         assert!(parse_fadt(&fadt(0x32, 1 << 5)).unwrap().cmos_rtc_absent);
         assert!(!parse_fadt(&fadt(0x32, !(1 << 5))).unwrap().cmos_rtc_absent);
-        assert_eq!(parse_fadt(&qemu[..110]), Err(AcpiError::Length(110)));
-        assert!(parse_fadt(&qemu[..111]).is_ok());
+        // The flags dword ends at offset 116, so a shorter table is refused.
+        assert_eq!(parse_fadt(&qemu[..115]), Err(AcpiError::Length(115)));
+        assert!(parse_fadt(&qemu[..116]).is_ok());
     }
 
     /// Random firmware tables never panic the parsers, and anything accepted is

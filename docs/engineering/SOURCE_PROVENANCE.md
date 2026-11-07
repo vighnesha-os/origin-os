@@ -630,6 +630,14 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 7 `acpi` tests (I/O APIC and overrides among them) and 3 `ioapic` tests; 163 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** routing the keyboard IRQ1 to a handler for live keystrokes (the i8042 bring-up is done; this is the remaining link), level-triggered PCI INTx routing, per-CPU interrupt affinity and balancing, and an EOI path for the I/O APIC's own remote-IRR on level interrupts.
 
+### The ACPI PM timer: a second time-source cross-check (CLAUDE.md §68; 2026-11-08)
+
+- **What:** `acpi::parse_fadt` extended to read `PM_TMR_BLK` (the PM timer's I/O port, accepted when `PM_TMR_LEN` is 4) and the `TMR_VAL_EXT` flag (24- vs 32-bit counter); `acpi::PM_TIMER_HZ` (3.579545 MHz). `time::prove_pm_timer` reads the counter across a TSC-timed window and requires the PM-timer-measured and TSC-measured elapsed times to agree within 2 %. A new `ind` (32-bit `in`) port helper.
+- **Proof** (every boot): "PM timer: 24-bit at port 0x608, 3.579545 MHz; 20 ms elapsed by the PM timer, 20 ms by the TSC". QEMU's PM timer is a 24-bit counter at 0x608; the kernel masks the single wrap and the two clocks agree. This is now the third independent clock the kernel validates against the TSC (the RTC second, the HPET, the PM timer).
+- **Negative control** (failing the boot test): the second counter read forced equal to the first → "0 ms elapsed by the PM timer, 20 ms by the TSC: PM timer failed".
+- **Test evidence:** the `acpi` FADT test checks the new fields; 163 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** using the PM timer as the wall-clock reference when the TSC is not invariant, and handling the PM timer's overflow interrupt.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.
