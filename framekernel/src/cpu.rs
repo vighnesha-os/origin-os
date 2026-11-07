@@ -220,12 +220,19 @@ struct CpuLocal {
     id: AtomicU64,
     /// Address of this processor's TSS (offset 8, used by [`set_kernel_stack`]).
     tss: AtomicU64,
+    /// The running thread's kernel stack top (offset 16), the stack `syscall_entry`
+    /// switches to; kept equal to TSS.RSP0.
+    kernel_stack: AtomicU64,
+    /// Scratch for the user RSP during `syscall_entry` (offset 24).
+    user_rsp: AtomicU64,
 }
 
 static CPU_LOCAL: [CpuLocal; MAX_LOCAL] = [const {
     CpuLocal {
         id: AtomicU64::new(0),
         tss: AtomicU64::new(0),
+        kernel_stack: AtomicU64::new(0),
+        user_rsp: AtomicU64::new(0),
     }
 }; MAX_LOCAL];
 /// The area of a processor whose ID is too large for [`CPU_LOCAL`]: its ID reads as
@@ -233,6 +240,8 @@ static CPU_LOCAL: [CpuLocal; MAX_LOCAL] = [const {
 static OUT_OF_RANGE: CpuLocal = CpuLocal {
     id: AtomicU64::new(u64::MAX),
     tss: AtomicU64::new(0),
+    kernel_stack: AtomicU64::new(0),
+    user_rsp: AtomicU64::new(0),
 };
 
 /// This processor's x2APIC ID from CPUID (leaf 0Bh EDX, else leaf 1 EBX bits 31:24), which
@@ -259,6 +268,58 @@ fn init_cpu_local(tss: u64) {
     // SAFETY: CPL 0 (every caller loads descriptor tables); IA32_GS_BASE exists on every
     // x86-64 processor and only sets GS's base, which only `cpu_id` uses.
     unsafe { wrmsr(GS_BASE, ptr::from_ref(local).addr() as u64) };
+    init_syscall();
+}
+
+/// IA32_STAR, IA32_LSTAR and IA32_FMASK.
+const STAR: u32 = 0xC000_0081;
+const LSTAR: u32 = 0xC000_0082;
+const FMASK: u32 = 0xC000_0084;
+/// RFLAGS bits SYSCALL clears: TF, IF, DF, NT and AC. With IF clear, no interrupt can
+/// arrive before `syscall_entry` has left the user stack.
+const SYSCALL_FMASK: u64 = 0x4_4700;
+
+/// Enables SYSCALL (EFER.SCE) with `syscall_entry` as its target. STAR's kernel base 0x08
+/// gives CS 0x08 and SS 0x10 on entry; its user base 0x20 would give SYSRET CS 0x33 and
+/// SS 0x2B, the user segments, although the kernel returns with IRETQ for now.
+fn init_syscall() {
+    let star = (0x20_u64 << 48) | (u64::from(KERNEL_CODE) << 32);
+    // SAFETY: CPL 0; these MSRs exist on every x86-64 processor; the values configure
+    // only the SYSCALL instruction, whose target is the kernel's own entry stub.
+    let efer = unsafe { rdmsr(EFER) };
+    // SAFETY: as above; EFER.SCE (bit 0) only enables SYSCALL/SYSRET.
+    unsafe { wrmsr(EFER, efer | 1) };
+    // SAFETY: as above.
+    unsafe { wrmsr(STAR, star) };
+    // SAFETY: as above.
+    unsafe { wrmsr(LSTAR, (syscall_entry as *const ()).addr() as u64) };
+    // SAFETY: as above.
+    unsafe { wrmsr(FMASK, SYSCALL_FMASK) };
+}
+
+/// The SYSCALL target: switches from the user stack to the running thread's kernel stack
+/// (from the CPU-local area; interrupts are off, SFMASK cleared IF), builds the frame an
+/// interrupt from user mode would have pushed (SS, RSP, RFLAGS from R11, CS, RIP from RCX)
+/// with vector [`SYSCALL_VECTOR`], and joins the common path, so system calls by `syscall`
+/// and by `int 0x80` are handled identically and return with IRETQ.
+#[unsafe(naked)]
+extern "sysv64" fn syscall_entry() {
+    naked_asm!(
+        "mov gs:[24], rsp",
+        "mov rsp, gs:[16]",
+        "push {ss}",
+        "push qword ptr gs:[24]",
+        "push r11",
+        "push {cs}",
+        "push rcx",
+        "push 0",
+        "push {vector}",
+        "jmp {common}",
+        ss = const d::USER_DATA,
+        cs = const d::USER_CODE,
+        vector = const SYSCALL_VECTOR,
+        common = sym exception_common,
+    );
 }
 
 /// Address of this processor's CPU-local area (the value IA32_GS_BASE holds).
@@ -281,6 +342,9 @@ pub(crate) fn set_kernel_stack(top: u64) {
         return;
     }
     let field = ptr::with_exposed_provenance_mut::<u32>(tss as usize + d::TSS_RSP0_OFFSET);
+    if let Some(l) = CPU_LOCAL.get(local) {
+        l.kernel_stack.store(top, Ordering::Relaxed);
+    }
     // SAFETY: `tss` is this processor's TSS (recorded by `init_cpu_local`), live for ever
     // and written only by this processor; RSP0 is two `u32` words at byte 4, 4-aligned.
     unsafe { field.write_volatile(top as u32) };

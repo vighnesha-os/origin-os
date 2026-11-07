@@ -161,6 +161,7 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: user mode: privileged instruction: reported Some(9), ended by vector 13 (error 0x0); kernel carries on".into(),
             "origin-kernel: user mode: two compute-bound user threads at once finished in ".into(),
             "reports 0b110; kernel stack follows every switch".into(),
+            "origin-kernel: user mode: syscall instruction: reported Some(77), exited with Some(0)".into(),
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],

@@ -81,6 +81,13 @@ fn programs(kernel_address: u64) -> [(usize, alloc::vec::Vec<u8>); 3] {
     [(0x000, good), (0x100, reader), (0x200, privileged)]
 }
 
+/// The same as the good program, but with the `syscall` instruction (at offset 0x400):
+/// mov edi, 77; mov eax, 1; syscall; xor edi, edi; xor eax, eax; syscall; jmp $.
+const SYSCALLER: [u8; 22] = [
+    0xBF, 77, 0, 0, 0, 0xB8, 1, 0, 0, 0, 0x0F, 0x05, 0x31, 0xFF, 0x31, 0xC0, 0x0F, 0x05, 0xEB,
+    0xFE, 0x90, 0x90,
+];
+
 /// Iterations of the compute-bound programs: long enough to be preempted many times.
 const SPIN: u32 = 40_000_000;
 
@@ -118,6 +125,26 @@ extern "sysv64" fn user_thread(entry: u64) -> ! {
         }
         None => sched::exit(),
     }
+}
+
+/// The `syscall` instruction reaches the same system calls as `int 0x80`.
+fn by_syscall(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool {
+    REPORTED.store(0, Ordering::Relaxed);
+    EXIT_CODE.store(0, Ordering::Relaxed);
+    let ended = ENDED.load(Ordering::Acquire);
+    if sched::spawn(bsp, user_thread, CODE + 0x400).is_err() {
+        return false;
+    }
+    sched::yield_until(|| ENDED.load(Ordering::Acquire) > ended, tsc_hz, 2);
+    let reported = REPORTED.load(Ordering::Relaxed).checked_sub(1);
+    let exited = EXIT_CODE.load(Ordering::Relaxed).checked_sub(1);
+    let right = reported == Some(77) && exited == Some(0);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: user mode: syscall instruction: reported {reported:?}, exited with {exited:?}{}",
+        if right { "" } else { ": user isolation failed" }
+    );
+    right
 }
 
 /// Two compute-bound user threads at once, preempted by the timer: both must finish with
@@ -178,6 +205,14 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool
             );
         }
     }
+    // SAFETY: the program is 22 bytes at offset 0x400 of the code frame.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            SYSCALLER.as_ptr(),
+            code.wrapping_add(0x400),
+            SYSCALLER.len(),
+        )
+    };
     let mapped = vm::map_user(CODE, code.expose_provenance() as u64, Access::ReadExecute)
         .and_then(|()| vm::map_user(STACK, stack.expose_provenance() as u64, Access::ReadWrite));
     let mut ok = mapped.is_ok();
@@ -225,6 +260,9 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool
     }
     if ok {
         ok &= concurrent(com1, bsp, tsc_hz);
+    }
+    if ok {
+        ok &= by_syscall(com1, bsp, tsc_hz);
     }
     let _ = vm::unmap(CODE);
     let _ = vm::unmap(STACK);
