@@ -11,12 +11,13 @@
 //! The order a loader follows (ONBF-R1):
 //! 1. `Image::parse`;
 //! 2. `verify_content_digest`;
-//! 3. verify the signatures (not yet implemented);
+//! 3. verify the signatures: [`signature::SignatureBlock::parse`] (structure, encodings
+//!    S1–S4), then the verifier checks both signatures with `origin-crypto` (not yet wired);
 //! 4. `Section::verify_sha256` on the manifest;
 //! 5. `KrnManifest::decode`;
 //! 6. `KrnManifest::check_against`.
 //!
-//! The signature block (§7.1) and Merkle verification (§4.6, crate `onbf-merkle`) are
+//! Signature *verification* and Merkle verification (§4.6, crate `onbf-merkle`) are
 //! separate layers.
 //!
 //! Parser contract (ONBF §12): `no_std`, no allocation, no `unsafe`, no panics, typed
@@ -51,6 +52,7 @@ mod manifest;
 pub mod ocbor;
 mod read;
 mod section;
+pub mod signature;
 
 pub use error::{Error, SectionError};
 pub use header::{
@@ -68,3 +70,5 @@ pub use section::{
 mod tests;
 #[cfg(test)]
 mod tests_ocbor;
+#[cfg(test)]
+mod tests_signature;

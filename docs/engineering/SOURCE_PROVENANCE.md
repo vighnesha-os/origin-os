@@ -357,6 +357,12 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - Not done yet: fuzzing (§13 item 3), Kani bounds (item 5) and the N-version check (item 6).
 - **Licensing:** project licence not chosen yet.
 
+### Signature-block parser (ONBF §7.1–§7.2, encodings S1–S4), added 2026-11-07
+
+- **What:** `signature::SignatureBlock::parse`: "ONBFSIG1", version 1, 1–8 length-prefixed entries; each entry a canonical OCBOR-1 map with exactly keys 1–7 (key 8, the transparency-log proof, is refused in v1); role 1–5 (S1) with its FIPS 204 context string from a table; suite 1–2 (S2), fixed by the role (kernel and release need OSS-1R); 32-byte key ID; the certificate array kept raw for the chain verifier; the statement as a map with exactly keys 0–6 (S3), whose exact encoded bytes are returned for the signatures; 64-byte Ed25519 and suite-length ML-DSA signatures; the statement's role must equal the entry's; no (role, key) twice. Verification (digest, both signatures, chain) is not wired yet.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-07, right after the owner decided S1–S4. Original code.
+- **Test evidence:** 6 tests: a two-entry block with the exact statement bytes; framing (magic, version, counts 0 and 9, truncation, trailing data, every strict prefix); each entry rule; each statement rule; duplicates and a non-minimal integer head; every single-bit flip of a valid block is refused or reads a different entry, and nothing panics. The no-panic object check still passes (4 allowed external symbols).
+
 ## `runtime/onbf/merkle/` (`onbf-merkle`), Merkle-SHA256-4K
 
 - **What:** the ONBF §4.6 trees, with the owner's G2 and G3 decisions and readings R1–R3 (`docs/spec/ONBF-errata.md`):
