@@ -32,6 +32,8 @@
 | M3: preemptive threads | per-CPU round-robin, timer-driven switching on every CPU | 51 switches per CPU in 500 ms, fair shares; negative control |
 | M3: thread lifecycle | yield, sleep, exit; slot reuse | 100/100 alternations, 5-tick sleep; negative control |
 | Hardening | SMEP/SMAP on every CPU; guard pages below every stack; loader memory reclaimed | five more #PF probes; two negative controls |
+| Thread cleanup | exited threads' stacks reaped on their own CPU | heap back to its pre-spawn size; negative control |
+| `origin-sync` | the spin lock as a freestanding, host-stress-tested crate | 3 multi-thread tests; no-panic check |
 
 ## In progress
 
@@ -41,7 +43,7 @@
 
 ## Next, in order
 
-1. **M3, scheduling proper** (ADR-0003 K7 is the baseline): a reaper for exited threads' stacks, wait queues and cross-CPU wake-ups by IPI, priorities and a fairness policy (EEVDF to be evaluated, §26), load balancing, a GS-based per-CPU area instead of APIC-ID indexing, a serialized kernel console for multi-CPU output. Pad the per-worker counters (cache-line sharing showed at 4 CPUs).
+1. **M3, scheduling proper** (ADR-0003 K7 is the baseline): wait queues and cross-CPU wake-ups by IPI, priorities and a fairness policy (EEVDF to be evaluated, §26), load balancing, a GS-based per-CPU area instead of APIC-ID indexing, a serialized kernel console for multi-CPU output. Pad the per-worker counters (cache-line sharing showed at 4 CPUs).
 2. **Address-space layout:** the higher-half kernel and KASLR (ADR-0002 B3), which M4's user address spaces need; then M4 (processes, system calls, capabilities, IPC).
 3. **Signature block (ONBF §7.1):** blocked on S1–S4; then Ed25519 + ML-DSA in the loader and the trust anchor (B7).
 4. **Formal and concurrency checks:** Loom models for `SpinLock`; Kani bounds for `paging`, `frames` and `heap` (CLAUDE.md §73).
@@ -62,6 +64,6 @@
 | G1 | A section kind for SYM's DWARF data | `.osym` (M6) |
 | R1–R5 | Readings applied in the errata (overrule if wanted) | — |
 | P1–P7, E1, L1 | Readings proposed by `onbf-pack`, Ed25519 and the loader (errata) | A second implementation, the host signer |
-| — | Downloads: NIST ACVP (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519) | External known-answer validation (§59) |
+| — | Downloads: NIST ACVP (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519); the `loom` crate (host-only dev-dependency, §5) | External known-answer validation (§59); concurrency models (§73) |
 | — | A project licence | Every provenance entry |
 | — | Merge into `main` and push | Sharing the work |

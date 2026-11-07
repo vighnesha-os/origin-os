@@ -237,7 +237,17 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Guard pages** below every kernel thread stack and AP stack (`sched::guarded_stack`, `vm::make_guard`, with the library's new `split_large` for 2 MiB leaves; each AP reloads CR3 when its scheduler starts) and below the boot processor's stack (the loader allocates one extra `KernelStack` page; `kernel_space` leaves it unmapped). Probes: both guards fault with #PF 0x0. Control: guard left mapped → "page protection violated: stack guard page … Completed".
 - **Reclaim** of `LoaderReclaimable` memory once every enabled processor is online: 40 MiB (463 → 504 MiB free); `frames::reclaim`, with frees outside owned regions still refused.
 - **Thread lifecycle:** run-queue slots Free/Ready/Sleeping; software interrupts 0x81 (yield), 0x82 (sleep), 0x83 (exit) share the timer's switch path; workers exit after the preemption window. Proof: "yield alternated 100 of 100 turns; sleep(5) took 5 ticks; exited threads freed their slots (slot Ok(1) reused)". The proof found a real bug (the boot flow runs with IF=0, so yielding only to itself froze time; fixed with an interrupt window). Control: a yield that never switches → "alternated 2 of 100 turns". A first attempt at that control did not compile and so proved nothing; it was redone and checked to have booted.
-- **Evidence:** `cargo xtask boot-test` passes with `ORIGIN_QEMU_SMP` = 1, 2 and 4; `cargo xtask check` passes (65 library tests). QEMU only. Not done: freeing exited threads' stacks (no reaper), priorities, load balancing, Loom models.
+- **Reaper:** each CPU records its threads' stacks; an exited thread's stack becomes a zombie, freed only by the CPU it died on and only from thread context (its exit handler ran on that stack), with the guard page remapped first. Proof: the heap returns exactly to its pre-spawn size (0, 88 and 264 KiB at 1, 2 and 4 CPUs; 88 KiB per AP stays). Control: a reaper that never frees fails the boot test.
+- **Evidence:** `cargo xtask boot-test` passes with `ORIGIN_QEMU_SMP` = 1, 2 and 4; `cargo xtask check` passes (65 library tests). QEMU only. Not done: priorities, load balancing, Loom models.
+
+## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
+
+- **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code.
+- **Dependencies:** `core` only. `no_std`; the no-panic lints are denied outside tests. One `unsafe impl Sync` and two `unsafe` blocks (the guard's `Deref`/`DerefMut`), each with a SAFETY argument.
+- **Test evidence (2026-11-07):** 3 host tests with real threads: 8 × 20,000 non-atomic increments under the lock (exact total), a writer/reader pair that never sees a torn two-field update, re-locking after a drop. Clippy on the host, UEFI and kernel targets; the no-panic object check references 0 external symbols.
+- **Not done:** Loom models (the `loom` crate needs the owner's approval to download), a fairness (ticket or MCS) lock, interrupt-disabling guards as a type.
+- **Licensing:** project licence not chosen yet.
 
 ## `origin-version.toml` and `runtime/version/` (`origin-version`), T5
 
