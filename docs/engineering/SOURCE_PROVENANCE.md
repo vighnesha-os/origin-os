@@ -786,6 +786,15 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Not done:** little/big-endian byte-order handling and BOM detection (this works on `u16` units, not bytes), and UTF-32. Wiring into the loader's existing CHAR16 handling.
 - **Licensing:** project licence not chosen yet.
 
+### Fixed-capacity ring buffer (CLAUDE.md §56 input queues, §55 audio, §69 log retention; 2026-11-08)
+
+- **What:** `ring::Ring<T: Copy + Default>` is a bounded FIFO over a once-allocated backing array: `push` fails when full, `force_push` overwrites and returns the oldest (the never-block, drop-stalest policy a keyboard or log ring wants), `pop`/`peek` take from the front, plus `len`/`is_full`/`clear`. Index wrap is one subtraction, not a `%`. No reallocation after `new`, so it fits a bounded kernel budget. Pure, no `unsafe`.
+- **Why:** the keyboard/serial input path (the missing piece behind "live keystrokes") needs a bounded input queue the IRQ handler pushes into; audio playback (§55) needs a sample ring; a structured-log buffer (§69) wants to retain the most recent lines and drop the oldest. This is the shared primitive.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); standard circular-buffer technique, no source used.
+- **Test evidence (2026-11-08):** 5 `ring` tests — FIFO order and fullness (push refused when full, room after a pop); `force_push` dropping the oldest; capacity clamped to 1 and `clear`; and a model-based test running 80 000 random `push`/`force_push`/`pop`/`peek` against a `VecDeque` with the same bounded drop-oldest policy, asserting the returned/dropped values, `len` and `is_full` match after every operation. 227 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the oracle is the control).
+- **Not done:** a lock-free single-producer/single-consumer variant for the IRQ-handler/consumer split (this one is `&mut`-synchronised by its holder's lock), bulk push/pop, and wiring into the i8042 keyboard IRQ and a kernel log.
+- **Licensing:** project licence not chosen yet.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.

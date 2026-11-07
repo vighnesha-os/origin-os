@@ -53,6 +53,7 @@
 //! - [`runqueue`]: the per-CPU round-robin run queue (scheduler policy);
 //! - [`serial`]: a polled 16550 UART driver over an abstract register interface;
 //! - [`report`]: the exact console text;
+//! - [`ring`]: a fixed-capacity ring buffer (input/audio/log queues);
 //! - [`route`]: an IPv4 longest-prefix-match routing table (a bit trie);
 //! - [`rtc`]: CMOS RTC decoding and UTC calendar arithmetic;
 //! - [`unwind`]: frame-pointer stack unwinding for panic diagnostics;
@@ -100,6 +101,7 @@ pub mod pci;
 pub mod ps2;
 pub mod raster;
 pub mod report;
+pub mod ring;
 pub mod route;
 pub mod rtc;
 pub mod runqueue;
