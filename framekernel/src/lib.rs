@@ -24,6 +24,7 @@
 //! - [`clock`]: monotonic-clock arithmetic (ticks to nanoseconds and back) and the CPUID
 //!   TSC rate;
 //! - [`descriptors`]: GDT, TSS and IDT descriptor encodings;
+//! - [`dhcp`]: a DHCP client (message build/parse and the lease state machine);
 //! - [`dns`]: DNS message parsing with bounded name decompression;
 //! - [`editbuffer`]: a gap buffer for editable text (caret, insert/delete);
 //! - [`entropy`]: bounded-retry hardware entropy draw/fill over an abstract source;
@@ -82,6 +83,7 @@ pub mod cache;
 pub mod channel;
 pub mod clock;
 pub mod descriptors;
+pub mod dhcp;
 pub mod dns;
 pub mod editbuffer;
 pub mod entropy;
