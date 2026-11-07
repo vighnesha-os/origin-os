@@ -500,6 +500,19 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 3 new run-queue tests (exact shares 100 : 400 : 1600 over 2100 quanta, and after a weight change; the idle context; no credit for sleeping and new threads starting level); 106 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** interactive and background classes on top of the weights, load balancing between processors, priority inheritance, and an EEVDF evaluation (§26).
 
+### Block layer: a page cache over NVMe (CLAUDE.md §39, §40; 2026-11-08)
+
+- **What:**
+  - `blockcache` (library): the cache's index — a fixed-capacity map from a page number to a slot, with LRU order and write-back bookkeeping. `access` returns Hit, Fill (an empty slot), Replace (evict a clean slot) or Evict (write back a dirty slot first); `mark_dirty`, `mark_clean`, `dirty_slots` (oldest first) and hit/miss counts. No data, no `unsafe`.
+  - `block` (binary): each cache slot is a 4 KiB DMA page (8 × 512 B device blocks). A read returns the cached page, fetching it on a miss after writing back the page it evicts; a write does a read-modify-write and dirties the page; a flush writes every dirty page back and flushes the controller. `storage` gained the polled device access it needs (`geometry`, `dma_page`, `transfer`, `flush_device`, `dma_read`/`dma_write`).
+- **Bugs found by the library's model test before the kernel ran:** none in the cache. Three first-run failures were all in the test model (a second stray `access` per write inflated the counts, the mirror was sized to the unclamped capacity, and one stats expectation was miscounted) and were fixed.
+- **Proof** (every boot): a 4-slot cache over the NVMe disk. Reading all 32 pattern blocks of 4 pages does 4 device reads (one per page) and every block matches; re-reading the 4 resident pages does no device I/O (32 hits). A 5th page evicts the LRU clean page with one read and no write-back. A block written through the cache, then flushed (one device write), is read back changed after its page is evicted.
+- **Negative controls**, each failing the boot test:
+  - cache hits still fetch from the device → cold reads jump from 4 to 32 and re-reads do 4 more;
+  - written pages never marked dirty → "flushed (0 device writes) ... read back changed: false".
+- **Test evidence:** 6 `blockcache` tests, including a 20 000-operation model check over a 20-block working set in 8 slots (every slot and dirty bit mirrored, no block cached twice, the hit rate sane); 112 library tests in all; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Limitation and not done:** the block layer holds its lock across polled I/O and is driven from the boot flow; a production one routes each request to the submitting processor's queue and blocks instead of polling. Also not done: readahead, a writeback thread on a timer, per-file or per-inode caching, and a filesystem above it.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

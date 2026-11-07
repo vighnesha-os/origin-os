@@ -17,6 +17,7 @@
 //! - [`acpi`]: RSDP, XSDT and MADT parsing (checksummed) for processor discovery;
 //! - [`apic`]: x2APIC and 8254 PIT encodings and timer calibration arithmetic;
 //! - [`boot`]: boot-info validation and the memory summary;
+//! - [`blockcache`]: the block cache's LRU index and write-back bookkeeping;
 //! - [`channel`]: one channel's queues, limits and signals (ADR-0005 P8);
 //! - [`clock`]: monotonic-clock arithmetic (ticks to nanoseconds and back) and the CPUID
 //!   TSC rate;
@@ -48,6 +49,7 @@ extern crate alloc;
 
 pub mod acpi;
 pub mod apic;
+pub mod blockcache;
 pub mod boot;
 pub mod channel;
 pub mod clock;

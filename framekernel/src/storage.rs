@@ -42,7 +42,7 @@ use crate::console::Console;
 const ADMIN_ENTRIES: u16 = 32;
 const IO_ENTRIES: u16 = 64;
 /// The memory page size the driver configures.
-const PAGE: u64 = 4096;
+pub(crate) const PAGE: u64 = 4096;
 /// How long one command may take.
 const COMMAND_TIMEOUT_NS: u64 = 2_000_000_000;
 /// The namespace the proof uses.
@@ -305,7 +305,7 @@ fn new_queue(qid: u16, entries: u16) -> Option<QueuePair> {
 }
 
 /// The bytes xtask writes in pattern block `lba`: `ORIGIN NVME LBA 00002048 ` repeated.
-fn pattern(lba: u64, out: &mut [u8]) {
+pub(crate) fn pattern(lba: u64, out: &mut [u8]) {
     let mut unit = *b"ORIGIN NVME LBA 00000000 ";
     let mut v = lba;
     for i in (16..24).rev() {
@@ -325,6 +325,8 @@ struct Driver {
     nvme: Nvme,
     dev: crate::pcie::Device,
     page: DmaPage,
+    /// Namespace 1.
+    namespace: NamespaceInfo,
     /// The MSI-X table's virtual address and the capability, once set up.
     msix: Option<(u64, pci::Msix)>,
 }
@@ -361,7 +363,7 @@ pub(crate) fn init(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
         return true;
     };
     let polled = match bind(com1, &dev, cpus.len()) {
-        Ok((nvme, ok)) => {
+        Ok((nvme, ok, namespace)) => {
             let Some(page) = DmaPage::new() else {
                 return false;
             };
@@ -370,6 +372,7 @@ pub(crate) fn init(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
                     nvme,
                     dev,
                     page,
+                    namespace,
                     msix: None,
                 });
             });
@@ -381,14 +384,88 @@ pub(crate) fn init(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
         }
     };
     let interrupts = polled && prove_interrupts(com1, cpus, tsc_hz);
-    interrupts && prove_per_cpu(com1, cpus, tsc_hz)
+    let per_cpu = interrupts && prove_per_cpu(com1, cpus, tsc_hz);
+    per_cpu && crate::block::prove(com1)
+}
+
+/// Device block size and block count of namespace 1, or `None` if no controller is bound.
+pub(crate) fn geometry() -> Option<(u32, u64)> {
+    crate::cpu::without_interrupts(|| {
+        let g = DRIVER.lock();
+        let d = g.as_ref()?;
+        Some((d.namespace.block_size, d.namespace.blocks))
+    })
+}
+
+/// Allocates a zeroed 4 KiB DMA page for the block layer: its virtual and physical
+/// addresses. Never freed.
+pub(crate) fn dma_page() -> Option<(u64, u64)> {
+    DmaPage::new().map(|p| (p.virt, p.phys))
+}
+
+/// Reads or writes `blocks` device blocks at `lba` between the disk and the DMA page at
+/// physical `phys`, through the polled I/O queue. Returns whether it succeeded. For the
+/// block layer, driven from the boot flow.
+pub(crate) fn transfer(write: bool, lba: u64, phys: u64, blocks: u32) -> bool {
+    crate::cpu::without_interrupts(|| {
+        let mut g = DRIVER.lock();
+        let Some(d) = g.as_mut() else {
+            return false;
+        };
+        let bs = u64::from(d.namespace.block_size);
+        let prps = nvme::prps(phys, u64::from(blocks) * bs, PAGE).unwrap_or((phys, 0));
+        d.nvme
+            .run(Q::Polled, |cid| {
+                Command::transfer(write, cid, NSID, lba, blocks, prps)
+            })
+            .is_ok_and(|c| c.status.ok())
+    })
+}
+
+/// Flushes namespace 1's write cache to media.
+pub(crate) fn flush_device() -> bool {
+    crate::cpu::without_interrupts(|| {
+        let mut g = DRIVER.lock();
+        let Some(d) = g.as_mut() else {
+            return false;
+        };
+        d.nvme
+            .run(Q::Polled, |cid| Command::flush(cid, NSID))
+            .is_ok_and(|c| c.status.ok())
+    })
+}
+
+/// Reads `out.len()` bytes at `offset` of the DMA page mapped at `virt` (from
+/// [`dma_page`]) into `out`. The block layer's slots are such pages.
+pub(crate) fn dma_read(virt: u64, offset: usize, out: &mut [u8]) {
+    if offset + out.len() > PAGE as usize {
+        return;
+    }
+    for (i, b) in out.iter_mut().enumerate() {
+        let p = ptr::with_exposed_provenance::<u8>(virt as usize + offset + i);
+        // SAFETY: inside a live 4 KiB DMA page (bounds checked); no command is outstanding
+        // on it while the block layer copies, so the device is not writing it.
+        *b = unsafe { p.read_volatile() };
+    }
+}
+
+/// Writes `bytes` at `offset` of the DMA page mapped at `virt`.
+pub(crate) fn dma_write(virt: u64, offset: usize, bytes: &[u8]) {
+    if offset + bytes.len() > PAGE as usize {
+        return;
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        let p = ptr::with_exposed_provenance_mut::<u8>(virt as usize + offset + i);
+        // SAFETY: as in `dma_read`; the page is the block layer's, not in device use here.
+        unsafe { p.write_volatile(b) };
+    }
 }
 
 fn bind(
     com1: &mut Console,
     dev: &crate::pcie::Device,
     cpus: usize,
-) -> Result<(Nvme, bool), &'static str> {
+) -> Result<(Nvme, bool, NamespaceInfo), &'static str> {
     let f = dev.function;
     let bar = dev.bars[0].ok_or("no BAR 0")?;
     if bar.kind == BarKind::Io || bar.size < 0x2000 {
@@ -523,7 +600,7 @@ fn bind(
     c.io = Some(io);
     let ok = prove_io(com1, &mut c, &data, namespace).map_err(failed)?;
     let gpt = prove_gpt(com1, &mut c, &data, namespace).map_err(failed)?;
-    Ok((c, ok && gpt))
+    Ok((c, ok && gpt, namespace))
 }
 
 /// Reads the interrupt-driven proof makes, of 8 blocks each.

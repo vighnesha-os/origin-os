@@ -31,6 +31,7 @@ use framekernel::boot::{self, InvalidBootInfo, MemorySummary};
 use crate::console::Console;
 use framekernel::report;
 
+mod block;
 mod console;
 mod cpu;
 mod firmware;
