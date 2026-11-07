@@ -31,6 +31,8 @@
 //! - [`hpet`]: the ACPI HPET table and main-counter arithmetic;
 //! - [`ioapic`]: I/O APIC redirection-table encoding;
 //! - [`net`]: Ethernet/IPv4/ICMP/ARP headers and the Internet checksum;
+//! - [`originfs`]: a read-only OriginFS on-disk parser and image builder (ADR-0006,
+//!   Proposed; host-tested, not mounted by the kernel pending owner approval, §84);
 //! - [`tcp`]: TCP segments and a minimal connection state machine;
 //! - [`timers`]: a monotonic-deadline timer queue;
 //! - [`topology`]: CPU topology (SMT/core/package) from CPUID leaf 0Bh;
@@ -76,6 +78,7 @@ pub mod hpet;
 pub mod ioapic;
 pub mod net;
 pub mod nvme;
+pub mod originfs;
 pub use origin_paging as paging;
 pub mod pci;
 pub mod ps2;
