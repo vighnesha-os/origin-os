@@ -268,7 +268,43 @@ fn check() -> Result {
         }
         run_step(cargo().args(["test", "--package", package]))?;
     }
+    // The Framekernel: its library on the host (with tests), the binary on its target.
+    run_step(cargo().args([
+        "clippy",
+        "--package",
+        KERNEL_PACKAGE,
+        "--lib",
+        "--tests",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run_step(cargo().args([
+        "clippy",
+        "--package",
+        KERNEL_PACKAGE,
+        "--target",
+        KERNEL_TARGET,
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run_step(cargo().args(["test", "--package", KERNEL_PACKAGE, "--lib"]))?;
+    // The loader in developer mode too (the boot test's variant).
+    run_step(cargo().args([
+        "clippy",
+        "--package",
+        LOADER_PACKAGE,
+        "--target",
+        UEFI_TARGET,
+        "--features",
+        "developer-mode",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
     build_loader()?;
+    build_kernel()?;
     no_panic_check()?;
     linux_cfg_lint()?;
     manifest_version_lint()?;
