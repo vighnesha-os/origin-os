@@ -243,6 +243,10 @@ struct CpuLocal {
     kernel_stack: AtomicU64,
     /// Scratch for the user RSP during `syscall_entry` (offset 24).
     user_rsp: AtomicU64,
+    /// The instruction at which this CPU's armed probe expects a fault, or 0.
+    probe_rip: AtomicU64,
+    /// CR2 of this CPU's last probe fault.
+    probe_address: AtomicU64,
 }
 
 static CPU_LOCAL: [CpuLocal; MAX_LOCAL] = [const {
@@ -251,6 +255,8 @@ static CPU_LOCAL: [CpuLocal; MAX_LOCAL] = [const {
         tss: AtomicU64::new(0),
         kernel_stack: AtomicU64::new(0),
         user_rsp: AtomicU64::new(0),
+        probe_rip: AtomicU64::new(0),
+        probe_address: AtomicU64::new(0),
     }
 }; MAX_LOCAL];
 /// The area of a processor whose ID is too large for [`CPU_LOCAL`]: its ID reads as
@@ -260,6 +266,8 @@ static OUT_OF_RANGE: CpuLocal = CpuLocal {
     tss: AtomicU64::new(0),
     kernel_stack: AtomicU64::new(0),
     user_rsp: AtomicU64::new(0),
+    probe_rip: AtomicU64::new(0),
+    probe_address: AtomicU64::new(0),
 };
 
 /// This processor's x2APIC ID from CPUID (leaf 0Bh EDX, else leaf 1 EBX bits 31:24), which
@@ -338,6 +346,11 @@ extern "sysv64" fn syscall_entry() {
         vector = const SYSCALL_VECTOR,
         common = sym exception_common,
     );
+}
+
+/// This processor's CPU-local area.
+fn local() -> &'static CpuLocal {
+    CPU_LOCAL.get(cpu_id() as usize).unwrap_or(&OUT_OF_RANGE)
 }
 
 /// Address of this processor's CPU-local area (the value IA32_GS_BASE holds).
@@ -528,9 +541,9 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     // A page fault at the exact instruction a probe armed: record it and resume at
     // `probe_recover`, which returns the error code to the probe's caller.
     if frame.vector == 14 {
-        let armed = PROBE_RIP.load(Ordering::SeqCst);
+        let armed = local().probe_rip.load(Ordering::SeqCst);
         if armed != 0 && frame.rip == armed {
-            PROBE_ADDRESS.store(read_cr2(), Ordering::SeqCst);
+            local().probe_address.store(read_cr2(), Ordering::SeqCst);
             frame.rax = frame.error_code;
             frame.rip = (probe_recover as *const ()).addr() as u64;
             return here;
@@ -746,10 +759,6 @@ pub(crate) unsafe fn load_page_tables(root: u64) {
     }
 }
 
-/// The instruction address at which an armed probe expects a page fault, or 0.
-static PROBE_RIP: AtomicU64 = AtomicU64::new(0);
-/// CR2 recorded by the last probe fault.
-static PROBE_ADDRESS: AtomicU64 = AtomicU64::new(0);
 /// What the probe functions return when the access completed (no #PF error code is this).
 const COMPLETED: u64 = u64::MAX;
 
@@ -773,15 +782,17 @@ pub(crate) enum Probe {
 
 /// Arms the probe for a fault at `fault_rip`, runs `access`, and disarms it.
 fn run_probe(fault_rip: u64, access: impl FnOnce() -> u64) -> Probe {
-    PROBE_RIP.store(fault_rip, Ordering::SeqCst);
+    // Per CPU: probes and user copies on different processors never disarm each other.
+    let here = local();
+    here.probe_rip.store(fault_rip, Ordering::SeqCst);
     let result = access();
-    PROBE_RIP.store(0, Ordering::SeqCst);
+    here.probe_rip.store(0, Ordering::SeqCst);
     if result == COMPLETED {
         Probe::Completed
     } else {
         Probe::Faulted {
             error: result,
-            address: PROBE_ADDRESS.load(Ordering::SeqCst),
+            address: here.probe_address.load(Ordering::SeqCst),
         }
     }
 }
