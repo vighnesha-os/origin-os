@@ -18,9 +18,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use framekernel::descriptors::{KERNEL_CODE, KERNEL_DATA};
 use framekernel::runqueue::{QueueError, RunQueue};
-use framekernel::serial::Uart16550;
 
-use crate::Com1;
+use crate::console::Console;
 use crate::cpu::{self, rdtsc};
 use crate::timer::{self, ApicRead, X2Apic};
 use origin_sync::SpinLock;
@@ -445,7 +444,7 @@ pub(crate) fn yield_until(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) {
 
 /// On the boot processor, with its timer running: yields must alternate two threads, a
 /// sleep must last its ticks, and exited threads must free their slots for reuse.
-fn prove_lifecycle(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool {
+fn prove_lifecycle(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
     let live = || {
         QUEUES
             .get(bsp)
@@ -506,7 +505,7 @@ fn prove_lifecycle(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool 
 /// contexts) waits. On each processor, both workers must have run there, with shares
 /// within a factor of two, over at least five full rounds of context switches. Returns
 /// whether the proof passed.
-pub(crate) fn prove(com1: &mut Uart16550<Com1>, cpus: &[u32], tsc_hz: u64) -> bool {
+pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
     let heap_before = crate::memory::stats().map(|(h, _)| h.bytes_in_use);
     for (i, &id) in cpus.iter().enumerate() {
         for k in 0..2 {
@@ -609,6 +608,7 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, cpus: &[u32], tsc_hz: u64) -> bo
     ok &= prove_lifecycle(com1, bsp, tsc_hz);
     ok &= crate::user::prove(com1, bsp, tsc_hz);
     ok &= crate::time::prove_consistent(com1, cpus, bsp, tsc_hz);
+    ok &= crate::console::prove(com1, cpus, bsp, tsc_hz);
     // Every thread has exited: once each processor has reaped its own, the heap is back
     // exactly where it was before the first spawn.
     let back = || crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before;

@@ -29,11 +29,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use framekernel::acpi;
 use framekernel::clock::{self, NANOS_PER_SECOND, Scale, SharedScale};
 use framekernel::rtc::{self, DateTime, Registers, register};
-use framekernel::serial::Uart16550;
 use origin_sync::SpinLock;
 
+use crate::console::Console;
 use crate::cpu::{self, rdtsc};
-use crate::{Com1, inb, outb};
+use crate::{inb, outb};
 
 /// The TSC when the kernel was entered: the monotonic clock's zero.
 static ENTRY_TSC: AtomicU64 = AtomicU64::new(0);
@@ -171,7 +171,7 @@ fn update_end(cmos: &mut Cmos, limit: u64) -> Option<u64> {
 
 /// Sets up both clocks from the PIT-calibrated TSC rate `calibrated_hz`, the RTC and the
 /// ACPI tables at `rsdp`. Returns whether every check passed.
-pub(crate) fn init(com1: &mut Uart16550<Com1>, calibrated_hz: u64, rsdp: u64) -> bool {
+pub(crate) fn init(com1: &mut Console, calibrated_hz: u64, rsdp: u64) -> bool {
     let fadt = crate::firmware::acpi_table(rsdp, b"FACP")
         .ok()
         .and_then(|t| acpi::parse_fadt(t).ok());
@@ -240,7 +240,7 @@ pub(crate) fn init(com1: &mut Uart16550<Com1>, calibrated_hz: u64, rsdp: u64) ->
 
 /// Sets the wall clock from the RTC reading taken at TSC `t1`, just after an update.
 fn set_wall_clock(
-    com1: &mut Uart16550<Com1>,
+    com1: &mut Console,
     scale: Scale,
     edge: Option<(u64, Option<Registers>)>,
     century: Option<u8>,
@@ -421,12 +421,7 @@ extern "sysv64" fn turn_taker(_: u64) -> ! {
 /// Proves that the TSC readings of every online processor are consistent: for 100 ms all
 /// of them take ordered readings in turn, and no reading may be below the one taken just
 /// before it on another processor. Runs from the boot flow with every scheduler active.
-pub(crate) fn prove_consistent(
-    com1: &mut Uart16550<Com1>,
-    cpus: &[u32],
-    bsp: usize,
-    tsc_hz: u64,
-) -> bool {
+pub(crate) fn prove_consistent(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -> bool {
     let mut aps = 0u64;
     for &id in cpus.iter().filter(|&&id| id as usize != bsp) {
         if crate::sched::spawn(id as usize, turn_taker, 0).is_err() {

@@ -29,10 +29,9 @@ use core::sync::atomic::{AtomicU32, Ordering, fence};
 
 use framekernel::acpi::{self, Processor};
 use framekernel::paging::{Access, PAGE};
-use framekernel::serial::Uart16550;
 use origin_boot_info::{BootInfo, MemoryRegion, RegionKind};
 
-use crate::Com1;
+use crate::console::Console;
 use crate::cpu::{self, CpuTables, rdtsc};
 use crate::timer::{ApicRead, X2Apic};
 use crate::vm;
@@ -173,7 +172,7 @@ impl Online {
 /// Brings up every enabled AP the MADT lists. Returns the processors online, the boot
 /// processor included.
 pub(crate) fn start(
-    com1: &mut Uart16550<Com1>,
+    com1: &mut Console,
     info: &BootInfo,
     regions: &[MemoryRegion],
     tsc_hz: u64,

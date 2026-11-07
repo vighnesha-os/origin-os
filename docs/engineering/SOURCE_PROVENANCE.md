@@ -304,6 +304,22 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - QEMU only.
 - **Not done:** HPET or ACPI PM timer fallbacks; resynchronising TSCs (IA32_TSC_ADJUST) when the check fails; TSC-deadline timers; time zones and network time; the user-visible clock calls.
 
+### Serialized kernel console (2026-11-07)
+
+- **What:**
+  - `console` (binary): a `Console` collects one line (160 bytes) and sends it to COM1 under one spin lock, with interrupts disabled. Lines from different processors, or from an interrupt handler on the same one, never interleave; longer lines go out in whole 160-byte pieces.
+  - Exception reports and the panic handler use `Console::urgent`. It tries the lock 2^22 times (on the order of 100 ms, longer than one line takes), then writes without it, so a processor that faulted inside the console, or waits on one that died holding the lock, still reports.
+  - Every boot proof, the exception handler, the panic handler and the write system call now print through it. `origin-sync` gains `SpinLock::try_lock`.
+- **A bug found on the way:** the first `try_lock` built its guard with `bool::then_some`, which evaluates its argument eagerly. A failed attempt therefore built a guard and dropped it, unlocking a lock that someone else held. The new host test (a held lock must refuse `try_lock` from another thread) caught it before the kernel used it; the guard is now built only on success.
+- **Proof** (every boot): every online CPU prints 20 lines at once. Each line is `origin-kernel: console: CPU {id} line {k} of 20: ` followed by 60 copies of the letter `a + id`. xtask then checks the whole log:
+  - every proof line arrived whole and in order, from every CPU;
+  - no line of the log holds two `origin-kernel:` prefixes.
+
+  Two new xtask unit tests cover mixed, lost, joined and over-long lines. In the boot log the two CPUs' lines alternate in runs (8, 1, 7, 1, 1, 1, 3, 6, …), so the printing really overlapped.
+- **Control:** with the lock bypassed, two CPUs' bytes mix mid-line, and the boot test fails with "two kernel lines ran together".
+- **Evidence:** `cargo xtask check` and `boot-matrix` (1, 2 and 4 CPUs) pass; boot to halt takes 4.8, 5.4 and 7.1 s.
+- **Limitation:** interrupts stay off while one line is sent. In QEMU that is microseconds; at 115 200 baud on real hardware it is about 9 ms per 100 bytes. Production logging will go to a memory ring drained by a thread (CLAUDE.md §69).
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

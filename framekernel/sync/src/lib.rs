@@ -68,6 +68,19 @@ impl<T> SpinLock<T> {
         }
         SpinGuard { lock: self }
     }
+
+    /// Takes the lock if it is free, without waiting.
+    pub fn try_lock(&self) -> Option<SpinGuard<'_, T>> {
+        // The guard is built only on success: a guard built and dropped after a failed
+        // exchange would unlock a lock that someone else holds.
+        match self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        {
+            Ok(_) => Some(SpinGuard { lock: self }),
+            Err(_) => None,
+        }
+    }
 }
 
 /// Access to the value while the lock is held.
@@ -108,6 +121,22 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn try_lock_fails_only_while_the_lock_is_held() {
+        let lock = SpinLock::new(5u32);
+        {
+            let mut held = lock.try_lock().unwrap();
+            *held += 1;
+            assert!(lock.try_lock().is_none());
+            // Another thread cannot take it either.
+            thread::scope(|s| {
+                s.spawn(|| assert!(lock.try_lock().is_none()));
+            });
+        }
+        assert_eq!(*lock.try_lock().unwrap(), 6);
+        assert_eq!(*lock.lock(), 6);
+    }
 
     #[test]
     fn guards_give_exclusive_access_under_contention() {

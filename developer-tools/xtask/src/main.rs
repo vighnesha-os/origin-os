@@ -75,6 +75,8 @@ struct Scenario {
     markers: Vec<String>,
     /// Output that fails the scenario as soon as it appears.
     failures: Vec<&'static str>,
+    /// A check of the whole serial log once every marker has appeared.
+    check: Option<fn(&str) -> Result>,
 }
 
 /// The good path: the loader verifies and enters the kernel, and the kernel reports on
@@ -188,6 +190,10 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: processes: PML4 ".into(),
             "at once and read back 0x400800 from 0x500000 (own values only: 0x400800); not mapped in the kernel's tables: true".into(),
             format!("origin-kernel: clock: TSC consistent across {cpus} processors: "),
+            // Every CPU printed its lines at once; `console_lines_intact` checks each one.
+            format!(
+                "origin-kernel: console: {cpus} processors printed {CONSOLE_LINES} lines each at once"
+            ),
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
@@ -228,7 +234,9 @@ fn boot_scenario_markers() -> Scenario {
             ": higher half failed",
             ": process isolation failed",
             ": clock failed",
+            ": console failed",
         ],
+        check: Some(|text| console_lines_intact(text, qemu_cpus() as usize)),
     }
 }
 
@@ -247,10 +255,56 @@ fn tamper_scenario() -> Scenario {
             "origin-boot: panic:",
             "origin-boot: kernel verified",
         ],
+        check: None,
     }
 }
 
 type Result<T = ()> = std::result::Result<T, String>;
+
+/// Lines each CPU prints in the kernel's console proof, and the letters after each line's
+/// prefix (`framekernel/src/console.rs`: `PROOF_LINES`, `PROOF_PAYLOAD`).
+const CONSOLE_LINES: usize = 20;
+const CONSOLE_PAYLOAD: usize = 60;
+
+/// The kernel's console serializes whole lines across processors. In its proof every CPU
+/// prints [`CONSOLE_LINES`] lines at once, each `origin-kernel: console: CPU {id} line {k}
+/// of 20: ` followed by [`CONSOLE_PAYLOAD`] copies of the letter `a + id % 26`. Every one
+/// must arrive whole and in order; a line that mixed two processors' bytes fails. No line
+/// of the whole log may hold two `origin-kernel:` prefixes either.
+fn console_lines_intact(text: &str, cpus: usize) -> Result {
+    if let Some(line) = text
+        .lines()
+        .find(|l| l.matches("origin-kernel:").count() > 1)
+    {
+        return Err(format!("two kernel lines ran together: {line:?}"));
+    }
+    let mut seen = std::collections::BTreeMap::<u64, Vec<usize>>::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("origin-kernel: console: CPU ") else {
+            continue;
+        };
+        let (id, k) =
+            parse_console_line(rest).ok_or_else(|| format!("garbled console line: {line:?}"))?;
+        seen.entry(id).or_default().push(k);
+    }
+    let complete: Vec<usize> = (0..CONSOLE_LINES).collect();
+    if seen.len() != cpus || seen.values().any(|ks| *ks != complete) {
+        return Err(format!(
+            "console proof: expected lines 0..{CONSOLE_LINES} from each of {cpus} CPUs, got {seen:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Parses `{id} line {k} of 20: {letters}`.
+fn parse_console_line(rest: &str) -> Option<(u64, usize)> {
+    let (id, rest) = rest.split_once(" line ")?;
+    let (k, letters) = rest.split_once(&format!(" of {CONSOLE_LINES}: "))?;
+    let id: u64 = id.parse().ok()?;
+    let k: usize = k.parse().ok()?;
+    let letter = char::from(b'a' + (id % 26) as u8);
+    (letters.len() == CONSOLE_PAYLOAD && letters.chars().all(|c| c == letter)).then_some((id, k))
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -1052,6 +1106,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
     let qemu_stderr = stderr_reader.join().unwrap_or_default();
 
     let text = serial::clean(&raw);
+    let verdict = verdict.and_then(|()| scenario.check.map_or(Ok(()), |check| check(&text)));
     let log = target_dir().join("xtask").join(format!(
         "boot-test-{}.log",
         scenario.label.replace(' ', "-")
@@ -1100,5 +1155,63 @@ fn run() -> Result {
         Ok(())
     } else {
         Err(format!("{QEMU} exited with {status}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proof(cpus: u64) -> String {
+        let mut text = String::from("origin-kernel: SMP: up\n");
+        for k in 0..CONSOLE_LINES {
+            for id in 0..cpus {
+                let letter = char::from(b'a' + (id % 26) as u8);
+                text += &format!(
+                    "origin-kernel: console: CPU {id} line {k} of {CONSOLE_LINES}: {}\n",
+                    letter.to_string().repeat(CONSOLE_PAYLOAD)
+                );
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn intact_console_lines_pass_from_every_cpu() {
+        assert_eq!(console_lines_intact(&proof(2), 2), Ok(()));
+        assert_eq!(console_lines_intact(&proof(4), 4), Ok(()));
+        assert!(
+            console_lines_intact(&proof(2), 4).is_err(),
+            "two CPUs missing"
+        );
+    }
+
+    #[test]
+    fn mixed_or_missing_lines_fail() {
+        let good = proof(2);
+        // Two processors' bytes mixed inside a line.
+        let mixed = good.replacen("aaaaab", "aabaab", 1).replacen(
+            "line 3 of 20: aaaaa",
+            "line 3 of 20: aabaa",
+            1,
+        );
+        assert!(console_lines_intact(&mixed, 2).is_err());
+        // One line lost.
+        let lost = good.replacen("origin-kernel: console: CPU 1 line 7", "x", 1);
+        assert!(console_lines_intact(&lost, 2).is_err());
+        // Two lines run together.
+        let joined = good.replacen(
+            "\norigin-kernel: console: CPU 0 line 5",
+            "origin-kernel: console: CPU 0 line 5",
+            1,
+        );
+        assert!(console_lines_intact(&joined, 2).is_err());
+        // A line too long by one letter.
+        let long = good.replacen(
+            &"b".repeat(CONSOLE_PAYLOAD),
+            &"b".repeat(CONSOLE_PAYLOAD + 1),
+            1,
+        );
+        assert!(console_lines_intact(&long, 2).is_err());
     }
 }

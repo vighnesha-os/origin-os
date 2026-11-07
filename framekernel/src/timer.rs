@@ -19,10 +19,10 @@ use framekernel::apic::{
     self, IA32_APIC_BASE, SPURIOUS_VECTOR, TIMER_VECTOR, TimerMode, X2APIC_ID, X2APIC_LVT_TIMER,
     X2APIC_SVR, X2APIC_TIMER_CURRENT, X2APIC_TIMER_DIVIDE, X2APIC_TIMER_INITIAL, X2APIC_VERSION,
 };
-use framekernel::serial::Uart16550;
 
+use crate::console::Console;
 use crate::cpu::{self, rdmsr, rdtsc, wrmsr};
-use crate::{Com1, inb, outb};
+use crate::{inb, outb};
 
 /// Periodic timer rate for the proof. 10 ms periods tolerate an emulator's wake-up latency
 /// (QEMU's TCG coalesces timer expiries that a halted vCPU is late to take, which at 1 kHz
@@ -197,7 +197,7 @@ impl X2Apic {
 
 /// Brings up the local APIC and proves its timer. Returns the TSC rate in Hz if every step
 /// passed.
-pub(crate) fn init(com1: &mut Uart16550<Com1>) -> Option<u64> {
+pub(crate) fn init(com1: &mut Console) -> Option<u64> {
     if !cpu::x2apic_supported() {
         let _ = writeln!(com1, "origin-kernel: the processor has no x2APIC");
         return None;

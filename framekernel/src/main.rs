@@ -27,8 +27,11 @@ use core::slice;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use framekernel::boot::{self, InvalidBootInfo, MemorySummary};
+
+use crate::console::Console;
 use framekernel::report;
 
+mod console;
 mod cpu;
 mod firmware;
 mod memory;
@@ -55,9 +58,6 @@ const TABLE_POOL_FRAMES: u64 = 256;
 /// I/O port base of COM1 on PC-compatible platforms.
 const COM1_BASE: u16 = 0x3F8;
 
-/// Set once `_start` has programmed COM1, so the panic handler does not program it again,
-/// which would clear the transmit FIFO.
-static COM1_READY: AtomicBool = AtomicBool::new(false);
 /// Set by the first panic. A panic while reporting a panic only halts.
 static PANICKING: AtomicBool = AtomicBool::new(false);
 
@@ -83,16 +83,18 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     // SAFETY: the entry contract: CPL 0, boot processor only, interrupts disabled. The
     // firmware and the loader stopped using COM1 at `ExitBootServices`, and no other kernel
     // code drives it.
-    let mut com1 = Uart16550::new(unsafe { Com1::new() });
-    com1.init();
-    COM1_READY.store(true, Ordering::Release);
+    let mut uart = Uart16550::new(unsafe { Com1::new() });
+    uart.init();
 
     if !relocations_applied() {
         // `core::fmt` would call through unrelocated vtables. `write_str` on the concrete
         // type is a direct call, and the string is addressed RIP-relative.
-        let _ = com1.write_str(report::RELOCATIONS_NOT_APPLIED);
+        let _ = uart.write_str(report::RELOCATIONS_NOT_APPLIED);
         halt();
     }
+    // From here on every processor prints through the console, a line at a time.
+    console::init(uart);
+    let mut com1 = console::Console::new();
 
     // SAFETY: `boot_info` is the loader's pointer, passed on unchanged, and this function's
     // contract is exactly `read_boot_info`'s.
@@ -189,7 +191,7 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
 /// Builds the kernel's address space, loads it, and proves its protections on the
 /// processor. Returns whether the kernel now runs on its own tables.
 fn init_paging(
-    com1: &mut Uart16550<Com1>,
+    com1: &mut Console,
     info: &BootInfo,
     regions: &[MemoryRegion],
     segments: &[KernelSegment],
@@ -255,11 +257,7 @@ fn init_paging(
 /// read-only kernel data, an instruction fetch from writable data and a read of page 0.
 /// Each must raise #PF with the expected error code (SDM Vol. 3A §4.7: bit 0 present,
 /// bit 1 write, bit 4 instruction fetch). Returns whether all four did.
-fn prove_protections(
-    com1: &mut Uart16550<Com1>,
-    info: &BootInfo,
-    segments: &[KernelSegment],
-) -> bool {
+fn prove_protections(com1: &mut Console, info: &BootInfo, segments: &[KernelSegment]) -> bool {
     let first = |want: u32, avoid: u32| {
         segments
             .iter()
@@ -331,7 +329,7 @@ fn prove_protections(
 /// the first usable region that can hold both. Returns the allocator, the pool and the
 /// pool's physical address.
 fn init_memory(
-    com1: &mut Uart16550<Com1>,
+    com1: &mut Console,
     regions: &'static [MemoryRegion],
 ) -> Option<(FrameAllocator<'static>, &'static [Table], u64)> {
     let words = frames::words_for(frames::covered_end(regions));
@@ -394,7 +392,7 @@ fn init_memory(
 /// Proves the heap with real `alloc` collections: a large vector (a frame run), thousands
 /// of boxes (slabs), a B-tree map and a string, with their contents checked; then that
 /// dropping them all returns the heap and the frame allocator exactly to where they were.
-fn prove_heap(com1: &mut Uart16550<Com1>) -> bool {
+fn prove_heap(com1: &mut Console) -> bool {
     use alloc::boxed::Box;
     use alloc::collections::BTreeMap;
     use alloc::string::String;
@@ -453,7 +451,7 @@ fn prove_heap(com1: &mut Uart16550<Com1>) -> bool {
 
 /// Sends this processor an NMI (x2APIC ICR, NMI delivery, "self" shorthand) and checks
 /// that it was taken on the dedicated NMI stack (IST2), not on the interrupted stack.
-fn prove_nmi_ist(com1: &mut Uart16550<Com1>) -> bool {
+fn prove_nmi_ist(com1: &mut Console) -> bool {
     let (before, _) = cpu::nmis();
     // SAFETY: CPL 0, boot processor; x2APIC mode is on (timer bring-up), so this is a no-op
     // transition yielding the handle.
@@ -481,7 +479,7 @@ const USER_PROBE_PAGE: u64 = 0x0000_7FFF_FFFF_E000;
 /// Enables SMEP and SMAP and proves both: a temporary user page holding `mov rax, -1;
 /// ret`, which a supervisor fetch (SMEP) and a supervisor read (SMAP) must both fault on.
 /// The page is removed afterwards.
-fn prove_user_isolation(com1: &mut Uart16550<Com1>) -> bool {
+fn prove_user_isolation(com1: &mut Console) -> bool {
     use alloc::alloc::{Layout, alloc_zeroed, dealloc};
     // SAFETY: CPL 0, and the kernel has no user mappings yet.
     let (smep, smap) = unsafe { cpu::enable_smep_smap() };
@@ -553,7 +551,7 @@ fn prove_user_isolation(com1: &mut Uart16550<Com1>) -> bool {
 }
 
 /// Proves the allocator by allocating, writing, reading back and freeing three frames.
-fn prove_frames(com1: &mut Uart16550<Com1>, alloc: &mut FrameAllocator<'_>) {
+fn prove_frames(com1: &mut Console, alloc: &mut FrameAllocator<'_>) {
     let mut got = [0u64; 3];
     for (i, slot) in got.iter_mut().enumerate() {
         let Some(addr) = alloc.allocate() else {
@@ -723,14 +721,10 @@ pub(crate) unsafe fn inb(port: u16) -> u8 {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     if !PANICKING.swap(true, Ordering::AcqRel) {
-        // SAFETY: the kernel runs at CPL 0 on the boot processor only. A panic interrupts
-        // `_start` on that same processor, so nothing drives COM1 concurrently; at worst a
-        // half-written line is followed by the panic line.
-        let mut com1 = Uart16550::new(unsafe { Com1::new() });
-        if !COM1_READY.load(Ordering::Acquire) {
-            com1.init();
-        }
-        let _ = report::write_panic(&mut com1, info);
+        // The urgent console never waits long for its lock, so a panic inside the console
+        // still reports; before `console::init` it programs COM1 itself.
+        let mut out = console::Console::urgent();
+        let _ = report::write_panic(&mut out, info);
     }
     halt()
 }

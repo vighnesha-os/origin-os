@@ -21,7 +21,6 @@ use framekernel::descriptors::{
     self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, MACHINE_CHECK_IST, NMI_IST,
     TSS, TSS_SIZE,
 };
-use framekernel::serial::Uart16550;
 
 /// Size of the double-fault stack.
 const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
@@ -549,9 +548,8 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
             return here;
         }
     }
-    // SAFETY: COM1 was programmed by `_start` before `init` installed any gate, and only
-    // this processor runs; an exception interrupts `_start` on that same processor.
-    let mut com1 = Uart16550::new(unsafe { crate::Com1::new() });
+    // An exception report must get out even if this processor faulted inside the console.
+    let mut com1 = crate::console::Console::urgent();
     let vector = frame.vector as u8;
     let _ = writeln!(
         com1,
@@ -574,6 +572,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         frame.rsi, frame.rdi, frame.rbp, frame.r8, frame.r9, frame.r10, frame.r11,
     );
     let _ = (frame.r12, frame.r13, frame.r14, frame.r15, frame.ss);
+    drop(com1);
     crate::halt()
 }
 
@@ -587,8 +586,7 @@ fn sys_write(buf: u64, len: u64) -> u64 {
     if let Err(e) = copy_from_user(dst, buf) {
         return e;
     }
-    // SAFETY: as in `dispatch`: COM1 is programmed and this processor drives it.
-    let mut com1 = Uart16550::new(unsafe { crate::Com1::new() });
+    let mut com1 = crate::console::Console::new();
     let _ = com1.write_str("origin-kernel: user mode: write: ");
     for &b in dst.iter() {
         let c = if (0x20..0x7F).contains(&b) {
