@@ -569,6 +569,17 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 7 `ps2` tests (lower case with releases, Shift capitals and symbols, Caps Lock on letters only, Ctrl typing nothing, the extended keys, make/break and function keys, and typing the whole string "Origin OS!"); 139 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** live keystrokes need the keyboard IRQ (vector routing through the I/O APIC, not wired yet), the keyboard device reset and LED/typematic control, scancode set 2 without translation, USB HID keyboards, and other layouts.
 
+### The HPET: discovery and a rate cross-check (CLAUDE.md §68; 2026-11-08)
+
+- **What:**
+  - `hpet` (library): parses the ACPI HPET table (the MMIO base from the GAS at offset 44, with the address-space and alignment checked) and the main-counter arithmetic (the period in femtoseconds from the capabilities register, period → frequency, a counter delta → nanoseconds, rate agreement). Pure, host-tested.
+  - `time::prove_hpet`: finds the HPET through ACPI, maps its registers uncached, enables the main counter, and measures a counter delta against a TSC-timed ~20 ms window, requiring the HPET-measured and TSC-measured elapsed times to agree within 2 %.
+- **Proof** (every boot): "HPET: at 0xfed00000, 100 MHz counter (period 10000000 fs); 20 ms elapsed by the HPET, 20 ms by the TSC". QEMU's HPET is a 100 MHz counter; the two clocks agree.
+- **A boot-test lesson:** mapping the HPET first took the MMIO window's first slot (0xffffe00000000000), so the PCIe ECAM then mapped one slot higher and a marker that had hard-coded the ECAM's virtual address stopped matching. The virtual address is an allocation detail, so that marker now matches "uncached true, 2 MiB pages" without it. (The debug that found this — printing the first unmatched marker on a timeout — was removed.)
+- **Negative control** (failing the boot test): the second counter read forced equal to the first (a frozen counter) → "0 ms elapsed by the HPET, 20 ms by the TSC: HPET failed".
+- **Test evidence:** 4 `hpet` tests (a valid table, bad addresses and short tables, the counter arithmetic at 100 MHz and 14.318 MHz, rate agreement); 143 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** HPET comparators as timer interrupt sources (one-shot and periodic), using the HPET as the wall-clock reference, and the ACPI PM timer as a further fallback.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

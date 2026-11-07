@@ -28,6 +28,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use framekernel::acpi;
 use framekernel::clock::{self, NANOS_PER_SECOND, Scale, SharedScale};
+use framekernel::hpet;
 use framekernel::rtc::{self, DateTime, Registers, register};
 use origin_sync::SpinLock;
 
@@ -235,7 +236,92 @@ pub(crate) fn init(com1: &mut Console, calibrated_hz: u64, rsdp: u64) -> bool {
         None => {}
     }
     ok &= set_wall_clock(com1, scale, edge, century, rtc_present);
+    ok &= prove_hpet(com1, rsdp, scale);
     ok
+}
+
+/// Reads the HPET's 64-bit register at `virt + offset`.
+fn hpet_read(virt: u64, offset: u64) -> u64 {
+    let p = core::ptr::with_exposed_provenance::<u64>((virt + offset) as usize);
+    // SAFETY: `virt` maps the HPET's registers uncached (just mapped); `offset` names a
+    // 64-bit-aligned register inside the 1 KiB block, and a register read has no memory
+    // effect.
+    unsafe { p.read_volatile() }
+}
+
+/// Writes the HPET's 64-bit register at `virt + offset`.
+fn hpet_write(virt: u64, offset: u64, value: u64) {
+    let p = core::ptr::with_exposed_provenance_mut::<u64>((virt + offset) as usize);
+    // SAFETY: as for `hpet_read`; the only register written here is General Configuration,
+    // which affects only the HPET.
+    unsafe { p.write_volatile(value) };
+}
+
+/// Discovers the HPET through ACPI, enables its main counter, and checks it advances at the
+/// rate its capabilities register declares, consistent with the TSC (CLAUDE.md §68). No
+/// HPET is reported and passes.
+fn prove_hpet(com1: &mut Console, rsdp: u64, scale: Scale) -> bool {
+    let Ok(table) = crate::firmware::acpi_table(rsdp, b"HPET") else {
+        let _ = writeln!(com1, "origin-kernel: HPET: no table");
+        return true;
+    };
+    let info = match hpet::parse(table) {
+        Ok(i) => i,
+        Err(e) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: HPET: invalid table: {e:?}: HPET failed"
+            );
+            return false;
+        }
+    };
+    let virt = match crate::vm::map_mmio(info.base, 0x1000) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: HPET: cannot map {:#x}: {e:?}: HPET failed",
+                info.base
+            );
+            return false;
+        }
+    };
+    let cap = hpet_read(virt, hpet::register::CAPABILITIES);
+    let Some(declared_hz) = hpet::frequency_hz(cap) else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: HPET: capabilities {cap:#x} give no usable period: HPET failed"
+        );
+        return false;
+    };
+    let period = hpet::period_fs(cap);
+    // Enable the main counter.
+    let config = hpet_read(virt, hpet::register::CONFIG);
+    hpet_write(virt, hpet::register::CONFIG, config | hpet::ENABLE_CNF);
+    // Measure over about 20 ms of the TSC.
+    let c0 = hpet_read(virt, hpet::register::COUNTER);
+    let t0 = rdtsc();
+    let window = scale.hz() / 50;
+    while rdtsc().wrapping_sub(t0) < window {
+        core::hint::spin_loop();
+    }
+    let c1 = hpet_read(virt, hpet::register::COUNTER);
+    let t1 = rdtsc();
+    let hpet_nanos = hpet::ticks_to_nanos(c1.wrapping_sub(c0), period);
+    let tsc_nanos = scale.nanos(t1.wrapping_sub(t0));
+    // The counter must advance (not frozen) and agree with the TSC within 2 %.
+    let advanced = c1 != c0;
+    let agree = advanced && hpet_nanos != 0 && hpet::agree(hpet_nanos, tsc_nanos, 20);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: HPET: at {:#x}, {} MHz counter (period {period} fs); {} ms elapsed by the HPET, {} ms by the TSC{}",
+        info.base,
+        declared_hz / 1_000_000,
+        hpet_nanos / 1_000_000,
+        tsc_nanos / 1_000_000,
+        if agree { "" } else { ": HPET failed" }
+    );
+    agree
 }
 
 /// Sets the wall clock from the RTC reading taken at TSC `t1`, just after an update.
