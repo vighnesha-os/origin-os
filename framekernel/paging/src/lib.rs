@@ -1,6 +1,7 @@
 //! x86-64 4-level paging (Intel SDM Vol. 3A §4.5 and Tables 4-14 to 4-20; AMD64 APM Vol. 2
-//! §5.3): page-table entries and an address-space builder, the third M2 step (CLAUDE.md
-//! §28: virtual memory, page tables).
+//! §5.3): page-table entries and an address-space builder (CLAUDE.md §28: virtual memory,
+//! page tables). Shared by the UEFI loader, which builds the kernel's first higher-half
+//! tables (ADR-0004 H4), and the Framekernel.
 //!
 //! The walk reaches table frames through [`TableMemory`], a safe interface that returns
 //! `None` for any address it does not hold, so this module needs no `unsafe` and is tested
@@ -14,6 +15,9 @@
 //! that is both writable and executable, and every leaf that is not executable sets NX.
 //! Intermediate entries are permissive (present and writable, and user when a user leaf
 //! lies below), so the leaf alone decides access.
+
+#![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

@@ -20,6 +20,7 @@ bench = false
 
 [dependencies]
 origin-boot-info.workspace = true
+origin-paging = { path = "paging" }
 origin-sync = { path = "sync" }
 origin-version.workspace = true
 
