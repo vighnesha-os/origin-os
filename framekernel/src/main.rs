@@ -234,6 +234,8 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                 (free * memory::FRAME) >> 20
             );
         }
+        // CPU topology from CPUID leaf 0Bh (CLAUDE.md §24, §27).
+        prove_topology(&mut com1, online.ids());
         // M3, second step: preemptive kernel threads on every online processor.
         sched::prove(&mut com1, online.ids(), tsc_hz);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
@@ -533,6 +535,40 @@ fn prove_vfs(com1: &mut console::Console) {
         listed.len(),
         fs.node_count(),
         if ok { "" } else { ": vfs failed" }
+    );
+}
+
+/// Reports the CPU topology from CPUID leaf 0Bh and checks that the online processors'
+/// x2APIC IDs decompose consistently (every package/core/thread triple unique), the
+/// groundwork for topology-aware scheduling (CLAUDE.md §24, §27).
+fn prove_topology(com1: &mut console::Console, ids: &[u32]) {
+    use framekernel::topology::Topology;
+    // Read leaf 0Bh sub-leaves until one reports level type 0 (or four, enough for SMT and
+    // core).
+    let mut subs = [[0u32; 4]; 4];
+    let mut n = 0;
+    if cpu::cpuid(0)[0] >= 0x0B {
+        for (i, slot) in subs.iter_mut().enumerate() {
+            *slot = cpu::cpuid_subleaf(0x0B, i as u32);
+            n = i + 1;
+            if (slot[2] >> 8) & 0xFF == 0 {
+                break;
+            }
+        }
+    }
+    let topology = Topology::decode(&subs[..n]);
+    let mut scratch = [(0u32, 0u32, 0u32); crate::sched::MAX_CPUS];
+    let (counts, consistent) = framekernel::topology::analyze(&topology, ids, &mut scratch);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: topology: {} logical, {} cores, {} packages ({} threads/core, {} logical/package); consistent {}{}",
+        counts.threads,
+        counts.cores,
+        counts.packages,
+        topology.threads_per_core(),
+        topology.logical_per_package(),
+        consistent,
+        if consistent { "" } else { ": topology failed" }
     );
 }
 

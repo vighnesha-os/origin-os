@@ -686,6 +686,26 @@ pub(crate) fn cpuid(leaf: u32) -> [u32; 4] {
     [eax, ebx, ecx, edx]
 }
 
+/// CPUID `leaf` with sub-leaf `sub` in ECX: `[eax, ebx, ecx, edx]`.
+pub(crate) fn cpuid_subleaf(leaf: u32, sub: u32) -> [u32; 4] {
+    let (eax, ebx, ecx, edx): (u32, u32, u32, u32);
+    // SAFETY: CPUID is available on every x86-64 processor and reads no memory. RBX is
+    // reserved by LLVM, so it is moved out through another register and restored.
+    unsafe {
+        asm!(
+            "mov {save:r}, rbx",
+            "cpuid",
+            "xchg {save:r}, rbx",
+            save = out(reg) ebx,
+            inout("eax") leaf => eax,
+            inout("ecx") sub => ecx,
+            out("edx") edx,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    [eax, ebx, ecx, edx]
+}
+
 /// Whether the processor supports the execute-disable bit (CPUID 8000_0001h EDX bit 20).
 pub(crate) fn nx_supported() -> bool {
     cpuid(0x8000_0000)[0] >= 0x8000_0001 && cpuid(0x8000_0001)[3] & (1 << 20) != 0

@@ -32,6 +32,7 @@
 //! - [`net`]: Ethernet/IPv4/ICMP/ARP headers and the Internet checksum;
 //! - [`tcp`]: TCP segments and a minimal connection state machine;
 //! - [`timers`]: a monotonic-deadline timer queue;
+//! - [`topology`]: CPU topology (SMT/core/package) from CPUID leaf 0Bh;
 //! - [`nvme`]: NVMe controller registers, queue entries and indexes, Identify data;
 //! - [`paging`]: 4-level page tables with structural W^X (the `origin-paging` crate,
 //!   shared with the loader);
@@ -85,5 +86,6 @@ pub mod tcp;
 #[cfg(test)]
 mod testing;
 pub mod timers;
+pub mod topology;
 pub mod unwind;
 pub mod vfs;

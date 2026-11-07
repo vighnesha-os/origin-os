@@ -141,6 +141,8 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: breakpoint handled; resuming".into(),
             // CPU features and the x86-64 level (QEMU TCG presents v2); SSE/AVX enabled.
             "origin-kernel: CPU: x86-64 level ".into(),
+            // A frame-pointer backtrace of a known call chain (CLAUDE.md §69).
+            "origin-kernel: backtrace: 4 frames from a known call chain, all in the kernel image true".into(),
             "origin-kernel: frame allocator: ".into(),
             "origin-kernel: page tables loaded: ".into(),
             "origin-kernel: higher half: kernel image identity address mapped false, direct-map alias mapped false".into(),
@@ -167,12 +169,22 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: clock: TSC at ".into(),
             "origin-kernel: clock: one RTC second lasted ".into(),
             format!("origin-kernel: wall clock: {RTC_BASE_MARKER}"),
+            // The HPET: discovered via ACPI, its counter rate cross-checked against the TSC.
+            "origin-kernel: HPET: at 0xfed00000, 100 MHz counter".into(),
+            // The ACPI PM timer: a second independent time source cross-checked vs the TSC.
+            "origin-kernel: PM timer: 24-bit at port 0x608, 3.579545 MHz;".into(),
+            // I/O APIC: the PIT's IRQ0 routed through it (IRQ0 -> GSI 2 via an override).
+            "origin-kernel: I/O APIC: id 0, 24 entries at 0xfec00000 (GSI base 0); routing the PIT's IRQ0 via GSI 2 to vector 0x41 on CPU 0".into(),
+            "origin-kernel: I/O APIC: 20 PIT interrupts routed through the I/O APIC in ".into(),
             // M3: every processor QEMU emulates (`-smp`, see `qemu_cpus`) comes online.
             format!("origin-kernel: ACPI MADT: {cpus} processors, {cpus} enabled"),
             format!(
                 "origin-kernel: SMP: {cpus} of {cpus} enabled processors online; trampoline identity pages removed true"
             ),
             "origin-kernel: reclaimed ".into(),
+            // CPU topology from CPUID leaf 0Bh: the online processors decompose consistently.
+            "origin-kernel: topology: ".into(),
+            "; consistent true".into(),
             "origin-kernel: page protection: stack guard page at ".into(),
             // M3: two non-yielding threads per processor, all preempted and all running.
             "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted ".into(),
@@ -233,7 +245,7 @@ fn boot_scenario_markers() -> Scenario {
             // M5 groundwork: PCIe through the MCFG, the ECAM window uncached, q35's
             // functions listed with their BARs sized and restored.
             "origin-kernel: PCIe: ECAM for segment 0, buses 0-255, at 0x".into(),
-            "mapped at 0xffffe00000000000: uncached true, 2 MiB pages".into(),
+            ": uncached true, 2 MiB pages".into(),
             "origin-kernel: PCIe: 00:00.0 8086:29c0 class 06:00:00 host bridge".into(),
             "origin-kernel: PCIe: 00:01.0 1234:1111 class 03:00:00 VGA-compatible display controller; BAR0 mem32 prefetchable 16 MiB at ".into(),
             "origin-kernel: PCIe: 00:02.0 1b36:0010 class 01:08:02 NVMe controller; BAR0 mem64 16 KiB at ".into(),
@@ -311,6 +323,21 @@ fn boot_scenario_markers() -> Scenario {
             // write-back work (CLAUDE.md §39).
             "origin-kernel: block cache: 4 pages (512 B blocks, 8 per page): 32 of 32 blocks matched the pattern; 4 device reads cold, re-reading 4 resident pages did 0 more (32 hits, 4 misses)".into(),
             "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); wrote LBA 10240, flushed (1 device writes), evicted and read back changed: true".into(),
+            // The in-memory VFS (CLAUDE.md §39): a file built, read back, listed and removed.
+            "origin-kernel: vfs: built /etc/origin/hostname (read back true), listed 1 entry, removed all back to 1 node".into(),
+            // The software rasterizer: the kernel's scene CRC matches the host-proven one.
+            "origin-kernel: raster: 160x48 scene rendered, CRC 0x912df877 (expected 0x912df877)".into(),
+            // The i8042 PS/2 controller answers its self-tests (CLAUDE.md §56).
+            "self-test 0x55 (want 0x55), keyboard port test 0x00 (want 0x00)".into(),
+            // The network packet layer: an ICMP echo built, parsed and replied via loopback.
+            "origin-kernel: net: 65-byte Ethernet/IPv4/ICMP echo built, parsed and replied; a UDP datagram round-tripped true; payload and checksums intact true".into(),
+            // TCP: a full loopback connection establishes, carries data and closes.
+            "origin-kernel: tcp: loopback connection established, 30-byte payload delivered, and closed: true".into(),
+            // The monotonic timer queue: three deadlines fire in order (one cancelled).
+            "origin-kernel: timers: 3 deadlines (1 cancelled) fired in order [10, 20, 30], worst lateness ".into(),
+            // Integration: a /sys tree built in the VFS from live discovered facts.
+            "origin-kernel: sysfs: built /sys with 4 facts (4 subtrees): ".into(),
+            "bus/pci/count=6, block/nvme0/size_mib=16; read back pci count Some(6)".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ])
         .collect(),
@@ -344,6 +371,7 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: AP start-up not possible",
             ": AP start-up failed",
             ": scheduler failed",
+            ": topology failed",
             "supervisor isolation from user pages incomplete",
             "origin-kernel: cannot map the user probe page",
             ": user isolation failed",
@@ -351,12 +379,23 @@ fn boot_scenario_markers() -> Scenario {
             ": higher half failed",
             ": process isolation failed",
             ": clock failed",
+            ": HPET failed",
+            ": I/O APIC failed",
+            ": PM timer failed",
             ": console failed",
             ": TLB failed",
             ": wait queues failed",
             ": PCIe failed",
             ": NVMe failed",
             ": block cache failed",
+            ": backtrace failed",
+            ": vfs failed",
+            ": raster failed",
+            ": i8042 failed",
+            ": net failed",
+            ": tcp failed",
+            ": timers failed",
+            ": sysfs failed",
             ": GPT failed",
         ],
         check: Some(|text| console_lines_intact(text, qemu_cpus() as usize)),

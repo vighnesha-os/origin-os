@@ -638,6 +638,14 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** the `acpi` FADT test checks the new fields; 163 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** using the PM timer as the wall-clock reference when the TSC is not invariant, and handling the PM timer's overflow interrupt.
 
+### CPU topology from CPUID (CLAUDE.md §24, §27; 2026-11-08)
+
+- **What:** `topology` (library) decodes CPUID leaf 0Bh sub-leaves into the bit widths that split an x2APIC ID into SMT thread, core and package, with `split`, `are_siblings`, and `analyze` (group a set of processors into package/core/thread counts and check every triple is unique). A flat fallback when the leaf is absent. Pure, no `unsafe`. `cpu::cpuid_subleaf` reads a leaf with a sub-leaf in ECX.
+- **Proof** (every boot): the online processors' x2APIC IDs decompose consistently. QEMU `-smp N` presents N single-thread cores in one package: "topology: 2 logical, 2 cores, 1 packages (1 threads/core, 2 logical/package); consistent true" (and 4 cores at `-smp 4`).
+- **Why no boot-level negative control:** distinct x2APIC IDs always decompose to distinct `(package, core, thread)` triples under any `smt_width ≤ core_width` (the split is injective, and `decode` enforces the bound), so the `consistent` check can only fail on duplicate IDs — a firmware fault, not something a code change toggles. The failure path is covered by the host test, where `analyze` with duplicate IDs returns `unique = false`.
+- **Test evidence:** 3 `topology` tests (width decode and ID splitting, the flat fallback, and `analyze`'s package/core/thread counts with a duplicate-ID rejection); 166 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs (and an earlier 8-CPU boot).
+- **Not done:** using the topology for scheduler placement (SMT-aware and cache-aware, §27), the cache hierarchy from leaf 04h, and hybrid-core capacity (§27).
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.
