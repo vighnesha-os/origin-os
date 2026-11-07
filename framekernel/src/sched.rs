@@ -63,12 +63,18 @@ fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
 /// The timer interrupted the context whose frame is at `interrupted`; returns the frame to
 /// resume. Processors without an active queue keep running what they were running.
 pub(crate) fn on_tick(interrupted: u64) -> u64 {
-    let id = this_cpu();
-    match (ACTIVE.get(id), QUEUES.get(id)) {
-        (Some(active), Some(queue)) if active.load(Ordering::Acquire) => {
-            queue.lock().tick(interrupted)
-        }
-        _ => interrupted,
+    with_queue(interrupted, |q| Some(q.tick(interrupted)))
+}
+
+/// Points TSS.RSP0 at the kernel stack of the thread in `slot` on CPU `id`, so an
+/// interrupt from user mode always lands on the running thread's own stack. The boot or
+/// idle flow (no recorded stack) never runs in user mode, so RSP0 is left as it is.
+fn follow_kernel_stack(id: usize, slot: usize) {
+    if let Some(stack) = THREADS
+        .get(id)
+        .and_then(|t| t.lock().stacks.get(slot).copied().flatten())
+    {
+        cpu::set_kernel_stack((stack.guard + 4096 + stack.bytes as u64) & !0xF);
     }
 }
 
@@ -155,7 +161,10 @@ fn with_queue(interrupted: u64, f: impl FnOnce(&mut RunQueue) -> Option<u64>) ->
     let id = this_cpu();
     match (ACTIVE.get(id), QUEUES.get(id)) {
         (Some(active), Some(queue)) if active.load(Ordering::Acquire) => {
-            f(&mut queue.lock()).unwrap_or(interrupted)
+            let mut q = queue.lock();
+            let next = f(&mut q).unwrap_or(interrupted);
+            follow_kernel_stack(id, q.current());
+            next
         }
         _ => interrupted,
     }

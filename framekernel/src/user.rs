@@ -40,9 +40,14 @@ static EXIT_CODE: AtomicU64 = AtomicU64::new(0);
 static FAULT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// User threads that have ended, by exit or by fault.
 static ENDED: AtomicU64 = AtomicU64::new(0);
+/// Bit `v` is set when a report system call carried `v` (v < 64).
+static REPORT_MASK: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn record_report(value: u64) {
     REPORTED.store(value + 1, Ordering::Relaxed);
+    if value < 64 {
+        REPORT_MASK.fetch_or(1 << value, Ordering::Relaxed);
+    }
 }
 
 pub(crate) fn record_exit(code: u64) {
@@ -76,17 +81,67 @@ fn programs(kernel_address: u64) -> [(usize, alloc::vec::Vec<u8>); 3] {
     [(0x000, good), (0x100, reader), (0x200, privileged)]
 }
 
-/// A kernel thread that becomes a user thread at `entry`.
+/// Iterations of the compute-bound programs: long enough to be preempted many times.
+const SPIN: u32 = 40_000_000;
+
+/// A compute-bound program at `offset` 0x300 + 0x40·k: counts `SPIN` down, checks that
+/// RSP is still its own stack top (else reports 63), reports `value`, and exits.
+fn spinner(value: u8, stack_top: u64) -> alloc::vec::Vec<u8> {
+    let mut p = alloc::vec![0xB9]; // mov ecx, SPIN
+    p.extend_from_slice(&SPIN.to_le_bytes());
+    p.extend_from_slice(&[0xFF, 0xC9, 0x75, 0xFC]); // 1: dec ecx; jnz 1b
+    p.extend_from_slice(&[0x48, 0xB8]); // movabs rax, stack_top
+    p.extend_from_slice(&stack_top.to_le_bytes());
+    p.extend_from_slice(&[0x48, 0x39, 0xC4]); // cmp rsp, rax
+    p.extend_from_slice(&[0xBF, value, 0, 0, 0]); // mov edi, value
+    p.extend_from_slice(&[0x74, 0x05]); // je +5 (skip the next mov)
+    p.extend_from_slice(&[0xBF, 63, 0, 0, 0]); // mov edi, 63
+    p.extend_from_slice(&[0xB8, 1, 0, 0, 0, 0xCD, 0x80]); // report
+    p.extend_from_slice(&[0x31, 0xFF, 0x31, 0xC0, 0xCD, 0x80, 0xEB, 0xFE]); // exit 0
+    p
+}
+
+/// A kernel thread that becomes a user thread at `entry`, with the stack top `STACK +
+/// 4096` (or, for the spinners, their own half of the stack page).
 extern "sysv64" fn user_thread(entry: u64) -> ! {
+    let stack_top = match entry.checked_sub(CODE + 0x300) {
+        Some(k) => STACK + 2048 * (k / 0x40 + 1),
+        None => STACK + 4096,
+    };
     match sched::current_stack_top() {
         Some(top) => {
             cpu::set_kernel_stack(top);
             // SAFETY: `entry` and the stack are in the user pages `prove` mapped; RSP0 is
-            // this thread's own kernel stack, which it leaves for good here.
-            unsafe { cpu::enter_user(entry, STACK + 4096, cpu::cpu_local_base()) }
+            // this thread's own kernel stack, which it leaves for good here (the scheduler
+            // keeps RSP0 on the running thread's stack from now on).
+            unsafe { cpu::enter_user(entry, stack_top, cpu::cpu_local_base()) }
         }
         None => sched::exit(),
     }
+}
+
+/// Two compute-bound user threads at once, preempted by the timer: both must finish with
+/// the right report, which needs TSS.RSP0 to follow every context switch (otherwise one
+/// thread's interrupt frames would land on the other's kernel stack).
+fn concurrent(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool {
+    REPORT_MASK.store(0, Ordering::Relaxed);
+    let ended = ENDED.load(Ordering::Acquire);
+    let started = crate::cpu::rdtsc();
+    for k in 0..2 {
+        if sched::spawn(bsp, user_thread, CODE + 0x300 + 0x40 * k).is_err() {
+            return false;
+        }
+    }
+    sched::yield_until(|| ENDED.load(Ordering::Acquire) >= ended + 2, tsc_hz, 10);
+    let ms = crate::cpu::rdtsc().wrapping_sub(started) / (tsc_hz / 1000).max(1);
+    let mask = REPORT_MASK.load(Ordering::Relaxed);
+    let right = mask == 0b110 && ENDED.load(Ordering::Acquire) == ended + 2;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: user mode: two compute-bound user threads at once finished in {ms} ms, reports {mask:#b}; kernel stack follows every switch{}",
+        if right { "" } else { ": user isolation failed" }
+    );
+    right
 }
 
 /// A program's name, the value it reports, and the fault (vector, error code) that must
@@ -109,6 +164,19 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool
     for (offset, bytes) in programs(kernel_address) {
         // SAFETY: each program is under 0x100 bytes and lands inside the fresh code frame.
         unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), code.wrapping_add(offset), bytes.len()) };
+    }
+    // Two spinners for the concurrent phase, each with its own half of the stack page.
+    for (k, value) in [(0usize, 1u8), (1, 2)] {
+        let top = STACK + 2048 * (k as u64 + 1);
+        let bytes = spinner(value, top);
+        // SAFETY: each spinner is under 0x40 bytes and lands inside the code frame.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                code.wrapping_add(0x300 + 0x40 * k),
+                bytes.len(),
+            );
+        }
     }
     let mapped = vm::map_user(CODE, code.expose_provenance() as u64, Access::ReadExecute)
         .and_then(|()| vm::map_user(STACK, stack.expose_provenance() as u64, Access::ReadWrite));
@@ -154,6 +222,9 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool
                 if right { "" } else { ": user isolation failed" }
             );
         }
+    }
+    if ok {
+        ok &= concurrent(com1, bsp, tsc_hz);
     }
     let _ = vm::unmap(CODE);
     let _ = vm::unmap(STACK);
