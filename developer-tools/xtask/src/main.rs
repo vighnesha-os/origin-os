@@ -35,22 +35,28 @@ environment:
 const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 const LOADER_PACKAGE: &str = "origin-boot-uefi";
 const LOADER_BIN: &str = "origin-boot";
+const VERSION_PACKAGE: &str = "origin-version";
 const QEMU: &str = "qemu-system-x86_64";
 const DEFAULT_BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Lines `boot-test` requires, in this order.
 ///
-/// The last two come from OVMF's boot manager, not from the loader. They show that the
-/// firmware received `EFI_UNSUPPORTED` as the image's return value, which checks the
+/// The banner is built from the same generated constants the loader uses, so the test
+/// also checks that the release identity in origin-version.toml reached the binary.
+/// The last two markers come from OVMF's boot manager, not from the loader. They show that
+/// the firmware received `EFI_UNSUPPORTED` as the image's return value, which checks the
 /// `efiapi` return path end to end.
-const BOOT_MARKERS: &[&str] = &[
-    "Origin OS UEFI loader (development build)",
-    "origin-boot: UEFI 2.",
-    "origin-boot: firmware ",
-    "origin-boot: Framekernel loading is not implemented yet (M1 step 2); returning EFI_UNSUPPORTED",
-    "BdsDxe: failed to start Boot0001 ",
-    "): Unsupported",
-];
+fn boot_markers() -> Vec<String> {
+    use origin_version::{BUILD, PRODUCT, VERSION};
+    vec![
+        format!("{PRODUCT} {VERSION} UEFI loader (build {BUILD})"),
+        "origin-boot: UEFI 2.".into(),
+        "origin-boot: firmware ".into(),
+        "origin-boot: Framekernel loading is not implemented yet (M1 step 2); returning EFI_UNSUPPORTED".into(),
+        "BdsDxe: failed to start Boot0001 ".into(),
+        "): Unsupported".into(),
+    ]
+}
 
 /// Output that fails `boot-test` as soon as it appears.
 const FAILURE_MARKERS: &[&str] = &["origin-boot: panic:"];
@@ -159,16 +165,72 @@ fn check() -> Result {
             "-D",
             "warnings",
         ],
+        // The generated release identity: library, tests and build script.
+        &[
+            "clippy",
+            "--package",
+            VERSION_PACKAGE,
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
         &["test", "--package", "xtask"],
         &["test", "--package", LOADER_PACKAGE, "--lib"],
+        &["test", "--package", VERSION_PACKAGE],
     ];
     for step in steps {
         run_step(cargo().args(*step))?;
     }
     build_loader()?;
     linux_cfg_lint()?;
+    manifest_version_lint()?;
     println!("xtask: check passed");
     Ok(())
+}
+
+/// CLAUDE.md §62: a version is written by hand only in origin-version.toml. No Cargo
+/// manifest may declare a package version, including `version.workspace = true`.
+fn manifest_version_lint() -> Result {
+    let root = repo_root();
+    let mut manifests = Vec::new();
+    collect_files(
+        &root,
+        &|_| false,
+        &|name| name == "Cargo.toml",
+        &mut manifests,
+    )
+    .map_err(|e| format!("version lint: {e}"))?;
+    let mut hits = Vec::new();
+    for file in &manifests {
+        let text = fs::read_to_string(file)
+            .map_err(|e| format!("version lint: {}: {e}", file.display()))?;
+        let mut section = String::new();
+        for (n, line) in text.lines().enumerate() {
+            let t = line.trim();
+            if t.starts_with('[') {
+                section = t.trim_matches(|c| c == '[' || c == ']').trim().to_string();
+                continue;
+            }
+            let key = t.split(['=', '.']).next().unwrap_or("").trim();
+            if (section == "package" || section == "workspace.package") && key == "version" {
+                let shown = file.strip_prefix(&root).unwrap_or(file);
+                hits.push(format!("{}:{}: {t}", shown.display(), n + 1));
+            }
+        }
+    }
+    println!(
+        "xtask: §62 version lint scanned {} Cargo manifests",
+        manifests.len()
+    );
+    if hits.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "crate versions must come from origin-version.toml, not Cargo manifests (CLAUDE.md §62):\n{}",
+            hits.join("\n")
+        ))
+    }
 }
 
 /// CLAUDE.md §11: Origin code compiles for the `x86_64-unknown-linux-gnu` triple only as a
@@ -177,7 +239,14 @@ fn check() -> Result {
 fn linux_cfg_lint() -> Result {
     let root = repo_root();
     let mut files = Vec::new();
-    collect_rust_files(&root, &mut files).map_err(|e| format!("cfg lint: {e}"))?;
+    let dev_tools = root.join("developer-tools");
+    collect_files(
+        &root,
+        &|dir| dir == dev_tools,
+        &|name| name.ends_with(".rs"),
+        &mut files,
+    )
+    .map_err(|e| format!("cfg lint: {e}"))?;
     let mut hits = Vec::new();
     for file in &files {
         let text =
@@ -204,20 +273,25 @@ fn linux_cfg_lint() -> Result {
     }
 }
 
-fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+/// Collects files under `dir` whose name satisfies `want`, in sorted order. Hidden
+/// directories, `target/` and any directory for which `skip` returns true are not entered.
+fn collect_files(
+    dir: &Path,
+    skip: &dyn Fn(&Path) -> bool,
+    want: &dyn Fn(&str) -> bool,
+    out: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if entry.file_type()?.is_dir() {
-            let skip = name.starts_with('.')
-                || name == "target"
-                || path == repo_root().join("developer-tools");
-            if !skip {
-                collect_rust_files(&path, out)?;
+            if !(name.starts_with('.') || name == "target" || skip(&path)) {
+                collect_files(&path, skip, want, out)?;
             }
-        } else if name.ends_with(".rs") {
+        } else if want(&name) {
             out.push(path);
         }
     }
@@ -406,6 +480,8 @@ fn boot_test() -> Result {
         s
     });
 
+    let markers = boot_markers();
+    let markers: Vec<&str> = markers.iter().map(String::as_str).collect();
     let started = Instant::now();
     let deadline = started + timeout;
     let mut raw = Vec::new();
@@ -417,7 +493,7 @@ fn boot_test() -> Result {
                 if let Some(m) = FAILURE_MARKERS.iter().find(|m| text.contains(**m)) {
                     break Err(format!("the serial output contains {m:?}"));
                 }
-                if serial::contains_in_order(&text, BOOT_MARKERS) {
+                if serial::contains_in_order(&text, &markers) {
                     break Ok(());
                 }
             }

@@ -13,16 +13,22 @@ resolver = "3"
 members = [
     "boot/uefi",
     "developer-tools/xtask",
+    "runtime/version",
 ]
-default-members = ["developer-tools/xtask"]
+# Host-buildable crates only. The UEFI loader's binary cannot be built for the host.
+default-members = ["developer-tools/xtask", "runtime/version"]
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.99.1"
 publish = false
-# No `version` here on purpose: the product version will be generated from
-# `origin-version.toml` (CLAUDE.md §62, task T5) rather than hand-edited per crate.
+# No `version` here or in any member, on purpose: the release identity lives only in
+# `origin-version.toml` and reaches code through the generated `origin-version` crate
+# (CLAUDE.md §62). `cargo xtask check` rejects a hand-written crate version.
 # No `license` yet: the project licence has not been chosen (SOURCE_PROVENANCE.md).
+
+[workspace.dependencies]
+origin-version = { path = "runtime/version" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

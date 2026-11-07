@@ -59,7 +59,14 @@ fn report(st: &SystemTable, out: &mut ConOut) -> core::fmt::Result {
     let n = unsafe { uefi::copy_char16_string(st.firmware_vendor, &mut vendor) };
     let vendor = vendor.get(..n).unwrap_or(&[]);
 
-    writeln!(out, "Origin OS UEFI loader (development build)")?;
+    // The release identity is generated from origin-version.toml (CLAUDE.md §62).
+    writeln!(
+        out,
+        "{} {} UEFI loader (build {})",
+        origin_version::PRODUCT,
+        origin_version::VERSION,
+        origin_version::BUILD
+    )?;
     writeln!(
         out,
         "origin-boot: UEFI {} system table",

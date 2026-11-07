@@ -1,0 +1,28 @@
+# Canonical Origin OS release identity (CLAUDE.md §62–§63).
+#
+# This is the only file where a version number is written by hand. Every first-party
+# module gets these values from the generated `origin-version` crate (runtime/version/);
+# no crate manifest carries its own `version` (enforced by `cargo xtask check`).
+#
+# The numbers below are independent of each other (ONBF-R8): changing the release version
+# does not change any compatibility identifier, and the other way round.
+#
+# Syntax: a strict subset of TOML. One `key = value` per line; values are "strings" or
+# non-negative integers. Unknown sections, unknown keys and duplicates fail the build.
+
+[release]
+# Product release version, SemVer 2.0. A pre-release tag marks a development line.
+# Build metadata ("+...") is not allowed here; the build number below carries it.
+version = "0.1.0-dev"
+# Monotonic build number for signed releases, incremented by release engineering.
+# 0 means this line has never been released.
+build = 0
+# Anti-rollback security version number, carried in the SYS manifest (ONBF §6.5, §7.6).
+# The boot loader refuses a release whose number is below the stored minimum.
+security-version = 0
+
+[compatibility]
+# ONBF container format, as `format_major.format_minor` in the header (ONBF §4.2).
+onbf-format = "1.0"
+# Further identifiers (boot-info ABI, Origin C ABI, driver ABI, manifest and data schemas)
+# are added when the interface they version first exists.

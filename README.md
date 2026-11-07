@@ -14,4 +14,6 @@ cargo xtask boot-test                                # boot the UEFI loader unde
 cargo xtask run                                      # same, with the serial console on this terminal
 ```
 
+The release version is written only in `origin-version.toml`; every module reads it through the generated `origin-version` crate, and `cargo xtask check` rejects a version in any Cargo manifest.
+
 Status: M0 (toolchain) and the first step of M1 (a UEFI loader that reports itself and returns to the firmware). There is no kernel yet. QEMU results are not hardware qualification.

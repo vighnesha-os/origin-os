@@ -94,7 +94,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - CLAUDE.md §10: a `BOOLEAN` is a `u8`; none crosses the boundary yet.
   - CLAUDE.md §19.
   - No third-party crates (CLAUDE.md §5; handoff §3).
-- **Dependencies:** `core` only.
+- **Dependencies:** `core`, and the first-party `origin-version` crate for the banner's release identity (since T5).
 - **Toolchain:** Rust 1.99.1, `x86_64-unknown-uefi`, rust-lld (msvc flavour).
 - **Unsafe inventory, reviewed 2026-11-07 by the author (not independently):**
   - Four `unsafe fn` with `# Safety` contracts: `efi_main`, `uefi::read_system_table`, `uefi::copy_char16_string`, `console::ConOut::new`.
@@ -115,20 +115,47 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `cargo xtask boot-test` passed in 1.8 s on QEMU 11.1.3 + edk2-stable202408 (q35, TCG):
     - The loader printed `UEFI 2.7 system table` and `firmware EDK II, revision 0x00010000`.
     - OVMF reported `failed to start Boot0001 …: Unsupported`, so the returned status reached the firmware intact.
+  - After T5 the banner reads `Origin OS 0.1.0-dev UEFI loader (build 0)`. `boot-test` builds the expected banner from the same generated constants, and it passes (1.8 s).
   - QEMU only. No physical hardware yet (CLAUDE.md §74).
+- **Licensing:** project licence not chosen yet.
+
+## `origin-version.toml` and `runtime/version/` (`origin-version`), T5
+
+- **What:**
+  - `origin-version.toml` is the canonical release identity (CLAUDE.md §62–§63) and the only place a version is written by hand. It holds:
+    - the release version, SemVer 2.0 without build metadata (ONBF §6.2);
+    - a monotonic `build` number;
+    - the anti-rollback `security-version` (ONBF §6.5, §7.6);
+    - the ONBF container version, `1.0` (ONBF §4.2).
+  - These numbers are independent of each other (ONBF-R8). No other ABI identifiers exist yet; each is added when its interface first exists.
+  - `origin-version` is a `no_std`, `forbid(unsafe_code)` crate. Its build script parses the file with a strict TOML-subset parser (`manifest.rs`) and generates the constants: `VERSION`, its parts, `BUILD`, `SECURITY_VERSION`, `ONBF_FORMAT_MAJOR` and `ONBF_FORMAT_MINOR`. `PRODUCT` is a plain constant.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code. The SemVer grammar follows semver.org 2.0.0.
+- **Architecture decisions:**
+  - The generated output depends only on `origin-version.toml`: no timestamps, host paths or git state (ONBF-R9, CLAUDE.md §75).
+  - Strict parsing: unknown sections or keys, duplicates, missing keys, escapes, leading zeros and trailing text are all errors. One file has one reading (ONBF-R6).
+  - The starting values (`0.1.0-dev`, build 0, security version 0) are a development default. The owner may change them.
+- **Dependencies:** `core` in the library; `std` in the build script (host only).
+- **Test evidence (2026-11-07):**
+  - 7 unit tests, covering 33 cases. One of them checks that the generated constants equal a fresh parse of the repository file.
+  - Negative checks by hand, with the files restored and compared with `cmp` afterwards:
+    - changing the version to `0.2.0-rc.1` reaches the rebuilt `.efi`, which proves the build script's `rerun-if-changed` works;
+    - `version = "0.2"` fails the build with `origin-version.toml:16: … expected MAJOR.MINOR.PATCH`;
+    - a hand-written `version` in a crate manifest fails `xtask check`, naming the file and line.
 - **Licensing:** project licence not chosen yet.
 
 ## `developer-tools/xtask/` (`xtask`)
 
 - **What:** host-side build orchestration, with four commands:
-  - `check`: rustfmt, clippy and tests per crate and target; the UEFI release build; the CLAUDE.md §11 `target_os = "linux"` lint over all Rust files outside `developer-tools/`.
+  - `check`: rustfmt, clippy and tests per crate and target; the UEFI release build; two lints:
+    - CLAUDE.md §11: no `target_os = "linux"` in any Rust file outside `developer-tools/`;
+    - CLAUDE.md §62: no `version` in the `[package]` or `[workspace.package]` section of any Cargo manifest.
   - `build`.
   - `boot-test`: stages a fresh ESP (`\EFI\BOOT\BOOTX64.EFI`, UEFI 2.11 §3.5.1.1) and a fresh NVRAM copy; boots QEMU with serial on a pipe; requires the loader's lines and OVMF's status line in order; then stops QEMU.
   - `run`.
 
   It is not part of the shipping OS.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code.
-- **Dependencies:** Rust `std` only (CLAUDE.md §4), with `#![forbid(unsafe_code)]`. At run time it needs QEMU and the EDK2 firmware, found next to `qemu-system-x86_64` or through `ORIGIN_OVMF_CODE` and `ORIGIN_OVMF_VARS`.
+- **Dependencies:** Rust `std` (CLAUDE.md §4) and the first-party `origin-version` crate; no third-party crates. `#![forbid(unsafe_code)]`. At run time it needs QEMU and the EDK2 firmware, found next to `qemu-system-x86_64` or through `ORIGIN_OVMF_CODE` and `ORIGIN_OVMF_VARS`.
 - **Test evidence (2026-11-07):**
   - 3 unit tests: escape-sequence stripping and in-order matching.
   - Failure paths checked by hand:

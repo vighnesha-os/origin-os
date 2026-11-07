@@ -1,0 +1,9 @@
+[package]
+name = "origin-version"
+description = "Origin OS release identity, generated from origin-version.toml (CLAUDE.md §62)"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
