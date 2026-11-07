@@ -97,12 +97,68 @@ pub(crate) fn guarded_stack(bytes: usize) -> Option<(&'static mut [u8], u64)> {
 /// The guard page of the first thread `spawn` created, for the boot proof.
 static FIRST_GUARD: AtomicU64 = AtomicU64::new(0);
 
-/// Creates a kernel thread on processor `cpu` (an x2APIC ID) that runs `entry(arg)`.
+/// The running thread's queue request, made with interrupts disabled (the gate cleared IF).
+fn with_queue(interrupted: u64, f: impl FnOnce(&mut RunQueue) -> Option<u64>) -> u64 {
+    let id = this_cpu();
+    match (ACTIVE.get(id), QUEUES.get(id)) {
+        (Some(active), Some(queue)) if active.load(Ordering::Acquire) => {
+            f(&mut queue.lock()).unwrap_or(interrupted)
+        }
+        _ => interrupted,
+    }
+}
+
+/// `YIELD_VECTOR`: the running context gives up the processor.
+pub(crate) fn on_yield(interrupted: u64) -> u64 {
+    with_queue(interrupted, |q| Some(q.yield_now(interrupted)))
+}
+
+/// `SLEEP_VECTOR`: the running thread sleeps for `ticks` timer ticks.
+pub(crate) fn on_sleep(interrupted: u64, ticks: u64) -> u64 {
+    with_queue(interrupted, |q| q.sleep(interrupted, ticks).ok())
+}
+
+/// `EXIT_VECTOR`: the running thread ends. Its stack is not freed yet (no reaper).
+pub(crate) fn on_exit(interrupted: u64) -> u64 {
+    with_queue(interrupted, |q| q.exit(interrupted).ok())
+}
+
+/// Gives up the processor to the next ready context on this CPU.
+pub(crate) fn yield_now() {
+    // SAFETY: the gate for this vector is installed; the handler saves and restores every
+    // register, and returns here when this context is next scheduled.
+    unsafe { asm!("int 0x81") };
+}
+
+/// Sleeps for `ticks` timer ticks of this CPU (at least one).
+pub(crate) fn sleep(ticks: u64) {
+    // SAFETY: as for `yield_now`; RDI carries the argument and is restored.
+    unsafe { asm!("int 0x82", in("rdi") ticks) };
+}
+
+/// Ends the running thread.
+pub(crate) fn exit() -> ! {
+    loop {
+        // SAFETY: as for `yield_now`; the handler frees this thread's slot and never
+        // resumes it. If the request is refused (no active queue), it is retried.
+        unsafe { asm!("int 0x83") };
+    }
+}
+
+/// This CPU's tick count, as its run queue sees it.
+fn queue_ticks() -> u64 {
+    QUEUES
+        .get(this_cpu())
+        .map_or(0, |q| without_interrupts(|| q.lock().ticks()))
+}
+
+/// Creates a kernel thread on processor `cpu` (an x2APIC ID) that runs `entry(arg)`, and
+/// returns its run-queue slot.
 pub(crate) fn spawn(
     cpu: usize,
     entry: extern "sysv64" fn(u64) -> !,
     arg: u64,
-) -> Result<(), QueueError> {
+) -> Result<usize, QueueError> {
     let queue = QUEUES.get(cpu).ok_or(QueueError::Full)?;
     let (stack, guard) = guarded_stack(THREAD_STACK).ok_or(QueueError::Full)?;
     let _ = FIRST_GUARD.compare_exchange(0, guard, Ordering::Relaxed, Ordering::Relaxed);
@@ -156,6 +212,8 @@ static PROGRESS: [AtomicU64; 2 * MAX_CPUS] = [const { AtomicU64::new(0) }; 2 * M
 static RAN_ON: [AtomicU64; 2 * MAX_CPUS] = [const { AtomicU64::new(0) }; 2 * MAX_CPUS];
 /// Tells the workers to stop counting.
 static STOP: AtomicBool = AtomicBool::new(false);
+/// Workers that have stopped and exited.
+static EXITED: AtomicU64 = AtomicU64::new(0);
 
 /// A worker that never yields: it counts until [`STOP`], so it only ever gives up its
 /// processor when the timer preempts it.
@@ -168,10 +226,110 @@ extern "sysv64" fn worker(slot: u64) -> ! {
         }
         core::hint::spin_loop();
     }
-    loop {
-        // SAFETY: as in `run_ap`: an idle wait with interrupts on.
-        unsafe { asm!("sti", "hlt", options(nomem, nostack)) };
+    EXITED.fetch_add(1, Ordering::Relaxed);
+    exit()
+}
+
+/// The last pinger to take a turn, and how often the turn changed hands.
+static LAST_TURN: AtomicU64 = AtomicU64::new(0);
+static ALTERNATIONS: AtomicU64 = AtomicU64::new(0);
+/// Lifecycle threads finished.
+static FINISHED: AtomicU64 = AtomicU64::new(0);
+/// Ticks the sleeper measured across `sleep(SLEEP_TICKS)`, plus one (0: not yet).
+static SLEPT: AtomicU64 = AtomicU64::new(0);
+const TURNS: u64 = 50;
+const SLEEP_TICKS: u64 = 5;
+
+/// Takes [`TURNS`] turns, yielding after each.
+extern "sysv64" fn pinger(me: u64) -> ! {
+    for _ in 0..TURNS {
+        if LAST_TURN.swap(me, Ordering::Relaxed) != me {
+            ALTERNATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        yield_now();
     }
+    FINISHED.fetch_add(1, Ordering::Relaxed);
+    exit()
+}
+
+/// Sleeps [`SLEEP_TICKS`] and records how long that took in ticks.
+extern "sysv64" fn sleeper(_: u64) -> ! {
+    let before = queue_ticks();
+    sleep(SLEEP_TICKS);
+    SLEPT.store(queue_ticks() - before + 1, Ordering::Relaxed);
+    FINISHED.fetch_add(1, Ordering::Relaxed);
+    exit()
+}
+
+/// Exits at once.
+extern "sysv64" fn quitter(_: u64) -> ! {
+    FINISHED.fetch_add(1, Ordering::Relaxed);
+    exit()
+}
+
+/// Yields until `done()` or `seconds` pass.
+///
+/// The boot flow runs with interrupts disabled, so yielding alone would never let a timer
+/// interrupt in: when it is the only ready context, it would yield to itself for ever and
+/// time (and every sleeper) would stand still. Each round therefore also opens an interrupt
+/// window.
+fn yield_until(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) {
+    let start = rdtsc();
+    while !done() && rdtsc().wrapping_sub(start) < tsc_hz.saturating_mul(seconds) {
+        yield_now();
+        cpu::interrupt_window();
+    }
+}
+
+/// On the boot processor, with its timer running: yields must alternate two threads, a
+/// sleep must last its ticks, and exited threads must free their slots for reuse.
+fn prove_lifecycle(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool {
+    let live = || {
+        QUEUES
+            .get(bsp)
+            .map_or(0, |q| without_interrupts(|| q.lock().live()))
+    };
+    if live() != 1 {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: CPU {bsp} still has threads: scheduler failed"
+        );
+        return false;
+    }
+    let spawned = [
+        spawn(bsp, pinger, 1),
+        spawn(bsp, pinger, 2),
+        spawn(bsp, sleeper, 0),
+    ];
+    if spawned.iter().any(Result::is_err) {
+        let _ = writeln!(com1, "origin-kernel: cannot spawn: scheduler failed");
+        return false;
+    }
+    yield_until(
+        || FINISHED.load(Ordering::Relaxed) == 3 && live() == 1,
+        tsc_hz,
+        3,
+    );
+    let reused = spawn(bsp, quitter, 0);
+    yield_until(
+        || FINISHED.load(Ordering::Relaxed) == 4 && live() == 1,
+        tsc_hz,
+        1,
+    );
+    let alternations = ALTERNATIONS.load(Ordering::Relaxed);
+    let slept = SLEPT.load(Ordering::Relaxed).saturating_sub(1);
+    let ok = alternations >= 2 * TURNS - 5
+        && (SLEEP_TICKS..=10 * SLEEP_TICKS).contains(&slept)
+        && reused == Ok(1)
+        && live() == 1;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: scheduler: yield alternated {alternations} of {} turns; sleep({SLEEP_TICKS}) took {slept} ticks; exited threads freed their slots (slot {:?} reused){}",
+        2 * TURNS,
+        reused,
+        if ok { "" } else { ": scheduler failed" }
+    );
+    ok
 }
 
 /// Proves preemptive multitasking on every online processor: two non-yielding workers per
@@ -230,16 +388,28 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, cpus: &[u32], tsc_hz: u64) -> bo
         unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
     }
     let elapsed_ms = rdtsc().wrapping_sub(start) / (tsc_hz / 1000).max(1);
-    STOP.store(true, Ordering::Relaxed);
-    lapic.stop();
-    if let Some(active) = ACTIVE.get(bsp) {
-        active.store(false, Ordering::Release);
-    }
-    let mut ok = true;
-    for (i, &id) in cpus.iter().enumerate() {
-        let switches = QUEUES
+    let mut switches_at_stop = [0u64; MAX_CPUS];
+    for (slot, &id) in switches_at_stop.iter_mut().zip(cpus) {
+        *slot = QUEUES
             .get(id as usize)
             .map_or(0, |q| without_interrupts(|| q.lock().switches()));
+    }
+    STOP.store(true, Ordering::Relaxed);
+    // Every worker now exits; the boot flow yields so the boot processor's workers run.
+    yield_until(
+        || EXITED.load(Ordering::Relaxed) == workers as u64,
+        tsc_hz,
+        2,
+    );
+    let mut ok = EXITED.load(Ordering::Relaxed) == workers as u64;
+    if !ok {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: workers did not exit: scheduler failed"
+        );
+    }
+    for (i, &id) in cpus.iter().enumerate() {
+        let switches = switches_at_stop.get(i).copied().unwrap_or(0);
         let (a, b) = (2 * i, 2 * i + 1);
         let count = |w: usize| PROGRESS.get(w).map_or(0, |p| p.load(Ordering::Relaxed));
         let place = |w: usize| RAN_ON.get(w).map_or(0, |r| r.load(Ordering::Relaxed));
@@ -265,6 +435,11 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, cpus: &[u32], tsc_hz: u64) -> bo
             "origin-kernel: preemptive multitasking: {workers} non-yielding threads on {} CPUs all ran, in {elapsed_ms} ms",
             cpus.len()
         );
+    }
+    ok &= prove_lifecycle(com1, bsp, tsc_hz);
+    lapic.stop();
+    if let Some(active) = ACTIVE.get(bsp) {
+        active.store(false, Ordering::Release);
     }
     ok
 }

@@ -136,6 +136,7 @@ fn boot_scenario() -> Scenario {
                 "origin-kernel: preemptive multitasking: {} non-yielding threads on {cpus} CPUs all ran",
                 2 * cpus
             ),
+            "origin-kernel: scheduler: yield alternated ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
         failures: vec![

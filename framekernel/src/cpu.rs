@@ -102,8 +102,13 @@ pub(crate) unsafe fn init() {
         let ist = if vector == 8 { DOUBLE_FAULT_IST } else { 0 };
         *gate = d::interrupt_gate(*stub as usize as u64, KERNEL_CODE, ist);
     }
-    let interrupts: [(u8, extern "sysv64" fn()); 2] =
-        [(TIMER_VECTOR, timer_stub), (SPURIOUS_VECTOR, spurious_stub)];
+    let interrupts: [(u8, extern "sysv64" fn()); 5] = [
+        (TIMER_VECTOR, timer_stub),
+        (SPURIOUS_VECTOR, spurious_stub),
+        (YIELD_VECTOR, yield_stub),
+        (SLEEP_VECTOR, sleep_stub),
+        (EXIT_VECTOR, exit_stub),
+    ];
     for (vector, stub) in interrupts {
         if let Some(gate) = idt.0.get_mut(usize::from(vector)) {
             *gate = d::interrupt_gate(stub as usize as u64, KERNEL_CODE, 0);
@@ -195,6 +200,13 @@ unsafe fn load_tables(tables: *mut CpuTables) {
     let _ = TSS_SIZE; // the limit is encoded by `tss_descriptor`
 }
 
+/// Software interrupt a kernel thread raises to yield the processor.
+pub(crate) const YIELD_VECTOR: u8 = 0x81;
+/// Software interrupt to sleep for RDI timer ticks.
+pub(crate) const SLEEP_VECTOR: u8 = 0x82;
+/// Software interrupt to end the running thread.
+pub(crate) const EXIT_VECTOR: u8 = 0x83;
+
 /// Local APIC timer interrupts taken since boot.
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
@@ -225,6 +237,16 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     }
     if frame.vector == u64::from(SPURIOUS_VECTOR) {
         return here;
+    }
+    // Scheduler requests from kernel threads (`sched::yield_now`, `sleep`, `exit`).
+    if frame.vector == u64::from(YIELD_VECTOR) {
+        return crate::sched::on_yield(here);
+    }
+    if frame.vector == u64::from(SLEEP_VECTOR) {
+        return crate::sched::on_sleep(here, frame.rdi);
+    }
+    if frame.vector == u64::from(EXIT_VECTOR) {
+        return crate::sched::on_exit(here);
     }
     // A page fault at the exact instruction a probe armed: record it and resume at
     // `probe_recover`, which returns the error code to the probe's caller.
@@ -596,6 +618,25 @@ extern "sysv64" fn timer_stub() {
         common = sym exception_common,
     );
 }
+
+/// Entry stubs of the scheduler's software interrupts: no error code, so push 0.
+macro_rules! soft_stub {
+    ($name:ident, $vector:expr) => {
+        #[unsafe(naked)]
+        extern "sysv64" fn $name() {
+            naked_asm!(
+                "push 0",
+                "push {vector}",
+                "jmp {common}",
+                vector = const $vector,
+                common = sym exception_common,
+            );
+        }
+    };
+}
+soft_stub!(yield_stub, YIELD_VECTOR);
+soft_stub!(sleep_stub, SLEEP_VECTOR);
+soft_stub!(exit_stub, EXIT_VECTOR);
 
 /// Entry stub of the spurious-interrupt vector.
 #[unsafe(naked)]
