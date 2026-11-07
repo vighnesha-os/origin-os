@@ -28,7 +28,17 @@ pub enum FrameError {
     OutOfRange(u64),
     /// The frame is already free.
     DoubleFree(u64),
+    /// A run of zero frames was asked for.
+    EmptyRun,
+    /// The frame was never allocatable (outside every `Usable` region, frame 0, or
+    /// reserved), so freeing it would hand out memory the allocator does not own.
+    NotAllocatable(u64),
+    /// More reserved ranges than [`MAX_RESERVED`].
+    TooManyReserved,
 }
+
+/// Most reserved ranges [`FrameAllocator::new`] accepts.
+pub const MAX_RESERVED: usize = 8;
 
 /// End of the highest `Usable` region: the memory the bitmap must cover.
 pub fn usable_end(regions: &[MemoryRegion]) -> u64 {
@@ -49,6 +59,8 @@ pub const fn words_for(end: u64) -> u64 {
 #[derive(Debug)]
 pub struct FrameAllocator<'a> {
     bitmap: &'a mut [u64],
+    regions: &'a [MemoryRegion],
+    reserved: [(u64, u64); MAX_RESERVED],
     frames: u64,
     next: u64,
     free: u64,
@@ -60,9 +72,16 @@ impl<'a> FrameAllocator<'a> {
     /// (`(base, pages)`, for example the bitmap's own frames).
     pub fn new(
         bitmap: &'a mut [u64],
-        regions: &[MemoryRegion],
+        regions: &'a [MemoryRegion],
         reserved: &[(u64, u64)],
     ) -> Result<Self, FrameError> {
+        let mut kept = [(0, 0); MAX_RESERVED];
+        if reserved.len() > MAX_RESERVED {
+            return Err(FrameError::TooManyReserved);
+        }
+        for (slot, range) in kept.iter_mut().zip(reserved) {
+            *slot = *range;
+        }
         let end = usable_end(regions);
         let needed = words_for(end);
         let provided = bitmap.len() as u64;
@@ -72,6 +91,8 @@ impl<'a> FrameAllocator<'a> {
         bitmap.fill(u64::MAX);
         let mut a = Self {
             bitmap,
+            regions,
+            reserved: kept,
             frames: end / FRAME,
             next: 0,
             free: 0,
@@ -145,6 +166,88 @@ impl<'a> FrameAllocator<'a> {
         None
     }
 
+    /// Whether `frame` is one this allocator may ever hand out: inside a `Usable` region,
+    /// not frame 0 and not reserved.
+    fn allocatable(&self, frame: u64) -> bool {
+        let addr = frame.saturating_mul(FRAME);
+        let inside = |base: u64, pages: u64| {
+            addr >= base && addr < base.saturating_add(pages.saturating_mul(FRAME))
+        };
+        frame != 0
+            && self
+                .regions
+                .iter()
+                .any(|r| r.kind == RegionKind::Usable as u32 && inside(r.base, r.pages))
+            && !self
+                .reserved
+                .iter()
+                .any(|&(base, pages)| inside(base, pages))
+    }
+
+    /// Whether `frame` is free.
+    fn is_free(&self, frame: u64) -> bool {
+        frame < self.frames
+            && self
+                .bitmap
+                .get((frame / BITS) as usize)
+                .is_some_and(|w| w & (1 << (frame % BITS)) == 0)
+    }
+
+    /// Allocates `count` physically contiguous frames whose first frame number is a
+    /// multiple of `align` (in frames; 0 or 1 means any), and returns the address of the
+    /// first. First fit, scanning from frame 1; for the rare large allocations only.
+    pub fn allocate_run(&mut self, count: u64, align: u64) -> Option<u64> {
+        if count == 0 || count > self.free {
+            return None;
+        }
+        let align = align.max(1);
+        let mut start = align;
+        while start
+            .checked_add(count)
+            .is_some_and(|end| end <= self.frames)
+        {
+            match (start..start + count).find(|&f| !self.is_free(f)) {
+                None => {
+                    for frame in start..start + count {
+                        self.set_free(frame, false);
+                    }
+                    return Some(start * FRAME);
+                }
+                // Restart after the used frame, rounded up to the alignment.
+                Some(used) => start = (used + 1).div_ceil(align) * align,
+            }
+        }
+        None
+    }
+
+    /// Returns a run from [`Self::allocate_run`]. Every frame is checked before any is
+    /// freed, so a bad call changes nothing.
+    pub fn free_run(&mut self, addr: u64, count: u64) -> Result<(), FrameError> {
+        if count == 0 {
+            return Err(FrameError::EmptyRun);
+        }
+        if !addr.is_multiple_of(FRAME) {
+            return Err(FrameError::Misaligned(addr));
+        }
+        let first = addr / FRAME;
+        let end = first
+            .checked_add(count)
+            .ok_or(FrameError::OutOfRange(addr))?;
+        if first == 0 || end > self.frames {
+            return Err(FrameError::OutOfRange(addr));
+        }
+        if let Some(frame) = (first..end).find(|&f| !self.allocatable(f)) {
+            return Err(FrameError::NotAllocatable(frame * FRAME));
+        }
+        if let Some(frame) = (first..end).find(|&f| self.is_free(f)) {
+            return Err(FrameError::DoubleFree(frame * FRAME));
+        }
+        for frame in first..end {
+            self.set_free(frame, true);
+        }
+        Ok(())
+    }
+
     /// Returns the frame at `addr` to the allocator.
     pub fn free(&mut self, addr: u64) -> Result<(), FrameError> {
         if !addr.is_multiple_of(FRAME) {
@@ -154,11 +257,10 @@ impl<'a> FrameAllocator<'a> {
         if frame >= self.frames || frame == 0 {
             return Err(FrameError::OutOfRange(addr));
         }
-        let used = self
-            .bitmap
-            .get((frame / BITS) as usize)
-            .is_some_and(|w| w & (1 << (frame % BITS)) != 0);
-        if !used {
+        if !self.allocatable(frame) {
+            return Err(FrameError::NotAllocatable(addr));
+        }
+        if self.is_free(frame) {
             return Err(FrameError::DoubleFree(addr));
         }
         self.set_free(frame, true);
@@ -235,6 +337,61 @@ mod tests {
     }
 
     #[test]
+    fn runs_are_contiguous_aligned_usable_and_returnable() {
+        let regions = sample();
+        let mut bitmap = vec![0u64; words_for(usable_end(&regions)) as usize];
+        let mut a = FrameAllocator::new(&mut bitmap, &regions, &[]).unwrap();
+        let before = a.free_frames();
+        // 0x100 frames at 1 MiB: a run of 0x100 fits only there.
+        let big = a.allocate_run(0x100, 1).unwrap();
+        assert_eq!(big, 0x10_0000);
+        assert_eq!(a.free_frames(), before - 0x100);
+        assert_eq!(a.allocate_run(0x100, 1), None, "no second run that long");
+        // Aligned to 16 frames (64 KiB), inside usable memory.
+        let aligned = a.allocate_run(5, 16).unwrap();
+        assert!(aligned.is_multiple_of(16 * FRAME));
+        for f in 0..5 {
+            assert!(is_usable(aligned + f * FRAME, &regions));
+        }
+        // Freeing checks everything first.
+        assert_eq!(a.free_run(big, 0), Err(FrameError::EmptyRun));
+        assert_eq!(a.free_run(big + 1, 1), Err(FrameError::Misaligned(big + 1)));
+        assert_eq!(a.free_run(0, 1), Err(FrameError::OutOfRange(0)));
+        // The run's last frame plus the kernel-image frame after it.
+        let last = big + 0xFF * FRAME;
+        assert_eq!(
+            a.free_run(last, 2),
+            Err(FrameError::NotAllocatable(last + FRAME))
+        );
+        // A run that reaches a frame that is free.
+        a.free(aligned + 4 * FRAME).unwrap();
+        assert_eq!(
+            a.free_run(aligned, 5),
+            Err(FrameError::DoubleFree(aligned + 4 * FRAME))
+        );
+        let again = a.allocate_run(1, 1).unwrap();
+        assert_eq!(again, 0x1000, "first fit from frame 1");
+        a.free(again).unwrap();
+        // Take the freed frame back so the run below is whole again.
+        let mut taken = Vec::new();
+        while let Some(f) = a.allocate() {
+            if f == aligned + 4 * FRAME {
+                break;
+            }
+            taken.push(f);
+        }
+        for f in taken {
+            a.free(f).unwrap();
+        }
+        assert_eq!(a.free_run(big, 0x100), Ok(()));
+        assert_eq!(a.free_run(aligned, 5), Ok(()));
+        assert_eq!(a.free_frames(), before);
+        assert_eq!(a.free_run(big, 1), Err(FrameError::DoubleFree(big)));
+        assert_eq!(a.allocate_run(0, 1), None);
+        assert_eq!(a.allocate_run(before + 1, 1), None);
+    }
+
+    #[test]
     fn free_returns_frames_and_rejects_bad_addresses() {
         let regions = sample();
         let mut bitmap = vec![0u64; words_for(usable_end(&regions)) as usize];
@@ -252,6 +409,10 @@ mod tests {
             a.free(0x1000_0000),
             Err(FrameError::OutOfRange(0x1000_0000))
         );
+        // Reserved, kernel-image and legacy-hole frames were never allocatable.
+        for addr in [0x20_0000, 0x21_0000, 0xA_0000] {
+            assert_eq!(a.free(addr), Err(FrameError::NotAllocatable(addr)));
+        }
         assert_eq!(a.free_frames(), before - 1);
         // Freeing the other allocation restores the original count exactly.
         assert_eq!(a.free(y), Ok(()));

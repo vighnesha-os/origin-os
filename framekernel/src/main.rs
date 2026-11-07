@@ -17,6 +17,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use core::arch::asm;
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -28,6 +30,8 @@ use framekernel::boot::{self, InvalidBootInfo, MemorySummary};
 use framekernel::report;
 
 mod cpu;
+mod memory;
+mod sync;
 mod timer;
 use framekernel::frames::{self, FrameAllocator};
 use framekernel::kernel_space;
@@ -127,6 +131,10 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     // the frame allocator is proven again through the new direct map.
     if init_paging(&mut com1, &info, regions, segments, pool, pool_base) {
         prove_frames(&mut com1, &mut alloc);
+        // M2: the kernel heap, which takes over the frame allocator; from here on the
+        // `alloc` crate works in the kernel.
+        memory::init(alloc);
+        prove_heap(&mut com1);
     }
 
     // M2, fourth step: interrupts. The local APIC in x2APIC mode, its timer calibrated
@@ -255,7 +263,7 @@ fn prove_protections(
 /// pool's physical address.
 fn init_memory(
     com1: &mut Uart16550<Com1>,
-    regions: &[MemoryRegion],
+    regions: &'static [MemoryRegion],
 ) -> Option<(FrameAllocator<'static>, &'static [Table], u64)> {
     let words = frames::words_for(frames::usable_end(regions));
     let bitmap_pages = (words * 8).div_ceil(frames::FRAME);
@@ -310,6 +318,66 @@ fn init_memory(
     );
     debug_assert_eq!(PAGE, frames::FRAME);
     Some((alloc, pool, pool_base))
+}
+
+/// Proves the heap with real `alloc` collections: a large vector (a frame run), thousands
+/// of boxes (slabs), a B-tree map and a string, with their contents checked; then that
+/// dropping them all returns the heap and the frame allocator exactly to where they were.
+fn prove_heap(com1: &mut Uart16550<Com1>) -> bool {
+    use alloc::boxed::Box;
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    let Some(before) = memory::stats() else {
+        return false;
+    };
+    let peak = {
+        let numbers: Vec<u64> = (0..100_000u64).collect();
+        let sum: u64 = numbers.iter().sum();
+        let boxes: Vec<Box<[u64; 4]>> = (0..2000u64).map(|i| Box::new([i; 4])).collect();
+        let box_sum: u64 = boxes.iter().map(|b| b[3]).sum();
+        let mut map = BTreeMap::new();
+        for i in 0..1000u64 {
+            map.insert(i * 7 % 1000, i);
+        }
+        let mut text = String::new();
+        let _ = write!(text, "{sum}");
+        let right = sum == 4_999_950_000
+            && box_sum == 1_999_000
+            && map.len() == 1000
+            && map.keys().copied().eq(0..1000)
+            && text == "4999950000";
+        if !right {
+            let _ = writeln!(com1, "origin-kernel: heap contents are wrong");
+            return false;
+        }
+        memory::stats()
+    };
+    let after = memory::stats();
+    if let Some((p, _)) = peak {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: heap: Vec of 100000 u64, 2000 boxes, B-tree of 1000 keys, a string: {} KiB in use, {} slabs, {} pages in runs",
+            p.bytes_in_use >> 10,
+            p.slabs,
+            p.large_pages
+        );
+    }
+    if after != Some(before) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: heap leaked: {after:?} after, {before:?} before"
+        );
+        return false;
+    }
+    let _ = writeln!(
+        com1,
+        "origin-kernel: heap: everything freed; {} free frames ({} MiB), as before",
+        before.1,
+        (before.1 * memory::FRAME) >> 20
+    );
+    true
 }
 
 /// Proves the allocator by allocating, writing, reading back and freeing three frames.

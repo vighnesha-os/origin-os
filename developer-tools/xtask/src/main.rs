@@ -105,6 +105,9 @@ fn boot_scenario() -> Scenario {
             "origin-kernel: page protection: read of page 0 at 0x0 faulted (#PF error 0x0)".into(),
             // After the switch, so this also proves the direct map.
             "origin-kernel: allocated, wrote and freed 3 frames at ".into(),
+            "origin-kernel: heap: Vec of 100000 u64, 2000 boxes, B-tree of 1000 keys, a string: "
+                .into(),
+            "origin-kernel: heap: everything freed; ".into(),
             "origin-kernel: x2APIC enabled: APIC ID 0, ".into(),
             "origin-kernel: APIC timer calibrated against the PIT: ".into(),
             "origin-kernel: APIC timer: 50 interrupts at 100 Hz in ".into(),
@@ -134,6 +137,8 @@ fn boot_scenario() -> Scenario {
             ": APIC timer is wrong",
             "is unusable",
             "(reserved) at rip",
+            "origin-kernel: heap contents are wrong",
+            "origin-kernel: heap leaked",
         ],
     }
 }
@@ -901,7 +906,12 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
             Ok(chunk) => {
                 raw.extend_from_slice(&chunk);
                 let text = serial::clean(&raw);
-                if let Some(m) = scenario.failures.iter().find(|m| text.contains(**m)) {
+                // Failures are matched in complete lines only, so a failing line reaches the
+                // log in full (its details follow the marker) before QEMU is stopped.
+                let complete = text
+                    .get(..text.rfind('\n').map_or(0, |i| i + 1))
+                    .unwrap_or("");
+                if let Some(m) = scenario.failures.iter().find(|m| complete.contains(**m)) {
                     break Err(format!("the serial output contains {m:?}"));
                 }
                 if serial::contains_in_order(&text, &markers) {

@@ -6,7 +6,8 @@
 //! summary of it, loads its own GDT, TSS and IDT, proves exception handling with a
 //! breakpoint, starts the physical frame allocator, switches to its own page tables (W^X
 //! kernel image, no null page, a never-executable direct map), proves those protections
-//! with deliberate faults and the allocator through the new mapping, brings up the local
+//! with deliberate faults and the allocator through the new mapping, starts the kernel heap
+//! (so the `alloc` crate works) and proves it leak-free, brings up the local
 //! APIC in x2APIC mode with its timer calibrated against the PIT and proven by taking
 //! periodic interrupts, and halts.
 //!
@@ -16,6 +17,7 @@
 //! - [`boot`]: boot-info validation and the memory summary;
 //! - [`descriptors`]: GDT, TSS and IDT descriptor encodings;
 //! - [`frames`]: the physical frame allocator over the boot-info regions;
+//! - [`heap`]: kernel heap bookkeeping (slabs and frame runs), addresses only;
 //! - [`paging`]: 4-level page tables with structural W^X;
 //! - [`kernel_space`]: what the kernel's first address space maps, and how;
 //! - [`serial`]: a polled 16550 UART driver over an abstract register interface;
@@ -23,7 +25,8 @@
 //!
 //! The binary holds the entry point, x86 port I/O, the descriptor tables, exception and
 //! interrupt stubs, MSR access and fault probes (`src/cpu.rs`), the APIC timer bring-up
-//! (`src/timer.rs`), and the panic handler. All of it is original code written for this
+//! (`src/timer.rs`), the spin lock (`src/sync.rs`), the global allocator (`src/memory.rs`),
+//! and the panic handler. All of it is original code written for this
 //! project, with no third-party crates (CLAUDE.md §3, §5).
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -32,6 +35,7 @@ pub mod apic;
 pub mod boot;
 pub mod descriptors;
 pub mod frames;
+pub mod heap;
 pub mod kernel_space;
 pub mod paging;
 pub mod report;
