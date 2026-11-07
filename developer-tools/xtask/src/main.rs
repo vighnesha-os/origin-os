@@ -336,6 +336,9 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); wrote LBA 10240, flushed (1 device writes), evicted and read back changed: true".into(),
             // The in-memory VFS (CLAUDE.md §39): a file built, read back, listed and removed.
             "origin-kernel: vfs: built /etc/origin/hostname (read back true), listed 1 entry, removed all back to 1 node".into(),
+            // §21: the embedded ustar initramfs extracts into a VFS (contents and an
+            // implicit parent directory checked).
+            "origin-kernel: initramfs: 4 entries into the VFS; /etc/hostname true, implicit /boot dir true; consistent true".into(),
             // The software rasterizer: the kernel's scene CRC matches the host-proven one.
             "origin-kernel: raster: 160x48 scene rendered, CRC 0x912df877 (expected 0x912df877)".into(),
             // The i8042 PS/2 controller answers its self-tests (CLAUDE.md §56).
@@ -386,6 +389,7 @@ fn boot_scenario_markers() -> Scenario {
             ": numa failed",
             ": slit failed",
             ": entropy failed",
+            ": initramfs failed",
             "supervisor isolation from user pages incomplete",
             "origin-kernel: cannot map the user probe page",
             ": user isolation failed",

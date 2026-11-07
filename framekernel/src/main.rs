@@ -254,6 +254,8 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
 
     // M8/M9 groundwork: the in-memory VFS (paths, directories, files).
     prove_vfs(&mut com1);
+    // §21 groundwork: extract an embedded initramfs (a ustar image) into a VFS.
+    prove_initramfs(&mut com1);
     // M8 groundwork: the software rasterizer draws a fixed scene whose CRC must match the
     // host-proven one, bit for bit.
     prove_raster(&mut com1);
@@ -541,6 +543,34 @@ fn prove_vfs(com1: &mut console::Console) {
         listed.len(),
         fs.node_count(),
         if ok { "" } else { ": vfs failed" }
+    );
+}
+
+/// Extracts an embedded initramfs (a ustar image) into a fresh VFS and reports it
+/// (CLAUDE.md §21 initial system deployment). Proves `ustar` + `initramfs` + `vfs` working
+/// end-to-end in the kernel on a real image: the entry count, a file's contents read back,
+/// and that a file whose parent directory the archive never listed was still created.
+fn prove_initramfs(com1: &mut console::Console) {
+    use framekernel::vfs::Vfs;
+    static IMAGE: &[u8] = include_bytes!("../assets/initramfs.tar");
+
+    let mut fs = Vfs::new(1 << 20, 256);
+    let result = framekernel::initramfs::extract(IMAGE, &mut fs);
+    let n = result.unwrap_or(0);
+
+    let mut buf = [0u8; 32];
+    let read = fs.read("/etc/hostname", 0, &mut buf).unwrap_or(0);
+    let hostname_ok = &buf[..read] == b"origin-os\n";
+    // "boot/banner.txt" has no "boot/" directory entry in the archive: its parent must have
+    // been created implicitly.
+    let implicit_parent_ok = fs.resolve("/boot/banner.txt").is_ok();
+    let consistent = result.is_ok() && n == 4 && hostname_ok && implicit_parent_ok;
+
+    let _ = writeln!(
+        com1,
+        "origin-kernel: initramfs: {n} entries into the VFS; /etc/hostname {hostname_ok}, implicit /boot dir {implicit_parent_ok}; consistent {}{}",
+        consistent,
+        if consistent { "" } else { ": initramfs failed" }
     );
 }
 
