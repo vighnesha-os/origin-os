@@ -240,9 +240,36 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
 
     // M8/M9 groundwork: the in-memory VFS (paths, directories, files).
     prove_vfs(&mut com1);
+    // M8 groundwork: the software rasterizer draws a fixed scene whose CRC must match the
+    // host-proven one, bit for bit.
+    prove_raster(&mut com1);
 
     let _ = report::write_halt(&mut com1);
     halt()
+}
+
+/// Renders the rasterizer's fixed demonstration scene to a heap surface and checks its
+/// CRC-32 equals the constant the host test proved, so the kernel and host renderers agree
+/// bit for bit (CLAUDE.md §52 the software fallback).
+fn prove_raster(com1: &mut console::Console) {
+    use framekernel::raster::{DEMO_CRC, DEMO_HEIGHT, DEMO_WIDTH, Surface, demo_scene};
+    let mut buf = alloc::vec![0u32; (DEMO_WIDTH * DEMO_HEIGHT) as usize];
+    let Some(mut surface) = Surface::new(&mut buf, DEMO_WIDTH, DEMO_HEIGHT, DEMO_WIDTH) else {
+        let _ = writeln!(com1, "origin-kernel: raster: bad surface: raster failed");
+        return;
+    };
+    demo_scene(&mut surface);
+    let mut running = 0xFFFF_FFFFu32;
+    for px in &buf {
+        running = framekernel::gpt::crc32_update(running, &px.to_le_bytes());
+    }
+    let crc = !running;
+    let ok = crc == DEMO_CRC;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: raster: {DEMO_WIDTH}x{DEMO_HEIGHT} scene rendered, CRC {crc:#010x} (expected {DEMO_CRC:#010x}){}",
+        if ok { "" } else { ": raster failed" }
+    );
 }
 
 /// Proves the in-memory VFS on the heap: builds a small tree, writes and reads a file

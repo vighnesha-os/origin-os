@@ -550,6 +550,15 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 6 `vfs` tests, including path parsing at the length limit, offset/gap read-write, the error taxonomy, the node limit with slot reuse, and a 4000-operation deterministic workload kept consistent; 127 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** an on-disk filesystem and its format ADR, open-file handles and a current-directory, permissions and ownership, symbolic links, mmap, and wiring the VFS to system calls (ADR-0005) and the block cache.
 
+### Software rasterizer (CLAUDE.md §50 Origin UI, §52 the compositor's software fallback; 2026-11-08)
+
+- **What:** `raster` (library): a 2D rasterizer over a borrowed 32-bit `0xAARRGGBB` surface with a stride (a view into a larger framebuffer works). `clear`, `fill_rect`, `blend_rect` (straight-alpha "over"), `stroke_rect`, `blit`, with every operation clipped to the surface, so out-of-bounds coordinates are safe. `blend` rounds `(a·s + (255−a)·d + 127)/255` per channel. Pure, no `unsafe`.
+- **Cross-check:** `demo_scene` draws a fixed scene (clear, three fills that run off the edges, a frame, a translucent band, a blitted checker sprite). The host test renders it to a 160×48 surface, checks it is deterministic, and proves its CRC-32 (`0x912df877`); the kernel renders the same scene on the heap and checks its CRC equals that constant, so the two renderers agree bit for bit.
+- **Proof** (every boot): "raster: 160x48 scene rendered, CRC 0x912df877 (expected 0x912df877)". The value is identical on every machine (pure computation, no timing or KASLR), so the boot test matches it exactly.
+- **Negative control** (failing the boot test): one fill's blue channel changed by 1 → CRC `0x53d95223` → "raster failed".
+- **Test evidence:** 5 `raster` tests (fills and clipping at every edge, the blend arithmetic, a clipped blit, surface-construction validation, the deterministic demo and its CRC); 132 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** a text/font engine (CLAUDE.md §51), drawing to a real framebuffer (no GOP framebuffer in boot info yet), damage tracking and the compositor (§52), and hardware-accelerated rendering.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.
