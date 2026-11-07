@@ -154,6 +154,21 @@ The owner asked for the design to be finalised with the recommended options, fol
 | `9b74be4` | PCIe enumeration through the MCFG: uncached ECAM, every function and BAR |
 | `05dcde1` | A polled NVMe driver: Identify, admin and I/O queues, read, write, flush, against a GPT test disk xtask builds |
 | `31e1c56` | GPT: both copies validated over NVMe, partitions listed |
+| `e075ca4` | Interim records (this handoff and the backlog) |
+| `742d1ef` | Seeded mutation tests for every firmware and device parser (§72) |
+| `2e06794` | Timed waits: deadlines on the monotonic clock for blocked threads |
+| `57a5f10` | MSI-X: interrupt-driven NVMe completions for a blocking thread |
+| `a28e58c` | Per-CPU NVMe queues: every CPU does I/O at once through its own pair |
+| `56996f6` | Stride scheduling: proportional shares; a true idle context on APs |
+| `216b926` | Block layer: a 4 KiB page cache over the NVMe namespace |
+| `a6a3cb4` | CPU feature discovery, and FPU/SIMD state across context switches |
+| `61e3ad5` | Panic diagnostics: a frame-pointer backtrace |
+| `885d764` | In-memory VFS: paths, directories, files |
+| `816158c` | Software rasterizer: fills, blits, alpha blend (CRC cross-check) |
+| `ab39160` | PS/2 keyboard: scancode decoding and i8042 controller bring-up |
+| `0e42e20` | HPET: ACPI discovery and a counter-rate cross-check |
+
+(The 2026-11-08 commits use the Claude Opus 4.8 attribution; the run spanned midnight.)
 
 ### Lessons from this run
 
@@ -164,3 +179,19 @@ The owner asked for the design to be finalised with the recommended options, fol
 - `split_large` must carry the memory type (PCD, PWT, PAT) into the 4 KiB pieces.
 - QEMU keeps stale TLB entries across vCPUs, so a missing shootdown is visible there. Its TCG TSC runs at about 1 GHz, is not reported as invariant, and has no CPUID 15h rate.
 - The wake-up race between registering on a wait queue and blocking really happens even in QEMU: the transfer stalled at 6202 of 10 000 items without pending wake-ups.
+
+## 7. Where the twelve-hour run stands (2026-11-08, ~02:00 IST)
+
+The kernel now boots on 1/2/4 CPUs through one `boot-matrix` run with, in order: higher-half
+load with KASLR, GDT/TSS/IDT and exceptions, a frame-pointer backtrace proof, CPU-feature
+discovery with SSE/AVX enabled, the frame allocator and W^X tables, the heap, SMEP/SMAP,
+the APIC timer, the monotonic/RTC clocks and the HPET cross-check, SMP bring-up, preemptive
+stride scheduling with FPU-state save/restore, kernel wait queues (timed and cross-CPU),
+a serialized console, TLB shootdown with global pages, PCIe enumeration, a polled and then
+MSI-X interrupt-driven NVMe driver with per-CPU queues, GPT validation, a block cache, the
+in-memory VFS, the software rasterizer and the i8042 keyboard bring-up — each with a boot
+proof and at least one negative control. 143 host library tests pass; `cargo xtask check`
+passes. Everything is QEMU-only; no physical-hardware qualification (CLAUDE.md §74). The
+ADR-0005 kernel system-call layer is still the one area left untouched (a safety classifier
+stopped it twice earlier); the owner's non-design items (downloads, a licence, merge/push)
+remain.
