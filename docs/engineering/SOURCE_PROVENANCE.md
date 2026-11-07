@@ -242,6 +242,14 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Measured** (yield ping-pong of three contexts, 2000 rounds, every boot; QEMU TCG, so only the comparison means anything): RDMSR-based CPU lookup 716 / 659 / 693 TSC cycles per switch over three boots; GS-based 553 / 567 / 612 (about 18 % less at the median).
 - **Evidence:** `cargo xtask boot-test` passes with `ORIGIN_QEMU_SMP` = 1, 2 and 4; `cargo xtask check` passes (65 library tests). QEMU only. Not done: priorities, load balancing, Loom models.
 
+### M4 groundwork: ring 3 and crash isolation (2026-11-07)
+
+- **What:** user data and 64-bit user code segments (GDT entries 5 and 6); one DPL-3 gate, `int 0x80` (RAX 0 exit, 1 report; everything else returns `u64::MAX`), every other gate DPL 0; `enter_user` (DPL-3 selectors in DS/ES/FS/GS so the return to CPL 3 nulls none, the kernel GS base put back, every general-purpose register zeroed, IF set, IOPL 0, no I/O bitmap); TSS.RSP0 recorded per CPU and moved by the scheduler on every switch to the resumed thread's kernel stack; an exception taken in user mode ends that thread and the kernel carries on.
+- **Proof** (boot-test, every boot): a good program reports 42 and exits 0; a program that reads a kernel address takes #PF 0x5 (present, read, user) and is ended; a program that executes `hlt` takes #GP(0) and is ended; two compute-bound user programs run at once, preempted many times, and both report correctly with their RSP intact; afterwards every thread stack is reaped.
+- **Controls:** the system-call gate at DPL 0 turns the good program's `int 0x80` into #GP 0x402 (IDT entry 0x80); RSP0 left frozen makes one of the two concurrent threads lose its frames ("reports 0b10"). Both fail the boot test.
+- **Specifications:** Intel SDM Vol. 3A: privilege levels and gates (DPL checks for `int n`), the 64-bit TSS (RSP0), IRET to a lower privilege level (segment-register nulling), #PF and #GP error codes.
+- **Not done:** per-process address spaces (the user pages live in the kernel's tables; the higher-half ADR comes first), `swapgs`, SYSCALL/SYSRET, process objects and capabilities (M4).
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

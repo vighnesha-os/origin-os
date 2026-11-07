@@ -84,3 +84,22 @@ Lessons worth keeping:
 - The kernel library stays `forbid(unsafe_code)`: page tables are reached through a safe `TableMemory` that returns `None` for unknown addresses, the heap does address arithmetic only, and hardware access sits behind capability types in the binary (`X2Apic`, `LegacyPorts`).
 
 Still running when this was written: the ML-DSA-65/87 verification agent (its own worktree; no NIST vectors without approval). Next: M3 (SMP and scheduling), starting with an ADR for AP start-up; see `TASKS.md`.
+
+### Continued, 19:00–19:55 IST
+
+| Commit | What |
+|---|---|
+| bbdc717 | merge ML-DSA-65/87 (agent) |
+| 50c790c | M3 step 1: ACPI MADT discovery, INIT-SIPI-SIPI, per-CPU GDT/TSS |
+| c41a39a | M3 step 2: preemptive kernel threads, per-CPU run queues |
+| 02be5c3, 2e24da7, 1711675 | SMEP/SMAP; guard pages below every stack (thread, AP, boot) |
+| 9332e52 | ADR-0003 (Proposed) |
+| 44b3684 | reclaim loader and boot-services memory (40 MiB) |
+| 9aac7da, bf79fce | thread lifecycle (yield, sleep, exit) and the stack reaper |
+| be93105 | `origin-sync`: the spin lock as a host-tested crate |
+| 5e3fbd3 | GS-based CPU-local area; switch cost measured (~18 % less) |
+| a520df2, 398f3c5 | ring 3: one DPL-3 gate, crash isolation, RSP0 per switch |
+
+Lessons: a negative control must be checked to have **rebuilt and booted** (two attempts here proved nothing: one did not compile, one used `timeout`, which macOS lacks). The boot flow runs with IF=0, so any wait in it must open interrupt windows, or time stops.
+
+How to see it all: `cargo xtask boot-test` (default 2 CPUs; `ORIGIN_QEMU_SMP=1..8` also pass) and `cargo xtask check`.

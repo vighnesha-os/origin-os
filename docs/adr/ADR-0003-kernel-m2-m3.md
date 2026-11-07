@@ -1,4 +1,4 @@
-# ADR-0003: Framekernel memory, interrupts, SMP start-up and first scheduler (M2, M3)
+# ADR-0003: Framekernel memory, interrupts, SMP start-up, first scheduler and first user mode (M2, M3, M4 groundwork)
 
 | | |
 |---|---|
@@ -41,6 +41,10 @@ Only processors the MADT marks enabled are started, one at a time. The trampolin
 ### K7. First scheduler: per-CPU round-robin, context = interrupt frame
 A thread's saved context is its interrupt frame on its own stack; the timer handler returns the frame to resume. One run queue per CPU (indexed by x2APIC ID for now) behind its own lock, taken with interrupts disabled outside the handler. Threads are never migrated.
 *Alternatives:* a separate `switch_to` with callee-saved registers only (cheaper for voluntary switches; to add with blocking); EEVDF-style fair scheduling (to evaluate once this baseline is proven, §26).
+
+### K8. First user mode: one DPL-3 gate, RSP0 per switch, faults end the thread
+Ring-3 code reaches the kernel only through `int 0x80` (DPL 3); every other gate is DPL 0. The kernel enters user mode with every general-purpose register zeroed and DPL-3 data selectors loaded (so the CPL change nulls no segment register and the kernel's GS base survives; user mode cannot read it). The scheduler points TSS.RSP0 at the resumed thread's kernel stack on every switch. An exception in user mode ends the thread, not the kernel.
+*Alternatives:* SYSCALL/SYSRET with `swapgs` (faster, the M4 target; needs STAR/LSTAR/SFMASK and a GS swap discipline); per-CPU RSP0 written only for user threads (cheaper, but easy to get wrong).
 
 ## Evidence
 
