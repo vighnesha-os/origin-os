@@ -42,7 +42,13 @@ const MERKLE_PACKAGE: &str = "onbf-merkle";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// `no_std` libraries embedded in the boot loader and the Framekernel. Each must be
 /// clippy-clean on every target and free of panic paths (ONBF §12).
-const FREESTANDING_LIBS: &[&str] = &[ONBF_FORMAT_PACKAGE, MERKLE_PACKAGE, CRYPTO_PACKAGE];
+const BOOT_INFO_PACKAGE: &str = "origin-boot-info";
+const FREESTANDING_LIBS: &[&str] = &[
+    BOOT_INFO_PACKAGE,
+    ONBF_FORMAT_PACKAGE,
+    MERKLE_PACKAGE,
+    CRYPTO_PACKAGE,
+];
 const QEMU: &str = "qemu-system-x86_64";
 const DEFAULT_BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 

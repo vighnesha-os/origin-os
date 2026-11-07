@@ -1,0 +1,12 @@
+[package]
+name = "origin-boot-info"
+description = "The boot-info structure the Origin boot loader hands the Framekernel (ADR-0002, Proposed)"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+origin-version.workspace = true
+
+[lints]
+workspace = true

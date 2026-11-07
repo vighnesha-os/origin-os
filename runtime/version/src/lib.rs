@@ -29,6 +29,7 @@ security-version = 7
 
 [compatibility]
 onbf-format = "1.0"
+boot-info = "0.1"
 "#;
 
     /// Replaces the first occurrence of `from` in [`VALID`].
@@ -54,6 +55,7 @@ onbf-format = "1.0"
         assert_eq!(m.build, BUILD);
         assert_eq!(m.security_version, SECURITY_VERSION);
         assert_eq!(m.onbf_format, (ONBF_FORMAT_MAJOR, ONBF_FORMAT_MINOR));
+        assert_eq!(m.boot_info, (BOOT_INFO_MAJOR, BOOT_INFO_MINOR));
     }
 
     #[test]

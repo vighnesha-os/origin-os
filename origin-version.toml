@@ -24,5 +24,8 @@ security-version = 0
 [compatibility]
 # ONBF container format, as `format_major.format_minor` in the header (ONBF §4.2).
 onbf-format = "1.0"
-# Further identifiers (boot-info ABI, Origin C ABI, driver ABI, manifest and data schemas)
-# are added when the interface they version first exists.
+# Boot-info structure the loader hands the Framekernel (docs/adr/ADR-0002-boot.md, Proposed).
+# Major 0 marks it as not yet stable: it changes freely until the boot ADR is accepted.
+boot-info = "0.1"
+# Further identifiers (Origin C ABI, driver ABI, manifest and data schemas) are added when
+# the interface they version first exists.

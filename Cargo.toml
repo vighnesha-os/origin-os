@@ -11,6 +11,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "boot/info",
     "boot/uefi",
     "developer-tools/xtask",
     "runtime/onbf/format",
@@ -20,6 +21,7 @@ members = [
 ]
 # Host-buildable crates only. The UEFI loader's binary cannot be built for the host.
 default-members = [
+    "boot/info",
     "developer-tools/xtask",
     "runtime/onbf/format",
     "runtime/onbf/merkle",
@@ -38,6 +40,7 @@ publish = false
 
 [workspace.dependencies]
 origin-version = { path = "runtime/version" }
+origin-boot-info = { path = "boot/info" }
 origin-crypto = { path = "security/crypto" }
 onbf-format = { path = "runtime/onbf/format" }
 

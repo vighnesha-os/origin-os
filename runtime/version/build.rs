@@ -50,7 +50,11 @@ fn generate() -> Result<(), String> {
          /// ONBF container `format_major` (`[compatibility] onbf-format`).\n\
          pub const ONBF_FORMAT_MAJOR: u16 = {fmaj};\n\
          /// ONBF container `format_minor` (`[compatibility] onbf-format`).\n\
-         pub const ONBF_FORMAT_MINOR: u16 = {fmin};\n",
+         pub const ONBF_FORMAT_MINOR: u16 = {fmin};\n\
+         /// Boot-info ABI major version (`[compatibility] boot-info`).\n\
+         pub const BOOT_INFO_MAJOR: u16 = {bmaj};\n\
+         /// Boot-info ABI minor version (`[compatibility] boot-info`).\n\
+         pub const BOOT_INFO_MINOR: u16 = {bmin};\n",
         version = m.version.text(),
         major = m.version.major,
         minor = m.version.minor,
@@ -60,6 +64,8 @@ fn generate() -> Result<(), String> {
         svn = m.security_version,
         fmaj = m.onbf_format.0,
         fmin = m.onbf_format.1,
+        bmaj = m.boot_info.0,
+        bmin = m.boot_info.1,
     );
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set")?);
