@@ -2,15 +2,18 @@
 //! queues, namespace discovery, DMA, flushes), the boot proof of its block I/O, and the
 //! disk's GUID Partition Table, both copies checked (CLAUDE.md §39).
 //!
-//! A first-party kernel-mode driver (ADR-0001 D2), polled for now: no interrupts until
-//! MSI-X routing exists. It binds to the first NVMe controller (class 01:08:02) that
-//! `pcie` listed:
+//! A first-party kernel-mode driver (ADR-0001 D2). It binds to the first NVMe controller
+//! (class 01:08:02) that `pcie` listed:
 //! 1. memory decoding and bus mastering on; BAR 0 mapped uncached;
 //! 2. the controller reset: CC.EN cleared and CSTS.RDY awaited within CAP.TO;
 //! 3. admin queues of 32 entries; CC.EN set (4 KiB pages, 64/16-byte entries); RDY awaited,
 //!    with the fatal-status bit checked;
 //! 4. Identify Controller and Identify Namespace 1;
-//! 5. one I/O queue pair of 64 entries.
+//! 5. I/O queue pair 1 (64 entries), polled;
+//! 6. after the polled proofs, MSI-X: vector 1 is sent to one processor as
+//!    `cpu::DEVICE_VECTOR` (every other entry masked), and I/O queue pair 2 completes to
+//!    it. A thread there submits under the driver lock and then blocks on a wait queue
+//!    until the interrupt wakes it; its wait condition is the completion queue itself.
 //!
 //! DMA memory is zeroed heap pages: the direct map makes them physically contiguous and
 //! gives their physical addresses (`phys::to_phys`), and x86 DMA is cache-coherent. The
@@ -24,9 +27,13 @@ use core::fmt::Write;
 use core::ptr;
 use core::sync::atomic::{Ordering, compiler_fence, fence};
 
+use core::sync::atomic::AtomicU64;
 use framekernel::gpt;
 use framekernel::nvme::{self, Capabilities, Command, Completion, NamespaceInfo, Queues, register};
-use framekernel::pci::BarKind;
+use framekernel::pci::{self, BarKind};
+use origin_sync::SpinLock;
+
+use crate::wait::WaitQueue;
 
 use crate::console::Console;
 
@@ -122,12 +129,23 @@ enum Failure {
     WrongCommand,
 }
 
+/// Which queue pair a command goes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Q {
+    Admin,
+    /// I/O queue 1: polled.
+    Polled,
+    /// I/O queue 2: completions raise an MSI-X interrupt.
+    Interrupt,
+}
+
 /// A bound controller.
 struct Nvme {
     regs: u64,
     cap: Capabilities,
     admin: QueuePair,
     io: Option<QueuePair>,
+    irq: Option<QueuePair>,
 }
 
 impl Nvme {
@@ -174,16 +192,34 @@ impl Nvme {
         }
     }
 
-    /// Submits `make(cid)` to the admin queue (or the I/O queue) and polls for its
-    /// completion.
-    fn run(&mut self, io: bool, make: impl FnOnce(u16) -> Command) -> Result<Completion, Failure> {
+    fn queue(&mut self, q: Q) -> Option<&mut QueuePair> {
+        match q {
+            Q::Admin => Some(&mut self.admin),
+            Q::Polled => self.io.as_mut(),
+            Q::Interrupt => self.irq.as_mut(),
+        }
+    }
+
+    /// Submits `make(cid)` to queue `q` and polls for its completion.
+    fn run(&mut self, q: Q, make: impl FnOnce(u16) -> Command) -> Result<Completion, Failure> {
+        let cid = self.submit(q, make)?;
+        let deadline = crate::time::monotonic_nanos() + COMMAND_TIMEOUT_NS;
+        loop {
+            if let Some(done) = self.poll(q, cid) {
+                return done;
+            }
+            if crate::time::monotonic_nanos() > deadline {
+                return Err(Failure::Timeout);
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Writes `make(cid)` into queue `q` and rings its doorbell; returns the command ID.
+    fn submit(&mut self, q: Q, make: impl FnOnce(u16) -> Command) -> Result<u16, Failure> {
         let stride = self.cap.doorbell_stride;
         let regs = self.regs;
-        let qp = if io {
-            self.io.as_mut().ok_or(Failure::Full)?
-        } else {
-            &mut self.admin
-        };
+        let qp = self.queue(q).ok_or(Failure::Full)?;
         let cid = qp.next_cid;
         qp.next_cid = qp.next_cid.wrapping_add(1);
         let slot = qp.state.submit().ok_or(Failure::Full)?;
@@ -199,8 +235,16 @@ impl Nvme {
             unsafe { p.write_volatile(u32::from(value)) };
         };
         doorbell(nvme::doorbell(qp.qid, false, stride), qp.state.sq_tail());
-        let deadline = crate::time::monotonic_nanos() + COMMAND_TIMEOUT_NS;
-        loop {
+        Ok(cid)
+    }
+
+    /// Takes queue `q`'s next completion if it is there: the result for command `cid`, or
+    /// `None` if nothing new has arrived.
+    fn poll(&mut self, q: Q, cid: u16) -> Option<Result<Completion, Failure>> {
+        let stride = self.cap.doorbell_stride;
+        let regs = self.regs;
+        let qp = self.queue(q)?;
+        {
             let at = usize::from(qp.state.cq_head()) * nvme::CQ_ENTRY;
             // The phase is in the last dword: read it first, then the rest.
             let last = qp.cq.read32(at + 12);
@@ -212,18 +256,19 @@ impl Nvme {
                 last,
             ];
             let c = Completion::decode(words);
-            if qp.state.complete(&c) {
-                doorbell(nvme::doorbell(qp.qid, true, stride), qp.state.cq_head());
-                return if c.cid == cid {
-                    Ok(c)
-                } else {
-                    Err(Failure::WrongCommand)
-                };
+            if !qp.state.complete(&c) {
+                return None;
             }
-            if crate::time::monotonic_nanos() > deadline {
-                return Err(Failure::Timeout);
-            }
-            core::hint::spin_loop();
+            let p = ptr::with_exposed_provenance_mut::<u32>(
+                (regs + nvme::doorbell(qp.qid, true, stride)) as usize,
+            );
+            // SAFETY: as in `write32`: the completion head doorbell of a queue that exists.
+            unsafe { p.write_volatile(u32::from(qp.state.cq_head())) };
+            Some(if c.cid == cid {
+                Ok(c)
+            } else {
+                Err(Failure::WrongCommand)
+            })
         }
     }
 }
@@ -253,23 +298,56 @@ fn pattern(lba: u64, out: &mut [u8]) {
     }
 }
 
-/// Binds the first NVMe controller and proves block I/O on namespace 1. Returns whether
-/// every step and check passed (no controller at all is reported, and passes).
-pub(crate) fn init(com1: &mut Console) -> bool {
+/// The bound controller, once the polled proofs are done, with a data page for the
+/// interrupt-driven proof's thread. Locked with interrupts disabled, never across a wait.
+struct Driver {
+    nvme: Nvme,
+    dev: crate::pcie::Device,
+    page: DmaPage,
+}
+
+static DRIVER: SpinLock<Option<Driver>> = SpinLock::new(None);
+/// Woken by the completion interrupt.
+static COMPLETED: WaitQueue = WaitQueue::new();
+static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+/// The processor the last completion interrupt arrived on, plus one (0: none yet).
+static INTERRUPT_CPU: AtomicU64 = AtomicU64::new(0);
+
+/// The completion interrupt (`cpu::DEVICE_VECTOR`): counts it and wakes the waiter, which
+/// then reads the completion itself.
+pub(crate) fn on_interrupt() {
+    INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+    INTERRUPT_CPU.store(crate::cpu::cpu_id() + 1, Ordering::Relaxed);
+    COMPLETED.wake_one();
+}
+
+/// Binds the first NVMe controller and proves block I/O on namespace 1, polled and then
+/// interrupt-driven. Returns whether every step and check passed (no controller at all is
+/// reported, and passes).
+pub(crate) fn init(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
     let Some(dev) = crate::pcie::find(0x01, 0x08, 0x02) else {
         let _ = writeln!(com1, "origin-kernel: NVMe: no controller");
         return true;
     };
-    match bind(com1, &dev) {
-        Ok(ok) => ok,
+    let polled = match bind(com1, &dev) {
+        Ok((nvme, ok)) => {
+            let Some(page) = DmaPage::new() else {
+                return false;
+            };
+            crate::cpu::without_interrupts(|| {
+                *DRIVER.lock() = Some(Driver { nvme, dev, page });
+            });
+            ok
+        }
         Err(why) => {
             let _ = writeln!(com1, "origin-kernel: NVMe: {why}: NVMe failed");
-            false
+            return false;
         }
-    }
+    };
+    polled && prove_interrupts(com1, cpus, tsc_hz)
 }
 
-fn bind(com1: &mut Console, dev: &crate::pcie::Device) -> Result<bool, &'static str> {
+fn bind(com1: &mut Console, dev: &crate::pcie::Device) -> Result<(Nvme, bool), &'static str> {
     let f = dev.function;
     let bar = dev.bars[0].ok_or("no BAR 0")?;
     if bar.kind == BarKind::Io || bar.size < 0x2000 {
@@ -286,6 +364,7 @@ fn bind(com1: &mut Console, dev: &crate::pcie::Device) -> Result<bool, &'static 
         cap: Capabilities::decode(0),
         admin: new_queue(0, ADMIN_ENTRIES).ok_or("no memory for the admin queues")?,
         io: None,
+        irq: None,
     };
     c.cap = Capabilities::decode(c.read64(register::CAP));
     let (major, minor, tertiary) = nvme::version(c.read32(register::VS));
@@ -330,7 +409,7 @@ fn bind(com1: &mut Console, dev: &crate::pcie::Device) -> Result<bool, &'static 
         }
     };
     let id = c
-        .run(false, |cid| Command::identify(cid, 1, 0, data.phys))
+        .run(Q::Admin, |cid| Command::identify(cid, 1, 0, data.phys))
         .map_err(failed)?;
     if !id.status.ok() {
         return Err("Identify Controller failed");
@@ -348,7 +427,7 @@ fn bind(com1: &mut Console, dev: &crate::pcie::Device) -> Result<bool, &'static 
         info.mdts
     );
     let ns = c
-        .run(false, |cid| Command::identify(cid, 0, NSID, data.phys))
+        .run(Q::Admin, |cid| Command::identify(cid, 0, NSID, data.phys))
         .map_err(failed)?;
     page.copy_from_slice(data.bytes());
     let Some(namespace) = ns
@@ -369,7 +448,7 @@ fn bind(com1: &mut Console, dev: &crate::pcie::Device) -> Result<bool, &'static 
     let io = new_queue(1, IO_ENTRIES).ok_or("no memory for the I/O queues")?;
     let (cq_phys, sq_phys) = (io.cq.phys, io.sq.phys);
     let created = c
-        .run(false, |cid| {
+        .run(Q::Admin, |cid| {
             Command::create_io_cq(cid, 1, IO_ENTRIES, cq_phys)
         })
         .map_err(failed)?;
@@ -377,7 +456,7 @@ fn bind(com1: &mut Console, dev: &crate::pcie::Device) -> Result<bool, &'static 
         return Err("Create I/O Completion Queue failed");
     }
     let created = c
-        .run(false, |cid| {
+        .run(Q::Admin, |cid| {
             Command::create_io_sq(cid, 1, IO_ENTRIES, 1, sq_phys)
         })
         .map_err(failed)?;
@@ -387,7 +466,218 @@ fn bind(com1: &mut Console, dev: &crate::pcie::Device) -> Result<bool, &'static 
     c.io = Some(io);
     let ok = prove_io(com1, &mut c, &data, namespace).map_err(failed)?;
     let gpt = prove_gpt(com1, &mut c, &data, namespace).map_err(failed)?;
-    Ok(ok && gpt)
+    Ok((c, ok && gpt))
+}
+
+/// Reads the interrupt-driven proof makes, of 8 blocks each.
+const IRQ_READS: u64 = 64;
+/// What the interrupt-driven thread found: reads done, blocks that matched, and the TSC
+/// cycles they took (each plus one once set; 0: not finished).
+static IRQ_RESULT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Programs MSI-X for I/O queue 2 (vector 1, sent to processor `target` at
+/// `cpu::DEVICE_VECTOR`, every other entry masked), turns MSI-X on, and creates the queue
+/// pair with interrupts. Returns the MSI-X capability.
+fn setup_interrupts(d: &mut Driver, target: u32) -> Result<pci::Msix, &'static str> {
+    let msix = crate::pcie::msix(d.dev.function.at).ok_or("no MSI-X capability")?;
+    if msix.entries < 2 {
+        return Err("fewer than two MSI-X vectors");
+    }
+    let bar = d
+        .dev
+        .bars
+        .get(usize::from(msix.table_bar))
+        .copied()
+        .flatten()
+        .ok_or("the MSI-X table's BAR is not implemented")?;
+    let table_len = u64::from(msix.entries) * pci::MSIX_ENTRY;
+    if u64::from(msix.table_offset) + table_len > bar.size {
+        return Err("the MSI-X table lies outside its BAR");
+    }
+    let table = if msix.table_bar == 0 {
+        d.nvme.regs + u64::from(msix.table_offset)
+    } else {
+        crate::vm::map_mmio(bar.address + u64::from(msix.table_offset), table_len)
+            .map_err(|_| "cannot map the MSI-X table")?
+    };
+    let address = pci::msi_address(target).ok_or("the target needs interrupt remapping")?;
+    let data = pci::msi_data(crate::cpu::DEVICE_VECTOR).ok_or("bad vector")?;
+    let entry = |i: u64, word: u64, value: u32| {
+        let p = ptr::with_exposed_provenance_mut::<u32>(
+            (table + i * pci::MSIX_ENTRY + 4 * word) as usize,
+        );
+        // SAFETY: inside the MSI-X table (checked against its BAR above), mapped uncached;
+        // the entries only say where the device's interrupt messages go.
+        unsafe { p.write_volatile(value) };
+    };
+    for i in 0..u64::from(msix.entries) {
+        entry(i, 3, pci::MSIX_MASKED);
+    }
+    entry(1, 0, address as u32);
+    entry(1, 1, (address >> 32) as u32);
+    entry(1, 2, data);
+    entry(1, 3, 0);
+    let control =
+        crate::pcie::enable_msix(d.dev.function.at, &msix).ok_or("no configuration access")?;
+    if control & pci::MSIX_ENABLE == 0 || control & pci::MSIX_FUNCTION_MASK != 0 {
+        return Err("MSI-X did not turn on");
+    }
+    let queue = new_queue(2, IO_ENTRIES).ok_or("no memory for I/O queue 2")?;
+    let (cq, sq) = (queue.cq.phys, queue.sq.phys);
+    let failed = |_| "creating I/O queue 2 failed";
+    let made = d
+        .nvme
+        .run(Q::Admin, |cid| {
+            Command::create_io_cq_with_interrupts(cid, 2, IO_ENTRIES, 1, cq)
+        })
+        .map_err(failed)?;
+    if !made.status.ok() {
+        return Err("Create I/O Completion Queue 2 failed");
+    }
+    let made = d
+        .nvme
+        .run(Q::Admin, |cid| {
+            Command::create_io_sq(cid, 2, IO_ENTRIES, 2, sq)
+        })
+        .map_err(failed)?;
+    if !made.status.ok() {
+        return Err("Create I/O Submission Queue 2 failed");
+    }
+    d.nvme.irq = Some(queue);
+    Ok(msix)
+}
+
+/// The interrupt-driven proof's thread: [`IRQ_READS`] reads through I/O queue 2, each
+/// submitted under the driver lock and then waited for by blocking until the completion
+/// interrupt wakes it. The wait's condition is the completion queue itself, so a
+/// completion that lands before the thread blocks is never missed.
+extern "sysv64" fn io_thread(_: u64) -> ! {
+    let start = crate::cpu::rdtsc();
+    let (mut reads, mut matched) = (0u64, 0u64);
+    let mut copy = [0u8; 4096];
+    let mut expected = [0u8; 512];
+    for i in 0..IRQ_READS {
+        let lba = 2048 + (i % 8) * 8;
+        let cid = crate::cpu::without_interrupts(|| {
+            let mut g = DRIVER.lock();
+            let d = g.as_mut()?;
+            let prps = (d.page.phys, 0);
+            d.nvme
+                .submit(Q::Interrupt, |cid| {
+                    Command::transfer(false, cid, NSID, lba, 8, prps)
+                })
+                .ok()
+        });
+        let Some(cid) = cid else {
+            break;
+        };
+        let done = core::cell::Cell::new(None);
+        let deadline = crate::time::monotonic_nanos() + COMMAND_TIMEOUT_NS;
+        let waited = COMPLETED.wait_until_deadline(
+            || {
+                let r = DRIVER
+                    .lock()
+                    .as_mut()
+                    .and_then(|d| d.nvme.poll(Q::Interrupt, cid));
+                let ready = r.is_some();
+                if ready {
+                    done.set(r);
+                }
+                ready
+            },
+            deadline,
+        );
+        let Some(Ok(c)) = done.get() else {
+            break;
+        };
+        if waited.is_err() || !c.status.ok() {
+            break;
+        }
+        crate::cpu::without_interrupts(|| {
+            if let Some(d) = DRIVER.lock().as_ref() {
+                copy.copy_from_slice(d.page.bytes());
+            }
+        });
+        for k in 0..8u64 {
+            pattern(lba + k, &mut expected);
+            let at = (k * 512) as usize;
+            if copy.get(at..at + 512) == Some(&expected[..]) {
+                matched += 1;
+            }
+        }
+        reads += 1;
+    }
+    let cycles = crate::cpu::rdtsc().wrapping_sub(start);
+    for (slot, v) in IRQ_RESULT.iter().zip([reads, matched, cycles]) {
+        slot.store(v + 1, Ordering::Release);
+    }
+    crate::sched::exit()
+}
+
+/// Proves interrupt-driven completions: MSI-X set up for a second I/O queue, then a thread
+/// on another processor reads through it, blocking for each completion.
+fn prove_interrupts(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
+    let bsp = crate::cpu::cpu_id();
+    let target = cpus
+        .iter()
+        .copied()
+        .find(|&id| u64::from(id) != bsp)
+        .unwrap_or(bsp as u32);
+    let setup = crate::cpu::without_interrupts(|| {
+        let mut g = DRIVER.lock();
+        let d = g.as_mut().ok_or("no driver")?;
+        setup_interrupts(d, target)
+    });
+    let msix = match setup {
+        Ok(m) => m,
+        Err(why) => {
+            let _ = writeln!(com1, "origin-kernel: NVMe: MSI-X: {why}: NVMe failed");
+            return false;
+        }
+    };
+    let _ = writeln!(
+        com1,
+        "origin-kernel: NVMe: MSI-X: {} vectors, table in BAR{} at offset {:#x}; I/O queue 2 completes to vector 1, sent to CPU {target} as IDT vector {:#x}",
+        msix.entries,
+        msix.table_bar,
+        msix.table_offset,
+        crate::cpu::DEVICE_VECTOR
+    );
+    if crate::sched::spawn(target as usize, io_thread, 0).is_err() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: NVMe: cannot spawn the I/O thread: NVMe failed"
+        );
+        return false;
+    }
+    let finished = || IRQ_RESULT.iter().all(|r| r.load(Ordering::Acquire) != 0);
+    crate::sched::yield_until(finished, tsc_hz, 10);
+    let get = |i: usize| {
+        IRQ_RESULT
+            .get(i)
+            .map_or(0, |r| r.load(Ordering::Acquire).saturating_sub(1))
+    };
+    let (reads, matched, cycles) = (get(0), get(1), get(2));
+    let interrupts = INTERRUPTS.load(Ordering::Relaxed);
+    let on = INTERRUPT_CPU.load(Ordering::Relaxed).saturating_sub(1);
+    let ok = finished()
+        && reads == IRQ_READS
+        && matched == 8 * IRQ_READS
+        && interrupts >= IRQ_READS
+        && on == u64::from(target);
+    let micros = cycles / reads.max(1) / (tsc_hz / 1_000_000).max(1);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: NVMe: interrupt-driven: {reads} reads of 8 blocks by a thread on CPU {target}, each blocking until its completion interrupt: {interrupts} interrupts ({}), {matched} of {} blocks match, {micros} us per read{}",
+        if interrupts == 0 {
+            alloc::string::String::from("none arrived")
+        } else {
+            alloc::format!("the last on CPU {on}")
+        },
+        8 * IRQ_READS,
+        if ok { "" } else { ": NVMe failed" }
+    );
+    ok
 }
 
 /// Reads whole blocks from `lba` into `out`, a page at a time.
@@ -405,7 +695,7 @@ fn read_blocks(
         let blocks = (chunk.len() as u64).div_ceil(bs).min(per_page);
         let prps = nvme::prps(data.phys, blocks * bs, PAGE).unwrap_or((data.phys, 0));
         let at = lba + done;
-        let r = c.run(true, |cid| {
+        let r = c.run(Q::Polled, |cid| {
             Command::transfer(false, cid, NSID, at, blocks as u32, prps)
         })?;
         if !r.status.ok() {
@@ -530,7 +820,7 @@ fn prove_io(
     let bs = u64::from(ns.block_size);
     let read = |c: &mut Nvme, lba: u64, blocks: u32| {
         let prps = nvme::prps(data.phys, u64::from(blocks) * bs, PAGE).unwrap_or((data.phys, 0));
-        c.run(true, |cid| {
+        c.run(Q::Polled, |cid| {
             Command::transfer(false, cid, NSID, lba, blocks, prps)
         })
     };
@@ -564,10 +854,10 @@ fn prove_io(
     pattern(scratch ^ 0xA5A5, &mut block);
     data.fill(&block);
     let prps = (data.phys, 0);
-    let wrote = c.run(true, |cid| {
+    let wrote = c.run(Q::Polled, |cid| {
         Command::transfer(true, cid, NSID, scratch, 1, prps)
     })?;
-    let flushed = c.run(true, |cid| Command::flush(cid, NSID))?;
+    let flushed = c.run(Q::Polled, |cid| Command::flush(cid, NSID))?;
     data.fill(&[0u8; 512]);
     let back = read(c, scratch, 1)?;
     let round_trip = wrote.status.ok()

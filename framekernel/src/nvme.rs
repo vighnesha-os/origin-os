@@ -157,6 +157,20 @@ impl Command {
         }
     }
 
+    /// As [`Command::create_io_cq`], with interrupts on: completions raise interrupt
+    /// `vector` (the MSI-X table entry).
+    pub const fn create_io_cq_with_interrupts(
+        cid: u16,
+        qid: u16,
+        entries: u16,
+        vector: u16,
+        prp1: u64,
+    ) -> Self {
+        let mut c = Self::create_io_cq(cid, qid, entries, prp1);
+        c.cdw11 = ((vector as u32) << 16) | 0b11;
+        c
+    }
+
     /// Create I/O Submission Queue `qid` of `entries` at `prp1`, completing to queue `cqid`,
     /// physically contiguous.
     pub const fn create_io_sq(cid: u16, qid: u16, entries: u16, cqid: u16, prp1: u64) -> Self {
@@ -472,6 +486,12 @@ mod tests {
         assert_eq!(
             (cq[0] & 0xFF, cq[6], cq[7], cq[10], cq[11]),
             (5, 0, 9, 0x003F_0001, 1)
+        );
+        let irq = Command::create_io_cq_with_interrupts(1, 2, 64, 1, 0x9000).to_words();
+        assert_eq!(
+            (irq[10], irq[11]),
+            (0x003F_0002, 0x0001_0003),
+            "PC, IEN, IV 1"
         );
         let sq = Command::create_io_sq(2, 1, 64, 1, 0x8000).to_words();
         assert_eq!(

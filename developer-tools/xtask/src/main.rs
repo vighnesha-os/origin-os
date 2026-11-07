@@ -272,6 +272,14 @@ fn boot_scenario_markers() -> Scenario {
                 disk::PARTITIONS[1].2,
                 disk::PARTITIONS[1].3
             ),
+            // Interrupt-driven completions: MSI-X vector 1 to another CPU (q35's NVMe has
+            // 65 vectors, the table in BAR 0), a thread there blocking for each one.
+            "origin-kernel: NVMe: MSI-X: 65 vectors, table in BAR0 at offset 0x2000; I/O queue 2 completes to vector 1, sent to CPU ".into(),
+            format!(
+                "origin-kernel: NVMe: interrupt-driven: 64 reads of 8 blocks by a thread on CPU {}, each blocking until its completion interrupt: ",
+                cpus.min(2) - 1
+            ),
+            "512 of 512 blocks match".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
         failures: vec![

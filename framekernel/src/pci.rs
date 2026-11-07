@@ -26,6 +26,17 @@ pub mod register {
     pub const BAR0: u16 = 0x10;
 }
 
+/// Status register bit 4 (in the upper half of the command dword): a capability list.
+const STATUS_CAPABILITIES: u32 = 1 << 20;
+/// The capability list's head pointer (type 0 and type 1 headers).
+const CAPABILITIES_POINTER: u16 = 0x34;
+/// Capability IDs (PCI Code and ID Assignment Specification).
+pub mod capability {
+    pub const MSI: u8 = 0x05;
+    pub const PCI_EXPRESS: u8 = 0x10;
+    pub const MSIX: u8 = 0x11;
+}
+
 /// Command register bits 0 and 1: I/O space and memory space decoding.
 const DECODE: u32 = 0b11;
 /// Header type bit 7: the device has several functions.
@@ -240,6 +251,101 @@ pub fn enumerate(
         }
     }
     Ok(n)
+}
+
+/// Reads the byte at `offset` of configuration space through 32-bit accesses.
+fn read8(cfg: &mut impl ConfigSpace, at: Address, offset: u16) -> u8 {
+    let dword = cfg.read32(at, offset & !3);
+    (dword >> (8 * u32::from(offset & 3))) as u8
+}
+
+/// The function's capabilities, as `(id, offset)` pairs in list order, into `out`; returns
+/// how many. A pointer into the header (below 40h), a loop or more entries than `out`
+/// holds ends the walk: configuration space is untrusted.
+pub fn capabilities(cfg: &mut impl ConfigSpace, at: Address, out: &mut [(u8, u16)]) -> usize {
+    if cfg.read32(at, register::COMMAND) & STATUS_CAPABILITIES == 0 {
+        return 0;
+    }
+    let mut next = u16::from(read8(cfg, at, CAPABILITIES_POINTER)) & 0xFC;
+    let mut n = 0;
+    while next >= 0x40 && n < out.len() {
+        // A loop revisits an offset: stop there.
+        if out.iter().take(n).any(|&(_, seen)| seen == next) {
+            break;
+        }
+        let id = read8(cfg, at, next);
+        if let Some(slot) = out.get_mut(n) {
+            *slot = (id, next);
+        }
+        n += 1;
+        next = u16::from(read8(cfg, at, next + 1)) & 0xFC;
+    }
+    n
+}
+
+/// The offset of the first capability with `id`.
+pub fn find_capability(cfg: &mut impl ConfigSpace, at: Address, id: u8) -> Option<u16> {
+    let mut caps = [(0u8, 0u16); 48];
+    let n = capabilities(cfg, at, &mut caps);
+    caps.iter()
+        .take(n)
+        .find(|&&(c, _)| c == id)
+        .map(|&(_, offset)| offset)
+}
+
+/// A function's MSI-X capability (PCI Express Base 6.x §7.7.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Msix {
+    /// The capability's offset in configuration space.
+    pub capability: u16,
+    /// Table entries (1–2048).
+    pub entries: u16,
+    /// The BAR holding the table, and the table's offset in it (8-byte aligned).
+    pub table_bar: u8,
+    pub table_offset: u32,
+    /// The same for the pending-bit array.
+    pub pba_bar: u8,
+    pub pba_offset: u32,
+}
+
+/// Message control bits: MSI-X enable, and function mask.
+pub const MSIX_ENABLE: u32 = 1 << 15;
+pub const MSIX_FUNCTION_MASK: u32 = 1 << 14;
+/// Bytes of one MSI-X table entry; the vector-control dword's mask bit.
+pub const MSIX_ENTRY: u64 = 16;
+pub const MSIX_MASKED: u32 = 1;
+
+/// Reads the function's MSI-X capability, if it has a valid one (both BIRs naming BARs
+/// 0–5).
+pub fn msix(cfg: &mut impl ConfigSpace, at: Address) -> Option<Msix> {
+    let capability = find_capability(cfg, at, capability::MSIX)?;
+    let control = cfg.read32(at, capability) >> 16;
+    let table = cfg.read32(at, capability + 4);
+    let pba = cfg.read32(at, capability + 8);
+    let (table_bar, pba_bar) = ((table & 7) as u8, (pba & 7) as u8);
+    if table_bar > 5 || pba_bar > 5 {
+        return None;
+    }
+    Some(Msix {
+        capability,
+        entries: ((control & 0x7FF) + 1) as u16,
+        table_bar,
+        table_offset: table & !7,
+        pba_bar,
+        pba_offset: pba & !7,
+    })
+}
+
+/// The MSI or MSI-X message address that delivers to the local APIC with ID `apic_id` in
+/// physical destination mode (Intel SDM Vol. 3A §11.11.1): `FEEh` in bits 31:20, the
+/// destination in bits 19:12. IDs above 255 need interrupt remapping: `None`.
+pub fn msi_address(apic_id: u32) -> Option<u64> {
+    (apic_id <= 0xFF).then(|| 0xFEE0_0000 | (u64::from(apic_id) << 12))
+}
+
+/// The message data for a fixed, edge-triggered interrupt at `vector` (16–254).
+pub fn msi_data(vector: u8) -> Option<u32> {
+    (16..=254).contains(&vector).then_some(u32::from(vector))
 }
 
 /// What a BAR decodes.
@@ -576,6 +682,60 @@ mod tests {
         assert_eq!(m.regs, before);
         assert!(!m.probed_while_decoding);
         assert!(!m.status_writes_of_one);
+    }
+
+    #[test]
+    fn capability_lists_are_walked_safely() {
+        let f = at(0, 4, 0);
+        let mut m = q35();
+        // Capabilities present; the list: 40h power management, 50h MSI-X (64 entries,
+        // table in BAR 0 at 2000h, PBA in BAR 0 at 3000h), 60h PCI Express.
+        let command = m.regs[&(f, register::COMMAND)];
+        m.regs
+            .insert((f, register::COMMAND), command | STATUS_CAPABILITIES);
+        m.regs.insert((f, 0x34), 0x40);
+        m.regs.insert((f, 0x40), 0x0003_5001);
+        m.regs.insert((f, 0x50), (63 << 16) | 0x6011);
+        m.regs.insert((f, 0x54), 0x2000);
+        m.regs.insert((f, 0x58), 0x3000);
+        m.regs.insert((f, 0x60), 0x0002_0010);
+        let mut caps = [(0, 0); 8];
+        let n = capabilities(&mut m, f, &mut caps);
+        assert_eq!(&caps[..n], &[(0x01, 0x40), (0x11, 0x50), (0x10, 0x60)]);
+        assert_eq!(
+            msix(&mut m, f),
+            Some(Msix {
+                capability: 0x50,
+                entries: 64,
+                table_bar: 0,
+                table_offset: 0x2000,
+                pba_bar: 0,
+                pba_offset: 0x3000
+            })
+        );
+        assert_eq!(find_capability(&mut m, f, capability::MSI), None);
+        // A loop back to 40h ends the walk.
+        m.regs.insert((f, 0x60), 0x0002_4010);
+        assert_eq!(capabilities(&mut m, f, &mut caps), 3);
+        // A pointer into the header ends it too.
+        m.regs.insert((f, 0x50), (63 << 16) | 0x2011);
+        assert_eq!(capabilities(&mut m, f, &mut caps), 2);
+        // A BIR naming no BAR is refused.
+        m.regs.insert((f, 0x50), (63 << 16) | 0x0011);
+        m.regs.insert((f, 0x54), 0x2006);
+        assert_eq!(msix(&mut m, f), None);
+        // Without the status bit there is no list at all.
+        m.regs
+            .insert((f, register::COMMAND), command & !STATUS_CAPABILITIES);
+        assert_eq!(capabilities(&mut m, f, &mut caps), 0);
+        // Messages.
+        assert_eq!(msi_address(1), Some(0xFEE0_1000));
+        assert_eq!(msi_address(255), Some(0xFEEF_F000));
+        assert_eq!(msi_address(256), None);
+        assert_eq!(
+            (msi_data(0x40), msi_data(15), msi_data(255)),
+            (Some(0x40), None, None)
+        );
     }
 
     #[test]

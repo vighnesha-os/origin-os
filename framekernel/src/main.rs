@@ -188,9 +188,10 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         sched::prove(&mut com1, online.ids(), tsc_hz);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
         if pcie::init(&mut com1, info.acpi_rsdp, regions, online.ids().len()) {
-            // M5: the NVMe driver and block I/O.
-            storage::init(&mut com1);
+            // M5: the NVMe driver and block I/O, polled and then interrupt-driven.
+            storage::init(&mut com1, online.ids(), tsc_hz);
         }
+        sched::stop_boot_processor();
     }
 
     let _ = report::write_halt(&mut com1);

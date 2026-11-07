@@ -251,6 +251,28 @@ fn report(com1: &mut Console, f: &Function, bars: &[Option<Bar>; 6]) {
     let _ = writeln!(com1);
 }
 
+/// The function's MSI-X capability, if it has one.
+pub(crate) fn msix(at: Address) -> Option<pci::Msix> {
+    crate::cpu::without_interrupts(|| {
+        let mut guard = ECAM.lock();
+        pci::msix(guard.as_mut()?, at)
+    })
+}
+
+/// Turns MSI-X on for the function, with the function mask clear: only entries the driver
+/// unmasked can then fire. Returns the message control word read back.
+pub(crate) fn enable_msix(at: Address, msix: &pci::Msix) -> Option<u32> {
+    crate::cpu::without_interrupts(|| {
+        let mut guard = ECAM.lock();
+        let space = guard.as_mut()?;
+        let dword = space.read32(at, msix.capability);
+        let control = ((dword >> 16) | pci::MSIX_ENABLE) & !pci::MSIX_FUNCTION_MASK;
+        // The low half (ID and next pointer) is read-only.
+        space.write32(at, msix.capability, (control << 16) | (dword & 0xFFFF));
+        Some(space.read32(at, msix.capability) >> 16)
+    })
+}
+
 /// The first listed function of this class, subclass and programming interface.
 pub(crate) fn find(class: u8, subclass: u8, prog_if: u8) -> Option<Device> {
     crate::cpu::without_interrupts(|| {

@@ -711,9 +711,16 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
         heap_before.unwrap_or(0) >> 10,
         if reaped { "" } else { ": scheduler failed" }
     );
+    ok
+}
+
+/// Stops the boot processor's scheduler and timer once the boot proofs are done, so the
+/// boot flow can halt.
+pub(crate) fn stop_boot_processor() {
+    // SAFETY: CPL 0, the boot processor, already in x2APIC mode (`timer::init`).
+    let lapic = unsafe { X2Apic::assume_enabled() };
     lapic.stop();
-    if let Some(active) = ACTIVE.get(bsp) {
+    if let Some(active) = ACTIVE.get(this_cpu()) {
         active.store(false, Ordering::Release);
     }
-    ok
 }

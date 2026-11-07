@@ -114,7 +114,7 @@ pub(crate) unsafe fn init() {
     if let Some(gate) = idt.0.get_mut(usize::from(SYSCALL_VECTOR)) {
         *gate = d::user_interrupt_gate((syscall_stub as *const ()).addr() as u64, KERNEL_CODE);
     }
-    let interrupts: [(u8, extern "sysv64" fn()); 8] = [
+    let interrupts: [(u8, extern "sysv64" fn()); 9] = [
         (TIMER_VECTOR, timer_stub),
         (SPURIOUS_VECTOR, spurious_stub),
         (YIELD_VECTOR, yield_stub),
@@ -123,6 +123,7 @@ pub(crate) unsafe fn init() {
         (BLOCK_VECTOR, block_stub),
         (crate::tlb::SHOOTDOWN_VECTOR, shootdown_stub),
         (RESCHEDULE_VECTOR, reschedule_stub),
+        (DEVICE_VECTOR, device_stub),
     ];
     for (vector, stub) in interrupts {
         if let Some(gate) = idt.0.get_mut(usize::from(vector)) {
@@ -455,6 +456,8 @@ pub(crate) const EXIT_VECTOR: u8 = 0x83;
 pub(crate) const BLOCK_VECTOR: u8 = 0x84;
 /// IPI: a thread queued on this processor was woken by another (`sched::wake`).
 pub(crate) const RESCHEDULE_VECTOR: u8 = 0xF1;
+/// The NVMe controller's I/O completion interrupt (an MSI-X message).
+pub(crate) const DEVICE_VECTOR: u8 = 0x40;
 /// The system-call vector, the only gate user mode may raise (DPL 3). RAX: 0 exit(RDI),
 /// 1 report(RDI); anything else returns `u64::MAX` in RAX.
 pub(crate) const SYSCALL_VECTOR: u8 = 0x80;
@@ -507,6 +510,15 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     }
     if frame.vector == u64::from(SPURIOUS_VECTOR) {
         return here;
+    }
+    // A device's MSI-X message (the NVMe I/O queue): acknowledge, let the driver wake its
+    // waiter, and switch to it now.
+    if frame.vector == u64::from(DEVICE_VECTOR) {
+        // SAFETY: as for the timer: MSI-X messages are only routed to processors whose
+        // APIC is in x2APIC mode; the write only acknowledges the interrupt.
+        unsafe { wrmsr(X2APIC_EOI, 0) };
+        crate::storage::on_interrupt();
+        return crate::sched::on_reschedule(here);
     }
     // Another processor woke a thread queued here: acknowledge, then switch to it now
     // rather than at the next timer tick.
@@ -1169,6 +1181,7 @@ soft_stub!(syscall_stub, SYSCALL_VECTOR);
 soft_stub!(shootdown_stub, crate::tlb::SHOOTDOWN_VECTOR);
 soft_stub!(block_stub, BLOCK_VECTOR);
 soft_stub!(reschedule_stub, RESCHEDULE_VECTOR);
+soft_stub!(device_stub, DEVICE_VECTOR);
 
 /// Entry stub of the spurious-interrupt vector.
 #[unsafe(naked)]

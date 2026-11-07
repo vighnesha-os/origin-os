@@ -442,6 +442,27 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Result:** no parser bug was found. The two first-run failures were in the tests themselves (shared Identify data, and random registers that are almost never a date) and were redesigned.
 - **Not done:** coverage-guided fuzzing (cargo-fuzz needs nightly, against CLAUDE.md §12), and Kani proofs of the same properties (§73).
 
+### MSI-X and interrupt-driven NVMe completions (CLAUDE.md §31 interrupt management, §33; 2026-11-07)
+
+- **What:**
+  - `pci` (library): the capability-list walk. It needs the status bit, starts from the pointer at 34h, stops at a loop, a pointer into the header or 48 entries, and reads bytes through dword accesses. Also the MSI-X capability (entries, table and PBA BARs and offsets, with BIRs above 5 refused) and the x86 MSI message: address `FEEh` with the destination APIC ID (IDs above 255 refused until interrupt remapping exists), and fixed edge-triggered data for vectors 16–254.
+  - `nvme`: Create I/O CQ with interrupts (PC, IEN and the vector in CDW11).
+  - `pcie::enable_msix`: sets the enable bit and clears the function mask; `pcie::msix`.
+  - `cpu`: `DEVICE_VECTOR` 0x40. Its handler acknowledges, calls `storage::on_interrupt` (count, record the CPU, wake the wait queue), then reschedules.
+  - `storage`:
+    - `run` split into `submit` and `poll`, so a thread can block between them;
+    - the controller kept in a lock once bound;
+    - `setup_interrupts`: every MSI-X entry masked, then entry 1 routed to the target CPU and unmasked; MSI-X on; I/O queue pair 2 created with interrupts on vector 1;
+    - the I/O thread submits under the driver lock and blocks with `wait_until_deadline`. Its condition is the completion queue itself, so a completion that lands before the thread blocks is never missed.
+  - `sched::stop_boot_processor`: the boot processor's scheduler now stays active through the storage proofs.
+- **Specifications:** PCI Express Base 6.x §7.5.1.1 (capability pointer), §7.7.2 (MSI-X); Intel SDM Vol. 3A §11.11 (message address and data); NVM Express Base 2.x §5.2.1 (Create I/O CQ: PC, IEN, IV).
+- **Proof** (every boot): q35's NVMe has 65 MSI-X vectors, with the table in BAR 0 at offset 2000h. A thread on CPU 1 (CPU 0 with one processor) made 64 reads of 8 blocks through queue 2, each blocking until its interrupt: exactly 64 interrupts, all on the target CPU, and 512 of 512 blocks matched the pattern.
+- **Measured in QEMU:** 89 µs per read on one CPU, about 375 µs when the thread waits on an idle AP. The difference is probably QEMU waking a halted vCPU, not the driver.
+- **Negative control:** vector 1 left masked → no interrupt arrives, and the first wait times out → "0 reads … none arrived … NVMe failed".
+- **Process note:** the MSI-X markers were first placed before the GPT markers, which the boot prints earlier. This time the good-path run made before the controls caught it, as the lesson from the PCIe step requires.
+- **Test evidence:** 1 more `pci` test (capability walk, loops, header pointers, bad BIRs, messages) and 1 more `nvme` assertion; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** per-CPU queues with a vector each, interrupt remapping (x2APIC IDs above 255), MSI (non-X) devices, and moving the admin queue to interrupts.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.
