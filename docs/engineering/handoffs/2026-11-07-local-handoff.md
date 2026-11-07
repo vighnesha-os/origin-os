@@ -177,6 +177,13 @@ The owner asked for the design to be finalised with the recommended options, fol
 | `6ae2541` | ACPI PM timer: a second time-source cross-check |
 | `c9e63d2` | CPU topology from CPUID leaf 0Bh |
 | `fe6be25` | CPU cache hierarchy from CPUID leaf 04h |
+| `e275027` | Records: STATUS milestone rows and this handoff's commit list |
+| `dc4ba79` | OriginFS v0 read-only parser + image builder (ADR-0006, Proposed; host-only, not mounted — §84) |
+| `3c038fc` | NUMA discovery from the ACPI SRAT (proven at boot with two `-numa` nodes) |
+| `f95384e` | NUMA distances from the ACPI SLIT |
+| `ec9c729` | NUMA locality map (CPU/address → node, nearest-node order, self-nearest) |
+| `a017bc6` | Streaming UTF-8 decoder for the text engine (byte-exact vs `core::str` over 20k fuzzed inputs) |
+| `a5b139b` | Gap buffer for editable text (50k-op model test) |
 
 (The 2026-11-08 commits use the Claude Opus 4.8 attribution; the run spanned midnight.)
 
@@ -205,3 +212,33 @@ passes; the system boots on 1–8 processors. Everything is QEMU-only; no physic
 ADR-0005 kernel system-call layer is still the one area left untouched (a safety classifier
 stopped it twice earlier); the owner's non-design items (downloads, a licence, merge/push)
 remain.
+
+### Continued (2026-11-08, ~02:00–03:50 IST)
+
+Six more features, each built → host-tested → committed, with boot proofs and negative
+controls where they run in the kernel:
+
+- **NUMA, end to end (§24, §27, §28, §66).** The ACPI **SRAT** (CPU and memory proximity
+  domains) and **SLIT** (inter-node distance matrix) are parsed, and a pure **locality map**
+  (`numa`) answers CPU/address → node, nearest-node order and the self-nearest invariant.
+  QEMU is now booted with two `-numa` nodes and a cross-node distance, so the kernel reads a
+  real firmware SRAT/SLIT: `numa: 2 nodes, N cpus, …; consistent true` and
+  `slit: 2 localities, local 10 (true), …, from 0 [0, 1]; consistent true` at `-smp`
+  1/2/4/8. Three negative controls (SRAT entry offset, SLIT matrix offset, inverted
+  nearest-node comparator) each fail the boot and were restored.
+- **OriginFS v0 (§39–§41, §84).** A read-only on-disk filesystem parser and image builder
+  against the **Proposed** ADR-0006 (superblock, inode table, 12 direct + 1 single-indirect
+  pointers, linked directory entries). Host-only, **not mounted** — the format decision
+  awaits the owner. The kernel binary does not reference it, so the no-panic object is
+  unaffected.
+- **Text-engine groundwork (§51).** A streaming, error-locating **UTF-8 decoder** (`text`),
+  byte-exact against `core::str::from_utf8` and `String::from_utf8_lossy` over 20 000 fuzzed
+  inputs; and a scalar-indexed **gap buffer** (`editbuffer`) for editable text, checked by a
+  50 000-operation model test against a `Vec<char>` oracle. Both host-only (no UI path yet).
+
+By ~03:50 IST, **189 host library tests** pass; `cargo xtask check`, `boot-test` and
+`boot-matrix` (1/2/4) pass; 8-CPU boots confirmed. The NUMA map is the decision layer — a
+NUMA-aware frame allocator and scheduler placement (§66) are the deliberate next step, left
+for a careful change rather than an unattended edit to the core allocator. ADR-0005
+(syscalls) remains untouched; the owner's non-design items (downloads, a licence,
+merge/push) remain.
