@@ -36,7 +36,10 @@ KRN, the Framekernel image, is an ONBF profile (ONBF §6.5), and only the boot l
      - the signature-block structure (§7.1).
    - **SHA-256 and SHA-512 are done** (`origin-crypto`). `Image::verify_content_digest(…)` can now be called with `origin_crypto::Sha512`.
 2. **`onbf-merkle` is done**: Merkle-SHA256-4K (§4.6), with G2, G3 and R1–R3. **Still to do:** connect it to `onbf-format` sections, so that a section's `digest` is checked as its Merkle root against the MERKLE section.
-3. **A conversion path for KRN**: an `onbf-pack` subset that turns the kernel's ELF linker output into KRN. G4 and G5 are decided and enforced by `onbf-format`. **Still needed:** the KRN manifest's OCBOR-1 key numbers (owner) and the OCBOR-1 validator.
+3. **A conversion path for KRN**: an `onbf-pack` subset that turns the kernel's ELF linker output into KRN. G4 and G5 are decided and enforced by `onbf-format`. The KRN manifest keys are decided (`docs/spec/ONBF-manifest-keys.md`, K1–K4). **Still needed:**
+   - the OCBOR-1 validator (§5);
+   - a KRN manifest decoder;
+   - the CPU-feature CPUID tests, verified against the Intel SDM and AMD APM.
 4. **M1 step 2**:
    - a *Proposed* boot ADR covering the boot-info structure and its ABI version (add it to `origin-version.toml [compatibility]` then), KASLR and relocation, and the trust anchor;
    - a `framekernel` crate for `x86_64-unknown-none` that writes to COM1;
@@ -47,7 +50,7 @@ KRN, the Framekernel image, is an ONBF profile (ONBF §6.5), and only the boot l
 
 - Merge `m0/toolchain-verification` into `main`, and push. Both are the owner's call; nothing has been pushed.
 - A project licence. Every provenance entry says "not chosen yet".
-- ONBF gap G1 (no section kind for SYM's DWARF data) in `docs/spec/ONBF-errata.md`. C1–C14 and G2–G5 were decided on 2026-11-07. Next decision on the critical path: the OCBOR-1 key numbers for the KRN manifest.
+- ONBF gap G1 (no section kind for SYM's DWARF data) in `docs/spec/ONBF-errata.md`. C1–C14, G2–G5 and the manifest-key policy K1–K4 were decided on 2026-11-07. Next decision on the critical path: the boot ADR (boot-info structure, KASLR, trust anchor), which is needed for M1 step 2.
 - The boot trust anchor (Microsoft UEFI CA 2023, or Origin keys enrolled in firmware) for the boot ADR.
 - Whether to install Rosetta 2 for the *executed* FFI-bool test (§10). Only the assembly-level check exists so far.
 - The starting release values in `origin-version.toml` (`0.1.0-dev`, build 0, SVN 0) are a development default. Change them if you prefer others.

@@ -138,6 +138,6 @@ The owner accepted all twelve defaults in spec Appendix B:
 ## Still open (owned elsewhere)
 
 - **Boot trust anchor**: signing under Microsoft UEFI CA 2023, or Origin keys enrolled in firmware. Owned by the M1 boot ADR (R5).
-- **Integer key numbers** for the OCBOR-1 schemas: assigned when `onbf-format` is implemented.
+- **Integer key numbers** for the OCBOR-1 schemas: assigned when `onbf-format` is implemented. *Resolved for the policy and the KRN profile on 2026-11-07 (owner decisions K1–K4): `docs/spec/ONBF-manifest-keys.md`. The other profiles follow the same registry.*
 - **User-process ABI details** (TLS model, calling-convention specifics, system-call mechanism): owned by the user-ABI ADR, M4–M6.
 - **Vector icon format**: owned by the UI ADR.

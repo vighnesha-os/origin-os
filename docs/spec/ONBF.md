@@ -6,6 +6,7 @@
 | Version | 1.0 (design) |
 | Status | **Accepted by the owner on 2026-11-07** (§2; `docs/adr/ADR-0001-onbf.md`). Byte layouts become v1.0 final only after the §13 parser tests pass. Until then, any layout change needs an ADR amendment. |
 | Clarifications | `docs/spec/ONBF-errata.md`. C1–C14 and G2–G5 were decided by the owner on 2026-11-07 and are normative. They narrow §4 and define the §4.6 Merkle level numbering, for example: every unknown section kind is rejected (C13); manifests are never compressed (C12); segments are page-sized, sorted and disjoint (G4); REQUIRED is set on every section (G5). G1 is open. |
+| Manifest keys | `docs/spec/ONBF-manifest-keys.md`: one shared OCBOR-1 key registry for all profiles. Key 0 is `schema`, CPU features are a bitset, and the KRN keys are assigned (owner decisions K1–K4, 2026-11-07). |
 | Research baseline | 2026-11-07 |
 | Toolchain | Rust 1.99.1 stable, edition 2024 (CLAUDE.md §8) |
 | Implements | CLAUDE.md §19, §42–47, §58–60, §62–64, §70 |
