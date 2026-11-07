@@ -37,7 +37,11 @@ Any failure stops the boot with a message on the console.
 - Each segment's content is copied to `base + mem_offset`, and the rest of `mem_size` is zero-filled.
 - Then each RELOCS slot gets `*(base + rva) += base` (RELR, ONBF §6.1).
 
-The loader allocates the kernel image, the boot info and the kernel stack with **OS-defined UEFI memory types**. UEFI reserves 0x8000_0000 and above for OS loaders: 0x8000_0001 for the kernel image, 0x8000_0002 for the boot info, 0x8000_0003 for the kernel stack. Because of that the firmware's own memory map identifies them, and the loader never has to split regions by address.
+Memory types:
+- **The kernel image** is `EfiLoaderCode`. When the boot info is built, it is marked `KernelImage` *by address*, which splits the containing region.
+  - OVMF's default no-execute policy (`PcdDxeNxMemoryProtectionPolicy`) is understood to mark `EfiLoaderData` and the OS-defined range as non-executable, so code placed there could not run. `EfiLoaderCode` is the type UEFI intends for loaded code, and the firmware keeps it executable.
+  - That NX default is from knowledge of EDK2, not verified in its source here. Using `EfiLoaderCode` is correct either way.
+- **The boot info and the kernel stack** are data. They use **OS-defined types**: UEFI reserves 0x8000_0000 and above for OS loaders. 0x8000_0002 is the boot info and 0x8000_0003 the kernel stack, so the firmware's own memory map identifies them.
 
 *KASLR:* in M1 the physical base is whatever the firmware returns. A randomized base, from `EFI_RNG_PROTOCOL`, belongs with the kernel's own page tables in M2, when the virtual layout becomes the kernel's to choose.
 

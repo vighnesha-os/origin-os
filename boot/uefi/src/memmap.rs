@@ -24,6 +24,8 @@ pub enum MapError {
     Overlap(u64),
     /// More regions than the output array holds.
     Capacity,
+    /// A range to carve out is not inside a single region.
+    NotContained(u64),
 }
 
 /// The Origin region kind for an `EFI_MEMORY_TYPE`.
@@ -39,7 +41,6 @@ pub const fn kind_of(uefi_type: u32) -> RegionKind {
         10 => RegionKind::AcpiNvs,
         11 | 12 => RegionKind::Mmio,
         14 => RegionKind::Persistent,
-        memory_type::OS_KERNEL_IMAGE => RegionKind::KernelImage,
         memory_type::OS_BOOT_INFO => RegionKind::BootInfo,
         memory_type::OS_KERNEL_STACK => RegionKind::KernelStack,
         // Reserved (0), PalCode (13), Unaccepted (15), unknown and other OEM/OS values.
@@ -140,6 +141,64 @@ pub fn translate(
     Ok(kept)
 }
 
+/// Re-labels `pages` pages at `base` as `kind` inside the first `count` regions of `out`,
+/// splitting the region that contains them into up to three. Returns the new count.
+///
+/// The kernel image is allocated as `EfiLoaderCode`, which firmware keeps executable, so
+/// the memory map cannot mark it by type; the loader marks it by address (ADR-0002 B3).
+pub fn carve(
+    out: &mut [MemoryRegion],
+    count: usize,
+    base: u64,
+    pages: u64,
+    kind: RegionKind,
+) -> Result<usize, MapError> {
+    let end = pages
+        .checked_mul(PAGE)
+        .and_then(|len| base.checked_add(len))
+        .ok_or(MapError::Overflow(base))?;
+    let regions = out.get(..count).ok_or(MapError::Capacity)?;
+    let (i, r) = regions
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, r)| {
+            let r_end = r.base.saturating_add(r.pages.saturating_mul(PAGE));
+            r.base <= base && end <= r_end
+        })
+        .ok_or(MapError::NotContained(base))?;
+    let r_end = r.base.saturating_add(r.pages.saturating_mul(PAGE));
+    let left = (base > r.base).then(|| MemoryRegion {
+        base: r.base,
+        pages: (base - r.base) / PAGE,
+        kind: r.kind,
+        reserved: 0,
+    });
+    let middle = MemoryRegion {
+        base,
+        pages,
+        kind: kind as u32,
+        reserved: 0,
+    };
+    let right = (end < r_end).then(|| MemoryRegion {
+        base: end,
+        pages: (r_end - end) / PAGE,
+        kind: r.kind,
+        reserved: 0,
+    });
+    let parts: [Option<MemoryRegion>; 3] = [left, Some(middle), right];
+    let n_parts = parts.iter().flatten().count();
+    let extra = n_parts.saturating_sub(1);
+    let new_count = count.checked_add(extra).ok_or(MapError::Capacity)?;
+    // Open `extra` free slots at `i` by rotating the tail, then write the parts there.
+    let tail = out.get_mut(i..new_count).ok_or(MapError::Capacity)?;
+    tail.rotate_right(extra);
+    for (slot, part) in tail.iter_mut().zip(parts.iter().flatten()) {
+        *slot = *part;
+    }
+    Ok(new_count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,7 +230,7 @@ mod tests {
             desc(48, 7, 0x10_0000, 0x100), // conventional
             desc(48, 2, 0x1000, 1),        // loader data
             desc(48, 4, 0x2000, 2),        // boot services data, adjacent: merges
-            desc(48, memory_type::OS_KERNEL_IMAGE, 0x20_0000, 3),
+            desc(48, memory_type::OS_KERNEL_STACK, 0x20_0000, 3),
             desc(48, 9, 0x4000, 0),       // empty: ignored
             desc(48, 11, 0xFEC0_0000, 1), // MMIO
         ]
@@ -183,7 +242,7 @@ mod tests {
             &[
                 region(0x1000, 3, RegionKind::LoaderReclaimable),
                 region(0x10_0000, 0x100, RegionKind::Usable),
-                region(0x20_0000, 3, RegionKind::KernelImage),
+                region(0x20_0000, 3, RegionKind::KernelStack),
                 region(0xFEC0_0000, 1, RegionKind::Mmio),
             ]
         );
@@ -195,6 +254,7 @@ mod tests {
         assert_eq!(kind_of(10), RegionKind::AcpiNvs);
         assert_eq!(kind_of(15), RegionKind::Reserved); // unaccepted memory
         assert_eq!(kind_of(0x7000_0000), RegionKind::Reserved);
+        assert_eq!(kind_of(1), RegionKind::LoaderReclaimable); // LoaderCode, incl. the kernel image before carving
         assert_eq!(kind_of(memory_type::OS_BOOT_INFO), RegionKind::BootInfo);
         assert_eq!(
             kind_of(memory_type::OS_KERNEL_STACK),
@@ -234,5 +294,70 @@ mod tests {
         let mut partial = desc(40, 7, 0x1000, 1);
         partial.extend_from_slice(&[0xFF; 20]);
         assert_eq!(translate(&partial, 40, &mut out), Ok(1));
+    }
+    #[test]
+    fn carve_splits_the_containing_region() {
+        let k = RegionKind::KernelImage;
+        let lr = RegionKind::LoaderReclaimable;
+        let mut out = [region(0, 0, RegionKind::Reserved); 8];
+        out[0] = region(0x1000, 1, RegionKind::Usable);
+        out[1] = region(0x10_0000, 0x10, lr);
+        out[2] = region(0x20_0000, 1, RegionKind::Mmio);
+        // Middle of a region: three parts.
+        let n = carve(&mut out, 3, 0x10_4000, 2, k).unwrap();
+        assert_eq!(
+            &out[..n],
+            &[
+                region(0x1000, 1, RegionKind::Usable),
+                region(0x10_0000, 4, lr),
+                region(0x10_4000, 2, k),
+                region(0x10_6000, 10, lr),
+                region(0x20_0000, 1, RegionKind::Mmio),
+            ]
+        );
+        // The whole of a region: relabelled in place.
+        let n2 = carve(&mut out, n, 0x1000, 1, RegionKind::BootInfo).unwrap();
+        assert_eq!(n2, n);
+        assert_eq!(out[0], region(0x1000, 1, RegionKind::BootInfo));
+        // At the start and at the end of a region: two parts each.
+        let mut out = [region(0, 0, RegionKind::Reserved); 4];
+        out[0] = region(0x10_0000, 4, lr);
+        assert_eq!(carve(&mut out, 1, 0x10_0000, 1, k), Ok(2));
+        assert_eq!(
+            &out[..2],
+            &[region(0x10_0000, 1, k), region(0x10_1000, 3, lr)]
+        );
+        let mut out = [region(0, 0, RegionKind::Reserved); 4];
+        out[0] = region(0x10_0000, 4, lr);
+        assert_eq!(carve(&mut out, 1, 0x10_3000, 1, k), Ok(2));
+        assert_eq!(
+            &out[..2],
+            &[region(0x10_0000, 3, lr), region(0x10_3000, 1, k)]
+        );
+    }
+
+    #[test]
+    fn carve_rejects_ranges_outside_one_region_and_full_arrays() {
+        let lr = RegionKind::LoaderReclaimable;
+        let mut out = [
+            region(0x10_0000, 2, lr),
+            region(0x10_2000, 2, RegionKind::Usable),
+        ];
+        // Spans two regions.
+        assert_eq!(
+            carve(&mut out, 2, 0x10_1000, 2, RegionKind::KernelImage),
+            Err(MapError::NotContained(0x10_1000))
+        );
+        // Not in the map at all.
+        assert_eq!(
+            carve(&mut out, 2, 0x50_0000, 1, RegionKind::KernelImage),
+            Err(MapError::NotContained(0x50_0000))
+        );
+        // A split needs room the array does not have.
+        let mut full = [region(0x10_0000, 4, lr)];
+        assert_eq!(
+            carve(&mut full, 1, 0x10_1000, 1, RegionKind::KernelImage),
+            Err(MapError::Capacity)
+        );
     }
 }

@@ -60,13 +60,14 @@ pub const BOOT_SERVICES_SIGNATURE: u64 = 0x5652_4553_544F_4F42;
 /// `EFI_ALLOCATE_TYPE` `AllocateAnyPages`.
 pub const ALLOCATE_ANY_PAGES: u32 = 0;
 
-/// `EFI_MEMORY_TYPE` values (§7.2), including the OS-defined range the loader uses so the
-/// firmware's memory map itself marks the kernel's memory (ADR-0002 B3).
+/// `EFI_MEMORY_TYPE` values (§7.2), including the OS-defined range the loader uses for the
+/// boot info and the kernel stack, so the firmware's memory map marks them (ADR-0002 B3).
 pub mod memory_type {
+    /// `EfiLoaderCode`: the kernel image. Firmware keeps this type executable, unlike
+    /// `EfiLoaderData` and the OS-defined range, which OVMF marks no-execute.
+    pub const LOADER_CODE: u32 = 1;
     /// `EfiLoaderData`.
     pub const LOADER_DATA: u32 = 2;
-    /// OS-defined: the loaded Framekernel image.
-    pub const OS_KERNEL_IMAGE: u32 = 0x8000_0001;
     /// OS-defined: the boot-info structure and its region array.
     pub const OS_BOOT_INFO: u32 = 0x8000_0002;
     /// OS-defined: the kernel's initial stack.

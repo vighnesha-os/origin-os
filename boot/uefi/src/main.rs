@@ -169,7 +169,7 @@ fn boot(
         place::span(&v.image).map_err(|e| fail(out, Status::LOAD_ERROR, format_args!("{e:?}")))?;
     let span_pages =
         usize::try_from(span.div_ceil(PAGE as u64)).map_err(|_| Status::OUT_OF_RESOURCES)?;
-    let base = allocate(&bs, memory_type::OS_KERNEL_IMAGE, span_pages).map_err(|s| {
+    let base = allocate(&bs, memory_type::LOADER_CODE, span_pages).map_err(|s| {
         fail(
             out,
             s,
@@ -276,6 +276,22 @@ fn boot(
                 out,
                 Status::LOAD_ERROR,
                 format_args!("memory map rejected: {e:?}"),
+            )
+        })?;
+        // The kernel image is EfiLoaderCode (executable under the firmware's NX policy), so
+        // it is marked as KernelImage by address (ADR-0002 B3).
+        let n = memmap::carve(
+            regions,
+            n,
+            base,
+            span_pages as u64,
+            origin_boot_info::RegionKind::KernelImage,
+        )
+        .map_err(|e| {
+            fail(
+                out,
+                Status::LOAD_ERROR,
+                format_args!("kernel region: {e:?}"),
             )
         })?;
         let info = BootInfo {
