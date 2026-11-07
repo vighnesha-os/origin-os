@@ -1,0 +1,41 @@
+# Origin OS workspace (CLAUDE.md §81, task T4).
+#
+# Each artifact is built for its own target, so plain `cargo build` / `cargo test` at the
+# root only touch the host crates in `default-members`. Use the xtask for everything else:
+#
+#   cargo xtask check       fmt, clippy and unit tests, each crate on its correct target(s)
+#   cargo xtask build       build the UEFI loader (x86_64-unknown-uefi, release)
+#   cargo xtask boot-test   build, boot in QEMU + OVMF, and assert on the serial output
+#   cargo xtask run         boot in QEMU with the serial console on this terminal
+
+[workspace]
+resolver = "3"
+members = [
+    "boot/uefi",
+    "developer-tools/xtask",
+]
+default-members = ["developer-tools/xtask"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.99.1"
+publish = false
+# No `version` here on purpose: the product version will be generated from
+# `origin-version.toml` (CLAUDE.md §62, task T5) rather than hand-edited per crate.
+# No `license` yet: the project licence has not been chosen (SOURCE_PROVENANCE.md).
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+# CLAUDE.md §13 and final rule 5: every unsafe boundary documents its invariants.
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+multiple_unsafe_ops_per_block = "deny"
+
+[profile.release]
+# One codegen unit: deterministic output (CLAUDE.md §75) and the same code shape that
+# docs/toolchain/VERIFICATION.md exercised for the §10 regressions.
+codegen-units = 1

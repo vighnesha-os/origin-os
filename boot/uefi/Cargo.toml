@@ -1,0 +1,20 @@
+[package]
+name = "origin-boot-uefi"
+description = "Origin OS UEFI boot loader (x86_64-unknown-uefi)"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# UEFI definitions and the logic that is unit-tested on the build host.
+[lib]
+path = "src/lib.rs"
+
+# The EFI application. Build it only for x86_64-unknown-uefi (`cargo xtask build`).
+[[bin]]
+name = "origin-boot"
+path = "src/main.rs"
+test = false
+bench = false
+
+[lints]
+workspace = true
