@@ -58,6 +58,82 @@ pub(crate) fn on_tick(interrupted: u64) -> u64 {
 /// so an interrupt from user mode always lands on the running thread's own stack (the boot
 /// or idle flow, with no recorded stack, never runs in user mode), and CR3 holds its
 /// address space (the kernel's for kernel threads), loaded only when it differs.
+/// Allocates and initializes a thread's FPU/SIMD save area (so a restore yields a clean
+/// FPU), or `None` if there is no memory. Never zeroed by the allocator; `fpu_init_area`
+/// sets it.
+fn alloc_fpu_area() -> Option<u64> {
+    use alloc::alloc::{Layout, alloc};
+    let size = cpu::fpu_area_size().max(framekernel::features::FXSAVE_SIZE);
+    let layout = Layout::from_size_align(size, 64).ok()?;
+    // SAFETY: `size` is non-zero.
+    let p = unsafe { alloc(layout) };
+    if p.is_null() {
+        return None;
+    }
+    let area = p.expose_provenance() as u64;
+    // SAFETY: `area` is a fresh buffer of `size` >= `fpu_area_size()` bytes.
+    unsafe { cpu::fpu_init_area(area) };
+    Some(area)
+}
+
+/// Frees an FPU area from [`alloc_fpu_area`].
+fn free_fpu_area(area: u64) {
+    use alloc::alloc::{Layout, dealloc};
+    let size = cpu::fpu_area_size().max(framekernel::features::FXSAVE_SIZE);
+    if area != 0
+        && let Ok(layout) = Layout::from_size_align(size, 64)
+    {
+        // SAFETY: `area` came from `alloc_fpu_area` with this exact layout, and its thread
+        // has exited and been switched away from, so nothing uses the state any more.
+        unsafe {
+            dealloc(
+                core::ptr::with_exposed_provenance_mut(area as usize),
+                layout,
+            )
+        };
+    }
+}
+
+/// Makes sure CPU `cpu`'s boot/idle context (slot 0) has an FPU area, so the first switch
+/// away from it can save its state. Called before the processor's scheduler runs.
+pub(crate) fn init_cpu_fpu(cpu: usize) {
+    if let Some(threads) = THREADS.get(cpu) {
+        without_interrupts(|| {
+            let mut t = threads.lock();
+            if t.fpu[0] == 0
+                && let Some(area) = alloc_fpu_area()
+            {
+                t.fpu[0] = area;
+            }
+        });
+    }
+}
+
+/// Saves the outgoing context's FPU/SIMD state and restores the incoming one's, so SIMD
+/// registers belong to one thread at a time. An exiting thread's area is already 0 (moved
+/// to its zombie), so its dead state is not saved.
+fn switch_fpu(id: usize, old: usize, new: usize) {
+    let Some(threads) = THREADS.get(id) else {
+        return;
+    };
+    let (old_area, new_area) = {
+        let t = threads.lock();
+        (
+            t.fpu.get(old).copied().unwrap_or(0),
+            t.fpu.get(new).copied().unwrap_or(0),
+        )
+    };
+    if old_area != 0 {
+        // SAFETY: SSE/XSAVE are enabled on this processor, `old_area` is this thread's own
+        // `fpu_area_size()`-byte aligned buffer, and interrupts are off here.
+        unsafe { cpu::fpu_save(old_area) };
+    }
+    if new_area != 0 {
+        // SAFETY: as above, for the incoming thread's area.
+        unsafe { cpu::fpu_restore(new_area) };
+    }
+}
+
 fn follow_thread(id: usize, slot: usize) {
     let Some(threads) = THREADS.get(id) else {
         return;
@@ -118,9 +194,12 @@ struct ThreadStack {
 /// [`reap`]. Locked after the run queue, always with interrupts disabled.
 struct Threads {
     stacks: [Option<ThreadStack>; framekernel::runqueue::CAPACITY],
-    zombies: [Option<ThreadStack>; framekernel::runqueue::CAPACITY],
+    /// Exited threads' stacks and FPU areas, awaiting [`reap`].
+    zombies: [Option<(ThreadStack, u64)>; framekernel::runqueue::CAPACITY],
     /// Each slot's address space (its PML4); 0 means the kernel's.
     roots: [u64; framekernel::runqueue::CAPACITY],
+    /// Each slot's FPU/SIMD save area (0: none); slot 0 is the boot or idle context.
+    fpu: [u64; framekernel::runqueue::CAPACITY],
 }
 
 static THREADS: [SpinLock<Threads>; MAX_CPUS] = [const {
@@ -128,6 +207,7 @@ static THREADS: [SpinLock<Threads>; MAX_CPUS] = [const {
         stacks: [None; framekernel::runqueue::CAPACITY],
         zombies: [None; framekernel::runqueue::CAPACITY],
         roots: [0; framekernel::runqueue::CAPACITY],
+        fpu: [0; framekernel::runqueue::CAPACITY],
     })
 }; MAX_CPUS];
 
@@ -142,9 +222,10 @@ pub(crate) fn reap() -> usize {
     let mut freed = 0;
     loop {
         let next = without_interrupts(|| threads.lock().zombies.iter_mut().find_map(Option::take));
-        let Some(stack) = next else {
+        let Some((stack, fpu)) = next else {
             return freed;
         };
+        free_fpu_area(fpu);
         let Ok(layout) = Layout::from_size_align(stack.bytes + 4096, 4096) else {
             continue;
         };
@@ -171,8 +252,13 @@ fn with_queue(interrupted: u64, f: impl FnOnce(&mut RunQueue) -> Option<u64>) ->
     match (ACTIVE.get(id), QUEUES.get(id)) {
         (Some(active), Some(queue)) if active.load(Ordering::Acquire) => {
             let mut q = queue.lock();
+            let old = q.current();
             let next = f(&mut q).unwrap_or(interrupted);
-            follow_thread(id, q.current());
+            let new = q.current();
+            if new != old {
+                switch_fpu(id, old, new);
+            }
+            follow_thread(id, new);
             next
         }
         _ => interrupted,
@@ -287,8 +373,13 @@ pub(crate) fn on_exit(interrupted: u64) -> u64 {
             if let Some(r) = t.roots.get_mut(slot) {
                 *r = 0;
             }
-            if let Some(free) = t.zombies.iter_mut().find(|z| z.is_none()) {
-                *free = stack;
+            let fpu = t
+                .fpu
+                .get_mut(slot)
+                .map(|f| core::mem::replace(f, 0))
+                .unwrap_or(0);
+            if let (Some(free), Some(stack)) = (t.zombies.iter_mut().find(|z| z.is_none()), stack) {
+                *free = Some((stack, fpu));
             }
         }
         Some(next)
@@ -401,6 +492,7 @@ fn spawn_with(
         guard,
         bytes: THREAD_STACK,
     };
+    let fpu_area = alloc_fpu_area().unwrap_or(0);
     without_interrupts(|| {
         let slot = queue.lock().push_weighted(frame_at, weight)?;
         if let Some(threads) = THREADS.get(cpu) {
@@ -410,6 +502,9 @@ fn spawn_with(
             }
             if let Some(r) = t.roots.get_mut(slot) {
                 *r = root;
+            }
+            if let Some(f) = t.fpu.get_mut(slot) {
+                *f = fpu_area;
             }
         }
         Ok(slot)
@@ -552,6 +647,102 @@ pub(crate) fn yield_until(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) {
     }
 }
 
+/// SIMD workers for [`prove_simd`].
+const SIMD_WORKERS: usize = 3;
+static SIMD_STOP: AtomicBool = AtomicBool::new(false);
+static SIMD_CORRUPT: [AtomicU64; SIMD_WORKERS] = [const { AtomicU64::new(0) }; SIMD_WORKERS];
+static SIMD_ITERS: [AtomicU64; SIMD_WORKERS] = [const { AtomicU64::new(0) }; SIMD_WORKERS];
+static SIMD_EXITED: AtomicU64 = AtomicU64::new(0);
+
+/// A worker that loads four distinct 64-bit values into spread-out XMM registers once,
+/// then spins checking they are unchanged. If a context switch did not save and restore
+/// SIMD state, another worker's values would appear here.
+extern "sysv64" fn simd_worker(index: u64) -> ! {
+    let v = [
+        index.wrapping_add(0x1111_1111_0000_0001),
+        !index,
+        index.rotate_left(23) ^ 0xA5A5_A5A5,
+        index.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+    ];
+    // SAFETY: SSE is enabled on this processor (`enable_simd`); these instructions only
+    // load the named XMM registers from general registers.
+    unsafe {
+        core::arch::asm!(
+            "movq xmm0, {0}",
+            "movq xmm3, {1}",
+            "movq xmm7, {2}",
+            "movq xmm15, {3}",
+            in(reg) v[0], in(reg) v[1], in(reg) v[2], in(reg) v[3],
+            out("xmm0") _, out("xmm3") _, out("xmm7") _, out("xmm15") _,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    while !SIMD_STOP.load(Ordering::Relaxed) {
+        let (a, b, c, d): (u64, u64, u64, u64);
+        // SAFETY: reads the XMM registers this thread set; no memory, no stack.
+        unsafe {
+            core::arch::asm!(
+                "movq {0}, xmm0",
+                "movq {1}, xmm3",
+                "movq {2}, xmm7",
+                "movq {3}, xmm15",
+                out(reg) a, out(reg) b, out(reg) c, out(reg) d,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        if [a, b, c, d] != v
+            && let Some(cnt) = SIMD_CORRUPT.get(index as usize)
+        {
+            cnt.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(it) = SIMD_ITERS.get(index as usize) {
+            it.fetch_add(1, Ordering::Relaxed);
+        }
+        core::hint::spin_loop();
+    }
+    SIMD_EXITED.fetch_add(1, Ordering::Relaxed);
+    exit()
+}
+
+/// Proves that FPU/SIMD state is private to each thread across preemption: [`SIMD_WORKERS`]
+/// workers on one processor each hold four XMM values and spin checking them for 300 ms
+/// while the timer preempts them. None may ever see another's values.
+fn prove_simd(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
+    for i in 0..SIMD_WORKERS {
+        if spawn(bsp, simd_worker, i as u64).is_err() {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: scheduler: cannot spawn: scheduler failed"
+            );
+            return false;
+        }
+    }
+    let start = rdtsc();
+    while rdtsc().wrapping_sub(start) < tsc_hz * 3 / 10 {
+        yield_now();
+        cpu::interrupt_window();
+    }
+    SIMD_STOP.store(true, Ordering::Relaxed);
+    yield_until(
+        || SIMD_EXITED.load(Ordering::Relaxed) == SIMD_WORKERS as u64,
+        tsc_hz,
+        2,
+    );
+    let corrupt: u64 = SIMD_CORRUPT.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+    let iters: u64 = SIMD_ITERS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+    let switches = QUEUES
+        .get(bsp)
+        .map_or(0, |q| without_interrupts(|| q.lock().switches()));
+    let ok =
+        SIMD_EXITED.load(Ordering::Relaxed) == SIMD_WORKERS as u64 && corrupt == 0 && iters > 0;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: scheduler: {SIMD_WORKERS} SIMD threads kept their XMM state across {switches} context switches: {iters} checks, {corrupt} corruptions{}",
+        if ok { "" } else { ": scheduler failed" }
+    );
+    ok
+}
+
 /// The weights of the three workers of [`prove_weights`].
 const WEIGHTS: [u32; 3] = [1, 4, 16];
 /// Iterations each weighted worker made.
@@ -683,6 +874,11 @@ fn prove_lifecycle(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
 /// within a factor of two, over at least five full rounds of context switches. Returns
 /// whether the proof passed.
 pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
+    // Give every online processor's boot/idle context an FPU area before the baseline is
+    // measured, so the first switch on it can save its state and the leak check is fair.
+    for &id in cpus {
+        init_cpu_fpu(id as usize);
+    }
     let heap_before = crate::memory::stats().map(|(h, _)| h.bytes_in_use);
     for (i, &id) in cpus.iter().enumerate() {
         for k in 0..2 {
@@ -784,6 +980,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
         );
     }
     ok &= prove_weights(com1, cpus, bsp, tsc_hz);
+    ok &= prove_simd(com1, bsp, tsc_hz);
     ok &= prove_lifecycle(com1, bsp, tsc_hz);
     ok &= crate::user::prove(com1, bsp, tsc_hz);
     ok &= crate::time::prove_consistent(com1, cpus, bsp, tsc_hz);

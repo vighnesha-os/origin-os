@@ -513,6 +513,19 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 6 `blockcache` tests, including a 20 000-operation model check over a 20-block working set in 8 slots (every slot and dirty bit mirrored, no block cached twice, the hit rate sane); 112 library tests in all; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Limitation and not done:** the block layer holds its lock across polled I/O and is driven from the boot flow; a production one routes each request to the submitting processor's queue and blocks instead of polling. Also not done: readahead, a writeback thread on a timer, per-file or per-inode caching, and a filesystem above it.
 
+### CPU feature discovery and FPU/SIMD state across context switches (CLAUDE.md §14, §24; 2026-11-08)
+
+- **The correctness gap closed:** the scheduler saved only general-purpose registers in the interrupt frame, never the FPU/SSE/AVX state. Two threads both using SIMD would corrupt each other's registers across a preemption. The negative control shows this happens on almost two thirds of checks when the state is not restored.
+- **What:**
+  - `features` (library): decodes CPUID leaves 1, 7, 0Dh and 8000_0001h into a `Features` set, grades the x86-64 microarchitecture level (v1–v3, from the psABI supplement), gives the XCR0 to set and the XSAVE area size. Host-tested against a synthetic v3 CPU and degraded ones.
+  - `cpu`: `gather_cpuid`; `enable_simd` (CR0.EM clear, MP set; CR4.OSFXSR, OSXMMEXCPT and, where XSAVE exists, OSXSAVE; XCR0 ← x87|SSE|AVX via XSETBV); `fpu_save`/`fpu_restore` (XSAVE/XRSTOR with the full mask, else FXSAVE/FXRSTOR) and `fpu_init_area` (a clean FCW and MXCSR). The kernel stays soft-float; this only adds a capability.
+  - `sched`: each slot has a 64-byte-aligned FPU area, allocated at spawn and initialized clean; a switch saves the outgoing context's state and restores the incoming one's; the area is freed with the stack when the thread is reaped. Each processor's boot/idle context gets an area before the heap baseline is measured, so the leak check stays fair.
+- **Proof** (every boot): the feature report with the x86-64 level, then three SIMD threads on one processor, each holding four values in spread-out XMM registers (0, 3, 7, 15), spin checking them for 300 ms across 100–307 context switches: 1.3–1.6 M checks, 0 corruptions.
+- **QEMU note:** QEMU 11's TCG `-cpu max` presents x86-64 level 2 (not every v3 feature), so the baseline reads false under emulation; on the supported 2026 hardware it is v3+. The level is reported, not enforced at boot. XCR0 is 0x7 (x87, SSE, AVX) and the XSAVE area 2696 bytes.
+- **Negative control** (failing the boot test): the incoming context's FPU state not restored on a switch → 812 443 of 1 318 469 checks saw another thread's XMM values → "scheduler failed".
+- **Test evidence:** 4 `features` tests (a v3 CPU decoded and graded, levels 1 and 2, absent leaves, the XSAVE-size sanity check); 116 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** lazy FPU (deliberately — eager save/restore is used), the AVX upper halves tested separately from the full XSAVE image, AVX-512 (XCR0 leaves it off), and a per-CPU "FPU used" optimization to skip saving an untouched state.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

@@ -139,6 +139,8 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: GDT, TSS and IDT loaded (32 exception vectors)".into(),
             "origin-kernel: exception 3 (#BP breakpoint) at rip ".into(),
             "origin-kernel: breakpoint handled; resuming".into(),
+            // CPU features and the x86-64 level (QEMU TCG presents v2); SSE/AVX enabled.
+            "origin-kernel: CPU: x86-64 level ".into(),
             "origin-kernel: frame allocator: ".into(),
             "origin-kernel: page tables loaded: ".into(),
             "origin-kernel: higher half: kernel image identity address mapped false, direct-map alias mapped false".into(),
@@ -181,6 +183,9 @@ fn boot_scenario_markers() -> Scenario {
             // Stride scheduling: shares follow the weights 1 : 4 : 16 on one CPU.
             "origin-kernel: scheduler: weights 1, 4 and 16 on CPU ".into(),
             " per mille (ideal 47, 190 and 761)".into(),
+            // FPU/SIMD state is saved and restored across context switches.
+            "origin-kernel: scheduler: 3 SIMD threads kept their XMM state across ".into(),
+            " corruptions".into(),
             "origin-kernel: scheduler: yield alternated ".into(),
             // M4 groundwork: ring 3, the one DPL-3 gate, and crash isolation.
             "origin-kernel: user mode: good program: reported Some(42), exited with Some(0); kernel carries on".into(),
@@ -302,6 +307,10 @@ fn boot_scenario_markers() -> Scenario {
                 256 * cpus,
                 256 * cpus
             ),
+            // The block cache over NVMe: cold misses fetch, re-reads hit, eviction and
+            // write-back work (CLAUDE.md §39).
+            "origin-kernel: block cache: 4 pages (512 B blocks, 8 per page): 32 of 32 blocks matched the pattern; 4 device reads cold, re-reading 4 resident pages did 0 more (32 hits, 4 misses)".into(),
+            "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); wrote LBA 10240, flushed (1 device writes), evicted and read back changed: true".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ])
         .collect(),
@@ -347,6 +356,7 @@ fn boot_scenario_markers() -> Scenario {
             ": wait queues failed",
             ": PCIe failed",
             ": NVMe failed",
+            ": block cache failed",
             ": GPT failed",
         ],
         check: Some(|text| console_lines_intact(text, qemu_cpus() as usize)),

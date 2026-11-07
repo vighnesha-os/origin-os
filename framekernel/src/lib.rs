@@ -22,6 +22,7 @@
 //! - [`clock`]: monotonic-clock arithmetic (ticks to nanoseconds and back) and the CPUID
 //!   TSC rate;
 //! - [`descriptors`]: GDT, TSS and IDT descriptor encodings;
+//! - [`features`]: CPUID feature decoding and the x86-64-v3 baseline;
 //! - [`frames`]: the physical frame allocator over the boot-info regions;
 //! - [`gpt`]: GUID Partition Table validation (both copies, CRC-32) and partitions;
 //! - [`handles`]: per-process handle tables with rights (ADR-0005 P1–P2);
@@ -54,6 +55,7 @@ pub mod boot;
 pub mod channel;
 pub mod clock;
 pub mod descriptors;
+pub mod features;
 pub mod frames;
 pub mod gpt;
 pub mod handles;

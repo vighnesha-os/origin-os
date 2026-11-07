@@ -1076,6 +1076,193 @@ pub(crate) fn smep_smap_supported() -> (bool, bool) {
 ///
 /// CPL 0. The kernel must not rely on executing or accessing user pages from supervisor
 /// mode (it has none; a future user-copy path must set RFLAGS.AC around its accesses).
+/// CR0 bits: EM (emulate FPU: must be clear for SSE), MP, TS.
+const CR0_EM: u64 = 1 << 2;
+const CR0_MP: u64 = 1 << 1;
+const CR0_TS: u64 = 1 << 3;
+/// CR4 bits: OSFXSR (FXSAVE and SSE), OSXMMEXCPT (SSE exceptions), OSXSAVE (XSAVE/XGETBV).
+const CR4_OSFXSR: u64 = 1 << 9;
+const CR4_OSXMMEXCPT: u64 = 1 << 10;
+const CR4_OSXSAVE: u64 = 1 << 18;
+
+/// Whether this processor's SIMD state is managed with XSAVE (else FXSAVE).
+static USE_XSAVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The XSAVE/FXSAVE area size the kernel allocates per thread, once known.
+static FPU_AREA_SIZE: AtomicU64 = AtomicU64::new(framekernel::features::FXSAVE_SIZE as u64);
+
+/// Gathers the CPUID leaves `features` decodes.
+pub(crate) fn gather_cpuid() -> framekernel::features::Cpuid {
+    framekernel::features::Cpuid {
+        leaf1: cpuid(1),
+        leaf7: cpuid(7),
+        leaf_d0: cpuid(0x0D),
+        ext1: cpuid(0x8000_0001),
+        max_basic: cpuid(0)[0],
+        max_ext: cpuid(0x8000_0000)[0],
+    }
+}
+
+/// Reads an extended control register with XGETBV.
+///
+/// # Safety
+///
+/// CPL 0, and CR4.OSXSAVE must be set (else #UD).
+unsafe fn xgetbv(reg: u32) -> u64 {
+    let (low, high): (u32, u32);
+    // SAFETY: the caller's contract; XGETBV reads no memory.
+    unsafe {
+        asm!("xgetbv", in("ecx") reg, out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags));
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Writes an extended control register with XSETBV.
+///
+/// # Safety
+///
+/// CPL 0, CR4.OSXSAVE set, and `value` valid for `reg` (a bad XCR0 is #GP).
+unsafe fn xsetbv(reg: u32, value: u64) {
+    // SAFETY: the caller's contract; XSETBV reads no memory.
+    unsafe {
+        asm!("xsetbv", in("ecx") reg, in("eax") value as u32, in("edx") (value >> 32) as u32, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Enables SSE (and AVX where present) on this processor and sets the per-thread FPU-area
+/// size from `features`. Returns the XCR0 value in force (0 if XSAVE is not used).
+///
+/// The kernel's own code is soft-float (the `x86_64-unknown-none` ABI uses no XMM), so this
+/// adds a capability for explicit SIMD and for user programs; it does not change how kernel
+/// code is generated.
+///
+/// # Safety
+///
+/// CPL 0. Must run once per processor before any code on it uses SSE or XSAVE.
+pub(crate) unsafe fn enable_simd(id: &framekernel::features::Cpuid) -> u64 {
+    use framekernel::features::{Features, wanted_xcr0, xsave_area_size};
+    let features = Features::decode(id);
+    // CR0: clear EM and TS, set MP, so SSE instructions run and do not fault to an
+    // emulator or a (nonexistent) lazy-FPU handler.
+    // SAFETY: the caller's contract; these CR0 bits only configure FPU/SSE behaviour.
+    unsafe {
+        asm!(
+            "mov {t}, cr0",
+            "and {t}, {clear}",
+            "or {t}, {mp}",
+            "mov cr0, {t}",
+            clear = in(reg) !(CR0_EM | CR0_TS),
+            mp = in(reg) CR0_MP,
+            t = out(reg) _,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    // CR4: OSFXSR and OSXMMEXCPT for SSE; OSXSAVE when the CPU has XSAVE.
+    let mut cr4_bits = CR4_OSFXSR | CR4_OSXMMEXCPT;
+    if features.xsave {
+        cr4_bits |= CR4_OSXSAVE;
+    }
+    // SAFETY: the caller's contract; these CR4 bits enable FXSAVE/SSE and XSAVE.
+    unsafe {
+        asm!(
+            "mov {t}, cr4",
+            "or {t}, {bits}",
+            "mov cr4, {t}",
+            bits = in(reg) cr4_bits,
+            t = out(reg) _,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    let mut xcr0 = 0;
+    if features.xsave {
+        xcr0 = wanted_xcr0(&features);
+        // SAFETY: CR4.OSXSAVE was just set; `xcr0` has x87 and SSE (required) and AVX only
+        // when the CPU reports it, so it is a legal XCR0.
+        unsafe { xsetbv(0, xcr0) };
+        USE_XSAVE.store(true, core::sync::atomic::Ordering::Relaxed);
+        if let Some(size) = xsave_area_size(id) {
+            // The area must hold every enabled component; take the maximum CPUID reports.
+            FPU_AREA_SIZE.store(size as u64, core::sync::atomic::Ordering::Relaxed);
+        }
+        // SAFETY: OSXSAVE is set.
+        let _ = unsafe { xgetbv(0) };
+    }
+    xcr0
+}
+
+/// The per-thread FPU save area size (bytes) and alignment (64).
+pub(crate) fn fpu_area_size() -> usize {
+    FPU_AREA_SIZE.load(core::sync::atomic::Ordering::Relaxed) as usize
+}
+
+/// Prepares a fresh thread's FPU area so a restore from it yields a clean FPU: default
+/// control words and no pending state. `area` must be `fpu_area_size()` bytes, 64-byte
+/// aligned.
+///
+/// # Safety
+///
+/// `area` must point at a writable buffer of at least [`fpu_area_size`] bytes.
+pub(crate) unsafe fn fpu_init_area(area: u64) {
+    let size = fpu_area_size();
+    // SAFETY: the caller vouches for the buffer and its size.
+    unsafe {
+        core::ptr::write_bytes(
+            ptr::with_exposed_provenance_mut::<u8>(area as usize),
+            0,
+            size,
+        );
+    }
+    // Legacy area: FCW = 0x037F (all x87 exceptions masked), MXCSR = 0x1F80 (all SSE
+    // exceptions masked). An all-zero MXCSR would unmask every exception.
+    let fcw = ptr::with_exposed_provenance_mut::<u16>(area as usize);
+    let mxcsr = ptr::with_exposed_provenance_mut::<u32>(area as usize + 24);
+    // SAFETY: offset 0 is inside the 512-byte legacy area the buffer begins with.
+    unsafe { fcw.write(0x037F) };
+    // SAFETY: offset 24 is inside the same legacy area.
+    unsafe { mxcsr.write(0x1F80) };
+    // The XSAVE header (just after the 512-byte legacy area) stays zero: XSTATE_BV = 0, so
+    // XRSTOR puts every component in its init state, which the legacy fields then refine.
+}
+
+/// Saves this processor's FPU/SIMD state into `area` (XSAVE if enabled, else FXSAVE).
+///
+/// # Safety
+///
+/// CPL 0, SSE/XSAVE enabled (`enable_simd`), and `area` a writable [`fpu_area_size`]-byte,
+/// 64-byte-aligned buffer not aliased by another save in progress.
+pub(crate) unsafe fn fpu_save(area: u64) {
+    if USE_XSAVE.load(core::sync::atomic::Ordering::Relaxed) {
+        // XSAVE with the full mask (EDX:EAX = all ones): save every enabled component.
+        // SAFETY: the caller's contract; the area is large enough (CPUID's maximum).
+        unsafe {
+            asm!("xsave [{a}]", a = in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, preserves_flags));
+        }
+    } else {
+        // SAFETY: as above; FXSAVE needs 512 bytes, 16-byte aligned.
+        unsafe {
+            asm!("fxsave [{a}]", a = in(reg) area, options(nostack, preserves_flags));
+        }
+    }
+}
+
+/// Restores this processor's FPU/SIMD state from `area`.
+///
+/// # Safety
+///
+/// As for [`fpu_save`]; `area` must hold state written by [`fpu_save`] or [`fpu_init_area`].
+pub(crate) unsafe fn fpu_restore(area: u64) {
+    if USE_XSAVE.load(core::sync::atomic::Ordering::Relaxed) {
+        // SAFETY: the caller's contract; the area holds a valid XSAVE image.
+        unsafe {
+            asm!("xrstor [{a}]", a = in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, preserves_flags));
+        }
+    } else {
+        // SAFETY: as above.
+        unsafe {
+            asm!("fxrstor [{a}]", a = in(reg) area, options(nostack, preserves_flags));
+        }
+    }
+}
+
 pub(crate) unsafe fn enable_smep_smap() -> (bool, bool) {
     let (smep, smap) = smep_smap_supported();
     SMAP_ON.store(smap, Ordering::Relaxed);

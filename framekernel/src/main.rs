@@ -137,6 +137,29 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     let _ = report::write_cpu_tables(&mut com1);
     cpu::breakpoint();
 
+    // CPU features and the x86-64-v3 baseline (CLAUDE.md §14, §24), then SSE/AVX enabled on
+    // the boot processor.
+    let cpuid = cpu::gather_cpuid();
+    let features = framekernel::features::Features::decode(&cpuid);
+    // SAFETY: CPL 0, boot processor, once, before any SIMD runs on it.
+    let xcr0 = unsafe { cpu::enable_simd(&cpuid) };
+    let _ = writeln!(
+        com1,
+        "origin-kernel: CPU: x86-64 level {} (baseline v3 {}); SSE {}, AVX2 {}, FMA {}, BMI2 {}, RDSEED {}, PCID {}, INVPCID {}, FSGSBASE {}; XSAVE area {} bytes, XCR0 {:#x}",
+        features.arch_level().unwrap_or(0),
+        features.meets_baseline(),
+        features.sse2,
+        features.avx2,
+        features.fma,
+        features.bmi2,
+        features.rdseed,
+        features.pcid,
+        features.invpcid,
+        features.fsgsbase,
+        cpu::fpu_area_size(),
+        xcr0
+    );
+
     // M2, second step: the physical frame allocator over the boot-info regions, with a
     // pool of frames for page tables beside its bitmap.
     let Some((mut alloc, pool, pool_base)) = init_memory(&mut com1, regions) else {

@@ -393,6 +393,8 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     // SAFETY: CPL 0; the kernel's tables mark only the kernel half global.
     let _ = unsafe { crate::tlb::enable_global_pages() };
     cpu::check_pat();
+    // SAFETY: CPL 0, this AP, once, before any SIMD runs on it.
+    let _ = unsafe { cpu::enable_simd(&cpu::gather_cpuid()) };
     if !cpu::x2apic_supported() {
         start.online.store(u32::MAX, Ordering::Release);
         crate::halt();
