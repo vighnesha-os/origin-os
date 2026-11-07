@@ -38,6 +38,13 @@
 | Higher half and KASLR | ADR-0004 H1–H4: boot info 0.3, loader-built tables, RDSEED/RDRAND slides, kernel in the higher half | boot-matrix; three distinct placements; fallback boot; negative control |
 | M4: process address spaces | own PML4 per process, shared kernel half, CR3 per thread | two-process isolation proof; negative control |
 | M4 groundwork: user mode | ring 3, one DPL-3 system-call gate and `syscall`, RSP0 per switch, user faults end the thread, NMI/#MC on IST | 5 user-program proofs, a self-NMI proof; four negative controls |
+| Clocks (§68) | monotonic TSC clock (rate proven against one RTC second), UTC wall clock from the CMOS RTC, TSC consistency across CPUs | boot-matrix; three negative controls |
+| Serialized console | whole lines from every CPU; urgent path for exceptions and panics | xtask whole-log check; negative control |
+| TLB shootdown, global pages (ADR-0004 H5) | IPIs with per-request generations; kernel half global | every AP's read of an unmapped page faults; two negative controls |
+| Kernel wait queues | blocking, cross-CPU wake-ups by IPI, pending wake-ups | 10 000-item transfer in order; 44–73 µs ping-pong; two negative controls |
+| PCIe enumeration | MCFG, uncached ECAM, every function and BAR (sized with decoding off, restored) | q35's functions listed; two negative controls |
+| NVMe driver | polled admin and I/O queues, Identify, read, write, flush | pattern blocks from the xtask test disk; two negative controls |
+| GPT | both copies validated (CRCs, layout, agreement), partitions listed | the xtask disk's partitions; negative control |
 
 ## In progress
 
@@ -47,12 +54,15 @@
 
 ## Next, in order
 
-1. **M3, scheduling proper** (ADR-0003 K7 is the baseline): wait queues and cross-CPU wake-ups by IPI, priorities and a fairness policy (EEVDF to be evaluated, §26), load balancing, a serialized kernel console for multi-CPU output. Pad the per-worker counters (cache-line sharing showed at 4 CPUs).
-2. **M4:** per-process address spaces are done; ADR-0005 (process ABI, handles, IPC) accepted 2026-11-07. Implementing it: the `origin-abi` crate, handle tables, channels, the system-call convention, `wait_one`, user copies against the calling process's tables; then the start record, memory objects, the Loader Service and `.ose` loading; global kernel pages and PCIDs (ADR-0004 H5).
-3. **Signature block (ONBF §7.1):** S1–S4 decided, parser and `onbf-verify` done (2026-11-07); next: `onbf-pack` signing with a host key, the loader requiring a signed KRN outside developer mode, the trust store and OKC chains, then the trust anchor (B7).
-4. **Formal and concurrency checks:** Loom models for `SpinLock`; Kani bounds for `paging`, `frames` and `heap` (CLAUDE.md §73).
-5. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks.
-6. **M1 follow-ups:** A/B deployment and boot-attempt recording (§20); an executed FFI-bool test (Rosetta); CI.
+1. **NVMe interrupts:** the PCI capability list, MSI-X, a vector per queue, and completions that wake a wait queue instead of polling; timed waits (deadlines on the monotonic clock).
+2. **IOMMU (§32):** VT-d under QEMU's `intel-iommu`: the DMAR table, DMA remapping for the NVMe controller, and a fault proof.
+3. **Parser hardening (§72):** deterministic mutation runs over every firmware and device parser (ACPI, PCI, NVMe Identify, GPT, RTC), with a seeded generator and no fuzzing crates.
+4. **M3, scheduling proper** (ADR-0003 K7 is the baseline): priorities and a fairness policy (EEVDF to be evaluated, §26), load balancing; pad the per-worker counters.
+5. **M4:** ADR-0005 is accepted; the `origin-abi` crate, handle tables and channel logic exist. Next: the kernel's system-call layer, user copies against the calling process's tables, `wait_one`, the start record, memory objects, the Loader Service and `.ose` loading; PCIDs (ADR-0004 H5).
+6. **Signature block (ONBF §7.1):** `onbf-pack` signing with a host key, the loader requiring a signed KRN outside developer mode, the trust store and OKC chains (the trust anchor is decided: B7).
+7. **Block layer and filesystem (§39–§41):** one I/O queue per CPU, a block cache, then a filesystem ADR.
+8. **Formal and concurrency checks:** Loom models for `SpinLock` and the wait-queue protocol; Kani bounds for `paging`, `frames`, `heap` (§73).
+9. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks; **M1 follow-ups** (A/B deployment, boot-attempt recording, CI).
 
 ## Waiting on the owner
 

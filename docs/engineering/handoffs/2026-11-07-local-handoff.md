@@ -139,3 +139,28 @@ Final state at 20:20: `cargo xtask check` and `cargo xtask boot-matrix` pass; th
 **The kernel no longer runs identity-mapped.** RAM is at `direct_map_base + physical` (use `phys::to_virt`/`to_phys`), the image at `kernel_virtual_base`; the lower half is empty and belongs to user space. Next: per-process address spaces sharing the kernel half (M4), then H5 (global pages, PCIDs).
 
 M4 began with per-process address spaces (`process::Process`, CR3 per thread in the scheduler); the next M4 decisions (process ABI, handles, IPC) need an ADR and the owner's approval (§84).
+
+## 6. The twelve-hour run (from 21:42 IST), under the owner's delegation
+
+The owner asked for the design to be finalised with the recommended options, followed by twelve hours of work without asking. Commits so far, each with its proof and negative controls in its message and in `SOURCE_PROVENANCE.md`:
+
+| Commit | What |
+|---|---|
+| `03379ff` | Every open design decision finalised: ADR-0002 with B7, ADR-0003, errata G1 (the SYM `DWARF` kind, implemented) and the readings |
+| `2d08b37` | Clocks: a monotonic TSC clock whose rate is proven against one RTC second, a UTC wall clock from the CMOS RTC (century register from the FADT), and TSC consistency checked across CPUs |
+| `b53a5c5` | A serialized console: whole lines from every CPU, checked over the whole boot log by xtask; `SpinLock::try_lock` |
+| `115651d` | TLB shootdown IPIs and global kernel pages (ADR-0004 H5); closes a real gap, since guard pages were invalidated only locally |
+| `a03df12` | Kernel wait queues with cross-CPU wake-ups by IPI; no lost wake-ups |
+| `9b74be4` | PCIe enumeration through the MCFG: uncached ECAM, every function and BAR |
+| `05dcde1` | A polled NVMe driver: Identify, admin and I/O queues, read, write, flush, against a GPT test disk xtask builds |
+| `31e1c56` | GPT: both copies validated over NVMe, partitions listed |
+
+### Lessons from this run
+
+- **Run the good path after adding boot-test markers, before any negative control.** A control fails on its failure string whatever the marker order. Wrongly ordered PCIe markers were therefore caught only by the boot matrix.
+- **Firmware state can defeat a control.** OVMF had already set bus mastering, so a control that only stopped setting it proved nothing. OVMF also restored a corrupted primary GPT from the backup before the kernel ran (UEFI 2.11 §5.3.2 allows it). A control must set the state it tests explicitly, and must check that its fault reached the kernel.
+- `bool::then_some(x)` evaluates `x` eagerly. A lock guard built that way and then dropped unlocks a lock that someone else holds. The host test caught it.
+- Check an unimplemented BAR's mask before widening it: a zero mask widened to 64 bits reads as 4 GiB.
+- `split_large` must carry the memory type (PCD, PWT, PAT) into the 4 KiB pieces.
+- QEMU keeps stale TLB entries across vCPUs, so a missing shootdown is visible there. Its TCG TSC runs at about 1 GHz, is not reported as invariant, and has no CPUID 15h rate.
+- The wake-up race between registering on a wait queue and blocking really happens even in QEMU: the transfer stalled at 6202 of 10 000 items without pending wake-ups.
