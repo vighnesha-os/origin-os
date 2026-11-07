@@ -211,6 +211,17 @@ pub(crate) fn exit() -> ! {
     }
 }
 
+/// The top of the running thread's kernel stack, or `None` for the boot or idle flow.
+pub(crate) fn current_stack_top() -> Option<u64> {
+    let id = this_cpu();
+    let (queue, threads) = (QUEUES.get(id)?, THREADS.get(id)?);
+    without_interrupts(|| {
+        let slot = queue.lock().current();
+        let stack = threads.lock().stacks.get(slot).copied().flatten()?;
+        Some((stack.guard + 4096 + stack.bytes as u64) & !0xF)
+    })
+}
+
 /// This CPU's tick count, as its run queue sees it.
 fn queue_ticks() -> u64 {
     QUEUES
@@ -386,7 +397,7 @@ extern "sysv64" fn quitter(_: u64) -> ! {
 /// interrupt in: when it is the only ready context, it would yield to itself for ever and
 /// time (and every sleeper) would stand still. Each round therefore also opens an interrupt
 /// window.
-fn yield_until(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) {
+pub(crate) fn yield_until(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) {
     let start = rdtsc();
     while !done() && rdtsc().wrapping_sub(start) < tsc_hz.saturating_mul(seconds) {
         yield_now();
@@ -559,6 +570,7 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, cpus: &[u32], tsc_hz: u64) -> bo
         );
     }
     ok &= prove_lifecycle(com1, bsp, tsc_hz);
+    ok &= crate::user::prove(com1, bsp, tsc_hz);
     // Every thread has exited: once each processor has reaped its own, the heap is back
     // exactly where it was before the first spawn.
     let back = || crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before;

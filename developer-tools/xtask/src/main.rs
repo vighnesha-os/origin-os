@@ -155,6 +155,10 @@ fn boot_scenario_markers() -> Scenario {
                 2 * cpus
             ),
             "origin-kernel: scheduler: yield alternated ".into(),
+            // M4 groundwork: ring 3, the one DPL-3 gate, and crash isolation.
+            "origin-kernel: user mode: good program: reported Some(42), exited with Some(0); kernel carries on".into(),
+            "origin-kernel: user mode: kernel read: reported Some(7), ended by vector 14 (error 0x5".into(),
+            "origin-kernel: user mode: privileged instruction: reported Some(9), ended by vector 13 (error 0x0); kernel carries on".into(),
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
@@ -190,6 +194,7 @@ fn boot_scenario_markers() -> Scenario {
             ": scheduler failed",
             "supervisor isolation from user pages incomplete",
             "origin-kernel: cannot map the user probe page",
+            ": user isolation failed",
         ],
     }
 }

@@ -102,6 +102,9 @@ pub(crate) unsafe fn init() {
         let ist = if vector == 8 { DOUBLE_FAULT_IST } else { 0 };
         *gate = d::interrupt_gate(*stub as usize as u64, KERNEL_CODE, ist);
     }
+    if let Some(gate) = idt.0.get_mut(usize::from(SYSCALL_VECTOR)) {
+        *gate = d::user_interrupt_gate((syscall_stub as *const ()).addr() as u64, KERNEL_CODE);
+    }
     let interrupts: [(u8, extern "sysv64" fn()); 5] = [
         (TIMER_VECTOR, timer_stub),
         (SPURIOUS_VECTOR, spurious_stub),
@@ -157,6 +160,8 @@ unsafe fn load_tables(tables: *mut CpuTables) {
         d::kernel_data_segment(),
         tss[0],
         tss[1],
+        d::user_data_segment(),
+        d::user_code_segment(),
     ]);
     // SAFETY: as above; the GDT is written before `lgdt` points the processor at it.
     unsafe { gdt_ptr_raw.write(gdt) };
@@ -199,7 +204,7 @@ unsafe fn load_tables(tables: *mut CpuTables) {
     unsafe { asm!("lidt [{idt}]", idt = in(reg) &raw const idt_ptr, options(nostack)) };
     let _ = TSS_SIZE; // the limit is encoded by `tss_descriptor`
     // GS was just reloaded (base 0): point it at this processor's CPU-local area.
-    init_cpu_local();
+    init_cpu_local(tss_field.addr() as u64);
 }
 
 /// Processors with a CPU-local area, indexed by x2APIC ID.
@@ -213,17 +218,21 @@ const GS_BASE: u32 = 0xC000_0101;
 struct CpuLocal {
     /// This processor's x2APIC ID (offset 0, read by [`cpu_id`]).
     id: AtomicU64,
+    /// Address of this processor's TSS (offset 8, used by [`set_kernel_stack`]).
+    tss: AtomicU64,
 }
 
 static CPU_LOCAL: [CpuLocal; MAX_LOCAL] = [const {
     CpuLocal {
         id: AtomicU64::new(0),
+        tss: AtomicU64::new(0),
     }
 }; MAX_LOCAL];
 /// The area of a processor whose ID is too large for [`CPU_LOCAL`]: its ID reads as
 /// `u64::MAX`, which no queue accepts, so it never schedules.
 static OUT_OF_RANGE: CpuLocal = CpuLocal {
     id: AtomicU64::new(u64::MAX),
+    tss: AtomicU64::new(0),
 };
 
 /// This processor's x2APIC ID from CPUID (leaf 0Bh EDX, else leaf 1 EBX bits 31:24), which
@@ -236,12 +245,13 @@ pub(crate) fn cpuid_apic_id() -> u32 {
     }
 }
 
-/// Points IA32_GS_BASE at this processor's [`CpuLocal`].
-fn init_cpu_local() {
+/// Points IA32_GS_BASE at this processor's [`CpuLocal`], which records its TSS at `tss`.
+fn init_cpu_local(tss: u64) {
     let id = cpuid_apic_id() as usize;
     let local = match CPU_LOCAL.get(id) {
         Some(local) => {
             local.id.store(id as u64, Ordering::Relaxed);
+            local.tss.store(tss, Ordering::Relaxed);
             local
         }
         None => &OUT_OF_RANGE,
@@ -249,6 +259,84 @@ fn init_cpu_local() {
     // SAFETY: CPL 0 (every caller loads descriptor tables); IA32_GS_BASE exists on every
     // x86-64 processor and only sets GS's base, which only `cpu_id` uses.
     unsafe { wrmsr(GS_BASE, ptr::from_ref(local).addr() as u64) };
+}
+
+/// Address of this processor's CPU-local area (the value IA32_GS_BASE holds).
+pub(crate) fn cpu_local_base() -> u64 {
+    let id = cpu_id() as usize;
+    CPU_LOCAL
+        .get(id)
+        .map_or(ptr::from_ref(&OUT_OF_RANGE), ptr::from_ref)
+        .addr() as u64
+}
+
+/// Sets this processor's TSS.RSP0: the stack an interrupt or exception from user mode
+/// switches to. It must be the kernel stack of the thread about to run in user mode.
+pub(crate) fn set_kernel_stack(top: u64) {
+    let local = cpu_id() as usize;
+    let Some(tss) = CPU_LOCAL.get(local).map(|l| l.tss.load(Ordering::Relaxed)) else {
+        return;
+    };
+    if tss == 0 {
+        return;
+    }
+    let field = ptr::with_exposed_provenance_mut::<u32>(tss as usize + d::TSS_RSP0_OFFSET);
+    // SAFETY: `tss` is this processor's TSS (recorded by `init_cpu_local`), live for ever
+    // and written only by this processor; RSP0 is two `u32` words at byte 4, 4-aligned.
+    unsafe { field.write_volatile(top as u32) };
+    // SAFETY: as above, the high word.
+    unsafe { field.wrapping_add(1).write_volatile((top >> 32) as u32) };
+}
+
+/// Enters user mode at `rip` with stack `rsp`: loads the user data selector into DS, ES,
+/// FS and GS (so the return to CPL 3 nulls none of them), restores GS's base to `gs_base`
+/// (this CPU's CPU-local area, unreadable from user mode), zeroes every general-purpose
+/// register so no kernel value leaks, and returns with `iretq` to CPL 3 with interrupts
+/// enabled and IOPL 0.
+///
+/// # Safety
+///
+/// `rip` and `rsp` must be in user pages of the current address space; TSS.RSP0 must be the
+/// calling thread's kernel stack, which nothing else uses once this returns to user mode.
+#[unsafe(naked)]
+pub(crate) unsafe extern "sysv64" fn enter_user(rip: u64, rsp: u64, gs_base: u64) -> ! {
+    naked_asm!(
+        "mov r8, rdi",
+        "mov r9, rsi",
+        "mov eax, {data}",
+        "mov ds, ax",
+        "mov es, ax",
+        "mov fs, ax",
+        "mov gs, ax",
+        "mov ecx, {gs_msr}",
+        "mov eax, edx",
+        "shr rdx, 32",
+        "wrmsr",
+        "push {data}",
+        "push r9",
+        "push 0x202",
+        "push {code}",
+        "push r8",
+        "xor eax, eax",
+        "xor ebx, ebx",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor ebp, ebp",
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "xor r10d, r10d",
+        "xor r11d, r11d",
+        "xor r12d, r12d",
+        "xor r13d, r13d",
+        "xor r14d, r14d",
+        "xor r15d, r15d",
+        "iretq",
+        data = const d::USER_DATA,
+        code = const d::USER_CODE,
+        gs_msr = const GS_BASE,
+    );
 }
 
 /// This processor's x2APIC ID: one GS-relative load from its CPU-local area.
@@ -266,6 +354,9 @@ pub(crate) const YIELD_VECTOR: u8 = 0x81;
 pub(crate) const SLEEP_VECTOR: u8 = 0x82;
 /// Software interrupt to end the running thread.
 pub(crate) const EXIT_VECTOR: u8 = 0x83;
+/// The system-call vector, the only gate user mode may raise (DPL 3). RAX: 0 exit(RDI),
+/// 1 report(RDI); anything else returns `u64::MAX` in RAX.
+pub(crate) const SYSCALL_VECTOR: u8 = 0x80;
 
 /// Local APIC timer interrupts taken since boot.
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -306,6 +397,25 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         return crate::sched::on_sleep(here, frame.rdi);
     }
     if frame.vector == u64::from(EXIT_VECTOR) {
+        return crate::sched::on_exit(here);
+    }
+    if frame.vector == u64::from(SYSCALL_VECTOR) {
+        match frame.rax {
+            0 => {
+                crate::user::record_exit(frame.rdi);
+                return crate::sched::on_exit(here);
+            }
+            1 => {
+                crate::user::record_report(frame.rdi);
+                frame.rax = 0;
+            }
+            _ => frame.rax = u64::MAX,
+        }
+        return here;
+    }
+    // An exception in user mode ends that thread; the kernel carries on (crash isolation).
+    if frame.vector < 32 && frame.cs & 3 == 3 {
+        crate::user::record_fault(frame.vector, frame.error_code, read_cr2());
         return crate::sched::on_exit(here);
     }
     // A page fault at the exact instruction a probe armed: record it and resume at
@@ -697,6 +807,7 @@ macro_rules! soft_stub {
 soft_stub!(yield_stub, YIELD_VECTOR);
 soft_stub!(sleep_stub, SLEEP_VECTOR);
 soft_stub!(exit_stub, EXIT_VECTOR);
+soft_stub!(syscall_stub, SYSCALL_VECTOR);
 
 /// Entry stub of the spurious-interrupt vector.
 #[unsafe(naked)]

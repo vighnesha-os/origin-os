@@ -10,8 +10,13 @@ pub const KERNEL_CODE: u16 = 0x08;
 pub const KERNEL_DATA: u16 = 0x10;
 /// GDT selector of the TSS (a 16-byte descriptor at entries 3 and 4).
 pub const TSS: u16 = 0x18;
-/// Number of 8-byte GDT entries: null, code, data, and the two halves of the TSS.
-pub const GDT_ENTRIES: usize = 5;
+/// GDT selector of the user data segment (index 5), with RPL 3.
+pub const USER_DATA: u16 = 0x28 | 3;
+/// GDT selector of the user 64-bit code segment (index 6), with RPL 3.
+pub const USER_CODE: u16 = 0x30 | 3;
+/// Number of 8-byte GDT entries: null, kernel code, kernel data, the two halves of the TSS,
+/// user data and user code.
+pub const GDT_ENTRIES: usize = 7;
 /// Size of the 64-bit TSS in bytes (SDM Vol. 3A Figure 8-11).
 pub const TSS_SIZE: u32 = 104;
 /// IST slot used for #DF, so a double fault always runs on a known-good stack.
@@ -26,6 +31,16 @@ pub const fn kernel_code_segment() -> u64 {
 /// base and limit are ignored; the descriptor must still be valid for SS and DS.
 pub const fn kernel_data_segment() -> u64 {
     descriptor(0x92, 0xC)
+}
+
+/// 64-bit user code segment: present, DPL 3, code execute/read, L = 1, G = 1.
+pub const fn user_code_segment() -> u64 {
+    descriptor(0xFA, 0xA)
+}
+
+/// User data segment: present, DPL 3, data read/write, D/B = 1, G = 1.
+pub const fn user_data_segment() -> u64 {
+    descriptor(0xF2, 0xC)
 }
 
 /// A flat code or data descriptor (base 0, limit 0xFFFFF) with the given access byte and
@@ -51,10 +66,21 @@ pub const fn tss_descriptor(base: u64) -> [u64; 2] {
 /// A 64-bit interrupt gate (type 0xE: interrupts stay disabled in the handler), present,
 /// DPL 0, to `offset` in segment `selector`, using IST slot `ist` (0 = none).
 pub const fn interrupt_gate(offset: u64, selector: u16, ist: u8) -> [u64; 2] {
+    gate(offset, selector, ist, 0)
+}
+
+/// As [`interrupt_gate`], but DPL 3: user mode may raise it with `int` (a system call).
+/// Every other gate is DPL 0, so `int n` from user mode for any other vector is a #GP.
+pub const fn user_interrupt_gate(offset: u64, selector: u16) -> [u64; 2] {
+    gate(offset, selector, 0, 3)
+}
+
+const fn gate(offset: u64, selector: u16, ist: u8, dpl: u8) -> [u64; 2] {
+    let access = 0x8E_u64 | (((dpl & 3) as u64) << 5);
     let low = (offset & 0xFFFF)
         | ((selector as u64) << 16)
         | (((ist & 0x7) as u64) << 32)
-        | (0x8E_u64 << 40)
+        | (access << 40)
         | (((offset >> 16) & 0xFFFF) << 48);
     [low, offset >> 32]
 }
@@ -63,7 +89,8 @@ pub const fn interrupt_gate(offset: u64, selector: u16, ist: u8) -> [u64; 2] {
 ///
 /// Every field is zero except IST1, the double-fault stack top, at byte 36, and the I/O
 /// map base at byte 102. The map base is set to `TSS_SIZE`, which means "no I/O permission
-/// bitmap". The RSP0–2 fields stay zero until user mode exists (M4).
+/// bitmap" (user mode can reach no port). RSP0, the stack an interrupt from user mode
+/// switches to, is set per thread later ([`TSS_RSP0_OFFSET`]).
 pub const fn tss_image(ist1: u64) -> [u32; 26] {
     let mut t = [0u32; 26];
     t[9] = ist1 as u32; // bytes 36..40, IST1 low
@@ -71,6 +98,9 @@ pub const fn tss_image(ist1: u64) -> [u32; 26] {
     t[25] = TSS_SIZE << 16; // bytes 100..104: reserved u16, then the I/O map base
     t
 }
+
+/// Byte offset of RSP0 in the 64-bit TSS.
+pub const TSS_RSP0_OFFSET: usize = 4;
 
 /// True for the exception vectors where the processor pushes an error code (SDM Vol. 3A
 /// Table 6-1): #DF, #TS, #NP, #SS, #GP, #PF, #AC, #CP, #VC and #SX.
@@ -116,6 +146,19 @@ mod tests {
     fn flat_segments_have_the_well_known_encodings() {
         assert_eq!(kernel_code_segment(), 0x00AF_9A00_0000_FFFF);
         assert_eq!(kernel_data_segment(), 0x00CF_9200_0000_FFFF);
+        assert_eq!(user_code_segment(), 0x00AF_FA00_0000_FFFF);
+        assert_eq!(user_data_segment(), 0x00CF_F200_0000_FFFF);
+        assert_eq!((USER_DATA >> 3, USER_DATA & 3), (5, 3));
+        assert_eq!((USER_CODE >> 3, USER_CODE & 3), (6, 3));
+    }
+
+    #[test]
+    fn only_the_user_gate_has_dpl_3() {
+        let [kernel, _] = interrupt_gate(0x1234, KERNEL_CODE, 0);
+        let [user, _] = user_interrupt_gate(0x1234, KERNEL_CODE);
+        assert_eq!((kernel >> 40) & 0xFF, 0x8E);
+        assert_eq!((user >> 40) & 0xFF, 0xEE, "present, DPL 3, interrupt gate");
+        assert_eq!(kernel & !(0xFF << 40), user & !(0xFF << 40));
     }
 
     #[test]

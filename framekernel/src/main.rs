@@ -34,6 +34,7 @@ mod memory;
 mod sched;
 mod smp;
 mod timer;
+mod user;
 mod vm;
 use framekernel::frames::{self, FrameAllocator};
 use framekernel::kernel_space;
