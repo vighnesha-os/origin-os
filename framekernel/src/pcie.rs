@@ -57,7 +57,6 @@ impl ConfigSpace for EcamSpace {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Device {
     pub(crate) function: Function,
-    #[expect(dead_code, reason = "the NVMe driver binds through it (the next step)")]
     pub(crate) bars: [Option<Bar>; 6],
 }
 
@@ -253,7 +252,6 @@ fn report(com1: &mut Console, f: &Function, bars: &[Option<Bar>; 6]) {
 }
 
 /// The first listed function of this class, subclass and programming interface.
-#[expect(dead_code, reason = "the NVMe driver binds through it (the next step)")]
 pub(crate) fn find(class: u8, subclass: u8, prog_if: u8) -> Option<Device> {
     crate::cpu::without_interrupts(|| {
         DEVICES.lock().iter().copied().find(|d| {
@@ -265,7 +263,6 @@ pub(crate) fn find(class: u8, subclass: u8, prog_if: u8) -> Option<Device> {
 
 /// Sets bits in a function's command register (for example memory decoding and bus
 /// mastering for a driver that binds to it); returns the new value.
-#[expect(dead_code, reason = "the NVMe driver binds through it (the next step)")]
 pub(crate) fn enable(at: Address, bits: u16) -> Option<u16> {
     crate::cpu::without_interrupts(|| {
         let mut guard = ECAM.lock();

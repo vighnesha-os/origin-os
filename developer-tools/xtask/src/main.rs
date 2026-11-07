@@ -6,6 +6,7 @@
 //! `.cargo/config.toml`: `cargo xtask <command>`.
 #![forbid(unsafe_code)]
 
+mod disk;
 mod serial;
 
 use std::env;
@@ -223,10 +224,26 @@ fn boot_scenario_markers() -> Scenario {
             "mapped at 0xffffe00000000000: uncached true, 2 MiB pages".into(),
             "origin-kernel: PCIe: 00:00.0 8086:29c0 class 06:00:00 host bridge".into(),
             "origin-kernel: PCIe: 00:01.0 1234:1111 class 03:00:00 VGA-compatible display controller; BAR0 mem32 prefetchable 16 MiB at ".into(),
+            "origin-kernel: PCIe: 00:02.0 1b36:0010 class 01:08:02 NVMe controller; BAR0 mem64 16 KiB at ".into(),
             "origin-kernel: PCIe: 00:1f.0 8086:2918 class 06:01:00 ISA bridge".into(),
             "origin-kernel: PCIe: 00:1f.2 8086:2922 class 01:06:01 SATA controller (AHCI); BAR4 I/O 32 B at ".into(),
             "; BAR5 mem32 4 KiB at ".into(),
             "functions on 1 buses; every BAR sized with decoding off and restored: true".into(),
+            // M5: the NVMe driver against the test disk `disk` writes (CLAUDE.md §33).
+            "origin-kernel: NVMe: 00:02.0 1b36:0010, NVMe 1.".into(),
+            "origin-kernel: NVMe: controller ready: model \"QEMU NVMe Ctrl\", serial \"ORIGIN0001\"".into(),
+            format!(
+                "origin-kernel: NVMe: namespace 1: {} blocks of {} B ({} MiB)",
+                disk::BLOCKS,
+                disk::BLOCK,
+                (disk::BLOCKS * disk::BLOCK) >> 20
+            ),
+            "origin-kernel: NVMe: through I/O queue 1: LBA 0 has the MBR signature true, LBA 1 the GPT signature true, and 8 of 8 blocks from LBA 2048 match the boot test's pattern".into(),
+            format!(
+                "origin-kernel: NVMe: wrote LBA {}, flushed and read it back: match true; a read at LBA {} (past the end) failed with status type 0 code 0x80 (LBA out of range: true)",
+                disk::BLOCKS - 64,
+                disk::BLOCKS
+            ),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
         failures: vec![
@@ -270,6 +287,7 @@ fn boot_scenario_markers() -> Scenario {
             ": TLB failed",
             ": wait queues failed",
             ": PCIe failed",
+            ": NVMe failed",
         ],
         check: Some(|text| console_lines_intact(text, qemu_cpus() as usize)),
     }
@@ -931,6 +949,8 @@ struct Staged {
     firmware: Firmware,
     esp: PathBuf,
     vars: PathBuf,
+    /// The NVMe test disk (`disk`).
+    nvme: PathBuf,
 }
 
 fn find_firmware() -> Result<Firmware> {
@@ -1002,10 +1022,14 @@ fn stage(kernel: &[u8]) -> Result<Staged> {
     let vars = work.join("ovmf-vars.fd");
     fs::copy(&firmware.vars_template, &vars)
         .map_err(|e| format!("copy {}: {e}", firmware.vars_template.display()))?;
+    // A fresh NVMe test disk for every boot, too.
+    let nvme = work.join("nvme.img");
+    disk::write_image(&nvme)?;
     Ok(Staged {
         firmware,
         esp,
         vars,
+        nvme,
     })
 }
 
@@ -1032,6 +1056,10 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         .arg(drive("if=pflash,format=raw,file=", &s.vars)?)
         .arg("-drive")
         .arg(drive("format=raw,file=fat:rw:", &s.esp)?)
+        // The NVMe controller and its test disk (CLAUDE.md §33).
+        .arg("-drive")
+        .arg(drive("if=none,id=nvme0,format=raw,file=", &s.nvme)?)
+        .args(["-device", "nvme,serial=ORIGIN0001,drive=nvme0"])
         .args(["-net", "none", "-display", "none", "-no-reboot"])
         .arg("-rtc")
         .arg(format!("base={RTC_BASE}"));

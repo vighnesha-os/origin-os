@@ -24,6 +24,7 @@
 //! - [`frames`]: the physical frame allocator over the boot-info regions;
 //! - [`handles`]: per-process handle tables with rights (ADR-0005 P1–P2);
 //! - [`heap`]: kernel heap bookkeeping (slabs and frame runs), addresses only;
+//! - [`nvme`]: NVMe controller registers, queue entries and indexes, Identify data;
 //! - [`paging`]: 4-level page tables with structural W^X (the `origin-paging` crate,
 //!   shared with the loader);
 //! - [`pci`]: the MCFG, ECAM addressing, configuration headers, enumeration and BAR
@@ -53,6 +54,7 @@ pub mod descriptors;
 pub mod frames;
 pub mod handles;
 pub mod heap;
+pub mod nvme;
 pub use origin_paging as paging;
 pub mod pci;
 pub mod report;

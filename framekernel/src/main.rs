@@ -40,6 +40,7 @@ mod phys;
 mod process;
 mod sched;
 mod smp;
+mod storage;
 mod time;
 mod timer;
 mod tlb;
@@ -186,7 +187,10 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
         // M3, second step: preemptive kernel threads on every online processor.
         sched::prove(&mut com1, online.ids(), tsc_hz);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
-        pcie::init(&mut com1, info.acpi_rsdp, regions, online.ids().len());
+        if pcie::init(&mut com1, info.acpi_rsdp, regions, online.ids().len()) {
+            // M5: the NVMe driver and block I/O.
+            storage::init(&mut com1);
+        }
     }
 
     let _ = report::write_halt(&mut com1);

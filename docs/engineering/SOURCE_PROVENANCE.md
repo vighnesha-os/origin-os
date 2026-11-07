@@ -384,6 +384,29 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 4 `pci` tests and 1 more `origin-paging` test; 83 library tests in all; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** bridges' bus numbers and hot-plug, MSI/MSI-X, PCIe capabilities, AER, an IOMMU (no DMA confinement yet), and segments other than 0.
 
+### NVMe driver (M5; CLAUDE.md §33; 2026-11-07)
+
+- **What:**
+  - `nvme` (library): CAP decoding, the version register, doorbell offsets, CC and AQA encodings, submission entries (Identify, Create I/O Completion and Submission Queue, Read, Write, Flush), PRP entries for transfers of up to two pages, completion decoding with the status field, the queue indexes (one slot always empty, the phase flipping at each wrap), and Identify Controller and Namespace parsing (bounds-checked; an inactive namespace, an out-of-range format index or a block size outside 512 B–64 KiB is refused).
+  - `storage` (binary), a first-party polled driver (ADR-0001 D2):
+    - binds to the first NVMe controller PCIe listed; turns on memory decoding and bus mastering; maps BAR 0 uncached;
+    - resets the controller and awaits CSTS.RDY within CAP.TO (failing on the fatal-status bit); creates 32-entry admin queues and one 64-entry I/O queue pair;
+    - masks the pin interrupt and polls each completion: the phase dword first, a deadline of 2 s, and a check that the command ID is its own;
+    - DMA pages are zeroed heap pages that are never freed; a fence orders writes before every doorbell; no reference is ever made into memory the device may write.
+  - xtask `disk`: a 16 MiB GPT test disk built independently of the kernel (protective MBR, primary and backup headers and entry arrays with bitwise CRC-32, two partitions, and a per-LBA pattern), attached as `-device nvme,serial=ORIGIN0001`. The image is fresh for every boot. The two Origin partition-type GUIDs are provisional, for this disk only (the M9 partition-layout decision fixes the real ones).
+- **Specifications:** NVM Express Base 2.x (§3.1.4 registers, §4.2 and §4.6 queue entries and the phase tag, §5.2 admin commands); NVM Command Set 1.x (Read, Write, Flush, Identify Namespace); NVMe over PCIe Transport 1.x (doorbells, PRPs); UEFI 2.11 §5.3 (GPT, for the test disk).
+- **Proof** (every boot):
+  - Controller: 00:02.0 1b36:0010, NVMe 1.4.0, with a 64-bit BAR 0 that OVMF placed at 0xc000000000 (above 4 GiB); model "QEMU NVMe Ctrl", serial "ORIGIN0001".
+  - Namespace 1: 32 768 blocks of 512 B.
+  - Through I/O queue 1: LBA 0 holds the MBR signature, LBA 1 "EFI PART", and 8 of 8 blocks at LBA 2048 match the pattern xtask wrote.
+  - LBA 32704 was written, flushed and read back unchanged; a read at LBA 32768 (past the end) completed with status type 0, code 80h (LBA out of range).
+- **Negative controls**, each failing the boot test:
+  - Reading from LBA 2049 instead of 2048 → "0 of 8 blocks … match".
+  - Bus mastering really off → "a command timed out". The driver reports the timeout; it does not hang.
+  - A first version of that control only left out the bus-mastering bit. OVMF had already set it, so the control passed and proved nothing; it was redone so that it clears the bit.
+- **Test evidence:** 7 `nvme` tests (91 library tests in all) and 3 xtask `disk` tests (CRC-32 check value, GUID byte order, a self-consistent GPT); `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** MSI-X interrupts, several I/O queues (one per CPU), PRP lists for transfers over 8 KiB, controller-reset recovery, power states, health logs (SMART), an IOMMU, and a block layer above the driver.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.
