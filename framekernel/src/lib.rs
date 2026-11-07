@@ -56,6 +56,7 @@
 //! - [`route`]: an IPv4 longest-prefix-match routing table (a bit trie);
 //! - [`rtc`]: CMOS RTC decoding and UTC calendar arithmetic;
 //! - [`unwind`]: frame-pointer stack unwinding for panic diagnostics;
+//! - [`ustar`]: a read-only ustar (tar) archive reader for an initramfs/package payload;
 //! - [`vfs`]: an in-memory virtual filesystem (paths, directories, files).
 //!
 //! The binary holds the entry point, x86 port I/O, the descriptor tables, exception and
@@ -109,4 +110,5 @@ pub mod text;
 pub mod timers;
 pub mod topology;
 pub mod unwind;
+pub mod ustar;
 pub mod vfs;
