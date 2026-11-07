@@ -116,3 +116,14 @@ How to see it all: `cargo xtask boot-test` (default 2 CPUs; `ORIGIN_QEMU_SMP=1..
 | ada5edb | heap and address-space locks held with interrupts disabled (found by review) |
 
 Start here next time: `docs/STATUS.md`, then `docs/engineering/TASKS.md`. The next code step after the owner's answers is either the signature block (S1–S4) or the higher-half layout (ADR-0004).
+
+### Continued, 20:05–20:20 IST
+
+| Commit | What |
+|---|---|
+| 1bdd1a4 | S1–S4 decided by the owner (all recommended options) |
+| 43a37ab | `onbf-format`: the signature-block parser |
+| d89f5b3, e19dd36 | `onbf-verify`: entry verification, proven against reference-signed vectors |
+| ab4aaa6 | validated, fault-safe copy from user memory; a write system call (closed a kernel-memory leak found by its own test) |
+
+Final state at 20:20: `cargo xtask check` and `cargo xtask boot-matrix` pass; the working tree is clean; nothing pushed.

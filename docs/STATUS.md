@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Updated | 2026-11-07, 20:00 IST |
+| Updated | 2026-11-07, 20:20 IST |
 | Branch | `m0/toolchain-verification` (local only, not pushed, not merged into `main`) |
 | Reproduce | `cargo xtask check`, `cargo xtask boot-test`, and `cargo xtask boot-matrix` (1, 2 and 4 CPUs; `ORIGIN_QEMU_SMP=1`…`8` for others) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs in QEMU 11.1.3 (TCG) + OVMF only; nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
@@ -15,7 +15,7 @@
 | **M1** bootable Framekernel | done (developer mode) | UEFI loader reads, verifies (content digest, manifest, every section's digest or Merkle root) and places the KRN image, applies RELR, exits boot services and enters the kernel; a tampered image is rejected. **Unsigned images only**: the signature block is parsed and verifiable (`onbf-verify`) but not yet required by the loader; the trust anchor waits on B7 |
 | **M2** CPU and memory | done (baseline) | Own GDT/TSS/IDT; exceptions; frame allocator; own page tables (W^X image from the signed segment table, NX direct map, no page 0, SMEP/SMAP, guard pages below every stack); kernel heap with `alloc`; x2APIC and a PIT-calibrated timer; loader memory reclaimed |
 | **M3** SMP and scheduler | started | All MADT-enabled CPUs started (1–8 tested); per-CPU round-robin with preemption, yield, sleep, exit and stack reaping; GS-based CPU-local data. Not yet: priorities, fairness policy, load balancing, wake-ups across CPUs |
-| **M4** processes and IPC | groundwork | Ring 3 with one DPL-3 gate and `syscall`; user faults end the thread, not the kernel; RSP0 per switch; NMI/#MC on IST. Not yet: per-process address spaces (needs the higher-half ADR), process objects, capabilities, IPC |
+| **M4** processes and IPC | groundwork | Ring 3 with one DPL-3 gate and `syscall`; user faults end the thread, not the kernel; RSP0 per switch; NMI/#MC on IST; validated, fault-safe copy from user memory (a write system call). Not yet: per-process address spaces (needs the higher-half ADR), process objects, capabilities, IPC |
 | **M5** onwards | not started | — |
 
 ## Native formats and cryptography
