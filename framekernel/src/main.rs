@@ -147,6 +147,9 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     // M2, fourth step: interrupts. The local APIC in x2APIC mode, its timer calibrated
     // against the PIT and proven by taking periodic interrupts.
     let tsc_hz = timer::init(&mut com1);
+    if tsc_hz.is_some() {
+        prove_nmi_ist(&mut com1);
+    }
 
     // M3, first step: start the application processors the ACPI MADT lists. It needs the
     // heap, the kernel's own tables and the calibrated TSC.
@@ -424,6 +427,30 @@ fn prove_heap(com1: &mut Uart16550<Com1>) -> bool {
         (before.1 * memory::FRAME) >> 20
     );
     true
+}
+
+/// Sends this processor an NMI (x2APIC ICR, NMI delivery, "self" shorthand) and checks
+/// that it was taken on the dedicated NMI stack (IST2), not on the interrupted stack.
+fn prove_nmi_ist(com1: &mut Uart16550<Com1>) -> bool {
+    let (before, _) = cpu::nmis();
+    // SAFETY: CPL 0, boot processor; x2APIC mode is on (timer bring-up), so this is a no-op
+    // transition yielding the handle.
+    let lapic = unsafe { timer::X2Apic::enable() };
+    // SAFETY: an NMI to this processor runs the NMI handler, which only records it.
+    unsafe { lapic.send_ipi(0, (1 << 18) | 0x400) };
+    let start = cpu::rdtsc();
+    while cpu::nmis().0 == before && cpu::rdtsc().wrapping_sub(start) < 100_000_000 {
+        core::hint::spin_loop();
+    }
+    let (count, frame) = cpu::nmis();
+    let (low, high) = cpu::bsp_nmi_stack();
+    let on_ist = count > before && (low..high).contains(&frame);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: NMI taken on its own stack (IST2): frame at {frame:#x}, stack {low:#x}..{high:#x}{}",
+        if on_ist { "" } else { ": NMI stack failed" }
+    );
+    on_ist
 }
 
 /// Where the SMEP/SMAP probe maps its temporary user page: the top of the lower half.

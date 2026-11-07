@@ -18,7 +18,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use framekernel::apic::{SPURIOUS_VECTOR, TIMER_VECTOR, X2APIC_EOI};
 use framekernel::descriptors::{
-    self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, TSS, TSS_SIZE,
+    self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, MACHINE_CHECK_IST, NMI_IST,
+    TSS, TSS_SIZE,
 };
 use framekernel::serial::Uart16550;
 
@@ -50,6 +51,8 @@ pub(crate) struct CpuTables {
     gdt: Gdt,
     tss: TssImage,
     double_fault_stack: Stack,
+    nmi_stack: Stack,
+    machine_check_stack: Stack,
 }
 
 /// The boot processor's tables. Application processors get theirs from the heap.
@@ -57,6 +60,8 @@ static mut BSP_TABLES: CpuTables = CpuTables {
     gdt: Gdt([0; GDT_ENTRIES]),
     tss: TssImage([0; 26]),
     double_fault_stack: Stack([0; DOUBLE_FAULT_STACK_SIZE]),
+    nmi_stack: Stack([0; DOUBLE_FAULT_STACK_SIZE]),
+    machine_check_stack: Stack([0; DOUBLE_FAULT_STACK_SIZE]),
 };
 static mut IDT: Idt = Idt([[0; 2]; 256]);
 
@@ -99,7 +104,12 @@ struct ExceptionFrame {
 pub(crate) unsafe fn init() {
     let mut idt = Idt([[0; 2]; 256]);
     for (vector, (gate, stub)) in idt.0.iter_mut().zip(STUBS.iter()).enumerate() {
-        let ist = if vector == 8 { DOUBLE_FAULT_IST } else { 0 };
+        let ist = match vector {
+            8 => DOUBLE_FAULT_IST,
+            2 => NMI_IST,
+            18 => MACHINE_CHECK_IST,
+            _ => 0,
+        };
         *gate = d::interrupt_gate(*stub as usize as u64, KERNEL_CODE, ist);
     }
     if let Some(gate) = idt.0.get_mut(usize::from(SYSCALL_VECTOR)) {
@@ -146,11 +156,19 @@ unsafe fn load_tables(tables: *mut CpuTables) {
     // Projecting to a field creates no reference.
     let stack = unsafe { &raw mut (*tables).double_fault_stack };
     // SAFETY: as above.
+    let nmi = unsafe { &raw mut (*tables).nmi_stack };
+    // SAFETY: as above.
+    let mc = unsafe { &raw mut (*tables).machine_check_stack };
+    // SAFETY: as above.
     let tss_field = unsafe { &raw mut (*tables).tss };
     // SAFETY: as above.
     let gdt_ptr_raw = unsafe { &raw mut (*tables).gdt };
-    let stack_top = stack.addr() + DOUBLE_FAULT_STACK_SIZE;
-    let tss_image = TssImage(d::tss_image(stack_top as u64));
+    let top = |p: usize| (p + DOUBLE_FAULT_STACK_SIZE) as u64;
+    let tss_image = TssImage(d::tss_image([
+        top(stack.addr()),
+        top(nmi.addr()),
+        top(mc.addr()),
+    ]));
     // SAFETY: as above; the TSS is written before `ltr` loads it.
     unsafe { tss_field.write(tss_image) };
     let tss = d::tss_descriptor(tss_field.addr() as u64);
@@ -424,6 +442,24 @@ pub(crate) const SYSCALL_VECTOR: u8 = 0x80;
 
 /// Local APIC timer interrupts taken since boot.
 static TICKS: AtomicU64 = AtomicU64::new(0);
+/// NMIs taken, and the frame address of the last one.
+static NMIS: AtomicU64 = AtomicU64::new(0);
+static NMI_FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// NMIs taken so far and the frame address of the last.
+pub(crate) fn nmis() -> (u64, u64) {
+    (
+        NMIS.load(Ordering::SeqCst),
+        NMI_FRAME.load(Ordering::SeqCst),
+    )
+}
+
+/// The boot processor's NMI stack, as `[low, high)`.
+pub(crate) fn bsp_nmi_stack() -> (u64, u64) {
+    // SAFETY: only the address of the static's field is taken; no reference is made.
+    let low = unsafe { &raw const BSP_TABLES.nmi_stack }.addr() as u64;
+    (low, low + DOUBLE_FAULT_STACK_SIZE as u64)
+}
 
 /// Local APIC timer interrupts taken since boot.
 pub(crate) fn ticks() -> u64 {
@@ -451,6 +487,12 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         return crate::sched::on_tick(here);
     }
     if frame.vector == u64::from(SPURIOUS_VECTOR) {
+        return here;
+    }
+    // NMI: counted and resumed (no NMI source is used yet besides the boot proof).
+    if frame.vector == 2 {
+        NMI_FRAME.store(here, Ordering::SeqCst);
+        NMIS.fetch_add(1, Ordering::SeqCst);
         return here;
     }
     // Scheduler requests from kernel threads (`sched::yield_now`, `sleep`, `exit`).

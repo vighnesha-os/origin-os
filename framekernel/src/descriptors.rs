@@ -21,6 +21,11 @@ pub const GDT_ENTRIES: usize = 7;
 pub const TSS_SIZE: u32 = 104;
 /// IST slot used for #DF, so a double fault always runs on a known-good stack.
 pub const DOUBLE_FAULT_IST: u8 = 1;
+/// IST slot used for NMI: an NMI can arrive at any instruction, including the one after
+/// `syscall`, before the kernel has left the user stack.
+pub const NMI_IST: u8 = 2;
+/// IST slot used for #MC, for the same reason.
+pub const MACHINE_CHECK_IST: u8 = 3;
 
 /// 64-bit kernel code segment: present, DPL 0, code execute/read, L = 1, G = 1.
 pub const fn kernel_code_segment() -> u64 {
@@ -87,14 +92,20 @@ const fn gate(offset: u64, selector: u16, ist: u8, dpl: u8) -> [u64; 2] {
 
 /// The 104-byte 64-bit TSS as 26 little-endian `u32` words (SDM Vol. 3A Figure 8-11).
 ///
-/// Every field is zero except IST1, the double-fault stack top, at byte 36, and the I/O
+/// Every field is zero except IST1–IST3 (the #DF, NMI and #MC stack tops, `ists`) from byte
+/// 36, and the I/O
 /// map base at byte 102. The map base is set to `TSS_SIZE`, which means "no I/O permission
 /// bitmap" (user mode can reach no port). RSP0, the stack an interrupt from user mode
 /// switches to, is set per thread later ([`TSS_RSP0_OFFSET`]).
-pub const fn tss_image(ist1: u64) -> [u32; 26] {
+pub const fn tss_image(ists: [u64; 3]) -> [u32; 26] {
     let mut t = [0u32; 26];
-    t[9] = ist1 as u32; // bytes 36..40, IST1 low
-    t[10] = (ist1 >> 32) as u32; // bytes 40..44, IST1 high
+    let mut i = 0;
+    while i < 3 {
+        // IST(i+1) is at byte 36 + 8 i: words 9 + 2 i (low) and 10 + 2 i (high).
+        t[9 + 2 * i] = ists[i] as u32;
+        t[10 + 2 * i] = (ists[i] >> 32) as u32;
+        i += 1;
+    }
     t[25] = TSS_SIZE << 16; // bytes 100..104: reserved u16, then the I/O map base
     t
 }
@@ -192,15 +203,22 @@ mod tests {
     }
     #[test]
     fn tss_image_places_ist1_and_the_io_map_base() {
-        let t = tss_image(0x1122_3344_5566_7788);
+        let ists = [
+            0x1122_3344_5566_7788,
+            0x99AA_BBCC_DDEE_FF00,
+            0x0102_0304_0506_0708,
+        ];
+        let t = tss_image(ists);
         let bytes: Vec<u8> = t.iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(bytes.len(), 104);
-        assert_eq!(&bytes[36..44], &0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(&bytes[36..44], &ists[0].to_le_bytes());
+        assert_eq!(&bytes[44..52], &ists[1].to_le_bytes());
+        assert_eq!(&bytes[52..60], &ists[2].to_le_bytes());
         assert_eq!(u16::from_le_bytes([bytes[102], bytes[103]]), 104);
         let others = bytes
             .iter()
             .enumerate()
-            .filter(|(i, _)| !(36..44).contains(i) && !(102..104).contains(i));
+            .filter(|(i, _)| !(36..60).contains(i) && !(102..104).contains(i));
         assert!(others.into_iter().all(|(_, &b)| b == 0));
     }
 }

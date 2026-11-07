@@ -143,6 +143,7 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: x2APIC enabled: APIC ID 0, ".into(),
             "origin-kernel: APIC timer calibrated against the PIT: ".into(),
             "origin-kernel: APIC timer: 50 interrupts at 100 Hz in ".into(),
+            "origin-kernel: NMI taken on its own stack (IST2): frame at ".into(),
             // M3: every processor QEMU emulates (`-smp`, see `qemu_cpus`) comes online.
             format!("origin-kernel: ACPI MADT: {cpus} processors, {cpus} enabled"),
             format!("origin-kernel: SMP: {cpus} of {cpus} enabled processors online"),
@@ -198,6 +199,7 @@ fn boot_scenario_markers() -> Scenario {
             "supervisor isolation from user pages incomplete",
             "origin-kernel: cannot map the user probe page",
             ": user isolation failed",
+            ": NMI stack failed",
         ],
     }
 }
