@@ -57,6 +57,7 @@
 //! - [`rtc`]: CMOS RTC decoding and UTC calendar arithmetic;
 //! - [`unwind`]: frame-pointer stack unwinding for panic diagnostics;
 //! - [`ustar`]: a read-only ustar (tar) archive reader for an initramfs/package payload;
+//! - [`utf16`]: UTF-16 ↔ scalar transcoding (surrogate pairs) for UEFI/CHAR16 interop;
 //! - [`vfs`]: an in-memory virtual filesystem (paths, directories, files).
 //!
 //! The binary holds the entry point, x86 port I/O, the descriptor tables, exception and
@@ -111,4 +112,5 @@ pub mod timers;
 pub mod topology;
 pub mod unwind;
 pub mod ustar;
+pub mod utf16;
 pub mod vfs;

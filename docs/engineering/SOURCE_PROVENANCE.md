@@ -777,6 +777,15 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Not done:** pax/GNU extended headers (long names, large sizes, xattrs), symlink/hardlink target handling beyond the type flag, writing archives, and extracting into the VFS (§21/§46).
 - **Licensing:** project licence not chosen yet.
 
+### UTF-16 transcoding (CLAUDE.md §51; UEFI/CHAR16 interop; 2026-11-08)
+
+- **What:** `utf16` (library) converts between Unicode scalars and UTF-16 code units, the companion to `text`'s UTF-8 decoder. `encode_scalar` (one or two units, a surrogate pair above U+FFFF), `decode_first` (BMP scalar, surrogate pair, or a typed error for a lone/mis-ordered surrogate), `encode_str_into` (fill a `u16` buffer, `None` if too small) and `decode_lossy` (an iterator substituting U+FFFD per bad unit). Pure, no `unsafe`.
+- **Why:** UEFI strings are NUL-terminated UTF-16, so the loader's and kernel's firmware-string handling (and any UTF-16 interop a text source needs) builds on this; it pairs with the UTF-8 decoder to complete the scalar↔bytes codecs.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the UTF-16 surrogate rules (Unicode 18.0 §3.9); no source used (CLAUDE.md §3).
+- **Test evidence (2026-11-08):** 4 `utf16` tests — BMP and supplementary scalars encode/decode (incl. the U+FFFF and U+10FFFF boundaries); lone/incomplete/mis-ordered surrogates rejected with the right `Incomplete`/`Invalid`; `encode_str_into` reports a too-small buffer; and an oracle test over six mixed-script samples (and four deliberately broken unit streams) asserting `encode_str_into` equals `str::encode_utf16`, a valid stream round-trips, and `decode_lossy` equals `char::decode_utf16` mapped to U+FFFD — byte-exact agreement with std. 223 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the std oracle is the control).
+- **Not done:** little/big-endian byte-order handling and BOM detection (this works on `u16` units, not bytes), and UTF-32. Wiring into the loader's existing CHAR16 handling.
+- **Licensing:** project licence not chosen yet.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.
