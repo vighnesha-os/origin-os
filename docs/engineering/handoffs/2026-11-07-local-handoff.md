@@ -202,6 +202,10 @@ The owner asked for the design to be finalised with the recommended options, fol
 | `8e6bb84` | Records: STATUS/handoff for the ustar/deflate/dhcp batch |
 | `e6145a5` | Base64 encode/decode (RFC 4648) |
 | `b789c50` | JSON parser (RFC 8259), depth-limited |
+| `4507507` | Records: base64/json/zlib-gzip + a 490-test checkpoint |
+| `fd944de` | Semantic versioning: parse + precedence (semver.org) |
+| `63ac05c` | String-keyed hash map (FNV-1a open addressing) |
+| `6bb0885` | semver requirement matcher (^, ~, ranges) + prerelease gate |
 
 (The 2026-11-08 commits use the Claude Opus 4.8 attribution; the run spanned midnight.)
 
@@ -330,3 +334,9 @@ the 40× mutation soak runs **12 parser suites** with 0 failures (~32 s); `cargo
 proofs consistent; an 8-CPU boot was confirmed earlier in the run. **249 framekernel host
 library tests across 49 modules.** Everything remains QEMU-only (§74); ADR-0005 and the
 owner's non-design items (downloads, a licence, merge/push) remain.
+
+Two more followed (`fd944de`, `63ac05c`, `6bb0885`): semantic-version parse/precedence
+with a requirement matcher (§46 dependency comparison) and a string-keyed FNV-1a hash map
+(§29/§30 name tables). **Final checkpoint (~05:25 IST): 501 workspace tests across 27
+suites, 0 failures; 260 framekernel host library tests across 49 modules; `cargo xtask
+check` passes.** The full run report is `docs/engineering/handoffs/2026-11-08-run-report.md`.
