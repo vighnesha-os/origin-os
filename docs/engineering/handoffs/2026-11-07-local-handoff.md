@@ -191,6 +191,13 @@ The owner asked for the design to be finalised with the recommended options, fol
 | `54e2aea` | DNS message parsing with bounded name decompression |
 | `32f3ae1` | Mutation soaks for SRAT/SLIT/DNS/OriginFS; cap `read_whole` |
 | `5774b7f` | Fixed-size bit allocator (lowest-free, model-tested) |
+| `34ec628` | Records: STATUS/handoff + the ~04:20 verification pass |
+| `ff23487` | ustar (tar) archive reader |
+| `7b7f71d` | UTF-16 transcoding for UEFI/CHAR16 interop |
+| `e051b10` | Fixed-capacity ring buffer (input/audio/log) |
+| `87bd46a` | Boot proof: extract an embedded ustar initramfs into a VFS (§21) |
+| `5188d53` | DHCP client (build/parse + lease state machine) |
+| `6a7a417` | DEFLATE (RFC 1951) decompression, all three block types |
 
 (The 2026-11-08 commits use the Claude Opus 4.8 attribution; the run spanned midnight.)
 
@@ -278,3 +285,27 @@ ignored = the download-gated crypto vectors); the 40× mutation soak runs 9 pars
 with 0 failures (~31 s); an 8-CPU boot comes up with NUMA, SLIT and entropy all consistent;
 `cargo xtask check` passes. **215 framekernel host library tests.** Still QEMU-only (§74);
 ADR-0005 and the owner's non-design items remain.
+
+### Continued (2026-11-08, ~04:20–04:55 IST)
+
+Six more commits, filling out formats, text and networking:
+
+- **ustar + initramfs (§21).** A read-only tar reader (`ustar`) and a loader (`initramfs`)
+  that extracts an archive into the VFS, creating implicit parents and refusing `..`/
+  absolute names (the tar path-traversal defense). **Boot-proven**: the kernel embeds a
+  small committed `assets/initramfs.tar` and extracts it into a VFS at boot
+  (`initramfs: 4 entries … consistent true`), with a negative control. This is the first
+  end-to-end §21 step — an initial filesystem image loaded at boot.
+- **DEFLATE (§17, §46).** `deflate::inflate` decodes raw DEFLATE — stored, fixed- and
+  dynamic-Huffman blocks — validated against zlib-generated known-answer vectors (a verified
+  dynamic block among them), with a decompression-bomb output cap. Real decompression for
+  compressed packages/images.
+- **UTF-16 (`utf16`), a ring buffer (`ring`), a DHCP client (`dhcp`).** The UTF-16 codec
+  (byte-exact vs std) completes the scalar↔bytes codecs; the ring buffer is the bounded
+  input/audio/log queue; the DHCP client is the full DISCOVER→OFFER→REQUEST→ACK lease
+  machine.
+
+By ~04:55 IST, **238 framekernel host library tests** pass; `cargo xtask check`, `boot-test`
+and `boot-matrix` (1/2/4) pass. The library now carries 46 host-tested modules. Still
+QEMU-only (§74); ADR-0005 (syscalls) and the owner's non-design items (downloads, a licence,
+merge/push) remain.
