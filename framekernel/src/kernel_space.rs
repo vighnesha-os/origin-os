@@ -5,7 +5,8 @@
 //! in them than the firmware mapped:
 //! - **Direct map**, read/write and never executable: the RAM the kernel may touch, that is
 //!   regions of kind `Usable`, `LoaderReclaimable`, `BootInfo`, `KernelStack` and
-//!   `AcpiReclaimable`. Page 0 is never mapped, so a null access faults.
+//!   `AcpiReclaimable`. Page 0 is never mapped, so a null access faults, and neither is the
+//!   guard page below the boot stack (the first page of its `KernelStack` region).
 //! - **Kernel image**: each segment with exactly the access its verified ONBF segment table
 //!   declares (boot info 0.2): read-only, read/execute or read/write, never writable and
 //!   executable. The `KernelImage` region is not in the direct map, so no writable alias of
@@ -62,13 +63,17 @@ pub fn build(
     kernel_base: u64,
     regions: &[MemoryRegion],
     segments: &[KernelSegment],
+    stack_guard: u64,
 ) -> Result<(AddressSpace, Stats), MapError> {
     let mut space = AddressSpace::new(mem)?;
     let mut stats = Stats::default();
     let rw = Attributes::kernel(Access::ReadWrite);
     for r in regions.iter().filter(|r| direct_mapped(r.kind)) {
-        let (base, pages) = if r.base == 0 {
-            (PAGE, r.pages.saturating_sub(1))
+        // Page 0, and the boot stack's guard page at the base of its region, stay unmapped.
+        let skip_first =
+            r.base == 0 || (r.kind == RegionKind::KernelStack as u32 && r.base == stack_guard);
+        let (base, pages) = if skip_first {
+            (r.base + PAGE, r.pages.saturating_sub(1))
         } else {
             (r.base, r.pages)
         };
@@ -155,7 +160,8 @@ mod tests {
     fn image_segments_get_their_exact_access_and_nothing_is_writable_and_executable() {
         let tables = pool(64);
         let mut mem = TablePool::new(&tables, POOL_BASE);
-        let (space, stats) = build(&mut mem, KERNEL, &regions(), &segments()).unwrap();
+        let (space, stats) =
+            build(&mut mem, KERNEL, &regions(), &segments(), KERNEL + 0xE000).unwrap();
         assert_eq!(stats.image_pages, 14);
         let at = |v| space.translate(&mem, v).unwrap();
         let rodata = at(KERNEL + 0x2FFF);
@@ -178,7 +184,8 @@ mod tests {
     fn the_direct_map_covers_only_ram_the_kernel_may_touch() {
         let tables = pool(64);
         let mut mem = TablePool::new(&tables, POOL_BASE);
-        let (space, stats) = build(&mut mem, KERNEL, &regions(), &segments()).unwrap();
+        let (space, stats) =
+            build(&mut mem, KERNEL, &regions(), &segments(), KERNEL + 0xE000).unwrap();
         let mapped = |v| space.translate(&mem, v).is_some();
         assert!(!mapped(0), "the null page");
         assert!(mapped(0x1000) && mapped(0x9_F000), "low usable RAM");
@@ -187,13 +194,14 @@ mod tests {
         assert!(!mapped(0x1F00_0000), "runtime code");
         assert!(!mapped(0xFEC0_0000), "MMIO");
         assert!(mapped(POOL_BASE), "the table pool, so tables stay editable");
-        let stack = space.translate(&mem, KERNEL + 0xE000).unwrap();
+        assert!(!mapped(KERNEL + 0xE000), "the boot stack's guard page");
+        let stack = space.translate(&mem, KERNEL + 0xF000).unwrap();
         assert!(stack.writable && !stack.executable);
         assert!(mapped(KERNEL + 0x1E000), "boot info");
         assert!(!mapped(KERNEL + 0x2_0000), "nothing after the boot info");
         let loader = space.translate(&mem, 0x100_0000).unwrap();
         assert_eq!(loader.size, LARGE_PAGE, "2 MiB pages where aligned");
-        let expected = (0x9F + 0x700 + 0x100 + 0x1_D0B0 + 0x10 + 0x2) * PAGE;
+        let expected = (0x9F + 0x700 + 0x100 + 0x1_D0B0 + 0xF + 0x2) * PAGE;
         assert_eq!(stats.direct_bytes, expected);
         assert!(stats.large_pages > 200);
     }
@@ -204,11 +212,18 @@ mod tests {
         let mut mem = TablePool::new(&tables, POOL_BASE);
         // A kernel that claims to live inside direct-mapped RAM: in 4 KiB pages, and inside
         // a 2 MiB page.
-        let err = build(&mut mem, 0x1000, &regions(), &segments()).unwrap_err();
+        let err = build(&mut mem, 0x1000, &regions(), &segments(), KERNEL + 0xE000).unwrap_err();
         assert_eq!(err, MapError::AlreadyMapped(0x1000));
         let tables = pool(64);
         let mut mem = TablePool::new(&tables, POOL_BASE);
-        let err = build(&mut mem, 0x20_0000, &regions(), &segments()).unwrap_err();
+        let err = build(
+            &mut mem,
+            0x20_0000,
+            &regions(),
+            &segments(),
+            KERNEL + 0xE000,
+        )
+        .unwrap_err();
         assert_eq!(err, MapError::LargePage(0x20_0000));
         // A W+X segment (rejected earlier by the boot-info check) never becomes writable.
         let wx = segment(0, 1, SEGMENT_READ | SEGMENT_WRITE | SEGMENT_EXECUTE);
@@ -220,7 +235,7 @@ mod tests {
         let tables = pool(3);
         let mut mem = TablePool::new(&tables, POOL_BASE);
         assert_eq!(
-            build(&mut mem, KERNEL, &regions(), &segments()).unwrap_err(),
+            build(&mut mem, KERNEL, &regions(), &segments(), KERNEL + 0xE000).unwrap_err(),
             MapError::OutOfMemory
         );
     }

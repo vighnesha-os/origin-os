@@ -192,8 +192,14 @@ fn init_paging(
         return false;
     }
     let mut tables = TablePool::new(pool, pool_base);
-    let (space, stats) = match kernel_space::build(&mut tables, info.kernel_base, regions, segments)
-    {
+    let stack_guard = info.stack_base.wrapping_sub(PAGE);
+    let (space, stats) = match kernel_space::build(
+        &mut tables,
+        info.kernel_base,
+        regions,
+        segments,
+        stack_guard,
+    ) {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(com1, "origin-kernel: page tables not built: {e:?}");
@@ -267,6 +273,13 @@ fn prove_protections(
         ),
         // SAFETY: page 0 is RAM or unmapped, never MMIO.
         ("read of page 0", 0, 0x0, unsafe { cpu::probe_read(0) }),
+        (
+            "read of the boot stack's guard page",
+            info.stack_base - PAGE,
+            0x0,
+            // SAFETY: the guard is a RAM page of the KernelStack region, not MMIO.
+            unsafe { cpu::probe_read(info.stack_base - PAGE) },
+        ),
     ];
     let mut all = true;
     for (what, addr, expected, probe) in cases {

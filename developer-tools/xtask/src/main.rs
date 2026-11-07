@@ -113,6 +113,7 @@ fn boot_scenario() -> Scenario {
             "origin-kernel: page protection: instruction fetch from writable data at ".into(),
             "faulted (#PF error 0x11)".into(),
             "origin-kernel: page protection: read of page 0 at 0x0 faulted (#PF error 0x0)".into(),
+            "origin-kernel: page protection: read of the boot stack's guard page at ".into(),
             // After the switch, so this also proves the direct map.
             "origin-kernel: allocated, wrote and freed 3 frames at ".into(),
             "origin-kernel: heap: Vec of 100000 u64, 2000 boxes, B-tree of 1000 keys, a string: "

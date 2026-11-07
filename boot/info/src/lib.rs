@@ -146,7 +146,8 @@ pub struct BootInfo {
     pub acpi_rsdp: u64,
     /// Physical address of the UEFI system table, for runtime services, or 0.
     pub uefi_system_table: u64,
-    /// Lowest address of the stack the kernel starts on.
+    /// Lowest address of the stack the kernel starts on. The 4 KiB page below it belongs
+    /// to the same `KernelStack` region and is a guard page: the kernel never maps it.
     pub stack_base: u64,
     /// Size of that stack in bytes.
     pub stack_size: u64,

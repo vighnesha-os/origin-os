@@ -225,8 +225,11 @@ fn boot(
     })?;
 
     // B4: stack, boot info and memory-map buffer, all allocated before the final map.
-    let stack = allocate(&bs, memory_type::OS_KERNEL_STACK, STACK_PAGES)
+    // One extra page below the stack, in the same KernelStack region: the kernel leaves it
+    // unmapped as a guard (boot info 0.2).
+    let stack = allocate(&bs, memory_type::OS_KERNEL_STACK, STACK_PAGES + 1)
         .map_err(|s| fail(out, s, format_args!("cannot allocate the kernel stack")))?;
+    let stack = stack + PAGE as u64;
     let (probe_size, descriptor_size) = probe_memory_map(&bs)
         .map_err(|s| fail(out, s, format_args!("cannot size the memory map: {s:?}")))?;
     let capacity = probe_size / descriptor_size.max(1) + MAP_SLACK;
