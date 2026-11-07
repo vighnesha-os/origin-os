@@ -559,6 +559,16 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 5 `raster` tests (fills and clipping at every edge, the blend arithmetic, a clipped blit, surface-construction validation, the deterministic demo and its CRC); 132 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** a text/font engine (CLAUDE.md §51), drawing to a real framebuffer (no GOP framebuffer in boot info yet), damage tracking and the compositor (§52), and hardware-accelerated rendering.
 
+### PS/2 keyboard: scancode decoding and i8042 bring-up (CLAUDE.md §56; 2026-11-08)
+
+- **What:**
+  - `ps2` (library): scan-code set 1 decoding. A `Decoder` turns bytes into key events (make/break, the `0xE0` extended prefix handled across calls, the `0xE1` pause sequence ignored), a US QWERTY `to_char` with a `Modifiers` state machine (Shift, Ctrl, Alt, Caps Lock, with Caps Lock affecting only letters and Shift the symbols). The tables are authored from the published set-1 assignments, not copied.
+  - `i8042` (binary): controller bring-up after `ExitBootServices` — disable both ports, flush, read and rewrite the config byte (clearing the IRQ and translation bits for now), the controller self-test (0xAA → 0x55), the keyboard-port test (0xAB → 0x00), then enable the keyboard port. Every status-register wait is bounded (a million polls), so a missing controller cannot hang the kernel.
+- **Proof** (every boot): "i8042: config 0x77; self-test 0x55 (want 0x55), keyboard port test 0x00 (want 0x00)". QEMU's emulated controller answers deterministically.
+- **Negative control** (failing the boot test): the self-test command byte changed from 0xAA to 0xAB, so the controller returns the port-test result 0x00 instead of 0x55 → "i8042 failed".
+- **Test evidence:** 7 `ps2` tests (lower case with releases, Shift capitals and symbols, Caps Lock on letters only, Ctrl typing nothing, the extended keys, make/break and function keys, and typing the whole string "Origin OS!"); 139 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** live keystrokes need the keyboard IRQ (vector routing through the I/O APIC, not wired yet), the keyboard device reset and LED/typematic control, scancode set 2 without translation, USB HID keyboards, and other layouts.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

@@ -32,6 +32,7 @@
 //!   shared with the loader);
 //! - [`pci`]: the MCFG, ECAM addressing, configuration headers, enumeration and BAR
 //!   sizing over an abstract configuration space;
+//! - [`ps2`]: PS/2 set-1 scancode decoding and the US keyboard layout;
 //! - [`raster`]: a 2D software rasterizer (fills, blits, alpha blend) for the UI;
 //! - [`runqueue`]: the per-CPU round-robin run queue (scheduler policy);
 //! - [`serial`]: a polled 16550 UART driver over an abstract register interface;
@@ -66,6 +67,7 @@ pub mod heap;
 pub mod nvme;
 pub use origin_paging as paging;
 pub mod pci;
+pub mod ps2;
 pub mod raster;
 pub mod report;
 pub mod rtc;

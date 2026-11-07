@@ -35,6 +35,7 @@ mod block;
 mod console;
 mod cpu;
 mod firmware;
+mod i8042;
 mod memory;
 mod pcie;
 mod phys;
@@ -243,6 +244,8 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // M8 groundwork: the software rasterizer draws a fixed scene whose CRC must match the
     // host-proven one, bit for bit.
     prove_raster(&mut com1);
+    // M10 groundwork: the i8042 PS/2 controller bring-up (CLAUDE.md §56).
+    i8042::init(&mut com1);
 
     let _ = report::write_halt(&mut com1);
     halt()
