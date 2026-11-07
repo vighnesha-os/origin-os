@@ -275,6 +275,11 @@ pub(crate) fn enable_msix(at: Address, msix: &pci::Msix) -> Option<u32> {
     })
 }
 
+/// How many PCIe functions were enumerated.
+pub(crate) fn device_count() -> usize {
+    crate::cpu::without_interrupts(|| DEVICES.read().len())
+}
+
 /// The first listed function of this class, subclass and programming interface.
 pub(crate) fn find(class: u8, subclass: u8, prog_if: u8) -> Option<Device> {
     crate::cpu::without_interrupts(|| {

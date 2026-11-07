@@ -609,6 +609,16 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 6 `net` tests (UDP among them) and 4 `timers` tests; 157 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** wiring the timer queue under the scheduler's sleeps and socket timeouts (it stands alone so far), a binary-heap implementation, and UDP/TCP port demultiplexing to sockets.
 
+### Integration: a `/sys` info tree in the VFS, and a verification pass (2026-11-08)
+
+- **What:** a boot step builds a read-only `/sys`-style tree in the in-memory VFS from facts several subsystems discovered — `/sys/mem/free_mib` (the frame allocator), `/sys/cpu/tsc_mhz` (the clock), `/sys/bus/pci/count` (`pcie::device_count`) and `/sys/block/nvme0/size_mib` (`storage::geometry`) — then reads a value back and checks it parses to the discovered number. It shows the VFS carrying a live system namespace built from real hardware state, tying the memory, clock, PCIe, NVMe and VFS subsystems together.
+- **Proof** (every boot): "sysfs: built /sys with 4 facts (4 subtrees): mem/free_mib=503, cpu/tsc_mhz=999, bus/pci/count=6, block/nvme0/size_mib=16; read back pci count Some(6)". The PCIe count (6) and disk size (16 MiB) are deterministic in QEMU; free MiB and the TSC MHz vary and are reported, not asserted.
+- **Negative control** (failing the boot test): a wrong value stored for the PCIe count → the read-back (7) no longer matches the discovered count (6) → "sysfs failed".
+- **Verification pass (2026-11-08):**
+  - The whole workspace: 27 test suites, 396 tests, 0 failures (1 ignored).
+  - An 8-processor boot (`ORIGIN_QEMU_SMP=8`): all 8 online, the scheduler on every one, the clock consistent across 8 (0 backwards), and 8 per-CPU NVMe queues doing I/O at once.
+  - A 40x parser-mutation soak (`ORIGIN_MUTATION_SCALE=40`, release): ~800,000 parser cases and ~4,000,000 RTC cases over the firmware/device parsers, 0 failures, in about 7 s.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.

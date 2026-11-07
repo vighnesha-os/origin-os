@@ -252,9 +252,74 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     prove_tcp(&mut com1);
     // The monotonic timer queue, driven by the real clock (CLAUDE.md §68).
     prove_timers(&mut com1);
+    // Integration: a read-only /sys tree in the VFS carrying live discovered facts.
+    prove_sysfs(&mut com1);
 
     let _ = report::write_halt(&mut com1);
     halt()
+}
+
+/// Builds a read-only `/sys`-style tree in the VFS from facts several subsystems
+/// discovered (free memory, the TSC rate, the PCIe device count, the NVMe disk size),
+/// then reads values back and checks they parse to the discovered numbers. This shows the
+/// VFS carrying a live system namespace built from real hardware state.
+fn prove_sysfs(com1: &mut console::Console) {
+    use framekernel::vfs::Vfs;
+    // Gather the facts.
+    let free_mib = memory::stats().map_or(0, |(_, free)| (free * memory::FRAME) >> 20);
+    let tsc_mhz = time::tsc_hz() / 1_000_000;
+    let pci = pcie::device_count() as u64;
+    let disk_mib = storage::geometry().map_or(0, |(bs, blocks)| (blocks * u64::from(bs)) >> 20);
+
+    // Build the tree.
+    let mut fs = Vfs::new(1 << 16, 64);
+    let mut n = 0u64;
+    let mut write = |fs: &mut Vfs, path: &str, value: u64| {
+        if fs
+            .mkdir_all(path.rsplit_once('/').map_or("/", |(dir, _)| dir))
+            .is_ok()
+            && fs.create(path).is_ok()
+        {
+            let mut buf = [0u8; 20];
+            let text = format_u64(value, &mut buf);
+            if fs.write(path, 0, text).is_ok() {
+                n += 1;
+            }
+        }
+    };
+    write(&mut fs, "/sys/mem/free_mib", free_mib);
+    write(&mut fs, "/sys/cpu/tsc_mhz", tsc_mhz);
+    write(&mut fs, "/sys/bus/pci/count", pci);
+    write(&mut fs, "/sys/block/nvme0/size_mib", disk_mib);
+
+    // Read one value back and check it parses to the discovered number.
+    let mut buf = [0u8; 32];
+    let read = fs.read("/sys/bus/pci/count", 0, &mut buf).unwrap_or(0);
+    let parsed = core::str::from_utf8(&buf[..read])
+        .ok()
+        .and_then(|t| t.parse::<u64>().ok());
+    let dirs = fs.list("/sys").map(|v| v.len()).unwrap_or(0);
+    let ok = n == 4 && parsed == Some(pci) && dirs == 4;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: sysfs: built /sys with {n} facts ({dirs} subtrees): mem/free_mib={free_mib}, cpu/tsc_mhz={tsc_mhz}, bus/pci/count={pci}, block/nvme0/size_mib={disk_mib}; read back pci count {parsed:?}{}",
+        if ok { "" } else { ": sysfs failed" }
+    );
+}
+
+/// Writes `value` as decimal into `buf`, returning the written slice.
+fn format_u64(value: u64, buf: &mut [u8; 20]) -> &[u8] {
+    let mut v = value;
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    &buf[i..]
 }
 
 /// Proves the monotonic timer queue against the real clock: three timers armed at
