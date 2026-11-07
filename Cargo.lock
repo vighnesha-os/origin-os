@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "framekernel"
+version = "0.0.0"
+dependencies = [
+ "origin-boot-info",
+ "origin-version",
+]
+
+[[package]]
 name = "onbf-format"
 version = "0.0.0"
 dependencies = [
