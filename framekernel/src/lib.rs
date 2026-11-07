@@ -41,6 +41,7 @@
 //! - [`initramfs`]: extracting a ustar archive into the VFS, with a path-traversal guard;
 //! - [`ioapic`]: I/O APIC redirection-table encoding;
 //! - [`json`]: a depth-limited JSON parser (config, manifests, SDK data);
+//! - [`klog`]: a bounded kernel log ring (level + inline message, drop-oldest);
 //! - [`net`]: Ethernet/IPv4/ICMP/ARP headers and the Internet checksum;
 //! - [`numa`]: a locality map (CPU/address → node, nearest-node order) from the SRAT/SLIT;
 //! - [`originfs`]: a read-only OriginFS on-disk parser and image builder (ADR-0006,
@@ -105,6 +106,7 @@ pub mod hpet;
 pub mod initramfs;
 pub mod ioapic;
 pub mod json;
+pub mod klog;
 pub mod net;
 pub mod numa;
 pub mod nvme;

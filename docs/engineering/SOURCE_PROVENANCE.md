@@ -863,6 +863,15 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Not done:** a generic key type (this is `String`-keyed; a `Hash`-like trait would generalize it), a keyed hash to resist collision-flooding from untrusted keys (SipHash, which needs its own test vectors and review, §58/§59), backward-shift deletion to avoid tombstone buildup, and adopting it inside `vfs`/`handles`.
 - **Licensing:** project licence not chosen yet.
 
+### Bounded kernel log buffer (CLAUDE.md §69 structured logging and failure records; 2026-11-08)
+
+- **What:** `klog::Log` is a `dmesg`-style ring of fixed-size records (a `Level` and an inline, UTF-8 message truncated to `MSG_CAP` = 120 bytes on a scalar boundary), built on `ring::Ring`. `log(level, msg)` retains the most recent records and drops the oldest when full, counting drops and the running total; `drain` reads them oldest-first. Each record stores its message inline (no per-line allocation), so a logger can run where allocation is undesirable. Pure, no `unsafe`.
+- **Why:** the kernel currently writes to the console but retains nothing; §69 wants structured logging and persistent failure records (a crash-diagnostics buffer, a readable `/sys/kernel/log`). This is the retention structure those build on.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3).
+- **Test evidence (2026-11-08):** 4 `klog` tests — retaining the most recent N records and dropping the oldest (with the drop and total counts, and the kept lines in order); levels and messages recorded and read back; a long multi-byte message truncated on a UTF-8 boundary (valid, no split scalar, the exact scalar count that fits); and capacity-one keeping only the latest. 264 library tests in all; `cargo xtask check`. Host-only groundwork — **not yet wired to the console or `/sys`** (that integration touches the boot output path and is a separate, careful change).
+- **Not done:** teeing the kernel console into the log, exposing it through `/sys`, a global logger behind a lock, and persisting the buffer across a panic for crash diagnostics (§69).
+- **Licensing:** project licence not chosen yet.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.
