@@ -419,6 +419,92 @@ mod tests {
         assert_eq!(decode(&r), Err(Field::Second));
     }
 
+    /// Encodes `t` as the RTC would in `mode` (register B's binary and 24-hour bits).
+    fn encode(t: DateTime, mode: u8, century: bool) -> Registers {
+        let enc = |v: u8| {
+            if mode & MODE_BINARY != 0 {
+                v
+            } else {
+                ((v / 10) << 4) | (v % 10)
+            }
+        };
+        let hours = if mode & MODE_24_HOUR != 0 {
+            enc(t.hour)
+        } else {
+            let (h, pm) = match t.hour {
+                0 => (12, false),
+                1..=11 => (t.hour, false),
+                12 => (12, true),
+                h => (h - 12, true),
+            };
+            enc(h) | if pm { 0x80 } else { 0 }
+        };
+        Registers {
+            seconds: enc(t.second),
+            minutes: enc(t.minute),
+            hours,
+            day: enc(t.day),
+            month: enc(t.month),
+            year: enc((t.year % 100) as u8),
+            century: century.then(|| enc((t.year / 100) as u8)),
+            status_b: mode,
+        }
+    }
+
+    /// Every real date round-trips through each register encoding, and one corrupted
+    /// register never decodes to anything but a real date (CLAUDE.md §72).
+    #[test]
+    fn encodings_round_trip_and_corrupted_registers_decode_only_to_real_dates() {
+        let mut rng = crate::testing::Rng::new(0x5254_4331);
+        let (mut corrupted_accepted, mut corrupted_refused) = (0, 0);
+        for case in 0..crate::testing::cases(100_000) {
+            let unix = rng.next() % 4_102_444_800; // 1970 to 2099
+            let mut t = DateTime::from_unix_seconds(unix).unwrap();
+            if t.year < 2000 {
+                t.year += 100; // without a century register the RTC means 20xx
+            }
+            let mode = [0, MODE_24_HOUR, MODE_BINARY, MODE_24_HOUR | MODE_BINARY][rng.below(4)];
+            let century = rng.below(2) == 0;
+            let mut r = encode(t, mode, century);
+            if t.day <= days_in_month(u64::from(t.year), t.month) {
+                assert_eq!(decode(&r), Ok(t), "case {case}: {r:?}");
+            }
+            // One register replaced with a random value.
+            let v = rng.byte();
+            match rng.below(7) {
+                0 => r.seconds = v,
+                1 => r.minutes = v,
+                2 => r.hours = v,
+                3 => r.day = v,
+                4 => r.month = v,
+                5 => r.year = v,
+                _ => r.century = Some(v),
+            }
+            match decode(&r) {
+                Ok(d) => {
+                    corrupted_accepted += 1;
+                    assert!(
+                        d.second <= 59 && d.minute <= 59 && d.hour <= 23,
+                        "case {case}: {d:?}"
+                    );
+                    assert!((1..=12).contains(&d.month), "case {case}: {d:?}");
+                    assert!(
+                        d.day >= 1 && d.day <= days_in_month(u64::from(d.year), d.month),
+                        "case {case}: {d:?}"
+                    );
+                    let back = d.unix_seconds().unwrap();
+                    assert_eq!(DateTime::from_unix_seconds(back), Some(d), "case {case}");
+                }
+                Err(_) => corrupted_refused += 1,
+            }
+        }
+        // Both outcomes were reached many times.
+        assert!(
+            corrupted_accepted > 10_000 && corrupted_refused > 10_000,
+            "{corrupted_accepted} accepted, {corrupted_refused} refused"
+        );
+    }
+
     #[test]
     fn invalid_dates_have_no_unix_time() {
         assert_eq!(dt(1969, 12, 31, 23, 59, 59).unix_seconds(), None);

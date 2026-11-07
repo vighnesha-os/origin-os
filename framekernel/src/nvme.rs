@@ -568,6 +568,49 @@ mod tests {
         assert_eq!(text(b"    "), "");
     }
 
+    /// Random Identify data never panics the parsers; an accepted namespace has a block
+    /// size from 512 B to 64 KiB and at least one block; text fields are printable.
+    #[test]
+    fn mutations_of_identify_data_never_panic() {
+        use crate::testing::{Rng, mutate};
+        let mut rng = Rng::new(0x4E56_4D45);
+        let mut accepted = 0;
+        for case in 0..crate::testing::cases(3000) {
+            let mut d = identify_data().to_vec();
+            // Namespace fields too: two formats, the first of 512-byte blocks.
+            d[0..8].copy_from_slice(&32768u64.to_le_bytes());
+            d[25] = 1;
+            d[26] = 0;
+            d[128..132].copy_from_slice(&(9u32 << 16).to_le_bytes());
+            mutate(&mut d, &mut rng);
+            d.resize(4096, 0);
+            let page: [u8; 4096] = d.try_into().unwrap();
+            let c = identify_controller(&page);
+            for field in [&c.serial[..], &c.model[..], &c.firmware[..]] {
+                assert!(
+                    text(field).bytes().all(|b| (0x20..0x7F).contains(&b)),
+                    "case {case}"
+                );
+            }
+            if let Some(ns) = identify_namespace(&page) {
+                assert!(
+                    ns.blocks > 0 && ns.block_size.is_power_of_two(),
+                    "case {case}"
+                );
+                assert!((512..=65536).contains(&ns.block_size), "case {case}");
+                accepted += 1;
+            }
+            // Any completion dwords decode.
+            let _ = Completion::decode([
+                rng.next() as u32,
+                rng.next() as u32,
+                rng.next() as u32,
+                rng.next() as u32,
+            ]);
+        }
+        assert!(accepted > 1000, "{accepted}");
+    }
+
     #[test]
     fn identify_namespace_fields() {
         let mut d = [0u8; 4096];

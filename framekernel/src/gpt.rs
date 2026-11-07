@@ -466,6 +466,78 @@ mod tests {
         );
     }
 
+    /// Whatever a disk holds, parsing never panics, and anything accepted keeps the
+    /// invariants: a header whose CRC really matches, a usable range inside the disk, and
+    /// partitions inside it that never overlap.
+    #[test]
+    fn mutations_never_panic_and_accepted_tables_keep_their_invariants() {
+        use crate::testing::{Rng, mutate};
+        let none = Partition {
+            index: 0,
+            kind: Guid::default(),
+            unique: Guid::default(),
+            first: 0,
+            last: 0,
+            attributes: 0,
+            name: [0; 36],
+        };
+        let array = entries(&[
+            (1, 2048, 2999, "Origin system A"),
+            (2, 3000, DISK - 34, "Origin data"),
+        ]);
+        let good = header(1, DISK - 1, 2, &array);
+        let mut rng = Rng::new(0x6770_7431);
+        let (mut headers, mut tables) = (0, 0);
+        for case in 0..crate::testing::cases(4000) {
+            let mut h = good.clone();
+            let mut a = array.clone();
+            if case % 2 == 0 {
+                mutate(&mut h, &mut rng);
+            } else {
+                mutate(&mut a, &mut rng);
+            }
+            // Half the cases re-seal both CRCs, so the checks behind them are reached.
+            if case % 4 >= 2 && h.len() >= 92 && a.len() >= 16384 {
+                let crc = crc32(&a[..16384]);
+                h[88..92].copy_from_slice(&crc.to_le_bytes());
+                seal(&mut h);
+            }
+            let Ok(parsed) = parse_header(&h, 1, DISK) else {
+                continue;
+            };
+            headers += 1;
+            let size = u32_at(&h, 12) as usize;
+            let mut check = h[..size].to_vec();
+            check[16..20].fill(0);
+            assert_eq!(crc32(&check), u32_at(&h, 16), "case {case}");
+            assert!(
+                parsed.first_usable <= parsed.last_usable && parsed.last_usable < DISK - 1,
+                "case {case}"
+            );
+            let mut out = [none; 8];
+            if let Ok(n) = parse_entries(&a, &parsed, &mut out) {
+                tables += 1;
+                let parts = &out[..n];
+                for (i, p) in parts.iter().enumerate() {
+                    assert!(
+                        p.first <= p.last
+                            && p.first >= parsed.first_usable
+                            && p.last <= parsed.last_usable,
+                        "case {case}"
+                    );
+                    for q in &parts[i + 1..] {
+                        assert!(p.last < q.first || q.last < p.first, "case {case}: overlap");
+                    }
+                }
+            }
+        }
+        // The mutations really reached the semantic checks, not only the CRCs.
+        assert!(
+            headers > 500 && tables > 300,
+            "{headers} headers, {tables} tables"
+        );
+    }
+
     #[test]
     fn entry_checks() {
         let none = Partition {

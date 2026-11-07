@@ -407,6 +407,68 @@ mod tests {
         assert!(parse_fadt(&qemu[..111]).is_ok());
     }
 
+    /// Random firmware tables never panic the parsers, and anything accepted is
+    /// self-consistent: checksums sum to zero, MADT processors are listed once each, a
+    /// century register is in the standard bank.
+    #[test]
+    fn mutations_never_panic_and_accepted_tables_are_consistent() {
+        use crate::testing::{Rng, mutate};
+        let mut rng = Rng::new(0xAC91);
+        let good_rsdp = rsdp(0x1FB7_D0E8);
+        let good_madt = madt(&[
+            &lapic(0, 0, 1),
+            &lapic(1, 1, 1),
+            &x2apic(300, 1, 7),
+            &[1, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ]);
+        let mut fadt_body = vec![0u8; 240];
+        fadt_body[FADT_CENTURY - 36] = 0x32;
+        let good_fadt = table(b"FACP", &fadt_body);
+        let mut accepted = [0u32; 3];
+        for case in 0..crate::testing::cases(6000) {
+            let mut r = good_rsdp.clone();
+            mutate(&mut r, &mut rng);
+            if let Ok(p) = parse_rsdp(&r) {
+                assert!(p.revision >= 2, "case {case}");
+                assert!(
+                    sums_to_zero(&r[..20]) && sums_to_zero(&r[..36]),
+                    "case {case}"
+                );
+                accepted[0] += 1;
+            }
+            let mut m = good_madt.clone();
+            mutate(&mut m, &mut rng);
+            if case % 2 == 0 && m.len() >= 36 {
+                let len = m.len() as u32;
+                m[4..8].copy_from_slice(&len.to_le_bytes());
+                fix_checksum(&mut m, 9);
+            }
+            if check_table(&m, b"APIC").is_ok() {
+                assert!(sums_to_zero(&m), "case {case}");
+                let mut out = [Processor::default(); 8];
+                if let Ok(n) = madt_processors(&m, &mut out) {
+                    accepted[1] += 1;
+                    for (i, p) in out[..n].iter().enumerate() {
+                        assert!(
+                            out[i + 1..n].iter().all(|q| q.apic_id != p.apic_id),
+                            "case {case}"
+                        );
+                    }
+                }
+            }
+            let mut f = good_fadt.clone();
+            mutate(&mut f, &mut rng);
+            if let Ok(fadt) = parse_fadt(&f) {
+                assert!(
+                    fadt.century.is_none_or(|c| (0x0E..=0x7F).contains(&c)),
+                    "case {case}"
+                );
+                accepted[2] += 1;
+            }
+        }
+        assert!(accepted.iter().all(|&n| n > 100), "{accepted:?}");
+    }
+
     #[test]
     fn malformed_madt_structures_are_refused() {
         for bad in [

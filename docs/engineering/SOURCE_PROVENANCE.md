@@ -425,6 +425,18 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 5 `gpt` tests: the CRC check value and incremental updates; GUID text; a valid disk with agreeing copies; header checks (signature, revision, size, the CRC and the bytes it does not cover, MyLBA, entry size and count, layout); entry checks (ranges, overlap, capacity, a flipped array bit, a short array). Also `cargo xtask check` and `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** restoring a corrupt copy (the kernel only reports it), MBR-only disks, a block layer and volumes above partitions, and a filesystem.
 
+### Seeded mutation tests for the firmware and device parsers (CLAUDE.md §72; 2026-11-07)
+
+- **What:** `testing` (test-only) holds xorshift64\* and a mutator: bit flips, random and boundary bytes, truncation, extension and chunk copies, one to four per case. Each parser gets a test that it never panics on mutated valid input and that anything it accepts keeps its invariants:
+  - **GPT:** the header CRC really matches; the usable range lies inside the disk; partitions lie inside it and never overlap. Half the cases re-seal both CRCs after mutating, so the semantic checks behind them are reached: over 500 headers and 300 tables were accepted per default run.
+  - **ACPI:** an accepted RSDP sums to zero over both checksum ranges; MADT processors are each listed once (half the cases re-sealed); an accepted FADT's century register is in the standard bank.
+  - **PCI:** accepted MCFG windows are 1 MiB-aligned and do not wrap; random sizing masks give only powers of two.
+  - **NVMe:** accepted Identify Namespace data has 512 B–64 KiB blocks and at least one block; Identify text fields are printable; any completion decodes.
+  - **RTC:** every date from 1970 to 2099 round-trips through each register encoding (BCD or binary, 12- or 24-hour, with or without a century register). A single corrupted register decodes only to a real date, and both outcomes are reached over 10 000 times.
+- **Scale:** the default run is about 20 000 parser cases plus 100 000 RTC cases, in 0.8 s with all 101 library tests. `ORIGIN_MUTATION_SCALE=n` multiplies the counts. A 50× release run (about a million parser cases and 5 million RTC cases) passed in 9 s.
+- **Result:** no parser bug was found. The two first-run failures were in the tests themselves (shared Identify data, and random registers that are almost never a date) and were redesigned.
+- **Not done:** coverage-guided fuzzing (cargo-fuzz needs nightly, against CLAUDE.md §12), and Kani proofs of the same properties (§73).
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

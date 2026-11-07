@@ -63,3 +63,5 @@ pub mod report;
 pub mod rtc;
 pub mod runqueue;
 pub mod serial;
+#[cfg(test)]
+mod testing;

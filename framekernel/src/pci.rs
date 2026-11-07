@@ -599,6 +599,48 @@ mod tests {
         assert_eq!(io_size(0x1), None);
     }
 
+    /// Random MCFG bodies never panic, and every accepted window is aligned and inside the
+    /// address space; random sizing masks give only powers of two.
+    #[test]
+    fn mutations_never_panic_and_accepted_windows_are_sane() {
+        use crate::testing::{Rng, mutate};
+        let mut rng = Rng::new(0x5043_4945);
+        let mut good = vec![0u8; 44];
+        for (base, start, end) in [(0xB000_0000u64, 0u8, 255u8), (0xE000_0000, 0x80, 0x8F)] {
+            good.extend(base.to_le_bytes());
+            good.extend([0, 0, start, end, 0, 0, 0, 0]);
+        }
+        let mut accepted = 0;
+        for case in 0..crate::testing::cases(5000) {
+            let mut t = good.clone();
+            mutate(&mut t, &mut rng);
+            let mut out = [Ecam::default(); 4];
+            if let Ok(n) = mcfg_allocations(&t, &mut out) {
+                accepted += 1;
+                for e in &out[..n] {
+                    let (start, len) = e.window().unwrap();
+                    assert!(
+                        e.base.is_multiple_of(1 << 20) && start.checked_add(len).is_some(),
+                        "case {case}"
+                    );
+                    assert!(e.start_bus <= e.end_bus, "case {case}");
+                }
+            }
+            let mask = rng.next() as u32;
+            for size in [
+                memory_size_32(mask),
+                io_size(mask),
+                memory_size_64(mask, rng.next() as u32),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(size.is_power_of_two(), "case {case}: {mask:#x}");
+            }
+        }
+        assert!(accepted > 500, "{accepted}");
+    }
+
     #[test]
     fn mcfg_allocations_are_checked() {
         let mut t = vec![0u8; 44];
