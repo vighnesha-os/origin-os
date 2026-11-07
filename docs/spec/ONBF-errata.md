@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Applies to | `docs/spec/ONBF.md` v1.0 (design), accepted 2026-11-07 |
-| Status | **C1–C14 decided by the owner on 2026-11-07. G1–G5 are open.** |
+| Status | **C1–C14 and G2–G5 decided by the owner on 2026-11-07. G1 is open.** |
 | Found by | Implementing `runtime/onbf/format` (`onbf-format`) against §4, 2026-11-07 |
 | Byte layouts | Unchanged. Every item below is a validation rule or a missing definition, not a new field. |
 
@@ -32,23 +32,27 @@ ONBF-R6 requires that a file have exactly one valid reading, and §13 item 6 say
 | C13 | §4.4 | Unknown kinds without REQUIRED could be skipped ("MAY"). | **Reject all unknown kinds** (the owner's choice; it differs from the recommendation to skip them). An unknown kind is rejected with or without REQUIRED. This is permitted by §4.4, because skipping was only a MAY. Adding a new section kind therefore needs an OS update before files that use it can be opened. |
 | C14 | §4.3 | The spec does not say whether a section may be empty. | **Empty SEGMENT only** (a change to the parser). Only a SEGMENT may have `content_size = 0`, as zero-filled memory (bss), and it must have `mem_size > 0`. Any other empty section is rejected, so "nothing" has one encoding: absent. |
 
+## Decided gaps
+
+| # | Spec | Gap | Decision (2026-11-07) | Enforced by |
+|---|---|---|---|---|
+| G2 | §4.6 step 2 | In `hL[j] = SHA-256(0x01 ‖ le8(L) ‖ le64(j) ‖ hash_block_j)`, it was unclear whether L is the level of the hash being produced or the level of the hashes inside the block. | **L is the level of the hash being produced**, which matches the spec's notation `hL`. Leaf hashes are level 0, so hashing a hash block of level-0 hashes gives `h1[j]` with `L = 1`, and so on upward. `j` is the hash's index within its level. | `onbf-merkle` (next) |
+| G3 | §4.6 step 3 | `le8(levels)` in the root was not defined beyond the single-block case. | **`levels` is the level of the top hash**: `top = h_levels[0]`. It is 0 for empty content or a single 4 KiB block, 1 for 2–128 blocks, 2 for 129–16,384, and so on. It equals the number of hash-block levels stored in the MERKLE section and agrees with `merkle_hash_blocks`. | `onbf-merkle` (next); `onbf-format` sizes MERKLE sections this way |
+| G4 | §4.3, §6.1 | Segment `mem_size` alignment, and the order and overlap of segment memory ranges, were not stated. | **Page-multiple, sorted, disjoint.** A SEGMENT's `mem_size`, like its `mem_offset`, is a multiple of 4 KiB. SEGMENT sections appear in ascending `mem_offset` order (table order) and never overlap. Unmapped gaps, such as guard pages, are allowed. Every segment ends within the 2 GiB image span (`mem_offset + mem_size ≤ 2^31`) in EXE, LIB and KRN. The Appendix A limit of 16 segments applies to EXE and LIB. | `onbf-format` (`MemoryLayout`, `SegmentOrder`, `SegmentSpan`, `TooManySegments`) |
+| G5 | §4.3, §4.4 | After C13, REQUIRED no longer changed anything for a v1 reader except on MANIFEST. | **REQUIRED is set on every section.** That is truthful in v1, because every section must be understood, and gives one encoding. Writers (`onbf-pack`, the SDK tools) always set it. The bit keeps its meaning in case a future major version brings optional kinds back. | `onbf-format` (`RequiredNotSet`) |
+
 ## Open gaps
 
 | # | Spec | Gap | Who needs it |
 |---|---|---|---|
 | G1 | §6.5, §4.4 | The SYM profile holds "DWARF and line tables", but §4.4 has no section kind for them. A SYM image can currently contain only MANIFEST and MERKLE. Under C13, adding a kind is a format change. | SYM producer and symbolizer (M6) |
-| G2 | §4.6 step 2 | In `hL[j] = SHA-256(0x01 ‖ le8(L) ‖ …)`, it is unclear whether L is the level of the hash being produced or the level of the hash block being hashed. | `onbf-merkle` |
-| G3 | §4.6 step 3 | `le8(levels)` is not defined. The parser assumes it is the number of hash-block levels: 0 for content of at most one block, 1 for 2–128 blocks, and so on. | `onbf-merkle` |
-| G4 | §4.3, §6.1 | Segment `mem_size` alignment and non-overlap of segment memory ranges are not stated. They belong to the EXE/LIB/KRN profile layer, not the container. | KRN loader (M1 step 2), Loader Service |
-| G5 | §4.3, §4.4 | **This gap follows from C13.** For a v1 reader, REQUIRED no longer changes anything, except that a MANIFEST must have it set. On every other known kind it is a free bit (still covered by `content_digest`). Possible fixes: fix its value per kind (for example, set on every known kind), or reserve it for v2. | `onbf-pack`; the owner |
 
 ## Observed by the bit-flip sweep
 
 Flipping every bit of the header and section table of a valid KRN image shows which fields can take another valid value without being rejected:
 - `format_minor` and `content_digest`;
 - the entry digests;
-- segment permissions and placement;
-- REQUIRED on kinds other than MANIFEST (G5);
+- segment permissions, and segment placements that stay page-aligned, ordered and disjoint;
 - `profile`, because KRN's sections are also valid in LIB.
 
-**All of them are covered by `content_digest`, and the signed statement names the profile (§7.1)**, so none can change undetected. Since C12, a manifest's `compression` is no longer among them.
+**All of them are covered by `content_digest`, and the signed statement names the profile (§7.1)**, so none can change undetected. Two fields are no longer on this list: since C12, a manifest's `compression`, and since G5, the REQUIRED bit.

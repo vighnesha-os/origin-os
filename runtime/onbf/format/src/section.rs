@@ -12,6 +12,10 @@ pub const SMALL_ALIGN: u64 = 8;
 pub const MAX_SECTION_CONTENT: u64 = 1 << 40;
 /// Largest manifest (§5, Appendix A).
 pub const MAX_MANIFEST: u64 = 1 << 20;
+/// Largest image span: the end of the highest segment, as an RVA (Appendix A; errata G4).
+pub const MAX_IMAGE_SPAN: u64 = 1 << 31;
+/// Most SEGMENT sections in an EXE or LIB image (Appendix A).
+pub const MAX_SEGMENTS_EXE_LIB: u32 = 16;
 /// `merkle_index` value when the section has no MERKLE section.
 pub const NO_MERKLE: u32 = 0xFFFF_FFFF;
 /// Hashes per 4 KiB hash block (§4.6).
@@ -244,6 +248,11 @@ impl SectionEntry {
             }
             Some(_) => {}
         }
+        // Errata G5 (owner decision): every v1 section must be understood, so REQUIRED is
+        // set on every section, which gives the bit one encoding.
+        if !flags.has(Flags::REQUIRED) {
+            return Err(SectionError::RequiredNotSet);
+        }
 
         // Sizes and compression.
         let compression = match compression {
@@ -303,14 +312,16 @@ impl SectionEntry {
         // Manifest.
         if k == Kind::Manifest {
             let is_sha256 = integrity == Integrity::Sha256;
-            if !flags.has(Flags::REQUIRED) || content_size > MAX_MANIFEST || !is_sha256 {
+            if content_size > MAX_MANIFEST || !is_sha256 {
                 return Err(SectionError::ManifestRules);
             }
         }
 
-        // Memory placement.
+        // Memory placement. A SEGMENT's RVA and size are whole pages (errata G4), so one
+        // memory layout has one encoding and the loader maps whole pages without rounding.
         let memory_ok = if is_segment {
             mem_offset % PAGE_SIZE == 0
+                && mem_size % PAGE_SIZE == 0
                 && mem_size >= content_size
                 && mem_offset.checked_add(mem_size).is_some()
         } else {

@@ -44,8 +44,8 @@ pub use header::{
 };
 pub use image::{Image, ParseOptions, Section};
 pub use section::{
-    Compression, Flags, Integrity, Kind, MAX_MANIFEST, MAX_SECTION_CONTENT, NO_MERKLE, PAGE_SIZE,
-    SMALL_ALIGN, SectionEntry, merkle_hash_blocks,
+    Compression, Flags, Integrity, Kind, MAX_IMAGE_SPAN, MAX_MANIFEST, MAX_SECTION_CONTENT,
+    MAX_SEGMENTS_EXE_LIB, NO_MERKLE, PAGE_SIZE, SMALL_ALIGN, SectionEntry, merkle_hash_blocks,
 };
 
 #[cfg(test)]

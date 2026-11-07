@@ -42,6 +42,8 @@ pub enum Error {
     PaddingNotZero(u64),
     /// The image does not contain exactly one MANIFEST section (§4.4).
     ManifestCount,
+    /// An EXE or LIB image has more than 16 SEGMENT sections (Appendix A).
+    TooManySegments,
     /// A section entry breaks a rule; `index` is its position in the section table.
     Section {
         /// Position in the section table.
@@ -100,11 +102,19 @@ pub enum SectionError {
     MerkleReferences(u16),
     /// The `digest` field is not zero although the integrity mode carries no digest.
     DigestNotZero,
-    /// A MANIFEST without REQUIRED, or larger than 1 MiB (§5).
+    /// A MANIFEST larger than 1 MiB, or not using integrity 0 (§5, errata C12).
     ManifestRules,
-    /// `mem_offset` and `mem_size` break §4.3: a SEGMENT not 4 KiB aligned, smaller than
-    /// its content, or overflowing; or a non-SEGMENT with a memory placement.
+    /// REQUIRED is not set; every v1 section must have it (errata G5).
+    RequiredNotSet,
+    /// `mem_offset` and `mem_size` break §4.3 or errata G4: a SEGMENT whose RVA or size is
+    /// not a whole number of pages, that is smaller than its content, or that overflows; or
+    /// a non-SEGMENT with a memory placement.
     MemoryLayout,
+    /// A SEGMENT starts below the end of the previous SEGMENT: overlap, or not in ascending
+    /// memory order (errata G4).
+    SegmentOrder,
+    /// A SEGMENT ends beyond the 2 GiB image span (Appendix A, errata G4).
+    SegmentSpan,
     /// A reserved entry field is not zero (ONBF-R6).
     Reserved,
     /// `file_offset` is not the canonical position after the previous section.

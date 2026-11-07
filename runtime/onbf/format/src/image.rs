@@ -1,10 +1,11 @@
 //! Whole-image validation: header, section table and file layout (§4.1–§4.5).
 
 use crate::error::{Error, SectionError};
-use crate::header::{ENTRY_SIZE, HEADER_SIZE, Header};
+use crate::header::{ENTRY_SIZE, HEADER_SIZE, Header, Profile};
 use crate::read::{align_up, slice};
 use crate::section::{
-    Integrity, Kind, NO_MERKLE, PAGE_SIZE, SMALL_ALIGN, SectionEntry, merkle_hash_blocks,
+    Integrity, Kind, MAX_IMAGE_SPAN, MAX_SEGMENTS_EXE_LIB, NO_MERKLE, PAGE_SIZE, SMALL_ALIGN,
+    SectionEntry, merkle_hash_blocks,
 };
 
 /// What the caller vouches for before parsing.
@@ -82,11 +83,28 @@ impl<'a> Image<'a> {
         // Pass 1: each entry on its own, then its canonical position in the file.
         let mut pos = data_start;
         let mut manifests = 0u32;
+        let mut segments = 0u32;
+        // Errata G4: segments are in ascending, non-overlapping memory order (table order),
+        // and end within the 2 GiB image span. Gaps, for example guard pages, are allowed.
+        let mut segment_floor = 0u64;
         for (i, raw) in table.as_chunks::<128>().0.iter().enumerate() {
             let index = u16::try_from(i).map_err(|_| Error::SectionCount(u32::MAX))?;
             let entry = SectionEntry::parse(raw, header.profile, nested).map_err(at(index))?;
-            if entry.kind() == Kind::Manifest {
-                manifests = manifests.saturating_add(1);
+            match entry.kind() {
+                Kind::Manifest => manifests = manifests.saturating_add(1),
+                Kind::Segment => {
+                    segments = segments.saturating_add(1);
+                    if entry.mem_offset < segment_floor {
+                        return Err(at(index)(SectionError::SegmentOrder));
+                    }
+                    let mem_end = entry
+                        .mem_offset
+                        .checked_add(entry.mem_size)
+                        .filter(|&e| e <= MAX_IMAGE_SPAN)
+                        .ok_or(at(index)(SectionError::SegmentSpan))?;
+                    segment_floor = mem_end;
+                }
+                _ => {}
             }
             let expected = align_up(pos, entry.file_alignment()).ok_or(Error::Truncated)?;
             if entry.file_offset != expected {
@@ -104,6 +122,10 @@ impl<'a> Image<'a> {
         }
         if manifests != 1 {
             return Err(Error::ManifestCount);
+        }
+        if matches!(header.profile, Profile::Exe | Profile::Lib) && segments > MAX_SEGMENTS_EXE_LIB
+        {
+            return Err(Error::TooManySegments);
         }
 
         // The signature block, if any, is the last item and ends exactly at EOF (§4.1).

@@ -160,13 +160,25 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - C12 makes manifests uncompressed only;
     - C14 allows empty sections only for SEGMENT;
     - C13 rejects every unknown kind. That was the owner's choice, against the recommendation to skip optional ones.
+  - The owner's G4 and G5 decisions are enforced here:
+    - segments are page-sized, in ascending memory order, disjoint, and end within the 2 GiB span, with at most 16 in EXE/LIB;
+    - REQUIRED is set on every section.
+
+    G2 and G3, the Merkle level numbering, bind `onbf-merkle`. MERKLE section sizes already follow G3.
   - A compile-time assertion ties the accepted `format_major` to `origin-version.toml`.
 - **Dependencies:** `core`, and the first-party `origin-version` crate.
 - **Toolchain:** Rust 1.99.1. Clippy-clean on the host, `x86_64-unknown-uefi` and `x86_64-unknown-none`.
-- **Test evidence (2026-11-07, after the C1–C14 decisions):** 16 tests.
-  - Valid images: a KRN image with Merkle and bss segments; a minimal image in every profile; unsigned images in developer mode and nested; `format_minor` > 0; the digest plumbing.
+- **Test evidence (2026-11-07, after the C1–C14 and G2–G5 decisions):** 17 tests.
+  - Valid images: a KRN image with Merkle and bss segments; a minimal image in every profile; unsigned images in developer mode and nested; `format_minor` > 0; the digest plumbing; 16 segments in EXE and LIB; 17 in KRN; a guard gap between segments.
   - Rejected by design: unknown kinds with or without REQUIRED (C13); empty sections other than bss segments (C14).
-  - **Malicious corpus, 74 cases** (ONBF §13 item 4, container part), each rejected with the exact expected error. It covers overlapping, misaligned and misplaced sections; counts beyond limits; integer overflow; truncation; trailing data; W+X; reserved fields; Merkle mis-references; padding; compressed manifests; and empty sections.
+  - **Malicious corpus, 81 cases** (ONBF §13 item 4, container part), each rejected with the exact expected error. It covers:
+    - overlapping, misaligned and misplaced sections;
+    - counts beyond limits, integer overflow, truncation and trailing data;
+    - W+X and reserved fields;
+    - Merkle mis-references and padding;
+    - compressed manifests and empty sections;
+    - REQUIRED not set (G5);
+    - segment size, order, overlap and span, and 17 segments in an EXE (G4).
   - Sweeps:
     - every truncation of a 20,648-byte image is rejected;
     - every one of 10,732 padding bytes is checked;

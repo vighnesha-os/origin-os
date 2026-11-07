@@ -51,7 +51,7 @@ impl Sec {
     fn segment(perms: u32, len: usize, mem_offset: u64, mem_size: u64, merkle_index: u32) -> Self {
         Self {
             kind: SEGMENT,
-            flags: MAP | perms,
+            flags: REQ | MAP | perms,
             stored: vec![0xCC; len],
             mem_offset,
             mem_size: Some(mem_size),
@@ -65,7 +65,7 @@ impl Sec {
     fn merkle(blocks: usize) -> Self {
         Self {
             kind: MERKLE,
-            flags: 0,
+            flags: REQ,
             stored: vec![0x33; blocks * 4096],
             integrity: 2,
             digest: [0; 32],
@@ -76,7 +76,7 @@ impl Sec {
     fn plain(kind: u32, len: usize) -> Self {
         Self {
             kind,
-            flags: 0,
+            flags: REQ,
             stored: vec![0x44; len],
             ..Self::manifest()
         }
@@ -310,6 +310,7 @@ fn unsigned_images_need_developer_mode_or_a_verified_parent() {
 fn unknown_kinds_are_rejected_with_or_without_required() {
     let mut b = Builder::kernel();
     b.sections.push(Sec::plain(0x7777, 10));
+    b.sections[4].flags = 0;
     assert_eq!(
         parse(&b.build()).err(),
         Some(sec(4, SectionError::UnknownKind(0x7777)))
@@ -588,7 +589,10 @@ fn section_cases() -> Vec<Case> {
         ),
         (
             "unknown optional kind (errata C13)",
-            mutated(|i| put32(i, e2, 0x7777)),
+            mutated(|i| {
+                put32(i, e2, 0x7777);
+                put32(i, e2 + 4, 0);
+            }),
             s,
             sec(2, E::UnknownKind(0x7777)),
         ),
@@ -708,7 +712,46 @@ fn section_cases() -> Vec<Case> {
             "manifest without REQUIRED",
             mutated(|i| put32(i, e0 + 4, 0)),
             s,
-            sec(0, E::ManifestRules),
+            sec(0, E::RequiredNotSet),
+        ),
+        (
+            "segment without REQUIRED (errata G5)",
+            mutated(|i| put32(i, e1 + 4, MAP | R | X)),
+            s,
+            sec(1, E::RequiredNotSet),
+        ),
+        (
+            "MERKLE section without REQUIRED (errata G5)",
+            mutated(|i| put32(i, e2 + 4, 0)),
+            s,
+            sec(2, E::RequiredNotSet),
+        ),
+        (
+            "segment mem_size not a page multiple (errata G4)",
+            mutated(|i| put64(i, e3 + 40, 4100)),
+            s,
+            sec(3, E::MemoryLayout),
+        ),
+        (
+            "overlapping segments in memory (errata G4)",
+            mutated(|i| put64(i, e3 + 32, 4096)),
+            s,
+            sec(3, E::SegmentOrder),
+        ),
+        (
+            "segments out of memory order (errata G4)",
+            mutated(|i| {
+                put64(i, e1 + 32, 12288);
+                put64(i, e3 + 32, 0);
+            }),
+            s,
+            sec(3, E::SegmentOrder),
+        ),
+        (
+            "segment beyond the 2 GiB image span (errata G4)",
+            mutated(|i| put64(i, e3 + 32, 1 << 31)),
+            s,
+            sec(3, E::SegmentSpan),
         ),
         (
             "manifest over 1 MiB",
@@ -896,7 +939,40 @@ fn section_cases() -> Vec<Case> {
             s,
             Error::ManifestCount,
         ),
+        (
+            "17 segments in an EXE (Appendix A)",
+            bss_segments(Profile::Exe, 17).build(),
+            s,
+            Error::TooManySegments,
+        ),
     ]
+}
+
+/// A manifest plus `n` one-page bss segments laid out back to back in memory.
+fn bss_segments(profile: Profile, n: u64) -> Builder {
+    let mut b = Builder::minimal(profile as u16);
+    for k in 0..n {
+        b.sections
+            .push(Sec::segment(R | W, 0, k * 4096, 4096, NO_MERKLE));
+    }
+    b
+}
+
+#[test]
+fn segment_limits_apply_to_exe_and_lib_only() {
+    assert!(parse(&bss_segments(Profile::Exe, 16).build()).is_ok());
+    assert!(parse(&bss_segments(Profile::Lib, 16).build()).is_ok());
+    assert_eq!(
+        parse(&bss_segments(Profile::Lib, 17).build()).err(),
+        Some(Error::TooManySegments)
+    );
+    // Appendix A sets no segment limit for KRN.
+    assert!(parse(&bss_segments(Profile::Krn, 17).build()).is_ok());
+    // A guard gap between segments is allowed (errata G4).
+    let mut b = Builder::kernel();
+    b.sections
+        .push(Sec::segment(R | W, 0, 16384, 4096, NO_MERKLE));
+    assert!(parse(&b.build()).is_ok());
 }
 
 #[test]
@@ -966,7 +1042,7 @@ fn bit_flips_in_header_and_table_are_rejected_outside_free_fields() {
         }
         let (i, off) = ((at - 128) / 128, (at - 128) % 128);
         let digest = (64..96).contains(&off) && i != 2; // MERKLE digest must stay zero
-        let flags = (4..8).contains(&off) && i != 0; // segment perms; REQUIRED on optional kinds
+        let flags = (4..8).contains(&off) && (i == 1 || i == 3); // segment permissions only (G5)
         let memory = (32..48).contains(&off) && (i == 1 || i == 3); // segment placement
         digest || flags || memory
     };
