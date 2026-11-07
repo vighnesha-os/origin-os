@@ -27,6 +27,7 @@
 //! - [`entropy`]: bounded-retry hardware entropy draw/fill over an abstract source;
 //! - [`features`]: CPUID feature decoding and the x86-64-v3 baseline;
 //! - [`frames`]: the physical frame allocator over the boot-info regions;
+//! - [`glob`]: glob pattern matching (`*`, `?`, `[...]`, escapes) for names and paths;
 //! - [`gpt`]: GUID Partition Table validation (both copies, CRC-32) and partitions;
 //! - [`handles`]: per-process handle tables with rights (ADR-0005 P1–P2);
 //! - [`heap`]: kernel heap bookkeeping (slabs and frame runs), addresses only;
@@ -77,6 +78,7 @@ pub mod editbuffer;
 pub mod entropy;
 pub mod features;
 pub mod frames;
+pub mod glob;
 pub mod gpt;
 pub mod handles;
 pub mod heap;
