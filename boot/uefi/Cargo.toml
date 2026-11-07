@@ -16,8 +16,17 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+# Accept an unsigned KRN image and say so on the console (ADR-0002 B8). The xtask boot
+# test builds this variant; a loader without it refuses unsigned kernels.
+developer-mode = []
+
 [dependencies]
 origin-version.workspace = true
+origin-boot-info.workspace = true
+onbf-format.workspace = true
+origin-crypto.workspace = true
+onbf-merkle = { path = "../../runtime/onbf/merkle" }
 
 [lints]
 workspace = true

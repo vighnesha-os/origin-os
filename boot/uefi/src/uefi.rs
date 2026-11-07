@@ -34,6 +34,14 @@ impl Status {
     pub const DEVICE_ERROR: Self = Self(Self::ERROR_BIT | 7);
     /// `EFI_INCOMPATIBLE_VERSION`.
     pub const INCOMPATIBLE_VERSION: Self = Self(Self::ERROR_BIT | 25);
+    /// `EFI_BUFFER_TOO_SMALL`.
+    pub const BUFFER_TOO_SMALL: Self = Self(Self::ERROR_BIT | 5);
+    /// `EFI_OUT_OF_RESOURCES`.
+    pub const OUT_OF_RESOURCES: Self = Self(Self::ERROR_BIT | 9);
+    /// `EFI_NOT_FOUND`.
+    pub const NOT_FOUND: Self = Self(Self::ERROR_BIT | 14);
+    /// `EFI_SECURITY_VIOLATION`.
+    pub const SECURITY_VIOLATION: Self = Self(Self::ERROR_BIT | 26);
     /// `EFI_WARN_UNKNOWN_GLYPH`: a warning, not an error.
     pub const WARN_UNKNOWN_GLYPH: Self = Self(1);
 
@@ -52,6 +60,10 @@ impl fmt::Debug for Status {
             Self::UNSUPPORTED => "EFI_UNSUPPORTED",
             Self::DEVICE_ERROR => "EFI_DEVICE_ERROR",
             Self::INCOMPATIBLE_VERSION => "EFI_INCOMPATIBLE_VERSION",
+            Self::BUFFER_TOO_SMALL => "EFI_BUFFER_TOO_SMALL",
+            Self::OUT_OF_RESOURCES => "EFI_OUT_OF_RESOURCES",
+            Self::NOT_FOUND => "EFI_NOT_FOUND",
+            Self::SECURITY_VIOLATION => "EFI_SECURITY_VIOLATION",
             Self::WARN_UNKNOWN_GLYPH => "EFI_WARN_UNKNOWN_GLYPH",
             _ => return write!(f, "EFI_STATUS({:#x})", self.0),
         };

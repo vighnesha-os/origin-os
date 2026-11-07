@@ -29,6 +29,10 @@ dependencies = [
 name = "origin-boot-uefi"
 version = "0.0.0"
 dependencies = [
+ "onbf-format",
+ "onbf-merkle",
+ "origin-boot-info",
+ "origin-crypto",
  "origin-version",
 ]
 
@@ -44,5 +48,6 @@ version = "0.0.0"
 name = "xtask"
 version = "0.0.0"
 dependencies = [
+ "onbf-format",
  "origin-version",
 ]

@@ -23,8 +23,9 @@ usage: cargo xtask <command>
 commands:
   check       rustfmt, clippy and unit tests, each crate on its own target(s);
               the UEFI release build; the CLAUDE.md §11 cfg lint
-  build       build the UEFI loader for x86_64-unknown-uefi (release) and print its path
-  boot-test   build, boot under QEMU + OVMF, and check the loader's serial output
+  build       build the loader (developer mode) and the KRN kernel image; print their paths
+  boot-test   boot under QEMU + OVMF twice: the kernel must start and report; a tampered
+              kernel image must be rejected by the loader
   run         boot under QEMU with the serial console on this terminal (Ctrl-A X quits)
 
 environment:
@@ -43,6 +44,8 @@ const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// `no_std` libraries embedded in the boot loader and the Framekernel. Each must be
 /// clippy-clean on every target and free of panic paths (ONBF §12).
 const BOOT_INFO_PACKAGE: &str = "origin-boot-info";
+const KERNEL_PACKAGE: &str = "framekernel";
+const PACK_PACKAGE: &str = "onbf-pack";
 const FREESTANDING_LIBS: &[&str] = &[
     BOOT_INFO_PACKAGE,
     ONBF_FORMAT_PACKAGE,
@@ -52,27 +55,65 @@ const FREESTANDING_LIBS: &[&str] = &[
 const QEMU: &str = "qemu-system-x86_64";
 const DEFAULT_BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Lines `boot-test` requires, in this order.
-///
-/// The banner is built from the same generated constants the loader uses, so the test
-/// also checks that the release identity in origin-version.toml reached the binary.
-/// The last two markers come from OVMF's boot manager, not from the loader. They show that
-/// the firmware received `EFI_UNSUPPORTED` as the image's return value, which checks the
-/// `efiapi` return path end to end.
-fn boot_markers() -> Vec<String> {
-    use origin_version::{BUILD, PRODUCT, VERSION};
-    vec![
-        format!("{PRODUCT} {VERSION} UEFI loader (build {BUILD})"),
-        "origin-boot: UEFI 2.".into(),
-        "origin-boot: firmware ".into(),
-        "origin-boot: Framekernel loading is not implemented yet (M1 step 2); returning EFI_UNSUPPORTED".into(),
-        "BdsDxe: failed to start Boot0001 ".into(),
-        "): Unsupported".into(),
-    ]
+/// One QEMU boot the test runs, and what its serial output must and must not contain.
+struct Scenario {
+    label: &'static str,
+    /// Lines required, in this order.
+    markers: Vec<String>,
+    /// Output that fails the scenario as soon as it appears.
+    failures: Vec<&'static str>,
 }
 
-/// Output that fails `boot-test` as soon as it appears.
-const FAILURE_MARKERS: &[&str] = &["origin-boot: panic:"];
+/// The good path: the loader verifies and enters the kernel, and the kernel reports on
+/// COM1. The banners are built from the same generated constants as the binaries, so the
+/// test also checks that the release identity reached both.
+fn boot_scenario() -> Scenario {
+    use origin_version::{BUILD, PRODUCT, VERSION};
+    Scenario {
+        label: "kernel boot",
+        markers: vec![
+            format!("{PRODUCT} {VERSION} UEFI loader (build {BUILD})"),
+            "origin-boot: UEFI 2.".into(),
+            "origin-boot: developer mode: unsigned kernel images are accepted".into(),
+            "origin-boot: read \\EFI\\ORIGIN\\KERNEL.ONBF (".into(),
+            "origin-boot: kernel verified: ".into(),
+            "origin-boot: kernel placed at ".into(),
+            "origin-boot: exiting boot services; entering the Framekernel".into(),
+            format!("origin-kernel: {PRODUCT} {VERSION} Framekernel (build {BUILD})"),
+            format!(
+                "origin-kernel: boot info {}.{}, ",
+                origin_version::BOOT_INFO_MAJOR,
+                origin_version::BOOT_INFO_MINOR
+            ),
+            "origin-kernel: loaded at ".into(),
+            "origin-kernel: M1 entry complete; halting".into(),
+        ],
+        failures: vec![
+            "origin-boot: panic:",
+            "origin-kernel: panic:",
+            "origin-boot: kernel rejected",
+            "origin-kernel: invalid boot info",
+        ],
+    }
+}
+
+/// The tampered path: one byte of a SEGMENT changed on disk. The loader must refuse it, and
+/// the kernel must never run.
+fn tamper_scenario() -> Scenario {
+    Scenario {
+        label: "tampered kernel",
+        markers: vec![
+            "origin-boot: read \\EFI\\ORIGIN\\KERNEL.ONBF (".into(),
+            "origin-boot: kernel rejected: section ".into(),
+            "does not match its digest".into(),
+        ],
+        failures: vec![
+            "origin-kernel:",
+            "origin-boot: panic:",
+            "origin-boot: kernel verified",
+        ],
+    }
+}
 
 type Result<T = ()> = std::result::Result<T, String>;
 
@@ -85,7 +126,11 @@ fn main() -> ExitCode {
         .as_slice()
     {
         ["check"] => check(),
-        ["build"] => build_loader().map(|p| println!("{}", p.display())),
+        ["build"] => build_loader().and_then(|loader| {
+            let kernel = pack_kernel(&build_kernel()?)?;
+            println!("{}\n{}", loader.display(), kernel.display());
+            Ok(())
+        }),
         ["boot-test"] => boot_test(),
         ["run"] => run(),
         _ => {
@@ -492,6 +537,8 @@ fn build_loader() -> Result<PathBuf> {
         "--target",
         UEFI_TARGET,
         "--release",
+        "--features",
+        "developer-mode",
     ]))?;
     let efi = target_dir()
         .join(UEFI_TARGET)
@@ -505,6 +552,77 @@ fn build_loader() -> Result<PathBuf> {
             efi.display()
         ))
     }
+}
+
+/// Builds the Framekernel ELF for `x86_64-unknown-none` and returns its path.
+fn build_kernel() -> Result<PathBuf> {
+    run_step(cargo().args([
+        "build",
+        "--package",
+        KERNEL_PACKAGE,
+        "--bin",
+        KERNEL_PACKAGE,
+        "--target",
+        KERNEL_TARGET,
+        "--release",
+    ]))?;
+    let elf = target_dir()
+        .join(KERNEL_TARGET)
+        .join("release")
+        .join(KERNEL_PACKAGE);
+    if elf.is_file() {
+        Ok(elf)
+    } else {
+        Err(format!(
+            "cargo reported success but {} does not exist",
+            elf.display()
+        ))
+    }
+}
+
+/// Converts the kernel ELF into the KRN image with `onbf-pack`, which verifies its output
+/// before writing it.
+fn pack_kernel(elf: &Path) -> Result<PathBuf> {
+    let out = target_dir().join("xtask").join("KERNEL.ONBF");
+    if let Some(dir) = out.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let (Some(input), Some(output)) = (elf.to_str(), out.to_str()) else {
+        return Err("kernel paths are not UTF-8".into());
+    };
+    run_step(cargo().args([
+        "run",
+        "--quiet",
+        "--release",
+        "--package",
+        PACK_PACKAGE,
+        "--",
+        "krn",
+        "--input",
+        input,
+        "--output",
+        output,
+    ]))?;
+    Ok(out)
+}
+
+/// A copy of `krn` with one byte flipped in the middle of the first SEGMENT's content.
+fn tampered(krn: &[u8]) -> Result<Vec<u8>> {
+    let options = onbf_format::ParseOptions {
+        developer_mode: true,
+        ..Default::default()
+    };
+    let image = onbf_format::Image::parse(krn, options).map_err(|e| format!("KRN image: {e:?}"))?;
+    let segment = image
+        .sections()
+        .find(|s| s.entry.kind() == onbf_format::Kind::Segment && s.entry.stored_size > 0)
+        .ok_or("the KRN image has no segment with content")?;
+    let at = usize::try_from(segment.entry.file_offset + segment.entry.stored_size / 2)
+        .map_err(|_| "segment offset does not fit in usize")?;
+    let mut out = krn.to_vec();
+    let byte = out.get_mut(at).ok_or("segment outside the file")?;
+    *byte ^= 0x01;
+    Ok(out)
 }
 
 // ------------------------------------------------------------------ QEMU
@@ -567,8 +685,9 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Builds the loader and lays out a fresh ESP and NVRAM copy for one boot.
-fn stage() -> Result<Staged> {
+/// Builds the loader and lays out a fresh ESP, holding `kernel` as the KRN image, and a
+/// fresh NVRAM copy for one boot.
+fn stage(kernel: &[u8]) -> Result<Staged> {
     let efi = build_loader()?;
     let firmware = find_firmware()?;
     let work = target_dir().join("xtask");
@@ -581,6 +700,11 @@ fn stage() -> Result<Staged> {
     fs::create_dir_all(&boot_dir).map_err(|e| format!("{}: {e}", boot_dir.display()))?;
     fs::copy(&efi, boot_dir.join("BOOTX64.EFI"))
         .map_err(|e| format!("copy {}: {e}", efi.display()))?;
+    // Where the loader looks for the Framekernel (ADR-0002 B1).
+    let origin_dir = esp.join("EFI").join("ORIGIN");
+    fs::create_dir_all(&origin_dir).map_err(|e| format!("{}: {e}", origin_dir.display()))?;
+    fs::write(origin_dir.join("KERNEL.ONBF"), kernel)
+        .map_err(|e| format!("write KERNEL.ONBF: {e}"))?;
     // A fresh NVRAM copy for every boot, so no run inherits variables from an earlier one.
     let vars = work.join("ovmf-vars.fd");
     fs::copy(&firmware.vars_template, &vars)
@@ -629,7 +753,17 @@ fn boot_test_timeout() -> Result<Duration> {
 }
 
 fn boot_test() -> Result {
-    let staged = stage()?;
+    let krn_path = pack_kernel(&build_kernel()?)?;
+    let krn = fs::read(&krn_path).map_err(|e| format!("{}: {e}", krn_path.display()))?;
+    run_scenario(&boot_scenario(), &krn)?;
+    run_scenario(&tamper_scenario(), &tampered(&krn)?)?;
+    println!("xtask: boot-test passed (both scenarios)");
+    Ok(())
+}
+
+/// Boots `kernel` once and checks the serial output against `scenario`.
+fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
+    let staged = stage(kernel)?;
     let timeout = boot_test_timeout()?;
     let mut cmd = qemu_command(&staged)?;
     cmd.args(["-serial", "stdio", "-monitor", "none"])
@@ -637,7 +771,8 @@ fn boot_test() -> Result {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     println!(
-        "xtask: booting under {QEMU} + OVMF (timeout {}s)",
+        "xtask: {}: booting under {QEMU} + OVMF (timeout {}s)",
+        scenario.label,
         timeout.as_secs()
     );
     let mut child = cmd
@@ -661,8 +796,7 @@ fn boot_test() -> Result {
         s
     });
 
-    let markers = boot_markers();
-    let markers: Vec<&str> = markers.iter().map(String::as_str).collect();
+    let markers: Vec<&str> = scenario.markers.iter().map(String::as_str).collect();
     let started = Instant::now();
     let deadline = started + timeout;
     let mut raw = Vec::new();
@@ -671,7 +805,7 @@ fn boot_test() -> Result {
             Ok(chunk) => {
                 raw.extend_from_slice(&chunk);
                 let text = serial::clean(&raw);
-                if let Some(m) = FAILURE_MARKERS.iter().find(|m| text.contains(**m)) {
+                if let Some(m) = scenario.failures.iter().find(|m| text.contains(**m)) {
                     break Err(format!("the serial output contains {m:?}"));
                 }
                 if serial::contains_in_order(&text, &markers) {
@@ -691,26 +825,31 @@ fn boot_test() -> Result {
     };
     let elapsed = started.elapsed();
 
-    // After the loader returns, the firmware moves on to its next boot option and QEMU
-    // keeps running, so the test stops it. (QEMU does not exit on SIGALRM.)
+    // QEMU keeps running after the scenario ends (the kernel halts; a rejecting loader hands
+    // back to the firmware), so the test stops it. (QEMU does not exit on SIGALRM.)
     let _ = child.kill();
     let exit = child.wait();
     let qemu_stderr = stderr_reader.join().unwrap_or_default();
 
     let text = serial::clean(&raw);
-    let log = target_dir().join("xtask").join("boot-test-serial.log");
+    let log = target_dir().join("xtask").join(format!(
+        "boot-test-{}.log",
+        scenario.label.replace(' ', "-")
+    ));
     fs::write(&log, &text).map_err(|e| format!("{}: {e}", log.display()))?;
 
     match verdict {
         Ok(()) => {
-            for line in text
-                .lines()
-                .filter(|l| l.starts_with("Origin OS") || l.starts_with("origin-boot:"))
-            {
+            for line in text.lines().filter(|l| {
+                l.starts_with("Origin OS")
+                    || l.starts_with("origin-boot:")
+                    || l.starts_with("origin-kernel:")
+            }) {
                 println!("  | {line}");
             }
             println!(
-                "xtask: boot-test passed in {:.1}s; serial log: {}",
+                "xtask: {}: passed in {:.1}s; serial log: {}",
+                scenario.label,
                 elapsed.as_secs_f64(),
                 log.display()
             );
@@ -719,7 +858,8 @@ fn boot_test() -> Result {
         Err(e) => {
             eprintln!("--- serial output ---\n{text}\n--- {QEMU} stderr ---\n{qemu_stderr}");
             Err(format!(
-                "boot-test failed: {e} (QEMU: {exit:?}); serial log: {}",
+                "boot-test ({}) failed: {e} (QEMU: {exit:?}); serial log: {}",
+                scenario.label,
                 log.display()
             ))
         }
@@ -727,7 +867,9 @@ fn boot_test() -> Result {
 }
 
 fn run() -> Result {
-    let staged = stage()?;
+    let krn_path = pack_kernel(&build_kernel()?)?;
+    let krn = fs::read(&krn_path).map_err(|e| format!("{}: {e}", krn_path.display()))?;
+    let staged = stage(&krn)?;
     let mut cmd = qemu_command(&staged)?;
     cmd.args(["-serial", "mon:stdio"]);
     println!("xtask: starting {QEMU}; Ctrl-A X quits, Ctrl-A C switches to the QEMU monitor");
