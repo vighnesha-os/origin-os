@@ -4,7 +4,7 @@
 |---|---|
 | Updated | 2026-11-07, 20:00 IST |
 | Branch | `m0/toolchain-verification` (local only, not pushed, not merged into `main`) |
-| Reproduce | `cargo xtask check` and `cargo xtask boot-test` (`ORIGIN_QEMU_SMP=1`…`8` for other CPU counts) |
+| Reproduce | `cargo xtask check`, `cargo xtask boot-test`, and `cargo xtask boot-matrix` (1, 2 and 4 CPUs; `ORIGIN_QEMU_SMP=1`…`8` for others) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs in QEMU 11.1.3 (TCG) + OVMF only; nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
 
 ## By milestone
