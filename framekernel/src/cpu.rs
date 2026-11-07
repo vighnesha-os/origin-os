@@ -515,6 +515,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
                 crate::user::record_report(frame.rdi);
                 frame.rax = 0;
             }
+            2 => frame.rax = sys_write(frame.rdi, frame.rsi),
             _ => frame.rax = u64::MAX,
         }
         return here;
@@ -561,6 +562,31 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     );
     let _ = (frame.r12, frame.r13, frame.r14, frame.r15, frame.ss);
     crate::halt()
+}
+
+/// System call 2: writes `len` (at most 128) bytes from user address `buf` to the console
+/// as one line; returns the byte count or `EFAULT`.
+fn sys_write(buf: u64, len: u64) -> u64 {
+    let mut text = [0u8; 128];
+    let Some(dst) = usize::try_from(len).ok().and_then(|n| text.get_mut(..n)) else {
+        return EFAULT;
+    };
+    if let Err(e) = copy_from_user(dst, buf) {
+        return e;
+    }
+    // SAFETY: as in `dispatch`: COM1 is programmed and this processor drives it.
+    let mut com1 = Uart16550::new(unsafe { crate::Com1::new() });
+    let _ = com1.write_str("origin-kernel: user mode: write: ");
+    for &b in dst.iter() {
+        let c = if (0x20..0x7F).contains(&b) {
+            b as char
+        } else {
+            '?'
+        };
+        let _ = com1.write_char(c);
+    }
+    let _ = com1.write_str("\n");
+    len
 }
 
 /// CR2: the linear address of the last page fault.
@@ -796,6 +822,61 @@ pub(crate) fn probe_execute_data() -> (u64, Probe) {
     (target, probe)
 }
 
+/// Whether SMAP is enabled (so user accesses need `stac`/`clac`).
+static SMAP_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The lowest and the end of the user range a system call may name (ADR-0003 K8: the
+/// lower half, page 0 excluded).
+const USER_LOW: u64 = 0x1000;
+const USER_END: u64 = 0x0000_8000_0000_0000;
+/// The error a system call returns for a bad user pointer (`-EFAULT`, as a u64).
+pub(crate) const EFAULT: u64 = (-14_i64) as u64;
+
+/// Copies `dst.len()` bytes from user address `src` into `dst`, checking first that the
+/// range lies in the user half and that every page of it is mapped as a user page, and
+/// surviving a fault during the copy: returns `Ok(())` or `Err(EFAULT)`.
+pub(crate) fn copy_from_user(dst: &mut [u8], src: u64) -> Result<(), u64> {
+    let len = dst.len() as u64;
+    let end = src.checked_add(len).ok_or(EFAULT)?;
+    if src < USER_LOW || end > USER_END {
+        return Err(EFAULT);
+    }
+    // The range test alone is not enough: the kernel is identity-mapped in the lower half
+    // for now, so every page must also be a user page. (A page unmapped after this check
+    // makes the copy fault, which is caught below.)
+    if !crate::vm::user_readable(src, len) {
+        return Err(EFAULT);
+    }
+    let smap = SMAP_ON.load(Ordering::Relaxed);
+    if smap {
+        // SAFETY: STAC only sets RFLAGS.AC, allowing supervisor access to user pages until
+        // the CLAC below; this code runs with interrupts disabled (system-call gate).
+        unsafe { asm!("stac", options(nomem, nostack)) };
+    }
+    let target = dst.as_mut_ptr().addr() as u64;
+    // SAFETY: `dst` is a live, writable kernel buffer of `len` bytes; the source range was
+    // checked to be in the user half, and a fault while reading it resumes at
+    // `probe_recover` (armed at the copy instruction) instead of taking the kernel down.
+    let result = run_probe((user_copy as *const ()).addr() as u64, || unsafe {
+        user_copy(target, src, 0, len)
+    });
+    if smap {
+        // SAFETY: CLAC only clears RFLAGS.AC again.
+        unsafe { asm!("clac", options(nomem, nostack)) };
+    }
+    match result {
+        Probe::Completed => Ok(()),
+        Probe::Faulted { .. } => Err(EFAULT),
+    }
+}
+
+/// `rep movsb` from RSI to RDI, RCX bytes (the fourth argument), as the first instruction,
+/// so a fault has RIP = `user_copy` and resumes at `probe_recover`.
+#[unsafe(naked)]
+unsafe extern "sysv64" fn user_copy(_dst: u64, _src: u64, _unused: u64, _len: u64) -> u64 {
+    naked_asm!("rep movsb", "mov rax, -1", "ret");
+}
+
 /// The bytes of `mov rax, -1; ret`, for a probe target that must not be executable.
 pub(crate) const PROBE_RETURN: [u8; 8] = [0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3];
 
@@ -833,6 +914,7 @@ pub(crate) fn smep_smap_supported() -> (bool, bool) {
 /// mode (it has none; a future user-copy path must set RFLAGS.AC around its accesses).
 pub(crate) unsafe fn enable_smep_smap() -> (bool, bool) {
     let (smep, smap) = smep_smap_supported();
+    SMAP_ON.store(smap, Ordering::Relaxed);
     let bits = if smep { CR4_SMEP } else { 0 } | if smap { CR4_SMAP } else { 0 };
     // SAFETY: the caller's contract; setting supported CR4 bits only adds restrictions on
     // supervisor accesses to user pages.

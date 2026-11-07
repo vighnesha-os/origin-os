@@ -166,6 +166,8 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: user mode: two compute-bound user threads at once finished in ".into(),
             "reports 0b110; kernel stack follows every switch".into(),
             "origin-kernel: user mode: syscall instruction: reported Some(77), exited with Some(0)".into(),
+            "origin-kernel: user mode: write: hello from ring 3".into(),
+            "origin-kernel: user mode: copy from user: valid buffer -> 17, kernel address -> EFAULT, unmapped user address -> EFAULT; kernel carries on".into(),
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],

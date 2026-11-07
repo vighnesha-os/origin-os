@@ -147,6 +147,65 @@ fn by_syscall(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool {
     right
 }
 
+/// The text the writer program passes to system call 2, at offset 0x700 of the code page.
+const GREETING: &[u8] = b"hello from ring 3";
+
+/// `movabs rdi, buf; mov esi, len; mov eax, 2; int 0x80` (write), then report RAX (the
+/// result) and exit.
+fn writer(buf: u64, len: u8) -> alloc::vec::Vec<u8> {
+    let mut p = alloc::vec![0x48, 0xBF];
+    p.extend_from_slice(&buf.to_le_bytes());
+    p.extend_from_slice(&[0xBE, len, 0, 0, 0, 0xB8, 2, 0, 0, 0, 0xCD, 0x80]);
+    p.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
+    p.extend_from_slice(&[0xB8, 1, 0, 0, 0, 0xCD, 0x80]); // report
+    p.extend_from_slice(&[0x31, 0xFF, 0x31, 0xC0, 0xCD, 0x80, 0xEB, 0xFE]); // exit 0
+    p
+}
+
+/// System call 2 copies from user memory: a valid buffer is written to the console, a
+/// kernel address is refused by the range check, and an unmapped user address faults
+/// inside the copy and is refused too; the kernel carries on.
+fn copies(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool {
+    let cases = [
+        ("valid buffer", 0x500u64, GREETING.len() as u64),
+        ("kernel address", 0x580, cpu::EFAULT),
+        ("unmapped user address", 0x600, cpu::EFAULT),
+    ];
+    let mut ok = true;
+    let mut results = [0u64; 3];
+    for (i, (_, offset, want)) in cases.iter().enumerate() {
+        REPORTED.store(0, Ordering::Relaxed);
+        EXIT_CODE.store(0, Ordering::Relaxed);
+        let ended = ENDED.load(Ordering::Acquire);
+        if sched::spawn(bsp, user_thread, CODE + offset).is_err() {
+            return false;
+        }
+        sched::yield_until(|| ENDED.load(Ordering::Acquire) > ended, tsc_hz, 2);
+        let got = REPORTED.load(Ordering::Relaxed).wrapping_sub(1);
+        let exited = EXIT_CODE.load(Ordering::Relaxed).checked_sub(1);
+        if let Some(r) = results.get_mut(i) {
+            *r = got;
+        }
+        ok &= got == *want && exited == Some(0);
+    }
+    let show = |v: u64| {
+        if v == cpu::EFAULT {
+            alloc::string::String::from("EFAULT")
+        } else {
+            alloc::format!("{v}")
+        }
+    };
+    let _ = writeln!(
+        com1,
+        "origin-kernel: user mode: copy from user: valid buffer -> {}, kernel address -> {}, unmapped user address -> {}; kernel carries on{}",
+        show(results[0]),
+        show(results[1]),
+        show(results[2]),
+        if ok { "" } else { ": user isolation failed" }
+    );
+    ok
+}
+
 /// Two compute-bound user threads at once, preempted by the timer: both must finish with
 /// the right report, which needs TSS.RSP0 to follow every context switch (otherwise one
 /// thread's interrupt frames would land on the other's kernel stack).
@@ -205,6 +264,21 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool
             );
         }
     }
+    let writers = [
+        (0x500usize, writer(CODE + 0x700, GREETING.len() as u8)),
+        (0x580, writer(ptr::from_ref(&REPORTED).addr() as u64, 8)),
+        (0x600, writer(0x0000_7000_0000_0000, 8)),
+    ];
+    for (offset, bytes) in &writers {
+        // SAFETY: each writer is under 0x80 bytes and lands inside the code frame.
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), code.wrapping_add(*offset), bytes.len())
+        };
+    }
+    // SAFETY: the greeting is 17 bytes at offset 0x700 of the code frame.
+    unsafe {
+        ptr::copy_nonoverlapping(GREETING.as_ptr(), code.wrapping_add(0x700), GREETING.len())
+    };
     // SAFETY: the program is 22 bytes at offset 0x400 of the code frame.
     unsafe {
         ptr::copy_nonoverlapping(
@@ -263,6 +337,9 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, bsp: usize, tsc_hz: u64) -> bool
     }
     if ok {
         ok &= by_syscall(com1, bsp, tsc_hz);
+    }
+    if ok {
+        ok &= copies(com1, bsp, tsc_hz);
     }
     let _ = vm::unmap(CODE);
     let _ = vm::unmap(STACK);
