@@ -64,18 +64,21 @@ pub enum SectionError {
     PermissionsOnNonSegment,
     /// A SEGMENT without MAPPABLE.
     SegmentNotMappable,
-    /// An unknown kind with REQUIRED set (§4.4).
-    UnknownRequiredKind(u32),
+    /// A kind not in §4.4, with or without REQUIRED (errata C13).
+    UnknownKind(u32),
     /// A known kind that §4.4 does not allow in this profile.
     KindNotAllowedInProfile(u32),
     /// `compression` is not 0 or 1.
     UnknownCompression(u8),
-    /// A MAPPABLE or MERKLE section is compressed.
+    /// A MAPPABLE, MERKLE or MANIFEST section is compressed (errata C9, C12).
     CompressionNotAllowed,
     /// `stored_size` or `content_size` exceeds 1 TiB (Appendix A).
     TooLarge,
     /// An uncompressed section whose `content_size` differs from `stored_size`.
     SizeMismatch,
+    /// A section with no content that is not a SEGMENT, or a SEGMENT with `mem_size = 0`
+    /// (errata C14).
+    EmptySection,
     /// `integrity` is not 0–3.
     UnknownIntegrity(u8),
     /// The integrity mode does not fit the section: Merkle hash blocks (2) on a

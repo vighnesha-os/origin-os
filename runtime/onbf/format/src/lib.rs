@@ -7,9 +7,10 @@
 //! (§7.1) and Merkle verification (§4.6) are separate layers.
 //!
 //! Parser contract (ONBF §12): `no_std`, no allocation, no `unsafe`, no panics, typed
-//! errors, no partial results. Where the specification allows more than one reading,
-//! this crate implements the reading recorded in `docs/spec/ONBF-errata.md` (Proposed).
-//! Until the owner approves those readings, this parser must not ship (CLAUDE.md §84).
+//! errors, no partial results. Where the specification allowed more than one reading,
+//! this crate implements the owner's decisions C1–C14 in `docs/spec/ONBF-errata.md`
+//! (2026-11-07). ONBF byte layouts become v1.0 final only after the remaining §13 tests:
+//! fuzzing, Kani bounds and an independent second parser.
 //!
 //! SHA-512 is not implemented here: [`Image::verify_content_digest`] takes the hash
 //! function from the caller, so `origin-crypto` can supply it.

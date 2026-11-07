@@ -17,7 +17,7 @@
 | T4 workspace | Virtual workspace, strict unsafe lints, `cargo xtask` (check / build / boot-test / run). | `Cargo.toml`, `developer-tools/xtask/` |
 | T8 step 1 | `boot/uefi` (`origin-boot-uefi`): validates the system table, prints to ConOut, returns `EFI_UNSUPPORTED`. `boot-test` passes in 1.8 s, and OVMF confirms it received `Unsupported`. | `SOURCE_PROVENANCE.md` |
 | T5 versioning | `origin-version.toml` plus the generated `origin-version` crate. The loader banner reads `Origin OS 0.1.0-dev UEFI loader (build 0)`. `xtask check` rejects a version in any Cargo manifest. | `SOURCE_PROVENANCE.md` |
-| T9 part 1 | `runtime/onbf/format` (`onbf-format`), the container layer: header, section table, layout, Merkle cross-references and the content-digest input. 69-case malicious corpus plus truncation, padding and bit-flip sweeps. **14 proposed clarifications and 4 spec gaps await the owner.** | `docs/spec/ONBF-errata.md` |
+| T9 part 1 | `runtime/onbf/format` (`onbf-format`), the container layer: header, section table, layout, Merkle cross-references and the content-digest input. 74-case malicious corpus plus truncation, padding and bit-flip sweeps. The owner decided C1–C14: C12 (uncompressed manifests), C13 (reject every unknown kind) and C14 (empty sections only for SEGMENT) changed the parser. | `docs/spec/ONBF-errata.md` |
 
 Commits: `b5a446a` (M0), `87f50fd` (workspace + loader), `fc4d99e` (T5, which added this file). The owner approved all three. T9 part 1 updates this file.
 
@@ -44,7 +44,7 @@ KRN, the Framekernel image, is an ONBF profile (ONBF §6.5), and only the boot l
 
 - Merge `m0/toolchain-verification` into `main`, and push. Both are the owner's call; nothing has been pushed.
 - A project licence. Every provenance entry says "not chosen yet".
-- Approve, amend or reject the ONBF clarifications C1–C14 in `docs/spec/ONBF-errata.md`, and decide gaps G1–G4. `onbf-format` must not ship before that.
+- The ONBF gaps G1–G5 in `docs/spec/ONBF-errata.md`, C1–C14 having been decided on 2026-11-07. G5, what REQUIRED means now that every unknown kind is rejected, matters before `onbf-pack` is written.
 - The boot trust anchor (Microsoft UEFI CA 2023, or Origin keys enrolled in firmware) for the boot ADR.
 - Whether to install Rosetta 2 for the *executed* FFI-bool test (§10). Only the assembly-level check exists so far.
 - The starting release values in `origin-version.toml` (`0.1.0-dev`, build 0, SVN 0) are a development default. Change them if you prefer others.

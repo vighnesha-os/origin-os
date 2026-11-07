@@ -155,13 +155,18 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Architecture decisions:**
   - ADR-0001.
   - The ONBF §12 parser contract: `no_std`, no allocation, `forbid(unsafe_code)`, typed errors, no partial results. In non-test builds `clippy::{panic, unwrap_used, expect_used, indexing_slicing, arithmetic_side_effects, unreachable, todo, unimplemented, cast_possible_truncation}` are denied. A planted index and a planted unchecked addition were rejected, which confirms the lints are active.
-  - Where §4 allows more than one reading, the parser implements `docs/spec/ONBF-errata.md` C1–C14 (**Proposed**). **It must not ship until the owner approves those readings** (CLAUDE.md §84).
+  - Where §4 allowed more than one reading, the parser implements the owner's decisions C1–C14 in `docs/spec/ONBF-errata.md` (2026-11-07):
+    - 12 keep the reading first implemented;
+    - C12 makes manifests uncompressed only;
+    - C14 allows empty sections only for SEGMENT;
+    - C13 rejects every unknown kind. That was the owner's choice, against the recommendation to skip optional ones.
   - A compile-time assertion ties the accepted `format_major` to `origin-version.toml`.
 - **Dependencies:** `core`, and the first-party `origin-version` crate.
 - **Toolchain:** Rust 1.99.1. Clippy-clean on the host, `x86_64-unknown-uefi` and `x86_64-unknown-none`.
-- **Test evidence (2026-11-07):** 15 tests.
-  - Valid images: a KRN image with Merkle and bss segments; a minimal image in every profile; unsigned images in developer mode and nested; skippable unknown kinds; `format_minor` > 0; the digest plumbing.
-  - **Malicious corpus, 69 cases** (ONBF §13 item 4, container part), each rejected with the exact expected error. It covers overlapping, misaligned and misplaced sections; counts beyond limits; integer overflow; truncation; trailing data; W+X; reserved fields; Merkle mis-references; and padding.
+- **Test evidence (2026-11-07, after the C1–C14 decisions):** 16 tests.
+  - Valid images: a KRN image with Merkle and bss segments; a minimal image in every profile; unsigned images in developer mode and nested; `format_minor` > 0; the digest plumbing.
+  - Rejected by design: unknown kinds with or without REQUIRED (C13); empty sections other than bss segments (C14).
+  - **Malicious corpus, 74 cases** (ONBF §13 item 4, container part), each rejected with the exact expected error. It covers overlapping, misaligned and misplaced sections; counts beyond limits; integer overflow; truncation; trailing data; W+X; reserved fields; Merkle mis-references; padding; compressed manifests; and empty sections.
   - Sweeps:
     - every truncation of a 20,648-byte image is rejected;
     - every one of 10,732 padding bytes is checked;

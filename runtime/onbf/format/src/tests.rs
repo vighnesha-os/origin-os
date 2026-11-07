@@ -312,21 +312,44 @@ fn unsigned_images_need_developer_mode_or_a_verified_parent() {
     );
 }
 
+/// Errata C13 (owner decision): unknown kinds are rejected with or without REQUIRED.
 #[test]
-fn unknown_optional_kind_is_skippable_but_unknown_required_kind_is_not() {
+fn unknown_kinds_are_rejected_with_or_without_required() {
     let mut b = Builder::kernel();
     b.sections.push(Sec::plain(0x7777, 10));
-    let img = b.build();
-    let image = parse(&img).expect("unknown kind without REQUIRED is allowed (§4.4)");
     assert_eq!(
-        image.section(4).map(|s| s.entry.kind()),
-        Some(Kind::Unknown(0x7777))
+        parse(&b.build()).err(),
+        Some(sec(4, SectionError::UnknownKind(0x7777)))
     );
-
     b.sections[4].flags = REQ;
     assert_eq!(
         parse(&b.build()).err(),
-        Some(sec(4, SectionError::UnknownRequiredKind(0x7777)))
+        Some(sec(4, SectionError::UnknownKind(0x7777)))
+    );
+}
+
+/// Errata C14: only a SEGMENT may be empty, and only as zero-filled memory (bss).
+#[test]
+fn only_segments_may_be_empty() {
+    let mut b = Builder::minimal(Profile::Exe as u16);
+    b.sections.push(Sec::plain(STRINGS, 0));
+    assert_eq!(
+        parse(&b.build()).err(),
+        Some(sec(1, SectionError::EmptySection))
+    );
+
+    let mut b = Builder::minimal(Profile::Exe as u16);
+    b.sections[0].stored = Vec::new();
+    assert_eq!(
+        parse(&b.build()).err(),
+        Some(sec(0, SectionError::EmptySection))
+    );
+
+    let mut b = Builder::kernel();
+    b.sections.push(Sec::segment(R | W, 0, 12288, 0, NO_MERKLE));
+    assert_eq!(
+        parse(&b.build()).err(),
+        Some(sec(4, SectionError::EmptySection))
     );
 }
 
@@ -568,7 +591,29 @@ fn section_cases() -> Vec<Case> {
                 put32(i, e2 + 4, REQ);
             }),
             s,
-            sec(2, E::UnknownRequiredKind(0x7777)),
+            sec(2, E::UnknownKind(0x7777)),
+        ),
+        (
+            "unknown optional kind (errata C13)",
+            mutated(|i| put32(i, e2, 0x7777)),
+            s,
+            sec(2, E::UnknownKind(0x7777)),
+        ),
+        (
+            "empty STRINGS section (errata C14)",
+            {
+                let mut b = Builder::minimal(Profile::Exe as u16);
+                b.sections.push(Sec::plain(STRINGS, 0));
+                b.build()
+            },
+            s,
+            sec(1, E::EmptySection),
+        ),
+        (
+            "segment with mem_size 0 (errata C14)",
+            built(|b| b.sections.push(Sec::segment(R | W, 0, 12288, 0, NO_MERKLE))),
+            s,
+            sec(4, E::EmptySection),
         ),
         (
             "IMPORTS in a KRN image",
@@ -673,14 +718,20 @@ fn section_cases() -> Vec<Case> {
             sec(0, E::ManifestRules),
         ),
         (
-            "manifest over 1 MiB (compressed)",
+            "manifest over 1 MiB",
             mutated(|i| {
-                i[e0 + 48] = 1;
-                put64(i, e0 + 24, 2 << 20);
-                put64(i, e0 + 40, 2 << 20);
+                put64(i, e0 + 16, (1 << 20) + 1);
+                put64(i, e0 + 24, (1 << 20) + 1);
+                put64(i, e0 + 40, (1 << 20) + 1);
             }),
             s,
             sec(0, E::ManifestRules),
+        ),
+        (
+            "compressed manifest (errata C12)",
+            mutated(|i| i[e0 + 48] = 1),
+            s,
+            sec(0, E::CompressionNotAllowed),
         ),
         (
             "segment RVA not page aligned",
@@ -924,8 +975,7 @@ fn bit_flips_in_header_and_table_are_rejected_outside_free_fields() {
         let digest = (64..96).contains(&off) && i != 2; // MERKLE digest must stay zero
         let flags = (4..8).contains(&off) && i != 0; // segment perms; REQUIRED on optional kinds
         let memory = (32..48).contains(&off) && (i == 1 || i == 3); // segment placement
-        let compression = off == 48 && i == 0; // a non-mapped manifest may be zstd
-        digest || flags || memory || compression
+        digest || flags || memory
     };
     let mut accepted_free = 0;
     let mut unexpected = Vec::new();

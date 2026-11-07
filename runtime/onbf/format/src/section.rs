@@ -235,12 +235,10 @@ impl SectionEntry {
         }
         let mappable = flags.has(Flags::MAPPABLE);
 
-        // Kind against profile.
+        // Kind against profile. Unknown kinds are rejected whether or not REQUIRED is set
+        // (errata C13, owner decision; §4.4 permits this, since skipping is only a MAY).
         match k.profiles() {
-            None if flags.has(Flags::REQUIRED) => {
-                return Err(SectionError::UnknownRequiredKind(kind));
-            }
-            None => {}
+            None => return Err(SectionError::UnknownKind(kind)),
             Some(allowed) if allowed & profile.bit() == 0 => {
                 return Err(SectionError::KindNotAllowedInProfile(kind));
             }
@@ -253,7 +251,11 @@ impl SectionEntry {
             1 => Compression::Zstd,
             other => return Err(SectionError::UnknownCompression(other)),
         };
-        if compression == Compression::Zstd && (mappable || k == Kind::Merkle) {
+        // Mapped content and hash blocks need random access. A manifest is never compressed
+        // (errata C12), so no decompressor runs before it is verified and the boot loader
+        // needs no zstd.
+        let no_compression = mappable || k == Kind::Merkle || k == Kind::Manifest;
+        if compression == Compression::Zstd && no_compression {
             return Err(SectionError::CompressionNotAllowed);
         }
         if stored_size > MAX_SECTION_CONTENT || content_size > MAX_SECTION_CONTENT {
@@ -261,6 +263,11 @@ impl SectionEntry {
         }
         if compression == Compression::None && content_size != stored_size {
             return Err(SectionError::SizeMismatch);
+        }
+        // Errata C14: "nothing" has one encoding, which is an absent section. Only a
+        // SEGMENT may have no content, and then only as zero-filled memory (bss).
+        if (content_size == 0 && !is_segment) || (is_segment && mem_size == 0) {
+            return Err(SectionError::EmptySection);
         }
 
         // Integrity.
