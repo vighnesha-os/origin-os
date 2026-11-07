@@ -611,6 +611,9 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
+**RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.
+
+
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code.
 - **Dependencies:** `core` only. `no_std`; the no-panic lints are denied outside tests. One `unsafe impl Sync` and two `unsafe` blocks (the guard's `Deref`/`DerefMut`), each with a SAFETY argument.

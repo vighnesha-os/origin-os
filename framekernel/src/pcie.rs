@@ -18,7 +18,7 @@ use core::ptr;
 
 use framekernel::pci::{self, Address, Bar, BarKind, ConfigSpace, Ecam, Function};
 use origin_boot_info::{MemoryRegion, RegionKind};
-use origin_sync::SpinLock;
+use origin_sync::{RwLock, SpinLock};
 
 use crate::console::Console;
 
@@ -61,7 +61,9 @@ pub(crate) struct Device {
 }
 
 static ECAM: SpinLock<Option<EcamSpace>> = SpinLock::new(None);
-static DEVICES: SpinLock<Vec<Device>> = SpinLock::new(Vec::new());
+/// The enumerated devices: written once at init, read by `find` (read-mostly, so an
+/// `RwLock`).
+static DEVICES: RwLock<Vec<Device>> = RwLock::new(Vec::new());
 
 /// Most functions the kernel lists.
 const MAX_FUNCTIONS: usize = 256;
@@ -214,7 +216,7 @@ pub(crate) fn init(com1: &mut Console, rsdp: u64, regions: &[MemoryRegion], cpus
         if restored { "" } else { ": PCIe failed" }
     );
     crate::cpu::without_interrupts(|| {
-        *DEVICES.lock() = devices;
+        *DEVICES.write() = devices;
         *ECAM.lock() = Some(space);
     });
     restored
@@ -276,7 +278,7 @@ pub(crate) fn enable_msix(at: Address, msix: &pci::Msix) -> Option<u32> {
 /// The first listed function of this class, subclass and programming interface.
 pub(crate) fn find(class: u8, subclass: u8, prog_if: u8) -> Option<Device> {
     crate::cpu::without_interrupts(|| {
-        DEVICES.lock().iter().copied().find(|d| {
+        DEVICES.read().iter().copied().find(|d| {
             (d.function.class, d.function.subclass, d.function.prog_if)
                 == (class, subclass, prog_if)
         })
