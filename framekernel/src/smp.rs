@@ -251,41 +251,16 @@ pub(crate) fn start(
     online
 }
 
-/// Reads `len` bytes of firmware memory at physical `addr`, mapping it read-only first if
-/// the kernel does not map it.
-fn firmware_bytes(addr: u64, len: usize) -> Result<&'static [u8], &'static str> {
-    if addr == 0 || addr.checked_add(len as u64).is_none() {
-        return Err("bad table address");
-    }
-    let virt = vm::map_firmware(addr, len as u64).map_err(|_| "cannot map an ACPI table")?;
-    // SAFETY: `[addr, addr + len)` is readable at its direct-map address `virt` (just
-    // ensured), does not wrap, and holds ACPI tables, which the firmware does not change
-    // after boot; `u8` has no alignment or validity requirement.
-    Ok(unsafe {
-        core::slice::from_raw_parts(ptr::with_exposed_provenance::<u8>(virt as usize), len)
-    })
-}
-
 /// RSDP → XSDT → MADT → processors.
 fn discover(rsdp_addr: u64, out: &mut [Processor]) -> Result<usize, &'static str> {
-    let rsdp = acpi::parse_rsdp(firmware_bytes(rsdp_addr, acpi::RSDP_LENGTH)?)
-        .map_err(|_| "invalid RSDP")?;
-    let table = |addr: u64, sig: &[u8; 4]| -> Result<&'static [u8], &'static str> {
-        let header = firmware_bytes(addr, acpi::HEADER_LENGTH)?;
-        let len = acpi::table_length(header).map_err(|_| "invalid table length")?;
-        let bytes = firmware_bytes(addr, len as usize)?;
-        acpi::check_table(bytes, sig).map_err(|_| "invalid table")?;
-        Ok(bytes)
-    };
-    let xsdt = table(rsdp.xsdt, b"XSDT")?;
-    for addr in acpi::xsdt_entries(xsdt) {
-        let header = firmware_bytes(addr, acpi::HEADER_LENGTH)?;
-        if acpi::signature(header) == Some(*b"APIC") {
-            let madt = table(addr, b"APIC")?;
-            return acpi::madt_processors(madt, out).map_err(|_| "invalid MADT");
+    let madt = crate::firmware::acpi_table(rsdp_addr, b"APIC").map_err(|e| {
+        if e == "table not listed in the XSDT" {
+            "no MADT"
+        } else {
+            e
         }
-    }
-    Err("no MADT")
+    })?;
+    acpi::madt_processors(madt, out).map_err(|_| "invalid MADT")
 }
 
 /// Writes `value` at `offset` in the trampoline data page.

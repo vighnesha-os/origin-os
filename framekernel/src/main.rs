@@ -30,11 +30,13 @@ use framekernel::boot::{self, InvalidBootInfo, MemorySummary};
 use framekernel::report;
 
 mod cpu;
+mod firmware;
 mod memory;
 mod phys;
 mod process;
 mod sched;
 mod smp;
+mod time;
 mod timer;
 mod user;
 mod vm;
@@ -76,6 +78,8 @@ static RELOCATION_PROBE: &[u8; 8] = &RELOCATION_TARGET;
 /// runs.
 #[unsafe(no_mangle)]
 pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
+    // The monotonic clock's zero (CLAUDE.md §68).
+    time::mark_entry();
     // SAFETY: the entry contract: CPL 0, boot processor only, interrupts disabled. The
     // firmware and the loader stopped using COM1 at `ExitBootServices`, and no other kernel
     // code drives it.
@@ -149,8 +153,11 @@ pub unsafe extern "sysv64" fn _start(boot_info: *const BootInfo) -> ! {
     // M2, fourth step: interrupts. The local APIC in x2APIC mode, its timer calibrated
     // against the PIT and proven by taking periodic interrupts.
     let tsc_hz = timer::init(&mut com1);
-    if tsc_hz.is_some() {
+    if let Some(hz) = tsc_hz {
         prove_nmi_ist(&mut com1);
+        // The clocks: the monotonic clock's TSC rate, proven against the RTC, and the wall
+        // clock from the RTC (CLAUDE.md §68).
+        time::init(&mut com1, hz, info.acpi_rsdp);
     }
 
     // M3, first step: start the application processors the ACPI MADT lists. It needs the

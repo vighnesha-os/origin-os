@@ -266,6 +266,44 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 15 `origin-paging` tests (one for the shared kernel half and per-space user frames); `cargo xtask boot-matrix` passes at 1, 2 and 4 CPUs; `cargo xtask check` passes.
 - **Not done:** process objects with handles and capabilities, a process's user copies checked against its own tables (`copy_from_user` still checks the kernel's), more than 32 table frames per process, PCIDs (H5), loading programs from `.ose` images.
 
+### Clocks: monotonic TSC clock and RTC wall clock (CLAUDE.md §68, 2026-11-07)
+
+- **What:**
+  - `clock` (library): `Scale` turns ticks into nanoseconds with one 64×64→128-bit multiply and a shift. The multiplier is rounded up and keeps at least 63 significant bits, so a reading is the exact value rounded either way (exact whenever that is a whole number of nanoseconds) and never decreases. Also `ticks_for` (deadlines, rounded up), `SharedScale` (published once, read without a lock) and the CPUID 15h TSC rate.
+  - `rtc` (library): CMOS RTC decoding (BCD or binary; 12- or 24-hour; the FADT's century register, else 20xx), with every field range-checked and invalid BCD digits refused; Unix time in both directions (proleptic Gregorian, no leap seconds); ISO 8601 display.
+  - `acpi::parse_fadt`: the century register index (accepted only in 0Eh–7Fh) and the IAPC_BOOT_ARCH "CMOS RTC not present" flag.
+  - `firmware` (binary): ACPI table lookup, moved out of `smp` and now shared by SMP and the clocks.
+  - `time` (binary):
+    - The monotonic clock's zero is the TSC at `_start`.
+    - At boot, one RTC second is timed on the TSC between the ends of two update cycles.
+    - The TSC rate is CPUID 15h's if enumerated and within 1 % of the PIT calibration; else the RTC second's, if within 1 %; else the PIT's.
+    - The RTC is read just after the first edge, as two identical consecutive readings, so the wall clock is right to the polling latency rather than to a second.
+    - A cross-CPU check: for 100 ms every online processor takes ordered TSC readings (RDTSCP, else LFENCE then RDTSC) in turn under one lock. No reading may be below the one before it, and the processors must have handed over at least 100 times.
+- **Specifications:**
+  - Intel SDM Vol. 2A, CPUID leaves 15h and 8000_0007h; Vol. 2B, RDTSC and RDTSCP;
+  - the MC146818-compatible RTC as Intel PCH datasheets describe it: registers 00h–0Bh, register A's update-in-progress bit, register B's binary and 24-hour bits;
+  - ACPI 6.6 §5.2.9 (FADT: `CENTURY` at offset 108, `IAPC_BOOT_ARCH` at 109, bit 5).
+- **Unsafe additions, reviewed by the author (not independently):**
+  - `time.rs`: `Cmos::new` (an `unsafe fn` owning ports 70h–71h, with NMIs left unmasked), two port-I/O blocks, and the two ordered-TSC `asm!` blocks;
+  - `firmware.rs`: the firmware-table slice, moved from `smp.rs`.
+- **Test evidence (2026-11-07):**
+  - 77 library tests:
+    - the conversion against exact 128-bit arithmetic at nine rates from 1 Hz to 2^64−1 Hz over about 7,000 tick counts, with monotonicity checked;
+    - Unix time against Python's `datetime` at nine dates from 1970 to 2400 (leap, century and Y2038 cases);
+    - every day from 1970 to 2500 round-trips;
+    - BCD, binary and 12-hour decoding, and twelve malformed-register cases;
+    - the FADT century register's accepted range.
+  - `cargo xtask boot-test` and `boot-matrix` (1, 2 and 4 CPUs) pass. QEMU's RTC starts at 2030-06-15T12:00:00 (`-rtc base=`), and the kernel reports 2030-06-15T12:00:04Z.
+  - Across boots, one RTC second lasted 999 930 to 1 001 231 µs on the PIT-calibrated TSC, so the RTC second set the rate (999 999 to 1 000 003 kHz; QEMU's TCG TSC runs at about 1 GHz). TCG reports no invariant TSC and no CPUID 15h rate.
+  - Cross-CPU check: 0 backwards readings with 12 291 handoffs on 2 CPUs and 8 658 handoffs on 4.
+  - The check costs up to two seconds of boot (two RTC update edges); boot to halt is 4.5 s.
+  - Negative controls, each restored afterwards and each failing the boot test:
+    - AP readings skewed by 5000 ticks → "3862 backwards (worst 5000 ticks): clock failed";
+    - the calibration 3 % off → "one RTC second lasted 968002 us … clock failed";
+    - BCD read as binary. This control found a real gap: the year became 3248, beyond the 64-bit nanosecond range, and was shown as 2554 without failing. Such a year is now refused ("the RTC says 3248-06-21T18:00:03Z, beyond the clock's range: clock failed").
+  - QEMU only.
+- **Not done:** HPET or ACPI PM timer fallbacks; resynchronising TSCs (IA32_TSC_ADJUST) when the check fails; TSC-deadline timers; time zones and network time; the user-visible clock calls.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

@@ -61,6 +61,11 @@ const FREESTANDING_LIBS: &[&str] = &[
     "origin-abi",
 ];
 const QEMU: &str = "qemu-system-x86_64";
+/// Where the emulated RTC starts (UTC), so the boot test can check the wall clock the
+/// kernel reads from it: BCD decoding, the FADT century register and the calendar.
+const RTC_BASE: &str = "2030-06-15T12:00:00";
+/// What the kernel must report, allowing up to ten minutes of boot.
+const RTC_BASE_MARKER: &str = "2030-06-15T12:0";
 const DEFAULT_BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One QEMU boot the test runs, and what its serial output must and must not contain.
@@ -152,6 +157,11 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: APIC timer calibrated against the PIT: ".into(),
             "origin-kernel: APIC timer: 50 interrupts at 100 Hz in ".into(),
             "origin-kernel: NMI taken on its own stack (IST2): frame at ".into(),
+            // The clocks (CLAUDE.md §68): the TSC rate proven against one RTC second, and
+            // the wall clock read from the RTC, which `qemu_command` starts at RTC_BASE.
+            "origin-kernel: clock: TSC at ".into(),
+            "origin-kernel: clock: one RTC second lasted ".into(),
+            format!("origin-kernel: wall clock: {RTC_BASE_MARKER}"),
             // M3: every processor QEMU emulates (`-smp`, see `qemu_cpus`) comes online.
             format!("origin-kernel: ACPI MADT: {cpus} processors, {cpus} enabled"),
             format!(
@@ -177,6 +187,7 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: user mode: copy from user: valid buffer -> 17, kernel address -> EFAULT, unmapped user address -> EFAULT; kernel carries on".into(),
             "origin-kernel: processes: PML4 ".into(),
             "at once and read back 0x400800 from 0x500000 (own values only: 0x400800); not mapped in the kernel's tables: true".into(),
+            format!("origin-kernel: clock: TSC consistent across {cpus} processors: "),
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
@@ -216,6 +227,7 @@ fn boot_scenario_markers() -> Scenario {
             ": NMI stack failed",
             ": higher half failed",
             ": process isolation failed",
+            ": clock failed",
         ],
     }
 }
@@ -931,7 +943,9 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         .arg(drive("if=pflash,format=raw,file=", &s.vars)?)
         .arg("-drive")
         .arg(drive("format=raw,file=fat:rw:", &s.esp)?)
-        .args(["-net", "none", "-display", "none", "-no-reboot"]);
+        .args(["-net", "none", "-display", "none", "-no-reboot"])
+        .arg("-rtc")
+        .arg(format!("base={RTC_BASE}"));
     // Opt-in diagnostics: every interrupt and CPU reset, for debugging a triple fault.
     if env::var_os("ORIGIN_QEMU_DEBUG").is_some() {
         let log = target_dir().join("xtask").join("qemu-debug.log");

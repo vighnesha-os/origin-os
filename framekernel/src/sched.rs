@@ -608,6 +608,7 @@ pub(crate) fn prove(com1: &mut Uart16550<Com1>, cpus: &[u32], tsc_hz: u64) -> bo
     }
     ok &= prove_lifecycle(com1, bsp, tsc_hz);
     ok &= crate::user::prove(com1, bsp, tsc_hz);
+    ok &= crate::time::prove_consistent(com1, cpus, bsp, tsc_hz);
     // Every thread has exited: once each processor has reaped its own, the heap is back
     // exactly where it was before the first spawn.
     let back = || crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before;

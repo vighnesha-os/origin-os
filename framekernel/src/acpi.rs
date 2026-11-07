@@ -2,8 +2,9 @@
 //! topology).
 //!
 //! References: ACPI 6.6 §5.2.5 (RSDP), §5.2.6 (system description table header), §5.2.8
-//! (XSDT) and §5.2.12 (MADT, with the Processor Local APIC structure, type 0, and the
-//! Processor Local x2APIC structure, type 9).
+//! (XSDT), §5.2.9 (FADT: the RTC century register and the boot-architecture flags) and
+//! §5.2.12 (MADT, with the Processor Local APIC structure, type 0, and the Processor Local
+//! x2APIC structure, type 9).
 //!
 //! Firmware tables are untrusted input. Every function here parses a byte slice the caller
 //! copied or mapped, checks signatures, lengths and checksums before using a field, never
@@ -136,6 +137,42 @@ pub fn xsdt_entries(xsdt: &[u8]) -> impl Iterator<Item = u64> + '_ {
         .0
         .iter()
         .map(|c| u64::from_le_bytes(*c))
+}
+
+/// What the kernel reads from the FADT (signature `"FACP"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fadt {
+    /// The CMOS index of the RTC's century register, if the firmware names a usable one
+    /// (`CENTURY`, offset 108; 0 means none). Indexes 00h–0Dh are the clock's own
+    /// registers and 80h and above are outside the standard bank, so neither is accepted.
+    pub century: Option<u8>,
+    /// `IAPC_BOOT_ARCH` (offset 109) bit 5: the platform has no CMOS RTC.
+    pub cmos_rtc_absent: bool,
+}
+
+/// Offset of the FADT's `CENTURY` byte.
+const FADT_CENTURY: usize = 108;
+/// Offset of the FADT's 16-bit `IAPC_BOOT_ARCH` flags.
+const FADT_IAPC_BOOT_ARCH: usize = 109;
+/// `IAPC_BOOT_ARCH` bit 5: CMOS RTC not present.
+const CMOS_RTC_NOT_PRESENT: u16 = 1 << 5;
+
+/// Reads the fields of a checked FADT that the kernel uses. A table too short to hold
+/// them (an ACPI 1.0 FADT has them; anything shorter is malformed) is refused.
+pub fn parse_fadt(fadt: &[u8]) -> Result<Fadt, AcpiError> {
+    let short = || AcpiError::Length(u32::try_from(fadt.len()).unwrap_or(u32::MAX));
+    let century = *fadt.get(FADT_CENTURY).ok_or_else(short)?;
+    let arch = fadt
+        .get(FADT_IAPC_BOOT_ARCH..FADT_IAPC_BOOT_ARCH + 2)
+        .ok_or_else(short)?;
+    let arch = u16::from_le_bytes([
+        arch.first().copied().unwrap_or(0),
+        arch.get(1).copied().unwrap_or(0),
+    ]);
+    Ok(Fadt {
+        century: (0x0E..=0x7F).contains(&century).then_some(century),
+        cmos_rtc_absent: arch & CMOS_RTC_NOT_PRESENT != 0,
+    })
 }
 
 /// One processor the MADT lists.
@@ -335,6 +372,39 @@ mod tests {
             madt_processors(&m, &mut small),
             Err(AcpiError::TooManyProcessors)
         );
+    }
+
+    #[test]
+    fn fadt_century_register_and_rtc_presence() {
+        // An ACPI 6 FADT is 276 bytes: a 240-byte body after the header.
+        let fadt = |century: u8, arch: u16| {
+            let mut body = vec![0u8; 240];
+            body[FADT_CENTURY - 36] = century;
+            body[FADT_IAPC_BOOT_ARCH - 36..FADT_IAPC_BOOT_ARCH - 34]
+                .copy_from_slice(&arch.to_le_bytes());
+            table(b"FACP", &body)
+        };
+        let qemu = fadt(0x32, 0);
+        assert_eq!(check_table(&qemu, b"FACP"), Ok(()));
+        assert_eq!(
+            parse_fadt(&qemu),
+            Ok(Fadt {
+                century: Some(0x32),
+                cmos_rtc_absent: false
+            })
+        );
+        for unusable in [0x00, 0x0B, 0x0D, 0x80, 0xFF] {
+            assert_eq!(
+                parse_fadt(&fadt(unusable, 0)).unwrap().century,
+                None,
+                "{unusable:#x}"
+            );
+        }
+        assert_eq!(parse_fadt(&fadt(0x0E, 0)).unwrap().century, Some(0x0E));
+        assert!(parse_fadt(&fadt(0x32, 1 << 5)).unwrap().cmos_rtc_absent);
+        assert!(!parse_fadt(&fadt(0x32, !(1 << 5))).unwrap().cmos_rtc_absent);
+        assert_eq!(parse_fadt(&qemu[..110]), Err(AcpiError::Length(110)));
+        assert!(parse_fadt(&qemu[..111]).is_ok());
     }
 
     #[test]

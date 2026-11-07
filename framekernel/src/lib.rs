@@ -18,6 +18,8 @@
 //! - [`apic`]: x2APIC and 8254 PIT encodings and timer calibration arithmetic;
 //! - [`boot`]: boot-info validation and the memory summary;
 //! - [`channel`]: one channel's queues, limits and signals (ADR-0005 P8);
+//! - [`clock`]: monotonic-clock arithmetic (ticks to nanoseconds and back) and the CPUID
+//!   TSC rate;
 //! - [`descriptors`]: GDT, TSS and IDT descriptor encodings;
 //! - [`frames`]: the physical frame allocator over the boot-info regions;
 //! - [`handles`]: per-process handle tables with rights (ADR-0005 P1–P2);
@@ -26,7 +28,8 @@
 //!   shared with the loader);
 //! - [`runqueue`]: the per-CPU round-robin run queue (scheduler policy);
 //! - [`serial`]: a polled 16550 UART driver over an abstract register interface;
-//! - [`report`]: the exact console text.
+//! - [`report`]: the exact console text;
+//! - [`rtc`]: CMOS RTC decoding and UTC calendar arithmetic.
 //!
 //! The binary holds the entry point, x86 port I/O, the descriptor tables, exception and
 //! interrupt stubs, MSR access and fault probes (`src/cpu.rs`), the APIC timer bring-up
@@ -43,11 +46,13 @@ pub mod acpi;
 pub mod apic;
 pub mod boot;
 pub mod channel;
+pub mod clock;
 pub mod descriptors;
 pub mod frames;
 pub mod handles;
 pub mod heap;
 pub use origin_paging as paging;
 pub mod report;
+pub mod rtc;
 pub mod runqueue;
 pub mod serial;
