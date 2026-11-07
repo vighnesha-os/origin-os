@@ -143,6 +143,124 @@ impl PartialEq for Version {
 }
 impl Eq for Version {}
 
+impl Version {
+    /// A normal (no-prerelease, no-build) version, for computing range bounds.
+    fn normal(major: u64, minor: u64, patch: u64) -> Version {
+        Version {
+            major,
+            minor,
+            patch,
+            pre: Vec::new(),
+            build: None,
+        }
+    }
+
+    fn same_core(&self, other: &Version) -> bool {
+        (self.major, self.minor, self.patch) == (other.major, other.minor, other.patch)
+    }
+}
+
+/// A single comparator's operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op {
+    Exact,
+    Greater,
+    GreaterEq,
+    Less,
+    LessEq,
+    /// `^`: compatible within the left-most non-zero field.
+    Caret,
+    /// `~`: patch-level changes within the minor.
+    Tilde,
+}
+
+#[derive(Debug)]
+struct Comparator {
+    op: Op,
+    base: Version,
+}
+
+impl Comparator {
+    /// The exclusive upper bound of a caret/tilde comparator.
+    fn upper(&self) -> Version {
+        let b = &self.base;
+        match self.op {
+            Op::Tilde => Version::normal(b.major, b.minor + 1, 0),
+            Op::Caret if b.major > 0 => Version::normal(b.major + 1, 0, 0),
+            Op::Caret if b.minor > 0 => Version::normal(0, b.minor + 1, 0),
+            Op::Caret => Version::normal(0, 0, b.patch + 1),
+            _ => b.clone(),
+        }
+    }
+
+    fn matches(&self, v: &Version) -> bool {
+        // Prerelease gate (the Cargo/npm convention): a prerelease version may only match
+        // when the comparator's own base is a prerelease on the same core — so `1.2.4-rc`
+        // never slips into `^1.2.3`, and `2.0.0-rc` never into `<2.0.0`.
+        if v.is_prerelease() && !(self.base.is_prerelease() && v.same_core(&self.base)) {
+            return false;
+        }
+        match self.op {
+            Op::Exact => v == &self.base,
+            Op::Greater => v > &self.base,
+            Op::GreaterEq => v >= &self.base,
+            Op::Less => v < &self.base,
+            Op::LessEq => v <= &self.base,
+            Op::Caret | Op::Tilde => v >= &self.base && v < &self.upper(),
+        }
+    }
+}
+
+/// A version requirement: a conjunction (AND) of comma-separated comparators, e.g.
+/// `">=1.2.0, <2.0.0"` or `"^1.4.2"`. A bare version (no operator) is exact.
+#[derive(Debug)]
+pub struct Req {
+    comparators: Vec<Comparator>,
+}
+
+/// Parses a requirement string, or `None` if any comparator is malformed.
+pub fn parse_req(input: &str) -> Option<Req> {
+    let mut comparators = Vec::new();
+    for part in input.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        let (op, rest) = if let Some(r) = part.strip_prefix(">=") {
+            (Op::GreaterEq, r)
+        } else if let Some(r) = part.strip_prefix("<=") {
+            (Op::LessEq, r)
+        } else if let Some(r) = part.strip_prefix('>') {
+            (Op::Greater, r)
+        } else if let Some(r) = part.strip_prefix('<') {
+            (Op::Less, r)
+        } else if let Some(r) = part.strip_prefix('^') {
+            (Op::Caret, r)
+        } else if let Some(r) = part.strip_prefix('~') {
+            (Op::Tilde, r)
+        } else if let Some(r) = part.strip_prefix('=') {
+            (Op::Exact, r)
+        } else {
+            (Op::Exact, part)
+        };
+        comparators.push(Comparator {
+            op,
+            base: parse(rest.trim())?,
+        });
+    }
+    if comparators.is_empty() {
+        return None;
+    }
+    Some(Req { comparators })
+}
+
+impl Req {
+    /// Whether `version` satisfies every comparator.
+    pub fn matches(&self, version: &Version) -> bool {
+        self.comparators.iter().all(|c| c.matches(version))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +358,74 @@ mod tests {
             sorted,
             ["0.9.9", "1.0.0-pre", "1.0.0-pre", "1.0.0", "1.0.1"]
         );
+    }
+
+    fn req(s: &str) -> Req {
+        parse_req(s).unwrap_or_else(|| panic!("parse_req {s:?}"))
+    }
+
+    #[test]
+    fn caret_tilde_and_range_requirements() {
+        // Caret: compatible within the left-most non-zero field.
+        let r = req("^1.2.3");
+        assert!(r.matches(&v("1.2.3")) && r.matches(&v("1.2.9")) && r.matches(&v("1.9.0")));
+        assert!(!r.matches(&v("1.2.2")) && !r.matches(&v("2.0.0")));
+        assert!(req("^0.2.3").matches(&v("0.2.9")) && !req("^0.2.3").matches(&v("0.3.0")));
+        assert!(req("^0.0.3").matches(&v("0.0.3")) && !req("^0.0.3").matches(&v("0.0.4")));
+        // Tilde: patch-level within the minor.
+        let t = req("~1.2.3");
+        assert!(t.matches(&v("1.2.3")) && t.matches(&v("1.2.99")));
+        assert!(!t.matches(&v("1.3.0")) && !t.matches(&v("1.2.2")));
+        // A comma-separated range (AND) and explicit comparators.
+        let range = req(">=1.0.0, <2.0.0");
+        assert!(
+            range.matches(&v("1.5.0"))
+                && !range.matches(&v("2.0.0"))
+                && !range.matches(&v("0.9.9"))
+        );
+        assert!(req("=1.2.3").matches(&v("1.2.3")) && !req("=1.2.3").matches(&v("1.2.4")));
+        assert!(req("1.2.3").matches(&v("1.2.3")), "a bare version is exact");
+    }
+
+    #[test]
+    fn prerelease_only_matches_when_opted_in() {
+        // A prerelease never slips into a normal requirement, even inside its range.
+        assert!(
+            !req("^1.2.3").matches(&v("1.2.4-rc.1")),
+            "different core prerelease"
+        );
+        assert!(
+            !req(">=1.0.0, <2.0.0").matches(&v("2.0.0-rc.1")),
+            "upper-bound prerelease"
+        );
+        assert!(!req(">=1.0.0").matches(&v("1.5.0-alpha")));
+        // It matches only when a comparator names the same core and is itself a prerelease.
+        assert!(req("^1.2.3-rc.1").matches(&v("1.2.3-rc.1")));
+        assert!(req("^1.2.3-rc.1").matches(&v("1.2.3-rc.2")));
+        assert!(
+            req("^1.2.3-rc.1").matches(&v("1.2.3")),
+            "the normal release is in range"
+        );
+        assert!(
+            !req("^1.2.3-rc.5").matches(&v("1.2.3-rc.1")),
+            "below the floor"
+        );
+        assert!(req(">=1.2.3-rc.1").matches(&v("1.2.3-rc.1")));
+    }
+
+    #[test]
+    fn rejects_malformed_requirements() {
+        for bad in [
+            "",
+            "   ",
+            ">=",
+            "^1.2",
+            ">= 1.0.0, ",
+            "~bad",
+            "1.2.3 1.4.0",
+            ">1",
+        ] {
+            assert!(parse_req(bad).is_none(), "{bad:?} must be rejected");
+        }
     }
 }
