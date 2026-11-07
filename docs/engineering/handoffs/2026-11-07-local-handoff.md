@@ -184,6 +184,13 @@ The owner asked for the design to be finalised with the recommended options, fol
 | `ec9c729` | NUMA locality map (CPU/address → node, nearest-node order, self-nearest) |
 | `a017bc6` | Streaming UTF-8 decoder for the text engine (byte-exact vs `core::str` over 20k fuzzed inputs) |
 | `a5b139b` | Gap buffer for editable text (50k-op model test) |
+| `ca9d3ce` | Records: STATUS and handoff for the NUMA/OriginFS/text work |
+| `ca44453` | Hardware entropy: RDSEED/RDRAND with bounded retries (boot-proven) |
+| `36cfaf9` | Glob pattern matching for names and paths |
+| `a34f0a9` | IPv4 longest-prefix-match routing table (bit trie, oracle-tested) |
+| `54e2aea` | DNS message parsing with bounded name decompression |
+| `32f3ae1` | Mutation soaks for SRAT/SLIT/DNS/OriginFS; cap `read_whole` |
+| `5774b7f` | Fixed-size bit allocator (lowest-free, model-tested) |
 
 (The 2026-11-08 commits use the Claude Opus 4.8 attribution; the run spanned midnight.)
 
@@ -242,3 +249,32 @@ NUMA-aware frame allocator and scheduler placement (§66) are the deliberate nex
 for a careful change rather than an unattended edit to the core allocator. ADR-0005
 (syscalls) remains untouched; the owner's non-design items (downloads, a licence,
 merge/push) remain.
+
+### Continued (2026-11-08, ~03:50–04:20 IST)
+
+Six more commits:
+
+- `ca44453` **Hardware entropy (§59).** A kernel entropy source: a pure bounded-retry
+  `draw`/`fill` layer (`entropy`) over RDSEED/RDRAND wrappers in `cpu.rs`. Boot proof: 16
+  draws, all distinct and non-zero (`entropy: … consistent true`) at `-smp` 1/2/4/8.
+  Negative control: a constant drawn value fails the boot. It is a true-random source, not
+  a DRBG (that needs KATs and review, deferred).
+- `36cfaf9` **Glob matching (§39).** `glob::matches` (`*`, `?`, `[...]` with ranges/
+  negation, `\` escapes; wildcards never cross `/`), single-star-pointer backtracking that
+  terminates on adversarial patterns. Host-tested.
+- `a34f0a9` **IPv4 LPM routing (§54).** `route::Table<V>`, a bit trie; `lookup` oracle-
+  tested against a brute-force longest-match scan over 2 000 random tables.
+- `54e2aea` **DNS parsing (§54).** `dns::parse` with RFC 1035 name compression, bounded so
+  a decompression bomb is a clean `None`. The round-trip test caught a real `rdlength`
+  offset bug. Host-tested.
+- `32f3ae1` **Mutation soaks + a fix.** "Never panics on mutated input" soaks for SRAT/
+  SLIT/DNS/OriginFS; the soak found that `OriginFS::read_whole` allocated `inode.size`
+  unbounded, now capped to v0's addressing (~2 MiB).
+- `5774b7f` **Bit allocator (§40, §29).** `bitmap::Bitmap` (lowest-free alloc, exact free
+  count), 60 000-op model test; the primitive for an FS free-space map and id pools.
+
+**Verification pass (~04:20 IST):** the full workspace is **456 tests, 0 failures** (6
+ignored = the download-gated crypto vectors); the 40× mutation soak runs 9 parser suites
+with 0 failures (~31 s); an 8-CPU boot comes up with NUMA, SLIT and entropy all consistent;
+`cargo xtask check` passes. **215 framekernel host library tests.** Still QEMU-only (§74);
+ADR-0005 and the owner's non-design items remain.
