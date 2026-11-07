@@ -26,12 +26,14 @@ commands:
   build       build the loader (developer mode) and the KRN kernel image; print their paths
   boot-test   boot under QEMU + OVMF twice: the kernel must start and report; a tampered
               kernel image must be rejected by the loader
+  boot-matrix boot-test with 1, 2 and 4 processors, one after another
   run         boot under QEMU with the serial console on this terminal (Ctrl-A X quits)
 
 environment:
   ORIGIN_OVMF_CODE, ORIGIN_OVMF_VARS  firmware code image and NVRAM template
                                       (default: the EDK2 files installed next to QEMU)
   ORIGIN_BOOT_TEST_TIMEOUT            boot-test timeout in seconds (default 120)
+  ORIGIN_QEMU_SMP                     processors QEMU emulates, 1-64 (default 2)
   ORIGIN_QEMU_DEBUG                   if set, QEMU logs interrupts and resets to
                                       target/xtask/qemu-debug.log";
 
@@ -239,6 +241,7 @@ fn main() -> ExitCode {
             Ok(())
         }),
         ["boot-test"] => boot_test(),
+        ["boot-matrix"] => boot_matrix(),
         ["run"] => run(),
         _ => {
             eprintln!("{USAGE}");
@@ -252,6 +255,27 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Runs `boot-test` in a child process for each processor count, so each gets its own
+/// `ORIGIN_QEMU_SMP` (the environment of this process is never changed).
+fn boot_matrix() -> Result {
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    for cpus in [1, 2, 4] {
+        println!("xtask: boot-matrix: {cpus} processor(s)");
+        let status = Command::new(&exe)
+            .arg("boot-test")
+            .env("ORIGIN_QEMU_SMP", cpus.to_string())
+            .status()
+            .map_err(|e| format!("cannot run boot-test: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "boot-test with {cpus} processor(s) failed ({status})"
+            ));
+        }
+    }
+    println!("xtask: boot-matrix passed (1, 2 and 4 processors)");
+    Ok(())
 }
 
 // ------------------------------------------------------------------ paths and commands
