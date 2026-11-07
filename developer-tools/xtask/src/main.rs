@@ -79,6 +79,24 @@ fn qemu_cpus() -> u32 {
 }
 
 fn boot_scenario() -> Scenario {
+    let mut scenario = boot_scenario_markers();
+    // With more than one processor, the first AP's start-up line comes right after the
+    // MADT line.
+    if qemu_cpus() > 1
+        && let Some(at) = scenario
+            .markers
+            .iter()
+            .position(|m| m.starts_with("origin-kernel: ACPI MADT: "))
+    {
+        scenario.markers.insert(
+            at + 1,
+            "origin-kernel: CPU 1 (APIC ID 1) online after ".into(),
+        );
+    }
+    scenario
+}
+
+fn boot_scenario_markers() -> Scenario {
     use origin_version::{BUILD, PRODUCT, VERSION};
     let cpus = qemu_cpus();
     Scenario {
@@ -126,7 +144,6 @@ fn boot_scenario() -> Scenario {
             "origin-kernel: APIC timer: 50 interrupts at 100 Hz in ".into(),
             // M3: every processor QEMU emulates (`-smp`, see `qemu_cpus`) comes online.
             format!("origin-kernel: ACPI MADT: {cpus} processors, {cpus} enabled"),
-            "origin-kernel: CPU 1 (APIC ID 1) online after ".into(),
             format!("origin-kernel: SMP: {cpus} of {cpus} enabled processors online"),
             "origin-kernel: reclaimed ".into(),
             "origin-kernel: page protection: stack guard page at ".into(),
