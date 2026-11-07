@@ -619,6 +619,17 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - An 8-processor boot (`ORIGIN_QEMU_SMP=8`): all 8 online, the scheduler on every one, the clock consistent across 8 (0 backwards), and 8 per-CPU NVMe queues doing I/O at once.
   - A 40x parser-mutation soak (`ORIGIN_MUTATION_SCALE=40`, release): ~800,000 parser cases and ~4,000,000 RTC cases over the firmware/device parsers, 0 failures, in about 7 s.
 
+### I/O APIC interrupt routing (CLAUDE.md §24, §31; 2026-11-08)
+
+- **What:**
+  - `acpi`: MADT parsing extended to I/O APIC structures (type 1: id, MMIO base, GSI base) and interrupt source overrides (type 2), with `gsi_for_irq` resolving a legacy ISA IRQ to its global system interrupt and flags (an override, else identity).
+  - `ioapic` (library): the redirection-table register indexes, the version register's max-entry field, MPS INTI flag decoding (polarity and trigger), and the redirection-entry bit layout (vector, fixed delivery, physical destination APIC id, polarity, trigger, mask). Host-tested.
+  - `irq` (binary): finds the I/O APIC via the MADT, maps its registers uncached, programs a redirection entry through IOREGSEL/IOWIN (high dword first), and the 8254 PIT channel 0 as a 100 Hz rate generator.
+- **Proof** (every boot): the I/O APIC is id 0 with 24 entries at 0xfec00000; the PIT's IRQ0, remapped to GSI 2 by a MADT override, is routed to vector 0x41 on the boot processor, and 20 periodic interrupts arrive in ~204 ms (polling with interrupt windows, never halting). The entry is then masked and the PIT stopped; nothing schedules on it yet.
+- **Negative control** (failing the boot test): the redirection entry left masked → 0 interrupts in 2 s → "I/O APIC failed".
+- **Test evidence:** 7 `acpi` tests (I/O APIC and overrides among them) and 3 `ioapic` tests; 163 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** routing the keyboard IRQ1 to a handler for live keystrokes (the i8042 bring-up is done; this is the remaining link), level-triggered PCI INTx routing, per-CPU interrupt affinity and balancing, and an EOI path for the I/O APIC's own remote-IRR on level interrupts.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.

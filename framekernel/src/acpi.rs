@@ -235,6 +235,102 @@ pub fn madt_processors(madt: &[u8], out: &mut [Processor]) -> Result<usize, Acpi
     Ok(count)
 }
 
+/// An I/O APIC the MADT lists (structure type 1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IoApic {
+    pub id: u8,
+    /// MMIO base of its registers.
+    pub address: u32,
+    /// The first global system interrupt this I/O APIC handles.
+    pub gsi_base: u32,
+}
+
+/// An interrupt source override (structure type 2): a legacy ISA IRQ is delivered as a
+/// different global system interrupt, with a polarity/trigger override.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SourceOverride {
+    pub source_irq: u8,
+    pub gsi: u32,
+    pub flags: u16,
+}
+
+/// Lists the I/O APICs in a checked MADT into `out`; returns how many.
+pub fn madt_ioapics(madt: &[u8], out: &mut [IoApic]) -> Result<usize, AcpiError> {
+    madt_scan(
+        madt,
+        |kind, entry, count, out: &mut [IoApic]| {
+            if kind == 1 && entry.len() >= 12 {
+                let ioapic = IoApic {
+                    id: entry.get(2).copied().unwrap_or(0),
+                    address: u32_at(entry, 4).unwrap_or(0),
+                    gsi_base: u32_at(entry, 8).unwrap_or(0),
+                };
+                *out.get_mut(count).ok_or(AcpiError::TooManyProcessors)? = ioapic;
+                return Ok(true);
+            }
+            Ok(false)
+        },
+        out,
+    )
+}
+
+/// Lists the interrupt source overrides into `out`; returns how many.
+pub fn madt_overrides(madt: &[u8], out: &mut [SourceOverride]) -> Result<usize, AcpiError> {
+    madt_scan(
+        madt,
+        |kind, entry, count, out: &mut [SourceOverride]| {
+            if kind == 2 && entry.len() >= 10 {
+                let iso = SourceOverride {
+                    source_irq: entry.get(3).copied().unwrap_or(0),
+                    gsi: u32_at(entry, 4).unwrap_or(0),
+                    flags: u16::from_le_bytes([
+                        entry.get(8).copied().unwrap_or(0),
+                        entry.get(9).copied().unwrap_or(0),
+                    ]),
+                };
+                *out.get_mut(count).ok_or(AcpiError::TooManyProcessors)? = iso;
+                return Ok(true);
+            }
+            Ok(false)
+        },
+        out,
+    )
+}
+
+/// The global system interrupt and flags a legacy ISA `irq` maps to: the matching override,
+/// else the identity mapping with default (active-high, edge) flags.
+pub fn gsi_for_irq(irq: u8, overrides: &[SourceOverride]) -> (u32, u16) {
+    overrides
+        .iter()
+        .find(|o| o.source_irq == irq)
+        .map_or((u32::from(irq), 0), |o| (o.gsi, o.flags))
+}
+
+/// Walks a checked MADT, calling `f(kind, entry, count_so_far, out)` for each structure;
+/// `f` returns whether it recorded an entry. Returns how many were recorded.
+fn madt_scan<T>(
+    madt: &[u8],
+    mut f: impl FnMut(u8, &[u8], usize, &mut [T]) -> Result<bool, AcpiError>,
+    out: &mut [T],
+) -> Result<usize, AcpiError> {
+    let mut count = 0;
+    let mut at = MADT_ENTRIES;
+    while at < madt.len() {
+        let (Some(&kind), Some(&len)) = (madt.get(at), madt.get(at + 1)) else {
+            return Err(AcpiError::MadtEntry(at));
+        };
+        let entry = madt
+            .get(at..at + usize::from(len))
+            .filter(|_| len >= 2)
+            .ok_or(AcpiError::MadtEntry(at))?;
+        if f(kind, entry, count, out)? {
+            count += 1;
+        }
+        at += usize::from(len);
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +563,50 @@ mod tests {
             }
         }
         assert!(accepted.iter().all(|&n| n > 100), "{accepted:?}");
+    }
+
+    fn ioapic(id: u8, addr: u32, gsi: u32) -> Vec<u8> {
+        let mut e = alloc::vec![1u8, 12, id, 0];
+        e.extend_from_slice(&addr.to_le_bytes());
+        e.extend_from_slice(&gsi.to_le_bytes());
+        e
+    }
+
+    fn iso(source: u8, gsi: u32, flags: u16) -> Vec<u8> {
+        let mut e = alloc::vec![2u8, 10, 0, source];
+        e.extend_from_slice(&gsi.to_le_bytes());
+        e.extend_from_slice(&flags.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn ioapics_overrides_and_gsi_mapping() {
+        let m = madt(&[
+            &lapic(0, 0, 1),
+            &ioapic(2, 0xFEC0_0000, 0),
+            &iso(0, 2, 0),      // the PIT's IRQ0 is delivered as GSI 2
+            &iso(9, 9, 0x000D), // active-low, level-triggered
+        ]);
+        assert_eq!(check_table(&m, b"APIC"), Ok(()));
+        let mut ios = [IoApic::default(); 4];
+        assert_eq!(madt_ioapics(&m, &mut ios), Ok(1));
+        assert_eq!(
+            ios[0],
+            IoApic {
+                id: 2,
+                address: 0xFEC0_0000,
+                gsi_base: 0
+            }
+        );
+        let mut over = [SourceOverride::default(); 4];
+        assert_eq!(madt_overrides(&m, &mut over), Ok(2));
+        assert_eq!(gsi_for_irq(0, &over[..2]), (2, 0), "IRQ0 -> GSI 2");
+        assert_eq!(gsi_for_irq(9, &over[..2]), (9, 0x000D));
+        assert_eq!(
+            gsi_for_irq(1, &over[..2]),
+            (1, 0),
+            "no override: identity, default flags"
+        );
     }
 
     #[test]

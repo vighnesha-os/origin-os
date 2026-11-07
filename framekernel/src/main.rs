@@ -36,6 +36,7 @@ mod console;
 mod cpu;
 mod firmware;
 mod i8042;
+mod irq;
 mod memory;
 mod pcie;
 mod phys;
@@ -209,6 +210,10 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         // The clocks: the monotonic clock's TSC rate, proven against the RTC, and the wall
         // clock from the RTC (CLAUDE.md §68).
         time::init(&mut com1, hz, info.acpi_rsdp);
+        // I/O APIC interrupt routing, proven by routing the PIT's IRQ0 (CLAUDE.md §24).
+        // SAFETY: the BSP's APIC is in x2APIC mode (timer::init) and the PICs are masked.
+        let bsp = unsafe { timer::X2Apic::enable() }.read(timer::ApicRead::Id) as u32;
+        irq::prove(&mut com1, info.acpi_rsdp, bsp, hz);
     }
 
     // M3, first step: start the application processors the ACPI MADT lists. It needs the

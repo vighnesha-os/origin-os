@@ -28,6 +28,7 @@
 //! - [`handles`]: per-process handle tables with rights (ADR-0005 P1–P2);
 //! - [`heap`]: kernel heap bookkeeping (slabs and frame runs), addresses only;
 //! - [`hpet`]: the ACPI HPET table and main-counter arithmetic;
+//! - [`ioapic`]: I/O APIC redirection-table encoding;
 //! - [`net`]: Ethernet/IPv4/ICMP/ARP headers and the Internet checksum;
 //! - [`tcp`]: TCP segments and a minimal connection state machine;
 //! - [`timers`]: a monotonic-deadline timer queue;
@@ -69,6 +70,7 @@ pub mod gpt;
 pub mod handles;
 pub mod heap;
 pub mod hpet;
+pub mod ioapic;
 pub mod net;
 pub mod nvme;
 pub use origin_paging as paging;

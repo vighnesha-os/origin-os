@@ -114,7 +114,7 @@ pub(crate) unsafe fn init() {
     if let Some(gate) = idt.0.get_mut(usize::from(SYSCALL_VECTOR)) {
         *gate = d::user_interrupt_gate((syscall_stub as *const ()).addr() as u64, KERNEL_CODE);
     }
-    let interrupts: [(u8, extern "sysv64" fn()); 9] = [
+    let interrupts: [(u8, extern "sysv64" fn()); 10] = [
         (TIMER_VECTOR, timer_stub),
         (SPURIOUS_VECTOR, spurious_stub),
         (YIELD_VECTOR, yield_stub),
@@ -124,6 +124,7 @@ pub(crate) unsafe fn init() {
         (crate::tlb::SHOOTDOWN_VECTOR, shootdown_stub),
         (RESCHEDULE_VECTOR, reschedule_stub),
         (DEVICE_VECTOR, device_stub),
+        (IOAPIC_VECTOR, ioapic_stub),
     ];
     for (vector, stub) in interrupts {
         if let Some(gate) = idt.0.get_mut(usize::from(vector)) {
@@ -458,6 +459,16 @@ pub(crate) const BLOCK_VECTOR: u8 = 0x84;
 pub(crate) const RESCHEDULE_VECTOR: u8 = 0xF1;
 /// The NVMe controller's I/O completion interrupt (an MSI-X message).
 pub(crate) const DEVICE_VECTOR: u8 = 0x40;
+/// A legacy IRQ routed through the I/O APIC (the PIT, in the routing proof).
+pub(crate) const IOAPIC_VECTOR: u8 = 0x41;
+
+/// Interrupts taken on [`IOAPIC_VECTOR`].
+static IOAPIC_IRQS: AtomicU64 = AtomicU64::new(0);
+
+/// How many I/O APIC-routed interrupts have been taken.
+pub(crate) fn ioapic_irqs() -> u64 {
+    IOAPIC_IRQS.load(Ordering::Relaxed)
+}
 /// The system-call vector, the only gate user mode may raise (DPL 3). RAX: 0 exit(RDI),
 /// 1 report(RDI); anything else returns `u64::MAX` in RAX.
 pub(crate) const SYSCALL_VECTOR: u8 = 0x80;
@@ -509,6 +520,15 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         return crate::sched::on_tick(here);
     }
     if frame.vector == u64::from(SPURIOUS_VECTOR) {
+        return here;
+    }
+    // A legacy IRQ routed through the I/O APIC (the PIT, for the routing proof): count and
+    // acknowledge.
+    if frame.vector == u64::from(IOAPIC_VECTOR) {
+        IOAPIC_IRQS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: as for the timer; x2APIC mode is on, and the write only acknowledges the
+        // interrupt in service.
+        unsafe { wrmsr(X2APIC_EOI, 0) };
         return here;
     }
     // A device's MSI-X message (the NVMe I/O queue): acknowledge, let the driver wake its
@@ -1398,6 +1418,7 @@ soft_stub!(shootdown_stub, crate::tlb::SHOOTDOWN_VECTOR);
 soft_stub!(block_stub, BLOCK_VECTOR);
 soft_stub!(reschedule_stub, RESCHEDULE_VECTOR);
 soft_stub!(device_stub, DEVICE_VECTOR);
+soft_stub!(ioapic_stub, IOAPIC_VECTOR);
 
 /// Entry stub of the spurious-interrupt vector.
 #[unsafe(naked)]
