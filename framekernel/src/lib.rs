@@ -23,6 +23,7 @@
 //! - [`clock`]: monotonic-clock arithmetic (ticks to nanoseconds and back) and the CPUID
 //!   TSC rate;
 //! - [`descriptors`]: GDT, TSS and IDT descriptor encodings;
+//! - [`dns`]: DNS message parsing with bounded name decompression;
 //! - [`editbuffer`]: a gap buffer for editable text (caret, insert/delete);
 //! - [`entropy`]: bounded-retry hardware entropy draw/fill over an abstract source;
 //! - [`features`]: CPUID feature decoding and the x86-64-v3 baseline;
@@ -75,6 +76,7 @@ pub mod cache;
 pub mod channel;
 pub mod clock;
 pub mod descriptors;
+pub mod dns;
 pub mod editbuffer;
 pub mod entropy;
 pub mod features;
