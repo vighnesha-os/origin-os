@@ -320,6 +320,29 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Evidence:** `cargo xtask check` and `boot-matrix` (1, 2 and 4 CPUs) pass; boot to halt takes 4.8, 5.4 and 7.1 s.
 - **Limitation:** interrupts stay off while one line is sent. In QEMU that is microseconds; at 115 200 baud on real hardware it is about 9 ms per 100 bytes. Production logging will go to a memory ring drained by a thread (CLAUDE.md §69).
 
+### TLB shootdown and global kernel pages (ADR-0004 H5; CLAUDE.md §28, 2026-11-07)
+
+- **The gap closed:** before this, a guard page made while application processors ran (every `spawn` makes one) was invalidated only on the processor that made it. Another processor could keep the old translation, a 2 MiB one included, and run through the guard without a fault. The negative control below shows QEMU really keeps such stale entries.
+- **What:**
+  - `origin-paging`: `Attributes::kernel_global`, `Translation::global`, and `AddressSpace::leaf_census` (present leaves by half and by global bit). The layout builder marks the whole kernel half (direct map and image) global.
+  - `cpu`: `enable_global_pages` (CR4.PGE, cleared then set, which also drops every translation cached under the loader's tables), `flush_tlb_all` (toggles CR4.PGE when it is set, since a CR3 load keeps global entries; else reloads CR3), `invlpg`, and the gate for vector 0xF0.
+  - `tlb` (binary), the shootdown:
+    - one request at a time, under an initiator lock; a processor waiting for the lock serves the request in progress, so two initiators never deadlock;
+    - each request has a generation; every processor records the last one it served, and the initiator waits for every target's record (panicking after about a second, because carrying on would not be memory-safe);
+    - targets are the processors whose schedulers run, each sent a fixed IPI by its x2APIC ID. A processor marks itself online and then flushes everything, so no request falls between the two.
+  - `vm`: `unmap` and `make_guard` shoot down once the address-space lock is released; `make_guards` unmaps several pages with one full flush. `map_firmware` and `unguard` map global pages.
+- **Specifications:** Intel SDM Vol. 3A §4.10.2.4 (global pages), §4.10.4 (invalidation: INVLPG, CR3 and CR4.PGE writes), §4.10.5 (propagation to multiple processors), the x2APIC ICR; Vol. 2A, INVLPG.
+- **Proof** (every boot):
+  - Every processor turned on global pages, and the kernel's tables hold 4269 to 4296 kernel-half leaves, all global, and none in the lower half.
+  - Every application processor reads three heap pages, then stops touching them. The boot processor unmaps one with a single-page shootdown and two with one full flush. Every processor's next read of each page must fault: 3 of 3 at 2 CPUs, 9 of 9 at 4.
+  - Measured in QEMU TCG (comparisons only): a single-page shootdown took 11 000 to 48 000 TSC cycles at 2 to 4 CPUs, a full flush 92 000 to 113 000.
+- **Negative controls**, each restored and each failing the boot test:
+  - No IPIs sent: "0 of their 3 reads faulted and 3 saw a stale translation".
+  - The direct map left non-global: "upper_local: 4199 … TLB failed".
+  - An earlier attempt at that control changed `map_firmware`. It passed, because this boot maps no new firmware page, and so proved nothing; it was redone on the layout builder.
+- **Test evidence:** 16 `origin-paging` tests (the census, and global bits surviving a large-page split); `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** PCIDs for user address spaces (every CR3 switch still drops all non-global entries); shootdowns for user mappings of a process running on several processors (processes are single-threaded so far); INVPCID.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

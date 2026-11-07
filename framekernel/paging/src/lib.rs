@@ -76,6 +76,17 @@ impl Attributes {
         }
     }
 
+    /// A supervisor-only global mapping: for the kernel half, which every address space
+    /// shares, so its translations may outlive a CR3 load (ADR-0004 H5). Never for the
+    /// lower half, whose translations belong to one process.
+    pub const fn kernel_global(access: Access) -> Self {
+        Self {
+            access,
+            user: false,
+            global: true,
+        }
+    }
+
     const fn bits(self) -> u64 {
         let access = match self.access {
             Access::Read => NO_EXECUTE,
@@ -101,6 +112,19 @@ pub struct Translation {
     pub executable: bool,
     /// CPL 3 may access it.
     pub user: bool,
+    /// Global: kept in the TLB across CR3 loads while CR4.PGE is set.
+    pub global: bool,
+}
+
+/// Present leaves of an address space, by half and by the global bit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LeafCensus {
+    /// Kernel-half leaves (PML4 entries 256–511) that are global, and that are not.
+    pub upper_global: u64,
+    pub upper_local: u64,
+    /// Lower-half leaves that are global, and that are not.
+    pub lower_global: u64,
+    pub lower_local: u64,
 }
 
 /// Why a mapping change was refused.
@@ -204,6 +228,36 @@ fn slot(mem: &impl TableMemory, table: u64, virt: u64, level: u32) -> Result<&At
     mem.table(table)
         .and_then(|t| t.get(index(virt, level)))
         .ok_or(MapError::UnknownTable(table))
+}
+
+/// Adds the leaves under the entry `value` at `level` (3: a PML4 entry) to `census`.
+fn census_below(
+    mem: &impl TableMemory,
+    value: u64,
+    level: u32,
+    upper: bool,
+    census: &mut LeafCensus,
+) {
+    if value & PRESENT == 0 {
+        return;
+    }
+    let leaf = level == 0 || (level <= 2 && value & LARGE != 0);
+    if leaf {
+        let count = match (upper, value & GLOBAL != 0) {
+            (true, true) => &mut census.upper_global,
+            (true, false) => &mut census.upper_local,
+            (false, true) => &mut census.lower_global,
+            (false, false) => &mut census.lower_local,
+        };
+        *count = count.saturating_add(1);
+        return;
+    }
+    let (Some(table), Some(below)) = (mem.table(value & ADDRESS), level.checked_sub(1)) else {
+        return;
+    };
+    for entry in table {
+        census_below(mem, entry.load(Ordering::Relaxed), below, upper, census);
+    }
 }
 
 /// One 4-level address space, identified by the physical address of its PML4. Tables are
@@ -427,7 +481,22 @@ impl AddressSpace {
             writable: value & WRITABLE != 0,
             executable: value & NO_EXECUTE == 0,
             user: value & USER != 0,
+            global: value & GLOBAL != 0,
         })
+    }
+
+    /// Counts every present leaf, by half and by the global bit: each half's leaves must be
+    /// all global (the kernel half) or all non-global (the lower half).
+    pub fn leaf_census(&self, mem: &impl TableMemory) -> LeafCensus {
+        let mut census = LeafCensus::default();
+        let Some(pml4) = mem.table(self.root) else {
+            return census;
+        };
+        for (i, entry) in pml4.iter().enumerate() {
+            let upper = i >= ENTRIES / 2;
+            census_below(mem, entry.load(Ordering::Relaxed), 3, upper, &mut census);
+        }
+        census
     }
 
     /// Splits the 2 MiB leaf covering `virt` into 512 4 KiB leaves with the same physical
@@ -521,6 +590,71 @@ mod tests {
         assert_eq!(mem.allocate_table(), Some(ARENA_BASE + 2 * PAGE));
         assert_eq!(mem.allocate_table(), None);
         assert_eq!((mem.used(), mem.remaining()), (3, 0));
+    }
+
+    #[test]
+    fn the_census_counts_leaves_by_half_and_global_bit() {
+        let tables = arena(16);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        assert_eq!(space.leaf_census(&mem), LeafCensus::default());
+        let high = 0xFFFF_8000_0000_0000;
+        space
+            .map(
+                &mut mem,
+                high,
+                0x1000,
+                Attributes::kernel_global(Access::Read),
+            )
+            .unwrap();
+        space
+            .map_large(
+                &mut mem,
+                high + LARGE_PAGE,
+                0x20_0000,
+                Attributes::kernel_global(Access::ReadWrite),
+            )
+            .unwrap();
+        space
+            .map(
+                &mut mem,
+                high + 3 * LARGE_PAGE,
+                0x3000,
+                Attributes::kernel(Access::Read),
+            )
+            .unwrap();
+        space
+            .map_user(&mut mem, 0x40_0000, 0x4000, Access::ReadExecute)
+            .unwrap();
+        space
+            .map(
+                &mut mem,
+                0x50_0000,
+                0x5000,
+                Attributes::kernel_global(Access::Read),
+            )
+            .unwrap();
+        assert_eq!(
+            space.leaf_census(&mem),
+            LeafCensus {
+                upper_global: 2,
+                upper_local: 1,
+                lower_global: 1,
+                lower_local: 1,
+            }
+        );
+        assert!(space.translate(&mem, high).unwrap().global);
+        assert!(!space.translate(&mem, 0x40_0000).unwrap().global);
+        // Splitting a global large page keeps every piece global.
+        space.split_large(&mut mem, high + LARGE_PAGE).unwrap();
+        let census = space.leaf_census(&mem);
+        assert_eq!(census.upper_global, 1 + 512);
+        assert!(
+            space
+                .translate(&mem, high + LARGE_PAGE + 5 * PAGE)
+                .unwrap()
+                .global
+        );
     }
 
     #[test]

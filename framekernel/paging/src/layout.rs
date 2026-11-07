@@ -114,7 +114,8 @@ pub fn build(
 ) -> Result<(AddressSpace, Stats), MapError> {
     let mut space = AddressSpace::new(mem)?;
     let mut stats = Stats::default();
-    let rw = Attributes::kernel(Access::ReadWrite);
+    // The whole kernel half is global (ADR-0004 H5): every address space shares it.
+    let rw = Attributes::kernel_global(Access::ReadWrite);
     for r in regions.iter().filter(|r| direct_mapped(r.kind)) {
         let skip_first =
             r.base == 0 || (r.kind == RegionKind::KernelStack as u32 && r.base == at.stack_guard);
@@ -146,7 +147,7 @@ pub fn build(
             .checked_add(s.rva)
             .ok_or(MapError::Overflow)?;
         let bytes = s.pages.checked_mul(PAGE).ok_or(MapError::Overflow)?;
-        let attributes = Attributes::kernel(segment_access(s));
+        let attributes = Attributes::kernel_global(segment_access(s));
         let (small, large) = space.map_range(mem, virt, phys, bytes, attributes)?;
         stats.small_pages += small;
         stats.large_pages += large;
@@ -244,6 +245,14 @@ mod tests {
         for page in (0..0x2000_0000).step_by(PAGE as usize) {
             assert_eq!(space.translate(&mem, page), None, "{page:#x}");
         }
+        // Every leaf is in the kernel half and global (ADR-0004 H5), both large and small.
+        assert!(text.global && data.global && t(DIRECT + 0x100_0000).global);
+        let census = space.leaf_census(&mem);
+        assert_eq!(
+            census.upper_local + census.lower_global + census.lower_local,
+            0
+        );
+        assert_eq!(census.upper_global, stats.small_pages + stats.large_pages);
     }
 
     #[test]

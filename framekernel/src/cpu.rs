@@ -114,12 +114,13 @@ pub(crate) unsafe fn init() {
     if let Some(gate) = idt.0.get_mut(usize::from(SYSCALL_VECTOR)) {
         *gate = d::user_interrupt_gate((syscall_stub as *const ()).addr() as u64, KERNEL_CODE);
     }
-    let interrupts: [(u8, extern "sysv64" fn()); 5] = [
+    let interrupts: [(u8, extern "sysv64" fn()); 6] = [
         (TIMER_VECTOR, timer_stub),
         (SPURIOUS_VECTOR, spurious_stub),
         (YIELD_VECTOR, yield_stub),
         (SLEEP_VECTOR, sleep_stub),
         (EXIT_VECTOR, exit_stub),
+        (crate::tlb::SHOOTDOWN_VECTOR, shootdown_stub),
     ];
     for (vector, stub) in interrupts {
         if let Some(gate) = idt.0.get_mut(usize::from(vector)) {
@@ -499,6 +500,14 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         return crate::sched::on_tick(here);
     }
     if frame.vector == u64::from(SPURIOUS_VECTOR) {
+        return here;
+    }
+    // Another processor changed a kernel mapping: invalidate it here, then acknowledge.
+    if frame.vector == u64::from(crate::tlb::SHOOTDOWN_VECTOR) {
+        crate::tlb::service();
+        // SAFETY: as for the timer: x2APIC mode is on (only processors with an active
+        // scheduler are sent this vector), and the write only acknowledges the interrupt.
+        unsafe { wrmsr(X2APIC_EOI, 0) };
         return here;
     }
     // NMI: counted and resumed (no NMI source is used yet besides the boot proof).
@@ -920,6 +929,79 @@ pub(crate) unsafe fn probe_execute(target: u64) -> Probe {
     run_probe(target, || unsafe { jump(target) })
 }
 
+/// CR4.PGE: global pages (Intel SDM Vol. 3A §4.10.2.4).
+const CR4_PGE: u64 = 1 << 7;
+
+/// Turns on global pages (CR4.PGE) where supported (CPUID 1 EDX bit 13): kernel-half
+/// translations then outlive CR3 loads. Clearing and setting the bit also invalidates every
+/// TLB entry, global ones included, so nothing cached under earlier tables (the firmware's
+/// or the loader's) survives. Returns whether global pages are on.
+///
+/// # Safety
+///
+/// CPL 0, and the live tables mark global only mappings that every address space shares
+/// (the kernel half); a global user mapping would leak between processes.
+pub(crate) unsafe fn enable_global_pages() -> bool {
+    if cpuid(1)[3] & (1 << 13) == 0 {
+        return false;
+    }
+    // SAFETY: the caller's contract. Each write changes only CR4.PGE, which affects only
+    // which translations the TLB keeps.
+    unsafe {
+        asm!(
+            "mov {tmp}, cr4",
+            "and {tmp}, {clear}",
+            "mov cr4, {tmp}",
+            "or {tmp}, {pge}",
+            "mov cr4, {tmp}",
+            clear = in(reg) !CR4_PGE,
+            pge = in(reg) CR4_PGE,
+            tmp = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+    true
+}
+
+/// Invalidates every TLB entry on this processor, global ones included: CR4.PGE toggled
+/// when it is set (a CR3 load keeps global entries), else a CR3 reload.
+pub(crate) fn flush_tlb_all() {
+    without_interrupts(|| {
+        // SAFETY: CPL 0. CR4 is written back with the value it had, after a write that
+        // differs only in PGE; CR3 is reloaded with its own value. Neither changes which
+        // memory is mapped, only what the TLB holds. Interrupts are off, so no handler sees
+        // CR4 between the writes.
+        unsafe {
+            asm!(
+                "mov {cr4}, cr4",
+                "test {cr4}, {pge}",
+                "jz 2f",
+                "mov {tmp}, {cr4}",
+                "xor {tmp}, {pge}",
+                "mov cr4, {tmp}",
+                "mov cr4, {cr4}",
+                "jmp 3f",
+                "2:",
+                "mov {tmp}, cr3",
+                "mov cr3, {tmp}",
+                "3:",
+                pge = in(reg) CR4_PGE,
+                cr4 = out(reg) _,
+                tmp = out(reg) _,
+                options(nostack),
+            );
+        }
+    });
+}
+
+/// Invalidates this processor's TLB entries for the page holding `addr`, whatever its size
+/// and whether or not it is global (Intel SDM Vol. 2A, INVLPG).
+pub(crate) fn invlpg(addr: u64) {
+    // SAFETY: CPL 0. INVLPG only drops cached translations; it never faults, even for an
+    // unmapped or non-canonical address (a non-canonical one is a no-op).
+    unsafe { asm!("invlpg [{}]", in(reg) addr, options(nostack, preserves_flags)) };
+}
+
 /// CR4.SMEP: supervisor instruction fetches from user pages fault.
 const CR4_SMEP: u64 = 1 << 20;
 /// CR4.SMAP: supervisor data accesses to user pages fault (unless RFLAGS.AC is set).
@@ -1022,7 +1104,8 @@ extern "sysv64" fn timer_stub() {
     );
 }
 
-/// Entry stubs of the scheduler's software interrupts: no error code, so push 0.
+/// Entry stubs of the scheduler's software interrupts and the TLB shootdown IPI: no error
+/// code, so push 0.
 macro_rules! soft_stub {
     ($name:ident, $vector:expr) => {
         #[unsafe(naked)]
@@ -1041,6 +1124,7 @@ soft_stub!(yield_stub, YIELD_VECTOR);
 soft_stub!(sleep_stub, SLEEP_VECTOR);
 soft_stub!(exit_stub, EXIT_VECTOR);
 soft_stub!(syscall_stub, SYSCALL_VECTOR);
+soft_stub!(shootdown_stub, crate::tlb::SHOOTDOWN_VECTOR);
 
 /// Entry stub of the spurious-interrupt vector.
 #[unsafe(naked)]

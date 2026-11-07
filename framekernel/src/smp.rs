@@ -390,6 +390,8 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     unsafe { cpu::init_ap(start.tables) };
     // SAFETY: CPL 0; the kernel has no user mappings. Every processor enforces SMEP and SMAP.
     let _ = unsafe { cpu::enable_smep_smap() };
+    // SAFETY: CPL 0; the kernel's tables mark only the kernel half global.
+    let _ = unsafe { crate::tlb::enable_global_pages() };
     if !cpu::x2apic_supported() {
         start.online.store(u32::MAX, Ordering::Release);
         crate::halt();

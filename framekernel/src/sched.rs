@@ -318,8 +318,8 @@ pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
         core::hint::spin_loop();
     }
     // The boot processor split large pages and unmapped guard pages while this processor
-    // waited: drop any stale translation before running threads.
-    crate::vm::flush_tlb();
+    // waited: from now on it is sent every shootdown, and it drops every older translation.
+    crate::tlb::mark_online();
     if let Some(active) = ACTIVE.get(this_cpu()) {
         active.store(true, Ordering::Release);
     }
@@ -526,6 +526,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
     if let Some(active) = ACTIVE.get(bsp) {
         active.store(true, Ordering::Release);
     }
+    crate::tlb::mark_online();
     timer::start_periodic(&lapic);
     // The first thread's guard page must be unmapped.
     let guard = FIRST_GUARD.load(Ordering::Relaxed);
@@ -609,6 +610,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
     ok &= crate::user::prove(com1, bsp, tsc_hz);
     ok &= crate::time::prove_consistent(com1, cpus, bsp, tsc_hz);
     ok &= crate::console::prove(com1, cpus, bsp, tsc_hz);
+    ok &= crate::tlb::prove(com1, cpus, bsp, tsc_hz);
     // Every thread has exited: once each processor has reaped its own, the heap is back
     // exactly where it was before the first spawn.
     let back = || crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before;

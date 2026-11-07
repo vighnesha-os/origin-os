@@ -85,6 +85,16 @@ impl X2Apic {
         apic
     }
 
+    /// The handle for a processor whose local APIC is already in x2APIC mode, without
+    /// touching it.
+    ///
+    /// # Safety
+    ///
+    /// CPL 0, and [`X2Apic::enable`] has run on this processor.
+    pub(crate) unsafe fn assume_enabled() -> Self {
+        Self(())
+    }
+
     pub(crate) fn read(&self, reg: ApicRead) -> u64 {
         let msr = match reg {
             ApicRead::Id => X2APIC_ID,

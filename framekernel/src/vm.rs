@@ -1,9 +1,14 @@
 //! The kernel's address space once it is live, behind a lock, so pages can be mapped or
-//! remapped later: firmware tables the kernel reads (ACPI) and the AP start-up trampoline.
+//! remapped later: firmware tables the kernel reads (ACPI), guard pages and the AP
+//! start-up trampoline.
+//!
+//! Every change that removes access is followed by a TLB shootdown (`tlb`) once the lock is
+//! released, so no processor keeps the old translation; changes that only add access need
+//! none. Kernel-half mappings are global; the identity pages of the AP trampoline are not.
 
-use core::arch::asm;
-
-use framekernel::paging::{Access, AddressSpace, Attributes, MapError, PAGE, TablePool};
+use framekernel::paging::{
+    Access, AddressSpace, Attributes, LeafCensus, MapError, PAGE, TablePool,
+};
 
 use origin_sync::SpinLock;
 
@@ -57,8 +62,12 @@ pub(crate) fn map_firmware(addr: u64, len: u64) -> Result<u64, MapError> {
         while page < end {
             let virt = crate::phys::to_virt(page);
             if k.space.translate(&k.tables, virt).is_none() {
-                k.space
-                    .map(&mut k.tables, virt, page, Attributes::kernel(Access::Read))?;
+                k.space.map(
+                    &mut k.tables,
+                    virt,
+                    page,
+                    Attributes::kernel_global(Access::Read),
+                )?;
             }
             page += PAGE;
         }
@@ -81,43 +90,54 @@ pub(crate) fn map_user(virt: u64, phys: u64, access: Access) -> Result<(), MapEr
     })
 }
 
-/// Removes the leaf at `virt` and flushes its TLB entry on this processor.
+/// Removes the leaf at `virt`; once this returns, no processor's TLB holds it.
 pub(crate) fn unmap(virt: u64) -> Result<u64, MapError> {
-    crate::cpu::without_interrupts(|| {
+    let phys = crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
-        let phys = k.space.unmap(&mut k.tables, virt)?;
-        // SAFETY: as in `set_access`.
-        unsafe { asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)) };
-        Ok(phys)
-    })
+        k.space.unmap(&mut k.tables, virt)
+    })?;
+    crate::tlb::shootdown(virt);
+    Ok(phys)
 }
 
-/// Turns the identity page at `page` into a guard page: unmapped, so any access faults.
-/// A 2 MiB leaf covering it is split first. Other processors must flush their TLBs before
-/// relying on the guard (each AP reloads CR3 when its scheduler starts).
+/// Turns the direct-map page `page` into a guard page: unmapped, so any access faults,
+/// on every processor once this returns. A 2 MiB leaf covering it is split first (one
+/// INVLPG in the page drops the old 2 MiB translation too).
 pub(crate) fn make_guard(page: u64) -> Result<(), MapError> {
+    unmap_guards(&[page])?;
+    crate::tlb::shootdown(page);
+    Ok(())
+}
+
+/// As [`make_guard`] for several pages, with one full TLB flush on every processor instead
+/// of one shootdown per page.
+pub(crate) fn make_guards(pages: &[u64]) -> Result<(), MapError> {
+    unmap_guards(pages)?;
+    crate::tlb::shootdown_all();
+    Ok(())
+}
+
+/// Splits and unmaps each page under the lock; the caller shoots down.
+fn unmap_guards(pages: &[u64]) -> Result<(), MapError> {
     crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
-        k.space.split_large(&mut k.tables, page)?;
-        k.space.unmap(&mut k.tables, page)?;
-        drop(guard);
-        // SAFETY: reloading CR3 with its own value flushes this processor's non-global TLB
-        // entries (the kernel uses no global pages), including the old 2 MiB translation.
-        unsafe {
-            asm!("mov {tmp}, cr3", "mov cr3, {tmp}", tmp = out(reg) _, options(nostack, preserves_flags));
+        for &page in pages {
+            k.space.split_large(&mut k.tables, page)?;
+            k.space.unmap(&mut k.tables, page)?;
         }
         Ok(())
     })
 }
 
-/// Flushes this processor's TLB (all non-global entries).
-pub(crate) fn flush_tlb() {
-    // SAFETY: as in `make_guard`.
-    unsafe {
-        asm!("mov {tmp}, cr3", "mov cr3, {tmp}", tmp = out(reg) _, options(nostack, preserves_flags));
-    }
+/// Counts the live tables' leaves by half and global bit (`tlb::prove`).
+pub(crate) fn leaf_census() -> Option<LeafCensus> {
+    crate::cpu::without_interrupts(|| {
+        let guard = KERNEL_SPACE.lock();
+        let k = guard.as_ref()?;
+        Some(k.space.leaf_census(&k.tables))
+    })
 }
 
 /// Maps a guard page back (read/write, never executable) before its memory is freed.
@@ -129,7 +149,7 @@ pub(crate) fn unguard(page: u64) -> Result<(), MapError> {
             &mut k.tables,
             page,
             crate::phys::to_phys(page),
-            Attributes::kernel(Access::ReadWrite),
+            Attributes::kernel_global(Access::ReadWrite),
         )
     })
 }

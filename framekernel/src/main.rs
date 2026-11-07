@@ -41,6 +41,7 @@ mod sched;
 mod smp;
 mod time;
 mod timer;
+mod tlb;
 mod user;
 mod vm;
 use framekernel::frames::{self, FrameAllocator};
@@ -226,11 +227,14 @@ fn init_paging(
     // this table pool (all in direct-mapped regions), and the kernel's statics (the GDT,
     // IDT, TSS and double-fault stack are in the RW segment). COM1 is port I/O.
     unsafe { cpu::load_page_tables(space.root()) };
+    // SAFETY: CPL 0; the tables just loaded mark only the kernel half global (`layout`).
+    // Toggling CR4.PGE also drops every translation cached under the loader's tables.
+    let global = unsafe { tlb::enable_global_pages() };
     let used = tables.used();
     vm::install(space, tables);
     let _ = writeln!(
         com1,
-        "origin-kernel: page tables loaded: {} tables, {} MiB direct map, {} image pages, {} 4 KiB and {} 2 MiB leaves",
+        "origin-kernel: page tables loaded: {} tables, {} MiB direct map, {} image pages, {} 4 KiB and {} 2 MiB leaves; global pages {global}",
         used,
         stats.direct_bytes >> 20,
         stats.image_pages,

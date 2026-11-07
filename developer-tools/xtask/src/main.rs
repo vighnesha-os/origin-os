@@ -194,6 +194,22 @@ fn boot_scenario_markers() -> Scenario {
             format!(
                 "origin-kernel: console: {cpus} processors printed {CONSOLE_LINES} lines each at once"
             ),
+            // ADR-0004 H5: global kernel pages on every CPU, nothing global in the lower
+            // half; and TLB shootdowns: every other CPU's next read of each unmapped page
+            // faults.
+            format!(
+                "origin-kernel: TLB: global pages on {cpus} of {cpus} processors; kernel's tables: Some(LeafCensus {{ upper_global: "
+            ),
+            ", upper_local: 0, lower_global: 0, lower_local: 0 })".into(),
+            format!(
+                "origin-kernel: TLB: {} other processors cached 3 pages; after one single-page shootdown (",
+                cpus - 1
+            ),
+            format!(
+                "{} of their {} reads faulted and 0 saw a stale translation",
+                3 * (cpus - 1),
+                3 * (cpus - 1)
+            ),
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ],
@@ -235,6 +251,7 @@ fn boot_scenario_markers() -> Scenario {
             ": process isolation failed",
             ": clock failed",
             ": console failed",
+            ": TLB failed",
         ],
         check: Some(|text| console_lines_intact(text, qemu_cpus() as usize)),
     }
