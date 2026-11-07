@@ -30,6 +30,8 @@
 | ML-DSA-65/87 verification | `origin-crypto`, FIPS 204, strict (errata M1) | 104 differential, 2,631 negative; OpenSSL cross-check |
 | M3: processor start-up | ACPI MADT, INIT-SIPI-SIPI, per-CPU GDT/TSS, x2APIC on every AP | 2, 4 and 8 CPUs online; negative control |
 | M3: preemptive threads | per-CPU round-robin, timer-driven switching on every CPU | 51 switches per CPU in 500 ms, fair shares; negative control |
+| M3: thread lifecycle | yield, sleep, exit; slot reuse | 100/100 alternations, 5-tick sleep; negative control |
+| Hardening | SMEP/SMAP on every CPU; guard pages below every stack; loader memory reclaimed | five more #PF probes; two negative controls |
 
 ## In progress
 
@@ -39,8 +41,8 @@
 
 ## Next, in order
 
-1. **M3, scheduling proper:** a scheduler ADR (§18), then thread exit and sleeping, wake-ups and IPIs, priorities and a fairness policy (EEVDF to be evaluated, §26), load balancing, guard pages below thread stacks, and per-CPU data without APIC-ID indexing. Pad the per-worker counters (cache-line sharing showed at 4 CPUs).
-2. **Security hardening of the address space:** SMEP/SMAP (with probes), the higher-half layout and KASLR (ADR-0002 B3), reclaiming `LoaderReclaimable` once nothing needs it, guard pages below the kernel stacks.
+1. **M3, scheduling proper** (ADR-0003 K7 is the baseline): a reaper for exited threads' stacks, wait queues and cross-CPU wake-ups by IPI, priorities and a fairness policy (EEVDF to be evaluated, §26), load balancing, a GS-based per-CPU area instead of APIC-ID indexing, a serialized kernel console for multi-CPU output. Pad the per-worker counters (cache-line sharing showed at 4 CPUs).
+2. **Address-space layout:** the higher-half kernel and KASLR (ADR-0002 B3), which M4's user address spaces need; then M4 (processes, system calls, capabilities, IPC).
 3. **Signature block (ONBF §7.1):** blocked on S1–S4; then Ed25519 + ML-DSA in the loader and the trust anchor (B7).
 4. **Formal and concurrency checks:** Loom models for `SpinLock`; Kani bounds for `paging`, `frames` and `heap` (CLAUDE.md §73).
 5. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks.

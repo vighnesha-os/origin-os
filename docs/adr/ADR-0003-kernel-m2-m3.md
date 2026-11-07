@@ -49,7 +49,6 @@ All in QEMU 11.1.3 (TCG, `-cpu max`, OVMF), `cargo xtask boot-test`, with `ORIGI
 ## Consequences and open points
 
 - Physical hardware qualification is still required (§74); the timer bound in particular must be tightened there.
-- The boot processor's own stack (from the loader) has no guard page yet.
-- `LoaderReclaimable` memory is not yet returned to the frame allocator.
+- Since this ADR was written (same day): the boot processor's stack has a guard page (the loader allocates one extra `KernelStack` page), `LoaderReclaimable` memory is reclaimed once every enabled processor is online, and threads can yield, sleep and exit (software interrupts 0x81–0x83 on the same switch path). Exited threads' stacks are not freed yet.
 - Loom models for the spin lock and Kani bounds for paging, frames and heap are not written yet (§73).
 - Per-CPU data is found by reading the x2APIC ID, which is slow; a GS-based per-CPU area should replace it.

@@ -229,7 +229,15 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `cargo xtask boot-test` (default `-smp 2`) and `ORIGIN_QEMU_SMP=4` and `=8` pass: every enabled processor online 10.0–10.5 ms after its INIT.
   - Scheduler: on every CPU two never-yielding workers ran there for 500 ms with shares within 3 % of each other and 51 context switches (2 and 4 CPUs).
   - Negative controls, each restored byte-identical and each failing the boot test: the trampoline left NX (the AP faults at its first fetch with paging on and triple-faults; QEMU stops after the MADT line), and a scheduler that never switches ("counted 0 and 0, 0 context switches").
-  - QEMU only. Not done: priorities, sleeping, thread exit, load balancing, guard pages below thread stacks, Loom models.
+  - QEMU only.
+
+### Hardening and lifecycle after ADR-0003 (2026-11-07)
+
+- **SMEP and SMAP** on every processor (CR4 bits 20 and 21, CPUID 7.0), proven on the boot processor with a temporary user page at 0x7fffffffe000: a supervisor fetch faults with #PF 0x11 and a supervisor read with #PF 0x1. Control: CR4 bits not set → "page protection violated: SMEP … Completed".
+- **Guard pages** below every kernel thread stack and AP stack (`sched::guarded_stack`, `vm::make_guard`, with the library's new `split_large` for 2 MiB leaves; each AP reloads CR3 when its scheduler starts) and below the boot processor's stack (the loader allocates one extra `KernelStack` page; `kernel_space` leaves it unmapped). Probes: both guards fault with #PF 0x0. Control: guard left mapped → "page protection violated: stack guard page … Completed".
+- **Reclaim** of `LoaderReclaimable` memory once every enabled processor is online: 40 MiB (463 → 504 MiB free); `frames::reclaim`, with frees outside owned regions still refused.
+- **Thread lifecycle:** run-queue slots Free/Ready/Sleeping; software interrupts 0x81 (yield), 0x82 (sleep), 0x83 (exit) share the timer's switch path; workers exit after the preemption window. Proof: "yield alternated 100 of 100 turns; sleep(5) took 5 ticks; exited threads freed their slots (slot Ok(1) reused)". The proof found a real bug (the boot flow runs with IF=0, so yielding only to itself froze time; fixed with an interrupt window). Control: a yield that never switches → "alternated 2 of 100 turns". A first attempt at that control did not compile and so proved nothing; it was redone and checked to have booted.
+- **Evidence:** `cargo xtask boot-test` passes with `ORIGIN_QEMU_SMP` = 1, 2 and 4; `cargo xtask check` passes (65 library tests). QEMU only. Not done: freeing exited threads' stacks (no reaper), priorities, load balancing, Loom models.
 
 ## `origin-version.toml` and `runtime/version/` (`origin-version`), T5
 
