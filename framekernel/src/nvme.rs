@@ -38,6 +38,7 @@ pub mod opcode {
     pub const CREATE_IO_SQ: u8 = 0x01;
     pub const CREATE_IO_CQ: u8 = 0x05;
     pub const IDENTIFY: u8 = 0x06;
+    pub const SET_FEATURES: u8 = 0x09;
     pub const FLUSH: u8 = 0x00;
     pub const WRITE: u8 = 0x01;
     pub const READ: u8 = 0x02;
@@ -207,6 +208,23 @@ impl Command {
         }
     }
 
+    /// Set Features, Number of Queues (feature 07h): asks for `submission` and
+    /// `completion` I/O queues (1–65535 each). The specification allows this only before
+    /// any I/O queue is created; the completion says how many the controller allocated
+    /// ([`allocated_queues`]).
+    pub const fn set_number_of_queues(cid: u16, submission: u16, completion: u16) -> Self {
+        Self {
+            opcode: opcode::SET_FEATURES,
+            cid,
+            nsid: 0,
+            prp1: 0,
+            prp2: 0,
+            cdw10: 0x07,
+            cdw11: (((completion - 1) as u32) << 16) | (submission - 1) as u32,
+            cdw12: 0,
+        }
+    }
+
     /// Flush namespace `nsid`'s volatile write cache to non-volatile media.
     pub const fn flush(cid: u16, nsid: u32) -> Self {
         Self {
@@ -238,6 +256,11 @@ pub fn prps(phys: u64, len: u64, page: u64) -> Option<(u64, u64)> {
     } else {
         None
     }
+}
+
+/// The I/O queues a Number of Queues completion allocated: `(submission, completion)`.
+pub const fn allocated_queues(result: u32) -> (u32, u32) {
+    ((result & 0xFFFF) + 1, (result >> 16) + 1)
 }
 
 /// A completion's status field.
@@ -504,6 +527,10 @@ mod tests {
         let wr = Command::transfer(true, 3, 1, 5, 1, (0x5000, 0)).to_words();
         assert_eq!((wr[0] & 0xFF, wr[12]), (1, 0));
         assert_eq!(Command::flush(4, 1).to_words()[0], 0x0004_0000);
+        let q = Command::set_number_of_queues(5, 6, 6).to_words();
+        assert_eq!((q[0], q[10], q[11]), (0x0005_0009, 7, 0x0005_0005));
+        assert_eq!(allocated_queues(0x003F_003F), (64, 64));
+        assert_eq!(allocated_queues(0x0001_0007), (8, 2));
     }
 
     #[test]

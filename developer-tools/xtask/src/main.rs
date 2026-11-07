@@ -242,6 +242,10 @@ fn boot_scenario_markers() -> Scenario {
                 disk::BLOCK,
                 (disk::BLOCKS * disk::BLOCK) >> 20
             ),
+            format!(
+                "origin-kernel: NVMe: asked for {} I/O queue pairs, allocated ",
+                2 + cpus
+            ),
             "origin-kernel: NVMe: through I/O queue 1: LBA 0 has the MBR signature true, LBA 1 the GPT signature true, and 8 of 8 blocks from LBA 2048 match the boot test's pattern".into(),
             format!(
                 "origin-kernel: NVMe: wrote LBA {}, flushed and read it back: match true; a read at LBA {} (past the end) failed with status type 0 code 0x80 (LBA out of range: true)",
@@ -280,8 +284,24 @@ fn boot_scenario_markers() -> Scenario {
                 cpus.min(2) - 1
             ),
             "512 of 512 blocks match".into(),
+            // Per-CPU queues: every CPU at once through its own queue pair and vector.
+        ]
+        .into_iter()
+        .chain((0..cpus).map(|id| {
+            format!(
+                "origin-kernel: NVMe: CPU {id}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, "
+            )
+        }))
+        .chain([
+            format!(
+                "origin-kernel: NVMe: per-CPU queues: {cpus} threads at once, one per CPU, each with its own queue pair and MSI-X vector: {} reads, {} of {} blocks match",
+                32 * cpus,
+                256 * cpus,
+                256 * cpus
+            ),
             "origin-kernel: M1 entry complete; halting".into(),
-        ],
+        ])
+        .collect(),
         failures: vec![
             "origin-boot: panic:",
             "origin-kernel: panic:",

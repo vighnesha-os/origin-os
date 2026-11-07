@@ -463,6 +463,24 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 1 more `pci` test (capability walk, loops, header pointers, bad BIRs, messages) and 1 more `nvme` assertion; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** per-CPU queues with a vector each, interrupt remapping (x2APIC IDs above 255), MSI (non-X) devices, and moving the admin queue to interrupts.
 
+### Per-CPU NVMe queues and concurrent I/O (CLAUDE.md §33 multiqueue, §66 per-CPU queues; 2026-11-07)
+
+- **What:**
+  - `nvme`: Set Features, Number of Queues (feature 07h), and decoding of the allocation in its completion.
+  - `storage`:
+    - before any I/O queue exists, the driver asks for queue pairs 1 (polled), 2 (the MSI-X proof) and one per processor, and fails if the controller allocates fewer;
+    - `submit_on` and `poll_on` work on one queue pair, so a processor's own queue needs no global lock;
+    - per processor `k`, MSI-X entry `2 + k` is sent to that processor and I/O queue pair `3 + k` completes to it;
+    - the completion interrupt wakes the wait queue of the processor it arrived on, and counts per processor.
+  - Each processor's thread submits under its own queue's lock and blocks until its interrupt; the wait's condition is its completion queue.
+- **Proof** (every boot):
+  - Asked for 4 queue pairs (6 at 4 CPUs); QEMU allocated 64.
+  - Every online CPU at once: 32 reads of 8 pattern blocks through its own queue pair, all matching, and one block of its own written, flushed, cleared and read back. Its 35 interrupts (32 reads, write, flush, read-back) all arrived on that CPU.
+  - Totals: 1 CPU 32 reads in 4 ms; 2 CPUs 64 in 52 ms; 4 CPUs 128 in 54 ms. Twice the work in the same time at 4 CPUs, so the queues run concurrently (QEMU throughput figures are only comparisons).
+- **Negative control:** every per-CPU vector sent to CPU 0 → CPU 1's thread is never woken: "0 reads … 0 interrupts on CPU 1 … NVMe failed".
+- **Test evidence:** 1 more `nvme` assertion group (Set Features encoding and allocation decoding); `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
+- **Not done:** a block layer that routes requests to the submitting CPU's queue, PRP lists and larger transfers, command timeouts with abort and controller reset, and NUMA placement of queue memory.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 - **What:** `SpinLock<T>` (Acquire on lock, Release on unlock; `SpinGuard` with `Deref`/`DerefMut`; `Debug` that never reads the value), moved out of the kernel binary on 2026-11-07 so that it can be tested. Interrupt rule: no handler may take a lock that interrupted code can hold; the kernel holds locks it shares with handlers with interrupts disabled.

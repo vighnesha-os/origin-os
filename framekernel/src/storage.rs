@@ -33,6 +33,7 @@ use framekernel::nvme::{self, Capabilities, Command, Completion, NamespaceInfo, 
 use framekernel::pci::{self, BarKind};
 use origin_sync::SpinLock;
 
+use crate::sched::MAX_CPUS;
 use crate::wait::WaitQueue;
 
 use crate::console::Console;
@@ -217,9 +218,27 @@ impl Nvme {
 
     /// Writes `make(cid)` into queue `q` and rings its doorbell; returns the command ID.
     fn submit(&mut self, q: Q, make: impl FnOnce(u16) -> Command) -> Result<u16, Failure> {
-        let stride = self.cap.doorbell_stride;
-        let regs = self.regs;
-        let qp = self.queue(q).ok_or(Failure::Full)?;
+        let (regs, stride) = (self.regs, self.cap.doorbell_stride);
+        submit_on(self.queue(q).ok_or(Failure::Full)?, regs, stride, make)
+    }
+
+    /// Takes queue `q`'s next completion if it is there: the result for command `cid`, or
+    /// `None` if nothing new has arrived.
+    fn poll(&mut self, q: Q, cid: u16) -> Option<Result<Completion, Failure>> {
+        let (regs, stride) = (self.regs, self.cap.doorbell_stride);
+        poll_on(self.queue(q)?, regs, stride, cid)
+    }
+}
+
+/// Writes `make(cid)` into `qp` and rings its doorbell (the controller's registers at
+/// `regs`, doorbells `stride` bytes apart); returns the command ID.
+fn submit_on(
+    qp: &mut QueuePair,
+    regs: u64,
+    stride: u64,
+    make: impl FnOnce(u16) -> Command,
+) -> Result<u16, Failure> {
+    {
         let cid = qp.next_cid;
         qp.next_cid = qp.next_cid.wrapping_add(1);
         let slot = qp.state.submit().ok_or(Failure::Full)?;
@@ -237,39 +256,41 @@ impl Nvme {
         doorbell(nvme::doorbell(qp.qid, false, stride), qp.state.sq_tail());
         Ok(cid)
     }
+}
 
-    /// Takes queue `q`'s next completion if it is there: the result for command `cid`, or
-    /// `None` if nothing new has arrived.
-    fn poll(&mut self, q: Q, cid: u16) -> Option<Result<Completion, Failure>> {
-        let stride = self.cap.doorbell_stride;
-        let regs = self.regs;
-        let qp = self.queue(q)?;
-        {
-            let at = usize::from(qp.state.cq_head()) * nvme::CQ_ENTRY;
-            // The phase is in the last dword: read it first, then the rest.
-            let last = qp.cq.read32(at + 12);
-            compiler_fence(Ordering::Acquire);
-            let words = [
-                qp.cq.read32(at),
-                qp.cq.read32(at + 4),
-                qp.cq.read32(at + 8),
-                last,
-            ];
-            let c = Completion::decode(words);
-            if !qp.state.complete(&c) {
-                return None;
-            }
-            let p = ptr::with_exposed_provenance_mut::<u32>(
-                (regs + nvme::doorbell(qp.qid, true, stride)) as usize,
-            );
-            // SAFETY: as in `write32`: the completion head doorbell of a queue that exists.
-            unsafe { p.write_volatile(u32::from(qp.state.cq_head())) };
-            Some(if c.cid == cid {
-                Ok(c)
-            } else {
-                Err(Failure::WrongCommand)
-            })
+/// Takes `qp`'s next completion if it is there: the result for command `cid`, or `None`
+/// if nothing new has arrived.
+fn poll_on(
+    qp: &mut QueuePair,
+    regs: u64,
+    stride: u64,
+    cid: u16,
+) -> Option<Result<Completion, Failure>> {
+    {
+        let at = usize::from(qp.state.cq_head()) * nvme::CQ_ENTRY;
+        // The phase is in the last dword: read it first, then the rest.
+        let last = qp.cq.read32(at + 12);
+        compiler_fence(Ordering::Acquire);
+        let words = [
+            qp.cq.read32(at),
+            qp.cq.read32(at + 4),
+            qp.cq.read32(at + 8),
+            last,
+        ];
+        let c = Completion::decode(words);
+        if !qp.state.complete(&c) {
+            return None;
         }
+        let p = ptr::with_exposed_provenance_mut::<u32>(
+            (regs + nvme::doorbell(qp.qid, true, stride)) as usize,
+        );
+        // SAFETY: as in `write32`: the completion head doorbell of a queue that exists.
+        unsafe { p.write_volatile(u32::from(qp.state.cq_head())) };
+        Some(if c.cid == cid {
+            Ok(c)
+        } else {
+            Err(Failure::WrongCommand)
+        })
     }
 }
 
@@ -304,11 +325,15 @@ struct Driver {
     nvme: Nvme,
     dev: crate::pcie::Device,
     page: DmaPage,
+    /// The MSI-X table's virtual address and the capability, once set up.
+    msix: Option<(u64, pci::Msix)>,
 }
 
 static DRIVER: SpinLock<Option<Driver>> = SpinLock::new(None);
-/// Woken by the completion interrupt.
-static COMPLETED: WaitQueue = WaitQueue::new();
+/// Per processor: woken by the completion interrupts routed there.
+static IO_WAIT: [WaitQueue; MAX_CPUS] = [const { WaitQueue::new() }; MAX_CPUS];
+/// Per processor: completion interrupts taken there.
+static CPU_INTERRUPTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 /// The processor the last completion interrupt arrived on, plus one (0: none yet).
 static INTERRUPT_CPU: AtomicU64 = AtomicU64::new(0);
@@ -316,9 +341,15 @@ static INTERRUPT_CPU: AtomicU64 = AtomicU64::new(0);
 /// The completion interrupt (`cpu::DEVICE_VECTOR`): counts it and wakes the waiter, which
 /// then reads the completion itself.
 pub(crate) fn on_interrupt() {
+    let me = crate::cpu::cpu_id();
     INTERRUPTS.fetch_add(1, Ordering::Relaxed);
-    INTERRUPT_CPU.store(crate::cpu::cpu_id() + 1, Ordering::Relaxed);
-    COMPLETED.wake_one();
+    INTERRUPT_CPU.store(me + 1, Ordering::Relaxed);
+    if let Some(n) = CPU_INTERRUPTS.get(me as usize) {
+        n.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(w) = IO_WAIT.get(me as usize) {
+        w.wake_one();
+    }
 }
 
 /// Binds the first NVMe controller and proves block I/O on namespace 1, polled and then
@@ -329,13 +360,18 @@ pub(crate) fn init(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
         let _ = writeln!(com1, "origin-kernel: NVMe: no controller");
         return true;
     };
-    let polled = match bind(com1, &dev) {
+    let polled = match bind(com1, &dev, cpus.len()) {
         Ok((nvme, ok)) => {
             let Some(page) = DmaPage::new() else {
                 return false;
             };
             crate::cpu::without_interrupts(|| {
-                *DRIVER.lock() = Some(Driver { nvme, dev, page });
+                *DRIVER.lock() = Some(Driver {
+                    nvme,
+                    dev,
+                    page,
+                    msix: None,
+                });
             });
             ok
         }
@@ -344,10 +380,15 @@ pub(crate) fn init(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
             return false;
         }
     };
-    polled && prove_interrupts(com1, cpus, tsc_hz)
+    let interrupts = polled && prove_interrupts(com1, cpus, tsc_hz);
+    interrupts && prove_per_cpu(com1, cpus, tsc_hz)
 }
 
-fn bind(com1: &mut Console, dev: &crate::pcie::Device) -> Result<(Nvme, bool), &'static str> {
+fn bind(
+    com1: &mut Console,
+    dev: &crate::pcie::Device,
+    cpus: usize,
+) -> Result<(Nvme, bool), &'static str> {
     let f = dev.function;
     let bar = dev.bars[0].ok_or("no BAR 0")?;
     if bar.kind == BarKind::Io || bar.size < 0x2000 {
@@ -444,6 +485,22 @@ fn bind(com1: &mut Console, dev: &crate::pcie::Device) -> Result<(Nvme, bool), &
         namespace.blocks,
         namespace.block_size,
         (namespace.blocks * u64::from(namespace.block_size)) >> 20
+    );
+    // Before any I/O queue exists: queue pairs 1 (polled), 2 (one interrupt) and one per
+    // processor.
+    let wanted = u16::try_from(2 + cpus).map_err(|_| "too many processors")?;
+    let granted = c
+        .run(Q::Admin, |cid| {
+            Command::set_number_of_queues(cid, wanted, wanted)
+        })
+        .map_err(failed)?;
+    let (sqs, cqs) = nvme::allocated_queues(granted.result);
+    if !granted.status.ok() || sqs < u32::from(wanted) || cqs < u32::from(wanted) {
+        return Err("the controller allocated too few I/O queues");
+    }
+    let _ = writeln!(
+        com1,
+        "origin-kernel: NVMe: asked for {wanted} I/O queue pairs, allocated {sqs} submission and {cqs} completion queues"
     );
     let io = new_queue(1, IO_ENTRIES).ok_or("no memory for the I/O queues")?;
     let (cq_phys, sq_phys) = (io.cq.phys, io.sq.phys);
@@ -544,6 +601,7 @@ fn setup_interrupts(d: &mut Driver, target: u32) -> Result<pci::Msix, &'static s
         return Err("Create I/O Submission Queue 2 failed");
     }
     d.nvme.irq = Some(queue);
+    d.msix = Some((table, msix));
     Ok(msix)
 }
 
@@ -573,7 +631,10 @@ extern "sysv64" fn io_thread(_: u64) -> ! {
         };
         let done = core::cell::Cell::new(None);
         let deadline = crate::time::monotonic_nanos() + COMMAND_TIMEOUT_NS;
-        let waited = COMPLETED.wait_until_deadline(
+        let Some(wait) = IO_WAIT.get(crate::cpu::cpu_id() as usize) else {
+            break;
+        };
+        let waited = wait.wait_until_deadline(
             || {
                 let r = DRIVER
                     .lock()
@@ -877,4 +938,257 @@ fn prove_io(
         if ok { "" } else { ": NVMe failed" }
     );
     Ok(reads_ok && ok)
+}
+
+/// One processor's own I/O queue pair, with its controller's doorbell addresses and a data
+/// page: only threads on that processor use it, so it never waits on another's lock.
+struct CpuQueue {
+    qp: QueuePair,
+    page: DmaPage,
+    regs: u64,
+    stride: u64,
+}
+
+static CPU_QUEUES: [SpinLock<Option<CpuQueue>>; MAX_CPUS] =
+    [const { SpinLock::new(None) }; MAX_CPUS];
+
+/// Reads each processor's thread makes, of 8 blocks each.
+const CPU_READS: u64 = 32;
+/// Per processor: reads done, blocks matched, and whether its write read back (each plus
+/// one once set).
+static CPU_RESULT: [[AtomicU64; 3]; MAX_CPUS] =
+    [const { [const { AtomicU64::new(0) }; 3] }; MAX_CPUS];
+
+/// For each online processor `k` (by position in `cpus`): MSI-X entry `2 + k` sent to it,
+/// and I/O queue pair `3 + k` completing to that entry.
+fn setup_cpu_queues(d: &mut Driver, cpus: &[u32]) -> Result<(), &'static str> {
+    let (table, msix) = d.msix.ok_or("MSI-X is not set up")?;
+    if usize::from(msix.entries) < 2 + cpus.len() {
+        return Err("too few MSI-X vectors for one per processor");
+    }
+    let data = pci::msi_data(crate::cpu::DEVICE_VECTOR).ok_or("bad vector")?;
+    for (k, &cpu) in cpus.iter().enumerate() {
+        let vector = 2 + k as u16;
+        let qid = 3 + k as u16;
+        let address = pci::msi_address(cpu).ok_or("a processor needs interrupt remapping")?;
+        let entry = |word: u64, value: u32| {
+            let at = table + u64::from(vector) * pci::MSIX_ENTRY + 4 * word;
+            let p = ptr::with_exposed_provenance_mut::<u32>(at as usize);
+            // SAFETY: inside the MSI-X table (`setup_interrupts` checked its bounds against
+            // its BAR, and `vector` is below its entry count), mapped uncached.
+            unsafe { p.write_volatile(value) };
+        };
+        entry(0, address as u32);
+        entry(1, (address >> 32) as u32);
+        entry(2, data);
+        entry(3, 0);
+        let queue = new_queue(qid, IO_ENTRIES).ok_or("no memory for a per-processor queue")?;
+        let page = DmaPage::new().ok_or("no memory for a per-processor page")?;
+        let (cq, sq) = (queue.cq.phys, queue.sq.phys);
+        let failed = |_| "creating a per-processor queue failed";
+        let made = d
+            .nvme
+            .run(Q::Admin, |cid| {
+                Command::create_io_cq_with_interrupts(cid, qid, IO_ENTRIES, vector, cq)
+            })
+            .map_err(failed)?;
+        let made_sq = d
+            .nvme
+            .run(Q::Admin, |cid| {
+                Command::create_io_sq(cid, qid, IO_ENTRIES, qid, sq)
+            })
+            .map_err(failed)?;
+        if !made.status.ok() || !made_sq.status.ok() {
+            return Err("a per-processor queue was refused");
+        }
+        let slot = CPU_QUEUES
+            .get(cpu as usize)
+            .ok_or("processor ID out of range")?;
+        *slot.lock() = Some(CpuQueue {
+            qp: queue,
+            page,
+            regs: d.nvme.regs,
+            stride: d.nvme.cap.doorbell_stride,
+        });
+    }
+    Ok(())
+}
+
+/// One command on this processor's own queue: submitted under its lock, then waited for by
+/// blocking until its interrupt (the wait's condition is the completion queue itself).
+/// Returns the page's contents for a read.
+fn cpu_command(me: usize, make: impl FnOnce(u16, u64) -> Command, out: &mut [u8; 4096]) -> bool {
+    let (Some(slot), Some(wait)) = (CPU_QUEUES.get(me), IO_WAIT.get(me)) else {
+        return false;
+    };
+    let cid = crate::cpu::without_interrupts(|| {
+        let mut g = slot.lock();
+        let q = g.as_mut()?;
+        let phys = q.page.phys;
+        submit_on(&mut q.qp, q.regs, q.stride, |cid| make(cid, phys)).ok()
+    });
+    let Some(cid) = cid else {
+        return false;
+    };
+    let done = core::cell::Cell::new(None);
+    let deadline = crate::time::monotonic_nanos() + COMMAND_TIMEOUT_NS;
+    let waited = wait.wait_until_deadline(
+        || {
+            let r = slot
+                .lock()
+                .as_mut()
+                .and_then(|q| poll_on(&mut q.qp, q.regs, q.stride, cid));
+            let ready = r.is_some();
+            if ready {
+                done.set(r);
+            }
+            ready
+        },
+        deadline,
+    );
+    let ok = waited.is_ok() && matches!(done.get(), Some(Ok(c)) if c.status.ok());
+    if ok {
+        crate::cpu::without_interrupts(|| {
+            if let Some(q) = slot.lock().as_ref() {
+                out.copy_from_slice(q.page.bytes());
+            }
+        });
+    }
+    ok
+}
+
+/// A processor's thread: [`CPU_READS`] reads of the pattern blocks through its own queue,
+/// then one block of its own written, flushed and read back.
+extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
+    let me = crate::cpu::cpu_id() as usize;
+    let (mut reads, mut matched) = (0u64, 0u64);
+    let mut page = [0u8; 4096];
+    let mut expected = [0u8; 512];
+    for i in 0..CPU_READS {
+        let lba = 2048 + ((i + index) % 8) * 8;
+        if !cpu_command(
+            me,
+            |cid, phys| Command::transfer(false, cid, NSID, lba, 8, (phys, 0)),
+            &mut page,
+        ) {
+            break;
+        }
+        for k in 0..8u64 {
+            pattern(lba + k, &mut expected);
+            let at = (k * 512) as usize;
+            if page.get(at..at + 512) == Some(&expected[..]) {
+                matched += 1;
+            }
+        }
+        reads += 1;
+    }
+    // A block of its own: written from this processor's page, flushed, cleared, read back.
+    let scratch = 20_000 + 8 * index;
+    pattern(scratch ^ 0x5A5A, &mut expected);
+    let filled = crate::cpu::without_interrupts(|| {
+        let g = CPU_QUEUES.get(me).map(|s| s.lock());
+        g.as_ref()
+            .and_then(|g| g.as_ref())
+            .map(|q| q.page.fill(&expected))
+            .is_some()
+    });
+    let wrote = filled
+        && cpu_command(
+            me,
+            |cid, phys| Command::transfer(true, cid, NSID, scratch, 1, (phys, 0)),
+            &mut page,
+        )
+        && cpu_command(me, |cid, _| Command::flush(cid, NSID), &mut page);
+    crate::cpu::without_interrupts(|| {
+        if let Some(q) = CPU_QUEUES
+            .get(me)
+            .and_then(|s| s.lock().as_ref().map(|q| q.page))
+        {
+            q.fill(&[0u8; 512]);
+        }
+    });
+    let back = wrote
+        && cpu_command(
+            me,
+            |cid, phys| Command::transfer(false, cid, NSID, scratch, 1, (phys, 0)),
+            &mut page,
+        )
+        && page.get(..512) == Some(&expected[..]);
+    if let Some(r) = CPU_RESULT.get(me) {
+        for (slot, v) in r.iter().zip([reads, matched, u64::from(back)]) {
+            slot.store(v + 1, Ordering::Release);
+        }
+    }
+    crate::sched::exit()
+}
+
+/// Every online processor reads and writes through its own queue pair and vector at the
+/// same time: every read must match, every write read back, and each processor's
+/// interrupts must have arrived on that processor.
+fn prove_per_cpu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
+    let setup = crate::cpu::without_interrupts(|| {
+        let mut g = DRIVER.lock();
+        let d = g.as_mut().ok_or("no driver")?;
+        setup_cpu_queues(d, cpus)
+    });
+    if let Err(why) = setup {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: NVMe: per-CPU queues: {why}: NVMe failed"
+        );
+        return false;
+    }
+    let before: [u64; MAX_CPUS] =
+        core::array::from_fn(|i| CPU_INTERRUPTS[i].load(Ordering::Relaxed));
+    let start = crate::cpu::rdtsc();
+    for (k, &cpu) in cpus.iter().enumerate() {
+        if crate::sched::spawn(cpu as usize, cpu_io_thread, k as u64).is_err() {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: NVMe: per-CPU queues: cannot spawn: NVMe failed"
+            );
+            return false;
+        }
+    }
+    let finished = || {
+        cpus.iter().all(|&c| {
+            CPU_RESULT
+                .get(c as usize)
+                .is_some_and(|r| r.iter().all(|x| x.load(Ordering::Acquire) != 0))
+        })
+    };
+    crate::sched::yield_until(finished, tsc_hz, 10);
+    let micros = crate::cpu::rdtsc().wrapping_sub(start) / (tsc_hz / 1_000_000).max(1);
+    let mut ok = finished();
+    let (mut reads, mut matched) = (0, 0);
+    for &cpu in cpus {
+        let c = cpu as usize;
+        let get = |i: usize| {
+            CPU_RESULT
+                .get(c)
+                .map_or(0, |r| r[i].load(Ordering::Acquire).saturating_sub(1))
+        };
+        let interrupts = CPU_INTERRUPTS[c].load(Ordering::Relaxed) - before[c];
+        let (r, m, back) = (get(0), get(1), get(2) == 1);
+        let mine = r == CPU_READS && m == 8 * CPU_READS && back && interrupts >= CPU_READS + 3;
+        ok &= mine;
+        reads += r;
+        matched += m;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: NVMe: CPU {cpu}: {r} reads through its own queue pair, {m} of {} blocks match, its write read back {back}, {interrupts} interrupts on CPU {cpu}{}",
+            8 * CPU_READS,
+            if mine { "" } else { ": NVMe failed" }
+        );
+    }
+    let mib = (reads * 4096 * 1_000_000 / micros.max(1)) >> 20;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: NVMe: per-CPU queues: {} threads at once, one per CPU, each with its own queue pair and MSI-X vector: {reads} reads, {matched} of {} blocks match, in {} ms ({mib} MiB/s){}",
+        cpus.len(),
+        8 * reads,
+        micros / 1000,
+        if ok { "" } else { ": NVMe failed" }
+    );
+    ok
 }
