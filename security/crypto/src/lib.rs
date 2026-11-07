@@ -9,6 +9,8 @@
 //! - SHA3-256, SHA3-512, SHAKE128 and SHAKE256 from FIPS 202. ML-DSA (FIPS 204), half of
 //!   every ONBF signature suite, is built on SHAKE128 and SHAKE256 (ONBF §7.2, ADR-0001);
 //! - strict Ed25519 verification from RFC 8032 §5.1 (ONBF §7.1), the other half.
+//! - strict ML-DSA-65 and ML-DSA-87 verification from FIPS 204 (pure ML-DSA, with a context
+//!   string; ONBF §7.1–§7.2), streaming Â so that it fits a 64 KiB kernel stack.
 //!
 //! All are portable Rust. A SHA-NI path with runtime CPU detection is planned (ONBF §4.6;
 //! CLAUDE.md §24).
@@ -42,11 +44,16 @@ mod block;
 mod constants;
 mod ed25519;
 mod keccak;
+mod mldsa;
 mod sha256;
 mod sha3;
 mod sha512;
 
 pub use ed25519::{Ed25519Error, verify as ed25519_verify};
+pub use mldsa::{
+    MLDSA65_PUBLIC_KEY_BYTES, MLDSA65_SIGNATURE_BYTES, MLDSA87_PUBLIC_KEY_BYTES,
+    MLDSA87_SIGNATURE_BYTES, MlDsaError, mldsa65_verify, mldsa87_verify,
+};
 pub use sha3::{Sha3_256, Sha3_512, Shake128, Shake256, ShakeReader};
 pub use sha256::Sha256;
 pub use sha512::Sha512;
@@ -55,5 +62,7 @@ pub use sha512::Sha512;
 mod tests;
 #[cfg(test)]
 mod tests_ed25519;
+#[cfg(test)]
+mod tests_mldsa;
 #[cfg(test)]
 mod tests_sha3;
