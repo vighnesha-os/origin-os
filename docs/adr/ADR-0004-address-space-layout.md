@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Proposed** (2026-11-07). Not implemented. Needs the owner: it fixes the user address range, which programs and the SDK see (CLAUDE.md §42, §84). |
+| Status | **Accepted** by the owner on 2026-11-07, as proposed (H1–H5, and the recommended answer to each of the four questions below). Implementation in progress. |
 | Supersedes | ADR-0003 K2's identity mapping, once implemented |
 | Related | ADR-0002 B3 (KASLR deferred to here), B4 (boot info), ADR-0003 K2, K8 |
 
@@ -42,7 +42,7 @@ Kernel mappings are global (CR4.PGE); user address spaces use PCIDs where availa
 - Every physical-to-virtual conversion goes through the direct-map offset (`phys_to_virt`), replacing today's identity assumption; `kernel_space`, `vm`, the AP trampoline (which must still start in low memory, then jump high) and the heap change accordingly.
 - Kernel stacks move to the stack region with virtual guard pages.
 
-## Questions for the owner
+## Questions for the owner (answered 2026-11-07: yes to 1–3, loader-built tables for 4)
 
 1. Accept the 47-bit user range (H1)?
 2. Accept KASLR from the loader with RDSEED/RDRAND/EFI_RNG and "no slide, reported" as the fallback (H3)?
