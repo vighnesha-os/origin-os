@@ -854,6 +854,15 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Not done:** a requirement/range matcher (`^1.2`, `~1.2.3`, `>=1.0, <2.0`), and wiring into a package dependency resolver (§46).
 - **Licensing:** project licence not chosen yet.
 
+### String-keyed hash map (CLAUDE.md §29 resource tables, §30 handle lookup; 2026-11-08)
+
+- **What:** `hashmap::StrMap<V>` is an open-addressing (linear-probing) hash map from `String` keys to `V`, hashed with FNV-1a (`fnv1a`), with tombstone deletion and growth (never shrink) when the load factor passes ~70%. `insert`/`get`/`remove`/`contains_key`/`len`/`iter`. Capacity is a power of two so the index is a mask, not a modulo. Pure, no `unsafe`; `alloc` for the buckets.
+- **Why:** the kernel's name→object tables — a VFS directory, a handle or service registry, a small cache — want an expected-O(1) map without a third-party crate; this is the reusable one (the existing `vfs` and `handles` use linear scans and can adopt it).
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); FNV-1a is the published non-cryptographic hash, standard open addressing.
+- **Test evidence (2026-11-08):** 4 `hashmap` tests — the FNV-1a **known-answer values** (`""`, `"a"`, `"foobar"`, verified against the FNV spec); insert/get/remove with replace-returns-old and a tombstone not hiding a later key; 500 inserts then 250 removes then 250 reinserts, exercising tombstone reuse across several grows; and a model-based test of 50 000 random `insert`/`remove`/`get` against a `BTreeMap` oracle over a small (collision-heavy) key space, asserting the returned values and `len` match throughout, then that every live entry agrees. 257 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the oracle is the control).
+- **Not done:** a generic key type (this is `String`-keyed; a `Hash`-like trait would generalize it), a keyed hash to resist collision-flooding from untrusted keys (SipHash, which needs its own test vectors and review, §58/§59), backward-shift deletion to avoid tombstone buildup, and adopting it inside `vfs`/`handles`.
+- **Licensing:** project licence not chosen yet.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.

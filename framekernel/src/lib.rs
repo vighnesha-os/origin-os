@@ -35,6 +35,7 @@
 //! - [`glob`]: glob pattern matching (`*`, `?`, `[...]`, escapes) for names and paths;
 //! - [`gpt`]: GUID Partition Table validation (both copies, CRC-32) and partitions;
 //! - [`handles`]: per-process handle tables with rights (ADR-0005 P1–P2);
+//! - [`hashmap`]: a string-keyed open-addressing hash map (FNV-1a) for name tables;
 //! - [`heap`]: kernel heap bookkeeping (slabs and frame runs), addresses only;
 //! - [`hpet`]: the ACPI HPET table and main-counter arithmetic;
 //! - [`initramfs`]: extracting a ustar archive into the VFS, with a path-traversal guard;
@@ -98,6 +99,7 @@ pub mod frames;
 pub mod glob;
 pub mod gpt;
 pub mod handles;
+pub mod hashmap;
 pub mod heap;
 pub mod hpet;
 pub mod initramfs;
