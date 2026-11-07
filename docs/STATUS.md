@@ -28,7 +28,7 @@
 
 ## Waiting on the owner
 
-ADR-0002 and ADR-0003 (both Proposed); B7; S1–S4; G1; the readings P1–P7, E1, M1 and L1 in `docs/spec/ONBF-errata.md`; approval to download NIST ACVP / FIPS 204 errata / Wycheproof vectors and the `loom` crate; a project licence; merging into `main` and pushing. Details: `docs/engineering/TASKS.md`.
+ADR-0002, ADR-0003 and ADR-0004 (all Proposed; ADR-0004 blocks per-process address spaces); B7; S1–S4; G1; the readings P1–P7, E1, M1 and L1 in `docs/spec/ONBF-errata.md`; approval to download NIST ACVP / FIPS 204 errata / Wycheproof vectors and the `loom` crate; a project licence; merging into `main` and pushing. Details: `docs/engineering/TASKS.md`.
 
 ## Where the evidence is
 

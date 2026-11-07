@@ -59,6 +59,7 @@
 | — | Accept, amend or reject **ADR-0002** (Proposed) | Shipping anything built on the boot path |
 | B7 | Boot trust anchor: Microsoft UEFI CA 2023, or Origin keys enrolled in firmware | Secure Boot |
 | — | Accept, amend or reject **ADR-0003** (kernel memory, interrupts, SMP start-up, first scheduler; Proposed) | Building M4 on it |
+| H1–H5 | **ADR-0004** (Proposed): user range, kernel-half layout, KASLR, loader-built tables, KPTI policy | Per-process address spaces (M4) |
 | S1 | Signature entry `role` encoding (§7.1): integer enum or text | Signature block parser |
 | S2 | Signature suite IDs for OSS-1 and OSS-1R (§7.2) | Signature block parser |
 | S3 | Statement map keys: §7.1 writes text names, but K1 requires integer keys | Signature block parser |
