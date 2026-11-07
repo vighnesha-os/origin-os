@@ -175,6 +175,8 @@ The owner asked for the design to be finalised with the recommended options, fol
 | `f740193` | Seeded mutation tests for the net and TCP parsers |
 | `b4c3fde` | I/O APIC interrupt routing, proven by routing the PIT's IRQ0 |
 | `6ae2541` | ACPI PM timer: a second time-source cross-check |
+| `c9e63d2` | CPU topology from CPUID leaf 0Bh |
+| `fe6be25` | CPU cache hierarchy from CPUID leaf 04h |
 
 (The 2026-11-08 commits use the Claude Opus 4.8 attribution; the run spanned midnight.)
 
