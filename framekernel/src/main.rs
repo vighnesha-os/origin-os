@@ -377,22 +377,33 @@ fn format_u64(value: u64, buf: &mut [u8; 20]) -> &[u8] {
 
 /// Proves the monotonic timer queue against the real clock: three timers armed at
 /// increasing deadlines (plus one cancelled) must fire in order, each close to its
-/// deadline, and the cancelled one never (CLAUDE.md §68). A run in which the polling loop
-/// itself stalled (a virtual CPU descheduled on a loaded host) cannot tell a late timer
-/// from a late look, so such a run that went wrong is measured again, a few times.
+/// deadline, and the cancelled one never (CLAUDE.md §68).
+///
+/// The queue looks at the time only when polled, and on a loaded host the polling loop's
+/// virtual CPU can be away for milliseconds: a timer fired after such a stall is a late
+/// look, not a late timer. So what the polls say about a firing is an interval, and a run
+/// decides only if every firing is inside the limit (`Verdict::OnTime`) or one is outside it
+/// (`Verdict::Late`: a poll that did not fire a timer already that overdue). A run a stall
+/// left undecided is measured again, up to `TIMER_ATTEMPTS` runs; a timer that fires in the
+/// wrong order, or one decisively late, fails at once.
 fn prove_timers(com1: &mut console::Console) {
-    use framekernel::timers::TimerQueue;
-    const ATTEMPTS: usize = 6;
-    /// Polls this far apart mean the polling processor stalled, which is what makes a late
-    /// expiry uninformative.
-    const STALLED_NANOS: u64 = 1_000_000;
+    use framekernel::timers::{Firing, TimerQueue, Verdict, judge};
+    /// Runs the proof may make; each costs about 15 ms, and only a run a stall left undecided
+    /// leads to another, so an undisturbed boot pays for one. Measured with two `yes` per
+    /// logical core, a run was undecided in 55 % of cases, in streaks of up to 12 (six runs,
+    /// the old budget, ran out in 4.4 % of cases); with four per core in 82 %, streaks up
+    /// to 21. 24 runs never ran out in those measurements; this is that with room to spare.
+    const TIMER_ATTEMPTS: usize = 64;
+    /// How late a timer may be delivered, in nanoseconds.
+    const LATENESS_LIMIT: u64 = 2_000_000;
     let step = 5_000_000u64; // 5 ms
     let ids = [10u64, 20, 30];
+    let tsc_hz = time::tsc_hz();
     let mut order = alloc::vec::Vec::new();
     let mut worst_late = 0u64;
-    let mut ok = false;
+    let mut verdict = Verdict::Undecided;
     let mut attempts = 0;
-    while attempts < ATTEMPTS {
+    while attempts < TIMER_ATTEMPTS && verdict == Verdict::Undecided {
         attempts += 1;
         let mut q = TimerQueue::new();
         let base = time::monotonic_nanos();
@@ -402,30 +413,41 @@ fn prove_timers(com1: &mut console::Console) {
         q.arm(99, base + 2 * step);
         q.cancel(99); // this one must never fire
         order.clear();
-        worst_late = 0;
+        let mut firings: [Firing; 3] = core::array::from_fn(|i| Firing {
+            deadline: base + (i as u64 + 1) * step,
+            previous_poll: base,
+            fired_at: None,
+        });
         let mut fired = alloc::vec::Vec::new();
         let mut last_poll = base;
-        let mut longest_gap = 0u64;
         let start = cpu::rdtsc();
-        let tsc_hz = time::tsc_hz();
         while !q.is_empty() && cpu::rdtsc().wrapping_sub(start) < tsc_hz {
             let now = time::monotonic_nanos();
-            longest_gap = longest_gap.max(now.saturating_sub(last_poll));
-            last_poll = now;
             if q.expire(now, &mut fired) > 0 {
                 for id in fired.drain(..) {
-                    let deadline = base + (order.len() as u64 + 1) * step;
-                    worst_late = worst_late.max(now.saturating_sub(deadline));
+                    if let Some(firing) = firings.get_mut(order.len()) {
+                        firing.previous_poll = last_poll;
+                        firing.fired_at = Some(now);
+                    }
                     order.push(id);
                 }
             }
+            last_poll = now;
             core::hint::spin_loop();
         }
-        ok = order == ids && worst_late < 2_000_000; // within 2 ms
-        if ok || longest_gap < STALLED_NANOS {
-            break;
+        // A timer the queue still holds was last looked at by the final poll.
+        for firing in firings.iter_mut().filter(|f| f.fired_at.is_none()) {
+            firing.previous_poll = last_poll;
         }
+        worst_late = firings.iter().filter_map(Firing::latest).max().unwrap_or(0);
+        verdict = if ids.starts_with(&order) {
+            judge(&firings, LATENESS_LIMIT)
+        } else {
+            // A stall cannot reorder the queue or fire a cancelled timer.
+            Verdict::Late
+        };
     }
+    let ok = verdict == Verdict::OnTime && order == ids;
     let _ = writeln!(
         com1,
         "origin-kernel: timers: 3 deadlines (1 cancelled) fired in order {order:?}, worst lateness {} us{}{}",

@@ -1085,4 +1085,24 @@ The task assumed a stall distorting a slice. Measuring first showed something br
 #### Next
 
 - Merge this branch after the clock-proof branch (`claude/musing-hamilton-587f7b`).
-- The two-worker fairness check in `sched::prove` still counts iterations (worst ratio 1.52 in 30 samples at full load, bound 2); `wait::prove`'s ping-pong bound and `prove_timers`' 2 ms bound fail at double load.
+- The two-worker fairness check in `sched::prove` still counts iterations (worst ratio 1.52 in 30 samples at full load, bound 2).
+- ~~`wait::prove`'s ping-pong bound and `prove_timers`' 2 ms bound fail at double load.~~ Done; see the next section.
+
+
+### Continued (2026-11-08, ~19:07–22:05 IST): the wake-up ping-pong and the timer queue under host load (task WAIT-TIMERS-LOAD)
+
+On `claude/priceless-einstein-d6f3b9`, from `118834b` (the weighted-share proof above), **committed locally, not merged, not pushed**. It touches `framekernel/src/cpu.rs`, `main.rs` (`prove_timers`), `runqueue.rs`, `sched.rs`, `timers.rs` and `wait.rs`, and merges after the weighted-share branch.
+
+Measuring first showed neither proof was timing the kernel. In 36,000 firings at up to four `yes` per core no timer was decisively late: the proof was timing the poller. And at double load the slowest tenth of the ping-pong's round trips carries 60 % of the time: a run's mean ranges from 145 to 1713 µs while its median stays under 640 µs.
+
+- **The fix, timers:** every firing's lateness is an interval from the polls around it (`timers::Firing`, `Verdict`, `judge`), and a run decides only if every firing's whole interval is inside or outside 2 ms. A timer held past the limit at a poll that did not fire it, or a wrong order, fails at once; an undecided run is repeated, up to 64 runs of about 15 ms.
+- **The fix, ping-pong:** the 2000 µs mean still decides on an undisturbed run, and always on one processor. A run with the boot flow's processor away for at least a tenth of it (`sched::yield_until_away`, steps of at least 3 ms) is judged by its median round trip against the same bound and at least 750 reschedule IPIs per 1000 rounds on the far processor (`runqueue::round_trips_ok`, `cpu::reschedule_ipis`), at most three runs. The boot line gains the median, the IPIs and the away share.
+- **Measured** (`docs/engineering/SOURCE_PROVENANCE.md`, "The wait-queue ping-pong and the timer queue under host load"): per run, the old six-run timer budget ran out for 0.14 % of the starting points at 1× and 4.4 % at 2× (3600 runs each), and no budget of 24 or more ever ran out. Boot level, alternating with `118834b`: neither kernel failed in 20 pairs at 1× or 30 pairs at 2×. **The original failures did not recur at those loads, so these boots show no new failures and no extra boot time, not an improvement.** At 4× (10 pairs) the old kernel failed the ping-pong in 2 of the 7 boots that reached it (2833 and 2523 µs) and this change in none; two of its boots had means the old bound would have failed (2871 and 3170 µs) and passed with medians of 780 and 1118 µs.
+- **Controls** (all on the final tree): for the timers, a timer 3 ms late with the poller running, a cancelled timer firing and a queue that never fires all fail the boot; a 9 ms stall across a deadline is repeated and passes, and fails with the repeat disabled. For the ping-pong, no IPIs, every second or fourth IPI lost, a 3 ms slow wake path (2.5 ms at 2×) and, on one processor, every fourth round trip 10 ms slow all fail the boot; a 2.5 s stall of the boot flow's processor passes, and fails judged by the mean alone.
+- **Gates:** `cargo xtask check` (711 tests, 0 failures, 6 ignored); `cargo xtask boot-matrix` (Intel and AMD at 1, 2, 4 CPUs, `boot-x2apic`; ping-pong means 25 to 38 µs on two or more processors, 4 and 5 µs on one; every `prove_timers` line `worst lateness 0 us`).
+- **Note for whoever edits a boot proof:** a disturbance signal must mean the same thing on every machine shape the proof runs on. The first version of this rule read the boot flow's away time on one processor too, where it is about 80 % on a quiet boot because the boot flow takes turns with the two threads, which silently set the mean bound aside; the quiet boot matrix's lines gave it away, and the guard now has a control. And `xtask`'s serial cleaner is quadratic in the log's size: a probe that prints thousands of lines makes a boot take minutes.
+
+#### Next
+
+- Merge this branch after the weighted-share branch (`claude/elegant-thompson-48edc8`).
+- At four `yes` per core, beyond the load this work was for, the RTC proof (`too uncertain to confirm within 1 %`, 2 boots of 10) and the APIC timer proof (`APIC timer is wrong`, 1 of 10) failed equally with and without this change. Not touched.
