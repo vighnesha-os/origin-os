@@ -788,6 +788,16 @@ const TFTP_FILE: &str = "initramfs.tar";
 const TFTP_CLIENT_PORT: u16 = 49152;
 /// The largest file the fetch accepts.
 const TFTP_LIMIT: usize = 64 * 1024;
+/// How long the reader waits for each packet before retransmitting what it sent last, and
+/// how many attempts it makes before giving up: together the 2 s budget of any other reply.
+const TFTP_ATTEMPT_NS: u64 = 500_000_000;
+const TFTP_ATTEMPTS: u32 = 4;
+/// The boot proof drops the first read request on purpose — it goes out with a corrupted UDP
+/// checksum, which the server discards — so the reader's timeout-and-retransmit path runs on
+/// every boot, and the file must still arrive whole.
+const TFTP_INJECT_LOST_REQUEST: bool = true;
+/// Packets the reader retransmitted after a timeout.
+static TFTP_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
 
 /// The fetch's results: bytes and blocks accepted, whether it completed and matched the
 /// embedded image (1), and the server's error code plus one (0: none).
@@ -846,7 +856,12 @@ fn timeout_note(step: u64) -> alloc::string::String {
         waiting::ARP => alloc::string::String::from("the gateway's ARP reply"),
         waiting::DHCP => alloc::string::String::from("a DHCP reply"),
         waiting::ECHO => alloc::format!("the reply to echo request {detail}"),
-        _ => alloc::format!("TFTP block {detail}"),
+        _ => {
+            return alloc::format!(
+                "; timed out after {TFTP_ATTEMPTS} attempts of {} ms waiting for TFTP block {detail}",
+                TFTP_ATTEMPT_NS / 1_000_000
+            );
+        }
     };
     alloc::format!(
         "; timed out after {} ms waiting for {what}",
@@ -855,18 +870,24 @@ fn timeout_note(step: u64) -> alloc::string::String {
 }
 
 /// Transmits a UDP datagram from `src`:`sport` to `dst`:`dport` (with its checksum), unicast
-/// to `dst_mac`.
+/// to `dst_mac`; with `damage`, its checksum is corrupted on purpose (a loss injected for a
+/// proof).
 fn send_udp(
     our_mac: Mac,
     dst_mac: Mac,
     (src, sport): (Ipv4, u16),
     (dst, dport): (Ipv4, u16),
     payload: &[u8],
+    damage: bool,
 ) -> bool {
     let mut udp = [0u8; net::UDP_HEADER + 600];
     let Some(un) = net::Udp::write(src, dst, sport, dport, payload, &mut udp) else {
         return false;
     };
+    if damage {
+        // A deliberately corrupted UDP checksum: the receiver must discard the datagram.
+        udp[7] ^= 0xFF;
+    }
     let mut ip = [0u8; net::IPV4_HEADER + net::UDP_HEADER + 600];
     let Some(ipn) =
         net::Ipv4Packet::write(src, dst, net::protocol::UDP, 64, 0, &udp[..un], &mut ip)
@@ -881,21 +902,20 @@ fn send_udp(
 }
 
 /// Sleeps for received frames until a UDP datagram from `from` to `to`:`port` arrives (at
-/// most `tries` frames), copies its payload into `out` and returns its source port and
-/// length. The IPv4 header checksum and the UDP checksum are verified; a datagram whose
+/// most `tries` frames, within `timeout_ns`), copies its payload into `out` and returns its
+/// source port and length. The IPv4 header checksum and the UDP checksum are verified; a datagram whose
 /// payload does not fit `out` is skipped.
 fn await_udp(
     rx: &mut RxRing,
     (from, to, port): (Ipv4, Ipv4, u16),
     tries: usize,
     out: &mut [u8],
-    (step, detail): (u64, u64),
-) -> Option<(u16, usize)> {
-    let deadline = reply_deadline();
+    timeout_ns: u64,
+) -> Result<(u16, usize), Missed> {
+    let deadline = crate::time::monotonic_nanos().saturating_add(timeout_ns);
     for _ in 0..tries {
         let Some(eth) = rx.recv(deadline) else {
-            timed_out(step, detail);
-            return None;
+            return Err(Missed::TimedOut);
         };
         if let Some(frame) = EthFrame::parse(eth)
             && frame.ethertype == ethertype::IPV4
@@ -908,10 +928,19 @@ fn await_udp(
             && let Some(dst) = out.get_mut(..udp.payload.len())
         {
             dst.copy_from_slice(udp.payload);
-            return Some((udp.src_port, udp.payload.len()));
+            return Ok((udp.src_port, udp.payload.len()));
         }
     }
-    None
+    Err(Missed::Strays)
+}
+
+/// Why [`await_udp`] came back without the datagram.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Missed {
+    /// Nothing arrived within the timeout.
+    TimedOut,
+    /// Frames arrived, none of them the datagram awaited.
+    Strays,
 }
 
 /// Fetches [`TFTP_FILE`] from the TFTP server on the gateway (`tftp::Download` drives the
@@ -927,41 +956,74 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
         return;
     };
     let ours_port = (ours, TFTP_CLIENT_PORT);
+    // What was sent last and to which port: retransmitted when nothing comes back in time
+    // (RFC 1350: the side waiting for a packet times out and retransmits its last one).
+    let (mut last, mut last_len, mut last_port) = (request, n, tftp::PORT);
     if !send_udp(
         our_mac,
         server_mac,
         ours_port,
-        (GATEWAY, tftp::PORT),
-        &request[..n],
+        (GATEWAY, last_port),
+        &last[..last_len],
+        TFTP_INJECT_LOST_REQUEST,
     ) {
         return;
     }
     let mut download = tftp::Download::new(TFTP_LIMIT);
     let mut server_port = None;
     let mut packet = [0u8; 4 + tftp::BLOCK];
-    // One frame per block, plus room for strays.
-    for _ in 0..TFTP_LIMIT / tftp::BLOCK + 8 {
-        let awaited = (waiting::TFTP, u64::from(download.blocks()) + 1);
-        let Some((port, len)) = await_udp(
+    let mut misses = 0;
+    // One frame per block, plus room for strays, for every attempt.
+    for _ in 0..(TFTP_LIMIT / tftp::BLOCK + 8) * TFTP_ATTEMPTS as usize {
+        let (port, len) = match await_udp(
             rx,
             (GATEWAY, ours, TFTP_CLIENT_PORT),
             4,
             &mut packet,
-            awaited,
-        ) else {
-            break;
+            TFTP_ATTEMPT_NS,
+        ) {
+            Ok(got) => got,
+            Err(Missed::Strays) => continue,
+            Err(Missed::TimedOut) => {
+                misses += 1;
+                if misses >= TFTP_ATTEMPTS {
+                    timed_out(waiting::TFTP, u64::from(download.blocks()) + 1);
+                    break;
+                }
+                TFTP_RETRANSMITS.fetch_add(1, Ordering::Relaxed);
+                send_udp(
+                    our_mac,
+                    server_mac,
+                    ours_port,
+                    (GATEWAY, last_port),
+                    &last[..last_len],
+                    false,
+                );
+                continue;
+            }
         };
+        misses = 0;
         // The transfer continues with the port the server first answered from (its TID).
         if *server_port.get_or_insert(port) != port {
             continue;
         }
         match download.on_packet(&packet[..len]) {
-            tftp::Step::Ack { block, last } => {
-                let mut ack = [0u8; 4];
-                if let Some(an) = tftp::ack(block, &mut ack) {
-                    send_udp(our_mac, server_mac, ours_port, (GATEWAY, port), &ack[..an]);
+            tftp::Step::Ack {
+                block,
+                last: final_block,
+            } => {
+                if let Some(an) = tftp::ack(block, &mut last) {
+                    (last_len, last_port) = (an, port);
+                    send_udp(
+                        our_mac,
+                        server_mac,
+                        ours_port,
+                        (GATEWAY, port),
+                        &last[..an],
+                        false,
+                    );
                 }
-                if last {
+                if final_block {
                     break;
                 }
             }
@@ -1334,9 +1396,11 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     let server_error = TFTP_ERROR.load(Ordering::Relaxed);
     let frames = RX_FRAMES.load(Ordering::Relaxed);
     let recycled = RX_RECYCLED.load(Ordering::Relaxed);
+    let retransmits = TFTP_RETRANSMITS.load(Ordering::Relaxed);
     let tftp_ok = finished
         && complete
         && identical
+        && retransmits == u64::from(TFTP_INJECT_LOST_REQUEST)
         && bytes == crate::INITRAMFS_IMAGE.len() as u64
         && frames > N_RX as u64
         && recycled > 0;
@@ -1352,12 +1416,13 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     };
     let _ = writeln!(
         com1,
-        "origin-kernel: virtio-net TFTP: {TFTP_FILE} from 10.0.2.2: {bytes} bytes in {blocks} blocks{}, {outcome}; the receive ring's {N_RX} buffers carried {frames} frames ({recycled} recycled){tftp_note}; consistent {}{}",
+        "origin-kernel: virtio-net TFTP: {TFTP_FILE} from 10.0.2.2: {bytes} bytes in {blocks} blocks{}, {outcome}; {retransmits} retransmitted after a {} ms timeout (the first read request is dropped on purpose); the receive ring's {N_RX} buffers carried {frames} frames ({recycled} recycled){tftp_note}; consistent {}{}",
         if complete && bytes.is_multiple_of(framekernel::tftp::BLOCK as u64) {
             " (the last empty)"
         } else {
             ""
         },
+        TFTP_ATTEMPT_NS / 1_000_000,
         tftp_ok,
         if tftp_ok { "" } else { ": virtio-net failed" }
     );
