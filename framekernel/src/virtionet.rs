@@ -1238,8 +1238,15 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
         return;
     }
     let at: Address = dev.function.at;
-    // Enable memory-space decoding and bus mastering for DMA.
-    crate::pcie::enable(at, (1 << 1) | (1 << 2));
+    // Memory-space decoding for the registers. Bus mastering waits until the device has a
+    // DMA path (ADR-0007 I12).
+    if crate::pcie::enable_memory(at).is_none() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: virtio-net: memory decoding did not turn on: virtio-net failed"
+        );
+        return;
+    }
 
     // Only structures in a memory BAR and inside it: this driver has no port I/O paths, and
     // a device may list an I/O-BAR instance first (virtio 1.1 §4.1.4.1).
@@ -1318,6 +1325,21 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
     } else {
         DeviceDma::Direct
     };
+    // Bus mastering only now (ADR-0007 I12): the driver reset the device above, so it is idle
+    // and owns no queue yet. A device without VIRTIO_F_ACCESS_PLATFORM behind a translating
+    // IOMMU is refused here: it could not be confined.
+    match dma.enable_bus_master(at) {
+        Ok(command) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: virtio-net: bus mastering on after the device got its DMA path: command register {command:#06x}"
+            );
+        }
+        Err(why) => {
+            let _ = writeln!(com1, "origin-kernel: virtio-net: {why}: virtio-net failed");
+            return;
+        }
+    }
 
     // The receive thread runs on another processor when there is one (as the NVMe interrupt
     // proof does), and the NIC's MSI-X message is routed to that processor, so it idles until

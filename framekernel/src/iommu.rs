@@ -728,6 +728,29 @@ pub(crate) fn translating() -> bool {
     crate::cpu::without_interrupts(|| IOMMU.lock().as_ref().is_some_and(|s| s.translating))
 }
 
+/// Whether domain `d` is the one the PCI function at `at` was attached to.
+pub(crate) fn attached(d: Domain, at: Address) -> bool {
+    if amd::active() {
+        return amd::attached(d, at);
+    }
+    let r = requester(at);
+    crate::cpu::without_interrupts(|| {
+        IOMMU
+            .lock()
+            .as_ref()
+            .is_some_and(|s| s.domains.get(d.0).is_some_and(|dom| dom.requester == r))
+    })
+}
+
+/// The PCI functions that are the IOMMUs themselves, from the firmware's IVRS: an AMD IOMMU
+/// is a PCI function, a VT-d unit is not. A domain cannot confine the hardware that enforces
+/// domains, and AMD's specification (48882) does not say what such a function's Bus Master
+/// Enable does, so `pcie::quiesce` leaves these alone. The list comes from firmware, never
+/// from a device's class code: a device can claim to be any class.
+pub(crate) fn own_functions(rsdp: u64) -> Vec<Address> {
+    amd::own_functions(rsdp)
+}
+
 impl Iommu {
     /// The running unit that translates `r`.
     fn unit_of(&self, r: Requester) -> Result<usize, &'static str> {

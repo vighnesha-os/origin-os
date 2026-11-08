@@ -39,6 +39,21 @@ impl DeviceDma {
         }
     }
 
+    /// Turns bus mastering on for the PCI function at `at`, which this path was attached for
+    /// (`attach`). Returns its command register. While the IOMMU translates, a function
+    /// without a domain of its own is refused: it would master the bus unconfined.
+    pub(crate) fn enable_bus_master(&self, at: Address) -> Result<u16, &'static str> {
+        match *self {
+            Self::Translated(d) if crate::iommu::attached(d, at) => {}
+            Self::Translated(_) => return Err("this domain does not belong to the device"),
+            Self::Direct if crate::iommu::translating() => {
+                return Err("the IOMMU translates and the device has no domain of its own");
+            }
+            Self::Direct => {}
+        }
+        crate::pcie::set_bus_master(at)
+    }
+
     /// A new zeroed page the device may read and write, mapped for it.
     pub(crate) fn page(&self) -> Option<DmaPage> {
         let layout = Layout::from_size_align(4096, 4096).ok()?;

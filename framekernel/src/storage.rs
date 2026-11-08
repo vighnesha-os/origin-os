@@ -4,8 +4,10 @@
 //!
 //! A first-party kernel-mode driver (ADR-0001 D2). It binds to the first NVMe controller
 //! (class 01:08:02) that `pcie` listed:
-//! 1. memory decoding and bus mastering on; BAR 0 mapped uncached;
-//! 2. the controller reset: CC.EN cleared and CSTS.RDY awaited within CAP.TO;
+//! 1. memory decoding on; BAR 0 mapped uncached; the controller attached to a domain;
+//! 2. the controller reset: CC.EN cleared and CSTS.RDY awaited within CAP.TO; only then is
+//!    bus mastering turned on (ADR-0007 I12: never before it is attached, and a controller
+//!    the firmware left running cannot act on the firmware's queues in between);
 //! 3. admin queues of 32 entries; CC.EN set (4 KiB pages, 64/16-byte entries); RDY awaited,
 //!    with the fatal-status bit checked;
 //! 4. Identify Controller and Identify Namespace 1;
@@ -54,8 +56,6 @@ pub(crate) const PAGE: u64 = 4096;
 const COMMAND_TIMEOUT_NS: u64 = 2_000_000_000;
 /// The namespace the proof uses.
 const NSID: u32 = 1;
-/// Command register bits: memory space decoding, bus mastering.
-const MEMORY_AND_BUS_MASTER: u16 = (1 << 1) | (1 << 2);
 
 /// A zeroed 4 KiB DMA page, kept for ever (the controller may use it at any time): where
 /// the kernel reaches it (`virt`) and the address the controller uses (`bus`: an IOVA in its
@@ -497,14 +497,10 @@ fn bind(
     if bar.kind == BarKind::Io || bar.size < 0x2000 {
         return Err("BAR 0 is not a register window");
     }
-    let command =
-        crate::pcie::enable(f.at, MEMORY_AND_BUS_MASTER).ok_or("no configuration access")?;
-    if command & MEMORY_AND_BUS_MASTER != MEMORY_AND_BUS_MASTER {
-        return Err("memory decoding and bus mastering did not turn on");
-    }
+    crate::pcie::enable_memory(f.at).ok_or("memory decoding did not turn on")?;
     let regs = crate::vm::map_mmio(bar.address, bar.size).map_err(|_| "cannot map BAR 0")?;
     // Its own IOMMU domain before its first DMA page: from here on it reaches only the pages
-    // mapped for it.
+    // mapped for it. Bus mastering stays off until the controller is reset.
     let dma = DeviceDma::attach(f.at)?;
     let mut c = Nvme {
         regs,
@@ -534,12 +530,17 @@ fn bind(
     if c.cap.max_entries < u32::from(IO_ENTRIES) {
         return Err("queues too small");
     }
-    // Reset, then the admin queues, then enable.
+    // Reset, then bus mastering, then the admin queues, then enable.
     let cc = c.read32(register::CC);
     if cc & 1 != 0 {
         c.write32(register::CC, cc & !1);
     }
     c.wait_ready(false)?;
+    let command = dma.enable_bus_master(f.at)?;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: NVMe: bus mastering on after the controller was attached and reset: command register {command:#06x}"
+    );
     c.write32(register::AQA, nvme::aqa(ADMIN_ENTRIES));
     c.write64(register::ASQ, c.admin.sq.bus);
     c.write64(register::ACQ, c.admin.cq.bus);

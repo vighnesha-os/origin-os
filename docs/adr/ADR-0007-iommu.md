@@ -4,7 +4,7 @@
 |---|---|
 | Status | **Accepted** by the owner on 2026-11-08: questions 1–5 and 9 first, then questions 6, 7 and 8 (AMD-Vi) once AMD's manuals were confirmed byte-identical to the copies that were read. This is a kernel-internal security mechanism, not an ABI or format decision; the parts that will reach the Driver ABI (how a user-mode driver asks for DMA memory, §31) are decided later, against this. |
 | Requires | CLAUDE.md §31 (DMA mapping, interrupt management, driver isolation), §32 (Intel VT-d, AMD IOMMU, interrupt remapping), §58 (DMA protection) |
-| Evidence | `docs/research/2026-11-08-vt-d-iommu.md` (VT-d Rev 5.20, D51397-019, 2026-05-14; what QEMU 11.1's `intel-iommu` emulates); `docs/research/2026-11-08-amd-vi-iommu.md` (AMD IOMMU specification 48882 Rev 3.11, April 2026; what QEMU 11.1's `amd-iommu` emulates and where it departs from the specification); the boot proofs and negative controls in `docs/engineering/SOURCE_PROVENANCE.md` ("Intel VT-d DMA and interrupt remapping"; "I/O APIC interrupts through VT-d interrupt remapping"; "AMD-Vi DMA and interrupt remapping") |
+| Evidence | `docs/research/2026-11-08-vt-d-iommu.md` (VT-d Rev 5.20, D51397-019, 2026-05-14; what QEMU 11.1's `intel-iommu` emulates); `docs/research/2026-11-08-amd-vi-iommu.md` (AMD IOMMU specification 48882 Rev 3.11, April 2026; what QEMU 11.1's `amd-iommu` emulates and where it departs from the specification); the boot proofs and negative controls in `docs/engineering/SOURCE_PROVENANCE.md` ("Intel VT-d DMA and interrupt remapping"; "I/O APIC interrupts through VT-d interrupt remapping"; "AMD-Vi DMA and interrupt remapping"; "Bus mastering cleared at enumeration"); `docs/research/2026-11-08-bus-master-quiesce.md` for I12 |
 | Threat model | `docs/engineering/THREAT_MODEL_IOMMU.md` (CLAUDE.md §58) |
 | Related | ADR-0001 D2 (first-party kernel drivers), ADR-0004 (address-space layout: the MMIO window holds the units' registers) |
 
@@ -53,10 +53,24 @@ QEMU 11.1's I/O APIC sends its messages without a requester ID, so under QEMU th
 Fault events stay masked; the fault-recording registers are read and cleared by the kernel (`iommu::take_faults`), decoded by reason. A fault-event interrupt that feeds the kernel log (§69) is a later step.
 
 ### I10. virtio devices
-A virtio device that offers `VIRTIO_F_ACCESS_PLATFORM` sits behind the IOMMU: the driver accepts the feature (QEMU refuses `FEATURES_OK` otherwise) and uses IOVAs. One that does not offer it uses physical addresses (virtio 1.1 §6) and is given them.
+A virtio device that offers `VIRTIO_F_ACCESS_PLATFORM` sits behind the IOMMU: the driver accepts the feature (QEMU refuses `FEATURES_OK` otherwise) and uses IOVAs. One that does not offer it uses physical addresses (virtio 1.1 §6) and is given them only where the IOMMU is not translating; behind a translating IOMMU it is refused (I12).
 
 ### I11. What is refused rather than half-done
 A DMAR that fails any check (`framekernel::dmar::parse`) leaves the IOMMU off and fails the boot proof loudly; the firmware's `DMA_REMAP_OPT_OUT` and `X2APIC_OPT_OUT` requests are reported and not honoured (Rev 5.20 §8.1; decision-sheet item 25); a unit the firmware left enabled is not taken over; a device named by a reserved memory region (RMRR) is refused at attach (identity-mapping RMRRs is not implemented yet), so its DMA stays blocked rather than unchecked; if one unit fails to come up, the units already running are turned off again so drivers are not left blocked with nobody to attach them.
+
+### I12. Bus mastering is cleared at enumeration and set again only after a device is attached (added 2026-11-08; threat T4)
+
+Translation is only on once the IOMMU is up, and firmware hands over with devices still able to master the bus (OVMF: every function, research ledger `docs/research/2026-11-08-bus-master-quiesce.md` §4). So:
+
+- `pcie::quiesce` clears **Bus Master Enable on every function of every MCFG window, bridges included**, as soon as the kernel's page tables and heap exist, before any other subsystem runs, and reads each one back. The read-back is also what pushes out writes the function had already posted. Transactions Pending is then waited for once (at most 100 ms for all functions together). A bridge is cleared before the functions behind it.
+- A driver turns bus mastering on again **only through `dma::DeviceDma::enable_bus_master`**, after `DeviceDma::attach` and, for a controller, after resetting it (the NVMe driver), which refuses when the IOMMU translates and the device has no domain of its own, and refuses if the bit is already on. It opens every bridge above the function, nearest the root first, then the function. `pcie::enable` no longer exists; nothing else can set the bit.
+- `iommu::init` runs **before `smp::start`** instead of after enumeration, right after the compatibility-format I/O APIC proof (which interrupt remapping would block on hardware).
+- A virtio device without `VIRTIO_F_ACCESS_PLATFORM` behind a translating IOMMU is refused (this tightens I10): the kernel cannot confine it.
+- **The IOMMU's own PCI function is not touched** (AMD-Vi; the IVRS names it, never a class code, which any device can claim): a domain cannot confine the hardware that enforces domains, and AMD's specification (48882 Rev 3.11) does not mention its Bus Master Enable, so whether its table walks depend on it could not be determined. Hardware qualification must check this.
+
+*Alternatives:* clearing only bridges (as a Linux patch did at ExitBootServices): an integrated endpoint has no bridge above it, so its own bit is all there is, and a device that ignores its own bit is stopped by its bridge, so both are cleared. Clearing only endpoints: a hostile endpoint ignores its bit; the bridge above it does not. Clearing in the loader before ExitBootServices: UEFI drivers are still running on those devices; rejected (ledger §1 E1, L2), and it would not shrink the hostile window much. Leaving firmware's bus masters running until a driver attaches: that is T4. Waiting per function for Transactions Pending: a device could then multiply the delay; one shared deadline cannot be stretched.
+*Evidence:* ledger §2 (requests in flight; the specification could not be read), §4 (what OVMF leaves), §7 (why the IOMMU is not earlier still), the boot proofs and controls C1–C10.
+*Trade-offs:* A device whose firmware keeps it running across the hand-off (SMM-driven USB legacy, a firmware framebuffer's scan-out) loses bus mastering; no driver depends on those yet, and hardware qualification must decide what to except (ledger §9). A function that ignores the write is only reported.
 
 ## Decisions for AMD-Vi
 
@@ -97,7 +111,7 @@ QEMU 11.1's `amd-iommu` translates emulated devices only with `dma-remap=on`, wr
 
 ## Consequences
 
-- Drivers allocate DMA memory through `dma::DeviceDma` (attach once, then pages that come mapped) and program bus addresses, never physical ones; MSI-X entries are programmed through `iommu::msi_message`.
+- Drivers allocate DMA memory through `dma::DeviceDma` (attach once, then pages that come mapped) and program bus addresses, never physical ones; MSI-X entries are programmed through `iommu::msi_message`. Bus mastering is set only by `DeviceDma::enable_bus_master`, after attaching (I12).
 - The boot needs `-device intel-iommu,intremap=on,eim=on` and `iommu_platform=on` on virtio devices (xtask). With `ORIGIN_QEMU_IOMMU=amd` it boots instead with `-device AMDVI-PCI,id=iommupci0,addr=05.0 -device amd-iommu,pci-id=iommupci0,intremap=on,xtsup=on,dma-remap=on`; `boot-matrix` runs both IOMMUs at 1, 2 and 4 CPUs. Any other value of `ORIGIN_QEMU_IOMMU` must be an `intel-iommu` device, booted with the VT-d markers (negative controls such as `intel-iommu,intremap=off`).
 - Legacy IRQs are routed through `iommu::route_ioapic_pin` and a remappable-format redirection entry whenever VT-d remaps interrupts (the PIT's IRQ0 is proven at every boot); a compatibility-format I/O APIC entry is used only before the IOMMU is up, or without interrupt remapping. Under AMD-Vi the pins are not routed yet (`iommu::routes_ioapic_pins` is false) and stay masked: see below.
 - Faults reach the proofs through the neutral `iommu::Fault`; the IOMMU proofs in `storage.rs` and the I/O APIC proof in `irq.rs` read it.
@@ -122,7 +136,7 @@ None on disk and none at any ABI: all of this is kernel-internal, and no persist
 - RMRR and IVMD identity maps are additive.
 - When user-mode drivers arrive (§31, §47), their DMA interface needs its own ADR. It must be capability-checked and must not expose the window or the table formats; `dma::DeviceDma` stays beneath it.
 
-## Questions for the owner (all answered 2026-11-08)
+## Questions for the owner (1–9 answered 2026-11-08; 10 open)
 
 1. Accept default-deny with one domain per requester ID (I2, I3)? **Yes (2026-11-08).**
 2. Accept the [1 GiB, 2 GiB) IOVA window and "IOVAs are never physical addresses" (I4)? **Yes (2026-11-08).**
@@ -133,3 +147,4 @@ None on disk and none at any ABI: all of this is kernel-internal, and no persist
 7. Accept the two QEMU allowances in the AMD-Vi proofs — a fault record with address 0, and no record of the blocked interrupt — as documented blind spots of QEMU 11.1, with hardware qualification required to check both (A10)? **Yes (2026-11-08),** as QEMU limits; hardware qualification must check both.
 8. Accept refusing devices that an IVMD names, as for RMRRs (A9, I11)? **Yes (2026-11-08),** with question 4's deadline: identity maps must land before real hardware.
 9. Should the kernel honour the firmware's `DMA_REMAP_OPT_OUT` and `X2APIC_OPT_OUT` requests (Rev 5.20 §8.1)? **No (2026-11-08): report them and carry on.** §58 requires DMA protection, and the kernel depends on x2APIC. A platform that truly needs either is outside the declared hardware scope.
+10. *(Open: added with T4, merged 2026-11-09.)* Accept clearing bus mastering on every function at enumeration (I12), including the bridges above devices that are not driven yet, and leaving the AMD IOMMU's own function alone pending hardware evidence? Clearing it may break firmware-owned controllers on real hardware (USB legacy, a firmware framebuffer) until drivers exist or exceptions are decided.
