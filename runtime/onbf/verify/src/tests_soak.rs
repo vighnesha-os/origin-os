@@ -11,7 +11,7 @@
 //! A failure is reproduced by its seed and case number; `ORIGIN_MUTATION_SCALE` scales the
 //! case counts.
 
-use onbf_format::signature::SignatureBlock;
+use onbf_format::signature::{Role, SignatureBlock};
 use origin_crypto::Sha256;
 
 use super::tests::{Fixture, fixture};
@@ -339,4 +339,137 @@ fn hand_built_entries_with_wrong_signature_lengths_are_refused() {
         verify_entry(&short_ml, &key, &f.digest, f.profile),
         Err(VerifyError::KeyLength)
     );
+}
+
+// ---------------------------------------------------------------- the KRN trust-store policy
+
+const KRN_POLICY_SEED: u64 = 0x4B52_4E50_4F4C_4943; // "KRNPOLIC"
+
+/// Everything `verify_krn_block` can decide in this soak.
+const KRN_VERDICTS: [&str; 8] = [
+    "verified",
+    "malformed",
+    "entry count",
+    "role",
+    "chain",
+    "untrusted key",
+    "statement",
+    "signature",
+];
+
+/// `verify_krn_block` judged against the policy written out from its documentation, over
+/// blocks and trust stores a mutator changes: a parsed block must hold one entry, in the
+/// kernel role, with no chain, by a key the store holds for that role; and whatever then
+/// verifies must be exactly what the fixture signed.
+#[test]
+fn the_krn_policy_holds_over_mutated_blocks_and_stores() {
+    let f: Fixture = fixture();
+    let parsed = SignatureBlock::parse(&f.block).expect("the fixture parses");
+    let reference = *parsed.entries().next().expect("one entry");
+    let st_at = offset_in(&f.block, reference.statement.bytes);
+    let st_len = reference.statement.bytes.len();
+    let entry_body = f.block[20..].to_vec();
+    let trusted = model_key_id(&f.ed, &f.ml);
+
+    let mut reached = Reached::default();
+    let total = cases(600);
+    for case in 0..total {
+        let mut rng = Rng::for_case(KRN_POLICY_SEED, case);
+        let mut block = f.block.clone();
+        let mut digest = f.digest;
+        // The store under test: which key, for which role.
+        let mut store_role = Role::Kernel;
+        let mut store_ed = f.ed;
+        let mut store_empty = false;
+        match rng.below(10) {
+            0 => {}
+            1 | 2 => mutate(&mut block, &mut rng),
+            3 => mutate_window(&mut block, st_at..st_at + st_len, &mut rng),
+            4 => block[20 + 2] = rng.pick(&[1, 2, 3, 5]),
+            5 => store_role = rng.pick(&[Role::Publisher, Role::Notary, Role::Release]),
+            6 => store_ed[rng.below(32)] ^= 1 << rng.below(8),
+            7 => store_empty = true,
+            8 => digest[rng.below(64)] ^= 1 << rng.below(8),
+            // A second entry, a chain, or a role change, each hand-made and well-formed.
+            _ => {
+                let id = if rng.chance(50) {
+                    trusted
+                } else {
+                    [rng.byte(); 32]
+                };
+                let certs = rng.below(3);
+                let role = rng.pick(&[1, 2, 3, 4, 5]);
+                let other = super::tests::hand_entry(role, &id, certs, &f.digest);
+                block = if rng.chance(50) {
+                    super::tests::hand_block(&[&entry_body, &other])
+                } else {
+                    super::tests::hand_block(&[&other])
+                };
+            }
+        }
+        let keys = [TrustedKey {
+            role: store_role,
+            key: PublicKey {
+                ed25519: &store_ed,
+                mldsa: &f.ml,
+            },
+        }];
+        let store: &[TrustedKey<'_>] = if store_empty { &[] } else { &keys };
+        let verdict = verify_krn_block(&block, store, &digest);
+
+        // The policy, written out independently of the function's structure.
+        let expected: Result<(), KrnBlockError> = match SignatureBlock::parse(&block) {
+            Err(e) => Err(KrnBlockError::Malformed(e)),
+            Ok(p) => {
+                let n = p.entries().count();
+                let first = p.entries().next();
+                match first {
+                    Some(e) if n == 1 && e.role == Role::Kernel && e.chain_len == 0 => {
+                        let holds = store.iter().any(|t| {
+                            t.role == Role::Kernel
+                                && model_key_id(t.key.ed25519, t.key.mldsa) == e.key_id
+                        });
+                        if holds {
+                            let key = PublicKey {
+                                ed25519: &store_ed,
+                                mldsa: &f.ml,
+                            };
+                            verify_entry(e, &key, &digest, 6).map_err(KrnBlockError::Entry)
+                        } else {
+                            Err(KrnBlockError::UntrustedKey)
+                        }
+                    }
+                    Some(e) if n == 1 && e.role != Role::Kernel => Err(KrnBlockError::Role(e.role)),
+                    Some(_) if n == 1 => Err(KrnBlockError::ChainNotSupported),
+                    _ => Err(KrnBlockError::EntryCount(n)),
+                }
+            }
+        };
+        assert_eq!(
+            verdict.map(|_| ()),
+            expected,
+            "case {case}: the verdict differs from the policy"
+        );
+        match verdict {
+            Ok(id) => {
+                reached.hit("verified");
+                // Nothing verifies except the pristine block, the signer's key and its digest.
+                assert_eq!(block, f.block, "case {case}");
+                assert_eq!(digest, f.digest, "case {case}");
+                assert_eq!(id, trusted, "case {case}");
+                assert_eq!(store_ed, f.ed, "case {case}");
+                assert_eq!(store_role, Role::Kernel, "case {case}");
+            }
+            Err(KrnBlockError::Malformed(_)) => reached.hit("malformed"),
+            Err(KrnBlockError::EntryCount(_)) => reached.hit("entry count"),
+            Err(KrnBlockError::Role(_)) => reached.hit("role"),
+            Err(KrnBlockError::ChainNotSupported) => reached.hit("chain"),
+            Err(KrnBlockError::UntrustedKey) => reached.hit("untrusted key"),
+            Err(KrnBlockError::Entry(VerifyError::Digest | VerifyError::Profile)) => {
+                reached.hit("statement");
+            }
+            Err(KrnBlockError::Entry(_)) => reached.hit("signature"),
+        }
+    }
+    reached.require("KRN policy soak", &KRN_VERDICTS);
 }

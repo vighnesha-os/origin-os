@@ -29,7 +29,7 @@ pub(crate) struct SectionSpec {
 }
 
 /// Rounds `x` up to `align`, a power of two.
-fn align_up(x: u64, align: u64) -> Option<u64> {
+pub(crate) fn align_up(x: u64, align: u64) -> Option<u64> {
     let mask = align.checked_sub(1)?;
     Some(x.checked_add(mask)? & !mask)
 }
@@ -39,7 +39,7 @@ fn usize_of(x: u64) -> Result<usize, LayoutError> {
 }
 
 /// Copies `src` to `out[at..]`.
-fn put(out: &mut [u8], at: usize, src: &[u8]) -> Result<(), LayoutError> {
+pub(crate) fn put(out: &mut [u8], at: usize, src: &[u8]) -> Result<(), LayoutError> {
     let end = at.checked_add(src.len()).ok_or(LayoutError::TooLarge)?;
     out.get_mut(at..end)
         .ok_or(LayoutError::TooLarge)?

@@ -17,4 +17,5 @@ pub mod memmap;
 pub mod place;
 pub mod protocols;
 pub mod text;
+pub mod trust;
 pub mod uefi;

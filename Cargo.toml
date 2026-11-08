@@ -56,6 +56,7 @@ origin-boot-info = { path = "boot/info" }
 origin-crypto = { path = "security/crypto" }
 onbf-format = { path = "runtime/onbf/format" }
 onbf-merkle = { path = "runtime/onbf/merkle" }
+onbf-verify = { path = "runtime/onbf/verify" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

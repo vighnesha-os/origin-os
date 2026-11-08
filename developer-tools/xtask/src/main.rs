@@ -25,8 +25,10 @@ commands:
   check       rustfmt, clippy and unit tests, each crate on its own target(s);
               the UEFI release build; the CLAUDE.md §11 cfg lint
   build       build the loader (developer mode) and the KRN kernel image; print their paths
-  boot-test   boot under QEMU + OVMF twice: the kernel must start and report; a tampered
-              kernel image must be rejected by the loader
+  boot-test   boot under QEMU + OVMF: a signed kernel must start and report with developer
+              mode off, an unsigned one in developer mode, and a loader with developer mode
+              off must refuse an unsigned image, a wrong key, a tampered statement, a bad
+              signature and tampered content, each with its own message
   boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
               one after another
   boot-x2apic boot-test on a sparse topology: the boot processor at APIC ID 0 and processors
@@ -39,6 +41,8 @@ environment:
   ORIGIN_OVMF_CODE, ORIGIN_OVMF_VARS  firmware code image and NVRAM template
                                       (default: the EDK2 files installed next to QEMU)
   ORIGIN_BOOT_TEST_TIMEOUT            boot-test timeout in seconds (default 120)
+  ORIGIN_BOOT_TEST_ONLY               run only the boot-test scenarios whose label contains
+                                      one of these comma-separated strings
   ORIGIN_QEMU_SMP                     processors QEMU emulates, 1-64 (default 2)
   ORIGIN_QEMU_TOPOLOGY                x2apic: the boot-x2apic machine (ORIGIN_QEMU_SMP is
                                       then ignored)
@@ -83,9 +87,31 @@ const RTC_BASE: &str = "2030-06-15T12:00:00";
 const RTC_BASE_MARKER: &str = "2030-06-15T12:0";
 const DEFAULT_BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Which loader build a scenario boots (ADR-0002 B8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Loader {
+    /// `developer-mode`: accepts an unsigned image, says so, and verifies a signed one.
+    Developer,
+    /// `test-trust-store` only: developer mode is off, so only a signed kernel boots. This is
+    /// what a release build does, but with the test key in place of Origin's own.
+    Verifying,
+}
+
+impl Loader {
+    /// The Cargo feature this build needs.
+    fn feature(self) -> &'static str {
+        match self {
+            Self::Developer => "developer-mode",
+            Self::Verifying => "test-trust-store",
+        }
+    }
+}
+
 /// One QEMU boot the test runs, and what its serial output must and must not contain.
 struct Scenario {
     label: &'static str,
+    /// The loader build it boots.
+    loader: Loader,
     /// Lines required, in this order.
     markers: Vec<String>,
     /// Output that fails the scenario as soon as it appears.
@@ -586,11 +612,14 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
     let target = machine.named(cpus.min(2) - 1);
     Scenario {
         label: "kernel boot",
+        // Developer mode off: the signed kernel of `boot_test`, against the test key.
+        loader: Loader::Verifying,
         markers: vec![
             format!("{PRODUCT} {VERSION} UEFI loader (build {BUILD})"),
             "origin-boot: UEFI 2.".into(),
             "origin-boot: read \\EFI\\ORIGIN\\KERNEL.ONBF (".into(),
-            "origin-boot: developer mode: unsigned kernel images are accepted".into(),
+            "origin-boot: TEST trust store: this loader trusts a development key and must never ship".into(),
+            "origin-boot: kernel signature verified: origin-kernel, Ed25519 and ML-DSA-87 both good, key ID ".into(),
             "origin-boot: kernel verified: ".into(),
             "origin-boot: kernel placed at ".into(),
             "origin-boot: KASLR: kernel at 0xffffffff".into(),
@@ -991,11 +1020,58 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
     }
 }
 
+/// Developer mode: an unsigned kernel still boots (ADR-0002 B8), and the loader says so.
+fn developer_scenario() -> Scenario {
+    use origin_version::{BUILD, PRODUCT, VERSION};
+    Scenario {
+        label: "developer mode unsigned kernel",
+        loader: Loader::Developer,
+        markers: vec![
+            "origin-boot: read \\EFI\\ORIGIN\\KERNEL.ONBF (".into(),
+            "origin-boot: developer mode: unsigned kernel images are accepted".into(),
+            "origin-boot: kernel verified: ".into(),
+            format!("origin-kernel: {PRODUCT} {VERSION} Framekernel (build {BUILD})"),
+        ],
+        failures: vec!["origin-boot: kernel rejected", "origin-boot: panic:"],
+        check: None,
+        stderr: vec![],
+    }
+}
+
+/// A scenario `loader` must refuse with `message` on the console, without ever entering the
+/// kernel. `details` are further lines that must follow.
+fn refusal_scenario(
+    label: &'static str,
+    loader: Loader,
+    message: &str,
+    details: &[&str],
+) -> Scenario {
+    let mut markers = vec![
+        "origin-boot: read \\EFI\\ORIGIN\\KERNEL.ONBF (".to_string(),
+        format!("origin-boot: kernel rejected: {message}"),
+    ];
+    markers.extend(details.iter().map(|d| (*d).to_string()));
+    Scenario {
+        label,
+        loader,
+        markers,
+        failures: vec![
+            "origin-kernel:",
+            "origin-boot: panic:",
+            "origin-boot: kernel verified",
+        ],
+        check: None,
+        stderr: vec![],
+    }
+}
+
 /// The tampered path: one byte of a SEGMENT changed on disk. The loader must refuse it, and
-/// the kernel must never run.
+/// the kernel must never run. Unsigned, under the developer-mode loader: developer mode
+/// still verifies what it can.
 fn tamper_scenario() -> Scenario {
     Scenario {
         label: "tampered kernel",
+        loader: Loader::Developer,
         markers: vec![
             "origin-boot: read \\EFI\\ORIGIN\\KERNEL.ONBF (".into(),
             "origin-boot: kernel rejected: section ".into(),
@@ -1067,7 +1143,7 @@ fn main() -> ExitCode {
         .as_slice()
     {
         ["check"] => check(),
-        ["build"] => build_loader().and_then(|loader| {
+        ["build"] => build_loader(Loader::Developer).and_then(|loader| {
             let kernel = pack_kernel(&build_kernel()?)?;
             println!("{}\n{}", loader.display(), kernel.display());
             Ok(())
@@ -1303,19 +1379,21 @@ fn check() -> Result {
     ]))?;
     run_step(cargo().args(["test", "--package", KERNEL_PACKAGE, "--lib"]))?;
     // The loader in developer mode too (the boot test's variant).
-    run_step(cargo().args([
-        "clippy",
-        "--package",
-        LOADER_PACKAGE,
-        "--target",
-        UEFI_TARGET,
-        "--features",
-        "developer-mode",
-        "--",
-        "-D",
-        "warnings",
-    ]))?;
-    build_loader()?;
+    for loader in [Loader::Developer, Loader::Verifying] {
+        run_step(cargo().args([
+            "clippy",
+            "--package",
+            LOADER_PACKAGE,
+            "--target",
+            UEFI_TARGET,
+            "--features",
+            loader.feature(),
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
+        build_loader(loader)?;
+    }
     build_kernel()?;
     no_panic_check()?;
     linux_cfg_lint()?;
@@ -1574,8 +1652,9 @@ fn collect_files(
 
 // ------------------------------------------------------------------ build
 
-/// Builds the EFI application and returns the path of `origin-boot.efi`.
-fn build_loader() -> Result<PathBuf> {
+/// Builds the EFI application with `loader`'s feature and returns the path of
+/// `origin-boot.efi`.
+fn build_loader(loader: Loader) -> Result<PathBuf> {
     run_step(cargo().args([
         "build",
         "--package",
@@ -1586,7 +1665,7 @@ fn build_loader() -> Result<PathBuf> {
         UEFI_TARGET,
         "--release",
         "--features",
-        "developer-mode",
+        loader.feature(),
     ]))?;
     let efi = target_dir()
         .join(UEFI_TARGET)
@@ -1673,6 +1752,195 @@ fn tampered(krn: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+// ------------------------------------------------------------------ signing, for the boot tests
+
+/// The text the test keys are derived from (`onbf-pack keygen --insecure-test-seed`). This is
+/// the only "private" input they have, and it is public, so they are test keys by
+/// construction and must never sign anything real (CLAUDE.md §59).
+const TEST_KEY_TRUSTED: &str = "TEST-ONLY origin-kernel key 1: the test trust store holds it";
+const TEST_KEY_UNTRUSTED: &str = "TEST-ONLY origin-kernel key 2: no trust store holds it";
+/// The test statements' claimed signing time. Informational (ONBF §7.6), and fixed: a build
+/// reads no clock (ONBF-R9).
+const TEST_SIGNING_TIME: &str = "1794000000";
+
+/// A test key's files, under `target/xtask/test-keys/` (never in the repository).
+struct TestKey {
+    ed25519: PathBuf,
+    mldsa: PathBuf,
+    public_ed25519: PathBuf,
+    public_mldsa: PathBuf,
+}
+
+/// Runs `onbf-pack` with these arguments.
+fn onbf_pack(args: &[&std::ffi::OsStr]) -> Result {
+    run_step(
+        cargo()
+            .args([
+                "run",
+                "--quiet",
+                "--release",
+                "--package",
+                PACK_PACKAGE,
+                "--",
+            ])
+            .args(args),
+    )
+}
+
+/// Creates the test key derived from `seed` in a fresh directory `name`.
+fn make_test_key(name: &str, seed: &str) -> Result<TestKey> {
+    let dir = target_dir().join("xtask").join("test-keys").join(name);
+    if dir.exists() {
+        fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let key = TestKey {
+        ed25519: dir.join("ed25519.pem"),
+        mldsa: dir.join("mldsa87.pem"),
+        public_ed25519: dir.join("ed25519.pub"),
+        public_mldsa: dir.join("mldsa87.pub"),
+    };
+    onbf_pack(&[
+        "keygen".as_ref(),
+        "--insecure-test-seed".as_ref(),
+        seed.as_ref(),
+        "--ed25519-key".as_ref(),
+        key.ed25519.as_os_str(),
+        "--mldsa-key".as_ref(),
+        key.mldsa.as_os_str(),
+        "--public-ed25519".as_ref(),
+        key.public_ed25519.as_os_str(),
+        "--public-mldsa".as_ref(),
+        key.public_mldsa.as_os_str(),
+    ])?;
+    Ok(key)
+}
+
+/// `path`'s contents, or an error naming it.
+fn read_file(path: &Path) -> Result<Vec<u8>> {
+    fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Derives the two test keys, and checks that the trusted one is the public key the loader
+/// has compiled in: a stale copy in `boot/uefi/trust` would otherwise show up as a boot
+/// failure with no explanation.
+fn test_keys() -> Result<(TestKey, TestKey)> {
+    let trusted = make_test_key("trusted", TEST_KEY_TRUSTED)?;
+    let untrusted = make_test_key("untrusted", TEST_KEY_UNTRUSTED)?;
+    let committed = repo_root().join("boot").join("uefi").join("trust");
+    for (name, generated) in [
+        ("TEST-ONLY-origin-kernel.ed25519", &trusted.public_ed25519),
+        ("TEST-ONLY-origin-kernel.mldsa87", &trusted.public_mldsa),
+    ] {
+        if read_file(&committed.join(name))? != read_file(generated)? {
+            return Err(format!(
+                "boot/uefi/trust/{name} is not the public half of the test key derived from \
+                 {TEST_KEY_TRUSTED:?}; regenerate it with `onbf-pack keygen`, as \
+                 boot/uefi/trust/README.md describes"
+            ));
+        }
+    }
+    Ok((trusted, untrusted))
+}
+
+/// Signs the unsigned KRN image `input` with `key`, into `target/xtask/<output>`, and returns
+/// the signed bytes.
+fn sign_kernel(input: &Path, key: &TestKey, output: &str) -> Result<Vec<u8>> {
+    let out = target_dir().join("xtask").join(output);
+    onbf_pack(&[
+        "sign".as_ref(),
+        "--input".as_ref(),
+        input.as_os_str(),
+        "--output".as_ref(),
+        out.as_os_str(),
+        "--ed25519-key".as_ref(),
+        key.ed25519.as_os_str(),
+        "--mldsa-key".as_ref(),
+        key.mldsa.as_os_str(),
+        "--signing-time".as_ref(),
+        TEST_SIGNING_TIME.as_ref(),
+    ])?;
+    read_file(&out)
+}
+
+/// Where a part of a signed image lies in it.
+fn offset_within(whole: &[u8], part: &[u8]) -> Result<usize> {
+    let start = (part.as_ptr() as usize).wrapping_sub(whole.as_ptr() as usize);
+    if start <= whole.len() && part.len() <= whole.len() - start {
+        Ok(start)
+    } else {
+        Err("a signature field lies outside the image".to_string())
+    }
+}
+
+/// A copy of `krn` with byte `at` flipped.
+fn flipped(krn: &[u8], at: usize) -> Result<Vec<u8>> {
+    let mut out = krn.to_vec();
+    let byte = out.get_mut(at).ok_or("flip outside the image")?;
+    *byte ^= 0x01;
+    Ok(out)
+}
+
+/// The offsets of the signed statement's content digest, the Ed25519 signature and the
+/// ML-DSA signature in the signed image `krn`.
+fn signature_fields(krn: &[u8]) -> Result<(usize, usize, usize)> {
+    let options = onbf_format::ParseOptions {
+        developer_mode: true,
+        ..Default::default()
+    };
+    let image = onbf_format::Image::parse(krn, options).map_err(|e| format!("KRN image: {e:?}"))?;
+    let block = image.signature_block().ok_or("the KRN image is unsigned")?;
+    let parsed = onbf_format::signature::SignatureBlock::parse(block)
+        .map_err(|e| format!("signature block: {e:?}"))?;
+    let entry = parsed.entries().next().ok_or("no signature entry")?;
+    Ok((
+        offset_within(krn, entry.statement.content_digest)?,
+        offset_within(krn, entry.sig_ed25519)?,
+        offset_within(krn, entry.sig_mldsa)?,
+    ))
+}
+
+/// A forged image whose digests all agree: one byte of a SEGMENT changed, its Merkle root and
+/// the content digest recomputed. Only the signed statement can tell it from the real one.
+fn substituted(krn: &[u8]) -> Result<Vec<u8>> {
+    let options = onbf_format::ParseOptions {
+        developer_mode: true,
+        ..Default::default()
+    };
+    let image = onbf_format::Image::parse(krn, options).map_err(|e| format!("KRN image: {e:?}"))?;
+    let segment = image
+        .sections()
+        .find(|s| s.entry.kind() == onbf_format::Kind::Segment && s.entry.stored_size > 0)
+        .ok_or("the KRN image has no segment with content")?;
+    let start = usize::try_from(segment.entry.file_offset).map_err(|_| "segment offset")?;
+    let len = usize::try_from(segment.entry.stored_size).map_err(|_| "segment size")?;
+    let entry = 128 + usize::from(segment.index) * 128;
+    let table_end = 128 + image.section_count() * 128;
+    let mut out = krn.to_vec();
+    let content = out
+        .get_mut(start..start + len)
+        .ok_or("segment outside the file")?;
+    let middle = content.len() / 2;
+    let byte = content.get_mut(middle).ok_or("empty segment")?;
+    *byte ^= 0x01;
+    let root = onbf_merkle::root(
+        out.get(start..start + len)
+            .ok_or("segment outside the file")?,
+    )
+    .map_err(|e| format!("Merkle root: {e:?}"))?;
+    out.get_mut(entry + 64..entry + 96)
+        .ok_or("section table outside the file")?
+        .copy_from_slice(&root);
+    let mut digest = origin_crypto::Sha512::new();
+    for range in [0..32, 112..128, 128..table_end] {
+        digest.update(out.get(range).ok_or("header outside the file")?);
+    }
+    out.get_mut(48..112)
+        .ok_or("header outside the file")?
+        .copy_from_slice(&digest.finalize());
+    Ok(out)
+}
+
 // ------------------------------------------------------------------ QEMU
 
 /// An EDK2 x86-64 firmware code image and the NVRAM template that belongs to it.
@@ -1735,10 +2003,10 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Builds the loader and lays out a fresh ESP, holding `kernel` as the KRN image, and a
-/// fresh NVRAM copy for one boot.
-fn stage(kernel: &[u8]) -> Result<Staged> {
-    let efi = build_loader()?;
+/// Builds the `loader` variant and lays out a fresh ESP, holding `kernel` as the KRN image,
+/// and a fresh NVRAM copy for one boot.
+fn stage(kernel: &[u8], loader: Loader) -> Result<Staged> {
+    let efi = build_loader(loader)?;
     let firmware = find_firmware()?;
     let work = target_dir().join("xtask");
     let esp = work.join("esp");
@@ -1855,19 +2123,140 @@ fn boot_test_timeout() -> Result<Duration> {
     }
 }
 
+/// Every boot `boot-test` runs, with the kernel image each one boots.
+fn boot_test_scenarios(unsigned: &Path) -> Result<Vec<(Scenario, Vec<u8>)>> {
+    let krn = read_file(unsigned)?;
+    let (trusted, untrusted) = test_keys()?;
+    let signed = sign_kernel(unsigned, &trusted, "KERNEL.signed.ONBF")?;
+    let wrong_key = sign_kernel(unsigned, &untrusted, "KERNEL.wrong-key.ONBF")?;
+    let (statement_digest, ed25519, mldsa) = signature_fields(&signed)?;
+    use Loader::{Developer, Verifying};
+    let refuse = refusal_scenario;
+    Ok(vec![
+        // The real boot: developer mode off, a signed kernel, every kernel proof.
+        (boot_scenario(), signed.clone()),
+        // Developer mode still boots an unsigned kernel, and still verifies what it can.
+        (developer_scenario(), krn.clone()),
+        (tamper_scenario(), tampered(&krn)?),
+        // Developer mode does not skip the signature check of a signed image (errata V5).
+        (
+            refuse(
+                "bad signature in developer mode",
+                Developer,
+                "the ML-DSA signature does not verify over the statement",
+                &[],
+            ),
+            flipped(&signed, mldsa)?,
+        ),
+        // What a loader with developer mode off must refuse, each with its own message.
+        (
+            refuse(
+                "unsigned kernel",
+                Verifying,
+                "unsigned image: a signature by an origin-kernel key is required outside developer mode",
+                &[],
+            ),
+            krn,
+        ),
+        (
+            refuse(
+                "wrong key",
+                Verifying,
+                "signed by a key this loader does not trust",
+                &[],
+            ),
+            wrong_key,
+        ),
+        (
+            refuse(
+                "tampered statement",
+                Verifying,
+                "the signed statement does not name this image (its content digest differs)",
+                &[],
+            ),
+            flipped(&signed, statement_digest)?,
+        ),
+        (
+            refuse(
+                "tampered Ed25519 signature",
+                Verifying,
+                "the Ed25519 signature does not verify over the statement",
+                &[],
+            ),
+            flipped(&signed, ed25519)?,
+        ),
+        (
+            refuse(
+                "tampered ML-DSA signature",
+                Verifying,
+                "the ML-DSA signature does not verify over the statement",
+                &[],
+            ),
+            flipped(&signed, mldsa)?,
+        ),
+        // Past the signature, each section's digest catches a changed byte...
+        (
+            refuse(
+                "tampered content",
+                Verifying,
+                "section ",
+                &["does not match its digest"],
+            ),
+            tampered(&signed)?,
+        ),
+        // ...and when an attacker makes those digests agree, only the signature can tell.
+        (
+            refuse(
+                "substituted kernel",
+                Verifying,
+                "the signed statement does not name this image (its content digest differs)",
+                &[],
+            ),
+            substituted(&signed)?,
+        ),
+    ])
+}
+
 fn boot_test() -> Result {
     check_environment()?;
     let krn_path = pack_kernel(&build_kernel()?)?;
-    let krn = fs::read(&krn_path).map_err(|e| format!("{}: {e}", krn_path.display()))?;
-    run_scenario(&boot_scenario(), &krn)?;
-    run_scenario(&tamper_scenario(), &tampered(&krn)?)?;
-    println!("xtask: boot-test passed (both scenarios)");
+    let scenarios = boot_test_scenarios(&krn_path)?;
+    let only = env::var("ORIGIN_BOOT_TEST_ONLY").unwrap_or_default();
+    let chosen = select_scenarios(&scenarios, &only)?;
+    for (scenario, kernel) in &chosen {
+        run_scenario(scenario, kernel)?;
+    }
+    println!(
+        "xtask: boot-test passed ({} of {} scenarios)",
+        chosen.len(),
+        scenarios.len()
+    );
     Ok(())
+}
+
+/// The scenarios whose label contains one of the comma-separated strings in `only`, or all of
+/// them if it is empty. A filter that matches nothing is an error: a mistyped name must not
+/// report a passing run with nothing booted.
+fn select_scenarios<'a>(
+    scenarios: &'a [(Scenario, Vec<u8>)],
+    only: &str,
+) -> Result<Vec<&'a (Scenario, Vec<u8>)>> {
+    let chosen: Vec<_> = scenarios
+        .iter()
+        .filter(|(s, _)| only.is_empty() || only.split(',').any(|p| s.label.contains(p)))
+        .collect();
+    if chosen.is_empty() {
+        return Err(format!(
+            "ORIGIN_BOOT_TEST_ONLY={only:?} matches none of the {} scenarios",
+            scenarios.len()
+        ));
+    }
+    Ok(chosen)
 }
 
 /// Boots `kernel` once and checks the serial output against `scenario`.
 fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
-    let staged = stage(kernel)?;
+    let staged = stage(kernel, scenario.loader)?;
     let timeout = boot_test_timeout()?;
     let mut cmd = qemu_command(&staged)?;
     cmd.args(["-serial", "stdio", "-monitor", "none"])
@@ -1987,7 +2376,7 @@ fn run() -> Result {
     check_environment()?;
     let krn_path = pack_kernel(&build_kernel()?)?;
     let krn = fs::read(&krn_path).map_err(|e| format!("{}: {e}", krn_path.display()))?;
-    let staged = stage(&krn)?;
+    let staged = stage(&krn, Loader::Developer)?;
     let mut cmd = qemu_command(&staged)?;
     cmd.args(["-serial", "mon:stdio"]);
     println!("xtask: starting {QEMU}; Ctrl-A X quits, Ctrl-A C switches to the QEMU monitor");
@@ -2017,6 +2406,26 @@ mod tests {
             }
         }
         text
+    }
+
+    #[test]
+    fn a_scenario_filter_that_matches_nothing_is_an_error() {
+        let scenarios = vec![
+            (
+                refusal_scenario("wrong key", Loader::Verifying, "x", &[]),
+                vec![],
+            ),
+            (
+                refusal_scenario("unsigned kernel", Loader::Verifying, "x", &[]),
+                vec![],
+            ),
+        ];
+        let all = select_scenarios(&scenarios, "").unwrap();
+        assert_eq!(all.len(), 2);
+        let some = select_scenarios(&scenarios, "wrong,nope").unwrap();
+        assert_eq!(some.len(), 1);
+        assert!(some[0].0.label.contains("wrong"));
+        assert!(select_scenarios(&scenarios, "nope").is_err());
     }
 
     /// Every VT-d marker the AMD-Vi boot swaps exists, so none is silently left in place.

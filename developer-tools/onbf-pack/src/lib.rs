@@ -11,9 +11,12 @@
 //! - [`krn`] builds the sections, lays out the container (errata C1–C4, C7, C10, C12,
 //!   C14, G4, G5), and verifies the result with `onbf-format` and `onbf-merkle` before
 //!   returning it ([`krn::verify`]).
+//! - [`sign`] signs a finished KRN image (§7.1–§7.2, S1–S4; CLAUDE.md §59) with an external
+//!   signer, and verifies the result with the boot loader's own signature code.
 //!
-//! Output is deterministic: the same ELF bytes and options always give the same image,
+//! Packing is deterministic: the same ELF bytes and options always give the same image,
 //! with no timestamps, host paths or other environment input (ONBF-R9, CLAUDE.md §75).
+//! Signing is not, because OpenSSL's ML-DSA signatures are hedged; the statement is.
 #![forbid(unsafe_code)]
 #![cfg_attr(
     not(test),
@@ -32,6 +35,7 @@ pub mod elf;
 pub mod krn;
 pub mod ocbor;
 pub mod relr;
+pub mod sign;
 pub mod toolchain;
 
 use core::fmt;
@@ -39,6 +43,7 @@ use core::fmt;
 pub use elf::ElfError;
 pub use krn::{KrnOptions, Packed, VerifyError};
 pub use relr::RelrError;
+pub use sign::{OpensslSigner, SignError, SignOptions, Signer};
 pub use toolchain::{Toolchain, ToolchainError};
 
 /// Why the container could not be laid out.
