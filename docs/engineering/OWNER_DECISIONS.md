@@ -6,7 +6,7 @@
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
 | Answered | 2026-11-08: items 1–6, 8, 9 and 13–20, each with the recommendation below. |
-| Still open | Item 7 (ready). Items 10–12 (after item 23). Items 21–24 (need you). |
+| Still open | Items 7 and 25 (ready). Items 10–12 (after item 23). Items 21–24 (need you). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -19,7 +19,7 @@ CLAUDE.md requires these of the three Proposed ADRs. An ADR can be marked Accept
 | A, **done** | Trade-offs and migration consequences added to all three ADRs, and alternatives to ADR-0006. | §18 | ADR-0006, 0007, 0008 |
 | B, **done** | [The OriginFS ledger](../research/2026-11-08-originfs-design.md). **The layout cannot grow into §40:** its inode is full, its block pointers hold only an address, and its inode table cannot move. | §16, §40 | ADR-0006 |
 | C, **done** | [The IOMMU threat model](THREAT_MODEL_IOMMU.md): 24 threats, 9 still open. Early-boot DMA and failing open are the most serious. | §58 | ADR-0007 |
-| D, **partly done** | The VT-d text is downloaded and answers item 7. Item 23 (the two AMD manuals) is still yours. | §3, §16 | Items 10–12 |
+| D, **partly done** | [Every VT-d encoding is checked against Rev 5.20](../research/2026-11-08-vt-d-iommu.md), which answers item 7. Item 23 (the two AMD manuals) is still yours. | §3, §16 | Items 10–12 |
 
 IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean little, so that waits for hardware (item 24). It does not hold up acceptance.
 
@@ -38,12 +38,13 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 |---|---|---|---|
 | 5, answered | Default-deny, one domain per device? | **Accept** | §58's DMA protection; §47's third-party drivers depend on this confinement. |
 | 6, answered | DMA addresses from a 1–2 GiB window, never physical addresses? | **Accept** | A translation failure can't pass unnoticed, and it can change later without an ABI break. Addresses aren't reused yet, which must be fixed before any driver maps memory per request. |
-| 7 | Legacy translation mode now, scalable mode later? | **Accept** | Rev 5.20 still defines legacy mode, with no deprecation notice and no capability bit to omit it. Hardware must still confirm it (§74). |
+| 7 | Legacy translation mode now, scalable mode later? | **Accept** | Rev 5.20 still defines legacy mode, with no deprecation notice. It needs second-stage translation: a newer unit that reports `SSTS` clear has none, and the kernel refuses it (T6). Hardware must confirm this (§74). |
 | 8, answered | Refuse devices that need firmware-reserved memory (RMRR) until identity maps exist? | **Accept, with a deadline** | It fails closed. USB controllers and integrated graphics commonly need RMRRs, so identity maps must land before real hardware. |
 | 9, answered | With no IOMMU present, refuse bus mastering for external and hot-plugged devices? | **Yes** | §32 asks for external-device authorization. An IOMMU should also be part of the declared hardware scope (item 24). |
 | 10 | AMD-Vi: blocking device table entries, one interrupt table per device? | **After item 23**, then accept. | The same posture as VT-d, but the encodings came from a mirror copy of AMD's manual. |
 | 11 | Allow two QEMU gaps in the AMD-Vi proofs (fault address 0, no record of a blocked interrupt)? | **After item 23**, then accept as QEMU limits. | Hardware qualification must check both (§74). The address bug is fixed after QEMU 11.1, so that check can tighten on upgrade. |
 | 12 | Refuse devices that an IVMD names, as for RMRRs? | **After item 23**, then accept. | Same reasoning and deadline as item 8. |
+| 25 | Rev 5.20 lets firmware ask the OS not to use DMA remapping (`DMA_REMAP_OPT_OUT`) or x2APIC (`X2APIC_OPT_OUT`). Honour them? | **No: report them and carry on** (what the kernel does today) | §58 requires DMA protection, and the kernel depends on x2APIC. A platform that truly needs either is outside the declared hardware scope (§76). |
 
 ## CPU indexes (ADR-0008): built and boot-proven
 
@@ -64,7 +65,7 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 
 | # | Question | Recommendation | Why |
 |---|---|---|---|
-| 18, answered | Intel VT-d Rev 5.20 PDF (D51397-019, intel.com, 12.8 MB)? | **Approved; downloaded 2026-11-08**, outside the repository | §16 wants this text before implementation. The VT-d code was written without it, and every encoding still has to be checked against it. |
+| 18, answered | Intel VT-d Rev 5.20 PDF (D51397-019, intel.com, 12.8 MB)? | **Approved; downloaded 2026-11-08**, outside the repository | §16 wants this text before implementation. Every encoding has now been checked against it: seven corrections, none affecting a boot proof. |
 | 19, answered | NIST ACVP vectors (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519)? | **Approved; not fetched yet** | §59 requires known-answer tests and independent validation. Host-only test data. Each file's source and size will be stated, and confirmed, when the work that uses them starts. |
 | 20, answered | The `loom` crate as a host-only dev-dependency? | **Approved; not added yet** | §73 names Loom, and it never reaches the shipping runtime (§5). It is added with the first Loom model. |
 

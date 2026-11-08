@@ -1687,6 +1687,18 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - **Two earlier full runs failed,** at different configurations, with `clock: the RTC did not complete two updates in 1.2 s`, while other sessions were loading the machine. Running each of the eight configurations alone then passed every one first time. The cause is in `time.rs`'s `update_end`, unchanged here: QEMU's RTC shows its update bit only for the last 244 µs of each second (`UIP_HOLD_LENGTH`), and a descheduled virtual CPU can miss it.
 - **Licensing:** project licence not chosen yet.
 
+### VT-d encodings checked against Rev 5.20 (`vtd`, `dmar`, `iommu`; CLAUDE.md §3, §16, §72; 2026-11-08)
+
+- **What:** every encoding in `vtd.rs`, `dmar.rs` and `ioapic.rs`, and the bring-up order in `iommu.rs`, compared with the specification's own text. The table is the last section of `docs/research/2026-11-08-vt-d-iommu.md`.
+- **Corrections:**
+  - A fault record's interrupt index is `None` for reasons 20h, 25h, 29h, 2Ah and 2Bh, whose FI field is undefined. Such a fault is still reported as an interrupt fault.
+  - The fault event mask is set at bring-up instead of relying on the reset value.
+  - A DRHD's register base must be aligned to its register set's size.
+  - `DMA_REMAP_OPT_OUT` is decoded and reported, and not honoured.
+  - Names added for fault reasons 27h–2Bh. The reserved GCMD names SFL and EAFL removed, with the specification's mask used directly. Chapter references and the revision's date corrected.
+- **Test evidence (2026-11-08):** `cargo xtask check`: 682 tests, 0 failures, 6 ignored. `cargo xtask boot-matrix`: a full run passes, at a host load average of about 12. Four earlier full runs failed on timing proofs (`clock`, and once `timers`) while other sessions were loading the machine (load averages above 100). No failure was in code this change touches, and each of the eight configurations also passed alone. Negative controls: without the fault-index rule, `fault_records_decode` fails; without the alignment rule, `malformed_tables_are_refused_at_their_offset` fails; both restored from saved copies. The fault-event mask and the opt-out report have no separate proof: QEMU sets neither condition.
+- **Licensing:** project licence not chosen yet.
+
 ### Signature-block parser (ONBF §7.1–§7.2, encodings S1–S4), added 2026-11-07
 
 - **What:** `signature::SignatureBlock::parse`: "ONBFSIG1", version 1, 1–8 length-prefixed entries; each entry a canonical OCBOR-1 map with exactly keys 1–7 (key 8, the transparency-log proof, is refused in v1); role 1–5 (S1) with its FIPS 204 context string from a table; suite 1–2 (S2), fixed by the role (kernel and release need OSS-1R); 32-byte key ID; the certificate array kept raw for the chain verifier; the statement as a map with exactly keys 0–6 (S3), whose exact encoded bytes are returned for the signatures; 64-byte Ed25519 and suite-length ML-DSA signatures; the statement's role must equal the entry's; no (role, key) twice. Verification (digest, both signatures, chain) is not wired yet.

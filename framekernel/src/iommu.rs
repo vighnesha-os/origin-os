@@ -500,6 +500,9 @@ fn bring_up(u: &dmar::Unit<'static>, remap: bool) -> Result<Brought, &'static st
     // Stale faults from before the kernel (the firmware's time) are dropped.
     let (stale, _) = unit.take_faults();
     unit.regs.write32(reg::FSTS, fsts::CLEAR);
+    // Fault events stay masked (ADR-0007 I9), whatever the firmware left.
+    let fectl = unit.regs.read32(reg::FECTL);
+    unit.regs.write32(reg::FECTL, fectl | vtd::FECTL_IM);
     // Queued invalidation: the tail at 0, one page of 128-bit descriptors.
     unit.regs.write64(reg::IQT, 0);
     unit.regs.write64(
@@ -524,7 +527,7 @@ fn bring_up(u: &dmar::Unit<'static>, remap: bool) -> Result<Brought, &'static st
         );
         unit.command(gcmd::SIRTP, 0, gcmd::SIRTP, true)?;
         unit.invalidate(&[Descriptor::IecGlobal])?;
-        // One field per GCMD write (chapter 10): compatibility format off first, if the
+        // One field per GCMD write (chapter 11): compatibility format off first, if the
         // firmware had allowed it, then remapping on.
         if unit.regs.read32(reg::GSTS) & gcmd::CFI != 0 {
             unit.command(0, gcmd::CFI, gcmd::CFI, false)?;
@@ -581,11 +584,12 @@ pub(crate) fn init(com1: &mut Console, rsdp: u64) -> bool {
     let units: Vec<_> = dmar.units().collect();
     let _ = writeln!(
         com1,
-        "origin-kernel: IOMMU: DMAR: host address width {} bits, interrupt remapping {}, x2APIC opt-out {}, DMA protection opt-in {}; {} remapping unit(s), {} reserved memory region(s)",
+        "origin-kernel: IOMMU: DMAR: host address width {} bits, interrupt remapping {}, x2APIC opt-out {}, DMA protection opt-in {}, DMA remapping opt-out {}; {} remapping unit(s), {} reserved memory region(s)",
         dmar.host_address_width,
         dmar.interrupt_remapping(),
         dmar.x2apic_opt_out(),
         dmar.dma_control_opt_in(),
+        dmar.dma_remap_opt_out(),
         units.len(),
         dmar.reserved_memory().count()
     );
@@ -1399,10 +1403,10 @@ impl Fault {
     fn from_vtd(r: FaultRecord) -> Self {
         Self {
             source_id: r.source_id,
-            interrupt: r.interrupt_index.is_some(),
+            interrupt: r.is_interrupt(),
             address: r.address,
             interrupt_index: r.interrupt_index,
-            write: r.interrupt_index.is_none().then_some(!r.read),
+            write: (!r.is_interrupt()).then_some(!r.read),
             kind: match r.reason {
                 5 | 6 => FaultKind::PageNotMapped,
                 0x22 => FaultKind::InterruptBlocked,
@@ -1430,9 +1434,10 @@ impl core::fmt::Display for Fault {
         match self.detail {
             Detail::Vtd(r) => {
                 write!(f, "source ID {:#06x}, ", r.source_id)?;
-                match r.interrupt_index {
-                    Some(i) => write!(f, "interrupt index {i}")?,
-                    None => write!(
+                match (r.is_interrupt(), r.interrupt_index) {
+                    (_, Some(i)) => write!(f, "interrupt index {i}")?,
+                    (true, None) => f.write_str("interrupt")?,
+                    (false, None) => write!(
                         f,
                         "{} at {:#x}",
                         if r.read { "read" } else { "write" },

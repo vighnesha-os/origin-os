@@ -1050,3 +1050,14 @@ The owner accepted the sheet's recommendations for items 1–6, 8, 9 and 13–20
 - Make the RTC wait in `time.rs` robust under host load.
 - **The owner:** the AMD manuals' hashes (item 23), then ADR-0007's questions 6–8; the licence, the push, the hardware (items 21, 22, 24).
 
+### Continued (2026-11-08, ~15:25 IST): every VT-d encoding checked against Rev 5.20
+
+On `claude/interesting-carson-ae7c83`, **not pushed**. The table is the last section of `docs/research/2026-11-08-vt-d-iommu.md`. Everything else matches. Corrected: the fault record's interrupt index for five reasons, the fault-event mask, DRHD alignment, `DMA_REMAP_OPT_OUT`, fault-reason names, reserved GCMD names, chapter references.
+
+**A correction to an earlier claim:** legacy mode needs second-stage translation, and a newer unit reporting `ECAP.SSTS` clear has none. The kernel refuses such a unit (threat T6).
+
+#### Next
+
+- **Before real hardware:** protected memory regions (`PMEN.EPM`); the threat model's list.
+- **The owner:** items 7 and 25 on the sheet; item 23 (then 10–12); items 21, 22 and 24.
+

@@ -2,18 +2,19 @@
 //! VT-d and interrupt remapping, §58 DMA protection), for the kernel's `iommu` driver.
 //!
 //! Reference: Intel Virtualization Technology for Directed I/O Architecture Specification,
-//! Rev 5.20 (D51397-019, 2026-05-14): chapter 3 (DMA remapping: legacy-mode root and context
+//! Rev 5.20 (D51397-019, April 2026): chapter 3 (DMA remapping: legacy-mode root and context
 //! entries, second-level translation), chapter 5 (interrupt remapping: the remappable message
 //! format and the IRTE), chapter 6 (invalidation: queued-invalidation descriptors), chapter 7
-//! (fault recording and the fault reasons), chapter 9 (structure formats) and chapter 10
-//! (registers). The research ledger is `docs/research/2026-11-08-vt-d-iommu.md`.
+//! (fault recording and the fault reasons), chapter 9 (structure formats) and chapter 11
+//! (registers). Every encoding here was checked against that text on 2026-11-08 (the
+//! research ledger's last section). The research ledger is `docs/research/2026-11-08-vt-d-iommu.md`.
 //!
 //! Everything here is pure encoding and decoding, plus a second-level page-table walker over
 //! an abstract [`TableMemory`], so all of it is host-tested. Register values come from
 //! hardware and are untrusted: decoders never panic, and an encoder refuses (`None`) anything
 //! it cannot encode exactly. Pure, no `unsafe`, no allocation.
 
-/// Register offsets in a remapping unit's register set (chapter 10).
+/// Register offsets in a remapping unit's register set (chapter 11).
 pub mod reg {
     /// Version (32-bit).
     pub const VER: u64 = 0x00;
@@ -47,10 +48,6 @@ pub mod gcmd {
     pub const TE: u32 = 1 << 31;
     /// Set root table pointer (RTPS), one-shot.
     pub const SRTP: u32 = 1 << 30;
-    /// Set fault log (FLS), one-shot.
-    pub const SFL: u32 = 1 << 29;
-    /// Enable advanced fault logging (AFLS).
-    pub const EAFL: u32 = 1 << 28;
     /// Write buffer flush (WBFS), one-shot.
     pub const WBF: u32 = 1 << 27;
     /// Queued invalidation enable (QIES).
@@ -64,12 +61,12 @@ pub mod gcmd {
 }
 
 /// The GSTS bits that report one-shot commands; a GCMD write must not echo them back, or it
-/// would repeat the command.
-const ONE_SHOT: u32 = gcmd::SRTP | gcmd::SFL | gcmd::WBF | gcmd::SIRTP;
+/// would repeat the command. The specification's mask is `96FFFFFFh`.
+const ONE_SHOT: u32 = !0x96FF_FFFF;
 
 /// The GCMD value that issues one command, given the current GSTS: every enable that is on
 /// stays on, the one-shot status bits are dropped, then `set` is set and `clear` cleared
-/// (chapter 10, the global command register: software reads GSTS, masks the one-shot bits
+/// (chapter 11, the global command register: software reads GSTS, masks the one-shot bits
 /// and writes the result with its command).
 pub fn gcmd(gsts: u32, set: u32, clear: u32) -> u32 {
     (gsts & !ONE_SHOT & !clear) | set
@@ -80,7 +77,7 @@ pub fn version(ver: u32) -> (u8, u8) {
     (((ver >> 4) & 0xF) as u8, (ver & 0xF) as u8)
 }
 
-/// The capability register (chapter 10).
+/// The capability register (chapter 11).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capability {
     /// Bits of domain ID supported (4 + 2 × ND; ND 7 is reserved and decodes as 0).
@@ -148,7 +145,7 @@ impl Capability {
     }
 }
 
-/// The extended capability register (chapter 10).
+/// The extended capability register (chapter 11).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExtCapability {
     /// C: hardware walks of the remapping structures snoop the CPU caches. Clear: software
@@ -193,7 +190,7 @@ impl ExtCapability {
 
 /// A 4 KiB page: every table, and the unit of mapping.
 pub const PAGE: u64 = 4096;
-/// Entries in a root, context or second-level table page.
+/// Entries in a second-level table page.
 pub const ENTRIES: usize = 512;
 /// Root and context entries per 4 KiB table (16 bytes each).
 pub const ROOT_ENTRIES: usize = 256;
@@ -603,7 +600,7 @@ pub fn interrupt_index(m: MsiMessage) -> Option<u16> {
     u16::try_from(handle + u64::from(m.data & 0xFFFF)).ok()
 }
 
-/// The IRTA register (chapter 10): the table's base, its size as 2^(S+1) entries, and EIME
+/// The IRTA register (chapter 11): the table's base, its size as 2^(S+1) entries, and EIME
 /// (extended interrupt mode: 32-bit x2APIC destinations). `entries` must be a power of two
 /// from 2 to 65536 and the table 4 KiB aligned.
 pub fn irta(table: u64, entries: u32, x2apic: bool) -> Option<u64> {
@@ -614,7 +611,7 @@ pub fn irta(table: u64, entries: u32, x2apic: bool) -> Option<u64> {
     (s <= 15).then_some(table | u64::from(x2apic) << 11 | u64::from(s))
 }
 
-/// The IQA register (chapter 10) for a queue of 2^`order` pages (order 0–7) at `queue`
+/// The IQA register (chapter 11) for a queue of 2^`order` pages (order 0–7) at `queue`
 /// (aligned to its size), with 128-bit descriptors (DW 0).
 pub fn iqa(queue: u64, order: u8) -> Option<u64> {
     if order > 7 || queue == 0 || queue & !ADDRESS != 0 {
@@ -762,7 +759,7 @@ impl Descriptor {
     }
 }
 
-/// Fault status register bits (chapter 10).
+/// Fault status register bits (chapter 11).
 pub mod fsts {
     /// PFO: a fault was lost because every recording register was full.
     pub const PFO: u32 = 1 << 0;
@@ -778,6 +775,10 @@ pub mod fsts {
     pub const CLEAR: u32 = PFO | IQE | ICE | ITE;
 }
 
+/// The fault event control register's IM bit: fault events stay masked (chapter 11). Its
+/// other writable-looking bits are RsvdP, so they are written back as read.
+pub const FECTL_IM: u32 = 1 << 31;
+
 /// The F bit of a fault-recording register's high qword (write 1 to clear).
 pub const FRCD_FAULT: u64 = 1 << 63;
 
@@ -788,12 +789,22 @@ pub struct FaultRecord {
     pub source_id: u16,
     /// The fault reason ([`fault_reason`]).
     pub reason: u8,
-    /// T: the request was a read; otherwise a write.
+    /// T1: the request was a read or an AtomicOp; otherwise a write. Meaningful only for an
+    /// address-translation fault.
     pub read: bool,
     /// FI: the faulting page, for a DMA fault.
     pub address: u64,
     /// For an interrupt-remapping fault (reasons 20h–2Fh): the interrupt index (FI 63:48).
+    /// `None` for reasons 20h, 25h, 29h, 2Ah and 2Bh, whose FI field is undefined.
     pub interrupt_index: Option<u16>,
+}
+
+impl FaultRecord {
+    /// Whether this is an interrupt-remapping fault (reasons 20h–2Fh), with or without an
+    /// index.
+    pub fn is_interrupt(&self) -> bool {
+        (0x20..=0x2F).contains(&self.reason)
+    }
 }
 
 /// Decodes a fault-recording register (low and high qwords); `None` when its F bit is clear.
@@ -803,17 +814,19 @@ pub fn fault_record(lo: u64, hi: u64) -> Option<FaultRecord> {
     }
     let reason = ((hi >> 32) & 0xFF) as u8;
     let interrupt = (0x20..=0x2F).contains(&reason);
+    // FI holds no index for these reasons (chapter 11, the fault-recording registers).
+    let indexed = interrupt && !matches!(reason, 0x20 | 0x25 | 0x29 | 0x2A | 0x2B);
     Some(FaultRecord {
         source_id: (hi & 0xFFFF) as u16,
         reason,
         read: hi & (1 << 62) != 0,
         address: if interrupt { 0 } else { lo & !(PAGE - 1) },
-        interrupt_index: interrupt.then_some((lo >> 48) as u16),
+        interrupt_index: indexed.then_some((lo >> 48) as u16),
     })
 }
 
-/// What a non-recoverable fault reason means (the specification's appendix of fault
-/// reasons), for the reasons this driver can provoke or meet.
+/// What a non-recoverable fault reason means (the tables in chapters 5 and 7), for the
+/// reasons this driver can provoke or meet.
 pub fn fault_reason(reason: u8) -> &'static str {
     match reason {
         0x01 => "root entry not present",
@@ -836,6 +849,11 @@ pub fn fault_reason(reason: u8) -> &'static str {
         0x24 => "reserved bits set in an interrupt table entry",
         0x25 => "compatibility-format interrupt blocked",
         0x26 => "interrupt source-ID check failed",
+        0x27 => "error reading a posted interrupt descriptor",
+        0x28 => "reserved bits set in a posted interrupt descriptor",
+        0x29 => "not a valid interrupt request",
+        0x2A => "extended interrupt mode required but off",
+        0x2B => "interrupt remapping required but off",
         _ => "other",
     }
 }
@@ -958,7 +976,8 @@ mod tests {
     #[test]
     fn global_command_keeps_enables_and_drops_one_shot_bits() {
         // Translation and QI are on, and the root-pointer status is still set.
-        let gsts = gcmd::TE | gcmd::QIE | gcmd::SRTP | gcmd::SIRTP | gcmd::WBF | gcmd::SFL;
+        // Bit 29 is reserved in Rev 5.20, but the specification's mask still drops it.
+        let gsts = gcmd::TE | gcmd::QIE | gcmd::SRTP | gcmd::SIRTP | gcmd::WBF | 1 << 29;
         assert_eq!(gcmd(gsts, gcmd::IRE, 0), gcmd::TE | gcmd::QIE | gcmd::IRE);
         assert_eq!(gcmd(gsts, gcmd::SRTP, 0), gcmd::TE | gcmd::QIE | gcmd::SRTP);
         assert_eq!(gcmd(gsts, 0, gcmd::TE), gcmd::QIE);
@@ -1447,6 +1466,14 @@ mod tests {
         let i = fault_record(7 << 48, FRCD_FAULT | 0x22 << 32 | 0x0010).unwrap();
         assert_eq!((i.interrupt_index, i.address), (Some(7), 0));
         assert_eq!(fault_reason(0x22), "interrupt table entry not present");
+        assert!(i.is_interrupt());
+        // Reasons whose FI field is undefined carry no index, however FI reads.
+        for reason in [0x20u64, 0x25, 0x29, 0x2A, 0x2B] {
+            let f = fault_record(7 << 48, FRCD_FAULT | reason << 32 | 0x0010).unwrap();
+            assert_eq!(f.interrupt_index, None, "{reason:#x}");
+            assert!(f.is_interrupt(), "{reason:#x}");
+        }
+        assert!(!w.is_interrupt());
         assert_eq!(fault_reason(0xEE), "other");
         // Any register contents decode without panicking.
         let mut rng = crate::testing::Rng::new(0xFA17);

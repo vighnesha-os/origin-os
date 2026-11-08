@@ -16,7 +16,7 @@ Until now every bus-mastering device could read and write all of physical memory
 
 ### I1. Legacy-mode translation first; scalable mode later
 Root table → per-bus context tables → second-level tables (4 levels, 48-bit, where the unit supports it; else 3 levels, 39-bit), translation type 0. It is the smallest correct design and QEMU's default.
-*Alternative:* scalable mode (PASID tables, first-level tables, nested translation) — needed later for shared virtual addressing and PASID-granular isolation of user-mode drivers; a later revision of this ADR. Rev 5.20 still defines legacy mode (`RTADDR_REG.TTM` 00b), with no deprecation notice and no capability bit to omit it (research ledger, update of 2026-11-08). Hardware qualification must still confirm it on the declared machines.
+*Alternative:* scalable mode (PASID tables, first-level tables, nested translation) — needed later for shared virtual addressing and PASID-granular isolation of user-mode drivers; a later revision of this ADR. Rev 5.20 still defines legacy mode (`RTADDR_REG.TTM` 00b), with no deprecation notice. It depends on second-stage translation: a unit of major version 6 or higher that reports `ECAP.SSTS` clear also reports `SAGAW` 0, and the kernel refuses such a unit. Hardware qualification must confirm this on the declared machines.
 
 ### I2. Default deny
 Translation is turned on before any driver binds, with no context entry present: until a driver attaches its device, the device's DMA faults (reason 2). A device with no driver never gets a context entry.
@@ -56,7 +56,7 @@ Fault events stay masked; the fault-recording registers are read and cleared by 
 A virtio device that offers `VIRTIO_F_ACCESS_PLATFORM` sits behind the IOMMU: the driver accepts the feature (QEMU refuses `FEATURES_OK` otherwise) and uses IOVAs. One that does not offer it uses physical addresses (virtio 1.1 §6) and is given them.
 
 ### I11. What is refused rather than half-done
-A DMAR that fails any check (`framekernel::dmar::parse`) leaves the IOMMU off and fails the boot proof loudly; a unit the firmware left enabled is not taken over; a device named by a reserved memory region (RMRR) is refused at attach (identity-mapping RMRRs is not implemented yet), so its DMA stays blocked rather than unchecked; if one unit fails to come up, the units already running are turned off again so drivers are not left blocked with nobody to attach them.
+A DMAR that fails any check (`framekernel::dmar::parse`) leaves the IOMMU off and fails the boot proof loudly; the firmware's `DMA_REMAP_OPT_OUT` and `X2APIC_OPT_OUT` requests are reported and not honoured (Rev 5.20 §8.1; decision-sheet item 25); a unit the firmware left enabled is not taken over; a device named by a reserved memory region (RMRR) is refused at attach (identity-mapping RMRRs is not implemented yet), so its DMA stays blocked rather than unchecked; if one unit fails to come up, the units already running are turned off again so drivers are not left blocked with nobody to attach them.
 
 ## Proposed decisions for AMD-Vi
 

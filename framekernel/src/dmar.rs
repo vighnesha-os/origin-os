@@ -49,6 +49,8 @@ pub mod flags {
     pub const X2APIC_OPT_OUT: u8 = 1 << 1;
     /// The platform opts in to DMA protection from boot (the units may already translate).
     pub const DMA_CTRL_PLATFORM_OPT_IN: u8 = 1 << 2;
+    /// The firmware asks the OS not to enable DMA remapping.
+    pub const DMA_REMAP_OPT_OUT: u8 = 1 << 3;
 }
 
 /// Why a DMAR was refused. Offsets are from the start of the table.
@@ -453,6 +455,12 @@ impl<'a> Dmar<'a> {
         self.flags & flags::X2APIC_OPT_OUT != 0
     }
 
+    /// Whether the firmware asks the OS not to enable DMA remapping. The kernel reports this
+    /// and does not honour it (CLAUDE.md §58).
+    pub fn dma_remap_opt_out(&self) -> bool {
+        self.flags & flags::DMA_REMAP_OPT_OUT != 0
+    }
+
     /// Whether the platform opted in to DMA protection from boot.
     pub fn dma_control_opt_in(&self) -> bool {
         self.flags & flags::DMA_CTRL_PLATFORM_OPT_IN != 0
@@ -625,7 +633,9 @@ fn check_scopes(s: &[u8], from: usize, offset: usize, no_pci: bool) -> Result<()
 /// it: its register base, and the one-INCLUDE_PCI_ALL-per-segment rule.
 fn check_unit(dmar: &Dmar<'_>, s: &[u8], offset: usize, at: usize) -> Result<(), DmarError> {
     let base = u64_at(s, 8).ok_or(DmarError::Structure(offset))?;
-    if base == 0 || !base.is_multiple_of(PAGE) {
+    // The base must be aligned to the register set's size, 2^N pages (Size bits 3:0).
+    let pages = 1u64 << (s.get(5).copied().unwrap_or(0) & 0x0F);
+    if base == 0 || !base.is_multiple_of(PAGE * pages) {
         return Err(DmarError::RegisterBase(offset));
     }
     let include_all = s.get(4).is_some_and(|f| f & 1 != 0);
@@ -807,7 +817,7 @@ mod tests {
         let mut all = drhd(
             1,
             0,
-            0xFED9_1000,
+            0xFED9_4000,
             &[
                 scope(3, 2, 0xF0, &[(0x1F, 0)]),
                 scope(4, 0, 0, &[(0x1F, 7)]),
@@ -869,8 +879,8 @@ mod tests {
         assert_eq!(unit(at(1, 0, 0)), Some(0xFED9_2000));
         assert_eq!(unit(at(3, 5, 1)), Some(0xFED9_2000));
         // Everything else on segment 0 falls to INCLUDE_PCI_ALL; segment 1 has no unit.
-        assert_eq!(unit(at(0, 0x14, 0)), Some(0xFED9_1000));
-        assert_eq!(unit(at(4, 0, 0)), Some(0xFED9_1000));
+        assert_eq!(unit(at(0, 0x14, 0)), Some(0xFED9_4000));
+        assert_eq!(unit(at(4, 0, 0)), Some(0xFED9_4000));
         assert_eq!(
             unit(Requester {
                 segment: 1,
@@ -930,7 +940,7 @@ mod tests {
         let d = parse(&t).unwrap();
         let (u, r) = d.ioapic(2, &mut m).unwrap();
         assert!(u.include_pci_all);
-        assert_eq!((u.register_base, r.source_id()), (0xFED9_1000, 0xF0F8));
+        assert_eq!((u.register_base, r.source_id()), (0xFED9_4000, 0xF0F8));
         assert_eq!(d.ioapic(0, &mut m).err(), Some(IoApicScopeError::NotListed));
         // Listed by two units, or twice by one: the source ID would be ambiguous.
         let one = scope(3, 0, 0xFF, &[(0, 0)]);
@@ -1019,6 +1029,17 @@ mod tests {
                 "{base:#x}"
             );
         }
+        // A two-page register set must be aligned to 8 KiB.
+        let two_pages = |base: u64| {
+            let mut s = drhd(0, 0, base, core::slice::from_ref(&ok));
+            s[5] = 1;
+            s
+        };
+        assert_eq!(
+            parse(&table(47, 0, &[two_pages(0xFED9_1000)])),
+            Err(DmarError::RegisterBase(48))
+        );
+        assert!(parse(&table(47, 0, &[two_pages(0xFED9_2000)])).is_ok());
         let a = unit(core::slice::from_ref(&ok));
         let second = 48 + a.len();
         assert_eq!(

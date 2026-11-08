@@ -5,7 +5,7 @@
 | Required by | CLAUDE.md §58 ("Threat-model every privileged interface"), §32, §47 |
 | Covers | `framekernel/src/iommu.rs`, `iommu/amd.rs`, `dma.rs`, `vtd.rs`, `amdvi.rs`, `dmar.rs`, `ivrs.rs`; ADR-0007 |
 | Written | 2026-11-08, **after** the implementation. §58 and §83 step 12 expect this during design. |
-| Evidence | QEMU only. "Proven" below means a boot proof with a negative control under QEMU 11.1. Nothing has run on hardware (§74). VT-d statements below were checked against Rev 5.20 where cited; a full check of every encoding is still to do. |
+| Evidence | QEMU only. "Proven" below means a boot proof with a negative control under QEMU 11.1. Nothing has run on hardware (§74). Every VT-d encoding has been checked against Rev 5.20 (research ledger, last section). |
 
 ## What is being protected
 
@@ -38,7 +38,7 @@ Status: **Proven** (boot proof and control, QEMU), **By design** (no proof), **O
 | T3 | A device reaches the IOMMU's own tables | They are never mapped in any domain | By design |
 | T4 | **Early-boot DMA.** A device the firmware left bus-mastering writes memory before translation is on. `iommu::init` runs after SMP start and PCIe enumeration, and nothing clears bus mastering first | None yet. VT-d's Abort DMA Mode (Rev 5.20 §3.4.4, where `ECAP.ADMS` is set) could block DMA during bring-up | **Open** |
 | T5 | **A unit the firmware left enabled** (pre-boot DMA protection). Bring-up refuses it, which leads to T6 | None | **Open** |
-| T6 | **Fail-open.** If bring-up fails, or no DMAR/IVRS exists, DMA runs unconfined. It is reported, and the boot test fails, but a production boot has no policy (sheet item 9) | Reported only | **Open** |
+| T6 | **Fail-open.** If bring-up fails, or no DMAR/IVRS exists, DMA runs unconfined. That includes a unit with no second-stage translation (`SSTS` clear). It is reported, and the boot test fails, but a production boot has no policy (sheet item 9). On a unit with `ECAP.IRREQ`, turning remapping off also blocks every MSI | Reported only | **Open** |
 | T7 | A device claims its addresses are already translated, through ATS (Thunderclap's Linux bypass) | ATS is never enabled. VT-d context entries use translation type 0, which blocks Translated and Translation Requests (Rev 5.20 §9.3). AMD device table entries leave `I` clear, which the decoder enforces | By design |
 | T8 | **Peer-to-peer.** Traffic between devices under a shared switch never reaches the IOMMU | None: the kernel does not configure ACS. QEMU cannot show this | **Open** |
 | T9 | **Requester-ID spoofing.** Isolation assumes the source ID is genuine | None: needs ACS source validation. QEMU cannot show this | **Open** |
