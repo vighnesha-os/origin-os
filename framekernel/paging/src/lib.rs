@@ -453,8 +453,10 @@ impl AddressSpace {
     /// Maps `bytes` (a multiple of 4 KiB) at `virt` to `phys`, using a 2 MiB page wherever
     /// both addresses are 2 MiB aligned and 2 MiB remain, and 4 KiB pages elsewhere.
     ///
-    /// Returns the number of 4 KiB and of 2 MiB pages mapped. On error, the pages mapped
-    /// before the failure stay mapped.
+    /// Returns the number of 4 KiB and of 2 MiB pages mapped. On error, every leaf this call
+    /// mapped is removed again, so the range is as it was and a later call can map it; only
+    /// tables created along the way stay, empty, for that later call to use. The caller must
+    /// invalidate the TLB for what this removed if these tables are live.
     pub fn map_range(
         &mut self,
         mem: &mut impl TableMemory,
@@ -469,19 +471,35 @@ impl AddressSpace {
         if virt.checked_add(bytes).is_none() || phys.checked_add(bytes).is_none() {
             return Err(MapError::Overflow);
         }
+        // Whether the leaf at offset `at` is a 2 MiB one, for mapping it and for undoing it.
+        let is_large = |at: u64| {
+            (virt + at).is_multiple_of(LARGE_PAGE)
+                && (phys + at).is_multiple_of(LARGE_PAGE)
+                && bytes - at >= LARGE_PAGE
+        };
         let (mut small, mut large) = (0, 0);
         let mut done = 0;
         while done < bytes {
             let (v, p) = (virt + done, phys + done);
-            if v.is_multiple_of(LARGE_PAGE)
-                && p.is_multiple_of(LARGE_PAGE)
-                && bytes - done >= LARGE_PAGE
-            {
-                self.map_large(mem, v, p, attributes)?;
+            let mapped = if is_large(done) {
+                self.map_large(mem, v, p, attributes)
+            } else {
+                self.map(mem, v, p, attributes)
+            };
+            if let Err(error) = mapped {
+                let mut undone = 0;
+                while undone < done {
+                    // Each of these is a leaf this call just mapped: nothing else can have
+                    // removed it under the caller's lock.
+                    let _ = self.unmap(mem, virt + undone);
+                    undone += if is_large(undone) { LARGE_PAGE } else { PAGE };
+                }
+                return Err(error);
+            }
+            if is_large(done) {
                 large += 1;
                 done += LARGE_PAGE;
             } else {
-                self.map(mem, v, p, attributes)?;
                 small += 1;
                 done += PAGE;
             }
@@ -890,6 +908,73 @@ mod tests {
             ),
             Err(MapError::Overflow)
         );
+    }
+
+    /// A range that fails partway leaves no leaf behind, keeps whatever it ran into, and can
+    /// be mapped again afterwards: partial leaves would make every later mapping of the same
+    /// addresses fail with `AlreadyMapped`.
+    #[test]
+    fn map_range_undoes_itself_when_it_fails() {
+        let rw = kernel(Access::ReadWrite);
+
+        // The pool runs out: the root, a PDPT and two page directories cover 2 GiB of large
+        // pages; the third directory is not there.
+        let tables = arena(4);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        let (gib, base) = (1u64 << 30, 0x10_0000_0000u64);
+        assert_eq!(
+            space.map_range(&mut mem, 0, base, 3 * gib, rw),
+            Err(MapError::OutOfMemory)
+        );
+        let census = space.leaf_census(&mem);
+        assert_eq!(census.lower_local, 0, "leaves left behind");
+        assert_eq!(space.translate(&mem, 0), None);
+        assert_eq!(space.translate(&mem, 2 * gib - PAGE), None);
+        // The tables it made stay, empty, and the failed range can be retried at once.
+        assert_eq!(mem.remaining(), 0);
+        assert_eq!(
+            space.map_range(&mut mem, 0, base, 2 * gib, rw),
+            Ok((0, 1024))
+        );
+
+        // A leaf already there stops the range: what the range mapped before it goes, the
+        // leaf itself stays, and pages after it were never touched.
+        let tables = arena(16);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        let v = 4 * LARGE_PAGE;
+        space.map(&mut mem, v + 2 * PAGE, 0x7000, rw).unwrap();
+        assert_eq!(
+            space.map_range(&mut mem, v, 0x20_0000, 4 * PAGE, rw),
+            Err(MapError::AlreadyMapped(v + 2 * PAGE))
+        );
+        assert_eq!(space.translate(&mem, v), None);
+        assert_eq!(space.translate(&mem, v + PAGE), None);
+        assert_eq!(space.translate(&mem, v + 2 * PAGE).unwrap().phys, 0x7000);
+        assert_eq!(space.translate(&mem, v + 3 * PAGE), None);
+        assert_eq!(space.leaf_census(&mem).lower_local, 1);
+
+        // Both kinds of leaf are undone: a 4 KiB head, a 2 MiB page, then a collision.
+        let start = 8 * LARGE_PAGE - PAGE;
+        space.map(&mut mem, 9 * LARGE_PAGE, 0x8000, rw).unwrap();
+        let bytes = PAGE + LARGE_PAGE + PAGE;
+        assert_eq!(
+            space.map_range(&mut mem, start, start, bytes, rw),
+            Err(MapError::AlreadyMapped(9 * LARGE_PAGE))
+        );
+        assert_eq!(space.translate(&mem, start), None);
+        assert_eq!(space.translate(&mem, 8 * LARGE_PAGE), None);
+        assert_eq!(space.translate(&mem, 9 * LARGE_PAGE).unwrap().phys, 0x8000);
+        assert_eq!(space.leaf_census(&mem).lower_local, 2);
+
+        // A failure partway through the physical range is undone the same way.
+        assert_eq!(
+            space.map_range(&mut mem, v + PAGE, (1 << 52) - PAGE, 2 * PAGE, rw),
+            Err(MapError::PhysicalRange(1 << 52))
+        );
+        assert_eq!(space.translate(&mem, v + PAGE), None);
+        assert_eq!(space.leaf_census(&mem).lower_local, 2);
     }
 
     #[test]

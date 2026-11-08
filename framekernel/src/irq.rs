@@ -170,6 +170,14 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
         let _ = writeln!(com1, "origin-kernel: I/O APIC: none in the MADT");
         return true;
     };
+    // A compatibility-format redirection entry names an 8-bit destination.
+    let Ok(destination) = u8::try_from(bsp) else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: I/O APIC: the boot processor's APIC ID {bsp} does not fit a compatibility-format redirection entry: I/O APIC failed"
+        );
+        return false;
+    };
     let virt = match crate::vm::map_mmio(u64::from(io.address), 0x1000) {
         Ok(v) => v,
         Err(e) => {
@@ -218,7 +226,7 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
 
     let before = cpu::ioapic_irqs();
     let (low, high) =
-        ioapic::redirection_entry(cpu::IOAPIC_VECTOR, bsp as u8, active_low, level, false);
+        ioapic::redirection_entry(cpu::IOAPIC_VECTOR, destination, active_low, level, false);
     mapped.set_redirection(index, low, high);
     start_pit();
 
@@ -232,7 +240,7 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
     let elapsed = rdtsc().wrapping_sub(start);
     // Mask the entry and stop the PIT: nothing schedules on this yet.
     let (masked_low, _) =
-        ioapic::redirection_entry(cpu::IOAPIC_VECTOR, bsp as u8, active_low, level, true);
+        ioapic::redirection_entry(cpu::IOAPIC_VECTOR, destination, active_low, level, true);
     mapped.set_redirection(index, masked_low, high);
     stop_pit();
 

@@ -274,15 +274,15 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         // including a device that ignored its cleared Bus Master Enable (CLAUDE.md §32, §58;
         // ADR-0007). It needs the clock (`time::init`) for its timeouts, and comes after the
         // compatibility-format I/O APIC proof above, which interrupt remapping would block.
-        if quiesced.is_some() {
-            iommu::init(&mut com1, info.acpi_rsdp);
-            if iommu::translating() {
-                let _ = writeln!(
-                    com1,
-                    "origin-kernel: IOMMU: translating {} ms after kernel entry",
-                    time::monotonic_nanos() / 1_000_000
-                );
-            }
+        // It runs whether or not the bus-master quiesce succeeded: confining a device that kept
+        // mastering the bus is exactly what a failed quiesce leaves to it.
+        iommu::init(&mut com1, info.acpi_rsdp);
+        if iommu::translating() {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: IOMMU: translating {} ms after kernel entry",
+                time::monotonic_nanos() / 1_000_000
+            );
         }
         let online = smp::start(&mut com1, &info, regions, tsc_hz);
         // M2 completion: once every enabled processor has left firmware code, the loader's
@@ -311,9 +311,11 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         sched::prove(&mut com1, online.cpus(), tsc_hz);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
         if let Some(q) = quiesced.as_mut()
-            && pcie::init(&mut com1, online.cpus())
+            && let Some(reserved) = pcie::reserved_ranges(&mut com1, q, info.acpi_rsdp)
+            && pcie::init(&mut com1, q, online.cpus(), regions, &reserved)
         {
-            // Nothing has turned bus mastering back on before any driver attaches.
+            // Anything that turned bus mastering back on is stopped again before any driver
+            // attaches.
             pcie::check_quiet(&mut com1, q);
             // M5: the NVMe driver and block I/O, polled and then interrupt-driven.
             storage::init(&mut com1, online.cpus(), tsc_hz);

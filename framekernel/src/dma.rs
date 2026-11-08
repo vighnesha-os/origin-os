@@ -7,9 +7,9 @@
 //! Without an IOMMU — or for a virtio device that did not offer `VIRTIO_F_ACCESS_PLATFORM`,
 //! which by virtio 1.1 §6 uses physical addresses — the bus address is the physical address.
 
-use alloc::alloc::{Layout, alloc_zeroed, dealloc};
+use alloc::alloc::{Layout, alloc_zeroed};
 
-use framekernel::pci::Address;
+use framekernel::pci::{self, Address, DmaPath};
 
 /// How one device reaches memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,27 +29,38 @@ pub(crate) struct DmaPage {
 }
 
 impl DeviceDma {
+    /// Whether a driver may bind at all now, and how its device may reach memory: refused if
+    /// the quiesce failed or an IOMMU is present but did not come up (`pci::dma_path`).
+    fn path() -> Result<DmaPath, &'static str> {
+        pci::dma_path(crate::pcie::quiesced(), crate::iommu::status())
+    }
+
     /// The DMA path for the PCI function at `at`: a domain of its own when the IOMMU
-    /// translates (from then on, it reaches only pages mapped for it), else direct.
+    /// translates (from then on, it reaches only pages mapped for it); direct only on a
+    /// platform with no IOMMU at all. Refused if the quiesce failed or the IOMMU did not
+    /// come up.
     pub(crate) fn attach(at: Address) -> Result<Self, &'static str> {
-        if crate::iommu::translating() {
-            crate::iommu::attach(at).map(Self::Translated)
-        } else {
-            Ok(Self::Direct)
+        match Self::path()? {
+            DmaPath::Domain => crate::iommu::attach(at).map(Self::Translated),
+            DmaPath::Direct => Ok(Self::Direct),
         }
     }
 
     /// Turns bus mastering on for the PCI function at `at`, which this path was attached for
     /// (`attach`). Returns its command register. While the IOMMU translates, a function
     /// without a domain of its own is refused: it would master the bus unconfined.
+    ///
+    /// A device that was never attached (a virtio device without `VIRTIO_F_ACCESS_PLATFORM`
+    /// is handed [`Self::Direct`]) gets the same check as [`attach`](Self::attach): direct
+    /// is refused unless the platform has no IOMMU at all.
     pub(crate) fn enable_bus_master(&self, at: Address) -> Result<u16, &'static str> {
-        match *self {
-            Self::Translated(d) if crate::iommu::attached(d, at) => {}
-            Self::Translated(_) => return Err("this domain does not belong to the device"),
-            Self::Direct if crate::iommu::translating() => {
+        match (*self, Self::path()?) {
+            (Self::Translated(d), DmaPath::Domain) if crate::iommu::attached(d, at) => {}
+            (Self::Translated(_), _) => return Err("this domain does not belong to the device"),
+            (Self::Direct, DmaPath::Domain) => {
                 return Err("the IOMMU translates and the device has no domain of its own");
             }
-            Self::Direct => {}
+            (Self::Direct, DmaPath::Direct) => {}
         }
         crate::pcie::set_bus_master(at)
     }
@@ -65,14 +76,12 @@ impl DeviceDma {
         let virt = p.expose_provenance() as u64;
         let phys = crate::phys::to_phys(virt);
         let bus = match *self {
-            Self::Translated(d) => crate::iommu::map(d, phys).ok(),
-            Self::Direct => Some(phys),
+            // On failure the page is deliberately leaked, never freed: `iommu::map` installs
+            // the page-table entry before its invalidation, which can fail, so a page whose
+            // map failed may still be reachable by the device.
+            Self::Translated(d) => crate::iommu::map(d, phys).ok()?,
+            Self::Direct => phys,
         };
-        if bus.is_none() {
-            // SAFETY: `p` came from `alloc_zeroed` with this layout just above, and no device
-            // was given it (the mapping failed).
-            unsafe { dealloc(p, layout) };
-        }
-        Some(DmaPage { virt, bus: bus? })
+        Some(DmaPage { virt, bus })
     }
 }

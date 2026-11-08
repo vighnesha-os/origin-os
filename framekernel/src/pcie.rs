@@ -11,12 +11,18 @@
 //! 2. [`settle`], once the TSC is calibrated: at most 100 ms for functions that report
 //!    Transactions Pending, for all of them together, so no device can add its own delay.
 //! 3. [`init`], after the application processors are up: every processor's PAT checked, every
-//!    function listed and every BAR sized with decoding off and then restored.
-//! 4. [`check_quiet`], before any driver binds: nothing has turned bus mastering back on.
+//!    function listed and every BAR sized with decoding off and then restored; a function the
+//!    quiesce did not see is stopped now, and a memory BAR is believed only if it passes
+//!    `framekernel::pci::validate_bars`.
+//! 4. [`check_quiet`], before any driver binds: a function that turned bus mastering back on is
+//!    stopped again.
 //! 5. A driver attaches its device to a domain, and only then turns bus mastering on, through
 //!    `dma::DeviceDma::enable_bus_master` ([`set_bus_master`]).
 //! 6. [`prove_bus_mastering`], after the drivers ran: bus mastering is on exactly for the
 //!    attached functions and the bridges above them.
+//!
+//! Drivers bind only if the quiesce held ([`quiesced`]): a window it could not cover, or a
+//! function that would not let go of the bus, leaves `DeviceDma::attach` refusing.
 //!
 //! Configuration accesses are 32-bit volatile loads and stores into the window.
 
@@ -24,7 +30,11 @@ use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::ops::ControlFlow;
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 
+use framekernel::acpi::{self, IoApic};
+use framekernel::hpet;
+pub(crate) use framekernel::pci::Device;
 use framekernel::pci::{self, Address, Bar, BarKind, ConfigSpace, Ecam, Function};
 use origin_boot_info::{MemoryRegion, RegionKind};
 use origin_sync::{RwLock, SpinLock};
@@ -63,17 +73,14 @@ impl ConfigSpace for EcamSpace {
     }
 }
 
-/// One function and its BARs.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Device {
-    pub(crate) function: Function,
-    pub(crate) bars: [Option<Bar>; 6],
-}
-
 static ECAM: SpinLock<Option<EcamSpace>> = SpinLock::new(None);
 /// The enumerated devices: written once at init, read by `find` (read-mostly, so an
 /// `RwLock`).
 static DEVICES: RwLock<Vec<Device>> = RwLock::new(Vec::new());
+
+/// Whether the quiesce covered every window and stopped every function: `dma::DeviceDma`
+/// refuses every driver until it has, and for good once it failed.
+static QUIESCED: AtomicBool = AtomicBool::new(false);
 
 /// Most functions the kernel lists.
 const MAX_FUNCTIONS: usize = 256;
@@ -89,6 +96,11 @@ pub(crate) struct Quiesce {
     /// The IOMMUs' own functions, on segment 0, each with what the firmware left its Bus
     /// Master Enable reading.
     own: Vec<(Address, bool)>,
+    /// Host bridges whose Bus Master Enable is read-only (`pci::bus_master_may_be_read_only`),
+    /// a named exception: reported, not a failure, and not read again.
+    hardwired: Vec<(u16, Address)>,
+    /// The window of every allocation the MCFG names, usable or not: no BAR may claim one.
+    windows: Vec<(u64, u64)>,
     /// The TSC when the clearing began and ended, reported once the TSC rate is known.
     started: u64,
     done: u64,
@@ -205,15 +217,21 @@ fn map_window(
 }
 
 /// Stops the firmware's devices: maps every ECAM window and clears Bus Master Enable on every
-/// function except the IOMMUs' own (`own`, which no domain can confine). Called as soon as the
-/// kernel's page tables and heap exist, on the boot processor alone. `None` (reported) if
-/// segment 0's window cannot be used; the later PCIe steps then do not run.
+/// function except the IOMMUs' own (`own`, which no domain can confine). Each allocation in
+/// the MCFG is judged on its own, so a bad one does not cost the good ones their clearing; but
+/// a window that is refused or cannot be mapped, or a function that keeps bus mastering on,
+/// leaves [`quiesced`] false, and every driver is refused. Called as soon as the kernel's
+/// page tables and heap exist, on the boot processor alone. `None` (reported) if segment 0's
+/// window cannot be used; the later PCIe steps then do not run.
 pub(crate) fn quiesce(
     com1: &mut Console,
     rsdp: u64,
-    regions: &[MemoryRegion],
+    regions: &'static [MemoryRegion],
     own: &[Address],
 ) -> Option<Quiesce> {
+    // The first thing that may map device memory after the console: `vm::map_mmio` holds
+    // every later mapping against this map.
+    crate::vm::set_memory_map(regions);
     let pat = crate::cpu::check_pat();
     if crate::cpu::pat_ready(&[crate::cpu::this_cpu()]) != 1 {
         let _ = writeln!(
@@ -230,7 +248,10 @@ pub(crate) fn quiesce(
         }
     };
     let mut allocations = [Ecam::default(); 8];
-    let count = match pci::mcfg_allocations(mcfg, &mut allocations) {
+    let mut bad_allocations = Vec::new();
+    let count = match pci::mcfg_allocations(mcfg, &mut allocations, |why, raw| {
+        bad_allocations.push((why, raw));
+    }) {
         Ok(n) => n,
         Err(e) => {
             let _ = writeln!(
@@ -245,16 +266,30 @@ pub(crate) fn quiesce(
         functions: Vec::new(),
         others: Vec::new(),
         own: Vec::new(),
+        hardwired: Vec::new(),
+        windows: Vec::new(),
         started,
         done: started,
     };
+    // Whether every allocation the MCFG names is a window the walk below covers.
+    let mut covered = bad_allocations.is_empty();
+    for &(why, raw) in &bad_allocations {
+        q.windows.extend(raw.window());
+        let _ = writeln!(
+            com1,
+            "origin-kernel: PCIe: MCFG allocation at {:#x} for segment {} refused ({why:?}): its functions are not stopped: PCIe failed",
+            raw.base, raw.segment
+        );
+    }
     let (mut left_on, mut refused) = (Vec::new(), Vec::new());
     let mut segment_zero = false;
     for ecam in allocations.iter().take(count).copied() {
+        q.windows.extend(ecam.window());
         let Some(mut space) = map_window(com1, ecam, regions, pat) else {
+            covered = false;
             continue;
         };
-        let _ = pci::for_each_function(&mut space, ecam.buses(), |space, f| {
+        let _ = pci::for_every_function(&mut space, ecam.buses(), |space, f| {
             if ecam.segment == 0 && own.contains(&f.at) {
                 q.own.push((f.at, pci::bus_master_on(space, f.at)));
             } else {
@@ -263,7 +298,11 @@ pub(crate) fn quiesce(
                     left_on.push((ecam.segment, f.at));
                 }
                 if outcome.still_on {
-                    refused.push((ecam.segment, f.at));
+                    if pci::bus_master_may_be_read_only(&f) {
+                        q.hardwired.push((ecam.segment, f.at));
+                    } else {
+                        refused.push((ecam.segment, f.at));
+                    }
                 }
             }
             q.functions.push((ecam.segment, f));
@@ -298,6 +337,13 @@ pub(crate) fn quiesce(
             "; the IOMMU's own function {at} left as the firmware set it (bus master {on})"
         );
     }
+    for &(segment, at) in &q.hardwired {
+        let _ = write!(
+            com1,
+            "; the host bridge {}'s bus master bit is read-only (an exception, not a failure)",
+            Named(segment, at)
+        );
+    }
     if refused.is_empty() {
         let _ = writeln!(com1);
     } else {
@@ -307,7 +353,14 @@ pub(crate) fn quiesce(
             Names(&refused)
         );
     }
+    QUIESCED.store(covered && refused.is_empty(), Ordering::Release);
     Some(q)
+}
+
+/// Whether the quiesce held: it covered every MCFG window and every function let go of the
+/// bus. Until it has, `DeviceDma::attach` and `enable_bus_master` refuse.
+pub(crate) fn quiesced() -> bool {
+    QUIESCED.load(Ordering::Acquire)
 }
 
 /// Waits for functions that report Transactions Pending to finish, at most [`SETTLE_MS`]
@@ -319,6 +372,7 @@ pub(crate) fn settle(com1: &mut Console, q: &mut Quiesce, tsc_hz: u64) -> bool {
         own,
         started,
         done,
+        ..
     } = q;
     // The IOMMUs' own functions keep their bus mastering, so nothing here applies to them.
     let cleared: Vec<(u16, Function)> = functions
@@ -380,6 +434,7 @@ fn bus_masters(q: &mut Quiesce) -> Vec<(u16, Function)> {
         functions,
         others,
         own,
+        hardwired,
         ..
     } = q;
     functions
@@ -387,6 +442,7 @@ fn bus_masters(q: &mut Quiesce) -> Vec<(u16, Function)> {
         .filter(|&&(segment, f)| {
             let mine = segment == 0 && own.iter().any(|&(at, _)| at == f.at);
             !mine
+                && !hardwired.contains(&(segment, f.at))
                 && with_space(others, segment, |space| pci::bus_master_on(space, f.at))
                     .unwrap_or(false)
         })
@@ -394,23 +450,43 @@ fn bus_masters(q: &mut Quiesce) -> Vec<(u16, Function)> {
         .collect()
 }
 
-/// Re-reads every function before any driver binds: nothing has turned bus mastering back
-/// on since [`quiesce`]. Returns whether that held.
+/// Re-reads every function before any driver binds, and stops again any that turned bus
+/// mastering back on since [`quiesce`]. Returns whether every function is off now; one that
+/// will not stop leaves [`quiesced`] false, so no driver binds.
 pub(crate) fn check_quiet(com1: &mut Console, q: &mut Quiesce) -> bool {
     let on: Vec<(u16, Address)> = bus_masters(q)
         .iter()
         .map(|&(segment, f)| (segment, f.at))
         .collect();
-    let n = q.functions.len() - q.own.len();
-    let quiet = on.is_empty();
+    let stuck: Vec<(u16, Address)> = on
+        .iter()
+        .copied()
+        .filter(|&(segment, at)| {
+            with_space(&mut q.others, segment, |space| {
+                pci::clear_bus_master(space, at)
+            })
+            .is_none_or(|outcome| outcome.still_on)
+        })
+        .collect();
+    let n = q.functions.len() - q.own.len() - q.hardwired.len();
+    let quiet = stuck.is_empty();
     let _ = write!(
         com1,
-        "origin-kernel: PCIe: bus mastering: off on all {n} functions before any driver attached: {quiet}"
+        "origin-kernel: PCIe: bus mastering: off on all {n} functions before any driver attached: {}",
+        on.is_empty()
     );
-    if quiet {
+    if on.is_empty() {
         let _ = writeln!(com1);
+    } else if quiet {
+        let _ = writeln!(com1, " (on for {}, cleared again)", Names(&on));
     } else {
-        let _ = writeln!(com1, " (on for {}): PCIe failed", Names(&on));
+        let _ = writeln!(
+            com1,
+            " (on for {}; these would not stop: {}): PCIe failed",
+            Names(&on),
+            Names(&stuck)
+        );
+        QUIESCED.store(false, Ordering::Release);
     }
     quiet
 }
@@ -425,11 +501,20 @@ pub(crate) fn prove_bus_mastering(com1: &mut Console, q: &mut Quiesce) -> bool {
     let on = bus_masters(q);
     let mut wrong = Vec::new();
     let mut bridges = 0usize;
+    // The attached functions and the bridges a walk up from each one finds, or only the
+    // functions if a walk is refused: then any bridge left on counts as wrong below.
+    let devices = crate::cpu::without_interrupts(|| DEVICES.read().clone());
+    let allowed = with_space(&mut q.others, 0, |space| {
+        pci::bus_master_allowed(space, &devices, &attached)
+    })
+    .and_then(Result::ok)
+    .unwrap_or_else(|| attached.clone());
     {
         let Quiesce {
             functions,
             others,
             own,
+            hardwired,
             ..
         } = q;
         // The IOMMUs' own functions still read as the firmware left them.
@@ -442,19 +527,18 @@ pub(crate) fn prove_bus_mastering(com1: &mut Console, q: &mut Quiesce) -> bool {
             if segment == 0 && own.iter().any(|&(at, _)| at == f.at) {
                 continue;
             }
-            let reads_on = on.iter().any(|&(s, g)| s == segment && g.at == f.at);
-            let Some(buses) = with_space(others, segment, |space| pci::bridge_buses(space, &f))
-            else {
+            if hardwired.contains(&(segment, f.at)) {
                 continue;
-            };
-            let allowed = segment == 0 && pci::bus_master_allowed(&f, buses.as_ref(), &attached);
+            }
+            let reads_on = on.iter().any(|&(s, g)| s == segment && g.at == f.at);
+            let expected = segment == 0 && allowed.contains(&f.at);
             bridges += usize::from(reads_on && f.layout == 1);
-            if reads_on != allowed {
+            if reads_on != expected {
                 wrong.push((segment, f.at));
             }
         }
     }
-    let total = q.functions.len() - q.own.len();
+    let total = q.functions.len() - q.own.len() - q.hardwired.len();
     let _ = write!(
         com1,
         "origin-kernel: PCIe: bus mastering: on for exactly the {} attached function(s) (",
@@ -483,9 +567,64 @@ pub(crate) fn prove_bus_mastering(com1: &mut Console, q: &mut Quiesce) -> bool {
     ok
 }
 
-/// Lists segment 0's functions with their BARs sized, once every processor is up. Returns
-/// whether every step and check passed; [`quiesce`] must have succeeded.
-pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex]) -> bool {
+/// The platform's own register ranges, which no BAR may claim: the local APICs' page, the
+/// IOMMUs' registers, the I/O APICs', the HPET's and every ECAM window. `None` (reported) if a
+/// table that names any of them cannot be read: drivers then do not bind (a table that is
+/// simply absent names nothing).
+pub(crate) fn reserved_ranges(
+    com1: &mut Console,
+    q: &Quiesce,
+    rsdp: u64,
+) -> Option<Vec<(u64, u64)>> {
+    match platform_ranges(rsdp) {
+        Ok(mut ranges) => {
+            ranges.extend_from_slice(&q.windows);
+            Some(ranges)
+        }
+        Err(why) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: PCIe: the platform's reserved ranges cannot be listed ({why}): PCIe failed"
+            );
+            None
+        }
+    }
+}
+
+fn platform_ranges(rsdp: u64) -> Result<Vec<(u64, u64)>, &'static str> {
+    let mut ranges = crate::iommu::register_ranges(rsdp)?;
+    ranges.push((pci::LAPIC_BASE, pci::LAPIC_SPAN));
+    if let Some(madt) = crate::iommu::acpi_table_if_listed(rsdp, b"APIC")? {
+        let mut ioapics = [IoApic::default(); 128];
+        let n = acpi::madt_ioapics(madt, &mut ioapics)
+            .map_err(|_| "the MADT's I/O APICs cannot be read")?;
+        ranges.extend(
+            ioapics
+                .iter()
+                .take(n)
+                .map(|io| (u64::from(io.address), 4096)),
+        );
+    }
+    if let Some(table) = crate::iommu::acpi_table_if_listed(rsdp, b"HPET")? {
+        let info = hpet::parse(table).map_err(|_| "the HPET table is invalid")?;
+        ranges.push((info.base, 4096));
+    }
+    Ok(ranges)
+}
+
+/// Lists segment 0's functions with their BARs sized, once every processor is up, and holds
+/// every memory BAR against `regions` and `reserved` (from [`reserved_ranges`]). A function
+/// the quiesce did not see is stopped and recorded here; the IOMMUs' own functions are left
+/// unsized, since sizing would briefly move registers the running IOMMU depends on. A function
+/// that does not restore its command register or BARs after sizing is dropped alone, with its
+/// decoding off. Returns whether the listing succeeded; [`quiesce`] must have run.
+pub(crate) fn init(
+    com1: &mut Console,
+    q: &mut Quiesce,
+    cpus: &[CpuIndex],
+    regions: &[MemoryRegion],
+    reserved: &[(u64, u64)],
+) -> bool {
     let pat = crate::cpu::check_pat();
     let ready = crate::cpu::pat_ready(cpus);
     if ready != cpus.len() {
@@ -515,9 +654,35 @@ pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex]) -> bool {
             n
         }
     };
-    let mut restored = true;
     let mut devices = Vec::with_capacity(n);
+    let mut dropped = Vec::new();
     for f in functions.iter().take(n) {
+        if !q.functions.iter().any(|&(s, g)| s == 0 && g.at == f.at) {
+            let outcome = pci::clear_bus_master(&mut space, f.at);
+            q.functions.push((0, *f));
+            let read_only = outcome.still_on && pci::bus_master_may_be_read_only(f);
+            if read_only {
+                q.hardwired.push((0, f.at));
+            }
+            let stopped = !outcome.still_on || read_only;
+            if !stopped {
+                QUIESCED.store(false, Ordering::Release);
+            }
+            let _ = writeln!(
+                com1,
+                "origin-kernel: PCIe: {} was not seen by the quiesce: bus mastering was on {}, stopped {stopped}{}",
+                f.at,
+                outcome.was_on,
+                if stopped { "" } else { ": PCIe failed" }
+            );
+        }
+        if q.own.iter().any(|&(at, _)| at == f.at) {
+            devices.push(Device {
+                function: *f,
+                bars: [None; 6],
+            });
+            continue;
+        }
         let snapshot = |space: &mut EcamSpace| {
             let mut regs = [0u32; 7];
             regs[0] = space.read32(f.at, pci::register::COMMAND) & 0xFFFF;
@@ -533,29 +698,54 @@ pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex]) -> bool {
         };
         let before = snapshot(&mut space);
         let bars = pci::size_bars(&mut space, f);
-        restored &= snapshot(&mut space) == before;
-        report(com1, f, &bars);
-        devices.push(Device { function: *f, bars });
+        if snapshot(&mut space) == before {
+            devices.push(Device { function: *f, bars });
+        } else {
+            pci::disable_function(&mut space, f.at);
+            dropped.push((0, f.at));
+        }
     }
+    pci::validate_bars(&mut devices, regions, reserved, |at, bar, why| {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: PCIe: {at} BAR{} of {} at {:#x} refused and treated as unimplemented: {why}",
+            bar.index,
+            Size(bar.size),
+            bar.address
+        );
+    });
+    for d in &devices {
+        let own = q.own.iter().any(|&(at, _)| at == d.function.at);
+        report(com1, &d.function, &d.bars, own);
+    }
+    let restored = dropped.is_empty();
     let buses: Vec<u8> = {
         let mut b: Vec<u8> = devices.iter().map(|d| d.function.at.bus).collect();
         b.dedup();
         b
     };
-    let _ = writeln!(
+    let _ = write!(
         com1,
-        "origin-kernel: PCIe: {n} functions on {} buses; every BAR sized with decoding off and restored: {restored}; PAT entry 3 uncached on {ready} processors (IA32_PAT {pat:#x}){}",
+        "origin-kernel: PCIe: {n} functions on {} buses; every BAR sized with decoding off and restored: {restored}; PAT entry 3 uncached on {ready} processors (IA32_PAT {pat:#x})",
         buses.len(),
-        if restored { "" } else { ": PCIe failed" }
     );
+    if restored {
+        let _ = writeln!(com1);
+    } else {
+        let _ = writeln!(
+            com1,
+            "; dropped, decoding off, no driver will bind them: {}",
+            Names(&dropped)
+        );
+    }
     crate::cpu::without_interrupts(|| {
         *DEVICES.write() = devices;
         *ECAM.lock() = Some(space);
     });
-    restored
+    true
 }
 
-fn report(com1: &mut Console, f: &Function, bars: &[Option<Bar>; 6]) {
+fn report(com1: &mut Console, f: &Function, bars: &[Option<Bar>; 6], own: bool) {
     let _ = write!(
         com1,
         "origin-kernel: PCIe: {} {:04x}:{:04x} class {:02x}:{:02x}:{:02x}",
@@ -582,6 +772,9 @@ fn report(com1: &mut Console, f: &Function, bars: &[Option<Bar>; 6]) {
             Size(bar.size),
             bar.address
         );
+    }
+    if own {
+        let _ = write!(com1, "; BARs not sized (the IOMMU's own function)");
     }
     let _ = writeln!(com1);
 }
@@ -628,28 +821,22 @@ pub(crate) fn find(class: u8, subclass: u8, prog_if: u8) -> Option<Device> {
     })
 }
 
-/// Sets `bit` in a function's command register, reads it back and returns the new value.
-fn set_command_bit(space: &mut EcamSpace, at: Address, bit: u16) -> Option<u16> {
-    let command = space.read32(at, pci::register::COMMAND) & 0xFFFF;
-    // The status half is written as zeros: its bits clear when written as one.
-    space.write32(at, pci::register::COMMAND, command | u32::from(bit));
-    let after = (space.read32(at, pci::register::COMMAND) & 0xFFFF) as u16;
-    (after & bit != 0).then_some(after)
-}
-
 /// Turns memory decoding on for a driver that binds to the function; returns the new value
 /// of its command register. Bus mastering is separate: [`set_bus_master`].
 pub(crate) fn enable_memory(at: Address) -> Option<u16> {
     crate::cpu::without_interrupts(|| {
         let mut guard = ECAM.lock();
-        set_command_bit(guard.as_mut()?, at, pci::MEMORY_SPACE)
+        pci::set_command_bit(guard.as_mut()?, at, pci::MEMORY_SPACE)
     })
 }
 
 /// Turns bus mastering on for the function at `at` and for the bridges above it, nearest the
 /// root first, so its requests can reach memory. Returns the function's command register.
 /// Refuses if the function is already mastering: something turned it on before its driver
-/// attached it. Only `dma::DeviceDma::enable_bus_master` calls this, after attaching.
+/// attached it. The bridges come from a walk up from the function's bus, never from what a
+/// function claims about its own range, and the function's bit is set first, so a refusal
+/// happens before any bridge opens (`pci::open_bus_master`). Only
+/// `dma::DeviceDma::enable_bus_master` calls this, after attaching.
 pub(crate) fn set_bus_master(at: Address) -> Result<u16, &'static str> {
     crate::cpu::without_interrupts(|| {
         let devices = DEVICES.read();
@@ -661,14 +848,26 @@ pub(crate) fn set_bus_master(at: Address) -> Result<u16, &'static str> {
         if pci::bus_master_on(space, at) {
             return Err("bus mastering was already on before the driver attached the device");
         }
-        // The list is in bus order, so a bridge comes before the bridges and functions below
-        // it (firmware numbers buses downstream).
-        for d in devices.iter() {
-            if pci::bridge_buses(space, &d.function).is_some_and(|b| b.contains(&at.bus)) {
-                set_command_bit(space, d.function.at, pci::BUS_MASTER)
-                    .ok_or("a bridge above the device kept bus mastering off")?;
-            }
+        let above = pci::bridges_above(space, &devices, at)?;
+        pci::open_bus_master(space, at, &above)
+    })
+}
+
+/// Turns bus mastering off on the function at `at` again and reads it back: for a driver that
+/// has given up on its device. The bridges above it stay as they are, since another device
+/// may be behind them. Returns an error if the function kept the bit on.
+#[allow(
+    dead_code,
+    reason = "the drivers' failure paths call this once their branches merge"
+)]
+pub(crate) fn clear_bus_master(at: Address) -> Result<(), &'static str> {
+    crate::cpu::without_interrupts(|| {
+        let mut guard = ECAM.lock();
+        let space = guard.as_mut().ok_or("no configuration access")?;
+        if pci::clear_bus_master(space, at).still_on {
+            Err("the function kept bus mastering on")
+        } else {
+            Ok(())
         }
-        set_command_bit(space, at, pci::BUS_MASTER).ok_or("bus mastering did not turn on")
     })
 }
