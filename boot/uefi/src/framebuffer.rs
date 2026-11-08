@@ -1,4 +1,4 @@
-//! Turning the firmware's graphics mode into the boot-info framebuffer (ADR-0010, Proposed).
+//! Turning the firmware's graphics mode into the boot-info framebuffer (ADR-0010 E1).
 //!
 //! The kernel never sees UEFI structures (ADR-0002 B4), so the firmware's pixel formats become
 //! channel masks here. The mode is whatever the firmware is already displaying: the loader

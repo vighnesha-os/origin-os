@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Proposed**, 2026-11-08. It changes the boot-info structure, so owner approval is required before it is Accepted (CLAUDE.md §84). The code is built and boot-tested on its own local branch, against this proposal; nothing here has been merged or shipped. |
+| Status | **Proposed**, 2026-11-08, except E1. **E1 (boot info 0.4, the §84 ABI decision) was accepted by the owner on 2026-11-08** (decision sheet item 27). E2 and E4 (sheet items 28 and 29) are still the owner's to decide. The code is built and boot-tested on its own local branch; nothing here has been merged or shipped. |
 | Requires | CLAUDE.md §13 (checked parsing), §19 (boot-info structure, early diagnostics), §51 (font provenance), §58 (threat-model privileged interfaces), §69 (diagnostics), §74, rules 14, 30 and 40 |
 | Implements | ADR-0009 H6, third bullet: a console that does not depend on a 16550 at `0x3F8` |
 | Code | `boot/info` (`Framebuffer`), `boot/uefi` (the Graphics Output Protocol hand-off), `framekernel/paging` (the mapping), `framekernel/src/{fbconsole,font,spcr,serial,console}.rs`, `developer-tools/xtask` |
@@ -15,7 +15,7 @@ Until this ADR the kernel's only console was a 16550 at the fixed I/O port `0x3F
 
 ## Decisions
 
-### E1. Boot info 0.4: a `Framebuffer` (the ABI decision)
+### E1. Boot info 0.4: a `Framebuffer` (the ABI decision; accepted by the owner on 2026-11-08)
 
 `origin-boot-info` appends one 48-byte structure at offset 128 and `size_of::<BootInfo>()` becomes 176. The version in `origin-version.toml` becomes 0.4. The kernel accepts only its own major-0 version, and the KRN manifest records it (ADR-0002 B4).
 
@@ -99,6 +99,6 @@ The framebuffer mapping is kernel-only, writable and never executable, in the ke
 
 ## Questions for the owner
 
-1. Accept boot info 0.4 as in E1 (recommended)? This is the §84 decision.
+1. Accept boot info 0.4 as in E1 (recommended)? This is the §84 decision. **Yes, accepted by the owner on 2026-11-08.**
 2. Accept reserving the first 2 GiB of the MMIO window for the framebuffer (E2)?
 3. Accept the UART policy: COM1 until the ACPI tables can be read, then the SPCR's UART with the earlier output replayed, 0x3F8 only when firmware gives nothing better (E4)?

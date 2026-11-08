@@ -127,7 +127,8 @@ pub const MAX_FRAMEBUFFER_BYTES: u64 = 1 << 30;
 /// Largest width or height of a [`Framebuffer`], in pixels.
 pub const MAX_FRAMEBUFFER_DIMENSION: u32 = 16384;
 
-/// The firmware's linear framebuffer: boot info 0.4 (ADR-0010, **Proposed**).
+/// The firmware's linear framebuffer: boot info 0.4 (ADR-0010 E1, accepted by the owner on
+/// 2026-11-08).
 ///
 /// A pixel is one little-endian 32-bit value at `base + y * stride + x * 4`. The channels
 /// are given by masks, so the kernel never sees the firmware's format names: the loader turns

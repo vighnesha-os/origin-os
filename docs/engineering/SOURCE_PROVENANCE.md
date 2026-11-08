@@ -157,7 +157,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Not done:** OKC chains (errata O2–O5 are decided; O3 makes them wait for the SYS profile's signed time), Origin's real root and kernel keys, release signing (HSM), B7's Secure Boot first stage, anti-rollback and TPM measurement (§7.6, §8.1). SYS and other profiles have no signature policy yet.
 - **Licensing:** MIT OR Apache-2.0.
 
-## `boot/info/` (`origin-boot-info`), the boot-info contract v0.4 (Proposed)
+## `boot/info/` (`origin-boot-info`), the boot-info contract v0.4 (accepted)
 
 - **What:** the one structure the loader hands the Framekernel (ADR-0002 B4):
   - `BootInfo`: `repr(C)`, 80 bytes, every field explicitly sized, offsets pinned at compile time;
@@ -166,7 +166,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `BootInfo::check`: validates magic, version, size and region count before anything else is trusted.
 
   The version is `[compatibility] boot-info` in `origin-version.toml`. Major 0 means unstable until ADR-0002 is accepted.
-- **0.4 (2026-11-08, ADR-0010, Proposed):** `Framebuffer` (physical base, size, the address the loader mapped it at, dimensions, stride and the channel masks of a 32-bit pixel, 48 bytes) appended to `BootInfo`, now 176 bytes; `Framebuffer::check` and `overlaps_ram`. See "The early console" under `framekernel/`.
+- **0.4 (2026-11-08, ADR-0010 E1, accepted by the owner the same day):** `Framebuffer` (physical base, size, the address the loader mapped it at, dimensions, stride and the channel masks of a 32-bit pixel, 48 bytes) appended to `BootInfo`, now 176 bytes; `Framebuffer::check` and `overlaps_ram`. See "The early console" under `framekernel/`.
 - **0.2 (2026-11-07):** `KernelSegment` (rva, pages, R/W/X access, 24 bytes; at most 16) appended to `BootInfo`, now 96 bytes; `check` bounds the count; `check_segments` enforces aligned, non-empty, sorted, disjoint, inside the span, readable, never W and X, no unknown bits, `reserved` zero. 6 unit tests.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code.
 - **Dependencies:** `core` and `origin-version`. `no_std`, `forbid(unsafe_code)`.
@@ -457,12 +457,12 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Evidence:** `cargo xtask check` and `boot-matrix` (1, 2 and 4 CPUs) pass; boot to halt takes 4.8, 5.4 and 7.1 s.
 - **Limitation:** interrupts stay off while one line is sent. In QEMU that is microseconds; at 115 200 baud on real hardware it is about 9 ms per 100 bytes. Production logging will go to a memory ring drained by a thread (CLAUDE.md §69).
 
-### The early console: the firmware's framebuffer and a UART from the SPCR (ADR-0010, **Proposed**; `boot/info`, `boot/uefi`, `paging::layout`, `fbconsole`, `font`, `spcr`, `serial`, `console`; xtask; CLAUDE.md §13, §19, §51, §58, §69; 2026-11-08)
+### The early console: the firmware's framebuffer and a UART from the SPCR (ADR-0010, boot info 0.4 accepted, the rest Proposed; `boot/info`, `boot/uefi`, `paging::layout`, `fbconsole`, `font`, `spcr`, `serial`, `console`; xtask; CLAUDE.md §13, §19, §51, §58, §69; 2026-11-08)
 
 ADR-0009 H6 required a console that does not depend on a 16550 at I/O port `0x3F8`, because neither first machine documents its COM port's address and a failed boot would have shown nothing.
 
 - **Author / date:** Claude Code (local, session `funny-benz-fa7d10`), 2026-11-08. Original code and font, no third-party crates (§3, §5).
-- **ABI:** boot info **0.4** appends `Framebuffer` (48 bytes at offset 128, `size_of::<BootInfo>() == 176`), with pixel format as channel masks. **Written as Proposed (ADR-0010 E1); the owner has not accepted it**, per §84. `docs/engineering/OWNER_DECISIONS.md` items 27–29 ask.
+- **ABI:** boot info **0.4** appends `Framebuffer` (48 bytes at offset 128, `size_of::<BootInfo>() == 176`), with pixel format as channel masks. Written as Proposed under §84 and **accepted by the owner on 2026-11-08** (ADR-0010 E1, `docs/engineering/OWNER_DECISIONS.md` item 27); items 28 and 29, the window and the UART policy, are still open.
 - **What:**
   - `origin-boot-info`: `Framebuffer`, `FramebufferError`, `Framebuffer::check` (the contract: both the loader and the kernel run it), `overlaps_ram` (the "is it RAM" question for a device range).
   - `origin-boot-uefi`: `protocols` (GOP structures, `LocateHandle`), `framebuffer::describe` (GOP mode → boot-info framebuffer; RGB, BGR and bit-mask formats become masks), and `find_framebuffer`/`framebuffer_of` in `main.rs`: every Graphics Output handle is examined and the first usable one the firmware uses as a console wins (`EFI_CONSOLE_OUT_DEVICE`), else the first usable one. The mode is never changed. A framebuffer that overlaps RAM or cannot be mapped is dropped, not fatal.
