@@ -142,8 +142,8 @@ fn benign_fault(b: &mut Builder, rng: &mut Rng) {
         1 if is_segment && s.flags & W != 0 => s.flags ^= RELRO,
         // §6.1 allows these four, and no other.
         2 if is_segment => {
-            s.flags = (s.flags & !(R | W | X | RELRO))
-                | rng.pick(&[R, R | W, R | W | RELRO, R | X]);
+            s.flags =
+                (s.flags & !(R | W | X | RELRO)) | rng.pick(&[R, R | W, R | W | RELRO, R | X]);
         }
         3 if s.kind != MERKLE && s.kind != MANIFEST && !is_segment && s.integrity == 0 => {
             let len = 1 + rng.below(9000);

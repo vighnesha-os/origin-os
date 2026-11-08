@@ -1,5 +1,7 @@
 //! Streaming tree construction: the root, and optionally the MERKLE section.
 
+use core::ops::Range;
+
 use origin_crypto::Sha256;
 
 use crate::{
@@ -141,6 +143,83 @@ pub fn root(content: &[u8]) -> Result<[u8; HASH_SIZE], Error> {
     run(content, |_, _, _| {})
 }
 
+/// The slot hash `index` of `level` occupies in the MERKLE section: hash block `(level + 1,
+/// index / 128)`, slot `index % 128`. `None` for the top hash, which no hash block holds.
+fn hash_slot(shape: &Shape, level: u8, index: u64) -> Option<Range<usize>> {
+    let position = shape.block_position(level.checked_add(1)?, index >> 7)?;
+    let start = position
+        .checked_mul(BLOCK_SIZE as u64)?
+        .checked_add((index & 127).checked_mul(HASH_SIZE as u64)?)?;
+    let start = usize::try_from(start).ok()?;
+    Some(start..start.checked_add(HASH_SIZE)?)
+}
+
+/// The zero padding after the last hash of hash-block `level`, or `None` if that block is
+/// full. The padding is part of the block that was hashed, but no hash is ever written there.
+fn padding(shape: &Shape, level: u8) -> Option<Range<usize>> {
+    let hashes = match level.checked_sub(1)? {
+        0 => shape.leaves(),
+        below => shape.blocks_at(below),
+    };
+    let used = hashes % HASHES_PER_BLOCK as u64;
+    if used == 0 {
+        return None;
+    }
+    let position = shape.block_position(level, shape.blocks_at(level).checked_sub(1)?)?;
+    let start = position
+        .checked_mul(BLOCK_SIZE as u64)?
+        .checked_add(used.checked_mul(HASH_SIZE as u64)?)?;
+    let end = position.checked_add(1)?.checked_mul(BLOCK_SIZE as u64)?;
+    Some(usize::try_from(start).ok()?..usize::try_from(end).ok()?)
+}
+
+/// Checks `content` against `root` and, in the same pass, that `hash_blocks` is byte for byte
+/// the MERKLE section [`build`] writes for `content`, padding included. It hashes exactly what
+/// [`root`] hashes and allocates nothing: each stored hash is compared as it is produced.
+///
+/// A wrong root is reported first ([`Error::RootMismatch`]): then the content is at fault,
+/// and every hash block above the change would differ anyway. Otherwise a bad hash block is
+/// [`Error::HashMismatch`], at the level of the first one found.
+pub fn verify_tree(
+    root: &[u8; HASH_SIZE],
+    content: &[u8],
+    hash_blocks: &[u8],
+) -> Result<(), Error> {
+    let size = u64::try_from(content.len()).map_err(|_| Error::TooLarge)?;
+    let shape = Shape::new(size)?;
+    let found = u64::try_from(hash_blocks.len()).unwrap_or(u64::MAX);
+    if found != shape.hash_blocks_len() {
+        return Err(Error::HashBlocksLength {
+            expected: shape.hash_blocks_len(),
+            found,
+        });
+    }
+    let mut mismatch: Option<u8> = None;
+    let computed = run(content, |level, index, hash| {
+        let Some(slot) = hash_slot(&shape, level, index) else {
+            return;
+        };
+        if hash_blocks.get(slot).is_none_or(|stored| stored != hash) {
+            mismatch.get_or_insert(level.saturating_add(1));
+        }
+    })?;
+    if computed != *root {
+        return Err(Error::RootMismatch);
+    }
+    if let Some(level) = mismatch {
+        return Err(Error::HashMismatch { level });
+    }
+    for level in 1..=shape.levels() {
+        let clean = padding(&shape, level)
+            .and_then(|range| hash_blocks.get(range))
+            .is_none_or(|bytes| bytes.iter().all(|&b| b == 0));
+        if !clean {
+            return Err(Error::HashMismatch { level });
+        }
+    }
+    Ok(())
+}
+
 /// Writes the MERKLE section for `content` into `hash_blocks`, which must be exactly
 /// `Shape::hash_blocks_len()` bytes, and returns the root.
 pub fn build(content: &[u8], hash_blocks: &mut [u8]) -> Result<[u8; HASH_SIZE], Error> {
@@ -155,27 +234,11 @@ pub fn build(content: &[u8], hash_blocks: &mut [u8]) -> Result<[u8; HASH_SIZE], 
     }
     hash_blocks.fill(0);
     run(content, |level, index, hash| {
-        // Hash h_level[index] (below the top) sits in hash block (level + 1, index / 128),
-        // slot index % 128.
-        let Some(block_level) = level.checked_add(1) else {
+        let Some(dst) = hash_slot(&shape, level, index).and_then(|s| hash_blocks.get_mut(s)) else {
             return;
         };
-        let Some(position) = shape.block_position(block_level, index >> 7) else {
-            return;
-        };
-        let offset = position
-            .checked_mul(BLOCK_SIZE as u64)
-            .and_then(|o| o.checked_add((index & 127).checked_mul(HASH_SIZE as u64)?));
-        let Some(start) = offset.and_then(|o| usize::try_from(o).ok()) else {
-            return;
-        };
-        if let Some(dst) = start
-            .checked_add(HASH_SIZE)
-            .and_then(|end| hash_blocks.get_mut(start..end))
-        {
-            for (d, s) in dst.iter_mut().zip(hash) {
-                *d = *s;
-            }
+        for (d, s) in dst.iter_mut().zip(hash) {
+            *d = *s;
         }
     })
 }

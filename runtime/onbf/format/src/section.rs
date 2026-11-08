@@ -251,10 +251,15 @@ impl SectionEntry {
         if is_segment
             && !matches!(
                 flags.0 & Flags::PERMISSIONS,
-                Flags::READ_ONLY | Flags::READ_WRITE | Flags::READ_WRITE_RELRO | Flags::READ_EXECUTE
+                Flags::READ_ONLY
+                    | Flags::READ_WRITE
+                    | Flags::READ_WRITE_RELRO
+                    | Flags::READ_EXECUTE
             )
         {
-            return Err(SectionError::SegmentPermissions(flags.0 & Flags::PERMISSIONS));
+            return Err(SectionError::SegmentPermissions(
+                flags.0 & Flags::PERMISSIONS,
+            ));
         }
         let mappable = flags.has(Flags::MAPPABLE);
         // Errata G1: symbol files are never mapped.
