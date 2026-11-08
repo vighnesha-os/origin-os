@@ -476,6 +476,48 @@ impl<'a> Dmar<'a> {
                     .find(|u| u.include_pci_all && u.segment == r.segment)
             })
     }
+
+    /// The unit that remaps the interrupts of the I/O APIC whose ID is `id` (its MADT I/O
+    /// APIC ID, the scope's enumeration ID), and the requester its interrupt messages carry —
+    /// the source ID an IRTE for one of its pins must check. VT-d chapter 8: an I/O APIC is
+    /// listed explicitly in the device scope of the unit that remaps its interrupts;
+    /// INCLUDE_PCI_ALL never covers one. Refused if no unit lists it, if more than one scope
+    /// does (the source ID would be ambiguous), or if its scope's path does not resolve.
+    pub fn ioapic(
+        &self,
+        id: u8,
+        bridges: &mut impl BridgeBuses,
+    ) -> Result<(Unit<'a>, Requester), IoApicScopeError> {
+        let mut found = None;
+        for u in self.units() {
+            for s in u
+                .scopes()
+                .filter(|s| s.kind == ScopeKind::IoApic && s.enumeration_id == id)
+            {
+                if found.is_some() {
+                    return Err(IoApicScopeError::ListedTwice);
+                }
+                found = Some((u, s));
+            }
+        }
+        let (u, s) = found.ok_or(IoApicScopeError::NotListed)?;
+        let r = s
+            .resolve(u.segment, bridges)
+            .ok_or(IoApicScopeError::Unresolved)?;
+        Ok((u, r))
+    }
+}
+
+/// Why [`Dmar::ioapic`] names no unit for an I/O APIC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoApicScopeError {
+    /// No unit's device scope lists an I/O APIC with this ID, so its interrupts cannot be
+    /// remapped.
+    NotListed,
+    /// More than one device scope lists it.
+    ListedTwice,
+    /// Its scope's path does not resolve (a middle step is not a bridge).
+    Unresolved,
 }
 
 /// Checks a DMAR (the whole table, `acpi::check_table(b"DMAR")` already passed) and returns
@@ -867,6 +909,69 @@ mod tests {
     }
 
     #[test]
+    fn io_apics_name_their_unit_and_source_id() {
+        // QEMU's q35: I/O APIC 0 on the pseudo bus 0xff, source ID 0xff00.
+        let t = qemu_q35();
+        let d = parse(&t).unwrap();
+        let mut none = Model::default();
+        let (u, r) = d.ioapic(0, &mut none).unwrap();
+        assert_eq!(u.register_base, 0xFED9_0000);
+        assert_eq!(r, at(0xFF, 0, 0));
+        assert_eq!(r.source_id(), 0xFF00);
+        assert_eq!(
+            d.ioapic(1, &mut none).err(),
+            Some(IoApicScopeError::NotListed)
+        );
+        // The platform: I/O APIC 2 is listed by the INCLUDE_PCI_ALL unit (bus 0xf0, 1f.0).
+        // INCLUDE_PCI_ALL does not cover I/O APICs, and an HPET scope with the same
+        // enumeration ID is not one.
+        let mut m = Model::default();
+        let t = platform(&mut m);
+        let d = parse(&t).unwrap();
+        let (u, r) = d.ioapic(2, &mut m).unwrap();
+        assert!(u.include_pci_all);
+        assert_eq!((u.register_base, r.source_id()), (0xFED9_1000, 0xF0F8));
+        assert_eq!(d.ioapic(0, &mut m).err(), Some(IoApicScopeError::NotListed));
+        // Listed by two units, or twice by one: the source ID would be ambiguous.
+        let one = scope(3, 0, 0xFF, &[(0, 0)]);
+        let other = scope(3, 0, 0xFE, &[(0, 0)]);
+        let t = table(
+            47,
+            flags::INTR_REMAP,
+            &[
+                drhd(0, 0, 0x1000, core::slice::from_ref(&one)),
+                drhd(0, 0, 0x2000, core::slice::from_ref(&other)),
+            ],
+        );
+        let d = parse(&t).unwrap();
+        assert_eq!(
+            d.ioapic(0, &mut none).err(),
+            Some(IoApicScopeError::ListedTwice)
+        );
+        let t = table(
+            47,
+            flags::INTR_REMAP,
+            &[drhd(0, 0, 0x1000, &[one.clone(), one])],
+        );
+        assert_eq!(
+            parse(&t).unwrap().ioapic(0, &mut none).err(),
+            Some(IoApicScopeError::ListedTwice)
+        );
+        // An I/O APIC behind a bridge: the path follows its secondary bus; without the bridge
+        // it does not resolve.
+        let behind = scope(3, 4, 0, &[(0x1C, 0), (0, 0)]);
+        let t = table(47, flags::INTR_REMAP, &[drhd(0, 0, 0x1000, &[behind])]);
+        let d = parse(&t).unwrap();
+        let mut bridged = Model::default();
+        bridged.0.insert((0, 0, 0x1C, 0), (5, 5));
+        assert_eq!(d.ioapic(4, &mut bridged).unwrap().1.source_id(), 0x0500);
+        assert_eq!(
+            d.ioapic(4, &mut none).err(),
+            Some(IoApicScopeError::Unresolved)
+        );
+    }
+
+    #[test]
     fn malformed_tables_are_refused_at_their_offset() {
         let ok = scope(1, 0, 0, &[(2, 0)]);
         let unit = |s: &[Vec<u8>]| drhd(0, 0, 0x1000, s);
@@ -1021,6 +1126,23 @@ mod tests {
             }
             for r in [at(0, 2, 0), at(0, 0x14, 0), at(2, 3, 1), at(0, 0x1C, 0)] {
                 let _ = d.unit_for(r, &mut model);
+            }
+            // An I/O APIC that resolves is listed, exactly once, by the unit returned.
+            for id in [0, 2, 0xFF] {
+                if let Ok((u, r)) = d.ioapic(id, &mut model) {
+                    let listing = d
+                        .units()
+                        .flat_map(|u| u.scopes())
+                        .filter(|s| s.kind == ScopeKind::IoApic && s.enumeration_id == id)
+                        .count();
+                    assert_eq!(listing, 1, "case {case}");
+                    assert!(
+                        u.scopes().any(|s| s.kind == ScopeKind::IoApic
+                            && s.enumeration_id == id
+                            && s.resolve(u.segment, &mut model) == Some(r)),
+                        "case {case}"
+                    );
+                }
             }
             let _ = d.structures().count();
         }

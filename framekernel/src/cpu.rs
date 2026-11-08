@@ -470,10 +470,19 @@ pub(crate) const NET_TX_VECTOR: u8 = 0x43;
 
 /// Interrupts taken on [`IOAPIC_VECTOR`].
 static IOAPIC_IRQS: AtomicU64 = AtomicU64::new(0);
+/// Interrupts taken on [`IOAPIC_VECTOR`], by the x2APIC ID of the processor that took them.
+static IOAPIC_IRQS_ON: [AtomicU64; MAX_LOCAL] = [const { AtomicU64::new(0) }; MAX_LOCAL];
 
 /// How many I/O APIC-routed interrupts have been taken.
 pub(crate) fn ioapic_irqs() -> u64 {
     IOAPIC_IRQS.load(Ordering::Relaxed)
+}
+
+/// How many I/O APIC-routed interrupts the processor with x2APIC ID `apic` has taken.
+pub(crate) fn ioapic_irqs_on(apic: u32) -> u64 {
+    IOAPIC_IRQS_ON
+        .get(apic as usize)
+        .map_or(0, |n| n.load(Ordering::Relaxed))
 }
 /// The system-call vector, the only gate user mode may raise (DPL 3). RAX: 0 exit(RDI),
 /// 1 report(RDI); anything else returns `u64::MAX` in RAX.
@@ -532,6 +541,9 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     // acknowledge.
     if frame.vector == u64::from(IOAPIC_VECTOR) {
         IOAPIC_IRQS.fetch_add(1, Ordering::Relaxed);
+        if let Some(n) = IOAPIC_IRQS_ON.get(cpu_id() as usize) {
+            n.fetch_add(1, Ordering::Relaxed);
+        }
         // SAFETY: as for the timer; x2APIC mode is on, and the write only acknowledges the
         // interrupt in service.
         unsafe { wrmsr(X2APIC_EOI, 0) };

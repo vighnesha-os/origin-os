@@ -279,6 +279,11 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
             // The IOMMU's own proofs, through the bound NVMe controller: translated DMA, a
             // blocked and recorded DMA, remapped and blocked interrupts.
             storage::prove_iommu(&mut com1, online.ids(), tsc_hz);
+            // Legacy interrupts under interrupt remapping: the PIT's IRQ0 through the I/O
+            // APIC in remappable format and an IRTE that checks the I/O APIC's source ID,
+            // with the IRTE made not present and given a wrong source ID (CLAUDE.md §24,
+            // §32; ADR-0007 I8).
+            irq::prove_remapped(&mut com1, online.ids(), tsc_hz);
         }
         sched::stop_boot_processor();
     }

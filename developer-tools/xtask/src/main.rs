@@ -399,6 +399,37 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: IOMMU: domains: 00:02.0 domain 1 (".into(),
             " 00:03.0 domain 2 (".into(),
             "no other function has a context entry, so its DMA faults; IOVAs from 0x40000000; faults recorded before the proofs: 0; consistent true".into(),
+            // The PIT's IRQ0 again, now through interrupt remapping (CLAUDE.md §24, §32;
+            // ADR-0007 I8): the I/O APIC's entry in remappable format names an IRTE that
+            // sends vector 0x41 to the target CPU (another than the boot processor when there
+            // is one), edge-triggered like the pin, checking the I/O APIC's source ID from the
+            // DMAR; the interrupts arrive there and nowhere else. With the IRTE not present,
+            // none arrive and the unit records reason 0x22. QEMU's I/O APIC sends its messages
+            // without a requester ID, so the fault carries 0xffff and the source-ID check
+            // cannot be shown under QEMU: the kernel says so, and the IRTE is restored.
+            "origin-kernel: I/O APIC: remapped: the PIT's IRQ0 (GSI 2, edge-triggered, active-high) through IRTE ".into(),
+            format!(
+                "the redirection entry reads back in remappable format with that index, vector 0x41 and mask clear: true; the IRTE reads back vector 0x41 to CPU {}, edge-triggered like the pin, checking source ID 0xff00 (I/O APIC 0's, from the DMAR): true; the two agree: true",
+                cpus.min(2) - 1
+            ),
+            "origin-kernel: I/O APIC: remapped: ".into(),
+            format!(
+                " PIT interrupts arrived on CPU {} through IRTE ",
+                cpus.min(2) - 1
+            ),
+            ", 0 on other CPUs; fault recorded: none; consistent true".into(),
+            "origin-kernel: I/O APIC: IRTE ".into(),
+            " not present: 0 interrupts arrived in 100 ms; fault recorded: source ID 0xffff, interrupt index ".into(),
+            format!(
+                "reason 0x22 (interrupt table entry not present), from a message without a requester ID (the DMAR names 0xff00); IRTE restored, 5 interrupts arrived on CPU {} again: true; consistent true",
+                cpus.min(2) - 1
+            ),
+            "origin-kernel: I/O APIC: IRTE ".into(),
+            " checking source ID 0xff01 instead of 0xff00: ".into(),
+            "fault recorded: none; the source-ID check cannot be shown on this platform".into(),
+            "; consistent true".into(),
+            "origin-kernel: I/O APIC: remapped: the entry masked, the PIT stopped and IRTE ".into(),
+            " released: true".into(),
             // The in-memory VFS (CLAUDE.md §39): a file built, read back, listed and removed.
             "origin-kernel: vfs: built /etc/origin/hostname (read back true), listed 1 entry, removed all back to 1 node".into(),
             // §21: the embedded ustar initramfs extracts into a VFS (contents and an
