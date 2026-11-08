@@ -5,7 +5,7 @@
 | Date | 2026-11-08 |
 | For | `onbf-verify::verify_krn_block`, the loader's `trust` and `kernel` modules, `onbf-pack sign` and `keygen`, the signature scenarios of `cargo xtask boot-test`; TASKS item 6 |
 | Requires | CLAUDE.md §16 (research first), §19, §58–§60, §84; ONBF §4.2, §7, §8.1; ADR-0001 D3; ADR-0002 B2, B7, B8; encodings S1–S4; errata C3, C4, E1, M1 |
-| Result | The smallest correct slice: direct trust in a compiled-in store, chains refused. Six readings are **Proposed** (errata V1–V6) and four gaps are open for the owner (errata O2–O5) |
+| Result | The smallest correct slice: direct trust in a compiled-in store, chains refused. The owner decided V1–V6 and O2–O5 on 2026-11-08 (`ONBF-errata.md`) and chose Rust signing; the tables below are kept as written when they were open |
 
 ## 1. What is specified, and what enforces it
 
@@ -19,7 +19,7 @@
 | The verification order: parse, profile, content digest, signatures, manifest, sections | ADR-0002 B2, ONBF-R1 | `kernel::verify`; the signature check comes before any section's content is read |
 | The roots live in the loader | ONBF §8.1 | new: `boot/uefi/src/trust.rs`, compiled in |
 | An unsigned image is allowed only in developer mode or under a verified parent | §4.2, B8 | `Image::parse`, and now a message of its own (`KernelError::Unsigned`) |
-| The OS only verifies; signing runs in host tools | CLAUDE.md §59, ONBF §7.2 | `onbf-pack sign` calls OpenSSL; no private key enters the OS or this tool |
+| The OS only verifies; signing runs in host tools | CLAUDE.md §59, ONBF §7.2 | `onbf-sign`, host only; `cargo xtask check` fails if the loader or the kernel depends on it |
 | The signer produces only what the verifier accepts | E1, M1 | `sign_krn` re-verifies with `verify_krn_block` before writing |
 
 `onbf-format` and `onbf-verify` already provided the parser and `verify_entry`, proven against reference-signed vectors. What was missing was the policy (which keys, which role, how many entries), the host signer, the loader wiring and the boot proofs.
@@ -42,29 +42,30 @@
 
 Out of scope, by the task and the ADR: Secure Boot's first stage (B7's first link), anti-rollback (§7.6, needs SYS and a TPM NV index), TPM measurement (§8.1), and release signing itself (HSM, CLAUDE.md §60, §75).
 
-## 3. Why OpenSSL does the signing
+## 3. Who signs, and in what
 
-Host tools sign; the OS only verifies (CLAUDE.md §59). So the choice was how a host tool should sign:
+Host tools sign; the OS only verifies (CLAUDE.md §59). The first version ran OpenSSL 3.5+ as a subprocess, which meant no signing code in the tree. **The owner chose original Rust signing instead (2026-11-08)**, accepting that it handles secrets and needs its own constant-time work and review.
 
-| Option | Verdict |
+So signing lives in a new host-only crate, `developer-tools/onbf-sign` (ONBF §12 names that crate):
+
+| Decision | Why |
 |---|---|
-| **Run OpenSSL (3.5 or later) as a subprocess** | **Chosen.** No signing algorithm is written or owned here, so there is nothing to make constant-time or to zeroize, and no RNG to get right (the things §59 lists for secret-handling code). It is permitted host infrastructure (§4), already on the machine, and already cross-checked against `origin-crypto` (the ML-DSA provenance entry). The private key stays in a file that only OpenSSL opens; `onbf-pack` never reads it. A boot proof then shows a real cross-implementation agreement: OpenSSL signs, `origin-crypto` verifies. |
-| Write Ed25519 and ML-DSA signing in Rust | Rejected. §4 says to implement established algorithms only when necessary. Signing handles secrets, which the verifier never does, and would need its own side-channel assessment and review. |
-| Use the Python references | Rejected as the signer. `ed25519_reference.py` and `mldsa_reference.py` are test oracles (variable-time, big-integer); they stay what they are. |
-| A signing crate (`ring`, `dalek`, a PQ crate) | Rejected. Each would be a host-tool dependency needing §5 approval, and none is needed. |
+| A crate of its own, not `origin-crypto` | `origin-crypto` ships in the loader and the kernel, and ONBF §7.2 says the OS contains verification code only. `cargo xtask check` now fails if the loader or the kernel can reach `onbf-sign`. |
+| Only the hashes are reused from `origin-crypto` | Their state updates have no data-dependent branches or table lookups. The signing arithmetic is written separately, so a signature that the verifiers accept is agreement between two implementations. |
+| ML-DSA-87 only, Ed25519 | The kernel role's suite (OSS-1R). ML-DSA-65 (OSS-1) is added when a role needs it. |
+| OpenSSL kept only as a test cross-check | It verifies what `onbf-sign` produces (`openssl_accepts_these_signatures`, skipped if no OpenSSL is installed). The committed test public keys were made by OpenSSL from the same seeds, so `test_keys_come_from_their_seed_only` also shows the two derive identical keys. Nothing else uses it, and `boot-test` no longer needs it. |
 
-Details that follow from the choice:
-- `onbf-pack` refuses anything but OpenSSL 3.5 or later (LibreSSL, macOS's `/usr/bin/openssl`, has no ML-DSA).
-- Public keys are read from `openssl pkey -pubout -outform DER` and accepted only with the exact fixed `SubjectPublicKeyInfo` prefix for Ed25519 or ML-DSA-87, which also pins the parameter set.
-- ML-DSA goes through `-pkeyopt hexcontext-string:<role context>`.
-- OpenSSL's ML-DSA is hedged by default, so a signature differs per run. Signing is the one non-reproducible step of a build; the container, the content digest and the statement stay reproducible (ONBF-R9).
-- `onbf-pack` is given the keys, so a compromised OpenSSL could misuse them. The boundary is the build host, as for any host-tool signer; the release path (HSM) is future work.
+Validation: the Ed25519 signer against RFC 8032 and 296 more vectors from `ed25519_reference.py signvectors` (seed, public key, signature), and the ML-DSA-87 signer against all 13 keys and 52 signatures in `mldsa-differential.txt`, which the independent Python reference produced and OpenSSL 4.1.0 matched byte for byte; every signature must also pass `origin-crypto`'s strict verifiers.
+
+The side-channel assessment is in `developer-tools/onbf-sign/src/lib.rs`: fixed-width arithmetic with masks, doubling and adding on every scalar bit, and rejection decisions made only on the combined result of each check. What it does not establish is stated there too: compiler and processor behaviour are assumed, not proven, and there is no timing measurement yet. Zeroization is best effort because the crate forbids `unsafe`, so it cannot use volatile writes. Release signing still belongs in an HSM (ONBF §7.2, CLAUDE.md §60).
+
+ML-DSA signing is hedged with fresh randomness from `/dev/urandom` (FIPS 204 §3.4), so signing remains the one non-reproducible step of a build; the container, the content digest and the statement stay reproducible (ONBF-R9).
 
 ## 4. Test keys
 
 The boot tests must sign with something, and the loader must trust it. A development key must never pass for a release key, so:
 - `onbf-pack keygen --insecure-test-seed <text>` derives the key from public text; anyone can recompute it.
-- No private key is stored in the repository. `cargo xtask boot-test` derives the private keys into `target/xtask/test-keys/`.
+- No private key is stored in the repository. `cargo xtask boot-test` derives the private keys into `target/xtask/test-keys/` (one key file, mode 0600, read only by `onbf-pack`).
 - The repository holds only the public halves, in `boot/uefi/trust/`, named `TEST-ONLY-…`, with a README. `xtask` checks them against the derived key before it boots anything.
 - Only a loader built with `test-trust-store` (or `developer-mode`, which includes it) compiles them in, and it prints a warning on every boot. A build without the feature trusts nothing and refuses every kernel.
 - "Must never ship" is enforced, not only stated: a loader holding the test key does not compile with a non-zero build number (`origin-version.toml`), which release engineering sets for a released build.

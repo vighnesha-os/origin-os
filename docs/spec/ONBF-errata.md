@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Applies to | `docs/spec/ONBF.md` v1.0 (design), accepted 2026-11-07 |
-| Status | **C1–C14 and G2–G5 decided by the owner on 2026-11-07. G1 and the readings below were decided the same day under the owner's instruction of 2026-11-07 to finalise the design with the recommended options.** V1–V6 (2026-11-08) are **Proposed**: see "Proposed readings of §7". |
+| Status | **C1–C14 and G2–G5 decided by the owner on 2026-11-07. G1 and the readings below were decided the same day under the owner's instruction of 2026-11-07 to finalise the design with the recommended options. V1–V6 and O2–O5 were decided by the owner on 2026-11-08.** O1 stays open. |
 | Found by | Implementing `runtime/onbf/format` (`onbf-format`) against §4, 2026-11-07 |
 | Byte layouts | Unchanged. Every item below is a validation rule or a missing definition, not a new field. |
 
@@ -71,11 +71,11 @@ Applied in code on 2026-11-07 and pinned by tests. **Accepted as normative the s
 | M1 | `origin-crypto`, ML-DSA | Strict FIPS 204 verification, first failure wins: context > 255 bytes; HintBitUnpack per polynomial (count range, then strictly increasing positions), then non-zero padding; ‖z‖∞ ≥ γ1 − β; c̃ mismatch. SampleInBall uses all λ/4 bytes of c̃; the ExpandA nonce is ρ ‖ column ‖ row; rejection loops are unbounded (no Appendix C bound). The host signer must produce only signatures this accepts. |
 | L1 | loader, boot info 0.2 | A RELRO segment is passed to the kernel without write access, because the loader has applied every relocation (ADR-0002 B4). |
 
-## Proposed readings of §7: awaiting the owner
+## Decided readings of §7 (owner, 2026-11-08)
 
-Found while wiring signature verification into the boot loader (2026-11-08; `docs/research/2026-11-08-krn-signature-verification.md`). **Status: Proposed. They are not normative until the owner decides (CLAUDE.md §84).** The code applies each one, because nothing ships from this branch; each is the choice that fails closed or changes the least.
+Found while wiring signature verification into the boot loader (`docs/research/2026-11-08-krn-signature-verification.md`). **Decided by the owner on 2026-11-08; normative.** Each was the recommended option; the column on the right is what was rejected.
 
-| # | Spec | Gap | Proposed reading (applied) | Alternative |
+| # | Spec | Gap | Decision (applied) | Rejected |
 |---|---|---|---|---|
 | V1 | §7.1 `chain`, §7.4 | Whether an entry may have no certificates, and what that means. The parser accepts a chain of length 0, and §7.1 only says the chain ends "below a trust-store root". | **An empty chain means the signer's own key is in the trust store.** It is direct trust, for that key and role. A non-empty chain is refused until OKC validation exists; it is never ignored. | Forbid empty chains, once a Kernel CA exists. Then every signed KRN would need a chain, and no key could be trusted directly. |
 | V2 | §7.5, §7.1 | How many entries a KRN block holds, and whether others are ignored. | **Exactly one entry, in the role `origin-kernel`.** Any other block is refused, so nothing in the block goes unchecked (ONBF-R6). The rule can be relaxed later; a looser one could not be tightened without breaking images. | Accept extra entries if one trusted entry verifies. |
@@ -84,15 +84,22 @@ Found while wiring signature verification into the boot loader (2026-11-08; `doc
 | V5 | ADR-0002 B8 | What developer mode does with a *signed* image. | **A signed image is verified in every mode.** Developer mode only allows an image with no signature at all: a signature that does not verify is a refusal, not a warning. | Skip verification in developer mode. |
 | V6 | §7.1, ONBF-R9 | `claimed_signing_time` is in the signed statement, and R9 forbids build timestamps in signed content. | **The caller supplies it** (`onbf-pack sign --signing-time`), and no tool reads the clock. It stays informational (§7.6). | Forbid the field in KRN statements. That changes S3. |
 
+## Decided for certificate chains (owner, 2026-11-08)
+
+These four were open gaps blocking chain validation. **Decided by the owner on 2026-11-08; normative when chains are built.** Chains are not implemented yet (V1 still refuses them).
+
+| # | Spec | Gap | Decision | Consequence |
+|---|---|---|---|---|
+| O2 | S4 key 10 | An OKC is signed with both algorithms, but S4 defined no ML-DSA context string for that signature (§7.1's `origin/onbf/1/<role>` is for signature-block entries). | **The context string is `origin/onbf/1/okc`.** One fixed string in the same family as the roles, so a certificate signature can never pass as a statement signature. | Issuance and validation use it. |
+| O3 | §7.6, §7.3 | `not_before`/`not_after` need trusted time, and the boot loader has only the firmware's RTC, which an attacker can set. | **Validity is checked against a signed time carried in signed release metadata**, as §7.6 asks for trusted time; never against the firmware clock. | Chain validation at boot waits for the SYS profile (§6.5), which carries that time. A chain cannot be checked before SYS exists. |
+| O4 | §7.1, S4 key 6 | How an `id_namespaces` entry matches a statement's `id` was undefined. | **Exact IDs only:** a certificate lists every ID it covers, and an `id` matches one entry by equality. | A publisher needs a new certificate for each new ID. §6.2's "falls inside a namespace" now means membership in that list. |
+| O5 | §7.4, §8.1 | What a trust-store *root* is. | **Bare public keys,** per role, compiled into the loader; a chain ends at one of them. | Root rotation (§7.4) can be layered on with signed metadata later. |
+
 ## Open gaps
 
 | # | Spec | Gap | Who needs it |
 |---|---|---|---|
 | O1 | S3, §5 | `id` is `text (NFC)`, but the signature-block parser has no Unicode normalization tables, and R4 avoided them for the manifest's text by restricting it to ASCII. Today the parser checks only that `id` is non-empty valid UTF-8, so a non-NFC `id` parses. The owner decides: restrict `id` to ASCII (as R4), or give the parser NFC tables. Found while the soak was being written (2026-11-08). | `onbf-format` signature-block parser; the Package Service's ID-namespace checks |
-| O2 | S4 key 10 | An OKC is signed with both algorithms, but S4 defines no ML-DSA context string for that signature (§7.1's `origin/onbf/1/<role>` is for signature-block entries). | OKC issuance and chain validation |
-| O3 | §7.6, §7.3 | `not_before`/`not_after` need trusted time, and the boot loader has only the firmware's RTC, which is not trusted. How does a chain's validity get checked at boot? | Chain validation in the loader |
-| O4 | §7.1, S4 key 6 | How an `id_namespaces` entry matches a statement's `id` (prefix, label boundary, wildcard) is undefined. | Chain validation; the Package Service |
-| O5 | §7.4, §8.1 | What a trust-store *root* is: a bare key, a self-signed OKC, or TUF-style root metadata (§7.4 mentions rotation by chained root metadata). | The release trust store; root rotation |
 
 ## Observed by the bit-flip sweep
 
