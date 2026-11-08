@@ -67,7 +67,8 @@
 //! - [`unwind`]: frame-pointer stack unwinding for panic diagnostics;
 //! - [`ustar`]: a read-only ustar (tar) archive reader for an initramfs/package payload;
 //! - [`utf16`]: UTF-16 ↔ scalar transcoding (surrogate pairs) for UEFI/CHAR16 interop;
-//! - [`vfs`]: an in-memory virtual filesystem (paths, directories, files).
+//! - [`vfs`]: an in-memory virtual filesystem (paths, directories, files);
+//! - [`virtqueue`]: the virtio split-virtqueue ring transport (descriptors, avail/used).
 //!
 //! The binary holds the entry point, x86 port I/O, the descriptor tables, exception and
 //! interrupt stubs, MSR access and fault probes (`src/cpu.rs`), the APIC timer bring-up
@@ -132,3 +133,4 @@ pub mod unwind;
 pub mod ustar;
 pub mod utf16;
 pub mod vfs;
+pub mod virtqueue;
