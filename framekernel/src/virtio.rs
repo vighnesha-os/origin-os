@@ -129,6 +129,84 @@ impl NetHeader {
     }
 }
 
+/// A virtio PCI capability `cfg_type` (virtio 1.1 §4.1.4).
+pub mod cfg {
+    pub const VNDR: u8 = 0x09; // PCI vendor-specific capability id
+    pub const COMMON: u8 = 1;
+    pub const NOTIFY: u8 = 2;
+    pub const ISR: u8 = 3;
+    pub const DEVICE: u8 = 4;
+}
+
+/// Where one virtio structure lives: a BAR index and a byte offset/length within it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CfgLocation {
+    pub bar: u8,
+    pub offset: u32,
+    pub length: u32,
+}
+
+/// The virtio modern capabilities a driver needs, discovered from PCI config space.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Caps {
+    pub common: Option<CfgLocation>,
+    pub notify: Option<CfgLocation>,
+    pub isr: Option<CfgLocation>,
+    pub device: Option<CfgLocation>,
+    /// The notify capability's `notify_off_multiplier`.
+    pub notify_off_multiplier: u32,
+}
+
+impl Caps {
+    /// Whether the mandatory structures for a modern driver were found.
+    pub fn is_modern(&self) -> bool {
+        self.common.is_some() && self.notify.is_some() && self.device.is_some()
+    }
+}
+
+/// Walks the PCI capability list and collects the virtio modern capability structures.
+/// `read` returns the little-endian dword at a byte offset in config space (offsets are
+/// dword-aligned here). Bounded by the capability count so a corrupt `next` cannot loop.
+pub fn find_caps(mut read: impl FnMut(u16) -> u32) -> Caps {
+    let mut caps = Caps::default();
+    // Capabilities exist only if the status register (offset 0x06) bit 4 is set.
+    if read(0x04) >> 16 & (1 << 4) == 0 {
+        return caps;
+    }
+    let mut ptr = (read(0x34) & 0xFF) as u16; // capabilities pointer
+    for _ in 0..48 {
+        if ptr < 0x40 || ptr & 0x3 != 0 {
+            break; // a valid capability lies past the header, dword-aligned
+        }
+        let d0 = read(ptr); // cap_vndr | cap_next<<8 | cap_len<<16 | cfg_type<<24
+        let vndr = (d0 & 0xFF) as u8;
+        let next = (d0 >> 8 & 0xFF) as u16;
+        if vndr == cfg::VNDR {
+            let bar = (read(ptr + 4) & 0xFF) as u8;
+            let location = CfgLocation {
+                bar,
+                offset: read(ptr + 8),
+                length: read(ptr + 12),
+            };
+            match (d0 >> 24 & 0xFF) as u8 {
+                cfg::COMMON => caps.common = Some(location),
+                cfg::NOTIFY => {
+                    caps.notify = Some(location);
+                    caps.notify_off_multiplier = read(ptr + 16);
+                }
+                cfg::ISR => caps.isr = Some(location),
+                cfg::DEVICE => caps.device = Some(location),
+                _ => {}
+            }
+        }
+        if next == 0 {
+            break;
+        }
+        ptr = next;
+    }
+    caps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +283,64 @@ mod tests {
         // The driver's bring-up progression ORs these in turn; they must not overlap.
         let all = status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK;
         assert_eq!(all.count_ones(), 4);
+    }
+
+    #[test]
+    fn find_caps_discovers_the_virtio_structures() {
+        // A 256-byte config space with a capability list of the four virtio caps.
+        let mut cfg = [0u8; 256];
+        let mut put = |at: usize, v: u32| cfg[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put(0x04, 0x0010_0000); // status (high word) with the capabilities bit (4) set
+        put(0x34, 0x40); // capabilities pointer
+        let cap = |vndr: u32, next: u32, len: u32, ty: u32| vndr | next << 8 | len << 16 | ty << 24;
+        // common @0x40 → BAR 4, offset 0
+        put(0x40, cap(cfg::VNDR.into(), 0x50, 16, cfg::COMMON.into()));
+        put(0x44, 4);
+        put(0x48, 0);
+        put(0x4C, 0x1000);
+        // notify @0x50 (20 bytes) → offset 0x3000, multiplier 4 at +16
+        put(0x50, cap(cfg::VNDR.into(), 0x64, 20, cfg::NOTIFY.into()));
+        put(0x54, 4);
+        put(0x58, 0x3000);
+        put(0x5C, 0x1000);
+        put(0x60, 4);
+        // isr @0x64 → offset 0x1000
+        put(0x64, cap(cfg::VNDR.into(), 0x74, 16, cfg::ISR.into()));
+        put(0x68, 4);
+        put(0x6C, 0x1000);
+        put(0x70, 0x1000);
+        // device @0x74 → offset 0x2000, end of list
+        put(0x74, cap(cfg::VNDR.into(), 0, 16, cfg::DEVICE.into()));
+        put(0x78, 4);
+        put(0x7C, 0x2000);
+        put(0x80, 0x1000);
+
+        let read = |off: u16| {
+            let o = off as usize;
+            u32::from_le_bytes([cfg[o], cfg[o + 1], cfg[o + 2], cfg[o + 3]])
+        };
+        let caps = find_caps(read);
+        assert!(caps.is_modern());
+        assert_eq!(
+            caps.common,
+            Some(CfgLocation {
+                bar: 4,
+                offset: 0,
+                length: 0x1000
+            })
+        );
+        assert_eq!(caps.notify.unwrap().offset, 0x3000);
+        assert_eq!(caps.notify_off_multiplier, 4);
+        assert_eq!(caps.isr.unwrap().offset, 0x1000);
+        assert_eq!(caps.device.unwrap().offset, 0x2000);
+
+        // With the capabilities bit clear, nothing is discovered.
+        let mut cfg2 = cfg;
+        cfg2[4..8].copy_from_slice(&0u32.to_le_bytes());
+        let read2 = |off: u16| {
+            let o = off as usize;
+            u32::from_le_bytes([cfg2[o], cfg2[o + 1], cfg2[o + 2], cfg2[o + 3]])
+        };
+        assert!(!find_caps(read2).is_modern());
     }
 }
