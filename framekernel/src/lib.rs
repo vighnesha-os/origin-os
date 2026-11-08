@@ -27,6 +27,7 @@
 //! - [`deflate`]: DEFLATE (RFC 1951) decompression with a decompression-bomb guard;
 //! - [`descriptors`]: GDT, TSS and IDT descriptor encodings;
 //! - [`dhcp`]: a DHCP client (message build/parse and the lease state machine);
+//! - [`dmar`]: the ACPI DMAR table (Intel VT-d units, device scopes, reserved memory);
 //! - [`dns`]: DNS message parsing with bounded name decompression;
 //! - [`editbuffer`]: a gap buffer for editable text (caret, insert/delete);
 //! - [`entropy`]: bounded-retry hardware entropy draw/fill over an abstract source;
@@ -71,7 +72,9 @@
 //! - [`utf16`]: UTF-16 ↔ scalar transcoding (surrogate pairs) for UEFI/CHAR16 interop;
 //! - [`vfs`]: an in-memory virtual filesystem (paths, directories, files);
 //! - [`virtio`]: virtio status/feature negotiation and the virtio-net config/header;
-//! - [`virtqueue`]: the virtio split-virtqueue ring transport (descriptors, avail/used).
+//! - [`virtqueue`]: the virtio split-virtqueue ring transport (descriptors, avail/used);
+//! - [`vtd`]: Intel VT-d register, table and descriptor encodings and a second-level
+//!   page-table walker (DMA and interrupt remapping).
 //!
 //! The binary holds the entry point, x86 port I/O, the descriptor tables, exception and
 //! interrupt stubs, MSR access and fault probes (`src/cpu.rs`), the APIC timer bring-up
@@ -96,6 +99,7 @@ pub mod clock;
 pub mod deflate;
 pub mod descriptors;
 pub mod dhcp;
+pub mod dmar;
 pub mod dns;
 pub mod editbuffer;
 pub mod entropy;
@@ -139,3 +143,4 @@ pub mod utf16;
 pub mod vfs;
 pub mod virtio;
 pub mod virtqueue;
+pub mod vtd;
