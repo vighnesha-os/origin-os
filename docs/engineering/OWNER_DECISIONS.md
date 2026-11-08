@@ -1,0 +1,74 @@
+# Open owner decisions
+
+| | |
+|---|---|
+| As of | 2026-11-08, commit `6a2b29c` on `claude/interesting-carson-ae7c83`. The M4 and signed-boot sessions are still running and may add to this list. |
+| Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
+| How to answer | Items 1–20 have a recommendation you can accept as a block: "accept 1–20", or "accept 1–20 except 9". Items 21–24 need you. |
+
+The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
+
+## OriginFS on-disk format (ADR-0006): blocks mounting any filesystem
+
+| # | Question | Recommendation | Why |
+|---|---|---|---|
+| 1 | A classic inode layout for v0, read-only? | **Accept, as a bring-up format only** | It gets real files mounted. §40's crash consistency and integrity may need a different layout, so v0 should carry no compatibility promise. |
+| 2 | 4 KiB blocks and a file limit of about 2 MiB? | **Accept for v0** | Blocks match the page cache. The limit suits the first programs; a double-indirect pointer can come when a real file needs it. |
+| 3 | Defer writes, journalling and crash consistency? | **Accept** | They need their own ADR (§41), which must be free to replace this layout. |
+| 4 | Reserve space now for per-block Merkle integrity? | **Later** | Space reserved for a design that doesn't exist yet is likely to be wrong, and v0 has nothing to stay compatible with. |
+
+## IOMMU (ADR-0007): built and boot-proven
+
+| # | Question | Recommendation | Why |
+|---|---|---|---|
+| 5 | Default-deny, one domain per device? | **Accept** | A device reaches only the pages its own driver mapped. |
+| 6 | DMA addresses from a 1–2 GiB window, never physical addresses? | **Accept** | A translation failure can't pass unnoticed, and it can change later without an ABI break. Addresses aren't reused yet, which must be fixed before any driver maps memory per request. |
+| 7 | Legacy translation mode now, scalable mode later? | **Accept, then verify** | It's the smallest correct design. Whether 2026+ platforms keep legacy mode is unconfirmed until the VT-d PDF is read (item 18). |
+| 8 | Refuse devices that need firmware-reserved memory (RMRR) until identity maps exist? | **Accept, with a deadline** | It fails closed. USB controllers and integrated graphics commonly need RMRRs, so identity maps must land before real hardware. |
+| 9 | With no IOMMU present, refuse bus mastering for external and hot-plugged devices? | **Yes** | §32 asks for external-device authorization. An IOMMU should also be part of the declared hardware scope (item 24). |
+| 10 | AMD-Vi: blocking device table entries, one interrupt table per device? | **Accept** | The same posture as VT-d. |
+| 11 | Allow two QEMU gaps in the AMD-Vi proofs (fault address 0, no record of a blocked interrupt)? | **Accept as QEMU limits** | Hardware qualification must check both. The address bug is fixed after QEMU 11.1, so that check can tighten on upgrade. |
+| 12 | Refuse devices that an IVMD names, as for RMRRs? | **Accept** | Same reasoning and deadline as item 8. |
+
+## CPU indexes (ADR-0008): built and boot-proven
+
+| # | Question | Recommendation | Why |
+|---|---|---|---|
+| 13 | Dense indexes in MADT order, with `CpuIndex` the only per-CPU array index? | **Accept** | The type makes mixing up an APIC ID and an index a compile error. |
+| 14 | Keep 64 static per-CPU slots for now? | **Keep for now** | Move to sizing at discovery with the scheduling work (TASKS item 4), before any machine with more than 64 logical CPUs enters the declared scope. |
+| 15 | Add `boot-x2apic` to `boot-matrix`? | **Yes** | About 40 s on a two-minute gate. Today's merges changed the code it guards. |
+| 16 | Park a silent AP with INIT and drill it on every boot? Per-AP trampoline data too? | **Accept parking; per-AP data later** | Parking closes the hazard it was built for. Per-AP data belongs with parallel start-up. |
+
+## Signature format (ONBF errata O1)
+
+| # | Question | Recommendation | Why |
+|---|---|---|---|
+| 17 | A signature statement's `id` must be NFC, but the parser has no Unicode tables. Restrict it to ASCII, or add tables? | **Restrict to ASCII** | The same call as errata R4. This parser runs before any signature is checked, so it should stay small. Human-readable names belong in localized metadata. |
+
+## Downloads
+
+| # | Question | Recommendation | Why |
+|---|---|---|---|
+| 18 | Intel VT-d Rev 5.20 PDF (D51397-019, intel.com, about 10 MB)? | **Approve** | The VT-d code has not been checked against this revision's text, and must be before hardware. |
+| 19 | NIST ACVP vectors (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519)? | **Approve** | §59 requires external known-answer validation. Host-only test data. Each file's source and size will be stated before fetching. |
+| 20 | The `loom` crate as a host-only dev-dependency? | **Approve** | §73 names Loom, and it never reaches the shipping runtime (§5). |
+
+## Only you can do these
+
+| # | Question | Recommendation | Why |
+|---|---|---|---|
+| 21 | The project licence? | **Apache-2.0 if this is to be open. If closed, make the repository private now.** | The GitHub repository is public with no LICENSE file: anyone can read the code, but nobody else has permission to reuse it. Apache-2.0 includes a patent grant. Much of this code is AI-written, and how copyright applies to that is unsettled, so take legal advice if it matters commercially. |
+| 22 | Push this branch and open a PR against PR #1's branch? | **Yes, after item 21** | 25 commits exist only on this Mac. Because the repository is public, pushing publishes them. |
+| 23 | Compare two AMD manuals with AMD's own copies? | **Before hardware qualification** | Both were read from the kib.kiev.ua mirror because AMD's site refuses automated reads. Download each from AMD and run `shasum -a 256` on it. IOMMU spec 48882 Rev 3.11: `f7c375a15db5ed63de760356867211063d164a2ed59f2d38613daec95894ce22`. APM Vol. 3, 24594 Rev 3.39: `b598514b19f204d973040d9867a7ffc48c949009a8b3dc86b20c9188e721ee45`. |
+| 24 | Which 2026+ Intel and AMD machines are the declared targets, and what physical x86 test hardware? | **One current Intel and one current AMD machine** | Nothing can be called qualified without them (§74, §76). CET shadow stacks, hybrid cores and real IOMMU behaviour cannot be shown under QEMU, and this Mac can't run x86 natively. Choosing models needs current research (§16). |
+
+## What accepting 1–20 changes
+
+- ADR-0006, ADR-0007 and ADR-0008 become Accepted, with these answers.
+- The signature parser restricts a statement's `id` to ASCII, and errata O1 is closed.
+- `boot-x2apic` joins `boot-matrix`.
+- The approved files are downloaded, each file's source and size stated first.
+
+Nothing is pushed.
+
+**Later, not now:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.
