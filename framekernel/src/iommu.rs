@@ -1,0 +1,1115 @@
+//! Intel VT-d DMA and interrupt remapping (CLAUDE.md §32 Intel VT-d and interrupt
+//! remapping, §58 DMA protection; ADR-0007, Proposed; research ledger
+//! `docs/research/2026-11-08-vt-d-iommu.md`).
+//!
+//! At boot, after PCIe enumeration and before any driver binds:
+//! 1. the ACPI DMAR names the remapping units (`framekernel::dmar`, checked whole);
+//! 2. each unit's registers are mapped uncached and its capabilities read and checked;
+//! 3. queued invalidation is turned on; an empty root table is set and the context and
+//!    IOTLB caches are invalidated; where the unit and the platform support interrupt
+//!    remapping, an interrupt remapping table is set (32-bit x2APIC destinations when the
+//!    unit has extended interrupt mode), its cache invalidated and remapping turned on, with
+//!    compatibility-format interrupts left blocked;
+//! 4. translation is turned on. No context entry is present yet, so every device's DMA
+//!    faults until its driver attaches it (ADR-0007 D2).
+//!
+//! A driver then attaches its device ([`attach`]): the device gets a domain of its own — a
+//! domain ID, second-level tables and an IOVA window — and a context entry. Each DMA page the
+//! driver allocates is mapped there ([`map`]) at an IOVA from [1 GiB, 2 GiB), never at its
+//! physical address. Unmapping ([`unmap`]) invalidates the IOTLB — page-selective, draining
+//! reads and writes where the unit can — and waits for it before returning. MSI-X messages
+//! are routed through IRTEs ([`msi_message`]): the device's table entry carries only a
+//! remappable-format handle; the vector, the 32-bit x2APIC destination and the check of the
+//! device's source ID live in the IRTE.
+//!
+//! Faults are read from the fault-recording registers ([`take_faults`]); fault events stay
+//! masked (ADR-0007 D9). Every remapping structure is a zeroed kernel page kept for ever, and
+//! when the unit's walks do not snoop the caches (ECAP.C clear) every line written is flushed
+//! before the hardware can need it (D7). The `unsafe` here is volatile MMIO to the register
+//! set, volatile access to those pages, and CLFLUSH; each has a SAFETY note.
+
+use alloc::alloc::{Layout, alloc_zeroed};
+use alloc::vec::Vec;
+use core::arch::asm;
+use core::fmt::Write;
+use core::ptr;
+use core::sync::atomic::{Ordering, fence};
+
+use framekernel::bitmap::Bitmap;
+use framekernel::dmar::{self, BridgeBuses, Dmar, Requester};
+use framekernel::pci::{self, Address};
+use framekernel::vtd::{
+    self, Access, Capability, ContextEntry, Descriptor, Drain, ExtCapability, FaultRecord,
+    IovaWindow, Irte, MsiMessage, SourceCheck, TableMemory, fsts, gcmd, reg,
+};
+use origin_sync::SpinLock;
+
+use crate::console::Console;
+
+/// A 4 KiB page.
+const PAGE: u64 = vtd::PAGE;
+/// Entries in each unit's interrupt remapping table (one page of 16-byte entries).
+const IRT_ENTRIES: u32 = 256;
+/// How long a register handshake or an invalidation may take.
+const TIMEOUT_NS: u64 = 100_000_000;
+/// Units the kernel drives.
+const MAX_UNITS: usize = 8;
+
+/// A zeroed 4 KiB kernel page, kept for ever (the remapping hardware may read it at any
+/// time): its direct-map address and its physical address.
+#[derive(Clone, Copy, Debug)]
+struct Page {
+    virt: u64,
+    phys: u64,
+}
+
+impl Page {
+    /// A new page; flushed from the caches when the unit's walks are not coherent, so the
+    /// hardware reads zeros rather than whatever the memory held before.
+    fn new(coherent: bool) -> Option<Self> {
+        let layout = Layout::from_size_align(PAGE as usize, PAGE as usize).ok()?;
+        // SAFETY: `layout` has a non-zero size. The page is never freed: the remapping
+        // hardware may read it at any time.
+        let p = unsafe { alloc_zeroed(layout) };
+        if p.is_null() {
+            return None;
+        }
+        let virt = p.expose_provenance() as u64;
+        if !coherent {
+            flush(virt, PAGE);
+        }
+        Some(Self {
+            virt,
+            phys: crate::phys::to_phys(virt),
+        })
+    }
+
+    fn read64(&self, offset: u64) -> u64 {
+        if offset + 8 > PAGE {
+            return 0;
+        }
+        let p = ptr::with_exposed_provenance::<u64>((self.virt + offset) as usize);
+        // SAFETY: inside this live, never-freed page, 8-byte aligned (callers use multiples
+        // of 8). The hardware may read it concurrently, so the access is volatile and no
+        // reference is formed.
+        unsafe { p.read_volatile() }
+    }
+
+    fn write64(&self, offset: u64, value: u64) {
+        if offset + 8 > PAGE {
+            return;
+        }
+        let p = ptr::with_exposed_provenance_mut::<u64>((self.virt + offset) as usize);
+        // SAFETY: as for `read64`. The page holds remapping structures only this module
+        // writes.
+        unsafe { p.write_volatile(value) };
+    }
+
+    fn read32(&self, offset: u64) -> u32 {
+        if offset + 4 > PAGE {
+            return 0;
+        }
+        let p = ptr::with_exposed_provenance::<u32>((self.virt + offset) as usize);
+        // SAFETY: as for `read64`, 4-byte aligned. The unit writes a wait descriptor's
+        // status here.
+        unsafe { p.read_volatile() }
+    }
+
+    fn write32(&self, offset: u64, value: u32) {
+        if offset + 4 > PAGE {
+            return;
+        }
+        let p = ptr::with_exposed_provenance_mut::<u32>((self.virt + offset) as usize);
+        // SAFETY: as for `read32`.
+        unsafe { p.write_volatile(value) };
+    }
+}
+
+/// Writes back and invalidates the cache lines of `[virt, virt + len)`, then fences, so
+/// remapping hardware that does not snoop the caches reads what the processor wrote.
+/// `virt` must be a live kernel page from [`Page::new`].
+fn flush(virt: u64, len: u64) {
+    let mut line = virt & !63;
+    while line < virt + len {
+        // SAFETY: `line` lies in a live, mapped kernel page (the caller's contract), and
+        // CLFLUSH only writes the line back and drops it from the caches.
+        unsafe { asm!("clflush [{}]", in(reg) line, options(nostack, preserves_flags)) };
+        line += 64;
+    }
+    // MFENCE orders the flushes before every later store (the register write that lets
+    // the hardware use the structure).
+    fence(Ordering::SeqCst);
+}
+
+/// A unit's register set, mapped uncached.
+#[derive(Clone, Copy, Debug)]
+struct Regs {
+    virt: u64,
+    size: u64,
+}
+
+impl Regs {
+    fn read32(&self, offset: u64) -> u32 {
+        if offset + 4 > self.size {
+            return 0;
+        }
+        let p = ptr::with_exposed_provenance::<u32>((self.virt + offset) as usize);
+        // SAFETY: the register set is mapped uncached at `virt` for `size` bytes (checked
+        // above); `offset` is a 4-byte aligned register. A register read has no effect on
+        // memory.
+        unsafe { p.read_volatile() }
+    }
+
+    fn write32(&self, offset: u64, value: u32) {
+        if offset + 4 > self.size {
+            return;
+        }
+        let p = ptr::with_exposed_provenance_mut::<u32>((self.virt + offset) as usize);
+        // SAFETY: as for `read32`. The writes are this unit's command, status and
+        // fault-control registers.
+        unsafe { p.write_volatile(value) };
+    }
+
+    fn read64(&self, offset: u64) -> u64 {
+        if offset + 8 > self.size {
+            return 0;
+        }
+        let p = ptr::with_exposed_provenance::<u64>((self.virt + offset) as usize);
+        // SAFETY: as for `read32`; the 64-bit registers are 8-byte aligned and read whole.
+        unsafe { p.read_volatile() }
+    }
+
+    fn write64(&self, offset: u64, value: u64) {
+        if offset + 8 > self.size {
+            return;
+        }
+        let p = ptr::with_exposed_provenance_mut::<u64>((self.virt + offset) as usize);
+        // SAFETY: as for `read64`. The values are addresses of this module's own pages, the
+        // queue tail, and write-1-to-clear fault bits.
+        unsafe { p.write_volatile(value) };
+    }
+}
+
+/// A unit's interrupt remapping table.
+struct Irt {
+    table: Page,
+    /// Entries handed out (an entry can be in use while not present: see
+    /// [`reserve_blocked_interrupt`]).
+    used: Bitmap,
+    /// EIME: destinations are 32-bit x2APIC IDs.
+    x2apic: bool,
+}
+
+/// One running remapping unit.
+struct Unit {
+    /// Physical base of its registers (its identity in the DMAR).
+    base: u64,
+    regs: Regs,
+    cap: Capability,
+    ecap: ExtCapability,
+    /// Second-level table depth for its domains.
+    levels: u8,
+    root: Page,
+    /// The context table of each bus, made on demand.
+    contexts: Vec<Option<Page>>,
+    /// The invalidation queue and the next free descriptor.
+    queue: Page,
+    tail: usize,
+    /// Where wait descriptors write their status, and the last status used.
+    status: Page,
+    sequence: u32,
+    irt: Option<Irt>,
+    next_domain: u32,
+}
+
+/// One device's domain.
+#[derive(Clone, Copy, Debug)]
+struct DomainState {
+    unit: usize,
+    id: u16,
+    requester: Requester,
+    /// Physical address of its top-level second-level table.
+    top: u64,
+    window: IovaWindow,
+    /// Pages mapped now, and pages ever mapped.
+    mapped: u64,
+    mapped_ever: u64,
+    /// Table pages (the top one included).
+    tables: u64,
+}
+
+/// A device's DMA domain, as drivers hold it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Domain(usize);
+
+struct Iommu {
+    dmar: Dmar<'static>,
+    units: Vec<Unit>,
+    domains: Vec<DomainState>,
+    /// Every unit translates.
+    translating: bool,
+    /// Every unit remaps interrupts.
+    remapping: bool,
+}
+
+static IOMMU: SpinLock<Option<Iommu>> = SpinLock::new(None);
+
+/// Bridge bus numbers from configuration space, for the DMAR's device-scope paths.
+struct Config;
+
+impl BridgeBuses for Config {
+    fn buses(&mut self, b: Requester) -> Option<(u8, u8)> {
+        if b.segment != 0 {
+            return None;
+        }
+        let at = Address {
+            bus: b.bus,
+            device: b.device,
+            function: b.function,
+        };
+        let id = crate::pcie::read_config32(at, pci::register::ID)?;
+        let header = crate::pcie::read_config32(at, pci::register::HEADER)?;
+        if id & 0xFFFF == 0xFFFF || (header >> 16) & 0x7F != 1 {
+            return None;
+        }
+        // Type 1 header: primary, secondary and subordinate bus numbers at 18h.
+        let buses = crate::pcie::read_config32(at, 0x18)?;
+        Some((((buses >> 8) & 0xFF) as u8, ((buses >> 16) & 0xFF) as u8))
+    }
+}
+
+fn requester(at: Address) -> Requester {
+    Requester {
+        segment: 0,
+        bus: at.bus,
+        device: at.device,
+        function: at.function,
+    }
+}
+
+/// Spins until `done()` holds or [`TIMEOUT_NS`] passes; returns whether it held.
+fn poll(mut done: impl FnMut() -> bool) -> bool {
+    let deadline = crate::time::monotonic_nanos() + TIMEOUT_NS;
+    loop {
+        if done() {
+            return true;
+        }
+        if crate::time::monotonic_nanos() > deadline {
+            return done();
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// The second-level tables of one unit's domains, through the direct map.
+struct Tables {
+    coherent: bool,
+    made: u64,
+}
+
+impl TableMemory for Tables {
+    fn read(&mut self, table: u64, index: usize) -> u64 {
+        if index >= vtd::ENTRIES {
+            return 0;
+        }
+        let p = ptr::with_exposed_provenance::<u64>(
+            (crate::phys::to_virt(table) + 8 * index as u64) as usize,
+        );
+        // SAFETY: `table` is a table page this module made (`new_table`: a live kernel
+        // page, reached through the direct map), and `index` is below 512, so the entry
+        // lies inside it, 8-byte aligned. The hardware may read it concurrently: volatile.
+        unsafe { p.read_volatile() }
+    }
+
+    fn write(&mut self, table: u64, index: usize, value: u64) {
+        if index >= vtd::ENTRIES {
+            return;
+        }
+        let virt = crate::phys::to_virt(table) + 8 * index as u64;
+        let p = ptr::with_exposed_provenance_mut::<u64>(virt as usize);
+        // SAFETY: as for `read`; the entry belongs to this module's tables.
+        unsafe { p.write_volatile(value) };
+        if !self.coherent {
+            flush(virt, 8);
+        }
+    }
+
+    fn new_table(&mut self) -> Option<u64> {
+        let page = Page::new(self.coherent)?;
+        self.made += 1;
+        Some(page.phys)
+    }
+}
+
+impl Unit {
+    /// Issues a global command and waits for its status bit to read `want`.
+    fn command(&self, set: u32, clear: u32, status: u32, want: bool) -> Result<(), &'static str> {
+        let gsts = self.regs.read32(reg::GSTS);
+        self.regs.write32(reg::GCMD, vtd::gcmd(gsts, set, clear));
+        if poll(|| (self.regs.read32(reg::GSTS) & status != 0) == want) {
+            Ok(())
+        } else {
+            Err("a global command was not acknowledged")
+        }
+    }
+
+    /// After structures changed: flushes the write buffer when the unit needs it (RWBF).
+    fn write_buffer_flush(&self) -> Result<(), &'static str> {
+        if self.cap.write_buffer_flush {
+            self.command(gcmd::WBF, 0, gcmd::WBF, false)?;
+        }
+        Ok(())
+    }
+
+    /// Queues `descriptors` and a wait descriptor, then waits (bounded) until the unit has
+    /// written the wait's status: every descriptor before it has completed.
+    fn invalidate(&mut self, descriptors: &[Descriptor]) -> Result<(), &'static str> {
+        self.sequence = self.sequence.wrapping_add(1).max(1);
+        let sequence = self.sequence;
+        self.status.write32(0, 0);
+        let wait = Descriptor::Wait {
+            address: self.status.phys,
+            status: sequence,
+            fence: true,
+        };
+        let entries = vtd::queue_entries(0);
+        for d in descriptors.iter().chain(core::iter::once(&wait)) {
+            let [lo, hi] = d.encode().ok_or("an invalidation does not encode")?;
+            let at = 16 * self.tail as u64;
+            self.queue.write64(at, lo);
+            self.queue.write64(at + 8, hi);
+            if !self.ecap.coherent {
+                flush(self.queue.virt + at, 16);
+            }
+            self.tail = (self.tail + 1) % entries;
+        }
+        fence(Ordering::SeqCst);
+        self.regs.write64(reg::IQT, vtd::queue_offset(self.tail));
+        let mut error = false;
+        let done = poll(|| {
+            error = self.regs.read32(reg::FSTS) & fsts::IQE != 0;
+            error || self.status.read32(0) == sequence
+        });
+        if error {
+            Err("the invalidation queue reported an error")
+        } else if !done {
+            Err("an invalidation did not complete")
+        } else {
+            Ok(())
+        }
+    }
+
+    /// What an IOTLB invalidation may drain on this unit.
+    fn drain(&self) -> Drain {
+        Drain {
+            reads: self.cap.drain_reads,
+            writes: self.cap.drain_writes,
+        }
+    }
+
+    /// Reads and clears every recorded fault, and the overflow bit; returns the faults and
+    /// whether any were lost.
+    fn take_faults(&mut self) -> (Vec<FaultRecord>, bool) {
+        let mut out = Vec::new();
+        for i in 0..u64::from(self.cap.fault_records) {
+            let at = self.cap.fault_offset + 16 * i;
+            let (lo, hi) = (self.regs.read64(at), self.regs.read64(at + 8));
+            if let Some(f) = vtd::fault_record(lo, hi) {
+                out.push(f);
+                self.regs.write64(at + 8, vtd::FRCD_FAULT);
+            }
+        }
+        let status = self.regs.read32(reg::FSTS);
+        let overflow = status & fsts::PFO != 0;
+        if overflow {
+            self.regs.write32(reg::FSTS, fsts::PFO);
+        }
+        (out, overflow)
+    }
+}
+
+/// What [`init`] found and did, for the report.
+struct Brought {
+    unit: Unit,
+    version: (u8, u8),
+    cap_raw: u64,
+    ecap_raw: u64,
+    stale: usize,
+    gsts: u32,
+}
+
+/// Brings up the unit `u`: checks its registers, turns on queued invalidation, sets an empty
+/// root table, sets up interrupt remapping when `remap`, and turns on translation.
+fn bring_up(u: &dmar::Unit<'static>, remap: bool) -> Result<Brought, &'static str> {
+    let size = u64::from(u.register_pages) * PAGE;
+    let virt =
+        crate::vm::map_mmio(u.register_base, size).map_err(|_| "cannot map its registers")?;
+    let regs = Regs { virt, size };
+    let version = vtd::version(regs.read32(reg::VER));
+    let cap_raw = regs.read64(reg::CAP);
+    let ecap_raw = regs.read64(reg::ECAP);
+    let cap = Capability::decode(cap_raw);
+    let ecap = ExtCapability::decode(ecap_raw);
+    if cap.fault_offset + 16 * u64::from(cap.fault_records) > size
+        || ecap.iotlb_offset + 16 > size
+        || cap.fault_offset < 0x100
+    {
+        return Err("its fault-recording or IOTLB registers lie outside its register set");
+    }
+    let levels = cap
+        .table_levels()
+        .ok_or("it supports neither 3- nor 4-level second-level tables")?;
+    if cap.domain_bits == 0 {
+        return Err("its domain-ID width is reserved");
+    }
+    if !ecap.queued_invalidation {
+        return Err(
+            "it has no queued invalidation (register-based invalidation is not implemented)",
+        );
+    }
+    let before = regs.read32(reg::GSTS);
+    if before & (gcmd::TE | gcmd::QIE | gcmd::IRE) != 0 {
+        return Err("the firmware left it enabled (taking a unit over is not implemented)");
+    }
+    let coherent = ecap.coherent;
+    let page = || Page::new(coherent).ok_or("no memory for its structures");
+    let mut unit = Unit {
+        base: u.register_base,
+        regs,
+        cap,
+        ecap,
+        levels,
+        root: page()?,
+        contexts: alloc::vec![None; 256],
+        queue: page()?,
+        tail: 0,
+        status: page()?,
+        sequence: 0,
+        irt: None,
+        next_domain: 1,
+    };
+    // Stale faults from before the kernel (the firmware's time) are dropped.
+    let (stale, _) = unit.take_faults();
+    unit.regs.write32(reg::FSTS, fsts::CLEAR);
+    // Queued invalidation: the tail at 0, one page of 128-bit descriptors.
+    unit.regs.write64(reg::IQT, 0);
+    unit.regs.write64(
+        reg::IQA,
+        vtd::iqa(unit.queue.phys, 0).ok_or("the invalidation queue is misplaced")?,
+    );
+    unit.command(gcmd::QIE, 0, gcmd::QIE, true)?;
+    // The root table, legacy mode (RTADDR.TTM 00), all entries not present; then both
+    // translation caches invalidated, as the specification asks after a new root.
+    unit.regs.write64(reg::RTADDR, unit.root.phys);
+    unit.command(gcmd::SRTP, 0, gcmd::SRTP, true)?;
+    let drain = unit.drain();
+    unit.invalidate(&[Descriptor::ContextGlobal, Descriptor::IotlbGlobal { drain }])?;
+    // Interrupt remapping: the table, its cache invalidated, then remapping on. CFI stays
+    // clear: compatibility-format interrupts are blocked.
+    if remap && ecap.interrupt_remapping {
+        let x2apic = ecap.extended_interrupt_mode;
+        let table = page()?;
+        unit.regs.write64(
+            reg::IRTA,
+            vtd::irta(table.phys, IRT_ENTRIES, x2apic).ok_or("the interrupt table is misplaced")?,
+        );
+        unit.command(gcmd::SIRTP, 0, gcmd::SIRTP, true)?;
+        unit.invalidate(&[Descriptor::IecGlobal])?;
+        // One field per GCMD write (chapter 10): compatibility format off first, if the
+        // firmware had allowed it, then remapping on.
+        if unit.regs.read32(reg::GSTS) & gcmd::CFI != 0 {
+            unit.command(0, gcmd::CFI, gcmd::CFI, false)?;
+        }
+        unit.command(gcmd::IRE, 0, gcmd::IRE, true)?;
+        unit.irt = Some(Irt {
+            table,
+            used: Bitmap::new(IRT_ENTRIES as usize),
+            x2apic,
+        });
+    }
+    // Translation on: from here, a device without a context entry cannot reach memory.
+    unit.write_buffer_flush()?;
+    unit.command(gcmd::TE, 0, gcmd::TE, true)?;
+    let gsts = unit.regs.read32(reg::GSTS);
+    Ok(Brought {
+        unit,
+        version,
+        cap_raw,
+        ecap_raw,
+        stale: stale.len(),
+        gsts,
+    })
+}
+
+/// Finds the remapping units through the ACPI DMAR and brings each up (translation and,
+/// where supported, interrupt remapping on). Returns `false` only for a failure; a platform
+/// without a DMAR is reported and left untranslated.
+pub(crate) fn init(com1: &mut Console, rsdp: u64) -> bool {
+    let table = match crate::firmware::acpi_table(rsdp, b"DMAR") {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: IOMMU: no DMAR ({e}): device DMA is not confined and interrupts are not remapped"
+            );
+            return true;
+        }
+    };
+    let dmar = match dmar::parse(table) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: IOMMU: the DMAR is invalid ({e:?}): IOMMU failed"
+            );
+            return false;
+        }
+    };
+    let units: Vec<_> = dmar.units().collect();
+    let _ = writeln!(
+        com1,
+        "origin-kernel: IOMMU: DMAR: host address width {} bits, interrupt remapping {}, x2APIC opt-out {}, DMA protection opt-in {}; {} remapping unit(s), {} reserved memory region(s)",
+        dmar.host_address_width,
+        dmar.interrupt_remapping(),
+        dmar.x2apic_opt_out(),
+        dmar.dma_control_opt_in(),
+        units.len(),
+        dmar.reserved_memory().count()
+    );
+    if units.is_empty() || units.len() > MAX_UNITS {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: {} remapping units (1-{MAX_UNITS} supported): IOMMU failed",
+            units.len()
+        );
+        return false;
+    }
+    for r in dmar.reserved_memory() {
+        // Identity-mapping a reserved region into its devices' domains is not implemented
+        // yet (ADR-0007): such a device is refused at `attach`, so its DMA stays blocked
+        // rather than reaching memory unchecked. QEMU's q35 reports none.
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: reserved memory {:#x}-{:#x} for {} device scope(s): not identity-mapped yet, so those devices cannot be attached",
+            r.base,
+            r.limit,
+            r.scopes().count()
+        );
+    }
+    let mut running = Vec::with_capacity(units.len());
+    for (i, u) in units.iter().enumerate() {
+        let pci = u
+            .scopes()
+            .filter(|s| s.kind == dmar::ScopeKind::Endpoint || s.kind == dmar::ScopeKind::Bridge)
+            .count();
+        let ioapics: Vec<_> = u
+            .scopes()
+            .filter(|s| s.kind == dmar::ScopeKind::IoApic)
+            .filter_map(|s| {
+                s.resolve(u.segment, &mut Config)
+                    .map(|r| (s.enumeration_id, r.source_id()))
+            })
+            .collect();
+        let _ = write!(
+            com1,
+            "origin-kernel: IOMMU: unit {i} at {:#x} (segment {}, {} KiB of registers): {}{} PCI scope(s)",
+            u.register_base,
+            u.segment,
+            u.register_pages * 4,
+            if u.include_pci_all {
+                "every PCI device not listed elsewhere, "
+            } else {
+                ""
+            },
+            pci
+        );
+        for (id, sid) in &ioapics {
+            let _ = write!(com1, ", I/O APIC {id} (source ID {sid:#06x})");
+        }
+        let _ = writeln!(com1);
+        match bring_up(u, dmar.interrupt_remapping()) {
+            Ok(b) => {
+                let c = b.unit.cap;
+                let e = b.unit.ecap;
+                let _ = writeln!(
+                    com1,
+                    "origin-kernel: IOMMU: unit {i}: VT-d {}.{}; CAP {:#x}: {}-bit domain IDs, {}-level tables ({}-bit), {} fault record(s) at {:#x}, page-selective invalidation {}, drain reads/writes {}/{}, caching mode {}, write-buffer flush {}; ECAP {:#x}: queued invalidation {}, interrupt remapping {}, extended interrupt mode {}, coherent walks {}",
+                    b.version.0,
+                    b.version.1,
+                    b.cap_raw,
+                    c.domain_bits,
+                    b.unit.levels,
+                    12 + 9 * u32::from(b.unit.levels),
+                    c.fault_records,
+                    c.fault_offset,
+                    c.page_invalidation,
+                    c.drain_reads,
+                    c.drain_writes,
+                    c.caching_mode,
+                    c.write_buffer_flush,
+                    b.ecap_raw,
+                    e.queued_invalidation,
+                    e.interrupt_remapping,
+                    e.extended_interrupt_mode,
+                    e.coherent
+                );
+                let remapping = b.unit.irt.as_ref().map(|t| t.x2apic);
+                let _ = writeln!(
+                    com1,
+                    "origin-kernel: IOMMU: unit {i}: queued invalidation on (256 descriptors); empty root table at {:#x}, context and IOTLB caches invalidated; {}; translation on (GSTS {:#x}){}: every device's DMA faults until its driver attaches it; {} stale fault(s) cleared",
+                    b.unit.root.phys,
+                    match remapping {
+                        Some(true) =>
+                            "interrupt remapping on (256 entries, 32-bit x2APIC destinations, compatibility format blocked)",
+                        Some(false) =>
+                            "interrupt remapping on (256 entries, 8-bit xAPIC destinations, compatibility format blocked)",
+                        None => "interrupt remapping off",
+                    },
+                    b.gsts,
+                    if b.gsts & gcmd::TE != 0 {
+                        ""
+                    } else {
+                        ": IOMMU failed"
+                    },
+                    b.stale
+                );
+                running.push(b.unit);
+            }
+            Err(why) => {
+                // The units already running would block every driver's DMA with nobody to
+                // attach devices to them: turn them off again (one field per write).
+                for u in &running {
+                    let _ = u.command(0, gcmd::TE, gcmd::TE, false);
+                    let _ = u.command(0, gcmd::IRE, gcmd::IRE, false);
+                }
+                let _ = writeln!(com1, "origin-kernel: IOMMU: unit {i}: {why}: IOMMU failed");
+                return false;
+            }
+        }
+    }
+    let translating = running
+        .iter()
+        .all(|u| u.regs.read32(reg::GSTS) & gcmd::TE != 0);
+    let remapping = running.iter().all(|u| u.irt.is_some());
+    crate::cpu::without_interrupts(|| {
+        *IOMMU.lock() = Some(Iommu {
+            dmar,
+            units: running,
+            domains: Vec::new(),
+            translating,
+            remapping,
+        });
+    });
+    translating
+}
+
+/// Whether DMA remapping is on (drivers must then attach their devices).
+pub(crate) fn translating() -> bool {
+    crate::cpu::without_interrupts(|| IOMMU.lock().as_ref().is_some_and(|s| s.translating))
+}
+
+impl Iommu {
+    /// The running unit that translates `r`.
+    fn unit_of(&self, r: Requester) -> Result<usize, &'static str> {
+        let base = self
+            .dmar
+            .unit_for(r, &mut Config)
+            .ok_or("no remapping unit translates this device")?
+            .register_base;
+        self.units
+            .iter()
+            .position(|u| u.base == base)
+            .ok_or("its remapping unit is not running")
+    }
+
+    fn attach(&mut self, r: Requester) -> Result<Domain, &'static str> {
+        if let Some(i) = self.domains.iter().position(|d| d.requester == r) {
+            return Ok(Domain(i));
+        }
+        if self
+            .dmar
+            .reserved_memory()
+            .any(|m| m.segment == r.segment && m.covers(r, &mut Config))
+        {
+            return Err("it needs reserved memory identity-mapped, which is not implemented");
+        }
+        let ui = self.unit_of(r)?;
+        let unit = self.units.get_mut(ui).ok_or("no unit")?;
+        let coherent = unit.ecap.coherent;
+        if unit.next_domain >= 1 << unit.cap.domain_bits {
+            return Err("its unit has no free domain ID");
+        }
+        let id = unit.next_domain as u16;
+        let top = Page::new(coherent).ok_or("no memory for a page table")?;
+        let bus = usize::from(r.bus);
+        let context = match unit.contexts.get(bus).copied().flatten() {
+            Some(c) => c,
+            None => {
+                let c = Page::new(coherent).ok_or("no memory for a context table")?;
+                let [lo, hi] = vtd::root_entry(c.phys).ok_or("a context table is misplaced")?;
+                let at = 16 * bus as u64;
+                unit.root.write64(at + 8, hi);
+                fence(Ordering::SeqCst);
+                unit.root.write64(at, lo);
+                if !coherent {
+                    flush(unit.root.virt + at, 16);
+                }
+                if let Some(slot) = unit.contexts.get_mut(bus) {
+                    *slot = Some(c);
+                }
+                c
+            }
+        };
+        let [lo, hi] = ContextEntry {
+            domain: id,
+            page_table: top.phys,
+            levels: unit.levels,
+            fault_processing_disable: false,
+        }
+        .encode()
+        .ok_or("a context entry does not encode")?;
+        let devfn = u64::from(r.device & 0x1F) << 3 | u64::from(r.function & 7);
+        // The high half first, so the entry turns present (low bit 0) only when complete.
+        context.write64(16 * devfn + 8, hi);
+        fence(Ordering::SeqCst);
+        context.write64(16 * devfn, lo);
+        if !coherent {
+            flush(context.virt + 16 * devfn, 16);
+        }
+        if unit.cap.caching_mode {
+            // Caching mode may have cached the entry while it was not present, tagged with
+            // domain 0 (VT-d chapter 6).
+            let drain = unit.drain();
+            unit.invalidate(&[
+                Descriptor::ContextDevice {
+                    domain: 0,
+                    source_id: r.source_id(),
+                    function_mask: 0,
+                },
+                Descriptor::IotlbDomain { domain: id, drain },
+            ])?;
+        } else {
+            unit.write_buffer_flush()?;
+        }
+        unit.next_domain += 1;
+        self.domains.push(DomainState {
+            unit: ui,
+            id,
+            requester: r,
+            top: top.phys,
+            window: IovaWindow::new(vtd::IOVA_BASE, vtd::IOVA_END),
+            mapped: 0,
+            mapped_ever: 0,
+            tables: 1,
+        });
+        Ok(Domain(self.domains.len() - 1))
+    }
+
+    fn map(&mut self, d: Domain, phys: u64) -> Result<u64, &'static str> {
+        let dom = self.domains.get_mut(d.0).ok_or("no such domain")?;
+        let unit = self.units.get_mut(dom.unit).ok_or("no unit")?;
+        let iova = dom
+            .window
+            .alloc(1)
+            .ok_or("the domain's IOVA window is full")?;
+        let mut tables = Tables {
+            coherent: unit.ecap.coherent,
+            made: 0,
+        };
+        vtd::map(
+            &mut tables,
+            dom.top,
+            unit.levels,
+            iova,
+            phys,
+            Access::READ_WRITE,
+        )
+        .map_err(|_| "the page could not be mapped")?;
+        dom.tables += tables.made;
+        dom.mapped += 1;
+        dom.mapped_ever += 1;
+        if unit.cap.caching_mode {
+            unit.invalidate(&[Descriptor::IotlbPages {
+                domain: dom.id,
+                address: iova,
+                order: 0,
+                leaf_only: false,
+                drain: Drain::default(),
+            }])?;
+        } else {
+            unit.write_buffer_flush()?;
+        }
+        Ok(iova)
+    }
+
+    fn unmap(&mut self, d: Domain, iova: u64) -> Result<u64, &'static str> {
+        let dom = self.domains.get_mut(d.0).ok_or("no such domain")?;
+        let unit = self.units.get_mut(dom.unit).ok_or("no unit")?;
+        let mut tables = Tables {
+            coherent: unit.ecap.coherent,
+            made: 0,
+        };
+        let phys = vtd::unmap(&mut tables, dom.top, unit.levels, iova)
+            .map_err(|_| "the page was not mapped")?;
+        dom.mapped -= 1;
+        // The IOTLB may still hold the translation: invalidate it (and drain requests already
+        // translated) before the page is reused.
+        let drain = unit.drain();
+        let invalidation = if unit.cap.page_invalidation {
+            Descriptor::IotlbPages {
+                domain: dom.id,
+                address: iova,
+                order: 0,
+                leaf_only: true,
+                drain,
+            }
+        } else {
+            Descriptor::IotlbDomain {
+                domain: dom.id,
+                drain,
+            }
+        };
+        unit.invalidate(&[invalidation])?;
+        Ok(phys)
+    }
+
+    /// Writes IRTE `index` of unit `ui` (`None`: clears it) and invalidates its cache entry.
+    fn write_irte(
+        &mut self,
+        ui: usize,
+        index: u16,
+        entry: Option<[u64; 2]>,
+    ) -> Result<(), &'static str> {
+        let unit = self.units.get_mut(ui).ok_or("no unit")?;
+        let irt = unit
+            .irt
+            .as_ref()
+            .ok_or("its unit does not remap interrupts")?;
+        let at = 16 * u64::from(index);
+        match entry {
+            // The high half first, so the entry turns present only when complete.
+            Some([lo, hi]) => {
+                irt.table.write64(at + 8, hi);
+                fence(Ordering::SeqCst);
+                irt.table.write64(at, lo);
+            }
+            // Not present first.
+            None => {
+                irt.table.write64(at, 0);
+                fence(Ordering::SeqCst);
+                irt.table.write64(at + 8, 0);
+            }
+        }
+        if !unit.ecap.coherent {
+            flush(irt.table.virt + at, 16);
+        }
+        unit.invalidate(&[Descriptor::IecIndex { index, order: 0 }])
+    }
+
+    /// Allocates an IRTE on `r`'s unit; returns the unit and the index.
+    fn alloc_irte(&mut self, r: Requester) -> Result<(usize, u16), &'static str> {
+        let ui = self.unit_of(r)?;
+        let irt = self
+            .units
+            .get_mut(ui)
+            .and_then(|u| u.irt.as_mut())
+            .ok_or("its unit does not remap interrupts")?;
+        let index = irt
+            .used
+            .alloc()
+            .ok_or("the interrupt remapping table is full")?;
+        Ok((ui, index as u16))
+    }
+
+    fn route(&mut self, r: Requester, apic: u32, vector: u8) -> Result<MsiMessage, &'static str> {
+        let ui = self.unit_of(r)?;
+        let x2apic = self
+            .units
+            .get(ui)
+            .and_then(|u| u.irt.as_ref())
+            .ok_or("its unit does not remap interrupts")?
+            .x2apic;
+        let entry = Irte {
+            vector,
+            destination: apic,
+            source: SourceCheck::RequesterId {
+                source_id: r.source_id(),
+                qualifier: 0,
+            },
+            fault_processing_disable: false,
+        }
+        .encode(x2apic)
+        .ok_or("the destination needs extended interrupt mode, or the vector is reserved")?;
+        let (ui, index) = self.alloc_irte(r)?;
+        self.write_irte(ui, index, Some(entry))?;
+        Ok(vtd::remappable_msi(index))
+    }
+
+    fn irte(&self, r: Requester, index: u16) -> Option<Irte> {
+        let irt = self.units.get(self.unit_of(r).ok()?)?.irt.as_ref()?;
+        let at = 16 * u64::from(index);
+        Irte::decode([irt.table.read64(at), irt.table.read64(at + 8)], irt.x2apic)
+    }
+}
+
+/// Attaches the PCI function at `at` to a domain of its own (created on first use): from
+/// then on its DMA is translated by that domain's tables, which map nothing until [`map`].
+pub(crate) fn attach(at: Address) -> Result<Domain, &'static str> {
+    crate::cpu::without_interrupts(|| {
+        let mut g = IOMMU.lock();
+        let s = g.as_mut().ok_or("no IOMMU")?;
+        if !s.translating {
+            return Err("DMA remapping is off");
+        }
+        s.attach(requester(at))
+    })
+}
+
+/// Maps the physical 4 KiB page `phys` into domain `d`, readable and writable by the
+/// device; returns the IOVA the device must use (never `phys` itself).
+pub(crate) fn map(d: Domain, phys: u64) -> Result<u64, &'static str> {
+    crate::cpu::without_interrupts(|| IOMMU.lock().as_mut().ok_or("no IOMMU")?.map(d, phys))
+}
+
+/// Unmaps `iova` from domain `d` and returns the page it mapped. When this returns, the
+/// IOTLB no longer holds the translation, so the device cannot reach the page.
+pub(crate) fn unmap(d: Domain, iova: u64) -> Result<u64, &'static str> {
+    crate::cpu::without_interrupts(|| IOMMU.lock().as_mut().ok_or("no IOMMU")?.unmap(d, iova))
+}
+
+/// How domain `d`'s tables translate `iova`, walked in software as the hardware would.
+pub(crate) fn translate(d: Domain, iova: u64) -> Option<(u64, Access)> {
+    crate::cpu::without_interrupts(|| {
+        let g = IOMMU.lock();
+        let s = g.as_ref()?;
+        let dom = s.domains.get(d.0)?;
+        let unit = s.units.get(dom.unit)?;
+        let mut tables = Tables {
+            coherent: unit.ecap.coherent,
+            made: 0,
+        };
+        vtd::translate(&mut tables, dom.top, unit.levels, iova)
+    })
+}
+
+/// The message the function at `at` must send to interrupt the processor with x2APIC ID
+/// `apic` at `vector`. With interrupt remapping on: a remappable-format handle to a new IRTE
+/// that holds the vector and destination and checks the device's source ID — any 32-bit APIC
+/// ID with extended interrupt mode. Without it: compatibility format, which reaches APIC IDs
+/// 0–255 only.
+pub(crate) fn msi_message(at: Address, apic: u32, vector: u8) -> Result<MsiMessage, &'static str> {
+    crate::cpu::without_interrupts(|| {
+        let mut g = IOMMU.lock();
+        match g.as_mut() {
+            Some(s) if s.remapping => s.route(requester(at), apic, vector),
+            _ => Ok(MsiMessage {
+                address: pci::msi_address(apic)
+                    .ok_or("APIC IDs above 255 need interrupt remapping")?,
+                data: pci::msi_data(vector).ok_or("a reserved vector")?,
+            }),
+        }
+    })
+}
+
+/// Whether interrupts are remapped.
+pub(crate) fn remapping() -> bool {
+    crate::cpu::without_interrupts(|| IOMMU.lock().as_ref().is_some_and(|s| s.remapping))
+}
+
+/// IRTE `index` on `at`'s unit, if present.
+pub(crate) fn irte(at: Address, index: u16) -> Option<Irte> {
+    crate::cpu::without_interrupts(|| IOMMU.lock().as_ref()?.irte(requester(at), index))
+}
+
+/// Allocates an IRTE on `at`'s unit and leaves it **not present**: a message through it is
+/// blocked and recorded as a fault (for the interrupt-remapping proof). Returns the message
+/// and the index.
+pub(crate) fn reserve_blocked_interrupt(at: Address) -> Result<(MsiMessage, u16), &'static str> {
+    crate::cpu::without_interrupts(|| {
+        let mut g = IOMMU.lock();
+        let s = g.as_mut().ok_or("no IOMMU")?;
+        let (ui, index) = s.alloc_irte(requester(at))?;
+        s.write_irte(ui, index, None)?;
+        Ok((vtd::remappable_msi(index), index))
+    })
+}
+
+/// Clears IRTE `index` on `at`'s unit, invalidates its cache entry and frees it.
+pub(crate) fn release_interrupt(at: Address, index: u16) -> Result<(), &'static str> {
+    crate::cpu::without_interrupts(|| {
+        let mut g = IOMMU.lock();
+        let s = g.as_mut().ok_or("no IOMMU")?;
+        let ui = s.unit_of(requester(at))?;
+        s.write_irte(ui, index, None)?;
+        if let Some(irt) = s.units.get_mut(ui).and_then(|u| u.irt.as_mut()) {
+            irt.used.clear(usize::from(index));
+        }
+        Ok(())
+    })
+}
+
+/// Reads and clears every unit's recorded faults; returns them and whether any were lost
+/// (a recording register was still full).
+pub(crate) fn take_faults() -> (Vec<FaultRecord>, bool) {
+    crate::cpu::without_interrupts(|| {
+        let mut g = IOMMU.lock();
+        let Some(s) = g.as_mut() else {
+            return (Vec::new(), false);
+        };
+        let mut all = Vec::new();
+        let mut lost = false;
+        for u in &mut s.units {
+            let (mut f, o) = u.take_faults();
+            all.append(&mut f);
+            lost |= o;
+        }
+        (all, lost)
+    })
+}
+
+/// One attached device, for the report.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DomainInfo {
+    pub(crate) at: Address,
+    pub(crate) id: u16,
+    pub(crate) mapped: u64,
+    pub(crate) mapped_ever: u64,
+    pub(crate) tables: u64,
+}
+
+/// Every attached device's domain, and the IRTEs in use on all units.
+pub(crate) fn domains() -> (Vec<DomainInfo>, usize) {
+    crate::cpu::without_interrupts(|| {
+        let g = IOMMU.lock();
+        let Some(s) = g.as_ref() else {
+            return (Vec::new(), 0);
+        };
+        let list = s
+            .domains
+            .iter()
+            .map(|d| DomainInfo {
+                at: Address {
+                    bus: d.requester.bus,
+                    device: d.requester.device,
+                    function: d.requester.function,
+                },
+                id: d.id,
+                mapped: d.mapped,
+                mapped_ever: d.mapped_ever,
+                tables: d.tables,
+            })
+            .collect();
+        let irtes = s
+            .units
+            .iter()
+            .filter_map(|u| u.irt.as_ref())
+            .map(|t| t.used.len() - t.used.free())
+            .sum();
+        (list, irtes)
+    })
+}
+
+/// The 16-bit source ID of the function at `at`.
+pub(crate) fn source_id(at: Address) -> u16 {
+    requester(at).source_id()
+}

@@ -34,8 +34,10 @@ use framekernel::report;
 mod block;
 mod console;
 mod cpu;
+mod dma;
 mod firmware;
 mod i8042;
+mod iommu;
 mod irq;
 mod memory;
 mod pcie;
@@ -265,11 +267,18 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         sched::prove(&mut com1, online.ids(), tsc_hz);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
         if pcie::init(&mut com1, info.acpi_rsdp, regions, online.ids().len()) {
+            // DMA and interrupt remapping (Intel VT-d) before any driver binds: translation
+            // on with no device attached, so every DMA faults until a driver attaches its
+            // device (CLAUDE.md §32, §58; ADR-0007).
+            iommu::init(&mut com1, info.acpi_rsdp);
             // M5: the NVMe driver and block I/O, polled and then interrupt-driven.
             storage::init(&mut com1, online.ids(), tsc_hz);
             // M10: bring up the virtio-net NIC; an interrupt-driven receive thread takes the
             // OS onto the network (CLAUDE.md §31, §54).
             virtionet::prove(&mut com1, online.ids(), tsc_hz);
+            // The IOMMU's own proofs, through the bound NVMe controller: translated DMA, a
+            // blocked and recorded DMA, remapped and blocked interrupts.
+            storage::prove_iommu(&mut com1, online.ids(), tsc_hz);
         }
         sched::stop_boot_processor();
     }

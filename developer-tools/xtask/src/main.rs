@@ -275,6 +275,17 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: PCIe: 00:1f.2 8086:2922 class 01:06:01 SATA controller (AHCI); BAR4 I/O 32 B at ".into(),
             "; BAR5 mem32 4 KiB at ".into(),
             "functions on 1 buses; every BAR sized with decoding off and restored: true".into(),
+            // Intel VT-d (CLAUDE.md §32, §58; ADR-0007): the DMAR QEMU builds for q35 with
+            // `intremap=on` (one unit at 0xfed90000 whose scope lists every PCI function and the
+            // I/O APIC), the unit's capabilities, then queued invalidation, interrupt remapping
+            // and translation on before any driver binds.
+            "origin-kernel: IOMMU: DMAR: host address width 48 bits, interrupt remapping true".into(),
+            "origin-kernel: IOMMU: unit 0 at 0xfed90000 (segment 0, 4 KiB of registers): 7 PCI scope(s), I/O APIC 0 (source ID 0xff00)".into(),
+            "origin-kernel: IOMMU: unit 0: VT-d 1.0; CAP 0x".into(),
+            "queued invalidation true, interrupt remapping true, extended interrupt mode true".into(),
+            "origin-kernel: IOMMU: unit 0: queued invalidation on (256 descriptors); empty root table at 0x".into(),
+            "interrupt remapping on (256 entries, 32-bit x2APIC destinations, compatibility format blocked); translation on (GSTS 0x".into(),
+            "every device's DMA faults until its driver attaches it; 0 stale fault(s) cleared".into(),
             // M5: the NVMe driver against the test disk `disk` writes (CLAUDE.md §33).
             "origin-kernel: NVMe: 00:02.0 1b36:0010, NVMe 1.".into(),
             "origin-kernel: NVMe: controller ready: model \"QEMU NVMe Ctrl\", serial \"ORIGIN0001\"".into(),
@@ -365,6 +376,29 @@ fn boot_scenario_markers() -> Scenario {
             "; consistent true".into(),
             // The fetched file — not the embedded copy — unpacked into a fresh VFS and read back.
             "origin-kernel: virtio-net initramfs: the fetched image extracted into a fresh VFS: 4 entries; /etc/hostname true, implicit /boot dir true; consistent true".into(),
+            // The IOMMU's proofs through the NVMe controller (both drivers above already ran
+            // through their own domains): a DMA through an IOVA lands in the physical page it
+            // maps; after an unmap the same DMA is blocked and recorded; every MSI-X entry is a
+            // handle to an IRTE, and an APIC ID above 255 is accepted; an interrupt through a
+            // not-present IRTE is blocked and recorded; and nothing else faulted.
+            "origin-kernel: IOMMU: translated DMA: the NVMe controller (00:02.0, source ID 0x0010) read LBA 2048 into IOVA 0x".into(),
+            "(not the same address): 8 of 8 blocks landed in that physical page; consistent true".into(),
+            "origin-kernel: IOMMU: blocked DMA: IOVA 0x".into(),
+            "and the page kept its canary true; fault recorded: source ID 0x0010, write at 0x".into(),
+            "reason 0x5 (write to a page not mapped writable); consistent true".into(),
+            format!(
+                "origin-kernel: IOMMU: interrupt remapping: {} of {} MSI-X entries (NVMe {}, virtio-net 2) hold only a remappable handle with data 0",
+                3 + cpus,
+                3 + cpus,
+                1 + cpus
+            ),
+            "APIC ID 300 accepted (its IRTE reads back destination 300), which compatibility format refuses: true; consistent true".into(),
+            "origin-kernel: IOMMU: blocked interrupt: NVMe MSI-X vector 1 pointed at IRTE ".into(),
+            "left not present: a read on I/O queue 2 completed true, 0 interrupts arrived; fault recorded: source ID 0x0010, interrupt index ".into(),
+            "reason 0x22 (interrupt table entry not present); vector 1 restored; consistent true".into(),
+            "origin-kernel: IOMMU: domains: 00:02.0 domain 1 (".into(),
+            " 00:03.0 domain 2 (".into(),
+            "no other function has a context entry, so its DMA faults; IOVAs from 0x40000000; faults recorded before the proofs: 0; consistent true".into(),
             // The in-memory VFS (CLAUDE.md §39): a file built, read back, listed and removed.
             "origin-kernel: vfs: built /etc/origin/hostname (read back true), listed 1 entry, removed all back to 1 node".into(),
             // §21: the embedded ustar initramfs extracts into a VFS (contents and an
@@ -448,6 +482,7 @@ fn boot_scenario_markers() -> Scenario {
             ": timers failed",
             ": sysfs failed",
             ": GPT failed",
+            ": IOMMU failed",
         ],
         check: Some(|text| console_lines_intact(text, qemu_cpus() as usize)),
     }
@@ -1228,6 +1263,11 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         .arg(qemu_path_arg("if=pflash,format=raw,file=", &s.vars)?)
         .arg("-drive")
         .arg(qemu_path_arg("format=raw,file=fat:rw:", &s.esp)?)
+        // Intel VT-d (CLAUDE.md §32, §58; ADR-0007): DMA and interrupt remapping. It comes
+        // before the PCI devices it translates. `eim=on` gives IRTEs 32-bit x2APIC
+        // destinations (`auto` resolves to off without KVM's in-kernel irqchip); TCG needs no
+        // irqchip option. See docs/research/2026-11-08-vt-d-iommu.md.
+        .args(["-device", "intel-iommu,intremap=on,eim=on"])
         // The NVMe controller and its test disk (CLAUDE.md §33).
         .arg("-drive")
         .arg(qemu_path_arg("if=none,id=nvme0,format=raw,file=", &s.nvme)?)
@@ -1235,7 +1275,8 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         // A modern virtio-net NIC with a fixed MAC, on QEMU user networking (CLAUDE.md §54).
         // Its built-in TFTP server serves framekernel/assets read-only, so the kernel can
         // fetch its own initramfs image over the network and compare it with the embedded
-        // copy (no host network involved).
+        // copy (no host network involved). `iommu_platform=on` puts its DMA behind the IOMMU
+        // (without it QEMU's virtio devices bypass it) and offers VIRTIO_F_ACCESS_PLATFORM.
         .arg("-netdev")
         .arg(qemu_path_arg(
             "user,id=net0,tftp=",
@@ -1243,7 +1284,7 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         )?)
         .args([
             "-device",
-            "virtio-net-pci,netdev=net0,mac=52:54:00:aa:bb:cc,disable-legacy=on",
+            "virtio-net-pci,netdev=net0,mac=52:54:00:aa:bb:cc,disable-legacy=on,iommu_platform=on",
         ])
         .args(["-display", "none", "-no-reboot"])
         .arg("-rtc")

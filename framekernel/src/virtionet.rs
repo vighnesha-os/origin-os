@@ -9,9 +9,12 @@
 //! Ethernet/IPv4/UDP frames) — and receive is interrupt-driven: for every frame the thread
 //! sleeps on a wait queue that only the NIC's interrupt handler wakes.
 //!
-//! The ring memory is zeroed DMA pages (`storage::dma_page`): the direct map makes them
-//! physically contiguous and gives their physical addresses, and x86 DMA is cache-coherent.
-//! The `unsafe` here is volatile MMIO and forming slices over those DMA pages.
+//! The ring memory is zeroed DMA pages (`dma::DeviceDma`). When the device offers
+//! `VIRTIO_F_ACCESS_PLATFORM` its DMA goes through the IOMMU: the driver accepts the feature,
+//! attaches the device to a domain of its own and gives it IOVAs (ADR-0007); otherwise the
+//! device uses physical addresses (virtio 1.1 §6). x86 DMA is cache-coherent. The MSI-X
+//! entries are programmed through `iommu::msi_message` (remappable handles when interrupts
+//! are remapped). The `unsafe` here is volatile MMIO and forming slices over those DMA pages.
 
 use core::fmt::Write;
 use core::ptr;
@@ -24,6 +27,7 @@ use framekernel::virtqueue::{self, Descriptor, F_WRITE};
 use origin_sync::SpinLock;
 
 use crate::console::Console;
+use crate::dma::DeviceDma;
 use crate::wait::WaitQueue;
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
@@ -37,6 +41,39 @@ const RX_MSIX_ENTRY: u16 = 1;
 const TX_MSIX_ENTRY: u16 = 2;
 /// virtio's "no MSI-X vector" sentinel.
 const NO_VECTOR: u16 = 0xFFFF;
+
+/// The device, its MSI-X table (mapped) and the processor its entries target, once set up.
+static NET_MSIX: SpinLock<Option<(Address, u64, u32)>> = SpinLock::new(None);
+
+/// The messages in the NIC's receive and transmit MSI-X entries, each with the vector and
+/// the processor it must reach (for the interrupt-remapping proof); empty before bring-up.
+pub(crate) fn msix_routes() -> alloc::vec::Vec<(Address, framekernel::vtd::MsiMessage, u8, u32)> {
+    let Some((at, table, target)) = crate::cpu::without_interrupts(|| *NET_MSIX.lock()) else {
+        return alloc::vec::Vec::new();
+    };
+    let word = |entry: u16, w: u64| {
+        let p = ptr::with_exposed_provenance::<u32>(
+            (table + u64::from(entry) * pci::MSIX_ENTRY + 4 * w) as usize,
+        );
+        // SAFETY: inside the MSI-X table (`enable_msix_table` checked it against its BAR and
+        // mapped it uncached; both entries are below its entry count). Reading an entry has
+        // no effect on the device.
+        unsafe { p.read_volatile() }
+    };
+    [
+        (RX_MSIX_ENTRY, crate::cpu::NET_VECTOR),
+        (TX_MSIX_ENTRY, crate::cpu::NET_TX_VECTOR),
+    ]
+    .into_iter()
+    .map(|(entry, vector)| {
+        let message = framekernel::vtd::MsiMessage {
+            address: u64::from(word(entry, 0)) | u64::from(word(entry, 1)) << 32,
+            data: word(entry, 2),
+        };
+        (at, message, vector, target)
+    })
+    .collect()
+}
 
 /// Counts the virtio-net MSI-X interrupts the device has raised.
 static NET_IRQS: AtomicU64 = AtomicU64::new(0);
@@ -109,9 +146,10 @@ fn w64(a: u64, v: u64) {
 
 /// A byte-slice view over a DMA page (for the virtqueue helpers to read and write).
 fn page(virt: u64, len: usize) -> &'static mut [u8] {
-    // SAFETY: `virt` is a live, kept-forever DMA page from `storage::dma_page` of at least
-    // one 4 KiB page; `len` is within it. The device accesses it coherently by physical
-    // address; this view is used only while no request is outstanding on it.
+    // SAFETY: `virt` is a live, kept-forever DMA page from `DeviceDma::page` of at least
+    // one 4 KiB page; `len` is within it. The device accesses it coherently through its bus
+    // address (an IOVA its domain maps to this page, or the physical address without an
+    // IOMMU); this view is used only while no request is outstanding on it.
     unsafe {
         core::slice::from_raw_parts_mut(ptr::with_exposed_provenance_mut::<u8>(virt as usize), len)
     }
@@ -135,6 +173,8 @@ struct Setup {
     mul: u32,
     rx: Queue,
     mac: [u8; 6],
+    /// How the device reaches memory: the receive buffers are mapped through it.
+    dma: DeviceDma,
 }
 static SETUP: SpinLock<Option<Setup>> = SpinLock::new(None);
 
@@ -153,7 +193,7 @@ struct TxRing {
     q: Queue,
     notify_base: u64,
     mul: u32,
-    /// Each descriptor's buffer: (virtual, physical).
+    /// Each descriptor's buffer: (virtual, bus address).
     bufs: [(u64, u64); N_TX],
     free: virtqueue::FreeList,
     in_flight: [bool; N_TX],
@@ -206,11 +246,11 @@ fn map_structure(dev: &crate::pcie::Device, loc: virtio::CfgLocation) -> Option<
     Some(base + u64::from(loc.offset))
 }
 
-/// Sets up queue `q`: a smaller-of device size and 256 ring in three DMA pages, with the
-/// physical addresses programmed, its MSI-X `vector` assigned (`NO_VECTOR` for none), and
+/// Sets up queue `q`: a smaller-of device size and 256 ring in three DMA pages (from `dma`),
+/// with their bus addresses programmed, its MSI-X `vector` assigned (`NO_VECTOR` for none), and
 /// the queue enabled. MSI-X must already be enabled on the function for a real vector to
 /// take.
-fn setup_queue(common: u64, q: u16, vector: u16) -> Option<Queue> {
+fn setup_queue(common: u64, q: u16, vector: u16, dma: DeviceDma) -> Option<Queue> {
     w16(common + reg::QUEUE_SELECT, q);
     let dev_size = r16(common + reg::QUEUE_SIZE);
     if dev_size == 0 {
@@ -219,9 +259,10 @@ fn setup_queue(common: u64, q: u16, vector: u16) -> Option<Queue> {
     let size = dev_size.min(256) as usize;
     w16(common + reg::QUEUE_SIZE, size as u16);
     let notify_off = r16(common + reg::QUEUE_NOTIFY_OFF);
-    let (dv, dp) = crate::storage::dma_page()?;
-    let (av, ap) = crate::storage::dma_page()?;
-    let (uv, up) = crate::storage::dma_page()?;
+    let (d, a, u) = (dma.page()?, dma.page()?, dma.page()?);
+    let (dv, dp) = (d.virt, d.bus);
+    let (av, ap) = (a.virt, a.bus);
+    let (uv, up) = (u.virt, u.bus);
     w64(common + reg::QUEUE_DESC, dp);
     w64(common + reg::QUEUE_DRIVER, ap);
     w64(common + reg::QUEUE_DEVICE, up);
@@ -258,10 +299,10 @@ fn enable_msix_table(dev: &crate::pcie::Device, target: u32) -> bool {
     else {
         return false;
     };
-    let (Some(address), Some(rx_data), Some(tx_data)) = (
-        pci::msi_address(target),
-        pci::msi_data(crate::cpu::NET_VECTOR),
-        pci::msi_data(crate::cpu::NET_TX_VECTOR),
+    let at = dev.function.at;
+    let (Ok(rx_message), Ok(tx_message)) = (
+        crate::iommu::msi_message(at, target, crate::cpu::NET_VECTOR),
+        crate::iommu::msi_message(at, target, crate::cpu::NET_TX_VECTOR),
     ) else {
         return false;
     };
@@ -278,13 +319,16 @@ fn enable_msix_table(dev: &crate::pcie::Device, target: u32) -> bool {
     }
     // Receive completions on `NET_VECTOR`, transmit completions on `NET_TX_VECTOR`, both to
     // `target`; every other entry stays masked.
-    for (index, data) in [(RX_MSIX_ENTRY, rx_data), (TX_MSIX_ENTRY, tx_data)] {
+    for (index, message) in [(RX_MSIX_ENTRY, rx_message), (TX_MSIX_ENTRY, tx_message)] {
         let i = u64::from(index);
-        entry(i, 0, address as u32);
-        entry(i, 1, (address >> 32) as u32);
-        entry(i, 2, data);
+        entry(i, 0, message.address as u32);
+        entry(i, 1, (message.address >> 32) as u32);
+        entry(i, 2, message.data);
         entry(i, 3, 0); // unmask
     }
+    crate::cpu::without_interrupts(|| {
+        *NET_MSIX.lock() = Some((at, table, target));
+    });
     let Some(control) = crate::pcie::enable_msix(dev.function.at, &msix) else {
         return false;
     };
@@ -304,12 +348,13 @@ const RX_BUF: usize = 2048;
 
 /// Posts [`N_RX`] device-writable receive buffers on the RX queue (descriptor `i` → buffer
 /// `i`), returning their virtual addresses, then notifies the device.
-fn post_rx(rx: &Queue, notify_base: u64, mul: u32) -> Option<[u64; N_RX]> {
+fn post_rx(rx: &Queue, notify_base: u64, mul: u32, dma: DeviceDma) -> Option<[u64; N_RX]> {
     let mut pages = [0u64; N_RX];
     let desc = page(rx.desc, virtqueue::desc_bytes(rx.size));
     let avail = page(rx.avail, virtqueue::avail_bytes(rx.size));
     for (i, slot) in pages.iter_mut().enumerate() {
-        let (v, p) = crate::storage::dma_page()?;
+        let page = dma.page()?;
+        let (v, p) = (page.virt, page.bus);
         *slot = v;
         Descriptor {
             addr: p,
@@ -327,13 +372,14 @@ fn post_rx(rx: &Queue, notify_base: u64, mul: u32) -> Option<[u64; N_RX]> {
 impl TxRing {
     /// A ring over `q` with one buffer page, allocated now and kept, for each of its first
     /// [`N_TX`] descriptors.
-    fn new(q: Queue, notify_base: u64, mul: u32) -> Option<Self> {
+    fn new(q: Queue, notify_base: u64, mul: u32, dma: DeviceDma) -> Option<Self> {
         if q.size < N_TX {
             return None;
         }
         let mut bufs = [(0, 0); N_TX];
         for buf in &mut bufs {
-            *buf = crate::storage::dma_page()?;
+            let page = dma.page()?;
+            *buf = (page.virt, page.bus);
         }
         Some(Self {
             q,
@@ -1114,7 +1160,7 @@ fn dhcp_lease(rx: &mut RxRing, our_mac: Mac) -> Option<Ipv4> {
 extern "sysv64" fn net_thread(_: u64) -> ! {
     let setup = crate::cpu::without_interrupts(|| *SETUP.lock());
     if let Some(s) = setup
-        && let Some(rx_pages) = post_rx(&s.rx, s.notify_base, s.mul)
+        && let Some(rx_pages) = post_rx(&s.rx, s.notify_base, s.mul, s.dma)
     {
         let mut rx = RxRing::new(s.rx, rx_pages, s.notify_base, s.mul);
         RX_ARMED.store(1, Ordering::Release);
@@ -1210,7 +1256,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     w32(common + reg::DEVICE_FEATURE_SELECT, 1);
     let fhi = r32(common + reg::DEVICE_FEATURE);
     let device_features = u64::from(fhi) << 32 | u64::from(flo);
-    let wanted = feature::VERSION_1 | feature::NET_MAC | feature::NET_STATUS;
+    let wanted =
+        feature::VERSION_1 | feature::NET_MAC | feature::NET_STATUS | feature::ACCESS_PLATFORM;
     let Some(accepted) = virtio::negotiate(device_features, wanted) else {
         let _ = writeln!(
             com1,
@@ -1227,6 +1274,20 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     w8(common + reg::DEVICE_STATUS, st);
     let features_ok = r8(common + reg::DEVICE_STATUS) & status::FEATURES_OK != 0;
 
+    // Behind the IOMMU (ACCESS_PLATFORM accepted), the device gets a domain of its own
+    // before its first DMA page; otherwise it uses physical addresses (virtio 1.1 §6).
+    let dma = if accepted & feature::ACCESS_PLATFORM != 0 {
+        match DeviceDma::attach(at) {
+            Ok(d) => d,
+            Err(why) => {
+                let _ = writeln!(com1, "origin-kernel: virtio-net: {why}: virtio-net failed");
+                return;
+            }
+        }
+    } else {
+        DeviceDma::Direct
+    };
+
     // The receive thread runs on another processor when there is one (as the NVMe interrupt
     // proof does), and the NIC's MSI-X message is routed to that processor, so it idles until
     // the interrupt wakes it. Turn MSI-X on (so the queues can take vectors), with no
@@ -1240,8 +1301,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         .unwrap_or(bsp as u32);
     let msix_enabled = enable_msix_table(&dev, target);
     w16(common + reg::CONFIG_MSIX_VECTOR, NO_VECTOR);
-    let rx = setup_queue(common, Q_RX, RX_MSIX_ENTRY);
-    let tx = setup_queue(common, Q_TX, TX_MSIX_ENTRY);
+    let rx = setup_queue(common, Q_RX, RX_MSIX_ENTRY, dma);
+    let tx = setup_queue(common, Q_TX, TX_MSIX_ENTRY, dma);
     let queues_ok = rx.is_some() && tx.is_some();
     // Confirm each queue kept its vector (NO_VECTOR back means none was available).
     w16(common + reg::QUEUE_SELECT, Q_RX);
@@ -1270,7 +1331,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     let mul = caps.notify_off_multiplier;
     let (mut spawned, mut arp_sent) = (false, false);
     if let (Some(rxq), Some(txq)) = (rx, tx)
-        && let Some(ring) = TxRing::new(txq, notify_base, mul)
+        && let Some(ring) = TxRing::new(txq, notify_base, mul, dma)
     {
         crate::cpu::without_interrupts(|| {
             *TX.lock() = Some(ring);
@@ -1279,6 +1340,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
                 mul,
                 rx: rxq,
                 mac,
+                dma,
             });
         });
         spawned = crate::sched::spawn(target as usize, net_thread, 0).is_ok();

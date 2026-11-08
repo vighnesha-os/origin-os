@@ -25,6 +25,10 @@ pub mod feature {
     pub const NET_MRG_RXBUF: u64 = 1 << 15;
     pub const NET_STATUS: u64 = 1 << 16;
     pub const NET_MQ: u64 = 1 << 22;
+    /// The device's DMA goes through the platform's IOMMU, so the driver gives it bus
+    /// addresses (IOVAs) rather than physical ones (virtio 1.1 §6, bit 33). A driver must
+    /// accept it when offered, or the device may refuse `FEATURES_OK`.
+    pub const ACCESS_PLATFORM: u64 = 1 << 33;
 }
 
 /// Negotiates features: the driver keeps only what both it and the device offer, and fails
@@ -229,6 +233,17 @@ mod tests {
         // The driver never accepts a feature it did not ask for.
         let acc = negotiate(device, feature::VERSION_1).unwrap();
         assert_eq!(acc & feature::NET_CSUM, 0);
+        // ACCESS_PLATFORM (bit 33, in the high feature word) is kept when the device offers
+        // it, and absent when it does not: the driver then gives physical addresses.
+        let behind_iommu = device | feature::ACCESS_PLATFORM;
+        let wanted = wanted | feature::ACCESS_PLATFORM;
+        let acc = negotiate(behind_iommu, wanted).unwrap();
+        assert_ne!(acc & feature::ACCESS_PLATFORM, 0);
+        assert_eq!((acc >> 32) as u32, 0b11, "VERSION_1 and ACCESS_PLATFORM");
+        assert_eq!(
+            negotiate(device, wanted).unwrap() & feature::ACCESS_PLATFORM,
+            0
+        );
     }
 
     #[test]

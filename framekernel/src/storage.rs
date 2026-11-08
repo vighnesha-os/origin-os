@@ -15,14 +15,16 @@
 //!    it. A thread there submits under the driver lock and then blocks on a wait queue
 //!    until the interrupt wakes it; its wait condition is the completion queue itself.
 //!
-//! DMA memory is zeroed heap pages: the direct map makes them physically contiguous and
-//! gives their physical addresses (`phys::to_phys`), and x86 DMA is cache-coherent. The
-//! driver never keeps a reference into memory the device may write: queue entries are
-//! written and read with volatile accesses, and a data buffer is read only after its command
-//! completed. A fence orders memory writes before every doorbell. There is no IOMMU yet,
-//! so the controller can reach all of memory (CLAUDE.md §32: a later step).
+//! DMA memory is zeroed heap pages (`dma::DeviceDma`). With the IOMMU translating, the
+//! controller is attached to a domain of its own before its first DMA, every page is mapped
+//! there, and the driver programs IOVAs (ADR-0007): the controller reaches those pages and
+//! nothing else. x86 DMA is cache-coherent. The driver never keeps a reference into memory
+//! the device may write: queue entries are written and read with volatile accesses, and a
+//! data buffer is read only after its command completed. A fence orders memory writes before
+//! every doorbell. MSI-X entries are programmed through `iommu::msi_message`, so with
+//! interrupt remapping on they hold only remappable-format handles.
 
-use alloc::alloc::{Layout, alloc_zeroed};
+use alloc::vec::Vec;
 use core::fmt::Write;
 use core::ptr;
 use core::sync::atomic::{Ordering, compiler_fence, fence};
@@ -31,8 +33,10 @@ use core::sync::atomic::AtomicU64;
 use framekernel::gpt;
 use framekernel::nvme::{self, Capabilities, Command, Completion, NamespaceInfo, Queues, register};
 use framekernel::pci::{self, BarKind};
+use framekernel::vtd;
 use origin_sync::SpinLock;
 
+use crate::dma::DeviceDma;
 use crate::sched::MAX_CPUS;
 use crate::wait::WaitQueue;
 
@@ -50,26 +54,21 @@ const NSID: u32 = 1;
 /// Command register bits: memory space decoding, bus mastering.
 const MEMORY_AND_BUS_MASTER: u16 = (1 << 1) | (1 << 2);
 
-/// A zeroed 4 KiB DMA page, kept for ever (the controller may use it at any time).
+/// A zeroed 4 KiB DMA page, kept for ever (the controller may use it at any time): where
+/// the kernel reaches it (`virt`) and the address the controller uses (`bus`: an IOVA in its
+/// domain, or the physical address without an IOMMU).
 #[derive(Clone, Copy)]
 struct DmaPage {
     virt: u64,
-    phys: u64,
+    bus: u64,
 }
 
 impl DmaPage {
-    fn new() -> Option<Self> {
-        let layout = Layout::from_size_align(PAGE as usize, PAGE as usize).ok()?;
-        // SAFETY: `layout` has a non-zero size. The page is never freed: the controller
-        // may write it until it is reset.
-        let p = unsafe { alloc_zeroed(layout) };
-        if p.is_null() {
-            return None;
-        }
-        let virt = p.expose_provenance() as u64;
+    fn new(dma: DeviceDma) -> Option<Self> {
+        let p = dma.page()?;
         Some(Self {
-            virt,
-            phys: crate::phys::to_phys(virt),
+            virt: p.virt,
+            bus: p.bus,
         })
     }
 
@@ -143,6 +142,8 @@ enum Q {
 /// A bound controller.
 struct Nvme {
     regs: u64,
+    /// How the controller reaches memory (its IOMMU domain, or directly).
+    dma: DeviceDma,
     cap: Capabilities,
     admin: QueuePair,
     io: Option<QueuePair>,
@@ -294,11 +295,11 @@ fn poll_on(
     }
 }
 
-fn new_queue(qid: u16, entries: u16) -> Option<QueuePair> {
+fn new_queue(dma: DeviceDma, qid: u16, entries: u16) -> Option<QueuePair> {
     Some(QueuePair {
         qid,
-        sq: DmaPage::new()?,
-        cq: DmaPage::new()?,
+        sq: DmaPage::new(dma)?,
+        cq: DmaPage::new(dma)?,
         state: Queues::new(entries),
         next_cid: 0,
     })
@@ -364,7 +365,7 @@ pub(crate) fn init(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
     };
     let polled = match bind(com1, &dev, cpus.len()) {
         Ok((nvme, ok, namespace)) => {
-            let Some(page) = DmaPage::new() else {
+            let Some(page) = DmaPage::new(nvme.dma) else {
                 return false;
             };
             crate::cpu::without_interrupts(|| {
@@ -397,28 +398,34 @@ pub(crate) fn geometry() -> Option<(u32, u64)> {
     })
 }
 
-/// Allocates a zeroed 4 KiB DMA page for the block layer: its virtual and physical
-/// addresses. Never freed.
+/// Allocates a zeroed 4 KiB DMA page for the block layer, mapped for the bound
+/// controller: its virtual address and the address the controller uses. Never freed.
 pub(crate) fn dma_page() -> Option<(u64, u64)> {
-    DmaPage::new().map(|p| (p.virt, p.phys))
+    let dma = crate::cpu::without_interrupts(|| DRIVER.lock().as_ref().map(|d| d.nvme.dma))?;
+    DmaPage::new(dma).map(|p| (p.virt, p.bus))
 }
 
-/// Reads or writes `blocks` device blocks at `lba` between the disk and the DMA page at
-/// physical `phys`, through the polled I/O queue. Returns whether it succeeded. For the
-/// block layer, driven from the boot flow.
-pub(crate) fn transfer(write: bool, lba: u64, phys: u64, blocks: u32) -> bool {
+/// Reads or writes `blocks` device blocks at `lba` between the disk and the DMA page the
+/// controller reaches at `bus`, through the polled I/O queue. Returns whether it succeeded.
+/// For the block layer, driven from the boot flow.
+pub(crate) fn transfer(write: bool, lba: u64, bus: u64, blocks: u32) -> bool {
+    transfer_status(write, lba, bus, blocks).is_some_and(|s| s.ok())
+}
+
+/// As [`transfer`], returning the completion's status (`None`: no controller, or no
+/// completion in time).
+fn transfer_status(write: bool, lba: u64, bus: u64, blocks: u32) -> Option<nvme::Status> {
     crate::cpu::without_interrupts(|| {
         let mut g = DRIVER.lock();
-        let Some(d) = g.as_mut() else {
-            return false;
-        };
+        let d = g.as_mut()?;
         let bs = u64::from(d.namespace.block_size);
-        let prps = nvme::prps(phys, u64::from(blocks) * bs, PAGE).unwrap_or((phys, 0));
+        let prps = nvme::prps(bus, u64::from(blocks) * bs, PAGE).unwrap_or((bus, 0));
         d.nvme
             .run(Q::Polled, |cid| {
                 Command::transfer(write, cid, NSID, lba, blocks, prps)
             })
-            .is_ok_and(|c| c.status.ok())
+            .ok()
+            .map(|c| c.status)
     })
 }
 
@@ -477,10 +484,14 @@ fn bind(
         return Err("memory decoding and bus mastering did not turn on");
     }
     let regs = crate::vm::map_mmio(bar.address, bar.size).map_err(|_| "cannot map BAR 0")?;
+    // Its own IOMMU domain before its first DMA page: from here on it reaches only the pages
+    // mapped for it.
+    let dma = DeviceDma::attach(f.at)?;
     let mut c = Nvme {
         regs,
+        dma,
         cap: Capabilities::decode(0),
-        admin: new_queue(0, ADMIN_ENTRIES).ok_or("no memory for the admin queues")?,
+        admin: new_queue(dma, 0, ADMIN_ENTRIES).ok_or("no memory for the admin queues")?,
         io: None,
         irq: None,
     };
@@ -511,14 +522,14 @@ fn bind(
     }
     c.wait_ready(false)?;
     c.write32(register::AQA, nvme::aqa(ADMIN_ENTRIES));
-    c.write64(register::ASQ, c.admin.sq.phys);
-    c.write64(register::ACQ, c.admin.cq.phys);
+    c.write64(register::ASQ, c.admin.sq.bus);
+    c.write64(register::ACQ, c.admin.cq.bus);
     c.write32(register::CC, nvme::cc_enable(12));
     c.wait_ready(true)?;
     // The driver polls: mask the controller's pin interrupt.
     c.write32(register::INTMS, u32::MAX);
 
-    let data = DmaPage::new().ok_or("no memory for a data page")?;
+    let data = DmaPage::new(dma).ok_or("no memory for a data page")?;
     let failed = |e: Failure| -> &'static str {
         match e {
             Failure::Full => "queue full",
@@ -527,7 +538,7 @@ fn bind(
         }
     };
     let id = c
-        .run(Q::Admin, |cid| Command::identify(cid, 1, 0, data.phys))
+        .run(Q::Admin, |cid| Command::identify(cid, 1, 0, data.bus))
         .map_err(failed)?;
     if !id.status.ok() {
         return Err("Identify Controller failed");
@@ -545,7 +556,7 @@ fn bind(
         info.mdts
     );
     let ns = c
-        .run(Q::Admin, |cid| Command::identify(cid, 0, NSID, data.phys))
+        .run(Q::Admin, |cid| Command::identify(cid, 0, NSID, data.bus))
         .map_err(failed)?;
     page.copy_from_slice(data.bytes());
     let Some(namespace) = ns
@@ -579,11 +590,11 @@ fn bind(
         com1,
         "origin-kernel: NVMe: asked for {wanted} I/O queue pairs, allocated {sqs} submission and {cqs} completion queues"
     );
-    let io = new_queue(1, IO_ENTRIES).ok_or("no memory for the I/O queues")?;
-    let (cq_phys, sq_phys) = (io.cq.phys, io.sq.phys);
+    let io = new_queue(dma, 1, IO_ENTRIES).ok_or("no memory for the I/O queues")?;
+    let (cq_bus, sq_bus) = (io.cq.bus, io.sq.bus);
     let created = c
         .run(Q::Admin, |cid| {
-            Command::create_io_cq(cid, 1, IO_ENTRIES, cq_phys)
+            Command::create_io_cq(cid, 1, IO_ENTRIES, cq_bus)
         })
         .map_err(failed)?;
     if !created.status.ok() {
@@ -591,7 +602,7 @@ fn bind(
     }
     let created = c
         .run(Q::Admin, |cid| {
-            Command::create_io_sq(cid, 1, IO_ENTRIES, 1, sq_phys)
+            Command::create_io_sq(cid, 1, IO_ENTRIES, 1, sq_bus)
         })
         .map_err(failed)?;
     if !created.status.ok() {
@@ -634,8 +645,7 @@ fn setup_interrupts(d: &mut Driver, target: u32) -> Result<pci::Msix, &'static s
         crate::vm::map_mmio(bar.address + u64::from(msix.table_offset), table_len)
             .map_err(|_| "cannot map the MSI-X table")?
     };
-    let address = pci::msi_address(target).ok_or("the target needs interrupt remapping")?;
-    let data = pci::msi_data(crate::cpu::DEVICE_VECTOR).ok_or("bad vector")?;
+    let message = crate::iommu::msi_message(d.dev.function.at, target, crate::cpu::DEVICE_VECTOR)?;
     let entry = |i: u64, word: u64, value: u32| {
         let p = ptr::with_exposed_provenance_mut::<u32>(
             (table + i * pci::MSIX_ENTRY + 4 * word) as usize,
@@ -647,17 +657,17 @@ fn setup_interrupts(d: &mut Driver, target: u32) -> Result<pci::Msix, &'static s
     for i in 0..u64::from(msix.entries) {
         entry(i, 3, pci::MSIX_MASKED);
     }
-    entry(1, 0, address as u32);
-    entry(1, 1, (address >> 32) as u32);
-    entry(1, 2, data);
+    entry(1, 0, message.address as u32);
+    entry(1, 1, (message.address >> 32) as u32);
+    entry(1, 2, message.data);
     entry(1, 3, 0);
     let control =
         crate::pcie::enable_msix(d.dev.function.at, &msix).ok_or("no configuration access")?;
     if control & pci::MSIX_ENABLE == 0 || control & pci::MSIX_FUNCTION_MASK != 0 {
         return Err("MSI-X did not turn on");
     }
-    let queue = new_queue(2, IO_ENTRIES).ok_or("no memory for I/O queue 2")?;
-    let (cq, sq) = (queue.cq.phys, queue.sq.phys);
+    let queue = new_queue(d.nvme.dma, 2, IO_ENTRIES).ok_or("no memory for I/O queue 2")?;
+    let (cq, sq) = (queue.cq.bus, queue.sq.bus);
     let failed = |_| "creating I/O queue 2 failed";
     let made = d
         .nvme
@@ -696,7 +706,7 @@ extern "sysv64" fn io_thread(_: u64) -> ! {
         let cid = crate::cpu::without_interrupts(|| {
             let mut g = DRIVER.lock();
             let d = g.as_mut()?;
-            let prps = (d.page.phys, 0);
+            let prps = (d.page.bus, 0);
             d.nvme
                 .submit(Q::Interrupt, |cid| {
                     Command::transfer(false, cid, NSID, lba, 8, prps)
@@ -831,7 +841,7 @@ fn read_blocks(
     let mut done = 0u64;
     for chunk in out.chunks_mut(PAGE as usize) {
         let blocks = (chunk.len() as u64).div_ceil(bs).min(per_page);
-        let prps = nvme::prps(data.phys, blocks * bs, PAGE).unwrap_or((data.phys, 0));
+        let prps = nvme::prps(data.bus, blocks * bs, PAGE).unwrap_or((data.bus, 0));
         let at = lba + done;
         let r = c.run(Q::Polled, |cid| {
             Command::transfer(false, cid, NSID, at, blocks as u32, prps)
@@ -957,7 +967,7 @@ fn prove_io(
 ) -> Result<bool, Failure> {
     let bs = u64::from(ns.block_size);
     let read = |c: &mut Nvme, lba: u64, blocks: u32| {
-        let prps = nvme::prps(data.phys, u64::from(blocks) * bs, PAGE).unwrap_or((data.phys, 0));
+        let prps = nvme::prps(data.bus, u64::from(blocks) * bs, PAGE).unwrap_or((data.bus, 0));
         c.run(Q::Polled, |cid| {
             Command::transfer(false, cid, NSID, lba, blocks, prps)
         })
@@ -991,7 +1001,7 @@ fn prove_io(
     let mut block = [0u8; 512];
     pattern(scratch ^ 0xA5A5, &mut block);
     data.fill(&block);
-    let prps = (data.phys, 0);
+    let prps = (data.bus, 0);
     let wrote = c.run(Q::Polled, |cid| {
         Command::transfer(true, cid, NSID, scratch, 1, prps)
     })?;
@@ -1043,11 +1053,10 @@ fn setup_cpu_queues(d: &mut Driver, cpus: &[u32]) -> Result<(), &'static str> {
     if usize::from(msix.entries) < 2 + cpus.len() {
         return Err("too few MSI-X vectors for one per processor");
     }
-    let data = pci::msi_data(crate::cpu::DEVICE_VECTOR).ok_or("bad vector")?;
     for (k, &cpu) in cpus.iter().enumerate() {
         let vector = 2 + k as u16;
         let qid = 3 + k as u16;
-        let address = pci::msi_address(cpu).ok_or("a processor needs interrupt remapping")?;
+        let message = crate::iommu::msi_message(d.dev.function.at, cpu, crate::cpu::DEVICE_VECTOR)?;
         let entry = |word: u64, value: u32| {
             let at = table + u64::from(vector) * pci::MSIX_ENTRY + 4 * word;
             let p = ptr::with_exposed_provenance_mut::<u32>(at as usize);
@@ -1055,13 +1064,14 @@ fn setup_cpu_queues(d: &mut Driver, cpus: &[u32]) -> Result<(), &'static str> {
             // its BAR, and `vector` is below its entry count), mapped uncached.
             unsafe { p.write_volatile(value) };
         };
-        entry(0, address as u32);
-        entry(1, (address >> 32) as u32);
-        entry(2, data);
+        entry(0, message.address as u32);
+        entry(1, (message.address >> 32) as u32);
+        entry(2, message.data);
         entry(3, 0);
-        let queue = new_queue(qid, IO_ENTRIES).ok_or("no memory for a per-processor queue")?;
-        let page = DmaPage::new().ok_or("no memory for a per-processor page")?;
-        let (cq, sq) = (queue.cq.phys, queue.sq.phys);
+        let queue =
+            new_queue(d.nvme.dma, qid, IO_ENTRIES).ok_or("no memory for a per-processor queue")?;
+        let page = DmaPage::new(d.nvme.dma).ok_or("no memory for a per-processor page")?;
+        let (cq, sq) = (queue.cq.bus, queue.sq.bus);
         let failed = |_| "creating a per-processor queue failed";
         let made = d
             .nvme
@@ -1101,8 +1111,8 @@ fn cpu_command(me: usize, make: impl FnOnce(u16, u64) -> Command, out: &mut [u8;
     let cid = crate::cpu::without_interrupts(|| {
         let mut g = slot.lock();
         let q = g.as_mut()?;
-        let phys = q.page.phys;
-        submit_on(&mut q.qp, q.regs, q.stride, |cid| make(cid, phys)).ok()
+        let bus = q.page.bus;
+        submit_on(&mut q.qp, q.regs, q.stride, |cid| make(cid, bus)).ok()
     });
     let Some(cid) = cid else {
         return false;
@@ -1145,7 +1155,7 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
         let lba = 2048 + ((i + index) % 8) * 8;
         if !cpu_command(
             me,
-            |cid, phys| Command::transfer(false, cid, NSID, lba, 8, (phys, 0)),
+            |cid, bus| Command::transfer(false, cid, NSID, lba, 8, (bus, 0)),
             &mut page,
         ) {
             break;
@@ -1172,7 +1182,7 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
     let wrote = filled
         && cpu_command(
             me,
-            |cid, phys| Command::transfer(true, cid, NSID, scratch, 1, (phys, 0)),
+            |cid, bus| Command::transfer(true, cid, NSID, scratch, 1, (bus, 0)),
             &mut page,
         )
         && cpu_command(me, |cid, _| Command::flush(cid, NSID), &mut page);
@@ -1187,7 +1197,7 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
     let back = wrote
         && cpu_command(
             me,
-            |cid, phys| Command::transfer(false, cid, NSID, scratch, 1, (phys, 0)),
+            |cid, bus| Command::transfer(false, cid, NSID, scratch, 1, (bus, 0)),
             &mut page,
         )
         && page.get(..512) == Some(&expected[..]);
@@ -1268,4 +1278,349 @@ fn prove_per_cpu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
         if ok { "" } else { ": NVMe failed" }
     );
     ok
+}
+
+/// A recognizable fill for a page no DMA may reach.
+const CANARY: u8 = 0xCA;
+/// The block the IOMMU proofs read (a pattern block the boot test wrote).
+const PROBE_LBA: u64 = 2048;
+
+/// Reads word `word` of MSI-X table entry `entry` (the table mapped at `table`).
+fn msix_word(table: u64, entry: u64, word: u64) -> u32 {
+    let p =
+        ptr::with_exposed_provenance::<u32>((table + entry * pci::MSIX_ENTRY + 4 * word) as usize);
+    // SAFETY: the callers pass entries below the table's entry count; `setup_interrupts`
+    // checked the table against its BAR, which is mapped uncached. Reading an entry has no
+    // effect on the device.
+    unsafe { p.read_volatile() }
+}
+
+/// Writes word `word` of MSI-X table entry `entry`.
+fn msix_write(table: u64, entry: u64, word: u64, value: u32) {
+    let p = ptr::with_exposed_provenance_mut::<u32>(
+        (table + entry * pci::MSIX_ENTRY + 4 * word) as usize,
+    );
+    // SAFETY: as for `msix_word`; the entry only says where the device's message goes.
+    unsafe { p.write_volatile(value) };
+}
+
+/// The message in MSI-X table entry `entry`.
+fn msix_message(table: u64, entry: u64) -> vtd::MsiMessage {
+    vtd::MsiMessage {
+        address: u64::from(msix_word(table, entry, 0))
+            | u64::from(msix_word(table, entry, 1)) << 32,
+        data: msix_word(table, entry, 2),
+    }
+}
+
+/// Points MSI-X entry `entry` at `m`: masked while it changes, then unmasked.
+fn msix_point(table: u64, entry: u64, m: vtd::MsiMessage) {
+    msix_write(table, entry, 3, pci::MSIX_MASKED);
+    msix_write(table, entry, 0, m.address as u32);
+    msix_write(table, entry, 1, (m.address >> 32) as u32);
+    msix_write(table, entry, 2, m.data);
+    msix_write(table, entry, 3, 0);
+}
+
+/// Whether `m` is a remappable-format message with data 0 whose IRTE (on `at`'s unit) sends
+/// `vector` to `apic` and checks `at`'s source ID.
+pub(crate) fn routed_through_irte(
+    at: pci::Address,
+    m: vtd::MsiMessage,
+    vector: u8,
+    apic: u32,
+) -> bool {
+    let Some(index) = vtd::interrupt_index(m) else {
+        return false;
+    };
+    let source = vtd::SourceCheck::RequesterId {
+        source_id: crate::iommu::source_id(at),
+        qualifier: 0,
+    };
+    m.data == 0
+        && crate::iommu::irte(at, index)
+            .is_some_and(|e| e.vector == vector && e.destination == apic && e.source == source)
+}
+
+/// A fault for the report: who, what and why.
+struct Fault(Option<vtd::FaultRecord>);
+
+impl core::fmt::Display for Fault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let Some(r) = self.0 else {
+            return f.write_str("none");
+        };
+        write!(f, "source ID {:#06x}, ", r.source_id)?;
+        match r.interrupt_index {
+            Some(i) => write!(f, "interrupt index {i}")?,
+            None => write!(
+                f,
+                "{} at {:#x}",
+                if r.read { "read" } else { "write" },
+                r.address
+            )?,
+        }
+        write!(
+            f,
+            ", reason {:#x} ({})",
+            r.reason,
+            vtd::fault_reason(r.reason)
+        )
+    }
+}
+
+/// The IOMMU proofs that need the bound controller (CLAUDE.md §32, §58; ADR-0007):
+/// 1. **translated DMA**: a read into a fresh page lands in that physical page, although the
+///    controller was given only its IOVA — never its physical address — and the domain's
+///    tables translate the one to the other;
+/// 2. **blocked DMA**: once that IOVA is unmapped (the IOTLB invalidated and drained), the
+///    same read leaves the page untouched, and the unit records the fault: the controller's
+///    source ID, the IOVA, a write, reason 5;
+/// 3. **remapped interrupts**: every MSI-X entry the NVMe and virtio-net drivers programmed
+///    holds only a remappable-format handle with data 0, and each handle's IRTE holds the
+///    vector, the destination and the device's source ID; and an APIC ID above 255, which
+///    compatibility format cannot address, is accepted (its IRTE read back, then freed);
+/// 4. **a blocked interrupt**: vector 1 pointed at a not-present IRTE, a completion on I/O
+///    queue 2 raises no interrupt, and the unit records the fault: the source ID, the index,
+///    reason 22h. Vector 1 is restored afterwards.
+///
+/// Faults recorded before the proofs are reported; one from an attached device fails the
+/// proof (a driver's DMA went where it had not mapped). Returns whether everything held;
+/// with no IOMMU there is nothing to prove.
+pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
+    let driver = crate::cpu::without_interrupts(|| {
+        DRIVER
+            .lock()
+            .as_ref()
+            .map(|d| (d.nvme.dma, d.dev.function.at, d.msix, d.page.bus))
+    });
+    let on = crate::iommu::translating();
+    let Some((dma, at, msix, irq_page)) = driver else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: no NVMe controller to prove DMA remapping with{}",
+            if on { ": IOMMU failed" } else { "" }
+        );
+        return !on;
+    };
+    let DeviceDma::Translated(domain) = dma else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: the NVMe controller's DMA is not translated{}",
+            if on { ": IOMMU failed" } else { "" }
+        );
+        return !on;
+    };
+    let sid = crate::iommu::source_id(at);
+    let (domains, _) = crate::iommu::domains();
+    let (before, lost_before) = crate::iommu::take_faults();
+    let attached_fault = before.iter().any(|f| {
+        domains
+            .iter()
+            .any(|d| crate::iommu::source_id(d.at) == f.source_id)
+    });
+    let canary = [CANARY; PAGE as usize];
+
+    // 1. Translated DMA: the controller writes through IOVA `page.bus` into physical `phys`.
+    let Some(page) = DmaPage::new(dma) else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: no memory for a probe page: IOMMU failed"
+        );
+        return false;
+    };
+    let phys = crate::phys::to_phys(page.virt);
+    let walked = crate::iommu::translate(domain, page.bus);
+    page.fill(&canary);
+    let first = transfer_status(false, PROBE_LBA, page.bus, 8);
+    let mut expected = [0u8; 512];
+    let mut landed = 0;
+    for k in 0..8u64 {
+        pattern(PROBE_LBA + k, &mut expected);
+        let at = (k * 512) as usize;
+        if page.bytes().get(at..at + 512) == Some(&expected[..]) {
+            landed += 1;
+        }
+    }
+    let translated = first.is_some_and(|s| s.ok())
+        && landed == 8
+        && page.bus != phys
+        && walked == Some((phys, vtd::Access::READ_WRITE));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: IOMMU: translated DMA: the NVMe controller ({at}, source ID {sid:#06x}) read LBA {PROBE_LBA} into IOVA {:#x}, which its domain maps to physical {phys:#x} ({}): {landed} of 8 blocks landed in that physical page; consistent {translated}{}",
+        page.bus,
+        if page.bus == phys {
+            "the same address"
+        } else {
+            "not the same address"
+        },
+        if translated { "" } else { ": IOMMU failed" }
+    );
+
+    // 2. Blocked DMA: unmapped, the same read must not reach the page, and must be recorded.
+    page.fill(&canary);
+    let unmapped = crate::iommu::unmap(domain, page.bus);
+    let gone = crate::iommu::translate(domain, page.bus).is_none();
+    let second = transfer_status(false, PROBE_LBA, page.bus, 8);
+    let intact = page.bytes() == &canary[..];
+    let (faults, lost) = crate::iommu::take_faults();
+    let mine = faults
+        .iter()
+        .find(|f| f.source_id == sid && f.interrupt_index.is_none() && f.address == page.bus)
+        .copied();
+    let recorded = mine.is_some_and(|f| !f.read && f.reason == 5);
+    let blocked = unmapped == Ok(phys) && gone && intact && recorded;
+    let status = match second {
+        Some(s) => alloc::format!("completed with status type {} code {:#x}", s.kind, s.code),
+        None => alloc::string::String::from("did not complete"),
+    };
+    let _ = writeln!(
+        com1,
+        "origin-kernel: IOMMU: blocked DMA: IOVA {:#x} unmapped (IOTLB invalidated page-selectively, reads and writes drained), the same read {status}, and the page kept its canary {intact}; fault recorded: {}{}; consistent {blocked}{}",
+        page.bus,
+        Fault(mine),
+        if lost { " (a fault was lost)" } else { "" },
+        if blocked { "" } else { ": IOMMU failed" }
+    );
+
+    // 3. Remapped interrupts: every programmed MSI-X entry is a handle to its own IRTE.
+    let bsp = crate::cpu::cpu_id();
+    let target = cpus
+        .iter()
+        .copied()
+        .find(|&id| u64::from(id) != bsp)
+        .unwrap_or(bsp as u32);
+    let mut routes: Vec<(pci::Address, vtd::MsiMessage, u8, u32)> = Vec::new();
+    if let Some((table, _)) = msix {
+        routes.push((
+            at,
+            msix_message(table, 1),
+            crate::cpu::DEVICE_VECTOR,
+            target,
+        ));
+        for (k, &cpu) in cpus.iter().enumerate() {
+            let entry = 2 + k as u64;
+            routes.push((
+                at,
+                msix_message(table, entry),
+                crate::cpu::DEVICE_VECTOR,
+                cpu,
+            ));
+        }
+    }
+    let nvme_routes = routes.len();
+    routes.extend(crate::virtionet::msix_routes());
+    let through = routes
+        .iter()
+        .filter(|&&(dev, m, vector, apic)| routed_through_irte(dev, m, vector, apic))
+        .count();
+    // An APIC ID above 255: compatibility format cannot carry it; an IRTE can.
+    const WIDE: u32 = 300;
+    let refused = pci::msi_address(WIDE).is_none();
+    let wide = crate::iommu::msi_message(at, WIDE, crate::cpu::DEVICE_VECTOR);
+    let wide_index = wide.ok().and_then(vtd::interrupt_index);
+    let wide_back = wide_index
+        .and_then(|i| crate::iommu::irte(at, i))
+        .map(|e| e.destination);
+    let released = wide_index.is_some_and(|i| crate::iommu::release_interrupt(at, i).is_ok());
+    let (_, irtes) = crate::iommu::domains();
+    let remapped = crate::iommu::remapping()
+        && nvme_routes == 1 + cpus.len()
+        && routes.len() == nvme_routes + 2
+        && through == routes.len()
+        && refused
+        && wide_back == Some(WIDE)
+        && released;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: IOMMU: interrupt remapping: {through} of {} MSI-X entries (NVMe {nvme_routes}, virtio-net {}) hold only a remappable handle with data 0 whose IRTE holds the vector, the x2APIC destination and the device's source ID; {irtes} IRTEs in use; APIC ID {WIDE} accepted (its IRTE reads back destination {}), which compatibility format refuses: {refused}; consistent {remapped}{}",
+        routes.len(),
+        routes.len() - nvme_routes,
+        wide_back.map_or(alloc::string::String::from("none"), |d| alloc::format!(
+            "{d}"
+        )),
+        if remapped { "" } else { ": IOMMU failed" }
+    );
+
+    // 4. A blocked interrupt: vector 1 sent through a not-present IRTE.
+    let blocked_irq = match (msix, crate::iommu::reserve_blocked_interrupt(at)) {
+        (Some((table, _)), Ok((message, index))) => {
+            let saved = msix_message(table, 1);
+            msix_point(table, 1, message);
+            let before = INTERRUPTS.load(Ordering::Relaxed);
+            let completed = crate::cpu::without_interrupts(|| {
+                let mut g = DRIVER.lock();
+                let d = g.as_mut()?;
+                d.nvme
+                    .run(Q::Interrupt, |cid| {
+                        Command::transfer(false, cid, NSID, PROBE_LBA, 8, (irq_page, 0))
+                    })
+                    .ok()
+            });
+            // Long enough for a message that was delivered to be taken.
+            let start = crate::cpu::rdtsc();
+            crate::sched::yield_until(
+                || crate::cpu::rdtsc().wrapping_sub(start) > tsc_hz / 50,
+                tsc_hz,
+                1,
+            );
+            let arrived = INTERRUPTS.load(Ordering::Relaxed) - before;
+            let (faults, lost) = crate::iommu::take_faults();
+            let fault = faults
+                .iter()
+                .find(|f| f.source_id == sid && f.interrupt_index == Some(index))
+                .copied();
+            msix_point(table, 1, saved);
+            let freed = crate::iommu::release_interrupt(at, index).is_ok();
+            let ok = completed.is_some_and(|c| c.status.ok())
+                && arrived == 0
+                && fault.is_some_and(|f| f.reason == 0x22)
+                && freed;
+            let _ = writeln!(
+                com1,
+                "origin-kernel: IOMMU: blocked interrupt: NVMe MSI-X vector 1 pointed at IRTE {index}, left not present: a read on I/O queue 2 completed {}, {arrived} interrupts arrived; fault recorded: {}{}; vector 1 restored; consistent {ok}{}",
+                completed.is_some_and(|c| c.status.ok()),
+                Fault(fault),
+                if lost { " (a fault was lost)" } else { "" },
+                if ok { "" } else { ": IOMMU failed" }
+            );
+            ok
+        }
+        (_, Err(why)) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: IOMMU: blocked interrupt: {why}: IOMMU failed"
+            );
+            false
+        }
+        (None, Ok(_)) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: IOMMU: blocked interrupt: NVMe MSI-X is not set up: IOMMU failed"
+            );
+            false
+        }
+    };
+
+    // The domains, and what was recorded before the proofs.
+    let (domains, _) = crate::iommu::domains();
+    let _ = write!(com1, "origin-kernel: IOMMU: domains:");
+    for d in &domains {
+        let _ = write!(
+            com1,
+            " {} domain {} ({} pages mapped, {} ever, {} table pages);",
+            d.at, d.id, d.mapped, d.mapped_ever, d.tables
+        );
+    }
+    let quiet = !attached_fault && !lost_before;
+    let _ = writeln!(
+        com1,
+        " no other function has a context entry, so its DMA faults; IOVAs from {:#x}; faults recorded before the proofs: {}{}; consistent {quiet}{}",
+        vtd::IOVA_BASE,
+        before.len(),
+        if lost_before { " (some lost)" } else { "" },
+        if quiet { "" } else { ": IOMMU failed" }
+    );
+    translated && blocked && remapped && blocked_irq && quiet
 }

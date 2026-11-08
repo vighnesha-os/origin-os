@@ -19,11 +19,12 @@ use framekernel::blockcache::{BlockCache, Lookup};
 
 use crate::console::Console;
 
-/// A DMA page used as one cache slot.
+/// A DMA page used as one cache slot: where the kernel reaches it, and the address the
+/// controller uses (an IOVA in its IOMMU domain, or the physical address without one).
 #[derive(Clone, Copy)]
 struct Page {
     virt: u64,
-    phys: u64,
+    bus: u64,
 }
 
 /// The block cache over the bound NVMe namespace.
@@ -58,8 +59,8 @@ impl Block {
         }
         let mut pages = alloc::vec::Vec::with_capacity(slots);
         for _ in 0..slots {
-            let (virt, phys) = crate::storage::dma_page()?;
-            pages.push(Page { virt, phys });
+            let (virt, bus) = crate::storage::dma_page()?;
+            pages.push(Page { virt, bus });
         }
         Some(Self {
             index: BlockCache::new(slots),
@@ -89,7 +90,7 @@ impl Block {
                 if !crate::storage::transfer(
                     true,
                     self.lba(evicted),
-                    p.phys,
+                    p.bus,
                     self.page_blocks as u32,
                 ) {
                     return (slot, Io::Failed);
@@ -100,7 +101,7 @@ impl Block {
             Lookup::Fill(_) | Lookup::Replace { .. } => Io::Read,
         };
         self.reads += 1;
-        if !crate::storage::transfer(false, self.lba(page), p.phys, self.page_blocks as u32) {
+        if !crate::storage::transfer(false, self.lba(page), p.bus, self.page_blocks as u32) {
             return (slot, Io::Failed);
         }
         self.index.filled(slot, page);
@@ -140,7 +141,7 @@ impl Block {
             if crate::storage::transfer(
                 true,
                 self.lba(page),
-                self.slots[slot].phys,
+                self.slots[slot].bus,
                 self.page_blocks as u32,
             ) {
                 self.index.mark_clean(slot);
