@@ -20,7 +20,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use framekernel::descriptors::{KERNEL_CODE, KERNEL_DATA};
-use framekernel::runqueue::{QueueError, RunQueue};
+use framekernel::runqueue::{QueueError, RunQueue, per_mille, share_near_weight};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
@@ -425,8 +425,13 @@ pub(crate) fn current_stack_top() -> Option<u64> {
 
 /// This CPU's tick count, as its run queue sees it.
 fn queue_ticks() -> u64 {
+    queue_ticks_of(this_cpu())
+}
+
+/// Processor `cpu`'s tick count, as its run queue sees it.
+fn queue_ticks_of(cpu: usize) -> u64 {
     QUEUES
-        .get(this_cpu())
+        .get(cpu)
         .map_or(0, |q| without_interrupts(|| q.lock().ticks()))
 }
 
@@ -749,16 +754,36 @@ fn prove_simd(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
 
 /// The weights of the three workers of [`prove_weights`].
 const WEIGHTS: [u32; 3] = [1, 4, 16];
-/// Iterations each weighted worker made.
+/// TSC ticks each weighted worker saw itself run (see [`weighted_worker`]).
 static WEIGHTED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static WEIGHTED_STOP: AtomicBool = AtomicBool::new(false);
 static WEIGHTED_EXITED: AtomicU64 = AtomicU64::new(0);
+/// A step between two of a worker's clock readings counts as time it ran only if it is
+/// shorter than this: a longer one means it was preempted or its virtual CPU was away.
+/// Three milliseconds, about a third of a timer tick: a loaded host takes a virtual CPU away for
+/// milliseconds many times a second, and a limit much below this would count only the
+/// luck of when those stalls fell (measured, 100 µs: twice the noise of 3 ms), while a
+/// thread preempted by another's slice is gone for a whole 10 ms tick.
+const RUNNING_STEP_MICROS: u64 = 3000;
+/// [`RUNNING_STEP_MICROS`] in TSC ticks, set before the workers start.
+static RUNNING_STEP: AtomicU64 = AtomicU64::new(0);
 
-/// A worker that never yields, counting into `WEIGHTED[index]` until told to stop.
+/// A worker that never yields. Until told to stop, it adds to `WEIGHTED[index]` the time it
+/// sees itself running: every step of the TSC shorter than [`RUNNING_STEP`]. Time, not
+/// iterations: on an emulated processor the iterations done in one 10 ms slice vary by an
+/// order of magnitude with the host's load, whatever the scheduler did, and the lightest
+/// thread's share is the sum of only about ten slices.
 extern "sysv64" fn weighted_worker(index: u64) -> ! {
+    let limit = RUNNING_STEP.load(Ordering::Relaxed);
+    let mut last = rdtsc();
     while !WEIGHTED_STOP.load(Ordering::Relaxed) {
-        if let Some(c) = WEIGHTED.get(index as usize) {
-            c.fetch_add(1, Ordering::Relaxed);
+        let now = rdtsc();
+        let step = now.wrapping_sub(last);
+        last = now;
+        if step < limit
+            && let Some(ran) = WEIGHTED.get(index as usize)
+        {
+            ran.fetch_add(step, Ordering::Relaxed);
         }
         core::hint::spin_loop();
     }
@@ -766,45 +791,108 @@ extern "sysv64" fn weighted_worker(index: u64) -> ! {
     exit()
 }
 
+/// How long the workers of [`prove_weights`] share the processor, in seconds.
+const WEIGHTS_SECONDS: u64 = 2;
+/// Runs [`prove_weights`] may make: an extra one only after a wrong result from a visibly
+/// disturbed run (see [`TICKS_LOST_TO_A_STALL`]).
+const WEIGHTS_ATTEMPTS: u32 = 3;
+/// A run counts as disturbed if its processor took at least this many ticks fewer than the
+/// window holds, because a late timer interrupt coalesced with the next (on a loaded host,
+/// the virtual CPU or QEMU's main loop was descheduled); one or two can go missing to the
+/// window's phase and the calibration's rounding. It also counts as disturbed if the
+/// workers saw themselves run for less than nine tenths of the window: their processor was
+/// away for the rest of it.
+const TICKS_LOST_TO_A_STALL: u64 = 3;
+
+/// One run of the workers of [`prove_weights`].
+struct WeightedRun {
+    /// The time each worker saw itself run, in TSC ticks.
+    ran: [u64; 3],
+    exited: bool,
+    /// Timer ticks the workers' processor took in the window.
+    ticks: u64,
+}
+
+/// Starts the three weighted workers on `far`, lets them run for [`WEIGHTS_SECONDS`], stops
+/// them and returns what they measured, or `None` if a worker could not be spawned.
+fn run_weighted(far: CpuIndex, tsc_hz: u64) -> Option<WeightedRun> {
+    RUNNING_STEP.store(
+        (tsc_hz / 1_000_000).max(1) * RUNNING_STEP_MICROS,
+        Ordering::Relaxed,
+    );
+    for ran in &WEIGHTED {
+        ran.store(0, Ordering::Relaxed);
+    }
+    WEIGHTED_STOP.store(false, Ordering::Relaxed);
+    WEIGHTED_EXITED.store(0, Ordering::Relaxed);
+    for (i, &w) in WEIGHTS.iter().enumerate() {
+        spawn_weighted(far, weighted_worker, i as u64, w).ok()?;
+    }
+    let ticks_before = queue_ticks_of(far.get());
+    let start = rdtsc();
+    while rdtsc().wrapping_sub(start) < WEIGHTS_SECONDS * tsc_hz {
+        yield_now();
+        cpu::interrupt_window();
+    }
+    let ticks = queue_ticks_of(far.get()).wrapping_sub(ticks_before);
+    WEIGHTED_STOP.store(true, Ordering::Relaxed);
+    yield_until(|| WEIGHTED_EXITED.load(Ordering::Relaxed) == 3, tsc_hz, 2);
+    Some(WeightedRun {
+        ran: core::array::from_fn(|i| WEIGHTED[i].load(Ordering::Relaxed)),
+        exited: WEIGHTED_EXITED.load(Ordering::Relaxed) == 3,
+        ticks,
+    })
+}
+
 /// Proves proportional shares (stride scheduling): three never-yielding workers with
-/// weights 1, 4 and 16 share one processor for 2 s; each one's share of the work must be
-/// near its share of the weights (1/21, 4/21, 16/21), and the lightest must not starve.
+/// weights 1, 4 and 16 share one processor for 2 s; each one's share of the time they ran
+/// must be near its share of the weights (1/21, 4/21, 16/21), and the lightest must not
+/// starve.
+///
+/// On a loaded host a late timer interrupt lets the running worker run on, and that alone
+/// can swing the lightest thread's share. Such a run says nothing about the scheduler: if
+/// the shares are wrong and the processor lost ticks or was away for over a tenth of the
+/// window, it is measured again, within a small budget. A wrong result with the ticks all
+/// there and the processor present fails at once.
 fn prove_weights(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
     let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
-    for (i, &w) in WEIGHTS.iter().enumerate() {
-        if spawn_weighted(far, weighted_worker, i as u64, w).is_err() {
+    let window_ticks = WEIGHTS_SECONDS * timer::HZ;
+    let mut attempts = 0;
+    let (shares, ran_ms, ok) = loop {
+        attempts += 1;
+        let Some(run) = run_weighted(far, tsc_hz) else {
             let _ = writeln!(
                 com1,
                 "origin-kernel: scheduler: cannot spawn: scheduler failed"
             );
             return false;
+        };
+        let total: u64 = run.ran.iter().sum();
+        let sum_weights: u32 = WEIGHTS.iter().sum();
+        let mut ok = run.exited && total > 0;
+        let mut shares = [0u64; 3];
+        for (i, (&ran, &w)) in run.ran.iter().zip(&WEIGHTS).enumerate() {
+            let share = per_mille(ran, total);
+            shares[i] = share;
+            ok &= ran > 0 && share_near_weight(share, w, sum_weights);
         }
-    }
-    let start = rdtsc();
-    while rdtsc().wrapping_sub(start) < 2 * tsc_hz {
-        yield_now();
-        cpu::interrupt_window();
-    }
-    WEIGHTED_STOP.store(true, Ordering::Relaxed);
-    yield_until(|| WEIGHTED_EXITED.load(Ordering::Relaxed) == 3, tsc_hz, 2);
-    let counts: [u64; 3] = core::array::from_fn(|i| WEIGHTED[i].load(Ordering::Relaxed));
-    let total: u64 = counts.iter().sum();
-    let sum_weights: u32 = WEIGHTS.iter().sum();
-    let mut ok = WEIGHTED_EXITED.load(Ordering::Relaxed) == 3 && total > 0;
-    let mut shares = [0u64; 3];
-    for (i, (&c, &w)) in counts.iter().zip(&WEIGHTS).enumerate() {
-        // Per mille: the share measured, and the share of the weights.
-        let share = c * 1000 / total.max(1);
-        let ideal = u64::from(w) * 1000 / u64::from(sum_weights);
-        shares[i] = share;
-        ok &= c > 0 && share.abs_diff(ideal) <= ideal / 3 + 15;
-    }
+        let disturbed = run.ticks + TICKS_LOST_TO_A_STALL <= window_ticks
+            || total.saturating_mul(10) < (WEIGHTS_SECONDS * tsc_hz).saturating_mul(9);
+        if ok || !run.exited || !disturbed || attempts == WEIGHTS_ATTEMPTS {
+            break (shares, total / (tsc_hz / 1000).max(1), ok);
+        }
+    };
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: weights 1, 4 and 16 on CPU {far} for 2 s: shares {}, {} and {} per mille (ideal 47, 190 and 761){}",
+        "origin-kernel: scheduler: weights 1, 4 and 16 on CPU {far} for {WEIGHTS_SECONDS} s: shares {}, {} and {} per mille (ideal 47, 190 and 761) over {ran_ms} ms of running{}{}",
         shares[0],
         shares[1],
         shares[2],
+        if attempts > 1 {
+            " (after a stalled run)"
+        } else {
+            ""
+        },
         if ok { "" } else { ": scheduler failed" }
     );
     ok

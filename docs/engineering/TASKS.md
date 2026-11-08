@@ -38,7 +38,7 @@
 | Higher half and KASLR | ADR-0004 H1–H4: boot info 0.3, loader-built tables, RDSEED/RDRAND slides, kernel in the higher half | boot-matrix; three distinct placements; fallback boot; negative control |
 | M4: process address spaces | own PML4 per process, shared kernel half, CR3 per thread | two-process isolation proof; negative control |
 | M4 groundwork: user mode | ring 3, one DPL-3 system-call gate and `syscall`, RSP0 per switch, user faults end the thread, NMI/#MC on IST | 5 user-program proofs, a self-NMI proof; four negative controls |
-| Clocks (§68) | monotonic TSC clock (rate proven against one RTC second), UTC wall clock from the CMOS RTC, TSC consistency across CPUs | boot-matrix; three negative controls |
+| Clocks (§68) | monotonic TSC clock (rate proven against one RTC second; the proofs tolerate a loaded host), UTC wall clock from the CMOS RTC, TSC consistency across CPUs | boot-matrix; twelve negative controls (frozen and wrong-rate RTCs, a wrong PIT rate, a skewed AP, late timers and more) and three positive ones |
 | Serialized console | whole lines from every CPU; urgent path for exceptions and panics | xtask whole-log check; negative control |
 | TLB shootdown, global pages (ADR-0004 H5) | IPIs with per-request generations; kernel half global | every AP's read of an unmapped page faults; two negative controls |
 | Kernel wait queues | blocking, cross-CPU wake-ups by IPI, pending wake-ups | 10 000-item transfer in order; 44–73 µs ping-pong; two negative controls |

@@ -324,6 +324,122 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - QEMU only.
 - **Not done:** HPET or ACPI PM timer fallbacks; resynchronising TSCs (IA32_TSC_ADJUST) when the check fails; TSC-deadline timers; time zones and network time; the user-visible clock calls.
 
+### The clock proofs under host load (`rtc::UpdateWatcher`, `rtc::SecondMeter`, `apic::CalibrationWindow`, `clock::closest_read`; `time::measure_rtc`, `time::prove_consistent`, `timer::calibrate`, `prove_timers`; CLAUDE.md §68, §72; task TIME-RTC-UIP; 2026-11-08)
+
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08, task TIME-RTC-UIP, on `claude/musing-hamilton-587f7b` from `b3efe8a`. Original code.
+- **Why.** The boot proofs that time one clock against another failed `cargo xtask boot-test` on a loaded development host: first `clock: the RTC did not complete two updates in 1.2 s`, then, once that was fixed and measured, the same stall sensitivity in the proofs around it. Every one of these proofs polls a clock on the boot processor and assumed the processor was running the whole time; on a loaded host a virtual CPU is descheduled for milliseconds, which looks to such a proof like the clock misbehaving.
+- **Measured (M1 Max host, QEMU 11.1.3 TCG, `-smp 2`, `cargo xtask boot-test`; one `yes` process per logical core, 10, plus other sessions' work; load averages from about 5 to over 250). Each row is 30 boots; the experiments alternate the two kernels boot by boot, so both see the same background load. The failure classes are each boot's first failure:**
+
+  | Experiment (each row 30 boots, every core busy) | Kernel | Pass | RTC wait timed out | RTC second v. PIT rate | TSC consistency | HPET | `timers` | scheduler | Failure rate |
+  |---|---|---|---|---|---|---|---|---|---|
+  | Sequential baseline | original | 5 | 12 | 11 | | | 2 | | 83 % |
+  | RTC fix alone, alternating | original | 6 | 17 | 7 | | | | | 80 % |
+  | | RTC fix only | 9 | **0** | 19 | | | 2 | | 70 % |
+  | RTC and PIT fixes, alternating | original | 3 | 21 | 6 | | | | | 90 % |
+  | | RTC + PIT fixes | 15 | **0** | 1 | 6 | 1 | 6 | 1 | 50 % |
+  | Final, alternating | original | 5 | 11 | 13 | | | 1 | | 83 % |
+  | | **final (this commit)** | **29** | **0** | **0** | **0** | **0** | **0** | 1 | **3 %** |
+
+
+  "RTC second v. PIT rate" means `one RTC second lasted X us: clock failed`: in all but one of these boots (one original kernel, where a long stall made the second itself read 3 s) the RTC second in TSC ticks was within 0.02 % of 1 GHz and the PIT calibration was wrong (19 of the 30 boots in the sequential baseline had a PIT rate off by at least 1 %, up to 38 %). The final kernel's remaining failure is the scheduler's weighted-share bound (`weights 1, 4 and 16 … for 2 s`), which this work does not touch; the same boot's clock proofs all passed.
+
+- **The causes, in the order the measurements exposed them:**
+  1. The RTC wait (`time.rs`): the proof waited to see register A's update-in-progress bit rise and fall, twice, with 1.2 s per edge. QEMU 11.1 shows that bit only for the last 244 µs of each second (`UIP_HOLD_LENGTH` in `hw/rtc/mc146818rtc.c`), and a virtual CPU descheduled across it missed the pulse. A probe kernel (not committed) that polled the clock for 12 s per boot under the same load saw the pulse missed at 29 % of about 110 updates, and a stall across an update of up to about 5 ms.
+  2. The PIT calibration (`timer.rs`): the 10 ms window that calibrates the TSC is polled, and a stall at either end, or between programming the count and raising the gate, corrupts the TSC rate by as much as the stall. The proof then reports the disagreement: `one RTC second lasted 746585 us on the PIT-calibrated TSC: clock failed`. In all but one such failure the RTC second itself, in TSC ticks, was within 0.02 % of 1 GHz: these "one RTC second" failures were the PIT window, not the RTC or the 1 % tolerance. A probe of 400 windows per boot found 5 % disturbed at light load and about 60 % under full load (about a quarter of those by under 200 µs, the rest up to several milliseconds). QEMU's PIT counts from the count's last byte, not the gate's rise (`pit_set_channel_gate` in `hw/timer/i8254.c` ignores the gate in mode 0), which the code now brackets too.
+  3. The TSC-consistency proof (`time.rs`, `prove_consistent`): it requires at least 100 handoffs between processors in 100 ms, to prove they interleaved; on a loaded host two virtual CPUs rarely run at once.
+  4. The HPET and PM-timer cross-checks (`time.rs`): a stall between reading the counter and reading the TSC made the two clocks appear to disagree (one boot: 24 ms by the HPET, 20 ms by the TSC).
+  5. `prove_timers` (`main.rs`): a timer "late" by more than 2 ms, when in fact the processor polling the queue was stalled.
+- **Options weighed for the RTC (the task's question).**
+  - *Keep waiting for the bit, retry on a miss:* it still depends on catching a 244 µs pulse, and costs a whole second per miss.
+  - *Treat a change of the seconds register as the edge* (chosen as the detector): every update is visible, however long the processor was away. Alone it moves the failure: a stall just after an update stretches one measured second by the stall, and the proof's 1 % is 10 ms, about the size of a bad stall.
+  - *Bracket each edge, and decide only on a whole interval* (chosen): an edge lies between the last poll showing the old second (or the update bit) and the first poll showing the new one, so a measurement is an interval that certainly contains the true second, and it decides only if the whole interval is inside, or outside, 1 % of the PIT rate. No stall can produce a wrong verdict, in either direction. The boot line shows the interval: `one RTC second lasted X us (+/- E us, over N s)`.
+  - *Measure across more than one second* (used when needed): a pair too vague to decide gives way to the next edge, over a longer baseline, with the seconds counted from the register so that a stall which hides an update still counts it. The proof stops at the second edge when nothing stalls, at most two seconds as before; the budget is 3.2 s (about one second more than before), used only when an edge was spoiled.
+- **What (library, host-tested, `forbid(unsafe_code)`):** `rtc`: `Poll`, `UpdateWatcher` (polls to edges), `UpdateEdge`, `SecondMeter` (edges to a `SecondMeasurement` with min/max ticks per RTC second and a `SecondVerdict`), `seconds_value`. `apic::CalibrationWindow`: the TSC readings around a PIT one-shot and whether it was observed closely. `clock::closest_read`: a counter read paired with the time stamp around it, retried until the bracket is tight.
+- **What (kernel binary):** `time::measure_rtc` replaces `update_end` (and reads the wall clock just after the sharpest edge, only if the registers still show that edge's second). `timer::calibrate` measures up to 32 windows, keeping the first clean one (each bracket within 1/500 of the window, 20 µs) or else the least disturbed, and reports how many it discarded. The HPET and PM-timer cross-checks pair each counter read with the TSC through `closest_read`. `prove_consistent` keeps going up to 500 ms while there are fewer than 100 handoffs. `prove_timers` repeats a run (at most six) whose polling loop stalled and went wrong, and fails at once if a timer is late with the poller running normally. None of the proofs got looser: every bound is unchanged, a wrong rate still fails, and only a stall that demonstrably corrupted a measurement is forgiven.
+- **Specifications and behaviour relied on.** The RTC: ST M48T86 data sheet, Rev. 4.0 (April 2004), "UIP. Update in Progress" and "Update Cycle" (the MC146818-compatible PC clock): a clear bit means the update transfer is at least 244 µs away, and a read during an update may not be valid; the update advances the seconds register. So a seconds reading is believed only if the bit was read clear first and the poll took under 244 µs, and a set bit is used only as evidence that the update has not ended. **Gaps:** the original Motorola MC146818 data sheet and the Intel PCH RTC chapter were not read; Intel's register description (document 795260) gives 488 µs, seen only in a search excerpt, and only the smaller 244 µs is relied on. QEMU's models were read in `hw/rtc/mc146818rtc.c` and `hw/timer/i8254.c` (11.1.0): they are the test machine, not operating-system implementations. Intel's and AMD's PIT and PM-timer interfaces are as already recorded.
+- **Unsafe:** no new `unsafe` blocks. `Cmos::new`'s use moved into a closure with the same contract; the PM-timer `ind` keeps its block and contract inside the read closure; `measure_window` is the same port and MSR accesses as before, split out.
+- **Test evidence:**
+  - Library tests (all `framekernel --lib`, 426 passing): the watcher (brackets, a missed pulse, readings a clear bit cannot vouch for, stalls across the minute wrap in BCD and binary); the meter (decisions only on a whole interval, a longer baseline, a stall hiding a second, keeping sharp edges); a simulator of a clock (QEMU's timing and a real part's) and a polling processor with stalls, on which every edge contains its update and every measurement's interval contains the clock's true period over 4000 seeded cases at any rate from a tenth to ten times the expected and any stall pattern (`ORIGIN_MUTATION_SCALE=20` passes too), verdicts are never wrong, a frozen clock gives no measurement, a good clock decides at the second edge without stalls, and within the budget with them; `CalibrationWindow`, `closest_read` (hand cases and arbitrary inputs).
+  - Negative controls, each a temporary edit on a scratch copy of the final tree, each failing the boot as stated (positive controls in italics):
+    - the seconds frozen → `the RTC did not complete two updates in 3.2 s: clock failed`;
+    - the update bit stuck set → the same;
+    - TSC timestamps skewed 3 % (an RTC 3 % slow against the TSC) → `one RTC second lasted 1029962 us (+/- 29 us, over 1 s): clock failed`;
+    - seconds doubled (twice the rate) → `one RTC second lasted 500015 us (+/- 3 us, over 2 s): clock failed`;
+    - seconds halved (half the rate) → `one RTC second lasted 2000162 us (+/- 1 us, over 1 s): clock failed`;
+    - the PIT-calibrated TSC rate 3 % high → `one RTC second lasted 970911 us (+/- 13 us, over 1 s): clock failed`;
+    - *a 30 ms stall in the first PIT window → the window is discarded and the boot passes;* with the clean check removed, the same stall → `: APIC timer is wrong` (the window read as a TSC of 1505 MHz);
+    - an AP's TSC readings 5000 ticks ahead → `3189 backwards (worst 5000 ticks): clock failed`;
+    - handoffs set unreachably high → `… 36279 handoffs … : clock failed`;
+    - the HPET 3 % fast → `: HPET failed`; the PM timer 3 % fast → `: PM timer failed`;
+    - *a 5 ms stall between an HPET read and its TSC read → discarded, the boot passes;*
+    - a timer genuinely 3 ms late with the poller running → `worst lateness 3000 us: timers failed`; *one polling run stalled 9 ms → repeated, "worst lateness 0 us (after a stalled run)", boot passes.*
+  - `cargo xtask check` passes (701 tests, 0 failures, 6 ignored); `cargo xtask boot-matrix` passes (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs, then `boot-x2apic` on leaves 1Fh and 0Bh). In the final comparison the calibration discarded at most 12 of 32 windows (a window is 10 ms), `prove_timers` needed a second run in 2 boots of 30, and the RTC second's uncertainty had a median of +/- 759 µs and a maximum of +/- 3663 µs; every measurement took one second, none needed a longer baseline.
+- **Not done:** the scheduler's weighted-share bound (`weights 1, 4 and 16 on CPU 1 for 2 s`) failed once in 30 boots at the highest load and is unchanged (since addressed: "The weighted-share proof under host load", next); the HPET and PM-timer proofs' 2 % windows (read-paired now, and they held in the final run) were not injected with host-sized stalls beyond the positive control; the TSC-consistency window extends to 500 ms under load; everything here is QEMU only (CLAUDE.md §74), and the real-hardware RTC timing is covered by the data sheet and the simulator's hardware model, not by a measurement.
+- **Licensing:** project licence not chosen yet.
+
+### The weighted-share proof under host load (`sched::prove_weights`, `sched::run_weighted`, `sched::weighted_worker`, `runqueue::per_mille`, `runqueue::share_near_weight`; CLAUDE.md §26, §72; task SCHED-SHARE-LOAD; 2026-11-08)
+
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08, task SCHED-SHARE-LOAD, on `claude/elegant-thompson-48edc8` from `20b8817` (the clock proofs, `claude/musing-hamilton-587f7b`). Original code.
+- **Why.** The proof that weighted threads share a processor in proportion to their weights (three never-yielding workers, weights 1, 4 and 16, on one processor for 2 s; each share within a third of its ideal plus 15 per mille) was the last boot proof still failing on a loaded host: 1 boot in 30 with every core loaded (`shares 81, 195 and 722 per mille`, ideal 47, 190 and 761).
+- **The cause, measured.** The proof counted loop iterations. A probe kernel (not committed) repeated the proof 30 times per boot and logged every timer tick on the workers' processor, with one `yes` per logical core and other sessions' work on the machine (load averages from about 15 to about 190):
+  - The slices came on time: the median gap between ticks was 9.9 ms and the 99th percentile 17 ms.
+  - The work done in a slice did not. Over 5992 slices the rate was 0.27 iterations per microsecond at the 10th percentile, 0.71 at the median and 1.53 at the 90th (extremes 0.001 and 4.1).
+  - The lightest worker's share is the sum of about ten such slices. In the probe's failing run its share read 80 per mille by iterations (the bound is 77), while the same run's time between ticks read 53 and its slice count 50.
+
+  So the proof was measuring how fast the host happened to run the virtual CPU during those ten slices, not how much processor the scheduler gave each thread.
+- **What changed (kernel binary, `sched.rs`).**
+  - `weighted_worker` reports the time it saw itself running instead of an iteration count: every turn of its loop reads the TSC and adds the step since the last reading if it is shorter than 3 ms (about a third of a tick). A longer step is a preemption, or the virtual CPU being away, and counts for nothing. `prove_weights` applies the bound to these times exactly as it was applied to the iteration counts.
+  - `prove_weights` believes a wrong result only from an undisturbed run. If the workers' processor took at least 3 of the window's 200 timer ticks fewer than it should (a late tick coalesced with the next, as a stalled vCPU or QEMU main loop causes), or the workers saw themselves run for under nine tenths of the window, the run says nothing about the scheduler and is measured again, at most three runs in all (`run_weighted` repeats the whole 2 s). A wrong result with the ticks and the processor present fails at once, the rule of `prove_timers`.
+  - The boot line now says how long the workers ran and whether a run was repeated: `… per mille (ideal 47, 190 and 761) over N ms of running (after a stalled run)`; the `boot-test` markers still match.
+- **What changed (library, host-tested).** `runqueue::per_mille` and `runqueue::share_near_weight` hold the proof's arithmetic, with a test pinning the bound at its edges: 17–77, 112–268 and 493–1029 per mille for weights 1, 4 and 16 of 21.
+- **Why time, and why the 3 ms limit.** Time rather than iterations: an emulated processor's iterations per slice measure the host, while stride scheduling allocates processor time. The measure stays end to end: each worker reports what it saw of itself, so a thread that is starved, or a wrong thread run in its place, shows up (see the controls), and a thread that does not run has nothing to report. The limit decides how long a gap in a worker's own clock still counts as running. It was chosen from a probe of the candidate's own loop that measured every limit on identical runs. At 50 µs the worker sees itself run for 38 % of the window and the lightest share's spread is 8.0 per mille; at 1 ms, 62 % and 6.0; at 3 ms, 89 % and 3.8; beyond that the spread stops improving (3.4 at 5 ms, against 3.2 for the time between ticks) while a slight bias toward the heaviest worker grows (a worker preempted by a catch-up slice shorter than the limit counts the gap as running: 0.5 % of slices at 3 ms, 16 % at 8 ms). The time between ticks would be steadier still, but it is the scheduler's own account of itself, not the thread's.
+- **Measured (M1 Max host, QEMU 11.1.3 TCG, `-smp 2`).** Probe kernels (not committed) repeated the proof 30 times per boot; "1×" is one `yes` per logical core (10) with other sessions running too, load averages from about 15 to about 190; "2×" is two `yes` per logical core. Each row is the runs named, all on the same load:
+
+  | Probe, load | Runs | Measure | Outside the bound | Weight-1 share, per mille: mean ± sd (range) | Worst distance / tolerance |
+  |---|---|---|---|---|---|
+  | The original worker loop, 1× | 150 | iterations (the proof before this change) | 0 | 48.7 ± 6.8 (31–67) | 0.67 |
+  | The candidate's loop, 1× | 150 | iterations | 1 (0.7 %) | 50.9 ± 9.3 (31–78) | 1.03 |
+  | | 150 | time seen running, limit 100 µs | 0 | 50.4 ± 7.8 (32–71) | 0.80 |
+  | | 150 | time seen running, limit 1 ms | 0 | 49.6 ± 6.0 (36–63) | 0.53 |
+  | | 150 | **time seen running, limit 3 ms (this change)** | **0** | **48.1 ± 3.8 (37–56)** | **0.38** |
+  | | 150 | time seen running, limit 5 ms | 0 | 47.8 ± 3.4 (37–55) | 0.33 |
+  | | 150 | time between ticks (reference) | 0 | 49.8 ± 3.2 (40–57) | 0.33 |
+  | | 150 | slice counts (reference) | 0 | 50.2 ± 0.7 (47–55) | 0.27 |
+  | The candidate's loop, 2× | 150 | iterations | 9 (6.0 %) | 51.7 ± 16.0 (15–120) | 2.43 |
+  | | 150 | time seen running, limit 1 ms | 4 (2.7 %) | 50.1 ± 12.3 (22–97) | 1.67 |
+  | | 150 | **time seen running, limit 3 ms (this change)** | **2 (1.3 %)** | **47.9 ± 9.7 (25–94)** | **1.57** |
+  | | 150 | time seen running, limit 5 ms | 1 (0.7 %) | 46.9 ± 8.5 (26–86) | 1.30 |
+  | | 150 | time between ticks (reference) | 0 | 50.0 ± 7.4 (36–71) | 0.80 |
+  | | 150 | slice counts (reference) | 0 | 49.6 ± 1.9 (47–57) | 0.33 |
+
+  The time rows measure the candidate's worker loop and each row's iterations are from the same runs, so the comparison is between measures on one load. The bound's tolerance for weight 1 is ±30 per mille around 47. At 1× an earlier probe boot (the original loop, 30 runs, whose iteration spread was 12.0 per mille against 6.8 for the 150 runs above) broke the bound once by iterations (80, 166 and 753 per mille) and an instrumented probe once in 150 (84, 215 and 699); the time between ticks read 53 and 51 for the weight-1 worker in those two runs. The workers' processor lost at least 3 of the window's 200 ticks in 25 % of the 1× runs (median 199 taken, minimum 190) and in 144 of the 150 runs at 2× (median 184, minimum 161), where a wrong result is therefore always repeated. The accounted running time (`over N ms of running`) is about 1985 ms of the 2 s window on a quiet host (the boots of the controls and of the boot matrix, 1982 to 2026 ms; the window itself overruns a little on one processor), and 89 % of the window on average at 1× load (minimum 73 %).
+
+  `cargo xtask boot-test`, the parent kernel `20b8817` and this change alternating boot by boot, each boot's first failure:
+
+  | Experiment (alternating boot by boot) | Kernel | Boots | Pass | First failure: this proof | First failure: another proof | Failure rate | Weight-1 share in the boot lines (range, per mille) | Mean boot time |
+  |---|---|---|---|---|---|---|---|---|
+  | 1×, 30 pairs (1-minute load averages 8 to 89) | original (`20b8817`) | 30 | 30 | 0 | 0 | 0 % | 34–64 | 26 s |
+  | | **this change** | 30 | 30 | 0 | 0 | **0 %** | 40–53 | 24 s |
+  | 2×, 15 pairs (1-minute load averages 30 to 130) | original (`20b8817`) | 15 | 12 | 2 | 1 (`timers`) | 20 % | 19–90 | 34 s |
+  | | **this change** | 15 | 14 | **0** | 1 (`timers`) | 7 % | 17–52 | 38 s |
+
+  At one `yes` per core neither kernel failed in 30 boots: a failure rate of one in thirty, as seen before, does not show up reliably in so few boots, and the host was calmer than in the probe runs (other sessions had gone idle); the 150-run probe above is the discriminating measurement at this load. At double load the original kernel failed this proof in 2 boots of 15 (`shares 90, 203 and 706` and `85, 172 and 741`), this change in none. Five of this change's 45 boots repeated a run (one at 1×, four at 2×) and all of them passed this proof. The `timers` failures are `prove_timers` at double load (worst lateness 3.3 and 7.0 ms, after a stalled run): another proof with its own load sensitivity, one boot in each arm, not touched here.
+
+- **Negative and positive controls** (each a temporary edit on a scratch copy of the final tree, each booted with `cargo xtask boot-test`; positive controls in italics):
+  - a worker with the wrong weight (16 instead of 1) → `shares 449, 109 and 441 per mille … over 1982 ms of running: scheduler failed`, at the first run (the ticks were all there);
+  - a smaller wrong weight (2 instead of 1) → `shares 93, 178 and 728 … scheduler failed`;
+  - weights ignored (one stride for every thread) → `shares 337, 334 and 328 … scheduler failed`;
+  - one weighted worker never picked by the run queue → `shares 208, 791 and 0 … scheduler failed`;
+  - the run queue picking the highest pass instead of the lowest, and a tick that never preempts → `workers did not exit: scheduler failed` (the earlier preemption proof catches both before this one runs);
+  - the step limit one second instead of 3 ms, so preemptions count as running → `shares 326, 335 and 338 … over 5822 ms of running: scheduler failed`;
+  - *one worker holding the timer off for 70 ms in the first run (interrupts masked while it keeps running, as a late tick looks) → the run is repeated and the boot passes: `shares 50, 196 and 753 … over 1989 ms of running (after a stalled run)`;*
+  - the same stall with the repeat disabled → `shares 83, 184 and 732 … scheduler failed` (the stall really would have failed the proof);
+  - a stall in every run → `shares 81, 180 and 738 … (after a stalled run): scheduler failed`, after three runs (the budget is bounded).
+- **Unsafe:** none added.
+- **Gates:** `cargo xtask check` passes (702 tests, 0 failures, 6 ignored, one test more than before); `cargo xtask boot-matrix` passes (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs, then `boot-x2apic` on leaves 1Fh and 0Bh), every boot within 47–51, 189–194 and 755–760 per mille over 1984 to 2026 ms of running, none repeated.
+- **Not done:** the fairness check in `sched::prove` (two workers on each CPU within a factor of two) still counts iterations; it is far from failing (median ratio 1.10, worst 1.52 over 30 samples at 1× and 1.43 over 10 at 2×, bound 2). At double load, `wait queues: ping-pong` (1000 round trips, each under 2000 µs) failed 3 boots of 5 in the probe runs (2003, 2045 and 2084 µs) and `prove_timers` (a timer at most 2 ms late) failed 2 boots of 30 in the A/B: different proofs, different mechanisms, not touched here. The window was not lengthened, so nothing here costs a normal boot any time. The step limit fits this host's stalls (milliseconds); on physical hardware (CLAUDE.md §74) the limit does not matter because a worker is not descheduled. QEMU only.
+- **Licensing:** project licence not chosen yet.
+
 ### Serialized kernel console (2026-11-07)
 
 - **What:**

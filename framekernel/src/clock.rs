@@ -131,6 +131,31 @@ pub fn cpuid_tsc_hz(eax: u32, ebx: u32, ecx: u32) -> Option<u64> {
     (hz != 0).then_some(hz)
 }
 
+/// A reading of a counter paired with a time stamp from around it: `read` returns the
+/// time stamp before the read, the value, and the time stamp after. Reads are retried, at
+/// most `attempts` times, until one is bracketed within `tight` ticks; otherwise the
+/// narrowest bracket is used. Returns the value and the middle of its bracket, so that a
+/// stall between reading a counter and taking the time cannot make two clocks seem to
+/// disagree.
+pub fn closest_read(
+    attempts: u32,
+    tight: u64,
+    mut read: impl FnMut() -> (u64, u64, u64),
+) -> (u64, u64) {
+    let mut best: Option<(u64, u64, u64)> = None;
+    for _ in 0..attempts.max(1) {
+        let (before, value, after) = read();
+        let width = after.saturating_sub(before);
+        if best.is_none_or(|(narrowest, ..)| width < narrowest) {
+            best = Some((width, value, before.saturating_add(width / 2)));
+        }
+        if width <= tight {
+            break;
+        }
+    }
+    best.map_or((0, 0), |(_, value, at)| (value, at))
+}
+
 /// Whether two independent rate estimates agree within `parts_per_thousand`.
 pub fn rates_agree(a: u64, b: u64, parts_per_thousand: u64) -> bool {
     let (lo, hi) = (a.min(b), a.max(b));
@@ -317,6 +342,66 @@ mod tests {
             cpuid_tsc_hz(1, u32::MAX, u32::MAX),
             Some(u64::from(u32::MAX) * u64::from(u32::MAX))
         );
+    }
+
+    #[test]
+    fn a_read_paired_with_the_clock_is_retried_until_it_is_close() {
+        // The first read is close: taken at once, at the middle of its bracket.
+        let mut calls = 0;
+        let mut once = || {
+            calls += 1;
+            (100, 7, 110)
+        };
+        assert_eq!(closest_read(8, 20, &mut once), (7, 105));
+        assert_eq!(calls, 1);
+        // Two stalled reads, then a close one.
+        let mut calls = 0;
+        let mut stalled = || {
+            calls += 1;
+            if calls < 3 {
+                (0, 1, 500)
+            } else {
+                (1000, 2, 1010)
+            }
+        };
+        assert_eq!(closest_read(8, 20, &mut stalled), (2, 1005));
+        assert_eq!(calls, 3);
+        // Never close enough: the narrowest of the attempts is used, and every attempt
+        // was made.
+        let mut widths = [900u64, 300, 700].iter().cycle();
+        let mut calls = 0;
+        let mut wide = || {
+            calls += 1;
+            let w = *widths.next().unwrap();
+            (10_000, w, 10_000 + w)
+        };
+        assert_eq!(closest_read(5, 20, &mut wide), (300, 10_150));
+        assert_eq!(calls, 5);
+        // At least one attempt is always made.
+        assert_eq!(closest_read(0, 20, || (5, 6, 5)), (6, 5));
+    }
+
+    /// Any values at all: nothing overflows or panics, and the value returned is the one
+    /// read with the narrowest bracket of the attempts made (CLAUDE.md §13).
+    #[test]
+    fn any_paired_reads_are_handled() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0x5041_4952);
+        for case in 0..crate::testing::cases(50_000) {
+            let reads: Vec<(u64, u64, u64)> = (0..1 + rng.below(6))
+                .map(|_| (rng.edge_u64(), rng.edge_u64(), rng.edge_u64()))
+                .collect();
+            let mut i = 0;
+            let (value, at) = closest_read(reads.len() as u32, rng.edge_u64(), || {
+                let r = reads[i.min(reads.len() - 1)];
+                i += 1;
+                r
+            });
+            let matches_a_read = reads.iter().any(|&(before, v, after)| {
+                v == value && at == before.saturating_add(after.saturating_sub(before) / 2)
+            });
+            assert!(matches_a_read, "case {case}");
+        }
     }
 
     #[test]

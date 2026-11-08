@@ -1047,7 +1047,7 @@ The owner accepted the sheet's recommendations for items 1–6, 8, 9 and 13–20
 #### Next
 
 - Check every VT-d encoding against Rev 5.20, then ADR-0007's question 3.
-- Make the RTC wait in `time.rs` robust under host load.
+- ~~Make the RTC wait in `time.rs` robust under host load.~~ Done; see the next section.
 - **The owner:** the AMD manuals' hashes (item 23), then ADR-0007's questions 6–8; the licence, the push, the hardware (items 21, 22, 24).
 
 ### Continued (2026-11-08, ~15:25 IST): every VT-d encoding checked against Rev 5.20
@@ -1185,3 +1185,39 @@ The tree before the last merge failed six times on the clock proofs before it pa
 #### Next
 
 Merge the clock and scheduler fixes if the owner agrees, since the unreliable gates are what made this push slow. Then the timer-queue and ping-pong proofs.
+
+### Continued (2026-11-08, ~15:10–17:15 IST): the clock proofs under host load (task TIME-RTC-UIP)
+
+On `claude/musing-hamilton-587f7b`, from `b3efe8a`, **committed locally, not merged, not pushed**.
+
+The task was the RTC wait (`time.rs`). Measuring it first showed that was only half the flake: with every host core loaded, the boot fails 83 % of the time, with the RTC wait timing out in 40 % of boots and, in most of the rest, the *PIT calibration* off by up to 39 % (the RTC second itself was right to 0.02 %). So the fix covers both, and the cross-CPU check, the HPET and PM-timer read pairs, and `prove_timers`' lateness bound, which share the cause: every one polls a clock and assumed it was never descheduled. The parent session left that scope to judgement.
+
+- **The RTC second** is now timed from the seconds register, between brackets, and decided only when a whole interval of uncertainty is inside or outside 1 % (`rtc::UpdateWatcher`, `rtc::SecondMeter`). A stalled edge costs precision, not the measurement; a vague pair waits for the next edge, up to a 3.2 s budget (at most one second more than the old two, used only when an edge was spoiled).
+- **The PIT calibration** measures a 10 ms window again when its ends were not observed closely (`apic::CalibrationWindow`; up to 32 windows; QEMU's PIT counts from the count write, not the gate, and the bracket covers both).
+- **The others:** `prove_consistent` extends to 500 ms while there are fewer than 100 handoffs; HPET and PM-timer reads are paired with the TSC through `clock::closest_read`; `prove_timers` repeats a run whose polling loop stalled, and fails at once if a timer is late with the poller running.
+- **Measured** (`boot-test`, one `yes` per logical core, 30 boots per arm, alternating): original 83 % → final 3 % failures; RTC-wait timeouts 11 → 0; PIT-off 13 → 0; the one final failure is the scheduler's weighted-share bound. All the before/after numbers, the 12 negative controls and the 3 positive ones are in `docs/engineering/SOURCE_PROVENANCE.md`, "The clock proofs under host load".
+- **Gates:** `cargo xtask check` (701 tests, 0 failures, 6 ignored); `cargo xtask boot-matrix` (Intel and AMD at 1, 2, 4 CPUs, `boot-x2apic`).
+- **Note for whoever edits a boot proof:** QEMU's `hw/timer/i8254.c` ignores the gate in mode 0; any new PIT window must bracket the count write. Any proof that polls a clock and compares to a bound should keep the bracket-and-retry shape, or a loaded host will fail it.
+
+#### Next
+
+- ~~The scheduler's weighted-share bound is the last load-sensitive proof seen (1 boot in 30 with every core loaded). It is a separate proof (`sched`), not changed here.~~ Done; see the next section.
+- Merge this branch (it touches `time.rs`, `timer.rs`, `main.rs`'s `prove_timers`, `rtc.rs`, `apic.rs`, `clock.rs`).
+
+
+### Continued (2026-11-08, ~17:10–19:01 IST): the weighted-share proof under host load (task SCHED-SHARE-LOAD)
+
+On `claude/elegant-thompson-48edc8`, from `20b8817` (the clock proofs above), **committed locally, not merged, not pushed**. It touches `framekernel/src/sched.rs` and `runqueue.rs` only, neither of which differs on `claude/interesting-carson-ae7c83`, so it merges cleanly after the clock-proof branch.
+
+The task assumed a stall distorting a slice. Measuring first showed something broader: the proof counted loop iterations, and on a loaded host the iterations in a 10 ms slice vary by more than tenfold whatever the scheduler did (0.27 to 1.53 per µs between the 10th and 90th percentiles over 5992 slices), so the lightest thread's share, the sum of about ten slices, is noise. In the probe's failing run the iteration share read 80 per mille while the time between ticks read 53.
+
+- **The fix:** each worker reports the time it saw itself running: every TSC step shorter than 3 ms (about a third of a tick; a longer one is a preemption or the vCPU being away). The bound is untouched and pinned by a host test (`runqueue::per_mille`, `runqueue::share_near_weight`). A wrong result from a run that visibly lost at least 3 of its 200 timer ticks, or whose workers ran for under nine tenths of the window, is measured again (at most three runs); a wrong result from an undisturbed run fails at once. The boot line gains `over N ms of running`, and `(after a stalled run)` when a run was repeated.
+- **Measured** (each row the same runs; `docs/engineering/SOURCE_PROVENANCE.md`, "The weighted-share proof under host load"): one `yes` per logical core, 150 runs: the iteration bound 1 of 150 (and 1 of 30 in an earlier probe boot), the new measure 0 of 150 (weight-1 spread 3.8 per mille against 9.3 for iterations). Two `yes` per core: iterations 9 of 150 (6.0 %), the new measure 2 of 150 (1.3 %), both of those with 28 and more ticks lost, so a retry covers them. Boot level: at one `yes` per core neither kernel failed in 30 boots; at two per core the old kernel failed this proof in 2 boots of 15 (`shares 90, 203 and 706` and `85, 172 and 741`) and this change in none, with `timers` failing one boot of each.
+- **Controls:** a wrong weight, the wrong pick, weights ignored, no preemption and a preposterous step limit all fail the boot; a 70 ms interrupts-masked stall in a run is detected, repeated, and passes (with the retry disabled the same stall fails it; stalled every time, it fails after three runs).
+- **Gates:** `cargo xtask check` (702 tests, 0 failures, 6 ignored); `cargo xtask boot-matrix` (Intel and AMD at 1, 2, 4 CPUs, `boot-x2apic`; every boot's shares 47–51, 189–194 and 755–760 per mille).
+- **Note for whoever edits a boot proof:** iterations of a spin loop per timer slice measure the host under TCG; proportional-share style proofs should count the time a thread saw itself running. At double host load, `wait queues: ping-pong`'s 2000 µs bound failed in 3 boots of 5 (2003, 2045 and 2084 µs) and `prove_timers` failed 2 boots of 30: different proofs, not touched.
+
+#### Next
+
+- Merge this branch after the clock-proof branch (`claude/musing-hamilton-587f7b`).
+- The two-worker fairness check in `sched::prove` still counts iterations (worst ratio 1.52 in 30 samples at full load, bound 2); `wait::prove`'s ping-pong bound and `prove_timers`' 2 ms bound fail at double load.

@@ -7,7 +7,8 @@
 //!    gate;
 //! 2. switch the local APIC to x2APIC mode and software-enable it;
 //! 3. calibrate: a 10 ms PIT channel-2 one-shot, during which the APIC timer counts down
-//!    from 2^32 − 1 and the TSC counts up;
+//!    from 2^32 − 1 and the TSC counts up, repeated when a stall spoiled it
+//!    ([`apic::CalibrationWindow`]);
 //! 4. run the APIC timer periodically at [`HZ`], take [`PROOF_TICKS`] interrupts while
 //!    polling with interrupt windows (never halting, so a lost interrupt cannot hang the
 //!    check past its two-second deadline), and check the TSC-measured time;
@@ -16,8 +17,9 @@
 use core::fmt::Write;
 
 use framekernel::apic::{
-    self, IA32_APIC_BASE, SPURIOUS_VECTOR, TIMER_VECTOR, TimerMode, X2APIC_ID, X2APIC_LVT_TIMER,
-    X2APIC_SVR, X2APIC_TIMER_CURRENT, X2APIC_TIMER_DIVIDE, X2APIC_TIMER_INITIAL, X2APIC_VERSION,
+    self, CalibrationWindow, IA32_APIC_BASE, SPURIOUS_VECTOR, TIMER_VECTOR, TimerMode, X2APIC_ID,
+    X2APIC_LVT_TIMER, X2APIC_SVR, X2APIC_TIMER_CURRENT, X2APIC_TIMER_DIVIDE, X2APIC_TIMER_INITIAL,
+    X2APIC_VERSION,
 };
 
 use crate::console::Console;
@@ -36,6 +38,11 @@ const CALIBRATION_MICROS: u64 = 10_000;
 const DIVISOR: u32 = 16;
 /// Port reads to wait for the PIT before giving up.
 const PIT_POLL_LIMIT: u32 = 50_000_000;
+/// Calibration windows to measure before taking the least disturbed one. A window is
+/// spoiled by a stall near its start or its end, and each spoiled one costs 10 ms; on the
+/// development host under full load about 60 % are spoiled, and a boot with no clean
+/// window among 32 is then a chance of about 1 in 10^7.
+const CALIBRATION_WINDOWS: u32 = 32;
 
 /// Master and slave 8259 data (mask) ports.
 const PIC_MASTER_DATA: u16 = 0x21;
@@ -227,16 +234,21 @@ pub(crate) fn init(com1: &mut Console) -> Option<u64> {
         ((version >> 16) & 0xFF) + 1
     );
 
-    let Some((apic_hz, tsc_hz)) = calibrate(&lapic, &mut ports) else {
+    let Some((apic_hz, tsc_hz, disturbed)) = calibrate(&lapic, &mut ports) else {
         let _ = writeln!(com1, "origin-kernel: APIC timer calibration failed");
         return None;
     };
-    let _ = writeln!(
+    let _ = write!(
         com1,
         "origin-kernel: APIC timer calibrated against the PIT: {} kHz (divide by {DIVISOR}), TSC {} MHz",
         apic_hz / 1000,
         tsc_hz / 1_000_000
     );
+    if disturbed != 0 {
+        let noun = if disturbed == 1 { "window" } else { "windows" };
+        let _ = write!(com1, " ({disturbed} disturbed {noun} discarded)");
+    }
+    let _ = writeln!(com1);
     let Some(count) = apic::initial_count(apic_hz, HZ) else {
         let _ = writeln!(
             com1,
@@ -283,39 +295,87 @@ pub(crate) fn init(com1: &mut Console) -> Option<u64> {
     Some(tsc_hz)
 }
 
-/// Measures the APIC timer and the TSC over a PIT channel-2 one-shot. Returns their rates
-/// in Hz, or `None` if the PIT never reached terminal count.
-fn calibrate(lapic: &X2Apic, ports: &mut LegacyPorts) -> Option<(u64, u64)> {
-    let pit = apic::pit_count(CALIBRATION_MICROS)?;
-    lapic.write(ApicWrite::TimerDivide, apic::divide_config(DIVISOR)?);
+/// One PIT channel-2 one-shot of `pit` input clocks, with the APIC timer counting down and
+/// the TSC counting up: the APIC ticks that elapsed and the TSC readings around the window.
+/// `None` if the PIT never reached terminal count.
+fn measure_window(
+    lapic: &X2Apic,
+    ports: &mut LegacyPorts,
+    pit: u16,
+) -> Option<(u64, CalibrationWindow)> {
     lapic.stop_timer();
     // Gate low and speaker off while programming channel 2 for mode 0.
     let port61 = ports.read(apic::PIT_GATE_PORT) & !0b11;
     ports.write(apic::PIT_GATE_PORT, port61);
     ports.write(apic::PIT_COMMAND, apic::PIT_CHANNEL2_MODE0);
     ports.write(apic::PIT_CHANNEL2, (pit & 0xFF) as u8);
+    // Start the three clocks together: the PIT's count (a real 8254 counts from the gate's
+    // rise, QEMU's model from the count's last byte, so the bracket covers both), the APIC
+    // count-down and the TSC.
+    let before_start = rdtsc();
     ports.write(apic::PIT_CHANNEL2, (pit >> 8) as u8);
-    // Start the three clocks together: the PIT gate, the APIC count-down, the TSC.
     ports.write(apic::PIT_GATE_PORT, port61 | 1);
     lapic.write(ApicWrite::TimerInitial, u64::from(u32::MAX));
-    let tsc0 = rdtsc();
+    let after_start = rdtsc();
+    let mut before_end = after_start;
     let mut polls = 0u32;
     // OUT2 (port 0x61 bit 5) rises at terminal count.
-    while ports.read(apic::PIT_GATE_PORT) & 0x20 == 0 {
+    loop {
+        let before = rdtsc();
+        if ports.read(apic::PIT_GATE_PORT) & 0x20 != 0 {
+            break;
+        }
+        before_end = before;
         polls += 1;
         if polls == PIT_POLL_LIMIT {
             lapic.stop_timer();
             return None;
         }
     }
-    let tsc1 = rdtsc();
+    let after_end = rdtsc();
     let current = lapic.read(ApicRead::TimerCurrent);
+    let after_read = rdtsc();
     lapic.stop_timer();
     ports.write(apic::PIT_GATE_PORT, port61);
-    let nanos = apic::pit_nanos(pit);
     let apic_ticks = u64::from(u32::MAX).checked_sub(current)?;
     Some((
+        apic_ticks,
+        CalibrationWindow {
+            before_start,
+            after_start,
+            before_end,
+            after_end,
+            after_read,
+        },
+    ))
+}
+
+/// Measures the APIC timer and the TSC against the PIT, repeating a window that a stall
+/// spoiled (see [`CalibrationWindow`]) and settling, after [`CALIBRATION_WINDOWS`], for the
+/// least disturbed one (the RTC proof then decides whether it is good enough). Returns
+/// their rates in Hz and the windows it discarded, or `None` if the PIT never reached
+/// terminal count.
+fn calibrate(lapic: &X2Apic, ports: &mut LegacyPorts) -> Option<(u64, u64, u32)> {
+    let pit = apic::pit_count(CALIBRATION_MICROS)?;
+    lapic.write(ApicWrite::TimerDivide, apic::divide_config(DIVISOR)?);
+    let nanos = apic::pit_nanos(pit);
+    let mut best: Option<(u64, CalibrationWindow)> = None;
+    let mut disturbed = 0;
+    for _ in 0..CALIBRATION_WINDOWS {
+        let (apic_ticks, window) = measure_window(lapic, ports, pit)?;
+        if window.clean() {
+            best = Some((apic_ticks, window));
+            break;
+        }
+        disturbed += 1;
+        if best.is_none_or(|(_, kept)| window.skew() < kept.skew()) {
+            best = Some((apic_ticks, window));
+        }
+    }
+    let (apic_ticks, window) = best?;
+    Some((
         apic::rate(apic_ticks, nanos)?,
-        apic::rate(tsc1.wrapping_sub(tsc0), nanos)?,
+        apic::rate(window.ticks(), nanos)?,
+        disturbed,
     ))
 }
