@@ -144,13 +144,26 @@ impl Vfs {
         let comps = components(path).ok_or(FsError::BadPath)?;
         let mut here = Self::ROOT;
         for comp in comps {
-            match comp {
-                Component::Current => {}
-                Component::Parent => here = self.get(here)?.parent,
-                Component::Name(name) => here = self.child(here, name)?,
-            }
+            here = match comp {
+                Component::Current => self.directory(here)?,
+                Component::Parent => self.parent_of(here)?,
+                Component::Name(name) => self.child(here, name)?,
+            };
         }
         Ok(here)
+    }
+
+    /// `id`, which must be a directory: `.` and `..` mean nothing after a file.
+    fn directory(&self, id: usize) -> Result<usize, FsError> {
+        match self.get(id)?.body {
+            Body::Dir(_) => Ok(id),
+            Body::File(_) => Err(FsError::NotDirectory),
+        }
+    }
+
+    /// The parent of directory `id`.
+    fn parent_of(&self, id: usize) -> Result<usize, FsError> {
+        Ok(self.get(self.directory(id)?)?.parent)
     }
 
     /// The node a directory `dir` holds under `name`.
@@ -176,8 +189,8 @@ impl Vfs {
         let mut dir = Self::ROOT;
         for comp in rest {
             dir = match comp {
-                Component::Current => dir,
-                Component::Parent => self.get(dir)?.parent,
+                Component::Current => self.directory(dir)?,
+                Component::Parent => self.parent_of(dir)?,
                 Component::Name(n) => self.child(dir, n)?,
             };
         }
@@ -269,8 +282,8 @@ impl Vfs {
         let mut here = Self::ROOT;
         for comp in comps {
             here = match comp {
-                Component::Current => here,
-                Component::Parent => self.get(here)?.parent,
+                Component::Current => self.directory(here)?,
+                Component::Parent => self.parent_of(here)?,
                 Component::Name(name) => match self.child(here, name) {
                     Ok(id) => {
                         if matches!(self.get(id)?.body, Body::File(_)) {
@@ -475,6 +488,40 @@ mod tests {
         assert_eq!(len, 21);
         let got = fs.read("/etc/hostname", 0, &mut buf).unwrap();
         assert_eq!(&buf[..got], b"ORIGIN-os\n\0\0\0\0\0\0\0\0\0\0!");
+    }
+
+    /// `.` and `..` need a directory to be relative to: after a file they name nothing, so
+    /// neither a lookup nor anything that creates an entry can step through a file.
+    #[test]
+    fn dot_and_dotdot_after_a_file_are_refused() {
+        let mut fs = Vfs::new(1 << 16, 100);
+        fs.mkdir("/d").unwrap();
+        fs.create("/d/f").unwrap();
+        let nodes = fs.node_count();
+        for path in ["/d/f/..", "/d/f/.", "/d/f/../f", "/d/f/./"] {
+            assert_eq!(fs.resolve(path), Err(FsError::NotDirectory), "{path}");
+        }
+        assert_eq!(fs.create("/d/f/../g"), Err(FsError::NotDirectory));
+        assert_eq!(fs.mkdir("/d/f/../g"), Err(FsError::NotDirectory));
+        assert_eq!(fs.create("/d/f/./g"), Err(FsError::NotDirectory));
+        assert_eq!(fs.remove("/d/f/../f"), Err(FsError::NotDirectory));
+        assert_eq!(fs.mkdir_all("/d/f/../g"), Err(FsError::NotDirectory));
+        assert_eq!(
+            fs.resolve("/d/g"),
+            Err(FsError::NotFound),
+            "nothing was created"
+        );
+        assert_eq!(fs.node_count(), nodes);
+
+        // Through directories they still work, and the root is its own parent.
+        assert_eq!(fs.resolve("/d/./f").unwrap(), fs.resolve("/d/f").unwrap());
+        assert_eq!(
+            fs.resolve("/d/../d/f").unwrap(),
+            fs.resolve("/d/f").unwrap()
+        );
+        assert_eq!(fs.resolve("/../..").unwrap(), fs.resolve("/").unwrap());
+        fs.create("/d/../h").unwrap();
+        assert_eq!(fs.stat("/h").map(|s| s.kind), Ok(Kind::File));
     }
 
     #[test]

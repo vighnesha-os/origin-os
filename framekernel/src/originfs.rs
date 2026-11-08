@@ -26,6 +26,9 @@ pub const POINTERS_PER_BLOCK: u64 = (BLOCK / 8) as u64;
 pub const DIRECT: usize = 12;
 /// The superblock magic.
 pub const MAGIC: [u8; 8] = *b"ORIGINFS";
+/// The most live entries one directory may hold. v0 directories can address far more records
+/// than a kernel heap should ever hold on behalf of a crafted image.
+pub const MAX_DIR_ENTRIES: usize = 4096;
 
 // Inode field byte offsets (ADR-0006 F3): kind u16, _reserved u16, links u32, size u64,
 // blocks u64, then 12 direct u64 pointers and one single-indirect u64.
@@ -53,6 +56,9 @@ pub enum FsError {
     Io,
     /// A structure referenced a block outside the volume.
     OutOfRange,
+    /// This directory inode holds a malformed record (ADR-0006 F4) or more than
+    /// [`MAX_DIR_ENTRIES`] live entries.
+    BadDirectory(u32),
 }
 
 /// A source of 4 KiB blocks.
@@ -257,9 +263,10 @@ impl<'a, D: BlockDevice> Fs<'a, D> {
         Ok(ptr)
     }
 
-    /// Reads block `block` of the volume into `out`, range-checked.
+    /// Reads block `block` of the data region into `out`, range-checked: an inode's pointer,
+    /// direct or single-indirect, cannot reach the superblock or the inode table.
     fn read_data(&self, block: u64, out: &mut [u8]) -> Result<(), FsError> {
-        if block >= self.sb.total_blocks {
+        if block < self.sb.data_start || block >= self.sb.total_blocks {
             return Err(FsError::OutOfRange);
         }
         if !self.device.read_block(block, out) {
@@ -318,7 +325,10 @@ impl<'a, D: BlockDevice> Fs<'a, D> {
         Ok(out)
     }
 
-    /// The entries of directory inode `n`.
+    /// The entries of directory inode `n`. One malformed record refuses the whole directory
+    /// ([`FsError::BadDirectory`]): every record must be 4-aligned, stay in its block, hold
+    /// its name, and name valid UTF-8 (ADR-0006 F4). An untouched zero record, inode 0 with
+    /// a `rec_len` of 0, ends the block.
     pub fn entries(&self, n: u32) -> Result<Vec<DirEntry>, FsError> {
         let inode = self.inode(n)?;
         if !inode.is_dir() {
@@ -339,17 +349,23 @@ impl<'a, D: BlockDevice> Fs<'a, D> {
                 let rec_len = u16::from_le_bytes([block[at + 4], block[at + 5]]) as usize;
                 let name_len = block[at + 6] as usize;
                 let ekind = block[at + 7];
-                if rec_len < 8 || at + rec_len > BLOCK {
-                    break; // malformed, or padding to the block end
+                if entry_inode == 0 && rec_len == 0 {
+                    break;
                 }
-                if entry_inode != 0 && at + 8 + name_len <= BLOCK {
+                // `8 + name_len <= rec_len` also keeps `at` moving: a record is at least 8 bytes.
+                if !rec_len.is_multiple_of(4) || at + rec_len > BLOCK || 8 + name_len > rec_len {
+                    return Err(FsError::BadDirectory(n));
+                }
+                if entry_inode != 0 {
+                    if out.len() == MAX_DIR_ENTRIES {
+                        return Err(FsError::BadDirectory(n));
+                    }
                     let name = core::str::from_utf8(&block[at + 8..at + 8 + name_len])
-                        .unwrap_or("")
-                        .into();
+                        .map_err(|_| FsError::BadDirectory(n))?;
                     out.push(DirEntry {
                         inode: entry_inode,
                         kind: ekind,
-                        name,
+                        name: name.into(),
                     });
                 }
                 at += rec_len;
@@ -358,23 +374,36 @@ impl<'a, D: BlockDevice> Fs<'a, D> {
         Ok(out)
     }
 
+    /// Fails unless inode `n` is a directory: `.` and `..` mean nothing after a file.
+    fn require_directory(&self, n: u32) -> Result<(), FsError> {
+        if self.inode(n)?.is_dir() {
+            Ok(())
+        } else {
+            Err(FsError::NotDirectory)
+        }
+    }
+
     /// Resolves `path` to an inode number, following `.` and `..` (the root's parent is
-    /// itself).
+    /// itself). `..` leaves through the directories the walk came down, to any depth, and
+    /// never consults an on-disk `..` record, which a crafted image could aim anywhere.
     pub fn resolve(&self, path: &str) -> Result<u32, FsError> {
         let comps = vfs::components(path).ok_or(FsError::BadPath)?;
         let mut here = self.sb.root_inode;
-        let mut parent = self.sb.root_inode;
+        let mut above = Vec::new();
         for comp in comps {
             match comp {
-                Component::Current => {}
-                Component::Parent => here = parent,
+                Component::Current => self.require_directory(here)?,
+                Component::Parent => {
+                    self.require_directory(here)?;
+                    here = above.pop().unwrap_or(self.sb.root_inode);
+                }
                 Component::Name(name) => {
                     let entry = self
                         .entries(here)?
                         .into_iter()
                         .find(|e| e.name == name)
                         .ok_or(FsError::NotFound)?;
-                    parent = here;
+                    above.push(here);
                     here = entry.inode;
                 }
             }
@@ -640,6 +669,238 @@ mod tests {
         assert_eq!(fs.read_whole(dir), Err(FsError::IsDirectory));
         assert_eq!(fs.entries(file), Err(FsError::NotDirectory));
         assert_eq!(fs.inode(0), Err(FsError::BadInode(0)));
+    }
+
+    /// `..` walks back up as many levels as it is written, and the file it reaches is the one
+    /// at the right level, not a same-named one a level down.
+    #[test]
+    fn dotdot_climbs_any_number_of_levels() {
+        let mut b = Builder::new();
+        let top = b.add(1, "secret", false, b"top");
+        let a = b.add(1, "a", true, &[]);
+        b.add(a, "secret", false, b"middle");
+        let ab = b.add(a, "b", true, &[]);
+        let abc = b.add(ab, "c", true, &[]);
+        let deep = b.add(abc, "secret", false, b"bottom");
+        let dev = Image(b.build());
+        let fs = Fs::open(&dev).unwrap();
+
+        assert_eq!(fs.resolve("/a/b/../../secret"), Ok(top));
+        assert_eq!(fs.resolve("/a/b/c/../../../secret"), Ok(top));
+        assert_eq!(fs.resolve("/a/b/c/../.."), Ok(a));
+        assert_eq!(fs.resolve("/a/b/../c"), Err(FsError::NotFound));
+        assert_eq!(fs.resolve("/a/b/c/../c/secret"), Ok(deep));
+        // Past the root, `..` stays at the root.
+        assert_eq!(fs.resolve("/../secret"), Ok(top));
+        assert_eq!(fs.resolve("/a/../../../secret"), Ok(top));
+    }
+
+    /// `.` and `..` need a directory: after a file they name nothing.
+    #[test]
+    fn dot_and_dotdot_after_a_file_are_refused() {
+        let mut b = Builder::new();
+        let dir = b.add(1, "dir", true, &[]);
+        b.add(dir, "f", false, b"x");
+        let dev = Image(b.build());
+        let fs = Fs::open(&dev).unwrap();
+
+        for path in ["/dir/f/..", "/dir/f/.", "/dir/f/../f", "/dir/f/./"] {
+            assert_eq!(fs.resolve(path), Err(FsError::NotDirectory), "{path}");
+        }
+        assert_eq!(fs.resolve("/dir/.."), Ok(1));
+        assert_eq!(fs.resolve("/dir/."), Ok(dir));
+    }
+
+    /// `..` is the walk's own, so a directory whose on-disk `..` aims elsewhere changes
+    /// nothing about where it leads.
+    #[test]
+    fn dotdot_does_not_trust_the_on_disk_record() {
+        let mut b = Builder::new();
+        let a = b.add(1, "a", true, &[]);
+        let inner = b.add(a, "inner", false, b"x");
+        let mut img = b.build();
+        // In /a's directory block, retarget its `..` record (the second, at offset 12) at
+        // the file, then walk `..` out of /a.
+        let dev = Image(img.clone());
+        let at = {
+            let fs = Fs::open(&dev).unwrap();
+            let start = fs.inode(a).unwrap().direct[0] as usize * BLOCK;
+            assert_eq!(&img[start + 12 + 8..start + 12 + 10], b"..");
+            start + 12
+        };
+        img[at..at + 4].copy_from_slice(&inner.to_le_bytes());
+        let dev = Image(img);
+        let fs = Fs::open(&dev).unwrap();
+        assert_eq!(fs.resolve("/a/.."), Ok(1));
+    }
+
+    /// One directory block of records: `(rec_len, name_len, name)`, each at the next offset
+    /// and with inode number 2. The last record's `rec_len` is taken as given.
+    fn crafted_dir_block(records: &[(u16, u8, &[u8])]) -> Vec<u8> {
+        let mut block = alloc::vec![0u8; BLOCK];
+        let mut at = 0usize;
+        for &(rec_len, name_len, name) in records {
+            block[at..at + 4].copy_from_slice(&2u32.to_le_bytes());
+            block[at + 4..at + 6].copy_from_slice(&rec_len.to_le_bytes());
+            block[at + 6] = name_len;
+            block[at + 7] = kind::FILE as u8;
+            block[at + 8..at + 8 + name.len()].copy_from_slice(name);
+            at += usize::from(rec_len);
+        }
+        block
+    }
+
+    /// An image whose root directory block is replaced by `block`.
+    fn image_with_root_block(block: &[u8]) -> Image {
+        let mut b = Builder::new();
+        b.add(1, "file", false, b"content");
+        let mut img = b.build();
+        let dev = Image(img.clone());
+        let start = {
+            let fs = Fs::open(&dev).unwrap();
+            fs.inode(1).unwrap().direct[0] as usize * BLOCK
+        };
+        img[start..start + BLOCK].copy_from_slice(block);
+        Image(img)
+    }
+
+    /// Each way a record can lie about itself refuses the directory, instead of showing a
+    /// name read from outside its record or a blank one.
+    #[test]
+    fn malformed_directory_records_are_refused() {
+        let rest = (BLOCK - 12) as u16;
+        let ok = crafted_dir_block(&[(12, 1, b"a"), (rest, 1, b"b")]);
+        let dev = image_with_root_block(&ok);
+        let names: Vec<String> = Fs::open(&dev)
+            .unwrap()
+            .entries(1)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(
+            names,
+            ["a", "b"],
+            "the well-formed block these are built from"
+        );
+
+        let cases: [(&str, Vec<u8>); 6] = [
+            (
+                "a name longer than its record, reaching into the next",
+                crafted_dir_block(&[(12, 9, b"aaaaaaaaa"), (rest, 1, b"b")]),
+            ),
+            (
+                "the same, with the record exactly as long as the header",
+                crafted_dir_block(&[(8, 1, b""), (BLOCK as u16 - 8, 1, b"b")]),
+            ),
+            (
+                "a rec_len that is not 4-aligned",
+                crafted_dir_block(&[(13, 1, b"a"), (BLOCK as u16 - 13, 1, b"b")]),
+            ),
+            (
+                "a rec_len that leaves the block",
+                crafted_dir_block(&[(12, 1, b"a"), (rest + 4, 1, b"b")]),
+            ),
+            (
+                "a rec_len below the header on a live record",
+                crafted_dir_block(&[(4, 0, b"")]),
+            ),
+            (
+                "a name that is not UTF-8",
+                crafted_dir_block(&[(12, 2, &[0xC3, 0x28]), (rest, 1, b"b")]),
+            ),
+        ];
+        for (why, block) in &cases {
+            let dev = image_with_root_block(block);
+            let fs = Fs::open(&dev).unwrap();
+            assert_eq!(fs.entries(1), Err(FsError::BadDirectory(1)), "{why}");
+            assert_eq!(
+                fs.resolve("/b"),
+                Err(FsError::BadDirectory(1)),
+                "{why}: a lookup sees the refusal too"
+            );
+        }
+
+        // A zero record after the live ones ends the block, as an all-zero block does.
+        let dev = image_with_root_block(&crafted_dir_block(&[(12, 1, b"a")]));
+        assert_eq!(Fs::open(&dev).unwrap().entries(1).unwrap().len(), 1);
+        let dev = image_with_root_block(&[0u8; BLOCK]);
+        assert_eq!(Fs::open(&dev).unwrap().entries(1), Ok(Vec::new()));
+    }
+
+    /// A crafted directory cannot make the kernel hold unbounded entries: twelve direct
+    /// pointers to one block of 8-byte records is more than the cap.
+    #[test]
+    fn a_directory_past_the_entry_cap_is_refused() {
+        let mut b = Builder::new();
+        let many = b.add(1, "many", true, &[]);
+        let mut img = b.build();
+
+        let mut records = alloc::vec![0u8; BLOCK];
+        for at in (0..BLOCK).step_by(8) {
+            records[at..at + 4].copy_from_slice(&2u32.to_le_bytes());
+            records[at + 4..at + 6].copy_from_slice(&8u16.to_le_bytes());
+        }
+        let dev = Image(img.clone());
+        let (block, inode_at) = {
+            let fs = Fs::open(&dev).unwrap();
+            let sb = fs.superblock();
+            let at = sb.inode_table_start as usize * BLOCK + many as usize * INODE_SIZE;
+            (fs.inode(many).unwrap().direct[0], at)
+        };
+        img[block as usize * BLOCK..(block as usize + 1) * BLOCK].copy_from_slice(&records);
+
+        // `pointers` direct pointers all at that block, and a size that covers them.
+        let aim = |img: &mut [u8], pointers: usize| {
+            for k in 0..pointers {
+                let at = inode_at + OFF_DIRECT + k * 8;
+                img[at..at + 8].copy_from_slice(&block.to_le_bytes());
+            }
+            let size = (pointers * BLOCK) as u64;
+            img[inode_at + OFF_SIZE..inode_at + OFF_SIZE + 8].copy_from_slice(&size.to_le_bytes());
+        };
+
+        let per_block = BLOCK / 8;
+        assert!(MAX_DIR_ENTRIES.is_multiple_of(per_block));
+        aim(&mut img, MAX_DIR_ENTRIES / per_block);
+        let dev = Image(img.clone());
+        let fs = Fs::open(&dev).unwrap();
+        assert_eq!(fs.entries(many).map(|e| e.len()), Ok(MAX_DIR_ENTRIES));
+
+        aim(&mut img, MAX_DIR_ENTRIES / per_block + 1);
+        let dev = Image(img);
+        let fs = Fs::open(&dev).unwrap();
+        assert_eq!(fs.entries(many), Err(FsError::BadDirectory(many)));
+    }
+
+    /// A single-indirect pointer into the metadata would read the inode table or superblock
+    /// as block pointers: refused, where a pointer past the volume already was.
+    #[test]
+    fn a_single_indirect_pointer_below_the_data_region_is_refused() {
+        let mut b = Builder::new();
+        let big: Vec<u8> = (0..14 * BLOCK).map(|i| i as u8).collect();
+        let ino = b.add(1, "big.bin", false, &big);
+        let img = b.build();
+        let dev = Image(img.clone());
+        let (data_start, inode_at) = {
+            let fs = Fs::open(&dev).unwrap();
+            let sb = fs.superblock();
+            (
+                sb.data_start,
+                sb.inode_table_start as usize * BLOCK + ino as usize * INODE_SIZE,
+            )
+        };
+        for bad in [1u64, data_start - 1] {
+            let mut crafted = img.clone();
+            crafted[inode_at + OFF_INDIRECT..inode_at + OFF_INDIRECT + 8]
+                .copy_from_slice(&bad.to_le_bytes());
+            let dev = Image(crafted);
+            let fs = Fs::open(&dev).unwrap();
+            assert_eq!(fs.read_whole(ino), Err(FsError::OutOfRange), "block {bad}");
+        }
+        // The untouched image still reads whole.
+        let fs_dev = Image(img);
+        assert_eq!(Fs::open(&fs_dev).unwrap().read_whole(ino).unwrap(), big);
     }
 
     #[test]

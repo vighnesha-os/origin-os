@@ -68,6 +68,12 @@ impl Mac {
     pub fn is_broadcast(&self) -> bool {
         self.0 == [0xFF; 6]
     }
+
+    /// Whether this can be one station's own address: not all zeros, and with the
+    /// individual/group bit (the low bit of the first octet) clear.
+    pub fn is_unicast(&self) -> bool {
+        self.0 != [0; 6] && self.0[0] & 1 == 0
+    }
 }
 
 /// An IPv4 address.
@@ -140,15 +146,24 @@ pub struct Ipv4Packet<'a> {
 /// The minimum IPv4 header length (no options).
 pub const IPV4_HEADER: usize = 20;
 
+/// The More Fragments flag and the 13-bit fragment offset in header bytes 6-7 (RFC 791 §3.1).
+/// Don't Fragment (`0x4000`) is not among them: it marks a whole datagram.
+const IPV4_FRAGMENT_BITS: u16 = 0x3FFF;
+
 impl<'a> Ipv4Packet<'a> {
     /// Parses an IPv4 header, requiring version 4, a header length of exactly 20 bytes (no
-    /// options), a total length within the buffer, and a correct header checksum.
+    /// options), a correct header checksum, a total length within the buffer, and a whole
+    /// datagram: this stack does not reassemble, so a fragment (More Fragments set, or a
+    /// non-zero offset) is dropped rather than presented as if it were complete.
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
         let header = buf.get(..IPV4_HEADER)?;
         if header[0] >> 4 != 4 || header[0] & 0x0F != 5 {
             return None; // not IPv4, or has options
         }
         if checksum(header) != 0 {
+            return None;
+        }
+        if u16::from_be_bytes([header[6], header[7]]) & IPV4_FRAGMENT_BITS != 0 {
             return None;
         }
         let total = u16::from_be_bytes([header[2], header[3]]) as usize;
@@ -335,6 +350,26 @@ impl Arp {
             target_ip: self.sender_ip,
         }
     }
+
+    /// The hardware address `frame` gives for this request's `target_ip`, or `None` unless
+    /// `frame` really is the reply to it: an ARP reply from that address, sent to the
+    /// requester's MAC and naming the requester as its target, whose sender MAC matches the
+    /// Ethernet source and is a unicast address. A stray ARP on the link, or one that would
+    /// point the address at a broadcast or group MAC, resolves nothing.
+    pub fn answer_in(&self, frame: &[u8]) -> Option<Mac> {
+        let eth = EthFrame::parse(frame)?;
+        if eth.ethertype != ethertype::ARP || eth.dst != self.sender_mac {
+            return None;
+        }
+        let reply = Arp::parse(eth.payload)?;
+        let answers = reply.operation == arp_op::REPLY
+            && reply.sender_ip == self.target_ip
+            && reply.target_ip == self.sender_ip
+            && reply.target_mac == self.sender_mac
+            && reply.sender_mac == eth.src
+            && reply.sender_mac.is_unicast();
+        answers.then_some(reply.sender_mac)
+    }
 }
 
 /// A parsed UDP datagram.
@@ -478,6 +513,53 @@ mod tests {
         assert_eq!(Ipv4Packet::parse(&opts[..n]), None);
     }
 
+    /// Seals a header's checksum again after a test changed it, so it is the field under
+    /// test that decides, not the checksum.
+    fn reseal_ipv4(packet: &mut [u8]) {
+        packet[10..12].copy_from_slice(&[0, 0]);
+        let c = checksum(&packet[..IPV4_HEADER]);
+        packet[10..12].copy_from_slice(&c.to_be_bytes());
+    }
+
+    /// There is no reassembly, so any fragment of a larger datagram is dropped: the first
+    /// (More Fragments), a middle one (both), the last (offset only). Don't Fragment is a
+    /// whole datagram and stays accepted.
+    #[test]
+    fn ipv4_fragments_are_dropped_and_only_those() {
+        let mut buf = [0u8; 100];
+        let n = Ipv4Packet::write(
+            Ipv4([10, 0, 0, 2]),
+            Ipv4([10, 0, 0, 1]),
+            protocol::UDP,
+            64,
+            1,
+            b"part of something",
+            &mut buf,
+        )
+        .unwrap();
+        for (flags, why) in [
+            (0x2000u16, "first fragment: More Fragments"),
+            (0x2000 | 185, "middle fragment"),
+            (185, "last fragment: offset only"),
+            (1, "the smallest non-zero offset"),
+            (0x1FFF, "the largest offset"),
+        ] {
+            let mut p = buf;
+            p[6..8].copy_from_slice(&flags.to_be_bytes());
+            reseal_ipv4(&mut p);
+            assert_eq!(Ipv4Packet::parse(&p[..n]), None, "{why}");
+        }
+        for flags in [0u16, 0x4000] {
+            let mut p = buf;
+            p[6..8].copy_from_slice(&flags.to_be_bytes());
+            reseal_ipv4(&mut p);
+            assert!(
+                Ipv4Packet::parse(&p[..n]).is_some(),
+                "flags {flags:#06x}: a whole datagram"
+            );
+        }
+    }
+
     #[test]
     fn icmp_echo_builds_parses_and_replies() {
         let mut req = [0u8; 64];
@@ -527,6 +609,90 @@ mod tests {
         bad[1] = 0;
         assert_eq!(Arp::parse(&bad), None);
         assert_eq!(Arp::parse(&buf[..27]), None, "short");
+    }
+
+    /// The request an ARP reply is matched against in the test below, and the frame of a
+    /// reply that does answer it.
+    fn arp_exchange() -> (Arp, [u8; ETH_HEADER + ARP_LEN]) {
+        let request = Arp {
+            operation: arp_op::REQUEST,
+            sender_mac: Mac([0x52, 0x54, 0, 0xAA, 0xBB, 0xCC]),
+            sender_ip: Ipv4([10, 0, 2, 15]),
+            target_mac: Mac([0; 6]),
+            target_ip: Ipv4([10, 0, 2, 2]),
+        };
+        let gateway = Mac([0x52, 0x55, 0x0A, 0, 2, 2]);
+        let mut frame = [0u8; ETH_HEADER + ARP_LEN];
+        EthFrame::write_header(request.sender_mac, gateway, ethertype::ARP, &mut frame).unwrap();
+        request
+            .reply(gateway)
+            .write(&mut frame[ETH_HEADER..])
+            .unwrap();
+        (request, frame)
+    }
+
+    /// A reply resolves the request only if every field that ties it to the request agrees.
+    #[test]
+    fn an_arp_reply_must_answer_the_outstanding_request() {
+        let (request, good) = arp_exchange();
+        let gateway = Mac([0x52, 0x55, 0x0A, 0, 2, 2]);
+        assert_eq!(request.answer_in(&good), Some(gateway));
+        assert_eq!(request.answer_in(&good[..ETH_HEADER + ARP_LEN - 1]), None);
+
+        // Each case changes one thing about the reply, at the given byte offset.
+        const OPERATION: usize = ETH_HEADER + 7;
+        const SENDER_MAC: usize = ETH_HEADER + 8;
+        const SENDER_IP: usize = ETH_HEADER + 14;
+        const TARGET_MAC: usize = ETH_HEADER + 18;
+        const TARGET_IP: usize = ETH_HEADER + 24;
+        let cases: [(usize, &[u8], &str); 7] = [
+            (0, &[0xFF; 6], "sent to everyone, not to the requester"),
+            (0, &[0x02, 1, 2, 3, 4, 5], "sent to another station"),
+            (
+                OPERATION,
+                &[arp_op::REQUEST as u8],
+                "a request, not a reply",
+            ),
+            (
+                SENDER_IP,
+                &[10, 0, 2, 3],
+                "from another address than the one asked",
+            ),
+            (
+                TARGET_IP,
+                &[10, 0, 2, 16],
+                "answering another address's request",
+            ),
+            (
+                TARGET_MAC,
+                &[0x02, 9, 9, 9, 9, 9],
+                "answering another station",
+            ),
+            (
+                6,
+                &[0x02, 1, 2, 3, 4, 5],
+                "Ethernet source differs from the sender MAC",
+            ),
+        ];
+        for (at, bytes, why) in cases {
+            let mut frame = good;
+            frame[at..at + bytes.len()].copy_from_slice(bytes);
+            assert_eq!(request.answer_in(&frame), None, "{why}");
+        }
+
+        // A sender MAC that is not one station's: both copies changed, so that only its form
+        // is left to judge.
+        for mac in [[0u8; 6], [0xFF; 6], [0x01, 0x00, 0x5E, 0, 0, 1]] {
+            let mut frame = good;
+            frame[6..12].copy_from_slice(&mac);
+            frame[SENDER_MAC..SENDER_MAC + 6].copy_from_slice(&mac);
+            assert_eq!(request.answer_in(&frame), None, "{mac:02x?}");
+        }
+
+        // Not ARP at all.
+        let mut frame = good;
+        frame[12..14].copy_from_slice(&ethertype::IPV4.to_be_bytes());
+        assert_eq!(request.answer_in(&frame), None);
     }
 
     /// Every parser survives arbitrary mutated and random input without panicking, and

@@ -26,6 +26,12 @@ pub const PORT: u16 = 69;
 /// is the last.
 pub const BLOCK: usize = 512;
 
+/// A client port (RFC 1350 §4's transfer identifier) from `random` bits: one of the 16 384
+/// dynamic ports, 49152 and up (RFC 6335 §6), so that the low 14 bits pick it without bias.
+pub fn client_port(random: u64) -> u16 {
+    0xC000 | (random as u16 & 0x3FFF)
+}
+
 /// Builds a read request for `filename` in octet mode into `out`. Returns the length, or
 /// `None` if the name is empty or contains a NUL, or `out` is too small.
 pub fn read_request(filename: &str, out: &mut [u8]) -> Option<usize> {
@@ -268,6 +274,20 @@ mod tests {
         assert_eq!(read_request("", &mut out), None);
         assert_eq!(read_request("a\0b", &mut out), None);
         assert_eq!(read_request("initramfs.tar", &mut out[..10]), None);
+    }
+
+    /// The port chosen from any random bits is a dynamic port, and the random bits reach it.
+    #[test]
+    fn client_ports_are_random_dynamic_ports() {
+        for random in [0, 1, 0x3FFF, 0x4000, 0xBFFF, 0xC000, 0xFFFF, u64::MAX] {
+            assert!(client_port(random) >= 49152, "{random:#x}");
+        }
+        assert_eq!(client_port(0), 49152);
+        assert_eq!(client_port(u64::MAX), 65535);
+        let mut rng = crate::testing::Rng::new(0x5446_504F);
+        let ports: alloc::collections::BTreeSet<u16> =
+            (0..1000).map(|_| client_port(rng.next())).collect();
+        assert!(ports.len() > 900, "{} distinct ports of 1000", ports.len());
     }
 
     #[test]
