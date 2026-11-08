@@ -25,7 +25,7 @@ A/B deployments with fallback (CLAUDE.md §20, §64) will replace the fixed path
 Nothing variable-length is interpreted before it is verified.
 1. `Image::parse`. The profile must be KRN.
 2. Content digest: SHA-512 over the header and section table.
-3. Signatures, by role `origin-kernel`. **Not implemented yet.** See B8.
+3. Signatures, by role `origin-kernel`: exactly one entry with no certificate chain, by a key in the loader's compiled-in trust store, with both signatures verified over the statement (`onbf_verify::verify_krn_block`, 2026-11-08; errata V1–V5, **Proposed**). Every byte of the kernel beyond the header and the section table is read only after this step.
 4. Manifest SHA-256, then `KrnManifest::decode`, then `check_against`, which requires the entry point to lie in RX segment content.
 5. `cpu_features`. Any non-zero value is refused until the CPUID tests in the key registry are implemented: fail closed.
 6. Every SEGMENT's content against its Merkle root (`onbf_merkle::root`), and the RELOCS section against its SHA-256.
@@ -94,9 +94,11 @@ After that, the loader calls nothing in the firmware.
 ### B8. Developer mode
 A loader built with the `developer-mode` feature accepts an unsigned KRN image and says so on the console. The `xtask` boot test builds this variant.
 
-A loader built without the feature refuses unsigned images. Until signature verification exists (ONBF §7), that build cannot boot anything, which is the safe failure.
+A loader built without the feature refuses unsigned images. It also verifies signed ones (since 2026-11-08), against the compiled-in trust store, and that store is empty until Origin's own kernel key exists (errata V4). So a build without the `test-trust-store` feature still cannot boot anything, which is the safe failure.
+
+Developer mode is a build feature, never a runtime choice. A developer-mode loader verifies a signed image like any other (errata V5, **Proposed**).
 
 ## Consequences
 - The kernel binary is a static-PIE ELF converted by `onbf-pack`. The loader never parses ELF (ADR-0001 D1).
 - QEMU + OVMF proves this path end to end. Physical hardware is still unproven (CLAUDE.md §74).
-- No protection against physical tampering exists until B7 is decided and signatures are verified (B2 step 3).
+- The kernel's signature is verified (B2 step 3), but no protection against physical tampering exists yet: there is no release key, and the loader itself is not checked until B7's first stage exists.

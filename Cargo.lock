@@ -35,6 +35,7 @@ version = "0.0.0"
 dependencies = [
  "onbf-format",
  "onbf-merkle",
+ "onbf-verify",
  "origin-crypto",
  "origin-version",
 ]
@@ -67,6 +68,7 @@ version = "0.0.0"
 dependencies = [
  "onbf-format",
  "onbf-merkle",
+ "onbf-verify",
  "origin-boot-info",
  "origin-crypto",
  "origin-paging",
@@ -97,5 +99,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "onbf-format",
+ "onbf-merkle",
+ "origin-crypto",
  "origin-version",
 ]

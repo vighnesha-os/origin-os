@@ -6,6 +6,7 @@ mod convert;
 mod elf_writer;
 mod encodings;
 mod reject;
+mod sign;
 
 use crate::{KrnOptions, Toolchain};
 

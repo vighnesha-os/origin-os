@@ -32,7 +32,7 @@ use origin_boot_uefi::protocols::{
 use origin_boot_uefi::uefi::{
     self, Handle, Revision, SimpleTextOutputProtocol, Status, SystemTable, TableHeader,
 };
-use origin_boot_uefi::{kernel, memmap, place};
+use origin_boot_uefi::{kernel, memmap, place, trust};
 use origin_paging::layout::{self, Placement};
 use origin_paging::{Access, Attributes, Table, TablePool};
 
@@ -152,13 +152,27 @@ fn boot(
             "origin-boot: developer mode: unsigned kernel images are accepted"
         );
     }
-    let v = kernel::verify(file, DEVELOPER_MODE).map_err(|e| {
+    if trust::HOLDS_TEST_KEY {
+        let _ = writeln!(
+            out,
+            "origin-boot: TEST trust store: this loader trusts a development key and must never ship"
+        );
+    }
+    let v = kernel::verify(file, DEVELOPER_MODE, trust::STORE).map_err(|e| {
         fail(
             out,
             Status::SECURITY_VIOLATION,
             format_args!("kernel rejected: {e}"),
         )
     })?;
+    if let Some(id) = v.signer {
+        let [a, b, c, d, e, f, g, h, ..] = id;
+        let short = u64::from_be_bytes([a, b, c, d, e, f, g, h]);
+        let _ = writeln!(
+            out,
+            "origin-boot: kernel signature verified: origin-kernel, Ed25519 and ML-DSA-87 both good, key ID {short:016x}..."
+        );
+    }
     let _ = writeln!(
         out,
         "origin-boot: kernel verified: {} sections, boot info {}.{}, entry RVA {:#x}",

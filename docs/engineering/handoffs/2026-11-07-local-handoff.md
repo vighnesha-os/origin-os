@@ -1082,3 +1082,45 @@ On branch **`claude/amazing-einstein-4eb320`** (on `b3efe8a`, not pushed): owner
 #### Next
 
 - Merge this branch into `claude/interesting-carson-ae7c83` when the coordinator is ready; it touches only `security/crypto/` and the records (STATUS, TASKS, OWNER_DECISIONS, this file, SOURCE_PROVENANCE), so conflicts would be in the records.
+
+### Continued (2026-11-08, ~14:30–15:45 IST): the kernel's signature, verified by the loader (TASKS item 6)
+
+On branch **`claude/adoring-hopper-a8f66b`** (on `claude/interesting-carson-ae7c83` at `6a2b29c`; **not pushed**). Governing: ONBF §7, ADR-0002 B2, B7, B8, S1–S4. Research and the separation of what is specified from what is open: `docs/research/2026-11-08-krn-signature-verification.md`. Evidence: `SOURCE_PROVENANCE.md`, `boot/uefi/`, "Step 3".
+
+| What | Where |
+|---|---|
+| The KRN policy over a trust store: one entry, `origin-kernel`, no chain, a trusted key, both signatures | `onbf_verify::verify_krn_block` |
+| The compiled-in trust store and the order of checks (B2 step 3); a message per refusal | `boot/uefi/src/trust.rs`, `kernel.rs`, `main.rs` |
+| Host signing (`sign`, `keygen`), OpenSSL as a subprocess, no signing code in this tree | `developer-tools/onbf-pack/src/sign.rs`, `main.rs` |
+| The boots: 11 scenarios, each naming its loader build | `developer-tools/xtask/src/main.rs` |
+| The test key: public halves only, `TEST-ONLY-…`, README | `boot/uefi/trust/` |
+
+**Result:** `cargo xtask check` (702 tests, 0 failures, 6 ignored), `boot-test`, `boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs) and `boot-x2apic` pass with the signed kernel as the main boot, with developer mode off. 22 negative controls were applied and restored, each failing its named check. A fresh reviewing agent found no way to get a refused image accepted, and six low-severity points: five are fixed, and the sixth (MERKLE bytes unread at boot) is recorded.
+
+#### What to know
+
+- **Three loader builds.** No feature: the trust store is empty and every kernel is refused. `test-trust-store`: the test key is trusted, developer mode is off; it is what `boot-test` boots. `developer-mode`: includes the test key and also accepts unsigned images. The two builds with the test key do not compile with a non-zero build number in `origin-version.toml`.
+- **A heavily loaded host fails the boot gates, in kernel proofs this work does not touch.** With five sessions running at once (load average 70–140), the kernel's clock proof failed (`the RTC did not complete two updates in 1.2 s`, `one RTC second lasted 742615 us`), and twice the timer-queue proof (`: timers failed`, which wants 2 ms lateness at most); both need QEMU to keep real time under TCG. In those boots the loader's signature line had already passed. On the final code `boot-matrix` failed once (`clock failed`) and passed on its rerun, and `boot-x2apic` failed at `clock failed` four times and `timers failed` twice, at load up to about 125, and passed at load about 13–18. The session [Make the RTC wait survive a loaded host](#local_aa5e8e22-45d8-4e7d-a14b-85de4eb4439a) (branch `claude/musing-hamilton-587f7b`) is fixing the RTC wait. If a gate fails with one of those lines on a busy machine, check the load before suspecting the change.
+- `kernel::verify` takes the trust store as an argument (`trust::STORE` in `main`), so the host tests pass their own.
+- `onbf-pack sign` needs OpenSSL 3.5+ on `PATH` (or `--openssl`), and `boot-test` now depends on it. LibreSSL is refused by name.
+- Signing is the one non-reproducible step: OpenSSL's ML-DSA is hedged. The container, digest and statement stay byte-identical.
+- `xtask` regenerates the test keys into `target/xtask/test-keys/` from text constants and refuses to boot if `boot/uefi/trust/` no longer matches them.
+- `ORIGIN_BOOT_TEST_ONLY=<label,label>` runs a subset of the scenarios. The summary says how many ran.
+- The tamper helpers (`tampered`, `flipped`, `substituted`) sit next to the scenario list in `boot_test_scenarios`. A new refusal is a `refusal_scenario` line plus a `KernelError` message.
+
+#### Open for the owner (errata)
+
+- **V1–V6, Proposed**: what an empty chain means, one entry per KRN block, the KRN statement's `id` and `version`, the compiled-in trust store (no real key exists, so a release build refuses every kernel), developer mode and signed images, the signing time. Implemented and boot-proven; each fails closed or changes the least.
+- **O1** (the statement's `id` and NFC) is untouched: the KRN `id` is ASCII, and the loader does not normalize.
+- **O2–O5** block certificate chains: the OKC's ML-DSA context (S4 defines none), trusted time at boot, how `id_namespaces` match, and what a root is.
+- OpenSSL as a host signing tool (research note §3).
+
+#### Not done
+
+- OKC chains, the Kernel CA and the Origin root (they need O2–O5 first).
+- Release signing and HSM key handling (§60).
+- B7's Secure Boot first stage; anti-rollback and TPM measurement (§7.6, §8.1).
+
+#### Next
+
+Backlog: OKC chains once O2–O5 are decided; item 4 (M3 scheduling) and the rest as they were.

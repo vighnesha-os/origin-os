@@ -8,7 +8,9 @@ publish.workspace = true
 # Std plus first-party crates only; no third-party dependencies (CLAUDE.md §5).
 [dependencies]
 origin-version.workspace = true
+origin-crypto.workspace = true
 onbf-format.workspace = true
+onbf-merkle.workspace = true
 
 [lints]
 workspace = true

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Applies to | `docs/spec/ONBF.md` v1.0 (design), accepted 2026-11-07 |
-| Status | **C1–C14 and G2–G5 decided by the owner on 2026-11-07. G1 and the readings below were decided the same day under the owner's instruction of 2026-11-07 to finalise the design with the recommended options.** |
+| Status | **C1–C14 and G2–G5 decided by the owner on 2026-11-07. G1 and the readings below were decided the same day under the owner's instruction of 2026-11-07 to finalise the design with the recommended options.** V1–V6 (2026-11-08) are **Proposed**: see "Proposed readings of §7". |
 | Found by | Implementing `runtime/onbf/format` (`onbf-format`) against §4, 2026-11-07 |
 | Byte layouts | Unchanged. Every item below is a validation rule or a missing definition, not a new field. |
 
@@ -72,9 +72,27 @@ Applied in code on 2026-11-07 and pinned by tests. **Accepted as normative the s
 | M1 | `origin-crypto`, ML-DSA | Strict FIPS 204 verification, first failure wins: context > 255 bytes; HintBitUnpack per polynomial (count range, then strictly increasing positions), then non-zero padding; ‖z‖∞ ≥ γ1 − β; c̃ mismatch. SampleInBall uses all λ/4 bytes of c̃; the ExpandA nonce is ρ ‖ column ‖ row; rejection loops are unbounded (no Appendix C bound). The host signer must produce only signatures this accepts. |
 | L1 | loader, boot info 0.2 | A RELRO segment is passed to the kernel without write access, because the loader has applied every relocation (ADR-0002 B4). |
 
+## Proposed readings of §7: awaiting the owner
+
+Found while wiring signature verification into the boot loader (2026-11-08; `docs/research/2026-11-08-krn-signature-verification.md`). **Status: Proposed. They are not normative until the owner decides (CLAUDE.md §84).** The code applies each one, because nothing ships from this branch; each is the choice that fails closed or changes the least.
+
+| # | Spec | Gap | Proposed reading (applied) | Alternative |
+|---|---|---|---|---|
+| V1 | §7.1 `chain`, §7.4 | Whether an entry may have no certificates, and what that means. The parser accepts a chain of length 0, and §7.1 only says the chain ends "below a trust-store root". | **An empty chain means the signer's own key is in the trust store.** It is direct trust, for that key and role. A non-empty chain is refused until OKC validation exists; it is never ignored. | Forbid empty chains, once a Kernel CA exists. Then every signed KRN would need a chain, and no key could be trusted directly. |
+| V2 | §7.5, §7.1 | How many entries a KRN block holds, and whether others are ignored. | **Exactly one entry, in the role `origin-kernel`.** Any other block is refused, so nothing in the block goes unchecked (ONBF-R6). The rule can be relaxed later; a looser one could not be tightened without breaking images. | Accept extra entries if one trusted entry verifies. |
+| V3 | S3 key 3–4, K4 | The statement carries the "artifact's ID from its manifest", but a KRN manifest has no `id` and no version (K4). | **`id` is `origin.framekernel`; `version` is the release version from `origin-version.toml`.** The loader compares neither: §7.1 lists no check on them, and the namespace check belongs to chains. | Derive `id` from a new manifest key. That is an ABI change for no present use. |
+| V4 | §7.4, §8.1 | What a "root compiled into the loader" is in practice before Origin has keys. | **The trust store is a compiled-in list of (role, public key).** A release build's list is empty until Origin's own kernel key exists, so it refuses every kernel (the safe failure of B8). A build with the `test-trust-store` feature adds the test key of `boot/uefi/trust/` and warns on every boot, and such a build cannot be compiled with a non-zero build number (`origin-version.toml`), so a released loader cannot hold it. | Require a real key before any build can boot. Then no signed boot could be tested. |
+| V5 | ADR-0002 B8 | What developer mode does with a *signed* image. | **A signed image is verified in every mode.** Developer mode only allows an image with no signature at all: a signature that does not verify is a refusal, not a warning. | Skip verification in developer mode. |
+| V6 | §7.1, ONBF-R9 | `claimed_signing_time` is in the signed statement, and R9 forbids build timestamps in signed content. | **The caller supplies it** (`onbf-pack sign --signing-time`), and no tool reads the clock. It stays informational (§7.6). | Forbid the field in KRN statements. That changes S3. |
+
 ## Open gaps
 
-None at present.
+| # | Spec | Gap | Who needs it |
+|---|---|---|---|
+| O2 | S4 key 10 | An OKC is signed with both algorithms, but S4 defines no ML-DSA context string for that signature (§7.1's `origin/onbf/1/<role>` is for signature-block entries). | OKC issuance and chain validation |
+| O3 | §7.6, §7.3 | `not_before`/`not_after` need trusted time, and the boot loader has only the firmware's RTC, which is not trusted. How does a chain's validity get checked at boot? | Chain validation in the loader |
+| O4 | §7.1, S4 key 6 | How an `id_namespaces` entry matches a statement's `id` (prefix, label boundary, wildcard) is undefined. | Chain validation; the Package Service |
+| O5 | §7.4, §8.1 | What a trust-store *root* is: a bare key, a self-signed OKC, or TUF-style root metadata (§7.4 mentions rotation by chained root metadata). | The release trust store; root rotation |
 
 ## Observed by the bit-flip sweep
 
