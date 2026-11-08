@@ -212,6 +212,7 @@ The owner asked for the design to be finalised with the recommended options, fol
 | `c053f4c` | virtio::find_caps (walk the PCI capability list) |
 | `9810c84` | virtio-net kernel driver: bring-up + TX (boot-proven) |
 | `f7cce65` | virtio-net: RX datapath + a **live ARP exchange** over the NIC |
+| `70d5a3c` | virtio-net: a **live DHCP lease** over the NIC — the OS joins the network |
 
 (The 2026-11-08 commits use the Claude Opus 4.8 attribution; the run spanned midnight.)
 
@@ -359,13 +360,18 @@ layer host-tested and committed, then the kernel driver boot-proven:
   `find_caps` (walk the PCI capability list for the modern virtio structures).
 - `virtionet` (kernel) — brings up a modern **virtio-net NIC** (PCI capability discovery,
   BAR mapping, the feature handshake to `DRIVER_OK`, RX/TX virtqueues on DMA pages), reads
-  the device MAC, and does a **live ARP exchange**: it transmits an ARP who-has for QEMU's
-  gateway and **receives and parses the reply** (`ARP 10.0.2.2 -> 52:55:0a:00:02:02`). Two
-  negative controls (wrong MAC; ARP a nonexistent host) each fail the boot and were
-  restored. This is the whole transmit-and-receive datapath, proven on the emulated device.
+  the device MAC, then **takes the OS onto the network**: it ARP-resolves QEMU's gateway
+  (`ARP 10.0.2.2 -> 52:55:0a:00:02:02`) and runs a full **DHCP exchange** (DISCOVER → OFFER
+  → REQUEST → ACK) with QEMU's built-in server, obtaining the lease **10.0.2.15** — each
+  message wrapped by `net` in UDP/IPv4/Ethernet with correct checksums, transmitted, and
+  each reply received and parsed back up into the `dhcp` client. Three negative controls
+  (wrong MAC; ARP a nonexistent host; DHCP to the wrong port) each fail the boot and were
+  restored. **The whole stack is live** — NIC TX+RX, Ethernet, ARP, IPv4, UDP and DHCP.
 
-**Checkpoint (~05:45 IST): 273 framekernel host library tests across 52 modules; the
+**Checkpoint (~06:00 IST): 273 framekernel host library tests across 52 modules; the
 workspace passes `cargo xtask check`, `boot-test` and `boot-matrix` (1/2/4), with the NIC
-bringing up and completing the ARP exchange at every `-smp`.** The reusable DMA/MMIO
-patterns (NVMe's) and the `net` Ethernet/ARP layer made the driver tractable. Next: wire
-the IP/UDP/DHCP stack onto the NIC so the OS obtains a real lease. QEMU-only (§74).
+coming up and the OS obtaining its DHCP lease at every `-smp`.** The reusable DMA/MMIO
+patterns (NVMe's) and the bottom-up host-tested libraries (`virtqueue`, `virtio`, `net`,
+`dhcp`) made the driver tractable. Next (left for careful continued work): make the NIC
+interrupt-driven (MSI-X), add a socket API, and route real traffic on the lease. QEMU-only
+(§74).

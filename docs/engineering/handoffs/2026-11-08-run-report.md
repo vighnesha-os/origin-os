@@ -14,7 +14,7 @@ This report covers the continuation of the twelve-hour run (from ~02:00 IST 2026
 
 - `cargo xtask check` passes: `rustfmt --check`, workspace Clippy with `-D warnings`, the no-panic object scan on the freestanding crates, and the §11 (`cfg(target_os)`) and §62 (manifest `version`) lints.
 - **514 tests across 27 workspace suites, 0 failures** (6 ignored = the download-gated crypto vectors). **273 of them** are `framekernel` host library tests across **52 modules**.
-- **The networking stack is live**: a virtio-net NIC driver brings the device up and completes a transmit **and** receive — it ARPs QEMU's gateway and parses the reply — proven at boot on the emulated device.
+- **The OS joins the network**: a virtio-net NIC driver brings the device up, ARP-resolves QEMU's gateway, and obtains a real **DHCP lease (10.0.2.15)** over the wire — Ethernet/ARP/IPv4/UDP (with checksums)/DHCP all live, transmit and receive, proven at boot across `-smp` 1/2/4.
 - `cargo xtask boot-test` and `cargo xtask boot-matrix` (1, 2 and 4 CPUs) pass; an 8-CPU boot (`ORIGIN_QEMU_SMP=8`) was confirmed. Every kernel feature added this run prints a gated boot marker and has at least one negative control that was shown to fail the boot and then restored.
 - A 40× mutation soak (`ORIGIN_MUTATION_SCALE=40`) over 12 untrusted-input parser suites ran with 0 failures.
 - **Everything runs under QEMU 11.1.3 (TCG) + OVMF only. No physical-hardware qualification (CLAUDE.md §74).**
@@ -51,7 +51,7 @@ Each item was built → host-tested → `cargo xtask check` → committed, with 
 - **routing** (`route`): an IPv4 longest-prefix-match bit trie (oracle-tested against a brute-force scan).
 - **DNS** (`dns`): message parsing with **bounded name decompression** (a decompression bomb is a clean parse failure).
 - **DHCP** (`dhcp`): a client — DISCOVER/REQUEST build, OFFER/ACK/NAK parse, the INIT → SELECTING → REQUESTING → BOUND lease state machine.
-- **A live virtio-net NIC** (boot-proven): the `virtqueue` split-ring transport and the `virtio` device/feature/`find_caps` layer (host-tested), under a kernel `virtionet` driver that brings up the device (PCI capability discovery, BAR mapping, feature handshake, DMA ring setup, `DRIVER_OK`), reads the MAC, and does a **live ARP exchange** — transmits an ARP who-has for QEMU's gateway and receives and parses the reply (`ARP 10.0.2.2 -> 52:55:0a:00:02:02`). Two negative controls (wrong MAC; ARP a nonexistent host). This is the whole transmit-and-receive datapath, running on the emulated device.
+- **A live virtio-net NIC, and the OS on the network** (boot-proven): the `virtqueue` split-ring transport and the `virtio` device/feature/`find_caps` layer (host-tested), under a kernel `virtionet` driver that brings up the device (PCI capability discovery, BAR mapping, feature handshake, DMA ring setup, `DRIVER_OK`), reads the MAC, then **ARP-resolves QEMU's gateway and obtains a real DHCP lease** (`ARP 10.0.2.2 -> 52:55:0a:00:02:02; DHCP lease 10.0.2.15`) by driving the `dhcp` client over UDP/IPv4/Ethernet (with checksums) on the live TX/RX datapath. Three negative controls (wrong MAC; ARP a nonexistent host; DHCP to the wrong port). The whole networking stack — NIC, Ethernet, ARP, IPv4, UDP, DHCP — runs end to end on the emulated device.
 
 ### Data formats & utilities
 - **Base64** (`base64`, RFC 4648, whitespace-tolerant) — RFC vectors.
@@ -82,7 +82,7 @@ Each item was built → host-tested → `cargo xtask check` → committed, with 
 
 1. **Owner decisions:** accept or revise ADR-0006 (OriginFS) so the read path can be mounted; approve the vector/`loom` downloads so the crypto and concurrency tests can be completed; choose a licence.
 2. **Wire the decision layers into the kernel:** NUMA-aware frame allocation and scheduler placement (the `numa` map is the decision layer, §66); the keyboard IRQ → `ring` → `editbuffer` input path; mounting OriginFS beneath `vfs` once accepted.
-3. **Finish the networking path:** the virtio-net NIC is live (TX+RX, ARP). Next, make it interrupt-driven (MSI-X) and wire the IP/UDP/DHCP stack onto it, so the OS obtains a DHCP lease and routes traffic.
+3. **Finish the networking path:** the virtio-net NIC is live end-to-end (TX+RX, ARP, and a DHCP lease). Next, make it interrupt-driven (MSI-X, it currently polls), add a socket API, and route real traffic on the lease (ping, DNS to slirp's 10.0.2.3).
 4. **Package/runtime:** a dependency resolver over `semver`, and reading real `.osi`/`.oapp` payloads through `ustar` + `deflate`.
 
 ## 6. Where the detail is
