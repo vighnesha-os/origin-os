@@ -15,7 +15,7 @@
 
 use core::fmt::Write;
 
-use framekernel::blockcache::{BlockCache, Lookup};
+use framekernel::blockcache::{BlockCache, Request, Transfer};
 
 use crate::console::Console;
 
@@ -39,13 +39,29 @@ struct Block {
     writes: u64,
 }
 
-/// What a page access did on the device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Io {
-    Hit,
-    Read,
-    WroteBackAndRead,
-    Failed,
+/// One of the cache's transfers on the device: a whole cache page between its slot and the
+/// disk, through the polled I/O queue.
+fn transfer(
+    slots: &[Page],
+    page_blocks: u64,
+    reads: &mut u64,
+    writes: &mut u64,
+    request: Request,
+) -> Transfer {
+    let (write, page, slot) = match request {
+        Request::WriteBack { slot, block } => {
+            *writes += 1;
+            (true, block, slot)
+        }
+        Request::Read { slot, block } => {
+            *reads += 1;
+            (false, block, slot)
+        }
+    };
+    let Some(p) = slots.get(slot) else {
+        return Transfer::Failed;
+    };
+    crate::storage::transfer(write, page * page_blocks, p.bus, page_blocks as u32)
 }
 
 impl Block {
@@ -72,48 +88,27 @@ impl Block {
         })
     }
 
-    /// The first device block of cache page `page`.
-    fn lba(&self, page: u64) -> u64 {
-        page * self.page_blocks
-    }
-
     /// Makes cache page `page`'s data present in a slot, reading it from the disk on a miss
-    /// (writing back the evicted dirty page first). Returns the slot and what it did.
-    fn bring_in(&mut self, page: u64) -> (usize, Io) {
-        let lookup = self.index.access(page);
-        let slot = lookup.slot();
-        let p = self.slots[slot];
-        let io = match lookup {
-            Lookup::Hit(_) => return (slot, Io::Hit),
-            Lookup::Evict { evicted, .. } => {
-                self.writes += 1;
-                if !crate::storage::transfer(
-                    true,
-                    self.lba(evicted),
-                    p.bus,
-                    self.page_blocks as u32,
-                ) {
-                    return (slot, Io::Failed);
-                }
-                self.index.mark_clean(slot);
-                Io::WroteBackAndRead
-            }
-            Lookup::Fill(_) | Lookup::Replace { .. } => Io::Read,
-        };
-        self.reads += 1;
-        if !crate::storage::transfer(false, self.lba(page), p.bus, self.page_blocks as u32) {
-            return (slot, Io::Failed);
-        }
-        self.index.filled(slot, page);
-        (slot, io)
+    /// (writing back the evicted dirty page first). Returns the slot, or `None` if that
+    /// failed. The index decides what a failed or stuck transfer leaves behind
+    /// ([`BlockCache::bring_in`]): a page a command never finished with is quarantined.
+    fn bring_in(&mut self, page: u64) -> Option<usize> {
+        self.index.bring_in(page, |request| {
+            transfer(
+                &self.slots,
+                self.page_blocks,
+                &mut self.reads,
+                &mut self.writes,
+                request,
+            )
+        })
     }
 
     /// Reads device block `lba` into `out` (one block). Returns whether it succeeded.
     fn read_block(&mut self, lba: u64, out: &mut [u8]) -> bool {
-        let (slot, io) = self.bring_in(lba / self.page_blocks);
-        if io == Io::Failed {
+        let Some(slot) = self.bring_in(lba / self.page_blocks) else {
             return false;
-        }
+        };
         let offset = ((lba % self.page_blocks) * self.block_size) as usize;
         crate::storage::dma_read(self.slots[slot].virt, offset, out);
         true
@@ -122,10 +117,9 @@ impl Block {
     /// Writes `data` (one block) to device block `lba` through the cache (read-modify-write
     /// if the page is not resident): the page is dirtied, not yet written to the disk.
     fn write_block(&mut self, lba: u64, data: &[u8]) -> bool {
-        let (slot, io) = self.bring_in(lba / self.page_blocks);
-        if io == Io::Failed {
+        let Some(slot) = self.bring_in(lba / self.page_blocks) else {
             return false;
-        }
+        };
         let offset = ((lba % self.page_blocks) * self.block_size) as usize;
         crate::storage::dma_write(self.slots[slot].virt, offset, data);
         self.index.mark_dirty(slot);
@@ -135,25 +129,21 @@ impl Block {
     /// Writes every dirty page back and flushes the controller's cache. Returns whether
     /// all of it succeeded.
     fn flush(&mut self) -> bool {
-        let mut ok = true;
-        for (slot, page) in self.index.dirty_slots() {
-            self.writes += 1;
-            if crate::storage::transfer(
-                true,
-                self.lba(page),
-                self.slots[slot].bus,
-                self.page_blocks as u32,
-            ) {
-                self.index.mark_clean(slot);
-            } else {
-                ok = false;
-            }
-        }
-        ok && crate::storage::flush_device()
+        let written = self.index.write_back_all(|request| {
+            transfer(
+                &self.slots,
+                self.page_blocks,
+                &mut self.reads,
+                &mut self.writes,
+                request,
+            )
+        });
+        written && crate::storage::flush_device()
     }
 }
 
-/// Proves the block cache against the NVMe test disk:
+/// Proves the block cache against the NVMe test disk, and on no other: every step reads its
+/// pattern, and the last one writes to it (CLAUDE.md P0; `storage` says when it is skipped):
 /// - cold reads miss and fetch from the disk; re-reads of resident pages hit without I/O;
 /// - reads return the pattern the boot test wrote;
 /// - more pages than slots force LRU eviction;
@@ -162,6 +152,9 @@ impl Block {
 pub(crate) fn prove(com1: &mut Console) -> bool {
     if crate::storage::geometry().is_none() {
         let _ = writeln!(com1, "origin-kernel: block cache: no block device");
+        return true;
+    }
+    if !crate::storage::on_test_disk() {
         return true;
     }
     const SLOTS: usize = 4;

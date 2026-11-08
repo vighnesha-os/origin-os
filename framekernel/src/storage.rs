@@ -28,6 +28,14 @@
 //! data buffer is read only after its command completed. A fence orders memory writes before
 //! every doorbell. MSI-X entries are programmed through `iommu::msi_message`, so with
 //! interrupt remapping on they hold only remappable-format handles.
+//!
+//! A queue runs one command at a time. A command that never completes kills its queue (there
+//! is no abort or controller reset yet): every later command on it fails at once, its late
+//! completion is never taken, and the block layer keeps the command's page out of use.
+//!
+//! The boot proofs write only to the disk the boot test builds, named positively by
+//! `framekernel::blockcache::test_disk` (CLAUDE.md P0). Any other disk gets no write and no
+//! flush during boot: the proofs say so once, and that is not a failure.
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -35,6 +43,7 @@ use core::ptr;
 use core::sync::atomic::{Ordering, compiler_fence, fence};
 
 use core::sync::atomic::AtomicU64;
+use framekernel::blockcache::{QueueGate, Transfer, test_disk};
 use framekernel::gpt;
 use framekernel::nvme::{self, Capabilities, Command, Completion, NamespaceInfo, Queues, register};
 use framekernel::pci::{self, BarKind};
@@ -46,6 +55,8 @@ use crate::dma::DeviceDma;
 use crate::wait::WaitQueue;
 
 use crate::console::Console;
+
+pub(crate) use framekernel::blockcache::test_disk::pattern;
 
 /// Entries in the admin queues and the I/O queues.
 const ADMIN_ENTRIES: u16 = 32;
@@ -96,8 +107,9 @@ impl DmaPage {
     fn fill(&self, bytes: &[u8]) {
         for (i, &b) in bytes.iter().enumerate().take(PAGE as usize) {
             let p = ptr::with_exposed_provenance_mut::<u8>(self.virt as usize + i);
-            // SAFETY: inside this live page; the device is not using it (no command is
-            // outstanding on it).
+            // SAFETY: inside this live page, which is kept for ever; the write is volatile
+            // and makes no reference, so even a command that timed out and may still reach
+            // the page cannot make it unsound.
             unsafe { p.write_volatile(b) };
         }
     }
@@ -122,14 +134,22 @@ struct QueuePair {
     cq: DmaPage,
     state: Queues,
     next_cid: u16,
+    /// Whether it can take a command: one at a time, and a dead queue never again.
+    gate: QueueGate,
 }
 
 /// Why a command failed.
 #[derive(Clone, Copy, Debug)]
 enum Failure {
     Full,
+    /// No completion in time: the command may still be live, so its queue is dead now.
     Timeout,
+    /// A completion for another command, so this one may still be live: dead, too.
     WrongCommand,
+    /// The queue is dead: refused without touching the device.
+    Dead,
+    /// Another command is outstanding on the queue: refused without touching the device.
+    Busy,
 }
 
 /// Which queue pair a command goes to.
@@ -205,18 +225,31 @@ impl Nvme {
         }
     }
 
-    /// Submits `make(cid)` to queue `q` and polls for its completion.
+    /// Submits `make(cid)` to queue `q` and polls for its completion. A caller holds no lock
+    /// (the wait lets interrupts in) and has the controller to itself; with the driver
+    /// shared, use [`command`].
     fn run(&mut self, q: Q, make: impl FnOnce(u16) -> Command) -> Result<Completion, Failure> {
         let cid = self.submit(q, make)?;
         let deadline = crate::time::monotonic_nanos() + COMMAND_TIMEOUT_NS;
         loop {
+            // The clock first: whatever completed by this moment is found below, however
+            // long this flow was away from the processor.
+            let late = crate::time::monotonic_nanos() > deadline;
             if let Some(done) = self.poll(q, cid) {
                 return done;
             }
-            if crate::time::monotonic_nanos() > deadline {
+            if late {
+                self.kill(q);
                 return Err(Failure::Timeout);
             }
-            core::hint::spin_loop();
+            between_polls();
+        }
+    }
+
+    /// Queue `q` lost a command: it is dead from now on.
+    fn kill(&mut self, q: Q) {
+        if let Some(qp) = self.queue(q) {
+            qp.gate.kill();
         }
     }
 
@@ -243,9 +276,19 @@ fn submit_on(
     make: impl FnOnce(u16) -> Command,
 ) -> Result<u16, Failure> {
     {
+        qp.gate.claim().map_err(|gate| {
+            if gate.is_dead() {
+                Failure::Dead
+            } else {
+                Failure::Busy
+            }
+        })?;
         let cid = qp.next_cid;
         qp.next_cid = qp.next_cid.wrapping_add(1);
-        let slot = qp.state.submit().ok_or(Failure::Full)?;
+        let Some(slot) = qp.state.submit() else {
+            qp.gate.release();
+            return Err(Failure::Full);
+        };
         for (i, word) in make(cid).to_words().iter().enumerate() {
             qp.sq
                 .write32(usize::from(slot) * nvme::SQ_ENTRY + 4 * i, *word);
@@ -271,6 +314,10 @@ fn poll_on(
     cid: u16,
 ) -> Option<Result<Completion, Failure>> {
     {
+        // The queue died with this command outstanding, so it may still be live.
+        if qp.gate.is_dead() {
+            return Some(Err(Failure::Timeout));
+        }
         let at = usize::from(qp.state.cq_head()) * nvme::CQ_ENTRY;
         // The phase is in the last dword: read it first, then the rest.
         let last = qp.cq.read32(at + 12);
@@ -291,11 +338,21 @@ fn poll_on(
         // SAFETY: as in `write32`: the completion head doorbell of a queue that exists.
         unsafe { p.write_volatile(u32::from(qp.state.cq_head())) };
         Some(if c.cid == cid {
+            qp.gate.release();
             Ok(c)
         } else {
+            qp.gate.kill();
             Err(Failure::WrongCommand)
         })
     }
+}
+
+/// Between two looks at a completion queue, with no lock held: lets a pending interrupt in,
+/// on whichever flow this is. A kernel thread runs with interrupts on anyway; the boot flow
+/// runs with them off and takes them only through windows like this one.
+fn between_polls() {
+    crate::cpu::without_interrupts(crate::cpu::interrupt_window);
+    core::hint::spin_loop();
 }
 
 fn new_queue(dma: DeviceDma, qid: u16, entries: u16) -> Option<QueuePair> {
@@ -305,32 +362,23 @@ fn new_queue(dma: DeviceDma, qid: u16, entries: u16) -> Option<QueuePair> {
         cq: DmaPage::new(dma)?,
         state: Queues::new(entries),
         next_cid: 0,
+        gate: QueueGate::Idle,
     })
 }
 
-/// The bytes xtask writes in pattern block `lba`: `ORIGIN NVME LBA 00002048 ` repeated.
-pub(crate) fn pattern(lba: u64, out: &mut [u8]) {
-    let mut unit = *b"ORIGIN NVME LBA 00000000 ";
-    let mut v = lba;
-    for i in (16..24).rev() {
-        if let Some(d) = unit.get_mut(i) {
-            *d = b'0' + (v % 10) as u8;
-        }
-        v /= 10;
-    }
-    for (o, u) in out.iter_mut().zip(unit.iter().cycle()) {
-        *o = *u;
-    }
-}
-
 /// The bound controller, once the polled proofs are done, with a data page for the
-/// interrupt-driven proof's thread. Locked with interrupts disabled, never across a wait.
+/// interrupt-driven proof's thread. Locked with interrupts disabled and never across a wait:
+/// [`command`] submits under the lock, waits with it released and takes it again only to
+/// look for the completion; set-up that needs the driver across several commands takes it
+/// out of the lock first ([`with_driver_out`]).
 struct Driver {
     nvme: Nvme,
     dev: crate::pcie::Device,
     page: DmaPage,
     /// Namespace 1.
     namespace: NamespaceInfo,
+    /// Namespace 1 is the boot test's disk: the only one the boot proofs may write to.
+    test_disk: bool,
     /// The MSI-X table's virtual address and the capability, once set up.
     msix: Option<(u64, pci::Msix)>,
 }
@@ -375,14 +423,15 @@ fn count_blocks(blocks: u64) {
 
 /// Binds the first NVMe controller and proves block I/O on namespace 1, polled and then
 /// interrupt-driven. Returns whether every step and check passed (no controller at all is
-/// reported, and passes).
+/// reported, and passes, and so does a disk that is not the boot test's, on which only the
+/// read-only proofs that do not need its contents run).
 pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
     let Some(dev) = crate::pcie::find(0x01, 0x08, 0x02) else {
         let _ = writeln!(com1, "origin-kernel: NVMe: no controller");
         return true;
     };
-    let polled = match bind(com1, &dev, cpus.len()) {
-        Ok((nvme, ok, namespace)) => {
+    let (polled, on_test_disk) = match bind(com1, &dev, cpus.len()) {
+        Ok((nvme, ok, namespace, test_disk)) => {
             let Some(page) = DmaPage::new(nvme.dma) else {
                 return false;
             };
@@ -392,16 +441,21 @@ pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
                     dev,
                     page,
                     namespace,
+                    test_disk,
                     msix: None,
                 });
             });
-            ok
+            (ok, test_disk)
         }
         Err(why) => {
             let _ = writeln!(com1, "origin-kernel: NVMe: {why}: NVMe failed");
             return false;
         }
     };
+    // Every proof below reads the boot test's pattern, and two of them write.
+    if !on_test_disk {
+        return polled;
+    }
     let interrupts = polled && prove_interrupts(com1, cpus, tsc_hz);
     let per_cpu = interrupts && prove_per_cpu(com1, cpus, tsc_hz);
     let x2apic = per_cpu && prove_x2apic(com1, cpus);
@@ -417,6 +471,11 @@ pub(crate) fn geometry() -> Option<(u32, u64)> {
     })
 }
 
+/// Whether namespace 1 is the boot test's disk, the only one the boot proofs may write to.
+pub(crate) fn on_test_disk() -> bool {
+    crate::cpu::without_interrupts(|| DRIVER.lock().as_ref().is_some_and(|d| d.test_disk))
+}
+
 /// Allocates a zeroed 4 KiB DMA page for the block layer, mapped for the bound
 /// controller: its virtual address and the address the controller uses. Never freed.
 pub(crate) fn dma_page() -> Option<(u64, u64)> {
@@ -425,40 +484,80 @@ pub(crate) fn dma_page() -> Option<(u64, u64)> {
 }
 
 /// Reads or writes `blocks` device blocks at `lba` between the disk and the DMA page the
-/// controller reaches at `bus`, through the polled I/O queue. Returns whether it succeeded.
-/// For the block layer, driven from the boot flow.
-pub(crate) fn transfer(write: bool, lba: u64, bus: u64, blocks: u32) -> bool {
-    transfer_status(write, lba, bus, blocks).is_some_and(|s| s.ok())
+/// controller reaches at `bus`, through the polled I/O queue. For the block layer, driven
+/// from the boot flow. A [`Transfer::Stuck`] means the command may still be live: the page
+/// must not be reused.
+pub(crate) fn transfer(write: bool, lba: u64, bus: u64, blocks: u32) -> Transfer {
+    match transfer_status(write, lba, bus, blocks) {
+        Ok(status) if status.ok() => Transfer::Done,
+        Ok(_) | Err(Failure::Full | Failure::Dead | Failure::Busy) => Transfer::Failed,
+        Err(Failure::Timeout | Failure::WrongCommand) => Transfer::Stuck,
+    }
 }
 
-/// As [`transfer`], returning the completion's status (`None`: no controller, or no
-/// completion in time).
-fn transfer_status(write: bool, lba: u64, bus: u64, blocks: u32) -> Option<nvme::Status> {
-    crate::cpu::without_interrupts(|| {
-        let mut g = DRIVER.lock();
-        let d = g.as_mut()?;
-        let bs = u64::from(d.namespace.block_size);
-        let prps = nvme::prps(bus, u64::from(blocks) * bs, PAGE).unwrap_or((bus, 0));
-        d.nvme
-            .run(Q::Polled, |cid| {
-                Command::transfer(write, cid, NSID, lba, blocks, prps)
-            })
-            .ok()
-            .map(|c| c.status)
+/// As [`transfer`], returning the completion's status, or why there is none.
+fn transfer_status(write: bool, lba: u64, bus: u64, blocks: u32) -> Result<nvme::Status, Failure> {
+    let (block_size, _) = geometry().ok_or(Failure::Full)?;
+    let prps = nvme::prps(bus, u64::from(blocks) * u64::from(block_size), PAGE).unwrap_or((bus, 0));
+    command(Q::Polled, |cid| {
+        Command::transfer(write, cid, NSID, lba, blocks, prps)
     })
+    .map(|c| c.status)
 }
 
 /// Flushes namespace 1's write cache to media.
 pub(crate) fn flush_device() -> bool {
-    crate::cpu::without_interrupts(|| {
-        let mut g = DRIVER.lock();
-        let Some(d) = g.as_mut() else {
-            return false;
-        };
-        d.nvme
-            .run(Q::Polled, |cid| Command::flush(cid, NSID))
-            .is_ok_and(|c| c.status.ok())
-    })
+    command(Q::Polled, |cid| Command::flush(cid, NSID)).is_ok_and(|c| c.status.ok())
+}
+
+/// Runs one command on queue `q` of the bound controller: submitted under the driver lock,
+/// then waited for with the lock released (taken again only to look for the completion) and
+/// interrupts let in. Queues are shared, so a caller that finds another command outstanding
+/// waits its turn the same way, for as long as one command may take.
+fn command(q: Q, make: impl Fn(u16) -> Command) -> Result<Completion, Failure> {
+    let turn = crate::time::monotonic_nanos() + COMMAND_TIMEOUT_NS;
+    let cid = loop {
+        let submitted = crate::cpu::without_interrupts(|| match DRIVER.lock().as_mut() {
+            Some(d) => d.nvme.submit(q, &make),
+            None => Err(Failure::Full),
+        });
+        match submitted {
+            Ok(cid) => break cid,
+            Err(Failure::Busy) if crate::time::monotonic_nanos() < turn => between_polls(),
+            Err(failure) => return Err(failure),
+        }
+    };
+    let deadline = crate::time::monotonic_nanos() + COMMAND_TIMEOUT_NS;
+    loop {
+        // The clock first, as in `Nvme::run`.
+        let late = crate::time::monotonic_nanos() > deadline;
+        let done = crate::cpu::without_interrupts(|| {
+            let mut g = DRIVER.lock();
+            let Some(d) = g.as_mut() else {
+                return Some(Err(Failure::Timeout));
+            };
+            let done = d.nvme.poll(q, cid);
+            if done.is_none() && late {
+                d.nvme.kill(q);
+                return Some(Err(Failure::Timeout));
+            }
+            done
+        });
+        if let Some(done) = done {
+            return done;
+        }
+        between_polls();
+    }
+}
+
+/// Runs boot-flow set-up on the bound driver with no lock held: the driver is taken out of
+/// [`DRIVER`] for the duration, so that its commands wait with interrupts let in. Nothing
+/// else uses the driver meanwhile: the threads that do are spawned after the set-up.
+fn with_driver_out<T>(f: impl FnOnce(&mut Driver) -> T) -> Option<T> {
+    let mut driver = crate::cpu::without_interrupts(|| DRIVER.lock().take())?;
+    let result = f(&mut driver);
+    crate::cpu::without_interrupts(|| *DRIVER.lock() = Some(driver));
+    Some(result)
 }
 
 /// Reads `out.len()` bytes at `offset` of the DMA page mapped at `virt` (from
@@ -491,7 +590,7 @@ fn bind(
     com1: &mut Console,
     dev: &crate::pcie::Device,
     cpus: usize,
-) -> Result<(Nvme, bool, NamespaceInfo), &'static str> {
+) -> Result<(Nvme, bool, NamespaceInfo, bool), &'static str> {
     let f = dev.function;
     let bar = dev.bars[0].ok_or("no BAR 0")?;
     if bar.kind == BarKind::Io || bar.size < 0x2000 {
@@ -511,6 +610,13 @@ fn bind(
         irq: None,
     };
     c.cap = Capabilities::decode(c.read64(register::CAP));
+    // CAP is the device's word. Before the first command and its first doorbell: every
+    // doorbell the driver will ring lies inside BAR 0 (the admin queues', queue pairs 1
+    // (polled), 2 (one interrupt) and one per processor).
+    let wanted = u16::try_from(2 + cpus).map_err(|_| "too many processors")?;
+    if !nvme::doorbells_fit(wanted, c.cap.doorbell_stride, bar.size) {
+        return Err("the queues' doorbells lie outside BAR 0");
+    }
     let (major, minor, tertiary) = nvme::version(c.read32(register::VS));
     let _ = writeln!(
         com1,
@@ -555,6 +661,8 @@ fn bind(
             Failure::Full => "queue full",
             Failure::Timeout => "a command timed out",
             Failure::WrongCommand => "a completion for another command",
+            Failure::Dead => "a command on a queue that lost an earlier one",
+            Failure::Busy => "a command on a queue with one outstanding",
         }
     };
     let id = c
@@ -598,12 +706,6 @@ fn bind(
         namespace.block_size,
         (namespace.blocks * u64::from(namespace.block_size)) >> 20
     );
-    // Before any I/O queue exists: queue pairs 1 (polled), 2 (one interrupt) and one per
-    // processor.
-    let wanted = u16::try_from(2 + cpus).map_err(|_| "too many processors")?;
-    if !nvme::doorbells_fit(wanted, c.cap.doorbell_stride, bar.size) {
-        return Err("the doorbells of the I/O queues lie outside BAR 0");
-    }
     let granted = c
         .run(Q::Admin, |cid| {
             Command::set_number_of_queues(cid, wanted, wanted)
@@ -636,9 +738,23 @@ fn bind(
         return Err("Create I/O Submission Queue failed");
     }
     c.io = Some(io);
-    let ok = prove_io(com1, &mut c, &data, namespace).map_err(failed)?;
-    let gpt = prove_gpt(com1, &mut c, &data, namespace).map_err(failed)?;
-    Ok((c, ok && gpt, namespace))
+    let on_test_disk = is_test_disk(&mut c, &data, namespace).map_err(failed)?;
+    let ok = prove_io(com1, &mut c, &data, namespace, on_test_disk).map_err(failed)?;
+    let gpt = prove_gpt(com1, &mut c, &data, namespace, on_test_disk).map_err(failed)?;
+    Ok((c, ok && gpt, namespace, on_test_disk))
+}
+
+/// Whether namespace 1 is the disk the boot test builds, the only one the boot proofs may
+/// write to (CLAUDE.md P0). Reads only, and nothing at all on a disk of any other geometry.
+fn is_test_disk(c: &mut Nvme, data: &DmaPage, ns: NamespaceInfo) -> Result<bool, Failure> {
+    if !test_disk::geometry_matches(ns.blocks, ns.block_size) {
+        return Ok(false);
+    }
+    let mut header = [0u8; test_disk::BLOCK_SIZE as usize];
+    let mut area = alloc::vec![0u8; test_disk::PATTERN_BYTES];
+    Ok(read_blocks(c, data, ns, 1, &mut header)?
+        && read_blocks(c, data, ns, test_disk::PATTERN_FIRST, &mut area)?
+        && test_disk::identifies(ns.blocks, ns.block_size, &header, &area))
 }
 
 /// Reads the interrupt-driven proof makes, of 8 blocks each.
@@ -763,6 +879,13 @@ extern "sysv64" fn io_thread(_: u64) -> ! {
         );
         count_blocks(*waited.as_ref().unwrap_or(&0));
         let Some(Ok(c)) = done.get() else {
+            // No completion for it, so it may still be live: the queue, and the page with it,
+            // is never used again.
+            crate::cpu::without_interrupts(|| {
+                if let Some(d) = DRIVER.lock().as_mut() {
+                    d.nvme.kill(Q::Interrupt);
+                }
+            });
             break;
         };
         if waited.is_err() || !c.status.ok() {
@@ -794,14 +917,13 @@ extern "sysv64" fn io_thread(_: u64) -> ! {
 fn prove_interrupts(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
     let bsp = crate::cpu::this_cpu();
     let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
-    let setup = crate::cpu::without_interrupts(|| {
-        let mut g = DRIVER.lock();
-        let d = g.as_mut().ok_or("no driver")?;
+    let setup = with_driver_out(|d| {
         let apic_id = target
             .apic_id()
             .ok_or("the target processor has no APIC ID")?;
         setup_interrupts(d, apic_id)
-    });
+    })
+    .unwrap_or(Err("no driver"));
     let msix = match setup {
         Ok(m) => m,
         Err(why) => {
@@ -927,12 +1049,14 @@ impl core::fmt::Display for State<'_> {
 }
 
 /// Reads and checks both GPT copies (UEFI 2.11 §5.3.2) and lists the partitions. Both must
-/// be valid and agree; with only one, the disk is reported from it, and the proof fails.
+/// be valid and agree; with only one, the disk is reported from it, and the proof fails. On
+/// a disk that is not the boot test's, which need not have a GPT at all, this only reports.
 fn prove_gpt(
     com1: &mut Console,
     c: &mut Nvme,
     data: &DmaPage,
     ns: NamespaceInfo,
+    on_test_disk: bool,
 ) -> Result<bool, Failure> {
     let empty = gpt::Partition {
         index: 0,
@@ -955,17 +1079,18 @@ fn prove_gpt(
         (Ok((p, n)), Ok((b, m))) => p.agrees_with(b) && parts.get(..*n) == backup_parts.get(..*m),
         _ => false,
     };
+    let passed = agree || !on_test_disk;
     let _ = writeln!(
         com1,
         "origin-kernel: GPT: primary copy {}, backup copy at LBA {backup_lba} {}, the two agree {agree}{}",
         State(&primary),
         State(&backup),
-        if agree { "" } else { ": GPT failed" }
+        if passed { "" } else { ": GPT failed" }
     );
     let (list, (h, n)) = match (&primary, &backup) {
         (Ok(p), _) => (&parts, p),
         (Err(_), Ok(b)) => (&backup_parts, b),
-        _ => return Ok(false),
+        _ => return Ok(passed),
     };
     let _ = writeln!(
         com1,
@@ -985,17 +1110,26 @@ fn prove_gpt(
             p.unique
         );
     }
-    Ok(agree)
+    Ok(passed)
 }
 
 /// Reads blocks the boot test wrote, writes and reads back one, and checks that a read past
-/// the end fails.
+/// the end fails. Only on the boot test's disk: on any other this says so, once, and passes
+/// having issued no write and no flush (CLAUDE.md P0).
 fn prove_io(
     com1: &mut Console,
     c: &mut Nvme,
     data: &DmaPage,
     ns: NamespaceInfo,
+    on_test_disk: bool,
 ) -> Result<bool, Failure> {
+    if !on_test_disk {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: NVMe: write proofs skipped: this is not the boot test's disk, so nothing is written to it or flushed during boot"
+        );
+        return Ok(true);
+    }
     let bs = u64::from(ns.block_size);
     let read = |c: &mut Nvme, lba: u64, blocks: u32| {
         let prps = nvme::prps(data.bus, u64::from(blocks) * bs, PAGE).unwrap_or((data.bus, 0));
@@ -1122,11 +1256,13 @@ fn setup_cpu_queues(d: &mut Driver, cpus: &[CpuIndex]) -> Result<(), &'static st
             return Err("a per-processor queue was refused");
         }
         let slot = CPU_QUEUES.get(cpu.get()).ok_or("CPU index out of range")?;
-        *slot.lock() = Some(CpuQueue {
-            qp: queue,
-            page,
-            regs: d.nvme.regs,
-            stride: d.nvme.cap.doorbell_stride,
+        crate::cpu::without_interrupts(|| {
+            *slot.lock() = Some(CpuQueue {
+                qp: queue,
+                page,
+                regs: d.nvme.regs,
+                stride: d.nvme.cap.doorbell_stride,
+            });
         });
     }
     Ok(())
@@ -1165,6 +1301,15 @@ fn cpu_command(me: usize, make: impl FnOnce(u16, u64) -> Command, out: &mut [u8;
         deadline,
     );
     count_blocks(*waited.as_ref().unwrap_or(&0));
+    if !matches!(done.get(), Some(Ok(_))) {
+        // No completion for it, so it may still be live: the queue, and the page with it, is
+        // never used again.
+        crate::cpu::without_interrupts(|| {
+            if let Some(q) = slot.lock().as_mut() {
+                q.qp.gate.kill();
+            }
+        });
+    }
     let ok = waited.is_ok() && matches!(done.get(), Some(Ok(c)) if c.status.ok());
     if ok {
         crate::cpu::without_interrupts(|| {
@@ -1201,16 +1346,18 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
         }
         reads += 1;
     }
-    // A block of its own: written from this processor's page, flushed, cleared, read back.
+    // A block of its own, on the boot test's disk and no other: written from this processor's
+    // page, flushed, cleared, read back.
     let scratch = 20_000 + 8 * index;
     pattern(scratch ^ 0x5A5A, &mut expected);
-    let filled = crate::cpu::without_interrupts(|| {
-        let g = CPU_QUEUES.get(me).map(|s| s.lock());
-        g.as_ref()
-            .and_then(|g| g.as_ref())
-            .map(|q| q.page.fill(&expected))
-            .is_some()
-    });
+    let filled = on_test_disk()
+        && crate::cpu::without_interrupts(|| {
+            let g = CPU_QUEUES.get(me).map(|s| s.lock());
+            g.as_ref()
+                .and_then(|g| g.as_ref())
+                .map(|q| q.page.fill(&expected))
+                .is_some()
+        });
     let wrote = filled
         && cpu_command(
             me,
@@ -1245,11 +1392,7 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
 /// same time: every read must match, every write read back, and each processor's
 /// interrupts must have arrived on that processor.
 fn prove_per_cpu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
-    let setup = crate::cpu::without_interrupts(|| {
-        let mut g = DRIVER.lock();
-        let d = g.as_mut().ok_or("no driver")?;
-        setup_cpu_queues(d, cpus)
-    });
+    let setup = with_driver_out(|d| setup_cpu_queues(d, cpus)).unwrap_or(Err("no driver"));
     if let Err(why) = setup {
         let _ = writeln!(
             com1,
@@ -1468,13 +1611,18 @@ pub(crate) fn routed_through_irte(
 /// with no IOMMU there is nothing to prove.
 pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
     let driver = crate::cpu::without_interrupts(|| {
-        DRIVER
-            .lock()
-            .as_ref()
-            .map(|d| (d.nvme.dma, d.dev.function.at, d.msix, d.page.bus))
+        DRIVER.lock().as_ref().map(|d| {
+            (
+                d.nvme.dma,
+                d.dev.function.at,
+                d.msix,
+                d.page.bus,
+                d.test_disk,
+            )
+        })
     });
     let on = crate::iommu::translating();
-    let Some((dma, at, msix, irq_page)) = driver else {
+    let Some((dma, at, msix, irq_page, on_test_disk)) = driver else {
         let _ = writeln!(
             com1,
             "origin-kernel: IOMMU: no NVMe controller to prove DMA remapping with{}",
@@ -1490,6 +1638,14 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
         );
         return !on;
     };
+    // They read the boot test's pattern and use the queues only its disk gets (`init`).
+    if !on_test_disk {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: the proofs through the NVMe controller skipped: this is not the boot test's disk"
+        );
+        return true;
+    }
     let sid = crate::iommu::source_id(at);
     let (domains, _) = crate::iommu::domains();
     let (before, lost_before) = crate::iommu::take_faults();
@@ -1511,10 +1667,11 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
     let phys = crate::phys::to_phys(page.virt);
     let walked = crate::iommu::translate(domain, page.bus);
     page.fill(&canary);
-    let first = transfer_status(false, PROBE_LBA, page.bus, 8);
+    let first = transfer_status(false, PROBE_LBA, page.bus, 8).ok();
     let mut expected = [0u8; 512];
     let mut landed = 0;
-    for k in 0..8u64 {
+    // Only after a completion: a read that never completed may land at any time.
+    for k in 0..first.map_or(0, |_| 8u64) {
         pattern(PROBE_LBA + k, &mut expected);
         let at = (k * 512) as usize;
         if page.bytes().get(at..at + 512) == Some(&expected[..]) {
@@ -1541,8 +1698,8 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
     page.fill(&canary);
     let unmapped = crate::iommu::unmap(domain, page.bus);
     let gone = crate::iommu::translate(domain, page.bus).is_none();
-    let second = transfer_status(false, PROBE_LBA, page.bus, 8);
-    let intact = page.bytes() == &canary[..];
+    let second = transfer_status(false, PROBE_LBA, page.bus, 8).ok();
+    let intact = unmapped == Ok(phys) && page.bytes() == &canary[..];
     let (faults, lost) = crate::iommu::take_faults();
     let address_ok = |a: u64| a == page.bus || (a == 0 && !crate::iommu::fault_address_required());
     let mine = faults
@@ -1573,14 +1730,17 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
     let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let apic = |c: CpuIndex| c.apic_id().unwrap_or(framekernel::cpumap::BROADCAST);
     let mut routes: Vec<(pci::Address, vtd::MsiMessage, u8, u32)> = Vec::new();
-    if let Some((table, _)) = msix {
+    if let Some((table, capability)) = msix {
         routes.push((
             at,
             msix_message(table, 1),
             crate::cpu::DEVICE_VECTOR,
             apic(target),
         ));
-        for (k, &cpu) in cpus.iter().enumerate() {
+        // Only the entries the table has: a table too short for one per processor
+        // (`setup_cpu_queues` refused it) leaves `nvme_routes` short, and the proof fails.
+        let per_cpu = usize::from(capability.entries).saturating_sub(2);
+        for (k, &cpu) in cpus.iter().enumerate().take(per_cpu) {
             let entry = 2 + k as u64;
             routes.push((
                 at,
@@ -1629,15 +1789,10 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
             let saved = msix_message(table, 1);
             msix_point(table, 1, message);
             let before = INTERRUPTS.load(Ordering::Relaxed);
-            let completed = crate::cpu::without_interrupts(|| {
-                let mut g = DRIVER.lock();
-                let d = g.as_mut()?;
-                d.nvme
-                    .run(Q::Interrupt, |cid| {
-                        Command::transfer(false, cid, NSID, PROBE_LBA, 8, (irq_page, 0))
-                    })
-                    .ok()
-            });
+            let completed = command(Q::Interrupt, |cid| {
+                Command::transfer(false, cid, NSID, PROBE_LBA, 8, (irq_page, 0))
+            })
+            .ok();
             // Long enough for a message that was delivered to be taken.
             let start = crate::cpu::rdtsc();
             crate::sched::yield_until(
