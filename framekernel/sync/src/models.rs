@@ -1,7 +1,7 @@
-//! Loom models of [`SpinLock`] and of the kernel's wait-queue protocol (CLAUDE.md §73).
+//! Loom models of [`SpinLock`], [`RwLock`] and the kernel's wait-queue protocol (CLAUDE.md §73).
 //!
 //! Built only by `cargo xtask loom`, with `--cfg loom`, for this crate's tests. A model runs the
-//! real code, not a copy of it: `SpinLock` with its orderings, `crate::wait` (the protocol
+//! real code, not a copy of it: the two locks with their orderings, `crate::wait` (the protocol
 //! `framekernel/src/wait.rs` instantiates) and the real run queue
 //! (`framekernel/src/runqueue.rs`, compiled in here), with Loom's atomics and cell in place of
 //! `core`'s (`prim` in `lib.rs`). `cargo xtask loom` also applies a negative control for each
@@ -18,6 +18,10 @@
 //!   by happens-before with every other (Loom's cell checks this; no data race); each holder
 //!   sees all earlier holders' writes, whole. `try_lock`: a failure leaves the holder's lock held
 //!   and a success is a real holder.
+//! - `RwLock`: a writer overlaps nobody; readers can hold it together; a reader sees a writer's
+//!   update whole or not at all; and every access is ordered by happens-before with every
+//!   conflicting one (a reader's reads with the next writer's writes, a writer's with the next
+//!   reader's or writer's).
 //! - The wait queue, no lost wake-ups: a thread in `wait_until` or `wait_until_deadline` whose
 //!   condition is made true by a thread that then calls `wake_one` does not stay blocked
 //!   (a lost wake-up leaves every thread blocked, which Loom reports as a deadlock). This holds
@@ -25,7 +29,8 @@
 //!   carries it. A wait returns only with its condition true, also after a wake-up that outlived
 //!   an earlier wait; a timed wait that gives up leaves no registration, so it cannot swallow
 //!   the next waiter's wake-up; and a thread that cannot register (a full queue, or the boot
-//!   flow) still sees the condition by polling.
+//!   flow) still sees the condition by polling. A timed wait on the boot flow polls, never blocks
+//!   or registers, and ends with the condition or at the deadline.
 //!
 //! # What is not proved
 //!
@@ -43,9 +48,10 @@
 //!   That a ready thread eventually runs is assumed. Fairness and starvation are not modelled.
 //! - The machine: these are host builds against Loom's atomics. The x86-64 code the kernel runs,
 //!   the `pause` instruction and TSO are not examined.
-//! - `RwLock`, which has no model yet; a timed wait on the boot flow (the poll path with a
-//!   deadline); and what callers must uphold themselves: the state changes before `wake_one`, and
-//!   one condition per queue (`waker_wakes_before_setting_the_flag` shows the first matters).
+//! - `RwLock` writer starvation, which its documentation accepts; a timed waiter that finds the
+//!   queue full (the other way to reach `Step::Poll`, the same loop as the boot flow's); and what
+//!   callers must uphold themselves: the state changes before `wake_one`, and one condition per
+//!   queue (`waker_wakes_before_setting_the_flag` shows the first matters).
 //!
 //! # What the models add
 //!
@@ -71,9 +77,9 @@ use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use loom::sync::{Arc, Notify};
 use loom::thread::{self, JoinHandle};
 
-use crate::SpinLock;
 use crate::runqueue::RunQueue;
-use crate::wait::{Scheduler, WaitQueue};
+use crate::wait::{Scheduler, TimedOut, WaitQueue};
+use crate::{RwLock, SpinLock};
 
 /// How far one model's search goes.
 #[derive(Clone, Copy)]
@@ -280,6 +286,113 @@ fn try_lock_passes_writes_to_the_next_holder() {
             writer.join().unwrap();
         },
     );
+}
+
+// ---------------------------------------------------------------- RwLock
+
+/// What a writer adds to `inside`, where a reader adds 1: any overlap with a writer shows.
+const WRITER_INSIDE: u64 = 1 << 32;
+
+/// One writer and two readers. A writer overlaps nobody; a reader sees the writer's update
+/// whole or not at all; a reader's reads are ordered before the next writer's writes.
+#[test]
+fn rwlock_writer_excludes_readers() {
+    check(
+        "rwlock_writer_excludes_readers",
+        preempted(2, SPINS),
+        preempted(4, SPINS),
+        || {
+            let lock = Arc::new(RwLock::new((0u64, 0u64)));
+            let inside = Arc::new(AtomicU64::new(0));
+            let writer = {
+                let (lock, inside) = (Arc::clone(&lock), Arc::clone(&inside));
+                thread::spawn(move || {
+                    let mut held = lock.write();
+                    assert_eq!(
+                        inside.fetch_add(WRITER_INSIDE, Relaxed),
+                        0,
+                        "a writer beside another holder"
+                    );
+                    held.0 = 1;
+                    held.1 = 3;
+                    inside.fetch_sub(WRITER_INSIDE, Relaxed);
+                })
+            };
+            let readers = [0, 1].map(|_| {
+                let (lock, inside) = (Arc::clone(&lock), Arc::clone(&inside));
+                thread::spawn(move || {
+                    let held = lock.read();
+                    assert!(
+                        inside.fetch_add(1, Relaxed) < WRITER_INSIDE,
+                        "a reader beside a writer"
+                    );
+                    let seen = *held;
+                    assert!(seen == (0, 0) || seen == (1, 3), "a torn update: {seen:?}");
+                    inside.fetch_sub(1, Relaxed);
+                })
+            });
+            writer.join().unwrap();
+            for reader in readers {
+                reader.join().unwrap();
+            }
+            assert_eq!(*lock.read(), (1, 3));
+        },
+    );
+}
+
+/// Two writers, each doing a non-atomic read-modify-write through its guard.
+#[test]
+fn rwlock_writers_exclude_each_other() {
+    check(
+        "rwlock_writers_exclude_each_other",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let lock = Arc::new(RwLock::new(0u64));
+            let writers = [0, 1].map(|_| {
+                let lock = Arc::clone(&lock);
+                thread::spawn(move || {
+                    let mut held = lock.write();
+                    let value = *held;
+                    *held = value + 1;
+                })
+            });
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            assert_eq!(*lock.read(), 2, "a lost update");
+        },
+    );
+}
+
+/// Readers do not exclude one another: each holds the lock while it waits for the other to
+/// have it too. If they excluded each other, neither would ever get there.
+#[test]
+fn rwlock_readers_share() {
+    check("rwlock_readers_share", EXHAUSTIVE, EXHAUSTIVE, || {
+        let lock = Arc::new(RwLock::new(0u64));
+        let first_holds = Arc::new(Notify::new());
+        let second_holds = Arc::new(Notify::new());
+        let first = {
+            let (lock, first_holds, second_holds) = (
+                Arc::clone(&lock),
+                Arc::clone(&first_holds),
+                Arc::clone(&second_holds),
+            );
+            thread::spawn(move || {
+                let _held = lock.read();
+                first_holds.notify();
+                second_holds.wait();
+            })
+        };
+        let second = thread::spawn(move || {
+            let _held = lock.read();
+            second_holds.notify();
+            first_holds.wait();
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+    });
 }
 
 // ---------------------------------------------------------------- the kernel, around the queue
@@ -689,6 +802,55 @@ fn wait_queue_boot_flow_polls() {
         boot.join().unwrap();
         waker.join().unwrap();
     });
+}
+
+/// A timed wait on the boot or idle flow: it cannot block or register, so it polls, and it ends
+/// with the condition or at the deadline, whichever it sees first.
+#[test]
+fn wait_queue_boot_flow_timed_wait() {
+    check(
+        "wait_queue_boot_flow_timed_wait",
+        preempted(3, SPINS),
+        EXHAUSTIVE,
+        || {
+            let kernel = Kernel::with_cpus(3);
+            let queue = Arc::new(Queue::new());
+            let flag = Arc::new(AtomicBool::new(false));
+            let boot = {
+                let (queue, flag) = (Arc::clone(&queue), Arc::clone(&flag));
+                let me = kernel.boot_flow_on(0);
+                thread::spawn(move || {
+                    match queue.wait_until_deadline(&me, || flag.load(Acquire), DEADLINE) {
+                        Ok(blocked) => {
+                            assert_eq!(blocked, 0, "the boot flow must never block");
+                        }
+                        Err(TimedOut) => {
+                            assert!(
+                                me.monotonic_nanos() >= DEADLINE,
+                                "gave up before the deadline"
+                            );
+                        }
+                    }
+                })
+            };
+            let waker = kernel.spawn(1, {
+                let (queue, flag) = (Arc::clone(&queue), Arc::clone(&flag));
+                move |me| {
+                    flag.store(true, Release);
+                    queue.wake_one(&me);
+                }
+            });
+            // The deadline passes whether or not the waker has run.
+            let timer = kernel.spawn(2, |me| me.world.clock.store(DEADLINE, Relaxed));
+            boot.join().unwrap();
+            waker.join().unwrap();
+            timer.join().unwrap();
+            assert!(
+                !queue.wake_one(&kernel.thread_on(1)),
+                "the boot flow left a registration"
+            );
+        },
+    );
 }
 
 /// A timed waiter that gives up must not swallow the wake-up meant for the waiter behind it:

@@ -44,6 +44,9 @@ const LOCK_EXCHANGE_RELAXED: &str =
 /// The guard's release of the lock.
 const UNLOCK: &str = "self.lock.locked.store(false, Ordering::Release);";
 const UNLOCK_RELAXED: &str = "self.lock.locked.store(false, Ordering::Relaxed);";
+/// `RwLock::write`'s exchange.
+const RWLOCK_WRITE_EXCHANGE: &str =
+    ".compare_exchange_weak(0, WRITER, Ordering::Acquire, Ordering::Relaxed)";
 
 const CONTROLS: &[Control] = &[
     Control {
@@ -112,6 +115,75 @@ const CONTROLS: &[Control] = &[
                 "Causality violation",
                 "a lost update",
             ],
+        )],
+    },
+    Control {
+        name: "rwlock_read_acquire_relaxed",
+        file: SPIN_LOCK,
+        from: ".compare_exchange_weak(s, s + 1, Ordering::Acquire, Ordering::Relaxed)",
+        to: ".compare_exchange_weak(s, s + 1, Ordering::Relaxed, Ordering::Relaxed)",
+        models: &[("rwlock_writer_excludes_readers", CAUSALITY)],
+    },
+    Control {
+        name: "rwlock_write_acquire_relaxed",
+        file: SPIN_LOCK,
+        from: RWLOCK_WRITE_EXCHANGE,
+        to: ".compare_exchange_weak(0, WRITER, Ordering::Relaxed, Ordering::Relaxed)",
+        models: &[("rwlock_writers_exclude_each_other", CAUSALITY)],
+    },
+    Control {
+        name: "rwlock_read_unlock_release_relaxed",
+        file: SPIN_LOCK,
+        from: "self.lock.state.fetch_sub(1, Ordering::Release);",
+        to: "self.lock.state.fetch_sub(1, Ordering::Relaxed);",
+        models: &[("rwlock_writer_excludes_readers", CAUSALITY)],
+    },
+    Control {
+        name: "rwlock_write_unlock_release_relaxed",
+        file: SPIN_LOCK,
+        from: "self.lock.state.store(0, Ordering::Release);",
+        to: "self.lock.state.store(0, Ordering::Relaxed);",
+        models: &[("rwlock_writers_exclude_each_other", CAUSALITY)],
+    },
+    Control {
+        // A reader that does not look for a writer.
+        name: "rwlock_reader_ignores_the_writer",
+        file: SPIN_LOCK,
+        from: "            if s != WRITER\n                && self\n",
+        to: "            if self\n",
+        models: &[(
+            "rwlock_writer_excludes_readers",
+            &[
+                "a reader beside a writer",
+                "a writer beside another holder",
+                "Causality violation",
+            ],
+        )],
+    },
+    Control {
+        // A writer that does not wait for the readers to drain.
+        name: "rwlock_writer_ignores_the_readers",
+        file: SPIN_LOCK,
+        from: RWLOCK_WRITE_EXCHANGE,
+        to: ".compare_exchange_weak(self.state.load(Ordering::Relaxed), WRITER, Ordering::Acquire, Ordering::Relaxed)",
+        models: &[(
+            "rwlock_writer_excludes_readers",
+            &[
+                "a writer beside another holder",
+                "a reader beside a writer",
+                "Causality violation",
+            ],
+        )],
+    },
+    Control {
+        // Readers that exclude one another: neither can reach the point of having it.
+        name: "rwlock_readers_exclude_each_other",
+        file: SPIN_LOCK,
+        from: ".compare_exchange_weak(s, s + 1, Ordering::Acquire, Ordering::Relaxed)",
+        to: RWLOCK_WRITE_EXCHANGE,
+        models: &[(
+            "rwlock_readers_share",
+            &["Model exceeded maximum number of branches", "deadlock"],
         )],
     },
     Control {
@@ -198,6 +270,23 @@ const CONTROLS: &[Control] = &[
                 };
 ",
         models: &[("wait_queue_boot_flow_polls", DEADLOCK)],
+    },
+    Control {
+        // A timed wait on the boot flow must poll; it has nothing to be woken by.
+        name: "boot_flow_timed_wait_blocks",
+        file: WAIT,
+        from: "                let Some(thread) = me else {
+                    return Step::Poll;
+                };
+",
+        to: "                let Some(thread) = me else {
+                    return Step::Block;
+                };
+",
+        models: &[(
+            "wait_queue_boot_flow_timed_wait",
+            &["the boot flow must never block"],
+        )],
     },
     Control {
         // A registration left behind by a timed-out wait swallows the next wake-up.

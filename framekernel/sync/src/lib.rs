@@ -27,7 +27,6 @@
     )
 )]
 
-use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::Ordering;
 
@@ -42,13 +41,13 @@ mod models;
 #[path = "../../src/runqueue.rs"]
 mod runqueue;
 
-/// What [`SpinLock`] is built on: `core` in every real build, Loom's checked versions when
+/// What the locks are built on: `core` in every real build, Loom's checked versions when
 /// this crate's own tests are built with `--cfg loom`. [`Ordering`] is the same type in both,
 /// so the orderings at the call sites are the ones the models check.
 #[cfg(not(all(test, loom)))]
 mod prim {
     pub(crate) use core::hint::spin_loop;
-    pub(crate) use core::sync::atomic::AtomicBool;
+    pub(crate) use core::sync::atomic::{AtomicBool, AtomicUsize};
 
     /// `core::cell::UnsafeCell` with the closure API of Loom's checked cell.
     pub(crate) struct UnsafeCell<T>(core::cell::UnsafeCell<T>);
@@ -75,7 +74,7 @@ mod prim {
     use core::cell::Cell;
 
     pub(crate) use loom::cell::UnsafeCell;
-    pub(crate) use loom::sync::atomic::AtomicBool;
+    pub(crate) use loom::sync::atomic::{AtomicBool, AtomicUsize};
 
     std::thread_local! {
         /// How many spin iterations each thread of the running model explores (`models.rs`
@@ -214,8 +213,8 @@ impl<T> Drop for SpinGuard<'_, T> {
 /// may take a lock that interrupted code can hold.
 pub struct RwLock<T> {
     /// 0 = free; `WRITER` = a writer holds it; otherwise the number of readers.
-    state: core::sync::atomic::AtomicUsize,
-    value: UnsafeCell<T>,
+    state: prim::AtomicUsize,
+    value: prim::UnsafeCell<T>,
 }
 
 /// The `state` value that marks a held write lock.
@@ -235,10 +234,21 @@ impl<T> core::fmt::Debug for RwLock<T> {
 }
 
 impl<T> RwLock<T> {
+    /// An unlocked lock holding `value`.
+    #[cfg(not(all(test, loom)))]
     pub const fn new(value: T) -> Self {
         Self {
-            state: core::sync::atomic::AtomicUsize::new(0),
-            value: UnsafeCell::new(value),
+            state: prim::AtomicUsize::new(0),
+            value: prim::UnsafeCell::new(value),
+        }
+    }
+
+    /// An unlocked lock holding `value` (Loom's atomics and cell cannot be built in a `const`).
+    #[cfg(all(test, loom))]
+    pub fn new(value: T) -> Self {
+        Self {
+            state: prim::AtomicUsize::new(0),
+            value: prim::UnsafeCell::new(value),
         }
     }
 
@@ -254,7 +264,7 @@ impl<T> RwLock<T> {
             {
                 return ReadGuard { lock: self };
             }
-            core::hint::spin_loop();
+            prim::spin_loop();
         }
     }
 
@@ -265,7 +275,7 @@ impl<T> RwLock<T> {
             .compare_exchange_weak(0, WRITER, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            core::hint::spin_loop();
+            prim::spin_loop();
         }
         WriteGuard { lock: self }
     }
@@ -287,7 +297,7 @@ impl<T> Deref for ReadGuard<'_, T> {
     fn deref(&self) -> &T {
         // SAFETY: a read guard exists only while `state` counts this reader, which excludes
         // a writer, so no `&mut T` exists; sharing `&T` among readers is sound.
-        unsafe { &*self.lock.value.get() }
+        self.lock.value.with(|value| unsafe { &*value })
     }
 }
 
@@ -313,14 +323,14 @@ impl<T> Deref for WriteGuard<'_, T> {
     fn deref(&self) -> &T {
         // SAFETY: a write guard exists only while `state == WRITER`, so it is the only
         // access to the value.
-        unsafe { &*self.lock.value.get() }
+        self.lock.value.with(|value| unsafe { &*value })
     }
 }
 
 impl<T> DerefMut for WriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: as for `deref`; `&mut self` makes this the only access through the guard.
-        unsafe { &mut *self.lock.value.get() }
+        self.lock.value.with_mut(|value| unsafe { &mut *value })
     }
 }
 
