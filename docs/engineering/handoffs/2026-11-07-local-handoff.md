@@ -991,3 +991,30 @@ Gates on the final tree: `cargo xtask check`: 596 tests, 0 failures, 6 ignored (
 - §27 proper: use the topology for placement (SMT siblings, shared caches, dies), and hybrid-core *capacity*, which no leaf read here gives (Intel's CPUID.06H feedback interface and ACPI CPPC are the candidates; AMD's efficiency ranking is decoded already).
 - Hardware qualification (§74): a real multi-die, hybrid and AMD machine must confirm leaf 1Fh, 1Ah and 80000026h, including whether the thread field really differs between core types.
 - **The owner:** compare the AMD manual's SHA-256 (in the ledger) with AMD's copy.
+
+### Continued (2026-11-08, ~14:15–14:25 IST): parser hardening, the ONBF soak and CPU topology merged
+
+The owner asked the VT-d session to merge the three newest branches into its own,
+**`claude/interesting-carson-ae7c83`**, and run every gate. **Nothing is pushed.**
+
+| Commit | What |
+|---|---|
+| fast-forward to `6a50bf5` | parser hardening (`claude/gifted-maxwell-7e8a3f`) and the ONBF multi-fault soak (`claude/heuristic-chandrasekhar-6a46a1`) |
+| `cdcdde7` | merge of CPU topology (`claude/zealous-lovelace-301ef1`), with parser hardening's topology soak ported to the new decoder |
+| (records) | provenance ("Integration: parser hardening, the ONBF soak and CPU topology merged"), STATUS, this section |
+
+Gates on the final tree:
+- `cargo xtask check`: 681 tests, 0 failures, 6 ignored.
+- `boot-matrix`: Intel VT-d and AMD-Vi, each at 1, 2 and 4 CPUs.
+- `boot-x2apic`: processors at APIC IDs 256 and 412, under leaves 1Fh and 0Bh.
+- Controls: `ORIGIN_QEMU_IOMMU=intel-iommu,intremap=off` still fails `boot-x2apic`, and a `virtio-iommu-pci` value is refused before QEMU starts.
+
+#### What to know
+
+- **The textual merge was not enough.** Git merged `topology.rs` without a conflict, but the soak it kept called a decoder the other branch had removed. It is now `hostile_cpuid_always_gives_a_layout_that_partitions_ids`, over `CpuTopology::detect`, and eight negative controls show it catches a broken decoder.
+- The branches named above stay as they were. This branch contains all of them.
+
+#### Next
+
+- **The owner:** ADR-0007's eight questions and ADR-0008's four; errata O1 (the signature statement's `id`: ASCII or NFC tables); Intel's VT-d PDF download; the two AMD manuals' hashes against AMD's copies.
+

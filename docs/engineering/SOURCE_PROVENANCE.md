@@ -1643,6 +1643,37 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Merge resolution and the adaptations above; no new mechanism. No operating system's code was read or copied (CLAUDE.md §3).
 - **Licensing:** project licence not chosen yet.
 
+### Integration: parser hardening, the ONBF soak and CPU topology merged (`topology`; CLAUDE.md §24, §27, §72; 2026-11-08)
+
+- **What was merged** into `claude/interesting-carson-ae7c83` at `0b9c3e0`:
+  - `claude/heuristic-chandrasekhar-6a46a1` (`6a50bf5`: the ONBF multi-fault soak), which carries `claude/gifted-maxwell-7e8a3f` (`62dc630`: parser hardening): a fast-forward;
+  - `claude/zealous-lovelace-301ef1` (`d1f78e5`: CPU topology from CPUID leaves 1Fh, 0Bh and 80000026h): merge `cdcdde7`.
+- **What the merge needed:**
+  - **The topology soak, ported.** Parser hardening had added `any_subleaves_split_ids_consistently` against the old leaf-0Bh decoder (`Topology::decode`, `split`, `analyze`), which the topology branch replaced. Git merged the file without a conflict, but the library's tests would not have compiled. It is now `hostile_cpuid_always_gives_a_layout_that_partitions_ids`, over `CpuTopology::detect`. Its 20 000 default cases use arbitrary CPUID words, levels of any type and shift, runs that end just in time or too late, and valid lists as they are or with a few words corrupted, for leaves 1Fh, 0Bh and 80000026h and the maximum leaves. The test requires that:
+    - `detect` never panics;
+    - every layout's fields partition the 32 bits of an ID, so any ID reassembles from its domain IDs;
+    - the census matches an independently written count, and its domains nest;
+    - the ID, the source and the core identity come from the leaf the record names;
+    - `agree` stays within its counts over any records.
+  - Floors show that the soak reaches every `Source` and every `LayoutError`.
+  - **Records:** STATUS's header and TASKS items 3 and 4 combined. The "Parser hardening" table names the new soak.
+- **Test evidence (2026-11-08):**
+  - `cargo xtask check`: 681 tests, 0 failures, 6 ignored.
+  - `cargo xtask boot-matrix`: Intel VT-d at 1, 2 and 4 CPUs (kernel boots in 15.1, 17.6 and 23.0 s) and AMD-Vi at 1, 2 and 4 CPUs (14.3, 16.6 and 21.9 s).
+  - `cargo xtask boot-x2apic`: processors at APIC IDs 0, 256 and 412 of 150 possible, on `-cpu max,vendor=GenuineIntel` (leaf 1Fh, 21.0 s) and `-cpu max` (leaf 0Bh, 19.5 s).
+  - **Controls on the ported soak**, each a temporary edit of the decoder, restored from a saved copy that `cmp` confirmed identical. All eight were caught:
+    - no shifts-decrease check in leaves 1Fh/0Bh, or in leaf 80000026h;
+    - no out-of-order check in 1Fh/0Bh;
+    - no 5-bit mask on the shift;
+    - an unlisted AMD level starting at bit 0;
+    - the fallback ID keeping leaf 1's EBX whole;
+    - the census counting distinct IDs at every domain;
+    - a leaf 1Ah core identity without checking EAX.
+  - **`ORIGIN_QEMU_IOMMU`, re-checked because the topology branch changed xtask:** `intel-iommu,intremap=off` still fails `boot-x2apic` ("APIC IDs above 255 need interrupt remapping"), and `virtio-iommu-pci` is refused before QEMU starts.
+  - Each branch's own negative controls were run on its branch (see their entries) and are not repeated here.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Merge resolution and the ported soak; no new mechanism. No operating system's code was read or copied (CLAUDE.md §3).
+- **Licensing:** project licence not chosen yet.
+
 ### Signature-block parser (ONBF §7.1–§7.2, encodings S1–S4), added 2026-11-07
 
 - **What:** `signature::SignatureBlock::parse`: "ONBFSIG1", version 1, 1–8 length-prefixed entries; each entry a canonical OCBOR-1 map with exactly keys 1–7 (key 8, the transparency-log proof, is refused in v1); role 1–5 (S1) with its FIPS 204 context string from a table; suite 1–2 (S2), fixed by the role (kernel and release need OSS-1R); 32-byte key ID; the certificate array kept raw for the chain verifier; the statement as a map with exactly keys 0–6 (S3), whose exact encoded bytes are returned for the signatures; 64-byte Ed25519 and suite-length ML-DSA signatures; the statement's role must equal the entry's; no (role, key) twice. Verification (digest, both signatures, chain) is not wired yet.

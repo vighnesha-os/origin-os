@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Updated | 2026-11-08, ~14:30 IST (parser hardening, the ONBF multi-fault soak and CPU topology merged into the IOMMU branch) |
+| Updated | 2026-11-08, ~14:25 IST (parser hardening, the ONBF multi-fault soak and CPU topology merged into the IOMMU branch) |
 | Branch | `claude/interesting-carson-ae7c83`: the IOMMU work (`1c790fe`) with its follow-ups merged in: dense CPU indexes and a processor above APIC ID 255 (`claude/eloquent-kapitsa-840594`), parking an AP that misses its start-up handshake (`claude/priceless-cartwright-2c1803`), I/O APIC interrupts through VT-d interrupt remapping (`claude/bold-williams-a8e3ff`), AMD-Vi (`claude/upbeat-dijkstra-0d25fe`), parser hardening (`claude/gifted-maxwell-7e8a3f`), the ONBF multi-fault soak (`claude/heuristic-chandrasekhar-6a46a1`) and CPU topology from CPUID leaves 1Fh, 0Bh and 80000026h (`claude/zealous-lovelace-301ef1`); all on `m0/toolchain-verification` at `540fc2c`. **None of these is pushed.** `m0/toolchain-verification` itself is pushed and open for review as PR vighnesha-os/origin-os#1, and is not merged into `main`. |
 | Reproduce | `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs; `ORIGIN_QEMU_SMP=1`…`8` for others), and `cargo xtask boot-x2apic` (processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs in QEMU 11.1.3 (TCG) + OVMF only; nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
