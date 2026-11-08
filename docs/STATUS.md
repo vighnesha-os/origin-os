@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Updated | 2026-11-08, ~12:55 IST (the IOMMU follow-ups merged into the IOMMU branch) |
+| Updated | 2026-11-08, ~12:45 IST (the IOMMU follow-ups merged into the IOMMU branch) |
 | Branch | `claude/interesting-carson-ae7c83`: the IOMMU work (`1c790fe`) with its follow-ups merged in: dense CPU indexes and a processor above APIC ID 255 (`claude/eloquent-kapitsa-840594`), parking an AP that misses its start-up handshake (`claude/priceless-cartwright-2c1803`), I/O APIC interrupts through VT-d interrupt remapping (`claude/bold-williams-a8e3ff`) and AMD-Vi (`claude/upbeat-dijkstra-0d25fe`); all on `m0/toolchain-verification` at `540fc2c`. **None of these is pushed.** `m0/toolchain-verification` itself is pushed and open for review as PR vighnesha-os/origin-os#1, and is not merged into `main`. |
 | Reproduce | `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs; `ORIGIN_QEMU_SMP=1`…`8` for others), and `cargo xtask boot-x2apic` (a processor at APIC ID 256 of 150 possible) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs in QEMU 11.1.3 (TCG) + OVMF only; nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
@@ -21,7 +21,7 @@
 - Before any driver binds, each remapping unit gets queued invalidation, an empty root table, interrupt remapping (32-bit x2APIC destinations, compatibility format blocked) and then translation. Every device's DMA therefore faults until its driver attaches it.
 - NVMe and virtio-net run all their existing proofs through domains of their own. Their IOVAs start at 1 GiB and are never physical addresses; virtio-net gets there through `VIRTIO_F_ACCESS_PLATFORM`.
 - Every MSI-X entry of both devices is a handle to an IRTE that checks the device's source ID. Under remapping an APIC ID above 255 is accepted: the old refusal is lifted. Since the CPU-index work this is proven live: in `boot-x2apic` the NVMe MSI-X vectors routed to APIC ID 256 wake threads on that processor.
-- I/O APIC pins are routed through IRTEs too (2026-11-08), because hardware drops compatibility-format I/O APIC interrupts once remapping is on. The redirection entry is in remappable format, naming an IRTE on the unit whose DMAR scope lists the I/O APIC. The IRTE has the pin's trigger mode and checks the I/O APIC's source ID (0xff00 in QEMU's DMAR). The keyboard IRQ can now take the same path.
+- I/O APIC pins are routed through IRTEs too (2026-11-08), because hardware drops compatibility-format I/O APIC interrupts once remapping is on. The redirection entry is in remappable format, naming an IRTE on the unit whose DMAR scope lists the I/O APIC. The IRTE has the pin's trigger mode and checks the I/O APIC's source ID (0xff00 in QEMU's DMAR). The keyboard IRQ can now take the same path. Under `boot-x2apic` the pin is routed to the processor at APIC ID 256. Under AMD-Vi the pins are not routed yet: the I/O APIC's device table entry blocks them, so they stay masked, and the boot says so.
 - Proven at boot:
   - a DMA through an IOVA lands in the physical page it maps;
   - after an unmap (the IOTLB invalidated and drained), the same DMA is blocked, the page left untouched, and recorded (source ID, address, write, reason 5);

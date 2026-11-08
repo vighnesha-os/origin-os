@@ -1510,6 +1510,35 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - Not done yet: fuzzing (§13 item 3), Kani bounds (item 5) and the N-version check (item 6).
 - **Licensing:** project licence not chosen yet.
 
+### Integration: the IOMMU follow-ups merged (`irq`, `cpu`, `iommu`; xtask; CLAUDE.md §24, §32, §72; ADR-0007 and ADR-0008, Proposed; 2026-11-08)
+
+- **What was merged** into `claude/interesting-carson-ae7c83`, the VT-d branch that all four started from at `1c790fe`:
+  - `claude/eloquent-kapitsa-840594` (`91688a1`: dense CPU indexes and a processor at APIC ID 256) and `claude/priceless-cartwright-2c1803` (`db16a9c`: parking an AP that misses its start-up handshake, on top of the first): a fast-forward;
+  - `claude/bold-williams-a8e3ff` (`29a6d59`: I/O APIC pins through VT-d IRTEs): merge `56c6c90`;
+  - `claude/upbeat-dijkstra-0d25fe` (`6cd511e`: AMD-Vi): merge `3aa34e4`.
+- **What the merges needed.** Each branch was correct on its own; these changes are where they met:
+  - **CPU indexes in the I/O APIC proof.** The per-CPU count of the I/O APIC vector is indexed by `CpuIndex` (`this_cpu()`), not by x2APIC ID. `irq::prove_remapped` takes the online CPU indexes, gives the IRTE the target's recorded APIC ID, and names the target `CPU n (APIC ID m)`, as the xtask markers now do. So `boot-x2apic` routes the PIT's IRQ0 to the processor at APIC ID 256: 20 interrupts arrived there through IRTE 5, none elsewhere. That is an I/O APIC interrupt delivered above APIC ID 255, which only interrupt remapping makes possible.
+  - **The vendor-neutral fault record.** The I/O APIC proof reads AMD-Vi's neutral `iommu::Fault` instead of `vtd::FaultRecord`, takes the VT-d reason from `Detail::Vtd`, and prints faults through `iommu::Recorded`. Its VT-d lines are unchanged byte for byte.
+  - **The I/O APIC under AMD-Vi.** The pin functions have no AMD-Vi path: the I/O APIC's device table entry blocks its fixed interrupts until it is given an interrupt table. `iommu::route_ioapic_pin` refuses under AMD-Vi, the new `iommu::routes_ioapic_pins` says whether pins are routed, and `irq::prove_remapped` reports "not under AMD-Vi yet" and leaves the pin masked. The AMD-Vi markers swap the VT-d proof's 14 markers for that one line, which `the_amd_markers_replace_every_vt_d_one` checks.
+  - **`ORIGIN_QEMU_IOMMU`.** On the AMD-Vi branch it was a preset (`intel` or `amd`); on the CPU-index branch it was a raw `-device` value, which that branch's control X2 uses (`intel-iommu,intremap=off`). Now `intel` (the default) and `amd` are presets, any other value must be an `intel-iommu` `-device` value and is booted with the VT-d markers, and anything else is refused before QEMU starts. `parse_iommu` and `check_iommu` are host-tested.
+  - **The AMD-Vi markers follow the machine.** `amd_iommu_markers` takes the CPU-index branch's `Machine`, so its MSI-X counts follow the processors actually booted.
+  - **Records:** both sides kept everywhere (STATUS, TASKS, this file, the handoff, ADR-0007's evidence and consequences).
+- **Test evidence (2026-11-08):**
+  - `cargo xtask check`: 579 tests, 0 failures, 6 ignored. 564 after the first merge; the AMD-Vi branch brought its own tests, and the merge added `the_iommu_variable_takes_presets_and_intel_iommu_devices`.
+  - `cargo xtask boot-matrix`: Intel VT-d at 1, 2 and 4 CPUs (kernel boots in 14.7, 16.3 and 22.6 s) and AMD-Vi at 1, 2 and 4 CPUs (14.1, 15.6 and 19.7 s), each with the tampered-kernel scenario.
+  - `cargo xtask boot-x2apic`: passes in 17.3 s. CPU 1, at APIC ID 256, takes NVMe MSI-X through IRTEs and now also the I/O APIC's IRQ0 through IRTE 5.
+  - After the first merge alone (`56c6c90`): `check`, `boot-test` and `boot-x2apic`.
+  - **Controls for what the merge changed:**
+    - `ORIGIN_QEMU_IOMMU=intel-iommu,intremap=off cargo xtask boot-x2apic` still fails, as the CPU-index branch's control X2 does ("NVMe: MSI-X: APIC IDs above 255 need interrupt remapping: NVMe failed").
+    - `ORIGIN_QEMU_IOMMU=virtio-iommu-pci cargo xtask boot-test` is refused before QEMU starts.
+  - Each branch's own negative controls were run on its branch (see their entries) and are not repeated here. The probes built into every boot ran in every boot above: the not-present IRTEs, the blocked DMA, the I/O APIC pin's wrong source ID and the AP park drill.
+- **Not done:**
+  - the I/O APIC under AMD-Vi: an interrupt table for its DeviceID, with the redirection entry's vector field carrying the IRTE index (the AMD-Vi entry above);
+  - `boot-x2apic` under AMD-Vi: the x2APIC proof's wording assumes VT-d's remappable handles;
+  - whether `boot-x2apic` joins `boot-matrix` is still ADR-0008's question for the owner.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Merge resolution and the adaptations above; no new mechanism. No operating system's code was read or copied (CLAUDE.md §3).
+- **Licensing:** project licence not chosen yet.
+
 ### Signature-block parser (ONBF §7.1–§7.2, encodings S1–S4), added 2026-11-07
 
 - **What:** `signature::SignatureBlock::parse`: "ONBFSIG1", version 1, 1–8 length-prefixed entries; each entry a canonical OCBOR-1 map with exactly keys 1–7 (key 8, the transparency-log proof, is refused in v1); role 1–5 (S1) with its FIPS 204 context string from a table; suite 1–2 (S2), fixed by the role (kernel and release need OSS-1R); 32-byte key ID; the certificate array kept raw for the chain verifier; the statement as a map with exactly keys 0–6 (S3), whose exact encoded bytes are returned for the signatures; 64-byte Ed25519 and suite-length ML-DSA signatures; the statement's role must equal the entry's; no (role, key) twice. Verification (digest, both signatures, chain) is not wired yet.

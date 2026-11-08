@@ -817,3 +817,40 @@ refused). Probes N8 and N9 are in the provenance entry.
   QEMU a level-triggered line also needs an explicit I/O APIC EOI.
 - IVMD unity maps and exclusion ranges (and RMRR identity maps for VT-d).
 - **The owner:** ADR-0007's eight questions; compare the AMD specification's hash with AMD's copy.
+
+### Continued (2026-11-08, ~12:25–12:45 IST): the IOMMU follow-ups merged
+
+The owner asked the VT-d session to merge its four follow-up branches into its own branch,
+**`claude/interesting-carson-ae7c83`**, and run every gate. **Nothing is pushed.**
+
+| Commit | What |
+|---|---|
+| fast-forward to `db16a9c` | the CPU-index work (`claude/eloquent-kapitsa-840594`) and AP parking (`claude/priceless-cartwright-2c1803`) |
+| `56c6c90` | merge of the I/O APIC branch (`claude/bold-williams-a8e3ff`), ported to CPU indexes |
+| `3aa34e4` | merge of AMD-Vi (`claude/upbeat-dijkstra-0d25fe`): the I/O APIC proof on the neutral fault record and skipped under AMD-Vi; `ORIGIN_QEMU_IOMMU` reconciled |
+| (records) | provenance ("Integration: the IOMMU follow-ups merged"), STATUS, this section |
+
+Gates on the final tree (`3aa34e4`):
+- `cargo xtask check`: 579 tests, 0 failures, 6 ignored.
+- `boot-matrix`: Intel VT-d and AMD-Vi, each at 1, 2 and 4 CPUs.
+- `boot-x2apic`: CPU 1, at APIC ID 256, now also takes the I/O APIC's IRQ0 through its IRTE (20 interrupts in 201 ms, none elsewhere).
+- Controls: `ORIGIN_QEMU_IOMMU=intel-iommu,intremap=off` still fails `boot-x2apic`, and a `virtio-iommu-pci` value is refused before QEMU starts.
+
+After the first merge, `check` failed once on formatting: the call to `route_ioapic_pin` fit on one line once it took `apic`. The merged AMD-Vi marker test then failed once on a wrong count in my own new assertion. Both are fixed, and nothing else failed.
+
+#### What to know
+
+- **`ORIGIN_QEMU_IOMMU`:** `intel` (default), `amd`, or an `intel-iommu` `-device` value booted
+  with the VT-d markers (for negative controls); anything else is refused.
+- **I/O APIC pins:** routed through IRTEs under VT-d only. Under AMD-Vi
+  `iommu::routes_ioapic_pins()` is false, `irq::prove_remapped` says so, and the pins stay
+  masked. The keyboard IRQ1 must check `routes_ioapic_pins()` first.
+- **Under `boot-x2apic`** the I/O APIC proof targets CPU 1, at APIC ID 256.
+- The four branches stay as they were. This branch contains all of them.
+
+#### Next
+
+- An interrupt table for the I/O APIC's DeviceID under AMD-Vi (the AMD-Vi section above has the
+  recipe), then the keyboard IRQ1 through `iommu::route_ioapic_pin` under both IOMMUs.
+- **The owner:** ADR-0007's eight questions and ADR-0008's four; Intel's VT-d PDF download;
+  a check of the AMD specification's hash against AMD's copy.
