@@ -605,7 +605,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         return here;
     }
     // A device's MSI-X message (the NVMe I/O queue): acknowledge, let the driver wake its
-    // waiter, and switch to it now.
+    // waiter, and switch to it if it should run now.
     if frame.vector == u64::from(DEVICE_VECTOR) {
         // SAFETY: as for the timer: MSI-X messages are only routed to processors whose
         // APIC is in x2APIC mode; the write only acknowledges the interrupt.
@@ -614,7 +614,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         return crate::sched::on_reschedule(here);
     }
     // The virtio-net NIC's used-buffer MSI-X message: acknowledge, let the driver wake its
-    // receive thread, and switch to it now.
+    // receive thread, and switch to it if it should run now.
     if frame.vector == u64::from(NET_VECTOR) {
         // SAFETY: as for the NVMe device vector; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
@@ -622,15 +622,15 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         return crate::sched::on_reschedule(here);
     }
     // The virtio-net NIC's transmit-completion MSI-X message: acknowledge, let the driver wake
-    // a sender waiting for a descriptor, and switch to it now.
+    // a sender waiting for a descriptor, and switch to it if it should run now.
     if frame.vector == u64::from(NET_TX_VECTOR) {
         // SAFETY: as for the NVMe device vector; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
         crate::virtionet::on_tx_interrupt();
         return crate::sched::on_reschedule(here);
     }
-    // Another processor woke a thread queued here: acknowledge, then switch to it now
-    // rather than at the next timer tick.
+    // Another processor woke a thread queued here: acknowledge, then switch to it if it
+    // should run now, rather than at the next timer tick.
     if frame.vector == u64::from(RESCHEDULE_VECTOR) {
         // SAFETY: as for the timer: only processors with an active scheduler are sent this
         // vector, so x2APIC mode is on; the write only acknowledges the interrupt.

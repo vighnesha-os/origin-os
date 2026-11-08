@@ -342,9 +342,12 @@ pub(crate) fn on_block(interrupted: u64, ticks: u64) -> u64 {
     })
 }
 
-/// `RESCHEDULE_VECTOR`: another processor made a thread here ready; switch now.
+/// A device interrupt whose driver may have woken a waiter, or `RESCHEDULE_VECTOR` (another
+/// processor made a thread here ready). The interrupted context is charged nothing: this
+/// switches only if a thread that was woken should run now
+/// ([`RunQueue::preempt_for_wake`]), and otherwise resumes what the interrupt interrupted.
 pub(crate) fn on_reschedule(interrupted: u64) -> u64 {
-    with_queue(interrupted, |q| Some(q.yield_now(interrupted)))
+    with_queue(interrupted, |q| Some(q.preempt_for_wake(interrupted)))
 }
 
 /// A kernel thread: its processor (CPU index), run-queue slot, and the slot's generation,
