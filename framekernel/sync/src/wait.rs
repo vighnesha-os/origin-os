@@ -9,9 +9,10 @@
 //! its run queue, so the block returns at once. No wake-up is lost.
 //!
 //! This is the protocol alone. The kernel supplies its scheduler and clock through
-//! [`Scheduler`]; `framekernel/src/wait.rs` instantiates it for kernel threads. Lock order: a
-//! wait queue's lock, then whatever its condition reads. A waker never holds a wait queue's
-//! lock while it takes another one.
+//! [`Scheduler`]; `framekernel/src/wait.rs` instantiates it for kernel threads. Generic so the
+//! Loom models (`models.rs`) run this code against the real run queue. Lock order: a wait
+//! queue's lock, then whatever its condition reads. A waker never holds a wait queue's lock
+//! while it takes another one.
 
 use crate::SpinLock;
 
@@ -77,7 +78,16 @@ impl<T: Copy + Eq, const N: usize> Default for WaitQueue<T, N> {
 
 impl<T: Copy + Eq, const N: usize> WaitQueue<T, N> {
     /// A queue with no waiters.
+    #[cfg(not(all(test, loom)))]
     pub const fn new() -> Self {
+        Self {
+            waiters: SpinLock::new([None; N]),
+        }
+    }
+
+    /// A queue with no waiters (under Loom, whose lock cannot be built in a `const`).
+    #[cfg(all(test, loom))]
+    pub fn new() -> Self {
         Self {
             waiters: SpinLock::new([None; N]),
         }

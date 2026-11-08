@@ -61,6 +61,8 @@ onbf-merkle = { path = "runtime/onbf/merkle" }
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
+# `cfg(loom)`: `cargo xtask loom` builds `origin-sync`'s tests against Loom (CLAUDE.md §73).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [workspace.lints.clippy]
 # CLAUDE.md §13 and final rule 5: every unsafe boundary documents its invariants.

@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod disk;
+mod loom;
 mod serial;
 
 use std::env;
@@ -34,8 +35,13 @@ commands:
               150 possible processors); twice, on a CPU model with CPUID leaf 1Fh and on
               one without
   run         boot under QEMU with the serial console on this terminal (Ctrl-A X quits)
+  loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
+              negative controls, each applied to a scratch copy of the source; also part of
+              check (CLAUDE.md §73)
 
 environment:
+  ORIGIN_LOOM_DEEP                    if set, the Loom models search to their deeper bounds
+                                      (a long run; the default search is part of check)
   ORIGIN_OVMF_CODE, ORIGIN_OVMF_VARS  firmware code image and NVRAM template
                                       (default: the EDK2 files installed next to QEMU)
   ORIGIN_BOOT_TEST_TIMEOUT            boot-test timeout in seconds (default 120)
@@ -1076,6 +1082,7 @@ fn main() -> ExitCode {
         ["boot-matrix"] => boot_matrix(),
         ["boot-x2apic"] => boot_x2apic(),
         ["run"] => run(),
+        ["loom"] => loom::run(),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -1321,8 +1328,10 @@ fn check() -> Result {
     build_loader()?;
     build_kernel()?;
     no_panic_check()?;
+    dependency_check()?;
     linux_cfg_lint()?;
     manifest_version_lint()?;
+    loom::run()?;
     println!("xtask: check passed");
     Ok(())
 }
@@ -1434,6 +1443,133 @@ fn build_kernel_object(package: &str, out_dir: &Path) -> Result<PathBuf> {
         }
         Ok(obj)
     }
+}
+
+/// Every third-party crate `Cargo.lock` may hold, at exactly this version. All of them are
+/// `loom` and what it brings, a host-only dev-dependency of `origin-sync`'s tests: approved by
+/// the owner with these versions, licences and sizes on 2026-11-08 (`SOURCE_PROVENANCE.md`,
+/// CLAUDE.md §5, §60). Changing this list is a new approval.
+const APPROVED_THIRD_PARTY: &[(&str, &str)] = &[
+    ("aho-corasick", "1.1.5"),
+    ("cc", "1.10.0"),
+    ("cfg-if", "1.0.5"),
+    ("find-msvc-tools", "0.1.15"),
+    ("generator", "0.8.11"),
+    ("lazy_static", "1.5.1"),
+    ("libc", "0.2.191"),
+    ("log", "0.4.34"),
+    ("loom", "0.7.2"),
+    ("matchers", "0.2.0"),
+    ("memchr", "2.8.3"),
+    ("nu-ansi-term", "0.50.3"),
+    ("once_cell", "1.21.4"),
+    ("pin-project-lite", "0.2.17"),
+    ("regex-automata", "0.4.18"),
+    ("regex-syntax", "0.8.11"),
+    ("rustversion", "1.0.23"),
+    ("scoped-tls", "1.0.1"),
+    ("sharded-slab", "0.1.7"),
+    ("shlex", "2.0.1"),
+    ("smallvec", "1.16.4"),
+    ("thread_local", "1.1.10"),
+    ("tracing", "0.1.44"),
+    ("tracing-core", "0.1.36"),
+    ("tracing-log", "0.2.0"),
+    ("tracing-subscriber", "0.3.23"),
+    ("valuable", "0.1.1"),
+    ("windows-link", "0.2.1"),
+    ("windows-result", "0.4.1"),
+    ("windows-sys", "0.61.2"),
+];
+
+/// The crates that end up in a boot image, whose normal and build dependencies must all be
+/// first-party.
+fn shipping_packages() -> Vec<&'static str> {
+    let mut packages = vec![LOADER_PACKAGE, KERNEL_PACKAGE, VERSION_PACKAGE];
+    packages.extend_from_slice(FREESTANDING_LIBS);
+    packages
+}
+
+/// The `(name, version)` of every package in a `Cargo.lock` that comes from outside the
+/// workspace (it has a `source`).
+fn third_party_in_lock(lock: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for package in lock.split("[[package]]").skip(1) {
+        let field = |key: &str| {
+            package.lines().find_map(|line| {
+                let value = line.strip_prefix(key)?.strip_prefix(" = \"")?;
+                value.strip_suffix('"').map(str::to_string)
+            })
+        };
+        if field("source").is_some()
+            && let (Some(name), Some(version)) = (field("name"), field("version"))
+        {
+            found.push((name, version));
+        }
+    }
+    found
+}
+
+/// CLAUDE.md §5 and §60: `Cargo.lock` holds only the approved third-party crates at their
+/// approved versions, and no shipping crate has a third-party crate among its normal or build
+/// dependencies, for any target.
+fn dependency_check() -> Result {
+    let path = repo_root().join("Cargo.lock");
+    let lock = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let locked = third_party_in_lock(&lock);
+    let unapproved: Vec<String> = locked
+        .iter()
+        .filter(|(n, v)| !APPROVED_THIRD_PARTY.contains(&(n.as_str(), v.as_str())))
+        .map(|(n, v)| format!("{n} {v}"))
+        .collect();
+    if !unapproved.is_empty() {
+        return Err(format!(
+            "Cargo.lock holds third-party crates nobody approved at these versions (CLAUDE.md §5, \
+             §60):\n  {}",
+            unapproved.join("\n  ")
+        ));
+    }
+    let root = repo_root();
+    let root_text = root.display().to_string();
+    for package in shipping_packages() {
+        let out = cargo()
+            .args([
+                "tree",
+                "--locked",
+                "--package",
+                package,
+                "--edges",
+                "normal,build",
+                "--target",
+                "all",
+                "--prefix",
+                "none",
+            ])
+            .output()
+            .map_err(|e| format!("cannot run cargo tree: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "cargo tree --package {package} failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        let tree = String::from_utf8_lossy(&out.stdout);
+        let outside: Vec<&str> = tree.lines().filter(|l| !l.contains(&root_text)).collect();
+        if !outside.is_empty() {
+            return Err(format!(
+                "{package} is a shipping crate but depends on crates outside the repository \
+                 (CLAUDE.md §5):\n  {}",
+                outside.join("\n  ")
+            ));
+        }
+    }
+    println!(
+        "xtask: dependency check: {} shipping crates depend on first-party crates only; \
+         Cargo.lock holds {} approved host-only crates",
+        shipping_packages().len(),
+        locked.len()
+    );
+    Ok(())
 }
 
 /// A tool from the pinned toolchain's `llvm-tools` component.
@@ -2001,6 +2137,51 @@ fn run() -> Result {
         Ok(())
     } else {
         Err(format!("{QEMU} exited with {status}"))
+    }
+}
+
+#[cfg(test)]
+mod dependency_tests {
+    use super::{APPROVED_THIRD_PARTY, third_party_in_lock};
+
+    #[test]
+    fn only_packages_with_a_source_count_as_third_party() {
+        let lock = r#"version = 4
+
+[[package]]
+name = "origin-sync"
+version = "0.0.0"
+dependencies = [
+ "loom",
+]
+
+[[package]]
+name = "loom"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
+name = "cfg-if"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+        assert_eq!(
+            third_party_in_lock(lock),
+            vec![
+                ("loom".to_string(), "0.7.2".to_string()),
+                ("cfg-if".to_string(), "1.0.5".to_string())
+            ]
+        );
+        assert!(third_party_in_lock("version = 4\n").is_empty());
+    }
+
+    #[test]
+    fn the_approved_list_is_sorted_and_has_no_duplicates() {
+        assert!(APPROVED_THIRD_PARTY.windows(2).all(|w| w[0].0 < w[1].0));
     }
 }
 

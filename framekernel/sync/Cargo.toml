@@ -5,5 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+# Host-only model checking (CLAUDE.md §5, §73; owner decision 20). Active only under
+# `--cfg loom`, only for this crate's own tests: no build of a shipping crate compiles it.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "=0.7.2"
+
 [lints]
 workspace = true
