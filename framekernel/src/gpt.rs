@@ -208,7 +208,12 @@ pub fn parse_header(block: &[u8], lba: u64, disk_blocks: u64) -> Result<Header, 
     // The usable range lies between the two copies' structures, and the array lies outside
     // it, inside the disk, never over block 0 or a header.
     let usable = h.first_usable <= h.last_usable && h.last_usable < last && h.first_usable > 1;
-    let alternate = h.alternate_lba <= last && h.alternate_lba != h.my_lba;
+    let clear_of_usable = |lba: u64| lba < h.first_usable || lba > h.last_usable;
+    let alternate = h.alternate_lba <= last
+        && h.my_lba <= last
+        && h.alternate_lba != h.my_lba
+        && clear_of_usable(h.alternate_lba)
+        && clear_of_usable(h.my_lba);
     let outside = array_end <= h.first_usable || h.entries_lba > h.last_usable;
     // Block 0 is the protective MBR.
     let array_ok = h.entries_lba >= 1
@@ -263,6 +268,10 @@ impl fmt::Display for Name<'_> {
 /// lists its used entries into `out`; returns how many there are, or `Err` with
 /// [`GptError::Entries`] if `out` is too small.
 pub fn parse_entries(array: &[u8], h: &Header, out: &mut [Partition]) -> Result<usize, GptError> {
+    // A `Header` built by hand need not have passed `parse_header`.
+    if h.entry_size < 128 {
+        return Err(GptError::Entries);
+    }
     let len = usize::try_from(h.array_len()).map_err(|_| GptError::Entries)?;
     let array = array.get(..len).ok_or(GptError::Entries)?;
     if crc32(array) != h.entries_crc {
@@ -536,6 +545,160 @@ mod tests {
             headers > 500 && tables > 300,
             "{headers} headers, {tables} tables"
         );
+    }
+
+    /// Both copies of the header on any disk size: an accepted header keeps its structures
+    /// out of the usable range, the two copies' agreement is symmetric, and every listed
+    /// partition has a name and a block count (CLAUDE.md §72).
+    #[test]
+    fn mutated_copies_keep_the_layout_and_agree_symmetrically() {
+        use crate::testing::{Rng, mutate_window};
+        let none = Partition {
+            index: 0,
+            kind: Guid::default(),
+            unique: Guid::default(),
+            first: 0,
+            last: 0,
+            attributes: 0,
+            name: [0; 36],
+        };
+        let array = entries(&[
+            (1, 2048, 2999, "Origin system A"),
+            (2, 3000, DISK - 34, "Origin \u{263A} data"),
+        ]);
+        let good_primary = header(1, DISK - 1, 2, &array);
+        let good_backup = header(DISK - 1, 1, DISK - 33, &array);
+        let mut rng = Rng::new(0x4750_5432);
+        let (mut accepted, mut agreeing, mut tables) = (0u32, 0u32, 0u32);
+        for case in 0..crate::testing::cases(6000) {
+            let (mut primary, mut backup) = (good_primary.clone(), good_backup.clone());
+            // Mutate the fields the checks read, then re-seal, so the layout checks are what
+            // refuses the bad ones. Every fourth case is left unsealed.
+            let h = if case % 2 == 0 {
+                &mut primary
+            } else {
+                &mut backup
+            };
+            mutate_window(h, 8..92, &mut rng);
+            if case % 4 != 3 {
+                let size = u32_at(h, 12) as usize;
+                if (92..=BS).contains(&size) {
+                    h[16..20].fill(0);
+                    let c = crc32(&h[..size]);
+                    h[16..20].copy_from_slice(&c.to_le_bytes());
+                }
+            }
+            let disk = match case % 8 {
+                6 => rng.edge_u64(),
+                7 => DISK + rng.below(4) as u64,
+                _ => DISK,
+            };
+            let (p, b) = (
+                parse_header(&primary, 1, disk),
+                parse_header(&backup, DISK - 1, disk),
+            );
+            for copy in [&p, &b] {
+                let Ok(h) = copy else { continue };
+                accepted += 1;
+                assert!(
+                    h.first_usable > 1 && h.first_usable <= h.last_usable,
+                    "case {case}"
+                );
+                assert!(h.last_usable < disk - 1, "case {case}: {h:?}");
+                for lba in [h.my_lba, h.alternate_lba] {
+                    assert!(lba < disk, "case {case}: {h:?}");
+                    assert!(
+                        lba < h.first_usable || lba > h.last_usable,
+                        "case {case}: a header at {lba} inside the usable range: {h:?}"
+                    );
+                }
+                assert_ne!(h.my_lba, h.alternate_lba, "case {case}");
+                let (end, blocks) = (
+                    h.entries_lba + h.array_blocks(BS as u64),
+                    h.array_blocks(BS as u64),
+                );
+                assert!(
+                    blocks > 0 && end <= disk && h.entries_lba >= 1,
+                    "case {case}: {h:?}"
+                );
+                assert!(
+                    end <= h.first_usable || h.entries_lba > h.last_usable,
+                    "case {case}"
+                );
+                for lba in [h.my_lba, h.alternate_lba] {
+                    assert!(!(h.entries_lba..end).contains(&lba), "case {case}: {h:?}");
+                }
+                assert!(h.array_len() <= MAX_ARRAY, "case {case}");
+                // Every accepted header's walk would CRC 16 KiB; every eighth is plenty.
+                if case % 8 != 0 {
+                    continue;
+                }
+                let mut out = [none; 8];
+                if let Ok(n) = parse_entries(&array, h, &mut out) {
+                    tables += 1;
+                    for (i, q) in out[..n].iter().enumerate() {
+                        assert!(i == 0 || out[i - 1].index < q.index, "case {case}");
+                        assert!(!q.kind.is_zero(), "case {case}");
+                        assert_eq!(q.blocks(), q.last - q.first + 1, "case {case}");
+                        let _ = format!("{} {} {}", q.kind, q.unique, q.name());
+                    }
+                }
+            }
+            if let (Ok(p), Ok(b)) = (p, b) {
+                assert_eq!(p.agrees_with(&b), b.agrees_with(&p), "case {case}");
+                agreeing += u32::from(p.agrees_with(&b));
+            }
+        }
+        assert!(
+            accepted > 2000 && agreeing > 100 && tables > 100,
+            "{accepted} accepted, {agreeing} agreeing, {tables} tables"
+        );
+    }
+
+    /// A header at a block inside the usable range describes a disk whose partitions cover
+    /// it: the alternate header of a primary, or the primary of a backup.
+    #[test]
+    fn a_header_inside_the_usable_range_is_refused() {
+        let array = entries(&[(1, 2048, 2999, "a")]);
+        let inside = header(1, DISK - 1, 2, &array);
+        let mut h = inside.clone();
+        h[32..40].copy_from_slice(&100u64.to_le_bytes());
+        seal(&mut h);
+        assert_eq!(
+            parse_header(&h, 1, DISK),
+            Err(GptError::Layout),
+            "alternate at 100"
+        );
+        // The usable range may end right before the alternate header, and it may start
+        // right after the primary array.
+        let edge = header(1, DISK - 1, 2, &array);
+        assert!(parse_header(&edge, 1, DISK).is_ok());
+    }
+
+    /// A hand-built header cannot make the walk panic with a zero or short entry size.
+    #[test]
+    fn a_short_entry_size_is_refused_not_panicked() {
+        let array = entries(&[(1, 2048, 2999, "a")]);
+        let h = parse_header(&header(1, DISK - 1, 2, &array), 1, DISK).unwrap();
+        let mut out = [Partition {
+            index: 0,
+            kind: Guid::default(),
+            unique: Guid::default(),
+            first: 0,
+            last: 0,
+            attributes: 0,
+            name: [0; 36],
+        }; 2];
+        for size in [0, 1, 96, 127] {
+            let hand = Header {
+                entry_size: size,
+                ..h
+            };
+            assert_eq!(
+                parse_entries(&array, &hand, &mut out),
+                Err(GptError::Entries)
+            );
+        }
     }
 
     #[test]

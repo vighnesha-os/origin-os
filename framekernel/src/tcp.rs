@@ -526,6 +526,94 @@ mod tests {
         assert!(accepted > 0, "{accepted} segments accepted");
     }
 
+    /// A segment with its checksum repaired reaches every check, and any segment fed to a
+    /// connection in any state moves it only along the state machine, delivering no more
+    /// than the segment carries (CLAUDE.md §72).
+    #[test]
+    fn hostile_segments_never_break_a_connection() {
+        use crate::testing::{Rng, mutate};
+        let states = [
+            State::Closed,
+            State::Listen,
+            State::SynSent,
+            State::SynReceived,
+            State::Established,
+            State::FinWait1,
+            State::FinWait2,
+            State::CloseWait,
+            State::LastAck,
+            State::Closing,
+            State::TimeWait,
+        ];
+        let mut buf = [0u8; 80];
+        let n = Segment::write(
+            A_IP,
+            B_IP,
+            1,
+            2,
+            123,
+            456,
+            flag::ACK,
+            1024,
+            b"payload!!",
+            &mut buf,
+        )
+        .unwrap();
+        let mut rng = Rng::new(0x5443_5032);
+        let (mut accepted, mut moved) = (0u32, 0u32);
+        for case in 0..crate::testing::cases(10_000) {
+            let mut v = buf[..n].to_vec();
+            mutate(&mut v, &mut rng);
+            if v.len() >= TCP_HEADER {
+                v[16] = 0;
+                v[17] = 0;
+                let c = pseudo_checksum(A_IP, B_IP, &v);
+                v[16..18].copy_from_slice(&c.to_be_bytes());
+            }
+            let Some(seg) = Segment::parse(&v, A_IP, B_IP) else {
+                continue;
+            };
+            accepted += 1;
+            let offset = usize::from(v[12] >> 4) * 4;
+            assert!((TCP_HEADER..=v.len()).contains(&offset), "case {case}");
+            assert_eq!(seg.payload, &v[offset..], "case {case}");
+            let mut tcb = Tcb::new(rng.next() as u32);
+            tcb.state = states[rng.below(states.len())];
+            tcb.rcv_nxt = if rng.below(2) == 0 {
+                seg.seq
+            } else {
+                rng.next() as u32
+            };
+            let before = tcb.state;
+            let out = tcb.on_segment(&seg);
+            assert!(out.deliver <= seg.payload.len(), "case {case}");
+            if out.deliver > 0 {
+                assert_eq!(before, State::Established, "case {case}");
+            }
+            let legal = match before {
+                State::Listen => [State::Listen, State::SynReceived].contains(&tcb.state),
+                State::SynSent => [State::SynSent, State::Established].contains(&tcb.state),
+                State::SynReceived => [State::SynReceived, State::Established].contains(&tcb.state),
+                State::Established => [State::Established, State::CloseWait].contains(&tcb.state),
+                State::FinWait1 => [
+                    State::FinWait1,
+                    State::FinWait2,
+                    State::Closing,
+                    State::TimeWait,
+                ]
+                .contains(&tcb.state),
+                State::FinWait2 => [State::FinWait2, State::TimeWait].contains(&tcb.state),
+                State::Closing => [State::Closing, State::TimeWait].contains(&tcb.state),
+                State::LastAck => [State::LastAck, State::Closed].contains(&tcb.state),
+                other => other == tcb.state,
+            };
+            assert!(legal, "case {case}: {before:?} -> {:?}", tcb.state);
+            moved += u32::from(before != tcb.state);
+            let _ = seg.seq_len();
+        }
+        assert!(accepted > 3000 && moved > 500, "{accepted}/{moved}");
+    }
+
     #[test]
     fn seq_len_counts_syn_and_fin() {
         let mut buf = [0u8; 40];

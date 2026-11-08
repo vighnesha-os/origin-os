@@ -160,6 +160,54 @@ mod tests {
         assert!(!t.are_siblings(0, 4), "different packages");
     }
 
+    /// Any sub-leaves decode, and the widths always split an APIC ID into fields that
+    /// reassemble it (CLAUDE.md §72).
+    #[test]
+    fn any_subleaves_split_ids_consistently() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0x544F_504F);
+        for case in 0..crate::testing::cases(20_000) {
+            let leaves: [[u32; 4]; 3] = core::array::from_fn(|_| {
+                [
+                    rng.edge_u32(),
+                    rng.edge_u32(),
+                    rng.edge_u32(),
+                    rng.edge_u32(),
+                ]
+            });
+            let t = Topology::decode(&leaves[..rng.below(4)]);
+            assert!(
+                t.smt_width <= t.core_width && t.core_width <= 31,
+                "case {case}: {t:?}"
+            );
+            assert_eq!(t.threads_per_core(), 1 << t.smt_width, "case {case}");
+            assert_eq!(t.logical_per_package(), 1 << t.core_width, "case {case}");
+            let id = rng.edge_u32();
+            let (package, core, thread) = t.split(id);
+            let back = (u64::from(package) << t.core_width)
+                | (u64::from(core) << t.smt_width)
+                | u64::from(thread);
+            assert_eq!(back, u64::from(id), "case {case}: {t:?}");
+            assert!(u64::from(thread) < (1u64 << t.smt_width), "case {case}");
+            assert!(t.are_siblings(id, id), "case {case}");
+
+            let ids: [u32; 6] = core::array::from_fn(|_| rng.edge_u32());
+            let mut scratch = [(0u32, 0u32, 0u32); 6];
+            let (counts, unique) = analyze(&t, &ids, &mut scratch);
+            assert_eq!(counts.threads, 6, "case {case}");
+            assert!(
+                counts.packages <= counts.cores && counts.cores <= 6,
+                "case {case}"
+            );
+            let mut sorted = ids;
+            sorted.sort_unstable();
+            let distinct = sorted.windows(2).all(|w| w[0] != w[1]);
+            assert_eq!(unique, distinct, "case {case}: {ids:x?}");
+            let mut small = [(0u32, 0u32, 0u32); 2];
+            assert_eq!(analyze(&t, &ids, &mut small).0.threads, 2, "case {case}");
+        }
+    }
+
     #[test]
     fn a_flat_topology_makes_each_processor_its_own_core() {
         let t = Topology::decode(&[]);

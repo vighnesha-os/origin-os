@@ -164,6 +164,40 @@ mod tests {
         u64::MAX,
     ];
 
+    /// Any CPUID leaf 15h words: a rate is produced only from three nonzero fields and is
+    /// exactly `crystal × numerator / denominator` (CLAUDE.md §72).
+    #[test]
+    fn any_cpuid_tsc_leaf_is_total() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0x5453_4331);
+        for case in 0..crate::testing::cases(20_000) {
+            let (eax, ebx, ecx) = (rng.edge_u32(), rng.edge_u32(), rng.edge_u32());
+            let got = cpuid_tsc_hz(eax, ebx, ecx);
+            if eax == 0 || ebx == 0 || ecx == 0 {
+                assert_eq!(got, None, "case {case}");
+            } else {
+                let exact = u128::from(ecx) * u128::from(ebx) / u128::from(eax);
+                assert_eq!(
+                    got.map(u128::from),
+                    (exact != 0).then_some(exact),
+                    "case {case}"
+                );
+            }
+            let (a, b) = (rng.edge_u64(), rng.edge_u64());
+            let ppt = rng.edge_u64();
+            assert_eq!(
+                rates_agree(a, b, ppt),
+                rates_agree(b, a, ppt),
+                "case {case}"
+            );
+            if let Some(s) = Scale::new(rng.edge_u64()) {
+                assert_ne!(s.hz(), 0, "case {case}");
+                let t = rng.edge_u64();
+                let _ = (s.nanos(t), s.ticks_for(t));
+            }
+        }
+    }
+
     #[test]
     fn nanos_is_the_exact_value_rounded_either_way_and_never_decreases() {
         // A deterministic spread of tick counts: small values, powers of two and their

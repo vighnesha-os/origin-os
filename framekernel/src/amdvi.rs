@@ -550,8 +550,12 @@ impl Irte {
         if u64::from(e) & IRTE_CONTROL != IRTE_REMAP || e >> 24 != 0 {
             return None;
         }
+        let vector = (e >> 16) as u8;
+        if vector < 16 {
+            return None; // `encode_basic` writes no such vector
+        }
         Some(Self {
-            vector: (e >> 16) as u8,
+            vector,
             destination: (e >> 8) & 0xFF,
         })
     }
@@ -570,8 +574,12 @@ impl Irte {
             }
             ((lo >> 8) & 0xFF) as u32
         };
+        let vector = hi as u8;
+        if vector < 16 {
+            return None; // `encode_wide` writes no such vector
+        }
         Some(Self {
-            vector: hi as u8,
+            vector,
             destination,
         })
     }
@@ -823,6 +831,78 @@ mod tests {
             ),
             (0x30, 3, 3)
         );
+    }
+
+    /// Registers decode for any value, and an entry that decodes is exactly one `encode`
+    /// writes: the decoders promise that, and the kernel reads these entries back from
+    /// memory a device could write (CLAUDE.md §72).
+    #[test]
+    fn any_register_and_entry_words_decode() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0xA3D4);
+        let (mut dtes, mut irtes) = (0u32, 0u32);
+        let good = Dte {
+            dma: Dma::Translated {
+                root: 0x1234_5000,
+                levels: 4,
+            },
+            domain: 7,
+            interrupts: Interrupts::Remapped {
+                table: 0x8000_0080,
+                order: 8,
+            },
+            setting: 0xC7,
+        }
+        .encode()
+        .unwrap();
+        for case in 0..crate::testing::cases(30_000) {
+            let v = rng.edge_u64();
+            let c = Capability::decode(v as u32);
+            let _ = (c.is_iommu, c.revision);
+            let f = Features::decode(v);
+            assert!([0, 4, 5, 6].contains(&f.host_levels), "case {case}: {v:#x}");
+            assert!(
+                matches!(interrupts_per_function(v), 512 | 2048),
+                "case {case}"
+            );
+            assert!(ring_index(v) < 1 << 15, "case {case}");
+            if let Some(e) = Event::decode(v, rng.edge_u64()) {
+                let _ = (
+                    e.permission(),
+                    e.reserved_bit(),
+                    e.translation(),
+                    event_name(e.code),
+                );
+            }
+
+            // One bit-flip from a valid entry, so the reserved bits are not all set at once.
+            let mut words = good;
+            words[rng.below(4)] ^= 1 << rng.below(64);
+            if rng.below(2) == 0 {
+                words[rng.below(4)] ^= 1 << rng.below(64);
+            }
+            if let Some(d) = Dte::decode(words) {
+                dtes += 1;
+                assert_eq!(d.encode(), Some(words), "case {case}: {words:x?}");
+            }
+
+            let basic = (rng.edge_u32() & 0x00FF_FFFF) | 1;
+            if let Some(i) = Irte::decode_basic(basic) {
+                irtes += 1;
+                assert_eq!(i.encode_basic(), Some(basic), "case {case}");
+            }
+            let wide = [
+                rng.edge_u64() & 0xFFFF_FF00 | 1,
+                rng.edge_u64() & !0x00FF_FFFF_FFFF_FF00,
+            ];
+            for x2apic in [false, true] {
+                if let Some(i) = Irte::decode_wide(wide, x2apic) {
+                    irtes += 1;
+                    assert_eq!(i.encode_wide(x2apic), Some(wide), "case {case}");
+                }
+            }
+        }
+        assert!(dtes > 500 && irtes > 1000, "{dtes} DTEs, {irtes} IRTEs");
     }
 
     #[test]

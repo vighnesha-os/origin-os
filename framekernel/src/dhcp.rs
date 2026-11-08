@@ -459,6 +459,56 @@ mod tests {
         assert!(client.lease().is_none());
     }
 
+    /// Mutated replies through every client state: what `parse` returns came from the
+    /// bytes, and the state machine only ever binds a lease for its own transaction
+    /// (CLAUDE.md §72).
+    #[test]
+    fn mutated_replies_keep_their_invariants_through_the_client() {
+        use crate::testing::{Rng, mutate};
+        let base = server_reply(MessageType::Offer, 7, ip(10, 0, 0, 9), ip(10, 0, 0, 1), 60);
+        let ack = server_reply(MessageType::Ack, 7, ip(10, 0, 0, 9), ip(10, 0, 0, 1), 60);
+        let mut rng = Rng::new(0x4448_4332);
+        let (mut parsed, mut bound) = (0u32, 0u32);
+        for case in 0..crate::testing::cases(10_000) {
+            let mut data = if case % 2 == 0 {
+                base.clone()
+            } else {
+                ack.clone()
+            };
+            mutate(&mut data, &mut rng);
+            if let Some(r) = parse(&data) {
+                parsed += 1;
+                assert_eq!(data[0], BOOTREPLY, "case {case}");
+                assert_eq!(
+                    r.xid.to_be_bytes(),
+                    data[OFF_XID..OFF_XID + 4],
+                    "case {case}"
+                );
+                assert_eq!(
+                    r.your_address.0,
+                    data[OFF_YIADDR..OFF_YIADDR + 4],
+                    "case {case}"
+                );
+                assert!(r.lease.dns.len() <= data.len() / 4, "case {case}");
+            }
+            let mut client = Client::new([2; 6]);
+            let _ = client.start(7);
+            if matches!(client.on_receive(&base), Action::Send(_)) {
+                match client.on_receive(&data) {
+                    Action::Bound(l) => {
+                        bound += 1;
+                        assert_eq!(client.lease(), Some(&l), "case {case}");
+                        let r = parse(&data).unwrap();
+                        assert_eq!(r.xid, 7, "case {case}: a lease for another transaction");
+                        assert_eq!(r.message_type, Some(MessageType::Ack), "case {case}");
+                    }
+                    Action::Send(_) | Action::Restart | Action::Ignore => {}
+                }
+            }
+        }
+        assert!(parsed > 1000 && bound > 100, "{parsed}/{bound}");
+    }
+
     #[test]
     fn mutated_replies_never_panic() {
         let base = server_reply(MessageType::Ack, 42, ip(10, 0, 0, 2), ip(10, 0, 0, 1), 3600);

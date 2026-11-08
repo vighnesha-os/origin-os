@@ -87,6 +87,12 @@ impl Descriptor {
             next: r16(table, at + 14),
         }
     }
+
+    /// Reads entry `i` if the table holds it: for an index the device supplied.
+    pub fn get(table: &[u8], i: usize) -> Option<Descriptor> {
+        let end = i.checked_mul(DESC_SIZE)?.checked_add(DESC_SIZE)?;
+        (end <= table.len()).then(|| Descriptor::read(table, i))
+    }
 }
 
 /// A buffer to place in a descriptor chain: a physical address, a length, and whether the
@@ -102,6 +108,8 @@ pub struct Buffer {
 #[derive(Debug)]
 pub struct FreeList {
     stack: Vec<u16>,
+    /// Whether each descriptor is on the stack, so one is never free twice.
+    is_free: Vec<bool>,
 }
 
 impl FreeList {
@@ -109,14 +117,31 @@ impl FreeList {
     pub fn new(queue_size: usize) -> Self {
         Self {
             stack: (0..queue_size as u16).rev().collect(),
+            is_free: alloc::vec![true; queue_size],
         }
     }
+
     pub fn alloc(&mut self) -> Option<u16> {
-        self.stack.pop()
+        let index = self.stack.pop()?;
+        if let Some(slot) = self.is_free.get_mut(usize::from(index)) {
+            *slot = false;
+        }
+        Some(index)
     }
-    pub fn free(&mut self, index: u16) {
-        self.stack.push(index);
+
+    /// Returns `index` to the pool, or returns `false` if it is out of range or already
+    /// free: a device reports completed indices, and neither mistake may get in the list.
+    pub fn free(&mut self, index: u16) -> bool {
+        match self.is_free.get_mut(usize::from(index)) {
+            Some(slot) if !*slot => {
+                *slot = true;
+                self.stack.push(index);
+                true
+            }
+            _ => false,
+        }
     }
+
     pub fn available(&self) -> usize {
         self.stack.len()
     }
@@ -150,18 +175,37 @@ pub fn add_chain(free: &mut FreeList, table: &mut [u8], buffers: &[Buffer]) -> O
     Some(indices[0])
 }
 
-/// Frees a descriptor chain starting at `head`, following `F_NEXT`. Bounded by the queue
-/// size, so a corrupt cycle cannot loop forever.
-pub fn free_chain(free: &mut FreeList, table: &[u8], queue_size: usize, head: u16) {
+/// Frees a descriptor chain starting at `head`, following `F_NEXT`, and returns how many
+/// descriptors it freed. `head` comes from the used ring and each `next` from memory the
+/// device can write: a walk stops at an index outside the table, at a descriptor that is
+/// already free, and after `queue_size` steps, so neither a corrupt cycle nor a repeated or
+/// out-of-range id can loop or panic.
+pub fn free_chain(free: &mut FreeList, table: &[u8], queue_size: usize, head: u16) -> usize {
     let mut i = head;
+    let mut freed = 0;
     for _ in 0..queue_size {
-        let d = Descriptor::read(table, i as usize);
-        free.free(i);
+        let Some(d) = Descriptor::get(table, usize::from(i)) else {
+            break;
+        };
+        if !free.free(i) {
+            break;
+        }
+        freed += 1;
         if d.flags & F_NEXT == 0 {
             break;
         }
         i = d.next;
     }
+    freed
+}
+
+/// The size to run a split queue at: the device's maximum, at most `limit`, or `None` if the
+/// device offers no queue or a size that is not a power of two (virtio 1.1 §2.6: the ring
+/// indices wrap at 65536, so anything else breaks the slot arithmetic at the wrap).
+pub fn queue_size(device_max: u16, limit: u16) -> Option<usize> {
+    device_max
+        .is_power_of_two()
+        .then(|| usize::from(device_max.min(limit)))
 }
 
 // --- Available ring (driver → device) ---
@@ -295,6 +339,163 @@ mod tests {
             None
         );
         assert_eq!(small.available(), 1, "nothing consumed on failure");
+    }
+
+    /// The ids and links a device reports are checked: an out-of-range head, a repeated
+    /// id, a `next` outside the table and a cycle all stop the walk without a panic or a
+    /// descriptor freed twice.
+    #[test]
+    fn a_hostile_device_cannot_corrupt_the_free_list() {
+        let size = 8;
+        let mut free = FreeList::new(size);
+        let table = alloc::vec![0u8; desc_bytes(size)];
+        // Out of range: refused, and the free count does not change.
+        assert_eq!(free_chain(&mut free, &table, size, 8), 0);
+        assert_eq!(free_chain(&mut free, &table, size, u16::MAX), 0);
+        assert_eq!(free.available(), size);
+        // A descriptor in use is freed exactly once.
+        let a = free.alloc().unwrap();
+        assert_eq!(free_chain(&mut free, &table, size, a), 1);
+        assert_eq!(free_chain(&mut free, &table, size, a), 0, "a repeated id");
+        assert_eq!(free.available(), size);
+        // `next` leaving the table, and a cycle.
+        let (b, c) = (free.alloc().unwrap(), free.alloc().unwrap());
+        let mut table = alloc::vec![0u8; desc_bytes(size)];
+        let link = |next: u16| Descriptor {
+            addr: 0,
+            len: 0,
+            flags: F_NEXT,
+            next,
+        };
+        link(c).write(&mut table, usize::from(b));
+        link(200).write(&mut table, usize::from(c));
+        assert_eq!(
+            free_chain(&mut free, &table, size, b),
+            2,
+            "stops at the bad link"
+        );
+        let (b, c) = (free.alloc().unwrap(), free.alloc().unwrap());
+        link(c).write(&mut table, usize::from(b));
+        link(b).write(&mut table, usize::from(c));
+        assert_eq!(
+            free_chain(&mut free, &table, size, b),
+            2,
+            "a cycle ends the walk"
+        );
+        assert_eq!(free.available(), size);
+        assert!(!free.free(9), "out of range");
+    }
+
+    #[test]
+    fn queue_sizes_must_be_powers_of_two() {
+        assert_eq!(queue_size(256, 256), Some(256));
+        assert_eq!(queue_size(1024, 256), Some(256), "the driver takes fewer");
+        assert_eq!(queue_size(128, 256), Some(128));
+        assert_eq!(queue_size(1, 256), Some(1));
+        assert_eq!(queue_size(0, 256), None, "no queue");
+        assert_eq!(queue_size(3, 256), None, "not a power of two");
+        assert_eq!(queue_size(1000, 256), None);
+    }
+
+    /// A device that scribbles over the rings it shares never breaks the driver's side: no
+    /// panic, no index out of range or free twice, and every descriptor is accounted for
+    /// (CLAUDE.md §72).
+    #[test]
+    fn hostile_rings_never_break_the_driver() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0x5251_4E47);
+        let mut reclaimed = 0u64;
+        for case in 0..crate::testing::cases(1500) {
+            let size = 1usize << (1 + rng.below(6));
+            let mut free = FreeList::new(size);
+            let mut table = alloc::vec![0u8; desc_bytes(size)];
+            let mut avail = alloc::vec![0u8; avail_bytes(size)];
+            let mut used = alloc::vec![0u8; used_bytes(size)];
+            let mut in_flight = alloc::vec![false; size];
+            let mut held = 0usize;
+            let mut last_used = 0u16;
+            for step in 0..80 {
+                match rng.below(5) {
+                    0 | 1 => {
+                        let n = 1 + rng.below(3);
+                        let buffers: Vec<Buffer> = (0..n)
+                            .map(|_| Buffer {
+                                addr: rng.edge_u64(),
+                                len: rng.edge_u32(),
+                                device_writable: rng.below(2) == 0,
+                            })
+                            .collect();
+                        if let Some(head) = add_chain(&mut free, &mut table, &buffers) {
+                            assert!(usize::from(head) < size, "case {case}.{step}");
+                            held += n;
+                            avail_push(&mut avail, size, head);
+                            // The chain's descriptors are the ones the driver wrote.
+                            let mut i = head;
+                            for (k, buffer) in buffers.iter().enumerate() {
+                                let d = Descriptor::read(&table, usize::from(i));
+                                assert_eq!(d.addr, buffer.addr, "case {case}.{step}");
+                                in_flight[usize::from(i)] = true;
+                                if d.flags & F_NEXT == 0 {
+                                    assert_eq!(k + 1, n, "case {case}.{step}");
+                                }
+                                i = d.next;
+                            }
+                        }
+                    }
+                    2 => {
+                        // The device overwrites part of its rings at will.
+                        let (buf, at) = if rng.below(2) == 0 {
+                            let at = rng.below(table.len());
+                            (&mut table, at)
+                        } else {
+                            let at = rng.below(used.len());
+                            (&mut used, at)
+                        };
+                        buf[at] = rng.byte();
+                    }
+                    _ => {
+                        // The driver reaps what the device claims; a bad id is the device's.
+                        let idx = used_idx(&used);
+                        if idx == last_used {
+                            let index = last_used;
+                            let head = if rng.below(4) == 0 {
+                                rng.edge_u32() as u16
+                            } else {
+                                rng.below(size + 2) as u16
+                            };
+                            used_push(&mut used, size, index, head, rng.edge_u32());
+                        }
+                        let slot = usize::from(last_used) % size;
+                        let (id, _len) = used_elem(&used, slot);
+                        last_used = last_used.wrapping_add(1);
+                        let before = free.available();
+                        let freed = free_chain(&mut free, &table, size, id as u16);
+                        assert_eq!(free.available(), before + freed, "case {case}.{step}");
+                        assert!(free.available() <= size, "case {case}.{step}");
+                        reclaimed += freed as u64;
+                        held = held.saturating_sub(freed);
+                    }
+                }
+                let _ = avail_idx(&avail);
+                let _ = avail_ring(&avail, rng.below(size));
+                assert!(free.available() <= size, "case {case}.{step}");
+                // Nothing the driver can pop is out of range or popped twice.
+                let mut drained = free.stack.clone();
+                drained.sort_unstable();
+                drained.dedup();
+                assert_eq!(
+                    drained.len(),
+                    free.available(),
+                    "case {case}.{step}: a repeat"
+                );
+                assert!(
+                    drained.iter().all(|&i| usize::from(i) < size),
+                    "case {case}.{step}"
+                );
+            }
+            let _ = held;
+        }
+        assert!(reclaimed > 1000, "{reclaimed}");
     }
 
     /// A full driver↔device round trip through the three rings, over the same byte buffers

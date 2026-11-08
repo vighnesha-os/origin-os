@@ -109,7 +109,10 @@ impl Superblock {
         // The inode table must lie before the data region, which lies inside the volume.
         let table_blocks = sb.inode_count.div_ceil(INODES_PER_BLOCK);
         if sb.inode_table_start < 1
-            || sb.inode_table_start + table_blocks > sb.data_start
+            || sb
+                .inode_table_start
+                .checked_add(table_blocks)
+                .is_none_or(|end| end > sb.data_start)
             || sb.data_start > sb.total_blocks
             || sb.root_inode == 0
             || u64::from(sb.root_inode) >= sb.inode_count
@@ -693,6 +696,88 @@ mod tests {
         assert!(
             got[2 * BLOCK..].iter().all(|&x| x == 0xAB),
             "block 2 intact"
+        );
+    }
+
+    /// Re-seals a mutated superblock's CRC, so what lies behind the checksum is reached.
+    fn reseal_superblock(image: &mut [u8]) {
+        let crc = crc32(&image[..Superblock::CRC_SPAN]);
+        image[Superblock::CRC_AT..Superblock::CRC_AT + 4].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    /// A superblock whose checksum is right but whose numbers are hostile, then every read
+    /// path on it. The checksum kept the earlier soak out of this code: mutated copies
+    /// nearly always failed the CRC, so the arithmetic behind it never met a large value
+    /// (CLAUDE.md §72).
+    #[test]
+    fn hostile_superblocks_with_valid_checksums_are_refused_or_safe() {
+        use crate::testing::{Rng, mutate_window};
+        let mut b = Builder::new();
+        b.add(1, "hello.txt", false, b"hello");
+        let etc = b.add(1, "etc", true, &[]);
+        b.add(etc, "hostname", false, b"origin");
+        let base = b.build();
+        let mut rng = Rng::new(0x4F46_5353);
+        let (mut opened, mut refused, mut touched) = (0u32, 0u32, 0u32);
+        for case in 0..crate::testing::cases(8000) {
+            let mut data = base.clone();
+            match case % 3 {
+                // A field of the superblock, re-sealed.
+                0 => {
+                    mutate_window(&mut data, 16..56, &mut rng);
+                    reseal_superblock(&mut data);
+                }
+                // One field set to a boundary value, re-sealed.
+                1 => {
+                    let v = rng.edge_u64();
+                    let field = 16 + 8 * rng.below(5);
+                    data[field..field + 8].copy_from_slice(&v.to_le_bytes());
+                    reseal_superblock(&mut data);
+                }
+                // An inode table block mutated (no checksum covers it).
+                _ => mutate_window(&mut data, BLOCK..BLOCK + 2 * BLOCK, &mut rng),
+            }
+            let dev = Image(data);
+            let Ok(fs) = Fs::open(&dev) else {
+                refused += 1;
+                continue;
+            };
+            opened += 1;
+            let sb = *fs.superblock();
+            assert!(sb.inode_table_start >= 1, "case {case}: {sb:?}");
+            assert!(sb.data_start <= sb.total_blocks, "case {case}: {sb:?}");
+            assert!(
+                u64::from(sb.root_inode) < sb.inode_count && sb.root_inode != 0,
+                "case {case}: {sb:?}"
+            );
+            let table_blocks = sb.inode_count.div_ceil(INODES_PER_BLOCK);
+            assert!(
+                sb.inode_table_start + table_blocks <= sb.data_start,
+                "case {case}"
+            );
+            for ino in [0u32, 1, 2, 3, 6, 40, u32::MAX, sb.root_inode] {
+                if fs.inode(ino).is_ok() {
+                    touched += 1;
+                }
+                if let Ok(entries) = fs.entries(ino) {
+                    for e in &entries {
+                        assert!(e.name.len() <= 255, "case {case}");
+                    }
+                }
+                if let Ok(whole) = fs.read_whole(ino) {
+                    assert!(whole.len() <= (DIRECT + 512) * BLOCK, "case {case}");
+                }
+                let mut buf = [0u8; 64];
+                if let Ok(n) = fs.read_file(ino, rng.edge_u64(), &mut buf) {
+                    assert!(n <= buf.len(), "case {case}");
+                }
+            }
+            let _ = fs.resolve("/etc/hostname");
+            let _ = fs.resolve("/etc/../hello.txt");
+        }
+        assert!(
+            opened > 1000 && refused > 1000 && touched > 1000,
+            "{opened}/{refused}/{touched}"
         );
     }
 

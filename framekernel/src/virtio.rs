@@ -5,6 +5,8 @@
 //! MMIO/common-config with these values; the rings themselves are [`crate::virtqueue`].
 //! Pure, no `unsafe`.
 
+use crate::pci::{Bar, BarKind};
+
 /// Device status bits written to the common config (virtio 1.1 §2.1).
 pub mod status {
     pub const ACKNOWLEDGE: u8 = 1;
@@ -142,12 +144,38 @@ pub mod cfg {
     pub const DEVICE: u8 = 4;
 }
 
-/// Where one virtio structure lives: a BAR index and a byte offset/length within it.
+/// Where one virtio structure lives: a BAR index and a byte offset/length within it. All
+/// three come from the device's capability; nothing else in the driver has checked them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CfgLocation {
     pub bar: u8,
     pub offset: u32,
     pub length: u32,
+}
+
+impl CfgLocation {
+    /// The structure's physical address, if it lies wholly inside the memory BAR `bar` it
+    /// names and is at least `min` bytes long (virtio 1.1 §4.1.4: "unexpectedly large" must
+    /// be tolerated, too short and outside the BAR must not).
+    pub fn address_in(&self, bar: &Bar, min: u32) -> Option<u64> {
+        if bar.index != self.bar || bar.kind == BarKind::Io || self.length < min {
+            return None;
+        }
+        let end = u64::from(self.offset).checked_add(u64::from(self.length))?;
+        if end > bar.size {
+            return None;
+        }
+        let address = bar.address.checked_add(u64::from(self.offset))?;
+        address.checked_add(u64::from(self.length)).map(|_| address)
+    }
+
+    /// The offset of a queue's 16-bit notification register in this notification structure
+    /// (`queue_notify_off × notify_off_multiplier`, virtio 1.1 §4.1.4.4), if it lies inside
+    /// the structure: both factors are the device's.
+    pub fn notify_offset(&self, queue_notify_off: u16, multiplier: u32) -> Option<u64> {
+        let at = u64::from(queue_notify_off) * u64::from(multiplier);
+        (at + 2 <= u64::from(self.length)).then_some(at)
+    }
 }
 
 /// The virtio modern capabilities a driver needs, discovered from PCI config space.
@@ -168,10 +196,26 @@ impl Caps {
     }
 }
 
+/// Bytes of a `virtio_pci_cap`, and of a `virtio_pci_notify_cap` (virtio 1.1 §4.1.4).
+const CAP_LEN: u16 = 16;
+const NOTIFY_CAP_LEN: u16 = 20;
+/// Capabilities live in the first 256 bytes of configuration space.
+const CAP_SPACE_END: u16 = 0x100;
+/// BAR indexes a capability may name; the others are reserved and such a capability must be
+/// ignored (virtio 1.1 §4.1.4.1).
+const LAST_BAR: u8 = 5;
+
 /// Walks the PCI capability list and collects the virtio modern capability structures.
 /// `read` returns the little-endian dword at a byte offset in config space (offsets are
-/// dword-aligned here). Bounded by the capability count so a corrupt `next` cannot loop.
-pub fn find_caps(mut read: impl FnMut(u16) -> u32) -> Caps {
+/// dword-aligned and below 100h). Bounded by the capability count so a corrupt `next` cannot
+/// loop. A capability that does not fit in configuration space, is shorter than its structure,
+/// names a reserved BAR or that `usable` turns down is passed over; of the rest, the first of
+/// each type is taken (virtio 1.1 §4.1.4.1: "the first instance of each virtio structure type
+/// they can support"; a later one is the device's fallback).
+pub fn find_caps(
+    mut read: impl FnMut(u16) -> u32,
+    mut usable: impl FnMut(&CfgLocation) -> bool,
+) -> Caps {
     let mut caps = Caps::default();
     // Capabilities exist only if the status register (offset 0x06) bit 4 is set.
     if read(0x04) >> 16 & (1 << 4) == 0 {
@@ -185,22 +229,33 @@ pub fn find_caps(mut read: impl FnMut(u16) -> u32) -> Caps {
         let d0 = read(ptr); // cap_vndr | cap_next<<8 | cap_len<<16 | cfg_type<<24
         let vndr = (d0 & 0xFF) as u8;
         let next = (d0 >> 8 & 0xFF) as u16;
-        if vndr == cfg::VNDR {
-            let bar = (read(ptr + 4) & 0xFF) as u8;
+        let len = (d0 >> 16 & 0xFF) as u16;
+        let kind = (d0 >> 24 & 0xFF) as u8;
+        let needed = if kind == cfg::NOTIFY {
+            NOTIFY_CAP_LEN
+        } else {
+            CAP_LEN
+        };
+        if vndr == cfg::VNDR && len >= needed && ptr + needed <= CAP_SPACE_END {
             let location = CfgLocation {
-                bar,
+                bar: (read(ptr + 4) & 0xFF) as u8,
                 offset: read(ptr + 8),
                 length: read(ptr + 12),
             };
-            match (d0 >> 24 & 0xFF) as u8 {
-                cfg::COMMON => caps.common = Some(location),
-                cfg::NOTIFY => {
-                    caps.notify = Some(location);
-                    caps.notify_off_multiplier = read(ptr + 16);
+            if location.bar <= LAST_BAR && usable(&location) {
+                let slot = match kind {
+                    cfg::COMMON => Some(&mut caps.common),
+                    cfg::NOTIFY => Some(&mut caps.notify),
+                    cfg::ISR => Some(&mut caps.isr),
+                    cfg::DEVICE => Some(&mut caps.device),
+                    _ => None,
+                };
+                if let Some(slot) = slot.filter(|slot| slot.is_none()) {
+                    *slot = Some(location);
+                    if kind == cfg::NOTIFY {
+                        caps.notify_off_multiplier = read(ptr + 16);
+                    }
                 }
-                cfg::ISR => caps.isr = Some(location),
-                cfg::DEVICE => caps.device = Some(location),
-                _ => {}
             }
         }
         if next == 0 {
@@ -334,7 +389,7 @@ mod tests {
             let o = off as usize;
             u32::from_le_bytes([cfg[o], cfg[o + 1], cfg[o + 2], cfg[o + 3]])
         };
-        let caps = find_caps(read);
+        let caps = find_caps(read, |_| true);
         assert!(caps.is_modern());
         assert_eq!(
             caps.common,
@@ -356,6 +411,337 @@ mod tests {
             let o = off as usize;
             u32::from_le_bytes([cfg2[o], cfg2[o + 1], cfg2[o + 2], cfg2[o + 3]])
         };
-        assert!(!find_caps(read2).is_modern());
+        assert!(!find_caps(read2, |_| true).is_modern());
+    }
+
+    /// One 256-byte configuration space for the capability tests.
+    fn config_space() -> [u8; 256] {
+        let mut b = [0u8; 256];
+        let mut put = |at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put(0x04, 0x0010_0000);
+        put(0x34, 0x40);
+        let cap = |next: u32, len: u32, ty: u32| 0x09 | next << 8 | len << 16 | ty << 24;
+        put(0x40, cap(0x50, 16, 1));
+        put(0x44, 4);
+        put(0x48, 0);
+        put(0x4C, 0x1000);
+        put(0x50, cap(0x64, 20, 2));
+        put(0x54, 4);
+        put(0x58, 0x3000);
+        put(0x5C, 0x1000);
+        put(0x60, 4);
+        put(0x64, cap(0x74, 16, 3));
+        put(0x68, 4);
+        put(0x6C, 0x1000);
+        put(0x70, 0x1000);
+        put(0x74, cap(0, 16, 4));
+        put(0x78, 4);
+        put(0x7C, 0x2000);
+        put(0x80, 0x1000);
+        b
+    }
+
+    fn reader(bytes: &[u8; 256]) -> impl FnMut(u16) -> u32 + '_ {
+        |off| {
+            let o = usize::from(off);
+            assert!(off < 0x100 && off & 3 == 0, "read at {off:#x}");
+            u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
+        }
+    }
+
+    /// The first usable instance of each structure wins, as virtio 1.1 §4.1.4.1 asks: a
+    /// device may list an I/O-BAR notification structure before a memory-BAR fallback.
+    #[test]
+    fn the_first_usable_instance_of_a_structure_is_taken() {
+        let mut b = config_space();
+        // A second common structure, later in the list, at BAR 3.
+        b[0x74..0x78].copy_from_slice(&(0x09u32 | 0x84 << 8 | 16 << 16 | 4 << 24).to_le_bytes());
+        b[0x84..0x88].copy_from_slice(&(0x09u32 | 16 << 16 | 1 << 24).to_le_bytes());
+        b[0x88..0x8C].copy_from_slice(&3u32.to_le_bytes());
+        b[0x90..0x94].copy_from_slice(&0x1000u32.to_le_bytes());
+        let caps = find_caps(reader(&b), |_| true);
+        assert_eq!(caps.common.unwrap().bar, 4, "the first common structure");
+        // With BAR 4 unusable, the later instance is the one the driver can take.
+        let caps = find_caps(reader(&b), |l| l.bar != 4);
+        assert_eq!(caps.common.unwrap().bar, 3, "the fallback");
+        assert!(caps.notify.is_none(), "every other structure was at BAR 4");
+    }
+
+    #[test]
+    fn capabilities_are_checked_before_their_bytes_are_used() {
+        // A capability at the very top: its 16 bytes must end by 100h, so F0h is the last
+        // place one fits, and at F4h it would cross into extended space.
+        let mut b = config_space();
+        b[0x34..0x38].copy_from_slice(&0xF0u32.to_le_bytes());
+        b[0xF0..0xF4].copy_from_slice(&(0x09u32 | 16 << 16 | 1 << 24).to_le_bytes());
+        assert!(find_caps(reader(&b), |_| true).common.is_some(), "F0h fits");
+        b[0x34..0x38].copy_from_slice(&0xF4u32.to_le_bytes());
+        b[0xF4..0xF8].copy_from_slice(&(0x09u32 | 16 << 16 | 1 << 24).to_le_bytes());
+        assert!(
+            find_caps(reader(&b), |_| true).common.is_none(),
+            "F4h does not"
+        );
+        // A notify capability needs 20 bytes: at ECh it fits, at F0h it does not.
+        let mut b = config_space();
+        b[0x34..0x38].copy_from_slice(&0xECu32.to_le_bytes());
+        b[0xEC..0xF0].copy_from_slice(&(0x09u32 | 20 << 16 | 2 << 24).to_le_bytes());
+        assert!(find_caps(reader(&b), |_| true).notify.is_some(), "ECh fits");
+        let mut b = config_space();
+        b[0x34..0x38].copy_from_slice(&0xF0u32.to_le_bytes());
+        b[0xF0..0xF4].copy_from_slice(&(0x09u32 | 20 << 16 | 2 << 24).to_le_bytes());
+        assert!(
+            find_caps(reader(&b), |_| true).notify.is_none(),
+            "F0h does not"
+        );
+        // Too short for its structure, or a reserved BAR: ignored, the walk continues.
+        let mut b = config_space();
+        b[0x40..0x44].copy_from_slice(&(0x09u32 | 0x50 << 8 | 12 << 16 | 1 << 24).to_le_bytes());
+        assert!(
+            find_caps(reader(&b), |_| true).common.is_none(),
+            "a 12-byte capability"
+        );
+        let mut b = config_space();
+        b[0x44..0x48].copy_from_slice(&6u32.to_le_bytes());
+        let caps = find_caps(reader(&b), |_| true);
+        assert!(
+            caps.common.is_none() && caps.notify.is_some(),
+            "reserved BAR 6"
+        );
+    }
+
+    #[test]
+    fn a_structure_is_located_only_inside_its_memory_bar() {
+        let loc = CfgLocation {
+            bar: 4,
+            offset: 0x1000,
+            length: 0x1000,
+        };
+        let bar = Bar {
+            index: 4,
+            kind: BarKind::Memory64,
+            prefetchable: true,
+            address: 0xFE00_0000,
+            size: 0x4000,
+        };
+        assert_eq!(loc.address_in(&bar, 56), Some(0xFE00_1000));
+        assert_eq!(
+            loc.address_in(&bar, 0x1001),
+            None,
+            "shorter than the driver needs"
+        );
+        let exact = Bar {
+            size: 0x2000,
+            ..bar
+        };
+        assert_eq!(
+            loc.address_in(&exact, 1),
+            Some(0xFE00_1000),
+            "ends at the BAR's end"
+        );
+        let short = Bar {
+            size: 0x1FFF,
+            ..bar
+        };
+        assert_eq!(loc.address_in(&short, 1), None, "one byte past the BAR");
+        assert_eq!(
+            loc.address_in(
+                &Bar {
+                    kind: BarKind::Io,
+                    ..bar
+                },
+                1
+            ),
+            None,
+            "an I/O BAR is not memory"
+        );
+        assert_eq!(
+            loc.address_in(&Bar { index: 0, ..bar }, 1),
+            None,
+            "the wrong BAR"
+        );
+        let wraps = Bar {
+            address: u64::MAX - 0x17FF,
+            ..bar
+        };
+        assert_eq!(loc.address_in(&wraps, 1), None, "wraps the address space");
+    }
+
+    #[test]
+    fn a_notification_register_stays_inside_its_structure() {
+        let notify = CfgLocation {
+            bar: 4,
+            offset: 0x3000,
+            length: 0x1000,
+        };
+        assert_eq!(notify.notify_offset(1, 4), Some(4));
+        assert_eq!(notify.notify_offset(1023, 4), Some(0xFFC));
+        assert_eq!(notify.notify_offset(0, 0), Some(0), "a shared register");
+        assert_eq!(notify.notify_offset(1024, 4), None, "past the structure");
+        assert_eq!(
+            notify.notify_offset(u16::MAX, u32::MAX),
+            None,
+            "no overflow"
+        );
+        let small = CfgLocation {
+            length: 1,
+            ..notify
+        };
+        assert_eq!(small.notify_offset(0, 0), None, "two bytes are written");
+    }
+
+    /// Whatever a virtio device's configuration space holds, and even if it changes
+    /// between reads, the walk reads only inside the capability area and keeps what it
+    /// promises (CLAUDE.md §72).
+    #[test]
+    fn hostile_capability_lists_never_break_the_walk() {
+        use crate::testing::{Rng, mutate_window};
+        let base = config_space();
+        let mut rng = Rng::new(0x5649_5254);
+        let (mut modern, mut seen) = (0u32, 0u32);
+        for case in 0..crate::testing::cases(12_000) {
+            let mut b = base;
+            mutate_window(&mut b, 0x34..0x100, &mut rng);
+            if case % 3 == 0 {
+                // A capability at any offset the list can name, so the end of the area is
+                // reached by the walk itself and not by a lucky mutation.
+                let offset = 0x40 + 4 * rng.below(48);
+                b[0x34] = offset as u8;
+                let kind = 1 + rng.below(4) as u32;
+                let len = if kind == 2 { 20 } else { 16 };
+                let head = 0x09u32 | len << 16 | kind << 24;
+                b[offset..offset + 4].copy_from_slice(&head.to_le_bytes());
+            }
+            let noisy = case % 4 == 0;
+            let mut noise = Rng::new(rng.next());
+            let mut reads = 0u32;
+            let caps = find_caps(
+                |off| {
+                    reads += 1;
+                    assert!(off < 0x100 && off & 3 == 0, "case {case}: read at {off:#x}");
+                    let o = usize::from(off);
+                    let v = u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+                    if noisy { v ^ noise.edge_u32() } else { v }
+                },
+                |l| l.bar != 2,
+            );
+            assert!(reads <= 2 + 48 * 5, "case {case}: {reads} reads");
+            modern += u32::from(caps.is_modern());
+            for loc in [caps.common, caps.notify, caps.isr, caps.device]
+                .into_iter()
+                .flatten()
+            {
+                seen += 1;
+                assert!(loc.bar <= 5 && loc.bar != 2, "case {case}: {loc:?}");
+            }
+            assert!(
+                caps.notify.is_some() || caps.notify_off_multiplier == 0,
+                "case {case}"
+            );
+
+            let mut plain = base;
+            mutate_window(&mut plain, 0x34..0x100, &mut rng);
+            let steady = find_caps(reader(&plain), |_| true);
+            // A steady device's locations are what its capability bytes say.
+            for loc in [steady.common, steady.notify, steady.isr, steady.device]
+                .into_iter()
+                .flatten()
+            {
+                let bar = Bar {
+                    index: loc.bar,
+                    kind: BarKind::Memory32,
+                    prefetchable: false,
+                    address: u64::from(rng.edge_u32()),
+                    size: 1 << rng.below(32),
+                };
+                if let Some(address) = loc.address_in(&bar, 2) {
+                    assert!(
+                        u64::from(loc.offset) + u64::from(loc.length) <= bar.size,
+                        "case {case}: {loc:?}"
+                    );
+                    assert_eq!(address, bar.address + u64::from(loc.offset), "case {case}");
+                }
+                if let Some(at) = loc.notify_offset(rng.next() as u16, rng.edge_u32()) {
+                    assert!(at + 2 <= u64::from(loc.length), "case {case}");
+                }
+            }
+        }
+        assert!(
+            modern > 1000 && seen > 1000,
+            "{modern} modern, {seen} structures"
+        );
+    }
+
+    /// The virtio-net structures decode exactly the bytes they cover; a header round-trips
+    /// and a configuration field is present only with its feature (CLAUDE.md §72).
+    #[test]
+    fn mutated_net_structures_decode_exactly_their_bytes() {
+        use crate::testing::{Rng, mutate};
+        let mut rng = Rng::new(0x4E45_5456);
+        for case in 0..crate::testing::cases(10_000) {
+            let hdr = NetHeader {
+                flags: rng.byte(),
+                gso_type: rng.byte(),
+                hdr_len: rng.edge_u32() as u16,
+                gso_size: rng.edge_u32() as u16,
+                csum_start: rng.edge_u32() as u16,
+                csum_offset: rng.edge_u32() as u16,
+                num_buffers: rng.edge_u32() as u16,
+            };
+            let bytes = hdr.encode();
+            assert_eq!(NetHeader::decode(&bytes), Some(hdr), "case {case}");
+            let mut mutated = bytes.to_vec();
+            mutate(&mut mutated, &mut rng);
+            match NetHeader::decode(&mutated) {
+                Some(h) => {
+                    assert!(mutated.len() >= NET_HDR_LEN, "case {case}");
+                    assert_eq!(h.encode()[..], mutated[..NET_HDR_LEN], "case {case}");
+                }
+                None => assert!(mutated.len() < NET_HDR_LEN, "case {case}"),
+            }
+
+            let mut config = [0u8; 12].to_vec();
+            for b in &mut config {
+                *b = rng.byte();
+            }
+            let features = rng.next();
+            let mut cut = config;
+            mutate(&mut cut, &mut rng);
+            let c = parse_net_config(&cut, features);
+            assert_eq!(
+                c.mac.is_some(),
+                features & feature::NET_MAC != 0 && cut.len() >= 6
+            );
+            assert_eq!(
+                c.status.is_some(),
+                features & feature::NET_STATUS != 0 && cut.len() >= 8,
+                "case {case}"
+            );
+            assert_eq!(
+                c.max_queue_pairs.is_some(),
+                features & feature::NET_MQ != 0 && cut.len() >= 10,
+                "case {case}"
+            );
+            assert_eq!(
+                c.mtu.is_some(),
+                features & feature::NET_MTU != 0 && cut.len() >= 12,
+                "case {case}"
+            );
+            if let Some(mac) = c.mac {
+                assert_eq!(mac[..], cut[..6], "case {case}");
+            }
+            assert_eq!(
+                link_up(&c),
+                c.status.is_some_and(|s| s & 1 == 1),
+                "case {case}"
+            );
+
+            let (offered, wanted) = (rng.next(), rng.next());
+            if let Some(accepted) = negotiate(offered, wanted) {
+                assert_eq!(accepted, offered & wanted, "case {case}");
+                assert_ne!(accepted & feature::VERSION_1, 0, "case {case}");
+            } else {
+                assert_eq!(offered & wanted & feature::VERSION_1, 0, "case {case}");
+            }
+        }
     }
 }

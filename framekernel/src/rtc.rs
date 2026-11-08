@@ -505,6 +505,114 @@ mod tests {
         );
     }
 
+    /// Every register random at once (the other soak corrupts one at a time): whatever
+    /// decodes is a real date, re-encodes to the registers it came from, and survives the
+    /// trip through Unix time (CLAUDE.md §72).
+    #[test]
+    fn fully_random_registers_decode_only_to_real_dates() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0x5254_4332);
+        let mut accepted = 0u32;
+        // Most random registers are not dates, so aim each field near its valid range.
+        let field = |rng: &mut Rng, max: u8, bcd: bool| {
+            let v = rng.below(usize::from(max) + 2) as u8;
+            if rng.below(16) == 0 {
+                rng.byte()
+            } else if bcd {
+                ((v / 10) << 4) | (v % 10)
+            } else {
+                v
+            }
+        };
+        for case in 0..crate::testing::cases(200_000) {
+            let status_b = rng.byte();
+            let bcd = status_b & MODE_BINARY == 0;
+            let r = Registers {
+                seconds: field(&mut rng, 59, bcd),
+                minutes: field(&mut rng, 59, bcd),
+                hours: field(&mut rng, 23, bcd) | if rng.below(4) == 0 { 0x80 } else { 0 },
+                day: field(&mut rng, 31, bcd),
+                month: field(&mut rng, 12, bcd),
+                year: field(&mut rng, 99, bcd),
+                century: if rng.below(2) == 0 {
+                    Some(field(&mut rng, 99, bcd))
+                } else {
+                    None
+                },
+                status_b,
+            };
+            let Ok(d) = decode(&r) else { continue };
+            accepted += 1;
+            assert!(
+                d.second <= 59 && d.minute <= 59 && d.hour <= 23,
+                "case {case}: {d:?}"
+            );
+            assert!((1..=12).contains(&d.month), "case {case}: {d:?}");
+            let len = days_in_month(u64::from(d.year), d.month);
+            assert!(d.day >= 1 && d.day <= len, "case {case}: {d:?}");
+            assert!(d.year >= 1970, "case {case}: {d:?}");
+            let again = encode(d, status_b, r.century.is_some());
+            assert_eq!(
+                (
+                    again.seconds,
+                    again.minutes,
+                    again.hours,
+                    again.day,
+                    again.month,
+                    again.year
+                ),
+                (r.seconds, r.minutes, r.hours, r.day, r.month, r.year),
+                "case {case}: {r:?} -> {d:?}"
+            );
+            if r.century.is_some() {
+                assert_eq!(again.century, r.century, "case {case}");
+            }
+            let back = d.unix_seconds().unwrap();
+            assert_eq!(DateTime::from_unix_seconds(back), Some(d), "case {case}");
+        }
+        assert!(accepted > 3000, "{accepted}");
+    }
+
+    /// The calendar arithmetic over any 64-bit input: Unix time and back agree, and fields
+    /// that cannot be a date have no Unix time.
+    #[test]
+    fn calendar_arithmetic_is_total_over_any_input() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0x4341_4C31);
+        for case in 0..crate::testing::cases(20_000) {
+            let seconds = rng.edge_u64();
+            if let Some(d) = DateTime::from_unix_seconds(seconds) {
+                assert_eq!(d.unix_seconds(), Some(seconds), "case {case}: {seconds}");
+                let _ = format!("{d}");
+            }
+            let t = dt(
+                rng.next() as u16,
+                rng.byte(),
+                rng.byte(),
+                rng.byte(),
+                rng.byte(),
+                rng.byte(),
+            );
+            if t.unix_seconds().is_some() {
+                let ok = t.year >= 1970
+                    && (1..=12).contains(&t.month)
+                    && t.day >= 1
+                    && t.day <= days_in_month(u64::from(t.year), t.month)
+                    && t.hour <= 23
+                    && t.minute <= 59
+                    && t.second <= 59;
+                assert!(ok, "case {case}: {t:?}");
+            }
+            let year = rng.edge_u64();
+            let month = rng.byte();
+            let n = days_in_month(year, month);
+            assert!(
+                (28..=31).contains(&n) == (1..=12).contains(&month) && (n <= 31),
+                "case {case}"
+            );
+        }
+    }
+
     #[test]
     fn invalid_dates_have_no_unix_time() {
         assert_eq!(dt(1969, 12, 31, 23, 59, 59).unix_seconds(), None);

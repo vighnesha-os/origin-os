@@ -756,7 +756,11 @@ fn prove_numa(com1: &mut console::Console, rsdp: u64, ids: &[u32]) {
     }
 
     let enabled_cpus = cpus.iter().filter(|c| c.enabled).count();
-    let mem_bytes: u64 = mems.iter().filter(|m| m.enabled).map(|m| m.length).sum();
+    // The lengths are firmware data, so the total must not wrap.
+    let mem_bytes = mems
+        .iter()
+        .filter(|m| m.enabled)
+        .fold(0u64, |sum, m| sum.saturating_add(m.length));
     // Every online processor must have an enabled affinity entry.
     let all_online_placed = ids
         .iter()

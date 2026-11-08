@@ -45,18 +45,16 @@ pub fn nearest_nodes(slit: &Slit, from: usize, out: &mut [usize]) -> usize {
 }
 
 /// Whether every locality's nearest node (by the SLIT) is itself — the basic sanity an
-/// allocator relies on, that local memory is never further than remote memory. Returns
-/// `false` if the SLIT has no localities.
+/// allocator relies on, that local memory is never further than remote memory. Every
+/// locality is checked against every other, however many the SLIT lists (the matrix is
+/// bounded by the table's own size). Returns `false` if the SLIT has no localities.
 pub fn self_is_nearest(slit: &Slit) -> bool {
     let n = slit.localities();
     if n == 0 {
         return false;
     }
-    let mut order = [0usize; 256];
-    (0..n).all(|from| {
-        let k = nearest_nodes(slit, from, &mut order).min(1);
-        k == 1 && order[0] == from
-    })
+    let dist = |from: usize, to: usize| slit.distance(from, to).unwrap_or(u8::MAX);
+    (0..n).all(|from| (0..n).all(|to| dist(from, from) <= dist(from, to)))
 }
 
 #[cfg(test)]
@@ -151,6 +149,106 @@ mod tests {
         let mut out = [0usize; 4];
         assert_eq!(nearest_nodes(&slit, 0, &mut out), 3);
         assert_eq!(&out[..3], &[0, 1, 2]);
+    }
+
+    /// A SLIT with more localities than `nearest_nodes`'s caller might expect: locality 299
+    /// is the nearest node to itself like every other, and a remote node strictly closer
+    /// than a late locality's own distance is noticed. The first version kept a 256-entry
+    /// order array and so could not place localities 256 and above.
+    #[test]
+    fn self_nearest_looks_at_every_locality() {
+        const N: usize = 300;
+        let mut matrix = alloc::vec![20u8; N * N];
+        for i in 0..N {
+            matrix[i * N + i] = 10;
+        }
+        let bytes = slit_bytes(N as u64, &matrix);
+        assert!(self_is_nearest(&parse_slit(&bytes).unwrap()));
+        // Locality 299 says locality 5 is closer than itself.
+        let mut broken = matrix.clone();
+        broken[299 * N + 5] = 5;
+        let bytes = slit_bytes(N as u64, &broken);
+        assert!(!self_is_nearest(&parse_slit(&bytes).unwrap()));
+    }
+
+    /// The locality map stays sound over mutated SLIT bytes and arbitrary affinity lists: the
+    /// order it returns is a permutation in ascending distance, a lookup answers only from an
+    /// enabled entry, and nothing panics (CLAUDE.md §72).
+    #[test]
+    fn mutated_tables_keep_the_map_sound() {
+        use crate::testing::{Rng, mutate};
+        let base = slit_bytes(
+            4,
+            &[
+                10, 16, 32, 40, 16, 10, 20, 32, 32, 20, 10, 16, 40, 32, 16, 10,
+            ],
+        );
+        let mut rng = Rng::new(0x4E55_4D41);
+        let mut maps = 0u32;
+        for case in 0..crate::testing::cases(8000) {
+            let mut t = base.clone();
+            mutate(&mut t, &mut rng);
+            if let Ok(slit) = parse_slit(&t) {
+                maps += 1;
+                let n = slit.localities();
+                let from = rng.below(n.max(1) + 1);
+                let mut out = [usize::MAX; 8];
+                let k = nearest_nodes(&slit, from, &mut out);
+                assert_eq!(k, n.min(out.len()), "case {case}");
+                let mut sorted = out[..k].to_vec();
+                sorted.sort_unstable();
+                assert!(sorted.iter().copied().eq(0..k), "case {case}: {out:?}");
+                let d = |to: usize| slit.distance(from, to).unwrap_or(u8::MAX);
+                assert!(
+                    out[..k].windows(2).all(|w| d(w[0]) <= d(w[1])),
+                    "case {case}"
+                );
+                if self_is_nearest(&slit) {
+                    assert!(n > 0, "case {case}");
+                    for i in 0..n.min(16) {
+                        for j in 0..n.min(16) {
+                            let own = slit.distance(i, i).unwrap_or(0);
+                            assert!(own <= slit.distance(i, j).unwrap_or(0), "case {case}");
+                        }
+                    }
+                }
+            }
+
+            let cpus: Vec<CpuAffinity> = (0..rng.below(4))
+                .map(|_| CpuAffinity {
+                    apic_id: rng.edge_u32(),
+                    proximity_domain: rng.edge_u32(),
+                    enabled: rng.below(2) == 0,
+                })
+                .collect();
+            let id = cpus.first().map_or(0, |c| c.apic_id);
+            if let Some(node) = node_of_cpu(&cpus, id) {
+                assert!(cpus.iter().any(|c| c.enabled && c.proximity_domain == node));
+            }
+            let mems: Vec<MemoryAffinity> = (0..rng.below(4))
+                .map(|_| MemoryAffinity {
+                    proximity_domain: rng.edge_u32(),
+                    base: rng.edge_u64(),
+                    length: rng.edge_u64(),
+                    enabled: rng.below(2) == 0,
+                    hot_pluggable: false,
+                    non_volatile: false,
+                })
+                .collect();
+            let addr = mems
+                .first()
+                .map_or(0, |m| m.base.wrapping_add(rng.edge_u64()));
+            if let Some(node) = node_of_address(&mems, addr) {
+                assert!(
+                    mems.iter().any(|m| m.enabled
+                        && m.proximity_domain == node
+                        && addr >= m.base
+                        && addr - m.base < m.length),
+                    "case {case}"
+                );
+            }
+        }
+        assert!(maps > 1000, "{maps}");
     }
 
     #[test]

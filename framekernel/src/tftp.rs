@@ -416,6 +416,54 @@ mod tests {
         assert_eq!(d.data().len(), BLOCK, "nothing past the limit is kept");
     }
 
+    /// A mutated transfer stays bounded, and a block the reader accepts is the next one in
+    /// order (CLAUDE.md §72).
+    #[test]
+    fn mutated_transfers_stay_in_order_and_in_bounds() {
+        use crate::testing::{Rng, mutate};
+        let mut rng = Rng::new(0x5446_5032);
+        let content = file(1500);
+        let mut steps = 0u32;
+        for case in 0..crate::testing::cases(2000) {
+            let mut d = Download::new(4096);
+            let mut expected: u16 = 1;
+            for i in 0..6 {
+                let start = (expected as usize - 1) * BLOCK;
+                let end = (start + BLOCK).min(content.len());
+                let mut packet = if start <= content.len() {
+                    data(expected, &content[start..end])
+                } else {
+                    data(expected, b"")
+                };
+                if i % 2 == 1 {
+                    mutate(&mut packet, &mut rng);
+                }
+                let parsed = parse(&packet);
+                match d.on_packet(&packet) {
+                    Step::Ack { block, last } => {
+                        steps += 1;
+                        if let Some(Packet::Data {
+                            block: b,
+                            data: payload,
+                        }) = parsed
+                        {
+                            assert_eq!(b, block, "case {case}");
+                            if b == expected {
+                                expected = expected.wrapping_add(1);
+                                assert_eq!(last, payload.len() < BLOCK, "case {case}");
+                            }
+                        }
+                    }
+                    Step::Failed(Failure::TooLarge) => panic!("case {case}: over the limit"),
+                    Step::Failed(Failure::Server(_)) | Step::Ignore => {}
+                }
+                assert!(d.data().len() <= 4096, "case {case}");
+                let _ = (d.blocks(), d.is_complete(), d.failure());
+            }
+        }
+        assert!(steps > 3000, "{steps}");
+    }
+
     #[test]
     fn mutated_packets_never_panic() {
         let content = file(700);

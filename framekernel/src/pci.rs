@@ -308,6 +308,27 @@ pub struct Msix {
     pub pba_offset: u32,
 }
 
+impl Msix {
+    /// The physical address of the MSI-X table if it lies wholly inside `bar`, which must
+    /// be the memory BAR it names; the table's size comes from the capability, the BAR's
+    /// from sizing, and neither is trusted to fit the other.
+    pub fn table_address(&self, bar: &Bar) -> Option<u64> {
+        if bar.index != self.table_bar || bar.kind == BarKind::Io {
+            return None;
+        }
+        let len = u64::from(self.entries).checked_mul(MSIX_ENTRY)?;
+        let end = u64::from(self.table_offset).checked_add(len)?;
+        if end > bar.size {
+            return None;
+        }
+        let table = bar.address.checked_add(u64::from(self.table_offset))?;
+        table.checked_add(len).map(|_| table)
+    }
+}
+
+/// The last offset that holds a whole MSI-X capability: 12 bytes, ending at FFh.
+const MSIX_CAPABILITY_END: u16 = 0x100 - 12;
+
 /// Message control bits: MSI-X enable, and function mask.
 pub const MSIX_ENABLE: u32 = 1 << 15;
 pub const MSIX_FUNCTION_MASK: u32 = 1 << 14;
@@ -315,10 +336,13 @@ pub const MSIX_FUNCTION_MASK: u32 = 1 << 14;
 pub const MSIX_ENTRY: u64 = 16;
 pub const MSIX_MASKED: u32 = 1;
 
-/// Reads the function's MSI-X capability, if it has a valid one (both BIRs naming BARs
-/// 0–5).
+/// Reads the function's MSI-X capability, if it has a valid one: both BIRs name BARs 0–5,
+/// and the 12-byte structure lies inside the 256 bytes that hold capabilities.
 pub fn msix(cfg: &mut impl ConfigSpace, at: Address) -> Option<Msix> {
     let capability = find_capability(cfg, at, capability::MSIX)?;
+    if capability > MSIX_CAPABILITY_END {
+        return None;
+    }
     let control = cfg.read32(at, capability) >> 16;
     let table = cfg.read32(at, capability + 4);
     let pba = cfg.read32(at, capability + 8);
@@ -741,6 +765,70 @@ mod tests {
         );
     }
 
+    /// An MSI-X capability placed so that its 12 bytes cross the end of the 256-byte
+    /// capability area is refused; its dwords at 100h and up belong to something else.
+    #[test]
+    fn an_msix_capability_must_fit_in_the_capability_area() {
+        let f = at(0, 4, 0);
+        let mut m = q35();
+        let command = m.regs[&(f, register::COMMAND)];
+        m.regs
+            .insert((f, register::COMMAND), command | STATUS_CAPABILITIES);
+        for (offset, accepted) in [(0xF4u16, true), (0xF8, false), (0xFC, false)] {
+            m.regs.insert((f, 0x34), u32::from(offset));
+            m.regs.insert((f, offset), (63 << 16) | 0x0011);
+            m.regs.insert((f, offset + 4), 0x2000);
+            m.regs.insert((f, offset + 8), 0x3000);
+            assert_eq!(msix(&mut m, f).is_some(), accepted, "at {offset:#x}");
+            m.regs.remove(&(f, offset));
+        }
+    }
+
+    /// The table must lie inside the memory BAR the capability names: an I/O BAR's "address"
+    /// is a port number, so writing MSI-X entries there would land in RAM.
+    #[test]
+    fn the_msix_table_is_located_only_inside_its_memory_bar() {
+        let m = Msix {
+            capability: 0x50,
+            entries: 64,
+            table_bar: 1,
+            table_offset: 0x1000,
+            pba_bar: 1,
+            pba_offset: 0x2000,
+        };
+        let bar = Bar {
+            index: 1,
+            kind: BarKind::Memory64,
+            prefetchable: false,
+            address: 0xC000_0000,
+            size: 0x4000,
+        };
+        assert_eq!(m.table_address(&bar), Some(0xC000_1000));
+        // 64 entries of 16 bytes end at 1400h: inside a 2 KiB-offset 5 KiB window only.
+        let exact = Bar {
+            size: 0x1400,
+            ..bar
+        };
+        assert_eq!(m.table_address(&exact), Some(0xC000_1000));
+        let short = Bar {
+            size: 0x13FF,
+            ..bar
+        };
+        assert_eq!(m.table_address(&short), None, "one byte short");
+        let io = Bar {
+            kind: BarKind::Io,
+            ..bar
+        };
+        assert_eq!(m.table_address(&io), None, "an I/O BAR");
+        let other = Bar { index: 2, ..bar };
+        assert_eq!(m.table_address(&other), None, "the wrong BAR");
+        let wraps = Bar {
+            address: u64::MAX - 0xFFF,
+            ..bar
+        };
+        assert_eq!(m.table_address(&wraps), None, "wraps the address space");
+    }
+
     #[test]
     fn sizing_masks() {
         assert_eq!(memory_size_32(0xFFFF_F000), Some(4096));
@@ -802,6 +890,321 @@ mod tests {
             }
         }
         assert!(accepted > 500, "{accepted}");
+    }
+
+    /// A function whose configuration space the soak chose. Every access is checked against
+    /// the [`ConfigSpace`] contract; it can answer differently on every read, and it keeps
+    /// the writes it saw.
+    struct Hostile {
+        /// The 4 KiB of configuration space.
+        bytes: Vec<u8>,
+        /// Each BAR's writable bits (what an all-ones probe reads back).
+        masks: [u32; 6],
+        /// When set, every read is XORed with noise: a device that changes its answers.
+        noise: Option<crate::testing::Rng>,
+        writes: Vec<(u16, u32)>,
+    }
+
+    impl Hostile {
+        fn dword(&self, register: u16) -> u32 {
+            let at = usize::from(register);
+            u32::from_le_bytes(self.bytes[at..at + 4].try_into().unwrap())
+        }
+
+        fn set_dword(&mut self, register: u16, value: u32) {
+            let at = usize::from(register);
+            self.bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    impl ConfigSpace for Hostile {
+        fn read32(&mut self, _at: Address, register: u16) -> u32 {
+            assert!(
+                register < 4096 && register.is_multiple_of(4),
+                "read at {register:#x}"
+            );
+            let mut v = self.dword(register);
+            if let Some(noise) = &mut self.noise {
+                v ^= noise.edge_u32();
+            }
+            v
+        }
+
+        fn write32(&mut self, _at: Address, register: u16, value: u32) {
+            assert!(
+                register < 4096 && register.is_multiple_of(4),
+                "write at {register:#x}"
+            );
+            self.writes.push((register, value));
+            if (0x10..0x28).contains(&register) {
+                let mask = self.masks[usize::from((register - 0x10) / 4)];
+                self.set_dword(register, if value == u32::MAX { mask } else { value });
+            } else if register == register::COMMAND {
+                let status = self.dword(register) & 0xFFFF_0000;
+                self.set_dword(register, status | (value & 0xFFFF));
+            }
+        }
+    }
+
+    /// A plausible endpoint: a capability list at 40h (MSI, MSI-X, PCI Express), a 64-bit
+    /// BAR, a 32-bit BAR and an I/O BAR.
+    fn hostile_base() -> (Vec<u8>, [u32; 6]) {
+        let mut b = vec![0u8; 4096];
+        let mut put = |at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put(0x00, 0x0010_1B36);
+        put(0x04, 0x0010_0007);
+        put(0x08, 0x0108_0201);
+        put(0x0C, 0x0000_0000);
+        put(0x10, 0xC000_0004); // BAR 0-1: 64-bit
+        put(0x14, 0x0000_0008);
+        put(0x18, 0xC100_0000); // BAR 2: 32-bit
+        put(0x1C, 0x0000_C041); // BAR 3: I/O
+        put(0x34, 0x40);
+        put(0x40, 0x0003_5005); // MSI, next 50h
+        put(0x50, (63 << 16) | 0x6011); // MSI-X, 64 entries, next 60h
+        put(0x54, 0x2000);
+        put(0x58, 0x3004);
+        put(0x60, 0x0002_0010); // PCI Express, end of list
+        (
+            b,
+            [0xFFFF_C000, 0xFFFF_FFFF, 0xFFFF_F000, 0xFFFF_FFE1, 0, 0],
+        )
+    }
+
+    /// Whatever a function's configuration space holds, and even if it changes between
+    /// reads, the walks stay inside it, terminate and return only what they promise; BAR
+    /// sizing still ends with the command register restored (CLAUDE.md §72).
+    #[test]
+    fn hostile_configuration_space_never_breaks_the_walks() {
+        use crate::testing::{Rng, mutate_window};
+        let (base, masks) = hostile_base();
+        let at = at(0, 4, 0);
+        let mut rng = Rng::new(0x4346_4731);
+        let (mut functions, mut lists, mut with_msix, mut bars) = (0u32, 0u32, 0u32, 0u32);
+        for case in 0..crate::testing::cases(12_000) {
+            let mut bytes = base.clone();
+            match case % 4 {
+                0 => mutate_window(&mut bytes, 0..0x40, &mut rng),
+                1 => mutate_window(&mut bytes, 0x34..0x100, &mut rng),
+                // An MSI-X capability at any offset the list can name, as its head: at the
+                // top of the area its 12 bytes must not count as present.
+                2 => {
+                    let offset = 0x40 + 4 * rng.below(48);
+                    bytes[0x34] = offset as u8;
+                    bytes[offset..offset + 4]
+                        .copy_from_slice(&((63u32 << 16) | 0x11).to_le_bytes());
+                }
+                _ => {
+                    // Reach the checks behind the header: keep the list intact and scribble
+                    // over the capability bodies only.
+                    mutate_window(&mut bytes, 0x40..0x100, &mut rng);
+                    bytes[0x34] = 0x40;
+                }
+            }
+            let mut masks = masks;
+            for m in &mut masks {
+                if rng.below(4) == 0 {
+                    *m = rng.edge_u32();
+                }
+            }
+            let noise = (case % 5 == 0).then(|| Rng::new(rng.next()));
+            let steady = noise.is_none();
+            let mut dev = Hostile {
+                bytes,
+                masks,
+                noise,
+                writes: Vec::new(),
+            };
+
+            let mut caps = [(0u8, 0u16); 64];
+            let n = capabilities(&mut dev, at, &mut caps);
+            assert!(n <= 48, "case {case}: {n} capabilities in 192 bytes");
+            for (i, &(_, offset)) in caps[..n].iter().enumerate() {
+                assert!((0x40..=0xFC).contains(&offset), "case {case}: {offset:#x}");
+                assert!(offset.is_multiple_of(4), "case {case}: {offset:#x}");
+                assert!(caps[..i].iter().all(|&(_, o)| o != offset), "case {case}");
+            }
+            if n > 0 {
+                lists += 1;
+            }
+            let mut small = [(0u8, 0u16); 2];
+            assert!(capabilities(&mut dev, at, &mut small) <= 2, "case {case}");
+
+            for id in [
+                capability::MSI,
+                capability::MSIX,
+                capability::PCI_EXPRESS,
+                0xFF,
+            ] {
+                if let (Some(offset), true) = (find_capability(&mut dev, at, id), steady) {
+                    assert!(caps[..n].contains(&(id, offset)), "case {case}");
+                }
+            }
+
+            if let Some(m) = msix(&mut dev, at) {
+                with_msix += 1;
+                assert!((1..=2048).contains(&m.entries), "case {case}: {m:?}");
+                assert!(m.table_bar <= 5 && m.pba_bar <= 5, "case {case}: {m:?}");
+                assert!(m.table_offset.is_multiple_of(8), "case {case}: {m:?}");
+                assert!(m.pba_offset.is_multiple_of(8), "case {case}: {m:?}");
+                // The 12-byte capability is wholly inside the 256 bytes that hold it.
+                assert!((0x40..=0xF4).contains(&m.capability), "case {case}: {m:?}");
+                assert!(m.capability.is_multiple_of(4), "case {case}: {m:?}");
+                for address in [rng.edge_u64(), 0xC000_0000] {
+                    let size = 1u64 << rng.below(40);
+                    let b = Bar {
+                        index: m.table_bar,
+                        kind: BarKind::Memory64,
+                        prefetchable: false,
+                        address,
+                        size,
+                    };
+                    if let Some(table) = m.table_address(&b) {
+                        let len = u64::from(m.entries) * MSIX_ENTRY;
+                        assert!(
+                            u64::from(m.table_offset) + len <= size,
+                            "case {case}: {m:?}"
+                        );
+                        assert_eq!(table, address + u64::from(m.table_offset), "case {case}");
+                        assert!(table.checked_add(len).is_some(), "case {case}");
+                    }
+                }
+            }
+
+            let Some(f) = read_function(&mut dev, at) else {
+                continue;
+            };
+            functions += 1;
+            assert!(f.vendor != 0 && f.vendor != 0xFFFF, "case {case}: {f:?}");
+            assert_eq!(f.at, at, "case {case}");
+            assert_eq!(
+                f.bar_count(),
+                match f.layout {
+                    0 => 6,
+                    1 => 2,
+                    _ => 0,
+                },
+                "case {case}: {f:?}"
+            );
+            assert!(f.layout < 0x80, "case {case}: {f:?}");
+
+            let before: Vec<u32> = (0..u16::from(f.bar_count()))
+                .map(|i| dev.dword(register::BAR0 + 4 * i))
+                .collect();
+            dev.writes.clear();
+            let sized = size_bars(&mut dev, &f);
+            for (i, bar) in sized.iter().enumerate() {
+                let Some(bar) = bar else { continue };
+                bars += 1;
+                assert_eq!(usize::from(bar.index), i, "case {case}: {bar:?}");
+                assert!(bar.size.is_power_of_two(), "case {case}: {bar:?}");
+                if bar.kind == BarKind::Memory64 {
+                    assert!(i + 1 < usize::from(f.bar_count()), "case {case}: {bar:?}");
+                    assert_eq!(sized[i + 1], None, "case {case}: {bar:?}");
+                }
+                assert!(
+                    bar.kind != BarKind::Io || !bar.prefetchable,
+                    "case {case}: {bar:?}"
+                );
+            }
+            // Decoding is off for every probe, and the status half is written as zeros.
+            let commands: Vec<u32> = dev
+                .writes
+                .iter()
+                .filter(|&&(r, _)| r == register::COMMAND)
+                .map(|&(_, v)| v)
+                .collect();
+            assert_eq!(commands.len(), 2, "case {case}: {commands:x?}");
+            assert_eq!(commands[0], commands[1] & !DECODE, "case {case}");
+            assert_eq!(commands[1] & 0xFFFF_0000, 0, "case {case}");
+            assert_eq!(dev.writes.first().map(|w| w.0), Some(register::COMMAND));
+            assert_eq!(dev.writes.last().map(|w| w.0), Some(register::COMMAND));
+            // A steady device gets every BAR back as it was.
+            if steady {
+                for (i, value) in before.iter().enumerate() {
+                    assert_eq!(
+                        dev.dword(register::BAR0 + 4 * i as u16),
+                        *value,
+                        "case {case}"
+                    );
+                }
+            }
+        }
+        assert!(
+            functions > 3000 && lists > 3000 && with_msix > 1000 && bars > 3000,
+            "{functions} functions, {lists} lists, {with_msix} with MSI-X, {bars} BARs"
+        );
+    }
+
+    /// Enumeration over any answers stays in its buses and output, lists each function once
+    /// and looks past function 0 only on a multi-function device.
+    #[test]
+    fn hostile_enumeration_stays_in_bounds() {
+        use crate::testing::{Rng, mutate_window};
+        let (base, masks) = hostile_base();
+        let mut rng = Rng::new(0x454E_554D);
+        let mut listed = 0u32;
+        for case in 0..crate::testing::cases(1500) {
+            let mut bytes = base.clone();
+            mutate_window(&mut bytes, 0..0x10, &mut rng);
+            let noise = (case % 2 == 0).then(|| Rng::new(rng.next()));
+            let mut dev = Hostile {
+                bytes,
+                masks,
+                noise,
+                writes: Vec::new(),
+            };
+            let start = rng.byte();
+            let end = start.saturating_add(rng.below(3) as u8);
+            let mut out = [Function::default(); 32];
+            let n = match enumerate(&mut dev, start..=end, &mut out) {
+                Ok(n) => n,
+                Err(n) => {
+                    assert_eq!(n, out.len(), "case {case}");
+                    n
+                }
+            };
+            listed += n as u32;
+            assert!(dev.writes.is_empty(), "case {case}: enumeration wrote");
+            for (i, f) in out[..n].iter().enumerate() {
+                assert!((start..=end).contains(&f.at.bus), "case {case}: {f:?}");
+                assert!(f.at.device < 32 && f.at.function < 8, "case {case}: {f:?}");
+                assert!(f.vendor != 0 && f.vendor != 0xFFFF, "case {case}: {f:?}");
+                assert!(out[..i].iter().all(|g| g.at != f.at), "case {case}: {f:?}");
+            }
+        }
+        assert!(listed > 1000, "{listed}");
+    }
+
+    /// The ECAM arithmetic: an offset is inside the window's bytes, for any window the MCFG
+    /// parser can return and any address.
+    #[test]
+    fn ecam_offsets_stay_inside_the_window() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0x4543_414D);
+        for case in 0..crate::testing::cases(20_000) {
+            let (start_bus, end_bus) = (rng.byte(), rng.byte());
+            let ecam = Ecam {
+                base: rng.edge_u64() & !0xF_FFFF,
+                segment: rng.byte() as u16,
+                start_bus,
+                end_bus,
+            };
+            let at = Address {
+                bus: rng.byte(),
+                device: rng.below(40) as u8,
+                function: rng.below(12) as u8,
+            };
+            let register = rng.next() as u16 & 0x1FFF;
+            let Some((_, len)) = ecam.window() else {
+                continue;
+            };
+            if let Some(offset) = ecam.offset(at, register) {
+                assert!(offset + 4 <= len, "case {case}: {offset:#x} of {len:#x}");
+                assert!(register.is_multiple_of(4) && register < 4096, "case {case}");
+                assert!(ecam.buses().contains(&at.bus), "case {case}");
+            }
+        }
     }
 
     #[test]

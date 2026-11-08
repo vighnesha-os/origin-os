@@ -103,10 +103,16 @@ pub fn parse_rsdp(b: &[u8]) -> Result<Rsdp, AcpiError> {
     })
 }
 
+/// The longest table the kernel will map and read. The length field is firmware data read
+/// before the checksum can be checked; a valid 32-bit length would otherwise map and walk up
+/// to 4 GiB. The largest tables it reads (an SRAT or MADT for a very large machine) are
+/// well under a megabyte, so this is deliberately generous.
+pub const MAX_TABLE_LENGTH: u32 = 16 << 20;
+
 /// The `length` field of a table header, so the caller knows how much to read.
 pub fn table_length(header: &[u8]) -> Result<u32, AcpiError> {
     let length = u32_at(header, 4).ok_or(AcpiError::Length(0))?;
-    if (length as usize) < HEADER_LENGTH {
+    if (length as usize) < HEADER_LENGTH || length > MAX_TABLE_LENGTH {
         return Err(AcpiError::Length(length));
     }
     Ok(length)
@@ -1032,6 +1038,369 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// An independent walk of a table's `(kind, length)` structures from `start`: each one's
+    /// `(offset, kind, length)`, or `None` if a header is cut off, a length is below 2 or a
+    /// structure runs past the table. The soaks compare the parsers against it.
+    fn walk(table: &[u8], start: usize) -> Option<Vec<(usize, u8, usize)>> {
+        let mut at = start;
+        let mut out = Vec::new();
+        while at < table.len() {
+            let (kind, len) = (*table.get(at)?, usize::from(*table.get(at + 1)?));
+            if len < 2 || at + len > table.len() {
+                return None;
+            }
+            out.push((at, kind, len));
+            at += len;
+        }
+        Some(out)
+    }
+
+    fn le32(b: &[u8]) -> u32 {
+        u32::from_le_bytes(b[..4].try_into().unwrap())
+    }
+
+    /// Restores a mutated table's length field and checksum, so what lies behind the
+    /// signature, length and checksum checks is reached.
+    fn reseal(t: &mut [u8]) {
+        if t.len() >= 36 {
+            let len = t.len() as u32;
+            t[4..8].copy_from_slice(&len.to_le_bytes());
+            fix_checksum(t, 9);
+        }
+    }
+
+    /// A table's length is firmware data read before the checksum: anything past the
+    /// bound is refused, so it never drives a mapping or a walk.
+    #[test]
+    fn an_absurd_table_length_is_refused_before_it_is_read() {
+        let mut header = [0u8; HEADER_LENGTH];
+        header[4..8].copy_from_slice(&MAX_TABLE_LENGTH.to_le_bytes());
+        assert_eq!(table_length(&header), Ok(MAX_TABLE_LENGTH));
+        header[4..8].copy_from_slice(&(MAX_TABLE_LENGTH + 1).to_le_bytes());
+        assert_eq!(
+            table_length(&header),
+            Err(AcpiError::Length(MAX_TABLE_LENGTH + 1))
+        );
+        header[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(table_length(&header), Err(AcpiError::Length(u32::MAX)));
+    }
+
+    /// Every check on an RSDP is reached on mutated input, and whatever passes has the fields
+    /// the bytes say (CLAUDE.md §72).
+    #[test]
+    fn mutated_rsdps_reach_every_check() {
+        use crate::testing::{Rng, mutate};
+        let good = rsdp(0x1FB7_D0E8);
+        let mut rng = Rng::new(0x5244_5350);
+        let mut reached = [0u32; 5];
+        for case in 0..crate::testing::cases(6000) {
+            let mut r = good.clone();
+            mutate(&mut r, &mut rng);
+            if case % 2 == 0 && r.len() >= 36 {
+                fix_checksum(&mut r[..20], 8);
+                fix_checksum(&mut r[..36], 32);
+            }
+            match parse_rsdp(&r) {
+                Ok(p) => {
+                    assert!(p.revision >= 2 && le32(&r[20..]) >= 36, "case {case}");
+                    assert_eq!(p.xsdt.to_le_bytes(), r[24..32], "case {case}");
+                    assert!(
+                        sums_to_zero(&r[..20]) && sums_to_zero(&r[..36]),
+                        "case {case}"
+                    );
+                    reached[0] += 1;
+                }
+                Err(AcpiError::RsdpSignature) => reached[1] += 1,
+                Err(AcpiError::RsdpChecksum) => reached[2] += 1,
+                Err(AcpiError::RsdpRevision(v)) => {
+                    assert!(v < 2, "case {case}");
+                    reached[3] += 1;
+                }
+                Err(AcpiError::RsdpLength(l)) => {
+                    assert!((l as usize) < RSDP_LENGTH, "case {case}");
+                    reached[4] += 1;
+                }
+                Err(e) => panic!("case {case}: {e:?}"),
+            }
+        }
+        assert!(reached.iter().all(|&n| n > 20), "{reached:?}");
+    }
+
+    /// The table-level checks and every MADT list agree with an independent walk of the same
+    /// mutated bytes, and an undersized output buffer is an error, never a panic.
+    #[test]
+    fn mutated_madts_match_an_independent_walk() {
+        use crate::testing::{Rng, mutate};
+        let base = madt(&[
+            &lapic(0, 0, 1),
+            &lapic(1, 3, 0),
+            &x2apic(300, 1, 7),
+            &ioapic(2, 0xFEC0_0000, 0),
+            &ioapic(3, 0xFEC0_1000, 24),
+            &iso(0, 2, 0),
+            &iso(9, 9, 0x000D),
+            &[0xD0u8, 4, 0, 0][..],
+        ]);
+        let mut rng = Rng::new(0x4D41_4454);
+        let (mut checked, mut listed, mut overflowed) = (0u32, 0u32, 0u32);
+        for case in 0..crate::testing::cases(8000) {
+            let mut m = base.clone();
+            mutate(&mut m, &mut rng);
+            if case % 3 != 0 {
+                reseal(&mut m);
+            }
+            let _ = signature(&m);
+            if let Ok(length) = table_length(&m) {
+                assert!(length as usize >= HEADER_LENGTH, "case {case}");
+            }
+            if check_table(&m, b"APIC").is_ok() {
+                checked += 1;
+                assert!(sums_to_zero(&m) && m[..4] == *b"APIC", "case {case}");
+                assert_eq!(le32(&m[4..]) as usize, m.len(), "case {case}");
+            }
+            let walked = walk(&m, MADT_ENTRIES);
+            let of_kind = |kind: u8, min: usize| -> Vec<usize> {
+                walked
+                    .iter()
+                    .flatten()
+                    .filter(|&&(_, k, len)| k == kind && len >= min)
+                    .map(|&(at, ..)| at)
+                    .collect()
+            };
+
+            let mut ios = [IoApic::default(); 8];
+            match madt_ioapics(&m, &mut ios) {
+                Ok(n) => {
+                    assert!(walked.is_some(), "case {case}");
+                    let expected = of_kind(1, 12);
+                    assert_eq!(n, expected.len(), "case {case}");
+                    for (io, &at) in ios[..n].iter().zip(&expected) {
+                        assert_eq!(io.id, m[at + 2], "case {case}");
+                        assert_eq!(io.address, le32(&m[at + 4..]), "case {case}");
+                        assert_eq!(io.gsi_base, le32(&m[at + 8..]), "case {case}");
+                    }
+                    listed += 1;
+                }
+                Err(AcpiError::MadtEntry(_)) => assert!(walked.is_none(), "case {case}"),
+                Err(e) => panic!("case {case}: {e:?}"),
+            }
+
+            let mut overrides = [SourceOverride::default(); 8];
+            let found = madt_overrides(&m, &mut overrides);
+            if let Ok(n) = found {
+                let expected = of_kind(2, 10);
+                assert_eq!(n, expected.len(), "case {case}");
+                for (o, &at) in overrides[..n].iter().zip(&expected) {
+                    assert_eq!((o.source_irq, o.gsi), (m[at + 3], le32(&m[at + 4..])));
+                }
+                // The lookup answers from the list, or with the identity mapping.
+                for irq in [0u8, 1, 9, 255] {
+                    let (gsi, flags) = gsi_for_irq(irq, &overrides[..n]);
+                    match overrides[..n].iter().find(|o| o.source_irq == irq) {
+                        Some(o) => assert_eq!((gsi, flags), (o.gsi, o.flags), "case {case}"),
+                        None => assert_eq!((gsi, flags), (u32::from(irq), 0), "case {case}"),
+                    }
+                }
+            }
+
+            let mut cpus = [Processor::default(); 8];
+            if let Ok(n) = madt_processors(&m, &mut cpus) {
+                let mut ids = Vec::new();
+                for &(at, kind, len) in walked.iter().flatten() {
+                    // A processor structure too short for its fields fails the whole list.
+                    let id = match (kind, len) {
+                        (0, 8..) => u32::from(m[at + 3]),
+                        (9, 16..) => le32(&m[at + 4..]),
+                        _ => continue,
+                    };
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                assert_eq!(n, ids.len(), "case {case}");
+                assert!(cpus[..n].iter().zip(&ids).all(|(p, id)| p.apic_id == *id));
+            }
+
+            // Buffers too small for the lists are refused, not overrun.
+            let mut tiny = [IoApic::default(); 1];
+            match madt_ioapics(&m, &mut tiny) {
+                Ok(n) => assert!(n <= 1, "case {case}"),
+                Err(AcpiError::TooManyProcessors) => overflowed += 1,
+                Err(_) => {}
+            }
+            let mut none: [SourceOverride; 0] = [];
+            let _ = madt_overrides(&m, &mut none);
+            let mut no_cpus: [Processor; 0] = [];
+            let _ = madt_processors(&m, &mut no_cpus);
+        }
+        assert!(
+            checked > 2000 && listed > 2000 && overflowed > 0,
+            "{checked} checked, {listed} listed, {overflowed} overflowed"
+        );
+    }
+
+    /// The XSDT's list is exactly its whole eight-byte entries, whatever follows the header.
+    #[test]
+    fn mutated_xsdts_list_exactly_their_whole_entries() {
+        use crate::testing::{Rng, mutate};
+        let mut body = Vec::new();
+        for a in [0x1000u64, 0x2000, u64::MAX] {
+            body.extend_from_slice(&a.to_le_bytes());
+        }
+        let base = table(b"XSDT", &body);
+        let mut rng = Rng::new(0x5853_4454);
+        for case in 0..crate::testing::cases(4000) {
+            let mut x = base.clone();
+            mutate(&mut x, &mut rng);
+            let got: Vec<u64> = xsdt_entries(&x).collect();
+            let expected: Vec<u64> = x
+                .get(HEADER_LENGTH..)
+                .unwrap_or(&[])
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_le_bytes(*c))
+                .collect();
+            assert_eq!(got, expected, "case {case}");
+        }
+    }
+
+    /// A FADT is read from its fixed offsets only, and each field follows its own bytes.
+    #[test]
+    fn mutated_fadts_read_their_fields_from_the_right_bytes() {
+        use crate::testing::{Rng, mutate_window};
+        let mut body = vec![0u8; 240];
+        body[FADT_CENTURY - 36] = 0x32;
+        body[FADT_PM_TMR_BLK - 36..FADT_PM_TMR_BLK - 36 + 4]
+            .copy_from_slice(&0x608u32.to_le_bytes());
+        body[FADT_PM_TMR_LEN - 36] = 4;
+        let base = table(b"FACP", &body);
+        let mut rng = Rng::new(0x4641_4454);
+        let mut with_port = 0u32;
+        for case in 0..crate::testing::cases(6000) {
+            let mut f = base.clone();
+            mutate_window(&mut f, FADT_PM_TMR_BLK..FADT_FLAGS + 4, &mut rng);
+            let len = case % (f.len() + 1);
+            let cut = if case % 4 == 0 { len } else { f.len() };
+            let f = &f[..cut];
+            let Ok(fadt) = parse_fadt(f) else {
+                assert!(
+                    f.len() < FADT_FLAGS + 4,
+                    "case {case}: refused a whole table"
+                );
+                continue;
+            };
+            assert_eq!(
+                fadt.century,
+                Some(f[FADT_CENTURY]).filter(|c| (0x0E..=0x7F).contains(c)),
+                "case {case}"
+            );
+            let port = le32(&f[FADT_PM_TMR_BLK..]);
+            match fadt.pm_timer_port {
+                Some(p) => {
+                    assert_eq!(u32::from(p), port, "case {case}");
+                    assert!(f[FADT_PM_TMR_LEN] == 4 && p != 0, "case {case}");
+                    with_port += 1;
+                }
+                None => assert!(f[FADT_PM_TMR_LEN] != 4 || port == 0 || port > 0xFFFF),
+            }
+        }
+        assert!(with_port > 500, "{with_port}");
+    }
+
+    /// The SRAT lists and the SLIT matrix keep their invariants on mutated tables, and the
+    /// lists match an independent walk.
+    #[test]
+    fn srat_and_slit_mutations_keep_their_invariants() {
+        use crate::testing::{Rng, mutate};
+        let base_srat = srat(&[
+            &cpu0(0, 0, true),
+            &cpu0(1, 0x0102_0304, false),
+            &cpu2(300, 1, true),
+            &mem(0, 0, 0x1000_0000, 1),
+            &mem(1, 0x1_0000_0000, 0x1000_0000, 0b110),
+            &[6u8, 4, 0, 0][..],
+        ]);
+        let base_slit = slit(3, &[10, 16, 32, 16, 10, 20, 32, 20, 10]);
+        let mut rng = Rng::new(0x5352_4154);
+        let (mut cpus_ok, mut mems_ok, mut slits_ok) = (0u32, 0u32, 0u32);
+        for case in 0..crate::testing::cases(10_000) {
+            let mut s = base_srat.clone();
+            mutate(&mut s, &mut rng);
+            if case % 3 != 0 {
+                reseal(&mut s);
+            }
+            let walked = walk(&s, SRAT_ENTRIES);
+            let mut cpus = [CpuAffinity::default(); 8];
+            if let Ok(n) = srat_cpu_affinities(&s, &mut cpus) {
+                cpus_ok += 1;
+                let expected: Vec<_> = walked
+                    .iter()
+                    .flatten()
+                    .filter(|&&(_, k, len)| (k == 0 && len >= 16) || (k == 2 && len >= 24))
+                    .collect();
+                assert_eq!(n, expected.len(), "case {case}");
+                for (c, &&(at, kind, _)) in cpus[..n].iter().zip(&expected) {
+                    let (id, domain, flags) = if kind == 0 {
+                        let hi = le32(&[s[at + 9], s[at + 10], s[at + 11], 0]) << 8;
+                        (
+                            u32::from(s[at + 3]),
+                            u32::from(s[at + 2]) | hi,
+                            le32(&s[at + 4..]),
+                        )
+                    } else {
+                        (le32(&s[at + 8..]), le32(&s[at + 4..]), le32(&s[at + 12..]))
+                    };
+                    assert_eq!((c.apic_id, c.proximity_domain), (id, domain), "case {case}");
+                    assert_eq!(c.enabled, flags & 1 != 0, "case {case}");
+                }
+            }
+            let mut mems = [MemoryAffinity::default(); 8];
+            if let Ok(n) = srat_memory_affinities(&s, &mut mems) {
+                mems_ok += 1;
+                let expected: Vec<_> = walked
+                    .iter()
+                    .flatten()
+                    .filter(|&&(_, k, _)| k == 1)
+                    .collect();
+                assert_eq!(n, expected.len(), "case {case}");
+                for (m, &&(at, _, len)) in mems[..n].iter().zip(&expected) {
+                    assert!(len >= 40, "case {case}");
+                    assert_eq!(m.proximity_domain, le32(&s[at + 2..]), "case {case}");
+                    assert_eq!(m.base as u32, le32(&s[at + 8..]), "case {case}");
+                    assert_eq!(
+                        m.length >> 32,
+                        u64::from(le32(&s[at + 20..])),
+                        "case {case}"
+                    );
+                }
+            }
+
+            let mut t = base_slit.clone();
+            mutate(&mut t, &mut rng);
+            if case % 3 != 0 {
+                reseal(&mut t);
+            }
+            if let Ok(table) = parse_slit(&t) {
+                slits_ok += 1;
+                let n = table.localities();
+                assert!(44 + n * n <= t.len(), "case {case}: {n} localities");
+                assert_eq!(n as u64, u64::from_le_bytes(t[36..44].try_into().unwrap()));
+                for i in 0..n.min(8) {
+                    for j in 0..n.min(8) {
+                        assert_eq!(table.distance(i, j), Some(t[44 + i * n + j]), "case {case}");
+                    }
+                    assert_eq!(table.distance(i, n), None, "case {case}");
+                    assert_eq!(table.distance(n, i), None, "case {case}");
+                }
+            }
+        }
+        assert!(
+            cpus_ok > 2000 && mems_ok > 2000 && slits_ok > 2000,
+            "{cpus_ok} cpu lists, {mems_ok} memory lists, {slits_ok} matrices"
+        );
     }
 
     #[test]

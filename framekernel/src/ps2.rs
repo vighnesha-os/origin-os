@@ -479,6 +479,58 @@ mod tests {
         );
     }
 
+    /// Any byte stream from the controller decodes: a key event per ordinary byte, the
+    /// E0 prefix consumed, modifiers tracking exactly their own keys, and `to_char` giving
+    /// only a printable character, a newline or a tab, and only for a key press (§72).
+    #[test]
+    fn any_scancode_stream_decodes_consistently() {
+        use crate::testing::{Rng, mutate};
+        let seed: std::vec::Vec<u8> = alloc_sentence();
+        let mut rng = Rng::new(0x5053_325F);
+        let mut events = 0u32;
+        for case in 0..crate::testing::cases(4000) {
+            let mut bytes = seed.clone();
+            mutate(&mut bytes, &mut rng);
+            for _ in 0..rng.below(16) {
+                bytes.push(rng.byte());
+            }
+            let mut d = Decoder::new();
+            let mut m = Modifiers::default();
+            for &b in &bytes {
+                let event = d.feed(b);
+                match b {
+                    0xE0 | 0xE1 => assert!(event.is_none(), "case {case}"),
+                    _ => {
+                        let e = event.expect("every other byte is a key event");
+                        events += 1;
+                        assert_eq!(e.pressed, b & 0x80 == 0, "case {case}");
+                        let before = m;
+                        let was_modifier = m.update(e);
+                        let held_changed =
+                            (before.shift, before.ctrl, before.alt, before.caps_lock)
+                                != (m.shift, m.ctrl, m.alt, m.caps_lock);
+                        assert!(was_modifier || !held_changed, "case {case}: {e:?}");
+                        if !was_modifier && let Some(c) = to_char(e, m) {
+                            assert!(e.pressed && !m.ctrl && !m.alt, "case {case}: {e:?}");
+                            assert!(
+                                c == '\n' || c == '\t' || (' '..='~').contains(&c),
+                                "case {case}: {c:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(events > 5000, "{events}");
+    }
+
+    fn alloc_sentence() -> std::vec::Vec<u8> {
+        [
+            0x2A, 0x18, 0x98, 0xAA, 0x13, 0x93, 0xE0, 0x48, 0xE0, 0xC8, 0x1D, 0x9D, 0x1C,
+        ]
+        .to_vec()
+    }
+
     #[test]
     fn a_full_sentence_round_trips() {
         // Type "Origin OS!" : Shift+o, r, i, g, i, n, space, Shift+o, Shift+s, Shift+1.

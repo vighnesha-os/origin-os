@@ -159,6 +159,65 @@ mod tests {
         assert_eq!(ticks_to_nanos(u64::MAX, u32::MAX), u64::MAX, "saturates");
     }
 
+    /// A mutated table is either refused or read from exactly the bytes the fields name,
+    /// and the counter arithmetic is total over any register value (CLAUDE.md §72).
+    #[test]
+    fn mutated_tables_and_registers_never_panic() {
+        use crate::testing::{Rng, mutate};
+        let base = table(0xFED0_0000, 0);
+        let mut rng = Rng::new(0x4850_4554);
+        let (mut accepted, mut refused) = (0u32, 0u32);
+        for case in 0..crate::testing::cases(10_000) {
+            let mut t = base.clone();
+            mutate(&mut t, &mut rng);
+            // A base address that often stays page-aligned, so acceptance stays common.
+            if case % 2 == 0 && t.len() >= 52 {
+                t[44] = 0;
+                t[45] &= 0xF0;
+                t[40] = 0;
+            }
+            match parse(&t) {
+                Ok(h) => {
+                    accepted += 1;
+                    assert!(t.len() >= MIN_LEN && t[40] == 0, "case {case}");
+                    assert!(h.base != 0 && h.base & 0xFFF == 0, "case {case}");
+                    assert_eq!(h.base.to_le_bytes(), t[44..52], "case {case}");
+                    assert_eq!(h.block_id.to_le_bytes(), t[36..40], "case {case}");
+                }
+                Err(HpetError::Length(n)) => {
+                    assert!(n < MIN_LEN && n == t.len(), "case {case}");
+                    refused += 1;
+                }
+                Err(HpetError::BadAddress) => {
+                    let asid = t[40];
+                    let b = u64::from_le_bytes(t[44..52].try_into().unwrap());
+                    assert!(asid != 0 || b == 0 || b & 0xFFF != 0, "case {case}");
+                    refused += 1;
+                }
+            }
+
+            let cap = rng.edge_u64();
+            assert_eq!(period_fs(cap), (cap >> 32) as u32, "case {case}");
+            match frequency_hz(cap) {
+                Some(hz) => {
+                    let period = u64::from(period_fs(cap));
+                    assert!((1..=100_000_000).contains(&period), "case {case}");
+                    assert_eq!(hz, 1_000_000_000_000_000 / period, "case {case}");
+                    assert!(hz >= 10_000_000, "case {case}");
+                }
+                None => {
+                    let period = period_fs(cap);
+                    assert!(period == 0 || period > 100_000_000, "case {case}");
+                }
+            }
+            let (a, b, ppt) = (rng.edge_u64(), rng.edge_u64(), rng.edge_u64());
+            let period = rng.edge_u32();
+            assert!(ticks_to_nanos(a.min(b), period) <= ticks_to_nanos(a.max(b), period));
+            assert_eq!(agree(a, b, ppt), agree(b, a, ppt), "case {case}");
+        }
+        assert!(accepted > 1000 && refused > 1000, "{accepted}/{refused}");
+    }
+
     #[test]
     fn rate_agreement() {
         assert!(agree(100_000_000, 100_050_000, 1));

@@ -1459,6 +1459,54 @@ mod tests {
         }
     }
 
+    /// Registers and table entries a unit hands back decode without panicking, and an
+    /// entry that decodes survives a re-encode (CLAUDE.md §72; the entries are DMA memory
+    /// the kernel reads back, so the words could be anything).
+    #[test]
+    fn any_register_and_entry_words_decode() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0x5654_4452);
+        let mut accepted = 0u32;
+        for case in 0..crate::testing::cases(20_000) {
+            let v = rng.edge_u64();
+            let c = Capability::decode(v);
+            assert!((1..=64).contains(&c.mgaw), "case {case}: {v:#x}");
+            assert!((1..=256).contains(&c.fault_records), "case {case}: {v:#x}");
+            assert!(c.domain_bits <= 16, "case {case}: {v:#x}");
+            if let Some(levels) = c.table_levels() {
+                assert!(c.supports_levels(levels), "case {case}");
+            }
+            assert!(!c.supports_levels(rng.byte() & !7), "case {case}");
+            let _ = ExtCapability::decode(v);
+            let _ = version(rng.edge_u32());
+            let _ = gcmd(rng.edge_u32(), rng.edge_u32(), rng.edge_u32());
+
+            let e = [v, rng.edge_u64()];
+            if let Some(ctx) = ContextEntry::decode(e) {
+                accepted += 1;
+                assert!((3..=5).contains(&ctx.levels), "case {case}");
+                assert_eq!(ctx.page_table & !ADDRESS, 0, "case {case}");
+                if let Some(again) = ctx.encode() {
+                    assert_eq!(ContextEntry::decode(again), Some(ctx), "case {case}");
+                }
+            }
+            for x2apic in [false, true] {
+                if let Some(i) = Irte::decode(e, x2apic)
+                    && let Some(again) = i.encode(x2apic)
+                {
+                    accepted += 1;
+                    assert_eq!(Irte::decode(again, x2apic), Some(i), "case {case}");
+                }
+            }
+            let m = MsiMessage {
+                address: rng.edge_u64(),
+                data: rng.edge_u32(),
+            };
+            let _ = interrupt_index(m);
+        }
+        assert!(accepted > 1000, "{accepted}");
+    }
+
     #[test]
     fn iova_window_hands_out_pages_once() {
         let mut w = IovaWindow::new(IOVA_BASE, IOVA_BASE + 4 * PAGE);

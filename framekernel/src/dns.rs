@@ -173,7 +173,15 @@ fn decode_rdata(msg: &[u8], rtype: u16, rdstart: usize, rdlen: usize) -> Option<
             a.copy_from_slice(rdata);
             RData::Aaaa(a)
         }
-        rtype::CNAME | rtype::NS | rtype::PTR => RData::Name(read_name(msg, rdstart)?.0),
+        // The name may jump backwards, but its own bytes must lie inside the RDATA: a name
+        // that overruns RDLENGTH reads the next record as if it were this one's.
+        rtype::CNAME | rtype::NS | rtype::PTR => {
+            let (name, end) = read_name(msg, rdstart)?;
+            if end > rdstart + rdlen {
+                return None;
+            }
+            RData::Name(name)
+        }
         _ => RData::Other(rdlen),
     })
 }
@@ -368,6 +376,74 @@ mod tests {
         // Reading the last pointer walks back 50 hops to the root: an empty name.
         let (name, _) = read_name(&m, prev as usize).unwrap();
         assert_eq!(name, "");
+    }
+
+    /// A name that runs past its RDLENGTH must not be read out of the following record.
+    #[test]
+    fn a_name_may_not_overrun_its_rdata() {
+        // A CNAME whose RDLENGTH (2) cuts its name short: the name's labels continue past it.
+        let mut b = Builder::new(1, 0x8180, 0, 1);
+        b.rr_head("a.example", rtype::CNAME, 1, 60, 2);
+        b.name("b.example");
+        assert_eq!(parse(&b.buf), None);
+        // With the true length, the same record parses.
+        let mut b = Builder::new(1, 0x8180, 0, 1);
+        b.cname("a.example", 60, "b.example");
+        assert!(parse(&b.buf).is_some());
+    }
+
+    /// What `parse` returns is consistent with the bytes: names within RFC 1035's bound, a
+    /// count that matches the header, record data the right size (CLAUDE.md §72).
+    #[test]
+    fn mutated_messages_keep_their_invariants() {
+        use crate::testing::{Rng, mutate};
+        let mut b = Builder::new(0x1234, 0x8180, 1, 2);
+        b.question("example.com", rtype::A, 1);
+        b.a("example.com", 300, Ipv4([93, 184, 216, 34]));
+        b.cname("www.example.com", 600, "example.com");
+        let base = b.buf;
+        let mut rng = Rng::new(0x444E_5332);
+        let (mut parsed, mut names) = (0u32, 0u32);
+        for case in 0..crate::testing::cases(20_000) {
+            let mut data = base.clone();
+            mutate(&mut data, &mut rng);
+            if let Some(h) = parse_header(&data) {
+                assert_eq!(h.rcode(), (h.flags & 0xF) as u8, "case {case}");
+                let _ = (h.is_response(), h.recursion_desired());
+            }
+            if let Some(m) = parse(&data) {
+                parsed += 1;
+                assert_eq!(
+                    m.questions.len(),
+                    usize::from(m.header.qdcount),
+                    "case {case}"
+                );
+                let total = usize::from(m.header.ancount)
+                    + usize::from(m.header.nscount)
+                    + usize::from(m.header.arcount);
+                assert_eq!(m.records.len(), total, "case {case}");
+                for q in &m.questions {
+                    assert!(q.name.len() <= MAX_NAME, "case {case}");
+                }
+                for r in &m.records {
+                    assert!(r.name.len() <= MAX_NAME, "case {case}");
+                    match &r.rdata {
+                        RData::Name(n) => assert!(n.len() <= MAX_NAME, "case {case}"),
+                        RData::A(_) => assert_eq!(r.rtype, rtype::A, "case {case}"),
+                        RData::Aaaa(_) => assert_eq!(r.rtype, rtype::AAAA, "case {case}"),
+                        RData::Other(n) => assert!(*n <= data.len(), "case {case}"),
+                    }
+                }
+            }
+            for off in [0usize, 12, data.len() / 2, data.len().saturating_sub(1)] {
+                if let Some((name, next)) = read_name(&data, off) {
+                    names += 1;
+                    assert!(name.len() <= MAX_NAME, "case {case}");
+                    assert!(next <= data.len(), "case {case}");
+                }
+            }
+        }
+        assert!(parsed > 500 && names > 1000, "{parsed}/{names}");
     }
 
     #[test]

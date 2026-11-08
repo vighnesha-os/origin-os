@@ -187,6 +187,73 @@ mod tests {
         assert!(matches!(extract(&junk, &mut vfs), Err(Error::Archive(_))));
     }
 
+    /// Mutated archives extract into a bounded tree or are refused; a name that leaves the
+    /// tree is never applied, and the tree that results has only clean paths (CLAUDE.md §72).
+    #[test]
+    fn mutated_archives_extract_safely_or_not_at_all() {
+        use crate::testing::{Rng, mutate, mutate_window};
+        let base = ustar_archive(&[
+            ("hello.txt", typeflag::REGULAR, b"hi\n"),
+            ("etc/", typeflag::DIRECTORY, b""),
+            ("etc/hostname", typeflag::REGULAR, b"origin\n"),
+            ("usr/bin/tool", typeflag::REGULAR, &alloc::vec![9u8; 900]),
+            ("a/b", typeflag::SYMLINK, b""),
+        ]);
+        let reseal = |h: &mut [u8]| {
+            h[148..156].fill(b' ');
+            let sum: u32 = h[..BLOCK].iter().map(|&b| u32::from(b)).sum();
+            let chk = alloc::format!("{sum:06o}\0 ");
+            h[148..156].copy_from_slice(chk.as_bytes());
+        };
+        let mut rng = Rng::new(0x4E46_5352);
+        let (mut extracted, mut refused) = (0u32, 0u32);
+        for case in 0..crate::testing::cases(6000) {
+            let mut data = base.clone();
+            if case % 2 == 0 {
+                mutate(&mut data, &mut rng);
+            } else {
+                // A mutated name, re-sealed so the name is what extraction must judge.
+                let header = BLOCK * rng.below(4).min(3);
+                if header + BLOCK <= data.len() {
+                    mutate_window(&mut data, header..header + 100, &mut rng);
+                    reseal(&mut data[header..header + BLOCK]);
+                }
+            }
+            let mut vfs = Vfs::new(4096, 64);
+            let archive = ustar::parse(&data);
+            match extract(&data, &mut vfs) {
+                Ok(n) => {
+                    extracted += 1;
+                    let entries = archive.unwrap();
+                    assert!(n <= entries.len(), "case {case}");
+                    // Everything applied has a clean path under the root.
+                    for e in entries.iter().filter(|e| e.is_file() || e.is_dir()) {
+                        let name = e.name.trim_end_matches('/');
+                        if name.is_empty() {
+                            continue;
+                        }
+                        assert!(!name.starts_with('/'), "case {case}: {name:?}");
+                        assert!(
+                            name.split('/')
+                                .all(|c| !c.is_empty() && c != "." && c != ".."),
+                            "case {case}: {name:?}"
+                        );
+                        assert!(
+                            vfs.resolve(&alloc::format!("/{name}")).is_ok(),
+                            "case {case}"
+                        );
+                    }
+                }
+                Err(Error::UnsafePath) => {
+                    refused += 1;
+                    assert!(archive.is_ok(), "case {case}");
+                }
+                Err(_) => refused += 1,
+            }
+        }
+        assert!(extracted > 1000 && refused > 1000, "{extracted}/{refused}");
+    }
+
     #[test]
     fn a_duplicate_entry_is_overwritten_not_appended() {
         let archive = ustar_archive(&[

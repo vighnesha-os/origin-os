@@ -97,6 +97,12 @@ pub(crate) fn on_interrupt() {
     }
 }
 
+/// The bytes of the common configuration structure this driver uses: through the 64-bit
+/// device-area address at 30h.
+const COMMON_CONFIG_LEN: u32 = 56;
+/// The bytes of the device configuration it reads: the MAC and the status word.
+const DEVICE_CONFIG_LEN: u32 = 8;
+
 // Common-configuration register offsets (virtio 1.1 §4.1.4.3).
 mod reg {
     pub(super) const DEVICE_FEATURE_SELECT: u64 = 0;
@@ -242,26 +248,34 @@ static RX_LEASE: AtomicU64 = AtomicU64::new(0);
 /// How often the receive thread blocked waiting for a frame.
 static RX_BLOCKED: AtomicU64 = AtomicU64::new(0);
 
-/// Maps the BAR holding capability `loc` and returns the virtual address of its structure.
-fn map_structure(dev: &crate::pcie::Device, loc: virtio::CfgLocation) -> Option<u64> {
-    let bar = dev.bars.get(loc.bar as usize)?.as_ref()?;
+/// Maps the BAR holding capability `loc` and returns the virtual address of its structure,
+/// which must lie inside that memory BAR and be at least `min` bytes long: the offset and
+/// length are the device's, and the driver reads and writes through this address.
+fn map_structure(dev: &crate::pcie::Device, loc: virtio::CfgLocation, min: u32) -> Option<u64> {
+    let bar = dev.bars.get(usize::from(loc.bar))?.as_ref()?;
+    let address = loc.address_in(bar, min)?;
     let base = crate::vm::map_mmio(bar.address, bar.size).ok()?;
-    Some(base + u64::from(loc.offset))
+    Some(base + (address - bar.address))
 }
 
 /// Sets up queue `q`: a smaller-of device size and 256 ring in three DMA pages (from `dma`),
 /// with their bus addresses programmed, its MSI-X `vector` assigned (`NO_VECTOR` for none), and
 /// the queue enabled. MSI-X must already be enabled on the function for a real vector to
-/// take.
-fn setup_queue(common: u64, q: u16, vector: u16, dma: DeviceDma) -> Option<Queue> {
+/// take. `None` if the device offers no queue, one whose size is not a power of two, or a
+/// notification register outside its notification structure `notify`.
+fn setup_queue(
+    common: u64,
+    q: u16,
+    vector: u16,
+    dma: DeviceDma,
+    notify: virtio::CfgLocation,
+    mul: u32,
+) -> Option<Queue> {
     w16(common + reg::QUEUE_SELECT, q);
-    let dev_size = r16(common + reg::QUEUE_SIZE);
-    if dev_size == 0 {
-        return None; // queue not available
-    }
-    let size = dev_size.min(256) as usize;
+    let size = virtqueue::queue_size(r16(common + reg::QUEUE_SIZE), 256)?;
     w16(common + reg::QUEUE_SIZE, size as u16);
     let notify_off = r16(common + reg::QUEUE_NOTIFY_OFF);
+    notify.notify_offset(notify_off, mul)?;
     let (d, a, u) = (dma.page()?, dma.page()?, dma.page()?);
     let (dv, dp) = (d.virt, d.bus);
     let (av, ap) = (a.virt, a.bus);
@@ -295,11 +309,10 @@ fn enable_msix_table(dev: &crate::pcie::Device, target: u32) -> bool {
         return false;
     };
     let table_len = u64::from(msix.entries) * pci::MSIX_ENTRY;
-    if u64::from(msix.table_offset) + table_len > bar.size {
+    let Some(table_address) = msix.table_address(&bar) else {
         return false;
-    }
-    let Ok(table) = crate::vm::map_mmio(bar.address + u64::from(msix.table_offset), table_len)
-    else {
+    };
+    let Ok(table) = crate::vm::map_mmio(table_address, table_len) else {
         return false;
     };
     let at = dev.function.at;
@@ -352,6 +365,10 @@ const RX_BUF: usize = 2048;
 /// Posts [`N_RX`] device-writable receive buffers on the RX queue (descriptor `i` → buffer
 /// `i`), returning their virtual addresses, then notifies the device.
 fn post_rx(rx: &Queue, notify_base: u64, mul: u32, dma: DeviceDma) -> Option<[u64; N_RX]> {
+    // The queue's size is the device's: a shorter ring has no descriptor `i` for every buffer.
+    if rx.size < N_RX {
+        return None;
+    }
     let mut pages = [0u64; N_RX];
     let desc = page(rx.desc, virtqueue::desc_bytes(rx.size));
     let avail = page(rx.avail, virtqueue::avail_bytes(rx.size));
@@ -1224,7 +1241,18 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
     // Enable memory-space decoding and bus mastering for DMA.
     crate::pcie::enable(at, (1 << 1) | (1 << 2));
 
-    let caps = virtio::find_caps(|off| crate::pcie::read_config32(at, off).unwrap_or(0));
+    // Only structures in a memory BAR and inside it: this driver has no port I/O paths, and
+    // a device may list an I/O-BAR instance first (virtio 1.1 §4.1.4.1).
+    let bars = dev.bars;
+    let caps = virtio::find_caps(
+        |off| crate::pcie::read_config32(at, off).unwrap_or(0),
+        |loc| {
+            bars.get(usize::from(loc.bar))
+                .copied()
+                .flatten()
+                .is_some_and(|bar| loc.address_in(&bar, 1).is_some())
+        },
+    );
     let (Some(common_loc), Some(notify_loc), Some(dev_loc)) =
         (caps.common, caps.notify, caps.device)
     else {
@@ -1235,9 +1263,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
         return;
     };
     let (Some(common), Some(notify_base), Some(devcfg)) = (
-        map_structure(&dev, common_loc),
-        map_structure(&dev, notify_loc),
-        map_structure(&dev, dev_loc),
+        map_structure(&dev, common_loc, COMMON_CONFIG_LEN),
+        map_structure(&dev, notify_loc, 2),
+        map_structure(&dev, dev_loc, DEVICE_CONFIG_LEN),
     ) else {
         let _ = writeln!(
             com1,
@@ -1302,8 +1330,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
         .apic_id()
         .is_some_and(|apic_id| enable_msix_table(&dev, apic_id));
     w16(common + reg::CONFIG_MSIX_VECTOR, NO_VECTOR);
-    let rx = setup_queue(common, Q_RX, RX_MSIX_ENTRY, dma);
-    let tx = setup_queue(common, Q_TX, TX_MSIX_ENTRY, dma);
+    let mul = caps.notify_off_multiplier;
+    let rx = setup_queue(common, Q_RX, RX_MSIX_ENTRY, dma, notify_loc, mul);
+    let tx = setup_queue(common, Q_TX, TX_MSIX_ENTRY, dma, notify_loc, mul);
     let queues_ok = rx.is_some() && tx.is_some();
     // Confirm each queue kept its vector (NO_VECTOR back means none was available).
     w16(common + reg::QUEUE_SELECT, Q_RX);
@@ -1329,7 +1358,6 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
     // here, so the reply's interrupt is what wakes the sleeping thread. It then obtains a DHCP
     // lease itself. The boot flow waits for it, bounded, so a NIC whose interrupt never wakes
     // the thread fails here instead of hanging.
-    let mul = caps.notify_off_multiplier;
     let (mut spawned, mut arp_sent) = (false, false);
     if let (Some(rxq), Some(txq)) = (rx, tx)
         && let Some(ring) = TxRing::new(txq, notify_base, mul, dma)

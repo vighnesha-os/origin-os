@@ -586,6 +586,10 @@ fn bind(
     else {
         return Err("namespace 1 is not usable");
     };
+    if !namespace.block_fits_page(PAGE) {
+        // A longer block needs a PRP list per block, and PRP1 alone would overrun the page.
+        return Err("namespace 1's blocks are larger than a page");
+    }
     let _ = writeln!(
         com1,
         "origin-kernel: NVMe: namespace {NSID}: {} blocks of {} B ({} MiB)",
@@ -596,6 +600,9 @@ fn bind(
     // Before any I/O queue exists: queue pairs 1 (polled), 2 (one interrupt) and one per
     // processor.
     let wanted = u16::try_from(2 + cpus).map_err(|_| "too many processors")?;
+    if !nvme::doorbells_fit(wanted, c.cap.doorbell_stride, bar.size) {
+        return Err("the doorbells of the I/O queues lie outside BAR 0");
+    }
     let granted = c
         .run(Q::Admin, |cid| {
             Command::set_number_of_queues(cid, wanted, wanted)
@@ -655,14 +662,13 @@ fn setup_interrupts(d: &mut Driver, target: u32) -> Result<pci::Msix, &'static s
         .flatten()
         .ok_or("the MSI-X table's BAR is not implemented")?;
     let table_len = u64::from(msix.entries) * pci::MSIX_ENTRY;
-    if u64::from(msix.table_offset) + table_len > bar.size {
-        return Err("the MSI-X table lies outside its BAR");
-    }
+    let table_address = msix
+        .table_address(&bar)
+        .ok_or("the MSI-X table lies outside its memory BAR")?;
     let table = if msix.table_bar == 0 {
         d.nvme.regs + u64::from(msix.table_offset)
     } else {
-        crate::vm::map_mmio(bar.address + u64::from(msix.table_offset), table_len)
-            .map_err(|_| "cannot map the MSI-X table")?
+        crate::vm::map_mmio(table_address, table_len).map_err(|_| "cannot map the MSI-X table")?
     };
     let message = crate::iommu::msi_message(d.dev.function.at, target, crate::cpu::DEVICE_VECTOR)?;
     let entry = |i: u64, word: u64, value: u32| {

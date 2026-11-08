@@ -10,13 +10,14 @@
 /// complemented. A trailing odd byte is padded with zero. Summing a block that already
 /// carries its correct checksum yields 0.
 pub fn checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
+    // A `u64` sum cannot overflow for any slice: it would take 2^48 words.
+    let mut sum: u64 = 0;
     let (pairs, remainder) = data.as_chunks::<2>();
     for pair in pairs {
-        sum += u32::from(u16::from_be_bytes(*pair));
+        sum += u64::from(u16::from_be_bytes(*pair));
     }
     if let [last] = remainder {
-        sum += u32::from(u16::from_be_bytes([*last, 0]));
+        sum += u64::from(u16::from_be_bytes([*last, 0]));
     }
     // Fold the carries in, twice (the first fold can itself carry).
     while sum >> 16 != 0 {
@@ -28,13 +29,13 @@ pub fn checksum(data: &[u8]) -> u16 {
 /// A checksum computed over several slices in sequence (a header and its payload, say),
 /// without copying them together. Equivalent to the checksum of their concatenation.
 pub fn checksum_parts(parts: &[&[u8]]) -> u16 {
-    let mut sum: u32 = 0;
+    let mut sum: u64 = 0;
     let mut carry_byte: Option<u8> = None;
     for part in parts {
         let mut data = *part;
         if let Some(high) = carry_byte.take() {
             if let Some((&low, rest)) = data.split_first() {
-                sum += u32::from(u16::from_be_bytes([high, low]));
+                sum += u64::from(u16::from_be_bytes([high, low]));
                 data = rest;
             } else {
                 carry_byte = Some(high);
@@ -43,14 +44,14 @@ pub fn checksum_parts(parts: &[&[u8]]) -> u16 {
         }
         let (pairs, remainder) = data.as_chunks::<2>();
         for pair in pairs {
-            sum += u32::from(u16::from_be_bytes(*pair));
+            sum += u64::from(u16::from_be_bytes(*pair));
         }
         if let [last] = remainder {
             carry_byte = Some(*last);
         }
     }
     if let Some(high) = carry_byte {
-        sum += u32::from(u16::from_be_bytes([high, 0]));
+        sum += u64::from(u16::from_be_bytes([high, 0]));
     }
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
@@ -581,6 +582,141 @@ mod tests {
         assert!(
             ips > 0 && udps > 0,
             "{ips} ipv4, {udps} udp accepted across the run"
+        );
+    }
+
+    /// The checksum sums more words than a `u32` holds without overflow: a frame the size of
+    /// a 64 KiB jumbo plus a bit is a valid slice to hand it (CLAUDE.md §72).
+    #[test]
+    fn the_checksum_sums_a_very_long_buffer() {
+        // 65 538 words of FFFFh sum past 2^32; the result is all ones complemented.
+        let data = alloc::vec![0xFFu8; 131_076];
+        assert_eq!(checksum(&data), 0);
+        assert_eq!(checksum_parts(&[&data[..7], &data[7..]]), 0);
+    }
+
+    /// Each packet parser, on mutated input with its checksum repaired so the checks behind
+    /// it are reached: what passes has fields from the right bytes, a payload inside the
+    /// buffer, and round-trips through its writer (CLAUDE.md §72).
+    #[test]
+    fn repaired_mutations_round_trip_through_their_writers() {
+        use crate::testing::{Rng, mutate};
+        let (a, b) = (Ipv4([10, 0, 0, 1]), Ipv4([10, 0, 0, 2]));
+        let mut rng = Rng::new(0x4E45_5432);
+        let (mut ips, mut udps, mut icmps, mut arps, mut frames) = (0u32, 0u32, 0u32, 0u32, 0u32);
+        for case in 0..crate::testing::cases(10_000) {
+            // IPv4: a mutated header with its checksum repaired.
+            let mut buf = [0u8; 96];
+            let n = Ipv4Packet::write(a, b, protocol::UDP, 64, 1, &[0xAB; 40], &mut buf).unwrap();
+            let mut v = buf[..n].to_vec();
+            mutate(&mut v, &mut rng);
+            if v.len() >= IPV4_HEADER {
+                v[10] = 0;
+                v[11] = 0;
+                let c = checksum(&v[..IPV4_HEADER]);
+                v[10..12].copy_from_slice(&c.to_be_bytes());
+            }
+            if let Some(p) = Ipv4Packet::parse(&v) {
+                ips += 1;
+                let total = u16::from_be_bytes([v[2], v[3]]) as usize;
+                assert_eq!(p.payload, &v[IPV4_HEADER..total], "case {case}");
+                assert_eq!(v[0], 0x45, "case {case}");
+                let mut back = [0u8; 2048];
+                let m = Ipv4Packet::write(p.src, p.dst, p.protocol, p.ttl, 0, p.payload, &mut back)
+                    .unwrap();
+                let again = Ipv4Packet::parse(&back[..m]).unwrap();
+                assert_eq!(
+                    (again.src, again.dst, again.protocol),
+                    (p.src, p.dst, p.protocol)
+                );
+                assert_eq!(again.payload, p.payload, "case {case}");
+            }
+
+            // UDP and ICMP with their checksums repaired.
+            let mut udp = [0u8; 64];
+            let n = Udp::write(a, b, 7, 9, &[0x55; 30], &mut udp).unwrap();
+            let mut v = udp[..n].to_vec();
+            mutate(&mut v, &mut rng);
+            if v.len() >= UDP_HEADER {
+                v[6] = 0;
+                v[7] = 0;
+                let len = u16::from_be_bytes([v[4], v[5]]) as usize;
+                if (UDP_HEADER..=v.len()).contains(&len) {
+                    let c = udp_checksum(a, b, &v[..len]);
+                    v[6..8].copy_from_slice(&c.to_be_bytes());
+                }
+            }
+            if let Some(d) = Udp::parse(&v, a, b) {
+                udps += 1;
+                let len = u16::from_be_bytes([v[4], v[5]]) as usize;
+                assert_eq!(d.payload, &v[UDP_HEADER..len], "case {case}");
+                let mut back = [0u8; 2048];
+                let m = Udp::write(a, b, d.src_port, d.dst_port, d.payload, &mut back).unwrap();
+                let again = Udp::parse(&back[..m], a, b).unwrap();
+                assert_eq!(again, d, "case {case}");
+            }
+
+            let mut icmp = [0u8; 64];
+            let n = IcmpEcho::write(icmp_type::ECHO_REPLY, 5, 6, b"data", &mut icmp).unwrap();
+            let mut v = icmp[..n].to_vec();
+            mutate(&mut v, &mut rng);
+            if v.len() >= ICMP_HEADER {
+                v[2] = 0;
+                v[3] = 0;
+                let c = checksum(&v);
+                v[2..4].copy_from_slice(&c.to_be_bytes());
+            }
+            if let Some(e) = IcmpEcho::parse(&v) {
+                icmps += 1;
+                assert_eq!(e.data, &v[ICMP_HEADER..], "case {case}");
+                let mut back = [0u8; 2048];
+                let m =
+                    IcmpEcho::write(e.kind, e.identifier, e.sequence, e.data, &mut back).unwrap();
+                assert_eq!(IcmpEcho::parse(&back[..m]), Some(e), "case {case}");
+            }
+
+            let mut arp = [0u8; 28];
+            Arp {
+                operation: arp_op::REPLY,
+                sender_mac: Mac([1, 2, 3, 4, 5, 6]),
+                sender_ip: a,
+                target_mac: Mac([7; 6]),
+                target_ip: b,
+            }
+            .write(&mut arp)
+            .unwrap();
+            let mut v = arp.to_vec();
+            mutate(&mut v, &mut rng);
+            if let Some(p) = Arp::parse(&v) {
+                arps += 1;
+                let mut back = [0u8; 28];
+                p.write(&mut back).unwrap();
+                assert_eq!(back[..28], v[..28], "case {case}");
+                let reply = p.reply(Mac([9; 6]));
+                assert_eq!(
+                    (reply.sender_ip, reply.target_ip),
+                    (p.target_ip, p.sender_ip)
+                );
+            }
+
+            let mut f = [0u8; 80];
+            let mut mac = [0u8; 6];
+            for byte in &mut mac {
+                *byte = rng.byte();
+            }
+            let ethertype = rng.next() as u16;
+            let _ = EthFrame::write_header(Mac(mac), Mac(mac), ethertype, &mut f).unwrap();
+            let len = rng.below(f.len() + 1);
+            if let Some(e) = EthFrame::parse(&f[..len]) {
+                frames += 1;
+                assert_eq!(e.ethertype, ethertype, "case {case}");
+                assert_eq!(e.payload.len(), len - ETH_HEADER, "case {case}");
+                assert_eq!(e.dst, Mac(mac), "case {case}");
+            }
+        }
+        assert!(
+            ips > 1000 && udps > 1000 && icmps > 1000 && arps > 1000 && frames > 1000,
+            "{ips} ip, {udps} udp, {icmps} icmp, {arps} arp, {frames} frames"
         );
     }
 
