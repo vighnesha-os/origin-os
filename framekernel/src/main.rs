@@ -262,11 +262,13 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         // compatibility-format I/O APIC proof above, which interrupt remapping would block.
         if quiesced.is_some() {
             iommu::init(&mut com1, info.acpi_rsdp);
-            let _ = writeln!(
-                com1,
-                "origin-kernel: IOMMU: translating {} ms after kernel entry",
-                time::monotonic_nanos() / 1_000_000
-            );
+            if iommu::translating() {
+                let _ = writeln!(
+                    com1,
+                    "origin-kernel: IOMMU: translating {} ms after kernel entry",
+                    time::monotonic_nanos() / 1_000_000
+                );
+            }
         }
         let online = smp::start(&mut com1, &info, regions, tsc_hz);
         // M2 completion: once every enabled processor has left firmware code, the loader's
