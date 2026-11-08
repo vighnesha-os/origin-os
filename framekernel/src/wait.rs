@@ -15,12 +15,16 @@
 //! a wait queue's lock while it takes another one.
 //!
 //! The user-visible waiting of ADR-0005 P9 (`ipc::wait_one`) is built on these queues.
+//!
+//! The protocol itself is `origin_sync::wait`, generic over the scheduler so the Loom models
+//! run it (`cargo xtask loom`); this module instantiates it for kernel threads.
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use framekernel::runqueue::{RoundTrips, judge_round_trips, per_mille};
 use origin_sync::SpinLock;
+use origin_sync::wait::{self, TimedOut};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, rdtsc};
@@ -29,58 +33,54 @@ use crate::sched::{self, ThreadRef};
 /// Threads one queue can hold. A thread that finds it full polls by yielding instead.
 const WAITERS: usize = 16;
 
-/// Threads waiting for one condition.
-pub(crate) struct WaitQueue {
-    waiters: SpinLock<[Option<ThreadRef>; WAITERS]>,
+/// The kernel's scheduler and clock, as a wait queue sees them.
+struct KernelThreads;
+
+impl wait::Scheduler for KernelThreads {
+    type Thread = ThreadRef;
+
+    fn current_thread(&self) -> Option<ThreadRef> {
+        sched::current_thread()
+    }
+
+    fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R {
+        cpu::without_interrupts(f)
+    }
+
+    fn block(&self) {
+        sched::block();
+    }
+
+    fn block_until(&self, deadline: u64) {
+        sched::block_until(deadline);
+    }
+
+    fn yield_now(&self) {
+        sched::yield_now();
+    }
+
+    fn wake(&self, thread: ThreadRef) {
+        sched::wake(thread);
+    }
+
+    fn monotonic_nanos(&self) -> u64 {
+        crate::time::monotonic_nanos()
+    }
 }
+
+/// Threads waiting for one condition.
+pub(crate) struct WaitQueue(wait::WaitQueue<ThreadRef, WAITERS>);
 
 impl WaitQueue {
     pub(crate) const fn new() -> Self {
-        Self {
-            waiters: SpinLock::new([None; WAITERS]),
-        }
+        Self(wait::WaitQueue::new())
     }
 
     /// Returns once `condition()` holds, blocking the running kernel thread meanwhile.
     /// `condition` runs under this queue's lock, with interrupts disabled. Returns how often
     /// the thread blocked. The boot or idle flow, which cannot block, polls by yielding.
     pub(crate) fn wait_until(&self, condition: impl Fn() -> bool) -> u64 {
-        let me = sched::current_thread();
-        let mut blocked = 0;
-        loop {
-            let registered = cpu::without_interrupts(|| {
-                let mut waiters = self.waiters.lock();
-                if condition() {
-                    // Leave no registration behind (a wake-up that raced with the
-                    // condition becoming true is harmless: the next block consumes it).
-                    if let Some(slot) = waiters.iter_mut().find(|w| **w == me && me.is_some()) {
-                        *slot = None;
-                    }
-                    return None;
-                }
-                let Some(thread) = me else {
-                    return Some(false);
-                };
-                if waiters.contains(&Some(thread)) {
-                    return Some(true);
-                }
-                match waiters.iter_mut().find(|w| w.is_none()) {
-                    Some(free) => {
-                        *free = Some(thread);
-                        Some(true)
-                    }
-                    None => Some(false),
-                }
-            });
-            match registered {
-                None => return blocked,
-                Some(true) => {
-                    sched::block();
-                    blocked += 1;
-                }
-                Some(false) => sched::yield_now(),
-            }
-        }
+        self.0.wait_until(&KernelThreads, condition)
     }
 
     /// As [`WaitQueue::wait_until`], but gives up when the monotonic clock reaches
@@ -91,79 +91,25 @@ impl WaitQueue {
         condition: impl Fn() -> bool,
         deadline: u64,
     ) -> Result<u64, TimedOut> {
-        let me = sched::current_thread();
-        let mut blocked = 0;
-        loop {
-            let step = cpu::without_interrupts(|| {
-                let mut waiters = self.waiters.lock();
-                let done = condition();
-                if done || crate::time::monotonic_nanos() >= deadline {
-                    if let Some(slot) = waiters.iter_mut().find(|w| **w == me && me.is_some()) {
-                        *slot = None;
-                    }
-                    return Step::Finished(done);
-                }
-                let Some(thread) = me else {
-                    return Step::Poll;
-                };
-                if waiters.contains(&Some(thread)) {
-                    return Step::Block;
-                }
-                match waiters.iter_mut().find(|w| w.is_none()) {
-                    Some(free) => {
-                        *free = Some(thread);
-                        Step::Block
-                    }
-                    None => Step::Poll,
-                }
-            });
-            match step {
-                Step::Finished(true) => return Ok(blocked),
-                Step::Finished(false) => return Err(TimedOut),
-                Step::Block => {
-                    sched::block_until(deadline);
-                    blocked += 1;
-                }
-                Step::Poll => sched::yield_now(),
-            }
-        }
+        self.0
+            .wait_until_deadline(&KernelThreads, condition, deadline)
     }
 
     /// Wakes one waiter, if there is one; returns whether there was.
     pub(crate) fn wake_one(&self) -> bool {
-        let thread =
-            cpu::without_interrupts(|| self.waiters.lock().iter_mut().find_map(Option::take));
-        if let Some(t) = thread {
-            sched::wake(t);
-        }
-        thread.is_some()
+        self.0.wake_one(&KernelThreads)
     }
 
     /// Wakes every waiter (each re-checks its own condition) and returns how many of them
     /// were blocked on another processor, and so took an IPI to wake.
     pub(crate) fn wake_all(&self) -> usize {
-        let waiting = cpu::without_interrupts(|| {
-            let mut waiters = self.waiters.lock();
-            core::mem::replace(&mut *waiters, [None; WAITERS])
-        });
-        waiting
+        self.0
+            .take_all(&KernelThreads)
             .into_iter()
             .flatten()
             .filter(|&thread| sched::wake(thread))
             .count()
     }
-}
-
-/// A timed wait whose deadline passed with its condition still false.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TimedOut;
-
-/// What one round of a timed wait decided.
-enum Step {
-    /// The condition held (`true`), or the deadline passed (`false`).
-    Finished(bool),
-    Block,
-    Poll,
 }
 
 /// The ring the producer fills and the consumer drains.

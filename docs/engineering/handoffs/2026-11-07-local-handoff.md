@@ -1416,3 +1416,27 @@ Gates on the final tree: `cargo xtask check` (698 tests, 0 failures, 6 ignored),
 #### Next
 
 - TASKS item 5: the start record, memory objects, the Loader Service, `.ose` loading; PCIDs.
+
+
+### Continued (2026-11-08, afternoon IST): Loom models of `SpinLock`, `RwLock` and the wait-queue protocol (TASKS item 8)
+
+On `claude/unruffled-morse-eade76`, based on `claude/interesting-carson-ae7c83` at `b3efe8a`, **not pushed**.
+
+- **`loom` 0.7.2** is a `[target.'cfg(loom)'.dev-dependencies]` entry of `origin-sync`, after the owner approved its exact version, licences, transitive crates and sizes (`SOURCE_PROVENANCE.md`, "Loom models"; owner decision 20). `cargo xtask check` now fails if a shipping crate gains a third-party dependency, or if `Cargo.lock` holds one that is not on `APPROVED_THIRD_PARTY` at its approved version: **changing that list is a new approval**.
+- **The wait-queue protocol moved**, unchanged, from `framekernel/src/wait.rs` to `origin_sync::wait` (`framekernel/sync/src/wait.rs`): `WaitQueue<T, N>` over a `Scheduler` trait. The kernel keeps a `WaitQueue` type that forwards to it, and all its boot proofs.
+- **`cargo xtask loom`** (part of `check`) runs 18 models of the real code, `SpinLock`, `RwLock`, `wait` and the real `RunQueue`, then 22 negative controls, each applied to a scratch copy of the source (`developer-tools/xtask/src/loom.rs`). Every model has at least one control.
+- **Read `framekernel/sync/src/models.rs` before trusting these models:** its header says what is proved and what is not (the bounds, interrupts, the context switch, fairness, the machine). The bounds per model and the deep results are in `SOURCE_PROVENANCE.md`.
+- **A spin bound had to be added** (`prim::spin_loop`, models only): with two threads spinning on one lock, Loom's search is unbounded whatever the preemption bound, and past a bound it now runs each execution to its end without branching. Raising the bound from 4 to 8 changes nothing for the two-thread SpinLock and waker/waiter models.
+- **Don't take the newest `origin_sync-*` binary from `target/loom/release/deps` for an experiment.** The controls' binaries are there too. One of them made a "deadlock" that took a while to tell apart from a real one.
+
+#### Evidence (Rust 1.99.1 stable; commits `9efadd2`, `d60af7c`, `48cd052`, and the commits that add the `RwLock` and timed boot-flow models)
+
+- `cargo xtask check`: passes; 26 test binaries, 702 passed, 0 failed, 6 ignored (the download-gated crypto vectors). The no-panic check and the new dependency check hold for the shipping crates.
+- `cargo xtask loom`: 18 models pass (530,152 executions), all 22 negative controls caught (29 model runs). `ORIGIN_LOOM_DEEP=1 cargo xtask loom`: 18 models pass over 26,174,404 executions in about 20 minutes.
+- `cargo xtask boot-matrix` passes on this code (VT-d and AMD-Vi at 1, 2 and 4 CPUs, then the sparse machine under leaves 1Fh and 0Bh), with the wait-queue boot proofs unchanged, and with them the default `boot-test` configuration. Boots during another session's CPU stress test (load average above 100) failed at the `clock` proof, before any wait-queue code runs; these passing runs came on a quiet machine. That is the RTC flake recorded above, and the `musing-hamilton` worktree has uncommitted edits to `framekernel/src/time.rs`.
+- Security review: no change to any privileged interface. `loom` and its crates are host-only and enforced out of the shipping crates by `cargo xtask check`.
+
+#### Next
+
+- A timed waiter that finds its queue full, the one path not modelled; Kani bounds (TASKS item 8).
+- M4's `wake_all` will conflict with the moved protocol; a note for that session is in the shared notes folder.

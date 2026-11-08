@@ -67,7 +67,7 @@
 5. **M4:** ADR-0005 is accepted. Done on 2026-11-08 (first slice, merged 2026-11-09): process objects, the kernel's system-call layer with copies against the calling process's tables, `wait_one`, and handles and channels through them; see the Done table. **Next:** the start record (P6), memory objects (P7), the Loader Service and `.ose` loading; PCIDs (ADR-0004 H5); events, ports and timers (P3, P9); termination through a `manage` handle and the crash record (P10, P11); memory and thread quotas (P11). ADR-0005 Amendment 1, accepted on 2026-11-08, covers what this slice needed and the ADR did not say.
 6. **Signature block (ONBF §7.1):** host signing in original Rust (`onbf-sign`), the loader requiring a signed KRN outside developer mode, and a compiled-in trust store with a test key — **done 2026-11-08** (`docs/research/2026-11-08-krn-signature-verification.md`; errata V1–V6 and O2–O5 decided by the owner). A loader built without `test-trust-store` trusts nothing and refuses every kernel, until Origin has its own keys. Remaining: OKC chains (O3 makes them wait for the SYS profile's signed time), Origin's real root and kernel keys and the signing ceremony (HSM, §60), and B7's Secure Boot first stage. Anti-rollback and TPM measurement (§7.6, §8.1) stay with the SYS profile.
 7. **Block layer and filesystem (§39–§41):** one I/O queue per CPU, a block cache, then a filesystem ADR.
-8. **Formal and concurrency checks:** Loom models for `SpinLock` and the wait-queue protocol; Kani bounds for `paging`, `frames`, `heap` (§73).
+8. **Formal and concurrency checks:** Loom models for `SpinLock`, `RwLock` and the wait-queue protocol (§73) — **done 2026-11-08** (`cargo xtask loom`, part of `check`): the real locks, the real wait-queue protocol and the real run queue, 18 models and 22 negative controls, the protocol moved out of the kernel binary into `origin_sync::wait` so it can run under Loom. What each model proves, what it leaves unproved and the approved crates are in `SOURCE_PROVENANCE.md`, "Loom models". Remaining: Kani bounds for `paging`, `frames`, `heap`.
 9. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks; **M1 follow-ups** (A/B deployment, boot-attempt recording, CI).
 
 ## Waiting on the owner
@@ -76,6 +76,5 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 
 | # | Decision | Blocks |
 |---|---|---|
-| — | The `loom` crate (host-only dev-dependency, §5), **approved 2026-11-08**, not fetched yet; its source and size are confirmed when the work that uses it starts. (The ACVP, errata and Wycheproof downloads of the same approval were fetched on 2026-11-08, file by file; see `SOURCE_PROVENANCE.md`.) | Concurrency models (§73) |
 | — | Buy the first test machines ADR-0009 chose: #2, then #5 once its serial option is confirmed (H5) | The first physical boot (§74) |
 | — | Review and merge PR #1 and the pull request stacked on it into `main` | Landing the work |
