@@ -6,10 +6,12 @@
 //! `forbid(unsafe_code)`.
 //!
 //! `cargo xtask loom` builds this crate's own tests with `--cfg loom`, which swaps what
-//! `prim` exports for Loom's checked atomics and cell. The Loom models (`models.rs`) therefore
-//! run the code below, with the orderings written below, and no copy of it. What they prove and
-//! what they leave unproved is stated at the top of `models.rs`. Nothing but those tests sees
-//! Loom: it is a dev-dependency, active only under `--cfg loom`.
+//! `prim` exports for Loom's checked atomics and cell, in a scratch workspace holding a verbatim
+//! copy of this source. The Loom models (`models.rs`) therefore run the code below, with the
+//! orderings written below. What they prove and what they leave unproved is stated at the top
+//! of `models.rs`. Nothing but those tests sees Loom: that scratch workspace alone depends on
+//! it, and every `cfg` here that names `loom` also requires `test`, so `--cfg loom` cannot
+//! change a build of the kernel.
 //!
 //! [`SpinLock`]: Acquire on lock and Release on unlock make every write done under the lock
 //! visible to the next holder. The lock does not disable interrupts, so **no interrupt
@@ -77,8 +79,9 @@ mod prim {
     pub(crate) use loom::sync::atomic::{AtomicBool, AtomicUsize};
 
     std::thread_local! {
-        /// How many spin iterations each thread of the running model explores (`models.rs`
-        /// sets it; a model runs on one host thread).
+        /// How many spin iterations one thread of the running model may make before its
+        /// execution stops being explored (`models.rs` sets it; a model runs on one host
+        /// thread).
         pub(crate) static SPIN_BOUND: Cell<u32> = const { Cell::new(u32::MAX) };
     }
 
@@ -88,12 +91,14 @@ mod prim {
     }
 
     /// `core::hint::spin_loop` in a model: yields, so that the spinner cannot starve the
-    /// holder, and stops branching once this thread has spun [`SPIN_BOUND`] times.
+    /// holder. Once this thread has spun more than [`SPIN_BOUND`] times, `skip_branch` stops the
+    /// exploration of its execution: of the whole execution, all its threads included, not of
+    /// this thread alone.
     ///
     /// Two threads spinning on one lock can take turns for ever, and each turn is a new
     /// execution to Loom, whatever the preemption bound. A spin changes nothing, so a turn
     /// past what the lock's own changes need adds no behaviour (`models.rs` says how the bound
-    /// was chosen). The execution still runs to its end, with its checks.
+    /// was chosen). The execution still runs to its end, with its checks, along one schedule.
     pub(crate) fn spin_loop() {
         let spins = SPINS.with(|spins| {
             spins.set(spins.get().saturating_add(1));

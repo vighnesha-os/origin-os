@@ -65,7 +65,8 @@ onbf-sign = { path = "developer-tools/onbf-sign" }
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
-# `cfg(loom)`: `cargo xtask loom` builds `origin-sync`'s tests against Loom (CLAUDE.md §73).
+# `cfg(loom)`: `cargo xtask loom` builds `origin-sync`'s tests against Loom (CLAUDE.md §73), in a
+# scratch workspace of its own: nothing in this workspace depends on Loom.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [workspace.lints.clippy]

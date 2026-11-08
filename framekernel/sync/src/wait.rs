@@ -197,8 +197,9 @@ impl<T: Copy + Eq, const N: usize> WaitQueue<T, N> {
     }
 
     /// Removes every waiter and returns them, for a caller that wakes each one itself (each
-    /// re-checks its own condition). The lock is released first: a waker never holds a wait
-    /// queue's lock while it wakes.
+    /// re-checks its own condition). One critical section, so that a thread registering as this
+    /// runs is either taken or registers after it, with nothing erased. The lock is released
+    /// first: a waker never holds a wait queue's lock while it wakes.
     pub fn take_all<S: Scheduler<Thread = T>>(&self, scheduler: &S) -> [Option<T>; N] {
         scheduler.without_interrupts(|| core::mem::replace(&mut *self.waiters.lock(), [None; N]))
     }

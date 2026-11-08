@@ -1,57 +1,97 @@
 //! Loom models of [`SpinLock`], [`RwLock`] and the kernel's wait-queue protocol (CLAUDE.md §73).
 //!
-//! Built only by `cargo xtask loom`, with `--cfg loom`, for this crate's tests. A model runs the
-//! real code, not a copy of it: the two locks with their orderings, `crate::wait` (the protocol
-//! `framekernel/src/wait.rs` instantiates) and the real run queue
-//! (`framekernel/src/runqueue.rs`, compiled in here), with Loom's atomics and cell in place of
-//! `core`'s (`prim` in `lib.rs`). `cargo xtask loom` also applies a negative control for each
-//! property to a scratch copy of this source and requires the named model to report the bug
-//! (`developer-tools/xtask/src/loom.rs`).
+//! Built only by `cargo xtask loom`, with `--cfg loom`, for this crate's tests, in a scratch
+//! workspace that alone has Loom as a dependency (`developer-tools/xtask/src/loom.rs`). That tool
+//! also applies a negative control for each property to a scratch copy of this source and
+//! requires the named model to report the bug.
+//!
+//! # What is the real code, and what is a copy of it
+//!
+//! Real, and compiled in unchanged: the two locks with their orderings (`lib.rs`), `crate::wait`
+//! (the protocol `framekernel/src/wait.rs` instantiates) and the run queue
+//! (`framekernel/src/runqueue.rs`). What differs under `--cfg loom` is `prim` in `lib.rs`, which
+//! swaps `core`'s atomics, cell and spin hint for Loom's, and that the constructors are not
+//! `const`.
+//!
+//! Copies, written by hand here, standing in for kernel code; nothing compares them with it:
+//!
+//! - `ThreadName` is `sched::ThreadRef`, and `OnCpu::current_thread` is `sched::current_thread`.
+//! - `OnCpu::wake` is the logic of `sched::wake`: `RunQueue::wake` under the queue's lock, then
+//!   a kick (the reschedule IPI) only if the thread it woke is on another processor.
+//! - `OnCpu::block` and `OnCpu::block_until` make the run-queue calls `sched::on_block` makes, and
+//!   `sched::block_until` turns a deadline into its tick count; the copy takes one tick to any
+//!   reachable deadline and `u64::MAX` ticks to `UNREACHABLE`.
+//! - `OnCpu::halt_until_ready` makes the calls `sched::on_reschedule` (`RunQueue::yield_now`) and
+//!   `sched::on_tick` (`RunQueue::tick`) make for a processor halted in its idle context. What
+//!   else those handlers do around them (`with_queue`, the FPU and TSS switch) is not here.
+//! - `Cpu::new` leaves a real run queue as `sched` has it while a kernel thread runs: the idle
+//!   context in slot 0 and that thread current.
+//! - `wake_all` is the loop of `WaitQueue::wake_all` in `framekernel/src/wait.rs`.
+//! - `monotonic_nanos` stands for `time::monotonic_nanos`, and `yield_now` for `sched::yield_now`
+//!   (to Loom, a spin).
 //!
 //! # What is proved
 //!
-//! For the code above, **within the bounds each model prints**, over every thread interleaving
+//! For the real code, **within the bounds each model prints**, over every thread interleaving
 //! (up to Loom's removal of equivalent ones) and every store a `Relaxed` load may see in Loom's
 //! model of the C11 memory model:
 //!
-//! - `SpinLock`: at most one holder at a time; every access to the protected value is ordered
-//!   by happens-before with every other (Loom's cell checks this; no data race); each holder
-//!   sees all earlier holders' writes, whole. `try_lock`: a failure leaves the holder's lock held
-//!   and a success is a real holder.
+//! - `SpinLock`: at most one holder at a time; every dereference of a guard is ordered by
+//!   happens-before with every other (Loom's cell checks each one; no data race at a dereference:
+//!   see "not proved"); each holder sees all earlier holders' writes, whole. `try_lock`: a failure
+//!   leaves the holder's lock held and a success is a real holder.
 //! - `RwLock`: a writer overlaps nobody; readers can hold it together; a reader sees a writer's
-//!   update whole or not at all; and every access is ordered by happens-before with every
-//!   conflicting one (a reader's reads with the next writer's writes, a writer's with the next
+//!   update whole or not at all; and every dereference of a guard is ordered by happens-before
+//!   with every conflicting one (a reader's with the next writer's, a writer's with the next
 //!   reader's or writer's).
-//! - The wait queue, no lost wake-ups: a thread in `wait_until` or `wait_until_deadline` whose
-//!   condition is made true by a thread that then calls `wake_one` does not stay blocked
-//!   (a lost wake-up leaves every thread blocked, which Loom reports as a deadlock). This holds
-//!   with `Relaxed` on the condition, the weakest ordering a caller could use: the queue's lock
-//!   carries it. A wait returns only with its condition true, also after a wake-up that outlived
-//!   an earlier wait; a timed wait that gives up leaves no registration, so it cannot swallow
-//!   the next waiter's wake-up; and a thread that cannot register (a full queue, or the boot
-//!   flow) still sees the condition by polling. A timed wait on the boot flow polls, never blocks
-//!   or registers, and ends with the condition or at the deadline.
+//! - The wait queue, no lost wake-ups: a thread in `wait_until`, or in `wait_until_deadline` with
+//!   a deadline the clock never reaches (`UNREACHABLE`, so that only a wake-up can end its block),
+//!   whose condition is made true by a thread that then calls `wake_one` does not stay blocked (a
+//!   lost wake-up leaves every thread blocked, which Loom reports as a deadlock). This holds with
+//!   `Relaxed` on the condition, the weakest ordering a caller could use: the queue's lock carries
+//!   it. It holds whether the waker is on another processor, which kicks the waiter's with a
+//!   reschedule IPI, or on the waiter's own, which sends none: the thread is made ready, and that
+//!   processor's next timer tick runs it (`OnCpu::wake` has `sched::wake`'s no-IPI rule).
+//! - Wake-all (`take_all`, each waiter then woken): it loses no wake-up against a waiter
+//!   registering at the same moment, which either is taken or sees the condition. It takes every
+//!   waiter, leaves none registered, and does not erase a registration made as it runs.
+//! - A wait returns only with its condition true, also after a wake-up that outlived an earlier
+//!   wait; a timed wait that gives up leaves no registration, so it cannot swallow the next
+//!   waiter's wake-up; and a thread that cannot register (a full queue, or the boot flow) still
+//!   sees the condition by polling. A timed wait on the boot flow polls, never blocks or registers,
+//!   and ends with the condition or at the deadline.
 //!
 //! # What is not proved
 //!
 //! - Anything past the bounds: more threads or rounds than the models have (at most three spawned
 //!   threads and the model's own thread here; Loom's limit is five in all), more thread preemptions
-//!   than the bound where one is printed, or more spin iterations than `Bound::spins` (below).
+//!   than the bound where one is printed, or a schedule in which a thread spins past
+//!   `Bound::spins`: from that point on its whole execution is no longer explored (below).
 //! - Anything Loom's memory model omits: it does not model load buffering (a load seeing a store
-//!   that its thread only makes later), and its `compare_exchange_weak` never fails spuriously,
-//!   so `lock` is not explored taking a spurious failure (it would only loop again).
+//!   that its thread only makes later), its `compare_exchange_weak` never fails spuriously, so
+//!   `lock` is not explored taking a spurious failure (it would only loop again), and it keeps
+//!   only the last 7 stores of each atomic (`MAX_ATOMIC_HISTORY`), so a load is never explored
+//!   reading an older one.
+//! - Later uses of a guard's reference: Loom's cell checks each `Deref` and `DerefMut` of a guard
+//!   as it runs (`with` and `with_mut` in `lib.rs`), and does not follow the reference it hands
+//!   back. "Every dereference" above means those moments, not each use of the reference. The code
+//!   the models run does nothing more to a Loom atomic or cell between the two, but no other
+//!   callers of these locks are modelled.
 //! - Interrupts: `without_interrupts` does nothing here, so the rule that no handler may take a
 //!   lock interrupted code can hold is not checked. A handler that wakes is modelled as another
-//!   thread.
-//! - The scheduler around the run queue: the context switch, `sched::on_block`, the reschedule
-//!   IPI and the timer are stood in for by [`Cpu`]'s `kick` and the run-queue calls they make.
-//!   That a ready thread eventually runs is assumed. Fairness and starvation are not modelled.
+//!   thread, which can overlap the thread it interrupted; on the machine it cannot.
+//! - The scheduler around the run queue: the context switch, the reschedule IPI and the timer
+//!   are stood in for by [`Cpu`]'s `kick` and the run-queue calls they make (the copies above).
+//!   That a ready thread eventually runs is assumed, and so is the timer: one kick after a
+//!   same-processor wake stands for the next tick, which the real timer always brings. Fairness
+//!   and starvation are not modelled.
 //! - The machine: these are host builds against Loom's atomics. The x86-64 code the kernel runs,
 //!   the `pause` instruction and TSO are not examined.
 //! - `RwLock` writer starvation, which its documentation accepts; a timed waiter that finds the
 //!   queue full (the other way to reach `Step::Poll`, the same loop as the boot flow's); and what
 //!   callers must uphold themselves: the state changes before `wake_one`, and one condition per
-//!   queue (`waker_wakes_before_setting_the_flag` shows the first matters).
+//!   queue (`waker_wakes_before_setting_the_flag` shows the first matters). A wait with a deadline
+//!   that does arrive is not shown to keep its wake-up: the timer ends it either way.
 //!
 //! # What the models add
 //!
@@ -63,11 +103,13 @@
 //! # Bounds
 //!
 //! Two threads spinning on one lock can take turns for ever, and Loom counts each turn as a new
-//! execution whatever the preemption bound. So a thread's spin iterations are explored only up
-//! to `Bound::spins`; past that the execution still runs to its end, with every check, but
-//! branches no further. A spin iteration changes nothing and can only observe the lock change
-//! hands, so the bound limits how many of those changes a thread can wait through.
-//! `ORIGIN_LOOM_DEEP` selects each model's larger bound (a long run).
+//! execution whatever the preemption bound. So spinning is cut off: once any one thread of an
+//! execution has spun more than `Bound::spins` times, Loom's `skip_branch` stops the exploration
+//! of that whole execution, for all its threads, from there on. The count is per thread; the
+//! cut-off is not. The execution still runs to its end, with every check, along one schedule.
+//! A spin iteration changes nothing and can only observe the lock change hands, so the bound
+//! limits how many of those changes a thread can wait through while its execution is explored.
+//! `ORIGIN_LOOM_DEEP` selects each model's larger bound (a long run, `cargo xtask loom` only).
 
 use std::sync::atomic::AtomicU64 as ExecutionCounter;
 
@@ -86,11 +128,12 @@ use crate::{RwLock, SpinLock};
 struct Bound {
     /// At most this many thread preemptions; `None` is the exhaustive search.
     preemptions: Option<usize>,
-    /// Spin iterations per thread that are explored (see `prim::spin_loop`).
+    /// The spin iterations one thread may make with its execution still explored; one more, by
+    /// any thread, ends the exploration of the whole execution (see `prim::spin_loop`).
     spins: u32,
 }
 
-/// The spin iterations every model explores, unless it says otherwise.
+/// Every model's spin bound (`Bound::spins`), unless it says otherwise.
 const SPINS: u32 = 4;
 
 const EXHAUSTIVE: Bound = Bound {
@@ -110,7 +153,9 @@ const fn preempted(preemptions: usize, spins: u32) -> Bound {
 ///
 /// For experiments, `LOOM_MAX_PREEMPTIONS` and `ORIGIN_LOOM_SPINS` override the bound, and
 /// `LOOM_LOG=trace` traces a failure through Loom's own runner (which uses the preemption bound
-/// from the environment only).
+/// from the environment only). They reach a model only when `ORIGIN_LOOM_EXPERIMENT` is set on
+/// `cargo xtask loom`, which proves nothing: xtask removes them from every other run, so that
+/// `cargo xtask check` cannot be weakened by what happens to be exported.
 fn check(name: &str, quick: Bound, deep: Bound, model: impl Fn() + Send + Sync + 'static) {
     let bound = if std::env::var_os("ORIGIN_LOOM_DEEP").is_some() {
         deep
@@ -143,7 +188,8 @@ fn check(name: &str, quick: Bound, deep: Bound, model: impl Fn() + Send + Sync +
             format!("at most {b} preemptions")
         });
     println!(
-        "loom model {name}: {} executions, {search}, {spins} spins per thread, {} ms",
+        "loom model {name}: {} executions, {search}, an execution stops branching once a thread \
+         has spun more than {spins} times, {} ms",
         executions.load(Relaxed),
         started.elapsed().as_millis()
     );
@@ -405,21 +451,34 @@ const IDLE_FRAME: u64 = 0x1000;
 const WAITERS: usize = 16;
 /// The timed models' deadline, on the model's clock (which starts at 0).
 const DEADLINE: u64 = 1;
+/// A deadline nothing moves the clock to: only a wake-up can end a block on it.
+const UNREACHABLE: u64 = u64::MAX;
+
+/// What restarts a halted processor, and so which handler looks at its queue.
+#[derive(Clone, Copy)]
+enum Restart {
+    /// The reschedule IPI another processor sends: `sched::on_reschedule`.
+    Ipi,
+    /// This processor's timer: `sched::on_tick`. A wake-up from the processor itself sends no
+    /// IPI, so its next tick is what runs the woken thread.
+    Tick,
+}
 
 /// A processor: its real run queue, holding one kernel thread and the idle context.
 struct Cpu {
     queue: SpinLock<RunQueue>,
     /// Stands for the reschedule IPI or timer tick that makes the halted processor look at its
-    /// queue again. Loom's `Notify` may also return spuriously, like a tick that readies
-    /// nothing: the queue, not this, decides what runs.
+    /// queue again. Loom's `Notify` may also return spuriously, once per execution, like a tick
+    /// that readies nothing: the queue, not this, decides what runs.
     kick: Notify,
+    restart: Restart,
     slot: usize,
     generation: u32,
 }
 
 impl Cpu {
     /// A processor already running its kernel thread.
-    fn new() -> Self {
+    fn new(restart: Restart) -> Self {
         let mut queue = RunQueue::new();
         queue.set_idle(true);
         let slot = queue.push(THREAD_FRAME).unwrap();
@@ -428,6 +487,7 @@ impl Cpu {
         Self {
             queue: SpinLock::new(queue),
             kick: Notify::new(),
+            restart,
             slot,
             generation,
         }
@@ -444,10 +504,19 @@ struct World {
 struct Kernel(Arc<World>);
 
 impl Kernel {
-    /// A kernel with `cpus` processors, its clock at 0.
+    /// A kernel with `cpus` processors, each restarted by the reschedule IPI, its clock at 0.
     fn with_cpus(cpus: usize) -> Self {
+        Self::new(cpus, Restart::Ipi)
+    }
+
+    /// A kernel with one processor, which only its timer can restart, its clock at 0.
+    fn with_one_ticking_cpu() -> Self {
+        Self::new(1, Restart::Tick)
+    }
+
+    fn new(cpus: usize, restart: Restart) -> Self {
         Self(Arc::new(World {
-            cpus: (0..cpus).map(|_| Cpu::new()).collect(),
+            cpus: (0..cpus).map(|_| Cpu::new(restart)).collect(),
             clock: AtomicU64::new(0),
         }))
     }
@@ -489,7 +558,8 @@ struct ThreadName {
 }
 
 /// One thread's view of the kernel, standing in for `sched` and `cpu`. The run-queue calls are
-/// the ones `sched::on_block`, `sched::wake` and `sched::on_tick` make, under the same lock.
+/// the ones `sched::on_block`, `sched::wake`, `sched::on_reschedule` and `sched::on_tick` make,
+/// under the same lock.
 struct OnCpu {
     world: Arc<World>,
     cpu: usize,
@@ -499,6 +569,27 @@ struct OnCpu {
 impl OnCpu {
     fn this_cpu(&self) -> &Cpu {
         &self.world.cpus[self.cpu]
+    }
+
+    /// Halted in the idle context until a restart finds this thread ready.
+    fn halt_until_ready(&self) {
+        let cpu = self.this_cpu();
+        loop {
+            cpu.kick.wait();
+            let next = match cpu.restart {
+                Restart::Ipi => cpu.queue.lock().yield_now(IDLE_FRAME),
+                Restart::Tick => cpu.queue.lock().tick(IDLE_FRAME),
+            };
+            if next == THREAD_FRAME {
+                return;
+            }
+        }
+    }
+
+    /// This processor's next timer interrupt, which always comes: it restarts the processor
+    /// (`Restart::Tick`).
+    fn timer_tick(&self) {
+        self.this_cpu().kick.notify();
     }
 }
 
@@ -522,28 +613,30 @@ impl Scheduler for OnCpu {
     }
 
     fn block(&self) {
-        let cpu = self.this_cpu();
-        let next = cpu.queue.lock().block(THREAD_FRAME).unwrap();
+        let next = self.this_cpu().queue.lock().block(THREAD_FRAME).unwrap();
         if next == THREAD_FRAME {
             return; // A wake-up was pending: this thread goes on.
         }
         assert_eq!(next, IDLE_FRAME);
-        // Halted in the idle context until a reschedule finds this thread ready.
-        loop {
-            cpu.kick.wait();
-            if cpu.queue.lock().yield_now(IDLE_FRAME) == THREAD_FRAME {
-                return;
-            }
-        }
+        self.halt_until_ready();
     }
 
     fn block_until(&self, deadline: u64) {
         let cpu = self.this_cpu();
-        let next = cpu.queue.lock().block_for(THREAD_FRAME, Some(1)).unwrap();
+        let ticks = if deadline == UNREACHABLE { u64::MAX } else { 1 };
+        let next = cpu
+            .queue
+            .lock()
+            .block_for(THREAD_FRAME, Some(ticks))
+            .unwrap();
         if next == THREAD_FRAME {
             return; // A wake-up was pending.
         }
         assert_eq!(next, IDLE_FRAME);
+        if deadline == UNREACHABLE {
+            // Nothing but a wake-up can end this block: no timer will.
+            return self.halt_until_ready();
+        }
         // Halted in the idle context. A timer tick always comes: the clock passes the deadline
         // and the queue makes this thread ready on its own, if no wake-up did first.
         self.world.clock.store(deadline, Relaxed);
@@ -556,10 +649,12 @@ impl Scheduler for OnCpu {
     }
 
     fn wake(&self, thread: ThreadName) {
-        let cpu = &self.world.cpus[thread.cpu];
-        let woke = cpu.queue.lock().wake(thread.slot, thread.generation);
-        if woke {
-            cpu.kick.notify();
+        let target = &self.world.cpus[thread.cpu];
+        let woke = target.queue.lock().wake(thread.slot, thread.generation);
+        // `sched::wake`: the IPI goes only to another processor. A thread woken from its own
+        // processor runs at that processor's next timer tick.
+        if woke && thread.cpu != self.cpu {
+            target.kick.notify();
         }
     }
 
@@ -569,6 +664,38 @@ impl Scheduler for OnCpu {
 }
 
 type Queue = WaitQueue<ThreadName, WAITERS>;
+
+/// How a model's waiter waits.
+#[derive(Clone, Copy)]
+enum Wait {
+    /// `WaitQueue::wait_until`.
+    Untimed,
+    /// `WaitQueue::wait_until_deadline`, with a deadline the clock never reaches: nothing but a
+    /// wake-up can end its block, so a lost one leaves it blocked, as in `Untimed`.
+    Timed,
+}
+
+impl Wait {
+    fn until(self, queue: &Queue, me: &OnCpu, condition: impl Fn() -> bool) {
+        match self {
+            Wait::Untimed => {
+                queue.wait_until(me, condition);
+            }
+            Wait::Timed => {
+                let waited = queue.wait_until_deadline(me, condition, UNREACHABLE);
+                assert!(waited.is_ok(), "gave up before a deadline that never comes");
+            }
+        }
+    }
+}
+
+/// `WaitQueue::wake_all` in `framekernel/src/wait.rs`: every waiter, each woken after the
+/// queue's lock is released, so that each can re-check its own condition.
+fn wake_all(queue: &Queue, me: &OnCpu) {
+    for thread in queue.take_all(me).into_iter().flatten() {
+        me.wake(thread);
+    }
+}
 
 /// Takes one token if there is one (each waiter's condition in the many-waiter models).
 fn take(tokens: &AtomicU32) -> bool {
@@ -581,14 +708,14 @@ fn take(tokens: &AtomicU32) -> bool {
 
 /// One thread waits for a flag; another sets it, then wakes the queue. A lost wake-up leaves
 /// the waiter blocked for ever, which Loom reports as a deadlock.
-fn one_waiter_one_waker(set: Ordering, read: Ordering) {
+fn one_waiter_one_waker(set: Ordering, read: Ordering, wait: Wait) {
     let world = Kernel::with_cpus(2);
     let queue = Arc::new(Queue::new());
     let flag = Arc::new(AtomicBool::new(false));
     let waiter = world.spawn(0, {
         let (queue, flag) = (Arc::clone(&queue), Arc::clone(&flag));
         move |me| {
-            queue.wait_until(&me, || flag.load(read));
+            wait.until(&queue, &me, || flag.load(read));
             assert!(flag.load(read), "returned with the condition false");
         }
     });
@@ -608,7 +735,7 @@ fn wait_queue_waker_and_waiter_release_acquire() {
         preempted(6, SPINS),
         EXHAUSTIVE,
         || {
-            one_waiter_one_waker(Release, Acquire);
+            one_waiter_one_waker(Release, Acquire, Wait::Untimed);
         },
     );
 }
@@ -623,8 +750,78 @@ fn wait_queue_waker_and_waiter_relaxed() {
         preempted(6, SPINS),
         EXHAUSTIVE,
         || {
-            one_waiter_one_waker(Relaxed, Relaxed);
+            one_waiter_one_waker(Relaxed, Relaxed, Wait::Untimed);
         },
+    );
+}
+
+/// As `wait_queue_waker_and_waiter_release_acquire`, for a timed wait whose deadline never
+/// comes: only a wake-up can end its block.
+#[test]
+fn wait_queue_timed_waiter_and_waker_release_acquire() {
+    check(
+        "wait_queue_timed_waiter_and_waker_release_acquire",
+        preempted(6, SPINS),
+        EXHAUSTIVE,
+        || {
+            one_waiter_one_waker(Release, Acquire, Wait::Timed);
+        },
+    );
+}
+
+/// As `wait_queue_waker_and_waiter_relaxed`, for a timed wait whose deadline never comes.
+#[test]
+fn wait_queue_timed_waiter_and_waker_relaxed() {
+    check(
+        "wait_queue_timed_waiter_and_waker_relaxed",
+        preempted(6, SPINS),
+        EXHAUSTIVE,
+        || {
+            one_waiter_one_waker(Relaxed, Relaxed, Wait::Timed);
+        },
+    );
+}
+
+/// The waker runs on the waiter's own processor, so `sched::wake` sends no IPI: nothing kicks
+/// the halted processor when the wake-up lands, and the waiter resumes at the processor's next
+/// timer tick. Without that tick it would stay blocked (control `same_cpu_wake_gets_no_tick`).
+fn same_cpu_wake(wait: Wait) {
+    let world = Kernel::with_one_ticking_cpu();
+    let queue = Arc::new(Queue::new());
+    let flag = Arc::new(AtomicBool::new(false));
+    let waiter = world.spawn(0, {
+        let (queue, flag) = (Arc::clone(&queue), Arc::clone(&flag));
+        move |me| {
+            wait.until(&queue, &me, || flag.load(Relaxed));
+            assert!(flag.load(Relaxed), "returned with the condition false");
+        }
+    });
+    let waker = world.spawn(0, move |me| {
+        flag.store(true, Relaxed);
+        queue.wake_one(&me);
+        me.timer_tick();
+    });
+    waiter.join().unwrap();
+    waker.join().unwrap();
+}
+
+#[test]
+fn wait_queue_same_cpu_wake_resumes_on_a_tick() {
+    check(
+        "wait_queue_same_cpu_wake_resumes_on_a_tick",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || same_cpu_wake(Wait::Untimed),
+    );
+}
+
+#[test]
+fn wait_queue_same_cpu_timed_wake_resumes_on_a_tick() {
+    check(
+        "wait_queue_same_cpu_timed_wake_resumes_on_a_tick",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || same_cpu_wake(Wait::Timed),
     );
 }
 
@@ -745,6 +942,92 @@ fn wait_queue_two_waiters() {
             }
             waker.join().unwrap();
         },
+    );
+}
+
+/// `take_all` against waiters registering as it runs: one waits untimed and one, as the kernel's
+/// `wait_one` does, with a deadline, and the flag has been set before the waker looks. Each
+/// waiter either is taken and woken or sees the flag, and none is left registered: once the
+/// waker has looked, nobody can register (the flag is visible under the queue's lock).
+#[test]
+fn wait_queue_wake_all_wakes_every_waiter() {
+    check(
+        "wait_queue_wake_all_wakes_every_waiter",
+        preempted(2, 2),
+        preempted(3, 3),
+        || {
+            let world = Kernel::with_cpus(3);
+            let queue = Arc::new(Queue::new());
+            let flag = Arc::new(AtomicBool::new(false));
+            let waiters = [(0, Wait::Untimed), (1, Wait::Timed)].map(|(cpu, wait)| {
+                let (queue, flag) = (Arc::clone(&queue), Arc::clone(&flag));
+                world.spawn(cpu, move |me| {
+                    wait.until(&queue, &me, || flag.load(Relaxed));
+                    assert!(flag.load(Relaxed), "returned with the condition false");
+                })
+            });
+            let waker = world.spawn(2, move |me| {
+                flag.store(true, Relaxed);
+                wake_all(&queue, &me);
+                assert!(
+                    queue.take_all(&me).iter().all(Option::is_none),
+                    "take_all left a waiter registered"
+                );
+            });
+            for waiter in waiters {
+                waiter.join().unwrap();
+            }
+            waker.join().unwrap();
+        },
+    );
+}
+
+/// A wake-all for some other reason (the kernel wakes a whole channel side on any signal)
+/// runs as a thread registers. It must leave that registration standing or wake it: erased, and
+/// not woken, the thread would sleep through the wake-up that matters. `take_all` is one
+/// critical section, so it does.
+fn wake_all_against_a_registration(wait: Wait) {
+    let world = Kernel::with_cpus(3);
+    let queue = Arc::new(Queue::new());
+    let flag = Arc::new(AtomicBool::new(false));
+    let waiter = world.spawn(0, {
+        let (queue, flag) = (Arc::clone(&queue), Arc::clone(&flag));
+        move |me| {
+            wait.until(&queue, &me, || flag.load(Relaxed));
+            assert!(flag.load(Relaxed), "returned with the condition false");
+        }
+    });
+    let unrelated = world.spawn(1, {
+        let queue = Arc::clone(&queue);
+        move |me| wake_all(&queue, &me)
+    });
+    let waker = world.spawn(2, move |me| {
+        flag.store(true, Relaxed);
+        wake_all(&queue, &me);
+    });
+    waiter.join().unwrap();
+    unrelated.join().unwrap();
+    waker.join().unwrap();
+}
+
+#[test]
+fn wait_queue_wake_all_keeps_a_concurrent_registration() {
+    check(
+        "wait_queue_wake_all_keeps_a_concurrent_registration",
+        preempted(2, 2),
+        preempted(3, 3),
+        || wake_all_against_a_registration(Wait::Untimed),
+    );
+}
+
+/// As above, for the timed wait the kernel's `wait_one` uses.
+#[test]
+fn wait_queue_wake_all_keeps_a_concurrent_timed_registration() {
+    check(
+        "wait_queue_wake_all_keeps_a_concurrent_timed_registration",
+        preempted(2, 2),
+        preempted(3, 3),
+        || wake_all_against_a_registration(Wait::Timed),
     );
 }
 
@@ -900,34 +1183,47 @@ fn wait_queue_timed_wait_gives_way() {
 
 /// A wake-up can outlive the wait it was for (it reached a timed waiter that had already been
 /// made ready by its deadline) and end the next wait's first block. The wait must re-check.
+fn stale_wake_up(wait: Wait) {
+    let world = Kernel::with_cpus(2);
+    let queue = Arc::new(Queue::new());
+    let first = Arc::new(AtomicBool::new(false));
+    let second = Arc::new(AtomicBool::new(false));
+    let waiter = world.spawn(0, {
+        let (queue, first, second) = (Arc::clone(&queue), Arc::clone(&first), Arc::clone(&second));
+        move |me| {
+            let _ = queue.wait_until_deadline(&me, || first.load(Acquire), DEADLINE);
+            wait.until(&queue, &me, || second.load(Acquire));
+            assert!(second.load(Acquire), "returned with the condition false");
+        }
+    });
+    let waker = world.spawn(1, move |me| {
+        first.store(true, Release);
+        queue.wake_one(&me);
+        second.store(true, Release);
+        queue.wake_one(&me);
+    });
+    waiter.join().unwrap();
+    waker.join().unwrap();
+}
+
 #[test]
 fn wait_queue_stale_wake_up_is_harmless() {
     check(
         "wait_queue_stale_wake_up_is_harmless",
         preempted(3, SPINS),
         preempted(4, SPINS),
-        || {
-            let world = Kernel::with_cpus(2);
-            let queue = Arc::new(Queue::new());
-            let first = Arc::new(AtomicBool::new(false));
-            let second = Arc::new(AtomicBool::new(false));
-            let waiter = world.spawn(0, {
-                let (queue, first, second) =
-                    (Arc::clone(&queue), Arc::clone(&first), Arc::clone(&second));
-                move |me| {
-                    let _ = queue.wait_until_deadline(&me, || first.load(Acquire), DEADLINE);
-                    queue.wait_until(&me, || second.load(Acquire));
-                    assert!(second.load(Acquire), "returned with the condition false");
-                }
-            });
-            let waker = world.spawn(1, move |me| {
-                first.store(true, Release);
-                queue.wake_one(&me);
-                second.store(true, Release);
-                queue.wake_one(&me);
-            });
-            waiter.join().unwrap();
-            waker.join().unwrap();
-        },
+        || stale_wake_up(Wait::Untimed),
+    );
+}
+
+/// As `wait_queue_stale_wake_up_is_harmless`, the second wait timed, with a deadline that never
+/// comes: `wait_until_deadline` must re-check too.
+#[test]
+fn wait_queue_timed_stale_wake_up_is_harmless() {
+    check(
+        "wait_queue_timed_stale_wake_up_is_harmless",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || stale_wake_up(Wait::Timed),
     );
 }
