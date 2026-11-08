@@ -696,11 +696,11 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: user mode: good program: reported Some(42), exited with Some(0); kernel carries on".into(),
             "origin-kernel: user mode: kernel read: reported Some(7), ended by vector 14 (error 0x5".into(),
             "origin-kernel: user mode: privileged instruction: reported Some(9), ended by vector 13 (error 0x0); kernel carries on".into(),
-            "origin-kernel: user mode: two compute-bound user threads at once finished in ".into(),
+            "origin-kernel: user mode: two compute-bound user processes at once finished in ".into(),
             "reports 0b110; kernel stack follows every switch".into(),
-            "origin-kernel: user mode: syscall instruction: reported Some(77), exited with Some(0)".into(),
+            "origin-kernel: user mode: int 0x80 is not a way in: reported Some(77), ended by vector 13 (error 0x402); kernel carries on".into(),
             "origin-kernel: user mode: write: hello from ring 3".into(),
-            "origin-kernel: user mode: copy from user: valid buffer -> 17, kernel address -> EFAULT, unmapped user address -> EFAULT; kernel carries on".into(),
+            "origin-kernel: user mode: copy from user: valid buffer -> OK, kernel address -> FAULT, unmapped user address -> FAULT; kernel carries on".into(),
             "origin-kernel: processes: PML4 ".into(),
             "at once and read back 0x400800 from 0x500000 (own values only: 0x400800); not mapped in the kernel's tables: true".into(),
             format!("origin-kernel: clock: TSC consistent across {cpus} processors: "),
@@ -734,6 +734,10 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: wait queues: an unsignalled 50 ms timed wait timed out true after ".into(),
             "ms; a 2000 ms timed wait signalled early returned in ".into(),
             " ms, timed out false".into(),
+        ])
+        // M4's first slice (ADR-0005 P1–P5, P8, P9): system calls between ring-3 processes.
+        .chain(ipc_markers(machine.named(0), target.clone()))
+        .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             // M5 groundwork: PCIe through the MCFG, the ECAM window uncached, q35's
             // functions listed with their BARs sized and restored.
@@ -969,6 +973,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             ": HPET failed",
             ": I/O APIC failed",
             ": PM timer failed",
+            ": ipc failed",
             ": console failed",
             ": TLB failed",
             ": wait queues failed",
@@ -989,6 +994,51 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         check: Some(|text| console_lines_intact(text, self::machine().cpus() as usize)),
         stderr: vec![],
     }
+}
+
+/// What the kernel's first system-call slice must report, in order: a line per group of
+/// hostile calls, each naming the status its call returned.
+fn ipc_markers(boot: String, far: String) -> Vec<String> {
+    let mut markers = vec![
+        format!(
+            "origin-kernel: ipc: ping-pong: two ring-3 processes on {boot} and {far} exchanged 1000 messages each way, every one checked in ring 3"
+        ),
+        "origin-kernel: ipc: ping-pong round trip: ".into(),
+    ];
+    markers.extend([
+        "origin-kernel: ipc: bad handles: handle 0 -> BAD_HANDLE, never issued -> BAD_HANDLE, bits above 32 -> BAD_HANDLE, wait on a bad handle -> BAD_HANDLE, closed -> BAD_HANDLE, stale, slot reused -> BAD_HANDLE, another process's -> BAD_HANDLE, wait on another process's -> BAD_HANDLE".to_string(),
+        "origin-kernel: ipc: too few rights: write without WRITE -> ACCESS_DENIED, read without READ -> ACCESS_DENIED, wait without WAIT -> ACCESS_DENIED, duplicate without DUPLICATE -> ACCESS_DENIED, send without TRANSFER -> ACCESS_DENIED".into(),
+        "origin-kernel: ipc: rights only shrink: adding WRITE -> INVALID_ARGS, an undefined right -> INVALID_ARGS, dropping DUPLICATE -> OK, the copy cannot write -> ACCESS_DENIED, the copy can read -> SHOULD_WAIT".into(),
+        "origin-kernel: ipc: bad pointers: write from the kernel -> FAULT, from unmapped -> FAULT, across the end of mapped -> FAULT, from address 0 -> FAULT, wrapping past the top -> FAULT, from the top page -> FAULT, read into the kernel -> FAULT, into unmapped -> FAULT, into code -> FAULT, into read-only memory -> FAULT, sizes in the kernel -> FAULT, create out to the kernel -> FAULT, create out to read-only -> FAULT, duplicate out to the kernel -> FAULT, duplicate out to read-only -> FAULT, wait out to read-only -> FAULT, wait out to the kernel -> FAULT, handle list in the kernel -> FAULT, zero length names no memory -> OK, the empty message arrived -> 0x0".into(),
+        "origin-kernel: ipc: sizes and numbers: one byte too many -> INVALID_ARGS, one handle too many -> INVALID_ARGS, no signals -> INVALID_ARGS, an undefined signal -> INVALID_ARGS, a sizes structure too small -> INVALID_ARGS, an unknown call number -> NOT_SUPPORTED, an object type not here yet -> NOT_SUPPORTED".into(),
+        "origin-kernel: ipc: queues: empty -> SHOULD_WAIT, nothing by deadline 0 -> TIMED_OUT, written -> OK, readable -> OK, observed -> 0x3, 4-byte buffer -> BUFFER_TOO_SMALL, it needs -> 0x10, still there -> OK, received -> 0x10".into(),
+        "origin-kernel: ipc: a full queue: the write after the last -> SHOULD_WAIT, not writable -> TIMED_OUT, writable again after a read -> OK".into(),
+        "origin-kernel: ipc: a closed peer: sees PEER_CLOSED -> OK, observed -> 0x5, write -> PEER_CLOSED, the message sent before the close -> OK, read past the close -> PEER_CLOSED, READABLE will never rise -> TIMED_OUT".into(),
+        "origin-kernel: ipc: handle transfer: send -> OK, the sender's handle is gone -> BAD_HANDLE, received -> OK, with one handle -> 0x1, the moved handle writes -> OK, and the other end reads -> OK, it kept its rights -> OK".into(),
+        "origin-kernel: ipc: transfers that would break the graph: an end through its own channel -> INVALID_ARGS, the peer end through its own channel -> INVALID_ARGS, the same handle twice -> INVALID_ARGS, an end with another handle -> INVALID_ARGS, that end, alone again -> OK, into the first channel -> OK, a cycle through two queues -> INVALID_ARGS, a stale handle in the list -> BAD_HANDLE".into(),
+        "origin-kernel: ipc: every hostile call returned its status and the process exited by itself (".into(),
+        "; user-copy faults recovered: 0".into(),
+    ]);
+    for how in ["exits", "faults"] {
+        markers.extend([
+            "origin-kernel: ipc: the peer of a process that: woken -> OK, observed -> 0x4, write -> PEER_CLOSED, read -> PEER_CLOSED".to_string(),
+            format!("origin-kernel: ipc: when a process {how}: its handles close (0 left), and its peer on {far}, blocked "),
+            "woke and saw PEER_CLOSED".into(),
+        ]);
+    }
+    markers.extend([
+        "origin-kernel: ipc: a thread in wait_one on a handle another thread closes completes with CANCELED".to_string(),
+        "origin-kernel: ipc: quotas: a fifth channel -> LIMIT, a thirteenth handle -> LIMIT, one more after a close -> OK, still working -> OK".into(),
+        "origin-kernel: ipc: a full-size message: sixty-four KiB -> OK, received -> OK, bytes -> 0x10000".into(),
+        "origin-kernel: ipc: 64 KiB through a channel and back, byte for byte: true".into(),
+        "origin-kernel: ipc: registers: every register but RAX, RCX and R11 survives a system call: true".into(),
+        "origin-kernel: ipc: a process's system calls are accepted only from its pinned code range: every call refused, and it ended by its own fault".into(),
+        "origin-kernel: ipc: a program that loaded a null GS was interrupted and made system calls, and the kernel used its own GS (reports [1, 0])".into(),
+        "origin-kernel: ipc: a program with RFLAGS.AC set took interrupts and made a system call: the flag reached kernel code 0 times, and stayed set in ring 3: true".into(),
+        "origin-kernel: ipc: a fault inside a user copy comes back as a failed copy, not a dead kernel: 1 fault recovered".into(),
+        "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap ".into(),
+    ]);
+    markers
 }
 
 /// The tampered path: one byte of a SEGMENT changed on disk. The loader must refuse it, and

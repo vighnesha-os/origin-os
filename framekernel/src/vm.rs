@@ -204,30 +204,6 @@ pub(crate) fn unguard(page: u64) -> Result<(), MapError> {
     })
 }
 
-/// Whether every page of `[addr, addr + len)` is mapped as a **user** page. A system call
-/// must check this before touching a user pointer: while the kernel is identity-mapped in
-/// the lower half (ADR-0003 K2), a lower-half address can name kernel memory.
-pub(crate) fn user_readable(addr: u64, len: u64) -> bool {
-    let Some(end) = addr.checked_add(len) else {
-        return false;
-    };
-    crate::cpu::without_interrupts(|| {
-        let guard = KERNEL_SPACE.lock();
-        let Some(k) = guard.as_ref() else {
-            return false;
-        };
-        let mut page = addr & !(PAGE - 1);
-        while page < end {
-            match k.space.translate(&k.tables, page) {
-                Some(t) if t.user => {}
-                _ => return false,
-            }
-            page += PAGE;
-        }
-        true
-    })
-}
-
 /// Maps the 4 KiB page at physical `page` at its identity address (the lower half) with
 /// `access`: only for the AP trampoline, which runs there while paging comes on.
 pub(crate) fn map_identity(page: u64, access: Access) -> Result<(), MapError> {

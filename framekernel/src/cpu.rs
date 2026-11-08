@@ -113,9 +113,6 @@ pub(crate) unsafe fn init() {
         };
         *gate = d::interrupt_gate(*stub as usize as u64, KERNEL_CODE, ist);
     }
-    if let Some(gate) = idt.0.get_mut(usize::from(SYSCALL_VECTOR)) {
-        *gate = d::user_interrupt_gate((syscall_stub as *const ()).addr() as u64, KERNEL_CODE);
-    }
     let interrupts: [(u8, extern "sysv64" fn()); 12] = [
         (TIMER_VECTOR, timer_stub),
         (SPURIOUS_VECTOR, spurious_stub),
@@ -242,6 +239,8 @@ unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex) {
 pub(crate) use framekernel::cpumap::MAX_CPUS;
 /// IA32_GS_BASE: the base of GS in 64-bit mode.
 const GS_BASE: u32 = 0xC000_0101;
+/// IA32_KERNEL_GS_BASE: what `swapgs` exchanges with the base of GS.
+const KERNEL_GS_BASE: u32 = 0xC000_0102;
 
 /// A processor's dense CPU index (ADR-0008): its slot in every per-CPU array. The boot
 /// processor is 0; the others are numbered in MADT order at discovery
@@ -388,6 +387,11 @@ pub(crate) fn cpuid_apic_id() -> u32 {
 /// processor's TSS at `tss` — if this processor's x2APIC ID (from CPUID) is the one
 /// [`assign`]ed to `index`. Otherwise GS points at [`OUT_OF_RANGE`]: the processor never
 /// schedules, and `smp` sees its handshake fail.
+///
+/// While the kernel runs GS's base is this area and IA32_KERNEL_GS_BASE holds user mode's GS
+/// base (0 here, and never set by a program: FSGSBASE stays off). `swapgs` exchanges them
+/// at every boundary crossing, so user mode never sees the kernel's base and nothing it does
+/// to GS can reach the kernel.
 fn init_cpu_local(tss: u64, index: CpuIndex) {
     let local = match CPU_LOCAL.get(index.0) {
         Some(local) if index.apic_id() == Some(cpuid_apic_id()) => {
@@ -401,6 +405,9 @@ fn init_cpu_local(tss: u64, index: CpuIndex) {
     // x86-64 processor and only sets GS's base, which only the CPU-local accessors use
     // (`this_cpu`, `local`, `syscall_entry`).
     unsafe { wrmsr(GS_BASE, ptr::from_ref(local).addr() as u64) };
+    // SAFETY: CPL 0; IA32_KERNEL_GS_BASE exists on every x86-64 processor and only supplies
+    // the value `swapgs` loads into GS's base. Zero: user mode starts with a null GS base.
+    unsafe { wrmsr(KERNEL_GS_BASE, 0) };
     init_syscall();
 }
 
@@ -430,14 +437,16 @@ fn init_syscall() {
     unsafe { wrmsr(FMASK, SYSCALL_FMASK) };
 }
 
-/// The SYSCALL target: switches from the user stack to the running thread's kernel stack
-/// (from the CPU-local area; interrupts are off, SFMASK cleared IF), builds the frame an
-/// interrupt from user mode would have pushed (SS, RSP, RFLAGS from R11, CS, RIP from RCX)
-/// with vector [`SYSCALL_VECTOR`], and joins the common path, so system calls by `syscall`
-/// and by `int 0x80` are handled identically and return with IRETQ.
+/// The SYSCALL target, the only way into the kernel from ring 3 other than a fault or an
+/// interrupt (ADR-0005 P4): swaps the kernel's GS base in, switches from the user stack to
+/// the running thread's kernel stack (from the CPU-local area; interrupts are off, SFMASK
+/// cleared IF), builds the frame an interrupt from user mode would have pushed (SS, RSP,
+/// RFLAGS from R11, CS, RIP from RCX) with vector [`SYSCALL_VECTOR`], and joins the common
+/// path after its `swapgs`, returning with IRETQ.
 #[unsafe(naked)]
 extern "sysv64" fn syscall_entry() {
     naked_asm!(
+        "swapgs",
         "mov gs:[24], rsp",
         "mov rsp, gs:[16]",
         "push {ss}",
@@ -447,25 +456,17 @@ extern "sysv64" fn syscall_entry() {
         "push rcx",
         "push 0",
         "push {vector}",
-        "jmp {common}",
+        "jmp {saved}",
         ss = const d::USER_DATA,
         cs = const d::USER_CODE,
         vector = const SYSCALL_VECTOR,
-        common = sym exception_common,
+        saved = sym exception_saved,
     );
 }
 
 /// This processor's CPU-local area.
 fn local() -> &'static CpuLocal {
     CPU_LOCAL.get(this_cpu().0).unwrap_or(&OUT_OF_RANGE)
-}
-
-/// Address of this processor's CPU-local area (the value IA32_GS_BASE holds).
-pub(crate) fn cpu_local_base() -> u64 {
-    CPU_LOCAL
-        .get(this_cpu().0)
-        .map_or(ptr::from_ref(&OUT_OF_RANGE), ptr::from_ref)
-        .addr() as u64
 }
 
 /// Sets this processor's TSS.RSP0: the stack an interrupt or exception from user mode
@@ -487,57 +488,6 @@ pub(crate) fn set_kernel_stack(top: u64) {
     unsafe { field.write_volatile(top as u32) };
     // SAFETY: as above, the high word.
     unsafe { field.wrapping_add(1).write_volatile((top >> 32) as u32) };
-}
-
-/// Enters user mode at `rip` with stack `rsp`: loads the user data selector into DS, ES,
-/// FS and GS (so the return to CPL 3 nulls none of them), restores GS's base to `gs_base`
-/// (this CPU's CPU-local area, unreadable from user mode), zeroes every general-purpose
-/// register so no kernel value leaks, and returns with `iretq` to CPL 3 with interrupts
-/// enabled and IOPL 0.
-///
-/// # Safety
-///
-/// `rip` and `rsp` must be in user pages of the current address space; TSS.RSP0 must be the
-/// calling thread's kernel stack, which nothing else uses once this returns to user mode.
-#[unsafe(naked)]
-pub(crate) unsafe extern "sysv64" fn enter_user(rip: u64, rsp: u64, gs_base: u64) -> ! {
-    naked_asm!(
-        "mov r8, rdi",
-        "mov r9, rsi",
-        "mov eax, {data}",
-        "mov ds, ax",
-        "mov es, ax",
-        "mov fs, ax",
-        "mov gs, ax",
-        "mov ecx, {gs_msr}",
-        "mov eax, edx",
-        "shr rdx, 32",
-        "wrmsr",
-        "push {data}",
-        "push r9",
-        "push 0x202",
-        "push {code}",
-        "push r8",
-        "xor eax, eax",
-        "xor ebx, ebx",
-        "xor ecx, ecx",
-        "xor edx, edx",
-        "xor esi, esi",
-        "xor edi, edi",
-        "xor ebp, ebp",
-        "xor r8d, r8d",
-        "xor r9d, r9d",
-        "xor r10d, r10d",
-        "xor r11d, r11d",
-        "xor r12d, r12d",
-        "xor r13d, r13d",
-        "xor r14d, r14d",
-        "xor r15d, r15d",
-        "iretq",
-        data = const d::USER_DATA,
-        code = const d::USER_CODE,
-        gs_msr = const GS_BASE,
-    );
 }
 
 /// This processor's CPU index: one GS-relative load from its CPU-local area. On a
@@ -585,8 +535,8 @@ pub(crate) fn ioapic_irqs_on(cpu: CpuIndex) -> u64 {
         .get(cpu.get())
         .map_or(0, |n| n.load(Ordering::Relaxed))
 }
-/// The system-call vector, the only gate user mode may raise (DPL 3). RAX: 0 exit(RDI),
-/// 1 report(RDI); anything else returns `u64::MAX` in RAX.
+/// The vector in a system call's frame (no gate has it: `syscall` builds the frame itself,
+/// and `int 0x80` from ring 3 faults).
 pub(crate) const SYSCALL_VECTOR: u8 = 0x80;
 
 /// Local APIC timer interrupts taken since boot.
@@ -626,6 +576,10 @@ pub(crate) fn breakpoint() {
 extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     // The frame to resume: this one, unless the scheduler switches to another thread.
     let here = ptr::from_mut(frame).addr() as u64;
+    // A program can set RFLAGS.AC; the entry path must have cleared it for the kernel.
+    if frame.cs & 3 == 3 && SMAP_ON.load(Ordering::Relaxed) && read_rflags() & RFLAGS_AC != 0 {
+        AC_LEAKS.fetch_add(1, Ordering::Relaxed);
+    }
     // Device interrupts: the timer counts and acknowledges; a spurious interrupt needs no
     // EOI (SDM Vol. 3A, spurious interrupt).
     if frame.vector == u64::from(TIMER_VECTOR) {
@@ -711,24 +665,39 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         return crate::sched::on_block(here, frame.rdi);
     }
     if frame.vector == u64::from(SYSCALL_VECTOR) {
-        match frame.rax {
-            0 => {
-                crate::user::record_exit(frame.rdi);
-                return crate::sched::on_exit(here);
+        let args = [
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        ];
+        return match crate::syscall::run(frame.rax, args, frame.rip) {
+            crate::syscall::Outcome::Status(status) => {
+                frame.rax = status as u64;
+                here
             }
-            1 => {
-                crate::user::record_report(frame.rdi);
-                frame.rax = 0;
-            }
-            2 => frame.rax = sys_write(frame.rdi, frame.rsi),
-            _ => frame.rax = u64::MAX,
-        }
-        return here;
+            crate::syscall::Outcome::ThreadExit => crate::sched::on_exit(here),
+        };
     }
     // An exception in user mode ends that thread; the kernel carries on (crash isolation).
     if frame.vector < 32 && frame.cs & 3 == 3 {
-        crate::user::record_fault(frame.vector, frame.error_code, read_cr2());
+        let on_exception_stack = matches!(frame.vector, 8 | 18);
+        crate::syscall::user_fault(
+            frame.vector,
+            frame.error_code,
+            read_cr2(),
+            on_exception_stack,
+        );
         return crate::sched::on_exit(here);
+    }
+    // A page fault at the user-copy instruction, on a user address: resume at
+    // `probe_recover`, which returns "failed" to `copy_user`'s caller.
+    if frame.vector == 14
+        && frame.cs & 3 == 0
+        && frame.rip == (user_copy as *const ()).addr() as u64
+        && framekernel::usercopy::is_user_address(read_cr2())
+    {
+        USER_COPY_FAULTS.fetch_add(1, Ordering::Relaxed);
+        frame.rax = 0;
+        frame.rip = (probe_recover as *const ()).addr() as u64;
+        return here;
     }
     // A page fault at the exact instruction a probe armed: record it and resume at
     // `probe_recover`, which returns the error code to the probe's caller.
@@ -769,28 +738,22 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     crate::halt()
 }
 
-/// System call 2: writes `len` (at most 128) bytes from user address `buf` to the console
-/// as one line; returns the byte count or `EFAULT`.
-fn sys_write(buf: u64, len: u64) -> u64 {
-    let mut text = [0u8; 128];
-    let Some(dst) = usize::try_from(len).ok().and_then(|n| text.get_mut(..n)) else {
-        return EFAULT;
-    };
-    if let Err(e) = copy_from_user(dst, buf) {
-        return e;
-    }
-    let mut com1 = crate::console::Console::new();
-    let _ = com1.write_str("origin-kernel: user mode: write: ");
-    for &b in dst.iter() {
-        let c = if (0x20..0x7F).contains(&b) {
-            b as char
-        } else {
-            '?'
-        };
-        let _ = com1.write_char(c);
-    }
-    let _ = com1.write_str("\n");
-    len
+/// RFLAGS.AC: with SMAP on, the only thing that lets the kernel touch user pages.
+const RFLAGS_AC: u64 = 1 << 18;
+/// Kernel entries that found AC set after `exception_saved` should have cleared it.
+static AC_LEAKS: AtomicU64 = AtomicU64::new(0);
+
+/// How many entries from ring 3 reached kernel code with RFLAGS.AC set, for the boot proof.
+pub(crate) fn ac_leaks() -> u64 {
+    AC_LEAKS.load(Ordering::Relaxed)
+}
+
+/// RFLAGS.
+fn read_rflags() -> u64 {
+    let value: u64;
+    // SAFETY: PUSHFQ and POP touch only the stack and the output register.
+    unsafe { asm!("pushfq", "pop {}", out(reg) value, options(nomem, preserves_flags)) };
+    value
 }
 
 /// CR2: the linear address of the last page fault.
@@ -1132,49 +1095,54 @@ pub(crate) fn probe_execute_data() -> (u64, Probe) {
 /// Whether SMAP is enabled (so user accesses need `stac`/`clac`).
 static SMAP_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// The lowest and the end of the user range a system call may name (ADR-0003 K8: the
-/// lower half, page 0 excluded).
-const USER_LOW: u64 = 0x1000;
-const USER_END: u64 = 0x0000_8000_0000_0000;
-/// The error a system call returns for a bad user pointer (`-EFAULT`, as a u64).
-pub(crate) const EFAULT: u64 = (-14_i64) as u64;
+/// Page faults the user-copy instruction took and survived.
+static USER_COPY_FAULTS: AtomicU64 = AtomicU64::new(0);
 
-/// Copies `dst.len()` bytes from user address `src` into `dst`, checking first that the
-/// range lies in the user half and that every page of it is mapped as a user page, and
-/// surviving a fault during the copy: returns `Ok(())` or `Err(EFAULT)`.
-pub(crate) fn copy_from_user(dst: &mut [u8], src: u64) -> Result<(), u64> {
-    let len = dst.len() as u64;
-    let end = src.checked_add(len).ok_or(EFAULT)?;
-    if src < USER_LOW || end > USER_END {
-        return Err(EFAULT);
-    }
-    // The range test alone is not enough: the kernel is identity-mapped in the lower half
-    // for now, so every page must also be a user page. (A page unmapped after this check
-    // makes the copy fault, which is caught below.)
-    if !crate::vm::user_readable(src, len) {
-        return Err(EFAULT);
-    }
+/// How many user copies a page fault cut short.
+pub(crate) fn user_copy_faults() -> u64 {
+    USER_COPY_FAULTS.load(Ordering::Relaxed)
+}
+
+/// Copies `len` bytes from `src` to `dst`, one of which is a user address, and reports
+/// whether it finished: `false` means a page fault stopped it. Runs with interrupts on, so
+/// a long copy stays preemptible; `dispatch` recognizes a fault at the copy instruction by
+/// its address, not by per-CPU state a preempted copy would disturb.
+///
+/// # Safety
+///
+/// One of `dst` and `src` must be a live kernel buffer of `len` bytes, which this call may
+/// read or write. The other must be a range the caller checked against the calling
+/// process's own tables, on this processor's live address space: user memory, so that a
+/// fault in it is recovered (a fault on the kernel side is a kernel bug, and stops here).
+pub(crate) unsafe fn copy_user(dst: u64, src: u64, len: u64) -> bool {
     let smap = SMAP_ON.load(Ordering::Relaxed);
     if smap {
         // SAFETY: STAC only sets RFLAGS.AC, allowing supervisor access to user pages until
-        // the CLAC below; this code runs with interrupts disabled (system-call gate).
+        // the CLAC below. An interrupt in between saves AC in its frame, and every handler
+        // runs with it clear (`exception_saved`), until IRETQ restores it for this copy.
         unsafe { asm!("stac", options(nomem, nostack)) };
     }
-    let target = dst.as_mut_ptr().addr() as u64;
-    // SAFETY: `dst` is a live, writable kernel buffer of `len` bytes; the source range was
-    // checked to be in the user half, and a fault while reading it resumes at
-    // `probe_recover` (armed at the copy instruction) instead of taking the kernel down.
-    let result = run_probe((user_copy as *const ()).addr() as u64, || unsafe {
-        user_copy(target, src, 0, len)
-    });
+    // SAFETY: the caller's contract; a fault in the user range resumes at `probe_recover`
+    // instead of taking the kernel down.
+    let result = unsafe { user_copy(dst, src, 0, len) };
     if smap {
         // SAFETY: CLAC only clears RFLAGS.AC again.
         unsafe { asm!("clac", options(nomem, nostack)) };
     }
-    match result {
-        Probe::Completed => Ok(()),
-        Probe::Faulted { .. } => Err(EFAULT),
-    }
+    result == COMPLETED
+}
+
+/// Turns interrupts on for a system call, which runs on its own thread's stack.
+pub(crate) fn enable_interrupts() {
+    // SAFETY: CPL 0; every vector that can arrive has a gate, and the caller holds no lock
+    // that an interrupt handler on this processor may take.
+    unsafe { asm!("sti", options(nomem, nostack)) };
+}
+
+/// Turns interrupts off on the way back out of a system call.
+pub(crate) fn disable_interrupts() {
+    // SAFETY: CPL 0; CLI only clears RFLAGS.IF.
+    unsafe { asm!("cli", options(nomem, nostack)) };
 }
 
 /// `rep movsb` from RSI to RDI, RCX bytes (the fourth argument), as the first instruction,
@@ -1562,28 +1530,60 @@ extern "sysv64" fn probe_recover() {
     naked_asm!("ret");
 }
 
+/// The common entry of every vector: swaps the kernel's GS base in if the processor came
+/// from ring 3 (the CS it pushed, at [rsp + 24]), then joins [`exception_saved`].
+///
+/// A program controls its own GS, so nothing here trusts GS until the swap, and `dispatch`
+/// reads no CPU-local data for an NMI: an NMI that lands in the two instructions around
+/// `swapgs` on the way in or out finds user mode's GS base, but CS says ring 0.
+#[unsafe(naked)]
+extern "sysv64" fn exception_common() {
+    naked_asm!(
+        "test byte ptr [rsp + 24], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
+        "jmp {saved}",
+        saved = sym exception_saved,
+    );
+}
+
 /// Saves the general-purpose registers, calls [`dispatch`] with a pointer to the frame,
 /// switches to the frame `dispatch` returns (the same one, or another thread's saved frame
-/// with the same layout), restores its registers, drops the vector and error code, and
-/// returns from the interrupt into it.
+/// with the same layout), restores its registers, drops the vector and error code, swaps
+/// user mode's GS base back in if the frame returns to ring 3, and returns from the
+/// interrupt into it.
 ///
 /// On entry the stack holds, from the top: vector, error code, then the processor's frame.
 /// The processor aligned RSP to 16 bytes before its 40-byte frame; with the 16 bytes of
 /// error code and vector and 120 bytes of registers, RSP is 16-byte aligned at the `call`.
+///
+/// RFLAGS.AC is cleared if SMAP is on, whatever the interrupted code left in it: otherwise
+/// a program could set AC and turn SMAP off for the kernel code an interrupt runs (an
+/// interrupted user copy keeps its AC in the saved frame, and gets it back from IRETQ).
 #[unsafe(naked)]
-extern "sysv64" fn exception_common() {
+extern "sysv64" fn exception_saved() {
     naked_asm!(
         "push rax", "push rbx", "push rcx", "push rdx", "push rsi", "push rdi", "push rbp",
         "push r8", "push r9", "push r10", "push r11", "push r12", "push r13", "push r14", "push r15",
         "mov rdi, rsp",
         "cld",
+        "cmp byte ptr [rip + {smap}], 0",
+        "je 3f",
+        "clac",
+        "3:",
         "call {dispatch}",
         // `dispatch` returns the saved frame to resume: this one, or another thread's.
         "mov rsp, rax",
         "pop r15", "pop r14", "pop r13", "pop r12", "pop r11", "pop r10", "pop r9", "pop r8",
         "pop rbp", "pop rdi", "pop rsi", "pop rdx", "pop rcx", "pop rbx", "pop rax",
         "add rsp, 16",
+        "test byte ptr [rsp + 8], 3",
+        "jz 4f",
+        "swapgs",
+        "4:",
         "iretq",
+        smap = sym SMAP_ON,
         dispatch = sym dispatch,
     );
 }
@@ -1619,7 +1619,6 @@ macro_rules! soft_stub {
 soft_stub!(yield_stub, YIELD_VECTOR);
 soft_stub!(sleep_stub, SLEEP_VECTOR);
 soft_stub!(exit_stub, EXIT_VECTOR);
-soft_stub!(syscall_stub, SYSCALL_VECTOR);
 soft_stub!(shootdown_stub, crate::tlb::SHOOTDOWN_VECTOR);
 soft_stub!(block_stub, BLOCK_VECTOR);
 soft_stub!(reschedule_stub, RESCHEDULE_VECTOR);
