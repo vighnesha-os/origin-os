@@ -2151,129 +2151,225 @@ fn build_kernel_object(package: &str, out_dir: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Every third-party crate `Cargo.lock` may hold, at exactly this version. All of them are
-/// `loom` and what it brings, a host-only dev-dependency of `origin-sync`'s tests: approved by
-/// the owner with these versions, licences and sizes on 2026-11-08 (`SOURCE_PROVENANCE.md`,
-/// CLAUDE.md §5, §60). Changing this list is a new approval.
-const APPROVED_THIRD_PARTY: &[(&str, &str)] = &[
-    ("aho-corasick", "1.1.5"),
-    ("cc", "1.10.0"),
-    ("cfg-if", "1.0.5"),
-    ("find-msvc-tools", "0.1.15"),
-    ("generator", "0.8.11"),
-    ("lazy_static", "1.5.1"),
-    ("libc", "0.2.191"),
-    ("log", "0.4.34"),
-    ("loom", "0.7.2"),
-    ("matchers", "0.2.0"),
-    ("memchr", "2.8.3"),
-    ("nu-ansi-term", "0.50.3"),
-    ("once_cell", "1.21.4"),
-    ("pin-project-lite", "0.2.17"),
-    ("regex-automata", "0.4.18"),
-    ("regex-syntax", "0.8.11"),
-    ("rustversion", "1.0.23"),
-    ("scoped-tls", "1.0.1"),
-    ("sharded-slab", "0.1.7"),
-    ("shlex", "2.0.1"),
-    ("smallvec", "1.16.4"),
-    ("thread_local", "1.1.10"),
-    ("tracing", "0.1.44"),
-    ("tracing-core", "0.1.36"),
-    ("tracing-log", "0.2.0"),
-    ("tracing-subscriber", "0.3.23"),
-    ("valuable", "0.1.1"),
-    ("windows-link", "0.2.1"),
-    ("windows-result", "0.4.1"),
-    ("windows-sys", "0.61.2"),
+/// Where every crate in [`APPROVED_THIRD_PARTY`] comes from.
+const APPROVED_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+/// Every third-party crate the Loom workspace's lock file (`src/loom.lock`) may hold, as
+/// `name version sha256-of-the-crate`, and no others may be anywhere else: the root `Cargo.lock`
+/// holds none. All of them are `loom` and what it brings, used only by the host-only models
+/// (`loom.rs`): approved by the owner with these versions, licences and sizes on 2026-11-08
+/// (`SOURCE_PROVENANCE.md`, CLAUDE.md §5, §60). Changing this list is a new approval.
+const APPROVED_THIRD_PARTY: &[&str] = &[
+    "aho-corasick 1.1.5 c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba",
+    "cc 1.10.0 86e055fa6e3e40ad6187ba25b6855eeb635d5271f8e0f0e1e9a5826b8d75bea0",
+    "cfg-if 1.0.5 4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600",
+    "find-msvc-tools 0.1.15 1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48",
+    "generator 0.8.11 1be81b31c9ce4caf7f3178eeb90662bb1864d3ad363ec6bdada3201adff19c37",
+    "lazy_static 1.5.1 20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb",
+    "libc 0.2.191 65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a",
+    "log 0.4.34 f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6",
+    "loom 0.7.2 419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca",
+    "matchers 0.2.0 d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9",
+    "memchr 2.8.3 cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+    "nu-ansi-term 0.50.3 7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5",
+    "once_cell 1.21.4 9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50",
+    "pin-project-lite 0.2.17 a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd",
+    "regex-automata 0.4.18 ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2",
+    "regex-syntax 0.8.11 d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4",
+    "rustversion 1.0.23 cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f",
+    "scoped-tls 1.0.1 e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294",
+    "sharded-slab 0.1.7 f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6",
+    "shlex 2.0.1 f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba",
+    "smallvec 1.16.4 d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8",
+    "thread_local 1.1.10 1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070",
+    "tracing 0.1.44 63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100",
+    "tracing-core 0.1.36 db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a",
+    "tracing-log 0.2.0 ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3",
+    "tracing-subscriber 0.3.23 cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319",
+    "valuable 0.1.1 ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65",
+    "windows-link 0.2.1 f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5",
+    "windows-result 0.4.1 7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5",
+    "windows-sys 0.61.2 ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc",
 ];
 
-/// The crates that end up in a boot image, whose normal and build dependencies must all be
-/// first-party.
-fn shipping_packages() -> Vec<&'static str> {
-    let mut packages = vec![LOADER_PACKAGE, KERNEL_PACKAGE, VERSION_PACKAGE];
-    packages.extend_from_slice(FREESTANDING_LIBS);
-    packages
+/// One `[[package]]` of a `Cargo.lock`.
+#[derive(Debug, PartialEq, Eq)]
+struct LockedPackage {
+    name: String,
+    version: String,
+    source: Option<String>,
+    checksum: Option<String>,
 }
 
-/// The `(name, version)` of every package in a `Cargo.lock` that comes from outside the
-/// workspace (it has a `source`).
-fn third_party_in_lock(lock: &str) -> Vec<(String, String)> {
-    let mut found = Vec::new();
-    for package in lock.split("[[package]]").skip(1) {
-        let field = |key: &str| {
-            package.lines().find_map(|line| {
-                let value = line.strip_prefix(key)?.strip_prefix(" = \"")?;
-                value.strip_suffix('"').map(str::to_string)
-            })
-        };
-        if field("source").is_some()
-            && let (Some(name), Some(version)) = (field("name"), field("version"))
-        {
-            found.push((name, version));
+/// The packages of a `Cargo.lock`.
+fn locked_packages(lock: &str) -> Vec<LockedPackage> {
+    lock.split("[[package]]")
+        .skip(1)
+        .map(|package| {
+            let field = |key: &str| {
+                package.lines().find_map(|line| {
+                    let value = line.strip_prefix(key)?.strip_prefix(" = \"")?;
+                    value.strip_suffix('"').map(str::to_string)
+                })
+            };
+            LockedPackage {
+                name: field("name").unwrap_or_default(),
+                version: field("version").unwrap_or_default(),
+                source: field("source"),
+                checksum: field("checksum"),
+            }
+        })
+        .collect()
+}
+
+/// What is wrong with the root `Cargo.lock`: it must name the workspace's own packages and
+/// nothing else, so that nothing but this repository is an input to building the kernel
+/// (CLAUDE.md §5, §60, §75). A package with a source or a checksum came from somewhere else;
+/// any table but `[[package]]` (`[[patch.unused]]`, say) is something else to review.
+fn root_lock_problems(lock: &str) -> Vec<String> {
+    let foreign = locked_packages(lock)
+        .into_iter()
+        .filter(|package| package.source.is_some() || package.checksum.is_some())
+        .map(|package| {
+            let from = package.source.unwrap_or_else(|| "a checksum".to_string());
+            format!("{} {} ({from})", package.name, package.version)
+        });
+    let tables = lock
+        .lines()
+        .filter(|line| line.starts_with('[') && *line != "[[package]]")
+        .map(|line| format!("the table {line}"));
+    foreign.chain(tables).collect()
+}
+
+/// Each value of `"key":"..."` in the compact JSON of `cargo metadata`, or `None` if one holds
+/// an escape: a value that cannot be compared must not be guessed at.
+fn json_strings(json: &str, key: &str) -> Option<Vec<String>> {
+    let opening = format!("\"{key}\":\"");
+    json.match_indices(&opening)
+        .map(|(at, _)| {
+            let value = json.get(at + opening.len()..)?;
+            let value = value.get(..value.find('"')?)?;
+            (!value.contains('\\')).then(|| value.to_string())
+        })
+        .collect()
+}
+
+/// What is wrong with the workspace's manifests, from `cargo metadata --no-deps` (every
+/// dependency of every member, for every target and feature): a dependency on a registry or git
+/// crate, or a path dependency on anything but a member of the workspace. Such a path
+/// dependency is third-party code too, and a `Cargo.lock` shows it without a `source`.
+fn manifest_problems(metadata: &str) -> Result<Vec<String>> {
+    let strings = |key: &str| {
+        json_strings(metadata, key)
+            .ok_or_else(|| format!("cargo metadata: an escape in a {key} value"))
+    };
+    let manifests = strings("manifest_path")?;
+    let members: Vec<&Path> = manifests
+        .iter()
+        .filter_map(|manifest| Path::new(manifest).parent())
+        .collect();
+    let mut problems: Vec<String> = strings("source")?
+        .into_iter()
+        .map(|source| format!("a dependency from {source}"))
+        .collect();
+    problems.extend(
+        strings("path")?
+            .into_iter()
+            .filter(|path| !members.contains(&Path::new(path)))
+            .map(|path| format!("a path dependency outside the workspace: {path}")),
+    );
+    Ok(problems)
+}
+
+/// What is wrong with the Loom workspace's lock file: it must hold `origin-sync` and exactly the
+/// approved crates, each from the approved source at its pinned checksum.
+fn model_lock_problems(lock: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut approved_seen = Vec::new();
+    for package in locked_packages(lock) {
+        let shown = format!("{} {}", package.name, package.version);
+        match (package.source.as_deref(), package.checksum.as_deref()) {
+            (None, None) if package.name == "origin-sync" => {}
+            (Some(APPROVED_SOURCE), Some(checksum)) => {
+                let pinned = format!("{shown} {checksum}");
+                match APPROVED_THIRD_PARTY.iter().find(|a| **a == pinned) {
+                    Some(approved) => approved_seen.push(*approved),
+                    None => {
+                        problems.push(format!("{shown} at checksum {checksum} is not approved"))
+                    }
+                }
+            }
+            (source, checksum) => problems.push(format!(
+                "{shown}: unexpected source {source:?} or checksum {checksum:?}"
+            )),
         }
     }
-    found
+    problems.extend(
+        APPROVED_THIRD_PARTY
+            .iter()
+            .filter(|approved| !approved_seen.contains(*approved))
+            .map(|approved| format!("{approved} is approved but missing")),
+    );
+    problems
 }
 
-/// CLAUDE.md §5 and §60: `Cargo.lock` holds only the approved third-party crates at their
-/// approved versions, and no shipping crate has a third-party crate among its normal or build
-/// dependencies, for any target.
+/// Fails unless `lock`, the Loom workspace's lock file, is the approved one (CLAUDE.md §60, §75).
+fn check_model_lock(lock: &str) -> Result {
+    let problems = model_lock_problems(lock);
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the Loom workspace's lock file (developer-tools/xtask/src/loom.lock) is not the \
+             approved one (CLAUDE.md §5, §60):\n  {}",
+            problems.join("\n  ")
+        ))
+    }
+}
+
+/// CLAUDE.md §5, §60 and §75: the root `Cargo.lock` holds this workspace's packages and nothing
+/// else, no member reaches a crate outside the workspace, and the one third-party set there is
+/// (the host-only Loom workspace's) is the approved one, by source and checksum.
 fn dependency_check() -> Result {
     let path = repo_root().join("Cargo.lock");
     let lock = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let locked = third_party_in_lock(&lock);
-    let unapproved: Vec<String> = locked
-        .iter()
-        .filter(|(n, v)| !APPROVED_THIRD_PARTY.contains(&(n.as_str(), v.as_str())))
-        .map(|(n, v)| format!("{n} {v}"))
-        .collect();
-    if !unapproved.is_empty() {
+    let problems = root_lock_problems(&lock);
+    if !problems.is_empty() {
         return Err(format!(
-            "Cargo.lock holds third-party crates nobody approved at these versions (CLAUDE.md §5, \
-             §60):\n  {}",
-            unapproved.join("\n  ")
+            "Cargo.lock must hold only this workspace's packages (CLAUDE.md §5, §60, §75):\n  {}",
+            problems.join("\n  ")
         ));
     }
-    let root = repo_root();
-    let root_text = root.display().to_string();
-    for package in shipping_packages() {
-        let out = cargo()
-            .args([
-                "tree",
-                "--locked",
-                "--package",
-                package,
-                "--edges",
-                "normal,build",
-                "--target",
-                "all",
-                "--prefix",
-                "none",
-            ])
-            .output()
-            .map_err(|e| format!("cannot run cargo tree: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "cargo tree --package {package} failed:\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            ));
-        }
-        let tree = String::from_utf8_lossy(&out.stdout);
-        let outside: Vec<&str> = tree.lines().filter(|l| !l.contains(&root_text)).collect();
-        if !outside.is_empty() {
-            return Err(format!(
-                "{package} is a shipping crate but depends on crates outside the repository \
-                 (CLAUDE.md §5):\n  {}",
-                outside.join("\n  ")
-            ));
-        }
+    let out = cargo()
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+        ])
+        .output()
+        .map_err(|e| format!("cannot run cargo metadata: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "cargo metadata failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
+    let problems = manifest_problems(&String::from_utf8_lossy(&out.stdout))?;
+    if !problems.is_empty() {
+        return Err(format!(
+            "this workspace depends on crates outside it (CLAUDE.md §5, §60):\n  {}",
+            problems.join("\n  ")
+        ));
+    }
+    check_model_lock(loom::MODEL_LOCK)?;
     println!(
-        "xtask: dependency check: {} shipping crates depend on first-party crates only; \
-         Cargo.lock holds {} approved host-only crates",
-        shipping_packages().len(),
-        locked.len()
+        "xtask: dependency check: Cargo.lock holds only this workspace's {} packages, no member \
+         depends on anything outside it, and the Loom workspace's lock holds the {} approved \
+         crates at their pinned sources and checksums",
+        locked_packages(&lock).len(),
+        APPROVED_THIRD_PARTY.len()
     );
     Ok(())
 }
@@ -3302,10 +3398,15 @@ fn run() -> Result {
 
 #[cfg(test)]
 mod dependency_tests {
-    use super::{APPROVED_THIRD_PARTY, third_party_in_lock};
+    use super::{
+        APPROVED_THIRD_PARTY, LockedPackage, dependency_check, locked_packages, loom,
+        manifest_problems, model_lock_problems, root_lock_problems,
+    };
+
+    const REGISTRY: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
     #[test]
-    fn only_packages_with_a_source_count_as_third_party() {
+    fn a_lock_file_is_read_package_by_package() {
         let lock = r#"version = 4
 
 [[package]]
@@ -3316,32 +3417,152 @@ dependencies = [
 ]
 
 [[package]]
-name = "loom"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
-dependencies = [
- "cfg-if",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 "#;
         assert_eq!(
-            third_party_in_lock(lock),
+            locked_packages(lock),
             vec![
-                ("loom".to_string(), "0.7.2".to_string()),
-                ("cfg-if".to_string(), "1.0.5".to_string())
+                LockedPackage {
+                    name: "origin-sync".to_string(),
+                    version: "0.0.0".to_string(),
+                    source: None,
+                    checksum: None,
+                },
+                LockedPackage {
+                    name: "cfg-if".to_string(),
+                    version: "1.0.5".to_string(),
+                    source: Some(REGISTRY.to_string()),
+                    checksum: Some(
+                        "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+                            .to_string()
+                    ),
+                },
             ]
         );
-        assert!(third_party_in_lock("version = 4\n").is_empty());
+        assert!(locked_packages("version = 4\n").is_empty());
+    }
+
+    #[test]
+    fn the_root_lock_may_hold_workspace_packages_only() {
+        let own = "version = 4\n\n[[package]]\nname = \"origin-sync\"\nversion = \"0.0.0\"\n";
+        assert!(root_lock_problems(own).is_empty());
+
+        let registry = format!(
+            "{own}\n[[package]]\nname = \"loom\"\nversion = \"0.7.2\"\nsource = \"{REGISTRY}\"\n"
+        );
+        let problems = root_lock_problems(&registry);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].starts_with("loom 0.7.2"), "{problems:?}");
+
+        let checksum =
+            format!("{own}\n[[package]]\nname = \"x\"\nversion = \"1.0.0\"\nchecksum = \"00\"\n");
+        assert_eq!(root_lock_problems(&checksum).len(), 1);
+
+        let patch = format!("{own}\n[[patch.unused]]\nname = \"x\"\nversion = \"1.0.0\"\n");
+        assert_eq!(root_lock_problems(&patch), ["the table [[patch.unused]]"]);
+    }
+
+    #[test]
+    fn a_path_dependency_must_be_a_member_of_the_workspace() {
+        let member = r#""manifest_path":"/repo/framekernel/Cargo.toml""#;
+        let sync = r#""manifest_path":"/repo/framekernel/sync/Cargo.toml""#;
+        let inside = format!(
+            r#"{{"packages":[{{"source":null,"dependencies":[{{"source":null,"path":"/repo/framekernel/sync"}}],{member}}},{{"source":null,"dependencies":[],{sync}}}]}}"#
+        );
+        assert_eq!(manifest_problems(&inside).unwrap(), Vec::<String>::new());
+
+        for outside in ["/elsewhere/sync", "/repo/vendor/not-a-member", "/repo"] {
+            let metadata = inside.replace("/repo/framekernel/sync\"}", &format!("{outside}\"}}"));
+            let problems = manifest_problems(&metadata).unwrap();
+            assert_eq!(
+                problems,
+                [format!(
+                    "a path dependency outside the workspace: {outside}"
+                )]
+            );
+        }
+
+        // The manifest of a registry crate, however it is resolved.
+        let registry = inside.replace(
+            r#""source":null,"path":"/repo/framekernel/sync""#,
+            r#""source":"registry+x""#,
+        );
+        assert_eq!(
+            manifest_problems(&registry).unwrap(),
+            ["a dependency from registry+x"]
+        );
+
+        assert!(manifest_problems(r#"{"path":"/repo/a\"b"}"#).is_err());
+    }
+
+    #[test]
+    fn the_committed_model_lock_is_the_approved_one() {
+        assert_eq!(model_lock_problems(loom::MODEL_LOCK), Vec::<String>::new());
+    }
+
+    #[test]
+    fn any_change_to_the_model_lock_is_found() {
+        let lock = loom::MODEL_LOCK;
+        // A crate at another version, from another source, at another checksum, or new: each is
+        // a change someone has to approve.
+        let checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca";
+        assert!(lock.contains(checksum));
+        for (from, to) in [
+            (
+                checksum,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            (
+                "name = \"loom\"\nversion = \"0.7.2\"",
+                "name = \"loom\"\nversion = \"0.7.1\"",
+            ),
+            (
+                "name = \"loom\"\nversion = \"0.7.2\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"",
+                "name = \"loom\"\nversion = \"0.7.2\"\nsource = \"git+https://example.invalid/loom#0\"",
+            ),
+        ] {
+            assert!(lock.contains(from), "{from}");
+            let changed = lock.replace(from, to);
+            assert!(!model_lock_problems(&changed).is_empty(), "{to}");
+        }
+        // A crate the lock lost.
+        let start = lock.find("[[package]]\nname = \"loom\"").unwrap();
+        let end = lock[start + 1..].find("[[package]]").unwrap() + start + 1;
+        let without = format!("{}{}", &lock[..start], &lock[end..]);
+        let problems = model_lock_problems(&without);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("loom 0.7.2") && p.contains("missing")),
+            "{problems:?}"
+        );
+        // An unapproved crate, and a package of unknown origin with no source.
+        for extra in [
+            format!(
+                "\n[[package]]\nname = \"new\"\nversion = \"1.0.0\"\nsource = \"{REGISTRY}\"\nchecksum = \"ab\"\n"
+            ),
+            "\n[[package]]\nname = \"elsewhere\"\nversion = \"1.0.0\"\n".to_string(),
+        ] {
+            assert_eq!(
+                model_lock_problems(&format!("{lock}{extra}")).len(),
+                1,
+                "{extra}"
+            );
+        }
     }
 
     #[test]
     fn the_approved_list_is_sorted_and_has_no_duplicates() {
-        assert!(APPROVED_THIRD_PARTY.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!(APPROVED_THIRD_PARTY.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// The gate itself, on this repository's real `Cargo.lock` and `cargo metadata`.
+    #[test]
+    fn this_workspace_passes_its_dependency_check() {
+        dependency_check().unwrap();
     }
 }
 
