@@ -1032,3 +1032,32 @@ The owner asked whether the decision sheet's recommendations had been checked ag
 - M4's system-call boundary needs its own threat model (§58).
 - **The owner:** the sheet. ADR-0007 also waits on the spec checks (items 18 and 23).
 
+### Continued (2026-11-08, ~16:35 IST): threat T4, bus mastering (`claude/agitated-raman-4a0775`, on `72285c5`; not pushed, not merged)
+
+The task (IOMMU-T4) closed what could be closed of threat T4 in `docs/engineering/THREAT_MODEL_IOMMU.md`: a device the firmware left bus-mastering writes memory until translation is on.
+
+| Commit | What |
+|---|---|
+| `36d664a` | the quiesce (`pci`, `pcie`), `DeviceDma::enable_bus_master`, both drivers' bind paths, the boot order, xtask markers, `boot-bridge`; ledger, ADR-0007 I12, threat model |
+| `ffbc42f`, `3ea8d7c` | the translating line only when translation is on; the quiesce line's wording |
+| (records) | provenance, STATUS, TASKS, the ledger's measurements, this section |
+
+What changed in the boot:
+- `pcie::quiesce` runs right after the kernel's page tables and heap: every function of every MCFG window, bridges included, Bus Master Enable cleared and read back. The IOMMU's own function (AMD-Vi, named by the IVRS) is left alone. `pcie::settle` waits for Transactions Pending once the TSC is calibrated.
+- `iommu::init` runs before `smp::start`, not after `pcie::init`. `pcie::init` (PAT everywhere, the function list, BAR sizing) now runs after SMP as before, and takes the online CPUs.
+- Drivers set the bit only through `dma::DeviceDma::enable_bus_master`, after attaching; the NVMe driver also after resetting the controller. `pcie::enable` is gone (`pcie::enable_memory` does decoding only).
+- virtio-net refuses a device without `VIRTIO_F_ACCESS_PLATFORM` while the IOMMU translates (ADR-0007 I10 tightened).
+
+Merge notes for the M4 and signed-boot sessions: `framekernel/src/main.rs` (the boot order around `memory::init`, `timer::init`, `smp::start`, `pcie::init`; `quiesced`), `developer-tools/xtask/src/main.rs` (marker order: the ECAM line moved before the heap proofs, the IOMMU lines before the MADT line, a new `qemu_bridge`/`boot-bridge`), and the records.
+
+Lessons:
+- **OVMF left every function bus-mastering, even the host bridge.** QEMU's reset value is 0 for all of them (read with the monitor before any firmware ran), so the firmware set each one. A control that relies on the firmware's state must check it first (the older lesson, now confirmed function by function).
+- **QEMU's model cannot show two things:** a bridge's Bus Master Enable stopping traffic (only the function's own bit gates its DMA) and a real Transactions Pending bit. The read-backs and C6/C7 cover the code; the effect needs hardware.
+- **Two proofs in the old boot can flake under host load:** `clock failed` (the RTC did not complete two updates in 1.2 s; `time::init`, whose window is the 244 µs update-in-progress pulse, is probably missed under host load, not investigated) and `timers failed` (a 7 ms lateness). They appeared while another session's `yes` stress run pushed the load past 200 (three of thirteen control boots, and several gate attempts on the final tree), and in those runs the TSC calibration itself can come out wrong (`TSC 4270 MHz` instead of about 1000). Neither proof touches this code. A failed run names the proof that failed, so check that line before blaming a change.
+
+Gates on the final tree (`35a5189`): `cargo xtask check`: 687 tests, 0 failures, 6 ignored (681 before); `boot-test`; `boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs; one attempt stopped on the `clock failed` flake, the next passed); `boot-x2apic` (leaves 1Fh and 0Bh; two attempts stopped on that flake, the third passed); `boot-bridge` (both IOMMUs). Controls C1–C10 each failed the boot and were restored (C2 to C10 run one commit earlier, C1 again on the final wording).
+
+#### Next
+
+- **The owner:** ADR-0007 question 9 (clearing bus mastering on every function, the bridges included; leaving the AMD IOMMU's own function alone).
+- Hardware (§74): the ordering claim in the ledger §2 (the read-back flushing posted writes) against the PCIe text, the AMD function's bit, firmware-owned controllers (USB legacy, a firmware framebuffer) when they exist, and VT-d's Abort DMA Mode (`ECAP.ADMS`, Rev 5.20 §3.4.4), which would bring translation up before any table exists and cannot be proven under QEMU.
