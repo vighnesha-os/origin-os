@@ -5,8 +5,8 @@
 | As of | 2026-11-08, on `claude/interesting-carson-ae7c83`, with signed boot and the crypto vectors merged. M4, Loom, the RTC fix and early-boot DMA are not merged and may add to this list. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–9, 13–22, 24 and 25. |
-| Still open | Item 23 (you are comparing the AMD manuals), then items 10–12. Choosing machines from the shortlist. Item 26. |
+| Answered | 2026-11-08: items 1–9, 13–22 and 24–26. |
+| Still open | Item 23 (you are comparing the AMD manuals), then items 10–12. Choosing machines from the shortlist. |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -74,7 +74,7 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 | # | Question | Recommendation | Why |
 |---|---|---|---|
 | 21, answered | The project licence? | **MIT OR Apache-2.0** (your choice, 2026-11-08) | `LICENSE-MIT` and `LICENSE-APACHE` are in the repository. The repository stays public. Much of this code is AI-written, and how copyright applies to that is unsettled, so take legal advice if it matters commercially. |
-| 22, answered | Push this branch and open a PR against PR #1's branch? | **Yes, after merging the finished side work** (your choice, 2026-11-08) | Signed boot and the crypto vectors are merged here. M4, Loom, the RTC fix and early-boot DMA are not, because they are not finished. A PR is review, not a merge (§80). |
+| 22, answered | Push this branch and open a PR against PR #1's branch? | **Yes, after merging the finished side work** (your choice, 2026-11-08) | Signed boot and the crypto vectors are merged here. M4, Loom, the RTC fix and early-boot DMA stay on their own branches: they were not finished when you chose this, and each needs your word to merge. A PR is review, not a merge (§80). |
 | 23, yours to do | Compare two AMD manuals with AMD's own copies? | **You are comparing them** (your choice, 2026-11-08). Items 10–12 follow | §3 requires legitimate specifications and §16 a confirmed revision. Both were read from the kib.kiev.ua mirror because AMD's site refuses automated reads. Download each from AMD and run `shasum -a 256` on it. IOMMU spec 48882 Rev 3.11: `f7c375a15db5ed63de760356867211063d164a2ed59f2d38613daec95894ce22`. APM Vol. 3, 24594 Rev 3.39: `b598514b19f204d973040d9867a7ffc48c949009a8b3dc86b20c9188e721ee45`. |
 | 24, answered | Which 2026+ Intel and AMD machines are the declared targets, and what physical x86 test hardware? | **Research a shortlist first** (your choice, 2026-11-08): `docs/hardware/SHORTLIST.md` | §74 requires multiple Intel and AMD models, with SMT, hybrid and NUMA variations, and §76 a declared scope. CET shadow stacks, hybrid cores and real IOMMU behaviour cannot be shown under QEMU, and this Mac can't run x86 natively. |
 
@@ -89,7 +89,7 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 
 | # | Question | Recommendation | Why |
 |---|---|---|---|
-| 26 | Errata V1–V6 and open gaps O2–O5 from the signed-boot work, and OpenSSL 3.5+ as the host signing tool (`docs/spec/ONBF-errata.md`, `docs/research/2026-11-08-krn-signature-verification.md`) | **Not reviewed yet** | The readings are applied in the code while Proposed. The gaps block certificate chains, not the test-key path. |
+| 26, answered | Errata V1–V6 and open gaps O2–O5 from the signed-boot work, and OpenSSL 3.5+ as the host signing tool (`docs/spec/ONBF-errata.md`, `docs/research/2026-11-08-krn-signature-verification.md`) | **V1–V6 accepted. O2: `origin/onbf/1/okc`. O3: check against signed time. O4: exact IDs only. O5: bare public keys. Host signing: original Rust (`onbf-sign`), not OpenSSL. Zeroization: best effort for host development keys** (your choices, 2026-11-08, in the signed-boot session) | Certificate chains are now specified and wait for the SYS profile's signed time. Release keys belong in an HSM (§60). O1 was already answered as item 17. |
 
 **Also found by the same check, not decisions for now:** ADR-0002, ADR-0004 and ADR-0005, already Accepted, have no migration consequences either (§18). The system-call boundary M4 is building has no threat model yet (§58).
 

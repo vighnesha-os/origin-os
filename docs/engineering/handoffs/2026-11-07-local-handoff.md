@@ -1125,3 +1125,63 @@ On branch **`claude/adoring-hopper-a8f66b`** (on `claude/interesting-carson-ae7c
 #### Next
 
 Backlog: OKC chains once SYS exists; item 4 (M3 scheduling) and the rest as they were.
+
+### Continued (2026-11-08, ~17:00–19:15 IST): signed boot and the crypto vectors merged, the licence, the hardware shortlist, and the branch pushed for review
+
+On branch **`claude/interesting-carson-ae7c83`**. The owner answered four questions on 2026-11-08: the licence is MIT OR Apache-2.0; merge the finished side branches (signed boot and the crypto vectors), run every gate, then push and open a PR; the owner compares the two AMD manuals; research a hardware shortlist.
+
+| What | Commit |
+|---|---|
+| The crypto vectors merged | `9e46aed` |
+| Signed boot merged | `e101bc7` |
+| The licence: `LICENSE-MIT`, `LICENSE-APACHE`, every package | `b45dc34` |
+| `docs/hardware/SHORTLIST.md`: research only, nothing bought or tested | `30993b0` |
+| Signed boot's later commits: the owner's answers, host signing in Rust | `d0e91d1` |
+
+**Result, on `d0e91d1`** (only documents changed after it): `cargo xtask check` passes with 752 tests passed, 0 failed, 6 ignored. `cargo xtask boot-matrix` passes in full at 19:10 IST: both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic` under leaves 1Fh and 0Bh, each 11 of 11 scenarios. Peak host load 4.83, one QEMU at a time.
+
+**That pass was the sixth attempt on this tree.** The first five failed:
+
+| Attempt | Host | Failed at | Proof |
+|---|---|---|---|
+| 1 | Load 170, another QEMU running | Intel, 1 CPU | `the RTC did not complete two updates in 1.2 s` |
+| 2 | Load 94, another QEMU running | Intel, 2 CPUs | `timers`: worst lateness 2205 us (limit 2 ms) |
+| 3 | Load 57, another QEMU running | Intel, 1 CPU | The RTC wait again |
+| 4 | Load 5 at the start; another session's control boots ran during it | AMD, 2 CPUs | `one RTC second lasted 740508 us` |
+| 5 | Load 66, another QEMU running | Intel, 1 CPU | The RTC wait again |
+| 6 | Quiet (peak load 4.83) | None | Full pass |
+
+The tree before the last merge failed six times on the clock proofs before it passed in full at 17:13 at load 6.6. Most of the load came from other sessions measuring exactly this problem, with one `yes` per core.
+
+#### What to know
+
+- **The boot gates are unreliable on a loaded host**, and that is a defect of the gates. Three kinds of proof depend on QEMU keeping real time under TCG: the clock proofs (fixed on `20b8817`, not merged), the scheduler's weighted shares (fixed on `118834b`, not merged), and the timer-queue and ping-pong proofs (no fix yet; that session reports they still fail at double load). Run `boot-matrix` with nothing else booting.
+- A pass after retries shows only that the proofs can pass. Each failure was a timing proof, and the loader's signature check had already passed in those boots, but a timing bug in the merged code could hide among them. The quiet pass is the evidence.
+- **O1 was decided as item 17** (a statement's `id` is printable ASCII). The signed-boot section above lists it as open because that session did not know.
+- `docs/hardware/SHORTLIST.md` asks one question: does "introduced in 2026 or later" (CLAUDE.md, header) mean the platform, or would a 2026 CPU on an older socket do? On the first reading, start with #2 and #5; on the second, #1 and #4 are much easier first machines.
+- There are no GitHub workflows in this repository, so a pull request runs no CI. The gates above are the evidence.
+
+#### Open for the owner
+
+- Item 23: compare the two AMD manuals with AMD's own copies. Items 10–12 and ADR-0007's acceptance follow it.
+- Which reading of the hardware target, then which machines.
+- Review and merge: PR vighnesha-os/origin-os#1, and the pull request stacked on it.
+- Whether to merge these. None is on this branch:
+
+| Branch | Tip | What |
+|---|---|---|
+| `claude/musing-hamilton-587f7b` | `20b8817` | The clock proofs tolerate a loaded host |
+| `claude/elegant-thompson-48edc8` | `118834b` | The scheduler share proof too, on top of `20b8817` |
+| `claude/agitated-raman-4a0775` | `494f872` | Early-boot DMA; T4 partly closed |
+| `claude/cranky-ramanujan-88d205` | `dc855db` | M4: system calls, handles, channels |
+| `claude/unruffled-morse-eade76` | `e4c6bbe` | Loom models |
+
+#### Not done
+
+- The independent review of the cryptography that §59 requires; so far it has only been reviewed by agents.
+- Nine of the 24 IOMMU threats are open, and T4, T5 and T6 are the most serious.
+- Nothing has run on physical hardware (§74).
+
+#### Next
+
+Merge the clock and scheduler fixes if the owner agrees, since the unreliable gates are what made this push slow. Then the timer-queue and ping-pong proofs.

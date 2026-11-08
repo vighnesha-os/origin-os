@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| Updated | 2026-11-08, ~16:00 IST (the external crypto vectors and the loader's signature check merged into the IOMMU branch) |
-| Branch | `claude/interesting-carson-ae7c83`, **pushed for review** as a pull request against `m0/toolchain-verification`. It holds the IOMMU work (Intel VT-d and AMD-Vi), dense CPU indexes and a processor above APIC ID 255, AP parking, I/O APIC interrupt remapping, parser hardening, the ONBF multi-fault soak, CPU topology, the external crypto vectors and the loader's signature check. Still on their own branches, unfinished: M4 system calls, Loom models, the RTC wait, early-boot DMA. `m0/toolchain-verification` is open as PR vighnesha-os/origin-os#1 and is not merged into `main`. |
+| Updated | 2026-11-08, ~19:15 IST (the crypto vectors, the loader's signature check and Rust host signing merged into the IOMMU branch; licence chosen; hardware shortlist written; branch pushed for review) |
+| Branch | `claude/interesting-carson-ae7c83`, **pushed for review** as a pull request against `m0/toolchain-verification`. It holds the IOMMU work (Intel VT-d and AMD-Vi), dense CPU indexes and a processor above APIC ID 255, AP parking, I/O APIC interrupt remapping, parser hardening, the ONBF multi-fault soak, CPU topology, the external crypto vectors, the loader's signature check and Rust host signing. On their own branches, not merged here: the RTC wait, early-boot DMA, M4 system calls and the Loom models. `m0/toolchain-verification` is open as PR vighnesha-os/origin-os#1 and is not merged into `main`. |
 | Reproduce | `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs in QEMU 11.1.3 (TCG) + OVMF only; nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
 
@@ -67,11 +67,11 @@ The owner accepted ADR-0006 (OriginFS v0, as a bring-up format that never ships 
 One ADR is still **Proposed**:
 - **ADR-0007**, DMA isolation and interrupt remapping (Intel VT-d and AMD-Vi). It is kernel-internal, so it is implemented and boot-proven while Proposed. The owner answered all but its three AMD-Vi questions on 2026-11-08; those wait on a check of AMD's manual (`docs/engineering/OWNER_DECISIONS.md`).
 
-Errata **V1–V6 and O2–O5** were decided by the owner on 2026-11-08, along with Rust host signing: `docs/spec/ONBF-errata.md`. Certificate chains are specified but wait for the SYS profile's signed time (O3). **O1** stays open.
+Errata **V1–V6 and O2–O5** were decided by the owner on 2026-11-08, along with Rust host signing: `docs/spec/ONBF-errata.md`. Certificate chains are specified but wait for the SYS profile's signed time (O3). **O1** was decided the same day: a statement's `id` is printable ASCII.
 
 For the host signer the owner accepted best-effort zeroization of development keys (2026-11-08); release keys belong in an HSM.
 
-Also waiting on the owner: a check of the AMD IOMMU specification (48882 Rev 3.11) read from a mirror against AMD's own copy (its SHA-256 is in the AMD-Vi research ledger). Still the owner's too, because they are not design: merging PR #1 into `main`; and, for production qualification, declaring the supported 2026+ Intel/AMD reference platforms and providing physical x86 test machines (CLAUDE.md §74, §76 — nothing is qualified on hardware until then). Details: `docs/engineering/TASKS.md`.
+Also waiting on the owner: a check of the AMD IOMMU specification (48882 Rev 3.11) read from a mirror against AMD's own copy (its SHA-256 is in the AMD-Vi research ledger). Still the owner's too, because they are not design: merging PR #1 into `main`; and, for production qualification, declaring the supported 2026+ Intel/AMD reference platforms and providing physical x86 test machines (CLAUDE.md §74, §76 — nothing is qualified on hardware until then). A researched shortlist, with nothing bought, is in `docs/hardware/SHORTLIST.md`. Details: `docs/engineering/TASKS.md`.
 
 ## Where the evidence is
 
