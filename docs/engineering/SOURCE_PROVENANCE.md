@@ -1674,6 +1674,19 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Merge resolution and the ported soak; no new mechanism. No operating system's code was read or copied (CLAUDE.md §3).
 - **Licensing:** project licence not chosen yet.
 
+### The owner's decisions of 2026-11-08 applied (`onbf-format` signature parser; xtask; errata O1; ADR-0008 question 3)
+
+- **What:**
+  - A signature statement's `id` must be non-empty printable ASCII (0x20–0x7E). `SignatureBlock::parse` refuses anything else with the field error for key 3. This is errata O1, the same rule as R4, so the parser needs no Unicode tables.
+  - `cargo xtask boot-matrix` ends with `boot-x2apic`.
+- **Test evidence (2026-11-08):**
+  - `cargo xtask check`: 682 tests, 0 failures, 6 ignored.
+  - `a_statement_id_must_be_printable_ascii` covers both ends of the printable range, composed and decomposed non-ASCII forms, and control characters. The multi-fault soak's model was updated to the same rule.
+  - **Negative control:** with the check removed, both that test and `mutated_signature_blocks_get_the_models_verdict` fail. Restored from a saved copy.
+  - `cargo xtask boot-matrix`: a full run passes (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs, then `boot-x2apic` on leaves 1Fh and 0Bh).
+  - **Two earlier full runs failed,** at different configurations, with `clock: the RTC did not complete two updates in 1.2 s`, while other sessions were loading the machine. Running each of the eight configurations alone then passed every one first time. The cause is in `time.rs`'s `update_end`, unchanged here: QEMU's RTC shows its update bit only for the last 244 µs of each second (`UIP_HOLD_LENGTH`), and a descheduled virtual CPU can miss it.
+- **Licensing:** project licence not chosen yet.
+
 ### Signature-block parser (ONBF §7.1–§7.2, encodings S1–S4), added 2026-11-07
 
 - **What:** `signature::SignatureBlock::parse`: "ONBFSIG1", version 1, 1–8 length-prefixed entries; each entry a canonical OCBOR-1 map with exactly keys 1–7 (key 8, the transparency-log proof, is refused in v1); role 1–5 (S1) with its FIPS 204 context string from a table; suite 1–2 (S2), fixed by the role (kernel and release need OSS-1R); 32-byte key ID; the certificate array kept raw for the chain verifier; the statement as a map with exactly keys 0–6 (S3), whose exact encoded bytes are returned for the signatures; 64-byte Ed25519 and suite-length ML-DSA signatures; the statement's role must equal the entry's; no (role, key) twice. Verification (digest, both signatures, chain) is not wired yet.

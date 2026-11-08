@@ -41,6 +41,7 @@ ONBF-R6 requires that a file have exactly one valid reading, and §13 item 6 say
 | G4 | §4.3, §6.1 | Segment `mem_size` alignment, and the order and overlap of segment memory ranges, were not stated. | **Page-multiple, sorted, disjoint.** A SEGMENT's `mem_size`, like its `mem_offset`, is a multiple of 4 KiB. SEGMENT sections appear in ascending `mem_offset` order (table order) and never overlap. Unmapped gaps, such as guard pages, are allowed. Every segment ends within the 2 GiB image span (`mem_offset + mem_size ≤ 2^31`) in EXE, LIB and KRN. The Appendix A limit of 16 segments applies to EXE and LIB. | `onbf-format` (`MemoryLayout`, `SegmentOrder`, `SegmentSpan`, `TooManySegments`) |
 | G1 | §6.5, §4.4 | The SYM profile holds "DWARF and line tables", but §4.4 had no section kind for them. | **A new kind, `0x00F2 DWARF`, allowed only in SYM.** One section per DWARF section, never MAPPABLE (SYM is never mapped), so it may be compressed; REQUIRED like every section (G5). The SYM manifest's `dwarf_sections` key (25) lists `[section_index, name]` pairs in ascending index order, each name one of `.debug_info`, `.debug_abbrev`, `.debug_line`, `.debug_line_str`, `.debug_str`, `.debug_str_offsets`, `.debug_addr`, `.debug_rnglists`, `.debug_loclists`, `.debug_frame` and `.debug_aranges`, each at most once. ONBF stays 1.0: no SYM image existed before this decision. | `onbf-format` (`Kind::Dwarf`, SYM only) |
 | G5 | §4.3, §4.4 | After C13, REQUIRED no longer changed anything for a v1 reader except on MANIFEST. | **REQUIRED is set on every section.** That is truthful in v1, because every section must be understood, and gives one encoding. Writers (`onbf-pack`, the SDK tools) always set it. The bit keeps its meaning in case a future major version brings optional kinds back. | `onbf-format` (`RequiredNotSet`) |
+| O1 | S3, §5 | A statement's `id` is `text (NFC)`, but the signature-block parser has no Unicode normalization tables. Found by the multi-fault soak (2026-11-08). | **Decided 2026-11-08: non-empty printable ASCII (0x20–0x7E)**, the rule R4 applies to the manifest's text, which is trivially NFC. An `id` is a machine identifier; human-readable names belong in localized metadata. | `onbf-format` signature-block parser (`SignatureBlock::parse`); the Package Service's ID-namespace checks |
 
 ## Readings applied without a separate decision
 
@@ -73,9 +74,7 @@ Applied in code on 2026-11-07 and pinned by tests. **Accepted as normative the s
 
 ## Open gaps
 
-| # | Spec | Gap | Who needs it |
-|---|---|---|---|
-| O1 | S3, §5 | `id` is `text (NFC)`, but the signature-block parser has no Unicode normalization tables, and R4 avoided them for the manifest's text by restricting it to ASCII. Today the parser checks only that `id` is non-empty valid UTF-8, so a non-NFC `id` parses. The owner decides: restrict `id` to ASCII (as R4), or give the parser NFC tables. Found while the soak was being written (2026-11-08). | `onbf-format` signature-block parser; the Package Service's ID-namespace checks |
+None at present.
 
 ## Observed by the bit-flip sweep
 

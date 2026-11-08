@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Proposed** (2026-11-08). The owner accepts ADRs (CLAUDE.md §18, §84). This is kernel-internal (no ABI or format), so it is implemented and boot-proven while Proposed. It amends ADR-0003 K7 ("one run queue per CPU, indexed by x2APIC ID for now") and the per-CPU note at the end of ADR-0003. C7 (added the same day) completes the failure path of ADR-0003 K6 without changing K6's design. |
+| Status | **Accepted** by the owner on 2026-11-08: the four questions below answered with the recommended option each. Kernel-internal (no ABI or format). It amends ADR-0003 K7 ("one run queue per CPU, indexed by x2APIC ID for now") and the per-CPU note at the end of ADR-0003. C7 (added the same day) completes the failure path of ADR-0003 K6 without changing K6's design. |
 | Requires | CLAUDE.md §18 (scheduler, kernel architecture), §24 (APIC/x2APIC, per-CPU state, CPU topology), §27 (topology-aware scheduling) |
 | Evidence | `docs/research/2026-11-08-x2apic-above-255.md` (how QEMU 11.1 presents an APIC ID above 255, what its MADT and SRAT list, what failed before); `cargo xtask boot-x2apic` and its negative controls in `docs/engineering/SOURCE_PROVENANCE.md` ("CPU indexes and processors above APIC ID 255"); for C7, the park drill on every boot and controls N1–N3 in the same file ("AP start-up: parking an AP that misses its handshake") |
 | Related | ADR-0003 (K6 SMP start-up, K7 scheduler), ADR-0007 I8 (interrupt remapping with 32-bit x2APIC destinations) |
@@ -15,7 +15,7 @@ x2APIC IDs are 32-bit and sparse. Firmware builds an ID from topology fields (pa
 
 With interrupt remapping (ADR-0007 I8) an MSI can reach any 32-bit APIC ID, but the kernel could not run on such a processor. Booted on that QEMU machine, it failed with `ACPI processor discovery failed: invalid MADT` (150 structures for a 64-entry buffer) and `numa: invalid SRAT`. Even with bigger buffers, APIC ID 256 had no CPU-local area and no run queue: it would never schedule.
 
-## Proposed decisions
+## Decisions
 
 ### C1. A dense CPU index, given at discovery
 The boot processor is index 0, wherever and whether the MADT lists it. Every other processor the MADT marks **enabled** gets the next index, in table order. A processor listed twice (as type 0 and type 9 structures) gets one index; processors that are not enabled get none, so hot-plug is a later step. The rule lives in `framekernel::cpumap` (safe code, host-tested, including a randomized invariant test).
@@ -72,9 +72,9 @@ None on disk and none at any ABI: `CpuIndex` is kernel-internal and is not expos
 - Hot-plug extends the map; an index already given must not change.
 - If the SDK ever exposes processors (affinity, §25), that needs its own stable identifier and ABI decision. `CpuIndex` should not be it.
 
-## Questions for the owner
+## Questions for the owner (answered 2026-11-08: the recommended option for all four)
 
-1. Accept dense indexes in MADT order with the boot processor as 0 (C1), and `CpuIndex` as the only per-CPU array index (C2)?
-2. Keep 64 static per-CPU slots for now, and report and leave extra processors in firmware (C6)? Or move per-CPU state to discovery-time allocation now?
-3. Should `boot-x2apic` join the default `boot-matrix` gate? Since the topology work it boots twice and adds about 40 s.
-4. Accept C7: park an AP that misses its handshake with INIT, and run the park drill on every boot? Or also give each AP its own trampoline data now, ahead of parallel start-up?
+1. Accept dense indexes in MADT order with the boot processor as 0 (C1), and `CpuIndex` as the only per-CPU array index (C2)? **Yes.**
+2. Keep 64 static per-CPU slots for now, and report and leave extra processors in firmware (C6)? Or move per-CPU state to discovery-time allocation now? **Keep 64 for now.** Per-CPU state moves to sizing at discovery with the scheduling work (TASKS item 4), before any machine with more than 64 logical CPUs enters the declared scope.
+3. Should `boot-x2apic` join the default `boot-matrix` gate? Since the topology work it boots twice and adds about 40 s. **Yes:** `boot-matrix` now ends with it.
+4. Accept C7: park an AP that misses its handshake with INIT, and run the park drill on every boot? Or also give each AP its own trampoline data now, ahead of parallel start-up? **Accept parking; per-AP data comes with parallel start-up.**

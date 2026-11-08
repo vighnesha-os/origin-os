@@ -1032,3 +1032,21 @@ The owner asked whether the decision sheet's recommendations had been checked ag
 - M4's system-call boundary needs its own threat model (§58).
 - **The owner:** the sheet. ADR-0007 also waits on the spec checks (items 18 and 23).
 
+### Continued (2026-11-08, ~14:55 IST): the owner's answers applied
+
+The owner accepted the sheet's recommendations for items 1–6, 8, 9 and 13–20 (`docs/engineering/OWNER_DECISIONS.md`). On `claude/interesting-carson-ae7c83`, **not pushed**:
+
+- **ADR-0006 and ADR-0008 are Accepted.** ADR-0007 records its answers to questions 1, 2, 4 and 5, and stays Proposed.
+- **`boot-matrix` ends with `boot-x2apic`.** Item 15.
+- **A signature statement's `id` must be non-empty printable ASCII.** Item 17, errata O1, enforced in `SignatureBlock::parse`, with a host test and the soak's model updated. With the check removed, both fail.
+- **Intel's VT-d Rev 5.20 PDF is downloaded,** outside the repository; its hash is in the VT-d ledger. Legacy mode, translation type 0 and the blocking of compatibility-format interrupts match the text. Every encoding has still to be checked against it.
+- **Items 19 and 20 are approved, not fetched:** each file's source and size are confirmed when the work that uses them starts.
+
+**A flaky boot proof.** Two of three full `boot-matrix` runs failed with `clock: the RTC did not complete two updates in 1.2 s`, while other sessions were loading the machine. Each configuration then passed alone, and a third full run passed. `time.rs`'s `update_end` must see QEMU's RTC update bit, which is set for only 244 µs each second, so a descheduled virtual CPU can miss it. Parallel sessions make this likely. It is not fixed.
+
+#### Next
+
+- Check every VT-d encoding against Rev 5.20, then ADR-0007's question 3.
+- Make the RTC wait in `time.rs` robust under host load.
+- **The owner:** the AMD manuals' hashes (item 23), then ADR-0007's questions 6–8; the licence, the push, the hardware (items 21, 22, 24).
+

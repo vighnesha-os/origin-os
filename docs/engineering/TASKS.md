@@ -72,10 +72,8 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 
 | # | Decision | Blocks |
 |---|---|---|
-| — | Downloads: NIST ACVP (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519); the `loom` crate (host-only dev-dependency, §5) | External known-answer validation (§59); concurrency models (§73) |
+| — | Downloads **approved 2026-11-08**, not fetched yet: NIST ACVP (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519); the `loom` crate (host-only dev-dependency, §5). Each file's source and size are confirmed when the work that uses them starts | External known-answer validation (§59); concurrency models (§73) |
 | — | A project licence | Every provenance entry |
-| — | ADR-0007 (DMA isolation and interrupt remapping, Intel VT-d and AMD-Vi, Proposed): eight questions | Accepting the IOMMU design; it is implemented and boot-proven already |
+| — | ADR-0007 (DMA isolation and interrupt remapping, Intel VT-d and AMD-Vi, Proposed): questions 3, 6, 7 and 8; the rest are answered (`docs/engineering/OWNER_DECISIONS.md`) | Accepting the IOMMU design; it is implemented and boot-proven already |
 | — | Compare the AMD IOMMU specification (48882 Rev 3.11) read from a mirror with AMD's own copy (SHA-256 in `docs/research/2026-11-08-amd-vi-iommu.md`) | Confidence that every AMD-Vi encoding comes from AMD's text |
-| — | Download of Intel's VT-d Rev 5.20 PDF (D51397-019, about 10 MB) | Re-checking every VT-d encoding against the text itself before hardware qualification |
-| — | ADR-0008 (dense CPU indexes, Proposed): three questions | Accepting the per-CPU indexing design; it is implemented and boot-proven already |
 | — | Merge into `main` and push | Sharing the work |

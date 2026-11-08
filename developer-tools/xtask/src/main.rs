@@ -28,7 +28,7 @@ commands:
   boot-test   boot under QEMU + OVMF twice: the kernel must start and report; a tampered
               kernel image must be rejected by the loader
   boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
-              one after another
+              one after another, then boot-x2apic
   boot-x2apic boot-test on a sparse topology: the boot processor at APIC ID 0 and processors
               at APIC IDs 256 and 412, above what 8-bit APIC IDs reach (the MADT lists
               150 possible processors); twice, on a CPU model with CPUID leaf 1Fh and on
@@ -1092,7 +1092,7 @@ fn main() -> ExitCode {
 
 /// Runs `boot-test` in a child process for each IOMMU and processor count, so each gets its
 /// own `ORIGIN_QEMU_IOMMU` and `ORIGIN_QEMU_SMP` (the environment of this process is never
-/// changed).
+/// changed), and then [`boot_x2apic`] (the owner's decision on ADR-0008, question 3).
 fn boot_matrix() -> Result {
     let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
     for iommu in ["intel", "amd"] {
@@ -1111,7 +1111,10 @@ fn boot_matrix() -> Result {
             }
         }
     }
-    println!("xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors)");
+    boot_x2apic()?;
+    println!(
+        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, and the sparse machine)"
+    );
     Ok(())
 }
 

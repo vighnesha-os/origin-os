@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Proposed** (2026-11-08; the AMD-Vi section added the same day, also Proposed). The owner accepts ADRs (CLAUDE.md §18, §84). This is a kernel-internal security mechanism, not an ABI or format decision, so it is implemented and boot-proven while Proposed; the parts that will reach the Driver ABI (how a user-mode driver asks for DMA memory, §31) are decided later, against this. |
+| Status | **Proposed** (2026-11-08; the AMD-Vi section added the same day, also Proposed). The owner answered questions 1, 2, 4 and 5 on 2026-11-08; questions 3, 6, 7 and 8 are still open. The owner accepts ADRs (CLAUDE.md §18, §84). This is a kernel-internal security mechanism, not an ABI or format decision, so it is implemented and boot-proven while Proposed; the parts that will reach the Driver ABI (how a user-mode driver asks for DMA memory, §31) are decided later, against this. |
 | Requires | CLAUDE.md §31 (DMA mapping, interrupt management, driver isolation), §32 (Intel VT-d, AMD IOMMU, interrupt remapping), §58 (DMA protection) |
 | Evidence | `docs/research/2026-11-08-vt-d-iommu.md` (VT-d Rev 5.20, D51397-019, 2026-05-14; what QEMU 11.1's `intel-iommu` emulates); `docs/research/2026-11-08-amd-vi-iommu.md` (AMD IOMMU specification 48882 Rev 3.11, April 2026; what QEMU 11.1's `amd-iommu` emulates and where it departs from the specification); the boot proofs and negative controls in `docs/engineering/SOURCE_PROVENANCE.md` ("Intel VT-d DMA and interrupt remapping"; "I/O APIC interrupts through VT-d interrupt remapping"; "AMD-Vi DMA and interrupt remapping") |
 | Threat model | `docs/engineering/THREAT_MODEL_IOMMU.md` (CLAUDE.md §58) |
@@ -16,7 +16,7 @@ Until now every bus-mastering device could read and write all of physical memory
 
 ### I1. Legacy-mode translation first; scalable mode later
 Root table → per-bus context tables → second-level tables (4 levels, 48-bit, where the unit supports it; else 3 levels, 39-bit), translation type 0. It is the smallest correct design and QEMU's default.
-*Alternative:* scalable mode (PASID tables, first-level tables, nested translation) — needed later for shared virtual addressing and PASID-granular isolation of user-mode drivers; a later revision of this ADR. Whether 2026+ platforms keep legacy mode must be checked against Rev 5.20 before hardware qualification (research ledger, gap).
+*Alternative:* scalable mode (PASID tables, first-level tables, nested translation) — needed later for shared virtual addressing and PASID-granular isolation of user-mode drivers; a later revision of this ADR. Rev 5.20 still defines legacy mode (`RTADDR_REG.TTM` 00b), with no deprecation notice and no capability bit to omit it (research ledger, update of 2026-11-08). Hardware qualification must still confirm it on the declared machines.
 
 ### I2. Default deny
 Translation is turned on before any driver binds, with no context entry present: until a driver attaches its device, the device's DMA faults (reason 2). A device with no driver never gets a context entry.
@@ -124,11 +124,11 @@ None on disk and none at any ABI: all of this is kernel-internal, and no persist
 
 ## Questions for the owner
 
-1. Accept default-deny with one domain per requester ID (I2, I3)?
-2. Accept the [1 GiB, 2 GiB) IOVA window and "IOVAs are never physical addresses" (I4)?
+1. Accept default-deny with one domain per requester ID (I2, I3)? **Yes (2026-11-08).**
+2. Accept the [1 GiB, 2 GiB) IOVA window and "IOVAs are never physical addresses" (I4)? **Yes (2026-11-08).**
 3. Accept legacy mode now, with scalable mode as a later revision (I1)?
-4. Accept refusing devices that need RMRRs until identity maps exist (I11), rather than leaving them untranslated?
-5. Policy when a platform has no DMAR or IVRS (today: run with DMA unconfined, reported): should production refuse to enable bus mastering for untrusted (external, hot-plugged) devices without an IOMMU (§32 external-device authorization)?
+4. Accept refusing devices that need RMRRs until identity maps exist (I11), rather than leaving them untranslated? **Yes (2026-11-08), with a deadline:** identity maps must land before real hardware.
+5. Policy when a platform has no DMAR or IVRS (today: run with DMA unconfined, reported): should production refuse to enable bus mastering for untrusted (external, hot-plugged) devices without an IOMMU (§32 external-device authorization)? **Yes (2026-11-08),** and an IOMMU is part of the declared hardware scope.
 6. Accept, for AMD-Vi, blocking device table entries (V=1, TV=0; IV=1, IntCtl 00b) and one interrupt remapping table per device (A2, A7)?
 7. Accept the two QEMU allowances in the AMD-Vi proofs — a fault record with address 0, and no record of the blocked interrupt — as documented blind spots of QEMU 11.1, with hardware qualification required to check both (A10)?
 8. Accept refusing devices that an IVMD names, as for RMRRs (A9, I11)?

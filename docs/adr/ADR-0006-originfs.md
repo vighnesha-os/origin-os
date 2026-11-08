@@ -2,19 +2,19 @@
 
 | | |
 |---|---|
-| Status | **Proposed** (2026-11-08). A format decision: it needs the owner's approval before it is Accepted (CLAUDE.md §84). A host-testable, read-only parser and an image builder are implemented against this proposal (allowed by §84); nothing is mounted in the shipping kernel until the owner accepts it. |
-| Scope | The on-disk layout of the native filesystem: the superblock, inodes, directories, and how a file's bytes are found. Read first; write and crash-consistency are a later revision. |
+| Status | **Accepted** by the owner on 2026-11-08: the four questions below answered with the recommended option each, and the ADR accepted with F7 (v0 is a bring-up format that never ships in an approved release). A host-tested read-only parser and an image builder exist; a read-only mount beneath the VFS may now be built. |
+| Scope | The on-disk layout of the bring-up filesystem: the superblock, inodes, directories, and how a file's bytes are found. Read only. Writing, crash consistency and the rest of §40 belong to a successor format with its own ADR (F7). |
 | Requires | CLAUDE.md §39 (storage architecture, VFS), §40 (native filesystem requirements), §41 (filesystem correctness) |
 | Builds on | the block layer (a 4 KiB page cache over NVMe), GPT partitions, `onbf-merkle` (for a future integrity option) |
 | Evidence | `docs/research/2026-11-08-originfs-design.md` (v0 against §40 and §41, the alternatives, the NVMe durability contract); the host-tested builder, parser and soak in `framekernel::originfs` |
 
 ## Context
 
-M5 gave the kernel a block device (NVMe), partitions (GPT) and a page cache. The runtime and services (§44, §49) need a file namespace with real files on disk; the in-memory VFS (`framekernel::vfs`) is the interface, and an on-disk filesystem must plug in beneath it. CLAUDE.md §40 asks for an "independently authored, standards-informed filesystem design." This ADR fixes the smallest on-disk format that stores a directory tree and file contents, so a read-only mount can be built and tested now; durable writes, journalling and snapshots come in a later revision once the read path is proven.
+M5 gave the kernel a block device (NVMe), partitions (GPT) and a page cache. The runtime and services (§44, §49) need a file namespace with real files on disk; the in-memory VFS (`framekernel::vfs`) is the interface, and an on-disk filesystem must plug in beneath it. CLAUDE.md §40 asks for an "independently authored, standards-informed filesystem design." This ADR fixes the smallest on-disk format that stores a directory tree and file contents, so a read-only mount can be built and tested now. Durable writes, journalling and snapshots belong to a successor format (F7).
 
-Because this is a format decision (§84), the format below is **Proposed**. A parser and a builder are implemented and host-tested against it, but the kernel does not mount OriginFS until the owner accepts this ADR.
+This is a format decision (§84). The owner accepted it on 2026-11-08; until then a parser and a builder were implemented and host-tested against the proposal, and the kernel did not mount OriginFS.
 
-## Proposed decisions
+## Decisions
 
 ### F1. One 4 KiB block, little-endian, in a GPT partition
 The block size is 4096 bytes, matching the page cache, so one cache page is one filesystem block. All multi-byte fields are little-endian. A volume lives in a GPT partition of the Origin system or data type (the provisional type GUIDs of the test disk; §21 fixes the real ones). Block 0 of the partition is the superblock.
@@ -31,7 +31,7 @@ A directory's data blocks hold a sequence of entries, each: `inode` (u32; 0 mark
 ### F5. Reading a file
 A file's byte `b` is in block index `b / 4096`; block indexes 0–11 are the direct pointers, 12–523 are entries of the single-indirect block. A pointer of 0 yields a zero-filled block (a sparse hole). Reads past `size` return nothing.
 
-### F6. What read-only leaves out (a later revision)
+### F6. What read-only leaves out (the successor format)
 No write path, allocation bitmap maintenance, journalling, crash consistency (§41), snapshots, extended attributes, permissions beyond the kind, hard links beyond `links` accounting, or symbolic links. The read path and its on-disk structures are fixed first so a read path can be proven.
 
 ### F7. v0 is a bring-up format and never ships in an approved release
@@ -67,11 +67,11 @@ None, because nothing has shipped and F7 keeps v0 out of every approved release.
 
 The layout follows the classic Unix inode filesystem (the BSD FFS and Linux ext2 lineage): a superblock, a fixed inode table, direct and indirect block pointers, and linked directory entries with `rec_len`. These are conceptual references; no source is used (CLAUDE.md §3). The read path is proven by a host-tested builder and parser that round-trip a directory tree and file contents. The comparison with journalling, copy-on-write and the other alternatives, written after this design, is in `docs/research/2026-11-08-originfs-design.md`.
 
-## Questions for the owner
+## Questions for the owner (answered 2026-11-08: the recommended option for all four)
 
-1. Accept a classic inode layout (superblock, fixed inode table, 12 direct + 1 single-indirect, linked directory entries) for v0 read-only (F1–F5), as a bring-up format that never ships in an approved release (F7)?
-2. Accept the 4 KiB block equal to the page-cache page, and the ~2 MiB single-indirect file limit for v0 (F1, F3)?
-3. Accept deferring the write path, journalling and crash consistency to a later revision (F6)?
-4. Should v0 reserve space for the optional per-block Merkle integrity leaf now, or add it later?
+1. Accept a classic inode layout (superblock, fixed inode table, 12 direct + 1 single-indirect, linked directory entries) for v0 read-only (F1–F5), as a bring-up format that never ships in an approved release (F7)? **Yes.**
+2. Accept the 4 KiB block equal to the page-cache page, and the ~2 MiB single-indirect file limit for v0 (F1, F3)? **Yes.**
+3. Accept deferring the write path, journalling and crash consistency to a later revision (F6)? **Yes: to the successor format.**
+4. Should v0 reserve space for the optional per-block Merkle integrity leaf now, or add it later? **No reservation: integrity belongs to the successor format.**
 
-Until this ADR is Accepted, the parser and builder stay host-only; the kernel does not mount OriginFS (CLAUDE.md §84).
+v0 must not appear in an approved release (F7).

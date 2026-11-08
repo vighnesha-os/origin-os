@@ -217,6 +217,27 @@ fn statement_rules_are_enforced() {
     );
 }
 
+/// Errata O1: a statement's `id` is printable ASCII, so the parser needs no NFC tables.
+#[test]
+fn a_statement_id_must_be_printable_ascii() {
+    let parse = |id: &str| {
+        let mut s = statement(4);
+        s[3].1 = text(id);
+        let mut e = entry(4, 2, 4627);
+        e[4].1 = map(&s);
+        SignatureBlock::parse(&block(&[map(&e)])).map(|_| ())
+    };
+    for good in ["origin.framekernel", " ", "~", "a b"] {
+        assert_eq!(parse(good), Ok(()), "{good:?}");
+    }
+    let refused = Err(SignatureError::Field { entry: 0, key: 53 });
+    // Composed and decomposed forms of one letter, and the control characters on each side
+    // of the printable range.
+    for bad in ["\u{e9}", "e\u{301}", "\u{7f}", "\u{1f}", "\0", "a\nb"] {
+        assert_eq!(parse(bad), refused, "{bad:?}");
+    }
+}
+
 /// Found by the multi-fault soak: Appendix A limits a chain to four certificates.
 #[test]
 fn a_chain_of_five_certificates_is_refused() {

@@ -4,7 +4,7 @@
 |---|---|
 | Updated | 2026-11-08, ~14:25 IST (parser hardening, the ONBF multi-fault soak and CPU topology merged into the IOMMU branch) |
 | Branch | `claude/interesting-carson-ae7c83`: the IOMMU work (`1c790fe`) with its follow-ups merged in: dense CPU indexes and a processor above APIC ID 255 (`claude/eloquent-kapitsa-840594`), parking an AP that misses its start-up handshake (`claude/priceless-cartwright-2c1803`), I/O APIC interrupts through VT-d interrupt remapping (`claude/bold-williams-a8e3ff`), AMD-Vi (`claude/upbeat-dijkstra-0d25fe`), parser hardening (`claude/gifted-maxwell-7e8a3f`), the ONBF multi-fault soak (`claude/heuristic-chandrasekhar-6a46a1`) and CPU topology from CPUID leaves 1Fh, 0Bh and 80000026h (`claude/zealous-lovelace-301ef1`); all on `m0/toolchain-verification` at `540fc2c`. **None of these is pushed.** `m0/toolchain-verification` itself is pushed and open for review as PR vighnesha-os/origin-os#1, and is not merged into `main`. |
-| Reproduce | `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs; `ORIGIN_QEMU_SMP=1`…`8` for others), and `cargo xtask boot-x2apic` (processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without) |
+| Reproduce | `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs in QEMU 11.1.3 (TCG) + OVMF only; nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
 
 ## By milestone
@@ -61,12 +61,12 @@ The ONBF parsers, which run in the boot loader on data read before any signature
 
 ADR-0002 with B7, ADR-0003, G1 and the errata readings were decided on 2026-11-07, under the owner's instruction to finalise with the recommended options. The owner accepted ADR-0004 and ADR-0005.
 
-Three ADRs are **Proposed** and await the owner:
-- **ADR-0006**, OriginFS v0. It is a format decision, so the filesystem is not mounted until it is accepted.
-- **ADR-0007**, DMA isolation and interrupt remapping (Intel VT-d and AMD-Vi). It is a kernel-internal mechanism, so it is implemented and boot-proven while Proposed; it ends with eight questions for the owner (three of them added with AMD-Vi).
-- **ADR-0008**, dense CPU indexes for per-CPU state, with APIC IDs only as addresses, and (C7) parking an AP that misses its start-up handshake. Kernel-internal, so implemented and boot-proven while Proposed; four questions for the owner (index order, the 64-slot limit, whether `boot-x2apic` joins `boot-matrix`, and C7: INIT parking with a drill on every boot, or per-AP trampoline data too).
+The owner accepted ADR-0006 (OriginFS v0, as a bring-up format that never ships in an approved release) and ADR-0008 (dense CPU indexes) on 2026-11-08.
 
-Also waiting on the owner: approval to download Intel's VT-d Rev 5.20 PDF (about 10 MB), so that every encoding can be re-checked against the text itself; and a check of the AMD IOMMU specification (48882 Rev 3.11) read from a mirror against AMD's own copy (its SHA-256 is in the AMD-Vi research ledger). Still the owner's too, because they are not design: approval to download NIST ACVP / FIPS 204 errata / Wycheproof vectors and the `loom` crate; a project licence; merging PR #1 into `main`; and, for production qualification, declaring the supported 2026+ Intel/AMD reference platforms and providing physical x86 test machines (CLAUDE.md §74, §76 — nothing is qualified on hardware until then). Details: `docs/engineering/TASKS.md`.
+One ADR is still **Proposed**:
+- **ADR-0007**, DMA isolation and interrupt remapping (Intel VT-d and AMD-Vi). It is kernel-internal, so it is implemented and boot-proven while Proposed. The owner answered four of its eight questions on 2026-11-08; the rest are on `docs/engineering/OWNER_DECISIONS.md`.
+
+Also waiting on the owner: a check of the AMD IOMMU specification (48882 Rev 3.11) read from a mirror against AMD's own copy (its SHA-256 is in the AMD-Vi research ledger). Still the owner's too, because they are not design: a project licence; merging PR #1 into `main`; and, for production qualification, declaring the supported 2026+ Intel/AMD reference platforms and providing physical x86 test machines (CLAUDE.md §74, §76 — nothing is qualified on hardware until then). Details: `docs/engineering/TASKS.md`.
 
 ## Where the evidence is
 

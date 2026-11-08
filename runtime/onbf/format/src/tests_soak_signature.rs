@@ -198,6 +198,11 @@ struct ModelEntry {
     sig_ml: Vec<u8>,
 }
 
+/// A statement's `id`: non-empty printable ASCII (errata O1).
+fn id_model(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| (0x20..=0x7E).contains(&b))
+}
+
 /// SemVer 2.0.0 (the grammar at semver.org), which S3 requires of the statement's version.
 fn semver_model(version: &str) -> bool {
     fn number(s: &str) -> bool {
@@ -256,7 +261,7 @@ fn model_entry(tree: &V) -> Option<ModelEntry> {
     else {
         return None;
     };
-    if digest.len() != 64 || id.is_empty() || !semver_model(version) {
+    if digest.len() != 64 || !id_model(id) || !semver_model(version) {
         return None;
     }
     let (V::B(sig_ed), V::B(sig_ml)) = (&fields[5].1, &fields[6].1) else {

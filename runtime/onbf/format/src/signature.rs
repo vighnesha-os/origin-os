@@ -4,8 +4,8 @@
 //! Parsing only: the block structure, every field's type and length, Appendix A's limits on
 //! the block and the chain, and the cross-field rules (the statement's role equals the
 //! entry's; the suite is fixed by the role; the ML-DSA signature length is fixed by the
-//! suite; no entry twice). A statement's version must be SemVer 2.0 (S3); its `id` is only
-//! checked to be non-empty (S3's NFC rule needs normalization tables: errata O1). The
+//! suite; no entry twice). A statement's version must be SemVer 2.0 (S3); its `id` must be
+//! non-empty printable ASCII, which is trivially NFC (errata O1). The
 //! cryptographic checks
 //! (the content digest, both signatures over [`Statement::bytes`] with the role's context
 //! string, the certificate chain) belong to the verifier, which uses `origin-crypto`.
@@ -122,7 +122,7 @@ pub struct Statement<'a> {
     pub profile: u64,
     /// Key 2: the 64-byte content digest; the verifier checks it against the image.
     pub content_digest: &'a [u8],
-    /// Key 3: the artifact's ID.
+    /// Key 3: the artifact's ID, non-empty printable ASCII (errata O1).
     pub id: &'a str,
     /// Key 4: the artifact's version, SemVer 2.0.
     pub version: &'a str,
@@ -279,6 +279,12 @@ impl<'a> SignatureBlock<'a> {
     }
 }
 
+/// True if `text` is printable ASCII (0x20–0x7E). That is trivially NFC, so this parser
+/// needs no Unicode normalization tables (errata O1, the same rule as R4).
+fn is_printable_ascii(text: &str) -> bool {
+    text.bytes().all(|b| (0x20..=0x7E).contains(&b))
+}
+
 /// A SemVer numeric identifier: `0`, or digits with no leading zero.
 fn is_number(field: &[u8]) -> bool {
     match field.split_first() {
@@ -426,6 +432,9 @@ fn parse_statement<'a>(
     };
     expect_key(c, 3, entry)?;
     let id = text(c, 3)?;
+    if !is_printable_ascii(id) {
+        return Err(field(3));
+    }
     expect_key(c, 4, entry)?;
     let version = text(c, 4)?;
     if !is_semver(version) {
