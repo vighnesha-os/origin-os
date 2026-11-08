@@ -136,38 +136,53 @@ impl Features {
         }
     }
 
-    /// The x86-64 microarchitecture level this CPU meets: 1, 2, 3 or 4 (CLAUDE.md §14: the
-    /// baseline is 3). `None` below level 1 (not a usable x86-64 CPU here).
+    /// Each x86-64 level requirement (psABI supplement): its name, the level that adds it,
+    /// and whether this CPU has it. v1 is the long-mode baseline with SSE2; v2 adds SSE3,
+    /// SSSE3, SSE4.1, SSE4.2, POPCNT, CMPXCHG16B and LAHF/SAHF; v3 adds AVX, AVX2, FMA,
+    /// F16C, BMI1, BMI2, LZCNT, MOVBE and XSAVE. (v4, the AVX-512 foundation, is not decoded,
+    /// so it is never reported.)
     ///
-    /// The levels (psABI supplement): v1 = SSE2 and the long-mode baseline; v2 adds SSE3,
-    /// SSSE3, SSE4.1, SSE4.2, POPCNT, CMPXCHG16B, LAHF/SAHF; v3 adds AVX, AVX2, FMA, F16C,
-    /// BMI1, BMI2, LZCNT, MOVBE and OSXSAVE; v4 adds the AVX-512 foundation (not decoded
-    /// here, so v4 is never reported).
+    /// The psABI lists OSXSAVE for v3, not XSAVE: OSXSAVE is how *user space* sees that the OS
+    /// enabled XSAVE (it mirrors CR4.OSXSAVE). These checks run in the kernel, before it sets
+    /// that bit — so it reads 0 there on every CPU — and the kernel is what enables it
+    /// (`cpu::enable_simd`), so they require the capability, XSAVE.
+    fn requirements(&self) -> [(&'static str, u8, bool); 21] {
+        [
+            ("long mode", 1, self.long_mode),
+            ("FPU", 1, self.fpu),
+            ("CMOV", 1, self.cmov),
+            ("SSE", 1, self.sse),
+            ("SSE2", 1, self.sse2),
+            ("SSE3", 2, self.sse3),
+            ("SSSE3", 2, self.ssse3),
+            ("SSE4.1", 2, self.sse41),
+            ("SSE4.2", 2, self.sse42),
+            ("POPCNT", 2, self.popcnt),
+            ("CMPXCHG16B", 2, self.cmpxchg16b),
+            ("LAHF/SAHF", 2, self.lahf),
+            ("AVX", 3, self.avx),
+            ("AVX2", 3, self.avx2),
+            ("FMA", 3, self.fma),
+            ("F16C", 3, self.f16c),
+            ("BMI1", 3, self.bmi1),
+            ("BMI2", 3, self.bmi2),
+            ("LZCNT", 3, self.lzcnt),
+            ("MOVBE", 3, self.movbe),
+            ("XSAVE", 3, self.xsave),
+        ]
+    }
+
+    /// The x86-64 microarchitecture level this CPU meets: 1, 2 or 3 (CLAUDE.md §14: the
+    /// baseline is 3). `None` below level 1 (not a usable x86-64 CPU here).
     pub fn arch_level(&self) -> Option<u8> {
-        let v1 = self.long_mode && self.sse && self.sse2 && self.fpu && self.cmov;
-        if !v1 {
+        let requirements = self.requirements();
+        let meets = |level| requirements.iter().all(|&(_, l, has)| l > level || has);
+        if !meets(1) {
             return None;
         }
-        let v2 = self.sse3
-            && self.ssse3
-            && self.sse41
-            && self.sse42
-            && self.popcnt
-            && self.cmpxchg16b
-            && self.lahf;
-        let v3 = v2
-            && self.avx
-            && self.avx2
-            && self.fma
-            && self.f16c
-            && self.bmi1
-            && self.bmi2
-            && self.lzcnt
-            && self.movbe
-            && self.osxsave;
-        Some(if v3 {
+        Some(if meets(3) {
             3
-        } else if v2 {
+        } else if meets(2) {
             2
         } else {
             1
@@ -177,6 +192,15 @@ impl Features {
     /// Whether the CPU meets the `x86-64-v3` baseline.
     pub fn meets_baseline(&self) -> bool {
         self.arch_level().is_some_and(|l| l >= 3)
+    }
+
+    /// The `x86-64-v3` requirements this CPU lacks, by name: empty exactly when it meets
+    /// the baseline (the boot names them when it refuses the CPU).
+    pub fn missing_baseline(&self) -> impl Iterator<Item = &'static str> {
+        self.requirements()
+            .into_iter()
+            .filter(|&(_, level, has)| level <= 3 && !has)
+            .map(|(name, _, _)| name)
     }
 }
 
@@ -312,6 +336,56 @@ mod tests {
         id.leaf7[1] = 0; // no BMI/AVX2
         let f = Features::decode(&id);
         assert_eq!(f.arch_level(), Some(2));
+    }
+
+    #[test]
+    fn the_baseline_needs_the_xsave_capability_not_the_os_setting() {
+        // At kernel entry CR4.OSXSAVE is clear, so CPUID reports OSXSAVE 0 on every CPU; a
+        // v3 CPU must still be v3 then (this is what booted as "level 2" before).
+        let mut id = modern();
+        id.leaf1[2] &= !(1 << 27);
+        let f = Features::decode(&id);
+        assert!(!f.osxsave && f.xsave);
+        assert_eq!(f.arch_level(), Some(3));
+        assert!(f.meets_baseline());
+        assert_eq!(f.missing_baseline().count(), 0);
+
+        // Without the XSAVE capability AVX state cannot be enabled: not v3, and named.
+        id.leaf1[2] &= !(1 << 26);
+        let f = Features::decode(&id);
+        assert_eq!(f.arch_level(), Some(2));
+        assert!(f.missing_baseline().eq(["XSAVE"]));
+    }
+
+    #[test]
+    fn missing_baseline_names_each_gap() {
+        let mut id = modern();
+        id.leaf7[1] &= !(1 << 5); // no AVX2
+        id.leaf1[2] &= !(1 << 22); // no MOVBE
+        id.ext1[2] &= !(1 << 5); // no LZCNT
+        let f = Features::decode(&id);
+        assert_eq!(f.arch_level(), Some(2));
+        assert!(f.missing_baseline().eq(["AVX2", "LZCNT", "MOVBE"]));
+    }
+
+    #[test]
+    fn the_level_and_the_named_gaps_always_agree() {
+        // For arbitrary CPUID words: a CPU meets the baseline exactly when nothing is
+        // missing, and below level 1 something from v1 is missing.
+        let mut rng = crate::testing::Rng::new(0x5633_4241);
+        for _ in 0..crate::testing::cases(20_000) {
+            let mut id = modern();
+            id.leaf1[2] &= rng.next() as u32;
+            id.leaf1[3] &= rng.next() as u32;
+            id.leaf7[1] &= rng.next() as u32;
+            id.ext1[2] &= rng.next() as u32;
+            let f = Features::decode(&id);
+            assert_eq!(f.meets_baseline(), f.missing_baseline().next().is_none());
+            assert_eq!(
+                f.arch_level().is_none(),
+                !f.long_mode || !f.sse || !f.sse2 || !f.fpu || !f.cmov
+            );
+        }
     }
 
     #[test]

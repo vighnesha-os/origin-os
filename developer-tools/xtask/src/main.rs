@@ -35,6 +35,7 @@ environment:
                                       (default: the EDK2 files installed next to QEMU)
   ORIGIN_BOOT_TEST_TIMEOUT            boot-test timeout in seconds (default 120)
   ORIGIN_QEMU_SMP                     processors QEMU emulates, 1-64 (default 2)
+  ORIGIN_QEMU_CPU                     the QEMU CPU model (default max), e.g. max,-avx2
   ORIGIN_QEMU_DEBUG                   if set, QEMU logs interrupts and resets to
                                       target/xtask/qemu-debug.log";
 
@@ -83,6 +84,15 @@ struct Scenario {
 /// The good path: the loader verifies and enters the kernel, and the kernel reports on
 /// COM1. The banners are built from the same generated constants as the binaries, so the
 /// test also checks that the release identity reached both.
+/// The QEMU CPU model: `ORIGIN_QEMU_CPU` (for example `max,-avx2` to boot a CPU below the
+/// x86-64-v3 baseline), or `max`.
+fn qemu_cpu_model() -> String {
+    std::env::var("ORIGIN_QEMU_CPU")
+        .ok()
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "max".into())
+}
+
 /// Processors QEMU emulates: `ORIGIN_QEMU_SMP` (1–64), or 2.
 fn qemu_cpus() -> u32 {
     std::env::var("ORIGIN_QEMU_SMP")
@@ -139,8 +149,9 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: GDT, TSS and IDT loaded (32 exception vectors)".into(),
             "origin-kernel: exception 3 (#BP breakpoint) at rip ".into(),
             "origin-kernel: breakpoint handled; resuming".into(),
-            // CPU features and the x86-64 level (QEMU TCG presents v2); SSE/AVX enabled.
-            "origin-kernel: CPU: x86-64 level ".into(),
+            // CPU features: QEMU's `max` CPU has every x86-64-v3 feature, so the kernel must
+            // find the baseline met (CLAUDE.md §14); below it, the kernel refuses to boot.
+            "origin-kernel: CPU: x86-64 level 3 (baseline v3 true)".into(),
             // A frame-pointer backtrace of a known call chain (CLAUDE.md §69).
             "origin-kernel: backtrace: 4 frames from a known call chain, all in the kernel image true".into(),
             "origin-kernel: frame allocator: ".into(),
@@ -406,6 +417,7 @@ fn boot_scenario_markers() -> Scenario {
             ": AP start-up failed",
             ": scheduler failed",
             ": topology failed",
+            ": CPU baseline failed",
             ": numa failed",
             ": slit failed",
             ": entropy failed",
@@ -1194,7 +1206,9 @@ fn qemu_path_arg(options: &str, path: &Path) -> Result<String> {
 /// supports), x86-64 with every feature TCG can emulate, and no network or display.
 fn qemu_command(s: &Staged) -> Result<Command> {
     let mut c = Command::new(QEMU);
-    c.args(["-machine", "q35", "-cpu", "max", "-m", "512M", "-smp"])
+    c.args(["-machine", "q35", "-cpu"])
+        .arg(qemu_cpu_model())
+        .args(["-m", "512M", "-smp"])
         .arg(qemu_cpus().to_string())
         // Two NUMA nodes so the ACPI SRAT is populated (CLAUDE.md §24, §28). The 256M
         // backends sum to -m, and QEMU auto-distributes the vCPUs across the nodes, so this

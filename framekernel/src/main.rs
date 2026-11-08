@@ -181,6 +181,24 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         cpu::fpu_area_size(),
         xcr0
     );
+    // CLAUDE.md §14: Origin OS requires x86-64-v3. Below it — or if AVX state could not be
+    // enabled (XCR0 must hold x87, SSE and AVX state) — refuse to go on, naming what is
+    // missing, rather than fail later in a way that hides why.
+    let avx_state = xcr0 & 0b111 == 0b111;
+    if !features.meets_baseline() || !avx_state {
+        let _ = write!(
+            com1,
+            "origin-kernel: this CPU is below the x86-64-v3 baseline Origin OS requires (CLAUDE.md §14); missing:"
+        );
+        for name in features.missing_baseline() {
+            let _ = write!(com1, " {name}");
+        }
+        if !avx_state {
+            let _ = write!(com1, " AVX state in XCR0 ({xcr0:#x})");
+        }
+        let _ = writeln!(com1, ": CPU baseline failed");
+        halt();
+    }
     prove_backtrace(&mut com1, &info);
 
     // M2, second step: the physical frame allocator over the boot-info regions, with a

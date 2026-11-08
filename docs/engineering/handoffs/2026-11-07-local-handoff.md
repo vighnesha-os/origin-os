@@ -457,3 +457,32 @@ requests, a socket API with a long-lived receive service over the two rings, and
 fetched content rather than only checking it. Outside networking: NUMA-aware frame allocation
 (the `numa` map is the decision layer), the keyboard IRQ → `ring` → `editbuffer` input path, and
 teeing the console into `klog`. The run report is `docs/engineering/handoffs/2026-11-08-run-report.md`.
+
+### Audit against CLAUDE.md's 2026+ hardware target (2026-11-08, ~09:45 IST)
+
+The owner asked whether the work targets the latest (2026+) hardware for production grade, per
+CLAUDE.md (header: "Intel and AMD platforms introduced in 2026 or later"; §14 x86-64-v3 baseline
+and CET shadow stacks; §17 PCIe Gen 5/6, NVMe 2.4, USB4 v2; §24 capability discovery, hybrid
+cores; §74/§76 physical qualification of a declared scope). **Answer: the direction is aligned,
+but nothing is production-grade or tested on 2026+ hardware.** Findings:
+
+- **Fixed now:** the x86-64-v3 baseline was misread (every v3 CPU graded v2, an OSXSAVE-ordering
+  bug — see `SOURCE_PROVENANCE.md`, CPU feature discovery) and only reported. It is now detected
+  correctly and **enforced**: a CPU below v3 is refused at boot with the missing features named
+  (`ORIGIN_QEMU_CPU=max,-avx2` shows it). An earlier note blaming QEMU for "level 2" was wrong.
+- **Missing 2026+-platform requirements (in priority order for the next session):** CET shadow
+  stacks (§14 says enforce; there is no CET code; QEMU's TCG cannot model CET, so it needs KVM on
+  CET hardware or bare metal); the **IOMMU** (Intel VT-d / AMD-Vi) with **interrupt remapping**
+  (§32 — DMA protection, and MSI to APIC IDs above 255 is refused without it; QEMU emulates both
+  IOMMUs, so this can proceed in CI); **hybrid/extended topology** (only CPUID leaf 0x0B is read —
+  no 0x1F, no core type 0x1A, no AMD 0x80000026; §24, §27); a **UEFI GOP display fallback** (§36);
+  **xHCI/USB HID** (the only keyboard path is legacy PS/2), then USB4/Thunderbolt (§34–35);
+  Secure Boot enforcement in the loader (signatures are parsed, not required); power (§67).
+- **Verification platform:** QEMU q35 emulates a 2007-era Intel ICH9 chipset; the NIC is
+  virtio-net (virtual-machine-only — a test vehicle; the protocol and ring code above it carry
+  over, the driver does not); the disk is QEMU's NVMe 1.4 (baseline: NVMe 2.4); the emulated CPU
+  topology is homogeneous (no SMT, no hybrid). No `docs/hardware` compatibility database (§79), no
+  physical test matrix (§74), no declared supported scope (§76, rule 40).
+- **Owner decisions needed:** which 2026+ Intel and AMD machines are the declared targets, and
+  physical x86 test hardware (the M1 Max host cannot run x86 natively). Before relying on specific
+  2026 platform features (e.g. FRED, AVX10, APX), research them per §16 rather than from memory.
