@@ -176,6 +176,10 @@ pub fn avail_push(avail: &mut [u8], queue_size: usize, head: u16) {
     let idx = avail_idx(avail);
     let slot = (idx as usize) % queue_size;
     w16(avail, 4 + 2 * slot, head);
+    // The entry (and the descriptors and buffers written before it) must be visible before
+    // the index that publishes it to the device (virtio 1.1 §2.7.13): a compiler and CPU
+    // barrier between the two stores.
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     w16(avail, 2, idx.wrapping_add(1));
 }
 

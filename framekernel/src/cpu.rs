@@ -114,7 +114,7 @@ pub(crate) unsafe fn init() {
     if let Some(gate) = idt.0.get_mut(usize::from(SYSCALL_VECTOR)) {
         *gate = d::user_interrupt_gate((syscall_stub as *const ()).addr() as u64, KERNEL_CODE);
     }
-    let interrupts: [(u8, extern "sysv64" fn()); 11] = [
+    let interrupts: [(u8, extern "sysv64" fn()); 12] = [
         (TIMER_VECTOR, timer_stub),
         (SPURIOUS_VECTOR, spurious_stub),
         (YIELD_VECTOR, yield_stub),
@@ -125,6 +125,7 @@ pub(crate) unsafe fn init() {
         (RESCHEDULE_VECTOR, reschedule_stub),
         (DEVICE_VECTOR, device_stub),
         (NET_VECTOR, net_stub),
+        (NET_TX_VECTOR, net_tx_stub),
         (IOAPIC_VECTOR, ioapic_stub),
     ];
     for (vector, stub) in interrupts {
@@ -462,8 +463,10 @@ pub(crate) const RESCHEDULE_VECTOR: u8 = 0xF1;
 pub(crate) const DEVICE_VECTOR: u8 = 0x40;
 /// A legacy IRQ routed through the I/O APIC (the PIT, in the routing proof).
 pub(crate) const IOAPIC_VECTOR: u8 = 0x41;
-/// The virtio-net NIC's used-buffer interrupt (an MSI-X message).
+/// The virtio-net NIC's receive used-buffer interrupt (an MSI-X message).
 pub(crate) const NET_VECTOR: u8 = 0x42;
+/// The virtio-net NIC's transmit-completion interrupt (an MSI-X message).
+pub(crate) const NET_TX_VECTOR: u8 = 0x43;
 
 /// Interrupts taken on [`IOAPIC_VECTOR`].
 static IOAPIC_IRQS: AtomicU64 = AtomicU64::new(0);
@@ -549,6 +552,14 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // SAFETY: as for the NVMe device vector; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
         crate::virtionet::on_interrupt();
+        return crate::sched::on_reschedule(here);
+    }
+    // The virtio-net NIC's transmit-completion MSI-X message: acknowledge, let the driver wake
+    // a sender waiting for a descriptor, and switch to it now.
+    if frame.vector == u64::from(NET_TX_VECTOR) {
+        // SAFETY: as for the NVMe device vector; the write only acknowledges the interrupt.
+        unsafe { wrmsr(X2APIC_EOI, 0) };
+        crate::virtionet::on_tx_interrupt();
         return crate::sched::on_reschedule(here);
     }
     // Another processor woke a thread queued here: acknowledge, then switch to it now
@@ -1487,6 +1498,7 @@ soft_stub!(block_stub, BLOCK_VECTOR);
 soft_stub!(reschedule_stub, RESCHEDULE_VECTOR);
 soft_stub!(device_stub, DEVICE_VECTOR);
 soft_stub!(net_stub, NET_VECTOR);
+soft_stub!(net_tx_stub, NET_TX_VECTOR);
 soft_stub!(ioapic_stub, IOAPIC_VECTOR);
 
 /// Entry stub of the spurious-interrupt vector.

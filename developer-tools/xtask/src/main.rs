@@ -339,6 +339,10 @@ fn boot_scenario_markers() -> Scenario {
             // lease (CLAUDE.md §31, §54).
             "origin-kernel: virtio-net: 52:54:00:aa:bb:cc, features_ok true".into(),
             "; consistent true".into(),
+            // Its transmit ring: more frames than descriptors, every one completed and its
+            // descriptor reclaimed and reused; the TX-completion interrupt fired.
+            "origin-kernel: virtio-net TX: ".into(),
+            "; consistent true".into(),
             // The in-memory VFS (CLAUDE.md §39): a file built, read back, listed and removed.
             "origin-kernel: vfs: built /etc/origin/hostname (read back true), listed 1 entry, removed all back to 1 node".into(),
             // §21: the embedded ustar initramfs extracts into a VFS (contents and an

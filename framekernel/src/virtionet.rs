@@ -33,6 +33,8 @@ const Q_TX: u16 = 1;
 const EXPECTED_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0xAA, 0xBB, 0xCC];
 /// The MSI-X table entry the receive queue's interrupts use. Entry 0 is left masked.
 const RX_MSIX_ENTRY: u16 = 1;
+/// The MSI-X table entry the transmit queue's completion interrupts use.
+const TX_MSIX_ENTRY: u16 = 2;
 /// virtio's "no MSI-X vector" sentinel.
 const NO_VECTOR: u16 = 0xFFFF;
 
@@ -125,16 +127,65 @@ struct Queue {
     notify_off: u16,
 }
 
-/// What the receive thread needs from the bring-up, handed over before it is spawned.
+/// What the receive thread needs from the bring-up, handed over before it is spawned. (It
+/// transmits through [`TX`].)
 #[derive(Clone, Copy)]
 struct Setup {
     notify_base: u64,
     mul: u32,
     rx: Queue,
-    tx: Queue,
     mac: [u8; 6],
 }
 static SETUP: SpinLock<Option<Setup>> = SpinLock::new(None);
+
+/// Transmit descriptors in use. Each has one buffer page allocated at bring-up and kept: a
+/// small pool, recycled as the device completes frames.
+const N_TX: usize = 4;
+/// Gratuitous ARP announcements of the leased address the receive thread sends as one
+/// batch: one more than the ring holds, so the batch fills it and the last frame must wait
+/// for a completion. With the ARP request, DISCOVER and REQUEST: eight frames through four
+/// descriptors.
+const ANNOUNCEMENTS: usize = N_TX + 1;
+
+/// The transmit ring: descriptors `0..N_TX`, each with a fixed buffer, recycled through a
+/// free list as the device reports them completed in the used ring.
+struct TxRing {
+    q: Queue,
+    notify_base: u64,
+    mul: u32,
+    /// Each descriptor's buffer: (virtual, physical).
+    bufs: [(u64, u64); N_TX],
+    free: virtqueue::FreeList,
+    in_flight: [bool; N_TX],
+    /// The used ring is consumed up to here.
+    last_used: u16,
+    sent: u64,
+    reclaimed: u64,
+}
+/// The NIC's transmit ring, shared by the boot flow and the receive thread. Locked with
+/// interrupts disabled, never across a wait; the TX-completion handler does not take it.
+static TX: SpinLock<Option<TxRing>> = SpinLock::new(None);
+/// A transmitter sleeps here (for a free descriptor, or to flush) until a TX-completion
+/// interrupt wakes it. Separate from [`NET_WAIT`], so a TX completion never wakes the
+/// receive thread in place of the receive interrupt.
+static TX_WAIT: WaitQueue = WaitQueue::new();
+/// Counts the NIC's TX-completion interrupts.
+static TX_IRQS: AtomicU64 = AtomicU64::new(0);
+/// TX-completion interrupts that found a transmitter asleep and woke it.
+static TX_WAKES: AtomicU64 = AtomicU64::new(0);
+/// How often a transmit found every descriptor in flight.
+static TX_FULL: AtomicU64 = AtomicU64::new(0);
+/// How often a transmitter blocked on [`TX_WAIT`].
+static TX_SLEPT: AtomicU64 = AtomicU64::new(0);
+
+/// Called from the NIC's TX-completion vector (`cpu::NET_TX_VECTOR`): counts it and wakes
+/// a transmitter waiting for a descriptor, which then reclaims the completions itself.
+pub(crate) fn on_tx_interrupt() {
+    TX_IRQS.fetch_add(1, Ordering::Relaxed);
+    if TX_WAIT.wake_one() {
+        TX_WAKES.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Set by the receive thread once its buffers are posted, just before it sleeps for the
 /// gateway's ARP reply; the boot flow sends the request only after this.
@@ -185,14 +236,15 @@ fn setup_queue(common: u64, q: u16, vector: u16) -> Option<Queue> {
     })
 }
 
-/// Programs the MSI-X table so entry [`RX_MSIX_ENTRY`] targets processor `target` (an
-/// x2APIC ID) at `cpu::NET_VECTOR` (every other entry masked), and turns MSI-X on for the
-/// function. Returns whether MSI-X is enabled and unmasked. Mirrors the NVMe driver's setup.
+/// Programs the MSI-X table so entries [`RX_MSIX_ENTRY`] and [`TX_MSIX_ENTRY`] target
+/// processor `target` (an x2APIC ID) at `cpu::NET_VECTOR` and `cpu::NET_TX_VECTOR` (every
+/// other entry masked), and turns MSI-X on for the function. Returns whether MSI-X is enabled
+/// and unmasked. Mirrors the NVMe driver's setup.
 fn enable_msix_table(dev: &crate::pcie::Device, target: u32) -> bool {
     let Some(msix) = crate::pcie::msix(dev.function.at) else {
         return false;
     };
-    if msix.entries <= RX_MSIX_ENTRY {
+    if msix.entries <= RX_MSIX_ENTRY.max(TX_MSIX_ENTRY) {
         return false;
     }
     let Some(bar) = dev.bars.get(usize::from(msix.table_bar)).copied().flatten() else {
@@ -206,9 +258,10 @@ fn enable_msix_table(dev: &crate::pcie::Device, target: u32) -> bool {
     else {
         return false;
     };
-    let (Some(address), Some(data)) = (
+    let (Some(address), Some(rx_data), Some(tx_data)) = (
         pci::msi_address(target),
         pci::msi_data(crate::cpu::NET_VECTOR),
+        pci::msi_data(crate::cpu::NET_TX_VECTOR),
     ) else {
         return false;
     };
@@ -223,10 +276,15 @@ fn enable_msix_table(dev: &crate::pcie::Device, target: u32) -> bool {
     for i in 0..u64::from(msix.entries) {
         entry(i, 3, pci::MSIX_MASKED);
     }
-    entry(u64::from(RX_MSIX_ENTRY), 0, address as u32);
-    entry(u64::from(RX_MSIX_ENTRY), 1, (address >> 32) as u32);
-    entry(u64::from(RX_MSIX_ENTRY), 2, data);
-    entry(u64::from(RX_MSIX_ENTRY), 3, 0); // unmask
+    // Receive completions on `NET_VECTOR`, transmit completions on `NET_TX_VECTOR`, both to
+    // `target`; every other entry stays masked.
+    for (index, data) in [(RX_MSIX_ENTRY, rx_data), (TX_MSIX_ENTRY, tx_data)] {
+        let i = u64::from(index);
+        entry(i, 0, address as u32);
+        entry(i, 1, (address >> 32) as u32);
+        entry(i, 2, data);
+        entry(i, 3, 0); // unmask
+    }
     let Some(control) = crate::pcie::enable_msix(dev.function.at, &msix) else {
         return false;
     };
@@ -266,36 +324,169 @@ fn post_rx(rx: &Queue, notify_base: u64, mul: u32) -> Option<[u64; N_RX]> {
     Some(pages)
 }
 
-/// Transmits `frame` (a complete Ethernet frame) on the TX queue, prepending the virtio-net
-/// header, and waits for the device to consume it.
-fn transmit(tx: &Queue, notify_base: u64, mul: u32, frame: &[u8]) -> bool {
-    let Some((fv, fp)) = crate::storage::dma_page() else {
-        return false;
-    };
-    let hdr = virtio::NetHeader::plain().encode();
-    let total = hdr.len() + frame.len();
-    if total > 4096 {
-        return false;
+impl TxRing {
+    /// A ring over `q` with one buffer page, allocated now and kept, for each of its first
+    /// [`N_TX`] descriptors.
+    fn new(q: Queue, notify_base: u64, mul: u32) -> Option<Self> {
+        if q.size < N_TX {
+            return None;
+        }
+        let mut bufs = [(0, 0); N_TX];
+        for buf in &mut bufs {
+            *buf = crate::storage::dma_page()?;
+        }
+        Some(Self {
+            q,
+            notify_base,
+            mul,
+            bufs,
+            free: virtqueue::FreeList::new(N_TX),
+            in_flight: [false; N_TX],
+            last_used: 0,
+            sent: 0,
+            reclaimed: 0,
+        })
     }
-    let buf = page(fv, 4096);
-    buf[..hdr.len()].copy_from_slice(&hdr);
-    buf[hdr.len()..total].copy_from_slice(frame);
-    Descriptor {
-        addr: fp,
-        len: total as u32,
-        flags: 0,
-        next: 0,
+
+    /// Whether the device has completed frames that are not reclaimed yet.
+    fn completion_pending(&self) -> bool {
+        r16(self.q.used + 2) != self.last_used
     }
-    .write(page(tx.desc, virtqueue::desc_bytes(tx.size)), 0);
-    virtqueue::avail_push(page(tx.avail, virtqueue::avail_bytes(tx.size)), tx.size, 0);
-    notify(notify_base, tx.notify_off, mul, Q_TX);
-    for _ in 0..5_000_000u64 {
-        if r16(tx.used + 2) != 0 {
+
+    /// Returns every completed frame's descriptor to the free list. The device reports the
+    /// ids: one out of range or not in flight is consumed but never freed (so never twice).
+    fn reclaim(&mut self) {
+        while self.completion_pending() {
+            fence(Ordering::SeqCst);
+            let slot = usize::from(self.last_used) % self.q.size;
+            let (id, _) =
+                virtqueue::used_elem(page(self.q.used, virtqueue::used_bytes(self.q.size)), slot);
+            self.last_used = self.last_used.wrapping_add(1);
+            if let Some(busy) = self.in_flight.get_mut(id as usize)
+                && *busy
+            {
+                *busy = false;
+                self.free.free(id as u16);
+                self.reclaimed += 1;
+            }
+        }
+    }
+
+    /// Tells the device that frames are available (the TX queue's notify register).
+    fn kick(&self) {
+        notify(self.notify_base, self.q.notify_off, self.mul, Q_TX);
+    }
+
+    /// Copies `frame` behind a virtio-net header into a free descriptor's buffer and makes
+    /// it available to the device, kicking the device when `kick` (a batch kicks once, at
+    /// its end or when the ring is full). `false` when every descriptor is in flight.
+    fn enqueue(&mut self, frame: &[u8], kick: bool) -> bool {
+        let Some(id) = self.free.alloc() else {
+            return false;
+        };
+        let i = usize::from(id);
+        let Some(&(virt, phys)) = self.bufs.get(i) else {
+            self.free.free(id); // cannot happen: the free list holds only 0..N_TX
+            return false;
+        };
+        // The descriptor is free, so the device is done with this buffer.
+        let hdr = virtio::NetHeader::plain().encode();
+        let total = hdr.len() + frame.len();
+        let buf = page(virt, 4096);
+        buf[..hdr.len()].copy_from_slice(&hdr);
+        buf[hdr.len()..total].copy_from_slice(frame);
+        Descriptor {
+            addr: phys,
+            len: total as u32,
+            flags: 0,
+            next: 0,
+        }
+        .write(page(self.q.desc, virtqueue::desc_bytes(self.q.size)), i);
+        if let Some(busy) = self.in_flight.get_mut(i) {
+            *busy = true;
+        }
+        virtqueue::avail_push(
+            page(self.q.avail, virtqueue::avail_bytes(self.q.size)),
+            self.q.size,
+            id,
+        );
+        self.sent += 1;
+        if kick {
+            self.kick();
+        }
+        true
+    }
+}
+
+/// The condition a transmitter sleeps on: true once the device has completed frames that
+/// are not reclaimed yet; otherwise it kicks the device (so frames queued without a kick
+/// get sent) and returns false. It runs inside [`WaitQueue::wait_until`] with interrupts
+/// disabled, before the sleeper registers, and the TX-completion interrupt is routed to the
+/// sender's processor: so the completion's interrupt can arrive only after the sender is
+/// registered, and cannot be missed.
+fn tx_kick_then_pending() -> bool {
+    TX.lock().as_ref().is_some_and(|ring| {
+        if ring.completion_pending() {
             return true;
         }
-        core::hint::spin_loop();
+        ring.kick();
+        false
+    })
+}
+
+/// Sleeps on [`TX_WAIT`] until a TX completion is pending (see [`tx_kick_then_pending`]).
+fn tx_sleep_for_completion() {
+    let blocked = TX_WAIT.wait_until(tx_kick_then_pending);
+    TX_SLEPT.fetch_add(blocked, Ordering::Relaxed);
+}
+
+/// Transmits `frame` (a complete Ethernet frame) through the TX ring, kicking the device now
+/// when `kick`, or leaving it queued for a later kick (a batch). It reclaims completed
+/// descriptors first, and while every descriptor is in flight sleeps on [`TX_WAIT`] until
+/// the NIC's TX-completion interrupt reports one done (a kernel thread sleeps; the boot flow
+/// yields). Returns whether the frame was queued.
+fn transmit_with(frame: &[u8], kick: bool) -> bool {
+    if virtio::NET_HDR_LEN + frame.len() > 4096 {
+        return false;
     }
-    false
+    loop {
+        let queued = crate::cpu::without_interrupts(|| {
+            let mut ring = TX.lock();
+            let ring = ring.as_mut()?;
+            ring.reclaim();
+            Some(ring.enqueue(frame, kick))
+        });
+        match queued {
+            None => return false,
+            Some(true) => return true,
+            Some(false) => {
+                TX_FULL.fetch_add(1, Ordering::Relaxed);
+                tx_sleep_for_completion();
+            }
+        }
+    }
+}
+
+/// Transmits `frame` and kicks the device at once.
+fn transmit(frame: &[u8]) -> bool {
+    transmit_with(frame, true)
+}
+
+/// Kicks the device and sleeps on [`TX_WAIT`] until every queued frame has completed and
+/// its descriptor is back in the pool.
+fn tx_flush() {
+    loop {
+        let idle = crate::cpu::without_interrupts(|| {
+            TX.lock().as_mut().is_none_or(|ring| {
+                ring.reclaim();
+                ring.free.available() == N_TX
+            })
+        });
+        if idle {
+            return;
+        }
+        tx_sleep_for_completion();
+    }
 }
 
 /// Sleeps until the next received frame and returns its Ethernet bytes (the virtio-net
@@ -330,7 +521,7 @@ fn build_frame(out: &mut [u8], our_mac: Mac, ethertype: u16, payload: &[u8]) -> 
 }
 
 /// Transmits a DHCP message (broadcast) by wrapping it in UDP (68 → 67), IPv4 and Ethernet.
-fn transmit_dhcp(tx: &Queue, notify_base: u64, mul: u32, our_mac: Mac, dhcp: &[u8]) -> bool {
+fn transmit_dhcp(our_mac: Mac, dhcp: &[u8]) -> bool {
     let any = Ipv4([0, 0, 0, 0]);
     let bcast = Ipv4([255, 255, 255, 255]);
     let mut udp = [0u8; 640];
@@ -347,7 +538,7 @@ fn transmit_dhcp(tx: &Queue, notify_base: u64, mul: u32, our_mac: Mac, dhcp: &[u
     let Some(fl) = build_frame(&mut frame, our_mac, ethertype::IPV4, &ip[..ipn]) else {
         return false;
     };
-    transmit(tx, notify_base, mul, &frame[..fl])
+    transmit(&frame[..fl])
 }
 
 /// Extracts the DHCP message (the UDP payload) from a received Ethernet frame addressed to
@@ -369,15 +560,17 @@ fn dhcp_payload(frame: &[u8]) -> Option<&[u8]> {
 /// QEMU's user-networking gateway, the address the datapath resolves by ARP.
 const GATEWAY: Ipv4 = Ipv4([10, 0, 2, 2]);
 
-/// Transmits an ARP who-has for [`GATEWAY`] (a broadcast Ethernet frame) on the TX queue.
-fn send_arp_request(tx: &Queue, notify_base: u64, mul: u32, our_mac: Mac) -> bool {
+/// Transmits an ARP request (a broadcast Ethernet frame) asking for `target_ip`, from
+/// `sender_ip`, kicking the device at once when `kick` (else it joins a batch). With both
+/// addresses equal it is a gratuitous announcement (RFC 5227 §2.3).
+fn send_arp(our_mac: Mac, sender_ip: Ipv4, target_ip: Ipv4, kick: bool) -> bool {
     let mut req = [0u8; net::ARP_LEN];
     let request = Arp {
         operation: arp_op::REQUEST,
         sender_mac: our_mac,
-        sender_ip: Ipv4([10, 0, 2, 15]),
+        sender_ip,
         target_mac: Mac([0; 6]),
-        target_ip: GATEWAY,
+        target_ip,
     };
     if request.write(&mut req).is_none() {
         return false;
@@ -386,7 +579,7 @@ fn send_arp_request(tx: &Queue, notify_base: u64, mul: u32, our_mac: Mac) -> boo
     let Some(fl) = build_frame(&mut frame, our_mac, ethertype::ARP, &req) else {
         return false;
     };
-    transmit(tx, notify_base, mul, &frame[..fl])
+    transmit_with(&frame[..fl], kick)
 }
 
 /// Sleeps for received frames until [`GATEWAY`]'s ARP reply arrives (at most four frames),
@@ -410,15 +603,12 @@ fn await_arp_reply(rx: &Queue, rx_pages: &[u64; N_RX], last_used: &mut u16) -> O
 /// server, returning the leased address.
 fn dhcp_lease(
     rx: &Queue,
-    tx: &Queue,
     rx_pages: &[u64; N_RX],
     last_used: &mut u16,
-    notify_base: u64,
-    mul: u32,
     our_mac: Mac,
 ) -> Option<Ipv4> {
     let mut client = framekernel::dhcp::Client::new(our_mac.0);
-    transmit_dhcp(tx, notify_base, mul, our_mac, &client.start(0x4F52_4947));
+    transmit_dhcp(our_mac, &client.start(0x4F52_4947));
     for _ in 0..8 {
         let eth = recv_frame(rx, rx_pages, last_used);
         let Some(message) = dhcp_payload(eth) else {
@@ -426,7 +616,7 @@ fn dhcp_lease(
         };
         match client.on_receive(message) {
             framekernel::dhcp::Action::Send(request) => {
-                transmit_dhcp(tx, notify_base, mul, our_mac, &request);
+                transmit_dhcp(our_mac, &request);
             }
             framekernel::dhcp::Action::Bound(lease) => return Some(lease.address),
             _ => {}
@@ -452,18 +642,21 @@ extern "sysv64" fn net_thread(_: u64) -> ! {
             let packed = gateway.0.iter().fold(0u64, |a, &b| (a << 8) | u64::from(b));
             RX_GATEWAY.store(packed, Ordering::Relaxed);
         }
-        if let Some(lease) = dhcp_lease(
-            &s.rx,
-            &s.tx,
-            &rx_pages,
-            &mut last_used,
-            s.notify_base,
-            s.mul,
-            Mac(s.mac),
-        ) {
+        if let Some(lease) = dhcp_lease(&s.rx, &rx_pages, &mut last_used, Mac(s.mac)) {
             let address = u64::from(u32::from_be_bytes(lease.0));
             RX_LEASE.store((1 << 32) | address, Ordering::Relaxed);
+            // Announce the bound address with gratuitous ARPs (back to back here, not
+            // RFC 5227's two-second spacing; nothing answers them), as one batch queued
+            // without kicking the device. The batch is one frame larger than the ring, so it
+            // fills the ring and the last frame's sender kicks the device and sleeps until
+            // the TX-completion interrupt frees a descriptor, which is then reused.
+            for _ in 0..ANNOUNCEMENTS {
+                send_arp(Mac(s.mac), Ipv4(lease.0), Ipv4(lease.0), false);
+            }
         }
+        // Kick whatever the batch left queued, and sleep until every frame (the boot flow's
+        // ARP request included) has completed and its descriptor is back in the pool.
+        tx_flush();
     }
     RX_DONE.store(1, Ordering::Release);
     crate::sched::exit()
@@ -557,11 +750,13 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     let msix_enabled = enable_msix_table(&dev, target);
     w16(common + reg::CONFIG_MSIX_VECTOR, NO_VECTOR);
     let rx = setup_queue(common, Q_RX, RX_MSIX_ENTRY);
-    let tx = setup_queue(common, Q_TX, NO_VECTOR);
+    let tx = setup_queue(common, Q_TX, TX_MSIX_ENTRY);
     let queues_ok = rx.is_some() && tx.is_some();
-    // Confirm the receive queue kept its vector (NO_VECTOR back means none was available).
+    // Confirm each queue kept its vector (NO_VECTOR back means none was available).
     w16(common + reg::QUEUE_SELECT, Q_RX);
     let rx_vector_ok = msix_enabled && r16(common + reg::QUEUE_MSIX_VECTOR) == RX_MSIX_ENTRY;
+    w16(common + reg::QUEUE_SELECT, Q_TX);
+    let tx_vector_ok = msix_enabled && r16(common + reg::QUEUE_MSIX_VECTOR) == TX_MSIX_ENTRY;
 
     st |= status::DRIVER_OK;
     w8(common + reg::DEVICE_STATUS, st);
@@ -583,13 +778,15 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     // the thread fails here instead of hanging.
     let mul = caps.notify_off_multiplier;
     let (mut spawned, mut arp_sent) = (false, false);
-    if let (Some(rxq), Some(txq)) = (rx, tx) {
+    if let (Some(rxq), Some(txq)) = (rx, tx)
+        && let Some(ring) = TxRing::new(txq, notify_base, mul)
+    {
         crate::cpu::without_interrupts(|| {
+            *TX.lock() = Some(ring);
             *SETUP.lock() = Some(Setup {
                 notify_base,
                 mul,
                 rx: rxq,
-                tx: txq,
                 mac,
             });
         });
@@ -605,7 +802,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
                 1,
             );
             if RX_ARMED.load(Ordering::Acquire) != 0 {
-                arp_sent = send_arp_request(&txq, notify_base, mul, Mac(mac));
+                arp_sent = send_arp(Mac(mac), Ipv4([10, 0, 2, 15]), GATEWAY, true);
             }
             crate::sched::yield_until(|| RX_DONE.load(Ordering::Acquire) != 0, tsc_hz, 10);
         }
@@ -666,5 +863,34 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         } else {
             ": virtio-net failed"
         }
+    );
+
+    // The transmit ring: more frames than descriptors went through it, so completed
+    // descriptors were reclaimed and reused; the announcement batch filled the ring and its
+    // sender slept until a TX-completion interrupt woke it; and at the end every frame has
+    // completed and the whole pool is free again.
+    let (sent, reclaimed, free) = crate::cpu::without_interrupts(|| {
+        TX.lock().as_ref().map_or((0, 0, 0), |ring| {
+            (ring.sent, ring.reclaimed, ring.free.available())
+        })
+    });
+    let tx_irqs = TX_IRQS.load(Ordering::Relaxed);
+    let tx_wakes = TX_WAKES.load(Ordering::Relaxed);
+    let tx_full = TX_FULL.load(Ordering::Relaxed);
+    let tx_slept = TX_SLEPT.load(Ordering::Relaxed);
+    let tx_ok = finished
+        && tx_vector_ok
+        && sent > N_TX as u64
+        && reclaimed == sent
+        && free == N_TX
+        && tx_full > 0
+        && tx_slept > 0
+        && tx_wakes > 0
+        && tx_irqs > 0;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: virtio-net TX: {sent} frames through {N_TX} descriptors (buffers allocated once), {reclaimed} completions reclaimed, {free} of {N_TX} free at the end; the ring was full {tx_full} times and senders slept {tx_slept} times, woken by the TX-completion interrupt {tx_wakes} (of {tx_irqs}); consistent {}{}",
+        tx_ok,
+        if tx_ok { "" } else { ": virtio-net failed" }
     );
 }
