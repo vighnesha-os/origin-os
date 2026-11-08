@@ -334,6 +334,10 @@ fn boot_scenario_markers() -> Scenario {
             // write-back work (CLAUDE.md §39).
             "origin-kernel: block cache: 4 pages (512 B blocks, 8 per page): 32 of 32 blocks matched the pattern; 4 device reads cold, re-reading 4 resident pages did 0 more (32 hits, 4 misses)".into(),
             "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); wrote LBA 10240, flushed (1 device writes), evicted and read back changed: true".into(),
+            // The virtio-net NIC brought up: features negotiated, MAC read, DRIVER_OK, and
+            // one frame transmitted and consumed by the device (CLAUDE.md §54).
+            "origin-kernel: virtio-net: 52:54:00:aa:bb:cc, features_ok true".into(),
+            "; consistent true".into(),
             // The in-memory VFS (CLAUDE.md §39): a file built, read back, listed and removed.
             "origin-kernel: vfs: built /etc/origin/hostname (read back true), listed 1 entry, removed all back to 1 node".into(),
             // §21: the embedded ustar initramfs extracts into a VFS (contents and an
@@ -351,7 +355,7 @@ fn boot_scenario_markers() -> Scenario {
             "origin-kernel: timers: 3 deadlines (1 cancelled) fired in order [10, 20, 30], worst lateness ".into(),
             // Integration: a /sys tree built in the VFS from live discovered facts.
             "origin-kernel: sysfs: built /sys with 4 facts (4 subtrees): ".into(),
-            "bus/pci/count=6, block/nvme0/size_mib=16; read back pci count Some(6)".into(),
+            "bus/pci/count=7, block/nvme0/size_mib=16; read back pci count Some(7)".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ])
         .collect(),
@@ -390,6 +394,7 @@ fn boot_scenario_markers() -> Scenario {
             ": slit failed",
             ": entropy failed",
             ": initramfs failed",
+            ": virtio-net failed",
             "supervisor isolation from user pages incomplete",
             "origin-kernel: cannot map the user probe page",
             ": user isolation failed",
@@ -1196,7 +1201,13 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         .arg("-drive")
         .arg(drive("if=none,id=nvme0,format=raw,file=", &s.nvme)?)
         .args(["-device", "nvme,serial=ORIGIN0001,drive=nvme0"])
-        .args(["-net", "none", "-display", "none", "-no-reboot"])
+        // A modern virtio-net NIC with a fixed MAC, on QEMU user networking (CLAUDE.md §54).
+        .args(["-netdev", "user,id=net0"])
+        .args([
+            "-device",
+            "virtio-net-pci,netdev=net0,mac=52:54:00:aa:bb:cc,disable-legacy=on",
+        ])
+        .args(["-display", "none", "-no-reboot"])
         .arg("-rtc")
         .arg(format!("base={RTC_BASE}"));
     // Opt-in diagnostics: every interrupt and CPU reset, for debugging a triple fault.

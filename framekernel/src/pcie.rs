@@ -280,6 +280,11 @@ pub(crate) fn device_count() -> usize {
     crate::cpu::without_interrupts(|| DEVICES.read().len())
 }
 
+/// Reads a configuration-space dword (for a driver walking its capability list).
+pub(crate) fn read_config32(at: Address, register: u16) -> Option<u32> {
+    crate::cpu::without_interrupts(|| ECAM.lock().as_mut().map(|s| s.read32(at, register)))
+}
+
 /// The first listed function of this class, subclass and programming interface.
 pub(crate) fn find(class: u8, subclass: u8, prog_if: u8) -> Option<Device> {
     crate::cpu::without_interrupts(|| {
