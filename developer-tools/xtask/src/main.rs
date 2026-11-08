@@ -343,6 +343,10 @@ fn boot_scenario_markers() -> Scenario {
             // descriptor reclaimed and reused; the TX-completion interrupt fired.
             "origin-kernel: virtio-net TX: ".into(),
             "; consistent true".into(),
+            // Traffic on the lease: the gateway answers every echo request sent from the
+            // leased address to the MAC ARP resolved.
+            "origin-kernel: virtio-net ping: 10.0.2.15 -> 10.0.2.2 (52:55:0a:00:02:02): 4 of 4 echo replies".into(),
+            "; consistent true".into(),
             // The in-memory VFS (CLAUDE.md §39): a file built, read back, listed and removed.
             "origin-kernel: vfs: built /etc/origin/hostname (read back true), listed 1 entry, removed all back to 1 node".into(),
             // §21: the embedded ustar initramfs extracts into a VFS (contents and an

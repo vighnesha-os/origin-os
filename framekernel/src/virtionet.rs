@@ -513,8 +513,14 @@ fn recv_frame(rx: &Queue, rx_pages: &[u64; N_RX], last_used: &mut u16) -> &'stat
 }
 
 /// Builds a broadcast Ethernet frame into `out` and returns its length.
-fn build_frame(out: &mut [u8], our_mac: Mac, ethertype: u16, payload: &[u8]) -> Option<usize> {
-    EthFrame::write_header(Mac::BROADCAST, our_mac, ethertype, out)?;
+fn build_frame(
+    out: &mut [u8],
+    dst: Mac,
+    our_mac: Mac,
+    ethertype: u16,
+    payload: &[u8],
+) -> Option<usize> {
+    EthFrame::write_header(dst, our_mac, ethertype, out)?;
     let end = net::ETH_HEADER + payload.len();
     out.get_mut(net::ETH_HEADER..end)?.copy_from_slice(payload);
     Some(end)
@@ -535,7 +541,13 @@ fn transmit_dhcp(our_mac: Mac, dhcp: &[u8]) -> bool {
         return false;
     };
     let mut frame = [0u8; 720];
-    let Some(fl) = build_frame(&mut frame, our_mac, ethertype::IPV4, &ip[..ipn]) else {
+    let Some(fl) = build_frame(
+        &mut frame,
+        Mac::BROADCAST,
+        our_mac,
+        ethertype::IPV4,
+        &ip[..ipn],
+    ) else {
         return false;
     };
     transmit(&frame[..fl])
@@ -576,7 +588,7 @@ fn send_arp(our_mac: Mac, sender_ip: Ipv4, target_ip: Ipv4, kick: bool) -> bool 
         return false;
     }
     let mut frame = [0u8; net::ETH_HEADER + net::ARP_LEN];
-    let Some(fl) = build_frame(&mut frame, our_mac, ethertype::ARP, &req) else {
+    let Some(fl) = build_frame(&mut frame, Mac::BROADCAST, our_mac, ethertype::ARP, &req) else {
         return false;
     };
     transmit_with(&frame[..fl], kick)
@@ -597,6 +609,115 @@ fn await_arp_reply(rx: &Queue, rx_pages: &[u64; N_RX], last_used: &mut u16) -> O
         }
     }
     None
+}
+
+/// The identifier our echo requests carry ("OR").
+const PING_ID: u16 = 0x4F52;
+/// Echo requests the receive thread sends the gateway once it holds a lease.
+const PINGS: u16 = 4;
+
+/// Echo replies received that matched their request, and their round trips in TSC cycles.
+static PING_REPLIES: AtomicU64 = AtomicU64::new(0);
+static PING_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
+static PING_MAX: AtomicU64 = AtomicU64::new(0);
+static PING_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// The data echo request `sequence` carries: 32 bytes that differ per request.
+fn ping_data(sequence: u16) -> [u8; 32] {
+    let mut data = [0u8; 32];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(7) ^ (sequence as u8);
+    }
+    data
+}
+
+/// Transmits an ICMP echo request from `src` to `dst`, unicast to `dst_mac`.
+fn send_ping(our_mac: Mac, dst_mac: Mac, src: Ipv4, dst: Ipv4, sequence: u16) -> bool {
+    let data = ping_data(sequence);
+    let mut icmp = [0u8; net::ICMP_HEADER + 32];
+    let Some(il) = net::IcmpEcho::write(
+        net::icmp_type::ECHO_REQUEST,
+        PING_ID,
+        sequence,
+        &data,
+        &mut icmp,
+    ) else {
+        return false;
+    };
+    let mut ip = [0u8; net::IPV4_HEADER + net::ICMP_HEADER + 32];
+    let Some(ipl) = net::Ipv4Packet::write(
+        src,
+        dst,
+        net::protocol::ICMP,
+        64,
+        sequence,
+        &icmp[..il],
+        &mut ip,
+    ) else {
+        return false;
+    };
+    let mut frame = [0u8; net::ETH_HEADER + net::IPV4_HEADER + net::ICMP_HEADER + 32];
+    let Some(fl) = build_frame(&mut frame, dst_mac, our_mac, ethertype::IPV4, &ip[..ipl]) else {
+        return false;
+    };
+    transmit(&frame[..fl])
+}
+
+/// Sleeps for received frames until the echo reply to request `sequence` arrives from
+/// `from` to `to` (at most four frames). The reply must carry our identifier, the sequence
+/// and the request's data, with valid IPv4 and ICMP checksums.
+fn await_echo_reply(
+    rx: &Queue,
+    rx_pages: &[u64; N_RX],
+    last_used: &mut u16,
+    from: Ipv4,
+    to: Ipv4,
+    sequence: u16,
+) -> bool {
+    let data = ping_data(sequence);
+    for _ in 0..4 {
+        let eth = recv_frame(rx, rx_pages, last_used);
+        if let Some(frame) = EthFrame::parse(eth)
+            && frame.ethertype == ethertype::IPV4
+            && let Some(packet) = net::Ipv4Packet::parse(frame.payload)
+            && packet.protocol == net::protocol::ICMP
+            && packet.src == from
+            && packet.dst == to
+            && let Some(echo) = net::IcmpEcho::parse(packet.payload)
+            && echo.kind == net::icmp_type::ECHO_REPLY
+            && echo.identifier == PING_ID
+            && echo.sequence == sequence
+            && echo.data == data
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Pings the gateway [`PINGS`] times from the leased address `ours`, unicast to the MAC the
+/// ARP exchange resolved, sleeping on the receive interrupt for each reply, and records the
+/// replies that matched and their round-trip times.
+fn ping_gateway(
+    rx: &Queue,
+    rx_pages: &[u64; N_RX],
+    last_used: &mut u16,
+    our_mac: Mac,
+    gateway_mac: Mac,
+    ours: Ipv4,
+) {
+    for sequence in 1..=PINGS {
+        let start = crate::cpu::rdtsc();
+        if send_ping(our_mac, gateway_mac, ours, GATEWAY, sequence)
+            && await_echo_reply(rx, rx_pages, last_used, GATEWAY, ours, sequence)
+        {
+            let rtt = crate::cpu::rdtsc().wrapping_sub(start);
+            PING_REPLIES.fetch_add(1, Ordering::Relaxed);
+            PING_MIN.fetch_min(rtt, Ordering::Relaxed);
+            PING_MAX.fetch_max(rtt, Ordering::Relaxed);
+            PING_TOTAL.fetch_add(rtt, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Obtains a DHCP lease over the NIC: DISCOVER → OFFER → REQUEST → ACK with QEMU's built-in
@@ -638,11 +759,13 @@ extern "sysv64" fn net_thread(_: u64) -> ! {
     {
         let mut last_used = 0u16;
         RX_ARMED.store(1, Ordering::Release);
-        if let Some(gateway) = await_arp_reply(&s.rx, &rx_pages, &mut last_used) {
+        let gateway = await_arp_reply(&s.rx, &rx_pages, &mut last_used);
+        if let Some(gateway) = gateway {
             let packed = gateway.0.iter().fold(0u64, |a, &b| (a << 8) | u64::from(b));
             RX_GATEWAY.store(packed, Ordering::Relaxed);
         }
-        if let Some(lease) = dhcp_lease(&s.rx, &rx_pages, &mut last_used, Mac(s.mac)) {
+        let lease = dhcp_lease(&s.rx, &rx_pages, &mut last_used, Mac(s.mac));
+        if let Some(lease) = lease {
             let address = u64::from(u32::from_be_bytes(lease.0));
             RX_LEASE.store((1 << 32) | address, Ordering::Relaxed);
             // Announce the bound address with gratuitous ARPs (back to back here, not
@@ -657,6 +780,12 @@ extern "sysv64" fn net_thread(_: u64) -> ! {
         // Kick whatever the batch left queued, and sleep until every frame (the boot flow's
         // ARP request included) has completed and its descriptor is back in the pool.
         tx_flush();
+        // Use the lease: ping the gateway from the leased address, unicast to the MAC the
+        // ARP exchange resolved, then flush those frames too.
+        if let (Some(gateway), Some(lease)) = (gateway, lease) {
+            ping_gateway(&s.rx, &rx_pages, &mut last_used, Mac(s.mac), gateway, lease);
+            tx_flush();
+        }
     }
     RX_DONE.store(1, Ordering::Release);
     crate::sched::exit()
@@ -892,5 +1021,35 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         "origin-kernel: virtio-net TX: {sent} frames through {N_TX} descriptors (buffers allocated once), {reclaimed} completions reclaimed, {free} of {N_TX} free at the end; the ring was full {tx_full} times and senders slept {tx_slept} times, woken by the TX-completion interrupt {tx_wakes} (of {tx_irqs}); consistent {}{}",
         tx_ok,
         if tx_ok { "" } else { ": virtio-net failed" }
+    );
+
+    // Traffic on the lease: echo requests from the leased address to the gateway, unicast to
+    // the MAC ARP resolved; every reply matched its request.
+    let replies = PING_REPLIES.load(Ordering::Relaxed);
+    let per_us = (tsc_hz / 1_000_000).max(1);
+    let (min, avg, max) = match PING_TOTAL.load(Ordering::Relaxed).checked_div(replies) {
+        Some(mean) => (
+            PING_MIN.load(Ordering::Relaxed) / per_us,
+            mean / per_us,
+            PING_MAX.load(Ordering::Relaxed) / per_us,
+        ),
+        None => (0, 0, 0),
+    };
+    let ping_ok = finished && gateway != 0 && lease & (1 << 32) != 0 && replies == u64::from(PINGS);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: virtio-net ping: {}.{}.{}.{} -> 10.0.2.2 ({:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}): {replies} of {PINGS} echo replies (identifier, sequence and data matched); round trip min/avg/max {min}/{avg}/{max} us; consistent {}{}",
+        ip[0],
+        ip[1],
+        ip[2],
+        ip[3],
+        g[2],
+        g[3],
+        g[4],
+        g[5],
+        g[6],
+        g[7],
+        ping_ok,
+        if ping_ok { "" } else { ": virtio-net failed" }
     );
 }
