@@ -11,8 +11,8 @@
 //!   kernel stack is 16 KiB. So a close only parks its undelivered messages; each system
 //!   call and each process exit drains them iteratively ([`reap_closed`]) and outside any
 //!   lock.
-//! - Sending a channel end is refused when that could make it unreachable (Proposed
-//!   amendment A3 to ADR-0005): it must not be an end of the channel it is sent on, must be
+//! - Sending a channel end is refused when that could make it unreachable (ADR-0005
+//!   amendment A3): it must not be an end of the channel it is sent on, must be
 //!   the only handle to that end, and must not end up inside its own queue. So every end in
 //!   flight has exactly one reference, the graph of ends held in queues is a forest rooted at
 //!   ends held in handle tables, and no reference cycle can keep a dead end alive.

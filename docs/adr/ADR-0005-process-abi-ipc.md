@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (2026-11-08, below): Proposed**, awaiting the owner. |
+| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (below): Accepted** by the owner on 2026-11-08, with the recommended option of each item. |
 | Scope | Kernel objects and handles, the system-call convention, status codes, process and thread start, memory mapping, IPC, waiting, faults, termination, ABI versioning |
 | Builds on | ONBF §6.1 (EXE/LIB images, syscall-origin pinning, TLS in FS), §8.2 (sealed objects, the Code Integrity Table, mapping rules), §8.3 (the user-mode Loader Service and the start record); ADR-0001 D2 (user-mode drivers); ADR-0004 (address-space layout) |
 | Requires | CLAUDE.md §29 (processes and isolation), §30 (IPC and capabilities), §42 (executable ABI), §44 (runtime), §49 (SDK) |
@@ -83,11 +83,11 @@ The handle-and-rights model follows the capability tradition (KeyKOS, EROS, seL4
 3. Faults go to an exception channel, else terminate the process; no POSIX signals (P10)?
 4. Message limits of 64 KiB and 64 handles (P8)?
 
-## Amendment 1 (Proposed, 2026-11-08): what the first system-call slice needs and P1–P12 do not say
+## Amendment 1 (Accepted, 2026-11-08): what the first system-call slice needs and P1–P12 do not say
 
-**Status: Proposed, awaiting the owner (CLAUDE.md §84).** The kernel implements the recommended option of each item, on a local branch only, so it can be built and boot-proven; nothing here is Accepted, and every one is easy to change before it ships. Each item only states behaviour the implementation has to define somehow; the ADR's accepted text is unchanged.
+**Status: Accepted by the owner on 2026-11-08, with the recommended option of each item (CLAUDE.md §84).** Each item states behaviour the first system-call slice had to define; the ADR's accepted text (P1–P12) is unchanged. The alternatives are kept for the record.
 
-| # | Question | Recommended (implemented) | Alternative |
+| # | Question | Decision (implemented) | Alternative |
 |---|---|---|---|
 | A1 | Which rights does a new channel end get? | `READ`, `WRITE`, `DUPLICATE`, `TRANSFER`, `WAIT` (`rights::CHANNEL`): everything that applies to a channel, since no operation can ever add a right (P2) | Omit `DUPLICATE`: ends are then unique by construction, and A3's second rule goes away, but `duplicate` means nothing for channels |
 | A2 | How does `wait_one` end besides a signal and a deadline? | Closing the waited-on handle, or moving it away in a message, completes the wait with `CANCELED`. A deadline of 0 is a poll, and `signals` of 0 or with undefined bits is `INVALID_ARGS` | Waits keep going until a signal or deadline, ignoring close (P9 says only that cancellation exists) |
@@ -96,4 +96,4 @@ The handle-and-rights model follows the capability tradition (KeyKOS, EROS, seL4
 | A5 | When does a process end? | When its last thread ends, by `exit` or by a fault (P10's no-exception-channel case). There is no separate process exit call in this release's numbers | A `process_exit` call, or terminating a process on any thread's fault (P10) |
 | A6 | Who decides the system-call origin before `origin.core` exists? | The creator names the code range for each process. A call from outside it returns `ACCESS_DENIED` | Terminate the process on the violation (ONBF §6.1 says only that such calls are not accepted) |
 
-Answers change only the items above; the implementation records each decision's consequences in `docs/engineering/SOURCE_PROVENANCE.md`.
+The implementation records each decision's consequences in `docs/engineering/SOURCE_PROVENANCE.md`.

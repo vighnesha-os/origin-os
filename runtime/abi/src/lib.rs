@@ -165,7 +165,7 @@ pub mod rights {
     /// Every right defined in this version.
     pub const ALL: u32 = (1 << 9) - 1;
     /// The rights of a new channel end: everything that applies to a channel (P2, P8,
-    /// Proposed amendment A1). `MAP`, `EXECUTE`, `SIGNAL` and `MANAGE` do not apply.
+    /// amendment A1). `MAP`, `EXECUTE`, `SIGNAL` and `MANAGE` do not apply.
     pub const CHANNEL: u32 = READ | WRITE | DUPLICATE | TRANSFER | WAIT;
 }
 
