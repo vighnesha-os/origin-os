@@ -377,39 +377,64 @@ fn format_u64(value: u64, buf: &mut [u8; 20]) -> &[u8] {
 
 /// Proves the monotonic timer queue against the real clock: three timers armed at
 /// increasing deadlines (plus one cancelled) must fire in order, each close to its
-/// deadline, and the cancelled one never (CLAUDE.md §68).
+/// deadline, and the cancelled one never (CLAUDE.md §68). A run in which the polling loop
+/// itself stalled (a virtual CPU descheduled on a loaded host) cannot tell a late timer
+/// from a late look, so such a run that went wrong is measured again, a few times.
 fn prove_timers(com1: &mut console::Console) {
     use framekernel::timers::TimerQueue;
-    let mut q = TimerQueue::new();
-    let base = time::monotonic_nanos();
+    const ATTEMPTS: usize = 6;
+    /// Polls this far apart mean the polling processor stalled, which is what makes a late
+    /// expiry uninformative.
+    const STALLED_NANOS: u64 = 1_000_000;
     let step = 5_000_000u64; // 5 ms
     let ids = [10u64, 20, 30];
-    for (i, &id) in ids.iter().enumerate() {
-        q.arm(id, base + (i as u64 + 1) * step);
-    }
-    q.arm(99, base + 2 * step);
-    q.cancel(99); // this one must never fire
     let mut order = alloc::vec::Vec::new();
-    let mut fired = alloc::vec::Vec::new();
     let mut worst_late = 0u64;
-    let start = cpu::rdtsc();
-    let tsc_hz = time::tsc_hz();
-    while !q.is_empty() && cpu::rdtsc().wrapping_sub(start) < tsc_hz {
-        let now = time::monotonic_nanos();
-        if q.expire(now, &mut fired) > 0 {
-            for id in fired.drain(..) {
-                let deadline = base + (order.len() as u64 + 1) * step;
-                worst_late = worst_late.max(now.saturating_sub(deadline));
-                order.push(id);
-            }
+    let mut ok = false;
+    let mut attempts = 0;
+    while attempts < ATTEMPTS {
+        attempts += 1;
+        let mut q = TimerQueue::new();
+        let base = time::monotonic_nanos();
+        for (i, &id) in ids.iter().enumerate() {
+            q.arm(id, base + (i as u64 + 1) * step);
         }
-        core::hint::spin_loop();
+        q.arm(99, base + 2 * step);
+        q.cancel(99); // this one must never fire
+        order.clear();
+        worst_late = 0;
+        let mut fired = alloc::vec::Vec::new();
+        let mut last_poll = base;
+        let mut longest_gap = 0u64;
+        let start = cpu::rdtsc();
+        let tsc_hz = time::tsc_hz();
+        while !q.is_empty() && cpu::rdtsc().wrapping_sub(start) < tsc_hz {
+            let now = time::monotonic_nanos();
+            longest_gap = longest_gap.max(now.saturating_sub(last_poll));
+            last_poll = now;
+            if q.expire(now, &mut fired) > 0 {
+                for id in fired.drain(..) {
+                    let deadline = base + (order.len() as u64 + 1) * step;
+                    worst_late = worst_late.max(now.saturating_sub(deadline));
+                    order.push(id);
+                }
+            }
+            core::hint::spin_loop();
+        }
+        ok = order == ids && worst_late < 2_000_000; // within 2 ms
+        if ok || longest_gap < STALLED_NANOS {
+            break;
+        }
     }
-    let ok = order == ids && worst_late < 2_000_000; // within 2 ms
     let _ = writeln!(
         com1,
-        "origin-kernel: timers: 3 deadlines (1 cancelled) fired in order {order:?}, worst lateness {} us{}",
+        "origin-kernel: timers: 3 deadlines (1 cancelled) fired in order {order:?}, worst lateness {} us{}{}",
         worst_late / 1000,
+        if attempts > 1 {
+            " (after a stalled run)"
+        } else {
+            ""
+        },
         if ok { "" } else { ": timers failed" }
     );
 }

@@ -1047,6 +1047,24 @@ The owner accepted the sheet's recommendations for items 1–6, 8, 9 and 13–20
 #### Next
 
 - Check every VT-d encoding against Rev 5.20, then ADR-0007's question 3.
-- Make the RTC wait in `time.rs` robust under host load.
+- ~~Make the RTC wait in `time.rs` robust under host load.~~ Done; see the next section.
 - **The owner:** the AMD manuals' hashes (item 23), then ADR-0007's questions 6–8; the licence, the push, the hardware (items 21, 22, 24).
 
+
+### Continued (2026-11-08, ~15:10–17:15 IST): the clock proofs under host load (task TIME-RTC-UIP)
+
+On `claude/musing-hamilton-587f7b`, from `b3efe8a`, **committed locally, not merged, not pushed**.
+
+The task was the RTC wait (`time.rs`). Measuring it first showed that was only half the flake: with every host core loaded, the boot fails 83 % of the time, with the RTC wait timing out in 40 % of boots and, in most of the rest, the *PIT calibration* off by up to 39 % (the RTC second itself was right to 0.02 %). So the fix covers both, and the cross-CPU check, the HPET and PM-timer read pairs, and `prove_timers`' lateness bound, which share the cause: every one polls a clock and assumed it was never descheduled. The parent session left that scope to judgement.
+
+- **The RTC second** is now timed from the seconds register, between brackets, and decided only when a whole interval of uncertainty is inside or outside 1 % (`rtc::UpdateWatcher`, `rtc::SecondMeter`). A stalled edge costs precision, not the measurement; a vague pair waits for the next edge, up to a 3.2 s budget (at most one second more than the old two, used only when an edge was spoiled).
+- **The PIT calibration** measures a 10 ms window again when its ends were not observed closely (`apic::CalibrationWindow`; up to 32 windows; QEMU's PIT counts from the count write, not the gate, and the bracket covers both).
+- **The others:** `prove_consistent` extends to 500 ms while there are fewer than 100 handoffs; HPET and PM-timer reads are paired with the TSC through `clock::closest_read`; `prove_timers` repeats a run whose polling loop stalled, and fails at once if a timer is late with the poller running.
+- **Measured** (`boot-test`, one `yes` per logical core, 30 boots per arm, alternating): original 83 % → final 3 % failures; RTC-wait timeouts 11 → 0; PIT-off 13 → 0; the one final failure is the scheduler's weighted-share bound. All the before/after numbers, the 12 negative controls and the 3 positive ones are in `docs/engineering/SOURCE_PROVENANCE.md`, "The clock proofs under host load".
+- **Gates:** `cargo xtask check` (701 tests, 0 failures, 6 ignored); `cargo xtask boot-matrix` (Intel and AMD at 1, 2, 4 CPUs, `boot-x2apic`).
+- **Note for whoever edits a boot proof:** QEMU's `hw/timer/i8254.c` ignores the gate in mode 0; any new PIT window must bracket the count write. Any proof that polls a clock and compares to a bound should keep the bracket-and-retry shape, or a loaded host will fail it.
+
+#### Next
+
+- The scheduler's weighted-share bound is the last load-sensitive proof seen (1 boot in 30 with every core loaded). It is a separate proof (`sched`), not changed here.
+- Merge this branch (it touches `time.rs`, `timer.rs`, `main.rs`'s `prove_timers`, `rtc.rs`, `apic.rs`, `clock.rs`).

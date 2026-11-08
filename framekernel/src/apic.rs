@@ -154,6 +154,62 @@ pub const fn rate(ticks: u64, nanos: u64) -> Option<u64> {
     }
 }
 
+/// The largest share of a PIT calibration window that its start, its end and the reading
+/// of the count-down may each be uncertain by: 1/500 (20 µs of a 10 ms window).
+const CALIBRATION_MAX_SKEW_SHARE: u64 = 500;
+
+/// Readings of the counter being calibrated around one PIT one-shot, enough to tell
+/// whether the window was observed closely.
+///
+/// A polled calibration has two instants that matter, the gate write that starts the
+/// PIT and the first poll that sees OUT2 high, and a stall on either (an SMI, or a
+/// virtual CPU descheduled on a loaded host) corrupts the rate by as much as the stall:
+/// in a 10 ms window a 3.5 ms stall reads as a 35 % faster TSC. The readings bracket those
+/// instants, so a spoiled window can be recognised and measured again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CalibrationWindow {
+    /// Before the gate write that starts the PIT and the APIC count-down.
+    pub before_start: u64,
+    /// After the gate write and the start of the APIC count-down.
+    pub after_start: u64,
+    /// Before the last poll of OUT2 that still read low.
+    pub before_end: u64,
+    /// After the poll of OUT2 that read high.
+    pub after_end: u64,
+    /// After reading the APIC's current count.
+    pub after_read: u64,
+}
+
+impl CalibrationWindow {
+    /// The window's length in counter ticks, taking each end at the middle of its
+    /// bracket: the best estimate, however disturbed the window was.
+    pub const fn ticks(&self) -> u64 {
+        let start = self.before_start + self.after_start.saturating_sub(self.before_start) / 2;
+        let end = self.before_end + self.after_end.saturating_sub(self.before_end) / 2;
+        end.saturating_sub(start)
+    }
+
+    /// How much the window's start, end and APIC reading could together be off by, in
+    /// counter ticks: the measure of how disturbed the window was.
+    pub const fn skew(&self) -> u64 {
+        self.after_start
+            .saturating_sub(self.before_start)
+            .saturating_add(self.after_end.saturating_sub(self.before_end))
+            .saturating_add(self.after_read.saturating_sub(self.after_end))
+    }
+
+    /// Whether this window was observed closely enough to trust: its start, its end and
+    /// the reading of the count-down each within 1/500 of the window (0.2 %, against the
+    /// 1 % the RTC proof allows), and not empty.
+    pub const fn clean(&self) -> bool {
+        let limit = self.after_end.saturating_sub(self.before_start) / CALIBRATION_MAX_SKEW_SHARE;
+        limit != 0
+            && self.after_start.saturating_sub(self.before_start) <= limit
+            && self.after_end.saturating_sub(self.before_end) <= limit
+            && self.after_read.saturating_sub(self.after_end) <= limit
+    }
+}
+
 /// Timer initial count for `hz` interrupts per second from a timer running at `rate` ticks
 /// per second, or `None` if it rounds to zero or does not fit 32 bits.
 pub const fn initial_count(rate: u64, hz: u64) -> Option<u32> {
@@ -238,5 +294,93 @@ mod tests {
         assert_eq!(initial_count(999, 1000), None, "rounds to zero");
         assert_eq!(initial_count(u64::MAX, 1), None, "beyond 32 bits");
         assert_eq!(initial_count(1, 0), None);
+    }
+
+    /// A 10 ms window on a 1 GHz counter, observed as closely as the code does.
+    fn close_window() -> CalibrationWindow {
+        CalibrationWindow {
+            before_start: 1_000_000,
+            after_start: 1_002_000,
+            before_end: 11_001_000,
+            after_end: 11_003_000,
+            after_read: 11_004_000,
+        }
+    }
+
+    #[test]
+    fn a_closely_observed_window_is_clean() {
+        let w = close_window();
+        assert_eq!(w.ticks(), 10_001_000);
+        assert_eq!(w.skew(), 2_000 + 2_000 + 1_000);
+        assert!(w.clean());
+    }
+
+    #[test]
+    fn a_window_with_a_stall_at_either_end_is_not_clean() {
+        // A share of 1/500 is 20 µs of this 10 ms window: 15 µs is close enough, 25 µs is
+        // not.
+        let cases: [fn(&mut CalibrationWindow, u64); 3] = [
+            |w, d| w.before_start = w.after_start - d,
+            |w, d| w.before_end = w.after_end - d,
+            |w, d| w.after_read = w.after_end + d,
+        ];
+        for (i, stall) in cases.iter().enumerate() {
+            let mut close = close_window();
+            stall(&mut close, 15_000);
+            assert!(close.clean(), "case {i}: 15 us");
+            let mut far = close_window();
+            stall(&mut far, 25_000);
+            assert!(!far.clean(), "case {i}: 25 us");
+        }
+        // A descheduling across the end, as a loaded host produces: the rate would be
+        // about 35 % high without this check.
+        let mut stalled = close_window();
+        stalled.after_end += 3_500_000;
+        stalled.after_read += 3_500_000;
+        assert!(!stalled.clean());
+        assert!(stalled.skew() > close_window().skew());
+    }
+
+    #[test]
+    fn an_empty_window_is_never_clean() {
+        let w = CalibrationWindow {
+            before_start: 5,
+            after_start: 5,
+            before_end: 5,
+            after_end: 5,
+            after_read: 5,
+        };
+        assert_eq!(w.ticks(), 0);
+        assert_eq!(w.skew(), 0);
+        assert!(!w.clean());
+    }
+
+    /// Any readings at all: nothing overflows or panics, and a clean window is a window
+    /// whose three uncertainties are within the share of its length (CLAUDE.md §13).
+    #[test]
+    fn any_readings_are_handled() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0x5049_5431);
+        for case in 0..crate::testing::cases(50_000) {
+            let w = CalibrationWindow {
+                before_start: rng.edge_u64(),
+                after_start: rng.edge_u64(),
+                before_end: rng.edge_u64(),
+                after_end: rng.edge_u64(),
+                after_read: rng.edge_u64(),
+            };
+            let (_, skew, clean) = (w.ticks(), w.skew(), w.clean());
+            if clean {
+                let limit = w.after_end.saturating_sub(w.before_start) / CALIBRATION_MAX_SKEW_SHARE;
+                assert_ne!(limit, 0, "case {case}");
+                assert!(
+                    w.after_start.saturating_sub(w.before_start) <= limit
+                        && w.after_end.saturating_sub(w.before_end) <= limit
+                        && w.after_read.saturating_sub(w.after_end) <= limit,
+                    "case {case}: {w:?}"
+                );
+                assert!(skew <= limit.saturating_mul(3), "case {case}: {w:?}");
+            }
+        }
     }
 }
