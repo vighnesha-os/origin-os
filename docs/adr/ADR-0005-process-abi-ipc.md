@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. |
+| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (below): Accepted** by the owner on 2026-11-08, with the recommended option of each item. |
 | Scope | Kernel objects and handles, the system-call convention, status codes, process and thread start, memory mapping, IPC, waiting, faults, termination, ABI versioning |
 | Builds on | ONBF §6.1 (EXE/LIB images, syscall-origin pinning, TLS in FS), §8.2 (sealed objects, the Code Integrity Table, mapping rules), §8.3 (the user-mode Loader Service and the start record); ADR-0001 D2 (user-mode drivers); ADR-0004 (address-space layout) |
 | Requires | CLAUDE.md §29 (processes and isolation), §30 (IPC and capabilities), §42 (executable ABI), §44 (runtime), §49 (SDK) |
@@ -82,3 +82,18 @@ The handle-and-rights model follows the capability tradition (KeyKOS, EROS, seL4
 2. Asynchronous message channels that move handles, with shared memory objects for bulk data (P8), rather than synchronous rendezvous IPC?
 3. Faults go to an exception channel, else terminate the process; no POSIX signals (P10)?
 4. Message limits of 64 KiB and 64 handles (P8)?
+
+## Amendment 1 (Accepted, 2026-11-08): what the first system-call slice needs and P1–P12 do not say
+
+**Status: Accepted by the owner on 2026-11-08, with the recommended option of each item (CLAUDE.md §84).** Each item states behaviour the first system-call slice had to define; the ADR's accepted text (P1–P12) is unchanged. The alternatives are kept for the record.
+
+| # | Question | Decision (implemented) | Alternative |
+|---|---|---|---|
+| A1 | Which rights does a new channel end get? | `READ`, `WRITE`, `DUPLICATE`, `TRANSFER`, `WAIT` (`rights::CHANNEL`): everything that applies to a channel, since no operation can ever add a right (P2) | Omit `DUPLICATE`: ends are then unique by construction, and A3's second rule goes away, but `duplicate` means nothing for channels |
+| A2 | How does `wait_one` end besides a signal and a deadline? | Closing the waited-on handle, or moving it away in a message, completes the wait with `CANCELED`. A deadline of 0 is a poll, and `signals` of 0 or with undefined bits is `INVALID_ARGS` | Waits keep going until a signal or deadline, ignoring close (P9 says only that cancellation exists) |
+| A3 | Which handle transfers does `channel_write` refuse? | `INVALID_ARGS` for a channel end that (a) is an end of the channel being written, (b) has another handle anywhere, or (c) would end up, through queues, inside its own queue. Without these a process can build a reference cycle that no process can ever read again, and the kernel can never free | Allow them and reclaim cycles with a garbage collector later; or (b) only, forbidding `DUPLICATE` on channel ends (A1) |
+| A4 | What does `channel_read` report? | Its `out_sizes` is `{u32 size; u32 bytes; u32 handles}` (P4: starts with `size`, set by the caller, at least 12). A message too big for the buffers stays queued and returns `BUFFER_TOO_SMALL` with its sizes; a reader whose table cannot hold the message's handles gets `LIMIT`, and the message also stays | Dropping the message on a read that cannot hold it |
+| A5 | When does a process end? | When its last thread ends, by `exit` or by a fault (P10's no-exception-channel case). There is no separate process exit call in this release's numbers | A `process_exit` call, or terminating a process on any thread's fault (P10) |
+| A6 | Who decides the system-call origin before `origin.core` exists? | The creator names the code range for each process. A call from outside it returns `ACCESS_DENIED` | Terminate the process on the violation (ONBF §6.1 says only that such calls are not accepted) |
+
+The implementation records each decision's consequences in `docs/engineering/SOURCE_PROVENANCE.md`.

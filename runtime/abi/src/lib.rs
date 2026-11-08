@@ -99,6 +99,47 @@ impl Error {
     pub fn from_raw(raw: i64) -> Option<Self> {
         Self::ALL.iter().copied().find(|e| e.raw() == raw)
     }
+
+    /// This status's name in the C ABI (P5).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::InvalidArgs => "INVALID_ARGS",
+            Self::BadHandle => "BAD_HANDLE",
+            Self::WrongType => "WRONG_TYPE",
+            Self::AccessDenied => "ACCESS_DENIED",
+            Self::NoMemory => "NO_MEMORY",
+            Self::Fault => "FAULT",
+            Self::ShouldWait => "SHOULD_WAIT",
+            Self::TimedOut => "TIMED_OUT",
+            Self::PeerClosed => "PEER_CLOSED",
+            Self::Canceled => "CANCELED",
+            Self::NotSupported => "NOT_SUPPORTED",
+            Self::Limit => "LIMIT",
+            Self::BufferTooSmall => "BUFFER_TOO_SMALL",
+        }
+    }
+}
+
+/// The name of a raw status: `OK`, an [`Error`]'s name, or `UNKNOWN` for anything else.
+pub fn status_name(raw: i64) -> &'static str {
+    if raw == OK {
+        "OK"
+    } else {
+        match Error::from_raw(raw) {
+            Some(e) => e.name(),
+            None => "UNKNOWN",
+        }
+    }
+}
+
+/// Decodes a boolean that crossed the boundary as a byte (P4, CLAUDE.md §10): 0 is false,
+/// 1 is true, and every other value is refused, never coerced.
+pub const fn decode_bool(raw: u8) -> Option<bool> {
+    match raw {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
 }
 
 /// Handle rights (P2). A right can be removed, never added.
@@ -123,6 +164,9 @@ pub mod rights {
     pub const MANAGE: u32 = 1 << 8;
     /// Every right defined in this version.
     pub const ALL: u32 = (1 << 9) - 1;
+    /// The rights of a new channel end: everything that applies to a channel (P2, P8,
+    /// amendment A1). `MAP`, `EXECUTE`, `SIGNAL` and `MANAGE` do not apply.
+    pub const CHANNEL: u32 = READ | WRITE | DUPLICATE | TRANSFER | WAIT;
 }
 
 /// Object signals (P9).
@@ -137,6 +181,8 @@ pub mod signals {
     pub const SIGNALED: u32 = 1 << 3;
     /// A process or thread has ended.
     pub const TERMINATED: u32 = 1 << 4;
+    /// Every signal defined in this version.
+    pub const ALL: u32 = (1 << 5) - 1;
 }
 
 /// Kernel object types (P3).
@@ -194,6 +240,29 @@ pub mod limits {
     pub const MAX_MESSAGE_HANDLES: usize = 64;
     /// A deadline that never passes.
     pub const DEADLINE_INFINITE: u64 = u64::MAX;
+}
+
+/// The structure `channel_read`'s `out_sizes` points at (P4): it begins with its own
+/// `u32 size`, which the caller sets, so a later minor version can append fields.
+///
+/// ```text
+/// 0  u32 size      set by the caller: bytes of the structure it knows
+/// 4  u32 bytes     the message's byte count
+/// 8  u32 handles   the message's handle count
+/// ```
+///
+/// The kernel refuses a `size` below [`read_sizes::SIZE`], and never reads or writes past the
+/// fields it knows. Both counts are also written when the buffers are too small
+/// ([`Error::BufferTooSmall`]).
+pub mod read_sizes {
+    /// Bytes of this version of the structure.
+    pub const SIZE: u32 = 12;
+    /// Byte offset of `size`.
+    pub const SIZE_AT: usize = 0;
+    /// Byte offset of `bytes`.
+    pub const BYTES_AT: usize = 4;
+    /// Byte offset of `handles`.
+    pub const HANDLES_AT: usize = 8;
 }
 
 /// The start record (P6): what a process begins with, at the address RDI holds.
@@ -367,6 +436,32 @@ mod tests {
     }
 
     #[test]
+    fn every_status_has_a_distinct_name() {
+        assert_eq!(status_name(OK), "OK");
+        assert_eq!(status_name(-14), "UNKNOWN");
+        assert_eq!(status_name(1), "UNKNOWN");
+        let mut names: Vec<&str> = Error::ALL.iter().map(|e| e.name()).collect();
+        for e in Error::ALL {
+            assert_eq!(status_name(e.raw()), e.name());
+        }
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), Error::ALL.len());
+    }
+
+    #[test]
+    fn a_boundary_boolean_is_0_or_1_and_nothing_else() {
+        for raw in 0..=u8::MAX {
+            let want = match raw {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            };
+            assert_eq!(decode_bool(raw), want, "byte {raw:#x}");
+        }
+    }
+
+    #[test]
     fn rights_signals_and_numbers_do_not_overlap() {
         let r = [
             rights::READ,
@@ -407,6 +502,22 @@ mod tests {
         assert_eq!(sorted.len(), n.len());
         assert_eq!(limits::MAX_MESSAGE_BYTES, 65536);
         assert_eq!(limits::MAX_MESSAGE_HANDLES, 64);
+    }
+
+    #[test]
+    fn channel_rights_and_the_sizes_structure_are_what_the_abi_says() {
+        // No right a channel cannot use, and every one it can (P2, P8).
+        assert_eq!(
+            rights::CHANNEL,
+            rights::READ | rights::WRITE | rights::DUPLICATE | rights::TRANSFER | rights::WAIT
+        );
+        assert_eq!(rights::CHANNEL & !rights::ALL, 0);
+        assert_eq!(signals::ALL.count_ones(), 5);
+        // `size` first (P4); the fields follow without overlap.
+        assert_eq!(read_sizes::SIZE_AT, 0);
+        assert_eq!(read_sizes::BYTES_AT, 4);
+        assert_eq!(read_sizes::HANDLES_AT, 8);
+        assert_eq!(read_sizes::SIZE, 12);
     }
 
     #[test]

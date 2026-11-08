@@ -1785,6 +1785,74 @@ ADR-0009 H6 required a console that does not depend on a 16550 at I/O port `0x3F
 - **Unsafe inventory:** nothing new. The two `unsafe` blocks in `pcie.rs` are the existing ECAM accesses, with their SAFETY notes.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code; the ordering and bridge semantics are from the vendor sources in the ledger, and the two Linux threads were read for reasoning only (no code).
 
+### M4, first slice: processes, the system-call layer, and channels through it (`process`, `syscall`, `ipc`, `ipc_proof`, `user`, `cpu`, `sched`, `wait`, kernel; `usercopy`, `handles`, `channel`, library; `origin-abi`; CLAUDE.md §29, §30, §42; ADR-0005 P1–P5, P8, P9, Amendment 1; 2026-11-08)
+
+- **What:** every ring-3 program is now a process, and the only way into the kernel from ring 3 is `syscall`, which reaches one dispatcher.
+  - `process`: a process owns its PML4 and page-table frames, the user frames it maps, its handle table, and a thread count. When its last thread ends (by `exit` or by a fault) its handles close at once and its peers see that; its memory goes with the last reference, which the scheduler keeps until the exiting thread's processor has left the address space, so no processor can be running on a freed table.
+  - `syscall`, the layer (P4, P5): `origin_abi` is the one definition of call numbers and status codes. RAX carries the number and returns a status; RDI, RSI, RDX, R10, R8, R9 carry the arguments; further results go through out pointers. Every user pointer is checked against the *calling* process's tables (the page walk in `usercopy`) and copied once, with fault recovery; a bad out pointer is found before a message is consumed. System calls run with interrupts on, on the thread's own stack, and each kernel lock disables them for the moment it is held. Calls are accepted only from the process's system-call code range (P4, ONBF §6.1); until `origin.core` exists the creator names that range.
+  - The boundary (`cpu`): `swapgs` on every crossing (interrupt entry from ring 3, `syscall`, and the common return path), so a program's GS never reaches the kernel; `clac` on every entry when SMAP is on, so a program's RFLAGS.AC cannot switch SMAP off for kernel code; the user-copy fault recovery no longer depends on per-CPU state, so a long copy can be preempted. A user thread starts from an `iretq` frame the scheduler builds; the DPL-3 `int 0x80` gate and the ad hoc calls in `cpu::dispatch` are gone (`int 0x80` from ring 3 is now #GP, error code `0x402`).
+  - `ipc` (P1, P2, P8, P9): kernel channels over the library's `channel`, handle transfer, `wait_one`. Queues are bounded in messages and bytes, with `SHOULD_WAIT` backpressure. Allocation on these paths is fallible (`NO_MEMORY`), via `try_reserve` and, for the channel object (where `Arc::try_new` is unstable on 1.99.1), a small counted reference, `ObjectRef`. A process's channel quota counts channels in flight in messages, so moving them out of the table cannot escape it.
+  - Closing never recurses: a close parks undelivered messages, and each system call and each process exit drains them iteratively (`reap_closed`), because a hostile process can nest channel ends in queues as deep as it likes and the kernel stack is 16 KiB.
+  - Handle transfer keeps the object graph collectable (ADR-0005 Amendment 1, A3): a channel end cannot be sent through its own channel, cannot be sent while it has another handle, and cannot end up inside its own queue, checked by walking which queue holds each end. So no reference cycle can keep a dead end alive.
+  - `handles`: 16-bit generations retire rather than wrap, so a stale handle never names a reused slot, however long a process runs (P1); `take_all` and `reserve` move handles all-or-nothing.
+  - `user`: the M4-groundwork programs (good, reader, privileged, concurrent, `int 0x80`, writers) are now real processes on the ABI; `ipc_proof` carries its programs as assembly in the image and runs scripted hostile sequences from tables in the Rust source. Everything executes in ring 3 through `syscall`.
+- **An independent, read-only review** (a fresh reviewer given the code and the contract, not this entry's reasoning) traced the ring boundary, the lifetimes and the locking as sound, and found, all fixed here unless marked otherwise:
+  - a new thread was made runnable before its stack, CR3, FPU area and process were recorded (an old race, harmless for kernel threads but dangerous for ring 3): `spawn_with` now holds the queue lock until they are, and `follow_thread` counts any switch that finds no state, which the boot proof requires to be 0;
+  - exited threads were reaped only when a processor went idle: now also from every system call (a processor running only threads that never make one still waits for its idle loop; a per-CPU reaper thread is the complete fix, left for the scheduling work);
+  - a user thread whose FPU save area cannot be allocated would have run on the previous thread's registers: refused;
+  - the developer-only calls were open to every process: gated per process (`Limits::debug_calls`);
+  - `sidt` from ring 3 revealed the KASLR slide: UMIP is on where supported;
+  - `cli`/`sti` were not compiler barriers (`options(nomem)`): removed;
+  - **open, recorded:** a process's kernel half is a snapshot at creation, so a new top-level kernel mapping made while a process exists would be missing from it (not reachable in today's boot order: proof processes are gone before PCIe and MMIO mapping start, TASKS item 5 needs this when processes outlive that); the transfer check's walk under its lock is bounded by the channel quota, so raising quotas much needs a limit on chain depth.
+- **Design decisions outside P1–P12:** ADR-0005 Amendment 1, accepted by the owner on 2026-11-08 with the recommended options: A1 (a new channel end's rights), A2 (cancellation of waits), A3 (transfer rules), A4 (`out_sizes`), A5 (a process ends with its last thread), A6 (the syscall origin before `origin.core`). Implemented as decided.
+- **The boolean rule (§10):** `origin_abi::decode_bool` accepts exactly 0 and 1 (all 256 values tested). No call in this slice has a boolean parameter, so the dispatcher does not call it yet; the first call that does must.
+- **`unsafe`:** `ipc::ObjectRef` (allocate, initialize, deref, drop in place, free), `process` (zeroing frames, table reference, `write_frame`, `read_u64` of a proof process's memory), `syscall` (two `copy_user` calls), `cpu` (`copy_user`, `stac`/`clac`, `sti`/`cli`, `pushfq`, the IA32_KERNEL_GS_BASE write), `ipc_proof` (reading the embedded programs, one deliberately unchecked `copy_user`), and the naked `syscall_entry`, `exception_common`, `exception_saved`. Each block has a safety comment (`clippy::undocumented_unsafe_blocks` is deny). `cargo xtask check` passes clippy on both targets with `-D warnings`.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08, from ADR-0005, the Intel SDM (Vol. 2: SYSCALL, SWAPGS, IRET; Vol. 3A: SMAP, interrupt delivery) and AMD APM Vol. 2 and Vol. 3. Original code. No third-party code (CLAUDE.md §3).
+- **Test evidence (2026-11-08):**
+  - Library: `origin-abi` (status names, `decode_bool`, the sizes structure), `handles` (seeded model of insert/get/remove/duplicate; generation retirement; atomic batches), `channel` (seeded model of writes, reads, closes and signals; the byte bound; `peek`), `usercopy` (seeded byte-by-byte reference over random ranges and page maps; the address bounds). `cargo xtask check`: 698 tests, 0 failures, 6 ignored.
+  - Boot, in ring 3 (`ipc_proof`; the xtask markers name every status):
+    - two processes on two processors exchange 1000 messages over a channel, each checked in ring 3, blocking in `wait_one` and woken across processors (blocked 1124 and 1059 times, 2104 cross-processor wake-ups in one run; 381 µs per round trip under TCG, on a host loaded by other work);
+    - 117 hostile calls, each with its required status: bad handles (`handle 0`, never issued, bits above 32, closed, stale after slot reuse), another process's handle value, too few rights (write, read, wait, duplicate, send), rights that only shrink, pointers (kernel, unmapped, across the end of a mapped range, address 0, wrapping, the top page, into code, into read-only memory, every out pointer), sizes and unknown numbers, queues (empty, too small a buffer, a full queue and `WRITABLE`), a closed peer, and the transfers A3 refuses;
+    - a process that exits and a process that faults: its handles close (0 left in its table), and the peer, blocked in `wait_one` on another processor, wakes, sees `PEER_CLOSED`, and its write and read return `PEER_CLOSED`;
+    - a thread in `wait_one` on a handle another thread closes completes with `CANCELED`; quotas (`LIMIT`, then recovery); a 64 KiB message byte for byte; every register but RAX, RCX and R11 preserved across a call; calls refused from outside the pinned range; a program with a null GS and one with RFLAGS.AC set; a page fault inside a user copy recovered directly;
+    - afterwards the heap and the frame count are exactly where they started, so nothing leaked: not the messages, not the channels, not the page tables.
+  - `cargo xtask boot-test`, `boot-matrix` (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs) and `boot-x2apic` (APIC IDs 256 and 412, under leaves 1Fh and 0Bh) pass.
+  - **Negative controls** (31; each mutation applied alone, the kernel built, `boot-test` run and required to fail for that mutation's reason, then the file restored): 
+    - no wake-up after a write: the reader never wakes: the ping-pong proof times out;
+    - a blocked wait polls instead: no thread blocks, so no wake-up crosses processors;
+    - a stale handle generation accepted: "stale, slot reused" is no longer `BAD_HANDLE`;
+    - rights never checked: the rights lines return `OK`;
+    - one handle namespace for all processes: another process's handle value works;
+    - no range check and no table check: a kernel pointer is accepted (the earlier copy proof catches it first);
+    - no check against the caller's tables: bad pointers still return `FAULT`, by fault recovery, so the recovered-faults count is not 0;
+    - no writable check: a read-only page is written: recovered, count not 0;
+    - no recovery from a user-copy fault: the direct recovery proof takes the kernel down;
+    - a closing end is never marked closed: `PEER_CLOSED` never appears;
+    - handles survive process exit: the peer of an exiting process stays blocked;
+    - a fault does not end the process's handles: a faulting process never ends (the first faulting program catches it);
+    - duplicate can add rights: "adding WRITE" returns `OK`;
+    - transfer leaves the handle with the sender: the sender's handle still works;
+    - a received handle loses its rights: "it kept its rights" fails;
+    - an end can be sent through its own channel: the transfer is accepted;
+    - a duplicated end can be sent: the transfer is accepted;
+    - a transfer can close a cycle: the transfer is accepted;
+    - no swapgs anywhere: a program's GS reaches the kernel: a double fault at the first program with a user GS;
+    - no clac on kernel entry: RFLAGS.AC reaches kernel code;
+    - no system-call origin pin: a call from outside the pinned range is accepted;
+    - a register clobbered by a system call: the register check fails in ring 3;
+    - undelivered messages never reaped: the heap does not return to its starting value;
+    - a process's frames are not freed: the free-frame count does not return;
+    - wait deadlines ignored: the deadline-0 wait never returns;
+    - a closed handle does not cancel a wait: the waiter stays blocked;
+    - a message's first byte corrupted: the ring-3 check in the ping-pong fails;
+    - both ping-pong processes on one processor: the marker naming the second processor never appears;
+    - a thread runnable before its state exists: a thread runs with no stack on record (the count of such switches must be 0);
+    - the developer calls open to any process: a process without them makes one;
+    - no UMIP: `sidt` from ring 3 succeeds.
+- **What QEMU cannot show (§74):** real interrupt and SMAP timing; CET shadow stacks (P6, not in this slice); physical hardware.
+- **Not done:** the start record, memory objects, the Loader Service, `.ose` loading, PCIDs (the remaining TASKS item 5); events, ports and timers; termination by handle and the crash record (P10, P11); memory and thread quotas (P11); the `Process` object as a handle-named object (no `TERMINATED` signal raised yet).
+- **Licensing:** project licence not chosen yet.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.

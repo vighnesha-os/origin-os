@@ -15,15 +15,17 @@
 //! Queues are indexed by CPU index (`cpu::CpuIndex`, ADR-0008), never by APIC ID; a
 //! reschedule IPI goes to the APIC ID recorded for the target's index.
 
+use alloc::sync::Arc;
 use core::arch::asm;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use framekernel::descriptors::{KERNEL_CODE, KERNEL_DATA};
+use framekernel::descriptors::{KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
 use framekernel::runqueue::{QueueError, RunQueue, per_mille, share_near_weight};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
+use crate::process::Process;
 use crate::timer::{self, X2Apic};
 use origin_sync::SpinLock;
 
@@ -146,8 +148,15 @@ fn follow_thread(id: usize, slot: usize) {
             t.roots.get(slot).copied().unwrap_or(0),
         )
     };
-    if let Some(stack) = stack {
-        cpu::set_kernel_stack((stack.guard + 4096 + stack.bytes as u64) & !0xF);
+    match stack {
+        Some(stack) => cpu::set_kernel_stack((stack.guard + 4096 + stack.bytes as u64) & !0xF),
+        // Every thread but the boot or idle flow has a stack: a slot without one means a
+        // thread was made runnable before its state was written, which `spawn_with` rules
+        // out by writing it under the queue lock. Counted for the boot proof.
+        None if slot != 0 => {
+            UNREADY_SWITCHES.fetch_add(1, Ordering::Relaxed);
+        }
+        None => {}
     }
     let want = if root == 0 {
         crate::vm::kernel_root()
@@ -191,60 +200,108 @@ struct ThreadStack {
     bytes: usize,
 }
 
+/// A thread that has exited, awaiting [`reap`]: its stack, FPU area and, for a user
+/// thread, the reference that keeps its process alive until this processor has left it.
+struct Zombie {
+    stack: ThreadStack,
+    fpu: u64,
+    process: Option<Arc<Process>>,
+}
+
 /// Per CPU: each slot's stack, and the stacks of threads that exited and await
 /// [`reap`]. Locked after the run queue, always with interrupts disabled.
 struct Threads {
     stacks: [Option<ThreadStack>; framekernel::runqueue::CAPACITY],
-    /// Exited threads' stacks and FPU areas, awaiting [`reap`].
-    zombies: [Option<(ThreadStack, u64)>; framekernel::runqueue::CAPACITY],
+    /// Exited threads awaiting [`reap`].
+    zombies: [Option<Zombie>; framekernel::runqueue::CAPACITY],
     /// Each slot's address space (its PML4); 0 means the kernel's.
     roots: [u64; framekernel::runqueue::CAPACITY],
     /// Each slot's FPU/SIMD save area (0: none); slot 0 is the boot or idle context.
     fpu: [u64; framekernel::runqueue::CAPACITY],
+    /// The process each slot's thread belongs to (`None`: a kernel thread).
+    process: [Option<Arc<Process>>; framekernel::runqueue::CAPACITY],
 }
 
 static THREADS: [SpinLock<Threads>; MAX_CPUS] = [const {
     SpinLock::new(Threads {
         stacks: [None; framekernel::runqueue::CAPACITY],
-        zombies: [None; framekernel::runqueue::CAPACITY],
+        zombies: [const { None }; framekernel::runqueue::CAPACITY],
         roots: [0; framekernel::runqueue::CAPACITY],
         fpu: [0; framekernel::runqueue::CAPACITY],
+        process: [const { None }; framekernel::runqueue::CAPACITY],
     })
 }; MAX_CPUS];
+
+/// Times a processor picked a thread whose state was not complete (never, if the queue
+/// lock is held as it must be; the boot proof requires 0).
+static UNREADY_SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+/// How many switches have found a thread with no recorded stack.
+pub(crate) fn unready_switches() -> u64 {
+    UNREADY_SWITCHES.load(Ordering::Relaxed)
+}
+
+/// Threads that exited on each processor and await [`reap`], so a processor can tell cheaply
+/// that it has none.
+static ZOMBIES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// Frees the stacks of threads that exited on **this** processor. Only this processor may
 /// do it, and only from thread context: by then its exit handler, which ran on the dead
 /// stack, has certainly switched away. Returns how many stacks were freed.
 pub(crate) fn reap() -> usize {
-    use alloc::alloc::{Layout, dealloc};
     let Some(threads) = THREADS.get(this_cpu()) else {
         return 0;
     };
+    if ZOMBIES
+        .get(this_cpu())
+        .is_some_and(|z| z.load(Ordering::Acquire) == 0)
+    {
+        return 0;
+    }
     let mut freed = 0;
     loop {
         let next = without_interrupts(|| threads.lock().zombies.iter_mut().find_map(Option::take));
-        let Some((stack, fpu)) = next else {
+        let Some(Zombie {
+            stack,
+            fpu,
+            process,
+        }) = next
+        else {
             return freed;
         };
-        free_fpu_area(fpu);
-        let Ok(layout) = Layout::from_size_align(stack.bytes + 4096, 4096) else {
-            continue;
-        };
-        // The guard must be mapped again before its frame returns to the heap.
-        if crate::vm::unguard(stack.guard).is_err() {
-            continue; // leak rather than free memory that is not mapped
+        if let Some(z) = ZOMBIES.get(this_cpu()) {
+            z.fetch_sub(1, Ordering::AcqRel);
         }
-        // SAFETY: `guard` is the start of a `guarded_stack` allocation with this layout;
-        // its thread exited on this processor and this processor has switched away from
-        // it, so nothing uses the memory any more.
-        unsafe {
-            dealloc(
-                core::ptr::with_exposed_provenance_mut(stack.guard as usize),
-                layout,
-            )
-        };
-        freed += 1;
+        free_fpu_area(fpu);
+        // Possibly the process's last reference, which frees its address space: this
+        // processor left it when the thread exited, and no processor still runs in it.
+        drop(process);
+        if free_thread_stack(stack) {
+            freed += 1;
+        }
     }
+}
+
+/// Frees a stack from [`guarded_stack`] that no thread uses (one that was never started, or
+/// one whose thread has exited and whose processor has switched away from it).
+fn free_thread_stack(stack: ThreadStack) -> bool {
+    use alloc::alloc::{Layout, dealloc};
+    let Ok(layout) = Layout::from_size_align(stack.bytes + 4096, 4096) else {
+        return false;
+    };
+    // The guard must be mapped again before its frame returns to the heap.
+    if crate::vm::unguard(stack.guard).is_err() {
+        return false; // leak rather than free memory that is not mapped
+    }
+    // SAFETY: `guard` is the start of a `guarded_stack` allocation with this layout, and
+    // nothing uses that memory any more (this function's contract).
+    unsafe {
+        dealloc(
+            core::ptr::with_exposed_provenance_mut(stack.guard as usize),
+            layout,
+        )
+    };
+    true
 }
 
 /// The running thread's queue request, made with interrupts disabled (the gate cleared IF).
@@ -340,10 +397,11 @@ const ICR_ASSERT: u32 = 1 << 14;
 
 /// Makes `thread` ready. If it was blocked on another processor, that processor is sent a
 /// reschedule IPI (to its APIC ID), so it switches to the thread now rather than at its
-/// next timer tick.
-pub(crate) fn wake(thread: ThreadRef) {
+/// next timer tick. Returns whether an IPI was sent, so a wake-up across processors can be
+/// counted.
+pub(crate) fn wake(thread: ThreadRef) -> bool {
     let Some(queue) = QUEUES.get(thread.cpu.get()) else {
-        return;
+        return false;
     };
     let woke = without_interrupts(|| queue.lock().wake(thread.slot as usize, thread.generation));
     if woke
@@ -361,7 +419,9 @@ pub(crate) fn wake(thread: ThreadRef) {
                 ICR_ASSERT | u32::from(crate::cpu::RESCHEDULE_VECTOR),
             )
         };
+        return true;
     }
+    false
 }
 
 /// `EXIT_VECTOR`: the running thread ends. Its stack becomes a zombie, freed later by
@@ -382,8 +442,22 @@ pub(crate) fn on_exit(interrupted: u64) -> u64 {
                 .get_mut(slot)
                 .map(|f| core::mem::replace(f, 0))
                 .unwrap_or(0);
-            if let (Some(free), Some(stack)) = (t.zombies.iter_mut().find(|z| z.is_none()), stack) {
-                *free = Some((stack, fpu));
+            let process = t.process.get_mut(slot).and_then(Option::take);
+            match (t.zombies.iter_mut().find(|z| z.is_none()), stack) {
+                (Some(free), Some(stack)) => {
+                    *free = Some(Zombie {
+                        stack,
+                        fpu,
+                        process,
+                    });
+                    if let Some(z) = ZOMBIES.get(id) {
+                        z.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+                // No record of it can be kept. The process reference is leaked deliberately:
+                // this processor is still in the process's address space, and dropping the
+                // last reference here would free the tables it is running on.
+                _ => core::mem::forget(process),
             }
         }
         Some(next)
@@ -412,14 +486,13 @@ pub(crate) fn exit() -> ! {
     }
 }
 
-/// The top of the running thread's kernel stack, or `None` for the boot or idle flow.
-pub(crate) fn current_stack_top() -> Option<u64> {
+/// The process of the running thread, or `None` for a kernel thread.
+pub(crate) fn current_process() -> Option<Arc<Process>> {
     let id = this_cpu();
     let (queue, threads) = (QUEUES.get(id)?, THREADS.get(id)?);
     without_interrupts(|| {
         let slot = queue.lock().current();
-        let stack = threads.lock().stacks.get(slot).copied().flatten()?;
-        Some((stack.guard + 4096 + stack.bytes as u64) & !0xF)
+        threads.lock().process.get(slot).cloned().flatten()
     })
 }
 
@@ -453,7 +526,33 @@ pub(crate) fn spawn_in(
     arg: u64,
     root: u64,
 ) -> Result<usize, QueueError> {
-    spawn_with(cpu, entry, arg, root, framekernel::runqueue::DEFAULT_WEIGHT)
+    spawn_with(
+        cpu,
+        Start::Kernel { entry, arg },
+        root,
+        framekernel::runqueue::DEFAULT_WEIGHT,
+        None,
+    )
+}
+
+/// Creates a user thread of `process` on processor `cpu`: it enters ring 3 at `rip` with the
+/// stack pointer `rsp` and `rdi` in RDI, every other register zero, the first time it is
+/// scheduled (there is no kernel half to the thread until it enters the kernel).
+pub(crate) fn spawn_user(
+    cpu: CpuIndex,
+    process: Arc<Process>,
+    rip: u64,
+    rsp: u64,
+    rdi: u64,
+) -> Result<usize, QueueError> {
+    let root = process.root();
+    spawn_with(
+        cpu,
+        Start::User { rip, rsp, rdi },
+        root,
+        framekernel::runqueue::DEFAULT_WEIGHT,
+        Some(process),
+    )
 }
 
 /// As [`spawn`], with a scheduling weight (stride scheduling: the thread's share of its
@@ -464,19 +563,31 @@ pub(crate) fn spawn_weighted(
     arg: u64,
     weight: u32,
 ) -> Result<usize, QueueError> {
-    spawn_with(cpu, entry, arg, 0, weight)
+    spawn_with(cpu, Start::Kernel { entry, arg }, 0, weight, None)
+}
+
+/// Where a new thread starts.
+enum Start {
+    /// In kernel mode at `entry(arg)`.
+    Kernel {
+        entry: extern "sysv64" fn(u64) -> !,
+        arg: u64,
+    },
+    /// In ring 3 at `rip`, with the stack pointer `rsp` and `rdi` in RDI.
+    User { rip: u64, rsp: u64, rdi: u64 },
 }
 
 fn spawn_with(
     cpu: CpuIndex,
-    entry: extern "sysv64" fn(u64) -> !,
-    arg: u64,
+    start: Start,
     root: u64,
     weight: u32,
+    process: Option<Arc<Process>>,
 ) -> Result<usize, QueueError> {
     let queue = QUEUES.get(cpu.get()).ok_or(QueueError::Full)?;
     let (stack, guard) = guarded_stack(THREAD_STACK).ok_or(QueueError::Full)?;
     let _ = FIRST_GUARD.compare_exchange(0, guard, Ordering::Relaxed, Ordering::Relaxed);
+    let user = matches!(start, Start::User { .. });
     let base = stack.as_ptr().addr() as u64;
     // The thread starts with RSP = top − 8 holding a zero return address, as if `entry` had
     // been called: RSP + 8 is then 16-byte aligned (System V).
@@ -484,12 +595,25 @@ fn spawn_with(
     let rsp = top - 8;
     let frame_at = rsp - (FRAME_WORDS as u64) * 8;
     let mut frame = [0u64; FRAME_WORDS];
-    frame[RDI] = arg;
-    frame[17] = (entry as *const ()).addr() as u64; // RIP
-    frame[18] = u64::from(KERNEL_CODE); // CS
+    match start {
+        Start::Kernel { entry, arg } => {
+            frame[RDI] = arg;
+            frame[17] = (entry as *const ()).addr() as u64; // RIP
+            frame[18] = u64::from(KERNEL_CODE); // CS
+            frame[20] = rsp;
+            frame[21] = u64::from(KERNEL_DATA); // SS
+        }
+        // The common return path enters ring 3 from this frame: `swapgs` when the frame's
+        // CS is a user one, then IRETQ, which leaves the segment registers usable at CPL 3.
+        Start::User { rip, rsp, rdi } => {
+            frame[RDI] = rdi;
+            frame[17] = rip;
+            frame[18] = u64::from(USER_CODE); // CS
+            frame[20] = rsp;
+            frame[21] = u64::from(USER_DATA); // SS
+        }
+    }
     frame[19] = NEW_RFLAGS;
-    frame[20] = rsp;
-    frame[21] = u64::from(KERNEL_DATA); // SS
     let offset = (frame_at - base) as usize;
     for (i, word) in frame.iter().chain(core::iter::once(&0u64)).enumerate() {
         let at = offset + i * 8;
@@ -501,9 +625,27 @@ fn spawn_with(
         guard,
         bytes: THREAD_STACK,
     };
-    let fpu_area = alloc_fpu_area().unwrap_or(0);
+    let fpu_area = alloc_fpu_area();
+    // A user thread without its own FPU save area would run on the previous thread's
+    // registers, which is another process's data; it is refused instead.
+    if fpu_area.is_none() && user {
+        free_thread_stack(record);
+        return Err(QueueError::Full);
+    }
+    let fpu_area = fpu_area.unwrap_or(0);
     without_interrupts(|| {
-        let slot = queue.lock().push_weighted(frame_at, weight)?;
+        // The queue lock is held until the thread's state is complete: the moment the slot
+        // is Ready the target processor can pick it, and `follow_thread` needs the state.
+        let mut queue = queue.lock();
+        let slot = match queue.push_weighted(frame_at, weight) {
+            Ok(slot) => slot,
+            Err(e) => {
+                drop(queue);
+                free_thread_stack(record);
+                free_fpu_area(fpu_area);
+                return Err(e);
+            }
+        };
         if let Some(threads) = THREADS.get(cpu.get()) {
             let mut t = threads.lock();
             if let Some(s) = t.stacks.get_mut(slot) {
@@ -514,6 +656,9 @@ fn spawn_with(
             }
             if let Some(f) = t.fpu.get_mut(slot) {
                 *f = fpu_area;
+            }
+            if let Some(p) = t.process.get_mut(slot) {
+                *p = process;
             }
         }
         Ok(slot)
@@ -542,7 +687,7 @@ pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
         reap();
         // SAFETY: CPL 0; every vector that can arrive has a gate. Halting with interrupts
         // on just waits for the next timer tick, which may switch to a thread.
-        unsafe { asm!("sti", "hlt", options(nomem, nostack)) };
+        unsafe { asm!("sti", "hlt", options(nostack)) };
     }
 }
 
@@ -1036,7 +1181,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
         // Interrupts on only while halted: the timer may switch to a worker here, and this
         // flow resumes after `hlt` when its turn comes round again.
         // SAFETY: as in `run_ap`.
-        unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+        unsafe { asm!("sti", "hlt", "cli", options(nostack)) };
     }
     let elapsed_ms = rdtsc().wrapping_sub(start) / (tsc_hz / 1000).max(1);
     let mut switches_at_stop = [0u64; MAX_CPUS];
@@ -1095,6 +1240,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
     ok &= crate::console::prove(com1, cpus, bsp, tsc_hz);
     ok &= crate::tlb::prove(com1, cpus, bsp, tsc_hz);
     ok &= crate::wait::prove(com1, cpus, bsp, tsc_hz);
+    ok &= crate::ipc_proof::prove(com1, cpus, bsp, tsc_hz);
     // Every thread has exited: once each processor has reaped its own, the heap is back
     // exactly where it was before the first spawn.
     let back = || crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before;

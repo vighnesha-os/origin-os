@@ -14,8 +14,7 @@
 //! Lock order: a wait queue's lock, then whatever its condition reads. A waker never holds
 //! a wait queue's lock while it takes another one.
 //!
-//! These queues are kernel-internal. The user-visible waiting of ADR-0005 P9 builds on them
-//! later.
+//! The user-visible waiting of ADR-0005 P9 (`ipc::wait_one`) is built on these queues.
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -138,6 +137,20 @@ impl WaitQueue {
             sched::wake(t);
         }
         thread.is_some()
+    }
+
+    /// Wakes every waiter (each re-checks its own condition) and returns how many of them
+    /// were blocked on another processor, and so took an IPI to wake.
+    pub(crate) fn wake_all(&self) -> usize {
+        let waiting = cpu::without_interrupts(|| {
+            let mut waiters = self.waiters.lock();
+            core::mem::replace(&mut *waiters, [None; WAITERS])
+        });
+        waiting
+            .into_iter()
+            .flatten()
+            .filter(|&thread| sched::wake(thread))
+            .count()
     }
 }
 

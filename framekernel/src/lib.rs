@@ -81,6 +81,7 @@
 //! - [`route`]: an IPv4 longest-prefix-match routing table (a bit trie);
 //! - [`rtc`]: CMOS RTC decoding and UTC calendar arithmetic;
 //! - [`unwind`]: frame-pointer stack unwinding for panic diagnostics;
+//! - [`usercopy`]: user-pointer range and page checks for system calls (ADR-0005 P4);
 //! - [`ustar`]: a read-only ustar (tar) archive reader for an initramfs/package payload;
 //! - [`utf16`]: UTF-16 ↔ scalar transcoding (surrogate pairs) for UEFI/CHAR16 interop;
 //! - [`vfs`]: an in-memory virtual filesystem (paths, directories, files);
@@ -158,6 +159,7 @@ pub mod tftp;
 pub mod timers;
 pub mod topology;
 pub mod unwind;
+pub mod usercopy;
 pub mod ustar;
 pub mod utf16;
 pub mod vfs;
