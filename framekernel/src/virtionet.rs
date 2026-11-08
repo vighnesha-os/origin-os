@@ -1,10 +1,12 @@
 //! A modern virtio-net driver bring-up (virtio 1.1; CLAUDE.md §31 driver framework, §54
 //! networking). It finds the virtio-net PCI function, discovers its capability structures
 //! (`virtio::find_caps`), maps the common/notify/device-config regions, runs the status and
-//! feature handshake to `DRIVER_OK`, sets up the receive and transmit virtqueues with DMA
-//! rings (`virtqueue`), reads the device MAC, and transmits one frame — confirming the
-//! device consumed it through the used ring. This is the first NIC bring-up; a full
-//! receive/transmit datapath that carries the IP stack is the next step.
+//! feature handshake to `DRIVER_OK`, programs MSI-X so the receive queue's used-buffer
+//! interrupts reach this processor (`cpu::NET_VECTOR`), sets up the receive and transmit
+//! virtqueues with DMA rings (`virtqueue`), and reads the device MAC. It then drives a live
+//! datapath over the link: it posts receive buffers, resolves QEMU's gateway by ARP, and
+//! obtains a DHCP lease — transmit and receive of real Ethernet/IPv4/UDP frames — and
+//! confirms the device raised and the handler serviced an MSI-X receive interrupt.
 //!
 //! The ring memory is zeroed DMA pages (`storage::dma_page`): the direct map makes them
 //! physically contiguous and gives their physical addresses, and x86 DMA is cache-coherent.
@@ -12,10 +14,10 @@
 
 use core::fmt::Write;
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 use framekernel::net::{self, Arp, EthFrame, Ipv4, Mac, arp_op, ethertype};
-use framekernel::pci::Address;
+use framekernel::pci::{self, Address};
 use framekernel::virtio::{self, feature, status};
 use framekernel::virtqueue::{self, Descriptor, F_WRITE};
 
@@ -26,6 +28,19 @@ const Q_RX: u16 = 0;
 const Q_TX: u16 = 1;
 /// The MAC the boot sets on the device (QEMU `-device virtio-net-pci,mac=…`).
 const EXPECTED_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0xAA, 0xBB, 0xCC];
+/// The MSI-X table entry the receive queue's interrupts use. Entry 0 is left masked.
+const RX_MSIX_ENTRY: u16 = 1;
+/// virtio's "no MSI-X vector" sentinel.
+const NO_VECTOR: u16 = 0xFFFF;
+
+/// Counts the virtio-net MSI-X interrupts the device has raised.
+static NET_IRQS: AtomicU64 = AtomicU64::new(0);
+
+/// Called from the NIC's interrupt vector (`cpu::NET_VECTOR`): records that the device
+/// raised a used-buffer interrupt.
+pub(crate) fn on_interrupt() {
+    NET_IRQS.fetch_add(1, Ordering::Relaxed);
+}
 
 // Common-configuration register offsets (virtio 1.1 §4.1.4.3).
 mod reg {
@@ -33,9 +48,11 @@ mod reg {
     pub(super) const DEVICE_FEATURE: u64 = 4;
     pub(super) const DRIVER_FEATURE_SELECT: u64 = 8;
     pub(super) const DRIVER_FEATURE: u64 = 12;
+    pub(super) const CONFIG_MSIX_VECTOR: u64 = 16;
     pub(super) const DEVICE_STATUS: u64 = 20;
     pub(super) const QUEUE_SELECT: u64 = 22;
     pub(super) const QUEUE_SIZE: u64 = 24;
+    pub(super) const QUEUE_MSIX_VECTOR: u64 = 26;
     pub(super) const QUEUE_ENABLE: u64 = 28;
     pub(super) const QUEUE_NOTIFY_OFF: u64 = 30;
     pub(super) const QUEUE_DESC: u64 = 32;
@@ -102,8 +119,10 @@ fn map_structure(dev: &crate::pcie::Device, loc: virtio::CfgLocation) -> Option<
 }
 
 /// Sets up queue `q`: a smaller-of device size and 256 ring in three DMA pages, with the
-/// physical addresses programmed and the queue enabled.
-fn setup_queue(common: u64, q: u16) -> Option<Queue> {
+/// physical addresses programmed, its MSI-X `vector` assigned (`NO_VECTOR` for none), and
+/// the queue enabled. MSI-X must already be enabled on the function for a real vector to
+/// take.
+fn setup_queue(common: u64, q: u16, vector: u16) -> Option<Queue> {
     w16(common + reg::QUEUE_SELECT, q);
     let dev_size = r16(common + reg::QUEUE_SIZE);
     if dev_size == 0 {
@@ -118,6 +137,7 @@ fn setup_queue(common: u64, q: u16) -> Option<Queue> {
     w64(common + reg::QUEUE_DESC, dp);
     w64(common + reg::QUEUE_DRIVER, ap);
     w64(common + reg::QUEUE_DEVICE, up);
+    w16(common + reg::QUEUE_MSIX_VECTOR, vector);
     w16(common + reg::QUEUE_ENABLE, 1);
     Some(Queue {
         size,
@@ -126,6 +146,54 @@ fn setup_queue(common: u64, q: u16) -> Option<Queue> {
         used: uv,
         notify_off,
     })
+}
+
+/// Programs the MSI-X table so entry [`RX_MSIX_ENTRY`] targets this processor at
+/// `cpu::NET_VECTOR` (every other entry masked), and turns MSI-X on for the function.
+/// Returns whether MSI-X is enabled and unmasked. Mirrors the NVMe driver's setup.
+fn enable_msix_table(dev: &crate::pcie::Device) -> bool {
+    let Some(msix) = crate::pcie::msix(dev.function.at) else {
+        return false;
+    };
+    if msix.entries <= RX_MSIX_ENTRY {
+        return false;
+    }
+    let Some(bar) = dev.bars.get(usize::from(msix.table_bar)).copied().flatten() else {
+        return false;
+    };
+    let table_len = u64::from(msix.entries) * pci::MSIX_ENTRY;
+    if u64::from(msix.table_offset) + table_len > bar.size {
+        return false;
+    }
+    let Ok(table) = crate::vm::map_mmio(bar.address + u64::from(msix.table_offset), table_len)
+    else {
+        return false;
+    };
+    let (Some(address), Some(data)) = (
+        pci::msi_address(crate::cpu::cpuid_apic_id()),
+        pci::msi_data(crate::cpu::NET_VECTOR),
+    ) else {
+        return false;
+    };
+    let entry = |i: u64, word: u64, value: u32| {
+        let p = ptr::with_exposed_provenance_mut::<u32>(
+            (table + i * pci::MSIX_ENTRY + 4 * word) as usize,
+        );
+        // SAFETY: inside the MSI-X table (checked against its BAR above), mapped uncached;
+        // the entries only direct where the device's interrupt messages go.
+        unsafe { p.write_volatile(value) };
+    };
+    for i in 0..u64::from(msix.entries) {
+        entry(i, 3, pci::MSIX_MASKED);
+    }
+    entry(u64::from(RX_MSIX_ENTRY), 0, address as u32);
+    entry(u64::from(RX_MSIX_ENTRY), 1, (address >> 32) as u32);
+    entry(u64::from(RX_MSIX_ENTRY), 2, data);
+    entry(u64::from(RX_MSIX_ENTRY), 3, 0); // unmask
+    let Some(control) = crate::pcie::enable_msix(dev.function.at, &msix) else {
+        return false;
+    };
+    control & pci::MSIX_ENABLE != 0 && control & pci::MSIX_FUNCTION_MASK == 0
 }
 
 /// Writes the notify address for queue `q`'s notify offset.
@@ -405,10 +473,17 @@ pub(crate) fn prove(com1: &mut Console) {
     w8(common + reg::DEVICE_STATUS, st);
     let features_ok = r8(common + reg::DEVICE_STATUS) & status::FEATURES_OK != 0;
 
-    // Set up the receive and transmit queues.
-    let rx = setup_queue(common, Q_RX);
-    let tx = setup_queue(common, Q_TX);
+    // Turn MSI-X on (so the queues can take vectors), with no config-change interrupt, then
+    // set up the receive queue (interrupt on entry RX_MSIX_ENTRY) and the transmit queue
+    // (no interrupt; it is polled).
+    let msix_enabled = enable_msix_table(&dev);
+    w16(common + reg::CONFIG_MSIX_VECTOR, NO_VECTOR);
+    let rx = setup_queue(common, Q_RX, RX_MSIX_ENTRY);
+    let tx = setup_queue(common, Q_TX, NO_VECTOR);
     let queues_ok = rx.is_some() && tx.is_some();
+    // Confirm the receive queue kept its vector (NO_VECTOR back means none was available).
+    w16(common + reg::QUEUE_SELECT, Q_RX);
+    let rx_vector_ok = msix_enabled && r16(common + reg::QUEUE_MSIX_VECTOR) == RX_MSIX_ENTRY;
 
     st |= status::DRIVER_OK;
     w8(common + reg::DEVICE_STATUS, st);
@@ -450,19 +525,34 @@ pub(crate) fn prove(com1: &mut Console) {
         );
     }
 
+    // The device raises an MSI-X used-buffer interrupt for the frames received above, but the
+    // boot thread runs with interrupts disabled, so the message stays pending in this
+    // processor's local APIC (which coalesces several arrivals into one). Open interrupt
+    // windows until it is taken and serviced (`cpu::NET_VECTOR` -> `on_interrupt`), bounded so
+    // a NIC that never interrupts fails the proof here instead of hanging.
+    for _ in 0..100_000 {
+        if NET_IRQS.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+        crate::cpu::interrupt_window();
+    }
+
     let mac_ok = mac == EXPECTED_MAC;
+    let irqs = NET_IRQS.load(Ordering::Relaxed);
     let consistent = features_ok
         && queues_ok
         && driver_ok
         && mac_ok
         && link_up
         && arp.is_some()
-        && lease.is_some();
+        && lease.is_some()
+        && rx_vector_ok
+        && irqs > 0;
     let g = arp.unwrap_or(Mac([0; 6])).0;
     let ip = lease.unwrap_or(Ipv4([0, 0, 0, 0])).0;
     let _ = writeln!(
         com1,
-        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; DHCP lease {}.{}.{}.{}; consistent {}{}",
+        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; DHCP lease {}.{}.{}.{}; MSI-X RX interrupts {irqs}; consistent {}{}",
         mac[0],
         mac[1],
         mac[2],
