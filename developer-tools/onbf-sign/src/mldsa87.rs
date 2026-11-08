@@ -427,6 +427,74 @@ impl Drop for SigningKey {
     }
 }
 
+/// Everything one signing attempt computes from the secrets. It lives outside the loop so that
+/// the buffers of every attempt, accepted or rejected, are the ones [`Attempt::wipe`] overwrites.
+pub(crate) struct Attempt {
+    pub(crate) y: [Poly; L],
+    pub(crate) y_hat: [Poly; L],
+    pub(crate) z: [Poly; L],
+    pub(crate) w: [Poly; K],
+    pub(crate) r: [Poly; K],
+    pub(crate) high: Poly,
+    pub(crate) low: Poly,
+    pub(crate) c_hat: Poly,
+    pub(crate) cs: Poly,
+    pub(crate) hints: [Poly; K],
+    pub(crate) w1_encoded: [u8; 128 * K],
+    pub(crate) ctilde: [u8; CTILDE_BYTES],
+}
+
+impl Attempt {
+    pub(crate) fn new() -> Self {
+        Self {
+            y: [[0; N]; L],
+            y_hat: [[0; N]; L],
+            z: [[0; N]; L],
+            w: [[0; N]; K],
+            r: [[0; N]; K],
+            high: [0; N],
+            low: [0; N],
+            c_hat: [0; N],
+            cs: [0; N],
+            hints: [[0; N]; K],
+            w1_encoded: [0; 128 * K],
+            ctilde: [0; CTILDE_BYTES],
+        }
+    }
+
+    fn wipe(&mut self) {
+        let Self {
+            y,
+            y_hat,
+            z,
+            w,
+            r,
+            high,
+            low,
+            c_hat,
+            cs,
+            hints,
+            w1_encoded,
+            ctilde,
+        } = self;
+        for poly in y
+            .iter_mut()
+            .chain(y_hat)
+            .chain(z)
+            .chain(w)
+            .chain(r)
+            .chain(hints)
+        {
+            wipe_words(poly);
+        }
+        for poly in [high, low, c_hat, cs] {
+            wipe_words(poly);
+        }
+        wipe(w1_encoded);
+        wipe(ctilde);
+    }
+}
+
 /// `Â ∘ v̂`, row by row, written into `out` in place: no intermediate polynomial is left on
 /// the stack. `out` must hold zeros.
 fn mat_vec(a_hat: &[[Poly; L]; K], v_hat: &[Poly; L], out: &mut [Poly; K]) {
@@ -514,6 +582,18 @@ impl SigningKey {
         context: &[u8],
         rnd: &[u8; 32],
     ) -> Result<Box<[u8; SIGNATURE_BYTES]>, SignError> {
+        self.sign_into(message, context, rnd, &mut Attempt::new())
+    }
+
+    /// [`Self::sign`], with the attempt's working buffers supplied by the caller, and wiped
+    /// here whether the attempt is accepted or rejected. Separate so that a test can see them.
+    pub(crate) fn sign_into(
+        &self,
+        message: &[u8],
+        context: &[u8],
+        rnd: &[u8; 32],
+        a: &mut Attempt,
+    ) -> Result<Box<[u8; SIGNATURE_BYTES]>, SignError> {
         let context_len = u8::try_from(context.len()).map_err(|_| SignError::ContextTooLong)?;
 
         // μ = H(tr ‖ M′, 64), M′ = 0 ‖ |ctx| ‖ ctx ‖ M (Algorithms 2 and 7).
@@ -524,90 +604,74 @@ impl SigningKey {
         shake256(&[self.k_secret.as_slice(), rnd, &mu], &mut rho_pp);
 
         let mut kappa = 0u16;
-        // The candidates live here, so each is wiped whether it is accepted or rejected.
-        let mut y = [[0u32; N]; L];
-        let mut y_hat = [[0u32; N]; L];
-        let mut z = [[0u32; N]; L];
-        let mut w = [[0u32; N]; K];
-        let mut r = [[0u32; N]; K];
-        let mut cs = [0u32; N];
-        let mut w1_encoded = [0u8; 128 * K];
         let signature = loop {
-            expand_mask(&rho_pp, kappa, &mut y);
+            expand_mask(&rho_pp, kappa, &mut a.y);
             kappa = kappa.wrapping_add(L as u16);
-            y_hat.copy_from_slice(&y);
-            for poly in y_hat.iter_mut() {
+            a.y_hat.copy_from_slice(&a.y);
+            for poly in a.y_hat.iter_mut() {
                 ntt(poly);
             }
-            for poly in w.iter_mut() {
+            for poly in a.w.iter_mut() {
                 poly.fill(0);
             }
-            mat_vec(&self.a_hat, &y_hat, &mut w);
-            for (wi, out) in w.iter_mut().zip(w1_encoded.as_chunks_mut::<128>().0) {
+            mat_vec(&self.a_hat, &a.y_hat, &mut a.w);
+            for (wi, out) in a.w.iter_mut().zip(a.w1_encoded.as_chunks_mut::<128>().0) {
                 inverse_ntt(wi);
-                let high: Poly = core::array::from_fn(|i| decompose(wi[i]).0);
-                pack_bits(&high, 4, out);
+                for (h, &c) in a.high.iter_mut().zip(wi.iter()) {
+                    *h = decompose(c).0;
+                }
+                pack_bits(&a.high, 4, out);
             }
-            let mut ctilde = [0u8; CTILDE_BYTES];
-            shake256(&[&mu, &w1_encoded], &mut ctilde);
-            let mut c_hat = sample_in_ball(&ctilde);
-            ntt(&mut c_hat);
+            shake256(&[&mu, &a.w1_encoded], &mut a.ctilde);
+            a.c_hat = sample_in_ball(&a.ctilde);
+            ntt(&mut a.c_hat);
 
-            for ((zi, yi), s1i) in z.iter_mut().zip(&y).zip(self.s1_hat.iter()) {
-                cs = pointwise(&c_hat, s1i);
-                inverse_ntt(&mut cs);
-                for ((out, &a), &b) in zi.iter_mut().zip(yi).zip(&cs) {
-                    *out = add(a, b);
+            for ((zi, yi), s1i) in a.z.iter_mut().zip(&a.y).zip(self.s1_hat.iter()) {
+                a.cs = pointwise(&a.c_hat, s1i);
+                inverse_ntt(&mut a.cs);
+                for ((out, &p), &q) in zi.iter_mut().zip(yi).zip(&a.cs) {
+                    *out = add(p, q);
                 }
             }
             // r = w − c·s2, and the first rejection check.
             let mut bad = 0u32;
-            for ((ri, wi), s2i) in r.iter_mut().zip(&w).zip(self.s2_hat.iter()) {
-                cs = pointwise(&c_hat, s2i);
-                inverse_ntt(&mut cs);
-                for ((out, &a), &b) in ri.iter_mut().zip(wi).zip(&cs) {
-                    *out = sub(a, b);
+            for ((ri, wi), s2i) in a.r.iter_mut().zip(&a.w).zip(self.s2_hat.iter()) {
+                a.cs = pointwise(&a.c_hat, s2i);
+                inverse_ntt(&mut a.cs);
+                for ((out, &p), &q) in ri.iter_mut().zip(wi).zip(&a.cs) {
+                    *out = sub(p, q);
                 }
-                let low: Poly = core::array::from_fn(|i| from_signed(decompose(ri[i]).1));
-                bad |= any_at_least(&low, (GAMMA2 - BETA) as i32);
+                for (l, &c) in a.low.iter_mut().zip(ri.iter()) {
+                    *l = from_signed(decompose(c).1);
+                }
+                bad |= any_at_least(&a.low, (GAMMA2 - BETA) as i32);
             }
-            for zi in &z {
+            for zi in &a.z {
                 bad |= any_at_least(zi, (GAMMA1 - BETA) as i32);
             }
             let mut accepted = None;
             if bad == 0 {
                 // ct0 and the hint are computed only for a candidate that passed.
-                let mut hints = [[0u32; N]; K];
                 let mut count = 0u32;
                 let mut bad_ct0 = 0u32;
-                for ((t0i, ri), hi) in self.t0_hat.iter().zip(&r).zip(hints.iter_mut()) {
-                    cs = pointwise(&c_hat, t0i);
-                    inverse_ntt(&mut cs);
-                    bad_ct0 |= any_at_least(&cs, GAMMA2 as i32);
-                    for ((h, &r_c), &c) in hi.iter_mut().zip(ri).zip(&cs) {
+                for ((t0i, ri), hi) in self.t0_hat.iter().zip(&a.r).zip(a.hints.iter_mut()) {
+                    a.cs = pointwise(&a.c_hat, t0i);
+                    inverse_ntt(&mut a.cs);
+                    bad_ct0 |= any_at_least(&a.cs, GAMMA2 as i32);
+                    for ((h, &r_c), &c) in hi.iter_mut().zip(ri).zip(&a.cs) {
                         *h = make_hint(sub(0, c), add(r_c, c));
                         count = count.wrapping_add(*h);
                     }
                 }
                 if bad_ct0 == 0 && count as usize <= OMEGA {
-                    accepted = Some(encode_signature(&ctilde, &z, &hints));
+                    accepted = Some(encode_signature(&a.ctilde, &a.z, &a.hints));
                 }
             }
             if let Some(signature) = accepted {
                 break signature;
             }
         };
-        wipe(&mut w1_encoded);
-        wipe_words(&mut cs);
-        for poly in y
-            .iter_mut()
-            .chain(y_hat.iter_mut())
-            .chain(z.iter_mut())
-            .chain(w.iter_mut())
-            .chain(r.iter_mut())
-        {
-            wipe_words(poly);
-        }
+        a.wipe();
         wipe(&mut rho_pp);
         wipe(&mut mu);
         Ok(signature)
@@ -646,8 +710,8 @@ fn encode_signature(
 pub(crate) mod testing {
     //! Internals for `src/tests.rs`.
     pub(crate) use super::{
-        ALPHA, DECOMPOSE_M, GAMMA2, N, Poly, Q, any_at_least, centered, decompose, equal_mask,
-        expand_mask, from_signed, inverse_ntt, make_hint, mul, ntt, pointwise, power2round, reduce,
-        sample_in_ball,
+        ALPHA, Attempt, DECOMPOSE_M, GAMMA2, N, Poly, Q, any_at_least, centered, decompose,
+        equal_mask, expand_mask, from_signed, inverse_ntt, make_hint, mul, ntt, pointwise,
+        power2round, reduce, sample_in_ball,
     };
 }

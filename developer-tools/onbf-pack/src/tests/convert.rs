@@ -543,3 +543,87 @@ fn framekernel_shaped_elf_converts() {
     // The R segment, including .eh_frame_hdr, is carried unchanged.
     assert_eq!(k.segments[0].stored, &elf[..0x8BC]);
 }
+
+/// The memory placement and RELRO bit of each SEGMENT.
+fn placements(segments: &[Section<'_>]) -> Vec<(u64, u64, u64, bool)> {
+    segments
+        .iter()
+        .map(|s| {
+            let e = &s.entry;
+            (
+                e.mem_offset,
+                e.mem_size,
+                e.content_size,
+                e.flags.has(Flags::RELRO),
+            )
+        })
+        .collect()
+}
+
+/// ADR-0001 default 9: `PT_GNU_RELRO` covering all of an R+W `PT_LOAD`, the shape `rust-lld`
+/// writes: that segment is flagged, nothing is split, and the data after it stays plain RW.
+#[test]
+fn relro_flags_the_load_it_covers() {
+    let mut elf = TestElf::kernel();
+    elf.loads[2] = Load::new(RW, 0x3000, vec![0x11; 0x20]).mem(0x1000);
+    elf.loads
+        .push(Load::new(RW, 0x4000, vec![0x22; 0x40]).mem(0x2000));
+    elf.extra.push(Phdr::relro(0x3000, 0x1000));
+    elf.rela = vec![(0x3008, RELATIVE, 0x2000), (0x4010, RELATIVE, 0x2010)];
+    let packed = pack(&elf.bytes(), &options()).unwrap();
+    let k = inspect(&packed.bytes);
+    assert_eq!(
+        placements(&k.segments)[2..4],
+        [(0x3000, 0x1000, 0x20, true), (0x4000, 0x2000, 0x40, false)]
+    );
+    let expected = Flags::REQUIRED | Flags::MAPPABLE | Flags::READ | Flags::WRITE;
+    assert_eq!(k.segments[2].entry.flags.0, expected | Flags::RELRO);
+    assert_eq!(k.segments[3].entry.flags.0, expected);
+    // Relocations land in both, and the addend was written into the RELRO slot.
+    assert_eq!(k.relocations, Some(vec![0x3008, 0x4010]));
+    assert_eq!(k.segments[2].stored[8..16], 0x2000u64.to_le_bytes());
+}
+
+/// A linker that keeps the relocated data and the rest in one R+W `PT_LOAD`: the packer splits it
+/// at the boundary, on a page, and the bytes on either side land in the right section.
+#[test]
+fn relro_splits_the_load_at_its_page_boundary() {
+    let data: Vec<u8> = (0..0x1800u32).map(|i| (i % 251) as u8).collect();
+    let mut elf = TestElf::kernel();
+    elf.loads[2] = Load::new(RW, 0x3000, data.clone()).mem(0x3000);
+    elf.extra.push(Phdr::relro(0x3000, 0x1000));
+    elf.rela = vec![(0x3ff8, RELATIVE, 0x2000), (0x4000, RELATIVE, 0x2010)];
+    let packed = pack(&elf.bytes(), &options()).unwrap();
+    let k = inspect(&packed.bytes);
+    assert_eq!(
+        placements(&k.segments)[2..4],
+        [
+            (0x3000, 0x1000, 0x1000, true),
+            (0x4000, 0x2000, 0x800, false)
+        ]
+    );
+    assert_eq!(&k.segments[2].stored[..0xFF8], &data[..0xFF8]);
+    assert_eq!(k.segments[2].stored[0xFF8..], 0x2000u64.to_le_bytes());
+    assert_eq!(k.segments[3].stored[..8], 0x2010u64.to_le_bytes());
+    assert_eq!(&k.segments[3].stored[8..], &data[0x1008..]);
+    assert_eq!(k.relocations, Some(vec![0x3ff8, 0x4000]));
+
+    // RELRO covers every file byte: the rest of the PT_LOAD is bss, a segment with no content.
+    let mut elf = TestElf::kernel();
+    elf.loads[2] = Load::new(RW, 0x3000, vec![0x33; 0x400]).mem(0x3000);
+    elf.extra.push(Phdr::relro(0x3000, 0x2000));
+    let packed = pack(&elf.bytes(), &options()).unwrap();
+    let k = inspect(&packed.bytes);
+    assert_eq!(
+        placements(&k.segments)[2..4],
+        [(0x3000, 0x2000, 0x400, true), (0x5000, 0x1000, 0, false)]
+    );
+}
+
+/// Without `PT_GNU_RELRO` nothing is flagged, which is what `-z norelro` output looks like.
+#[test]
+fn no_relro_header_means_no_relro_segment() {
+    let packed = pack(&TestElf::kernel().bytes(), &options()).unwrap();
+    let k = inspect(&packed.bytes);
+    assert!(placements(&k.segments).iter().all(|&(.., relro)| !relro));
+}

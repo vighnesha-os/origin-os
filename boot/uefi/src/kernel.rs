@@ -4,7 +4,7 @@ use core::fmt;
 
 use onbf_format::{
     Compression, Error as FormatError, Image, Integrity, Kind, KrnManifest, ManifestError,
-    ParseOptions, Profile,
+    NO_MERKLE, ParseOptions, Profile, Section,
 };
 use onbf_verify::{KrnBlockError, TrustedKey, VerifyError, verify_krn_block};
 use origin_crypto::{Sha256, Sha512};
@@ -40,6 +40,8 @@ pub enum KernelError {
     Compressed(u16),
     /// A section's content does not match its SHA-256 digest or Merkle root.
     SectionDigest(u16),
+    /// A MERKLE section is not the hash blocks of the section it serves.
+    MerkleBlocks(u16),
 }
 
 impl fmt::Display for KernelError {
@@ -97,6 +99,10 @@ impl fmt::Display for KernelError {
             ),
             Self::Compressed(i) => write!(f, "section {i} is compressed"),
             Self::SectionDigest(i) => write!(f, "section {i} does not match its digest"),
+            Self::MerkleBlocks(i) => write!(
+                f,
+                "section {i} (MERKLE) is not the hash blocks of the section it serves"
+            ),
         }
     }
 }
@@ -143,7 +149,7 @@ pub fn verify<'a>(
     image
         .verify_content_digest(sha512)
         .map_err(|_| KernelError::ContentDigest)?;
-    let signer = check_signature(&image, store)?;
+    let signer = check_signature(&image, developer_mode, store)?;
 
     let manifest_section = image
         .manifest()
@@ -165,24 +171,7 @@ pub fn verify<'a>(
         return Err(KernelError::CpuFeatures(manifest.cpu_features.0));
     }
 
-    // Every byte that will be placed or used is checked against its section digest.
-    // MERKLE sections only serve page-level verification later; they are not needed here.
-    for s in image.sections() {
-        if s.entry.kind() == Kind::Merkle {
-            continue;
-        }
-        if s.entry.compression != Compression::None {
-            return Err(KernelError::Compressed(s.index));
-        }
-        let ok = match s.entry.integrity {
-            Integrity::Sha256 => Sha256::digest(s.stored) == s.entry.digest,
-            Integrity::Merkle => onbf_merkle::root(s.stored).is_ok_and(|r| r == s.entry.digest),
-            Integrity::MerkleHashBlocks | Integrity::CoveredByParent => false,
-        };
-        if !ok {
-            return Err(KernelError::SectionDigest(s.index));
-        }
-    }
+    check_sections(&image)?;
     Ok(Verified {
         image,
         manifest,
@@ -190,15 +179,53 @@ pub fn verify<'a>(
     })
 }
 
+/// Checks every section against its digest, so that every byte of the image is verified
+/// before any of it is used (ONBF §4.5). A MERKLE section is not hashed on its own: it is
+/// compared with the hash blocks of the section it serves, which `parse` has shown exists and
+/// is unique (errata C9), in the pass that hashes that section.
+fn check_sections(image: &Image<'_>) -> Result<(), KernelError> {
+    for s in image.sections() {
+        if s.entry.kind() == Kind::Merkle {
+            continue;
+        }
+        if s.entry.compression != Compression::None {
+            return Err(KernelError::Compressed(s.index));
+        }
+        match s.entry.integrity {
+            Integrity::Sha256 if Sha256::digest(s.stored) == s.entry.digest => {}
+            Integrity::Merkle if s.entry.merkle_index != NO_MERKLE => check_tree(image, &s)?,
+            Integrity::Merkle if onbf_merkle::root(s.stored).is_ok_and(|r| r == s.entry.digest) => {
+            }
+            _ => return Err(KernelError::SectionDigest(s.index)),
+        }
+    }
+    Ok(())
+}
+
+/// Checks section `s`, whose tree has hash blocks, and its MERKLE section together.
+fn check_tree(image: &Image<'_>, s: &Section<'_>) -> Result<(), KernelError> {
+    let merkle = usize::try_from(s.entry.merkle_index)
+        .ok()
+        .and_then(|i| image.section(i))
+        .ok_or(KernelError::SectionDigest(s.index))?;
+    onbf_merkle::verify_tree(&s.entry.digest, s.stored, merkle.stored).map_err(|e| match e {
+        onbf_merkle::Error::HashMismatch { .. } => KernelError::MerkleBlocks(merkle.index),
+        _ => KernelError::SectionDigest(s.index),
+    })
+}
+
 /// B2 step 3: the signature block against the trust store. The digest it checks is the
 /// header's, which step 2 has just proven to be the image's. Nothing of the kernel beyond
-/// the header and the section table has been read before this returns.
+/// the header and the section table has been read before this returns. An image with no
+/// block is accepted in developer mode only (ADR-0002 B8).
 fn check_signature(
     image: &Image<'_>,
+    developer_mode: bool,
     store: &[TrustedKey<'_>],
 ) -> Result<Option<[u8; 32]>, KernelError> {
     match image.signature_block() {
-        None => Ok(None),
+        None if developer_mode => Ok(None),
+        None => Err(KernelError::Unsigned),
         Some(block) => verify_krn_block(block, store, &image.header().content_digest)
             .map(Some)
             .map_err(KernelError::Signature),

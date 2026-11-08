@@ -416,6 +416,31 @@ fn a_damaged_or_foreign_key_file_is_refused() {
     );
 }
 
+/// The key file is opened once with `O_NOFOLLOW`, and only that open file is checked and read:
+/// a symbolic link is never followed, even to a key file that would be accepted itself.
+#[test]
+fn a_symbolic_link_to_a_key_file_is_refused() {
+    let dir = TempDir::new("symlink");
+    let (paths, _) = generate(&dir.0, "symlink", Some("symlink test"));
+    assert!(HostKey::load(&paths.key).is_ok(), "the file itself loads");
+
+    let link = dir.0.join("link.key");
+    std::os::unix::fs::symlink(&paths.key, &link).unwrap();
+    let refused = HostKey::load(&link).map(|_| ());
+    assert!(
+        matches!(&refused, Err(SignError::Io(why)) if why.contains("cannot read")),
+        "{refused:?}"
+    );
+    // A directory is refused too, by the check on the open handle.
+    assert_eq!(
+        HostKey::load(&dir.0).map(|_| ()),
+        Err(SignError::KeyFile {
+            path: dir.0.clone(),
+            why: "not a regular file",
+        })
+    );
+}
+
 // ---------------------------------------------------------------- OpenSSL, as an outside check
 
 /// An OpenSSL with ML-DSA (3.5 or later), if one is installed. Signing does not use it; this is

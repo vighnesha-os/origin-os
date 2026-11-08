@@ -3,6 +3,8 @@
 //! - [`root`] computes a section's Merkle root in one streaming pass. The boot loader uses
 //!   it to verify a whole KRN segment.
 //! - [`build`] writes the MERKLE section, for writers such as `onbf-pack`.
+//! - [`verify_tree`] checks a section and its MERKLE section together, in one pass with no
+//!   more hashing than [`root`]. The boot loader uses it so every stored byte is covered.
 //! - [`verify_block`] checks one 4 KiB block against the root by walking one hash block per
 //!   level, using a caller-supplied cache of trusted hash blocks (§4.6). This is the
 //!   page-fault path (ONBF-R2).
@@ -42,7 +44,7 @@ mod tree;
 mod verify;
 
 pub use shape::Shape;
-pub use tree::{build, root};
+pub use tree::{build, root, verify_tree};
 pub use verify::{NoCache, TrustCache, verify_block};
 
 use origin_crypto::Sha256;

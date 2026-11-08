@@ -37,9 +37,9 @@
 //!
 //! What this assessment does not establish:
 //! - that a future compiler keeps these properties. `cargo xtask check` counts the conditional
-//!   branches of `ed25519::sign` in its assembly on the build host, so a regression like the
-//!   one found shows up, but the ML-DSA paths and the other architecture were checked once, by
-//!   hand;
+//!   branches of each Ed25519 function that handles the secret scalar or nonce in its assembly
+//!   on the build host, so a regression like the one found shows up, but the ML-DSA paths and
+//!   the other architecture were checked once, by hand;
 //! - that the processor does: Apple documents data-independent timing only under PSTATE.DIT,
 //!   which needs `unsafe` to set, and the M-series data-memory-dependent prefetcher can leak
 //!   even index-free code. Keep to trusted hosts;
@@ -73,6 +73,12 @@ pub fn wipe(bytes: &mut [u8]) {
 
 /// Overwrites `words` with zeros, best effort (see the crate documentation).
 pub fn wipe_words(words: &mut [u32]) {
+    words.fill(0);
+    core::hint::black_box(&*words);
+}
+
+/// Overwrites 64-bit `words` with zeros, best effort (see the crate documentation).
+pub fn wipe_u64(words: &mut [u64]) {
     words.fill(0);
     core::hint::black_box(&*words);
 }

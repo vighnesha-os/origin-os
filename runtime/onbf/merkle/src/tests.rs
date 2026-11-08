@@ -305,6 +305,76 @@ fn tampered_hash_block_padding_and_upper_levels_are_rejected() {
     );
 }
 
+/// `verify_tree` accepts exactly the section `build` writes: every byte of a one-block MERKLE
+/// section, padding included, and bytes across every level and the padding of a taller tree.
+#[test]
+fn verify_tree_covers_every_stored_byte() {
+    for n in [
+        0,
+        1,
+        4096,
+        4097,
+        128 * 4096,
+        128 * 4096 + 1,
+        129 * 4096 - 100,
+    ] {
+        let (data, shape, section, root) = tree_for(n);
+        assert_eq!(verify_tree(&root, &data, &section), Ok(()), "size {n}");
+        assert_eq!(section.len() as u64, shape.hash_blocks_len());
+    }
+
+    // Two leaves: one hash block, two hashes, and 4,032 bytes of padding, all checked.
+    let (data, _, section, root) = tree_for(5000);
+    for at in 0..section.len() {
+        let mut t = section.clone();
+        t[at] ^= 0x40;
+        assert_eq!(
+            verify_tree(&root, &data, &t),
+            Err(Error::HashMismatch { level: 1 }),
+            "byte {at}"
+        );
+    }
+
+    // Two levels, 129 leaves: blocks [top, h0..127, h128 + padding]. A sweep across all three
+    // blocks, and the padding of the last block by itself (the padding of the top block is
+    // among the swept positions).
+    let (data, shape, section, root) = tree_for(129 * 4096);
+    assert_eq!(shape.levels(), 2);
+    let last_block_padding = 4096 * 2 + 32;
+    for at in (0..section.len()).step_by(97).chain([last_block_padding]) {
+        let mut t = section.clone();
+        t[at] ^= 1;
+        let level = if at < 4096 { 2 } else { 1 };
+        assert_eq!(
+            verify_tree(&root, &data, &t),
+            Err(Error::HashMismatch { level }),
+            "byte {at}"
+        );
+    }
+
+    // The content, the root and the section's length are each checked too.
+    let mut bad = data.clone();
+    bad[0] ^= 1;
+    assert_eq!(
+        verify_tree(&root, &bad, &section),
+        Err(Error::RootMismatch),
+        "changed content is a root mismatch, not a hash-block one"
+    );
+    let mut wrong_root = root;
+    wrong_root[31] ^= 1;
+    assert_eq!(
+        verify_tree(&wrong_root, &data, &section),
+        Err(Error::RootMismatch)
+    );
+    assert_eq!(
+        verify_tree(&root, &data, &section[..4096]),
+        Err(Error::HashBlocksLength {
+            expected: section.len() as u64,
+            found: 4096
+        })
+    );
+}
+
 #[test]
 fn wrong_root_size_index_or_lengths_are_rejected() {
     let (data, shape, section, root) = tree_for(3 * 4096 + 10);

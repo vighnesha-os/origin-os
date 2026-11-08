@@ -140,7 +140,11 @@ fn benign_fault(b: &mut Builder, rng: &mut Rng) {
     match rng.below(6) {
         0 if s.integrity <= 1 => s.digest = [rng.byte(); 32],
         1 if is_segment && s.flags & W != 0 => s.flags ^= RELRO,
-        2 if is_segment => s.flags ^= R,
+        // §6.1 allows these four, and no other.
+        2 if is_segment => {
+            s.flags =
+                (s.flags & !(R | W | X | RELRO)) | rng.pick(&[R, R | W, R | W | RELRO, R | X]);
+        }
         3 if s.kind != MERKLE && s.kind != MANIFEST && !is_segment && s.integrity == 0 => {
             let len = 1 + rng.below(9000);
             s.stored.resize(len, 0x77);
@@ -321,6 +325,7 @@ fn section_error_name(e: SectionError) -> &'static str {
         S::WriteAndExecute => "WriteAndExecute",
         S::PermissionsOnNonSegment => "PermissionsOnNonSegment",
         S::SegmentNotMappable => "SegmentNotMappable",
+        S::SegmentPermissions(_) => "SegmentPermissions",
         S::MappableNotAllowed => "MappableNotAllowed",
         S::UnknownKind(_) => "UnknownKind",
         S::KindNotAllowedInProfile(_) => "KindNotAllowedInProfile",
@@ -373,7 +378,7 @@ fn error_name(e: Error) -> &'static str {
 }
 
 /// Every refusal the container soak must reach.
-const IMAGE_REFUSALS: [&str; 47] = [
+const IMAGE_REFUSALS: [&str; 48] = [
     "Truncated",
     "BadMagic",
     "UnsupportedFormatMajor",
@@ -398,6 +403,7 @@ const IMAGE_REFUSALS: [&str; 47] = [
     "WriteAndExecute",
     "PermissionsOnNonSegment",
     "SegmentNotMappable",
+    "SegmentPermissions",
     "MappableNotAllowed",
     "UnknownKind",
     "KindNotAllowedInProfile",
@@ -556,6 +562,11 @@ fn assert_rules(case: usize, bytes: &[u8], image: &Image<'_>, options: ParseOpti
         assert!(!e.flags.has(W | X), "{at}: W+X (ONBF-R5)");
         if segment {
             assert!(mappable, "{at}: a SEGMENT must be MAPPABLE (C6)");
+            let permissions = e.flags.0 & (R | W | X | RELRO);
+            assert!(
+                [R, R | W, R | W | RELRO, R | X].contains(&permissions),
+                "{at}: §6.1 allows R, RW (optionally RELRO) or RX"
+            );
         } else {
             assert_eq!(e.flags.0 & (R | W | X | RELRO), 0, "{at}: permissions (C6)");
         }
