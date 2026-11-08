@@ -451,6 +451,25 @@ ipc_sidt_start:
     jmp .Lsidt_exit
 ipc_sidt_end:
 
+    // Sets RFLAGS.TF: the next instruction traps to #DB, which the kernel takes on its own
+    // interrupt stack and answers by ending the thread.
+    .globl ipc_step_start
+    .globl ipc_step_end
+ipc_step_start:
+    pushfq
+    or dword ptr [rsp], 0x100
+    popfq
+    nop
+    mov edi, 1
+    mov eax, {DEBUG_REPORT}
+    syscall
+    xor edi, edi
+.Lstep_exit:
+    mov eax, {THREAD_EXIT}
+    syscall
+    jmp .Lstep_exit
+ipc_step_end:
+
     .popsection
 "#,
     DATA = const DATA,
@@ -486,6 +505,8 @@ unsafe extern "C" {
     static ipc_nodebug_end: u8;
     static ipc_sidt_start: u8;
     static ipc_sidt_end: u8;
+    static ipc_step_start: u8;
+    static ipc_step_end: u8;
 }
 
 /// The bytes of one program in the image.
@@ -1701,6 +1722,38 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         } else {
             "completed"
         },
+        if right { "" } else { ": ipc failed" }
+    );
+
+    // A program that single-steps itself ends by #DB, which arrives on its own interrupt
+    // stack: a debug exception can come with no usable kernel stack (see `cpu::init`).
+    let step = program(&raw const ipc_step_start, &raw const ipc_step_end);
+    let Some(image) = Image::new(LIMITS, step) else {
+        return false;
+    };
+    let process = image.finish();
+    if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
+        return false;
+    }
+    let ended = await_end(&process, tsc_hz, 5);
+    let (low, high) = cpu::bsp_debug_stack();
+    let frame = cpu::last_debug_frame();
+    let on_its_stack = (low..high).contains(&frame);
+    let right = ended
+        && process.reports().is_empty()
+        && on_its_stack
+        && matches!(
+            process.ending(),
+            Some(Ending::Faulted {
+                vector: 1,
+                error: 0,
+                address: 0
+            })
+        );
+    ok &= right;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: a program that single-stepped itself ended by #DB, taken on its own interrupt stack: {on_its_stack}{}",
         if right { "" } else { ": ipc failed" }
     );
     ok

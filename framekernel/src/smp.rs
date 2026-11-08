@@ -229,6 +229,10 @@ pub(crate) fn start(
         );
         return online;
     }
+    cpu::record_cpu_state();
+    // The boot processor's interrupt stacks are in the kernel's image; nothing could guard
+    // them before the kernel's own tables were live.
+    let bsp_guards = guard_interrupt_stacks(cpu::bsp_tables());
     let map = match discover(info.acpi_rsdp, bsp) {
         Ok(map) => map,
         Err(e) => {
@@ -329,7 +333,55 @@ pub(crate) fn start(
         !leftover,
         if leftover { ": AP start-up failed" } else { "" }
     );
+    // Each processor's interrupt stacks end at a guard page that faults, and each put its own
+    // control state where the kernel's rules need it.
+    let proven = INTERRUPT_STACK_GUARDS.load(Ordering::Relaxed);
+    let expected = online.count as u64 * 4;
+    if bsp_guards.is_ok() && proven == expected {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: page protection: interrupt-stack guard pages: {proven} of {expected} faulted (4 per processor)"
+        );
+    } else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: page protection violated: interrupt-stack guard pages: {proven} of {expected} faulted ({})",
+            bsp_guards.err().unwrap_or("an application processor's")
+        );
+    }
+    let holding = cpu::cpu_states_holding(online.cpus());
+    let _ = writeln!(
+        com1,
+        "origin-kernel: CPU state: machine checks raise #MC, x87 errors raise #MF, ring 3 has no RDPMC, FSGSBASE or SYSENTER, no debug breakpoint armed: {holding} of {} processors{}",
+        online.count,
+        if holding == online.count {
+            ""
+        } else {
+            ": CPU baseline failed"
+        }
+    );
     online
+}
+
+/// Guard pages proven unmapped, for the boot report.
+static INTERRUPT_STACK_GUARDS: AtomicU64 = AtomicU64::new(0);
+
+/// Unmaps the guard page below each interrupt stack in `tables`, which no processor is using
+/// (the boot processor has yet to take an exception on them; an AP has yet to start), and
+/// proves that each one faults.
+fn guard_interrupt_stacks(tables: *const CpuTables) -> Result<(), &'static str> {
+    let guards = cpu::interrupt_stack_guards(tables);
+    vm::make_guards(&guards).map_err(|_| "cannot unmap the guard pages")?;
+    for guard in guards {
+        // SAFETY: the page is RAM of `tables`, not MMIO; the probe only reads it.
+        match unsafe { cpu::probe_read(guard) } {
+            cpu::Probe::Faulted { error: 0, address } if address == guard => {
+                INTERRUPT_STACK_GUARDS.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => return Err("a guard page did not fault"),
+        }
+    }
+    Ok(())
 }
 
 /// RSDP → XSDT → MADT → the processors it lists → their CPU indexes, the boot processor
@@ -505,6 +557,7 @@ fn start_one(
     // SAFETY: an all-zero `CpuTables` is valid (integers only); `init_ap` writes it before
     // the processor uses it.
     let tables = Box::into_raw(unsafe { Box::<CpuTables>::new_zeroed().assume_init() });
+    guard_interrupt_stacks(tables)?;
     let (stack, _guard) =
         crate::sched::guarded_stack(AP_STACK_BYTES).ok_or("no memory for the AP stack")?;
     let stack_top = (stack.as_mut_ptr().addr() + AP_STACK_BYTES) as u64 & !0xF;
@@ -657,6 +710,7 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     cpu::check_pat();
     // SAFETY: CPL 0, this AP, once, before any SIMD runs on it.
     let _ = unsafe { cpu::enable_simd(&cpu::gather_cpuid()) };
+    cpu::record_cpu_state();
     if !cpu::x2apic_supported() {
         let _ = start.handshake.refuse(Refusal::NoX2Apic);
         crate::halt();

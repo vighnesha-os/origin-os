@@ -830,6 +830,15 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             format!(
                 "origin-kernel: SMP: {cpus} of {cpus} enabled processors online; trampoline identity pages removed true"
             ),
+            // Every processor's interrupt stacks end at a guard page, and each processor set
+            // its own control state (CLAUDE.md §24, §58).
+            format!(
+                "origin-kernel: page protection: interrupt-stack guard pages: {0} of {0} faulted (4 per processor)",
+                4 * cpus
+            ),
+            format!(
+                "origin-kernel: CPU state: machine checks raise #MC, x87 errors raise #MF, ring 3 has no RDPMC, FSGSBASE or SYSENTER, no debug breakpoint armed: {cpus} of {cpus} processors"
+            ),
             "origin-kernel: reclaimed ".into(),
         ]
         .into_iter()
@@ -1121,6 +1130,7 @@ fn boot_failures() -> Vec<&'static str> {
         "(#GP general protection)",
         "(#PF page fault)",
         "(#UD invalid opcode)",
+        "origin-kernel: machine check:",
         "origin-kernel: no usable region can hold",
         "origin-kernel: frame allocator exhausted",
         "did not keep its contents",
@@ -1295,6 +1305,7 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
         "origin-kernel: ipc: a program with RFLAGS.AC set took interrupts and made a system call: the flag reached kernel code 0 times, and stayed set in ring 3: true".into(),
         "origin-kernel: ipc: a process without the developer calls gets NOT_SUPPORTED: true".into(),
         "origin-kernel: ipc: sidt from ring 3 with UMIP on: refused, the process ended by vector 13".into(),
+        "origin-kernel: ipc: a program that single-stepped itself ended by #DB, taken on its own interrupt stack: true".into(),
         "origin-kernel: ipc: a fault inside a user copy comes back as a failed copy, not a dead kernel: 1 fault recovered".into(),
         "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap ".into(),
         "; threads run before their state existed: 0".into(),

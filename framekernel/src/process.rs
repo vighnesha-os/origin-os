@@ -117,7 +117,8 @@ pub(crate) struct Limits {
 pub(crate) enum Ending {
     /// `exit(code)`.
     Exited(u64),
-    /// A fault: its vector, error code and CR2.
+    /// A fault: its vector, its error code and, for a page fault, CR2 (0 for any other
+    /// vector, where CR2 holds some earlier page fault's address).
     Faulted {
         vector: u64,
         error: u64,

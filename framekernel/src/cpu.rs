@@ -24,8 +24,14 @@ use framekernel::descriptors::{
 use framekernel::topology::CpuTopology;
 use origin_sync::SpinLock;
 
-/// Size of the double-fault stack.
-const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
+/// Size of each interrupt stack (#DF, NMI, #MC, #DB).
+const IST_STACK_SIZE: usize = 16 * 1024;
+/// IST slot used for #DB: a debug exception can be taken with no usable kernel stack (a pending
+/// one is delivered on the first instruction of `syscall_entry`, still on the user's).
+const DEBUG_IST: u8 = 4;
+/// The word of the TSS image where IST4 begins: byte 60 (`descriptors::tss_image` fills
+/// IST1-IST3 from byte 36).
+const TSS_IST4_WORD: usize = 15;
 
 #[repr(C, align(16))]
 struct Gdt([u64; GDT_ENTRIES]);
@@ -36,8 +42,19 @@ struct TssImage([u32; 26]);
 #[repr(C, align(4096))]
 struct Idt([[u64; 2]; 256]);
 
-#[repr(C, align(16))]
-struct Stack([u8; DOUBLE_FAULT_STACK_SIZE]);
+/// One interrupt stack and the page below it. That page is unmapped once the kernel's own
+/// page tables are live (`smp::start`), so running off the end of the stack faults instead of
+/// overwriting what lies below: another stack, the TSS or the GDT.
+#[repr(C, align(4096))]
+struct IstStack {
+    guard: [u8; 4096],
+    stack: [u8; IST_STACK_SIZE],
+}
+
+const ZERO_IST_STACK: IstStack = IstStack {
+    guard: [0; 4096],
+    stack: [0; IST_STACK_SIZE],
+};
 
 /// The operand of `lgdt` and `lidt`: a 16-bit limit followed by a 64-bit base.
 #[repr(C, packed)]
@@ -46,25 +63,44 @@ struct TablePointer {
     base: u64,
 }
 
-/// One processor's GDT, TSS and double-fault stack. The IDT is shared.
-#[repr(C, align(16))]
+/// One processor's GDT, TSS and interrupt stacks. The IDT is shared. The GDT and TSS have the
+/// first page to themselves, and every interrupt stack starts on a page boundary.
+#[repr(C, align(4096))]
 pub(crate) struct CpuTables {
     gdt: Gdt,
     tss: TssImage,
-    double_fault_stack: Stack,
-    nmi_stack: Stack,
-    machine_check_stack: Stack,
+    double_fault: IstStack,
+    nmi: IstStack,
+    machine_check: IstStack,
+    debug: IstStack,
 }
 
 /// The boot processor's tables. Application processors get theirs from the heap.
 static mut BSP_TABLES: CpuTables = CpuTables {
     gdt: Gdt([0; GDT_ENTRIES]),
     tss: TssImage([0; 26]),
-    double_fault_stack: Stack([0; DOUBLE_FAULT_STACK_SIZE]),
-    nmi_stack: Stack([0; DOUBLE_FAULT_STACK_SIZE]),
-    machine_check_stack: Stack([0; DOUBLE_FAULT_STACK_SIZE]),
+    double_fault: ZERO_IST_STACK,
+    nmi: ZERO_IST_STACK,
+    machine_check: ZERO_IST_STACK,
+    debug: ZERO_IST_STACK,
 };
 static mut IDT: Idt = Idt([[0; 2]; 256]);
+
+/// The guard pages of the four interrupt stacks in `tables`.
+pub(crate) fn interrupt_stack_guards(tables: *const CpuTables) -> [u64; 4] {
+    let base = tables.addr() as u64;
+    [
+        base + core::mem::offset_of!(CpuTables, double_fault.guard) as u64,
+        base + core::mem::offset_of!(CpuTables, nmi.guard) as u64,
+        base + core::mem::offset_of!(CpuTables, machine_check.guard) as u64,
+        base + core::mem::offset_of!(CpuTables, debug.guard) as u64,
+    ]
+}
+
+/// The boot processor's tables, for [`interrupt_stack_guards`].
+pub(crate) fn bsp_tables() -> *const CpuTables {
+    &raw const BSP_TABLES
+}
 
 /// Registers saved by [`exception_common`], then the vector and error code the stubs push,
 /// then the frame the processor pushed (SDM Vol. 3A Figure 6-9).
@@ -106,8 +142,9 @@ pub(crate) unsafe fn init() {
     let mut idt = Idt([[0; 2]; 256]);
     for (vector, (gate, stub)) in idt.0.iter_mut().zip(STUBS.iter()).enumerate() {
         let ist = match vector {
-            8 => DOUBLE_FAULT_IST,
+            1 => DEBUG_IST,
             2 => NMI_IST,
+            8 => DOUBLE_FAULT_IST,
             18 => MACHINE_CHECK_IST,
             _ => 0,
         };
@@ -163,21 +200,32 @@ pub(crate) unsafe fn init_ap(tables: *mut CpuTables, index: CpuIndex) {
 unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex) {
     // SAFETY: the caller's contract: `tables` is valid, writable and this processor's own.
     // Projecting to a field creates no reference.
-    let stack = unsafe { &raw mut (*tables).double_fault_stack };
+    let stack = unsafe { &raw mut (*tables).double_fault.stack };
     // SAFETY: as above.
-    let nmi = unsafe { &raw mut (*tables).nmi_stack };
+    let nmi = unsafe { &raw mut (*tables).nmi.stack };
     // SAFETY: as above.
-    let mc = unsafe { &raw mut (*tables).machine_check_stack };
+    let mc = unsafe { &raw mut (*tables).machine_check.stack };
+    // SAFETY: as above.
+    let debug = unsafe { &raw mut (*tables).debug.stack };
     // SAFETY: as above.
     let tss_field = unsafe { &raw mut (*tables).tss };
     // SAFETY: as above.
     let gdt_ptr_raw = unsafe { &raw mut (*tables).gdt };
-    let top = |p: usize| (p + DOUBLE_FAULT_STACK_SIZE) as u64;
-    let tss_image = TssImage(d::tss_image([
+    let top = |p: usize| (p + IST_STACK_SIZE) as u64;
+    let mut tss_image = TssImage(d::tss_image([
         top(stack.addr()),
         top(nmi.addr()),
         top(mc.addr()),
     ]));
+    let debug_top = top(debug.addr());
+    if let Some([low, high]) = tss_image
+        .0
+        .get_mut(TSS_IST4_WORD..TSS_IST4_WORD + 2)
+        .and_then(|w| w.first_chunk_mut::<2>())
+    {
+        *low = debug_top as u32;
+        *high = (debug_top >> 32) as u32;
+    }
     // SAFETY: as above; the TSS is written before `ltr` loads it.
     unsafe { tss_field.write(tss_image) };
     let tss = d::tss_descriptor(tss_field.addr() as u64);
@@ -223,7 +271,8 @@ unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex) {
             code = in(reg) u64::from(KERNEL_CODE),
             data = in(reg) u64::from(KERNEL_DATA),
             tss = in(reg) u64::from(TSS),
-            tmp = lateout(reg) _,
+            // Written before the last input is read: it must not share a register with one.
+            tmp = out(reg) _,
         );
     }
     // SAFETY: `idt_ptr` describes the IDT `init` wrote; every present gate points at a stub
@@ -232,6 +281,7 @@ unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex) {
     let _ = TSS_SIZE; // the limit is encoded by `tss_descriptor`
     // GS was just reloaded (base 0): point it at this processor's CPU-local area.
     init_cpu_local(tss_field.addr() as u64, index);
+    init_cpu_state();
 }
 
 /// Processors the kernel indexes: every per-CPU array, the CPU-local areas included, has
@@ -411,6 +461,119 @@ fn init_cpu_local(tss: u64, index: CpuIndex) {
     init_syscall();
 }
 
+/// CR4.MCE: a machine check raises #MC, instead of shutting the processor down.
+const CR4_MCE: u64 = 1 << 6;
+/// CR4.PCE: `rdpmc` at CPL 3.
+const CR4_PCE: u64 = 1 << 8;
+/// CR4.FSGSBASE: `rdgsbase`, `wrgsbase` and their FS forms at CPL 3.
+const CR4_FSGSBASE: u64 = 1 << 16;
+/// CR0.NE: x87 errors raise #MF (with it clear, the processor waits for an external FERR#
+/// nothing wired up to it delivers, and the instruction hangs).
+const CR0_NE: u64 = 1 << 5;
+/// DR7's reset value: every breakpoint disabled.
+const DR7_CLEAR: u64 = 0x400;
+/// IA32_SYSENTER_CS: zero makes `sysenter` raise #GP.
+const SYSENTER_CS: u32 = 0x174;
+
+/// Whether this processor has SYSENTER's MSRs (CPUID.1:EDX.SEP).
+fn has_sysenter() -> bool {
+    cpuid(1)[3] & (1 << 11) != 0
+}
+
+/// Puts this processor's control state where the kernel's rules need it, whatever the firmware
+/// or INIT left there: machine checks raise #MC, ring 3 cannot use `rdpmc` or the FS/GS base
+/// instructions (the second is what lets [`init_cpu_local`] trust GS's base) or `sysenter`
+/// (the one way into the kernel is `syscall`), and no debug breakpoint is armed. Together
+/// with `enable_simd`'s CR0.NE, [`record_cpu_state`] checks all of it.
+fn init_cpu_state() {
+    // SAFETY: CPL 0, interrupts off (`load_tables`' contract). Setting MCE only makes machine
+    // checks raise #MC, whose gate `init` installed; clearing FSGSBASE and PCE only takes
+    // instructions away from CPL 3.
+    unsafe {
+        asm!(
+            "mov {t}, cr4",
+            "or {t}, {set}",
+            "and {t}, {clear}",
+            "mov cr4, {t}",
+            set = in(reg) CR4_MCE,
+            clear = in(reg) !(CR4_FSGSBASE | CR4_PCE),
+            t = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+    // SAFETY: CPL 0; DR7's reset value disarms every breakpoint, and nothing here uses one.
+    unsafe { asm!("mov dr7, {}", in(reg) DR7_CLEAR, options(nostack, preserves_flags)) };
+    if has_sysenter() {
+        // SAFETY: CPL 0; SEP says the MSR exists, and a zero selector only makes SYSENTER
+        // raise #GP (Intel SDM Vol. 2B, SYSENTER).
+        unsafe { wrmsr(SYSENTER_CS, 0) };
+    }
+}
+
+/// CR4.
+fn read_cr4() -> u64 {
+    let value: u64;
+    // SAFETY: reading CR4 at CPL 0 has no side effect.
+    unsafe { asm!("mov {}, cr4", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
+/// CR0.
+fn read_cr0() -> u64 {
+    let value: u64;
+    // SAFETY: reading CR0 at CPL 0 has no side effect.
+    unsafe { asm!("mov {}, cr0", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
+/// DR7.
+fn read_dr7() -> u64 {
+    let value: u64;
+    // SAFETY: reading DR7 at CPL 0 has no side effect.
+    unsafe { asm!("mov {}, dr7", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
+/// Whether this processor's control state is what [`init_cpu_state`] and `enable_simd` leave.
+fn cpu_state_holds() -> bool {
+    let cr4 = read_cr4();
+    let sysenter_cs = if has_sysenter() {
+        // SAFETY: CPL 0; SEP says the MSR exists, and reading it has no side effect.
+        unsafe { rdmsr(SYSENTER_CS) }
+    } else {
+        0
+    };
+    cr4 & CR4_MCE != 0
+        && cr4 & (CR4_FSGSBASE | CR4_PCE) == 0
+        && read_cr0() & CR0_NE != 0
+        && read_dr7() & 0xFF == 0
+        && sysenter_cs == 0
+}
+
+/// Each CPU index whose processor passed [`cpu_state_holds`] on itself.
+static CPU_STATE_HOLDS: [core::sync::atomic::AtomicBool; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_CPUS];
+
+/// Records whether this processor's control state holds, after `enable_simd`. The boot
+/// processor and every AP do it on themselves; an AP before its handshake, which orders the
+/// mark before the boot processor sees it online.
+pub(crate) fn record_cpu_state() {
+    if let Some(holds) = CPU_STATE_HOLDS.get(this_cpu().get()) {
+        holds.store(cpu_state_holds(), Ordering::Relaxed);
+    }
+}
+
+/// How many of `cpus` recorded a control state that holds.
+pub(crate) fn cpu_states_holding(cpus: &[CpuIndex]) -> usize {
+    cpus.iter()
+        .filter(|c| {
+            CPU_STATE_HOLDS
+                .get(c.get())
+                .is_some_and(|h| h.load(Ordering::Relaxed))
+        })
+        .count()
+}
+
 /// IA32_STAR, IA32_LSTAR and IA32_FMASK.
 const STAR: u32 = 0xC000_0081;
 const LSTAR: u32 = 0xC000_0082;
@@ -556,8 +719,23 @@ pub(crate) fn nmis() -> (u64, u64) {
 /// The boot processor's NMI stack, as `[low, high)`.
 pub(crate) fn bsp_nmi_stack() -> (u64, u64) {
     // SAFETY: only the address of the static's field is taken; no reference is made.
-    let low = unsafe { &raw const BSP_TABLES.nmi_stack }.addr() as u64;
-    (low, low + DOUBLE_FAULT_STACK_SIZE as u64)
+    let low = unsafe { &raw const BSP_TABLES.nmi.stack }.addr() as u64;
+    (low, low + IST_STACK_SIZE as u64)
+}
+
+/// The frame of the last user-mode #DB, for the boot proof that it arrives on its own stack.
+static DEBUG_FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// Where the last #DB in user mode saved its frame.
+pub(crate) fn last_debug_frame() -> u64 {
+    DEBUG_FRAME.load(Ordering::SeqCst)
+}
+
+/// The boot processor's #DB stack, as `[low, high)`.
+pub(crate) fn bsp_debug_stack() -> (u64, u64) {
+    // SAFETY: only the address of the static's field is taken; no reference is made.
+    let low = unsafe { &raw const BSP_TABLES.debug.stack }.addr() as u64;
+    (low, low + IST_STACK_SIZE as u64)
 }
 
 /// Local APIC timer interrupts taken since boot.
@@ -676,15 +854,29 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
             crate::syscall::Outcome::ThreadExit => crate::sched::on_exit(here),
         };
     }
+    // A machine check is the hardware reporting on itself: it says nothing about the program
+    // it interrupted, and it can only be recovered from or stop the processor.
+    let machine_check_report = if frame.vector == 18 {
+        match machine_check() {
+            Ok(()) => return here,
+            Err(report) => Some(report),
+        }
+    } else {
+        None
+    };
     // An exception in user mode ends that thread; the kernel carries on (crash isolation).
-    if frame.vector < 32 && frame.cs & 3 == 3 {
-        let on_exception_stack = matches!(frame.vector, 8 | 18);
-        crate::syscall::user_fault(
-            frame.vector,
-            frame.error_code,
-            read_cr2(),
-            on_exception_stack,
-        );
+    // Neither #DF (its saved CS is architecturally undefined) nor #MC (taken above) says
+    // anything about user mode. CR2 means something only for a page fault: read for any
+    // other vector, it is the address of the last page fault on this processor, which may
+    // be another process's.
+    if frame.vector < 32 && !matches!(frame.vector, 8 | 18) && frame.cs & 3 == 3 {
+        let address = if frame.vector == 14 { read_cr2() } else { 0 };
+        // #DB is the one vector here with a stack of its own, which takes no interrupts.
+        let on_exception_stack = frame.vector == 1;
+        if on_exception_stack {
+            DEBUG_FRAME.store(here, Ordering::SeqCst);
+        }
+        crate::syscall::user_fault(frame.vector, frame.error_code, address, on_exception_stack);
         return crate::sched::on_exit(here);
     }
     // A page fault at the user-copy instruction, on a user address: resume at
@@ -734,8 +926,89 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         frame.rsi, frame.rdi, frame.rbp, frame.r8, frame.r9, frame.r10, frame.r11,
     );
     let _ = (frame.r12, frame.r13, frame.r14, frame.r15, frame.ss);
+    if let Some(report) = machine_check_report {
+        let _ = writeln!(com1, "origin-kernel: machine check: {report}");
+    }
     drop(com1);
     crate::halt()
+}
+
+/// The machine-check MSRs and bits (Intel SDM Vol. 3B §16.3): CPUID.1:EDX.MCA, the number of
+/// banks in IA32_MCG_CAP, restart IP valid and machine check in progress in IA32_MCG_STATUS,
+/// and valid, uncorrected and processor context corrupt in each bank's IA32_MCi_STATUS.
+const CPUID_MCA: u32 = 1 << 14;
+const MCG_CAP: u32 = 0x179;
+const MCG_STATUS: u32 = 0x17A;
+const MCG_RIPV: u64 = 1 << 0;
+const MCG_MCIP: u64 = 1 << 2;
+const MC0_STATUS: u32 = 0x401;
+const MC_VAL: u64 = 1 << 63;
+const MC_UC: u64 = 1 << 61;
+const MC_PCC: u64 = 1 << 57;
+/// The most banks read (MCG_CAP's count, whatever it says, indexes at most this many).
+const MC_BANKS: u64 = 32;
+
+/// Why a machine check cannot be recovered from.
+struct FatalMachineCheck {
+    /// IA32_MCG_STATUS (0 if the processor has no machine-check MSRs).
+    status: u64,
+    /// The first bank reporting an uncorrected error or a corrupt processor context.
+    bank: Option<(u64, u64)>,
+}
+
+impl core::fmt::Display for FatalMachineCheck {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "IA32_MCG_STATUS {:#x}", self.status)?;
+        if let Some((bank, status)) = self.bank {
+            write!(f, ", bank {bank} IA32_MCi_STATUS {status:#x}")?;
+        }
+        write!(f, ", not recoverable")
+    }
+}
+
+/// Reads the machine-check state and decides: recoverable means the processor can restart the
+/// interrupted instruction (RIPV) and no bank holds an uncorrected error or says the
+/// processor's context is corrupt (the kernel has no way to contain one yet, and would be
+/// guessing if it went on). Then the valid banks and MCIP are cleared and the interrupted
+/// context goes on (MCIP left set makes the next machine check a shutdown). Anything else
+/// is fatal. Reads no CPU-local data: it may interrupt anything, even `swapgs` in progress.
+fn machine_check() -> Result<(), FatalMachineCheck> {
+    if cpuid(1)[3] & CPUID_MCA == 0 {
+        return Err(FatalMachineCheck {
+            status: 0,
+            bank: None,
+        });
+    }
+    // SAFETY: CPL 0; MCA says these MSRs exist, and reading them has no side effect.
+    let status = unsafe { rdmsr(MCG_STATUS) };
+    // SAFETY: as above.
+    let banks = (unsafe { rdmsr(MCG_CAP) } & 0xFF).min(MC_BANKS) as u32;
+    let mut bad_bank = None;
+    let mut valid = [false; MC_BANKS as usize];
+    for (bank, valid) in (0..banks).zip(valid.iter_mut()) {
+        // SAFETY: CPL 0; `bank` is one of the banks MCG_CAP says exist.
+        let bank_status = unsafe { rdmsr(MC0_STATUS + 4 * bank) };
+        *valid = bank_status & MC_VAL != 0;
+        if *valid && bank_status & (MC_UC | MC_PCC) != 0 && bad_bank.is_none() {
+            bad_bank = Some((u64::from(bank), bank_status));
+        }
+    }
+    if bad_bank.is_some() || status & (MCG_RIPV | MCG_MCIP) != MCG_RIPV | MCG_MCIP {
+        return Err(FatalMachineCheck {
+            status,
+            bank: bad_bank,
+        });
+    }
+    for (bank, valid) in (0..banks).zip(valid.iter()) {
+        if *valid {
+            // SAFETY: CPL 0; a bank MCG_CAP says exists. Zero clears its record.
+            unsafe { wrmsr(MC0_STATUS + 4 * bank, 0) };
+        }
+    }
+    // SAFETY: CPL 0; clearing MCIP is what the handler of a machine check must do before it
+    // resumes, and only affects how the next machine check is delivered.
+    unsafe { wrmsr(MCG_STATUS, status & !MCG_MCIP) };
+    Ok(())
 }
 
 /// RFLAGS.AC: with SMAP on, the only thing that lets the kernel touch user pages.
@@ -1310,7 +1583,8 @@ pub(crate) fn smep_smap_supported() -> (bool, bool) {
 ///
 /// CPL 0. The kernel must not rely on executing or accessing user pages from supervisor
 /// mode (it has none; a future user-copy path must set RFLAGS.AC around its accesses).
-/// CR0 bits: EM (emulate FPU: must be clear for SSE), MP, TS.
+/// CR0 bits: EM (emulate FPU: must be clear for SSE), MP, TS. NE is set on every processor
+/// for its own sake: see [`CR0_NE`].
 const CR0_EM: u64 = 1 << 2;
 const CR0_MP: u64 = 1 << 1;
 const CR0_TS: u64 = 1 << 3;
@@ -1376,16 +1650,17 @@ pub(crate) unsafe fn enable_simd(id: &framekernel::features::Cpuid) -> u64 {
     use framekernel::features::{Features, wanted_xcr0, xsave_area_size};
     let features = Features::decode(id);
     // CR0: clear EM and TS, set MP, so SSE instructions run and do not fault to an
-    // emulator or a (nonexistent) lazy-FPU handler.
+    // emulator or a (nonexistent) lazy-FPU handler; set NE, so an x87 error raises #MF
+    // (INIT leaves it clear on an AP).
     // SAFETY: the caller's contract; these CR0 bits only configure FPU/SSE behaviour.
     unsafe {
         asm!(
             "mov {t}, cr0",
             "and {t}, {clear}",
-            "or {t}, {mp}",
+            "or {t}, {set}",
             "mov cr0, {t}",
             clear = in(reg) !(CR0_EM | CR0_TS),
-            mp = in(reg) CR0_MP,
+            set = in(reg) CR0_MP | CR0_NE,
             t = out(reg) _,
             options(nomem, nostack, preserves_flags),
         );
@@ -1555,6 +1830,10 @@ extern "sysv64" fn probe_recover() {
 /// A program controls its own GS, so nothing here trusts GS until the swap, and `dispatch`
 /// reads no CPU-local data for an NMI: an NMI that lands in the two instructions around
 /// `swapgs` on the way in or out finds user mode's GS base, but CS says ring 0.
+///
+/// `lfence` on both paths: otherwise a mispredicted branch could run the GS-relative loads
+/// below with the wrong GS base, the kernel's data reachable through a program's
+/// (CVE-2019-1125). The join point has one `lfence`, so both paths reach it.
 #[unsafe(naked)]
 extern "sysv64" fn exception_common() {
     naked_asm!(
@@ -1562,6 +1841,7 @@ extern "sysv64" fn exception_common() {
         "jz 2f",
         "swapgs",
         "2:",
+        "lfence",
         "jmp {saved}",
         saved = sym exception_saved,
     );
