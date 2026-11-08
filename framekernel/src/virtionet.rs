@@ -525,16 +525,17 @@ impl RxRing {
     }
 
     /// Hands the previous frame's buffer back to the device, then sleeps until the next
-    /// received frame and returns its Ethernet bytes (the virtio-net header stripped). The
-    /// slice is valid until the next `recv` (the borrow of `self` enforces it). An empty
-    /// slice means a malformed completion the caller should skip.
+    /// received frame and returns its Ethernet bytes (the virtio-net header stripped), or
+    /// `None` if none arrives by `deadline` (monotonic nanoseconds). The slice is valid until
+    /// the next `recv` (the borrow of `self` enforces it). An empty slice means a malformed
+    /// completion the caller should skip.
     ///
-    /// The running kernel thread blocks on [`NET_WAIT`] and only the NIC's used-buffer
-    /// interrupt (`on_interrupt`) wakes it: there is no deadline, so without the interrupt it
-    /// never runs again (the boot flow's bounded wait for the thread is what notices). The
-    /// condition reads the used ring itself, so a frame that arrived before the thread
-    /// registered is seen at once and no wake-up is lost.
-    fn recv(&mut self) -> &[u8] {
+    /// The running kernel thread blocks on [`NET_WAIT`]; the NIC's used-buffer interrupt
+    /// (`on_interrupt`) wakes it as a frame arrives, and the deadline is only a backstop for
+    /// a frame that never comes (a timer wake-up, within one 10 ms tick of it). The condition
+    /// reads the used ring itself, so a frame that arrived before the thread registered is
+    /// seen at once and no wake-up is lost.
+    fn recv(&mut self, deadline: u64) -> Option<&[u8]> {
         if let Some(id) = self.held.take() {
             // Its descriptor still describes the same page, so publishing the id is enough.
             if let Some(posted) = self.posted.get_mut(usize::from(id)) {
@@ -549,7 +550,9 @@ impl RxRing {
             self.recycled += 1;
         }
         let (used, last) = (self.q.used, self.last_used);
-        let blocked = NET_WAIT.wait_until(|| r16(used + 2) != last);
+        let blocked = NET_WAIT
+            .wait_until_deadline(|| r16(used + 2) != last, deadline)
+            .ok()?;
         RX_BLOCKED.fetch_add(blocked, Ordering::Relaxed);
         fence(Ordering::SeqCst);
         let slot = usize::from(self.last_used) % self.q.size;
@@ -559,17 +562,17 @@ impl RxRing {
         self.received += 1;
         let (i, len) = (id as usize, len as usize);
         let (Some(posted), Some(&virt)) = (self.posted.get_mut(i), self.pages.get(i)) else {
-            return &[]; // an id we never posted: nothing to read or recycle
+            return Some(&[]); // an id we never posted: nothing to read or recycle
         };
         if !*posted {
-            return &[]; // a buffer the device already returned: refuse it
+            return Some(&[]); // a buffer the device already returned: refuse it
         }
         *posted = false;
         self.held = Some(id as u16);
         if !(virtio::NET_HDR_LEN..=RX_BUF).contains(&len) {
-            return &[];
+            return Some(&[]);
         }
-        &page(virt, RX_BUF)[virtio::NET_HDR_LEN..len]
+        Some(&page(virt, RX_BUF)[virtio::NET_HDR_LEN..len])
     }
 }
 
@@ -658,8 +661,12 @@ fn send_arp(our_mac: Mac, sender_ip: Ipv4, target_ip: Ipv4, kick: bool) -> bool 
 /// Sleeps for received frames until [`GATEWAY`]'s ARP reply arrives (at most four frames),
 /// returning the gateway's MAC.
 fn await_arp_reply(rx: &mut RxRing) -> Option<Mac> {
+    let deadline = reply_deadline();
     for _ in 0..4 {
-        let eth = rx.recv();
+        let Some(eth) = rx.recv(deadline) else {
+            timed_out(waiting::ARP, 0);
+            return None;
+        };
         if let Some(parsed) = EthFrame::parse(eth)
             && parsed.ethertype == ethertype::ARP
             && let Some(arp) = Arp::parse(parsed.payload)
@@ -729,8 +736,12 @@ fn send_ping(our_mac: Mac, dst_mac: Mac, src: Ipv4, dst: Ipv4, sequence: u16) ->
 /// and the request's data, with valid IPv4 and ICMP checksums.
 fn await_echo_reply(rx: &mut RxRing, from: Ipv4, to: Ipv4, sequence: u16) -> bool {
     let data = ping_data(sequence);
+    let deadline = reply_deadline();
     for _ in 0..4 {
-        let eth = rx.recv();
+        let Some(eth) = rx.recv(deadline) else {
+            timed_out(waiting::ECHO, u64::from(sequence));
+            return false;
+        };
         if let Some(frame) = EthFrame::parse(eth)
             && frame.ethertype == ethertype::IPV4
             && let Some(packet) = net::Ipv4Packet::parse(frame.payload)
@@ -755,15 +766,18 @@ fn await_echo_reply(rx: &mut RxRing, from: Ipv4, to: Ipv4, sequence: u16) -> boo
 fn ping_gateway(rx: &mut RxRing, our_mac: Mac, gateway_mac: Mac, ours: Ipv4) {
     for sequence in 1..=PINGS {
         let start = crate::cpu::rdtsc();
-        if send_ping(our_mac, gateway_mac, ours, GATEWAY, sequence)
-            && await_echo_reply(rx, GATEWAY, ours, sequence)
+        if !(send_ping(our_mac, gateway_mac, ours, GATEWAY, sequence)
+            && await_echo_reply(rx, GATEWAY, ours, sequence))
         {
-            let rtt = crate::cpu::rdtsc().wrapping_sub(start);
-            PING_REPLIES.fetch_add(1, Ordering::Relaxed);
-            PING_MIN.fetch_min(rtt, Ordering::Relaxed);
-            PING_MAX.fetch_max(rtt, Ordering::Relaxed);
-            PING_TOTAL.fetch_add(rtt, Ordering::Relaxed);
+            // No reply (the wait timed out, or nothing matched): stop pinging a gateway that
+            // is not answering, and let the datapath go on.
+            break;
         }
+        let rtt = crate::cpu::rdtsc().wrapping_sub(start);
+        PING_REPLIES.fetch_add(1, Ordering::Relaxed);
+        PING_MIN.fetch_min(rtt, Ordering::Relaxed);
+        PING_MAX.fetch_max(rtt, Ordering::Relaxed);
+        PING_TOTAL.fetch_add(rtt, Ordering::Relaxed);
     }
 }
 
@@ -787,6 +801,58 @@ static RX_FRAMES: AtomicU64 = AtomicU64::new(0);
 static RX_RECYCLED: AtomicU64 = AtomicU64::new(0);
 /// The file the TFTP fetch completed, handed to the boot flow, which unpacks it.
 static FETCHED: SpinLock<Option<alloc::vec::Vec<u8>>> = SpinLock::new(None);
+
+/// How long the receive thread waits for each expected reply before giving up on it. A
+/// reply normally takes well under a millisecond (QEMU TCG), so this only ends a wait for
+/// a reply that is not coming — quickly, and saying which.
+const REPLY_TIMEOUT_NS: u64 = 2_000_000_000;
+
+/// What the receive thread was waiting for when a wait timed out: the step in the high half,
+/// a detail (an echo sequence, a TFTP block) in the low half; 0 when none did. The first
+/// timeout wins.
+static TIMED_OUT: AtomicU64 = AtomicU64::new(0);
+
+/// The steps whose replies the receive thread waits for.
+mod waiting {
+    pub(super) const ARP: u64 = 1;
+    pub(super) const DHCP: u64 = 2;
+    pub(super) const ECHO: u64 = 3;
+    pub(super) const TFTP: u64 = 4;
+}
+
+/// The deadline for a reply awaited from now.
+fn reply_deadline() -> u64 {
+    crate::time::monotonic_nanos().saturating_add(REPLY_TIMEOUT_NS)
+}
+
+/// Records that the wait for `step` (with `detail`) timed out, unless an earlier one did.
+fn timed_out(step: u64, detail: u64) {
+    let _ = TIMED_OUT.compare_exchange(
+        0,
+        (step << 32) | (detail & 0xFFFF_FFFF),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+}
+
+/// The note a report line carries when the wait for `step` timed out (else empty).
+fn timeout_note(step: u64) -> alloc::string::String {
+    let t = TIMED_OUT.load(Ordering::Relaxed);
+    if t >> 32 != step {
+        return alloc::string::String::new();
+    }
+    let detail = t & 0xFFFF_FFFF;
+    let what = match step {
+        waiting::ARP => alloc::string::String::from("the gateway's ARP reply"),
+        waiting::DHCP => alloc::string::String::from("a DHCP reply"),
+        waiting::ECHO => alloc::format!("the reply to echo request {detail}"),
+        _ => alloc::format!("TFTP block {detail}"),
+    };
+    alloc::format!(
+        "; timed out after {} ms waiting for {what}",
+        REPLY_TIMEOUT_NS / 1_000_000
+    )
+}
 
 /// Transmits a UDP datagram from `src`:`sport` to `dst`:`dport` (with its checksum), unicast
 /// to `dst_mac`.
@@ -823,9 +889,14 @@ fn await_udp(
     (from, to, port): (Ipv4, Ipv4, u16),
     tries: usize,
     out: &mut [u8],
+    (step, detail): (u64, u64),
 ) -> Option<(u16, usize)> {
+    let deadline = reply_deadline();
     for _ in 0..tries {
-        let eth = rx.recv();
+        let Some(eth) = rx.recv(deadline) else {
+            timed_out(step, detail);
+            return None;
+        };
         if let Some(frame) = EthFrame::parse(eth)
             && frame.ethertype == ethertype::IPV4
             && let Some(packet) = net::Ipv4Packet::parse(frame.payload)
@@ -870,8 +941,14 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
     let mut packet = [0u8; 4 + tftp::BLOCK];
     // One frame per block, plus room for strays.
     for _ in 0..TFTP_LIMIT / tftp::BLOCK + 8 {
-        let Some((port, len)) = await_udp(rx, (GATEWAY, ours, TFTP_CLIENT_PORT), 4, &mut packet)
-        else {
+        let awaited = (waiting::TFTP, u64::from(download.blocks()) + 1);
+        let Some((port, len)) = await_udp(
+            rx,
+            (GATEWAY, ours, TFTP_CLIENT_PORT),
+            4,
+            &mut packet,
+            awaited,
+        ) else {
             break;
         };
         // The transfer continues with the port the server first answered from (its TID).
@@ -911,8 +988,12 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
 fn dhcp_lease(rx: &mut RxRing, our_mac: Mac) -> Option<Ipv4> {
     let mut client = framekernel::dhcp::Client::new(our_mac.0);
     transmit_dhcp(our_mac, &client.start(0x4F52_4947));
+    let deadline = reply_deadline();
     for _ in 0..8 {
-        let eth = rx.recv();
+        let Some(eth) = rx.recv(deadline) else {
+            timed_out(waiting::DHCP, 0);
+            return None;
+        };
         let Some(message) = dhcp_payload(eth) else {
             continue;
         };
@@ -1150,10 +1231,15 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         && irqs > 0
         && on == u64::from(target);
     let g = gateway.to_be_bytes();
+    let rx_note = alloc::format!(
+        "{}{}",
+        timeout_note(waiting::ARP),
+        timeout_note(waiting::DHCP)
+    );
     let ip = (lease as u32).to_be_bytes();
     let _ = writeln!(
         com1,
-        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; DHCP lease {}.{}.{}.{}; receive thread on CPU {target}: slept {blocked}, woken by the NIC's interrupt {wakes} (of {irqs} MSI-X interrupts, {last}); consistent {}{}",
+        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; DHCP lease {}.{}.{}.{}; receive thread on CPU {target}: slept {blocked}, woken by the NIC's interrupt {wakes} (of {irqs} MSI-X interrupts, {last}){rx_note}; consistent {}{}",
         mac[0],
         mac[1],
         mac[2],
@@ -1219,10 +1305,11 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         ),
         None => (0, 0, 0),
     };
+    let ping_note = timeout_note(waiting::ECHO);
     let ping_ok = finished && gateway != 0 && lease & (1 << 32) != 0 && replies == u64::from(PINGS);
     let _ = writeln!(
         com1,
-        "origin-kernel: virtio-net ping: {}.{}.{}.{} -> 10.0.2.2 ({:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}): {replies} of {PINGS} echo replies (identifier, sequence and data matched); round trip min/avg/max {min}/{avg}/{max} us; consistent {}{}",
+        "origin-kernel: virtio-net ping: {}.{}.{}.{} -> 10.0.2.2 ({:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}): {replies} of {PINGS} echo replies (identifier, sequence and data matched); round trip min/avg/max {min}/{avg}/{max} us{ping_note}; consistent {}{}",
         ip[0],
         ip[1],
         ip[2],
@@ -1253,6 +1340,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         && bytes == crate::INITRAMFS_IMAGE.len() as u64
         && frames > N_RX as u64
         && recycled > 0;
+    let tftp_note = timeout_note(waiting::TFTP);
     let outcome = if identical {
         alloc::string::String::from("identical to the embedded image")
     } else if server_error != 0 {
@@ -1264,7 +1352,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     };
     let _ = writeln!(
         com1,
-        "origin-kernel: virtio-net TFTP: {TFTP_FILE} from 10.0.2.2: {bytes} bytes in {blocks} blocks{}, {outcome}; the receive ring's {N_RX} buffers carried {frames} frames ({recycled} recycled); consistent {}{}",
+        "origin-kernel: virtio-net TFTP: {TFTP_FILE} from 10.0.2.2: {bytes} bytes in {blocks} blocks{}, {outcome}; the receive ring's {N_RX} buffers carried {frames} frames ({recycled} recycled){tftp_note}; consistent {}{}",
         if complete && bytes.is_multiple_of(framekernel::tftp::BLOCK as u64) {
             " (the last empty)"
         } else {
