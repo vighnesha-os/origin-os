@@ -387,7 +387,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   Whether sizing turns decoding off is invisible in QEMU; a host test checks it on a device model that records any probe made while decoding is on.
 - **A mistake in the boot test, caught by the matrix:** the PCIe markers were first listed before the scheduler's last line, which the boot prints earlier, so every boot would have failed. The controls had failed on their own failure strings, so they did not show it. The markers now follow the boot order. Lesson: run the good path after adding markers, before running controls.
 - **Test evidence:** 4 `pci` tests and 1 more `origin-paging` test; 83 library tests in all; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
-- **Not done:** bridges' bus numbers and hot-plug, MSI/MSI-X, PCIe capabilities, AER, an IOMMU (no DMA confinement yet), and segments other than 0.
+- **Not done:** bridges' bus numbers and hot-plug, MSI/MSI-X, PCIe capabilities, AER, an IOMMU (no DMA confinement yet; done 2026-11-08, see "Intel VT-d DMA and interrupt remapping"), and segments other than 0.
 
 ### NVMe driver (M5; CLAUDE.md §33; 2026-11-07)
 
@@ -410,7 +410,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - Bus mastering really off → "a command timed out". The driver reports the timeout; it does not hang.
   - A first version of that control only left out the bus-mastering bit. OVMF had already set it, so the control passed and proved nothing; it was redone so that it clears the bit.
 - **Test evidence:** 7 `nvme` tests (91 library tests in all) and 3 xtask `disk` tests (CRC-32 check value, GUID byte order, a self-consistent GPT); `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
-- **Not done:** MSI-X interrupts, several I/O queues (one per CPU), PRP lists for transfers over 8 KiB, controller-reset recovery, power states, health logs (SMART), an IOMMU, and a block layer above the driver.
+- **Not done:** MSI-X interrupts, several I/O queues (one per CPU), PRP lists for transfers over 8 KiB, controller-reset recovery, power states, health logs (SMART), an IOMMU (done 2026-11-08, see "Intel VT-d DMA and interrupt remapping"), and a block layer above the driver.
 
 ### GUID Partition Tables (CLAUDE.md §39; UEFI 2.11 §5.3; 2026-11-07)
 
@@ -461,7 +461,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Negative control:** vector 1 left masked → no interrupt arrives, and the first wait times out → "0 reads … none arrived … NVMe failed".
 - **Process note:** the MSI-X markers were first placed before the GPT markers, which the boot prints earlier. This time the good-path run made before the controls caught it, as the lesson from the PCIe step requires.
 - **Test evidence:** 1 more `pci` test (capability walk, loops, header pointers, bad BIRs, messages) and 1 more `nvme` assertion; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
-- **Not done:** per-CPU queues with a vector each, interrupt remapping (x2APIC IDs above 255), MSI (non-X) devices, and moving the admin queue to interrupts.
+- **Not done:** per-CPU queues with a vector each, interrupt remapping (x2APIC IDs above 255; done 2026-11-08, see "Intel VT-d DMA and interrupt remapping"), MSI (non-X) devices, and moving the admin queue to interrupts.
 
 ### Per-CPU NVMe queues and concurrent I/O (CLAUDE.md §33 multiqueue, §66 per-CPU queues; 2026-11-07)
 
@@ -972,6 +972,119 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Negative control:** a single attempt with the same injected loss fails `cargo xtask boot-test` (exit 1): `DHCP lease 0.0.0.0 (0 retransmitted …); … timed out after 1 attempts of 500 ms waiting for a DHCP reply; consistent false` — without the retransmission there is no lease. Restored, it passes.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. From RFC 2131 §4.1 (retransmission) and RFC 768.
 - **Not done:** the backoff and the `secs` field RFC 2131 describes; renewal (T1/T2). **QEMU-only (§74).**
+- **Licensing:** project licence not chosen yet.
+
+### The ACPI DMAR and VT-d encodings (`dmar`, `vtd`; library; CLAUDE.md §16, §32, §72; 2026-11-08)
+
+- **Why:** the audit against CLAUDE.md's 2026+ target named the IOMMU, with interrupt remapping, as the top missing piece QEMU can test (DMA protection, §32 and §58; MSI to APIC IDs above 255). Research came first (§16): `docs/research/2026-11-08-vt-d-iommu.md`.
+- **What:**
+  - **`dmar`: the ACPI DMA Remapping Reporting table.** One `parse` checks the whole table before any view of it is returned:
+    - the 48-byte header, and a host address width of 32–64 bits;
+    - each remapping structure's header, its type minimum (DRHD 16, RMRR 24, RHSA 20, others 8) and its placement; unknown types are skipped by their length;
+    - DRHD register bases: non-zero, 4 KiB aligned, unique;
+    - at most one INCLUDE_PCI_ALL unit per segment, naming no PCI device;
+    - RMRR ranges on 4 KiB boundaries, never ending before they start;
+    - every device scope: a 6-byte header, inside its structure, and (for the known types) a non-empty, even path of devices 0–31 and functions 0–7.
+
+    The views are units (with register-set size), scopes, RMRR, ATSR, RHSA and ANDD. The iterators also stop on a zero length, so they cannot loop even over unchecked bytes. `Dmar::unit_for` resolves a requester to the unit that translates it: an endpoint scope first, then a bridge sub-hierarchy (the bridge's secondary to subordinate buses), then the segment's INCLUDE_PCI_ALL unit. Multi-step paths follow each bridge's secondary bus through a `BridgeBuses` trait (the kernel reads type 1 headers; tests use a model). `Requester::source_id` gives the 16-bit requester ID.
+  - **`vtd`: pure VT-d encodings.**
+    - register offsets and CAP/ECAP decoding (domain-ID width, SAGAW, MGAW, FRO/NFR, PSI, MAMV, drain, CM, RWBF, ESRTPS/ESIRTPS; C, QI, DT, IR, EIM, PT, SC, IRO, MHMV, SMTS);
+    - the GCMD rule (keep the enables, drop the one-shot status bits, change one field);
+    - legacy root and context entries (translation type 0, AW from 3–5 levels, domain ID);
+    - a second-level page-table walker over an abstract `TableMemory`. It maps 4 KiB pages, creating tables, with non-leaf entries R|W so the leaf decides. It never replaces a live mapping, unmaps returning the page, and translates as hardware would, checking permissions at every level;
+    - IRTEs for remapped interrupts: fixed, physical, edge; a 32-bit x2APIC destination under EIME, else 8-bit; SVT/SQ source checks (requester ID or bus range);
+    - remappable-format MSI messages (the handle in address bits 19:5 and 2, SHV, the sub-handle) and the index hardware derives from a message;
+    - IRTA and IQA;
+    - the 128-bit queued-invalidation descriptors: context (global, domain, device), IOTLB (global, domain, page with address mask, IH and drain), interrupt entry cache (global, index), and wait (status write, fence);
+    - fault-record decoding (F, T, reason, source ID, the page, or the interrupt index for 20h–2Fh) and reason names;
+    - the IOVA window [1 GiB, 2 GiB) and a bump allocator over it.
+- **Specifications:** Intel VT-d Architecture Specification Rev 5.20 (D51397-019, 2026-05-14), chapters 3, 5, 6, 7, 8, 9 and 10. The PDF itself could not be read through the research tools: a 10 MB fetch limit, and saving it is a download needing approval. The encodings are the legacy-mode ones, stable since rev 2.x, and were cross-checked against how QEMU 11.1's device model decodes each field (`hw/i386/intel_iommu.c`, `acpi-build.c`; read, not copied). **Re-check against Rev 5.20 before hardware qualification.**
+- **Test evidence (2026-11-08), 17 host tests:**
+  - `dmar` (5):
+    - the exact table QEMU builds for q35 (one unit at 0xfed90000 listing the I/O APIC on bus 0xff and seven endpoints; I/O APIC source ID 0xff00);
+    - a three-unit platform with every structure type (an endpoint unit, a root-port sub-hierarchy unit, and an INCLUDE_PCI_ALL unit with I/O APIC and HPET scopes; an RMRR for the USB controller; ATSR, RHSA, ANDD, an unknown type), resolving devices on the port's secondary and subordinate buses and falling back to INCLUDE_PCI_ALL;
+    - three-step paths through two bridges, and a path whose middle step is not a bridge (unresolved, so it covers nothing);
+    - every refusal at its offset;
+    - a 12,000-case mutation soak (`crate::testing`, two thirds re-sealed). More than 1,000 tables are accepted per default run, and each keeps every invariant `parse` promises.
+  - `vtd` (12):
+    - CAP/ECAP decoding against the values QEMU builds;
+    - the GCMD rule;
+    - golden root, context, IRTE, message, IRTA/IQA and descriptor encodings, with refusals;
+    - the walker: table sharing and creation, permissions, double maps, out-of-range, misaligned and no-access requests, and table-page exhaustion; plus a 20,000-step model check against a map;
+    - 20,000 random fault registers decode without panicking.
+- **Not done:** scalable-mode structures (PASID tables, first-level entries), large-page mappings, device-TLB descriptors, posted-interrupt IRTEs, the SATC/SIDP structures beyond skipping them, and a Kani proof of the parser (§73).
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the specification. QEMU's device model was read only to learn what it emulates. No operating system's IOMMU code was read or copied (CLAUDE.md §3).
+- **Licensing:** project licence not chosen yet.
+
+### Intel VT-d DMA and interrupt remapping (`iommu`, `dma`; kernel; CLAUDE.md §31, §32, §58; ADR-0007 Proposed; 2026-11-08)
+
+- **What:**
+  - **`iommu` (kernel).** After PCIe enumeration, and before any driver binds, each DMAR unit is brought up:
+    1. its registers are mapped uncached (the DRHD's register-set size) and checked: the fault-recording and IOTLB registers must lie inside them, a 3- or 4-level table depth must be supported, queued invalidation must exist, and the firmware must not have left the unit enabled;
+    2. stale faults are cleared;
+    3. queued invalidation goes on (one page, 256 descriptors);
+    4. an empty legacy root table is set (SRTP), and the context and IOTLB caches are invalidated globally;
+    5. with ECAP.IR and the DMAR's INTR_REMAP flag, a 256-entry interrupt remapping table is set (EIME when ECAP.EIM), its cache invalidated, and IRE turned on. CFI stays clear, and is cleared in its own write if the firmware had set it;
+    6. TE goes on.
+
+    With no context entry present, every device's DMA faults until its driver attaches it. If a unit fails, the units already running are turned off again.
+    - `attach`: one domain per requester ID, with a domain ID from 1, a 4-level table and the IOVA window; the context table is made on demand. The context entry is written high half first, so it turns present last. Under CM, a device-selective context invalidation with domain 0 and a domain IOTLB invalidation follow; otherwise a write-buffer flush where RWBF requires one. A device named by an RMRR is refused (identity maps are not implemented).
+    - `map`: one 4 KiB read/write page at the next IOVA (a page-selective invalidation under CM).
+    - `unmap`: clears the leaf, then queues a page-selective IOTLB invalidation (leaf-only hint, drain reads and writes as CAP allows) and a wait descriptor, and returns only when the unit wrote the wait's status.
+    - `msi_message`: allocates an IRTE (the vector, the 32-bit destination, SVT 1 with the device's source ID), writes it high half first, invalidates its cache entry, and returns a remappable handle with SHV and data 0. Without remapping it falls back to compatibility format, which still refuses APIC IDs above 255.
+    - Faults are read and cleared from the fault-recording registers (`take_faults`); fault events stay masked.
+    - With ECAP.C clear (QEMU), every written structure line is CLFLUSHed and fenced; new table pages are flushed whole.
+    - Every invalidation is a batch of descriptors plus a wait descriptor (status write, fence). It polls the status for at most 100 ms and fails on FSTS.IQE.
+  - **`dma::DeviceDma`.** A driver attaches its device once. Every page it then allocates comes mapped, as `virt` plus `bus`; the bus address is the IOVA, or the physical address without an IOMMU.
+  - **NVMe** (`storage`): attached before its admin queue. Its admin, I/O, per-CPU and data queues, and the block cache's pages, all live in its domain, and its MSI-X entries (vector 1, and one per CPU) go through `msi_message`.
+  - **virtio-net**: accepts `VIRTIO_F_ACCESS_PLATFORM` (bit 33; QEMU refuses FEATURES_OK otherwise) and then attaches. Its rings and RX/TX buffers live in its domain, and its RX and TX MSI-X entries go through IRTEs. A device without the feature is given physical addresses (virtio 1.1 §6).
+  - **xtask**: `-device intel-iommu,intremap=on,eim=on` before the PCI devices, `iommu_platform=on` on virtio-net, markers for every line below, and `": IOMMU failed"` as a failure marker.
+- **Boot proof** (every boot; `boot-matrix` at `-smp` 1, 2 and 4; quoted at 2). Every existing NVMe, GPT, block cache and virtio-net proof passes unchanged through the IOMMU. Then:
+  - `IOMMU: DMAR: host address width 48 bits, interrupt remapping true, x2APIC opt-out false, DMA protection opt-in false; 1 remapping unit(s), 0 reserved memory region(s)`
+  - `IOMMU: unit 0 at 0xfed90000 (segment 0, 4 KiB of registers): 7 PCI scope(s), I/O APIC 0 (source ID 0xff00)`
+  - `IOMMU: unit 0: VT-d 1.0; CAP 0x80d2008c222f0606: 16-bit domain IDs, 4-level tables (48-bit), 1 fault record(s) at 0x220, page-selective invalidation true, drain reads/writes true/true, caching mode false, write-buffer flush false; ECAP 0xf00f5a: queued invalidation true, interrupt remapping true, extended interrupt mode true, coherent walks false`
+  - `… interrupt remapping on (256 entries, 32-bit x2APIC destinations, compatibility format blocked); translation on (GSTS 0xc7000000): every device's DMA faults until its driver attaches it; 0 stale fault(s) cleared`
+  - **Translated DMA:** `the NVMe controller (00:02.0, source ID 0x0010) read LBA 2048 into IOVA 0x40012000, which its domain maps to physical 0x75000 (not the same address): 8 of 8 blocks landed in that physical page`. Under QEMU's 512 MiB nothing is backed at the IOVA, so the data can only have arrived through translation.
+  - **Blocked DMA:** `IOVA 0x40012000 unmapped (IOTLB invalidated page-selectively, reads and writes drained), the same read completed with status type 0 code 0x0, and the page kept its canary true; fault recorded: source ID 0x0010, write at 0x40012000, reason 0x5 (write to a page not mapped writable)`. The command "completes" because QEMU's device model drops the blocked DMA without telling the device, as a posted write on hardware would. The proof is the untouched canary and the fault record.
+  - **Interrupt remapping:** `5 of 5 MSI-X entries (NVMe 3, virtio-net 2) hold only a remappable handle with data 0 whose IRTE holds the vector, the x2APIC destination and the device's source ID; 5 IRTEs in use; APIC ID 300 accepted (its IRTE reads back destination 300), which compatibility format refuses: true`. Every NVMe and virtio-net interrupt the earlier proofs counted arrived at the right vector and CPU, yet these entries' data is 0: as compatibility-format messages they would be vector 0, which the APIC drops. Those interrupts can only have come through the IRTEs.
+  - **Blocked interrupt:** `NVMe MSI-X vector 1 pointed at IRTE 5, left not present: a read on I/O queue 2 completed true, 0 interrupts arrived; fault recorded: source ID 0x0010, interrupt index 5, reason 0x22 (interrupt table entry not present); vector 1 restored`.
+  - **Domains:** `00:02.0 domain 1 (18 pages mapped, 19 ever, 4 table pages); 00:03.0 domain 2 (18 pages mapped, 18 ever, 4 table pages); no other function has a context entry, so its DMA faults; IOVAs from 0x40000000; faults recorded before the proofs: 0`.
+
+  The matrix gives the same results at 1 and 4 CPUs: 4 and 7 MSI-X entries remapped, 15 and 24 NVMe pages. Kernel boots: 13.2 s, 15.4 s and 21.8 s (13.0 s at 2 CPUs before this work).
+- **Negative controls.** Each is a temporary change. With it applied, `cargo xtask boot-test` exited 1; the change was then restored from git (the scripts are in the session's scratchpad; the patches are quoted here):
+  - **C1, unmap without the IOTLB invalidation:** the stale IOTLB entry lets the "blocked" DMA through: `blocked DMA: … the page kept its canary false; fault recorded: none; consistent false: IOMMU failed`. QEMU caches translations, so the proof tests the invalidation path, not only the page table.
+  - **C3, IOVAs handed out but never mapped:** the controller cannot fetch its first admin command: `NVMe: a command timed out: NVMe failed`. The drivers' own DMA really goes through translation.
+  - **C4, virtio-net never attached (no context entry), although it accepted ACCESS_PLATFORM:** its DMA faults, so no frame moves: `virtio-net: … ARP 10.0.2.2 -> 00:00:00:00:00:00; DHCP lease 0.0.0.0 (3 retransmitted …); … (of 0 MSI-X interrupts, none arrived) …: virtio-net failed`. This is default deny.
+  - **C5, IRE never set, while the drivers still program remappable handles:** QEMU passes the handles through unremapped, as vector-0 messages its APIC drops: `NVMe: interrupt-driven: 0 reads … 0 interrupts (none arrived) …: NVMe failed`. Every interrupt depends on the IRTE translation.
+  - **C6, every IRTE checks a source ID one function off its device's:** the source-ID check blocks every NVMe MSI, with the same `0 interrupts (none arrived) …: NVMe failed`. Source validation is enforced.
+  - **C7, the blocked-interrupt probe sent through a present IRTE:** `blocked interrupt: … 1 interrupts arrived; fault recorded: none; … consistent false: IOMMU failed`. The proof notices an interrupt that gets through.
+
+  **A blind spot, measured.** C8, no interrupt-entry-cache invalidation after an IRTE is written, **passes** the boot test: QEMU's TCG path reads the IRTE from memory on every interrupt, so a missing IEC invalidation cannot be detected under QEMU. CFI blocking cannot be shown either, because QEMU passes compatibility-format messages through. The code follows the specification on both points; both need hardware to verify (§74).
+- **QEMU facts worth keeping:**
+  - `eim=auto` is off under TCG;
+  - virtio devices bypass the IOMMU without `iommu_platform=on`;
+  - QEMU collapses repeated faults from one source ID while a record is pending, so clear records before provoking one;
+  - QEMU passes compatibility-format MSIs through even with IR on, so the CFI protection cannot be shown under QEMU;
+  - a vector-0 MSI is silently dropped by QEMU's APIC;
+  - QEMU's DMA bounce path completes a device's command whose DMA the IOMMU blocked.
+- **Unsafe inventory (reviewed by the author, not independently):**
+  - `iommu`: volatile 32/64-bit MMIO to the unit's register set (`Regs`, bounds-checked against the mapped size); volatile access to the kernel's own remapping pages (`Page`, bounds-checked; `Tables`, through the direct map at indexes below 512); `alloc_zeroed` for kept-forever structure pages; `CLFLUSH` on lines of those live pages.
+  - `dma`: `alloc_zeroed`, and `dealloc` of a page no device was given.
+  - `storage`/`virtionet`: volatile reads and writes of MSI-X table entries inside tables already checked against their BARs.
+  Each block has a SAFETY note.
+- **Not done:**
+  - AMD-Vi (a separate step);
+  - scalable mode;
+  - RMRR identity maps (such devices are refused);
+  - taking over a unit the firmware left enabled (pre-boot DMA protection);
+  - I/O APIC entries in remappable format. The I/O APIC proof runs before the IOMMU and is masked afterwards; on hardware, a compatibility-format I/O APIC interrupt is blocked once IR is on;
+  - a fault-event interrupt into `klog`;
+  - freeing IOVAs and table pages;
+  - device-TLBs/ATS;
+  - hot-plug.
+  - **No CPU with an APIC ID above 255 exists in the test configuration.** The kernel indexes per-CPU state by APIC ID with `MAX_CPUS` 64, so delivery to one is shown by the IRTE encoding, not by a live interrupt. Decoupling CPU index from APIC ID is a separate task.
+  - **QEMU-only (§74).**
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the VT-d specification and virtio 1.1 §6.
 - **Licensing:** project licence not chosen yet.
 
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives

@@ -55,7 +55,7 @@
 ## Next, in order
 
 1. **NVMe interrupts:** the PCI capability list, MSI-X, a vector per queue, and completions that wake a wait queue instead of polling; timed waits (deadlines on the monotonic clock).
-2. **IOMMU (§32):** VT-d under QEMU's `intel-iommu`: the DMAR table, DMA remapping for the NVMe controller, and a fault proof.
+2. **IOMMU (§32):** VT-d under QEMU's `intel-iommu` — **done 2026-11-08** (ADR-0007, Proposed): the DMAR table, DMA remapping for NVMe and virtio-net with blocked-DMA and fault proofs, and interrupt remapping (see STATUS and `SOURCE_PROVENANCE.md`). Remaining: AMD-Vi, RMRR identity maps, I/O APIC entries in remappable format, scalable mode.
 3. **Parser hardening (§72):** deterministic mutation runs over every firmware and device parser (ACPI, PCI, NVMe Identify, GPT, RTC), with a seeded generator and no fuzzing crates.
 4. **M3, scheduling proper** (ADR-0003 K7 is the baseline): priorities and a fairness policy (EEVDF to be evaluated, §26), load balancing; pad the per-worker counters.
 5. **M4:** ADR-0005 is accepted; the `origin-abi` crate, handle tables and channel logic exist. Next: the kernel's system-call layer, user copies against the calling process's tables, `wait_one`, the start record, memory objects, the Loader Service and `.ose` loading; PCIDs (ADR-0004 H5).
@@ -72,4 +72,6 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 |---|---|---|
 | — | Downloads: NIST ACVP (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519); the `loom` crate (host-only dev-dependency, §5) | External known-answer validation (§59); concurrency models (§73) |
 | — | A project licence | Every provenance entry |
+| — | ADR-0007 (DMA isolation and interrupt remapping, Proposed): five questions | Accepting the IOMMU design; it is implemented and boot-proven already |
+| — | Download of Intel's VT-d Rev 5.20 PDF (D51397-019, about 10 MB) | Re-checking every VT-d encoding against the text itself before hardware qualification |
 | — | Merge into `main` and push | Sharing the work |

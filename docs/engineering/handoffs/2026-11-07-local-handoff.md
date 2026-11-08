@@ -486,3 +486,90 @@ but nothing is production-grade or tested on 2026+ hardware.** Findings:
 - **Owner decisions needed:** which 2026+ Intel and AMD machines are the declared targets, and
   physical x86 test hardware (the M1 Max host cannot run x86 natively). Before relying on specific
   2026 platform features (e.g. FRED, AVX10, APX), research them per §16 rather than from memory.
+
+### Continued (2026-11-08, ~10:20–11:50 IST): Intel VT-d DMA and interrupt remapping
+
+The audit above put the IOMMU with interrupt remapping first among the missing 2026+ pieces that
+QEMU can test. This stretch built it. Another session started it in its own worktree,
+**branch `claude/interesting-carson-ae7c83`**. That branch began at `main`'s initial commit and
+was fast-forwarded to `540fc2c` (the `m0/toolchain-verification` tip) before any work. Its
+commits are **local and not pushed**; PR #1 is untouched.
+
+| Commit | What |
+|---|---|
+| `6a39520` | research (`docs/research/2026-11-08-vt-d-iommu.md`); `dmar`, the ACPI DMAR parser; `vtd`, the VT-d encodings and second-level walker (17 host tests, a mutation soak) |
+| `38c288e` | the kernel's `iommu` and `dma`; NVMe and virtio-net through their own domains, with MSI-X through IRTEs; xtask's `intel-iommu` and markers; ADR-0007 (Proposed) |
+| (records) | provenance, STATUS, this section |
+
+What every boot now shows (at `-smp` 2; the matrix agrees at 1 and 4, with 4 and 7 MSI-X entries
+remapped):
+
+```
+IOMMU: unit 0 at 0xfed90000 (segment 0, 4 KiB of registers): 7 PCI scope(s), I/O APIC 0 (source ID 0xff00)
+IOMMU: unit 0: … interrupt remapping on (256 entries, 32-bit x2APIC destinations, compatibility format blocked); translation on (GSTS 0xc7000000): every device's DMA faults until its driver attaches it
+IOMMU: translated DMA: the NVMe controller (00:02.0, source ID 0x0010) read LBA 2048 into IOVA 0x40012000, which its domain maps to physical 0x75000 (not the same address): 8 of 8 blocks landed in that physical page; consistent true
+IOMMU: blocked DMA: IOVA 0x40012000 unmapped (IOTLB invalidated page-selectively, reads and writes drained), the same read completed with status type 0 code 0x0, and the page kept its canary true; fault recorded: source ID 0x0010, write at 0x40012000, reason 0x5 (write to a page not mapped writable); consistent true
+IOMMU: interrupt remapping: 5 of 5 MSI-X entries (NVMe 3, virtio-net 2) hold only a remappable handle with data 0 …; APIC ID 300 accepted (its IRTE reads back destination 300), which compatibility format refuses: true; consistent true
+IOMMU: blocked interrupt: NVMe MSI-X vector 1 pointed at IRTE 5, left not present: … 0 interrupts arrived; fault recorded: source ID 0x0010, interrupt index 5, reason 0x22 (interrupt table entry not present); vector 1 restored; consistent true
+```
+
+Negative controls, each failing `cargo xtask boot-test` and then restored from git:
+- **C1**, no IOTLB invalidation on unmap: the canary is overwritten and no fault is recorded.
+- **C3**, IOVAs never mapped: an NVMe admin command times out.
+- **C4**, virtio-net without a context entry: no ARP, no lease.
+- **C5**, IRE off: no NVMe interrupt arrives.
+- **C6**, a wrong source ID in the IRTEs: no NVMe interrupt arrives.
+- **C7**, the probe IRTE left present: 1 interrupt arrives and no fault is recorded.
+
+One probe **passed**, and is recorded as a QEMU blind spot. C8, with no interrupt-entry-cache
+invalidation, boots fine: QEMU reads IRTEs from memory on every interrupt. CFI blocking cannot
+be shown under QEMU either.
+
+**Checkpoint (~11:50 IST):**
+- `cargo xtask check` passes: 542 tests, 0 failures, 6 ignored (the download-gated vectors);
+  301 framekernel host library tests, 17 of them new.
+- `boot-test` and `boot-matrix` (1/2/4) pass on the committed code; the kernel boots in
+  13–22 s.
+- QEMU-only (§74): nothing is qualified on physical hardware.
+
+#### Lessons from this stretch
+
+- **Make translation visible.** IOVAs are never physical addresses, and under QEMU's 512 MiB the
+  IOVA window [1 GiB, 2 GiB) has no RAM behind it. A DMA that skipped translation would land
+  nowhere, so "the data arrived in that physical page" proves translation. With identity mapping,
+  a translation that never happened would look exactly like one that did.
+- **The unmap proof works only because QEMU caches translations.** Its IOTLB keeps a translation
+  until it is invalidated, so control C1 (no invalidation) lets the "blocked" DMA through. The
+  proof therefore really tests the invalidation path.
+- **QEMU's device model does not report a blocked DMA to the device.** The NVMe read to an
+  unmapped IOVA "completes" with status 0, through QEMU's bounce path. A proof of blocking must
+  check memory and the fault record, never the command status. On hardware a blocked posted
+  write is silent to the device too.
+- **QEMU facts:**
+  - `eim=auto` is off under TCG, so set `eim=on`;
+  - virtio devices bypass the IOMMU unless `iommu_platform=on`, and then the driver must accept
+    `VIRTIO_F_ACCESS_PLATFORM`;
+  - repeated faults from one source ID collapse while a record is pending, so clear records
+    first;
+  - compatibility-format MSIs pass through even with IR on (CFI is not enforced);
+  - a vector-0 MSI is silently dropped.
+- **This worktree started on `main`'s initial commit,** not on the code. Check `git log` before
+  building anything in a new worktree.
+
+#### Next, for the following session
+
+- **Interrupts:**
+  - I/O APIC entries in remappable format, with IRTEs for the I/O APIC's source ID 0xff00. This
+    is needed before any I/O APIC interrupt (the keyboard IRQ) is used with IR on: hardware
+    blocks compatibility format.
+  - Decouple the CPU index from the APIC ID (per-CPU arrays are indexed by APIC ID, `MAX_CPUS`
+    64). Then QEMU can boot a CPU with an APIC ID above 255 and prove delivery to it live.
+  - A fault-event interrupt feeding `klog`.
+- **DMA:**
+  - RMRR identity maps (devices that need them are refused today);
+  - AMD-Vi (the IVRS table, device table, command buffer), as the separate step the task planned;
+  - scalable mode, after checking from VT-d Rev 5.20 itself (download approval) whether 2026+
+    platforms keep legacy mode.
+- **The owner:** ADR-0007's five questions; approval to download the VT-d PDF.
+- **The rest of the audit list:** CET shadow stacks (needs KVM on CET hardware or bare metal),
+  hybrid/extended topology, a GOP display fallback, xHCI/USB HID, Secure Boot enforcement.
