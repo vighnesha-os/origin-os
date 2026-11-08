@@ -1018,3 +1018,33 @@ Gates on the final tree:
 
 - **The owner:** ADR-0007's eight questions and ADR-0008's four; errata O1 (the signature statement's `id`: ASCII or NFC tables); Intel's VT-d PDF download; the two AMD manuals' hashes against AMD's copies.
 
+### Continued (2026-11-08, afternoon IST): M4's first slice, real system calls between isolated processes
+
+Branch **`claude/cranky-ramanujan-88d205`**, built on `claude/interesting-carson-ae7c83` at `6a2b29c`. **Nothing is pushed.**
+
+| Commit | What |
+|---|---|
+| `6b1106e` | process objects, the system-call layer, channels and handles through it, `wait_one`, `swapgs`/`clac` at the boundary, the ring-3 boot proofs and their xtask markers |
+| `2147928` | fixes from an independent review (thread start, reaping, developer-call gate, UMIP) |
+| (records) | ADR-0005 Amendment 1 (Proposed), `SOURCE_PROVENANCE.md` ("M4, first slice"), STATUS, TASKS item 5, this section |
+
+Gates on the final tree: `cargo xtask check` (698 tests, 0 failures, 6 ignored), `boot-test`, `boot-matrix` (Intel and AMD at 1, 2, 4 CPUs, in one run) and `boot-x2apic`. Other sessions' boots and load kept this machine busy (load average up to 230): failing attempts of `boot-matrix` and `boot-x2apic`, before the passing runs, failed only on the clock and timer proofs, and an attempt that finished the IPC proofs passed them. 31 negative controls, each failing the boot for its own reason, listed in `SOURCE_PROVENANCE.md`.
+
+#### What to know
+
+- **API changes other work will hit:**
+  - `process::Process` is the real process object now: `new(limits, syscall_origin)`, `map_page`, `write_frame`, `grant`, `start_thread`, `thread_ended`, `reports`, `ending`. The old `destroy`, `map` and `spawn_in`-with-a-trampoline flow are gone.
+  - `cpu::enter_user`, `cpu::copy_from_user`, `cpu::EFAULT`, `cpu::cpu_local_base` and `vm::user_readable` are gone. Copies go through `syscall::copy_in`/`copy_out` (checked against the caller's tables) and `cpu::copy_user`.
+  - `sched::spawn_user` starts a thread in ring 3 from an IRETQ frame; the `int 0x80` gate no longer exists.
+  - `framekernel::channel::Channel::try_new(depth, bytes)` replaces `new` (queues are bounded in messages and bytes, and pre-reserved); `HandleTable::insert` is fallible on allocation; `reserve`, `check_all`, `take_all` are new.
+  - `origin_abi`: `status_name`, `Error::name`, `decode_bool`, `rights::CHANNEL`, `signals::ALL`, `read_sizes`.
+  - xtask: `ipc_markers`, the failure string `: ipc failed`, and changed marker text for the user-mode lines (`EFAULT` became `FAULT`, the two user threads became processes).
+- **Boot proofs are timing-sensitive under host load.** The clock, HPET, PM-timer and timer proofs (not this work) can fail on a machine under heavy load from other boots; a re-run settles it. The session "Make the RTC wait survive a loaded host" is on that.
+- **ADR-0005 Amendment 1 is Proposed**, not accepted: the code implements its recommendations on this branch only (channel-end rights, cancellation, the transfer rules, the `out_sizes` layout, when a process ends, the syscall origin before `origin.core`). The owner decides; each is easy to change before it ships.
+- A boolean system-call argument is `origin_abi::decode_bool`; this slice has none yet, so nothing calls it from the dispatcher.
+- An independent review found, and these commits fixed: a new thread runnable before its state was recorded (dangerous for ring 3, harmless before for kernel threads; `spawn_with` holds the queue lock), no reaping while a processor stays busy (now from every system call; a CPU running only user spins still needs the planned per-CPU reaper), the developer-only calls open to everyone (`Limits::debug_calls`), `sidt` revealing the KASLR slide (UMIP on), `cli`/`sti` not being compiler barriers. Open, recorded in `SOURCE_PROVENANCE.md`: a process's kernel half is a snapshot from creation time, which matters once processes outlive early boot.
+
+#### Next
+
+- **The owner:** ADR-0005 Amendment 1.
+- TASKS item 5: the start record, memory objects, the Loader Service, `.ose` loading; PCIDs.
