@@ -21,6 +21,8 @@ use framekernel::descriptors::{
     self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, MACHINE_CHECK_IST, NMI_IST,
     TSS, TSS_SIZE,
 };
+use framekernel::topology::CpuTopology;
+use origin_sync::SpinLock;
 
 /// Size of the double-fault stack.
 const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
@@ -309,6 +311,26 @@ pub(crate) fn assign(index: CpuIndex, apic_id: u32) {
     if let Some(slot) = APIC_IDS.get(index.0) {
         slot.store(apic_id, Ordering::Release);
     }
+}
+
+/// What each processor read from CPUID about its own topology, by CPU index (CLAUDE.md §24,
+/// §27; ADR-0008 C2). A hybrid part's leaves can differ between logical processors, so each
+/// processor writes its own slot on itself ([`record_topology`]), before it reports online.
+static TOPOLOGY: [SpinLock<Option<CpuTopology>>; MAX_CPUS] =
+    [const { SpinLock::new(None) }; MAX_CPUS];
+
+/// Reads this processor's topology from CPUID and records it under its CPU index. The
+/// boot processor and every AP call this once, on themselves.
+pub(crate) fn record_topology() {
+    let own = CpuTopology::detect(cpuid_subleaf);
+    if let Some(slot) = TOPOLOGY.get(this_cpu().0) {
+        *slot.lock() = Some(own);
+    }
+}
+
+/// What processor `index` recorded about itself, if it has.
+pub(crate) fn topology_of(index: CpuIndex) -> Option<CpuTopology> {
+    *TOPOLOGY.get(index.0)?.lock()
 }
 
 /// One processor's CPU-local area, reached through GS. A cache line each, so processors

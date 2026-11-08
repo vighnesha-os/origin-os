@@ -963,3 +963,31 @@ After the first merge, `check` failed once on formatting: the call to `route_ioa
   recipe), then the keyboard IRQ1 through `iommu::route_ioapic_pin` under both IOMMUs.
 - **The owner:** ADR-0007's eight questions and ADR-0008's four; Intel's VT-d PDF download;
   a check of the AMD specification's hash against AMD's copy.
+
+
+### Continued (2026-11-08, ~13:45 IST): CPU topology from CPUID (dies, modules, core types)
+
+The next gap in the 2026+ hardware audit above: only CPUID leaf 0Bh was read. This branch, **`claude/zealous-lovelace-301ef1`**, was fast-forwarded from `claude/interesting-carson-ae7c83` (`0b9c3e0`) and is **not pushed**.
+
+| Commit | What |
+|---|---|
+| `d1984cd` | the decoder and its host tests, per-CPU records by `CpuIndex`, the boot proof with its xtask markers, the research ledger |
+| (the commit after it) | records: provenance, STATUS, TASKS, ADR-0008's consequence, this section |
+
+What it adds:
+- `framekernel::topology`: `CpuTopology::detect` reads leaves 80000026h, 1Fh and 0Bh (each only below its maximum) into one `Layout`, from thread to package, with core types as raw codes. Pure, host-tested (19 tests).
+- Every processor records itself on itself: `cpu::record_topology`, read back by `cpu::topology_of(CpuIndex)`.
+- `prove_topology` reports the layout, each processor's package, die, module, core and thread, the census of everything the MADT lists, and the checks against the MADT.
+
+What to know:
+- **Leaf 1Fh is not reachable under the default `-cpu max`.** QEMU's TCG vendor there is AMD, and it raises the CPUID maximum to 1Fh only for an Intel model. `boot-x2apic` therefore boots twice: `-cpu max,vendor=GenuineIntel` (leaf 1Fh) and `-cpu max` (leaf 0Bh). The `boot-x2apic` machine also has a new third processor at APIC ID 412 (package 1, die 2, module 3, core 4), so a die/module/core confusion shows.
+- **A CPUID read above the maximum returns the highest basic leaf's data, not zeros** (Intel documents this; QEMU does it). So leaf 80000026h on the Intel-vendor model reads as a valid-looking copy of leaf 1Fh, with a different meaning of the shift. The decoder gates every leaf; a host test reproduces it.
+- **QEMU 11.1 cannot show:** leaf 80000026h, leaf 1Ah and the hybrid flag (no model has them), mixed SMT widths, tiles or die groups. The boot prints `hybrid false` under QEMU, which says nothing about hybrid processors. AMD's leaf and core types are host-tested only (§74). Details: `docs/research/2026-11-08-cpu-topology-leaf-1fh.md`.
+
+Gates on the final tree: `cargo xtask check`: 596 tests, 0 failures, 6 ignored (579 before); `boot-test`; `boot-matrix` (Intel VT-d and AMD-Vi, each at 1, 2 and 4 CPUs); `boot-x2apic` on both CPU models. Negative controls C1–C10 each fail the boot and were restored (`SOURCE_PROVENANCE.md`, "CPU topology from CPUID leaves 1Fh, 0Bh and 80000026h").
+
+#### Next
+
+- §27 proper: use the topology for placement (SMT siblings, shared caches, dies), and hybrid-core *capacity*, which no leaf read here gives (Intel's CPUID.06H feedback interface and ACPI CPPC are the candidates; AMD's efficiency ranking is decoded already).
+- Hardware qualification (§74): a real multi-die, hybrid and AMD machine must confirm leaf 1Fh, 1Ah and 80000026h, including whether the thread field really differs between core types.
+- **The owner:** compare the AMD manual's SHA-256 (in the ledger) with AMD's copy.
