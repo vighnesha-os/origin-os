@@ -1160,6 +1160,73 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the Intel SDM (x2APIC, MSI address format), ACPI 6.6 §5.2.12 and §5.2.16, and VT-d (IRTE destination with EIME).
 - **Licensing:** project licence not chosen yet.
 
+### AP start-up: parking an AP that misses its handshake (`apstart`; `smp`; library + kernel; CLAUDE.md §24, §72; ADR-0008 C7 Proposed; 2026-11-08)
+
+- **Why:** APs start one at a time through one trampoline data page at 0x9000 (stack, entry, start record), which `start_one` rewrote for the next AP as soon as one missed its 200 ms handshake (ADR-0003 K6). An AP that was only slow could then run the trampoline with the next AP's stack and `ApStart`, so two processors shared one kernel stack and one set of tables. `351e630` made such an AP refuse its index and halt, but only after it had run on the shared stack. Control N1 below shows the hazard live on `91688a1`.
+- **Decision (CLAUDE.md §16, §24; ADR-0003 K6):** park the AP with INIT before the page is reused, and settle each start-up once. Per-AP trampoline data was the larger alternative. It was rejected for now: an AP that times out still runs on later, after `start` has removed the trampoline's identity mapping (ADR-0004 H1), where it faults with no IDT (a triple fault). So it must be stopped anyway, and INIT is the protocol's own way to stop it. Per-AP data stays with parallel start-up (K6's listed alternative), and would also close the residual risk below. K6's design (one at a time, one shared data page, INIT-SIPI-SIPI) is unchanged; ADR-0008 C7 records the failure path.
+- **What:**
+  - **`apstart` (library, safe, host-tested).** `Handshake` is one `AtomicU64` per start-up, settled once by a compare-and-swap from "undecided". The AP calls `answer(apic_id)` or `refuse(NoX2Apic | NotMine)`, and the boot processor calls `abandon()` at its deadline. Whichever comes first wins. `answer` returns false once the boot processor has given up, and `abandon` returns the AP's answer if it came first. Answers are encoded as the x2APIC ID + 1 (at most 2^32); the other outcomes are above 2^32, so no ID can be mistaken for one.
+  - **`smp`.**
+    - `wake` is the INIT, 10 ms, SIPI, 200 µs, SIPI, 200 ms protocol, shared by the start-up and the drill (`unsafe fn`: the trampoline must be ready).
+    - `park` (`unsafe fn`: the AP must not be online) sends INIT (level assert, `0x4500`) and waits 10 ms. The AP is left in wait-for-SIPI.
+    - `start_one` settles the handshake with `abandon()` after `wake`. Any outcome other than its own answer (a missed handshake, a refusal, a different ID) parks the AP before returning: `CPU n (APIC ID m): no answer within 200 ms; parked by INIT: AP start-up failed`. The next AP then starts as usual.
+    - `ap_entry` answers through the handshake and joins the scheduler only if its answer settled the start-up. Otherwise it halts with interrupts off until it is parked.
+    - **The park drill.** Before the first start-up, the first AP is started into `ap_drill`, a loop that only counts, on a 4 KiB guarded stack of its own. Once its count is seen moving, it is parked. The count must not move in the 1 ms after INIT plus 10 ms. If it does, INIT cannot be relied on, so no AP is started (`parked false … no AP is started: AP start-up failed`). The drill AP then waits in wait-for-SIPI and is started for real like any other. About 22 ms of boot, by construction.
+    - `poke`'s SAFETY note now names the invariant: every AP started before is online (it answered after reading its data) or parked.
+  - **xtask.** With two or more CPUs, the drill's line is required between the MADT line and CPU 1's start-up line, ending `its count moved 0 in 1000 us: parked true`.
+- **Host tests:** 7 `apstart` tests:
+  - an answer in time stands;
+  - after the deadline an answer does not join;
+  - a refusal settles like an answer;
+  - only the first of two answers counts;
+  - every APIC ID round-trips and differs from the other outcomes (edges, and 10 000 random IDs scaled by `ORIGIN_MUTATION_SCALE`);
+  - a word no outcome encodes never reads as an answer;
+  - the race: in 2000 rounds on real threads, the answer and the deadline start together with random jitter. Exactly one side wins each round, both sides agree, and both kinds of winner occur. A barrier start was tried first: it let the AP thread win 1994–2000 of 2000 rounds, so the start was changed to a spin; five runs then split 1041–1056 answered against 944–959 abandoned.
+
+  `cargo xtask check`: 557 tests, 0 failures, 6 ignored (550 before).
+- **Boot proof** (QEMU 11.1.3 TCG):
+  - `boot-test` (2 CPUs, kernel boot 15.3 s): `SMP: park drill: CPU 1 (APIC ID 1) ran a counting loop from the trampoline (count 122 at INIT); 10 ms after INIT, its count moved 0 in 1000 us: parked true`, then `CPU 1 (APIC ID 1) online after 10736 us`.
+  - `boot-matrix`: at 1 CPU there is no AP and no drill (13.4 s). At 2 CPUs, count 146, then CPU 1 online after 10670 us (15.9 s). At 4 CPUs, count 75, then CPUs 1, 2 and 3 online after 10787, 10148 and 10101 us (21.7 s).
+  - `boot-x2apic` (17.3 s): `park drill: CPU 1 (APIC ID 256) … (count 252 at INIT); … moved 0 in 1000 us: parked true`, then `CPU 1 (APIC ID 256) online after 10677 us`. INIT reaches a 32-bit destination, and a parked AP restarts.
+  - Every earlier proof passes unchanged. Kernel boot times are within TCG's run-to-run noise of the previous entry.
+- **Controls.** Each is a temporary change; afterwards `smp.rs` was restored and compared byte for byte. The slow AP of N1, P1 and N3 is a test-only hook (never committed). In the trampoline, before it reads its stack, entry and argument, the processor at APIC ID 2 waits until the boot processor rewrites the argument for another AP, then carries on, counting that at data offset 0x50 and recording the argument it went on with. This is the worst case of a slow AP. The boot uses 4 CPUs, under `cargo xtask run` so the whole log is kept.
+  - **N1, the hazard on the unfixed code** (`91688a1` plus the hook):
+    - `CPU 2 (APIC ID 2): no answer within 200 ms: AP start-up failed`;
+    - `CPU 3 (APIC ID 3): a different processor answered: AP start-up failed`;
+    - `the slow processor (APIC ID 2) read the data page after it was rewritten 1 times, and went on with the start record of CPU 3 (APIC ID 3)`;
+    - `SMP: 2 of 4 enabled processors online`.
+
+    Both processors ran `ap_entry` on CPU 3's stack and tables. Later checks counted them both: `TLB: global pages on 4 of 2 processors … TLB failed` and `PCIe: PAT entry 3 is uncached on only 4 of 2 processors … PCIe failed`.
+  - **P1, the fix with the same hook:**
+    - `CPU 2 (APIC ID 2): no answer within 200 ms; parked by INIT: AP start-up failed`;
+    - `CPU 3 (APIC ID 3) online after 10114 us`;
+    - `the slow processor (APIC ID 2) read the data page after it was rewritten 0 times`;
+    - `SMP: 3 of 4 enabled processors online`.
+
+    The boot then carries on with CPUs 0, 1 and 3 (`TLB: global pages on 3 of 3 processors`, schedulers on CPUs 0, 1 and 3, the TSC consistent across 3 processors). The only failure line is CPU 2's.
+  - **N2, `park` without its INIT** (no hook, 2 CPUs; `boot-test` exits 1): `park drill: CPU 1 (APIC ID 1) ran a counting loop from the trampoline (count 134 at INIT); 10 ms after INIT, its count moved 5189 in 1000 us: parked false; INIT does not stop a running processor, so no AP is started: AP start-up failed`. The proof line can fail.
+  - **N3, the settled handshake without the park** (the fix, minus `park` after a missed handshake, plus the hook): `CPU 3 (APIC ID 3): a different processor answered` and `the slow processor … went on with the start record of CPU 3 (APIC ID 3)`. Settling the handshake keeps a late AP out of the scheduler, but only INIT keeps it off the next AP's data. (The CPU 2 line still reads `parked by INIT`, because the control removed only the call.)
+- **Research:** Intel SDM (version 093, cited by chapter as in `docs/research/2026-11-08-x2apic-above-255.md`):
+  - Vol. 3A, MP initialization: INIT, a 10 ms delay, then start-up IPIs; an AP that takes INIT waits for a SIPI.
+  - Vol. 3A, the ICR: INIT is delivery mode 101b, sent as level assert; processors since the Pentium 4 support no INIT level de-assert.
+  - Vol. 3C, VMX: INIT is blocked in VMX root operation.
+  - SMM: INIT is inhibited on SMM entry and held until the processor leaves SMM.
+
+  The last two were read second-hand, from SDM page mirrors and a comment in EDK2's OVMF; the SDM PDF is still beyond the fetch limit. No operating-system code was read. QEMU's own INIT behaviour was measured, not read: the drill and N2.
+- **Security review:** a processor that misses its handshake can no longer write another AP's GDT, TSS or stack, take its CPU-local area or scheduler, or bring CPU indexes out of step with the processors online. The drill runs kernel code on an AP with interrupts off and no IDT, as the trampoline already did, for about 1 ms.
+- **Unsafe inventory:**
+  - new `unsafe fn wake` and `unsafe fn park`, each with a `# Safety` contract and one `send_ipi` per block;
+  - the existing INIT and SIPI sends moved into them;
+  - `ap_drill` is safe code.
+- **Not done / known limits:**
+  - **Residual risk:** INIT waits while a processor is in SMM. An SMI longer than 10 ms on a timed-out AP could still let it read the rewritten page. Per-AP trampoline data with parallel start-up would close it.
+  - `ap_entry` adds to the PAT and global-page counters before its handshake. An AP parked after reaching them is still counted (seen in N1 and N3). None was in P1, where the AP stalled earlier.
+  - A parked AP is not retried, and `online.complete` stays false, so loader memory is not reclaimed.
+  - The drill covers only the first AP.
+  - **QEMU-only (§74).**
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the Intel SDM (MP initialization, the ICR's INIT and start-up delivery modes).
+- **Licensing:** project licence not chosen yet.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.

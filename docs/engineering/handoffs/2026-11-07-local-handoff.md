@@ -621,3 +621,49 @@ Negative controls, each failing `boot-x2apic` and then restored:
 - **Per-CPU state:** sized at discovery instead of 64 static slots (ADR-0008 C6); CPU hot-plug (MADT "online capable"); CPUID leaf 1Fh topology for §27.
 - **AP start-up, an older hazard noticed here:** an AP that answers only after its 200 ms timeout would run on the trampoline data the boot processor has already rewritten for the next AP (stack, entry, argument). The new identity check makes such an AP refuse and halt, but only after it has run on the shared stack. Send INIT to a silent AP before the page is reused, or give each AP its own trampoline data.
 - **The owner:** ADR-0008's three questions; ADR-0007's five; whether `boot-x2apic` joins `boot-matrix`.
+
+### Continued (2026-11-08, ~12:00–12:30 IST): parking an AP that misses its handshake
+
+The section above listed an older AP start-up hazard under *Next*: an AP that misses its 200 ms handshake may only be slow, and could later run the trampoline with the data the boot processor had already rewritten for the next AP. This stretch fixed it, in another session's worktree: **branch `claude/priceless-cartwright-2c1803`**, fast-forwarded to `claude/eloquent-kapitsa-840594` (`91688a1`) before any work. Its commits are **local and not pushed**.
+
+| Commit | What |
+|---|---|
+| `e430ee5` | `framekernel::apstart` (7 host tests, including the race on real threads); `smp`: `wake`, `park`, the settled handshake in `start_one` and `ap_entry`, and the park drill; xtask: the drill's markers; ADR-0008 C7 (Proposed) |
+| (records) | provenance, STATUS, this section |
+
+**The choice.** INIT-park was chosen over per-AP trampoline data. A timed-out AP must be stopped in any case: otherwise it runs on after the trampoline's identity mapping is gone and triple-faults. INIT is the MP protocol's own way to stop it. Per-AP data stays with parallel start-up, and would also close the residual risk (an SMI longer than 10 ms on a timed-out AP). ADR-0003 K6's design is unchanged; ADR-0008 C7 records the failure path and asks the owner.
+
+On every boot with an AP (here `boot-x2apic`):
+
+```
+SMP: park drill: CPU 1 (APIC ID 256) ran a counting loop from the trampoline (count 252 at INIT); 10 ms after INIT, its count moved 0 in 1000 us: parked true
+CPU 1 (APIC ID 256) online after 10677 us: own GDT, TSS and IDT, x2APIC
+```
+
+The test-only slow AP (APIC ID 2 waits in the trampoline until its data page is rewritten for another AP; 4 CPUs) shows the hazard and the fix:
+
+```
+before (91688a1):
+CPU 2 (APIC ID 2): no answer within 200 ms: AP start-up failed
+CPU 3 (APIC ID 3): a different processor answered: AP start-up failed
+SMP: control S: the slow processor (APIC ID 2) read the data page after it was rewritten 1 times, and went on with the start record of CPU 3 (APIC ID 3)
+after:
+CPU 2 (APIC ID 2): no answer within 200 ms; parked by INIT: AP start-up failed
+CPU 3 (APIC ID 3) online after 10114 us: own GDT, TSS and IDT, x2APIC
+SMP: control S: the slow processor (APIC ID 2) read the data page after it was rewritten 0 times
+```
+
+Controls: N2 (`park` without INIT) fails the drill: `its count moved 5189 in 1000 us: parked false; … no AP is started`. N3 (no park after a missed handshake) brings the hazard back. The hook, the capture script and the logs are in the shared notes folder of this group of sessions, not in the repository.
+
+`cargo xtask check` passes: 557 tests, 0 failures, 6 ignored. So do `boot-test`, `boot-matrix` (1, 2, 4) and `boot-x2apic`.
+
+#### Lessons
+
+- **A race test must show it raced.** The first version released both threads from a `Barrier`, and the AP thread won 1994–2000 of 2000 rounds: the last thread to arrive runs on while the other one is woken. Spinning both threads to the start, with random jitter, split the rounds about 52/48. The test now asserts that both kinds of winner occur.
+- **Make the slow AP wait for an event, not for a time.** It stalls until the boot processor rewrites its argument, the exact moment of the hazard. So the control is deterministic under TCG, whatever the host's load.
+- **`boot-test` stops at the first failure line.** A control whose interesting lines come later needs the whole log. `cargo xtask run`, with the serial output redirected and QEMU stopped by a script, gives that.
+
+#### Next, for the following session
+
+- **AP start-up:** per-AP trampoline data together with parallel start-up (ADR-0003 K6); move the PAT and global-page counts after the handshake, so an AP parked after reaching them is not counted (seen in N1 and N3); optionally retry a parked AP once after the others; and decide whether loader memory may be reclaimed when the only processors not online are parked (`online.complete` stays false today).
+- **The owner:** ADR-0008's four questions (C7 is the fourth).
