@@ -1940,12 +1940,101 @@ fn check() -> Result {
     Ok(())
 }
 
-/// CLAUDE.md §59: `ed25519::sign` must compile with no conditional branch beyond its loop
-/// counters (one for each of its 512-bit reductions: the signer does three). LLVM once turned
-/// the reduction's masks into two data-dependent branches per bit, which `black_box` now
-/// prevents; a toolchain or code change that brought them back would show up here.
+/// CLAUDE.md §59: every Ed25519 function that handles the secret scalar or nonce, as
+/// `(name, end of its symbol, conditional branches)`. Each branch counted is a loop counter or
+/// a test of a public value: none depends on a secret bit. The same on aarch64 and x86-64.
+const ED25519_SIGNING_PATH: &[(&str, &str, usize)] = &[
+    // One loop per 512-bit reduction: the signer does three, inlined.
+    ("ed25519::sign", "7ed255194sign", 3),
+    // Expands the seed and calls `base_multiple`.
+    ("ed25519::public_key", "7ed2551910public_key", 0),
+    // The secret scalar's loop: one counter, for all 256 bits, doubling and adding each one.
+    ("ed25519::base_multiple", "7ed2551913base_multiple", 1),
+    // The inversion, by the public exponent: its loop and the exponent's two zero bits.
+    ("ed25519::Point::compress", "5Point8compress", 3),
+];
+/// The module part of every Ed25519 symbol in the signing crate (v0 mangling).
+const ED25519_SYMBOL: &str = "9onbf_sign7ed25519";
+
+/// Each function in compiler-written `assembly`: its label and the lines up to its
+/// `.cfi_endproc`. A label heads a function only if `.cfi_startproc` comes right after it, so
+/// local and data labels are not mistaken for one.
+fn assembly_functions(assembly: &str) -> Vec<(&str, Vec<&str>)> {
+    let mut functions = Vec::new();
+    let mut lines = assembly.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(label) = line.strip_suffix(':') else {
+            continue;
+        };
+        if lines.peek().map(|l| l.trim()) != Some(".cfi_startproc") {
+            continue;
+        }
+        let body = lines
+            .by_ref()
+            .take_while(|l| l.trim() != ".cfi_endproc")
+            .collect();
+        functions.push((label, body));
+    }
+    functions
+}
+
+/// Whether `line` is a conditional branch instruction on `arch`.
+fn is_conditional_branch(line: &str, arch: &str) -> bool {
+    let word = line.split_whitespace().next().unwrap_or("");
+    match arch {
+        "aarch64" => word.starts_with("b.") || ["cbz", "cbnz", "tbz", "tbnz"].contains(&word),
+        "x86_64" => word.starts_with('j') && !word.starts_with("jmp"),
+        _ => false,
+    }
+}
+
+/// Counts the conditional branches of each function of the Ed25519 signing path in `assembly`
+/// (from `arch`, the host) against [`ED25519_SIGNING_PATH`]. A listed function that is missing
+/// fails, as does a count that differs, and an Ed25519 function outside the list, which would
+/// be code the check never looks at (the reason this check walks the whole path).
+fn check_signing_path(assembly: &str, arch: &str) -> Result<Vec<(&'static str, usize)>> {
+    if !matches!(arch, "aarch64" | "x86_64") {
+        return Err(format!(
+            "§59: the branch check does not know the {arch} instruction set"
+        ));
+    }
+    let functions = assembly_functions(assembly);
+    let mut counted = Vec::new();
+    for &(name, suffix, expected) in ED25519_SIGNING_PATH {
+        let (_, body) = functions
+            .iter()
+            .find(|(label, _)| label.contains(ED25519_SYMBOL) && label.ends_with(suffix))
+            .ok_or_else(|| format!("§59: {name} is not in the assembly"))?;
+        let count = body
+            .iter()
+            .filter(|line| is_conditional_branch(line, arch))
+            .count();
+        if count != expected {
+            return Err(format!(
+                "§59: {name} has {count} conditional branches in its {arch} assembly, expected only its {expected} loop counters and public tests; check for a branch on the secret scalar or nonce"
+            ));
+        }
+        counted.push((name, count));
+    }
+    for (label, _) in &functions {
+        let listed = ED25519_SIGNING_PATH
+            .iter()
+            .any(|&(_, suffix, _)| label.ends_with(suffix));
+        if label.contains(ED25519_SYMBOL) && !listed {
+            return Err(format!(
+                "§59: {label} is an Ed25519 function outside ED25519_SIGNING_PATH: classify it"
+            ));
+        }
+    }
+    Ok(counted)
+}
+
+/// CLAUDE.md §59: the Ed25519 signing path must compile with no conditional branch that
+/// depends on the secret scalar or nonce (see [`ED25519_SIGNING_PATH`]). LLVM once turned the
+/// reduction's masks into two data-dependent branches per bit, which `black_box` now prevents;
+/// a toolchain or code change that brought them back would show up here. ML-DSA has no such
+/// check: its rejection loops branch by design (`onbf-sign`'s side-channel assessment).
 fn signing_has_no_secret_branches() -> Result {
-    const EXPECTED: usize = 3;
     let deps = target_dir().join("release").join("deps");
     run_step(cargo().args([
         "rustc",
@@ -1978,30 +2067,12 @@ fn signing_has_no_secret_branches() -> Result {
         .last()
         .ok_or("the signing crate's assembly was not written")?;
     let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut lines = text.lines();
-    lines
-        .find(|l| l.ends_with(":") && l.contains("9onbf_sign7ed255194sign"))
-        .ok_or("the assembly has no ed25519::sign")?;
-    let conditional = |line: &str| {
-        let word = line.split_whitespace().next().unwrap_or("");
-        word.starts_with("b.")
-            || ["cbz", "cbnz", "tbz", "tbnz"].contains(&word)
-            || (word.starts_with('j') && word != "jmp" && cfg!(target_arch = "x86_64"))
-    };
-    let body: Vec<&str> = lines
-        .take_while(|l| !l.trim_start().starts_with(".cfi_endproc"))
-        .collect();
-    let count = body.iter().filter(|line| conditional(line)).count();
-    if count != EXPECTED {
-        return Err(format!(
-            "§59: ed25519::sign has {count} conditional branches in its {} assembly, expected only its {EXPECTED} loop counters; check for a branch on the secret scalar or nonce",
-            std::env::consts::ARCH
-        ));
+    let arch = std::env::consts::ARCH;
+    for (name, count) in check_signing_path(&text, arch)? {
+        println!(
+            "xtask: §59 branch check: {name} has {count} conditional branches, its loop counters and public tests ({arch})"
+        );
     }
-    println!(
-        "xtask: §59 branch check: ed25519::sign has {count} conditional branches, its loop counters ({})",
-        std::env::consts::ARCH
-    );
     Ok(())
 }
 
@@ -2059,6 +2130,46 @@ const NO_PANIC_ALLOWED_PARTS: &[&str] = &[
     "4core3str8converts9from_utf8",
 ];
 
+/// Freestanding libraries whose object rightly holds no symbols at all: every item in them is
+/// generic, so nothing is compiled until a user instantiates it, and the no-panic check has
+/// nothing of theirs to read. Listed by name so that nothing else can pass having shown nothing.
+const NO_PANIC_NO_SYMBOLS: &[&str] = &["origin-sync"];
+
+/// What `nm` says about `obj` for `flag`. A failing `nm` is an error, not an empty list.
+fn nm_symbols(nm: &Path, obj: &Path, flag: &str) -> Result<Vec<String>> {
+    let out = Command::new(nm)
+        .arg(flag)
+        .arg(obj)
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", nm.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "{} {flag} {} failed ({}): {}",
+            nm.display(),
+            obj.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // Lines are "[address] TYPE name"; the name is the last field.
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().last().map(str::to_string))
+        .collect())
+}
+
+/// Fails if `package`'s object listed no symbols at all: a gate that saw nothing has shown
+/// nothing, unless the library is one of [`NO_PANIC_NO_SYMBOLS`].
+fn require_symbols(package: &str, obj: &Path, symbols: usize) -> Result {
+    if symbols == 0 && !NO_PANIC_NO_SYMBOLS.contains(&package) {
+        return Err(format!(
+            "no-panic check: {} ({package}) has no symbols: nothing was checked",
+            obj.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Builds each freestanding library for the kernel target in release mode, as one object,
 /// and fails if it references any symbol outside the allowlist. A symbol defined by another
 /// freestanding library is allowed, because that library passes this same check.
@@ -2070,24 +2181,22 @@ fn no_panic_check() -> Result {
     for &package in FREESTANDING_LIBS {
         objects.push((package, build_kernel_object(package, &out_dir)?));
     }
-    let symbols = |obj: &Path, flag: &str| -> Result<Vec<String>> {
-        let out = Command::new(&nm)
-            .arg(flag)
-            .arg(obj)
-            .output()
-            .map_err(|e| format!("cannot run {}: {e}", nm.display()))?;
-        // Lines are "[address] TYPE name"; the name is the last field.
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|l| l.split_whitespace().last().map(str::to_string))
-            .collect())
-    };
     let mut defined = std::collections::HashSet::new();
-    for (_, obj) in &objects {
-        defined.extend(symbols(obj, "--defined-only")?);
-    }
+    let mut referenced = Vec::new();
     for (package, obj) in &objects {
-        let undefined = symbols(obj, "-u")?;
+        let own = nm_symbols(&nm, obj, "--defined-only")?;
+        let undefined = nm_symbols(&nm, obj, "-u")?;
+        require_symbols(package, obj, own.len() + undefined.len())?;
+        if own.is_empty() && undefined.is_empty() {
+            println!(
+                "xtask: no-panic check: {package} ({KERNEL_TARGET}, release) is all generic: no symbols of its own to check"
+            );
+            continue;
+        }
+        defined.extend(own);
+        referenced.push((package, undefined));
+    }
+    for (package, undefined) in &referenced {
         let bad: Vec<&String> = undefined
             .iter()
             .filter(|s| {
@@ -3344,6 +3453,128 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
     #[test]
     fn the_approved_list_is_sorted_and_has_no_duplicates() {
         assert!(APPROVED_THIRD_PARTY.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// `body` as an executable shell script in a new directory under `target/xtask/`.
+    fn script(name: &str, body: &str) -> PathBuf {
+        let dir = target_dir().join("xtask").join("gate-tests").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nm");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_failing_nm_is_an_error_not_an_empty_list() {
+        let obj = Path::new("whatever.o");
+        let nm = script("failing-nm", "echo boom >&2\nexit 3");
+        let err = nm_symbols(&nm, obj, "-u").unwrap_err();
+        assert!(err.contains("failed") && err.contains("boom"), "{err}");
+        // A successful run reports its symbols, by the last field of each line.
+        let nm = script("working-nm", "echo '  U memcpy'\necho '0000 T _start'");
+        assert_eq!(
+            nm_symbols(&nm, obj, "-u").unwrap(),
+            ["memcpy".to_string(), "_start".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_symbols_at_all_is_an_error_except_for_generic_only_libraries() {
+        let obj = Path::new("some.o");
+        assert_eq!(require_symbols("onbf-format", obj, 3), Ok(()));
+        let err = require_symbols("onbf-format", obj, 0).unwrap_err();
+        assert!(err.contains("nothing was checked"), "{err}");
+        assert_eq!(require_symbols("origin-sync", obj, 0), Ok(()));
+    }
+
+    /// Function `name` with `branches` branch lines of the given mnemonic and some noise.
+    fn function(label: &str, mnemonic: &str, branches: usize) -> String {
+        let mut text = format!("{label}:\n\t.cfi_startproc\n\tret\n");
+        for i in 0..branches {
+            text += &format!(".LBB0_{i}:\n\t{mnemonic}\t.LBB0_{i}\n");
+        }
+        text += "\t.cfi_endproc\n";
+        text
+    }
+
+    /// The listed functions with their expected branch counts, as the compiler writes them.
+    fn signing_path(arch_mnemonic: &str) -> String {
+        ED25519_SIGNING_PATH
+            .iter()
+            .map(|&(_, suffix, count)| {
+                function(
+                    &format!("_RNvNtCsAB_{ED25519_SYMBOL}{suffix}"),
+                    arch_mnemonic,
+                    count,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_branch_check_counts_each_listed_function_on_both_architectures() {
+        for (arch, mnemonic) in [("aarch64", "b.ne"), ("x86_64", "jne")] {
+            let counted = check_signing_path(&signing_path(mnemonic), arch).unwrap();
+            assert_eq!(counted.len(), ED25519_SIGNING_PATH.len(), "{arch}");
+        }
+        // aarch64's other conditional branches count, and neither `b` nor `jmp` do.
+        assert!(is_conditional_branch("\tcbnz\tx0, .L1", "aarch64"));
+        assert!(is_conditional_branch("\ttbz\tx0, #3, .L1", "aarch64"));
+        assert!(!is_conditional_branch("\tb\t.L1", "aarch64"));
+        assert!(!is_conditional_branch("\tjmp\t.L1", "x86_64"));
+        assert!(!is_conditional_branch("\tjmpq\t*%rax", "x86_64"));
+        assert!(is_conditional_branch("\tjae\t.L1", "x86_64"));
+    }
+
+    #[test]
+    fn the_branch_check_refuses_what_it_cannot_vouch_for() {
+        let good = signing_path("b.ne");
+        // A listed function missing from the assembly.
+        let without_loop = good.replacen("13base_multiple", "13renamed_elsewhere", 1);
+        let err = check_signing_path(&without_loop, "aarch64").unwrap_err();
+        assert!(err.contains("ed25519::base_multiple is not in"), "{err}");
+        // One more branch inside the secret scalar loop.
+        let more = format!(
+            "{}{}",
+            function(
+                &format!("_RNvNtCsAB_{ED25519_SYMBOL}13base_multiple"),
+                "b.ne",
+                2
+            ),
+            good.replacen("13base_multiple", "x", 1)
+        );
+        let err = check_signing_path(&more, "aarch64").unwrap_err();
+        assert!(
+            err.contains("base_multiple has 2 conditional branches"),
+            "{err}"
+        );
+        // A new function in the module that nobody has looked at.
+        let extra = good
+            + &function(
+                &format!("_RNvNtCsAB_{ED25519_SYMBOL}9leak_a_bit"),
+                "b.ne",
+                5,
+            );
+        let err = check_signing_path(&extra, "aarch64").unwrap_err();
+        assert!(err.contains("outside ED25519_SIGNING_PATH"), "{err}");
+        // An architecture it knows nothing about.
+        assert!(check_signing_path(&signing_path("b.ne"), "riscv64").is_err());
+    }
+
+    #[test]
+    fn only_a_label_followed_by_cfi_startproc_is_a_function() {
+        let asm = "\t.globl\tdata\ndata:\n\t.quad\t1\n_foo:\n\t.cfi_startproc\n.LBB0_1:\n\tb.ne\t.LBB0_1\n\tret\n\t.cfi_endproc\n";
+        let functions = assembly_functions(asm);
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].0, "_foo");
+        assert_eq!(functions[0].1.len(), 4, "everything up to .cfi_endproc");
     }
 }
 
