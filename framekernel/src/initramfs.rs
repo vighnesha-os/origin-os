@@ -70,12 +70,14 @@ fn parent(path: &str) -> &str {
 pub fn extract(archive: &[u8], vfs: &mut Vfs) -> Result<usize, Error> {
     let mut applied = 0;
     for entry in ustar::parse(archive)? {
-        let path = match safe_path(&entry.name) {
-            Some(p) => p,
-            // A directory entry named "." / "" is a harmless no-op; a "../…" is an attack.
-            None if entry.name.trim_end_matches('/').is_empty() => continue,
-            None => return Err(Error::UnsafePath),
-        };
+        // The root of the tree itself (`.`, `./`, an empty name): a harmless no-op.
+        if matches!(entry.name.trim_end_matches('/'), "" | ".") {
+            continue;
+        }
+        // `tar -C root -cf image .` names everything `./…`. One leading `./` is only that;
+        // any other `.` or `..` component is still refused below.
+        let name = entry.name.strip_prefix("./").unwrap_or(&entry.name);
+        let path = safe_path(name).ok_or(Error::UnsafePath)?;
 
         if entry.is_dir() {
             vfs.mkdir_all(&path)?;
@@ -187,6 +189,54 @@ mod tests {
         assert!(matches!(extract(&junk, &mut vfs), Err(Error::Archive(_))));
     }
 
+    /// What `tar -C root -cf image .` produces: the root as `./` and everything under `./`.
+    #[test]
+    fn an_archive_of_a_directory_extracts_under_the_root() {
+        let archive = ustar_archive(&[
+            ("./", typeflag::DIRECTORY, b""),
+            ("./etc/", typeflag::DIRECTORY, b""),
+            ("./etc/hostname", typeflag::REGULAR, b"origin\n"),
+            ("./hello.txt", typeflag::REGULAR, b"hi\n"),
+        ]);
+        let mut vfs = Vfs::new(1 << 20, 100);
+        assert_eq!(
+            extract(&archive, &mut vfs),
+            Ok(3),
+            "the `./` root is a no-op"
+        );
+        assert_eq!(read(&vfs, "/etc/hostname"), b"origin\n");
+        assert_eq!(read(&vfs, "/hello.txt"), b"hi\n");
+
+        // A bare `.` is the root too, whichever type flag it carries.
+        let archive = ustar_archive(&[
+            (".", typeflag::DIRECTORY, b""),
+            ("a", typeflag::REGULAR, b"x"),
+        ]);
+        let mut vfs = Vfs::new(1 << 16, 100);
+        assert_eq!(extract(&archive, &mut vfs), Ok(1));
+    }
+
+    /// Only the one leading `./` is forgiven: what follows it is judged like any other name.
+    #[test]
+    fn a_leading_dot_slash_does_not_hide_a_traversal() {
+        for bad in [
+            "./../evil",
+            "./a/../../evil",
+            ".//etc/passwd",
+            "././x",
+            "./a/./b",
+        ] {
+            let archive = ustar_archive(&[(bad, typeflag::REGULAR, b"x")]);
+            let mut vfs = Vfs::new(1 << 16, 100);
+            assert_eq!(
+                extract(&archive, &mut vfs),
+                Err(Error::UnsafePath),
+                "{bad:?} must be refused"
+            );
+            assert_eq!(vfs.node_count(), 1, "{bad:?}: nothing was written");
+        }
+    }
+
     /// Mutated archives extract into a bounded tree or are refused; a name that leaves the
     /// tree is never applied, and the tree that results has only clean paths (CLAUDE.md §72).
     #[test]
@@ -226,12 +276,14 @@ mod tests {
                     extracted += 1;
                     let entries = archive.unwrap();
                     assert!(n <= entries.len(), "case {case}");
-                    // Everything applied has a clean path under the root.
+                    // Everything applied has a clean path under the root, once the one
+                    // leading `./` an archive of a directory carries is taken off.
                     for e in entries.iter().filter(|e| e.is_file() || e.is_dir()) {
                         let name = e.name.trim_end_matches('/');
-                        if name.is_empty() {
+                        if name.is_empty() || name == "." {
                             continue;
                         }
+                        let name = name.strip_prefix("./").unwrap_or(name);
                         assert!(!name.starts_with('/'), "case {case}: {name:?}");
                         assert!(
                             name.split('/')
