@@ -70,6 +70,8 @@ pub enum SectionError {
     PermissionsOnNonSegment,
     /// A SEGMENT without MAPPABLE.
     SegmentNotMappable,
+    /// MAPPABLE on a section that is never mapped: a DWARF section (errata G1).
+    MappableNotAllowed,
     /// A kind not in §4.4, with or without REQUIRED (errata C13).
     UnknownKind(u32),
     /// A known kind that §4.4 does not allow in this profile.

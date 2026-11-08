@@ -121,4 +121,9 @@ fn root_hash(content_size: u64, levels: u8, top: &[u8; HASH_SIZE]) -> [u8; HASH_
 }
 
 #[cfg(test)]
+#[path = "../../format/src/testing.rs"]
+mod testing;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_soak;

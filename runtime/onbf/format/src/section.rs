@@ -244,6 +244,10 @@ impl SectionEntry {
             return Err(SectionError::SegmentNotMappable);
         }
         let mappable = flags.has(Flags::MAPPABLE);
+        // Errata G1: symbol files are never mapped.
+        if k == Kind::Dwarf && mappable {
+            return Err(SectionError::MappableNotAllowed);
+        }
 
         // Kind against profile. Unknown kinds are rejected whether or not REQUIRED is set
         // (errata C13, owner decision; §4.4 permits this, since skipping is only a MAY).
@@ -295,7 +299,9 @@ impl SectionEntry {
         };
         let raw_integrity = integrity as u8;
         let allowed = match integrity {
-            Integrity::MerkleHashBlocks => k == Kind::Merkle,
+            // A MAPPABLE section uses integrity 1 or 3 (errata C8), so hash blocks are never
+            // mapped.
+            Integrity::MerkleHashBlocks => k == Kind::Merkle && !mappable,
             _ if k == Kind::Merkle => false,
             Integrity::CoveredByParent => nested,
             Integrity::Sha256 => !mappable,

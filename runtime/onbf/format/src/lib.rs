@@ -67,8 +67,16 @@ pub use section::{
 };
 
 #[cfg(test)]
+mod testing;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_ocbor;
 #[cfg(test)]
 mod tests_signature;
+#[cfg(test)]
+mod tests_soak_image;
+#[cfg(test)]
+mod tests_soak_ocbor;
+#[cfg(test)]
+mod tests_soak_signature;

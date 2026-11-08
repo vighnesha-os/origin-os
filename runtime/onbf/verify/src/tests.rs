@@ -4,12 +4,12 @@
 use super::*;
 use onbf_format::signature::SignatureBlock;
 
-struct Fixture {
-    digest: [u8; 64],
-    profile: u64,
-    ed: [u8; 32],
-    ml: Vec<u8>,
-    block: Vec<u8>,
+pub(crate) struct Fixture {
+    pub(crate) digest: [u8; 64],
+    pub(crate) profile: u64,
+    pub(crate) ed: [u8; 32],
+    pub(crate) ml: Vec<u8>,
+    pub(crate) block: Vec<u8>,
 }
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -19,7 +19,7 @@ fn unhex(s: &str) -> Vec<u8> {
         .collect()
 }
 
-fn fixture() -> Fixture {
+pub(crate) fn fixture() -> Fixture {
     let text = include_str!("../tests/vectors/kernel-block.txt");
     let field = |name: &str| {
         text.lines()

@@ -1,9 +1,12 @@
 //! The ONBF signature block (ONBF §7.1–§7.2) with the owner's encodings S1–S4
 //! (`docs/spec/ONBF-signature-encoding.md`, decided 2026-11-07).
 //!
-//! Parsing only: the block structure, every field's type and length, and the cross-field
-//! rules (the statement's role equals the entry's; the suite is fixed by the role; the
-//! ML-DSA signature length is fixed by the suite; no entry twice). The cryptographic checks
+//! Parsing only: the block structure, every field's type and length, Appendix A's limits on
+//! the block and the chain, and the cross-field rules (the statement's role equals the
+//! entry's; the suite is fixed by the role; the ML-DSA signature length is fixed by the
+//! suite; no entry twice). A statement's version must be SemVer 2.0 (S3); its `id` is only
+//! checked to be non-empty (S3's NFC rule needs normalization tables: errata O1). The
+//! cryptographic checks
 //! (the content digest, both signatures over [`Statement::bytes`] with the role's context
 //! string, the certificate chain) belong to the verifier, which uses `origin-crypto`.
 //!
@@ -12,6 +15,7 @@
 //! Entry          = le32 entry_size ‖ OCBOR-1 map with exactly keys 1–7
 //! ```
 
+use crate::header::MAX_SIGNATURE_BLOCK;
 use crate::ocbor::{self, Cursor, Item, OcborError};
 
 /// The block's first eight bytes.
@@ -20,6 +24,8 @@ pub const MAGIC: [u8; 8] = *b"ONBFSIG1";
 pub const VERSION: u32 = 1;
 /// Most entries a block may hold.
 pub const MAX_ENTRIES: usize = 8;
+/// Most certificates a chain may hold (Appendix A).
+pub const MAX_CHAIN: u64 = 4;
 
 /// Who signed (S1): integer roles, 0 and unknown values rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,7 +124,7 @@ pub struct Statement<'a> {
     pub content_digest: &'a [u8],
     /// Key 3: the artifact's ID.
     pub id: &'a str,
-    /// Key 4: the artifact's version.
+    /// Key 4: the artifact's version, SemVer 2.0.
     pub version: &'a str,
     /// Key 5: the role, equal to the entry's.
     pub role: Role,
@@ -135,7 +141,8 @@ pub struct Entry<'a> {
     pub suite: Suite,
     /// Key 3: SHA-256 of the signer's canonical public-key encoding, 32 bytes.
     pub key_id: &'a [u8],
-    /// Key 4: the encoded certificate array, leaf first (parsed by the chain verifier).
+    /// Key 4: the encoded certificate array, leaf first, at most [`MAX_CHAIN`] long (parsed by
+    /// the chain verifier).
     pub chain: &'a [u8],
     /// Number of certificates in [`Self::chain`].
     pub chain_len: u64,
@@ -150,6 +157,8 @@ pub struct Entry<'a> {
 /// Why a signature block was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignatureError {
+    /// The block is larger than 1 MiB (Appendix A).
+    TooLarge,
     /// The block does not start with [`MAGIC`].
     Magic,
     /// A version other than [`VERSION`].
@@ -215,6 +224,9 @@ fn le32(b: &[u8], at: usize) -> Option<u32> {
 impl<'a> SignatureBlock<'a> {
     /// Parses a whole signature block.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, SignatureError> {
+        if u64::try_from(bytes.len()).map_or(true, |n| n > MAX_SIGNATURE_BLOCK) {
+            return Err(SignatureError::TooLarge);
+        }
         if bytes.get(..8) != Some(&MAGIC[..]) {
             return Err(SignatureError::Magic);
         }
@@ -267,6 +279,46 @@ impl<'a> SignatureBlock<'a> {
     }
 }
 
+/// A SemVer numeric identifier: `0`, or digits with no leading zero.
+fn is_number(field: &[u8]) -> bool {
+    match field.split_first() {
+        None => false,
+        Some((&b'0', rest)) => rest.is_empty(),
+        Some(_) => field.iter().all(u8::is_ascii_digit),
+    }
+}
+
+/// A SemVer identifier: one or more of `[0-9A-Za-z-]`.
+fn is_identifier(field: &[u8]) -> bool {
+    !field.is_empty()
+        && field
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// True if `version` follows SemVer 2.0.0 (the grammar at semver.org), which S3 requires of
+/// the statement's version. Syntax only: numbers are not converted, so their size is not
+/// limited.
+fn is_semver(version: &str) -> bool {
+    let is_dot = |b: &u8| *b == b'.';
+    let mut parts = version.as_bytes().splitn(2, |&b| b == b'+');
+    let (main, build) = (parts.next().unwrap_or(&[]), parts.next());
+    let mut parts = main.splitn(2, |&b| b == b'-');
+    let (core, pre) = (parts.next().unwrap_or(&[]), parts.next());
+    let mut numbers = core.split(is_dot);
+    let core_ok = (numbers.next().is_some_and(is_number))
+        && (numbers.next().is_some_and(is_number))
+        && (numbers.next().is_some_and(is_number))
+        && numbers.next().is_none();
+    core_ok
+        && pre.is_none_or(|pre| {
+            pre.split(is_dot).all(|id| {
+                is_identifier(id) && (is_number(id) || !id.iter().all(u8::is_ascii_digit))
+            })
+        })
+        && build.is_none_or(|build| build.split(is_dot).all(is_identifier))
+}
+
 /// Reads the next item, which must be the map key `key`.
 fn expect_key(c: &mut Cursor<'_>, key: u64, entry: u8) -> Result<(), SignatureError> {
     match c.next_item() {
@@ -303,7 +355,7 @@ fn parse_entry(body: &[u8], entry: u8) -> Result<Entry<'_>, SignatureError> {
     expect_key(&mut c, 4, entry)?;
     let chain_start = c.position();
     let chain_len = match c.next_item() {
-        Ok(Item::Array(n)) => n,
+        Ok(Item::Array(n)) if n <= MAX_CHAIN => n,
         _ => return Err(field(4)),
     };
     for _ in 0..chain_len {
@@ -376,6 +428,9 @@ fn parse_statement<'a>(
     let id = text(c, 3)?;
     expect_key(c, 4, entry)?;
     let version = text(c, 4)?;
+    if !is_semver(version) {
+        return Err(field(4));
+    }
     expect_key(c, 5, entry)?;
     let role = Role::from_raw(uint(c, 5)?).ok_or(field(5))?;
     expect_key(c, 6, entry)?;

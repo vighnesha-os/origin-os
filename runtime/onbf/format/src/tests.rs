@@ -7,33 +7,33 @@
 
 use crate::*;
 
-const MANIFEST: u32 = 0x0001;
-const STRINGS: u32 = 0x0002;
-const SEGMENT: u32 = 0x0010;
-const IMPORTS: u32 = 0x0012;
-const MERKLE: u32 = 0x00F0;
-const REQ: u32 = Flags::REQUIRED;
-const MAP: u32 = Flags::MAPPABLE;
-const R: u32 = Flags::READ;
-const W: u32 = Flags::WRITE;
-const X: u32 = Flags::EXECUTE;
+pub(crate) const MANIFEST: u32 = 0x0001;
+pub(crate) const STRINGS: u32 = 0x0002;
+pub(crate) const SEGMENT: u32 = 0x0010;
+pub(crate) const IMPORTS: u32 = 0x0012;
+pub(crate) const MERKLE: u32 = 0x00F0;
+pub(crate) const REQ: u32 = Flags::REQUIRED;
+pub(crate) const MAP: u32 = Flags::MAPPABLE;
+pub(crate) const R: u32 = Flags::READ;
+pub(crate) const W: u32 = Flags::WRITE;
+pub(crate) const X: u32 = Flags::EXECUTE;
 
 #[derive(Clone)]
-struct Sec {
-    kind: u32,
-    flags: u32,
-    stored: Vec<u8>,
-    content_size: Option<u64>,
-    mem_offset: u64,
-    mem_size: Option<u64>,
-    compression: u8,
-    integrity: u8,
-    merkle_index: u32,
-    digest: [u8; 32],
+pub(crate) struct Sec {
+    pub(crate) kind: u32,
+    pub(crate) flags: u32,
+    pub(crate) stored: Vec<u8>,
+    pub(crate) content_size: Option<u64>,
+    pub(crate) mem_offset: u64,
+    pub(crate) mem_size: Option<u64>,
+    pub(crate) compression: u8,
+    pub(crate) integrity: u8,
+    pub(crate) merkle_index: u32,
+    pub(crate) digest: [u8; 32],
 }
 
 impl Sec {
-    fn manifest() -> Self {
+    pub(crate) fn manifest() -> Self {
         Self {
             kind: MANIFEST,
             flags: REQ,
@@ -48,7 +48,13 @@ impl Sec {
         }
     }
 
-    fn segment(perms: u32, len: usize, mem_offset: u64, mem_size: u64, merkle_index: u32) -> Self {
+    pub(crate) fn segment(
+        perms: u32,
+        len: usize,
+        mem_offset: u64,
+        mem_size: u64,
+        merkle_index: u32,
+    ) -> Self {
         Self {
             kind: SEGMENT,
             flags: REQ | MAP | perms,
@@ -62,7 +68,7 @@ impl Sec {
         }
     }
 
-    fn merkle(blocks: usize) -> Self {
+    pub(crate) fn merkle(blocks: usize) -> Self {
         Self {
             kind: MERKLE,
             flags: REQ,
@@ -73,7 +79,7 @@ impl Sec {
         }
     }
 
-    fn plain(kind: u32, len: usize) -> Self {
+    pub(crate) fn plain(kind: u32, len: usize) -> Self {
         Self {
             kind,
             flags: REQ,
@@ -84,18 +90,18 @@ impl Sec {
 }
 
 #[derive(Clone)]
-struct Builder {
-    profile: u16,
-    sections: Vec<Sec>,
-    signature: Option<Vec<u8>>,
+pub(crate) struct Builder {
+    pub(crate) profile: u16,
+    pub(crate) sections: Vec<Sec>,
+    pub(crate) signature: Option<Vec<u8>>,
 }
 
-fn align(x: usize, a: usize) -> usize {
+pub(crate) fn align(x: usize, a: usize) -> usize {
     x.div_ceil(a) * a
 }
 
 /// SHA-512 over the three content-digest ranges, in order (§4.5).
-fn sha512(parts: &[&[u8]; 3]) -> [u8; 64] {
+pub(crate) fn sha512(parts: &[&[u8]; 3]) -> [u8; 64] {
     let mut h = origin_crypto::Sha512::new();
     for part in parts {
         h.update(part);
@@ -109,7 +115,7 @@ impl Builder {
     ///
     /// Layout: table ends at 640; manifest 4096..4112; text 8192..13192; MERKLE
     /// 13192..17288; data 20480..20580; signature 20584..20648.
-    fn kernel() -> Self {
+    pub(crate) fn kernel() -> Self {
         Self {
             profile: Profile::Krn as u16,
             sections: vec![
@@ -122,7 +128,7 @@ impl Builder {
         }
     }
 
-    fn minimal(profile: u16) -> Self {
+    pub(crate) fn minimal(profile: u16) -> Self {
         Self {
             profile,
             sections: vec![Sec::manifest()],
@@ -130,12 +136,12 @@ impl Builder {
         }
     }
 
-    fn unsigned(mut self) -> Self {
+    pub(crate) fn unsigned(mut self) -> Self {
         self.signature = None;
         self
     }
 
-    fn build(&self) -> Vec<u8> {
+    pub(crate) fn build(&self) -> Vec<u8> {
         let n = self.sections.len();
         let table_end = 128 + 128 * n;
         let mut pos = align(table_end, 4096);
@@ -185,29 +191,29 @@ impl Builder {
     }
 }
 
-fn entry(i: usize) -> usize {
+pub(crate) fn entry(i: usize) -> usize {
     128 + 128 * i
 }
-fn put16(b: &mut [u8], at: usize, v: u16) {
+pub(crate) fn put16(b: &mut [u8], at: usize, v: u16) {
     b[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }
-fn put32(b: &mut [u8], at: usize, v: u32) {
+pub(crate) fn put32(b: &mut [u8], at: usize, v: u32) {
     b[at..at + 4].copy_from_slice(&v.to_le_bytes());
 }
-fn put64(b: &mut [u8], at: usize, v: u64) {
+pub(crate) fn put64(b: &mut [u8], at: usize, v: u64) {
     b[at..at + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-fn strict() -> ParseOptions {
+pub(crate) fn strict() -> ParseOptions {
     ParseOptions::default()
 }
-fn dev() -> ParseOptions {
+pub(crate) fn dev() -> ParseOptions {
     ParseOptions {
         developer_mode: true,
         ..ParseOptions::default()
     }
 }
-fn nested() -> ParseOptions {
+pub(crate) fn nested() -> ParseOptions {
     ParseOptions {
         nested_in_verified_parent: true,
         ..ParseOptions::default()
@@ -697,6 +703,28 @@ fn section_cases() -> Vec<Case> {
             sec(0, E::IntegrityNotAllowed(2)),
         ),
         (
+            // Found by the multi-fault soak: flipping MAPPABLE alone misaligns this section,
+            // so only a layout that also page-aligns it reaches the rule.
+            "MAPPABLE MERKLE section (errata C8)",
+            built(|b| b.sections[2].flags |= MAP),
+            s,
+            sec(2, E::IntegrityNotAllowed(2)),
+        ),
+        (
+            // Found by the multi-fault soak: needs MAPPABLE and Merkle integrity together.
+            "MAPPABLE DWARF section (errata G1)",
+            {
+                let mut b = Builder::minimal(Profile::Sym as u16);
+                let mut s = Sec::plain(0x00F2, 16);
+                s.flags |= MAP;
+                s.integrity = 1;
+                b.sections.push(s);
+                b.build()
+            },
+            s,
+            sec(1, E::MappableNotAllowed),
+        ),
+        (
             "merkle_index on a SHA-256 section",
             mutated(|i| put32(i, e0 + 52, 2)),
             s,
@@ -1072,12 +1100,12 @@ fn bit_flips_in_header_and_table_are_rejected_outside_free_fields() {
 
 // ------------------------------------------------------------------ the loader's order (ONBF-R1)
 
-fn sha256(bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     origin_crypto::Sha256::digest(bytes)
 }
 
 /// The test kernel image with a real KRN manifest and its true SHA-256 digest.
-fn kernel_with_manifest(doc: Vec<u8>) -> Builder {
+pub(crate) fn kernel_with_manifest(doc: Vec<u8>) -> Builder {
     let mut b = Builder::kernel();
     b.sections[0].digest = sha256(&doc);
     b.sections[0].stored = doc;

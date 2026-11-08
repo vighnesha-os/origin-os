@@ -139,4 +139,9 @@ pub fn verify_entry(
 }
 
 #[cfg(test)]
+#[path = "../../format/src/testing.rs"]
+mod testing;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_soak;
