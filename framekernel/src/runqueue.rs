@@ -40,6 +40,19 @@ pub const STRIDE_ONE: u64 = 1 << 20;
 pub const DEFAULT_WEIGHT: u32 = 8;
 pub const MAX_WEIGHT: u32 = 1024;
 
+/// `part` of `whole`, in parts per thousand (a `whole` of 0 counts as 1).
+pub fn per_mille(part: u64, whole: u64) -> u64 {
+    part.saturating_mul(1000) / whole.max(1)
+}
+
+/// Whether a measured `share` (per mille) is near the share `weight` is due of `total`
+/// weights: within a third of that ideal, plus 15 per mille. This is the bound of the
+/// weighted-share boot proof (`sched::prove_weights`).
+pub fn share_near_weight(share: u64, weight: u32, total: u32) -> bool {
+    let ideal = u64::from(weight) * 1000 / u64::from(total.max(1));
+    share.abs_diff(ideal) <= ideal / 3 + 15
+}
+
 /// Why a request was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueError {
@@ -595,6 +608,21 @@ mod tests {
         assert_eq!(q.weight(c), 1);
         q.set_weight(c, u32::MAX);
         assert_eq!(q.weight(c), MAX_WEIGHT);
+    }
+
+    #[test]
+    fn the_share_bound_is_the_one_the_boot_proof_always_used() {
+        assert_eq!(per_mille(1, 21), 47);
+        assert_eq!(per_mille(4, 21), 190);
+        assert_eq!(per_mille(16, 21), 761);
+        assert_eq!(per_mille(0, 0), 0, "nothing of nothing is nothing");
+        // Ideal 47: 17 to 77 per mille; 190: 112 to 268; 761: 493 to 1029.
+        for (weight, low, high) in [(1, 17, 77), (4, 112, 268), (16, 493, 1029)] {
+            assert!(share_near_weight(low, weight, 21), "{weight}: {low}");
+            assert!(share_near_weight(high, weight, 21), "{weight}: {high}");
+            assert!(!share_near_weight(low - 1, weight, 21), "{weight}: below");
+            assert!(!share_near_weight(high + 1, weight, 21), "{weight}: above");
+        }
     }
 
     #[test]
