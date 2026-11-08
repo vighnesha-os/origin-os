@@ -206,6 +206,12 @@ The owner asked for the design to be finalised with the recommended options, fol
 | `fd944de` | Semantic versioning: parse + precedence (semver.org) |
 | `63ac05c` | String-keyed hash map (FNV-1a open addressing) |
 | `6bb0885` | semver requirement matcher (^, ~, ranges) + prerelease gate |
+| `b19dc37` | Bounded kernel log buffer (§69) |
+| `f0a0972` | virtio split virtqueue ring transport |
+| `4074b18` | virtio device negotiation + virtio-net structures |
+| `c053f4c` | virtio::find_caps (walk the PCI capability list) |
+| `9810c84` | virtio-net kernel driver: bring-up + TX (boot-proven) |
+| `f7cce65` | virtio-net: RX datapath + a **live ARP exchange** over the NIC |
 
 (The 2026-11-08 commits use the Claude Opus 4.8 attribution; the run spanned midnight.)
 
@@ -340,3 +346,26 @@ with a requirement matcher (§46 dependency comparison) and a string-keyed FNV-1
 (§29/§30 name tables). **Final checkpoint (~05:25 IST): 501 workspace tests across 27
 suites, 0 failures; 260 framekernel host library tests across 49 modules; `cargo xtask
 check` passes.** The full run report is `docs/engineering/handoffs/2026-11-08-run-report.md`.
+
+### Continued (2026-11-08, ~05:25–05:45 IST): a live NIC
+
+The headline result of the later run: **the networking stack is live.** Bottom-up, each
+layer host-tested and committed, then the kernel driver boot-proven:
+
+- `klog` — a bounded kernel log ring (§69 groundwork).
+- `virtqueue` — the split-virtqueue ring transport (descriptors, available/used rings),
+  over plain byte buffers so the kernel drives DMA and the tests drive a `Vec<u8>`.
+- `virtio` — device status/feature negotiation, the virtio-net config/header, and
+  `find_caps` (walk the PCI capability list for the modern virtio structures).
+- `virtionet` (kernel) — brings up a modern **virtio-net NIC** (PCI capability discovery,
+  BAR mapping, the feature handshake to `DRIVER_OK`, RX/TX virtqueues on DMA pages), reads
+  the device MAC, and does a **live ARP exchange**: it transmits an ARP who-has for QEMU's
+  gateway and **receives and parses the reply** (`ARP 10.0.2.2 -> 52:55:0a:00:02:02`). Two
+  negative controls (wrong MAC; ARP a nonexistent host) each fail the boot and were
+  restored. This is the whole transmit-and-receive datapath, proven on the emulated device.
+
+**Checkpoint (~05:45 IST): 273 framekernel host library tests across 52 modules; the
+workspace passes `cargo xtask check`, `boot-test` and `boot-matrix` (1/2/4), with the NIC
+bringing up and completing the ARP exchange at every `-smp`.** The reusable DMA/MMIO
+patterns (NVMe's) and the `net` Ethernet/ARP layer made the driver tractable. Next: wire
+the IP/UDP/DHCP stack onto the NIC so the OS obtains a real lease. QEMU-only (§74).

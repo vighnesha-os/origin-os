@@ -13,7 +13,8 @@ This report covers the continuation of the twelve-hour run (from ~02:00 IST 2026
 ## 1. Headline state at the end of the run
 
 - `cargo xtask check` passes: `rustfmt --check`, workspace Clippy with `-D warnings`, the no-panic object scan on the freestanding crates, and the §11 (`cfg(target_os)`) and §62 (manifest `version`) lints.
-- **505 tests across 27 workspace suites, 0 failures** (6 ignored = the download-gated crypto vectors). **264 of them** are `framekernel` host library tests across **50 modules**.
+- **514 tests across 27 workspace suites, 0 failures** (6 ignored = the download-gated crypto vectors). **273 of them** are `framekernel` host library tests across **52 modules**.
+- **The networking stack is live**: a virtio-net NIC driver brings the device up and completes a transmit **and** receive — it ARPs QEMU's gateway and parses the reply — proven at boot on the emulated device.
 - `cargo xtask boot-test` and `cargo xtask boot-matrix` (1, 2 and 4 CPUs) pass; an 8-CPU boot (`ORIGIN_QEMU_SMP=8`) was confirmed. Every kernel feature added this run prints a gated boot marker and has at least one negative control that was shown to fail the boot and then restored.
 - A 40× mutation soak (`ORIGIN_MUTATION_SCALE=40`) over 12 untrusted-input parser suites ran with 0 failures.
 - **Everything runs under QEMU 11.1.3 (TCG) + OVMF only. No physical-hardware qualification (CLAUDE.md §74).**
@@ -50,6 +51,7 @@ Each item was built → host-tested → `cargo xtask check` → committed, with 
 - **routing** (`route`): an IPv4 longest-prefix-match bit trie (oracle-tested against a brute-force scan).
 - **DNS** (`dns`): message parsing with **bounded name decompression** (a decompression bomb is a clean parse failure).
 - **DHCP** (`dhcp`): a client — DISCOVER/REQUEST build, OFFER/ACK/NAK parse, the INIT → SELECTING → REQUESTING → BOUND lease state machine.
+- **A live virtio-net NIC** (boot-proven): the `virtqueue` split-ring transport and the `virtio` device/feature/`find_caps` layer (host-tested), under a kernel `virtionet` driver that brings up the device (PCI capability discovery, BAR mapping, feature handshake, DMA ring setup, `DRIVER_OK`), reads the MAC, and does a **live ARP exchange** — transmits an ARP who-has for QEMU's gateway and receives and parses the reply (`ARP 10.0.2.2 -> 52:55:0a:00:02:02`). Two negative controls (wrong MAC; ARP a nonexistent host). This is the whole transmit-and-receive datapath, running on the emulated device.
 
 ### Data formats & utilities
 - **Base64** (`base64`, RFC 4648, whitespace-tolerant) — RFC vectors.
@@ -71,7 +73,7 @@ Each item was built → host-tested → `cargo xtask check` → committed, with 
 ## 4. Honest limitations
 
 - **QEMU only.** Nothing is qualified on physical hardware (§74). QEMU TCG does not populate some structures (e.g. CPUID leaf 04h caches), which the relevant lines note.
-- **Many new modules are host-tested libraries, not wired into the live kernel yet.** OriginFS, the text/codec stack, routing, DNS, DHCP, the data-format parsers, the containers — all compile for the kernel target and are proven by host tests, but only NUMA, entropy and the initramfs extraction run (and are boot-proven) in the kernel so far. They are the decision/parse layers a driver, syscall or service will call.
+- **Many new modules are host-tested libraries, not wired into the live kernel yet.** OriginFS, the text/codec stack, routing, DNS, DHCP, the data-format parsers, the containers — all compile for the kernel target and are proven by host tests, but only NUMA, entropy, the initramfs extraction and the virtio-net NIC (which uses `virtqueue`/`virtio`/`net`) run (and are boot-proven) in the kernel so far. They are the decision/parse layers a driver, syscall or service will call. The IP/UDP/TCP/DHCP logic is proven in host tests and at the link layer (the NIC does a live ARP exchange), but is not yet wired onto the NIC to obtain a lease and route traffic.
 - **OriginFS (ADR-0006) is Proposed, not Accepted.** The parser is host-only and the kernel does not mount it, pending the owner's approval of the on-disk format (§84).
 - **No compressor, no DRBG, no SipHash.** DEFLATE is decompression-only; the entropy source is true-random, not a reseedable DRBG; the hash map is not collision-flood-resistant. Each is noted where it would matter, with the reason it is deferred (a DRBG and SipHash need their own KATs/review, §59).
 - **Not done / owner-only:** ADR-0005 (the kernel syscall layer) remains untouched; downloading NIST/Wycheproof vectors and `loom`; choosing a project licence; and merging into `main` / pushing.
@@ -80,7 +82,7 @@ Each item was built → host-tested → `cargo xtask check` → committed, with 
 
 1. **Owner decisions:** accept or revise ADR-0006 (OriginFS) so the read path can be mounted; approve the vector/`loom` downloads so the crypto and concurrency tests can be completed; choose a licence.
 2. **Wire the decision layers into the kernel:** NUMA-aware frame allocation and scheduler placement (the `numa` map is the decision layer, §66); the keyboard IRQ → `ring` → `editbuffer` input path; mounting OriginFS beneath `vfs` once accepted.
-3. **Finish the networking path:** a NIC driver and a UDP/TCP socket layer to carry the existing route/DNS/DHCP logic on the wire.
+3. **Finish the networking path:** the virtio-net NIC is live (TX+RX, ARP). Next, make it interrupt-driven (MSI-X) and wire the IP/UDP/DHCP stack onto it, so the OS obtains a DHCP lease and routes traffic.
 4. **Package/runtime:** a dependency resolver over `semver`, and reading real `.osi`/`.oapp` payloads through `ustar` + `deflate`.
 
 ## 6. Where the detail is
