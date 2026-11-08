@@ -10,7 +10,7 @@
 //!   its verified ONBF segment table declares, never writable and executable. The
 //!   `KernelImage` region is not in the direct map, so no writable alias of kernel code
 //!   exists.
-//! - **The firmware framebuffer** (ADR-0010, Proposed), when there is one: uncached, at the
+//! - **The firmware framebuffer** (ADR-0010), when there is one: uncached, at the
 //!   start of the MMIO window ([`FRAMEBUFFER_WINDOW`]), so a console can draw from the
 //!   kernel's first instruction and across the switch to its own tables.
 //! - **Nothing else**: firmware runtime memory, ACPI NVS, other MMIO, reserved and unknown

@@ -1273,7 +1273,7 @@ Each was fetched from the address the portal's own search returned for it (`docs
 - Buying the machines.
 - Whether to push these commits to the PR.
 
-### Continued (2026-11-08, ~20:20–22:20 IST): the early console, for ADR-0009 H6 (ADR-0010; boot info 0.4 accepted)
+### Continued (2026-11-08, ~20:20–22:30 IST): the early console, for ADR-0009 H6 (ADR-0010, accepted)
 
 On branch **`claude/funny-benz-fa7d10`**, local only, not pushed, on top of `claude/interesting-carson-ae7c83` at `f9a948d` (fast-forwarded before any work). The code and these records land in one local commit.
 
@@ -1294,7 +1294,7 @@ Before this, the kernel's only console was a 16550 at the fixed port `0x3F8`, wh
 
 #### What to know
 
-- **Boot info changed (0.3 → 0.4), the ABI decision of §84. The owner accepted it on 2026-11-08** (ADR-0010 E1, sheet item 27).
+- **Boot info changed (0.3 → 0.4), the ABI decision of §84. The owner accepted it and the rest of ADR-0010 on 2026-11-08** (the three questions, sheet items 27–29).
 - The screen check in `boot-test` runs in every cell of `boot-matrix`. `-serial mon:stdio` replaced `-serial stdio -monitor none` for the kernel scenario only.
 - `boot-console` is new and adds eight full boots to `boot-matrix` (about 4 minutes).
 - **On real hardware expect the framebuffer to go dark at `iommu::init`** on a machine whose firmware scans out through the IOMMU, until identity maps (T14) or the T4 changes land: ADR-0010, "What this does not prove". A serial line is still wanted for a first boot (`adopt_firmware_uart` will find it if firmware names it).
@@ -1302,5 +1302,4 @@ Before this, the kernel's only console was a 16550 at the fixed port `0x3F8`, wh
 
 #### Open for the owner
 
-- ADR-0010, sheet items 28 and 29: the framebuffer's mapping window (E2) and the UART policy (E4). Item 27, boot info 0.4, was accepted on 2026-11-08.
 - Whether and when to merge this branch.

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Proposed**, 2026-11-08, except E1. **E1 (boot info 0.4, the §84 ABI decision) was accepted by the owner on 2026-11-08** (decision sheet item 27). E2 and E4 (sheet items 28 and 29) are still the owner's to decide. The code is built and boot-tested on its own local branch; nothing here has been merged or shipped. |
+| Status | **Accepted** by the owner on 2026-11-08, as proposed (E1–E6, and the recommended answer to each of the three questions below; decision sheet items 27–29). It changes the boot-info structure (CLAUDE.md §84). The code is built and boot-tested on its own local branch; nothing here has been merged or shipped. |
 | Requires | CLAUDE.md §13 (checked parsing), §19 (boot-info structure, early diagnostics), §51 (font provenance), §58 (threat-model privileged interfaces), §69 (diagnostics), §74, rules 14, 30 and 40 |
 | Implements | ADR-0009 H6, third bullet: a console that does not depend on a 16550 at `0x3F8` |
 | Code | `boot/info` (`Framebuffer`), `boot/uefi` (the Graphics Output Protocol hand-off), `framekernel/paging` (the mapping), `framekernel/src/{fbconsole,font,spcr,serial,console}.rs`, `developer-tools/xtask` |
@@ -97,8 +97,8 @@ The framebuffer mapping is kernel-only, writable and never executable, in the ke
 - A UART in memory space: QEMU's x86 machines have no memory-mapped 16550, so that path is tested with mocks on the build host only (register stride, access width, RAM overlap at the SPCR level), not on a live device.
 - A really wedged UART. The boot shows the give-up path with a port that answers the status register with 0 (`isa-debugcon` set to read back 0) rather than a device that genuinely stops; the mechanism is the same bounded poll.
 
-## Questions for the owner
+## Questions for the owner (answered 2026-11-08: yes to all three)
 
-1. Accept boot info 0.4 as in E1 (recommended)? This is the §84 decision. **Yes, accepted by the owner on 2026-11-08.**
-2. Accept reserving the first 2 GiB of the MMIO window for the framebuffer (E2)?
-3. Accept the UART policy: COM1 until the ACPI tables can be read, then the SPCR's UART with the earlier output replayed, 0x3F8 only when firmware gives nothing better (E4)?
+1. Accept boot info 0.4 as in E1 (recommended)? This is the §84 decision. **Yes (2026-11-08).**
+2. Accept reserving the first 2 GiB of the MMIO window for the framebuffer (E2)? **Yes (2026-11-08).**
+3. Accept the UART policy: COM1 until the ACPI tables can be read, then the SPCR's UART with the earlier output replayed, 0x3F8 only when firmware gives nothing better (E4)? **Yes (2026-11-08).**

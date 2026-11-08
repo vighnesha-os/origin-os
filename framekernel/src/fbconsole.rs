@@ -1,4 +1,4 @@
-//! A text console on the firmware's linear framebuffer (ADR-0010, Proposed; CLAUDE.md §19,
+//! A text console on the firmware's linear framebuffer (ADR-0010; CLAUDE.md §19,
 //! §69).
 //!
 //! The kernel draws through [`PixelSink`], so the geometry, glyph placement and the handling

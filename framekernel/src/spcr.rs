@@ -1,4 +1,4 @@
-//! The ACPI Serial Port Console Redirection table (ADR-0010, Proposed): where the firmware
+//! The ACPI Serial Port Console Redirection table (ADR-0010): where the firmware
 //! says its serial console is, and how it is set.
 //!
 //! References: Microsoft, "Serial Port Console Redirection Table (SPCR)", revision history

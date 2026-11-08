@@ -1,5 +1,5 @@
 //! The kernel console: a UART and, when the firmware offers one, its framebuffer; shared by
-//! every processor (ADR-0010, Proposed; CLAUDE.md §19, §69).
+//! every processor (ADR-0010; CLAUDE.md §19, §69).
 //!
 //! Output goes to the framebuffer and then the UART, from the first line on. The UART starts
 //! at the PC's COM1 port; [`adopt_firmware_uart`], once the ACPI tables can be read, moves it

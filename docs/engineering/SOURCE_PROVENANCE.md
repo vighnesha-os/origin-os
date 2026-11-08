@@ -457,12 +457,12 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Evidence:** `cargo xtask check` and `boot-matrix` (1, 2 and 4 CPUs) pass; boot to halt takes 4.8, 5.4 and 7.1 s.
 - **Limitation:** interrupts stay off while one line is sent. In QEMU that is microseconds; at 115 200 baud on real hardware it is about 9 ms per 100 bytes. Production logging will go to a memory ring drained by a thread (CLAUDE.md §69).
 
-### The early console: the firmware's framebuffer and a UART from the SPCR (ADR-0010, boot info 0.4 accepted, the rest Proposed; `boot/info`, `boot/uefi`, `paging::layout`, `fbconsole`, `font`, `spcr`, `serial`, `console`; xtask; CLAUDE.md §13, §19, §51, §58, §69; 2026-11-08)
+### The early console: the firmware's framebuffer and a UART from the SPCR (ADR-0010, accepted by the owner; `boot/info`, `boot/uefi`, `paging::layout`, `fbconsole`, `font`, `spcr`, `serial`, `console`; xtask; CLAUDE.md §13, §19, §51, §58, §69; 2026-11-08)
 
 ADR-0009 H6 required a console that does not depend on a 16550 at I/O port `0x3F8`, because neither first machine documents its COM port's address and a failed boot would have shown nothing.
 
 - **Author / date:** Claude Code (local, session `funny-benz-fa7d10`), 2026-11-08. Original code and font, no third-party crates (§3, §5).
-- **ABI:** boot info **0.4** appends `Framebuffer` (48 bytes at offset 128, `size_of::<BootInfo>() == 176`), with pixel format as channel masks. Written as Proposed under §84 and **accepted by the owner on 2026-11-08** (ADR-0010 E1, `docs/engineering/OWNER_DECISIONS.md` item 27); items 28 and 29, the window and the UART policy, are still open.
+- **ABI:** boot info **0.4** appends `Framebuffer` (48 bytes at offset 128, `size_of::<BootInfo>() == 176`), with pixel format as channel masks. Written as Proposed under §84 and **accepted by the owner on 2026-11-08** (ADR-0010 E1, `docs/engineering/OWNER_DECISIONS.md` item 27), together with the mapping window and the UART policy (items 28 and 29).
 - **What:**
   - `origin-boot-info`: `Framebuffer`, `FramebufferError`, `Framebuffer::check` (the contract: both the loader and the kernel run it), `overlaps_ram` (the "is it RAM" question for a device range).
   - `origin-boot-uefi`: `protocols` (GOP structures, `LocateHandle`), `framebuffer::describe` (GOP mode → boot-info framebuffer; RGB, BGR and bit-mask formats become masks), and `find_framebuffer`/`framebuffer_of` in `main.rs`: every Graphics Output handle is examined and the first usable one the firmware uses as a console wins (`EFI_CONSOLE_OUT_DEVICE`), else the first usable one. The mode is never changed. A framebuffer that overlaps RAM or cannot be mapped is dropped, not fatal.
