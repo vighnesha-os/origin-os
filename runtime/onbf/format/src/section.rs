@@ -40,6 +40,10 @@ impl Flags {
     pub const RELRO: u32 = 1 << 5;
     const DEFINED: u32 = 0x3F;
     const PERMISSIONS: u32 = Self::READ | Self::WRITE | Self::EXECUTE | Self::RELRO;
+    const READ_ONLY: u32 = Self::READ;
+    const READ_WRITE: u32 = Self::READ | Self::WRITE;
+    const READ_WRITE_RELRO: u32 = Self::READ_WRITE | Self::RELRO;
+    const READ_EXECUTE: u32 = Self::READ | Self::EXECUTE;
 
     /// True if every bit in `bits` is set.
     pub const fn has(self, bits: u32) -> bool {
@@ -242,6 +246,15 @@ impl SectionEntry {
         }
         if is_segment && !flags.has(Flags::MAPPABLE) {
             return Err(SectionError::SegmentNotMappable);
+        }
+        // §6.1: exactly one of R, RW (optionally RELRO) or RX.
+        if is_segment
+            && !matches!(
+                flags.0 & Flags::PERMISSIONS,
+                Flags::READ_ONLY | Flags::READ_WRITE | Flags::READ_WRITE_RELRO | Flags::READ_EXECUTE
+            )
+        {
+            return Err(SectionError::SegmentPermissions(flags.0 & Flags::PERMISSIONS));
         }
         let mappable = flags.has(Flags::MAPPABLE);
         // Errata G1: symbol files are never mapped.

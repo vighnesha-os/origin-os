@@ -17,6 +17,7 @@ pub(crate) const MAP: u32 = Flags::MAPPABLE;
 pub(crate) const R: u32 = Flags::READ;
 pub(crate) const W: u32 = Flags::WRITE;
 pub(crate) const X: u32 = Flags::EXECUTE;
+pub(crate) const RELRO: u32 = Flags::RELRO;
 
 #[derive(Clone)]
 pub(crate) struct Sec {
@@ -583,6 +584,43 @@ fn section_cases() -> Vec<Case> {
             mutated(|i| put32(i, e1 + 4, R | X)),
             s,
             sec(1, E::SegmentNotMappable),
+        ),
+        // §6.1: exactly one of R, RW (optionally RELRO) or RX, whatever else is set.
+        (
+            "segment with no permissions",
+            mutated(|i| put32(i, e1 + 4, REQ | MAP)),
+            s,
+            sec(1, E::SegmentPermissions(0)),
+        ),
+        (
+            "segment writable but not readable",
+            mutated(|i| put32(i, e1 + 4, REQ | MAP | W)),
+            s,
+            sec(1, E::SegmentPermissions(W)),
+        ),
+        (
+            "segment executable but not readable",
+            mutated(|i| put32(i, e1 + 4, REQ | MAP | X)),
+            s,
+            sec(1, E::SegmentPermissions(X)),
+        ),
+        (
+            "RELRO without WRITE",
+            mutated(|i| put32(i, e1 + 4, REQ | MAP | R | RELRO)),
+            s,
+            sec(1, E::SegmentPermissions(R | RELRO)),
+        ),
+        (
+            "RELRO on an executable segment",
+            mutated(|i| put32(i, e1 + 4, REQ | MAP | R | X | RELRO)),
+            s,
+            sec(1, E::SegmentPermissions(R | X | RELRO)),
+        ),
+        (
+            "RELRO alone",
+            mutated(|i| put32(i, e1 + 4, REQ | MAP | RELRO)),
+            s,
+            sec(1, E::SegmentPermissions(RELRO)),
         ),
         (
             "unknown required kind",
