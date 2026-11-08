@@ -629,6 +629,8 @@ The section above listed an older AP start-up hazard under *Next*: an AP that mi
 | Commit | What |
 |---|---|
 | `e430ee5` | `framekernel::apstart` (7 host tests, including the race on real threads); `smp`: `wake`, `park`, the settled handshake in `start_one` and `ap_entry`, and the park drill; xtask: the drill's markers; ADR-0008 C7 (Proposed) |
+| `2ca1af2` | records: provenance, STATUS, this section |
+| `7a1200c` | the PAT and global-page checks count online processors only: one flag per CPU index (`cpu`, `tlb`, `pcie`, `main`); controls C1–C3 |
 | (records) | provenance, STATUS, this section |
 
 **The choice.** INIT-park was chosen over per-AP trampoline data. A timed-out AP must be stopped in any case: otherwise it runs on after the trampoline's identity mapping is gone and triple-faults. INIT is the MP protocol's own way to stop it. Per-AP data stays with parallel start-up, and would also close the residual risk (an SMI longer than 10 ms on a timed-out AP). ADR-0003 K6's design is unchanged; ADR-0008 C7 records the failure path and asks the owner.
@@ -657,13 +659,16 @@ Controls: N2 (`park` without INIT) fails the drill: `its count moved 5189 in 100
 
 `cargo xtask check` passes: 557 tests, 0 failures, 6 ignored. So do `boot-test`, `boot-matrix` (1, 2, 4) and `boot-x2apic`.
 
+**Counts of processors.** `ap_entry` added to two global counters, PAT-ready and global pages, before its handshake. So an AP parked after reaching them was still counted, and both checks failed. Control C1, with an AP stalled after both checks: `global pages on 4 of 3` and `PAT entry 3 is uncached on only 4 of 3 processors: PCIe failed`, so no NVMe or network ran. Each is now one flag per CPU index, counted over the online processors (C2: `3 of 3`, and the boot carries on). C3 (APs never mark) still fails both checks.
+
 #### Lessons
 
 - **A race test must show it raced.** The first version released both threads from a `Barrier`, and the AP thread won 1994–2000 of 2000 rounds: the last thread to arrive runs on while the other one is woken. Spinning both threads to the start, with random jitter, split the rounds about 52/48. The test now asserts that both kinds of winner occur.
 - **Make the slow AP wait for an event, not for a time.** It stalls until the boot processor rewrites its argument, the exact moment of the hazard. So the control is deterministic under TCG, whatever the host's load.
+- **Count per-CPU facts per CPU index, over the online set.** A global counter of processors that did X counts every processor that got that far, online or not. A flag per index, read for the online indexes, cannot.
 - **`boot-test` stops at the first failure line.** A control whose interesting lines come later needs the whole log. `cargo xtask run`, with the serial output redirected and QEMU stopped by a script, gives that.
 
 #### Next, for the following session
 
-- **AP start-up:** per-AP trampoline data together with parallel start-up (ADR-0003 K6); move the PAT and global-page counts after the handshake, so an AP parked after reaching them is not counted (seen in N1 and N3); optionally retry a parked AP once after the others; and decide whether loader memory may be reclaimed when the only processors not online are parked (`online.complete` stays false today).
+- **AP start-up:** per-AP trampoline data together with parallel start-up (ADR-0003 K6); optionally retry a parked AP once after the others; and decide whether loader memory may be reclaimed when the only processors not online are parked (`online.complete` stays false today).
 - **The owner:** ADR-0008's four questions (C7 is the fourth).

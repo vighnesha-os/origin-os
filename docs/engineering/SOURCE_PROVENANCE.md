@@ -1220,11 +1220,29 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `ap_drill` is safe code.
 - **Not done / known limits:**
   - **Residual risk:** INIT waits while a processor is in SMM. An SMI longer than 10 ms on a timed-out AP could still let it read the rewritten page. Per-AP trampoline data with parallel start-up would close it.
-  - `ap_entry` adds to the PAT and global-page counters before its handshake. An AP parked after reaching them is still counted (seen in N1 and N3). None was in P1, where the AP stalled earlier.
+  - `ap_entry` added to the PAT and global-page counters before its handshake, so an AP parked after reaching them was still counted (seen in N1 and N3; none was in P1, where the AP stalled earlier). Fixed in the next entry.
   - A parked AP is not retried, and `online.complete` stays false, so loader memory is not reclaimed.
   - The drill covers only the first AP.
   - **QEMU-only (§74).**
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the Intel SDM (MP initialization, the ICR's INIT and start-up delivery modes).
+- **Licensing:** project licence not chosen yet.
+
+### The PAT and global-page checks count online processors only (`cpu`, `tlb`, `pcie`; kernel; CLAUDE.md §24, §69; ADR-0008 C2 and C7; 2026-11-08)
+
+- **Why:** every processor that ran `ap_entry` as far as `tlb::enable_global_pages` and `cpu::check_pat` added to two global counters, before its start-up handshake. The TLB proof and `pcie::init` compared those counters with the number of processors online. So an AP that was parked after reaching them (ADR-0008 C7) was still counted. Both checks then failed with impossible counts, and the failed PCIe check took NVMe, the IOMMU and the network down with it: one slow AP cost the boot its devices.
+- **What:**
+  - `cpu::PAT_READY` and `tlb::GLOBAL_PAGES` are now one flag per CPU index, as ADR-0008 C2 wants for per-CPU state. A processor marks its own index (`this_cpu`).
+  - A processor with no index cannot mark: its CPU-local area names no slot (ADR-0008 C4).
+  - `cpu::pat_ready(cpus)` and `tlb::prove` count the flags of the processors online only.
+  - `pcie::init` takes the online CPU indexes instead of a count.
+  - An AP marks its index before its handshake, so the release and acquire of the handshake order the mark before the boot processor sees the AP online.
+- **Controls** (4 CPUs, `cargo xtask run`, whole log kept). Each is a temporary change, then restored: C1 and C2 add a test-only hook; C3 changes `check_pat` and `tlb::enable_global_pages` for the run only. The hook (never committed) makes the processor at APIC ID 2 stall in `ap_entry` right after both checks, until the boot processor settles its start-up without it. So it is parked after it marked.
+  - **C1, before the fix** (`e430ee5` plus the hook): `CPU 2 (APIC ID 2): no answer within 200 ms; parked by INIT`, then `TLB: global pages on 4 of 3 processors … TLB failed` and `PCIe: PAT entry 3 is uncached on only 4 of 3 processors (IA32_PAT 0x7040600070406): PCIe failed`. No NVMe or network proof ran.
+  - **C2, the fix with the same hook:** `TLB: global pages on 3 of 3 processors`; `PCIe: ECAM for segment 0 … IA32_PAT 0x7040600070406 on 3 processors`; then the NVMe interrupt-driven proof on CPU 1 and the rest of the boot. CPU 2's line is the only failure.
+  - **C3, APs never mark their index** (2 CPUs, no hook): `TLB: global pages on 1 of 2 processors … TLB failed` and `PCIe: PAT entry 3 is uncached on only 1 of 2 processors … PCIe failed`. Counting over the online processors still catches an online processor that did not pass.
+- **Gates:** `cargo xtask check`, `boot-test`, `boot-matrix` (1, 2, 4) and `boot-x2apic` pass, with their TLB and PCIe lines unchanged.
+- **Unsafe inventory:** nothing new.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code.
 - **Licensing:** project licence not chosen yet.
 
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
