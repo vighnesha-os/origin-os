@@ -1221,3 +1221,28 @@ The task assumed a stall distorting a slice. Measuring first showed something br
 
 - Merge this branch after the clock-proof branch (`claude/musing-hamilton-587f7b`).
 - The two-worker fairness check in `sched::prove` still counts iterations (worst ratio 1.52 in 30 samples at full load, bound 2); `wait::prove`'s ping-pong bound and `prove_timers`' 2 ms bound fail at double load.
+
+### Continued (2026-11-08, ~19:30–19:50 IST): the clock and scheduler proof fixes merged
+
+On branch **`claude/interesting-carson-ae7c83`**, merge commit `31b4347`, bringing in `118834b` (which contains `20b8817`), on the owner's word, and pushed to PR vighnesha-os/origin-os#2, again on the owner's word. The kernel code merged without conflict; `docs/STATUS.md` and this file kept both sides.
+
+The code diff was read before merging. It changes the boot proofs and the boot-time PIT calibration, and no ABI or format. No accuracy bound was loosened: the RTC's 1 %, the timer queue's 2 ms, the HPET and PM timer's 2 % and the scheduler's share bound are as they were, and the share bound is now pinned by a host test. What changed is that a proof whose run was visibly stalled may measure again. The RTC proof's time budget grew to 3.2 s, spent only when an edge was spoiled.
+
+**Result, on `31b4347`:** `cargo xtask check` passes with 772 tests passed, 0 failed, 6 ignored. `cargo xtask boot-matrix` passes in full **on its first attempt, with the host at load 50–260 (mean 168)** and another session's QEMU running for 128 of 141 samples: both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic` under leaves 1Fh and 0Bh, each 11 of 11 scenarios.
+
+| In that run | |
+|---|---|
+| Kernel boots with the timing proofs | 8 |
+| `timers` runs repeated after a stall | 1 |
+| PIT calibration windows discarded | 41, over 6 boots, at most 15 in one |
+| The RTC second | All confirmed within 1 %; widest uncertainty ±4.7 ms |
+
+#### What to know
+
+- One pass under load is not a failure rate. The measured rates are in `SOURCE_PROVENANCE.md`, "The clock proofs under host load" (83 % to 3 % of boots failing with every core busy) and "The weighted-share proof under host load".
+- The section above says the timer proof had no fix. `20b8817` already repeats a stalled `timers` run, and that path fired once in this run.
+- At two busy-loop processes per core, the `timers` and ping-pong proofs are reported to still fail. Another session is working on that on `claude/priceless-einstein-d6f3b9`; its boot loops may run until about 22:00 IST. A session started for the same work stood down without changing anything.
+
+#### Open for the owner
+
+- As in the section above; early-boot DMA, M4 and the Loom models are still on their own branches.
