@@ -481,6 +481,8 @@ pub const fn class_name(class: u8, subclass: u8, prog_if: u8) -> Option<&'static
         (0x06, 0x01, _) => "ISA bridge",
         (0x06, 0x04, _) => "PCI-to-PCI bridge",
         (0x06, _, _) => "bridge",
+        // System peripheral, IOMMU (an AMD IOMMU's function, AMD IOMMU spec §3.1).
+        (0x08, 0x06, _) => "IOMMU",
         (0x0C, 0x03, 0x30) => "USB controller (xHCI)",
         (0x0C, 0x03, _) => "USB controller",
         (0x0C, 0x05, _) => "SMBus controller",
@@ -630,6 +632,7 @@ mod tests {
         let nvme = out[2];
         assert_eq!((nvme.class, nvme.subclass, nvme.prog_if), (1, 8, 2));
         assert_eq!(class_name(1, 8, 2), Some("NVMe controller"));
+        assert_eq!(class_name(8, 6, 0), Some("IOMMU"));
         assert_eq!(out[3].layout, 1, "a bridge");
         assert!(out[4].multifunction);
         let mut small = [Function::default(); 3];
