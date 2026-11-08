@@ -14,6 +14,7 @@ members = [
     "boot/info",
     "boot/uefi",
     "developer-tools/onbf-pack",
+    "developer-tools/onbf-sign",
     "developer-tools/xtask",
     "framekernel",
     "framekernel/paging",
@@ -30,6 +31,7 @@ members = [
 default-members = [
     "boot/info",
     "developer-tools/onbf-pack",
+    "developer-tools/onbf-sign",
     "developer-tools/xtask",
     "framekernel/paging",
     "framekernel/sync",
@@ -57,6 +59,7 @@ origin-crypto = { path = "security/crypto" }
 onbf-format = { path = "runtime/onbf/format" }
 onbf-merkle = { path = "runtime/onbf/merkle" }
 onbf-verify = { path = "runtime/onbf/verify" }
+onbf-sign = { path = "developer-tools/onbf-sign" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -81,4 +84,7 @@ codegen-units = 1
 opt-level = 3
 
 [profile.dev.package.onbf-merkle]
+opt-level = 3
+
+[profile.dev.package.onbf-sign]
 opt-level = 3

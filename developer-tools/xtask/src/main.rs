@@ -69,6 +69,8 @@ const KERNEL_TARGET: &str = "x86_64-unknown-none";
 const BOOT_INFO_PACKAGE: &str = "origin-boot-info";
 const KERNEL_PACKAGE: &str = "framekernel";
 const PACK_PACKAGE: &str = "onbf-pack";
+/// The host-only signing code (CLAUDE.md §59): never linked into the OS.
+const SIGN_PACKAGE: &str = "onbf-sign";
 const FREESTANDING_LIBS: &[&str] = &[
     BOOT_INFO_PACKAGE,
     ONBF_FORMAT_PACKAGE,
@@ -1323,10 +1325,21 @@ fn check() -> Result {
             "-D",
             "warnings",
         ],
+        // The host-only signing code.
+        &[
+            "clippy",
+            "--package",
+            SIGN_PACKAGE,
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
         &["test", "--package", "xtask"],
         &["test", "--package", LOADER_PACKAGE, "--lib"],
         &["test", "--package", VERSION_PACKAGE],
         &["test", "--package", PACK_PACKAGE],
+        &["test", "--package", SIGN_PACKAGE],
     ];
     for step in steps {
         run_step(cargo().args(*step))?;
@@ -1401,7 +1414,113 @@ fn check() -> Result {
     no_panic_check()?;
     linux_cfg_lint()?;
     manifest_version_lint()?;
+    signing_stays_off_the_os_lint()?;
+    signing_has_no_secret_branches()?;
     println!("xtask: check passed");
+    Ok(())
+}
+
+/// CLAUDE.md §59: `ed25519::sign` must compile with no conditional branch beyond its loop
+/// counters (one for each of its 512-bit reductions: the signer does three). LLVM once turned
+/// the reduction's masks into two data-dependent branches per bit, which `black_box` now
+/// prevents; a toolchain or code change that brought them back would show up here.
+fn signing_has_no_secret_branches() -> Result {
+    const EXPECTED: usize = 3;
+    let deps = target_dir().join("release").join("deps");
+    run_step(cargo().args([
+        "rustc",
+        "--quiet",
+        "--release",
+        "--package",
+        SIGN_PACKAGE,
+        "--lib",
+        "--",
+        "--emit=asm",
+        "-C",
+        "codegen-units=1",
+        "-C",
+        "debuginfo=0",
+        "-C",
+        "symbol-mangling-version=v0",
+    ]))?;
+    let mut assembly: Vec<_> = fs::read_dir(&deps)
+        .map_err(|e| format!("{}: {e}", deps.display()))?
+        .filter_map(std::result::Result::ok)
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("onbf_sign-") && name.ends_with(".s")
+        })
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    assembly.sort();
+    let (_, path) = assembly
+        .last()
+        .ok_or("the signing crate's assembly was not written")?;
+    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut lines = text.lines();
+    lines
+        .find(|l| l.ends_with(":") && l.contains("9onbf_sign7ed255194sign"))
+        .ok_or("the assembly has no ed25519::sign")?;
+    let conditional = |line: &str| {
+        let word = line.split_whitespace().next().unwrap_or("");
+        word.starts_with("b.")
+            || ["cbz", "cbnz", "tbz", "tbnz"].contains(&word)
+            || (word.starts_with('j') && word != "jmp" && cfg!(target_arch = "x86_64"))
+    };
+    let body: Vec<&str> = lines
+        .take_while(|l| !l.trim_start().starts_with(".cfi_endproc"))
+        .collect();
+    let count = body.iter().filter(|line| conditional(line)).count();
+    if count != EXPECTED {
+        return Err(format!(
+            "§59: ed25519::sign has {count} conditional branches in its {} assembly, expected only its {EXPECTED} loop counters; check for a branch on the secret scalar or nonce",
+            std::env::consts::ARCH
+        ));
+    }
+    println!(
+        "xtask: §59 branch check: ed25519::sign has {count} conditional branches, its loop counters ({})",
+        std::env::consts::ARCH
+    );
+    Ok(())
+}
+
+/// CLAUDE.md §59: Origin OS contains verification code only. The crate with the signing
+/// algorithms must not be a dependency of anything that ships.
+fn signing_stays_off_the_os_lint() -> Result {
+    for package in [LOADER_PACKAGE, KERNEL_PACKAGE] {
+        let output = cargo()
+            .args([
+                "tree",
+                "--package",
+                package,
+                "--prefix",
+                "none",
+                "--edges",
+                "normal",
+                "--target",
+                "all",
+                "--all-features",
+            ])
+            .output()
+            .map_err(|e| format!("cannot run cargo tree: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "cargo tree failed for {package}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let tree = String::from_utf8_lossy(&output.stdout);
+        if tree
+            .lines()
+            .any(|l| l.split_whitespace().next() == Some(SIGN_PACKAGE))
+        {
+            return Err(format!(
+                "{package} depends on {SIGN_PACKAGE}: the OS must contain verification code only (CLAUDE.md §59)"
+            ));
+        }
+        println!("xtask: §59 signing lint: {package} does not depend on {SIGN_PACKAGE}");
+    }
     Ok(())
 }
 
@@ -1768,8 +1887,7 @@ const TEST_SIGNING_TIME: &str = "1794000000";
 
 /// A test key's files, under `target/xtask/test-keys/` (never in the repository).
 struct TestKey {
-    ed25519: PathBuf,
-    mldsa: PathBuf,
+    key: PathBuf,
     public_ed25519: PathBuf,
     public_mldsa: PathBuf,
 }
@@ -1798,8 +1916,7 @@ fn make_test_key(name: &str, seed: &str) -> Result<TestKey> {
     }
     fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let key = TestKey {
-        ed25519: dir.join("ed25519.pem"),
-        mldsa: dir.join("mldsa87.pem"),
+        key: dir.join("origin-kernel.key"),
         public_ed25519: dir.join("ed25519.pub"),
         public_mldsa: dir.join("mldsa87.pub"),
     };
@@ -1807,10 +1924,8 @@ fn make_test_key(name: &str, seed: &str) -> Result<TestKey> {
         "keygen".as_ref(),
         "--insecure-test-seed".as_ref(),
         seed.as_ref(),
-        "--ed25519-key".as_ref(),
-        key.ed25519.as_os_str(),
-        "--mldsa-key".as_ref(),
-        key.mldsa.as_os_str(),
+        "--key".as_ref(),
+        key.key.as_os_str(),
         "--public-ed25519".as_ref(),
         key.public_ed25519.as_os_str(),
         "--public-mldsa".as_ref(),
@@ -1856,10 +1971,8 @@ fn sign_kernel(input: &Path, key: &TestKey, output: &str) -> Result<Vec<u8>> {
         input.as_os_str(),
         "--output".as_ref(),
         out.as_os_str(),
-        "--ed25519-key".as_ref(),
-        key.ed25519.as_os_str(),
-        "--mldsa-key".as_ref(),
-        key.mldsa.as_os_str(),
+        "--key".as_ref(),
+        key.key.as_os_str(),
         "--signing-time".as_ref(),
         TEST_SIGNING_TIME.as_ref(),
     ])?;

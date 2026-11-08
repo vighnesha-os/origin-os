@@ -23,10 +23,9 @@ No private key is stored in this repository. `cargo xtask boot-test` derives the
 into `target/xtask/test-keys/` from the text `TEST_KEY_TRUSTED` in
 `developer-tools/xtask/src/main.rs`, and checks that the public half matches these files.
 
-To regenerate these files after changing that text, remove them and the two PEM files below
-(`keygen` never overwrites anything), and run this from the repository root, with an OpenSSL of
-3.5 or later on `PATH`:
+To regenerate these files after changing that text, remove them and any old key file (`keygen`
+never overwrites anything), and run this from the repository root:
 
 ```bash
-cargo run --package onbf-pack -- keygen --insecure-test-seed "TEST-ONLY origin-kernel key 1: the test trust store holds it" --ed25519-key /tmp/test-ed25519.pem --mldsa-key /tmp/test-mldsa87.pem --public-ed25519 boot/uefi/trust/TEST-ONLY-origin-kernel.ed25519 --public-mldsa boot/uefi/trust/TEST-ONLY-origin-kernel.mldsa87
+cargo run --package onbf-pack -- keygen --insecure-test-seed "TEST-ONLY origin-kernel key 1: the test trust store holds it" --key /tmp/test-origin-kernel.key --public-ed25519 boot/uefi/trust/TEST-ONLY-origin-kernel.ed25519 --public-mldsa boot/uefi/trust/TEST-ONLY-origin-kernel.mldsa87
 ```

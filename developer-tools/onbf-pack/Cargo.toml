@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 onbf-format.workspace = true
 onbf-merkle.workspace = true
+onbf-sign.workspace = true
 onbf-verify.workspace = true
 origin-crypto.workspace = true
 origin-version.workspace = true

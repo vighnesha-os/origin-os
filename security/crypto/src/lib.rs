@@ -21,7 +21,8 @@
 //! writes lanes at fixed positions only. The Keccak constants are computed at compile time
 //! from their FIPS 202 definitions. Ed25519 verification is variable time by design, because
 //! it handles only public data (ONBF §7.2). Origin's verification paths hash public data. No
-//! hasher state is zeroized on drop, which matters only if secrets are ever hashed (see
+//! hasher state is zeroized on drop, which matters only if secrets are hashed: only the
+//! host-only signer does, where the owner accepted best-effort zeroization (see
 //! `SOURCE_PROVENANCE.md`).
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]

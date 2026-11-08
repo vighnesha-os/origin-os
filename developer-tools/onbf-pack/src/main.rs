@@ -10,16 +10,15 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 
-use onbf_pack::sign::{self, KeyPaths, OpensslSigner, SignOptions, Signer};
+use onbf_pack::sign::{self, HostKey, KeyPaths, SignOptions, Signer};
 use onbf_pack::{KrnOptions, Toolchain, krn};
 
 const USAGE: &str = "\
 usage: onbf-pack krn --input <kernel.elf> --output <kernel.onbf> [options]
-       onbf-pack sign --input <kernel.onbf> --output <signed.onbf> --ed25519-key <key.pem>
-                      --mldsa-key <key.pem> --signing-time <seconds> [--openssl <path>]
-       onbf-pack keygen --ed25519-key <key.pem> --mldsa-key <key.pem>
-                        --public-ed25519 <file> --public-mldsa <file>
-                        [--insecure-test-seed <text>] [--openssl <path>]
+       onbf-pack sign --input <kernel.onbf> --output <signed.onbf> --key <file>
+                      --signing-time <seconds>
+       onbf-pack keygen --key <file> --public-ed25519 <file> --public-mldsa <file>
+                        [--insecure-test-seed <text>]
 
 krn converts the Framekernel's ELF64 x86-64 PIE (rust-lld output) into an unsigned KRN image
 (docs/spec/ONBF.md §6.1.2, §6.5).
@@ -33,19 +32,16 @@ krn options:
   --rustc-commit H     rustc commit hash    } `rustc -vV`, run in the current directory
   --llvm-version V     LLVM version         }
 
-sign signs an unsigned KRN image in the role origin-kernel, with Ed25519 and ML-DSA-87
-private keys in PEM files (ONBF §7.1-§7.2), and checks the result with the boot loader's code.
-OpenSSL 3.5 or later does the signing; this program never reads the private keys.
+sign signs an unsigned KRN image in the role origin-kernel (ONBF §7.1-§7.2), with a key from
+`keygen`, and checks the result with the boot loader's code.
   --signing-time N     the statement's claimed signing time, seconds since 1970-01-01 UTC
                        (decimal or 0x hex); informational only, and never taken from the clock
-  --openssl PATH       the OpenSSL program (default: `openssl` on PATH)
 
-keygen creates a new key pair: the private keys in new PEM files (mode 0600) and the raw
-public keys in two new files. No existing file is ever overwritten.
+keygen creates a new key pair: the private key in a new file (mode 0600) and the raw public
+keys in two new files. No existing file is ever overwritten.
   --insecure-test-seed TEXT
-                       derive the keys from public text instead of OpenSSL's random
-                       generator. The result is a TEST KEY: anyone can recompute it.
-  --openssl PATH       the OpenSSL program (default: `openssl` on PATH)
+                       derive the keys from public text instead of the operating system's
+                       random generator. The result is a TEST KEY: anyone can recompute it.
 
 options:
   -h, --help           print this help";
@@ -93,12 +89,6 @@ impl Options {
             })
             .transpose()
     }
-
-    /// The OpenSSL program to run.
-    fn openssl(&mut self) -> PathBuf {
-        self.take("--openssl")
-            .map_or_else(|| PathBuf::from("openssl"), PathBuf::from)
-    }
 }
 
 /// What each command accepts.
@@ -111,21 +101,12 @@ const KRN_OPTIONS: &[&str] = &[
     "--rustc-commit",
     "--llvm-version",
 ];
-const SIGN_OPTIONS: &[&str] = &[
-    "--input",
-    "--output",
-    "--ed25519-key",
-    "--mldsa-key",
-    "--signing-time",
-    "--openssl",
-];
+const SIGN_OPTIONS: &[&str] = &["--input", "--output", "--key", "--signing-time"];
 const KEYGEN_OPTIONS: &[&str] = &[
-    "--ed25519-key",
-    "--mldsa-key",
+    "--key",
     "--public-ed25519",
     "--public-mldsa",
     "--insecure-test-seed",
-    "--openssl",
 ];
 
 fn main() -> ExitCode {
@@ -295,14 +276,19 @@ fn pack_krn(mut options: Options) -> Result<String, Failure> {
 fn sign_krn(mut options: Options) -> Result<String, Failure> {
     let input = PathBuf::from(options.require("--input")?);
     let output = PathBuf::from(options.require("--output")?);
-    let ed25519_key = PathBuf::from(options.require("--ed25519-key")?);
-    let mldsa_key = PathBuf::from(options.require("--mldsa-key")?);
+    let key = PathBuf::from(options.require("--key")?);
     let claimed_signing_time = options
         .number("--signing-time")?
         .ok_or_else(|| Failure::Usage("--signing-time is required".into()))?;
-    let openssl = options.openssl();
+    // Signing replaces the output through a rename, which would destroy the key.
+    if output.exists() && fs::canonicalize(&output).ok() == fs::canonicalize(&key).ok() {
+        return Err(Failure::Conversion(format!(
+            "--output {} is the key file",
+            output.display()
+        )));
+    }
     let image = read_input(&input)?;
-    let signer = OpensslSigner::new(&openssl, &ed25519_key, &mldsa_key).map_err(conversion)?;
+    let signer = HostKey::load(&key).map_err(conversion)?;
     let signed = sign::sign_krn(
         &image,
         &signer,
@@ -313,8 +299,13 @@ fn sign_krn(mut options: Options) -> Result<String, Failure> {
     .map_err(conversion)?;
     write_output(&output, &signed)?;
     Ok(format!(
-        "onbf-pack: signed KRN {} in the role origin-kernel, key ID {}: {} bytes",
+        "onbf-pack: signed KRN {} in the role origin-kernel{}, key ID {}: {} bytes",
         output.display(),
+        if signer.is_test_key() {
+            " with a TEST KEY"
+        } else {
+            ""
+        },
         sign::hex(&onbf_verify::key_id(&onbf_verify::PublicKey {
             ed25519: &signer.public_keys().ed25519,
             mldsa: &signer.public_keys().mldsa87,
@@ -324,17 +315,13 @@ fn sign_krn(mut options: Options) -> Result<String, Failure> {
 }
 
 fn keygen(mut options: Options) -> Result<String, Failure> {
-    let ed25519_key = PathBuf::from(options.require("--ed25519-key")?);
-    let mldsa_key = PathBuf::from(options.require("--mldsa-key")?);
+    let key = PathBuf::from(options.require("--key")?);
     let public_ed25519 = PathBuf::from(options.require("--public-ed25519")?);
     let public_mldsa = PathBuf::from(options.require("--public-mldsa")?);
     let seed = options.text("--insecure-test-seed")?;
-    let openssl = options.openssl();
     let keys = sign::generate_keys(
-        &openssl,
         &KeyPaths {
-            ed25519_key: &ed25519_key,
-            mldsa87_key: &mldsa_key,
+            key: &key,
             public_ed25519: &public_ed25519,
             public_mldsa87: &public_mldsa,
         },

@@ -55,8 +55,8 @@ The ONBF parsers, which run in the boot loader on data read before any signature
 |---|---|
 | ONBF parser (`onbf-format`), Merkle trees (`onbf-merkle`), KRN packer (`onbf-pack`) | done for KRN; EXE/LIB/OSI/OAPP/OD profiles not yet |
 | SHA-2, SHA-3/SHAKE, Ed25519 (strict), ML-DSA-65/87 (strict) in `origin-crypto` | done, verification only. **External validation added 2026-11-08 (§59):** 3,882 vectors, all passing: every applicable NIST ACVP vector for SHA-2, SHA-3, SHAKE and ML-DSA signature verification, and all 210 Wycheproof Ed25519 vectors under strict errata E1. `cargo xtask check` runs 3,870 of them in about 4 s; `ORIGIN_KAT_SCALE=8` adds the 2, 4 and 8 GiB vectors (about 1 min). Not applicable, justified in `SOURCE_PROVENANCE.md`: bit-oriented SHA-3 and SHAKE input, ML-DSA-44, HashML-DSA and ML-DSA's internal interface. The FIPS 204 errata sheet changed one check (`UseHint`'s bound). An independent review (§59) is still to come |
-| Signature block, certificate chain, trust store | encodings decided (S1–S4); parser (`onbf-format`), entry verification and the KRN policy (`onbf-verify`, proven against reference-signed vectors and OpenSSL-made signatures) and the loader's compiled-in store done, with a test key only; OKC chains next, once errata O2–O5 are decided; trust anchor decided (B7) |
-| Signing (host) | `onbf-pack sign` and `keygen`: both signatures made by OpenSSL 3.5+ as a subprocess, which reads the private keys itself; `onbf-pack` holds no signing algorithm and self-verifies every image with the loader's code. A test key is derived from public text; no release key exists |
+| Signature block, certificate chain, trust store | encodings decided (S1–S4); parser (`onbf-format`), entry verification and the KRN policy (`onbf-verify`, proven against reference-signed vectors and `onbf-sign`'s signatures) and the loader's compiled-in store done, with a test key only; OKC chains specified (errata O2–O5) and waiting for the SYS profile's signed time; trust anchor decided (B7) |
+| Signing (host) | `onbf-pack sign` and `keygen`, with Ed25519 and ML-DSA-87 signing written in Rust (`onbf-sign`, host only: the loader and kernel cannot reach it). Keygen and signing match the independent Python references and OpenSSL byte for byte; every image is self-verified with the loader's code. Side-channel assessment recorded; zeroization is best effort, accepted by the owner for development keys; agent-reviewed, not independently audited. A test key is derived from public text; no release key exists |
 
 ## Waiting on the owner
 
@@ -67,7 +67,9 @@ The owner accepted ADR-0006 (OriginFS v0, as a bring-up format that never ships 
 One ADR is still **Proposed**:
 - **ADR-0007**, DMA isolation and interrupt remapping (Intel VT-d and AMD-Vi). It is kernel-internal, so it is implemented and boot-proven while Proposed. The owner answered all but its three AMD-Vi questions on 2026-11-08; those wait on a check of AMD's manual (`docs/engineering/OWNER_DECISIONS.md`).
 
-Errata **V1–V6** (2026-11-08) are **Proposed** and await the owner: what an empty certificate chain means, one entry per KRN block, the KRN statement's `id` and `version`, the compiled-in trust store, developer mode and signed images, and the signing time. They are implemented and boot-proven. Errata **O1–O5** stay open: O2–O5 (the OKC's ML-DSA context, trusted time at boot, namespace matching, what a root is) block certificate chains.
+Errata **V1–V6 and O2–O5** were decided by the owner on 2026-11-08, along with Rust host signing: `docs/spec/ONBF-errata.md`. Certificate chains are specified but wait for the SYS profile's signed time (O3). **O1** stays open.
+
+For the host signer the owner accepted best-effort zeroization of development keys (2026-11-08); release keys belong in an HSM.
 
 Also waiting on the owner: a check of the AMD IOMMU specification (48882 Rev 3.11) read from a mirror against AMD's own copy (its SHA-256 is in the AMD-Vi research ledger). Still the owner's too, because they are not design: merging PR #1 into `main`; and, for production qualification, declaring the supported 2026+ Intel/AMD reference platforms and providing physical x86 test machines (CLAUDE.md §74, §76 — nothing is qualified on hardware until then). Details: `docs/engineering/TASKS.md`.
 
