@@ -174,7 +174,7 @@ fn follow_thread(id: usize, slot: usize) {
 /// lowest page) is unmapped, so running off the end of the stack faults instead of
 /// overwriting a neighbour. Returns the stack (above the guard) and the guard's address.
 pub(crate) fn guarded_stack(bytes: usize) -> Option<(&'static mut [u8], u64)> {
-    use alloc::alloc::{Layout, alloc_zeroed};
+    use alloc::alloc::{Layout, alloc_zeroed, dealloc};
     let layout = Layout::from_size_align(bytes + 4096, 4096).ok()?;
     // SAFETY: `layout` has a non-zero size; the allocation is never freed (threads do not
     // exit yet), so the slice below is `'static`.
@@ -183,7 +183,12 @@ pub(crate) fn guarded_stack(bytes: usize) -> Option<(&'static mut [u8], u64)> {
         return None;
     }
     let guard = base.expose_provenance() as u64;
-    crate::vm::make_guard(guard).ok()?;
+    if crate::vm::make_guard(guard).is_err() {
+        // SAFETY: `base` is the allocation made just above with this layout, and nothing
+        // else refers to it; a failed `make_guard` left its first page mapped.
+        unsafe { dealloc(base, layout) };
+        return None;
+    }
     // SAFETY: `base + 4096 .. base + 4096 + bytes` lies inside the fresh allocation, is
     // still mapped read/write, and nothing else refers to it.
     let stack = unsafe { core::slice::from_raw_parts_mut(base.wrapping_add(4096), bytes) };
@@ -587,10 +592,22 @@ fn spawn_with(
     weight: u32,
     process: Option<Arc<Process>>,
 ) -> Result<usize, QueueError> {
+    spawn_with_fpu(cpu, start, root, weight, process, alloc_fpu_area)
+}
+
+/// [`spawn_with`], with `fpu_area` the source of the thread's FPU area (the boot proof gives
+/// it one that has none). A thread is created whole or not at all: every way this fails
+/// returns the stack, its guard page and the FPU area.
+fn spawn_with_fpu(
+    cpu: CpuIndex,
+    start: Start,
+    root: u64,
+    weight: u32,
+    process: Option<Arc<Process>>,
+    fpu_area: impl FnOnce() -> Option<u64>,
+) -> Result<usize, QueueError> {
     let queue = QUEUES.get(cpu.get()).ok_or(QueueError::Full)?;
     let (stack, guard) = guarded_stack(THREAD_STACK).ok_or(QueueError::Full)?;
-    let _ = FIRST_GUARD.compare_exchange(0, guard, Ordering::Relaxed, Ordering::Relaxed);
-    let user = matches!(start, Start::User { .. });
     let base = stack.as_ptr().addr() as u64;
     // The thread starts with RSP = top − 8 holding a zero return address, as if `entry` had
     // been called: RSP + 8 is then 16-byte aligned (System V).
@@ -628,15 +645,14 @@ fn spawn_with(
         guard,
         bytes: THREAD_STACK,
     };
-    let fpu_area = alloc_fpu_area();
-    // A user thread without its own FPU save area would run on the previous thread's
-    // registers, which is another process's data; it is refused instead.
-    if fpu_area.is_none() && user {
+    // A thread without its own FPU save area would run on the previous thread's registers
+    // (`switch_fpu` then has nothing to restore), which may be another process's data; it
+    // is refused instead.
+    let Some(fpu_area) = fpu_area() else {
         free_thread_stack(record);
         return Err(QueueError::Full);
-    }
-    let fpu_area = fpu_area.unwrap_or(0);
-    without_interrupts(|| {
+    };
+    let spawned = without_interrupts(|| {
         // The queue lock is held until the thread's state is complete: the moment the slot
         // is Ready the target processor can pick it, and `follow_thread` needs the state.
         let mut queue = queue.lock();
@@ -665,7 +681,11 @@ fn spawn_with(
             }
         }
         Ok(slot)
-    })
+    });
+    if spawned.is_ok() {
+        let _ = FIRST_GUARD.compare_exchange(0, guard, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    spawned
 }
 
 /// An application processor's scheduler: waits until the boot processor has queued its
@@ -1124,6 +1144,65 @@ fn prove_lifecycle(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     ok
 }
 
+/// A spawn that cannot be completed leaves nothing behind: refused for want of an FPU area
+/// (without one the thread would inherit another's SIMD registers), or because the queue
+/// is full, it hands back the stack, its guard page and the FPU area. The processor must
+/// hold only its boot context when this runs. (Anything a refusal leaks would also fail the
+/// final check in [`prove`], which holds the heap to the byte.)
+fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let live = || {
+        QUEUES
+            .get(bsp.get())
+            .map_or(0, |q| without_interrupts(|| q.lock().live()))
+    };
+    let in_use = || crate::memory::stats().map_or(0, |(h, _)| h.bytes_in_use);
+    let started = FINISHED.load(Ordering::Relaxed);
+    let contexts = live();
+    let before = in_use();
+    let no_area = spawn_with_fpu(
+        bsp,
+        Start::Kernel {
+            entry: quitter,
+            arg: 0,
+        },
+        0,
+        framekernel::runqueue::DEFAULT_WEIGHT,
+        None,
+        || None,
+    );
+    let no_area_clean =
+        no_area == Err(QueueError::Full) && in_use() <= before && live() == contexts;
+    let free = framekernel::runqueue::CAPACITY.saturating_sub(contexts);
+    let mut filled = 0;
+    for _ in 0..free {
+        if spawn(bsp, quitter, 0).is_ok() {
+            filled += 1;
+        }
+    }
+    let full_use = in_use();
+    let full = spawn(bsp, quitter, 0);
+    let full_clean =
+        full == Err(QueueError::Full) && in_use() <= full_use && live() == contexts + free;
+    let finished = started + filled as u64;
+    yield_until(
+        || FINISHED.load(Ordering::Relaxed) == finished && live() == contexts,
+        tsc_hz,
+        3,
+    );
+    reap();
+    let ok = no_area_clean
+        && full_clean
+        && filled == free
+        && live() == contexts
+        && FINISHED.load(Ordering::Relaxed) == finished;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: scheduler: spawns refused for want of an FPU area ({no_area:?}) and on a full queue ({full:?}) give back the stack, its guard page and the FPU area{}",
+        if ok { "" } else { ": scheduler failed" }
+    );
+    ok
+}
+
 /// Proves preemptive multitasking on every online processor: two non-yielding workers per
 /// processor run for 500 ms while the boot flow (itself one of the boot processor's
 /// contexts) waits. On each processor, both workers must have run there, with shares
@@ -1238,6 +1317,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
     ok &= prove_weights(com1, cpus, bsp, tsc_hz);
     ok &= prove_simd(com1, bsp, tsc_hz);
     ok &= prove_lifecycle(com1, bsp, tsc_hz);
+    ok &= prove_spawn_refused(com1, bsp, tsc_hz);
     ok &= crate::user::prove(com1, bsp, tsc_hz);
     ok &= crate::time::prove_consistent(com1, cpus, bsp, tsc_hz);
     ok &= crate::console::prove(com1, cpus, bsp, tsc_hz);
