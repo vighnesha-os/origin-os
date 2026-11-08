@@ -57,9 +57,24 @@ ADR-0003 K6 starts APs one at a time through one trampoline data page (stack, en
 - Nothing here is qualified on hardware (CLAUDE.md §74). CPU topology (package, die, module, core, thread) is now read per processor from CPUID leaves 1Fh, 0Bh or 80000026h, in records indexed by `CpuIndex` (C2), and checked against the MADT: `framekernel::topology`, research ledger `docs/research/2026-11-08-cpu-topology-leaf-1fh.md`. `boot-x2apic` boots a third processor, at APIC ID 412 (package 1, die 2, module 3, core 4), to show those fields apart.
 - C7: each boot with an AP reports `SMP: park drill: CPU 1 (APIC ID n) … its count moved 0 in 1000 us: parked true`, and the boot tests require it. By construction the drill adds about 22 ms to the boot: two INIT waits of 10 ms, 1 ms watching the count, and the AP's trip through the trampoline (under a millisecond in QEMU TCG). An AP that misses its handshake is reported as `parked by INIT`, and the other APs still start.
 
+## Trade-offs
+
+- **An extra table lookup on IPI paths (C3)**, in exchange for compact arrays and one index type. Hot paths read the index from GS (`this_cpu`).
+- **64 static slots (C6):** simple and free of allocation at boot, but the memory is reserved whether used or not, and a machine with more than 64 enabled processors leaves the rest in firmware.
+- **Table order (C1)** is the one order firmware defines, but it carries no topology: adjacent indexes need not be adjacent cores. Placement must use the topology records.
+- **INIT parking with a drill on every boot (C7):** about 22 ms of boot time to prove the mechanism works before anything depends on it.
+
+## Migration consequences
+
+None on disk and none at any ABI: `CpuIndex` is kernel-internal and is not exposed to user space.
+- Indexes follow the firmware's table order, so they are not stable across boots or firmware updates. Nothing persistent may store one; logs and crash dumps should record the APIC ID as well (`CpuIndex::named`).
+- Moving per-CPU state to allocation at discovery (C6) changes the storage only; `CpuIndex` and its call sites stay.
+- Hot-plug extends the map; an index already given must not change.
+- If the SDK ever exposes processors (affinity, §25), that needs its own stable identifier and ABI decision. `CpuIndex` should not be it.
+
 ## Questions for the owner
 
 1. Accept dense indexes in MADT order with the boot processor as 0 (C1), and `CpuIndex` as the only per-CPU array index (C2)?
 2. Keep 64 static per-CPU slots for now, and report and leave extra processors in firmware (C6)? Or move per-CPU state to discovery-time allocation now?
-3. Should `boot-x2apic` join the default `boot-matrix` gate? It adds about 18 s.
+3. Should `boot-x2apic` join the default `boot-matrix` gate? Since the topology work it boots twice and adds about 40 s.
 4. Accept C7: park an AP that misses its handshake with INIT, and run the park drill on every boot? Or also give each AP its own trampoline data now, ahead of parallel start-up?

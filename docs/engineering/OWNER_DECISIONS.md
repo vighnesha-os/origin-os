@@ -5,20 +5,20 @@
 | As of | 2026-11-08, commit `944a276` on `claude/interesting-carson-ae7c83`. The M4 and signed-boot sessions are still running and may add to this list. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| How to answer | Reply with numbers: "yes to 5, 6, 8, 9, 13–20". Items marked "Not yet" or "After item N" wait for what they name. Items 21–24 need you. |
+| How to answer | Reply with numbers: "yes to 1–6, 8, 9, 13–20". Items marked "After item N" wait for that item. Items 21–24 need you. |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
 ## What has to happen first
 
-The three Proposed ADRs do not yet meet what CLAUDE.md requires of them. An ADR can be marked Accepted only once the steps that apply to it are done. Steps A–C are agent work.
+CLAUDE.md requires these of the three Proposed ADRs. An ADR can be marked Accepted only once the steps that apply to it are done. Steps A–C are done.
 
 | Step | What | Rule | Applies to |
 |---|---|---|---|
-| A | Add migration consequences to all three ADRs. ADR-0006 also needs alternatives and trade-offs. | §18 | ADR-0006, 0007, 0008 |
-| B | Research OriginFS and record it under `docs/research/`; there is no ledger. The main question: can the crash consistency, integrity and snapshots §40 requires fit this layout at all? | §16, §40 | ADR-0006 |
-| C | Write a threat model for DMA and interrupt remapping. The repository has no threat model of any kind. | §58 | ADR-0007 |
-| D | Check the specifications' own text: items 18 and 23. | §3, §16 | Items 7, 10–12 |
+| A, **done** | Trade-offs and migration consequences added to all three ADRs, and alternatives to ADR-0006. | §18 | ADR-0006, 0007, 0008 |
+| B, **done** | [The OriginFS ledger](../research/2026-11-08-originfs-design.md). **The layout cannot grow into §40:** its inode is full, its block pointers hold only an address, and its inode table cannot move. | §16, §40 | ADR-0006 |
+| C, **done** | [The IOMMU threat model](THREAT_MODEL_IOMMU.md): 24 threats, 9 still open. Early-boot DMA and failing open are the most serious. | §58 | ADR-0007 |
+| D, **waiting on you** | Check the specifications' own text: items 18 and 23. | §3, §16 | Items 7, 10–12 |
 
 IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean little, so that waits for hardware (item 24). It does not hold up acceptance.
 
@@ -26,12 +26,12 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 
 | # | Question | Recommendation | Why |
 |---|---|---|---|
-| 1 | A classic inode layout for v0, read-only? | **Not yet** (steps A, B). Then accept, as a bring-up format that never ships in an approved release. | §40 requires crash consistency, integrity, large files and safe migrations, which v0 lacks. Rule 39 requires safe migration across approved releases. |
-| 2 | 4 KiB blocks and a file limit of about 2 MiB? | **Not yet** (item 1). Then accept for v0. | 4 KiB matches the page cache. The limit falls short of §40's large files, so it only works for a format that never ships. |
-| 3 | Defer writes, journalling and crash consistency? | **Not yet** (item 1). Then accept. | A read-only format needs no write path. That path needs its own ADR (§41), free to replace this layout. |
-| 4 | Reserve space now for per-block Merkle integrity? | **Not yet** (item 1). Then no, add it later. | §40's integrity belongs to the design that replaces v0. Space reserved for a design that doesn't exist yet is likely to be wrong. |
+| 1 | A classic inode layout for v0, read-only? | **Accept, as a bring-up format that never ships in an approved release** (new decision F7) | v0 cannot become the §40 filesystem, so it should only prove the read path. Rule 39 would otherwise require a migration path from it. |
+| 2 | 4 KiB blocks and a file limit of about 2 MiB? | **Accept for v0** | 4 KiB matches the page cache. The limit falls short of §40's large files, so it only works for a format that never ships. |
+| 3 | Defer writes, journalling and crash consistency? | **Accept** | A read-only format needs no write path. Writing belongs to a successor format with its own ADR (§41). |
+| 4 | Reserve space now for per-block Merkle integrity? | **No** | §40's integrity belongs to the successor. v0's pointers have no room for it, and reserved space would never be used. |
 
-## IOMMU (ADR-0007): built and boot-proven; needs steps A, C and D before it is Accepted
+## IOMMU (ADR-0007): built and boot-proven; needs step D before it is Accepted
 
 | # | Question | Recommendation | Why |
 |---|---|---|---|
@@ -44,7 +44,7 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 | 11 | Allow two QEMU gaps in the AMD-Vi proofs (fault address 0, no record of a blocked interrupt)? | **After item 23**, then accept as QEMU limits. | Hardware qualification must check both (§74). The address bug is fixed after QEMU 11.1, so that check can tighten on upgrade. |
 | 12 | Refuse devices that an IVMD names, as for RMRRs? | **After item 23**, then accept. | Same reasoning and deadline as item 8. |
 
-## CPU indexes (ADR-0008): built and boot-proven; needs step A before it is Accepted
+## CPU indexes (ADR-0008): built and boot-proven
 
 | # | Question | Recommendation | Why |
 |---|---|---|---|
@@ -72,16 +72,16 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 | # | Question | Recommendation | Why |
 |---|---|---|---|
 | 21 | The project licence? | **Apache-2.0 if this is to be open. If closed, make the repository private now.** | The GitHub repository is public with no LICENSE file: anyone can read the code, but nobody else has permission to reuse it. Apache-2.0 includes a patent grant. Much of this code is AI-written, and how copyright applies to that is unsettled, so take legal advice if it matters commercially. |
-| 22 | Push this branch and open a PR against PR #1's branch? | **Yes, after item 21** | 26 commits exist only on this Mac (§79: the repository is the durable record). Because the repository is public, pushing publishes them. A PR is review, not a merge (§80). |
+| 22 | Push this branch and open a PR against PR #1's branch? | **Yes, after item 21** | Everything since PR #1 exists only on this Mac (§79: the repository is the durable record). Because the repository is public, pushing publishes them. A PR is review, not a merge (§80). |
 | 23 | Compare two AMD manuals with AMD's own copies? | **Now, before items 10–12** | §3 requires legitimate specifications and §16 a confirmed revision. Both were read from the kib.kiev.ua mirror because AMD's site refuses automated reads. Download each from AMD and run `shasum -a 256` on it. IOMMU spec 48882 Rev 3.11: `f7c375a15db5ed63de760356867211063d164a2ed59f2d38613daec95894ce22`. APM Vol. 3, 24594 Rev 3.39: `b598514b19f204d973040d9867a7ffc48c949009a8b3dc86b20c9188e721ee45`. |
 | 24 | Which 2026+ Intel and AMD machines are the declared targets, and what physical x86 test hardware? | **One Intel and one AMD machine to start; several of each before any qualification** | §74 requires multiple Intel and AMD models, with SMT, hybrid and NUMA variations, and §76 a declared scope. CET shadow stacks, hybrid cores and real IOMMU behaviour cannot be shown under QEMU, and this Mac can't run x86 natively. Choosing models needs current research (§16). |
 
 ## What answering changes
 
-- Answers are recorded in the ADRs. An ADR becomes Accepted only when its steps above are done.
+- Answers are recorded in the ADRs. ADR-0006 and ADR-0008 can then be marked Accepted. ADR-0007 waits for step D.
 - Item 15 adds `boot-x2apic` to `boot-matrix`. Item 17 restricts a statement's `id` to ASCII and closes errata O1. Items 18–20 download the approved files.
 - Nothing is pushed unless you answer yes to item 22.
 
-**Also found by the same check, not decisions for now:** ADR-0002, ADR-0004 and ADR-0005, already Accepted, have no migration consequences either (§18). The system-call boundary M4 is building has no threat model (§58).
+**Also found by the same check, not decisions for now:** ADR-0002, ADR-0004 and ADR-0005, already Accepted, have no migration consequences either (§18). The system-call boundary M4 is building has no threat model yet (§58).
 
 **Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.

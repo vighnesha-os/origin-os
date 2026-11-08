@@ -5,6 +5,7 @@
 | Status | **Proposed** (2026-11-08; the AMD-Vi section added the same day, also Proposed). The owner accepts ADRs (CLAUDE.md §18, §84). This is a kernel-internal security mechanism, not an ABI or format decision, so it is implemented and boot-proven while Proposed; the parts that will reach the Driver ABI (how a user-mode driver asks for DMA memory, §31) are decided later, against this. |
 | Requires | CLAUDE.md §31 (DMA mapping, interrupt management, driver isolation), §32 (Intel VT-d, AMD IOMMU, interrupt remapping), §58 (DMA protection) |
 | Evidence | `docs/research/2026-11-08-vt-d-iommu.md` (VT-d Rev 5.20, D51397-019, 2026-05-14; what QEMU 11.1's `intel-iommu` emulates); `docs/research/2026-11-08-amd-vi-iommu.md` (AMD IOMMU specification 48882 Rev 3.11, April 2026; what QEMU 11.1's `amd-iommu` emulates and where it departs from the specification); the boot proofs and negative controls in `docs/engineering/SOURCE_PROVENANCE.md` ("Intel VT-d DMA and interrupt remapping"; "I/O APIC interrupts through VT-d interrupt remapping"; "AMD-Vi DMA and interrupt remapping") |
+| Threat model | `docs/engineering/THREAT_MODEL_IOMMU.md` (CLAUDE.md §58) |
 | Related | ADR-0001 D2 (first-party kernel drivers), ADR-0004 (address-space layout: the MMIO window holds the units' registers) |
 
 ## Context
@@ -102,6 +103,24 @@ QEMU 11.1's `amd-iommu` translates emulated devices only with `dma-remap=on`, wr
 - Faults reach the proofs through the neutral `iommu::Fault`; the IOMMU proofs in `storage.rs` and the I/O APIC proof in `irq.rs` read it.
 - Not yet for AMD-Vi: IVMD unity maps and exclusion ranges, segments other than 0, taking over an IOMMU the firmware enabled (IVinfo DMA remap support), guest translation, guest virtual APIC (posted interrupts), ATS, PPR, the event-log interrupt, 2048-entry interrupt tables, device-table segmentation; and the I/O APIC under AMD-Vi, whose device table entry (DeviceID from the IVRS special entry) blocks its fixed interrupts until it gets an interrupt table.
 - Not yet: scalable mode, RMRR identity maps, taking over a unit the firmware enabled (pre-boot DMA protection, `DMA_CTRL_PLATFORM_OPT_IN`), freeing IOVAs and table pages, large-page mappings, device-TLBs (ATS), a fault-event interrupt, hot-plug, and a live level-triggered I/O APIC pin (PCI INTx) with its EOI path.
+
+## Trade-offs
+
+- **One domain per device (I3):** the strongest isolation available here, at the cost of a set of translation tables per device.
+- **Strict, synchronous invalidation on unmap (I5):** it closes the window that deferred invalidation leaves open, at a cost on every unmap. That cost has not been measured (CLAUDE.md rule 21); no driver unmaps yet.
+- **IOVAs are never physical (I4):** a failed translation cannot pass unnoticed, but there is no identity-mapped fast path.
+- **4 KiB read/write mappings only:** simple and uniform, but more IOTLB misses than large pages, and a device can write pages it only needs to read.
+- **Queued invalidation only (I6):** one invalidation path to get right; a unit without it goes unused.
+- **Polled faults (I9, A8):** no interrupt path to harden, but nothing notices a fault after the boot proofs.
+- **Refusing rather than half-doing (I11, A9):** RMRR and IVMD devices fail closed, at the cost of devices that will not work until identity maps exist. A failed bring-up, by contrast, fails *open*: threat T6 in `docs/engineering/THREAT_MODEL_IOMMU.md`.
+
+## Migration consequences
+
+None on disk and none at any ABI: all of this is kernel-internal, and no persistent state depends on it.
+- Scalable mode (I1) replaces table formats behind `iommu`; drivers do not change.
+- The IOVA window (I4) can move or grow, because drivers use only the addresses `map` returns.
+- RMRR and IVMD identity maps are additive.
+- When user-mode drivers arrive (§31, §47), their DMA interface needs its own ADR. It must be capability-checked and must not expose the window or the table formats; `dma::DeviceDma` stays beneath it.
 
 ## Questions for the owner
 

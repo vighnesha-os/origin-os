@@ -1018,3 +1018,17 @@ Gates on the final tree:
 
 - **The owner:** ADR-0007's eight questions and ADR-0008's four; errata O1 (the signature statement's `id`: ASCII or NFC tables); Intel's VT-d PDF download; the two AMD manuals' hashes against AMD's copies.
 
+### Continued (2026-11-08, ~15:00 IST): CLAUDE.md requirements for the Proposed ADRs (documents only)
+
+The owner asked whether the decision sheet's recommendations had been checked against CLAUDE.md. They had not, fully, so the sheet (`docs/engineering/OWNER_DECISIONS.md`) was corrected, and its steps A–C were done on `claude/interesting-carson-ae7c83`. **Nothing is pushed, and no code changed.**
+
+- **§18:** trade-offs and migration consequences added to ADR-0006, 0007 and 0008; alternatives added to ADR-0006.
+- **§16, §40:** `docs/research/2026-11-08-originfs-design.md`. OriginFS v0 cannot grow into the filesystem §40 requires. New proposed decision F7: v0 is a bring-up format that never ships in an approved release. F3's "the rest reserved zero" was wrong (the inode is full) and is corrected.
+- **§58:** `docs/engineering/THREAT_MODEL_IOMMU.md`, the repository's first threat model. 24 threats, 9 still open.
+
+#### Next
+
+- **Before real hardware:** the threat model's T4–T6 (early-boot DMA, firmware-enabled units, failing open), T8–T9 (ACS), T14 (RMRR identity maps) and T23 (nobody reads runtime faults).
+- M4's system-call boundary needs its own threat model (§58).
+- **The owner:** the sheet. ADR-0007 also waits on the spec checks (items 18 and 23).
+
