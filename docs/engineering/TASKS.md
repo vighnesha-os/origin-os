@@ -63,7 +63,7 @@
 5. **M4:** ADR-0005 is accepted; the `origin-abi` crate, handle tables and channel logic exist. Next: the kernel's system-call layer, user copies against the calling process's tables, `wait_one`, the start record, memory objects, the Loader Service and `.ose` loading; PCIDs (ADR-0004 H5).
 6. **Signature block (ONBF §7.1):** `onbf-pack` signing with a host key, the loader requiring a signed KRN outside developer mode, the trust store and OKC chains (the trust anchor is decided: B7).
 7. **Block layer and filesystem (§39–§41):** one I/O queue per CPU, a block cache, then a filesystem ADR.
-8. **Formal and concurrency checks:** Loom models for `SpinLock` and the wait-queue protocol; Kani bounds for `paging`, `frames`, `heap` (§73).
+8. **Formal and concurrency checks:** Loom models for `SpinLock` and the wait-queue protocol (§73) — **done 2026-11-08** (`cargo xtask loom`, part of `check`): the real lock, the real wait-queue protocol and the real run queue, 14 models and 14 negative controls, the protocol moved out of the kernel binary into `origin_sync::wait` so it can run under Loom. What each model proves, what it leaves unproved and the approved crates are in `SOURCE_PROVENANCE.md`, "Loom models". Remaining: a model for `RwLock`, a timed wait on the boot flow; Kani bounds for `paging`, `frames`, `heap`.
 9. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks; **M1 follow-ups** (A/B deployment, boot-attempt recording, CI).
 
 ## Waiting on the owner
@@ -72,7 +72,7 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 
 | # | Decision | Blocks |
 |---|---|---|
-| — | Downloads **approved 2026-11-08**, not fetched yet: NIST ACVP (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519); the `loom` crate (host-only dev-dependency, §5). Each file's source and size are confirmed when the work that uses them starts | External known-answer validation (§59); concurrency models (§73) |
+| — | Downloads **approved 2026-11-08**, not fetched yet: NIST ACVP (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519); and, done, the `loom` crate (host-only dev-dependency, §5; added 2026-11-08 once its versions, licences and sizes were approved, see `SOURCE_PROVENANCE.md`). Each file's source and size are confirmed when the work that uses them starts | External known-answer validation (§59); concurrency models (§73) |
 | — | A project licence | Every provenance entry |
 | — | ADR-0007 (DMA isolation and interrupt remapping, Intel VT-d and AMD-Vi, Proposed): questions 3, 6, 7 and 8; the rest are answered (`docs/engineering/OWNER_DECISIONS.md`) | Accepting the IOMMU design; it is implemented and boot-proven already |
 | — | Compare the AMD IOMMU specification (48882 Rev 3.11) read from a mirror with AMD's own copy (SHA-256 in `docs/research/2026-11-08-amd-vi-iommu.md`) | Confidence that every AMD-Vi encoding comes from AMD's text |

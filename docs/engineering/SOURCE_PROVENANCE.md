@@ -348,7 +348,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **What:**
   - `runqueue` (library): a `Blocked` state; a per-slot generation, bumped by every `push`, so a wake-up names its thread exactly and a stale one never wakes the slot's next thread; and a pending-wake flag, so a wake-up that arrives before its thread has blocked makes the next `block` return at once.
   - `sched`: `block` (software interrupt 0x84), `current_thread`, `ThreadRef`, and `wake`. Waking a thread blocked on another processor sends that processor a reschedule IPI (vector 0xF1), whose handler acknowledges and switches.
-  - `wait` (binary): `WaitQueue::wait_until(condition)` checks the condition under the queue's lock and registers the thread there before blocking; `wake_one` takes a waiter under the lock, releases it, then wakes it. Lock order: a wait queue's lock, then what its condition reads. These queues are kernel-internal.
+  - `wait` (binary): `WaitQueue::wait_until(condition)` checks the condition under the queue's lock and registers the thread there before blocking; `wake_one` takes a waiter under the lock, releases it, then wakes it. Lock order: a wait queue's lock, then what its condition reads. These queues are kernel-internal. (The protocol moved unchanged to `origin_sync::wait` on 2026-11-08, where Loom can run it: see "Loom models" under `origin-sync`.)
 - **Proof** (every boot):
   - A producer on CPU 1 sends 10 000 numbers through an 8-slot ring to a consumer on CPU 0, each blocking when the ring is full or empty. All arrive in order, in 19–32 ms.
   - Two threads on CPUs 0 and 1 pass a turn back and forth 1000 times: 44–73 µs per round trip, woken by IPI, against a bound of 2 ms.
@@ -1515,8 +1515,117 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code.
 - **Dependencies:** `core` only. `no_std`; the no-panic lints are denied outside tests. One `unsafe impl Sync` and two `unsafe` blocks (the guard's `Deref`/`DerefMut`), each with a SAFETY argument.
 - **Test evidence (2026-11-07):** 3 host tests with real threads: 8 × 20,000 non-atomic increments under the lock (exact total), a writer/reader pair that never sees a torn two-field update, re-locking after a drop. Clippy on the host, UEFI and kernel targets; the no-panic object check references 0 external symbols.
-- **Not done:** Loom models (the `loom` crate needs the owner's approval to download), a fairness (ticket or MCS) lock, interrupt-disabling guards as a type.
+- **Not done:** a fairness (ticket or MCS) lock, interrupt-disabling guards as a type. A Loom model for `RwLock` (`SpinLock` and the wait-queue protocol have theirs: "Loom models", below).
 - **Licensing:** project licence not chosen yet.
+
+### Loom models of `SpinLock` and the wait-queue protocol (`origin-sync`; xtask; CLAUDE.md §5, §6, §13, §73; 2026-11-08)
+
+- **What:** `cargo xtask loom`, part of `cargo xtask check`, model-checks the real `SpinLock`, the real wait-queue protocol and the real run queue under Loom. To make that possible the protocol moved out of the kernel binary, without changing it, into `origin_sync::wait` (`framekernel/sync/src/wait.rs`): `WaitQueue<T, N>`, generic over a `Scheduler` trait that the kernel implements for kernel threads (`framekernel/src/wait.rs`, four forwarding methods). Boot proofs of the wait queues pass unchanged.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code.
+- **Specifications:** CLAUDE.md §13, §73. The C11 memory model as Loom implements it, read in Loom 0.7.2's source (see "What is not proved").
+- **Architecture decisions:**
+  - The model runs the real source, not a copy. `prim` (`lib.rs`) is the only switch: `core`'s atomics and cell in every real build, Loom's under `all(test, loom)`. `Ordering` is the same type in both, so the orderings at the call sites are the ones the models check (§13). The lock's own source changes only in reaching the cell through `with`/`with_mut` closures, which the release build inlines. The kernel still boots and passes its proofs on the real build.
+  - The real `RunQueue` (`framekernel/src/runqueue.rs`) is compiled into the model by `#[path]`, because the no-lost-wake-up guarantee is half the queue's lock and half the run queue's pending wake-up.
+  - `loom` is a `[target.'cfg(loom)'.dev-dependencies]` entry of `origin-sync` only. The library sees a dev-dependency only when it is built for its own unit tests (`cfg(test)`), which is why the models live in `src/models.rs` under `all(test, loom)`.
+  - Spinning is bounded in the model only (see "Bounds").
+  - Negative controls change a scratch copy of the source (`target/loom-controls`), never the working tree. Each is an exact text replacement that must match exactly once, so a control that no longer applies stops the run instead of silently passing.
+- **Dependencies and supply chain (CLAUDE.md §4, §5, §60):** `loom` **0.7.2** (MIT, tokio-rs/loom, published 2024-04-23), the owner's decision 20. Its version, licence, transitive crates and sizes were stated to the owner and approved in the session on 2026-11-08, with four crates held back so that every locked crate was at least two weeks old (generator 0.8.11 instead of 0.8.12, cc 1.10.0, smallvec 1.16.4, log 0.4.34). OSV (which carries RustSec) lists no advisory for any of the 30 at these versions, as of that date.
+
+  | Crate | Version | On this Mac | `.crate` size (KiB) | Licence | Published |
+  |---|---|---|---:|---|---|
+  | aho-corasick | 1.1.5 | downloaded, not compiled | 180.0 | Unlicense OR MIT | 2026-08-03 |
+  | cc | 1.10.0 | compiled | 145.0 | MIT OR Apache-2.0 | 2026-10-23 |
+  | cfg-if | 1.0.5 | compiled | 9.4 | MIT OR Apache-2.0 | 2026-09-16 |
+  | find-msvc-tools | 0.1.15 | compiled | 30.9 | MIT OR Apache-2.0 | 2026-10-19 |
+  | generator | 0.8.11 | compiled | 42.8 | MIT/Apache-2.0 | 2026-10-14 |
+  | lazy_static | 1.5.1 | compiled | 13.6 | MIT OR Apache-2.0 | 2026-10-01 |
+  | libc | 0.2.191 | compiled | 835.4 | MIT OR Apache-2.0 | 2026-10-16 |
+  | log | 0.4.34 | compiled | 52.1 | MIT OR Apache-2.0 | 2026-08-22 |
+  | loom | 0.7.2 | compiled | 72.3 | MIT | 2024-04-23 |
+  | matchers | 0.2.0 | compiled | 6.9 | MIT | 2024-07-01 |
+  | memchr | 2.8.3 | downloaded, not compiled | 96.8 | Unlicense OR MIT | 2026-07-08 |
+  | nu-ansi-term | 0.50.3 | compiled | 28.9 | MIT | 2025-10-10 |
+  | once_cell | 1.21.4 | compiled | 34.2 | MIT OR Apache-2.0 | 2026-03-12 |
+  | pin-project-lite | 0.2.17 | compiled | 30.3 | Apache-2.0 OR MIT | 2026-02-27 |
+  | regex-automata | 0.4.18 | compiled | 614.0 | MIT OR Apache-2.0 | 2026-08-04 |
+  | regex-syntax | 0.8.11 | compiled | 350.6 | MIT OR Apache-2.0 | 2026-06-09 |
+  | rustversion | 1.0.23 | compiled | 20.5 | MIT OR Apache-2.0 | 2026-07-07 |
+  | scoped-tls | 1.0.1 | compiled | 8.0 | MIT/Apache-2.0 | 2022-10-31 |
+  | sharded-slab | 0.1.7 | compiled | 56.9 | MIT | 2023-10-04 |
+  | shlex | 2.0.1 | compiled | 18.9 | MIT OR Apache-2.0 | 2026-05-17 |
+  | smallvec | 1.16.4 | compiled | 34.0 | MIT OR Apache-2.0 | 2026-10-23 |
+  | thread_local | 1.1.10 | compiled | 16.0 | MIT OR Apache-2.0 | 2026-07-10 |
+  | tracing | 0.1.44 | compiled | 452.3 | MIT | 2025-12-18 |
+  | tracing-core | 0.1.36 | compiled | 62.5 | MIT | 2025-12-18 |
+  | tracing-log | 0.2.0 | compiled | 17.1 | MIT | 2023-10-25 |
+  | tracing-subscriber | 0.3.23 | compiled | 208.8 | MIT | 2026-03-13 |
+  | valuable | 0.1.1 | not downloaded (other platforms or features) | 28.0 | MIT | 2025-01-17 |
+  | windows-link | 0.2.1 | not downloaded (other platforms or features) | 6.0 | MIT OR Apache-2.0 | 2025-10-06 |
+  | windows-result | 0.4.1 | not downloaded (other platforms or features) | 13.1 | MIT OR Apache-2.0 | 2025-10-06 |
+  | windows-sys | 0.61.2 | not downloaded (other platforms or features) | 2458.2 | MIT OR Apache-2.0 | 2025-10-06 |
+
+  Compiled: 24 crates, 3.09 MiB of `.crate` files. Locked: 30 crates, 5.80 MiB. `Cargo.lock` holds each crate's checksum.
+  - Cargo compiled exactly the 24 crates marked above on this Mac. It also downloaded `memchr` and `aho-corasick` without compiling them: 26 `.crate` files, 3.36 MiB, **two more than the owner was told** (24, 3.09 MiB). The owner was told these two would not be fetched here. The compiled set is exactly what was approved.
+  - On this host, build time runs code from `generator` (`build.rs`), `libc` (`build.rs`) and `rustversion` (`build/build.rs`, proc-macro). `cc` is only a build-dependency of `generator` and its build script calls it only for powerpc64.
+  - `generator` contains hand-written context-switching assembly and runs only inside these tests.
+  - Nothing here reaches a shipping crate. `cargo xtask check` now enforces it: every shipping crate's normal and build dependencies (`cargo tree --target all`) must be first-party, and every third-party package in `Cargo.lock` must be on `APPROVED_THIRD_PARTY` at its exact version.
+  - **A side effect to weigh:** because `Cargo.lock` now lists third-party crates, any `cargo` command in this workspace on a machine with an empty registry cache fetches crates.io *index metadata* for them (1.6 MB in a test with an empty `CARGO_HOME`). It fetches no `.crate` file unless a build uses `--cfg loom` (the same test: 0 `.crate` files, for both a host test build of `origin-sync` and a kernel-target build).
+
+| Model | Scenario (the real code) | Default search (`check`) | Deep search (`ORIGIN_LOOM_DEEP=1`) |
+|---|---|---|---|
+| `spin_lock_two_threads_two_rounds` | two threads, two critical sections each: exclusion (a counter, and Loom's cell checks) and no lost update | exhaustive, spin bound 4: 19,785 executions | exhaustive, spin bound 4: 19,785 executions |
+| `spin_lock_three_threads` | three threads, one critical section each: the same | at most 3 preemptions, spin bound 4: 46,070 executions | at most 4 preemptions, spin bound 4: 411,984 executions |
+| `spin_lock_passes_writes_to_the_next_holder` | a two-field write is seen whole by the next holder | exhaustive, spin bound 4: 17 executions | exhaustive, spin bound 4: 17 executions |
+| `try_lock_leaves_a_held_lock_held` | a failed `try_lock` leaves the holder's lock held; a successful one excludes | exhaustive, spin bound 4: 123 executions | exhaustive, spin bound 4: 123 executions |
+| `try_lock_passes_writes_to_the_next_holder` | a successful `try_lock` sees the last holder's writes whole | exhaustive, spin bound 4: 12 executions | exhaustive, spin bound 4: 12 executions |
+| `wait_queue_waker_and_waiter_release_acquire` | one waiter, one waker, `Release`/`Acquire` on the condition (the boot proof's orderings) | at most 6 preemptions, spin bound 4: 25,061 executions | exhaustive, spin bound 4: 365,323 executions |
+| `wait_queue_waker_and_waiter_relaxed` | the same with `Relaxed` on the condition, the weakest a caller could use | at most 6 preemptions, spin bound 4: 25,061 executions | exhaustive, spin bound 4: 365,323 executions |
+| `wait_queue_ping_pong` | the boot proof's ping-pong, one round: each thread both waits and wakes | at most 3 preemptions, spin bound 4: 21,116 executions | at most 4 preemptions, spin bound 4: 142,182 executions |
+| `wait_queue_producer_consumer` | the boot proof's ring, one slot, two items: each side blocks on the other, the condition takes the ring's lock under the queue's | at most 3 preemptions, spin bound 4: 44,503 executions | at most 4 preemptions, spin bound 4: 383,635 executions |
+| `wait_queue_two_waiters` | two waiters, one waker with two tokens and two wake-ups | at most 2 preemptions, spin bound 2: 75,798 executions | at most 3 preemptions, spin bound 3: 3,447,974 executions |
+| `wait_queue_full_queue_polls` | a queue with one slot: the second waiter cannot register and polls | at most 2 preemptions, spin bound 2: 64,437 executions | at most 3 preemptions, spin bound 3: 3,330,439 executions |
+| `wait_queue_boot_flow_polls` | the boot or idle flow polls and never blocks | exhaustive, spin bound 4: 45,318 executions | exhaustive, spin bound 4: 45,318 executions |
+| `wait_queue_timed_wait_gives_way` | a timed waiter, an untimed waiter, one token and one wake-up: giving up must not swallow the wake-up | at most 2 preemptions, spin bound 2: 72,918 executions | at most 3 preemptions, spin bound 3: 3,705,610 executions |
+| `wait_queue_stale_wake_up_is_harmless` | a wake-up outlives a timed wait and ends the next wait's first block: the wait re-checks | at most 3 preemptions, spin bound 4: 40,186 executions | at most 4 preemptions, spin bound 4: 335,371 executions |
+
+- **What is proved (CLAUDE.md §73):** for the code above, **within the bounds in the table**, over every thread interleaving (up to Loom's removal of equivalent ones) and every store a `Relaxed` load may see in Loom's model of the C11 memory model:
+  - `SpinLock`: at most one holder at a time; every access to the protected value is ordered by happens-before with every other (Loom's cell checks this: no data race); each holder sees all earlier holders' writes, whole. `try_lock`: a failure leaves the holder's lock held; a success is a real holder.
+  - The wait queue, **no lost wake-ups**: a thread in `wait_until` or `wait_until_deadline` whose condition is made true by a thread that then calls `wake_one` does not stay blocked (a lost wake-up leaves every thread blocked, and Loom reports that as a deadlock). That holds with `Relaxed` on the condition, the weakest ordering a caller could use: the queue's lock carries the ordering. A wait returns only with its condition true, also after a wake-up that outlived an earlier wait. A timed wait that gives up leaves no registration, so it cannot swallow the next waiter's wake-up. A thread that cannot register (a full queue, or the boot flow) still sees the condition by polling.
+- **What is not proved:**
+  - Anything past the bounds: more threads or rounds (at most three spawned threads and the model's own; Loom's limit is five in all), more preemptions than a model's bound, more spin iterations than its spin bound (below).
+  - Anything Loom's memory model omits: load buffering is not modelled (Loom's own documentation says so), and `compare_exchange_weak` never fails spuriously in Loom (`loom-0.7.2/src/sync/atomic/bool.rs`), so `lock` is not explored taking a spurious failure (it would only loop again).
+  - Interrupts. `without_interrupts` does nothing in the models, so the rule that no handler may take a lock interrupted code can hold is not checked. A handler that wakes is modelled as another thread.
+  - The scheduler around the run queue: the context switch, `sched::on_block`, the reschedule IPI and the timer are stood in for by a `Notify` and the run-queue calls they make. That a ready thread eventually runs is assumed. Fairness and starvation are not modelled: Loom's checks here are safety and deadlock, not progress of one thread among many.
+  - The machine. These are host builds against Loom's atomics; the x86-64 code the kernel runs, `pause` and TSO are not examined. Boot proofs (QEMU, TCG) cover the running kernel; hardware is §74.
+  - `RwLock` (no model yet), the timed wait on the boot flow (`Step::Poll`), and what callers must uphold themselves: the state changes before `wake_one` (control `waker_wakes_before_setting_the_flag` shows it matters), one condition per queue.
+  - Models add no ordering of their own: their counters, tokens and clock are `Relaxed`. `Notify` synchronizes, but the resumed thread then takes the run queue's lock, which carries the same ordering in the real resumption.
+- **Bounds:** two threads spinning on one lock can take turns for ever, and Loom counts each turn as a new execution whatever the preemption bound (found here: the first three-thread models exceeded Loom's 1000 branches per execution). So each thread's spin iterations are explored up to a bound; past it the execution still runs to its end, with all its checks, but branches no further (`prim::spin_loop`, `loom::skip_branch`). A spin changes nothing and can only observe the lock change hands, so the bound limits how many such changes a thread can wait through. Raising it from 4 to 8 changed nothing for `spin_lock_two_threads_two_rounds` and the waker/waiter models (19,785 and 365,323 executions, the same as with no bound at all), and those two-thread runs are exhaustive. Three-thread counts do grow with the bound (for `wait_queue_two_waiters`, 75,798 / 148,125 / 291,717 at 2 / 4 / 8, all at two preemptions), so those results are bounded in both senses.
+- **Negative controls:** 14, each applied to a scratch copy and required to make the named models fail with the named report. Every model has at least one; 21 model runs in all.
+
+| Control | The bug | Model(s) that find it | Report |
+|---|---|---|---|
+| `lock_acquire_relaxed` | `lock()`'s successful exchange `Acquire` → `Relaxed` | `spin_lock_two_threads_two_rounds`, `spin_lock_three_threads`, `wait_queue_waker_and_waiter_relaxed` | `Causality violation` |
+| `unlock_release_relaxed` | the guard's unlock `Release` → `Relaxed` | `spin_lock_two_threads_two_rounds`, `spin_lock_passes_writes_to_the_next_holder`, `wait_queue_waker_and_waiter_relaxed` | `Causality violation` |
+| `try_lock_acquire_relaxed` | `try_lock`'s exchange `Acquire` → `Relaxed` | `try_lock_passes_writes_to_the_next_holder` | `Causality violation` |
+| `failed_try_lock_unlocks` | a failed `try_lock` builds and drops a guard (the bug its comment warns of) | `try_lock_leaves_a_held_lock_held` | `Causality violation` |
+| `lock_not_atomic` | checking and then setting in two steps | `spin_lock_two_threads_two_rounds` | `Causality violation` |
+| `wake_one_never_wakes` | `wake_one` takes the waiter and does not wake it | `wait_queue_waker_and_waiter_release_acquire`, `wait_queue_ping_pong`, `wait_queue_producer_consumer`, `wait_queue_two_waiters` | `deadlock` |
+| `run_queue_forgets_an_early_wake` | `RunQueue::wake` does not keep a wake-up for a thread that has not blocked yet | `wait_queue_waker_and_waiter_release_acquire` | `deadlock` |
+| `condition_checked_before_the_lock` | the condition read before taking the queue's lock | `wait_queue_waker_and_waiter_relaxed` | `deadlock` |
+| `registered_after_unlocking` | the check and the registration in separate critical sections | `wait_queue_waker_and_waiter_relaxed` | `deadlock` |
+| `full_queue_blocks_unregistered` | a thread that found the queue full blocks without registering | `wait_queue_full_queue_polls` | `deadlock` |
+| `boot_flow_blocks` | the boot flow blocks instead of polling | `wait_queue_boot_flow_polls` | `deadlock` |
+| `timeout_leaves_its_registration` | a timed-out wait leaves its registration | `wait_queue_timed_wait_gives_way` | `deadlock` |
+| `no_recheck_after_a_block` | `wait_until` returns after a block without re-checking | `wait_queue_stale_wake_up_is_harmless` | `returned with the condition false` |
+| `waker_wakes_before_setting_the_flag` | the model's waker wakes before changing the state (the rule for callers) | `wait_queue_waker_and_waiter_release_acquire` | `deadlock` |
+
+- **Test evidence (2026-11-08):** `cargo xtask loom` and `cargo xtask check`: 14 models pass in the default search (480,405 executions), each model's control is caught. A deep run (`ORIGIN_LOOM_DEEP=1 cargo xtask loom`) passes 14 models over 12,553,096 executions in 7.7 minutes under heavy host load, the two-thread waker/waiter models exhaustively (365,323 executions each). `cargo xtask check` passes on the final code: 26 test binaries, 698 passed, 0 failed, 6 ignored (the download-gated crypto vectors). `cargo xtask boot-test` and `cargo xtask boot-matrix` pass on this code: VT-d and AMD-Vi at 1, 2 and 4 CPUs, then the sparse machine under leaves 1Fh and 0Bh, with the wait-queue boot proofs unchanged (ping-pong 4–5 µs on one CPU, 35–51 µs across CPUs). Several earlier attempts failed at the `clock` proof while another session ran a CPU stress test (load average above 100): that proof runs before any wait-queue code, it is the RTC flake recorded in the handoff, and the passing run came after the stress ended.
+- **Toolchain:** stable Rust 1.99.1, no nightly features: `RUSTFLAGS="--cfg loom"` and a target directory of its own (`target/loom`). The models need `--release` to be practical.
+- **Known external firmware/data dependencies:** none.
+- **Performance (measured under a host load average above 100, from another session's stress run):** `cargo xtask loom` takes 26 s (13 s of models; 14 control builds and 21 model runs). The first run also builds Loom's 24 crates (19 s) once. All of `cargo xtask check` took 52 s. The search is bounded per model for that reason; `ORIGIN_LOOM_DEEP=1` (7.7 minutes here) runs the deeper bounds.
+- **Code review:** not yet independently reviewed.
+- **Reproduce:** `cargo xtask loom` (or `cargo xtask check`). `ORIGIN_LOOM_DEEP=1 cargo xtask loom` runs each model at its deeper bound.
+- **Licensing:** project licence not chosen yet. The 30 locked crates are MIT, Apache-2.0 or Unlicense, as listed above, and none of them ships.
 
 ## `origin-version.toml` and `runtime/version/` (`origin-version`), T5
 

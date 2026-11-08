@@ -49,6 +49,14 @@ Every parser in the host-tested library that reads firmware or device data has a
 
 The ONBF parsers, which run in the boot loader on data read before any signature is checked, have their own seeded multi-fault soaks: one to four faults per case over the container, OCBOR-1, the KRN manifest and the signature block, plus Merkle and signature verification, each judged by a model written from the specification (re-encoding byte for byte where an encoder exists, and compared in both directions). A default run is about 98,000 cases and adds about 1 s to `cargo xtask check`. They found five conformance bugs, none a panic or an out-of-bounds read, since all of these crates are panic-free by lint and by the object check: a mapped MERKLE or DWARF section was accepted, a certificate chain longer than four, a statement version that is not SemVer, and a block larger than 1 MiB passed straight to `SignatureBlock::parse`. Each is fixed with a regression test and shown to fail with its fix reverted.
 
+## Concurrency models (CLAUDE.md §73; 2026-11-08)
+
+`cargo xtask loom`, also part of `cargo xtask check`, model-checks the real `SpinLock`, the real wait-queue protocol and the real run queue under Loom 0.7.2 (a host-only dev-dependency of `origin-sync`'s tests; no shipping crate can reach it, and `cargo xtask check` now fails if one does or if `Cargo.lock` changes without approval). To run under Loom the protocol moved out of the kernel binary, unchanged, into `origin_sync::wait`.
+
+**Proved, within each model's printed bounds** (14 models; every interleaving up to Loom's reduction, in Loom's model of C11): one `SpinLock` holder at a time, no data race on the protected value, and each holder sees earlier holders' writes whole; `try_lock` likewise; and **no lost wake-up**: a waiter whose condition is made true by a thread that then calls `wake_one` does not stay blocked, even with `Relaxed` on the condition (the queue's lock carries the ordering), a wait returns only with its condition true, a timed-out waiter leaves no registration behind, and threads that cannot register still see the condition by polling. 14 negative controls (weakened orderings, a removed wake-up, an early wake-up forgotten by the run queue, a condition read outside the lock, and others), each applied to a scratch copy of the source, make the models fail with the expected report; every model has one.
+
+**Not proved:** anything past the bounds; what Loom's memory model omits (load buffering, spurious `compare_exchange_weak` failures); interrupts, the context switch, IPIs and timers, which the models stand in for; fairness and starvation; the x86-64 machine code; `RwLock`, which has no model yet. The full statement, the bounds and the 30 approved third-party crates with their licences and sizes are in `docs/engineering/SOURCE_PROVENANCE.md`, "Loom models".
+
 ## Native formats and cryptography
 
 | Component | State |
