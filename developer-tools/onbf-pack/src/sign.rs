@@ -14,7 +14,7 @@
 use core::fmt;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -149,6 +149,16 @@ pub fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// `O_NOFOLLOW` of the build host, which `std` does not name: opening a symbolic link fails.
+/// There is no value for any other host, so a build there stops here rather than following
+/// links.
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const O_NOFOLLOW: i32 = 0o400_000;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_NOFOLLOW: i32 = 0o100_000;
+
 /// The first bytes of a key file holding a real key.
 const KEY_FILE_MAGIC: [u8; 8] = *b"ONBFKEY1";
 /// The first bytes of a key file holding a test key, derived from public text. The file says
@@ -199,21 +209,32 @@ impl HostKey {
         self.is_test_key
     }
 
-    /// Loads a key file written by [`generate_keys`], refusing a damaged or foreign one, and
-    /// one that anyone but its owner can read: like an SSH private key, it must be mode 0600.
+    /// Loads a key file written by [`generate_keys`], refusing a damaged or foreign one, a
+    /// symbolic link, and one that anyone but its owner can read: like an SSH private key, it
+    /// must be mode 0600. Opened once and checked on that handle, so that what is read is
+    /// exactly what was checked.
     pub fn load(path: &Path) -> Result<Self, SignError> {
-        let permissions = fs::metadata(path)
-            .map_err(|e| SignError::Io(format!("cannot read {}: {e}", path.display())))?
-            .permissions()
-            .mode();
-        if permissions & 0o077 != 0 {
+        let cannot_read = |e| SignError::Io(format!("cannot read {}: {e}", path.display()));
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(path)
+            .map_err(cannot_read)?;
+        let metadata = file.metadata().map_err(cannot_read)?;
+        if !metadata.is_file() {
+            return Err(SignError::KeyFile {
+                path: path.to_path_buf(),
+                why: "not a regular file",
+            });
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
             return Err(SignError::KeyFile {
                 path: path.to_path_buf(),
                 why: "readable by others: a key file must be mode 0600",
             });
         }
-        let mut bytes = fs::read(path)
-            .map_err(|e| SignError::Io(format!("cannot read {}: {e}", path.display())))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(cannot_read)?;
         let result = Self::parse(&bytes).map_err(|why| SignError::KeyFile {
             path: path.to_path_buf(),
             why,

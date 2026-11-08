@@ -11,9 +11,11 @@
 use origin_crypto::{ed25519_verify, mldsa87_verify};
 
 use crate::ed25519;
-use crate::ed25519::testing::{L, bytes_from_words, reduce_512, scalar_mul_add, words_from_bytes};
+use crate::ed25519::testing::{
+    L, bytes_from_words, reduce_512, scalar_mul_add, scalar_mul_add_into, words_from_bytes,
+};
 use crate::mldsa87::testing::{
-    ALPHA, DECOMPOSE_M, GAMMA2, N, Poly, Q, any_at_least, centered, decompose, equal_mask,
+    ALPHA, Attempt, DECOMPOSE_M, GAMMA2, N, Poly, Q, any_at_least, centered, decompose, equal_mask,
     expand_mask, from_signed, inverse_ntt, make_hint, mul, ntt, pointwise, power2round, reduce,
     sample_in_ball,
 };
@@ -303,6 +305,61 @@ fn mldsa87_signatures_verify_for_many_keys_contexts_and_messages() {
             assert!(mldsa87_verify(key.public_key(), &message, &other, &sig).is_err());
         }
     }
+}
+
+/// `scalar_mul_add`'s copy of the secret scalar and its wide product are wiped, and the
+/// result is the one the buffers do not change.
+#[test]
+fn ed25519_wipes_its_copy_of_the_scalar_and_the_product() {
+    let k = [3, 5, 7, 11];
+    let a = [0x5Au8; 32];
+    let r = [13, 17, 19, 23];
+    let (mut a_words, mut wide) = ([0u64; 4], [0u64; 8]);
+    let result = scalar_mul_add_into(&k, &a, &r, &mut a_words, &mut wide);
+    assert_eq!(a_words, [0u64; 4], "the scalar's copy");
+    assert_eq!(wide, [0u64; 8], "the 512-bit product");
+    assert_eq!(result, scalar_mul_add(&k, &a, &r));
+}
+
+/// Every buffer of a signing attempt is wiped: the ones that outlive the loop, and the
+/// per-attempt polynomials, which leave each attempt's secrets behind if they are left alone.
+#[test]
+fn mldsa87_wipes_every_attempt_buffer() {
+    let key = SigningKey::from_seed(&[0x42; 32]);
+    let mut a = Attempt::new();
+    // Poison, so the check below cannot pass on buffers that were never written.
+    a.y = [[9; N]; 7];
+    a.y_hat = a.y;
+    a.z = a.y;
+    a.w = [[9; N]; 8];
+    a.r = a.w;
+    a.hints = a.w;
+    a.high = [9; N];
+    a.low = [9; N];
+    a.c_hat = [9; N];
+    a.cs = [9; N];
+    a.w1_encoded = [9; 1024];
+    a.ctilde = [9; 64];
+    let signature = key.sign_into(b"message", b"", &[7; 32], &mut a).unwrap();
+    let (polys_l, polys_k) = ([[0; N]; 7], [[0; N]; 8]);
+    assert_eq!(a.y, polys_l, "y");
+    assert_eq!(a.y_hat, polys_l, "y_hat");
+    assert_eq!(a.z, polys_l, "z");
+    assert_eq!(a.w, polys_k, "w");
+    assert_eq!(a.r, polys_k, "r");
+    assert_eq!(a.hints, polys_k, "hints");
+    assert_eq!(a.high, [0; N], "high");
+    assert_eq!(a.low, [0; N], "low");
+    assert_eq!(a.c_hat, [0; N], "c_hat");
+    assert_eq!(a.cs, [0; N], "cs");
+    assert_eq!(a.w1_encoded, [0; 1024], "w1");
+    assert_eq!(a.ctilde, [0; 64], "c tilde");
+    // The wiping does not touch the result, and buffers still poisoned do not either.
+    assert_eq!(
+        signature,
+        key.sign(b"message", b"", &[7; 32]).unwrap(),
+        "signing is deterministic for a fixed rnd"
+    );
 }
 
 #[test]

@@ -6,7 +6,7 @@
 
 use origin_crypto::Sha512;
 
-use crate::wipe;
+use crate::{wipe, wipe_u64};
 
 const LOW_51: u64 = (1 << 51) - 1;
 
@@ -336,12 +336,25 @@ pub(crate) fn bytes_from_words(w: &[u64; 4]) -> [u8; 32] {
 
 /// `(k·a + r) mod L`, with every step independent of the values.
 pub(crate) fn scalar_mul_add(k: &[u64; 4], a: &[u8; 32], r: &[u64; 4]) -> [u8; 32] {
-    let a = words_from_bytes(a);
+    let (mut a_words, mut wide) = ([0u64; 4], [0u64; 8]);
+    scalar_mul_add_into(k, a, r, &mut a_words, &mut wide)
+}
+
+/// [`scalar_mul_add`], with the two working buffers that hold the secret scalar and its product
+/// supplied by the caller, and wiped here before the result is returned (see the crate
+/// documentation). Separate so that a test can see them. Both must hold zeros.
+pub(crate) fn scalar_mul_add_into(
+    k: &[u64; 4],
+    a: &[u8; 32],
+    r: &[u64; 4],
+    a_words: &mut [u64; 4],
+    wide: &mut [u64; 8],
+) -> [u8; 32] {
+    *a_words = words_from_bytes(a);
     // The 512-bit product k·a plus r: k < 2^256 and a < 2^255, so it cannot overflow.
-    let mut wide = [0u64; 8];
     for (i, &ki) in k.iter().enumerate() {
         let mut carry = 0u128;
-        for (j, &aj) in a.iter().enumerate() {
+        for (j, &aj) in a_words.iter().enumerate() {
             let sum = u128::from(wide[i + j]) + u128::from(ki) * u128::from(aj) + carry;
             wide[i + j] = sum as u64;
             carry = sum >> 64;
@@ -355,11 +368,13 @@ pub(crate) fn scalar_mul_add(k: &[u64; 4], a: &[u8; 32], r: &[u64; 4]) -> [u8; 3
         carry = sum >> 64;
     }
     let mut bytes = [0u8; 64];
-    for (chunk, word) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(wide) {
+    for (chunk, word) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(wide.iter()) {
         *chunk = word.to_le_bytes();
     }
     let result = reduce_512(&bytes);
     wipe(&mut bytes);
+    wipe_u64(a_words);
+    wipe_u64(wide);
     bytes_from_words(&result)
 }
 
@@ -411,8 +426,7 @@ pub fn sign(seed: &[u8; 32], message: &[u8]) -> [u8; 64] {
     wipe(&mut prefix);
     wipe(&mut nonce_hash);
     wipe(&mut r_bytes);
-    r.fill(0);
-    core::hint::black_box(&r);
+    wipe_u64(&mut r);
 
     let mut signature = [0u8; 64];
     signature[..32].copy_from_slice(&big_r);
@@ -423,5 +437,7 @@ pub fn sign(seed: &[u8; 32], message: &[u8]) -> [u8; 64] {
 #[cfg(test)]
 pub(crate) mod testing {
     //! Internals for `src/tests.rs`.
-    pub(crate) use super::{L, bytes_from_words, reduce_512, scalar_mul_add, words_from_bytes};
+    pub(crate) use super::{
+        L, bytes_from_words, reduce_512, scalar_mul_add, scalar_mul_add_into, words_from_bytes,
+    };
 }
