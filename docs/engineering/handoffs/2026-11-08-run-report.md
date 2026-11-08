@@ -13,7 +13,7 @@ This report covers the continuation of the twelve-hour run (from ~02:00 IST 2026
 ## 1. Headline state at the end of the run
 
 - `cargo xtask check` passes: `rustfmt --check`, workspace Clippy with `-D warnings`, the no-panic object scan on the freestanding crates, and the §11 (`cfg(target_os)`) and §62 (manifest `version`) lints.
-- **501 tests across 27 workspace suites, 0 failures** (6 ignored = the download-gated crypto vectors). **260 of them** are `framekernel` host library tests across **49 modules**.
+- **505 tests across 27 workspace suites, 0 failures** (6 ignored = the download-gated crypto vectors). **264 of them** are `framekernel` host library tests across **50 modules**.
 - `cargo xtask boot-test` and `cargo xtask boot-matrix` (1, 2 and 4 CPUs) pass; an 8-CPU boot (`ORIGIN_QEMU_SMP=8`) was confirmed. Every kernel feature added this run prints a gated boot marker and has at least one negative control that was shown to fail the boot and then restored.
 - A 40× mutation soak (`ORIGIN_MUTATION_SCALE=40`) over 12 untrusted-input parser suites ran with 0 failures.
 - **Everything runs under QEMU 11.1.3 (TCG) + OVMF only. No physical-hardware qualification (CLAUDE.md §74).**
@@ -58,6 +58,7 @@ Each item was built → host-tested → `cargo xtask check` → committed, with 
 - **glob** (`glob`): `*`/`?`/`[...]` matching for names and paths (single-star-pointer backtracking, terminates on adversarial patterns).
 - **ring buffer** (`ring`): the bounded input/audio/log queue (§55/§56/§69).
 - **hash map** (`hashmap`): a string-keyed FNV-1a open-addressing map for name tables (§29/§30).
+- **kernel log buffer** (`klog`): a `dmesg`-style ring of level+message records that retains the most recent and drops the oldest (§69 structured logging / failure records); groundwork, not yet teed from the console.
 
 ## 3. How it was validated
 
