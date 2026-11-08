@@ -193,23 +193,90 @@ fn transmit(tx: &Queue, notify_base: u64, mul: u32, frame: &[u8]) -> bool {
     false
 }
 
-/// Does a live ARP exchange over the NIC: posts receive buffers, transmits an ARP request
-/// for `target` (QEMU's gateway), and polls the receive queue for the reply, returning the
-/// resolved MAC. This proves the whole transmit **and** receive datapath against a real
-/// device. `our_mac` is the NIC's address.
-fn arp_exchange(
+/// Waits for the next received frame and returns its Ethernet bytes (the virtio-net header
+/// stripped), advancing `last_used`. An empty slice means a malformed completion the caller
+/// should skip; `None` means the poll timed out.
+fn recv_frame(
+    rx: &Queue,
+    rx_pages: &[u64; N_RX],
+    last_used: &mut u16,
+    spins: u64,
+) -> Option<&'static [u8]> {
+    for _ in 0..spins {
+        if r16(rx.used + 2) != *last_used {
+            fence(Ordering::SeqCst);
+            let slot = (*last_used as usize) % rx.size;
+            let (id, len) =
+                virtqueue::used_elem(page(rx.used, virtqueue::used_bytes(rx.size)), slot);
+            *last_used = last_used.wrapping_add(1);
+            let (id, len) = (id as usize, len as usize);
+            if id >= N_RX || !(virtio::NET_HDR_LEN..=RX_BUF).contains(&len) {
+                return Some(&[]);
+            }
+            return Some(&page(rx_pages[id], RX_BUF)[virtio::NET_HDR_LEN..len]);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+/// Builds a broadcast Ethernet frame into `out` and returns its length.
+fn build_frame(out: &mut [u8], our_mac: Mac, ethertype: u16, payload: &[u8]) -> Option<usize> {
+    EthFrame::write_header(Mac::BROADCAST, our_mac, ethertype, out)?;
+    let end = net::ETH_HEADER + payload.len();
+    out.get_mut(net::ETH_HEADER..end)?.copy_from_slice(payload);
+    Some(end)
+}
+
+/// Transmits a DHCP message (broadcast) by wrapping it in UDP (68 → 67), IPv4 and Ethernet.
+fn transmit_dhcp(tx: &Queue, notify_base: u64, mul: u32, our_mac: Mac, dhcp: &[u8]) -> bool {
+    let any = Ipv4([0, 0, 0, 0]);
+    let bcast = Ipv4([255, 255, 255, 255]);
+    let mut udp = [0u8; 640];
+    let Some(un) = net::Udp::write(any, bcast, 68, 67, dhcp, &mut udp) else {
+        return false;
+    };
+    let mut ip = [0u8; 680];
+    let Some(ipn) =
+        net::Ipv4Packet::write(any, bcast, net::protocol::UDP, 64, 0, &udp[..un], &mut ip)
+    else {
+        return false;
+    };
+    let mut frame = [0u8; 720];
+    let Some(fl) = build_frame(&mut frame, our_mac, ethertype::IPV4, &ip[..ipn]) else {
+        return false;
+    };
+    transmit(tx, notify_base, mul, &frame[..fl])
+}
+
+/// Extracts the DHCP message (the UDP payload) from a received Ethernet frame addressed to
+/// the client port (68), or `None` if it is not such a datagram. The UDP checksum is not
+/// re-verified here (the IPv4 header checksum is, by `parse`).
+fn dhcp_payload(frame: &[u8]) -> Option<&[u8]> {
+    let eth = EthFrame::parse(frame)?;
+    if eth.ethertype != ethertype::IPV4 {
+        return None;
+    }
+    let ip = net::Ipv4Packet::parse(eth.payload)?;
+    if ip.protocol != net::protocol::UDP || ip.payload.len() < net::UDP_HEADER {
+        return None;
+    }
+    let dst_port = u16::from_be_bytes([ip.payload[2], ip.payload[3]]);
+    (dst_port == 68).then(|| &ip.payload[net::UDP_HEADER..])
+}
+
+/// Resolves `target`'s MAC with a live ARP request/reply over the NIC.
+fn arp_resolve(
     rx: &Queue,
     tx: &Queue,
+    rx_pages: &[u64; N_RX],
+    last_used: &mut u16,
     notify_base: u64,
     mul: u32,
     our_mac: Mac,
-    target: Ipv4,
 ) -> Option<Mac> {
-    let rx_pages = post_rx(rx, notify_base, mul)?;
-
-    // Build the ARP request frame: broadcast Ethernet, then the ARP who-has.
-    let mut frame = [0u8; net::ETH_HEADER + net::ARP_LEN];
-    EthFrame::write_header(Mac::BROADCAST, our_mac, ethertype::ARP, &mut frame)?;
+    let target = Ipv4([10, 0, 2, 2]); // QEMU's gateway
+    let mut req = [0u8; net::ARP_LEN];
     Arp {
         operation: arp_op::REQUEST,
         sender_mac: our_mac,
@@ -217,33 +284,50 @@ fn arp_exchange(
         target_mac: Mac([0; 6]),
         target_ip: target,
     }
-    .write(&mut frame[net::ETH_HEADER..])?;
-    if !transmit(tx, notify_base, mul, &frame) {
-        return None;
-    }
+    .write(&mut req)?;
+    let mut frame = [0u8; net::ETH_HEADER + net::ARP_LEN];
+    let fl = build_frame(&mut frame, our_mac, ethertype::ARP, &req)?;
+    transmit(tx, notify_base, mul, &frame[..fl]);
 
-    // Poll the receive queue for the gateway's reply.
-    for _ in 0..50_000_000u64 {
-        if r16(rx.used + 2) != 0 {
-            fence(Ordering::SeqCst);
-            let (id, len) = virtqueue::used_elem(page(rx.used, virtqueue::used_bytes(rx.size)), 0);
-            let (id, len) = (id as usize, len as usize);
-            if id >= N_RX || !(virtio::NET_HDR_LEN..=RX_BUF).contains(&len) {
-                return None;
-            }
-            let buf = page(rx_pages[id], RX_BUF);
-            // Strip the virtio-net header, then parse Ethernet → ARP.
-            let eth = EthFrame::parse(&buf[virtio::NET_HDR_LEN..len])?;
-            if eth.ethertype != ethertype::ARP {
-                return None;
-            }
-            let arp = Arp::parse(eth.payload)?;
-            if arp.operation == arp_op::REPLY && arp.sender_ip == target {
-                return Some(arp.sender_mac);
-            }
-            return None;
+    for _ in 0..4 {
+        let eth = recv_frame(rx, rx_pages, last_used, 50_000_000)?;
+        if let Some(parsed) = EthFrame::parse(eth)
+            && parsed.ethertype == ethertype::ARP
+            && let Some(arp) = Arp::parse(parsed.payload)
+            && arp.operation == arp_op::REPLY
+            && arp.sender_ip == target
+        {
+            return Some(arp.sender_mac);
         }
-        core::hint::spin_loop();
+    }
+    None
+}
+
+/// Obtains a DHCP lease over the NIC: DISCOVER → OFFER → REQUEST → ACK with QEMU's built-in
+/// server, returning the leased address.
+fn dhcp_lease(
+    rx: &Queue,
+    tx: &Queue,
+    rx_pages: &[u64; N_RX],
+    last_used: &mut u16,
+    notify_base: u64,
+    mul: u32,
+    our_mac: Mac,
+) -> Option<Ipv4> {
+    let mut client = framekernel::dhcp::Client::new(our_mac.0);
+    transmit_dhcp(tx, notify_base, mul, our_mac, &client.start(0x4F52_4947));
+    for _ in 0..8 {
+        let eth = recv_frame(rx, rx_pages, last_used, 100_000_000)?;
+        let Some(message) = dhcp_payload(eth) else {
+            continue;
+        };
+        match client.on_receive(message) {
+            framekernel::dhcp::Action::Send(request) => {
+                transmit_dhcp(tx, notify_base, mul, our_mac, &request);
+            }
+            framekernel::dhcp::Action::Bound(lease) => return Some(lease.address),
+            _ => {}
+        }
     }
     None
 }
@@ -338,28 +422,47 @@ pub(crate) fn prove(com1: &mut Console) {
     let status_word = r16(devcfg + 6);
     let link_up = status_word & 1 != 0;
 
-    // Do a live ARP exchange with QEMU's gateway (10.0.2.2): this transmits a frame and
-    // receives the reply, exercising the whole datapath.
-    let gateway = Ipv4([10, 0, 2, 2]);
-    let resolved = match (rx.as_ref(), tx.as_ref()) {
-        (Some(rx), Some(tx)) => arp_exchange(
-            rx,
-            tx,
+    // Live datapath over the NIC: post receive buffers once, resolve the gateway by ARP,
+    // then obtain a DHCP lease — a real transmit-and-receive against QEMU's networking.
+    let mul = caps.notify_off_multiplier;
+    let (mut arp, mut lease) = (None, None);
+    if let (Some(rxq), Some(txq)) = (rx.as_ref(), tx.as_ref())
+        && let Some(rx_pages) = post_rx(rxq, notify_base, mul)
+    {
+        let mut last_used = 0u16;
+        arp = arp_resolve(
+            rxq,
+            txq,
+            &rx_pages,
+            &mut last_used,
             notify_base,
-            caps.notify_off_multiplier,
+            mul,
             Mac(mac),
-            gateway,
-        ),
-        _ => None,
-    };
+        );
+        lease = dhcp_lease(
+            rxq,
+            txq,
+            &rx_pages,
+            &mut last_used,
+            notify_base,
+            mul,
+            Mac(mac),
+        );
+    }
 
     let mac_ok = mac == EXPECTED_MAC;
-    let consistent =
-        features_ok && queues_ok && driver_ok && mac_ok && link_up && resolved.is_some();
-    let g = resolved.unwrap_or(Mac([0; 6])).0;
+    let consistent = features_ok
+        && queues_ok
+        && driver_ok
+        && mac_ok
+        && link_up
+        && arp.is_some()
+        && lease.is_some();
+    let g = arp.unwrap_or(Mac([0; 6])).0;
+    let ip = lease.unwrap_or(Ipv4([0, 0, 0, 0])).0;
     let _ = writeln!(
         com1,
-        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, RX+TX queues up {queues_ok}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({}); consistent {}{}",
+        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; DHCP lease {}.{}.{}.{}; consistent {}{}",
         mac[0],
         mac[1],
         mac[2],
@@ -372,11 +475,10 @@ pub(crate) fn prove(com1: &mut Console) {
         g[3],
         g[4],
         g[5],
-        if resolved.is_some() {
-            "reply received"
-        } else {
-            "no reply"
-        },
+        ip[0],
+        ip[1],
+        ip[2],
+        ip[3],
         consistent,
         if consistent {
             ""
