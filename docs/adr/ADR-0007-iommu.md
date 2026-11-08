@@ -1,15 +1,15 @@
-# ADR-0007: DMA isolation and interrupt remapping with the IOMMU (Intel VT-d first)
+# ADR-0007: DMA isolation and interrupt remapping with the IOMMU (Intel VT-d and AMD-Vi)
 
 | | |
 |---|---|
-| Status | **Proposed** (2026-11-08). The owner accepts ADRs (CLAUDE.md §18, §84). This is a kernel-internal security mechanism, not an ABI or format decision, so it is implemented and boot-proven while Proposed; the parts that will reach the Driver ABI (how a user-mode driver asks for DMA memory, §31) are decided later, against this. |
+| Status | **Proposed** (2026-11-08; the AMD-Vi section added the same day, also Proposed). The owner accepts ADRs (CLAUDE.md §18, §84). This is a kernel-internal security mechanism, not an ABI or format decision, so it is implemented and boot-proven while Proposed; the parts that will reach the Driver ABI (how a user-mode driver asks for DMA memory, §31) are decided later, against this. |
 | Requires | CLAUDE.md §31 (DMA mapping, interrupt management, driver isolation), §32 (Intel VT-d, AMD IOMMU, interrupt remapping), §58 (DMA protection) |
-| Evidence | `docs/research/2026-11-08-vt-d-iommu.md` (VT-d Rev 5.20, D51397-019, 2026-05-14; what QEMU 11.1's `intel-iommu` emulates); the boot proofs and negative controls in `docs/engineering/SOURCE_PROVENANCE.md` ("Intel VT-d DMA and interrupt remapping"; "I/O APIC interrupts through VT-d interrupt remapping") |
+| Evidence | `docs/research/2026-11-08-vt-d-iommu.md` (VT-d Rev 5.20, D51397-019, 2026-05-14; what QEMU 11.1's `intel-iommu` emulates); `docs/research/2026-11-08-amd-vi-iommu.md` (AMD IOMMU specification 48882 Rev 3.11, April 2026; what QEMU 11.1's `amd-iommu` emulates and where it departs from the specification); the boot proofs and negative controls in `docs/engineering/SOURCE_PROVENANCE.md` ("Intel VT-d DMA and interrupt remapping"; "I/O APIC interrupts through VT-d interrupt remapping"; "AMD-Vi DMA and interrupt remapping") |
 | Related | ADR-0001 D2 (first-party kernel drivers), ADR-0004 (address-space layout: the MMIO window holds the units' registers) |
 
 ## Context
 
-Until now every bus-mastering device could read and write all of physical memory: a buggy or malicious device, or a driver that hands a device a wrong address, could overwrite the kernel. MSI-X messages could reach only APIC IDs 0–255 (compatibility format), so `pci::msi_address` refused any higher ID, and 2026+ platforms with many cores have x2APIC IDs above 255. Both need the IOMMU: DMA remapping for the first, interrupt remapping for the second. QEMU emulates Intel VT-d (and AMD-Vi), so this can be proven in the boot test before hardware exists (CLAUDE.md §74 still applies: nothing here is qualified on hardware).
+Until now every bus-mastering device could read and write all of physical memory: a buggy or malicious device, or a driver that hands a device a wrong address, could overwrite the kernel. MSI-X messages could reach only APIC IDs 0–255 (compatibility format), so `pci::msi_address` refused any higher ID, and 2026+ platforms with many cores have x2APIC IDs above 255. Both need the IOMMU: DMA remapping for the first, interrupt remapping for the second. CLAUDE.md §32 asks for both vendors' IOMMUs. QEMU emulates Intel VT-d and AMD-Vi, so both can be proven in the boot test before hardware exists (CLAUDE.md §74 still applies: nothing here is qualified on hardware). The decisions I1–I11 were written for VT-d in vendor-neutral terms; A1–A10 below say how AMD-Vi meets them.
 
 ## Proposed decisions
 
@@ -57,12 +57,51 @@ A virtio device that offers `VIRTIO_F_ACCESS_PLATFORM` sits behind the IOMMU: th
 ### I11. What is refused rather than half-done
 A DMAR that fails any check (`framekernel::dmar::parse`) leaves the IOMMU off and fails the boot proof loudly; a unit the firmware left enabled is not taken over; a device named by a reserved memory region (RMRR) is refused at attach (identity-mapping RMRRs is not implemented yet), so its DMA stays blocked rather than unchecked; if one unit fails to come up, the units already running are turned off again so drivers are not left blocked with nobody to attach them.
 
+## Proposed decisions for AMD-Vi
+
+The same policy, through AMD-Vi's structures (AMD IOMMU specification 48882 Rev 3.11; research ledger §4). Drivers do not change: `dma::DeviceDma`, `iommu::msi_message` and the other `iommu` entry points dispatch to the AMD-Vi driver (`iommu::amd`) when the firmware provides an IVRS instead of a DMAR.
+
+### A1. Discovery from the IVRS, each IOMMU once
+The IVRS is checked whole (`framekernel::ivrs::parse`); a platform may describe one IOMMU in several IVHD types, and the richest one is used (40h, then 11h, then 10h; specification §4.5). A feature is used only if the Extended Feature Register and the IVHD's image of it both report it.
+*Alternative:* trusting the IVHD image alone, as §5 allows — rejected for the features the kernel turns on (x2APIC mode, INVALIDATE_IOMMU_ALL): a firmware that over-reports would make the kernel program what the hardware lacks.
+
+### A2. Default deny (I2), as device table entries that block
+The device table reaches the highest DeviceID the IVHD names, rounded up to a page; a DeviceID beyond it is denied by the IOMMU itself. Every entry starts **V=1, TV=0**: every DMA aborted and logged, none passed untranslated; and **IV=1, IntCtl 00b**: fixed and arbitrated interrupts aborted. The firmware's DTE settings from the IVRS (the INIT, ExtInt, NMI, LINT0 and LINT1 pass bits and SysMgt) are kept. After enabling, every entry is invalidated (and INVALIDATE_IOMMU_ALL issued where supported).
+*Alternatives:* V=0 — rejected: it passes DMA through untranslated (specification Table 8); Mode 0 with IR=IW=0 — blocks by the specification but QEMU 11.1 passes it through, so it could not be proven; a 64K-entry table always — wasteful when the IVRS names a few buses.
+
+### A3. One domain per requester (I3), host page tables, the same IOVA window (I4)
+Each attached device gets a domain ID from 1 and 4-level host page tables (Mode 4, 48-bit), for the DeviceID its requests carry (the IVRS alias where one is named). IOVAs come from [1 GiB, 2 GiB), never physical addresses. Directory entries name the next level (no level skipping) and allow read and write; the leaf decides.
+
+### A4. Unmapping invalidates and waits (I5)
+The PTE is cleared, then INVALIDATE_IOMMU_PAGES for the page and a COMPLETION_WAIT whose store the kernel polls; only then may the page be reused. A map is followed by an invalidation only where the capability block reports NpCache.
+
+### A5. The command buffer only (I6)
+AMD-Vi has no register-based invalidation. One page, 256 commands; every batch ends with a COMPLETION_WAIT (store, f bit), bounded at 100 ms. A stopped command buffer is reported as a failure.
+
+### A6. Coherency (I7)
+Page-table and interrupt-table walks are snooped (DTE.SD clear; interrupt walks always are). Device-table reads follow Control.Coherent, set as the IVHD recommends; when it is clear, each device table line the kernel writes is flushed.
+
+### A7. Interrupt remapping per device (I8)
+On first use a device gets its own 256-entry interrupt remapping table (IV, IntCtl 10b, IntTabLen 8). Its MSI/MSI-X messages carry `0xFEE0_0000` and data = the IRTE index, below 256 so the message type stays fixed; the vector and destination exist only in the IRTE (fixed delivery, physical destination, no EOI request). With GASup and XTSup, the IOMMU runs GAEn and XTEn: **128-bit IRTEs with 32-bit x2APIC destinations** (GuestMode 0), and `iommu::msi_message` accepts any APIC ID. Without them, 32-bit IRTEs and 8-bit destinations, and APIC IDs above 255 are refused. VT-d checks the source ID in every IRTE; AMD-Vi needs no such field, because a device can reach only the table its own device table entry points to.
+*Alternatives:* one shared table per IOMMU (impossible: the table hangs off each DTE); 2048-entry tables (NumIntRemapMode 01b) — not needed yet, and the indexes above 255 change the message type.
+
+### A8. Faults polled from the event log (I9)
+Event interrupts stay off; `iommu::take_faults` drains the event log (restarting it after an overflow) and decodes by the specification. Both IOMMUs' faults reach callers as one neutral record (page not mapped, page denied, interrupt blocked, other), with the vendor's own record attached for the report. An I/O page fault counts as an interrupt only if I is set and its address is in the interrupt range — on hardware the two agree; QEMU 11.1 sets I on DMA faults too.
+
+### A9. Refused rather than half-done (I11)
+An IVRS that fails any check fails the boot proof loudly; an IOMMU the firmware left enabled is not taken over; a PCI segment other than 0 is refused; a device an IVMD names (unity maps, exclusion ranges) is refused at attach, as RMRR devices are, so its DMA stays blocked rather than unchecked; if one IOMMU fails to come up, the ones already running are turned off again.
+
+### A10. What the QEMU proofs cannot show (CLAUDE.md §74)
+QEMU 11.1's `amd-iommu` translates emulated devices only with `dma-remap=on`, writes every event with address 0 (undefined behaviour in its event encoder, fixed only after 11.1), logs no interrupt-remapping fault and caches no IRTEs. The kernel follows the specification on each point. The AMD-Vi boot test pins QEMU's behaviour (address 0, no interrupt fault record, QEMU's own stderr line for the blocked interrupt), so a QEMU that changes is noticed; **hardware qualification must require the IOVA in the fault record and the interrupt fault event.**
+
 ## Consequences
 
 - Drivers allocate DMA memory through `dma::DeviceDma` (attach once, then pages that come mapped) and program bus addresses, never physical ones; MSI-X entries are programmed through `iommu::msi_message`.
-- The boot needs `-device intel-iommu,intremap=on,eim=on` and `iommu_platform=on` on virtio devices (xtask).
-- Legacy IRQs are routed through `iommu::route_ioapic_pin` and a remappable-format redirection entry whenever interrupts are remapped (the PIT's IRQ0 is proven at every boot); a compatibility-format I/O APIC entry is used only before the IOMMU is up, or without interrupt remapping.
-- Not yet: AMD-Vi (a separate, later step), scalable mode, RMRR identity maps, taking over a unit the firmware enabled (pre-boot DMA protection, `DMA_CTRL_PLATFORM_OPT_IN`), freeing IOVAs and table pages, large-page mappings, device-TLBs (ATS), a fault-event interrupt, hot-plug, and a live level-triggered I/O APIC pin (PCI INTx) with its EOI path.
+- The boot needs `-device intel-iommu,intremap=on,eim=on` and `iommu_platform=on` on virtio devices (xtask). With `ORIGIN_QEMU_IOMMU=amd` it boots instead with `-device AMDVI-PCI,id=iommupci0,addr=05.0 -device amd-iommu,pci-id=iommupci0,intremap=on,xtsup=on,dma-remap=on`; `boot-matrix` runs both IOMMUs at 1, 2 and 4 CPUs. Any other value of `ORIGIN_QEMU_IOMMU` must be an `intel-iommu` device, booted with the VT-d markers (negative controls such as `intel-iommu,intremap=off`).
+- Legacy IRQs are routed through `iommu::route_ioapic_pin` and a remappable-format redirection entry whenever VT-d remaps interrupts (the PIT's IRQ0 is proven at every boot); a compatibility-format I/O APIC entry is used only before the IOMMU is up, or without interrupt remapping. Under AMD-Vi the pins are not routed yet (`iommu::routes_ioapic_pins` is false) and stay masked: see below.
+- Faults reach the proofs through the neutral `iommu::Fault`; the IOMMU proofs in `storage.rs` and the I/O APIC proof in `irq.rs` read it.
+- Not yet for AMD-Vi: IVMD unity maps and exclusion ranges, segments other than 0, taking over an IOMMU the firmware enabled (IVinfo DMA remap support), guest translation, guest virtual APIC (posted interrupts), ATS, PPR, the event-log interrupt, 2048-entry interrupt tables, device-table segmentation; and the I/O APIC under AMD-Vi, whose device table entry (DeviceID from the IVRS special entry) blocks its fixed interrupts until it gets an interrupt table.
+- Not yet: scalable mode, RMRR identity maps, taking over a unit the firmware enabled (pre-boot DMA protection, `DMA_CTRL_PLATFORM_OPT_IN`), freeing IOVAs and table pages, large-page mappings, device-TLBs (ATS), a fault-event interrupt, hot-plug, and a live level-triggered I/O APIC pin (PCI INTx) with its EOI path.
 
 ## Questions for the owner
 
@@ -70,4 +109,7 @@ A DMAR that fails any check (`framekernel::dmar::parse`) leaves the IOMMU off an
 2. Accept the [1 GiB, 2 GiB) IOVA window and "IOVAs are never physical addresses" (I4)?
 3. Accept legacy mode now, with scalable mode as a later revision (I1)?
 4. Accept refusing devices that need RMRRs until identity maps exist (I11), rather than leaving them untranslated?
-5. Policy when a platform has no DMAR (today: run with DMA unconfined, reported): should production refuse to enable bus mastering for untrusted (external, hot-plugged) devices without an IOMMU (§32 external-device authorization)?
+5. Policy when a platform has no DMAR or IVRS (today: run with DMA unconfined, reported): should production refuse to enable bus mastering for untrusted (external, hot-plugged) devices without an IOMMU (§32 external-device authorization)?
+6. Accept, for AMD-Vi, blocking device table entries (V=1, TV=0; IV=1, IntCtl 00b) and one interrupt remapping table per device (A2, A7)?
+7. Accept the two QEMU allowances in the AMD-Vi proofs — a fault record with address 0, and no record of the blocked interrupt — as documented blind spots of QEMU 11.1, with hardware qualification required to check both (A10)?
+8. Accept refusing devices that an IVMD names, as for RMRRs (A9, I11)?

@@ -1,6 +1,9 @@
-//! Intel VT-d DMA and interrupt remapping (CLAUDE.md §32 Intel VT-d and interrupt
-//! remapping, §58 DMA protection; ADR-0007, Proposed; research ledger
-//! `docs/research/2026-11-08-vt-d-iommu.md`).
+//! DMA and interrupt remapping (CLAUDE.md §32 Intel VT-d, AMD IOMMU and interrupt
+//! remapping, §58 DMA protection; ADR-0007, Proposed): the entry points drivers use, and the
+//! Intel VT-d driver (research ledger `docs/research/2026-11-08-vt-d-iommu.md`). The AMD-Vi
+//! driver is the child module [`amd`] (`docs/research/2026-11-08-amd-vi-iommu.md`); every
+//! entry point below goes there when the firmware described AMD IOMMUs (an IVRS) instead
+//! of VT-d units (a DMAR), so drivers do not know which IOMMU they run behind.
 //!
 //! At boot, after PCIe enumeration and before any driver binds:
 //! 1. the ACPI DMAR names the remapping units (`framekernel::dmar`, checked whole);
@@ -38,6 +41,7 @@ use core::fmt::Write;
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 
+use framekernel::amdvi;
 use framekernel::bitmap::Bitmap;
 use framekernel::dmar::{self, BridgeBuses, Dmar, IoApicScopeError, Requester};
 use framekernel::pci::{self, Address};
@@ -48,6 +52,8 @@ use framekernel::vtd::{
 use origin_sync::SpinLock;
 
 use crate::console::Console;
+
+mod amd;
 
 /// A 4 KiB page.
 const PAGE: u64 = vtd::PAGE;
@@ -551,9 +557,13 @@ pub(crate) fn init(com1: &mut Console, rsdp: u64) -> bool {
     let table = match crate::firmware::acpi_table(rsdp, b"DMAR") {
         Ok(t) => t,
         Err(e) => {
+            // No VT-d units: AMD IOMMUs, if the firmware describes any.
+            if let Ok(ivrs) = crate::firmware::acpi_table(rsdp, b"IVRS") {
+                return amd::init(com1, ivrs);
+            }
             let _ = writeln!(
                 com1,
-                "origin-kernel: IOMMU: no DMAR ({e}): device DMA is not confined and interrupts are not remapped"
+                "origin-kernel: IOMMU: no DMAR or IVRS ({e}): device DMA is not confined and interrupts are not remapped"
             );
             return true;
         }
@@ -708,6 +718,9 @@ pub(crate) fn init(com1: &mut Console, rsdp: u64) -> bool {
 
 /// Whether DMA remapping is on (drivers must then attach their devices).
 pub(crate) fn translating() -> bool {
+    if amd::active() {
+        return amd::translating();
+    }
     crate::cpu::without_interrupts(|| IOMMU.lock().as_ref().is_some_and(|s| s.translating))
 }
 
@@ -1014,11 +1027,33 @@ impl Iommu {
         let at = 16 * u64::from(index);
         Irte::decode([irt.table.read64(at), irt.table.read64(at + 8)], irt.x2apic)
     }
+
+    /// The IRTE a remappable-format message with data 0 selects, read back.
+    fn lookup(&self, r: Requester, m: MsiMessage) -> Option<Route> {
+        if m.data != 0 {
+            return None;
+        }
+        let index = vtd::interrupt_index(m)?;
+        let e = self.irte(r, index)?;
+        Some(Route {
+            index,
+            vector: e.vector,
+            destination: e.destination,
+            source_checked: e.source
+                == SourceCheck::RequesterId {
+                    source_id: r.source_id(),
+                    qualifier: 0,
+                },
+        })
+    }
 }
 
 /// Attaches the PCI function at `at` to a domain of its own (created on first use): from
 /// then on its DMA is translated by that domain's tables, which map nothing until [`map`].
 pub(crate) fn attach(at: Address) -> Result<Domain, &'static str> {
+    if amd::active() {
+        return amd::attach(at);
+    }
     crate::cpu::without_interrupts(|| {
         let mut g = IOMMU.lock();
         let s = g.as_mut().ok_or("no IOMMU")?;
@@ -1032,17 +1067,27 @@ pub(crate) fn attach(at: Address) -> Result<Domain, &'static str> {
 /// Maps the physical 4 KiB page `phys` into domain `d`, readable and writable by the
 /// device; returns the IOVA the device must use (never `phys` itself).
 pub(crate) fn map(d: Domain, phys: u64) -> Result<u64, &'static str> {
+    if amd::active() {
+        return amd::map(d, phys);
+    }
     crate::cpu::without_interrupts(|| IOMMU.lock().as_mut().ok_or("no IOMMU")?.map(d, phys))
 }
 
 /// Unmaps `iova` from domain `d` and returns the page it mapped. When this returns, the
-/// IOTLB no longer holds the translation, so the device cannot reach the page.
+/// IOMMU's translation cache no longer holds the translation, so the device cannot reach the
+/// page.
 pub(crate) fn unmap(d: Domain, iova: u64) -> Result<u64, &'static str> {
+    if amd::active() {
+        return amd::unmap(d, iova);
+    }
     crate::cpu::without_interrupts(|| IOMMU.lock().as_mut().ok_or("no IOMMU")?.unmap(d, iova))
 }
 
 /// How domain `d`'s tables translate `iova`, walked in software as the hardware would.
 pub(crate) fn translate(d: Domain, iova: u64) -> Option<(u64, Access)> {
+    if amd::active() {
+        return amd::translate(d, iova);
+    }
     crate::cpu::without_interrupts(|| {
         let g = IOMMU.lock();
         let s = g.as_ref()?;
@@ -1057,11 +1102,15 @@ pub(crate) fn translate(d: Domain, iova: u64) -> Option<(u64, Access)> {
 }
 
 /// The message the function at `at` must send to interrupt the processor with x2APIC ID
-/// `apic` at `vector`. With interrupt remapping on: a remappable-format handle to a new IRTE
-/// that holds the vector and destination and checks the device's source ID — any 32-bit APIC
-/// ID with extended interrupt mode. Without it: compatibility format, which reaches APIC IDs
-/// 0–255 only.
+/// `apic` at `vector`. With interrupt remapping on: a handle to a new IRTE that holds the
+/// vector and destination — under VT-d a remappable-format handle whose IRTE checks the
+/// device's source ID, under AMD-Vi an index into the device's own table — and any 32-bit
+/// APIC ID where the IOMMU has x2APIC destinations. Without it: compatibility format, which
+/// reaches APIC IDs 0–255 only.
 pub(crate) fn msi_message(at: Address, apic: u32, vector: u8) -> Result<MsiMessage, &'static str> {
+    if amd::active() {
+        return amd::msi_message(at, apic, vector);
+    }
     crate::cpu::without_interrupts(|| {
         let mut g = IOMMU.lock();
         match g.as_mut() {
@@ -1077,18 +1126,28 @@ pub(crate) fn msi_message(at: Address, apic: u32, vector: u8) -> Result<MsiMessa
 
 /// Whether interrupts are remapped.
 pub(crate) fn remapping() -> bool {
+    if amd::active() {
+        return amd::translating();
+    }
     crate::cpu::without_interrupts(|| IOMMU.lock().as_ref().is_some_and(|s| s.remapping))
 }
 
-/// IRTE `index` on `at`'s unit, if present.
-pub(crate) fn irte(at: Address, index: u16) -> Option<Irte> {
-    crate::cpu::without_interrupts(|| IOMMU.lock().as_ref()?.irte(requester(at), index))
+/// Where a message from `at` goes, read back from its IRTE: `None` unless `m` is a handle to
+/// a present IRTE in the form `msi_message` writes.
+pub(crate) fn route(at: Address, m: MsiMessage) -> Option<Route> {
+    if amd::active() {
+        return amd::route(at, m);
+    }
+    crate::cpu::without_interrupts(|| IOMMU.lock().as_ref()?.lookup(requester(at), m))
 }
 
 /// Allocates an IRTE on `at`'s unit and leaves it **not present**: a message through it is
 /// blocked and recorded as a fault (for the interrupt-remapping proof). Returns the message
 /// and the index.
 pub(crate) fn reserve_blocked_interrupt(at: Address) -> Result<(MsiMessage, u16), &'static str> {
+    if amd::active() {
+        return amd::reserve_blocked_interrupt(at);
+    }
     crate::cpu::without_interrupts(|| {
         let mut g = IOMMU.lock();
         let s = g.as_mut().ok_or("no IOMMU")?;
@@ -1100,6 +1159,9 @@ pub(crate) fn reserve_blocked_interrupt(at: Address) -> Result<(MsiMessage, u16)
 
 /// Clears IRTE `index` on `at`'s unit, invalidates its cache entry and frees it.
 pub(crate) fn release_interrupt(at: Address, index: u16) -> Result<(), &'static str> {
+    if amd::active() {
+        return amd::release_interrupt(at, index);
+    }
     crate::cpu::without_interrupts(|| {
         let mut g = IOMMU.lock();
         let s = g.as_mut().ok_or("no IOMMU")?;
@@ -1131,14 +1193,18 @@ pub(crate) struct PinRoute {
 /// it), checking the I/O APIC's source ID from the DMAR's device scope, so a message with
 /// any other source ID is blocked (ADR-0007 I8; QEMU cannot show this: its I/O APIC sends
 /// no source ID, so its unit has none to check). The caller then programs the pin's
-/// redirection entry in remappable format with the returned index. Refused when interrupts
-/// are not remapped or the DMAR lists no unit for this I/O APIC.
+/// redirection entry in remappable format with the returned index. Refused under AMD-Vi
+/// (not yet: [`routes_ioapic_pins`]), when interrupts are not remapped, or when the DMAR
+/// lists no unit for this I/O APIC.
 pub(crate) fn route_ioapic_pin(
     ioapic: u8,
     apic: u32,
     vector: u8,
     level: bool,
 ) -> Result<PinRoute, &'static str> {
+    if amd::active() {
+        return Err("I/O APIC pins are not routed through AMD-Vi interrupt tables yet");
+    }
     crate::cpu::without_interrupts(|| {
         let mut g = IOMMU.lock();
         let s = g.as_mut().ok_or("no IOMMU")?;
@@ -1194,9 +1260,20 @@ pub(crate) fn release_pin(pin: &PinRoute) -> Result<(), &'static str> {
     })
 }
 
-/// Reads and clears every unit's recorded faults; returns them and whether any were lost
-/// (a recording register was still full).
-pub(crate) fn take_faults() -> (Vec<FaultRecord>, bool) {
+/// Whether I/O APIC pins are routed through IRTEs ([`route_ioapic_pin`]): under VT-d with
+/// interrupt remapping on. Not yet under AMD-Vi, where the I/O APIC's device table entry
+/// (DeviceID 00A0h in QEMU's IVRS) blocks its fixed interrupts until it is given an
+/// interrupt table of its own (ADR-0007).
+pub(crate) fn routes_ioapic_pins() -> bool {
+    !amd::active() && remapping()
+}
+
+/// Reads and clears every unit's recorded faults; returns them and whether any were lost (a
+/// VT-d recording register was still full, or an AMD-Vi event log overflowed).
+pub(crate) fn take_faults() -> (Vec<Fault>, bool) {
+    if amd::active() {
+        return amd::take_faults();
+    }
     crate::cpu::without_interrupts(|| {
         let mut g = IOMMU.lock();
         let Some(s) = g.as_mut() else {
@@ -1205,8 +1282,8 @@ pub(crate) fn take_faults() -> (Vec<FaultRecord>, bool) {
         let mut all = Vec::new();
         let mut lost = false;
         for u in &mut s.units {
-            let (mut f, o) = u.take_faults();
-            all.append(&mut f);
+            let (f, o) = u.take_faults();
+            all.extend(f.into_iter().map(Fault::from_vtd));
             lost |= o;
         }
         (all, lost)
@@ -1225,6 +1302,9 @@ pub(crate) struct DomainInfo {
 
 /// Every attached device's domain, and the IRTEs in use on all units.
 pub(crate) fn domains() -> (Vec<DomainInfo>, usize) {
+    if amd::active() {
+        return amd::domains();
+    }
     crate::cpu::without_interrupts(|| {
         let g = IOMMU.lock();
         let Some(s) = g.as_ref() else {
@@ -1255,7 +1335,199 @@ pub(crate) fn domains() -> (Vec<DomainInfo>, usize) {
     })
 }
 
-/// The 16-bit source ID of the function at `at`.
+/// The 16-bit source ID (AMD-Vi: DeviceID) the function at `at`'s requests carry.
 pub(crate) fn source_id(at: Address) -> u16 {
+    if amd::active() {
+        return amd::source_id(at);
+    }
     requester(at).source_id()
+}
+
+/// Where an interrupt from a device goes, read back from its IRTE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Route {
+    /// The IRTE's index (in the unit's table under VT-d, in the device's own table under
+    /// AMD-Vi).
+    pub(crate) index: u16,
+    pub(crate) vector: u8,
+    /// The destination APIC ID.
+    pub(crate) destination: u32,
+    /// Only the device can use the IRTE: VT-d checks its source ID; AMD-Vi reaches the
+    /// table only through the device's own device table entry.
+    pub(crate) source_checked: bool,
+}
+
+/// What a recorded fault was about, whichever IOMMU recorded it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FaultKind {
+    /// A DMA to a page its domain does not map for that access (VT-d reasons 5 and 6, where
+    /// not-present and not-writable read the same; AMD-Vi an I/O page fault with PR clear).
+    PageNotMapped,
+    /// A DMA to a present page without the access it needed (AMD-Vi PR set).
+    PageDenied,
+    /// An interrupt through a remapping entry that is not present (VT-d reason 22h; AMD-Vi
+    /// an I/O page fault for an interrupt, PR clear: RemapEn clear).
+    InterruptBlocked,
+    Other,
+}
+
+/// The IOMMU's own record of a fault.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Detail {
+    Vtd(FaultRecord),
+    Amd(amdvi::Event),
+}
+
+/// One recorded fault.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Fault {
+    /// The requester ID (DeviceID) the request carried.
+    pub(crate) source_id: u16,
+    /// An interrupt request (else a DMA).
+    pub(crate) interrupt: bool,
+    /// The device address of a DMA (AMD-Vi: also of an interrupt).
+    pub(crate) address: u64,
+    /// The IRTE index of an interrupt fault, where the IOMMU records it (VT-d).
+    pub(crate) interrupt_index: Option<u16>,
+    /// A write, where the IOMMU says.
+    pub(crate) write: Option<bool>,
+    pub(crate) kind: FaultKind,
+    pub(crate) detail: Detail,
+}
+
+impl Fault {
+    fn from_vtd(r: FaultRecord) -> Self {
+        Self {
+            source_id: r.source_id,
+            interrupt: r.interrupt_index.is_some(),
+            address: r.address,
+            interrupt_index: r.interrupt_index,
+            write: r.interrupt_index.is_none().then_some(!r.read),
+            kind: match r.reason {
+                5 | 6 => FaultKind::PageNotMapped,
+                0x22 => FaultKind::InterruptBlocked,
+                _ => FaultKind::Other,
+            },
+            detail: Detail::Vtd(r),
+        }
+    }
+}
+
+/// Why an AMD-Vi I/O page fault happened, from its flags (§2.5.3) and whether it was an
+/// interrupt (`Fault::interrupt`).
+fn amd_cause(e: &amdvi::Event, interrupt: bool) -> &'static str {
+    match (interrupt, e.present()) {
+        (false, false) => "page not present",
+        (true, false) => "interrupt remapping entry not enabled",
+        _ if e.reserved_bit() => "reserved bit set",
+        _ if e.permission() => "access not permitted",
+        _ => "bad entry",
+    }
+}
+
+impl core::fmt::Display for Fault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.detail {
+            Detail::Vtd(r) => {
+                write!(f, "source ID {:#06x}, ", r.source_id)?;
+                match r.interrupt_index {
+                    Some(i) => write!(f, "interrupt index {i}")?,
+                    None => write!(
+                        f,
+                        "{} at {:#x}",
+                        if r.read { "read" } else { "write" },
+                        r.address
+                    )?,
+                }
+                write!(
+                    f,
+                    ", reason {:#x} ({})",
+                    r.reason,
+                    vtd::fault_reason(r.reason)
+                )
+            }
+            Detail::Amd(e) => {
+                write!(f, "DeviceID {:#06x}, ", e.device)?;
+                let access = match (self.interrupt, self.write) {
+                    (true, _) => "interrupt",
+                    (false, Some(true)) => "write",
+                    (false, Some(false)) => "read",
+                    (false, None) => "access",
+                };
+                write!(
+                    f,
+                    "{access} at {:#x}, domain {}, event {:#x} ({}",
+                    e.address,
+                    e.domain,
+                    e.code,
+                    amdvi::event_name(e.code)
+                )?;
+                if e.code == amdvi::event::IO_PAGE_FAULT {
+                    write!(f, ": {}", amd_cause(&e, self.interrupt))?;
+                }
+                f.write_str(")")
+            }
+        }
+    }
+}
+
+/// A fault the proofs looked for, or "none".
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Recorded(pub(crate) Option<Fault>);
+
+impl core::fmt::Display for Recorded {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(r) => write!(f, "{r}"),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// How MSI-X entries name their IRTE under the running IOMMU, for the proofs' report.
+pub(crate) fn routing_words() -> &'static str {
+    if amd::active() {
+        "hold only an index into their device's own interrupt remapping table, whose IRTE holds the vector and the x2APIC destination"
+    } else {
+        "hold only a remappable handle with data 0 whose IRTE holds the vector, the x2APIC destination and the device's source ID"
+    }
+}
+
+/// What an unmap waited for, for the proofs' report.
+pub(crate) fn unmap_words() -> &'static str {
+    if amd::active() {
+        "the translation cache invalidated page-selectively and the completion awaited"
+    } else {
+        "IOTLB invalidated page-selectively, reads and writes drained"
+    }
+}
+
+/// Whether the interrupt proof must find the blocked interrupt in the IOMMU's fault record.
+/// VT-d records it (reason 22h), and QEMU's model does. AMD-Vi logs it too (an I/O page fault,
+/// §2.2.5.2), but QEMU 11.1's `amd-iommu` logs no interrupt-remapping fault (it only prints
+/// one on its stderr), so under AMD-Vi the proof requires only that the interrupt was not
+/// delivered, and the boot test expects the record to be absent: a QEMU that starts logging is
+/// noticed. Hardware qualification must require the record (§74).
+pub(crate) fn interrupt_record_required() -> bool {
+    !amd::active()
+}
+
+/// Whether the DMA proof must find the blocked IOVA in the fault record's address. VT-d
+/// records it, and QEMU's model does. AMD-Vi records it too (§2.5.3), but QEMU 11.1's
+/// `amd-iommu` writes every event with address 0: its event encoder stores the address
+/// through a 64-bit-wide mask built with a shift by 64, undefined in C and empty in practice.
+/// So under AMD-Vi the proof also accepts address 0 — never another address — and the boot
+/// test expects 0: a QEMU that starts recording the address is noticed. Hardware
+/// qualification must require the address (§74).
+pub(crate) fn fault_address_required() -> bool {
+    !amd::active()
+}
+
+/// What confines an unattached device, for the proofs' report.
+pub(crate) fn default_deny_words() -> &'static str {
+    if amd::active() {
+        "every other function's device table entry blocks its DMA and fixed interrupts"
+    } else {
+        "no other function has a context entry, so its DMA faults"
+    }
 }

@@ -27,7 +27,8 @@ commands:
   build       build the loader (developer mode) and the KRN kernel image; print their paths
   boot-test   boot under QEMU + OVMF twice: the kernel must start and report; a tampered
               kernel image must be rejected by the loader
-  boot-matrix boot-test with 1, 2 and 4 processors, one after another
+  boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
+              one after another
   boot-x2apic boot-test on a sparse topology: the boot processor at APIC ID 0 and a second
               processor at APIC ID 256, above what 8-bit APIC IDs reach (the MADT lists
               150 possible processors)
@@ -41,9 +42,10 @@ environment:
   ORIGIN_QEMU_TOPOLOGY                x2apic: the boot-x2apic machine (ORIGIN_QEMU_SMP is
                                       then ignored)
   ORIGIN_QEMU_CPU                     the QEMU CPU model (default max), e.g. max,-avx2
-  ORIGIN_QEMU_IOMMU                   the IOMMU device (default
-                                      intel-iommu,intremap=on,eim=on), e.g.
-                                      intel-iommu,intremap=off for a negative control
+  ORIGIN_QEMU_IOMMU                   the IOMMU QEMU emulates: intel (default) or amd; or
+                                      an intel-iommu -device value, booted with the VT-d
+                                      markers (e.g. intel-iommu,intremap=off for a
+                                      negative control)
   ORIGIN_QEMU_DEBUG                   if set, QEMU logs interrupts and resets to
                                       target/xtask/qemu-debug.log";
 
@@ -87,6 +89,9 @@ struct Scenario {
     failures: Vec<&'static str>,
     /// A check of the whole serial log once every marker has appeared.
     check: Option<fn(&str) -> Result>,
+    /// Text QEMU itself must have printed on its stderr by then (what its device models
+    /// report about the guest).
+    stderr: Vec<&'static str>,
 }
 
 /// The good path: the loader verifies and enters the kernel, and the kernel reports on
@@ -101,13 +106,74 @@ fn qemu_cpu_model() -> String {
         .unwrap_or_else(|| "max".into())
 }
 
-/// The IOMMU QEMU emulates: `ORIGIN_QEMU_IOMMU` (a `-device` value, for negative
-/// controls), or Intel VT-d with interrupt remapping and 32-bit x2APIC destinations.
-fn qemu_iommu() -> String {
-    std::env::var("ORIGIN_QEMU_IOMMU")
-        .ok()
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| "intel-iommu,intremap=on,eim=on".into())
+/// The IOMMU QEMU emulates (`ORIGIN_QEMU_IOMMU`): Intel VT-d or AMD-Vi, or a raw
+/// `intel-iommu` device for negative controls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Iommu {
+    Intel,
+    Amd,
+    /// An `intel-iommu` `-device` value other than the default (for example
+    /// `intel-iommu,intremap=off`), booted with the VT-d markers.
+    Device(String),
+}
+
+impl Iommu {
+    /// The QEMU options that add it.
+    fn device_args(&self) -> Vec<String> {
+        let args: &[&str] = match self {
+            // Intel VT-d: DMA and interrupt remapping. `eim=on` gives IRTEs 32-bit x2APIC
+            // destinations (`auto` resolves to off without KVM's in-kernel irqchip); TCG needs
+            // no irqchip option. See docs/research/2026-11-08-vt-d-iommu.md.
+            Self::Intel => &["-device", "intel-iommu,intremap=on,eim=on"],
+            // AMD-Vi: interrupt remapping, `xtsup=on` for 128-bit IRTEs with 32-bit x2APIC
+            // destinations, and `dma-remap=on`, without which QEMU 11.1 does not translate the
+            // DMA of emulated devices at all (they bypass the IOMMU). Its PCI function is
+            // pinned at 00:05.0: QEMU would otherwise take the first free slot, moving the NVMe
+            // and the NIC. See docs/research/2026-11-08-amd-vi-iommu.md.
+            Self::Amd => &[
+                "-device",
+                "AMDVI-PCI,id=iommupci0,addr=05.0",
+                "-device",
+                "amd-iommu,pci-id=iommupci0,intremap=on,xtsup=on,dma-remap=on",
+            ],
+            Self::Device(device) => return vec!["-device".into(), device.clone()],
+        };
+        args.iter().map(|a| (*a).to_string()).collect()
+    }
+}
+
+/// `ORIGIN_QEMU_IOMMU`: `intel` (the default), `amd`, or an `intel-iommu` `-device` value;
+/// anything else is refused by [`check_environment`].
+fn qemu_iommu() -> Iommu {
+    parse_iommu(env::var("ORIGIN_QEMU_IOMMU").ok().as_deref())
+}
+
+/// What an `ORIGIN_QEMU_IOMMU` value selects.
+fn parse_iommu(value: Option<&str>) -> Iommu {
+    match value {
+        None | Some("" | "intel") => Iommu::Intel,
+        Some("amd") => Iommu::Amd,
+        Some(other) => Iommu::Device(other.into()),
+    }
+}
+
+/// Refuses an `ORIGIN_QEMU_IOMMU` the boot test cannot check, rather than booting another
+/// IOMMU: a raw `-device` value is booted with the VT-d markers, so it must be an
+/// `intel-iommu`.
+fn check_environment() -> Result {
+    check_iommu(&qemu_iommu())
+}
+
+/// [`check_environment`]'s rule for the IOMMU.
+fn check_iommu(iommu: &Iommu) -> Result {
+    match iommu {
+        Iommu::Device(device) if device != "intel-iommu" && !device.starts_with("intel-iommu,") => {
+            Err(format!(
+                "ORIGIN_QEMU_IOMMU must be intel, amd or an intel-iommu -device value, not {device:?}"
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Processors QEMU emulates: `ORIGIN_QEMU_SMP` (1–64), or 2.
@@ -209,6 +275,9 @@ fn boot_scenario() -> Scenario {
             );
         }
     }
+    if qemu_iommu() == Iommu::Amd {
+        amd_iommu_markers(&mut scenario, &machine);
+    }
     scenario
 }
 
@@ -241,6 +310,129 @@ fn x2apic_markers(machine: &Machine) -> Vec<String> {
             ]
         })
         .collect()
+}
+
+/// The AMD-Vi boot (`ORIGIN_QEMU_IOMMU=amd`): the IOMMU's own PCI function, its bring-up from
+/// the IVRS, and the AMD-Vi wording of the IOMMU proofs replace the VT-d markers; every
+/// other marker is the same. Two lines pin what QEMU 11.1's `amd-iommu` does not do (research
+/// ledger `docs/research/2026-11-08-amd-vi-iommu.md` §2.5): its events carry address 0, and
+/// it logs no interrupt-remapping fault, which it reports on its stderr instead.
+fn amd_iommu_markers(scenario: &mut Scenario, machine: &Machine) {
+    let cpus = machine.cpus();
+    let swaps: [(String, Vec<String>); 13] = [
+        (
+            "origin-kernel: PCIe: 00:02.0 1b36:0010 class 01:08:02 NVMe controller; BAR0 mem64 16 KiB at ".into(),
+            vec![
+                "origin-kernel: PCIe: 00:02.0 1b36:0010 class 01:08:02 NVMe controller; BAR0 mem64 16 KiB at ".into(),
+                "origin-kernel: PCIe: 00:05.0 1022:1419 class 08:06:00 IOMMU".into(),
+            ],
+        ),
+        (
+            "origin-kernel: IOMMU: DMAR: host address width 48 bits, interrupt remapping true".into(),
+            vec!["origin-kernel: IOMMU: IVRS revision 1, IVinfo 0x2801 (EFR support true, 40-bit physical and 0-bit virtual addresses, pre-boot DMA protection false); 1 IOMMU(s) in 2 IVHD(s), 0 memory definition(s)".into()],
+        ),
+        (
+            "origin-kernel: IOMMU: unit 0 at 0xfed90000 (segment 0, 4 KiB of registers): 7 PCI scope(s), I/O APIC 0 (source ID 0xff00)".into(),
+            vec!["origin-kernel: IOMMU: unit 0 at 0xfed80000 (segment 0, IVHD type 0x11 of 2, IOMMU function 00:05.0, capability at 0x40): 9 device entries up to DeviceID 0x00fb, I/O APIC 0 (DeviceID 0x00a0)".into()],
+        ),
+        (
+            "origin-kernel: IOMMU: unit 0: VT-d 1.0; CAP 0x".into(),
+            vec!["origin-kernel: IOMMU: unit 0: AMD-Vi capability revision 0, IOTLB true, not-present entries cached true; EFR 0x29d7 (register 0x29d7, IVRS image 0x29d7): x2APIC true, guest APIC true, INVALIDATE_IOMMU_ALL true, 6-level host tables, performance counters false; EFR2 0x0: 512 interrupts per function".into()],
+        ),
+        (
+            "queued invalidation true, interrupt remapping true, extended interrupt mode true".into(),
+            vec![],
+        ),
+        (
+            "origin-kernel: IOMMU: unit 0: queued invalidation on (256 descriptors); empty root table at 0x".into(),
+            vec!["origin-kernel: IOMMU: unit 0: device table of 256 entries at 0x".into()],
+        ),
+        (
+            "interrupt remapping on (256 entries, 32-bit x2APIC destinations, compatibility format blocked); translation on (GSTS 0x".into(),
+            vec!["every entry blocking DMA and fixed interrupts; command buffer and event log on (256 entries each); interrupt remapping per device (128-bit entries, 32-bit x2APIC destinations); translation on (control 0x4000000021007, status 0x18): every device's DMA is blocked until its driver attaches it; caches invalidated (INVALIDATE_IOMMU_ALL, then every device table entry and interrupt table); 0 stale event(s) cleared".into()],
+        ),
+        (
+            "every device's DMA faults until its driver attaches it; 0 stale fault(s) cleared".into(),
+            vec![],
+        ),
+        (
+            "and the page kept its canary true; fault recorded: source ID 0x0010, write at 0x".into(),
+            vec!["unmapped (the translation cache invalidated page-selectively and the completion awaited), the same read completed with status type 0 code 0x0, and the page kept its canary true; fault recorded: DeviceID 0x0010, access at 0x0, domain 0, event 0x2 (I/O page fault: page not present); consistent true".into()],
+        ),
+        (
+            "reason 0x5 (write to a page not mapped writable); consistent true".into(),
+            vec![],
+        ),
+        (
+            format!(
+                "origin-kernel: IOMMU: interrupt remapping: {} of {} MSI-X entries (NVMe {}, virtio-net 2) hold only a remappable handle with data 0",
+                3 + cpus,
+                3 + cpus,
+                1 + cpus
+            ),
+            vec![format!(
+                "origin-kernel: IOMMU: interrupt remapping: {} of {} MSI-X entries (NVMe {}, virtio-net 2) hold only an index into their device's own interrupt remapping table, whose IRTE holds the vector and the x2APIC destination",
+                3 + cpus,
+                3 + cpus,
+                1 + cpus
+            )],
+        ),
+        (
+            "left not present: a read on I/O queue 2 completed true, 0 interrupts arrived; fault recorded: source ID 0x0010, interrupt index ".into(),
+            vec!["left not present: a read on I/O queue 2 completed true, 0 interrupts arrived; fault recorded: none; vector 1 restored; consistent true".into()],
+        ),
+        (
+            "reason 0x22 (interrupt table entry not present); vector 1 restored; consistent true".into(),
+            vec![],
+        ),
+    ];
+    for (old, new) in swaps {
+        match scenario.markers.iter().position(|m| *m == old) {
+            Some(at) => {
+                scenario.markers.splice(at..=at, new);
+            }
+            // Unmatchable on purpose, so a renamed VT-d marker fails the AMD boot loudly.
+            None => scenario
+                .markers
+                .push(format!("xtask: the VT-d marker {old:?} is missing")),
+        }
+    }
+    // The last proof line and the PCI count are shared with other markers' text, so they are
+    // swapped in place.
+    for m in &mut scenario.markers {
+        if m == "no other function has a context entry, so its DMA faults; IOVAs from 0x40000000; faults recorded before the proofs: 0; consistent true"
+        {
+            *m = "every other function's device table entry blocks its DMA and fixed interrupts; IOVAs from 0x40000000; faults recorded before the proofs: 0; consistent true".into();
+        }
+        if m == "bus/pci/count=7, block/nvme0/size_mib=16; read back pci count Some(7)" {
+            *m = "bus/pci/count=8, block/nvme0/size_mib=16; read back pci count Some(8)".into();
+        }
+    }
+    // The I/O APIC's pins are routed through IRTEs under VT-d only: under AMD-Vi the kernel
+    // reports that they stay masked, in one line, where the VT-d proof's lines were.
+    let first = "origin-kernel: I/O APIC: remapped: the PIT's IRQ0 (GSI 2, edge-triggered, active-high) through IRTE ";
+    let start = scenario.markers.iter().position(|m| m == first);
+    let end = start.and_then(|s| {
+        scenario.markers[s..]
+            .iter()
+            .position(|m| m == " released: true")
+            .map(|n| s + n)
+    });
+    match (start, end) {
+        (Some(s), Some(e)) => {
+            scenario.markers.splice(
+                s..=e,
+                ["origin-kernel: I/O APIC: remapped: not under AMD-Vi yet: the I/O APIC's device table entry blocks its fixed interrupts until it has an interrupt table, so its pins stay masked".into()],
+            );
+        }
+        _ => scenario
+            .markers
+            .push(format!("xtask: the VT-d marker {first:?} is missing")),
+    }
+    // QEMU reports the probe interrupt it blocked (its IRTE has RemapEn clear) on its stderr.
+    scenario
+        .stderr
+        .push("failed to remap interrupt from devid 0x10");
 }
 
 fn boot_scenario_markers(machine: &Machine) -> Scenario {
@@ -647,6 +839,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             ": IOMMU failed",
         ],
         check: Some(|text| console_lines_intact(text, self::machine().cpus() as usize)),
+        stderr: vec![],
     }
 }
 
@@ -666,6 +859,7 @@ fn tamper_scenario() -> Scenario {
             "origin-boot: kernel verified",
         ],
         check: None,
+        stderr: vec![],
     }
 }
 
@@ -748,24 +942,28 @@ fn main() -> ExitCode {
     }
 }
 
-/// Runs `boot-test` in a child process for each processor count, so each gets its own
-/// `ORIGIN_QEMU_SMP` (the environment of this process is never changed).
+/// Runs `boot-test` in a child process for each IOMMU and processor count, so each gets its
+/// own `ORIGIN_QEMU_IOMMU` and `ORIGIN_QEMU_SMP` (the environment of this process is never
+/// changed).
 fn boot_matrix() -> Result {
     let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
-    for cpus in [1, 2, 4] {
-        println!("xtask: boot-matrix: {cpus} processor(s)");
-        let status = Command::new(&exe)
-            .arg("boot-test")
-            .env("ORIGIN_QEMU_SMP", cpus.to_string())
-            .status()
-            .map_err(|e| format!("cannot run boot-test: {e}"))?;
-        if !status.success() {
-            return Err(format!(
-                "boot-test with {cpus} processor(s) failed ({status})"
-            ));
+    for iommu in ["intel", "amd"] {
+        for cpus in [1, 2, 4] {
+            println!("xtask: boot-matrix: {iommu} IOMMU, {cpus} processor(s)");
+            let status = Command::new(&exe)
+                .arg("boot-test")
+                .env("ORIGIN_QEMU_IOMMU", iommu)
+                .env("ORIGIN_QEMU_SMP", cpus.to_string())
+                .status()
+                .map_err(|e| format!("cannot run boot-test: {e}"))?;
+            if !status.success() {
+                return Err(format!(
+                    "boot-test with the {iommu} IOMMU and {cpus} processor(s) failed ({status})"
+                ));
+            }
         }
     }
-    println!("xtask: boot-matrix passed (1, 2 and 4 processors)");
+    println!("xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors)");
     Ok(())
 }
 
@@ -1452,11 +1650,8 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         .arg(qemu_path_arg("if=pflash,format=raw,file=", &s.vars)?)
         .arg("-drive")
         .arg(qemu_path_arg("format=raw,file=fat:rw:", &s.esp)?)
-        // Intel VT-d (CLAUDE.md §32, §58; ADR-0007): DMA and interrupt remapping. It comes
-        // before the PCI devices it translates. `eim=on` gives IRTEs 32-bit x2APIC
-        // destinations (`auto` resolves to off without KVM's in-kernel irqchip); TCG needs no
-        // irqchip option. See docs/research/2026-11-08-vt-d-iommu.md.
-        .args(["-device", &qemu_iommu()])
+        // The IOMMU (CLAUDE.md §32, §58; ADR-0007), before the PCI devices it translates.
+        .args(qemu_iommu().device_args())
         // The NVMe controller and its test disk (CLAUDE.md §33).
         .arg("-drive")
         .arg(qemu_path_arg("if=none,id=nvme0,format=raw,file=", &s.nvme)?)
@@ -1500,6 +1695,7 @@ fn boot_test_timeout() -> Result<Duration> {
 }
 
 fn boot_test() -> Result {
+    check_environment()?;
     let krn_path = pack_kernel(&build_kernel()?)?;
     let krn = fs::read(&krn_path).map_err(|e| format!("{}: {e}", krn_path.display()))?;
     run_scenario(&boot_scenario(), &krn)?;
@@ -1584,7 +1780,14 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
     let qemu_stderr = stderr_reader.join().unwrap_or_default();
 
     let text = serial::clean(&raw);
-    let verdict = verdict.and_then(|()| scenario.check.map_or(Ok(()), |check| check(&text)));
+    let verdict = verdict
+        .and_then(|()| scenario.check.map_or(Ok(()), |check| check(&text)))
+        .and_then(
+            |()| match scenario.stderr.iter().find(|m| !qemu_stderr.contains(**m)) {
+                Some(m) => Err(format!("QEMU's stderr lacks {m:?}")),
+                None => Ok(()),
+            },
+        );
     let log = target_dir().join("xtask").join(format!(
         "boot-test-{}.log",
         scenario.label.replace(' ', "-")
@@ -1620,6 +1823,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
 }
 
 fn run() -> Result {
+    check_environment()?;
     let krn_path = pack_kernel(&build_kernel()?)?;
     let krn = fs::read(&krn_path).map_err(|e| format!("{}: {e}", krn_path.display()))?;
     let staged = stage(&krn)?;
@@ -1652,6 +1856,69 @@ mod tests {
             }
         }
         text
+    }
+
+    /// Every VT-d marker the AMD-Vi boot swaps exists, so none is silently left in place.
+    #[test]
+    fn the_amd_markers_replace_every_vt_d_one() {
+        let m = machine();
+        let mut s = boot_scenario_markers(&m);
+        amd_iommu_markers(&mut s, &m);
+        assert!(
+            !s.markers
+                .iter()
+                .any(|m| m.starts_with("xtask: the VT-d marker"))
+        );
+        for vtd in [
+            "DMAR",
+            "VT-d",
+            "context entry",
+            "remappable handle",
+            "reason 0x",
+            "pci count Some(7)",
+        ] {
+            assert!(!s.markers.iter().any(|m| m.contains(vtd)), "{vtd}");
+        }
+        assert!(
+            s.markers
+                .iter()
+                .any(|m| m.contains("00:05.0 1022:1419 class 08:06:00 IOMMU"))
+        );
+        assert_eq!(s.stderr, ["failed to remap interrupt from devid 0x10"]);
+        // The I/O APIC's VT-d proof gives way to one line saying its pins stay masked (the
+        // proof that runs before the IOMMU is up keeps its lines).
+        let remapped: Vec<&String> = s
+            .markers
+            .iter()
+            .filter(|m| {
+                m.starts_with("origin-kernel: I/O APIC: remapped")
+                    || m.starts_with("origin-kernel: I/O APIC: IRTE")
+            })
+            .collect();
+        assert_eq!(remapped.len(), 1);
+        assert!(remapped[0].contains("not under AMD-Vi yet"));
+    }
+
+    /// `ORIGIN_QEMU_IOMMU` selects a preset, or passes an `intel-iommu` device through (the
+    /// CPU-index work's negative control X2 boots `intel-iommu,intremap=off`); any other
+    /// device is refused rather than booted against the VT-d markers.
+    #[test]
+    fn the_iommu_variable_takes_presets_and_intel_iommu_devices() {
+        assert_eq!(parse_iommu(None), Iommu::Intel);
+        assert_eq!(parse_iommu(Some("")), Iommu::Intel);
+        assert_eq!(parse_iommu(Some("intel")), Iommu::Intel);
+        assert_eq!(parse_iommu(Some("amd")), Iommu::Amd);
+        assert_eq!(
+            Iommu::Intel.device_args(),
+            ["-device", "intel-iommu,intremap=on,eim=on"]
+        );
+        let off = parse_iommu(Some("intel-iommu,intremap=off"));
+        assert_eq!(off, Iommu::Device("intel-iommu,intremap=off".into()));
+        assert_eq!(off.device_args(), ["-device", "intel-iommu,intremap=off"]);
+        assert_eq!(check_iommu(&off), Ok(()));
+        assert_eq!(check_iommu(&Iommu::Amd), Ok(()));
+        assert!(check_iommu(&parse_iommu(Some("virtio-iommu-pci"))).is_err());
+        assert!(check_iommu(&parse_iommu(Some("intel-iommu-x"))).is_err());
     }
 
     #[test]

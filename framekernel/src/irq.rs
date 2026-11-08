@@ -8,7 +8,9 @@
 //!   destination and checks the I/O APIC's source ID. With compatibility-format interrupts
 //!   blocked, as they are once remapping is on, this is the only format whose interrupts
 //!   arrive on hardware (QEMU passes the other through, so the proof shows the difference
-//!   itself: with the IRTE not present, nothing may arrive).
+//!   itself: with the IRTE not present, nothing may arrive). Under AMD-Vi the pins are not
+//!   routed yet: the I/O APIC's device table entry blocks its fixed interrupts until it has
+//!   an interrupt table, and [`prove_remapped`] says so.
 //!
 //! The register encodings are `framekernel::ioapic`; this module does the indirect MMIO
 //! (IOREGSEL/IOWIN) and the PIT programming. Only the boot processor runs this, with the
@@ -20,11 +22,12 @@ use core::fmt::Write;
 use framekernel::acpi::{self, IoApic, SourceOverride};
 use framekernel::apic;
 use framekernel::ioapic::{self, RemappableEntry};
-use framekernel::vtd::{self, FaultRecord, Irte, SourceCheck};
+use framekernel::vtd::{Irte, SourceCheck};
 use origin_sync::SpinLock;
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, rdtsc};
+use crate::iommu::{Detail, Fault, Recorded};
 use crate::outb;
 
 /// The PIT's command port and channel-0 data port.
@@ -285,24 +288,12 @@ fn wait_for(cpu: CpuIndex, n: u64, tsc_hz: u64) -> bool {
     more()
 }
 
-/// A fault for the report: who, which entry and why.
-struct Fault(Option<FaultRecord>);
-
-impl core::fmt::Display for Fault {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let Some(r) = self.0 else {
-            return f.write_str("none");
-        };
-        write!(f, "source ID {:#06x}", r.source_id)?;
-        if let Some(i) = r.interrupt_index {
-            write!(f, ", interrupt index {i}")?;
-        }
-        write!(
-            f,
-            ", reason {:#x} ({})",
-            r.reason,
-            vtd::fault_reason(r.reason)
-        )
+/// The VT-d fault reason of `f`: the pin proofs run only under VT-d
+/// ([`crate::iommu::routes_ioapic_pins`]).
+fn reason(f: &Fault) -> Option<u8> {
+    match f.detail {
+        Detail::Vtd(r) => Some(r.reason),
+        Detail::Amd(_) => None,
     }
 }
 
@@ -314,7 +305,7 @@ struct Probe {
     /// Interrupts that arrived, on any processor, while the change held.
     arrived: u64,
     /// The fault the unit recorded for the pin's IRTE, if any; whether a fault was lost.
-    fault: Option<FaultRecord>,
+    fault: Option<Fault>,
     lost: bool,
     /// The route was restored, and [`RESUME_TICKS`] interrupts arrived on the target again.
     restored: bool,
@@ -388,6 +379,13 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
         let _ = writeln!(
             com1,
             "origin-kernel: I/O APIC: remapped: interrupts are not remapped, so the I/O APIC keeps compatibility format"
+        );
+        return true;
+    }
+    if !crate::iommu::routes_ioapic_pins() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: I/O APIC: remapped: not under AMD-Vi yet: the I/O APIC's device table entry blocks its fixed interrupts until it has an interrupt table, so its pins stay masked"
         );
         return true;
     }
@@ -495,7 +493,7 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
         "origin-kernel: I/O APIC: remapped: {arrived} PIT interrupts arrived on {named} through IRTE {} in {} ms, {elsewhere} on other CPUs; fault recorded: {}{}; consistent {delivered}{}",
         route.index,
         elapsed.saturating_mul(1000) / tsc_hz.max(1),
-        Fault(blocked),
+        Recorded(blocked),
         if lost { " (a fault was lost)" } else { "" },
         if delivered { "" } else { ": I/O APIC failed" }
     );
@@ -507,7 +505,8 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
     let carries_none = seen == Some(NO_REQUESTER_ID) && route.source_id != NO_REQUESTER_ID;
     let a_ok = a.written
         && a.arrived == 0
-        && a.fault.is_some_and(|f| f.reason == REASON_NOT_PRESENT)
+        && a.fault
+            .is_some_and(|f| reason(&f) == Some(REASON_NOT_PRESENT))
         && (carries_id || carries_none)
         && a.restored
         && a.resumed;
@@ -516,7 +515,7 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
         "origin-kernel: I/O APIC: IRTE {} not present: {} interrupts arrived in {BLOCKED_MS} ms; fault recorded: {}{}{}; IRTE restored, {RESUME_TICKS} interrupts arrived on {named} again: {}; consistent {a_ok}{}",
         route.index,
         a.arrived,
-        Fault(a.fault),
+        Recorded(a.fault),
         if a.lost { " (a fault was lost)" } else { "" },
         if carries_none {
             alloc::format!(
@@ -546,8 +545,9 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
         tsc_hz,
     );
     let enforced = b.arrived == 0
-        && b.fault
-            .is_some_and(|f| f.reason == REASON_SOURCE_ID && f.source_id == route.source_id);
+        && b.fault.is_some_and(|f| {
+            reason(&f) == Some(REASON_SOURCE_ID) && f.source_id == route.source_id
+        });
     let unchecked = b.arrived > 0 && b.fault.is_none();
     let b_ok = b.written
         && b.restored
@@ -563,7 +563,7 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
         route.index,
         route.source_id,
         b.arrived,
-        Fault(b.fault),
+        Recorded(b.fault),
         if b.lost { " (a fault was lost)" } else { "" },
         if carries_none {
             "; the source-ID check cannot be shown on this platform: its I/O APIC's messages carry no requester ID (0xffff above), so the unit skips the check (hardware blocks them, reason 0x26)"

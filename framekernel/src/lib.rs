@@ -15,6 +15,8 @@
 //! This library holds everything that can be unit-tested on the build host, all of it safe
 //! code (`forbid(unsafe_code)`):
 //! - [`acpi`]: RSDP, XSDT and MADT parsing (checksummed) for processor discovery;
+//! - [`amdvi`]: AMD IOMMU (AMD-Vi) register, table, command and event encodings and a host
+//!   page-table walker (DMA and interrupt remapping);
 //! - [`apic`]: x2APIC and 8254 PIT encodings and timer calibration arithmetic;
 //! - [`apstart`]: the start-up handshake with one application processor, settled once by
 //!   the AP's answer or the boot processor's deadline;
@@ -45,6 +47,7 @@
 //! - [`hpet`]: the ACPI HPET table and main-counter arithmetic;
 //! - [`initramfs`]: extracting a ustar archive into the VFS, with a path-traversal guard;
 //! - [`ioapic`]: I/O APIC redirection-table encoding;
+//! - [`ivrs`]: the ACPI IVRS table (AMD IOMMUs, their device entries, memory definitions);
 //! - [`json`]: a depth-limited JSON parser (config, manifests, SDK data);
 //! - [`klog`]: a bounded kernel log ring (level + inline message, drop-oldest);
 //! - [`net`]: Ethernet/IPv4/ICMP/ARP headers and the Internet checksum;
@@ -92,6 +95,7 @@
 extern crate alloc;
 
 pub mod acpi;
+pub mod amdvi;
 pub mod apic;
 pub mod apstart;
 pub mod base64;
@@ -119,6 +123,7 @@ pub mod heap;
 pub mod hpet;
 pub mod initramfs;
 pub mod ioapic;
+pub mod ivrs;
 pub mod json;
 pub mod klog;
 pub mod net;
