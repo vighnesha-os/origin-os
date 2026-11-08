@@ -194,6 +194,11 @@ impl Download {
         }
     }
 
+    /// The bytes accepted so far, taken out of the download (the whole file once complete).
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
+    }
+
     /// The bytes accepted so far: the whole file once complete.
     pub fn data(&self) -> &[u8] {
         &self.data
@@ -312,6 +317,7 @@ mod tests {
         assert_eq!(d.blocks(), 3);
         assert_eq!(d.data(), &content[..]);
         assert_eq!(d.failure(), None);
+        assert_eq!(d.into_data(), content, "the file moves out whole");
     }
 
     #[test]

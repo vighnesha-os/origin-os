@@ -352,6 +352,8 @@ fn boot_scenario_markers() -> Scenario {
             // embedded copy, through recycled receive buffers.
             "origin-kernel: virtio-net TFTP: initramfs.tar from 10.0.2.2: 4608 bytes in 10 blocks (the last empty), identical to the embedded image".into(),
             "; consistent true".into(),
+            // The fetched file — not the embedded copy — unpacked into a fresh VFS and read back.
+            "origin-kernel: virtio-net initramfs: the fetched image extracted into a fresh VFS: 4 entries; /etc/hostname true, implicit /boot dir true; consistent true".into(),
             // The in-memory VFS (CLAUDE.md §39): a file built, read back, listed and removed.
             "origin-kernel: vfs: built /etc/origin/hostname (read back true), listed 1 entry, removed all back to 1 node".into(),
             // §21: the embedded ustar initramfs extracts into a VFS (contents and an

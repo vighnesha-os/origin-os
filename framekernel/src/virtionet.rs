@@ -785,6 +785,8 @@ static TFTP_ERROR: AtomicU64 = AtomicU64::new(0);
 /// Frames the receive ring delivered and buffers it handed back, as the thread finished.
 static RX_FRAMES: AtomicU64 = AtomicU64::new(0);
 static RX_RECYCLED: AtomicU64 = AtomicU64::new(0);
+/// The file the TFTP fetch completed, handed to the boot flow, which unpacks it.
+static FETCHED: SpinLock<Option<alloc::vec::Vec<u8>>> = SpinLock::new(None);
 
 /// Transmits a UDP datagram from `src`:`sport` to `dst`:`dport` (with its checksum), unicast
 /// to `dst_mac`.
@@ -897,6 +899,10 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
     TFTP_IDENTICAL.store(u64::from(identical), Ordering::Relaxed);
     if let Some(tftp::Failure::Server(code)) = download.failure() {
         TFTP_ERROR.store(u64::from(code) + 1, Ordering::Relaxed);
+    }
+    if download.is_complete() {
+        let file = download.into_data();
+        crate::cpu::without_interrupts(|| *FETCHED.lock() = Some(file));
     }
 }
 
@@ -1266,5 +1272,25 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         },
         tftp_ok,
         if tftp_ok { "" } else { ": virtio-net failed" }
+    );
+
+    // The first filesystem content from the network: the fetched file — the downloaded
+    // bytes, not the embedded copy — unpacked as an initramfs into a fresh VFS and read back,
+    // by the same checks as the embedded image's.
+    let fetched = crate::cpu::without_interrupts(|| FETCHED.lock().take());
+    let check = crate::check_initramfs(fetched.as_deref().unwrap_or(&[]));
+    let unpacked_ok = fetched.is_some() && check.ok;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: virtio-net initramfs: the fetched image extracted into a fresh VFS: {} entries; /etc/hostname {}, implicit /boot dir {}; consistent {}{}",
+        check.entries,
+        check.hostname,
+        check.implicit_dir,
+        unpacked_ok,
+        if unpacked_ok {
+            ""
+        } else {
+            ": virtio-net failed"
+        }
     );
 }

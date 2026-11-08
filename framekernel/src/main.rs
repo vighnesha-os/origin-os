@@ -559,26 +559,46 @@ pub(crate) static INITRAMFS_IMAGE: &[u8] = include_bytes!("../assets/initramfs.t
 /// end-to-end in the kernel on a real image: the entry count, a file's contents read back,
 /// and that a file whose parent directory the archive never listed was still created.
 fn prove_initramfs(com1: &mut console::Console) {
+    let check = check_initramfs(INITRAMFS_IMAGE);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: initramfs: {} entries into the VFS; /etc/hostname {}, implicit /boot dir {}; consistent {}{}",
+        check.entries,
+        check.hostname,
+        check.implicit_dir,
+        check.ok,
+        if check.ok { "" } else { ": initramfs failed" }
+    );
+}
+
+/// What extracting an initramfs image into a fresh VFS showed.
+pub(crate) struct InitramfsCheck {
+    pub(crate) entries: usize,
+    pub(crate) hostname: bool,
+    pub(crate) implicit_dir: bool,
+    pub(crate) ok: bool,
+}
+
+/// Extracts `image` (a ustar initramfs) into a fresh VFS and checks the result: four
+/// entries, `/etc/hostname`'s contents, and `/boot/banner.txt`, whose parent directory the
+/// archive never lists, so it must have been created implicitly. Used for the embedded image
+/// and for the copy fetched over the network.
+pub(crate) fn check_initramfs(image: &[u8]) -> InitramfsCheck {
     use framekernel::vfs::Vfs;
 
     let mut fs = Vfs::new(1 << 20, 256);
-    let result = framekernel::initramfs::extract(INITRAMFS_IMAGE, &mut fs);
-    let n = result.unwrap_or(0);
-
+    let result = framekernel::initramfs::extract(image, &mut fs);
+    let entries = result.unwrap_or(0);
     let mut buf = [0u8; 32];
     let read = fs.read("/etc/hostname", 0, &mut buf).unwrap_or(0);
-    let hostname_ok = &buf[..read] == b"origin-os\n";
-    // "boot/banner.txt" has no "boot/" directory entry in the archive: its parent must have
-    // been created implicitly.
-    let implicit_parent_ok = fs.resolve("/boot/banner.txt").is_ok();
-    let consistent = result.is_ok() && n == 4 && hostname_ok && implicit_parent_ok;
-
-    let _ = writeln!(
-        com1,
-        "origin-kernel: initramfs: {n} entries into the VFS; /etc/hostname {hostname_ok}, implicit /boot dir {implicit_parent_ok}; consistent {}{}",
-        consistent,
-        if consistent { "" } else { ": initramfs failed" }
-    );
+    let hostname = &buf[..read] == b"origin-os\n";
+    let implicit_dir = fs.resolve("/boot/banner.txt").is_ok();
+    InitramfsCheck {
+        entries,
+        hostname,
+        implicit_dir,
+        ok: result.is_ok() && entries == 4 && hostname && implicit_dir,
+    }
 }
 
 /// Reports the CPU topology from CPUID leaf 0Bh and checks that the online processors'
