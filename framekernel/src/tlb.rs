@@ -38,8 +38,13 @@ use crate::timer::X2Apic;
 pub(crate) const SHOOTDOWN_VECTOR: u8 = 0xF0;
 /// A request to flush everything rather than one page.
 const ALL: u64 = u64::MAX;
-/// Polls before an initiator gives up waiting: on the order of a second.
-const WAIT_POLLS: u64 = 1 << 26;
+/// An initiator gives up waiting after this many seconds of the TSC (for its turn, and for
+/// every other processor's answer): time, not polls, so the bound does not depend on what
+/// PAUSE costs on this processor.
+const WAIT_SECONDS: u64 = 1;
+/// The TSC rate to assume before the clock has measured one (`time::tsc_hz` is then 1, and
+/// no other processor is running to wait for).
+const MIN_TSC_HZ: u64 = 1_000_000_000;
 /// ICR level bit: assert (the only meaningful level for fixed IPIs).
 const ICR_ASSERT: u32 = 1 << 14;
 
@@ -135,15 +140,17 @@ pub(crate) fn shootdown_all() -> u64 {
 
 fn shoot(request: u64) -> u64 {
     let outcome = cpu::without_interrupts(|| {
-        let mut polls = 0u64;
+        let limit = crate::time::tsc_hz()
+            .max(MIN_TSC_HZ)
+            .saturating_mul(WAIT_SECONDS);
+        let waiting_since = rdtsc();
         let turn = loop {
             if let Some(turn) = INITIATOR.try_lock() {
                 break turn;
             }
             service();
             core::hint::spin_loop();
-            polls += 1;
-            if polls == WAIT_POLLS {
+            if rdtsc().wrapping_sub(waiting_since) >= limit {
                 return Err(usize::MAX);
             }
         };
@@ -179,10 +186,12 @@ fn shoot(request: u64) -> u64 {
             if !target {
                 continue;
             }
-            let mut polls = 0u64;
             while served.load(Ordering::Acquire) < generation {
-                polls += 1;
-                if polls == WAIT_POLLS {
+                if rdtsc().wrapping_sub(start) >= limit {
+                    // Looked at once more: this processor may have been the one away.
+                    if served.load(Ordering::Acquire) >= generation {
+                        break;
+                    }
                     return Err(id);
                 }
                 core::hint::spin_loop();
