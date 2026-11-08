@@ -56,7 +56,7 @@ The ONBF parsers, which run in the boot loader on data read before any signature
 | ONBF parser (`onbf-format`), Merkle trees (`onbf-merkle`), KRN packer (`onbf-pack`) | done for KRN; EXE/LIB/OSI/OAPP/OD profiles not yet |
 | SHA-2, SHA-3/SHAKE, Ed25519 (strict), ML-DSA-65/87 (strict) in `origin-crypto` | done, verification only; **no NIST ACVP or Wycheproof validation yet** (downloads need approval) |
 | Signature block, certificate chain, trust store | encodings decided (S1–S4); parser (`onbf-format`), entry verification and the KRN policy (`onbf-verify`, proven against reference-signed vectors and `onbf-sign`'s signatures) and the loader's compiled-in store done, with a test key only; OKC chains specified (errata O2–O5) and waiting for the SYS profile's signed time; trust anchor decided (B7) |
-| Signing (host) | `onbf-pack sign` and `keygen`, with Ed25519 and ML-DSA-87 signing written in Rust (`onbf-sign`, host only: the loader and kernel cannot reach it). Keygen and signing match the independent Python references and OpenSSL byte for byte; every image is self-verified with the loader's code. Side-channel assessment and best-effort zeroization are recorded; agent-reviewed, not independently audited. A test key is derived from public text; no release key exists |
+| Signing (host) | `onbf-pack sign` and `keygen`, with Ed25519 and ML-DSA-87 signing written in Rust (`onbf-sign`, host only: the loader and kernel cannot reach it). Keygen and signing match the independent Python references and OpenSSL byte for byte; every image is self-verified with the loader's code. Side-channel assessment recorded; zeroization is best effort, accepted by the owner for development keys; agent-reviewed, not independently audited. A test key is derived from public text; no release key exists |
 
 ## Waiting on the owner
 
@@ -69,7 +69,7 @@ Three ADRs are **Proposed** and await the owner:
 
 Errata **V1–V6 and O2–O5** were decided by the owner on 2026-11-08, along with Rust host signing: `docs/spec/ONBF-errata.md`. Certificate chains are specified but wait for the SYS profile's signed time (O3). **O1** stays open.
 
-Waiting on the owner for the host signer: whether to allow a reviewed `unsafe` volatile wipe of hasher state, or accept best-effort zeroization for host development keys (`TASKS.md`).
+For the host signer the owner accepted best-effort zeroization of development keys (2026-11-08); release keys belong in an HSM.
 
 Also waiting on the owner: approval to download Intel's VT-d Rev 5.20 PDF (about 10 MB), so that every encoding can be re-checked against the text itself; and a check of the AMD IOMMU specification (48882 Rev 3.11) read from a mirror against AMD's own copy (its SHA-256 is in the AMD-Vi research ledger). Still the owner's too, because they are not design: approval to download NIST ACVP / FIPS 204 errata / Wycheproof vectors and the `loom` crate; a project licence; merging PR #1 into `main`; and, for production qualification, declaring the supported 2026+ Intel/AMD reference platforms and providing physical x86 test machines (CLAUDE.md §74, §76 — nothing is qualified on hardware until then). Details: `docs/engineering/TASKS.md`.
 

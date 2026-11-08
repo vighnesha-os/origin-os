@@ -45,7 +45,8 @@
 //!   even index-free code. Keep to trusted hosts;
 //! - any timing measurement: none has been made.
 //!
-//! **Secret zeroization is best effort.** The crate forbids `unsafe` (ONBF §12), so it cannot
+//! **Secret zeroization is best effort**, accepted by the owner for host development keys on
+//! 2026-11-08. The crate forbids `unsafe` (ONBF §12), so it cannot
 //! use volatile writes: [`wipe`] and [`wipe_words`] overwrite buffers and pass them to
 //! `black_box`, which the compiler treats as an opaque use but does not promise to honour.
 //! Secrets are written in place, to avoid copies from returns and moves, but coverage is

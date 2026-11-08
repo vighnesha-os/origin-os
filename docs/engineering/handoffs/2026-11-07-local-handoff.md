@@ -1034,7 +1034,7 @@ On branch **`claude/adoring-hopper-a8f66b`** (on `claude/interesting-carson-ae7c
 
 **Result, on the final code:** `cargo xtask check` (719 tests, 0 failures, 6 ignored), `boot-test` (11 of 11), `boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs) and `boot-x2apic` pass, each on the first attempt once the host was quiet, with the signed kernel as the main boot and developer mode off. The signatures are made by `onbf-sign`, and verified by `origin-crypto` and OpenSSL. 36 negative controls were applied and restored, each failing its named check. Two fresh reviewing agents read the work: the first found no way to get a refused image accepted and six low-severity points (five fixed, the sixth recorded); the second found no signature-correctness bug in the signer and three real problems (a compiled data branch in Ed25519, gaps in wiping, a key-file overwrite), all fixed.
 
-**The owner decided on 2026-11-08** (errata, "Decided readings of §7" and "Decided for certificate chains"): V1–V6 as recommended; host signing in **Rust** rather than OpenSSL; O2 `origin/onbf/1/okc`; O3 **expiry against signed time** (so chains wait for SYS); O4 **exact IDs only**; O5 bare public keys.
+**The owner decided on 2026-11-08** (errata, "Decided readings of §7" and "Decided for certificate chains"): V1–V6 as recommended; host signing in **Rust** rather than OpenSSL; O2 `origin/onbf/1/okc`; O3 **expiry against signed time** (so chains wait for SYS); O4 **exact IDs only**; O5 bare public keys; and best-effort zeroization accepted for host development keys (no `unsafe` volatile wipe; release keys belong in an HSM).
 
 #### What to know
 
@@ -1050,7 +1050,6 @@ On branch **`claude/adoring-hopper-a8f66b`** (on `claude/interesting-carson-ae7c
 
 #### Open for the owner
 
-- **Hasher-state zeroization.** `origin-crypto`'s SHA-2 entry says a volatile wipe must be added before any secret is hashed. `onbf-sign` now hashes secrets (the owner's choice of Rust signing), so that condition stands unmet: either allow one reviewed `unsafe` volatile wipe, or accept best effort for host development keys, as the release path is an HSM anyway.
 - **O1** (the statement's `id` and NFC) is untouched: the KRN `id` is ASCII, and the loader does not normalize.
 
 #### Not done

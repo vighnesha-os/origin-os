@@ -80,5 +80,4 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 | — | Download of Intel's VT-d Rev 5.20 PDF (D51397-019, about 10 MB) | Re-checking every VT-d encoding against the text itself before hardware qualification |
 | — | ADR-0008 (dense CPU indexes, Proposed): three questions | Accepting the per-CPU indexing design; it is implemented and boot-proven already |
 | — | ONBF errata O1: the statement `id`'s NFC rule | The Package Service's ID checks |
-| — | A reviewed `unsafe` volatile wipe for hasher state (`SOURCE_PROVENANCE.md`, `onbf-sign`), or accepting best-effort zeroization for host development keys | Closing §59's zeroization requirement for the host signer; release keys belong in an HSM |
 | — | Merge into `main` and push | Sharing the work |
