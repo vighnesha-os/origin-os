@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| As of | 2026-11-08, commit `944a276` on `claude/interesting-carson-ae7c83`. The M4 and signed-boot sessions are still running and may add to this list. |
+| As of | 2026-11-08, on `claude/interesting-carson-ae7c83`, with signed boot and the crypto vectors merged. M4, Loom, the RTC fix and early-boot DMA are not merged and may add to this list. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–9, 13–20 and 25, each with the recommendation below. |
-| Still open | Items 10–12 (after item 23). Items 21–24 (need you). |
+| Answered | 2026-11-08: items 1–9, 13–22, 24 and 25. |
+| Still open | Item 23 (you are comparing the AMD manuals), then items 10–12. Choosing machines from the shortlist. Item 26. |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -73,10 +73,10 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 
 | # | Question | Recommendation | Why |
 |---|---|---|---|
-| 21 | The project licence? | **Apache-2.0 if this is to be open. If closed, make the repository private now.** | The GitHub repository is public with no LICENSE file: anyone can read the code, but nobody else has permission to reuse it. Apache-2.0 includes a patent grant. Much of this code is AI-written, and how copyright applies to that is unsettled, so take legal advice if it matters commercially. |
-| 22 | Push this branch and open a PR against PR #1's branch? | **Yes, after item 21** | Everything since PR #1 exists only on this Mac (§79: the repository is the durable record). Because the repository is public, pushing publishes them. A PR is review, not a merge (§80). |
-| 23 | Compare two AMD manuals with AMD's own copies? | **Now, before items 10–12** | §3 requires legitimate specifications and §16 a confirmed revision. Both were read from the kib.kiev.ua mirror because AMD's site refuses automated reads. Download each from AMD and run `shasum -a 256` on it. IOMMU spec 48882 Rev 3.11: `f7c375a15db5ed63de760356867211063d164a2ed59f2d38613daec95894ce22`. APM Vol. 3, 24594 Rev 3.39: `b598514b19f204d973040d9867a7ffc48c949009a8b3dc86b20c9188e721ee45`. |
-| 24 | Which 2026+ Intel and AMD machines are the declared targets, and what physical x86 test hardware? | **One Intel and one AMD machine to start; several of each before any qualification** | §74 requires multiple Intel and AMD models, with SMT, hybrid and NUMA variations, and §76 a declared scope. CET shadow stacks, hybrid cores and real IOMMU behaviour cannot be shown under QEMU, and this Mac can't run x86 natively. Choosing models needs current research (§16). |
+| 21, answered | The project licence? | **MIT OR Apache-2.0** (your choice, 2026-11-08) | `LICENSE-MIT` and `LICENSE-APACHE` are in the repository. The repository stays public. Much of this code is AI-written, and how copyright applies to that is unsettled, so take legal advice if it matters commercially. |
+| 22, answered | Push this branch and open a PR against PR #1's branch? | **Yes, after merging the finished side work** (your choice, 2026-11-08) | Signed boot and the crypto vectors are merged here. M4, Loom, the RTC fix and early-boot DMA are not, because they are not finished. A PR is review, not a merge (§80). |
+| 23, yours to do | Compare two AMD manuals with AMD's own copies? | **You are comparing them** (your choice, 2026-11-08). Items 10–12 follow | §3 requires legitimate specifications and §16 a confirmed revision. Both were read from the kib.kiev.ua mirror because AMD's site refuses automated reads. Download each from AMD and run `shasum -a 256` on it. IOMMU spec 48882 Rev 3.11: `f7c375a15db5ed63de760356867211063d164a2ed59f2d38613daec95894ce22`. APM Vol. 3, 24594 Rev 3.39: `b598514b19f204d973040d9867a7ffc48c949009a8b3dc86b20c9188e721ee45`. |
+| 24, answered | Which 2026+ Intel and AMD machines are the declared targets, and what physical x86 test hardware? | **Research a shortlist first** (your choice, 2026-11-08): `docs/hardware/SHORTLIST.md` | §74 requires multiple Intel and AMD models, with SMT, hybrid and NUMA variations, and §76 a declared scope. CET shadow stacks, hybrid cores and real IOMMU behaviour cannot be shown under QEMU, and this Mac can't run x86 natively. |
 
 ## What the answers changed (2026-11-08)
 
@@ -84,6 +84,12 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 - Item 15: `boot-matrix` ends with `boot-x2apic`.
 - Item 17: a statement's `id` must be printable ASCII; errata O1 is closed.
 - Item 18: the VT-d PDF is downloaded, outside the repository because it is Intel's document.
+
+## New since this sheet was written
+
+| # | Question | Recommendation | Why |
+|---|---|---|---|
+| 26 | Errata V1–V6 and open gaps O2–O5 from the signed-boot work, and OpenSSL 3.5+ as the host signing tool (`docs/spec/ONBF-errata.md`, `docs/research/2026-11-08-krn-signature-verification.md`) | **Not reviewed yet** | The readings are applied in the code while Proposed. The gaps block certificate chains, not the test-key path. |
 
 **Also found by the same check, not decisions for now:** ADR-0002, ADR-0004 and ADR-0005, already Accepted, have no migration consequences either (§18). The system-call boundary M4 is building has no threat model yet (§58).
 

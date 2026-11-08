@@ -75,9 +75,8 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 | # | Decision | Blocks |
 |---|---|---|
 | — | The `loom` crate (host-only dev-dependency, §5), **approved 2026-11-08**, not fetched yet; its source and size are confirmed when the work that uses it starts. (The ACVP, errata and Wycheproof downloads of the same approval were fetched on 2026-11-08, file by file; see `SOURCE_PROVENANCE.md`.) | Concurrency models (§73) |
-| — | A project licence | Every provenance entry |
 | — | ADR-0007 (DMA isolation and interrupt remapping, Intel VT-d and AMD-Vi, Proposed): questions 6, 7 and 8, after the AMD manual check; the rest are answered (`docs/engineering/OWNER_DECISIONS.md`) | Accepting the IOMMU design; it is implemented and boot-proven already |
 | — | Compare the AMD IOMMU specification (48882 Rev 3.11) read from a mirror with AMD's own copy (SHA-256 in `docs/research/2026-11-08-amd-vi-iommu.md`) | Confidence that every AMD-Vi encoding comes from AMD's text |
 | — | ONBF errata V1–V6 (Proposed, 2026-11-08): what an empty chain means, one entry per KRN block, the KRN statement's `id` and `version`, the compiled-in trust store, developer mode and signed images, the signing time; and errata O1–O5, which chains need | Accepting the signature readings; they are implemented and boot-proven already. OKC chains are blocked on O2–O5 |
 | — | OpenSSL 3.5+ as a host signing tool (`onbf-pack`): the choice recorded in `docs/research/2026-11-08-krn-signature-verification.md` §3 | Confirming that signing path for development; release signing (HSM) is separate |
-| — | Merge into `main` and push | Sharing the work |
+| — | Review and merge PR #1 and the pull request stacked on it into `main` | Landing the work |
