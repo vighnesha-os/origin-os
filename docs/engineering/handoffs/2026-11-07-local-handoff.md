@@ -1061,3 +1061,24 @@ On `claude/interesting-carson-ae7c83`, **not pushed**. The table is the last sec
 - **Before real hardware:** protected memory regions (`PMEN.EPM`); the threat model's list.
 - **The owner:** item 23 (then 10–12); items 21, 22 and 24. Items 7 and 25 were accepted on 2026-11-08.
 
+### Continued (2026-11-08, ~15:00–15:50 IST): external known-answer vectors for `origin-crypto` (CRYPTO-KAT)
+
+On branch **`claude/amazing-einstein-4eb320`** (on `b3efe8a`, not pushed): owner decision 19's downloads, fetched after each file's name, source and size were confirmed with the owner. Evidence: `SOURCE_PROVENANCE.md`, "External known-answer vectors" (sources, hashes, the exceptions, the errata table, the planted faults).
+
+- **`security/crypto/tests/kat/`** runs 3,882 vectors through the public API: NIST ACVP for SHA-256, SHA-512, SHA3-256, SHA3-512, SHAKE128, SHAKE256 and ML-DSA-65/87 signature verification, and all 210 of Wycheproof's Ed25519. All pass. `cargo xtask check` picks them up through `cargo test --package origin-crypto`, about 4 s more.
+- **The data** (`tests/vectors/acvp/`, `tests/vectors/wycheproof/`, 6.5 MB) is the applicable subset, converted by `tools/convert_kat_vectors.py` from upstream files at pinned commits and SHA-256 hashes, and committed with NIST's notice and Apache-2.0's `LICENSE`, because the public repository needs both to redistribute them.
+- **`ORIGIN_KAT_SCALE`** is the largest large-data vector in GiB (default 1; 8 runs all 16, about 1 min; 0 none).
+- **Errata:** the FIPS 204 errata sheet's 12 entries are recorded; one check changed (`UseHint`'s upper bound, asserted over all of Z_q).
+
+#### What to know
+
+- ACVP's two SHAKE revisions encode a partial last output byte differently: revision 1.0 keeps the bits in place, FIPS202 moves them to the high-order end. The tests carry both (`PartialByte`).
+- The library is untouched, on purpose: the signed-boot session uses it. `Verify_internal` has no public entry point, so ACVP's internal-interface vectors don't apply; if a future change exposes one, those vectors could run.
+
+#### Not done
+
+- An independent review of the crate (§59). The Python references and these tests have the same author as the code.
+
+#### Next
+
+- Merge this branch into `claude/interesting-carson-ae7c83` when the coordinator is ready; it touches only `security/crypto/` and the records (STATUS, TASKS, OWNER_DECISIONS, this file, SOURCE_PROVENANCE), so conflicts would be in the records.
