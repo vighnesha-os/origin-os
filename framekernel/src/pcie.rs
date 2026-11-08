@@ -32,7 +32,7 @@ use origin_sync::{RwLock, SpinLock};
 use crate::console::Console;
 use crate::cpu::CpuIndex;
 
-/// Segment 0's ECAM window, mapped.
+/// One ECAM window, mapped (segment 0's is [`ECAM`]; any others stay in [`Quiesce`]).
 struct EcamSpace {
     ecam: Ecam,
     virt: u64,
