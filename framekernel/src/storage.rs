@@ -1322,67 +1322,36 @@ fn msix_point(table: u64, entry: u64, m: vtd::MsiMessage) {
     msix_write(table, entry, 3, 0);
 }
 
-/// Whether `m` is a remappable-format message with data 0 whose IRTE (on `at`'s unit) sends
-/// `vector` to `apic` and checks `at`'s source ID.
+/// Whether `m` is a handle to an IRTE (VT-d: remappable format with data 0, on `at`'s unit;
+/// AMD-Vi: an index into `at`'s own table) that sends `vector` to `apic` and that only `at`
+/// can use.
 pub(crate) fn routed_through_irte(
     at: pci::Address,
     m: vtd::MsiMessage,
     vector: u8,
     apic: u32,
 ) -> bool {
-    let Some(index) = vtd::interrupt_index(m) else {
-        return false;
-    };
-    let source = vtd::SourceCheck::RequesterId {
-        source_id: crate::iommu::source_id(at),
-        qualifier: 0,
-    };
-    m.data == 0
-        && crate::iommu::irte(at, index)
-            .is_some_and(|e| e.vector == vector && e.destination == apic && e.source == source)
-}
-
-/// A fault for the report: who, what and why.
-struct Fault(Option<vtd::FaultRecord>);
-
-impl core::fmt::Display for Fault {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let Some(r) = self.0 else {
-            return f.write_str("none");
-        };
-        write!(f, "source ID {:#06x}, ", r.source_id)?;
-        match r.interrupt_index {
-            Some(i) => write!(f, "interrupt index {i}")?,
-            None => write!(
-                f,
-                "{} at {:#x}",
-                if r.read { "read" } else { "write" },
-                r.address
-            )?,
-        }
-        write!(
-            f,
-            ", reason {:#x} ({})",
-            r.reason,
-            vtd::fault_reason(r.reason)
-        )
-    }
+    crate::iommu::route(at, m)
+        .is_some_and(|r| r.vector == vector && r.destination == apic && r.source_checked)
 }
 
 /// The IOMMU proofs that need the bound controller (CLAUDE.md §32, §58; ADR-0007):
 /// 1. **translated DMA**: a read into a fresh page lands in that physical page, although the
 ///    controller was given only its IOVA — never its physical address — and the domain's
 ///    tables translate the one to the other;
-/// 2. **blocked DMA**: once that IOVA is unmapped (the IOTLB invalidated and drained), the
-///    same read leaves the page untouched, and the unit records the fault: the controller's
-///    source ID, the IOVA, a write, reason 5;
+/// 2. **blocked DMA**: once that IOVA is unmapped (the translation cache invalidated and the
+///    invalidation waited for), the same read leaves the page untouched, and the IOMMU
+///    records the fault: the controller's source ID, the IOVA, a page not mapped (VT-d: a
+///    write, reason 5; AMD-Vi: an I/O page fault with PR clear);
 /// 3. **remapped interrupts**: every MSI-X entry the NVMe and virtio-net drivers programmed
-///    holds only a remappable-format handle with data 0, and each handle's IRTE holds the
-///    vector, the destination and the device's source ID; and an APIC ID above 255, which
-///    compatibility format cannot address, is accepted (its IRTE read back, then freed);
+///    holds only a handle to an IRTE (VT-d: remappable format with data 0; AMD-Vi: an index
+///    into the device's own table), and each IRTE holds the vector and the destination and
+///    can be used only by its device; and an APIC ID above 255, which compatibility format
+///    cannot address, is accepted (its IRTE read back, then freed);
 /// 4. **a blocked interrupt**: vector 1 pointed at a not-present IRTE, a completion on I/O
-///    queue 2 raises no interrupt, and the unit records the fault: the source ID, the index,
-///    reason 22h. Vector 1 is restored afterwards.
+///    queue 2 raises no interrupt, and the IOMMU records the fault (VT-d: the source ID, the
+///    index, reason 22h; AMD-Vi: the DeviceID, an interrupt I/O page fault with PR clear).
+///    Vector 1 is restored afterwards.
 ///
 /// Faults recorded before the proofs are reported; one from an attached device fails the
 /// proof (a driver's DMA went where it had not mapped). Returns whether everything held;
@@ -1465,11 +1434,14 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool
     let second = transfer_status(false, PROBE_LBA, page.bus, 8);
     let intact = page.bytes() == &canary[..];
     let (faults, lost) = crate::iommu::take_faults();
+    let address_ok = |a: u64| a == page.bus || (a == 0 && !crate::iommu::fault_address_required());
     let mine = faults
         .iter()
-        .find(|f| f.source_id == sid && f.interrupt_index.is_none() && f.address == page.bus)
+        .find(|f| f.source_id == sid && !f.interrupt && address_ok(f.address))
         .copied();
-    let recorded = mine.is_some_and(|f| !f.read && f.reason == 5);
+    let recorded = mine.is_some_and(|f| {
+        f.kind == crate::iommu::FaultKind::PageNotMapped && f.write != Some(false)
+    });
     let blocked = unmapped == Ok(phys) && gone && intact && recorded;
     let status = match second {
         Some(s) => alloc::format!("completed with status type {} code {:#x}", s.kind, s.code),
@@ -1477,9 +1449,10 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool
     };
     let _ = writeln!(
         com1,
-        "origin-kernel: IOMMU: blocked DMA: IOVA {:#x} unmapped (IOTLB invalidated page-selectively, reads and writes drained), the same read {status}, and the page kept its canary {intact}; fault recorded: {}{}; consistent {blocked}{}",
+        "origin-kernel: IOMMU: blocked DMA: IOVA {:#x} unmapped ({}), the same read {status}, and the page kept its canary {intact}; fault recorded: {}{}; consistent {blocked}{}",
         page.bus,
-        Fault(mine),
+        crate::iommu::unmap_words(),
+        crate::iommu::Recorded(mine),
         if lost { " (a fault was lost)" } else { "" },
         if blocked { "" } else { ": IOMMU failed" }
     );
@@ -1519,11 +1492,9 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool
     const WIDE: u32 = 300;
     let refused = pci::msi_address(WIDE).is_none();
     let wide = crate::iommu::msi_message(at, WIDE, crate::cpu::DEVICE_VECTOR);
-    let wide_index = wide.ok().and_then(vtd::interrupt_index);
-    let wide_back = wide_index
-        .and_then(|i| crate::iommu::irte(at, i))
-        .map(|e| e.destination);
-    let released = wide_index.is_some_and(|i| crate::iommu::release_interrupt(at, i).is_ok());
+    let wide_route = wide.ok().and_then(|m| crate::iommu::route(at, m));
+    let wide_back = wide_route.map(|r| r.destination);
+    let released = wide_route.is_some_and(|r| crate::iommu::release_interrupt(at, r.index).is_ok());
     let (_, irtes) = crate::iommu::domains();
     let remapped = crate::iommu::remapping()
         && nvme_routes == 1 + cpus.len()
@@ -1534,9 +1505,10 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool
         && released;
     let _ = writeln!(
         com1,
-        "origin-kernel: IOMMU: interrupt remapping: {through} of {} MSI-X entries (NVMe {nvme_routes}, virtio-net {}) hold only a remappable handle with data 0 whose IRTE holds the vector, the x2APIC destination and the device's source ID; {irtes} IRTEs in use; APIC ID {WIDE} accepted (its IRTE reads back destination {}), which compatibility format refuses: {refused}; consistent {remapped}{}",
+        "origin-kernel: IOMMU: interrupt remapping: {through} of {} MSI-X entries (NVMe {nvme_routes}, virtio-net {}) {}; {irtes} IRTEs in use; APIC ID {WIDE} accepted (its IRTE reads back destination {}), which compatibility format refuses: {refused}; consistent {remapped}{}",
         routes.len(),
         routes.len() - nvme_routes,
+        crate::iommu::routing_words(),
         wide_back.map_or(alloc::string::String::from("none"), |d| alloc::format!(
             "{d}"
         )),
@@ -1569,19 +1541,24 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool
             let (faults, lost) = crate::iommu::take_faults();
             let fault = faults
                 .iter()
-                .find(|f| f.source_id == sid && f.interrupt_index == Some(index))
+                .find(|f| {
+                    f.source_id == sid
+                        && f.interrupt
+                        && f.interrupt_index.is_none_or(|i| i == index)
+                })
                 .copied();
             msix_point(table, 1, saved);
             let freed = crate::iommu::release_interrupt(at, index).is_ok();
-            let ok = completed.is_some_and(|c| c.status.ok())
-                && arrived == 0
-                && fault.is_some_and(|f| f.reason == 0x22)
-                && freed;
+            let recorded = match fault {
+                Some(f) => f.kind == crate::iommu::FaultKind::InterruptBlocked,
+                None => !crate::iommu::interrupt_record_required(),
+            };
+            let ok = completed.is_some_and(|c| c.status.ok()) && arrived == 0 && recorded && freed;
             let _ = writeln!(
                 com1,
                 "origin-kernel: IOMMU: blocked interrupt: NVMe MSI-X vector 1 pointed at IRTE {index}, left not present: a read on I/O queue 2 completed {}, {arrived} interrupts arrived; fault recorded: {}{}; vector 1 restored; consistent {ok}{}",
                 completed.is_some_and(|c| c.status.ok()),
-                Fault(fault),
+                crate::iommu::Recorded(fault),
                 if lost { " (a fault was lost)" } else { "" },
                 if ok { "" } else { ": IOMMU failed" }
             );
@@ -1616,7 +1593,8 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool
     let quiet = !attached_fault && !lost_before;
     let _ = writeln!(
         com1,
-        " no other function has a context entry, so its DMA faults; IOVAs from {:#x}; faults recorded before the proofs: {}{}; consistent {quiet}{}",
+        " {}; IOVAs from {:#x}; faults recorded before the proofs: {}{}; consistent {quiet}{}",
+        crate::iommu::default_deny_words(),
         vtd::IOVA_BASE,
         before.len(),
         if lost_before { " (some lost)" } else { "" },
