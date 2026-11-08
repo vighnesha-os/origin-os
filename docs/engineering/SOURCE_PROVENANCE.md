@@ -647,6 +647,48 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 3 `topology` tests (width decode and ID splitting, the flat fallback, and `analyze`'s package/core/thread counts with a duplicate-ID rejection); 166 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs (and an earlier 8-CPU boot).
 - **Not done:** using the topology for scheduler placement (SMT-aware and cache-aware, §27), the cache hierarchy from leaf 04h, and hybrid-core capacity (§27).
 
+### CPU topology from CPUID leaves 1Fh, 0Bh and 80000026h (`topology`; `cpu`, `smp`, `main`; xtask; library + kernel; CLAUDE.md §24, §27, §72, §74; ADR-0008 C2; 2026-11-08)
+
+- **What:** an extension of the entry above (which read leaf 0Bh only) in `framekernel::topology` (library, `forbid(unsafe_code)`):
+  - `CpuTopology::detect(cpuid)`, driven by a CPUID reader: the kernel passes `cpu::cpuid_subleaf`, host tests a modelled processor;
+  - `Layout`: from thread to package, the bits below each domain's ID field, one type for three encodings. Leaves 1Fh and 0Bh give upper bounds (the shift to the next wider domain); AMD's 80000026h gives lower bounds (the shift to each level's own ID), so the two are decoded apart. AMD's complex is the module domain. Leaf 0Bh shows the core field reaching to the package;
+  - the choice of leaf: 80000026h, then 1Fh, then 0Bh, then none, each checked against its maximum and its own validity rule, never by vendor. A malformed leaf is skipped and recorded in `problem`;
+  - unknown domain types absorbed into the known domain directly below (Intel's paper §1.3.2);
+  - `CoreIdentity`: leaf 1Ah's or leaf 80000026h's core type as a raw code, native model, and AMD's efficiency ranking. No names (§24); Intel's text says the code implies nothing;
+  - `Placement` (package, die group, die, tile, module, core, thread), `Census`, and `agree` (each processor against its MADT APIC ID and against the first processor).
+- **Kernel:** `cpu::record_topology` runs on every processor on itself (the boot processor in `prove_topology`, each AP in `smp::ap_entry` before its handshake answer) and stores the decoded record under its `CpuIndex` (`cpu::topology_of`, a spin lock per slot; no new `unsafe`). `smp::listed_apic_ids` gives the MADT's whole list. `prove_topology` reports the layout, each online processor's placement, the MADT census, the core types, and the checks.
+- **Research ledger:** `docs/research/2026-11-08-cpu-topology-leaf-1fh.md`.
+- **Specifications:** Intel SDM Vol. 1 Chapter 21 (253665-093US, September 2026; CPUID.0BH, 1AH, 1FH), Intel *Processor Topology Enumeration* (337015-002), AMD APM Vol. 3 (24594 Rev 3.39, October 2026, read from a mirror; its SHA-256 is in the ledger: compare with AMD's copy before hardware qualification).
+- **Host tests:** 19 `topology` tests: QEMU's exact leaves and census; a leaf above the maximum not believed (the XSAVE reply, and 80000026h reading 1Fh's list); every domain; unknown domains (Intel's Examples B, C, D); every malformed list skipped and reported; 80000026h's convention, hybrid flag, core type and ranking; the leaf 1Ah rules; each way `agree` can fail; mixed thread widths on a hybrid only; and a randomized test over 3000 layouts through all three encodings. xtask: `the_topology_markers_follow_the_machine`. `cargo xtask check`: 596 tests, 0 failures, 6 ignored (579 before).
+- **Boot proof, `cargo xtask boot-x2apic`** (two boots, one machine: `-smp 1,maxcpus=150,sockets=2,dies=3,modules=5,cores=5,threads=1` with processors at APIC IDs 256 and 412, cold-plugged). With `-cpu max,vendor=GenuineIntel`, which raises QEMU's CPUID maximum to 1Fh:
+  - `topology: layout from leaf 1Fh: thread bits 0, core bits 3, module bits 3, die bits 2, package from bit 8`
+  - `topology: CPU 2 (APIC ID 412): package 1, die 2, module 3, core 4, thread 0`
+  - `topology: the MADT lists 150 processors: 2 packages, 6 dies, 30 modules, 150 cores, 150 threads`
+  - `topology: core types: reported by 0 of 3 processors; hybrid false`
+  - `topology: against the MADT: 3 processors checked, 0 recorded nothing, 0 have another APIC ID, 0 another layout, 0 an undecodable leaf, 0 no core type although hybrid, 0 a duplicate placement; consistent true`
+  - `topology: 3 logical, 3 cores, 2 packages (1 threads/core, 256 logical/package); consistent true`
+
+  With the default `-cpu max` (AMD vendor, maximum leaf 0Dh) the same machine reads through leaf 0Bh alone: `layout from leaf 0Bh: thread bits 0, core bits 8, module bits 0, die bits 0, package from bit 8`, `CPU 2 (APIC ID 412): package 1, die 0, module 0, core 156, thread 0`, and `2 packages, 2 dies, 2 modules, 150 cores, 150 threads`. xtask derives every expected value from the `-smp` fields alone. A third processor exists so that a die, module and core mix-up shows: at APIC ID 256 they are all 0.
+- **`cargo xtask boot-matrix`** (Intel and AMD IOMMUs, 1, 2 and 4 CPUs): each CPU's placement through leaf 0Bh, e.g. `CPU 3 (APIC ID 3): package 0, die 0, module 0, core 3, thread 0` at `-smp 4`.
+- **Negative controls.** Each is a temporary change. With it applied, `cargo xtask boot-test` (`ORIGIN_BOOT_TEST_TIMEOUT=45`) exited 1 on the sparse machine with `-cpu max,vendor=GenuineIntel`, and C9 and C10 on the default machine; it was then restored and `git diff` was empty:
+  - **C1, an AP that never records itself** (no `cpu::record_topology()` in `ap_entry`): `CPU 1 (APIC ID 256): it recorded nothing about itself`, `2 recorded nothing`, `consistent false: topology failed`.
+  - **C2, leaf 1Fh ignored** (1Fh removed from the leaves tried): `layout from leaf 0Bh`, so the `leaf 1Fh` markers never appear and the boot times out at its deadline.
+  - **C3, the module and die codes swapped**: the list is then out of order (die before module): `3 an undecodable leaf`, the fallback to 0Bh, `consistent false: topology failed`.
+  - **C4, an APIC ID that is not the MADT's** (the recorded MADT value off by one on each AP): `2 have another APIC ID`, `consistent false: topology failed`.
+  - **C5, an AP that draws another layout** (EAX of leaf 1Fh sub-leaf 1 raised by one on the APs): `CPU 2 (APIC ID 412): package 1, die 2, module 1, core 12, thread 0`, `2 another layout`, `consistent false: topology failed`.
+  - **C6, the census counts modules as dies**: `2 packages, 30 dies, 30 modules`, so the `6 dies` marker never appears and the boot times out.
+  - **C7, a hybrid claim with no core type** (CPUID.07H:EDX\[15\] forced set for every processor): `core types: reported by 0 of 3 processors; hybrid true`, `3 no core type although hybrid`, `consistent false: topology failed`.
+  - **C8, an AP that reports the boot processor's ID** (EDX forced to 0 on the APs): `CPU 2 (APIC ID 412): package 0, die 0, module 0, core 0, thread 0`, `2 have another APIC ID, ... 2 a duplicate placement`, `consistent false: topology failed`.
+  - **C9, leaf 0Bh ignored** (default `-smp 2` machine): `layout from no topology leaf`, `2 packages`, so the `core bits 1` markers never appear and the boot times out.
+  - **C10, no maximum-leaf check** (default machine, so leaf 1Fh is read beyond level 0Dh and returns leaf 0Dh's XSAVE data): `2 an undecodable leaf`, `consistent false: topology failed`.
+- **QEMU facts worth keeping** (ledger §3): `-cpu max` under TCG is AuthenticAMD with maximum basic leaf 0Dh, so leaf 1Fh is out of its range even with dies and modules; an Intel-vendor model (or `min-level=0x1f`) reaches it; a read above a maximum returns the highest basic leaf's data, never zeros; leaf 80000026h does not exist in QEMU 11.1.3 (`xlevel=0x80000026` gives zeros); leaf 1Ah reads zero and the hybrid bit has no name; `max` and `EPYC-Genoa` leave TopologyExtensions clear under TCG.
+- **Unsafe inventory:** nothing new. `framekernel::topology` is `forbid(unsafe_code)`; the per-CPU table is a spin lock per slot; CPUID goes through the existing `cpu::cpuid_subleaf`.
+- **Not done:** topology-aware placement (§27); hybrid-core capacity, which needs the CPUID.06H feedback interface or ACPI CPPC; leaf 8000001Eh, deliberately (AMD processors without 80000026h or 0Bh are below the 2026+ target, and they fall back to a flat layout); the ACPI PPTT; the MADT's "online capable" processors; **QEMU-only (§74): leaf 80000026h, leaf 1Ah, mixed SMT widths, tiles, die groups and any hybrid processor are host-tested from the specifications and were not run on hardware.** `hybrid false` under QEMU says nothing about hybrid processors.
+- **Review:** not yet independently reviewed.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code, written from the Intel SDM, Intel's topology paper and AMD's APM (T1, T2, A1 in the ledger); no operating-system code was read or copied (CLAUDE.md §3).
+- **Commit:** `d1984cd` (code and ledger), and the records commit after it.
+- **Licensing:** project licence not chosen yet.
+
 ### CPU cache hierarchy from CPUID leaf 04h (CLAUDE.md §24, §27; 2026-11-08)
 
 - **What:** `cache` (library) decodes leaf-04h deterministic-cache sub-leaves into each cache's level, type (data/instruction/unified), size, line size, ways and how many logical processors share it. The size is the product of ways, partitions, line size and sets. Pure, no `unsafe`. The kernel reports the hierarchy in its topology step.

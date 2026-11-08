@@ -54,7 +54,7 @@ ADR-0003 K6 starts APs one at a time through one trampoline data page (stack, en
 
 - Reports name a processor as `CPU {index} (APIC ID {id})` where the ID matters: AP start-up, MSI-X targets, interrupt delivery. Elsewhere they give `CPU {index}`, which equals the APIC ID only on dense machines.
 - `cargo xtask boot-x2apic` boots a processor at APIC ID 256 of 150 possible: it comes online, runs threads, takes shootdowns and wake-up IPIs, and the NVMe and virtio-net interrupts reach it through IRTEs. `boot-matrix` (1, 2 and 4 CPUs) is unchanged.
-- Nothing here is qualified on hardware (CLAUDE.md §74). The topology proof still reads CPUID leaf 0Bh only, and leaf 1Fh (dies, modules) is a later step for §27.
+- Nothing here is qualified on hardware (CLAUDE.md §74). CPU topology (package, die, module, core, thread) is now read per processor from CPUID leaves 1Fh, 0Bh or 80000026h, in records indexed by `CpuIndex` (C2), and checked against the MADT: `framekernel::topology`, research ledger `docs/research/2026-11-08-cpu-topology-leaf-1fh.md`. `boot-x2apic` boots a third processor, at APIC ID 412 (package 1, die 2, module 3, core 4), to show those fields apart.
 - C7: each boot with an AP reports `SMP: park drill: CPU 1 (APIC ID n) … its count moved 0 in 1000 us: parked true`, and the boot tests require it. By construction the drill adds about 22 ms to the boot: two INIT waits of 10 ms, 1 ms watching the count, and the AP's trip through the trampoline (under a millisecond in QEMU TCG). An AP that misses its handshake is reported as `parked by INIT`, and the other APs still start.
 
 ## Questions for the owner
