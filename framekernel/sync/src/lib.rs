@@ -26,6 +26,8 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
+pub mod wait;
+
 /// Mutual exclusion by spinning.
 pub struct SpinLock<T> {
     locked: AtomicBool,
