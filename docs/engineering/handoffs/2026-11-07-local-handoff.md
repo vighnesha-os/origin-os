@@ -573,3 +573,65 @@ be shown under QEMU either.
 - **The owner:** ADR-0007's five questions; approval to download the VT-d PDF.
 - **The rest of the audit list:** CET shadow stacks (needs KVM on CET hardware or bare metal),
   hybrid/extended topology, a GOP display fallback, xHCI/USB HID, Secure Boot enforcement.
+
+### Continued (2026-11-08, afternoon IST): AMD-Vi DMA and interrupt remapping
+
+The VT-d session named AMD-Vi as the next, separate step (§32 asks for both IOMMUs), and started
+this work in its own worktree, **branch `claude/upbeat-dijkstra-0d25fe`**. That branch began at
+`main`'s initial commit and was fast-forwarded to the VT-d branch's tip, `1c790fe`, before any
+work. Its commits are **local and not pushed**.
+
+| Commit | What |
+|---|---|
+| `313fa35` | research (`docs/research/2026-11-08-amd-vi-iommu.md`); `ivrs`, the ACPI IVRS parser; `amdvi`, the AMD-Vi encodings and host-table walker (14 host tests, a mutation soak); PCI class 08:06 named |
+| `6e2426a` | `iommu::amd`, behind the existing `iommu` entry points; the neutral `iommu::Fault` and `iommu::route` for the proofs; xtask `ORIGIN_QEMU_IOMMU=amd`, its markers, QEMU-stderr checks, and `boot-matrix` over both IOMMUs |
+| (records) | ADR-0007's AMD-Vi section (Proposed), provenance, STATUS, TASKS, this section |
+
+What the AMD-Vi boot shows (at `-smp` 2):
+
+```
+IOMMU: IVRS revision 1, IVinfo 0x2801 (...); 1 IOMMU(s) in 2 IVHD(s), 0 memory definition(s)
+IOMMU: unit 0 at 0xfed80000 (segment 0, IVHD type 0x11 of 2, IOMMU function 00:05.0, capability at 0x40): 9 device entries up to DeviceID 0x00fb, I/O APIC 0 (DeviceID 0x00a0)
+IOMMU: unit 0: device table of 256 entries at 0x…, every entry blocking DMA and fixed interrupts; …; interrupt remapping per device (128-bit entries, 32-bit x2APIC destinations); translation on (control 0x4000000021007, status 0x18): …
+IOMMU: translated DMA: the NVMe controller (00:02.0, source ID 0x0010) read LBA 2048 into IOVA 0x40012000, which its domain maps to physical 0x76000 (not the same address): 8 of 8 blocks landed in that physical page; consistent true
+IOMMU: blocked DMA: IOVA 0x40012000 unmapped (…), … the page kept its canary true; fault recorded: DeviceID 0x0010, access at 0x0, domain 0, event 0x2 (I/O page fault: page not present); consistent true
+IOMMU: interrupt remapping: 5 of 5 MSI-X entries (NVMe 3, virtio-net 2) hold only an index into their device's own interrupt remapping table, …; APIC ID 300 accepted (its IRTE reads back destination 300), …; consistent true
+IOMMU: blocked interrupt: NVMe MSI-X vector 1 pointed at IRTE 3, left not present: … 0 interrupts arrived; fault recorded: none; vector 1 restored; consistent true
+```
+
+Negative controls, each failing `ORIGIN_QEMU_IOMMU=amd cargo xtask boot-test`, then restored from
+git: N1 no page invalidation on unmap (the canary is overwritten, no fault); N2 IOVAs never
+mapped (an NVMe command times out); N3 virtio-net never attached (no ARP, no lease); N4 the
+DTE never routes interrupts to the device's table (no NVMe interrupt; QEMU reports the refusal);
+N5 every IRTE's vector one too high (no NVMe interrupt); N6 the probe IRTE left present (1
+interrupt arrives); N7 no x2APIC mode (32-bit IRTEs carry every interrupt, but APIC ID 300 is
+refused). Probes N8 and N9 are in the provenance entry.
+
+#### Lessons from this stretch
+
+- **QEMU 11.1's `amd-iommu` translates nothing unless `dma-remap=on`.** The first boot brought the
+  IOMMU up perfectly and then timed out the NVMe: its DMA went untranslated to unbacked IOVAs.
+  Making translation visible (the VT-d lesson) is what exposed it at once. And even with
+  `dma-remap=on`, QEMU puts a device under translation only on an INVALIDATE_DEVTAB_ENTRY for
+  it, so the kernel invalidates every entry at bring-up.
+- **Read the device model's events, do not assume them.** QEMU writes every event with
+  address 0 (undefined behaviour in its encoder, fixed only after 11.1) and sets the
+  "interrupt" flag on DMA faults; it logs no interrupt-remapping fault at all. The kernel
+  decodes by the specification, handles each deviation narrowly, and the boot test pins
+  QEMU's behaviour so a change is noticed.
+- **Prefer the encoding both the specification and the model enforce.** Blocking with Mode 0
+  and IR=IW=0 is correct by the specification but QEMU passes it through; V=1, TV=0 blocks in
+  both.
+- **Pin the IOMMU's PCI function** (`-device AMDVI-PCI,…,addr=05.0` with `pci-id`): unpinned it
+  takes 00:02.0 and moves every device after it.
+- **A second agent driving the device model directly** (`-accel qtest` with test DMA masters)
+  confirmed QEMU's behaviour independently of the kernel.
+
+#### Next, for the following session
+
+- **I/O APIC under AMD-Vi:** its DTE (DeviceID 0x00a0, from the IVRS special entry) blocks fixed
+  interrupts. Before an I/O APIC line is used with the IOMMU on, give that DeviceID an
+  interrupt table (the redirection entry's vector field then carries the IRTE index); under
+  QEMU a level-triggered line also needs an explicit I/O APIC EOI.
+- IVMD unity maps and exclusion ranges (and RMRR identity maps for VT-d).
+- **The owner:** ADR-0007's eight questions; compare the AMD specification's hash with AMD's copy.

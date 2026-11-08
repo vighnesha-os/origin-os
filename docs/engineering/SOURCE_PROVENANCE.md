@@ -1073,7 +1073,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `storage`/`virtionet`: volatile reads and writes of MSI-X table entries inside tables already checked against their BARs.
   Each block has a SAFETY note.
 - **Not done:**
-  - AMD-Vi (a separate step);
+  - AMD-Vi (done 2026-11-08: see "AMD-Vi DMA and interrupt remapping");
   - scalable mode;
   - RMRR identity maps (such devices are refused);
   - taking over a unit the firmware left enabled (pre-boot DMA protection);
@@ -1085,6 +1085,103 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - **No CPU with an APIC ID above 255 exists in the test configuration.** The kernel indexes per-CPU state by APIC ID with `MAX_CPUS` 64, so delivery to one is shown by the IRTE encoding, not by a live interrupt. Decoupling CPU index from APIC ID is a separate task.
   - **QEMU-only (§74).**
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the VT-d specification and virtio 1.1 §6.
+- **Licensing:** project licence not chosen yet.
+
+### The ACPI IVRS and AMD-Vi encodings (`ivrs`, `amdvi`; library; CLAUDE.md §16, §32, §72; 2026-11-08)
+
+- **Why:** CLAUDE.md §32 asks for the AMD IOMMU beside Intel VT-d, and the VT-d work named AMD-Vi as the next, separate step. Research came first (§16): `docs/research/2026-11-08-amd-vi-iommu.md`.
+- **What:**
+  - **`ivrs`: the ACPI I/O Virtualization Reporting Structure.** One `parse` checks the whole table before any view of it is returned:
+    - the 48-byte header and the revision (1 or 2);
+    - each definition block's header, its type's length (IVHD 10h 24 bytes, 11h and 40h 40, IVMD exactly 32) and its placement; unknown types are skipped by their length;
+    - IVHD types against the header: 11h and 40h need IVinfo EFRSup, and 40h needs revision 2;
+    - register bases: non-zero and 16 KiB aligned; a second IVHD with the same base must be another type naming the same segment and DeviceID (the same IOMMU described again);
+    - every device entry: a known length (4, 8, or an ACPI HID entry's 22 plus its UID), inside its IVHD; ACPI HID entries only in type 40h, with a UID format of 0–2 that agrees with the UID length;
+    - range starts (03h, 43h, 47h) followed at once by an end (04h) at or above them, and no end alone;
+    - at most one "all" entry per IVHD, and one IOMMU per segment that claims all;
+    - IVMDs after some IVHD, below 2^64, with ranges that do not end before they start, and no identity mapping without access.
+
+    The views are the IOMMUs (each once, from its richest IVHD: 40h, 11h, 10h, as the specification's §4.5 recommends), their device entries with ranges joined (select, range, alias select and range, extended select and range, special I/O APIC and HPET, ACPI HID, reserved types), the DTE settings, and the memory definitions with the IOMMU they follow. `Ivrs::unit_for` resolves a DeviceID to the IOMMU and the requester (alias) it is seen as: an entry naming it first, then a range, then "all"; `Ivrs::special` finds the I/O APIC's DeviceID.
+  - **`amdvi`: pure AMD-Vi encodings.**
+    - register offsets, Control and Status bits; capability-header, EFR and EFR2 decoding;
+    - the device-table, command-buffer and event-log base registers and ring pointers;
+    - the 256-bit device table entry as the kernel writes it: DMA blocked (V set, TV clear) or translated (Mode, root, IR, IW), interrupts blocked (IV, IntCtl 00b) or remapped through a table (IV, IntCtl 10b, IntTabLen, the 128-byte aligned root), the IVRS pass bits and SysMgt, the domain; decoding refuses every entry the kernel never writes;
+    - a host page-table walker over the VT-d walker's `TableMemory`: 4 KiB pages, directory entries naming the next level with read and write, the leaf deciding; it never replaces a live mapping and translates as the IOMMU would;
+    - IRTEs: the basic 32-bit entry (8-bit destination) and the 128-bit entry with GuestMode 0 (32-bit x2APIC destination under XTEn); remapped MSI messages (data = the index, kept below 256 so the message type stays fixed) and the index the IOMMU derives;
+    - commands: COMPLETION_WAIT (store, f), INVALIDATE_DEVTAB_ENTRY, INVALIDATE_IOMMU_PAGES (one page or the whole domain), INVALIDATE_INTERRUPT_TABLE, INVALIDATE_IOMMU_ALL;
+    - events: code, DeviceID, domain, address and the I, PR, RW, PE, RZ and TR flags; event names.
+- **Specifications:** AMD I/O Virtualization Technology (IOMMU) Specification, 48882 Rev 3.11 (April 2026): §2.2.2, §2.2.3, §2.2.5, §2.4, §2.5, §3.2, §3.4 and §5. Read from a mirror of AMD's PDF (AMD's own site refuses automated readers; SHA-256 in the research ledger). **Compare the hash with AMD's copy before hardware qualification.** The specification's agreement forbids duplicating it, so the code cites sections and copies no text.
+- **Test evidence (2026-11-08), 14 host tests:**
+  - `ivrs` (6):
+    - QEMU 11.1.3's exact table for the AMD boot (192 bytes as the kernel read them): one IOMMU at 0xfed80000 described by an IVHD 10h and an IVHD 11h, eight select entries and the I/O APIC as DeviceID 0x00a0;
+    - a two-IOMMU, two-segment platform with every block and entry type, one IOMMU described twice (10h and 40h);
+    - resolution by rank, aliases (select and range), extended ranges, segments, special devices and memory definitions;
+    - a named entry beating a range beating "all";
+    - every refusal at its offset;
+    - a 12,000-case mutation soak over three tables (two thirds re-sealed); more than 1,000 tables are accepted per default run, and each keeps every invariant `parse` promises.
+  - `amdvi` (7): capability, EFR and EFR2 decoding with the base registers; DTE round-trips and refusals; the walker (sharing, permissions, double maps, skipped levels, exhaustion) and a 20,000-step model check against a map; both IRTE formats and the messages; every command's encoding; event decoding (QEMU's form too) and 20,000 random entries.
+- **Not done:** guest translation (GCR3 tables, PASIDs), guest virtual APIC IRTEs (GuestMode 1), 2048-entry interrupt tables, device-table segmentation, PPR and GA logs, large-page mappings, and a Kani proof of the parser (§73).
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the specification. QEMU's device model was read and driven only to learn what it emulates. No operating system's IOMMU code was read or copied (CLAUDE.md §3).
+- **Licensing:** project licence not chosen yet.
+
+### AMD-Vi DMA and interrupt remapping (`iommu::amd`, `iommu`; kernel; CLAUDE.md §31, §32, §58; ADR-0007 Proposed; 2026-11-08)
+
+- **What:**
+  - **One set of entry points.** `iommu::{attach, map, unmap, translate, msi_message, route, reserve_blocked_interrupt, release_interrupt, take_faults, domains, source_id}` dispatch to the AMD-Vi driver when the firmware provides an IVRS and no DMAR. `dma::DeviceDma`, NVMe and virtio-net are unchanged. Faults reach callers as a neutral `iommu::Fault` (page not mapped, page denied, interrupt blocked, other) carrying the vendor's record; `iommu::route` reads an MSI's IRTE back for either vendor. The IOMMU proofs in `storage.rs` use these, so one proof serves both; every VT-d line is unchanged.
+  - **`iommu::amd` (kernel).** After PCIe enumeration, and before any driver binds, each IOMMU the IVRS names is brought up:
+    1. its capability block is read from its PCI function (it must be an IOMMU block) and its registers mapped uncached (16 KiB: every register used lies there); the firmware must have left IOMMUEn clear;
+    2. its features are the EFR register ANDed with the IVHD's image of it; 4-level host tables must be supported;
+    3. a device table to the highest DeviceID the IVHD names (rounded to a page) is built with every entry blocking: V set and TV clear (every DMA aborted and logged), IV set with IntCtl 00b (fixed and arbitrated interrupts aborted), and the IVRS pass bits and SysMgt on the entry each device's requests use;
+    4. a command buffer and an event log (one page, 256 entries each), no exclusion range, the control settings the IVHD recommends, then EventLogEn, CmdBufEn and IOMMUEn in one write — with GAEn and XTEn (128-bit IRTEs, 32-bit x2APIC destinations) where GASup and XTSup;
+    5. INVALIDATE_IOMMU_ALL (with IASup) and every device table entry and interrupt table invalidated, batches closed by COMPLETION_WAIT stores; stale events drained.
+
+    If an IOMMU fails, those already running are turned off again.
+    - `attach`: one domain per requester DeviceID (the IVRS alias where named), domain IDs from 1, a 4-level table, the IOVA window [1 GiB, 2 GiB); the device's interrupt table first, then its DTE's domain and translation words (word 0 last), then INVALIDATE_DEVTAB_ENTRY and INVALIDATE_IOMMU_PAGES for the domain. A device an IVMD names is refused (unity maps and exclusion ranges are not implemented).
+    - `map`: one 4 KiB read/write page at the next IOVA; a page invalidation follows where the capability block reports NpCache (QEMU does).
+    - `unmap`: clears the leaf, then INVALIDATE_IOMMU_PAGES for the page and a COMPLETION_WAIT, and returns only when the IOMMU stored its value.
+    - `msi_message`: an index into the device's own 256-entry interrupt remapping table (made on first use; IV, IntCtl 10b, IntTabLen 8); the IRTE (fixed, physical, the vector, the destination) is written high word first so RemapEn turns on last, then INVALIDATE_INTERRUPT_TABLE; the message is `0xFEE0_0000` with data = the index.
+    - Faults are drained from the event log (event interrupts off; logging restarted after an overflow). An I/O page fault counts as an interrupt only if I is set and its address is in the interrupt range.
+  - **xtask**: `ORIGIN_QEMU_IOMMU=amd` boots with `-device AMDVI-PCI,id=iommupci0,addr=05.0 -device amd-iommu,pci-id=iommupci0,intremap=on,xtsup=on,dma-remap=on` (pinned so the NVMe and NIC keep their slots; `dma-remap=on` because without it QEMU 11.1 translates no emulated device's DMA). The AMD marker set replaces only the vendor-specific lines; a scenario can now require text on QEMU's stderr; `boot-matrix` runs both IOMMUs at 1, 2 and 4 CPUs. PCI class 08:06 is named "IOMMU".
+- **Boot proof** (`ORIGIN_QEMU_IOMMU=amd`; `boot-matrix` at `-smp` 1, 2 and 4; quoted at 2). Every existing NVMe, GPT, block cache and virtio-net proof passes unchanged through the IOMMU. Then:
+  - `IOMMU: IVRS revision 1, IVinfo 0x2801 (EFR support true, 40-bit physical and 0-bit virtual addresses, pre-boot DMA protection false); 1 IOMMU(s) in 2 IVHD(s), 0 memory definition(s)`
+  - `IOMMU: unit 0 at 0xfed80000 (segment 0, IVHD type 0x11 of 2, IOMMU function 00:05.0, capability at 0x40): 9 device entries up to DeviceID 0x00fb, I/O APIC 0 (DeviceID 0x00a0)`
+  - `IOMMU: unit 0: AMD-Vi capability revision 0, IOTLB true, not-present entries cached true; EFR 0x29d7 (register 0x29d7, IVRS image 0x29d7): x2APIC true, guest APIC true, INVALIDATE_IOMMU_ALL true, 6-level host tables, performance counters false; EFR2 0x0: 512 interrupts per function`
+  - `IOMMU: unit 0: device table of 256 entries at 0x…, every entry blocking DMA and fixed interrupts; command buffer and event log on (256 entries each); interrupt remapping per device (128-bit entries, 32-bit x2APIC destinations); translation on (control 0x4000000021007, status 0x18): every device's DMA is blocked until its driver attaches it; caches invalidated (INVALIDATE_IOMMU_ALL, then every device table entry and interrupt table); 0 stale event(s) cleared`
+  - **Translated DMA:** `the NVMe controller (00:02.0, source ID 0x0010) read LBA 2048 into IOVA 0x40012000, which its domain maps to physical 0x76000 (not the same address): 8 of 8 blocks landed in that physical page`.
+  - **Blocked DMA:** `IOVA 0x40012000 unmapped (the translation cache invalidated page-selectively and the completion awaited), the same read completed with status type 0 code 0x0, and the page kept its canary true; fault recorded: DeviceID 0x0010, access at 0x0, domain 0, event 0x2 (I/O page fault: page not present)`. The record names the controller and the fault; the address and domain read 0 because QEMU 11.1's event encoder drops them (research ledger §2.5). The proof accepts address 0 only under AMD-Vi, never another address, and the boot test expects 0, so a QEMU that starts recording the IOVA is noticed.
+  - **Interrupt remapping:** `5 of 5 MSI-X entries (NVMe 3, virtio-net 2) hold only an index into their device's own interrupt remapping table, whose IRTE holds the vector and the x2APIC destination; 5 IRTEs in use; APIC ID 300 accepted (its IRTE reads back destination 300), which compatibility format refuses: true`. These entries' data is the index (0–4) to destination 0: delivered as plain messages, they would be vectors 0–4 on CPU 0, which the APIC drops, yet every NVMe and virtio-net interrupt the earlier proofs counted arrived at the right vector and CPU.
+  - **Blocked interrupt:** `NVMe MSI-X vector 1 pointed at IRTE 3, left not present: a read on I/O queue 2 completed true, 0 interrupts arrived; fault recorded: none; vector 1 restored`. QEMU 11.1 logs no interrupt-remapping fault; the boot test requires QEMU's own stderr line, `failed to remap interrupt from devid 0x10`, as evidence that its IOMMU refused the message.
+  - **Domains:** `00:02.0 domain 1 (18 pages mapped, 19 ever, 4 table pages); 00:03.0 domain 2 (18 pages mapped, 18 ever, 4 table pages); every other function's device table entry blocks its DMA and fixed interrupts; IOVAs from 0x40000000; faults recorded before the proofs: 0`.
+
+  The matrix gives the same results at 1 and 4 CPUs: 4 and 7 MSI-X entries remapped, 15 and 24 NVMe pages. Kernel boots: 13.0 s, 15.6 s and 20.9 s; the VT-d boot in the same matrix, unchanged: 14.1 s, 15.6 s and 20.2 s.
+- **Negative controls.** Each is a temporary change. With it applied, `ORIGIN_QEMU_IOMMU=amd cargo xtask boot-test` exited 1; the file was then restored from git (the script, with every patch, is in the session's scratchpad; the patches are described here):
+  - **N1, unmap without INVALIDATE_IOMMU_PAGES:** QEMU's IOTLB still holds the translation, so the "blocked" read goes through: `blocked DMA: … the page kept its canary false; fault recorded: none; consistent false: IOMMU failed`. The proof tests the invalidation path, not only the page table.
+  - **N2, IOVAs handed out but never mapped:** `NVMe: a command timed out: NVMe failed`. The drivers' own DMA goes through translation.
+  - **N3, virtio-net never attached, DMAing to physical addresses although it accepted ACCESS_PLATFORM:** its blocking entry stops every frame: `ARP 10.0.2.2 -> 00:00:00:00:00:00; DHCP lease 0.0.0.0 …; (of 0 MSI-X interrupts, none arrived) …: virtio-net failed`. This is default deny.
+  - **N4, the device's interrupt table made but its DTE never pointed at it (IntCtl stays 00b):** every MSI is target aborted: `NVMe: interrupt-driven: 0 reads … 0 interrupts (none arrived) …: NVMe failed`, and QEMU prints `failed to remap interrupt from devid 0x10`.
+  - **N5, every IRTE's vector one too high:** `NVMe: interrupt-driven: 0 reads … 0 interrupts (none arrived) …: NVMe failed`. The vector comes from the IRTE; the message carries only the index.
+  - **N6, the blocked-interrupt probe sent through a present IRTE:** `blocked interrupt: … 1 interrupts arrived; fault recorded: none; … consistent false: IOMMU failed`. The proof notices an interrupt that gets through.
+  - **N7, GAEn and XTEn off (32-bit IRTEs, 8-bit destinations):** every NVMe and virtio-net interrupt still arrives through the 32-bit IRTEs — the fallback path works — but `APIC ID 300 … (its IRTE reads back destination none) … consistent false: IOMMU failed`. The x2APIC destination needs the 128-bit format.
+
+  **Probes.** N8, no INVALIDATE_INTERRUPT_TABLE after an IRTE is written, **passes** the boot test: QEMU keeps no IRTE cache, so the missing invalidation cannot be seen under QEMU (the VT-d C8 blind spot again); the code follows the specification. N9, N3 with the bring-up's per-entry invalidation removed, fails like N3: virtio-net's own interrupt-table setup invalidates its entry, which is enough for QEMU to put it under the blocking entry. The bring-up invalidation therefore protects only functions no driver touches, and none of those DMA in this machine; the device-model experiment in the research ledger (§2.4) shows the pass-through it prevents.
+- **QEMU facts worth keeping** (research ledger §2):
+  - `dma-remap=on` or no emulated device's DMA is translated; a device is put under translation only by an INVALIDATE_DEVTAB_ENTRY for its DeviceID;
+  - Mode 0 passes DMA through without checking IR and IW (V=1/TV=0 blocks);
+  - the AMDVI-PCI function takes the first free slot unless pinned with `pci-id`;
+  - every event has address 0 and DomainID 0, I is set on DMA faults, and interrupt-remapping faults are never logged (only printed on stderr);
+  - one page fault is logged per bounced 4-byte access, so a blocked 4 KiB write fills the 256-entry log; EventOverflow is set only with EventIntEn;
+  - no IRTE cache; INVALIDATE_IOMMU_PAGES flushes the whole domain; illegal commands never stop processing.
+- **Unsafe inventory (reviewed by the author, not independently):**
+  - `iommu::amd`: `alloc_zeroed` of the device table (a run of frames, kept for ever); volatile 64-bit access to it (`Region`, bounds- and alignment-checked); the command, event, status and interrupt-table pages and the page tables through the parent's `Page`, `Regs` and `Tables` (unchanged); `CLFLUSH` of device table lines when device-table reads are not snooped.
+  Each block has a SAFETY note.
+- **Not done:**
+  - IVMD unity maps and exclusion ranges (such devices are refused);
+  - segments other than 0;
+  - taking over an IOMMU the firmware left enabled (pre-boot DMA protection, IVinfo bit 1);
+  - the I/O APIC under AMD-Vi: its entry (DeviceID 0x00a0 from the IVRS) blocks fixed interrupts until it gets an interrupt table; the kernel uses the I/O APIC only before the IOMMU comes up;
+  - the event-log interrupt; guest translation, guest virtual APIC, ATS, PPR; 2048-entry interrupt tables; device-table segmentation; hot-plug; freeing IOVAs and table pages;
+  - **QEMU-only (§74).** Hardware qualification must require the IOVA in the fault record and the interrupt fault event, which QEMU 11.1 cannot show.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the AMD IOMMU specification.
 - **Licensing:** project licence not chosen yet.
 
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
