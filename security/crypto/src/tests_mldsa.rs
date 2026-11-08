@@ -589,6 +589,12 @@ fn decompose_and_use_hint_match_their_definitions_exhaustively() {
                 use_hint_by_definition(h, r, g2),
                 "UseHint({h}, {r})"
             );
+            // The FIPS 204 errata sheet's bound for Algorithm 40: r1 ≤ (q − 1)/(2γ2) − 1. The
+            // 4-bit fields of w1Encode depend on it.
+            assert!(
+                use_hint::<MlDsa65>(h, r) < (Q - 1) / (2 * MlDsa65::GAMMA2),
+                "UseHint({h}, {r}) is above the errata bound"
+            );
         }
     }
     // The wrap-around case: r − r0 = q − 1 gives r1 = 0 and r0 − 1.

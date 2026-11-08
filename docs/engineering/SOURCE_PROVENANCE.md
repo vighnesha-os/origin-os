@@ -1804,7 +1804,7 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
     - The first version referenced `copy_from_slice`'s length-mismatch panic, which no lint flags. It was replaced with a non-panicking copy.
     - Putting it back makes `xtask check` fail and name the symbol.
   - **Throughput on the M1 Max host (aarch64, portable code, release, single thread):** SHA-256 285 MiB/s, SHA-512 462 MiB/s. This is indicative only: the target is x86-64, and SHA-NI is not used yet.
-  - Not done: NIST CAVP/ACVP vector files (downloading them needs the owner's approval), SHA-NI, and an independent review.
+  - External vectors: NIST ACVP (see "External known-answer vectors" below). Not done: SHA-NI and an independent review.
 - **Licensing:** project licence not chosen yet.
 
 ### SHA-3 and SHAKE (FIPS 202)
@@ -1831,7 +1831,7 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
   - **Mutation check:** five planted faults, one at a time; all were caught.
   - **No panic paths:** the kernel-target object references only `memcpy`, `memset` and `Formatter::write_str`.
   - **Throughput:** SHA3-256 581 MiB/s and SHAKE256 about 580 MiB/s on the M1 host (aarch64, portable code). Indicative only.
-  - Not done: NIST CAVP/ACVP files, and an independent review.
+  - External vectors: NIST ACVP (see "External known-answer vectors" below). Not done: an independent review.
 
 ### Ed25519 verification (RFC 8032 §5.1, pure variant; ONBF §7.1), added 2026-11-07
 
@@ -1847,7 +1847,7 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
   - **Fault injection:** six deliberate faults, each caught.
   - **No panic paths:** the `x86_64-unknown-none` release object references only `memcpy`, `memset` and `Formatter::write_str`.
   - **Throughput:** 16,625 verifications/s on the M1 Max host (aarch64, release, single thread). Indicative only; the target is x86-64.
-  - **Not done:** Wycheproof vectors (downloading them needs the owner's approval); an N-version check by a different author (ONBF §13 item 6); Kani and fuzzing; an x86-64 benchmark; independent review.
+  - **External vectors:** Wycheproof (see "External known-answer vectors" below). **Not done:** an N-version check by a different author (ONBF §13 item 6); Kani and fuzzing; an x86-64 benchmark; independent review.
 
 ### ML-DSA verification (FIPS 204), added 2026-11-07
 
@@ -1866,7 +1866,69 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
   - **Mutation check:** 13 planted faults, one at a time; 12 caught, and the 13th (accepting ω + 1 hints) cannot change a verdict because the position-slice bound returns the same error.
   - **No panic paths:** the kernel-target object references only `memcpy`, `memset` and `Formatter::write_str`.
   - **Throughput:** ML-DSA-65 about 14,000 and ML-DSA-87 about 8,400 verifications/s on the M1 host (aarch64, portable code). Indicative only.
-  - **Not done:** NIST ACVP vectors and the FIPS 204 errata sheet (downloading needs the owner's approval), an AVX2 path, an independent review. The oracle has the same author as the code.
+  - **External vectors:** NIST ACVP and the FIPS 204 errata sheet (see "External known-answer vectors" below). **Not done:** an AVX2 path, an independent review. The oracle has the same author as the code.
+
+### External known-answer vectors: NIST ACVP and Wycheproof (CRYPTO-KAT), added 2026-11-08
+
+- **What:** `security/crypto/tests/kat/`, a host-only integration-test crate that runs the public API of `origin-crypto` against NIST's ACVP vector sets (SHA-2, SHA-3, SHAKE, ML-DSA signature verification) and Wycheproof's Ed25519 vectors (CLAUDE.md §59). The library is unchanged. Besides the new test crate, the converter and the data, the only code edit tightens one assertion in `src/tests_mldsa.rs` (the errata table below).
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08, on `claude/amazing-einstein-4eb320`. Original test code, written from the ACVP test specifications (`draft-celi-acvp-sha`, `draft-celi-acvp-sha3`, `draft-celi-acvp-ml-dsa`) and the Wycheproof vector format; no source copied (§3).
+- **Approval and sources:** owner decision 19 (`OWNER_DECISIONS.md`). Each file's name, source and size was stated to the owner and confirmed before anything was fetched, on 2026-11-08. Revisions pinned, each download checked against its git blob hash.
+
+  | Committed file (`security/crypto/tests/vectors/`) | Upstream file | Upstream SHA-256 | Bytes | Kept | Excluded |
+  |---|---|---|---|---|---|
+  | `acvp/sha2-256.txt` | `SHA2-256-1.0/internalProjection.json` | `a7e0bf4f5c661f1787b343bf3ae1a809b1e62f8fb2c8a627791510d03a570a6c` | 1,006,446 | 512 AFT, 1 MCT, 4 LDT | — |
+  | `acvp/sha2-512.txt` | `SHA2-512-1.0/internalProjection.json` | `2b514c517a2ef150d240efc52fdb2c4127925f0b4291b5a5b9153515e0ec7478` | 2,020,454 | 1,024 AFT, 1 MCT, 4 LDT | — |
+  | `acvp/sha3-256.txt` | `SHA3-256-2.0/internalProjection.json` | `dba4689436c7e440e61dc517210def3e8e09e50c0e9eff29ea66d89bdd0f2c63` | 1,217,364 | 151 AFT, 1 MCT, 4 LDT | 1,043 AFT, bit-oriented input |
+  | `acvp/sha3-512.txt` | `SHA3-512-2.0/internalProjection.json` | `b0521468a178f7fd362d63319aa69b708885d08f0c71cee99ac70729f5bdf64b` | 1,148,507 | 86 AFT, 1 MCT, 4 LDT | 596 AFT, bit-oriented input |
+  | `acvp/shake128-1.0.txt` | `SHAKE-128-1.0/internalProjection.json` | `ec2f9da6b146ae58fde2b73e552d3b29753fdfce7e05fbbb66329a075fa5d103` | 1,282,487 | 174 AFT, 512 VOT, 1 MCT | 1,218 AFT, bit-oriented input |
+  | `acvp/shake128-fips202.txt` | `SHAKE-128-FIPS202/internalProjection.json` | `1cbebb33db1f7e86ca265f89705dfac95cf90e8e0807b378e088af42cd0ae5db` | 871,436 | 269 AFT | — |
+  | `acvp/shake256-1.0.txt` | `SHAKE-256-1.0/internalProjection.json` | `94d0992ed2acbebe45f359cb1ffaceaf881a170339935ba9d2d36c8388005d26` | 1,319,076 | 143 AFT, 512 VOT, 1 MCT | 1,005 AFT, bit-oriented input |
+  | `acvp/shake256-fips202.txt` | `SHAKE-256-FIPS202/internalProjection.json` | `a9348d17e009cad62a2baa70160353f5bca936a27116f60dd5811f39b91c6991` | 953,531 | 237 AFT | — |
+  | `acvp/mldsa-sigver.txt` | `ML-DSA-sigVer-FIPS204/internalProjection.json` | `47cdd6314c7f746d02421ffcba89d4dbc7bb875ac49e07a029fdfc26fba55437` | 4,533,178 | 15 ML-DSA-65, 15 ML-DSA-87 (external, pure) | 60 ML-DSA-44, 30 HashML-DSA, 60 internal interface |
+  | `wycheproof/ed25519.txt` | `testvectors_v1/ed25519_test.json` | `ea80ffebac085e21cb9d3e903e7fa2b448d96702da5b31f061d0b83b430b74b3` | 172,628 | all 210 | — |
+  - ACVP files: <https://github.com/usnistgov/ACVP-Server>, commit `975de31eb83d87039ec88934fdc47d8c312b892d` (release v1.1.0.43, 2026-08-12), under `gen-val/json-files/`. `internalProjection.json` holds inputs and answers together, and gives ML-DSA vectors their `reason`, which the tests use.
+  - Wycheproof: <https://github.com/C2SP/wycheproof>, commit `d17cc89fa5c8f4f4d378b5385ebf75da5d0926c9` (2026-10-23).
+  - FIPS 204 errata: <https://csrc.nist.gov/files/pubs/fips/204/final/docs/fips-204-potential-updates.xlsx>, "Last updated 7/31/2026" (HTTP `Last-Modified` 2026-07-31), SHA-256 `5bc93ce63bc647e6d1d456cb2d3a171426c15aca4a7a0e0edd40d08b7a34c793`, 23,071 bytes. Read for this work and not committed.
+- **Licensing of the data (checked before committing, because the repository is public):** both licences allow redistribution.
+  - ACVP-Server has no licence file; its README's License section lets anyone use, copy and distribute copies, provided the notice stays intact, with changes marked by date and nature and NIST acknowledged. `tests/vectors/acvp/NOTICE.md` reproduces that notice in full, and it and every file header state the change. (NIST's separate data statement, for work of NIST employees, is to the same effect.)
+  - Wycheproof is Apache-2.0. `tests/vectors/wycheproof/LICENSE` is the upstream file, byte for byte; `NOTICE.md` and the `ed25519.txt` header mark the file as modified (§4(b)). The upstream repository has no NOTICE file.
+  - The data is included only by this host-only test crate, so it never reaches the shipping runtime (§5). The project's own licence is still not chosen; these files carry their own terms.
+- **Conversion:** `tools/convert_kat_vectors.py` (standard library only) reads the upstream JSON, refuses anything but the pinned bytes, filters by the applicability rules below, and writes the line format described in each file's header. Re-running it on the pinned files reproduces every committed byte (`diff -r`, 2026-11-08). No value in a kept vector was changed.
+- **What runs (3,882 vectors):** 1,773 AFT and 4 MCT and 16 LDT for SHA-2 and SHA-3, 823 AFT, 1,024 VOT and 2 MCT for SHAKE, 30 ML-DSA and 210 Ed25519. The counts are asserted in the tests, so a vector cannot silently vanish.
+  - SHAKE digests of a non-whole number of bytes (1,091 vectors) are applicable and run: the test squeezes whole bytes and truncates. The two ACVP revisions write the partial last byte differently (revision 1.0 keeps the bits in place, FIPS202 moves them to the top of the byte), which was determined from the data and confirmed against OpenSSL on every one of those vectors (`hashes.rs`, `PartialByte`).
+- **Exceptions, each justified:**
+  - 3,862 SHA-3 and SHAKE messages that are not a whole number of bytes. `origin-crypto` takes `&[u8]` input because everything Origin OS hashes is bytes (ONBF digests, FIPS 204's framing), so no bit-granular code exists to test.
+  - 60 ML-DSA-44, 30 HashML-DSA and 60 internal-interface vectors. The crate provides pure ML-DSA-65 and ML-DSA-87 only (§59, ADR-0001); the internal interface is Verify_internal with a caller-chosen M′ or µ, which the public API deliberately does not expose. The algorithm steps those vectors share are the same ones the 30 applicable vectors exercise.
+  - ACVP's rule that a large message must go through one `Update` call applies to submissions to the server. The test feeds the repeated pattern in pieces of about 1 MiB, to stay within modest memory.
+- **Results:** every applicable vector passes; no vector disagrees with the crate.
+  - Wycheproof under E1: all 117 valid verify; all 64 invalid are refused (12 for a wrong signature length at the `&[u8; 64]` boundary); of the 29 acceptable, E1 refuses the 8 small-order keys and accepts the 21 mixed-order keys, whose signatures satisfy the cofactorless equation. The tally of exact errors is pinned.
+  - ACVP ML-DSA: the exact `MlDsaError` for each vector's class is asserted, not only the verdict.
+  - **Independent cross-checks of the data, before the Rust ran:** OpenSSL through Python `hashlib` reproduced all hash AFT, VOT and MCT answers; `tools/mldsa_reference.py` agreed with NIST on all 30 applicable vectors (and on the 30 internal-interface vectors with a message, which the crate does not cover); `tools/ed25519_reference.py` matched the Wycheproof outcomes and error tally.
+- **FIPS 204 errata sheet** (12 entries; NIST calls them potential updates, "not official changes"; the sheet was last updated 2026-07-31):
+
+  | Identified | Location | Effect on `origin-crypto` |
+  |---|---|---|
+  | 2024-09-20 | §2.5, §7.5: ζ_j in the NTT definition | None: `ntt_by_definition` (tests) evaluates w once at ζ^(2·BitRev8(i)+1), as corrected. |
+  | 2024-10-17 | §6.2, §6.3: M should be M′ in two sentences | None: the code hashes M′ (`mldsa/mod.rs`), which the external vectors exercise. |
+  | 2025-12-02 | Broken links | None. |
+  | 2025-12-02 | §2: unused AES acronym, typography | None. |
+  | 2025-12-02 | §3.3: c̃ is over µ ‖ w1 (the text had them reversed) | None in the code, which absorbs µ first as Algorithm 8 says. A planted fault reversing them fails the vectors. |
+  | 2025-12-02 | §5: NULL → ⊥ in Algorithms 1, 2, 4 | None: those are signing. |
+  | 2025-12-02 | §6: naming, Algorithm 8 line 7 parentheses | None. |
+  | 2025-12-02 | §7: where w1Encode is used | None. |
+  | 2025-12-02 | App. A: Montgomery reduction | None: `field.rs` uses Barrett reduction. |
+  | 2026-02-23 | §5.3: Algorithm 3 step 2 returns false, not ⊥ | None: `ContextTooLong` is an `Err`, a rejection; the API has no third outcome. |
+  | 2026-02-27 | §7.4: UseHint's output is at most (q − 1)/(2γ2) − 1 | **Check tightened:** `decompose_and_use_hint_match_their_definitions_exhaustively` now asserts this bound for every element of Z_q and both hint values. `w1_encode_row`'s 4-bit fields depend on it. |
+  | 2026-07-31 | §4, App. C: signing repetition counts, Table 3's limit 821 | None: no signing here, and verification rejection loops are unbounded (M1). |
+- **Negative controls in the tests (`negative_controls`, one test per algorithm and per ACVP revision):** a corrupted digest, message, seed, checkpoint, signature, context or public key, run through the same check, must fail; a rejection claimed as valid, or a pass claimed as rejected, must fail; the piecewise large-message path must match a one-shot digest and fail when corrupted; a wrong partial-byte reading must fail.
+- **Planted faults (a scratch copy of the crate; none in the tree), one at a time:** 23 faults, 21 caught by these vectors.
+  - Caught: SHA-256 and SHA-512 rotations; a 32-bit message-length field in SHA-256 and in SHA-512 (only the 1 GiB LDT vector can see that); SHA-3's and SHAKE's domain bits; 23 Keccak rounds; SHAKE output without the permutation between blocks; ML-DSA without its 0 domain byte, ignoring the context, absorbing w1 before µ, hint order and hint padding unchecked, UseHint not wrapping, the challenge always matching; Ed25519 without its S range check, the small-order checks for A and R, the y < p check and the x = 0 sign-bit check, and with R and A swapped in the hash.
+  - Not caught by these vectors, caught by the crate's own tests: the z bound (`negative_corpus_gives_the_exact_error`, `z_decoding_and_its_bound`): ACVP's modified z values stay in range; and a cofactored Ed25519 equation (`negative_corpus_gives_the_exact_error`): no Wycheproof vector separates it from the cofactorless one.
+- **Performance:** the default run adds about 4 s (4.14 s measured) to `cargo xtask check`, which took 80 s from a cold build and 31 s incrementally. `ORIGIN_KAT_SCALE=8` runs all 16 LDT vectors, 60 GiB hashed, in 57 s wall and 175 s of CPU on the M1 Max; it passes. The default, 1, runs each hash's 1 GiB vector, past the 2^32-bit length boundary; 0 runs none.
+- **Dependencies:** none added; the tests use `std` and the crate's public API.
+- **Reproduce:** `cargo test --package origin-crypto --test kat` (or `cargo xtask check`); `ORIGIN_KAT_SCALE=8 cargo test --package origin-crypto --test kat -- large_data` for the long run. To re-derive the data, fetch the pinned upstream files into `<raw>/<ACVP set>/internalProjection.json` and `<raw>/wycheproof/ed25519_test.json`, then `python3 -I security/crypto/tools/convert_kat_vectors.py <raw> security/crypto/tests/vectors`.
+- **Review:** not independently reviewed yet. The Python cross-checks have the same author as the crate.
+- **Not done:** an independent review (§59); ACVP coverage of FIPS 204's external µ and HashML-DSA paths, which Origin OS does not use.
 
 ## `developer-tools/xtask/` (`xtask`)
 

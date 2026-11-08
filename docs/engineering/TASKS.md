@@ -47,6 +47,7 @@
 | GPT | both copies validated (CRCs, layout, agreement), partitions listed | the xtask disk's partitions; negative control |
 | CPU indexes, APIC IDs above 255 (2026-11-08, branch `claude/eloquent-kapitsa-840594`) | dense `CpuIndex` per processor at MADT discovery (ADR-0008, Proposed); per-CPU arrays by index, IPIs and MSI/IRTE destinations by APIC ID; MADT and SRAT lists sized from the table | `cpumap` host tests; `cargo xtask boot-x2apic` (APIC ID 256 of 150 possible); three negative controls |
 | CPU topology from CPUID (2026-11-08) | `framekernel::topology`: leaves 1Fh and 0Bh (thread, core, module, tile, die, die group, with unknown domains absorbed), AMD's 80000026h normalized into one layout, core types as raw codes; each processor reads its own leaves and records them under its `CpuIndex`; package, die, module, core and thread of every processor reported and checked against the MADT. 80000026h and core types host-tested only: QEMU 11.1 models neither | 19 `topology` host tests; `boot-matrix`; `boot-x2apic` on a third processor at APIC ID 412, under both leaf 1Fh and leaf 0Bh; 10 negative controls |
+| External known-answer vectors, CRYPTO-KAT (2026-11-08, branch `claude/amazing-einstein-4eb320`) | `security/crypto/tests/kat`, host-only: NIST ACVP SHA-2, SHA-3, SHAKE and ML-DSA signature verification, and Wycheproof Ed25519, from vectors converted at pinned revisions and hashes and committed with their notices; FIPS 204 errata sheet applied (one check tightened) | 3,882 vectors pass, each exception justified; negative controls per algorithm; planted faults; `SOURCE_PROVENANCE.md` |
 
 ## In progress
 
@@ -72,7 +73,7 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 
 | # | Decision | Blocks |
 |---|---|---|
-| — | Downloads **approved 2026-11-08**, not fetched yet: NIST ACVP (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519); the `loom` crate (host-only dev-dependency, §5). Each file's source and size are confirmed when the work that uses them starts | External known-answer validation (§59); concurrency models (§73) |
+| — | The `loom` crate (host-only dev-dependency, §5), **approved 2026-11-08**, not fetched yet; its source and size are confirmed when the work that uses it starts. (The ACVP, errata and Wycheproof downloads of the same approval were fetched on 2026-11-08, file by file; see `SOURCE_PROVENANCE.md`.) | Concurrency models (§73) |
 | — | A project licence | Every provenance entry |
 | — | ADR-0007 (DMA isolation and interrupt remapping, Intel VT-d and AMD-Vi, Proposed): questions 3, 6, 7 and 8; the rest are answered (`docs/engineering/OWNER_DECISIONS.md`) | Accepting the IOMMU design; it is implemented and boot-proven already |
 | — | Compare the AMD IOMMU specification (48882 Rev 3.11) read from a mirror with AMD's own copy (SHA-256 in `docs/research/2026-11-08-amd-vi-iommu.md`) | Confidence that every AMD-Vi encoding comes from AMD's text |

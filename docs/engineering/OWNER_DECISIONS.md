@@ -65,7 +65,7 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 | # | Question | Recommendation | Why |
 |---|---|---|---|
 | 18, answered | Intel VT-d Rev 5.20 PDF (D51397-019, intel.com, 12.8 MB)? | **Approved; downloaded 2026-11-08**, outside the repository | §16 wants this text before implementation. The VT-d code was written without it, and every encoding still has to be checked against it. |
-| 19, answered | NIST ACVP vectors (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519)? | **Approved; not fetched yet** | §59 requires known-answer tests and independent validation. Host-only test data. Each file's source and size will be stated, and confirmed, when the work that uses them starts. |
+| 19, answered | NIST ACVP vectors (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519)? | **Approved; fetched 2026-11-08**, after each file's name, source and size were confirmed with the owner | §59 requires known-answer tests and independent validation. Host-only test data. The applicable vectors are committed under `security/crypto/tests/vectors/` with the upstream notices; sources and hashes are in `SOURCE_PROVENANCE.md`. |
 | 20, answered | The `loom` crate as a host-only dev-dependency? | **Approved; not added yet** | §73 names Loom, and it never reaches the shipping runtime (§5). It is added with the first Loom model. |
 
 ## Only you can do these

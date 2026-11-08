@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Updated | 2026-11-08, ~14:25 IST (parser hardening, the ONBF multi-fault soak and CPU topology merged into the IOMMU branch) |
+| Updated | 2026-11-08, ~15:45 IST (external known-answer vectors for `origin-crypto`, CRYPTO-KAT, on `claude/amazing-einstein-4eb320`, not merged or pushed) |
 | Branch | `claude/interesting-carson-ae7c83`: the IOMMU work (`1c790fe`) with its follow-ups merged in: dense CPU indexes and a processor above APIC ID 255 (`claude/eloquent-kapitsa-840594`), parking an AP that misses its start-up handshake (`claude/priceless-cartwright-2c1803`), I/O APIC interrupts through VT-d interrupt remapping (`claude/bold-williams-a8e3ff`), AMD-Vi (`claude/upbeat-dijkstra-0d25fe`), parser hardening (`claude/gifted-maxwell-7e8a3f`), the ONBF multi-fault soak (`claude/heuristic-chandrasekhar-6a46a1`) and CPU topology from CPUID leaves 1Fh, 0Bh and 80000026h (`claude/zealous-lovelace-301ef1`); all on `m0/toolchain-verification` at `540fc2c`. **None of these is pushed.** `m0/toolchain-verification` itself is pushed and open for review as PR vighnesha-os/origin-os#1, and is not merged into `main`. |
 | Reproduce | `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs in QEMU 11.1.3 (TCG) + OVMF only; nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
@@ -54,7 +54,7 @@ The ONBF parsers, which run in the boot loader on data read before any signature
 | Component | State |
 |---|---|
 | ONBF parser (`onbf-format`), Merkle trees (`onbf-merkle`), KRN packer (`onbf-pack`) | done for KRN; EXE/LIB/OSI/OAPP/OD profiles not yet |
-| SHA-2, SHA-3/SHAKE, Ed25519 (strict), ML-DSA-65/87 (strict) in `origin-crypto` | done, verification only; **no NIST ACVP or Wycheproof validation yet** (downloads need approval) |
+| SHA-2, SHA-3/SHAKE, Ed25519 (strict), ML-DSA-65/87 (strict) in `origin-crypto` | done, verification only. **External validation added 2026-11-08 (§59):** 3,882 vectors, all passing: every applicable NIST ACVP vector for SHA-2, SHA-3, SHAKE and ML-DSA signature verification, and all 210 Wycheproof Ed25519 vectors under strict errata E1. `cargo xtask check` runs 3,870 of them in about 4 s; `ORIGIN_KAT_SCALE=8` adds the 2, 4 and 8 GiB vectors (about 1 min). Not applicable, justified in `SOURCE_PROVENANCE.md`: bit-oriented SHA-3 and SHAKE input, ML-DSA-44, HashML-DSA and ML-DSA's internal interface. The FIPS 204 errata sheet changed one check (`UseHint`'s bound). An independent review (§59) is still to come |
 | Signature block, certificate chain, trust store | encodings decided (S1–S4); parser (`onbf-format`) and entry verification (`onbf-verify`, both signatures, proven against reference-signed vectors) done; loader wiring, trust store and chains next; trust anchor decided (B7) |
 
 ## Waiting on the owner
