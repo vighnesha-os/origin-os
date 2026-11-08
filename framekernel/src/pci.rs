@@ -8,13 +8,16 @@
 //! - PCI Express Base Specification 6.x §7.2.2 (ECAM: `bus << 20 | device << 15 |
 //!   function << 12 | register`) and §7.5.1 (the type 0 and type 1 configuration headers:
 //!   IDs at 00h, command 04h, status 06h, revision and class 08h–0Bh, header type 0Eh,
-//!   BARs from 10h; §7.5.1.2.1 sizing a BAR by writing all ones).
+//!   BARs from 10h; §7.5.1.2.1 sizing a BAR by writing all ones);
+//! - the Command register's Bus Master Enable and the Device Status register's Transactions
+//!   Pending bit: not read in the specification, which is not public; what could and could
+//!   not be confirmed is in `docs/research/2026-11-08-bus-master-quiesce.md`.
 //!
 //! Configuration space is untrusted input: a device can report anything. Every value is
 //! decoded with checked arithmetic, and sizing restores each BAR and the command register.
 
 use core::fmt;
-use core::ops::RangeInclusive;
+use core::ops::{ControlFlow, RangeInclusive};
 
 /// Configuration registers this module uses.
 pub mod register {
@@ -24,6 +27,8 @@ pub mod register {
     /// The dword holding cache line size, latency timer, header type (byte 0Eh) and BIST.
     pub const HEADER: u16 = 0x0C;
     pub const BAR0: u16 = 0x10;
+    /// Type 1 header: the dword holding the primary, secondary and subordinate bus numbers.
+    pub const BRIDGE_BUSES: u16 = 0x18;
 }
 
 /// Status register bit 4 (in the upper half of the command dword): a capability list.
@@ -39,6 +44,17 @@ pub mod capability {
 
 /// Command register bits 0 and 1: I/O space and memory space decoding.
 const DECODE: u32 = 0b11;
+/// Command register bit 1: memory space decoding.
+pub const MEMORY_SPACE: u16 = 1 << 1;
+/// Command register bit 2, Bus Master Enable: an endpoint may issue memory and I/O requests,
+/// a bridge may forward them upstream. MSI and MSI-X messages are memory writes, so they
+/// stop with it.
+pub const BUS_MASTER: u16 = 1 << 2;
+/// A PCI Express capability's Device Control register; Device Status is the upper half of
+/// the same dword.
+const DEVICE_CONTROL: u16 = 0x08;
+/// Device Status bit 5, Transactions Pending (bit 21 of the dword at [`DEVICE_CONTROL`]).
+const TRANSACTIONS_PENDING: u32 = 1 << 21;
 /// Header type bit 7: the device has several functions.
 const MULTIFUNCTION: u8 = 0x80;
 
@@ -217,15 +233,15 @@ pub fn read_function(cfg: &mut impl ConfigSpace, at: Address) -> Option<Function
     })
 }
 
-/// Lists every function on `buses` into `out`; returns how many there are, or `Err` with
-/// the count when `out` filled up. A device whose function 0 does not answer has no other
-/// functions; functions 1–7 are probed only on multi-function devices.
-pub fn enumerate(
-    cfg: &mut impl ConfigSpace,
+/// Calls `visit` on every function on `buses`, in bus, device and function order, until it
+/// breaks. A device whose function 0 does not answer has no other functions; functions 1–7
+/// are probed only on multi-function devices. Firmware numbers a bridge's buses above the
+/// bridge's own, so this order reaches a bridge before the devices behind it.
+pub fn for_each_function<C: ConfigSpace>(
+    cfg: &mut C,
     buses: RangeInclusive<u8>,
-    out: &mut [Function],
-) -> Result<usize, usize> {
-    let mut n = 0;
+    mut visit: impl FnMut(&mut C, Function) -> ControlFlow<()>,
+) -> ControlFlow<()> {
     for bus in buses {
         for device in 0..32 {
             let at = |function| Address {
@@ -244,13 +260,100 @@ pub fn enumerate(
                     read_function(cfg, at(function))
                 };
                 if let Some(f) = found {
-                    *out.get_mut(n).ok_or(n)? = f;
-                    n += 1;
+                    visit(cfg, f)?;
                 }
             }
         }
     }
-    Ok(n)
+    ControlFlow::Continue(())
+}
+
+/// Lists every function on `buses` into `out`; returns how many there are, or `Err` with
+/// the count when `out` filled up.
+pub fn enumerate(
+    cfg: &mut impl ConfigSpace,
+    buses: RangeInclusive<u8>,
+    out: &mut [Function],
+) -> Result<usize, usize> {
+    let mut n = 0;
+    let walked = for_each_function(cfg, buses, |_, f| match out.get_mut(n) {
+        Some(slot) => {
+            *slot = f;
+            n += 1;
+            ControlFlow::Continue(())
+        }
+        None => ControlFlow::Break(()),
+    });
+    if walked.is_break() { Err(n) } else { Ok(n) }
+}
+
+/// What [`clear_bus_master`] found on one function.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BusMaster {
+    /// Bus Master Enable was set: the firmware left the function able to master the bus.
+    pub was_on: bool,
+    /// It still reads set after the write: the function ignored the write.
+    pub still_on: bool,
+}
+
+/// Clears Bus Master Enable on the function at `at` and reads the register back.
+///
+/// A configuration read is a non-posted request whose completion must not pass the
+/// function's earlier posted writes, so the read-back also pushes out any memory write the
+/// function issued before it stopped mastering; Transactions Pending, which counts only
+/// non-posted requests, cannot show those (`transactions_pending`).
+pub fn clear_bus_master(cfg: &mut impl ConfigSpace, at: Address) -> BusMaster {
+    let command = cfg.read32(at, register::COMMAND);
+    let was_on = command & u32::from(BUS_MASTER) != 0;
+    if was_on {
+        // The upper half is the status register, whose bits clear when written as one: write
+        // zeros there.
+        cfg.write32(
+            at,
+            register::COMMAND,
+            command & 0xFFFF & !u32::from(BUS_MASTER),
+        );
+    }
+    let still_on = cfg.read32(at, register::COMMAND) & u32::from(BUS_MASTER) != 0;
+    BusMaster { was_on, still_on }
+}
+
+/// Whether Bus Master Enable reads set on the function at `at`.
+pub fn bus_master_on(cfg: &mut impl ConfigSpace, at: Address) -> bool {
+    cfg.read32(at, register::COMMAND) & u32::from(BUS_MASTER) != 0
+}
+
+/// Whether the function at `at`, whose PCI Express capability is at `capability`, reports
+/// Transactions Pending: non-posted requests it issued that have neither completed nor been
+/// ended by its Completion Timeout. Posted writes are never counted here. A function that
+/// reads as all ones is gone and reports nothing.
+pub fn transactions_pending(cfg: &mut impl ConfigSpace, at: Address, capability: u16) -> bool {
+    let dword = cfg.read32(at, capability + DEVICE_CONTROL);
+    dword != u32::MAX && dword & TRANSACTIONS_PENDING != 0
+}
+
+/// The buses behind the bridge `f`: its secondary bus through its subordinate bus, or `None`
+/// if `f` is not a bridge or its bus numbers are unset or inverted (configuration space is
+/// untrusted).
+pub fn bridge_buses(cfg: &mut impl ConfigSpace, f: &Function) -> Option<RangeInclusive<u8>> {
+    if f.layout != 1 {
+        return None;
+    }
+    let dword = cfg.read32(f.at, register::BRIDGE_BUSES);
+    let secondary = (dword >> 8) as u8;
+    let subordinate = (dword >> 16) as u8;
+    (secondary != 0 && secondary <= subordinate).then_some(secondary..=subordinate)
+}
+
+/// Whether Bus Master Enable may read set on the function `f`, whose buses (`Some` for a
+/// bridge) are `buses`, once the functions in `attached` are the only ones with a domain:
+/// exactly those functions, and the bridges above them.
+pub fn bus_master_allowed(
+    f: &Function,
+    buses: Option<&RangeInclusive<u8>>,
+    attached: &[Address],
+) -> bool {
+    attached.contains(&f.at) || buses.is_some_and(|b| attached.iter().any(|a| b.contains(&a.bus)))
 }
 
 /// Reads the byte at `offset` of configuration space through 32-bit accesses.
@@ -827,6 +930,226 @@ mod tests {
             ..bar
         };
         assert_eq!(m.table_address(&wraps), None, "wraps the address space");
+    }
+
+    /// Bus mastering is cleared on the device, read back, and the status half is left alone.
+    #[test]
+    fn bus_mastering_is_cleared_and_read_back() {
+        let mut m = q35();
+        let nvme = at(0, 4, 0);
+        // q35's model starts with decoding and bus mastering on.
+        assert!(bus_master_on(&mut m, nvme));
+        let outcome = clear_bus_master(&mut m, nvme);
+        assert_eq!(
+            outcome,
+            BusMaster {
+                was_on: true,
+                still_on: false
+            }
+        );
+        assert!(!bus_master_on(&mut m, nvme));
+        assert!(!m.status_writes_of_one, "the RW1C status half was written");
+        assert_eq!(
+            m.regs[&(nvme, register::COMMAND)],
+            0x0010_0003,
+            "decoding kept, status kept, only bit 2 cleared"
+        );
+        // Clearing again finds it off and writes nothing.
+        let before = m.regs.clone();
+        assert_eq!(
+            clear_bus_master(&mut m, nvme),
+            BusMaster {
+                was_on: false,
+                still_on: false
+            }
+        );
+        assert_eq!(m.regs, before);
+    }
+
+    /// A function that ignores the write is reported, not assumed cleared.
+    #[test]
+    fn a_function_that_keeps_bus_mastering_is_reported() {
+        struct Stuck(u32);
+        impl ConfigSpace for Stuck {
+            fn read32(&mut self, _: Address, register: u16) -> u32 {
+                if register == register::COMMAND {
+                    self.0
+                } else {
+                    0
+                }
+            }
+            fn write32(&mut self, _: Address, _: u16, _: u32) {}
+        }
+        let mut s = Stuck(0x0000_0006);
+        assert_eq!(
+            clear_bus_master(&mut s, at(0, 2, 0)),
+            BusMaster {
+                was_on: true,
+                still_on: true
+            }
+        );
+    }
+
+    /// Transactions Pending is bit 5 of Device Status, the upper half of the dword 8 bytes
+    /// into the PCI Express capability; a device that reads as all ones reports nothing.
+    #[test]
+    fn transactions_pending_is_read_from_device_status() {
+        let f = at(0, 4, 0);
+        let mut m = q35();
+        m.regs.insert((f, 0x68), 0x0020_0000 | 0x2020);
+        assert!(transactions_pending(&mut m, f, 0x60));
+        m.regs.insert((f, 0x68), 0x001F_0000 | 0x2020);
+        assert!(!transactions_pending(&mut m, f, 0x60), "other status bits");
+        m.regs.insert((f, 0x68), u32::MAX);
+        assert!(!transactions_pending(&mut m, f, 0x60), "gone");
+    }
+
+    #[test]
+    fn a_bridge_covers_its_secondary_through_subordinate_buses() {
+        let mut m = q35();
+        let bridge = read_function(&mut m, at(0, 0x1E, 0)).unwrap();
+        // Primary 0, secondary 1, subordinate 3.
+        m.regs
+            .insert((bridge.at, register::BRIDGE_BUSES), 0x0003_0100);
+        let buses = bridge_buses(&mut m, &bridge).unwrap();
+        assert_eq!(buses, 1..=3);
+        // An endpoint has no bus numbers there, whatever the register holds.
+        let nvme = read_function(&mut m, at(0, 4, 0)).unwrap();
+        m.regs
+            .insert((nvme.at, register::BRIDGE_BUSES), 0x0003_0100);
+        assert_eq!(bridge_buses(&mut m, &nvme), None);
+        // Unset or inverted numbers are refused.
+        for value in [0, 0x0000_0100, 0x0001_0200] {
+            m.regs.insert((bridge.at, register::BRIDGE_BUSES), value);
+            assert_eq!(bridge_buses(&mut m, &bridge), None, "{value:#x}");
+        }
+        // Bus mastering is allowed on the attached function and the bridges above it only.
+        let attached = [at(2, 0, 0)];
+        let behind = Function {
+            at: at(2, 0, 0),
+            ..Function::default()
+        };
+        assert!(bus_master_allowed(&behind, None, &attached));
+        assert!(bus_master_allowed(&bridge, Some(&buses), &attached));
+        let other = Function {
+            at: at(0, 3, 0),
+            ..Function::default()
+        };
+        assert!(!bus_master_allowed(&other, None, &attached));
+        assert!(!bus_master_allowed(&bridge, Some(&(4..=5)), &attached));
+        assert!(!bus_master_allowed(&bridge, None, &attached));
+        assert!(!bus_master_allowed(&behind, None, &[]));
+    }
+
+    #[test]
+    fn walking_functions_visits_them_all_in_order_and_stops_when_asked() {
+        let mut m = q35();
+        let mut seen = Vec::new();
+        let walked = for_each_function(&mut m, 0..=255, |_, f| {
+            seen.push(f.at);
+            ControlFlow::Continue(())
+        });
+        assert!(walked.is_continue());
+        assert_eq!(
+            seen,
+            [
+                at(0, 0, 0),
+                at(0, 1, 0),
+                at(0, 4, 0),
+                at(0, 0x1E, 0),
+                at(0, 0x1F, 0),
+                at(0, 0x1F, 2),
+                at(0, 0x1F, 3),
+                at(1, 0, 0),
+            ]
+        );
+        let mut n = 0;
+        assert!(
+            for_each_function(&mut m, 0..=255, |_, _| {
+                n += 1;
+                if n == 3 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .is_break()
+        );
+        assert_eq!(n, 3);
+    }
+
+    /// Whatever a function's configuration space holds, clearing bus mastering writes only
+    /// the command register, only with zeros in the status half, and never sets a bit the
+    /// function did not have; a function that changes its answers can only be reported.
+    #[test]
+    fn hostile_configuration_space_never_breaks_the_quiesce() {
+        use crate::testing::{Rng, mutate_window};
+        let (base, masks) = hostile_base();
+        let at = at(0, 4, 0);
+        let mut rng = Rng::new(0x4251_4945);
+        let (mut cleared, mut pending, mut bridges) = (0u32, 0u32, 0u32);
+        for case in 0..crate::testing::cases(8000) {
+            let mut bytes = base.clone();
+            mutate_window(&mut bytes, 0..0x100, &mut rng);
+            if case % 4 == 1 {
+                // A bridge, with bus numbers the soak chooses.
+                bytes[0x0E] = 1;
+                bytes[0x18..0x1C].copy_from_slice(&rng.edge_u32().to_le_bytes());
+            }
+            let noise = (case % 3 == 0).then(|| Rng::new(rng.next()));
+            let steady = noise.is_none();
+            let mut dev = Hostile {
+                bytes,
+                masks,
+                noise,
+                writes: Vec::new(),
+            };
+            let command = dev.dword(register::COMMAND) & 0xFFFF;
+            let outcome = clear_bus_master(&mut dev, at);
+            for &(register, value) in &dev.writes {
+                assert_eq!(register, register::COMMAND, "case {case}");
+                assert_eq!(value & 0xFFFF_0000, 0, "case {case}: {value:#x}");
+                assert_eq!(value & u32::from(BUS_MASTER), 0, "case {case}: {value:#x}");
+                if steady {
+                    assert_eq!(
+                        value,
+                        command & !u32::from(BUS_MASTER),
+                        "case {case}: only bit 2 changes"
+                    );
+                }
+            }
+            if steady {
+                assert_eq!(
+                    outcome.was_on,
+                    command & u32::from(BUS_MASTER) != 0,
+                    "case {case}"
+                );
+                assert!(!outcome.still_on, "case {case}");
+                cleared += u32::from(outcome.was_on);
+            }
+            dev.writes.clear();
+            // The capability a real device would hand over, and any offset at all.
+            for capability in [
+                find_capability(&mut dev, at, capability::PCI_EXPRESS).unwrap_or(0x60),
+                rng.below(0xFD) as u16 & !3,
+            ] {
+                pending += u32::from(transactions_pending(&mut dev, at, capability));
+            }
+            assert!(dev.writes.is_empty(), "case {case}: reading status wrote");
+            let f = Function {
+                at,
+                layout: dev.dword(register::HEADER).to_le_bytes()[2] & 0x7F,
+                ..Function::default()
+            };
+            if let Some(buses) = bridge_buses(&mut dev, &f) {
+                bridges += 1;
+                assert!(*buses.start() != 0 && buses.start() <= buses.end());
+            }
+        }
+        assert!(
+            cleared > 500 && pending > 100 && bridges > 1,
+            "{cleared} cleared, {pending} pending, {bridges} bridges"
+        );
     }
 
     #[test]

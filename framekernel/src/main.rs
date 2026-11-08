@@ -212,11 +212,20 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // M2, third step: the kernel's own page tables, proven with deliberate faults; then
     // the frame allocator is proven again through the new direct map.
     let mut heap_ok = false;
+    // Threat T4: stop every device the firmware left bus-mastering as soon as the kernel can
+    // reach configuration space, before it claims any more memory for itself.
+    let mut quiesced = None;
     if init_paging(&mut com1, &info, regions, segments, pool, pool_base) {
         prove_frames(&mut com1, &mut alloc);
         // M2: the kernel heap, which takes over the frame allocator; from here on the
         // `alloc` crate works in the kernel.
         memory::init(alloc);
+        quiesced = pcie::quiesce(
+            &mut com1,
+            info.acpi_rsdp,
+            regions,
+            &iommu::own_functions(info.acpi_rsdp),
+        );
         heap_ok = prove_heap(&mut com1);
         if heap_ok {
             prove_user_isolation(&mut com1);
@@ -227,6 +236,9 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // against the PIT and proven by taking periodic interrupts.
     let tsc_hz = timer::init(&mut com1);
     if let Some(hz) = tsc_hz {
+        if let Some(q) = quiesced.as_mut() {
+            pcie::settle(&mut com1, q, hz);
+        }
         prove_nmi_ist(&mut com1);
         // The clocks: the monotonic clock's TSC rate, proven against the RTC, and the wall
         // clock from the RTC (CLAUDE.md §68).
@@ -242,6 +254,20 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     if let Some(tsc_hz) = tsc_hz
         && heap_ok
     {
+        // DMA and interrupt remapping (Intel VT-d or AMD-Vi) before the application
+        // processors start, the loader's memory is reclaimed or any driver binds: translation
+        // on with no device attached, so every DMA faults until a driver attaches its device,
+        // including a device that ignored its cleared Bus Master Enable (CLAUDE.md §32, §58;
+        // ADR-0007). It needs the clock (`time::init`) for its timeouts, and comes after the
+        // compatibility-format I/O APIC proof above, which interrupt remapping would block.
+        if quiesced.is_some() {
+            iommu::init(&mut com1, info.acpi_rsdp);
+            let _ = writeln!(
+                com1,
+                "origin-kernel: IOMMU: translating {} ms after kernel entry",
+                time::monotonic_nanos() / 1_000_000
+            );
+        }
         let online = smp::start(&mut com1, &info, regions, tsc_hz);
         // M2 completion: once every enabled processor has left firmware code, the loader's
         // and the firmware's boot-time memory belongs to the kernel.
@@ -268,11 +294,11 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         // M3, second step: preemptive kernel threads on every online processor.
         sched::prove(&mut com1, online.cpus(), tsc_hz);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
-        if pcie::init(&mut com1, info.acpi_rsdp, regions, online.cpus()) {
-            // DMA and interrupt remapping (Intel VT-d) before any driver binds: translation
-            // on with no device attached, so every DMA faults until a driver attaches its
-            // device (CLAUDE.md §32, §58; ADR-0007).
-            iommu::init(&mut com1, info.acpi_rsdp);
+        if let Some(q) = quiesced.as_mut()
+            && pcie::init(&mut com1, online.cpus())
+        {
+            // Nothing has turned bus mastering back on before any driver attaches.
+            pcie::check_quiet(&mut com1, q);
             // M5: the NVMe driver and block I/O, polled and then interrupt-driven.
             storage::init(&mut com1, online.cpus(), tsc_hz);
             // M10: bring up the virtio-net NIC; an interrupt-driven receive thread takes the
@@ -286,6 +312,8 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
             // with the IRTE made not present and given a wrong source ID (CLAUDE.md §24,
             // §32; ADR-0007 I8).
             irq::prove_remapped(&mut com1, online.cpus(), tsc_hz);
+            // Bus mastering is on exactly for what the drivers attached to a domain.
+            pcie::prove_bus_mastering(&mut com1, q);
         }
         sched::stop_boot_processor();
     }

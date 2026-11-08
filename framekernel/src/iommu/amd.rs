@@ -953,6 +953,28 @@ pub(super) fn translating() -> bool {
     crate::cpu::without_interrupts(|| AMD.lock().as_ref().is_some_and(|s| !s.units.is_empty()))
 }
 
+pub(super) fn attached(d: Domain, at: Address) -> bool {
+    crate::cpu::without_interrupts(|| {
+        AMD.lock()
+            .as_ref()
+            .is_some_and(|s| s.domains.get(d.0).is_some_and(|dom| dom.at == at))
+    })
+}
+
+/// The AMD IOMMUs' PCI functions on segment 0, named by the IVRS (see `iommu::own_functions`).
+pub(super) fn own_functions(rsdp: u64) -> Vec<Address> {
+    let Ok(table) = crate::firmware::acpi_table(rsdp, b"IVRS") else {
+        return Vec::new();
+    };
+    let Ok(ivrs) = ivrs::parse(table) else {
+        return Vec::new();
+    };
+    ivrs.units()
+        .filter(|u| u.segment == 0)
+        .map(|u| address(u.device_id))
+        .collect()
+}
+
 pub(super) fn attach(at: Address) -> Result<Domain, &'static str> {
     with(|s| s.attach(at))
 }

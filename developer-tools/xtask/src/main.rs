@@ -29,6 +29,8 @@ commands:
               kernel image must be rejected by the loader
   boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
               one after another
+  boot-bridge boot-test with the NIC behind a PCIe root port (both IOMMUs): bus mastering is
+              cleared on the bridge too and opened again above the device its driver attached
   boot-x2apic boot-test on a sparse topology: the boot processor at APIC ID 0 and processors
               at APIC IDs 256 and 412, above what 8-bit APIC IDs reach (the MADT lists
               150 possible processors); twice, on a CPU model with CPUID leaf 1Fh and on
@@ -49,6 +51,8 @@ environment:
                                       an intel-iommu -device value, booted with the VT-d
                                       markers (e.g. intel-iommu,intremap=off for a
                                       negative control)
+  ORIGIN_QEMU_BRIDGE                  on: the NIC behind a PCIe root port (the boot-bridge
+                                      machine)
   ORIGIN_QEMU_DEBUG                   if set, QEMU logs interrupts and resets to
                                       target/xtask/qemu-debug.log";
 
@@ -177,6 +181,11 @@ fn check_iommu(iommu: &Iommu) -> Result {
         }
         _ => Ok(()),
     }
+}
+
+/// Whether the NIC sits behind a PCIe root port (`ORIGIN_QEMU_BRIDGE=on`, `boot-bridge`).
+fn qemu_bridge() -> bool {
+    env::var("ORIGIN_QEMU_BRIDGE").as_deref() == Ok("on")
 }
 
 /// Processors QEMU emulates: `ORIGIN_QEMU_SMP` (1–64), or 2.
@@ -421,7 +430,67 @@ fn boot_scenario() -> Scenario {
     if qemu_iommu() == Iommu::Amd {
         amd_iommu_markers(&mut scenario, &machine);
     }
+    if qemu_bridge() {
+        bridge_markers(&mut scenario);
+    }
     scenario
+}
+
+/// The `boot-bridge` machine (`ORIGIN_QEMU_BRIDGE=on`): the NIC at 01:00.0 behind a PCIe root
+/// port at 00:04.0, one more function than the default machine.
+fn bridge_markers(scenario: &mut Scenario) {
+    let amd = qemu_iommu() == Iommu::Amd;
+    let count = if amd { 9 } else { 8 };
+    let swaps: [(&str, String); 6] = [
+        (
+            "origin-kernel: PCIe: bus mastering: the firmware left it on for 7 of 7 functions (",
+            "origin-kernel: PCIe: bus mastering: the firmware left it on for 8 of 8 functions (".into(),
+        ),
+        (
+            "origin-kernel: PCIe: bus mastering: 1 of 7 functions have a PCI Express capability; Transactions Pending clear on 1 of them after waiting ",
+            "origin-kernel: PCIe: bus mastering: 3 of 8 functions have a PCI Express capability; Transactions Pending clear on 3 of them after waiting ".into(),
+        ),
+        (
+            "functions on 1 buses; every BAR sized with decoding off and restored: true",
+            "functions on 2 buses; every BAR sized with decoding off and restored: true".into(),
+        ),
+        (
+            "origin-kernel: PCIe: bus mastering: off on all 7 functions before any driver attached: true",
+            "origin-kernel: PCIe: bus mastering: off on all 8 functions before any driver attached: true".into(),
+        ),
+        (
+            "origin-kernel: PCIe: bus mastering: on for exactly the 2 attached function(s) (00:02.0 domain 1, 00:03.0 domain 2) and the 0 bridge(s) above them, off on the other 5; IOMMU translating true; consistent true",
+            "origin-kernel: PCIe: bus mastering: on for exactly the 2 attached function(s) (00:02.0 domain 1, 01:00.0 domain 2) and the 1 bridge(s) above them, off on the other 5; IOMMU translating true; consistent true".into(),
+        ),
+        (" 00:03.0 domain 2 (", " 01:00.0 domain 2 (".into()),
+    ];
+    let mut swap = |old: &str, new: String| match scenario.markers.iter().position(|m| m == old) {
+        Some(i) => scenario.markers[i] = new,
+        None => scenario
+            .markers
+            .push(format!("xtask: the marker {old:?} is missing")),
+    };
+    for (old, new) in swaps {
+        swap(old, new);
+    }
+    // The AMD-Vi device table reaches the highest DeviceID, now on bus 1.
+    if amd {
+        swap(
+            "origin-kernel: IOMMU: unit 0 at 0xfed80000 (segment 0, IVHD type 0x11 of 2, IOMMU function 00:05.0, capability at 0x40): 9 device entries up to DeviceID 0x00fb, I/O APIC 0 (DeviceID 0x00a0)",
+            "origin-kernel: IOMMU: unit 0 at 0xfed80000 (segment 0, IVHD type 0x11 of 2, IOMMU function 00:05.0, capability at 0x40): 10 device entries up to DeviceID 0x01ff, I/O APIC 0 (DeviceID 0x00a0)".into(),
+        );
+        swap(
+            "origin-kernel: IOMMU: unit 0: device table of 256 entries at 0x",
+            "origin-kernel: IOMMU: unit 0: device table of 512 entries at 0x".into(),
+        );
+    }
+    for m in &mut scenario.markers {
+        if m.starts_with("bus/pci/count=") {
+            *m = format!(
+                "bus/pci/count={count}, block/nvme0/size_mib=16; read back pci count Some({count})"
+            );
+        }
+    }
 }
 
 /// What the kernel reports about its processors' x2APIC IDs: for each one above 255, its
@@ -627,6 +696,13 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: page protection: read of the boot stack's guard page at ".into(),
             // After the switch, so this also proves the direct map.
             "origin-kernel: allocated, wrote and freed 3 frames at ".into(),
+            // Threat T4 (ADR-0007 I12): as soon as the kernel can reach configuration space,
+            // bus mastering is cleared on every function and read back. OVMF leaves it on for
+            // all of them (QEMU resets them all clear).
+            "origin-kernel: PCIe: ECAM for segment 0, buses 0-255, at 0x".into(),
+            ": uncached true, 2 MiB pages".into(),
+            "origin-kernel: PCIe: bus mastering: the firmware left it on for 7 of 7 functions (".into(),
+            "; every function reads back clear: true".into(),
             "origin-kernel: heap: Vec of 100000 u64, 2000 boxes, B-tree of 1000 keys, a string: "
                 .into(),
             "origin-kernel: heap: everything freed; ".into(),
@@ -635,6 +711,8 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: x2APIC enabled: APIC ID 0, ".into(),
             "origin-kernel: APIC timer calibrated against the PIT: ".into(),
             "origin-kernel: APIC timer: 50 interrupts at 100 Hz in ".into(),
+            // The wait for Transactions Pending, once the TSC is calibrated: none is pending.
+            "origin-kernel: PCIe: bus mastering: 1 of 7 functions have a PCI Express capability; Transactions Pending clear on 1 of them after waiting ".into(),
             "origin-kernel: NMI taken on its own stack (IST2): frame at ".into(),
             // The clocks (CLAUDE.md §68): the TSC rate proven against one RTC second, and
             // the wall clock read from the RTC, which `qemu_command` starts at RTC_BASE.
@@ -648,6 +726,19 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // I/O APIC: the PIT's IRQ0 routed through it (IRQ0 -> GSI 2 via an override).
             "origin-kernel: I/O APIC: id 0, 24 entries at 0xfec00000 (GSI base 0); routing the PIT's IRQ0 via GSI 2 to vector 0x41 on CPU 0".into(),
             "origin-kernel: I/O APIC: 20 PIT interrupts routed through the I/O APIC in ".into(),
+            // Intel VT-d (CLAUDE.md §32, §58; ADR-0007): before the application processors
+            // start (T4), the DMAR QEMU builds for q35 with `intremap=on` (one unit at 0xfed90000
+            // whose scope lists every PCI function and the I/O APIC), the unit's capabilities,
+            // then queued invalidation, interrupt remapping and translation on, so every DMA
+            // faults until a driver attaches its device.
+            "origin-kernel: IOMMU: DMAR: host address width 48 bits, interrupt remapping true".into(),
+            "origin-kernel: IOMMU: unit 0 at 0xfed90000 (segment 0, 4 KiB of registers): 7 PCI scope(s), I/O APIC 0 (source ID 0xff00)".into(),
+            "origin-kernel: IOMMU: unit 0: VT-d 1.0; CAP 0x".into(),
+            "queued invalidation true, interrupt remapping true, extended interrupt mode true".into(),
+            "origin-kernel: IOMMU: unit 0: queued invalidation on (256 descriptors); empty root table at 0x".into(),
+            "interrupt remapping on (256 entries, 32-bit x2APIC destinations, compatibility format blocked); translation on (GSTS 0x".into(),
+            "every device's DMA faults until its driver attaches it; 0 stale fault(s) cleared".into(),
+            "origin-kernel: IOMMU: translating ".into(),
             // M3: every processor QEMU emulates (`-smp`, see `machine`) comes online. The
             // MADT lists every possible processor; each enabled one gets a CPU index.
             format!(
@@ -735,10 +826,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "ms; a 2000 ms timed wait signalled early returned in ".into(),
             " ms, timed out false".into(),
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
-            // M5 groundwork: PCIe through the MCFG, the ECAM window uncached, q35's
-            // functions listed with their BARs sized and restored.
-            "origin-kernel: PCIe: ECAM for segment 0, buses 0-255, at 0x".into(),
-            ": uncached true, 2 MiB pages".into(),
+            // M5 groundwork: q35's functions listed with their BARs sized and restored.
             "origin-kernel: PCIe: 00:00.0 8086:29c0 class 06:00:00 host bridge".into(),
             "origin-kernel: PCIe: 00:01.0 1234:1111 class 03:00:00 VGA-compatible display controller; BAR0 mem32 prefetchable 16 MiB at ".into(),
             "origin-kernel: PCIe: 00:02.0 1b36:0010 class 01:08:02 NVMe controller; BAR0 mem64 16 KiB at ".into(),
@@ -746,19 +834,12 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: PCIe: 00:1f.2 8086:2922 class 01:06:01 SATA controller (AHCI); BAR4 I/O 32 B at ".into(),
             "; BAR5 mem32 4 KiB at ".into(),
             "functions on 1 buses; every BAR sized with decoding off and restored: true".into(),
-            // Intel VT-d (CLAUDE.md §32, §58; ADR-0007): the DMAR QEMU builds for q35 with
-            // `intremap=on` (one unit at 0xfed90000 whose scope lists every PCI function and the
-            // I/O APIC), the unit's capabilities, then queued invalidation, interrupt remapping
-            // and translation on before any driver binds.
-            "origin-kernel: IOMMU: DMAR: host address width 48 bits, interrupt remapping true".into(),
-            "origin-kernel: IOMMU: unit 0 at 0xfed90000 (segment 0, 4 KiB of registers): 7 PCI scope(s), I/O APIC 0 (source ID 0xff00)".into(),
-            "origin-kernel: IOMMU: unit 0: VT-d 1.0; CAP 0x".into(),
-            "queued invalidation true, interrupt remapping true, extended interrupt mode true".into(),
-            "origin-kernel: IOMMU: unit 0: queued invalidation on (256 descriptors); empty root table at 0x".into(),
-            "interrupt remapping on (256 entries, 32-bit x2APIC destinations, compatibility format blocked); translation on (GSTS 0x".into(),
-            "every device's DMA faults until its driver attaches it; 0 stale fault(s) cleared".into(),
+            // T4: re-read before any driver binds; nothing turned bus mastering back on.
+            "origin-kernel: PCIe: bus mastering: off on all 7 functions before any driver attached: true".into(),
             // M5: the NVMe driver against the test disk `disk` writes (CLAUDE.md §33).
             "origin-kernel: NVMe: 00:02.0 1b36:0010, NVMe 1.".into(),
+            // T4: only after the controller has a domain and has been reset.
+            "origin-kernel: NVMe: bus mastering on after the controller was attached and reset: command register 0x0007".into(),
             "origin-kernel: NVMe: controller ready: model \"QEMU NVMe Ctrl\", serial \"ORIGIN0001\"".into(),
             format!(
                 "origin-kernel: NVMe: namespace 1: {} blocks of {} B ({} MiB)",
@@ -834,6 +915,8 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // The virtio-net NIC brought up (features, MAC, DRIVER_OK, MSI-X); a receive thread
             // woken only by the NIC's interrupt resolves the gateway by ARP and takes a DHCP
             // lease (CLAUDE.md §31, §54).
+            // T4: only after the device has its domain.
+            "origin-kernel: virtio-net: bus mastering on after the device got its DMA path: command register 0x0007".into(),
             "origin-kernel: virtio-net: 52:54:00:aa:bb:cc, features_ok true".into(),
             format!("; receive thread on {target}: slept "),
             format!(", the last on {target}); consistent true"),
@@ -901,6 +984,9 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "; consistent true".into(),
             "origin-kernel: I/O APIC: remapped: the entry masked, the PIT stopped and IRTE ".into(),
             " released: true".into(),
+            // T4: with every driver bound, bus mastering is on exactly for the attached
+            // functions and the bridges above them.
+            "origin-kernel: PCIe: bus mastering: on for exactly the 2 attached function(s) (00:02.0 domain 1, 00:03.0 domain 2) and the 0 bridge(s) above them, off on the other 5; IOMMU translating true; consistent true".into(),
             // The in-memory VFS (CLAUDE.md §39): a file built, read back, listed and removed.
             "origin-kernel: vfs: built /etc/origin/hostname (read back true), listed 1 entry, removed all back to 1 node".into(),
             // §21: the embedded ustar initramfs extracts into a VFS (contents and an
@@ -1075,6 +1161,7 @@ fn main() -> ExitCode {
         ["boot-test"] => boot_test(),
         ["boot-matrix"] => boot_matrix(),
         ["boot-x2apic"] => boot_x2apic(),
+        ["boot-bridge"] => boot_bridge(),
         ["run"] => run(),
         _ => {
             eprintln!("{USAGE}");
@@ -1112,6 +1199,31 @@ fn boot_matrix() -> Result {
         }
     }
     println!("xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors)");
+    Ok(())
+}
+
+/// Runs `boot-test` in a child process with the NIC behind a PCIe root port
+/// (`ORIGIN_QEMU_BRIDGE=on`), under each IOMMU: bus mastering must be cleared on the bridge at
+/// the quiesce and opened again above the device its driver attached (ADR-0007 I12). QEMU
+/// itself ignores a bridge's Bus Master Enable, so this proves the kernel's path logic and the
+/// read-backs, not the bridge's effect on traffic (the research ledger says so).
+fn boot_bridge() -> Result {
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    for iommu in ["intel", "amd"] {
+        println!("xtask: boot-bridge: the {iommu} IOMMU, the NIC behind a PCIe root port");
+        let status = Command::new(&exe)
+            .arg("boot-test")
+            .env("ORIGIN_QEMU_IOMMU", iommu)
+            .env("ORIGIN_QEMU_BRIDGE", "on")
+            .status()
+            .map_err(|e| format!("cannot run boot-test: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "boot-test with the NIC behind a bridge and the {iommu} IOMMU failed ({status})"
+            ));
+        }
+    }
+    println!("xtask: boot-bridge passed (both IOMMUs, the NIC behind a PCIe root port)");
     Ok(())
 }
 
@@ -1816,7 +1928,19 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         // The NVMe controller and its test disk (CLAUDE.md §33).
         .arg("-drive")
         .arg(qemu_path_arg("if=none,id=nvme0,format=raw,file=", &s.nvme)?)
-        .args(["-device", "nvme,serial=ORIGIN0001,drive=nvme0"])
+        .args(["-device", "nvme,serial=ORIGIN0001,drive=nvme0"]);
+    // A PCIe root port for the NIC (threat T4): clearing bus mastering stops its forwarding too,
+    // and the driver must open it again above the device it attached (`boot-bridge`).
+    let nic_bus = if qemu_bridge() {
+        c.args([
+            "-device",
+            "pcie-root-port,id=rp0,chassis=1,slot=1,bus=pcie.0,addr=04.0",
+        ]);
+        ",bus=rp0"
+    } else {
+        ""
+    };
+    c
         // A modern virtio-net NIC with a fixed MAC, on QEMU user networking (CLAUDE.md §54).
         // Its built-in TFTP server serves framekernel/assets read-only, so the kernel can
         // fetch its own initramfs image over the network and compare it with the embedded
@@ -1827,10 +1951,10 @@ fn qemu_command(s: &Staged) -> Result<Command> {
             "user,id=net0,tftp=",
             &repo_root().join("framekernel").join("assets"),
         )?)
-        .args([
-            "-device",
-            "virtio-net-pci,netdev=net0,mac=52:54:00:aa:bb:cc,disable-legacy=on,iommu_platform=on",
-        ])
+        .arg("-device")
+        .arg(format!(
+            "virtio-net-pci,netdev=net0,mac=52:54:00:aa:bb:cc,disable-legacy=on,iommu_platform=on{nic_bus}"
+        ))
         .args(["-display", "none", "-no-reboot"])
         .arg("-rtc")
         .arg(format!("base={RTC_BASE}"));

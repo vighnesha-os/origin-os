@@ -48,6 +48,11 @@ pub(crate) fn mark_entry() {
     ENTRY_TSC.store(rdtsc(), Ordering::Relaxed);
 }
 
+/// The TSC when the kernel was entered.
+pub(crate) fn entry_tsc() -> u64 {
+    ENTRY_TSC.load(Ordering::Relaxed)
+}
+
 /// Nanoseconds since kernel entry; 0 until [`init`] has chosen the TSC rate.
 pub(crate) fn monotonic_nanos() -> u64 {
     let Some(scale) = SCALE.get() else {
