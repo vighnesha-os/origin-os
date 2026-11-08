@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Updated | 2026-11-08, ~09:30 IST (continuous run) |
-| Branch | `m0/toolchain-verification` (local only, not pushed, not merged into `main`) |
+| Branch | `m0/toolchain-verification` (pushed; open for review as PR vighnesha-os/origin-os#1; not merged into `main`) |
 | Reproduce | `cargo xtask check`, `cargo xtask boot-test`, and `cargo xtask boot-matrix` (1, 2 and 4 CPUs; `ORIGIN_QEMU_SMP=1`…`8` for others) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs in QEMU 11.1.3 (TCG) + OVMF only; nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
 
@@ -31,7 +31,7 @@
 
 ## Waiting on the owner
 
-every design decision is now final (ADR-0002 with B7, ADR-0003, G1 and the errata readings were decided on 2026-11-07 under the owner's instruction to finalise with the recommended options; ADR-0004 and ADR-0005 were accepted by the owner). Still the owner's, because they are not design: approval to download NIST ACVP / FIPS 204 errata / Wycheproof vectors and the `loom` crate; a project licence; merging into `main` and pushing. Details: `docs/engineering/TASKS.md`.
+every design decision is now final (ADR-0002 with B7, ADR-0003, G1 and the errata readings were decided on 2026-11-07 under the owner's instruction to finalise with the recommended options; ADR-0004 and ADR-0005 were accepted by the owner). Still the owner's, because they are not design: approval to download NIST ACVP / FIPS 204 errata / Wycheproof vectors and the `loom` crate; a project licence; merging PR #1 into `main`. Details: `docs/engineering/TASKS.md`.
 
 ## Where the evidence is
 

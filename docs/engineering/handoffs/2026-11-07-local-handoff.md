@@ -5,7 +5,7 @@
 | From | Claude Code, local, in `~/work/origin-os` (follows `2026-11-07-handoff.md`) |
 | Directive | `CLAUDE.md` v7.1 |
 | Owner | Vighnesha |
-| Branch | `m0/toolchain-verification` (local only; not pushed, not merged into `main`) |
+| Branch | `m0/toolchain-verification` — pushed and open for review as PR vighnesha-os/origin-os#1 (at the owner's request, 2026-11-08); **not merged into `main`** |
 
 ## 1. Done in this session
 
@@ -375,3 +375,85 @@ patterns (NVMe's) and the bottom-up host-tested libraries (`virtqueue`, `virtio`
 `dhcp`) made the driver tractable. Next (left for careful continued work): make the NIC
 interrupt-driven (MSI-X), add a socket API, and route real traffic on the lease. QEMU-only
 (§74).
+
+### Continued (2026-11-08, ~07:50–09:30 IST): the network path, interrupt-driven and recovering
+
+Owner prompts in this stretch: "Keep building" (repeatedly), a request to open a pull request
+(done: **vighnesha-os/origin-os#1**, ready for review, pushed and its description refreshed after
+every commit — **not merged**; merging stays the owner's), and a request for this handoff.
+
+Each commit below was built, passed `cargo xtask check`, was boot-proven at `-smp` 1/2/4, and
+has at least one negative control that failed the boot and was restored (details in each commit
+message and in `SOURCE_PROVENANCE.md`). Co-authored `Claude Opus 4.8` for `321b1a7`,
+`Claude Opus 5.5` from `87b8f93`.
+
+| Commit | What |
+|---|---|
+| `321b1a7` | MSI-X on the NIC's receive queue (IDT vector `0x42`) |
+| `87b8f93` | an interrupt-driven **receive thread** on another CPU: it sleeps for each frame and the NIC interrupt wakes it |
+| `1ab5405` | a **recycled TX ring** (4 descriptors, buffers allocated once), batched kicks, TX-completion interrupts (`0x43`); `virtqueue::avail_push` gained the index-publication barrier |
+| `2326561` | **ping the gateway** from the leased address, unicast to the ARP-resolved MAC |
+| `4293998` | `tftp` (RFC 1350 reader, host-tested); **fetch a file by TFTP**, byte-identical to the embedded image; receive-buffer recycling |
+| `d54cc16` | **unpack the fetched image** into a fresh VFS (checks shared with the embedded proof) |
+| `ba2de8d` | **reply timeouts**: a lost reply fails its own step by name and the datapath carries on |
+| `3f415b2` | **TFTP retransmission**, with the first read request dropped on purpose every boot |
+| `cfbbd0f` | **DHCP retransmission**, with the first DISCOVER dropped on purpose every boot |
+
+What every boot now shows (all `consistent true`, at 1, 2 and 4 CPUs; the excerpt is the
+2-CPU boot — across the three, the receive thread's sleeps (13/8/9) and the ping round trips
+vary, and at one CPU the thread runs on CPU 0; the frame counts, the TX ring's figures, the
+retransmissions and the fetched file are identical):
+
+```
+virtio-net: … DHCP lease 10.0.2.15 (1 retransmitted after a 500 ms timeout, the first DISCOVER dropped on purpose); receive thread on CPU 1: slept 8, woken by the NIC's interrupt 8 (of 17 MSI-X interrupts, the last on CPU 1)
+virtio-net TX: 25 frames through 4 descriptors (buffers allocated once), 25 completions reclaimed, 4 of 4 free at the end; the ring was full 1 times and senders slept 2 times, woken by the TX-completion interrupt 2 (of 22)
+virtio-net ping: 10.0.2.15 -> 10.0.2.2 (52:55:0a:00:02:02): 4 of 4 echo replies (identifier, sequence and data matched)
+virtio-net TFTP: initramfs.tar from 10.0.2.2: 4608 bytes in 10 blocks (the last empty), identical to the embedded image; 1 retransmitted after a 500 ms timeout (the first read request is dropped on purpose); the receive ring's 8 buffers carried 17 frames (16 recycled)
+virtio-net initramfs: the fetched image extracted into a fresh VFS: 4 entries; /etc/hostname true, implicit /boot dir true
+```
+
+#### Lessons from this stretch
+
+- **A passing check can hide a path that never ran.** Three times a mechanism existed but QEMU's
+  timing never exercised it: the receive thread "slept 0 times" (slirp's replies beat it to its
+  wait), the TX ring was "full 0 times", and slirp never loses a packet. Each time the fix was to
+  *make the condition happen deterministically* and assert that the path ran: an armed handshake
+  (the boot flow sends the ARP request only once the thread is asleep), batched kicks with the
+  kick inside the wait condition, and losses injected on purpose (a corrupted checksum the server
+  discards). Proofs now require the path to have run (`slept > 0`, `woken > 0`, exactly one
+  retransmission), so they cannot pass on a lucky fast path.
+- **The boot thread runs with interrupts off.** An MSI-X message routed to it waits in the local
+  APIC (several arrivals coalesce into one IRR bit) until an interrupt window. Reading the x2APIC
+  IRR told "pending" from "never delivered" when the interrupt count was 0.
+- **To never miss a completion, kick inside the wait condition and route the interrupt to the
+  waiter's CPU:** the condition runs with interrupts off before the waiter registers, so the
+  completion's interrupt can only arrive once it is registered — and a batch's sleep becomes
+  deterministic.
+- **More traffic finds latent bugs.** Adding traffic exposed three: the receive ring never
+  handed buffers back (7 of 8 were already used); the transmit path reused descriptor 0 and
+  leaked a page per frame, and stopped waiting for completions after the first frame; and
+  `avail_push` published the ring index without a barrier.
+- **`xtask` stops QEMU at the first failure marker,** so later lines are lost. Put the reason in
+  the failing step's own line (the timeout notes do), and expect controls to show only the first
+  failing line.
+- **Re-run a control when a change touches its premise.** With a receive deadline, "no wake-up"
+  changed from a permanent sleep to a crawl (`woken … 0`) that misses the boot flow's bound —
+  still a failure, for a different reason, and recorded as such.
+- **QEMU user networking (slirp) facts:** it answers pings to its own addresses itself
+  (`icmp_reflect`, no host socket — an earlier note here that its ICMP might need host
+  privileges applies only to outside hosts); it verifies ICMP and UDP checksums; with
+  `tftp=<dir>` it serves that directory read-only from 10.0.2.2:69 with no host network; and it
+  never drops packets, so recovery paths need injected losses.
+
+**Checkpoint (~09:30 IST): 522 workspace tests across 27 suites, 0 failures (6 ignored: the
+download-gated crypto vectors); 281 framekernel host library tests across 53 modules;
+`cargo xtask check`, `boot-test` and `boot-matrix` (1/2/4) pass.** QEMU-only (§74): nothing is
+qualified on physical hardware.
+
+**Next, for the following session:** the owner's non-design items still stand (a licence, the
+NIST/Wycheproof/`loom` downloads, ADR-0006, and merging PR #1). In networking: answer ARP and
+echo requests addressed to us, RFC 2131's backoff and lease renewal, retransmitting echo
+requests, a socket API with a long-lived receive service over the two rings, and mounting
+fetched content rather than only checking it. Outside networking: NUMA-aware frame allocation
+(the `numa` map is the decision layer), the keyboard IRQ → `ring` → `editbuffer` input path, and
+teeing the console into `klog`. The run report is `docs/engineering/handoffs/2026-11-08-run-report.md`.

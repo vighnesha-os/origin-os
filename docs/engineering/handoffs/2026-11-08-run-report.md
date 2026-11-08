@@ -2,13 +2,13 @@
 
 | | |
 |---|---|
-| Run | 2026-11-07 ~21:42 IST → 2026-11-08 (continuous, autonomous, under the owner's delegation) |
-| Branch | `m0/toolchain-verification` — **local only, not pushed, not merged into `main`** |
+| Run | 2026-11-07 ~21:42 IST → 2026-11-08 ~09:30 IST (continuous, under the owner's delegation; "Keep building" prompts after ~06:00) |
+| Branch | `m0/toolchain-verification` — pushed and open for review as **PR vighnesha-os/origin-os#1** (at the owner's request); **not merged into `main`** |
 | Compiler | Rust 1.99.1 stable, edition 2024 (pinned) |
 | Reproduce | `cargo xtask check`, `cargo xtask boot-test`, `cargo xtask boot-matrix` (QEMU 11.1.3 TCG + OVMF) |
-| Attribution | 2026-11-08 commits are co-authored `Claude Opus 4.8` |
+| Attribution | 2026-11-08 commits are co-authored `Claude Opus 4.8`, and `Claude Opus 5.5` from `87b8f93` |
 
-This report covers the continuation of the twelve-hour run (from ~02:00 IST 2026-11-08 onward); the earlier part is in `2026-11-07-local-handoff.md`, which this run also kept current. Everything below is **built, tested and committed locally**. Nothing was pushed, merged, or run on physical hardware.
+This report covers the continuation of the twelve-hour run (from ~02:00 IST 2026-11-08 onward); the earlier part is in `2026-11-07-local-handoff.md`, which this run also kept current. Everything below is **built, tested and committed**; the branch is pushed and open as PR #1 for review (not merged). Nothing was run on physical hardware. The commit list for the last stretch (07:50–09:30) and its lessons are in the handoff's final section.
 
 ## 1. Headline state at the end of the run
 
@@ -76,7 +76,7 @@ Each item was built → host-tested → `cargo xtask check` → committed, with 
 - **Many new modules are host-tested libraries, not wired into the live kernel yet.** OriginFS, the text/codec stack, routing, DNS, DHCP, the data-format parsers, the containers — all compile for the kernel target and are proven by host tests, but only NUMA, entropy, the initramfs extraction and the virtio-net NIC (which uses `virtqueue`/`virtio`/`net`) run (and are boot-proven) in the kernel so far. They are the decision/parse layers a driver, syscall or service will call. The IP/UDP/TCP/DHCP logic is proven in host tests and at the link layer (the NIC does a live ARP exchange), but is not yet wired onto the NIC to obtain a lease and route traffic.
 - **OriginFS (ADR-0006) is Proposed, not Accepted.** The parser is host-only and the kernel does not mount it, pending the owner's approval of the on-disk format (§84).
 - **No compressor, no DRBG, no SipHash.** DEFLATE is decompression-only; the entropy source is true-random, not a reseedable DRBG; the hash map is not collision-flood-resistant. Each is noted where it would matter, with the reason it is deferred (a DRBG and SipHash need their own KATs/review, §59).
-- **Not done / owner-only:** ADR-0005 (the kernel syscall layer) remains untouched; downloading NIST/Wycheproof vectors and `loom`; choosing a project licence; and merging into `main` / pushing.
+- **Not done / owner-only:** ADR-0005 (the kernel syscall layer) remains untouched; downloading NIST/Wycheproof vectors and `loom`; choosing a project licence; and merging PR #1 into `main` (the branch itself is pushed, at the owner's request).
 
 ## 5. Suggested next steps
 
