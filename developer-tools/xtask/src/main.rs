@@ -752,10 +752,12 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
                 origin_version::BOOT_INFO_MINOR
             ),
             "origin-kernel: loaded at ".into(),
-            // Boot info 0.2: the verified segment table, in RVA order (R, RX, RW).
+            // Boot info 0.2: the verified segment table, in RVA order (R, RX, the RELRO part
+            // of the data, which the loader hands over without write access, then RW).
             "origin-kernel: kernel segment 0: R at ".into(),
             "origin-kernel: kernel segment 1: RX at ".into(),
-            "origin-kernel: kernel segment 2: RW at ".into(),
+            "origin-kernel: kernel segment 2: R at ".into(),
+            "origin-kernel: kernel segment 3: RW at ".into(),
             "origin-kernel: GDT, TSS and IDT loaded (32 exception vectors)".into(),
             "origin-kernel: exception 3 (#BP breakpoint) at rip ".into(),
             "origin-kernel: breakpoint handled; resuming".into(),

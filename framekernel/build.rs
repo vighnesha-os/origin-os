@@ -4,10 +4,10 @@
 //! For `x86_64-unknown-none`, rustc 1.99.1 runs rust-lld with `-pie --eh-frame-hdr
 //! -z noexecstack --gc-sections -z relro -z now -O1 --strip-debug` (observed with
 //! `--print link-args`): a PIE, but without `--no-dynamic-linker` or `-z text`. The
-//! arguments below come after rustc's own, and in lld the last of two opposing `-z` options
-//! wins, so `-znorelro` overrides `-z relro`. They are scoped to this crate's binary and
-//! emitted only for the kernel target; the library is also built for the host, for its
-//! unit tests, where these options mean nothing.
+//! arguments below come after rustc's own, so they decide the output whatever rustc's
+//! defaults become (in lld the last of two opposing `-z` options wins). They are scoped to
+//! this crate's binary and emitted only for the kernel target; the library is also built for
+//! the host, for its unit tests, where these options mean nothing.
 
 /// The target the kernel binary is built for.
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
@@ -25,8 +25,11 @@ const LINK_ARGS: &[&str] = &[
     "-zseparate-loadable-segments",
     "-zmax-page-size=4096",
     "-zcommon-page-size=4096",
-    // No PT_GNU_RELRO. The boot loader maps segments only as R, RX or RW.
-    "-znorelro",
+    // Full RELRO (CLAUDE.md §14, ADR-0001 default 9): rust-lld ends one PT_LOAD at the end of
+    // PT_GNU_RELRO, `onbf-pack` flags it RELRO, and the boot loader applies its relocations
+    // and hands it to the kernel read-only.
+    "-zrelro",
+    "-znow",
     // PT_GNU_STACK, if emitted, is not executable.
     "-znoexecstack",
 ];

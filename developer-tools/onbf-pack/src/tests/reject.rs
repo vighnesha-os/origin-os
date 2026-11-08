@@ -104,11 +104,31 @@ fn pt_tls_is_rejected() {
 }
 
 #[test]
-fn pt_gnu_relro_is_rejected() {
-    rejects(
-        &with(|e| e.extra.push(Phdr::other(0x6474_E552, R))),
-        ElfError::GnuRelro,
-    );
+fn pt_gnu_relro_must_be_whole_pages_at_the_start_of_an_rw_segment() {
+    // TestElf::kernel: RX at 0x1000, R at 0x2000, RW at 0x3000 (one page mapped).
+    for (start, size, why) in [
+        (0x3000, 0, "empty"),
+        (0x3000, 0x800, "not a whole number of pages"),
+        (0x3000, 0x2000, "past the end of the segment"),
+        (0x3800, 0x800, "not at the start of the segment"),
+        (0x2000, 0x1000, "in a read-only segment"),
+        (0x1000, 0x1000, "in the code segment"),
+        (0x5000, 0x1000, "outside every segment"),
+    ] {
+        assert_eq!(
+            pack(
+                &with(|e| e.extra.push(Phdr::relro(start, size))),
+                &options()
+            ),
+            Err(Error::Elf(ElfError::RelroRange { start, size })),
+            "{why}"
+        );
+    }
+    let two = with(|e| {
+        e.extra.push(Phdr::relro(0x3000, 0x1000));
+        e.extra.push(Phdr::relro(0x3000, 0x1000));
+    });
+    rejects(&two, ElfError::DuplicateProgramHeader(0x6474_E552));
 }
 
 #[test]

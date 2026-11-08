@@ -7,13 +7,15 @@
 //!
 //! The parser accepts exactly the shape that `rust-lld` writes for the Framekernel, a
 //! static PIE linked with `--no-dynamic-linker -z text -z separate-loadable-segments
-//! -z max-page-size=4096 -z common-page-size=4096 -z norelro -z noexecstack`, and rejects
+//! -z max-page-size=4096 -z common-page-size=4096 -z relro -z now -z noexecstack`, and rejects
 //! everything else with a typed [`ElfError`]. It returns validated data only: no partial
 //! results.
 //!
-//! Program headers: `PT_LOAD`; `PT_DYNAMIC` and `PT_GNU_STACK` (non-executable), at most
-//! once each; `PT_NOTE`, `PT_PHDR` and `PT_GNU_EH_FRAME`, which are ignored. Anything else
-//! is a hard error.
+//! Program headers: `PT_LOAD`; `PT_DYNAMIC`, `PT_GNU_STACK` (non-executable) and
+//! `PT_GNU_RELRO`, at most once each; `PT_NOTE`, `PT_PHDR` and `PT_GNU_EH_FRAME`, which are
+//! ignored. Anything else is a hard error. `PT_GNU_RELRO` must be whole pages at the start of
+//! an R+W `PT_LOAD`: `rust-lld` also ends that `PT_LOAD` there, and if a linker does not, the
+//! rest is split off, so the two never share a page (ONBF §6.1).
 
 use core::fmt;
 
@@ -151,6 +153,8 @@ pub struct LoadSegment {
     pub header: u16,
     /// Permissions.
     pub permissions: Permissions,
+    /// Read-only once relocated: the part of an R+W `PT_LOAD` that `PT_GNU_RELRO` covers.
+    pub relro: bool,
     /// RVA (`p_vaddr`), a multiple of 4096.
     pub vaddr: u64,
     /// File offset (`p_offset`), a multiple of 4096.
@@ -255,8 +259,13 @@ pub enum ElfError {
     Interp,
     /// `PT_TLS`: thread-local storage is not part of the KRN contract.
     Tls,
-    /// `PT_GNU_RELRO`: link with `-z norelro`; KRN segments are RW or read-only.
-    GnuRelro,
+    /// `PT_GNU_RELRO` is not a whole number of pages at the start of one R+W `PT_LOAD`.
+    RelroRange {
+        /// `p_vaddr`.
+        start: u64,
+        /// `p_memsz`.
+        size: u64,
+    },
     /// A program header type outside the contract (for example `PT_NULL` or
     /// `PT_GNU_PROPERTY`).
     UnsupportedProgramHeader(u32),
@@ -388,7 +397,10 @@ impl fmt::Display for ElfError {
             E::TooManyProgramHeaders => f.write_str("e_phnum is PN_XNUM; too many program headers"),
             E::Interp => f.write_str("PT_INTERP is not allowed (ONBF §6.1.2)"),
             E::Tls => f.write_str("PT_TLS is not allowed in a KRN image"),
-            E::GnuRelro => f.write_str("PT_GNU_RELRO is not allowed; link with -z norelro"),
+            E::RelroRange { start, size } => write!(
+                f,
+                "PT_GNU_RELRO {start:#x}+{size:#x} is not whole pages at the start of one R+W PT_LOAD"
+            ),
             E::UnsupportedProgramHeader(t) => {
                 write!(f, "program header type {t:#x} is outside the contract")
             }
@@ -519,6 +531,7 @@ pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
 
     let mut segments: Vec<LoadSegment> = Vec::new();
     let mut dynamic: Option<(u64, u64)> = None;
+    let mut relro: Option<(u64, u64)> = None;
     let mut stack_seen = false;
     for (i, raw) in table.as_chunks::<PHDR_BYTES>().0.iter().enumerate() {
         let index = u16::try_from(i).map_err(|_| ElfError::TooManyProgramHeaders)?;
@@ -554,12 +567,19 @@ pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
             pt::NOTE | pt::PHDR | pt::GNU_EH_FRAME => {}
             pt::INTERP => return Err(ElfError::Interp),
             pt::TLS => return Err(ElfError::Tls),
-            pt::GNU_RELRO => return Err(ElfError::GnuRelro),
+            pt::GNU_RELRO => {
+                if relro.replace((ph.vaddr, ph.mem_size)).is_some() {
+                    return Err(ElfError::DuplicateProgramHeader(ph.p_type));
+                }
+            }
             other => return Err(ElfError::UnsupportedProgramHeader(other)),
         }
     }
     if segments.is_empty() {
         return Err(ElfError::NoLoadSegments);
+    }
+    if let Some((start, size)) = relro {
+        apply_relro(&mut segments, start, size)?;
     }
     let in_text = segments
         .iter()
@@ -577,6 +597,47 @@ pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
         segments,
         relocations,
     })
+}
+
+/// Marks the first `size` bytes of the R+W `PT_LOAD` starting at `start` read-only after
+/// relocation. A remainder becomes its own segment, starting on the page after them.
+fn apply_relro(segments: &mut Vec<LoadSegment>, start: u64, size: u64) -> Result<(), ElfError> {
+    let bad = ElfError::RelroRange { start, size };
+    let index = segments
+        .iter()
+        .position(|s| s.vaddr == start && s.permissions == Permissions::ReadWrite)
+        .ok_or(bad)?;
+    let whole = segments.get(index).copied().ok_or(bad)?;
+    if size == 0 || size & PAGE_MASK != 0 || size > whole.mapped_size {
+        return Err(bad);
+    }
+    let relro_file = whole.file_size.min(size);
+    let rest_file = whole.file_size.saturating_sub(relro_file);
+    let rest_mapped = whole.mapped_size.saturating_sub(size);
+    if let Some(segment) = segments.get_mut(index) {
+        *segment = LoadSegment {
+            relro: true,
+            file_size: relro_file,
+            mapped_size: size,
+            ..whole
+        };
+    }
+    if rest_mapped != 0 {
+        let rest = LoadSegment {
+            vaddr: whole.vaddr.checked_add(size).ok_or(bad)?,
+            // With no file bytes left the offset is never read, but it stays a page multiple
+            // inside the input.
+            file_offset: match rest_file {
+                0 => whole.file_offset,
+                _ => whole.file_offset.checked_add(size).ok_or(bad)?,
+            },
+            file_size: rest_file,
+            mapped_size: rest_mapped,
+            ..whole
+        };
+        segments.insert(index.saturating_add(1), rest);
+    }
+    Ok(())
 }
 
 /// The ELF header fields the rest of the parser needs.
@@ -734,6 +795,7 @@ fn check_load(file: &[u8], header: u16, ph: &ProgramHeader) -> Result<LoadSegmen
     Ok(LoadSegment {
         header,
         permissions,
+        relro: false,
         vaddr,
         file_offset: offset,
         file_size,

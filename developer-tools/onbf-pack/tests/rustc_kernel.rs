@@ -6,7 +6,8 @@
 //! The program has a table of 70 pointers to one static and one pointer to another, so
 //! the PIE carries RELATIVE relocations: in `DT_RELA` by default, or in `DT_RELR` with
 //! `-z pack-relative-relocs`. A 6000-byte read-only array makes the R segment larger than
-//! 4 KiB, so that segment gets a MERKLE section.
+//! 4 KiB, so that segment gets a MERKLE section, and `POINTERS`, immutable but relocated, puts
+//! data in `.data.rel.ro`, which the linker's `PT_GNU_RELRO` covers.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,7 @@ fn panic(_info: &PanicInfo) -> ! {
 static ONE: u8 = 1;
 static TWO: u8 = 2;
 static BIG: [u8; 6000] = [0x5A; 6000];
+static POINTERS: [&u8; 2] = [&ONE, &TWO];
 
 #[repr(C)]
 pub struct Table {
@@ -56,6 +58,8 @@ pub extern "C" fn _start() -> ! {
     core::hint::black_box(table);
     // SAFETY: BIG is a valid, aligned static.
     core::hint::black_box(unsafe { core::ptr::read_volatile(&BIG[5999]) });
+    // SAFETY: POINTERS is a valid, aligned static.
+    core::hint::black_box(unsafe { core::ptr::read_volatile(&POINTERS) });
     loop {
         core::hint::spin_loop();
     }
@@ -72,7 +76,8 @@ const KERNEL_LINK_FLAGS: &[&str] = &[
     "-zseparate-loadable-segments",
     "-zmax-page-size=4096",
     "-zcommon-page-size=4096",
-    "-znorelro",
+    "-zrelro",
+    "-znow",
     "-znoexecstack",
 ];
 
@@ -277,7 +282,7 @@ fn check_table(memory: &[u8], segments: &[Section<'_>], base: u64) {
     let word = |at: usize| u64::from_le_bytes(memory[at..at + 8].try_into().unwrap());
     let rw = segments
         .iter()
-        .find(|s| s.entry.flags.has(Flags::WRITE))
+        .find(|s| s.entry.flags.has(Flags::WRITE) && !s.entry.flags.has(Flags::RELRO))
         .unwrap();
     let start = rw.entry.mem_offset as usize;
     let table = (start..start + rw.stored.len())
@@ -340,10 +345,49 @@ fn relr_kernel_packs_and_relocates() {
     pack_compile_and_check(&flags, "relr");
 }
 
+/// CLAUDE.md §14, ADR-0001 default 9, on the real linker's output: `PT_GNU_RELRO` becomes a
+/// RELRO segment of whole pages, the data after it is a plain RW segment, and the relocated
+/// pointers of `.data.rel.ro` sit in the RELRO one. What the loader does with it is in
+/// `boot/uefi/src/place.rs`.
+#[test]
+fn the_linkers_relro_becomes_a_relro_segment() {
+    let dir = TempDir::new("relro-segment");
+    let elf = compile(&dir, "kernel", KERNEL_LINK_FLAGS);
+    let packed = krn::pack(&elf, &options(toolchain_of(&pinned_rustc()))).unwrap();
+    let (segments, slots) = check_independently(&packed.bytes, "relro");
+
+    let (r, w, x, relro) = (Flags::READ, Flags::WRITE, Flags::EXECUTE, Flags::RELRO);
+    let permissions: Vec<u32> = segments
+        .iter()
+        .map(|s| s.entry.flags.0 & (r | w | x | relro))
+        .collect();
+    assert_eq!(permissions, [r, r | x, r | w | relro, r | w]);
+    let (start, size) = (segments[2].entry.mem_offset, segments[2].entry.mem_size);
+    assert_eq!(size % 4096, 0);
+    assert_eq!(segments[3].entry.mem_offset, start + size);
+
+    let in_relro: Vec<u64> = slots
+        .iter()
+        .copied()
+        .filter(|s| (start..start + size).contains(s))
+        .collect();
+    assert!(in_relro.len() >= 2, "{} slots in RELRO", in_relro.len());
+    let base = 0xFFFF_FFFF_8460_0000;
+    let memory = load(&segments, &slots, base);
+    for slot in in_relro {
+        let at = slot as usize;
+        let value = u64::from_le_bytes(memory[at..at + 8].try_into().unwrap());
+        assert!(
+            value >= base,
+            "slot {slot:#x} was not relocated: {value:#x}"
+        );
+    }
+}
+
 #[test]
 fn link_flags_that_the_contract_needs() {
-    // On rust-lld 23.1.1, these two flags change the output of this program; without
-    // them the image is rejected. The others match lld's or rustc's defaults here.
+    // On rust-lld 23.1.1, this flag changes the output of this program; without it the image
+    // is rejected. The others match lld's or rustc's defaults here.
     let dir = TempDir::new("flags");
     let toolchain = toolchain_of(&pinned_rustc());
     let without = |dropped: &str| -> Vec<&str> {
@@ -362,10 +406,17 @@ fn link_flags_that_the_contract_needs() {
         krn::pack(&elf, &options(toolchain.clone())),
         Err(Error::Elf(ElfError::SegmentAlignment { header: 2 }))
     );
-    let elf = compile(&dir, "relro", &without("-znorelro"));
-    assert_eq!(
-        krn::pack(&elf, &options(toolchain.clone())),
-        Err(Error::Elf(ElfError::GnuRelro))
+    // RELRO is what the linker writes: `-znorelro` turns it off, and the packer invents nothing.
+    let mut norelro = KERNEL_LINK_FLAGS.to_vec();
+    norelro.push("-znorelro");
+    let elf = compile(&dir, "norelro", &norelro);
+    let bytes = krn::pack(&elf, &options(toolchain.clone())).unwrap().bytes;
+    let verified = krn::verify(&bytes).unwrap();
+    assert!(
+        verified
+            .segments
+            .iter()
+            .all(|s| s.flags & Flags::RELRO == 0)
     );
     // rustc's default link line alone is rejected too.
     let elf = compile(&dir, "default", &[]);
@@ -413,7 +464,7 @@ fn command_line() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert_eq!(stdout.lines().count(), 1);
     assert!(stdout.starts_with("onbf-pack: wrote KRN "), "{stdout}");
-    assert!(stdout.contains(" sections, 3 segments, "), "{stdout}");
+    assert!(stdout.contains(" sections, 4 segments, "), "{stdout}");
     let expected = krn::pack(
         &elf,
         &KrnOptions {
