@@ -543,13 +543,13 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         crate::storage::on_interrupt();
         return crate::sched::on_reschedule(here);
     }
-    // The virtio-net NIC's used-buffer MSI-X message: acknowledge and count it. The driver
-    // polls the used ring, so the interrupt only needs recording here.
+    // The virtio-net NIC's used-buffer MSI-X message: acknowledge, let the driver wake its
+    // receive thread, and switch to it now.
     if frame.vector == u64::from(NET_VECTOR) {
         // SAFETY: as for the NVMe device vector; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
         crate::virtionet::on_interrupt();
-        return here;
+        return crate::sched::on_reschedule(here);
     }
     // Another processor woke a thread queued here: acknowledge, then switch to it now
     // rather than at the next timer tick.

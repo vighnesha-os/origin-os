@@ -249,8 +249,9 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         if pcie::init(&mut com1, info.acpi_rsdp, regions, online.ids().len()) {
             // M5: the NVMe driver and block I/O, polled and then interrupt-driven.
             storage::init(&mut com1, online.ids(), tsc_hz);
-            // M10: bring up the virtio-net NIC (CLAUDE.md §54).
-            virtionet::prove(&mut com1);
+            // M10: bring up the virtio-net NIC; an interrupt-driven receive thread takes the
+            // OS onto the network (CLAUDE.md §31, §54).
+            virtionet::prove(&mut com1, online.ids(), tsc_hz);
         }
         sched::stop_boot_processor();
     }

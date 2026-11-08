@@ -2,11 +2,12 @@
 //! networking). It finds the virtio-net PCI function, discovers its capability structures
 //! (`virtio::find_caps`), maps the common/notify/device-config regions, runs the status and
 //! feature handshake to `DRIVER_OK`, programs MSI-X so the receive queue's used-buffer
-//! interrupts reach this processor (`cpu::NET_VECTOR`), sets up the receive and transmit
-//! virtqueues with DMA rings (`virtqueue`), and reads the device MAC. It then drives a live
-//! datapath over the link: it posts receive buffers, resolves QEMU's gateway by ARP, and
-//! obtains a DHCP lease — transmit and receive of real Ethernet/IPv4/UDP frames — and
-//! confirms the device raised and the handler serviced an MSI-X receive interrupt.
+//! interrupts reach a chosen processor (`cpu::NET_VECTOR`), sets up the receive and transmit
+//! virtqueues with DMA rings (`virtqueue`), and reads the device MAC. A receive thread on that
+//! processor then drives a live datapath over the link — it posts receive buffers, resolves
+//! QEMU's gateway by ARP, and obtains a DHCP lease (transmit and receive of real
+//! Ethernet/IPv4/UDP frames) — and receive is interrupt-driven: for every frame the thread
+//! sleeps on a wait queue that only the NIC's interrupt handler wakes.
 //!
 //! The ring memory is zeroed DMA pages (`storage::dma_page`): the direct map makes them
 //! physically contiguous and gives their physical addresses, and x86 DMA is cache-coherent.
@@ -20,8 +21,10 @@ use framekernel::net::{self, Arp, EthFrame, Ipv4, Mac, arp_op, ethertype};
 use framekernel::pci::{self, Address};
 use framekernel::virtio::{self, feature, status};
 use framekernel::virtqueue::{self, Descriptor, F_WRITE};
+use origin_sync::SpinLock;
 
 use crate::console::Console;
+use crate::wait::WaitQueue;
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
 const Q_RX: u16 = 0;
@@ -35,11 +38,21 @@ const NO_VECTOR: u16 = 0xFFFF;
 
 /// Counts the virtio-net MSI-X interrupts the device has raised.
 static NET_IRQS: AtomicU64 = AtomicU64::new(0);
+/// The processor the last NIC interrupt arrived on, plus one (0: none yet).
+static NET_IRQ_CPU: AtomicU64 = AtomicU64::new(0);
+/// The receive thread sleeps here until a used-buffer interrupt wakes it.
+static NET_WAIT: WaitQueue = WaitQueue::new();
+/// NIC interrupts that found the receive thread asleep and woke it.
+static NET_WAKES: AtomicU64 = AtomicU64::new(0);
 
-/// Called from the NIC's interrupt vector (`cpu::NET_VECTOR`): records that the device
-/// raised a used-buffer interrupt.
+/// Called from the NIC's interrupt vector (`cpu::NET_VECTOR`): records the used-buffer
+/// interrupt and wakes the receive thread, which then reads the used ring itself.
 pub(crate) fn on_interrupt() {
     NET_IRQS.fetch_add(1, Ordering::Relaxed);
+    NET_IRQ_CPU.store(crate::cpu::cpu_id() + 1, Ordering::Relaxed);
+    if NET_WAIT.wake_one() {
+        NET_WAKES.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // Common-configuration register offsets (virtio 1.1 §4.1.4.3).
@@ -103,6 +116,7 @@ fn page(virt: u64, len: usize) -> &'static mut [u8] {
 }
 
 /// One set-up virtqueue.
+#[derive(Clone, Copy)]
 struct Queue {
     size: usize,
     desc: u64,
@@ -110,6 +124,29 @@ struct Queue {
     used: u64,
     notify_off: u16,
 }
+
+/// What the receive thread needs from the bring-up, handed over before it is spawned.
+#[derive(Clone, Copy)]
+struct Setup {
+    notify_base: u64,
+    mul: u32,
+    rx: Queue,
+    tx: Queue,
+    mac: [u8; 6],
+}
+static SETUP: SpinLock<Option<Setup>> = SpinLock::new(None);
+
+/// Set by the receive thread once its buffers are posted, just before it sleeps for the
+/// gateway's ARP reply; the boot flow sends the request only after this.
+static RX_ARMED: AtomicU64 = AtomicU64::new(0);
+/// The receive thread's results. `RX_DONE` is stored last (Release), after the others.
+static RX_DONE: AtomicU64 = AtomicU64::new(0);
+/// The gateway's MAC, packed big-endian into the low 48 bits (0: unresolved).
+static RX_GATEWAY: AtomicU64 = AtomicU64::new(0);
+/// The leased address in the low 32 bits, with bit 32 set once a lease is bound (0: none).
+static RX_LEASE: AtomicU64 = AtomicU64::new(0);
+/// How often the receive thread blocked waiting for a frame.
+static RX_BLOCKED: AtomicU64 = AtomicU64::new(0);
 
 /// Maps the BAR holding capability `loc` and returns the virtual address of its structure.
 fn map_structure(dev: &crate::pcie::Device, loc: virtio::CfgLocation) -> Option<u64> {
@@ -148,10 +185,10 @@ fn setup_queue(common: u64, q: u16, vector: u16) -> Option<Queue> {
     })
 }
 
-/// Programs the MSI-X table so entry [`RX_MSIX_ENTRY`] targets this processor at
-/// `cpu::NET_VECTOR` (every other entry masked), and turns MSI-X on for the function.
-/// Returns whether MSI-X is enabled and unmasked. Mirrors the NVMe driver's setup.
-fn enable_msix_table(dev: &crate::pcie::Device) -> bool {
+/// Programs the MSI-X table so entry [`RX_MSIX_ENTRY`] targets processor `target` (an
+/// x2APIC ID) at `cpu::NET_VECTOR` (every other entry masked), and turns MSI-X on for the
+/// function. Returns whether MSI-X is enabled and unmasked. Mirrors the NVMe driver's setup.
+fn enable_msix_table(dev: &crate::pcie::Device, target: u32) -> bool {
     let Some(msix) = crate::pcie::msix(dev.function.at) else {
         return false;
     };
@@ -170,7 +207,7 @@ fn enable_msix_table(dev: &crate::pcie::Device) -> bool {
         return false;
     };
     let (Some(address), Some(data)) = (
-        pci::msi_address(crate::cpu::cpuid_apic_id()),
+        pci::msi_address(target),
         pci::msi_data(crate::cpu::NET_VECTOR),
     ) else {
         return false;
@@ -261,31 +298,27 @@ fn transmit(tx: &Queue, notify_base: u64, mul: u32, frame: &[u8]) -> bool {
     false
 }
 
-/// Waits for the next received frame and returns its Ethernet bytes (the virtio-net header
-/// stripped), advancing `last_used`. An empty slice means a malformed completion the caller
-/// should skip; `None` means the poll timed out.
-fn recv_frame(
-    rx: &Queue,
-    rx_pages: &[u64; N_RX],
-    last_used: &mut u16,
-    spins: u64,
-) -> Option<&'static [u8]> {
-    for _ in 0..spins {
-        if r16(rx.used + 2) != *last_used {
-            fence(Ordering::SeqCst);
-            let slot = (*last_used as usize) % rx.size;
-            let (id, len) =
-                virtqueue::used_elem(page(rx.used, virtqueue::used_bytes(rx.size)), slot);
-            *last_used = last_used.wrapping_add(1);
-            let (id, len) = (id as usize, len as usize);
-            if id >= N_RX || !(virtio::NET_HDR_LEN..=RX_BUF).contains(&len) {
-                return Some(&[]);
-            }
-            return Some(&page(rx_pages[id], RX_BUF)[virtio::NET_HDR_LEN..len]);
-        }
-        core::hint::spin_loop();
+/// Sleeps until the next received frame and returns its Ethernet bytes (the virtio-net
+/// header stripped), advancing `last_used`. An empty slice means a malformed completion the
+/// caller should skip.
+///
+/// The running kernel thread blocks on [`NET_WAIT`] and only the NIC's used-buffer interrupt
+/// (`on_interrupt`) wakes it: there is no deadline, so without the interrupt it never runs
+/// again (the boot flow's bounded wait for the thread is what notices). The condition reads
+/// the used ring itself, so a frame that arrived before the thread registered is seen at
+/// once and no wake-up is lost.
+fn recv_frame(rx: &Queue, rx_pages: &[u64; N_RX], last_used: &mut u16) -> &'static [u8] {
+    let blocked = NET_WAIT.wait_until(|| r16(rx.used + 2) != *last_used);
+    RX_BLOCKED.fetch_add(blocked, Ordering::Relaxed);
+    fence(Ordering::SeqCst);
+    let slot = (*last_used as usize) % rx.size;
+    let (id, len) = virtqueue::used_elem(page(rx.used, virtqueue::used_bytes(rx.size)), slot);
+    *last_used = last_used.wrapping_add(1);
+    let (id, len) = (id as usize, len as usize);
+    if id >= N_RX || !(virtio::NET_HDR_LEN..=RX_BUF).contains(&len) {
+        return &[];
     }
-    None
+    &page(rx_pages[id], RX_BUF)[virtio::NET_HDR_LEN..len]
 }
 
 /// Builds a broadcast Ethernet frame into `out` and returns its length.
@@ -333,37 +366,39 @@ fn dhcp_payload(frame: &[u8]) -> Option<&[u8]> {
     (dst_port == 68).then(|| &ip.payload[net::UDP_HEADER..])
 }
 
-/// Resolves `target`'s MAC with a live ARP request/reply over the NIC.
-fn arp_resolve(
-    rx: &Queue,
-    tx: &Queue,
-    rx_pages: &[u64; N_RX],
-    last_used: &mut u16,
-    notify_base: u64,
-    mul: u32,
-    our_mac: Mac,
-) -> Option<Mac> {
-    let target = Ipv4([10, 0, 2, 2]); // QEMU's gateway
+/// QEMU's user-networking gateway, the address the datapath resolves by ARP.
+const GATEWAY: Ipv4 = Ipv4([10, 0, 2, 2]);
+
+/// Transmits an ARP who-has for [`GATEWAY`] (a broadcast Ethernet frame) on the TX queue.
+fn send_arp_request(tx: &Queue, notify_base: u64, mul: u32, our_mac: Mac) -> bool {
     let mut req = [0u8; net::ARP_LEN];
-    Arp {
+    let request = Arp {
         operation: arp_op::REQUEST,
         sender_mac: our_mac,
         sender_ip: Ipv4([10, 0, 2, 15]),
         target_mac: Mac([0; 6]),
-        target_ip: target,
+        target_ip: GATEWAY,
+    };
+    if request.write(&mut req).is_none() {
+        return false;
     }
-    .write(&mut req)?;
     let mut frame = [0u8; net::ETH_HEADER + net::ARP_LEN];
-    let fl = build_frame(&mut frame, our_mac, ethertype::ARP, &req)?;
-    transmit(tx, notify_base, mul, &frame[..fl]);
+    let Some(fl) = build_frame(&mut frame, our_mac, ethertype::ARP, &req) else {
+        return false;
+    };
+    transmit(tx, notify_base, mul, &frame[..fl])
+}
 
+/// Sleeps for received frames until [`GATEWAY`]'s ARP reply arrives (at most four frames),
+/// returning the gateway's MAC.
+fn await_arp_reply(rx: &Queue, rx_pages: &[u64; N_RX], last_used: &mut u16) -> Option<Mac> {
     for _ in 0..4 {
-        let eth = recv_frame(rx, rx_pages, last_used, 50_000_000)?;
+        let eth = recv_frame(rx, rx_pages, last_used);
         if let Some(parsed) = EthFrame::parse(eth)
             && parsed.ethertype == ethertype::ARP
             && let Some(arp) = Arp::parse(parsed.payload)
             && arp.operation == arp_op::REPLY
-            && arp.sender_ip == target
+            && arp.sender_ip == GATEWAY
         {
             return Some(arp.sender_mac);
         }
@@ -385,7 +420,7 @@ fn dhcp_lease(
     let mut client = framekernel::dhcp::Client::new(our_mac.0);
     transmit_dhcp(tx, notify_base, mul, our_mac, &client.start(0x4F52_4947));
     for _ in 0..8 {
-        let eth = recv_frame(rx, rx_pages, last_used, 100_000_000)?;
+        let eth = recv_frame(rx, rx_pages, last_used);
         let Some(message) = dhcp_payload(eth) else {
             continue;
         };
@@ -400,8 +435,43 @@ fn dhcp_lease(
     None
 }
 
-/// Brings up the virtio-net device and reports the result (CLAUDE.md §54).
-pub(crate) fn prove(com1: &mut Console) {
+/// The receive thread: runs the live datapath over the queues the bring-up handed over,
+/// sleeping on [`NET_WAIT`] for every frame until the NIC's used-buffer interrupt wakes it.
+/// It posts its receive buffers, says so (`RX_ARMED`), and falls asleep waiting for the
+/// gateway's ARP reply — the boot flow sends the request only then, so that reply's
+/// interrupt is what wakes it. Then it obtains a DHCP lease. Records what it found
+/// (`RX_DONE` last), then exits.
+extern "sysv64" fn net_thread(_: u64) -> ! {
+    let setup = crate::cpu::without_interrupts(|| *SETUP.lock());
+    if let Some(s) = setup
+        && let Some(rx_pages) = post_rx(&s.rx, s.notify_base, s.mul)
+    {
+        let mut last_used = 0u16;
+        RX_ARMED.store(1, Ordering::Release);
+        if let Some(gateway) = await_arp_reply(&s.rx, &rx_pages, &mut last_used) {
+            let packed = gateway.0.iter().fold(0u64, |a, &b| (a << 8) | u64::from(b));
+            RX_GATEWAY.store(packed, Ordering::Relaxed);
+        }
+        if let Some(lease) = dhcp_lease(
+            &s.rx,
+            &s.tx,
+            &rx_pages,
+            &mut last_used,
+            s.notify_base,
+            s.mul,
+            Mac(s.mac),
+        ) {
+            let address = u64::from(u32::from_be_bytes(lease.0));
+            RX_LEASE.store((1 << 32) | address, Ordering::Relaxed);
+        }
+    }
+    RX_DONE.store(1, Ordering::Release);
+    crate::sched::exit()
+}
+
+/// Brings up the virtio-net device, hands its queues to a receive thread on another
+/// processor (the boot one when there is no other), and reports the result (CLAUDE.md §54).
+pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     let Some(dev) = crate::pcie::find(0x02, 0x00, 0x00) else {
         let _ = writeln!(
             com1,
@@ -473,10 +543,18 @@ pub(crate) fn prove(com1: &mut Console) {
     w8(common + reg::DEVICE_STATUS, st);
     let features_ok = r8(common + reg::DEVICE_STATUS) & status::FEATURES_OK != 0;
 
-    // Turn MSI-X on (so the queues can take vectors), with no config-change interrupt, then
-    // set up the receive queue (interrupt on entry RX_MSIX_ENTRY) and the transmit queue
-    // (no interrupt; it is polled).
-    let msix_enabled = enable_msix_table(&dev);
+    // The receive thread runs on another processor when there is one (as the NVMe interrupt
+    // proof does), and the NIC's MSI-X message is routed to that processor, so it idles until
+    // the interrupt wakes it. Turn MSI-X on (so the queues can take vectors), with no
+    // config-change interrupt, then set up the receive queue (interrupt on entry
+    // RX_MSIX_ENTRY) and the transmit queue (no interrupt; its completion is polled).
+    let bsp = crate::cpu::cpu_id();
+    let target = cpus
+        .iter()
+        .copied()
+        .find(|&id| u64::from(id) != bsp)
+        .unwrap_or(bsp as u32);
+    let msix_enabled = enable_msix_table(&dev, target);
     w16(common + reg::CONFIG_MSIX_VECTOR, NO_VECTOR);
     let rx = setup_queue(common, Q_RX, RX_MSIX_ENTRY);
     let tx = setup_queue(common, Q_TX, NO_VECTOR);
@@ -497,74 +575,87 @@ pub(crate) fn prove(com1: &mut Console) {
     let status_word = r16(devcfg + 6);
     let link_up = status_word & 1 != 0;
 
-    // Live datapath over the NIC: post receive buffers once, resolve the gateway by ARP,
-    // then obtain a DHCP lease — a real transmit-and-receive against QEMU's networking.
+    // Live datapath over the NIC, interrupt-driven: hand the queues to a receive thread on
+    // `target`. Once it has posted its buffers (`RX_ARMED`), give it 10 ms to fall asleep on
+    // the NIC's interrupt (it needs microseconds), then send the gateway an ARP request from
+    // here, so the reply's interrupt is what wakes the sleeping thread. It then obtains a DHCP
+    // lease itself. The boot flow waits for it, bounded, so a NIC whose interrupt never wakes
+    // the thread fails here instead of hanging.
     let mul = caps.notify_off_multiplier;
-    let (mut arp, mut lease) = (None, None);
-    if let (Some(rxq), Some(txq)) = (rx.as_ref(), tx.as_ref())
-        && let Some(rx_pages) = post_rx(rxq, notify_base, mul)
-    {
-        let mut last_used = 0u16;
-        arp = arp_resolve(
-            rxq,
-            txq,
-            &rx_pages,
-            &mut last_used,
-            notify_base,
-            mul,
-            Mac(mac),
-        );
-        lease = dhcp_lease(
-            rxq,
-            txq,
-            &rx_pages,
-            &mut last_used,
-            notify_base,
-            mul,
-            Mac(mac),
-        );
-    }
-
-    // The device raises an MSI-X used-buffer interrupt for the frames received above, but the
-    // boot thread runs with interrupts disabled, so the message stays pending in this
-    // processor's local APIC (which coalesces several arrivals into one). Open interrupt
-    // windows until it is taken and serviced (`cpu::NET_VECTOR` -> `on_interrupt`), bounded so
-    // a NIC that never interrupts fails the proof here instead of hanging.
-    for _ in 0..100_000 {
-        if NET_IRQS.load(Ordering::Relaxed) > 0 {
-            break;
+    let (mut spawned, mut arp_sent) = (false, false);
+    if let (Some(rxq), Some(txq)) = (rx, tx) {
+        crate::cpu::without_interrupts(|| {
+            *SETUP.lock() = Some(Setup {
+                notify_base,
+                mul,
+                rx: rxq,
+                tx: txq,
+                mac,
+            });
+        });
+        spawned = crate::sched::spawn(target as usize, net_thread, 0).is_ok();
+        if spawned {
+            let armed_or_done =
+                || RX_ARMED.load(Ordering::Acquire) != 0 || RX_DONE.load(Ordering::Acquire) != 0;
+            crate::sched::yield_until(armed_or_done, tsc_hz, 10);
+            let settle = crate::cpu::rdtsc();
+            crate::sched::yield_until(
+                || crate::cpu::rdtsc().wrapping_sub(settle) > tsc_hz / 100,
+                tsc_hz,
+                1,
+            );
+            if RX_ARMED.load(Ordering::Acquire) != 0 {
+                arp_sent = send_arp_request(&txq, notify_base, mul, Mac(mac));
+            }
+            crate::sched::yield_until(|| RX_DONE.load(Ordering::Acquire) != 0, tsc_hz, 10);
         }
-        crate::cpu::interrupt_window();
     }
+    let finished = RX_DONE.load(Ordering::Acquire) != 0;
+    let gateway = RX_GATEWAY.load(Ordering::Relaxed);
+    let lease = RX_LEASE.load(Ordering::Relaxed);
+    let blocked = RX_BLOCKED.load(Ordering::Relaxed);
+    let wakes = NET_WAKES.load(Ordering::Relaxed);
+    let irqs = NET_IRQS.load(Ordering::Relaxed);
+    let on = NET_IRQ_CPU.load(Ordering::Relaxed).saturating_sub(1);
+    let last = if irqs == 0 {
+        alloc::string::String::from("none arrived")
+    } else {
+        alloc::format!("the last on CPU {on}")
+    };
 
     let mac_ok = mac == EXPECTED_MAC;
-    let irqs = NET_IRQS.load(Ordering::Relaxed);
     let consistent = features_ok
         && queues_ok
         && driver_ok
         && mac_ok
         && link_up
-        && arp.is_some()
-        && lease.is_some()
         && rx_vector_ok
-        && irqs > 0;
-    let g = arp.unwrap_or(Mac([0; 6])).0;
-    let ip = lease.unwrap_or(Ipv4([0, 0, 0, 0])).0;
+        && spawned
+        && arp_sent
+        && finished
+        && gateway != 0
+        && lease & (1 << 32) != 0
+        && blocked > 0
+        && wakes > 0
+        && irqs > 0
+        && on == u64::from(target);
+    let g = gateway.to_be_bytes();
+    let ip = (lease as u32).to_be_bytes();
     let _ = writeln!(
         com1,
-        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; DHCP lease {}.{}.{}.{}; MSI-X RX interrupts {irqs}; consistent {}{}",
+        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; DHCP lease {}.{}.{}.{}; receive thread on CPU {target}: slept {blocked}, woken by the NIC's interrupt {wakes} (of {irqs} MSI-X interrupts, {last}); consistent {}{}",
         mac[0],
         mac[1],
         mac[2],
         mac[3],
         mac[4],
         mac[5],
-        g[0],
-        g[1],
         g[2],
         g[3],
         g[4],
         g[5],
+        g[6],
+        g[7],
         ip[0],
         ip[1],
         ip[2],

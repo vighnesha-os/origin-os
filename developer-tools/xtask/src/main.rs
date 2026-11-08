@@ -334,8 +334,9 @@ fn boot_scenario_markers() -> Scenario {
             // write-back work (CLAUDE.md §39).
             "origin-kernel: block cache: 4 pages (512 B blocks, 8 per page): 32 of 32 blocks matched the pattern; 4 device reads cold, re-reading 4 resident pages did 0 more (32 hits, 4 misses)".into(),
             "origin-kernel: block cache: a 5th page evicted the LRU clean page (one read, no write-back: true); wrote LBA 10240, flushed (1 device writes), evicted and read back changed: true".into(),
-            // The virtio-net NIC brought up: features negotiated, MAC read, DRIVER_OK, and
-            // one frame transmitted and consumed by the device (CLAUDE.md §54).
+            // The virtio-net NIC brought up (features, MAC, DRIVER_OK, MSI-X); a receive thread
+            // woken only by the NIC's interrupt resolves the gateway by ARP and takes a DHCP
+            // lease (CLAUDE.md §31, §54).
             "origin-kernel: virtio-net: 52:54:00:aa:bb:cc, features_ok true".into(),
             "; consistent true".into(),
             // The in-memory VFS (CLAUDE.md §39): a file built, read back, listed and removed.
