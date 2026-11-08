@@ -1161,6 +1161,10 @@ fn boot_failures() -> Vec<&'static str> {
         ": TLB failed",
         ": wait queues failed",
         ": PCIe failed",
+        // No BAR on the test machines is refused, and the exhaustive quiesce sees every
+        // function before enumeration does.
+        "refused and treated as unimplemented",
+        "was not seen by the quiesce",
         ": NVMe failed",
         ": block cache failed",
         ": backtrace failed",

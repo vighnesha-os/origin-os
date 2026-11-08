@@ -731,6 +731,9 @@ impl AmdVi {
         let unit = self.units.get_mut(ui).ok_or("no unit")?;
         let domain =
             u16::try_from(unit.next_domain).map_err(|_| "its IOMMU has no free domain ID")?;
+        // Consumed before any entry names it: an attach that fails below may have left the
+        // device table entry naming it, and that domain ID must never go to another device.
+        unit.next_domain += 1;
         let top = Page::new(true).ok_or("no memory for a page table")?;
         let mut dte = Dte::decode(unit.dte(requester))
             .ok_or("its device table entry is not this kernel's")?;
@@ -748,7 +751,6 @@ impl AmdVi {
                 pages: Pages::All,
             },
         ])?;
-        unit.next_domain += 1;
         self.domains.push(DomainState {
             unit: ui,
             id: domain,
@@ -959,6 +961,13 @@ pub(super) fn attached(d: Domain, at: Address) -> bool {
             .as_ref()
             .is_some_and(|s| s.domains.get(d.0).is_some_and(|dom| dom.at == at))
     })
+}
+
+/// The physical range of every AMD IOMMU's registers the IVRS (`table`) names, for
+/// `iommu::register_ranges`.
+pub(super) fn register_ranges(table: &'static [u8]) -> Result<Vec<(u64, u64)>, &'static str> {
+    let ivrs = ivrs::parse(table).map_err(|_| "the IVRS is invalid")?;
+    Ok(ivrs.units().map(|u| (u.base, reg::SPAN)).collect())
 }
 
 /// The AMD IOMMUs' PCI functions on segment 0, named by the IVRS (see `iommu::own_functions`).

@@ -262,6 +262,25 @@ struct Iommu {
 }
 
 static IOMMU: SpinLock<Option<Iommu>> = SpinLock::new(None);
+/// What [`init`] established about the platform's IOMMUs.
+static STATUS: SpinLock<pci::IommuStatus> = SpinLock::new(pci::IommuStatus::NotRun);
+
+/// What `firmware::acpi_table` says when the XSDT does not list a table: the one failure that
+/// means the table is really absent, not unreadable.
+const NOT_LISTED: &str = "table not listed in the XSDT";
+
+/// The table with signature `sig`, or `None` if the firmware does not list one: unlike
+/// `firmware::acpi_table`, this tells an absent table from one that cannot be read.
+pub(crate) fn acpi_table_if_listed(
+    rsdp: u64,
+    sig: &[u8; 4],
+) -> Result<Option<&'static [u8]>, &'static str> {
+    match crate::firmware::acpi_table(rsdp, sig) {
+        Ok(t) => Ok(Some(t)),
+        Err(NOT_LISTED) => Ok(None),
+        Err(why) => Err(why),
+    }
+}
 
 /// Bridge bus numbers from configuration space, for the DMAR's device-scope paths.
 struct Config;
@@ -351,6 +370,14 @@ impl TableMemory for Tables {
 }
 
 impl Unit {
+    /// Turns the unit off again, one field per GCMD write (chapter 11): translation, then
+    /// interrupt remapping, then queued invalidation, each only once the one before is off.
+    fn shut_down(&self) {
+        let _ = self.command(0, gcmd::TE, gcmd::TE, false);
+        let _ = self.command(0, gcmd::IRE, gcmd::IRE, false);
+        let _ = self.command(0, gcmd::QIE, gcmd::QIE, false);
+    }
+
     /// Issues a global command and waits for its status bit to read `want`.
     fn command(&self, set: u32, clear: u32, status: u32, want: bool) -> Result<(), &'static str> {
         let gsts = self.regs.read32(reg::GSTS);
@@ -448,7 +475,8 @@ struct Brought {
 }
 
 /// Brings up the unit `u`: checks its registers, turns on queued invalidation, sets an empty
-/// root table, sets up interrupt remapping when `remap`, and turns on translation.
+/// root table, sets up interrupt remapping when `remap`, and turns on translation. A unit that
+/// fails after any of that began is turned off again before the error returns.
 fn bring_up(u: &dmar::Unit<'static>, remap: bool) -> Result<Brought, &'static str> {
     let size = u64::from(u.register_pages) * PAGE;
     let virt =
@@ -503,6 +531,25 @@ fn bring_up(u: &dmar::Unit<'static>, remap: bool) -> Result<Brought, &'static st
     // Fault events stay masked (ADR-0007 I9), whatever the firmware left.
     let fectl = unit.regs.read32(reg::FECTL);
     unit.regs.write32(reg::FECTL, fectl | vtd::FECTL_IM);
+    if let Err(why) = enable(&mut unit, remap) {
+        unit.shut_down();
+        return Err(why);
+    }
+    let gsts = unit.regs.read32(reg::GSTS);
+    Ok(Brought {
+        unit,
+        version,
+        cap_raw,
+        ecap_raw,
+        stale: stale.len(),
+        gsts,
+    })
+}
+
+/// Turns on queued invalidation, the empty root table, interrupt remapping when `remap`, and
+/// translation, in that order (one field per GCMD write); the caller shuts the unit down on
+/// failure.
+fn enable(unit: &mut Unit, remap: bool) -> Result<(), &'static str> {
     // Queued invalidation: the tail at 0, one page of 128-bit descriptors.
     unit.regs.write64(reg::IQT, 0);
     unit.regs.write64(
@@ -518,9 +565,9 @@ fn bring_up(u: &dmar::Unit<'static>, remap: bool) -> Result<Brought, &'static st
     unit.invalidate(&[Descriptor::ContextGlobal, Descriptor::IotlbGlobal { drain }])?;
     // Interrupt remapping: the table, its cache invalidated, then remapping on. CFI stays
     // clear: compatibility-format interrupts are blocked.
-    if remap && ecap.interrupt_remapping {
-        let x2apic = ecap.extended_interrupt_mode;
-        let table = page()?;
+    if remap && unit.ecap.interrupt_remapping {
+        let x2apic = unit.ecap.extended_interrupt_mode;
+        let table = Page::new(unit.ecap.coherent).ok_or("no memory for its structures")?;
         unit.regs.write64(
             reg::IRTA,
             vtd::irta(table.phys, IRT_ENTRIES, x2apic).ok_or("the interrupt table is misplaced")?,
@@ -542,33 +589,75 @@ fn bring_up(u: &dmar::Unit<'static>, remap: bool) -> Result<Brought, &'static st
     // Translation on: from here, a device without a context entry cannot reach memory.
     unit.write_buffer_flush()?;
     unit.command(gcmd::TE, 0, gcmd::TE, true)?;
-    let gsts = unit.regs.read32(reg::GSTS);
-    Ok(Brought {
-        unit,
-        version,
-        cap_raw,
-        ecap_raw,
-        stale: stale.len(),
-        gsts,
-    })
+    Ok(())
 }
 
-/// Finds the remapping units through the ACPI DMAR and brings each up (translation and,
-/// where supported, interrupt remapping on). Returns `false` only for a failure; a platform
-/// without a DMAR is reported and left untranslated.
+/// Finds the IOMMUs through the ACPI DMAR or IVRS and brings each up (translation and, where
+/// supported, interrupt remapping on), and records the outcome ([`status`]): drivers bind only
+/// if every IOMMU runs, or if the platform has none at all. Returns `false` only for a failure;
+/// a platform with neither table is reported and left untranslated (the owner's decision,
+/// sheet item 9: internal devices may still bind). A table that exists but cannot be read is a
+/// failure, not an absence.
 pub(crate) fn init(com1: &mut Console, rsdp: u64) -> bool {
-    let table = match crate::firmware::acpi_table(rsdp, b"DMAR") {
-        Ok(t) => t,
-        Err(e) => {
-            // No VT-d units: AMD IOMMUs, if the firmware describes any.
-            if let Ok(ivrs) = crate::firmware::acpi_table(rsdp, b"IVRS") {
-                return amd::init(com1, ivrs);
-            }
-            let _ = writeln!(
-                com1,
-                "origin-kernel: IOMMU: no DMAR or IVRS ({e}): device DMA is not confined and interrupts are not remapped"
-            );
-            return true;
+    let status = bring_up_all(com1, rsdp);
+    crate::cpu::without_interrupts(|| *STATUS.lock() = status);
+    status != pci::IommuStatus::Failed
+}
+
+/// What the kernel knows about the platform's IOMMUs.
+pub(crate) fn status() -> pci::IommuStatus {
+    crate::cpu::without_interrupts(|| *STATUS.lock())
+}
+
+/// The physical ranges of every IOMMU's registers the firmware names, whether or not it came
+/// up: no BAR may overlap them. `Err` if a table that exists cannot be read.
+pub(crate) fn register_ranges(rsdp: u64) -> Result<Vec<(u64, u64)>, &'static str> {
+    let mut ranges = Vec::new();
+    if let Some(table) = acpi_table_if_listed(rsdp, b"DMAR")? {
+        let dmar = dmar::parse(table).map_err(|_| "the DMAR is invalid")?;
+        ranges.extend(
+            dmar.units()
+                .map(|u| (u.register_base, u64::from(u.register_pages) * PAGE)),
+        );
+    }
+    if let Some(table) = acpi_table_if_listed(rsdp, b"IVRS")? {
+        ranges.extend(amd::register_ranges(table)?);
+    }
+    Ok(ranges)
+}
+
+/// The VT-d or AMD-Vi bring-up itself, and what it found.
+fn bring_up_all(com1: &mut Console, rsdp: u64) -> pci::IommuStatus {
+    use pci::IommuStatus::{Absent, Failed, Translating};
+    let failed = |com1: &mut Console, why: &str| {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: the firmware's IOMMU tables cannot be read ({why}): IOMMU failed"
+        );
+        Failed
+    };
+    let table = match acpi_table_if_listed(rsdp, b"DMAR") {
+        Ok(Some(t)) => t,
+        Err(why) => return failed(com1, why),
+        // No VT-d units: AMD IOMMUs, if the firmware describes any.
+        Ok(None) => {
+            return match acpi_table_if_listed(rsdp, b"IVRS") {
+                Ok(Some(ivrs)) => {
+                    if amd::init(com1, ivrs) {
+                        Translating
+                    } else {
+                        Failed
+                    }
+                }
+                Err(why) => failed(com1, why),
+                Ok(None) => {
+                    let _ = writeln!(
+                        com1,
+                        "origin-kernel: IOMMU: no DMAR or IVRS ({NOT_LISTED}): device DMA is not confined and interrupts are not remapped"
+                    );
+                    Absent
+                }
+            };
         }
     };
     let dmar = match dmar::parse(table) {
@@ -578,7 +667,7 @@ pub(crate) fn init(com1: &mut Console, rsdp: u64) -> bool {
                 com1,
                 "origin-kernel: IOMMU: the DMAR is invalid ({e:?}): IOMMU failed"
             );
-            return false;
+            return Failed;
         }
     };
     let units: Vec<_> = dmar.units().collect();
@@ -599,7 +688,7 @@ pub(crate) fn init(com1: &mut Console, rsdp: u64) -> bool {
             "origin-kernel: IOMMU: {} remapping units (1-{MAX_UNITS} supported): IOMMU failed",
             units.len()
         );
-        return false;
+        return Failed;
     }
     for r in dmar.reserved_memory() {
         // Identity-mapping a reserved region into its devices' domains is not implemented
@@ -693,14 +782,14 @@ pub(crate) fn init(com1: &mut Console, rsdp: u64) -> bool {
                 running.push(b.unit);
             }
             Err(why) => {
-                // The units already running would block every driver's DMA with nobody to
-                // attach devices to them: turn them off again (one field per write).
+                // No driver will bind now (`dma_path`), and the units already running would
+                // block every firmware-owned device with nobody to attach it: turn them off
+                // again (one field per write).
                 for u in &running {
-                    let _ = u.command(0, gcmd::TE, gcmd::TE, false);
-                    let _ = u.command(0, gcmd::IRE, gcmd::IRE, false);
+                    u.shut_down();
                 }
                 let _ = writeln!(com1, "origin-kernel: IOMMU: unit {i}: {why}: IOMMU failed");
-                return false;
+                return Failed;
             }
         }
     }
@@ -717,7 +806,7 @@ pub(crate) fn init(com1: &mut Console, rsdp: u64) -> bool {
             remapping,
         });
     });
-    translating
+    if translating { Translating } else { Failed }
 }
 
 /// Whether DMA remapping is on (drivers must then attach their devices).
@@ -783,6 +872,9 @@ impl Iommu {
             return Err("its unit has no free domain ID");
         }
         let id = unit.next_domain as u16;
+        // Consumed before any entry names it: an attach that fails below may have left a
+        // context entry behind, and that domain ID must never go to another device.
+        unit.next_domain += 1;
         let top = Page::new(coherent).ok_or("no memory for a page table")?;
         let bus = usize::from(r.bus);
         let context = match unit.contexts.get(bus).copied().flatten() {
@@ -834,7 +926,6 @@ impl Iommu {
         } else {
             unit.write_buffer_flush()?;
         }
-        unit.next_domain += 1;
         self.domains.push(DomainState {
             unit: ui,
             id,
