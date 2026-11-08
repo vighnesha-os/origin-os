@@ -59,7 +59,8 @@
 //! - [`tftp`]: a TFTP reader (RFC 1350): read requests, acknowledgements and a download
 //!   state machine;
 //! - [`timers`]: a monotonic-deadline timer queue;
-//! - [`topology`]: CPU topology (SMT/core/package) from CPUID leaf 0Bh;
+//! - [`topology`]: CPU topology (thread/core/module/tile/die/package, and core types) from
+//!   CPUID leaves 1Fh, 0Bh and 80000026h;
 //! - [`nvme`]: NVMe controller registers, queue entries and indexes, Identify data;
 //! - [`paging`]: 4-level page tables with structural W^X (the `origin-paging` crate,
 //!   shared with the loader);

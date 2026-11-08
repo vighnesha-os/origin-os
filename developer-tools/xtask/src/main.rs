@@ -29,9 +29,10 @@ commands:
               kernel image must be rejected by the loader
   boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
               one after another
-  boot-x2apic boot-test on a sparse topology: the boot processor at APIC ID 0 and a second
-              processor at APIC ID 256, above what 8-bit APIC IDs reach (the MADT lists
-              150 possible processors)
+  boot-x2apic boot-test on a sparse topology: the boot processor at APIC ID 0 and processors
+              at APIC IDs 256 and 412, above what 8-bit APIC IDs reach (the MADT lists
+              150 possible processors); twice, on a CPU model with CPUID leaf 1Fh and on
+              one without
   run         boot under QEMU with the serial console on this terminal (Ctrl-A X quits)
 
 environment:
@@ -41,7 +42,9 @@ environment:
   ORIGIN_QEMU_SMP                     processors QEMU emulates, 1-64 (default 2)
   ORIGIN_QEMU_TOPOLOGY                x2apic: the boot-x2apic machine (ORIGIN_QEMU_SMP is
                                       then ignored)
-  ORIGIN_QEMU_CPU                     the QEMU CPU model (default max), e.g. max,-avx2
+  ORIGIN_QEMU_CPU                     the QEMU CPU model (default max), e.g. max,-avx2 or
+                                      max,vendor=GenuineIntel (which exposes leaf 1Fh on
+                                      the boot-x2apic machine)
   ORIGIN_QEMU_IOMMU                   the IOMMU QEMU emulates: intel (default) or amd; or
                                       an intel-iommu -device value, booted with the VT-d
                                       markers (e.g. intel-iommu,intremap=off for a
@@ -198,6 +201,60 @@ struct Machine {
     listed: u32,
     /// The largest APIC ID the MADT lists.
     highest: u32,
+    /// How `-smp` lays out the topology, for the proof of it.
+    geometry: Geometry,
+}
+
+/// How many of each topology domain `-smp` builds, per parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Geometry {
+    packages: u32,
+    dies: u32,
+    modules: u32,
+    cores: u32,
+    threads: u32,
+}
+
+impl Geometry {
+    /// The bits QEMU allots to `count` IDs: the smallest power of two that holds them.
+    fn bits(count: u32) -> u32 {
+        count.next_power_of_two().trailing_zeros()
+    }
+
+    /// The possible processors' x2APIC IDs, as QEMU numbers them from these fields.
+    fn ids(&self) -> Vec<u32> {
+        let (t, c, m, d) = (
+            Self::bits(self.threads),
+            Self::bits(self.cores),
+            Self::bits(self.modules),
+            Self::bits(self.dies),
+        );
+        let mut ids = Vec::new();
+        for package in 0..self.packages {
+            for die in 0..self.dies {
+                for module in 0..self.modules {
+                    for core in 0..self.cores {
+                        for thread in 0..self.threads {
+                            ids.push(
+                                package << (t + c + m + d)
+                                    | die << (t + c + m)
+                                    | module << (t + c)
+                                    | core << t
+                                    | thread,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    /// Whether the machine has a level CPUID leaf 1Fh describes (QEMU exposes the leaf only
+    /// for die or module levels).
+    fn has_extended_levels(&self) -> bool {
+        self.dies > 1 || self.modules > 1
+    }
 }
 
 impl Machine {
@@ -216,22 +273,32 @@ impl Machine {
 /// The machine the boot uses: `-smp N` (QEMU numbers the processors 0 to N-1), or with
 /// `ORIGIN_QEMU_TOPOLOGY=x2apic` a sparse one. There, 2 packages of 3 dies × 5 modules × 5
 /// cores take 2 + 3 + 3 bits of the APIC ID below the package, so package 1 starts at APIC
-/// ID 256; 150 processors are possible, and only the boot processor and one cold-plugged
-/// at package 1 (APIC ID 256) are present (docs/research/2026-11-08-x2apic-above-255.md).
+/// ID 256; 150 processors are possible. Present are the boot processor, one cold-plugged at
+/// package 1 (APIC ID 256, docs/research/2026-11-08-x2apic-above-255.md) and one at package 1,
+/// die 2, module 3, core 4 (APIC ID 412): its die, module and core are all non-zero, so a
+/// decoder that confuses them shows (docs/research/2026-11-08-cpu-topology-leaf-1fh.md).
 fn machine() -> Machine {
     if std::env::var("ORIGIN_QEMU_TOPOLOGY").as_deref() == Ok("x2apic") {
-        // The cold-plugged processor is of the boot processor's model: QEMU names its type
-        // after the model (`max` -> `max-x86_64-cpu`) and applies `-cpu`'s features to it.
+        // The cold-plugged processors are of the boot processor's model: QEMU names their
+        // type after the model (`max` -> `max-x86_64-cpu`) and applies `-cpu`'s features.
         let model = qemu_cpu_model();
         let base = model.split(',').next().unwrap_or("max");
         return Machine {
             smp: "1,maxcpus=150,sockets=2,dies=3,modules=5,cores=5,threads=1".into(),
-            devices: vec![format!(
-                "{base}-x86_64-cpu,socket-id=1,die-id=0,module-id=0,core-id=0,thread-id=0"
-            )],
-            apic_ids: vec![0, 256],
+            devices: vec![
+                format!("{base}-x86_64-cpu,socket-id=1,die-id=0,module-id=0,core-id=0,thread-id=0"),
+                format!("{base}-x86_64-cpu,socket-id=1,die-id=2,module-id=3,core-id=4,thread-id=0"),
+            ],
+            apic_ids: vec![0, 256, 412],
             listed: 150,
             highest: 420,
+            geometry: Geometry {
+                packages: 2,
+                dies: 3,
+                modules: 5,
+                cores: 5,
+                threads: 1,
+            },
         };
     }
     let cpus = qemu_cpus();
@@ -241,7 +308,83 @@ fn machine() -> Machine {
         apic_ids: (0..cpus).collect(),
         listed: cpus,
         highest: cpus - 1,
+        // `-smp N`: QEMU builds one package of N single-thread cores.
+        geometry: Geometry {
+            packages: 1,
+            dies: 1,
+            modules: 1,
+            cores: cpus,
+            threads: 1,
+        },
     }
+}
+
+/// What the kernel must report about the machine's topology (CLAUDE.md §24, §27), computed
+/// here from the `-smp` fields alone, independently of CPUID. `leaf_1f`: the CPU model reports
+/// die and module levels in leaf 1Fh; otherwise leaf 0Bh shows the core field reaching all
+/// the way to the package.
+fn topology_markers(machine: &Machine, leaf_1f: bool) -> Vec<String> {
+    let g = machine.geometry;
+    let (t, c, m, d) = (
+        Geometry::bits(g.threads),
+        Geometry::bits(g.cores),
+        Geometry::bits(g.modules),
+        Geometry::bits(g.dies),
+    );
+    let package_at = t + c + m + d;
+    // Under leaf 0Bh the die and module bits belong to the core field.
+    let (source, core_bits, module_bits, die_bits) = if leaf_1f {
+        ("leaf 1Fh", c, m, d)
+    } else {
+        ("leaf 0Bh", c + m + d, 0, 0)
+    };
+    let field = |id: u32, from: u32, bits: u32| (id >> from) & ((1u32 << bits) - 1);
+    let distinct = |ids: &[u32], shift: u32| {
+        let mut seen: Vec<u32> = ids.iter().map(|id| id >> shift).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        seen.len()
+    };
+    let mut markers = vec![format!(
+        "origin-kernel: topology: layout from {source}: thread bits {t}, core bits {core_bits}, module bits {module_bits}, die bits {die_bits}, package from bit {package_at}"
+    )];
+    for (index, &id) in (0..).zip(&machine.apic_ids) {
+        markers.push(format!(
+            "origin-kernel: topology: {}: package {}, die {}, module {}, core {}, thread {}",
+            machine.named(index),
+            id >> package_at,
+            field(id, t + core_bits + module_bits, die_bits),
+            field(id, t + core_bits, module_bits),
+            field(id, t, core_bits),
+            field(id, 0, t)
+        ));
+    }
+    let listed = g.ids();
+    let online = machine.apic_ids.as_slice();
+    markers.push(format!(
+        "origin-kernel: topology: the MADT lists {} processors: {} packages, {} dies, {} modules, {} cores, {} threads",
+        machine.listed,
+        distinct(&listed, package_at),
+        distinct(&listed, t + core_bits + module_bits),
+        distinct(&listed, t + core_bits),
+        distinct(&listed, t),
+        listed.len()
+    ));
+    let cpus = machine.cpus();
+    markers.push(format!(
+        "origin-kernel: topology: core types: reported by 0 of {cpus} processors; hybrid false"
+    ));
+    markers.push(format!(
+        "origin-kernel: topology: against the MADT: {cpus} processors checked, 0 recorded nothing, 0 have another APIC ID, 0 another layout, 0 an undecodable leaf, 0 no core type although hybrid, 0 a duplicate placement; consistent true"
+    ));
+    markers.push(format!(
+        "origin-kernel: topology: {cpus} logical, {} cores, {} packages ({} threads/core, {} logical/package); consistent true",
+        distinct(online, t),
+        distinct(online, package_at),
+        1u32 << t,
+        1u32 << package_at
+    ));
+    markers
 }
 
 fn boot_scenario() -> Scenario {
@@ -515,9 +658,15 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
                 "origin-kernel: SMP: {cpus} of {cpus} enabled processors online; trampoline identity pages removed true"
             ),
             "origin-kernel: reclaimed ".into(),
-            // CPU topology from CPUID leaf 0Bh: the online processors decompose consistently.
-            "origin-kernel: topology: ".into(),
-            "; consistent true".into(),
+        ]
+        .into_iter()
+        // CPU topology from CPUID (leaf 1Fh, 0Bh): each processor, the layout, the MADT.
+        .chain(topology_markers(
+            machine,
+            machine.geometry.has_extended_levels()
+                && qemu_cpu_model().contains("vendor=GenuineIntel"),
+        ))
+        .chain([
             // NUMA from the ACPI SRAT (QEMU is booted with two -numa nodes): every online
             // processor is placed in a node and memory is present.
             "origin-kernel: numa: ".into(),
@@ -662,8 +811,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             format!("(the last on {target}), 512 of 512 blocks match"),
             // Per-CPU queues: every CPU at once through its own queue pair and vector, the
             // vector's destination its APIC ID.
-        ]
-        .into_iter()
+        ])
         .chain((0..cpus).map(|index| {
             format!(
                 "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, ",
@@ -968,22 +1116,35 @@ fn boot_matrix() -> Result {
 }
 
 /// Runs `boot-test` in a child process on the sparse machine (`ORIGIN_QEMU_TOPOLOGY=x2apic`,
-/// see `machine`): a processor at APIC ID 256 must come online, run threads, and take the
-/// NVMe interrupts routed to it through interrupt remapping.
+/// see `machine`): processors at APIC IDs 256 and 412 must come online, run threads, and
+/// take the NVMe interrupts routed to them through interrupt remapping.
+///
+/// Twice, because the two models tell the kernel different things about one machine. On an
+/// Intel-vendor model QEMU raises the CPUID maximum to 1Fh, so the proof sees dies and modules.
+/// On `max` (AMD vendor), the maximum stays 0Dh and only leaf 0Bh remains, so the die and
+/// module fields read as part of the core
+/// (docs/research/2026-11-08-cpu-topology-leaf-1fh.md).
 fn boot_x2apic() -> Result {
     let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
-    println!("xtask: boot-x2apic: processors at APIC IDs 0 and 256 of 150 possible");
-    let status = Command::new(&exe)
-        .arg("boot-test")
-        .env("ORIGIN_QEMU_TOPOLOGY", "x2apic")
-        .status()
-        .map_err(|e| format!("cannot run boot-test: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "boot-test with a processor at APIC ID 256 failed ({status})"
-        ));
+    for (model, leaf) in [("max,vendor=GenuineIntel", "leaf 1Fh"), ("max", "leaf 0Bh")] {
+        println!(
+            "xtask: boot-x2apic: processors at APIC IDs 0, 256 and 412 of 150 possible, -cpu {model} ({leaf})"
+        );
+        let status = Command::new(&exe)
+            .arg("boot-test")
+            .env("ORIGIN_QEMU_TOPOLOGY", "x2apic")
+            .env("ORIGIN_QEMU_CPU", model)
+            .status()
+            .map_err(|e| format!("cannot run boot-test: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "boot-test on the sparse machine with -cpu {model} failed ({status})"
+            ));
+        }
     }
-    println!("xtask: boot-x2apic passed (a processor at APIC ID 256)");
+    println!(
+        "xtask: boot-x2apic passed (processors at APIC IDs 256 and 412, under leaves 1Fh and 0Bh)"
+    );
     Ok(())
 }
 
@@ -1919,6 +2080,97 @@ mod tests {
         assert_eq!(check_iommu(&Iommu::Amd), Ok(()));
         assert!(check_iommu(&parse_iommu(Some("virtio-iommu-pci"))).is_err());
         assert!(check_iommu(&parse_iommu(Some("intel-iommu-x"))).is_err());
+    }
+
+    /// The expected topology lines, computed from the `-smp` fields alone: what QEMU's
+    /// machine must decode to under each leaf.
+    #[test]
+    fn the_topology_markers_follow_the_machine() {
+        let sparse = Machine {
+            smp: String::new(),
+            devices: Vec::new(),
+            apic_ids: vec![0, 256, 412],
+            listed: 150,
+            highest: 420,
+            geometry: Geometry {
+                packages: 2,
+                dies: 3,
+                modules: 5,
+                cores: 5,
+                threads: 1,
+            },
+        };
+        assert_eq!(sparse.geometry.ids().len(), 150);
+        assert_eq!(sparse.geometry.ids().iter().max(), Some(&420));
+        let intel = topology_markers(&sparse, true);
+        assert_eq!(
+            intel[0],
+            "origin-kernel: topology: layout from leaf 1Fh: thread bits 0, core bits 3, module bits 3, die bits 2, package from bit 8"
+        );
+        assert_eq!(
+            intel[1],
+            "origin-kernel: topology: CPU 0 (APIC ID 0): package 0, die 0, module 0, core 0, thread 0"
+        );
+        assert_eq!(
+            intel[3],
+            "origin-kernel: topology: CPU 2 (APIC ID 412): package 1, die 2, module 3, core 4, thread 0"
+        );
+        assert_eq!(
+            intel[4],
+            "origin-kernel: topology: the MADT lists 150 processors: 2 packages, 6 dies, 30 modules, 150 cores, 150 threads"
+        );
+        assert_eq!(
+            intel[7],
+            "origin-kernel: topology: 3 logical, 3 cores, 2 packages (1 threads/core, 256 logical/package); consistent true"
+        );
+        // Leaf 0Bh on the same machine: no dies or modules are visible.
+        let amd = topology_markers(&sparse, false);
+        assert_eq!(
+            amd[0],
+            "origin-kernel: topology: layout from leaf 0Bh: thread bits 0, core bits 8, module bits 0, die bits 0, package from bit 8"
+        );
+        assert_eq!(
+            amd[3],
+            "origin-kernel: topology: CPU 2 (APIC ID 412): package 1, die 0, module 0, core 156, thread 0"
+        );
+        assert_eq!(
+            amd[4],
+            "origin-kernel: topology: the MADT lists 150 processors: 2 packages, 2 dies, 2 modules, 150 cores, 150 threads"
+        );
+        // A plain -smp 4 machine: one package of 4 single-thread cores.
+        let plain = Machine {
+            smp: String::new(),
+            devices: Vec::new(),
+            apic_ids: vec![0, 1, 2, 3],
+            listed: 4,
+            highest: 3,
+            geometry: Geometry {
+                packages: 1,
+                dies: 1,
+                modules: 1,
+                cores: 4,
+                threads: 1,
+            },
+        };
+        let m = topology_markers(&plain, false);
+        assert_eq!(
+            m[0],
+            "origin-kernel: topology: layout from leaf 0Bh: thread bits 0, core bits 2, module bits 0, die bits 0, package from bit 2"
+        );
+        assert_eq!(
+            m[4],
+            "origin-kernel: topology: CPU 3 (APIC ID 3): package 0, die 0, module 0, core 3, thread 0"
+        );
+        assert_eq!(
+            m[5],
+            "origin-kernel: topology: the MADT lists 4 processors: 1 packages, 1 dies, 1 modules, 4 cores, 4 threads"
+        );
+        assert_eq!(
+            m[8],
+            "origin-kernel: topology: 4 logical, 4 cores, 1 packages (1 threads/core, 4 logical/package); consistent true"
+        );
+        assert!(!plain.geometry.has_extended_levels());
+        assert!(sparse.geometry.has_extended_levels());
     }
 
     #[test]

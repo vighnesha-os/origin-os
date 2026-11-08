@@ -337,6 +337,13 @@ pub(crate) fn start(
 /// or not (QEMU lists all of `maxcpus`, up to 4096 on q35), so the list is sized from the
 /// table, on the heap: each processor structure is at least 8 bytes long.
 fn discover(rsdp_addr: u64, bsp: u32) -> Result<CpuMap, &'static str> {
+    let listed = madt_listing(rsdp_addr)?;
+    Ok(CpuMap::new(bsp, &listed))
+}
+
+/// Every processor the MADT lists, enabled or not. The list is sized from the table, on the
+/// heap: each processor structure is at least 8 bytes long.
+fn madt_listing(rsdp_addr: u64) -> Result<Vec<Processor>, &'static str> {
     let madt = crate::firmware::acpi_table(rsdp_addr, b"APIC").map_err(|e| {
         if e == "table not listed in the XSDT" {
             "no MADT"
@@ -346,7 +353,14 @@ fn discover(rsdp_addr: u64, bsp: u32) -> Result<CpuMap, &'static str> {
     })?;
     let mut listed = alloc::vec![Processor::default(); madt.len() / 8];
     let count = acpi::madt_processors(madt, &mut listed).map_err(|_| "invalid MADT")?;
-    Ok(CpuMap::new(bsp, listed.get(..count).unwrap_or(&[])))
+    listed.truncate(count);
+    Ok(listed)
+}
+
+/// The x2APIC ID of every processor the MADT lists, enabled or not: the topology proof
+/// checks the CPUID layout against them (CLAUDE.md §24, §27).
+pub(crate) fn listed_apic_ids(rsdp_addr: u64) -> Result<Vec<u32>, &'static str> {
+    Ok(madt_listing(rsdp_addr)?.iter().map(|p| p.apic_id).collect())
 }
 
 /// Writes `value` at `offset` in the trampoline data page.
@@ -661,6 +675,8 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
         let _ = start.handshake.refuse(Refusal::NotMine);
         crate::halt();
     }
+    // This processor's topology, read on itself: its leaves are its own (CLAUDE.md §24, §27).
+    cpu::record_topology();
     // Join only if this answer settles the start-up. If the boot processor stopped waiting
     // first, CPU `index` stays offline and this processor is being parked: do nothing more.
     if !start.handshake.answer(id) {

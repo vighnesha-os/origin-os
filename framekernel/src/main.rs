@@ -255,9 +255,10 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                 (free * memory::FRAME) >> 20
             );
         }
-        // CPU topology from CPUID leaf 0Bh (CLAUDE.md §24, §27).
+        // CPU topology from CPUID, each processor's on itself, checked against the MADT
+        // (CLAUDE.md §24, §27).
         let apic_ids = online.apic_ids();
-        prove_topology(&mut com1, &apic_ids);
+        prove_topology(&mut com1, info.acpi_rsdp, &online);
         // NUMA affinities from the ACPI SRAT (CLAUDE.md §24, §28).
         prove_numa(&mut com1, info.acpi_rsdp, &apic_ids);
         // Inter-node distances from the ACPI SLIT (CLAUDE.md §27, §28).
@@ -634,27 +635,26 @@ pub(crate) fn check_initramfs(image: &[u8]) -> InitramfsCheck {
     }
 }
 
-/// Reports the CPU topology from CPUID leaf 0Bh and checks that the online processors'
-/// x2APIC IDs decompose consistently (every package/core/thread triple unique), the
-/// groundwork for topology-aware scheduling (CLAUDE.md §24, §27).
-fn prove_topology(com1: &mut console::Console, ids: &[u32]) {
-    use framekernel::topology::Topology;
-    // Read leaf 0Bh sub-leaves until one reports level type 0 (or four, enough for SMT and
-    // core).
-    let mut subs = [[0u32; 4]; 4];
-    let mut n = 0;
-    if cpu::cpuid(0)[0] >= 0x0B {
-        for (i, slot) in subs.iter_mut().enumerate() {
-            *slot = cpu::cpuid_subleaf(0x0B, i as u32);
-            n = i + 1;
-            if (slot[2] >> 8) & 0xFF == 0 {
-                break;
-            }
-        }
-    }
-    let topology = Topology::decode(&subs[..n]);
-    let mut scratch = [(0u32, 0u32, 0u32); crate::cpu::MAX_CPUS];
-    let (counts, consistent) = framekernel::topology::analyze(&topology, ids, &mut scratch);
+/// Reports the CPU topology each online processor read about itself from CPUID, package
+/// down to thread, and checks it against the ACPI MADT (CLAUDE.md §24, §27; research ledger
+/// `docs/research/2026-11-08-cpu-topology-leaf-1fh.md`).
+///
+/// Every processor recorded its own leaves on itself (a hybrid part's differ between
+/// processors), before it reported online. The checks:
+/// - each processor's own CPUID x2APIC ID is the one the MADT lists for its CPU index;
+/// - every processor decoded its leaves, and they all draw the same layout (the thread
+///   field may differ only on a hybrid part);
+/// - a hybrid processor reports a core type (the SDM makes leaf 1Ah present on all of them);
+/// - no two processors have one placement;
+/// - and the layout is applied to everything the MADT lists, so `cargo xtask` can compare
+///   the resulting package, die, module and core counts with the machine it asked QEMU for.
+///
+/// None of this reads the QEMU machine definition; the counts are only printed here.
+fn prove_topology(com1: &mut console::Console, rsdp: u64, online: &smp::Online) {
+    use framekernel::topology::{self, CpuTopology, Layout, Source};
+
+    // The boot processor's own record; every AP wrote its own before it came online.
+    cpu::record_topology();
     // The cache hierarchy from leaf 04h.
     let mut caches = [framekernel::cache::Cache {
         level: 0,
@@ -691,14 +691,105 @@ fn prove_topology(com1: &mut console::Console, ids: &[u32]) {
     }
     let _ = writeln!(com1, "; consistent {caches_ok}");
 
+    // Each online processor: the APIC ID the MADT gave its CPU index, and what it recorded.
+    let records: alloc::vec::Vec<(u32, Option<CpuTopology>)> = online
+        .cpus()
+        .iter()
+        .map(|&c| (c.apic_id().unwrap_or(u32::MAX), cpu::topology_of(c)))
+        .collect();
+    let boot = records.first().and_then(|r| r.1);
+    let source = boot.map_or(Source::None, |b| b.source);
+    let layout = boot.map_or(Layout::FLAT, |b| b.layout);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: topology: layout from {source}: {layout}"
+    );
+    for (c, (_, own)) in online.cpus().iter().zip(&records) {
+        match own {
+            Some(own) => {
+                let _ = write!(
+                    com1,
+                    "origin-kernel: topology: {}: {}",
+                    c.named(),
+                    own.place()
+                );
+                if let Some(core) = own.core {
+                    let _ = write!(com1, "; core type {:#x}", core.core_type);
+                }
+                let _ = writeln!(com1);
+            }
+            None => {
+                let _ = writeln!(
+                    com1,
+                    "origin-kernel: topology: {}: it recorded nothing about itself",
+                    c.named()
+                );
+            }
+        }
+    }
+
+    // The layout over everything the MADT lists. Counts only: xtask knows the machine.
+    let listed = smp::listed_apic_ids(rsdp);
+    let madt_read = listed.is_ok();
+    match listed {
+        Ok(mut ids) => {
+            let census = layout.census(&mut ids);
+            let _ = writeln!(
+                com1,
+                "origin-kernel: topology: the MADT lists {} processors: {} packages, {} dies, {} modules, {} cores, {} threads",
+                ids.len(),
+                census.packages,
+                census.dies,
+                census.modules,
+                census.cores,
+                census.threads
+            );
+        }
+        Err(why) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: topology: the MADT is unreadable: {why}"
+            );
+        }
+    }
+
+    // Core types: only what the processors themselves report (§24: capabilities, never
+    // marketing names).
+    let reporting = records
+        .iter()
+        .filter(|r| r.1.is_some_and(|o| o.core.is_some()))
+        .count();
+    let hybrid = records.iter().any(|r| r.1.is_some_and(|o| o.hybrid));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: topology: core types: reported by {reporting} of {} processors; hybrid {hybrid}",
+        records.len()
+    );
+
+    // The checks.
+    let agreement = topology::agree(&records);
+    let mut online_ids: alloc::vec::Vec<u32> = records.iter().map(|r| r.0).collect();
+    let counts = layout.census(&mut online_ids);
+    let consistent = agreement.holds() && madt_read && counts.threads == records.len();
+    let _ = writeln!(
+        com1,
+        "origin-kernel: topology: against the MADT: {} processors checked, {} recorded nothing, {} have another APIC ID, {} another layout, {} an undecodable leaf, {} no core type although hybrid, {} a duplicate placement; consistent {consistent}",
+        agreement.checked,
+        agreement.missing,
+        agreement.wrong_apic_id,
+        agreement.layout_differs,
+        agreement.undecodable,
+        agreement.unidentified,
+        agreement.duplicates,
+    );
     let _ = writeln!(
         com1,
         "origin-kernel: topology: {} logical, {} cores, {} packages ({} threads/core, {} logical/package); consistent {}{}",
         counts.threads,
         counts.cores,
         counts.packages,
-        topology.threads_per_core(),
-        topology.logical_per_package(),
+        layout.threads_per_core(),
+        layout.logical_per_package(),
         consistent,
         if consistent { "" } else { ": topology failed" }
     );
