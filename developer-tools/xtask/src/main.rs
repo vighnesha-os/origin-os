@@ -193,6 +193,21 @@ fn boot_scenario() -> Scenario {
                 format!("origin-kernel: {} online after ", machine.named(index)),
             );
         }
+        // Before them, the park drill on CPU 1: started into a counting loop, then INIT;
+        // its count must stand still (ADR-0008 C7).
+        if machine.cpus() > 1 {
+            scenario.markers.insert(
+                at + 1,
+                format!(
+                    "origin-kernel: SMP: park drill: {} ran a counting loop from the trampoline (count ",
+                    machine.named(1)
+                ),
+            );
+            scenario.markers.insert(
+                at + 2,
+                "; 10 ms after INIT, its count moved 0 in 1000 us: parked true".into(),
+            );
+        }
     }
     scenario
 }
