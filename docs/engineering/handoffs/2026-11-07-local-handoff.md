@@ -1246,3 +1246,29 @@ The code diff was read before merging. It changes the boot proofs and the boot-t
 #### Open for the owner
 
 - As in the section above; early-boot DMA, M4 and the Loom models are still on their own branches.
+
+### Continued (2026-11-08, ~19:55–20:10 IST): the AMD manuals checked and the hardware scope decided
+
+The owner told Claude to do both ("You do"). On branch **`claude/interesting-carson-ae7c83`**, in local commits on top of `c3a9bb3`, which is what PR vighnesha-os/origin-os#2 holds.
+
+**Sheet item 23, the AMD manuals: byte-identical to AMD's own copies.** Compared through the desktop app's browser pane, on AMD's Technical Information Portal.
+
+| Manual | AMD's listing | Bytes | SHA-256 |
+|---|---|---|---|
+| IOMMU specification, 48882 | `48882_3.11_IOMMU_PUB.pdf`, Revision 3.11, released 2026-04-08 | 7,705,637 | `f7c375a15db5ed63de760356867211063d164a2ed59f2d38613daec95894ce22` |
+| APM Vol. 3, 24594 | `24594_3.39_APM_Vol3.pdf`, Revision 3.39, released 2026-10-28 | 16,226,519 | `b598514b19f204d973040d9867a7ffc48c949009a8b3dc86b20c9188e721ee45` |
+
+Each was fetched from the address the portal's own search returned for it (`docs.amd.com/api/khub/documents/<id>/content`) and hashed in the browser's memory. No PDF was saved, and there was no sign-in and no challenge. The old `amd.com` PDF addresses are 404, and the portal's reader address answers 401, even in a browser.
+
+**Sheet item 24, the hardware: `docs/adr/ADR-0009-hardware-targets.md`.** A platform counts if the vendor launched its generation in 2026 or later, so a refresh launched as a new generation counts and a new model on an older platform does not. The first machines are #2 (ASRock iBOX-358H, Intel), then #5 (Lenovo M75q Gen 6, AMD). Claude decided, by delegation, and the owner has not reviewed the ADR. **Nothing has been bought, and buying is the owner's.**
+
+#### What to know
+
+- The ADR's H5 lists what to confirm before buying, and H6 what must happen before the first boot, including a console that does not depend on a 16550 at `0x3F8`.
+- Sheet items 10–12 (ADR-0007 questions 6–8) are no longer blocked. They are still the owner's to answer.
+
+#### Open for the owner
+
+- Sheet items 10–12.
+- Buying the machines.
+- Whether to push these commits to the PR.

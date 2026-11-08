@@ -4,7 +4,7 @@
 |---|---|
 | Answers | Owner sheet item 24 ("Research a shortlist", 2026-11-08) |
 | Rules | CLAUDE.md header ("Intel and AMD platforms introduced in 2026 or later"), §17, §74, §76, §80, rule 30 |
-| Status | **Research only. Nothing has been bought, booted or tested.** The owner chooses. |
+| Status | **Research only. Nothing has been bought, booted or tested.** The decision is in `docs/adr/ADR-0009-hardware-targets.md`: Claude chose at the owner's request, 2026-11-08. |
 | Method | Vendor product pages, manuals and datasheets where they could be read; press and reseller pages for dates and prices. Prices were seen on 2026-11-08, are undated on the pages themselves, and are mostly US. Availability in your own country was not checked. |
 
 Marketing names only help us find a machine. The kernel decides what a CPU can do from CPUID and ACPI (§24).
@@ -15,7 +15,7 @@ Marketing names only help us find a machine. The kernel decides what a CPU can d
 
 **If a 2026 CPU on an older socket is acceptable, #1 and #4 are much easier first machines.** Both are socketed boards with a COM header and a separate management controller. But their platforms are older: Core Ultra 200S dates from October 2024 [47], the W880 board manual from March 2025 [4], and Ryzen 9000 predates 2026.
 
-This is the question for you: which reading do you want? A pair is only a start either way. §74 requires several Intel and several AMD models before anything is qualified, and §76 ties any claim to a declared list.
+The owner asked Claude to decide, and ADR-0009 takes the first reading. A pair is only a start either way. §74 requires several Intel and several AMD models before anything is qualified, and §76 ties any claim to a declared list.
 
 Two warnings about the recommended pair:
 

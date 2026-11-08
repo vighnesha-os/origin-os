@@ -5,21 +5,21 @@
 | As of | 2026-11-08, on `claude/interesting-carson-ae7c83`, with signed boot, the crypto vectors and the clock and scheduler proof fixes merged. M4, Loom and early-boot DMA are not merged and may add to this list. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–9, 13–22 and 24–26. |
-| Still open | Item 23 (you are comparing the AMD manuals), then items 10–12. Choosing machines from the shortlist. |
+| Answered | 2026-11-08: items 1–9 and 13–26. Claude did items 23 and 24 at your request. |
+| Still open | Items 10–12. Buying the machines ADR-0009 chose. |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
 ## What has to happen first
 
-CLAUDE.md requires these of the three Proposed ADRs. An ADR can be marked Accepted only once the steps that apply to it are done. Steps A–C are done.
+CLAUDE.md requires these of the three Proposed ADRs. An ADR can be marked Accepted only once the steps that apply to it are done. Steps A–D are done.
 
 | Step | What | Rule | Applies to |
 |---|---|---|---|
 | A, **done** | Trade-offs and migration consequences added to all three ADRs, and alternatives to ADR-0006. | §18 | ADR-0006, 0007, 0008 |
 | B, **done** | [The OriginFS ledger](../research/2026-11-08-originfs-design.md). **The layout cannot grow into §40:** its inode is full, its block pointers hold only an address, and its inode table cannot move. | §16, §40 | ADR-0006 |
 | C, **done** | [The IOMMU threat model](THREAT_MODEL_IOMMU.md): 24 threats, 9 still open. Early-boot DMA and failing open are the most serious. | §58 | ADR-0007 |
-| D, **partly done** | [Every VT-d encoding is checked against Rev 5.20](../research/2026-11-08-vt-d-iommu.md), which answers item 7. Item 23 (the two AMD manuals) is still yours. | §3, §16 | Items 10–12 |
+| D, **done** | [Every VT-d encoding is checked against Rev 5.20](../research/2026-11-08-vt-d-iommu.md), which answers item 7. Both AMD manuals are byte-identical to AMD's own copies (item 23). | §3, §16 | Items 10–12 |
 
 IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean little, so that waits for hardware (item 24). It does not hold up acceptance.
 
@@ -41,9 +41,9 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 | 7, answered | Legacy translation mode now, scalable mode later? | **Accept** | Rev 5.20 still defines legacy mode, with no deprecation notice. It needs second-stage translation: a newer unit that reports `SSTS` clear has none, and the kernel refuses it (T6). Hardware must confirm this (§74). |
 | 8, answered | Refuse devices that need firmware-reserved memory (RMRR) until identity maps exist? | **Accept, with a deadline** | It fails closed. USB controllers and integrated graphics commonly need RMRRs, so identity maps must land before real hardware. |
 | 9, answered | With no IOMMU present, refuse bus mastering for external and hot-plugged devices? | **Yes** | §32 asks for external-device authorization. An IOMMU should also be part of the declared hardware scope (item 24). |
-| 10 | AMD-Vi: blocking device table entries, one interrupt table per device? | **After item 23**, then accept. | The same posture as VT-d, but the encodings came from a mirror copy of AMD's manual. |
-| 11 | Allow two QEMU gaps in the AMD-Vi proofs (fault address 0, no record of a blocked interrupt)? | **After item 23**, then accept as QEMU limits. | Hardware qualification must check both (§74). The address bug is fixed after QEMU 11.1, so that check can tighten on upgrade. |
-| 12 | Refuse devices that an IVMD names, as for RMRRs? | **After item 23**, then accept. | Same reasoning and deadline as item 8. |
+| 10 | AMD-Vi: blocking device table entries, one interrupt table per device? | **Accept** | The same posture as VT-d, and item 23 confirmed the encodings come from AMD's own text. |
+| 11 | Allow two QEMU gaps in the AMD-Vi proofs (fault address 0, no record of a blocked interrupt)? | **Accept as QEMU limits** | Hardware qualification must check both (§74). The address bug is fixed after QEMU 11.1, so that check can tighten on upgrade. |
+| 12 | Refuse devices that an IVMD names, as for RMRRs? | **Accept** | Same reasoning and deadline as item 8. |
 | 25, answered | Rev 5.20 lets firmware ask the OS not to use DMA remapping (`DMA_REMAP_OPT_OUT`) or x2APIC (`X2APIC_OPT_OUT`). Honour them? | **No: report them and carry on** (what the kernel does today) | §58 requires DMA protection, and the kernel depends on x2APIC. A platform that truly needs either is outside the declared hardware scope (§76). |
 
 ## CPU indexes (ADR-0008): built and boot-proven
@@ -75,8 +75,8 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 |---|---|---|---|
 | 21, answered | The project licence? | **MIT OR Apache-2.0** (your choice, 2026-11-08) | `LICENSE-MIT` and `LICENSE-APACHE` are in the repository. The repository stays public. Much of this code is AI-written, and how copyright applies to that is unsettled, so take legal advice if it matters commercially. |
 | 22, answered | Push this branch and open a PR against PR #1's branch? | **Yes, after merging the finished side work** (your choice, 2026-11-08) | Signed boot and the crypto vectors are merged here. The clock and scheduler proof fixes followed on your word, after the PR opened. M4, Loom and early-boot DMA stay on their own branches: they were not finished when you chose this, and each needs your word to merge. A PR is review, not a merge (§80). |
-| 23, yours to do | Compare two AMD manuals with AMD's own copies? | **You are comparing them** (your choice, 2026-11-08). Items 10–12 follow | §3 requires legitimate specifications and §16 a confirmed revision. Both were read from the kib.kiev.ua mirror because AMD's site refuses automated reads. Download each from AMD and run `shasum -a 256` on it. IOMMU spec 48882 Rev 3.11: `f7c375a15db5ed63de760356867211063d164a2ed59f2d38613daec95894ce22`. APM Vol. 3, 24594 Rev 3.39: `b598514b19f204d973040d9867a7ffc48c949009a8b3dc86b20c9188e721ee45`. |
-| 24, answered | Which 2026+ Intel and AMD machines are the declared targets, and what physical x86 test hardware? | **Research a shortlist first** (your choice, 2026-11-08): `docs/hardware/SHORTLIST.md` | §74 requires multiple Intel and AMD models, with SMT, hybrid and NUMA variations, and §76 a declared scope. CET shadow stacks, hybrid cores and real IOMMU behaviour cannot be shown under QEMU, and this Mac can't run x86 natively. |
+| 23, answered | Compare two AMD manuals with AMD's own copies? | **Byte-identical** (done by Claude at your request, 2026-11-08) | §3 requires legitimate specifications and §16 a confirmed revision. AMD's portal serves 48882 Rev 3.11 (released 2026-04-08, 7,705,637 bytes) and 24594 Rev 3.39 (released 2026-10-28, 16,226,519 bytes). Both have the SHA-256 of the mirror copies that were read: `f7c375a15db5ed63de760356867211063d164a2ed59f2d38613daec95894ce22` and `b598514b19f204d973040d9867a7ffc48c949009a8b3dc86b20c9188e721ee45`. They were hashed in memory, and no PDF was saved. |
+| 24, answered | Which 2026+ Intel and AMD machines are the declared targets, and what physical x86 test hardware? | **[ADR-0009](../adr/ADR-0009-hardware-targets.md), decided by Claude at your request (2026-11-08).** A platform counts if the vendor launched its generation in 2026 or later. First machines: #2 (ASRock iBOX-358H, Intel), then #5 (Lenovo M75q Gen 6, AMD). **Nothing is bought; that is yours.** | §74 requires multiple Intel and AMD models, with SMT, hybrid and NUMA variations, and §76 a declared scope. CET shadow stacks, hybrid cores and real IOMMU behaviour cannot be shown under QEMU, and this Mac can't run x86 natively. |
 
 ## What the answers changed (2026-11-08)
 
@@ -84,6 +84,8 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 - Item 15: `boot-matrix` ends with `boot-x2apic`.
 - Item 17: a statement's `id` must be printable ASCII; errata O1 is closed.
 - Item 18: the VT-d PDF is downloaded, outside the repository because it is Intel's document.
+- Item 23: both AMD manuals match AMD's own copies, so items 10–12 are ready to answer.
+- Item 24: ADR-0009 records the hardware scope and the first machines.
 
 ## New since this sheet was written
 

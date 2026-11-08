@@ -17,7 +17,7 @@
 | A4 | virtio 1.1 §6, `VIRTIO_F_ACCESS_PLATFORM` (bit 33) | As for VT-d: without it a virtio device uses physical addresses and bypasses the IOMMU. |
 | A5 | Linux documentation patches (lkml, December 2025 and July 2026) naming the specification's current location (`docs.amd.com/v/u/en-US/48882_3.11_IOMMU_PUB`) | Only to locate the document; no code was read. |
 
-**How A1 was obtained.** `docs.amd.com` answers 401 to automated readers and the older `amd.com` PDF address is 404. The PDF was read from the kib.kiev.ua mirror of AMD's documents (`x86docs/AMD/IOMMU/48882-3.11.pdf`, 7,705,637 bytes, SHA-256 `f7c375a15db5ed63de760356867211063d164a2ed59f2d38613daec95894ce22`), with text extracted by macOS PDFKit. **Before hardware qualification, compare that hash with AMD's own copy.**
+**How A1 was obtained.** `docs.amd.com` answers 401 to automated readers and the older `amd.com` PDF address is 404. The PDF was read from the kib.kiev.ua mirror of AMD's documents (`x86docs/AMD/IOMMU/48882-3.11.pdf`, 7,705,637 bytes, SHA-256 `f7c375a15db5ed63de760356867211063d164a2ed59f2d38613daec95894ce22`), with text extracted by macOS PDFKit. **Checked against AMD's own copy on 2026-11-08: identical.** AMD's Technical Information Portal lists it as `48882_3.11_IOMMU_PUB.pdf`, Revision 3.11, released 2026-04-08, and the file it serves has the same size and SHA-256. It was hashed in the browser's memory and not saved.
 
 **Licence.** The specification's agreement allows reviewing it to design products that interface with AMD products and forbids duplicating it. The repository therefore cites it by section and table and implements from it; it reproduces none of its text or figures.
 
@@ -102,6 +102,6 @@ A second agent drove the device model directly (`-accel qtest`, `iommu-testdev` 
 ## 6. Gaps and risks
 
 - **QEMU is not hardware (§74).** Under QEMU 11.1 the event address, the interrupt-fault event and the IRTE cache cannot be shown (§2.4, §2.5); the kernel follows the specification on each, and the boot test pins QEMU's current behaviour so a change is noticed. A hardware run must require the IOVA in the fault record and the interrupt fault event.
-- The specification was read from a mirror (§1): verify its hash against AMD's copy.
+- The specification was read from a mirror (§1); its hash has since been checked against AMD's copy and is identical.
 - Not implemented: IVMD unity maps and exclusion ranges (such devices are refused), segments other than 0, taking over an IOMMU the firmware left enabled (pre-boot DMA protection, IVinfo bit 1), guest translation, guest virtual APIC (posted interrupts), ATS and device IOTLBs, PPR, the event-log interrupt, 2048-entry interrupt tables, device-table segmentation, and hot-plug. The register window mapped is the 16 KiB every register used lies in; with PCSup the window is 512 KiB.
 - **The I/O APIC is blocked under AMD-Vi.** Its DTE (DeviceID 0x00A0 from the IVRS) aborts fixed interrupts. The kernel uses the I/O APIC only before the IOMMU comes up; routing an I/O APIC line afterwards needs an IRTE in that DeviceID's table (the redirection entry's vector field then holds the index). Under QEMU, a level-triggered line also needs an explicit I/O APIC EOI, because QEMU drops the trigger mode.

@@ -75,6 +75,6 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 | # | Decision | Blocks |
 |---|---|---|
 | — | The `loom` crate (host-only dev-dependency, §5), **approved 2026-11-08**, not fetched yet; its source and size are confirmed when the work that uses it starts. (The ACVP, errata and Wycheproof downloads of the same approval were fetched on 2026-11-08, file by file; see `SOURCE_PROVENANCE.md`.) | Concurrency models (§73) |
-| — | ADR-0007 (DMA isolation and interrupt remapping, Intel VT-d and AMD-Vi, Proposed): questions 6, 7 and 8, after the AMD manual check; the rest are answered (`docs/engineering/OWNER_DECISIONS.md`) | Accepting the IOMMU design; it is implemented and boot-proven already |
-| — | Compare the AMD IOMMU specification (48882 Rev 3.11) read from a mirror with AMD's own copy (SHA-256 in `docs/research/2026-11-08-amd-vi-iommu.md`) | Confidence that every AMD-Vi encoding comes from AMD's text |
+| — | ADR-0007 (DMA isolation and interrupt remapping, Intel VT-d and AMD-Vi, Proposed): questions 6, 7 and 8, ready now that the AMD manual check has passed; the rest are answered (`docs/engineering/OWNER_DECISIONS.md`) | Accepting the IOMMU design; it is implemented and boot-proven already |
+| — | Buy the first test machines ADR-0009 chose: #2, then #5 once its serial option is confirmed (H5) | The first physical boot (§74) |
 | — | Review and merge PR #1 and the pull request stacked on it into `main` | Landing the work |
