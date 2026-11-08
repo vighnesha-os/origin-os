@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Proposed** (2026-11-08; the AMD-Vi section added the same day, also Proposed). The owner answered questions 1–5 and 9 on 2026-11-08; questions 6, 7 and 8 (AMD-Vi) are still the owner's; the check of AMD's manual they waited on passed on 2026-11-08 (byte-identical to AMD's own copy). The owner accepts ADRs (CLAUDE.md §18, §84). This is a kernel-internal security mechanism, not an ABI or format decision, so it is implemented and boot-proven while Proposed; the parts that will reach the Driver ABI (how a user-mode driver asks for DMA memory, §31) are decided later, against this. |
+| Status | **Accepted** by the owner on 2026-11-08: questions 1–5 and 9 first, then questions 6, 7 and 8 (AMD-Vi) once AMD's manuals were confirmed byte-identical to the copies that were read. This is a kernel-internal security mechanism, not an ABI or format decision; the parts that will reach the Driver ABI (how a user-mode driver asks for DMA memory, §31) are decided later, against this. |
 | Requires | CLAUDE.md §31 (DMA mapping, interrupt management, driver isolation), §32 (Intel VT-d, AMD IOMMU, interrupt remapping), §58 (DMA protection) |
 | Evidence | `docs/research/2026-11-08-vt-d-iommu.md` (VT-d Rev 5.20, D51397-019, 2026-05-14; what QEMU 11.1's `intel-iommu` emulates); `docs/research/2026-11-08-amd-vi-iommu.md` (AMD IOMMU specification 48882 Rev 3.11, April 2026; what QEMU 11.1's `amd-iommu` emulates and where it departs from the specification); the boot proofs and negative controls in `docs/engineering/SOURCE_PROVENANCE.md` ("Intel VT-d DMA and interrupt remapping"; "I/O APIC interrupts through VT-d interrupt remapping"; "AMD-Vi DMA and interrupt remapping") |
 | Threat model | `docs/engineering/THREAT_MODEL_IOMMU.md` (CLAUDE.md §58) |
@@ -12,7 +12,7 @@
 
 Until now every bus-mastering device could read and write all of physical memory: a buggy or malicious device, or a driver that hands a device a wrong address, could overwrite the kernel. MSI-X messages could reach only APIC IDs 0–255 (compatibility format), so `pci::msi_address` refused any higher ID, and 2026+ platforms with many cores have x2APIC IDs above 255. Both need the IOMMU: DMA remapping for the first, interrupt remapping for the second. CLAUDE.md §32 asks for both vendors' IOMMUs. QEMU emulates Intel VT-d and AMD-Vi, so both can be proven in the boot test before hardware exists (CLAUDE.md §74 still applies: nothing here is qualified on hardware). The decisions I1–I11 were written for VT-d in vendor-neutral terms; A1–A10 below say how AMD-Vi meets them.
 
-## Proposed decisions
+## Decisions
 
 ### I1. Legacy-mode translation first; scalable mode later
 Root table → per-bus context tables → second-level tables (4 levels, 48-bit, where the unit supports it; else 3 levels, 39-bit), translation type 0. It is the smallest correct design and QEMU's default.
@@ -58,7 +58,7 @@ A virtio device that offers `VIRTIO_F_ACCESS_PLATFORM` sits behind the IOMMU: th
 ### I11. What is refused rather than half-done
 A DMAR that fails any check (`framekernel::dmar::parse`) leaves the IOMMU off and fails the boot proof loudly; the firmware's `DMA_REMAP_OPT_OUT` and `X2APIC_OPT_OUT` requests are reported and not honoured (Rev 5.20 §8.1; decision-sheet item 25); a unit the firmware left enabled is not taken over; a device named by a reserved memory region (RMRR) is refused at attach (identity-mapping RMRRs is not implemented yet), so its DMA stays blocked rather than unchecked; if one unit fails to come up, the units already running are turned off again so drivers are not left blocked with nobody to attach them.
 
-## Proposed decisions for AMD-Vi
+## Decisions for AMD-Vi
 
 The same policy, through AMD-Vi's structures (AMD IOMMU specification 48882 Rev 3.11; research ledger §4). Drivers do not change: `dma::DeviceDma`, `iommu::msi_message` and the other `iommu` entry points dispatch to the AMD-Vi driver (`iommu::amd`) when the firmware provides an IVRS instead of a DMAR.
 
@@ -122,14 +122,14 @@ None on disk and none at any ABI: all of this is kernel-internal, and no persist
 - RMRR and IVMD identity maps are additive.
 - When user-mode drivers arrive (§31, §47), their DMA interface needs its own ADR. It must be capability-checked and must not expose the window or the table formats; `dma::DeviceDma` stays beneath it.
 
-## Questions for the owner
+## Questions for the owner (all answered 2026-11-08)
 
 1. Accept default-deny with one domain per requester ID (I2, I3)? **Yes (2026-11-08).**
 2. Accept the [1 GiB, 2 GiB) IOVA window and "IOVAs are never physical addresses" (I4)? **Yes (2026-11-08).**
 3. Accept legacy mode now, with scalable mode as a later revision (I1)? **Yes (2026-11-08).**
 4. Accept refusing devices that need RMRRs until identity maps exist (I11), rather than leaving them untranslated? **Yes (2026-11-08), with a deadline:** identity maps must land before real hardware.
 5. Policy when a platform has no DMAR or IVRS (today: run with DMA unconfined, reported): should production refuse to enable bus mastering for untrusted (external, hot-plugged) devices without an IOMMU (§32 external-device authorization)? **Yes (2026-11-08),** and an IOMMU is part of the declared hardware scope.
-6. Accept, for AMD-Vi, blocking device table entries (V=1, TV=0; IV=1, IntCtl 00b) and one interrupt remapping table per device (A2, A7)?
-7. Accept the two QEMU allowances in the AMD-Vi proofs — a fault record with address 0, and no record of the blocked interrupt — as documented blind spots of QEMU 11.1, with hardware qualification required to check both (A10)?
-8. Accept refusing devices that an IVMD names, as for RMRRs (A9, I11)?
+6. Accept, for AMD-Vi, blocking device table entries (V=1, TV=0; IV=1, IntCtl 00b) and one interrupt remapping table per device (A2, A7)? **Yes (2026-11-08).**
+7. Accept the two QEMU allowances in the AMD-Vi proofs — a fault record with address 0, and no record of the blocked interrupt — as documented blind spots of QEMU 11.1, with hardware qualification required to check both (A10)? **Yes (2026-11-08),** as QEMU limits; hardware qualification must check both.
+8. Accept refusing devices that an IVMD names, as for RMRRs (A9, I11)? **Yes (2026-11-08),** with question 4's deadline: identity maps must land before real hardware.
 9. Should the kernel honour the firmware's `DMA_REMAP_OPT_OUT` and `X2APIC_OPT_OUT` requests (Rev 5.20 §8.1)? **No (2026-11-08): report them and carry on.** §58 requires DMA protection, and the kernel depends on x2APIC. A platform that truly needs either is outside the declared hardware scope.

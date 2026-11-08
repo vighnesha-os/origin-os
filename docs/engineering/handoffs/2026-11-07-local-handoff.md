@@ -1249,7 +1249,7 @@ The code diff was read before merging. It changes the boot proofs and the boot-t
 
 ### Continued (2026-11-08, ~19:55–20:10 IST): the AMD manuals checked and the hardware scope decided
 
-The owner told Claude to do both ("You do"). On branch **`claude/interesting-carson-ae7c83`**, in local commits on top of `c3a9bb3`, which is what PR vighnesha-os/origin-os#2 holds.
+The owner told Claude to do both ("You do"). On branch **`claude/interesting-carson-ae7c83`**, pushed to PR vighnesha-os/origin-os#2 on the owner's word.
 
 **Sheet item 23, the AMD manuals: byte-identical to AMD's own copies.** Compared through the desktop app's browser pane, on AMD's Technical Information Portal.
 
@@ -1269,6 +1269,12 @@ Each was fetched from the address the portal's own search returned for it (`docs
 
 #### Open for the owner
 
-- Sheet items 10–12.
-- Buying the machines.
-- Whether to push these commits to the PR.
+- Buying the machines. Sheet items 10–12 were answered just after this; see the next section.
+
+### Continued (2026-11-08, ~20:15 IST): ADR-0007 accepted
+
+The owner accepted sheet items 10–12 (ADR-0007 questions 6–8) as recommended: blocking AMD-Vi device table entries and one interrupt table per device; the two QEMU gaps in the AMD-Vi proofs, as QEMU limits that hardware qualification must check; and refusing devices an IVMD names, with the same deadline as RMRRs (identity maps before real hardware). Those were ADR-0007's last open questions, so it is **Accepted**, and no ADR is waiting on the owner. No code changed.
+
+Status words left stale by earlier acceptances in `docs/STATUS.md` and `docs/engineering/TASKS.md` (ADR-0006, ADR-0008, errata V1–V6) are corrected in the same commit. Dated provenance headings and research ledgers keep the status they had when written.
+
+Pushed to PR vighnesha-os/origin-os#2 on the owner's word, with the PR's description updated.

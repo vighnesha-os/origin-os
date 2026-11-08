@@ -5,8 +5,8 @@
 | As of | 2026-11-08, on `claude/interesting-carson-ae7c83`, with signed boot, the crypto vectors and the clock and scheduler proof fixes merged. M4, Loom and early-boot DMA are not merged and may add to this list. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–9 and 13–26. Claude did items 23 and 24 at your request. |
-| Still open | Items 10–12. Buying the machines ADR-0009 chose. |
+| Answered | 2026-11-08: all 26 items. Claude did items 23 and 24 at your request. |
+| Still open | Buying the machines ADR-0009 chose. |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -32,7 +32,7 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 | 3, answered | Defer writes, journalling and crash consistency? | **Accept** | A read-only format needs no write path. Writing belongs to a successor format with its own ADR (§41). |
 | 4, answered | Reserve space now for per-block Merkle integrity? | **No** | §40's integrity belongs to the successor. v0's pointers have no room for it, and reserved space would never be used. |
 
-## IOMMU (ADR-0007): built and boot-proven; Proposed until items 10–12 are answered
+## IOMMU (ADR-0007): built, boot-proven and Accepted
 
 | # | Question | Recommendation | Why |
 |---|---|---|---|
@@ -41,9 +41,9 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 | 7, answered | Legacy translation mode now, scalable mode later? | **Accept** | Rev 5.20 still defines legacy mode, with no deprecation notice. It needs second-stage translation: a newer unit that reports `SSTS` clear has none, and the kernel refuses it (T6). Hardware must confirm this (§74). |
 | 8, answered | Refuse devices that need firmware-reserved memory (RMRR) until identity maps exist? | **Accept, with a deadline** | It fails closed. USB controllers and integrated graphics commonly need RMRRs, so identity maps must land before real hardware. |
 | 9, answered | With no IOMMU present, refuse bus mastering for external and hot-plugged devices? | **Yes** | §32 asks for external-device authorization. An IOMMU should also be part of the declared hardware scope (item 24). |
-| 10 | AMD-Vi: blocking device table entries, one interrupt table per device? | **Accept** | The same posture as VT-d, and item 23 confirmed the encodings come from AMD's own text. |
-| 11 | Allow two QEMU gaps in the AMD-Vi proofs (fault address 0, no record of a blocked interrupt)? | **Accept as QEMU limits** | Hardware qualification must check both (§74). The address bug is fixed after QEMU 11.1, so that check can tighten on upgrade. |
-| 12 | Refuse devices that an IVMD names, as for RMRRs? | **Accept** | Same reasoning and deadline as item 8. |
+| 10, answered | AMD-Vi: blocking device table entries, one interrupt table per device? | **Accept** | The same posture as VT-d, and item 23 confirmed the encodings come from AMD's own text. |
+| 11, answered | Allow two QEMU gaps in the AMD-Vi proofs (fault address 0, no record of a blocked interrupt)? | **Accept as QEMU limits** | Hardware qualification must check both (§74). The address bug is fixed after QEMU 11.1, so that check can tighten on upgrade. |
+| 12, answered | Refuse devices that an IVMD names, as for RMRRs? | **Accept** | Same reasoning and deadline as item 8. |
 | 25, answered | Rev 5.20 lets firmware ask the OS not to use DMA remapping (`DMA_REMAP_OPT_OUT`) or x2APIC (`X2APIC_OPT_OUT`). Honour them? | **No: report them and carry on** (what the kernel does today) | §58 requires DMA protection, and the kernel depends on x2APIC. A platform that truly needs either is outside the declared hardware scope (§76). |
 
 ## CPU indexes (ADR-0008): built and boot-proven
@@ -80,12 +80,13 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 
 ## What the answers changed (2026-11-08)
 
-- ADR-0006 and ADR-0008 are Accepted. ADR-0007 records the answers to its questions 1–5 and 9, and stays Proposed.
+- ADR-0006 and ADR-0008 are Accepted. ADR-0007 recorded the answers to its questions 1–5 and 9, and was Accepted later the same day (below).
 - Item 15: `boot-matrix` ends with `boot-x2apic`.
 - Item 17: a statement's `id` must be printable ASCII; errata O1 is closed.
 - Item 18: the VT-d PDF is downloaded, outside the repository because it is Intel's document.
 - Item 23: both AMD manuals match AMD's own copies, so items 10–12 are ready to answer.
 - Item 24: ADR-0009 records the hardware scope and the first machines.
+- Items 10–12: ADR-0007 is Accepted.
 
 ## New since this sheet was written
 
