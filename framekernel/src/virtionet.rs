@@ -14,9 +14,10 @@ use core::fmt::Write;
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 
+use framekernel::net::{self, Arp, EthFrame, Ipv4, Mac, arp_op, ethertype};
 use framekernel::pci::Address;
 use framekernel::virtio::{self, feature, status};
-use framekernel::virtqueue::{self, Buffer, Descriptor};
+use framekernel::virtqueue::{self, Descriptor, F_WRITE};
 
 use crate::console::Console;
 
@@ -127,48 +128,62 @@ fn setup_queue(common: u64, q: u16) -> Option<Queue> {
     })
 }
 
-/// Transmits one Ethernet frame on the TX queue and waits for the device to consume it
-/// (the used ring to advance). Returns whether it completed.
-fn transmit(common: u64, tx: &Queue, notify_base: u64, notify_mul: u32, mac: [u8; 6]) -> bool {
-    let _ = common;
+/// Writes the notify address for queue `q`'s notify offset.
+fn notify(notify_base: u64, off: u16, mul: u32, q: u16) {
+    fence(Ordering::SeqCst); // the ring writes must be visible before the notification
+    w16(notify_base + u64::from(off) * u64::from(mul), q);
+}
+
+/// How many receive buffers to post.
+const N_RX: usize = 8;
+/// The size of each receive buffer (a virtio-net header plus a full frame).
+const RX_BUF: usize = 2048;
+
+/// Posts [`N_RX`] device-writable receive buffers on the RX queue (descriptor `i` → buffer
+/// `i`), returning their virtual addresses, then notifies the device.
+fn post_rx(rx: &Queue, notify_base: u64, mul: u32) -> Option<[u64; N_RX]> {
+    let mut pages = [0u64; N_RX];
+    let desc = page(rx.desc, virtqueue::desc_bytes(rx.size));
+    let avail = page(rx.avail, virtqueue::avail_bytes(rx.size));
+    for (i, slot) in pages.iter_mut().enumerate() {
+        let (v, p) = crate::storage::dma_page()?;
+        *slot = v;
+        Descriptor {
+            addr: p,
+            len: RX_BUF as u32,
+            flags: F_WRITE,
+            next: 0,
+        }
+        .write(desc, i);
+        virtqueue::avail_push(avail, rx.size, i as u16);
+    }
+    notify(notify_base, rx.notify_off, mul, Q_RX);
+    Some(pages)
+}
+
+/// Transmits `frame` (a complete Ethernet frame) on the TX queue, prepending the virtio-net
+/// header, and waits for the device to consume it.
+fn transmit(tx: &Queue, notify_base: u64, mul: u32, frame: &[u8]) -> bool {
     let Some((fv, fp)) = crate::storage::dma_page() else {
         return false;
     };
-    // [virtio-net header | Ethernet frame]. A minimum 60-byte frame: broadcast dst, our
-    // src, a test ethertype, zero payload. QEMU consumes the TX buffer regardless of where
-    // the frame would route.
     let hdr = virtio::NetHeader::plain().encode();
+    let total = hdr.len() + frame.len();
+    if total > 4096 {
+        return false;
+    }
     let buf = page(fv, 4096);
     buf[..hdr.len()].copy_from_slice(&hdr);
-    let frame = &mut buf[hdr.len()..hdr.len() + 60];
-    frame[0..6].copy_from_slice(&[0xFF; 6]);
-    frame[6..12].copy_from_slice(&mac);
-    frame[12..14].copy_from_slice(&0x88B5u16.to_be_bytes()); // a local-experimental EtherType
-    let total = (hdr.len() + 60) as u32;
-
-    // One read-only descriptor at index 0, published to the available ring.
+    buf[hdr.len()..total].copy_from_slice(frame);
     Descriptor {
         addr: fp,
-        len: total,
+        len: total as u32,
         flags: 0,
         next: 0,
     }
     .write(page(tx.desc, virtqueue::desc_bytes(tx.size)), 0);
-    let _ = Buffer {
-        addr: fp,
-        len: total,
-        device_writable: false,
-    };
     virtqueue::avail_push(page(tx.avail, virtqueue::avail_bytes(tx.size)), tx.size, 0);
-
-    // Make the ring writes visible, then notify the device of the TX queue.
-    fence(Ordering::SeqCst);
-    w16(
-        notify_base + u64::from(tx.notify_off) * u64::from(notify_mul),
-        Q_TX,
-    );
-
-    // Poll the used ring (volatile, so each read re-fetches) until the device completes it.
+    notify(notify_base, tx.notify_off, mul, Q_TX);
     for _ in 0..5_000_000u64 {
         if r16(tx.used + 2) != 0 {
             return true;
@@ -176,6 +191,61 @@ fn transmit(common: u64, tx: &Queue, notify_base: u64, notify_mul: u32, mac: [u8
         core::hint::spin_loop();
     }
     false
+}
+
+/// Does a live ARP exchange over the NIC: posts receive buffers, transmits an ARP request
+/// for `target` (QEMU's gateway), and polls the receive queue for the reply, returning the
+/// resolved MAC. This proves the whole transmit **and** receive datapath against a real
+/// device. `our_mac` is the NIC's address.
+fn arp_exchange(
+    rx: &Queue,
+    tx: &Queue,
+    notify_base: u64,
+    mul: u32,
+    our_mac: Mac,
+    target: Ipv4,
+) -> Option<Mac> {
+    let rx_pages = post_rx(rx, notify_base, mul)?;
+
+    // Build the ARP request frame: broadcast Ethernet, then the ARP who-has.
+    let mut frame = [0u8; net::ETH_HEADER + net::ARP_LEN];
+    EthFrame::write_header(Mac::BROADCAST, our_mac, ethertype::ARP, &mut frame)?;
+    Arp {
+        operation: arp_op::REQUEST,
+        sender_mac: our_mac,
+        sender_ip: Ipv4([10, 0, 2, 15]),
+        target_mac: Mac([0; 6]),
+        target_ip: target,
+    }
+    .write(&mut frame[net::ETH_HEADER..])?;
+    if !transmit(tx, notify_base, mul, &frame) {
+        return None;
+    }
+
+    // Poll the receive queue for the gateway's reply.
+    for _ in 0..50_000_000u64 {
+        if r16(rx.used + 2) != 0 {
+            fence(Ordering::SeqCst);
+            let (id, len) = virtqueue::used_elem(page(rx.used, virtqueue::used_bytes(rx.size)), 0);
+            let (id, len) = (id as usize, len as usize);
+            if id >= N_RX || !(virtio::NET_HDR_LEN..=RX_BUF).contains(&len) {
+                return None;
+            }
+            let buf = page(rx_pages[id], RX_BUF);
+            // Strip the virtio-net header, then parse Ethernet → ARP.
+            let eth = EthFrame::parse(&buf[virtio::NET_HDR_LEN..len])?;
+            if eth.ethertype != ethertype::ARP {
+                return None;
+            }
+            let arp = Arp::parse(eth.payload)?;
+            if arp.operation == arp_op::REPLY && arp.sender_ip == target {
+                return Some(arp.sender_mac);
+            }
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+    None
 }
 
 /// Brings up the virtio-net device and reports the result (CLAUDE.md §54).
@@ -268,22 +338,45 @@ pub(crate) fn prove(com1: &mut Console) {
     let status_word = r16(devcfg + 6);
     let link_up = status_word & 1 != 0;
 
-    // Transmit one frame and confirm the device consumed it.
-    let tx_ok = tx
-        .as_ref()
-        .is_some_and(|tx| transmit(common, tx, notify_base, caps.notify_off_multiplier, mac));
+    // Do a live ARP exchange with QEMU's gateway (10.0.2.2): this transmits a frame and
+    // receives the reply, exercising the whole datapath.
+    let gateway = Ipv4([10, 0, 2, 2]);
+    let resolved = match (rx.as_ref(), tx.as_ref()) {
+        (Some(rx), Some(tx)) => arp_exchange(
+            rx,
+            tx,
+            notify_base,
+            caps.notify_off_multiplier,
+            Mac(mac),
+            gateway,
+        ),
+        _ => None,
+    };
 
     let mac_ok = mac == EXPECTED_MAC;
-    let consistent = features_ok && queues_ok && driver_ok && mac_ok && link_up && tx_ok;
+    let consistent =
+        features_ok && queues_ok && driver_ok && mac_ok && link_up && resolved.is_some();
+    let g = resolved.unwrap_or(Mac([0; 6])).0;
     let _ = writeln!(
         com1,
-        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, RX+TX queues up {queues_ok}, DRIVER_OK {driver_ok}, TX consumed {tx_ok}; consistent {}{}",
+        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, RX+TX queues up {queues_ok}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({}); consistent {}{}",
         mac[0],
         mac[1],
         mac[2],
         mac[3],
         mac[4],
         mac[5],
+        g[0],
+        g[1],
+        g[2],
+        g[3],
+        g[4],
+        g[5],
+        if resolved.is_some() {
+            "reply received"
+        } else {
+            "no reply"
+        },
         consistent,
         if consistent {
             ""
