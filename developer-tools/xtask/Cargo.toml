@@ -12,6 +12,10 @@ origin-version.workspace = true
 origin-crypto.workspace = true
 onbf-format.workspace = true
 onbf-merkle.workspace = true
+# For the boot tests: the framebuffer console's drawing and the font (the screen-dump proof
+# compares QEMU's picture against them) and the boot-info layout it reads.
+framekernel = { path = "../../framekernel" }
+origin-boot-info.workspace = true
 
 [lints]
 workspace = true

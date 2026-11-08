@@ -2,8 +2,9 @@
 //!
 //! The Origin boot loader jumps to `_start` (`src/main.rs`) after `ExitBootServices`, with
 //! the physical address of an [`origin_boot_info::BootInfo`] in `rdi`. The kernel brings up
-//! COM1, checks that the loader applied its relocations, validates the boot info, prints a
-//! summary of it, loads its own GDT, TSS and IDT, proves exception handling with a
+//! its console (the firmware's framebuffer and a UART, ADR-0010), checks that the loader
+//! applied its relocations, validates the boot info, prints a summary of it, loads its own
+//! GDT, TSS and IDT, proves exception handling with a
 //! breakpoint, starts the physical frame allocator, switches to its own page tables (W^X
 //! kernel image, no null page, a never-executable direct map), proves those protections
 //! with deliberate faults and the allocator through the new mapping, starts the kernel heap
@@ -37,7 +38,10 @@
 //! - [`dns`]: DNS message parsing with bounded name decompression;
 //! - [`editbuffer`]: a gap buffer for editable text (caret, insert/delete);
 //! - [`entropy`]: bounded-retry hardware entropy draw/fill over an abstract source;
+//! - [`fbconsole`]: the text console on the firmware's framebuffer (geometry, glyph placement
+//!   and the byte rules, drawn through an abstract pixel sink);
 //! - [`features`]: CPUID feature decoding and the x86-64-v3 baseline;
+//! - [`font`]: the original 8 by 16 ASCII console font;
 //! - [`frames`]: the physical frame allocator over the boot-info regions;
 //! - [`glob`]: glob pattern matching (`*`, `?`, `[...]`, escapes) for names and paths;
 //! - [`gpt`]: GUID Partition Table validation (both copies, CRC-32) and partitions;
@@ -72,6 +76,7 @@
 //! - [`semver`]: semantic-version parsing and precedence (package dependency resolution);
 //! - [`serial`]: a polled 16550 UART driver over an abstract register interface;
 //! - [`report`]: the exact console text;
+//! - [`spcr`]: the ACPI SPCR table (the firmware's serial console, its address and speed);
 //! - [`ring`]: a fixed-capacity ring buffer (input/audio/log queues);
 //! - [`route`]: an IPv4 longest-prefix-match routing table (a bit trie);
 //! - [`rtc`]: CMOS RTC decoding and UTC calendar arithmetic;
@@ -114,7 +119,9 @@ pub mod dmar;
 pub mod dns;
 pub mod editbuffer;
 pub mod entropy;
+pub mod fbconsole;
 pub mod features;
+pub mod font;
 pub mod frames;
 pub mod glob;
 pub mod gpt;
@@ -142,6 +149,7 @@ pub mod rtc;
 pub mod runqueue;
 pub mod semver;
 pub mod serial;
+pub mod spcr;
 pub mod tcp;
 #[cfg(test)]
 mod testing;

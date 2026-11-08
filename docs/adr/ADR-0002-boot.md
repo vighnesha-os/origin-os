@@ -49,6 +49,8 @@ Memory types:
 
 *0.3 (2026-11-07, ADR-0004 H4):* `page_table_root`, `direct_map_base`, `kernel_virtual_base` and `flags` (KASLR) are appended (128 bytes). The boot-info pointer in RDI and the initial RSP are direct-map addresses; every other address field stays physical. The page below the stack is a guard (not mapped).
 
+*0.4 (2026-11-08, ADR-0010 E1, **accepted by the owner on 2026-11-08**, CLAUDE.md §84):* the firmware's framebuffer is appended (48 bytes, `size` 176): physical base, size, the virtual address the loader mapped it at, width, height, stride and the channel masks of a 32-bit pixel, or all zero if there is none. A missing or unusable framebuffer never stops the boot. `origin-version.toml` carries 0.4 on the branch that implements it.
+
 `origin-boot-info` defines the structure, at version 0.2 (`origin-version.toml [compatibility] boot-info`); major 0 means unstable, so the kernel accepts only its exact version. It contains:
 - a magic number, the version and the structure's size;
 - the physical memory regions, using Origin's own kinds: the loader translates the UEFI map so the kernel never sees UEFI structures;

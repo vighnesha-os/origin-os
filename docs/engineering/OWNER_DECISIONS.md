@@ -5,7 +5,7 @@
 | As of | 2026-11-08, on `claude/interesting-carson-ae7c83`, with signed boot, the crypto vectors and the clock and scheduler proof fixes merged. M4, Loom and early-boot DMA are not merged and may add to this list. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: all 26 items. Claude did items 23 and 24 at your request. |
+| Answered | 2026-11-08: all 29 items. Claude did items 23 and 24 at your request. |
 | Still open | Buying the machines ADR-0009 chose. |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -95,5 +95,15 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 | 26, answered | Errata V1–V6 and open gaps O2–O5 from the signed-boot work, and OpenSSL 3.5+ as the host signing tool (`docs/spec/ONBF-errata.md`, `docs/research/2026-11-08-krn-signature-verification.md`) | **V1–V6 accepted. O2: `origin/onbf/1/okc`. O3: check against signed time. O4: exact IDs only. O5: bare public keys. Host signing: original Rust (`onbf-sign`), not OpenSSL. Zeroization: best effort for host development keys** (your choices, 2026-11-08, in the signed-boot session) | Certificate chains are now specified and wait for the SYS profile's signed time. Release keys belong in an HSM (§60). O1 was already answered as item 17. |
 
 **Also found by the same check, not decisions for now:** ADR-0002, ADR-0004 and ADR-0005, already Accepted, have no migration consequences either (§18). The system-call boundary M4 is building has no threat model yet (§58).
+
+## Early console (ADR-0010): built and boot-proven on its branch; accepted
+
+ADR-0009 H6 asked for a console that does not depend on a 16550 at `0x3F8`. `claude/funny-benz-fa7d10` has it, proven under QEMU only: every kernel line drawn on the UEFI framebuffer, the UART taken from the ACPI SPCR when firmware names one, 0x3F8 as the fallback, and a boot that goes on with neither. Evidence: `docs/adr/ADR-0010-early-console.md`, `docs/engineering/SOURCE_PROVENANCE.md`, "The early console".
+
+| # | Question | Recommendation | Why |
+|---|---|---|---|
+| 27, answered | Boot info 0.4: the framebuffer appended as 48 bytes (`Framebuffer`, E1) | **Accepted by the owner, 2026-11-08** | This is the §84 ABI decision for this work. It adds one field group, with no compatibility promise at major 0, and matches ADR-0002 B4 (the loader translates firmware structures). Alternatives and trade-offs are in the ADR |
+| 28, answered | The framebuffer mapped uncached in the first 2 GiB of the MMIO window, by the loader, and kept at that address by the kernel (E2) | **Accepted by the owner, 2026-11-08** | Draws from the first kernel line and across the page-table switch. ADR-0004's layout keeps MMIO out of the direct map; drivers' MMIO now starts 2 GiB higher |
+| 29, answered | The UART: COM1 until the ACPI tables can be read, then the SPCR's UART with earlier output replayed; 0x3F8 only when firmware gives nothing better (E4) | **Accepted by the owner, 2026-11-08** | A hang before the tables are readable still shows on the screen and on COM1; once firmware names a UART, COM1 is not used |
 
 **Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.

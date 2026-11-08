@@ -10,10 +10,16 @@
 //!   its verified ONBF segment table declares, never writable and executable. The
 //!   `KernelImage` region is not in the direct map, so no writable alias of kernel code
 //!   exists.
-//! - **Nothing else**: firmware runtime memory, ACPI NVS, MMIO, reserved and unknown
+//! - **The firmware framebuffer** (ADR-0010), when there is one: uncached, at the
+//!   start of the MMIO window ([`FRAMEBUFFER_WINDOW`]), so a console can draw from the
+//!   kernel's first instruction and across the switch to its own tables.
+//! - **Nothing else**: firmware runtime memory, ACPI NVS, other MMIO, reserved and unknown
 //!   regions stay unmapped until a driver maps what it owns.
 
-use origin_boot_info::{KernelSegment, MemoryRegion, RegionKind, SEGMENT_EXECUTE, SEGMENT_WRITE};
+use origin_boot_info::{
+    Framebuffer, KernelSegment, MAX_FRAMEBUFFER_BYTES, MemoryRegion, RegionKind, SEGMENT_EXECUTE,
+    SEGMENT_WRITE,
+};
 
 use crate::{Access, AddressSpace, Attributes, LARGE_PAGE, MapError, PAGE, TableMemory};
 
@@ -33,6 +39,48 @@ pub const KERNEL_WINDOW: u64 = 0xFFFF_FFFF_8000_0000;
 pub const KERNEL_WINDOW_SIZE: u64 = 0x8000_0000;
 /// Granularity of the kernel-image slide (H3).
 pub const KERNEL_ALIGN: u64 = LARGE_PAGE;
+/// Start of the window the firmware framebuffer is mapped in: the first 2 GiB of the MMIO
+/// window (H2).
+pub const FRAMEBUFFER_WINDOW: u64 = 0xFFFF_E000_0000_0000;
+/// Size of the framebuffer window. Device registers are mapped above it.
+pub const FRAMEBUFFER_WINDOW_SIZE: u64 = 2 << 30;
+const _: () = assert!(
+    FRAMEBUFFER_WINDOW_SIZE >= MAX_FRAMEBUFFER_BYTES + 2 * PAGE + LARGE_PAGE,
+    "the window must hold the largest framebuffer at any offset within a large page"
+);
+
+/// Where a framebuffer is mapped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FramebufferMapping {
+    /// Physical address of the first page mapped.
+    pub phys: u64,
+    /// Virtual address of the first page mapped.
+    pub virt: u64,
+    /// Bytes mapped: a whole number of pages.
+    pub bytes: u64,
+    /// Virtual address of the top-left pixel.
+    pub first_pixel: u64,
+}
+
+/// Where `framebuffer` belongs in the window, or `None` if it is unusable or too large for
+/// it. The virtual address keeps the physical address's offset within 2 MiB, so an aligned
+/// framebuffer gets 2 MiB leaves.
+pub fn framebuffer_mapping(framebuffer: &Framebuffer) -> Option<FramebufferMapping> {
+    framebuffer.check().ok()?;
+    let phys = framebuffer.base & !(PAGE - 1);
+    let bytes =
+        (framebuffer.base + framebuffer.visible_bytes() - phys).checked_next_multiple_of(PAGE)?;
+    let virt = FRAMEBUFFER_WINDOW + phys % LARGE_PAGE;
+    if virt + bytes > FRAMEBUFFER_WINDOW + FRAMEBUFFER_WINDOW_SIZE {
+        return None;
+    }
+    Some(FramebufferMapping {
+        phys,
+        virt,
+        bytes,
+        first_pixel: virt + (framebuffer.base - phys),
+    })
+}
 
 /// Where the loader put things.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +151,26 @@ pub fn segment_access(segment: &KernelSegment) -> Access {
     } else {
         Access::Read
     }
+}
+
+/// Maps the firmware framebuffer, uncached, into `space`, after everything the boot needs has
+/// its tables, so that running out of them here cannot cost anything else. Returns whether
+/// the whole framebuffer is mapped; a framebuffer that cannot be mapped is not an error
+/// (ADR-0010: a missing console never stops the boot).
+pub fn map_framebuffer(
+    space: &mut AddressSpace,
+    mem: &mut impl TableMemory,
+    framebuffer: &FramebufferMapping,
+) -> bool {
+    space
+        .map_range(
+            mem,
+            framebuffer.virt,
+            framebuffer.phys,
+            framebuffer.bytes,
+            Attributes::mmio(),
+        )
+        .is_ok()
 }
 
 /// Builds the address space described in the module documentation.
@@ -217,6 +285,94 @@ mod tests {
             kernel_physical_base: KERNEL,
             stack_guard: KERNEL + 0xE000,
         }
+    }
+
+    fn display(base: u64) -> Framebuffer {
+        Framebuffer {
+            base,
+            size: 0x40_0000,
+            virtual_base: 0,
+            width: 1280,
+            height: 800,
+            stride: 5120,
+            red_mask: 0x00FF_0000,
+            green_mask: 0x0000_FF00,
+            blue_mask: 0x0000_00FF,
+        }
+    }
+
+    #[test]
+    fn the_framebuffer_maps_uncached_in_its_window_and_keeps_its_offset() {
+        // 2 MiB aligned: large leaves; the first pixel is at the start of the window.
+        let mapping = framebuffer_mapping(&display(0x8000_0000)).unwrap();
+        assert_eq!(mapping.phys, 0x8000_0000);
+        assert_eq!(mapping.virt, FRAMEBUFFER_WINDOW);
+        assert_eq!(mapping.first_pixel, FRAMEBUFFER_WINDOW);
+        assert_eq!(mapping.bytes, (800 * 5120 + 0xFFF) & !0xFFF);
+
+        let tables = pool(64);
+        let mut mem = TablePool::new(&tables, POOL_BASE);
+        let (mut space, _) = build(&mut mem, &at(), &regions(), &segments()).unwrap();
+        assert!(map_framebuffer(&mut space, &mut mem, &mapping));
+        let first = space.translate(&mem, mapping.first_pixel).unwrap();
+        assert_eq!(first.phys, 0x8000_0000);
+        assert!(first.writable && !first.executable && first.global && first.uncached);
+        assert_eq!(first.size, LARGE_PAGE);
+        let last = space
+            .translate(&mem, mapping.first_pixel + 800 * 5120 - 4)
+            .unwrap();
+        assert_eq!(last.phys, 0x8000_0000 + 800 * 5120 - 4);
+        assert_eq!(
+            space.translate(&mem, mapping.virt + mapping.bytes),
+            None,
+            "nothing past it is mapped"
+        );
+
+        // Not page aligned: the offset within the page survives, and so does the alignment
+        // within 2 MiB, so a large page can be used where the physical address allows one.
+        let mapping = framebuffer_mapping(&display(0x8000_1800)).unwrap();
+        assert_eq!(mapping.phys, 0x8000_1000);
+        assert_eq!(mapping.virt, FRAMEBUFFER_WINDOW + 0x1000);
+        assert_eq!(mapping.first_pixel, FRAMEBUFFER_WINDOW + 0x1800);
+        assert_eq!(mapping.bytes % PAGE, 0);
+        assert!(mapping.bytes >= 800 * 5120 + 0x800);
+    }
+
+    #[test]
+    fn a_framebuffer_that_cannot_be_mapped_is_not_a_failed_boot() {
+        // A table pool with nothing left once the kernel is mapped: the framebuffer does not
+        // fit, and the rest of the address space is intact.
+        let probe_tables = pool(64);
+        let mut probe = TablePool::new(&probe_tables, POOL_BASE);
+        let (_, _) = build(&mut probe, &at(), &regions(), &segments()).unwrap();
+        let used = probe.used();
+
+        let tables = pool(used);
+        let mut mem = TablePool::new(&tables, POOL_BASE);
+        let (mut space, _) = build(&mut mem, &at(), &regions(), &segments()).unwrap();
+        let mapping = framebuffer_mapping(&display(0x8000_0000)).unwrap();
+        assert!(!map_framebuffer(&mut space, &mut mem, &mapping));
+        assert!(
+            space.translate(&mem, DIRECT + 0x1000).is_some(),
+            "the direct map is intact"
+        );
+    }
+
+    #[test]
+    fn an_unusable_framebuffer_has_no_mapping() {
+        assert_eq!(framebuffer_mapping(&Framebuffer::NONE), None);
+        let mut bad = display(0x8000_0000);
+        bad.stride = 3;
+        assert_eq!(framebuffer_mapping(&bad), None);
+        // The largest accepted framebuffer still fits at any offset within a large page.
+        let mut largest = display(0x8000_0000 + LARGE_PAGE - 4);
+        largest.width = 16384;
+        largest.height = 16384;
+        largest.stride = 65536;
+        largest.size = u64::MAX;
+        let mapping = framebuffer_mapping(&largest).unwrap();
+        assert_eq!(mapping.virt % LARGE_PAGE, mapping.phys % LARGE_PAGE);
+        assert!(mapping.virt + mapping.bytes <= FRAMEBUFFER_WINDOW + FRAMEBUFFER_WINDOW_SIZE);
     }
 
     fn pool(n: usize) -> Vec<Table> {

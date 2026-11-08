@@ -13,8 +13,10 @@ use framekernel::paging::{
     Translation,
 };
 
-/// The MMIO window (ADR-0004 H2): device registers, mapped uncached on demand.
-const MMIO_BASE: u64 = 0xFFFF_E000_0000_0000;
+/// The MMIO window (ADR-0004 H2): device registers, mapped uncached on demand. It starts
+/// after the 2 GiB reserved for the framebuffer (ADR-0010).
+const MMIO_BASE: u64 = framekernel::paging::layout::FRAMEBUFFER_WINDOW
+    + framekernel::paging::layout::FRAMEBUFFER_WINDOW_SIZE;
 const MMIO_END: u64 = 0xFFFF_F000_0000_0000;
 /// The next free address in the MMIO window.
 static MMIO_NEXT: AtomicU64 = AtomicU64::new(MMIO_BASE);

@@ -1278,3 +1278,34 @@ The owner accepted sheet items 10–12 (ADR-0007 questions 6–8) as recommended
 Status words left stale by earlier acceptances in `docs/STATUS.md` and `docs/engineering/TASKS.md` (ADR-0006, ADR-0008, errata V1–V6) are corrected in the same commit. Dated provenance headings and research ledgers keep the status they had when written.
 
 Pushed to PR vighnesha-os/origin-os#2 on the owner's word, with the PR's description updated.
+
+### Continued (2026-11-08, ~20:20–22:30 IST): the early console, for ADR-0009 H6 (ADR-0010, accepted)
+
+On branch **`claude/funny-benz-fa7d10`**, local only, not pushed, on top of `claude/interesting-carson-ae7c83` at `f9a948d` (fast-forwarded before any work). The code and these records land in one local commit.
+
+Before this, the kernel's only console was a 16550 at the fixed port `0x3F8`, which neither first machine in ADR-0009 documents. Now:
+
+- **The framebuffer.** The loader passes the UEFI GOP framebuffer through boot info **0.4** (`Framebuffer`: address, size, the address it mapped it at, dimensions, stride, channel masks). The loader maps it uncached in the MMIO window so the kernel draws from its first line, and across its switch to its own tables. Everything the console prints goes to the screen first and then the UART: text in an original 8×16 font, wrapped rather than scrolled, so each line costs one row of pixel writes.
+- **The UART.** The console starts on COM1 (it has nothing better until the ACPI tables can be mapped), and as soon as they can be, it reads the SPCR. If the firmware names a UART this kernel can drive, I/O or memory-mapped, the console moves there, with everything printed so far sent to it again (8 KiB kept), and COM1 is not used again. Otherwise COM1 stays: "fall back to 0x3F8 only when the firmware gives nothing better".
+- **A missing console never stops a boot.** No GOP, a Blt-only mode, a framebuffer the checks refuse, a table that is refused or names a port with nothing behind it, a UART that stops taking bytes, or no UART at all: each is named on whatever console there is, and the boot goes on.
+
+**Evidence** (`docs/engineering/SOURCE_PROVENANCE.md`, "The early console"):
+
+- `cargo xtask check` (819 tests, 0 failed, 6 ignored) and a full `cargo xtask boot-matrix` on a quiet host: both IOMMUs at 1, 2 and 4 CPUs (11 of 11 scenarios each), `boot-x2apic` under leaves 1Fh and 0Bh, and `boot-console` (8 of 8). An earlier matrix run lost only `boot-console`'s third scenario, to another session's load test starting mid-run (`wait queues` timed-wait bound); host load, unrelated to this work.
+- `boot-test`'s kernel scenario checks a QEMU screen dump, cell by cell in the literal colors, against the rows the serial log implies (computed independently of the drawing code), in every cell of `boot-matrix`.
+- `boot-console`: all the kernel's output on a UART at port `0x2F8` named by an SPCR, while COM1's log stops at the move line; COM1 named by the table itself; a refused table, a dead port, registers in RAM; a UART that answers but takes no bytes; no display; and no UART at all (judged from screen dumps only).
+- Fourteen negative controls fail these proofs (FB1–FB6, SP1–SP8). One of them, red and blue swapped, passed against the first version of the screen check, which compared the dump with a frame from the kernel's own drawing code; that check was rewritten so a bug in the drawing cannot vouch for itself.
+- A fresh reviewing agent found no memory-safety bug and several real gaps (a UART that answers but will not take bytes lost the console; a zero divisor could be restored; the entry stub could lose its page tables to the framebuffer; the UART speed rule), all fixed.
+- The picture was looked at, not assumed: the screen dump of a full boot shows legible text and the cursor bar right after the last line.
+
+#### What to know
+
+- **Boot info changed (0.3 → 0.4), the ABI decision of §84. The owner accepted it and the rest of ADR-0010 on 2026-11-08** (the three questions, sheet items 27–29).
+- The screen check in `boot-test` runs in every cell of `boot-matrix`. `-serial mon:stdio` replaced `-serial stdio -monitor none` for the kernel scenario only.
+- `boot-console` is new and adds eight full boots to `boot-matrix` (about 4 minutes).
+- **On real hardware expect the framebuffer to go dark at `iommu::init`** on a machine whose firmware scans out through the IOMMU, until identity maps (T14) or the T4 changes land: ADR-0010, "What this does not prove". A serial line is still wanted for a first boot (`adopt_firmware_uart` will find it if firmware names it).
+- The MMIO UART path has no boot proof: QEMU's x86 machines have no memory-mapped 16550.
+
+#### Open for the owner
+
+- Whether and when to merge this branch.

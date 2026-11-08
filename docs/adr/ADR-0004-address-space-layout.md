@@ -21,7 +21,7 @@ User addresses are `0x0000_0000_0000_1000` to `0x0000_7FFF_FFFF_E000` (page 0 an
 |---|---|
 | `0xFFFF_8000_0000_0000` + slide | direct map of all RAM, read/write, never executable (1 GiB or 2 MiB pages; holes as in K2) |
 | `0xFFFF_C000_0000_0000` … | kernel heap and stacks (per-thread stacks with guard pages in virtual space, not in the direct map) |
-| `0xFFFF_E000_0000_0000` … | MMIO windows, mapped uncached on demand by drivers |
+| `0xFFFF_E000_0000_0000` … | MMIO windows, mapped uncached on demand by drivers. Since ADR-0010: the first 2 GiB hold the firmware framebuffer, mapped by the loader; drivers' MMIO starts above them |
 | `0xFFFF_FFFF_8000_0000` + slide | the kernel image, with its segment permissions from the signed ONBF table |
 
 Each address space has the same PML4 entries 256–511, pointing at kernel tables allocated once at boot, so kernel mappings never need to be copied or synchronized between address spaces.

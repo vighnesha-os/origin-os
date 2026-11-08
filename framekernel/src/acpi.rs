@@ -14,6 +14,8 @@
 pub const RSDP_LENGTH: usize = 36;
 /// Bytes of a system description table header.
 pub const HEADER_LENGTH: usize = 36;
+/// Offset of a table header's revision byte.
+pub const HEADER_REVISION: usize = 8;
 /// Offset of the first MADT interrupt controller structure.
 const MADT_ENTRIES: usize = 44;
 /// Offset of the first SRAT resource-affinity structure (36-byte header + 12 reserved).
