@@ -4,7 +4,7 @@
 |---|---|
 | Status | **Proposed** (2026-11-08). The owner accepts ADRs (CLAUDE.md §18, §84). This is a kernel-internal security mechanism, not an ABI or format decision, so it is implemented and boot-proven while Proposed; the parts that will reach the Driver ABI (how a user-mode driver asks for DMA memory, §31) are decided later, against this. |
 | Requires | CLAUDE.md §31 (DMA mapping, interrupt management, driver isolation), §32 (Intel VT-d, AMD IOMMU, interrupt remapping), §58 (DMA protection) |
-| Evidence | `docs/research/2026-11-08-vt-d-iommu.md` (VT-d Rev 5.20, D51397-019, 2026-05-14; what QEMU 11.1's `intel-iommu` emulates); the boot proofs and negative controls in `docs/engineering/SOURCE_PROVENANCE.md` ("Intel VT-d DMA and interrupt remapping") |
+| Evidence | `docs/research/2026-11-08-vt-d-iommu.md` (VT-d Rev 5.20, D51397-019, 2026-05-14; what QEMU 11.1's `intel-iommu` emulates); the boot proofs and negative controls in `docs/engineering/SOURCE_PROVENANCE.md` ("Intel VT-d DMA and interrupt remapping"; "I/O APIC interrupts through VT-d interrupt remapping") |
 | Related | ADR-0001 D2 (first-party kernel drivers), ADR-0004 (address-space layout: the MMIO window holds the units' registers) |
 
 ## Context
@@ -39,7 +39,14 @@ All invalidation goes through the invalidation queue (it is required for interru
 With `ECAP.C` clear, every written root, context, paging, IRTE and queue line is flushed (`CLFLUSH`, then `MFENCE`) before the hardware can need it; with `CAP.RWBF`, a write-buffer flush follows changes; with `CAP.CM`, not-present-to-present changes are invalidated too (context: device-selective with domain 0; IOTLB: domain or page). Entries are written high half first and the present bit last.
 
 ### I8. Interrupt remapping with 32-bit x2APIC destinations and source checks
-One interrupt remapping table per unit (256 entries to start), `EIME` set when the unit has `ECAP.EIM`. Every IRTE is fixed delivery, physical destination, edge-triggered, and **verifies its device's source ID** (`SVT` 1, `SQ` 0). An MSI-X entry carries only a remappable-format handle (`SHV` set, sub-handle and data 0): the vector and destination exist only in the IRTE. `CFI` stays clear, so compatibility-format interrupts are blocked (QEMU does not enforce this; hardware does). With interrupt remapping on and EIM, `iommu::msi_message` accepts any 32-bit APIC ID — the APIC-ID-255 refusal is lifted. Without interrupt remapping the compatibility format and its refusal stay.
+One interrupt remapping table per unit (256 entries to start), `EIME` set when the unit has `ECAP.EIM`. Every IRTE is fixed delivery, physical destination, and **verifies its source's ID** (`SVT` 1, `SQ` 0). An MSI's IRTE is edge-triggered. An MSI-X entry carries only a remappable-format handle (`SHV` set, sub-handle and data 0): the vector and destination exist only in the IRTE. `CFI` stays clear, so compatibility-format interrupts are blocked (QEMU does not enforce this; hardware does). With interrupt remapping on and EIM, `iommu::msi_message` accepts any 32-bit APIC ID — the APIC-ID-255 refusal is lifted. Without interrupt remapping the compatibility format and its refusal stay.
+
+**I/O APIC pins** (added 2026-11-08) are routed the same way, since with `CFI` clear hardware drops their compatibility-format interrupts:
+- The redirection entry is written in remappable format (VT-d chapter 5): the IRTE index, the format bit, delivery-mode bits 000, and the pin's polarity, trigger mode and mask.
+- The IRTE (`iommu::route_ioapic_pin`) lives on the unit whose DMAR device scope lists that I/O APIC by its MADT ID, and checks the source ID that scope names. An I/O APIC no unit lists explicitly is refused; INCLUDE_PCI_ALL does not cover one.
+- The IRTE has the pin's trigger mode. For a level-triggered pin, the entry's vector equals the IRTE's, so the EOI broadcast for the delivered vector clears the pin's remote IRR.
+
+QEMU 11.1's I/O APIC sends its messages without a requester ID, so under QEMU the unit records their faults with source ID 0xffff and cannot check the source ID; the boot proof measures this and says so (`SOURCE_PROVENANCE.md`).
 
 ### I9. Faults are polled and recorded
 Fault events stay masked; the fault-recording registers are read and cleared by the kernel (`iommu::take_faults`), decoded by reason. A fault-event interrupt that feeds the kernel log (§69) is a later step.
@@ -54,7 +61,8 @@ A DMAR that fails any check (`framekernel::dmar::parse`) leaves the IOMMU off an
 
 - Drivers allocate DMA memory through `dma::DeviceDma` (attach once, then pages that come mapped) and program bus addresses, never physical ones; MSI-X entries are programmed through `iommu::msi_message`.
 - The boot needs `-device intel-iommu,intremap=on,eim=on` and `iommu_platform=on` on virtio devices (xtask).
-- Not yet: AMD-Vi (a separate, later step), scalable mode, RMRR identity maps, taking over a unit the firmware enabled (pre-boot DMA protection, `DMA_CTRL_PLATFORM_OPT_IN`), I/O APIC entries in remappable format (the only I/O APIC proof runs before the IOMMU and is masked afterwards; once IR is on, a compatibility-format I/O APIC interrupt is blocked on hardware), freeing IOVAs and table pages, large-page mappings, device-TLBs (ATS), a fault-event interrupt, and hot-plug.
+- Legacy IRQs are routed through `iommu::route_ioapic_pin` and a remappable-format redirection entry whenever interrupts are remapped (the PIT's IRQ0 is proven at every boot); a compatibility-format I/O APIC entry is used only before the IOMMU is up, or without interrupt remapping.
+- Not yet: AMD-Vi (a separate, later step), scalable mode, RMRR identity maps, taking over a unit the firmware enabled (pre-boot DMA protection, `DMA_CTRL_PLATFORM_OPT_IN`), freeing IOVAs and table pages, large-page mappings, device-TLBs (ATS), a fault-event interrupt, hot-plug, and a live level-triggered I/O APIC pin (PCI INTx) with its EOI path.
 
 ## Questions for the owner
 

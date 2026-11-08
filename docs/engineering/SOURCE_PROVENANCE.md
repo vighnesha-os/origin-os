@@ -629,6 +629,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Negative control** (failing the boot test): the redirection entry left masked → 0 interrupts in 2 s → "I/O APIC failed".
 - **Test evidence:** 7 `acpi` tests (I/O APIC and overrides among them) and 3 `ioapic` tests; 163 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** routing the keyboard IRQ1 to a handler for live keystrokes (the i8042 bring-up is done; this is the remaining link), level-triggered PCI INTx routing, per-CPU interrupt affinity and balancing, and an EOI path for the I/O APIC's own remote-IRR on level interrupts.
+- **Under interrupt remapping (2026-11-08):** this proof still runs before the IOMMU, in compatibility format. Once the IOMMU is up, the same pin is routed again in remappable format through an IRTE; see "I/O APIC interrupts through VT-d interrupt remapping".
 
 ### The ACPI PM timer: a second time-source cross-check (CLAUDE.md §68; 2026-11-08)
 
@@ -1077,7 +1078,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - scalable mode;
   - RMRR identity maps (such devices are refused);
   - taking over a unit the firmware left enabled (pre-boot DMA protection);
-  - I/O APIC entries in remappable format. The I/O APIC proof runs before the IOMMU and is masked afterwards; on hardware, a compatibility-format I/O APIC interrupt is blocked once IR is on;
+  - ~~I/O APIC entries in remappable format~~ — done 2026-11-08, see "I/O APIC interrupts through VT-d interrupt remapping" below;
   - a fault-event interrupt into `klog`;
   - freeing IOVAs and table pages;
   - device-TLBs/ATS;
@@ -1085,6 +1086,67 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - **No CPU with an APIC ID above 255 exists in the test configuration.** The kernel indexes per-CPU state by APIC ID with `MAX_CPUS` 64, so delivery to one is shown by the IRTE encoding, not by a live interrupt. Decoupling CPU index from APIC ID is a separate task.
   - **QEMU-only (§74).**
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the VT-d specification and virtio 1.1 §6.
+- **Licensing:** project licence not chosen yet.
+
+### I/O APIC interrupts through VT-d interrupt remapping (`ioapic`, `vtd`, `dmar` libraries; `iommu`, `irq`, `cpu` kernel; CLAUDE.md §24, §32, §72; ADR-0007 I8, Proposed; 2026-11-08)
+
+- **Why:** once interrupt remapping is on with compatibility format blocked (CFI clear, ADR-0007 I8), hardware drops every I/O APIC interrupt whose redirection entry is in compatibility format. The keyboard IRQ and every other legacy IRQ need their entries in remappable format, naming IRTEs. QEMU passes compatibility format through, so until now the boot test could not show the gap: the only I/O APIC proof ran before the IOMMU came up.
+- **What:**
+  - **`ioapic` (library): `RemappableEntry`**, the remappable-format redirection entry (VT-d chapter 5, programming the I/OxAPIC):
+    - the IRTE index's bits 14:0 in entry bits 63:49 and its bit 15 in bit 11 (where compatibility format keeps the destination mode);
+    - the format bit, 48;
+    - bits 10:8 000 (fixed), so the message's SHV stays clear and the handle alone selects the IRTE;
+    - polarity (13), trigger mode (15) and mask (16) where compatibility format keeps them, because they govern how the I/O APIC samples its pin;
+    - reserved bits 47:17 zero.
+
+    `encode` refuses vectors 0–15. `decode` refuses compatibility format, a non-zero delivery mode, any reserved bit and vectors 0–15, and ignores the read-only delivery-status and remote-IRR bits. `agrees_with_irte` holds when the trigger modes are equal and, for a level-triggered pin, the vectors too: the I/O APIC clears a level pin's remote IRR on an EOI broadcast that names its own vector, while the processor broadcasts the IRTE's. `is_remappable` tells the formats apart.
+  - **`vtd` (library):** `Irte` gains `level` (TM, low-qword bit 4). An MSI stays edge-triggered; an I/O APIC pin's IRTE takes the pin's trigger mode. `decode` now accepts TM and still refuses logical destinations (DM), the redirection hint and non-fixed delivery modes.
+  - **`dmar` (library): `Dmar::ioapic(id)`**: the unit whose device scope lists the I/O APIC with that enumeration ID (its MADT I/O APIC ID), and the requester its scope's path resolves to — the source ID an IRTE for one of its pins must check. INCLUDE_PCI_ALL never covers an I/O APIC (chapter 8). Refused (`IoApicScopeError`) when no scope lists it, when two do (the source ID would be ambiguous), or when the path does not resolve.
+  - **`iommu` (kernel):**
+    - `route_ioapic_pin(ioapic, apic, vector, level)`: an IRTE on the unit `Dmar::ioapic` names, with the vector, the 32-bit x2APIC destination, the pin's trigger mode and SVT 1/SQ 0 on the DMAR's source ID; written high half first, its interrupt-entry-cache entry invalidated. If the write or the invalidation fails, the entry is cleared before its slot is freed.
+    - `pin_irte` reads the entry back; `rewrite_pin` (for the proofs) writes another entry or clears it, with the invalidation; `release_pin` clears and frees it.
+  - **`irq` (kernel): `prove_remapped`.** The first I/O APIC proof (before the IOMMU) now keeps the pin it found and its single MMIO mapping. After the IOMMU proofs, the pin is routed through `route_ioapic_pin` to a target CPU, another than the boot processor when there is one, and its redirection entry rewritten in remappable format. Every redirection write is now masked first, then the high dword, then the low one, so an entry is never live half written.
+  - **`cpu`:** a per-CPU count of the I/O APIC vector (`ioapic_irqs_on`, by x2APIC ID), so the proof can say which CPU took each interrupt.
+  - **xtask:** markers for the five new lines, after the IOMMU proofs.
+- **Boot proof** (every boot; `boot-matrix` at `-smp` 1, 2 and 4; quoted at 2):
+  - `I/O APIC: remapped: the PIT's IRQ0 (GSI 2, edge-triggered, active-high) through IRTE 5: the redirection entry reads back in remappable format with that index, vector 0x41 and mask clear: true; the IRTE reads back vector 0x41 to CPU 1, edge-triggered like the pin, checking source ID 0xff00 (I/O APIC 0's, from the DMAR): true; the two agree: true; 0 earlier fault(s) cleared`
+  - `I/O APIC: remapped: 20 PIT interrupts arrived on CPU 1 through IRTE 5 in 200 ms, 0 on other CPUs; fault recorded: none; consistent true`
+  - **The IRTE not present:** `I/O APIC: IRTE 5 not present: 0 interrupts arrived in 100 ms; fault recorded: source ID 0xffff, interrupt index 5, reason 0x22 (interrupt table entry not present), from a message without a requester ID (the DMAR names 0xff00); IRTE restored, 5 interrupts arrived on CPU 1 again: true; consistent true`
+  - **A wrong source ID:** `I/O APIC: IRTE 5 checking source ID 0xff01 instead of 0xff00: 10 interrupts arrived in 100 ms; fault recorded: none; the source-ID check cannot be shown on this platform: its I/O APIC's messages carry no requester ID (0xffff above), so the unit skips the check (hardware blocks them, reason 0x26); IRTE restored, 5 interrupts arrived on CPU 1 again: true; consistent true`
+  - `I/O APIC: remapped: the entry masked, the PIT stopped and IRTE 5 released: true; 0 fault(s) recorded after`
+
+  At `-smp` 1 the IRTE is 4 and the target CPU 0; at 4, IRTE 7 and CPU 1; the results are otherwise the same. Kernel boots on the committed code: 15.0 s, 16.6 s and 20.6 s (13.2 s, 15.4 s and 21.8 s before this work; TCG timings vary by about a second between runs). The new proof takes about 0.7 s.
+
+  **Why the not-present probe is the proof.** Under QEMU a compatibility-format entry's interrupts arrive whatever the IRTEs say, and a read-back only shows what the I/O APIC holds. With the IRTE cleared, nothing may arrive and the unit must record a fault for that index. The interrupts stop, then resume when the IRTE is restored, so they went through it. Control N1 below shows the probe catching a compatibility-format entry that delivers perfectly well.
+- **A QEMU blind spot, measured and then confirmed in QEMU's source.** QEMU 11.1's I/O APIC writes its interrupt messages with `MEMTXATTRS_UNSPECIFIED` (`hw/intc/ioapic.c`, `ioapic_service`). They carry no requester ID, so the VT-d model sees `X86_IOMMU_SID_INVALID` (0xffff) and:
+  - records a fault from them with source ID 0xffff, not the DMAR's 0xff00;
+  - skips the IRTE's source-ID check (`hw/i386/intel_iommu.c`, `vtd_irte_get`: validation only `if (sid != X86_IOMMU_SID_INVALID)`). A wrong source ID — reason 0x26 on hardware — goes unnoticed: the probe saw 10 interrupts arrive and nothing recorded.
+
+  The kernel stays strict where the messages carry a source ID. If the not-present fault shows the I/O APIC's own source ID, as on hardware, the wrong-ID probe must block every interrupt and record reason 0x26 with that source ID. Only if it shows none (0xffff, while the DMAR names another) is the probe allowed to see the interrupts arrive, and only with nothing recorded; the line then says the check cannot be shown. Any other source ID fails the proof. So **the source-ID check on I/O APIC interrupts (and the 0xff00 in the fault) needs hardware (§74)**, like CFI blocking and the interrupt-entry-cache invalidation before it. The IRTE's source check itself is read back and checked against the DMAR on every boot (control N4).
+- **Negative controls.** Each is a temporary change; with it applied `cargo xtask boot-test` exited 1 (except N4b, a measured probe that passes), and the files were restored from git (the script is in the session's scratchpad; the changes are described here). Because xtask stops at the first failure marker, the `b` variants disable an earlier read-back so a later check is reached:
+  - **N1, the redirection entry left in compatibility format** (its destination the target CPU): `the redirection entry reads back in remappable format …: false; the IRTE reads back …: true; the two agree: false; … I/O APIC failed`.
+  - **N1b, the same with the read-back checks disabled.** QEMU delivers compatibility format perfectly well: `20 PIT interrupts arrived on CPU 1 through IRTE 5 in 201 ms, 0 on other CPUs; fault recorded: none; consistent true`. Only the not-present probe catches it: `IRTE 5 not present: 10 interrupts arrived in 100 ms; fault recorded: none; … consistent false: I/O APIC failed`. This is the control that shows the probe, not a read-back, proves the path through the IRTE.
+  - **N2, the pin's IRTE never written:** `the IRTE reads back …: false; the two agree: false; … I/O APIC failed`.
+  - **N2b, the same with the IRTE read-back disabled:** `0 PIT interrupts arrived on CPU 1 through IRTE 5 in 2000 ms, 0 on other CPUs; fault recorded: source ID 0xffff, interrupt index 5, reason 0x22 (interrupt table entry not present); consistent false: I/O APIC failed`. The task asked for this control with source ID 0xff00; QEMU records 0xffff (the blind spot above).
+  - **N3, the not-present probe leaves the IRTE present:** `IRTE 5 not present: 10 interrupts arrived in 100 ms; fault recorded: none; … consistent false: I/O APIC failed`.
+  - **N4, the pin's IRTE checks a source ID one function off (0xff01):** `the IRTE reads back … checking source ID 0xff00 (I/O APIC 0's, from the DMAR): false; the two agree: true; … I/O APIC failed`. Under QEMU it is this read-back against the DMAR that catches a wrong source ID, not the unit.
+  - **N4b, the same with the IRTE read-back disabled, passes the boot test**, as expected: a measured probe, not a control. With the IRTE checking 0xff01 instead of the I/O APIC's 0xff00, every interrupt still arrives through it (`20 PIT interrupts arrived on CPU 1 through IRTE 5 in 200 ms, 0 on other CPUs; fault recorded: none; consistent true`): QEMU's unit cannot check a source ID its I/O APIC never sends. On hardware that IRTE would block every interrupt with reason 0x26.
+  - **N5, the pin's IRTE level-triggered while the pin is edge-triggered:** `the IRTE reads back …: false; the two agree: false; … I/O APIC failed`.
+- **Test evidence (2026-11-08):** 7 new host tests and two extended:
+  - `ioapic` (5): golden remappable encodings (index 0, 5, 0x8000 and 0xFFFF; polarity, trigger and mask where compatibility format keeps them; delivery bits 000) and the refusal of vectors 0–15; 20,000 random entries round-trip, the status bits ignored; every refusal (compatibility format, each delivery mode, each reserved bit, a low vector), plus 20,000 random register pairs that decode only to what re-encodes; a model of the I/O APIC's message wiring, showing a remappable entry's message selects its IRTE through `vtd::interrupt_index` with SHV clear (and that a lowest-priority entry would set SHV and shift the index); and `agrees_with_irte`;
+  - `vtd` (1 new, 1 extended): a pin's IRTE (golden, edge and level), 10,000 random IRTEs round-trip with TM; logical destination, RH and each non-fixed delivery mode refused;
+  - `dmar` (1 new, 1 extended): QEMU's I/O APIC 0 → 0xff00; an INCLUDE_PCI_ALL unit's I/O APIC 2 → 0xf0f8; an HPET with the same ID is not one; listed by two units, or twice by one, refused; an I/O APIC behind a bridge resolves through its secondary bus, and without the bridge does not. The 12,000-case mutation soak also runs the lookup, and every I/O APIC it returns is listed exactly once, by the unit returned.
+
+  308 framekernel library tests (301 before); `cargo xtask check` (549 tests, 0 failures, 6 ignored); `boot-test`; `boot-matrix` (1, 2, 4).
+- **Unsafe:** none added. The new kernel code reaches the I/O APIC through the existing `MappedIoApic` register access and the IRTEs through the existing `iommu` page access.
+- **Not done:**
+  - the keyboard's IRQ1 to a handler (the route and the entry format are ready; the i8042 driver is not interrupt-driven yet);
+  - a level-triggered pin in a live proof (PCI INTx). The encodings and the vector rule are host-tested; the EOI path for a level-triggered remapped interrupt (an EOI broadcast that names the RTE's vector, or a directed EOI) is not exercised;
+  - more than one I/O APIC (only the first in the MADT is routed), and HPET MSIs (the DMAR's HPET scopes);
+  - the per-CPU count is indexed by x2APIC ID (`MAX_LOCAL` 64), like the rest of the kernel's per-CPU state today;
+  - **QEMU-only (§74).** The source-ID check on I/O APIC interrupts and the 0xff00 in their faults need hardware.
+- **Specifications:** Intel VT-d Architecture Specification, chapter 5 (I/OxAPIC programming, the remappable interrupt request) and chapters 7–9 (fault reasons, the IRTE, the DRHD device scope). As for the rest of the VT-d work, the Rev 5.20 PDF itself was not read (download approval pending); the layout has been stable since early revisions and QEMU's I/O APIC builds its messages from exactly these fields. **Re-check against Rev 5.20 before hardware qualification.**
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the VT-d specification (chapter 5, I/OxAPIC programming; chapters 7–9). QEMU's I/O APIC and VT-d models were read only to learn what they do with these messages. No operating system's code was read or copied (CLAUDE.md §3).
 - **Licensing:** project licence not chosen yet.
 
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
