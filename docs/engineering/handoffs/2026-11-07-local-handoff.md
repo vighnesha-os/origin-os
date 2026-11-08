@@ -1332,7 +1332,7 @@ Measuring first showed neither proof was timing the kernel. In 36,000 firings at
 
 ### Continued (2026-11-09, ~03:20–03:35 IST): the early console and the wait-queue and timer proof fixes merged
 
-On branch **`claude/interesting-carson-ae7c83`**, on the owner's word ("Yes, merge both"): merge commits `8040882` (the early console, `a96bf7b`, ADR-0010) and `31c3d39` (the wait-queue and timer proofs, `cc375ac`). **Local only: PR vighnesha-os/origin-os#2 is still at `c23e9a4`.**
+On branch **`claude/interesting-carson-ae7c83`**, on the owner's word ("Yes, merge both"): merge commits `8040882` (the early console, `a96bf7b`, ADR-0010) and `31c3d39` (the wait-queue and timer proofs, `cc375ac`). Pushed to PR vighnesha-os/origin-os#2 on the owner's word, with the PR's description updated.
 
 Both diffs were read before merging: the loader's and the kernel's changes, the SPCR parser, the framebuffer console and the screen-dump proof, the timer verdicts and the ping-pong's rule. No code conflicted, and `framekernel/src/main.rs`, the one code file both change, merged automatically. The conflicts were records only and kept both sides' facts. No bound was loosened: a timer may still be at most 2 ms late, and only a mean round trip under 2000 µs passes a run.
 
@@ -1353,6 +1353,5 @@ Both diffs were read before merging: the loader's and the kernel's changes, the 
 
 #### Open for the owner
 
-- Whether to push these commits to the PR.
 - Buying the machines ADR-0009 chose.
 - Early-boot DMA, M4 and the Loom models are still on their own branches.
