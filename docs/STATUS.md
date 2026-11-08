@@ -64,7 +64,7 @@ ADR-0002 with B7, ADR-0003, G1 and the errata readings were decided on 2026-11-0
 The owner accepted ADR-0006 (OriginFS v0, as a bring-up format that never ships in an approved release) and ADR-0008 (dense CPU indexes) on 2026-11-08.
 
 One ADR is still **Proposed**:
-- **ADR-0007**, DMA isolation and interrupt remapping (Intel VT-d and AMD-Vi). It is kernel-internal, so it is implemented and boot-proven while Proposed. The owner answered four of its eight questions on 2026-11-08; the rest are on `docs/engineering/OWNER_DECISIONS.md`.
+- **ADR-0007**, DMA isolation and interrupt remapping (Intel VT-d and AMD-Vi). It is kernel-internal, so it is implemented and boot-proven while Proposed. The owner answered all but its three AMD-Vi questions on 2026-11-08; those wait on a check of AMD's manual (`docs/engineering/OWNER_DECISIONS.md`).
 
 Also waiting on the owner: a check of the AMD IOMMU specification (48882 Rev 3.11) read from a mirror against AMD's own copy (its SHA-256 is in the AMD-Vi research ledger). Still the owner's too, because they are not design: a project licence; merging PR #1 into `main`; and, for production qualification, declaring the supported 2026+ Intel/AMD reference platforms and providing physical x86 test machines (CLAUDE.md §74, §76 — nothing is qualified on hardware until then). Details: `docs/engineering/TASKS.md`.
 

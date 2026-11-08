@@ -1059,5 +1059,5 @@ On `claude/interesting-carson-ae7c83`, **not pushed**. The table is the last sec
 #### Next
 
 - **Before real hardware:** protected memory regions (`PMEN.EPM`); the threat model's list.
-- **The owner:** items 7 and 25 on the sheet; item 23 (then 10–12); items 21, 22 and 24.
+- **The owner:** item 23 (then 10–12); items 21, 22 and 24. Items 7 and 25 were accepted on 2026-11-08.
 
