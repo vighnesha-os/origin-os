@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Required by | CLAUDE.md §58 ("Threat-model every privileged interface"), §32, §47 |
-| Covers | `framekernel/src/iommu.rs`, `iommu/amd.rs`, `dma.rs`, `vtd.rs`, `amdvi.rs`, `dmar.rs`, `ivrs.rs`; ADR-0007 |
+| Covers | `framekernel/src/iommu.rs`, `iommu/amd.rs`, `dma.rs`, `pcie.rs`, `pci.rs`, `vtd.rs`, `amdvi.rs`, `dmar.rs`, `ivrs.rs`; ADR-0007 |
 | Written | 2026-11-08, **after** the implementation. §58 and §83 step 12 expect this during design. |
 | Evidence | QEMU only. "Proven" below means a boot proof with a negative control under QEMU 11.1. Nothing has run on hardware (§74). VT-d behaviour not shown by a proof is from the specification as recalled, and needs checking against Rev 5.20. |
 

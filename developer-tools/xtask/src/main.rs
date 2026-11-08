@@ -702,7 +702,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: PCIe: ECAM for segment 0, buses 0-255, at 0x".into(),
             ": uncached true, 2 MiB pages".into(),
             "origin-kernel: PCIe: bus mastering: the firmware left it on for 7 of 7 functions (".into(),
-            "; every function reads back clear: true".into(),
+            "; every cleared function reads back clear: true".into(),
             "origin-kernel: heap: Vec of 100000 u64, 2000 boxes, B-tree of 1000 keys, a string: "
                 .into(),
             "origin-kernel: heap: everything freed; ".into(),

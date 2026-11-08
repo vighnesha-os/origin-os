@@ -287,7 +287,7 @@ pub(crate) fn quiesce(
     let cleared = q.functions.len() - q.own.len();
     let _ = write!(
         com1,
-        "origin-kernel: PCIe: bus mastering: the firmware left it on for {} of {cleared} functions ({}); every function reads back clear: {}",
+        "origin-kernel: PCIe: bus mastering: the firmware left it on for {} of {cleared} functions ({}); every cleared function reads back clear: {}",
         left_on.len(),
         Names(&left_on),
         refused.is_empty()
