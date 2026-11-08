@@ -2,6 +2,7 @@
 name = "onbf-verify"
 description = "Origin OS ONBF signature verification (ONBF §7): both signatures over the statement, digest, profile, key ID"
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

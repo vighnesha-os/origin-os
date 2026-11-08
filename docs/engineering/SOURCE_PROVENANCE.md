@@ -5,13 +5,13 @@
 | Required by | CLAUDE.md §6 |
 | Rule | One entry per original module. Automated similarity scanning cannot prove independent authorship, so this file records how each module was produced. |
 
-**Open item for the owner:** the repository has no LICENSE file yet. Every entry below therefore reads "project licence not chosen yet".
+**Licence:** MIT OR Apache-2.0, chosen by the owner on 2026-11-08 (`LICENSE-MIT`, `LICENSE-APACHE`). Third-party test data keeps its own licence, stated beside it.
 
 ## `rust-toolchain.toml`
 
 - **Content:** copied verbatim from CLAUDE.md §8 (v7.1).
 - **Author / date:** Claude (cloud session), 2026-11-07.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `developer-tools/toolchain/verify.sh`
 
@@ -28,7 +28,7 @@
   - POSIX utilities: `od`, `grep`, `sed`, `sort`, `mktemp`, `date`, `head`, plus `shasum` (macOS) or `sha256sum` (Linux) for firmware hashes.
 - **Toolchain:** bash 3.2 or later (the macOS default), and Rust 1.99.1 per `rust-toolchain.toml`.
 - **Review:** not yet independently reviewed.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 - **Test evidence.** Run on 2026-11-07 in the cloud sandbox: Linux x86-64, rustc 1.97.0, no network.
   - The syntax check passes.
   - Failure paths are reported correctly, with the expected exit codes:
@@ -70,7 +70,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `default-members` is the host `xtask` only. Freestanding crates are built for their own target through the xtask, because per-package targets are unstable in Cargo.
   - No `version` field: generated version metadata comes in T5 (CLAUDE.md §62).
 - **Dependencies:** none. `Cargo.lock` lists only workspace crates.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `boot/uefi/` (`origin-boot-uefi`), the UEFI loader, M1 steps 1 and 2
 
@@ -119,7 +119,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - OVMF reported `failed to start Boot0001 …: Unsupported`, so the returned status reached the firmware intact.
   - After T5 the banner reads `Origin OS 0.1.0-dev UEFI loader (build 0)`. `boot-test` builds the expected banner from the same generated constants, and it passes (1.8 s).
   - QEMU only. No physical hardware yet (CLAUDE.md §74).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Step 2: read, verify, place and enter the Framekernel (ADR-0002, Proposed)
 
@@ -155,7 +155,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - On the final code: `cargo xtask check` passes (702 tests, 0 failures, 6 ignored), `boot-test` passes 11 of 11, `boot-matrix` passes (Intel VT-d and AMD-Vi, each at 1, 2 and 4 CPUs), and `boot-x2apic` passes under both CPU models. With five sessions running on the same machine (load average 70–140), those boot gates also failed in kernel proofs this work does not touch, which need QEMU to keep real time: `clock failed` (`boot-matrix` once; `boot-x2apic` four times) and `timers failed` (`boot-x2apic` twice). `boot-matrix` passed on its rerun; `boot-x2apic` passed at load about 13–18, after failing at load up to about 125. In every one of those boots the loader's signature line had passed first. The RTC wait is being fixed separately (branch `claude/musing-hamilton-587f7b`).
 - **Security review:** by the author, and by one fresh reviewing agent (2026-11-08) given the code, the specification and no conclusions. It found no way to get a refused image accepted and no refusal of a valid one, and six low-severity points. Five are fixed: a scenario filter that matches nothing now fails; the signing directory is private (mode 0700, so no other user can swap a statement before OpenSSL signs it); `keygen` never overwrites any path; the self-check's documentation says what it covers (it does not repeat the loader's own `cpu_features` and boot-info limits); and a loader holding the test key does not compile with a non-zero build number. The sixth is pre-existing and recorded: the loader does not read MERKLE sections' bytes, because nothing uses them yet (`docs/research/2026-11-08-krn-signature-verification.md` §5). This is agent review, not the independent security review CLAUDE.md §59 requires for a release. What it covers: the order of checks (ONBF-R1: only the header, the table and padding are read before the signature), and what a developer-mode build can and cannot do.
 - **Not done:** OKC chains (blocked on errata O2–O5), Origin's real root and kernel keys, release signing (HSM), B7's Secure Boot first stage, anti-rollback and TPM measurement (§7.6, §8.1). SYS and other profiles have no signature policy yet.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `boot/info/` (`origin-boot-info`), the boot-info contract v0.3 (Proposed)
 
@@ -173,7 +173,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - 4 unit tests: magic, header acceptance and rejection, region-kind round trip, version source.
   - Clippy on the host, UEFI and kernel targets.
   - **No panic paths:** the kernel-target object references 0 external symbols.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `framekernel/` (`framekernel`), the Framekernel: M1 entry and M2
 
@@ -214,7 +214,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - 38 RELATIVE relocations.
   - Two clean builds in the same path were byte-identical.
   - Boot evidence is in the `boot/uefi` step 2 entry.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Higher half and KASLR (ADR-0004, accepted and implemented 2026-11-07)
 
@@ -707,7 +707,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Review:** not yet independently reviewed.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code, written from the Intel SDM, Intel's topology paper and AMD's APM (T1, T2, A1 in the ledger); no operating-system code was read or copied (CLAUDE.md §3).
 - **Commit:** `d1984cd` (code and ledger), and the records commit after it.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### CPU cache hierarchy from CPUID leaf 04h (CLAUDE.md §24, §27; 2026-11-08)
 
@@ -723,7 +723,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code, written from the classic Unix inode-filesystem design (a superblock, a fixed inode table, direct and single-indirect block pointers, linked directory entries with `rec_len`) described conceptually in the BSD FFS / ext2 lineage; no source is used (CLAUDE.md §3). Reuses the first-party `gpt::crc32` and `vfs::components`.
 - **Test evidence (2026-11-08):** 4 `originfs` tests — build→parse→list→read a directory tree (a small file, a nested file, and a 15-block+123-byte file that exercises the single-indirect block, read whole byte-exact and with a block-straddling partial read); `.`/`..` resolution; distinct `NotFound`/`BadPath`/`IsDirectory`/`NotDirectory`/`BadInode`/`Io` errors; a corrupt-superblock rejection (flipped magic byte, and a flipped CRC-covered field with a stale CRC) and a too-small device as `Io`; and a punched direct pointer reading back as a zero-filled hole. 172 library tests in all; `cargo xtask check`.
 - **Not done (ADR-0006 F6):** the write path, allocation bitmap, journalling and crash consistency (§41), double-indirect (so files are capped at ~2 MiB in v0), snapshots, permissions beyond the kind, and mounting beneath the VFS (pending owner acceptance). The CRC is the first-party IEEE CRC-32 used for internal consistency; it is not a cryptographic integrity check.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### NUMA from the ACPI SRAT (CLAUDE.md §24 NUMA topology, §28 NUMA policies; 2026-11-08)
 
@@ -734,7 +734,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code, written from ACPI 6.6 §5.2.16 (SRAT and its three x86-relevant affinity structures); no source is used (CLAUDE.md §3). Reuses the first-party `acpi` table-checking (`check_table`, `xsdt_entries`) and `firmware::acpi_table`.
 - **Test evidence (2026-11-08):** 2 new `acpi` tests — a two-node SRAT with type-0, type-2 and type-1 structures (the 32-bit type-0 domain split, a present-but-disabled CPU, an x2APIC affinity, 64-bit memory base/length, hot-plug/NV flags, and an unknown type skipped), and malformed/overflow rejection (a short type-0, a length running past the table, a full buffer → `TooManyEntries`, and a short type-1). 9 `acpi` tests and 174 library tests in all; `cargo xtask check`; `boot-test`; `boot-matrix` (1, 2, 4) and an 8-CPU boot; the negative control above.
 - **Not done:** using the affinities for memory-allocator placement and scheduler locality (§27, §28, §66) — this is the discovery half; a NUMA-aware frame allocator and placement policy come next. The SLIT inter-node distance matrix is parsed (below); the HMAT memory-latency table is not.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### NUMA distances from the ACPI SLIT (CLAUDE.md §27 migration cost, §28 NUMA policies; 2026-11-08)
 
@@ -745,7 +745,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from ACPI 6.6 §5.2.17; no source used (CLAUDE.md §3). Reuses the `acpi` table-checking and `firmware::acpi_table`.
 - **Test evidence (2026-11-08):** 2 `acpi` tests — a 2-locality `[10,21,21,10]` matrix and a 3-locality asymmetric matrix round-tripped cell for cell with out-of-range `distance` returning `None`; a truncated matrix and a `u64::MAX` locality count both refused as `Length`. 11 `acpi` tests and 176 library tests in all; `cargo xtask check`; `boot-test`; `boot-matrix` (1, 2, 4) and an 8-CPU boot; the negative control above.
 - **Not done:** using the distances to order NUMA-aware placement and migration decisions (§27, §66); the HMAT table (bandwidth/latency) is not parsed.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### NUMA locality map (CLAUDE.md §27, §28, §66; 2026-11-08)
 
@@ -755,7 +755,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3), building only on the first-party `acpi` types.
 - **Test evidence (2026-11-08):** 4 `numa` tests — CPU and address lookup (a disabled affinity and an unlisted/unmapped address return `None`, a range is half-open), distance ordering from two different origin nodes with a capped output buffer, stable ordering of equal distances, and a broken SLIT (a remote node closer than self) failing `self_is_nearest`. 180 library tests in all; `cargo xtask check`; `boot-test`; `boot-matrix` (1, 2, 4); the negative control above.
 - **Not done:** wiring the map into the frame allocator (local-node-first allocation) and the scheduler (locality-aware placement/migration, §66) — the map is the decision layer; the allocator and scheduler changes that consume it come next.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Streaming UTF-8 decoder for the text engine (CLAUDE.md §51; 2026-11-08)
 
@@ -764,7 +764,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the Unicode 18.0 well-formed byte-sequence table (§3.9, Table 3-7) and the recommended U+FFFD substitution (TR#36 / the WHATWG Encoding rule); no implementation source is used (CLAUDE.md §3), and no Unicode data tables are needed (the rules are expressed as byte-range constraints).
 - **Test evidence (2026-11-08):** 5 `text` tests. Besides the hand-written cases (every sequence length and the U+0080/07FF/0800/FFFF/10000/10FFFF boundaries; overlong, surrogate, over-max, stray-continuation, truncated and bad-continuation rejection with the exact `Incomplete`/`Invalid` lengths; lossy substitution), an oracle test runs 20 000 biased-random byte strings through both `validate` and `core::str::from_utf8` and asserts they agree on validity, `valid_up_to` and `error_len`, and that `chars_lossy` equals `String::from_utf8_lossy` and, for valid input, `str::chars` — a byte-exact equivalence to the standard library's decoder, used only as a test oracle (CLAUDE.md §4/§5). 185 library tests in all; `cargo xtask check`. Host-only, so no boot proof or negative control (there is no boot path to break; the std oracle is the control).
 - **Not done:** grapheme-cluster and word segmentation (UAX #29), line breaking (UAX #14), normalization, bidi and shaping (§51) — this is the byte→scalar layer those build on; UTF-16/UTF-32 transcoding; and East Asian width. These need Unicode property data (permitted infrastructure, §4) with provenance, added when the segmentation work lands.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Gap buffer for editable text (CLAUDE.md §51 text editing, caret movement; 2026-11-08)
 
@@ -773,7 +773,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); the gap-buffer technique is textbook, no source used.
 - **Test evidence (2026-11-08):** 4 `editbuffer` tests. Besides the hand-written cases (ASCII editing with backspace/forward-delete at both ends; a non-ASCII string — `café ∀😀` — edited mid-string with scalar-correct lengths and `get`; caret clamping and mid-gap insertion), a model-based test runs 50 000 random operations (insert, both deletes, both moves, jump-to) against a `Vec<char>` + cursor oracle and asserts the text length and caret match after **every** operation, then the whole text and every position at the end. 189 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the oracle is the control).
 - **Not done:** selection ranges, undo/redo, line-aware operations, and grapheme-granular movement (needs UAX #29). Wiring it into a terminal line editor or a text-field control comes with the UI milestone (§50).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Hardware entropy source: RDSEED/RDRAND with bounded retries (CLAUDE.md §59; 2026-11-08)
 
@@ -785,7 +785,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence (2026-11-08):** 5 `entropy` tests over a scripted mock source — `draw` stops at the first success, counts exactly `retries + 1` attempts, and gives up with `None`; `fill` writes a partial final chunk from a word's low bytes (one draw per 8-byte chunk), fails cleanly when the source dies mid-buffer, and an empty fill makes no attempt. 194 library tests in all; `cargo xtask check`; `boot-test`; `boot-matrix` (1, 2, 4); the negative control above.
 - **Unsafe:** two inline-asm blocks (`cpu::rdrand`, `cpu::rdseed`), each a single instruction + SETC writing only a register and the carry flag, CPUID-gated, with SAFETY notes; neither is `pure`.
 - **Not done:** a DRBG for a reseedable stream (§59), wiring entropy into user-process ASLR, stack canaries and TCP ISN (§54, §58), and a health/continuous test (SP 800-90B). The loader's KASLR entropy stays separate for now.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Glob pattern matching (CLAUDE.md §39; 2026-11-08)
 
@@ -794,7 +794,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); POSIX `fnmatch`-style semantics, standard algorithm, no source used.
 - **Test evidence (2026-11-08):** 6 `glob` tests — literals and `?` (exactly one, never `/`); stars (empty, extensions, no crossing `/`, collapsed runs, `src/*/*.rs`); classes (sets, ranges, double ranges, `!`/`^` negation, literal leading `]` and trailing `-`, never `/`, unterminated `[` as a literal); escaping of `*`/`?`/`[]` and inside a class; Unicode (`café`, a Greek range) and the `filter` helper; and a pathological-backtracking case (`*a*a*…*b` on 64 `a`s) that must terminate with the right answer. 200 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the cases are the control).
 - **Not done:** `**` (crossing `/`), brace expansion `{a,b}`, case-insensitive matching, and a directory-walk that applies a multi-segment pattern against the VFS. These are callers of `matches`, added with the shell/package work.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### IPv4 longest-prefix-match routing table (CLAUDE.md §54 routing; 2026-11-08)
 
@@ -803,7 +803,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); the LPM bit-trie is textbook, no source used.
 - **Test evidence (2026-11-08):** 4 `route` tests — most-specific wins (default < /8 < /16 < /24), no default means no match, host bits ignored and re-insert replaces plus a /32 host route; and an **oracle test** building 2 000 random tables (up to 24 routes, lengths 0–32, a crowded prefix space so nesting and collisions are common) and checking `lookup` against a brute-force longest-match scan over 30 random addresses each — the trie must agree with the reference on every (table, address). 204 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the brute-force scan is the control).
 - **Not done:** route deletion and prefix aggregation, path-compressed (Patricia) nodes for memory, ECMP, metrics/administrative distance, IPv6 (a 128-bit trie), and wiring it into an IP forwarding/output path with ARP/NDP next-hop resolution (§54).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### DNS message parsing with bounded name decompression (CLAUDE.md §54 DNS; 2026-11-08)
 
@@ -813,14 +813,14 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 1035 §4; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `dns` tests — a round-trip (a no-compression builder writes a response with a question, an A record and a CNAME; parse recovers the header flags/rcode, the names, the A address and the CNAME target) which **caught a real rdlength offset bug** (read at `pos+8`, not `pos+6`); a backward compression pointer (an answer whose name points to the question) resolved correctly; hostile/truncated names refused (a self-pointer, a forward pointer, a label past the end, a short header — all `None`); and a 50-deep chain of strictly-backward pointers that must terminate at the root. 208 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the round-trip and the malformed cases are the control).
 - **Not done:** a message builder/encoder for sending queries (the test builder is minimal and test-only), EDNS(0), DNSSEC, the full record-type set, and wiring into a resolver with UDP/TCP transport and a cache (§54).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Mutation soaks for the new parsers, and a `read_whole` allocation cap (CLAUDE.md §72; 2026-11-08)
 
 - **What:** seeded "never panics on mutated input" soaks (the existing `crate::testing` `Rng`/`mutate`/`cases` harness, scaled by `ORIGIN_MUTATION_SCALE`) for the untrusted-input parsers added this run: `acpi::srat_and_slit_mutations_never_panic` (SRAT and SLIT, 10 000 cases × 2 bases), `dns::mutations_never_panic` (`parse` and `read_name` over 20 000 mutated messages), and `originfs::mutations_never_panic` (4 000 mutated images through `Fs::open`, `entries`, `read_whole`, `read_file` and `resolve`). All parse paths use `.get`/checked arithmetic, so arbitrary bytes yield `Ok`/`Err`, never a panic.
 - **Hardening found by the soak:** `originfs::Fs::read_whole` allocated `inode.size` bytes from the on-disk inode; a mutated (or malicious) inode with a huge `size` would drive an unbounded allocation (an abort). It now refuses a size beyond what v0 can address (12 direct + 512 single-indirect blocks, ~2 MiB) with `OutOfRange` before allocating. `read_file` was already bounded by the caller's buffer, and `entries` by the 524-block addressing limit.
 - **Test evidence (2026-11-08):** the three soaks pass at scale 1 and at `ORIGIN_MUTATION_SCALE=10` (≈340 000 parser cases); 211 library tests in all; `cargo xtask check`.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Fixed-size bit allocator (CLAUDE.md §40 allocation bitmap, §29 resource allocation; 2026-11-08)
 
@@ -829,7 +829,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); standard bitmap technique, no source used.
 - **Test evidence (2026-11-08):** 4 `bitmap` tests — lowest-free allocation with reuse after a free; filling exactly `len` bits across a partial final word (every index once, no padding bit, then full); `set`/`get` tracking the free count and out-of-range no-ops; and a model-based test running 60 000 random `alloc`/`set`/`clear`/`get` operations against a `[bool; 200]` oracle (spanning three words with a partial last), asserting `alloc` returns the lowest free index and the free count matches after every op. 215 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the oracle is the control).
 - **Not done:** multi-bit (contiguous run) allocation for extents, a hint/cursor to avoid rescanning from 0, and a two-level summary for very large maps. Wiring into OriginFS's (future) write path and a pid/handle allocator.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### ustar (tar) archive reader (CLAUDE.md §21 initial deployment, §46 package parsing; 2026-11-08)
 
@@ -838,7 +838,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the POSIX ustar header layout; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `ustar` tests — a builder round-trip (a regular file, a directory, and a >512-byte file in a subdirectory via the `prefix` field, checking names, sizes and bytes across block padding); rejection of a flipped checksum, corrupt magic, a short header (`Truncated`), and a size running past the archive (`BadSize`); stopping at the zero block with trailing garbage ignored; and a 20 000-case mutation soak (`parse` over mutated archives never panics). 219 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the round-trip, the malformed cases and the soak are the control).
 - **Not done:** pax/GNU extended headers (long names, large sizes, xattrs), symlink/hardlink target handling beyond the type flag, writing archives, and extracting into the VFS (§21/§46).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### UTF-16 transcoding (CLAUDE.md §51; UEFI/CHAR16 interop; 2026-11-08)
 
@@ -847,7 +847,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the UTF-16 surrogate rules (Unicode 18.0 §3.9); no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `utf16` tests — BMP and supplementary scalars encode/decode (incl. the U+FFFF and U+10FFFF boundaries); lone/incomplete/mis-ordered surrogates rejected with the right `Incomplete`/`Invalid`; `encode_str_into` reports a too-small buffer; and an oracle test over six mixed-script samples (and four deliberately broken unit streams) asserting `encode_str_into` equals `str::encode_utf16`, a valid stream round-trips, and `decode_lossy` equals `char::decode_utf16` mapped to U+FFFD — byte-exact agreement with std. 223 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the std oracle is the control).
 - **Not done:** little/big-endian byte-order handling and BOM detection (this works on `u16` units, not bytes), and UTF-32. Wiring into the loader's existing CHAR16 handling.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Fixed-capacity ring buffer (CLAUDE.md §56 input queues, §55 audio, §69 log retention; 2026-11-08)
 
@@ -856,7 +856,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); standard circular-buffer technique, no source used.
 - **Test evidence (2026-11-08):** 5 `ring` tests — FIFO order and fullness (push refused when full, room after a pop); `force_push` dropping the oldest; capacity clamped to 1 and `clear`; and a model-based test running 80 000 random `push`/`force_push`/`pop`/`peek` against a `VecDeque` with the same bounded drop-oldest policy, asserting the returned/dropped values, `len` and `is_full` match after every operation. 227 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the oracle is the control).
 - **Not done:** a lock-free single-producer/single-consumer variant for the IRQ-handler/consumer split (this one is `&mut`-synchronised by its holder's lock), bulk push/pop, and wiring into the i8042 keyboard IRQ and a kernel log.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### initramfs: extracting a ustar archive into the VFS (CLAUDE.md §21; 2026-11-08)
 
@@ -868,7 +868,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Boot proof** (every boot): the kernel includes a small committed ustar image (`framekernel/assets/initramfs.tar`, built deterministically by hand-written header bytes, validated by system `tar` and this reader) and `prove_initramfs` extracts it into a fresh VFS, then reads `/etc/hostname` back and confirms `/boot/banner.txt` exists even though the archive never lists a `boot/` directory: `origin-kernel: initramfs: 4 entries into the VFS; /etc/hostname true, implicit /boot dir true; consistent true` at `-smp` 1/2/4. This proves `ustar` + `initramfs` + `vfs` end-to-end in the kernel on a real image. Gated marker; `: initramfs failed` is a failure marker.
 - **Negative control:** changing the kernel's expected entry count (`n == 4` → `n == 5`) makes the line read `consistent false: initramfs failed` and `cargo xtask boot-test` fails (exit 1); restored, it passes.
 - **Not done:** symlink/hardlink/device entries, file permissions and mtimes, streaming extraction for a large image, and loading the initramfs over the real block device/filesystem rather than an embedded demo image.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### DHCP client: message build/parse and the lease state machine (CLAUDE.md §54 DHCP; 2026-11-08)
 
@@ -877,7 +877,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 2131/2132; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `dhcp` tests — a full DISCOVER→OFFER→REQUEST→ACK exchange (the client's DISCOVER fields and options, the REQUEST it sends for the offered address with the server id, and the bound lease's address/mask/router/DNS/lease-time); wrong-`xid` and out-of-state (an early ACK) replies ignored, plus garbage/empty input ignored without panic; a NAK restarting to INIT with no lease; and a 20 000-case mutation soak over `parse` and `on_receive`. 234 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the scripted exchange and the soak are the control).
 - **Not done:** the renewing/rebinding (T1/T2) timers and lease expiry, retransmission/backoff, DECLINE after an ARP conflict check, RFC 3927 link-local fallback, and wiring onto a real UDP socket and NIC (§54).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### DEFLATE decompression (RFC 1951; CLAUDE.md §17 compression, §46 package payloads; 2026-11-08)
 
@@ -887,7 +887,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 1951; the algorithm and constants are the public specification, no source copied.
 - **Test evidence (2026-11-08):** 4 `deflate` tests. The vectors are **known-answer vectors**: raw DEFLATE produced by Python's `zlib` (`wbits=-15`), each the compression of a plaintext the test reconstructs — the implementation is independent of them (CLAUDE.md §72). `inflates_reference_vectors` covers the empty stream, a fixed-Huffman block, a back-reference block (`abc`×40), a level-0 stored block (300 zeros) and a long-back-reference block (300 zeros); `a_dynamic_block_round_trips` decodes a **dynamic-Huffman** block (`lorem`×8, 992 bytes → 104, verified `BTYPE=2`) exactly, exercising the code-length-code table and the length RLE; `rejects_malformed_and_bombs` refuses empty, reserved-block-type, bad-`NLEN` and over-the-cap streams; `adler32_known_values` checks the Adler-32 of `""` and `"Wikipedia"`; `zlib_and_gzip_wrappers` decompresses a real Python-`zlib.compress` stream and a `gzip.compress` stream (verifying their Adler-32 and CRC-32/ISIZE trailers) and rejects corrupted trailers and bad headers; and a 20 000-case mutation soak over the reference streams and arbitrary bytes — through `inflate`, `zlib_decompress` and `gzip_decompress` — never panics. 240 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the zlib/gzip vectors and the soak are the control).
 - **Not done:** a `deflate` *compressor* (the project needs only decompression for reading packages/images), and the eventual Zstandard decoder (§17 names it as the target). CAVP-style NIST validation does not apply (this is not cryptographic); the zlib/gzip differential vectors are the validation.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Base64 encode/decode (RFC 4648; CLAUDE.md §59 PEM/tokens; 2026-11-08)
 
@@ -896,7 +896,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 4648; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `base64` tests — the **RFC 4648 §10 vectors** (`""`, `f`, `fo`, `foo`, `foob`, `fooba`, `foobar`) encoded and decoded both ways; whitespace tolerance (a PEM-style wrapped body with newlines/spaces/tabs); rejection of a short length, a character after padding, over-padding, an invalid character, misplaced padding, and the URL-safe `-_` alphabet; and a round-trip over arbitrary byte strings of every length 0–199 (output always a multiple of four). 244 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the RFC vectors and the round-trip are the control).
 - **Not done:** the URL-safe alphabet (`-_`) and no-padding variants (RFC 4648 §5), Base32/Base16, and streaming (incremental) codecs.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### JSON parser (RFC 8259; CLAUDE.md §23 config, §46 manifests, §49 SDK; 2026-11-08)
 
@@ -906,7 +906,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 8259; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 5 `json` tests — a full document (nested objects/arrays, a kept number text, `as_i64`/`as_str`/`get`, and `é`+a `😀` surrogate pair decoding to `café 😀`); scalars and edge numbers (`0`, `-0`, a 12-digit integer, empty string/array/object); rejection of 16 malformed inputs (unterminated, trailing comma, missing value/colon, leading zero, bare `-`/`1.`/`1e`, bad escape, unescaped control, trailing garbage, lone high surrogate); a 10 000-deep nesting refused without overflow (and just-under-the-limit accepted); and a 20 000-case mutation soak. 249 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the documents and the soak are the control).
 - **Not done:** a serializer, `f64`/decimal interpretation of non-integer numbers (needs a `no_std` float parser), duplicate-key policy, and JSON5/JSONC extensions.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Semantic versioning (semver.org 2.0.0; CLAUDE.md §46 dependency resolution; 2026-11-08)
 
@@ -915,7 +915,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the semver.org 2.0.0 specification; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `semver` tests — field/prerelease/build parsing with build-metadata equality; rejection of 14 malformed strings (too few/many fields, leading zeros, non-digits, empty/underscore prerelease, a bare `-`, a leading `v`, trailing space); the **canonical semver.org §11 precedence chain** (`1.0.0-alpha` < `-alpha.1` < `-alpha.beta` < `-beta` < `-beta.2` < `-beta.11` < `-rc.1` < `1.0.0`) plus core precedence, prerelease-below-normal, numeric-below-alphanumeric and build-ignored; and sorting a list into precedence order. Three more cover the requirement matcher — caret/tilde/range/exact (`^1.2.3`, `^0.2.3`, `^0.0.3`, `~1.2.3`, `>=1.0.0, <2.0.0`, `=1.2.3`, bare), the prerelease gate (a prerelease never matching a normal requirement, even at a range boundary, and matching only when opted in via a same-core prerelease comparator), and rejection of 8 malformed requirements. 260 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the spec chain is the control).
 - **Not done:** wiring into a package dependency resolver (§46) — this is the comparator and matcher the resolver will call; the resolution algorithm (selecting a consistent set across a dependency graph) is the next step.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### String-keyed hash map (CLAUDE.md §29 resource tables, §30 handle lookup; 2026-11-08)
 
@@ -924,7 +924,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); FNV-1a is the published non-cryptographic hash, standard open addressing.
 - **Test evidence (2026-11-08):** 4 `hashmap` tests — the FNV-1a **known-answer values** (`""`, `"a"`, `"foobar"`, verified against the FNV spec); insert/get/remove with replace-returns-old and a tombstone not hiding a later key; 500 inserts then 250 removes then 250 reinserts, exercising tombstone reuse across several grows; and a model-based test of 50 000 random `insert`/`remove`/`get` against a `BTreeMap` oracle over a small (collision-heavy) key space, asserting the returned values and `len` match throughout, then that every live entry agrees. 257 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the oracle is the control).
 - **Not done:** a generic key type (this is `String`-keyed; a `Hash`-like trait would generalize it), a keyed hash to resist collision-flooding from untrusted keys (SipHash, which needs its own test vectors and review, §58/§59), backward-shift deletion to avoid tombstone buildup, and adopting it inside `vfs`/`handles`.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Bounded kernel log buffer (CLAUDE.md §69 structured logging and failure records; 2026-11-08)
 
@@ -933,7 +933,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `klog` tests — retaining the most recent N records and dropping the oldest (with the drop and total counts, and the kept lines in order); levels and messages recorded and read back; a long multi-byte message truncated on a UTF-8 boundary (valid, no split scalar, the exact scalar count that fits); and capacity-one keeping only the latest. 264 library tests in all; `cargo xtask check`. Host-only groundwork — **not yet wired to the console or `/sys`** (that integration touches the boot output path and is a separate, careful change).
 - **Not done:** teeing the kernel console into the log, exposing it through `/sys`, a global logger behind a lock, and persisting the buffer across a panic for crash diagnostics (§69).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### virtio split virtqueue (virtio 1.1 §2.6; CLAUDE.md §31 driver framework, §54; 2026-11-08)
 
@@ -942,7 +942,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the virtio 1.1 specification; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `virtqueue` tests — descriptor LE round-trip at the right offset; the free list; `add_chain` linking two buffers with the correct `F_NEXT`/`F_WRITE` flags and refusing an over-large request without leaking; and a full driver↔device round trip over the three byte-buffer rings (post a TX chain and an RX writable buffer, a mock device completes both in the used ring, the driver reaps and returns every descriptor to the free list). 268 library tests in all; `cargo xtask check`. Host-only so far; the kernel device bring-up and its boot proof are the next step.
 - **Not done:** indirect descriptors (`F_INDIRECT`), event-index (`used_event`/`avail_event`) suppression, and the kernel integration (mapping the rings as DMA, programming their physical addresses into a device). Those land with virtio-net.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### virtio device negotiation and virtio-net structures (virtio 1.1; CLAUDE.md §31, §54; 2026-11-08)
 
@@ -951,7 +951,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the virtio 1.1 spec; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 5 `virtio` tests — feature negotiation (intersection, VERSION_1 required, never accepting an unasked feature); config parsing per accepted feature (mac/status/mtu read, link-up derived, fields left `None` when their feature is off even though the bytes exist, and a truncated config refused without panic); the net-header round trip (plain and offload-flagged); distinct status bits; and `find_caps` discovering the four virtio structures (bar/offset/length and the notify multiplier) from a mock capability list, and finding nothing when the capabilities bit is clear. 273 library tests in all; `cargo xtask check`. Host-only; the kernel driver and its boot proof are next.
 - **Not done:** the full receive datapath and the control virtqueue / multiqueue (the bring-up and a transmit are done — below).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### virtio-net kernel driver: bring-up, ARP, a live DHCP lease, and an interrupt-driven receive thread (kernel; CLAUDE.md §25, §26, §31, §54; 2026-11-08)
 
@@ -963,7 +963,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence (2026-11-08):** the boot proof and the controls above; `boot-matrix` at `-smp` 1/2/4; the transport, device, Ethernet/ARP/IP/UDP and DHCP logic are host-tested in `virtqueue` (4), `virtio` (5), `net` and `dhcp` (4). 273 framekernel host library tests; `cargo xtask check`; `boot-test`.
 - **Not done:** a general send/receive socket API and a receive service other code calls (the receive thread here runs one fixed datapath and exits); DHCP retransmission, timeouts and lease renewal; the control virtqueue and multiqueue; and routing real traffic on the lease (ping, DNS). (Transmit — a recycled descriptor ring with TX-completion interrupts — has its own entry below.) **QEMU-only; no physical NIC qualification (§74).**
 - **Unsafe:** volatile MMIO reads/writes over the mapped BAR (`r8`/`w8`/… ) and the MSI-X table writes (inside the table, bounds-checked against its BAR), and `core::slice::from_raw_parts_mut` views over the kept-forever DMA pages, each documented; DMA is cache-coherent on x86 and a `SeqCst` fence orders the ring writes before the notify. The hand-off to the thread is a `SpinLock<Option<Setup>>` taken with interrupts disabled; results return through atomics with `RX_DONE` stored last (Release) and read first (Acquire).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### virtio-net transmit ring: recycled descriptors, batched kicks, TX-completion interrupts (kernel; CLAUDE.md §31, §54; 2026-11-08)
 
@@ -982,7 +982,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence (2026-11-08):** the boot proof and the two controls; `boot-matrix` at `-smp` 1/2/4; `virtqueue`'s 4 host tests still pass with the barrier; `cargo xtask check`; `boot-test`.
 - **Not done:** freeing the ring (it lives for the boot); larger and multi-descriptor (scatter-gather) frames — each frame must fit one page behind the header; event-index notification suppression (`VIRTIO_F_EVENT_IDX`) to cut interrupts; and a transmit API for other kernel code (the datapath here is fixed). **QEMU-only (§74).**
 - **Unsafe:** none new beyond the existing documented volatile MMIO and DMA-page views; the TX buffers are kept-forever DMA pages, and a buffer is rewritten only while its descriptor is free.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### virtio-net: traffic on the lease — pinging the gateway (kernel; CLAUDE.md §54; 2026-11-08)
 
@@ -992,7 +992,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Negative control:** each request sent with its **ICMP checksum corrupted** (one byte flipped) fails `cargo xtask boot-test` (exit 1): slirp verifies the checksum and drops the requests, so no reply arrives — the receive line shows only the 3 MSI-X interrupts of ARP and DHCP instead of 7 — the thread sleeps on the first reply, never finishes, and the boot fails through the boot flow's bounded wait (`consistent false`). This shows the gateway really checks what we send (so the normal path's checksums are right) and that a pass depends on real replies. Restored, it passes.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 792 (ICMP echo), RFC 791 (IPv4) and RFC 894 (IPv4 over Ethernet), on the existing `net` library.
 - **Not done:** answering ARP requests and echo requests addressed to us (slirp learned our MAC from our own ARP request and DHCP, so it never had to ask); a timeout per reply (a lost reply leaves the thread asleep until the boot flow's bounded wait gives up); and anything beyond the gateway (routing through it, DNS). **QEMU-only (§74).**
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### TFTP reader (`tftp`), receive-buffer recycling, and a file over the lease (library + kernel; CLAUDE.md §21, §54; 2026-11-08)
 
@@ -1005,7 +1005,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 1350 (TFTP), RFC 768 (UDP) and virtio 1.1 §2.7 (returning buffers to the available ring).
 - **Using the fetched file (added the same morning):** the completed download moves out of the reader (`Download::into_data`) to the boot flow through a one-slot hand-off (`FETCHED`), which unpacks it as an initramfs into a fresh VFS and reads it back — the first filesystem content the OS takes from the network. The checks are shared with the embedded-image proof (`check_initramfs` in `main.rs`: four entries, `/etc/hostname` reads `origin-os\n`, and `/boot/banner.txt` resolves although the archive never lists `/boot/`), so both are judged by exactly the same rules; the embedded proof's output is unchanged. Boot proof: `virtio-net initramfs: the fetched image extracted into a fresh VFS: 4 entries; /etc/hostname true, implicit /boot dir true; consistent true`. **Negative control:** one byte of the *downloaded* buffer flipped before unpacking — the TFTP line still reports the download identical (the corruption comes after it), but the first ustar header's checksum no longer matches and extraction refuses the archive: `0 entries; /etc/hostname false, implicit /boot dir false; consistent false` (the network proof reads the fetched bytes, not the embedded copy). Restored, it passes.
 - **Not done:** retransmission and timeouts (a lost block leaves the reader waiting; slirp does not lose packets here); option negotiation (RFC 2347 block size and transfer size); writing (WRQ); and mounting or booting from fetched content (it is unpacked and checked, then dropped) or the update path. **QEMU-only (§74).**
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### virtio-net: reply timeouts (kernel; CLAUDE.md §54, §69 diagnostics; 2026-11-08)
 
@@ -1015,7 +1015,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Negative controls:** (A) echo requests sent with a corrupted ICMP checksum, which slirp drops — the run now fails fast and says why: `virtio-net ping: … 0 of 4 echo replies …; timed out after 2000 ms waiting for the reply to echo request 1; consistent false`, while the receive and transmit lines before it stay `consistent true`, and the datapath went on to fetch the whole file (20 frames sent, 13 receive interrupts: ARP, DHCP and the ten TFTP blocks); the failing boot took 16 s in all instead of stalling on the 10 s bound. (B) The receive interrupt counted but **waking nobody** — each receive now ends only at its 2 s deadline, so the thread crawls (`slept 5, woken by the NIC's interrupt 0 (of 12 MSI-X interrupts …)`) and cannot finish inside the boot flow's bound: `consistent false`. This replaces the earlier permanent sleep as that control's outcome: the receive still depends on the interrupt to make timely progress, and the count of interrupt wake-ups (0 here) is part of the proof.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. On the kernel's `wait::WaitQueue::wait_until_deadline` and `sched::block_until`.
 - **Not done:** retransmitting an echo request (DHCP and TFTP retransmit, see the next entries); backoff; per-step timeouts other than one constant. **QEMU-only (§74).**
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### TFTP retransmission, with a loss injected on every boot (kernel; CLAUDE.md §54; 2026-11-08)
 
@@ -1025,7 +1025,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Negative control:** a single attempt (no retransmission) with the same injected loss fails `cargo xtask boot-test` (exit 1): `0 bytes in 0 blocks, incomplete; 0 retransmitted …; timed out after 1 attempts of 500 ms waiting for TFTP block 1; consistent false` — the retransmission is what recovers the file. Restored, it passes.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. From RFC 1350 §2 (timeouts and retransmission) and RFC 768 (the UDP checksum the server verifies).
 - **Not done:** an adaptive timeout (RFC 1123 §4.2.3.2) and backoff. The "Sorcerer's Apprentice" problem (RFC 1123 §4.2.3.1) is a sender's: a sender must not retransmit DATA on a duplicate ACK. This reader acknowledges each duplicate block once, as RFC 1350 expects, and retransmits only on a timeout, but its behaviour against a server prone to that problem is not tested. **QEMU-only (§74).**
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### DHCP retransmission, with a lost DISCOVER injected on every boot (kernel; CLAUDE.md §54; 2026-11-08)
 
@@ -1035,7 +1035,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Negative control:** a single attempt with the same injected loss fails `cargo xtask boot-test` (exit 1): `DHCP lease 0.0.0.0 (0 retransmitted …); … timed out after 1 attempts of 500 ms waiting for a DHCP reply; consistent false` — without the retransmission there is no lease. Restored, it passes.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. From RFC 2131 §4.1 (retransmission) and RFC 768.
 - **Not done:** the backoff and the `secs` field RFC 2131 describes; renewal (T1/T2). **QEMU-only (§74).**
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### The ACPI DMAR and VT-d encodings (`dmar`, `vtd`; library; CLAUDE.md §16, §32, §72; 2026-11-08)
 
@@ -1077,7 +1077,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - 20,000 random fault registers decode without panicking.
 - **Not done:** scalable-mode structures (PASID tables, first-level entries), large-page mappings, device-TLB descriptors, posted-interrupt IRTEs, the SATC/SIDP structures beyond skipping them, and a Kani proof of the parser (§73).
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the specification. QEMU's device model was read only to learn what it emulates. No operating system's IOMMU code was read or copied (CLAUDE.md §3).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Intel VT-d DMA and interrupt remapping (`iommu`, `dma`; kernel; CLAUDE.md §31, §32, §58; ADR-0007 Proposed; 2026-11-08)
 
@@ -1148,7 +1148,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - **No CPU with an APIC ID above 255 exists in the test configuration.** The kernel indexes per-CPU state by APIC ID with `MAX_CPUS` 64, so delivery to one is shown by the IRTE encoding, not by a live interrupt. Decoupling CPU index from APIC ID is a separate task. *(Done 2026-11-08: see "CPU indexes and processors above x2APIC ID 255" below; `cargo xtask boot-x2apic` delivers NVMe MSI-X to APIC ID 256 live.)*
   - **QEMU-only (§74).**
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the VT-d specification and virtio 1.1 §6.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### CPU indexes and processors above x2APIC ID 255 (`cpumap`; `cpu`, `smp`, `sched`, `tlb`, `storage`, `virtionet`; library + kernel; CLAUDE.md §24, §32; ADR-0008 Proposed; 2026-11-08)
 
@@ -1221,7 +1221,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - I/O APIC destinations are still 8-bit physical (`ioapic`). They go to the boot processor until I/O APIC entries go through IRTEs;
   - **QEMU-only (§74).**
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the Intel SDM (x2APIC, MSI address format), ACPI 6.6 §5.2.12 and §5.2.16, and VT-d (IRTE destination with EIME).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### AP start-up: parking an AP that misses its handshake (`apstart`; `smp`; library + kernel; CLAUDE.md §24, §72; ADR-0008 C7 Proposed; 2026-11-08)
 
@@ -1288,7 +1288,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - The drill covers only the first AP.
   - **QEMU-only (§74).**
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the Intel SDM (MP initialization, the ICR's INIT and start-up delivery modes).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### The PAT and global-page checks count online processors only (`cpu`, `tlb`, `pcie`; kernel; CLAUDE.md §24, §69; ADR-0008 C2 and C7; 2026-11-08)
 
@@ -1402,7 +1402,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `amdvi` (7): capability, EFR and EFR2 decoding with the base registers; DTE round-trips and refusals; the walker (sharing, permissions, double maps, skipped levels, exhaustion) and a 20,000-step model check against a map; both IRTE formats and the messages; every command's encoding; event decoding (QEMU's form too) and 20,000 random entries.
 - **Not done:** guest translation (GCR3 tables, PASIDs), guest virtual APIC IRTEs (GuestMode 1), 2048-entry interrupt tables, device-table segmentation, PPR and GA logs, large-page mappings, and a Kani proof of the parser (§73).
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the specification. QEMU's device model was read and driven only to learn what it emulates. No operating system's IOMMU code was read or copied (CLAUDE.md §3).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### AMD-Vi DMA and interrupt remapping (`iommu::amd`, `iommu`; kernel; CLAUDE.md §31, §32, §58; ADR-0007 Proposed; 2026-11-08)
 
@@ -1462,7 +1462,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - the event-log interrupt; guest translation, guest virtual APIC, ATS, PPR; 2048-entry interrupt tables; device-table segmentation; hot-plug; freeing IOVAs and table pages;
   - **QEMU-only (§74).** Hardware qualification must require the IOVA in the fault record and the interrupt fault event, which QEMU 11.1 cannot show.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the AMD IOMMU specification.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Parser hardening: seeded mutation soaks over every firmware and device parser (`acpi`, `pci`, `nvme`, `gpt`, `rtc`, `hpet`, `numa`, `virtio`, `virtqueue`, `cache`, `topology`, `clock`, `features`, `boot`, `ustar`, `initramfs`, `originfs`, `net`, `tcp`, `dhcp`, `dns`, `tftp`, `deflate`, `ps2`, `vtd`, `amdvi`; `storage`, `virtionet`, kernel; library + kernel; CLAUDE.md §13, §72; 2026-11-08)
 
@@ -1524,7 +1524,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - A negative control for each of the 13 library fixes and the checks the kernel shares with them (28 controls: each fix reverted alone in a scratch copy, its regression test or soak failing as it should). The first run showed three soaks too shallow to find their bug (MSI-X and virtio capabilities at the top of the capability area, a directory's size field); those soaks were strengthened until each caught it.
   - `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d and AMD-Vi) and `cargo xtask boot-matrix` (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs) pass. The `framekernel` library tests take 1.0 s (0.92 s before); `cargo xtask check` is about 25 s incremental.
 - **Not done:** coverage-guided fuzzing (nightly-only, §12) and Kani bounds (§73); the malformed-device paths above need a fault-injecting device model or hardware (§74). (The multi-fault soak over the ONBF parsers, listed here at the time, has since been done: see its entry under `onbf-format`.)
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
@@ -1536,7 +1536,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Dependencies:** `core` only. `no_std`; the no-panic lints are denied outside tests. One `unsafe impl Sync` and two `unsafe` blocks (the guard's `Deref`/`DerefMut`), each with a SAFETY argument.
 - **Test evidence (2026-11-07):** 3 host tests with real threads: 8 × 20,000 non-atomic increments under the lock (exact total), a writer/reader pair that never sees a torn two-field update, re-locking after a drop. Clippy on the host, UEFI and kernel targets; the no-panic object check references 0 external symbols.
 - **Not done:** Loom models (the `loom` crate needs the owner's approval to download), a fairness (ticket or MCS) lock, interrupt-disabling guards as a type.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `origin-version.toml` and `runtime/version/` (`origin-version`), T5
 
@@ -1560,7 +1560,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - changing the version to `0.2.0-rc.1` reaches the rebuilt `.efi`, which proves the build script's `rerun-if-changed` works;
     - `version = "0.2"` fails the build with `origin-version.toml:16: … expected MAJOR.MINOR.PATCH`;
     - a hand-written `version` in a crate manifest fails `xtask check`, naming the file and line.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `runtime/onbf/format/` (`onbf-format`), the ONBF parser: container, OCBOR-1, KRN manifest
 
@@ -1632,7 +1632,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - **Canonical-encoding property (ONBF-R6):** all 1,208 single-bit flips of a KRN manifest were tried. Every flip the decoder accepts re-encodes to exactly the flipped bytes, so no accepted document has a second reading. Every truncation is rejected.
   - **No panic paths:** the release object for `x86_64-unknown-none` references only `memset` and `core::str::from_utf8` (`xtask check`, no-panic step). The latter was added to the allowlist with a justification: it is total and RFC 3629-strict, and under `forbid(unsafe_code)` it is the only way to turn bytes into `&str`.
   - Not done yet: fuzzing (§13 item 3), Kani bounds (item 5) and the N-version check (item 6).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Integration: the IOMMU follow-ups merged (`irq`, `cpu`, `iommu`; xtask; CLAUDE.md §24, §32, §72; ADR-0007 and ADR-0008, Proposed; 2026-11-08)
 
@@ -1661,7 +1661,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `boot-x2apic` under AMD-Vi: the x2APIC proof's wording assumes VT-d's remappable handles;
   - whether `boot-x2apic` joins `boot-matrix` is still ADR-0008's question for the owner.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Merge resolution and the adaptations above; no new mechanism. No operating system's code was read or copied (CLAUDE.md §3).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Integration: parser hardening, the ONBF soak and CPU topology merged (`topology`; CLAUDE.md §24, §27, §72; 2026-11-08)
 
@@ -1692,7 +1692,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - **`ORIGIN_QEMU_IOMMU`, re-checked because the topology branch changed xtask:** `intel-iommu,intremap=off` still fails `boot-x2apic` ("APIC IDs above 255 need interrupt remapping"), and `virtio-iommu-pci` is refused before QEMU starts.
   - Each branch's own negative controls were run on its branch (see their entries) and are not repeated here.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Merge resolution and the ported soak; no new mechanism. No operating system's code was read or copied (CLAUDE.md §3).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### The owner's decisions of 2026-11-08 applied (`onbf-format` signature parser; xtask; errata O1; ADR-0008 question 3)
 
@@ -1705,7 +1705,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - **Negative control:** with the check removed, both that test and `mutated_signature_blocks_get_the_models_verdict` fail. Restored from a saved copy.
   - `cargo xtask boot-matrix`: a full run passes (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs, then `boot-x2apic` on leaves 1Fh and 0Bh).
   - **Two earlier full runs failed,** at different configurations, with `clock: the RTC did not complete two updates in 1.2 s`, while other sessions were loading the machine. Running each of the eight configurations alone then passed every one first time. The cause is in `time.rs`'s `update_end`, unchanged here: QEMU's RTC shows its update bit only for the last 244 µs of each second (`UIP_HOLD_LENGTH`), and a descheduled virtual CPU can miss it.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### VT-d encodings checked against Rev 5.20 (`vtd`, `dmar`, `iommu`; CLAUDE.md §3, §16, §72; 2026-11-08)
 
@@ -1717,7 +1717,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `DMA_REMAP_OPT_OUT` is decoded and reported, and not honoured.
   - Names added for fault reasons 27h–2Bh. The reserved GCMD names SFL and EAFL removed, with the specification's mask used directly. Chapter references and the revision's date corrected.
 - **Test evidence (2026-11-08):** `cargo xtask check`: 682 tests, 0 failures, 6 ignored. `cargo xtask boot-matrix`: a full run passes, at a host load average of about 12. Four earlier full runs failed on timing proofs (`clock`, and once `timers`) while other sessions were loading the machine (load averages above 100). No failure was in code this change touches, and each of the eight configurations also passed alone. Negative controls: without the fault-index rule, `fault_records_decode` fails; without the alignment rule, `malformed_tables_are_refused_at_their_offset` fails; both restored from saved copies. The fault-event mask and the opt-out report have no separate proof: QEMU sets neither condition.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Signature-block parser (ONBF §7.1–§7.2, encodings S1–S4), added 2026-11-07
 
@@ -1758,7 +1758,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `cargo test` at the default scale: `onbf-format` 0.9 s (0.3 s before), `onbf-merkle` 1.1 s (unchanged: its soaks run beside the existing three-level-tree test), `onbf-verify` 0.2 s. In `cargo xtask check` (51 s clean, about 25 s incremental) the soaks add about 1 s.
   - A default run is about 98,000 cases (66,000 mutated images, documents, signature blocks and tree paths, 30,000 shape computations, 1,500 key IDs). `ORIGIN_MUTATION_SCALE=30`, debug, overflow checks on: about 2.9 million cases, 0 failures, 45 s. `ORIGIN_MUTATION_SCALE=100`, release: about 9.8 million cases, 0 failures. An earlier 100x run stopped on a `below(0)` in the sparse Merkle soak (a harness fault: a later fault chose a position in a block an earlier one had truncated to nothing; fixed). It is the only soak bug the scale runs exposed.
   - `cargo xtask check` and `cargo xtask boot-test` (both IOMMU configurations) pass; the crates stay on the no-panic list (`onbf-format` still references only the allowed symbols with the SemVer check added).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `runtime/onbf/verify/` (`onbf-verify`), signature-entry verification
 
@@ -1768,7 +1768,7 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code. `no_std`, no allocation, `forbid(unsafe_code)`, no-panic lints; depends only on `onbf-format` and `origin-crypto`.
 - **Test evidence:** `tools/make_fixture.py` builds a Kernel-role (OSS-1R) block signed by the independent pure-Python references (Ed25519 RFC 8032 and ML-DSA-87 FIPS 204, deterministic keys; byte-identical on every run, SHA-256 `aa9e76c0…2e72`). 3 tests: the block verifies under the Rust verifiers (two implementations agreeing end to end); a wrong digest, profile or key and a flipped byte in either signature fail with their own errors; every single-bit flip inside the statement fails. The no-panic object check passes (6 allowed external symbols).
 - **Not done:** OKC chain verification (errata O2–O5), vectors from an independent author. The loader wiring and the KRN policy (`verify_krn_block`) are in `boot/uefi/`, "Step 3".
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `runtime/onbf/merkle/` (`onbf-merkle`), Merkle-SHA256-4K
 
@@ -1805,7 +1805,7 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
   - **No panic paths:** the release object for `x86_64-unknown-none` references only `memcpy`, `memset` and `origin_crypto`'s `Sha256::update`/`finalize`, which are themselves checked. A planted latent `split_at` passed Clippy and the tests, and was caught only by the no-panic step (`core::panicking::panic_fmt`).
   - **Throughput on the M1 Max host, portable SHA-256, release:** `root` 279 MiB/s, against 285 MiB/s for plain SHA-256. That is about 2% tree overhead, as expected from 1 extra hash per 128 blocks.
   - Not done: a second Merkle implementation by a different author (§13 item 6), integration of `verify_block` with `onbf-format` sections, and Kani bounds.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `security/crypto/` (`origin-crypto`), SHA-2, SHA-3, SHAKE, Ed25519 and ML-DSA
 
@@ -1837,7 +1837,7 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
     - Putting it back makes `xtask check` fail and name the symbol.
   - **Throughput on the M1 Max host (aarch64, portable code, release, single thread):** SHA-256 285 MiB/s, SHA-512 462 MiB/s. This is indicative only: the target is x86-64, and SHA-NI is not used yet.
   - External vectors: NIST ACVP (see "External known-answer vectors" below). Not done: SHA-NI and an independent review.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### SHA-3 and SHAKE (FIPS 202)
 
@@ -1991,7 +1991,7 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
     - a timeout below the boot time fails with exit 1 and QEMU is killed;
     - missing firmware is reported by path;
     - an unknown command exits 2.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `developer-tools/onbf-pack/` (`onbf-pack`), ELF64 PIE → KRN
 
@@ -2015,4 +2015,4 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
   - **Real kernel:** `cargo xtask boot-test` packs the real Framekernel ELF (7 sections, 3 segments, 128 relocations at the time of writing), which the loader verifies and boots.
   - **Not done:** fuzzing, Kani bounds, an independent second implementation (§13), certificate chains and release signing, EXE/LIB profiles, UNWIND/DEBUG_LINK sections.
 - **Review:** not yet independently reviewed.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.

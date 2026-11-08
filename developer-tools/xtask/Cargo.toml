@@ -2,6 +2,7 @@
 name = "xtask"
 description = "Origin OS build orchestration and QEMU boot tests (host only)"
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

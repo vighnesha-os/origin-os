@@ -48,7 +48,7 @@ publish = false
 # No `version` here or in any member, on purpose: the release identity lives only in
 # `origin-version.toml` and reaches code through the generated `origin-version` crate
 # (CLAUDE.md §62). `cargo xtask check` rejects a hand-written crate version.
-# No `license` yet: the project licence has not been chosen (SOURCE_PROVENANCE.md).
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 origin-version = { path = "runtime/version" }

@@ -17,3 +17,13 @@ cargo xtask run                                      # same, with the serial con
 The release version is written only in `origin-version.toml`; every module reads it through the generated `origin-version` crate, and `cargo xtask check` rejects a version in any Cargo manifest.
 
 Status: M0 (toolchain) and the first step of M1 (a UEFI loader that reports itself and returns to the firmware). There is no kernel yet. QEMU results are not hardware qualification.
+
+## Licence
+
+Origin OS is licensed under either of
+
+- the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)), or
+- the MIT License ([LICENSE-MIT](LICENSE-MIT)),
+
+at your option. Third-party test data in this repository keeps its own licence, stated beside it.
+
