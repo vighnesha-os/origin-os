@@ -68,6 +68,7 @@
 //! - [`ustar`]: a read-only ustar (tar) archive reader for an initramfs/package payload;
 //! - [`utf16`]: UTF-16 ↔ scalar transcoding (surrogate pairs) for UEFI/CHAR16 interop;
 //! - [`vfs`]: an in-memory virtual filesystem (paths, directories, files);
+//! - [`virtio`]: virtio status/feature negotiation and the virtio-net config/header;
 //! - [`virtqueue`]: the virtio split-virtqueue ring transport (descriptors, avail/used).
 //!
 //! The binary holds the entry point, x86 port I/O, the descriptor tables, exception and
@@ -133,4 +134,5 @@ pub mod unwind;
 pub mod ustar;
 pub mod utf16;
 pub mod vfs;
+pub mod virtio;
 pub mod virtqueue;

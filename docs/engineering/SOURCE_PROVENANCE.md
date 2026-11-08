@@ -881,6 +881,15 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Not done:** indirect descriptors (`F_INDIRECT`), event-index (`used_event`/`avail_event`) suppression, and the kernel integration (mapping the rings as DMA, programming their physical addresses into a device). Those land with virtio-net.
 - **Licensing:** project licence not chosen yet.
 
+### virtio device negotiation and virtio-net structures (virtio 1.1; CLAUDE.md §31, §54; 2026-11-08)
+
+- **What:** `virtio` (library) is the device-independent handshake and the virtio-net wire structures. `status` bits (ACKNOWLEDGE/DRIVER/FEATURES_OK/DRIVER_OK/…) for the bring-up progression; `feature` bits (the transport `VERSION_1` and the net features); `negotiate(device, wanted)` (the intersection, refusing a legacy-only device without `VERSION_1`); `parse_net_config` (mac/status/mtu/queue-pairs, each read only when its feature was accepted, truncation-safe); `link_up`; and the 12-byte virtio-net `NetHeader` encode/decode. Pure, no `unsafe`.
+- **Why:** these are the values the kernel virtio-net driver writes to the device's common config and prepends to each frame; paired with `virtqueue` they are everything needed to bring a virtio NIC up, which activates the routing/DNS/DHCP/TCP/UDP logic on the wire (§54).
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the virtio 1.1 spec; no source used (CLAUDE.md §3).
+- **Test evidence (2026-11-08):** 4 `virtio` tests — feature negotiation (intersection, VERSION_1 required, never accepting an unasked feature); config parsing per accepted feature (mac/status/mtu read, link-up derived, fields left `None` when their feature is off even though the bytes exist, and a truncated config refused without panic); the net-header round trip (plain and offload-flagged); and distinct status bits. 272 library tests in all; `cargo xtask check`. Host-only; the kernel driver and its boot proof are next.
+- **Not done:** the kernel driver (PCI capability discovery of the virtio BAR regions, ring DMA, RX/TX), and the control virtqueue / multiqueue. Those are the virtio-net bring-up step.
+- **Licensing:** project licence not chosen yet.
+
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
 
 **RwLock (2026-11-08):** a reader-writer spin lock added beside `SpinLock`, for read-mostly kernel state: many readers or one writer, writers waiting for the readers to drain (writer starvation is accepted for rarely-written state). It does not disable interrupts, the same contract as `SpinLock`. Host stress test: 4 writers keep a protected pair equal while 8 readers (which overlap — a max-concurrency counter proves it) check 500,000 times that they never see a half-updated pair; 0 torn reads. Two guard types with documented `unsafe` `Deref`/`DerefMut`. Now backs the kernel's PCIe device list (`pcie::DEVICES`), written once at enumeration and read by driver binding. 6 `origin-sync` tests in all; `cargo xtask check`; boots with the NVMe driver finding its controller through the read lock.
