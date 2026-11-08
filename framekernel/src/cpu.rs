@@ -585,16 +585,6 @@ pub(crate) fn ioapic_irqs_on(cpu: CpuIndex) -> u64 {
         .get(cpu.get())
         .map_or(0, |n| n.load(Ordering::Relaxed))
 }
-
-/// Reschedule IPIs taken, by the CPU index of the processor that took them.
-static RESCHEDULE_IPIS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
-
-/// How many reschedule IPIs the processor with CPU index `cpu` has taken.
-pub(crate) fn reschedule_ipis(cpu: CpuIndex) -> u64 {
-    RESCHEDULE_IPIS
-        .get(cpu.get())
-        .map_or(0, |n| n.load(Ordering::Relaxed))
-}
 /// The system-call vector, the only gate user mode may raise (DPL 3). RAX: 0 exit(RDI),
 /// 1 report(RDI); anything else returns `u64::MAX` in RAX.
 pub(crate) const SYSCALL_VECTOR: u8 = 0x80;
@@ -688,9 +678,6 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     // Another processor woke a thread queued here: acknowledge, then switch to it now
     // rather than at the next timer tick.
     if frame.vector == u64::from(RESCHEDULE_VECTOR) {
-        if let Some(n) = RESCHEDULE_IPIS.get(this_cpu().get()) {
-            n.fetch_add(1, Ordering::Relaxed);
-        }
         // SAFETY: as for the timer: only processors with an active scheduler are sent this
         // vector, so x2APIC mode is on; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };

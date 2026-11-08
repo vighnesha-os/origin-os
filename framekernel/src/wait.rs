@@ -17,11 +17,10 @@
 //! These queues are kernel-internal. The user-visible waiting of ADR-0005 P9 builds on them
 //! later.
 
-use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use framekernel::runqueue::{DISTURBED_PER_MILLE, median, per_mille, round_trips_ok};
+use framekernel::runqueue::{RoundTrips, judge_round_trips, per_mille};
 use origin_sync::SpinLock;
 
 use crate::console::Console;
@@ -228,22 +227,18 @@ static TURN: AtomicU64 = AtomicU64::new(0);
 static PING: WaitQueue = WaitQueue::new();
 static PONG: WaitQueue = WaitQueue::new();
 static PING_CYCLES: AtomicU64 = AtomicU64::new(0);
-/// How long each round trip took, in TSC ticks: filled in by the pinger.
-static ROUND_TRIPS: [AtomicU64; ROUNDS as usize] = [const { AtomicU64::new(0) }; ROUNDS as usize];
-/// Runs of the ping-pong [`prove_ping_pong`] may make: an extra one only after a wrong
-/// result from a visibly disturbed run (see [`DISTURBED_PER_MILLE`]).
-const PING_ATTEMPTS: u32 = 3;
+/// Runs of the ping-pong [`prove_ping_pong`] may make: an extra one only after a run over
+/// the bound that shows a disturbance (`judge_round_trips`). A generous budget costs
+/// nothing where it is not used: an undisturbed boot pays for one run, and every run has
+/// the same bound to meet.
+const PING_ATTEMPTS: u32 = 8;
 
 extern "sysv64" fn pinger(_: u64) -> ! {
     let start = rdtsc();
-    let mut previous = start;
-    for round in &ROUND_TRIPS {
+    for _ in 0..ROUNDS {
         TURN.store(1, Ordering::Release);
         PONG.wake_one();
         PING.wait_until(|| TURN.load(Ordering::Acquire) == 0);
-        let now = rdtsc();
-        round.store(now.wrapping_sub(previous), Ordering::Relaxed);
-        previous = now;
     }
     PING_CYCLES.store(rdtsc().wrapping_sub(start), Ordering::Relaxed);
     TURN.store(2, Ordering::Release);
@@ -355,13 +350,10 @@ fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> bool {
 struct PingPongRun {
     /// Whether both threads finished within 5 s.
     done: bool,
-    /// The mean and the median round trip, in microseconds.
+    /// The mean round trip, in microseconds.
     mean: u64,
-    median: u64,
-    /// How much of the run the boot flow saw its processor away, in parts per thousand.
+    /// How much of the run the boot flow went without a turn, in parts per thousand.
     away: u64,
-    /// Reschedule IPIs the far processor took during the run.
-    ipis: u64,
 }
 
 /// Starts the two threads of the ping-pong on `bsp` and `far`, waits at most 5 s for them
@@ -369,24 +361,16 @@ struct PingPongRun {
 fn run_ping_pong(bsp: CpuIndex, far: CpuIndex, tsc_hz: u64) -> Option<PingPongRun> {
     TURN.store(0, Ordering::Release);
     let before = FINISHED.load(Ordering::Acquire);
-    let ipis_before = cpu::reschedule_ipis(far);
     sched::spawn(bsp, pinger, 0).ok()?;
     sched::spawn(far, ponger, 0).ok()?;
     let finished = || FINISHED.load(Ordering::Acquire) == before + 2;
     let start = rdtsc();
     let away = sched::yield_until_away(finished, tsc_hz, 5);
     let elapsed = rdtsc().wrapping_sub(start);
-    let per_micro = (tsc_hz / 1_000_000).max(1);
-    let mut round_trips: Vec<u64> = ROUND_TRIPS
-        .iter()
-        .map(|round| round.load(Ordering::Relaxed) / per_micro)
-        .collect();
     Some(PingPongRun {
         done: finished(),
-        mean: PING_CYCLES.load(Ordering::Relaxed) / ROUNDS / per_micro,
-        median: median(&mut round_trips),
+        mean: PING_CYCLES.load(Ordering::Relaxed) / ROUNDS / (tsc_hz / 1_000_000).max(1),
         away: per_mille(away, elapsed),
-        ipis: cpu::reschedule_ipis(far).wrapping_sub(ipis_before),
     })
 }
 
@@ -397,14 +381,14 @@ fn run_ping_pong(bsp: CpuIndex, far: CpuIndex, tsc_hz: u64) -> Option<PingPongRu
 /// tick, it would take milliseconds).
 ///
 /// On a loaded host a virtual CPU is descheduled for milliseconds, and a stall that falls
-/// into a round trip lengthens it by as much. The mean is then set by the host's tail, not
-/// by the kernel: measured with two `yes` per logical core, the slowest tenth of the round
-/// trips carried over half the total, and the median was about a third of the mean. So a
-/// run the boot flow saw its processor away for at least a tenth of is judged by what a
-/// stall cannot change (`round_trips_ok`): its median round trip, and the share of round
-/// trips that came by reschedule IPI. If that is wrong too, it is measured again, a few
-/// times. A wrong result from an undisturbed run fails at once, and a run on one processor
-/// is never counted as disturbed.
+/// into a round trip lengthens it by as much, so the mean of a run can be the host's tail
+/// and not the kernel. Such a run says nothing either way, and is measured again, at most
+/// [`PING_ATTEMPTS`] runs in all, each against the same bound. What earns the repeat is the
+/// boot flow going without a turn for at least a tenth of the run. A thread on its
+/// processor can produce that reading just by running, so it can earn a repeat and never a
+/// pass: every run that passes has its mean under the bound. A run over the bound without
+/// that reading fails at once, and so does any run on one processor, where the boot flow
+/// takes turns with the two threads and the reading says nothing about the host.
 fn prove_ping_pong(com1: &mut Console, bsp: CpuIndex, far: CpuIndex, tsc_hz: u64) -> bool {
     let mut attempts = 0;
     let (run, ok) = loop {
@@ -416,22 +400,22 @@ fn prove_ping_pong(com1: &mut Console, bsp: CpuIndex, far: CpuIndex, tsc_hz: u64
             );
             return false;
         };
-        // On one processor the boot flow takes turns with the two threads, so its own clock
-        // says nothing about the host (it reads about 80 % away on a quiet boot) and no IPIs
-        // are sent: the mean decides, as it always did.
-        let disturbed = far != bsp && run.away >= DISTURBED_PER_MILLE;
-        let ipi_per_mille = per_mille(run.ipis, ROUNDS);
-        let ok = run.done && round_trips_ok(run.mean, run.median, ipi_per_mille, disturbed);
-        if ok || !run.done || !disturbed || attempts == PING_ATTEMPTS {
-            break (run, ok);
+        let away = if far == bsp { 0 } else { run.away };
+        let verdict = if run.done {
+            judge_round_trips(run.mean, away)
+        } else {
+            RoundTrips::Fail
+        };
+        if verdict != RoundTrips::Repeat || attempts == PING_ATTEMPTS {
+            break (run, verdict == RoundTrips::Pass);
         }
     };
-    let (mean, median_trip, ipis, away) = (run.mean, run.median, run.ipis, run.away);
+    let (mean, away) = (run.mean, run.away);
     let failed = if ok { "" } else { ": wait queues failed" };
     if run.done && far == bsp {
         let _ = writeln!(
             com1,
-            "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips, {mean} us each (median {median_trip} us) (one processor){failed}"
+            "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips, {mean} us each (one processor){failed}"
         );
     } else if run.done {
         let retried = if attempts > 1 {
@@ -441,7 +425,7 @@ fn prove_ping_pong(com1: &mut Console, bsp: CpuIndex, far: CpuIndex, tsc_hz: u64
         };
         let _ = writeln!(
             com1,
-            "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips, {mean} us each (median {median_trip} us, {ipis} reschedule IPIs, processor away for {away} per mille of the run), woken by IPI{retried}{failed}"
+            "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips, {mean} us each, woken by IPI (boot flow away for {away} per mille of the run, run {attempts} of {PING_ATTEMPTS}){retried}{failed}"
         );
     } else {
         let _ = writeln!(

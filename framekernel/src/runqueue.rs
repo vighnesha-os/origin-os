@@ -53,48 +53,40 @@ pub fn share_near_weight(share: u64, weight: u32, total: u32) -> bool {
     share.abs_diff(ideal) <= ideal / 3 + 15
 }
 
-/// The median of `samples` (the upper one of an even number), reordering them; 0 if there
-/// are none.
-pub fn median(samples: &mut [u64]) -> u64 {
-    if samples.is_empty() {
-        return 0;
-    }
-    let (_, &mut middle, _) = samples.select_nth_unstable(samples.len() / 2);
-    middle
-}
-
 /// The bound of the wake-up ping-pong boot proof (`wait::prove`): the round trip between
 /// two processors, each woken by the other, in microseconds. Woken only by the other's
 /// timer tick (10 ms), a round trip would take milliseconds.
 pub const ROUND_TRIP_LIMIT_MICROS: u64 = 2000;
 
-/// A ping-pong run counts as disturbed if the boot flow saw its processor away for at least
-/// this much of it, in parts per thousand: a virtual CPU descheduled on a loaded host. A
-/// tenth, as for the weighted-share proof.
+/// A ping-pong run over the bound is measured again if the boot flow went without a turn
+/// for at least this much of it, in parts per thousand: on a loaded host, a virtual CPU
+/// descheduled. A tenth, as for the weighted-share proof. The boot flow shares its processor
+/// with a thread under test, which can produce the same reading just by running, so this can
+/// earn a repeat and nothing more.
 pub const DISTURBED_PER_MILLE: u64 = 100;
 
-/// The share of round trips, in parts per thousand, that must have reached the far
-/// processor by reschedule IPI before a disturbed run can be forgiven its mean. A correct
-/// kernel took at least 82 % in every measured run, at any host load; a kernel that loses
-/// IPIs is below this however fast or slow the host is.
-pub const IPI_PER_MILLE_MIN: u64 = 750;
+/// What one run of the ping-pong boot proof calls for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundTrips {
+    /// The mean round trip is under the bound.
+    Pass,
+    /// Over the bound, on a run that shows a disturbance: it says nothing, measure again.
+    Repeat,
+    /// Over the bound, on a run that shows none.
+    Fail,
+}
 
-/// Whether a ping-pong run passes the bound: its mean round trip (microseconds) must be
-/// under it. On a loaded host the mean is carried by the slowest round trips, those a stall
-/// of the host fell into, and says more about the host than about the kernel. So a run
-/// whose processor was visibly away for at least a tenth of it (`disturbed`) is judged
-/// instead by what the host cannot fake: its median round trip against the same bound, and
-/// the share of round trips (`ipi_per_mille`) that arrived by reschedule IPI.
-pub fn round_trips_ok(
-    mean_micros: u64,
-    median_micros: u64,
-    ipi_per_mille: u64,
-    disturbed: bool,
-) -> bool {
-    mean_micros < ROUND_TRIP_LIMIT_MICROS
-        || (disturbed
-            && median_micros < ROUND_TRIP_LIMIT_MICROS
-            && ipi_per_mille >= IPI_PER_MILLE_MIN)
+/// Judges a ping-pong run by its mean round trip (microseconds). A disturbance
+/// (`away_per_mille`, see [`DISTURBED_PER_MILLE`]) can earn a run over the bound a repeat;
+/// it can never pass one.
+pub const fn judge_round_trips(mean_micros: u64, away_per_mille: u64) -> RoundTrips {
+    if mean_micros < ROUND_TRIP_LIMIT_MICROS {
+        RoundTrips::Pass
+    } else if away_per_mille >= DISTURBED_PER_MILLE {
+        RoundTrips::Repeat
+    } else {
+        RoundTrips::Fail
+    }
 }
 
 /// Why a request was refused.
@@ -670,33 +662,34 @@ mod tests {
     }
 
     #[test]
-    fn median_is_the_middle_sample_and_tolerates_the_order() {
-        assert_eq!(median(&mut []), 0);
-        assert_eq!(median(&mut [7]), 7);
-        assert_eq!(median(&mut [3, 1, 2]), 2);
-        // The upper of the two middle ones.
-        assert_eq!(median(&mut [40, 10, 30, 20]), 30);
-        // Unmoved by a stall's outliers, however long.
-        assert_eq!(median(&mut [30, 28, 31, 29, 1_000_000]), 30);
-    }
-
-    #[test]
-    fn the_round_trip_bound_only_gives_way_on_a_visibly_disturbed_run_with_its_ipis() {
+    fn a_disturbance_earns_a_repeat_and_never_a_pass() {
         assert_eq!(ROUND_TRIP_LIMIT_MICROS, 2000);
-        assert_eq!(IPI_PER_MILLE_MIN, 750);
-        // The mean under the bound passes, whatever else.
-        assert!(round_trips_ok(1999, 5000, 0, false));
-        // At or over it, an undisturbed run fails, whatever the median and the IPIs say.
-        assert!(!round_trips_ok(2000, 30, 1000, false));
-        assert!(!round_trips_ok(50_000, 30, 1000, false));
-        // A disturbed run is judged by its median, against the same bound...
-        assert!(round_trips_ok(2045, 1999, 900, true));
-        assert!(!round_trips_ok(2045, 2000, 900, true));
-        assert!(!round_trips_ok(9000, 9000, 900, true));
-        // ... and by how many round trips really came by IPI.
-        assert!(round_trips_ok(2045, 1999, 750, true));
-        assert!(!round_trips_ok(2045, 1999, 749, true));
-        // The tenth that makes a run disturbed.
+        // Under the bound passes, disturbed or not.
+        assert_eq!(judge_round_trips(1999, 0), RoundTrips::Pass);
+        assert_eq!(judge_round_trips(1999, 1000), RoundTrips::Pass);
+        // At or over it, a run that shows no disturbance fails at once...
+        assert_eq!(judge_round_trips(2000, 0), RoundTrips::Fail);
+        assert_eq!(
+            judge_round_trips(2000, DISTURBED_PER_MILLE - 1),
+            RoundTrips::Fail
+        );
+        assert_eq!(judge_round_trips(50_000, 0), RoundTrips::Fail);
+        // ... and one that shows a disturbance is measured again, however disturbed.
+        assert_eq!(
+            judge_round_trips(2000, DISTURBED_PER_MILLE),
+            RoundTrips::Repeat
+        );
+        assert_eq!(judge_round_trips(50_000, 1000), RoundTrips::Repeat);
+        // Over any mix of inputs, only a mean under the bound passes.
+        for mean in [0, 1, 1999, 2000, 2001, 1_000_000, u64::MAX] {
+            for away in [0, 99, 100, 101, 1000, u64::MAX] {
+                assert_eq!(
+                    judge_round_trips(mean, away) == RoundTrips::Pass,
+                    mean < 2000
+                );
+            }
+        }
+        // The tenth of a run away that earns a repeat.
         assert_eq!(DISTURBED_PER_MILLE, 100);
         assert_eq!(per_mille(99, 1000), 99);
         assert_eq!(per_mille(100, 1000), DISTURBED_PER_MILLE);
