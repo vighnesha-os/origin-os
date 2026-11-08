@@ -256,29 +256,30 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
             );
         }
         // CPU topology from CPUID leaf 0Bh (CLAUDE.md §24, §27).
-        prove_topology(&mut com1, online.ids());
+        let apic_ids = online.apic_ids();
+        prove_topology(&mut com1, &apic_ids);
         // NUMA affinities from the ACPI SRAT (CLAUDE.md §24, §28).
-        prove_numa(&mut com1, info.acpi_rsdp, online.ids());
+        prove_numa(&mut com1, info.acpi_rsdp, &apic_ids);
         // Inter-node distances from the ACPI SLIT (CLAUDE.md §27, §28).
         prove_slit(&mut com1, info.acpi_rsdp);
         // Hardware entropy from RDSEED/RDRAND (CLAUDE.md §59).
         prove_entropy(&mut com1, &features);
         // M3, second step: preemptive kernel threads on every online processor.
-        sched::prove(&mut com1, online.ids(), tsc_hz);
+        sched::prove(&mut com1, online.cpus(), tsc_hz);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
-        if pcie::init(&mut com1, info.acpi_rsdp, regions, online.ids().len()) {
+        if pcie::init(&mut com1, info.acpi_rsdp, regions, online.cpus().len()) {
             // DMA and interrupt remapping (Intel VT-d) before any driver binds: translation
             // on with no device attached, so every DMA faults until a driver attaches its
             // device (CLAUDE.md §32, §58; ADR-0007).
             iommu::init(&mut com1, info.acpi_rsdp);
             // M5: the NVMe driver and block I/O, polled and then interrupt-driven.
-            storage::init(&mut com1, online.ids(), tsc_hz);
+            storage::init(&mut com1, online.cpus(), tsc_hz);
             // M10: bring up the virtio-net NIC; an interrupt-driven receive thread takes the
             // OS onto the network (CLAUDE.md §31, §54).
-            virtionet::prove(&mut com1, online.ids(), tsc_hz);
+            virtionet::prove(&mut com1, online.cpus(), tsc_hz);
             // The IOMMU's own proofs, through the bound NVMe controller: translated DMA, a
             // blocked and recorded DMA, remapped and blocked interrupts.
-            storage::prove_iommu(&mut com1, online.ids(), tsc_hz);
+            storage::prove_iommu(&mut com1, online.cpus(), tsc_hz);
         }
         sched::stop_boot_processor();
     }
@@ -647,7 +648,7 @@ fn prove_topology(com1: &mut console::Console, ids: &[u32]) {
         }
     }
     let topology = Topology::decode(&subs[..n]);
-    let mut scratch = [(0u32, 0u32, 0u32); crate::sched::MAX_CPUS];
+    let mut scratch = [(0u32, 0u32, 0u32); crate::cpu::MAX_CPUS];
     let (counts, consistent) = framekernel::topology::analyze(&topology, ids, &mut scratch);
     // The cache hierarchy from leaf 04h.
     let mut caches = [framekernel::cache::Cache {
@@ -714,8 +715,11 @@ fn prove_numa(com1: &mut console::Console, rsdp: u64, ids: &[u32]) {
         return;
     };
 
-    let mut cpus = [CpuAffinity::default(); crate::sched::MAX_CPUS];
-    let mut mems = [MemoryAffinity::default(); 32];
+    // The SRAT lists every processor the platform may have (QEMU: all of `maxcpus`, each
+    // marked enabled), so the lists are sized from the table, on the heap: a CPU affinity
+    // structure is at least 16 bytes long, a memory affinity structure 40.
+    let mut cpus = alloc::vec![CpuAffinity::default(); srat.len() / 16];
+    let mut mems = alloc::vec![MemoryAffinity::default(); srat.len() / 40];
     let (Ok(ncpu), Ok(nmem)) = (
         acpi::srat_cpu_affinities(srat, &mut cpus),
         acpi::srat_memory_affinities(srat, &mut mems),

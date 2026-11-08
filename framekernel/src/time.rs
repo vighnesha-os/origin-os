@@ -552,7 +552,7 @@ extern "sysv64" fn turn_taker(_: u64) -> ! {
     while UNTIL.load(Ordering::Acquire) == 0 {
         core::hint::spin_loop();
     }
-    take_turns(cpu::cpu_id());
+    take_turns(cpu::this_cpu().get() as u64);
     DONE.fetch_add(1, Ordering::AcqRel);
     crate::sched::exit()
 }
@@ -560,10 +560,15 @@ extern "sysv64" fn turn_taker(_: u64) -> ! {
 /// Proves that the TSC readings of every online processor are consistent: for 100 ms all
 /// of them take ordered readings in turn, and no reading may be below the one taken just
 /// before it on another processor. Runs from the boot flow with every scheduler active.
-pub(crate) fn prove_consistent(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -> bool {
+pub(crate) fn prove_consistent(
+    com1: &mut Console,
+    cpus: &[cpu::CpuIndex],
+    bsp: cpu::CpuIndex,
+    tsc_hz: u64,
+) -> bool {
     let mut aps = 0u64;
-    for &id in cpus.iter().filter(|&&id| id as usize != bsp) {
-        if crate::sched::spawn(id as usize, turn_taker, 0).is_err() {
+    for &id in cpus.iter().filter(|&&id| id != bsp) {
+        if crate::sched::spawn(id, turn_taker, 0).is_err() {
             let _ = writeln!(
                 com1,
                 "origin-kernel: clock: cannot spawn on CPU {id}: clock failed"
@@ -581,7 +586,7 @@ pub(crate) fn prove_consistent(com1: &mut Console, cpus: &[u32], bsp: usize, tsc
         return false;
     }
     UNTIL.store(rdtsc().saturating_add(tsc_hz / 10), Ordering::Release);
-    take_turns(bsp as u64);
+    take_turns(bsp.get() as u64);
     crate::sched::yield_until(|| DONE.load(Ordering::Acquire) == aps, tsc_hz, 2);
     let done = DONE.load(Ordering::Acquire) == aps;
     let readings = READINGS.load(Ordering::Relaxed);

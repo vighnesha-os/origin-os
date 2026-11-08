@@ -42,7 +42,7 @@ const TX_MSIX_ENTRY: u16 = 2;
 /// virtio's "no MSI-X vector" sentinel.
 const NO_VECTOR: u16 = 0xFFFF;
 
-/// The device, its MSI-X table (mapped) and the processor its entries target, once set up.
+/// The device, its MSI-X table (mapped) and the x2APIC ID its entries target, once set up.
 static NET_MSIX: SpinLock<Option<(Address, u64, u32)>> = SpinLock::new(None);
 
 /// The messages in the NIC's receive and transmit MSI-X entries, each with the vector and
@@ -77,7 +77,7 @@ pub(crate) fn msix_routes() -> alloc::vec::Vec<(Address, framekernel::vtd::MsiMe
 
 /// Counts the virtio-net MSI-X interrupts the device has raised.
 static NET_IRQS: AtomicU64 = AtomicU64::new(0);
-/// The processor the last NIC interrupt arrived on, plus one (0: none yet).
+/// The CPU index the last NIC interrupt arrived on, plus one (0: none yet).
 static NET_IRQ_CPU: AtomicU64 = AtomicU64::new(0);
 /// The receive thread sleeps here until a used-buffer interrupt wakes it.
 static NET_WAIT: WaitQueue = WaitQueue::new();
@@ -88,7 +88,10 @@ static NET_WAKES: AtomicU64 = AtomicU64::new(0);
 /// interrupt and wakes the receive thread, which then reads the used ring itself.
 pub(crate) fn on_interrupt() {
     NET_IRQS.fetch_add(1, Ordering::Relaxed);
-    NET_IRQ_CPU.store(crate::cpu::cpu_id() + 1, Ordering::Relaxed);
+    NET_IRQ_CPU.store(
+        (crate::cpu::this_cpu().get() as u64).saturating_add(1),
+        Ordering::Relaxed,
+    );
     if NET_WAIT.wake_one() {
         NET_WAKES.fetch_add(1, Ordering::Relaxed);
     }
@@ -1201,7 +1204,7 @@ extern "sysv64" fn net_thread(_: u64) -> ! {
 
 /// Brings up the virtio-net device, hands its queues to a receive thread on another
 /// processor (the boot one when there is no other), and reports the result (CLAUDE.md §54).
-pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
+pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u64) {
     let Some(dev) = crate::pcie::find(0x02, 0x00, 0x00) else {
         let _ = writeln!(
             com1,
@@ -1293,13 +1296,11 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     // the interrupt wakes it. Turn MSI-X on (so the queues can take vectors), with no
     // config-change interrupt, then set up the receive queue (interrupt on entry
     // RX_MSIX_ENTRY) and the transmit queue (no interrupt; its completion is polled).
-    let bsp = crate::cpu::cpu_id();
-    let target = cpus
-        .iter()
-        .copied()
-        .find(|&id| u64::from(id) != bsp)
-        .unwrap_or(bsp as u32);
-    let msix_enabled = enable_msix_table(&dev, target);
+    let bsp = crate::cpu::this_cpu();
+    let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let msix_enabled = target
+        .apic_id()
+        .is_some_and(|apic_id| enable_msix_table(&dev, apic_id));
     w16(common + reg::CONFIG_MSIX_VECTOR, NO_VECTOR);
     let rx = setup_queue(common, Q_RX, RX_MSIX_ENTRY, dma);
     let tx = setup_queue(common, Q_TX, TX_MSIX_ENTRY, dma);
@@ -1343,7 +1344,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
                 dma,
             });
         });
-        spawned = crate::sched::spawn(target as usize, net_thread, 0).is_ok();
+        spawned = crate::sched::spawn(target, net_thread, 0).is_ok();
         if spawned {
             let armed_or_done =
                 || RX_ARMED.load(Ordering::Acquire) != 0 || RX_DONE.load(Ordering::Acquire) != 0;
@@ -1371,7 +1372,10 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     let last = if irqs == 0 {
         alloc::string::String::from("none arrived")
     } else {
-        alloc::format!("the last on CPU {on}")
+        match usize::try_from(on).ok().and_then(crate::cpu::CpuIndex::new) {
+            Some(c) => alloc::format!("the last on {}", c.named()),
+            None => alloc::string::String::from("the last on a processor without a CPU index"),
+        }
     };
 
     let mac_ok = mac == EXPECTED_MAC;
@@ -1389,7 +1393,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         && blocked > 0
         && wakes > 0
         && irqs > 0
-        && on == u64::from(target)
+        && on == target.get() as u64
         && dhcp_retransmits == u64::from(DHCP_INJECT_LOST_DISCOVER);
     let g = gateway.to_be_bytes();
     let dhcp_ms = DHCP_ATTEMPT_NS / 1_000_000;
@@ -1401,7 +1405,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     let ip = (lease as u32).to_be_bytes();
     let _ = writeln!(
         com1,
-        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; DHCP lease {}.{}.{}.{} ({dhcp_retransmits} retransmitted after a {dhcp_ms} ms timeout, the first DISCOVER dropped on purpose); receive thread on CPU {target}: slept {blocked}, woken by the NIC's interrupt {wakes} (of {irqs} MSI-X interrupts, {last}){rx_note}; consistent {}{}",
+        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; DHCP lease {}.{}.{}.{} ({dhcp_retransmits} retransmitted after a {dhcp_ms} ms timeout, the first DISCOVER dropped on purpose); receive thread on {}: slept {blocked}, woken by the NIC's interrupt {wakes} (of {irqs} MSI-X interrupts, {last}){rx_note}; consistent {}{}",
         mac[0],
         mac[1],
         mac[2],
@@ -1418,6 +1422,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         ip[1],
         ip[2],
         ip[3],
+        target.named(),
         consistent,
         if consistent {
             ""

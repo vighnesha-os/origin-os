@@ -14,7 +14,7 @@
 use core::arch::{asm, naked_asm};
 use core::fmt::Write;
 use core::ptr;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use framekernel::apic::{SPURIOUS_VECTOR, TIMER_VECTOR, X2APIC_EOI};
 use framekernel::descriptors::{
@@ -136,28 +136,32 @@ pub(crate) unsafe fn init() {
     // SAFETY: the IDT is written once, here, before any `lidt` points a processor at it
     // (the caller's contract: single-threaded, first).
     unsafe { (&raw mut IDT).write(idt) };
+    // The boot processor is CPU index 0, whatever its APIC ID.
+    assign(CpuIndex::BOOT, cpuid_apic_id());
     // SAFETY: `BSP_TABLES` is used only by the boot processor, and only from here on.
-    unsafe { load_tables(&raw mut BSP_TABLES) };
+    unsafe { load_tables(&raw mut BSP_TABLES, CpuIndex::BOOT) };
 }
 
-/// Loads an application processor's own GDT and TSS from `tables`, and the shared IDT.
+/// Loads an application processor's own GDT and TSS from `tables`, and the shared IDT, and
+/// makes it CPU `index` (if its APIC ID is the one [`assign`]ed to `index`).
 ///
 /// # Safety
 ///
 /// Call once per application processor, at CPL 0 with interrupts disabled, after [`init`]
 /// ran on the boot processor. `tables` must be writable, live for ever, and used by no
-/// other processor.
-pub(crate) unsafe fn init_ap(tables: *mut CpuTables) {
+/// other processor; no other processor may be CPU `index`.
+pub(crate) unsafe fn init_ap(tables: *mut CpuTables, index: CpuIndex) {
     // SAFETY: the caller's contract is `load_tables`'s.
-    unsafe { load_tables(tables) };
+    unsafe { load_tables(tables, index) };
 }
 
 /// Writes the GDT and TSS in `tables` and loads them, the segment registers and the IDT.
 ///
 /// # Safety
 ///
-/// As for [`init_ap`]; for the boot processor, `tables` is `BSP_TABLES`.
-unsafe fn load_tables(tables: *mut CpuTables) {
+/// As for [`init_ap`]; for the boot processor, `tables` is `BSP_TABLES` and `index` is
+/// [`CpuIndex::BOOT`].
+unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex) {
     // SAFETY: the caller's contract: `tables` is valid, writable and this processor's own.
     // Projecting to a field creates no reference.
     let stack = unsafe { &raw mut (*tables).double_fault_stack };
@@ -228,19 +232,90 @@ unsafe fn load_tables(tables: *mut CpuTables) {
     unsafe { asm!("lidt [{idt}]", idt = in(reg) &raw const idt_ptr, options(nostack)) };
     let _ = TSS_SIZE; // the limit is encoded by `tss_descriptor`
     // GS was just reloaded (base 0): point it at this processor's CPU-local area.
-    init_cpu_local(tss_field.addr() as u64);
+    init_cpu_local(tss_field.addr() as u64, index);
 }
 
-/// Processors with a CPU-local area, indexed by x2APIC ID.
-const MAX_LOCAL: usize = 64;
+/// Processors the kernel indexes: every per-CPU array, the CPU-local areas included, has
+/// this many slots (`framekernel::cpumap`).
+pub(crate) use framekernel::cpumap::MAX_CPUS;
 /// IA32_GS_BASE: the base of GS in 64-bit mode.
 const GS_BASE: u32 = 0xC000_0101;
+
+/// A processor's dense CPU index (ADR-0008): its slot in every per-CPU array. The boot
+/// processor is 0; the others are numbered in MADT order at discovery
+/// (`framekernel::cpumap`). It is not the APIC ID, which IPIs and interrupt destinations
+/// use ([`CpuIndex::apic_id`]): x2APIC IDs are 32-bit, sparse, and may exceed 255.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CpuIndex(usize);
+
+impl CpuIndex {
+    /// The boot processor.
+    pub(crate) const BOOT: Self = Self(0);
+
+    /// Index `index`, if an array has that slot (below [`MAX_CPUS`]).
+    pub(crate) const fn new(index: usize) -> Option<Self> {
+        if index < MAX_CPUS {
+            Some(Self(index))
+        } else {
+            None
+        }
+    }
+
+    /// The array slot.
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+
+    /// The x2APIC ID of the processor with this index, once discovery assigned one.
+    pub(crate) fn apic_id(self) -> Option<u32> {
+        let id = APIC_IDS.get(self.0)?.load(Ordering::Acquire);
+        (id != UNASSIGNED).then_some(id)
+    }
+
+    /// `CPU {index} (APIC ID {id})`, for reports.
+    pub(crate) fn named(self) -> Named {
+        Named(self)
+    }
+}
+
+impl core::fmt::Display for CpuIndex {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A CPU index shown with its APIC ID: `CPU 1 (APIC ID 256)`.
+pub(crate) struct Named(CpuIndex);
+
+impl core::fmt::Display for Named {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0.apic_id() {
+            Some(id) => write!(f, "CPU {} (APIC ID {id})", self.0),
+            None => write!(f, "CPU {} (no APIC ID)", self.0),
+        }
+    }
+}
+
+/// What an unassigned slot of [`APIC_IDS`] holds: the broadcast ID, never one processor's.
+const UNASSIGNED: u32 = framekernel::cpumap::BROADCAST;
+/// Each CPU index's x2APIC ID, or [`UNASSIGNED`]. Written once per index, before that
+/// processor runs any kernel code that reads it.
+static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(UNASSIGNED) }; MAX_CPUS];
+
+/// Records that the processor with CPU index `index` has x2APIC ID `apic_id`. The boot
+/// processor records itself in [`init`]; `smp` records every other processor at discovery,
+/// before it starts any (an AP checks its own entry in [`init_ap`]).
+pub(crate) fn assign(index: CpuIndex, apic_id: u32) {
+    if let Some(slot) = APIC_IDS.get(index.0) {
+        slot.store(apic_id, Ordering::Release);
+    }
+}
 
 /// One processor's CPU-local area, reached through GS. A cache line each, so processors
 /// never share one.
 #[repr(C, align(64))]
 struct CpuLocal {
-    /// This processor's x2APIC ID (offset 0, read by [`cpu_id`]).
+    /// This processor's CPU index (offset 0, read by [`this_cpu`]).
     id: AtomicU64,
     /// Address of this processor's TSS (offset 8, used by [`set_kernel_stack`]).
     tss: AtomicU64,
@@ -255,7 +330,7 @@ struct CpuLocal {
     probe_address: AtomicU64,
 }
 
-static CPU_LOCAL: [CpuLocal; MAX_LOCAL] = [const {
+static CPU_LOCAL: [CpuLocal; MAX_CPUS] = [const {
     CpuLocal {
         id: AtomicU64::new(0),
         tss: AtomicU64::new(0),
@@ -264,9 +339,10 @@ static CPU_LOCAL: [CpuLocal; MAX_LOCAL] = [const {
         probe_rip: AtomicU64::new(0),
         probe_address: AtomicU64::new(0),
     }
-}; MAX_LOCAL];
-/// The area of a processor whose ID is too large for [`CPU_LOCAL`]: its ID reads as
-/// `u64::MAX`, which no queue accepts, so it never schedules.
+}; MAX_CPUS];
+/// The area of a processor that has no CPU index (its APIC ID is not the one assigned to
+/// the index it was given): its index reads as `u64::MAX`, which names no array slot, so it
+/// never schedules.
 static OUT_OF_RANGE: CpuLocal = CpuLocal {
     id: AtomicU64::new(u64::MAX),
     tss: AtomicU64::new(0),
@@ -286,19 +362,22 @@ pub(crate) fn cpuid_apic_id() -> u32 {
     }
 }
 
-/// Points IA32_GS_BASE at this processor's [`CpuLocal`], which records its TSS at `tss`.
-fn init_cpu_local(tss: u64) {
-    let id = cpuid_apic_id() as usize;
-    let local = match CPU_LOCAL.get(id) {
-        Some(local) => {
-            local.id.store(id as u64, Ordering::Relaxed);
+/// Points IA32_GS_BASE at the [`CpuLocal`] of CPU `index`, which records the index and this
+/// processor's TSS at `tss` — if this processor's x2APIC ID (from CPUID) is the one
+/// [`assign`]ed to `index`. Otherwise GS points at [`OUT_OF_RANGE`]: the processor never
+/// schedules, and `smp` sees its handshake fail.
+fn init_cpu_local(tss: u64, index: CpuIndex) {
+    let local = match CPU_LOCAL.get(index.0) {
+        Some(local) if index.apic_id() == Some(cpuid_apic_id()) => {
+            local.id.store(index.0 as u64, Ordering::Relaxed);
             local.tss.store(tss, Ordering::Relaxed);
             local
         }
-        None => &OUT_OF_RANGE,
+        _ => &OUT_OF_RANGE,
     };
     // SAFETY: CPL 0 (every caller loads descriptor tables); IA32_GS_BASE exists on every
-    // x86-64 processor and only sets GS's base, which only `cpu_id` uses.
+    // x86-64 processor and only sets GS's base, which only the CPU-local accessors use
+    // (`this_cpu`, `local`, `syscall_entry`).
     unsafe { wrmsr(GS_BASE, ptr::from_ref(local).addr() as u64) };
     init_syscall();
 }
@@ -356,14 +435,13 @@ extern "sysv64" fn syscall_entry() {
 
 /// This processor's CPU-local area.
 fn local() -> &'static CpuLocal {
-    CPU_LOCAL.get(cpu_id() as usize).unwrap_or(&OUT_OF_RANGE)
+    CPU_LOCAL.get(this_cpu().0).unwrap_or(&OUT_OF_RANGE)
 }
 
 /// Address of this processor's CPU-local area (the value IA32_GS_BASE holds).
 pub(crate) fn cpu_local_base() -> u64 {
-    let id = cpu_id() as usize;
     CPU_LOCAL
-        .get(id)
+        .get(this_cpu().0)
         .map_or(ptr::from_ref(&OUT_OF_RANGE), ptr::from_ref)
         .addr() as u64
 }
@@ -371,7 +449,7 @@ pub(crate) fn cpu_local_base() -> u64 {
 /// Sets this processor's TSS.RSP0: the stack an interrupt or exception from user mode
 /// switches to. It must be the kernel stack of the thread about to run in user mode.
 pub(crate) fn set_kernel_stack(top: u64) {
-    let local = cpu_id() as usize;
+    let local = this_cpu().0;
     let Some(tss) = CPU_LOCAL.get(local).map(|l| l.tss.load(Ordering::Relaxed)) else {
         return;
     };
@@ -440,13 +518,14 @@ pub(crate) unsafe extern "sysv64" fn enter_user(rip: u64, rsp: u64, gs_base: u64
     );
 }
 
-/// This processor's x2APIC ID: one GS-relative load from its CPU-local area.
-pub(crate) fn cpu_id() -> u64 {
+/// This processor's CPU index: one GS-relative load from its CPU-local area. On a
+/// processor without one ([`OUT_OF_RANGE`]) it is an index no array has.
+pub(crate) fn this_cpu() -> CpuIndex {
     let id: u64;
     // SAFETY: `load_tables` set GS's base to a live `CpuLocal` on every processor before
     // any code that calls this runs, and offset 0 is its `id`, a `u64`.
     unsafe { asm!("mov {}, gs:[0]", out(reg) id, options(nostack, readonly, preserves_flags)) };
-    id
+    CpuIndex(usize::try_from(id).unwrap_or(usize::MAX))
 }
 
 /// Software interrupt a kernel thread raises to yield the processor.

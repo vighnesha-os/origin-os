@@ -14,6 +14,9 @@
 //!    `cpu::DEVICE_VECTOR` (every other entry masked), and I/O queue pair 2 completes to
 //!    it. A thread there submits under the driver lock and then blocks on a wait queue
 //!    until the interrupt wakes it; its wait condition is the completion queue itself.
+//!    Then every processor gets a queue pair and vector of its own. A message's destination
+//!    is the processor's x2APIC ID (which may exceed 255: ADR-0008); per-CPU state here is
+//!    indexed by its CPU index.
 //!
 //! DMA memory is zeroed heap pages (`dma::DeviceDma`). With the IOMMU translating, the
 //! controller is attached to a domain of its own before its first DMA, every page is mapped
@@ -36,8 +39,8 @@ use framekernel::pci::{self, BarKind};
 use framekernel::vtd;
 use origin_sync::SpinLock;
 
+use crate::cpu::{CpuIndex, MAX_CPUS};
 use crate::dma::DeviceDma;
-use crate::sched::MAX_CPUS;
 use crate::wait::WaitQueue;
 
 use crate::console::Console;
@@ -333,32 +336,47 @@ struct Driver {
 }
 
 static DRIVER: SpinLock<Option<Driver>> = SpinLock::new(None);
-/// Per processor: woken by the completion interrupts routed there.
+/// Per processor (by CPU index): woken by the completion interrupts routed there.
 static IO_WAIT: [WaitQueue; MAX_CPUS] = [const { WaitQueue::new() }; MAX_CPUS];
 /// Per processor: completion interrupts taken there.
 static CPU_INTERRUPTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Per processor: completion interrupts taken there that found a thread waiting on its
+/// queue and woke it.
+static CPU_WAKES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Per processor: how often threads there blocked waiting for a completion.
+static CPU_BLOCKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
-/// The processor the last completion interrupt arrived on, plus one (0: none yet).
+/// The CPU index the last completion interrupt arrived on, plus one (0: none yet).
 static INTERRUPT_CPU: AtomicU64 = AtomicU64::new(0);
 
-/// The completion interrupt (`cpu::DEVICE_VECTOR`): counts it and wakes the waiter, which
-/// then reads the completion itself.
+/// The completion interrupt (`cpu::DEVICE_VECTOR`): counts it on the processor that took it
+/// and wakes the waiter there, which then reads the completion itself.
 pub(crate) fn on_interrupt() {
-    let me = crate::cpu::cpu_id();
+    let me = crate::cpu::this_cpu().get();
     INTERRUPTS.fetch_add(1, Ordering::Relaxed);
-    INTERRUPT_CPU.store(me + 1, Ordering::Relaxed);
-    if let Some(n) = CPU_INTERRUPTS.get(me as usize) {
+    INTERRUPT_CPU.store((me as u64).saturating_add(1), Ordering::Relaxed);
+    if let Some(n) = CPU_INTERRUPTS.get(me) {
         n.fetch_add(1, Ordering::Relaxed);
     }
-    if let Some(w) = IO_WAIT.get(me as usize) {
-        w.wake_one();
+    if let Some(w) = IO_WAIT.get(me)
+        && w.wake_one()
+        && let Some(n) = CPU_WAKES.get(me)
+    {
+        n.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Counts `blocks` waits for a completion by a thread on this processor.
+fn count_blocks(blocks: u64) {
+    if let Some(n) = CPU_BLOCKS.get(crate::cpu::this_cpu().get()) {
+        n.fetch_add(blocks, Ordering::Relaxed);
     }
 }
 
 /// Binds the first NVMe controller and proves block I/O on namespace 1, polled and then
 /// interrupt-driven. Returns whether every step and check passed (no controller at all is
 /// reported, and passes).
-pub(crate) fn init(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
+pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
     let Some(dev) = crate::pcie::find(0x01, 0x08, 0x02) else {
         let _ = writeln!(com1, "origin-kernel: NVMe: no controller");
         return true;
@@ -386,7 +404,8 @@ pub(crate) fn init(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
     };
     let interrupts = polled && prove_interrupts(com1, cpus, tsc_hz);
     let per_cpu = interrupts && prove_per_cpu(com1, cpus, tsc_hz);
-    per_cpu && crate::block::prove(com1)
+    let x2apic = per_cpu && prove_x2apic(com1, cpus);
+    x2apic && crate::block::prove(com1)
 }
 
 /// Device block size and block count of namespace 1, or `None` if no controller is bound.
@@ -718,7 +737,7 @@ extern "sysv64" fn io_thread(_: u64) -> ! {
         };
         let done = core::cell::Cell::new(None);
         let deadline = crate::time::monotonic_nanos() + COMMAND_TIMEOUT_NS;
-        let Some(wait) = IO_WAIT.get(crate::cpu::cpu_id() as usize) else {
+        let Some(wait) = IO_WAIT.get(crate::cpu::this_cpu().get()) else {
             break;
         };
         let waited = wait.wait_until_deadline(
@@ -735,6 +754,7 @@ extern "sysv64" fn io_thread(_: u64) -> ! {
             },
             deadline,
         );
+        count_blocks(*waited.as_ref().unwrap_or(&0));
         let Some(Ok(c)) = done.get() else {
             break;
         };
@@ -764,17 +784,16 @@ extern "sysv64" fn io_thread(_: u64) -> ! {
 
 /// Proves interrupt-driven completions: MSI-X set up for a second I/O queue, then a thread
 /// on another processor reads through it, blocking for each completion.
-fn prove_interrupts(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
-    let bsp = crate::cpu::cpu_id();
-    let target = cpus
-        .iter()
-        .copied()
-        .find(|&id| u64::from(id) != bsp)
-        .unwrap_or(bsp as u32);
+fn prove_interrupts(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
+    let bsp = crate::cpu::this_cpu();
+    let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let setup = crate::cpu::without_interrupts(|| {
         let mut g = DRIVER.lock();
         let d = g.as_mut().ok_or("no driver")?;
-        setup_interrupts(d, target)
+        let apic_id = target
+            .apic_id()
+            .ok_or("the target processor has no APIC ID")?;
+        setup_interrupts(d, apic_id)
     });
     let msix = match setup {
         Ok(m) => m,
@@ -785,13 +804,14 @@ fn prove_interrupts(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
     };
     let _ = writeln!(
         com1,
-        "origin-kernel: NVMe: MSI-X: {} vectors, table in BAR{} at offset {:#x}; I/O queue 2 completes to vector 1, sent to CPU {target} as IDT vector {:#x}",
+        "origin-kernel: NVMe: MSI-X: {} vectors, table in BAR{} at offset {:#x}; I/O queue 2 completes to vector 1, sent to {} as IDT vector {:#x}",
         msix.entries,
         msix.table_bar,
         msix.table_offset,
+        target.named(),
         crate::cpu::DEVICE_VECTOR
     );
-    if crate::sched::spawn(target as usize, io_thread, 0).is_err() {
+    if crate::sched::spawn(target, io_thread, 0).is_err() {
         let _ = writeln!(
             com1,
             "origin-kernel: NVMe: cannot spawn the I/O thread: NVMe failed"
@@ -812,15 +832,19 @@ fn prove_interrupts(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
         && reads == IRQ_READS
         && matched == 8 * IRQ_READS
         && interrupts >= IRQ_READS
-        && on == u64::from(target);
+        && on == target.get() as u64;
     let micros = cycles / reads.max(1) / (tsc_hz / 1_000_000).max(1);
     let _ = writeln!(
         com1,
-        "origin-kernel: NVMe: interrupt-driven: {reads} reads of 8 blocks by a thread on CPU {target}, each blocking until its completion interrupt: {interrupts} interrupts ({}), {matched} of {} blocks match, {micros} us per read{}",
+        "origin-kernel: NVMe: interrupt-driven: {reads} reads of 8 blocks by a thread on {}, each blocking until its completion interrupt: {interrupts} interrupts ({}), {matched} of {} blocks match, {micros} us per read{}",
+        target.named(),
         if interrupts == 0 {
             alloc::string::String::from("none arrived")
         } else {
-            alloc::format!("the last on CPU {on}")
+            match usize::try_from(on).ok().and_then(CpuIndex::new) {
+                Some(c) => alloc::format!("the last on {}", c.named()),
+                None => alloc::string::String::from("the last on a processor without a CPU index"),
+            }
         },
         8 * IRQ_READS,
         if ok { "" } else { ": NVMe failed" }
@@ -1046,9 +1070,9 @@ const CPU_READS: u64 = 32;
 static CPU_RESULT: [[AtomicU64; 3]; MAX_CPUS] =
     [const { [const { AtomicU64::new(0) }; 3] }; MAX_CPUS];
 
-/// For each online processor `k` (by position in `cpus`): MSI-X entry `2 + k` sent to it,
-/// and I/O queue pair `3 + k` completing to that entry.
-fn setup_cpu_queues(d: &mut Driver, cpus: &[u32]) -> Result<(), &'static str> {
+/// For each online processor `k` (by position in `cpus`): MSI-X entry `2 + k` sent to its
+/// APIC ID, and I/O queue pair `3 + k` completing to that entry.
+fn setup_cpu_queues(d: &mut Driver, cpus: &[CpuIndex]) -> Result<(), &'static str> {
     let (table, msix) = d.msix.ok_or("MSI-X is not set up")?;
     if usize::from(msix.entries) < 2 + cpus.len() {
         return Err("too few MSI-X vectors for one per processor");
@@ -1056,7 +1080,9 @@ fn setup_cpu_queues(d: &mut Driver, cpus: &[u32]) -> Result<(), &'static str> {
     for (k, &cpu) in cpus.iter().enumerate() {
         let vector = 2 + k as u16;
         let qid = 3 + k as u16;
-        let message = crate::iommu::msi_message(d.dev.function.at, cpu, crate::cpu::DEVICE_VECTOR)?;
+        let apic_id = cpu.apic_id().ok_or("a processor has no APIC ID")?;
+        let message =
+            crate::iommu::msi_message(d.dev.function.at, apic_id, crate::cpu::DEVICE_VECTOR)?;
         let entry = |word: u64, value: u32| {
             let at = table + u64::from(vector) * pci::MSIX_ENTRY + 4 * word;
             let p = ptr::with_exposed_provenance_mut::<u32>(at as usize);
@@ -1088,9 +1114,7 @@ fn setup_cpu_queues(d: &mut Driver, cpus: &[u32]) -> Result<(), &'static str> {
         if !made.status.ok() || !made_sq.status.ok() {
             return Err("a per-processor queue was refused");
         }
-        let slot = CPU_QUEUES
-            .get(cpu as usize)
-            .ok_or("processor ID out of range")?;
+        let slot = CPU_QUEUES.get(cpu.get()).ok_or("CPU index out of range")?;
         *slot.lock() = Some(CpuQueue {
             qp: queue,
             page,
@@ -1133,6 +1157,7 @@ fn cpu_command(me: usize, make: impl FnOnce(u16, u64) -> Command, out: &mut [u8;
         },
         deadline,
     );
+    count_blocks(*waited.as_ref().unwrap_or(&0));
     let ok = waited.is_ok() && matches!(done.get(), Some(Ok(c)) if c.status.ok());
     if ok {
         crate::cpu::without_interrupts(|| {
@@ -1147,7 +1172,7 @@ fn cpu_command(me: usize, make: impl FnOnce(u16, u64) -> Command, out: &mut [u8;
 /// A processor's thread: [`CPU_READS`] reads of the pattern blocks through its own queue,
 /// then one block of its own written, flushed and read back.
 extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
-    let me = crate::cpu::cpu_id() as usize;
+    let me = crate::cpu::this_cpu().get();
     let (mut reads, mut matched) = (0u64, 0u64);
     let mut page = [0u8; 4096];
     let mut expected = [0u8; 512];
@@ -1212,7 +1237,7 @@ extern "sysv64" fn cpu_io_thread(index: u64) -> ! {
 /// Every online processor reads and writes through its own queue pair and vector at the
 /// same time: every read must match, every write read back, and each processor's
 /// interrupts must have arrived on that processor.
-fn prove_per_cpu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
+fn prove_per_cpu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
     let setup = crate::cpu::without_interrupts(|| {
         let mut g = DRIVER.lock();
         let d = g.as_mut().ok_or("no driver")?;
@@ -1229,7 +1254,7 @@ fn prove_per_cpu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
         core::array::from_fn(|i| CPU_INTERRUPTS[i].load(Ordering::Relaxed));
     let start = crate::cpu::rdtsc();
     for (k, &cpu) in cpus.iter().enumerate() {
-        if crate::sched::spawn(cpu as usize, cpu_io_thread, k as u64).is_err() {
+        if crate::sched::spawn(cpu, cpu_io_thread, k as u64).is_err() {
             let _ = writeln!(
                 com1,
                 "origin-kernel: NVMe: per-CPU queues: cannot spawn: NVMe failed"
@@ -1240,7 +1265,7 @@ fn prove_per_cpu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
     let finished = || {
         cpus.iter().all(|&c| {
             CPU_RESULT
-                .get(c as usize)
+                .get(c.get())
                 .is_some_and(|r| r.iter().all(|x| x.load(Ordering::Acquire) != 0))
         })
     };
@@ -1249,13 +1274,16 @@ fn prove_per_cpu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
     let mut ok = finished();
     let (mut reads, mut matched) = (0, 0);
     for &cpu in cpus {
-        let c = cpu as usize;
+        let c = cpu.get();
         let get = |i: usize| {
             CPU_RESULT
                 .get(c)
                 .map_or(0, |r| r[i].load(Ordering::Acquire).saturating_sub(1))
         };
-        let interrupts = CPU_INTERRUPTS[c].load(Ordering::Relaxed) - before[c];
+        let interrupts = CPU_INTERRUPTS
+            .get(c)
+            .map_or(0, |n| n.load(Ordering::Relaxed))
+            - before.get(c).copied().unwrap_or(0);
         let (r, m, back) = (get(0), get(1), get(2) == 1);
         let mine = r == CPU_READS && m == 8 * CPU_READS && back && interrupts >= CPU_READS + 3;
         ok &= mine;
@@ -1263,7 +1291,8 @@ fn prove_per_cpu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
         matched += m;
         let _ = writeln!(
             com1,
-            "origin-kernel: NVMe: CPU {cpu}: {r} reads through its own queue pair, {m} of {} blocks match, its write read back {back}, {interrupts} interrupts on CPU {cpu}{}",
+            "origin-kernel: NVMe: {}: {r} reads through its own queue pair, {m} of {} blocks match, its write read back {back}, {interrupts} interrupts on CPU {cpu}{}",
+            cpu.named(),
             8 * CPU_READS,
             if mine { "" } else { ": NVMe failed" }
         );
@@ -1277,6 +1306,80 @@ fn prove_per_cpu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
         micros / 1000,
         if ok { "" } else { ": NVMe failed" }
     );
+    ok
+}
+
+/// For every online processor whose x2APIC ID is above 255, proves that NVMe interrupts reach
+/// it live through interrupt remapping (CLAUDE.md §24, §32; ADR-0007 I8, ADR-0008):
+/// - a compatibility-format MSI address cannot carry its ID (8 bits), so the kernel's
+///   compatibility path refuses it;
+/// - its per-CPU MSI-X entry, programmed through `iommu::msi_message`, holds only a
+///   remappable handle (data 0), and the IRTE behind it holds the vector, the full 32-bit
+///   APIC ID and the check of the controller's source ID;
+/// - the completions of its own queue pair arrived as interrupts on that processor (each
+///   counted by the handler running there, which knows its CPU index from its CPU-local
+///   area);
+/// - every time a thread there blocked for a completion, an interrupt taken there woke it:
+///   blocks and wake-ups are equal, and not zero. An interrupt sent anywhere else wakes
+///   nobody, and the thread would sleep until its deadline instead.
+///
+/// With no such processor (APIC IDs 0-255) there is nothing beyond compatibility format to
+/// prove; that is reported, and passes.
+fn prove_x2apic(com1: &mut Console, cpus: &[CpuIndex]) -> bool {
+    let wide: Vec<(usize, CpuIndex, u32)> = cpus
+        .iter()
+        .enumerate()
+        .filter_map(|(k, &c)| c.apic_id().map(|id| (k, c, id)))
+        .filter(|&(_, _, id)| id > 0xFF)
+        .collect();
+    if wide.is_empty() {
+        let largest = cpus.iter().filter_map(|c| c.apic_id()).max().unwrap_or(0);
+        let _ = writeln!(
+            com1,
+            "origin-kernel: x2APIC: no online processor has an APIC ID above 255 (the largest is {largest}): nothing beyond compatibility-format MSI to prove"
+        );
+        return true;
+    }
+    let driver = crate::cpu::without_interrupts(|| {
+        DRIVER
+            .lock()
+            .as_ref()
+            .map(|d| (d.dev.function.at, d.msix.map(|(table, _)| table)))
+    });
+    let Some((at, Some(table))) = driver else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: x2APIC: NVMe MSI-X is not set up: NVMe failed"
+        );
+        return false;
+    };
+    let mut ok = true;
+    for (k, cpu, apic_id) in wide {
+        let entry = 2 + k as u64;
+        let message = msix_message(table, entry);
+        let refused = pci::msi_address(apic_id).is_none();
+        let routed = routed_through_irte(at, message, crate::cpu::DEVICE_VECTOR, apic_id);
+        let irte = vtd::interrupt_index(message);
+        let c = cpu.get();
+        let read =
+            |counts: &[AtomicU64; MAX_CPUS]| counts.get(c).map_or(0, |n| n.load(Ordering::Relaxed));
+        let (interrupts, blocks, wakes) =
+            (read(&CPU_INTERRUPTS), read(&CPU_BLOCKS), read(&CPU_WAKES));
+        let mine =
+            refused && routed && interrupts >= CPU_READS + 3 && blocks > 0 && wakes == blocks;
+        ok &= mine;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: x2APIC: {} is above 255, which a compatibility-format MSI address cannot carry (refused {refused}); its NVMe MSI-X entry {entry} holds only remappable handle {}, whose IRTE sends vector {:#x} to destination {apic_id} after checking source ID {:#06x}: {routed}; {interrupts} NVMe interrupts arrived there, and its threads blocked {blocks} times for a completion and were woken {wakes} times by an interrupt taken there; consistent {mine}{}",
+            cpu.named(),
+            irte.map_or(alloc::string::String::from("none"), |i| alloc::format!(
+                "{i}"
+            )),
+            crate::cpu::DEVICE_VECTOR,
+            crate::iommu::source_id(at),
+            if mine { "" } else { ": NVMe failed" }
+        );
+    }
     ok
 }
 
@@ -1387,7 +1490,7 @@ impl core::fmt::Display for Fault {
 /// Faults recorded before the proofs are reported; one from an attached device fails the
 /// proof (a driver's DMA went where it had not mapped). Returns whether everything held;
 /// with no IOMMU there is nothing to prove.
-pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
+pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
     let driver = crate::cpu::without_interrupts(|| {
         DRIVER
             .lock()
@@ -1484,20 +1587,18 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool
         if blocked { "" } else { ": IOMMU failed" }
     );
 
-    // 3. Remapped interrupts: every programmed MSI-X entry is a handle to its own IRTE.
-    let bsp = crate::cpu::cpu_id();
-    let target = cpus
-        .iter()
-        .copied()
-        .find(|&id| u64::from(id) != bsp)
-        .unwrap_or(bsp as u32);
+    // 3. Remapped interrupts: every programmed MSI-X entry is a handle to its own IRTE, whose
+    //    destination is the target processor's APIC ID.
+    let bsp = crate::cpu::this_cpu();
+    let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let apic = |c: CpuIndex| c.apic_id().unwrap_or(framekernel::cpumap::BROADCAST);
     let mut routes: Vec<(pci::Address, vtd::MsiMessage, u8, u32)> = Vec::new();
     if let Some((table, _)) = msix {
         routes.push((
             at,
             msix_message(table, 1),
             crate::cpu::DEVICE_VECTOR,
-            target,
+            apic(target),
         ));
         for (k, &cpu) in cpus.iter().enumerate() {
             let entry = 2 + k as u64;
@@ -1505,7 +1606,7 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool
                 at,
                 msix_message(table, entry),
                 crate::cpu::DEVICE_VECTOR,
-                cpu,
+                apic(cpu),
             ));
         }
     }

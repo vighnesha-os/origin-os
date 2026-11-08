@@ -127,7 +127,7 @@ extern "sysv64" fn user_thread(entry: u64) -> ! {
 }
 
 /// The `syscall` instruction reaches the same system calls as `int 0x80`.
-fn by_syscall(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
+fn by_syscall(com1: &mut Console, bsp: crate::cpu::CpuIndex, tsc_hz: u64) -> bool {
     REPORTED.store(0, Ordering::Relaxed);
     EXIT_CODE.store(0, Ordering::Relaxed);
     let ended = ENDED.load(Ordering::Acquire);
@@ -164,7 +164,7 @@ fn writer(buf: u64, len: u8) -> alloc::vec::Vec<u8> {
 /// System call 2 copies from user memory: a valid buffer is written to the console, a
 /// kernel address is refused by the range check, and an unmapped user address faults
 /// inside the copy and is refused too; the kernel carries on.
-fn copies(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
+fn copies(com1: &mut Console, bsp: crate::cpu::CpuIndex, tsc_hz: u64) -> bool {
     let cases = [
         ("valid buffer", 0x500u64, GREETING.len() as u64),
         ("kernel address", 0x580, cpu::EFAULT),
@@ -208,7 +208,7 @@ fn copies(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
 /// Two compute-bound user threads at once, preempted by the timer: both must finish with
 /// the right report, which needs TSS.RSP0 to follow every context switch (otherwise one
 /// thread's interrupt frames would land on the other's kernel stack).
-fn concurrent(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
+fn concurrent(com1: &mut Console, bsp: crate::cpu::CpuIndex, tsc_hz: u64) -> bool {
     REPORT_MASK.store(0, Ordering::Relaxed);
     let ended = ENDED.load(Ordering::Acquire);
     let started = crate::cpu::rdtsc();
@@ -234,7 +234,7 @@ fn concurrent(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
 type Case = (&'static str, u64, Option<(u64, u64)>);
 
 /// Runs the three programs and checks each outcome. Returns whether all were right.
-pub(crate) fn prove(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
+pub(crate) fn prove(com1: &mut Console, bsp: crate::cpu::CpuIndex, tsc_hz: u64) -> bool {
     let Ok(layout) = Layout::from_size_align(4096, 4096) else {
         return false;
     };
@@ -398,7 +398,7 @@ extern "sysv64" fn process_thread(entry: u64) -> ! {
 /// Two processes run the same program at the same virtual addresses at the same time,
 /// each in its own address space: each must read back only its own value, the kernel's
 /// tables must not map their pages, and their PML4s must differ.
-fn processes(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
+fn processes(com1: &mut Console, bsp: crate::cpu::CpuIndex, tsc_hz: u64) -> bool {
     let Ok(layout) = Layout::from_size_align(4096, 4096) else {
         return false;
     };

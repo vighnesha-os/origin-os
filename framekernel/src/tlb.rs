@@ -13,8 +13,9 @@
 //!   serves the request in progress meanwhile, so two initiators never wait on each other.
 //! - Each request has a generation. A processor records the last generation it served, and
 //!   the initiator waits until every target's record reaches its own.
-//! - Targets are the processors whose schedulers run ([`mark_online`]), each named by its
-//!   x2APIC ID: nothing is broadcast to processors that never started.
+//! - Targets are the processors whose schedulers run ([`mark_online`]), recorded by CPU
+//!   index and sent the IPI at the x2APIC ID recorded for that index: nothing is
+//!   broadcast to processors that never started.
 //! - The caller must hold no lock that another processor may wait for with interrupts
 //!   disabled: that processor could then never take the interrupt. `vm` releases its own
 //!   lock before it shoots down.
@@ -30,8 +31,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use origin_sync::SpinLock;
 
 use crate::console::Console;
-use crate::cpu::{self, rdtsc};
-use crate::sched::MAX_CPUS;
+use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
 use crate::timer::X2Apic;
 
 /// The shootdown interrupt's vector: a fixed IPI, above every device vector in use.
@@ -59,7 +59,7 @@ static LAST_CYCLES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_PAGES: AtomicU64 = AtomicU64::new(0);
 
 fn this_cpu() -> usize {
-    usize::try_from(cpu::cpu_id()).unwrap_or(usize::MAX)
+    cpu::this_cpu().get()
 }
 
 /// Turns on global pages on this processor and counts it, for the boot report.
@@ -159,12 +159,17 @@ fn shoot(request: u64) -> u64 {
         let mut targets = [false; MAX_CPUS];
         for (id, (online, target)) in ONLINE.iter().zip(targets.iter_mut()).enumerate() {
             if id != me && online.load(Ordering::SeqCst) {
+                // Every online processor is waited for. One without an APIC ID on record
+                // (impossible: `smp` records it before the processor starts) gets no IPI,
+                // so the wait below times out and panics rather than skipping it.
                 *target = true;
-                // SAFETY: a fixed IPI with the shootdown vector, whose handler only
-                // invalidates TLB entries and acknowledges; `id` is an online processor's
-                // x2APIC ID.
-                unsafe {
-                    lapic.send_ipi(id as u32, ICR_ASSERT | u32::from(SHOOTDOWN_VECTOR));
+                if let Some(apic_id) = CpuIndex::new(id).and_then(CpuIndex::apic_id) {
+                    // SAFETY: a fixed IPI with the shootdown vector, whose handler only
+                    // invalidates TLB entries and acknowledges; `apic_id` is the x2APIC ID
+                    // recorded for online processor `id`.
+                    unsafe {
+                        lapic.send_ipi(apic_id, ICR_ASSERT | u32::from(SHOOTDOWN_VECTOR));
+                    }
                 }
             }
         }
@@ -244,7 +249,7 @@ extern "sysv64" fn toucher(_: u64) -> ! {
 /// - every application processor caches three pages; the boot processor unmaps one with a
 ///   single-page shootdown and two with one full flush; every processor's next read of
 ///   each page must fault.
-pub(crate) fn prove(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -> bool {
+pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
     let mut ok = true;
     let census = crate::vm::leaf_census();
     let global = GLOBAL_PAGES.load(Ordering::Relaxed);
@@ -272,8 +277,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -
         page.store(*slot, Ordering::Release);
     }
     let mut aps = 0u64;
-    for &id in cpus.iter().filter(|&&id| id as usize != bsp) {
-        if crate::sched::spawn(id as usize, toucher, 0).is_err() {
+    for &id in cpus.iter().filter(|&&id| id != bsp) {
+        if crate::sched::spawn(id, toucher, 0).is_err() {
             let _ = writeln!(
                 com1,
                 "origin-kernel: TLB: cannot spawn on CPU {id}: TLB failed"

@@ -23,7 +23,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use origin_sync::SpinLock;
 
 use crate::console::Console;
-use crate::cpu::{self, rdtsc};
+use crate::cpu::{self, CpuIndex, rdtsc};
 use crate::sched::{self, ThreadRef};
 
 /// Threads one queue can hold. A thread that finds it full polls by yielding instead.
@@ -287,7 +287,7 @@ extern "sysv64" fn timed_waiter(which: u64) -> ! {
 
 /// A timed wait that nobody ends must time out at its deadline (within two ticks), and one
 /// that is signalled first must return then, long before its deadline.
-fn prove_timed(com1: &mut Console, far: usize, tsc_hz: u64) -> bool {
+fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> bool {
     let before = FINISHED.load(Ordering::Acquire);
     let spawned = [
         sched::spawn(far, timed_waiter, 0),
@@ -349,12 +349,8 @@ fn prove_timed(com1: &mut Console, far: usize, tsc_hz: u64) -> bool {
 ///   other's timer tick (10 ms), a round trip would take milliseconds.
 ///
 /// Runs from the boot flow with every scheduler active.
-pub(crate) fn prove(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -> bool {
-    let far = cpus
-        .iter()
-        .map(|&id| id as usize)
-        .find(|&id| id != bsp)
-        .unwrap_or(bsp);
+pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let spawned = [
         sched::spawn(far, producer, 0),
         sched::spawn(bsp, consumer, 0),

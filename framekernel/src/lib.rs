@@ -24,6 +24,8 @@
 //! - [`channel`]: one channel's queues, limits and signals (ADR-0005 P8);
 //! - [`clock`]: monotonic-clock arithmetic (ticks to nanoseconds and back) and the CPUID
 //!   TSC rate;
+//! - [`cpumap`]: dense CPU indexes for the processors the MADT enables (per-CPU arrays are
+//!   indexed by them; APIC IDs stay the IPI and interrupt destinations);
 //! - [`deflate`]: DEFLATE (RFC 1951) decompression with a decompression-bomb guard;
 //! - [`descriptors`]: GDT, TSS and IDT descriptor encodings;
 //! - [`dhcp`]: a DHCP client (message build/parse and the lease state machine);
@@ -96,6 +98,7 @@ pub mod boot;
 pub mod cache;
 pub mod channel;
 pub mod clock;
+pub mod cpumap;
 pub mod deflate;
 pub mod descriptors;
 pub mod dhcp;

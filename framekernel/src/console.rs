@@ -178,7 +178,7 @@ extern "sysv64" fn printer(_: u64) -> ! {
     while !PRINT_GO.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
-    print_lines(crate::cpu::cpu_id());
+    print_lines(crate::cpu::this_cpu().get() as u64);
     PRINTERS_DONE.fetch_add(1, Ordering::AcqRel);
     crate::sched::exit()
 }
@@ -186,12 +186,17 @@ extern "sysv64" fn printer(_: u64) -> ! {
 /// Every online processor prints [`PROOF_LINES`] lines at the same time; the boot test
 /// checks that every one of them arrived whole. Runs from the boot flow with every
 /// scheduler active.
-pub(crate) fn prove(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -> bool {
+pub(crate) fn prove(
+    com1: &mut Console,
+    cpus: &[crate::cpu::CpuIndex],
+    bsp: crate::cpu::CpuIndex,
+    tsc_hz: u64,
+) -> bool {
     use core::fmt::Write as _;
     use core::sync::atomic::Ordering;
     let mut aps = 0u64;
-    for &id in cpus.iter().filter(|&&id| id as usize != bsp) {
-        if crate::sched::spawn(id as usize, printer, 0).is_err() {
+    for &id in cpus.iter().filter(|&&id| id != bsp) {
+        if crate::sched::spawn(id, printer, 0).is_err() {
             let _ = writeln!(
                 com1,
                 "origin-kernel: console: cannot spawn on CPU {id}: console failed"
@@ -202,7 +207,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -
     }
     crate::sched::yield_until(|| PRINTERS_READY.load(Ordering::Acquire) == aps, tsc_hz, 2);
     PRINT_GO.store(true, Ordering::Release);
-    print_lines(bsp as u64);
+    print_lines(bsp.get() as u64);
     crate::sched::yield_until(|| PRINTERS_DONE.load(Ordering::Acquire) == aps, tsc_hz, 5);
     let ok = PRINTERS_DONE.load(Ordering::Acquire) == aps;
     let _ = writeln!(

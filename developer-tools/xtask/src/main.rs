@@ -28,6 +28,9 @@ commands:
   boot-test   boot under QEMU + OVMF twice: the kernel must start and report; a tampered
               kernel image must be rejected by the loader
   boot-matrix boot-test with 1, 2 and 4 processors, one after another
+  boot-x2apic boot-test on a sparse topology: the boot processor at APIC ID 0 and a second
+              processor at APIC ID 256, above what 8-bit APIC IDs reach (the MADT lists
+              150 possible processors)
   run         boot under QEMU with the serial console on this terminal (Ctrl-A X quits)
 
 environment:
@@ -35,7 +38,12 @@ environment:
                                       (default: the EDK2 files installed next to QEMU)
   ORIGIN_BOOT_TEST_TIMEOUT            boot-test timeout in seconds (default 120)
   ORIGIN_QEMU_SMP                     processors QEMU emulates, 1-64 (default 2)
+  ORIGIN_QEMU_TOPOLOGY                x2apic: the boot-x2apic machine (ORIGIN_QEMU_SMP is
+                                      then ignored)
   ORIGIN_QEMU_CPU                     the QEMU CPU model (default max), e.g. max,-avx2
+  ORIGIN_QEMU_IOMMU                   the IOMMU device (default
+                                      intel-iommu,intremap=on,eim=on), e.g.
+                                      intel-iommu,intremap=off for a negative control
   ORIGIN_QEMU_DEBUG                   if set, QEMU logs interrupts and resets to
                                       target/xtask/qemu-debug.log";
 
@@ -93,6 +101,15 @@ fn qemu_cpu_model() -> String {
         .unwrap_or_else(|| "max".into())
 }
 
+/// The IOMMU QEMU emulates: `ORIGIN_QEMU_IOMMU` (a `-device` value, for negative
+/// controls), or Intel VT-d with interrupt remapping and 32-bit x2APIC destinations.
+fn qemu_iommu() -> String {
+    std::env::var("ORIGIN_QEMU_IOMMU")
+        .ok()
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "intel-iommu,intremap=on,eim=on".into())
+}
+
 /// Processors QEMU emulates: `ORIGIN_QEMU_SMP` (1–64), or 2.
 fn qemu_cpus() -> u32 {
     std::env::var("ORIGIN_QEMU_SMP")
@@ -102,27 +119,121 @@ fn qemu_cpus() -> u32 {
         .unwrap_or(2)
 }
 
+/// The processors QEMU presents, and what the kernel must find.
+struct Machine {
+    /// The `-smp` value.
+    smp: String,
+    /// Processors cold-plugged with `-device` (QEMU starts them with the machine).
+    devices: Vec<String>,
+    /// The APIC ID of each CPU index the kernel gives: the boot processor, then the MADT's
+    /// enabled processors in table order.
+    apic_ids: Vec<u32>,
+    /// Processor structures the MADT lists (QEMU lists every possible processor).
+    listed: u32,
+    /// The largest APIC ID the MADT lists.
+    highest: u32,
+}
+
+impl Machine {
+    /// Processors online.
+    fn cpus(&self) -> u32 {
+        self.apic_ids.len() as u32
+    }
+
+    /// `CPU {index} (APIC ID {id})`, as the kernel names a processor.
+    fn named(&self, index: u32) -> String {
+        let id = self.apic_ids.get(index as usize).copied().unwrap_or(index);
+        format!("CPU {index} (APIC ID {id})")
+    }
+}
+
+/// The machine the boot uses: `-smp N` (QEMU numbers the processors 0 to N-1), or with
+/// `ORIGIN_QEMU_TOPOLOGY=x2apic` a sparse one. There, 2 packages of 3 dies × 5 modules × 5
+/// cores take 2 + 3 + 3 bits of the APIC ID below the package, so package 1 starts at APIC
+/// ID 256; 150 processors are possible, and only the boot processor and one cold-plugged
+/// at package 1 (APIC ID 256) are present (docs/research/2026-11-08-x2apic-above-255.md).
+fn machine() -> Machine {
+    if std::env::var("ORIGIN_QEMU_TOPOLOGY").as_deref() == Ok("x2apic") {
+        // The cold-plugged processor is of the boot processor's model: QEMU names its type
+        // after the model (`max` -> `max-x86_64-cpu`) and applies `-cpu`'s features to it.
+        let model = qemu_cpu_model();
+        let base = model.split(',').next().unwrap_or("max");
+        return Machine {
+            smp: "1,maxcpus=150,sockets=2,dies=3,modules=5,cores=5,threads=1".into(),
+            devices: vec![format!(
+                "{base}-x86_64-cpu,socket-id=1,die-id=0,module-id=0,core-id=0,thread-id=0"
+            )],
+            apic_ids: vec![0, 256],
+            listed: 150,
+            highest: 420,
+        };
+    }
+    let cpus = qemu_cpus();
+    Machine {
+        smp: cpus.to_string(),
+        devices: Vec::new(),
+        apic_ids: (0..cpus).collect(),
+        listed: cpus,
+        highest: cpus - 1,
+    }
+}
+
 fn boot_scenario() -> Scenario {
-    let mut scenario = boot_scenario_markers();
-    // With more than one processor, the first AP's start-up line comes right after the
-    // MADT line.
-    if qemu_cpus() > 1
-        && let Some(at) = scenario
-            .markers
-            .iter()
-            .position(|m| m.starts_with("origin-kernel: ACPI MADT: "))
+    let machine = machine();
+    let mut scenario = boot_scenario_markers(&machine);
+    // Each AP's start-up line comes after the MADT line, in index order.
+    if let Some(at) = scenario
+        .markers
+        .iter()
+        .position(|m| m.starts_with("origin-kernel: ACPI MADT: "))
     {
-        scenario.markers.insert(
-            at + 1,
-            "origin-kernel: CPU 1 (APIC ID 1) online after ".into(),
-        );
+        for index in (1..machine.cpus()).rev() {
+            scenario.markers.insert(
+                at + 1,
+                format!("origin-kernel: {} online after ", machine.named(index)),
+            );
+        }
     }
     scenario
 }
 
-fn boot_scenario_markers() -> Scenario {
+/// What the kernel reports about its processors' x2APIC IDs: for each one above 255, its
+/// interrupts reach it through an IRTE holding its full ID (NVMe MSI-X entry `2 + index`)
+/// and wake its threads; with none, that there is nothing to prove.
+fn x2apic_markers(machine: &Machine) -> Vec<String> {
+    let wide: Vec<(u32, u32)> = (0..machine.cpus())
+        .zip(machine.apic_ids.iter().copied())
+        .filter(|&(_, id)| id > 0xFF)
+        .collect();
+    if wide.is_empty() {
+        let largest = machine.apic_ids.iter().copied().max().unwrap_or(0);
+        return vec![format!(
+            "origin-kernel: x2APIC: no online processor has an APIC ID above 255 (the largest is {largest})"
+        )];
+    }
+    wide.into_iter()
+        .flat_map(|(index, id)| {
+            [
+                format!(
+                    "origin-kernel: x2APIC: {} is above 255, which a compatibility-format MSI address cannot carry (refused true); its NVMe MSI-X entry {} holds only remappable handle ",
+                    machine.named(index),
+                    2 + index
+                ),
+                format!(
+                    ", whose IRTE sends vector 0x40 to destination {id} after checking source ID 0x0010: true; "
+                ),
+                "; consistent true".into(),
+            ]
+        })
+        .collect()
+}
+
+fn boot_scenario_markers(machine: &Machine) -> Scenario {
     use origin_version::{BUILD, PRODUCT, VERSION};
-    let cpus = qemu_cpus();
+    let cpus = machine.cpus();
+    // The processor the interrupt-driven NVMe and virtio-net threads run on: the first
+    // one after the boot processor, if any.
+    let target = machine.named(cpus.min(2) - 1);
     Scenario {
         label: "kernel boot",
         markers: vec![
@@ -187,8 +298,12 @@ fn boot_scenario_markers() -> Scenario {
             // I/O APIC: the PIT's IRQ0 routed through it (IRQ0 -> GSI 2 via an override).
             "origin-kernel: I/O APIC: id 0, 24 entries at 0xfec00000 (GSI base 0); routing the PIT's IRQ0 via GSI 2 to vector 0x41 on CPU 0".into(),
             "origin-kernel: I/O APIC: 20 PIT interrupts routed through the I/O APIC in ".into(),
-            // M3: every processor QEMU emulates (`-smp`, see `qemu_cpus`) comes online.
-            format!("origin-kernel: ACPI MADT: {cpus} processors, {cpus} enabled"),
+            // M3: every processor QEMU emulates (`-smp`, see `machine`) comes online. The
+            // MADT lists every possible processor; each enabled one gets a CPU index.
+            format!(
+                "origin-kernel: ACPI MADT: {} processors, {cpus} enabled (largest APIC ID listed {})",
+                machine.listed, machine.highest
+            ),
             format!(
                 "origin-kernel: SMP: {cpus} of {cpus} enabled processors online; trampoline identity pages removed true"
             ),
@@ -331,27 +446,32 @@ fn boot_scenario_markers() -> Scenario {
             ),
             // Interrupt-driven completions: MSI-X vector 1 to another CPU (q35's NVMe has
             // 65 vectors, the table in BAR 0), a thread there blocking for each one.
-            "origin-kernel: NVMe: MSI-X: 65 vectors, table in BAR0 at offset 0x2000; I/O queue 2 completes to vector 1, sent to CPU ".into(),
             format!(
-                "origin-kernel: NVMe: interrupt-driven: 64 reads of 8 blocks by a thread on CPU {}, each blocking until its completion interrupt: ",
-                cpus.min(2) - 1
+                "origin-kernel: NVMe: MSI-X: 65 vectors, table in BAR0 at offset 0x2000; I/O queue 2 completes to vector 1, sent to {target} as IDT vector 0x40"
             ),
-            "512 of 512 blocks match".into(),
-            // Per-CPU queues: every CPU at once through its own queue pair and vector.
+            format!(
+                "origin-kernel: NVMe: interrupt-driven: 64 reads of 8 blocks by a thread on {target}, each blocking until its completion interrupt: "
+            ),
+            format!("(the last on {target}), 512 of 512 blocks match"),
+            // Per-CPU queues: every CPU at once through its own queue pair and vector, the
+            // vector's destination its APIC ID.
         ]
         .into_iter()
-        .chain((0..cpus).map(|id| {
+        .chain((0..cpus).map(|index| {
             format!(
-                "origin-kernel: NVMe: CPU {id}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, "
+                "origin-kernel: NVMe: {}: 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, ",
+                machine.named(index)
             )
         }))
+        .chain([format!(
+            "origin-kernel: NVMe: per-CPU queues: {cpus} threads at once, one per CPU, each with its own queue pair and MSI-X vector: {} reads, {} of {} blocks match",
+            32 * cpus,
+            256 * cpus,
+            256 * cpus
+        )])
+        // Processors above APIC ID 255: NVMe interrupts reach them live through IRTEs.
+        .chain(x2apic_markers(machine))
         .chain([
-            format!(
-                "origin-kernel: NVMe: per-CPU queues: {cpus} threads at once, one per CPU, each with its own queue pair and MSI-X vector: {} reads, {} of {} blocks match",
-                32 * cpus,
-                256 * cpus,
-                256 * cpus
-            ),
             // The block cache over NVMe: cold misses fetch, re-reads hit, eviction and
             // write-back work (CLAUDE.md §39).
             "origin-kernel: block cache: 4 pages (512 B blocks, 8 per page): 32 of 32 blocks matched the pattern; 4 device reads cold, re-reading 4 resident pages did 0 more (32 hits, 4 misses)".into(),
@@ -360,7 +480,8 @@ fn boot_scenario_markers() -> Scenario {
             // woken only by the NIC's interrupt resolves the gateway by ARP and takes a DHCP
             // lease (CLAUDE.md §31, §54).
             "origin-kernel: virtio-net: 52:54:00:aa:bb:cc, features_ok true".into(),
-            "; consistent true".into(),
+            format!("; receive thread on {target}: slept "),
+            format!(", the last on {target}); consistent true"),
             // Its transmit ring: more frames than descriptors, every one completed and its
             // descriptor reclaimed and reused; the TX-completion interrupt fired.
             "origin-kernel: virtio-net TX: ".into(),
@@ -484,7 +605,7 @@ fn boot_scenario_markers() -> Scenario {
             ": GPT failed",
             ": IOMMU failed",
         ],
-        check: Some(|text| console_lines_intact(text, qemu_cpus() as usize)),
+        check: Some(|text| console_lines_intact(text, self::machine().cpus() as usize)),
     }
 }
 
@@ -570,6 +691,7 @@ fn main() -> ExitCode {
         }),
         ["boot-test"] => boot_test(),
         ["boot-matrix"] => boot_matrix(),
+        ["boot-x2apic"] => boot_x2apic(),
         ["run"] => run(),
         _ => {
             eprintln!("{USAGE}");
@@ -603,6 +725,26 @@ fn boot_matrix() -> Result {
         }
     }
     println!("xtask: boot-matrix passed (1, 2 and 4 processors)");
+    Ok(())
+}
+
+/// Runs `boot-test` in a child process on the sparse machine (`ORIGIN_QEMU_TOPOLOGY=x2apic`,
+/// see `machine`): a processor at APIC ID 256 must come online, run threads, and take the
+/// NVMe interrupts routed to it through interrupt remapping.
+fn boot_x2apic() -> Result {
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    println!("xtask: boot-x2apic: processors at APIC IDs 0 and 256 of 150 possible");
+    let status = Command::new(&exe)
+        .arg("boot-test")
+        .env("ORIGIN_QEMU_TOPOLOGY", "x2apic")
+        .status()
+        .map_err(|e| format!("cannot run boot-test: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "boot-test with a processor at APIC ID 256 failed ({status})"
+        ));
+    }
+    println!("xtask: boot-x2apic passed (a processor at APIC ID 256)");
     Ok(())
 }
 
@@ -1240,14 +1382,20 @@ fn qemu_path_arg(options: &str, path: &Path) -> Result<String> {
 /// The machine every boot uses: q35 (the only machine type the Secure Boot firmware
 /// supports), x86-64 with every feature TCG can emulate, and no network or display.
 fn qemu_command(s: &Staged) -> Result<Command> {
+    let machine = machine();
     let mut c = Command::new(QEMU);
     c.args(["-machine", "q35", "-cpu"])
         .arg(qemu_cpu_model())
         .args(["-m", "512M", "-smp"])
-        .arg(qemu_cpus().to_string())
+        .arg(&machine.smp);
+    for cpu in &machine.devices {
+        c.args(["-device", cpu]);
+    }
+    c
         // Two NUMA nodes so the ACPI SRAT is populated (CLAUDE.md §24, §28). The 256M
         // backends sum to -m, and QEMU auto-distributes the vCPUs across the nodes, so this
-        // is valid for any -smp (verified at 1/2/4/8).
+        // is valid for any -smp (verified at 1/2/4/8, and for the sparse x2APIC machine,
+        // whose packages go to one node each).
         .args(["-object", "memory-backend-ram,id=onuma0,size=256M"])
         .args(["-object", "memory-backend-ram,id=onuma1,size=256M"])
         .args(["-numa", "node,nodeid=0,memdev=onuma0"])
@@ -1267,7 +1415,7 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         // before the PCI devices it translates. `eim=on` gives IRTEs 32-bit x2APIC
         // destinations (`auto` resolves to off without KVM's in-kernel irqchip); TCG needs no
         // irqchip option. See docs/research/2026-11-08-vt-d-iommu.md.
-        .args(["-device", "intel-iommu,intremap=on,eim=on"])
+        .args(["-device", &qemu_iommu()])
         // The NVMe controller and its test disk (CLAUDE.md §33).
         .arg("-drive")
         .arg(qemu_path_arg("if=none,id=nvme0,format=raw,file=", &s.nvme)?)

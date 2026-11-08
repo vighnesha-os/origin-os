@@ -11,6 +11,9 @@
 //! Locking: each queue has its own spin lock, taken by that processor's timer interrupt and
 //! by [`spawn`] from any processor. `spawn` holds it with interrupts disabled, so the
 //! processor's own timer can never spin on a lock it interrupted.
+//!
+//! Queues are indexed by CPU index (`cpu::CpuIndex`, ADR-0008), never by APIC ID; a
+//! reschedule IPI goes to the APIC ID recorded for the target's index.
 
 use core::arch::asm;
 use core::fmt::Write;
@@ -20,12 +23,10 @@ use framekernel::descriptors::{KERNEL_CODE, KERNEL_DATA};
 use framekernel::runqueue::{QueueError, RunQueue};
 
 use crate::console::Console;
-use crate::cpu::{self, rdtsc};
-use crate::timer::{self, ApicRead, X2Apic};
+use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
+use crate::timer::{self, X2Apic};
 use origin_sync::SpinLock;
 
-/// Processors with a run queue, indexed by x2APIC ID.
-pub(crate) const MAX_CPUS: usize = 64;
 /// Each kernel thread's stack.
 const THREAD_STACK: usize = 16 * 1024;
 /// Words in a saved frame: 15 registers, vector, error code, RIP, CS, RFLAGS, RSP, SS.
@@ -41,9 +42,9 @@ static ACTIVE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_C
 /// Set by the boot processor once every AP's threads are queued.
 static GO: AtomicBool = AtomicBool::new(false);
 
-/// This processor's x2APIC ID, as a queue index (from its GS-based CPU-local area).
+/// This processor's CPU index, as a queue index (from its GS-based CPU-local area).
 fn this_cpu() -> usize {
-    usize::try_from(cpu::cpu_id()).unwrap_or(usize::MAX)
+    cpu::this_cpu().get()
 }
 
 use crate::cpu::without_interrupts;
@@ -96,8 +97,8 @@ fn free_fpu_area(area: u64) {
 
 /// Makes sure CPU `cpu`'s boot/idle context (slot 0) has an FPU area, so the first switch
 /// away from it can save its state. Called before the processor's scheduler runs.
-pub(crate) fn init_cpu_fpu(cpu: usize) {
-    if let Some(threads) = THREADS.get(cpu) {
+pub(crate) fn init_cpu_fpu(cpu: CpuIndex) {
+    if let Some(threads) = THREADS.get(cpu.get()) {
         without_interrupts(|| {
             let mut t = threads.lock();
             if t.fpu[0] == 0
@@ -289,24 +290,24 @@ pub(crate) fn on_reschedule(interrupted: u64) -> u64 {
     with_queue(interrupted, |q| Some(q.yield_now(interrupted)))
 }
 
-/// A kernel thread: its processor (x2APIC ID), run-queue slot, and the slot's generation,
+/// A kernel thread: its processor (CPU index), run-queue slot, and the slot's generation,
 /// so a reference that outlives its thread never names the slot's next one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ThreadRef {
-    cpu: u32,
+    cpu: CpuIndex,
     slot: u32,
     generation: u32,
 }
 
 /// The running kernel thread, or `None` for the boot or idle flow (which cannot block).
 pub(crate) fn current_thread() -> Option<ThreadRef> {
-    let id = this_cpu();
-    let queue = QUEUES.get(id)?;
+    let cpu = cpu::this_cpu();
+    let queue = QUEUES.get(cpu.get())?;
     without_interrupts(|| {
         let q = queue.lock();
         let slot = q.current();
         (slot != 0).then(|| ThreadRef {
-            cpu: id as u32,
+            cpu,
             slot: slot as u32,
             generation: q.generation(slot),
         })
@@ -338,22 +339,25 @@ pub(crate) fn block_until(deadline: u64) {
 const ICR_ASSERT: u32 = 1 << 14;
 
 /// Makes `thread` ready. If it was blocked on another processor, that processor is sent a
-/// reschedule IPI, so it switches to the thread now rather than at its next timer tick.
+/// reschedule IPI (to its APIC ID), so it switches to the thread now rather than at its
+/// next timer tick.
 pub(crate) fn wake(thread: ThreadRef) {
-    let cpu = thread.cpu as usize;
-    let Some(queue) = QUEUES.get(cpu) else {
+    let Some(queue) = QUEUES.get(thread.cpu.get()) else {
         return;
     };
     let woke = without_interrupts(|| queue.lock().wake(thread.slot as usize, thread.generation));
-    if woke && cpu != this_cpu() {
+    if woke
+        && thread.cpu != cpu::this_cpu()
+        && let Some(apic_id) = thread.cpu.apic_id()
+    {
         // SAFETY: CPL 0; this processor's APIC is in x2APIC mode (it runs kernel threads).
         let lapic = unsafe { X2Apic::assume_enabled() };
         // SAFETY: a fixed IPI with the reschedule vector, whose handler acknowledges and
         // switches through the target's own run queue; the target ran this thread, so its
-        // scheduler is active.
+        // scheduler is active, and `apic_id` is the one recorded for its index.
         unsafe {
             lapic.send_ipi(
-                thread.cpu,
+                apic_id,
                 ICR_ASSERT | u32::from(crate::cpu::RESCHEDULE_VECTOR),
             )
         };
@@ -426,10 +430,10 @@ fn queue_ticks() -> u64 {
         .map_or(0, |q| without_interrupts(|| q.lock().ticks()))
 }
 
-/// Creates a kernel thread on processor `cpu` (an x2APIC ID) that runs `entry(arg)`, and
-/// returns its run-queue slot.
+/// Creates a kernel thread on processor `cpu` that runs `entry(arg)`, and returns its
+/// run-queue slot.
 pub(crate) fn spawn(
-    cpu: usize,
+    cpu: CpuIndex,
     entry: extern "sysv64" fn(u64) -> !,
     arg: u64,
 ) -> Result<usize, QueueError> {
@@ -439,7 +443,7 @@ pub(crate) fn spawn(
 /// As [`spawn`], in the address space whose PML4 is `root` (0: the kernel's). The thread
 /// starts in kernel mode; a process thread then enters user mode in that space.
 pub(crate) fn spawn_in(
-    cpu: usize,
+    cpu: CpuIndex,
     entry: extern "sysv64" fn(u64) -> !,
     arg: u64,
     root: u64,
@@ -450,7 +454,7 @@ pub(crate) fn spawn_in(
 /// As [`spawn`], with a scheduling weight (stride scheduling: the thread's share of its
 /// processor is its share of the weights there).
 pub(crate) fn spawn_weighted(
-    cpu: usize,
+    cpu: CpuIndex,
     entry: extern "sysv64" fn(u64) -> !,
     arg: u64,
     weight: u32,
@@ -459,13 +463,13 @@ pub(crate) fn spawn_weighted(
 }
 
 fn spawn_with(
-    cpu: usize,
+    cpu: CpuIndex,
     entry: extern "sysv64" fn(u64) -> !,
     arg: u64,
     root: u64,
     weight: u32,
 ) -> Result<usize, QueueError> {
-    let queue = QUEUES.get(cpu).ok_or(QueueError::Full)?;
+    let queue = QUEUES.get(cpu.get()).ok_or(QueueError::Full)?;
     let (stack, guard) = guarded_stack(THREAD_STACK).ok_or(QueueError::Full)?;
     let _ = FIRST_GUARD.compare_exchange(0, guard, Ordering::Relaxed, Ordering::Relaxed);
     let base = stack.as_ptr().addr() as u64;
@@ -495,7 +499,7 @@ fn spawn_with(
     let fpu_area = alloc_fpu_area().unwrap_or(0);
     without_interrupts(|| {
         let slot = queue.lock().push_weighted(frame_at, weight)?;
-        if let Some(threads) = THREADS.get(cpu) {
+        if let Some(threads) = THREADS.get(cpu.get()) {
             let mut t = threads.lock();
             if let Some(s) = t.stacks.get_mut(slot) {
                 *s = Some(record);
@@ -539,7 +543,7 @@ pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
 
 /// Iterations each worker thread has made, indexed by worker.
 static PROGRESS: [AtomicU64; 2 * MAX_CPUS] = [const { AtomicU64::new(0) }; 2 * MAX_CPUS];
-/// The x2APIC ID each worker last ran on, plus one (0: never ran).
+/// The CPU index each worker last ran on, plus one (0: never ran).
 static RAN_ON: [AtomicU64; 2 * MAX_CPUS] = [const { AtomicU64::new(0) }; 2 * MAX_CPUS];
 /// Tells the workers to stop counting.
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -608,7 +612,7 @@ extern "sysv64" fn bencher(_: u64) -> ! {
 
 /// TSC cycles per context switch: the boot flow and two threads that only yield, so each
 /// boot-flow yield is three switches (boot → A → B → boot).
-fn measure_switch(bsp: usize) -> Option<u64> {
+fn measure_switch(bsp: CpuIndex) -> Option<u64> {
     let before = FINISHED.load(Ordering::Relaxed);
     spawn(bsp, bencher, 0).ok()?;
     spawn(bsp, bencher, 1).ok()?;
@@ -707,7 +711,7 @@ extern "sysv64" fn simd_worker(index: u64) -> ! {
 /// Proves that FPU/SIMD state is private to each thread across preemption: [`SIMD_WORKERS`]
 /// workers on one processor each hold four XMM values and spin checking them for 300 ms
 /// while the timer preempts them. None may ever see another's values.
-fn prove_simd(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
+fn prove_simd(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     for i in 0..SIMD_WORKERS {
         if spawn(bsp, simd_worker, i as u64).is_err() {
             let _ = writeln!(
@@ -731,7 +735,7 @@ fn prove_simd(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
     let corrupt: u64 = SIMD_CORRUPT.iter().map(|c| c.load(Ordering::Relaxed)).sum();
     let iters: u64 = SIMD_ITERS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
     let switches = QUEUES
-        .get(bsp)
+        .get(bsp.get())
         .map_or(0, |q| without_interrupts(|| q.lock().switches()));
     let ok =
         SIMD_EXITED.load(Ordering::Relaxed) == SIMD_WORKERS as u64 && corrupt == 0 && iters > 0;
@@ -765,12 +769,8 @@ extern "sysv64" fn weighted_worker(index: u64) -> ! {
 /// Proves proportional shares (stride scheduling): three never-yielding workers with
 /// weights 1, 4 and 16 share one processor for 2 s; each one's share of the work must be
 /// near its share of the weights (1/21, 4/21, 16/21), and the lightest must not starve.
-fn prove_weights(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -> bool {
-    let far = cpus
-        .iter()
-        .map(|&id| id as usize)
-        .find(|&id| id != bsp)
-        .unwrap_or(bsp);
+fn prove_weights(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     for (i, &w) in WEIGHTS.iter().enumerate() {
         if spawn_weighted(far, weighted_worker, i as u64, w).is_err() {
             let _ = writeln!(
@@ -812,10 +812,10 @@ fn prove_weights(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -> b
 
 /// On the boot processor, with its timer running: yields must alternate two threads, a
 /// sleep must last its ticks, and exited threads must free their slots for reuse.
-fn prove_lifecycle(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
+fn prove_lifecycle(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let live = || {
         QUEUES
-            .get(bsp)
+            .get(bsp.get())
             .map_or(0, |q| without_interrupts(|| q.lock().live()))
     };
     if live() != 1 {
@@ -873,16 +873,16 @@ fn prove_lifecycle(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
 /// contexts) waits. On each processor, both workers must have run there, with shares
 /// within a factor of two, over at least five full rounds of context switches. Returns
 /// whether the proof passed.
-pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
+pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
     // Give every online processor's boot/idle context an FPU area before the baseline is
     // measured, so the first switch on it can save its state and the leak check is fair.
     for &id in cpus {
-        init_cpu_fpu(id as usize);
+        init_cpu_fpu(id);
     }
     let heap_before = crate::memory::stats().map(|(h, _)| h.bytes_in_use);
     for (i, &id) in cpus.iter().enumerate() {
         for k in 0..2 {
-            if spawn(id as usize, worker, (2 * i + k) as u64).is_err() {
+            if spawn(id, worker, (2 * i + k) as u64).is_err() {
                 let _ = writeln!(
                     com1,
                     "origin-kernel: cannot spawn on CPU {id}: scheduler failed"
@@ -894,9 +894,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
     // SAFETY: the boot processor is in x2APIC mode (the timer bring-up), and `start` was
     // already called on it; the transition is a no-op that yields the handle.
     let lapic = unsafe { X2Apic::enable() };
-    let bsp = lapic.read(ApicRead::Id) as usize;
+    let bsp = cpu::this_cpu();
     GO.store(true, Ordering::Release);
-    if let Some(active) = ACTIVE.get(bsp) {
+    if let Some(active) = ACTIVE.get(bsp.get()) {
         active.store(true, Ordering::Release);
     }
     crate::tlb::mark_online();
@@ -934,7 +934,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
     let mut switches_at_stop = [0u64; MAX_CPUS];
     for (slot, &id) in switches_at_stop.iter_mut().zip(cpus) {
         *slot = QUEUES
-            .get(id as usize)
+            .get(id.get())
             .map_or(0, |q| without_interrupts(|| q.lock().switches()));
     }
     STOP.store(true, Ordering::Relaxed);
@@ -956,7 +956,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
         let (a, b) = (2 * i, 2 * i + 1);
         let count = |w: usize| PROGRESS.get(w).map_or(0, |p| p.load(Ordering::Relaxed));
         let place = |w: usize| RAN_ON.get(w).map_or(0, |r| r.load(Ordering::Relaxed));
-        let right_cpu = place(a) == u64::from(id) + 1 && place(b) == u64::from(id) + 1;
+        let right_cpu = place(a) == id.get() as u64 + 1 && place(b) == id.get() as u64 + 1;
         // Both workers ran, with comparable shares (within a factor of two).
         let (lo, hi) = (count(a).min(count(b)), count(a).max(count(b)));
         let fair = lo > 0 && lo * 2 >= hi;

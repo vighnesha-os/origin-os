@@ -6,7 +6,11 @@
 //! "Initializing IA-32e Mode" (PAE, CR3, EFER.LME, then CR0.PG); ACPI 6.6 §5.2.12 (MADT).
 //!
 //! 1. The processors come from the ACPI MADT (`framekernel::acpi`), so only enabled
-//!    processors are started; nothing is broadcast.
+//!    processors are started; nothing is broadcast. Each gets a dense CPU index
+//!    (`framekernel::cpumap`, ADR-0008): the boot processor 0, the others in table order.
+//!    Per-CPU state is indexed by it; the x2APIC ID, which may exceed 255, stays the
+//!    processor's address for IPIs and interrupts. The MADT may list far more processors
+//!    than are enabled (QEMU lists every possible one), so its list is read onto the heap.
 //! 2. A trampoline is copied to [`TRAMPOLINE`] (frames reserved at boot), whose page is
 //!    mapped at its identity address read/execute while APs start; its mutable data (a 32/64-bit GDT, CR3, the stack, the entry
 //!    and its argument) lives in the separate read/write page [`TRAMPOLINE_DATA`]. The GDT
@@ -16,23 +20,26 @@
 //!    IPI, 200 µs, a second start-up IPI if it is not up yet, and up to 200 ms for its
 //!    handshake. The AP runs the trampoline (real → protected → long mode with the
 //!    kernel's own page tables), then [`ap_entry`]: its own GDT and TSS, the shared IDT,
-//!    SMEP and SMAP, its local APIC in x2APIC mode, and the handshake with its APIC ID.
+//!    the CPU-local area of its index (only if that index's APIC ID is its own), SMEP and
+//!    SMAP, its local APIC in x2APIC mode, and the handshake with its APIC ID.
 //! 4. The trampoline page goes back to read/write, never executable.
 //!
 //! Each AP then enters its own scheduler (`sched::run_ap`).
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::fmt::Write;
 use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 
 use framekernel::acpi::{self, Processor};
+use framekernel::cpumap::CpuMap;
 use framekernel::paging::{Access, PAGE};
 use origin_boot_info::{BootInfo, MemoryRegion, RegionKind};
 
 use crate::console::Console;
-use crate::cpu::{self, CpuTables, rdtsc};
+use crate::cpu::{self, CpuIndex, CpuTables, MAX_CPUS, rdtsc};
 use crate::timer::{ApicRead, X2Apic};
 use crate::vm;
 
@@ -42,8 +49,6 @@ pub(crate) const TRAMPOLINE: u64 = 0x8000;
 pub(crate) const TRAMPOLINE_DATA: u64 = 0x9000;
 /// Each AP's kernel stack.
 const AP_STACK_BYTES: usize = 64 * 1024;
-/// Processors this kernel tracks.
-const MAX_CPUS: usize = 64;
 
 // Data-page layout, shared with the trampoline below.
 const GDT: u64 = 0x00;
@@ -125,15 +130,18 @@ unsafe extern "C" {
 
 /// What the boot processor hands one AP, and the AP's answer.
 struct ApStart {
-    /// 0 until the AP is up, then its x2APIC ID + 1 (`u32::MAX` if it has no x2APIC).
+    /// 0 until the AP is up, then its x2APIC ID + 1 (`u32::MAX` if it has no x2APIC,
+    /// `u32::MAX - 1` if it is not the processor `index` was assigned to).
     online: AtomicU32,
     /// The AP's own GDT, TSS and double-fault stack.
     tables: *mut CpuTables,
+    /// The CPU index the AP takes; discovery assigned it the AP's APIC ID.
+    index: CpuIndex,
 }
 
-/// The x2APIC IDs of the processors online, the boot processor first.
+/// The processors online, by CPU index, the boot processor first.
 pub(crate) struct Online {
-    ids: [u32; MAX_CPUS],
+    cpus: [CpuIndex; MAX_CPUS],
     count: usize,
     /// Every processor the MADT marks enabled is online: none can still be running
     /// firmware code.
@@ -141,19 +149,17 @@ pub(crate) struct Online {
 }
 
 impl Online {
-    fn one(bsp: u32) -> Self {
-        let mut ids = [0; MAX_CPUS];
-        ids[0] = bsp;
+    fn one() -> Self {
         Self {
-            ids,
+            cpus: [CpuIndex::BOOT; MAX_CPUS],
             count: 1,
             complete: false,
         }
     }
 
-    fn add(&mut self, id: u32) {
-        if let Some(slot) = self.ids.get_mut(self.count) {
-            *slot = id;
+    fn add(&mut self, index: CpuIndex) {
+        if let Some(slot) = self.cpus.get_mut(self.count) {
+            *slot = index;
             self.count += 1;
         }
     }
@@ -163,9 +169,14 @@ impl Online {
         self.complete
     }
 
-    /// The IDs.
-    pub(crate) fn ids(&self) -> &[u32] {
-        self.ids.get(..self.count).unwrap_or(&[])
+    /// Their CPU indexes, the boot processor first: where threads are spawned.
+    pub(crate) fn cpus(&self) -> &[CpuIndex] {
+        self.cpus.get(..self.count).unwrap_or(&[])
+    }
+
+    /// Their x2APIC IDs, in the same order: for topology and NUMA affinity.
+    pub(crate) fn apic_ids(&self) -> Vec<u32> {
+        self.cpus().iter().filter_map(|c| c.apic_id()).collect()
     }
 }
 
@@ -181,52 +192,86 @@ pub(crate) fn start(
     // bring-up checked it and already switched this APIC; the transition is then a no-op).
     let lapic = unsafe { X2Apic::enable() };
     let bsp = lapic.read(ApicRead::Id) as u32;
-    let mut online = Online::one(bsp);
-    if cpu::cpu_id() != u64::from(bsp) {
+    let mut online = Online::one();
+    if cpu::this_cpu() != CpuIndex::BOOT || CpuIndex::BOOT.apic_id() != Some(bsp) {
         let _ = writeln!(
             com1,
-            "origin-kernel: the CPU-local area names CPU {}, not {bsp}: AP start-up failed",
-            cpu::cpu_id()
+            "origin-kernel: the CPU-local area names {}, not APIC ID {bsp}: AP start-up failed",
+            cpu::this_cpu().named()
         );
         return online;
     }
-    let mut cpus = [Processor::default(); MAX_CPUS];
-    let count = match discover(info.acpi_rsdp, &mut cpus) {
-        Ok(n) => n,
+    let map = match discover(info.acpi_rsdp, bsp) {
+        Ok(map) => map,
         Err(e) => {
             let _ = writeln!(com1, "origin-kernel: ACPI processor discovery failed: {e}");
             return online;
         }
     };
-    let enabled = cpus.iter().take(count).filter(|p| p.enabled).count();
-    let _ = writeln!(
+    let _ = write!(
         com1,
-        "origin-kernel: ACPI MADT: {count} processors, {enabled} enabled"
+        "origin-kernel: ACPI MADT: {} processors, {} enabled (largest APIC ID listed {}); CPU index 0 for the boot processor (APIC ID {bsp})",
+        map.listed(),
+        map.enabled(),
+        map.highest().unwrap_or(bsp),
     );
+    match map.indexed() {
+        1 => {}
+        2 => {
+            let _ = write!(com1, ", 1 for the other enabled processor");
+        }
+        n => {
+            let _ = write!(
+                com1,
+                ", 1-{} for the other enabled processors in table order",
+                n - 1
+            );
+        }
+    }
+    if !map.boot_listed() {
+        let _ = write!(com1, "; the MADT does not list the boot processor");
+    }
+    if map.unindexed() > 0 {
+        let _ = write!(
+            com1,
+            "; {} enabled processors beyond the kernel's {MAX_CPUS} CPU indexes stay in firmware",
+            map.unindexed()
+        );
+    }
+    if map.invalid() > 0 {
+        let _ = write!(
+            com1,
+            "; {} with the broadcast APIC ID refused",
+            map.invalid()
+        );
+    }
+    let _ = writeln!(com1);
+    // Every AP's APIC ID is on record before any AP starts: each checks its own.
+    for (i, apic_id) in map.iter().skip(1) {
+        if let Some(index) = CpuIndex::new(i) {
+            cpu::assign(index, apic_id);
+        }
+    }
     if let Err(why) = prepare(regions) {
         let _ = writeln!(com1, "origin-kernel: AP start-up not possible: {why}");
         return online;
     }
-    for p in cpus
-        .iter()
-        .take(count)
-        .filter(|p| p.enabled && p.apic_id != bsp)
-    {
-        match start_one(&lapic, p.apic_id, tsc_hz) {
+    for (i, apic_id) in map.iter().skip(1) {
+        let Some(index) = CpuIndex::new(i) else {
+            continue;
+        };
+        match start_one(&lapic, index, apic_id, tsc_hz) {
             Ok(micros) => {
-                online.add(p.apic_id);
+                online.add(index);
                 let _ = writeln!(
                     com1,
-                    "origin-kernel: CPU {} (APIC ID {}) online after {micros} us: own GDT, TSS and IDT, x2APIC",
-                    online.count - 1,
-                    p.apic_id
+                    "origin-kernel: CPU {index} (APIC ID {apic_id}) online after {micros} us: own GDT, TSS and IDT, x2APIC",
                 );
             }
             Err(why) => {
                 let _ = writeln!(
                     com1,
-                    "origin-kernel: APIC ID {}: {why}: AP start-up failed",
-                    p.apic_id
+                    "origin-kernel: CPU {index} (APIC ID {apic_id}): {why}: AP start-up failed"
                 );
             }
         }
@@ -238,20 +283,24 @@ pub(crate) fn start(
             "origin-kernel: trampoline mappings not removed: {e:?}: AP start-up failed"
         );
     }
-    online.complete = online.count == enabled;
+    online.complete = online.count == map.indexed() && map.covers_enabled();
     let leftover = vm::is_mapped(TRAMPOLINE) || vm::is_mapped(TRAMPOLINE_DATA);
     let _ = writeln!(
         com1,
-        "origin-kernel: SMP: {} of {enabled} enabled processors online; trampoline identity pages removed {}{}",
+        "origin-kernel: SMP: {} of {} enabled processors online; trampoline identity pages removed {}{}",
         online.count,
+        map.enabled(),
         !leftover,
         if leftover { ": AP start-up failed" } else { "" }
     );
     online
 }
 
-/// RSDP → XSDT → MADT → processors.
-fn discover(rsdp_addr: u64, out: &mut [Processor]) -> Result<usize, &'static str> {
+/// RSDP → XSDT → MADT → the processors it lists → their CPU indexes, the boot processor
+/// (APIC ID `bsp`) first. The MADT lists every processor the platform may ever have, enabled
+/// or not (QEMU lists all of `maxcpus`, up to 4096 on q35), so the list is sized from the
+/// table, on the heap: each processor structure is at least 8 bytes long.
+fn discover(rsdp_addr: u64, bsp: u32) -> Result<CpuMap, &'static str> {
     let madt = crate::firmware::acpi_table(rsdp_addr, b"APIC").map_err(|e| {
         if e == "table not listed in the XSDT" {
             "no MADT"
@@ -259,7 +308,9 @@ fn discover(rsdp_addr: u64, out: &mut [Processor]) -> Result<usize, &'static str
             e
         }
     })?;
-    acpi::madt_processors(madt, out).map_err(|_| "invalid MADT")
+    let mut listed = alloc::vec![Processor::default(); madt.len() / 8];
+    let count = acpi::madt_processors(madt, &mut listed).map_err(|_| "invalid MADT")?;
+    Ok(CpuMap::new(bsp, listed.get(..count).unwrap_or(&[])))
 }
 
 /// Writes `value` at `offset` in the trampoline data page.
@@ -336,8 +387,14 @@ fn delay(micros: u64, tsc_hz: u64) {
     }
 }
 
-/// Starts the AP with x2APIC ID `apic_id`; returns microseconds until its handshake.
-fn start_one(lapic: &X2Apic, apic_id: u32, tsc_hz: u64) -> Result<u64, &'static str> {
+/// Starts the AP with x2APIC ID `apic_id` as CPU `index`; returns microseconds until its
+/// handshake.
+fn start_one(
+    lapic: &X2Apic,
+    index: CpuIndex,
+    apic_id: u32,
+    tsc_hz: u64,
+) -> Result<u64, &'static str> {
     // SAFETY: an all-zero `CpuTables` is valid (integers only); `init_ap` writes it before
     // the processor uses it.
     let tables = Box::into_raw(unsafe { Box::<CpuTables>::new_zeroed().assume_init() });
@@ -347,6 +404,7 @@ fn start_one(lapic: &X2Apic, apic_id: u32, tsc_hz: u64) -> Result<u64, &'static 
     let start: &'static ApStart = Box::leak(Box::new(ApStart {
         online: AtomicU32::new(0),
         tables,
+        index,
     }));
     poke(STACK, stack_top);
     poke(ENTRY, (ap_entry as *const ()).addr() as u64);
@@ -386,8 +444,8 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     let start = unsafe { &*start };
     // SAFETY: once per AP (each gets its own `start`), CPL 0, interrupts disabled (the
     // trampoline ran `cli`), after `cpu::init` on the boot processor; the tables are this
-    // AP's alone.
-    unsafe { cpu::init_ap(start.tables) };
+    // AP's alone, and so is `start.index` (the boot processor gives each index once).
+    unsafe { cpu::init_ap(start.tables, start.index) };
     // SAFETY: CPL 0; the kernel has no user mappings. Every processor enforces SMEP and SMAP.
     let _ = unsafe { cpu::enable_smep_smap() };
     // SAFETY: CPL 0; the kernel's tables mark only the kernel half global.
@@ -402,15 +460,18 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     // SAFETY: CPL 0, this AP only, interrupts disabled, x2APIC supported, and the spurious
     // vector has a gate in the shared IDT.
     let lapic = unsafe { X2Apic::enable() };
-    let id = lapic.read(ApicRead::Id);
-    // The CPU-local area (GS) must name this processor, or its scheduler would use another
-    // processor's queue: answer with a value the boot processor rejects.
-    let answer = if cpu::cpu_id() == id {
-        (id as u32).wrapping_add(1)
-    } else {
-        u32::MAX - 1
-    };
-    start.online.store(answer, Ordering::Release);
+    let id = lapic.read(ApicRead::Id) as u32;
+    // The CPU-local area (GS) must hold the index this processor was given, and that index
+    // must be this processor's APIC ID, or its scheduler would use another processor's
+    // queue: otherwise answer with a value the boot processor rejects.
+    let mine = cpu::this_cpu() == start.index && start.index.apic_id() == Some(id);
+    if !mine {
+        // Not the processor this index was given to: refuse, and do nothing more (no
+        // timer, no scheduler; interrupts stay disabled).
+        start.online.store(u32::MAX - 1, Ordering::Release);
+        crate::halt();
+    }
+    start.online.store(id.wrapping_add(1), Ordering::Release);
     // M3: this processor's scheduler.
     crate::sched::run_ap(&lapic)
 }
