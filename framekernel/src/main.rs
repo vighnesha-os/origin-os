@@ -550,16 +550,19 @@ fn prove_vfs(com1: &mut console::Console) {
     );
 }
 
+/// The initramfs image (a ustar archive) built into the kernel. The NIC proof also fetches
+/// the same file over TFTP and compares the two.
+pub(crate) static INITRAMFS_IMAGE: &[u8] = include_bytes!("../assets/initramfs.tar");
+
 /// Extracts an embedded initramfs (a ustar image) into a fresh VFS and reports it
 /// (CLAUDE.md §21 initial system deployment). Proves `ustar` + `initramfs` + `vfs` working
 /// end-to-end in the kernel on a real image: the entry count, a file's contents read back,
 /// and that a file whose parent directory the archive never listed was still created.
 fn prove_initramfs(com1: &mut console::Console) {
     use framekernel::vfs::Vfs;
-    static IMAGE: &[u8] = include_bytes!("../assets/initramfs.tar");
 
     let mut fs = Vfs::new(1 << 20, 256);
-    let result = framekernel::initramfs::extract(IMAGE, &mut fs);
+    let result = framekernel::initramfs::extract(INITRAMFS_IMAGE, &mut fs);
     let n = result.unwrap_or(0);
 
     let mut buf = [0u8; 32];

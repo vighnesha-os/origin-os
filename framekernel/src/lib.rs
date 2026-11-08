@@ -48,6 +48,8 @@
 //!   Proposed; host-tested, not mounted by the kernel pending owner approval, §84);
 //! - [`tcp`]: TCP segments and a minimal connection state machine;
 //! - [`text`]: a streaming, error-locating UTF-8 decoder for the text engine;
+//! - [`tftp`]: a TFTP reader (RFC 1350): read requests, acknowledgements and a download
+//!   state machine;
 //! - [`timers`]: a monotonic-deadline timer queue;
 //! - [`topology`]: CPU topology (SMT/core/package) from CPUID leaf 0Bh;
 //! - [`nvme`]: NVMe controller registers, queue entries and indexes, Identify data;
@@ -128,6 +130,7 @@ pub mod tcp;
 #[cfg(test)]
 mod testing;
 pub mod text;
+pub mod tftp;
 pub mod timers;
 pub mod topology;
 pub mod unwind;

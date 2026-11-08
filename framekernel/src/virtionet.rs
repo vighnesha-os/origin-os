@@ -489,27 +489,88 @@ fn tx_flush() {
     }
 }
 
-/// Sleeps until the next received frame and returns its Ethernet bytes (the virtio-net
-/// header stripped), advancing `last_used`. An empty slice means a malformed completion the
-/// caller should skip.
-///
-/// The running kernel thread blocks on [`NET_WAIT`] and only the NIC's used-buffer interrupt
-/// (`on_interrupt`) wakes it: there is no deadline, so without the interrupt it never runs
-/// again (the boot flow's bounded wait for the thread is what notices). The condition reads
-/// the used ring itself, so a frame that arrived before the thread registered is seen at
-/// once and no wake-up is lost.
-fn recv_frame(rx: &Queue, rx_pages: &[u64; N_RX], last_used: &mut u16) -> &'static [u8] {
-    let blocked = NET_WAIT.wait_until(|| r16(rx.used + 2) != *last_used);
-    RX_BLOCKED.fetch_add(blocked, Ordering::Relaxed);
-    fence(Ordering::SeqCst);
-    let slot = (*last_used as usize) % rx.size;
-    let (id, len) = virtqueue::used_elem(page(rx.used, virtqueue::used_bytes(rx.size)), slot);
-    *last_used = last_used.wrapping_add(1);
-    let (id, len) = (id as usize, len as usize);
-    if id >= N_RX || !(virtio::NET_HDR_LEN..=RX_BUF).contains(&len) {
-        return &[];
+/// The receive ring: buffers `0..N_RX` (kept DMA pages, posted once by [`post_rx`]) that
+/// the device fills, recycled one at a time — the buffer holding the frame [`RxRing::recv`]
+/// returned goes back to the device at the next `recv`, so the ring never runs dry.
+struct RxRing {
+    q: Queue,
+    pages: [u64; N_RX],
+    notify_base: u64,
+    mul: u32,
+    /// The used ring is consumed up to here.
+    last_used: u16,
+    /// Each buffer is the device's to fill (posted) or the driver's (returned, not yet
+    /// re-posted): a device-reported id that is not posted is refused, never re-posted twice.
+    posted: [bool; N_RX],
+    /// The buffer holding the frame the last `recv` returned.
+    held: Option<u16>,
+    received: u64,
+    recycled: u64,
+}
+
+impl RxRing {
+    /// The ring over `q` whose buffers `post_rx` posted at `pages`.
+    fn new(q: Queue, pages: [u64; N_RX], notify_base: u64, mul: u32) -> Self {
+        Self {
+            q,
+            pages,
+            notify_base,
+            mul,
+            last_used: 0,
+            posted: [true; N_RX],
+            held: None,
+            received: 0,
+            recycled: 0,
+        }
     }
-    &page(rx_pages[id], RX_BUF)[virtio::NET_HDR_LEN..len]
+
+    /// Hands the previous frame's buffer back to the device, then sleeps until the next
+    /// received frame and returns its Ethernet bytes (the virtio-net header stripped). The
+    /// slice is valid until the next `recv` (the borrow of `self` enforces it). An empty
+    /// slice means a malformed completion the caller should skip.
+    ///
+    /// The running kernel thread blocks on [`NET_WAIT`] and only the NIC's used-buffer
+    /// interrupt (`on_interrupt`) wakes it: there is no deadline, so without the interrupt it
+    /// never runs again (the boot flow's bounded wait for the thread is what notices). The
+    /// condition reads the used ring itself, so a frame that arrived before the thread
+    /// registered is seen at once and no wake-up is lost.
+    fn recv(&mut self) -> &[u8] {
+        if let Some(id) = self.held.take() {
+            // Its descriptor still describes the same page, so publishing the id is enough.
+            if let Some(posted) = self.posted.get_mut(usize::from(id)) {
+                *posted = true;
+            }
+            virtqueue::avail_push(
+                page(self.q.avail, virtqueue::avail_bytes(self.q.size)),
+                self.q.size,
+                id,
+            );
+            notify(self.notify_base, self.q.notify_off, self.mul, Q_RX);
+            self.recycled += 1;
+        }
+        let (used, last) = (self.q.used, self.last_used);
+        let blocked = NET_WAIT.wait_until(|| r16(used + 2) != last);
+        RX_BLOCKED.fetch_add(blocked, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        let slot = usize::from(self.last_used) % self.q.size;
+        let (id, len) =
+            virtqueue::used_elem(page(self.q.used, virtqueue::used_bytes(self.q.size)), slot);
+        self.last_used = self.last_used.wrapping_add(1);
+        self.received += 1;
+        let (i, len) = (id as usize, len as usize);
+        let (Some(posted), Some(&virt)) = (self.posted.get_mut(i), self.pages.get(i)) else {
+            return &[]; // an id we never posted: nothing to read or recycle
+        };
+        if !*posted {
+            return &[]; // a buffer the device already returned: refuse it
+        }
+        *posted = false;
+        self.held = Some(id as u16);
+        if !(virtio::NET_HDR_LEN..=RX_BUF).contains(&len) {
+            return &[];
+        }
+        &page(virt, RX_BUF)[virtio::NET_HDR_LEN..len]
+    }
 }
 
 /// Builds a broadcast Ethernet frame into `out` and returns its length.
@@ -596,9 +657,9 @@ fn send_arp(our_mac: Mac, sender_ip: Ipv4, target_ip: Ipv4, kick: bool) -> bool 
 
 /// Sleeps for received frames until [`GATEWAY`]'s ARP reply arrives (at most four frames),
 /// returning the gateway's MAC.
-fn await_arp_reply(rx: &Queue, rx_pages: &[u64; N_RX], last_used: &mut u16) -> Option<Mac> {
+fn await_arp_reply(rx: &mut RxRing) -> Option<Mac> {
     for _ in 0..4 {
-        let eth = recv_frame(rx, rx_pages, last_used);
+        let eth = rx.recv();
         if let Some(parsed) = EthFrame::parse(eth)
             && parsed.ethertype == ethertype::ARP
             && let Some(arp) = Arp::parse(parsed.payload)
@@ -666,17 +727,10 @@ fn send_ping(our_mac: Mac, dst_mac: Mac, src: Ipv4, dst: Ipv4, sequence: u16) ->
 /// Sleeps for received frames until the echo reply to request `sequence` arrives from
 /// `from` to `to` (at most four frames). The reply must carry our identifier, the sequence
 /// and the request's data, with valid IPv4 and ICMP checksums.
-fn await_echo_reply(
-    rx: &Queue,
-    rx_pages: &[u64; N_RX],
-    last_used: &mut u16,
-    from: Ipv4,
-    to: Ipv4,
-    sequence: u16,
-) -> bool {
+fn await_echo_reply(rx: &mut RxRing, from: Ipv4, to: Ipv4, sequence: u16) -> bool {
     let data = ping_data(sequence);
     for _ in 0..4 {
-        let eth = recv_frame(rx, rx_pages, last_used);
+        let eth = rx.recv();
         if let Some(frame) = EthFrame::parse(eth)
             && frame.ethertype == ethertype::IPV4
             && let Some(packet) = net::Ipv4Packet::parse(frame.payload)
@@ -698,18 +752,11 @@ fn await_echo_reply(
 /// Pings the gateway [`PINGS`] times from the leased address `ours`, unicast to the MAC the
 /// ARP exchange resolved, sleeping on the receive interrupt for each reply, and records the
 /// replies that matched and their round-trip times.
-fn ping_gateway(
-    rx: &Queue,
-    rx_pages: &[u64; N_RX],
-    last_used: &mut u16,
-    our_mac: Mac,
-    gateway_mac: Mac,
-    ours: Ipv4,
-) {
+fn ping_gateway(rx: &mut RxRing, our_mac: Mac, gateway_mac: Mac, ours: Ipv4) {
     for sequence in 1..=PINGS {
         let start = crate::cpu::rdtsc();
         if send_ping(our_mac, gateway_mac, ours, GATEWAY, sequence)
-            && await_echo_reply(rx, rx_pages, last_used, GATEWAY, ours, sequence)
+            && await_echo_reply(rx, GATEWAY, ours, sequence)
         {
             let rtt = crate::cpu::rdtsc().wrapping_sub(start);
             PING_REPLIES.fetch_add(1, Ordering::Relaxed);
@@ -720,18 +767,146 @@ fn ping_gateway(
     }
 }
 
+/// The file fetched over TFTP: `xtask` points slirp's built-in TFTP server (`tftp=`) at
+/// `framekernel/assets`, the directory the kernel's own initramfs image comes from.
+const TFTP_FILE: &str = "initramfs.tar";
+/// Our UDP port for the transfer.
+const TFTP_CLIENT_PORT: u16 = 49152;
+/// The largest file the fetch accepts.
+const TFTP_LIMIT: usize = 64 * 1024;
+
+/// The fetch's results: bytes and blocks accepted, whether it completed and matched the
+/// embedded image (1), and the server's error code plus one (0: none).
+static TFTP_BYTES: AtomicU64 = AtomicU64::new(0);
+static TFTP_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static TFTP_COMPLETE: AtomicU64 = AtomicU64::new(0);
+static TFTP_IDENTICAL: AtomicU64 = AtomicU64::new(0);
+static TFTP_ERROR: AtomicU64 = AtomicU64::new(0);
+/// Frames the receive ring delivered and buffers it handed back, as the thread finished.
+static RX_FRAMES: AtomicU64 = AtomicU64::new(0);
+static RX_RECYCLED: AtomicU64 = AtomicU64::new(0);
+
+/// Transmits a UDP datagram from `src`:`sport` to `dst`:`dport` (with its checksum), unicast
+/// to `dst_mac`.
+fn send_udp(
+    our_mac: Mac,
+    dst_mac: Mac,
+    (src, sport): (Ipv4, u16),
+    (dst, dport): (Ipv4, u16),
+    payload: &[u8],
+) -> bool {
+    let mut udp = [0u8; net::UDP_HEADER + 600];
+    let Some(un) = net::Udp::write(src, dst, sport, dport, payload, &mut udp) else {
+        return false;
+    };
+    let mut ip = [0u8; net::IPV4_HEADER + net::UDP_HEADER + 600];
+    let Some(ipn) =
+        net::Ipv4Packet::write(src, dst, net::protocol::UDP, 64, 0, &udp[..un], &mut ip)
+    else {
+        return false;
+    };
+    let mut frame = [0u8; net::ETH_HEADER + net::IPV4_HEADER + net::UDP_HEADER + 600];
+    let Some(fl) = build_frame(&mut frame, dst_mac, our_mac, ethertype::IPV4, &ip[..ipn]) else {
+        return false;
+    };
+    transmit(&frame[..fl])
+}
+
+/// Sleeps for received frames until a UDP datagram from `from` to `to`:`port` arrives (at
+/// most `tries` frames), copies its payload into `out` and returns its source port and
+/// length. The IPv4 header checksum and the UDP checksum are verified; a datagram whose
+/// payload does not fit `out` is skipped.
+fn await_udp(
+    rx: &mut RxRing,
+    (from, to, port): (Ipv4, Ipv4, u16),
+    tries: usize,
+    out: &mut [u8],
+) -> Option<(u16, usize)> {
+    for _ in 0..tries {
+        let eth = rx.recv();
+        if let Some(frame) = EthFrame::parse(eth)
+            && frame.ethertype == ethertype::IPV4
+            && let Some(packet) = net::Ipv4Packet::parse(frame.payload)
+            && packet.protocol == net::protocol::UDP
+            && packet.src == from
+            && packet.dst == to
+            && let Some(udp) = net::Udp::parse(packet.payload, from, to)
+            && udp.dst_port == port
+            && let Some(dst) = out.get_mut(..udp.payload.len())
+        {
+            dst.copy_from_slice(udp.payload);
+            return Some((udp.src_port, udp.payload.len()));
+        }
+    }
+    None
+}
+
+/// Fetches [`TFTP_FILE`] from the TFTP server on the gateway (`tftp::Download` drives the
+/// protocol): a read request to port 69 from the leased address, then each DATA block
+/// acknowledged to the port the server answers from, until the short final block — the
+/// thread sleeping on the receive interrupt for every block. Records the outcome and
+/// whether the file matches the image built into the kernel.
+fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
+    use framekernel::tftp;
+
+    let mut request = [0u8; 64];
+    let Some(n) = tftp::read_request(TFTP_FILE, &mut request) else {
+        return;
+    };
+    let ours_port = (ours, TFTP_CLIENT_PORT);
+    if !send_udp(
+        our_mac,
+        server_mac,
+        ours_port,
+        (GATEWAY, tftp::PORT),
+        &request[..n],
+    ) {
+        return;
+    }
+    let mut download = tftp::Download::new(TFTP_LIMIT);
+    let mut server_port = None;
+    let mut packet = [0u8; 4 + tftp::BLOCK];
+    // One frame per block, plus room for strays.
+    for _ in 0..TFTP_LIMIT / tftp::BLOCK + 8 {
+        let Some((port, len)) = await_udp(rx, (GATEWAY, ours, TFTP_CLIENT_PORT), 4, &mut packet)
+        else {
+            break;
+        };
+        // The transfer continues with the port the server first answered from (its TID).
+        if *server_port.get_or_insert(port) != port {
+            continue;
+        }
+        match download.on_packet(&packet[..len]) {
+            tftp::Step::Ack { block, last } => {
+                let mut ack = [0u8; 4];
+                if let Some(an) = tftp::ack(block, &mut ack) {
+                    send_udp(our_mac, server_mac, ours_port, (GATEWAY, port), &ack[..an]);
+                }
+                if last {
+                    break;
+                }
+            }
+            tftp::Step::Failed(_) => break,
+            tftp::Step::Ignore => {}
+        }
+    }
+    TFTP_BYTES.store(download.data().len() as u64, Ordering::Relaxed);
+    TFTP_BLOCKS.store(u64::from(download.blocks()), Ordering::Relaxed);
+    TFTP_COMPLETE.store(u64::from(download.is_complete()), Ordering::Relaxed);
+    let identical = download.is_complete() && download.data() == crate::INITRAMFS_IMAGE;
+    TFTP_IDENTICAL.store(u64::from(identical), Ordering::Relaxed);
+    if let Some(tftp::Failure::Server(code)) = download.failure() {
+        TFTP_ERROR.store(u64::from(code) + 1, Ordering::Relaxed);
+    }
+}
+
 /// Obtains a DHCP lease over the NIC: DISCOVER → OFFER → REQUEST → ACK with QEMU's built-in
 /// server, returning the leased address.
-fn dhcp_lease(
-    rx: &Queue,
-    rx_pages: &[u64; N_RX],
-    last_used: &mut u16,
-    our_mac: Mac,
-) -> Option<Ipv4> {
+fn dhcp_lease(rx: &mut RxRing, our_mac: Mac) -> Option<Ipv4> {
     let mut client = framekernel::dhcp::Client::new(our_mac.0);
     transmit_dhcp(our_mac, &client.start(0x4F52_4947));
     for _ in 0..8 {
-        let eth = recv_frame(rx, rx_pages, last_used);
+        let eth = rx.recv();
         let Some(message) = dhcp_payload(eth) else {
             continue;
         };
@@ -757,14 +932,14 @@ extern "sysv64" fn net_thread(_: u64) -> ! {
     if let Some(s) = setup
         && let Some(rx_pages) = post_rx(&s.rx, s.notify_base, s.mul)
     {
-        let mut last_used = 0u16;
+        let mut rx = RxRing::new(s.rx, rx_pages, s.notify_base, s.mul);
         RX_ARMED.store(1, Ordering::Release);
-        let gateway = await_arp_reply(&s.rx, &rx_pages, &mut last_used);
+        let gateway = await_arp_reply(&mut rx);
         if let Some(gateway) = gateway {
             let packed = gateway.0.iter().fold(0u64, |a, &b| (a << 8) | u64::from(b));
             RX_GATEWAY.store(packed, Ordering::Relaxed);
         }
-        let lease = dhcp_lease(&s.rx, &rx_pages, &mut last_used, Mac(s.mac));
+        let lease = dhcp_lease(&mut rx, Mac(s.mac));
         if let Some(lease) = lease {
             let address = u64::from(u32::from_be_bytes(lease.0));
             RX_LEASE.store((1 << 32) | address, Ordering::Relaxed);
@@ -781,11 +956,14 @@ extern "sysv64" fn net_thread(_: u64) -> ! {
         // ARP request included) has completed and its descriptor is back in the pool.
         tx_flush();
         // Use the lease: ping the gateway from the leased address, unicast to the MAC the
-        // ARP exchange resolved, then flush those frames too.
+        // ARP exchange resolved, fetch a file from its TFTP server, then flush those frames.
         if let (Some(gateway), Some(lease)) = (gateway, lease) {
-            ping_gateway(&s.rx, &rx_pages, &mut last_used, Mac(s.mac), gateway, lease);
+            ping_gateway(&mut rx, Mac(s.mac), gateway, lease);
+            fetch_tftp(&mut rx, Mac(s.mac), gateway, lease);
             tx_flush();
         }
+        RX_FRAMES.store(rx.received, Ordering::Relaxed);
+        RX_RECYCLED.store(rx.recycled, Ordering::Relaxed);
     }
     RX_DONE.store(1, Ordering::Release);
     crate::sched::exit()
@@ -1051,5 +1229,42 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         g[7],
         ping_ok,
         if ping_ok { "" } else { ": virtio-net failed" }
+    );
+
+    // A file over the lease: the kernel's own initramfs image fetched from the gateway's
+    // TFTP server must arrive whole and identical to the copy built into the kernel; and the
+    // receive ring, which posts only N_RX buffers, must have recycled them to carry it.
+    let bytes = TFTP_BYTES.load(Ordering::Relaxed);
+    let blocks = TFTP_BLOCKS.load(Ordering::Relaxed);
+    let complete = TFTP_COMPLETE.load(Ordering::Relaxed) != 0;
+    let identical = TFTP_IDENTICAL.load(Ordering::Relaxed) != 0;
+    let server_error = TFTP_ERROR.load(Ordering::Relaxed);
+    let frames = RX_FRAMES.load(Ordering::Relaxed);
+    let recycled = RX_RECYCLED.load(Ordering::Relaxed);
+    let tftp_ok = finished
+        && complete
+        && identical
+        && bytes == crate::INITRAMFS_IMAGE.len() as u64
+        && frames > N_RX as u64
+        && recycled > 0;
+    let outcome = if identical {
+        alloc::string::String::from("identical to the embedded image")
+    } else if server_error != 0 {
+        alloc::format!("server error {}", server_error - 1)
+    } else if complete {
+        alloc::string::String::from("differs from the embedded image")
+    } else {
+        alloc::string::String::from("incomplete")
+    };
+    let _ = writeln!(
+        com1,
+        "origin-kernel: virtio-net TFTP: {TFTP_FILE} from 10.0.2.2: {bytes} bytes in {blocks} blocks{}, {outcome}; the receive ring's {N_RX} buffers carried {frames} frames ({recycled} recycled); consistent {}{}",
+        if complete && bytes.is_multiple_of(framekernel::tftp::BLOCK as u64) {
+            " (the last empty)"
+        } else {
+            ""
+        },
+        tftp_ok,
+        if tftp_ok { "" } else { ": virtio-net failed" }
     );
 }

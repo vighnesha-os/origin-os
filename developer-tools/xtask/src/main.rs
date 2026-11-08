@@ -347,6 +347,11 @@ fn boot_scenario_markers() -> Scenario {
             // leased address to the MAC ARP resolved.
             "origin-kernel: virtio-net ping: 10.0.2.15 -> 10.0.2.2 (52:55:0a:00:02:02): 4 of 4 echo replies".into(),
             "; consistent true".into(),
+            // A file over the lease: the kernel's initramfs image fetched by TFTP from the
+            // gateway (4608 bytes = nine full blocks and an empty tenth), identical to the
+            // embedded copy, through recycled receive buffers.
+            "origin-kernel: virtio-net TFTP: initramfs.tar from 10.0.2.2: 4608 bytes in 10 blocks (the last empty), identical to the embedded image".into(),
+            "; consistent true".into(),
             // The in-memory VFS (CLAUDE.md §39): a file built, read back, listed and removed.
             "origin-kernel: vfs: built /etc/origin/hostname (read back true), listed 1 entry, removed all back to 1 node".into(),
             // §21: the embedded ustar initramfs extracts into a VFS (contents and an
@@ -1174,8 +1179,9 @@ fn stage(kernel: &[u8]) -> Result<Staged> {
     })
 }
 
-/// One `-drive` value. QEMU option syntax escapes a literal comma as ",,".
-fn drive(options: &str, path: &Path) -> Result<String> {
+/// A QEMU option value that ends in a path (a `-drive` or `-netdev` value). QEMU option
+/// syntax escapes a literal comma as ",,".
+fn qemu_path_arg(options: &str, path: &Path) -> Result<String> {
     let p = path
         .to_str()
         .ok_or_else(|| format!("path is not UTF-8: {}", path.display()))?;
@@ -1198,20 +1204,27 @@ fn qemu_command(s: &Staged) -> Result<Command> {
         // A cross-node distance so the ACPI SLIT is populated too (QEMU mirrors 1->0).
         .args(["-numa", "dist,src=0,dst=1,val=21"])
         .arg("-drive")
-        .arg(drive(
+        .arg(qemu_path_arg(
             "if=pflash,format=raw,readonly=on,file=",
             &s.firmware.code,
         )?)
         .arg("-drive")
-        .arg(drive("if=pflash,format=raw,file=", &s.vars)?)
+        .arg(qemu_path_arg("if=pflash,format=raw,file=", &s.vars)?)
         .arg("-drive")
-        .arg(drive("format=raw,file=fat:rw:", &s.esp)?)
+        .arg(qemu_path_arg("format=raw,file=fat:rw:", &s.esp)?)
         // The NVMe controller and its test disk (CLAUDE.md §33).
         .arg("-drive")
-        .arg(drive("if=none,id=nvme0,format=raw,file=", &s.nvme)?)
+        .arg(qemu_path_arg("if=none,id=nvme0,format=raw,file=", &s.nvme)?)
         .args(["-device", "nvme,serial=ORIGIN0001,drive=nvme0"])
         // A modern virtio-net NIC with a fixed MAC, on QEMU user networking (CLAUDE.md §54).
-        .args(["-netdev", "user,id=net0"])
+        // Its built-in TFTP server serves framekernel/assets read-only, so the kernel can
+        // fetch its own initramfs image over the network and compare it with the embedded
+        // copy (no host network involved).
+        .arg("-netdev")
+        .arg(qemu_path_arg(
+            "user,id=net0,tftp=",
+            &repo_root().join("framekernel").join("assets"),
+        )?)
         .args([
             "-device",
             "virtio-net-pci,netdev=net0,mac=52:54:00:aa:bb:cc,disable-legacy=on",
