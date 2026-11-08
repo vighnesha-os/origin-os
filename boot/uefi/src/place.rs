@@ -24,7 +24,7 @@ pub enum PlaceError {
     Misaligned(u64),
     /// A relocation slot is not inside the content of a writable, non-executable segment.
     NotWritable(u64),
-    /// `slot + base` overflows.
+    /// A relocation location runs past the top of the address space.
     Overflow(u64),
     /// The image has more segments than the boot info can describe.
     TooManySegments,
@@ -105,7 +105,9 @@ fn writable_slot(image: &Image<'_>, rva: u64) -> bool {
     })
 }
 
-/// Adds `base` to the u64 at `rva` in `dest`, after checking the slot.
+/// Adds `base` to the u64 at `rva` in `dest`, after checking the slot. The addition wraps:
+/// a negative addend is stored as u64 two's complement (errata P5), so a slot legitimately
+/// holds a value that only comes back into range once the base is added.
 fn relocate(
     writable: &impl Fn(u64) -> bool,
     dest: &mut [u8],
@@ -125,9 +127,7 @@ fn relocate(
         .ok_or(PlaceError::NotWritable(rva))?;
     let mut word = [0u8; 8];
     copy(&mut word, slot);
-    let value = u64::from_le_bytes(word)
-        .checked_add(base)
-        .ok_or(PlaceError::Overflow(rva))?;
+    let value = u64::from_le_bytes(word).wrapping_add(base);
     copy(slot, &value.to_le_bytes());
     Ok(())
 }
@@ -298,12 +298,20 @@ mod tests {
             apply_relr(&some, 0, &words(&[0, u64::MAX]), &mut small, BASE),
             Err(PlaceError::NotWritable(32))
         );
-        // An addend that overflows when relocated.
+    }
+
+    /// Errata P5: addends are u64 two's complement, so the loader adds with wrapping.
+    #[test]
+    fn a_negative_addend_wraps_to_its_address() {
+        let kernel_base = 0xFFFF_FFFF_8460_0000_u64;
         let mut d = dest();
-        d[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        d[..8].copy_from_slice(&(-0x1000_i64 as u64).to_le_bytes());
+        d[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(
-            apply_relr(&ALL, 0, &words(&[0]), &mut d, BASE),
-            Err(PlaceError::Overflow(0))
+            apply_relr(&ALL, 0, &words(&[0, 0b11]), &mut d, kernel_base),
+            Ok(2)
         );
+        assert_eq!(slot(&d, 0), kernel_base - 0x1000);
+        assert_eq!(slot(&d, 1), kernel_base - 1);
     }
 }

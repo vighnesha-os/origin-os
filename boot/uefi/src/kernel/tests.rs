@@ -92,7 +92,7 @@ fn signature_verdict(
     store: &[TrustedKey<'_>],
 ) -> Result<Option<[u8; 32]>, KernelError> {
     let image = Image::parse(bytes, ParseOptions::default()).expect("the image parses");
-    check_signature(&image, store)
+    check_signature(&image, false, store)
 }
 
 #[test]
@@ -125,7 +125,8 @@ fn an_unsigned_image_is_refused_outside_developer_mode() {
         verify(&bytes, true, &store(&f)).map(|_| ()),
         Err(KernelError::ContentDigest)
     );
-    // An unsigned image has no signature to check.
+    // An unsigned image has no signature to check, which is acceptable only in developer
+    // mode: the step refuses it by itself, whatever the parser let through.
     let image = Image::parse(
         &bytes,
         ParseOptions {
@@ -134,7 +135,11 @@ fn an_unsigned_image_is_refused_outside_developer_mode() {
         },
     )
     .unwrap();
-    assert_eq!(check_signature(&image, &store(&f)), Ok(None));
+    assert_eq!(check_signature(&image, true, &store(&f)), Ok(None));
+    assert_eq!(
+        check_signature(&image, false, &store(&f)),
+        Err(KernelError::Unsigned)
+    );
 }
 
 /// Each refusal has its own message; `xtask` matches these on the serial console.

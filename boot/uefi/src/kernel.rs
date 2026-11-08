@@ -143,7 +143,7 @@ pub fn verify<'a>(
     image
         .verify_content_digest(sha512)
         .map_err(|_| KernelError::ContentDigest)?;
-    let signer = check_signature(&image, store)?;
+    let signer = check_signature(&image, developer_mode, store)?;
 
     let manifest_section = image
         .manifest()
@@ -192,13 +192,16 @@ pub fn verify<'a>(
 
 /// B2 step 3: the signature block against the trust store. The digest it checks is the
 /// header's, which step 2 has just proven to be the image's. Nothing of the kernel beyond
-/// the header and the section table has been read before this returns.
+/// the header and the section table has been read before this returns. An image with no
+/// block is accepted in developer mode only (ADR-0002 B8).
 fn check_signature(
     image: &Image<'_>,
+    developer_mode: bool,
     store: &[TrustedKey<'_>],
 ) -> Result<Option<[u8; 32]>, KernelError> {
     match image.signature_block() {
-        None => Ok(None),
+        None if developer_mode => Ok(None),
+        None => Err(KernelError::Unsigned),
         Some(block) => verify_krn_block(block, store, &image.header().content_digest)
             .map(Some)
             .map_err(KernelError::Signature),
