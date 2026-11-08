@@ -313,6 +313,46 @@ pub unsafe fn copy_char16_string(s: *const u16, buf: &mut [u16]) -> usize {
     n
 }
 
+/// How [`exit_boot_services`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitOutcome<E> {
+    /// Boot services are gone: the caller owns the machine.
+    Exited,
+    /// `prepare` failed before the first `ExitBootServices` call. Boot services are untouched,
+    /// so the caller may report this on the console and return to the firmware.
+    NotAttempted(E),
+    /// `ExitBootServices` was called and did not succeed. The firmware may be partly shut
+    /// down (UEFI 2.11 §7.4), so nothing in it may be used again, not even the console: the
+    /// caller must halt.
+    Halt,
+}
+
+/// Leaves the firmware (ADR-0002 B5). `prepare` takes the memory map and returns its key;
+/// `exit` calls `ExitBootServices` with it. On `EFI_INVALID_PARAMETER`, a key that changed,
+/// they run once more, which is the one retry UEFI 2.11 §7.4 allows: after the first `exit`
+/// only the memory services and `ExitBootServices` itself may be called, so `prepare` must use
+/// nothing else, and any failure from then on is [`ExitOutcome::Halt`].
+pub fn exit_boot_services<E>(
+    mut prepare: impl FnMut() -> Result<usize, E>,
+    mut exit: impl FnMut(usize) -> Status,
+) -> ExitOutcome<E> {
+    let key = match prepare() {
+        Ok(key) => key,
+        Err(e) => return ExitOutcome::NotAttempted(e),
+    };
+    let status = exit(key);
+    if !status.is_error() {
+        return ExitOutcome::Exited;
+    }
+    if status != Status::INVALID_PARAMETER {
+        return ExitOutcome::Halt;
+    }
+    match prepare().map(&mut exit) {
+        Ok(status) if !status.is_error() => ExitOutcome::Exited,
+        _ => ExitOutcome::Halt,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,6 +500,68 @@ mod tests {
         // SAFETY: the string at `p` is NUL-terminated within `bytes`; unaligned is allowed.
         let n = unsafe { copy_char16_string(p, &mut buf) };
         assert_eq!(&buf[..n], &[u16::from(b'A'), u16::from(b'B')]);
+    }
+
+    /// Runs [`exit_boot_services`] against scripted firmware answers, returning the outcome and
+    /// how many times each step ran.
+    fn exit_run(
+        prepares: &[Result<usize, u32>],
+        exits: &[Status],
+    ) -> (ExitOutcome<u32>, usize, usize) {
+        let (mut prepared, mut exited) = (0, 0);
+        let outcome = exit_boot_services(
+            || {
+                prepared += 1;
+                prepares[prepared - 1]
+            },
+            |key| {
+                exited += 1;
+                assert_eq!(key, 7 + exited - 1, "exit uses the key prepare returned");
+                exits[exited - 1]
+            },
+        );
+        (outcome, prepared, exited)
+    }
+
+    #[test]
+    fn exit_boot_services_retries_once_and_only_for_a_changed_key() {
+        let (bad_key, device) = (Status::INVALID_PARAMETER, Status::DEVICE_ERROR);
+        let keys = [Ok(7), Ok(8)];
+        // Success at once, and success on the one allowed retry.
+        assert_eq!(
+            exit_run(&keys, &[Status::SUCCESS]),
+            (ExitOutcome::Exited, 1, 1)
+        );
+        assert_eq!(
+            exit_run(&keys, &[bad_key, Status::SUCCESS]),
+            (ExitOutcome::Exited, 2, 2)
+        );
+        // A second bad key is the end: no third attempt.
+        assert_eq!(
+            exit_run(&keys, &[bad_key, bad_key]),
+            (ExitOutcome::Halt, 2, 2)
+        );
+        // Any other status from the first call: no retry, and no memory map either.
+        assert_eq!(exit_run(&keys, &[device]), (ExitOutcome::Halt, 1, 1));
+        // The second attempt failing any way at all is also a halt.
+        assert_eq!(
+            exit_run(&keys, &[bad_key, device]),
+            (ExitOutcome::Halt, 2, 2)
+        );
+    }
+
+    #[test]
+    fn exit_boot_services_reports_only_failures_before_the_first_call() {
+        // Before the first `ExitBootServices`: reported, and boot services are still up.
+        assert_eq!(
+            exit_run(&[Err(3)], &[]),
+            (ExitOutcome::NotAttempted(3), 1, 0)
+        );
+        // After it: the memory map failing again is a halt, not a report on the console.
+        assert_eq!(
+            exit_run(&[Ok(7), Err(3)], &[Status::INVALID_PARAMETER]),
+            (ExitOutcome::Halt, 2, 1)
+        );
     }
 
     #[test]

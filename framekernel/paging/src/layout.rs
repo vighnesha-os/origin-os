@@ -44,6 +44,10 @@ pub const KERNEL_ALIGN: u64 = LARGE_PAGE;
 pub const FRAMEBUFFER_WINDOW: u64 = 0xFFFF_E000_0000_0000;
 /// Size of the framebuffer window. Device registers are mapped above it.
 pub const FRAMEBUFFER_WINDOW_SIZE: u64 = 2 << 30;
+/// Bits of the address a page directory covers (1 GiB).
+const GIB_SHIFT: u32 = 30;
+/// Bits of the address a PDPT covers (512 GiB).
+const PDPT_SHIFT: u32 = 39;
 const _: () = assert!(
     FRAMEBUFFER_WINDOW_SIZE >= MAX_FRAMEBUFFER_BYTES + 2 * PAGE + LARGE_PAGE,
     "the window must hold the largest framebuffer at any offset within a large page"
@@ -112,6 +116,49 @@ pub fn place(random: u64, max_physical: u64, kernel_span: u64) -> Option<(u64, u
     let direct = DIRECT_MAP_WINDOW + (random % direct_slots) * DIRECT_MAP_ALIGN;
     let kernel = KERNEL_WINDOW + ((random >> 32) % kernel_slots) * KERNEL_ALIGN;
     Some((direct, kernel))
+}
+
+/// An upper bound on the page tables that mapping these `regions` and a kernel image of
+/// `kernel_span` bytes can take: [`build`], then [`map_framebuffer`], then the two identity
+/// pages of the boot loader's entry stub.
+///
+/// The bound follows what [`AddressSpace::map_range`] does with 4 KiB and 2 MiB leaves:
+/// - **the direct map:** a PDPT per 512 GiB up to the highest RAM, plus two for a window
+///   slid by only 1 GiB; a page directory per GiB each region touches; and a page table for each
+///   end of a region that is not on a 2 MiB boundary, so two per region, however large;
+/// - **the image:** one PDPT, the directories of its span plus one (it may straddle a GiB),
+///   and a page table per 2 MiB of it, plus one: its physical base is only page-aligned, so
+///   every page of it may be a 4 KiB leaf;
+/// - **the framebuffer:** one PDPT, two directories (at most 1 GiB, at any offset) and two
+///   page tables for its ends, since its virtual address keeps the physical offset within 2 MiB;
+/// - **the entry stub:** two adjacent pages, which in the worst case share nothing.
+///
+/// `regions` may come from an earlier map than the one the tables are built from: every later
+/// allocation turns direct-mapped RAM into RAM of another kind, so the GiBs touched can only
+/// shrink, but regions split, so their ends are counted from `max_regions`, the most regions
+/// the later map can have. `None` if the bound does not fit in a `u64`.
+pub fn table_frames(regions: &[MemoryRegion], max_regions: u64, kernel_span: u64) -> Option<u64> {
+    let mut directories = 0u64;
+    let mut max_physical = 0u64;
+    for r in regions
+        .iter()
+        .filter(|r| direct_mapped(r.kind) && r.pages > 0)
+    {
+        let end = r.base.checked_add(r.pages.checked_mul(PAGE)?)?;
+        directories = directories
+            .checked_add(((end - 1) >> GIB_SHIFT) - (r.base >> GIB_SHIFT))?
+            .checked_add(1)?;
+        max_physical = max_physical.max(end);
+    }
+    let direct = ((max_physical >> PDPT_SHIFT) + 2)
+        .checked_add(directories)?
+        .checked_add(max_regions.checked_mul(2)?)?;
+    let image =
+        1 + (kernel_span.div_ceil(1 << GIB_SHIFT) + 1) + (kernel_span.div_ceil(LARGE_PAGE) + 1);
+    let (root, framebuffer, entry_stub) = (1, 1 + 2 + 2, 2 + 2 + 2);
+    direct
+        .checked_add(image)?
+        .checked_add(root + framebuffer + entry_stub)
 }
 
 /// What [`build`] mapped.
@@ -460,6 +507,134 @@ mod tests {
             place(0, ram, span),
             Some((DIRECT_MAP_WINDOW, KERNEL_WINDOW))
         );
+    }
+
+    /// Everything [`table_frames`] bounds, built into a pool of exactly that many tables. Returns
+    /// the tables used, and whether the framebuffer stayed.
+    fn build_within_the_bound(
+        tables: &[Table],
+        regions: &[MemoryRegion],
+        direct_base: u64,
+        kernel_physical_base: u64,
+        span: u64,
+    ) -> (usize, bool) {
+        let bound = table_frames(regions, regions.len() as u64, span).unwrap() as usize;
+        assert!(bound <= tables.len(), "the test's pool is too small");
+        let mut mem = TablePool::new(&tables[..bound], POOL_BASE);
+        let at = Placement {
+            direct_map_base: direct_base,
+            kernel_virtual_base: KERNEL_WINDOW + LARGE_PAGE,
+            kernel_physical_base,
+            stack_guard: 0,
+        };
+        let pages = span / PAGE;
+        let segments = [
+            segment(0, pages / 2, SEGMENT_READ),
+            segment(
+                (pages / 2) * PAGE,
+                pages - pages / 2,
+                SEGMENT_READ | SEGMENT_WRITE,
+            ),
+        ];
+        let (mut space, _) = build(&mut mem, &at, regions, &segments)
+            .unwrap_or_else(|e| panic!("{e:?}: {regions:x?}"));
+        let framebuffer = framebuffer_mapping(&display(0x8000_0000)).unwrap();
+        let kept = map_framebuffer(&mut space, &mut mem, &framebuffer);
+        // The entry stub, in the worst place: its two pages straddle a 512 GiB boundary.
+        let stub = (1 << 39) - PAGE;
+        let rx = Attributes::kernel(Access::ReadExecute);
+        space.map(&mut mem, stub, stub, rx).unwrap();
+        space.map(&mut mem, stub + PAGE, stub + PAGE, rx).unwrap();
+        (mem.used(), kept)
+    }
+
+    #[test]
+    fn the_table_bound_holds_for_large_and_for_ragged_memory_maps() {
+        let tables = pool(6000);
+        let span = 512 * PAGE;
+        let direct = DIRECT_MAP_WINDOW + (17 << 30);
+
+        // One region of 1 TiB, as a server's firmware reports it above 4 GiB: 1,024 page
+        // directories, far beyond the fixed 256 frames this replaced.
+        let big = [region(4 << 30, (1 << 40) / PAGE, RegionKind::Usable)];
+        assert!(table_frames(&big, 1, span).unwrap() > 1024);
+        let (used, kept) = build_within_the_bound(&tables, &big, direct, 0x1E0B_0000, span);
+        assert!(kept, "the framebuffer survives");
+        assert!(used > 1024);
+
+        // 300 GiB cut into many regions, each with both ends off a 2 MiB boundary, some of them
+        // not direct-mapped at all.
+        let mut ragged = Vec::new();
+        let mut base = 0x10_0000u64;
+        for i in 0..300 {
+            let kind = if i % 7 == 3 {
+                RegionKind::Reserved
+            } else {
+                RegionKind::LoaderReclaimable
+            };
+            let pages = (1 << 18) + 5 * (i % 11);
+            ragged.push(region(base, pages, kind));
+            base += (pages + 3) * PAGE;
+        }
+        let (used, kept) = build_within_the_bound(&tables, &ragged, direct, 0x1234_5000, span);
+        assert!(kept);
+        assert!(used > 256, "{used}: this map did not fit in the fixed pool");
+
+        // Random maps: unaligned bases and sizes, large and tiny regions, holes of any size.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..400 {
+            let mut regions = Vec::new();
+            let mut base = (next() % (1 << 21)) & !(PAGE - 1);
+            for _ in 0..1 + next() % 64 {
+                let pages = 1 + next() % (1 << (next() % 22));
+                let kind = match next() % 4 {
+                    0 => RegionKind::Usable,
+                    1 => RegionKind::LoaderReclaimable,
+                    2 => RegionKind::AcpiReclaimable,
+                    _ => RegionKind::Reserved,
+                };
+                regions.push(region(base, pages, kind));
+                base += (pages + next() % (1 << (next() % 20))) * PAGE;
+            }
+            let slide = (next() % (1 << 11)) << 30;
+            let physical_base = (next() % (1 << 30)) & !(PAGE - 1);
+            let span = (1 + next() % (1 << 15)) * PAGE;
+            let (used, kept) = build_within_the_bound(
+                &tables,
+                &regions,
+                DIRECT_MAP_WINDOW + slide,
+                physical_base,
+                span,
+            );
+            assert!(kept, "case {case}");
+            let bound = table_frames(&regions, regions.len() as u64, span).unwrap() as usize;
+            assert!(used <= bound, "case {case}: {used} of {bound}");
+        }
+    }
+
+    #[test]
+    fn the_table_bound_counts_later_splits_and_ignores_what_is_not_direct_mapped() {
+        let usable = [region(0x20_0000, 512, RegionKind::Usable)];
+        // One table per extra region end, for regions that exist only in the later map.
+        assert_eq!(
+            table_frames(&usable, 10, PAGE).unwrap() - table_frames(&usable, 1, PAGE).unwrap(),
+            2 * 9
+        );
+        // Memory that is never direct-mapped costs nothing, however much of it there is.
+        let mmio = [usable[0], region(1 << 42, 1 << 30, RegionKind::Mmio)];
+        assert_eq!(
+            table_frames(&mmio, 2, PAGE).unwrap(),
+            table_frames(&usable, 2, PAGE).unwrap()
+        );
+        // A bound that does not fit is reported, not wrapped.
+        let absurd = [region(!(PAGE - 1), 2, RegionKind::Usable)];
+        assert_eq!(table_frames(&absurd, 1, PAGE), None);
     }
 
     #[test]

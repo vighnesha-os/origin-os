@@ -161,7 +161,7 @@ fn padding(shape: &Shape, level: u8) -> Option<Range<usize>> {
         0 => shape.leaves(),
         below => shape.blocks_at(below),
     };
-    let used = hashes % HASHES_PER_BLOCK as u64;
+    let used = hashes & 127;
     if used == 0 {
         return None;
     }
