@@ -46,7 +46,7 @@ Status: **Proven** (boot proof and control, QEMU), **By design** (no proof), **O
 | T11 | A device overwrites a page it only needed to read | None: every mapping is read/write (I4) | **Open** |
 | T12 | A device reaches kernel data that shares a page with its buffer (compare Markuze et al., ASPLOS 2016) | `DeviceDma::page` allocates whole pages. But `iommu::map` is crate-visible, so kernel code could misuse it | By design |
 | T13 | A device changes shared memory after the driver checked it | Drivers validate what a device supplies, and hostile-ring tests exercise it. Most kernel-side refusals are host-tested only | Partly |
-| T14 | Firmware requires a device to reach reserved memory (RMRR, IVMD) | The device is refused at attach (fails closed). Costs availability | By design |
+| T14 | Firmware requires a device to reach reserved memory (RMRR, IVMD) | The device is refused at attach (fails closed). Costs availability. One consequence to expect on real machines: an integrated GPU scans out the firmware framebuffer through this path, so the framebuffer console (ADR-0010) goes dark when translation comes up, until identity maps exist | By design |
 | T15 | IOVAs run out: 1 GiB per device, and they are not reused | None. No driver maps per request yet | **Open** |
 
 ### Interrupts

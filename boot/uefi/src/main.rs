@@ -21,18 +21,21 @@ use core::panic::PanicInfo;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use origin_boot_info::{BootInfo, FLAG_KASLR, KernelSegment, MAX_KERNEL_SEGMENTS, MemoryRegion};
+use origin_boot_info::{
+    BootInfo, FLAG_KASLR, Framebuffer, KernelSegment, MAX_KERNEL_SEGMENTS, MemoryRegion,
+};
 use origin_boot_uefi::console::ConOut;
 use origin_boot_uefi::protocols::{
-    ACPI_20_TABLE, ALLOCATE_ANY_PAGES, BOOT_SERVICES_SIGNATURE, BootServices, ConfigurationTable,
-    FILE_INFO, FILE_INFO_FILE_SIZE_OFFSET, FILE_MODE_READ, FileProtocol, Guid,
-    LOADED_IMAGE_PROTOCOL, LoadedImageProtocol, SIMPLE_FILE_SYSTEM_PROTOCOL,
-    SimpleFileSystemProtocol, memory_type,
+    ACPI_20_TABLE, ALLOCATE_ANY_PAGES, BOOT_SERVICES_SIGNATURE, BootServices, CONSOLE_OUT_DEVICE,
+    ConfigurationTable, FILE_INFO, FILE_INFO_FILE_SIZE_OFFSET, FILE_MODE_READ, FileProtocol,
+    GRAPHICS_OUTPUT_PROTOCOL, GraphicsOutputProtocol, Guid, LOADED_IMAGE_PROTOCOL,
+    LOCATE_BY_PROTOCOL, LoadedImageProtocol, SIMPLE_FILE_SYSTEM_PROTOCOL, SimpleFileSystemProtocol,
+    memory_type,
 };
 use origin_boot_uefi::uefi::{
     self, Handle, Revision, SimpleTextOutputProtocol, Status, SystemTable, TableHeader,
 };
-use origin_boot_uefi::{kernel, memmap, place, trust};
+use origin_boot_uefi::{framebuffer, kernel, memmap, place, trust};
 use origin_paging::layout::{self, Placement};
 use origin_paging::{Access, Attributes, Table, TablePool};
 
@@ -273,6 +276,9 @@ fn boot(
     let pool_phys = allocate(&bs, memory_type::LOADER_DATA, TABLE_POOL_PAGES)
         .map_err(|s| fail(out, s, format_args!("cannot allocate the page-table pool")))?;
     let rsdp = find_rsdp(st);
+    // The firmware's framebuffer, for the kernel's console from its first line on (ADR-0010).
+    // The memory map says below whether it can be used; missing or unusable, the boot goes on.
+    let mut framebuffer = find_framebuffer(&bs, out);
 
     // B5: final memory map, translation, ExitBootServices (one retry, UEFI 2.11 §7.4).
     // Layout: BootInfo, then MAX_KERNEL_SEGMENTS segment slots, then the region array.
@@ -363,6 +369,20 @@ fn boot(
             .unwrap_or(0);
         let (direct, _) =
             layout::place(random, max_physical, span).ok_or(Status::OUT_OF_RESOURCES)?;
+        let framebuffer_map = layout::framebuffer_mapping(&framebuffer).filter(|m| {
+            let in_ram = origin_boot_info::overlaps_ram(regions, m.phys, m.bytes);
+            if in_ram {
+                let _ = writeln!(
+                    out,
+                    "origin-boot: framebuffer at {:#x}: it overlaps RAM in the memory map; not used",
+                    framebuffer.base
+                );
+            }
+            !in_ram
+        });
+        if framebuffer_map.is_none() {
+            framebuffer = Framebuffer::NONE;
+        }
         // SAFETY: `allocate` zeroed `TABLE_POOL_PAGES` identity-mapped pages at `pool_phys`
         // that only this pool uses; `Table` is 4 KiB of `AtomicU64`, valid for any bits.
         let tables = unsafe {
@@ -392,6 +412,33 @@ fn boot(
                     Attributes::kernel(Access::ReadExecute),
                 )
                 .map_err(|e| fail(out, Status::LOAD_ERROR, format_args!("entry stub: {e:?}")))?;
+        }
+        // Mapped last, so running out of tables here costs only the framebuffer (ADR-0010).
+        match framebuffer_map {
+            Some(m) if layout::map_framebuffer(&mut space, &mut pool, &m) => {
+                framebuffer.virtual_base = m.first_pixel;
+                let _ = writeln!(
+                    out,
+                    "origin-boot: framebuffer: {}x{} at {:#x}, stride {}, red {:#x} green {:#x} blue {:#x}; mapped at {:#x}",
+                    framebuffer.width,
+                    framebuffer.height,
+                    framebuffer.base,
+                    framebuffer.stride,
+                    framebuffer.red_mask,
+                    framebuffer.green_mask,
+                    framebuffer.blue_mask,
+                    framebuffer.virtual_base
+                );
+            }
+            Some(m) => {
+                let _ = writeln!(
+                    out,
+                    "origin-boot: framebuffer at {:#x}: could not map {} bytes; not used",
+                    m.phys, m.bytes
+                );
+                framebuffer = Framebuffer::NONE;
+            }
+            None => {}
         }
         let _ = writeln!(
             out,
@@ -479,6 +526,7 @@ fn boot(
             direct_map_base,
             kernel_virtual_base: kernel_virtual,
             flags: if entropy.is_some() { FLAG_KASLR } else { 0 },
+            framebuffer,
         };
         // SAFETY: `info_addr` is the start of this loader's zeroed, 4 KiB-aligned boot-info
         // allocation, large enough for a `BootInfo`.
@@ -700,6 +748,95 @@ fn find_rsdp(st: &SystemTable) -> u64 {
         }
     }
     0
+}
+
+/// The linear framebuffer of the firmware's display, or [`Framebuffer::NONE`] if there is none
+/// the kernel could use. Which one: every handle with a Graphics Output Protocol is looked at,
+/// and the first whose current mode is usable and which the firmware uses as a console output
+/// device wins, else the first usable one. A display that is on but not a console is better
+/// than none. Nothing here changes a mode, and nothing here can stop the boot.
+fn find_framebuffer(bs: &BootServices, out: &mut ConOut) -> Framebuffer {
+    let Some(locate) = bs.locate_handle else {
+        return Framebuffer::NONE;
+    };
+    let mut handles = [ptr::null_mut(); 32];
+    let mut bytes = size_of_val(&handles);
+    // SAFETY: valid `LocateHandle` from the validated boot services, which are active; the
+    // GUID, `bytes` and `handles` are live, and `bytes` holds the buffer's size. A search key
+    // is only read for `ByRegisterNotify`, not this `ByProtocol` search.
+    let status = unsafe {
+        locate(
+            LOCATE_BY_PROTOCOL,
+            &GRAPHICS_OUTPUT_PROTOCOL,
+            ptr::null_mut(),
+            &mut bytes,
+            handles.as_mut_ptr(),
+        )
+    };
+    if status.is_error() {
+        let _ = writeln!(
+            out,
+            "origin-boot: no Graphics Output Protocol ({status:?}): the kernel will have no framebuffer"
+        );
+        return Framebuffer::NONE;
+    }
+    let found = bytes / size_of::<Handle>();
+    let (mut any, mut unusable) = (None, 0u32);
+    for &handle in handles.get(..found).unwrap_or(&[]) {
+        match framebuffer_of(bs, handle) {
+            Ok(framebuffer) => {
+                if console_device(bs, handle) {
+                    return framebuffer;
+                }
+                any.get_or_insert(framebuffer);
+            }
+            Err(reason) => {
+                unusable += 1;
+                let _ = writeln!(out, "origin-boot: graphics mode not usable: {reason:?}");
+            }
+        }
+    }
+    if any.is_none() {
+        let _ = writeln!(
+            out,
+            "origin-boot: {found} Graphics Output handle(s), {unusable} without a usable framebuffer: the kernel will have no framebuffer"
+        );
+    }
+    any.unwrap_or(Framebuffer::NONE)
+}
+
+/// Whether the firmware uses `handle` as a console output device.
+fn console_device(bs: &BootServices, handle: Handle) -> bool {
+    let Some(f) = bs.handle_protocol else {
+        return false;
+    };
+    let mut iface: *mut c_void = ptr::null_mut();
+    // SAFETY: valid `HandleProtocol` from the validated boot services, which are active; the
+    // GUID and `iface` are live. The interface of this tag protocol is NULL, so only the status
+    // says whether it is there.
+    !unsafe { f(handle, &CONSOLE_OUT_DEVICE, &mut iface) }.is_error()
+}
+
+/// The framebuffer of the graphics device on `handle`, in the mode it is in now.
+fn framebuffer_of(bs: &BootServices, handle: Handle) -> Result<Framebuffer, framebuffer::Unusable> {
+    use framebuffer::Unusable;
+    let gop = protocol::<GraphicsOutputProtocol>(bs, handle, &GRAPHICS_OUTPUT_PROTOCOL)
+        .map_err(|_| Unusable::NoMode)?;
+    // SAFETY: `HandleProtocol` returned a live `EFI_GRAPHICS_OUTPUT_PROTOCOL`; `Mode` is a
+    // plain pointer field, valid for any bits.
+    let mode = unsafe { (*gop).mode };
+    if mode.is_null() || !mode.is_aligned() {
+        return Err(Unusable::NoMode);
+    }
+    // SAFETY: non-null and aligned (checked), from a live protocol; the firmware keeps it
+    // readable while boot services are active, and it holds only integers and a raw pointer.
+    let mode = unsafe { mode.read() };
+    if mode.info.is_null() || !mode.info.is_aligned() {
+        return Err(Unusable::NoMode);
+    }
+    // SAFETY: non-null and aligned (checked), from a live protocol; `Info` holds only integers.
+    let info = unsafe { mode.info.read() };
+    framebuffer::describe(&info, mode.frame_buffer_base, mode.frame_buffer_size as u64)
 }
 
 /// Enters the kernel (ADR-0002 B6, ADR-0004 H4): interrupts off; EFER.NXE and CR0.WP on;

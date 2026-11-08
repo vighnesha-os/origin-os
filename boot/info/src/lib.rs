@@ -121,6 +121,146 @@ pub const MAX_KERNEL_SEGMENTS: u64 = 16;
 /// ADR-0004 H3). Clear when the processor offered no entropy source.
 pub const FLAG_KASLR: u64 = 1;
 
+/// The largest number of bytes a [`Framebuffer`] may span, in visible rows. A 16384 by 16384
+/// display of 32-bit pixels is exactly this; nothing larger exists.
+pub const MAX_FRAMEBUFFER_BYTES: u64 = 1 << 30;
+/// Largest width or height of a [`Framebuffer`], in pixels.
+pub const MAX_FRAMEBUFFER_DIMENSION: u32 = 16384;
+
+/// The firmware's linear framebuffer: boot info 0.4 (ADR-0010, **Proposed**).
+///
+/// A pixel is one little-endian 32-bit value at `base + y * stride + x * 4`. The channels
+/// are given by masks, so the kernel never sees the firmware's format names: the loader turns
+/// UEFI's RGB, BGR and bit-mask formats into masks, as it turns the UEFI memory map into
+/// Origin's [`RegionKind`]s (ADR-0002 B4).
+///
+/// `base` is zero when there is no framebuffer to use. The kernel carries on without one
+/// (ADR-0010: a missing console never stops the boot).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct Framebuffer {
+    /// Physical address of the top-left pixel, or 0 if there is no usable framebuffer.
+    pub base: u64,
+    /// Bytes the firmware says belong to it (`FrameBufferSize`).
+    pub size: u64,
+    /// Virtual address of the top-left pixel in the first page tables, or 0 if the loader did
+    /// not map it. The kernel's own tables map it at this same address.
+    pub virtual_base: u64,
+    /// Visible pixels per row.
+    pub width: u32,
+    /// Visible rows.
+    pub height: u32,
+    /// Bytes from the start of one row to the start of the next.
+    pub stride: u32,
+    /// The bits of a pixel that hold red.
+    pub red_mask: u32,
+    /// The bits of a pixel that hold green.
+    pub green_mask: u32,
+    /// The bits of a pixel that hold blue.
+    pub blue_mask: u32,
+}
+
+/// Why a [`Framebuffer`] cannot be drawn on. None of these stops a boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FramebufferError {
+    /// `base` is zero: there is no framebuffer.
+    Absent,
+    /// A width or height of zero or above [`MAX_FRAMEBUFFER_DIMENSION`].
+    Dimensions,
+    /// `stride` is not a multiple of 4, or leaves no room for `width` pixels.
+    Stride,
+    /// `base` is not 4-byte aligned, or the framebuffer would end past 2^52.
+    Address,
+    /// `stride * height` is above `size` or above [`MAX_FRAMEBUFFER_BYTES`].
+    Size,
+    /// A channel mask is empty, not contiguous, wider than 16 bits, or overlaps another.
+    Masks,
+}
+
+impl Framebuffer {
+    /// No framebuffer.
+    pub const NONE: Self = Self {
+        base: 0,
+        size: 0,
+        virtual_base: 0,
+        width: 0,
+        height: 0,
+        stride: 0,
+        red_mask: 0,
+        green_mask: 0,
+        blue_mask: 0,
+    };
+
+    /// Whether the firmware offered a framebuffer at all.
+    pub const fn is_present(&self) -> bool {
+        self.base != 0
+    }
+
+    /// Bytes from the first pixel to the end of the last visible row.
+    pub const fn visible_bytes(&self) -> u64 {
+        self.stride as u64 * self.height as u64
+    }
+
+    /// Checks the description against the contract. Run by the loader before it maps the
+    /// framebuffer and by the kernel again before it draws.
+    pub fn check(&self) -> Result<(), FramebufferError> {
+        use FramebufferError as E;
+        if !self.is_present() {
+            return Err(E::Absent);
+        }
+        if self.width == 0
+            || self.height == 0
+            || self.width > MAX_FRAMEBUFFER_DIMENSION
+            || self.height > MAX_FRAMEBUFFER_DIMENSION
+        {
+            return Err(E::Dimensions);
+        }
+        if !self.stride.is_multiple_of(4) || u64::from(self.stride) < u64::from(self.width) * 4 {
+            return Err(E::Stride);
+        }
+        let bytes = self.visible_bytes();
+        if bytes > self.size || bytes > MAX_FRAMEBUFFER_BYTES {
+            return Err(E::Size);
+        }
+        const PHYSICAL_LIMIT: u64 = 1 << 52;
+        let end = self.base.checked_add(bytes);
+        if !self.base.is_multiple_of(4) || end.is_none_or(|e| e > PHYSICAL_LIMIT) {
+            return Err(E::Address);
+        }
+        let masks = [self.red_mask, self.green_mask, self.blue_mask];
+        let contiguous = |m: u32| {
+            m != 0
+                && m.count_ones() <= 16
+                && (m >> m.trailing_zeros())
+                    .checked_add(1)
+                    .is_some_and(u32::is_power_of_two)
+        };
+        let disjoint = self.red_mask & self.green_mask == 0
+            && self.red_mask & self.blue_mask == 0
+            && self.green_mask & self.blue_mask == 0;
+        if !disjoint || !masks.iter().all(|&m| contiguous(m)) {
+            return Err(E::Masks);
+        }
+        Ok(())
+    }
+}
+
+/// Whether `[base, base + bytes)` touches a region that holds memory rather than device
+/// space: everything except [`RegionKind::Mmio`], [`RegionKind::Reserved`] and unknown kinds,
+/// which the contract treats as reserved. Firmware says nothing it hands the kernel about a
+/// device, such as a framebuffer or a UART, may be drawn on or written to if this is true.
+pub fn overlaps_ram(regions: &[MemoryRegion], base: u64, bytes: u64) -> bool {
+    let end = base.saturating_add(bytes);
+    regions.iter().any(|r| {
+        let region_end = r.base.saturating_add(r.pages.saturating_mul(4096));
+        let device = matches!(
+            RegionKind::from_raw(r.kind),
+            None | Some(RegionKind::Reserved | RegionKind::Mmio)
+        );
+        !device && r.pages != 0 && r.base < end && base < region_end
+    })
+}
+
 /// Everything the kernel learns from the loader.
 ///
 /// Since 0.3 (ADR-0004) the kernel starts at its higher-half virtual address on page
@@ -170,12 +310,25 @@ pub struct BootInfo {
     pub kernel_virtual_base: u64,
     /// [`FLAG_KASLR`] and reserved zero bits (0.3).
     pub flags: u64,
+    /// The firmware's linear framebuffer (0.4); [`Framebuffer::NONE`] if there is none.
+    pub framebuffer: Framebuffer,
 }
 
 // The ABI layout; a change here is a boot-info major version change.
 const _: () = {
     use core::mem::{offset_of, size_of};
     assert!(size_of::<MemoryRegion>() == 24);
+    assert!(offset_of!(Framebuffer, base) == 0);
+    assert!(offset_of!(Framebuffer, size) == 8);
+    assert!(offset_of!(Framebuffer, virtual_base) == 16);
+    assert!(offset_of!(Framebuffer, width) == 24);
+    assert!(offset_of!(Framebuffer, height) == 28);
+    assert!(offset_of!(Framebuffer, stride) == 32);
+    assert!(offset_of!(Framebuffer, red_mask) == 36);
+    assert!(offset_of!(Framebuffer, green_mask) == 40);
+    assert!(offset_of!(Framebuffer, blue_mask) == 44);
+    assert!(size_of::<Framebuffer>() == 48);
+    assert!(offset_of!(BootInfo, framebuffer) == 128);
     assert!(offset_of!(BootInfo, version_major) == 8);
     assert!(offset_of!(BootInfo, size) == 12);
     assert!(offset_of!(BootInfo, regions) == 16);
@@ -188,7 +341,7 @@ const _: () = {
     assert!(offset_of!(BootInfo, direct_map_base) == 104);
     assert!(offset_of!(BootInfo, kernel_virtual_base) == 112);
     assert!(offset_of!(BootInfo, flags) == 120);
-    assert!(size_of::<BootInfo>() == 128);
+    assert!(size_of::<BootInfo>() == 176);
     assert!(size_of::<KernelSegment>() == 24);
 };
 
@@ -298,6 +451,22 @@ mod tests {
             direct_map_base: 0xFFFF_8000_0000_0000,
             kernel_virtual_base: 0xFFFF_FFFF_8000_0000,
             flags: FLAG_KASLR,
+            framebuffer: Framebuffer::NONE,
+        }
+    }
+
+    /// A 1280 by 800 display in the blue-green-red byte order QEMU's VGA uses.
+    fn display() -> Framebuffer {
+        Framebuffer {
+            base: 0x8000_0000,
+            size: 0x40_0000,
+            virtual_base: 0,
+            width: 1280,
+            height: 800,
+            stride: 5120,
+            red_mask: 0x00FF_0000,
+            green_mask: 0x0000_FF00,
+            blue_mask: 0x0000_00FF,
         }
     }
 
@@ -391,6 +560,92 @@ mod tests {
 
     #[test]
     fn version_comes_from_origin_version_toml() {
-        assert_eq!(VERSION, (0, 3));
+        assert_eq!(VERSION, (0, 4));
+    }
+
+    #[test]
+    fn a_framebuffer_description_is_checked_strictly() {
+        use FramebufferError as E;
+        type Mutate = fn(&mut Framebuffer);
+        assert_eq!(display().check(), Ok(()));
+        assert_eq!(Framebuffer::NONE.check(), Err(E::Absent));
+        assert_eq!(display().visible_bytes(), 800 * 5120);
+
+        // Red in the middle byte, 10-bit channels, a 16-bit channel: all contiguous and fine.
+        let mut tall = display();
+        tall.red_mask = 0x3FF0_0000;
+        tall.green_mask = 0x000F_FC00;
+        tall.blue_mask = 0x0000_03FF;
+        assert_eq!(tall.check(), Ok(()));
+
+        let cases: [(Mutate, E); 15] = [
+            (|f| f.width = 0, E::Dimensions),
+            (|f| f.height = 0, E::Dimensions),
+            (|f| f.width = 16385, E::Dimensions),
+            (|f| f.height = 16385, E::Dimensions),
+            (|f| f.stride = 5121, E::Stride),
+            (|f| f.stride = 5116, E::Stride), // one pixel short of width * 4
+            (|f| f.size = 800 * 5120 - 1, E::Size),
+            (
+                |f| {
+                    f.width = 16384;
+                    f.height = 16384;
+                    f.stride = 65540;
+                    f.size = u64::MAX;
+                },
+                E::Size,
+            ),
+            (|f| f.base = 0x8000_0002, E::Address),
+            (|f| f.base = u64::MAX - 3, E::Address),
+            (|f| f.base = (1 << 52) - 0x1000, E::Address),
+            (|f| f.red_mask = 0, E::Masks),
+            (|f| f.green_mask = 0x00FF_0000, E::Masks), // overlaps red
+            (|f| f.blue_mask = 0x0000_0505, E::Masks),  // not contiguous
+            (|f| f.green_mask = 0xFFFF_FF00, E::Masks), // wider than 16 bits
+        ];
+        for (mutate, expected) in cases {
+            let mut f = display();
+            mutate(&mut f);
+            assert_eq!(f.check(), Err(expected), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn a_device_range_never_overlaps_ram() {
+        let region = |base, pages, kind: RegionKind| MemoryRegion {
+            base,
+            pages,
+            kind: kind as u32,
+            reserved: 0,
+        };
+        let map = [
+            region(0x0, 0xA0, RegionKind::Usable),
+            region(0x10_0000, 0x100, RegionKind::LoaderReclaimable),
+            region(0x30_0000, 0x10, RegionKind::Reserved),
+            region(0xFEC0_0000, 1, RegionKind::Mmio),
+            region(0x1_0000_0000, 0x100, RegionKind::Usable),
+        ];
+        // Inside RAM or crossing into it.
+        assert!(overlaps_ram(&map, 0x1000, 8));
+        assert!(overlaps_ram(&map, 0x9_FFFC, 8));
+        assert!(overlaps_ram(&map, 0x0F_FFFC, 8));
+        assert!(overlaps_ram(&map, 0x1_0000_0000 - 4, 8));
+        // A reserved region, device space and holes in the map are not RAM.
+        assert!(!overlaps_ram(&map, 0x30_0000, 0x1000));
+        assert!(!overlaps_ram(&map, 0xFEC0_0000, 8));
+        assert!(!overlaps_ram(&map, 0xA_0000, 8));
+        assert!(!overlaps_ram(&map, 0xFEDC_9000, 0x20));
+        // An unknown kind counts as reserved, and an empty region covers nothing.
+        let other = [MemoryRegion {
+            base: 0x10_0000,
+            pages: 1,
+            kind: 99,
+            reserved: 0,
+        }];
+        assert!(!overlaps_ram(&other, 0x10_0000, 8));
+        let empty = [region(0x10_0000, 0, RegionKind::Usable)];
+        assert!(!overlaps_ram(&empty, 0x10_0000, 8));
+        // A range running off the top of the address space is cut there, not wrapped round.
+        assert!(!overlaps_ram(&map, u64::MAX - 7, 64));
     }
 }

@@ -53,6 +53,92 @@ pub const ACPI_20_TABLE: Guid = Guid {
     data3: 0x11D3,
     data4: [0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81],
 };
+/// `EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID` (UEFI 2.11 §12.9).
+pub const GRAPHICS_OUTPUT_PROTOCOL: Guid = Guid {
+    data1: 0x9042_A9DE,
+    data2: 0x23DC,
+    data3: 0x4A38,
+    data4: [0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A],
+};
+/// `EFI_CONSOLE_OUT_DEVICE_GUID`: a tag protocol the firmware installs on the handles it uses
+/// as console output devices. Its interface is NULL.
+pub const CONSOLE_OUT_DEVICE: Guid = Guid {
+    data1: 0xD3B3_6F2C,
+    data2: 0xD551,
+    data3: 0x11D4,
+    data4: [0x9A, 0x46, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D],
+};
+
+/// `EFI_LOCATE_SEARCH_TYPE` `ByProtocol`.
+pub const LOCATE_BY_PROTOCOL: u32 = 2;
+
+/// `EFI_GRAPHICS_PIXEL_FORMAT`.
+pub mod pixel_format {
+    /// `PixelRedGreenBlueReserved8BitPerColor`: byte 0 is red.
+    pub const RGB: u32 = 0;
+    /// `PixelBlueGreenRedReserved8BitPerColor`: byte 0 is blue.
+    pub const BGR: u32 = 1;
+    /// `PixelBitMask`: the masks say which bits are which.
+    pub const BIT_MASK: u32 = 2;
+    /// `PixelBltOnly`: the mode has no physical framebuffer.
+    pub const BLT_ONLY: u32 = 3;
+}
+
+/// `EFI_GRAPHICS_OUTPUT_MODE_INFORMATION` (§12.9).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphicsModeInformation {
+    /// `Version`.
+    pub version: u32,
+    /// `HorizontalResolution`: visible pixels per row.
+    pub horizontal_resolution: u32,
+    /// `VerticalResolution`: visible rows.
+    pub vertical_resolution: u32,
+    /// `PixelFormat`: a [`pixel_format`] value.
+    pub pixel_format: u32,
+    /// `PixelInformation.RedMask`, valid only for [`pixel_format::BIT_MASK`].
+    pub red_mask: u32,
+    /// `PixelInformation.GreenMask`.
+    pub green_mask: u32,
+    /// `PixelInformation.BlueMask`.
+    pub blue_mask: u32,
+    /// `PixelInformation.ReservedMask`.
+    pub reserved_mask: u32,
+    /// `PixelsPerScanLine`, which can exceed `horizontal_resolution`.
+    pub pixels_per_scan_line: u32,
+}
+
+/// `EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE` (§12.9).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GraphicsOutputMode {
+    /// `MaxMode`.
+    pub max_mode: u32,
+    /// `Mode`: the current mode's number.
+    pub mode: u32,
+    /// `Info`: the current mode.
+    pub info: *const GraphicsModeInformation,
+    /// `SizeOfInfo`.
+    pub size_of_info: usize,
+    /// `FrameBufferBase`: physical address of the first pixel, or 0 in a Blt-only mode.
+    pub frame_buffer_base: u64,
+    /// `FrameBufferSize`.
+    pub frame_buffer_size: usize,
+}
+
+/// `EFI_GRAPHICS_OUTPUT_PROTOCOL` (§12.9). The loader changes no mode and calls no member.
+#[repr(C)]
+#[derive(Debug)]
+pub struct GraphicsOutputProtocol {
+    /// `QueryMode`.
+    pub query_mode: *const c_void,
+    /// `SetMode`.
+    pub set_mode: *const c_void,
+    /// `Blt`.
+    pub blt: *const c_void,
+    /// `Mode`: the current mode and its framebuffer.
+    pub mode: *const GraphicsOutputMode,
+}
 
 /// `EFI_BOOT_SERVICES_SIGNATURE`: "BOOTSERV".
 pub const BOOT_SERVICES_SIGNATURE: u64 = 0x5652_4553_544F_4F42;
@@ -97,6 +183,14 @@ pub type HandleProtocolFn = unsafe extern "efiapi" fn(
     protocol: *const Guid,
     interface: *mut *mut c_void,
 ) -> Status;
+/// `EFI_LOCATE_HANDLE`.
+pub type LocateHandleFn = unsafe extern "efiapi" fn(
+    search_type: u32,
+    protocol: *const Guid,
+    search_key: *mut c_void,
+    buffer_size: *mut usize,
+    buffer: *mut Handle,
+) -> Status;
 /// `EFI_EXIT_BOOT_SERVICES`.
 pub type ExitBootServicesFn = unsafe extern "efiapi" fn(image: Handle, map_key: usize) -> Status;
 
@@ -129,9 +223,12 @@ pub struct BootServices {
     pub handle_protocol: Option<HandleProtocolFn>,
     /// `Reserved`.
     pub reserved: *const c_void,
-    /// `RegisterProtocolNotify`, `LocateHandle`, `LocateDevicePath`,
-    /// `InstallConfigurationTable`.
-    pub locate: [*const c_void; 4],
+    /// `RegisterProtocolNotify`.
+    pub register_protocol_notify: *const c_void,
+    /// `LocateHandle`.
+    pub locate_handle: Option<LocateHandleFn>,
+    /// `LocateDevicePath`, `InstallConfigurationTable`.
+    pub device_paths: [*const c_void; 2],
     /// `LoadImage`, `StartImage`, `Exit`, `UnloadImage`.
     pub images: [*const c_void; 4],
     /// `ExitBootServices`.
@@ -241,7 +338,17 @@ const _: () = {
     assert!(offset_of!(BootServices, free_pages) == 48);
     assert!(offset_of!(BootServices, get_memory_map) == 56);
     assert!(offset_of!(BootServices, handle_protocol) == 152);
+    assert!(offset_of!(BootServices, locate_handle) == 176);
     assert!(offset_of!(BootServices, exit_boot_services) == 232);
+    assert!(size_of::<GraphicsModeInformation>() == 36);
+    assert!(offset_of!(GraphicsModeInformation, pixel_format) == 12);
+    assert!(offset_of!(GraphicsModeInformation, pixels_per_scan_line) == 32);
+    assert!(offset_of!(GraphicsOutputMode, info) == 8);
+    assert!(offset_of!(GraphicsOutputMode, size_of_info) == 16);
+    assert!(offset_of!(GraphicsOutputMode, frame_buffer_base) == 24);
+    assert!(offset_of!(GraphicsOutputMode, frame_buffer_size) == 32);
+    assert!(size_of::<GraphicsOutputMode>() == 40);
+    assert!(offset_of!(GraphicsOutputProtocol, mode) == 24);
     assert!(size_of::<BootServices>() == 264);
     assert!(offset_of!(LoadedImageProtocol, device_handle) == 24);
     assert!(offset_of!(SimpleFileSystemProtocol, open_volume) == 8);

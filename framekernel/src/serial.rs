@@ -76,20 +76,119 @@ impl Register {
     }
 }
 
-/// The register writes that program the UART for 115200 baud, 8N1, FIFOs on, interrupts
-/// off, in order.
-pub const INIT_SEQUENCE: [(Register, u8); 7] = [
-    // No UART interrupts: the kernel polls.
-    (Register::InterruptEnable, 0x00),
-    (Register::LineControl, LCR_DLAB),
-    // The divisor latch, low byte then high byte.
-    (Register::Data, DIVISOR.to_le_bytes()[0]),
-    (Register::InterruptEnable, DIVISOR.to_le_bytes()[1]),
-    // 8N1, which also clears DLAB.
-    (Register::LineControl, LCR_8N1),
-    (Register::FifoControl, FCR_ENABLE_CLEAR_14),
-    (Register::ModemControl, MCR_DTR_RTS_OUT2),
-];
+/// The register writes that program the UART for the given baud-rate divisor, 8N1, FIFOs on,
+/// interrupts off, in order.
+pub const fn program_sequence(divisor: u16) -> [(Register, u8); 8] {
+    [
+        // DLAB off first, in case the firmware left it on: until it is, the next write
+        // would reach the divisor instead of the interrupt-enable register.
+        (Register::LineControl, LCR_8N1),
+        // No UART interrupts: the kernel polls.
+        (Register::InterruptEnable, 0x00),
+        (Register::LineControl, LCR_DLAB),
+        // The divisor latch, low byte then high byte.
+        (Register::Data, divisor.to_le_bytes()[0]),
+        (Register::InterruptEnable, divisor.to_le_bytes()[1]),
+        // 8N1, which also clears DLAB.
+        (Register::LineControl, LCR_8N1),
+        (Register::FifoControl, FCR_ENABLE_CLEAR_14),
+        (Register::ModemControl, MCR_DTR_RTS_OUT2),
+    ]
+}
+
+/// What [`Uart16550::init`] writes: 115200 baud on the PC-compatible clock.
+pub const INIT_SEQUENCE: [(Register, u8); 8] = program_sequence(DIVISOR);
+
+/// The first bytes a console sent, kept to send again when it moves to another UART.
+/// Bytes past the capacity are dropped and counted; the first lines of a boot are the
+/// ones worth having.
+#[derive(Debug)]
+pub struct EarlyLog<const N: usize> {
+    bytes: [u8; N],
+    used: usize,
+    dropped: u64,
+}
+
+impl<const N: usize> EarlyLog<N> {
+    /// An empty log.
+    pub const fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            used: 0,
+            dropped: 0,
+        }
+    }
+
+    /// Appends what fits of `bytes` and counts the rest as dropped.
+    pub fn push(&mut self, bytes: &[u8]) {
+        let free = N - self.used;
+        let take = bytes.len().min(free);
+        if let Some(slot) = self.bytes.get_mut(self.used..self.used + take)
+            && let Some(source) = bytes.get(..take)
+        {
+            slot.copy_from_slice(source);
+            self.used += take;
+        }
+        self.dropped += (bytes.len() - take) as u64;
+    }
+
+    /// Everything kept, oldest first.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.bytes.get(..self.used).unwrap_or(&[])
+    }
+
+    /// Bytes that did not fit.
+    pub const fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Empties it.
+    pub fn clear(&mut self) {
+        self.used = 0;
+        self.dropped = 0;
+    }
+}
+
+impl<const N: usize> Default for EarlyLog<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How [`Uart16550::configure`] sets the line speed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineSetup {
+    /// Program this baud-rate divisor and 8N1.
+    Divisor(u16),
+    /// Leave the speed and format as the firmware set them.
+    Keep,
+}
+
+/// A UART's line format and divisor, as [`Uart16550::line_settings`] read them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineSettings {
+    /// The line control register.
+    pub line_control: u8,
+    /// The baud-rate divisor.
+    pub divisor: u16,
+}
+
+/// The divisor for `baud` given the UART's input clock, or `None` if the clock cannot produce
+/// the rate to within 2 %. A UART samples each bit 16 times.
+pub fn divisor_for(baud: u32, clock_hz: u32) -> Option<u16> {
+    let per_tick = u64::from(baud).checked_mul(16)?;
+    if per_tick == 0 || clock_hz == 0 {
+        return None;
+    }
+    let clock = u64::from(clock_hz);
+    let divisor = (clock + per_tick / 2) / per_tick;
+    if divisor == 0 || divisor > u64::from(u16::MAX) {
+        return None;
+    }
+    let actual = clock / (16 * divisor);
+    // Within 2 % of the rate; a UART tolerates a few percent, so this is safely usable.
+    (actual.abs_diff(u64::from(baud)) * 50 <= u64::from(baud)).then_some(divisor as u16)
+}
 
 /// Access to the registers of one 16550-compatible UART.
 pub trait UartRegisters {
@@ -120,10 +219,57 @@ impl<R: UartRegisters> Uart16550<R> {
     /// the firmware or the loader queued just before the kernel started. If the transmitter
     /// never becomes idle, the UART is programmed anyway.
     pub fn init(&mut self) {
+        self.configure(LineSetup::Divisor(DIVISOR));
+    }
+
+    /// Sets the UART up for polled output: interrupts off, FIFOs on and cleared, DTR, RTS and
+    /// OUT2 on, and `line` for the speed. Waits for the transmitter first, as [`Self::init`]
+    /// does.
+    pub fn configure(&mut self, line: LineSetup) {
         let _ = self.poll_line_status(LSR_TRANSMITTER_EMPTY);
-        for (reg, value) in INIT_SEQUENCE {
-            self.regs.write(reg, value);
+        match line {
+            LineSetup::Divisor(divisor) => {
+                for (reg, value) in program_sequence(divisor) {
+                    self.regs.write(reg, value);
+                }
+            }
+            LineSetup::Keep => {
+                // DLAB off first, in case the firmware left it set: until then, offset 1 is
+                // the divisor's high byte, not the interrupt-enable register.
+                let line_control = self.regs.read(Register::LineControl);
+                self.regs
+                    .write(Register::LineControl, line_control & !LCR_DLAB);
+                self.regs.write(Register::InterruptEnable, 0);
+                self.regs.write(Register::FifoControl, FCR_ENABLE_CLEAR_14);
+                self.regs.write(Register::ModemControl, MCR_DTR_RTS_OUT2);
+            }
         }
+    }
+
+    /// Reads the line format and divisor the firmware left, without changing them.
+    pub fn line_settings(&mut self) -> LineSettings {
+        let line_control = self.regs.read(Register::LineControl);
+        self.regs
+            .write(Register::LineControl, line_control | LCR_DLAB);
+        let low = self.regs.read(Register::Data);
+        let high = self.regs.read(Register::InterruptEnable);
+        self.regs.write(Register::LineControl, line_control);
+        LineSettings {
+            line_control,
+            divisor: u16::from_le_bytes([low, high]),
+        }
+    }
+
+    /// Puts back settings that [`Self::line_settings`] read, as they were.
+    pub fn restore(&mut self, saved: LineSettings) {
+        let _ = self.poll_line_status(LSR_TRANSMITTER_EMPTY);
+        let [low, high] = saved.divisor.to_le_bytes();
+        self.regs
+            .write(Register::LineControl, saved.line_control | LCR_DLAB);
+        self.regs.write(Register::Data, low);
+        self.regs.write(Register::InterruptEnable, high);
+        self.regs
+            .write(Register::LineControl, saved.line_control & !LCR_DLAB);
     }
 
     /// Sends one byte once the transmitter has room for it. Fails, and drops the byte, if
@@ -131,6 +277,18 @@ impl<R: UartRegisters> Uart16550<R> {
     pub fn write_byte(&mut self, byte: u8) -> fmt::Result {
         self.poll_line_status(LSR_THR_EMPTY)?;
         self.regs.write(Register::Data, byte);
+        Ok(())
+    }
+
+    /// Sends `bytes`, turning LF into CR LF, stopping at the first byte the UART will not
+    /// take: one bounded wait, however long the line.
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> fmt::Result {
+        for &byte in bytes {
+            if byte == b'\n' {
+                self.write_byte(b'\r')?;
+            }
+            self.write_byte(byte)?;
+        }
         Ok(())
     }
 
@@ -149,13 +307,7 @@ impl<R: UartRegisters> Uart16550<R> {
 
 impl<R: UartRegisters> fmt::Write for Uart16550<R> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for byte in s.bytes() {
-            if byte == b'\n' {
-                self.write_byte(b'\r')?;
-            }
-            self.write_byte(byte)?;
-        }
-        Ok(())
+        self.write_bytes(s.as_bytes())
     }
 }
 
@@ -226,8 +378,9 @@ mod tests {
 
     #[test]
     fn init_sequence_is_115200_8n1() {
-        // (offset, value) exactly as the M1 COM1 bring-up specifies it.
-        let expected: [(u16, u8); 7] = [
+        // (offset, value): the M1 COM1 bring-up, after the write that clears a stray DLAB.
+        let expected: [(u16, u8); 8] = [
+            (3, 0x03),
             (1, 0x00),
             (3, 0x80),
             (0, 0x01),
@@ -301,6 +454,167 @@ mod tests {
     fn a_wedged_transmitter_fails_after_the_poll_limit() {
         let mut uart = Uart16550::new(Mock::new(TX_POLL_LIMIT));
         assert_eq!(uart.write_byte(b'z'), Err(fmt::Error));
+        assert_eq!(uart.regs.status_reads(), TX_POLL_LIMIT as usize);
+        assert!(uart.regs.data_bytes().is_empty());
+    }
+
+    #[test]
+    fn program_sequence_writes_the_divisor_it_is_given() {
+        let seq = program_sequence(0x0102);
+        assert_eq!(seq[3], (Register::Data, 0x02));
+        assert_eq!(seq[4], (Register::InterruptEnable, 0x01));
+        assert_eq!(program_sequence(DIVISOR), INIT_SEQUENCE);
+    }
+
+    #[test]
+    fn keep_leaves_the_divisor_and_format_alone() {
+        let mut uart = Uart16550::new(Mock::new(0));
+        uart.configure(LineSetup::Keep);
+        let writes: Vec<(Register, u8)> = uart
+            .regs
+            .log
+            .iter()
+            .filter_map(|a| match a {
+                Access::Write(reg, value) => Some((*reg, *value)),
+                _ => None,
+            })
+            .collect();
+        // The mock reads LCR back as 0, so it is written back with DLAB clear; the divisor
+        // latch is never touched and the format is not rewritten to 8N1.
+        assert_eq!(
+            writes,
+            vec![
+                (Register::LineControl, 0),
+                (Register::InterruptEnable, 0),
+                (Register::FifoControl, FCR_ENABLE_CLEAR_14),
+                (Register::ModemControl, MCR_DTR_RTS_OUT2),
+            ]
+        );
+    }
+
+    #[test]
+    fn keep_clears_a_stray_dlab_before_touching_the_interrupt_enable_register() {
+        struct LatchFirst(Mock);
+        impl UartRegisters for LatchFirst {
+            fn read(&mut self, reg: Register) -> u8 {
+                self.0.read(reg);
+                match reg {
+                    Register::LineStatus => self.0.ready,
+                    Register::LineControl => LCR_DLAB | 0x03,
+                    _ => 0,
+                }
+            }
+            fn write(&mut self, reg: Register, value: u8) {
+                self.0.write(reg, value);
+            }
+        }
+        let mut uart = Uart16550::new(LatchFirst(Mock::new(0)));
+        uart.configure(LineSetup::Keep);
+        let log = &uart.regs.0.log;
+        let dlab_off = log
+            .iter()
+            .position(|a| *a == Access::Write(Register::LineControl, 0x03))
+            .expect("DLAB is cleared");
+        let interrupts_off = log
+            .iter()
+            .position(|a| *a == Access::Write(Register::InterruptEnable, 0))
+            .expect("interrupts are turned off");
+        assert!(dlab_off < interrupts_off);
+    }
+
+    /// A UART that behaves like one for the registers `line_settings` and `restore` use.
+    struct Registers {
+        line_control: u8,
+        divisor: [u8; 2],
+    }
+
+    impl UartRegisters for Registers {
+        fn read(&mut self, reg: Register) -> u8 {
+            match reg {
+                Register::LineStatus => LSR_THR_EMPTY | LSR_TRANSMITTER_EMPTY,
+                Register::LineControl => self.line_control,
+                Register::Data if self.line_control & LCR_DLAB != 0 => self.divisor[0],
+                Register::InterruptEnable if self.line_control & LCR_DLAB != 0 => self.divisor[1],
+                _ => 0,
+            }
+        }
+
+        fn write(&mut self, reg: Register, value: u8) {
+            match reg {
+                Register::LineControl => self.line_control = value,
+                Register::Data if self.line_control & LCR_DLAB != 0 => self.divisor[0] = value,
+                Register::InterruptEnable if self.line_control & LCR_DLAB != 0 => {
+                    self.divisor[1] = value;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn firmware_line_settings_can_be_read_and_put_back() {
+        let mut uart = Uart16550::new(Registers {
+            line_control: 0x03,
+            divisor: [0x0C, 0x00], // 9600 baud
+        });
+        let saved = uart.line_settings();
+        assert_eq!(
+            saved,
+            LineSettings {
+                line_control: 0x03,
+                divisor: 12
+            }
+        );
+        assert_eq!(uart.regs.line_control, 0x03, "DLAB is back off");
+        uart.init();
+        assert_eq!(uart.regs.divisor, [1, 0], "init programs 115200");
+        uart.restore(saved);
+        assert_eq!(uart.regs.divisor, [0x0C, 0x00]);
+        assert_eq!(uart.regs.line_control, 0x03);
+    }
+
+    #[test]
+    fn the_early_log_keeps_order_and_counts_what_did_not_fit() {
+        let mut log = EarlyLog::<10>::new();
+        log.push(b"abc");
+        log.push(b"defg");
+        assert_eq!(log.as_bytes(), b"abcdefg");
+        assert_eq!(log.dropped(), 0);
+        log.push(b"hijklm");
+        assert_eq!(log.as_bytes(), b"abcdefghij");
+        assert_eq!(log.dropped(), 3);
+        log.push(b"zz");
+        assert_eq!(log.as_bytes(), b"abcdefghij");
+        assert_eq!(log.dropped(), 5);
+        log.clear();
+        assert_eq!(log.as_bytes(), b"");
+        assert_eq!(log.dropped(), 0);
+        log.push(b"xy");
+        assert_eq!(log.as_bytes(), b"xy");
+    }
+
+    #[test]
+    fn divisors_come_from_the_rate_and_the_clock() {
+        assert_eq!(divisor_for(115_200, INPUT_CLOCK_HZ), Some(1));
+        assert_eq!(divisor_for(9_600, INPUT_CLOCK_HZ), Some(12));
+        assert_eq!(divisor_for(115_200, 48_000_000), Some(26)); // 115 384 baud, 0.16 % fast
+        assert_eq!(divisor_for(1_500_000, 48_000_000), Some(2));
+        // The clock cannot reach the rate, or the divisor does not fit in 16 bits.
+        assert_eq!(divisor_for(115_200, 1_000_000), None);
+        assert_eq!(divisor_for(1, u32::MAX), None);
+        assert_eq!(divisor_for(0, INPUT_CLOCK_HZ), None);
+        assert_eq!(divisor_for(115_200, 0), None);
+        // Never a panic on the extremes.
+        assert_eq!(divisor_for(u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn a_wedged_uart_costs_one_bounded_wait_for_a_whole_line_of_bytes() {
+        let mut uart = Uart16550::new(Mock::new(u32::MAX));
+        assert_eq!(
+            uart.write_bytes(b"a line of sixty bytes that a wedged UART will never take\n"),
+            Err(fmt::Error)
+        );
         assert_eq!(uart.regs.status_reads(), TX_POLL_LIMIT as usize);
         assert!(uart.regs.data_bytes().is_empty());
     }

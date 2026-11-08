@@ -8,8 +8,10 @@
 //! - the direction flag clear;
 //! - the image's relocations applied.
 //!
-//! The kernel assumes nothing else about memory. It programs COM1, checks that its own
-//! relocations were applied, validates the boot info and prints a summary. Then come the
+//! The kernel assumes nothing else about memory. It programs COM1 (its UART until the ACPI
+//! tables name a better one), checks that its own relocations were applied, validates the
+//! boot info, attaches the firmware's framebuffer if the loader passed one, and prints a
+//! summary. Then come the
 //! first M2 steps: its own GDT, TSS and IDT (proven with a breakpoint), the frame
 //! allocator, and its own page tables with a W^X kernel image (proven with deliberate
 //! faults), after which it halts. Only the boot processor runs, and nothing here enables
@@ -56,7 +58,7 @@ mod wait;
 use framekernel::frames::{self, FrameAllocator};
 use framekernel::paging::layout::{self, Placement};
 use framekernel::paging::{PAGE, Table, TablePool};
-use framekernel::serial::{Register, Uart16550, UartRegisters};
+use framekernel::serial::Uart16550;
 use origin_boot_info::{
     BootInfo, KernelSegment, MemoryRegion, RegionKind, SEGMENT_EXECUTE, SEGMENT_WRITE,
 };
@@ -66,7 +68,7 @@ use origin_boot_info::{
 const TABLE_POOL_FRAMES: u64 = 256;
 
 /// I/O port base of COM1 on PC-compatible platforms.
-const COM1_BASE: u16 = 0x3F8;
+pub(crate) const COM1_BASE: u16 = 0x3F8;
 
 /// Set by the first panic. A panic while reporting a panic only halts.
 static PANICKING: AtomicBool = AtomicBool::new(false);
@@ -111,8 +113,10 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     time::mark_entry();
     // SAFETY: the entry contract: CPL 0, boot processor only, interrupts disabled. The
     // firmware and the loader stopped using COM1 at `ExitBootServices`, and no other kernel
-    // code drives it.
-    let mut uart = Uart16550::new(unsafe { Com1::new() });
+    // code drives it. COM1 is the UART of last resort: nothing better is known until the
+    // ACPI tables can be read, which `console::adopt_firmware_uart` does.
+    let mut uart = Uart16550::new(unsafe { console::KernelUart::port(COM1_BASE) });
+    let firmware_line = uart.line_settings();
     uart.init();
 
     if !relocations_applied() {
@@ -122,7 +126,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         halt();
     }
     // From here on every processor prints through the console, a line at a time.
-    console::init(uart);
+    console::init(uart, firmware_line);
     let mut com1 = console::Console::new();
 
     // SAFETY: `boot_info` is the loader's pointer, passed on unchanged, and this function's
@@ -134,6 +138,9 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
             halt();
         }
     };
+    // The firmware's framebuffer, drawn on from here on (ADR-0010). The earlier lines of a
+    // boot this far can only have been a report of an invalid boot info, on the UART.
+    console::attach_framebuffer(&mut com1, &info, regions);
     let _ = report::write_report(&mut com1, &info, &memory);
     for (i, s) in segments.iter().enumerate() {
         let access = match (
@@ -212,7 +219,11 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // M2, third step: the kernel's own page tables, proven with deliberate faults; then
     // the frame allocator is proven again through the new direct map.
     let mut heap_ok = false;
-    if init_paging(&mut com1, &info, regions, segments, pool, pool_base) {
+    let paging = init_paging(&mut com1, &info, regions, segments, pool, pool_base);
+    // The kernel's own tables are loaded, so firmware tables can be mapped: the console's
+    // UART is the one the firmware names, if it names one (ADR-0010).
+    console::adopt_firmware_uart(&mut com1, info.acpi_rsdp, regions);
+    if paging {
         prove_frames(&mut com1, &mut alloc);
         // M2: the kernel heap, which takes over the frame allocator; from here on the
         // `alloc` crate works in the kernel.
@@ -1087,18 +1098,29 @@ fn init_paging(
         kernel_physical_base: info.kernel_base,
         stack_guard,
     };
-    let (space, stats) = match layout::build(&mut tables, &at, regions, segments) {
+    let (mut space, stats) = match layout::build(&mut tables, &at, regions, segments) {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(com1, "origin-kernel: page tables not built: {e:?}");
             return false;
         }
     };
+    // The console keeps drawing through the switch to these tables, at the address the
+    // loader used (ADR-0010). Last, so that it costs nothing else if it fails.
+    if console::has_screen() {
+        let mapped = layout::framebuffer_mapping(&info.framebuffer)
+            .is_some_and(|m| layout::map_framebuffer(&mut space, &mut tables, &m));
+        if !mapped {
+            console::withdraw_framebuffer(com1);
+        }
+    }
     // SAFETY: boot processor, CPL 0, interrupts disabled (entry contract); NX is supported
     // (checked above). `kernel_space::build` mapped the kernel image segments, the stack
     // this code runs on, the boot info and region and segment arrays, the frame bitmap and
     // this table pool (all in direct-mapped regions), and the kernel's statics (the GDT,
-    // IDT, TSS and double-fault stack are in the RW segment). COM1 is port I/O.
+    // IDT, TSS and double-fault stack are in the RW segment). The console's framebuffer is
+    // mapped at the same address in these tables (or was withdrawn above), and COM1 is port
+    // I/O.
     unsafe { cpu::load_page_tables(space.root()) };
     // SAFETY: CPL 0; the tables just loaded mark only the kernel half global (`layout`).
     // Toggling CR4.PGE also drops every translation cached under the loader's tables.
@@ -1534,33 +1556,6 @@ pub(crate) fn halt() -> ! {
         // and needs no stack. An NMI or SMI can still resume the processor, so it halts
         // again.
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
-    }
-}
-
-/// COM1's registers, reached through x86 port I/O.
-pub(crate) struct Com1(());
-
-impl Com1 {
-    /// # Safety
-    ///
-    /// The caller must run at CPL 0, and no other processor or driver may program COM1
-    /// while the value is used. Accesses through it reach only COM1's registers
-    /// 0x3F8–0x3FD, which cannot affect memory.
-    pub(crate) unsafe fn new() -> Self {
-        Self(())
-    }
-}
-
-impl UartRegisters for Com1 {
-    fn read(&mut self, reg: Register) -> u8 {
-        // SAFETY: `Com1::new`'s contract (CPL 0, COM1 owned by the kernel), and the port is
-        // one of COM1's registers, so the read cannot affect memory.
-        unsafe { inb(COM1_BASE + reg.offset()) }
-    }
-
-    fn write(&mut self, reg: Register, value: u8) {
-        // SAFETY: as for `read`.
-        unsafe { outb(COM1_BASE + reg.offset(), value) }
     }
 }
 

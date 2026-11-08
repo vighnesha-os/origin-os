@@ -7,13 +7,14 @@
 #![forbid(unsafe_code)]
 
 mod disk;
+mod screen;
 mod serial;
 
 use std::env;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{ChildStdin, Command, ExitCode, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,14 +36,17 @@ commands:
               at APIC IDs 256 and 412, above what 8-bit APIC IDs reach (the MADT lists
               150 possible processors); twice, on a CPU model with CPUID leaf 1Fh and on
               one without
+  boot-console the kernel's console on machines without a 16550 at 0x3F8 (ADR-0010): a UART
+              named by an ACPI SPCR table, a table that must be refused, no display, and no
+              UART at all (with a framebuffer the only way to see the boot)
   run         boot under QEMU with the serial console on this terminal (Ctrl-A X quits)
 
 environment:
   ORIGIN_OVMF_CODE, ORIGIN_OVMF_VARS  firmware code image and NVRAM template
                                       (default: the EDK2 files installed next to QEMU)
   ORIGIN_BOOT_TEST_TIMEOUT            boot-test timeout in seconds (default 120)
-  ORIGIN_BOOT_TEST_ONLY               run only the boot-test scenarios whose label contains
-                                      one of these comma-separated strings
+  ORIGIN_BOOT_TEST_ONLY               run only the boot-test or boot-console scenarios whose
+                                      label contains one of these comma-separated strings
   ORIGIN_QEMU_SMP                     processors QEMU emulates, 1-64 (default 2)
   ORIGIN_QEMU_TOPOLOGY                x2apic: the boot-x2apic machine (ORIGIN_QEMU_SMP is
                                       then ignored)
@@ -118,11 +122,43 @@ struct Scenario {
     markers: Vec<String>,
     /// Output that fails the scenario as soon as it appears.
     failures: Vec<&'static str>,
-    /// A check of the whole serial log once every marker has appeared.
-    check: Option<fn(&str) -> Result>,
+    /// A check of the whole boot once every marker has appeared.
+    check: Option<fn(&Completed) -> Result>,
     /// Text QEMU itself must have printed on its stderr by then (what its device models
     /// report about the guest).
     stderr: Vec<&'static str>,
+    /// Which serial ports and monitor QEMU has, and where the markers are read from.
+    capture: Capture,
+    /// Stages what the scenario needs under the work directory and gives QEMU's extra
+    /// arguments for it.
+    qemu_args: Option<QemuArgs>,
+}
+
+/// A function that stages a scenario's files and returns its extra QEMU arguments.
+type QemuArgs = fn(&Path) -> Result<Vec<String>>;
+
+/// How a scenario's QEMU is wired for output (the devices are `qemu_command`'s).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Capture {
+    /// COM1 on stdout, no monitor: what most scenarios use.
+    Com1,
+    /// COM1 and the monitor multiplexed on stdio: the screen is dumped once the markers
+    /// have appeared, and the scenario's check gets the picture.
+    Com1AndScreen,
+    /// The UART an SPCR table names on stdout, COM1 in a file for the check to read.
+    SpcrUart,
+    /// No UART: the monitor on stdio, the markers looked for in screen dumps.
+    Screen,
+}
+
+/// What a scenario's boot left behind, for its check.
+struct Completed {
+    /// The serial output, cleaned (the markers were found in this).
+    serial: String,
+    /// The screen dump, for [`Capture::Com1AndScreen`].
+    screen: Option<screen::Image>,
+    /// What COM1 wrote to its file, for [`Capture::SpcrUart`].
+    com1: Option<String>,
 }
 
 /// The good path: the loader verifies and enters the kernel, and the kernel reports on
@@ -624,9 +660,16 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-boot: kernel signature verified: origin-kernel, Ed25519 and ML-DSA-87 both good, key ID ".into(),
             "origin-boot: kernel verified: ".into(),
             "origin-boot: kernel placed at ".into(),
+            // The firmware's framebuffer, for the kernel's console (ADR-0010).
+            format!(
+                "origin-boot: framebuffer: {QEMU_DISPLAY} at 0x"
+            ),
             "origin-boot: KASLR: kernel at 0xffffffff".into(),
             "origin-boot: page tables built: ".into(),
             "origin-boot: exiting boot services; entering the Framekernel".into(),
+            // Attached before anything else is printed, so everything below is also on the
+            // screen; `check_screen` holds the kernel to that.
+            format!("origin-kernel: console: framebuffer {QEMU_DISPLAY} at 0x"),
             format!("origin-kernel: {PRODUCT} {VERSION} Framekernel (build {BUILD})"),
             format!(
                 "origin-kernel: boot info {}.{}, ",
@@ -656,6 +699,8 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "faulted (#PF error 0x11)".into(),
             "origin-kernel: page protection: read of page 0 at 0x0 faulted (#PF error 0x0)".into(),
             "origin-kernel: page protection: read of the boot stack's guard page at ".into(),
+            // QEMU's firmware publishes no SPCR, so the console keeps COM1 (ADR-0010).
+            format!("origin-kernel: console: {NO_SPCR}"),
             // After the switch, so this also proves the direct map.
             "origin-kernel: allocated, wrote and freed 3 frames at ".into(),
             "origin-kernel: heap: Vec of 100000 u64, 2000 boxes, B-tree of 1000 keys, a string: "
@@ -739,6 +784,8 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             format!(
                 "origin-kernel: console: {cpus} processors printed {CONSOLE_LINES} lines each at once"
             ),
+            // What drawing a line costs, measured (CLAUDE.md rule 21).
+            "origin-kernel: console: framebuffer: ".into(),
             // ADR-0004 H5: global kernel pages on every CPU, nothing global in the lower
             // half; and TLB shootdowns: every other CPU's next read of each unmapped page
             // faults.
@@ -953,73 +1000,110 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: M1 entry complete; halting".into(),
         ])
         .collect(),
-        failures: vec![
-            "origin-boot: panic:",
-            "origin-kernel: panic:",
-            "origin-boot: kernel rejected",
-            "origin-kernel: invalid boot info",
-            "origin-kernel: invalid image",
-            "(#DF double fault)",
-            "(#GP general protection)",
-            "(#PF page fault)",
-            "(#UD invalid opcode)",
-            "origin-kernel: no usable region can hold",
-            "origin-kernel: frame allocator exhausted",
-            "did not keep its contents",
-            "could not be freed",
-            "origin-kernel: page tables not built",
-            "origin-kernel: page protection violated",
-            "origin-kernel: the processor has no NX bit",
-            "origin-kernel: no code or read-only segment to probe",
-            "RWX at",
-            "origin-kernel: the processor has no x2APIC",
-            "origin-kernel: APIC timer calibration failed",
-            ": APIC timer is wrong",
-            "is unusable",
-            "(reserved) at rip",
-            "origin-kernel: heap contents are wrong",
-            "origin-kernel: heap leaked",
-            "origin-kernel: ACPI processor discovery failed",
-            "origin-kernel: AP start-up not possible",
-            ": AP start-up failed",
-            ": scheduler failed",
-            ": topology failed",
-            ": CPU baseline failed",
-            ": numa failed",
-            ": slit failed",
-            ": entropy failed",
-            ": initramfs failed",
-            ": virtio-net failed",
-            "supervisor isolation from user pages incomplete",
-            "origin-kernel: cannot map the user probe page",
-            ": user isolation failed",
-            ": NMI stack failed",
-            ": higher half failed",
-            ": process isolation failed",
-            ": clock failed",
-            ": HPET failed",
-            ": I/O APIC failed",
-            ": PM timer failed",
-            ": console failed",
-            ": TLB failed",
-            ": wait queues failed",
-            ": PCIe failed",
-            ": NVMe failed",
-            ": block cache failed",
-            ": backtrace failed",
-            ": vfs failed",
-            ": raster failed",
-            ": i8042 failed",
-            ": net failed",
-            ": tcp failed",
-            ": timers failed",
-            ": sysfs failed",
-            ": GPT failed",
-            ": IOMMU failed",
-        ],
-        check: Some(|text| console_lines_intact(text, self::machine().cpus() as usize)),
+        failures: boot_failures(),
+        check: Some(|done| {
+            console_lines_intact(&done.serial, self::machine().cpus() as usize)?;
+            check_screen(done)
+        }),
         stderr: vec![],
+        capture: Capture::Com1AndScreen,
+        qemu_args: None,
     }
+}
+
+/// Output that fails any kernel boot the moment it appears.
+fn boot_failures() -> Vec<&'static str> {
+    vec![
+        "origin-boot: panic:",
+        "origin-kernel: panic:",
+        "origin-boot: kernel rejected",
+        "origin-kernel: invalid boot info",
+        "origin-kernel: invalid image",
+        "(#DF double fault)",
+        "(#GP general protection)",
+        "(#PF page fault)",
+        "(#UD invalid opcode)",
+        "origin-kernel: no usable region can hold",
+        "origin-kernel: frame allocator exhausted",
+        "did not keep its contents",
+        "could not be freed",
+        "origin-kernel: page tables not built",
+        "origin-kernel: page protection violated",
+        "origin-kernel: the processor has no NX bit",
+        "origin-kernel: no code or read-only segment to probe",
+        "RWX at",
+        "origin-kernel: the processor has no x2APIC",
+        "origin-kernel: APIC timer calibration failed",
+        ": APIC timer is wrong",
+        "is unusable",
+        "(reserved) at rip",
+        "origin-kernel: heap contents are wrong",
+        "origin-kernel: heap leaked",
+        "origin-kernel: ACPI processor discovery failed",
+        "origin-kernel: AP start-up not possible",
+        ": AP start-up failed",
+        ": scheduler failed",
+        ": topology failed",
+        ": CPU baseline failed",
+        ": numa failed",
+        ": slit failed",
+        ": entropy failed",
+        ": initramfs failed",
+        ": virtio-net failed",
+        "supervisor isolation from user pages incomplete",
+        "origin-kernel: cannot map the user probe page",
+        ": user isolation failed",
+        ": NMI stack failed",
+        ": higher half failed",
+        ": process isolation failed",
+        ": clock failed",
+        ": HPET failed",
+        ": I/O APIC failed",
+        ": PM timer failed",
+        ": console failed",
+        ": TLB failed",
+        ": wait queues failed",
+        ": PCIe failed",
+        ": NVMe failed",
+        ": block cache failed",
+        ": backtrace failed",
+        ": vfs failed",
+        ": raster failed",
+        ": i8042 failed",
+        ": net failed",
+        ": tcp failed",
+        ": timers failed",
+        ": sysfs failed",
+        ": GPT failed",
+        ": IOMMU failed",
+    ]
+}
+
+/// The kernel's console, as QEMU's firmware sets it up: the mode, and the size of the first
+/// console line it leads to.
+const QEMU_DISPLAY: &str = "1280x800";
+/// What the kernel says about the SPCR when the firmware has none (`console.rs`).
+const NO_SPCR: &str =
+    "no usable ACPI SPCR table (table not listed in the XSDT); the UART stays at I/O port 0x3f8";
+/// Every scenario here boots the whole kernel, so it ends with this line.
+const HALT_LINE: &str = "origin-kernel: M1 entry complete; halting";
+
+/// The screen after a whole boot: exactly what the serial log says it must show (the
+/// console writes one line at a time to both).
+fn check_screen(done: &Completed) -> Result {
+    let image = done.screen.as_ref().ok_or("no screen dump was taken")?;
+    let start = done
+        .serial
+        .find("origin-kernel: console: framebuffer")
+        .ok_or("the serial log has no framebuffer console line")?;
+    let text = done.serial.get(start..).ok_or("serial log out of bounds")?;
+    // The markers can be seen a moment before the serial port's last newline arrives; the
+    // console drew that whole last line before any of it left through the UART.
+    let mut text = text.to_string();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    screen::check_frame(image, &text)
 }
 
 /// Developer mode: an unsigned kernel still boots (ADR-0002 B8), and the loader says so.
@@ -1037,6 +1121,8 @@ fn developer_scenario() -> Scenario {
         failures: vec!["origin-boot: kernel rejected", "origin-boot: panic:"],
         check: None,
         stderr: vec![],
+        capture: Capture::Com1,
+        qemu_args: None,
     }
 }
 
@@ -1064,6 +1150,8 @@ fn refusal_scenario(
         ],
         check: None,
         stderr: vec![],
+        capture: Capture::Com1,
+        qemu_args: None,
     }
 }
 
@@ -1086,6 +1174,8 @@ fn tamper_scenario() -> Scenario {
         ],
         check: None,
         stderr: vec![],
+        capture: Capture::Com1,
+        qemu_args: None,
     }
 }
 
@@ -1153,6 +1243,7 @@ fn main() -> ExitCode {
         ["boot-test"] => boot_test(),
         ["boot-matrix"] => boot_matrix(),
         ["boot-x2apic"] => boot_x2apic(),
+        ["boot-console"] => boot_console(),
         ["run"] => run(),
         _ => {
             eprintln!("{USAGE}");
@@ -1190,8 +1281,260 @@ fn boot_matrix() -> Result {
         }
     }
     boot_x2apic()?;
+    boot_console()?;
     println!(
-        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, and the sparse machine)"
+        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, and the console machines)"
+    );
+    Ok(())
+}
+
+/// The I/O port of the UART the SPCR proof's table names: COM2's, where there is no COM1.
+const SPCR_PORT: u16 = 0x2F8;
+
+/// A checksummed SPCR table, revision 2: `interface` type, the Generic Address Structure
+/// (`[space, bit width, bit offset, access size, address...]`) at the UART, `baud` code 7 for
+/// 115 200 and 1 stop bit (the only value the table defines). Built here, independently of
+/// `framekernel::spcr`, so the boot proof checks the parser against the specification.
+fn spcr_table(interface: u8, base_address: [u8; 12], baud: u8) -> Vec<u8> {
+    let mut table = vec![0u8; 80];
+    table[..4].copy_from_slice(b"SPCR");
+    table[4..8].copy_from_slice(&80u32.to_le_bytes());
+    table[8] = 2;
+    table[10..16].copy_from_slice(b"ORIGIN");
+    table[16..24].copy_from_slice(b"ORIGSPCR");
+    table[24..28].copy_from_slice(&1u32.to_le_bytes());
+    table[28..32].copy_from_slice(b"ORIG");
+    table[32..36].copy_from_slice(&1u32.to_le_bytes());
+    table[36] = interface;
+    table[40..52].copy_from_slice(&base_address);
+    table[58] = baud;
+    table[60] = 1;
+    table[64..68].copy_from_slice(&[0xFF; 4]);
+    let sum = table.iter().fold(0u8, |s, &b| s.wrapping_add(b));
+    table[9] = 0u8.wrapping_sub(sum);
+    table
+}
+
+/// A Generic Address Structure in I/O space, as the SPCR's examples write COM1 and COM2.
+fn gas_io(port: u16) -> [u8; 12] {
+    let mut gas = [0u8; 12];
+    gas[0] = 1;
+    gas[1] = 8;
+    gas[4..6].copy_from_slice(&port.to_le_bytes());
+    gas
+}
+
+/// Writes `table` under the work directory and returns the QEMU arguments that add it.
+fn spcr_args(work: &Path, table: &[u8], extra: &[&str]) -> Result<Vec<String>> {
+    let path = work.join("spcr.bin");
+    fs::write(&path, table).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut args = vec!["-acpitable".to_string(), qemu_path_arg("file=", &path)?];
+    args.extend(extra.iter().map(|a| (*a).to_string()));
+    Ok(args)
+}
+
+/// Text the scenarios in [`boot_console`] must see from the kernel at the end of a boot.
+fn console_markers(specific: &[&str]) -> Vec<String> {
+    let mut markers: Vec<String> = specific.iter().map(|m| (*m).to_string()).collect();
+    markers.push(HALT_LINE.to_string());
+    markers
+}
+
+/// A scenario for [`boot_console`]: the signed boot and every kernel failure message; the
+/// markers come from the machine and what's special about it.
+fn console_scenario(
+    label: &'static str,
+    capture: Capture,
+    markers: Vec<String>,
+    qemu_args: Option<QemuArgs>,
+    check: Option<fn(&Completed) -> Result>,
+) -> Scenario {
+    Scenario {
+        label,
+        loader: Loader::Verifying,
+        markers,
+        failures: boot_failures(),
+        check,
+        stderr: vec![],
+        capture,
+        qemu_args,
+    }
+}
+
+/// The UART the SPCR names: everything printed before the move is sent to it, from the first
+/// line of the boot, and what follows the move reaches it and only it. COM1's log is checked
+/// to stop at the line announcing the move.
+fn spcr_uart_scenario() -> Scenario {
+    use origin_version::{BUILD, PRODUCT, VERSION};
+    console_scenario(
+        "console: UART named by the SPCR",
+        Capture::SpcrUart,
+        console_markers(&[
+            // Everything before the move, replayed: the first kernel lines of the boot.
+            "origin-kernel: console: framebuffer ",
+            &format!("origin-kernel: {PRODUCT} {VERSION} Framekernel (build {BUILD})"),
+            "origin-kernel: GDT, TSS and IDT loaded (32 exception vectors)",
+            "origin-kernel: page tables loaded: ",
+            MOVED_LINE,
+            "origin-kernel: console: the UART is now at I/O port 0x2f8, as the firmware set it; ",
+            // After the move: only this UART has these.
+            "origin-kernel: allocated, wrote and freed 3 frames at ",
+            "origin-kernel: TLB: ",
+            "origin-kernel: GPT: partition 2",
+            "origin-kernel: sysfs: built /sys with 4 facts",
+        ]),
+        Some(|work| spcr_args(work, &spcr_table(0, gas_io(SPCR_PORT), 7), &[])),
+        Some(check_com1_stopped_at_the_move),
+    )
+}
+
+/// The line announcing the move, the last one COM1 may ever carry.
+const MOVED_LINE: &str = "origin-kernel: console: the ACPI SPCR (revision 2, interface 0x0) names a UART at I/O port 0x2f8: moving the console there";
+
+/// Once the firmware has named a better UART, the fallback is not used: COM1 holds the move
+/// line as its last kernel line, and has never heard of anything after it.
+fn check_com1_stopped_at_the_move(done: &Completed) -> Result {
+    let com1 = done.com1.as_deref().ok_or("no COM1 log")?;
+    let text = serial::clean(com1.as_bytes());
+    let kernel_lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("origin-kernel:"))
+        .collect();
+    if kernel_lines.last().copied() != Some(MOVED_LINE) {
+        return Err(format!(
+            "COM1's last kernel line is {:?}; it should be the line about the move",
+            kernel_lines.last()
+        ));
+    }
+    if kernel_lines.len() < 10 {
+        return Err(format!(
+            "COM1 carried only {} kernel lines before the move",
+            kernel_lines.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Every console scenario for `boot-console`: where the UART is not at 0x3F8, and what the
+/// kernel does without one or without a display (ADR-0010: a missing or unusable console
+/// never stops the boot).
+fn console_scenarios() -> Vec<Scenario> {
+    vec![
+        spcr_uart_scenario(),
+        console_scenario(
+            "console: SPCR naming COM1 itself",
+            Capture::Com1,
+            console_markers(&[
+                "origin-kernel: console: the ACPI SPCR (revision 2, interface 0x0) names a UART at I/O port 0x3f8: moving the console there",
+                "origin-kernel: console: the UART is now at I/O port 0x3f8, as the firmware set it; 0 bytes of earlier output sent to it again, 0 did not fit",
+                "origin-kernel: allocated, wrote and freed 3 frames at ",
+            ]),
+            Some(|work| spcr_args(work, &spcr_table(0, gas_io(0x3F8), 7), &[])),
+            None,
+        ),
+        // A device that answers at the UART's status register but never reports room to
+        // transmit: the debug console's read value, which QEMU makes readable, stands in
+        // for a clock-gated UART (this is the status port of the block the table names).
+        console_scenario(
+            "console: SPCR naming a UART that takes no bytes",
+            Capture::Com1,
+            console_markers(&[
+                "origin-kernel: console: the ACPI SPCR (revision 2, interface 0x0) names a UART at I/O port 0x2e8: moving the console there",
+                "origin-kernel: console: the UART at I/O port 0x2e8 takes no bytes; the UART stays at I/O port 0x3f8",
+                "origin-kernel: allocated, wrote and freed 3 frames at ",
+            ]),
+            Some(|work| {
+                spcr_args(
+                    work,
+                    &spcr_table(0, gas_io(0x2E8), 7),
+                    &[
+                        "-chardev",
+                        "null,id=wedged",
+                        "-device",
+                        "isa-debugcon,iobase=0x2ed,readback=0,chardev=wedged",
+                    ],
+                )
+            }),
+            None,
+        ),
+        console_scenario(
+            "console: SPCR for an interface this kernel cannot drive",
+            Capture::Com1,
+            console_markers(&[
+                "origin-kernel: console: the ACPI SPCR table was refused (Interface(3)); the UART stays at I/O port 0x3f8",
+                "origin-kernel: allocated, wrote and freed 3 frames at ",
+            ]),
+            Some(|work| spcr_args(work, &spcr_table(3, gas_io(SPCR_PORT), 7), &[])),
+            None,
+        ),
+        console_scenario(
+            "console: SPCR naming a port with no UART",
+            Capture::Com1,
+            console_markers(&[
+                "origin-kernel: console: the ACPI SPCR names a UART at I/O port 0x2e8 that cannot be used (nothing answers at that address); the UART stays at I/O port 0x3f8",
+                "origin-kernel: allocated, wrote and freed 3 frames at ",
+            ]),
+            Some(|work| spcr_args(work, &spcr_table(0, gas_io(0x2E8), 7), &[])),
+            None,
+        ),
+        console_scenario(
+            "console: SPCR naming registers in RAM",
+            Capture::Com1,
+            console_markers(&[
+                "origin-kernel: console: the ACPI SPCR names a UART at physical address 0x1000000 (registers 4 bytes apart, 4 bytes wide) that cannot be used (its registers are in RAM); the UART stays at I/O port 0x3f8",
+                "origin-kernel: allocated, wrote and freed 3 frames at ",
+            ]),
+            Some(|work| {
+                let mut base = [0u8; 12];
+                base[1] = 32; // a 32-bit stride
+                base[3] = 3; // dword accesses
+                base[4..12].copy_from_slice(&0x0100_0000u64.to_le_bytes());
+                spcr_args(work, &spcr_table(0x12, base, 7), &[])
+            }),
+            None,
+        ),
+        console_scenario(
+            "console: no display",
+            Capture::Com1,
+            console_markers(&[
+                "origin-boot: no Graphics Output Protocol",
+                "origin-kernel: console: the loader found no framebuffer; output goes to the UART only",
+                &format!("origin-kernel: console: {NO_SPCR}"),
+            ]),
+            Some(|_| Ok(vec!["-vga".into(), "none".into()])),
+            None,
+        ),
+        console_scenario(
+            "console: no UART at all",
+            Capture::Screen,
+            // Read from the screen: the last screenful of lines, the only record of the boot.
+            console_markers(&["origin-kernel: sysfs: built /sys with 4 facts"]),
+            None,
+            None,
+        ),
+    ]
+}
+
+/// The console scenarios (`boot-console`), each a whole boot. `ORIGIN_BOOT_TEST_ONLY` selects
+/// by label, as for `boot-test`.
+fn boot_console() -> Result {
+    check_environment()?;
+    let krn_path = pack_kernel(&build_kernel()?)?;
+    let (trusted, _) = test_keys()?;
+    let signed = sign_kernel(&krn_path, &trusted, "KERNEL.signed.ONBF")?;
+    let scenarios: Vec<(Scenario, Vec<u8>)> = console_scenarios()
+        .into_iter()
+        .map(|scenario| (scenario, signed.clone()))
+        .collect();
+    let only = env::var("ORIGIN_BOOT_TEST_ONLY").unwrap_or_default();
+    let chosen = select_scenarios(&scenarios, &only)?;
+    for (scenario, kernel) in &chosen {
+        run_scenario(scenario, kernel)?;
+    }
+    println!(
+        "xtask: boot-console passed ({} of {} scenarios: the UART the SPCR names, COM1 named, refused tables, a UART that takes no bytes, no display, no UART)",
+        chosen.len(),
+        scenarios.len()
     );
     Ok(())
 }
@@ -2370,15 +2713,45 @@ fn select_scenarios<'a>(
     Ok(chosen)
 }
 
-/// Boots `kernel` once and checks the serial output against `scenario`.
+/// Boots `kernel` once and checks its output against `scenario`.
 fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
     let staged = stage(kernel, scenario.loader)?;
     let timeout = boot_test_timeout()?;
+    let work = target_dir().join("xtask");
     let mut cmd = qemu_command(&staged)?;
-    cmd.args(["-serial", "stdio", "-monitor", "none"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    if let Some(args) = scenario.qemu_args {
+        cmd.args(args(&work)?);
+    }
+    let com1_log = work.join("com1.log");
+    let _ = fs::remove_file(&com1_log);
+    match scenario.capture {
+        Capture::Com1 => {
+            cmd.args(["-serial", "stdio", "-monitor", "none"]);
+        }
+        Capture::Com1AndScreen => {
+            cmd.args(["-serial", "mon:stdio"]);
+        }
+        Capture::SpcrUart => {
+            cmd.arg("-serial")
+                .arg(qemu_path_arg("file:", &com1_log)?)
+                .args(["-chardev", "stdio,id=spcruart", "-device"])
+                .arg(format!(
+                    "isa-serial,iobase={SPCR_PORT:#x},irq=3,chardev=spcruart"
+                ))
+                .args(["-monitor", "none"]);
+        }
+        Capture::Screen => {
+            cmd.args(["-serial", "none", "-monitor", "stdio"]);
+        }
+    }
+    let monitored = matches!(scenario.capture, Capture::Com1AndScreen | Capture::Screen);
+    cmd.stdin(if monitored {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     println!(
         "xtask: {}: booting under {QEMU} + OVMF (timeout {}s)",
         scenario.label,
@@ -2389,6 +2762,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
         .map_err(|e| format!("cannot start {QEMU}: {e}"))?;
     let mut stdout = child.stdout.take().ok_or("QEMU stdout was not captured")?;
     let mut stderr = child.stderr.take().ok_or("QEMU stderr was not captured")?;
+    let mut stdin = child.stdin.take();
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     thread::spawn(move || {
@@ -2409,35 +2783,61 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
     let started = Instant::now();
     let deadline = started + timeout;
     let mut raw = Vec::new();
-    let verdict: Result = loop {
-        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(chunk) => {
-                raw.extend_from_slice(&chunk);
-                let text = serial::clean(&raw);
-                // Failures are matched in complete lines only, so a failing line reaches the
-                // log in full (its details follow the marker) before QEMU is stopped.
-                let complete = text
-                    .get(..text.rfind('\n').map_or(0, |i| i + 1))
-                    .unwrap_or("");
-                if let Some(m) = scenario.failures.iter().find(|m| complete.contains(**m)) {
-                    break Err(format!("the serial output contains {m:?}"));
+    let screen_path = work.join("screen.ppm");
+    let mut verdict: Result = if scenario.capture == Capture::Screen {
+        let monitor = stdin.as_mut().ok_or("QEMU stdin was not captured")?;
+        wait_for_screen(
+            monitor,
+            &screen_path,
+            &markers,
+            &scenario.failures,
+            deadline,
+        )
+    } else {
+        loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(chunk) => {
+                    raw.extend_from_slice(&chunk);
+                    let text = serial::clean(&raw);
+                    // Failures are matched in complete lines only, so a failing line reaches
+                    // the log in full (its details follow the marker) before QEMU is stopped.
+                    let complete = text
+                        .get(..text.rfind('\n').map_or(0, |i| i + 1))
+                        .unwrap_or("");
+                    if let Some(m) = scenario.failures.iter().find(|m| complete.contains(**m)) {
+                        break Err(format!("the serial output contains {m:?}"));
+                    }
+                    if serial::contains_in_order(&text, &markers) {
+                        break Ok(());
+                    }
                 }
-                if serial::contains_in_order(&text, &markers) {
-                    break Ok(());
+                Err(RecvTimeoutError::Timeout) => {
+                    break Err(format!(
+                        "no complete loader output within {}s",
+                        timeout.as_secs()
+                    ));
                 }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                break Err(format!(
-                    "no complete loader output within {}s",
-                    timeout.as_secs()
-                ));
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                break Err("QEMU exited before the loader output was complete".into());
+                Err(RecvTimeoutError::Disconnected) => {
+                    break Err("QEMU exited before the loader output was complete".into());
+                }
             }
         }
     };
     let elapsed = started.elapsed();
+
+    // What the markers were found in, before any monitor output joins the stream.
+    let text = serial::clean(&raw);
+    let mut screen = None;
+    if verdict.is_ok() && scenario.capture == Capture::Com1AndScreen {
+        match stdin.as_mut() {
+            Some(monitor) => match dump_screen(monitor, &screen_path, true) {
+                Ok(image) => screen = Some(image),
+                Err(e) => verdict = Err(format!("no screen dump: {e}")),
+            },
+            None => verdict = Err("QEMU stdin was not captured".into()),
+        }
+    }
+    drop(stdin);
 
     // QEMU keeps running after the scenario ends (the kernel halts; a rejecting loader hands
     // back to the firmware), so the test stops it. (QEMU does not exit on SIGALRM.)
@@ -2445,18 +2845,37 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
     let exit = child.wait();
     let qemu_stderr = stderr_reader.join().unwrap_or_default();
 
-    let text = serial::clean(&raw);
+    let com1 = if scenario.capture == Capture::SpcrUart {
+        match fs::read(&com1_log) {
+            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(e) => {
+                if verdict.is_ok() {
+                    verdict = Err(format!("{}: {e}", com1_log.display()));
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let done = Completed {
+        serial: text.clone(),
+        screen,
+        com1,
+    };
     let verdict = verdict
-        .and_then(|()| scenario.check.map_or(Ok(()), |check| check(&text)))
+        .and_then(|()| scenario.check.map_or(Ok(()), |check| check(&done)))
         .and_then(
             |()| match scenario.stderr.iter().find(|m| !qemu_stderr.contains(**m)) {
                 Some(m) => Err(format!("QEMU's stderr lacks {m:?}")),
                 None => Ok(()),
             },
         );
-    let log = target_dir().join("xtask").join(format!(
+    let log = work.join(format!(
         "boot-test-{}.log",
-        scenario.label.replace(' ', "-")
+        scenario
+            .label
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "-")
     ));
     fs::write(&log, &text).map_err(|e| format!("{}: {e}", log.display()))?;
 
@@ -2486,6 +2905,67 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
             ))
         }
     }
+}
+
+/// Asks QEMU's monitor for a screen dump and reads it. `switch`: the monitor shares stdio
+/// with the serial port, so change over to it first (Ctrl-A, then C). QEMU writes the file
+/// once, whole, so a complete PPM is a finished dump.
+fn dump_screen(monitor: &mut ChildStdin, path: &Path, switch: bool) -> Result<screen::Image> {
+    let _ = fs::remove_file(path);
+    let shown = path
+        .to_str()
+        .ok_or_else(|| format!("path is not UTF-8: {}", path.display()))?;
+    if switch {
+        monitor
+            .write_all(b"\x01c")
+            .map_err(|e| format!("cannot reach the QEMU monitor: {e}"))?;
+        thread::sleep(Duration::from_millis(250));
+    }
+    monitor
+        .write_all(format!("screendump \"{shown}\"\n").as_bytes())
+        .map_err(|e| format!("cannot reach the QEMU monitor: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(bytes) = fs::read(path)
+            && let Ok(image) = screen::parse_ppm(&bytes)
+        {
+            return Ok(image);
+        }
+        if Instant::now() > deadline {
+            return Err(format!("{} never became a screen dump", path.display()));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// [`Capture::Screen`]: the display is all there is, so a poll of screen dumps watches for
+/// the markers, in order, in the rows on the screen, and for any failure message among the
+/// rows visible when it looks.
+fn wait_for_screen(
+    monitor: &mut ChildStdin,
+    path: &Path,
+    markers: &[&str],
+    failures: &[&'static str],
+    deadline: Instant,
+) -> Result {
+    let mut rows = Vec::new();
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1500));
+        let image = dump_screen(monitor, path, false)?;
+        // Until the kernel draws, the screen holds no console rows.
+        rows = screen::screen_text(&image).unwrap_or_default();
+        let text = rows.join("\n");
+        if let Some(m) = failures.iter().find(|m| text.contains(**m)) {
+            return Err(format!("the screen shows {m:?}"));
+        }
+        if serial::contains_in_order(&text, markers) {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "the screen never showed the markers; it showed:\n{}",
+        rows.join("\n")
+    ))
 }
 
 fn run() -> Result {
@@ -2696,6 +3176,43 @@ mod tests {
         );
         assert!(!plain.geometry.has_extended_levels());
         assert!(sparse.geometry.has_extended_levels());
+    }
+
+    /// The table the boot proof hands QEMU means what the proof claims, by the kernel's own
+    /// parser and the ACPI checks every table goes through.
+    #[test]
+    fn the_spcr_table_for_the_proof_parses_as_the_uart_it_names() {
+        use framekernel::spcr::{self, Access, UartAddress};
+        let table = spcr_table(0, gas_io(SPCR_PORT), 7);
+        assert_eq!(framekernel::acpi::check_table(&table, b"SPCR"), Ok(()));
+        let parsed = spcr::parse(&table).unwrap();
+        assert_eq!(parsed.address, UartAddress::Port(SPCR_PORT));
+        assert_eq!(parsed.baud, Some(115_200));
+        assert_eq!(
+            parsed.line_setup(0),
+            framekernel::serial::LineSetup::Divisor(1)
+        );
+
+        // The table `boot-console` uses for "registers in RAM".
+        let mut base = [0u8; 12];
+        base[1] = 32;
+        base[3] = 3;
+        base[4..12].copy_from_slice(&0x0100_0000u64.to_le_bytes());
+        let table = spcr_table(0x12, base, 7);
+        assert_eq!(framekernel::acpi::check_table(&table, b"SPCR"), Ok(()));
+        assert_eq!(
+            spcr::parse(&table).unwrap().address,
+            UartAddress::Mmio {
+                base: 0x0100_0000,
+                stride: 4,
+                access: Access::Dword
+            }
+        );
+        // The refused one, by name.
+        assert_eq!(
+            spcr::parse(&spcr_table(3, gas_io(SPCR_PORT), 7)),
+            Err(spcr::SpcrError::Interface(3))
+        );
     }
 
     #[test]

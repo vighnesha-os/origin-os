@@ -26,7 +26,7 @@ Two warnings about the recommended pair:
 
 | Need | Why |
 |---|---|
-| A real serial port at I/O address 0x3F8 | The kernel's only console is a 16550 at `0x3F8` (`framekernel/src/main.rs`). Without it, a failed boot shows nothing. |
+| A real serial port at I/O address 0x3F8 | The kernel's only console is a 16550 at `0x3F8` (`framekernel/src/main.rs`). Without it, a failed boot shows nothing. *(Since 2026-11-08, on branch `claude/funny-benz-fa7d10` (ADR-0010, Proposed), the kernel also draws on the GOP framebuffer and takes the UART's address from the ACPI SPCR when firmware names one, so this is no longer the only path, though a serial line is still the most useful one on a first boot.)* |
 | An IOMMU the firmware exposes | §32, §58. VT-d or AMD-Vi with a DMAR or IVRS table. |
 | PCIe Gen 5 NVMe | §17 ("Target actual PCIe Gen 5/6 hardware initially"), §33. |
 | CET shadow stacks, `x86-64-v3`, x2APIC | §14, §24. CET and real IOMMU behaviour cannot be shown under QEMU. |
