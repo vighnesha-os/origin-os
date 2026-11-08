@@ -73,10 +73,9 @@ Applied in code on 2026-11-07 and pinned by tests. **Accepted as normative the s
 
 ## Open gaps
 
-None at present.
-
 | # | Spec | Gap | Who needs it |
 |---|---|---|---|
+| O1 | S3, §5 | `id` is `text (NFC)`, but the signature-block parser has no Unicode normalization tables, and R4 avoided them for the manifest's text by restricting it to ASCII. Today the parser checks only that `id` is non-empty valid UTF-8, so a non-NFC `id` parses. The owner decides: restrict `id` to ASCII (as R4), or give the parser NFC tables. Found while the soak was being written (2026-11-08). | `onbf-format` signature-block parser; the Package Service's ID-namespace checks |
 
 ## Observed by the bit-flip sweep
 

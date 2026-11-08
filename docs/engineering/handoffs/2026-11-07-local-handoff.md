@@ -877,6 +877,56 @@ blocks larger than a page.
 Backlog item 4 (M3 scheduling proper). The owner: the questions that were already open in this
 file (ADR-0007, ADR-0008, the VT-d PDF, the AMD specification's hash) are unchanged.
 
+### Continued (2026-11-08, afternoon IST): a multi-fault soak over the ONBF parsers
+
+The follow-up to parser hardening, on branch **`claude/heuristic-chandrasekhar-6a46a1`** (on
+`claude/gifted-maxwell-7e8a3f` at `62dc630`; **not pushed**). The ONBF parsers (`onbf-format`,
+`onbf-merkle`, `onbf-verify`) now have seeded multi-fault soaks on a test-only helper,
+`runtime/onbf/format/src/testing.rs`, which the other two crates include by path.
+
+Evidence: `SOURCE_PROVENANCE.md`, "Seeded multi-fault mutation soaks over the ONBF parsers":
+the inventory, the five bugs, 30 negative controls.
+
+**Result:** 30 new tests (workspace 634 → 664, 0 failed, 6 ignored). A default run adds about 1 s
+to `cargo xtask check`. Scale runs: 30x debug and 100x release, 0 failures.
+
+**The five bugs** (each with a regression test shown to fail with its fix reverted):
+- a MAPPABLE MERKLE section accepted (errata C8);
+- a MAPPABLE DWARF section accepted (errata G1);
+- a certificate chain of more than four accepted (Appendix A);
+- a statement `version` that is not SemVer 2.0 accepted (S3);
+- a block over 1 MiB accepted by `SignatureBlock::parse` when called directly (Appendix A).
+
+None was a panic or an out-of-bounds read: every one of these crates is panic-free by lint and
+by the object check, so what a soak finds here is a rule of the specification not enforced.
+
+#### What to know
+
+- `SectionError` gained `MappableNotAllowed`; `SignatureError` gained `TooLarge`;
+  `signature::MAX_CHAIN` is new. `TrustCache`'s documentation now says an entry belongs to one
+  tree (its MERKLE bytes and content size): the soak showed a warm cache given another tree's
+  shape can accept, which is the caller's contract, not a forgery path.
+- When adding an ONBF check, name a refusal in the soak's `*_REFUSALS` list and its model, and the
+  floor keeps the check reached. To see what each soak reached, run with
+  `ORIGIN_MUTATION_REPORT=1 ... -- --nocapture`.
+- A multi-fault soak needs layouts rebuilt after each fault, and sometimes composite faults: a
+  flipped MAPPABLE bit only counts once the layout is canonical again, and the DWARF rule needed
+  two fields changed together, which did not happen by chance in 24,000 cases.
+
+#### Open for the owner
+
+- Errata **O1**: a statement's `id` must be NFC, and the parser has no normalization tables
+  (R4 avoided them for the manifest with ASCII-only text). Today `id` is checked only as non-empty
+  valid UTF-8. Decide: ASCII only, or tables in the parser.
+
+#### Not done
+
+- Coverage-guided fuzzing, Kani bounds and the N-version second parser (§13 items 3, 5, 6).
+
+#### Next
+
+Backlog item 4 (M3 scheduling proper). The owner's questions from earlier sections stand.
+
 ### Continued (2026-11-08, ~12:25–12:45 IST): the IOMMU follow-ups merged
 
 The owner asked the VT-d session to merge its four follow-up branches into its own branch,

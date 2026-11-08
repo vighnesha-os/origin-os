@@ -1436,7 +1436,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 | `vtd`, `amdvi` register and entry decoders | IOMMU registers and tables read back | fault/event only | `any_register_and_entry_words_decode` (20 000 / 30 000, `decode` then `encode`) | **bug 11** |
 | `ioapic` | redirection entries | yes (round trip, 20 000) | unchanged (the rest of the file is bit operations) | — |
 | `dmar`, `ivrs` | ACPI | yes: 12 000 mutations each, two thirds re-sealed, every invariant `parse` promises, device-scope resolution and lookups | not redone; passed at scale 10 | clean |
-| `onbf-format`, `onbf-verify`, `onbf-merkle` | the signed image | exhaustive single-fault sweeps (every truncation, padding byte and bit flip), corpus tests; no multi-fault random soak (the helper is `framekernel`-only) | not redone | noted, see Not done |
+| `onbf-format`, `onbf-verify`, `onbf-merkle` | the signed image | exhaustive single-fault sweeps (every truncation, padding byte and bit flip), corpus tests; no multi-fault random soak (the helper is `framekernel`-only) | not redone here; done afterwards, see "Seeded multi-fault mutation soaks over the ONBF parsers" | see that entry |
 
 - **Bugs found** (each with a regression test; each test was confirmed to fail with its fix reverted, 28 controls in all, in a scratch copy of the tree):
   1. `cache::decode`: `sub[2] + 1` overflowed `u32` for `ECX = FFFFFFFFh` (a value a hypervisor can return): a panic with overflow checks on, a wrong cache size with them off; the size product could overflow `u64` at the fields' maxima (exactly 2^64 bytes). Now checked in `u64`; a sub-leaf whose size does not fit ends the list.
@@ -1461,7 +1461,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `ORIGIN_MUTATION_SCALE=10` in the debug build, overflow checks on: all 391 library tests in 10.3 s. `ORIGIN_MUTATION_SCALE=100` in the release build: 24.6 s, 0 failures.
   - A negative control for each of the 13 library fixes and the checks the kernel shares with them (28 controls: each fix reverted alone in a scratch copy, its regression test or soak failing as it should). The first run showed three soaks too shallow to find their bug (MSI-X and virtio capabilities at the top of the capability area, a directory's size field); those soaks were strengthened until each caught it.
   - `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d and AMD-Vi) and `cargo xtask boot-matrix` (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs) pass. The `framekernel` library tests take 1.0 s (0.92 s before); `cargo xtask check` is about 25 s incremental.
-- **Not done:** coverage-guided fuzzing (nightly-only, §12) and Kani bounds (§73); a random multi-fault soak over the ONBF parsers (their single-fault sweeps are exhaustive, and the §72 fuzzing that §13 asks of them is still listed); the malformed-device paths above need a fault-injecting device model or hardware (§74).
+- **Not done:** coverage-guided fuzzing (nightly-only, §12) and Kani bounds (§73); the malformed-device paths above need a fault-injecting device model or hardware (§74). (The multi-fault soak over the ONBF parsers, listed here at the time, has since been done: see its entry under `onbf-format`.)
 - **Licensing:** project licence not chosen yet.
 
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
@@ -1607,7 +1607,44 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07, right after the owner decided S1–S4. Original code.
 - **Test evidence:** 6 tests: a two-entry block with the exact statement bytes; framing (magic, version, counts 0 and 9, truncation, trailing data, every strict prefix); each entry rule; each statement rule; duplicates and a non-minimal integer head; every single-bit flip of a valid block is refused or reads a different entry, and nothing panics. The no-panic object check still passes (4 allowed external symbols).
 
+### Seeded multi-fault mutation soaks over the ONBF parsers (`onbf-format`, `onbf-merkle`, `onbf-verify`; ONBF §13 item 3, CLAUDE.md §13, §72; 2026-11-08)
+
+- **What:** ONBF parsing runs in the boot loader on data read before any signature is checked. Those parsers had exhaustive single-fault sweeps and corpus tests. This adds seeded random multi-fault soaks: one to four faults per case, xorshift64\*, deterministic, no fuzzing crate (§5). The helper is `runtime/onbf/format/src/testing.rs`, test-only; `onbf-merkle` and `onbf-verify` include it by path, so there is one copy and no new dependency or feature. `ORIGIN_MUTATION_SCALE` scales every soak; `ORIGIN_MUTATION_REPORT` prints what each one reached. A failure is reproduced by its seed and case number (a case's generator depends only on those two). Overflow checks are on in every run (a test asserts it where the crate is built at opt-level 3).
+- **Re-sealing:** a share of the cases rebuild what would otherwise hide the checks behind it: the content digest, the section layout (offsets, sizes, padding, via the test builder), a manifest's SHA-256, signature-entry length prefixes, and, for the verifier, a key's own ID and the statement's own digest and profile as the expected values. No test can re-sign the reference fixture (Origin OS has verification code only, §7.2), so those last two are what lets hostile statements, signatures and keys reach the signature code.
+- **Inventory** (default case counts; each soak asserts a floor on accepted cases and a floor of one on every refusal it can reach):
+
+| Parser | Soak | Judged by | Result |
+|---|---|---|---|
+| `Image::parse` (header, section table, layout; §4.1–§4.4) | `mutated_images_are_refused_or_keep_every_section_4_rule` (12 000; 19 image shapes, three fault layers) | an accepted image must re-encode byte for byte from its parsed view (ONBF-R6) and satisfy every §4.1–§4.4, C1–C14, G1, G4, G5 rule, re-derived in the test; scrambling section content and the signature block must not change the verdict (ONBF-R1); a poked padding byte, a cut file and a one-byte-longer file must be refused; digests compared independently | **bugs 1, 2** |
+| the loader's order (`parse` → content digest → manifest SHA-256 → `KrnManifest::decode` → `check_against`) | `mutated_kernels_follow_the_loader_order` (4 000) | every stage reached; `check_against` judged by its own definition | clean |
+| `ocbor::validate`, `Cursor` (§5) | `mutated_documents_get_the_oracles_verdict` (24 000) | a recursive oracle written from §5 and R5: exact verdict, offset and rule on every input; an accepted document re-encodes to itself and a cursor reads exactly its value tree; a cursor over unvalidated input still terminates | clean |
+| `KrnManifest::decode` (K1–K4, R4) | `mutated_krn_manifests_decode_only_what_the_registry_allows` (10 000) | a key-lookup model of the registry on the value tree, in both directions; decoded fields re-encode to the document (extensions aside) | clean |
+| `SignatureBlock::parse` (S1–S4, Appendix A) | `mutated_signature_blocks_get_the_models_verdict` (12 000) | a model of S1–S4 and Appendix A on the OCBOR-1 oracle, in both directions; accepted blocks re-encode from the parsed view | **bugs 3, 4, 5** |
+| `onbf-merkle` `verify_block`, `Shape`, `build`, `root` (§4.6, G2, G3, R1–R3) | `mutated_paths_verify_exactly_when_the_model_says_so` (2 500), `built_trees_match_the_model_and_survive_multi_fault_damage` (120), `shapes_are_total_and_match_the_model` (30 000) | a §4.6 model with its own shape arithmetic and hashing: exact verdict, exact error, exact cache contents; sparse paths reach every tree height to 4 levels and 8 GiB without materializing the content; `build` must be byte-identical to the model's section | clean |
+| `onbf-verify` `verify_entry`, `key_id` (§7.1–§7.2, S4) | `mutated_signatures_keys_and_statements_never_verify` (1 500), `key_ids_follow_the_canonical_encoding` (1 500), `hand_built_entries_with_wrong_signature_lengths_are_refused` | the cheap checks in their documented order, exactly; nothing verifies except what was signed; every Ed25519 and ML-DSA refusal reached, via hostile signatures and hostile keys under their own IDs | clean |
+
+- **Bugs found** (each fixed with a regression test; both the test and the soak fail with the fix reverted):
+  1. `SectionEntry::parse`: a MAPPABLE MERKLE section was accepted, against errata C8 and the `IntegrityNotAllowed` doc. Flipping MAPPABLE alone misaligns the section, so the single-fault sweep could not reach it; the layout must also change, as the soak's rebuilt layouts do. Now `IntegrityNotAllowed(2)`.
+  2. `SectionEntry::parse`: a MAPPABLE DWARF section was accepted, against G1 ("never MAPPABLE"). It needs MAPPABLE and Merkle integrity together. New `SectionError::MappableNotAllowed`.
+  3. `parse_entry`: a certificate chain of more than four was accepted, against Appendix A and ONBF-R10. Now `Field { key: 4 }`, with `MAX_CHAIN`.
+  4. `parse_statement`: any non-empty text was accepted as `version`, against S3 ("SemVer 2.0"). Now the SemVer 2.0.0 grammar (`is_semver`), allocation-free and syntax-only, so numbers of any length pass and no conversion can overflow.
+  5. `SignatureBlock::parse`: no 1 MiB limit of its own; only `Image::parse` applied it, to the header's size field. Called directly, a block of 1.2 MiB (two entries, each within the 1 MiB OCBOR-1 limit) parsed. New `SignatureError::TooLarge`.
+- **Negative controls:** 30 edits, each applied alone to a scratch copy of the tree (the script is not committed), 36 expected test failures, 0 misses:
+  - the five fixes reverted, each failing its regression test and its soak;
+  - 25 parser edits removing one check each (reserved bytes, padding, canonical offsets, W+X, C8's SHA-256 rule, segment order, MERKLE size, shortest integers, depth limit, key order, text limit, IBT, commit shape, unknown keys, duplicates, role binding, the hash-slot comparison, trusting before the root check, the root comparison, the hash-block order, the statement's profile, the key-ID head, a section slice off by one, a content digest that always passes, and a parser that refuses everything), each failing the named soak.
+- **What the soaks do not show:** that every malformed image is refused, only that these inputs and the properties above held; nothing is proved (§73: Kani bounds are not done). `verify_block`'s cache contract covers one tree: handed another tree's shape, a warm cache can accept (the soak found this; it is the caller's contract, now stated on `TrustCache`). The real kernel image exercises the same parsers on every boot.
+- **Not done:** coverage-guided fuzzing (nightly, §12) and Kani bounds (§73, §13 item 5); the N-version second parser (§13 item 6; this soak's model is a partial, test-only stand-in). Statement `id` must be NFC (S3), which needs Unicode tables the parser does not have: an open gap for the owner (errata O1), with `id` checked only as non-empty valid UTF-8. §6.1's EXE rules (1–16 segments; permissions exactly R, RW or RX; relocation targets) are for the `.ose` loader, not this container parser. A compressed section's `stored_size` of 0 parses (it can only fail at decompression, which does not exist yet).
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code, from `docs/spec/ONBF.md` §4–§5, §7, Appendix A, the errata, `ONBF-manifest-keys.md`, `ONBF-signature-encoding.md`, FIPS 204's signature layout and semver.org 2.0.0. No source copied (CLAUDE.md §3).
+- **Test evidence (2026-11-08):**
+  - 30 new tests: `onbf-format` 38 → 52, `onbf-merkle` 13 → 21 (1 ignored as before), `onbf-verify` 3 → 11; the workspace 634 → 664, 0 failures, 6 ignored.
+  - `cargo test` at the default scale: `onbf-format` 0.9 s (0.3 s before), `onbf-merkle` 1.1 s (unchanged: its soaks run beside the existing three-level-tree test), `onbf-verify` 0.2 s. In `cargo xtask check` (51 s clean, about 25 s incremental) the soaks add about 1 s.
+  - A default run is about 98,000 cases (66,000 mutated images, documents, signature blocks and tree paths, 30,000 shape computations, 1,500 key IDs). `ORIGIN_MUTATION_SCALE=30`, debug, overflow checks on: about 2.9 million cases, 0 failures, 45 s. `ORIGIN_MUTATION_SCALE=100`, release: about 9.8 million cases, 0 failures. An earlier 100x run stopped on a `below(0)` in the sparse Merkle soak (a harness fault: a later fault chose a position in a block an earlier one had truncated to nothing; fixed). It is the only soak bug the scale runs exposed.
+  - `cargo xtask check` and `cargo xtask boot-test` (both IOMMU configurations) pass; the crates stay on the no-panic list (`onbf-format` still references only the allowed symbols with the SemVer check added).
+- **Licensing:** project licence not chosen yet.
+
 ## `runtime/onbf/verify/` (`onbf-verify`), signature-entry verification
+
+Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" under `onbf-format`.
 
 - **What:** `verify_entry(entry, key, content_digest, profile)`, in order: the key ID is SHA-256 of the key's canonical encoding (the OCBOR-1 `keys` map, S4); the ML-DSA key length fits the suite; the statement's digest and profile match the image; Ed25519 (strict) over the exact statement bytes; ML-DSA-65 or -87 (strict) over the same bytes with the role's context string. Trust decisions (which keys, certificate chains) are left to the trust store (B7).
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code. `no_std`, no allocation, `forbid(unsafe_code)`, no-panic lints; depends only on `onbf-format` and `origin-crypto`.
@@ -1616,6 +1653,8 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Licensing:** project licence not chosen yet.
 
 ## `runtime/onbf/merkle/` (`onbf-merkle`), Merkle-SHA256-4K
+
+Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" under `onbf-format`.
 
 - **What:** the ONBF §4.6 trees, with the owner's G2 and G3 decisions and readings R1–R3 (`docs/spec/ONBF-errata.md`):
   - `Shape`: leaves, levels and MERKLE-section positions, highest level first;
