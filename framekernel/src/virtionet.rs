@@ -1402,6 +1402,16 @@ extern "sysv64" fn net_thread(_: u64) -> ! {
     crate::sched::exit()
 }
 
+/// Polls the status register for 0 after a reset, with a bound: a device may take a moment, and
+/// one that never finishes must not hang the boot.
+fn reset_completed(common: u64) -> bool {
+    const POLLS: u32 = 1 << 20;
+    (0..POLLS).any(|_| {
+        core::hint::spin_loop();
+        r8(common + reg::DEVICE_STATUS) == 0
+    })
+}
+
 /// Brings up the virtio-net device, hands its queues to a receive thread on another
 /// processor (the boot one when there is no other), and reports the result (CLAUDE.md §54).
 pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u64) {
@@ -1464,8 +1474,16 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
         return;
     };
 
-    // Status handshake: reset, acknowledge, driver.
+    // Status handshake: reset, acknowledge, driver. A device that does not read back 0 has not
+    // finished resetting (virtio 1.1 §2.1.2) and cannot be called idle below.
     w8(common + reg::DEVICE_STATUS, 0);
+    if !reset_completed(common) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: virtio-net: the device did not finish its reset: virtio-net failed"
+        );
+        return;
+    }
     let mut st = status::ACKNOWLEDGE;
     w8(common + reg::DEVICE_STATUS, st);
     st |= status::DRIVER;
@@ -1494,6 +1512,14 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
     st |= status::FEATURES_OK;
     w8(common + reg::DEVICE_STATUS, st);
     let features_ok = r8(common + reg::DEVICE_STATUS) & status::FEATURES_OK != 0;
+    if !features_ok {
+        // A device that refuses the features is unusable (virtio 1.1 §3.1.1): no bus mastering.
+        let _ = writeln!(
+            com1,
+            "origin-kernel: virtio-net: the device refused the negotiated features: virtio-net failed"
+        );
+        return;
+    }
 
     // Behind the IOMMU (ACCESS_PLATFORM accepted), the device gets a domain of its own
     // before its first DMA page; otherwise it uses physical addresses (virtio 1.1 §6).
@@ -1593,6 +1619,11 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
             }
             crate::sched::yield_until(|| RX_DONE.load(Ordering::Acquire) != 0, tsc_hz, 10);
         }
+    }
+    if !spawned {
+        // Nothing drives the device: reset it and take bus mastering away again (I12).
+        w8(common + reg::DEVICE_STATUS, 0);
+        let _ = crate::pcie::clear_bus_master(at);
     }
     let finished = RX_DONE.load(Ordering::Acquire) != 0;
     let gateway = RX_GATEWAY.load(Ordering::Relaxed);

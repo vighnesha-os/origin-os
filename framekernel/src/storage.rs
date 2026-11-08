@@ -433,6 +433,8 @@ pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
     let (polled, on_test_disk) = match bind(com1, &dev, cpus.len()) {
         Ok((nvme, ok, namespace, test_disk)) => {
             let Some(page) = DmaPage::new(nvme.dma) else {
+                // Nothing will drive the controller: it must not keep bus mastering (I12).
+                let _ = crate::pcie::clear_bus_master(dev.function.at);
                 return false;
             };
             crate::cpu::without_interrupts(|| {
@@ -448,6 +450,8 @@ pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
             (ok, test_disk)
         }
         Err(why) => {
+            // Failed after bus mastering went on, or before: either way nobody drives it (I12).
+            let _ = crate::pcie::clear_bus_master(dev.function.at);
             let _ = writeln!(com1, "origin-kernel: NVMe: {why}: NVMe failed");
             return false;
         }
