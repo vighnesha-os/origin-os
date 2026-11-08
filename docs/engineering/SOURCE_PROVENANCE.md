@@ -951,7 +951,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Boot proof:** the good path is unchanged at `-smp` 1/2/4 (all five network lines `consistent true`, no timeout notes). The behaviour on a lost reply is shown by the controls.
 - **Negative controls:** (A) echo requests sent with a corrupted ICMP checksum, which slirp drops — the run now fails fast and says why: `virtio-net ping: … 0 of 4 echo replies …; timed out after 2000 ms waiting for the reply to echo request 1; consistent false`, while the receive and transmit lines before it stay `consistent true`, and the datapath went on to fetch the whole file (20 frames sent, 13 receive interrupts: ARP, DHCP and the ten TFTP blocks); the failing boot took 16 s in all instead of stalling on the 10 s bound. (B) The receive interrupt counted but **waking nobody** — each receive now ends only at its 2 s deadline, so the thread crawls (`slept 5, woken by the NIC's interrupt 0 (of 12 MSI-X interrupts …)`) and cannot finish inside the boot flow's bound: `consistent false`. This replaces the earlier permanent sleep as that control's outcome: the receive still depends on the interrupt to make timely progress, and the count of interrupt wake-ups (0 here) is part of the proof.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. On the kernel's `wait::WaitQueue::wait_until_deadline` and `sched::block_until`.
-- **Not done:** retransmitting for the other steps (a DHCP DISCOVER, an echo request — TFTP retransmits, see the next entry); backoff; per-step timeouts other than one constant. **QEMU-only (§74).**
+- **Not done:** retransmitting an echo request (DHCP and TFTP retransmit, see the next entries); backoff; per-step timeouts other than one constant. **QEMU-only (§74).**
 - **Licensing:** project licence not chosen yet.
 
 ### TFTP retransmission, with a loss injected on every boot (kernel; CLAUDE.md §54; 2026-11-08)
@@ -962,6 +962,16 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Negative control:** a single attempt (no retransmission) with the same injected loss fails `cargo xtask boot-test` (exit 1): `0 bytes in 0 blocks, incomplete; 0 retransmitted …; timed out after 1 attempts of 500 ms waiting for TFTP block 1; consistent false` — the retransmission is what recovers the file. Restored, it passes.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. From RFC 1350 §2 (timeouts and retransmission) and RFC 768 (the UDP checksum the server verifies).
 - **Not done:** an adaptive timeout (RFC 1123 §4.2.3.2) and backoff. The "Sorcerer's Apprentice" problem (RFC 1123 §4.2.3.1) is a sender's: a sender must not retransmit DATA on a duplicate ACK. This reader acknowledges each duplicate block once, as RFC 1350 expects, and retransmits only on a timeout, but its behaviour against a server prone to that problem is not tested. **QEMU-only (§74).**
+- **Licensing:** project licence not chosen yet.
+
+### DHCP retransmission, with a lost DISCOVER injected on every boot (kernel; CLAUDE.md §54; 2026-11-08)
+
+- **What:** the DHCP exchange no longer gives up at its first timeout. It waits for each reply in attempts of `DHCP_ATTEMPT_NS` = 500 ms; on a timeout it retransmits the message it sent last (the DISCOVER, then the REQUEST) and gives up only after `DHCP_ATTEMPTS` = 4 attempts in a row (the 2 s budget of any other reply; its timeout note names the attempts). A reply that moves the exchange on resets the count. RFC 2131 §4.1 asks for randomized exponential backoff starting near 4 s; a fixed short attempt suits a boot-time proof on an emulated link and is recorded as a deviation.
+- **A loss on every boot:** as for TFTP, the boot drops the first DISCOVER on purpose — it goes out with a deliberately corrupted UDP checksum (`transmit_dhcp(…, damage)`, `DHCP_INJECT_LOST_DISCOVER`), which slirp's DHCP server discards — so the retransmit path runs every boot (half a second).
+- **Boot proof** (every boot, `-smp` 1/2/4): the receive line now reads `… DHCP lease 10.0.2.15 (1 retransmitted after a 500 ms timeout, the first DISCOVER dropped on purpose); … consistent true`, and requires exactly the injected loss to have been retransmitted.
+- **Negative control:** a single attempt with the same injected loss fails `cargo xtask boot-test` (exit 1): `DHCP lease 0.0.0.0 (0 retransmitted …); … timed out after 1 attempts of 500 ms waiting for a DHCP reply; consistent false` — without the retransmission there is no lease. Restored, it passes.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. From RFC 2131 §4.1 (retransmission) and RFC 768.
+- **Not done:** the backoff and the `secs` field RFC 2131 describes; renewal (T1/T2). **QEMU-only (§74).**
 - **Licensing:** project licence not chosen yet.
 
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives

@@ -591,13 +591,17 @@ fn build_frame(
 }
 
 /// Transmits a DHCP message (broadcast) by wrapping it in UDP (68 → 67), IPv4 and Ethernet.
-fn transmit_dhcp(our_mac: Mac, dhcp: &[u8]) -> bool {
+fn transmit_dhcp(our_mac: Mac, dhcp: &[u8], damage: bool) -> bool {
     let any = Ipv4([0, 0, 0, 0]);
     let bcast = Ipv4([255, 255, 255, 255]);
     let mut udp = [0u8; 640];
     let Some(un) = net::Udp::write(any, bcast, 68, 67, dhcp, &mut udp) else {
         return false;
     };
+    if damage {
+        // A deliberately corrupted UDP checksum: the server must discard the datagram.
+        udp[7] ^= 0xFF;
+    }
     let mut ip = [0u8; 680];
     let Some(ipn) =
         net::Ipv4Packet::write(any, bcast, net::protocol::UDP, 64, 0, &udp[..un], &mut ip)
@@ -830,6 +834,19 @@ mod waiting {
     pub(super) const TFTP: u64 = 4;
 }
 
+/// How long the DHCP exchange waits for each reply before retransmitting its last message,
+/// and how many attempts it makes before giving up: together the 2 s budget of any other
+/// reply. (RFC 2131 §4.1 asks for randomized exponential backoff from 4 s; a fixed short
+/// attempt suits a boot-time proof on an emulated link.)
+const DHCP_ATTEMPT_NS: u64 = 500_000_000;
+const DHCP_ATTEMPTS: u32 = 4;
+/// The boot proof drops the first DISCOVER on purpose — it goes out with a corrupted UDP
+/// checksum, which the server discards — so the exchange's retransmit path runs on every
+/// boot, and the lease must still be bound.
+const DHCP_INJECT_LOST_DISCOVER: bool = true;
+/// DHCP messages retransmitted after a timeout.
+static DHCP_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
+
 /// The deadline for a reply awaited from now.
 fn reply_deadline() -> u64 {
     crate::time::monotonic_nanos().saturating_add(REPLY_TIMEOUT_NS)
@@ -854,7 +871,12 @@ fn timeout_note(step: u64) -> alloc::string::String {
     let detail = t & 0xFFFF_FFFF;
     let what = match step {
         waiting::ARP => alloc::string::String::from("the gateway's ARP reply"),
-        waiting::DHCP => alloc::string::String::from("a DHCP reply"),
+        waiting::DHCP => {
+            return alloc::format!(
+                "; timed out after {DHCP_ATTEMPTS} attempts of {} ms waiting for a DHCP reply",
+                DHCP_ATTEMPT_NS / 1_000_000
+            );
+        }
         waiting::ECHO => alloc::format!("the reply to echo request {detail}"),
         _ => {
             return alloc::format!(
@@ -1049,19 +1071,32 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
 /// server, returning the leased address.
 fn dhcp_lease(rx: &mut RxRing, our_mac: Mac) -> Option<Ipv4> {
     let mut client = framekernel::dhcp::Client::new(our_mac.0);
-    transmit_dhcp(our_mac, &client.start(0x4F52_4947));
-    let deadline = reply_deadline();
-    for _ in 0..8 {
+    // The message sent last (the DISCOVER, then the REQUEST): retransmitted when no reply
+    // comes within an attempt.
+    let mut last = client.start(0x4F52_4947);
+    transmit_dhcp(our_mac, &last, DHCP_INJECT_LOST_DISCOVER);
+    let attempt = || crate::time::monotonic_nanos().saturating_add(DHCP_ATTEMPT_NS);
+    let (mut deadline, mut misses) = (attempt(), 0);
+    for _ in 0..8 * DHCP_ATTEMPTS {
         let Some(eth) = rx.recv(deadline) else {
-            timed_out(waiting::DHCP, 0);
-            return None;
+            misses += 1;
+            if misses >= DHCP_ATTEMPTS {
+                timed_out(waiting::DHCP, 0);
+                return None;
+            }
+            DHCP_RETRANSMITS.fetch_add(1, Ordering::Relaxed);
+            transmit_dhcp(our_mac, &last, false);
+            deadline = attempt();
+            continue;
         };
         let Some(message) = dhcp_payload(eth) else {
             continue;
         };
         match client.on_receive(message) {
             framekernel::dhcp::Action::Send(request) => {
-                transmit_dhcp(our_mac, &request);
+                transmit_dhcp(our_mac, &request, false);
+                last = request;
+                (deadline, misses) = (attempt(), 0);
             }
             framekernel::dhcp::Action::Bound(lease) => return Some(lease.address),
             _ => {}
@@ -1268,6 +1303,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     let lease = RX_LEASE.load(Ordering::Relaxed);
     let blocked = RX_BLOCKED.load(Ordering::Relaxed);
     let wakes = NET_WAKES.load(Ordering::Relaxed);
+    let dhcp_retransmits = DHCP_RETRANSMITS.load(Ordering::Relaxed);
     let irqs = NET_IRQS.load(Ordering::Relaxed);
     let on = NET_IRQ_CPU.load(Ordering::Relaxed).saturating_sub(1);
     let last = if irqs == 0 {
@@ -1291,8 +1327,10 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         && blocked > 0
         && wakes > 0
         && irqs > 0
-        && on == u64::from(target);
+        && on == u64::from(target)
+        && dhcp_retransmits == u64::from(DHCP_INJECT_LOST_DISCOVER);
     let g = gateway.to_be_bytes();
+    let dhcp_ms = DHCP_ATTEMPT_NS / 1_000_000;
     let rx_note = alloc::format!(
         "{}{}",
         timeout_note(waiting::ARP),
@@ -1301,7 +1339,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     let ip = (lease as u32).to_be_bytes();
     let _ = writeln!(
         com1,
-        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; DHCP lease {}.{}.{}.{}; receive thread on CPU {target}: slept {blocked}, woken by the NIC's interrupt {wakes} (of {irqs} MSI-X interrupts, {last}){rx_note}; consistent {}{}",
+        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; DHCP lease {}.{}.{}.{} ({dhcp_retransmits} retransmitted after a {dhcp_ms} ms timeout, the first DISCOVER dropped on purpose); receive thread on CPU {target}: slept {blocked}, woken by the NIC's interrupt {wakes} (of {irqs} MSI-X interrupts, {last}){rx_note}; consistent {}{}",
         mac[0],
         mac[1],
         mac[2],
