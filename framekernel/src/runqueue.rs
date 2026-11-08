@@ -53,6 +53,42 @@ pub fn share_near_weight(share: u64, weight: u32, total: u32) -> bool {
     share.abs_diff(ideal) <= ideal / 3 + 15
 }
 
+/// The bound of the wake-up ping-pong boot proof (`wait::prove`): the round trip between
+/// two processors, each woken by the other, in microseconds. Woken only by the other's
+/// timer tick (10 ms), a round trip would take milliseconds.
+pub const ROUND_TRIP_LIMIT_MICROS: u64 = 2000;
+
+/// A ping-pong run over the bound is measured again if the boot flow went without a turn
+/// for at least this much of it, in parts per thousand: on a loaded host, a virtual CPU
+/// descheduled. A tenth, as for the weighted-share proof. The boot flow shares its processor
+/// with a thread under test, which can produce the same reading just by running, so this can
+/// earn a repeat and nothing more.
+pub const DISTURBED_PER_MILLE: u64 = 100;
+
+/// What one run of the ping-pong boot proof calls for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundTrips {
+    /// The mean round trip is under the bound.
+    Pass,
+    /// Over the bound, on a run that shows a disturbance: it says nothing, measure again.
+    Repeat,
+    /// Over the bound, on a run that shows none.
+    Fail,
+}
+
+/// Judges a ping-pong run by its mean round trip (microseconds). A disturbance
+/// (`away_per_mille`, see [`DISTURBED_PER_MILLE`]) can earn a run over the bound a repeat;
+/// it can never pass one.
+pub const fn judge_round_trips(mean_micros: u64, away_per_mille: u64) -> RoundTrips {
+    if mean_micros < ROUND_TRIP_LIMIT_MICROS {
+        RoundTrips::Pass
+    } else if away_per_mille >= DISTURBED_PER_MILLE {
+        RoundTrips::Repeat
+    } else {
+        RoundTrips::Fail
+    }
+}
+
 /// Why a request was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueError {
@@ -623,6 +659,40 @@ mod tests {
             assert!(!share_near_weight(low - 1, weight, 21), "{weight}: below");
             assert!(!share_near_weight(high + 1, weight, 21), "{weight}: above");
         }
+    }
+
+    #[test]
+    fn a_disturbance_earns_a_repeat_and_never_a_pass() {
+        assert_eq!(ROUND_TRIP_LIMIT_MICROS, 2000);
+        // Under the bound passes, disturbed or not.
+        assert_eq!(judge_round_trips(1999, 0), RoundTrips::Pass);
+        assert_eq!(judge_round_trips(1999, 1000), RoundTrips::Pass);
+        // At or over it, a run that shows no disturbance fails at once...
+        assert_eq!(judge_round_trips(2000, 0), RoundTrips::Fail);
+        assert_eq!(
+            judge_round_trips(2000, DISTURBED_PER_MILLE - 1),
+            RoundTrips::Fail
+        );
+        assert_eq!(judge_round_trips(50_000, 0), RoundTrips::Fail);
+        // ... and one that shows a disturbance is measured again, however disturbed.
+        assert_eq!(
+            judge_round_trips(2000, DISTURBED_PER_MILLE),
+            RoundTrips::Repeat
+        );
+        assert_eq!(judge_round_trips(50_000, 1000), RoundTrips::Repeat);
+        // Over any mix of inputs, only a mean under the bound passes.
+        for mean in [0, 1, 1999, 2000, 2001, 1_000_000, u64::MAX] {
+            for away in [0, 99, 100, 101, 1000, u64::MAX] {
+                assert_eq!(
+                    judge_round_trips(mean, away) == RoundTrips::Pass,
+                    mean < 2000
+                );
+            }
+        }
+        // The tenth of a run away that earns a repeat.
+        assert_eq!(DISTURBED_PER_MILLE, 100);
+        assert_eq!(per_mille(99, 1000), 99);
+        assert_eq!(per_mille(100, 1000), DISTURBED_PER_MILLE);
     }
 
     #[test]

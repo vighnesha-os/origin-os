@@ -648,12 +648,32 @@ extern "sysv64" fn quitter(_: u64) -> ! {
 /// time (and every sleeper) would stand still. Each round therefore also opens an interrupt
 /// window.
 pub(crate) fn yield_until(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) {
+    let _ = yield_until_away(done, tsc_hz, seconds);
+}
+
+/// As [`yield_until`], and returns how long the boot flow went without a turn while it
+/// waited, in TSC ticks: the sum of the steps of this loop of at least
+/// [`RUNNING_STEP_MICROS`]. A step that long means the virtual CPU was descheduled (a loaded
+/// host) or that another thread on this processor ran for that long, and this loop cannot
+/// tell which. So the result is only a hint: it may earn a repeat of a measurement, never
+/// a more lenient verdict.
+pub(crate) fn yield_until_away(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) -> u64 {
+    let limit = (tsc_hz / 1_000_000).max(1) * RUNNING_STEP_MICROS;
     let start = rdtsc();
+    let mut last = start;
+    let mut away = 0;
     while !done() && rdtsc().wrapping_sub(start) < tsc_hz.saturating_mul(seconds) {
         yield_now();
         cpu::interrupt_window();
         reap();
+        let now = rdtsc();
+        let step = now.wrapping_sub(last);
+        last = now;
+        if step >= limit {
+            away += step;
+        }
     }
+    away
 }
 
 /// SIMD workers for [`prove_simd`].

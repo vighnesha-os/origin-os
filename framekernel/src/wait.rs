@@ -20,6 +20,7 @@
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use framekernel::runqueue::{RoundTrips, judge_round_trips, per_mille};
 use origin_sync::SpinLock;
 
 use crate::console::Console;
@@ -226,6 +227,11 @@ static TURN: AtomicU64 = AtomicU64::new(0);
 static PING: WaitQueue = WaitQueue::new();
 static PONG: WaitQueue = WaitQueue::new();
 static PING_CYCLES: AtomicU64 = AtomicU64::new(0);
+/// Runs of the ping-pong [`prove_ping_pong`] may make: an extra one only after a run over
+/// the bound that shows a disturbance (`judge_round_trips`). A generous budget costs
+/// nothing where it is not used: an undisturbed boot pays for one run, and every run has
+/// the same bound to meet.
+const PING_ATTEMPTS: u32 = 8;
 
 extern "sysv64" fn pinger(_: u64) -> ! {
     let start = rdtsc();
@@ -340,13 +346,103 @@ fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> bool {
     ok
 }
 
+/// One run of the ping-pong, as the boot flow measured it.
+struct PingPongRun {
+    /// Whether both threads finished within 5 s.
+    done: bool,
+    /// The mean round trip, in microseconds.
+    mean: u64,
+    /// How much of the run the boot flow went without a turn, in parts per thousand.
+    away: u64,
+}
+
+/// Starts the two threads of the ping-pong on `bsp` and `far`, waits at most 5 s for them
+/// and returns what the run measured, or `None` if a thread could not be spawned.
+fn run_ping_pong(bsp: CpuIndex, far: CpuIndex, tsc_hz: u64) -> Option<PingPongRun> {
+    TURN.store(0, Ordering::Release);
+    let before = FINISHED.load(Ordering::Acquire);
+    sched::spawn(bsp, pinger, 0).ok()?;
+    sched::spawn(far, ponger, 0).ok()?;
+    let finished = || FINISHED.load(Ordering::Acquire) == before + 2;
+    let start = rdtsc();
+    let away = sched::yield_until_away(finished, tsc_hz, 5);
+    let elapsed = rdtsc().wrapping_sub(start);
+    Some(PingPongRun {
+        done: finished(),
+        mean: PING_CYCLES.load(Ordering::Relaxed) / ROUNDS / (tsc_hz / 1_000_000).max(1),
+        away: per_mille(away, elapsed),
+    })
+}
+
+/// Proves a thread blocked on another processor is woken at once by its IPI, not at that
+/// processor's next timer tick: two threads pass a turn back and forth [`ROUNDS`] times,
+/// each waking the other, and a round trip must average under
+/// [`framekernel::runqueue::ROUND_TRIP_LIMIT_MICROS`] (woken only by the other's timer
+/// tick, it would take milliseconds).
+///
+/// On a loaded host a virtual CPU is descheduled for milliseconds, and a stall that falls
+/// into a round trip lengthens it by as much, so the mean of a run can be the host's tail
+/// and not the kernel. Such a run says nothing either way, and is measured again, at most
+/// [`PING_ATTEMPTS`] runs in all, each against the same bound. What earns the repeat is the
+/// boot flow going without a turn for at least a tenth of the run. A thread on its
+/// processor can produce that reading just by running, so it can earn a repeat and never a
+/// pass: every run that passes has its mean under the bound. A run over the bound without
+/// that reading fails at once, and so does any run on one processor, where the boot flow
+/// takes turns with the two threads and the reading says nothing about the host.
+fn prove_ping_pong(com1: &mut Console, bsp: CpuIndex, far: CpuIndex, tsc_hz: u64) -> bool {
+    let mut attempts = 0;
+    let (run, ok) = loop {
+        attempts += 1;
+        let Some(run) = run_ping_pong(bsp, far, tsc_hz) else {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: wait queues: cannot spawn: wait queues failed"
+            );
+            return false;
+        };
+        let away = if far == bsp { 0 } else { run.away };
+        let verdict = if run.done {
+            judge_round_trips(run.mean, away)
+        } else {
+            RoundTrips::Fail
+        };
+        if verdict != RoundTrips::Repeat || attempts == PING_ATTEMPTS {
+            break (run, verdict == RoundTrips::Pass);
+        }
+    };
+    let (mean, away) = (run.mean, run.away);
+    let failed = if ok { "" } else { ": wait queues failed" };
+    if run.done && far == bsp {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips, {mean} us each (one processor){failed}"
+        );
+    } else if run.done {
+        let retried = if attempts > 1 {
+            " (after a stalled run)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            com1,
+            "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips, {mean} us each, woken by IPI (boot flow away for {away} per mille of the run, run {attempts} of {PING_ATTEMPTS}){retried}{failed}"
+        );
+    } else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips did not finish within 5 s: wait queues failed"
+        );
+    }
+    ok
+}
+
 /// Proves the wait queues:
 /// - a producer on one processor sends [`ITEMS`] numbers through an 8-slot ring to a
 ///   consumer on another, each blocking when the ring is full or empty: every item must
 ///   arrive, in order, within 5 s;
 /// - two threads on different processors pass a turn back and forth [`ROUNDS`] times,
-///   each waking the other: a round trip must average under 2 ms. Woken only by the
-///   other's timer tick (10 ms), a round trip would take milliseconds.
+///   each waking the other ([`prove_ping_pong`]);
+/// - timed waits time out when nobody signals them and return early when somebody does.
 ///
 /// Runs from the boot flow with every scheduler active.
 pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
@@ -382,35 +478,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
             ": wait queues failed"
         }
     );
-    let spawned = [sched::spawn(bsp, pinger, 0), sched::spawn(far, ponger, 0)];
-    if spawned.iter().any(Result::is_err) {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: wait queues: cannot spawn: wait queues failed"
-        );
-        return false;
-    }
-    sched::yield_until(|| FINISHED.load(Ordering::Acquire) == 4, tsc_hz, 5);
-    let done = FINISHED.load(Ordering::Acquire) == 4;
-    let each = PING_CYCLES.load(Ordering::Relaxed) / ROUNDS / (tsc_hz / 1_000_000).max(1);
-    let ping_ok = done && each < 2000;
-    let where_ = if far == bsp {
-        " (one processor)"
-    } else {
-        ", woken by IPI"
-    };
-    if done {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips, {each} us each{where_}{}",
-            if ping_ok { "" } else { ": wait queues failed" }
-        );
-    } else {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips did not finish within 5 s: wait queues failed"
-        );
-    }
+    let ping_ok = prove_ping_pong(com1, bsp, far, tsc_hz);
     let timed_ok = prove_timed(com1, far, tsc_hz);
     transfer_ok && ping_ok && timed_ok
 }

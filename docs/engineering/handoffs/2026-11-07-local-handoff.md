@@ -1220,7 +1220,8 @@ The task assumed a stall distorting a slice. Measuring first showed something br
 #### Next
 
 - Merge this branch after the clock-proof branch (`claude/musing-hamilton-587f7b`).
-- The two-worker fairness check in `sched::prove` still counts iterations (worst ratio 1.52 in 30 samples at full load, bound 2); `wait::prove`'s ping-pong bound and `prove_timers`' 2 ms bound fail at double load.
+- The two-worker fairness check in `sched::prove` still counts iterations (worst ratio 1.52 in 30 samples at full load, bound 2).
+- ~~`wait::prove`'s ping-pong bound and `prove_timers`' 2 ms bound fail at double load.~~ Done; see "~19:07–23:50 IST" below.
 
 ### Continued (2026-11-08, ~19:30–19:50 IST): the clock and scheduler proof fixes merged
 
@@ -1309,3 +1310,22 @@ Before this, the kernel's only console was a 16550 at the fixed port `0x3F8`, wh
 #### Open for the owner
 
 - Whether and when to merge this branch.
+
+### Continued (2026-11-08, ~19:07–23:50 IST): the wake-up ping-pong and the timer queue under host load (task WAIT-TIMERS-LOAD)
+
+On `claude/priceless-einstein-d6f3b9`, from `118834b` (the weighted-share proof above), **committed locally, not merged, not pushed**: `05deb69` and the correction on top of it. It touches `framekernel/src/main.rs` (`prove_timers`), `runqueue.rs`, `sched.rs`, `timers.rs` and `wait.rs`, and merges after the weighted-share branch.
+
+Measuring first showed neither proof was timing the kernel. In 36,000 firings at up to four `yes` per core no timer was decisively late: the proof was timing the poller. And at double load the slowest tenth of the ping-pong's round trips carries 60 % of the time: a run's mean ranges from 145 to 1713 µs while its median stays under 640 µs.
+
+- **The fix, timers:** every firing's lateness is an interval from the polls around it (`timers::Firing`, `Verdict`, `judge`), and a run decides only if every firing's whole interval is inside or outside 2 ms. A timer held past the limit at a poll that did not fire it, or a wrong order, fails at once; an undecided run is repeated, up to 64 runs of about 15 ms.
+- **The fix, ping-pong:** only a mean under the old 2000 µs bound passes a run (`runqueue::judge_round_trips`). A run over it is measured again if the boot flow went without a turn for at least a tenth of the run (`sched::yield_until_away`, steps of at least 3 ms), at most 8 runs; otherwise it fails at once, and any run on one processor fails at once. The boot line gains the reading and the run number.
+- **The rule was corrected after review.** `05deb69` let that reading swap the mean for the median and the reschedule-IPI share; two reviewing sessions showed a kernel that delays itself passing (the pinger spinning 10 ms on every fourth round trip, no host load: 2555 and 2554 µs, passed, where `118834b` failed). A version on lost ticks on both processors was then built and rejected: a kernel holding interrupts off on both processors passed it (`pp-self-delay-masked-both`: 2553 µs). The reading can now only earn a repeat, the method of the clock and weighted-share proofs.
+- **Measured** (`docs/engineering/SOURCE_PROVENANCE.md`, "The wait-queue ping-pong and the timer queue under host load"): per run, the old six-run timer budget ran out for 0.14 % of the starting points at 1× and 4.4 % at 2× (3600 runs each), and no budget of 24 or more ever ran out. Boot level, alternating with `118834b`: at 2× (15 pairs) no boot of either kernel failed the ping-pong and the old kernel failed the timer proof once where the final rule did not; at 1× (10 pairs) neither failed either proof. **At 4× (20 pairs) the host's ordinary round trip was over the bound: the final rule passed 2 of the 6 boots that reached the ping-pong (at runs 5 and 8) and failed 4 after all 8 runs; the old kernel failed all 5 it reached.** The host was about 2.5 times slower per round trip in that batch than earlier the same day, for the same kernel.
+- **Controls** (all on the final tree): for the timers, a timer 3 ms late with the poller running, a cancelled timer firing and a queue that never fires all fail the boot; a 9 ms stall across a deadline is repeated and passes, and fails with the repeat disabled. For the ping-pong, the pinger or the ponger spinning 10 ms on every fourth round trip, a hold with interrupts off on either side or both, no IPIs, every second or fourth IPI lost, a 3 ms slow wake path (2.5 ms at 2×) and, on one processor, every fourth round trip 10 ms slow all fail the boot; a 2.5 s stall of one or both processors in the first run is repeated and passes, and fails with the repeat disabled.
+- **Gates:** `cargo xtask check` passes (710 tests, 0 failures, 6 ignored, eight tests more than `118834b`); `cargo xtask boot-matrix` passes (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs, then `boot-x2apic` on leaves 1Fh and 0Bh). In that matrix every ping-pong passed at its first run, with means of 41 to 55 µs on two or more processors (boot flow away for 0 per mille) and 4 and 5 µs on one, and every `prove_timers` line read `worst lateness 0 us`.
+- **Note for whoever edits a boot proof:** evidence of a disturbance should only ever earn a repeat against the same bound, because a kernel under test can produce most evidence itself: a thread on the same processor can look like a descheduled vCPU, and a thread holding interrupts off can lose ticks. And `xtask`'s serial cleaner is quadratic in the log's size: a probe that prints thousands of lines makes a boot take minutes.
+
+#### Next
+
+- Merge this branch after the weighted-share branch (`claude/elegant-thompson-48edc8`).
+- Still load-sensitive and not touched: at 1× and 2× the RTC proof (`too uncertain to confirm within 1 %`), the timed wait (`prove_timed`, 81 ms against a bound of 80), and the iteration-counted two-worker fairness check in `sched::prove`; at 4× the APIC timer proof and the cross-CPU TSC check, and the ping-pong itself (the host's ordinary round trip was over its bound in that batch).
