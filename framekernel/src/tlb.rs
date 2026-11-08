@@ -55,14 +55,16 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 static SERVED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// TSC cycles the last completed shootdown took, for the boot report.
 static LAST_CYCLES: AtomicU64 = AtomicU64::new(0);
-/// Processors that turned on global pages.
-static GLOBAL_PAGES: AtomicU64 = AtomicU64::new(0);
+/// Each CPU index whose processor turned on global pages.
+static GLOBAL_PAGES: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
 fn this_cpu() -> usize {
     cpu::this_cpu().get()
 }
 
-/// Turns on global pages on this processor and counts it, for the boot report.
+/// Turns on global pages on this processor and marks its CPU index, for the boot report.
+/// [`prove`] counts only the processors online, so an AP that got this far but never came
+/// online (it was parked, `smp::park`) is not counted.
 ///
 /// # Safety
 ///
@@ -70,8 +72,8 @@ fn this_cpu() -> usize {
 pub(crate) unsafe fn enable_global_pages() -> bool {
     // SAFETY: the caller's contract.
     let on = unsafe { cpu::enable_global_pages() };
-    if on {
-        GLOBAL_PAGES.fetch_add(1, Ordering::Relaxed);
+    if on && let Some(global) = GLOBAL_PAGES.get(this_cpu()) {
+        global.store(true, Ordering::Relaxed);
     }
     on
 }
@@ -252,10 +254,17 @@ extern "sysv64" fn toucher(_: u64) -> ! {
 pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
     let mut ok = true;
     let census = crate::vm::leaf_census();
-    let global = GLOBAL_PAGES.load(Ordering::Relaxed);
+    let global = cpus
+        .iter()
+        .filter(|c| {
+            GLOBAL_PAGES
+                .get(c.get())
+                .is_some_and(|g| g.load(Ordering::Relaxed))
+        })
+        .count();
     let census_ok =
         census.is_some_and(|c| c.upper_local == 0 && c.lower_global == 0 && c.upper_global > 0);
-    ok &= census_ok && global == cpus.len() as u64;
+    ok &= census_ok && global == cpus.len();
     let _ = writeln!(
         com1,
         "origin-kernel: TLB: global pages on {global} of {} processors; kernel's tables: {:?}{}",

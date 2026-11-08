@@ -1167,27 +1167,41 @@ pub(crate) unsafe fn probe_execute(target: u64) -> Probe {
 
 /// IA32_PAT.
 const IA32_PAT: u32 = 0x277;
-/// Processors whose PAT holds the two memory types the page tables use.
-static PAT_READY: AtomicU64 = AtomicU64::new(0);
+/// Each CPU index whose processor's PAT holds the two memory types the page tables use.
+static PAT_READY: [core::sync::atomic::AtomicBool; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_CPUS];
 
 /// Checks that this processor's PAT has entry 0 write-back (06h) and entry 3 uncached
 /// (00h), the memory types `paging::Cache` selects (Intel SDM Vol. 3A §11.12.2,
-/// Table 11-10), and counts it if so. These are the architectural reset values; a firmware
-/// that changed them would make uncached mappings cacheable, so the kernel then refuses to
-/// map device registers rather than reprogramming caches it cannot see. Returns the PAT.
+/// Table 11-10), and marks this processor's CPU index if so. These are the architectural
+/// reset values; a firmware that changed them would make uncached mappings cacheable, so the
+/// kernel then refuses to map device registers rather than reprogramming caches it cannot
+/// see. Returns the PAT.
 pub(crate) fn check_pat() -> u64 {
     // SAFETY: CPL 0; IA32_PAT exists on every x86-64 processor (CPUID 1 EDX bit 16) and
     // reading it has no side effect.
     let pat = unsafe { rdmsr(IA32_PAT) };
-    if pat & 0xFF == 0x06 && (pat >> 24) & 0xFF == 0x00 {
-        PAT_READY.fetch_add(1, Ordering::Relaxed);
+    if pat & 0xFF == 0x06
+        && (pat >> 24) & 0xFF == 0x00
+        && let Some(ready) = PAT_READY.get(this_cpu().get())
+    {
+        ready.store(true, Ordering::Relaxed);
     }
     pat
 }
 
-/// Processors that passed [`check_pat`].
-pub(crate) fn pat_ready() -> u64 {
-    PAT_READY.load(Ordering::Relaxed)
+/// How many of `cpus` passed [`check_pat`]. Only the processors asked about count: an AP
+/// that checked its PAT but never came online (it was parked, `smp::park`) is not counted.
+/// An AP marks its index before its start-up handshake, which orders the mark before the
+/// boot processor sees it online.
+pub(crate) fn pat_ready(cpus: &[CpuIndex]) -> usize {
+    cpus.iter()
+        .filter(|c| {
+            PAT_READY
+                .get(c.get())
+                .is_some_and(|r| r.load(Ordering::Relaxed))
+        })
+        .count()
 }
 
 /// CR4.PGE: global pages (Intel SDM Vol. 3A §4.10.2.4).

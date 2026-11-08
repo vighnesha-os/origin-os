@@ -21,6 +21,7 @@ use origin_boot_info::{MemoryRegion, RegionKind};
 use origin_sync::{RwLock, SpinLock};
 
 use crate::console::Console;
+use crate::cpu::CpuIndex;
 
 /// Segment 0's ECAM window, mapped.
 struct EcamSpace {
@@ -91,13 +92,19 @@ impl fmt::Display for Size {
 
 /// Finds, maps and enumerates segment 0's ECAM window and reports every function. Returns
 /// whether every step and check passed.
-pub(crate) fn init(com1: &mut Console, rsdp: u64, regions: &[MemoryRegion], cpus: usize) -> bool {
+pub(crate) fn init(
+    com1: &mut Console,
+    rsdp: u64,
+    regions: &[MemoryRegion],
+    cpus: &[CpuIndex],
+) -> bool {
     let pat = crate::cpu::check_pat();
-    let ready = crate::cpu::pat_ready();
-    if ready != cpus as u64 {
+    let ready = crate::cpu::pat_ready(cpus);
+    if ready != cpus.len() {
         let _ = writeln!(
             com1,
-            "origin-kernel: PCIe: PAT entry 3 is uncached on only {ready} of {cpus} processors (IA32_PAT {pat:#x}): PCIe failed"
+            "origin-kernel: PCIe: PAT entry 3 is uncached on only {ready} of {} processors (IA32_PAT {pat:#x}): PCIe failed",
+            cpus.len()
         );
         return false;
     }

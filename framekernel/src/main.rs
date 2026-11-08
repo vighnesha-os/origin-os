@@ -267,7 +267,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         // M3, second step: preemptive kernel threads on every online processor.
         sched::prove(&mut com1, online.cpus(), tsc_hz);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
-        if pcie::init(&mut com1, info.acpi_rsdp, regions, online.cpus().len()) {
+        if pcie::init(&mut com1, info.acpi_rsdp, regions, online.cpus()) {
             // DMA and interrupt remapping (Intel VT-d) before any driver binds: translation
             // on with no device attached, so every DMA faults until a driver attaches its
             // device (CLAUDE.md §32, §58; ADR-0007).
