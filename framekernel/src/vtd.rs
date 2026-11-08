@@ -455,7 +455,7 @@ pub enum SourceCheck {
 }
 
 /// An interrupt remapping table entry for a remapped (not posted) interrupt (chapter 9):
-/// fixed delivery, physical destination mode, edge-triggered.
+/// fixed delivery, physical destination mode, edge- or level-triggered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Irte {
     pub vector: u8,
@@ -463,20 +463,28 @@ pub struct Irte {
     /// 8-bit xAPIC ID.
     pub destination: u32,
     pub source: SourceCheck,
+    /// TM: the interrupt is level-triggered. An MSI is edge-triggered; an I/O APIC pin's
+    /// IRTE takes the pin's trigger mode, which its redirection entry repeats (chapter 5).
+    pub level: bool,
     /// FPD: faults for this entry are not recorded.
     pub fault_processing_disable: bool,
 }
 
-/// Bits of an IRTE's low qword: present, FPD, the vector and the destination field.
+/// Bits of an IRTE's low qword: present, FPD, the trigger mode; the vector and the
+/// destination field are placed by [`Irte::encode`].
 const IRTE_PRESENT: u64 = 1;
 const IRTE_FPD: u64 = 1 << 1;
+const IRTE_LEVEL: u64 = 1 << 4;
+/// Low-qword fields `encode` never sets: DM (bit 2, logical), RH (bit 3) and a delivery mode
+/// other than fixed (bits 7:5).
+const IRTE_NOT_FIXED_PHYSICAL: u64 = 0b1110_1100;
 
 impl Irte {
-    /// The 128-bit entry. Low qword: P, FPD, DM 0 (physical), RH 0, TM 0 (edge), DLM 000
-    /// (fixed), IM 0 (remapped), the vector in bits 23:16 and the destination in 63:32 (in
-    /// x2APIC mode the whole ID; in xAPIC mode the 8-bit ID in bits 47:40). High qword: SID,
-    /// SQ and SVT. `x2apic` is the table's EIME. `None` for a vector below 16, an xAPIC
-    /// destination above 255, or a qualifier above 3.
+    /// The 128-bit entry. Low qword: P, FPD, DM 0 (physical), RH 0, TM (1 when `level`),
+    /// DLM 000 (fixed), IM 0 (remapped), the vector in bits 23:16 and the destination in
+    /// 63:32 (in x2APIC mode the whole ID; in xAPIC mode the 8-bit ID in bits 47:40). High
+    /// qword: SID, SQ and SVT. `x2apic` is the table's EIME. `None` for a vector below 16, an
+    /// xAPIC destination above 255, or a qualifier above 3.
     pub fn encode(&self, x2apic: bool) -> Option<[u64; 2]> {
         if self.vector < 16 {
             return None;
@@ -491,7 +499,8 @@ impl Irte {
         } else {
             0
         };
-        let lo = destination | u64::from(self.vector) << 16 | fpd | IRTE_PRESENT;
+        let level = if self.level { IRTE_LEVEL } else { 0 };
+        let lo = destination | u64::from(self.vector) << 16 | level | fpd | IRTE_PRESENT;
         let hi = match self.source {
             SourceCheck::None => 0,
             SourceCheck::RequesterId {
@@ -511,10 +520,10 @@ impl Irte {
     }
 
     /// The entry back, or `None` if it is not present, is posted, or uses a delivery mode,
-    /// trigger mode or destination mode `encode` never writes.
+    /// redirection hint or destination mode `encode` never writes.
     pub fn decode(e: [u64; 2], x2apic: bool) -> Option<Self> {
         let [lo, hi] = e;
-        if lo & IRTE_PRESENT == 0 || lo & 0b1111_1100 != 0 || lo & (1 << 15) != 0 {
+        if lo & IRTE_PRESENT == 0 || lo & IRTE_NOT_FIXED_PHYSICAL != 0 || lo & (1 << 15) != 0 {
             return None;
         }
         let destination = if x2apic {
@@ -539,6 +548,7 @@ impl Irte {
             vector: (lo >> 16) as u8,
             destination,
             source,
+            level: lo & IRTE_LEVEL != 0,
             fault_processing_disable: lo & IRTE_FPD != 0,
         })
     }
@@ -1146,6 +1156,7 @@ mod tests {
                 source_id: 0x0010,
                 qualifier: 0,
             },
+            level: false,
             fault_processing_disable: false,
         };
         let e = nvme.encode(true).unwrap();
@@ -1198,8 +1209,66 @@ mod tests {
         );
         assert_eq!(Irte::decode([0, 0], true), None, "not present");
         assert_eq!(Irte::decode([1 | 1 << 15, 0], true), None, "posted");
-        assert_eq!(Irte::decode([1 | 1 << 4, 0], true), None, "level-triggered");
         assert_eq!(Irte::decode([1, 3 << 18], true), None, "SVT 3");
+        assert_eq!(
+            Irte::decode([1 | 1 << 2, 0], true),
+            None,
+            "logical destination"
+        );
+        assert_eq!(
+            Irte::decode([1 | 1 << 3, 0], true),
+            None,
+            "redirection hint"
+        );
+        for mode in 1..8u64 {
+            assert_eq!(
+                Irte::decode([1 | mode << 5, 0], true),
+                None,
+                "delivery {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn io_apic_pin_entries_carry_the_pin_trigger_mode() {
+        // QEMU's q35 PIT pin (edge) to vector 0x41 on CPU 1, checking the I/O APIC's source
+        // ID from the DMAR (bus 0xff, device 0, function 0).
+        let pit = Irte {
+            vector: 0x41,
+            destination: 1,
+            source: SourceCheck::RequesterId {
+                source_id: 0xFF00,
+                qualifier: 0,
+            },
+            level: false,
+            fault_processing_disable: false,
+        };
+        let e = pit.encode(true).unwrap();
+        assert_eq!(e, [1 << 32 | 0x41 << 16 | 1, 1 << 18 | 0xFF00]);
+        assert_eq!(Irte::decode(e, true), Some(pit));
+        // A level-triggered pin (PCI INTx, say): TM is bit 4 of the low qword, and nothing
+        // else changes.
+        let intx = Irte { level: true, ..pit };
+        let l = intx.encode(true).unwrap();
+        assert_eq!(l, [e[0] | 1 << 4, e[1]]);
+        assert_eq!(Irte::decode(l, true), Some(intx));
+        assert_eq!(Irte::decode(l, false).map(|i| i.level), Some(true));
+        // Trigger mode round-trips with every other field.
+        let mut rng = crate::testing::Rng::new(0x1A7E);
+        for _ in 0..crate::testing::cases(10_000) {
+            let r = rng.next();
+            let i = Irte {
+                vector: 16 + (r as u8) % 240,
+                destination: (r >> 8) as u32,
+                source: SourceCheck::RequesterId {
+                    source_id: (r >> 40) as u16,
+                    qualifier: ((r >> 56) & 3) as u8,
+                },
+                level: r & 1 << 60 != 0,
+                fault_processing_disable: r & 1 << 61 != 0,
+            };
+            assert_eq!(Irte::decode(i.encode(true).unwrap(), true), Some(i));
+        }
     }
 
     #[test]

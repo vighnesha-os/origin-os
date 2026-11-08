@@ -20,7 +20,10 @@
 //! reads and writes where the unit can — and waits for it before returning. MSI-X messages
 //! are routed through IRTEs ([`msi_message`]): the device's table entry carries only a
 //! remappable-format handle; the vector, the 32-bit x2APIC destination and the check of the
-//! device's source ID live in the IRTE.
+//! device's source ID live in the IRTE. An I/O APIC pin is routed the same way
+//! ([`route_ioapic_pin`]): its redirection entry, in remappable format, carries the handle,
+//! and the IRTE checks the source ID the DMAR names for that I/O APIC and has the pin's
+//! trigger mode.
 //!
 //! Faults are read from the fault-recording registers ([`take_faults`]); fault events stay
 //! masked (ADR-0007 D9). Every remapping structure is a zeroed kernel page kept for ever, and
@@ -36,7 +39,7 @@ use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 
 use framekernel::bitmap::Bitmap;
-use framekernel::dmar::{self, BridgeBuses, Dmar, Requester};
+use framekernel::dmar::{self, BridgeBuses, Dmar, IoApicScopeError, Requester};
 use framekernel::pci::{self, Address};
 use framekernel::vtd::{
     self, Access, Capability, ContextEntry, Descriptor, Drain, ExtCapability, FaultRecord,
@@ -936,6 +939,7 @@ impl Iommu {
                 source_id: r.source_id(),
                 qualifier: 0,
             },
+            level: false,
             fault_processing_disable: false,
         }
         .encode(x2apic)
@@ -943,6 +947,66 @@ impl Iommu {
         let (ui, index) = self.alloc_irte(r)?;
         self.write_irte(ui, index, Some(entry))?;
         Ok(vtd::remappable_msi(index))
+    }
+
+    /// Routes a pin of the I/O APIC whose ID is `ioapic` through a new IRTE on the unit whose
+    /// DMAR device scope lists that I/O APIC: `vector` to the processor with x2APIC ID
+    /// `apic`, with the pin's trigger mode (`level`), checking the source ID the scope names.
+    fn route_pin(
+        &mut self,
+        ioapic: u8,
+        apic: u32,
+        vector: u8,
+        level: bool,
+    ) -> Result<PinRoute, &'static str> {
+        let (listed, requester) = self.dmar.ioapic(ioapic, &mut Config).map_err(|e| match e {
+            IoApicScopeError::NotListed => "no remapping unit's DMAR scope lists this I/O APIC",
+            IoApicScopeError::ListedTwice => "the DMAR lists this I/O APIC twice",
+            IoApicScopeError::Unresolved => "this I/O APIC's DMAR scope does not resolve",
+        })?;
+        let ui = self
+            .units
+            .iter()
+            .position(|u| u.base == listed.register_base)
+            .ok_or("its remapping unit is not running")?;
+        let irt = self
+            .units
+            .get_mut(ui)
+            .and_then(|u| u.irt.as_mut())
+            .ok_or("its unit does not remap interrupts")?;
+        let source_id = requester.source_id();
+        let entry = Irte {
+            vector,
+            destination: apic,
+            source: SourceCheck::RequesterId {
+                source_id,
+                qualifier: 0,
+            },
+            level,
+            fault_processing_disable: false,
+        };
+        let encoded = entry
+            .encode(irt.x2apic)
+            .ok_or("the destination needs extended interrupt mode, or the vector is reserved")?;
+        let index = irt
+            .used
+            .alloc()
+            .ok_or("the interrupt remapping table is full")? as u16;
+        if let Err(why) = self.write_irte(ui, index, Some(encoded)) {
+            // The entry may be present in memory: free its slot only once it is cleared.
+            if self.write_irte(ui, index, None).is_ok()
+                && let Some(irt) = self.units.get_mut(ui).and_then(|u| u.irt.as_mut())
+            {
+                irt.used.clear(usize::from(index));
+            }
+            return Err(why);
+        }
+        Ok(PinRoute {
+            unit: ui,
+            index,
+            source_id,
+            entry,
+        })
     }
 
     fn irte(&self, r: Requester, index: u16) -> Option<Irte> {
@@ -1043,6 +1107,88 @@ pub(crate) fn release_interrupt(at: Address, index: u16) -> Result<(), &'static 
         s.write_irte(ui, index, None)?;
         if let Some(irt) = s.units.get_mut(ui).and_then(|u| u.irt.as_mut()) {
             irt.used.clear(usize::from(index));
+        }
+        Ok(())
+    })
+}
+
+/// An I/O APIC pin routed through an IRTE ([`route_ioapic_pin`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PinRoute {
+    /// The unit whose table holds the entry.
+    unit: usize,
+    /// The IRTE index: the handle the pin's remappable-format redirection entry carries.
+    pub(crate) index: u16,
+    /// The I/O APIC's source ID, from its DMAR device scope: what the IRTE checks.
+    pub(crate) source_id: u16,
+    /// The entry as written.
+    pub(crate) entry: Irte,
+}
+
+/// Routes a pin of the I/O APIC whose ID (MADT and DMAR enumeration ID) is `ioapic` through
+/// a new IRTE: `vector` to the processor with x2APIC ID `apic` — any 32-bit ID with extended
+/// interrupt mode — with the pin's trigger mode (`level`; the redirection entry must repeat
+/// it), checking the I/O APIC's source ID from the DMAR's device scope, so a message with
+/// any other source ID is blocked (ADR-0007 I8; QEMU cannot show this: its I/O APIC sends
+/// no source ID, so its unit has none to check). The caller then programs the pin's
+/// redirection entry in remappable format with the returned index. Refused when interrupts
+/// are not remapped or the DMAR lists no unit for this I/O APIC.
+pub(crate) fn route_ioapic_pin(
+    ioapic: u8,
+    apic: u32,
+    vector: u8,
+    level: bool,
+) -> Result<PinRoute, &'static str> {
+    crate::cpu::without_interrupts(|| {
+        let mut g = IOMMU.lock();
+        let s = g.as_mut().ok_or("no IOMMU")?;
+        if !s.remapping {
+            return Err("interrupt remapping is off");
+        }
+        s.route_pin(ioapic, apic, vector, level)
+    })
+}
+
+/// The IRTE of `pin` as its unit's table holds it now; `None` if it is not present.
+pub(crate) fn pin_irte(pin: &PinRoute) -> Option<Irte> {
+    crate::cpu::without_interrupts(|| {
+        let g = IOMMU.lock();
+        let irt = g.as_ref()?.units.get(pin.unit)?.irt.as_ref()?;
+        let at = 16 * u64::from(pin.index);
+        Irte::decode([irt.table.read64(at), irt.table.read64(at + 8)], irt.x2apic)
+    })
+}
+
+/// For the proofs: rewrites `pin`'s IRTE as `entry` (`None`: not present) and invalidates
+/// its cache entry, so the next message through it sees the change. `Some(pin.entry)`
+/// restores the route.
+pub(crate) fn rewrite_pin(pin: &PinRoute, entry: Option<Irte>) -> Result<(), &'static str> {
+    crate::cpu::without_interrupts(|| {
+        let mut g = IOMMU.lock();
+        let s = g.as_mut().ok_or("no IOMMU")?;
+        let x2apic = s
+            .units
+            .get(pin.unit)
+            .and_then(|u| u.irt.as_ref())
+            .ok_or("its unit does not remap interrupts")?
+            .x2apic;
+        let encoded = match entry {
+            Some(e) => Some(e.encode(x2apic).ok_or("the entry does not encode")?),
+            None => None,
+        };
+        s.write_irte(pin.unit, pin.index, encoded)
+    })
+}
+
+/// Clears `pin`'s IRTE, invalidates its cache entry and frees it. Mask the pin's
+/// redirection entry first: a message through a cleared IRTE is blocked and recorded.
+pub(crate) fn release_pin(pin: &PinRoute) -> Result<(), &'static str> {
+    crate::cpu::without_interrupts(|| {
+        let mut g = IOMMU.lock();
+        let s = g.as_mut().ok_or("no IOMMU")?;
+        s.write_irte(pin.unit, pin.index, None)?;
+        if let Some(irt) = s.units.get_mut(pin.unit).and_then(|u| u.irt.as_mut()) {
+            irt.used.clear(usize::from(pin.index));
         }
         Ok(())
     })

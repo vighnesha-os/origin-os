@@ -672,3 +672,86 @@ Controls: N2 (`park` without INIT) fails the drill: `its count moved 5189 in 100
 
 - **AP start-up:** per-AP trampoline data together with parallel start-up (ADR-0003 K6); optionally retry a parked AP once after the others; and decide whether loader memory may be reclaimed when the only processors not online are parked (`online.complete` stays false today).
 - **The owner:** ADR-0008's four questions (C7 is the fourth).
+
+### Continued (2026-11-08, ~11:15–12:05 IST): I/O APIC interrupts through VT-d interrupt remapping
+
+The VT-d stretch above left one hole: with interrupt remapping on and compatibility format
+blocked, hardware drops every I/O APIC interrupt whose redirection entry is in compatibility
+format, and the only I/O APIC proof ran before the IOMMU. The IOMMU session started this one in
+its own worktree, **branch `claude/bold-williams-a8e3ff`**. The worktree began at `main`'s
+initial commit and was fast-forwarded to `1c790fe` (the VT-d branch tip) before any work.
+Commits are **local and not pushed**.
+
+| Commit | What |
+|---|---|
+| `cf0dee8` | `ioapic::RemappableEntry` (the remappable-format redirection entry), `Irte.level`, `Dmar::ioapic`; `iommu::route_ioapic_pin` (+ read-back, rewrite, release); `irq::prove_remapped`; a per-CPU count of the I/O APIC vector; xtask markers |
+| (records) | provenance, ADR-0007 I8, the research ledger §2.5, STATUS, TASKS, this section |
+
+What every boot now shows after the IOMMU proofs (at `-smp` 2; at 1 the IRTE is 4 and the target
+CPU 0, at 4 the IRTE is 7 and the target CPU 1):
+
+```
+I/O APIC: remapped: the PIT's IRQ0 (GSI 2, edge-triggered, active-high) through IRTE 5: the redirection entry reads back in remappable format with that index, vector 0x41 and mask clear: true; the IRTE reads back vector 0x41 to CPU 1, edge-triggered like the pin, checking source ID 0xff00 (I/O APIC 0's, from the DMAR): true; the two agree: true; 0 earlier fault(s) cleared
+I/O APIC: remapped: 20 PIT interrupts arrived on CPU 1 through IRTE 5 in 200 ms, 0 on other CPUs; fault recorded: none; consistent true
+I/O APIC: IRTE 5 not present: 0 interrupts arrived in 100 ms; fault recorded: source ID 0xffff, interrupt index 5, reason 0x22 (interrupt table entry not present), from a message without a requester ID (the DMAR names 0xff00); IRTE restored, 5 interrupts arrived on CPU 1 again: true; consistent true
+I/O APIC: IRTE 5 checking source ID 0xff01 instead of 0xff00: 10 interrupts arrived in 100 ms; fault recorded: none; the source-ID check cannot be shown on this platform: … (hardware blocks them, reason 0x26); IRTE restored, 5 interrupts arrived on CPU 1 again: true; consistent true
+I/O APIC: remapped: the entry masked, the PIT stopped and IRTE 5 released: true; 0 fault(s) recorded after
+```
+
+Negative controls, each failing `cargo xtask boot-test` and then restored from git:
+- **N1**, the entry left in compatibility format: the entry read-back fails.
+- **N1b**, the same with the read-backs disabled: QEMU delivers all 20 interrupts to CPU 1 anyway,
+  and the not-present probe catches it (10 arrive with the IRTE cleared, no fault).
+- **N2**, the pin's IRTE never written: the IRTE read-back fails.
+- **N2b**, the same with that read-back disabled: 0 interrupts in 2 s, and the unit records
+  reason 0x22 for index 5 — with source ID 0xffff, not 0xff00 (below).
+- **N3**, the not-present probe leaves the IRTE present: 10 interrupts arrive, no fault.
+- **N4**, the IRTE checks source ID 0xff01: the IRTE read-back against the DMAR fails.
+- **N5**, the IRTE level-triggered for an edge pin: the IRTE read-back and the agreement fail.
+
+One variant **passed**, and is recorded as a QEMU blind spot: **N4b**, the wrong source ID with
+the read-back disabled. All 20 interrupts arrive through an IRTE that checks 0xff01, because
+QEMU's I/O APIC sends no source ID to check. Reason 0x26 needs hardware.
+
+**Checkpoint (~12:05 IST):**
+- `cargo xtask check` passes: 549 tests, 0 failures, 6 ignored (the download-gated vectors);
+  308 framekernel host library tests, 7 of them new.
+- `boot-test` and `boot-matrix` (1/2/4) pass on the committed code; the kernel boots in
+  15.0 s, 16.6 s and 20.6 s.
+- QEMU-only (§74): nothing is qualified on physical hardware.
+
+#### Lessons from this stretch
+
+- **QEMU's I/O APIC sends no requester ID.** It writes its messages with
+  `MEMTXATTRS_UNSPECIFIED` (`hw/intc/ioapic.c`), so QEMU's VT-d model sees source ID 0xffff:
+  it records I/O APIC faults as 0xffff and skips the IRTE's source-ID check for them
+  (`hw/i386/intel_iommu.c`, `vtd_irte_get`). Reason 0x26 and the DMAR's 0xff00 in a fault
+  cannot be shown for I/O APIC interrupts under QEMU. The task as given expected both; this is
+  the third VT-d check that needs hardware, after CFI blocking and the IEC invalidation.
+  Read the device model before promising a control.
+- **A read-back is not a delivery proof; a blocked probe is.** Under QEMU a
+  compatibility-format entry delivers whatever the IRTEs say, and an encoding slip in the
+  remappable format could leave a compatibility-format message that still arrives (on CPU 0 if
+  the index bits land in the destination). Clearing the IRTE and seeing the interrupts stop,
+  then resume when it is restored, is what shows they went through it. Targeting another CPU
+  than the boot processor guards the same way at `-smp` ≥ 2.
+- **xtask stops at the first failure marker,** so a control that breaks an early check never
+  reaches the later ones. To show what a later check catches on its own, disable the earlier
+  check in the same control (N1b, N2b, N4b).
+- **Coordinate per-CPU state with the CPU-index work.** The x2APIC session (branch
+  `claude/eloquent-kapitsa-840594`) replaces `cpu_id()` with a dense `CpuIndex`. The new
+  `IOAPIC_IRQS_ON` count is indexed by x2APIC ID and must follow that change when the branches
+  meet (noted in the shared session notes).
+
+#### Next, for the following session
+
+- **The keyboard:** route IRQ1 through `iommu::route_ioapic_pin` and a remappable entry (or a
+  compatibility-format one when interrupts are not remapped), and make the i8042 driver
+  interrupt-driven: live keystrokes.
+- **A level-triggered pin:** PCI INTx through the I/O APIC (active-low, level), with the EOI
+  path that clears the pin's remote IRR (the entry's vector equals the IRTE's; host-tested).
+- **More I/O APICs and HPET MSIs** (the DMAR's HPET scopes).
+- **Hardware (§74):** the source-ID check on I/O APIC interrupts (reason 0x26, source ID from
+  the DMAR), CFI blocking, and the IEC invalidation.
+- Everything else in the VT-d stretch's list above still stands (AMD-Vi, RMRR identity maps,
+  scalable mode, the CPU-index work, a fault-event interrupt).
