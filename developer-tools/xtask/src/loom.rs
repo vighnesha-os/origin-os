@@ -345,6 +345,7 @@ members = ["framekernel/sync"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.99.1"
+license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.lints.rust]
