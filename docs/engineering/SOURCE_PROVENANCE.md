@@ -1082,9 +1082,82 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - freeing IOVAs and table pages;
   - device-TLBs/ATS;
   - hot-plug.
-  - **No CPU with an APIC ID above 255 exists in the test configuration.** The kernel indexes per-CPU state by APIC ID with `MAX_CPUS` 64, so delivery to one is shown by the IRTE encoding, not by a live interrupt. Decoupling CPU index from APIC ID is a separate task.
+  - **No CPU with an APIC ID above 255 exists in the test configuration.** The kernel indexes per-CPU state by APIC ID with `MAX_CPUS` 64, so delivery to one is shown by the IRTE encoding, not by a live interrupt. Decoupling CPU index from APIC ID is a separate task. *(Done 2026-11-08: see "CPU indexes and processors above x2APIC ID 255" below; `cargo xtask boot-x2apic` delivers NVMe MSI-X to APIC ID 256 live.)*
   - **QEMU-only (§74).**
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the VT-d specification and virtio 1.1 §6.
+- **Licensing:** project licence not chosen yet.
+
+### CPU indexes and processors above x2APIC ID 255 (`cpumap`; `cpu`, `smp`, `sched`, `tlb`, `storage`, `virtionet`; library + kernel; CLAUDE.md §24, §32; ADR-0008 Proposed; 2026-11-08)
+
+- **Why:** per-CPU state was indexed by x2APIC ID in 64-slot arrays, and the MADT and SRAT were read into 64-entry buffers. With interrupt remapping, an MSI could already reach any 32-bit APIC ID (ADR-0007 I8), but no processor above 255 could run. On a QEMU machine whose second package starts at APIC ID 256 (`docs/research/2026-11-08-x2apic-above-255.md` §2), the kernel at `1c790fe` reported `ACPI processor discovery failed: invalid MADT` (150 processor structures) and `numa: invalid SRAT; consistent false: numa failed`.
+- **What:**
+  - **`cpumap` (library, safe, host-tested).** `CpuMap::new(boot, processors)` gives the boot processor index 0, wherever and whether the MADT lists it. Then each enabled processor gets the next index, in table order. An enabled processor listed twice is indexed once. Processors beyond `MAX_CPUS` (64) are counted as unindexed, and the broadcast ID `0xFFFFFFFF` is refused and counted. It also reports processors listed and enabled, whether the boot processor is listed, and the largest ID. Lookups go both ways.
+  - **`cpu`.** `CpuIndex` is a newtype, so an APIC ID cannot index an array by mistake; it shows as `CPU n (APIC ID m)` through `named`. The GS-based CPU-local area holds the index at offset 0: `this_cpu`, which replaces `cpu_id`. A lock-free table of `AtomicU32` holds each index's APIC ID, written once by `assign` (the boot processor in `init`, each AP by `smp` before it starts).
+    - `init_cpu_local` takes the index and gives this processor that index's area only if CPUID's x2APIC ID matches the record. Otherwise GS points at an area whose index names no slot.
+  - **`smp`.** The MADT list is sized from the table (length / 8) on the heap, then mapped with `CpuMap`. Every AP's APIC ID is assigned before the first AP starts, and the AP's start record carries its index. An AP that is not the processor its index names answers with a refusal and halts with interrupts off. "Every enabled processor online" now means every indexed processor online, with none unindexed or refused; it gates reclaiming loader memory.
+  - **`sched`.** The queues, `ACTIVE` and the thread tables are indexed by CPU index. `ThreadRef.cpu` is a `CpuIndex`, and the reschedule IPI goes to its recorded APIC ID. `spawn` takes a `CpuIndex`.
+  - **`tlb`.** `ONLINE` and `SERVED` are indexed by CPU index, and the shootdown IPI goes to the recorded APIC ID. An online target without a record is still waited for, so the wait panics rather than skipping a processor that may hold a stale translation.
+  - **`storage`.**
+    - The per-CPU wait queues, interrupt counts and queue pairs are indexed by CPU index. MSI-X destinations are APIC IDs.
+    - Per CPU, it counts the blocks of threads waiting for a completion, and the interrupts that woke them.
+    - A new **x2APIC proof** for each online processor above 255:
+      - the compatibility format refuses its ID;
+      - its per-CPU MSI-X entry holds only a remappable handle, and the IRTE behind it holds destination = its APIC ID, the vector and the source-ID check (`routed_through_irte`);
+      - its queue's interrupts arrived there;
+      - its threads' blocks equal the wake-ups by interrupts taken there, and are not zero.
+    - With no such processor, it reports that there is nothing to prove.
+  - **`virtionet`.** Its target is a `CpuIndex`, and its MSI-X entries go to that index's APIC ID.
+  - **`main`.** The SRAT lists are sized from the table (length / 16 for CPU affinities, length / 40 for memory). Topology and NUMA get APIC IDs, and everything else gets indexes.
+  - **`wait`, `console`, `time`, `user`.** `CpuIndex` throughout.
+  - **xtask.**
+    - A `Machine`: the `-smp` value, cold-plugged `-device` processors, the expected APIC ID of each CPU index, and the MADT's count and largest ID.
+    - `ORIGIN_QEMU_TOPOLOGY=x2apic` selects the sparse machine: `-smp 1,maxcpus=150,sockets=2,dies=3,modules=5,cores=5,threads=1` and `-device max-x86_64-cpu,socket-id=1,die-id=0,module-id=0,core-id=0,thread-id=0`.
+    - A **`boot-x2apic`** command runs `boot-test` on that machine.
+    - `ORIGIN_QEMU_IOMMU` overrides the IOMMU device, for controls.
+    - Markers name `CPU n (APIC ID m)`. Every AP's start-up line is required in index order, and so is the x2APIC line, or its "nothing to prove" line.
+- **Host tests:** 8 `cpumap` tests:
+  - the boot processor first, then table order;
+  - the boot processor anywhere, or not listed;
+  - QEMU's 150-processor table, where index 1 is APIC ID 256 and 75 IDs need type 9;
+  - capacity: 70 enabled gives 64 indexed and 7 unindexed;
+  - a duplicate is indexed once;
+  - the broadcast ID is refused;
+  - a randomized test over 2000 tables (`ORIGIN_MUTATION_SCALE` scales it) checking every invariant.
+
+  `cargo xtask check`: 550 tests, 0 failures, 6 ignored (542 before).
+- **Boot proof, `cargo xtask boot-x2apic`** (16.9 s for the kernel boot):
+  - `ACPI MADT: 150 processors, 2 enabled (largest APIC ID listed 420); CPU index 0 for the boot processor (APIC ID 0), 1 for the other enabled processor`
+  - `CPU 1 (APIC ID 256) online after 10641 us: own GDT, TSS and IDT, x2APIC`
+  - `SMP: 2 of 2 enabled processors online; trampoline identity pages removed true`
+  - `topology: 2 logical, 2 cores, 2 packages (1 threads/core, 256 logical/package); consistent true`
+  - `numa: 2 nodes, 150 cpus, 3 memory ranges, 511 MiB; consistent true`
+  - `scheduler: CPU 1: workers 2 and 3 counted 1157688 and 1265397, 51 context switches`
+  - `TLB: 1 other processors cached 3 pages; after one single-page shootdown (9000 TSC cycles) and one full flush of two pages (82000 cycles), 3 of their 3 reads faulted and 0 saw a stale translation`
+  - `wait queues: ping-pong between CPU 0 and CPU 1: 1000 round trips, 39 us each, woken by IPI`
+  - `NVMe: MSI-X: 65 vectors, table in BAR0 at offset 0x2000; I/O queue 2 completes to vector 1, sent to CPU 1 (APIC ID 256) as IDT vector 0x40`
+  - `NVMe: interrupt-driven: 64 reads of 8 blocks by a thread on CPU 1 (APIC ID 256), each blocking until its completion interrupt: 64 interrupts (the last on CPU 1 (APIC ID 256)), 512 of 512 blocks match, 81 us per read`
+  - `NVMe: CPU 1 (APIC ID 256): 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, 35 interrupts on CPU 1`
+  - `x2APIC: CPU 1 (APIC ID 256) is above 255, which a compatibility-format MSI address cannot carry (refused true); its NVMe MSI-X entry 3 holds only remappable handle 2, whose IRTE sends vector 0x40 to destination 256 after checking source ID 0x0010: true; 99 NVMe interrupts arrived there, and its threads blocked 98 times for a completion and were woken 98 times by an interrupt taken there; consistent true`
+  - `… receive thread on CPU 1 (APIC ID 256): slept 11, woken by the NIC's interrupt 11 (of 17 MSI-X interrupts, the last on CPU 1 (APIC ID 256)); consistent true`
+  Every other proof passes unchanged on this machine, with CPU 1 at APIC ID 256: the weights on CPU 1, SIMD state, user mode, TSC consistency, the console (both CPUs' lines whole), TLB shootdowns, GPT, the block cache, virtio-net's lease, ping and TFTP, and every IOMMU proof.
+- **`cargo xtask boot-matrix`** (1, 2 and 4 CPUs; APIC IDs equal indexes there) passes with every earlier proof, the new names (`CPU 1 (APIC ID 1)`) and `x2APIC: no online processor has an APIC ID above 255 (the largest is 3)` at 4. Kernel boots: 14.2 s, 16.8 s and 23.3 s at 1, 2 and 4 CPUs (the IOMMU entry above recorded 13.2 s, 15.4 s and 21.8 s; TCG boot times vary by about a second between runs). `cargo xtask boot-test` passes.
+- **Negative controls.** Each is a temporary change. With it applied, `cargo xtask boot-x2apic` exited 1; it was then restored, and `git diff` was empty again:
+  - **X1, the IRTE destination truncated to 8 bits** (`destination: apic & 0xFF` in `iommu::route`): APIC ID 256 becomes 0, so the interrupts land on the boot processor and the thread on CPU 1 sleeps until each 2 s deadline: `NVMe: interrupt-driven: 0 reads of 8 blocks by a thread on CPU 1 (APIC ID 256), each blocking until its completion interrupt: 6 interrupts (the last on CPU 0 (APIC ID 0)), 0 of 512 blocks match, 0 us per read: NVMe failed`.
+  - **X2, interrupt remapping off** (`ORIGIN_QEMU_IOMMU=intel-iommu,intremap=off`; QEMU accepts it under TCG). The AP still comes online, since IPIs need no remapping, but the kernel refuses to program the MSI: `IOMMU: unit 0: … interrupt remapping off …` then `NVMe: MSI-X: APIC IDs above 255 need interrupt remapping: NVMe failed`.
+  - **X3, a wrong APIC ID on record for CPU 1** (`assign(index, apic_id ^ 1)` in `smp`). The AP finds that index 1 is not its own, refuses and halts: `CPU 1 (APIC ID 256): a different processor answered: AP start-up failed`.
+- **QEMU facts worth keeping** (research ledger §2–§3):
+  - under TCG, QEMU 11.1 needs only the x2APIC CPU feature for APIC IDs above 255. It accepts `intremap=off`, `eim=off` or no IOMMU, so the kernel must refuse those itself;
+  - the MADT and SRAT list every possible processor. The MADT uses type 9 from ID 255 up and never sets "online capable"; the SRAT flags them all enabled;
+  - `-cpu max` reports an AMD vendor, so `threads=3` draws a hyperthreading warning;
+  - q35 allows at most 4096 possible processors.
+- **Unsafe inventory:** nothing new. The GS load in `this_cpu` is `cpu_id`'s, unchanged. `init_ap` and `load_tables` gained an index argument, and their SAFETY notes now say no other processor may be that index. The shootdown IPI's SAFETY note names the recorded APIC ID.
+- **Not done:**
+  - more than 64 processors: the per-CPU state is static, so extra ones are reported and left in firmware (ADR-0008 C6);
+  - CPU hot-plug (MADT "online capable");
+  - CPUID leaf 1Fh topology (dies and modules), which §27 needs;
+  - I/O APIC destinations are still 8-bit physical (`ioapic`). They go to the boot processor until I/O APIC entries go through IRTEs;
+  - **QEMU-only (§74).**
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the Intel SDM (x2APIC, MSI address format), ACPI 6.6 §5.2.12 and §5.2.16, and VT-d (IRTE destination with EIME).
 - **Licensing:** project licence not chosen yet.
 
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives

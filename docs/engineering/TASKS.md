@@ -45,6 +45,7 @@
 | PCIe enumeration | MCFG, uncached ECAM, every function and BAR (sized with decoding off, restored) | q35's functions listed; two negative controls |
 | NVMe driver | polled admin and I/O queues, Identify, read, write, flush | pattern blocks from the xtask test disk; two negative controls |
 | GPT | both copies validated (CRCs, layout, agreement), partitions listed | the xtask disk's partitions; negative control |
+| CPU indexes, APIC IDs above 255 (2026-11-08, branch `claude/eloquent-kapitsa-840594`) | dense `CpuIndex` per processor at MADT discovery (ADR-0008, Proposed); per-CPU arrays by index, IPIs and MSI/IRTE destinations by APIC ID; MADT and SRAT lists sized from the table | `cpumap` host tests; `cargo xtask boot-x2apic` (APIC ID 256 of 150 possible); three negative controls |
 
 ## In progress
 
@@ -55,9 +56,9 @@
 ## Next, in order
 
 1. **NVMe interrupts:** the PCI capability list, MSI-X, a vector per queue, and completions that wake a wait queue instead of polling; timed waits (deadlines on the monotonic clock).
-2. **IOMMU (§32):** VT-d under QEMU's `intel-iommu` — **done 2026-11-08** (ADR-0007, Proposed): the DMAR table, DMA remapping for NVMe and virtio-net with blocked-DMA and fault proofs, and interrupt remapping (see STATUS and `SOURCE_PROVENANCE.md`). Remaining: AMD-Vi, RMRR identity maps, I/O APIC entries in remappable format, scalable mode.
+2. **IOMMU (§32):** VT-d under QEMU's `intel-iommu` — **done 2026-11-08** (ADR-0007, Proposed): the DMAR table, DMA remapping for NVMe and virtio-net with blocked-DMA and fault proofs, and interrupt remapping (see STATUS and `SOURCE_PROVENANCE.md`). Delivery to an APIC ID above 255 is proven live since the CPU-index work (ADR-0008, `boot-x2apic`). Remaining: AMD-Vi, RMRR identity maps, I/O APIC entries in remappable format, scalable mode.
 3. **Parser hardening (§72):** deterministic mutation runs over every firmware and device parser (ACPI, PCI, NVMe Identify, GPT, RTC), with a seeded generator and no fuzzing crates.
-4. **M3, scheduling proper** (ADR-0003 K7 is the baseline): priorities and a fairness policy (EEVDF to be evaluated, §26), load balancing; pad the per-worker counters.
+4. **M3, scheduling proper** (ADR-0003 K7 is the baseline; ADR-0008 indexes its queues): priorities and a fairness policy (EEVDF to be evaluated, §26), load balancing; pad the per-worker counters. Per-CPU state sized at discovery instead of 64 static slots (ADR-0008 C6), CPU hot-plug (MADT "online capable"), and CPUID leaf 1Fh topology (dies, modules) for §27.
 5. **M4:** ADR-0005 is accepted; the `origin-abi` crate, handle tables and channel logic exist. Next: the kernel's system-call layer, user copies against the calling process's tables, `wait_one`, the start record, memory objects, the Loader Service and `.ose` loading; PCIDs (ADR-0004 H5).
 6. **Signature block (ONBF §7.1):** `onbf-pack` signing with a host key, the loader requiring a signed KRN outside developer mode, the trust store and OKC chains (the trust anchor is decided: B7).
 7. **Block layer and filesystem (§39–§41):** one I/O queue per CPU, a block cache, then a filesystem ADR.
@@ -74,4 +75,5 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 | — | A project licence | Every provenance entry |
 | — | ADR-0007 (DMA isolation and interrupt remapping, Proposed): five questions | Accepting the IOMMU design; it is implemented and boot-proven already |
 | — | Download of Intel's VT-d Rev 5.20 PDF (D51397-019, about 10 MB) | Re-checking every VT-d encoding against the text itself before hardware qualification |
+| — | ADR-0008 (dense CPU indexes, Proposed): three questions | Accepting the per-CPU indexing design; it is implemented and boot-proven already |
 | — | Merge into `main` and push | Sharing the work |
