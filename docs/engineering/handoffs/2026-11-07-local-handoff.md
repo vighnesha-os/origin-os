@@ -1329,3 +1329,30 @@ Measuring first showed neither proof was timing the kernel. In 36,000 firings at
 
 - Merge this branch after the weighted-share branch (`claude/elegant-thompson-48edc8`).
 - Still load-sensitive and not touched: at 1× and 2× the RTC proof (`too uncertain to confirm within 1 %`), the timed wait (`prove_timed`, 81 ms against a bound of 80), and the iteration-counted two-worker fairness check in `sched::prove`; at 4× the APIC timer proof and the cross-CPU TSC check, and the ping-pong itself (the host's ordinary round trip was over its bound in that batch).
+
+### Continued (2026-11-09, ~03:20–03:35 IST): the early console and the wait-queue and timer proof fixes merged
+
+On branch **`claude/interesting-carson-ae7c83`**, on the owner's word ("Yes, merge both"): merge commits `8040882` (the early console, `a96bf7b`, ADR-0010) and `31c3d39` (the wait-queue and timer proofs, `cc375ac`). **Local only: PR vighnesha-os/origin-os#2 is still at `c23e9a4`.**
+
+Both diffs were read before merging: the loader's and the kernel's changes, the SPCR parser, the framebuffer console and the screen-dump proof, the timer verdicts and the ping-pong's rule. No code conflicted, and `framekernel/src/main.rs`, the one code file both change, merged automatically. The conflicts were records only and kept both sides' facts. No bound was loosened: a timer may still be at most 2 ms late, and only a mean round trip under 2000 µs passes a run.
+
+**Result, on `31c3d39`:** `cargo xtask check` passes with 827 tests passed, 0 failed, 6 ignored. `cargo xtask boot-matrix` passes in full on its first attempt on a quiet host (load 2.7–4.0): both IOMMUs at 1, 2 and 4 CPUs, `boot-x2apic` under leaves 1Fh and 0Bh, and the 8 `boot-console` scenarios.
+
+| In that run | |
+|---|---|
+| Kernel boots | 8, then the 8 console boots |
+| Ping-pongs | 15, all passed at their first run: 41 to 56 µs on two or more processors, 5 µs on one |
+| `timers` runs | 15, all decided at their first run: worst lateness 0 µs in 14, 38 µs in one |
+| Drawing a console line | 226 to 245 µs on average, at most 808 µs (14 boots, QEMU TCG) |
+
+#### What to know
+
+- One pass on a quiet host says nothing about load. The measurements at 1×, 2× and 4× are in `SOURCE_PROVENANCE.md`; at 4× the ping-pong still fails most of the boots that reach it, because the host's ordinary round trip is over the bound.
+- The framebuffer console has only run under QEMU. On a machine whose firmware scans out through the IOMMU, expect the screen to go dark at `iommu::init` until T14's identity maps or the T4 work land (ADR-0010, "What this does not prove"). A serial line is still wanted for a first boot.
+- `boot-matrix` now takes about 8 minutes on a quiet host, with `boot-console`'s eight boots in it.
+
+#### Open for the owner
+
+- Whether to push these commits to the PR.
+- Buying the machines ADR-0009 chose.
+- Early-boot DMA, M4 and the Loom models are still on their own branches.

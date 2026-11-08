@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| As of | 2026-11-08, on `claude/interesting-carson-ae7c83`, with signed boot, the crypto vectors and the clock and scheduler proof fixes merged. M4, Loom and early-boot DMA are not merged and may add to this list. |
+| As of | 2026-11-09, on `claude/interesting-carson-ae7c83`, with signed boot, the crypto vectors, the clock, scheduler, wait-queue and timer proof fixes and the early console merged. M4, Loom and early-boot DMA are not merged and may add to this list. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
 | Answered | 2026-11-08: all 29 items. Claude did items 23 and 24 at your request. |
@@ -96,9 +96,9 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 
 **Also found by the same check, not decisions for now:** ADR-0002, ADR-0004 and ADR-0005, already Accepted, have no migration consequences either (§18). The system-call boundary M4 is building has no threat model yet (§58).
 
-## Early console (ADR-0010): built and boot-proven on its branch; accepted
+## Early console (ADR-0010): built, boot-proven, Accepted and merged
 
-ADR-0009 H6 asked for a console that does not depend on a 16550 at `0x3F8`. `claude/funny-benz-fa7d10` has it, proven under QEMU only: every kernel line drawn on the UEFI framebuffer, the UART taken from the ACPI SPCR when firmware names one, 0x3F8 as the fallback, and a boot that goes on with neither. Evidence: `docs/adr/ADR-0010-early-console.md`, `docs/engineering/SOURCE_PROVENANCE.md`, "The early console".
+ADR-0009 H6 asked for a console that does not depend on a 16550 at `0x3F8`. The kernel has it since the merge of 2026-11-09, proven under QEMU only: every kernel line drawn on the UEFI framebuffer, the UART taken from the ACPI SPCR when firmware names one, 0x3F8 as the fallback, and a boot that goes on with neither. Evidence: `docs/adr/ADR-0010-early-console.md`, `docs/engineering/SOURCE_PROVENANCE.md`, "The early console".
 
 | # | Question | Recommendation | Why |
 |---|---|---|---|
