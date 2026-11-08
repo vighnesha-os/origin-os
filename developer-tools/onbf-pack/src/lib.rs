@@ -16,7 +16,7 @@
 //!
 //! Packing is deterministic: the same ELF bytes and options always give the same image,
 //! with no timestamps, host paths or other environment input (ONBF-R9, CLAUDE.md §75).
-//! Signing is not, because OpenSSL's ML-DSA signatures are hedged; the statement is.
+//! Signing is not, because ML-DSA signing is hedged with fresh randomness; the statement is.
 #![forbid(unsafe_code)]
 #![cfg_attr(
     not(test),
@@ -43,7 +43,7 @@ use core::fmt;
 pub use elf::ElfError;
 pub use krn::{KrnOptions, Packed, VerifyError};
 pub use relr::RelrError;
-pub use sign::{OpensslSigner, SignError, SignOptions, Signer};
+pub use sign::{HostKey, SignError, SignOptions, Signer};
 pub use toolchain::{Toolchain, ToolchainError};
 
 /// Why the container could not be laid out.

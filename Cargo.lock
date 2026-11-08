@@ -35,9 +35,17 @@ version = "0.0.0"
 dependencies = [
  "onbf-format",
  "onbf-merkle",
+ "onbf-sign",
  "onbf-verify",
  "origin-crypto",
  "origin-version",
+]
+
+[[package]]
+name = "onbf-sign"
+version = "0.0.0"
+dependencies = [
+ "origin-crypto",
 ]
 
 [[package]]
