@@ -48,8 +48,11 @@ pub(crate) fn run(call: u64, args: [u64; 6], rip: u64) -> Outcome {
     }
     cpu::enable_interrupts();
     let outcome = dispatch(&process, call, args);
-    // Anything a close left behind is dropped here, with no lock held.
+    // Anything a close left behind is dropped here, with no lock held, and anything an exit
+    // on this processor left behind is freed here too: otherwise a processor kept busy by
+    // user threads would never get to its idle loop to do it.
     ipc::reap_closed();
+    sched::reap();
     cpu::disable_interrupts();
     outcome
 }
@@ -78,6 +81,7 @@ fn dispatch(p: &Process, call: u64, [a0, a1, a2, a3, a4, a5]: [u64; 6]) -> Outco
             p.thread_ended(Ending::Exited(a0));
             return Outcome::ThreadExit;
         }
+        number::DEBUG_REPORT | number::DEBUG_WRITE if !p.debug_calls() => Err(Error::NotSupported),
         number::DEBUG_REPORT => {
             p.report(a0);
             Ok(())

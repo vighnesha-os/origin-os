@@ -416,11 +416,47 @@ ipc_ac_start:
     jmp .Lac_exit
 ipc_ac_end:
 
+    // Without the developer calls: both must come back NOT_SUPPORTED, and it exits with 0
+    // if the first did.
+    .globl ipc_nodebug_start
+    .globl ipc_nodebug_end
+ipc_nodebug_start:
+    xor edi, edi
+    xor esi, esi
+    mov eax, {DEBUG_WRITE}
+    syscall
+    cmp rax, {NOT_SUPPORTED}
+    setne al
+    movzx edi, al
+    mov eax, {DEBUG_REPORT}
+    syscall
+.Lnodebug_exit:
+    mov eax, {THREAD_EXIT}
+    syscall
+    jmp .Lnodebug_exit
+ipc_nodebug_end:
+
+    // `sidt` from ring 3: with UMIP on it is a #GP, and the kernel's IDT address stays secret.
+    .globl ipc_sidt_start
+    .globl ipc_sidt_end
+ipc_sidt_start:
+    sidt [{DATA} + 0x100]
+    mov edi, 1
+    mov eax, {DEBUG_REPORT}
+    syscall
+    xor edi, edi
+.Lsidt_exit:
+    mov eax, {THREAD_EXIT}
+    syscall
+    jmp .Lsidt_exit
+ipc_sidt_end:
+
     .popsection
 "#,
     DATA = const DATA,
     DEBUG_REPORT = const sys::DEBUG_REPORT,
     THREAD_EXIT = const sys::THREAD_EXIT,
+    DEBUG_WRITE = const sys::DEBUG_WRITE,
     CHANNEL_WRITE = const sys::CHANNEL_WRITE,
     CHANNEL_READ = const sys::CHANNEL_READ,
     WAIT_ONE = const sys::WAIT_ONE,
@@ -446,6 +482,10 @@ unsafe extern "C" {
     static ipc_gs_end: u8;
     static ipc_ac_start: u8;
     static ipc_ac_end: u8;
+    static ipc_nodebug_start: u8;
+    static ipc_nodebug_end: u8;
+    static ipc_sidt_start: u8;
+    static ipc_sidt_end: u8;
 }
 
 /// The bytes of one program in the image.
@@ -723,6 +763,7 @@ impl Image {
 const LIMITS: Limits = Limits {
     handles: 64,
     channels: 32,
+    debug_calls: true,
 };
 
 /// Waits for `process`'s last thread to end.
@@ -1416,6 +1457,7 @@ fn quotas(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let limits = Limits {
         handles: 12,
         channels: 4,
+        debug_calls: true,
     };
     let limit = Error::Limit.raw();
     let steps = alloc::vec![
@@ -1610,6 +1652,57 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         "origin-kernel: ipc: a program with RFLAGS.AC set took interrupts and made a system call: the flag reached kernel code {leaks} times, and stayed set in ring 3: {flag_was_set}{}",
         if right { "" } else { ": ipc failed" }
     );
+
+    // A process without the developer calls cannot use them (the ABI reserves them for
+    // developer builds): it cannot hold the console for the whole machine.
+    let nodebug = program(&raw const ipc_nodebug_start, &raw const ipc_nodebug_end);
+    let limits = Limits {
+        debug_calls: false,
+        ..LIMITS
+    };
+    let Some(image) = Image::new(limits, nodebug) else {
+        return false;
+    };
+    let process = image.finish();
+    if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
+        return false;
+    }
+    let ended = await_end(&process, tsc_hz, 5);
+    let right =
+        ended && process.ending() == Some(Ending::Exited(0)) && process.reports().is_empty();
+    ok &= right;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: a process without the developer calls gets NOT_SUPPORTED: {right}{}",
+        if right { "" } else { ": ipc failed" }
+    );
+
+    // With UMIP on, `sidt` from ring 3 faults: the kernel's descriptor-table addresses, which
+    // reveal the KASLR slide, stay out of reach of programs.
+    let sidt = program(&raw const ipc_sidt_start, &raw const ipc_sidt_end);
+    let Some(image) = Image::new(LIMITS, sidt) else {
+        return false;
+    };
+    let process = image.finish();
+    if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
+        return false;
+    }
+    let ended = await_end(&process, tsc_hz, 5);
+    let umip = cpu::umip_on();
+    let refused = matches!(process.ending(), Some(Ending::Faulted { vector: 13, .. }));
+    let right = ended && (!umip || refused);
+    ok &= right;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: sidt from ring 3 with UMIP {}: {}{}",
+        if umip { "on" } else { "unavailable" },
+        if refused {
+            "refused, the process ended by vector 13"
+        } else {
+            "completed"
+        },
+        if right { "" } else { ": ipc failed" }
+    );
     ok
 }
 
@@ -1661,10 +1754,16 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
     let elapsed = time::monotonic_nanos().wrapping_sub(started) / 1_000_000;
     let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
     let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    // Every thread's state was complete before it could be picked (`sched::spawn_with`).
+    let unready = sched::unready_switches();
     let _ = writeln!(
         com1,
-        "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}), {elapsed} ms for the whole proof{}",
-        if back { "" } else { ": ipc failed" }
+        "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}), {elapsed} ms for the whole proof; threads run before their state existed: {unready}{}",
+        if back && unready == 0 {
+            ""
+        } else {
+            ": ipc failed"
+        }
     );
-    ok && back
+    ok && back && unready == 0
 }

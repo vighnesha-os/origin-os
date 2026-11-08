@@ -1035,8 +1035,11 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
         "origin-kernel: ipc: a process's system calls are accepted only from its pinned code range: every call refused, and it ended by its own fault".into(),
         "origin-kernel: ipc: a program that loaded a null GS was interrupted and made system calls, and the kernel used its own GS (reports [1, 0])".into(),
         "origin-kernel: ipc: a program with RFLAGS.AC set took interrupts and made a system call: the flag reached kernel code 0 times, and stayed set in ring 3: true".into(),
+        "origin-kernel: ipc: a process without the developer calls gets NOT_SUPPORTED: true".into(),
+        "origin-kernel: ipc: sidt from ring 3 with UMIP on: refused, the process ended by vector 13".into(),
         "origin-kernel: ipc: a fault inside a user copy comes back as a failed copy, not a dead kernel: 1 fault recovered".into(),
         "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap ".into(),
+        "; threads run before their state existed: 0".into(),
     ]);
     markers
 }

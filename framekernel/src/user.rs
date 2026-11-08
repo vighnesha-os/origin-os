@@ -34,6 +34,7 @@ const DATA: u64 = 0x50_0000;
 const LIMITS: Limits = Limits {
     handles: 16,
     channels: 4,
+    debug_calls: true,
 };
 
 /// A kernel object for the reader to touch.

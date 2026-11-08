@@ -106,6 +106,10 @@ impl Account {
 pub(crate) struct Limits {
     pub(crate) handles: usize,
     pub(crate) channels: usize,
+    /// May it use `DEBUG_REPORT` and `DEBUG_WRITE`? The ABI reserves them for developer
+    /// builds: an ordinary process that calls them gets `NOT_SUPPORTED`, so it cannot hold
+    /// the serial line (at 115200 baud, a line for many milliseconds) with interrupts off.
+    pub(crate) debug_calls: bool,
 }
 
 /// What ended the process's last thread, for the boot proofs.
@@ -139,6 +143,8 @@ pub(crate) struct Process {
     pub(crate) account: Arc<Account>,
     /// The only code range that may issue system calls (P4, ONBF §6.1): `[start, end)`.
     syscall_origin: (u64, u64),
+    /// May it use the developer-only calls?
+    debug_calls: bool,
     /// Threads running in it.
     threads: AtomicU32,
     /// Developer-only output of `DEBUG_REPORT`.
@@ -172,6 +178,7 @@ impl Process {
                 max_channels: limits.channels,
             }),
             syscall_origin,
+            debug_calls: limits.debug_calls,
             threads: AtomicU32::new(0),
             reports: SpinLock::new(ReportLog {
                 values: [0; REPORTS],
@@ -264,6 +271,11 @@ impl Process {
             .is_some_and(|at| at >= start && rip <= end)
     }
 
+    /// Whether this process may use the developer-only calls.
+    pub(crate) const fn debug_calls(&self) -> bool {
+        self.debug_calls
+    }
+
     /// Puts `object` in this process's table with `rights`: what the creator grants.
     pub(crate) fn grant(&self, object: Object, rights: u32) -> Result<Handle, Error> {
         without_interrupts(|| self.handles.lock().insert(object, rights)).map_err(|(e, _)| e)
@@ -341,7 +353,9 @@ impl Process {
         });
         drop(table);
         ipc::reap_closed();
-        // Last: "ended" means its handles are closed and its peers can see that.
+        // Last: "ended" means its handles are closed and its peers can see that. (Ends that
+        // were only reachable through an undelivered message another processor is reaping
+        // this instant close a moment later: they are delayed, never lost.)
         without_interrupts(|| *self.ending.lock() = Some(ending));
     }
 }

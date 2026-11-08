@@ -889,15 +889,16 @@ pub(crate) unsafe fn wrmsr(msr: u32, value: u64) {
 ///
 /// Every lock that a thread can hold while preemptible is taken inside this: otherwise a
 /// thread preempted while holding it makes every other thread on the same processor that
-/// wants it spin away its whole time slice.
+/// wants it spin away its whole time slice. The `cli` and `sti` are compiler barriers (no
+/// `nomem`): a lock's atomics must not move outside the disabled region.
 pub(crate) fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
     let flags: u64;
     // SAFETY: reads RFLAGS and disables interrupts; CPL 0. Restored below.
-    unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem, preserves_flags)) };
+    unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags, options(preserves_flags)) };
     let result = f();
     if flags & (1 << 9) != 0 {
         // SAFETY: interrupts were enabled on entry, so re-enabling restores that state.
-        unsafe { asm!("sti", options(nomem, nostack)) };
+        unsafe { asm!("sti", options(nostack)) };
     }
     result
 }
@@ -972,7 +973,7 @@ pub(crate) fn interrupt_window() {
     // a pending one is taken after the NOP and before CLI. Every vector that can arrive has
     // a gate (the timer, the spurious vector and the exceptions), and the 8259 PICs are
     // masked.
-    unsafe { asm!("sti", "nop", "cli", options(nomem, nostack)) };
+    unsafe { asm!("sti", "nop", "cli", options(nostack)) };
 }
 
 /// IA32_EFER.
@@ -1094,6 +1095,13 @@ pub(crate) fn probe_execute_data() -> (u64, Probe) {
 
 /// Whether SMAP is enabled (so user accesses need `stac`/`clac`).
 static SMAP_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Whether UMIP is on (ring 3 cannot read the descriptor-table registers).
+static UMIP_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether UMIP is on, for the boot proof.
+pub(crate) fn umip_on() -> bool {
+    UMIP_ON.load(Ordering::Relaxed)
+}
 
 /// Page faults the user-copy instruction took and survived.
 static USER_COPY_FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -1136,13 +1144,13 @@ pub(crate) unsafe fn copy_user(dst: u64, src: u64, len: u64) -> bool {
 pub(crate) fn enable_interrupts() {
     // SAFETY: CPL 0; every vector that can arrive has a gate, and the caller holds no lock
     // that an interrupt handler on this processor may take.
-    unsafe { asm!("sti", options(nomem, nostack)) };
+    unsafe { asm!("sti", options(nostack)) };
 }
 
 /// Turns interrupts off on the way back out of a system call.
 pub(crate) fn disable_interrupts() {
     // SAFETY: CPL 0; CLI only clears RFLAGS.IF.
-    unsafe { asm!("cli", options(nomem, nostack)) };
+    unsafe { asm!("cli", options(nostack)) };
 }
 
 /// `rep movsb` from RSI to RDI, RCX bytes (the fourth argument), as the first instruction,
@@ -1283,6 +1291,9 @@ pub(crate) fn invlpg(addr: u64) {
 const CR4_SMEP: u64 = 1 << 20;
 /// CR4.SMAP: supervisor data accesses to user pages fault (unless RFLAGS.AC is set).
 const CR4_SMAP: u64 = 1 << 21;
+/// CR4.UMIP: `sidt`, `sgdt`, `sldt`, `str` and `smsw` fault at CPL 3, so a program cannot
+/// read the kernel's descriptor table addresses, which give away the KASLR slide.
+const CR4_UMIP: u64 = 1 << 11;
 
 /// Which of SMEP and SMAP this processor supports (CPUID 7.0 EBX bits 7 and 20).
 pub(crate) fn smep_smap_supported() -> (bool, bool) {
@@ -1489,9 +1500,17 @@ pub(crate) unsafe fn fpu_restore(area: u64) {
 pub(crate) unsafe fn enable_smep_smap() -> (bool, bool) {
     let (smep, smap) = smep_smap_supported();
     SMAP_ON.store(smap, Ordering::Relaxed);
-    let bits = if smep { CR4_SMEP } else { 0 } | if smap { CR4_SMAP } else { 0 };
+    // UMIP (CPUID.7.0:ECX bit 2): `sidt` from ring 3 would otherwise reveal the kernel's
+    // descriptor-table addresses, and with them the KASLR slide (ADR-0004 H3).
+    let umip = cpuid(0)[0] >= 7 && cpuid(7)[2] & (1 << 2) != 0;
+    if umip && this_cpu() == CpuIndex::BOOT {
+        UMIP_ON.store(true, Ordering::Relaxed);
+    }
+    let bits = if smep { CR4_SMEP } else { 0 }
+        | if smap { CR4_SMAP } else { 0 }
+        | if umip { CR4_UMIP } else { 0 };
     // SAFETY: the caller's contract; setting supported CR4 bits only adds restrictions on
-    // supervisor accesses to user pages.
+    // supervisor accesses to user pages and on user-mode descriptor reads.
     unsafe {
         asm!(
             "mov {tmp}, cr4",

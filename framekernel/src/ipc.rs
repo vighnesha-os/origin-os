@@ -194,7 +194,9 @@ impl Drop for KernelChannel {
 }
 
 /// Serializes every addition of a channel end to the graph of ends held in queues, so the
-/// cycle check always sees the whole graph.
+/// cycle check always sees the whole graph. The walk under it visits at most one end per
+/// channel in the chain, and each process's channels are bounded by its quota (today's are
+/// small; a higher quota would also need a limit on the chain's depth).
 static TRANSFERS: SpinLock<()> = SpinLock::new(());
 
 /// Channels with undelivered messages waiting for [`reap_closed`].
@@ -379,16 +381,18 @@ pub(crate) fn channel_write(
             handles: moved,
         };
         // `can_write` and the handle count were checked just above, under this lock, and
-        // the queue's storage was taken at creation, so this cannot be refused.
-        state.write(side, message).map_err(|(e, refused)| {
-            // The handles it carried close here if it ever could be: a bug, not a hostile call.
-            drop(refused);
-            e
-        })?;
+        // the queue's storage was taken at creation, so this cannot be refused. Were that
+        // ever wrong, the message goes back outside the locks, since dropping it may close
+        // the handles it carried.
+        let refused = state.write(side, message).err();
         drop(state);
-        Ok::<_, Error>((channel, reader))
+        Ok::<_, Error>((channel, reader, refused))
     });
-    let (channel, reader) = wake_side?;
+    let (channel, reader, refused) = wake_side?;
+    if let Some((error, message)) = refused {
+        drop(message);
+        return Err(error);
+    }
     wake(&channel, reader);
     for (end, side) in &moved_ends {
         wake(end, *side);
@@ -444,15 +448,21 @@ pub(crate) fn channel_read(
                 ReadError::TooSmall { .. } => Error::BufferTooSmall,
             })?;
         drop(state);
-        for (object, entry_rights) in message.handles {
+        let mut incoming = message.handles.into_iter();
+        for (object, entry_rights) in incoming.by_ref() {
             let Object::Channel(end) = &object;
             if let Some(holder) = end.channel.holder.get(end.side) {
                 *holder.lock() = None;
             }
             match table.insert(object, entry_rights) {
                 Ok(h) => values.push(h),
-                // `reserve` above covers this insert.
-                Err((e, _)) => return Err(e),
+                // `reserve` above makes this unreachable. Were it reached, nothing may
+                // close here, under the table lock: the objects are leaked instead.
+                Err((e, object)) => {
+                    core::mem::forget(object);
+                    core::mem::forget(incoming);
+                    return Err(e);
+                }
             }
         }
         let read = Read::Message {
