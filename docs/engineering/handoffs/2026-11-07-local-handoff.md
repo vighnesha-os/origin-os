@@ -818,6 +818,65 @@ refused). Probes N8 and N9 are in the provenance entry.
 - IVMD unity maps and exclusion ranges (and RMRR identity maps for VT-d).
 - **The owner:** ADR-0007's eight questions; compare the AMD specification's hash with AMD's copy.
 
+### Continued (2026-11-08, afternoon IST): parser hardening (TASKS item 3)
+
+Backlog item 3, on branch **`claude/gifted-maxwell-7e8a3f`** (based on
+`claude/interesting-carson-ae7c83` at `0b9c3e0`; **not pushed**). Every parser in the
+host-tested library that reads firmware or device data now has a deterministic, seeded
+mutation soak on `crate::testing`. The evidence is `SOURCE_PROVENANCE.md`, "Parser hardening":
+the inventory, the per-parser results and the bugs.
+
+**Result:** 55 new tests. The workspace went from 579 to 634 tests (0 failed, 6 ignored); the
+`framekernel` library runs in 1.0 s (0.92 s before). A default run is about 1.3 million mutated
+inputs; `ORIGIN_MUTATION_SCALE=n` multiplies it.
+
+**Gates on the final tree:** `cargo xtask check`; `cargo xtask boot-test` (both IOMMUs); `cargo
+xtask boot-matrix` (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs). `ORIGIN_MUTATION_SCALE=10` (debug,
+overflow checks on) and `ORIGIN_MUTATION_SCALE=100` (release) both pass in seconds.
+
+**The 13 library bugs** (each with a regression test shown to fail without its fix):
+`cache::decode` (`sub[2] + 1` wrapped at `ECX = FFFFFFFFh`); `originfs` (`inode_table_start +
+table_blocks`, behind the CRC that kept the old soak out); `virtqueue::free_chain` and
+`FreeList` (a device-reported id panicked or double-freed); `virtio::find_caps` (read past 100h,
+took the last instance, took short capabilities and reserved BARs); `nvme::identify_namespace`
+(a byte size over 64 bits); `pci::msix` (a capability at F8h or FCh); `gpt` (a header inside the
+usable range); `ustar` (a directory's size swallowed the next header); `dns` (a name past its
+RDLENGTH); `net::checksum` (a `u32` sum); `amdvi::Irte::decode_*` (vectors below 16);
+`numa::self_is_nearest` (more than 256 localities); `acpi::table_length` (no upper bound).
+
+**The kernel side** (fixed through the same library checks): a virtio structure or MSI-X table
+outside its memory BAR, or in an I/O BAR; a notification register outside its structure; a queue
+size that is not a power of two, or too short for the receive buffers; NVMe doorbells past BAR 0;
+blocks larger than a page.
+
+#### What to know
+
+- `virtio::find_caps` now takes a second argument, `usable`, a predicate on each structure's
+  location (the kernel passes "inside a memory BAR"): a device may list an I/O-BAR instance
+  first (virtio 1.1 §4.1.4.1).
+- `virtqueue::FreeList::free` returns `bool` and `free_chain` returns the count freed; a
+  repeated or out-of-range index is refused rather than stored.
+- `pci::Msix::table_address`, `virtio::CfgLocation::address_in` and `notify_offset`,
+  `virtqueue::queue_size`, `nvme::doorbells_fit` and `NamespaceInfo::block_fits_page` are the
+  checks a future driver must use: every value they take is device-supplied.
+- `acpi::table_length` refuses anything over `MAX_TABLE_LENGTH` (16 MiB).
+- When adding a parser: re-seal any checksum after mutating (a checksummed structure otherwise
+  hides what is behind it from the soak) and, for a device model, assert the access bounds in
+  the model itself. `crate::testing` has `Rng::edge_u64` and `mutate_window` for this.
+
+#### Not done
+
+- Coverage-guided fuzzing and Kani bounds (nightly, §12, §73); a multi-fault soak over the ONBF
+  parsers (they have exhaustive single-fault sweeps, and the brief said not to redo them).
+- The malformed-device paths in the kernel binary are host-tested through the library
+  checks but can only be shown live on a fault-injecting device model or hardware (§74): QEMU
+  will not present a capability outside its BAR or a queue size of 3.
+
+#### Next
+
+Backlog item 4 (M3 scheduling proper). The owner: the questions that were already open in this
+file (ADR-0007, ADR-0008, the VT-d PDF, the AMD specification's hash) are unchanged.
+
 ### Continued (2026-11-08, ~12:25–12:45 IST): the IOMMU follow-ups merged
 
 The owner asked the VT-d session to merge its four follow-up branches into its own branch,

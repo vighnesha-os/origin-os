@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Required by | CLAUDE.md §79 (persistent engineering memory) |
-| Updated | 2026-11-07 |
+| Updated | 2026-11-08 |
 | Rule | Status words mean what they say. "Done" means built, tested and committed; QEMU is not hardware (CLAUDE.md §74). |
 
 ## Done (branch `m0/toolchain-verification`)
@@ -57,7 +57,7 @@
 
 1. **NVMe interrupts:** the PCI capability list, MSI-X, a vector per queue, and completions that wake a wait queue instead of polling; timed waits (deadlines on the monotonic clock).
 2. **IOMMU (§32):** VT-d under QEMU's `intel-iommu` — **done 2026-11-08** (ADR-0007, Proposed): the DMAR table, DMA remapping for NVMe and virtio-net with blocked-DMA and fault proofs, and interrupt remapping (see STATUS and `SOURCE_PROVENANCE.md`). Delivery to an APIC ID above 255 is proven live since the CPU-index work (ADR-0008, `boot-x2apic`). I/O APIC entries in remappable format, through IRTEs that check the I/O APIC's source ID — **done 2026-11-08**. AMD-Vi under QEMU's `amd-iommu` — **done 2026-11-08** (ADR-0007's AMD-Vi section, Proposed): the IVRS, default-deny device tables, DMA and per-device interrupt remapping with x2APIC destinations, the same proofs and drivers, `boot-matrix` over both IOMMUs. Remaining: RMRR and IVMD identity maps, scalable mode; an interrupt table for the I/O APIC's DeviceID under AMD-Vi (its pins stay masked there until then); the keyboard IRQ1 to a handler through `iommu::route_ioapic_pin`; a live level-triggered pin (PCI INTx) with its EOI path; the source-ID check on I/O APIC interrupts on hardware (QEMU's I/O APIC sends no requester ID).
-3. **Parser hardening (§72):** deterministic mutation runs over every firmware and device parser (ACPI, PCI, NVMe Identify, GPT, RTC), with a seeded generator and no fuzzing crates.
+3. **Parser hardening (§72):** deterministic mutation runs over every firmware and device parser (ACPI, PCI, NVMe Identify, GPT, RTC), with a seeded generator and no fuzzing crates — **done 2026-11-08** (branch `claude/gifted-maxwell-7e8a3f`): the whole inventory, with a soak per parser (about 1.3 million mutated inputs in the default 1 s run; `ORIGIN_MUTATION_SCALE` scales it). The soaks found 13 library bugs and several unchecked device values in the kernel; each is fixed with a regression test (see `SOURCE_PROVENANCE.md`, "Parser hardening"). Remaining: coverage-guided fuzzing and Kani bounds (§73); a multi-fault soak over the ONBF parsers (they have exhaustive single-fault sweeps); the malformed-device paths on a fault-injecting device model or hardware (§74).
 4. **M3, scheduling proper** (ADR-0003 K7 is the baseline; ADR-0008 indexes its queues): priorities and a fairness policy (EEVDF to be evaluated, §26), load balancing; pad the per-worker counters. Per-CPU state sized at discovery instead of 64 static slots (ADR-0008 C6), CPU hot-plug (MADT "online capable"), and CPUID leaf 1Fh topology (dies, modules) for §27.
 5. **M4:** ADR-0005 is accepted; the `origin-abi` crate, handle tables and channel logic exist. Next: the kernel's system-call layer, user copies against the calling process's tables, `wait_one`, the start record, memory objects, the Loader Service and `.ose` loading; PCIDs (ADR-0004 H5).
 6. **Signature block (ONBF §7.1):** `onbf-pack` signing with a host key, the loader requiring a signed KRN outside developer mode, the trust store and OKC chains (the trust anchor is decided: B7).
