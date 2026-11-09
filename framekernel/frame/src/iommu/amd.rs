@@ -6,7 +6,7 @@
 //!
 //! At boot, when the firmware describes AMD IOMMUs (an ACPI IVRS, no DMAR), after PCIe
 //! enumeration and before any driver binds:
-//! 1. the IVRS names the IOMMUs and the DeviceIDs each translates (`framekernel::ivrs`,
+//! 1. the IVRS names the IOMMUs and the DeviceIDs each translates (`crate::ivrs`,
 //!    checked whole); each IOMMU is taken from its richest IVHD;
 //! 2. each IOMMU's capability block is read from its PCI function and its registers are
 //!    mapped uncached; the firmware must have left it disabled;
@@ -41,18 +41,17 @@ use core::fmt::Write;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering, fence};
 
-use framekernel::amdvi::{
+use crate::amdvi::{
     self, Capability, Command, Dma, Dte, Event, Features, Interrupts, Irte, MsiMessage, Pages,
     control, reg, status,
 };
-use framekernel::bitmap::Bitmap;
-use framekernel::ivrs::{self, Ivrs, Special};
-use framekernel::pci::Address;
-use framekernel::vtd::{Access, IovaWindow};
-use origin_frame::sync::SpinLock;
+use crate::bitmap::Bitmap;
+use crate::ivrs::{self, Ivrs, Special};
+use crate::pci::Address;
+use crate::sync::SpinLock;
+use crate::vtd::{Access, IovaWindow};
 
 use super::{Domain, DomainInfo, Fault, FaultKind, PAGE, Page, Regs, Route, Tables, poll};
-use crate::console::Console;
 
 /// Each ring (command buffer, event log) is one page: 2^8 entries of 16 bytes.
 const RING_ORDER: u8 = 8;
@@ -333,13 +332,13 @@ fn bring_up(u: &ivrs::Unit<'static>) -> Result<Brought, &'static str> {
         return Err("PCI segments other than 0 are not supported");
     }
     let at = address(u.device_id);
-    let header = crate::pcie::read_config32(at, u.capability_offset)
+    let header = super::read_config32(at, u.capability_offset)
         .ok_or("its capability block cannot be read")?;
     let capability = Capability::decode(header);
     if !capability.is_iommu {
         return Err("its capability offset does not hold an IOMMU capability block");
     }
-    let region = crate::vm::map_mmio(origin_frame::addr::PhysAddr::new(u.base), reg::SPAN)
+    let region = crate::vm::map_mmio(crate::addr::PhysAddr::new(u.base), reg::SPAN)
         .map_err(|_| "cannot map its registers")?;
     let regs = Regs { region };
     if regs.read64(reg::CONTROL) & control::IOMMU_EN != 0 {
@@ -509,7 +508,7 @@ fn bring_up(u: &ivrs::Unit<'static>) -> Result<Brought, &'static str> {
 
 /// Brings up every IOMMU the IVRS (`table`, checked by `firmware::acpi_table`) names.
 /// Returns `false` only for a failure.
-pub(super) fn init(com1: &mut Console, table: &'static [u8]) -> bool {
+pub(super) fn init(com1: &mut dyn Write, table: &'static [u8]) -> bool {
     let ivrs = match ivrs::parse(table) {
         Ok(r) => r,
         Err(e) => {

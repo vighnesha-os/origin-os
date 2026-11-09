@@ -13,6 +13,7 @@
 //! an abstract [`TableMemory`], so all of it is host-tested. Register values come from
 //! hardware and are untrusted: decoders never panic, and an encoder refuses (`None`) anything
 //! it cannot encode exactly. Pure, no `unsafe`, no allocation.
+#![forbid(unsafe_code)]
 
 /// Register offsets in a remapping unit's register set (chapter 11).
 pub mod reg {

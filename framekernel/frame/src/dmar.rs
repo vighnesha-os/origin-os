@@ -14,6 +14,7 @@
 //! checks and cannot panic. Device resolution ([`Dmar::unit_for`]) reads bridge bus numbers
 //! through a caller-supplied [`BridgeBuses`], so it is host-tested over a model of a PCI
 //! hierarchy. Pure, no `unsafe`, no allocation.
+#![forbid(unsafe_code)]
 
 /// Offset of the first remapping structure: the 36-byte table header, the host address
 /// width (1 byte), the flags (1 byte) and 10 reserved bytes.

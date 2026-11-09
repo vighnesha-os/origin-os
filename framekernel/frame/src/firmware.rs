@@ -5,15 +5,15 @@
 //! table parsers (`framekernel::acpi`) treat every byte as untrusted.
 #![forbid(unsafe_code)]
 
-use framekernel::acpi;
-use origin_frame::addr::PhysAddr;
+use crate::acpi;
+use crate::addr::PhysAddr;
 
 use crate::vm;
 
 /// Reads `len` bytes of firmware memory at physical `addr`, mapping it read-only first if
 /// the kernel does not map it. Refused unless the memory map says the range is the
 /// firmware's own (ACPI or reserved memory): the kernel never reads its own RAM this way.
-pub(crate) fn bytes(addr: u64, len: usize) -> Result<&'static [u8], &'static str> {
+pub fn bytes(addr: u64, len: usize) -> Result<&'static [u8], &'static str> {
     if addr == 0 || addr.checked_add(len as u64).is_none() {
         return Err("bad table address");
     }
@@ -25,7 +25,7 @@ pub(crate) fn bytes(addr: u64, len: usize) -> Result<&'static [u8], &'static str
 /// the error is why the last table with this signature was refused, if there was one. An
 /// entry that could not be read at all might have been this table, so a search that finds
 /// nothing then says so, and does not claim the table is absent. A null entry names nothing.
-pub(crate) fn acpi_table(rsdp_addr: u64, sig: &[u8; 4]) -> Result<&'static [u8], &'static str> {
+pub fn acpi_table(rsdp_addr: u64, sig: &[u8; 4]) -> Result<&'static [u8], &'static str> {
     let rsdp =
         acpi::parse_rsdp(bytes(rsdp_addr, acpi::RSDP_LENGTH)?).map_err(|_| "invalid RSDP")?;
     let table = |addr: u64, sig: &[u8; 4]| -> Result<&'static [u8], &'static str> {

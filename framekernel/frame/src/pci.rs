@@ -17,6 +17,7 @@
 //! decoded with checked arithmetic, sizing restores each BAR and the command register, and a
 //! memory BAR is believed only after [`validate_bars`] has held it against the memory map, the
 //! platform's own registers and every other BAR.
+#![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
 use core::fmt;

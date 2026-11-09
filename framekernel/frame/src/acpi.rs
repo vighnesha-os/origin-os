@@ -9,6 +9,7 @@
 //! Firmware tables are untrusted input. Every function here parses a byte slice the caller
 //! copied or mapped, checks signatures, lengths and checksums before using a field, never
 //! panics, and needs no `unsafe`.
+#![forbid(unsafe_code)]
 
 /// Bytes of an ACPI 2.0+ RSDP that are checksummed and parsed.
 pub const RSDP_LENGTH: usize = 36;

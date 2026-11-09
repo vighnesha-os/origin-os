@@ -15,6 +15,7 @@
 //! checks and cannot panic. A platform may describe one IOMMU several times, once per IVHD
 //! type; [`Ivrs::units`] yields each IOMMU once, from the richest block (40h, then 11h, then
 //! 10h), as §4.5 of the specification recommends. Pure, no `unsafe`, no allocation.
+#![forbid(unsafe_code)]
 
 /// Offset of the first definition block: the 36-byte table header, IVinfo (4 bytes) and 8
 /// reserved bytes.

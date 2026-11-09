@@ -15,6 +15,7 @@
 //! (`None`) anything it cannot encode exactly. The access type, the MSI message, the table
 //! memory and the IOVA window are shared with [`crate::vtd`], where they were defined first.
 //! Pure, no `unsafe`, no allocation.
+#![forbid(unsafe_code)]
 
 pub use crate::vtd::{Access, IOVA_BASE, IOVA_END, IovaWindow, MapError, MsiMessage, TableMemory};
 

@@ -35,9 +35,7 @@ use framekernel::report;
 mod block;
 mod console;
 mod dma;
-mod firmware;
 mod i8042;
-mod iommu;
 mod ipc;
 mod ipc_proof;
 mod irq;
@@ -61,7 +59,7 @@ use framekernel::serial::Uart16550;
 use origin_boot_info::{
     BootInfo, KernelSegment, MemoryRegion, RegionKind, SEGMENT_EXECUTE, SEGMENT_WRITE,
 };
-pub(crate) use origin_frame::{cpu, memory, phys, timer, vm};
+pub(crate) use origin_frame::{cpu, firmware, iommu, memory, phys, timer, vm};
 
 /// The fewest frames reserved, next to the frame bitmap, for the kernel's page tables.
 const TABLE_POOL_MIN_FRAMES: u64 = 256;
@@ -293,7 +291,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         // compatibility-format I/O APIC proof above, which interrupt remapping would block.
         // It runs whether or not the bus-master quiesce succeeded: confining a device that kept
         // mastering the bus is exactly what a failed quiesce leaves to it.
-        iommu::init(&mut com1, info.acpi_rsdp);
+        iommu::init(&mut com1, info.acpi_rsdp, pcie::read_config32);
         if iommu::translating() {
             let _ = writeln!(
                 com1,

@@ -26,21 +26,28 @@ extern crate alloc;
 
 pub use origin_sync as sync;
 
+pub mod acpi;
 pub mod addr;
+pub mod amdvi;
 pub mod apic;
+pub mod bitmap;
 pub mod clock;
 pub mod descriptors;
+pub mod dmar;
 pub mod features;
 pub mod frames;
 pub mod heap;
 pub mod irq;
+pub mod ivrs;
 pub mod limits;
 pub mod mmio;
 pub mod objref;
 pub mod once;
+pub mod pci;
 pub mod trap;
 pub mod unwind;
 pub mod usercopy;
+pub mod vtd;
 
 #[cfg(test)]
 mod testing;
@@ -50,12 +57,18 @@ pub mod cpu;
 #[cfg(target_os = "none")]
 pub mod dma;
 #[cfg(target_os = "none")]
+pub mod firmware;
+#[cfg(target_os = "none")]
+pub mod iommu;
+#[cfg(target_os = "none")]
 pub mod memory;
 #[cfg(target_os = "none")]
 pub mod monotonic;
 #[cfg(target_os = "none")]
 pub mod phys;
 pub mod port;
+#[cfg(target_os = "none")]
+pub mod proof_programs;
 #[cfg(target_os = "none")]
 pub mod stack;
 #[cfg(target_os = "none")]

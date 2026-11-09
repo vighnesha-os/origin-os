@@ -6,7 +6,7 @@
 //! of VT-d units (a DMAR), so drivers do not know which IOMMU they run behind.
 //!
 //! At boot, after PCIe enumeration and before any driver binds:
-//! 1. the ACPI DMAR names the remapping units (`framekernel::dmar`, checked whole);
+//! 1. the ACPI DMAR names the remapping units (`crate::dmar`, checked whole);
 //! 2. each unit's registers are mapped uncached and its capabilities read and checked;
 //! 3. queued invalidation is turned on; an empty root table is set and the context and
 //!    IOTLB caches are invalidated; where the unit and the platform support interrupt
@@ -31,30 +31,35 @@
 //! Faults are read from the fault-recording registers ([`take_faults`]); fault events stay
 //! masked (ADR-0007 D9). Every remapping structure is a zeroed kernel page kept for ever, and
 //! when the unit's walks do not snoop the caches (ECAP.C clear) every line written is flushed
-//! before the hardware can need it (D7). The `unsafe` here is volatile MMIO to the register
-//! set, volatile access to those pages, and CLFLUSH; each has a SAFETY note.
+//! before the hardware can need it (D7). The `unsafe` here is volatile access to those pages
+//! and CLFLUSH; each has a SAFETY note.
+//!
+//! Sound against safe callers (ADR-0011 N6, N12: IOMMU programming is the framework's): every
+//! remapping structure is private to this module, a domain's tables map only [`DmaFrame`]s
+//! (kept for ever, and never a Rust object), so no call in any order, with any argument, can give
+//! a device a reference to memory safe code holds; [`init`] runs once. A wrong interrupt route
+//! is a logic error of its caller: it can only deliver a vector the IDT has a gate for.
 
 use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::fmt::Write;
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{AtomicBool, Ordering, fence};
 
-use framekernel::amdvi;
-use framekernel::bitmap::Bitmap;
-use framekernel::dmar::{self, BridgeBuses, Dmar, IoApicScopeError, Requester};
-use framekernel::pci::{self, Address};
-use framekernel::vtd::{
+use crate::addr::{Iova, PhysAddr};
+use crate::amdvi;
+use crate::bitmap::Bitmap;
+use crate::dma::DmaFrame;
+use crate::dmar::{self, BridgeBuses, Dmar, IoApicScopeError, Requester};
+use crate::mmio::MmioRegion;
+use crate::once::SetOnce;
+use crate::pci::{self, Address};
+use crate::sync::SpinLock;
+use crate::vtd::{
     self, Access, Capability, ContextEntry, Descriptor, Drain, ExtCapability, FaultRecord,
     IovaWindow, Irte, MsiMessage, SourceCheck, TableMemory, fsts, gcmd, reg,
 };
-use origin_frame::addr::{Iova, PhysAddr};
-use origin_frame::dma::DmaFrame;
-use origin_frame::mmio::MmioRegion;
-use origin_frame::sync::SpinLock;
-
-use crate::console::Console;
 
 mod amd;
 
@@ -227,7 +232,7 @@ struct DomainState {
 
 /// A device's DMA domain, as drivers hold it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Domain(usize);
+pub struct Domain(usize);
 
 struct Iommu {
     dmar: Dmar<'static>,
@@ -240,6 +245,8 @@ struct Iommu {
 }
 
 static IOMMU: SpinLock<Option<Iommu>> = SpinLock::new(None);
+/// Whether [`init`] has run.
+static STARTED: AtomicBool = AtomicBool::new(false);
 /// What [`init`] established about the platform's IOMMUs.
 static STATUS: SpinLock<pci::IommuStatus> = SpinLock::new(pci::IommuStatus::NotRun);
 
@@ -249,7 +256,7 @@ const NOT_LISTED: &str = "table not listed in the XSDT";
 
 /// The table with signature `sig`, or `None` if the firmware does not list one: unlike
 /// `firmware::acpi_table`, this tells an absent table from one that cannot be read.
-pub(crate) fn acpi_table_if_listed(
+pub fn acpi_table_if_listed(
     rsdp: u64,
     sig: &[u8; 4],
 ) -> Result<Option<&'static [u8]>, &'static str> {
@@ -258,6 +265,19 @@ pub(crate) fn acpi_table_if_listed(
         Err(NOT_LISTED) => Ok(None),
         Err(why) => Err(why),
     }
+}
+
+/// Reads the 32-bit PCI configuration register at byte offset `register` of the function at
+/// the [`Address`]. The configuration space belongs to the PCIe layer above: what it answers
+/// only decides which IOMMU unit and which requester an attachment names, never what memory a
+/// domain can reach (a domain maps [`DmaFrame`]s and nothing else).
+pub type ConfigRead = fn(Address, u16) -> Option<u32>;
+
+/// How to read configuration space, given to [`init`].
+static CONFIG_READ: SetOnce<ConfigRead> = SetOnce::new();
+
+fn read_config32(at: Address, register: u16) -> Option<u32> {
+    CONFIG_READ.get().and_then(|read| read(at, register))
 }
 
 /// Bridge bus numbers from configuration space, for the DMAR's device-scope paths.
@@ -273,13 +293,13 @@ impl BridgeBuses for Config {
             device: b.device,
             function: b.function,
         };
-        let id = crate::pcie::read_config32(at, pci::register::ID)?;
-        let header = crate::pcie::read_config32(at, pci::register::HEADER)?;
+        let id = read_config32(at, pci::register::ID)?;
+        let header = read_config32(at, pci::register::HEADER)?;
         if id & 0xFFFF == 0xFFFF || (header >> 16) & 0x7F != 1 {
             return None;
         }
         // Type 1 header: primary, secondary and subordinate bus numbers at 18h.
-        let buses = crate::pcie::read_config32(at, 0x18)?;
+        let buses = read_config32(at, 0x18)?;
         Some((((buses >> 8) & 0xFF) as u8, ((buses >> 16) & 0xFF) as u8))
     }
 }
@@ -295,12 +315,12 @@ fn requester(at: Address) -> Requester {
 
 /// Spins until `done()` holds or [`TIMEOUT_NS`] passes; returns whether it held.
 fn poll(mut done: impl FnMut() -> bool) -> bool {
-    let deadline = crate::time::monotonic_nanos() + TIMEOUT_NS;
+    let deadline = crate::monotonic::monotonic_nanos() + TIMEOUT_NS;
     loop {
         if done() {
             return true;
         }
-        if crate::time::monotonic_nanos() > deadline {
+        if crate::monotonic::monotonic_nanos() > deadline {
             return done();
         }
         core::hint::spin_loop();
@@ -576,20 +596,25 @@ fn enable(unit: &mut Unit, remap: bool) -> Result<(), &'static str> {
 /// a platform with neither table is reported and left untranslated (the owner's decision,
 /// sheet item 9: internal devices may still bind). A table that exists but cannot be read is a
 /// failure, not an absence.
-pub(crate) fn init(com1: &mut Console, rsdp: u64) -> bool {
+pub fn init(com1: &mut dyn Write, rsdp: u64, config: ConfigRead) -> bool {
+    // Once: the hardware is brought up by the first call, and a later one must not disturb it.
+    if STARTED.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let _ = CONFIG_READ.set(config);
     let status = bring_up_all(com1, rsdp);
     crate::cpu::without_interrupts(|| *STATUS.lock() = status);
     status != pci::IommuStatus::Failed
 }
 
 /// What the kernel knows about the platform's IOMMUs.
-pub(crate) fn status() -> pci::IommuStatus {
+pub fn status() -> pci::IommuStatus {
     crate::cpu::without_interrupts(|| *STATUS.lock())
 }
 
 /// The physical ranges of every IOMMU's registers the firmware names, whether or not it came
 /// up: no BAR may overlap them. `Err` if a table that exists cannot be read.
-pub(crate) fn register_ranges(rsdp: u64) -> Result<Vec<(u64, u64)>, &'static str> {
+pub fn register_ranges(rsdp: u64) -> Result<Vec<(u64, u64)>, &'static str> {
     let mut ranges = Vec::new();
     if let Some(table) = acpi_table_if_listed(rsdp, b"DMAR")? {
         let dmar = dmar::parse(table).map_err(|_| "the DMAR is invalid")?;
@@ -605,9 +630,9 @@ pub(crate) fn register_ranges(rsdp: u64) -> Result<Vec<(u64, u64)>, &'static str
 }
 
 /// The VT-d or AMD-Vi bring-up itself, and what it found.
-fn bring_up_all(com1: &mut Console, rsdp: u64) -> pci::IommuStatus {
+fn bring_up_all(com1: &mut dyn Write, rsdp: u64) -> pci::IommuStatus {
     use pci::IommuStatus::{Absent, Failed, Translating};
-    let failed = |com1: &mut Console, why: &str| {
+    let failed = |com1: &mut dyn Write, why: &str| {
         let _ = writeln!(
             com1,
             "origin-kernel: IOMMU: the firmware's IOMMU tables cannot be read ({why}): IOMMU failed"
@@ -788,7 +813,7 @@ fn bring_up_all(com1: &mut Console, rsdp: u64) -> pci::IommuStatus {
 }
 
 /// Whether DMA remapping is on (drivers must then attach their devices).
-pub(crate) fn translating() -> bool {
+pub fn translating() -> bool {
     if amd::active() {
         return amd::translating();
     }
@@ -796,7 +821,7 @@ pub(crate) fn translating() -> bool {
 }
 
 /// Whether domain `d` is the one the PCI function at `at` was attached to.
-pub(crate) fn attached(d: Domain, at: Address) -> bool {
+pub fn attached(d: Domain, at: Address) -> bool {
     if amd::active() {
         return amd::attached(d, at);
     }
@@ -814,7 +839,7 @@ pub(crate) fn attached(d: Domain, at: Address) -> bool {
 /// domains, and AMD's specification (48882) does not say what such a function's Bus Master
 /// Enable does, so `pcie::quiesce` leaves these alone. The list comes from firmware, never
 /// from a device's class code: a device can claim to be any class.
-pub(crate) fn own_functions(rsdp: u64) -> Vec<Address> {
+pub fn own_functions(rsdp: u64) -> Vec<Address> {
     amd::own_functions(rsdp)
 }
 
@@ -1146,7 +1171,7 @@ impl Iommu {
 
 /// Attaches the PCI function at `at` to a domain of its own (created on first use): from
 /// then on its DMA is translated by that domain's tables, which map nothing until [`map`].
-pub(crate) fn attach(at: Address) -> Result<Domain, &'static str> {
+pub fn attach(at: Address) -> Result<Domain, &'static str> {
     if amd::active() {
         return amd::attach(at);
     }
@@ -1162,7 +1187,7 @@ pub(crate) fn attach(at: Address) -> Result<Domain, &'static str> {
 
 /// Maps the physical 4 KiB page `phys` into domain `d`, readable and writable by the
 /// device; returns the IOVA the device must use (never `phys` itself).
-pub(crate) fn map(d: Domain, frame: DmaFrame) -> Result<Iova, &'static str> {
+pub fn map(d: Domain, frame: DmaFrame) -> Result<Iova, &'static str> {
     let phys = frame.phys().raw();
     let iova = if amd::active() {
         amd::map(d, phys)?
@@ -1175,7 +1200,7 @@ pub(crate) fn map(d: Domain, frame: DmaFrame) -> Result<Iova, &'static str> {
 /// Unmaps `iova` from domain `d` and returns the page it mapped. When this returns, the
 /// IOMMU's translation cache no longer holds the translation, so the device cannot reach the
 /// page.
-pub(crate) fn unmap(d: Domain, iova: Iova) -> Result<u64, &'static str> {
+pub fn unmap(d: Domain, iova: Iova) -> Result<u64, &'static str> {
     if amd::active() {
         return amd::unmap(d, iova.raw());
     }
@@ -1189,7 +1214,7 @@ pub(crate) fn unmap(d: Domain, iova: Iova) -> Result<u64, &'static str> {
 }
 
 /// How domain `d`'s tables translate `iova`, walked in software as the hardware would.
-pub(crate) fn translate(d: Domain, iova: Iova) -> Option<(u64, Access)> {
+pub fn translate(d: Domain, iova: Iova) -> Option<(u64, Access)> {
     let iova = iova.raw();
     if amd::active() {
         return amd::translate(d, iova);
@@ -1213,7 +1238,7 @@ pub(crate) fn translate(d: Domain, iova: Iova) -> Option<(u64, Access)> {
 /// device's source ID, under AMD-Vi an index into the device's own table — and any 32-bit
 /// APIC ID where the IOMMU has x2APIC destinations. Without it: compatibility format, which
 /// reaches APIC IDs 0–255 only.
-pub(crate) fn msi_message(at: Address, apic: u32, vector: u8) -> Result<MsiMessage, &'static str> {
+pub fn msi_message(at: Address, apic: u32, vector: u8) -> Result<MsiMessage, &'static str> {
     if amd::active() {
         return amd::msi_message(at, apic, vector);
     }
@@ -1231,7 +1256,7 @@ pub(crate) fn msi_message(at: Address, apic: u32, vector: u8) -> Result<MsiMessa
 }
 
 /// Whether interrupts are remapped.
-pub(crate) fn remapping() -> bool {
+pub fn remapping() -> bool {
     if amd::active() {
         return amd::translating();
     }
@@ -1240,7 +1265,7 @@ pub(crate) fn remapping() -> bool {
 
 /// Where a message from `at` goes, read back from its IRTE: `None` unless `m` is a handle to
 /// a present IRTE in the form `msi_message` writes.
-pub(crate) fn route(at: Address, m: MsiMessage) -> Option<Route> {
+pub fn route(at: Address, m: MsiMessage) -> Option<Route> {
     if amd::active() {
         return amd::route(at, m);
     }
@@ -1250,7 +1275,7 @@ pub(crate) fn route(at: Address, m: MsiMessage) -> Option<Route> {
 /// Allocates an IRTE on `at`'s unit and leaves it **not present**: a message through it is
 /// blocked and recorded as a fault (for the interrupt-remapping proof). Returns the message
 /// and the index.
-pub(crate) fn reserve_blocked_interrupt(at: Address) -> Result<(MsiMessage, u16), &'static str> {
+pub fn reserve_blocked_interrupt(at: Address) -> Result<(MsiMessage, u16), &'static str> {
     if amd::active() {
         return amd::reserve_blocked_interrupt(at);
     }
@@ -1264,7 +1289,7 @@ pub(crate) fn reserve_blocked_interrupt(at: Address) -> Result<(MsiMessage, u16)
 }
 
 /// Clears IRTE `index` on `at`'s unit, invalidates its cache entry and frees it.
-pub(crate) fn release_interrupt(at: Address, index: u16) -> Result<(), &'static str> {
+pub fn release_interrupt(at: Address, index: u16) -> Result<(), &'static str> {
     if amd::active() {
         return amd::release_interrupt(at, index);
     }
@@ -1282,15 +1307,15 @@ pub(crate) fn release_interrupt(at: Address, index: u16) -> Result<(), &'static 
 
 /// An I/O APIC pin routed through an IRTE ([`route_ioapic_pin`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PinRoute {
+pub struct PinRoute {
     /// The unit whose table holds the entry.
     unit: usize,
     /// The IRTE index: the handle the pin's remappable-format redirection entry carries.
-    pub(crate) index: u16,
+    pub index: u16,
     /// The I/O APIC's source ID, from its DMAR device scope: what the IRTE checks.
-    pub(crate) source_id: u16,
+    pub source_id: u16,
     /// The entry as written.
-    pub(crate) entry: Irte,
+    pub entry: Irte,
 }
 
 /// Routes a pin of the I/O APIC whose ID (MADT and DMAR enumeration ID) is `ioapic` through
@@ -1302,7 +1327,7 @@ pub(crate) struct PinRoute {
 /// redirection entry in remappable format with the returned index. Refused under AMD-Vi
 /// (not yet: [`routes_ioapic_pins`]), when interrupts are not remapped, or when the DMAR
 /// lists no unit for this I/O APIC.
-pub(crate) fn route_ioapic_pin(
+pub fn route_ioapic_pin(
     ioapic: u8,
     apic: u32,
     vector: u8,
@@ -1322,7 +1347,7 @@ pub(crate) fn route_ioapic_pin(
 }
 
 /// The IRTE of `pin` as its unit's table holds it now; `None` if it is not present.
-pub(crate) fn pin_irte(pin: &PinRoute) -> Option<Irte> {
+pub fn pin_irte(pin: &PinRoute) -> Option<Irte> {
     crate::cpu::without_interrupts(|| {
         let g = IOMMU.lock();
         let irt = g.as_ref()?.units.get(pin.unit)?.irt.as_ref()?;
@@ -1334,7 +1359,7 @@ pub(crate) fn pin_irte(pin: &PinRoute) -> Option<Irte> {
 /// For the proofs: rewrites `pin`'s IRTE as `entry` (`None`: not present) and invalidates
 /// its cache entry, so the next message through it sees the change. `Some(pin.entry)`
 /// restores the route.
-pub(crate) fn rewrite_pin(pin: &PinRoute, entry: Option<Irte>) -> Result<(), &'static str> {
+pub fn rewrite_pin(pin: &PinRoute, entry: Option<Irte>) -> Result<(), &'static str> {
     crate::cpu::without_interrupts(|| {
         let mut g = IOMMU.lock();
         let s = g.as_mut().ok_or("no IOMMU")?;
@@ -1354,7 +1379,7 @@ pub(crate) fn rewrite_pin(pin: &PinRoute, entry: Option<Irte>) -> Result<(), &'s
 
 /// Clears `pin`'s IRTE, invalidates its cache entry and frees it. Mask the pin's
 /// redirection entry first: a message through a cleared IRTE is blocked and recorded.
-pub(crate) fn release_pin(pin: &PinRoute) -> Result<(), &'static str> {
+pub fn release_pin(pin: &PinRoute) -> Result<(), &'static str> {
     crate::cpu::without_interrupts(|| {
         let mut g = IOMMU.lock();
         let s = g.as_mut().ok_or("no IOMMU")?;
@@ -1370,13 +1395,13 @@ pub(crate) fn release_pin(pin: &PinRoute) -> Result<(), &'static str> {
 /// interrupt remapping on. Not yet under AMD-Vi, where the I/O APIC's device table entry
 /// (DeviceID 00A0h in QEMU's IVRS) blocks its fixed interrupts until it is given an
 /// interrupt table of its own (ADR-0007).
-pub(crate) fn routes_ioapic_pins() -> bool {
+pub fn routes_ioapic_pins() -> bool {
     !amd::active() && remapping()
 }
 
 /// Reads and clears every unit's recorded faults; returns them and whether any were lost (a
 /// VT-d recording register was still full, or an AMD-Vi event log overflowed).
-pub(crate) fn take_faults() -> (Vec<Fault>, bool) {
+pub fn take_faults() -> (Vec<Fault>, bool) {
     if amd::active() {
         return amd::take_faults();
     }
@@ -1398,16 +1423,16 @@ pub(crate) fn take_faults() -> (Vec<Fault>, bool) {
 
 /// One attached device, for the report.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct DomainInfo {
-    pub(crate) at: Address,
-    pub(crate) id: u16,
-    pub(crate) mapped: u64,
-    pub(crate) mapped_ever: u64,
-    pub(crate) tables: u64,
+pub struct DomainInfo {
+    pub at: Address,
+    pub id: u16,
+    pub mapped: u64,
+    pub mapped_ever: u64,
+    pub tables: u64,
 }
 
 /// Every attached device's domain, and the IRTEs in use on all units.
-pub(crate) fn domains() -> (Vec<DomainInfo>, usize) {
+pub fn domains() -> (Vec<DomainInfo>, usize) {
     if amd::active() {
         return amd::domains();
     }
@@ -1442,7 +1467,7 @@ pub(crate) fn domains() -> (Vec<DomainInfo>, usize) {
 }
 
 /// The 16-bit source ID (AMD-Vi: DeviceID) the function at `at`'s requests carry.
-pub(crate) fn source_id(at: Address) -> u16 {
+pub fn source_id(at: Address) -> u16 {
     if amd::active() {
         return amd::source_id(at);
     }
@@ -1451,21 +1476,21 @@ pub(crate) fn source_id(at: Address) -> u16 {
 
 /// Where an interrupt from a device goes, read back from its IRTE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Route {
+pub struct Route {
     /// The IRTE's index (in the unit's table under VT-d, in the device's own table under
     /// AMD-Vi).
-    pub(crate) index: u16,
-    pub(crate) vector: u8,
+    pub index: u16,
+    pub vector: u8,
     /// The destination APIC ID.
-    pub(crate) destination: u32,
+    pub destination: u32,
     /// Only the device can use the IRTE: VT-d checks its source ID; AMD-Vi reaches the
     /// table only through the device's own device table entry.
-    pub(crate) source_checked: bool,
+    pub source_checked: bool,
 }
 
 /// What a recorded fault was about, whichever IOMMU recorded it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FaultKind {
+pub enum FaultKind {
     /// A DMA to a page its domain does not map for that access (VT-d reasons 5 and 6, where
     /// not-present and not-writable read the same; AMD-Vi an I/O page fault with PR clear).
     PageNotMapped,
@@ -1479,26 +1504,26 @@ pub(crate) enum FaultKind {
 
 /// The IOMMU's own record of a fault.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Detail {
+pub enum Detail {
     Vtd(FaultRecord),
     Amd(amdvi::Event),
 }
 
 /// One recorded fault.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Fault {
+pub struct Fault {
     /// The requester ID (DeviceID) the request carried.
-    pub(crate) source_id: u16,
+    pub source_id: u16,
     /// An interrupt request (else a DMA).
-    pub(crate) interrupt: bool,
+    pub interrupt: bool,
     /// The device address of a DMA (AMD-Vi: also of an interrupt).
-    pub(crate) address: u64,
+    pub address: u64,
     /// The IRTE index of an interrupt fault, where the IOMMU records it (VT-d).
-    pub(crate) interrupt_index: Option<u16>,
+    pub interrupt_index: Option<u16>,
     /// A write, where the IOMMU says.
-    pub(crate) write: Option<bool>,
-    pub(crate) kind: FaultKind,
-    pub(crate) detail: Detail,
+    pub write: Option<bool>,
+    pub kind: FaultKind,
+    pub detail: Detail,
 }
 
 impl Fault {
@@ -1580,7 +1605,7 @@ impl core::fmt::Display for Fault {
 
 /// A fault the proofs looked for, or "none".
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Recorded(pub(crate) Option<Fault>);
+pub struct Recorded(pub Option<Fault>);
 
 impl core::fmt::Display for Recorded {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1592,7 +1617,7 @@ impl core::fmt::Display for Recorded {
 }
 
 /// How MSI-X entries name their IRTE under the running IOMMU, for the proofs' report.
-pub(crate) fn routing_words() -> &'static str {
+pub fn routing_words() -> &'static str {
     if amd::active() {
         "hold only an index into their device's own interrupt remapping table, whose IRTE holds the vector and the x2APIC destination"
     } else {
@@ -1601,7 +1626,7 @@ pub(crate) fn routing_words() -> &'static str {
 }
 
 /// What an unmap waited for, for the proofs' report.
-pub(crate) fn unmap_words() -> &'static str {
+pub fn unmap_words() -> &'static str {
     if amd::active() {
         "the translation cache invalidated page-selectively and the completion awaited"
     } else {
@@ -1615,7 +1640,7 @@ pub(crate) fn unmap_words() -> &'static str {
 /// one on its stderr), so under AMD-Vi the proof requires only that the interrupt was not
 /// delivered, and the boot test expects the record to be absent: a QEMU that starts logging is
 /// noticed. Hardware qualification must require the record (§74).
-pub(crate) fn interrupt_record_required() -> bool {
+pub fn interrupt_record_required() -> bool {
     !amd::active()
 }
 
@@ -1626,12 +1651,12 @@ pub(crate) fn interrupt_record_required() -> bool {
 /// So under AMD-Vi the proof also accepts address 0 — never another address — and the boot
 /// test expects 0: a QEMU that starts recording the address is noticed. Hardware
 /// qualification must require the address (§74).
-pub(crate) fn fault_address_required() -> bool {
+pub fn fault_address_required() -> bool {
     !amd::active()
 }
 
 /// What confines an unattached device, for the proofs' report.
-pub(crate) fn default_deny_words() -> &'static str {
+pub fn default_deny_words() -> &'static str {
     if amd::active() {
         "every other function's device table entry blocks its DMA and fixed interrupts"
     } else {

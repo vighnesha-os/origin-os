@@ -7,6 +7,7 @@
 //!
 //! Padding bits past `len` in the final word are kept permanently set, so they are never
 //! handed out and the free counter stays exact.
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 use alloc::vec::Vec;

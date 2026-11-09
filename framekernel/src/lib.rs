@@ -100,11 +100,8 @@
 
 extern crate alloc;
 
-pub mod acpi;
-pub mod amdvi;
 pub mod apstart;
 pub mod base64;
-pub mod bitmap;
 pub mod blockcache;
 pub mod boot;
 pub mod cache;
@@ -112,7 +109,6 @@ pub mod channel;
 pub mod cpumap;
 pub mod deflate;
 pub mod dhcp;
-pub mod dmar;
 pub mod dns;
 pub mod editbuffer;
 pub mod entropy;
@@ -125,16 +121,17 @@ pub mod hashmap;
 pub mod hpet;
 pub mod initramfs;
 pub mod ioapic;
-pub mod ivrs;
 pub mod json;
 pub mod klog;
 pub mod net;
 pub mod numa;
 pub mod nvme;
 pub mod originfs;
-pub use origin_frame::{apic, clock, descriptors, features, frames, heap, unwind, usercopy};
+pub use origin_frame::{
+    acpi, amdvi, apic, bitmap, clock, descriptors, dmar, features, frames, heap, ivrs, pci, unwind,
+    usercopy, vtd,
+};
 pub use origin_paging as paging;
-pub mod pci;
 pub mod ps2;
 pub mod raster;
 pub mod report;
@@ -158,4 +155,3 @@ pub mod utf16;
 pub mod vfs;
 pub mod virtio;
 pub mod virtqueue;
-pub mod vtd;
