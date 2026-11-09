@@ -614,6 +614,20 @@ fn kvm_pin_markers(scenario: &mut Scenario) {
     }
 }
 
+/// Whether a boot's processor says it is Intel's: a `vendor=` in the model decides. Without
+/// one, TCG's `max` is AMD's, and under KVM the processor reports the host's vendor.
+fn guest_is_intel(model: &str, accel: Accel, host_is_intel: bool) -> bool {
+    if model.contains("vendor=") {
+        return model.contains("vendor=GenuineIntel");
+    }
+    accel == Accel::Kvm && host_is_intel
+}
+
+/// Whether this host's processor is Intel's (read only for KVM, which needs a Linux host).
+fn host_is_intel() -> bool {
+    fs::read_to_string("/proc/cpuinfo").is_ok_and(|info| info.contains("GenuineIntel"))
+}
+
 /// True for a line reporting a failure under KVM that says nothing about the kernel. Every
 /// other failure fails the boot.
 fn kvm_forgives(line: &str) -> bool {
@@ -1009,7 +1023,11 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(topology_markers(
             machine,
             machine.geometry.has_extended_levels()
-                && qemu_cpu_model().contains("vendor=GenuineIntel"),
+                && guest_is_intel(
+                    &qemu_cpu_model(),
+                    Accel::from_env().unwrap_or(Accel::Tcg),
+                    host_is_intel(),
+                ),
         ))
         .chain([
             // NUMA from the ACPI SRAT (QEMU is booted with two -numa nodes): every online
@@ -4191,6 +4209,24 @@ mod tests {
         assert!(Accel::named(Some("hvf")).is_err());
         assert_eq!(Accel::Tcg.machine(), "q35");
         assert_eq!(Accel::Kvm.machine(), "q35,accel=kvm,kernel-irqchip=split");
+    }
+
+    #[test]
+    fn the_guest_is_intel_when_its_model_or_under_kvm_its_host_says_so() {
+        // A vendor in the model decides, on any host.
+        for host in [false, true] {
+            for accel in [Accel::Tcg, Accel::Kvm] {
+                assert!(guest_is_intel("max,vendor=GenuineIntel", accel, host));
+                assert!(!guest_is_intel("max,vendor=AuthenticAMD", accel, host));
+            }
+        }
+        // TCG's `max` is AMD's, whatever runs it.
+        assert!(!guest_is_intel("max", Accel::Tcg, true));
+        assert!(!guest_is_intel("max", Accel::Tcg, false));
+        // Under KVM, the host's.
+        assert!(guest_is_intel("max", Accel::Kvm, true));
+        assert!(!guest_is_intel("max", Accel::Kvm, false));
+        assert!(guest_is_intel("host", Accel::Kvm, true));
     }
 
     /// As the kernel printed them on a real AMD EPYC (Actions run 42547942738).
