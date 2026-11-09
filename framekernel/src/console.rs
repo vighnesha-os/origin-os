@@ -26,233 +26,149 @@
 //! Interrupts stay disabled while a line is sent. In QEMU that is microseconds; at 115 200
 //! baud on real hardware it is about 9 ms for 100 bytes. Production logging will go to a
 //! memory ring drained by a thread; this serial console is for development (CLAUDE.md §69).
+#![forbid(unsafe_code)]
 
-use core::cell::UnsafeCell;
 use core::fmt;
-use core::mem::MaybeUninit;
-use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use framekernel::fbconsole::{Cursor, PixelSink, Screen, ScreenError};
-use framekernel::paging::layout;
-use framekernel::serial::{
+use crate::fbconsole::{Cursor, PixelSink, Screen, ScreenError};
+use crate::paging::layout;
+use crate::serial::{
     DIVISOR, EarlyLog, LCR_8N1, LineSettings, LineSetup, Register, Uart16550, UartRegisters,
 };
-use framekernel::spcr::{self, Access, Spcr, UartAddress};
+use crate::spcr::{self, Access, Spcr, UartAddress};
 use origin_boot_info::{BootInfo, Framebuffer, MemoryRegion, overlaps_ram};
-use origin_sync::SpinLock;
+use origin_frame::addr::PhysAddr;
+use origin_frame::mmio::MmioRegion;
+use origin_frame::once::SetOnce;
+use origin_frame::port::PortRange;
+use origin_frame::sync::SpinLock;
 
 use crate::COM1_BASE;
 
 /// How the kernel reaches a UART's registers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum KernelUart {
     /// Port-mapped, one byte apart.
-    Port(u16),
+    Port(PortRange),
     /// In the MMIO window: `stride` bytes between registers, each access `access` wide.
     Mmio {
-        base: u64,
+        region: MmioRegion,
         stride: u8,
         access: Access,
     },
+    /// No usable UART: reads as all ones, like a floating bus; writes go nowhere.
+    Absent,
+}
+
+/// COM1's ports, claimed at the first use of the UART (idempotent).
+static COM1_PORTS: SetOnce<PortRange> = SetOnce::new();
+
+fn com1_ports() -> Option<PortRange> {
+    if let Some(&ports) = COM1_PORTS.get() {
+        return Some(ports);
+    }
+    if let Some(ports) = PortRange::claim(COM1_BASE, 8) {
+        let _ = COM1_PORTS.set(ports);
+    }
+    COM1_PORTS.get().copied()
 }
 
 impl KernelUart {
-    /// The UART at I/O port `base`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must run at CPL 0. The ports `base` to `base + 7` are written and read as
-    /// a UART; the caller must have no reason to think something else lives there (COM1 by
-    /// the PC platform's convention, or a port the SPCR named and `spcr::parse` allowed).
-    pub(crate) const unsafe fn port(base: u16) -> Self {
-        Self::Port(base)
+    /// The PC's COM1 UART (claimed once, here).
+    pub(crate) fn com1() -> Self {
+        com1_ports().map_or(Self::Absent, Self::Port)
     }
 
-    /// The UART whose registers start at the kernel virtual address `base`.
-    ///
-    /// # Safety
-    ///
-    /// `[base, base + 8 * stride)` must be mapped uncached, read/write and belong to the
-    /// UART `spcr::parse` accepted: it is written and read as one, and nothing else uses it.
-    pub(crate) const unsafe fn mmio(base: u64, stride: u8, access: Access) -> Self {
-        Self::Mmio {
-            base,
-            stride,
-            access,
+    /// The UART at I/O port `base`, if the ports can be claimed (a port the SPCR named and
+    /// `spcr::parse` allowed; COM1 keeps its one claim).
+    fn port(base: u16) -> Option<Self> {
+        if base == COM1_BASE {
+            return com1_ports().map(Self::Port);
         }
+        PortRange::claim(base, 8).map(Self::Port)
     }
 
-    /// `(word, shape)`, for [`UNOWNED`].
-    fn pack(self) -> (u64, u64) {
-        match self {
-            Self::Port(port) => (u64::from(port), 0),
-            Self::Mmio {
-                base,
-                stride,
-                access,
-            } => (
-                base,
-                u64::from(stride) << 8
-                    | match access {
-                        Access::Byte => 1,
-                        Access::Word => 2,
-                        Access::Dword => 3,
-                    },
-            ),
-        }
-    }
-
-    fn unpack(word: u64, shape: u64) -> Self {
-        let access = match shape & 0xFF {
-            0 => return Self::Port(word as u16),
-            1 => Access::Byte,
-            2 => Access::Word,
-            _ => Access::Dword,
-        };
-        Self::Mmio {
-            base: word,
-            stride: (shape >> 8) as u8,
-            access,
-        }
-    }
-
-    /// The address of register `reg` in the MMIO window.
-    fn register(base: u64, stride: u8, reg: Register) -> *mut u8 {
-        ptr::with_exposed_provenance_mut(
-            (base + u64::from(reg.offset()) * u64::from(stride)) as usize,
-        )
+    /// Whether this is COM1 at its usual port.
+    fn is_com1(self) -> bool {
+        matches!(self, Self::Port(ports) if ports.base() == COM1_BASE)
     }
 }
 
 impl UartRegisters for KernelUart {
     fn read(&mut self, reg: Register) -> u8 {
         match *self {
-            // SAFETY: `port`'s contract: CPL 0 and these are this UART's ports, which cannot
-            // affect memory.
-            Self::Port(base) => unsafe { crate::inb(base + reg.offset()) },
+            Self::Port(ports) => ports.read8(reg.offset()),
             Self::Mmio {
-                base,
+                region,
                 stride,
                 access,
             } => {
-                let at = Self::register(base, stride, reg);
+                let at = usize::from(reg.offset()) * usize::from(stride);
                 match access {
-                    // SAFETY: `mmio`'s contract: this is a mapped register of this UART.
-                    Access::Byte => unsafe { at.read_volatile() },
-                    // SAFETY: as above; `spcr::parse` checked the alignment for this access.
-                    Access::Word => unsafe { at.cast::<u16>().read_volatile() as u8 },
-                    // SAFETY: as above.
-                    Access::Dword => unsafe { at.cast::<u32>().read_volatile() as u8 },
+                    Access::Byte => region.read8(at),
+                    Access::Word => region.read16(at) as u8,
+                    Access::Dword => region.read32(at) as u8,
                 }
             }
+            Self::Absent => 0xFF,
         }
     }
 
     fn write(&mut self, reg: Register, value: u8) {
         match *self {
-            // SAFETY: as for `read`.
-            Self::Port(base) => unsafe { crate::outb(base + reg.offset(), value) },
+            Self::Port(ports) => ports.write8(reg.offset(), value),
             Self::Mmio {
-                base,
+                region,
                 stride,
                 access,
             } => {
-                let at = Self::register(base, stride, reg);
+                let at = usize::from(reg.offset()) * usize::from(stride);
                 match access {
-                    // SAFETY: `mmio`'s contract: this is a mapped register of this UART.
-                    Access::Byte => unsafe { at.write_volatile(value) },
-                    // SAFETY: as above; `spcr::parse` checked the alignment for this access.
-                    Access::Word => unsafe { at.cast::<u16>().write_volatile(u16::from(value)) },
-                    // SAFETY: as above.
-                    Access::Dword => unsafe { at.cast::<u32>().write_volatile(u32::from(value)) },
+                    Access::Byte => region.write8(at, value),
+                    Access::Word => region.write16(at, u16::from(value)),
+                    Access::Dword => region.write32(at, u32::from(value)),
                 }
             }
+            Self::Absent => {}
         }
     }
 }
 
-/// The framebuffer as a pixel sink: 32-bit volatile writes at its mapped address.
+/// The framebuffer as a pixel sink: 32-bit volatile writes through its typed region.
 #[derive(Clone, Copy, Debug)]
 struct FramebufferMemory {
-    first_pixel: u64,
-    bytes: usize,
+    region: MmioRegion,
 }
 
 impl PixelSink for FramebufferMemory {
     fn write32(&mut self, offset: usize, value: u32) {
-        let Some(end) = offset.checked_add(4) else {
-            return;
-        };
-        if end > self.bytes || !offset.is_multiple_of(4) {
-            return;
-        }
-        let at = ptr::with_exposed_provenance_mut::<u32>(self.first_pixel as usize + offset);
-        // SAFETY: `attach_framebuffer` checked the framebuffer's description and that its
-        // first page is mapped uncached and writable at `first_pixel`; `layout::build` maps
-        // the visible rows, so every byte below `self.bytes` is mapped, and this write is
-        // inside them, 4-byte aligned (both checked above). Video memory has no Rust object
-        // on it and no side effects a pixel write could harm.
-        unsafe { at.write_volatile(value) };
+        self.region.write32(offset, value);
     }
 }
 
-/// The screen, set at most once.
-struct ScreenCell {
-    ready: AtomicBool,
-    value: UnsafeCell<MaybeUninit<(Screen, FramebufferMemory)>>,
+/// The framebuffer console, once [`attach_framebuffer`] has run (set once; the kernel's own
+/// page tables may then force [`withdraw_framebuffer`]).
+static SCREEN: SetOnce<(Screen, FramebufferMemory)> = SetOnce::new();
+/// The screen was withdrawn: the kernel's tables could not map the framebuffer.
+static SCREEN_WITHDRAWN: AtomicBool = AtomicBool::new(false);
+
+/// The screen, unless it is unset or was withdrawn.
+fn screen() -> Option<(Screen, FramebufferMemory)> {
+    if SCREEN_WITHDRAWN.load(Ordering::Acquire) {
+        return None;
+    }
+    SCREEN.get().copied()
 }
-
-// SAFETY: `value` is written only by `set`, which runs once on the boot processor before any
-// other processor is started, before `ready` is released. It is read only after `ready` is
-// acquired and never written again, and the value is `Copy` data, so readers never race a
-// write. `withdraw` only clears `ready`.
-unsafe impl Sync for ScreenCell {}
-
-impl ScreenCell {
-    const fn new() -> Self {
-        Self {
-            ready: AtomicBool::new(false),
-            value: UnsafeCell::new(MaybeUninit::uninit()),
-        }
-    }
-
-    /// Stores the screen. Runs once, on the boot processor, before the application processors
-    /// exist.
-    fn set(&self, screen: Screen, memory: FramebufferMemory) {
-        // SAFETY: nothing reads `value` before `ready` is set below, and `set` runs once.
-        unsafe { (*self.value.get()).write((screen, memory)) };
-        self.ready.store(true, Ordering::Release);
-    }
-
-    /// The screen, unless it is unset or was withdrawn.
-    fn get(&self) -> Option<(Screen, FramebufferMemory)> {
-        if !self.ready.load(Ordering::Acquire) {
-            return None;
-        }
-        // SAFETY: `ready` was set after `value` was written, and `value` is never written
-        // again (see the `Sync` implementation), so this shared reference aliases nothing
-        // that is being mutated.
-        let value = unsafe { &*self.value.get() };
-        // SAFETY: as above, `value` was fully written by `set` before `ready` was set.
-        Some(unsafe { value.assume_init() })
-    }
-
-    fn withdraw(&self) {
-        self.ready.store(false, Ordering::Release);
-    }
-}
-
-/// The framebuffer console, once [`attach_framebuffer`] has run.
-static SCREEN: ScreenCell = ScreenCell::new();
 /// Where the next glyph goes, kept outside every lock for urgent reports (see the module
 /// documentation).
 static CURSOR: Cursor = Cursor::new();
 
-/// The UART an urgent report writes to when it cannot take the console lock, as
-/// `(word, shape)` (see [`KernelUart::pack`]): COM1 until [`adopt_firmware_uart`] moves it.
-/// Written only while the boot processor runs alone.
-static UNOWNED: [AtomicU64; 2] = [AtomicU64::new(COM1_BASE as u64), AtomicU64::new(0)];
+/// The UART an urgent report writes to when it cannot take the console lock: COM1 until
+/// [`adopt_firmware_uart`] moves it. Written only while the boot processor runs alone.
+static MOVED_UART: SetOnce<KernelUart> = SetOnce::new();
+/// The move was undone (the new UART took no bytes): back to COM1.
+static FELL_BACK_TO_COM1: AtomicBool = AtomicBool::new(false);
 
 /// Bytes of output kept for the UART that [`adopt_firmware_uart`] moves to.
 const EARLY_BYTES: usize = 8 * 1024;
@@ -337,7 +253,7 @@ static DRAW_WORST: AtomicU64 = AtomicU64::new(0);
 
 /// Draws `bytes` on the framebuffer, if there is one.
 fn draw(bytes: &[u8]) {
-    if let Some((screen, mut memory)) = SCREEN.get() {
+    if let Some((screen, mut memory)) = screen() {
         let start = crate::cpu::rdtsc();
         screen.write(&CURSOR, &mut memory, bytes);
         let cycles = crate::cpu::rdtsc().wrapping_sub(start);
@@ -386,11 +302,8 @@ fn screen_for(
     if overlaps_ram(regions, framebuffer.base, framebuffer.visible_bytes()) {
         return Err(Unusable::OverlapsRam);
     }
-    let memory = FramebufferMemory {
-        first_pixel: framebuffer.virtual_base,
-        bytes: framebuffer.visible_bytes() as usize,
-    };
-    Ok((screen, memory))
+    let region = crate::vm::framebuffer_region(framebuffer, regions).ok_or(Unusable::Misplaced)?;
+    Ok((screen, FramebufferMemory { region }))
 }
 
 /// Starts drawing on the firmware's framebuffer, if the loader passed a usable one. Called
@@ -408,7 +321,7 @@ pub(crate) fn attach_framebuffer(out: &mut Console, info: &BootInfo, regions: &[
     }
     match screen_for(&framebuffer, regions) {
         Ok((screen, mut memory)) => {
-            SCREEN.set(screen, memory);
+            let _ = SCREEN.set((screen, memory));
             screen.clear(&CURSOR, &mut memory);
             let _ = writeln!(
                 out,
@@ -444,12 +357,12 @@ pub(crate) fn withdraw_framebuffer(out: &mut Console) {
         out,
         "origin-kernel: console: the kernel's page tables cannot map the framebuffer; output goes to the UART only"
     );
-    SCREEN.withdraw();
+    SCREEN_WITHDRAWN.store(true, Ordering::Release);
 }
 
 /// Whether the console draws on the framebuffer.
 pub(crate) fn has_screen() -> bool {
-    SCREEN.get().is_some()
+    screen().is_some()
 }
 
 /// Moves the console's UART to the one the firmware names in its ACPI SPCR table, when it names
@@ -534,8 +447,7 @@ impl fmt::Display for Named<'_> {
 /// Maps the UART `spcr` names and checks something answers there.
 fn uart_for(spcr: &Spcr, regions: &[MemoryRegion]) -> Result<KernelUart, &'static str> {
     let uart = match spcr.address {
-        // SAFETY: CPL 0; `spcr::parse` kept the system's own ports out of the UART's block.
-        UartAddress::Port(port) => unsafe { KernelUart::port(port) },
+        UartAddress::Port(port) => KernelUart::port(port).ok_or("its ports are not available")?,
         UartAddress::Mmio {
             base,
             stride,
@@ -544,11 +456,13 @@ fn uart_for(spcr: &Spcr, regions: &[MemoryRegion]) -> Result<KernelUart, &'stati
             if overlaps_ram(regions, base, spcr.address.span()) {
                 return Err("its registers are in RAM");
             }
-            let virt = crate::vm::map_mmio(base, spcr.address.span())
+            let region = crate::vm::map_mmio(PhysAddr::new(base), spcr.address.span())
                 .map_err(|_| "its registers cannot be mapped")?;
-            // SAFETY: `map_mmio` mapped these registers uncached and read/write, and the
-            // memory map just said they are not RAM.
-            unsafe { KernelUart::mmio(virt, stride, access) }
+            KernelUart::Mmio {
+                region,
+                stride,
+                access,
+            }
         }
     };
     let mut probe = uart;
@@ -603,7 +517,7 @@ fn move_to(out: &mut Console, spcr: &Spcr, uart: KernelUart) {
 /// old one stays. Returns the speed setup used, the bytes replayed, the bytes that did not
 /// fit in the log, and whether the console stayed where it was.
 fn move_uart(sinks: &mut Sinks, spcr: &Spcr, uart: KernelUart) -> (LineSetup, usize, u64, bool) {
-    let same_port = matches!(uart, KernelUart::Port(COM1_BASE));
+    let same_port = uart.is_com1();
     let mut new = Uart16550::new(uart);
     // COM1 is the UART the console has been writing to: its latch was read before the
     // console's own programming, so the firmware's value is the one that counts. Elsewhere,
@@ -634,16 +548,14 @@ fn move_uart(sinks: &mut Sinks, spcr: &Spcr, uart: KernelUart) -> (LineSetup, us
         new.configure(setup);
         true
     };
-    let (word, shape) = uart.pack();
     if !same_port {
         sinks.uart = new;
-        UNOWNED[0].store(word, Ordering::Release);
-        UNOWNED[1].store(shape, Ordering::Release);
+        let _ = MOVED_UART.set(uart);
         sinks.uart_alive = true;
     }
     // A new UART, or a new speed on the same one: the log so far has not been readable there.
     // Send it again. If a new UART will not take it, the old one stays.
-    let log = core::mem::replace(&mut sinks.early, EarlyLog::new());
+    let log = core::mem::take(&mut sinks.early);
     sinks.early_open = false;
     let dropped = log.dropped();
     let mut replayed = 0;
@@ -652,8 +564,7 @@ fn move_uart(sinks: &mut Sinks, spcr: &Spcr, uart: KernelUart) -> (LineSetup, us
             Ok(()) => replayed = log.as_bytes().len(),
             Err(_) if !same_port => {
                 sinks.uart = unowned_com1();
-                UNOWNED[0].store(u64::from(COM1_BASE), Ordering::Release);
-                UNOWNED[1].store(0, Ordering::Release);
+                FELL_BACK_TO_COM1.store(true, Ordering::Release);
                 sinks.uart_alive = true;
                 return (setup, 0, dropped, true);
             }
@@ -728,23 +639,18 @@ impl Console {
 
 /// COM1, as the console left it: for the move that did not work.
 fn unowned_com1() -> Uart16550<KernelUart> {
-    // SAFETY: CPL 0; COM1 is the console's own UART, and only `move_uart`, under the console
-    // lock, comes back to it.
-    Uart16550::new(unsafe { KernelUart::port(COM1_BASE) })
+    Uart16550::new(KernelUart::com1())
 }
 
 /// The console's UART outside the console's own state: for urgent reports that cannot get
-/// the lock, and to program the UART for a report made before [`init`].
+/// the lock, and to program the UART for a report made before [`init`]. The worst a concurrent
+/// writer can then cause is mixed bytes on the line.
 fn unowned_uart() -> Uart16550<KernelUart> {
-    let (word, shape) = (
-        UNOWNED[0].load(Ordering::Acquire),
-        UNOWNED[1].load(Ordering::Acquire),
-    );
-    // SAFETY: CPL 0. Used only under the console lock before `init`, or by an urgent
-    // report that could not get the lock; the worst a concurrent writer can then cause is
-    // mixed bytes on the line, never memory unsafety, since `UNOWNED` only ever holds this
-    // UART's ports or its uncached register mapping.
-    Uart16550::new(KernelUart::unpack(word, shape))
+    let uart = match (FELL_BACK_TO_COM1.load(Ordering::Acquire), MOVED_UART.get()) {
+        (false, Some(&uart)) => uart,
+        _ => KernelUart::com1(),
+    };
+    Uart16550::new(uart)
 }
 
 impl fmt::Write for Console {
@@ -768,6 +674,34 @@ impl fmt::Write for Console {
 impl Drop for Console {
     fn drop(&mut self) {
         self.flush();
+    }
+}
+
+/// One exception report, from the trap entry's hook: it gets out even if this processor
+/// faulted inside the console.
+pub(crate) fn report_exception(r: &origin_frame::trap::ExceptionReport<'_>) {
+    use crate::descriptors::exception_name;
+    use core::fmt::Write as _;
+    let mut com1 = Console::urgent();
+    let _ = writeln!(
+        com1,
+        "origin-kernel: exception {} ({}) at rip {:#x}, error code {:#x}",
+        r.vector,
+        exception_name(r.vector),
+        r.rip,
+        r.error_code
+    );
+    if r.vector == 3 {
+        let _ = writeln!(com1, "origin-kernel: breakpoint handled; resuming");
+        return;
+    }
+    let _ = writeln!(
+        com1,
+        "origin-kernel: rsp {:#x} rflags {:#x} cs {:#x} rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x}",
+        r.rsp, r.rflags, r.cs, r.rax, r.rbx, r.rcx, r.rdx
+    );
+    if let Some(report) = r.machine_check {
+        let _ = writeln!(com1, "origin-kernel: machine check: {report}");
     }
 }
 

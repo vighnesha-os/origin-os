@@ -14,7 +14,7 @@ M2 needs the kernel to own its CPU tables, memory and interrupts; M3 needs real 
 ## Decisions
 
 ### K1. The library is safe code; hardware access is capability-typed in the binary
-`framekernel` (lib) is `forbid(unsafe_code)` and host-tested: descriptors, frames, paging, kernel_space, heap, apic, acpi, runqueue. The binary holds every `unsafe` operation, one per block, each with a SAFETY argument. Hardware is reached through types that encode what was proven (`X2Apic` exists only after the mode switch; its safe methods cannot reach the ICR; `send_ipi` is a separate `unsafe fn`). *(ADR-0011 N6, accepted 2026-11-09, replaces this split when the framework crate lands: this split separates what can be tested on the host, not what is trusted.)*
+`framekernel` (lib) is `forbid(unsafe_code)` and host-tested: descriptors, frames, paging, kernel_space, heap, apic, acpi, runqueue. The binary holds every `unsafe` operation, one per block, each with a SAFETY argument. Hardware is reached through types that encode what was proven (`X2Apic` exists only after the mode switch; its safe methods cannot reach the ICR; `send_ipi` is a separate `unsafe fn`). *(ADR-0011 N6, accepted 2026-11-09, replaces this split: the framework crate `framekernel/frame/` landed on 2026-11-09 and holds the kernel's `unsafe`, with the gate in `cargo xtask check`; this split separated what can be tested on the host, not what is trusted.)*
 *Alternatives:* a single crate with `unsafe` throughout (less testable); a separate HAL crate (premature).
 
 ### K2. Address space: identity mapping with exact permissions, until a higher-half ADR

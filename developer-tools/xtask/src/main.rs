@@ -10,6 +10,7 @@ mod disk;
 mod loom;
 mod screen;
 mod serial;
+mod unsafety;
 
 use std::borrow::Cow;
 use std::env;
@@ -47,6 +48,8 @@ commands:
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
+  unsafe-gate only the gate on `unsafe` and on the kernel's dependency direction (part of
+              check; quick)
 
 environment:
   ORIGIN_LOOM_DEEP                    if set, the Loom models search to their deeper bounds
@@ -86,6 +89,8 @@ const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// clippy-clean on every target and free of panic paths (ONBF §12).
 const BOOT_INFO_PACKAGE: &str = "origin-boot-info";
 const KERNEL_PACKAGE: &str = "framekernel";
+/// The Framekernel's privileged framework (ADR-0011 N6).
+const FRAMEWORK_PACKAGE: &str = "origin-frame";
 const PACK_PACKAGE: &str = "onbf-pack";
 /// The host-only signing code (CLAUDE.md §59): never linked into the OS.
 const SIGN_PACKAGE: &str = "onbf-sign";
@@ -1132,6 +1137,8 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
                 "origin-kernel: CPU state: machine checks raise #MC, x87 errors raise #MF, ring 3 has no RDPMC, FSGSBASE or SYSENTER, no debug breakpoint armed: {cpus} of {cpus} processors"
             ),
             "origin-kernel: reclaimed ".into(),
+            // A boot step out of turn, or run twice, does nothing (ADR-0011 N6).
+            "origin-kernel: boot steps: out of turn refused true; a second run refused true".into(),
         ]
         .into_iter()
         // CPU topology from CPUID (leaf 1Fh, 0Bh): each processor, the layout, the MADT.
@@ -1446,6 +1453,7 @@ fn boot_failures() -> Vec<&'static str> {
         "origin-kernel: ACPI processor discovery failed",
         "origin-kernel: AP start-up not possible",
         ": AP start-up failed",
+        ": boot steps failed",
         ": scheduler failed",
         ": topology failed",
         ": CPU baseline failed",
@@ -1704,6 +1712,7 @@ fn main() -> ExitCode {
         .as_slice()
     {
         ["check"] => check(),
+        ["unsafe-gate"] => unsafety::gate(),
         ["build"] => build_loader(Loader::Developer).and_then(|loader| {
             let kernel = pack_kernel(&build_kernel()?)?;
             println!("{}\n{}", loader.display(), kernel.display());
@@ -2212,6 +2221,28 @@ fn check() -> Result {
         }
         run_step(cargo().args(["test", "--package", package]))?;
     }
+    // The framework: its logic on the host (with tests), and for the kernel's own target.
+    run_step(cargo().args([
+        "clippy",
+        "--package",
+        FRAMEWORK_PACKAGE,
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run_step(cargo().args([
+        "clippy",
+        "--package",
+        FRAMEWORK_PACKAGE,
+        "--lib",
+        "--target",
+        KERNEL_TARGET,
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run_step(cargo().args(["test", "--package", FRAMEWORK_PACKAGE]))?;
     // The Framekernel: its library on the host (with tests), the binary on its target.
     run_step(cargo().args([
         "clippy",
@@ -2254,6 +2285,7 @@ fn check() -> Result {
     no_panic_check()?;
     dependency_check()?;
     linux_cfg_lint()?;
+    unsafety::gate()?;
     manifest_version_lint()?;
     signing_stays_off_the_os_lint()?;
     signing_has_no_secret_branches()?;
@@ -3659,8 +3691,10 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    let text = serial::clean(&raw);
+                    let missing = serial::first_missing(&text, &markers).unwrap_or("(none)");
                     break Err(format!(
-                        "no complete loader output within {}s",
+                        "first missing marker {missing:?}; no complete loader output within {}s",
                         timeout.as_secs()
                     ));
                 }
