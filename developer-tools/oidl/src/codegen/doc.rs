@@ -1,0 +1,298 @@
+//! The reference documentation generator (`docs/spec/OIDL.md` §11, CLAUDE.md §71).
+
+use super::{Generated, Text};
+use crate::layout;
+use crate::model::{Compilation, Library, Method, Param, Transport, Type};
+use crate::sema::registers_of;
+
+/// Doc text in Markdown: the three characters that can start markup a reader would see as
+/// something else, and the one that ends a table cell (§15 O11).
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('|', "\\|")
+}
+
+fn joined(lines: &[String]) -> String {
+    escape(&lines.join(" "))
+}
+
+fn type_text(ty: &Type) -> String {
+    match ty {
+        Type::Bool => "bool".to_string(),
+        Type::Int(int) => int.rust().to_string(),
+        Type::Enum(e) => e.name.clone(),
+        Type::Bits(b) => b.name.clone(),
+        Type::Struct(s) => s.name.clone(),
+        Type::Array(elem, count) => format!("array<{}, {count}>", type_text(elem)),
+        Type::Vector(elem, bound) => format!("vector<{}, {bound}>", type_text(elem)),
+        Type::String(bound) => format!("string<{bound}>"),
+        Type::Handle(h) => {
+            let object = h.object.as_deref().unwrap_or("any");
+            let rights = if h.rights.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", h.rights.join(" | "))
+            };
+            if h.optional {
+                format!("optional<handle<{object}{rights}>>")
+            } else {
+                format!("handle<{object}{rights}>")
+            }
+        }
+    }
+}
+
+fn write_params(t: &mut Text, params: &[Param], title: &str) {
+    if params.is_empty() {
+        return;
+    }
+    t.line(format!("{title}:"));
+    t.blank();
+    for param in params {
+        let mut extras = Vec::new();
+        if param.nonzero {
+            extras.push("`@nonzero`".to_string());
+        }
+        if let Some((result, field)) = &param.count {
+            extras.push(format!("filled length in `{result}.{field}`"));
+        }
+        if !param.also_on.is_empty() {
+            extras.push(format!("also written on `{}`", param.also_on.join("`, `")));
+        }
+        let extra = if extras.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", extras.join("; "))
+        };
+        let doc = joined(&param.doc);
+        t.line(format!(
+            "- `{}`: `{}`{extra}. {doc}",
+            param.name,
+            type_text(&param.ty)
+        ));
+    }
+    t.blank();
+}
+
+fn write_method(t: &mut Text, lib: &Library, method: &Method) {
+    t.line(format!("### `{}`", method.name));
+    t.blank();
+    for line in &method.doc {
+        t.line(escape(line));
+    }
+    t.blank();
+    if method.reserved {
+        t.line("**Reserved:** the number and signature exist; no implementation does, so a call answers `not_supported`.");
+        t.blank();
+    }
+    let ordinal_name = match lib.transport {
+        Transport::Syscall => "Call number (private to the release)",
+        Transport::Channel => "Ordinal",
+    };
+    t.line(format!("- {ordinal_name}: {}", method.ordinal));
+    t.line(format!("- Since: {}", method.since));
+    if method.oneway {
+        t.line("- One-way: no reply.");
+    }
+    if method.never {
+        t.line("- Does not return.");
+    }
+    match &method.requires {
+        Some(requirement) => t.line(format!(
+            "- Requires: `{}` (refused with `{}`)",
+            requirement.capability.name, requirement.denied.name
+        )),
+        None => t.line("- Requires: nothing"),
+    }
+    if !method.oneway && !method.never {
+        let errors: Vec<String> = method
+            .errors
+            .iter()
+            .map(|e| format!("`{}`", e.name))
+            .collect();
+        t.line(format!(
+            "- Errors: {}",
+            if errors.is_empty() {
+                "none".to_string()
+            } else {
+                errors.join(", ")
+            }
+        ));
+    }
+    if lib.transport == Transport::Syscall {
+        let registers: u32 = method
+            .params
+            .iter()
+            .chain(&method.returns)
+            .map(|p| registers_of(&p.ty))
+            .fold(0, u32::saturating_add);
+        t.line(format!("- Argument registers: {registers}"));
+    }
+    t.blank();
+    write_params(t, &method.params, "Parameters");
+    write_params(t, &method.returns, "Results");
+    if lib.transport == Transport::Channel {
+        let newest = lib.version.minor;
+        t.line(format!(
+            "Largest request: {} bytes.",
+            layout::max_message_size(&method.params, newest)
+        ));
+        if !method.oneway {
+            t.line(format!(
+                "Largest response: {} bytes.",
+                layout::max_message_size(&method.returns, newest)
+            ));
+        }
+        t.blank();
+    }
+}
+
+fn gen_library(lib: &Library) -> String {
+    let mut t = Text::default();
+    t.line(format!("# `{}`", lib.name));
+    t.blank();
+    t.line("_Generated by oidl. Do not edit._");
+    t.blank();
+    for line in &lib.doc {
+        t.line(escape(line));
+    }
+    t.blank();
+    let transport = match lib.transport {
+        Transport::Syscall => "syscall",
+        Transport::Channel => "channel",
+    };
+    t.line(format!(
+        "Transport: `{transport}`. Version: {}{}.",
+        lib.version,
+        lib.version_key
+            .as_ref()
+            .map_or(String::new(), |key| format!(" (the `{key}` identifier)"))
+    ));
+    t.blank();
+    if !lib.consts.is_empty() {
+        t.line("## Constants");
+        t.blank();
+        t.line("| Name | Value | Meaning |");
+        t.line("|---|---|---|");
+        for c in &lib.consts {
+            t.line(format!(
+                "| `{}` | `{}` | {} |",
+                c.name,
+                c.value,
+                c.doc.join(" ")
+            ));
+        }
+        t.blank();
+    }
+    if !lib.enums.is_empty() {
+        t.line("## Enumerations");
+        t.blank();
+        for e in &lib.enums {
+            t.line(format!("### `{}` (`{}`)", e.name, e.repr.rust()));
+            t.blank();
+            for line in &e.doc {
+                t.line(escape(line));
+            }
+            t.blank();
+            t.line("| Name | Value | Meaning |");
+            t.line("|---|---|---|");
+            for member in &e.members {
+                t.line(format!(
+                    "| `{}` | {} | {} |",
+                    member.name,
+                    member.value,
+                    joined(&member.doc)
+                ));
+            }
+            t.blank();
+        }
+    }
+    if !lib.bits.is_empty() {
+        t.line("## Bit sets");
+        t.blank();
+        for b in &lib.bits {
+            t.line(format!("### `{}` (`{}`)", b.name, b.repr.rust()));
+            t.blank();
+            for line in &b.doc {
+                t.line(escape(line));
+            }
+            t.blank();
+            t.line("| Name | Bit | Meaning |");
+            t.line("|---|---|---|");
+            for member in &b.members {
+                t.line(format!(
+                    "| `{}` | {} | {} |",
+                    member.name,
+                    member.value,
+                    joined(&member.doc)
+                ));
+            }
+            t.blank();
+        }
+    }
+    if !lib.structs.is_empty() {
+        t.line("## Structures");
+        t.blank();
+        for s in &lib.structs {
+            let kind = if s.sized { "sized struct" } else { "struct" };
+            t.line(format!("### `{}` ({kind}, {} bytes)", s.name, s.size));
+            t.blank();
+            for line in &s.doc {
+                t.line(escape(line));
+            }
+            t.blank();
+            t.line("| Offset | Field | Type | Meaning |");
+            t.line("|---|---|---|---|");
+            if s.sized {
+                t.line("| 0 | `size` | `u32` | Set by the caller |");
+            }
+            for field in &s.fields {
+                t.line(format!(
+                    "| {} | `{}` | `{}` | {} |",
+                    field.offset,
+                    field.name,
+                    type_text(&field.ty),
+                    joined(&field.doc)
+                ));
+            }
+            t.blank();
+        }
+    }
+    if !lib.capabilities.is_empty() {
+        t.line("## Capabilities");
+        t.blank();
+        for capability in &lib.capabilities {
+            t.line(format!(
+                "- `{}`: {}",
+                capability.name,
+                capability.doc.join(" ")
+            ));
+        }
+        t.blank();
+    }
+    for interface in &lib.interfaces {
+        t.line(format!("## Interface `{}`", interface.name));
+        t.blank();
+        for line in &interface.doc {
+            t.line(escape(line));
+        }
+        t.blank();
+        for method in &interface.methods {
+            write_method(&mut t, lib, method);
+        }
+    }
+    t.finish()
+}
+
+/// One Markdown file per library.
+pub fn generate(comp: &Compilation) -> Vec<Generated> {
+    comp.libraries
+        .iter()
+        .map(|lib| Generated {
+            path: format!("doc/{}.md", lib.name),
+            text: gen_library(lib),
+        })
+        .collect()
+}

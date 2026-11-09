@@ -1,0 +1,165 @@
+// Fixture for the generator's own tests: every channel-transport construct. It defines no
+// shipping interface, and nothing in the tree depends on it.
+
+/// A service used only by the generator's tests.
+library origin.fixture.echo;
+transport channel;
+version 1.2;
+use origin.kernel;
+use origin.fixture.calls;
+
+/// A struct with interior padding.
+struct point {
+    /// A byte, then padding.
+    x: u8;
+    /// A 32-bit value.
+    y: u32;
+}
+
+/// A struct holding a struct.
+struct segment {
+    /// One end.
+    a: point;
+    /// The other end.
+    b: point;
+    /// How wide.
+    width: u64;
+}
+
+/// Nested arrays, so a C header has to get the dimensions right.
+struct board {
+    /// Three rows of two bytes.
+    grid: array<array<u8, 2>, 3>;
+    /// A value after it.
+    tail: u16;
+}
+
+/// A byte enumeration.
+enum color: u8 {
+    /// Red.
+    red = 1;
+    /// Green.
+    green = 2;
+    /// Blue, added in minor 2.
+    @since(1.2) blue = 3;
+}
+
+/// A set of flags.
+bits flags: u16 {
+    /// The low bit.
+    a = 0;
+    /// Bit 3.
+    b = 3;
+    /// Bit 9, added in minor 1.
+    @since(1.1) c = 9;
+}
+
+/// The longest name.
+const max_name: u32 = 16;
+
+/// Lets a client use the privileged methods.
+capability echo.admin;
+
+/// The fixture's one interface.
+interface echo {
+    /// The worked example in docs/spec/OIDL.md.
+    method put = 5 (
+        /// A flag.
+        flag: bool,
+        /// A count.
+        count: u16,
+        /// A name.
+        name: string<max_name>,
+        /// A channel handle with the read right.
+        h: handle<channel, read>,
+    ) errors(peer_closed) requires none;
+
+    /// Every fixed-size type.
+    method fixed = 6 (
+        /// A boolean.
+        b: bool,
+        /// A signed byte.
+        small: i8,
+        /// A 16-bit value.
+        mid: u16,
+        /// A signed 32-bit value.
+        big: i32,
+        /// A 64-bit value.
+        wide: u64,
+        /// A closed enumeration.
+        c: color,
+        /// A bit set.
+        f: flags,
+        /// A struct.
+        p: point,
+        /// Three values.
+        trio: array<u16, 3>,
+        /// A nested struct.
+        s: segment,
+        /// Never zero.
+        @nonzero nz: u32,
+        /// Flags that may not be empty.
+        @nonzero nzf: flags,
+    ) -> (
+        /// A color back.
+        c2: color,
+        /// Flags back.
+        f2: flags,
+        /// The sum.
+        sum: i64,
+    ) errors(invalid_args, no_memory) requires none;
+
+    /// Vectors, an optional handle and later-version fields.
+    method vectors = 7 (
+        /// Structs with padding.
+        points: vector<point, 4>,
+        /// Plain bytes.
+        data: vector<u8, 64>,
+        /// A name.
+        name: string<max_name>,
+        /// A handle that may be absent.
+        opt: optional<handle<any, transfer>>,
+        /// Several handles.
+        handles: vector<handle<any, transfer>, 8>,
+        /// Added in minor 1.
+        @since(1.1) extra: u32,
+        /// Added in minor 2.
+        @since(1.2) late_name: string<8>,
+    ) -> (
+        /// How many.
+        total: u64,
+        /// Some bytes back.
+        echoed: vector<u8, 64>,
+        /// Added in minor 1.
+        @since(1.1) more: array<u8, 4>,
+    ) errors(limit) requires echo.admin;
+
+    /// A one-way notification.
+    oneway method note = 8 (
+        /// The text.
+        text: string<32>,
+    ) requires none;
+
+    /// A type of another library, whose members are versioned by that library, and a result
+    /// that arrived after the method did.
+    method borrowed = 10 (
+        /// Flags from another library; bit 9 arrived in that library's minor 1.
+        m: calls.mode,
+    ) -> (
+        /// Added in minor 1, so absent at minor 0.
+        @since(1.1) note: string<8>,
+    ) errors() requires none;
+
+    /// A struct holding nested arrays.
+    method tiles = 11 (
+        /// The board.
+        b: board,
+    ) errors() requires none;
+
+    /// A method added in minor 1.
+    @since(1.1)
+    method ping = 9 () -> (
+        /// A value.
+        value: u32,
+    ) errors() requires none;
+}
