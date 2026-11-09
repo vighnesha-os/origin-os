@@ -195,6 +195,24 @@ pub fn send_nmi_to_self() {
     }
 }
 
+/// Makes the I/O APIC's interrupt ([`crate::cpu::IOAPIC_VECTOR`]) pending on this processor,
+/// as if its device had raised it (x2APIC ICR, fixed delivery, "self" shorthand), so that a
+/// proof can see where it is taken: with interrupts off, it waits until something lets it in.
+/// Nothing happens if this processor's APIC is not in x2APIC mode. Safe: the vector has a gate
+/// and its handler is safe code, so this is no more than a device can do at any moment.
+pub fn interrupt_self() {
+    if let Some(lapic) = X2Apic::this_cpu() {
+        // SAFETY: fixed delivery of a vector with an IDT gate, to this processor alone: the
+        // same as the device behind that vector interrupting it.
+        unsafe {
+            lapic.send_ipi(
+                0,
+                (1 << 18) | (1 << 14) | u32::from(crate::cpu::IOAPIC_VECTOR),
+            )
+        };
+    }
+}
+
 /// The legacy PC ports this module drives: the 8259 mask registers, PIT channel 2 and
 /// port 0x61.
 struct LegacyPorts(());

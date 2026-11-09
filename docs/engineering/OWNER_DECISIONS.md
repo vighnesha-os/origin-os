@@ -5,7 +5,7 @@
 | As of | 2026-11-09, on `main`, after the pre-merge review. Everything that was on a side branch is merged. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38 and 40–51. |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38 and 40–53. |
 | Still open | Items 30, 31 and 39 below. Buying machines is off for now (ADR-0009's update of 2026-11-09). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -105,6 +105,8 @@ ADR-0009 H6 asked for a console that does not depend on a 16550 at `0x3F8`. The 
 | 27, answered | Boot info 0.4: the framebuffer appended as 48 bytes (`Framebuffer`, E1) | **Accepted by the owner, 2026-11-08** | This is the §84 ABI decision for this work. It adds one field group, with no compatibility promise at major 0, and matches ADR-0002 B4 (the loader translates firmware structures). Alternatives and trade-offs are in the ADR |
 | 28, answered | The framebuffer mapped uncached in the first 2 GiB of the MMIO window, by the loader, and kept at that address by the kernel (E2) | **Accepted by the owner, 2026-11-08** | Draws from the first kernel line and across the page-table switch. ADR-0004's layout keeps MMIO out of the direct map; drivers' MMIO now starts 2 GiB higher |
 | 29, answered | The UART: COM1 until the ACPI tables can be read, then the SPCR's UART with earlier output replayed; 0x3F8 only when firmware gives nothing better (E4) | **Accepted by the owner, 2026-11-08** | A hang before the tables are readable still shows on the screen and on COM1; once firmware names a UART, COM1 is not used |
+| 52, answered | ADR-0010 Amendment 1: each line to the UART first, then drawn at most 256 pixels per interrupts-off section, instead of E3's screen first | **Accepted by the owner, 2026-11-09** | The UART is the log of last resort and no longer waits behind pixels. Under KVM on an AMD EPYC 9V74 a section holds interrupts off for about 24 µs; a whole line took 4.3 to 4.6 ms on a different EPYC model. No real machine has been measured |
+| 53, answered | ADR-0010 Amendment 2: the UART sent at most 16 bytes (one FIFO load) per interrupts-off section, the wait for the wire between sections; a line from an interrupt handler leaves with the next writer or report | **Accepted by the owner, 2026-11-09** | At most 17 register accesses with interrupts off, whatever the line speed, against about 8.7 ms per 100 bytes at 115 200 baud. What a section costs on a real UART is not measured yet; the kernel prints it on every boot |
 
 ## From the pre-merge review (2026-11-09)
 

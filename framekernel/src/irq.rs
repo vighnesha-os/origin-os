@@ -105,7 +105,7 @@ fn ioapic_irqs() -> u64 {
 }
 
 /// How many I/O APIC-routed interrupts the processor with CPU index `cpu` has taken.
-fn ioapic_irqs_on(cpu: CpuIndex) -> u64 {
+pub(crate) fn ioapic_irqs_on(cpu: CpuIndex) -> u64 {
     IOAPIC_IRQS_ON
         .get(cpu.get())
         .map_or(0, |n| n.load(Ordering::Relaxed))
@@ -117,6 +117,8 @@ fn on_interrupt() -> Action {
     if let Some(n) = IOAPIC_IRQS_ON.get(cpu::this_cpu().get()) {
         n.fetch_add(1, Ordering::Relaxed);
     }
+    // The console's boot proof prints from this handler once.
+    crate::console::on_proof_interrupt();
     Action::Resume
 }
 

@@ -7,11 +7,20 @@
 //! write fails. A missing or wedged UART therefore costs one bounded wait per `write_str`
 //! call, not a hang.
 //!
+//! Waiting for the wire is the slow part of a UART: at 115 200 baud a byte takes 87 µs, so
+//! 100 bytes take 8.7 ms, and [`Uart16550::write_bytes`] spends that time polling. A caller
+//! that must not stay put that long uses [`TxQueue`] instead: [`TxQueue::pump`] looks at the
+//! line status once and, if the transmitter is empty, writes what it can take without looking
+//! again, [`TX_FIFO_BYTES`] at most. It never waits, so the caller decides what happens while
+//! the bytes leave.
+//!
 //! The driver reaches the hardware only through [`UartRegisters`]. The kernel binary
 //! implements that trait with x86 port I/O; the unit tests implement it with a recording
 //! mock, so the programming sequence and the polling bounds are tested on the build host.
 
 use core::fmt;
+
+use crate::linequeue::LineQueue;
 
 /// The UART input clock on PC-compatible platforms: 1.8432 MHz.
 pub const INPUT_CLOCK_HZ: u32 = 1_843_200;
@@ -44,10 +53,22 @@ pub const MCR_DTR_RTS_OUT2: u8 = 0x0B;
 pub const LSR_THR_EMPTY: u8 = 0x20;
 /// Line status: the transmitter is idle; both the FIFO and the shift register are empty.
 pub const LSR_TRANSMITTER_EMPTY: u8 = 0x40;
+/// Interrupt identification, read from [`Register::FifoControl`]: both bits are set when the
+/// FIFOs are enabled and usable. A 16550 whose FIFO does not work sets only bit 7, and a UART
+/// with no FIFO sets neither.
+pub const IIR_FIFOS_ENABLED: u8 = 0xC0;
 
 /// Line-status polls the driver spends on one byte, or on draining the transmitter before
 /// [`Uart16550::init`], before it gives up.
 pub const TX_POLL_LIMIT: u32 = 100_000;
+
+/// The most bytes the driver writes without reading the line status again: the 16 bytes of a
+/// 16550's transmit FIFO. [`LSR_THR_EMPTY`] means the FIFO is empty (PC16550D, line status bit
+/// 5, in FIFO mode), so 16 bytes written one after another cannot overrun it, whatever the
+/// line's speed; the first may move to the shift register at once and that only makes room.
+/// A UART with a larger FIFO still has at least these 16, and one with none takes a byte at a
+/// time ([`Uart16550::detect_fifo`]).
+pub const TX_FIFO_BYTES: u32 = 16;
 
 /// A UART register, by its offset from the UART's base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,7 +80,8 @@ pub enum Register {
     /// Offset 1: the interrupt-enable register (IER), or the divisor latch high byte (DLM)
     /// while [`LCR_DLAB`] is set.
     InterruptEnable = 1,
-    /// Offset 2: the FIFO control register (FCR) when written.
+    /// Offset 2: the FIFO control register (FCR) when written, the interrupt identification
+    /// register (IIR) when read.
     FifoControl = 2,
     /// Offset 3: the line control register (LCR).
     LineControl = 3,
@@ -203,13 +225,35 @@ pub trait UartRegisters {
 #[derive(Debug)]
 pub struct Uart16550<R> {
     regs: R,
+    /// Bytes the transmitter takes in one go once it reports empty ([`Self::tx_load`]).
+    tx_load: u32,
 }
 
 impl<R: UartRegisters> Uart16550<R> {
     /// Wraps a UART's registers. Call [`Self::init`] before writing, unless the UART is
-    /// already programmed.
+    /// already programmed. Until [`Self::detect_fifo`] has run, or [`Self::configure`], it is
+    /// taken to have no FIFO, which is always safe.
     pub const fn new(regs: R) -> Self {
-        Self { regs }
+        Self { regs, tx_load: 1 }
+    }
+
+    /// Bytes the transmitter takes in one go once it reports empty: [`TX_FIFO_BYTES`], or 1
+    /// when it has no working FIFO.
+    pub const fn tx_load(&self) -> u32 {
+        self.tx_load
+    }
+
+    /// Finds out how much the transmitter takes in one go, from what the FIFO enable left in
+    /// the interrupt identification register. Only a UART that says its FIFOs are on and
+    /// usable is given more than a byte at a time: writing 16 bytes to a 16450, or to a first
+    /// 16550 whose FIFO does not work, would lose them.
+    pub fn detect_fifo(&mut self) {
+        let fifos = self.regs.read(Register::FifoControl) & IIR_FIFOS_ENABLED;
+        self.tx_load = if fifos == IIR_FIFOS_ENABLED {
+            TX_FIFO_BYTES
+        } else {
+            1
+        };
     }
 
     /// Programs the UART with [`INIT_SEQUENCE`].
@@ -244,6 +288,7 @@ impl<R: UartRegisters> Uart16550<R> {
                 self.regs.write(Register::ModemControl, MCR_DTR_RTS_OUT2);
             }
         }
+        self.detect_fifo();
     }
 
     /// Reads the line format and divisor the firmware left, without changing them.
@@ -308,6 +353,149 @@ impl<R: UartRegisters> Uart16550<R> {
 impl<R: UartRegisters> fmt::Write for Uart16550<R> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.write_bytes(s.as_bytes())
+    }
+}
+
+/// What the UART is told in place of lines its queue had no room for.
+const TX_LOST_NOTICE: &[u8] =
+    b"origin-kernel: console: some lines were lost here: the UART fell behind\n";
+
+/// What one [`TxQueue::pump`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pumped {
+    /// Nothing was waiting. No register was touched.
+    Idle,
+    /// The transmitter took this many bytes.
+    Sent(u32),
+    /// The transmitter had no room yet, and nothing was written.
+    Busy,
+    /// The transmitter has had no room for the whole of the wait the driver allows it (see
+    /// [`TxQueue::pump`]), `polls` line-status reads in all: it has stopped.
+    Stopped {
+        /// How many reads that was.
+        polls: u32,
+    },
+}
+
+/// Text waiting for a UART, sent a bounded amount at a time ([`Self::pump`]), with each LF
+/// turned into CR LF. The caller serializes everything, and decides what happens between
+/// one call and the next.
+///
+/// Positions count the bytes of the text as it was queued, from the start of time, as for
+/// [`LineQueue`]: a line is on the UART when [`Self::sent`] has reached the position
+/// [`Self::push`] returned, which is when the last of its bytes has been written to the UART.
+#[derive(Debug)]
+pub struct TxQueue<const N: usize> {
+    lines: LineQueue<N>,
+    /// Bytes of the queued text the UART has taken.
+    sent: u64,
+    /// The line feed at the front of the queue has had its carriage return sent, and is next.
+    cr_sent: bool,
+    /// Polls in a row that found the transmitter busy.
+    stalled: u32,
+    /// How many bytes the transmitter took the last time: what it has been busy with since.
+    load: u32,
+}
+
+impl<const N: usize> TxQueue<N> {
+    /// An empty queue.
+    pub const fn new() -> Self {
+        Self {
+            lines: LineQueue::new(TX_LOST_NOTICE),
+            sent: 0,
+            cr_sent: false,
+            stalled: 0,
+            load: 0,
+        }
+    }
+
+    /// Whether [`Self::push`] would take `bytes` more bytes now.
+    pub const fn has_room(&self, bytes: usize) -> bool {
+        self.lines.has_room(bytes)
+    }
+
+    /// Accepts `text`, whole or not at all, and returns the position at which it will be on
+    /// the UART. `None` when there is no room.
+    pub fn push(&mut self, text: &[u8]) -> Option<u64> {
+        self.lines.push(text)
+    }
+
+    /// Records that a line had to be dropped because a caller could not wait for room: the
+    /// next line that fits is preceded by a notice saying so.
+    pub const fn note_lost(&mut self) {
+        self.lines.note_lost();
+    }
+
+    /// Writes as much of the waiting text as the transmitter can take without being asked
+    /// again, and returns at once. One read of the line status and, if the transmitter says
+    /// it is empty, at most [`Uart16550::tx_load`] writes, so never more than
+    /// [`TX_FIFO_BYTES`] bytes: this is the whole of what a call does, however long the
+    /// text, and however slow the line.
+    ///
+    /// A UART that stops taking bytes is given up on after one bounded wait, spread over
+    /// however many calls it takes: [`TX_POLL_LIMIT`] polls in a row that find it busy, for
+    /// each byte of the last load it took. That is what polling a byte at a time allows a
+    /// transmitter: a full FIFO takes 16 times as long to get through as one byte. The very
+    /// first bytes have no load before them, and get the wait for one.
+    pub fn pump<R: UartRegisters>(&mut self, uart: &mut Uart16550<R>) -> Pumped {
+        if self.lines.is_empty() {
+            return Pumped::Idle;
+        }
+        if uart.regs.read(Register::LineStatus) & LSR_THR_EMPTY == 0 {
+            self.stalled = self.stalled.saturating_add(1);
+            return if self.stalled >= TX_POLL_LIMIT.saturating_mul(self.load.max(1)) {
+                Pumped::Stopped {
+                    polls: self.stalled,
+                }
+            } else {
+                Pumped::Busy
+            };
+        }
+        self.stalled = 0;
+        let mut written = 0;
+        while written < uart.tx_load {
+            let Some(byte) = self.lines.peek() else {
+                break;
+            };
+            if byte == b'\n' && !self.cr_sent {
+                uart.regs.write(Register::Data, b'\r');
+                self.cr_sent = true;
+            } else {
+                uart.regs.write(Register::Data, byte);
+                self.cr_sent = false;
+                self.lines.pop();
+                self.sent += 1;
+            }
+            written += 1;
+        }
+        self.load = written;
+        Pumped::Sent(written)
+    }
+
+    /// How far the UART has got (see the type's documentation).
+    pub const fn sent(&self) -> u64 {
+        self.sent
+    }
+
+    /// Whether nothing is waiting.
+    pub const fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Forgets everything waiting, and what the queue knew about the UART: the UART has
+    /// stopped, or another has taken its place. Nothing is left for anyone to wait for.
+    pub const fn clear(&mut self) {
+        self.lines.clear();
+        self.sent = self.lines.queued();
+        self.cr_sent = false;
+        self.stalled = 0;
+        self.load = 0;
+    }
+}
+
+impl<const N: usize> Default for TxQueue<N> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -399,7 +587,7 @@ mod tests {
         let mut uart = Uart16550::new(Mock::new(3));
         uart.init();
         let log = &uart.regs.log;
-        assert_eq!(log.len(), 4 + INIT_SEQUENCE.len());
+        assert_eq!(log.len(), 4 + INIT_SEQUENCE.len() + 1);
         assert!(
             log[..4]
                 .iter()
@@ -409,7 +597,12 @@ mod tests {
             .iter()
             .map(|&(reg, value)| Access::Write(reg, value))
             .collect();
-        assert_eq!(&log[4..], writes.as_slice());
+        assert_eq!(&log[4..log.len() - 1], writes.as_slice());
+        assert_eq!(
+            log[log.len() - 1],
+            Access::Read(Register::FifoControl),
+            "last of all it finds out whether the FIFOs came on"
+        );
     }
 
     #[test]
@@ -422,7 +615,7 @@ mod tests {
         assert_eq!(uart.regs.status_reads(), TX_POLL_LIMIT as usize);
         assert_eq!(
             uart.regs.log.len(),
-            TX_POLL_LIMIT as usize + INIT_SEQUENCE.len()
+            TX_POLL_LIMIT as usize + INIT_SEQUENCE.len() + 1
         );
     }
 
@@ -625,5 +818,448 @@ mod tests {
         assert_eq!(uart.write_str("hello\n"), Err(fmt::Error));
         assert_eq!(uart.regs.status_reads(), TX_POLL_LIMIT as usize);
         assert!(uart.regs.data_bytes().is_empty());
+    }
+
+    /// A 16550 as its datasheet has it, its clock counted in register accesses: each byte
+    /// takes `byte_time` accesses to leave, the FIFO holds 16 bytes (1 without a FIFO) and
+    /// the shift register takes the next one the moment it is free. A write to a full FIFO is
+    /// an overrun and the byte is lost.
+    struct Wire {
+        fifo: std::collections::VecDeque<u8>,
+        capacity: usize,
+        shifting: Option<u8>,
+        left: u32,
+        byte_time: u32,
+        wire: Vec<u8>,
+        overruns: u32,
+        /// Register accesses so far.
+        accesses: u64,
+        /// Bytes written since the line status was last read.
+        unchecked: u32,
+        most_unchecked: u32,
+        stopped: bool,
+    }
+
+    impl Wire {
+        fn new(byte_time: u32) -> Self {
+            Self {
+                fifo: Default::default(),
+                capacity: TX_FIFO_BYTES as usize,
+                shifting: None,
+                left: 0,
+                byte_time,
+                wire: Vec::new(),
+                overruns: 0,
+                accesses: 0,
+                unchecked: 0,
+                most_unchecked: 0,
+                stopped: false,
+            }
+        }
+
+        fn without_fifo(byte_time: u32) -> Self {
+            Self {
+                capacity: 1,
+                ..Self::new(byte_time)
+            }
+        }
+
+        fn clock(&mut self) {
+            self.accesses += 1;
+            if self.stopped {
+                return;
+            }
+            if self.left > 0 {
+                self.left -= 1;
+            }
+            if self.left == 0 {
+                self.wire.extend(self.shifting.take());
+                if let Some(next) = self.fifo.pop_front() {
+                    self.shifting = Some(next);
+                    self.left = self.byte_time;
+                }
+            }
+        }
+
+        /// Runs the wire until everything written has left.
+        fn drain(&mut self) {
+            while self.shifting.is_some() || !self.fifo.is_empty() {
+                self.clock();
+            }
+        }
+    }
+
+    impl UartRegisters for Wire {
+        fn read(&mut self, reg: Register) -> u8 {
+            self.clock();
+            match reg {
+                Register::LineStatus => {
+                    self.unchecked = 0;
+                    let idle = self.shifting.is_none() && self.fifo.is_empty();
+                    (if self.fifo.is_empty() {
+                        LSR_THR_EMPTY
+                    } else {
+                        0
+                    }) | (if idle { LSR_TRANSMITTER_EMPTY } else { 0 })
+                }
+                Register::FifoControl if self.capacity > 1 => 0xC1,
+                Register::FifoControl => 0x01,
+                _ => 0,
+            }
+        }
+
+        fn write(&mut self, reg: Register, value: u8) {
+            self.clock();
+            if reg == Register::Data {
+                self.unchecked += 1;
+                self.most_unchecked = self.most_unchecked.max(self.unchecked);
+                if self.fifo.len() == self.capacity {
+                    self.overruns += 1;
+                } else {
+                    self.fifo.push_back(value);
+                }
+            }
+        }
+    }
+
+    fn with_crlf(text: &[u8]) -> Vec<u8> {
+        text.iter()
+            .flat_map(|&b| {
+                if b == b'\n' {
+                    vec![b'\r', b'\n']
+                } else {
+                    vec![b]
+                }
+            })
+            .collect()
+    }
+
+    fn configured(wire: Wire) -> Uart16550<Wire> {
+        let mut uart = Uart16550::new(wire);
+        uart.configure(LineSetup::Keep);
+        uart
+    }
+
+    #[test]
+    fn the_transmitter_gets_a_fifo_load_only_if_it_says_its_fifos_work() {
+        struct Ident(u8);
+        impl UartRegisters for Ident {
+            fn read(&mut self, reg: Register) -> u8 {
+                match reg {
+                    Register::LineStatus => LSR_THR_EMPTY | LSR_TRANSMITTER_EMPTY,
+                    Register::FifoControl => self.0,
+                    _ => 0,
+                }
+            }
+            fn write(&mut self, _: Register, _: u8) {}
+        }
+        for (ident, load) in [
+            (0xC1, 16), // a working 16550A or later, nothing pending
+            (0xC2, 16), // the low bits are the interrupt state
+            (0x81, 1),  // the first 16550, whose FIFO does not work
+            (0x41, 1),
+            (0x01, 1), // a 16450: no FIFO
+            (0x00, 1),
+        ] {
+            let mut uart = Uart16550::new(Ident(ident));
+            assert_eq!(uart.tx_load(), 1, "no FIFO until one is seen");
+            uart.init();
+            assert_eq!(uart.tx_load(), load, "IIR {ident:#x}");
+            let mut uart = Uart16550::new(Ident(ident));
+            uart.configure(LineSetup::Keep);
+            assert_eq!(
+                uart.tx_load(),
+                load,
+                "IIR {ident:#x}, as the firmware left it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_section_reads_the_status_once_and_writes_at_most_a_fifo_load() {
+        let mut uart = Uart16550::new(Mock::new(0));
+        uart.tx_load = TX_FIFO_BYTES;
+        let mut queue = TxQueue::<64>::new();
+        queue.push(&[b'x'; 40]).unwrap();
+        for (section, expected) in [16, 16, 8].into_iter().enumerate() {
+            uart.regs.log.clear();
+            assert_eq!(queue.pump(&mut uart), Pumped::Sent(expected), "{section}");
+            assert_eq!(uart.regs.status_reads(), 1, "section {section}");
+            assert_eq!(uart.regs.data_bytes().len(), expected as usize);
+            assert_eq!(
+                uart.regs.log.first(),
+                Some(&Access::Read(Register::LineStatus)),
+                "the status comes before any byte"
+            );
+        }
+        assert_eq!(queue.pump(&mut uart), Pumped::Idle);
+    }
+
+    #[test]
+    fn nothing_waiting_touches_no_register() {
+        let mut uart = Uart16550::new(Mock::new(0));
+        let mut queue = TxQueue::<64>::new();
+        assert_eq!(queue.pump(&mut uart), Pumped::Idle);
+        assert!(uart.regs.log.is_empty());
+    }
+
+    #[test]
+    fn a_busy_transmitter_gets_no_bytes_and_one_read() {
+        let mut uart = Uart16550::new(Mock::new(2));
+        uart.tx_load = TX_FIFO_BYTES;
+        let mut queue = TxQueue::<64>::new();
+        queue.push(b"abc\n").unwrap();
+        assert_eq!(queue.pump(&mut uart), Pumped::Busy);
+        assert_eq!(queue.pump(&mut uart), Pumped::Busy);
+        assert_eq!(uart.regs.status_reads(), 2);
+        assert!(uart.regs.data_bytes().is_empty());
+        assert_eq!(queue.pump(&mut uart), Pumped::Sent(5));
+        assert_eq!(uart.regs.data_bytes(), b"abc\r\n");
+    }
+
+    #[test]
+    fn a_line_feed_cut_by_the_end_of_a_section_keeps_its_carriage_return_and_its_place() {
+        let mut uart = Uart16550::new(Mock::new(0));
+        uart.tx_load = TX_FIFO_BYTES;
+        let mut queue = TxQueue::<64>::new();
+        // 15 bytes, and the LF at the end: the CR is the 16th byte of the section.
+        let mut line = [b'a'; 16];
+        line[15] = b'\n';
+        let end = queue.push(&line).unwrap();
+        queue.push(b"b\n").unwrap();
+        assert_eq!(queue.pump(&mut uart), Pumped::Sent(16));
+        assert_eq!(queue.sent(), 15, "the line is not out until its LF is");
+        assert!(queue.sent() < end);
+        assert_eq!(queue.pump(&mut uart), Pumped::Sent(4));
+        assert_eq!(queue.sent(), end + 2);
+        let mut expected = vec![b'a'; 15];
+        expected.extend_from_slice(b"\r\nb\r\n");
+        assert_eq!(uart.regs.data_bytes(), expected);
+    }
+
+    #[test]
+    fn a_line_is_on_the_uart_at_its_position_and_not_before() {
+        let mut uart = Uart16550::new(Mock::new(0));
+        let mut queue = TxQueue::<64>::new();
+        let first = queue.push(b"one\n").unwrap();
+        let second = queue.push(b"two\n").unwrap();
+        // A byte at a time, so that every position is seen.
+        for pumps in 1..=10u32 {
+            assert!(matches!(queue.pump(&mut uart), Pumped::Sent(1)));
+            let wire = uart.regs.data_bytes();
+            assert_eq!(wire.len(), pumps as usize);
+            assert_eq!(
+                queue.sent() >= first,
+                wire.ends_with(b"one\r\n") || pumps > 5
+            );
+            assert_eq!(queue.sent() >= second, pumps == 10);
+        }
+        assert!(queue.is_empty());
+        assert_eq!(uart.regs.data_bytes(), b"one\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn a_line_queued_while_another_is_on_its_way_goes_out_behind_it_whole() {
+        let mut uart = Uart16550::new(Mock::new(0));
+        uart.tx_load = TX_FIFO_BYTES;
+        let mut queue = TxQueue::<256>::new();
+        let first = [b'a'; 40];
+        queue.push(&first).unwrap();
+        queue.pump(&mut uart);
+        // The interrupt handler's line, or another processor's, arrives here.
+        let second = [b'b'; 40];
+        queue.push(&second).unwrap();
+        while queue.pump(&mut uart) != Pumped::Idle {}
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(&second);
+        assert_eq!(uart.regs.data_bytes(), expected);
+    }
+
+    #[test]
+    fn a_full_queue_refuses_a_whole_line_and_owns_up_on_the_uart() {
+        let mut uart = Uart16550::new(Mock::new(0));
+        let mut queue = TxQueue::<128>::new();
+        assert!(queue.push(&[b'a'; 100]).is_some());
+        assert!(!queue.has_room(100));
+        assert!(queue.push(&[b'b'; 100]).is_none());
+        queue.note_lost();
+        while queue.pump(&mut uart) != Pumped::Idle {}
+        assert!(queue.push(b"next\n").is_some());
+        while queue.pump(&mut uart) != Pumped::Idle {}
+        let wire = uart.regs.data_bytes();
+        assert_eq!(&wire[..100], [b'a'; 100].as_slice());
+        let mut told = with_crlf(TX_LOST_NOTICE);
+        told.extend_from_slice(b"next\r\n");
+        assert_eq!(&wire[100..], told.as_slice());
+    }
+
+    #[test]
+    fn a_wedged_uart_is_given_up_on_after_one_bounded_wait_over_many_sections() {
+        // The status never reports room. The log would be enormous, so a count will do.
+        struct Wedged(u64);
+        impl UartRegisters for Wedged {
+            fn read(&mut self, reg: Register) -> u8 {
+                self.0 += u64::from(reg == Register::LineStatus);
+                0
+            }
+            fn write(&mut self, reg: Register, _: u8) {
+                assert_ne!(reg, Register::Data, "a wedged UART is given no bytes");
+            }
+        }
+        let mut uart = Uart16550::new(Wedged(0));
+        let mut queue = TxQueue::<256>::new();
+        // However many lines are waiting, it is one wait.
+        for _ in 0..10 {
+            queue.push(b"a whole line that a wedged UART will never take\n");
+        }
+        for poll in 1..TX_POLL_LIMIT {
+            assert_eq!(queue.pump(&mut uart), Pumped::Busy, "poll {poll}");
+        }
+        assert_eq!(
+            queue.pump(&mut uart),
+            Pumped::Stopped {
+                polls: TX_POLL_LIMIT
+            }
+        );
+        assert_eq!(uart.regs.0, u64::from(TX_POLL_LIMIT));
+        let queued = queue.lines.queued();
+        queue.clear();
+        assert!(queue.is_empty());
+        assert_eq!(queue.sent(), queued, "nobody is left waiting for it");
+        assert_eq!(queue.pump(&mut uart), Pumped::Idle);
+        assert_eq!(uart.regs.0, u64::from(TX_POLL_LIMIT), "and no more waits");
+    }
+
+    #[test]
+    fn a_uart_that_stops_after_a_full_load_gets_as_long_as_that_load_needs() {
+        struct StopsAfter(u32);
+        impl UartRegisters for StopsAfter {
+            fn read(&mut self, _: Register) -> u8 {
+                if self.0 == 0 {
+                    return 0;
+                }
+                self.0 -= 1;
+                LSR_THR_EMPTY
+            }
+            fn write(&mut self, _: Register, _: u8) {}
+        }
+        let mut uart = Uart16550::new(StopsAfter(1));
+        uart.tx_load = TX_FIFO_BYTES;
+        let mut queue = TxQueue::<64>::new();
+        queue.push(&[b'x'; 32]).unwrap();
+        assert_eq!(queue.pump(&mut uart), Pumped::Sent(TX_FIFO_BYTES));
+        let limit = TX_POLL_LIMIT * TX_FIFO_BYTES;
+        for poll in 1..limit {
+            assert_eq!(queue.pump(&mut uart), Pumped::Busy, "poll {poll}");
+        }
+        assert_eq!(queue.pump(&mut uart), Pumped::Stopped { polls: limit });
+    }
+
+    #[test]
+    fn a_transmitter_that_recovers_starts_its_wait_again() {
+        let mut uart = Uart16550::new(Wire::new(1));
+        let mut queue = TxQueue::<64>::new();
+        queue.push(b"ab").unwrap();
+        // One poll short of the limit: a byte taken starts the count again.
+        queue.stalled = TX_POLL_LIMIT - 1;
+        assert_eq!(queue.pump(&mut uart), Pumped::Sent(1));
+        assert_eq!(queue.stalled, 0);
+        assert_eq!(queue.pump(&mut uart), Pumped::Sent(1));
+    }
+
+    /// Sends `lines` through a queue the way the console does: every call to `pump` is one
+    /// section with interrupts off; between them the wire runs on.
+    fn send_all(uart: &mut Uart16550<Wire>, queue: &mut TxQueue<512>, lines: &[Vec<u8>]) -> u64 {
+        let mut worst = 0;
+        for line in lines {
+            let end = queue.push(line).expect("the queue has room");
+            while queue.sent() < end {
+                let before = uart.regs.accesses;
+                assert!(!matches!(queue.pump(uart), Pumped::Stopped { .. }));
+                worst = worst.max(uart.regs.accesses - before);
+                uart.regs.clock(); // Interrupts on: the wire runs while no section is open.
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn however_slow_the_line_a_section_is_a_status_read_and_a_fifo_load() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0x16550);
+        for case in 0..crate::testing::cases(300) {
+            // Accesses per byte on the wire: from a line that keeps up with the bus, through
+            // 115 200 baud at a microsecond an access (87), to 9600 baud (1042).
+            let byte_time = [1, 2, 5, 17, 87, 1042][rng.below(6)];
+            let mut uart = configured(Wire::new(byte_time));
+            let mut queue = TxQueue::<512>::new();
+            let lines: Vec<Vec<u8>> = (0..1 + rng.below(8))
+                .map(|_| {
+                    let mut line: Vec<u8> =
+                        (0..rng.below(160)).map(|_| rng.byte() & 0x7F).collect();
+                    line.push(b'\n');
+                    line
+                })
+                .collect();
+            let worst = send_all(&mut uart, &mut queue, &lines);
+            uart.regs.drain();
+            assert!(
+                worst <= 1 + u64::from(TX_FIFO_BYTES),
+                "case {case}: {worst}"
+            );
+            assert!(
+                uart.regs.most_unchecked <= TX_FIFO_BYTES,
+                "case {case}: {} bytes between status reads",
+                uart.regs.most_unchecked
+            );
+            assert_eq!(uart.regs.overruns, 0, "case {case}: bytes lost");
+            assert_eq!(uart.regs.wire, with_crlf(&lines.concat()), "case {case}");
+        }
+    }
+
+    #[test]
+    fn without_a_fifo_a_section_is_a_status_read_and_one_byte() {
+        let mut uart = configured(Wire::without_fifo(50));
+        assert_eq!(uart.tx_load(), 1);
+        let mut queue = TxQueue::<512>::new();
+        let lines = [b"no FIFO at all\n".to_vec()];
+        let worst = send_all(&mut uart, &mut queue, &lines);
+        uart.regs.drain();
+        assert_eq!(worst, 2);
+        assert_eq!(uart.regs.overruns, 0);
+        assert_eq!(uart.regs.wire, with_crlf(&lines[0]));
+    }
+
+    /// The negative control of the two tests above: on the model, a load larger than the
+    /// FIFO loses bytes and more than one load between status reads is seen, so a queue that
+    /// ignored its bound would fail them.
+    #[test]
+    fn the_model_catches_a_load_larger_than_the_fifo() {
+        let mut uart = configured(Wire::new(1000));
+        let mut queue = TxQueue::<512>::new();
+        queue.push(b"a").unwrap();
+        uart.tx_load = 1;
+        assert_eq!(queue.pump(&mut uart), Pumped::Sent(1));
+        // That byte moves to the shift register, which keeps it for a long time: the FIFO
+        // reports empty, and has room for 16 and no more.
+        uart.regs.clock();
+        uart.tx_load = TX_FIFO_BYTES + 1;
+        queue.push(&[b'x'; 100]).unwrap();
+        assert_eq!(queue.pump(&mut uart), Pumped::Sent(TX_FIFO_BYTES + 1));
+        uart.regs.drain();
+        assert_eq!(uart.regs.most_unchecked, TX_FIFO_BYTES + 1);
+        assert_eq!(uart.regs.overruns, 1, "the FIFO has room for 16 bytes");
+        assert_eq!(uart.regs.wire.len(), 1 + TX_FIFO_BYTES as usize);
+    }
+
+    #[test]
+    fn the_model_catches_a_fifo_load_written_to_a_uart_without_one() {
+        let mut uart = Uart16550::new(Wire::without_fifo(1000));
+        uart.tx_load = TX_FIFO_BYTES;
+        let mut queue = TxQueue::<512>::new();
+        queue.push(&[b'x'; 100]).unwrap();
+        assert_eq!(queue.pump(&mut uart), Pumped::Sent(TX_FIFO_BYTES));
+        uart.regs.drain();
+        assert!(uart.regs.overruns > 0);
     }
 }
