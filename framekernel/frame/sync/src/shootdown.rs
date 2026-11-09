@@ -30,6 +30,12 @@
 //! has not reached the space yet needs nothing: its page walks start after its fence in
 //! `switch_space`, so if the initiator read that it had not arrived, those walks see the change.
 //!
+//! # Freeing what was mapped
+//!
+//! A frame that has left the page tables can still be reached through a TLB. So it is freed by
+//! [`Shootdown::retire`], which runs the release only after every processor has answered, and
+//! never at all if one does not: a frame nobody may reuse is leaked, for good.
+//!
 //! # What the caller must uphold
 //!
 //! It must hold no lock that another processor may wait for with interrupts disabled: that
@@ -369,6 +375,35 @@ impl<const CPUS: usize> Shootdown<CPUS> {
                 ticks: hardware.now().wrapping_sub(start),
             })
         })
+    }
+}
+
+impl<const CPUS: usize> Shootdown<CPUS> {
+    /// The deferred free: `value` is what the caller has just taken out of the page tables
+    /// (`request` and `scope` say which translations can still lead to it), and `release` gets it
+    /// back only once no processor can reach it any more.
+    ///
+    /// On [`Stalled`] a processor may still hold a translation: `release` does not run, and
+    /// `value` is forgotten. What it owns stays allocated for good, which is the only way to be
+    /// sure it is not reused.
+    pub fn retire<T>(
+        &self,
+        hardware: &impl TlbHardware,
+        value: T,
+        request: Request,
+        scope: Scope,
+        release: impl FnOnce(T),
+    ) -> Result<Completed, Stalled> {
+        match self.shoot(hardware, request, scope) {
+            Ok(done) => {
+                release(value);
+                Ok(done)
+            }
+            Err(stalled) => {
+                core::mem::forget(value);
+                Err(stalled)
+            }
+        }
     }
 }
 
@@ -755,6 +790,79 @@ mod tests {
             .unwrap();
         assert_eq!(done.processors, 0);
         assert!(machine.ipis.lock().unwrap().is_empty());
+    }
+
+    /// What a retirement holds: counts its releases, and its destruction.
+    struct Retired<'a> {
+        dropped: &'a AtomicUsize,
+    }
+
+    impl Drop for Retired<'_> {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn a_retirement_releases_only_after_everyone_has_answered() {
+        let machine = Machine::default();
+        let shootdown = Shootdown::<2>::new();
+        shootdown.mark_online(&cpu(0, &machine));
+        shootdown.mark_online(&cpu(1, &machine));
+        let (released, dropped) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let stop = AtomicBool::new(false);
+        thread::scope(|s| {
+            let (shootdown, machine, stop) = (&shootdown, &machine, &stop);
+            s.spawn(move || {
+                let me = cpu(1, machine);
+                while !stop.load(Ordering::Relaxed) {
+                    shootdown.service(&me);
+                    thread::yield_now();
+                }
+            });
+            let done = shootdown
+                .retire(
+                    &cpu(0, machine),
+                    Retired { dropped: &dropped },
+                    Request::page(0x1000),
+                    Scope::Kernel,
+                    |retired| {
+                        // By now the other processor has dropped the translation.
+                        let invalidated = machine.invalidated.lock().unwrap();
+                        assert!(invalidated.contains(&(1, Request::page(0x1000))));
+                        released.fetch_add(1, Ordering::Relaxed);
+                        drop(retired);
+                    },
+                )
+                .unwrap();
+            assert_eq!(done.processors, 1);
+            stop.store(true, Ordering::Relaxed);
+        });
+        assert_eq!(released.load(Ordering::Relaxed), 1);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    /// Nothing that may still be reached is released, or even dropped: it is leaked.
+    #[test]
+    fn a_retirement_that_stalls_releases_nothing_and_leaks_the_value() {
+        let machine = Machine::default();
+        machine.ticking.store(true, Ordering::Relaxed);
+        let shootdown = Shootdown::<2>::new();
+        shootdown.mark_online(&cpu(0, &machine));
+        shootdown.mark_online(&cpu(1, &machine));
+        let (released, dropped) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let outcome = shootdown.retire(
+            &cpu(0, &machine),
+            Retired { dropped: &dropped },
+            Request::Everything,
+            Scope::Kernel,
+            |_| {
+                released.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+        assert_eq!(outcome, Err(Stalled { cpu: 1 }));
+        assert_eq!(released.load(Ordering::Relaxed), 0);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
     }
 
     #[test]

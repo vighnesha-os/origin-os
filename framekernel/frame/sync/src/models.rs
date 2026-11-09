@@ -78,6 +78,10 @@
 //!   initiator asked for; and two initiators shooting at each other both finish. A request for
 //!   one address space asks a processor in another for nothing, and still leaves no stale
 //!   translation on a processor entering or leaving that space as it runs.
+//! - The deferred free (`Shootdown::retire`): every access through a translation that was cached
+//!   when the page left the tables happens before the frame is released (Loom's cell reports any
+//!   pair that is not ordered), and an unmap that shoots down releases exactly once, also for a
+//!   frame mapped in two spaces and unmapped from each by a different processor (`RefCount`).
 //!
 //! # What is not proved
 //!
@@ -135,11 +139,13 @@ use std::sync::atomic::AtomicU64 as ExecutionCounter;
 
 use core::sync::atomic::Ordering::{self, Acquire, Relaxed, Release};
 
+use loom::cell::UnsafeCell;
 use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use loom::sync::{Arc, Notify};
 use loom::thread::{self, JoinHandle};
 
 use crate::floor::MonotonicFloor;
+use crate::refcount::RefCount;
 use crate::runqueue::RunQueue;
 use crate::shootdown::{Request, Scope, Shootdown, TlbHardware};
 use crate::wait::{Scheduler, TimedOut, WaitQueue};
@@ -1723,6 +1729,175 @@ fn shootdown_and_a_processor_leaving_the_space() {
             near.take_the_page_away(Scope::Space(THE_SPACE));
             assert!(!leaving.holds(), "{STALE}");
             world.finish(vec![serving]);
+        },
+    );
+}
+
+// ---------------------------------------------------------------- the deferred free
+
+/// What the frame holds once it has been reused: not anything its old mapping should see.
+const REUSED: u64 = 0xDEAD;
+
+/// A frame of memory: Loom's cell reports any two accesses that are not ordered.
+type ModelFrame = UnsafeCell<u64>;
+
+impl TlbCpu {
+    /// A user-mode access through this processor's TLB, if it still holds the translation.
+    fn touch(&self, frame: &ModelFrame) {
+        if self.holds() {
+            // SAFETY: the pointer is the cell's own; Loom's cell checks this access against
+            // every other, and panics if they are not ordered, which is the point of the model.
+            frame.with_mut(|p| unsafe { *p = 1 });
+        }
+    }
+
+    /// What `service` does in the shootdown interrupt, followed by the user code it interrupted
+    /// going on: if the translation is gone, there is no access.
+    fn take_interrupt_then_touch(&self, frame: &ModelFrame) {
+        self.world.kick[self.id].wait();
+        self.world.shootdown.service(self);
+        self.touch(frame);
+    }
+}
+
+/// The frame is released, and reused at once. Ordered after every access through a stale
+/// translation, or Loom says so.
+fn reuse(frame: &ModelFrame) {
+    // SAFETY: as in `touch`.
+    frame.with_mut(|p| unsafe { *p = REUSED });
+}
+
+/// A processor in user mode holds the translation and touches the page, before and after the
+/// interrupt. The frame is taken out of the tables and retired while it does: the release runs
+/// after every access that could use the translation.
+#[test]
+fn deferred_free_comes_after_the_last_use_of_a_stale_translation() {
+    check(
+        "deferred_free_comes_after_the_last_use_of_a_stale_translation",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let (near, user) = (tlb_cpu(&world, 0), tlb_cpu(&world, 1));
+            world.shootdown.mark_online(&near);
+            world.shootdown.mark_online(&user);
+            world.shootdown.switch_space(1, 0, THE_SPACE, || ());
+            world.tlb[1].store(true, Relaxed);
+            let frame = Arc::new(ModelFrame::new(0));
+            let running = {
+                let (me, frame) = (user.clone(), Arc::clone(&frame));
+                (
+                    1,
+                    thread::spawn(move || {
+                        me.touch(&frame);
+                        me.take_interrupt_then_touch(&frame);
+                        me.serve();
+                    }),
+                )
+            };
+            world.pte.store(0, Relaxed);
+            world
+                .shootdown
+                .retire(
+                    &near,
+                    Arc::clone(&frame),
+                    Request::page(THE_PAGE),
+                    Scope::Space(THE_SPACE),
+                    |frame| reuse(&frame),
+                )
+                .unwrap();
+            assert!(!user.holds(), "{STALE}");
+            world.finish(vec![running]);
+        },
+    );
+}
+
+/// A frame shared between two spaces: what each mapping holds of it, counted.
+struct SharedModelFrame {
+    frame: ModelFrame,
+    mappings: RefCount,
+    frees: AtomicU64,
+}
+
+impl SharedModelFrame {
+    /// A mapping is gone: the last one frees the frame.
+    fn release(&self) {
+        if self.mappings.release() {
+            reuse(&self.frame);
+            self.frees.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// One frame mapped in two address spaces. A processor in the first holds its translation and
+/// touches the page; two others unmap it, one from each space, at once. The frame is freed
+/// exactly once, after the last access, and only one of the two unmaps can be the one to do it.
+#[test]
+fn deferred_free_of_a_frame_shared_by_two_spaces() {
+    check(
+        "deferred_free_of_a_frame_shared_by_two_spaces",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let (first, second, user) =
+                (tlb_cpu(&world, 0), tlb_cpu(&world, 1), tlb_cpu(&world, 2));
+            for cpu in [&first, &second, &user] {
+                world.shootdown.mark_online(cpu);
+            }
+            world.shootdown.switch_space(2, 0, THE_SPACE, || ());
+            world.tlb[2].store(true, Relaxed);
+            let shared = Arc::new(SharedModelFrame {
+                frame: ModelFrame::new(0),
+                mappings: RefCount::one(),
+                frees: AtomicU64::new(0),
+            });
+            shared.mappings.retain();
+            let running = {
+                let (me, shared) = (user.clone(), Arc::clone(&shared));
+                (
+                    2,
+                    thread::spawn(move || {
+                        me.touch(&shared.frame);
+                        me.take_interrupt_then_touch(&shared.frame);
+                        me.serve();
+                    }),
+                )
+            };
+            let unmap_second = {
+                let (me, shared) = (second.clone(), Arc::clone(&shared));
+                thread::spawn(move || {
+                    let world = Arc::clone(&me.world);
+                    world
+                        .shootdown
+                        .retire(
+                            &me,
+                            Arc::clone(&shared),
+                            Request::page(THE_PAGE),
+                            Scope::Space(OTHER_SPACE),
+                            |shared| shared.release(),
+                        )
+                        .unwrap();
+                })
+            };
+            world.pte.store(0, Relaxed);
+            world
+                .shootdown
+                .retire(
+                    &first,
+                    Arc::clone(&shared),
+                    Request::page(THE_PAGE),
+                    Scope::Space(THE_SPACE),
+                    |shared| shared.release(),
+                )
+                .unwrap();
+            unmap_second.join().unwrap();
+            world.finish(vec![running]);
+            assert_eq!(
+                shared.frees.load(Relaxed),
+                1,
+                "the frame was not freed once"
+            );
         },
     );
 }

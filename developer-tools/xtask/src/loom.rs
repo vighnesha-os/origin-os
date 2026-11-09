@@ -95,6 +95,12 @@ const WENT_BACK: &[&str] = &["the clock went backwards"];
 const STALE: &[&str] = &["a processor kept a translation the shootdown took away"];
 /// A wait that can never end: to Loom, a processor spinning for ever.
 const NEVER_ENDS: &[&str] = &["Model exceeded maximum number of branches", "deadlock"];
+/// The frame was reused while something could still reach it, or two things reused it.
+const REUSED_TOO_SOON: &[&str] = &[
+    "Causality violation",
+    "the frame was not freed once",
+    "a processor kept a translation the shootdown took away",
+];
 const LOST_UPDATE: &[&str] = &["the floor is the largest reading"];
 
 /// One deliberate bug, and the models that must find it.
@@ -116,6 +122,7 @@ const RUN_QUEUE: &str = "framekernel/src/runqueue.rs";
 const MODELS: &str = "framekernel/frame/sync/src/models.rs";
 const FLOOR: &str = "framekernel/frame/sync/src/floor.rs";
 const SHOOTDOWN: &str = "framekernel/frame/sync/src/shootdown.rs";
+const REFCOUNT: &str = "framekernel/frame/sync/src/refcount.rs";
 
 /// `WaitQueue::take_all`'s one critical section.
 const TAKE_ALL: &str = "        scheduler.without_interrupts(|| core::mem::replace(&mut *self.waiters.lock(), [None; N]))\n";
@@ -694,6 +701,7 @@ const CONTROLS: &[Control] = &[
         models: &[
             ("shootdown_reaches_an_online_processor", STALE),
             ("shootdown_two_initiators_serve_each_other", STALE),
+            ("deferred_free_comes_after_the_last_use_of_a_stale_translation", REUSED_TOO_SOON),
         ],
     },
     Control {
@@ -710,7 +718,10 @@ const CONTROLS: &[Control] = &[
         file: SHOOTDOWN,
         from: "            hardware.invalidate(Request::decode(self.request.load(Ordering::Relaxed)));\n",
         to: "            let _ = self.request.load(Ordering::Relaxed);\n",
-        models: &[("shootdown_reaches_an_online_processor", STALE)],
+        models: &[
+            ("shootdown_reaches_an_online_processor", STALE),
+            ("deferred_free_comes_after_the_last_use_of_a_stale_translation", REUSED_TOO_SOON),
+        ],
     },
     Control {
         // The answer is not ordered with the invalidation it reports.
@@ -718,7 +729,10 @@ const CONTROLS: &[Control] = &[
         file: SHOOTDOWN,
         from: "            served.store(generation, Ordering::Release);\n",
         to: "            served.store(generation, Ordering::Relaxed);\n",
-        models: &[("shootdown_reaches_an_online_processor", STALE)],
+        models: &[
+            ("shootdown_reaches_an_online_processor", STALE),
+            ("deferred_free_comes_after_the_last_use_of_a_stale_translation", REUSED_TOO_SOON),
+        ],
     },
     Control {
         // The request is not published with its generation: a target can read the previous
@@ -796,6 +810,54 @@ const CONTROLS: &[Control] = &[
             "shootdown_for_a_space_asks_only_the_processors_in_it",
             &["a shootdown for one space reached a processor in another", "deadlock", "Model exceeded maximum number of branches"],
         )],
+    },
+    // The deferred free (N14 step 3, S3-5a).
+    Control {
+        // The frame goes back to the allocator as soon as it leaves the tables.
+        name: "released_before_the_shootdown",
+        file: SHOOTDOWN,
+        from: "        match self.shoot(hardware, request, scope) {
+            Ok(done) => {
+                release(value);
+                Ok(done)
+            }
+            Err(stalled) => {
+                core::mem::forget(value);
+                Err(stalled)
+            }
+        }
+",
+        to: "        release(value);
+        self.shoot(hardware, request, scope)
+",
+        models: &[
+            ("deferred_free_comes_after_the_last_use_of_a_stale_translation", REUSED_TOO_SOON),
+            ("deferred_free_of_a_frame_shared_by_two_spaces", REUSED_TOO_SOON),
+        ],
+    },
+    Control {
+        // Giving up a reference does not publish what its holder did with the frame.
+        name: "reference_released_relaxed",
+        file: REFCOUNT,
+        from: "self.count.fetch_sub(1, Ordering::Release)",
+        to: "self.count.fetch_sub(1, Ordering::Relaxed)",
+        models: &[("deferred_free_of_a_frame_shared_by_two_spaces", REUSED_TOO_SOON)],
+    },
+    Control {
+        // Whoever is last does not see what the others did with the frame.
+        name: "last_reference_without_a_fence",
+        file: REFCOUNT,
+        from: "        prim::fence(Ordering::Acquire);\n        true\n",
+        to: "        true\n",
+        models: &[("deferred_free_of_a_frame_shared_by_two_spaces", REUSED_TOO_SOON)],
+    },
+    Control {
+        // The first unmapper thinks it is the last.
+        name: "a_shared_frame_freed_by_the_first_unmap",
+        file: REFCOUNT,
+        from: "!= 1 {\n            return false;\n",
+        to: "!= 2 {\n            return false;\n",
+        models: &[("deferred_free_of_a_frame_shared_by_two_spaces", REUSED_TOO_SOON)],
     },
     Control {
         // Nobody is in the space, as far as the initiator can tell.
