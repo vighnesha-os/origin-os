@@ -160,7 +160,7 @@ const CONTROLS: &[Control] = &[
         name: "failed_try_lock_unlocks",
         file: SPIN_LOCK,
         from: "            Err(_) => None,\n",
-        to: "            Err(_) => {\n                drop(SpinGuard { lock: self });\n                None\n            }\n",
+        to: "            Err(_) => {\n                drop(SpinGuard { lock: self, _shares_t: PhantomData });\n                None\n            }\n",
         models: &[(
             "try_lock_leaves_a_held_lock_held",
             &["Causality violation", "a lost update"],
