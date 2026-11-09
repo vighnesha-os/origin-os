@@ -34,6 +34,7 @@ const DATA: u64 = 0x50_0000;
 const LIMITS: Limits = Limits {
     handles: 16,
     channels: 4,
+    message_bytes: 1 << 20,
     debug_calls: true,
 };
 

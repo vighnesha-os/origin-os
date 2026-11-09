@@ -784,6 +784,7 @@ impl Image {
 const LIMITS: Limits = Limits {
     handles: 64,
     channels: 32,
+    message_bytes: 1 << 20,
     debug_calls: true,
 };
 
@@ -1478,6 +1479,7 @@ fn quotas(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let limits = Limits {
         handles: 12,
         channels: 4,
+        message_bytes: 1 << 20,
         debug_calls: true,
     };
     let limit = Error::Limit.raw();
@@ -1506,6 +1508,155 @@ fn quotas(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         steps,
     }];
     let Some(mut image) = Image::new(limits, script_program()) else {
+        return false;
+    };
+    if image.scratch().is_none() || image.script(&group[0].steps).is_none() {
+        return false;
+    }
+    let process = image.finish();
+    if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
+        return false;
+    }
+    let ended = await_end(&process, tsc_hz, 10);
+    let groups_ok = check_groups(com1, &group, &process.reports());
+    ended && groups_ok && process.ending() == Some(Ending::Exited(0))
+}
+
+/// Queued messages are charged to the process that sent them, by the heap they hold (P11): a
+/// writer reaches its byte quota and gets `LIMIT`, nothing else changes, and its peer, on
+/// another processor with its own quota, goes on working. The writer's bytes come back when
+/// the peer reads them, and when what is left is read or its end closes.
+fn byte_quota(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    // 17 bytes round up to a 32-byte heap block. The quota holds two messages; counted
+    // unrounded, a third (51 of 64 bytes) would have fit.
+    let limits = Limits {
+        handles: 16,
+        channels: 4,
+        message_bytes: 64,
+        debug_calls: true,
+    };
+    let (Some(mut writer), Some(mut peer)) = (
+        Image::new(limits, script_program()),
+        Image::new(LIMITS, script_program()),
+    ) else {
+        return false;
+    };
+    let Ok((end_a, end_b)) = ipc::create_channel(&writer.process.account) else {
+        return false;
+    };
+    let (Ok(ha), Ok(hb)) = (
+        writer
+            .process
+            .grant(Object::Channel(end_a), rights::CHANNEL),
+        peer.process.grant(Object::Channel(end_b), rights::CHANNEL),
+    ) else {
+        return false;
+    };
+    let (held_w, held_p) = (Imm(u64::from(ha)), Imm(u64::from(hb)));
+    let writer_steps = alloc::vec![
+        write("the first", held_w, MSG, 17, OK),
+        write("the second", held_w, MSG, 17, OK),
+        write(
+            "the third is over the quota",
+            held_w,
+            MSG,
+            17,
+            Error::Limit.raw()
+        ),
+        wait(
+            "the peer answers",
+            held_w,
+            signals::READABLE,
+            DEADLINE_INFINITE,
+            OK
+        ),
+        read("the answer", held_w, RBUF, 16, OK),
+        write("written after the peer read", held_w, MSG, 17, OK),
+    ];
+    // The peer never reads the writer's last message: its exit closes the end the message
+    // is queued for, and that refunds it.
+    let peer_steps = alloc::vec![
+        read("the first", held_p, RBUF, 32, OK),
+        read("the second", held_p, RBUF, 32, OK),
+        write("its answer", held_p, MSG, 16, OK),
+        wait("", held_p, signals::PEER_CLOSED, DEADLINE_INFINITE, OK),
+    ];
+    if writer.scratch().is_none()
+        || writer.script(&writer_steps).is_none()
+        || peer.scratch().is_none()
+        || peer.script(&peer_steps).is_none()
+    {
+        return false;
+    }
+    let (writer, peer) = (writer.finish(), peer.finish());
+    if Process::start_thread(&writer, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
+        return false;
+    }
+    // The peer starts once the writer has been refused and waits for the answer, so the
+    // quota is full when it is proven full.
+    sched::yield_until(|| writer.waiting.load(Ordering::Acquire) > 0, tsc_hz, 5);
+    if Process::start_thread(&peer, far, CODE, STACK + PAGE, SCRIPT).is_err() {
+        return false;
+    }
+    let ended = await_end(&writer, tsc_hz, 10) && await_end(&peer, tsc_hz, 10);
+    let writer_group = [Group {
+        title: "a writer over its byte quota",
+        steps: writer_steps,
+    }];
+    let peer_group = [Group {
+        title: "its peer, unaffected",
+        steps: peer_steps,
+    }];
+    let groups_ok = check_groups(com1, &writer_group, &writer.reports())
+        & check_groups(com1, &peer_group, &peer.reports());
+    let charged = (writer.account.queued_bytes(), peer.account.queued_bytes());
+    let right = ended
+        && groups_ok
+        && charged == (0, 0)
+        && writer.ending() == Some(Ending::Exited(0))
+        && peer.ending() == Some(Ending::Exited(0));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: queued messages are charged to their sender and refunded on read and close: {} and {} bytes still charged{}",
+        charged.0,
+        charged.1,
+        if right { "" } else { ": ipc failed" }
+    );
+    right
+}
+
+/// The check that a transfer cannot build a reference cycle walks up the chain of queues
+/// holding an end, and the walk is bounded (`ipc::MAX_HOLDER_DEPTH`): a transfer into an end
+/// nested exactly that deep is accepted, one nested a link deeper gets `LIMIT`, and the
+/// process goes on.
+fn transfer_depth(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let depth = ipc::MAX_HOLDER_DEPTH as u64;
+    // Channel i holds its ends in slots 2i and 2i + 1. A transfer into channel 0 walks up
+    // from its peer end: that end is queued in channel 1, whose peer end is queued in
+    // channel 2, and so on. `extra` is a channel whose ends are sent through channel 0.
+    let extra = depth + 2;
+    let mut steps = Vec::new();
+    for channel in 0..=extra {
+        steps.push(create(2 * channel));
+    }
+    // Links 1 to `depth`: the peer end of channel i goes into channel i + 1.
+    for channel in 0..depth {
+        steps.push(copy32(slot_addr(2 * channel + 1), LIST));
+        steps.push(send("", h(2 * channel + 2), 1, OK));
+    }
+    steps.push(copy32(slot_addr(2 * extra), LIST));
+    steps.push(send("nested to the limit", h(0), 1, OK));
+    // One more link, and a transfer that would have to walk it is refused.
+    steps.push(copy32(slot_addr(2 * depth + 1), LIST));
+    steps.push(send("", h(2 * depth + 2), 1, OK));
+    steps.push(copy32(slot_addr(2 * extra + 1), LIST));
+    steps.push(send("a link deeper", h(0), 1, Error::Limit.raw()));
+    let group = [Group {
+        title: "transfers into nested ends",
+        steps,
+    }];
+    let Some(mut image) = Image::new(LIMITS, script_program()) else {
         return false;
     };
     if image.scratch().is_none() || image.script(&group[0].steps).is_none() {
@@ -1792,6 +1943,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
     ok &= exit_closes(com1, cpus, bsp, tsc_hz);
     ok &= cancel(com1, cpus, bsp, tsc_hz);
     ok &= quotas(com1, bsp, tsc_hz);
+    ok &= byte_quota(com1, cpus, bsp, tsc_hz);
+    ok &= transfer_depth(com1, bsp, tsc_hz);
     ok &= big_message(com1, bsp, tsc_hz);
     ok &= abi_and_entry(com1, bsp, tsc_hz);
     ok &= copy_fault_recovered(com1);

@@ -258,7 +258,7 @@ fn channel_write(
         *value = u32::from_le_bytes(*chunk);
     }
     let transfer = values.get(..count).ok_or(Error::InvalidArgs)?;
-    ipc::channel_write(&p.handles, handle, payload, transfer)
+    ipc::channel_write(&p.handles, &p.account, handle, payload, transfer)
 }
 
 /// `channel_read(handle, bytes, capacity, handles, capacity, out_sizes)`.

@@ -1297,6 +1297,10 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
     markers.extend([
         "origin-kernel: ipc: a thread in wait_one on a handle another thread closes completes with CANCELED".to_string(),
         "origin-kernel: ipc: quotas: a fifth channel -> LIMIT, a thirteenth handle -> LIMIT, one more after a close -> OK, still working -> OK".into(),
+        "origin-kernel: ipc: a writer over its byte quota: the first -> OK, the second -> OK, the third is over the quota -> LIMIT, the peer answers -> OK, the answer -> OK, written after the peer read -> OK".into(),
+        "origin-kernel: ipc: its peer, unaffected: the first -> OK, the second -> OK, its answer -> OK".into(),
+        "origin-kernel: ipc: queued messages are charged to their sender and refunded on read and close: 0 and 0 bytes still charged".into(),
+        "origin-kernel: ipc: transfers into nested ends: nested to the limit -> OK, a link deeper -> LIMIT".into(),
         "origin-kernel: ipc: a full-size message: sixty-four KiB -> OK, received -> OK, bytes -> 0x10000".into(),
         "origin-kernel: ipc: 64 KiB through a channel and back, byte for byte: true".into(),
         "origin-kernel: ipc: registers: every register but RAX, RCX and R11 survives a system call: true".into(),
