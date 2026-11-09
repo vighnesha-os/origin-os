@@ -29,6 +29,7 @@ use core::slice;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use framekernel::boot::{self, InvalidBootInfo, MemorySummary};
+use framekernel::bootproof::{Proof, Tally};
 
 use crate::console::Console;
 use framekernel::report;
@@ -133,6 +134,8 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // From here on every processor prints through the console, a line at a time.
     console::init(uart, firmware_line);
     let mut com1 = console::Console::new();
+    // What each boot proof found, and what that means for this boot (ADR-0013).
+    let mut proofs = Tally::new();
 
     // SAFETY: `boot_info` is the loader's pointer, passed on unchanged, and this function's
     // contract is exactly `read_boot_info`'s.
@@ -213,7 +216,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         let _ = writeln!(com1, ": CPU baseline failed");
         halt();
     }
-    prove_backtrace(&mut com1, &info);
+    proofs.record(Proof::Backtrace, prove_backtrace(&mut com1, &info));
 
     // M2, second step: the physical frame allocator over the boot-info regions, with a
     // pool of frames for page tables beside its bitmap.
@@ -229,11 +232,14 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // The kernel's own tables are loaded, so firmware tables can be mapped: the console's
     // UART is the one the firmware names, if it names one (ADR-0010).
     console::adopt_firmware_uart(&mut com1, info.acpi_rsdp, regions);
+    // After the UART is settled, so the refusal reaches the console the firmware names.
+    record_or_stop(&mut com1, &mut proofs, Proof::PageTables, paging);
     // Threat T4: stop every device the firmware left bus-mastering as soon as the kernel can
     // reach configuration space, before it claims any more memory for itself.
     let mut quiesced = None;
     if paging {
-        prove_frames(&mut com1, &mut alloc);
+        let frames = prove_frames(&mut com1, &mut alloc);
+        record_or_stop(&mut com1, &mut proofs, Proof::FrameAllocator, frames);
         // M2: the kernel heap, which takes over the frame allocator; from here on the
         // `alloc` crate works in the kernel.
         memory::init(alloc);
@@ -243,7 +249,13 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
             regions,
             &iommu::own_functions(info.acpi_rsdp),
         );
+        // Every driver is refused if this failed (`DeviceDma`): only the verdict is left to do.
+        proofs.record(
+            Proof::BusMasterQuiesce,
+            quiesced.is_some() && pcie::quiesced(),
+        );
         heap_ok = prove_heap(&mut com1);
+        record_or_stop(&mut com1, &mut proofs, Proof::Heap, heap_ok);
         if heap_ok && !prove_user_isolation(&mut com1) {
             // Ring 3 comes next: a kernel that cannot keep itself from user pages must not
             // run it, any more than a processor below the baseline (and `prove_user_isolation`
@@ -259,18 +271,22 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // M2, fourth step: interrupts. The local APIC in x2APIC mode, its timer calibrated
     // against the PIT and proven by taking periodic interrupts.
     let tsc_hz = timer::init(&mut com1);
+    record_or_stop(&mut com1, &mut proofs, Proof::ApicTimer, tsc_hz.is_some());
     if let Some(hz) = tsc_hz {
         if let Some(q) = quiesced.as_mut() {
-            pcie::settle(&mut com1, q, hz);
+            proofs.record(Proof::BusMastersSettled, pcie::settle(&mut com1, q, hz));
         }
-        prove_nmi_ist(&mut com1);
+        proofs.record(Proof::NmiStack, prove_nmi_ist(&mut com1));
         // The clocks: the monotonic clock's TSC rate, proven against the RTC, and the wall
         // clock from the RTC (CLAUDE.md §68).
-        time::init(&mut com1, hz, info.acpi_rsdp);
+        proofs.record(Proof::Clocks, time::init(&mut com1, hz, info.acpi_rsdp));
         // I/O APIC interrupt routing, proven by routing the PIT's IRQ0 (CLAUDE.md §24).
         // SAFETY: the BSP's APIC is in x2APIC mode (timer::init) and the PICs are masked.
         let bsp = unsafe { timer::X2Apic::enable() }.read(timer::ApicRead::Id) as u32;
-        irq::prove(&mut com1, info.acpi_rsdp, bsp, hz);
+        proofs.record(
+            Proof::IoApic,
+            irq::prove(&mut com1, info.acpi_rsdp, bsp, hz),
+        );
     }
 
     // M3, first step: start the application processors the ACPI MADT lists. It needs the
@@ -286,7 +302,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         // compatibility-format I/O APIC proof above, which interrupt remapping would block.
         // It runs whether or not the bus-master quiesce succeeded: confining a device that kept
         // mastering the bus is exactly what a failed quiesce leaves to it.
-        iommu::init(&mut com1, info.acpi_rsdp);
+        proofs.record(Proof::Iommu, iommu::init(&mut com1, info.acpi_rsdp));
         if iommu::translating() {
             let _ = writeln!(
                 com1,
@@ -295,6 +311,10 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
             );
         }
         let online = smp::start(&mut com1, &info, regions, tsc_hz);
+        proofs.record(Proof::Processors, online.complete());
+        // What each processor put in its own control registers, which ring 3 relies on.
+        let held = cpu::cpu_states_holding(online.cpus()) == online.cpus().len();
+        record_or_stop(&mut com1, &mut proofs, Proof::CpuState, held);
         // M2 completion: once every enabled processor has left firmware code, the loader's
         // and the firmware's boot-time memory belongs to the kernel.
         if online.complete()
@@ -310,69 +330,97 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         // CPU topology from CPUID, each processor's on itself, checked against the MADT
         // (CLAUDE.md §24, §27).
         let apic_ids = online.apic_ids();
-        prove_topology(&mut com1, info.acpi_rsdp, &online);
+        let topology = prove_topology(&mut com1, info.acpi_rsdp, &online);
+        proofs.record(Proof::Topology, topology);
         // NUMA affinities from the ACPI SRAT (CLAUDE.md §24, §28).
-        prove_numa(&mut com1, info.acpi_rsdp, &apic_ids);
+        let numa = prove_numa(&mut com1, info.acpi_rsdp, &apic_ids);
+        proofs.record(Proof::Numa, numa);
         // Inter-node distances from the ACPI SLIT (CLAUDE.md §27, §28).
-        prove_slit(&mut com1, info.acpi_rsdp);
+        proofs.record(Proof::NumaDistances, prove_slit(&mut com1, info.acpi_rsdp));
         // Hardware entropy from RDSEED/RDRAND (CLAUDE.md §59).
-        prove_entropy(&mut com1, &features);
-        // M3, second step: preemptive kernel threads on every online processor.
-        sched::prove(&mut com1, online.cpus(), tsc_hz);
+        proofs.record(Proof::Entropy, prove_entropy(&mut com1, &features));
+        // M3, second step: preemptive kernel threads on every online processor. Its proofs
+        // run to the end and are judged together (ADR-0013 R4): the proofs after a failure
+        // use only the kernel's fixed programs, and the operator sees every result.
+        sched::prove(&mut com1, online.cpus(), tsc_hz, &mut proofs);
+        stop_if_refused(&mut com1, proofs);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
         if let Some(q) = quiesced.as_mut()
             && let Some(reserved) = pcie::reserved_ranges(&mut com1, q, info.acpi_rsdp)
             && pcie::init(&mut com1, q, online.cpus(), regions, &reserved)
         {
+            proofs.record(Proof::Pcie, true);
             // Anything that turned bus mastering back on is stopped again before any driver
             // attaches.
-            pcie::check_quiet(&mut com1, q);
+            proofs.record(Proof::BusMastersQuiet, pcie::check_quiet(&mut com1, q));
             // M5: the NVMe driver and block I/O, polled and then interrupt-driven.
-            storage::init(&mut com1, online.cpus(), tsc_hz);
+            proofs.record(Proof::Nvme, storage::init(&mut com1, online.cpus(), tsc_hz));
             // M10: bring up the virtio-net NIC; an interrupt-driven receive thread takes the
-            // OS onto the network (CLAUDE.md §31, §54).
+            // OS onto the network (CLAUDE.md §31, §54). The one proof not in the verdict yet
+            // (ADR-0013): `virtionet` returns nothing, and it prints each failure itself.
             virtionet::prove(&mut com1, online.cpus(), tsc_hz);
             // The IOMMU's own proofs, through the bound NVMe controller: translated DMA, a
             // blocked and recorded DMA, remapped and blocked interrupts.
-            storage::prove_iommu(&mut com1, online.cpus(), tsc_hz);
+            let devices = storage::prove_iommu(&mut com1, online.cpus(), tsc_hz);
+            proofs.record(Proof::IommuDevices, devices);
             // Legacy interrupts under interrupt remapping: the PIT's IRQ0 through the I/O
             // APIC in remappable format and an IRTE that checks the I/O APIC's source ID,
             // with the IRTE made not present and given a wrong source ID (CLAUDE.md §24,
             // §32; ADR-0007 I8).
-            irq::prove_remapped(&mut com1, online.cpus(), tsc_hz);
+            let remapped = irq::prove_remapped(&mut com1, online.cpus(), tsc_hz);
+            proofs.record(Proof::IoApicRemapped, remapped);
             // Bus mastering is on exactly for what the drivers attached to a domain.
-            pcie::prove_bus_mastering(&mut com1, q);
+            let mastering = pcie::prove_bus_mastering(&mut com1, q);
+            proofs.record(Proof::BusMastering, mastering);
+        } else {
+            proofs.record(Proof::Pcie, false);
         }
         sched::stop_boot_processor();
     }
 
     // M8/M9 groundwork: the in-memory VFS (paths, directories, files).
-    prove_vfs(&mut com1);
+    proofs.record(Proof::Vfs, prove_vfs(&mut com1));
     // §21 groundwork: extract an embedded initramfs (a ustar image) into a VFS.
-    prove_initramfs(&mut com1);
+    proofs.record(Proof::Initramfs, prove_initramfs(&mut com1));
     // M8 groundwork: the software rasterizer draws a fixed scene whose CRC must match the
     // host-proven one, bit for bit.
-    prove_raster(&mut com1);
+    proofs.record(Proof::Raster, prove_raster(&mut com1));
     // M10 groundwork: the i8042 PS/2 controller bring-up (CLAUDE.md §56).
-    i8042::init(&mut com1);
+    proofs.record(Proof::I8042, i8042::init(&mut com1));
     // Networking groundwork: build and parse an ICMP echo through a loopback (CLAUDE.md §54).
-    prove_net(&mut com1);
+    proofs.record(Proof::Net, prove_net(&mut com1));
     // TCP: a full connection over an in-memory loopback (CLAUDE.md §54).
-    prove_tcp(&mut com1);
+    proofs.record(Proof::Tcp, prove_tcp(&mut com1));
     // The monotonic timer queue, driven by the real clock (CLAUDE.md §68).
-    prove_timers(&mut com1);
+    proofs.record(Proof::TimerQueue, prove_timers(&mut com1));
     // Integration: a read-only /sys tree in the VFS carrying live discovered facts.
-    prove_sysfs(&mut com1);
+    proofs.record(Proof::Sysfs, prove_sysfs(&mut com1));
 
+    // The operator's summary: everything above scrolls past on a real machine's screen.
+    let _ = proofs.write_verdict(&mut com1);
     let _ = report::write_halt(&mut com1);
     halt()
+}
+
+/// Records one proof's result, and stops the boot if that result says to (ADR-0013).
+fn record_or_stop(com1: &mut Console, proofs: &mut Tally, proof: Proof, passed: bool) {
+    proofs.record(proof, passed);
+    stop_if_refused(com1, *proofs);
+}
+
+/// Halts if a recorded failure means the kernel must stop (ADR-0013 R1), having said which.
+fn stop_if_refused(com1: &mut Console, proofs: Tally) {
+    if proofs.must_stop() {
+        let _ = proofs.write_refusal(com1);
+        halt();
+    }
 }
 
 /// Builds a read-only `/sys`-style tree in the VFS from facts several subsystems
 /// discovered (free memory, the TSC rate, the PCIe device count, the NVMe disk size),
 /// then reads values back and checks they parse to the discovered numbers. This shows the
 /// VFS carrying a live system namespace built from real hardware state.
-fn prove_sysfs(com1: &mut console::Console) {
+fn prove_sysfs(com1: &mut console::Console) -> bool {
     use framekernel::vfs::Vfs;
     // Gather the facts.
     let free_mib = memory::stats().map_or(0, |(_, free)| (free * memory::FRAME) >> 20);
@@ -414,6 +462,7 @@ fn prove_sysfs(com1: &mut console::Console) {
         "origin-kernel: sysfs: built /sys with {n} facts ({dirs} subtrees): mem/free_mib={free_mib}, cpu/tsc_mhz={tsc_mhz}, bus/pci/count={pci}, block/nvme0/size_mib={disk_mib}; read back pci count {parsed:?}{}",
         if ok { "" } else { ": sysfs failed" }
     );
+    ok
 }
 
 /// Writes `value` as decimal into `buf`, returning the written slice.
@@ -442,7 +491,7 @@ fn format_u64(value: u64, buf: &mut [u8; 20]) -> &[u8] {
 /// (`Verdict::Late`: a poll that did not fire a timer already that overdue). A run a stall
 /// left undecided is measured again, up to `TIMER_ATTEMPTS` runs; a timer that fires in the
 /// wrong order, or one decisively late, fails at once.
-fn prove_timers(com1: &mut console::Console) {
+fn prove_timers(com1: &mut console::Console) -> bool {
     use framekernel::timers::{Firing, TimerQueue, Verdict, judge};
     /// Runs the proof may make; each costs about 15 ms, and only a run a stall left undecided
     /// leads to another, so an undisturbed boot pays for one. Measured with two `yes` per
@@ -515,11 +564,12 @@ fn prove_timers(com1: &mut console::Console) {
         },
         if ok { "" } else { ": timers failed" }
     );
+    ok
 }
 
 /// Proves the TCP connection core on the heap: a loopback connection establishes,
 /// carries a payload and closes (CLAUDE.md §54).
-fn prove_tcp(com1: &mut console::Console) {
+fn prove_tcp(com1: &mut console::Console) -> bool {
     let payload = b"origin-os tcp loopback payload";
     let ok = framekernel::tcp::loopback_demo(payload);
     let _ = writeln!(
@@ -528,12 +578,13 @@ fn prove_tcp(com1: &mut console::Console) {
         payload.len(),
         if ok { "" } else { ": tcp failed" }
     );
+    ok
 }
 
 /// Proves the network packet layer on the heap: builds an Ethernet/IPv4/ICMP echo request
 /// from host A to host B, has B parse it and build a reply, and checks A matches the reply
 /// to its request with the payload intact and the checksums valid (CLAUDE.md §54).
-fn prove_net(com1: &mut console::Console) {
+fn prove_net(com1: &mut console::Console) -> bool {
     use framekernel::net::{
         EthFrame, IcmpEcho, Ipv4, Ipv4Packet, Mac, Udp, ethertype, icmp_type, protocol,
     };
@@ -562,7 +613,7 @@ fn prove_net(com1: &mut console::Console) {
             com1,
             "origin-kernel: net: cannot build the request: net failed"
         );
-        return;
+        return false;
     };
     // Host B receives and replies; host A checks the reply.
     let ok = (|| {
@@ -612,17 +663,18 @@ fn prove_net(com1: &mut console::Console) {
         "origin-kernel: net: {len}-byte Ethernet/IPv4/ICMP echo built, parsed and replied; a UDP datagram round-tripped {udp_ok}; payload and checksums intact {ok}{}",
         if all { "" } else { ": net failed" }
     );
+    all
 }
 
 /// Renders the rasterizer's fixed demonstration scene to a heap surface and checks its
 /// CRC-32 equals the constant the host test proved, so the kernel and host renderers agree
 /// bit for bit (CLAUDE.md §52 the software fallback).
-fn prove_raster(com1: &mut console::Console) {
+fn prove_raster(com1: &mut console::Console) -> bool {
     use framekernel::raster::{DEMO_CRC, DEMO_HEIGHT, DEMO_WIDTH, Surface, demo_scene};
     let mut buf = alloc::vec![0u32; (DEMO_WIDTH * DEMO_HEIGHT) as usize];
     let Some(mut surface) = Surface::new(&mut buf, DEMO_WIDTH, DEMO_HEIGHT, DEMO_WIDTH) else {
         let _ = writeln!(com1, "origin-kernel: raster: bad surface: raster failed");
-        return;
+        return false;
     };
     demo_scene(&mut surface);
     let mut running = 0xFFFF_FFFFu32;
@@ -636,12 +688,13 @@ fn prove_raster(com1: &mut console::Console) {
         "origin-kernel: raster: {DEMO_WIDTH}x{DEMO_HEIGHT} scene rendered, CRC {crc:#010x} (expected {DEMO_CRC:#010x}){}",
         if ok { "" } else { ": raster failed" }
     );
+    ok
 }
 
 /// Proves the in-memory VFS on the heap: builds a small tree, writes and reads a file
 /// through `..`, lists and removes, and checks the node count returns to the root alone
 /// (no leak). A failure in any step shows in the reported counts.
-fn prove_vfs(com1: &mut console::Console) {
+fn prove_vfs(com1: &mut console::Console) -> bool {
     use framekernel::vfs::{Kind, Vfs};
     let mut fs = Vfs::new(1 << 20, 64);
     let start = fs.node_count();
@@ -685,6 +738,7 @@ fn prove_vfs(com1: &mut console::Console) {
         fs.node_count(),
         if ok { "" } else { ": vfs failed" }
     );
+    ok
 }
 
 /// The initramfs image (a ustar archive) built into the kernel. The NIC proof also fetches
@@ -695,7 +749,7 @@ pub(crate) static INITRAMFS_IMAGE: &[u8] = include_bytes!("../assets/initramfs.t
 /// (CLAUDE.md §21 initial system deployment). Proves `ustar` + `initramfs` + `vfs` working
 /// end-to-end in the kernel on a real image: the entry count, a file's contents read back,
 /// and that a file whose parent directory the archive never listed was still created.
-fn prove_initramfs(com1: &mut console::Console) {
+fn prove_initramfs(com1: &mut console::Console) -> bool {
     let check = check_initramfs(INITRAMFS_IMAGE);
     let _ = writeln!(
         com1,
@@ -706,6 +760,7 @@ fn prove_initramfs(com1: &mut console::Console) {
         check.ok,
         if check.ok { "" } else { ": initramfs failed" }
     );
+    check.ok
 }
 
 /// What extracting an initramfs image into a fresh VFS showed.
@@ -753,7 +808,7 @@ pub(crate) fn check_initramfs(image: &[u8]) -> InitramfsCheck {
 ///   the resulting package, die, module and core counts with the machine it asked QEMU for.
 ///
 /// None of this reads the QEMU machine definition; the counts are only printed here.
-fn prove_topology(com1: &mut console::Console, rsdp: u64, online: &smp::Online) {
+fn prove_topology(com1: &mut console::Console, rsdp: u64, online: &smp::Online) -> bool {
     use framekernel::topology::{self, CpuTopology, Layout, Source};
 
     // The boot processor's own record; every AP wrote its own before it came online.
@@ -896,6 +951,7 @@ fn prove_topology(com1: &mut console::Console, rsdp: u64, online: &smp::Online) 
         consistent,
         if consistent { "" } else { ": topology failed" }
     );
+    consistent
 }
 
 /// Reports NUMA proximity domains from the ACPI SRAT (CLAUDE.md §24 NUMA topology, §28 NUMA
@@ -903,7 +959,7 @@ fn prove_topology(com1: &mut console::Console, rsdp: u64, online: &smp::Online) 
 /// `-numa`), that is reported as a single implicit node. Otherwise every online processor
 /// must appear as an enabled CPU affinity and some memory must be present, or the line reads
 /// `consistent false`.
-fn prove_numa(com1: &mut console::Console, rsdp: u64, ids: &[u32]) {
+fn prove_numa(com1: &mut console::Console, rsdp: u64, ids: &[u32]) -> bool {
     use framekernel::acpi::{self, CpuAffinity, MemoryAffinity};
 
     let Ok(srat) = crate::firmware::acpi_table(rsdp, b"SRAT") else {
@@ -911,7 +967,7 @@ fn prove_numa(com1: &mut console::Console, rsdp: u64, ids: &[u32]) {
             com1,
             "origin-kernel: numa: no SRAT (1 node assumed); consistent true"
         );
-        return;
+        return true;
     };
 
     // The SRAT lists every processor the platform may have (QEMU: all of `maxcpus`, each
@@ -927,7 +983,7 @@ fn prove_numa(com1: &mut console::Console, rsdp: u64, ids: &[u32]) {
             com1,
             "origin-kernel: numa: invalid SRAT; consistent false: numa failed"
         );
-        return;
+        return false;
     };
     let cpus = &cpus[..ncpu];
     let mems = &mems[..nmem];
@@ -971,26 +1027,27 @@ fn prove_numa(com1: &mut console::Console, rsdp: u64, ids: &[u32]) {
         consistent,
         if consistent { "" } else { ": numa failed" }
     );
+    consistent
 }
 
 /// Reports inter-node distances from the ACPI SLIT (CLAUDE.md §27 migration cost, §28 NUMA
 /// policies). The diagonal must be the normalized local distance 10 and every off-diagonal
 /// at least 10, or the line reads `consistent false`. A machine with no SLIT (uniform
 /// distance) is reported as such.
-fn prove_slit(com1: &mut console::Console, rsdp: u64) {
+fn prove_slit(com1: &mut console::Console, rsdp: u64) -> bool {
     let Ok(table) = crate::firmware::acpi_table(rsdp, b"SLIT") else {
         let _ = writeln!(
             com1,
             "origin-kernel: slit: no SLIT (uniform distance assumed); consistent true"
         );
-        return;
+        return true;
     };
     let Ok(slit) = framekernel::acpi::parse_slit(table) else {
         let _ = writeln!(
             com1,
             "origin-kernel: slit: invalid SLIT; consistent false: slit failed"
         );
-        return;
+        return false;
     };
 
     let n = slit.localities();
@@ -1026,6 +1083,7 @@ fn prove_slit(com1: &mut console::Console, rsdp: u64) {
         consistent,
         if consistent { "" } else { ": slit failed" }
     );
+    consistent
 }
 
 /// Proves the kernel's hardware entropy source (CLAUDE.md §59 secure randomness). Draws a
@@ -1034,7 +1092,7 @@ fn prove_slit(com1: &mut console::Console, rsdp: u64) {
 /// distinct — the smoke test that distinguishes a live entropy source from a dead one that
 /// returns a constant. A processor that reports neither instruction is reported honestly,
 /// not failed.
-fn prove_entropy(com1: &mut console::Console, features: &framekernel::features::Features) {
+fn prove_entropy(com1: &mut console::Console, features: &framekernel::features::Features) -> bool {
     use framekernel::entropy::{self, Source};
 
     if !features.rdseed && !features.rdrand {
@@ -1042,7 +1100,7 @@ fn prove_entropy(com1: &mut console::Console, features: &framekernel::features::
             com1,
             "origin-kernel: entropy: no RDSEED or RDRAND; consistent true (no source claimed)"
         );
-        return;
+        return true;
     }
 
     // Prefer RDSEED (full-entropy), falling back to RDRAND within one attempt; the generic
@@ -1105,6 +1163,7 @@ fn prove_entropy(com1: &mut console::Console, features: &framekernel::features::
         consistent,
         if consistent { "" } else { ": entropy failed" }
     );
+    consistent
 }
 
 /// A three-deep call chain whose innermost frame captures a backtrace; `#[inline(never)]`
@@ -1124,7 +1183,7 @@ fn backtrace_a(out: &mut [u64]) -> usize {
 
 /// Proves the frame-pointer backtrace (CLAUDE.md §69): a known call chain must produce at
 /// least four return addresses, every one inside the kernel image's 2 GiB virtual window.
-fn prove_backtrace(com1: &mut Console, info: &BootInfo) {
+fn prove_backtrace(com1: &mut Console, info: &BootInfo) -> bool {
     let mut frames = [0u64; 16];
     let n = backtrace_a(&mut frames);
     let base = info.kernel_virtual_base;
@@ -1138,6 +1197,7 @@ fn prove_backtrace(com1: &mut Console, info: &BootInfo) {
         if in_kernel { "true" } else { "false" },
         if ok { "" } else { ": backtrace failed" }
     );
+    ok
 }
 
 /// Builds the kernel's address space, loads it, and proves its protections on the
@@ -1530,12 +1590,12 @@ fn prove_user_isolation(com1: &mut Console) -> bool {
 }
 
 /// Proves the allocator by allocating, writing, reading back and freeing three frames.
-fn prove_frames(com1: &mut Console, alloc: &mut FrameAllocator<'_>) {
+fn prove_frames(com1: &mut Console, alloc: &mut FrameAllocator<'_>) -> bool {
     let mut got = [0u64; 3];
     for (i, slot) in got.iter_mut().enumerate() {
         let Some(addr) = alloc.allocate() else {
             let _ = writeln!(com1, "origin-kernel: frame allocator exhausted");
-            return;
+            return false;
         };
         let p = ptr::with_exposed_provenance_mut::<u64>(phys::to_virt(addr) as usize);
         let pattern = 0x4F52_4947_494E_0000 | i as u64;
@@ -1550,14 +1610,14 @@ fn prove_frames(com1: &mut Console, alloc: &mut FrameAllocator<'_>) {
                 com1,
                 "origin-kernel: frame {addr:#x} did not keep its contents"
             );
-            return;
+            return false;
         }
         *slot = addr;
     }
     for &addr in &got {
         if alloc.free(addr).is_err() {
             let _ = writeln!(com1, "origin-kernel: frame {addr:#x} could not be freed");
-            return;
+            return false;
         }
     }
     let _ = writeln!(
@@ -1565,6 +1625,7 @@ fn prove_frames(com1: &mut Console, alloc: &mut FrameAllocator<'_>) {
         "origin-kernel: allocated, wrote and freed 3 frames at {:#x}, {:#x}, {:#x}",
         got[0], got[1], got[2]
     );
+    true
 }
 
 /// What [`read_boot_info`] returns: the copied header, the region and kernel segment

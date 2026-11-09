@@ -1106,6 +1106,13 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // Integration: a /sys tree built in the VFS from live discovered facts.
             "origin-kernel: sysfs: built /sys with 4 facts (4 subtrees): ".into(),
             "bus/pci/count=7, block/nvme0/size_mib=16; read back pci count Some(7)".into(),
+            // ADR-0013: every proof was recorded. Whether it passed is the failure list's
+            // job, line by line: a proof a machine forgives can fail here too.
+            "origin-kernel: boot verdict: ".into(),
+            format!(
+                " of {} proofs passed",
+                framekernel::bootproof::Proof::ALL.len()
+            ),
             "origin-kernel: M1 entry complete; halting".into(),
         ])
         .collect(),
@@ -1128,6 +1135,8 @@ fn boot_failures() -> Vec<&'static str> {
         "origin-boot: kernel rejected",
         "origin-kernel: invalid boot info",
         "origin-kernel: invalid image",
+        // ADR-0013: a proof whose failure stops the boot said so.
+        "origin-kernel: boot refused",
         "(#DF double fault)",
         "(#GP general protection)",
         "(#PF page fault)",

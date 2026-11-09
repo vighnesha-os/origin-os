@@ -24,6 +24,7 @@
 //! - [`base64`]: RFC 4648 Base64 encode/decode (whitespace-tolerant), for PEM and tokens;
 //! - [`bitmap`]: a fixed-size bit allocator (free-space, ids) with lowest-free alloc;
 //! - [`boot`]: boot-info validation and the memory summary;
+//! - [`bootproof`]: what a failed boot proof means for the boot (ADR-0013);
 //! - [`blockcache`]: the block cache's LRU index and write-back bookkeeping;
 //! - [`cache`]: the CPU cache hierarchy from CPUID leaf 04h;
 //! - [`channel`]: one channel's queues, limits and signals (ADR-0005 P8);
@@ -109,6 +110,7 @@ pub mod base64;
 pub mod bitmap;
 pub mod blockcache;
 pub mod boot;
+pub mod bootproof;
 pub mod cache;
 pub mod channel;
 pub mod clock;

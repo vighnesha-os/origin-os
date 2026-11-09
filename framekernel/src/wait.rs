@@ -22,6 +22,7 @@
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use framekernel::bootproof::{Proof, Tally};
 use framekernel::runqueue::{RoundTrips, judge_round_trips, per_mille};
 use origin_sync::SpinLock;
 use origin_sync::wait::{self, TimedOut};
@@ -252,7 +253,7 @@ extern "sysv64" fn timed_waiter(which: u64) -> ! {
 
 /// A timed wait that nobody ends must time out at its deadline (within two ticks), and one
 /// that is signalled first must return then, long before its deadline.
-fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> bool {
+fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> Results {
     let before = FINISHED.load(Ordering::Acquire);
     let spawned = [
         sched::spawn(far, timed_waiter, 0),
@@ -263,7 +264,7 @@ fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> bool {
             com1,
             "origin-kernel: wait queues: cannot spawn: wait queues failed"
         );
-        return false;
+        return Results::FAILED;
     }
     // Signal the second waiter after about 20 ms.
     sched::yield_until(|| false, tsc_hz / 50, 1);
@@ -275,11 +276,10 @@ fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> bool {
     let finished = short != 0 && long != 0;
     let (short_ms, short_timed_out) = (short.saturating_sub(2) / 2, short & 1 == 1);
     let (long_ms, long_timed_out) = (long.saturating_sub(2) / 2, long & 1 == 1);
-    let ok = finished
-        && short_timed_out
-        && (SHORT_MS..=SHORT_MS + 30).contains(&short_ms)
-        && !long_timed_out
-        && long_ms < LONG_MS / 4;
+    let correct = finished && short_timed_out && !long_timed_out;
+    let timely =
+        finished && (SHORT_MS..=SHORT_MS + 30).contains(&short_ms) && long_ms < LONG_MS / 4;
+    let ok = correct && timely;
     if finished {
         let _ = writeln!(
             com1,
@@ -302,7 +302,23 @@ fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> bool {
             }
         );
     }
-    ok
+    Results { correct, timely }
+}
+
+/// What a wait-queue proof found, kept apart because only one half can stop a boot: `correct`
+/// (it finished, and what came back was right) and `timely` (the measured times were in
+/// bounds, which a correct kernel can miss on a loaded machine).
+#[derive(Clone, Copy)]
+struct Results {
+    correct: bool,
+    timely: bool,
+}
+
+impl Results {
+    const FAILED: Self = Self {
+        correct: false,
+        timely: false,
+    };
 }
 
 /// One run of the ping-pong, as the boot flow measured it.
@@ -348,7 +364,7 @@ fn run_ping_pong(bsp: CpuIndex, far: CpuIndex, tsc_hz: u64) -> Option<PingPongRu
 /// pass: every run that passes has its mean under the bound. A run over the bound without
 /// that reading fails at once, and so does any run on one processor, where the boot flow
 /// takes turns with the two threads and the reading says nothing about the host.
-fn prove_ping_pong(com1: &mut Console, bsp: CpuIndex, far: CpuIndex, tsc_hz: u64) -> bool {
+fn prove_ping_pong(com1: &mut Console, bsp: CpuIndex, far: CpuIndex, tsc_hz: u64) -> Results {
     let mut attempts = 0;
     let (run, ok) = loop {
         attempts += 1;
@@ -357,7 +373,7 @@ fn prove_ping_pong(com1: &mut Console, bsp: CpuIndex, far: CpuIndex, tsc_hz: u64
                 com1,
                 "origin-kernel: wait queues: cannot spawn: wait queues failed"
             );
-            return false;
+            return Results::FAILED;
         };
         let away = if far == bsp { 0 } else { run.away };
         let verdict = if run.done {
@@ -392,7 +408,10 @@ fn prove_ping_pong(com1: &mut Console, bsp: CpuIndex, far: CpuIndex, tsc_hz: u64
             "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips did not finish within 5 s: wait queues failed"
         );
     }
-    ok
+    Results {
+        correct: run.done,
+        timely: ok,
+    }
 }
 
 /// Proves the wait queues:
@@ -403,8 +422,15 @@ fn prove_ping_pong(com1: &mut Console, bsp: CpuIndex, far: CpuIndex, tsc_hz: u64
 ///   each waking the other ([`prove_ping_pong`]);
 /// - timed waits time out when nobody signals them and return early when somebody does.
 ///
-/// Runs from the boot flow with every scheduler active.
-pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+/// Runs from the boot flow with every scheduler active. Records two results in `proofs`:
+/// that the queues work, and that they work within their time bounds (ADR-0013).
+pub(crate) fn prove(
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    bsp: CpuIndex,
+    tsc_hz: u64,
+    proofs: &mut Tally,
+) {
     let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let spawned = [
         sched::spawn(far, producer, 0),
@@ -415,7 +441,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
             com1,
             "origin-kernel: wait queues: cannot spawn: wait queues failed"
         );
-        return false;
+        proofs.record(Proof::WaitQueues, false);
+        return;
     }
     let start = rdtsc();
     sched::yield_until(|| FINISHED.load(Ordering::Acquire) == 2, tsc_hz, 5);
@@ -437,7 +464,11 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
             ": wait queues failed"
         }
     );
-    let ping_ok = prove_ping_pong(com1, bsp, far, tsc_hz);
-    let timed_ok = prove_timed(com1, far, tsc_hz);
-    transfer_ok && ping_ok && timed_ok
+    let ping = prove_ping_pong(com1, bsp, far, tsc_hz);
+    let timed = prove_timed(com1, far, tsc_hz);
+    proofs.record(
+        Proof::WaitQueues,
+        transfer_ok && ping.correct && timed.correct,
+    );
+    proofs.record(Proof::WaitTiming, ping.timely && timed.timely);
 }
