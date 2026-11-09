@@ -1470,3 +1470,14 @@ In short: every capability is defined once in a typed interface, and GUI, comman
 #### Open for the owner
 
 - Sheet items 33–39, the ADR's seven questions.
+
+### Continued (2026-11-09, ~07:10 IST): ADR-0011 accepted
+
+The owner accepted ADR-0011 as recommended: questions 1–6, sheet items 33–38. ADR-0005 gains Amendment 2 (kernel-stamped caller identity, per-call system-call pinning), and ADR-0003 K1 notes what replaces it. **Nothing in any of them is built.** Question 7, whether to amend CLAUDE.md §48 and §70, is still the owner's, and Claude has not changed the directive.
+
+The next work, in ADR-0011 N14's order, starts with the Framekernel framework crate and its gate, before the kernel grows further.
+
+#### Open for the owner
+
+- Sheet items 30–32 and 39.
+- Buying the machines ADR-0009 chose.

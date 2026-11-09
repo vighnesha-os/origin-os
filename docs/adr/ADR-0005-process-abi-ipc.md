@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (below): Accepted** by the owner on 2026-11-08, with the recommended option of each item. |
+| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (below): Accepted** by the owner on 2026-11-08, with the recommended option of each item. **Amendment 2 (below): Accepted** by the owner on 2026-11-09, through ADR-0011. |
 | Scope | Kernel objects and handles, the system-call convention, status codes, process and thread start, memory mapping, IPC, waiting, faults, termination, ABI versioning |
 | Builds on | ONBF §6.1 (EXE/LIB images, syscall-origin pinning, TLS in FS), §8.2 (sealed objects, the Code Integrity Table, mapping rules), §8.3 (the user-mode Loader Service and the start record); ADR-0001 D2 (user-mode drivers); ADR-0004 (address-space layout) |
 | Requires | CLAUDE.md §29 (processes and isolation), §30 (IPC and capabilities), §42 (executable ABI), §44 (runtime), §49 (SDK) |
@@ -97,3 +97,12 @@ The handle-and-rights model follows the capability tradition (KeyKOS, EROS, seL4
 | A6 | Who decides the system-call origin before `origin.core` exists? | The creator names the code range for each process. A call from outside it returns `ACCESS_DENIED` | Terminate the process on the violation (ONBF §6.1 says only that such calls are not accepted) |
 
 The implementation records each decision's consequences in `docs/engineering/SOURCE_PROVENANCE.md`.
+
+## Amendment 2 (Accepted, 2026-11-09): caller identity and per-call pinning
+
+**Status: Accepted by the owner on 2026-11-09, through ADR-0011 questions 5 and 6 (CLAUDE.md §84). Neither item is built.** The ADR's accepted text is otherwise unchanged.
+
+| # | Decision | What it changes |
+|---|---|---|
+| B1 | The kernel stamps each channel message with the sender's identity, which the sender cannot set or forge (ADR-0011 N9). A capability says what may be done; identity says who asked, for per-user policy and audit (CLAUDE.md §30, §48). The fields and their layout are specified with the slice that builds them, and are an ABI decision (§84) | P8 says nothing about identity |
+| B2 | Each system-call number is accepted only from that number's own instruction address in `origin.core` (ADR-0011 N5). A call from anywhere else is refused. It is hardening, not authorization | P4's "accepted only from `origin.core`'s code range", and A6 until `origin.core` exists |

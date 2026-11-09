@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| Status | **Proposed**, for the owner to accept (CLAUDE.md §18, §84). Nothing here is built. The owner set the direction on 2026-11-09: "100% native SDK (if possible)", with the console, the terminal and the kernel included, and "every module as SDK" |
+| Status | **Accepted** by the owner on 2026-11-09, as recommended: questions 1–6 below, decision sheet items 33–38 (CLAUDE.md §18, §84). Question 7 is still the owner's. **Nothing here is built.** The owner set the direction the same day: "100% native SDK (if possible)", with the console, the terminal and the kernel included, and "every module as SDK" |
 | Requires | CLAUDE.md P1, P2, P3, P8; §3, §5, §7, §13, §22, §30, §42, §44, §45, §47–§50, §53, §58, §62, §63, §66, §70, §72; final rules 5, 10, 11, 12, 20, 21, 36 |
 | Evidence | `docs/research/2026-11-09-native-sdk.md`; `docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md` |
 | Builds on | ADR-0001 (framekernel argument R1, user-mode drivers D2, default 10); ADR-0003 K1; ADR-0005 (P1, P4, P6, P8, P12, A6); ONBF §6.1 |
-| Would change | ADR-0003 K1 (the safe-library, unsafe-binary split), ADR-0005 (an amendment for caller identity and per-call pinning), `origin-abi`'s layout. CLAUDE.md §48 and §70, if the owner edits them (question 7) |
+| Would change | ADR-0003 K1 (the safe-library, unsafe-binary split), ADR-0005 (Amendment 2: caller identity and per-call pinning), `origin-abi`'s layout. CLAUDE.md §48 and §70, if the owner edits them (question 7) |
 
 ## Context
 
@@ -42,7 +42,7 @@ Every module is reached only through its typed interface. But a stable, versione
 
 ### N5. The kernel is below the SDK, and the SDK is its only door
 
-Everything the kernel offers reaches programs only through `origin.core`. System-call numbers stay private to each release (§42). The kernel enforces this by accepting each call number only from that number's own instruction address in `origin.core`, the method of Zircon and OpenBSD, extending ADR-0005 P4 and A6. This is hardening. It is not authorization (N9).
+Everything the kernel offers reaches programs only through `origin.core`. System-call numbers stay private to each release (§42). The kernel enforces this by accepting each call number only from that number's own instruction address in `origin.core`, the method of Zircon and OpenBSD, extending ADR-0005 P4 and A6 (its Amendment 2). This is hardening. It is not authorization (N9).
 
 The kernel does not call the SDK, because the SDK is built on it.
 
@@ -80,7 +80,7 @@ No per-item crossing on a data path. For block I/O, frames and audio the SDK set
 A program can skip the library. So every check lives in the kernel or the service.
 
 - The generated server stub refuses a call before any service code runs, if the handle lacks the rights the interface declares or the message fails validation (§30).
-- The kernel stamps each channel message with the sender's identity, which the sender cannot forge. A capability says what may be done; identity says who asked, for per-user policy and audit (§30, §48). This needs an amendment to ADR-0005.
+- The kernel stamps each channel message with the sender's identity, which the sender cannot forge. A capability says what may be done; identity says who asked, for per-user policy and audit (§30, §48). This is ADR-0005's Amendment 2.
 - A process finds services only through the directory channel in its start record (ADR-0005 P1, P6). Its launcher decides what that directory contains, from the application's declared capabilities (§45).
 - Handle values are opaque in the SDK. `origin_abi::syscall` moves out of the crate holding the stable items.
 
@@ -149,7 +149,7 @@ The ledger `docs/research/2026-11-09-native-sdk.md` records the sources and what
 ## Migration consequences
 
 - No on-disk format changes. `user-abi` stays at major 0, with no compatibility promise yet, so `origin-abi` can be reorganized freely now. After the first release with third-party programs this becomes much harder, which is the reason to decide now.
-- ADR-0003 K1 would be superseded when the framework crate lands. ADR-0005 gains an amendment.
+- ADR-0003 K1 would be superseded when the framework crate lands. ADR-0005 gains Amendment 2.
 - Removing a published SDK interface later is a compatibility change and must follow rule 39.
 
 ## Threat model (§58)
@@ -170,12 +170,12 @@ The ledger `docs/research/2026-11-09-native-sdk.md` records the sources and what
 
 The OIDL grammar, the Driver ABI, the graphics path, any POSIX layer, how `std` maps onto the SDK (§44), and numeric performance budgets.
 
-## Questions for the owner
+## Questions for the owner (1–6 answered 2026-11-09; 7 open)
 
-1. Are command-line tools, the shell, the terminal and the recovery console SDK clients with no private doors, going further than §48 and §70 (N1, N2)? **Recommended: yes.**
-2. Stable promises per capability, with every module having a typed interface, rather than a stable SDK per module (N3, N4)? **Recommended: yes.**
-3. The Framekernel framework crate first, before the kernel grows further, at the cost of delaying M5 and M6 work (N6, N14)? **Recommended: yes.**
-4. A small original interface language rather than adopting one (N7)? **Recommended: yes.**
-5. Kernel-stamped caller identity on every channel message, as an amendment to ADR-0005 (N9)? **Recommended: yes.**
-6. Each system-call number accepted only from its own address in `origin.core` (N5)? **Recommended: yes.**
+1. Are command-line tools, the shell, the terminal and the recovery console SDK clients with no private doors, going further than §48 and §70 (N1, N2)? **Yes (2026-11-09).**
+2. Stable promises per capability, with every module having a typed interface, rather than a stable SDK per module (N3, N4)? **Yes (2026-11-09).**
+3. The Framekernel framework crate first, before the kernel grows further, at the cost of delaying M5 and M6 work (N6, N14)? **Yes (2026-11-09).**
+4. A small original interface language rather than adopting one (N7)? **Yes (2026-11-09).**
+5. Kernel-stamped caller identity on every channel message, as an amendment to ADR-0005 (N9)? **Yes (2026-11-09).**
+6. Each system-call number accepted only from its own address in `origin.core` (N5)? **Yes (2026-11-09).**
 7. If accepted, will you amend CLAUDE.md §48 and §70 to say this? They are your text, so Claude has not changed them.
