@@ -2490,7 +2490,7 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
 
 ## `developer-tools/oidl/` (`oidl`) and `sdk/interfaces/origin.kernel.oidl`, the interface language
 
-- **What:** a host tool for OIDL, the interface language ADR-0011 N7 calls for, and the first definition written in it (`docs/spec/OIDL.md`, **Proposed**: the wire format is an ABI decision that the owner accepts, CLAUDE.md §84). Nothing it generates is in the tree or linked into the OS. It generates into a directory the caller names, and the kernel does not use the output.
+- **What:** a host tool for OIDL, the interface language ADR-0011 N7 calls for, and the first definition written in it (`docs/spec/OIDL.md`, accepted by the owner on 2026-11-09, CLAUDE.md §84). Nothing it generates is in the tree or linked into the OS. It generates into a directory the caller names, and the kernel does not use the output.
   - `lex`, `parse`, `ast`: the file as untrusted input. Every limit (1 MiB, tokens, line and identifier length, type nesting) is checked, and nothing recurses on untrusted depth.
   - `sema`: names, the three roles (`status`, `rights`, `object_type`) and the two message limits, every rule in the specification; every rejection is a named code with a position.
   - `layout`: every offset, in one place (natural alignment, 8-byte message ends, the version-prefix rule).
@@ -2498,7 +2498,7 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
   - `fingerprint`: the per-minor canonical description, SHA-256 from `origin-crypto`, the lock gate.
   - `wire`, `corpus`: an independent model of the format, and a hostile corpus that it labels.
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-09, in worktree `sad-lalande-b83a31`. Original code, written from `docs/spec/OIDL.md`, ADR-0011 and ADR-0005. FIDL's wire-format page and Cap'n Proto's encoding page were read for concepts only (`docs/research/2026-11-09-oidl-wire-format.md`): no source of any system was read (§3).
-- **Architecture decisions:** ADR-0011 N7, N8, N9, N10; ADR-0005 P4, P5, P8, P12; the specification's questions Q1–Q12 await the owner.
+- **Architecture decisions:** ADR-0011 N7, N8, N9, N10; ADR-0005 P4, P5, P8, P12; the specification's questions Q1–Q12, answered by the owner on 2026-11-09 with the recommended option of each.
 - **Dependencies:** Rust `std` and first-party `origin-crypto`; the dev-dependency `origin-abi` exists only to compare values. No third-party crate. The generated code uses only `core`. Tests invoke the pinned `rustc` and `clippy-driver`, `llvm-objdump` from the pinned toolchain's `llvm-tools`, and the host's `cc` and `c++` for the header check.
 - **Toolchain:** Rust 1.99.1; `#![forbid(unsafe_code)]`; the crate is clippy-clean on the host with the no-panic lints denied in non-test builds.
 - **Test evidence:** `cargo xtask check` runs all of this (`cargo test -p oidl`).

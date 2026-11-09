@@ -12,8 +12,8 @@
 //! Generation is deterministic: the same input bytes give the same output, with no timestamps,
 //! paths or other environment input (CLAUDE.md §75).
 //!
-//! **The wire format is Proposed**: generated code is written to scratch locations only. No
-//! Origin OS component uses it until the owner accepts the format (CLAUDE.md §84).
+//! The owner accepted the format on 2026-11-09 (`docs/spec/OIDL.md` §19, CLAUDE.md §84). Generated
+//! code is written to a directory the caller names; no Origin OS component uses it yet.
 #![forbid(unsafe_code)]
 #![cfg_attr(
     not(test),

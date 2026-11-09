@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (below): Accepted** by the owner on 2026-11-08, with the recommended option of each item. **Amendment 2 (below): Accepted** by the owner on 2026-11-09, through ADR-0011. |
+| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (below): Accepted** by the owner on 2026-11-08, with the recommended option of each item. **Amendment 2 (below): Accepted** by the owner on 2026-11-09, through ADR-0011. **Amendment 3 (below): Accepted** by the owner on 2026-11-09, through `docs/spec/OIDL.md`'s question Q8. |
 | Scope | Kernel objects and handles, the system-call convention, status codes, process and thread start, memory mapping, IPC, waiting, faults, termination, ABI versioning |
 | Builds on | ONBF §6.1 (EXE/LIB images, syscall-origin pinning, TLS in FS), §8.2 (sealed objects, the Code Integrity Table, mapping rules), §8.3 (the user-mode Loader Service and the start record); ADR-0001 D2 (user-mode drivers); ADR-0004 (address-space layout) |
 | Requires | CLAUDE.md §29 (processes and isolation), §30 (IPC and capabilities), §42 (executable ABI), §44 (runtime), §49 (SDK) |
@@ -106,3 +106,11 @@ The implementation records each decision's consequences in `docs/engineering/SOU
 |---|---|---|
 | B1 | The kernel stamps each channel message with the sender's identity, which the sender cannot set or forge (ADR-0011 N9). A capability says what may be done; identity says who asked, for per-user policy and audit (CLAUDE.md §30, §48). The fields and their layout are specified with the slice that builds them, and are an ABI decision (§84) | P8 says nothing about identity |
 | B2 | Each system-call number is accepted only from that number's own instruction address in `origin.core` (ADR-0011 N5). A call from anywhere else is refused. It is hardening, not authorization | P4's "accepted only from `origin.core`'s code range", and A6 until `origin.core` exists |
+
+## Amendment 3 (Accepted, 2026-11-09): what `channel_read` reports about handles
+
+**Status: Accepted by the owner on 2026-11-09, through `docs/spec/OIDL.md` question Q8 (CLAUDE.md §84). Not built.** The ADR's accepted text and Amendment 1's A4 are otherwise unchanged.
+
+| # | Decision | What it changes |
+|---|---|---|
+| B3 | `channel_read` delivers each received handle as a record `{u32 handle; u32 object_type; u32 rights}` instead of a bare value, so a receiver can check a handle's type and rights before using it, which ADR-0011 N9 requires of the generated stub. It lands in the same slice as B1, while `user-abi` is at major 0 | P8 and A4: the out-handles array of `channel_read` |

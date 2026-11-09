@@ -1039,10 +1039,7 @@ fn the_command_line_checks_generates_and_guards_the_lock() {
     args.extend(files.iter().map(String::as_str));
     let (ok, text) = cli.run(&args);
     assert!(ok, "{text}");
-    assert!(
-        text.contains("Proposed"),
-        "the output says it must not ship: {text}"
-    );
+    assert!(text.contains("files written"), "{text}");
     assert!(out_dir.join("rust/oidl_rt.rs").is_file());
     assert!(out_dir.join("c/origin/kernel.h").is_file());
     assert!(out_dir.join("abi/origin.kernel.fingerprint").is_file());

@@ -2947,8 +2947,6 @@ pub fn generate(comp: &Compilation) -> Vec<Generated> {
     let mut root = Text::default();
     root.line("//! Generated from the OIDL definitions. `docs/spec/OIDL.md`.");
     root.line("//!");
-    root.line("//! The wire format these modules implement is Proposed: nothing here may ship");
-    root.line("//! until the owner accepts it (CLAUDE.md §84).");
     root.line("#![no_std]");
     root.line("#![deny(unsafe_op_in_unsafe_fn)]");
     root.blank();

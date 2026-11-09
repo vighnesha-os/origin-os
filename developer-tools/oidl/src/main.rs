@@ -107,10 +107,7 @@ fn generate(options: &Options) -> Result<(), String> {
         write_file(out, &format!("corpus/{}.corpus", library.name), &text)?;
         count = count.saturating_add(2);
     }
-    println!(
-        "oidl: {count} files written to {} (the wire format is Proposed: do not ship them)",
-        out.display()
-    );
+    println!("oidl: {count} files written to {}", out.display());
     Ok(())
 }
 
