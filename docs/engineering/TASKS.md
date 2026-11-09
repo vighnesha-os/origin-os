@@ -73,6 +73,7 @@
 9. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks; **M1 follow-ups** (A/B deployment, boot-attempt recording, CI).
 
 10. **The pre-merge review's open list:** the Framekernel's trusted base, speculation controls, CET, TCP's acceptance checks, the open IOMMU threats, NVMe reset, scheduling and allocator scaling (`docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md`, "Not fixed").
+11. **IOMMU after the Rev 3.11 check (2026-11-09; AMD-Vi ledger §7, "Found, not changed"):** clear Enable No Snoop in each attached function where a VT-d unit lacks snoop control; IVMD semantics and placement, with question 4's identity maps; whether the IVRS parser stops one IVHD's walk instead of refusing the table; a precedence for several entries naming one DeviceID; decoding a type 10h block's feature field. On the first AMD machine: record which address form an interrupt fault carries, and that the SMI filter the firmware set is still on after boot.
 
 ## Waiting on the owner
 

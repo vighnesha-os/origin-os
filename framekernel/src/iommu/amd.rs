@@ -13,8 +13,10 @@
 //! 3. a device table reaching the highest DeviceID the IVHD names is built with **every
 //!    entry blocking** (ADR-0007 I2): valid with translation information not valid, so
 //!    every DMA is target aborted and logged and none passes untranslated; interrupt
-//!    remapping valid with fixed and arbitrated interrupts target aborted; only the special
-//!    interrupts the firmware asks to pass (the IVRS DTE settings) get through;
+//!    remapping valid with fixed and arbitrated interrupts target aborted; of the special
+//!    interrupts, only those the firmware asks to pass (the IVRS DTE settings) get through,
+//!    except SMIs, which no DTE field controls (Table 10): the firmware's SMI filter does,
+//!    and its Control bits are kept as the firmware left them;
 //! 4. a command buffer and an event log (one page, 256 entries each) are set and the IOMMU
 //!    is enabled — with 128-bit IRTEs and 32-bit x2APIC destinations (GAEn and XTEn) where
 //!    it has both GASup and XTSup — then every cache and every device table entry is
@@ -146,6 +148,11 @@ struct Unit {
     wide: bool,
     control: u64,
     next_domain: u32,
+    /// Why the command buffer can no longer be trusted: the IOMMU stopped fetching, or a
+    /// completion never came. Commands then may sit unfetched in the ring, so nothing more is
+    /// written to it (a tail moved past them would overwrite them) and every later command
+    /// fails with this reason.
+    broken: Option<&'static str>,
 }
 
 /// One device's domain.
@@ -244,6 +251,15 @@ impl Unit {
     }
 
     fn submit_batch(&mut self, commands: &[Command]) -> Result<(), &'static str> {
+        if let Some(why) = self.broken {
+            return Err(why);
+        }
+        // The tail may not reach the head (MMIO 2008h): room for the batch and its wait.
+        let head = amdvi::ring_index(self.regs.read64(reg::COMMAND_HEAD)) % RING_ENTRIES;
+        let free = (head + RING_ENTRIES - self.tail - 1) % RING_ENTRIES;
+        if commands.len() + 1 > free {
+            return Err("the command buffer has no room");
+        }
         self.sequence = self.sequence.wrapping_add(1).max(1);
         let sequence = self.sequence;
         self.status.write64(0, 0);
@@ -267,15 +283,17 @@ impl Unit {
             stopped = self.regs.read64(reg::STATUS) & status::CMD_BUF_RUN == 0;
             stopped || self.status.read64(0) == sequence
         });
-        if self.status.read64(0) == sequence {
-            Ok(())
+        let why = if self.status.read64(0) == sequence {
+            return Ok(());
         } else if stopped {
-            Err("the IOMMU stopped fetching commands (an illegal command)")
+            "the IOMMU stopped fetching commands (an illegal command)"
         } else if !done {
-            Err("a command did not complete")
+            "a command did not complete"
         } else {
-            Err("a completion wait stored the wrong value")
-        }
+            "a completion wait stored the wrong value"
+        };
+        self.broken = Some(why);
+        Err(why)
     }
 
     /// Reads and clears every event in the log, and restarts logging after an overflow
@@ -312,9 +330,11 @@ impl Unit {
         (out, overflow)
     }
 
-    /// Turns the IOMMU off again (a later IOMMU failed to come up).
+    /// Turns the IOMMU off again (a later IOMMU failed to come up), leaving the firmware's
+    /// own bits as they were.
     fn disable(&self) {
-        self.regs.write64(reg::CONTROL, 0);
+        self.regs
+            .write64(reg::CONTROL, self.control & control::FIRMWARE);
     }
 }
 
@@ -325,26 +345,60 @@ struct Brought {
     status: u64,
 }
 
-/// Brings up the IOMMU `u`: checks its capability block and registers, builds the blocking
-/// device table, sets the command buffer and event log, enables it and invalidates its
-/// caches.
-fn bring_up(u: &ivrs::Unit<'static>) -> Result<Brought, &'static str> {
+/// What [`probe`] read from an IOMMU before any IOMMU is brought up.
+struct Probe {
+    regs: Regs,
+    capability: Capability,
+    efr_register: u64,
+    efr2: u64,
+    efr: u64,
+    features: Features,
+    /// The Control bits the firmware owns, as it left them ([`control::FIRMWARE`]).
+    firmware: u64,
+}
+
+/// Checks the IOMMU `u` and reads what it supports: its capability block (an IOMMU block of
+/// a revision this driver knows, holding the register base the IVHD names), its registers
+/// (answering, and left disabled by the firmware) and its features, which must include host
+/// translation.
+fn probe(u: &ivrs::Unit<'static>) -> Result<Probe, &'static str> {
     if u.segment != 0 {
         return Err("PCI segments other than 0 are not supported");
     }
+    if u.host_translation_disabled() {
+        return Err(
+            "its IVHD reports no host address translation (HATDis), so it cannot confine DMA",
+        );
+    }
     let at = address(u.device_id);
-    let header = crate::pcie::read_config32(at, u.capability_offset)
-        .ok_or("its capability block cannot be read")?;
+    let config = |offset: u16| {
+        let offset = u.capability_offset.checked_add(offset)?;
+        crate::pcie::read_config32(at, offset)
+    };
+    let header = config(0).ok_or("its capability block cannot be read")?;
     let capability = Capability::decode(header);
     if !capability.is_iommu {
         return Err("its capability offset does not hold an IOMMU capability block");
+    }
+    if capability.revision > Capability::REVISION {
+        return Err("its capability revision is above 1, an interface this driver does not know");
+    }
+    let low = config(4).ok_or("its capability block cannot be read")?;
+    let high = config(8).ok_or("its capability block cannot be read")?;
+    if amdvi::capability_base(low, high) != u.base {
+        return Err("its capability block holds a register base other than the one the IVHD names");
     }
     let virt = crate::vm::map_mmio(u.base, reg::SPAN).map_err(|_| "cannot map its registers")?;
     let regs = Regs {
         virt,
         size: reg::SPAN,
     };
-    if regs.read64(reg::CONTROL) & control::IOMMU_EN != 0 {
+    let control_now = regs.read64(reg::CONTROL);
+    if control_now == u64::MAX {
+        // Nothing decodes the address: the capability block is not enabled there.
+        return Err("its registers do not answer (they read as all ones)");
+    }
+    if control_now & control::IOMMU_EN != 0 {
         return Err("the firmware left it enabled (taking an IOMMU over is not implemented)");
     }
     let efr_register = if capability.efr {
@@ -363,6 +417,30 @@ fn bring_up(u: &ivrs::Unit<'static>) -> Result<Brought, &'static str> {
     if features.host_levels < LEVELS {
         return Err("it does not support 4-level host page tables");
     }
+    Ok(Probe {
+        regs,
+        capability,
+        efr_register,
+        efr2,
+        efr,
+        features,
+        firmware: control_now & control::FIRMWARE,
+    })
+}
+
+/// Brings up the IOMMU `u`, probed as `p`: builds the blocking device table, sets the
+/// command buffer and event log, enables it and invalidates its caches. `wide` is the IRTE
+/// format every IOMMU in the system uses (§2.2.5.2: they must all use the same size).
+fn bring_up(u: &ivrs::Unit<'static>, p: Probe, wide: bool) -> Result<Brought, &'static str> {
+    let Probe {
+        regs,
+        capability,
+        efr_register,
+        efr2,
+        efr,
+        features,
+        firmware,
+    } = p;
     let last = u.last_device_id().ok_or("its IVHD lists no devices")?;
     let entries = (u32::from(last) + 1).next_multiple_of(amdvi::DTES_PER_PAGE);
     let table = Region::new(u64::from(entries) * amdvi::DTE_BYTES)
@@ -386,9 +464,10 @@ fn bring_up(u: &ivrs::Unit<'static>) -> Result<Brought, &'static str> {
         events: page()?,
         status: page()?,
         sequence: 0,
-        wide: features.wide_interrupts(),
-        control: 0,
+        wide: wide && features.wide_interrupts(),
+        control: firmware,
         next_domain: 1,
+        broken: None,
     };
     // Every entry blocks DMA and fixed interrupts; the firmware's pass bits go to the entry
     // the device's requests use (its alias, where it has one).
@@ -450,7 +529,8 @@ fn bring_up(u: &ivrs::Unit<'static>) -> Result<Brought, &'static str> {
     // No exclusion range: every access is translated and checked.
     r.write64(reg::EXCLUSION_BASE, 0);
     r.write64(reg::EXCLUSION_LIMIT, 0);
-    // The control settings the IVHD recommends, then the enables in one write (§2.3.1).
+    // The firmware's own bits as it left them (its SMI filter above all), the control
+    // settings the IVHD recommends, then the enables, in one write (§2.3.1).
     let flags = u64::from(u.flags);
     let recommended = [
         (ivrs::ivhd_flags::HT_TUNNEL, control::HT_TUN_EN),
@@ -467,8 +547,12 @@ fn bring_up(u: &ivrs::Unit<'static>) -> Result<Brought, &'static str> {
     } else {
         0
     };
-    unit.control =
-        recommended | interrupts | control::EVENT_LOG_EN | control::CMD_BUF_EN | control::IOMMU_EN;
+    unit.control = firmware
+        | recommended
+        | interrupts
+        | control::EVENT_LOG_EN
+        | control::CMD_BUF_EN
+        | control::IOMMU_EN;
     unit.regs.write64(reg::CONTROL, unit.control);
     let running = status::CMD_BUF_RUN | status::EVENT_LOG_RUN;
     if !poll(|| unit.regs.read64(reg::STATUS) & running == running) {
@@ -477,8 +561,9 @@ fn bring_up(u: &ivrs::Unit<'static>) -> Result<Brought, &'static str> {
     }
     // Nothing the IOMMU cached before belongs to this table: invalidate it all — with
     // INVALIDATE_IOMMU_ALL where it exists, and every device table entry and interrupt table
-    // one by one in any case. The second is what the specification asks without IASup; it
-    // is also what makes QEMU 11.1 put each device under its entry (it switches a device to
+    // one by one in any case. The specification asks for an invalidation only where V or IV
+    // was set before a change (§2.2.2.2), so the second is caution about what the firmware
+    // left cached; it is also what makes QEMU 11.1 put each device under its entry (it switches a device to
     // translation only on that device's INVALIDATE_DEVTAB_ENTRY), so default deny holds for
     // devices no driver ever attaches.
     let all = features.invalidate_all.then_some(Command::InvalidateAll);
@@ -559,7 +644,9 @@ pub(super) fn init(com1: &mut Console, table: &'static [u8]) -> bool {
             m.exclusion()
         );
     }
-    let mut running: Vec<Unit> = Vec::with_capacity(units.len());
+    // Every IOMMU is probed before any is enabled: all of them must read IRTEs of one size
+    // (§2.2.5.2), so 128-bit entries with x2APIC destinations are used only if every one can.
+    let mut probes: Vec<Probe> = Vec::with_capacity(units.len());
     for (i, u) in units.iter().enumerate() {
         let entries = u.entries().count();
         let _ = write!(
@@ -586,7 +673,18 @@ pub(super) fn init(com1: &mut Console, table: &'static [u8]) -> bool {
             }
         }
         let _ = writeln!(com1);
-        match bring_up(u) {
+        match probe(u) {
+            Ok(p) => probes.push(p),
+            Err(why) => {
+                let _ = writeln!(com1, "origin-kernel: IOMMU: unit {i}: {why}: IOMMU failed");
+                return false;
+            }
+        }
+    }
+    let wide = probes.iter().all(|p| p.features.wide_interrupts());
+    let mut running: Vec<Unit> = Vec::with_capacity(units.len());
+    for (i, (u, p)) in units.iter().zip(probes).enumerate() {
+        match bring_up(u, p, wide) {
             Ok(b) => {
                 let n = &b.unit;
                 let f = n.features;
@@ -797,11 +895,19 @@ impl AmdVi {
         dom.mapped += 1;
         dom.mapped_ever += 1;
         if unit.capability.not_present_cached {
-            // The IOMMU may have cached the entry while it was not present (NpCache).
+            // The IOMMU may have cached entries while they were not present (NpCache). A new
+            // table page made a directory entry present too, and only an invalidation with
+            // PDE set covers directory entries (§2.4.3): then the whole domain's, as the one
+            // with a range wide enough under every new entry.
+            let pages = if tables.made > 0 {
+                Pages::All
+            } else {
+                Pages::One
+            };
             unit.submit(&[Command::InvalidatePages {
                 domain: dom.id,
                 address: iova,
-                pages: Pages::One,
+                pages,
             }])?;
         } else {
             fence(Ordering::SeqCst);
@@ -928,35 +1034,45 @@ impl AmdVi {
     }
 }
 
-/// Whether `address` lies in the interrupt address range, where every interrupt request goes
-/// (§2.2.5, Table 3).
+/// Whether `address` is an interrupt address in any form an event may carry: the x86 MSI
+/// window `0xFEEx_xxxx`, which the IOMMU treats as interrupts rather than DMA (§2.2.9); the
+/// HyperTransport interrupt range FD_F800_0000h–FD_F8FF_FFFFh (Table 3); and that range as
+/// the IOMMU builds remapped addresses on it, sign-extended from FFFF_FFFD_F800_0000h
+/// (§2.2.5). The specification does not say which form an interrupt fault records, so all
+/// three count until a hardware run shows which (CLAUDE.md §74). QEMU 11.1 records 0.
 fn interrupt_address(address: u64) -> bool {
     (0xFEE0_0000..=0xFEEF_FFFF).contains(&address)
+        || (0xFD_F800_0000..=0xFD_F8FF_FFFF).contains(&address)
+        || (0xFFFF_FFFD_F800_0000..=0xFFFF_FFFD_F8FF_FFFF).contains(&address)
 }
 
-/// The neutral fault for an event. An I/O page fault counts as an interrupt only if I is set
-/// **and** the address is an interrupt address: an interrupt request is a write to that range
-/// (§2.2.5), and QEMU 11.1 sets I on every page fault it logs, DMA ones included (research
-/// ledger §2.5). On hardware the two agree, so the rule changes nothing there.
+/// The neutral fault for an event. An event counts as an interrupt only if its entry says so
+/// (I in an I/O page fault, Type 101b in an invalid device request) **and** the address is an
+/// interrupt address: an interrupt request is a write to that range, and QEMU 11.1 sets I on
+/// every page fault it logs, DMA ones included (research ledger §2.5). On hardware the two
+/// should agree. An interrupt from a device whose DTE blocks interrupts (IntCtl 00b, every
+/// device without a table of its own) is an invalid device request, not a page fault (Table
+/// 64), and is blocked just the same.
 fn fault(e: Event) -> Fault {
     let interrupt = e.interrupt() && interrupt_address(e.address);
-    let kind = if e.code == amdvi::event::IO_PAGE_FAULT {
-        match (interrupt, e.present()) {
+    let kind = match e.code {
+        amdvi::event::IO_PAGE_FAULT => match (interrupt, e.present()) {
             (false, false) => FaultKind::PageNotMapped,
             (false, true) => FaultKind::PageDenied,
             (true, false) => FaultKind::InterruptBlocked,
             (true, true) => FaultKind::Other,
-        }
-    } else {
-        FaultKind::Other
+        },
+        amdvi::event::INVALID_DEVICE_REQUEST if interrupt => FaultKind::InterruptBlocked,
+        _ => FaultKind::Other,
     };
     Fault {
         source_id: e.device,
         interrupt,
         address: e.address,
         interrupt_index: None,
-        // RW is meaningful only for a present page (§2.5.3).
-        write: (e.present() && !interrupt).then_some(e.write()),
+        // RW means nothing for an interrupt; for the rest the entry says where it holds
+        // (Tables 56–60; in an I/O page fault only for a present page).
+        write: if interrupt { None } else { e.write() },
         kind,
         detail: super::Detail::Amd(e),
     }
@@ -979,10 +1095,11 @@ pub(super) fn attached(d: Domain, at: Address) -> bool {
 }
 
 /// The physical range of every AMD IOMMU's registers the IVRS (`table`) names, for
-/// `iommu::register_ranges`.
+/// `iommu::register_ranges`: all of it, 512 KiB where the IOMMU has performance counters
+/// (§2.3), though the kernel maps only the first 16 KiB, so no BAR is placed over the rest.
 pub(super) fn register_ranges(table: &'static [u8]) -> Result<Vec<(u64, u64)>, &'static str> {
     let ivrs = ivrs::parse(table).map_err(|_| "the IVRS is invalid")?;
-    Ok(ivrs.units().map(|u| (u.base, reg::SPAN)).collect())
+    Ok(ivrs.units().map(|u| (u.base, u.register_span())).collect())
 }
 
 /// The AMD IOMMUs' PCI functions on segment 0, named by the IVRS (see `iommu::own_functions`).
