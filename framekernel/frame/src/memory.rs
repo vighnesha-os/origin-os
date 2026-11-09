@@ -130,6 +130,28 @@ pub fn allocate_frame() -> Option<OwnedFrame> {
     })
 }
 
+/// The frame at `phys`, if it is free: for a boot proof that needs to see one particular frame
+/// reused. Safe: only a free frame can be claimed, and nothing else then owns it.
+pub fn claim_frame(phys: PhysAddr) -> Option<OwnedFrame> {
+    without_interrupts(|| {
+        MEMORY
+            .lock()
+            .as_mut()
+            .is_some_and(|m| m.frames.claim(phys.raw()))
+    })
+    .then_some(OwnedFrame { phys })
+}
+
+/// Whether the frame at `phys` is free right now.
+pub fn is_frame_free(phys: PhysAddr) -> bool {
+    without_interrupts(|| {
+        MEMORY
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.frames.frame_is_free(phys.raw()))
+    })
+}
+
 /// Gives back a frame from [`allocate_frame`]; `false` if the allocator refused it.
 pub fn free_frame(frame: OwnedFrame) -> bool {
     without_interrupts(|| {
