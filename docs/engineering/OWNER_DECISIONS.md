@@ -193,4 +193,19 @@ UEFI added two memory attributes after 2.7 that a 2026+ kernel must respect, and
 |---|---|---|
 | 69, answered | After the landing, make the loader honour `EFI_MEMORY_SP` (UEFI 2.8) and `EFI_MEMORY_HOT_PLUGGABLE` (UEFI 2.11): conventional memory carrying either becomes its own region kind, `SpecificPurpose` or `HotPluggable`, which the kernel neither allocates from nor direct-maps (boot info 0.5)? | **Yes, after the landing (2026-11-09)** |
 
+## How work lands (2026-11-09)
+
+Work reaches `main` through pull requests, and merging each one takes the owner's word. Until this decision each task opened its own pull request, so the owner was asked to merge pull requests of 1 to 14 commits.
+
+| # | Question | Answer |
+|---|---|---|
+| 70, answered | Offer a pull request for review only once it carries at least 100 commits? | **Yes: "create PRs with minimum 100 commits" (2026-11-09)** |
+
+What this means in practice:
+
+- Tasks collect on one landing branch per batch, as a draft pull request. CI runs on every push to it, so each task is tested, including the real-CPU boots, as it arrives. The first batch is ADR-0011 N14 step 3, pull request 13.
+- Commits are small and self-contained: each one builds and passes its tests.
+- Merge commits from `main` don't count toward the 100, and nothing is padded to reach it (CLAUDE.md §7).
+- Merging still takes the owner's word.
+
 **Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.
