@@ -57,6 +57,45 @@ impl Typed for Object {
     }
 }
 
+/// What a wait, or the wake-up of one, needs of an object: a counted reference that keeps its
+/// signals and its waiters alive, and is not one more handle to it (an end's reference count
+/// is what closes it).
+enum Waitable {
+    /// A channel and which of its two sides.
+    Channel(ObjectRef<KernelChannel>, usize),
+}
+
+impl Waitable {
+    fn of(object: &Object) -> Self {
+        match object {
+            Object::Channel(end) => Self::Channel(end.channel.clone(), end.side),
+        }
+    }
+
+    /// The signals the object has raised.
+    fn signals(&self) -> u32 {
+        match self {
+            Self::Channel(channel, side) => {
+                without_interrupts(|| channel.state.lock().signals(*side))
+            }
+        }
+    }
+
+    /// The threads waiting on it.
+    fn waiters(&self) -> Option<&WaitQueue> {
+        match self {
+            Self::Channel(channel, side) => channel.waiters.get(*side),
+        }
+    }
+
+    /// Wakes everything waiting on it.
+    fn wake(&self) {
+        if let Some(waiters) = self.waiters() {
+            note_cross_cpu_wakes(waiters.wake_all());
+        }
+    }
+}
+
 /// A handle in a message: its object and its rights, preserved in transit (P2).
 pub(crate) type Entry = (Object, u32);
 
@@ -184,16 +223,20 @@ static CLOSED_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Wake-ups of threads blocked on another processor, for the boot proof.
 static CROSS_CPU_WAKES: AtomicU64 = AtomicU64::new(0);
 
-/// How many blocked threads a channel operation woke on another processor (by IPI).
+/// How many blocked threads an operation woke on another processor (by IPI).
 pub(crate) fn cross_cpu_wakes() -> u64 {
     CROSS_CPU_WAKES.load(Ordering::Relaxed)
+}
+
+/// Counts `woken` wake-ups that crossed processors, for the boot proof.
+pub(crate) fn note_cross_cpu_wakes(woken: usize) {
+    CROSS_CPU_WAKES.fetch_add(woken as u64, Ordering::Relaxed);
 }
 
 /// Wakes everything waiting on `side`.
 fn wake(channel: &KernelChannel, side: usize) {
     if let Some(waiters) = channel.waiters.get(side) {
-        let crossed = waiters.wake_all();
-        CROSS_CPU_WAKES.fetch_add(crossed as u64, Ordering::Relaxed);
+        note_cross_cpu_wakes(waiters.wake_all());
     }
 }
 
@@ -345,8 +388,8 @@ pub(crate) fn channel_write(
 ) -> Result<(), Error> {
     // Threads blocked on a handle this message takes away must wake and see it gone (P9),
     // and that happens after the locks are released.
-    let mut moved_ends: Vec<EndId> = Vec::new();
-    moved_ends
+    let mut moved_away: Vec<Waitable> = Vec::new();
+    moved_away
         .try_reserve_exact(transfer.len())
         .map_err(|_| Error::NoMemory)?;
     let wake_side = without_interrupts(|| {
@@ -385,7 +428,7 @@ pub(crate) fn channel_write(
             if let Some(holder) = end.channel.holder.get(end.side) {
                 *holder.lock() = Some((channel.clone(), reader));
             }
-            moved_ends.push((end.channel.clone(), end.side));
+            moved_away.push(Waitable::of(object));
         }
         let message = Message {
             bytes,
@@ -414,8 +457,8 @@ pub(crate) fn channel_write(
         return Err(error);
     }
     wake(&channel, reader);
-    for (end, side) in &moved_ends {
-        wake(end, *side);
+    for target in &moved_away {
+        target.wake();
     }
     Ok(())
 }
@@ -516,8 +559,7 @@ pub(crate) fn handle_close(
     let (object, _) = without_interrupts(|| table.lock().remove(handle, need))?;
     // The handle is gone from the table: a waiter on it sees that when it is woken here. If
     // this was the end's last reference, the drop below closes the end and wakes its peer.
-    let Object::Channel(end) = &object;
-    wake(&end.channel, end.side);
+    Waitable::of(&object).wake();
     drop(object);
     Ok(())
 }
@@ -553,14 +595,19 @@ pub(crate) fn wait_one(
     mask: u32,
     deadline: u64,
 ) -> Result<Waited, Error> {
-    let (channel, side) = without_interrupts(|| channel_of(&table.lock(), handle, need))?;
-    let waiters = channel.waiters.get(side).ok_or(Error::BadHandle)?;
+    let target = without_interrupts(|| {
+        table
+            .lock()
+            .get(handle, need)
+            .map(|(object, _)| Waitable::of(object))
+    })?;
+    let waiters = target.waiters().ok_or(Error::BadHandle)?;
     waiting.fetch_add(1, Ordering::Release);
-    let signals = || without_interrupts(|| channel.state.lock().signals(side));
     let still_open = || without_interrupts(|| table.lock().get(handle, Need::NOTHING).is_ok());
-    let result = waiters.wait_until_deadline(|| signals() & mask != 0 || !still_open(), deadline);
+    let result =
+        waiters.wait_until_deadline(|| target.signals() & mask != 0 || !still_open(), deadline);
     waiting.fetch_sub(1, Ordering::AcqRel);
-    let observed = signals();
+    let observed = target.signals();
     let status = if !still_open() {
         Err(Error::Canceled)
     } else if result.is_err() {
@@ -569,7 +616,7 @@ pub(crate) fn wait_one(
         Ok(())
     };
     let blocked = result.unwrap_or(0);
-    drop(channel);
+    drop(target);
     Ok(Waited {
         status,
         observed,
