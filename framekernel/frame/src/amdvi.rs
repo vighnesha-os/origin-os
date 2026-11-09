@@ -73,6 +73,22 @@ pub mod control {
     pub const XT_EN: u64 = 1 << 50;
     /// GAMEn (bits 27:25): 000b, plain remapping. Kept clear.
     pub const GAM_EN: u64 = 0b111 << 25;
+    /// SmiFEn: SMIs from devices are blocked unless an SMI filter register lets their
+    /// DeviceID through (§2.1.5.1). The firmware sets it when it programs the filter
+    /// (§2.1.5.3); with IV set, no DTE field controls SMIs (Table 10), so this is their only
+    /// control.
+    pub const SMI_F_EN: u64 = 1 << 22;
+    /// SlfWBdis: implementation-defined, the firmware's to set.
+    pub const SLF_WB_DIS: u64 = 1 << 23;
+    /// SmiFLogEn: SMIs the filter blocks are logged as I/O page faults (§2.1.5.1).
+    pub const SMI_F_LOG_EN: u64 = 1 << 24;
+    /// BlkStopMrkEn: on at reset where supported (§2.6.4.5).
+    pub const BLK_STOP_MRK_EN: u64 = 1 << 41;
+    /// The bits the kernel keeps as the firmware left them when it enables the IOMMU and
+    /// when it turns it off again (§2.3.1: the SMI filter is set up before software runs).
+    /// Every other bit is the kernel's: in particular MarcEn (40), whose apertures bypass the
+    /// page tables, and the PPR, guest and virtual-IOMMU enables stay clear.
+    pub const FIRMWARE: u64 = SMI_F_EN | SLF_WB_DIS | SMI_F_LOG_EN | BLK_STOP_MRK_EN;
 }
 
 /// IOMMU Status register bits (§3.4.16, MMIO 2020h).
@@ -105,6 +121,11 @@ pub struct Capability {
 }
 
 impl Capability {
+    /// The newest capability revision this driver knows: 1, Rev 3.11's reset value. The
+    /// revision changes when the interface becomes incompatible (§3.2, CapRev), so a higher
+    /// one is refused. QEMU 11.1's `amd-iommu` reports 0 (research ledger §2.3).
+    pub const REVISION: u8 = 1;
+
     pub fn decode(header: u32) -> Self {
         Self {
             is_iommu: header & 0xFF == 0x0F && (header >> 16) & 7 == 3,
@@ -114,6 +135,14 @@ impl Capability {
             efr: header & 1 << 27 != 0,
         }
     }
+}
+
+/// The register base the IOMMU's capability block holds (§3.2, Capability Offsets 04h and
+/// 08h): bits 31:14 of the low register and all of the high one. Enable (low bit 0) is not
+/// part of it: the firmware sets it on hardware, and QEMU 11.1 leaves it clear while its
+/// registers answer at that base anyway (research ledger §2.3).
+pub fn capability_base(low: u32, high: u32) -> u64 {
+    u64::from(high) << 32 | u64::from(low & 0xFFFF_C000)
 }
 
 /// The Extended Feature Register (§3.4.1, MMIO 0030h): the features the kernel may use or
@@ -128,7 +157,9 @@ pub struct Features {
     pub guest_translation: bool,
     /// IASup: INVALIDATE_IOMMU_ALL.
     pub invalidate_all: bool,
-    /// GASup: guest virtual APIC (needed, with XTSup, for 128-bit IRTEs).
+    /// GASup: guest virtual APIC. With GAEn set and GAMEn 000b the IOMMU reads 128-bit
+    /// IRTEs (Table 21); XTSup is what lets their destination be a 32-bit x2APIC ID
+    /// (§2.2.5.3).
     pub guest_apic: bool,
     pub hardware_errors: bool,
     /// PCSup: performance counters (the register set is then 512 KiB).
@@ -367,6 +398,16 @@ pub mod pte {
     /// IR, IW: read and write allowed through this entry (ANDed down the walk).
     pub const READ: u64 = 1 << 61;
     pub const WRITE: u64 = 1 << 62;
+    /// FC (bit 60, a leaf only): the IOMMU marks every untranslated access to the page
+    /// coherent, so a device's No Snoop attribute cannot bypass the processor's caches
+    /// (Table 17). Clear, the device's own attribute passes through. In a directory entry the
+    /// bit is reserved (Table 18).
+    pub const FORCE_COHERENT: u64 = 1 << 60;
+    /// Bits a directory entry must keep clear: 60:52 (Table 18).
+    pub const DIRECTORY_RESERVED: u64 = 0x1FF << 52;
+    /// Bits a leaf must keep clear: 56:52, and 58:57 (Page Migration State) while
+    /// TMPMSup is clear, as this kernel never uses it (Table 17).
+    pub const LEAF_RESERVED: u64 = 0x7F << 52;
 }
 
 fn access_bits(access: Access) -> u64 {
@@ -380,13 +421,23 @@ fn index(iova: u64, level: u8) -> usize {
     ((iova >> (12 + 9 * u32::from(level - 1))) & 0x1FF) as usize
 }
 
+/// Whether `address` is one no translation may use or produce: the x86 MSI window, which the
+/// IOMMU treats as interrupts (§2.2.9), and the HyperTransport special ranges
+/// FD_0000_0000h–FF_FFFF_FFFFh (Table 3, with HTRangeIgnore clear as this kernel leaves it).
+/// §2.1.4.2's software note asks that no translation result in such an address.
+fn special(address: u64) -> bool {
+    (0xFEE0_0000..=0xFEEF_FFFF).contains(&address)
+        || (0xFD_0000_0000..=0xFF_FFFF_FFFF).contains(&address)
+}
+
 /// Checks the depth and the IOVA's range. Only 3–5 levels are built here (the kernel uses 4;
-/// every IOMMU supports at least 4, HATS).
+/// every IOMMU supports at least 4, HATS). A special address is out of range: a device's
+/// request there never reaches the page tables.
 fn check(levels: u8, iova: u64) -> Result<(), MapError> {
     if !(3..=5).contains(&levels) {
         return Err(MapError::Levels);
     }
-    if iova >> (12 + 9 * u32::from(levels)) != 0 {
+    if iova >> (12 + 9 * u32::from(levels)) != 0 || special(iova) {
         return Err(MapError::OutOfRange);
     }
     if !iova.is_multiple_of(PAGE) {
@@ -397,8 +448,11 @@ fn check(levels: u8, iova: u64) -> Result<(), MapError> {
 
 /// Maps the 4 KiB page at `iova` to physical `phys` with `access`, in the `levels`-deep host
 /// tables rooted at `root`, creating table pages as needed. Directory entries name the next
-/// level (no level is skipped) and allow reading and writing, so the leaf alone decides. An
-/// IOVA that is already mapped is refused.
+/// level (no level is skipped) and allow reading and writing, so the leaf alone decides. The
+/// leaf forces coherent accesses (FC): every buffer the kernel hands a device is in cached
+/// memory, and nothing else stops a device that sets No Snoop from reading stale data or
+/// having its writes overwritten. An IOVA that is already mapped is refused, and so is a
+/// special physical address ([`special`]).
 pub fn map(
     mem: &mut impl TableMemory,
     root: u64,
@@ -410,6 +464,9 @@ pub fn map(
     check(levels, iova)?;
     if phys & !ADDRESS != 0 {
         return Err(MapError::Misaligned);
+    }
+    if special(phys) {
+        return Err(MapError::OutOfRange);
     }
     if !access.read && !access.write {
         return Err(MapError::NoAccess);
@@ -444,7 +501,11 @@ pub fn map(
     if mem.read(table, i) & pte::PRESENT != 0 {
         return Err(MapError::AlreadyMapped);
     }
-    mem.write(table, i, phys | access_bits(access) | pte::PRESENT);
+    mem.write(
+        table,
+        i,
+        phys | access_bits(access) | pte::FORCE_COHERENT | pte::PRESENT,
+    );
     Ok(())
 }
 
@@ -477,7 +538,8 @@ pub fn unmap(
 }
 
 /// How the tables translate `iova`, as the hardware would: the physical page and the access
-/// every level allows; `None` if an entry is not present or is not one `map` makes.
+/// every level allows; `None` if an entry is not present, has a reserved bit set (which the
+/// hardware reports as an I/O page fault, Table 44), or is not one `map` makes.
 pub fn translate(
     mem: &mut impl TableMemory,
     root: u64,
@@ -489,7 +551,13 @@ pub fn translate(
     let mut table = root;
     for level in (1..=levels).rev() {
         let e = mem.read(table, index(iova, level));
+        let reserved = if level == 1 {
+            pte::LEAF_RESERVED
+        } else {
+            pte::DIRECTORY_RESERVED
+        };
         if e & pte::PRESENT == 0
+            || e & reserved != 0
             || (e & pte::NEXT_LEVEL) >> pte::NEXT_LEVEL_SHIFT != u64::from(level - 1)
         {
             return None;
@@ -604,10 +672,14 @@ pub fn remapped_msi(index: u16) -> Option<MsiMessage> {
     })
 }
 
-/// The IRTE index the IOMMU takes from `m` (data bits 10:0, of which 10:8 are also the
-/// message type); `None` if `m` is not an MSI to the interrupt range, is level-triggered, or
-/// has a message type other than fixed (000b) or arbitrated (001b), which the IOMMU handles
-/// by the DTE's pass bits rather than the table.
+/// The IRTE index of a message this kernel writes (data bits 10:0, of which 10:8 are also
+/// the message type; Figure 14). `None` if `m` is not an MSI to the interrupt range, is
+/// level-triggered, sets data bits 15:11, or has a message type other than fixed (000b) or
+/// arbitrated (001b). This is stricter than the IOMMU, which ignores data bits 15:11 and
+/// remaps through IRTE[data 10:0] whatever they hold, and it assumes destination mode 0
+/// (no 2048-entry mode, which this kernel never enables). The other message types never
+/// reach the table: NMI, INIT, ExtInt, LINT0 and LINT1 go by the DTE's pass bits, SMI by the
+/// SMI filter, and the rest are target-aborted (Tables 19 and 10).
 pub fn msi_index(m: MsiMessage) -> Option<u16> {
     if m.address >> 32 != 0 || m.address & 0xFFF0_0000 != INTERRUPT_HEAD {
         return None;
@@ -688,7 +760,9 @@ impl Command {
     }
 }
 
-/// Event codes (§2.5, Table 42).
+/// Event codes (§2.5). Table 42 gives 1001b to two events and calls 1010b–1111b reserved;
+/// the sections that define the events (§2.5.10–§2.5.15) number them 1001b–1110b, as here
+/// (research ledger, errata).
 pub mod event {
     pub const ILLEGAL_DEV_TABLE_ENTRY: u8 = 1;
     pub const IO_PAGE_FAULT: u8 = 2;
@@ -698,21 +772,35 @@ pub mod event {
     pub const COMMAND_HARDWARE_ERROR: u8 = 6;
     pub const IOTLB_INV_TIMEOUT: u8 = 7;
     pub const INVALID_DEVICE_REQUEST: u8 = 8;
+    pub const INVALID_PPR_REQUEST: u8 = 9;
+    pub const EVENT_COUNTER_ZERO: u8 = 10;
+    pub const GUEST_EVENT_FAULT: u8 = 11;
+    pub const VIOMMU_HARDWARE_ERROR: u8 = 12;
+    pub const RMP_PAGE_FAULT: u8 = 13;
+    pub const RMP_HARDWARE_ERROR: u8 = 14;
+    /// An INVALID_DEVICE_REQUEST of Type 101b (TR clear): a posted write to the interrupt
+    /// range from a device whose DTE has IntCtl 00b, which is how an interrupt from a
+    /// blocked device is reported (Table 64).
+    pub const BLOCKED_INTERRUPT_TYPE: u8 = 0b101;
 }
 
-/// One event log entry.
+/// One event log entry. Each event code lays out the second dword differently (Tables 56–72),
+/// so the accessors answer only for the codes whose entry has the field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Event {
     pub code: u8,
     /// The DeviceID the event is about (0 for command errors).
     pub device: u16,
-    /// For page faults: the DomainID (or PASID when GN is set).
-    pub domain: u16,
-    /// Flag bits 24:16 of the second dword: TR (24), RZ (23), PE (22), RW (21), PR (20), I
-    /// (19), US (18), NX (17), GN (16).
+    /// Bits 15:0 of the second dword: the DomainID in an I/O page fault or a page-table
+    /// hardware error (GN clear), a PASID in an illegal-DTE or invalid-request entry, and
+    /// reserved in the others. See [`Event::domain`].
+    id: u16,
+    /// Bits 27:16 of the second dword. In an I/O page fault (Table 57): TR (24), RZ (23), PE
+    /// (22), RW (21), PR (20), I (19), US (18), NX (17), GN (16). The other codes reuse some of
+    /// these positions and leave others reserved; Type sits in 26:25 or 27:25.
     flags: u16,
-    /// The device address (page faults), or the system address of the failing access or
-    /// command.
+    /// The device address (page faults, invalid requests), or the system address of the
+    /// failing table access or command, with the bits the entry reserves cleared.
     pub address: u64,
 }
 
@@ -723,48 +811,110 @@ impl Event {
         if code == 0 {
             return None;
         }
-        let address = if code == event::ILLEGAL_DEV_TABLE_ENTRY {
-            hi & !3
-        } else {
-            hi
+        // The address's low bits that each entry reserves (Tables 56, 59–63). Table 60 says
+        // 3:0 and its figure 2:0 for a page-table entry's address; 2:0 is right either way,
+        // as entries are 8-byte aligned.
+        let reserved_low = match code {
+            event::ILLEGAL_DEV_TABLE_ENTRY => 0x3,
+            event::PAGE_TAB_HARDWARE_ERROR => 0x7,
+            event::DEV_TAB_HARDWARE_ERROR
+            | event::ILLEGAL_COMMAND_ERROR
+            | event::COMMAND_HARDWARE_ERROR
+            | event::IOTLB_INV_TIMEOUT => 0xF,
+            _ => 0,
         };
         Some(Self {
             code,
             device: (lo & 0xFFFF) as u16,
-            domain: ((lo >> 32) & 0xFFFF) as u16,
-            flags: ((lo >> 48) & 0x1FF) as u16,
-            address,
+            id: ((lo >> 32) & 0xFFFF) as u16,
+            flags: ((lo >> 48) & 0xFFF) as u16,
+            address: hi & !reserved_low,
         })
     }
 
-    /// I: the request was an interrupt.
-    pub fn interrupt(&self) -> bool {
-        self.flags & 1 << 3 != 0
+    fn flag(&self, bit: u32) -> bool {
+        self.flags & 1 << bit != 0
     }
 
-    /// PR: the page (or the IRTE) was present, so the fault is about permissions or format.
-    pub fn present(&self) -> bool {
-        self.flags & 1 << 4 != 0
-    }
-
-    /// RW: a write (meaningful only when present, for memory requests).
-    pub fn write(&self) -> bool {
-        self.flags & 1 << 5 != 0
-    }
-
-    /// PE: the device lacked permission.
-    pub fn permission(&self) -> bool {
-        self.flags & 1 << 6 != 0
-    }
-
-    /// RZ: a reserved bit was set (else, with PR, a bad level encoding).
-    pub fn reserved_bit(&self) -> bool {
-        self.flags & 1 << 7 != 0
-    }
-
-    /// TR: the request was an ATS translation request.
+    /// TR: the request was an ATS translation request (the codes whose entry has TR at bit
+    /// 24: 1–4 and 8).
     pub fn translation(&self) -> bool {
-        self.flags & 1 << 8 != 0
+        matches!(self.code, 1..=4 | event::INVALID_DEVICE_REQUEST) && self.flag(8)
+    }
+
+    /// Type: the kind of hardware error or invalid request (bits 26:25 for codes 3, 4 and 6,
+    /// Table 58; bits 27:25 for code 8, Table 64).
+    pub fn kind(&self) -> Option<u8> {
+        match self.code {
+            event::DEV_TAB_HARDWARE_ERROR
+            | event::PAGE_TAB_HARDWARE_ERROR
+            | event::COMMAND_HARDWARE_ERROR => Some(((self.flags >> 9) & 0b11) as u8),
+            event::INVALID_DEVICE_REQUEST => Some(((self.flags >> 9) & 0b111) as u8),
+            _ => None,
+        }
+    }
+
+    /// The request was an interrupt: I (bit 19) in codes 1–4; in an invalid device request,
+    /// which has no I bit, Type 101b with TR clear (Table 64).
+    pub fn interrupt(&self) -> bool {
+        match self.code {
+            1..=4 => self.flag(3),
+            event::INVALID_DEVICE_REQUEST => {
+                self.kind() == Some(event::BLOCKED_INTERRUPT_TYPE) && !self.translation()
+            }
+            _ => false,
+        }
+    }
+
+    /// PR (I/O page faults only): the page, or the IRTE, was present, so the fault is about
+    /// permissions or format (Table 57).
+    pub fn present(&self) -> bool {
+        self.code == event::IO_PAGE_FAULT && self.flag(4)
+    }
+
+    /// RW: whether the access was a write, where the entry records it (Tables 56, 57, 59 and
+    /// 60). `None` for a code without RW, a translation request, or an I/O page fault on a
+    /// page that was not present. RW means nothing for an interrupt either; the caller
+    /// decides that, because QEMU 11.1 sets I on DMA faults too (`iommu::amd`).
+    pub fn write(&self) -> Option<bool> {
+        let recorded = match self.code {
+            event::IO_PAGE_FAULT => self.present(),
+            event::ILLEGAL_DEV_TABLE_ENTRY
+            | event::DEV_TAB_HARDWARE_ERROR
+            | event::PAGE_TAB_HARDWARE_ERROR => true,
+            _ => false,
+        };
+        (recorded && !self.translation()).then_some(self.flag(5))
+    }
+
+    /// PE (I/O page faults on a present page): the device lacked permission.
+    pub fn permission(&self) -> bool {
+        self.present() && self.flag(6)
+    }
+
+    /// RZ: a reserved bit was set; clear, a bad level encoding. In an illegal-DTE entry it
+    /// is about the DTE; in an I/O page fault, about a present entry (Tables 56, 57).
+    pub fn reserved_bit(&self) -> bool {
+        match self.code {
+            event::ILLEGAL_DEV_TABLE_ENTRY => self.flag(7),
+            event::IO_PAGE_FAULT => self.present() && self.flag(7),
+            _ => false,
+        }
+    }
+
+    /// S (device-table hardware errors only, Table 59): a secure DTE was being read.
+    pub fn secure(&self) -> bool {
+        self.code == event::DEV_TAB_HARDWARE_ERROR && self.flag(4)
+    }
+
+    /// The DomainID, for the codes that record one: an I/O page fault or a page-table
+    /// hardware error whose GN is clear (else the field holds a PASID; Tables 57, 60).
+    pub fn domain(&self) -> Option<u16> {
+        let records = matches!(
+            self.code,
+            event::IO_PAGE_FAULT | event::PAGE_TAB_HARDWARE_ERROR
+        );
+        (records && !self.flag(0)).then_some(self.id)
     }
 }
 
@@ -779,7 +929,12 @@ pub fn event_name(code: u8) -> &'static str {
         event::COMMAND_HARDWARE_ERROR => "command buffer hardware error",
         event::IOTLB_INV_TIMEOUT => "IOTLB invalidation timeout",
         event::INVALID_DEVICE_REQUEST => "invalid device request",
-        9 => "invalid PPR request or event counter zero",
+        event::INVALID_PPR_REQUEST => "invalid PPR request",
+        event::EVENT_COUNTER_ZERO => "event counter zero",
+        event::GUEST_EVENT_FAULT => "guest event fault",
+        event::VIOMMU_HARDWARE_ERROR => "vIOMMU hardware error",
+        event::RMP_PAGE_FAULT => "RMP page fault",
+        event::RMP_HARDWARE_ERROR => "RMP hardware error",
         _ => "reserved event",
     }
 }
@@ -792,7 +947,7 @@ mod tests {
     #[test]
     fn registers_and_capabilities_decode() {
         // QEMU's capability header (ID 0Fh, type 3, revision 1, EFRSup, NpCache, IotlbSup,
-        // HtTunnel) and an EFR with XTSup, GASup, IASup and HATS 4 levels.
+        // HtTunnel) and an EFR with XTSup, GASup, IASup and HATS 01b (5 levels).
         let c =
             Capability::decode(0x0F | 3 << 16 | 1 << 19 | 1 << 24 | 1 << 25 | 1 << 26 | 1 << 27);
         assert!(c.is_iommu && c.iotlb && c.not_present_cached && c.efr);
@@ -808,6 +963,23 @@ mod tests {
         assert_eq!(interrupts_per_function(0), 512);
         assert_eq!(interrupts_per_function(1 << 8), 2048);
         assert_eq!(interrupts_per_function(3 << 8), 512);
+        // The capability block's register base: bits 31:14 and the high dword; neither Enable
+        // nor the reserved bits 13:1 reach the address.
+        assert_eq!(capability_base(0xFED8_0001, 0), 0xFED8_0000);
+        assert_eq!(capability_base(0xFED8_0000, 0), 0xFED8_0000);
+        assert_eq!(capability_base(0xFD20_3FFF, 0x1), 0x1_FD20_0000);
+        // The firmware's Control bits: the SMI filter, its log, SlfWBdis and BlkStopMrkEn,
+        // and none of the enables the kernel owns.
+        assert_eq!(control::FIRMWARE, 1 << 22 | 1 << 23 | 1 << 24 | 1 << 41);
+        let kernel = control::IOMMU_EN
+            | control::EVENT_LOG_EN
+            | control::CMD_BUF_EN
+            | control::GA_EN
+            | control::XT_EN
+            | control::GAM_EN
+            | control::COHERENT
+            | 1 << 40; // MarcEn
+        assert_eq!(control::FIRMWARE & kernel, 0);
         // Base registers.
         assert_eq!(device_table_base(0x10_0000, 256), Some(0x10_0001));
         assert_eq!(device_table_base(0x20_0000, 65536), Some(0x20_01FF));
@@ -988,7 +1160,8 @@ mod tests {
             [w[0], w[1] | 1 << 32, w[2], w[3]],    // ATS (I)
             [w[0], w[1], w[2] & !1, w[3]],         // IV clear
             [w[0], w[1], w[2] ^ 3 << 60, w[3]],    // IntCtl 01b, pass-through
-            [w[0], w[1], w[2], 1],                 // guest fields
+            [w[0], w[1], w[2], 1],                 // reserved (bit 192)
+            [w[0], w[1], w[2], 1 << 15],           // vImuEn (bit 207), a guest field
             [w[0], w[1], w[2] | 1 << 5, w[3]],     // IG
             [w[0] | 1 << 2, w[1], w[2], w[3]],     // a reserved bit in word 0
             [w[0], w[1], w[2] | 0x40, w[3]],       // a table not 128-byte aligned
@@ -1052,6 +1225,19 @@ mod tests {
             pte::PRESENT | pte::READ | pte::WRITE | 3 << 9
         );
         assert_eq!(m.pages.len(), 4);
+        // Only the leaf forces coherent accesses: in a directory entry FC is reserved.
+        let mut table = root;
+        for level in (2..=4).rev() {
+            let e = m.read(table, index(iova, level));
+            assert_eq!(e & pte::DIRECTORY_RESERVED, 0, "level {level}: {e:#x}");
+            table = e & ADDRESS;
+        }
+        let leaf = m.read(table, index(iova, 1));
+        assert_eq!(
+            leaf,
+            0x7_5000 | pte::READ | pte::WRITE | pte::FORCE_COHERENT | pte::PRESENT
+        );
+        assert_eq!(leaf & pte::LEAF_RESERVED, 0);
         assert_eq!(
             translate(&mut m, root, 4, iova),
             Some((0x7_5000, Access::READ_WRITE))
@@ -1091,6 +1277,33 @@ mod tests {
             map(&mut m, root, 4, 1 << 48, 0, Access::READ),
             Err(MapError::OutOfRange)
         );
+        // Special addresses, as an IOVA or as the page (§2.1.4.2, §2.2.9, Table 3); the first
+        // page past them maps.
+        for special in [0xFEE0_0000, 0xFEEF_F000, 0xFD_0000_0000, 0xFF_FFFF_F000] {
+            assert_eq!(
+                map(&mut m, root, 4, special, 0x1000, Access::READ),
+                Err(MapError::OutOfRange),
+                "IOVA {special:#x}"
+            );
+            assert_eq!(translate(&mut m, root, 4, special), None);
+            assert_eq!(
+                map(&mut m, root, 4, iova + 4 * PAGE, special, Access::READ),
+                Err(MapError::OutOfRange),
+                "page {special:#x}"
+            );
+        }
+        assert_eq!(
+            map(
+                &mut m,
+                root,
+                4,
+                iova + 4 * PAGE,
+                0x100_0000_0000,
+                Access::READ
+            ),
+            Ok(())
+        );
+        assert_eq!(unmap(&mut m, root, 4, iova + 4 * PAGE), Ok(0x100_0000_0000));
         assert_eq!(
             map(&mut m, root, 6, iova, 0, Access::READ),
             Err(MapError::Levels)
@@ -1112,6 +1325,40 @@ mod tests {
                 }
             ),
             Err(MapError::NoAccess)
+        );
+        // A reserved bit makes the hardware fault (Table 44), so the model refuses it too: in
+        // a leaf (56:52, and 58:57 without TMPMSup) and in a directory entry (60:52, FC
+        // included). FC and U in a leaf are not reserved.
+        let mut table = root;
+        let mut path = [(0u64, 0usize); 4];
+        for level in (1..=4).rev() {
+            let i = index(iova, level);
+            path[usize::from(level - 1)] = (table, i);
+            table = m.read(table, i) & ADDRESS;
+        }
+        let (leaf_table, leaf_i) = path[0];
+        let leaf = m.read(leaf_table, leaf_i);
+        for bit in [52, 56, 57, 58] {
+            m.write(leaf_table, leaf_i, leaf | 1 << bit);
+            assert_eq!(translate(&mut m, root, 4, iova), None, "leaf bit {bit}");
+        }
+        m.write(leaf_table, leaf_i, leaf | 1 << 59);
+        assert!(translate(&mut m, root, 4, iova).is_some());
+        m.write(leaf_table, leaf_i, leaf);
+        let (dir_table, dir_i) = path[1];
+        let dir = m.read(dir_table, dir_i);
+        for bit in [52, 59, 60] {
+            m.write(dir_table, dir_i, dir | 1 << bit);
+            assert_eq!(
+                translate(&mut m, root, 4, iova),
+                None,
+                "directory bit {bit}"
+            );
+        }
+        m.write(dir_table, dir_i, dir);
+        assert_eq!(
+            translate(&mut m, root, 4, iova),
+            Some((0x8_8000, Access::WRITE))
         );
         // A directory entry that names a skipped level is not this walker's: it neither
         // translates nor maps through it.
@@ -1147,6 +1394,11 @@ mod tests {
             if rng.below(2) == 0 {
                 let phys = (rng.below(1 << 20) as u64 + 1) * PAGE;
                 let r = map(&mut m, root, 4, iova, phys, Access::READ_WRITE);
+                if special(phys) {
+                    // The MSI window lies in this range of pages; refused before the walk.
+                    assert_eq!(r, Err(MapError::OutOfRange), "step {step}");
+                    continue;
+                }
                 match model.entry(iova) {
                     std::collections::btree_map::Entry::Occupied(_) => {
                         assert_eq!(r, Err(MapError::AlreadyMapped), "step {step}");
@@ -1358,40 +1610,105 @@ mod tests {
 
     #[test]
     fn events_decode() {
-        // An I/O page fault: DeviceID 0x0010, domain 1, a write to a not-present page.
-        let lo = 0x0010 | 1 << 32 | (1u64 << 5) << 48 | 2 << 60;
+        // The second dword's flags, by bit number in that dword (Table 57).
+        let f = |bits: &[u32]| bits.iter().fold(0u64, |a, &b| a | 1 << (32 + b));
+        let code = |c: u64| c << 60;
+        // An I/O page fault: DeviceID 0x0010, domain 1, a write to a present page it may not
+        // write (PR, RW and PE set).
+        let lo = 0x0010 | 1 << 32 | f(&[20, 21, 22]) | code(2);
         let e = Event::decode(lo, 0x4001_2000).unwrap();
         assert_eq!(
-            (e.code, e.device, e.domain, e.address),
-            (2, 0x0010, 1, 0x4001_2000)
+            (e.code, e.device, e.domain(), e.address),
+            (2, 0x0010, Some(1), 0x4001_2000)
         );
-        assert!(
-            e.write()
-                && !e.present()
-                && !e.interrupt()
-                && !e.permission()
-                && !e.reserved_bit()
-                && !e.translation()
-        );
+        assert!(e.present() && e.permission() && !e.interrupt());
+        assert!(!e.reserved_bit() && !e.translation());
+        assert_eq!(e.write(), Some(true));
+        // Not present: RW and PE mean nothing (Table 57), whatever the bits hold.
+        let np = Event::decode(f(&[21, 22, 23]) | code(2), 0x4001_2000).unwrap();
+        assert!(!np.present() && !np.permission() && !np.reserved_bit());
+        assert_eq!(np.write(), None);
         // An interrupt blocked by an IRTE with RemapEn clear: I set, PR clear.
-        let irq = Event::decode(0x0010 | (1u64 << 3) << 48 | 2 << 60, 0xFEE0_0000).unwrap();
+        let irq = Event::decode(0x0010 | f(&[19]) | code(2), 0xFEE0_0000).unwrap();
         assert!(irq.interrupt() && !irq.present());
-        // A permission fault on a present page, a reserved bit, a translation request.
-        let pe = Event::decode((1u64 << 4 | 1 << 6 | 1 << 7 | 1 << 8) << 48 | 2 << 60, 0).unwrap();
-        assert!(pe.present() && pe.permission() && pe.reserved_bit() && pe.translation());
-        // An illegal DTE: the address's low two bits are reserved.
-        let dte = Event::decode(0x0018 | 1 << 60, 0x1000_0003).unwrap();
+        // A translation request: RW means nothing; GN set: the field is a PASID, not a domain.
+        let tr = Event::decode(f(&[16, 20, 21, 23, 24]) | code(2), 0).unwrap();
+        assert!(tr.present() && tr.reserved_bit() && tr.translation());
+        assert_eq!((tr.write(), tr.domain()), (None, None));
+        // An illegal DTE: RZ and RW are its own; bit 20 is reserved, not PR; the address's low
+        // two bits are reserved (Table 56); 15:0 is a PASID.
+        let dte =
+            Event::decode(0x0018 | 7 << 32 | f(&[20, 21, 23]) | code(1), 0x1000_0003).unwrap();
         assert_eq!((dte.code, dte.device, dte.address), (1, 0x18, 0x1000_0000));
+        assert!(dte.reserved_bit() && !dte.present() && !dte.interrupt());
+        assert_eq!((dte.write(), dte.domain()), (Some(true), None));
+        // A device-table hardware error: bit 20 is S, Type in 26:25, address bits 3:0 reserved
+        // (Table 59).
+        let dth = Event::decode(f(&[19, 20, 25]) | code(3), 0x2000_000F).unwrap();
+        assert!(dth.secure() && !dth.present() && dth.interrupt());
+        assert_eq!(
+            (dth.kind(), dth.write(), dth.address),
+            (Some(1), Some(false), 0x2000_0000)
+        );
+        // A page-table hardware error: Type, the domain, an 8-byte aligned entry address.
+        let pth = Event::decode(3 << 32 | f(&[21, 26]) | code(4), 0x3000_0008 | 7).unwrap();
+        assert_eq!(
+            (pth.kind(), pth.domain(), pth.write(), pth.address),
+            (Some(2), Some(3), Some(true), 0x3000_0008)
+        );
+        assert!(!pth.secure());
+        // Command errors: address bits 3:0 reserved; no Type in an illegal command.
+        let cmd = Event::decode(code(5), 0x4000_0007).unwrap();
+        assert_eq!(
+            (cmd.address, cmd.kind(), cmd.write()),
+            (0x4000_0000, None, None)
+        );
+        assert_eq!(
+            Event::decode(f(&[25, 26]) | code(6), 0).unwrap().kind(),
+            Some(3)
+        );
+        // An invalid device request has no I bit: Type 101b (TR clear) is a write to the
+        // interrupt range from a device whose interrupts are blocked (Table 64). Bit 19 is
+        // reserved there; 15:0 is a PASID.
+        let blocked =
+            Event::decode(0x0020 | 5 << 32 | f(&[25, 27]) | code(8), 0xFEE0_0000).unwrap();
+        assert_eq!(blocked.kind(), Some(event::BLOCKED_INTERRUPT_TYPE));
+        assert!(blocked.interrupt() && !blocked.present());
+        assert_eq!((blocked.write(), blocked.domain()), (None, None));
+        let not_irq = Event::decode(f(&[19, 20]) | code(8), 0xFEE0_0000).unwrap();
+        assert!(!not_irq.interrupt() && !not_irq.present());
+        let translated = Event::decode(f(&[24, 25, 27]) | code(8), 0).unwrap();
+        assert!(translated.translation() && !translated.interrupt());
+        // Codes without these fields answer nothing.
+        let ppr = Event::decode(f(&[16, 19, 20, 21, 24]) | code(9), 0).unwrap();
+        assert!(!ppr.interrupt() && !ppr.present() && !ppr.translation());
+        assert_eq!((ppr.write(), ppr.domain(), ppr.kind()), (None, None, None));
         assert_eq!(Event::decode(0, 0), None);
         assert_eq!(Event::decode(0x1234, 0x5678), None);
+        // Names: codes 9–14 as their own sections number them; 0 and 15 are reserved.
+        assert_eq!(event_name(9), "invalid PPR request");
+        assert_eq!(event_name(10), "event counter zero");
+        assert_eq!(event_name(14), "RMP hardware error");
+        assert_eq!(
+            (event_name(0), event_name(15)),
+            ("reserved event", "reserved event")
+        );
         for code in 0..16 {
             assert!(!event_name(code).is_empty());
         }
-        // Random entries never panic.
+        // Random entries never panic, and only an I/O page fault reports PR.
         let mut rng = crate::testing::Rng::new(0xE7);
         for _ in 0..crate::testing::cases(20_000) {
             if let Some(e) = Event::decode(rng.next(), rng.next()) {
-                let _ = (e.interrupt(), e.present(), e.write(), event_name(e.code));
+                assert!(!e.present() || e.code == event::IO_PAGE_FAULT);
+                assert!(e.domain().is_none() || matches!(e.code, 2 | 4));
+                let _ = (
+                    e.interrupt(),
+                    e.write(),
+                    e.kind(),
+                    e.secure(),
+                    event_name(e.code),
+                );
             }
         }
     }
