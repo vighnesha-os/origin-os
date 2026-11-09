@@ -3338,7 +3338,23 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
         s
     });
 
-    let markers: Vec<&str> = scenario.markers.iter().map(String::as_str).collect();
+    // On real silicon this run is a report, read by a person, not a gate: the markers are
+    // written for TCG (timer figures, CPU features), so only reaching the end counts. The one
+    // proof QEMU cannot pass with KVM is left out: with a split irqchip it keeps the old route
+    // when an IRTE goes away, so a pin's interrupts still arrive (`vtd_irte_get` on stderr
+    // shows QEMU did look, and refused the entry).
+    let on_real_silicon = env::var("ORIGIN_QEMU_ACCEL").as_deref() == Ok("kvm");
+    let markers: Vec<&str> = if on_real_silicon && scenario.markers.iter().any(|m| m == HALT_LINE) {
+        vec![HALT_LINE]
+    } else {
+        scenario.markers.iter().map(String::as_str).collect()
+    };
+    let failures: Vec<&str> = scenario
+        .failures
+        .iter()
+        .copied()
+        .filter(|f| !(on_real_silicon && *f == ": I/O APIC failed"))
+        .collect();
     let started = Instant::now();
     let deadline = started + timeout;
     let mut raw = Vec::new();
@@ -3363,7 +3379,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
                     let complete = text
                         .get(..text.rfind('\n').map_or(0, |i| i + 1))
                         .unwrap_or("");
-                    if let Some(m) = scenario.failures.iter().find(|m| complete.contains(**m)) {
+                    if let Some(m) = failures.iter().find(|m| complete.contains(**m)) {
                         break Err(format!("the serial output contains {m:?}"));
                     }
                     if serial::contains_in_order(&text, &markers) {

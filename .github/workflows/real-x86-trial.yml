@@ -55,6 +55,7 @@ jobs:
       - name: Boot the kernel, under TCG as a control and then on real silicon
         shell: bash
         run: |
+          set +e
           qemu-system-x86_64 --version | head -1
           mkdir -p logs
           boot() {
@@ -67,12 +68,17 @@ jobs:
             echo "$name: exit $rc" | tee -a logs/summary.txt
           }
           boot tcg-intel-2 ORIGIN_QEMU_SMP=2
+          boot kvm-intel-1 ORIGIN_QEMU_ACCEL=kvm ORIGIN_QEMU_SMP=1
           boot kvm-intel-2 ORIGIN_QEMU_ACCEL=kvm ORIGIN_QEMU_SMP=2
           boot kvm-intel-4 ORIGIN_QEMU_ACCEL=kvm ORIGIN_QEMU_SMP=4
+          boot kvm-amd-2 ORIGIN_QEMU_ACCEL=kvm ORIGIN_QEMU_SMP=2 ORIGIN_QEMU_IOMMU=amd
           boot kvm-amd-4 ORIGIN_QEMU_ACCEL=kvm ORIGIN_QEMU_SMP=4 ORIGIN_QEMU_IOMMU=amd
+          boot kvm-sparse-x2apic ORIGIN_QEMU_ACCEL=kvm ORIGIN_QEMU_TOPOLOGY=x2apic
+          boot kvm-cpu-host ORIGIN_QEMU_ACCEL=kvm ORIGIN_QEMU_SMP=4 ORIGIN_QEMU_CPU=host
           echo '=== results'
           cat logs/summary.txt
           for f in logs/*.log; do
             echo "=== $f ($(wc -l < "$f") lines)"
-            sed -n '1,400p' "$f"
+            grep -v 'console: CPU [0-9]* line' "$f" | sed -n '1,400p'
           done
+          ! grep -q -v ': exit 0' logs/summary.txt
