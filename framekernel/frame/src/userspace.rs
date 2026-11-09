@@ -93,8 +93,9 @@ impl UserSpace {
     pub fn new() -> Option<Self> {
         let mut tables = Tables { frames: Vec::new() };
         let mut space = AddressSpace::new(&mut tables).ok()?;
-        let half = crate::vm::kernel_half()?;
-        space.set_upper_half(&tables, &half).ok()?;
+        space
+            .set_upper_half(&tables, crate::vm::kernel_half()?)
+            .ok()?;
         Some(Self {
             space,
             tables,

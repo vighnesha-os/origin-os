@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use origin_paging::{
     Access, AddressSpace, Attributes, LARGE_PAGE, LeafCensus, MapError, PAGE, TablePool,
-    Translation,
+    Translation, kernel_half_is_complete, same_kernel_half,
 };
 
 /// The MMIO window (ADR-0004 H2): device registers, mapped uncached on demand. It starts
@@ -26,6 +26,7 @@ use origin_sync::SpinLock;
 
 use crate::addr::PhysAddr;
 use crate::mmio::MmioRegion;
+use crate::once::SetOnce;
 
 /// Physical ranges of device registers that have been handed out, at most one owner each. A
 /// claim outside `map_mmio` is the framework's own (the IOMMU's registers, ECAM): no driver
@@ -82,12 +83,26 @@ pub fn kernel_root() -> u64 {
     KERNEL_ROOT.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// The kernel half (PML4 entries 256–511) every process address space shares.
-pub fn kernel_half() -> Option<[u64; 256]> {
+/// The kernel half as it was when the kernel's tables went live (`install`). No later mapping
+/// changes these entries (`reserve_upper_half`): every address space's copy stays right.
+static KERNEL_HALF: SetOnce<[u64; 256]> = SetOnce::new();
+
+/// The kernel half (PML4 entries 256–511) every process address space shares: each points at a
+/// table allocated once at boot (ADR-0004 H2). `None` before `install`, and if the half was
+/// not complete when it ran.
+pub fn kernel_half() -> Option<&'static [u64; 256]> {
+    KERNEL_HALF.get()
+}
+
+/// Whether the kernel's own tables still have the entries [`kernel_half`] gave everyone.
+pub fn kernel_half_unchanged() -> bool {
+    let Some(fixed) = kernel_half() else {
+        return false;
+    };
     crate::cpu::without_interrupts(|| {
         let guard = KERNEL_SPACE.lock();
-        let k = guard.as_ref()?;
-        k.space.upper_half(&k.tables)
+        let live = guard.as_ref().and_then(|k| k.space.upper_half(&k.tables));
+        live.is_some_and(|live| same_kernel_half(&live, fixed))
     })
 }
 
@@ -104,6 +119,12 @@ pub unsafe fn install(
     memory_map: &'static [MemoryRegion],
 ) {
     KERNEL_ROOT.store(space.root(), core::sync::atomic::Ordering::Release);
+    if let Some(half) = space.upper_half(&tables)
+        && kernel_half_is_complete(&half)
+    {
+        // Only this call sets it, and `early` makes it once.
+        let _ = KERNEL_HALF.set(half);
+    }
     crate::cpu::without_interrupts(|| {
         *KERNEL_SPACE.lock() = Some(KernelSpace {
             space,
