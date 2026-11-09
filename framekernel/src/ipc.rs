@@ -27,7 +27,6 @@
 #![forbid(unsafe_code)]
 
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -118,7 +117,7 @@ fn heap_block(bytes: usize) -> usize {
 /// What a queued message cost its sender. Its drop is the refund, when the message leaves the
 /// queue: read, or left behind when the end it was queued for closed.
 struct Charge {
-    account: Arc<Account>,
+    account: ObjectRef<Account>,
     bytes: usize,
 }
 
@@ -195,7 +194,7 @@ pub(crate) struct KernelChannel {
     /// Whether this channel is on that list.
     listed: AtomicBool,
     /// Its creator's account, charged once for this channel's lifetime.
-    account: Arc<Account>,
+    account: ObjectRef<Account>,
 }
 
 impl Drop for KernelChannel {
@@ -306,7 +305,9 @@ pub(crate) fn reap_closed() {
 }
 
 /// Creates a channel charged to `account`: its two ends, or why not.
-pub(crate) fn create_channel(account: &Arc<Account>) -> Result<(ChannelEnd, ChannelEnd), Error> {
+pub(crate) fn create_channel(
+    account: &ObjectRef<Account>,
+) -> Result<(ChannelEnd, ChannelEnd), Error> {
     account.charge_channel()?;
     let refund = || account.refund_channel();
     let state = Channel::try_new(QUEUE_DEPTH, QUEUE_BYTES).inspect_err(|_| refund())?;
@@ -379,7 +380,7 @@ fn inside(
 /// listed handle must.
 pub(crate) fn channel_write(
     table: &SpinLock<HandleTable<Object>>,
-    account: &Arc<Account>,
+    account: &ObjectRef<Account>,
     handle: Handle,
     need: Need,
     bytes: Vec<u8>,

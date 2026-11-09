@@ -29,6 +29,7 @@ use crate::handles::HandleTable;
 use crate::paging::{Access, MapError, Translation};
 use crate::runqueue::QueueError;
 use origin_abi::{Error, Handle};
+use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
 use origin_frame::userspace::{UserFrame, UserSpace};
 
@@ -130,7 +131,7 @@ pub(crate) struct Process {
     /// Its handles (P1).
     pub(crate) handles: SpinLock<HandleTable<Object>>,
     /// What it may hold (P11).
-    pub(crate) account: Arc<Account>,
+    pub(crate) account: ObjectRef<Account>,
     /// The only code range that may issue system calls (P4, ONBF §6.1): `[start, end)`.
     syscall_origin: (u64, u64),
     /// May it use the developer-only calls?
@@ -154,12 +155,13 @@ impl Process {
         Some(Self {
             space: UserSpace::new()?,
             handles: SpinLock::new(HandleTable::new(limits.handles)),
-            account: Arc::new(Account {
+            account: ObjectRef::try_new(Account {
                 channels: AtomicUsize::new(0),
                 max_channels: limits.channels,
                 queued_bytes: AtomicUsize::new(0),
                 max_queued_bytes: limits.message_bytes,
-            }),
+            })
+            .ok()?,
             syscall_origin,
             debug_calls: limits.debug_calls,
             threads: AtomicU32::new(0),
