@@ -1,0 +1,230 @@
+// The Framekernel's system calls as OIDL (docs/spec/OIDL.md): the first consumer of the
+// generator, ADR-0011 N14 step 2.
+//
+// The owner accepted the format on 2026-11-09, but **nothing is generated from this file
+// into the tree yet, and the kernel does not use it**: adopting it is a later step (ADR-0011
+// N14), and the kernel may be restructured first (N6). The comparison with runtime/abi and
+// framekernel/src/syscall.rs is in docs/engineering/OIDL_KERNEL_COMPARISON.md.
+
+/// The Framekernel's system calls: what the kernel offers a process (ADR-0005).
+/// Everything here reaches a program only through origin.core (ADR-0011 N5); the numbers are
+/// private to the release (CLAUDE.md §42).
+library origin.kernel;
+transport syscall;
+version compatibility "user-abi";
+
+/// Every failure a system call can report (ADR-0005 P5). The values are part of the C ABI;
+/// new ones are only appended.
+enum status: i64 {
+    /// Success.
+    ok = 0;
+    /// An argument is out of range or inconsistent.
+    invalid_args = -1;
+    /// The handle is not valid in this process (never issued, closed, or stale).
+    bad_handle = -2;
+    /// The handle names an object of another type.
+    wrong_type = -3;
+    /// The handle lacks a right the operation needs, or the caller may not do this.
+    access_denied = -4;
+    /// The kernel is out of memory for this request.
+    no_memory = -5;
+    /// A user pointer is not valid, mapped or writable as needed.
+    fault = -6;
+    /// The operation cannot proceed now (empty or full queue); wait and retry.
+    should_wait = -7;
+    /// The deadline passed.
+    timed_out = -8;
+    /// The other end of a channel is closed.
+    peer_closed = -9;
+    /// A wait was cancelled.
+    canceled = -10;
+    /// Not supported by this kernel.
+    not_supported = -11;
+    /// A quota or table limit was reached.
+    limit = -12;
+    /// The caller's buffer is too small; the sizes it needs were written to the out pointer.
+    buffer_too_small = -13;
+}
+
+/// Handle rights (ADR-0005 P2). A right can be removed, never added.
+bits rights: u32 {
+    /// Read data or messages.
+    read = 0;
+    /// Write data or messages.
+    write = 1;
+    /// Map the object into an address space.
+    map = 2;
+    /// Map it executable (still subject to the Code Integrity Table).
+    execute = 3;
+    /// Duplicate the handle (with equal or fewer rights).
+    duplicate = 4;
+    /// Send the handle through a channel.
+    transfer = 5;
+    /// Wait on the object's signals.
+    wait = 6;
+    /// Raise or clear the object's user signals.
+    signal = 7;
+    /// Control the object (terminate a process, change a thread).
+    manage = 8;
+}
+
+/// The rights of a new channel end: everything that applies to a channel (ADR-0005 P2, P8,
+/// amendment A1).
+const channel_rights: rights = read | write | duplicate | transfer | wait;
+
+/// Object signals (ADR-0005 P9).
+bits signals: u32 {
+    /// A message or data can be read.
+    readable = 0;
+    /// A message or data can be written.
+    writable = 1;
+    /// The other end of a channel is closed.
+    peer_closed = 2;
+    /// An event's user signal.
+    signaled = 3;
+    /// A process or thread has ended.
+    terminated = 4;
+}
+
+/// Kernel object types (ADR-0005 P3).
+enum object_type: u32 {
+    /// A process.
+    process = 1;
+    /// A thread.
+    thread = 2;
+    /// A memory object.
+    memory_object = 3;
+    /// One end of a channel.
+    channel = 4;
+    /// An event.
+    event = 5;
+    /// A completion port.
+    port = 6;
+    /// A timer.
+    timer = 7;
+}
+
+/// Most bytes in one channel message (ADR-0005 P8).
+const max_message_bytes: u32 = 65536;
+
+/// Most handles in one channel message (ADR-0005 P8).
+const max_message_handles: u32 = 64;
+
+/// A deadline that never passes (ADR-0005 P9).
+const deadline_infinite: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+/// Longest line a developer build's debug write takes (framekernel/src/syscall.rs).
+const debug_write_max: u32 = 128;
+
+/// Developer builds only: the calls that report to the boot proofs. The process is created
+/// with this permission or without it; a process without it is refused.
+capability kernel.debug;
+
+/// What channel_read reports (ADR-0005 P4, amendment A4).
+sized struct read_sizes {
+    /// The message's byte count.
+    bytes: u32;
+    /// The message's handle count.
+    handles: u32;
+}
+
+/// Calls made by a thread on its process's behalf (ADR-0005 P4). Every number here is private
+/// to the release; the C entry points below are the stable interface.
+interface kernel {
+    /// Ends the calling thread.
+    method thread_exit = 0 (
+        /// The code the thread's process reports.
+        code: u64,
+    ) -> never requires none;
+
+    /// Developer builds only, for boot proofs.
+    method debug_report = 1 (
+        /// A value for the boot proofs to read.
+        value: u64,
+    ) errors(not_supported) requires kernel.debug else not_supported;
+
+    /// Developer builds only: writes one console line.
+    method debug_write = 2 (
+        /// The line.
+        text: vector<u8, debug_write_max>,
+    ) errors(not_supported, invalid_args, fault) requires kernel.debug else not_supported;
+
+    /// Closes a handle. A thread waiting on it completes with canceled.
+    method handle_close = 3 (
+        /// The handle.
+        handle: handle<any>,
+    ) errors(bad_handle) requires none;
+
+    /// Duplicates a handle, keeping at most the rights it has (ADR-0005 P2).
+    method handle_duplicate = 4 (
+        /// The handle to duplicate.
+        handle: handle<any, duplicate>,
+        /// The new handle's rights: a subset of the original's.
+        rights: rights,
+    ) -> (
+        /// The new handle.
+        new_handle: handle<any>,
+    ) errors(bad_handle, invalid_args, fault, access_denied, limit, no_memory) requires none;
+
+    /// Creates a channel and returns its two ends, each with channel_rights.
+    method channel_create = 5 () -> (
+        /// The two ends.
+        ends: array<handle<channel>, 2>,
+    ) errors(fault, limit, no_memory) requires none;
+
+    /// Queues a message on a channel and moves the listed handles out of the caller's table.
+    method channel_write = 6 (
+        /// The channel end to write to.
+        end: handle<channel, write>,
+        /// The message.
+        bytes: vector<u8, max_message_bytes>,
+        /// Handles to move with it.
+        handles: vector<handle<any, transfer>, max_message_handles>,
+    ) errors(bad_handle, wrong_type, invalid_args, no_memory, fault, access_denied, should_wait, peer_closed, limit) requires none;
+
+    /// Reads the next message from a channel. If the buffers are too small the message stays
+    /// queued and sizes reports what is needed.
+    method channel_read = 7 (
+        /// The channel end to read from.
+        end: handle<channel, read>,
+    ) -> (
+        /// Filled with the message's bytes.
+        @count(sizes.bytes) bytes: vector<u8, max_message_bytes>,
+        /// Filled with the handles moved to the caller's table.
+        @count(sizes.handles) handles: vector<handle<any>, max_message_handles>,
+        /// The message's sizes; set size before the call.
+        @also_on(buffer_too_small) sizes: read_sizes,
+    ) errors(bad_handle, wrong_type, access_denied, fault, invalid_args, should_wait, peer_closed, buffer_too_small, limit, no_memory) requires none;
+
+    /// Blocks until a signal is raised on the object, the deadline passes, or the handle is
+    /// closed (ADR-0005 P9).
+    method wait_one = 8 (
+        /// The object to wait on.
+        handle: handle<any, wait>,
+        /// The signals that end the wait.
+        @nonzero signals: signals,
+        /// A monotonic deadline in nanoseconds; 0 polls, deadline_infinite never expires.
+        deadline: u64,
+    ) -> (
+        /// The object's signals when the wait ended.
+        @also_on(timed_out, canceled) observed: signals,
+    ) errors(bad_handle, invalid_args, fault, access_denied, timed_out, canceled) requires none;
+
+    /// Reserved: creates an event. Events do not exist yet (ADR-0005 P3).
+    @reserved
+    method event_create = 9 () -> (
+        /// The new event.
+        event: handle<event>,
+    ) errors(not_supported) requires none;
+
+    /// Reserved: changes an object's user signals. Events do not exist yet (ADR-0005 P9).
+    @reserved
+    method object_signal = 10 (
+        /// The object.
+        object: handle<any, signal>,
+        /// Signals to clear.
+        clear: signals,
+        /// Signals to set.
+        set: signals,
+    ) errors(not_supported) requires none;
+}

@@ -5,8 +5,8 @@
 | As of | 2026-11-09, on `main`, after the pre-merge review. Everything that was on a side branch is merged. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 33–38. |
-| Still open | Items 30–32 and 39 below. Buying the machines ADR-0009 chose. |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38 and 40–53. |
+| Still open | Items 30, 31 and 39 below. Buying machines is off for now (ADR-0009's update of 2026-11-09). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -105,6 +105,8 @@ ADR-0009 H6 asked for a console that does not depend on a 16550 at `0x3F8`. The 
 | 27, answered | Boot info 0.4: the framebuffer appended as 48 bytes (`Framebuffer`, E1) | **Accepted by the owner, 2026-11-08** | This is the §84 ABI decision for this work. It adds one field group, with no compatibility promise at major 0, and matches ADR-0002 B4 (the loader translates firmware structures). Alternatives and trade-offs are in the ADR |
 | 28, answered | The framebuffer mapped uncached in the first 2 GiB of the MMIO window, by the loader, and kept at that address by the kernel (E2) | **Accepted by the owner, 2026-11-08** | Draws from the first kernel line and across the page-table switch. ADR-0004's layout keeps MMIO out of the direct map; drivers' MMIO now starts 2 GiB higher |
 | 29, answered | The UART: COM1 until the ACPI tables can be read, then the SPCR's UART with earlier output replayed; 0x3F8 only when firmware gives nothing better (E4) | **Accepted by the owner, 2026-11-08** | A hang before the tables are readable still shows on the screen and on COM1; once firmware names a UART, COM1 is not used |
+| 52, answered | ADR-0010 Amendment 1: each line to the UART first, then drawn at most 256 pixels per interrupts-off section, instead of E3's screen first | **Accepted by the owner, 2026-11-09** | The UART is the log of last resort and no longer waits behind pixels. Under KVM on an AMD EPYC 9V74 a section holds interrupts off for about 24 µs; a whole line took 4.3 to 4.6 ms on a different EPYC model. No real machine has been measured |
+| 53, answered | ADR-0010 Amendment 2: the UART sent at most 16 bytes (one FIFO load) per interrupts-off section, the wait for the wire between sections; a line from an interrupt handler leaves with the next writer or report | **Accepted by the owner, 2026-11-09** | At most 17 register accesses with interrupts off, whatever the line speed, against about 8.7 ms per 100 bytes at 115 200 baud. What a section costs on a real UART is not measured yet; the kernel prints it on every boot |
 
 ## From the pre-merge review (2026-11-09)
 
@@ -112,7 +114,7 @@ ADR-0009 H6 asked for a console that does not depend on a 16550 at `0x3F8`. The 
 |---|---|---|---|
 | 30 | ADR-0007 question 10: clear bus mastering on every function at enumeration (I12), bridges included, and leave an AMD IOMMU's own function alone until hardware shows what it needs? | **Accept** | §32 and §58. It is built and boot-proven, and it merged on your word. It may stop firmware-owned controllers (USB legacy, a firmware framebuffer) until drivers or exceptions exist, which hardware must settle (§74). |
 | 31 | The Loom download went beyond what you approved: 26 crate files and 3.36 MiB, against the 24 and 3.09 MiB you were told, and `memchr` and `aho-corasick` were said not to be fetched | **Accept** | §5. All are host-only and no shipping crate reaches them, and since the review they sit outside the kernel's workspace. The record should match what happened. |
-| 32 | Add CI: a GitHub workflow running `cargo xtask check` and the boot tests on every pull request? | **Yes** | §8 and §82 put CI in M0, and today every gate depends on one Mac. §80 forbids silent external costs, so it needs your word. GitHub's standard runners are free for public repositories. |
+| 32, answered | Add CI: a GitHub workflow running `cargo xtask check` and the boot tests on every pull request? | **Yes: the owner's decision, 2026-11-09** | §8 and §82 put CI in M0, and until then every gate depended on one Mac. §80 forbids silent external costs, so it needed the owner's word. It uses only GitHub's standard runners, free for this public repository. Built in `.github/workflows/ci.yml`, with the boots on a real processor through KVM as well as on QEMU's software CPU. A trial branch first booted the kernel on a real AMD EPYC on those runners (`docs/research/2026-11-09-testing-without-buying-hardware.md`) and showed costs QEMU's software CPU had hidden. |
 
 ## The native SDK (ADR-0011): Accepted 2026-11-09, nothing built
 
@@ -127,5 +129,24 @@ Every recommendation below was checked against the whole of CLAUDE.md. The secti
 | 37, answered | Kernel-stamped caller identity on every channel message (N9, an ADR-0005 amendment)? | **Yes** | §30 and §48 require authenticated IPC, and a capability says what may be done, not who asked. |
 | 38, answered | Each system-call number accepted only from its own address in `origin.core` (N5)? | **Yes** | Enforces §42's private door. It is hardening, not authorization (§58). |
 | 39 | If accepted, will you amend CLAUDE.md §48 and §70 to say this? | Your text, your call | Claude has not changed the directive. |
+
+## The interface language (OIDL): accepted 2026-11-09, as recommended
+
+The specification is `docs/spec/OIDL.md`, accepted by the owner on 2026-11-09. The generator and the first definition exist and are host-tested; the kernel does not use the output yet. Each question is answered there, in §19, with its reasoning and the sections of CLAUDE.md it was checked against. Summary:
+
+| # | Question | Recommendation |
+|---|---|---|
+| 40 (Q1), answered | Accept wire format revision 1 as specified (§7)? | **Accept** |
+| 41 (Q2), answered | Handles in the body as a slot equal to the handle's position? | **Accept** |
+| 42 (Q3), answered | A hello on every connection, negotiating the minor (§7.7)? | **Accept** |
+| 43 (Q4), answered | Exact size at the negotiated minor, refusing unknown trailing bytes? | **Exact** |
+| 44 (Q5), answered | A library whose version is already in `origin-version.toml` names that key? | **Accept** |
+| 45 (Q6), answered | A named `capability` per library and `requires` mandatory on every method? | **Accept** |
+| 46 (Q7), answered | A method's errors frozen for the whole major? | **Accept** |
+| 47 (Q8), answered | Have `channel_read` report each handle's type and rights, with ADR-0005 B1? | **Accept, with B1** |
+| 48 (Q9), answered | A `string` is valid UTF-8 with no NUL? | **Accept** |
+| 49 (Q10), answered | C symbols are `<library>_<method>`, with no special case for the kernel? | **Accept** |
+| 50 (Q11), answered | Keep `event_create` and `object_signal` as `@reserved`? | **Keep them** |
+| 51 (Q12), answered | A type from another library is read with all its members known, because only the interface's own library is negotiated? | **Accept** |
 
 **Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.

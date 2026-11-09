@@ -19,62 +19,25 @@
 //! The first slice has no process-creation or memory system calls: the kernel builds each
 //! process and maps its pages before any of its threads runs, so the page tables do not
 //! change while it lives.
+#![forbid(unsafe_code)]
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use framekernel::handles::HandleTable;
-use framekernel::paging::{Access, AddressSpace, MapError, PAGE, Table, TableMemory, Translation};
-use framekernel::runqueue::QueueError;
-use framekernel::usercopy;
+use crate::handles::HandleTable;
+use crate::paging::{Access, MapError, Translation};
+use crate::runqueue::QueueError;
 use origin_abi::{Error, Handle};
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
+use origin_frame::userspace::{UserFrame, UserSpace};
 
 use crate::cpu::{CpuIndex, without_interrupts};
 use crate::ipc::{self, Object};
-use crate::{memory, phys, sched, vm};
-
-/// Page-table frames one process may own (enough for a few scattered megabytes; larger
-/// processes come with a growable table list).
-const MAX_TABLES: usize = 32;
+use crate::sched;
 
 /// Values a process's report log keeps, for the boot proofs.
 const REPORTS: usize = 128;
-
-/// The page-table frames of one process.
-struct ProcessTables {
-    frames: [u64; MAX_TABLES],
-    count: usize,
-}
-
-impl TableMemory for ProcessTables {
-    fn allocate_table(&mut self) -> Option<u64> {
-        if self.count >= MAX_TABLES {
-            return None;
-        }
-        let frame = memory::allocate_frame()?;
-        let p = core::ptr::with_exposed_provenance_mut::<u8>(phys::to_virt(frame) as usize);
-        // SAFETY: the allocator just handed out this frame, which only this process now
-        // owns; the direct map makes it writable at `p`.
-        unsafe { p.write_bytes(0, PAGE as usize) };
-        let slot = self.frames.get_mut(self.count)?;
-        *slot = frame;
-        self.count += 1;
-        Some(frame)
-    }
-
-    fn table(&self, addr: u64) -> Option<&Table> {
-        if !self.frames.get(..self.count)?.contains(&addr) {
-            return None;
-        }
-        let p = core::ptr::with_exposed_provenance::<Table>(phys::to_virt(addr) as usize);
-        // SAFETY: `addr` is a zeroed frame this process allocated for its tables (checked
-        // just above), live until the process is dropped, reachable through the direct map,
-        // and only ever accessed as atomics; `Table` is valid for any bits.
-        Some(unsafe { &*p })
-    }
-}
 
 /// What a process may hold, set by its creator (P11). Objects are charged here even while
 /// they are in flight in a message, so a process cannot escape its table quota by putting
@@ -162,10 +125,8 @@ struct ReportLog {
 
 /// One process.
 pub(crate) struct Process {
-    space: AddressSpace,
-    tables: ProcessTables,
-    /// The user frames this process owns: freed with it.
-    pages: Vec<u64>,
+    /// Its page tables and the user frames they map, freed with it.
+    space: UserSpace,
     /// Its handles (P1).
     pub(crate) handles: SpinLock<HandleTable<Object>>,
     /// What it may hold (P11).
@@ -190,17 +151,8 @@ impl Process {
     /// A new process with an empty lower half and the kernel's half, under `limits`, whose
     /// code may issue system calls only from `[syscall_origin.0, syscall_origin.1)`.
     pub(crate) fn new(limits: Limits, syscall_origin: (u64, u64)) -> Option<Self> {
-        let mut tables = ProcessTables {
-            frames: [0; MAX_TABLES],
-            count: 0,
-        };
-        let mut space = AddressSpace::new(&mut tables).ok()?;
-        let half = vm::kernel_half()?;
-        space.set_upper_half(&tables, &half).ok()?;
         Some(Self {
-            space,
-            tables,
-            pages: Vec::new(),
+            space: UserSpace::new()?,
             handles: SpinLock::new(HandleTable::new(limits.handles)),
             account: Arc::new(Account {
                 channels: AtomicUsize::new(0),
@@ -226,67 +178,35 @@ impl Process {
         self.space.root()
     }
 
-    /// Maps the user page `virt` to a fresh zeroed frame this process owns, and returns the
-    /// frame's address. Only inside the user half (ADR-0004 H1). Before the process has
-    /// threads.
-    pub(crate) fn map_page(&mut self, virt: u64, access: Access) -> Result<u64, MapError> {
-        if !usercopy::is_user_address(virt) || usercopy::USER_END - virt < PAGE {
-            return Err(MapError::NonCanonical(virt));
-        }
-        self.pages
-            .try_reserve(1)
-            .map_err(|_| MapError::OutOfMemory)?;
-        let frame = memory::allocate_frame().ok_or(MapError::OutOfMemory)?;
-        let p = core::ptr::with_exposed_provenance_mut::<u8>(phys::to_virt(frame) as usize);
-        // SAFETY: the allocator just handed out this frame, which only this process now
-        // owns; the direct map makes it writable at `p`, and it spans `PAGE` bytes.
-        unsafe { p.write_bytes(0, PAGE as usize) };
-        if let Err(e) = self.space.map_user(&mut self.tables, virt, frame, access) {
-            let _ = memory::free_frame(frame);
-            return Err(e);
-        }
-        self.pages.push(frame);
-        Ok(frame)
+    /// This process's address space.
+    pub(crate) const fn space(&self) -> &UserSpace {
+        &self.space
     }
 
-    /// Copies `bytes` to `offset` bytes into the frame at `frame` (from [`Process::map_page`]).
-    /// Before the process has threads, so nothing else touches the frame.
-    pub(crate) fn write_frame(&self, frame: u64, offset: usize, bytes: &[u8]) -> bool {
-        if !self.pages.contains(&frame)
-            || offset
-                .checked_add(bytes.len())
-                .is_none_or(|e| e > PAGE as usize)
-        {
-            return false;
-        }
-        let p = core::ptr::with_exposed_provenance_mut::<u8>(phys::to_virt(frame) as usize);
-        // SAFETY: `frame` is one of this process's frames (checked), writable through the
-        // direct map; `offset + bytes.len()` is inside its page (checked); no thread runs in
-        // the process yet (the caller's contract), so nothing races this write.
-        unsafe {
-            p.wrapping_add(offset)
-                .copy_from(bytes.as_ptr(), bytes.len())
-        };
-        true
+    /// Maps the user page `virt` to a fresh zeroed frame this process owns, and returns it.
+    /// Only inside the user half (ADR-0004 H1). Before the process has threads.
+    pub(crate) fn map_page(&mut self, virt: u64, access: Access) -> Result<UserFrame, MapError> {
+        self.space.map_page(virt, access)
     }
 
-    /// The little-endian `u64` at `virt` in this process's memory, for the boot proofs. The
-    /// process has ended, or it only writes the word the proof is waiting for.
+    /// Copies `bytes` to `offset` bytes into the frame `frame` (from [`Process::map_page`]).
+    pub(crate) fn write_frame(&self, frame: UserFrame, offset: usize, bytes: &[u8]) -> bool {
+        self.space.write_frame(frame, offset, bytes)
+    }
+
+    /// The frame mapped at `virt`, if any.
+    pub(crate) fn frame_of(&self, virt: u64) -> Option<UserFrame> {
+        self.space.frame_of(virt)
+    }
+
+    /// The little-endian `u64` at `virt` in this process's memory, for the boot proofs.
     pub(crate) fn read_u64(&self, virt: u64) -> Option<u64> {
-        if !virt.is_multiple_of(8) {
-            return None;
-        }
-        let leaf = self.translate(virt)?;
-        let p = core::ptr::with_exposed_provenance::<u64>(phys::to_virt(leaf.phys) as usize);
-        // SAFETY: `translate` found the page mapped in this process, so its frame is this
-        // process's and stays allocated while the proof holds a reference; `virt`, and so
-        // the frame offset, is 8-aligned and inside the page. A volatile read of plain data.
-        Some(unsafe { p.read_volatile() })
+        self.space.read_u64(virt)
     }
 
     /// How this process's tables translate the user address `virt`.
     pub(crate) fn translate(&self, virt: u64) -> Option<Translation> {
-        self.space.translate(&self.tables, virt)
+        self.space.translate(virt)
     }
 
     /// Whether `virt` is mapped in this process's address space.
@@ -388,19 +308,5 @@ impl Process {
         // were only reachable through an undelivered message another processor is reaping
         // this instant close a moment later: they are delayed, never lost.)
         without_interrupts(|| *self.ending.lock() = Some(ending));
-    }
-}
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        // The last reference is gone: every thread has exited and its processor has moved
-        // to another address space (the scheduler holds a reference per live thread), so
-        // nothing maps these frames any more.
-        for &frame in &self.pages {
-            let _ = memory::free_frame(frame);
-        }
-        for &frame in self.tables.frames.iter().take(self.tables.count) {
-            let _ = memory::free_frame(frame);
-        }
     }
 }

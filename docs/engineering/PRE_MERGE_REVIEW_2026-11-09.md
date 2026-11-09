@@ -48,8 +48,8 @@ Each reviewer read one area in full and reported defects with a concrete failure
 |---|---|---|
 | High | The Framekernel's small trusted base does not exist yet: 310 `unsafe` sites in 21 files, and memory-unsafe operations exposed as safe functions (`vm::map_mmio`, `Process::map`, `memory::free_frame`). ADR-0001's security model depends on it | A refactor needing its own ADR. It is the same work as the owner's SDK-first direction |
 | High | No speculative-execution controls (IBRS or AutoIBRS, IBPB; §24, ADR-0004 H5) | QEMU TCG has no speculation, so it could not be proven. Required before any real-hardware claim |
-| High | CET shadow stacks are not enabled (§14) | As above: needs hardware to prove |
-| High | No CI, though §82 puts it in M0 and §8 requires it | Needs the owner's word (§80: no silent external costs). STATUS now says so |
+| High | CET shadow stacks are not enabled (§14) | The code does not exist yet. A free KVM runner offers shadow stacks to a guest (found the same day: QEMU reports `cet-ss` true), so they can be tested once it does |
+| High | No CI, though §82 puts it in M0 and §8 requires it | Needs the owner's word (§80: no silent external costs). STATUS now says so. **Added on the owner's word the same day:** `.github/workflows/ci.yml` |
 | High | `tcp.rs` has no acceptance checks | Not connected to the NIC; only an in-memory loopback uses it. Must be rewritten against RFC 9293 before it is |
 | Medium | IOMMU threats T5, T8, T9, T11, T15, T19 and T23 are open, and T14's identity maps are not built | ADR-0009 H6 requires closing or accepting them before the first physical boot |
 | Medium | Scheduler: time before a block is uncharged; thread identity blocks migration; 15 threads per CPU; a 10 ms tick; no load balancing | M3 work (§26, §27) |

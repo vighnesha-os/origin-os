@@ -15,36 +15,30 @@
 //!   checked before anything is consumed, so a bad out pointer does not lose a message.
 //! - Only a call from the process's system-call code range is accepted (P4, ONBF §6.1,
 //!   "syscall-origin pinning"). Until `origin.core` exists the creator names that range.
+#![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use framekernel::usercopy::{self, UserAccess, UserRange};
+use crate::usercopy::UserAccess;
 use origin_abi::limits::{MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES};
 use origin_abi::{Error, Handle, OK, read_sizes, signals, syscall as number};
+use origin_frame::trap::SyscallOutcome;
 
 use crate::console::Console;
 use crate::process::{Ending, Process};
 use crate::{cpu, ipc, sched};
 
-/// What a system call left to do on its way out of the kernel.
-pub(crate) enum Outcome {
-    /// Return this status in RAX.
-    Status(i64),
-    /// The thread is over: the handler switches away and never returns to it.
-    ThreadExit,
-}
-
 /// Runs one system call from ring 3: the number, its six arguments, and the address after
 /// the `syscall` instruction. Interrupts are off on entry and on return.
-pub(crate) fn run(call: u64, args: [u64; 6], rip: u64) -> Outcome {
+pub(crate) fn run(call: u64, args: [u64; 6], rip: u64) -> SyscallOutcome {
     let Some(process) = sched::current_process() else {
         // A thread in user mode always has a process. If that ever failed, ending the
         // thread is the only safe thing: it can do nothing without one.
-        return Outcome::ThreadExit;
+        return SyscallOutcome::ThreadExit;
     };
     if !process.may_call_from(rip) {
-        return Outcome::Status(Error::AccessDenied.raw());
+        return SyscallOutcome::Status(Error::AccessDenied.raw());
     }
     cpu::enable_interrupts();
     let outcome = dispatch(&process, call, args);
@@ -75,11 +69,11 @@ pub(crate) fn user_fault(vector: u64, error: u64, address: u64, stack_fixed: boo
     cpu::disable_interrupts();
 }
 
-fn dispatch(p: &Process, call: u64, [a0, a1, a2, a3, a4, a5]: [u64; 6]) -> Outcome {
+fn dispatch(p: &Process, call: u64, [a0, a1, a2, a3, a4, a5]: [u64; 6]) -> SyscallOutcome {
     let result = match call {
         number::THREAD_EXIT => {
             p.thread_ended(Ending::Exited(a0));
-            return Outcome::ThreadExit;
+            return SyscallOutcome::ThreadExit;
         }
         number::DEBUG_REPORT | number::DEBUG_WRITE if !p.debug_calls() => Err(Error::NotSupported),
         number::DEBUG_REPORT => {
@@ -95,7 +89,7 @@ fn dispatch(p: &Process, call: u64, [a0, a1, a2, a3, a4, a5]: [u64; 6]) -> Outco
         number::WAIT_ONE => wait_one(p, a0, a1, a2, a3),
         _ => Err(Error::NotSupported),
     };
-    Outcome::Status(match result {
+    SyscallOutcome::Status(match result {
         Ok(()) => OK,
         Err(e) => e.raw(),
     })
@@ -107,43 +101,18 @@ fn handle_arg(raw: u64) -> Result<Handle, Error> {
 }
 
 /// A pointer and length, checked against the caller's tables.
-fn checked(p: &Process, addr: u64, len: u64, access: UserAccess) -> Result<UserRange, Error> {
-    let range = UserRange::new(addr, len)?;
-    usercopy::check_mapped(&range, access, |page| p.translate(page))?;
-    Ok(range)
+fn checked(p: &Process, addr: u64, len: u64, access: UserAccess) -> Result<(), Error> {
+    p.space().check_user(addr, len, access)
 }
 
 /// Fills `dst` from the caller's memory at `src`.
 fn copy_in(p: &Process, dst: &mut [u8], src: u64) -> Result<(), Error> {
-    let range = checked(p, src, dst.len() as u64, UserAccess::Read)?;
-    if range.is_empty() {
-        return Ok(());
-    }
-    let target = dst.as_mut_ptr().expose_provenance() as u64;
-    // SAFETY: `dst` is a live kernel buffer of `range.len()` bytes that this call owns; the
-    // source was checked to be present user memory of the calling process, whose tables are
-    // the live ones; and a page fault during the copy is recovered.
-    if unsafe { cpu::copy_user(target, src, range.len()) } {
-        Ok(())
-    } else {
-        Err(Error::Fault)
-    }
+    p.space().copy_in(dst, src)
 }
 
 /// Copies `src` into the caller's memory at `dst`.
 fn copy_out(p: &Process, dst: u64, src: &[u8]) -> Result<(), Error> {
-    let range = checked(p, dst, src.len() as u64, UserAccess::Write)?;
-    if range.is_empty() {
-        return Ok(());
-    }
-    let source = src.as_ptr().expose_provenance() as u64;
-    // SAFETY: as in `copy_in`, the other way round: the destination was checked to be
-    // present, writable user memory of the calling process, and `src` is a kernel buffer.
-    if unsafe { cpu::copy_user(dst, source, range.len()) } {
-        Ok(())
-    } else {
-        Err(Error::Fault)
-    }
+    p.space().copy_out(dst, src)
 }
 
 /// The little-endian `u32` at `addr` in the caller's memory, read once.

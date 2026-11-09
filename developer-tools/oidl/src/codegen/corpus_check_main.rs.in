@@ -1,0 +1,115 @@
+fn hex_bytes(text: &str) -> Vec<u8> {
+    assert!(text.len() % 2 == 0, "odd hex");
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).expect("hex digit"))
+        .collect()
+}
+
+fn field<'a>(parts: &'a [&'a str], key: &str) -> &'a str {
+    parts
+        .iter()
+        .find_map(|part| part.strip_prefix(key)?.strip_prefix('='))
+        .unwrap_or_else(|| panic!("no {key}= in {parts:?}"))
+}
+
+fn run_line(library: &str, line: &str) -> Result<(), String> {
+    let parts: Vec<&str> = line.split(' ').collect();
+    match parts[0] {
+        "syscall" => {
+            let interface = parts[1];
+            let method = parts[2];
+            let number: u64 = parts[3].parse().expect("number");
+            let holds = field(&parts, "holds") == "1";
+            let args: Vec<u64> = field(&parts, "args")
+                .split(',')
+                .map(|a| u64::from_str_radix(a, 16).expect("arg"))
+                .collect();
+            let args: [u64; 6] = args.try_into().expect("six arguments");
+            let expect = field(&parts, "expect");
+            let got = check_syscall(library, interface, number, holds, args);
+            let matched = if expect == "ok" {
+                got == 0
+            } else {
+                status_text(got) == expect
+            };
+            if matched {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{interface}.{method}: got {got} ({}), want {expect}, in: {line}",
+                    status_text(got)
+                ))
+            }
+        }
+        "message" => {
+            let interface = parts[1];
+            let method = parts[2];
+            let request = parts[3] == "request";
+            let minor: u16 = field(&parts, "minor").parse().expect("minor");
+            let handles: Vec<rt::RecvHandle> = field(&parts, "handles")
+                .split(',')
+                .filter(|h| !h.is_empty())
+                .map(|h| {
+                    let mut items = h.split(':');
+                    let mut next = || {
+                        u32::from_str_radix(items.next().expect("field"), 16).expect("hex")
+                    };
+                    let value = next();
+                    let object = next();
+                    let rights = next();
+                    rt::RecvHandle {
+                        value: rt::Handle::from_abi(value),
+                        object,
+                        rights,
+                    }
+                })
+                .collect();
+            let bytes = hex_bytes(field(&parts, "bytes"));
+            let expect = field(&parts, "expect");
+            let got = check_message(library, interface, method, request, minor, &bytes, &handles);
+            let matches = match (&got, expect) {
+                (Ok(()), "ok") => true,
+                (Err(e), want) => e.name() == want,
+                (Ok(()), _) => false,
+            };
+            if matches {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{interface}.{method}: got {got:?}, want {expect}, in: {line}"
+                ))
+            }
+        }
+        other => Err(format!("unknown record {other}")),
+    }
+}
+
+fn main() {
+    let mut cases = 0usize;
+    let mut failures = 0usize;
+    for path in std::env::args().skip(1) {
+        let text = std::fs::read_to_string(&path).expect("read corpus");
+        let mut library = String::new();
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("# oidl-corpus 1 ") {
+                library = rest.to_string();
+                continue;
+            }
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            cases += 1;
+            if let Err(message) = run_line(&library, line) {
+                failures += 1;
+                if failures <= 20 {
+                    eprintln!("MISMATCH {message}");
+                }
+            }
+        }
+    }
+    println!("corpus: {cases} cases, {failures} mismatches");
+    if failures != 0 {
+        std::process::exit(1);
+    }
+}

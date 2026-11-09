@@ -25,19 +25,21 @@
 //! function that would not let go of the bus, leaves `DeviceDma::attach` refusing.
 //!
 //! Configuration accesses are 32-bit volatile loads and stores into the window.
+#![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::ops::ControlFlow;
-use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use framekernel::acpi::{self, IoApic};
-use framekernel::hpet;
-pub(crate) use framekernel::pci::Device;
-use framekernel::pci::{self, Address, Bar, BarKind, ConfigSpace, Ecam, Function};
+use crate::acpi::{self, IoApic};
+use crate::hpet;
+pub(crate) use crate::pci::Device;
+use crate::pci::{self, Address, Bar, BarKind, ConfigSpace, Ecam, Function};
 use origin_boot_info::{MemoryRegion, RegionKind};
-use origin_sync::{RwLock, SpinLock};
+use origin_frame::addr::PhysAddr;
+use origin_frame::mmio::MmioRegion;
+use origin_frame::sync::{RwLock, SpinLock};
 
 use crate::console::Console;
 use crate::cpu::CpuIndex;
@@ -45,31 +47,23 @@ use crate::cpu::CpuIndex;
 /// One ECAM window, mapped (segment 0's is [`ECAM`]; any others stay in [`Quiesce`]).
 struct EcamSpace {
     ecam: Ecam,
-    virt: u64,
+    window: MmioRegion,
 }
 
 impl ConfigSpace for EcamSpace {
     fn read32(&mut self, at: Address, register: u16) -> u32 {
+        // A function or register outside the window reads as all ones, like an absent device.
         let Some(offset) = self.ecam.offset(at, register) else {
             return u32::MAX;
         };
-        let p = ptr::with_exposed_provenance::<u32>((self.virt + offset) as usize);
-        // SAFETY: `offset` lies inside the window (`Ecam::offset` checked the bus, device,
-        // function and register), which is mapped uncached and read/write at `virt`, and
-        // is aligned to 4. A configuration read has no effect on memory.
-        unsafe { p.read_volatile() }
+        self.window.read32(offset as usize)
     }
 
     fn write32(&mut self, at: Address, register: u16, value: u32) {
         let Some(offset) = self.ecam.offset(at, register) else {
             return;
         };
-        let p = ptr::with_exposed_provenance_mut::<u32>((self.virt + offset) as usize);
-        // SAFETY: as for `read32`. A configuration write reaches only the device's
-        // configuration registers. The writes this kernel makes are BAR sizing (with
-        // decoding off, so the all-ones probe address is never decoded, and each BAR is
-        // restored) and command-register bits it owns.
-        unsafe { p.write_volatile(value) };
+        self.window.write32(offset as usize, value);
     }
 }
 
@@ -190,7 +184,7 @@ fn map_window(
         );
         return None;
     }
-    let virt = match crate::vm::map_mmio(phys, len) {
+    let window = match crate::vm::map_mmio(PhysAddr::new(phys), len) {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(
@@ -200,6 +194,7 @@ fn map_window(
             return None;
         }
     };
+    let virt = window.virt();
     let leaf = crate::vm::translate(virt);
     let uncached =
         leaf.is_some_and(|t| t.uncached && t.writable && !t.executable && t.phys == phys);
@@ -213,7 +208,7 @@ fn map_window(
         Size(leaf.map_or(0, |t| t.size)),
         if uncached { "" } else { ": PCIe failed" }
     );
-    uncached.then_some(EcamSpace { ecam, virt })
+    uncached.then_some(EcamSpace { ecam, window })
 }
 
 /// Stops the firmware's devices: maps every ECAM window and clears Bus Master Enable on every
@@ -229,9 +224,6 @@ pub(crate) fn quiesce(
     regions: &'static [MemoryRegion],
     own: &[Address],
 ) -> Option<Quiesce> {
-    // The first thing that may map device memory after the console: `vm::map_mmio` holds
-    // every later mapping against this map.
-    crate::vm::set_memory_map(regions);
     let pat = crate::cpu::check_pat();
     if crate::cpu::pat_ready(&[crate::cpu::this_cpu()]) != 1 {
         let _ = writeln!(

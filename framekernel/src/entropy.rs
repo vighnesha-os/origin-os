@@ -3,7 +3,7 @@
 //! on-chip entropy pool is momentarily drained; Intel's guidance is a short bounded retry
 //! loop, not an unbounded spin. This module holds that retry and buffer-fill logic as pure
 //! functions over an abstract one-shot [`Source`], so it is tested on the host; the kernel
-//! supplies the real instruction (`main.rs`/`cpu.rs`).
+//! supplies the real instruction (`kernel.rs`/`cpu.rs`).
 //!
 //! This is a *true-random* source, not a deterministic RBG: it returns hardware bits or
 //! fails. A caller that wants a reseedable stream builds a DRBG over it — a later, reviewed

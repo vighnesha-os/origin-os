@@ -31,63 +31,29 @@
 //! (CPUID 8000_0007h EDX bit 8: constant rate in every P-, C- and T-state). Without that
 //! bit (QEMU's TCG does not report it) the clock still runs and still never steps back, but
 //! its rate is only what the boot measured, and the boot report says so.
+#![forbid(unsafe_code)]
 
-use core::arch::asm;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use framekernel::acpi;
-use framekernel::clock::{self, NANOS_PER_SECOND, Scale, SharedScale};
-use framekernel::hpet;
-use framekernel::rtc::{self, DateTime, Registers, SecondMeasurement, SecondVerdict, register};
-use origin_sync::SpinLock;
-use origin_sync::floor::MonotonicFloor;
+use crate::acpi;
+use crate::clock::{self, NANOS_PER_SECOND, Scale};
+use crate::hpet;
+use crate::rtc::{self, DateTime, Registers, SecondMeasurement, SecondVerdict, register};
+use origin_frame::addr::PhysAddr;
+use origin_frame::mmio::MmioRegion;
+use origin_frame::monotonic::monotonic_reading;
+use origin_frame::sync::SpinLock;
+use origin_frame::sync::floor::MonotonicFloor;
 
 use crate::console::Console;
 use crate::cpu::{self, rdtsc};
-use crate::{inb, outb};
+use origin_frame::port;
 
-/// The TSC when the kernel was entered: the monotonic clock's zero.
-static ENTRY_TSC: AtomicU64 = AtomicU64::new(0);
-/// TSC ticks to nanoseconds, once [`init`] has chosen the rate.
-static SCALE: SharedScale = SharedScale::new();
-/// The latest time any caller has been given, on any processor (ADR-0012).
-static FLOOR: MonotonicFloor = MonotonicFloor::new();
 /// Unix time in nanoseconds at monotonic zero; 0 while unknown.
 static BOOT_WALL: AtomicU64 = AtomicU64::new(0);
 
-/// Records the monotonic clock's zero: the first thing `_start` does.
-pub(crate) fn mark_entry() {
-    ENTRY_TSC.store(rdtsc(), Ordering::Relaxed);
-}
-
-/// The TSC when the kernel was entered.
-pub(crate) fn entry_tsc() -> u64 {
-    ENTRY_TSC.load(Ordering::Relaxed)
-}
-
-/// Nanoseconds since kernel entry; 0 until [`init`] has chosen the TSC rate.
-///
-/// Never less than any value this function has returned earlier, on any processor, whatever
-/// the processors' TSCs say (ADR-0012). Two calls can return the same value. Safe in any
-/// context, interrupt and NMI handlers included.
-pub(crate) fn monotonic_nanos() -> u64 {
-    monotonic_reading().map_or(0, |(_, given)| given)
-}
-
-/// What this processor's TSC says in nanoseconds since kernel entry, and what the clock gives
-/// out for that: the same, or the floor if the floor is above it. `None` before [`init`].
-#[inline]
-fn monotonic_reading() -> Option<(u64, u64)> {
-    let scale = SCALE.get()?;
-    let counted = scale.nanos(rdtsc().saturating_sub(ENTRY_TSC.load(Ordering::Relaxed)));
-    Some((counted, FLOOR.advance(counted)))
-}
-
-/// The chosen TSC rate in Hz (1 before the clock is set up), for spin-wait budgets.
-pub(crate) fn tsc_hz() -> u64 {
-    SCALE.get().map_or(1, |s| s.hz())
-}
+pub(crate) use origin_frame::monotonic::{entry_tsc, mark_entry, monotonic_nanos, tsc_hz};
 
 /// Unix time in nanoseconds, or `None` if the wall clock was never set.
 pub(crate) fn wall_nanos() -> Option<u64> {
@@ -115,9 +81,6 @@ fn rdtscp_supported() -> bool {
     cpu::cpuid(0x8000_0000)[0] >= 0x8000_0001 && cpu::cpuid(0x8000_0001)[3] & (1 << 27) != 0
 }
 
-/// CMOS index and data ports.
-const CMOS_INDEX: u16 = 0x70;
-const CMOS_DATA: u16 = 0x71;
 /// Register B bit 7: updates are inhibited while the clock is being set.
 const STATUS_B_SET: u8 = 0x80;
 /// How long [`measure_rtc`] may take, in tenths of a second: the two seconds that two
@@ -129,27 +92,13 @@ const RTC_BUDGET_TENTHS: u64 = 32;
 /// thousand (1 %).
 const RTC_TOLERANCE_PPT: u16 = 10;
 
-/// The CMOS RTC, through ports 70h and 71h.
-struct Cmos(());
+/// The CMOS real-time clock's registers (the framework's single [`port::Cmos`] handle).
+struct Cmos(port::Cmos);
 
 impl Cmos {
-    /// # Safety
-    ///
-    /// CPL 0, and nothing else drives ports 70h–71h while the value lives (only the boot
-    /// processor reads the clock, at boot). Bit 7 of the index port masks NMIs on some
-    /// chipsets; every index written here has it clear, so NMIs stay enabled.
-    unsafe fn new() -> Self {
-        Self(())
-    }
-
-    /// Reads CMOS register `index` (below 80h). No register read here has a side effect:
-    /// register C, whose read acknowledges RTC interrupts, is never read.
+    /// Reads RTC register `index` (the NMI-mask bit stays clear).
     fn read(&mut self, index: u8) -> u8 {
-        // SAFETY: the constructor's contract; selecting a register only latches an index.
-        unsafe { outb(CMOS_INDEX, index & 0x7F) };
-        // SAFETY: as above; the read returns the selected register and cannot affect
-        // memory.
-        unsafe { inb(CMOS_DATA) }
+        self.0.read(index)
     }
 
     fn updating(&mut self) -> bool {
@@ -262,12 +211,10 @@ pub(crate) fn init(com1: &mut Console, calibrated_hz: u64, rsdp: u64) -> bool {
     let rtc_present = !fadt.is_some_and(|f| f.cmos_rtc_absent);
     let mut ok = true;
     // One RTC second on the TSC, and a reading of the clock just after an update.
-    let measured = rtc_present.then(|| {
-        // SAFETY: CPL 0, the boot processor, interrupts disabled; no other code uses the
-        // CMOS ports.
-        let mut cmos = unsafe { Cmos::new() };
-        measure_rtc(&mut cmos, calibrated_hz, century)
-    });
+    let measured = rtc_present
+        .then(|| port::Cmos::take().map(Cmos))
+        .flatten()
+        .map(|mut cmos| measure_rtc(&mut cmos, calibrated_hz, century));
     let second = measured.as_ref().and_then(|m| m.second);
     let cpuid_hz = cpuid_tsc_hz();
     let (hz, source) = match (cpuid_hz, second.map(|s| s.ticks())) {
@@ -279,7 +226,7 @@ pub(crate) fn init(com1: &mut Console, calibrated_hz: u64, rsdp: u64) -> bool {
         let _ = writeln!(com1, "origin-kernel: clock: TSC rate 0: clock failed");
         return false;
     };
-    SCALE.publish(scale);
+    origin_frame::monotonic::publish_scale(scale);
     let _ = writeln!(
         com1,
         "origin-kernel: clock: TSC at {} kHz, from {source}; invariant TSC {}; PIT calibration {} kHz; CPUID 15h {}",
@@ -342,21 +289,15 @@ fn pair_tight_ticks(scale: Scale) -> u64 {
     scale.hz() / 50_000
 }
 
-/// Reads the HPET's 64-bit register at `virt + offset`.
-fn hpet_read(virt: u64, offset: u64) -> u64 {
-    let p = core::ptr::with_exposed_provenance::<u64>((virt + offset) as usize);
-    // SAFETY: `virt` maps the HPET's registers uncached (just mapped); `offset` names a
-    // 64-bit-aligned register inside the 1 KiB block, and a register read has no memory
-    // effect.
-    unsafe { p.read_volatile() }
+/// Reads the HPET's 64-bit register at `offset`.
+fn hpet_read(regs: MmioRegion, offset: u64) -> u64 {
+    regs.read64(offset as usize)
 }
 
-/// Writes the HPET's 64-bit register at `virt + offset`.
-fn hpet_write(virt: u64, offset: u64, value: u64) {
-    let p = core::ptr::with_exposed_provenance_mut::<u64>((virt + offset) as usize);
-    // SAFETY: as for `hpet_read`; the only register written here is General Configuration,
-    // which affects only the HPET.
-    unsafe { p.write_volatile(value) };
+/// Writes the HPET's 64-bit register at `offset`: only General Configuration is written here,
+/// which affects only the HPET.
+fn hpet_write(regs: MmioRegion, offset: u64, value: u64) {
+    regs.write64(offset as usize, value);
 }
 
 /// Discovers the HPET through ACPI, enables its main counter, and checks it advances at the
@@ -377,7 +318,7 @@ fn prove_hpet(com1: &mut Console, rsdp: u64, scale: Scale) -> bool {
             return false;
         }
     };
-    let virt = match crate::vm::map_mmio(info.base, 0x1000) {
+    let virt = match crate::vm::map_mmio(PhysAddr::new(info.base), 0x1000) {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(
@@ -446,11 +387,17 @@ fn prove_pm_timer(com1: &mut Console, rsdp: u64, scale: Scale) -> bool {
         return true;
     };
     let mask: u32 = if wide { 0xFFFF_FFFF } else { 0x00FF_FFFF };
+    // The FADT's PM_TMR_BLK: a read-only 32-bit timer port. A first claim of it succeeds.
+    let Some(timer) = origin_frame::port::PortRange::claim(port, 4) else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: PM timer: its port {port:#x} is not available: PM timer failed"
+        );
+        return false;
+    };
     let read = move || {
         let before = rdtsc();
-        // SAFETY: CPL 0, boot processor; `port` is the FADT's PM_TMR_BLK, a read-only
-        // 32-bit timer port that cannot affect memory.
-        let value = u64::from((unsafe { crate::ind(port) }) & mask);
+        let value = u64::from(timer.read32(0) & mask);
         (before, value, rdtsc())
     };
     let tight = pair_tight_ticks(scale);
@@ -522,7 +469,7 @@ fn set_wall_clock(
         );
         return false;
     };
-    let at = scale.nanos(t1.saturating_sub(ENTRY_TSC.load(Ordering::Relaxed)));
+    let at = scale.nanos(t1.saturating_sub(entry_tsc()));
     let base = unix.saturating_sub(at);
     BOOT_WALL.store(base, Ordering::Relaxed);
     let now = wall_nanos().unwrap_or(0);
@@ -654,24 +601,10 @@ impl Reading {
     }
 }
 
-/// The TSC, read only once every earlier instruction has executed, so a reading cannot be
-/// taken before the lock that orders it is held: RDTSCP (Intel SDM Vol. 2B, RDTSCP; AMD
-/// APM Vol. 3), else LFENCE then RDTSC.
+/// The TSC, read only once every earlier instruction has executed (RDTSCP, else LFENCE and
+/// RDTSC): the framework's `cpu::ordered_tsc`.
 fn ordered_tsc(rdtscp: bool) -> u64 {
-    let (low, high): (u32, u32);
-    if rdtscp {
-        // SAFETY: RDTSCP exists (the caller checked CPUID); it writes EDX:EAX and ECX
-        // (IA32_TSC_AUX, unused here) and reads no memory.
-        unsafe {
-            asm!("rdtscp", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack, preserves_flags));
-        }
-    } else {
-        // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory.
-        unsafe {
-            asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags));
-        }
-    }
-    (u64::from(high) << 32) | u64::from(low)
+    cpu::ordered_tsc(rdtscp)
 }
 
 /// Reads `reading` under [`TURN`]'s lock until [`UNTIL`], comparing each value with the one
@@ -867,9 +800,9 @@ extern "sysv64" fn cost_reader(_: u64) -> ! {
 /// every processor reading at once, the case the shared floor makes expensive. This reports;
 /// it decides nothing.
 fn report_read_cost(com1: &mut Console, cpus: &[cpu::CpuIndex], bsp: cpu::CpuIndex, tsc_hz: u64) {
-    let entry = ENTRY_TSC.load(Ordering::Relaxed);
+    let entry = entry_tsc();
     let bare = ticks_per_read(rdtsc);
-    let unfloored = SCALE.get().map_or(0, |scale| {
+    let unfloored = origin_frame::monotonic::published_scale().map_or(0, |scale| {
         ticks_per_read(|| scale.nanos(rdtsc().saturating_sub(entry)))
     });
     let floored = ticks_per_read(monotonic_nanos);

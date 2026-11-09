@@ -16,15 +16,16 @@
 //!
 //! The user-visible waiting of ADR-0005 P9 (`ipc::wait_one`) is built on these queues.
 //!
-//! The protocol itself is `origin_sync::wait`, generic over the scheduler so the Loom models
+//! The protocol itself is `origin_frame::sync::wait`, generic over the scheduler so the Loom models
 //! run it (`cargo xtask loom`); this module instantiates it for kernel threads.
+#![forbid(unsafe_code)]
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use framekernel::runqueue::{RoundTrips, judge_round_trips, per_mille};
-use origin_sync::SpinLock;
-use origin_sync::wait::{self, TimedOut};
+use crate::runqueue::{RoundTrips, judge_round_trips, per_mille};
+use origin_frame::sync::SpinLock;
+use origin_frame::sync::wait::{self, TimedOut};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, rdtsc};
