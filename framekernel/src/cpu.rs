@@ -780,6 +780,8 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // SAFETY: as for the timer; x2APIC mode is on, and the write only acknowledges the
         // interrupt in service.
         unsafe { wrmsr(X2APIC_EOI, 0) };
+        // The console's boot proof prints from this handler once: see `console::prove`.
+        crate::console::on_proof_interrupt();
         return here;
     }
     // A device's MSI-X message (the NVMe I/O queue): acknowledge, let the driver wake its
@@ -1027,6 +1029,11 @@ fn read_rflags() -> u64 {
     // SAFETY: PUSHFQ and POP touch only the stack and the output register.
     unsafe { asm!("pushfq", "pop {}", out(reg) value, options(nomem, preserves_flags)) };
     value
+}
+
+/// Whether this processor takes interrupts now (RFLAGS.IF).
+pub(crate) fn interrupts_enabled() -> bool {
+    read_rflags() & (1 << 9) != 0
 }
 
 /// CR2: the linear address of the last page fault.

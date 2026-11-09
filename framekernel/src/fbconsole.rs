@@ -17,6 +17,13 @@
 //! one replacement glyph and continuation bytes draw nothing, so a line is as many cells wide
 //! as it has characters.
 //!
+//! Drawing can stop after any pixel and carry on later. Everything the console paints is a
+//! rectangle, solid or a glyph, so an unfinished character is a few rectangles and how far the
+//! current one has got ([`Painting`]). [`Backlog`] keeps accepted text in order and paints it a
+//! given number of pixels at a time. The caller chooses how many, and what happens in between:
+//! the kernel uses this to bound the uncached memory it writes in one stretch with interrupts
+//! off (`console.rs` gives the bound and the reasoning).
+//!
 //! Nothing here can panic. A framebuffer whose description is refused gets no console at all;
 //! an accepted one's every pixel is inside the visible rows, and a wrong cursor is clamped.
 //! The kernel's sink checks each offset again anyway.
@@ -196,84 +203,357 @@ impl Screen {
         y as usize * self.stride as usize + x as usize * 4
     }
 
-    fn hline(&self, out: &mut impl PixelSink, x0: u32, y: u32, value: u32) {
-        for x in x0..self.width {
-            out.write32(self.offset(x, y), value);
-        }
-    }
-
-    /// Paints the part of text row `row` from `from` (a pixel column) to the display's edge.
-    fn fill_row(&self, out: &mut impl PixelSink, row: u32, from: u32, value: u32) {
+    /// The rest of text row `row` from `column` on, in the background: how a line ends.
+    fn end_of_row(&self, column: u32, row: u32) -> Stroke {
         let top = row * self.row_height();
-        for y in top..top + self.row_height() {
-            self.hline(out, from, y, value);
-        }
+        Stroke::new(
+            column * self.column_width(),
+            top,
+            self.width,
+            top + self.row_height(),
+            Ink::Solid(self.background),
+        )
     }
 
-    /// Paints `bitmap` into the cell at `(column, row)`, every pixel of it.
-    fn draw(&self, out: &mut impl PixelSink, column: u32, row: u32, bitmap: &[u8; 16]) {
+    /// All of text row `row`, as the bar.
+    fn bar_row(&self, row: u32) -> Stroke {
+        let top = row * self.row_height();
+        Stroke::new(
+            0,
+            top,
+            self.width,
+            top + self.row_height(),
+            Ink::Solid(self.bar),
+        )
+    }
+
+    /// The glyph of `byte` in the cell at `(column, row)`.
+    fn glyph_cell(&self, column: u32, row: u32, byte: u8) -> Stroke {
         let (left, top) = (column * self.column_width(), row * self.row_height());
-        for (index, bits) in (0u32..).zip(bitmap.iter()) {
-            for sub_row in 0..self.scale {
-                let y = top + index * self.scale + sub_row;
-                for bit in 0..font::WIDTH {
-                    let value = if bits & (0x80 >> bit) != 0 {
-                        self.foreground
-                    } else {
-                        self.background
-                    };
-                    for sub_column in 0..self.scale {
-                        let x = left + bit * self.scale + sub_column;
-                        out.write32(self.offset(x, y), value);
+        Stroke::new(
+            left,
+            top,
+            left + self.column_width(),
+            top + self.row_height(),
+            Ink::Glyph(font::glyph(byte)),
+        )
+    }
+
+    /// Paints `stroke` from where it had got to, stopping when `budget` runs out. True when
+    /// the stroke is finished. Each row is a run: as many of its pixels as the budget allows,
+    /// in one tight loop, because this is what every pixel of the console costs.
+    fn paint_stroke(
+        &self,
+        out: &mut impl PixelSink,
+        stroke: &mut Stroke,
+        budget: &mut u32,
+    ) -> bool {
+        while stroke.y < stroke.bottom {
+            let run = (stroke.right - stroke.x).min(*budget);
+            let first = self.offset(stroke.x, stroke.y);
+            match stroke.ink {
+                Ink::Solid(value) => {
+                    for pixel in 0..run as usize {
+                        out.write32(first + pixel * 4, value);
+                    }
+                }
+                Ink::Glyph(bitmap) => {
+                    // Scale 1 is nearly every display, and a division per pixel would be the
+                    // most expensive thing here.
+                    let scaled = |d: u32| if self.scale == 1 { d } else { d / self.scale };
+                    let cell_row = scaled(stroke.y - stroke.top) as usize;
+                    let bits = bitmap.get(cell_row).copied().unwrap_or(0);
+                    let start = stroke.x - stroke.left;
+                    for pixel in 0..run {
+                        let lit = bits & (0x80 >> scaled(start + pixel)) != 0;
+                        let value = if lit {
+                            self.foreground
+                        } else {
+                            self.background
+                        };
+                        out.write32(first + pixel as usize * 4, value);
                     }
                 }
             }
+            stroke.x += run;
+            *budget -= run;
+            if stroke.x < stroke.right {
+                return false;
+            }
+            stroke.x = stroke.left;
+            stroke.y += 1;
         }
+        true
     }
 
     /// Paints the whole display and moves the cursor to the top-left cell.
     pub fn clear(&self, cursor: &Cursor, out: &mut impl PixelSink) {
-        for y in 0..self.height {
-            self.hline(out, 0, y, self.background);
-        }
+        let mut budget = u32::MAX;
+        let mut all = Stroke::new(0, 0, self.width, self.height, Ink::Solid(self.background));
+        self.paint_stroke(out, &mut all, &mut budget);
         cursor.set(0, 0);
-        self.fill_row(out, 0, 0, self.bar);
+        self.paint_stroke(out, &mut self.bar_row(0), &mut budget);
     }
 
-    /// Writes `bytes` at the cursor. `\n` ends a line, `\r` does nothing, printable ASCII
-    /// draws its glyph, and anything else draws the replacement glyph. A cell past the last
-    /// column wraps to the next row. See the module documentation for the rows.
-    pub fn write(&self, cursor: &Cursor, out: &mut impl PixelSink, bytes: &[u8]) {
-        let (mut column, row) = cursor.get();
-        let mut row = row % self.rows;
-        if column > self.columns {
-            column = 0;
-        }
-        for &byte in bytes {
-            match byte {
-                b'\n' => {
-                    self.fill_row(out, row, column * self.column_width(), self.background);
+    /// Starts one byte at the cursor and moves the cursor past it: what is left is painting
+    /// the rectangles this returns. `\n` ends a line, `\r` does nothing, printable ASCII draws
+    /// its glyph, and anything else draws the replacement glyph. A cell past the last column
+    /// wraps to the next row. See the module documentation for the rows.
+    fn begin(&self, cursor: &Cursor, byte: u8) -> Painting {
+        let (mut column, mut row) = self.clamped(cursor);
+        let mut painting = Painting::new();
+        match byte {
+            b'\n' => {
+                painting.add(self.end_of_row(column, row));
+                row = (row + 1) % self.rows;
+                column = 0;
+                painting.add(self.bar_row(row));
+            }
+            b'\r' => {}
+            // UTF-8 continuation bytes: the lead byte already drew the character's cell.
+            0x80..=0xBF => {}
+            _ => {
+                if column == self.columns {
+                    // A full row: only the margin to its right is still the bar's.
+                    painting.add(self.end_of_row(column, row));
                     row = (row + 1) % self.rows;
                     column = 0;
-                    self.fill_row(out, row, 0, self.bar);
+                    painting.add(self.bar_row(row));
                 }
-                b'\r' => {}
-                // UTF-8 continuation bytes: the lead byte already drew the character's cell.
-                0x80..=0xBF => {}
-                _ => {
-                    if column == self.columns {
-                        // A full row: only the margin to its right is still the bar's.
-                        self.fill_row(out, row, column * self.column_width(), self.background);
-                        row = (row + 1) % self.rows;
-                        column = 0;
-                        self.fill_row(out, row, 0, self.bar);
-                    }
-                    self.draw(out, column, row, font::glyph(byte));
-                    column += 1;
-                }
+                painting.add(self.glyph_cell(column, row, byte));
+                column += 1;
             }
         }
         cursor.set(column, row);
+        painting
+    }
+
+    /// Paints `painting` from where it had got to, stopping when `budget` runs out. True when
+    /// the whole character is drawn.
+    fn paint(&self, out: &mut impl PixelSink, painting: &mut Painting, budget: &mut u32) -> bool {
+        while painting.next < painting.count {
+            let Some(stroke) = painting.strokes.get_mut(painting.next) else {
+                break;
+            };
+            if !self.paint_stroke(out, stroke, budget) {
+                return false;
+            }
+            painting.next += 1;
+        }
+        true
+    }
+
+    /// Where the cursor says the next cell is, made to be on the screen whatever it held.
+    fn clamped(&self, cursor: &Cursor) -> (u32, u32) {
+        let (column, row) = cursor.get();
+        let column = if column > self.columns { 0 } else { column };
+        (column, row % self.rows)
+    }
+
+    /// Writes `bytes` at the cursor, all of it now.
+    pub fn write(&self, cursor: &Cursor, out: &mut impl PixelSink, bytes: &[u8]) {
+        let (column, row) = self.clamped(cursor);
+        cursor.set(column, row);
+        for &byte in bytes {
+            let mut painting = self.begin(cursor, byte);
+            let mut budget = u32::MAX;
+            self.paint(out, &mut painting, &mut budget);
+        }
+    }
+}
+
+/// What a [`Stroke`] paints with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ink {
+    /// One pixel value throughout.
+    Solid(u32),
+    /// A glyph's bitmap, in the foreground and background colors.
+    Glyph(&'static [u8; 16]),
+}
+
+/// A rectangle to paint and how far that has got: `(x, y)` is the next pixel, and `y` reaches
+/// `bottom` when it is finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stroke {
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+    ink: Ink,
+    x: u32,
+    y: u32,
+}
+
+impl Stroke {
+    const fn new(left: u32, top: u32, right: u32, bottom: u32, ink: Ink) -> Self {
+        Self {
+            left,
+            top,
+            right,
+            bottom,
+            ink,
+            x: left,
+            y: top,
+        }
+    }
+}
+
+/// The rest of one character's drawing: at most three rectangles (ending a row, the next row's
+/// bar, a glyph).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Painting {
+    strokes: [Stroke; 3],
+    count: usize,
+    next: usize,
+}
+
+impl Painting {
+    const fn new() -> Self {
+        Self {
+            strokes: [Stroke::new(0, 0, 0, 0, Ink::Solid(0)); 3],
+            count: 0,
+            next: 0,
+        }
+    }
+
+    fn add(&mut self, stroke: Stroke) {
+        if let Some(slot) = self.strokes.get_mut(self.count) {
+            *slot = stroke;
+            self.count += 1;
+        }
+    }
+}
+
+/// What a backlog shows in place of lines it had no room for.
+const LOST_NOTICE: &[u8] =
+    b"origin-kernel: console: the screen fell behind; some lines are on the UART only\n";
+
+/// Text the console has accepted and the screen has not shown yet, oldest first, and the
+/// character being painted. The caller serializes everything; nothing here waits.
+///
+/// Positions count bytes from the start of time: [`Backlog::push`] returns the position the
+/// painting must reach for that text to be fully on the screen, and [`Backlog::painted`] says
+/// how far it has got.
+#[derive(Debug)]
+pub struct Backlog<const N: usize> {
+    /// A ring of bytes, `len` of them from index `start`, not yet started.
+    text: [u8; N],
+    start: usize,
+    len: usize,
+    /// Bytes ever accepted.
+    queued: u64,
+    /// Bytes ever finished: a byte counts once every pixel of it is written.
+    painted: u64,
+    /// The character in progress.
+    painting: Option<Painting>,
+    /// A line was refused: the next one that fits says so first.
+    lost: bool,
+}
+
+impl<const N: usize> Backlog<N> {
+    /// An empty backlog.
+    pub const fn new() -> Self {
+        const { assert!(N > 0, "a backlog needs room for at least one byte") };
+        Self {
+            text: [0; N],
+            start: 0,
+            len: 0,
+            queued: 0,
+            painted: 0,
+            painting: None,
+            lost: false,
+        }
+    }
+
+    /// Accepts `text`, whole or not at all, and returns the position at which it will be
+    /// fully on the screen. `None` when there is no room.
+    pub fn push(&mut self, text: &[u8]) -> Option<u64> {
+        let notice = if self.lost { LOST_NOTICE.len() } else { 0 };
+        if N - self.len < notice.saturating_add(text.len()) {
+            return None;
+        }
+        if self.lost {
+            self.lost = false;
+            self.push_bytes(LOST_NOTICE);
+        }
+        self.push_bytes(text);
+        Some(self.queued)
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if let Some(slot) = self.text.get_mut((self.start + self.len) % N) {
+                *slot = byte;
+                self.len += 1;
+                self.queued += 1;
+            }
+        }
+    }
+
+    /// Records that a line had to be dropped because a caller could not wait for room: the
+    /// next line that fits is preceded by a notice saying so.
+    pub fn note_lost(&mut self) {
+        self.lost = true;
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        if self.len == 0 {
+            return None;
+        }
+        let byte = self.text.get(self.start).copied();
+        self.start = (self.start + 1) % N;
+        self.len -= 1;
+        byte
+    }
+
+    /// Paints at most `pixels` more pixels of what is queued, oldest first, starting where the
+    /// last call stopped. Returns whether anything is left to paint.
+    pub fn paint(
+        &mut self,
+        screen: &Screen,
+        cursor: &Cursor,
+        out: &mut impl PixelSink,
+        pixels: u32,
+    ) -> bool {
+        let mut budget = pixels;
+        loop {
+            if let Some(painting) = self.painting.as_mut() {
+                if !screen.paint(out, painting, &mut budget) {
+                    return true;
+                }
+                self.painting = None;
+                self.painted += 1;
+            }
+            match self.pop() {
+                Some(byte) => self.painting = Some(screen.begin(cursor, byte)),
+                None => return false,
+            }
+        }
+    }
+
+    /// The position the painting has reached (see the type's documentation).
+    pub const fn painted(&self) -> u64 {
+        self.painted
+    }
+
+    /// Whether everything accepted is on the screen.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0 && self.painting.is_none()
+    }
+
+    /// Forgets everything queued: the screen is gone.
+    pub fn clear(&mut self) {
+        self.start = 0;
+        self.len = 0;
+        self.painting = None;
+        self.painted = self.queued;
+        self.lost = false;
+    }
+}
+
+impl<const N: usize> Default for Backlog<N> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -606,5 +886,222 @@ mod tests {
             accepted > 1000 && drawn > 500,
             "{accepted} accepted, {drawn} drawn"
         );
+    }
+
+    /// A display small enough to compare whole frames.
+    fn small() -> Framebuffer {
+        let mut f = display();
+        f.width = 160;
+        f.height = 128;
+        f.stride = 160 * 4;
+        f.size = u64::from(f.stride) * 128;
+        f
+    }
+
+    /// Counts the pixels written, and forwards them.
+    struct Counting<'a> {
+        memory: &'a mut Memory,
+        written: u32,
+    }
+
+    impl PixelSink for Counting<'_> {
+        fn write32(&mut self, offset: usize, value: u32) {
+            self.written += 1;
+            self.memory.write32(offset, value);
+        }
+    }
+
+    /// The frame `Screen::write` draws for `text`: the reference every incremental painting
+    /// must reach.
+    fn written(s: &Screen, f: &Framebuffer, text: &[u8]) -> Memory {
+        let mut m = frame(f);
+        let cursor = Cursor::new();
+        s.clear(&cursor, &mut m);
+        s.write(&cursor, &mut m, text);
+        m
+    }
+
+    #[test]
+    fn painting_in_any_steps_draws_exactly_what_writing_draws() {
+        use crate::testing::Rng;
+        let f = small();
+        let s = Screen::new(&f).unwrap();
+        let mut rng = Rng::new(0xC0FF);
+        for case in 0..crate::testing::cases(600) {
+            let text: Vec<u8> = (0..rng.below(120)).map(|_| rng.byte()).collect();
+            // A cursor and a frame in the state the reference draws from.
+            let mut m = frame(&f);
+            let cursor = Cursor::new();
+            s.clear(&cursor, &mut m);
+            let mut backlog: Backlog<256> = Backlog::new();
+            let end = backlog.push(&text).unwrap();
+            assert_eq!(end, text.len() as u64);
+            let mut more = true;
+            while more {
+                // Any step, down to a single pixel, and a step of no pixels at all.
+                let step = rng.below(40) as u32;
+                let mut counted = Counting {
+                    memory: &mut m,
+                    written: 0,
+                };
+                more = backlog.paint(&s, &cursor, &mut counted, step);
+                assert!(counted.written <= step, "case {case}: over the budget");
+            }
+            assert_eq!(backlog.painted(), end, "case {case}");
+            assert!(backlog.is_empty());
+            assert_eq!(
+                m.pixels,
+                written(&s, &f, &text).pixels,
+                "case {case}: {text:?}"
+            );
+            let (c, r) = cursor.get();
+            assert!(c <= s.columns() && r < s.rows(), "case {case}");
+        }
+    }
+
+    #[test]
+    fn a_section_writes_no_more_pixels_than_it_is_given() {
+        let f = display();
+        let s = Screen::new(&f).unwrap();
+        let mut m = frame(&f);
+        let cursor = Cursor::new();
+        s.clear(&cursor, &mut m);
+        let mut backlog: Backlog<256> = Backlog::new();
+        backlog
+            .push(b"the line is long enough for many sections\n")
+            .unwrap();
+        let mut sections = 0;
+        loop {
+            let mut counted = Counting {
+                memory: &mut m,
+                written: 0,
+            };
+            let more = backlog.paint(&s, &cursor, &mut counted, 256);
+            assert!(counted.written <= 256);
+            sections += 1;
+            if !more {
+                break;
+            }
+            assert_eq!(counted.written, 256, "only the last section may be short");
+        }
+        // 41 glyphs of 8 by 16, the rest of the row, and a whole row of bar: 160 sections.
+        let pixels = 41 * 128 + (1280 - 41 * 8) * 16 + 1280 * 16;
+        assert_eq!(pixels, 40_960);
+        assert_eq!(sections, pixels / 256);
+    }
+
+    #[test]
+    fn a_line_is_fully_drawn_at_the_position_its_push_returned_and_not_before() {
+        let f = small();
+        let s = Screen::new(&f).unwrap();
+        let mut m = frame(&f);
+        let cursor = Cursor::new();
+        s.clear(&cursor, &mut m);
+        let mut backlog: Backlog<64> = Backlog::new();
+        let end_of_a = backlog.push(b"a\n").unwrap();
+        let end_of_b = backlog.push(b"b\n").unwrap();
+        assert_eq!((end_of_a, end_of_b), (2, 4));
+        // One pixel at a time: at the moment the position passes the first line's end, the
+        // frame holds that line and nothing of the next.
+        while backlog.painted() < end_of_a {
+            backlog.paint(&s, &cursor, &mut m, 1);
+        }
+        assert_eq!(m.pixels, written(&s, &f, b"a\n").pixels);
+        while backlog.paint(&s, &cursor, &mut m, 1) {}
+        assert_eq!(backlog.painted(), end_of_b);
+        assert_eq!(m.pixels, written(&s, &f, b"a\nb\n").pixels);
+    }
+
+    #[test]
+    fn text_is_taken_whole_or_not_at_all() {
+        let f = small();
+        let s = Screen::new(&f).unwrap();
+        let mut m = frame(&f);
+        let cursor = Cursor::new();
+        s.clear(&cursor, &mut m);
+        let mut backlog: Backlog<8> = Backlog::new();
+        assert_eq!(backlog.push(b"12345678"), Some(8));
+        assert_eq!(backlog.push(b"9"), None, "full");
+        // Refusing nothing changed: the next paint draws the eight bytes.
+        while backlog.paint(&s, &cursor, &mut m, u32::MAX) {}
+        assert_eq!(backlog.painted(), 8);
+        // Drawn, so there is room again, and the ring wraps.
+        assert_eq!(backlog.push(b"abcdefgh"), Some(16));
+        assert_eq!(backlog.len, 8);
+        assert!(backlog.start <= 8);
+        while backlog.paint(&s, &cursor, &mut m, u32::MAX) {}
+        assert_eq!(m.pixels, written(&s, &f, b"12345678abcdefgh").pixels);
+    }
+
+    #[test]
+    fn a_lost_line_is_owned_up_to_before_the_next_line_that_fits() {
+        let f = small();
+        let s = Screen::new(&f).unwrap();
+        let mut m = frame(&f);
+        let cursor = Cursor::new();
+        s.clear(&cursor, &mut m);
+        let mut backlog: Backlog<256> = Backlog::new();
+        backlog.note_lost();
+        let end = backlog.push(b"after\n").unwrap();
+        assert_eq!(end, (LOST_NOTICE.len() + 6) as u64);
+        while backlog.paint(&s, &cursor, &mut m, u32::MAX) {}
+        let shown: Vec<u8> = [LOST_NOTICE, b"after\n"].concat();
+        assert_eq!(m.pixels, written(&s, &f, &shown).pixels);
+        // Said once: the next line has no notice.
+        assert_eq!(backlog.push(b"x"), Some(end + 1));
+        // When the notice cannot fit, the line waits with it.
+        let mut tiny: Backlog<8> = Backlog::new();
+        tiny.note_lost();
+        assert_eq!(tiny.push(b"line"), None);
+    }
+
+    /// Writers pushing lines between painting steps, in any interleaving: the screen ends up
+    /// as if the lines had been written whole, in the order they were accepted.
+    #[test]
+    fn any_interleaving_of_pushes_and_painting_keeps_the_order() {
+        use crate::testing::Rng;
+        let f = small();
+        let s = Screen::new(&f).unwrap();
+        let mut rng = Rng::new(0xBEEF);
+        for case in 0..crate::testing::cases(400) {
+            let mut m = frame(&f);
+            let cursor = Cursor::new();
+            s.clear(&cursor, &mut m);
+            let mut backlog: Backlog<64> = Backlog::new();
+            let mut accepted: Vec<u8> = Vec::new();
+            for _ in 0..20 {
+                let line: Vec<u8> = (0..rng.below(20))
+                    .map(|_| b'a' + rng.below(26) as u8)
+                    .collect();
+                if backlog.push(&line).is_some() {
+                    accepted.extend_from_slice(&line);
+                }
+                for _ in 0..rng.below(4) {
+                    backlog.paint(&s, &cursor, &mut m, rng.below(64) as u32);
+                }
+            }
+            while backlog.paint(&s, &cursor, &mut m, 32) {}
+            assert_eq!(
+                m.pixels,
+                written(&s, &f, &accepted).pixels,
+                "case {case}: {accepted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clearing_the_backlog_forgets_the_character_in_progress() {
+        let f = small();
+        let s = Screen::new(&f).unwrap();
+        let mut m = frame(&f);
+        let cursor = Cursor::new();
+        s.clear(&cursor, &mut m);
+        let mut backlog: Backlog<64> = Backlog::new();
+        let end = backlog.push(b"gone\n").unwrap();
+        assert!(backlog.paint(&s, &cursor, &mut m, 3));
+        backlog.clear();
+        assert!(backlog.is_empty());
+        assert_eq!(backlog.painted(), end);
+        assert!(!backlog.paint(&s, &cursor, &mut m, 100));
     }
 }
