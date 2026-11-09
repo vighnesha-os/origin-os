@@ -16,10 +16,14 @@
 //!   the only handle to that end, and must not end up inside its own queue. So every end in
 //!   flight has exactly one reference, the graph of ends held in queues is a forest rooted at
 //!   ends held in handle tables, and no reference cycle can keep a dead end alive.
+//! - A queued message is charged to the process that sent it, by the kernel heap it holds
+//!   ([`message_cost`], ADR-0005 P11), until it is read or the end it was queued for closes;
+//!   a sender over its `Limits::message_bytes` gets `LIMIT` and the peer is unaffected.
 //!
-//! Lock order: a handle table, then [`TRANSFERS`], then a channel's state, then an end's
-//! holder link. A wait queue's lock is taken before whatever a wait's condition reads (a
-//! table, a channel's state); a waker holds none of these locks while it wakes.
+//! Lock order: a handle table, then [`TRANSFERS`], then a channel's state, then its charge
+//! list, then an end's holder link. A wait queue's lock is taken before whatever a wait's
+//! condition reads (a table, a channel's state); a waker holds none of these locks while it
+//! wakes.
 
 use alloc::alloc::{Layout, alloc, dealloc};
 use alloc::collections::VecDeque;
@@ -31,6 +35,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use framekernel::channel::{Channel, Message, QUEUE_BYTES, QUEUE_DEPTH, ReadError, other};
 use framekernel::handles::HandleTable;
+use framekernel::heap::{MAX_BLOCK, MIN_BLOCK, PAGE};
 use origin_abi::{Error, Handle, rights};
 use origin_sync::SpinLock;
 
@@ -128,6 +133,43 @@ pub(crate) enum Object {
 /// A handle in a message: its object and its rights, preserved in transit (P2).
 pub(crate) type Entry = (Object, u32);
 
+/// What a queued message of `bytes` bytes and `handles` handles costs the account that sent
+/// it: the heap blocks they occupy, rounded as the heap rounds them (`framekernel::heap`).
+pub(crate) fn message_cost(bytes: usize, handles: usize) -> usize {
+    heap_block(bytes) + heap_block(handles * core::mem::size_of::<Entry>())
+}
+
+/// What the kernel heap sets aside for an allocation of `bytes` (see `framekernel::heap`).
+fn heap_block(bytes: usize) -> usize {
+    let (min, max, page) = (MIN_BLOCK as usize, MAX_BLOCK as usize, PAGE as usize);
+    match bytes {
+        0 => 0,
+        _ if bytes <= max => bytes.max(min).next_power_of_two(),
+        _ => bytes.next_multiple_of(page),
+    }
+}
+
+/// What a queued message cost its sender. Its drop is the refund, when the message leaves the
+/// queue: read, or left behind when the end it was queued for closed.
+struct Charge {
+    account: Arc<Account>,
+    bytes: usize,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.account.refund_queued(self.bytes);
+    }
+}
+
+/// An empty list of charges with room for a whole queue, so writing never allocates.
+fn charge_list() -> Result<VecDeque<Charge>, Error> {
+    let mut list = VecDeque::new();
+    list.try_reserve_exact(QUEUE_DEPTH)
+        .map_err(|_| Error::NoMemory)?;
+    Ok(list)
+}
+
 /// One end of a channel, as a reference: a handle in a table or a handle in a message.
 pub(crate) struct ChannelEnd {
     channel: ObjectRef<KernelChannel>,
@@ -175,6 +217,9 @@ pub(crate) struct KernelChannel {
     open: [AtomicU32; 2],
     /// Threads in `wait_one` on each end.
     waiters: [WaitQueue; 2],
+    /// Who was charged for each message queued toward each side, in queue order, kept in
+    /// step with the queues: locked only under `state`.
+    charges: SpinLock<[VecDeque<Charge>; 2]>,
     /// Messages left when an end closed, until [`reap_closed`] drops them.
     undelivered: [SpinLock<VecDeque<Message<Entry>>>; 2],
     /// Where each end is in flight: the channel and side whose queue holds it.
@@ -194,10 +239,15 @@ impl Drop for KernelChannel {
 }
 
 /// Serializes every addition of a channel end to the graph of ends held in queues, so the
-/// cycle check always sees the whole graph. The walk under it visits at most one end per
-/// channel in the chain, and each process's channels are bounded by its quota (today's are
-/// small; a higher quota would also need a limit on the chain's depth).
+/// cycle check always sees the whole graph. The walk under it stops at [`MAX_HOLDER_DEPTH`]
+/// links (the quotas of however many processes built the chain would allow far more).
 static TRANSFERS: SpinLock<()> = SpinLock::new(());
+
+/// The most links the transfer check follows up the chain of queues holding an end (ADR-0005
+/// A3): this bounds the walk under the global lock with interrupts off, whatever the depth of
+/// nesting other processes' quotas would allow. A transfer into an end nested deeper gets
+/// [`Error::Limit`].
+pub(crate) const MAX_HOLDER_DEPTH: usize = 16;
 
 /// Channels with undelivered messages waiting for [`reap_closed`].
 static CLOSED: SpinLock<Option<ObjectRef<KernelChannel>>> = SpinLock::new(None);
@@ -223,7 +273,20 @@ fn wake(channel: &KernelChannel, side: usize) {
 /// `side` lost its last reference: it closes. Its waiters and the peer's are woken, and
 /// its undelivered messages go on the list [`reap_closed`] drains.
 fn close_side(channel: &ObjectRef<KernelChannel>, side: usize) {
-    let undelivered = without_interrupts(|| channel.state.lock().close(side));
+    let (undelivered, charges) = without_interrupts(|| {
+        let mut state = channel.state.lock();
+        let undelivered = state.close(side);
+        // Nothing can be queued toward a closed side any more: every charge for this side
+        // goes with its message, refunded just below, outside the locks.
+        let charges = channel
+            .charges
+            .lock()
+            .get_mut(side)
+            .map(core::mem::take)
+            .unwrap_or_default();
+        (undelivered, charges)
+    });
+    drop(charges);
     if !undelivered.is_empty()
         && let Some(slot) = channel.undelivered.get(side)
     {
@@ -277,10 +340,14 @@ pub(crate) fn create_channel(account: &Arc<Account>) -> Result<(ChannelEnd, Chan
     account.charge_channel()?;
     let refund = || account.refund_channel();
     let state = Channel::try_new(QUEUE_DEPTH, QUEUE_BYTES).inspect_err(|_| refund())?;
+    let charges = charge_list()
+        .and_then(|one| Ok([one, charge_list()?]))
+        .inspect_err(|_| refund())?;
     let channel = KernelChannel {
         state: SpinLock::new(state),
         open: [AtomicU32::new(1), AtomicU32::new(1)],
         waiters: [WaitQueue::new(), WaitQueue::new()],
+        charges: SpinLock::new(charges),
         undelivered: [
             SpinLock::new(VecDeque::new()),
             SpinLock::new(VecDeque::new()),
@@ -311,30 +378,37 @@ fn channel_of(
     Ok((end.channel.clone(), end.side))
 }
 
-/// Whether `target` is the end `(channel, side)` or holds it, through any number of queues:
-/// the walk goes up from that end, along which queue holds it, towards the end held in a
-/// table. Called under [`TRANSFERS`], so no link can be added meanwhile.
-fn inside(target: &ChannelEnd, mut channel: ObjectRef<KernelChannel>, mut side: usize) -> bool {
-    loop {
+/// Whether `target` is the end `(channel, side)` or holds it, through up to
+/// [`MAX_HOLDER_DEPTH`] queues: the walk goes up from that end, along which queue holds it,
+/// towards the end held in a table, and a chain any longer than that is [`Error::Limit`].
+/// Called under [`TRANSFERS`], so no link can be added meanwhile.
+fn inside(
+    target: &ChannelEnd,
+    mut channel: ObjectRef<KernelChannel>,
+    mut side: usize,
+) -> Result<bool, Error> {
+    for _ in 0..=MAX_HOLDER_DEPTH {
         if ObjectRef::same(&channel, &target.channel) && side == target.side {
-            return true;
+            return Ok(true);
         }
         let Some(holder) = channel.holder.get(side) else {
-            return false;
+            return Ok(false);
         };
         let link = holder.lock().clone();
         let Some((next, next_side)) = link else {
-            return false;
+            return Ok(false);
         };
         channel = next;
         side = next_side;
     }
+    Err(Error::Limit)
 }
 
 /// `channel_write`: queues `bytes` and moves the handles in `transfer` out of `table`, or
 /// does nothing and says why.
 pub(crate) fn channel_write(
     table: &SpinLock<HandleTable<Object>>,
+    account: &Arc<Account>,
     handle: Handle,
     bytes: Vec<u8>,
     transfer: &[Handle],
@@ -360,13 +434,20 @@ pub(crate) fn channel_write(
             let references = end.channel.open.get(end.side);
             if ObjectRef::same(&end.channel, &channel)
                 || references.is_none_or(|n| n.load(Ordering::Relaxed) != 1)
-                || inside(end, channel.clone(), reader)
+                || inside(end, channel.clone(), reader)?
             {
                 return Err(Error::InvalidArgs);
             }
         }
         let mut state = channel.state.lock();
         state.can_write(side, bytes.len())?;
+        // The sender pays, before anything is consumed: a refusal changes nothing.
+        let cost = message_cost(bytes.len(), transfer.len());
+        account.charge_queued(cost)?;
+        let charge = Charge {
+            account: account.clone(),
+            bytes: cost,
+        };
         let moved = table.take_all(transfer, rights::TRANSFER)?;
         // The reader's queue holds them now, recorded before anyone can see the message.
         for (object, _) in &moved {
@@ -380,11 +461,20 @@ pub(crate) fn channel_write(
             bytes,
             handles: moved,
         };
+        // Beside the message, in step with the queue; its storage was taken at creation.
+        if let Some(list) = channel.charges.lock().get_mut(reader) {
+            list.push_back(charge);
+        }
         // `can_write` and the handle count were checked just above, under this lock, and
         // the queue's storage was taken at creation, so this cannot be refused. Were that
-        // ever wrong, the message goes back outside the locks, since dropping it may close
-        // the handles it carried.
+        // ever wrong, the charge and the message go back, the message outside the locks,
+        // since dropping it may close the handles it carried.
         let refused = state.write(side, message).err();
+        if refused.is_some()
+            && let Some(list) = channel.charges.lock().get_mut(reader)
+        {
+            drop(list.pop_back());
+        }
         drop(state);
         Ok::<_, Error>((channel, reader, refused))
     });
@@ -432,7 +522,7 @@ pub(crate) fn channel_read(
         let (bytes, handles) = state.peek(side)?;
         if bytes > byte_capacity || handles > handle_capacity {
             drop(state);
-            return Ok((None, Read::TooSmall { bytes, handles }));
+            return Ok((None, Read::TooSmall { bytes, handles }, None));
         }
         // Room for its handles first: if the table is full, or memory is out, the message
         // stays queued.
@@ -447,6 +537,12 @@ pub(crate) fn channel_read(
                 ReadError::Status(e) => e,
                 ReadError::TooSmall { .. } => Error::BufferTooSmall,
             })?;
+        // Off the queue: this message's charge goes with it, refunded outside the locks.
+        let charge = channel
+            .charges
+            .lock()
+            .get_mut(side)
+            .and_then(VecDeque::pop_front);
         drop(state);
         let mut incoming = message.handles.into_iter();
         for (object, entry_rights) in incoming.by_ref() {
@@ -469,12 +565,14 @@ pub(crate) fn channel_read(
             bytes: message.bytes,
             handles: values,
         };
-        Ok::<_, Error>((Some((channel, other(side))), read))
+        Ok::<_, Error>((Some((channel, other(side))), read, charge))
     })?;
-    if let (Some((channel, writer)), _) = &read {
+    let (woken, result, charge) = read;
+    drop(charge);
+    if let Some((channel, writer)) = &woken {
         wake(channel, *writer);
     }
-    Ok(read.1)
+    Ok(result)
 }
 
 /// Closes `handle`, so a thread waiting on it completes with `CANCELED`.

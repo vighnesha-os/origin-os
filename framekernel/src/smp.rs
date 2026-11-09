@@ -161,11 +161,21 @@ struct ApStart {
     /// Settled once, by the AP's answer or refusal or by the boot processor's deadline,
     /// whichever comes first.
     handshake: Handshake,
-    /// The AP's own GDT, TSS and double-fault stack.
+    /// The AP's own GDT, TSS and interrupt stacks.
     tables: *mut CpuTables,
     /// The CPU index the AP takes; discovery assigned it the AP's APIC ID.
     index: CpuIndex,
+    /// What the AP found it lacks, set before it refuses (`Refusal` has room only for its
+    /// x2APIC), so the boot processor can name it: 0, [`LACKS_SMEP_SMAP`] or
+    /// [`LACKS_BASELINE`].
+    lacks: AtomicU64,
 }
+
+/// An AP's [`ApStart::lacks`]: no SMEP or no SMAP, which ADR-0003 requires on every CPU.
+const LACKS_SMEP_SMAP: u64 = 1;
+/// An AP's [`ApStart::lacks`]: below the x86-64-v3 baseline (CLAUDE.md §14), or without the
+/// AVX state XCR0 must hold.
+const LACKS_BASELINE: u64 = 2;
 
 /// The processors online, by CPU index, the boot processor first.
 pub(crate) struct Online {
@@ -229,6 +239,10 @@ pub(crate) fn start(
         );
         return online;
     }
+    cpu::record_cpu_state();
+    // The boot processor's interrupt stacks are in the kernel's image; nothing could guard
+    // them before the kernel's own tables were live.
+    let bsp_guards = guard_interrupt_stacks(cpu::bsp_tables());
     let map = match discover(info.acpi_rsdp, bsp) {
         Ok(map) => map,
         Err(e) => {
@@ -329,7 +343,55 @@ pub(crate) fn start(
         !leftover,
         if leftover { ": AP start-up failed" } else { "" }
     );
+    // Each processor's interrupt stacks end at a guard page that faults, and each put its own
+    // control state where the kernel's rules need it.
+    let proven = INTERRUPT_STACK_GUARDS.load(Ordering::Relaxed);
+    let expected = online.count as u64 * 4;
+    if bsp_guards.is_ok() && proven == expected {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: page protection: interrupt-stack guard pages: {proven} of {expected} faulted (4 per processor)"
+        );
+    } else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: page protection violated: interrupt-stack guard pages: {proven} of {expected} faulted ({})",
+            bsp_guards.err().unwrap_or("an application processor's")
+        );
+    }
+    let holding = cpu::cpu_states_holding(online.cpus());
+    let _ = writeln!(
+        com1,
+        "origin-kernel: CPU state: machine checks raise #MC, x87 errors raise #MF, ring 3 has no RDPMC, FSGSBASE or SYSENTER, no debug breakpoint armed: {holding} of {} processors{}",
+        online.count,
+        if holding == online.count {
+            ""
+        } else {
+            ": CPU baseline failed"
+        }
+    );
     online
+}
+
+/// Guard pages proven unmapped, for the boot report.
+static INTERRUPT_STACK_GUARDS: AtomicU64 = AtomicU64::new(0);
+
+/// Unmaps the guard page below each interrupt stack in `tables`, which no processor is using
+/// (the boot processor has yet to take an exception on them; an AP has yet to start), and
+/// proves that each one faults.
+fn guard_interrupt_stacks(tables: *const CpuTables) -> Result<(), &'static str> {
+    let guards = cpu::interrupt_stack_guards(tables);
+    vm::make_guards(&guards).map_err(|_| "cannot unmap the guard pages")?;
+    for guard in guards {
+        // SAFETY: the page is RAM of `tables`, not MMIO; the probe only reads it.
+        match unsafe { cpu::probe_read(guard) } {
+            cpu::Probe::Faulted { error: 0, address } if address == guard => {
+                INTERRUPT_STACK_GUARDS.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => return Err("a guard page did not fault"),
+        }
+    }
+    Ok(())
 }
 
 /// RSDP → XSDT → MADT → the processors it lists → their CPU indexes, the boot processor
@@ -505,6 +567,7 @@ fn start_one(
     // SAFETY: an all-zero `CpuTables` is valid (integers only); `init_ap` writes it before
     // the processor uses it.
     let tables = Box::into_raw(unsafe { Box::<CpuTables>::new_zeroed().assume_init() });
+    guard_interrupt_stacks(tables)?;
     let (stack, _guard) =
         crate::sched::guarded_stack(AP_STACK_BYTES).ok_or("no memory for the AP stack")?;
     let stack_top = (stack.as_mut_ptr().addr() + AP_STACK_BYTES) as u64 & !0xF;
@@ -512,6 +575,7 @@ fn start_one(
         handshake: Handshake::new(),
         tables,
         index,
+        lacks: AtomicU64::new(0),
     }));
     poke(STACK, stack_top);
     poke(ENTRY, (ap_entry as *const ()).addr() as u64);
@@ -538,7 +602,11 @@ fn start_one(
     unsafe { park(lapic, apic_id, tsc_hz) };
     Err(match outcome {
         Outcome::Abandoned => "no answer within 200 ms; parked by INIT",
-        Outcome::Refused(Refusal::NoX2Apic) => "no x2APIC; parked by INIT",
+        Outcome::Refused(Refusal::NoX2Apic) => match start.lacks.load(Ordering::Acquire) {
+            LACKS_SMEP_SMAP => "no SMEP or no SMAP; parked by INIT",
+            LACKS_BASELINE => "below the x86-64-v3 baseline; parked by INIT",
+            _ => "no x2APIC; parked by INIT",
+        },
         Outcome::Refused(Refusal::NotMine) | Outcome::Answered(_) => {
             "a different processor answered; parked by INIT"
         }
@@ -651,12 +719,28 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     // AP's alone, and so is `start.index` (the boot processor gives each index once).
     unsafe { cpu::init_ap(start.tables, start.index) };
     // SAFETY: CPL 0; the kernel has no user mappings. Every processor enforces SMEP and SMAP.
-    let _ = unsafe { cpu::enable_smep_smap() };
+    let (smep, smap) = unsafe { cpu::enable_smep_smap() };
     // SAFETY: CPL 0; the kernel's tables mark only the kernel half global.
     let _ = unsafe { crate::tlb::enable_global_pages() };
     cpu::check_pat();
+    let cpuid = cpu::gather_cpuid();
     // SAFETY: CPL 0, this AP, once, before any SIMD runs on it.
-    let _ = unsafe { cpu::enable_simd(&cpu::gather_cpuid()) };
+    let xcr0 = unsafe { cpu::enable_simd(&cpuid) };
+    cpu::record_cpu_state();
+    // Every processor is held to what the boot processor is held to. One that falls short
+    // does not come online: it refuses, and the boot processor reports why and parks it.
+    let baseline =
+        framekernel::features::Features::decode(&cpuid).meets_baseline() && xcr0 & 0b111 == 0b111;
+    if !(smep && smap) || !baseline {
+        let lacks = if smep && smap {
+            LACKS_BASELINE
+        } else {
+            LACKS_SMEP_SMAP
+        };
+        start.lacks.store(lacks, Ordering::Release);
+        let _ = start.handshake.refuse(Refusal::NoX2Apic);
+        crate::halt();
+    }
     if !cpu::x2apic_supported() {
         let _ = start.handshake.refuse(Refusal::NoX2Apic);
         crate::halt();

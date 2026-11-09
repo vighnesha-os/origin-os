@@ -498,6 +498,7 @@ mod tests {
             syscall::OBJECT_SIGNAL,
         ];
         let mut sorted = n.to_vec();
+        sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), n.len());
         assert_eq!(limits::MAX_MESSAGE_BYTES, 65536);

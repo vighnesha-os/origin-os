@@ -34,6 +34,7 @@ const DATA: u64 = 0x50_0000;
 const LIMITS: Limits = Limits {
     handles: 16,
     channels: 4,
+    message_bytes: 1 << 20,
     debug_calls: true,
 };
 
@@ -249,7 +250,10 @@ pub(crate) fn prove(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
                 error,
                 address,
             }) => (
-                want_fault == Some((vector, error)),
+                want_fault == Some((vector, error))
+                    // Only a page fault's CR2 is reported: `privileged` (#GP) runs after
+                    // `reader` (#PF on a kernel address), and must not be told that address.
+                    && (vector == 14) == (address != 0),
                 if vector == 14 {
                     alloc::format!("ended by vector 14 (error {error:#x}, address {address:#x})")
                 } else {

@@ -832,6 +832,15 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             format!(
                 "origin-kernel: SMP: {cpus} of {cpus} enabled processors online; trampoline identity pages removed true"
             ),
+            // Every processor's interrupt stacks end at a guard page, and each processor set
+            // its own control state (CLAUDE.md §24, §58).
+            format!(
+                "origin-kernel: page protection: interrupt-stack guard pages: {0} of {0} faulted (4 per processor)",
+                4 * cpus
+            ),
+            format!(
+                "origin-kernel: CPU state: machine checks raise #MC, x87 errors raise #MF, ring 3 has no RDPMC, FSGSBASE or SYSENTER, no debug breakpoint armed: {cpus} of {cpus} processors"
+            ),
             "origin-kernel: reclaimed ".into(),
         ]
         .into_iter()
@@ -867,6 +876,8 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: scheduler: 3 SIMD threads kept their XMM state across ".into(),
             " corruptions".into(),
             "origin-kernel: scheduler: yield alternated ".into(),
+            // A thread is created whole or not at all.
+            "origin-kernel: scheduler: spawns refused for want of an FPU area (Err(Full)) and on a full queue (Err(Full)) give back".into(),
             // M4 groundwork: ring 3, the one DPL-3 gate, and crash isolation.
             "origin-kernel: user mode: good program: reported Some(42), exited with Some(0); kernel carries on".into(),
             "origin-kernel: user mode: kernel read: reported Some(7), ended by vector 14 (error 0x5".into(),
@@ -1121,6 +1132,7 @@ fn boot_failures() -> Vec<&'static str> {
         "(#GP general protection)",
         "(#PF page fault)",
         "(#UD invalid opcode)",
+        "origin-kernel: machine check:",
         "origin-kernel: no usable region can hold",
         "origin-kernel: frame allocator exhausted",
         "did not keep its contents",
@@ -1291,6 +1303,10 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
     markers.extend([
         "origin-kernel: ipc: a thread in wait_one on a handle another thread closes completes with CANCELED".to_string(),
         "origin-kernel: ipc: quotas: a fifth channel -> LIMIT, a thirteenth handle -> LIMIT, one more after a close -> OK, still working -> OK".into(),
+        "origin-kernel: ipc: a writer over its byte quota: the first -> OK, the second -> OK, the third is over the quota -> LIMIT, the peer answers -> OK, the answer -> OK, written after the peer read -> OK".into(),
+        "origin-kernel: ipc: its peer, unaffected: the first -> OK, the second -> OK, its answer -> OK".into(),
+        "origin-kernel: ipc: queued messages are charged to their sender and refunded on read and close: 0 and 0 bytes still charged".into(),
+        "origin-kernel: ipc: transfers into nested ends: nested to the limit -> OK, a link deeper -> LIMIT".into(),
         "origin-kernel: ipc: a full-size message: sixty-four KiB -> OK, received -> OK, bytes -> 0x10000".into(),
         "origin-kernel: ipc: 64 KiB through a channel and back, byte for byte: true".into(),
         "origin-kernel: ipc: registers: every register but RAX, RCX and R11 survives a system call: true".into(),
@@ -1299,6 +1315,7 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
         "origin-kernel: ipc: a program with RFLAGS.AC set took interrupts and made a system call: the flag reached kernel code 0 times, and stayed set in ring 3: true".into(),
         "origin-kernel: ipc: a process without the developer calls gets NOT_SUPPORTED: true".into(),
         "origin-kernel: ipc: sidt from ring 3 with UMIP on: refused, the process ended by vector 13".into(),
+        "origin-kernel: ipc: a program that single-stepped itself ended by #DB, taken on its own interrupt stack: true".into(),
         "origin-kernel: ipc: a fault inside a user copy comes back as a failed copy, not a dead kernel: 1 fault recovered".into(),
         "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap ".into(),
         "; threads run before their state existed: 0".into(),

@@ -78,10 +78,14 @@ impl TableMemory for ProcessTables {
 
 /// What a process may hold, set by its creator (P11). Objects are charged here even while
 /// they are in flight in a message, so a process cannot escape its table quota by putting
-/// channels in the kernel's queues.
+/// channels in the kernel's queues. Queued messages are charged too, to the process that
+/// sent them, by the memory they hold.
 pub(crate) struct Account {
     channels: AtomicUsize,
     max_channels: usize,
+    /// Bytes of kernel heap held by messages this process has queued and nobody has read.
+    queued_bytes: AtomicUsize,
+    max_queued_bytes: usize,
 }
 
 impl Account {
@@ -99,13 +103,37 @@ impl Account {
     pub(crate) fn refund_channel(&self) {
         self.channels.fetch_sub(1, Ordering::AcqRel);
     }
+
+    /// `bytes` more of queued-message memory, or [`Error::Limit`].
+    pub(crate) fn charge_queued(&self, bytes: usize) -> Result<(), Error> {
+        self.queued_bytes
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                n.checked_add(bytes)
+                    .filter(|&total| total <= self.max_queued_bytes)
+            })
+            .map(|_| ())
+            .map_err(|_| Error::Limit)
+    }
+
+    /// Queued-message memory charged to this account has gone: its message was read, or the
+    /// end it was queued for closed.
+    pub(crate) fn refund_queued(&self, bytes: usize) {
+        self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    /// Bytes of queued-message memory charged to this account now.
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.queued_bytes.load(Ordering::Acquire)
+    }
 }
 
-/// A process's quotas: at most `handles` entries in its table and `channels` live channels.
+/// A process's quotas: at most `handles` entries in its table, `channels` live channels and
+/// `message_bytes` of kernel heap in messages it has queued.
 #[derive(Clone, Copy)]
 pub(crate) struct Limits {
     pub(crate) handles: usize,
     pub(crate) channels: usize,
+    pub(crate) message_bytes: usize,
     /// May it use `DEBUG_REPORT` and `DEBUG_WRITE`? The ABI reserves them for developer
     /// builds: an ordinary process that calls them gets `NOT_SUPPORTED`, so it cannot hold
     /// the serial line (at 115200 baud, a line for many milliseconds) with interrupts off.
@@ -117,7 +145,8 @@ pub(crate) struct Limits {
 pub(crate) enum Ending {
     /// `exit(code)`.
     Exited(u64),
-    /// A fault: its vector, error code and CR2.
+    /// A fault: its vector, its error code and, for a page fault, CR2 (0 for any other
+    /// vector, where CR2 holds some earlier page fault's address).
     Faulted {
         vector: u64,
         error: u64,
@@ -176,6 +205,8 @@ impl Process {
             account: Arc::new(Account {
                 channels: AtomicUsize::new(0),
                 max_channels: limits.channels,
+                queued_bytes: AtomicUsize::new(0),
+                max_queued_bytes: limits.message_bytes,
             }),
             syscall_origin,
             debug_calls: limits.debug_calls,
