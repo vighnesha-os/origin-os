@@ -242,7 +242,8 @@ pub(crate) fn start(
     cpu::record_cpu_state();
     // The boot processor's interrupt stacks are in the kernel's image; nothing could guard
     // them before the kernel's own tables were live.
-    let bsp_guards = guard_interrupt_stacks(cpu::bsp_tables());
+    let bsp_guards = guard_interrupt_stacks(cpu::bsp_tables())
+        .map(|proven| INTERRUPT_STACK_GUARDS.store(proven, Ordering::Relaxed));
     let map = match discover(info.acpi_rsdp, bsp) {
         Ok(map) => map,
         Err(e) => {
@@ -376,22 +377,23 @@ pub(crate) fn start(
 /// Guard pages proven unmapped, for the boot report.
 static INTERRUPT_STACK_GUARDS: AtomicU64 = AtomicU64::new(0);
 
-/// Unmaps the guard page below each interrupt stack in `tables`, which no processor is using
-/// (the boot processor has yet to take an exception on them; an AP has yet to start), and
-/// proves that each one faults.
-fn guard_interrupt_stacks(tables: *const CpuTables) -> Result<(), &'static str> {
+/// Unmaps the guard page below each interrupt stack in `tables` (an AP has yet to start; on the
+/// boot processor each guard page lies below anything those stacks have used so far), proves
+/// that each one faults, and returns how many did.
+fn guard_interrupt_stacks(tables: *const CpuTables) -> Result<u64, &'static str> {
     let guards = cpu::interrupt_stack_guards(tables);
     vm::make_guards(&guards).map_err(|_| "cannot unmap the guard pages")?;
+    let mut proven = 0;
     for guard in guards {
         // SAFETY: the page is RAM of `tables`, not MMIO; the probe only reads it.
         match unsafe { cpu::probe_read(guard) } {
             cpu::Probe::Faulted { error: 0, address } if address == guard => {
-                INTERRUPT_STACK_GUARDS.fetch_add(1, Ordering::Relaxed);
+                proven += 1;
             }
             _ => return Err("a guard page did not fault"),
         }
     }
-    Ok(())
+    Ok(proven)
 }
 
 /// RSDP → XSDT → MADT → the processors it lists → their CPU indexes, the boot processor
@@ -567,7 +569,7 @@ fn start_one(
     // SAFETY: an all-zero `CpuTables` is valid (integers only); `init_ap` writes it before
     // the processor uses it.
     let tables = Box::into_raw(unsafe { Box::<CpuTables>::new_zeroed().assume_init() });
-    guard_interrupt_stacks(tables)?;
+    let guards = guard_interrupt_stacks(tables)?;
     let (stack, _guard) =
         crate::sched::guarded_stack(AP_STACK_BYTES).ok_or("no memory for the AP stack")?;
     let stack_top = (stack.as_mut_ptr().addr() + AP_STACK_BYTES) as u64 & !0xF;
@@ -595,6 +597,8 @@ fn start_one(
     // join.
     let outcome = start.handshake.abandon();
     if outcome == Outcome::Answered(apic_id) {
+        // Counted only now: `expected` is four per processor that came online.
+        INTERRUPT_STACK_GUARDS.fetch_add(guards, Ordering::Relaxed);
         return Ok(rdtsc().wrapping_sub(t0) / (tsc_hz / 1_000_000).max(1));
     }
     // SAFETY: the AP is not online: its start-up was settled without it joining, so it

@@ -66,9 +66,11 @@ use origin_boot_info::{
     BootInfo, KernelSegment, MemoryRegion, RegionKind, SEGMENT_EXECUTE, SEGMENT_WRITE,
 };
 
-/// Frames reserved, next to the frame bitmap, for the kernel's page tables: enough for a
-/// direct map of well over 100 GiB with 2 MiB pages plus 4 KiB edges at every region.
-const TABLE_POOL_FRAMES: u64 = 256;
+/// The fewest frames reserved, next to the frame bitmap, for the kernel's page tables.
+const TABLE_POOL_MIN_FRAMES: u64 = 256;
+/// Frames kept beyond what the boot's own tables can need (`layout::table_frames`), for what
+/// is mapped afterwards: device registers, firmware tables and guard pages that split a leaf.
+const TABLE_POOL_RESERVE: u64 = 235;
 
 /// I/O port base of COM1 on PC-compatible platforms.
 pub(crate) const COM1_BASE: u16 = 0x3F8;
@@ -215,7 +217,8 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
 
     // M2, second step: the physical frame allocator over the boot-info regions, with a
     // pool of frames for page tables beside its bitmap.
-    let Some((mut alloc, pool, pool_base)) = init_memory(&mut com1, regions) else {
+    let Some((mut alloc, pool, pool_base)) = init_memory(&mut com1, regions, info.kernel_span)
+    else {
         halt();
     };
 
@@ -1294,10 +1297,23 @@ fn prove_protections(com1: &mut Console, info: &BootInfo, segments: &[KernelSegm
 fn init_memory(
     com1: &mut Console,
     regions: &'static [MemoryRegion],
+    kernel_span: u64,
 ) -> Option<(FrameAllocator<'static>, &'static [Table], u64)> {
     let words = frames::words_for(frames::covered_end(regions));
     let bitmap_pages = (words * 8).div_ceil(frames::FRAME);
-    let pages = bitmap_pages + TABLE_POOL_FRAMES;
+    // As large as the memory map can need, so a machine the loader could map is one the kernel
+    // can map too.
+    let Some(table_frames) = layout::table_frames(regions, regions.len() as u64, kernel_span)
+        .and_then(|needed| needed.checked_add(TABLE_POOL_RESERVE))
+        .map(|frames| frames.max(TABLE_POOL_MIN_FRAMES))
+    else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: the memory map needs more page tables than can be counted"
+        );
+        return None;
+    };
+    let pages = bitmap_pages + table_frames;
     let usable = RegionKind::Usable as u32;
     let Some(home) = regions
         .iter()
@@ -1320,7 +1336,7 @@ fn init_memory(
     // kernel's run, and nothing else refers to these frames.
     let bitmap = unsafe { slice::from_raw_parts_mut(bitmap_ptr, words as usize) };
     let pool_base = home.base + bitmap_pages * frames::FRAME;
-    // SAFETY: the pool's `TABLE_POOL_FRAMES` frames follow the bitmap inside `home`, were
+    // SAFETY: the pool's `table_frames` frames follow the bitmap inside `home`, were
     // zeroed above and are reserved below, so only the pool uses them. `Table` is 4 KiB of
     // `AtomicU64`, valid for any bits and aligned (the frames are 4 KiB aligned); accesses
     // through the shared slice are atomic, so the processor's own accessed/dirty updates
@@ -1328,7 +1344,7 @@ fn init_memory(
     let pool = unsafe {
         slice::from_raw_parts(
             ptr::with_exposed_provenance::<Table>(phys::to_virt(pool_base) as usize),
-            TABLE_POOL_FRAMES as usize,
+            table_frames as usize,
         )
     };
     // The AP trampoline's code and data frames (M3) are never handed out.

@@ -313,6 +313,19 @@ const CONTROLS: &[Control] = &[
         ],
     },
     Control {
+        // A wake that leaves no mark: the reschedule IPI finds nobody it should run.
+        name: "run_queue_wake_leaves_no_mark",
+        file: RUN_QUEUE,
+        from: "                if let Some(w) = self.woken.get_mut(slot) {
+                    *w = true;
+                }
+                true
+",
+        to: "                true
+",
+        models: &[("wait_queue_waker_and_waiter_relaxed", DEADLOCK)],
+    },
+    Control {
         // The condition read outside the lock: it can go stale before the registration.
         name: "condition_checked_before_the_lock",
         file: WAIT,
@@ -723,17 +736,51 @@ pub(crate) fn run() -> Result {
 
 /// The lines of `source` that use a `cfg` naming `loom` without also naming `test`.
 fn loom_cfg_without_test(source: &str) -> Vec<usize> {
-    source
+    // Comments may speak of the flag; code may split a predicate across lines.
+    let code: String = source
         .lines()
-        .enumerate()
-        .filter(|(_, line)| {
-            !line.trim_start().starts_with("//")
-                && line.contains("cfg")
-                && line.contains("loom")
-                && !line.contains("test")
-        })
-        .map(|(index, _)| index + 1)
-        .collect()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    /// The only predicates under which `loom` may appear: each requires `test` to select Loom's
+    /// code, or is the exact opposite of one that does.
+    const ALLOWED: [&str; 3] = [
+        "all(test,loom)",
+        "not(all(test,loom))",
+        "all(test,not(loom))",
+    ];
+    let mut offending = Vec::new();
+    for (at, _) in code.match_indices("cfg") {
+        let rest = code.get(at + 3..).unwrap_or("");
+        let attr = rest.starts_with("_attr");
+        let after = rest
+            .strip_prefix("_attr")
+            .or_else(|| rest.strip_prefix('!'))
+            .unwrap_or(rest)
+            .trim_start();
+        let Some(body) = after.strip_prefix('(') else {
+            continue;
+        };
+        let (mut depth, mut predicate) = (1usize, String::new());
+        for c in body.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if attr && depth == 1 => break,
+                _ => {}
+            }
+            if depth == 0 {
+                break;
+            }
+            if !c.is_whitespace() {
+                predicate.push(c);
+            }
+        }
+        if predicate.contains("loom") && !ALLOWED.contains(&predicate.as_str()) {
+            offending.push(code.get(..at).unwrap_or("").lines().count().max(1));
+        }
+    }
+    offending
 }
 
 /// `--cfg loom` must not be able to select other code in a build of the kernel: whatever names
@@ -1070,6 +1117,10 @@ mod tests {
     fn a_cfg_naming_loom_must_require_test() {
         let source = "// cfg(loom) in a comment\n#[cfg(all(test, loom))]\n#[cfg(loom)]\nlet x = cfg!(loom);\n";
         assert_eq!(loom_cfg_without_test(source), [3, 4]);
+        // What a line-by-line check let through: `test` merely beside `loom`, and a predicate
+        // rustfmt split across lines. The last two are the forms the crate really uses.
+        let tricky = "#[cfg(any(test, loom))]\n#[cfg(all(not(test), loom))]\n#[cfg(\n    all(\n        not(test),\n        loom\n    )\n)]\n#[cfg_attr(any(test, loom), allow(dead_code))]\n#[cfg(not(all(test, loom)))]\n#[cfg(all(test, not(loom)))]\n";
+        assert_eq!(loom_cfg_without_test(tricky), [1, 2, 3, 9]);
         check_loom_cfgs_need_test(&repo_root()).unwrap();
     }
 

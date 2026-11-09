@@ -21,7 +21,7 @@
 //! - `OnCpu::block` and `OnCpu::block_until` make the run-queue calls `sched::on_block` makes, and
 //!   `sched::block_until` turns a deadline into its tick count; the copy takes one tick to any
 //!   reachable deadline and `u64::MAX` ticks to `UNREACHABLE`.
-//! - `OnCpu::halt_until_ready` makes the calls `sched::on_reschedule` (`RunQueue::yield_now`) and
+//! - `OnCpu::halt_until_ready` makes the calls `sched::on_reschedule` (`RunQueue::preempt_for_wake`) and
 //!   `sched::on_tick` (`RunQueue::tick`) make for a processor halted in its idle context. What
 //!   else those handlers do around them (`with_queue`, the FPU and TSS switch) is not here.
 //! - `Cpu::new` leaves a real run queue as `sched` has it while a kernel thread runs: the idle
@@ -577,7 +577,7 @@ impl OnCpu {
         loop {
             cpu.kick.wait();
             let next = match cpu.restart {
-                Restart::Ipi => cpu.queue.lock().yield_now(IDLE_FRAME),
+                Restart::Ipi => cpu.queue.lock().preempt_for_wake(IDLE_FRAME),
                 Restart::Tick => cpu.queue.lock().tick(IDLE_FRAME),
             };
             if next == THREAD_FRAME {

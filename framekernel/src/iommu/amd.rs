@@ -647,6 +647,21 @@ pub(super) fn init(com1: &mut Console, table: &'static [u8]) -> bool {
             }
         }
     }
+    // A unit that runs its queues but never latched IOMMU_EN translates nothing, so the status
+    // comes from the control register, as VT-d's comes from GSTS.TE.
+    if !running
+        .iter()
+        .all(|u| u.regs.read64(reg::CONTROL) & control::IOMMU_EN != 0)
+    {
+        for u in &running {
+            u.disable();
+        }
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: a unit did not turn translation on: IOMMU failed"
+        );
+        return false;
+    }
     crate::cpu::without_interrupts(|| {
         *AMD.lock() = Some(AmdVi {
             ivrs,

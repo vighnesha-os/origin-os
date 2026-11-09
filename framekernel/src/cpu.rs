@@ -498,7 +498,7 @@ fn init_cpu_state() {
             set = in(reg) CR4_MCE,
             clear = in(reg) !(CR4_FSGSBASE | CR4_PCE),
             t = out(reg) _,
-            options(nostack, preserves_flags),
+            options(nostack),
         );
     }
     // SAFETY: CPL 0; DR7's reset value disarms every breakpoint, and nothing here uses one.

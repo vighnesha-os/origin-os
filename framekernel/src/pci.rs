@@ -505,12 +505,18 @@ pub fn disable_function(cfg: &mut impl ConfigSpace, at: Address) {
     );
 }
 
-/// Whether `f` is a host bridge (class 06:00, a type 0 header): the one kind of function
-/// whose Bus Master Enable is allowed to read set after being cleared. Intel hard-wires it on
-/// device 0 of the host bridge, so a read-only bit there is reported, not a failure. Every
-/// other function that keeps the bit on failed the quiesce.
+/// Whether `f` is the host bridge at 00:00.0 (class 06:00, a type 0 header): the one function
+/// whose Bus Master Enable is allowed to read set after being cleared. Intel hard-wires it
+/// there, so a read-only bit at that address is reported, not a failure. A class code is the
+/// device's own claim, so it counts only at that address. Every other function that keeps the
+/// bit on failed the quiesce.
 pub const fn bus_master_may_be_read_only(f: &Function) -> bool {
-    f.class == 0x06 && f.subclass == 0x00 && f.layout == 0
+    f.class == 0x06
+        && f.subclass == 0x00
+        && f.layout == 0
+        && f.at.bus == 0
+        && f.at.device == 0
+        && f.at.function == 0
 }
 
 /// What the kernel knows about the platform's IOMMUs.
@@ -1604,6 +1610,31 @@ mod tests {
             },
             // A type 1 header cannot be a host bridge, whatever its class.
             Function { layout: 1, ..host },
+            // The class is the device's own claim: anywhere else it waives nothing.
+            Function {
+                at: Address {
+                    bus: 0,
+                    device: 3,
+                    function: 0,
+                },
+                ..host
+            },
+            Function {
+                at: Address {
+                    bus: 1,
+                    device: 0,
+                    function: 0,
+                },
+                ..host
+            },
+            Function {
+                at: Address {
+                    bus: 0,
+                    device: 0,
+                    function: 1,
+                },
+                ..host
+            },
         ] {
             assert!(!bus_master_may_be_read_only(&not), "{not:?}");
         }

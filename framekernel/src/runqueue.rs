@@ -326,9 +326,9 @@ impl RunQueue {
     /// An interrupt or IPI that may have woken a thread arrived while the context whose
     /// frame is at `interrupted` ran. That context is charged nothing. If a thread woken
     /// since the last choice should run now, it runs: the woken one with the lowest pass, if
-    /// the running context is the idle one or its pass is no lower than that thread's (what a
-    /// choice now would decide, the woken thread winning a tie). Otherwise `interrupted` is
-    /// returned and nothing here changes.
+    /// the running context is the idle one or its pass is no lower than that thread's (the
+    /// woken thread winning a tie). A ready context that was not woken is not considered: it
+    /// waits for the next tick. Otherwise `interrupted` is returned and nothing here changes.
     pub fn preempt_for_wake(&mut self, interrupted: u64) -> u64 {
         let woken = core::mem::replace(&mut self.woken, [false; CAPACITY]);
         let pass = |slot: usize| self.pass.get(slot).copied().unwrap_or(u64::MAX);

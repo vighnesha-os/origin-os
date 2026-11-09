@@ -1224,8 +1224,9 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
     let mut packet = [0u8; 4 + tftp::BLOCK];
     let attempt = || crate::time::monotonic_nanos().saturating_add(TFTP_ATTEMPT_NS);
     let transfer = crate::time::monotonic_nanos().saturating_add(TFTP_TRANSFER_NS);
-    // A packet that moves the transfer on buys a new attempt; anything else (a stray, a
-    // packet from the wrong port) only uses up the current one.
+    // A packet that gets an answer (new data, or a repeat of a block, which must be acknowledged
+    // again) buys a new attempt; anything else (a stray, a packet from the wrong port) only uses
+    // up the current one. The whole transfer is bounded by `TFTP_TRANSFER_NS` either way.
     let (mut deadline, mut misses) = (attempt(), 0);
     while crate::time::monotonic_nanos() < transfer {
         let Some((port, len)) = await_udp(rx, (GATEWAY, ours, client_port), &mut packet, deadline)
@@ -1620,17 +1621,18 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
             crate::sched::yield_until(|| RX_DONE.load(Ordering::Acquire) != 0, tsc_hz, 10);
         }
     }
-    if !spawned {
-        // Nothing drives the device: reset it and take bus mastering away again (I12).
-        w8(common + reg::DEVICE_STATUS, 0);
-        let _ = crate::pcie::clear_bus_master(at);
-    }
     let finished = RX_DONE.load(Ordering::Acquire) != 0;
     let gateway = RX_GATEWAY.load(Ordering::Relaxed);
     let lease = RX_LEASE.load(Ordering::Relaxed);
     let blocked = RX_BLOCKED.load(Ordering::Relaxed);
     let wakes = NET_WAKES.load(Ordering::Relaxed);
     let device_faults = DEVICE_FAULTS.load(Ordering::Relaxed);
+    let unarmed = RX_ARMED.load(Ordering::Acquire) == 0;
+    if !spawned || (finished && (device_faults != 0 || unarmed)) {
+        // Nothing drives the device: reset it and take bus mastering away again (I12).
+        w8(common + reg::DEVICE_STATUS, 0);
+        let _ = crate::pcie::clear_bus_master(at);
+    }
     let dhcp_retransmits = DHCP_RETRANSMITS.load(Ordering::Relaxed);
     let irqs = NET_IRQS.load(Ordering::Relaxed);
     let on = NET_IRQ_CPU.load(Ordering::Relaxed).saturating_sub(1);
