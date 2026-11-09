@@ -36,6 +36,8 @@ use framekernel::acpi;
 use framekernel::clock::{self, NANOS_PER_SECOND, Scale};
 use framekernel::hpet;
 use framekernel::rtc::{self, DateTime, Registers, SecondMeasurement, SecondVerdict, register};
+use origin_frame::addr::PhysAddr;
+use origin_frame::mmio::MmioRegion;
 use origin_frame::sync::SpinLock;
 
 use crate::console::Console;
@@ -294,21 +296,15 @@ fn pair_tight_ticks(scale: Scale) -> u64 {
     scale.hz() / 50_000
 }
 
-/// Reads the HPET's 64-bit register at `virt + offset`.
-fn hpet_read(virt: u64, offset: u64) -> u64 {
-    let p = core::ptr::with_exposed_provenance::<u64>((virt + offset) as usize);
-    // SAFETY: `virt` maps the HPET's registers uncached (just mapped); `offset` names a
-    // 64-bit-aligned register inside the 1 KiB block, and a register read has no memory
-    // effect.
-    unsafe { p.read_volatile() }
+/// Reads the HPET's 64-bit register at `offset`.
+fn hpet_read(regs: MmioRegion, offset: u64) -> u64 {
+    regs.read64(offset as usize)
 }
 
-/// Writes the HPET's 64-bit register at `virt + offset`.
-fn hpet_write(virt: u64, offset: u64, value: u64) {
-    let p = core::ptr::with_exposed_provenance_mut::<u64>((virt + offset) as usize);
-    // SAFETY: as for `hpet_read`; the only register written here is General Configuration,
-    // which affects only the HPET.
-    unsafe { p.write_volatile(value) };
+/// Writes the HPET's 64-bit register at `offset`: only General Configuration is written here,
+/// which affects only the HPET.
+fn hpet_write(regs: MmioRegion, offset: u64, value: u64) {
+    regs.write64(offset as usize, value);
 }
 
 /// Discovers the HPET through ACPI, enables its main counter, and checks it advances at the
@@ -329,7 +325,7 @@ fn prove_hpet(com1: &mut Console, rsdp: u64, scale: Scale) -> bool {
             return false;
         }
     };
-    let virt = match crate::vm::map_mmio(info.base, 0x1000) {
+    let virt = match crate::vm::map_mmio(PhysAddr::new(info.base), 0x1000) {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(

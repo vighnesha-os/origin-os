@@ -1154,7 +1154,7 @@ fn prove_backtrace(com1: &mut Console, info: &BootInfo) {
 fn init_paging(
     com1: &mut Console,
     info: &BootInfo,
-    regions: &[MemoryRegion],
+    regions: &'static [MemoryRegion],
     segments: &[KernelSegment],
     pool: &'static [Table],
     pool_base: u64,
@@ -1202,7 +1202,7 @@ fn init_paging(
     // Toggling CR4.PGE also drops every translation cached under the loader's tables.
     let global = unsafe { tlb::enable_global_pages() };
     let used = tables.used();
-    vm::install(space, tables);
+    vm::install(space, tables, regions);
     let _ = writeln!(
         com1,
         "origin-kernel: page tables loaded: {} tables, {} MiB direct map, {} image pages, {} 4 KiB and {} 2 MiB leaves; global pages {global}",

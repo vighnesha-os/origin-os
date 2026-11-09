@@ -3,26 +3,21 @@
 //! The firmware leaves its tables in ACPI-reclaim or ACPI-NVS memory, which the kernel's
 //! direct map may not cover; [`bytes`] maps them read-only and never executable first. The
 //! table parsers (`framekernel::acpi`) treat every byte as untrusted.
-
-use core::ptr;
+#![forbid(unsafe_code)]
 
 use framekernel::acpi;
+use origin_frame::addr::PhysAddr;
 
 use crate::vm;
 
 /// Reads `len` bytes of firmware memory at physical `addr`, mapping it read-only first if
-/// the kernel does not map it.
+/// the kernel does not map it. Refused unless the memory map says the range is the
+/// firmware's own (ACPI or reserved memory): the kernel never reads its own RAM this way.
 pub(crate) fn bytes(addr: u64, len: usize) -> Result<&'static [u8], &'static str> {
     if addr == 0 || addr.checked_add(len as u64).is_none() {
         return Err("bad table address");
     }
-    let virt = vm::map_firmware(addr, len as u64).map_err(|_| "cannot map an ACPI table")?;
-    // SAFETY: `[addr, addr + len)` is readable at its direct-map address `virt` (just
-    // ensured), does not wrap, and holds ACPI tables, which the firmware does not change
-    // after boot; `u8` has no alignment or validity requirement.
-    Ok(unsafe {
-        core::slice::from_raw_parts(ptr::with_exposed_provenance::<u8>(virt as usize), len)
-    })
+    vm::firmware_bytes(PhysAddr::new(addr), len as u64).map_err(|_| "cannot map an ACPI table")
 }
 
 /// The first valid table with signature `sig` that the XSDT lists, checked (signature,

@@ -24,7 +24,9 @@ use framekernel::acpi::{self, IoApic, SourceOverride};
 use framekernel::apic;
 use framekernel::ioapic::{self, RemappableEntry};
 use framekernel::vtd::{Irte, SourceCheck};
+use origin_frame::addr::PhysAddr;
 use origin_frame::irq::{self as vectors, Action};
+use origin_frame::mmio::MmioRegion;
 use origin_frame::sync::SpinLock;
 
 use crate::console::Console;
@@ -59,35 +61,22 @@ const NO_REQUESTER_ID: u16 = 0xFFFF;
 const REASON_NOT_PRESENT: u8 = 0x22;
 const REASON_SOURCE_ID: u8 = 0x26;
 
-/// The mapped I/O APIC: its MMIO virtual base and GSI base.
+/// The mapped I/O APIC: its registers and GSI base. Only the boot processor touches them.
 #[derive(Clone, Copy)]
 struct MappedIoApic {
-    virt: u64,
+    regs: MmioRegion,
     gsi_base: u32,
 }
 
 impl MappedIoApic {
     fn read(&self, index: u32) -> u32 {
-        let sel =
-            core::ptr::with_exposed_provenance_mut::<u32>((self.virt + ioapic::IOREGSEL) as usize);
-        let win = core::ptr::with_exposed_provenance::<u32>((self.virt + ioapic::IOWIN) as usize);
-        // SAFETY: `virt` maps the I/O APIC's registers uncached; writing IOREGSEL selects a
-        // register, with no memory effect. Only the boot processor touches these.
-        unsafe { sel.write_volatile(index) };
-        // SAFETY: reading IOWIN returns the selected register, with no memory effect.
-        unsafe { win.read_volatile() }
+        self.regs.write32(ioapic::IOREGSEL as usize, index);
+        self.regs.read32(ioapic::IOWIN as usize)
     }
 
     fn write(&self, index: u32, value: u32) {
-        let sel =
-            core::ptr::with_exposed_provenance_mut::<u32>((self.virt + ioapic::IOREGSEL) as usize);
-        let win =
-            core::ptr::with_exposed_provenance_mut::<u32>((self.virt + ioapic::IOWIN) as usize);
-        // SAFETY: as for `read`; selecting a register has no memory effect.
-        unsafe { sel.write_volatile(index) };
-        // SAFETY: the only registers written through IOWIN here are the redirection table,
-        // which routes device interrupts.
-        unsafe { win.write_volatile(value) };
+        self.regs.write32(ioapic::IOREGSEL as usize, index);
+        self.regs.write32(ioapic::IOWIN as usize, value);
     }
 
     /// Writes redirection entry `n` (relative to this I/O APIC's GSI base): masked first,
@@ -206,7 +195,7 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
         );
         return false;
     };
-    let virt = match crate::vm::map_mmio(u64::from(io.address), 0x1000) {
+    let regs = match crate::vm::map_mmio(PhysAddr::new(u64::from(io.address)), 0x1000) {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(
@@ -218,7 +207,7 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
         }
     };
     let mapped = MappedIoApic {
-        virt,
+        regs,
         gsi_base: io.gsi_base,
     };
     let entries = ioapic::max_redirection_entry(mapped.read(ioapic::REG_VERSION)) + 1;

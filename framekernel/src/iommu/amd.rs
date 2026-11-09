@@ -339,11 +339,9 @@ fn bring_up(u: &ivrs::Unit<'static>) -> Result<Brought, &'static str> {
     if !capability.is_iommu {
         return Err("its capability offset does not hold an IOMMU capability block");
     }
-    let virt = crate::vm::map_mmio(u.base, reg::SPAN).map_err(|_| "cannot map its registers")?;
-    let regs = Regs {
-        virt,
-        size: reg::SPAN,
-    };
+    let region = crate::vm::map_mmio(origin_frame::addr::PhysAddr::new(u.base), reg::SPAN)
+        .map_err(|_| "cannot map its registers")?;
+    let regs = Regs { region };
     if regs.read64(reg::CONTROL) & control::IOMMU_EN != 0 {
         return Err("the firmware left it enabled (taking an IOMMU over is not implemented)");
     }

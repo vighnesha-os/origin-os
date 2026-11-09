@@ -26,6 +26,7 @@ extern crate alloc;
 
 pub use origin_sync as sync;
 
+pub mod addr;
 pub mod apic;
 pub mod clock;
 pub mod descriptors;
@@ -34,6 +35,7 @@ pub mod frames;
 pub mod heap;
 pub mod irq;
 pub mod limits;
+pub mod mmio;
 pub mod once;
 pub mod trap;
 pub mod unwind;
@@ -44,6 +46,8 @@ mod testing;
 
 #[cfg(target_os = "none")]
 pub mod cpu;
+#[cfg(target_os = "none")]
+pub mod dma;
 #[cfg(target_os = "none")]
 pub mod memory;
 #[cfg(target_os = "none")]

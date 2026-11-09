@@ -5,7 +5,6 @@
 //! Every change that removes access is followed by a TLB shootdown (`tlb`) once the lock is
 //! released, so no processor keeps the old translation; changes that only add access need
 //! none. Kernel-half mappings are global; the identity pages of the AP trampoline are not.
-#![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,15 +21,55 @@ const MMIO_END: u64 = 0xFFFF_F000_0000_0000;
 /// The next free address in the MMIO window.
 static MMIO_NEXT: AtomicU64 = AtomicU64::new(MMIO_BASE);
 
-use origin_boot_info::{MemoryRegion, overlaps_ram};
+use origin_boot_info::{MemoryRegion, RegionKind, overlaps_ram};
 use origin_sync::SpinLock;
+
+use crate::addr::PhysAddr;
+use crate::mmio::MmioRegion;
+
+/// Physical ranges of device registers that have been handed out, at most one owner each. A
+/// claim outside `map_mmio` is the framework's own (the IOMMU's registers, ECAM): no driver
+/// can get at them through `map_mmio`, because a mapping that overlaps an earlier claim is
+/// refused.
+struct Claims {
+    ranges: [(u64, u64); 64],
+    count: usize,
+}
+
+impl Claims {
+    const fn new() -> Self {
+        Self {
+            ranges: [(0, 0); 64],
+            count: 0,
+        }
+    }
+
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.ranges
+            .iter()
+            .take(self.count)
+            .any(|&(a, b)| start < b && a < end)
+    }
+
+    fn add(&mut self, start: u64, end: u64) -> bool {
+        match self.ranges.get_mut(self.count) {
+            Some(slot) => {
+                *slot = (start, end);
+                self.count += 1;
+                true
+            }
+            None => false,
+        }
+    }
+}
 
 struct KernelSpace {
     space: AddressSpace,
     tables: TablePool<'static>,
-    /// The firmware's memory map, once [`set_memory_map`] has recorded it: [`map_mmio`]
-    /// refuses to map anything it calls RAM.
+    /// The firmware's memory map: [`map_mmio`] refuses to map anything it calls RAM.
     memory_map: &'static [MemoryRegion],
+    /// Device registers handed out so far.
+    claims: Claims,
 }
 
 static KERNEL_SPACE: SpinLock<Option<KernelSpace>> = SpinLock::new(None);
@@ -52,26 +91,22 @@ pub fn kernel_half() -> Option<[u64; 256]> {
     })
 }
 
-/// Keeps the live address space (`init_paging` calls this right after loading CR3).
-pub fn install(space: AddressSpace, tables: TablePool<'static>) {
+/// Keeps the live address space, and the firmware's memory map that [`map_mmio`] holds every
+/// mapping against (`init_paging` calls this right after loading CR3).
+pub fn install(
+    space: AddressSpace,
+    tables: TablePool<'static>,
+    memory_map: &'static [MemoryRegion],
+) {
     KERNEL_ROOT.store(space.root(), core::sync::atomic::Ordering::Release);
     crate::cpu::without_interrupts(|| {
         *KERNEL_SPACE.lock() = Some(KernelSpace {
             space,
             tables,
-            memory_map: &[],
+            memory_map,
+            claims: Claims::new(),
         });
     })
-}
-
-/// Records the firmware's memory map for [`map_mmio`], as soon as the first caller that needs
-/// the check runs (`pcie::quiesce`); the console's UART, mapped earlier, checks for itself.
-pub fn set_memory_map(regions: &'static [MemoryRegion]) {
-    crate::cpu::without_interrupts(|| {
-        if let Some(k) = KERNEL_SPACE.lock().as_mut() {
-            k.memory_map = regions;
-        }
-    });
 }
 
 /// Physical address of the live PML4.
@@ -167,6 +202,8 @@ fn unmap_guards(pages: &[u64]) -> Result<(), MapError> {
 pub enum MmioError {
     /// The firmware's memory map says part of the range is RAM.
     OverlapsRam,
+    /// Part of the range was already handed out (see [`map_mmio`]).
+    Claimed,
     /// The tables refused the mapping; none of it is left behind.
     Map(MapError),
 }
@@ -178,14 +215,21 @@ impl From<MapError> for MmioError {
 }
 
 /// Maps the device registers at physical `[phys, phys + len)` uncached, read/write and
-/// never executable into the MMIO window, and returns the virtual address of `phys`. The
-/// window keeps the physical address's offset within 2 MiB, so aligned ranges get 2 MiB
-/// pages. A range the firmware's memory map calls RAM is refused: writing device registers
-/// through an uncached mapping there would corrupt memory. On any failure no leaf remains
-/// and the window does not advance, so the next mapping starts clean.
-pub fn map_mmio(phys: u64, len: u64) -> Result<u64, MmioError> {
-    let first = phys & !(PAGE - 1);
-    let end = phys
+/// never executable into the MMIO window, and returns them as a typed region. The window keeps
+/// the physical address's offset within 2 MiB, so aligned ranges get 2 MiB pages. A range the
+/// firmware's memory map calls RAM is refused: writing device registers through an uncached
+/// mapping there would corrupt memory, and an [`MmioRegion`] must only ever be device memory.
+/// So is a range that overlaps one already handed out: registers have one owner, so the
+/// IOMMU's and ECAM's registers, claimed at boot before any driver binds, cannot be reached by a
+/// driver asking for them (a device's BAR is the driver's input and can lie). On any failure no
+/// leaf remains and the window does not advance, so the next mapping starts clean.
+pub fn map_mmio(phys: PhysAddr, len: u64) -> Result<MmioRegion, MmioError> {
+    if len == 0 || len > isize::MAX as u64 {
+        return Err(MapError::Overflow.into());
+    }
+    let raw = phys.raw();
+    let first = raw & !(PAGE - 1);
+    let end = raw
         .checked_add(len)
         .and_then(|e| e.checked_next_multiple_of(PAGE))
         .ok_or(MapError::Overflow)?;
@@ -196,6 +240,9 @@ pub fn map_mmio(phys: u64, len: u64) -> Result<u64, MmioError> {
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
         if overlaps_ram(k.memory_map, first, bytes) {
             return Err(MmioError::OverlapsRam);
+        }
+        if k.claims.overlaps(first, end) {
+            return Err(MmioError::Claimed);
         }
         let start = MMIO_NEXT
             .load(Ordering::Relaxed)
@@ -214,6 +261,12 @@ pub fn map_mmio(phys: u64, len: u64) -> Result<u64, MmioError> {
             return Err(e.into());
         }
         MMIO_NEXT.store(stop, Ordering::Relaxed);
+        if !k.claims.add(first, end) {
+            // The claim table is full: refuse the mapping rather than lose track of it.
+            // (A leaf stays behind in the window; no one can reach it, and nothing else
+            // will ever be mapped there.)
+            return Err(MapError::OutOfMemory.into());
+        }
         Ok(start)
     });
     // `map_range` took back what it had installed, and the next mapping will reuse these
@@ -221,7 +274,84 @@ pub fn map_mmio(phys: u64, len: u64) -> Result<u64, MmioError> {
     if removed {
         crate::tlb::shootdown_all();
     }
-    Ok(mapped? + (phys - first))
+    let virt = mapped? + (raw - first);
+    // SAFETY: `[virt, virt + len)` was just mapped uncached, read/write and never executable,
+    // to the device registers at `phys` (the memory map says they are not RAM), and the
+    // mapping lasts for ever.
+    Ok(unsafe { MmioRegion::from_mapped(virt as usize, len as usize, phys) })
+}
+
+/// A readable copy of what the firmware put at physical `[addr, addr + len)` (ACPI tables):
+/// `&'static` because firmware tables do not change after boot. Refused for anything but the
+/// firmware's own data: a range that overlaps memory the kernel owns or will own (`Usable`,
+/// the heap, the kernel's image, the loader's memory), which safe code must not be able to
+/// read as a `&'static [u8]` while something writes it.
+pub fn firmware_bytes(addr: PhysAddr, len: u64) -> Result<&'static [u8], MapError> {
+    let raw = addr.raw();
+    if raw == 0 || len > isize::MAX as u64 {
+        return Err(MapError::Overflow);
+    }
+    let end = raw.checked_add(len).ok_or(MapError::Overflow)?;
+    // Only memory the firmware described as its own (reserved, ACPI, runtime or device
+    // memory): never RAM the kernel owns or will own.
+    let firmware = [
+        RegionKind::Reserved,
+        RegionKind::AcpiReclaimable,
+        RegionKind::AcpiNvs,
+        RegionKind::Mmio,
+        RegionKind::RuntimeCode,
+        RegionKind::RuntimeData,
+    ]
+    .map(|kind| kind as u32);
+    let is_firmware_data = crate::cpu::without_interrupts(|| {
+        KERNEL_SPACE.lock().as_ref().is_some_and(|k| {
+            !k.memory_map.iter().any(|r| {
+                r.base < end
+                    && raw < r.base.saturating_add(r.pages.saturating_mul(PAGE))
+                    && !firmware.contains(&r.kind)
+            })
+        })
+    });
+    if !is_firmware_data {
+        return Err(MapError::OutOfMemory);
+    }
+    let virt = map_firmware(raw, len)?;
+    // SAFETY: `[raw, raw + len)` is firmware data (checked above), mapped readable at its
+    // direct-map address `virt` (just ensured), not wrapping (checked), and the firmware does
+    // not change its tables after boot; `u8` has no alignment or validity requirement.
+    Ok(unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::with_exposed_provenance::<u8>(virt as usize),
+            len as usize,
+        )
+    })
+}
+
+/// The MMIO region describing the framebuffer the kernel's tables mapped (ADR-0010), for the
+/// console's pixel writes. Refused if `fb` is not what the loader passed and was placed at
+/// `framebuffer_mapping`'s address, so this cannot be made to point at anything else.
+pub fn framebuffer_region(fb: &origin_boot_info::Framebuffer) -> Option<MmioRegion> {
+    let mapping = origin_paging::layout::framebuffer_mapping(fb)?;
+    if mapping.first_pixel != fb.virtual_base {
+        return None;
+    }
+    let bytes = usize::try_from(fb.visible_bytes()).ok()?;
+    // Everything the console will draw is mapped: its first page (checked here) and the
+    // visible rows (`layout::build` maps the framebuffer's whole visible part, or the
+    // console withdraws it before these tables are used).
+    let first = translate(fb.virtual_base).filter(|t| t.uncached && t.writable && !t.executable)?;
+    if first.phys != fb.base & !(PAGE - 1) {
+        return None;
+    }
+    // SAFETY: the loader mapped the framebuffer uncached at `virtual_base` and `layout::build`
+    // keeps that mapping (or the console was withdrawn before these tables loaded, in which
+    // case `translate` above found nothing); the memory map says it is not RAM (checked by
+    // `console::screen_for`, which constructs the screen before calling this); video memory
+    // is device memory, not a Rust object, so 32-bit volatile pixel writes through the
+    // region are fine.
+    Some(unsafe {
+        MmioRegion::from_mapped(fb.virtual_base as usize, bytes, PhysAddr::new(fb.base))
+    })
 }
 
 /// How the live tables translate `virt`.

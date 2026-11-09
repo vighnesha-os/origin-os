@@ -49,6 +49,9 @@ use framekernel::vtd::{
     self, Access, Capability, ContextEntry, Descriptor, Drain, ExtCapability, FaultRecord,
     IovaWindow, Irte, MsiMessage, SourceCheck, TableMemory, fsts, gcmd, reg,
 };
+use origin_frame::addr::{Iova, PhysAddr};
+use origin_frame::dma::DmaFrame;
+use origin_frame::mmio::MmioRegion;
 use origin_frame::sync::SpinLock;
 
 use crate::console::Console;
@@ -153,49 +156,24 @@ fn flush(virt: u64, len: u64) {
 /// A unit's register set, mapped uncached.
 #[derive(Clone, Copy, Debug)]
 struct Regs {
-    virt: u64,
-    size: u64,
+    region: MmioRegion,
 }
 
 impl Regs {
     fn read32(&self, offset: u64) -> u32 {
-        if offset + 4 > self.size {
-            return 0;
-        }
-        let p = ptr::with_exposed_provenance::<u32>((self.virt + offset) as usize);
-        // SAFETY: the register set is mapped uncached at `virt` for `size` bytes (checked
-        // above); `offset` is a 4-byte aligned register. A register read has no effect on
-        // memory.
-        unsafe { p.read_volatile() }
+        self.region.read32(offset as usize)
     }
 
     fn write32(&self, offset: u64, value: u32) {
-        if offset + 4 > self.size {
-            return;
-        }
-        let p = ptr::with_exposed_provenance_mut::<u32>((self.virt + offset) as usize);
-        // SAFETY: as for `read32`. The writes are this unit's command, status and
-        // fault-control registers.
-        unsafe { p.write_volatile(value) };
+        self.region.write32(offset as usize, value);
     }
 
     fn read64(&self, offset: u64) -> u64 {
-        if offset + 8 > self.size {
-            return 0;
-        }
-        let p = ptr::with_exposed_provenance::<u64>((self.virt + offset) as usize);
-        // SAFETY: as for `read32`; the 64-bit registers are 8-byte aligned and read whole.
-        unsafe { p.read_volatile() }
+        self.region.read64(offset as usize)
     }
 
     fn write64(&self, offset: u64, value: u64) {
-        if offset + 8 > self.size {
-            return;
-        }
-        let p = ptr::with_exposed_provenance_mut::<u64>((self.virt + offset) as usize);
-        // SAFETY: as for `read64`. The values are addresses of this module's own pages, the
-        // queue tail, and write-1-to-clear fault bits.
-        unsafe { p.write_volatile(value) };
+        self.region.write64(offset as usize, value);
     }
 }
 
@@ -479,9 +457,9 @@ struct Brought {
 /// fails after any of that began is turned off again before the error returns.
 fn bring_up(u: &dmar::Unit<'static>, remap: bool) -> Result<Brought, &'static str> {
     let size = u64::from(u.register_pages) * PAGE;
-    let virt =
-        crate::vm::map_mmio(u.register_base, size).map_err(|_| "cannot map its registers")?;
-    let regs = Regs { virt, size };
+    let region = crate::vm::map_mmio(PhysAddr::new(u.register_base), size)
+        .map_err(|_| "cannot map its registers")?;
+    let regs = Regs { region };
     let version = vtd::version(regs.read32(reg::VER));
     let cap_raw = regs.read64(reg::CAP);
     let ecap_raw = regs.read64(reg::ECAP);
@@ -1184,25 +1162,35 @@ pub(crate) fn attach(at: Address) -> Result<Domain, &'static str> {
 
 /// Maps the physical 4 KiB page `phys` into domain `d`, readable and writable by the
 /// device; returns the IOVA the device must use (never `phys` itself).
-pub(crate) fn map(d: Domain, phys: u64) -> Result<u64, &'static str> {
-    if amd::active() {
-        return amd::map(d, phys);
-    }
-    crate::cpu::without_interrupts(|| IOMMU.lock().as_mut().ok_or("no IOMMU")?.map(d, phys))
+pub(crate) fn map(d: Domain, frame: DmaFrame) -> Result<Iova, &'static str> {
+    let phys = frame.phys().raw();
+    let iova = if amd::active() {
+        amd::map(d, phys)?
+    } else {
+        crate::cpu::without_interrupts(|| IOMMU.lock().as_mut().ok_or("no IOMMU")?.map(d, phys))?
+    };
+    Ok(Iova::new(iova))
 }
 
 /// Unmaps `iova` from domain `d` and returns the page it mapped. When this returns, the
 /// IOMMU's translation cache no longer holds the translation, so the device cannot reach the
 /// page.
-pub(crate) fn unmap(d: Domain, iova: u64) -> Result<u64, &'static str> {
+pub(crate) fn unmap(d: Domain, iova: Iova) -> Result<u64, &'static str> {
     if amd::active() {
-        return amd::unmap(d, iova);
+        return amd::unmap(d, iova.raw());
     }
-    crate::cpu::without_interrupts(|| IOMMU.lock().as_mut().ok_or("no IOMMU")?.unmap(d, iova))
+    crate::cpu::without_interrupts(|| {
+        IOMMU
+            .lock()
+            .as_mut()
+            .ok_or("no IOMMU")?
+            .unmap(d, iova.raw())
+    })
 }
 
 /// How domain `d`'s tables translate `iova`, walked in software as the hardware would.
-pub(crate) fn translate(d: Domain, iova: u64) -> Option<(u64, Access)> {
+pub(crate) fn translate(d: Domain, iova: Iova) -> Option<(u64, Access)> {
+    let iova = iova.raw();
     if amd::active() {
         return amd::translate(d, iova);
     }

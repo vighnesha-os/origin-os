@@ -544,8 +544,10 @@ fn uart_for(spcr: &Spcr, regions: &[MemoryRegion]) -> Result<KernelUart, &'stati
             if overlaps_ram(regions, base, spcr.address.span()) {
                 return Err("its registers are in RAM");
             }
-            let virt = crate::vm::map_mmio(base, spcr.address.span())
-                .map_err(|_| "its registers cannot be mapped")?;
+            let virt =
+                crate::vm::map_mmio(origin_frame::addr::PhysAddr::new(base), spcr.address.span())
+                    .map_err(|_| "its registers cannot be mapped")?
+                    .virt();
             // SAFETY: `map_mmio` mapped these registers uncached and read/write, and the
             // memory map just said they are not RAM.
             unsafe { KernelUart::mmio(virt, stride, access) }

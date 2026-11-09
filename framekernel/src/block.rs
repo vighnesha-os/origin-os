@@ -17,21 +17,14 @@
 use core::fmt::Write;
 
 use framekernel::blockcache::{BlockCache, Request, Transfer};
+use origin_frame::dma::DmaPage;
 
 use crate::console::Console;
-
-/// A DMA page used as one cache slot: where the kernel reaches it, and the address the
-/// controller uses (an IOVA in its IOMMU domain, or the physical address without one).
-#[derive(Clone, Copy)]
-struct Page {
-    virt: u64,
-    bus: u64,
-}
 
 /// The block cache over the bound NVMe namespace.
 struct Block {
     index: BlockCache,
-    slots: alloc::vec::Vec<Page>,
+    slots: alloc::vec::Vec<DmaPage>,
     /// Device block size, and device blocks per 4 KiB cache page.
     block_size: u64,
     page_blocks: u64,
@@ -43,7 +36,7 @@ struct Block {
 /// One of the cache's transfers on the device: a whole cache page between its slot and the
 /// disk, through the polled I/O queue.
 fn transfer(
-    slots: &[Page],
+    slots: &[DmaPage],
     page_blocks: u64,
     reads: &mut u64,
     writes: &mut u64,
@@ -62,7 +55,7 @@ fn transfer(
     let Some(p) = slots.get(slot) else {
         return Transfer::Failed;
     };
-    crate::storage::transfer(write, page * page_blocks, p.bus, page_blocks as u32)
+    crate::storage::transfer(write, page * page_blocks, p.bus().raw(), page_blocks as u32)
 }
 
 impl Block {
@@ -76,8 +69,7 @@ impl Block {
         }
         let mut pages = alloc::vec::Vec::with_capacity(slots);
         for _ in 0..slots {
-            let (virt, bus) = crate::storage::dma_page()?;
-            pages.push(Page { virt, bus });
+            pages.push(crate::storage::dma_page()?);
         }
         Some(Self {
             index: BlockCache::new(slots),
@@ -111,8 +103,7 @@ impl Block {
             return false;
         };
         let offset = ((lba % self.page_blocks) * self.block_size) as usize;
-        crate::storage::dma_read(self.slots[slot].virt, offset, out);
-        true
+        self.slots[slot].copy_out(offset, out)
     }
 
     /// Writes `data` (one block) to device block `lba` through the cache (read-modify-write
@@ -122,7 +113,9 @@ impl Block {
             return false;
         };
         let offset = ((lba % self.page_blocks) * self.block_size) as usize;
-        crate::storage::dma_write(self.slots[slot].virt, offset, data);
+        if !self.slots[slot].copy_in(offset, data) {
+            return false;
+        }
         self.index.mark_dirty(slot);
         true
     }
