@@ -177,10 +177,15 @@ pub(crate) fn reap() -> usize {
             z.fetch_sub(1, Ordering::AcqRel);
         }
         drop(fpu);
-        // Possibly the last reference to its process and address space, which frees them: this
-        // processor left it when the thread exited, and no processor still runs in it.
-        drop(user);
         drop(stack);
+        if let Some(user) = user {
+            let process = user.process.clone();
+            // Possibly the last reference to the address space, which frees it: this processor
+            // left it when the thread exited, and no processor still runs in it.
+            drop(user);
+            // After the memory, so that whoever sees `TERMINATED` knows it has gone (P11).
+            process.thread_reaped();
+        }
         freed += 1;
     }
 }

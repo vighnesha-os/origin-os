@@ -11,14 +11,21 @@
 //!   process does not own.
 //! - Its handle table is the only way it names kernel objects (P1).
 //!
-//! When its last thread ends, by exit or by fault, its handles close at once and its peers
-//! see that. Its address space goes last, with the final reference (`Drop`): the threads
-//! hold references through the scheduler, so by then no processor runs in it, and each that
-//! ran one has loaded another CR3, which flushes its translations (no PCIDs yet).
+//! A process is an object a handle can name, and it may outlive what it ran:
+//! - When its last thread ends, by exit or by fault, its handles close at once and its peers
+//!   see that.
+//! - Its address space goes when the last of its threads has been reaped, whoever still holds
+//!   a handle to the process: each thread holds a reference to the space through the scheduler
+//!   and gives it up when it is reaped, so by then no processor runs in it, and each that ran
+//!   one has loaded another CR3, which flushes its translations (no PCIDs yet).
+//! - Only then is `TERMINATED` raised (P11's order: handles, memory, signal), so whoever sees
+//!   it knows all of that has happened. The scheduler reaps a thread once its processor has
+//!   left it: on a processor kept busy by a program that never enters the kernel, that waits
+//!   until something gives the processor up, as the reaping of any thread's stack does.
+//! - A thread is an object too ([`ThreadObject`]): `TERMINATED` on a thread is raised as soon
+//!   as it has ended, without waiting to be reaped.
 //!
-//! A process and a thread are objects a handle can name, and both raise `TERMINATED` when they
-//! have ended: a thread as soon as it does, a process when its last thread has, after its
-//! handles have closed. Every object here is allocated fallibly ([`ObjectRef::try_new`]): one that
+//! Every object here is allocated fallibly ([`ObjectRef::try_new`]): a process or thread that
 //! cannot be created is an error for its creator, never a stopped kernel.
 //!
 //! The first slice has no process-creation or memory system calls: the kernel builds each
@@ -157,6 +164,11 @@ impl Termination {
         &self.waiters
     }
 
+    /// Whether the object has ended.
+    pub(crate) fn raised(&self) -> bool {
+        self.raised.load(Ordering::Acquire)
+    }
+
     /// Raises the signal: the state first, then the wake-ups, as every waker does (`wait`).
     fn raise(&self) {
         self.raised.store(true, Ordering::Release);
@@ -183,19 +195,8 @@ impl ThreadObject {
     }
 }
 
-/// Where a process's threads are, under one lock so that "the last one has ended" and "no more
-/// may start" are one decision.
-struct Lifecycle {
-    /// Threads started that have not ended.
-    running: u32,
-    /// What ended the most recent thread, once one has.
-    latest: Option<Ending>,
-    /// Its last thread has ended: no thread may start in it again.
-    ended: bool,
-}
-
 /// What a running user thread stands on, held by the scheduler from the thread's start until
-/// it is reaped.
+/// it is reaped: dropping the last of these is what frees the address space.
 pub(crate) struct UserContext {
     /// The thread's process.
     pub(crate) process: ObjectRef<Process>,
@@ -205,10 +206,23 @@ pub(crate) struct UserContext {
     pub(crate) thread: ObjectRef<ThreadObject>,
 }
 
+/// Where a process's threads are, under one lock so that "the last one has ended" and "no more
+/// may start" are one decision.
+struct Lifecycle {
+    /// Threads started that have not ended.
+    running: u32,
+    /// Threads started that have not been reaped.
+    unreaped: u32,
+    /// What ended the most recent thread, once one has.
+    latest: Option<Ending>,
+    /// Its last thread has ended: no thread may start in it again.
+    ended: bool,
+}
+
 /// One process.
 pub(crate) struct Process {
-    /// Its page tables and the user frames they map, shared with its threads.
-    space: ObjectRef<UserSpace>,
+    /// The creator's reference to its address space, given up when its last thread ends.
+    space: SpinLock<Option<ObjectRef<UserSpace>>>,
     /// Its handles (P1).
     pub(crate) handles: SpinLock<HandleTable<Object>>,
     /// What it may hold (P11).
@@ -219,7 +233,7 @@ pub(crate) struct Process {
     debug_calls: bool,
     /// Its threads.
     lifecycle: SpinLock<Lifecycle>,
-    /// `TERMINATED`, raised once its last thread has ended and its handles have closed.
+    /// `TERMINATED`, raised once everything it held is gone (P11).
     termination: Termination,
     /// Developer-only output of `DEBUG_REPORT`.
     reports: SpinLock<ReportLog>,
@@ -236,7 +250,7 @@ impl Process {
     /// code may issue system calls only from `[syscall_origin.0, syscall_origin.1)`.
     pub(crate) fn new(limits: Limits, syscall_origin: (u64, u64)) -> Option<Self> {
         Some(Self {
-            space: ObjectRef::try_new(UserSpace::new()?).ok()?,
+            space: SpinLock::new(Some(ObjectRef::try_new(UserSpace::new()?).ok()?)),
             handles: SpinLock::new(HandleTable::new(limits.handles)),
             account: ObjectRef::try_new(Account {
                 channels: AtomicUsize::new(0),
@@ -249,6 +263,7 @@ impl Process {
             debug_calls: limits.debug_calls,
             lifecycle: SpinLock::new(Lifecycle {
                 running: 0,
+                unreaped: 0,
                 latest: None,
                 ended: false,
             }),
@@ -268,43 +283,44 @@ impl Process {
         &self.termination
     }
 
-    /// The PML4 (physical), the value for CR3.
-    pub(crate) fn root(&self) -> u64 {
-        self.space.root()
+    /// A reference to its address space, while it has one: for its creator, and for a boot
+    /// proof that inspects a process's memory after it has ended.
+    pub(crate) fn memory(&self) -> Option<ObjectRef<UserSpace>> {
+        without_interrupts(|| self.space.lock().clone())
     }
 
-    /// A reference to its address space, for a thread about to run in it.
-    pub(crate) fn memory(&self) -> ObjectRef<UserSpace> {
-        self.space.clone()
+    /// The PML4 (physical), the value for CR3; 0 once the address space is gone.
+    pub(crate) fn root(&self) -> u64 {
+        self.memory().map_or(0, |space| space.root())
     }
 
     /// Maps the user page `virt` to a fresh zeroed frame this process owns, and returns it.
     /// Only inside the user half (ADR-0004 H1). Before the process has threads, while its
     /// creator holds the only reference to the address space.
     pub(crate) fn map_page(&mut self, virt: u64, access: Access) -> Result<UserFrame, MapError> {
-        ObjectRef::get_mut(&mut self.space).map_or(Err(MapError::OutOfMemory), |space| {
-            space.map_page(virt, access)
+        without_interrupts(|| {
+            let mut space = self.space.lock();
+            let unique = space.as_mut().and_then(ObjectRef::get_mut);
+            unique.map_or(Err(MapError::OutOfMemory), |space| {
+                space.map_page(virt, access)
+            })
         })
     }
 
     /// Copies `bytes` to `offset` bytes into the frame `frame` (from [`Process::map_page`]).
     pub(crate) fn write_frame(&self, frame: UserFrame, offset: usize, bytes: &[u8]) -> bool {
-        self.space.write_frame(frame, offset, bytes)
+        self.memory()
+            .is_some_and(|space| space.write_frame(frame, offset, bytes))
     }
 
     /// The frame mapped at `virt`, if any.
     pub(crate) fn frame_of(&self, virt: u64) -> Option<UserFrame> {
-        self.space.frame_of(virt)
-    }
-
-    /// The little-endian `u64` at `virt` in this process's memory, for the boot proofs.
-    pub(crate) fn read_u64(&self, virt: u64) -> Option<u64> {
-        self.space.read_u64(virt)
+        self.memory()?.frame_of(virt)
     }
 
     /// How this process's tables translate the user address `virt`.
     pub(crate) fn translate(&self, virt: u64) -> Option<Translation> {
-        self.space.translate(virt)
+        self.memory()?.translate(virt)
     }
 
     /// Whether `virt` is mapped in this process's address space.
@@ -380,10 +396,11 @@ impl Process {
         rsp: u64,
         rdi: u64,
     ) -> Result<ObjectRef<ThreadObject>, QueueError> {
+        let space = process.memory().ok_or(QueueError::Full)?;
         let thread = ObjectRef::try_new(ThreadObject::new()).map_err(|_| QueueError::Full)?;
         let user = ObjectRef::try_new(UserContext {
             process: process.clone(),
-            space: process.memory(),
+            space,
             thread: thread.clone(),
         })
         .map_err(|_| QueueError::Full)?;
@@ -394,6 +411,7 @@ impl Process {
                 return Err(QueueError::Full);
             }
             life.running += 1;
+            life.unreaped += 1;
             Ok(())
         })?;
         match sched::spawn_user(cpu, user, rip, rsp, rdi) {
@@ -408,19 +426,23 @@ impl Process {
     /// A counted thread never started. If every other thread ended in the meantime, this is
     /// what makes the process end: the thread that thought it was not the last did not.
     fn start_failed(&self) {
-        let finished = without_interrupts(|| {
+        let (finished, done) = without_interrupts(|| {
             let mut life = self.lifecycle.lock();
             life.running -= 1;
+            life.unreaped -= 1;
             let finished = if life.running == 0 && !life.ended {
                 life.latest
             } else {
                 None
             };
             life.ended |= finished.is_some();
-            finished
+            (finished, life.ended && life.unreaped == 0)
         });
         if let Some(ending) = finished {
             self.close_out(ending);
+        }
+        if done {
+            self.termination.raise();
         }
     }
 
@@ -442,7 +464,8 @@ impl Process {
         }
     }
 
-    /// The last thread has ended: its handles close.
+    /// The last thread has ended: its handles close, and the creator's reference to its
+    /// address space goes, so that the threads' own are all that hold it up.
     fn close_out(&self, ending: Ending) {
         // An empty table of limit 0 replaces this one, so nothing can be added afterwards
         // and the old table is dropped outside its lock.
@@ -451,10 +474,24 @@ impl Process {
         });
         drop(table);
         ipc::reap_closed();
-        // Last: "ended" means its handles are closed and its peers can see that. (Ends that
-        // were only reachable through an undelivered message another processor is reaping
-        // this instant close a moment later: they are delayed, never lost.)
+        // "Ended" means its handles are closed and its peers can see that. (Ends that were only
+        // reachable through an undelivered message another processor is reaping this instant
+        // close a moment later: they are delayed, never lost.)
         without_interrupts(|| *self.ending.lock() = Some(ending));
-        self.termination.raise();
+        let creators = without_interrupts(|| self.space.lock().take());
+        drop(creators);
+    }
+
+    /// A thread of this process has been reaped, and its reference to the address space is
+    /// gone. After the last of them everything the process held has been released: `TERMINATED`.
+    pub(crate) fn thread_reaped(&self) {
+        let done = without_interrupts(|| {
+            let mut life = self.lifecycle.lock();
+            life.unreaped -= 1;
+            life.ended && life.unreaped == 0
+        });
+        if done {
+            self.termination.raise();
+        }
     }
 }

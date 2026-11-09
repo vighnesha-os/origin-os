@@ -10,6 +10,7 @@
 //! memory instead of leaving a processor running on freed page tables.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use origin_abi::Error;
 use origin_paging::{Access, AddressSpace, MapError, PAGE, Table, TableMemory, Translation};
@@ -20,6 +21,14 @@ use crate::usercopy::{self, UserAccess, UserRange};
 
 /// Page-table frames one space may own (enough for a few scattered megabytes).
 const MAX_TABLES: usize = 32;
+
+/// How many spaces have given their memory back, for the proofs of when that happens.
+static SPACES_FREED: AtomicU64 = AtomicU64::new(0);
+
+/// How many address spaces have given their tables and frames back since the kernel started.
+pub fn spaces_freed() -> u64 {
+    SPACES_FREED.load(Ordering::Relaxed)
+}
 
 /// The page-table frames of one space.
 struct Tables {
@@ -264,5 +273,6 @@ impl Drop for UserSpace {
         for frame in self.tables.frames.drain(..) {
             let _ = memory::free_frame(frame);
         }
+        SPACES_FREED.fetch_add(1, Ordering::Relaxed);
     }
 }

@@ -1796,7 +1796,8 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
 /// The proofs of process and thread objects (ADR-0005 P3, P9, P11; `ipc_proof::prove_objects`).
 fn object_markers(far: &str) -> Vec<String> {
     let mut markers = vec![
-        "origin-kernel: ipc: object types: a process is no channel -> WRONG_TYPE, a thread is no channel -> WRONG_TYPE, the type comes before the rights -> WRONG_TYPE, a live process -> TIMED_OUT, raises nothing -> 0x0, a live thread -> TIMED_OUT, raises nothing either -> 0x0, waiting needs WAIT -> ACCESS_DENIED, a duplicate waits -> TIMED_OUT, and cannot duplicate -> ACCESS_DENIED, a process handle travels -> OK, the sender's is gone -> BAD_HANDLE, the received one waits -> TIMED_OUT, a thread handle closes -> OK".to_string(),
+        "origin-kernel: ipc: a process's memory goes when its last thread is reaped, with the process object still held: 0 spaces freed while a thread ran, 1 when TERMINATED was raised".to_string(),
+        "origin-kernel: ipc: object types: a process is no channel -> WRONG_TYPE, a thread is no channel -> WRONG_TYPE, the type comes before the rights -> WRONG_TYPE, a live process -> TIMED_OUT, raises nothing -> 0x0, a live thread -> TIMED_OUT, raises nothing either -> 0x0, waiting needs WAIT -> ACCESS_DENIED, a duplicate waits -> TIMED_OUT, and cannot duplicate -> ACCESS_DENIED, a process handle travels -> OK, the sender's is gone -> BAD_HANDLE, the received one waits -> TIMED_OUT, a thread handle closes -> OK".into(),
     ];
     for how in ["exits", "faults"] {
         markers.extend([

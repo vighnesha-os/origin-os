@@ -36,7 +36,7 @@ use origin_abi::{Error, OK, read_sizes, rights, signals, status_name, syscall as
 
 use origin_frame::objref::ObjectRef;
 use origin_frame::proof_programs::{self, DATA, STACK};
-use origin_frame::userspace::UserFrame;
+use origin_frame::userspace::{self, UserFrame};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex};
@@ -1285,6 +1285,10 @@ fn big_message(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let Some(process) = image.finish() else {
         return false;
     };
+    // Its memory goes with its last thread: this keeps it to be read afterwards.
+    let Some(memory) = process.memory() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -1297,7 +1301,7 @@ fn big_message(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let mut intact = ended;
     if ended {
         for k in 0..(MAX_MESSAGE_BYTES as u64 / 8) {
-            intact &= process.read_u64(BIG_IN + 8 * k) == Some(pattern(k));
+            intact &= memory.read_u64(BIG_IN + 8 * k) == Some(pattern(k));
         }
     }
     let right = ended && groups_ok && intact && process.ending() == Some(Ending::Exited(0));
@@ -1797,6 +1801,80 @@ fn thread_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_h
     done && groups_ok && process.ending() == Some(Ending::Exited(0))
 }
 
+/// The address space of a process goes when the last of its threads has been reaped, and only
+/// then, however many references to the process remain; `TERMINATED` is raised after it.
+fn memory_goes_with_the_last_thread(
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    bsp: CpuIndex,
+    tsc_hz: u64,
+) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let Some(mut image) = Image::new(LIMITS, proof_programs::script()) else {
+        return false;
+    };
+    if image.map(STACK_1, 1, Access::ReadWrite).is_none() {
+        return false;
+    }
+    let Ok((end, kept)) = ipc::create_channel(&image.process.account) else {
+        return false;
+    };
+    let Ok(held) = image.process.grant(Object::Channel(end), rights::CHANNEL) else {
+        return false;
+    };
+    // The first thread stays until the kernel drops the far end; the second exits at once.
+    let stays = alloc::vec![wait(
+        "",
+        Imm(u64::from(held)),
+        signals::PEER_CLOSED,
+        DEADLINE_INFINITE,
+        OK
+    )];
+    if image.scratch().is_none()
+        || image.script(&stays).is_none()
+        || image.write_script(SECOND_SCRIPT, &[]).is_none()
+    {
+        return false;
+    }
+    let Some(process) = image.finish() else {
+        return false;
+    };
+    let before = userspace::spaces_freed();
+    if Process::start_thread(&process, far, CODE, STACK + PAGE, SCRIPT).is_err() {
+        return false;
+    }
+    sched::yield_until(|| process.waiting.load(Ordering::Acquire) > 0, tsc_hz, 5);
+    let Ok(second) = Process::start_thread(&process, bsp, CODE, STACK_1 + PAGE, SECOND_SCRIPT)
+    else {
+        return false;
+    };
+    // The second thread ends and is reaped here while the first still runs in the space.
+    sched::yield_until(|| second.termination().raised(), tsc_hz, 5);
+    let second_ended = second.termination().raised();
+    sched::reap();
+    let while_running = userspace::spaces_freed().wrapping_sub(before);
+    let raised_early = process.termination().raised();
+    drop(kept);
+    sched::yield_until(|| process.termination().raised(), tsc_hz, 10);
+    let raised = process.termination().raised();
+    let at_terminated = userspace::spaces_freed().wrapping_sub(before);
+    let reports = process.reports();
+    let right = second_ended
+        && while_running == 0
+        && !raised_early
+        && raised
+        && at_terminated == 1
+        && reports == [OK as u64]
+        && process.memory().is_none()
+        && process.ending() == Some(Ending::Exited(0));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: a process's memory goes when its last thread is reaped, with the process object still held: {while_running} spaces freed while a thread ran, {at_terminated} when TERMINATED was raised{}",
+        if right { "" } else { ": ipc failed" }
+    );
+    right
+}
+
 /// A thread blocked on a handle to a process completes with `CANCELED` when another thread of
 /// its process closes that handle, or sends it away (ADR-0005 A2): cancellation does not
 /// depend on the object being a channel.
@@ -1891,6 +1969,8 @@ pub(crate) fn prove_objects(
 ) -> bool {
     let before = memory::stats();
     let mut ok = true;
+    // First, while no other address space is being freed: it counts them.
+    ok &= memory_goes_with_the_last_thread(com1, cpus, bsp, tsc_hz);
     ok &= object_types(com1, bsp, tsc_hz);
     ok &= process_terminated(com1, cpus, bsp, tsc_hz);
     ok &= thread_terminated(com1, cpus, bsp, tsc_hz);
