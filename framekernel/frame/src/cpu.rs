@@ -1185,6 +1185,11 @@ fn read_rflags() -> u64 {
     value
 }
 
+/// Whether this processor takes interrupts now (RFLAGS.IF).
+pub fn interrupts_enabled() -> bool {
+    read_rflags() & (1 << 9) != 0
+}
+
 /// CR2: the linear address of the last page fault.
 fn read_cr2() -> u64 {
     let value: u64;
