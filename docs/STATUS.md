@@ -103,7 +103,7 @@ ADR-0002 with B7, ADR-0003, G1 and the errata readings were decided on 2026-11-0
 
 The owner accepted ADR-0006 (OriginFS v0, as a bring-up format that never ships in an approved release), ADR-0008 (dense CPU indexes) and ADR-0010 (the early console, including boot info 0.4) on 2026-11-08.
 
-The owner accepted **ADR-0007** (DMA isolation and interrupt remapping, Intel VT-d and AMD-Vi) the same day, once AMD's manuals were confirmed byte-identical to the copies that were read. No ADR is waiting on the owner (`docs/engineering/OWNER_DECISIONS.md`).
+The owner accepted **ADR-0007** (DMA isolation and interrupt remapping, Intel VT-d and AMD-Vi) the same day, once AMD's manuals were confirmed byte-identical to the copies that were read. **ADR-0011** (the native SDK as the only way to the OS) is Proposed and waiting on the owner (`docs/engineering/OWNER_DECISIONS.md`, items 33–39). Nothing in it is built.
 
 Errata **V1–V6 and O2–O5** were decided by the owner on 2026-11-08, along with Rust host signing: `docs/spec/ONBF-errata.md`. Certificate chains are specified but wait for the SYS profile's signed time (O3). **O1** was decided the same day: a statement's `id` is printable ASCII.
 

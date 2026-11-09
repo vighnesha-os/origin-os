@@ -6,7 +6,7 @@
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
 | Answered | 2026-11-08: items 1–29. |
-| Still open | Items 30–32 below. Buying the machines ADR-0009 chose. |
+| Still open | Items 30–39 below. Buying the machines ADR-0009 chose. |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -113,5 +113,19 @@ ADR-0009 H6 asked for a console that does not depend on a 16550 at `0x3F8`. The 
 | 30 | ADR-0007 question 10: clear bus mastering on every function at enumeration (I12), bridges included, and leave an AMD IOMMU's own function alone until hardware shows what it needs? | **Accept** | §32 and §58. It is built and boot-proven, and it merged on your word. It may stop firmware-owned controllers (USB legacy, a firmware framebuffer) until drivers or exceptions exist, which hardware must settle (§74). |
 | 31 | The Loom download went beyond what you approved: 26 crate files and 3.36 MiB, against the 24 and 3.09 MiB you were told, and `memchr` and `aho-corasick` were said not to be fetched | **Accept** | §5. All are host-only and no shipping crate reaches them, and since the review they sit outside the kernel's workspace. The record should match what happened. |
 | 32 | Add CI: a GitHub workflow running `cargo xtask check` and the boot tests on every pull request? | **Yes** | §8 and §82 put CI in M0, and today every gate depends on one Mac. §80 forbids silent external costs, so it needs your word. GitHub's standard runners are free for public repositories. |
+
+## The native SDK (ADR-0011): Proposed, nothing built
+
+Every recommendation below was checked against the whole of CLAUDE.md. The sections each one touches are in the ADR's `Requires` row and in its decisions.
+
+| # | Question | Recommendation | Why |
+|---|---|---|---|
+| 33 | Command-line tools, the shell, the terminal and the recovery console are SDK clients with no private doors (N1, N2)? | **Yes** | Goes further than §48 and §70, which bind only the GUI. Removes shell injection and text-format coupling, and gives permissions and versioning one home (P3, rules 10–12). |
+| 34 | Stable promises per capability, with every module having a typed interface, rather than a stable SDK per module (N3, N4)? | **Yes** | A stable promise on every internal module freezes what must change (§7, P8) and multiplies versioned units against one release identity (§62, §63). |
+| 35 | The Framekernel's privileged crate first, with every other kernel crate `forbid(unsafe_code)` (N6, N14)? | **Yes**, and it delays M5 and M6 work | ADR-0001's security argument depends on it, and the review found it does not exist (rule 5). It is the kernel's part of your SDK direction. |
+| 36 | A small original interface language (N7)? | **Yes** | One source of truth for Rust, C, IPC, the kernel's calls and documentation (§42, §49). Adopting one would put third-party generated code in the runtime (§3, §5). |
+| 37 | Kernel-stamped caller identity on every channel message (N9, an ADR-0005 amendment)? | **Yes** | §30 and §48 require authenticated IPC, and a capability says what may be done, not who asked. |
+| 38 | Each system-call number accepted only from its own address in `origin.core` (N5)? | **Yes** | Enforces §42's private door. It is hardening, not authorization (§58). |
+| 39 | If accepted, will you amend CLAUDE.md §48 and §70 to say this? | Your text, your call | Claude has not changed the directive. |
 
 **Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.

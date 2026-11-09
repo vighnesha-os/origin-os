@@ -80,3 +80,4 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 |---|---|---|
 | — | Buy the first test machines ADR-0009 chose: #2, then #5 once its serial option is confirmed (H5) | The first physical boot (§74) |
 | — | Sheet items 30–32: ADR-0007's bus-mastering question, the Loom download's deviation, and CI (`docs/engineering/OWNER_DECISIONS.md`) | Accepting I12; an honest record; §82's M0 |
+| — | Sheet items 33–39: ADR-0011, the native SDK, Proposed | The Framekernel framework crate, the interface language, `origin.core` and every SDK domain |
