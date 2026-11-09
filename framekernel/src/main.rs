@@ -241,8 +241,15 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
             &iommu::own_functions(info.acpi_rsdp),
         );
         heap_ok = prove_heap(&mut com1);
-        if heap_ok {
-            prove_user_isolation(&mut com1);
+        if heap_ok && !prove_user_isolation(&mut com1) {
+            // Ring 3 comes next: a kernel that cannot keep itself from user pages must not
+            // run it, any more than a processor below the baseline (and `prove_user_isolation`
+            // has said why).
+            let _ = writeln!(
+                com1,
+                "origin-kernel: supervisor protection from user pages is not in force: user isolation failed"
+            );
+            halt();
         }
     }
 

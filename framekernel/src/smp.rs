@@ -161,11 +161,21 @@ struct ApStart {
     /// Settled once, by the AP's answer or refusal or by the boot processor's deadline,
     /// whichever comes first.
     handshake: Handshake,
-    /// The AP's own GDT, TSS and double-fault stack.
+    /// The AP's own GDT, TSS and interrupt stacks.
     tables: *mut CpuTables,
     /// The CPU index the AP takes; discovery assigned it the AP's APIC ID.
     index: CpuIndex,
+    /// What the AP found it lacks, set before it refuses (`Refusal` has room only for its
+    /// x2APIC), so the boot processor can name it: 0, [`LACKS_SMEP_SMAP`] or
+    /// [`LACKS_BASELINE`].
+    lacks: AtomicU64,
 }
+
+/// An AP's [`ApStart::lacks`]: no SMEP or no SMAP, which ADR-0003 requires on every CPU.
+const LACKS_SMEP_SMAP: u64 = 1;
+/// An AP's [`ApStart::lacks`]: below the x86-64-v3 baseline (CLAUDE.md §14), or without the
+/// AVX state XCR0 must hold.
+const LACKS_BASELINE: u64 = 2;
 
 /// The processors online, by CPU index, the boot processor first.
 pub(crate) struct Online {
@@ -565,6 +575,7 @@ fn start_one(
         handshake: Handshake::new(),
         tables,
         index,
+        lacks: AtomicU64::new(0),
     }));
     poke(STACK, stack_top);
     poke(ENTRY, (ap_entry as *const ()).addr() as u64);
@@ -591,7 +602,11 @@ fn start_one(
     unsafe { park(lapic, apic_id, tsc_hz) };
     Err(match outcome {
         Outcome::Abandoned => "no answer within 200 ms; parked by INIT",
-        Outcome::Refused(Refusal::NoX2Apic) => "no x2APIC; parked by INIT",
+        Outcome::Refused(Refusal::NoX2Apic) => match start.lacks.load(Ordering::Acquire) {
+            LACKS_SMEP_SMAP => "no SMEP or no SMAP; parked by INIT",
+            LACKS_BASELINE => "below the x86-64-v3 baseline; parked by INIT",
+            _ => "no x2APIC; parked by INIT",
+        },
         Outcome::Refused(Refusal::NotMine) | Outcome::Answered(_) => {
             "a different processor answered; parked by INIT"
         }
@@ -704,13 +719,28 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     // AP's alone, and so is `start.index` (the boot processor gives each index once).
     unsafe { cpu::init_ap(start.tables, start.index) };
     // SAFETY: CPL 0; the kernel has no user mappings. Every processor enforces SMEP and SMAP.
-    let _ = unsafe { cpu::enable_smep_smap() };
+    let (smep, smap) = unsafe { cpu::enable_smep_smap() };
     // SAFETY: CPL 0; the kernel's tables mark only the kernel half global.
     let _ = unsafe { crate::tlb::enable_global_pages() };
     cpu::check_pat();
+    let cpuid = cpu::gather_cpuid();
     // SAFETY: CPL 0, this AP, once, before any SIMD runs on it.
-    let _ = unsafe { cpu::enable_simd(&cpu::gather_cpuid()) };
+    let xcr0 = unsafe { cpu::enable_simd(&cpuid) };
     cpu::record_cpu_state();
+    // Every processor is held to what the boot processor is held to. One that falls short
+    // does not come online: it refuses, and the boot processor reports why and parks it.
+    let baseline =
+        framekernel::features::Features::decode(&cpuid).meets_baseline() && xcr0 & 0b111 == 0b111;
+    if !(smep && smap) || !baseline {
+        let lacks = if smep && smap {
+            LACKS_BASELINE
+        } else {
+            LACKS_SMEP_SMAP
+        };
+        start.lacks.store(lacks, Ordering::Release);
+        let _ = start.handshake.refuse(Refusal::NoX2Apic);
+        crate::halt();
+    }
     if !cpu::x2apic_supported() {
         let _ = start.handshake.refuse(Refusal::NoX2Apic);
         crate::halt();

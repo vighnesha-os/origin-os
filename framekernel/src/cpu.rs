@@ -1774,7 +1774,11 @@ pub(crate) unsafe fn fpu_restore(area: u64) {
 
 pub(crate) unsafe fn enable_smep_smap() -> (bool, bool) {
     let (smep, smap) = smep_smap_supported();
-    SMAP_ON.store(smap, Ordering::Relaxed);
+    // The boot processor's answer decides what the kernel assumes: an AP that lacks SMAP
+    // refuses to start (`smp::ap_entry`) and must not turn it off for everyone else.
+    if this_cpu() == CpuIndex::BOOT {
+        SMAP_ON.store(smap, Ordering::Relaxed);
+    }
     // UMIP (CPUID.7.0:ECX bit 2): `sidt` from ring 3 would otherwise reveal the kernel's
     // descriptor-table addresses, and with them the KASLR slide (ADR-0004 H3).
     let umip = cpuid(0)[0] >= 7 && cpuid(7)[2] & (1 << 2) != 0;
