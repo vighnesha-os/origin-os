@@ -122,11 +122,7 @@ impl Attributes {
     }
 
     const fn bits(self) -> u64 {
-        let access = match self.access {
-            Access::Read => NO_EXECUTE,
-            Access::ReadWrite => WRITABLE | NO_EXECUTE,
-            Access::ReadExecute => 0,
-        };
+        let access = access_bits(self.access);
         let user = if self.user { USER } else { 0 };
         let global = if self.global { GLOBAL } else { 0 };
         let cache = match self.cache {
@@ -134,6 +130,15 @@ impl Attributes {
             Cache::Uncached => PCD | PWT,
         };
         PRESENT | access | user | global | cache
+    }
+}
+
+/// The leaf bits a permission sets, out of [`WRITABLE`] and [`NO_EXECUTE`]: W^X lives here.
+const fn access_bits(access: Access) -> u64 {
+    match access {
+        Access::Read => NO_EXECUTE,
+        Access::ReadWrite => WRITABLE | NO_EXECUTE,
+        Access::ReadExecute => 0,
     }
 }
 
@@ -625,6 +630,35 @@ impl AddressSpace {
         let link = table | PRESENT | WRITABLE | (flags & USER);
         entry.store(link, Ordering::Release);
         Ok(())
+    }
+
+    /// Changes what the 4 KiB leaf at `virt` allows to `access`, and returns whether that
+    /// changed anything. Nothing else in the entry changes, and it is written in one atomic
+    /// step, so an accessed or dirty bit the processor sets at the same moment is kept. A page
+    /// covered by a 2 MiB leaf is refused: it would have to be split first. The caller must
+    /// invalidate the TLB on every processor that may cache the old permissions, if these
+    /// tables are live.
+    pub fn protect(
+        &mut self,
+        mem: &mut impl TableMemory,
+        virt: u64,
+        access: Access,
+    ) -> Result<bool, MapError> {
+        if !virt.is_multiple_of(PAGE) {
+            return Err(MapError::Misaligned(virt));
+        }
+        let (entry, level) = self.leaf(mem, virt).ok_or(MapError::NotMapped(virt))?;
+        if level != 0 {
+            return Err(MapError::LargePage(virt));
+        }
+        let bits = access_bits(access);
+        let mut changed = false;
+        let _ = entry.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            let next = (value & !(WRITABLE | NO_EXECUTE)) | bits;
+            changed = next != value;
+            Some(next)
+        });
+        Ok(changed)
     }
 
     /// Removes the leaf at `virt` (a 4 KiB or 2 MiB page base) and returns the physical
@@ -1170,6 +1204,75 @@ mod tests {
         b = a;
         b[200] = 1;
         assert!(!same_kernel_half(&a, &b));
+    }
+
+    #[test]
+    fn protect_changes_only_the_permissions_and_keeps_w_xor_x() {
+        let tables = arena(8);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        let (virt, phys) = (0x40_0000, 0x7000);
+        space
+            .map_user(&mut mem, virt, phys, Access::ReadWrite)
+            .unwrap();
+        // What the processor sets by itself must survive a change of permissions.
+        let table = {
+            let mut table = space.root();
+            for level in [3, 2, 1] {
+                table = slot(&mem, table, virt, level)
+                    .unwrap()
+                    .load(Ordering::Relaxed)
+                    & ADDRESS;
+            }
+            table
+        };
+        slot(&mem, table, virt, 0)
+            .unwrap()
+            .fetch_or(ACCESSED | 1 << 6, Ordering::Relaxed);
+        for (access, writable, executable) in [
+            (Access::Read, false, false),
+            (Access::ReadExecute, false, true),
+            (Access::ReadWrite, true, false),
+        ] {
+            assert_eq!(
+                space.protect(&mut mem, virt, access),
+                Ok(true),
+                "{access:?}"
+            );
+            let t = space.translate(&mem, virt).unwrap();
+            assert_eq!(
+                (t.phys, t.size, t.writable, t.executable, t.user),
+                (phys, PAGE, writable, executable, true),
+                "{access:?}"
+            );
+            let raw = raw(&mem, &space, virt, 0);
+            assert!(raw & WRITABLE == 0 || raw & NO_EXECUTE != 0, "W and X");
+            assert_eq!(raw & (ACCESSED | 1 << 6), ACCESSED | 1 << 6, "A and D kept");
+        }
+        // Asking for what is already there changes nothing: no TLB work to do.
+        assert_eq!(space.protect(&mut mem, virt, Access::ReadWrite), Ok(false));
+    }
+
+    #[test]
+    fn protect_refuses_what_it_cannot_do() {
+        let tables = arena(8);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        assert_eq!(
+            space.protect(&mut mem, 0x1000, Access::Read),
+            Err(MapError::NotMapped(0x1000))
+        );
+        assert_eq!(
+            space.protect(&mut mem, 0x1234, Access::Read),
+            Err(MapError::Misaligned(0x1234))
+        );
+        space
+            .map_large(&mut mem, LARGE_PAGE, LARGE_PAGE, kernel(Access::Read))
+            .unwrap();
+        assert_eq!(
+            space.protect(&mut mem, LARGE_PAGE, Access::ReadWrite),
+            Err(MapError::LargePage(LARGE_PAGE))
+        );
     }
 
     #[test]
