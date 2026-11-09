@@ -84,15 +84,6 @@ fn invariant_tsc() -> bool {
     cpu::cpuid(0x8000_0000)[0] >= 0x8000_0007 && cpu::cpuid(0x8000_0007)[3] & (1 << 8) != 0
 }
 
-/// The TSC rate CPUID leaf 15h enumerates, if it does.
-fn cpuid_tsc_hz() -> Option<u64> {
-    if cpu::cpuid(0)[0] < 0x15 {
-        return None;
-    }
-    let [eax, ebx, ecx, _] = cpu::cpuid(0x15);
-    clock::cpuid_tsc_hz(eax, ebx, ecx)
-}
-
 /// Whether RDTSCP exists (CPUID 8000_0001h EDX bit 27).
 fn rdtscp_supported() -> bool {
     cpu::cpuid(0x8000_0000)[0] >= 0x8000_0001 && cpu::cpuid(0x8000_0001)[3] & (1 << 27) != 0
@@ -252,11 +243,12 @@ pub(crate) fn init(com1: &mut Console, calibrated_hz: u64, rsdp: u64) -> bool {
         measure_rtc(&mut cmos, calibrated_hz, century)
     });
     let second = measured.as_ref().and_then(|m| m.second);
-    let cpuid_hz = cpuid_tsc_hz();
+    let cpuid_hz = crate::timer::cpuid_tsc_hz();
+    let calibrated_by = crate::timer::calibration_source();
     let (hz, source) = match (cpuid_hz, second.map(|s| s.ticks())) {
         (Some(c), _) if clock::rates_agree(c, calibrated_hz, 10) => (c, "CPUID 15h"),
         (_, Some(r)) if clock::rates_agree(r, calibrated_hz, 10) => (r, "one RTC second"),
-        _ => (calibrated_hz, "the PIT calibration"),
+        _ => (calibrated_hz, calibrated_by),
     };
     let Some(scale) = Scale::new(hz) else {
         let _ = writeln!(com1, "origin-kernel: clock: TSC rate 0: clock failed");
@@ -265,7 +257,7 @@ pub(crate) fn init(com1: &mut Console, calibrated_hz: u64, rsdp: u64) -> bool {
     SCALE.publish(scale);
     let _ = writeln!(
         com1,
-        "origin-kernel: clock: TSC at {} kHz, from {source}; invariant TSC {}; PIT calibration {} kHz; CPUID 15h {}",
+        "origin-kernel: clock: TSC at {} kHz, from {source}; invariant TSC {}; calibrated against {calibrated_by} at {} kHz; CPUID 15h {}",
         hz / 1000,
         invariant_tsc(),
         calibrated_hz / 1000,
@@ -279,7 +271,7 @@ pub(crate) fn init(com1: &mut Console, calibrated_hz: u64, rsdp: u64) -> bool {
             ok &= second.verdict == SecondVerdict::Confirmed;
             let _ = writeln!(
                 com1,
-                "origin-kernel: clock: one RTC second lasted {} us on the PIT-calibrated TSC (+/- {} us, over {} s){}",
+                "origin-kernel: clock: one RTC second lasted {} us on the calibrated TSC (+/- {} us, over {} s){}",
                 micros(second.ticks()),
                 micros(second.error_ticks()),
                 second.seconds,

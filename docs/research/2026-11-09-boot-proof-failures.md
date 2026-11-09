@@ -59,7 +59,14 @@ The Intel findings (C1, C2's fairness) are from runs not in this table; they are
 
 Two proofs that passed in all 59 boots are still Report in the ADR because they can fail on a machine that is merely different (the NMI stack, F1; the i8042, F2), which CI's QEMU firmware and devices cannot reveal.
 
-## 4. What the policy took from this
+## 4. What a machine with no 8254 and no 8042 showed
+
+QEMU can leave those devices out (`-machine pit=off,i8042=off`). OVMF boots such a machine, so it became a real test for F2 and F3 rather than a forced failure.
+
+- Before the fix, the kernel read `0xFF` from the absent port 61h. OUT2 read high from the first poll of every window, the calibration "succeeded" on nonsense (`APIC timer calibrated against the PIT: 0 kHz ... TSC 0 MHz (32 disturbed windows discarded)`), and `timer::init` then failed on its own check.
+- After the fix, a window whose OUT2 was never seen low is not used; with no 8254 every window is discarded, and the fallback runs: the ACPI PM timer. The result on QEMU TCG: APIC timer 62525 kHz, TSC 1000062 kHz, against one RTC second of 999937 us on that TSC (+/- 1 us), 0.006 % from 1 s. A read of the PM timer is a port read and so takes time of its own, which is why the calibration windows are bracketed the same way as the PIT's.
+
+## 5. What the policy took from this
 
 - The proofs that have failed on real processors with nothing wrong are exactly the ones that compare measured quantities or depend on platform behaviour: fairness (a ratio of loop counts), the TSC (agreement between counters), the TX ring (a race with QEMU's device thread), and the IRTE steps (a limit of QEMU under KVM). That is the shape of rule R1(b).
 - A halting proof that failed on real Intel processors in 9 of 10 boots is the strongest argument for keeping the Refuse list short and structural.

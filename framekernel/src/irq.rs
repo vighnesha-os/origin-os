@@ -18,6 +18,7 @@
 
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use framekernel::acpi::{self, IoApic, SourceOverride};
 use framekernel::apic;
@@ -28,7 +29,7 @@ use origin_sync::SpinLock;
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, rdtsc};
 use crate::iommu::{Detail, Fault, Recorded};
-use crate::outb;
+use crate::{inb, outb};
 
 /// The PIT's command port and channel-0 data port.
 const PIT_CHANNEL0: u16 = 0x40;
@@ -135,6 +136,30 @@ fn start_pit() {
     unsafe { outb(PIT_CHANNEL0, (divisor >> 8) as u8) };
 }
 
+/// Whether the PIT's channel 0 has been counting: two latched readings a millisecond apart
+/// differ. A gated 8254 takes its programming and never counts, and with no 8254 at all the
+/// ports read the same. [`start_pit`] must have run.
+fn pit_counting(tsc_hz: u64) -> bool {
+    let read = || {
+        // SAFETY: CPL 0, boot processor; the PIT's command port cannot affect memory.
+        unsafe { outb(apic::PIT_COMMAND, 0) };
+        // SAFETY: as above; the latched count's low byte, from channel 0's data port.
+        let low = unsafe { inb(PIT_CHANNEL0) };
+        // SAFETY: as above; the high byte.
+        let high = unsafe { inb(PIT_CHANNEL0) };
+        u16::from_le_bytes([low, high])
+    };
+    let first = read();
+    let start = rdtsc();
+    while rdtsc().wrapping_sub(start) < tsc_hz / 1000 {
+        core::hint::spin_loop();
+    }
+    read() != first
+}
+
+/// Whether [`prove`] found the PIT counting, for [`prove_remapped`].
+static PIT_COUNTING: AtomicBool = AtomicBool::new(false);
+
 /// Stops the PIT channel 0 (mode 0, count 0: it fires once and then idles).
 fn stop_pit() {
     // SAFETY: as for `start_pit`; the PIT command port.
@@ -238,6 +263,9 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
         core::hint::spin_loop();
     }
     let elapsed = rdtsc().wrapping_sub(start);
+    // Checked only when nothing arrived: it decides what no interrupts mean, and a healthy
+    // boot does not pay for it.
+    let counting = cpu::ioapic_irqs() - before != 0 || pit_counting(tsc_hz);
     // Mask the entry and stop the PIT: nothing schedules on this yet.
     let (masked_low, _) =
         ioapic::redirection_entry(cpu::IOAPIC_VECTOR, destination, active_low, level, true);
@@ -246,6 +274,14 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
 
     let taken = cpu::ioapic_irqs() - before;
     let micros = elapsed.saturating_mul(1_000_000) / tsc_hz.max(1);
+    PIT_COUNTING.store(counting, Ordering::Relaxed);
+    if !counting {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: I/O APIC: routing not proven: the 8254 is not counting on this machine (absent or gated), so there are no PIT interrupts to route"
+        );
+        return true;
+    }
     let ok = taken >= PROOF_TICKS;
     let _ = writeln!(
         com1,
@@ -383,6 +419,13 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
         );
         return true;
     };
+    if !PIT_COUNTING.load(Ordering::Relaxed) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: I/O APIC: remapped: not proven: the 8254 is not counting on this machine (absent or gated)"
+        );
+        return true;
+    }
     if !crate::iommu::remapping() {
         let _ = writeln!(
             com1,

@@ -270,13 +270,17 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
 
     // M2, fourth step: interrupts. The local APIC in x2APIC mode, its timer calibrated
     // against the PIT and proven by taking periodic interrupts.
-    let tsc_hz = timer::init(&mut com1);
+    let tsc_hz = timer::init(&mut com1, info.acpi_rsdp);
     record_or_stop(&mut com1, &mut proofs, Proof::ApicTimer, tsc_hz.is_some());
     if let Some(hz) = tsc_hz {
         if let Some(q) = quiesced.as_mut() {
             proofs.record(Proof::BusMastersSettled, pcie::settle(&mut com1, q, hz));
         }
-        proofs.record(Proof::NmiStack, prove_nmi_ist(&mut com1));
+        let nmi = prove_nmi_ist(&mut com1, hz);
+        proofs.record(Proof::NmiDelivery, nmi.delivered);
+        if nmi.delivered {
+            record_or_stop(&mut com1, &mut proofs, Proof::NmiStack, nmi.on_own_stack);
+        }
         // The clocks: the monotonic clock's TSC rate, proven against the RTC, and the wall
         // clock from the RTC (CLAUDE.md §68).
         proofs.record(Proof::Clocks, time::init(&mut com1, hz, info.acpi_rsdp));
@@ -386,7 +390,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // host-proven one, bit for bit.
     proofs.record(Proof::Raster, prove_raster(&mut com1));
     // M10 groundwork: the i8042 PS/2 controller bring-up (CLAUDE.md §56).
-    proofs.record(Proof::I8042, i8042::init(&mut com1));
+    proofs.record(Proof::I8042, i8042::init(&mut com1, info.acpi_rsdp));
     // Networking groundwork: build and parse an ICMP echo through a loopback (CLAUDE.md §54).
     proofs.record(Proof::Net, prove_net(&mut com1));
     // TCP: a full connection over an in-memory loopback (CLAUDE.md §54).
@@ -1488,28 +1492,58 @@ fn prove_heap(com1: &mut Console) -> bool {
     true
 }
 
-/// Sends this processor an NMI (x2APIC ICR, NMI delivery, "self" shorthand) and checks
-/// that it was taken on the dedicated NMI stack (IST2), not on the interrupted stack.
-fn prove_nmi_ist(com1: &mut Console) -> bool {
+/// What sending this processor an NMI found.
+struct NmiProof {
+    /// One arrived within the budget.
+    delivered: bool,
+    /// It ran on the dedicated NMI stack (IST2), not on the interrupted stack.
+    on_own_stack: bool,
+}
+
+/// The ICR value for an NMI, by destination and without a shorthand: Intel's table of valid
+/// ICR combinations marks the Self shorthand with NMI delivery invalid (ADR-0013 F1).
+const ICR_NMI: u32 = 0x4400;
+
+/// Sends this processor an NMI and checks where it was taken. An NMI that does not arrive
+/// says nothing about the stack: that case, and a wrong stack, stay apart in the result.
+fn prove_nmi_ist(com1: &mut Console, tsc_hz: u64) -> NmiProof {
     let (before, _) = cpu::nmis();
     // SAFETY: CPL 0, boot processor; x2APIC mode is on (timer bring-up), so this is a no-op
     // transition yielding the handle.
     let lapic = unsafe { timer::X2Apic::enable() };
+    let own = lapic.read(timer::ApicRead::Id) as u32;
     // SAFETY: an NMI to this processor runs the NMI handler, which only records it.
-    unsafe { lapic.send_ipi(0, (1 << 18) | 0x400) };
+    unsafe { lapic.send_ipi(own, ICR_NMI) };
     let start = cpu::rdtsc();
-    while cpu::nmis().0 == before && cpu::rdtsc().wrapping_sub(start) < 100_000_000 {
+    while cpu::nmis().0 == before && cpu::rdtsc().wrapping_sub(start) < tsc_hz {
         core::hint::spin_loop();
     }
     let (count, frame) = cpu::nmis();
+    if count == before {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: NMI: none arrived within a second of sending one: NMI stack failed"
+        );
+        return NmiProof {
+            delivered: false,
+            on_own_stack: false,
+        };
+    }
     let (low, high) = cpu::bsp_nmi_stack();
-    let on_ist = count > before && (low..high).contains(&frame);
+    let on_own_stack = (low..high).contains(&frame);
     let _ = writeln!(
         com1,
         "origin-kernel: NMI taken on its own stack (IST2): frame at {frame:#x}, stack {low:#x}..{high:#x}{}",
-        if on_ist { "" } else { ": NMI stack failed" }
+        if on_own_stack {
+            ""
+        } else {
+            ": NMI stack failed"
+        }
     );
-    on_ist
+    NmiProof {
+        delivered: true,
+        on_own_stack,
+    }
 }
 
 /// Where the SMEP/SMAP probe maps its temporary user page: the top of the lower half.

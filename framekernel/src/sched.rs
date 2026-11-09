@@ -715,7 +715,10 @@ pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
     }
 }
 
-/// Iterations each worker thread has made, indexed by worker.
+/// The time each worker has seen itself run, in TSC ticks, indexed by worker: every step of
+/// the TSC shorter than [`RUNNING_STEP`], like [`weighted_worker`]. Time, not iterations: on a
+/// processor sharing a physical core, or an emulated one, how many iterations a slice holds
+/// varies with what else is running, whatever the scheduler did.
 static PROGRESS: [AtomicU64; 2 * MAX_CPUS] = [const { AtomicU64::new(0) }; 2 * MAX_CPUS];
 /// The CPU index each worker last ran on, plus one (0: never ran).
 static RAN_ON: [AtomicU64; 2 * MAX_CPUS] = [const { AtomicU64::new(0) }; 2 * MAX_CPUS];
@@ -724,13 +727,20 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// Workers that have stopped and exited.
 static EXITED: AtomicU64 = AtomicU64::new(0);
 
-/// A worker that never yields: it counts until [`STOP`], so it only ever gives up its
-/// processor when the timer preempts it.
+/// A worker that never yields: until [`STOP`] it adds up the time it sees itself run, so it
+/// only ever gives up its processor when the timer preempts it.
 extern "sysv64" fn worker(slot: u64) -> ! {
     let slot = slot as usize;
+    let limit = RUNNING_STEP.load(Ordering::Relaxed);
+    let mut last = rdtsc();
     while !STOP.load(Ordering::Relaxed) {
+        let now = rdtsc();
+        let step = now.wrapping_sub(last);
+        last = now;
         if let (Some(p), Some(r)) = (PROGRESS.get(slot), RAN_ON.get(slot)) {
-            p.fetch_add(1, Ordering::Relaxed);
+            if step < limit {
+                p.fetch_add(step, Ordering::Relaxed);
+            }
             r.store(this_cpu() as u64 + 1, Ordering::Relaxed);
         }
         core::hint::spin_loop();
@@ -1218,6 +1228,10 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         init_cpu_fpu(id);
     }
     let heap_before = crate::memory::stats().map(|(h, _)| h.bytes_in_use);
+    RUNNING_STEP.store(
+        (tsc_hz / 1_000_000).max(1) * RUNNING_STEP_MICROS,
+        Ordering::Relaxed,
+    );
     for (i, &id) in cpus.iter().enumerate() {
         for k in 0..2 {
             if spawn(id, worker, (2 * i + k) as u64).is_err() {

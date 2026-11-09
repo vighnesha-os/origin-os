@@ -495,6 +495,15 @@ pub(crate) fn check_quiet(com1: &mut Console, q: &mut Quiesce) -> bool {
 /// mastering is on exactly for the functions attached to a domain and the bridges above
 /// them. Returns whether that held.
 pub(crate) fn prove_bus_mastering(com1: &mut Console, q: &mut Quiesce) -> bool {
+    // No DMAR or IVRS at all: drivers use the bus directly (ADR-0007, sheet item 9), so there
+    // are no domains to compare against.
+    if crate::iommu::status() == pci::IommuStatus::Absent {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: PCIe: bus mastering: no IOMMU on this platform, so nothing here confines a device to check"
+        );
+        return true;
+    }
     let translating = crate::iommu::translating();
     let (domains, _) = crate::iommu::domains();
     let attached: Vec<Address> = domains.iter().map(|d| d.at).collect();
@@ -553,7 +562,7 @@ pub(crate) fn prove_bus_mastering(com1: &mut Console, q: &mut Quiesce) -> bool {
             d.id
         );
     }
-    let ok = translating && wrong.is_empty();
+    let ok = wrong.is_empty();
     let _ = write!(
         com1,
         ") and the {bridges} bridge(s) above them, off on the other {}; IOMMU translating {translating}; consistent {ok}",

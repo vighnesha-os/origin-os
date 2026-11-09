@@ -32,9 +32,13 @@ commands:
               off must refuse an unsigned image, a wrong key, a tampered statement, a bad
               signature and tampered content, each with its own message
   boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
-              one after another, then boot-x2apic, boot-bridge and boot-console
+              one after another, then boot-x2apic, boot-bridge, boot-legacy-free and
+              boot-console
   boot-bridge boot-test with the NIC behind a PCIe root port (both IOMMUs): bus mastering is
               cleared on the bridge too and opened again above the device its driver attached
+  boot-legacy-free  the kernel boot on a machine with no 8254 and no 8042: the timers
+              calibrate against the ACPI PM timer, and the proofs that need those devices
+              say they cannot run
   boot-x2apic boot-test on a sparse topology: the boot processor at APIC ID 0 and processors
               at APIC IDs 256 and 412, above what 8-bit APIC IDs reach (the MADT lists
               150 possible processors); twice, on a CPU model with CPUID leaf 1Fh and on
@@ -65,6 +69,9 @@ environment:
                                       an intel-iommu -device value, booted with the VT-d
                                       markers (e.g. intel-iommu,intremap=off for a
                                       negative control)
+  ORIGIN_QEMU_MACHINE                 extra -machine options, e.g. pit=off,i8042=off for a
+                                      machine with no 8254 and no 8042 (the boot-legacy-free
+                                      machine)
   ORIGIN_QEMU_BRIDGE                  on: the NIC behind a PCIe root port (the boot-bridge
                                       machine)
   ORIGIN_QEMU_DEBUG                   if set, QEMU logs interrupts and resets to
@@ -174,6 +181,21 @@ struct Completed {
 /// The good path: the loader verifies and enters the kernel, and the kernel reports on
 /// COM1. The banners are built from the same generated constants as the binaries, so the
 /// test also checks that the release identity reached both.
+/// QEMU's machine option: q35, with what `ORIGIN_QEMU_MACHINE` adds (for example
+/// `pit=off,i8042=off` for a machine with no 8254 or 8042).
+fn qemu_machine_options() -> String {
+    match env::var("ORIGIN_QEMU_MACHINE") {
+        Ok(extra) if !extra.is_empty() => format!("q35,{extra}"),
+        _ => "q35".to_string(),
+    }
+}
+
+/// Whether `ORIGIN_QEMU_MACHINE` turns `device` off (`device=off`).
+fn qemu_machine_lacks(device: &str) -> bool {
+    let off = format!("{device}=off");
+    env::var("ORIGIN_QEMU_MACHINE").is_ok_and(|extra| extra.split(',').any(|o| o == off))
+}
+
 /// The QEMU CPU model: `ORIGIN_QEMU_CPU` (for example `max,-avx2` to boot a CPU below the
 /// x86-64-v3 baseline), or `max`.
 fn qemu_cpu_model() -> String {
@@ -503,7 +525,70 @@ fn boot_scenario() -> Scenario {
     if qemu_bridge() {
         bridge_markers(&mut scenario);
     }
+    if qemu_machine_lacks("pit") {
+        no_pit_markers(&mut scenario);
+    }
+    if qemu_machine_lacks("i8042") {
+        no_i8042_markers(&mut scenario);
+    }
     scenario
+}
+
+/// Replaces the required marker `old` with `new`, or records that it was not found, which
+/// fails the boot.
+fn swap_marker(scenario: &mut Scenario, old: &str, new: String) {
+    match scenario.markers.iter().position(|m| m == old) {
+        Some(i) => scenario.markers[i] = new,
+        None => scenario
+            .markers
+            .push(format!("xtask: the marker {old:?} is missing")),
+    }
+}
+
+/// A machine with no 8254 (`pit=off`, ADR-0013 F3): the kernel calibrates against the ACPI PM
+/// timer, and has no PIT interrupts to route through the I/O APIC, then or under remapping.
+fn no_pit_markers(scenario: &mut Scenario) {
+    swap_marker(
+        scenario,
+        "origin-kernel: APIC timer calibrated against the PIT: ",
+        "origin-kernel: APIC timer calibrated against the ACPI PM timer: ".into(),
+    );
+    swap_marker(
+        scenario,
+        "origin-kernel: I/O APIC: 20 PIT interrupts routed through the I/O APIC in ",
+        "origin-kernel: I/O APIC: routing not proven: the 8254 is not counting".into(),
+    );
+    let first = "origin-kernel: I/O APIC: remapped: the PIT's IRQ0 (GSI 2, edge-triggered, active-high) through IRTE ";
+    let start = scenario.markers.iter().position(|m| m == first);
+    let end = start.and_then(|s| {
+        scenario.markers[s..]
+            .iter()
+            .position(|m| m == " released: true")
+            .map(|n| s + n)
+    });
+    match (start, end) {
+        (Some(s), Some(e)) => {
+            scenario.markers.splice(
+                s..=e,
+                [
+                    "origin-kernel: I/O APIC: remapped: not proven: the 8254 is not counting"
+                        .into(),
+                ],
+            );
+        }
+        _ => scenario
+            .markers
+            .push(format!("xtask: the marker {first:?} is missing")),
+    }
+}
+
+/// A machine with no 8042 (`i8042=off`, ADR-0013 F2): the FADT says so, and that passes.
+fn no_i8042_markers(scenario: &mut Scenario) {
+    swap_marker(
+        scenario,
+        "self-test 0x55 (want 0x55), keyboard port test 0x00 (want 0x00)",
+        "origin-kernel: i8042: the FADT says this platform has none".into(),
+    );
 }
 
 /// The `boot-bridge` machine (`ORIGIN_QEMU_BRIDGE=on`): the NIC at 01:00.0 behind a PCIe root
@@ -1422,6 +1507,7 @@ fn main() -> ExitCode {
         ["boot-x2apic"] => boot_x2apic(),
         ["boot-console"] => boot_console(),
         ["boot-bridge"] => boot_bridge(),
+        ["boot-legacy-free"] => boot_legacy_free(),
         ["run"] => run(),
         ["loom"] => loom::run(),
         _ => {
@@ -1461,9 +1547,10 @@ fn boot_matrix() -> Result {
     }
     boot_x2apic()?;
     boot_bridge()?;
+    boot_legacy_free()?;
     boot_console()?;
     println!(
-        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, and the console machines)"
+        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, and the console machines)"
     );
     Ok(())
 }
@@ -1716,6 +1803,26 @@ fn boot_console() -> Result {
         chosen.len(),
         scenarios.len()
     );
+    Ok(())
+}
+
+/// Runs the kernel boot on a machine with no 8254 and no 8042 (ADR-0013 F2, F3), the
+/// legacy-free shape of the machines Origin targets.
+fn boot_legacy_free() -> Result {
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    println!("xtask: boot-legacy-free: no 8254 and no 8042");
+    let status = Command::new(&exe)
+        .arg("boot-test")
+        .env("ORIGIN_QEMU_MACHINE", "pit=off,i8042=off")
+        .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
+        .status()
+        .map_err(|e| format!("cannot run boot-test: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "boot-test with no 8254 and no 8042 failed ({status})"
+        ));
+    }
+    println!("xtask: boot-legacy-free passed (no 8254, no 8042)");
     Ok(())
 }
 
@@ -3050,7 +3157,9 @@ fn qemu_path_arg(options: &str, path: &Path) -> Result<String> {
 fn qemu_command(s: &Staged) -> Result<Command> {
     let machine = machine();
     let mut c = Command::new(QEMU);
-    c.args(["-machine", "q35", "-cpu"])
+    c.arg("-machine")
+        .arg(qemu_machine_options())
+        .arg("-cpu")
         .arg(qemu_cpu_model())
         .args(["-m", "512M", "-smp"])
         .arg(&machine.smp);
