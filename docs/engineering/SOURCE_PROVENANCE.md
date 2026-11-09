@@ -2487,3 +2487,12 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
   - **Not done:** fuzzing, Kani bounds, an independent second implementation (§13), certificate chains and release signing, EXE/LIB profiles, UNWIND/DEBUG_LINK sections.
 - **Review:** not yet independently reviewed.
 - **Licensing:** MIT OR Apache-2.0.
+
+## Pre-merge review fixes (2026-11-09)
+
+- **What:** the fixes from the review recorded in `docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md`, made on separate branches and merged in `4eaeb07` (network, firmware tables, filesystems), `643144e` (storage), `b5c89d7` (boot chain and tooling), `318f03c` (PCI, IOMMU, DMA), `1fed0a3` (Loom and dependencies), `8c433f5` (CPU, scheduler, system calls), and the commits around them up to `c465fe6`.
+- **Author / date:** Claude Code agents (local, M1 Max), 2026-11-09. Original code from the specifications those modules already cite. No third-party crate and no operating system's code was read or copied (CLAUDE.md §3).
+- **Review:** by AI agents only, two of them reading the combined fixes afterwards. Not the independent review §59 requires.
+- **Test evidence:** each fix that can be tested on the host has a test that fails with the fix reverted. Kernel-only paths were shown by temporary QEMU fault injections, which are not committed, or could not be shown; the review record and the fix commits say which. On `c465fe6`: `cargo xtask check` 968 passed, 0 failed, 6 ignored; Loom 26 models and 35 negative controls; `cargo xtask boot-matrix` a full pass.
+- **Supersedes:** where older entries in this file say the kernel links with `-znorelro`, has no `PT_GNU_RELRO`, or that Loom is a dev-dependency of `origin-sync` with its crates in the root `Cargo.lock`, those were true when written and are no longer.
+- **Licensing:** MIT OR Apache-2.0.

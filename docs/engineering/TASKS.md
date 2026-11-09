@@ -70,6 +70,8 @@
 8. **Formal and concurrency checks:** Loom models for `SpinLock`, `RwLock` and the wait-queue protocol (§73) — **done 2026-11-08** (`cargo xtask loom`, part of `check`): the real locks, the real wait-queue protocol and the real run queue, 18 models and 22 negative controls, the protocol moved out of the kernel binary into `origin_sync::wait` so it can run under Loom. What each model proves, what it leaves unproved and the approved crates are in `SOURCE_PROVENANCE.md`, "Loom models". Remaining: Kani bounds for `paging`, `frames`, `heap`.
 9. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks; **M1 follow-ups** (A/B deployment, boot-attempt recording, CI).
 
+10. **The pre-merge review's open list:** the Framekernel's trusted base, speculation controls, CET, TCP's acceptance checks, the open IOMMU threats, NVMe reset, scheduling and allocator scaling (`docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md`, "Not fixed").
+
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
@@ -77,4 +79,4 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 | # | Decision | Blocks |
 |---|---|---|
 | — | Buy the first test machines ADR-0009 chose: #2, then #5 once its serial option is confirmed (H5) | The first physical boot (§74) |
-| — | Review and merge PR #1 and the pull request stacked on it into `main` | Landing the work |
+| — | Sheet items 30–32: ADR-0007's bus-mastering question, the Loom download's deviation, and CI (`docs/engineering/OWNER_DECISIONS.md`) | Accepting I12; an honest record; §82's M0 |

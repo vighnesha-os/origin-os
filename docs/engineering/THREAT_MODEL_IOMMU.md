@@ -33,19 +33,19 @@ Status: **Proven** (boot proof and control, QEMU), **By design** (no proof), **O
 
 | # | Threat | Defence | Status |
 |---|---|---|---|
-| T1 | A device reads or writes memory it was not given | Default deny; one domain per device; only the driver's own pages are mapped | **Proven** |
-| T2 | A device keeps using a page after it is unmapped | The unmap invalidates, drains and waits before returning (I5). No driver unmaps yet, and no DMA page is ever freed | **Proven** (control C1) |
+| T1 | A device reads or writes memory it was not given | Default deny; one domain per device; only the driver's own pages are mapped. Rests on T25 | **Proven** |
+| T2 | A device keeps using a page after it is unmapped | The unmap invalidates, drains and waits before returning (I5). No driver unmaps yet, and no DMA page is ever freed, including one whose map failed | **Proven** (control C1) |
 | T3 | A device reaches the IOMMU's own tables | They are never mapped in any domain | By design |
 | T4 | **Early-boot DMA.** A device the firmware left bus-mastering writes memory before translation is on | `pcie::quiesce` clears Bus Master Enable on every function (bridges too) as soon as the kernel can reach configuration space, before the IOMMU, the timer or any other processor; the IOMMU then comes up before SMP start. Drivers set the bit again only through `DeviceDma::enable_bus_master`, after attaching. | **Partly.** Proven in QEMU for a function that honours the bit: boot proof and controls C1–C10, ledger `docs/research/2026-11-08-bus-master-quiesce.md`. Two windows remain (below) |
 | T5 | **A unit the firmware left enabled** (pre-boot DMA protection). Bring-up refuses it, which leads to T6 | None | **Open** |
-| T6 | **Fail-open.** If bring-up fails, or no DMAR/IVRS exists, DMA runs unconfined. That includes a unit with no second-stage translation (`SSTS` clear). It is reported, and the boot test fails, but a production boot has no policy (sheet item 9). On a unit with `ECAP.IRREQ`, turning remapping off also blocks every MSI | Reported only | **Open** |
+| T6 | **Fail-open.** If bring-up fails, or no DMAR/IVRS exists, DMA runs unconfined. That includes a unit with no second-stage translation (`SSTS` clear). It is reported, and the boot test fails. On a unit with `ECAP.IRREQ`, turning remapping off also blocks every MSI | A present IOMMU that fails, an unreadable DMAR or a failed quiesce refuses every driver (`DeviceDma::attach`). With no DMAR or IVRS at all, internal devices still bind (sheet item 9) | **Partly** |
 | T7 | A device claims its addresses are already translated, through ATS (Thunderclap's Linux bypass) | ATS is never enabled. VT-d context entries use translation type 0, which blocks Translated and Translation Requests (Rev 5.20 §9.3). AMD device table entries leave `I` clear, which the decoder enforces | By design |
 | T8 | **Peer-to-peer.** Traffic between devices under a shared switch never reaches the IOMMU | None: the kernel does not configure ACS. QEMU cannot show this | **Open** |
 | T9 | **Requester-ID spoofing.** Isolation assumes the source ID is genuine | None: needs ACS source validation. QEMU cannot show this | **Open** |
 | T10 | A device behind a PCIe-to-PCI bridge carries a different source ID | VT-d: not handled, so its DMA faults (fails closed). AMD-Vi: the IVRS alias is used | Partly |
 | T11 | A device overwrites a page it only needed to read | None: every mapping is read/write (I4) | **Open** |
 | T12 | A device reaches kernel data that shares a page with its buffer (compare Markuze et al., ASPLOS 2016) | `DeviceDma::page` allocates whole pages. But `iommu::map` is crate-visible, so kernel code could misuse it | By design |
-| T13 | A device changes shared memory after the driver checked it | Drivers validate what a device supplies, and hostile-ring tests exercise it. Most kernel-side refusals are host-tested only | Partly |
+| T13 | A device changes shared memory after the driver checked it | Drivers validate what a device supplies, and hostile-ring tests exercise it. Virtio rings are read with volatile accesses and received frames are copied once before parsing. Most kernel-side refusals are host-tested only | Partly |
 | T14 | Firmware requires a device to reach reserved memory (RMRR, IVMD) | The device is refused at attach (fails closed). Costs availability. One consequence to expect on real machines: an integrated GPU scans out the firmware framebuffer through this path, so the framebuffer console (ADR-0010) goes dark when translation comes up, until identity maps exist | By design |
 | T15 | IOVAs run out: 1 GiB per device, and they are not reused | None. No driver maps per request yet | **Open** |
 
@@ -66,7 +66,8 @@ Status: **Proven** (boot proof and control, QEMU), **By design** (no proof), **O
 | T21 | A malformed DMAR or IVRS | Validated whole before use; mutation soaks | **Proven** (host) |
 | T22 | Firmware over-reports capabilities | AMD-Vi requires both the register and the IVRS to agree. VT-d trusts `CAP` | Partly |
 | T23 | **An attack goes unnoticed.** Faults are blocked and recorded, but `take_faults` is only called by the boot proofs, so a runtime fault is never read or logged (§69) | None | **Open** |
-| T24 | A stuck unit stalls the kernel | Each invalidation waits at most 100 ms with interrupts off, then fails. A failed unmap never hands the page back, so it cannot be reused | Partly |
+| T24 | A stuck unit stalls the kernel | Each invalidation waits at most 100 ms with interrupts off, then fails. A failed unmap never hands the page back, so it cannot be reused. An NVMe poll no longer holds the driver lock with interrupts off | Partly |
+| T25 | A device reports BAR values that aim the kernel's own register writes at RAM, at ECAM or at an IOMMU's registers | A memory BAR is used only if non-zero, naturally aligned, at most 1 GiB and clear of RAM, of the platform's reserved ranges and of other BARs; `map_mmio` refuses RAM. A BAR moved after sizing is not noticed | **Proven** (host controls and one boot control) |
 
 ### T4 in detail: what remains
 

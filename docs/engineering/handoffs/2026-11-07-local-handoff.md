@@ -1440,3 +1440,23 @@ On `claude/unruffled-morse-eade76`, based on `claude/interesting-carson-ae7c83` 
 
 - A timed waiter that finds its queue full, the one path not modelled; Kani bounds (TASKS item 8).
 - M4's `wake_all` will conflict with the moved protocol; a note for that session is in the shared notes folder.
+
+### Continued (2026-11-09, ~03:50–06:30 IST): the pre-merge review, and landing on `main`
+
+The owner: "You review and merge them, review extremely very good design, security, performance", with the question of whether everything, even the kernel, should be native SDK. Claude took "them" to mean everything then waiting on review or merge: PR #1, PR #2, and the three side branches (early-boot DMA, M4's first slice, the Loom models). M4 was also what fixed the review's first critical finding.
+
+**The record is `docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md`:** what was found, what was fixed, what was not and why, and what no reviewer opened. AI reviewers only: no human has reviewed this code.
+
+**Result, on `c465fe6`:** `cargo xtask check` 968 passed, 0 failed, 6 ignored, with 26 Loom models and 35 negative controls; `cargo xtask boot-matrix` a full pass on its first attempt at load 1.9–11.7 (mean 2.9), now including `boot-bridge` and `boot-console`. Ping-pongs 5 to 35 µs, down from 41 to 56 µs, after interrupts stopped forcing a context switch. Under QEMU only.
+
+#### What to know
+
+- **The kernel no longer writes to a disk it does not recognise.** Boot write proofs need the boot test's disk.
+- **The first physical boot needs the review's open list**, above all the IOMMU threats ADR-0009 H6 names.
+- The fix branches (`fix/*`) and the agents' worktrees can be deleted: everything is merged.
+
+#### Open for the owner
+
+- Sheet items 30–32: the bus-mastering question, the Loom download's deviation, CI.
+- Whether to write the SDK-first decision as an ADR.
+- Buying the machines ADR-0009 chose.
