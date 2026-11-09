@@ -2430,6 +2430,7 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
     - `check` also covers the Framekernel (host and kernel-target clippy, tests, release build), the developer-mode and test-trust-store loaders, and `onbf-pack` (clippy and tests).
     - *Since 2026-11-08 (the early console, ADR-0010):* `boot-test`'s kernel scenario keeps its serial and monitor multiplexed on stdio, takes a screen dump when the kernel halts and checks it cell by cell against the rows the serial log implies (`screen`, computed independently of the kernel's drawing code); `boot-console` boots eight machines for the console (a UART named by an SPCR, COM1 named, a refused table, a dead port, registers in RAM, a UART that takes no bytes, no display, no UART at all), and `boot-matrix` runs it last.
     - *Since 2026-11-08 (signature verification, `boot/uefi/`, "Step 3"):* `boot-test` derives two test keys, signs the kernel with both, and runs 11 scenarios, each naming the loader build it boots (`Loader::Developer`, or `Loader::Verifying` with developer mode off). `ORIGIN_BOOT_TEST_ONLY` selects scenarios by label. `check` also runs `onbf-sign`'s clippy and tests, fails if the loader or the kernel can reach `onbf-sign` (CLAUDE.md §59, over every target and feature), and counts the conditional branches of `ed25519::sign` in its release assembly on the build host (only the three loop counters).
+    - *Since 2026-11-09 (CI, sheet item 32):* `ORIGIN_QEMU_ACCEL=kvm` runs any boot on the host's real processor through KVM. Every marker and failure message stays in force except for what `kvm_markers` and `kvm_forgives` name. The two steps of the VT-d pin proof that QEMU cannot show with KVM get markers saying what it does show. `kvm_forgives` lets through only those two lines and three lines that assume a software CPU's timing: a rare step back in the TSC of under 1,000 ticks, a TX ring that never filled with everything else right, and two workers within a factor of four when both ran for enough rounds. The boot then does not wait for what those lines leave out. Unit tests use lines from real runs, including the variants that must still fail. `-cpu max` under KVM takes the host's vendor, which decides the topology leaf the sparse machine reports (`guest_is_intel`).
   - `run`.
 
   It is not part of the shipping OS.
@@ -2441,6 +2442,16 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
     - a timeout below the boot time fails with exit 1 and QEMU is killed;
     - missing firmware is reported by path;
     - an unknown command exits 2.
+- **Licensing:** MIT OR Apache-2.0.
+
+## `.github/` (CI)
+
+- **What:** `workflows/ci.yml` and three scripts in `ci/`, run on every pull request and on pushes to `main`: `cargo xtask check`, `boot-matrix` on QEMU's software CPU, and `boot-matrix` plus one `-cpu host` boot on a real processor through KVM. `workflows/processor-sweep.yml` runs weekly: up to 64 short jobs, one at a time, of which each job on a processor the sweep has not booted on yet runs those boots and any other stops in seconds. Not part of the shipping OS.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-09. Original. The owner's decision: sheet item 32.
+- **External inputs:** `actions/checkout`, `actions/upload-artifact` and `actions/download-artifact` pinned by commit; QEMU 11.1.3's release tarball, pinned by the SHA-256 that Homebrew's formula records for the same URL; Rust by `rust-toolchain.toml`, through rustup; Ubuntu's build packages (CLAUDE.md §4). No secrets, and the token only reads.
+- **Test evidence:** Actions run 42555218264, on the first commit. `check` passed (under 6 minutes, EPYC 7763). `boot-matrix` passed on the software CPU (24 minutes, EPYC 9V74). On a real CPU, `boot-matrix` and the `-cpu host` boot passed on an EPYC 7763 (30 minutes), and an EPYC 9V45 stopped at one TSC step back, in 1 of its 13 kernel boots. Actions run 42568129521, on the final code, landed on two Intel runners: 21 of 21 boots passed on a Xeon 8370C and 21 of 21 on a Xeon 6973P-C.
+- **What it found:** on Intel Xeons under KVM (8370C, 8573C, 6973P-C), the first supervisor fetch from a just-mapped user page faulted as not present, #PF error 0x10, in 9 of 10 boots, and every later access gave the right answer: the tables were right and the first use came too soon. `vm::map_user` now ends with INVLPG, a serializing instruction. On the same machines afterwards the proof saw 0x11 on the first fetch in every boot.
+- **What it does not show:** physical hardware support (CLAUDE.md §74, rule 30). The devices and firmware are QEMU's, and a job cannot choose its processor.
 - **Licensing:** MIT OR Apache-2.0.
 
 ## `developer-tools/onbf-sign/` (`onbf-sign`), Ed25519 and ML-DSA-87 signing for the build host

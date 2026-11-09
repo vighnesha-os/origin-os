@@ -106,6 +106,7 @@ pub(crate) fn map_firmware(addr: u64, len: u64) -> Result<u64, MapError> {
 
 /// Maps the 4 KiB page `virt` to `phys` as a **user** page with `access`: only for probes
 /// that prove supervisor protections (SMEP, SMAP); the kernel has no user mappings otherwise.
+/// Once this returns, what this processor does next sees the new entries.
 pub(crate) fn map_user(virt: u64, phys: u64, access: Access) -> Result<(), MapError> {
     crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
@@ -117,7 +118,14 @@ pub(crate) fn map_user(virt: u64, phys: u64, access: Access) -> Result<(), MapEr
             cache: framekernel::paging::Cache::WriteBack,
         };
         k.space.map(&mut k.tables, virt, phys, attributes)
-    })
+    })?;
+    // A fetch from the page straight after mapping it found it not present on Intel Xeons
+    // under KVM (#PF error 0x10, and the right 0x11 on every later try), in 9 of 10 boots.
+    // INVLPG is a serializing instruction (Intel SDM Vol. 3A, "Serializing Instructions"):
+    // the entries are in memory before anything after it runs, and no older view of this
+    // address survives it.
+    crate::cpu::invlpg(virt);
+    Ok(())
 }
 
 /// Removes the leaf at `virt`; once this returns, no processor's TLB holds it.
