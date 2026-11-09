@@ -8,12 +8,26 @@
 //! instruction. Dropping a space frees its tables and frames, but only if no processor
 //! still has it loaded (`tlb::root_loaded`): a safe caller that drops one too early leaks the
 //! memory instead of leaving a processor running on freed page tables.
+//!
+//! # A space that changes while it runs
+//!
+//! Every operation takes `&self`: the space's own threads may be running on other processors.
+//!
+//! - `state` holds the page tables and the records of what is mapped. It is taken briefly, with
+//!   interrupts off, and never held across a TLB shootdown, so that it stays safe to spin on.
+//! - `editor` makes changes to the space one at a time: taken around every change and held for
+//!   as long as the TLBs need to catch up with it. Whoever waits for it serves shootdown requests
+//!   in its loop, so waiting for it can never hold up the shootdown its holder is waiting for.
+//!
+//! The page-table memory of a space is freed only with the space, and no page is freed while
+//! `state` could still lead to it, so a walk of the tables never reaches freed memory.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use origin_abi::Error;
 use origin_paging::{Access, AddressSpace, MapError, PAGE, Table, TableMemory, Translation};
+use origin_sync::{SpinGuard, SpinLock};
 
 use crate::addr::PhysAddr;
 use crate::memory::{self, OwnedFrame};
@@ -61,46 +75,140 @@ impl TableMemory for Tables {
     }
 }
 
-/// A user page frame this space owns, named by its physical address.
+/// A user page frame this space maps, named by where it is mapped and what it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UserFrame(PhysAddr);
+pub struct UserFrame {
+    virt: u64,
+    phys: PhysAddr,
+}
 
 impl UserFrame {
     /// The frame's physical address, for reports.
     pub const fn phys(self) -> PhysAddr {
-        self.0
+        self.phys
+    }
+}
+
+/// One mapped page, and the frame it maps.
+#[derive(Debug)]
+struct Mapping {
+    virt: u64,
+    frame: OwnedFrame,
+}
+
+/// What `state` holds.
+struct State {
+    space: AddressSpace,
+    tables: Tables,
+    /// What this space maps, by ascending address: each entry is a present user leaf, and each
+    /// present user leaf has an entry.
+    mapped: Vec<Mapping>,
+}
+
+impl State {
+    /// A new, empty space with the kernel half `half`, or `None` without memory.
+    fn new(half: &[u64; 256]) -> Option<Self> {
+        let mut tables = Tables { frames: Vec::new() };
+        let mut space = AddressSpace::new(&mut tables).ok()?;
+        space.set_upper_half(&tables, half).ok()?;
+        Some(Self {
+            space,
+            tables,
+            mapped: Vec::new(),
+        })
+    }
+
+    /// Where `virt`'s entry is, or would go, in `mapped`.
+    fn position(&self, virt: u64) -> usize {
+        self.mapped.partition_point(|m| m.virt < virt)
+    }
+
+    /// The record of the page at `virt`.
+    fn mapping(&self, virt: u64) -> Option<&Mapping> {
+        self.mapped
+            .get(self.position(virt))
+            .filter(|m| m.virt == virt)
+    }
+
+    /// Maps the user page `virt` to `frame` with `access`, or gives the frame back with the
+    /// reason. Nothing changes on failure.
+    fn map(
+        &mut self,
+        virt: u64,
+        frame: OwnedFrame,
+        access: Access,
+    ) -> Result<(), (MapError, OwnedFrame)> {
+        if self.mapped.try_reserve(1).is_err() {
+            return Err((MapError::OutOfMemory, frame));
+        }
+        let at = self.position(virt);
+        if let Err(e) = self
+            .space
+            .map_user(&mut self.tables, virt, frame.phys().raw(), access)
+        {
+            return Err((e, frame));
+        }
+        self.mapped.insert(at, Mapping { virt, frame });
+        Ok(())
     }
 }
 
 /// One user address space: its own lower half and the kernel's half.
 pub struct UserSpace {
-    space: AddressSpace,
-    tables: Tables,
-    /// The user frames this space maps, freed with it.
-    pages: Vec<OwnedFrame>,
+    /// The PML4's physical address, which never changes.
+    root: u64,
+    /// Changes to the space go one at a time: see the module documentation.
+    editor: SpinLock<()>,
+    state: SpinLock<State>,
 }
 
 impl core::fmt::Debug for UserSpace {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UserSpace")
-            .field("root", &self.space.root())
+            .field("root", &self.root)
             .finish_non_exhaustive()
     }
+}
+
+/// A fresh zeroed frame, or `None`.
+fn zeroed_frame() -> Option<OwnedFrame> {
+    let frame = memory::allocate_frame()?;
+    let p = core::ptr::with_exposed_provenance_mut::<u8>(frame.virt());
+    // SAFETY: the allocator just handed out this frame, which only this function holds; the
+    // direct map makes it writable at `p`, and it spans `PAGE` bytes.
+    unsafe { p.write_bytes(0, PAGE as usize) };
+    Some(frame)
 }
 
 impl UserSpace {
     /// A new, empty space with the kernel's half mapped, or `None` without memory.
     pub fn new() -> Option<Self> {
-        let mut tables = Tables { frames: Vec::new() };
-        let mut space = AddressSpace::new(&mut tables).ok()?;
-        space
-            .set_upper_half(&tables, crate::vm::kernel_half()?)
-            .ok()?;
+        Self::from_state(State::new(crate::vm::kernel_half()?)?)
+    }
+
+    /// A space around tables that have just been built.
+    fn from_state(state: State) -> Option<Self> {
         Some(Self {
-            space,
-            tables,
-            pages: Vec::new(),
+            root: state.space.root(),
+            editor: SpinLock::new(()),
+            state: SpinLock::new(state),
         })
+    }
+
+    /// Runs `f` on this space's tables and records, with interrupts off.
+    fn with_state<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
+        crate::cpu::without_interrupts(|| f(&mut self.state.lock()))
+    }
+
+    /// Takes this space's turn to change, serving TLB requests meanwhile (module documentation).
+    fn edit(&self) -> SpinGuard<'_, ()> {
+        loop {
+            if let Some(turn) = self.editor.try_lock() {
+                return turn;
+            }
+            crate::tlb::service();
+            core::hint::spin_loop();
+        }
     }
 
     /// As [`new`](Self::new), with the top-level entry of the kernel probe page's slot empty:
@@ -109,23 +217,16 @@ impl UserSpace {
     /// is harmless: nothing but a `KernelProbe` is ever mapped in that slot, so all the code,
     /// stacks and data the kernel touches stay mapped.
     pub fn without_probe_slot() -> Option<Self> {
-        let mut tables = Tables { frames: Vec::new() };
-        let mut space = AddressSpace::new(&mut tables).ok()?;
         let mut half = *crate::vm::kernel_half()?;
         *half.get_mut(crate::vm::PROBE_SLOT)? = 0;
-        space.set_upper_half(&tables, &half).ok()?;
-        Some(Self {
-            space,
-            tables,
-            pages: Vec::new(),
-        })
+        Self::from_state(State::new(&half)?)
     }
 
     /// Whether this space's PML4 entries 256–511 are the ones the kernel fixed at boot
     /// (ADR-0004 H2).
     #[must_use]
     pub fn shares_kernel_half(&self) -> bool {
-        let own = self.space.upper_half(&self.tables);
+        let own = self.with_state(|s| s.space.upper_half(&s.tables));
         match (own, crate::vm::kernel_half()) {
             (Some(own), Some(fixed)) => origin_paging::same_kernel_half(&own, fixed),
             _ => false,
@@ -135,7 +236,7 @@ impl UserSpace {
     /// The physical address of this space's top-level table (the value for CR3), for reports
     /// and proofs; the scheduler loads the space through [`activate`](Self::activate).
     pub const fn root(&self) -> u64 {
-        self.space.root()
+        self.root
     }
 
     /// Makes this space the current one on the calling processor. Safe: the space is complete
@@ -143,73 +244,69 @@ impl UserSpace {
     /// borrow; the scheduler holds a reference per thread that runs in it, and a dropped
     /// space's memory is not freed while a processor still has it loaded.
     pub fn activate(&self) {
-        let root = self.space.root();
-        if crate::cpu::read_cr3() != root {
+        if crate::cpu::read_cr3() != self.root {
             // SAFETY: `root` is the PML4 of this complete address space, whose kernel half is the
             // kernel's (built by `new`), so the code, stacks and data running now stay mapped.
-            unsafe { crate::cpu::write_cr3(root) };
+            unsafe { crate::cpu::write_cr3(self.root) };
         }
     }
 
-    /// The frame mapped at user address `virt` in this space, if any.
+    /// The frame mapped at the user page holding `virt` in this space, if any.
     pub fn frame_of(&self, virt: u64) -> Option<UserFrame> {
-        let leaf = self.translate(virt)?;
-        let page = leaf.phys & !(PAGE - 1);
-        self.pages
-            .iter()
-            .find(|f| f.phys().raw() == page)
-            .map(|f| UserFrame(f.phys()))
+        let page = virt & !(PAGE - 1);
+        self.with_state(|s| {
+            s.mapping(page).map(|m| UserFrame {
+                virt: page,
+                phys: m.frame.phys(),
+            })
+        })
     }
 
     /// Maps the user page `virt` to a fresh zeroed frame this space owns, with `access`. Only
-    /// inside the user half. `&mut self`: nothing runs in the space while it changes (a
-    /// process's creator holds it uniquely before any thread starts).
-    pub fn map_page(&mut self, virt: u64, access: Access) -> Result<UserFrame, MapError> {
+    /// inside the user half.
+    pub fn map_page(&self, virt: u64, access: Access) -> Result<UserFrame, MapError> {
         if !usercopy::is_user_address(virt) || usercopy::USER_END - virt < PAGE {
             return Err(MapError::NonCanonical(virt));
         }
-        self.pages
-            .try_reserve(1)
-            .map_err(|_| MapError::OutOfMemory)?;
-        let frame = memory::allocate_frame().ok_or(MapError::OutOfMemory)?;
-        let p = core::ptr::with_exposed_provenance_mut::<u8>(frame.virt());
-        // SAFETY: the allocator just handed out this frame, which only this space now owns;
-        // the direct map makes it writable at `p`, and it spans `PAGE` bytes.
-        unsafe { p.write_bytes(0, PAGE as usize) };
+        let frame = zeroed_frame().ok_or(MapError::OutOfMemory)?;
         let phys = frame.phys();
-        if let Err(e) = self
-            .space
-            .map_user(&mut self.tables, virt, phys.raw(), access)
-        {
-            let _ = memory::free_frame(frame);
-            return Err(e);
+        let _turn = self.edit();
+        match self.with_state(|s| s.map(virt, frame, access)) {
+            Ok(()) => Ok(UserFrame { virt, phys }),
+            Err((e, frame)) => {
+                let _ = memory::free_frame(frame);
+                Err(e)
+            }
         }
-        self.pages.push(frame);
-        Ok(UserFrame(phys))
     }
 
     /// Copies `bytes` into the frame `frame` of this space, at `offset`, with volatile
-    /// writes. `false` if `frame` is not one of its frames or the range is not inside it.
+    /// writes. `false` if `frame` is no longer mapped there or the range is not inside it.
     pub fn write_frame(&self, frame: UserFrame, offset: usize, bytes: &[u8]) -> bool {
-        let Some(owned) = self.pages.iter().find(|f| f.phys() == frame.0) else {
-            return false;
-        };
         if offset
             .checked_add(bytes.len())
             .is_none_or(|end| end > PAGE as usize)
         {
             return false;
         }
-        let p = core::ptr::with_exposed_provenance_mut::<u8>(owned.virt());
-        for (i, &byte) in bytes.iter().enumerate() {
-            let at = p.wrapping_add(offset + i);
-            // SAFETY: `frame` is one of this space's frames (found above, so owned and live
-            // while `self` is borrowed), writable through the direct map, and `offset + i` is
-            // inside the page (checked). A volatile byte store: the frame may be mapped into
-            // ring 3, so a racing user access touches only user memory, never a Rust object.
-            unsafe { at.write_volatile(byte) };
-        }
-        true
+        self.with_state(|s| {
+            let Some(mapping) = s
+                .mapping(frame.virt)
+                .filter(|m| m.frame.phys() == frame.phys)
+            else {
+                return false;
+            };
+            let p = core::ptr::with_exposed_provenance_mut::<u8>(mapping.frame.virt());
+            for (i, &byte) in bytes.iter().enumerate() {
+                let at = p.wrapping_add(offset + i);
+                // SAFETY: the frame is one this space maps (found above) and `state` is held,
+                // so it stays allocated; the direct map makes it writable, and `offset + i` is
+                // inside the page (checked). A volatile byte store: the frame may be mapped
+                // into ring 3, so a racing user access touches only user memory.
+                unsafe { at.write_volatile(byte) };
+            }
+            true
+        })
     }
 
     /// The little-endian `u64` at `virt` in this space, read once (`None` unless `virt` is
@@ -218,23 +315,26 @@ impl UserSpace {
         if !virt.is_multiple_of(8) {
             return None;
         }
-        let leaf = self.translate(virt)?;
-        let p = core::ptr::with_exposed_provenance::<u64>(crate::phys::to_virt(leaf.phys) as usize);
-        // SAFETY: `translate` found the page mapped in this space, so its frame belongs to this
-        // space and stays allocated while `self` is borrowed; the frame offset of `virt` is
-        // 8-aligned and inside the page. A volatile read of plain data; a user thread may be
-        // writing the word, so no reference is formed and the value is not trusted.
-        Some(unsafe { p.read_volatile() })
+        self.with_state(|s| {
+            let leaf = s.space.translate(&s.tables, virt)?;
+            let p =
+                core::ptr::with_exposed_provenance::<u64>(crate::phys::to_virt(leaf.phys) as usize);
+            // SAFETY: `translate` found the page mapped in this space and `state` is held, so
+            // nothing can unmap and free its frame during the read; the offset of `virt` is
+            // 8-aligned and inside the page. A volatile read of plain data; a user thread may
+            // be writing the word, so no reference is formed and the value is not trusted.
+            Some(unsafe { p.read_volatile() })
+        })
     }
 
     /// How this space's tables translate the user address `virt`.
     pub fn translate(&self, virt: u64) -> Option<Translation> {
-        self.space.translate(&self.tables, virt)
+        self.with_state(|s| s.space.translate(&s.tables, virt))
     }
 
     /// Whether this space is the one loaded on the calling processor (its CR3 holds this root).
     fn loaded_here(&self) -> bool {
-        crate::cpu::read_cr3() == self.space.root()
+        crate::cpu::read_cr3() == self.root
     }
 
     /// Copies into `dst` from the user range `[src, src + dst.len())` of this space, checked
@@ -291,16 +391,17 @@ impl UserSpace {
 
 impl Drop for UserSpace {
     fn drop(&mut self) {
+        let mut state = self.state.lock();
         // Leak (not free) a space a processor still has loaded (see the module docs).
-        if crate::tlb::root_loaded(self.space.root()) {
-            core::mem::forget(core::mem::take(&mut self.pages));
-            core::mem::forget(core::mem::take(&mut self.tables.frames));
+        if crate::tlb::root_loaded(self.root) {
+            core::mem::forget(core::mem::take(&mut state.mapped));
+            core::mem::forget(core::mem::take(&mut state.tables.frames));
             return;
         }
-        for frame in self.pages.drain(..) {
-            let _ = memory::free_frame(frame);
+        for mapping in state.mapped.drain(..) {
+            let _ = memory::free_frame(mapping.frame);
         }
-        for frame in self.tables.frames.drain(..) {
+        for frame in state.tables.frames.drain(..) {
             let _ = memory::free_frame(frame);
         }
         SPACES_FREED.fetch_add(1, Ordering::Relaxed);
