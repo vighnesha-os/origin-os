@@ -5,7 +5,7 @@
 | As of | 2026-11-09, on `main`, after the pre-merge review. Everything that was on a side branch is merged. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38. |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38 and 40–51. |
 | Still open | Items 30, 31 and 39 below. Buying the machines ADR-0009 chose. |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -127,5 +127,24 @@ Every recommendation below was checked against the whole of CLAUDE.md. The secti
 | 37, answered | Kernel-stamped caller identity on every channel message (N9, an ADR-0005 amendment)? | **Yes** | §30 and §48 require authenticated IPC, and a capability says what may be done, not who asked. |
 | 38, answered | Each system-call number accepted only from its own address in `origin.core` (N5)? | **Yes** | Enforces §42's private door. It is hardening, not authorization (§58). |
 | 39 | If accepted, will you amend CLAUDE.md §48 and §70 to say this? | Your text, your call | Claude has not changed the directive. |
+
+## The interface language (OIDL): accepted 2026-11-09, as recommended
+
+The specification is `docs/spec/OIDL.md`, accepted by the owner on 2026-11-09. The generator and the first definition exist and are host-tested; the kernel does not use the output yet. Each question is answered there, in §19, with its reasoning and the sections of CLAUDE.md it was checked against. Summary:
+
+| # | Question | Recommendation |
+|---|---|---|
+| 40 (Q1), answered | Accept wire format revision 1 as specified (§7)? | **Accept** |
+| 41 (Q2), answered | Handles in the body as a slot equal to the handle's position? | **Accept** |
+| 42 (Q3), answered | A hello on every connection, negotiating the minor (§7.7)? | **Accept** |
+| 43 (Q4), answered | Exact size at the negotiated minor, refusing unknown trailing bytes? | **Exact** |
+| 44 (Q5), answered | A library whose version is already in `origin-version.toml` names that key? | **Accept** |
+| 45 (Q6), answered | A named `capability` per library and `requires` mandatory on every method? | **Accept** |
+| 46 (Q7), answered | A method's errors frozen for the whole major? | **Accept** |
+| 47 (Q8), answered | Have `channel_read` report each handle's type and rights, with ADR-0005 B1? | **Accept, with B1** |
+| 48 (Q9), answered | A `string` is valid UTF-8 with no NUL? | **Accept** |
+| 49 (Q10), answered | C symbols are `<library>_<method>`, with no special case for the kernel? | **Accept** |
+| 50 (Q11), answered | Keep `event_create` and `object_signal` as `@reserved`? | **Keep them** |
+| 51 (Q12), answered | A type from another library is read with all its members known, because only the interface's own library is negotiated? | **Accept** |
 
 **Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.
