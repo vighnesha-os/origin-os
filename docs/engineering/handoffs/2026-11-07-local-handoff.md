@@ -1486,12 +1486,13 @@ The next work, in ADR-0011 N14's order, starts with the Framekernel framework cr
 
 The owner decided sheet item 32: yes, with the boots on a real processor. `.github/workflows/ci.yml` runs on every pull request and on `main`: `cargo xtask check`, `boot-matrix` on QEMU's software CPU, and `boot-matrix` plus a `-cpu host` boot through KVM on two runner images. Only GitHub's free standard runners; no secrets; the token only reads.
 
-Under KVM xtask holds every proof to its markers, not only the last line, with two exceptions, both in `kvm_forgives`: the two VT-d pin steps QEMU cannot show there, and a rare step back in the TSC of under 1,000 ticks.
+Under KVM xtask holds every proof to its markers, not only the last line. The exceptions are all in `kvm_markers` and `kvm_forgives`: the two VT-d pin steps QEMU cannot show there, a rare step back in the TSC of under 1,000 ticks, a TX ring that never filled, and two workers within a factor of four. TCG still holds all of these as written.
 
 #### What to know
 
 - **`cargo xtask check` passes on an x86-64 Linux host,** the first time it has run on anything but the Mac. That includes the signing check's branch counts, which the review had left unconfirmed there.
-- **A real finding:** an EPYC 9V45 runner showed one TSC step back of 16 ticks in 261,083 handoffs, in 1 of 13 kernel boots. The processors are virtual processors of a virtual machine. The kernel's proof stays strict, and `time::monotonic_nanos` is not clamped, so a step like that can reach a caller on another processor.
+- **The first runs on Intel found a real problem.** On Xeons 8370C, 8573C and 6973P-C under KVM, the first supervisor fetch from a just-mapped user page faulted as not present (#PF error 0x10), in 9 of 10 boots, where every later access gave the right 0x11. `vm::map_user` now ends with INVLPG, and the proof saw 0x11 first time in every boot after that. The cause is not proven: the fix also serializes and invalidates, so it does not tell which of those mattered, and it was seen only under nested KVM. The architecture says a change from not present to present needs no invalidation. Nothing else in the kernel fetches from a page straight after mapping it today.
+- **A real finding on AMD:** an EPYC 9V45 runner showed one TSC step back of 16 ticks in 261,083 handoffs, in 1 of 13 kernel boots. The processors are virtual processors of a virtual machine. The kernel's proof stays strict, and `time::monotonic_nanos` is not clamped, so a step like that can reach a caller on another processor.
 - `-cpu max,vendor=GenuineIntel` works under KVM on an AMD host: the leaf 1Fh markers hold there.
 
 #### Open for the owner

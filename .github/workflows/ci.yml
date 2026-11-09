@@ -54,8 +54,9 @@ jobs:
       - run: cargo xtask boot-matrix
 
   # The same boots on a real processor through KVM. Two runner images, because that is the only
-  # say a job has in which processor it gets. xtask holds every proof to its markers except the
-  # two steps QEMU cannot show with KVM (kvm_pin_markers), which the job above proves.
+  # say a job has in which processor it gets. xtask holds every proof to its markers, except the
+  # few that QEMU cannot show with KVM or that assume a software CPU's timing (kvm_markers and
+  # kvm_forgives). The job above holds those too.
   boot-real-cpu:
     name: boots on a real CPU (${{ matrix.runner }})
     strategy:
