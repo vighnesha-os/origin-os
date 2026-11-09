@@ -6,7 +6,7 @@
 | Requires | CLAUDE.md P1, P2, P3, P8; §3, §5, §7, §13, §22, §30, §42, §44, §45, §47–§50, §53, §58, §62, §63, §66, §70, §72; final rules 5, 10, 11, 12, 20, 21, 36 |
 | Evidence | `docs/research/2026-11-09-native-sdk.md`; `docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md` |
 | Builds on | ADR-0001 (framekernel argument R1, user-mode drivers D2, default 10); ADR-0003 K1; ADR-0005 (P1, P4, P6, P8, P12, A6); ONBF §6.1 |
-| Would change | ADR-0003 K1 (the safe-library, unsafe-binary split), ADR-0005 (Amendment 2: caller identity and per-call pinning), `origin-abi`'s layout. CLAUDE.md §48 and §70, if the owner edits them (question 7) |
+| Would change | ADR-0003 K1 (the safe-library, unsafe-binary split), ADR-0005 (Amendment 2: caller identity and per-call pinning), `origin-abi`'s layout. CLAUDE.md §48 and §70, amended to match in revision 7.2 (question 7) |
 
 ## Context
 
@@ -178,4 +178,4 @@ The OIDL grammar, the Driver ABI, the graphics path, any POSIX layer, how `std` 
 4. A small original interface language rather than adopting one (N7)? **Yes (2026-11-09).**
 5. Kernel-stamped caller identity on every channel message, as an amendment to ADR-0005 (N9)? **Yes (2026-11-09).**
 6. Each system-call number accepted only from its own address in `origin.core` (N5)? **Yes (2026-11-09).**
-7. If accepted, will you amend CLAUDE.md §48 and §70 to say this? They are your text, so Claude has not changed them. **Yes (2026-11-09; decision sheet item 39): Claude drafts the wording and the owner approves it before it goes in. Until then the directive is unchanged.**
+7. If accepted, will you amend CLAUDE.md §48 and §70 to say this? They are your text, so Claude has not changed them. **Yes (2026-11-09; decision sheet item 39): Claude drafts the wording and the owner approves it before it goes in. The owner approved it the same day: CLAUDE.md revision 7.2.**

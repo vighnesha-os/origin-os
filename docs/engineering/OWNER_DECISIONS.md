@@ -6,7 +6,7 @@
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
 | Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. |
-| Still open | No item. The wording of the CLAUDE.md amendment item 39 asks for awaits the owner's approval. Buying machines is off for now (ADR-0009's update of 2026-11-09). |
+| Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -128,7 +128,7 @@ Every recommendation below was checked against the whole of CLAUDE.md. The secti
 | 36, answered | A small original interface language (N7)? | **Yes** | One source of truth for Rust, C, IPC, the kernel's calls and documentation (§42, §49). Adopting one would put third-party generated code in the runtime (§3, §5). |
 | 37, answered | Kernel-stamped caller identity on every channel message (N9, an ADR-0005 amendment)? | **Yes** | §30 and §48 require authenticated IPC, and a capability says what may be done, not who asked. |
 | 38, answered | Each system-call number accepted only from its own address in `origin.core` (N5)? | **Yes** | Enforces §42's private door. It is hardening, not authorization (§58). |
-| 39, answered | If accepted, will you amend CLAUDE.md §48 and §70 to say this? | **Yes, with Claude drafting the wording and the owner approving it before it goes in (2026-11-09)** | The directive is the owner's text: nothing in it changes until the owner approves the exact wording. |
+| 39, answered | If accepted, will you amend CLAUDE.md §48 and §70 to say this? | **Yes, with Claude drafting the wording and the owner approving it before it goes in (2026-11-09)** | The owner approved the wording the same day; it is CLAUDE.md revision 7.2, and 7.1 is kept at `docs/engineering/CLAUDE-v7.1.md`. |
 
 ## The interface language (OIDL): accepted 2026-11-09, as recommended
 
