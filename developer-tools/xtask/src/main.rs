@@ -11,6 +11,7 @@ mod loom;
 mod screen;
 mod serial;
 
+use std::borrow::Cow;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -67,6 +68,9 @@ environment:
                                       negative control)
   ORIGIN_QEMU_BRIDGE                  on: the NIC behind a PCIe root port (the boot-bridge
                                       machine)
+  ORIGIN_QEMU_ACCEL                   tcg (default) or kvm: run on a real x86-64 processor (needs
+                                      an x86-64 host with /dev/kvm); the devices and firmware
+                                      stay QEMU's
   ORIGIN_QEMU_DEBUG                   if set, QEMU logs interrupts and resets to
                                       target/xtask/qemu-debug.log";
 
@@ -238,6 +242,7 @@ fn parse_iommu(value: Option<&str>) -> Iommu {
 /// IOMMU: a raw `-device` value is booted with the VT-d markers, so it must be an
 /// `intel-iommu`.
 fn check_environment() -> Result {
+    Accel::from_env()?;
     check_iommu(&qemu_iommu())
 }
 
@@ -265,6 +270,67 @@ fn qemu_cpus() -> u32 {
         .and_then(|v| v.parse().ok())
         .filter(|n| (1..=64).contains(n))
         .unwrap_or(2)
+}
+
+/// How QEMU runs the guest's instructions (`ORIGIN_QEMU_ACCEL`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Accel {
+    /// QEMU's software CPU: the default, and all an Apple Silicon host has.
+    Tcg,
+    /// The host's real x86-64 processor, through KVM. The devices and the firmware stay QEMU's.
+    Kvm,
+}
+
+impl Accel {
+    /// The accelerator a value of `ORIGIN_QEMU_ACCEL` names: unset, empty or `tcg` is TCG.
+    fn named(value: Option<&str>) -> Result<Accel> {
+        match value.filter(|v| !v.is_empty()) {
+            None | Some("tcg") => Ok(Accel::Tcg),
+            Some("kvm") => Ok(Accel::Kvm),
+            Some(other) => Err(format!(
+                "ORIGIN_QEMU_ACCEL must be tcg or kvm, not {other:?}"
+            )),
+        }
+    }
+
+    fn from_env() -> Result<Accel> {
+        Accel::named(env::var("ORIGIN_QEMU_ACCEL").ok().as_deref())
+    }
+
+    /// The `-machine` value. Interrupt remapping needs the I/O APIC in QEMU, not in the host
+    /// kernel, hence the split irqchip.
+    fn machine(self) -> &'static str {
+        match self {
+            Accel::Tcg => "q35",
+            Accel::Kvm => "q35,accel=kvm,kernel-irqchip=split",
+        }
+    }
+
+    /// The complete lines of a boot that failure messages are looked for in: under KVM,
+    /// without the two lines [`kvm_cannot_pass`] describes.
+    fn judged(self, complete: &str) -> Cow<'_, str> {
+        match self {
+            Accel::Tcg => Cow::Borrowed(complete),
+            Accel::Kvm => Cow::Owned(
+                complete
+                    .lines()
+                    .filter(|l| !kvm_cannot_pass(l))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        }
+    }
+
+    /// The failure messages a screen is searched for. A screen wraps long lines, so under KVM
+    /// the two lines [`kvm_cannot_pass`] describes cannot be told from the rest there, and the
+    /// screen-only boot leaves that one message to the boots with a serial port.
+    fn screen_failures(self, failures: &[&'static str]) -> Vec<&'static str> {
+        failures
+            .iter()
+            .copied()
+            .filter(|f| self == Accel::Tcg || *f != IOAPIC_FAILED)
+            .collect()
+    }
 }
 
 /// The processors QEMU presents, and what the kernel must find.
@@ -499,11 +565,62 @@ fn boot_scenario() -> Scenario {
     }
     if qemu_iommu() == Iommu::Amd {
         amd_iommu_markers(&mut scenario, &machine);
+    } else if Accel::from_env() == Ok(Accel::Kvm) {
+        kvm_pin_markers(&mut scenario);
     }
     if qemu_bridge() {
         bridge_markers(&mut scenario);
     }
     scenario
+}
+
+/// What the VT-d pin proof can show under KVM. Its last two steps take a remapped pin's IRTE
+/// away and then make it check the wrong source ID, and expect the interrupts to stop. With
+/// KVM's split irqchip QEMU keeps the route it already has when the IRTE goes away, so they
+/// keep arriving, no fault is recorded and the kernel rightly reports a failure. TCG proves
+/// those two steps; here the rest of each line must still hold, the restored IRTE carrying
+/// interrupts again. Every other marker and failure message stays in force.
+fn kvm_pin_markers(scenario: &mut Scenario) {
+    let first = " not present: 0 interrupts arrived in 100 ms; fault recorded: source ID 0xffff, interrupt index ";
+    let after = "origin-kernel: I/O APIC: remapped: the entry masked, the PIT stopped and IRTE ";
+    let start = scenario.markers.iter().position(|m| m == first);
+    let end = start.and_then(|s| {
+        scenario.markers[s..]
+            .iter()
+            .position(|m| m == after)
+            .map(|n| s + n)
+    });
+    match (start, end) {
+        (Some(s), Some(e)) => {
+            let restored = "; fault recorded: none; IRTE restored, ";
+            let failed = " again: true; consistent false: I/O APIC failed";
+            scenario.markers.splice(
+                s..e,
+                [
+                    " not present: ",
+                    restored,
+                    failed,
+                    "origin-kernel: I/O APIC: IRTE ",
+                    " checking source ID 0xff01 instead of 0xff00: ",
+                    restored,
+                    failed,
+                ]
+                .map(String::from),
+            );
+        }
+        _ => scenario
+            .markers
+            .push(format!("xtask: the VT-d marker {first:?} is missing")),
+    }
+}
+
+/// True for the two lines of [`kvm_pin_markers`], exactly as KVM leaves them: no fault was
+/// recorded and the interrupts came back. Any other shape is a failure like any other.
+fn kvm_cannot_pass(line: &str) -> bool {
+    line.starts_with("origin-kernel: I/O APIC: IRTE ")
+        && (line.contains(" not present: ") || line.contains(" checking source ID "))
+        && line.contains("; fault recorded: none; IRTE restored, ")
+        && line.ends_with(" again: true; consistent false: I/O APIC failed")
 }
 
 /// The `boot-bridge` machine (`ORIGIN_QEMU_BRIDGE=on`): the NIC at 01:00.0 behind a PCIe root
@@ -1168,7 +1285,7 @@ fn boot_failures() -> Vec<&'static str> {
         ": process isolation failed",
         ": clock failed",
         ": HPET failed",
-        ": I/O APIC failed",
+        IOAPIC_FAILED,
         ": PM timer failed",
         ": ipc failed",
         ": console failed",
@@ -1202,6 +1319,9 @@ const NO_SPCR: &str =
     "no usable ACPI SPCR table (table not listed in the XSDT); the UART stays at I/O port 0x3f8";
 /// Every scenario here boots the whole kernel, so it ends with this line.
 const HALT_LINE: &str = "origin-kernel: M1 entry complete; halting";
+
+/// How every I/O APIC proof ends a line that failed.
+const IOAPIC_FAILED: &str = ": I/O APIC failed";
 
 /// The screen after a whole boot: exactly what the serial log says it must show (the
 /// console writes one line at a time to both).
@@ -3041,7 +3161,9 @@ fn qemu_path_arg(options: &str, path: &Path) -> Result<String> {
 fn qemu_command(s: &Staged) -> Result<Command> {
     let machine = machine();
     let mut c = Command::new(QEMU);
-    c.args(["-machine", "q35", "-cpu"])
+    c.arg("-machine")
+        .arg(Accel::from_env()?.machine())
+        .arg("-cpu")
         .arg(qemu_cpu_model())
         .args(["-m", "512M", "-smp"])
         .arg(&machine.smp);
@@ -3259,6 +3381,7 @@ fn select_scenarios<'a>(
 fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
     let staged = stage(kernel, scenario.loader)?;
     let timeout = boot_test_timeout()?;
+    let accel = Accel::from_env()?;
     let work = target_dir().join("xtask");
     let mut cmd = qemu_command(&staged)?;
     if let Some(args) = scenario.qemu_args {
@@ -3332,7 +3455,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
             monitor,
             &screen_path,
             &markers,
-            &scenario.failures,
+            &accel.screen_failures(&scenario.failures),
             deadline,
         )
     } else {
@@ -3346,7 +3469,8 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
                     let complete = text
                         .get(..text.rfind('\n').map_or(0, |i| i + 1))
                         .unwrap_or("");
-                    if let Some(m) = scenario.failures.iter().find(|m| complete.contains(**m)) {
+                    let judged = accel.judged(complete);
+                    if let Some(m) = scenario.failures.iter().find(|m| judged.contains(**m)) {
                         break Err(format!("the serial output contains {m:?}"));
                     }
                     if serial::contains_in_order(&text, &markers) {
@@ -4010,6 +4134,104 @@ mod tests {
         );
         assert!(!plain.geometry.has_extended_levels());
         assert!(sparse.geometry.has_extended_levels());
+    }
+
+    #[test]
+    fn the_accelerator_is_tcg_unless_kvm_is_asked_for() {
+        assert_eq!(Accel::named(None), Ok(Accel::Tcg));
+        assert_eq!(Accel::named(Some("")), Ok(Accel::Tcg));
+        assert_eq!(Accel::named(Some("tcg")), Ok(Accel::Tcg));
+        assert_eq!(Accel::named(Some("kvm")), Ok(Accel::Kvm));
+        assert!(Accel::named(Some("hvf")).is_err());
+        assert_eq!(Accel::Tcg.machine(), "q35");
+        assert_eq!(Accel::Kvm.machine(), "q35,accel=kvm,kernel-irqchip=split");
+    }
+
+    /// As the kernel printed them on a real AMD EPYC (Actions run 42547942738).
+    const KVM_NOT_PRESENT: &str = "origin-kernel: I/O APIC: IRTE 5 not present: 10 interrupts arrived in 100 ms; fault recorded: none; IRTE restored, 5 interrupts arrived on CPU 1 (APIC ID 1) again: true; consistent false: I/O APIC failed";
+    const KVM_WRONG_SOURCE: &str = "origin-kernel: I/O APIC: IRTE 5 checking source ID 0xff01 instead of 0xff00: 10 interrupts arrived in 100 ms; fault recorded: none; IRTE restored, 5 interrupts arrived on CPU 1 (APIC ID 1) again: true; consistent false: I/O APIC failed";
+
+    #[test]
+    fn kvm_forgives_only_the_two_lines_qemu_cannot_pass() {
+        assert!(kvm_cannot_pass(KVM_NOT_PRESENT));
+        assert!(kvm_cannot_pass(KVM_WRONG_SOURCE));
+        for line in [
+            // The interrupts did not come back.
+            KVM_NOT_PRESENT.replace("again: true", "again: false"),
+            KVM_WRONG_SOURCE.replace("again: true", "again: false"),
+            // A fault was recorded, so QEMU did act on the entry: not this limit.
+            KVM_NOT_PRESENT.replace("fault recorded: none", "fault recorded: source ID 0x0010"),
+            // Every other I/O APIC proof.
+            "origin-kernel: I/O APIC: remapped: the entry masked, the PIT stopped and IRTE 5 released: false; 0 fault(s) recorded after: I/O APIC failed".to_string(),
+            "origin-kernel: I/O APIC: remapped: 0 PIT interrupts arrived on CPU 1 (APIC ID 1) through IRTE 5 in 200 ms, 0 on other CPUs; fault recorded: none; consistent false: I/O APIC failed".to_string(),
+        ] {
+            assert!(!kvm_cannot_pass(&line), "{line}");
+        }
+    }
+
+    #[test]
+    fn only_kvm_leaves_those_lines_out_of_the_failure_search() {
+        let known = format!("a\n{KVM_NOT_PRESENT}\n{KVM_WRONG_SOURCE}\nb\n");
+        assert!(Accel::Tcg.judged(&known).contains(IOAPIC_FAILED));
+        assert!(!Accel::Kvm.judged(&known).contains(IOAPIC_FAILED));
+        let another = format!("{known}origin-kernel: I/O APIC: x{IOAPIC_FAILED}\n");
+        assert!(Accel::Kvm.judged(&another).contains(IOAPIC_FAILED));
+
+        let failures = boot_failures();
+        assert!(
+            Accel::Tcg
+                .screen_failures(&failures)
+                .contains(&IOAPIC_FAILED)
+        );
+        let on_kvm = Accel::Kvm.screen_failures(&failures);
+        assert!(!on_kvm.contains(&IOAPIC_FAILED));
+        assert_eq!(on_kvm.len(), failures.len() - 1);
+    }
+
+    /// The KVM markers replace those two steps, and only those: they match what KVM prints and
+    /// not what TCG prints, so the boot that proves the steps cannot be mistaken for this one.
+    #[test]
+    fn the_kvm_markers_replace_the_two_pin_steps() {
+        let m = machine();
+        let mut s = boot_scenario_markers(&m);
+        let (before, target) = (s.markers.clone(), m.named(m.cpus().min(2) - 1));
+        kvm_pin_markers(&mut s);
+        assert!(
+            !s.markers
+                .iter()
+                .any(|m| m.starts_with("xtask: the VT-d marker"))
+        );
+        // Six out, seven in.
+        assert_eq!(s.markers.len(), before.len() + 1);
+        let at = s
+            .markers
+            .iter()
+            .position(|m| m == " not present: ")
+            .unwrap();
+        assert_eq!(s.markers[..at], before[..at]);
+        assert_eq!(s.markers[at + 7..], before[at + 6..]);
+
+        let window: Vec<&str> = s.markers[at..at + 7].iter().map(String::as_str).collect();
+        let on_kvm = format!("{KVM_NOT_PRESENT}\n{KVM_WRONG_SOURCE}\n");
+        assert!(serial::contains_in_order(&on_kvm, &window));
+        let on_tcg = format!(
+            "origin-kernel: I/O APIC: IRTE 5 not present: 0 interrupts arrived in 100 ms; fault recorded: source ID 0xffff, interrupt index 5, reason 0x22 (interrupt table entry not present), from a message without a requester ID (the DMAR names 0xff00); IRTE restored, 5 interrupts arrived on {target} again: true; consistent true\n"
+        );
+        assert!(!serial::contains_in_order(&on_tcg, &window));
+    }
+
+    /// A marker list without the proof's lines is reported, not silently left alone.
+    #[test]
+    fn the_kvm_markers_say_so_when_the_vt_d_lines_are_gone() {
+        let m = machine();
+        let mut s = boot_scenario_markers(&m);
+        amd_iommu_markers(&mut s, &m);
+        kvm_pin_markers(&mut s);
+        assert!(
+            s.markers
+                .last()
+                .is_some_and(|m| m.starts_with("xtask: the VT-d marker"))
+        );
     }
 
     /// The table the boot proof hands QEMU means what the proof claims, by the kernel's own

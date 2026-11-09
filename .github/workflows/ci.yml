@@ -1,0 +1,89 @@
+# Continuous integration (CLAUDE.md §8 and §82; the owner's decision, item 32 of
+# docs/engineering/OWNER_DECISIONS.md): the project's gates on x86-64 Linux.
+#
+# GitHub's standard runners are free for this public repository, and this workflow uses nothing
+# else (§80). It has no secrets and only reads the repository.
+#
+# Neither kind of boot below qualifies anything (§74, rule 30): the devices and the firmware are
+# QEMU's, and the processors are whatever GitHub's fleet holds, not the declared hardware.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      # Only while this workflow is being proven, before its pull request exists.
+      - claude/interesting-carson-ae7c83
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # QEMU's software CPU on four shared processors is slower than on the development Mac, and the
+  # default suits the Mac. A boot that hangs still fails.
+  ORIGIN_BOOT_TEST_TIMEOUT: 600
+
+jobs:
+  check:
+    name: cargo xtask check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: bash .github/ci/install-rust.sh
+      - run: cargo xtask check
+
+  # The control: every proof, on QEMU's software CPU, as on the development Mac.
+  boot-software-cpu:
+    name: boots on QEMU's software CPU
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: bash .github/ci/install-rust.sh
+      - name: Build QEMU
+        run: bash .github/ci/install-qemu.sh
+      - run: cargo xtask boot-matrix
+
+  # The same boots on a real processor through KVM. Two runner images, because that is the only
+  # say a job has in which processor it gets. xtask holds every proof to its markers except the
+  # two steps QEMU cannot show with KVM (kvm_pin_markers), which the job above proves.
+  boot-real-cpu:
+    name: boots on a real CPU (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      ORIGIN_QEMU_ACCEL: kvm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: bash .github/ci/install-rust.sh
+      - name: Build QEMU
+        run: bash .github/ci/install-qemu.sh
+      - name: Let this job use KVM
+        run: bash .github/ci/enable-kvm.sh
+      - run: cargo xtask boot-matrix
+      - name: The processor as it is, nothing masked
+        if: ${{ !cancelled() }}
+        env:
+          ORIGIN_QEMU_CPU: host
+          ORIGIN_QEMU_SMP: 4
+          ORIGIN_BOOT_TEST_ONLY: kernel boot
+        run: cargo xtask boot-test
