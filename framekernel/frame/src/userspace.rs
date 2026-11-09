@@ -44,6 +44,7 @@ use origin_sync::{SpinGuard, SpinLock};
 
 use crate::addr::PhysAddr;
 use crate::memory::{self, OwnedFrame};
+use crate::objref::ObjectRef;
 use crate::usercopy::{self, UserAccess, UserRange};
 
 /// Page-table frames one space may own (enough for a few scattered megabytes).
@@ -106,11 +107,135 @@ impl UserFrame {
 /// and how many pages a shootdown covers at most.
 const CHUNK: usize = 128;
 
+/// A frame that can be mapped into several address spaces at once. Each mapping holds a
+/// reference, given up only after its own shootdown, and the frame goes back to the allocator
+/// with the last reference: so no processor can reach it by then, through any space.
+///
+/// What is in it is shared with ring 3, so it is reached only by volatile copies, never as a
+/// Rust reference.
+#[derive(Clone, Debug)]
+pub struct SharedFrame {
+    inner: ObjectRef<SharedInner>,
+}
+
+#[derive(Debug)]
+struct SharedInner {
+    phys: PhysAddr,
+    /// `Some` until it is dropped: the frame moves out to be freed.
+    frame: Option<OwnedFrame>,
+}
+
+impl Drop for SharedInner {
+    fn drop(&mut self) {
+        if let Some(frame) = self.frame.take() {
+            let _ = memory::free_frame(frame);
+        }
+    }
+}
+
+impl SharedFrame {
+    /// A fresh frame, zeroed, or `None` without memory.
+    pub fn new() -> Option<Self> {
+        Self::adopt(zeroed_frame()?)
+    }
+
+    /// The frame at `phys`, if it is free, zeroed: for a proof that needs to see one particular
+    /// frame reused. Any free frame is as good as another to the rest of the kernel.
+    pub fn claim(phys: PhysAddr) -> Option<Self> {
+        let frame = memory::claim_frame(phys)?;
+        zero_frame(&frame);
+        Self::adopt(frame)
+    }
+
+    fn adopt(frame: OwnedFrame) -> Option<Self> {
+        let phys = frame.phys();
+        // On failure the value comes back and is dropped, which frees the frame.
+        ObjectRef::try_new(SharedInner {
+            phys,
+            frame: Some(frame),
+        })
+        .ok()
+        .map(|inner| Self { inner })
+    }
+
+    /// The frame's physical address.
+    #[must_use]
+    pub fn phys(&self) -> PhysAddr {
+        self.inner.phys
+    }
+
+    /// Writes `value` at `offset`, once, as a volatile store. `false` unless that is an
+    /// 8-aligned offset inside the frame.
+    #[must_use]
+    pub fn write_u64(&self, offset: usize, value: u64) -> bool {
+        let Some(p) = self.word(offset) else {
+            return false;
+        };
+        // SAFETY: `word` checked the offset, and this reference keeps the frame allocated. A
+        // volatile store: the frame may be mapped into ring 3, so a racing access touches only
+        // user memory.
+        unsafe { p.write_volatile(value) };
+        true
+    }
+
+    /// The word at `offset`, read once, as a volatile load. `None` unless that is an
+    /// 8-aligned offset inside the frame.
+    #[must_use]
+    pub fn read_u64(&self, offset: usize) -> Option<u64> {
+        let p = self.word(offset)?;
+        // SAFETY: as in `write_u64`; the value is plain data and is not trusted.
+        Some(unsafe { p.read_volatile() })
+    }
+
+    /// Where the kernel reaches the word at `offset`, if that is an 8-aligned offset inside
+    /// the frame.
+    fn word(&self, offset: usize) -> Option<*mut u64> {
+        let inside = offset
+            .checked_add(8)
+            .is_some_and(|end| end <= PAGE as usize);
+        if !inside || !offset.is_multiple_of(8) {
+            return None;
+        }
+        let base = direct_map(self.phys());
+        Some(base.wrapping_add(offset).cast())
+    }
+}
+
+/// What a mapping owns of the frame it maps.
+#[derive(Debug)]
+enum Frame {
+    /// A frame only this space has: freed when it is unmapped.
+    Private(OwnedFrame),
+    /// A reference to a frame other spaces may map too.
+    Shared(SharedFrame),
+}
+
+impl Frame {
+    /// The frame's physical address.
+    fn phys(&self) -> PhysAddr {
+        match self {
+            Self::Private(frame) => frame.phys(),
+            Self::Shared(frame) => frame.phys(),
+        }
+    }
+
+    /// Gives up this mapping's hold on the frame: only with no processor able to reach it
+    /// through this mapping.
+    fn release(self) {
+        match self {
+            Self::Private(frame) => {
+                let _ = memory::free_frame(frame);
+            }
+            Self::Shared(frame) => drop(frame),
+        }
+    }
+}
+
 /// One mapped page, and the frame it maps.
 #[derive(Debug)]
 struct Mapping {
     virt: u64,
-    frame: OwnedFrame,
+    frame: Frame,
 }
 
 /// What a change to a space cost, for whoever pays for it (N14 step 3, S3-5b): each shootdown
@@ -197,12 +322,7 @@ impl State {
 
     /// Maps the user page `virt` to `frame` with `access`, or gives the frame back with the
     /// reason. Nothing changes on failure.
-    fn map(
-        &mut self,
-        virt: u64,
-        frame: OwnedFrame,
-        access: Access,
-    ) -> Result<(), (MapError, OwnedFrame)> {
+    fn map(&mut self, virt: u64, frame: Frame, access: Access) -> Result<(), (MapError, Frame)> {
         let needed = self.mapped.len() + 1;
         if self.mapped.try_reserve(1).is_err() || self.spare.try_reserve(needed).is_err() {
             return Err((MapError::OutOfMemory, frame));
@@ -330,13 +450,23 @@ fn user_range_end(virt: u64, pages: u64) -> Result<u64, MapError> {
         .ok_or(MapError::Overflow)
 }
 
+/// Where the kernel reaches the frame at `phys`: its address in the direct map.
+fn direct_map(phys: PhysAddr) -> *mut u8 {
+    core::ptr::with_exposed_provenance_mut(crate::phys::to_virt(phys.raw()) as usize)
+}
+
+/// Zeroes a frame nothing else holds.
+fn zero_frame(frame: &OwnedFrame) {
+    let p = direct_map(frame.phys());
+    // SAFETY: an `OwnedFrame` has one owner, the caller, which has mapped it nowhere yet; the
+    // direct map makes it writable at `p`, and it spans `PAGE` bytes.
+    unsafe { p.write_bytes(0, PAGE as usize) };
+}
+
 /// A fresh zeroed frame, or `None`.
 fn zeroed_frame() -> Option<OwnedFrame> {
     let frame = memory::allocate_frame()?;
-    let p = core::ptr::with_exposed_provenance_mut::<u8>(frame.virt());
-    // SAFETY: the allocator just handed out this frame, which only this function holds; the
-    // direct map makes it writable at `p`, and it spans `PAGE` bytes.
-    unsafe { p.write_bytes(0, PAGE as usize) };
+    zero_frame(&frame);
     Some(frame)
 }
 
@@ -415,10 +545,8 @@ impl UserSpace {
     pub fn frame_of(&self, virt: u64) -> Option<UserFrame> {
         let page = virt & !(PAGE - 1);
         self.with_state(|s| {
-            s.mapping(page).map(|m| UserFrame {
-                virt: page,
-                phys: m.frame.phys(),
-            })
+            let phys = s.mapping(page)?.frame.phys();
+            Some(UserFrame { virt: page, phys })
         })
     }
 
@@ -431,13 +559,34 @@ impl UserSpace {
         let frame = zeroed_frame().ok_or(MapError::OutOfMemory)?;
         let phys = frame.phys();
         let _turn = self.edit();
-        match self.with_state(|s| s.map(virt, frame, access)) {
+        match self.with_state(|s| s.map(virt, Frame::Private(frame), access)) {
             Ok(()) => Ok(UserFrame { virt, phys }),
             Err((e, frame)) => {
-                let _ = memory::free_frame(frame);
+                frame.release();
                 Err(e)
             }
         }
+    }
+
+    /// Maps the user page `virt` to `frame`, with `access`, as this space's own mapping of a
+    /// frame others may map too. Only inside the user half. Needs no shootdown: a translation
+    /// that was not present is in no TLB.
+    pub fn map_shared(
+        &self,
+        virt: u64,
+        frame: &SharedFrame,
+        access: Access,
+    ) -> Result<(), MapError> {
+        if !usercopy::is_user_address(virt) || usercopy::USER_END - virt < PAGE {
+            return Err(MapError::NonCanonical(virt));
+        }
+        let frame = Frame::Shared(frame.clone());
+        let _turn = self.edit();
+        self.with_state(|s| s.map(virt, frame, access))
+            .map_err(|(e, frame)| {
+                frame.release();
+                e
+            })
     }
 
     /// Removes every mapping in the `pages` pages from `virt`, and gives back their frames.
@@ -462,7 +611,7 @@ impl UserSpace {
             let done =
                 crate::tlb::retire_in_space(self.root, request, mappings, |mut mappings| {
                     for mapping in mappings.drain(..) {
-                        let _ = memory::free_frame(mapping.frame);
+                        mapping.frame.release();
                     }
                     self.with_state(|s| s.spare = mappings);
                 })?;
@@ -506,13 +655,13 @@ impl UserSpace {
             return false;
         }
         self.with_state(|s| {
-            let Some(mapping) = s
-                .mapping(frame.virt)
-                .filter(|m| m.frame.phys() == frame.phys)
-            else {
+            let Some(mapping) = s.mapping(frame.virt) else {
                 return false;
             };
-            let p = core::ptr::with_exposed_provenance_mut::<u8>(mapping.frame.virt());
+            if mapping.frame.phys() != frame.phys {
+                return false;
+            }
+            let p = direct_map(frame.phys);
             for (i, &byte) in bytes.iter().enumerate() {
                 let at = p.wrapping_add(offset + i);
                 // SAFETY: the frame is one this space maps (found above) and `state` is held,
@@ -615,7 +764,7 @@ impl Drop for UserSpace {
             return;
         }
         for mapping in state.mapped.drain(..) {
-            let _ = memory::free_frame(mapping.frame);
+            mapping.frame.release();
         }
         for frame in state.tables.frames.drain(..) {
             let _ = memory::free_frame(frame);
