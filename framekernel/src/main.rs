@@ -275,8 +275,8 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         // clock from the RTC (CLAUDE.md §68).
         time::init(&mut com1, hz, info.acpi_rsdp);
         // I/O APIC interrupt routing, proven by routing the PIT's IRQ0 (CLAUDE.md §24).
-        // SAFETY: the BSP's APIC is in x2APIC mode (timer::init) and the PICs are masked.
-        let bsp = unsafe { timer::X2Apic::enable() }.read(timer::ApicRead::Id) as u32;
+        let bsp =
+            timer::X2Apic::this_cpu().map_or(u32::MAX, |l| l.read(timer::ApicRead::Id) as u32);
         irq::prove(&mut com1, info.acpi_rsdp, bsp, hz);
     }
 
@@ -304,9 +304,13 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         let online = smp::start(&mut com1, &info, regions, tsc_hz);
         // M2 completion: once every enabled processor has left firmware code, the loader's
         // and the firmware's boot-time memory belongs to the kernel.
-        if online.complete()
-            && let Some((added, free)) = memory::reclaim_loader_memory()
-        {
+        // SAFETY: the kernel's own tables replaced the firmware's long ago (`init_paging`), and
+        // every enabled processor has left firmware code: `online.complete` says so.
+        let reclaimed = online
+            .complete()
+            .then(|| unsafe { memory::reclaim_loader_memory() })
+            .flatten();
+        if let Some((added, free)) = reclaimed {
             let _ = writeln!(
                 com1,
                 "origin-kernel: reclaimed {} MiB of loader and boot-services memory; {} MiB free",
@@ -1200,7 +1204,9 @@ fn init_paging(
     // Toggling CR4.PGE also drops every translation cached under the loader's tables.
     let global = unsafe { tlb::enable_global_pages() };
     let used = tables.used();
-    vm::install(space, tables, regions);
+    // SAFETY: once, here, with the tables `load_page_tables` just loaded: they map everything
+    // running now, and from here on every mapping goes through them.
+    unsafe { vm::install(space, tables, regions) };
     let _ = writeln!(
         com1,
         "origin-kernel: page tables loaded: {} tables, {} MiB direct map, {} image pages, {} 4 KiB and {} 2 MiB leaves; global pages {global}",
@@ -1437,11 +1443,7 @@ fn prove_heap(com1: &mut Console) -> bool {
 /// that it was taken on the dedicated NMI stack (IST2), not on the interrupted stack.
 fn prove_nmi_ist(com1: &mut Console) -> bool {
     let (before, _) = cpu::nmis();
-    // SAFETY: CPL 0, boot processor; x2APIC mode is on (timer bring-up), so this is a no-op
-    // transition yielding the handle.
-    let lapic = unsafe { timer::X2Apic::enable() };
-    // SAFETY: an NMI to this processor runs the NMI handler, which only records it.
-    unsafe { lapic.send_ipi(0, (1 << 18) | 0x400) };
+    timer::send_nmi_to_self();
     let start = cpu::rdtsc();
     while cpu::nmis().0 == before && cpu::rdtsc().wrapping_sub(start) < 100_000_000 {
         core::hint::spin_loop();

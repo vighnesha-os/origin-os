@@ -9,9 +9,15 @@ use origin_boot_info::BootInfo;
 static DIRECT: AtomicU64 = AtomicU64::new(0);
 static KERNEL_VIRTUAL: AtomicU64 = AtomicU64::new(0);
 static KERNEL_PHYSICAL: AtomicU64 = AtomicU64::new(0);
+/// Whether [`init`] has run.
+static PHYS_SET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Records the loader's placement. Called once, first thing after the boot info is read.
+/// Records the loader's placement. Called once, first thing after the boot info is read; a
+/// later call changes nothing (the direct map's base is fixed for the kernel's lifetime).
 pub fn init(info: &BootInfo) {
+    if PHYS_SET.swap(true, Ordering::AcqRel) {
+        return;
+    }
     DIRECT.store(info.direct_map_base, Ordering::Relaxed);
     KERNEL_VIRTUAL.store(info.kernel_virtual_base, Ordering::Relaxed);
     KERNEL_PHYSICAL.store(info.kernel_base, Ordering::Relaxed);

@@ -93,7 +93,12 @@ pub fn kernel_half() -> Option<[u64; 256]> {
 
 /// Keeps the live address space, and the firmware's memory map that [`map_mmio`] holds every
 /// mapping against (`init_paging` calls this right after loading CR3).
-pub fn install(
+///
+/// # Safety
+///
+/// Once, at boot, with `space` and `tables` the page tables just loaded into CR3: this is the
+/// kernel's address space from now on, and every later mapping edits these tables.
+pub unsafe fn install(
     space: AddressSpace,
     tables: TablePool<'static>,
     memory_map: &'static [MemoryRegion],
@@ -117,7 +122,7 @@ pub fn root() -> Option<u64> {
 /// Makes physical `[addr, addr + len)` readable at its direct-map address: pages not mapped
 /// yet are mapped read-only and never executable; mapped pages keep their mapping.
 /// Returns the direct-map address of `addr`.
-pub fn map_firmware(addr: u64, len: u64) -> Result<u64, MapError> {
+fn map_firmware(addr: u64, len: u64) -> Result<u64, MapError> {
     crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;

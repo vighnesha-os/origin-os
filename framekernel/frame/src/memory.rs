@@ -30,6 +30,8 @@ struct Memory {
 
 /// `None` until [`init`].
 static MEMORY: SpinLock<Option<Memory>> = SpinLock::new(None);
+/// Whether [`init`] has run: the slab table is handed out once.
+static MEMORY_STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 struct Frames<'a>(&'a mut FrameAllocator<'static>);
 
@@ -51,12 +53,15 @@ impl PageSource for Frames<'_> {
     }
 }
 
-/// Takes ownership of the frame allocator and starts the heap. Call once, after the kernel's
-/// own page tables are live (the direct map makes heap addresses usable as pointers).
+/// Takes ownership of the frame allocator and starts the heap, once (a later call does
+/// nothing). The first call is the boot flow's, after the kernel's own page tables are live
+/// (the direct map makes heap addresses usable as pointers).
 pub fn init(frames: FrameAllocator<'static>) {
-    // SAFETY: `init` runs once, on the boot processor, before anything allocates, so this is
-    // the only reference ever made to `SLAB_TABLE` (non-null and aligned: it is a static);
-    // it then lives inside `MEMORY`.
+    if MEMORY_STARTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    // SAFETY: `init` passes the check above once, so this is the only reference ever made to
+    // `SLAB_TABLE` (non-null and aligned: it is a static); it then lives inside `MEMORY`.
     let Some(table) = (unsafe { (&raw mut SLAB_TABLE).as_mut() }) else {
         return;
     };
@@ -82,9 +87,12 @@ pub fn stats() -> Option<(HeapStats, u64)> {
 /// frame allocator. Returns the frames added and the free frames after, or `None` before
 /// [`init`].
 ///
-/// Call only when nothing there is in use: after the kernel's own page tables replaced the
+///
+/// # Safety
+///
+/// Only once nothing there is in use: after the kernel's own page tables replaced the
 /// firmware's, and after every enabled processor has left firmware code (INIT).
-pub fn reclaim_loader_memory() -> Option<(u64, u64)> {
+pub unsafe fn reclaim_loader_memory() -> Option<(u64, u64)> {
     without_interrupts(|| {
         let mut guard = MEMORY.lock();
         let m = guard.as_mut()?;

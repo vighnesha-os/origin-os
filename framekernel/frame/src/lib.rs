@@ -55,7 +55,6 @@ pub mod memory;
 pub mod monotonic;
 #[cfg(target_os = "none")]
 pub mod phys;
-#[cfg(target_os = "none")]
 pub mod port;
 #[cfg(target_os = "none")]
 pub mod stack;

@@ -185,6 +185,16 @@ pub fn send_reschedule_ipi(apic_id: u32) {
     }
 }
 
+/// Sends this processor an NMI (x2APIC ICR, NMI delivery, "self" shorthand). Nothing happens
+/// if its APIC is not in x2APIC mode. Safe: the NMI handler only records it.
+pub fn send_nmi_to_self() {
+    if X2Apic::this_cpu().is_some() {
+        // SAFETY: x2APIC mode is on (`this_cpu`), so the ICR exists; an NMI to this
+        // processor runs the kernel's NMI handler, which only counts it.
+        unsafe { crate::cpu::wrmsr(X2APIC_ICR, (1 << 18) | 0x400) };
+    }
+}
+
 /// The legacy PC ports this module drives: the 8259 mask registers, PIT channel 2 and
 /// port 0x61.
 struct LegacyPorts(());

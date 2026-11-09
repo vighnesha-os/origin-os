@@ -8,5 +8,5 @@
 8 framekernel/src/iommu.rs
 3 framekernel/src/iommu/amd.rs
 3 framekernel/src/ipc_proof.rs
-32 framekernel/src/main.rs
+31 framekernel/src/main.rs
 22 framekernel/src/smp.rs
