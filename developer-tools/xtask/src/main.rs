@@ -909,8 +909,9 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             format!(
                 "origin-kernel: console: {cpus} processors printed {CONSOLE_LINES} lines each at once"
             ),
-            // What drawing a line costs, measured (CLAUDE.md rule 21).
-            "origin-kernel: console: framebuffer: ".into(),
+            // A thread's line, drawn a section at a time with interrupts on between them.
+            "origin-kernel: console: a line drawn by a thread: ".into(),
+            "origin-kernel: console: a thread's line took ".into(),
             // ADR-0004 H5: global kernel pages on every CPU, nothing global in the lower
             // half; and TLB shootdowns: every other CPU's next read of each unmapped page
             // faults.
@@ -1121,6 +1122,18 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // Integration: a /sys tree built in the VFS from live discovered facts.
             "origin-kernel: sysfs: built /sys with 4 facts (4 subtrees): ".into(),
             "bus/pci/count=7, block/nvme0/size_mib=16; read back pci count Some(7)".into(),
+            // A line drawn in sections (`console::prove_sections`, last so its lines are
+            // on the screen for the screen check): an interrupt taken before it was finished,
+            // whose handler's line queued behind it; a breakpoint in the middle of another;
+            // every section at most 1 KiB of pixels; and what drawing a line costs, measured
+            // (CLAUDE.md rule 21).
+            "origin-kernel: console: a line drawn in sections while an interrupt waits: ".into(),
+            "origin-kernel: console: this line comes from an interrupt handler".into(),
+            "origin-kernel: console: a line drawn in sections with a breakpoint in the middle: ".into(),
+            "origin-kernel: exception 3 (#BP breakpoint) at rip".into(),
+            "origin-kernel: breakpoint handled; resuming".into(),
+            "origin-kernel: console: a line took ".into(),
+            "origin-kernel: console: framebuffer: ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ])
         .collect(),
@@ -1222,18 +1235,40 @@ const HALT_LINE: &str = "origin-kernel: M1 entry complete; halting";
 /// console writes one line at a time to both).
 fn check_screen(done: &Completed) -> Result {
     let image = done.screen.as_ref().ok_or("no screen dump was taken")?;
-    let start = done
-        .serial
+    check_screen_text(image, &done.serial)
+}
+
+/// The check itself: `image` against everything the log says the console printed.
+fn check_screen_text(image: &screen::Image, serial: &str) -> Result {
+    let start = serial
         .find("origin-kernel: console: framebuffer")
         .ok_or("the serial log has no framebuffer console line")?;
-    let text = done.serial.get(start..).ok_or("serial log out of bounds")?;
+    let text = serial.get(start..).ok_or("serial log out of bounds")?;
     // The markers can be seen a moment before the serial port's last newline arrives; the
-    // console drew that whole last line before any of it left through the UART.
+    // whole last line is on the screen by then or very soon after ([`settled_screen`]).
     let mut text = text.to_string();
     if !text.ends_with('\n') {
         text.push('\n');
     }
     screen::check_frame(image, &text)
+}
+
+/// How long [`settled_screen`] gives the screen to catch up with the log.
+const SCREEN_SETTLE: Duration = Duration::from_secs(5);
+
+/// The screen dump to check, once it has caught up with the log. The console sends each line
+/// to the UART before it draws it (ADR-0010 Amendment 1), so a dump taken the moment the markers appear can be a line or so behind
+/// the log: this takes dumps until one matches or the time is up. Whichever comes first, the
+/// last one is returned for [`check_screen`] to judge, so a frame that never matches fails
+/// the same way as before, with the difference named.
+fn settled_screen(monitor: &mut ChildStdin, path: &Path, serial: &str) -> Result<screen::Image> {
+    let mut image = dump_screen(monitor, path, true)?;
+    let deadline = Instant::now() + SCREEN_SETTLE;
+    while check_screen_text(&image, serial).is_err() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+        image = dump_screen(monitor, path, false)?;
+    }
+    Ok(image)
 }
 
 /// Developer mode: an unsigned kernel still boots (ADR-0002 B8), and the loader says so.
@@ -3405,7 +3440,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
     let mut screen = None;
     if verdict.is_ok() && scenario.capture == Capture::Com1AndScreen {
         match stdin.as_mut() {
-            Some(monitor) => match dump_screen(monitor, &screen_path, true) {
+            Some(monitor) => match settled_screen(monitor, &screen_path, &text) {
                 Ok(image) => screen = Some(image),
                 Err(e) => verdict = Err(format!("no screen dump: {e}")),
             },

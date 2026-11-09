@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-08, as proposed (E1–E6, and the recommended answer to each of the three questions below; decision sheet items 27–29). It changes the boot-info structure (CLAUDE.md §84). The code is built and boot-tested under QEMU, and was merged into `claude/interesting-carson-ae7c83` on 2026-11-09 on the owner's word. Nothing here has shipped. |
+| Status | **Accepted** by the owner on 2026-11-08, as proposed (E1–E6, and the recommended answer to each of the three questions below; decision sheet items 27–29). It changes the boot-info structure (CLAUDE.md §84). The code is built and boot-tested under QEMU, and was merged into `claude/interesting-carson-ae7c83` on 2026-11-09 on the owner's word. Nothing here has shipped. **Amendment 1 (below, to E3) is Proposed**, not accepted: it records a change waiting for the owner's word. |
 | Requires | CLAUDE.md §13 (checked parsing), §19 (boot-info structure, early diagnostics), §51 (font provenance), §58 (threat-model privileged interfaces), §69 (diagnostics), §74, rules 14, 30 and 40 |
 | Implements | ADR-0009 H6, third bullet: a console that does not depend on a 16550 at `0x3F8` |
 | Code | `boot/info` (`Framebuffer`), `boot/uefi` (the Graphics Output Protocol hand-off), `framekernel/paging` (the mapping), `framekernel/src/{fbconsole,font,spcr,serial,console}.rs`, `developer-tools/xtask` |
@@ -36,7 +36,7 @@ The loader maps the framebuffer's visible rows in the first page tables (ADR-000
 
 ### E3. The console: framebuffer first, then the UART
 
-Every line goes to the framebuffer, then to the UART, under the existing console lock. `framekernel::fbconsole` draws text through an abstract pixel sink, in 8 by 16 cells scaled by a whole number on panels taller than 1439 rows. Text never scrolls and the framebuffer is never read: the next line goes to the row below, painted first as a bar, and the screen wraps at the bottom. Scrolling would read or rewrite the whole screen for each line, with interrupts off, on memory that may be uncached. This way a line costs at most two rows of writes: its own and the bar's.
+Every line goes to the framebuffer, then to the UART, under the existing console lock. (Amendment 1, below, proposes changing this order.) `framekernel::fbconsole` draws text through an abstract pixel sink, in 8 by 16 cells scaled by a whole number on panels taller than 1439 rows. Text never scrolls and the framebuffer is never read: the next line goes to the row below, painted first as a bar, and the screen wraps at the bottom. Scrolling would read or rewrite the whole screen for each line, with interrupts off, on memory that may be uncached. This way a line costs at most two rows of writes: its own and the bar's.
 
 ### E4. The UART: from the SPCR when the firmware names one
 
@@ -102,3 +102,27 @@ The framebuffer mapping is kernel-only, writable and never executable, in the ke
 1. Accept boot info 0.4 as in E1 (recommended)? This is the §84 decision. **Yes (2026-11-08).**
 2. Accept reserving the first 2 GiB of the MMIO window for the framebuffer (E2)? **Yes (2026-11-08).**
 3. Accept the UART policy: COM1 until the ACPI tables can be read, then the SPCR's UART with the earlier output replayed, 0x3F8 only when firmware gives nothing better (E4)? **Yes (2026-11-08).**
+
+## Amendment 1 (Proposed, 2026-11-09): the UART first, then the screen a section at a time
+
+**Status: Proposed, not accepted (branch `claude/epic-joliot-bff82c`, local, not pushed).** The code on that branch already behaves as below, because the question only arose while building it; the owner can accept or reject it when the branch comes to be merged, and E3 as accepted above stands until then.
+
+**Why.** Under KVM on a real AMD EPYC 7763 (free GitHub runner, Actions run 42547942738) one console line took 4.3 to 4.6 ms on average and up to 10 ms at worst, with interrupts off. TCG, QEMU's software CPU, had hidden it (about 0.2 to 0.6 ms). The line is about 40,960 pixels of uncached memory, and one line can cost a whole 10 ms timer tick. E3's text ("Every line goes to the framebuffer, then to the UART, under the existing console lock") is what made a line one critical section.
+
+**The change to E3.** A line is handed over in one critical section under the console lock: it goes out on the UART and joins a bounded backlog of text for the screen, so both sinks get lines in one order (E3's guarantee). The pixels are then written after that hand-over, a section at a time: each section holds the console lock with interrupts off for at most 256 pixels (1 KiB of uncached memory), and nothing is held between sections, so interrupts are taken between them, and no preempted holder can stand in anyone's way. Any processor can paint the next section. A writer that can wait draws through its own line before it returns. A writer with interrupts off for its own reasons (an interrupt handler) hands its line over and leaves. An exception or panic report draws the whole backlog before its own line and leaves nothing behind.
+
+**Why the UART goes first.** Keeping the screen first would keep each line's UART send behind its pixels, as now, and would add to that everything that can now happen between sections: interrupts, preemption, a turn at the lock. The UART is the log that has to survive a bad machine, so a line must not wait for pixels. So the line is on the wire before any pixel of it is drawn, whatever happens next. E3's stated reason for the opposite order, "a UART that holds a line up cannot delay what reaches the screen", weakens to this: a UART delays the screen by at most that one line's send, and a UART that stops taking bytes is given up on after one bounded wait, as E5 requires, so the delay happens once.
+
+**What it changes.** `framekernel/src/console.rs`, `framekernel/src/fbconsole.rs` (`Backlog`, resumable drawing), one line each in `framekernel/src/cpu.rs` and `framekernel/src/main.rs`, and `developer-tools/xtask` (its check of the screen against the log waits a moment for the screen to catch up; a frame that never matches still fails).
+
+**Alternatives.**
+
+| | Gain | Why not |
+|---|---|---|
+| Keep E3's order: draw each line in sections, then send it | No change to E3 | The UART waits behind the pixels and everything between the sections, which is what this work must avoid; the UART is the record of last resort |
+| Draw a whole line with interrupts on, one drawer at a time, nobody waiting | No resumable drawing | A drawer preempted while holding the role can block every other writer: the boot flow, which only runs when nothing else is ready, would hold it while threads wait for it |
+| A write-combining mapping for the framebuffer | Much cheaper pixels on real hardware | No bound: a large display still takes as long as it takes; touches paging; independent of this and worth doing later |
+| Send the UART through the same backlog | One queue | A line is no longer on the wire when `flush` returns, so a crash can lose it |
+| Spend fewer pixels on a line (a thinner bar) | Less to do | No bound either, and it changes what E3 and the screen check specify |
+
+**Evidence.** `docs/engineering/SOURCE_PROVENANCE.md`, "The console: a line drawn a section at a time". The KVM figure has not been taken again; the measurements in that entry are TCG only.

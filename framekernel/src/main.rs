@@ -132,7 +132,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     }
     // From here on every processor prints through the console, a line at a time.
     console::init(uart, firmware_line);
-    let mut com1 = console::Console::new();
+    let mut com1 = console::Console::boot_flow();
 
     // SAFETY: `boot_info` is the loader's pointer, passed on unchanged, and this function's
     // contract is exactly `read_boot_info`'s.
@@ -260,6 +260,9 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // against the PIT and proven by taking periodic interrupts.
     let tsc_hz = timer::init(&mut com1);
     if let Some(hz) = tsc_hz {
+        // The timer runs and every vector that can arrive has a gate: from here on, the
+        // boot flow takes interrupts between the sections of the lines it prints.
+        console::allow_interrupt_windows();
         if let Some(q) = quiesced.as_mut() {
             pcie::settle(&mut com1, q, hz);
         }
@@ -363,6 +366,9 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     prove_timers(&mut com1);
     // Integration: a read-only /sys tree in the VFS carrying live discovered facts.
     prove_sysfs(&mut com1);
+    // The console's drawing in sections, proven last so that what it prints is still on the
+    // screen when the boot test compares the screen with the serial log.
+    console::prove_sections(&mut com1);
 
     let _ = report::write_halt(&mut com1);
     halt()
@@ -1426,6 +1432,17 @@ fn prove_heap(com1: &mut Console) -> bool {
         (before.1 * memory::FRAME) >> 20
     );
     true
+}
+
+/// Sends this processor an interrupt on `vector` (x2APIC ICR, fixed delivery, "self"
+/// shorthand), for the console's boot proof. With interrupts off it stays pending until
+/// something lets it in.
+pub(crate) fn interrupt_self(vector: u8) {
+    // SAFETY: CPL 0, after `timer::init` put this processor's APIC in x2APIC mode (the proof
+    // runs after it), so this is a no-op transition yielding the handle.
+    let lapic = unsafe { timer::X2Apic::assume_enabled() };
+    // SAFETY: `vector` is the proof's, one whose handler only counts and acknowledges.
+    unsafe { lapic.send_ipi(0, (1 << 18) | (1 << 14) | u32::from(vector)) };
 }
 
 /// Sends this processor an NMI (x2APIC ICR, NMI delivery, "self" shorthand) and checks
