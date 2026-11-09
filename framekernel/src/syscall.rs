@@ -400,6 +400,7 @@ fn wait_one(
         &p.handles,
         &p.waiting,
         handle.value(),
+        need(handle),
         signals.bits(),
         deadline,
     )?;

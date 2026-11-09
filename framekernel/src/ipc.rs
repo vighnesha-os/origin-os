@@ -34,7 +34,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::channel::{Channel, Message, QUEUE_BYTES, QUEUE_DEPTH, ReadError, other};
 use crate::handles::{HandleTable, Need, Typed};
 use crate::heap::{MAX_BLOCK, MIN_BLOCK, PAGE};
-use origin_abi::{Error, Handle, ObjectType, rights};
+use origin_abi::{Error, Handle, ObjectType};
 use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
 
@@ -544,16 +544,16 @@ pub(crate) struct Waited {
 }
 
 /// `wait_one`: blocks until a signal in `mask` is raised on `handle`'s object, the monotonic
-/// clock reaches `deadline`, or `handle` is closed (P9).
+/// clock reaches `deadline`, or `handle` is closed (P9). `need` is what the handle must meet.
 pub(crate) fn wait_one(
     table: &SpinLock<HandleTable<Object>>,
     waiting: &AtomicU32,
     handle: Handle,
+    need: Need,
     mask: u32,
     deadline: u64,
 ) -> Result<Waited, Error> {
-    let (channel, side) =
-        without_interrupts(|| channel_of(&table.lock(), handle, Need::rights(rights::WAIT)))?;
+    let (channel, side) = without_interrupts(|| channel_of(&table.lock(), handle, need))?;
     let waiters = channel.waiters.get(side).ok_or(Error::BadHandle)?;
     waiting.fetch_add(1, Ordering::Release);
     let signals = || without_interrupts(|| channel.state.lock().signals(side));
