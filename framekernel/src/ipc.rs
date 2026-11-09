@@ -517,16 +517,15 @@ pub(crate) fn handle_close(
     Ok(())
 }
 
-/// `duplicate`: a new handle with `new_rights`, which may only remove rights (P2).
+/// `duplicate`: a new handle with `new_rights`, which may only remove rights (P2). The decoder
+/// has refused a right the definition does not declare.
 pub(crate) fn handle_duplicate(
     table: &SpinLock<HandleTable<Object>>,
     handle: Handle,
+    need: Need,
     new_rights: u32,
 ) -> Result<Handle, Error> {
-    if new_rights & !rights::ALL != 0 {
-        return Err(Error::InvalidArgs);
-    }
-    without_interrupts(|| table.lock().duplicate(handle, new_rights))
+    without_interrupts(|| table.lock().duplicate(handle, need, new_rights))
 }
 
 /// What ended a `wait_one`.

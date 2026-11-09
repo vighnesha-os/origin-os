@@ -249,7 +249,7 @@ fn handle_duplicate(
     new_handle: rt::UserRef<rt::Handle>,
 ) -> Result<(), Error> {
     checked(p, new_handle.addr(), HANDLE_BYTES as u64, UserAccess::Write)?;
-    let new = ipc::handle_duplicate(&p.handles, handle.value(), rights.bits())?;
+    let new = ipc::handle_duplicate(&p.handles, handle.value(), need(handle), rights.bits())?;
     copy_out(p, new_handle.addr(), &new.to_le_bytes()).inspect_err(|_| {
         let _ = ipc::handle_close(&p.handles, new, Need::NOTHING);
     })

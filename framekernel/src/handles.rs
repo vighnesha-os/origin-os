@@ -16,7 +16,7 @@
 
 use alloc::vec::Vec;
 
-use origin_abi::{Error, Handle, rights};
+use origin_abi::{Error, Handle};
 
 /// Most entries any table can have (the index field's range).
 pub const MAX_HANDLES: usize = 0xFFFF;
@@ -226,9 +226,14 @@ impl<T: Typed> HandleTable<T> {
 
 impl<T: Typed + Clone> HandleTable<T> {
     /// A new handle to the same object with `new_rights`, which must be a subset of the
-    /// original's; the original needs [`rights::DUPLICATE`].
-    pub fn duplicate(&mut self, handle: Handle, new_rights: u32) -> Result<Handle, Error> {
-        let (object, old) = self.get(handle, Need::rights(rights::DUPLICATE))?;
+    /// original's; the original must meet `need` (the `duplicate` right, for a system call).
+    pub fn duplicate(
+        &mut self,
+        handle: Handle,
+        need: Need,
+        new_rights: u32,
+    ) -> Result<Handle, Error> {
+        let (object, old) = self.get(handle, need)?;
         if new_rights & !old != 0 {
             return Err(Error::InvalidArgs);
         }
@@ -241,7 +246,7 @@ impl<T: Typed + Clone> HandleTable<T> {
 mod tests {
     use super::*;
     use crate::testing::{Rng, cases};
-    use origin_abi::rights::{DUPLICATE, READ, TRANSFER, WRITE};
+    use origin_abi::rights::{self, DUPLICATE, READ, TRANSFER, WRITE};
     use std::collections::HashMap;
 
     /// The object type every test object has.
@@ -272,6 +277,15 @@ mod tests {
         Need::rights(rights)
     }
 
+    /// A duplicate needing [`DUPLICATE`], as the definition asks of `handle_duplicate`.
+    fn dup<T: Typed + Clone>(
+        t: &mut HandleTable<T>,
+        h: Handle,
+        new_rights: u32,
+    ) -> Result<Handle, Error> {
+        t.duplicate(h, r(DUPLICATE), new_rights)
+    }
+
     #[test]
     fn handles_are_never_zero_and_name_their_object() {
         let mut t = HandleTable::new(8);
@@ -295,14 +309,14 @@ mod tests {
         let h = t.insert(7u32, READ | DUPLICATE).unwrap();
         assert_eq!(t.get(h, r(WRITE)), Err(Error::AccessDenied));
         assert_eq!(
-            t.duplicate(h, READ | WRITE),
+            dup(&mut t, h, READ | WRITE),
             Err(Error::InvalidArgs),
             "cannot add"
         );
-        let d = t.duplicate(h, READ).unwrap();
+        let d = dup(&mut t, h, READ).unwrap();
         assert_eq!(t.get(d, r(READ)), Ok((&7, READ)));
         assert_eq!(
-            t.duplicate(d, READ),
+            dup(&mut t, d, READ),
             Err(Error::AccessDenied),
             "no DUPLICATE right"
         );
@@ -354,6 +368,7 @@ mod tests {
         assert_eq!(t.remove(h, of(1)), Err(Error::WrongType));
         assert_eq!(t.check_all(&[h], of(1)), Err(Error::WrongType));
         assert_eq!(t.take_all(&[h], of(1)), Err(Error::WrongType));
+        assert_eq!(t.duplicate(h, of(1), READ), Err(Error::WrongType));
         assert_eq!(t.len(), 1, "nothing was consumed");
     }
 
@@ -490,7 +505,7 @@ mod tests {
                         if let Some(h) = pick {
                             let (obj, r) = model[&h];
                             let wanted = rng.next() as u32 & rights::ALL;
-                            let got = table.duplicate(h, wanted);
+                            let got = dup(&mut table, h, wanted);
                             match got {
                                 Ok(d) => {
                                     assert!(r & DUPLICATE != 0);
