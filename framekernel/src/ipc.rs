@@ -1,5 +1,5 @@
-//! Kernel channels (ADR-0005 P1, P2, P8, P9): the objects handles name, the moves between
-//! handle tables and queues, and blocking until a signal.
+//! Kernel objects and channels (ADR-0005 P1, P2, P3, P8, P9): the objects handles name, the
+//! moves between handle tables and queues, and blocking until a signal on any of them.
 //!
 //! The queues and limits are the library's `framekernel::channel`; this module adds the
 //! locks, the handle moves, the waiting and the lifetime:
@@ -38,36 +38,48 @@ use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
 
 use crate::cpu::without_interrupts;
-use crate::process::Account;
+use crate::process::{Account, Process, ThreadObject};
 use crate::wait::WaitQueue;
 
-/// What a handle names (ADR-0005 P3; only channels exist so far).
+/// What a handle names (ADR-0005 P3; channels, processes and threads so far).
 #[derive(Clone)]
 pub(crate) enum Object {
     /// One end of a channel.
     Channel(ChannelEnd),
+    /// A process.
+    Process(ObjectRef<Process>),
+    /// A thread.
+    Thread(ObjectRef<ThreadObject>),
 }
 
 impl Typed for Object {
     fn object_type(&self) -> u32 {
-        match self {
-            Self::Channel(_) => ObjectType::Channel as u32,
-        }
+        (match self {
+            Self::Channel(_) => ObjectType::Channel,
+            Self::Process(_) => ObjectType::Process,
+            Self::Thread(_) => ObjectType::Thread,
+        }) as u32
     }
 }
 
-/// What a wait, or the wake-up of one, needs of an object: a counted reference that keeps its
-/// signals and its waiters alive, and is not one more handle to it (an end's reference count
+/// What a wait, or the wake-up of one, needs of an object: counted references that keep its
+/// signals and its waiters alive, and are not one more handle to it (an end's reference count
 /// is what closes it).
 enum Waitable {
     /// A channel and which of its two sides.
     Channel(ObjectRef<KernelChannel>, usize),
+    /// A process.
+    Process(ObjectRef<Process>),
+    /// A thread.
+    Thread(ObjectRef<ThreadObject>),
 }
 
 impl Waitable {
     fn of(object: &Object) -> Self {
         match object {
             Object::Channel(end) => Self::Channel(end.channel.clone(), end.side),
+            Object::Process(process) => Self::Process(process.clone()),
+            Object::Thread(thread) => Self::Thread(thread.clone()),
         }
     }
 
@@ -77,6 +89,8 @@ impl Waitable {
             Self::Channel(channel, side) => {
                 without_interrupts(|| channel.state.lock().signals(*side))
             }
+            Self::Process(process) => process.termination().signals(),
+            Self::Thread(thread) => thread.termination().signals(),
         }
     }
 
@@ -84,6 +98,8 @@ impl Waitable {
     fn waiters(&self) -> Option<&WaitQueue> {
         match self {
             Self::Channel(channel, side) => channel.waiters.get(*side),
+            Self::Process(process) => Some(process.termination().waiters()),
+            Self::Thread(thread) => Some(thread.termination().waiters()),
         }
     }
 
@@ -338,15 +354,19 @@ pub(crate) fn create_channel(
     Ok((first, second))
 }
 
-/// Which object `handle` names, if it is a channel and has `need`.
+/// The channel and side `handle` names, if it meets `need` and names a channel. Every call
+/// that reaches here asks for a channel, so a handle to anything else already failed the lookup;
+/// this answer is for a definition that stopped asking.
 fn channel_of(
     table: &HandleTable<Object>,
     handle: Handle,
     need: Need,
 ) -> Result<(ObjectRef<KernelChannel>, usize), Error> {
     let (object, _) = table.get(handle, need)?;
-    let Object::Channel(end) = object;
-    Ok((end.channel.clone(), end.side))
+    match object {
+        Object::Channel(end) => Ok((end.channel.clone(), end.side)),
+        Object::Process(_) | Object::Thread(_) => Err(Error::WrongType),
+    }
 }
 
 /// Whether `target` is the end `(channel, side)` or holds it, through up to
@@ -399,12 +419,15 @@ pub(crate) fn channel_write(
         let reader = other(side);
         table.check_all(transfer, transfer_need)?;
         // An end may be sent only if that keeps every end reachable (amendment A3). Every
-        // listed handle was just checked to exist.
+        // listed handle was just checked to exist. Only an end can be held in a queue and so
+        // be part of a cycle of queues: other objects are just carried.
         let moves_an_end = !transfer.is_empty();
         let _order = moves_an_end.then(|| TRANSFERS.lock());
         for &value in transfer {
             let (object, _) = table.get(value, Need::NOTHING)?;
-            let Object::Channel(end) = object;
+            let Object::Channel(end) = object else {
+                continue;
+            };
             let references = end.channel.open.get(end.side);
             if ObjectRef::same(&end.channel, &channel)
                 || references.is_none_or(|n| n.load(Ordering::Relaxed) != 1)
@@ -425,8 +448,9 @@ pub(crate) fn channel_write(
         let moved = table.take_all(transfer, transfer_need)?;
         // The reader's queue holds them now, recorded before anyone can see the message.
         for (object, _) in &moved {
-            let Object::Channel(end) = object;
-            if let Some(holder) = end.channel.holder.get(end.side) {
+            if let Object::Channel(end) = object
+                && let Some(holder) = end.channel.holder.get(end.side)
+            {
                 *holder.lock() = Some((channel.clone(), reader));
             }
             moved_away.push(Waitable::of(object));
@@ -522,8 +546,9 @@ pub(crate) fn channel_read(
         drop(state);
         let mut incoming = message.handles.into_iter();
         for (object, entry_rights) in incoming.by_ref() {
-            let Object::Channel(end) = &object;
-            if let Some(holder) = end.channel.holder.get(end.side) {
+            if let Object::Channel(end) = &object
+                && let Some(holder) = end.channel.holder.get(end.side)
+            {
                 *holder.lock() = None;
             }
             match table.insert(object, entry_rights) {
@@ -559,7 +584,7 @@ pub(crate) fn handle_close(
 ) -> Result<(), Error> {
     let (object, _) = without_interrupts(|| table.lock().remove(handle, need))?;
     // The handle is gone from the table: a waiter on it sees that when it is woken here. If
-    // this was the end's last reference, the drop below closes the end and wakes its peer.
+    // this was an end's last reference, the drop below closes the end and wakes its peer.
     Waitable::of(&object).wake();
     drop(object);
     Ok(())
@@ -586,8 +611,9 @@ pub(crate) struct Waited {
     pub(crate) blocked: u64,
 }
 
-/// `wait_one`: blocks until a signal in `mask` is raised on `handle`'s object, the monotonic
-/// clock reaches `deadline`, or `handle` is closed (P9). `need` is what the handle must meet.
+/// `wait_one`: blocks until a signal in `mask` is raised on `handle`'s object, of any type, the
+/// monotonic clock reaches `deadline`, or `handle` is closed (P9). `need` is what the handle
+/// must meet.
 pub(crate) fn wait_one(
     table: &SpinLock<HandleTable<Object>>,
     waiting: &AtomicU32,

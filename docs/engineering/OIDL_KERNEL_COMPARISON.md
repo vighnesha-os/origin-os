@@ -27,7 +27,7 @@ Each method now has a closed set of errors (spec §8). The kernel's code was rea
 
 | Method | Declared in OIDL | The kernel today | Difference |
 |---|---|---|---|
-| `channel_write` | … and `wrong_type` | Only channels exist, so `wrong_type` is unreachable (`let Object::Channel(end) = object` is irrefutable) | Declared for the future, not returned today |
+| `channel_write` | … and `wrong_type` | At this comparison only channels existed, so `wrong_type` was unreachable. Since S3-1 a process or thread handle gets it | Reachable since S3-1 |
 | `channel_read` | … and `wrong_type` | The same | The same |
 | every other call | exactly the statuses its code can return | — | none |
 

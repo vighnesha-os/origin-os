@@ -1521,6 +1521,313 @@ fn copy_fault_recovered(com1: &mut Console) -> bool {
     right
 }
 
+// ------------------------------------------------------------------ process and thread objects
+
+/// The rights a process handle carries (ADR-0005 C6).
+const PROCESS_RIGHTS: u32 = rights::READ
+    | rights::WRITE
+    | rights::MANAGE
+    | rights::WAIT
+    | rights::DUPLICATE
+    | rights::TRANSFER;
+/// The rights a thread handle carries (ADR-0005 C6).
+const THREAD_RIGHTS: u32 = rights::WAIT | rights::MANAGE | rights::DUPLICATE | rights::TRANSFER;
+/// Where a second thread's script starts, on the script pages.
+const SECOND_SCRIPT: u64 = SCRIPT + SCRIPT_PAGES * PAGE / 2;
+
+/// Writes handle slot `k` of a process that has already started, before the thread that reads
+/// that slot does.
+fn write_slot(process: &Process, k: u64, value: u32) -> bool {
+    process
+        .frame_of(DATA)
+        .is_some_and(|f| process.write_frame(f, 4 * k as usize, &value.to_le_bytes()))
+}
+
+/// Handles name objects of a type, and each call asks for a type: a process or a thread is not a
+/// channel, whatever rights it has. A live process or thread raises nothing; a handle to one
+/// can be waited on, duplicated, carried in a message and closed like any other.
+fn object_types(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let (Some(mut target), Some(mut prober)) = (
+        Image::new(LIMITS, proof_programs::script()),
+        Image::new(LIMITS, proof_programs::script()),
+    ) else {
+        return false;
+    };
+    let Ok((target_end, prober_end)) = ipc::create_channel(&target.process.account) else {
+        return false;
+    };
+    let (Ok(held_t), Ok(_)) = (
+        target
+            .process
+            .grant(Object::Channel(target_end), rights::CHANNEL),
+        prober
+            .process
+            .grant(Object::Channel(prober_end), rights::CHANNEL),
+    ) else {
+        return false;
+    };
+    // The target stays alive for as long as the prober holds the other end.
+    let target_steps = alloc::vec![wait(
+        "",
+        Imm(u64::from(held_t)),
+        signals::PEER_CLOSED,
+        DEADLINE_INFINITE,
+        OK
+    )];
+    if target.scratch().is_none() || target.script(&target_steps).is_none() {
+        return false;
+    }
+    let Some(target) = target.finish() else {
+        return false;
+    };
+    let Ok(thread) = Process::start_thread(&target, bsp, CODE, STACK + PAGE, SCRIPT) else {
+        return false;
+    };
+    let granted = (
+        prober
+            .process
+            .grant(Object::Process(target.clone()), PROCESS_RIGHTS),
+        prober
+            .process
+            .grant(Object::Process(target.clone()), rights::READ),
+        prober.process.grant(Object::Thread(thread), THREAD_RIGHTS),
+    );
+    let (Ok(process_handle), Ok(read_only), Ok(thread_handle)) = granted else {
+        return false;
+    };
+    let (p, weak, t) = (
+        Imm(u64::from(process_handle)),
+        Imm(u64::from(read_only)),
+        Imm(u64::from(thread_handle)),
+    );
+    let wrong = Error::WrongType.raw();
+    let denied = Error::AccessDenied.raw();
+    let timed_out = Error::TimedOut.raw();
+    let ended = signals::TERMINATED;
+    let group = [Group {
+        title: "object types",
+        steps: alloc::vec![
+            create(20),
+            write("a process is no channel", p, MSG, 8, wrong),
+            read("a thread is no channel", t, RBUF, 16, wrong),
+            write("the type comes before the rights", weak, MSG, 8, wrong),
+            wait("a live process", p, ended, 0, timed_out),
+            value_at("raises nothing", OBS, 0),
+            wait("a live thread", t, ended, 0, timed_out),
+            value_at("raises nothing either", OBS, 0),
+            wait("waiting needs WAIT", weak, ended, 0, denied),
+            dup("", p, rights::WAIT | rights::TRANSFER, 8, OK),
+            wait("a duplicate waits", h(8), ended, 0, timed_out),
+            dup("and cannot duplicate", h(8), rights::WAIT, 9, denied),
+            copy32(slot_addr(8), LIST),
+            send("a process handle travels", h(20), 1, OK),
+            wait(
+                "the sender's is gone",
+                h(8),
+                ended,
+                0,
+                Error::BadHandle.raw()
+            ),
+            read_handles("", h(21), OK),
+            wait("the received one waits", Hd(RECV), ended, 0, timed_out),
+            close("", Hd(RECV), OK),
+            close("a thread handle closes", t, OK),
+        ],
+    }];
+    if prober.scratch().is_none() || prober.script(&group[0].steps).is_none() {
+        return false;
+    }
+    let Some(prober) = prober.finish() else {
+        return false;
+    };
+    if Process::start_thread(&prober, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
+        return false;
+    }
+    let done = await_end(&prober, tsc_hz, 10) && await_end(&target, tsc_hz, 10);
+    let groups_ok = check_groups(com1, &group, &prober.reports());
+    done && groups_ok
+        && prober.ending() == Some(Ending::Exited(0))
+        && target.ending() == Some(Ending::Exited(0))
+}
+
+/// A thread of one process blocked on a handle to another, on another processor, wakes when that
+/// process ends, by exiting or by faulting, and sees `TERMINATED`; it stays raised.
+fn process_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let mut ok = true;
+    for (label, exit_step) in [("exits", None), ("faults", Some(fault()))] {
+        let (Some(mut waiter), Some(mut ender)) = (
+            Image::new(LIMITS, proof_programs::script()),
+            Image::new(LIMITS, proof_programs::script()),
+        ) else {
+            return false;
+        };
+        let ender_steps: Vec<Step> = exit_step.into_iter().collect();
+        if ender.scratch().is_none() || ender.script(&ender_steps).is_none() {
+            return false;
+        }
+        let Some(ender) = ender.finish() else {
+            return false;
+        };
+        let Ok(held) = waiter
+            .process
+            .grant(Object::Process(ender.clone()), PROCESS_RIGHTS)
+        else {
+            return false;
+        };
+        let held = Imm(u64::from(held));
+        let ended = signals::TERMINATED;
+        let waiter_steps = alloc::vec![
+            wait("woken", held, ended, DEADLINE_INFINITE, OK),
+            value_at("observed", OBS, u64::from(ended)),
+            wait("and it stays raised", held, ended, 0, OK),
+        ];
+        if waiter.scratch().is_none() || waiter.script(&waiter_steps).is_none() {
+            return false;
+        }
+        let Some(waiter) = waiter.finish() else {
+            return false;
+        };
+        let wakes_before = ipc::cross_cpu_wakes();
+        if Process::start_thread(&waiter, far, CODE, STACK + PAGE, SCRIPT).is_err() {
+            return false;
+        }
+        sched::yield_until(|| waiter.waiting.load(Ordering::Acquire) > 0, tsc_hz, 5);
+        if Process::start_thread(&ender, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
+            return false;
+        }
+        let done = await_end(&ender, tsc_hz, 10) && await_end(&waiter, tsc_hz, 10);
+        let groups = [Group {
+            title: "the waiter on a process that",
+            steps: waiter_steps,
+        }];
+        let right_reports = check_groups(com1, &groups, &waiter.reports());
+        let wakes = ipc::cross_cpu_wakes().wrapping_sub(wakes_before);
+        let ender_ok = matches!(
+            (exit_step.is_some(), ender.ending()),
+            (false, Some(Ending::Exited(0))) | (true, Some(Ending::Faulted { vector: 6, .. }))
+        );
+        let right = done && right_reports && ender_ok && (far == bsp || wakes > 0);
+        ok &= right;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: ipc: when a process {label}: TERMINATED reached the thread waiting on it on {}, blocked {} times; {} wake-ups crossed processors{}",
+            far.named(),
+            waiter.blocked(),
+            wakes,
+            if right { "" } else { ": ipc failed" }
+        );
+    }
+    ok
+}
+
+/// A thread waits for another thread of its own process: `TERMINATED` on a thread is raised when
+/// that thread ends, with the process and the waiter still running.
+fn thread_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let Some(mut image) = Image::new(LIMITS, proof_programs::script()) else {
+        return false;
+    };
+    if image.map(STACK_1, 1, Access::ReadWrite).is_none() {
+        return false;
+    }
+    let Ok((a, b)) = ipc::create_channel(&image.process.account) else {
+        return false;
+    };
+    let (Ok(ha), Ok(hb)) = (
+        image.process.grant(Object::Channel(a), rights::CHANNEL),
+        image.process.grant(Object::Channel(b), rights::CHANNEL),
+    ) else {
+        return false;
+    };
+    // Slot 3 holds the handle to the other thread: it exists only once that thread has started.
+    let other = h(3);
+    let ended = signals::TERMINATED;
+    let joined_thread = alloc::vec![wait(
+        "",
+        Imm(u64::from(hb)),
+        signals::READABLE,
+        DEADLINE_INFINITE,
+        OK
+    )];
+    let joiner = alloc::vec![
+        wait(
+            "a thread still running",
+            other,
+            ended,
+            0,
+            Error::TimedOut.raw()
+        ),
+        write("", Imm(u64::from(ha)), MSG, 8, OK),
+        wait("joined", other, ended, DEADLINE_INFINITE, OK),
+        value_at("observed", OBS, u64::from(ended)),
+        wait("and it stays raised", other, ended, 0, OK),
+    ];
+    if image.scratch().is_none()
+        || image.script(&joiner).is_none()
+        || image.write_script(SECOND_SCRIPT, &joined_thread).is_none()
+    {
+        return false;
+    }
+    let Some(process) = image.finish() else {
+        return false;
+    };
+    let Ok(thread) = Process::start_thread(&process, far, CODE, STACK_1 + PAGE, SECOND_SCRIPT)
+    else {
+        return false;
+    };
+    let Ok(value) = process.grant(Object::Thread(thread), THREAD_RIGHTS) else {
+        return false;
+    };
+    if !write_slot(&process, 3, value)
+        || Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err()
+    {
+        return false;
+    }
+    let done = await_end(&process, tsc_hz, 10);
+    // Both threads report to the one log. The other thread's only status, OK, is always somewhere
+    // among the first OKs: it cannot come later, because the joiner's wait ends after it.
+    let mut steps = joiner;
+    steps.insert(2, step("", sys::WAIT_ONE, &[], OK));
+    let group = [Group {
+        title: "a thread waiting for another thread",
+        steps,
+    }];
+    let groups_ok = check_groups(com1, &group, &process.reports());
+    done && groups_ok && process.ending() == Some(Ending::Exited(0))
+}
+
+/// Runs the proofs of process and thread objects, with a leak check of their own: every one of
+/// them is dropped by the end, and the memory is back to the frame. Called from the boot flow
+/// with every scheduler running, after [`prove`], which leaves nothing behind.
+pub(crate) fn prove_objects(
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    bsp: CpuIndex,
+    tsc_hz: u64,
+) -> bool {
+    let before = memory::stats();
+    let mut ok = true;
+    ok &= object_types(com1, bsp, tsc_hz);
+    ok &= process_terminated(com1, cpus, bsp, tsc_hz);
+    ok &= thread_terminated(com1, cpus, bsp, tsc_hz);
+    let same = || {
+        memory::stats().map(|(h, f)| (h.bytes_in_use, f))
+            == before.map(|(h, f)| (h.bytes_in_use, f))
+    };
+    ipc::reap_closed();
+    sched::yield_until(same, tsc_hz, 2);
+    let back = same();
+    let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: every process and thread object and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){}",
+        if back { "" } else { ": ipc failed" }
+    );
+    ok && back
+}
+
 /// Runs every proof and checks nothing leaked. Called from the boot flow with every
 /// scheduler running.
 pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {

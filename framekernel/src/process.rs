@@ -16,18 +16,23 @@
 //! hold references through the scheduler, so by then no processor runs in it, and each that
 //! ran one has loaded another CR3, which flushes its translations (no PCIDs yet).
 //!
+//! A process and a thread are objects a handle can name, and both raise `TERMINATED` when they
+//! have ended: a thread as soon as it does, a process when its last thread has, after its
+//! handles have closed. Every object here is allocated fallibly ([`ObjectRef::try_new`]): one that
+//! cannot be created is an error for its creator, never a stopped kernel.
+//!
 //! The first slice has no process-creation or memory system calls: the kernel builds each
 //! process and maps its pages before any of its threads runs, so the page tables do not
 //! change while it lives.
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::handles::HandleTable;
 use crate::paging::{Access, MapError, Translation};
 use crate::runqueue::QueueError;
-use origin_abi::{Error, Handle};
+use origin_abi::{Error, Handle, signals};
 use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
 use origin_frame::userspace::{UserFrame, UserSpace};
@@ -35,6 +40,7 @@ use origin_frame::userspace::{UserFrame, UserSpace};
 use crate::cpu::{CpuIndex, without_interrupts};
 use crate::ipc::{self, Object};
 use crate::sched;
+use crate::wait::WaitQueue;
 
 /// Values a process's report log keeps, for the boot proofs.
 const REPORTS: usize = 128;
@@ -123,6 +129,60 @@ struct ReportLog {
     count: usize,
 }
 
+/// The signal an object raises when it has ended, and who waits for it (P9, P11).
+pub(crate) struct Termination {
+    raised: AtomicBool,
+    waiters: WaitQueue,
+}
+
+impl Termination {
+    const fn new() -> Self {
+        Self {
+            raised: AtomicBool::new(false),
+            waiters: WaitQueue::new(),
+        }
+    }
+
+    /// The object's signals: `TERMINATED` once it has ended, and nothing before.
+    pub(crate) fn signals(&self) -> u32 {
+        if self.raised.load(Ordering::Acquire) {
+            signals::TERMINATED
+        } else {
+            0
+        }
+    }
+
+    /// The threads waiting on the object.
+    pub(crate) const fn waiters(&self) -> &WaitQueue {
+        &self.waiters
+    }
+
+    /// Raises the signal: the state first, then the wake-ups, as every waker does (`wait`).
+    fn raise(&self) {
+        self.raised.store(true, Ordering::Release);
+        ipc::note_cross_cpu_wakes(self.waiters.wake_all());
+    }
+}
+
+/// A thread, as a handle names it (ADR-0005 P3). It owns nothing the thread ran on: a handle to
+/// a thread that has ended keeps only this.
+pub(crate) struct ThreadObject {
+    termination: Termination,
+}
+
+impl ThreadObject {
+    const fn new() -> Self {
+        Self {
+            termination: Termination::new(),
+        }
+    }
+
+    /// Its `TERMINATED` signal.
+    pub(crate) const fn termination(&self) -> &Termination {
+        &self.termination
+    }
+}
+
 /// Where a process's threads are, under one lock so that "the last one has ended" and "no more
 /// may start" are one decision.
 struct Lifecycle {
@@ -141,6 +201,8 @@ pub(crate) struct UserContext {
     pub(crate) process: ObjectRef<Process>,
     /// The address space it runs in.
     pub(crate) space: ObjectRef<UserSpace>,
+    /// The thread, as handles name it.
+    pub(crate) thread: ObjectRef<ThreadObject>,
 }
 
 /// One process.
@@ -157,6 +219,8 @@ pub(crate) struct Process {
     debug_calls: bool,
     /// Its threads.
     lifecycle: SpinLock<Lifecycle>,
+    /// `TERMINATED`, raised once its last thread has ended and its handles have closed.
+    termination: Termination,
     /// Developer-only output of `DEBUG_REPORT`.
     reports: SpinLock<ReportLog>,
     /// Its last thread's ending, once it has ended.
@@ -188,6 +252,7 @@ impl Process {
                 latest: None,
                 ended: false,
             }),
+            termination: Termination::new(),
             reports: SpinLock::new(ReportLog {
                 values: [0; REPORTS],
                 count: 0,
@@ -196,6 +261,11 @@ impl Process {
             blocked: AtomicU64::new(0),
             waiting: AtomicU32::new(0),
         })
+    }
+
+    /// Its `TERMINATED` signal.
+    pub(crate) const fn termination(&self) -> &Termination {
+        &self.termination
     }
 
     /// The PML4 (physical), the value for CR3.
@@ -301,17 +371,20 @@ impl Process {
     }
 
     /// Starts a thread of this process on processor `cpu`, at the user address `rip` with
-    /// the stack pointer `rsp` and `rdi` as its RDI; every other register is zero.
+    /// the stack pointer `rsp` and `rdi` as its RDI; every other register is zero. Gives back
+    /// the thread, as handles name it. Refused once the process has ended.
     pub(crate) fn start_thread(
         process: &ObjectRef<Self>,
         cpu: CpuIndex,
         rip: u64,
         rsp: u64,
         rdi: u64,
-    ) -> Result<(), QueueError> {
+    ) -> Result<ObjectRef<ThreadObject>, QueueError> {
+        let thread = ObjectRef::try_new(ThreadObject::new()).map_err(|_| QueueError::Full)?;
         let user = ObjectRef::try_new(UserContext {
             process: process.clone(),
             space: process.memory(),
+            thread: thread.clone(),
         })
         .map_err(|_| QueueError::Full)?;
         // Counted before it can run, so that its own end always finds itself counted.
@@ -324,7 +397,7 @@ impl Process {
             Ok(())
         })?;
         match sched::spawn_user(cpu, user, rip, rsp, rdi) {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(thread),
             Err(e) => {
                 process.start_failed();
                 Err(e)
@@ -351,9 +424,11 @@ impl Process {
         }
     }
 
-    /// The calling thread is ending, for the reason `ending`. If it was the last, every
-    /// handle closes now, and peers see that.
-    pub(crate) fn thread_ended(&self, ending: Ending) {
+    /// The calling thread, `thread`, is ending, for the reason `ending`. `TERMINATED` is raised
+    /// on the thread now. If it was the process's last, every handle closes now, and peers see
+    /// that.
+    pub(crate) fn thread_ended(&self, thread: &ThreadObject, ending: Ending) {
+        thread.termination.raise();
         let last = without_interrupts(|| {
             let mut life = self.lifecycle.lock();
             life.running -= 1;
@@ -380,5 +455,6 @@ impl Process {
         // were only reachable through an undelivered message another processor is reaping
         // this instant close a moment later: they are delayed, never lost.)
         without_interrupts(|| *self.ending.lock() = Some(ending));
+        self.termination.raise();
     }
 }

@@ -78,11 +78,14 @@ pub(crate) fn user_fault(vector: u64, error: u64, address: u64, stack_fixed: boo
     if !stack_fixed {
         cpu::enable_interrupts();
     }
-    caller.process.thread_ended(Ending::Faulted {
-        vector,
-        error,
-        address,
-    });
+    caller.process.thread_ended(
+        &caller.thread,
+        Ending::Faulted {
+            vector,
+            error,
+            address,
+        },
+    );
     cpu::disable_interrupts();
 }
 
@@ -112,7 +115,8 @@ impl server::Calls for UserContext {
     }
 
     fn thread_exit(&self, code: u64) {
-        self.process.thread_ended(Ending::Exited(code));
+        self.process
+            .thread_ended(&self.thread, Ending::Exited(code));
     }
 
     fn debug_report(&self, value: u64) -> Result<(), server::DebugReportError> {
