@@ -80,6 +80,6 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 
 | # | Decision | Blocks |
 |---|---|---|
-| — | Buy the first test machines ADR-0009 chose: #2, then #5 once its serial option is confirmed (H5) | The first physical boot (§74) |
+| — | The owner cannot buy machines for now. The steps that need the owner (sign-ups and small rentals) are in `docs/research/2026-11-09-testing-without-buying-hardware.md` | The first physical boot (§74) |
 | — | Sheet items 30–32: ADR-0007's bus-mastering question, the Loom download's deviation, and CI (`docs/engineering/OWNER_DECISIONS.md`) | Accepting I12; an honest record; §82's M0 |
 | — | Sheet item 39: whether to amend CLAUDE.md §48 and §70 to match ADR-0011 | Keeping the directive and the design in step |

@@ -1481,3 +1481,20 @@ The next work, in ADR-0011 N14's order, starts with the Framekernel framework cr
 
 - Sheet items 30–32 and 39.
 - Buying the machines ADR-0009 chose.
+
+### Continued (2026-11-09, ~07:15–08:10 IST): testing without buying hardware
+
+The owner cannot buy test machines and asked what can be tried today. The research is `docs/research/2026-11-09-testing-without-buying-hardware.md`.
+
+**Tried, on branch `trial/real-x86` only** (GitHub Actions, free): `ORIGIN_QEMU_ACCEL=kvm` in xtask, and a workflow that boots the kernel with KVM. Run 42547942738 on an AMD EPYC 7763: all 8 boots reached the last line (a TCG control, the VT-d model at 1, 2 and 4 CPUs, the AMD-Vi model at 2 and 4 CPUs, the sparse x2APIC machine and `-cpu host`). Run 42550240456, on `ubuntu-26.04`: QEMU reports CET shadow stacks can reach a guest. In KVM mode the harness only checks that the boot reached the end, so the logs were read by hand. The trial branch is not merged.
+
+#### What to know
+
+- **KVM showed costs TCG hid:** one console line takes 4.3 to 4.6 ms on the uncached framebuffer, with interrupts off. The quiesce takes about 0.9 s where configuration reads trap.
+- **One proof cannot pass under KVM:** with a split irqchip QEMU keeps the old route when an I/O APIC pin's IRTE goes away. QEMU's stderr shows it refused the entry.
+- It is a real CPU with software devices and firmware, a 2021 server part outside the declared target. It qualifies nothing.
+
+#### Open for the owner
+
+- Sheet item 32, CI: the trial is the evidence for it.
+- The sign-ups in the report's step list, if and when the owner wants them.
