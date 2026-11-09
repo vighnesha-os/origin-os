@@ -38,6 +38,8 @@ const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
 const LARGE: u64 = 1 << 7;
 const GLOBAL: u64 = 1 << 8;
+/// Set by the processor in any entry a walk has used; software neither needs nor keeps it.
+const ACCESSED: u64 = 1 << 5;
 /// Page-level write-through and cache-disable: with PAT bit 0, they select PAT entry
 /// `PCD << 1 | PWT` (Intel SDM Vol. 3A §11.12.3).
 const PWT: u64 = 1 << 3;
@@ -261,6 +263,17 @@ pub const fn is_canonical(virt: u64) -> bool {
     top == 0 || top == -1
 }
 
+/// Whether two copies of PML4 entries 256–511 name the same tables with the same permissions.
+/// The processor sets the accessed bit in each copy on its own, so that bit does not count.
+pub fn same_kernel_half(a: &[u64; ENTRIES / 2], b: &[u64; ENTRIES / 2]) -> bool {
+    a.iter().zip(b).all(|(x, y)| (x ^ y) & !ACCESSED == 0)
+}
+
+/// Whether every one of these PML4 entries points at a table (ADR-0004 H2).
+pub fn kernel_half_is_complete(entries: &[u64; ENTRIES / 2]) -> bool {
+    entries.iter().all(|e| e & PRESENT != 0)
+}
+
 /// The entry for `virt` at `level` in the table at `table`.
 fn slot(mem: &impl TableMemory, table: u64, virt: u64, level: u32) -> Result<&AtomicU64, MapError> {
     mem.table(table)
@@ -343,6 +356,33 @@ impl AddressSpace {
             e.store(*v, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// Gives every PML4 entry 256–511 that has none a table of its own (ADR-0004 H2), and
+    /// returns how many it made. Afterwards no mapping of the kernel half ever writes the
+    /// PML4, so a copy of these entries stays right for as long as the kernel runs: a mapping
+    /// made later is found through tables that every copy already points at.
+    ///
+    /// Only for the kernel's own address space, once, before any copy is taken. On
+    /// [`MapError::OutOfMemory`] the entries already made stay, and a later call makes the rest.
+    pub fn reserve_upper_half(&mut self, mem: &mut impl TableMemory) -> Result<u32, MapError> {
+        let mut made = 0;
+        for index in ENTRIES / 2..ENTRIES {
+            let entry = mem
+                .table(self.root)
+                .and_then(|t| t.get(index))
+                .ok_or(MapError::UnknownTable(self.root))?;
+            if entry.load(Ordering::Relaxed) & PRESENT != 0 {
+                continue;
+            }
+            let table = mem.allocate_table().ok_or(MapError::OutOfMemory)?;
+            mem.table(self.root)
+                .and_then(|t| t.get(index))
+                .ok_or(MapError::UnknownTable(self.root))?
+                .store(table | PRESENT | WRITABLE, Ordering::Relaxed);
+            made += 1;
+        }
+        Ok(made)
     }
 
     /// Maps the 4 KiB **user** page at `virt` (lower half only) to `phys`.
@@ -1039,6 +1079,97 @@ mod tests {
             Err(MapError::NonCanonical(high)),
             "user mappings stay in the lower half"
         );
+    }
+
+    /// ADR-0004 H2. The defect this closes: a kernel mapping made in a top-level slot of its
+    /// own, after a copy of the kernel half was taken, is missing from that copy.
+    #[test]
+    fn a_mapping_in_a_fresh_slot_reaches_an_earlier_copy_only_if_the_half_was_reserved() {
+        let fresh = 0xFFFF_F000_0000_0000;
+        let build = |reserve: bool, tables: &Vec<Table>| {
+            let mut mem = TablePool::new(tables, ARENA_BASE);
+            let mut kernel = AddressSpace::new(&mut mem).unwrap();
+            if reserve {
+                assert_eq!(kernel.reserve_upper_half(&mut mem), Ok(256));
+            }
+            let half = kernel.upper_half(&mem).unwrap();
+            let mut process = AddressSpace::new(&mut mem).unwrap();
+            process.set_upper_half(&mem, &half).unwrap();
+            kernel.map(&mut mem, fresh, 0x5000, kernel_page()).unwrap();
+            (process.translate(&mem, fresh).map(|t| t.phys), {
+                let now = kernel.upper_half(&mem).unwrap();
+                same_kernel_half(&now, &half)
+            })
+        };
+        let tables = arena(300);
+        assert_eq!(build(false, &tables), (None, false), "today's defect");
+        let tables = arena(300);
+        assert_eq!(build(true, &tables), (Some(0x5000), true));
+    }
+
+    fn kernel_page() -> Attributes {
+        Attributes::kernel_global(Access::Read)
+    }
+
+    #[test]
+    fn reserving_the_half_keeps_what_is_there_and_makes_the_rest() {
+        let tables = arena(300);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        let (a, b) = (0xFFFF_8000_0000_0000, 0xFFFF_FFFF_8000_0000);
+        space.map(&mut mem, a, 0x1000, kernel_page()).unwrap();
+        space.map(&mut mem, b, 0x2000, kernel_page()).unwrap();
+        assert!(!kernel_half_is_complete(&space.upper_half(&mem).unwrap()));
+        assert_eq!(space.reserve_upper_half(&mut mem), Ok(254));
+        let half = space.upper_half(&mem).unwrap();
+        assert!(kernel_half_is_complete(&half));
+        assert_eq!(space.translate(&mem, a).map(|t| t.phys), Some(0x1000));
+        assert_eq!(space.translate(&mem, b).map(|t| t.phys), Some(0x2000));
+        // The new tables are writable, supervisor links: a leaf below one is what decides.
+        for (i, entry) in half.iter().enumerate() {
+            assert_eq!(entry & USER, 0, "slot {}", i + 256);
+            assert_eq!(entry & WRITABLE, WRITABLE, "slot {}", i + 256);
+        }
+        // Doing it again makes nothing, and no slot is ever written again by a later mapping.
+        assert_eq!(space.reserve_upper_half(&mut mem), Ok(0));
+        for slot in 256..512u64 {
+            let virt = 0xFFFF_0000_0000_0000 | (slot << 39);
+            let _ = space.map(&mut mem, virt + 0x20_0000, 0x3000, kernel_page());
+        }
+        assert!(same_kernel_half(&space.upper_half(&mem).unwrap(), &half));
+    }
+
+    #[test]
+    fn a_half_that_cannot_be_reserved_says_so_and_can_be_finished_later() {
+        let tables = arena(5);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        assert_eq!(
+            space.reserve_upper_half(&mut mem),
+            Err(MapError::OutOfMemory)
+        );
+        assert!(!kernel_half_is_complete(&space.upper_half(&mem).unwrap()));
+        assert_eq!(mem.remaining(), 0);
+        // Nothing but the slots that fit were written.
+        let half = space.upper_half(&mem).unwrap();
+        assert_eq!(half.iter().filter(|e| **e & PRESENT != 0).count(), 4);
+    }
+
+    #[test]
+    fn only_the_accessed_bit_may_differ_between_copies_of_the_half() {
+        let mut a = [0u64; ENTRIES / 2];
+        a[3] = 0x1000 | PRESENT | WRITABLE;
+        let mut b = a;
+        assert!(same_kernel_half(&a, &b));
+        b[3] |= ACCESSED;
+        assert!(same_kernel_half(&a, &b), "the processor sets this one");
+        b[3] |= USER;
+        assert!(!same_kernel_half(&a, &b));
+        b[3] = 0x2000 | PRESENT | WRITABLE | ACCESSED;
+        assert!(!same_kernel_half(&a, &b));
+        b = a;
+        b[200] = 1;
+        assert!(!same_kernel_half(&a, &b));
     }
 
     #[test]
