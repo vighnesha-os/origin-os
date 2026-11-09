@@ -153,6 +153,11 @@ fn cases() -> Vec<(Code, Case)> {
         (ReservedWord, s("/// d\nlibrary a.b; transport syscall; version 1.2; /// c\nconst match: u32 = 1;")),
         (ReservedWord, s("/// d\nlibrary a.b; transport syscall; version 1.2; /// c\nconst oidl_x: u32 = 1;")),
         (ReservedWord, s("/// d\nlibrary a.b; transport syscall; version 1.2; /// c\nconst public: u32 = 1;")),
+        // Keywords only from C23, C++20 and C++26: a name the older compilers accept.
+        (ReservedWord, s("/// d\nlibrary a.b; transport syscall; version 1.2; /// c\nconst typeof_unqual: u32 = 1;")),
+        (ReservedWord, s("/// d\nlibrary a.b; transport syscall; version 1.2; /// c\nconst consteval: u32 = 1;")),
+        (ReservedWord, s("/// d\nlibrary a.b; transport syscall; version 1.2; /// c\nconst constinit: u32 = 1;")),
+        (ReservedWord, s("/// d\nlibrary a.b; transport syscall; version 1.2; /// c\nconst contract_assert: u32 = 1;")),
         (ReservedWord, Case::Sources(sys("/// c\nconst vector: u32 = 1;"))),
         (ReservedWord, Case::Sources(sys("/// c\nconst u32: u32 = 1;"))),
         (UnexpectedToken, s("/// d\nlibrary ;")),

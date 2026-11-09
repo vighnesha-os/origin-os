@@ -3,8 +3,8 @@
 //! keyword of a target language, or that would shadow what generated code relies on, is refused
 //! at the source rather than escaped.
 
-/// Rust 2024 keywords and reserved words, C11 and C++17 keywords, and the words the generators
-/// use for themselves. Sorted, so the check is a binary search.
+/// Rust 2024 keywords and reserved words, C keywords through C23, C++ keywords through C++26,
+/// and the words the generators use for themselves. Sorted, so the check is a binary search.
 const RESERVED: &[&str] = &[
     "abstract",
     "alignas",
@@ -37,8 +37,11 @@ const RESERVED: &[&str] = &[
     "concept",
     "const",
     "const_cast",
+    "consteval",
     "constexpr",
+    "constinit",
     "continue",
+    "contract_assert",
     "crate",
     "decltype",
     "default",
@@ -117,6 +120,7 @@ const RESERVED: &[&str] = &[
     "typeid",
     "typename",
     "typeof",
+    "typeof_unqual",
     "union",
     "unsafe",
     "unsigned",
@@ -258,7 +262,18 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(sorted, RESERVED, "binary search needs a sorted list");
         for word in [
-            "match", "gen", "register", "typedef", "class", "template", "oidl_x",
+            "match",
+            "gen",
+            "register",
+            "typedef",
+            "class",
+            "template",
+            "public",
+            "typeof_unqual",
+            "consteval",
+            "constinit",
+            "contract_assert",
+            "oidl_x",
         ] {
             assert!(is_reserved(word), "{word}");
         }

@@ -263,7 +263,20 @@ fn unsafe_appears_only_in_the_named_shims() {
     assert!(checked > 10, "{checked} files");
 }
 
-fn compile_c(language: &str, standard: &str, dir: &Path, source: &str, name: &str) {
+/// The C standards the headers are compiled under: from the first with `_Static_assert` to the
+/// newest published (`docs/spec/OIDL.md` §17).
+const C_STANDARDS: &[&str] = &["c11", "c17", "c23"];
+/// The C++ standards, likewise.
+const CXX_STANDARDS: &[&str] = &["c++11", "c++17", "c++20", "c++23"];
+
+/// Compiles `source` under one standard, with every warning an error.
+fn try_compile_c(
+    language: &str,
+    standard: &str,
+    dir: &Path,
+    source: &str,
+    name: &str,
+) -> Result<(), String> {
     let path = dir.join(name);
     fs::write(&path, source).expect("write");
     let compiler = if language == "c" { "cc" } else { "c++" };
@@ -275,15 +288,30 @@ fn compile_c(language: &str, standard: &str, dir: &Path, source: &str, name: &st
         .args(["-x", language])
         .arg(&path)
         .current_dir(dir);
-    run_ok(cmd, &format!("{compiler} {standard}"));
+    let out = cmd.output().map_err(|e| format!("{compiler}: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+fn compile_c(language: &str, standard: &str, dir: &Path, source: &str, name: &str) {
+    if let Err(message) = try_compile_c(language, standard, dir, source, name) {
+        panic!("{language} {standard} failed:\n{message}");
+    }
 }
 
 #[test]
-fn the_c_headers_compile_as_c11_and_cxx17_and_check_the_layouts() {
+fn the_c_headers_compile_under_every_standard_from_the_oldest_to_the_newest() {
     let tree = tree();
     let source = "#include <origin/kernel.h>\n#include <origin/fixture/echo.h>\n#include <origin/fixture/calls.h>\nint main(void) { return (int)ORIGIN_KERNEL_MAX_MESSAGE_HANDLES * 0; }\n";
-    compile_c("c", "c11", &tree.dir, source, "headers.c");
-    compile_c("c++", "c++17", &tree.dir, source, "headers.cpp");
+    for standard in C_STANDARDS {
+        compile_c("c", standard, &tree.dir, source, "headers.c");
+    }
+    for standard in CXX_STANDARDS {
+        compile_c("c++", standard, &tree.dir, source, "headers.cpp");
+    }
     // The compilers check the layout assertions; pin one, so a removed assertion is noticed.
     let kernel = &tree.files["c/origin/kernel.h"];
     assert!(kernel.contains("ORIGIN_OIDL_ASSERT(sizeof(origin_kernel_read_sizes_t) == 12"));
@@ -297,6 +325,21 @@ fn the_c_headers_compile_as_c11_and_cxx17_and_check_the_layouts() {
         !echo.contains(" bool ") && !echo.contains("_Bool"),
         "a C bool must not appear: {echo}"
     );
+}
+
+#[test]
+fn the_standards_really_change_the_language_being_compiled() {
+    // The control for the test above: if a `-std` flag were ignored, that test would prove
+    // nothing. `bool` is a keyword only from C23, and `consteval` only from C++20.
+    let dir = scratch("c-standards");
+    let c = "int bool = 1;\nint main(void) { return bool - 1; }\n";
+    assert_eq!(try_compile_c("c", "c11", &dir, c, "key.c"), Ok(()));
+    let error = try_compile_c("c", "c23", &dir, c, "key.c").expect_err("C23 reserves bool");
+    assert!(error.contains("error"), "{error}");
+    let cxx = "int consteval = 1;\nint main() { return consteval - 1; }\n";
+    assert_eq!(try_compile_c("c++", "c++11", &dir, cxx, "key.cpp"), Ok(()));
+    let error = try_compile_c("c++", "c++23", &dir, cxx, "key.cpp").expect_err("C++20 reserves it");
+    assert!(error.contains("error"), "{error}");
 }
 
 #[test]
