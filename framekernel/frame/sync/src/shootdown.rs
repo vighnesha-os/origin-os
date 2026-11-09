@@ -164,6 +164,10 @@ pub struct Shootdown<const CPUS: usize> {
     served: [prim::AtomicU64; CPUS],
     /// Which processors take requests.
     online: [prim::AtomicBool; CPUS],
+    /// Each processor's current address-space root (0 before its first switch).
+    loaded: [prim::AtomicU64; CPUS],
+    /// The root a processor is switching away from, while its switch is in flight (else 0).
+    leaving: [prim::AtomicU64; CPUS],
 }
 
 impl<const CPUS: usize> core::fmt::Debug for Shootdown<CPUS> {
@@ -183,6 +187,8 @@ impl<const CPUS: usize> Shootdown<CPUS> {
             generation: prim::AtomicU64::new(0),
             served: [const { prim::AtomicU64::new(0) }; CPUS],
             online: [const { prim::AtomicBool::new(false) }; CPUS],
+            loaded: [const { prim::AtomicU64::new(0) }; CPUS],
+            leaving: [const { prim::AtomicU64::new(0) }; CPUS],
         }
     }
 
@@ -195,6 +201,8 @@ impl<const CPUS: usize> Shootdown<CPUS> {
             generation: prim::AtomicU64::new(0),
             served: core::array::from_fn(|_| prim::AtomicU64::new(0)),
             online: core::array::from_fn(|_| prim::AtomicBool::new(false)),
+            loaded: core::array::from_fn(|_| prim::AtomicU64::new(0)),
+            leaving: core::array::from_fn(|_| prim::AtomicU64::new(0)),
         }
     }
 
@@ -207,6 +215,48 @@ impl<const CPUS: usize> Shootdown<CPUS> {
         }
         prim::fence(Ordering::SeqCst);
         hardware.invalidate(Request::Everything);
+    }
+
+    /// Moves processor `me` from address space `from` to `to`, by running `load` (the CR3
+    /// write). Both count as loaded while the switch is in flight: the old one until the
+    /// processor has really left it, the new one from before it arrives.
+    ///
+    /// The fence is what lets an initiator skip a processor that has not reached the space it
+    /// is changing: this processor's page walks start after the fence, so if the initiator
+    /// read the old `loaded`, its own fence came first, and the walks see its change.
+    pub fn switch_space<R>(&self, me: usize, from: u64, to: u64, load: impl FnOnce() -> R) -> R {
+        if let Some(leaving) = self.leaving.get(me) {
+            leaving.store(from, Ordering::Release);
+        }
+        if let Some(loaded) = self.loaded.get(me) {
+            loaded.store(to, Ordering::Release);
+        }
+        prim::fence(Ordering::SeqCst);
+        let result = load();
+        if let Some(leaving) = self.leaving.get(me) {
+            leaving.store(0, Ordering::Release);
+        }
+        result
+    }
+
+    /// Whether processor `id` has `root` loaded, or is in the middle of leaving it. `loaded`
+    /// is read before `leaving`, the reverse of the order [`switch_space`] writes them, so a
+    /// processor in the middle of a switch counts as holding both.
+    ///
+    /// [`switch_space`]: Self::switch_space
+    fn holds(&self, id: usize, root: u64) -> bool {
+        self.loaded
+            .get(id)
+            .is_some_and(|loaded| loaded.load(Ordering::Acquire) == root)
+            || self
+                .leaving
+                .get(id)
+                .is_some_and(|leaving| leaving.load(Ordering::Acquire) == root)
+    }
+
+    /// How many processors have the address space `root` loaded.
+    pub fn processors_holding(&self, root: u64) -> u32 {
+        (0..CPUS).filter(|&id| self.holds(id, root)).count() as u32
     }
 
     /// Serves the request in progress, if this processor has not yet. Called from the
@@ -292,7 +342,6 @@ impl<const CPUS: usize> Shootdown<CPUS> {
     }
 }
 
-#[cfg(not(all(test, loom)))]
 impl<const CPUS: usize> Default for Shootdown<CPUS> {
     fn default() -> Self {
         Self::new()
@@ -569,6 +618,30 @@ mod tests {
             }
         });
         assert_eq!(finished.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn a_switch_counts_as_holding_both_spaces_until_it_is_done() {
+        let shootdown = Shootdown::<3>::new();
+        assert_eq!(shootdown.processors_holding(7), 0);
+        shootdown.switch_space(1, 0, 7, || {
+            assert_eq!(shootdown.processors_holding(7), 1, "arriving");
+        });
+        assert_eq!(shootdown.processors_holding(7), 1);
+        shootdown.switch_space(1, 7, 9, || {
+            assert_eq!(shootdown.processors_holding(7), 1, "leaving");
+            assert_eq!(shootdown.processors_holding(9), 1, "arriving");
+        });
+        assert_eq!(shootdown.processors_holding(7), 0, "gone");
+        assert_eq!(shootdown.processors_holding(9), 1);
+        // A second processor in the same space.
+        shootdown.switch_space(2, 0, 9, || ());
+        assert_eq!(shootdown.processors_holding(9), 2);
+        // An index past the table counts nothing, and still runs the load.
+        let mut ran = false;
+        shootdown.switch_space(5, 1, 2, || ran = true);
+        assert!(ran);
+        assert_eq!(shootdown.processors_holding(2), 0);
     }
 
     #[test]

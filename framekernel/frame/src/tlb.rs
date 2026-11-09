@@ -115,6 +115,17 @@ pub fn mark_online() {
     SHOOTDOWN.mark_online(&Hardware);
 }
 
+/// Runs `load` (the CR3 write) as processor `me`'s move from address space `from` to `to`.
+pub(crate) fn switch_space<R>(me: usize, from: u64, to: u64, load: impl FnOnce() -> R) -> R {
+    SHOOTDOWN.switch_space(me, from, to, load)
+}
+
+/// Whether any processor has the address space `root` loaded. A user space's tables are freed
+/// only when this is false.
+pub(crate) fn root_loaded(root: u64) -> bool {
+    SHOOTDOWN.processors_holding(root) != 0
+}
+
 /// Serves the request in progress, if this processor has not yet. Runs in the shootdown
 /// interrupt.
 pub fn service() {

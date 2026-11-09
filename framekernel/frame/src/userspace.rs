@@ -6,7 +6,7 @@
 //! copy to or from one goes through [`UserSpace::copy_in`] or [`UserSpace::copy_out`], which
 //! check the range against this space's own tables and recover from a fault at the copy
 //! instruction. Dropping a space frees its tables and frames, but only if no processor
-//! still has it loaded (`cpu::root_loaded`): a safe caller that drops one too early leaks the
+//! still has it loaded (`tlb::root_loaded`): a safe caller that drops one too early leaks the
 //! memory instead of leaving a processor running on freed page tables.
 
 use alloc::vec::Vec;
@@ -292,7 +292,7 @@ impl UserSpace {
 impl Drop for UserSpace {
     fn drop(&mut self) {
         // Leak (not free) a space a processor still has loaded (see the module docs).
-        if crate::cpu::root_loaded(self.space.root()) {
+        if crate::tlb::root_loaded(self.space.root()) {
             core::mem::forget(core::mem::take(&mut self.pages));
             core::mem::forget(core::mem::take(&mut self.tables.frames));
             return;
