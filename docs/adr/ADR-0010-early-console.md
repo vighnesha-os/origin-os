@@ -144,7 +144,7 @@ The framebuffer mapping is kernel-only, writable and never executable, in the ke
 - Amendment 1 says a line is on the wire before any pixel of it is drawn. That is now true of the writer that can wait: it sends its line before it draws. One writer's last section of drawing can run on into the line queued behind its own, so a little of that later line may be drawn before it has gone out.
 - The replay of the early log (E4) is not sent in sections: it runs once, before the timer starts and before any other processor does.
 
-**What it changes.** `framekernel/src/console.rs`, `framekernel/src/serial.rs` (`TxQueue`, `Uart16550::detect_fifo`), `framekernel/src/linequeue.rs` (the ring both sinks use, taken out of `fbconsole::Backlog`), and `developer-tools/xtask`.
+**What it changes.** `framekernel/src/console.rs`, `framekernel/src/serial.rs` (`TxQueue`, `Uart16550::detect_fifo`), `framekernel/src/linequeue.rs` (the ring both sinks use, taken out of `fbconsole::Backlog`), `framekernel/frame/src/timer.rs` (the proof's self-interrupt, a safe call in the framework crate) and `developer-tools/xtask`.
 
 **Alternatives.**
 

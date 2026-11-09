@@ -1,0 +1,18 @@
+[package]
+name = "oidl"
+description = "The Origin interface language: parser, validator and generator (docs/spec/OIDL.md, ADR-0011 N7). Host only: never linked into the OS."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+# Std plus first-party crates only; no third-party dependencies (CLAUDE.md §5).
+[dependencies]
+origin-crypto.workspace = true
+
+# Only to compare the generated values against the hand-written ABI.
+[dev-dependencies]
+origin-abi = { path = "../../runtime/abi" }
+
+[lints]
+workspace = true

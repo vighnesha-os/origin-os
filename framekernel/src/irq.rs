@@ -15,27 +15,25 @@
 //! The register encodings are `framekernel::ioapic`; this module does the indirect MMIO
 //! (IOREGSEL/IOWIN) and the PIT programming. Only the boot processor runs this, with the
 //! local APIC already in x2APIC mode and the 8259 PICs masked (`timer::init`).
+#![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU64, Ordering};
 
-use framekernel::acpi::{self, IoApic, SourceOverride};
-use framekernel::apic;
-use framekernel::ioapic::{self, RemappableEntry};
-use framekernel::vtd::{Irte, SourceCheck};
-use origin_sync::SpinLock;
+use crate::acpi::{self, IoApic, SourceOverride};
+use crate::ioapic::{self, RemappableEntry};
+use crate::vtd::{Irte, SourceCheck};
+use origin_frame::addr::PhysAddr;
+use origin_frame::irq::{self as vectors, Action};
+use origin_frame::mmio::MmioRegion;
+use origin_frame::sync::SpinLock;
 
 use crate::console::Console;
-use crate::cpu::{self, CpuIndex, rdtsc};
+use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
 use crate::iommu::{Detail, Fault, Recorded};
-use crate::outb;
+use crate::timer;
 
-/// The PIT's command port and channel-0 data port.
-const PIT_CHANNEL0: u16 = 0x40;
-/// Channel 0, access lo/hi byte, mode 2 (rate generator), binary.
-const PIT_CHANNEL0_MODE2: u8 = 0x34;
-/// Channel 0, access lo/hi byte, mode 0 (one-shot): used to stop the rate generator.
-const PIT_CHANNEL0_MODE0: u8 = 0x30;
 /// The routed rate, and how many interrupts the proof waits for.
 const HZ: u64 = 100;
 const PROOF_TICKS: u64 = 20;
@@ -57,35 +55,22 @@ const NO_REQUESTER_ID: u16 = 0xFFFF;
 const REASON_NOT_PRESENT: u8 = 0x22;
 const REASON_SOURCE_ID: u8 = 0x26;
 
-/// The mapped I/O APIC: its MMIO virtual base and GSI base.
+/// The mapped I/O APIC: its registers and GSI base. Only the boot processor touches them.
 #[derive(Clone, Copy)]
 struct MappedIoApic {
-    virt: u64,
+    regs: MmioRegion,
     gsi_base: u32,
 }
 
 impl MappedIoApic {
     fn read(&self, index: u32) -> u32 {
-        let sel =
-            core::ptr::with_exposed_provenance_mut::<u32>((self.virt + ioapic::IOREGSEL) as usize);
-        let win = core::ptr::with_exposed_provenance::<u32>((self.virt + ioapic::IOWIN) as usize);
-        // SAFETY: `virt` maps the I/O APIC's registers uncached; writing IOREGSEL selects a
-        // register, with no memory effect. Only the boot processor touches these.
-        unsafe { sel.write_volatile(index) };
-        // SAFETY: reading IOWIN returns the selected register, with no memory effect.
-        unsafe { win.read_volatile() }
+        self.regs.write32(ioapic::IOREGSEL as usize, index);
+        self.regs.read32(ioapic::IOWIN as usize)
     }
 
     fn write(&self, index: u32, value: u32) {
-        let sel =
-            core::ptr::with_exposed_provenance_mut::<u32>((self.virt + ioapic::IOREGSEL) as usize);
-        let win =
-            core::ptr::with_exposed_provenance_mut::<u32>((self.virt + ioapic::IOWIN) as usize);
-        // SAFETY: as for `read`; selecting a register has no memory effect.
-        unsafe { sel.write_volatile(index) };
-        // SAFETY: the only registers written through IOWIN here are the redirection table,
-        // which routes device interrupts.
-        unsafe { win.write_volatile(value) };
+        self.regs.write32(ioapic::IOREGSEL as usize, index);
+        self.regs.write32(ioapic::IOWIN as usize, value);
     }
 
     /// Writes redirection entry `n` (relative to this I/O APIC's GSI base): masked first,
@@ -109,6 +94,34 @@ impl MappedIoApic {
 /// A redirection entry's mask bit (low dword bit 16).
 const MASKED: u32 = 1 << 16;
 
+/// Interrupts taken on the I/O APIC's vector.
+static IOAPIC_IRQS: AtomicU64 = AtomicU64::new(0);
+/// Interrupts taken on the I/O APIC's vector, by the CPU index of the processor that took them.
+static IOAPIC_IRQS_ON: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// How many I/O APIC-routed interrupts have been taken.
+fn ioapic_irqs() -> u64 {
+    IOAPIC_IRQS.load(Ordering::Relaxed)
+}
+
+/// How many I/O APIC-routed interrupts the processor with CPU index `cpu` has taken.
+pub(crate) fn ioapic_irqs_on(cpu: CpuIndex) -> u64 {
+    IOAPIC_IRQS_ON
+        .get(cpu.get())
+        .map_or(0, |n| n.load(Ordering::Relaxed))
+}
+
+/// An I/O APIC-routed interrupt: counted, and the interrupted context resumes.
+fn on_interrupt() -> Action {
+    IOAPIC_IRQS.fetch_add(1, Ordering::Relaxed);
+    if let Some(n) = IOAPIC_IRQS_ON.get(cpu::this_cpu().get()) {
+        n.fetch_add(1, Ordering::Relaxed);
+    }
+    // The console's boot proof prints from this handler once.
+    crate::console::on_proof_interrupt();
+    Action::Resume
+}
+
 /// The pin the PIT's IRQ0 reaches, as [`prove`] found it, kept for [`prove_remapped`].
 #[derive(Clone, Copy)]
 struct PitPin {
@@ -123,27 +136,6 @@ struct PitPin {
 }
 
 static PIT_PIN: SpinLock<Option<PitPin>> = SpinLock::new(None);
-
-/// Programs the PIT channel 0 as a `HZ` rate generator (mode 2).
-fn start_pit() {
-    let divisor = (apic::PIT_HZ / HZ) as u16;
-    // SAFETY: CPL 0, boot processor; the PIT command port cannot affect memory.
-    unsafe { outb(apic::PIT_COMMAND, PIT_CHANNEL0_MODE2) };
-    // SAFETY: as above; the PIT channel-0 data port.
-    unsafe { outb(PIT_CHANNEL0, (divisor & 0xFF) as u8) };
-    // SAFETY: as above; the high byte of the divisor.
-    unsafe { outb(PIT_CHANNEL0, (divisor >> 8) as u8) };
-}
-
-/// Stops the PIT channel 0 (mode 0, count 0: it fires once and then idles).
-fn stop_pit() {
-    // SAFETY: as for `start_pit`; the PIT command port.
-    unsafe { outb(apic::PIT_COMMAND, PIT_CHANNEL0_MODE0) };
-    // SAFETY: as above; channel-0 data, low then high byte of a zero count.
-    unsafe { outb(PIT_CHANNEL0, 0) };
-    // SAFETY: as above.
-    unsafe { outb(PIT_CHANNEL0, 0) };
-}
 
 /// Discovers the I/O APIC, routes the PIT's IRQ0 through it to the boot processor, and
 /// proves periodic interrupts arrive. `rsdp` is the ACPI RSDP, `bsp` the boot processor's
@@ -178,7 +170,7 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
         );
         return false;
     };
-    let virt = match crate::vm::map_mmio(u64::from(io.address), 0x1000) {
+    let regs = match crate::vm::map_mmio(PhysAddr::new(u64::from(io.address)), 0x1000) {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(
@@ -190,7 +182,7 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
         }
     };
     let mapped = MappedIoApic {
-        virt,
+        regs,
         gsi_base: io.gsi_base,
     };
     let entries = ioapic::max_redirection_entry(mapped.read(ioapic::REG_VERSION)) + 1;
@@ -224,16 +216,23 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
         cpu::IOAPIC_VECTOR
     );
 
-    let before = cpu::ioapic_irqs();
+    if vectors::register(cpu::IOAPIC_VECTOR, on_interrupt).is_err() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: I/O APIC: its interrupt vector is already taken: I/O APIC failed"
+        );
+        return false;
+    }
+    let before = ioapic_irqs();
     let (low, high) =
         ioapic::redirection_entry(cpu::IOAPIC_VECTOR, destination, active_low, level, false);
     mapped.set_redirection(index, low, high);
-    start_pit();
+    timer::pit_channel0_start(HZ);
 
     // Count interrupts, polling with interrupt windows (never halting), within two seconds.
     let start = rdtsc();
     let limit = tsc_hz.saturating_mul(2);
-    while cpu::ioapic_irqs() - before < PROOF_TICKS && rdtsc().wrapping_sub(start) < limit {
+    while ioapic_irqs() - before < PROOF_TICKS && rdtsc().wrapping_sub(start) < limit {
         cpu::interrupt_window();
         core::hint::spin_loop();
     }
@@ -242,9 +241,9 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
     let (masked_low, _) =
         ioapic::redirection_entry(cpu::IOAPIC_VECTOR, destination, active_low, level, true);
     mapped.set_redirection(index, masked_low, high);
-    stop_pit();
+    timer::pit_channel0_stop();
 
-    let taken = cpu::ioapic_irqs() - before;
+    let taken = ioapic_irqs() - before;
     let micros = elapsed.saturating_mul(1_000_000) / tsc_hz.max(1);
     let ok = taken >= PROOF_TICKS;
     let _ = writeln!(
@@ -258,7 +257,7 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
 
 /// Interrupts each of `cpus` has taken on the I/O APIC vector so far.
 fn taken(cpus: &[CpuIndex]) -> Vec<u64> {
-    cpus.iter().map(|&c| cpu::ioapic_irqs_on(c)).collect()
+    cpus.iter().map(|&c| ioapic_irqs_on(c)).collect()
 }
 
 /// Interrupts taken since `before` (from [`taken`] over the same `cpus`): on `target`, and
@@ -266,7 +265,7 @@ fn taken(cpus: &[CpuIndex]) -> Vec<u64> {
 fn since(cpus: &[CpuIndex], before: &[u64], target: CpuIndex) -> (u64, u64) {
     let (mut on, mut elsewhere) = (0, 0);
     for (&c, &b) in cpus.iter().zip(before) {
-        let n = cpu::ioapic_irqs_on(c).wrapping_sub(b);
+        let n = ioapic_irqs_on(c).wrapping_sub(b);
         if c == target {
             on += n;
         } else {
@@ -290,8 +289,8 @@ fn wait_ms(ms: u64, tsc_hz: u64) {
 /// Waits, for at most a second, until `cpu` has taken `n` more interrupts on the I/O APIC
 /// vector; returns whether it did.
 fn wait_for(cpu: CpuIndex, n: u64, tsc_hz: u64) -> bool {
-    let from = cpu::ioapic_irqs_on(cpu);
-    let more = || cpu::ioapic_irqs_on(cpu).wrapping_sub(from) >= n;
+    let from = ioapic_irqs_on(cpu);
+    let more = || ioapic_irqs_on(cpu).wrapping_sub(from) >= n;
     crate::sched::yield_until(more, tsc_hz, 1);
     more()
 }
@@ -480,10 +479,10 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
     // 2. Delivered: the PIT's interrupts arrive on the target, through the IRTE.
     let before = taken(&ids);
     let start = rdtsc();
-    start_pit();
-    let from = cpu::ioapic_irqs_on(target);
+    timer::pit_channel0_start(HZ);
+    let from = ioapic_irqs_on(target);
     crate::sched::yield_until(
-        || cpu::ioapic_irqs_on(target).wrapping_sub(from) >= PROOF_TICKS,
+        || ioapic_irqs_on(target).wrapping_sub(from) >= PROOF_TICKS,
         tsc_hz,
         2,
     );
@@ -586,7 +585,7 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
     if let Some((low, high)) = encoded {
         pin.io.set_redirection(pin.entry, low | MASKED, high);
     }
-    stop_pit();
+    timer::pit_channel0_stop();
     let masked = ioapic::is_masked(pin.io.redirection(pin.entry).0);
     let released = crate::iommu::release_pin(&route).is_ok();
     let (after, _) = crate::iommu::take_faults();
