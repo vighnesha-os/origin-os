@@ -307,14 +307,14 @@ impl Accel {
     }
 
     /// The complete lines of a boot that failure messages are looked for in: under KVM,
-    /// without the two lines [`kvm_cannot_pass`] describes.
+    /// without the lines [`kvm_forgives`] describes.
     fn judged(self, complete: &str) -> Cow<'_, str> {
         match self {
             Accel::Tcg => Cow::Borrowed(complete),
             Accel::Kvm => Cow::Owned(
                 complete
                     .lines()
-                    .filter(|l| !kvm_cannot_pass(l))
+                    .filter(|l| !kvm_forgives(l))
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
@@ -322,13 +322,13 @@ impl Accel {
     }
 
     /// The failure messages a screen is searched for. A screen wraps long lines, so under KVM
-    /// the two lines [`kvm_cannot_pass`] describes cannot be told from the rest there, and the
-    /// screen-only boot leaves that one message to the boots with a serial port.
+    /// the lines [`kvm_forgives`] describes cannot be told from the rest there, and the
+    /// screen-only boot leaves those two messages to the boots with a serial port.
     fn screen_failures(self, failures: &[&'static str]) -> Vec<&'static str> {
         failures
             .iter()
             .copied()
-            .filter(|f| self == Accel::Tcg || *f != IOAPIC_FAILED)
+            .filter(|f| self == Accel::Tcg || (*f != IOAPIC_FAILED && *f != CLOCK_FAILED))
             .collect()
     }
 }
@@ -614,13 +614,57 @@ fn kvm_pin_markers(scenario: &mut Scenario) {
     }
 }
 
-/// True for the two lines of [`kvm_pin_markers`], exactly as KVM leaves them: no fault was
-/// recorded and the interrupts came back. Any other shape is a failure like any other.
-fn kvm_cannot_pass(line: &str) -> bool {
+/// True for a line reporting a failure under KVM that says nothing about the kernel. Every
+/// other failure fails the boot.
+fn kvm_forgives(line: &str) -> bool {
+    is_pin_limit(line) || is_small_tsc_step(line)
+}
+
+/// The two lines of [`kvm_pin_markers`], exactly as KVM leaves them: no fault was recorded and
+/// the interrupts came back.
+fn is_pin_limit(line: &str) -> bool {
     line.starts_with("origin-kernel: I/O APIC: IRTE ")
         && (line.contains(" not present: ") || line.contains(" checking source ID "))
         && line.contains("; fault recorded: none; IRTE restored, ")
         && line.ends_with(" again: true; consistent false: I/O APIC failed")
+}
+
+/// The largest step back in the TSC [`is_small_tsc_step`] lets pass: under half a microsecond
+/// at the rates these machines run.
+const KVM_TSC_STEP_LIMIT: u64 = 1000;
+
+/// The TSC proof's line when all it saw was a rare, tiny step back. On a runner the guest's
+/// processors are virtual processors of a virtual machine, which the hypervisors below can
+/// move between physical processors whose counters agree only to within nanoseconds: an AMD
+/// EPYC 9V45 runner showed one step of 16 ticks in 261,083 handoffs. A steady offset between
+/// two processors would step back on nearly every handoff one way, and a large step is not
+/// this, so neither is forgiven. TCG, whose processors share one clock, holds the proof to
+/// zero.
+fn is_small_tsc_step(line: &str) -> bool {
+    if !line.starts_with("origin-kernel: clock: TSC consistent across ") {
+        return false;
+    }
+    let tail = " ticks): clock failed";
+    match (
+        number_before(line, " handoffs between"),
+        number_before(line, " backwards (worst "),
+        number_before(line, tail),
+    ) {
+        (Some(handoffs), Some(backwards), Some(worst)) => {
+            line.ends_with(tail)
+                && backwards >= 1
+                && backwards.saturating_mul(1000) <= handoffs
+                && worst < KVM_TSC_STEP_LIMIT
+        }
+        _ => false,
+    }
+}
+
+/// The decimal number written immediately before the first `word` in `text`.
+fn number_before(text: &str, word: &str) -> Option<u64> {
+    let head = text.get(..text.find(word)?)?;
+    let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    head.get(head.len() - digits..)?.parse().ok()
 }
 
 /// The `boot-bridge` machine (`ORIGIN_QEMU_BRIDGE=on`): the NIC at 01:00.0 behind a PCIe root
@@ -1283,7 +1327,7 @@ fn boot_failures() -> Vec<&'static str> {
         ": NMI stack failed",
         ": higher half failed",
         ": process isolation failed",
-        ": clock failed",
+        CLOCK_FAILED,
         ": HPET failed",
         IOAPIC_FAILED,
         ": PM timer failed",
@@ -1322,6 +1366,8 @@ const HALT_LINE: &str = "origin-kernel: M1 entry complete; halting";
 
 /// How every I/O APIC proof ends a line that failed.
 const IOAPIC_FAILED: &str = ": I/O APIC failed";
+/// How every clock proof ends a line that failed.
+const CLOCK_FAILED: &str = ": clock failed";
 
 /// The screen after a whole boot: exactly what the serial log says it must show (the
 /// console writes one line at a time to both).
@@ -4153,8 +4199,8 @@ mod tests {
 
     #[test]
     fn kvm_forgives_only_the_two_lines_qemu_cannot_pass() {
-        assert!(kvm_cannot_pass(KVM_NOT_PRESENT));
-        assert!(kvm_cannot_pass(KVM_WRONG_SOURCE));
+        assert!(kvm_forgives(KVM_NOT_PRESENT));
+        assert!(kvm_forgives(KVM_WRONG_SOURCE));
         for line in [
             // The interrupts did not come back.
             KVM_NOT_PRESENT.replace("again: true", "again: false"),
@@ -4165,8 +4211,41 @@ mod tests {
             "origin-kernel: I/O APIC: remapped: the entry masked, the PIT stopped and IRTE 5 released: false; 0 fault(s) recorded after: I/O APIC failed".to_string(),
             "origin-kernel: I/O APIC: remapped: 0 PIT interrupts arrived on CPU 1 (APIC ID 1) through IRTE 5 in 200 ms, 0 on other CPUs; fault recorded: none; consistent false: I/O APIC failed".to_string(),
         ] {
-            assert!(!kvm_cannot_pass(&line), "{line}");
+            assert!(!kvm_forgives(&line), "{line}");
         }
+    }
+
+    /// As the kernel printed it on an AMD EPYC 9V45 (Actions run 42555218264).
+    const KVM_TSC_STEP: &str = "origin-kernel: clock: TSC consistent across 2 processors: 261609 ordered readings, 261083 handoffs between processors, 1 backwards (worst 16 ticks): clock failed";
+
+    #[test]
+    fn kvm_forgives_only_a_rare_tiny_step_back_in_the_tsc() {
+        assert!(kvm_forgives(KVM_TSC_STEP));
+        for line in [
+            // At the limit.
+            KVM_TSC_STEP.replace("worst 16 ticks", "worst 1000 ticks"),
+            // A steady offset: backwards on far more than one handoff in a thousand.
+            KVM_TSC_STEP.replace("1 backwards", "262 backwards"),
+            // It failed for another reason: too few handoffs, or a thread that never ended.
+            KVM_TSC_STEP.replace("1 backwards (worst 16", "0 backwards (worst 0"),
+            // Another clock proof.
+            "origin-kernel: clock: TSC rate 0: clock failed".to_string(),
+        ] {
+            assert!(!kvm_forgives(&line), "{line}");
+        }
+        // The most the ratio allows passes.
+        assert!(kvm_forgives(
+            &KVM_TSC_STEP.replace("1 backwards", "261 backwards")
+        ));
+    }
+
+    #[test]
+    fn number_before_reads_the_digits_right_before_the_word() {
+        assert_eq!(number_before("a 12 b", " b"), Some(12));
+        assert_eq!(number_before("12 b", " b"), Some(12));
+        assert_eq!(number_before("a b", " b"), None);
+        assert_eq!(number_before("a 1x b", " b"), None);
+        assert_eq!(number_before("a 12", " b"), None);
     }
 
     #[test]
@@ -4185,7 +4264,8 @@ mod tests {
         );
         let on_kvm = Accel::Kvm.screen_failures(&failures);
         assert!(!on_kvm.contains(&IOAPIC_FAILED));
-        assert_eq!(on_kvm.len(), failures.len() - 1);
+        assert!(!on_kvm.contains(&CLOCK_FAILED));
+        assert_eq!(on_kvm.len(), failures.len() - 2);
     }
 
     /// The KVM markers replace those two steps, and only those: they match what KVM prints and

@@ -11,10 +11,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches:
-      - main
-      # Only while this workflow is being proven, before its pull request exists.
-      - claude/interesting-carson-ae7c83
+    branches: [main]
 
 permissions:
   contents: read
