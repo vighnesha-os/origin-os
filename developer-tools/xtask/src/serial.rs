@@ -35,6 +35,18 @@ pub(crate) fn clean(raw: &[u8]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The first marker of `markers` that does not appear in `text` in order, if any.
+pub(crate) fn first_missing<'a>(text: &str, markers: &[&'a str]) -> Option<&'a str> {
+    let mut rest = text;
+    for m in markers {
+        match rest.find(m) {
+            Some(at) => rest = rest.get(at + m.len()..).unwrap_or(""),
+            None => return Some(m),
+        }
+    }
+    None
+}
+
 /// True if every marker appears in `text`, each one after the end of the previous match.
 pub(crate) fn contains_in_order(text: &str, markers: &[&str]) -> bool {
     let mut rest = text;

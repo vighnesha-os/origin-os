@@ -8,8 +8,8 @@ version = "0.0.0"
 dependencies = [
  "origin-abi",
  "origin-boot-info",
+ "origin-frame",
  "origin-paging",
- "origin-sync",
  "origin-version",
 ]
 
@@ -86,6 +86,16 @@ dependencies = [
 [[package]]
 name = "origin-crypto"
 version = "0.0.0"
+
+[[package]]
+name = "origin-frame"
+version = "0.0.0"
+dependencies = [
+ "origin-abi",
+ "origin-boot-info",
+ "origin-paging",
+ "origin-sync",
+]
 
 [[package]]
 name = "origin-paging"

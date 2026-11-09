@@ -14,22 +14,25 @@
 //! attaches the device to a domain of its own and gives it IOVAs (ADR-0007); otherwise the
 //! device uses physical addresses (virtio 1.1 §6). x86 DMA is cache-coherent. The MSI-X
 //! entries are programmed through `iommu::msi_message` (remappable handles when interrupts
-//! are remapped). The `unsafe` here is volatile MMIO and volatile access to those DMA pages
-//! (`DeviceMem`): the device can write them at any moment, so no reference ever covers them
-//! and a received frame is copied out once, into kernel memory, before anything parses it.
+//! are remapped). The device can write its DMA pages at any moment, so no reference ever covers
+//! them and a received frame is copied out once, into kernel memory, before anything parses it
+//! (the framework's `DmaFrame` accessors).
+#![forbid(unsafe_code)]
 
 use core::fmt::Write;
-use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
 
-use framekernel::net::{self, Arp, EthFrame, Ipv4, Mac, arp_op, ethertype};
-use framekernel::pci::{self, Address};
-use framekernel::virtio::{self, feature, status};
-use framekernel::virtqueue::{self, Descriptor, F_WRITE, RingMemory};
-use origin_sync::SpinLock;
+use crate::net::{self, Arp, EthFrame, Ipv4, Mac, arp_op, ethertype};
+use crate::pci::{self, Address};
+use crate::virtio::{self, feature, status};
+use crate::virtqueue::{self, Descriptor, F_WRITE, RingMemory};
+use origin_frame::addr::PhysAddr;
+use origin_frame::dma::{DmaFrame, DmaPage};
+use origin_frame::mmio::MmioRegion;
+use origin_frame::sync::SpinLock;
 
 use crate::console::Console;
-use crate::dma::{DeviceDma, DmaPage};
+use crate::dma::DeviceDma;
 use crate::wait::WaitQueue;
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
@@ -45,30 +48,23 @@ const TX_MSIX_ENTRY: u16 = 2;
 const NO_VECTOR: u16 = 0xFFFF;
 
 /// The device, its MSI-X table (mapped) and the x2APIC ID its entries target, once set up.
-static NET_MSIX: SpinLock<Option<(Address, u64, u32)>> = SpinLock::new(None);
+static NET_MSIX: SpinLock<Option<(Address, MmioRegion, u32)>> = SpinLock::new(None);
 
 /// The messages in the NIC's receive and transmit MSI-X entries, each with the vector and
 /// the processor it must reach (for the interrupt-remapping proof); empty before bring-up.
-pub(crate) fn msix_routes() -> alloc::vec::Vec<(Address, framekernel::vtd::MsiMessage, u8, u32)> {
+pub(crate) fn msix_routes() -> alloc::vec::Vec<(Address, crate::vtd::MsiMessage, u8, u32)> {
     let Some((at, table, target)) = crate::cpu::without_interrupts(|| *NET_MSIX.lock()) else {
         return alloc::vec::Vec::new();
     };
-    let word = |entry: u16, w: u64| {
-        let p = ptr::with_exposed_provenance::<u32>(
-            (table + u64::from(entry) * pci::MSIX_ENTRY + 4 * w) as usize,
-        );
-        // SAFETY: inside the MSI-X table (`enable_msix_table` checked it against its BAR and
-        // mapped it uncached; both entries are below its entry count). Reading an entry has
-        // no effect on the device.
-        unsafe { p.read_volatile() }
-    };
+    let word =
+        |entry: u16, w: u64| table.read32((u64::from(entry) * pci::MSIX_ENTRY + 4 * w) as usize);
     [
         (RX_MSIX_ENTRY, crate::cpu::NET_VECTOR),
         (TX_MSIX_ENTRY, crate::cpu::NET_TX_VECTOR),
     ]
     .into_iter()
     .map(|(entry, vector)| {
-        let message = framekernel::vtd::MsiMessage {
+        let message = crate::vtd::MsiMessage {
             address: u64::from(word(entry, 0)) | u64::from(word(entry, 1)) << 32,
             data: word(entry, 2),
         };
@@ -86,9 +82,9 @@ static NET_WAIT: WaitQueue = WaitQueue::new();
 /// NIC interrupts that found the receive thread asleep and woke it.
 static NET_WAKES: AtomicU64 = AtomicU64::new(0);
 
-/// Called from the NIC's interrupt vector (`cpu::NET_VECTOR`): records the used-buffer
-/// interrupt and wakes the receive thread, which then reads the used ring itself.
-pub(crate) fn on_interrupt() {
+/// The NIC's interrupt vector (`cpu::NET_VECTOR`), registered at bring-up: records the
+/// used-buffer interrupt and wakes the receive thread, which then reads the used ring itself.
+fn on_interrupt() -> origin_frame::irq::Action {
     NET_IRQS.fetch_add(1, Ordering::Relaxed);
     NET_IRQ_CPU.store(
         (crate::cpu::this_cpu().get() as u64).saturating_add(1),
@@ -97,6 +93,7 @@ pub(crate) fn on_interrupt() {
     if NET_WAIT.wake_one() {
         NET_WAKES.fetch_add(1, Ordering::Relaxed);
     }
+    origin_frame::irq::Action::Reschedule
 }
 
 /// The bytes of the common configuration structure this driver uses: through the 64-bit
@@ -107,118 +104,54 @@ const DEVICE_CONFIG_LEN: u32 = 8;
 
 // Common-configuration register offsets (virtio 1.1 §4.1.4.3).
 mod reg {
-    pub(super) const DEVICE_FEATURE_SELECT: u64 = 0;
-    pub(super) const DEVICE_FEATURE: u64 = 4;
-    pub(super) const DRIVER_FEATURE_SELECT: u64 = 8;
-    pub(super) const DRIVER_FEATURE: u64 = 12;
-    pub(super) const CONFIG_MSIX_VECTOR: u64 = 16;
-    pub(super) const DEVICE_STATUS: u64 = 20;
-    pub(super) const QUEUE_SELECT: u64 = 22;
-    pub(super) const QUEUE_SIZE: u64 = 24;
-    pub(super) const QUEUE_MSIX_VECTOR: u64 = 26;
-    pub(super) const QUEUE_ENABLE: u64 = 28;
-    pub(super) const QUEUE_NOTIFY_OFF: u64 = 30;
-    pub(super) const QUEUE_DESC: u64 = 32;
-    pub(super) const QUEUE_DRIVER: u64 = 40;
-    pub(super) const QUEUE_DEVICE: u64 = 48;
-}
-
-// --- volatile MMIO over a mapped BAR virtual address ---
-
-fn r8(a: u64) -> u8 {
-    // SAFETY: `a` is inside a BAR region mapped uncached by `vm::map_mmio`; the device may
-    // change it, so the read is volatile and no reference is formed.
-    unsafe { ptr::with_exposed_provenance::<u8>(a as usize).read_volatile() }
-}
-fn w8(a: u64, v: u8) {
-    // SAFETY: as `r8`; a configuration write reaches only this device's register.
-    unsafe { ptr::with_exposed_provenance_mut::<u8>(a as usize).write_volatile(v) }
-}
-fn r16(a: u64) -> u16 {
-    // SAFETY: as `r8`, 2-byte access to an aligned register.
-    unsafe { ptr::with_exposed_provenance::<u16>(a as usize).read_volatile() }
-}
-fn w16(a: u64, v: u16) {
-    // SAFETY: as `w8`.
-    unsafe { ptr::with_exposed_provenance_mut::<u16>(a as usize).write_volatile(v) }
-}
-fn r32(a: u64) -> u32 {
-    // SAFETY: as `r8`, 4-byte access to an aligned register.
-    unsafe { ptr::with_exposed_provenance::<u32>(a as usize).read_volatile() }
-}
-fn w32(a: u64, v: u32) {
-    // SAFETY: as `w8`.
-    unsafe { ptr::with_exposed_provenance_mut::<u32>(a as usize).write_volatile(v) }
-}
-fn w64(a: u64, v: u64) {
-    w32(a, v as u32);
-    w32(a + 4, (v >> 32) as u32);
+    pub(super) const DEVICE_FEATURE_SELECT: usize = 0;
+    pub(super) const DEVICE_FEATURE: usize = 4;
+    pub(super) const DRIVER_FEATURE_SELECT: usize = 8;
+    pub(super) const DRIVER_FEATURE: usize = 12;
+    pub(super) const CONFIG_MSIX_VECTOR: usize = 16;
+    pub(super) const DEVICE_STATUS: usize = 20;
+    pub(super) const QUEUE_SELECT: usize = 22;
+    pub(super) const QUEUE_SIZE: usize = 24;
+    pub(super) const QUEUE_MSIX_VECTOR: usize = 26;
+    pub(super) const QUEUE_ENABLE: usize = 28;
+    pub(super) const QUEUE_NOTIFY_OFF: usize = 30;
+    pub(super) const QUEUE_DESC: usize = 32;
+    pub(super) const QUEUE_DRIVER: usize = 40;
+    pub(super) const QUEUE_DEVICE: usize = 48;
 }
 
 /// The bytes of one DMA page.
 const DMA_PAGE: usize = 4096;
 
 /// One DMA page the device may write at any moment: a ring, or a frame buffer. The kernel
-/// touches it only through the volatile accesses here, so no Rust reference ever covers
+/// touches it only through the framework's volatile accessors, so no Rust reference ever covers
 /// device-writable memory. A ring field is one aligned load or store of its own width, so it
-/// cannot tear; frame bytes are copied once, into or out of kernel memory.
+/// cannot tear; frame bytes are copied once, into or out of kernel memory. `None` until the
+/// page is allocated.
 #[derive(Clone, Copy)]
 struct DeviceMem {
-    virt: u64,
+    frame: Option<DmaFrame>,
 }
 
 impl DeviceMem {
+    const EMPTY: Self = Self { frame: None };
+
     /// The page `DeviceDma::page` handed out (kept for ever, so the address stays valid).
     fn of(page: DmaPage) -> Self {
-        Self { virt: page.virt }
-    }
-
-    /// Where a `T` at byte offset `at` lives, if it is inside the page and aligned.
-    fn field<T>(self, at: usize) -> Option<*mut T> {
-        let end = at.checked_add(size_of::<T>())?;
-        (end <= DMA_PAGE && at.is_multiple_of(align_of::<T>()))
-            .then(|| ptr::with_exposed_provenance_mut::<T>(self.virt as usize + at))
-    }
-
-    /// Reads a `T` at `at`; zero for one outside the page or misaligned. (`virtqueue` keeps
-    /// every field inside a page and aligned.)
-    fn load<T: Copy + Default>(self, at: usize) -> T {
-        self.field::<T>(at).map_or_else(T::default, |p| {
-            // SAFETY: `p` is aligned and inside this page (`field`), which stays allocated for
-            // ever. A volatile load forms no reference; the device may write it concurrently.
-            unsafe { p.read_volatile() }
-        })
-    }
-
-    /// Writes a `T` at `at`, if that is inside the page and aligned.
-    fn store<T: Copy>(self, at: usize, value: T) {
-        if let Some(p) = self.field::<T>(at) {
-            // SAFETY: as `load`; the kernel owns this field's value until it publishes it.
-            unsafe { p.write_volatile(value) };
+        Self {
+            frame: Some(page.frame()),
         }
     }
 
     /// Copies `out.len()` bytes from offset `at` into `out` with volatile reads; `false` if
     /// they are not all inside the page.
     fn copy_out(self, at: usize, out: &mut [u8]) -> bool {
-        if at.checked_add(out.len()).is_none_or(|end| end > DMA_PAGE) {
-            return false;
-        }
-        for (i, byte) in out.iter_mut().enumerate() {
-            *byte = self.load(at + i);
-        }
-        true
+        self.frame.is_some_and(|f| f.copy_out(at, out))
     }
 
     /// Copies `bytes` to offset `at` with volatile writes; `false` if they do not fit.
     fn copy_in(self, at: usize, bytes: &[u8]) -> bool {
-        if at.checked_add(bytes.len()).is_none_or(|end| end > DMA_PAGE) {
-            return false;
-        }
-        for (i, &byte) in bytes.iter().enumerate() {
-            self.store(at + i, byte);
-        }
-        true
+        self.frame.is_some_and(|f| f.copy_in(at, bytes))
     }
 }
 
@@ -227,22 +160,28 @@ impl RingMemory for DeviceMem {
         DMA_PAGE
     }
     fn read_u16(&self, at: usize) -> u16 {
-        u16::from_le(self.load(at))
+        u16::from_le(self.frame.map_or(0, |f| f.read16(at)))
     }
     fn read_u32(&self, at: usize) -> u32 {
-        u32::from_le(self.load(at))
+        u32::from_le(self.frame.map_or(0, |f| f.read32(at)))
     }
     fn read_u64(&self, at: usize) -> u64 {
-        u64::from_le(self.load(at))
+        u64::from_le(self.frame.map_or(0, |f| f.read64(at)))
     }
     fn write_u16(&mut self, at: usize, value: u16) {
-        self.store(at, value.to_le());
+        if let Some(f) = self.frame {
+            f.write16(at, value.to_le());
+        }
     }
     fn write_u32(&mut self, at: usize, value: u32) {
-        self.store(at, value.to_le());
+        if let Some(f) = self.frame {
+            f.write32(at, value.to_le());
+        }
     }
     fn write_u64(&mut self, at: usize, value: u64) {
-        self.store(at, value.to_le());
+        if let Some(f) = self.frame {
+            f.write64(at, value.to_le());
+        }
     }
 }
 
@@ -260,7 +199,7 @@ struct Queue {
 /// transmits through [`TX`].)
 #[derive(Clone, Copy)]
 struct Setup {
-    notify_base: u64,
+    notify_base: MmioRegion,
     mul: u32,
     rx: Queue,
     mac: [u8; 6],
@@ -282,7 +221,7 @@ const ANNOUNCEMENTS: usize = N_TX + 1;
 /// free list as the device reports them completed in the used ring.
 struct TxRing {
     q: Queue,
-    notify_base: u64,
+    notify_base: MmioRegion,
     mul: u32,
     /// Each descriptor's buffer: (where the kernel reaches it, bus address).
     bufs: [(DeviceMem, u64); N_TX],
@@ -313,13 +252,15 @@ static TX_SLEPT: AtomicU64 = AtomicU64::new(0);
 /// How often the device claimed more completions than a ring holds.
 static DEVICE_FAULTS: AtomicU64 = AtomicU64::new(0);
 
-/// Called from the NIC's TX-completion vector (`cpu::NET_TX_VECTOR`): counts it and wakes
-/// a transmitter waiting for a descriptor, which then reclaims the completions itself.
-pub(crate) fn on_tx_interrupt() {
+/// The NIC's TX-completion vector (`cpu::NET_TX_VECTOR`), registered at bring-up: counts it
+/// and wakes a transmitter waiting for a descriptor, which then reclaims the completions
+/// itself.
+fn on_tx_interrupt() -> origin_frame::irq::Action {
     TX_IRQS.fetch_add(1, Ordering::Relaxed);
     if TX_WAIT.wake_one() {
         TX_WAKES.fetch_add(1, Ordering::Relaxed);
     }
+    origin_frame::irq::Action::Reschedule
 }
 
 /// Set by the receive thread once its buffers are posted, just before it sleeps for the
@@ -334,14 +275,40 @@ static RX_LEASE: AtomicU64 = AtomicU64::new(0);
 /// How often the receive thread blocked waiting for a frame.
 static RX_BLOCKED: AtomicU64 = AtomicU64::new(0);
 
-/// Maps the BAR holding capability `loc` and returns the virtual address of its structure,
-/// which must lie inside that memory BAR and be at least `min` bytes long: the offset and
-/// length are the device's, and the driver reads and writes through this address.
-fn map_structure(dev: &crate::pcie::Device, loc: virtio::CfgLocation, min: u32) -> Option<u64> {
-    let bar = dev.bars.get(usize::from(loc.bar))?.as_ref()?;
-    let address = loc.address_in(bar, min)?;
-    let base = crate::vm::map_mmio(bar.address, bar.size).ok()?;
-    Some(base + (address - bar.address))
+/// The device's BARs, each mapped at most once: its structures can share a BAR, and a range
+/// of device registers has one owner (`vm::map_mmio`).
+struct Bars<'a> {
+    dev: &'a crate::pcie::Device,
+    mapped: [Option<MmioRegion>; 6],
+}
+
+impl<'a> Bars<'a> {
+    fn new(dev: &'a crate::pcie::Device) -> Self {
+        Self {
+            dev,
+            mapped: [None; 6],
+        }
+    }
+
+    /// BAR `index`, mapped.
+    fn region(&mut self, index: usize) -> Option<MmioRegion> {
+        let bar = self.dev.bars.get(index)?.as_ref()?;
+        let slot = self.mapped.get_mut(index)?;
+        if slot.is_none() {
+            *slot = Some(crate::vm::map_mmio(PhysAddr::new(bar.address), bar.size).ok()?);
+        }
+        *slot
+    }
+
+    /// The structure a capability names, inside its memory BAR and at least `min` bytes long:
+    /// the offset and length are the device's, and the driver reads and writes through this
+    /// region. It covers the structure's whole `length`.
+    fn map_structure(&mut self, loc: virtio::CfgLocation, min: u32) -> Option<MmioRegion> {
+        let bar = self.dev.bars.get(usize::from(loc.bar))?.as_ref()?;
+        let address = loc.address_in(bar, min)?;
+        let region = self.region(usize::from(loc.bar))?;
+        region.slice((address - bar.address) as usize, loc.length as usize)
+    }
 }
 
 /// Sets up queue `q`: a smaller-of device size and 256 ring in three DMA pages (from `dma`),
@@ -350,24 +317,24 @@ fn map_structure(dev: &crate::pcie::Device, loc: virtio::CfgLocation, min: u32) 
 /// take. `None` if the device offers no queue, one whose size is not a power of two, or a
 /// notification register outside its notification structure `notify`.
 fn setup_queue(
-    common: u64,
+    common: MmioRegion,
     q: u16,
     vector: u16,
     dma: DeviceDma,
     notify: virtio::CfgLocation,
     mul: u32,
 ) -> Option<Queue> {
-    w16(common + reg::QUEUE_SELECT, q);
-    let size = virtqueue::queue_size(r16(common + reg::QUEUE_SIZE), 256)?;
-    w16(common + reg::QUEUE_SIZE, size as u16);
-    let notify_off = r16(common + reg::QUEUE_NOTIFY_OFF);
+    common.write16(reg::QUEUE_SELECT, q);
+    let size = virtqueue::queue_size(common.read16(reg::QUEUE_SIZE), 256)?;
+    common.write16(reg::QUEUE_SIZE, size as u16);
+    let notify_off = common.read16(reg::QUEUE_NOTIFY_OFF);
     notify.notify_offset(notify_off, mul)?;
     let (d, a, u) = (dma.page()?, dma.page()?, dma.page()?);
-    w64(common + reg::QUEUE_DESC, d.bus);
-    w64(common + reg::QUEUE_DRIVER, a.bus);
-    w64(common + reg::QUEUE_DEVICE, u.bus);
-    w16(common + reg::QUEUE_MSIX_VECTOR, vector);
-    w16(common + reg::QUEUE_ENABLE, 1);
+    write64(common, reg::QUEUE_DESC, d.bus().raw());
+    write64(common, reg::QUEUE_DRIVER, a.bus().raw());
+    write64(common, reg::QUEUE_DEVICE, u.bus().raw());
+    common.write16(reg::QUEUE_MSIX_VECTOR, vector);
+    common.write16(reg::QUEUE_ENABLE, 1);
     Some(Queue {
         size,
         desc: DeviceMem::of(d),
@@ -381,7 +348,7 @@ fn setup_queue(
 /// processor `target` (an x2APIC ID) at `cpu::NET_VECTOR` and `cpu::NET_TX_VECTOR` (every
 /// other entry masked), and turns MSI-X on for the function. Returns whether MSI-X is enabled
 /// and unmasked. Mirrors the NVMe driver's setup.
-fn enable_msix_table(dev: &crate::pcie::Device, target: u32) -> bool {
+fn enable_msix_table(dev: &crate::pcie::Device, bars: &mut Bars<'_>, target: u32) -> bool {
     let Some(msix) = crate::pcie::msix(dev.function.at) else {
         return false;
     };
@@ -395,7 +362,10 @@ fn enable_msix_table(dev: &crate::pcie::Device, target: u32) -> bool {
     let Some(table_address) = msix.table_address(&bar) else {
         return false;
     };
-    let Ok(table) = crate::vm::map_mmio(table_address, table_len) else {
+    // The table lives inside its BAR, which may also hold virtio structures: one mapping.
+    let Some(table) = bars.region(usize::from(msix.table_bar)).and_then(|region| {
+        region.slice((table_address - bar.address) as usize, table_len as usize)
+    }) else {
         return false;
     };
     let at = dev.function.at;
@@ -406,12 +376,7 @@ fn enable_msix_table(dev: &crate::pcie::Device, target: u32) -> bool {
         return false;
     };
     let entry = |i: u64, word: u64, value: u32| {
-        let p = ptr::with_exposed_provenance_mut::<u32>(
-            (table + i * pci::MSIX_ENTRY + 4 * word) as usize,
-        );
-        // SAFETY: inside the MSI-X table (checked against its BAR above), mapped uncached;
-        // the entries only direct where the device's interrupt messages go.
-        unsafe { p.write_volatile(value) };
+        table.write32((i * pci::MSIX_ENTRY + 4 * word) as usize, value);
     };
     for i in 0..u64::from(msix.entries) {
         entry(i, 3, pci::MSIX_MASKED);
@@ -434,10 +399,16 @@ fn enable_msix_table(dev: &crate::pcie::Device, target: u32) -> bool {
     control & pci::MSIX_ENABLE != 0 && control & pci::MSIX_FUNCTION_MASK == 0
 }
 
+/// A 64-bit register, as two 32-bit writes, low half first (virtio 1.1 §4.1.3.1).
+fn write64(region: MmioRegion, offset: usize, value: u64) {
+    region.write32(offset, value as u32);
+    region.write32(offset + 4, (value >> 32) as u32);
+}
+
 /// Writes the notify address for queue `q`'s notify offset.
-fn notify(notify_base: u64, off: u16, mul: u32, q: u16) {
+fn notify(notify_base: MmioRegion, off: u16, mul: u32, q: u16) {
     fence(Ordering::SeqCst); // the ring writes must be visible before the notification
-    w16(notify_base + u64::from(off) * u64::from(mul), q);
+    notify_base.write16((u64::from(off) * u64::from(mul)) as usize, q);
 }
 
 /// How many receive buffers to post.
@@ -447,18 +418,23 @@ const RX_BUF: usize = 2048;
 
 /// Posts [`N_RX`] device-writable receive buffers on the RX queue (descriptor `i` → buffer
 /// `i`), returning those buffers, then notifies the device.
-fn post_rx(rx: &Queue, notify_base: u64, mul: u32, dma: DeviceDma) -> Option<[DeviceMem; N_RX]> {
+fn post_rx(
+    rx: &Queue,
+    notify_base: MmioRegion,
+    mul: u32,
+    dma: DeviceDma,
+) -> Option<[DeviceMem; N_RX]> {
     // The queue's size is the device's: a shorter ring has no descriptor `i` for every buffer.
     if rx.size < N_RX {
         return None;
     }
-    let mut pages = [DeviceMem { virt: 0 }; N_RX];
+    let mut pages = [DeviceMem::EMPTY; N_RX];
     let (mut desc, mut avail) = (rx.desc, rx.avail);
     for (i, slot) in pages.iter_mut().enumerate() {
         let page = dma.page()?;
         *slot = DeviceMem::of(page);
         Descriptor {
-            addr: page.bus,
+            addr: page.bus().raw(),
             len: RX_BUF as u32,
             flags: F_WRITE,
             next: 0,
@@ -473,14 +449,14 @@ fn post_rx(rx: &Queue, notify_base: u64, mul: u32, dma: DeviceDma) -> Option<[De
 impl TxRing {
     /// A ring over `q` with one buffer page, allocated now and kept, for each of its first
     /// [`N_TX`] descriptors.
-    fn new(q: Queue, notify_base: u64, mul: u32, dma: DeviceDma) -> Option<Self> {
+    fn new(q: Queue, notify_base: MmioRegion, mul: u32, dma: DeviceDma) -> Option<Self> {
         if q.size < N_TX {
             return None;
         }
-        let mut bufs = [(DeviceMem { virt: 0 }, 0); N_TX];
+        let mut bufs = [(DeviceMem::EMPTY, 0); N_TX];
         for buf in &mut bufs {
             let page = dma.page()?;
-            *buf = (DeviceMem::of(page), page.bus);
+            *buf = (DeviceMem::of(page), page.bus().raw());
         }
         Some(Self {
             q,
@@ -665,7 +641,7 @@ fn tx_flush() {
 struct RxRing {
     q: Queue,
     pages: [DeviceMem; N_RX],
-    notify_base: u64,
+    notify_base: MmioRegion,
     mul: u32,
     /// The used ring is consumed up to here.
     last_used: u16,
@@ -685,7 +661,7 @@ struct RxRing {
 
 impl RxRing {
     /// The ring over `q` whose buffers `post_rx` posted at `pages`.
-    fn new(q: Queue, pages: [DeviceMem; N_RX], notify_base: u64, mul: u32) -> Self {
+    fn new(q: Queue, pages: [DeviceMem; N_RX], notify_base: MmioRegion, mul: u32) -> Self {
         Self {
             q,
             pages,
@@ -792,8 +768,8 @@ fn transmit_dhcp(our_mac: Mac, dhcp: &[u8], damage: bool) -> bool {
     let Some(un) = net::Udp::write(
         any,
         bcast,
-        framekernel::dhcp::CLIENT_PORT,
-        framekernel::dhcp::SERVER_PORT,
+        crate::dhcp::CLIENT_PORT,
+        crate::dhcp::SERVER_PORT,
         dhcp,
         &mut udp,
     ) else {
@@ -1052,8 +1028,8 @@ fn reply_deadline() -> u64 {
 /// TFTP port. `None` when the processor gives none; the caller stops rather than use a
 /// predictable value.
 fn random_u64() -> Option<u64> {
-    use framekernel::entropy::{self, Source};
-    use framekernel::features::Features;
+    use crate::entropy::{self, Source};
+    use crate::features::Features;
 
     struct Hardware(Features);
     impl Source for Hardware {
@@ -1110,7 +1086,7 @@ fn timeout_note(step: u64) -> alloc::string::String {
         waiting::DHCP_REFUSED => {
             return alloc::format!(
                 "; the DHCP server refused the lease through {} restarts",
-                framekernel::dhcp::MAX_RESTARTS
+                crate::dhcp::MAX_RESTARTS
             );
         }
         _ => {
@@ -1194,7 +1170,7 @@ fn await_udp(
 /// outcome and whether the file matches the image built into the kernel; only then is it
 /// handed on to be unpacked.
 fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
-    use framekernel::tftp;
+    use crate::tftp;
 
     let mut request = [0u8; 64];
     let Some(n) = tftp::read_request(TFTP_FILE, &mut request) else {
@@ -1298,7 +1274,7 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
 /// and an attempt is renewed only by a retransmission or a step forward, whatever else
 /// arrives.
 fn dhcp_lease(rx: &mut RxRing, our_mac: Mac) -> Option<Ipv4> {
-    use framekernel::dhcp::{self, Action};
+    use crate::dhcp::{self, Action};
 
     /// A new transaction ID, or `None` (recorded) with no entropy to draw one from.
     fn new_xid() -> Option<u32> {
@@ -1405,11 +1381,11 @@ extern "sysv64" fn net_thread(_: u64) -> ! {
 
 /// Polls the status register for 0 after a reset, with a bound: a device may take a moment, and
 /// one that never finishes must not hang the boot.
-fn reset_completed(common: u64) -> bool {
+fn reset_completed(common: MmioRegion) -> bool {
     const POLLS: u32 = 1 << 20;
     (0..POLLS).any(|_| {
         core::hint::spin_loop();
-        r8(common + reg::DEVICE_STATUS) == 0
+        common.read8(reg::DEVICE_STATUS) == 0
     })
 }
 
@@ -1432,6 +1408,16 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
         return;
     }
     let at: Address = dev.function.at;
+    // Its two interrupts reach this driver: registered before the device can send them.
+    if origin_frame::irq::register(crate::cpu::NET_VECTOR, on_interrupt).is_err()
+        || origin_frame::irq::register(crate::cpu::NET_TX_VECTOR, on_tx_interrupt).is_err()
+    {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: virtio-net: its interrupt vectors are taken: virtio-net failed"
+        );
+        return;
+    }
     // Memory-space decoding for the registers. Bus mastering waits until the device has a
     // DMA path (ADR-0007 I12).
     if crate::pcie::enable_memory(at).is_none() {
@@ -1463,10 +1449,11 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
         );
         return;
     };
+    let mut bars = Bars::new(&dev);
     let (Some(common), Some(notify_base), Some(devcfg)) = (
-        map_structure(&dev, common_loc, COMMON_CONFIG_LEN),
-        map_structure(&dev, notify_loc, 2),
-        map_structure(&dev, dev_loc, DEVICE_CONFIG_LEN),
+        bars.map_structure(common_loc, COMMON_CONFIG_LEN),
+        bars.map_structure(notify_loc, 2),
+        bars.map_structure(dev_loc, DEVICE_CONFIG_LEN),
     ) else {
         let _ = writeln!(
             com1,
@@ -1477,7 +1464,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
 
     // Status handshake: reset, acknowledge, driver. A device that does not read back 0 has not
     // finished resetting (virtio 1.1 §2.1.2) and cannot be called idle below.
-    w8(common + reg::DEVICE_STATUS, 0);
+    common.write8(reg::DEVICE_STATUS, 0);
     if !reset_completed(common) {
         let _ = writeln!(
             com1,
@@ -1486,15 +1473,15 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
         return;
     }
     let mut st = status::ACKNOWLEDGE;
-    w8(common + reg::DEVICE_STATUS, st);
+    common.write8(reg::DEVICE_STATUS, st);
     st |= status::DRIVER;
-    w8(common + reg::DEVICE_STATUS, st);
+    common.write8(reg::DEVICE_STATUS, st);
 
     // Read the device features (two 32-bit banks) and negotiate.
-    w32(common + reg::DEVICE_FEATURE_SELECT, 0);
-    let flo = r32(common + reg::DEVICE_FEATURE);
-    w32(common + reg::DEVICE_FEATURE_SELECT, 1);
-    let fhi = r32(common + reg::DEVICE_FEATURE);
+    common.write32(reg::DEVICE_FEATURE_SELECT, 0);
+    let flo = common.read32(reg::DEVICE_FEATURE);
+    common.write32(reg::DEVICE_FEATURE_SELECT, 1);
+    let fhi = common.read32(reg::DEVICE_FEATURE);
     let device_features = u64::from(fhi) << 32 | u64::from(flo);
     let wanted =
         feature::VERSION_1 | feature::NET_MAC | feature::NET_STATUS | feature::ACCESS_PLATFORM;
@@ -1505,14 +1492,14 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
         );
         return;
     };
-    w32(common + reg::DRIVER_FEATURE_SELECT, 0);
-    w32(common + reg::DRIVER_FEATURE, accepted as u32);
-    w32(common + reg::DRIVER_FEATURE_SELECT, 1);
-    w32(common + reg::DRIVER_FEATURE, (accepted >> 32) as u32);
+    common.write32(reg::DRIVER_FEATURE_SELECT, 0);
+    common.write32(reg::DRIVER_FEATURE, accepted as u32);
+    common.write32(reg::DRIVER_FEATURE_SELECT, 1);
+    common.write32(reg::DRIVER_FEATURE, (accepted >> 32) as u32);
 
     st |= status::FEATURES_OK;
-    w8(common + reg::DEVICE_STATUS, st);
-    let features_ok = r8(common + reg::DEVICE_STATUS) & status::FEATURES_OK != 0;
+    common.write8(reg::DEVICE_STATUS, st);
+    let features_ok = common.read8(reg::DEVICE_STATUS) & status::FEATURES_OK != 0;
     if !features_ok {
         // A device that refuses the features is unusable (virtio 1.1 §3.1.1): no bus mastering.
         let _ = writeln!(
@@ -1560,28 +1547,28 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
     let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let msix_enabled = target
         .apic_id()
-        .is_some_and(|apic_id| enable_msix_table(&dev, apic_id));
-    w16(common + reg::CONFIG_MSIX_VECTOR, NO_VECTOR);
+        .is_some_and(|apic_id| enable_msix_table(&dev, &mut bars, apic_id));
+    common.write16(reg::CONFIG_MSIX_VECTOR, NO_VECTOR);
     let mul = caps.notify_off_multiplier;
     let rx = setup_queue(common, Q_RX, RX_MSIX_ENTRY, dma, notify_loc, mul);
     let tx = setup_queue(common, Q_TX, TX_MSIX_ENTRY, dma, notify_loc, mul);
     let queues_ok = rx.is_some() && tx.is_some();
     // Confirm each queue kept its vector (NO_VECTOR back means none was available).
-    w16(common + reg::QUEUE_SELECT, Q_RX);
-    let rx_vector_ok = msix_enabled && r16(common + reg::QUEUE_MSIX_VECTOR) == RX_MSIX_ENTRY;
-    w16(common + reg::QUEUE_SELECT, Q_TX);
-    let tx_vector_ok = msix_enabled && r16(common + reg::QUEUE_MSIX_VECTOR) == TX_MSIX_ENTRY;
+    common.write16(reg::QUEUE_SELECT, Q_RX);
+    let rx_vector_ok = msix_enabled && common.read16(reg::QUEUE_MSIX_VECTOR) == RX_MSIX_ENTRY;
+    common.write16(reg::QUEUE_SELECT, Q_TX);
+    let tx_vector_ok = msix_enabled && common.read16(reg::QUEUE_MSIX_VECTOR) == TX_MSIX_ENTRY;
 
     st |= status::DRIVER_OK;
-    w8(common + reg::DEVICE_STATUS, st);
-    let driver_ok = r8(common + reg::DEVICE_STATUS) & status::DRIVER_OK != 0;
+    common.write8(reg::DEVICE_STATUS, st);
+    let driver_ok = common.read8(reg::DEVICE_STATUS) & status::DRIVER_OK != 0;
 
     // Read the MAC and the link status from the device config.
     let mut mac = [0u8; 6];
     for (i, b) in mac.iter_mut().enumerate() {
-        *b = r8(devcfg + i as u64);
+        *b = devcfg.read8(i);
     }
-    let status_word = r16(devcfg + 6);
+    let status_word = devcfg.read16(6);
     let link_up = status_word & 1 != 0;
 
     // Live datapath over the NIC, interrupt-driven: hand the queues to a receive thread on
@@ -1630,7 +1617,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
     let unarmed = RX_ARMED.load(Ordering::Acquire) == 0;
     if !spawned || (finished && (device_faults != 0 || unarmed)) {
         // Nothing drives the device: reset it and take bus mastering away again (I12).
-        w8(common + reg::DEVICE_STATUS, 0);
+        common.write8(reg::DEVICE_STATUS, 0);
         let _ = crate::pcie::clear_bus_master(at);
     }
     let dhcp_retransmits = DHCP_RETRANSMITS.load(Ordering::Relaxed);
@@ -1797,7 +1784,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
     let _ = writeln!(
         com1,
         "origin-kernel: virtio-net TFTP: {TFTP_FILE} from 10.0.2.2: {bytes} bytes in {blocks} blocks{}, {outcome}; {retransmits} retransmitted after a {} ms timeout (the first read request is dropped on purpose); the receive ring's {N_RX} buffers carried {frames} frames ({recycled} recycled){tftp_note}; consistent {}{}",
-        if complete && bytes.is_multiple_of(framekernel::tftp::BLOCK as u64) {
+        if complete && bytes.is_multiple_of(crate::tftp::BLOCK as u64) {
             " (the last empty)"
         } else {
             ""

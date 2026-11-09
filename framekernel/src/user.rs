@@ -9,13 +9,14 @@
 //! - **reader:** reports 7, then reads a kernel address: a #PF with the user bit set;
 //! - **privileged:** reports 9, then executes `hlt`: a #GP;
 //! - **`int 0x80`:** reports 77, then tries the old gate, which is gone: a #GP.
+#![forbid(unsafe_code)]
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::ptr;
 
-use framekernel::paging::{Access, PAGE};
+use crate::paging::{Access, PAGE};
 use origin_abi::{Error, status_name};
 
 use crate::console::Console;
