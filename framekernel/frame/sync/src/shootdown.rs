@@ -262,18 +262,22 @@ impl<const CPUS: usize> Shootdown<CPUS> {
     /// Serves the request in progress, if this processor has not yet. Called from the
     /// shootdown interrupt, and by an initiator waiting for its turn.
     pub fn service(&self, hardware: &impl TlbHardware) {
-        let Some(served) = self.served.get(hardware.this_cpu()) else {
-            return;
-        };
-        // Acquire: the request read below is the one this generation published (its initiator
-        // stored it before the generation, and the next initiator cannot start until every
-        // target, this processor included, has served this one).
-        let generation = self.generation.load(Ordering::Acquire);
-        if served.load(Ordering::Relaxed) < generation {
-            hardware.invalidate(Request::decode(self.request.load(Ordering::Relaxed)));
-            // Release: the initiator that sees this may free what the translation led to.
-            served.store(generation, Ordering::Release);
-        }
+        // With interrupts off, so that the record below only ever goes forward: a request's
+        // interrupt arriving between the comparison and the store would otherwise be overwritten.
+        hardware.without_interrupts(|| {
+            let Some(served) = self.served.get(hardware.this_cpu()) else {
+                return;
+            };
+            // Acquire: the request read below is the one this generation published (its
+            // initiator stored it before the generation, and the next initiator cannot start
+            // until every target, this processor included, has served this one).
+            let generation = self.generation.load(Ordering::Acquire);
+            if served.load(Ordering::Relaxed) < generation {
+                hardware.invalidate(Request::decode(self.request.load(Ordering::Relaxed)));
+                // Release: the initiator that sees this may free what the translation led to.
+                served.store(generation, Ordering::Release);
+            }
+        });
     }
 
     /// Whether processor `id` must answer a request made now.
