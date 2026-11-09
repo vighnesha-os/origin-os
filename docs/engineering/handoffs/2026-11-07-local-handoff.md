@@ -1461,9 +1461,9 @@ The owner: "You review and merge them, review extremely very good design, securi
 - The SDK-first decision: written as ADR-0011 (Proposed); see the next section.
 - Buying the machines ADR-0009 chose.
 
-### Continued (2026-11-09, ~06:50–07:10 IST): ADR-0011, the native SDK
+### Continued (2026-11-09, ~06:50–07:00 IST): ADR-0011, the native SDK
 
-The owner asked for the SDK-first decision to be written. `docs/adr/ADR-0011-native-sdk.md` is **Proposed**, with its research ledger at `docs/research/2026-11-09-native-sdk.md` (§16). Nothing in it is built. Committed locally on `claude/interesting-carson-ae7c83` on top of what merged to `main`; not pushed.
+The owner asked for the SDK-first decision to be written. `docs/adr/ADR-0011-native-sdk.md` is **Proposed**, with its research ledger at `docs/research/2026-11-09-native-sdk.md` (§16). Nothing in it is built. Committed on `claude/interesting-carson-ae7c83` on top of what merged to `main`, and landed on `main` on the owner's word once accepted.
 
 In short: every capability is defined once in a typed interface, and GUI, command-line tools, shell, terminal and recovery are clients with no private doors. Stable promises go per capability, not per module. The kernel is below the SDK and reached only through `origin.core`, and inside it the Framekernel becomes an SDK of its own: one privileged crate holding every `unsafe`, with safe services above. One original interface language generates the Rust, the C ABI, the messages and the docs. The SDK is not a security boundary, so checks live in the kernel and the services. The exceptions are a closed list.
 
@@ -1471,7 +1471,7 @@ In short: every capability is defined once in a typed interface, and GUI, comman
 
 - Sheet items 33–39, the ADR's seven questions.
 
-### Continued (2026-11-09, ~07:10 IST): ADR-0011 accepted
+### Continued (2026-11-09, ~07:00 IST): ADR-0011 accepted
 
 The owner accepted ADR-0011 as recommended: questions 1–6, sheet items 33–38. ADR-0005 gains Amendment 2 (kernel-stamped caller identity, per-call system-call pinning), and ADR-0003 K1 notes what replaces it. **Nothing in any of them is built.** Question 7, whether to amend CLAUDE.md §48 and §70, is still the owner's, and Claude has not changed the directive.
 
