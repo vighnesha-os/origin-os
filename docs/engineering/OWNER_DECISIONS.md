@@ -5,7 +5,7 @@
 | As of | 2026-11-09, on `main`, after the pre-merge review. Everything that was on a side branch is merged. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38 and 40–55. |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38 and 40–68. |
 | Still open | Items 30, 31 and 39 below. Buying machines is off for now (ADR-0009's update of 2026-11-09). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -164,5 +164,25 @@ CI caught one processor's TSC stepping back by 16 ticks on an EPYC 9V45 under KV
 | # | Question | Recommendation | Why |
 |---|---|---|---|
 | 55, answered | Accept ADR-0013: the Refuse, Withdraw and Report classes and R1's test for Refuse (questions 1 and 2), that a refusal halts rather than resets until a boot manager records boot attempts (3), no "continue past a refusal" switch (4), and which proofs a production boot keeps decided before M9 (5). | **Accepted by the owner, 2026-11-09** ("Accept both", for ADR-0012 and ADR-0013 together) | The smallest policy that does not stop working machines |
+
+## ADR-0011 N14 step 3: caller identity, the start record, the directory, memory objects and ports (Accepted 2026-11-09)
+
+Step 3 adds system calls and structures, so these are ABI and format decisions (CLAUDE.md §84). The owner accepted all thirteen with the recommended answer on 2026-11-09 ("Accept all 13"). They are ADR-0005 Amendment 4, C1–C13; the scoping is `docs/research/2026-11-09-n14-step3-scope.md`. Not built.
+
+| # | Question | Answer |
+|---|---|---|
+| 56, answered | C1: a message's identity is `{u64 process; u64 principal}`: process IDs unique for the boot and never reused (0 the kernel), the principal opaque, set at creation, inherited and immutable? | **Accept** |
+| 57, answered | C2: the identity reaches the reader through `channel_read`'s growing `read_sizes` result, old-size callers unaffected? | **Accept** |
+| 58, answered | C3: OIDL allows plain structs as system-call vector and array elements (a change to OIDL's format), for B3's handle records? | **Accept** |
+| 59, answered | C4: the start record v1 layout (32-byte header, 16-byte handle entries, then arguments and environment; kernel-written, read-only, random address; at most 64 handles and 64 KiB)? | **Accept** |
+| 60, answered | C5: add the DIRECTORY role and retire SERVICE, never reusing its number? | **Accept** |
+| 61, answered | C6: the default rights per object type, with `write` on a process handle needed to change its address space? | **Accept** |
+| 62, answered | C7: memory committed at creation and charged to the creator; whole-mapping unmap and protect; no fixed-address replacement; no execute until the Code Integrity Table exists? | **Accept** |
+| 63, answered | C8: `memory_map(process, object, map_request) -> address`? | **Accept** |
+| 64, answered | C9: one-shot, level-triggered port bindings with reserved storage; a silent explicit cancel that also removes queued packets? | **Accept** |
+| 65, answered | C10: events now, with `object_signal` on events only and `SIGNALED` only in v1? | **Accept** |
+| 66, answered | C11: append `not_found = -14`? | **Accept** |
+| 67, answered | C12: `origin.directory` 0.1, keyed by OIDL interface ID and major, with a pipelined `connect`? | **Accept** |
+| 68, answered | C13: a `clock_read` system call now, a shared clock page later? | **Accept** |
 
 **Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.

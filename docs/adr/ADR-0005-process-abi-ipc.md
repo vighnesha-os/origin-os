@@ -114,3 +114,23 @@ The implementation records each decision's consequences in `docs/engineering/SOU
 | # | Decision | What it changes |
 |---|---|---|
 | B3 | `channel_read` delivers each received handle as a record `{u32 handle; u32 object_type; u32 rights}` instead of a bare value, so a receiver can check a handle's type and rights before using it, which ADR-0011 N9 requires of the generated stub. It lands in the same slice as B1, while `user-abi` is at major 0 | P8 and A4: the out-handles array of `channel_read` |
+
+## Amendment 4 (Accepted, 2026-11-09): what ADR-0011 N14 step 3 needs
+
+**Status: Accepted by the owner on 2026-11-09, all thirteen items with the recommended answer (decision sheet items 56–68; CLAUDE.md §84). Not built.** The scoping is `docs/research/2026-11-09-n14-step3-scope.md`. The ADR's accepted text and Amendments 1–3 are otherwise unchanged; where an item below refines a P decision, the item governs.
+
+| # | Decision | Refines |
+|---|---|---|
+| C1 | A message's stamped identity (Amendment 2, B1) is `{u64 process; u64 principal}`. Process IDs are assigned by the kernel, unique for the boot and never reused; 0 is the kernel. A process ID grants nothing. The principal is opaque, set when the process is created, inherited by default (a different one only through a capability) and immutable. Program identity is added in a later minor. | B1 |
+| C2 | The identity reaches the reader through `channel_read`'s size-versioned result (`read_sizes`, which may be renamed while the ABI is at major 0): the identity fields follow the existing 12 bytes, a caller asking for the old size gets no identity and no error, and the fields are written on `BUFFER_TOO_SMALL` too. | B1, P8 |
+| C3 | OIDL lets plain structs of integers, enums and bits be elements of system-call vectors and arrays, encoded field by field, never by the compiler's layout. B3's handle records use it. This is a change to OIDL's format (`docs/spec/OIDL.md` §3.1, §10, §18 to be revised to match). | B3, N7 |
+| C4 | The start record, version 1: a 32-byte header (`size`, `abi_major`, `abi_minor`, `abi_min_minor`, reserved, then the handle, argument and environment counts and byte totals); 16-byte handle entries `{handle, object_type, rights, role}`; then the arguments, then the environment, each a `u32`-length-prefixed byte string padded to 8. Exact size, zero padding, at most 64 handles and 64 KiB. The kernel writes it, read-only to the process, at a random address, before the first thread runs. | P6 |
+| C5 | Start-record roles: `DIRECTORY = 5` is added; `SERVICE = 4` is retired and never reused, because the directory is the only way a process finds services (ADR-0011 N9). | P6 |
+| C6 | Default rights. The process's own handle: read, write, manage, wait, duplicate, transfer. Thread: wait, manage, duplicate, transfer. Memory object: read, write, map, duplicate, transfer, and never execute for an anonymous object. Event: wait, signal, duplicate, transfer. Port: read, write, duplicate, transfer. Changing another process's address space needs `write` on its process handle; `manage` is for termination and thread control. | P2, P3, P7 |
+| C7 | Memory objects are committed in full at creation and charged to the creator (demand commit comes later, with a user page-fault path and P10). In v1, unmap and protect act on whole mappings; a fixed-address request never replaces an existing mapping; nothing is executable until the Code Integrity Table exists (ONBF §8.2). | P7, P11 |
+| C8 | The map call is `memory_map(process, object, map_request) -> address`, with the placement, access and flags in a sized `map_request` struct. | P4, P7 |
+| C9 | Ports: one-shot, level-triggered bindings with a `u64` key and packet storage reserved at bind time, charged to the binder. An implicit cancel (the bound handle closed or moved) delivers a `canceled` packet; an explicit `port_cancel` is silent and also removes packets already queued for that object and key, so the key can be reused at once. A packet is `{key; kind; trigger; observed; reserved; data}`, one per `port_wait`. | P9 |
+| C10 | Events are implemented now (`event_create`, `object_signal`). In v1, `object_signal` works on events only, and only on `SIGNALED`. | P3, P9 |
+| C11 | `not_found = -14` is appended to the status codes. | P5 |
+| C12 | The service directory's interface is `origin.directory` 0.1, keyed by the OIDL interface ID and major version (the same ID the hello carries), with a pipelined, two-way `connect(interface_id, major, server)` whose reply carries `not_found` or `limit`. | ADR-0011 N9 |
+| C13 | User mode reads the clock through a `clock_read` system call; a shared read-only clock page may come later, with its own ordering argument and measurements (ADR-0012 C7). | P9 |
