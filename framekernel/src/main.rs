@@ -366,8 +366,9 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     prove_timers(&mut com1);
     // Integration: a read-only /sys tree in the VFS carrying live discovered facts.
     prove_sysfs(&mut com1);
-    // The console's drawing in sections, proven last so that what it prints is still on the
-    // screen when the boot test compares the screen with the serial log.
+    // The console's sending and drawing in sections, proven last so that what it prints is
+    // still on the screen when the boot test compares the screen with the serial log.
+    console::prove_uart_sections(&mut com1);
     console::prove_sections(&mut com1);
 
     let _ = report::write_halt(&mut com1);

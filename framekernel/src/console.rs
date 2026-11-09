@@ -9,41 +9,58 @@
 //! given up on after one bounded wait, reported on the framebuffer.
 //!
 //! A [`Console`] collects one line and hands it over in one critical section, holding the
-//! console lock with interrupts disabled: it goes out on the UART and joins the backlog of text
-//! for the screen. So lines from different processors, or from an interrupt handler on the
-//! same processor, never interleave, and both sinks get them in the same order. Lines longer
-//! than [`LINE`] bytes go out in [`LINE`]-byte pieces, each one whole. The UART comes first
-//! (ADR-0010 Amendment 1), so the screen can never hold a line back from the log the machine's
-//! owner has to read when something goes wrong: a line is on the wire before any pixel of it
-//! is drawn, and the slow UART is what delays the screen by one line's send, not the reverse.
+//! console lock with interrupts disabled: it joins the queue of text for the UART and the
+//! backlog of text for the screen, and no device is touched. So lines from different
+//! processors, or from an interrupt handler on the same processor, never interleave on either
+//! sink, and both sinks get them in the same order. Lines longer than [`LINE`] bytes go out in
+//! [`LINE`]-byte pieces, each one whole. The UART comes first (ADR-0010 Amendment 1), so the
+//! screen can never hold a line back from the log the machine's owner has to read when
+//! something goes wrong: a writer that can wait has its line on the wire before it draws any
+//! of it. The slow UART is what delays the screen, by what is queued ahead of the line, not
+//! the reverse. (One writer's last section of drawing can run on into the line queued behind
+//! its own, so a little of a line may be drawn before that line has gone out.)
 //!
-//! Drawing is what used to take long. The framebuffer is uncached, and under KVM on a real
-//! AMD EPYC 7763 one console line, about 40,960 pixels, took 4.3 to 4.6 ms and up to 10 ms
-//! with interrupts off: as long as the kernel's 10 ms timer tick. So the pixels of a line are
-//! written a section at a time, after the line was handed over: each section holds the console
-//! lock with interrupts off for at most [`SECTION_PIXELS`] pixels, and nothing is held between
-//! sections, so any processor can take the next one, interrupts are taken between them and no
-//! preempted holder can block anyone. At the cost measured there (105 to 245 ns a pixel), a
-//! section of 1 KiB is about 27 to 63 us. What a caller may do between sections depends on
-//! where it runs (see [`Flow`]): with interrupts on they are simply back on between sections;
-//! the boot flow, which runs with them off, opens a window once they can be taken at all
-//! ([`allow_interrupt_windows`]); a caller that has interrupts off for its own reasons, an
-//! interrupt handler, hands its line over and leaves, and the screen shows it when the next
-//! writer that can wait paints that far. Its line is on the UART at once, in order.
+//! Both devices are slow in their own way, so each is worked at a section at a time, after the
+//! line was handed over. Every section holds the console lock with interrupts off, and nothing
+//! is held between sections, so any processor can take the next one, interrupts are taken
+//! between them and no preempted holder can block anyone.
 //!
-//! Exception and panic reports use [`Console::urgent`], which waits for the lock only
-//! about as long as another processor needs to send one line, and which then draws the whole
-//! backlog at once: everything queued before the report, and the report. A processor that
-//! faulted while holding the lock, or that waits on a processor that died holding it, still
-//! gets its report out, at the risk of mixing it into another line: the cursor and the UART's
-//! address are kept outside the lock for that. A mixed-up report is all that can happen
+//! The UART's time is the wire's: at 115 200 baud a byte takes 87 us, so 100 bytes take 8.7 ms,
+//! as long as the kernel's 10 ms timer tick. A section does not wait for it. It reads the
+//! line status once and, if the transmitter reports empty, writes one load, at most
+//! [`TX_FIFO_BYTES`] bytes: a section is at most 17 register accesses, however slow the line,
+//! because the 16 bytes of a 16550's FIFO need no further look at the status. (A UART with no
+//! working FIFO takes a byte at a time.) Waiting for those 16 bytes to leave, 1.4 ms at 115 200
+//! baud, is done between sections, with the lock free and interrupts as the writer has them.
+//!
+//! The framebuffer's time is uncached writes: under KVM on a real AMD EPYC 7763 one console
+//! line, about 40,960 pixels, took 4.3 to 4.6 ms and up to 10 ms. A section writes at most
+//! [`SECTION_PIXELS`] pixels; at the cost measured there (105 to 245 ns a pixel), that is about
+//! 27 to 63 us.
+//!
+//! What a caller may do between sections depends on where it runs (see [`Flow`]): with
+//! interrupts on they are simply back on between sections; the boot flow, which runs with them
+//! off, opens a window once they can be taken at all ([`allow_interrupt_windows`]). Either way
+//! it goes on until its line is on the UART, before it returns, and then until the line is on
+//! the screen. A caller that has interrupts off for its own reasons, an interrupt handler, may
+//! not wait: it hands its line over, sends one section and leaves. The rest of its line goes
+//! out with the next writer that can wait, or the next report: the queue keeps its place.
+//!
+//! Exception and panic reports use [`Console::urgent`]. A report keeps interrupts off from
+//! start to finish and takes the lock a section at a time like everyone else, so two reports at
+//! once queue behind each other instead of waiting each other out. It goes on until everything
+//! queued before it, and the report itself, are on the UART and on the screen, in that order.
+//! Its wait for the lock is bounded, since a section is short, and needs no other processor:
+//! one that faulted while holding the lock, or that waits on a processor that died holding it,
+//! still gets its report out, at the risk of mixing it into another line: the cursor and the
+//! UART's address are kept outside the lock for that. A mixed-up report is all that can happen
 //! there: every pixel goes through the sink's bounds check, and the UART registers are the
 //! console's own.
 //!
-//! A line's UART time is still spent with interrupts disabled: in QEMU that is microseconds;
-//! at 115 200 baud on real hardware it is about 9 ms for 100 bytes. Production logging will
-//! go to a memory ring drained by a thread; this serial console is for development (CLAUDE.md
-//! §69).
+//! The replay of the early log ([`adopt_firmware_uart`]) is not sent in sections: it runs once,
+//! before the timer starts and before any other processor does, when no interrupt can arrive
+//! and nobody can be waiting. Production logging will go to a memory ring drained by a thread;
+//! this serial console is for development (CLAUDE.md §69).
 
 use core::cell::UnsafeCell;
 use core::fmt;
@@ -54,7 +71,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use framekernel::fbconsole::{Backlog, Cursor, PixelSink, Screen, ScreenError};
 use framekernel::paging::layout;
 use framekernel::serial::{
-    DIVISOR, EarlyLog, LCR_8N1, LineSettings, LineSetup, Register, Uart16550, UartRegisters,
+    DIVISOR, EarlyLog, LCR_8N1, LineSettings, LineSetup, Pumped, Register, TX_FIFO_BYTES, TxQueue,
+    Uart16550, UartRegisters,
 };
 use framekernel::spcr::{self, Access, Spcr, UartAddress};
 use origin_boot_info::{BootInfo, Framebuffer, MemoryRegion, overlaps_ram};
@@ -168,6 +186,9 @@ impl UartRegisters for KernelUart {
     }
 
     fn write(&mut self, reg: Register, value: u8) {
+        if reg == Register::Data {
+            UART_BYTES.fetch_add(1, Ordering::Relaxed);
+        }
         match *self {
             // SAFETY: as for `read`.
             Self::Port(base) => unsafe { crate::outb(base + reg.offset(), value) },
@@ -286,8 +307,23 @@ static CURSOR: Cursor = Cursor::new();
 /// Written only while the boot processor runs alone.
 static UNOWNED: [AtomicU64; 2] = [AtomicU64::new(COM1_BASE as u64), AtomicU64::new(0)];
 
+/// Writes to the UART's data register: counted at the sink, so that the proof of
+/// [`TX_FIFO_BYTES`] does not take the queue's word for it.
+static UART_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// Bytes of output kept for the UART that [`adopt_firmware_uart`] moves to.
 const EARLY_BYTES: usize = 8 * 1024;
+/// Bytes of text that can be waiting for the UART: room for 25 lines of the longest kind, and
+/// 355 ms of them at 115 200 baud, which is how long an urgent report can wait behind them on
+/// a UART that is working. (A UART that keeps taking a load just before it would have been
+/// given up on can stretch that, load by load; the wait stays bounded, in polls.) Writers that
+/// can wait stay behind their own line and, if this is ever full, wait for room, so only
+/// writers that cannot wait can ever lose a line, and the UART is told when one did.
+const UART_QUEUE_BYTES: usize = 4 * 1024;
+const _: () = assert!(
+    UART_QUEUE_BYTES >= 2 * LINE,
+    "a line must always fit, with any notice in front of it"
+);
 /// Bytes of text the screen can be behind the UART by: about 80 lines of ordinary length. A
 /// writer that can wait stays behind its own line and, if this is ever full, waits for room,
 /// so only writers that cannot wait, and only on the screen, can ever lose a line.
@@ -305,18 +341,29 @@ enum Flow {
     /// that a window is opened between sections.
     Boot { windows: bool },
     /// Interrupts are off for a reason this code cannot see, and must stay off: an interrupt
-    /// handler. Such a writer hands its line over and never waits for the screen.
+    /// handler. Such a writer hands its line over, sends one section of the UART's queue and
+    /// leaves.
     NoWaiting,
+}
+
+/// Which of a line's sections has just been done, for [`prove_sections`] and
+/// [`prove_uart_sections`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sink {
+    Uart,
+    Screen,
 }
 
 /// What became of a line handed to the console.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sent {
-    /// On the UART, and queued for the screen: drawn when the painting reaches this position.
-    Queued(u64),
-    /// On the UART only: there is no screen, or no room and a writer that cannot wait for it.
-    UartOnly,
-    /// Nowhere yet: the backlog is full and this writer can wait for room.
+    /// Accepted: the positions at which it will have reached each sink, `None` for a sink it
+    /// is not going to (that sink is gone, or had no room and the writer cannot wait).
+    Queued {
+        uart: Option<u64>,
+        screen: Option<u64>,
+    },
+    /// Nowhere yet: a queue is full and this writer can wait for room.
     NoRoom,
 }
 
@@ -336,8 +383,14 @@ struct Sinks {
     /// What has been sent, until the UART is settled ([`adopt_firmware_uart`]).
     early: EarlyLog<EARLY_BYTES>,
     early_open: bool,
+    /// What the UART has not taken yet.
+    tx: TxQueue<UART_QUEUE_BYTES>,
     /// What the screen has not shown yet.
     backlog: Backlog<BACKLOG_BYTES>,
+    /// Where the screen has shown that the UART stopped, once it has got that far: no writer
+    /// goes on before it has, so the machine's owner is told even if nothing is printed again.
+    /// 0 until the UART stops.
+    stop_notice: u64,
 }
 
 impl Sinks {
@@ -354,20 +407,36 @@ impl Sinks {
             },
             early: EarlyLog::new(),
             early_open: true,
+            tx: TxQueue::new(),
             backlog: Backlog::new(),
+            stop_notice: 0,
         }
     }
 
-    /// Hands `bytes` over: into the backlog for the screen and out on the UART, together, so
-    /// the two sinks get lines in one order. When the backlog has no room, `may_wait` says
-    /// whether the writer waits for it or the line is lost on the screen only.
+    /// Hands `bytes` over: into the queue for the UART and the backlog for the screen,
+    /// together, so the two sinks get lines in one order, and no device is touched. A line
+    /// goes to both or, if a writer that can wait finds no room in one, to neither: `may_wait`
+    /// says whether the writer waits for room or the line is lost on that sink alone.
     fn send(&mut self, bytes: &[u8], may_wait: bool) -> Sent {
-        let queued = if SCREEN.get().is_some() {
+        let has_screen = SCREEN.get().is_some();
+        if may_wait
+            && ((self.uart_alive && !self.tx.has_room(bytes.len()))
+                || (has_screen && !self.backlog.has_room(bytes.len())))
+        {
+            return Sent::NoRoom;
+        }
+        let uart = if self.uart_alive {
+            let position = self.tx.push(bytes);
+            if position.is_none() {
+                self.tx.note_lost();
+            }
+            position
+        } else {
+            None
+        };
+        let screen = if has_screen {
             let position = self.backlog.push(bytes);
             if position.is_none() {
-                if may_wait {
-                    return Sent::NoRoom;
-                }
                 self.backlog.note_lost();
             }
             position
@@ -377,18 +446,65 @@ impl Sinks {
         if self.early_open {
             self.early.push(bytes);
         }
-        if self.uart_alive && emit(&mut self.uart, bytes).is_err() {
-            self.uart_alive = false;
-            if SCREEN.get().is_some() && self.backlog.push(UART_STOPPED).is_none() {
-                self.backlog.note_lost();
+        if screen.is_some() {
+            note_line();
+        }
+        Sent::Queued { uart, screen }
+    }
+
+    /// One section of the sink that has no room for `needed` more bytes.
+    fn make_room(&mut self, needed: usize) {
+        if self.uart_alive && !self.tx.has_room(needed) {
+            UART_NO_ROOM.fetch_add(1, Ordering::Relaxed);
+            self.pump_uart();
+        } else {
+            self.paint_section();
+        }
+    }
+
+    /// Sends one section of the queue, the most the console writes to the UART in one stretch
+    /// with interrupts off: at most [`TX_FIFO_BYTES`] bytes, with no waiting in it. Returns
+    /// whether more is waiting. See the module documentation.
+    fn pump_uart(&mut self) -> bool {
+        if !self.uart_alive {
+            return false;
+        }
+        let (start, written) = (crate::cpu::rdtsc(), UART_BYTES.load(Ordering::Relaxed));
+        let pumped = self.tx.pump(&mut self.uart);
+        let cycles = crate::cpu::rdtsc().wrapping_sub(start);
+        match pumped {
+            Pumped::Stopped { polls } => {
+                UART_GIVEN_UP_AFTER.fetch_add(u64::from(polls), Ordering::Relaxed);
+                self.give_up_on_uart();
+                return false;
+            }
+            Pumped::Idle => {}
+            Pumped::Busy | Pumped::Sent(_) => note_uart_section(
+                cycles,
+                UART_BYTES.load(Ordering::Relaxed).wrapping_sub(written),
+            ),
+        }
+        !self.tx.is_empty()
+    }
+
+    /// The UART stopped taking bytes: nothing more goes to it, and the screen says so.
+    fn give_up_on_uart(&mut self) {
+        self.uart_alive = false;
+        self.tx.clear();
+        if SCREEN.get().is_some() {
+            match self.backlog.push(UART_STOPPED) {
+                Some(end) => self.stop_notice = end,
+                None => self.backlog.note_lost(),
             }
         }
-        match queued {
-            Some(end) => {
-                note_line();
-                Sent::Queued(end)
-            }
-            None => Sent::UartOnly,
+    }
+
+    /// Sends everything queued, and waits for that here: before the console moves to another
+    /// UART, when nothing else is running. Bounded: the queue's size, and the one wait a UART
+    /// that stops taking bytes is given.
+    fn drain_uart(&mut self) {
+        while self.pump_uart() {
+            core::hint::spin_loop();
         }
     }
 
@@ -415,7 +531,8 @@ static SINKS: SpinLock<Option<Sinks>> = SpinLock::new(None);
 /// Bytes a [`Console`] holds before it sends them.
 const LINE: usize = 160;
 /// Lock attempts an urgent report makes before it writes without the lock: on the order of
-/// 100 ms, longer than another processor needs for one line.
+/// 100 ms, far longer than a section, so only a holder that is stuck makes a report go without
+/// it.
 const URGENT_ATTEMPTS: u32 = 1 << 22;
 
 /// Hands the programmed UART to the console. `firmware_line` is how the firmware had left it.
@@ -428,13 +545,17 @@ pub(crate) fn init(uart: Uart16550<KernelUart>, firmware_line: LineSettings) {
             firmware_line,
             early: EarlyLog::new(),
             early_open: true,
+            tx: TxQueue::new(),
             backlog: Backlog::new(),
+            stop_notice: 0,
         });
     });
 }
 
-/// Sends `bytes`, turning each LF into CR LF. Stops at the first byte the UART will not take,
-/// which costs one bounded wait.
+/// Sends `bytes` at once, turning each LF into CR LF and waiting for each byte in turn: only
+/// where nothing can wait behind it (the replay of the early log) or nothing else is left (a
+/// report that could not get the lock). Stops at the first byte the UART will not take, which
+/// costs one bounded wait.
 fn emit(uart: &mut Uart16550<KernelUart>, bytes: &[u8]) -> fmt::Result {
     uart.write_bytes(bytes)
 }
@@ -459,10 +580,41 @@ static SECTION_WORST_CYCLES: AtomicU64 = AtomicU64::new(0);
 /// The most pixels one section wrote: counted at the sink, not taken from the budget.
 static SECTION_WORST_PIXELS: AtomicU64 = AtomicU64::new(0);
 
+/// UART sections since [`allow_interrupt_windows`] that wrote bytes, and the time they kept
+/// interrupts off, for the report in [`prove_uart_sections`] (CLAUDE.md rule 21).
+static UART_SECTIONS: AtomicU64 = AtomicU64::new(0);
+static UART_SECTION_CYCLES: AtomicU64 = AtomicU64::new(0);
+static UART_SECTION_WORST_CYCLES: AtomicU64 = AtomicU64::new(0);
+/// The most bytes one section wrote: counted at the sink, not taken from the queue.
+static UART_SECTION_WORST_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Sections that found the transmitter busy and wrote nothing.
+static UART_BUSY_POLLS: AtomicU64 = AtomicU64::new(0);
+/// The polls spent giving up on the UART, added up: one bounded wait's worth at most, and 0 if
+/// it was never given up on.
+static UART_GIVEN_UP_AFTER: AtomicU64 = AtomicU64::new(0);
+/// Times a writer that can wait found the UART's queue full, for [`prove_room`].
+static UART_NO_ROOM: AtomicU64 = AtomicU64::new(0);
+/// Whether the writer that found the UART had stopped went on only with that on the screen.
+static STOP_SHOWN_AT_ONCE: AtomicBool = AtomicBool::new(false);
+
 fn note_line() {
     if WINDOWS_ALLOWED.load(Ordering::Relaxed) {
         LINES_QUEUED.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+fn note_uart_section(cycles: u64, bytes: u64) {
+    if !WINDOWS_ALLOWED.load(Ordering::Relaxed) {
+        return;
+    }
+    if bytes == 0 {
+        UART_BUSY_POLLS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    UART_SECTIONS.fetch_add(1, Ordering::Relaxed);
+    UART_SECTION_CYCLES.fetch_add(cycles, Ordering::Relaxed);
+    UART_SECTION_WORST_CYCLES.fetch_max(cycles, Ordering::Relaxed);
+    UART_SECTION_WORST_BYTES.fetch_max(bytes, Ordering::Relaxed);
 }
 
 fn note_section(cycles: u64, pixels: u64) {
@@ -484,7 +636,7 @@ fn draw(bytes: &[u8]) {
 
 /// Runs `f` on the console's state, under the lock and with interrupts off. A writer that can
 /// wait waits with interrupts as they were: the lock is tried, and retried after a [`pause`].
-/// One that cannot only spins: the lock is held for at most a section or one line's send.
+/// One that cannot only spins: the lock is held for at most a section.
 fn with_sinks<T>(flow: Flow, f: impl FnOnce(&mut Sinks) -> T) -> T {
     let mut f = Some(f);
     loop {
@@ -516,61 +668,109 @@ fn pause(flow: Flow) {
 }
 
 /// What a [`Console`] does with a line that is not urgent: hands it over and, if the writer
-/// can wait, draws it a section at a time. See the module documentation. `between` runs
-/// after each section but the last, with interrupts as the caller has them: for [`prove`].
-fn send_and_draw(bytes: &[u8], flow: Flow, between: &mut dyn FnMut(u32)) {
-    let end = loop {
+/// can wait, sends it and then draws it, a section at a time. See the module documentation.
+/// `between` runs after each section but the last, with interrupts as the caller has them:
+/// for [`prove`].
+fn send_and_draw(bytes: &[u8], flow: Flow, between: &mut dyn FnMut(Sink, u32)) {
+    let (uart, screen) = loop {
         let sent = with_sinks(flow, |sinks| {
             let sent = sinks.send(bytes, flow != Flow::NoWaiting);
-            if sent == Sent::NoRoom {
-                sinks.paint_section();
+            match sent {
+                Sent::NoRoom => sinks.make_room(bytes.len()),
+                // What it can do for its line without waiting: it has interrupts off anyway.
+                Sent::Queued { .. } if flow == Flow::NoWaiting => {
+                    sinks.pump_uart();
+                }
+                Sent::Queued { .. } => {}
             }
             sent
         });
         match sent {
-            Sent::Queued(end) => break end,
-            Sent::UartOnly => return,
+            Sent::Queued { uart, screen } => break (uart, screen),
             Sent::NoRoom => pause(flow),
         }
     };
     if flow == Flow::NoWaiting {
         return;
     }
-    let mut section = 0;
-    while with_sinks(flow, |sinks| {
-        sinks.paint_section() && sinks.backlog.painted() < end
-    }) {
-        pause(flow);
-        section += 1;
-        between(section);
+    let polls_given = UART_GIVEN_UP_AFTER.load(Ordering::Relaxed);
+    if let Some(end) = uart {
+        let mut section = 0;
+        while with_sinks(flow, |sinks| sinks.pump_uart() && sinks.tx.sent() < end) {
+            pause(flow);
+            section += 1;
+            between(Sink::Uart, section);
+        }
     }
+    if let Some(end) = screen {
+        let mut section = 0;
+        while with_sinks(flow, |sinks| {
+            sinks.paint_section() && sinks.backlog.painted() < end.max(sinks.stop_notice)
+        }) {
+            pause(flow);
+            section += 1;
+            between(Sink::Screen, section);
+        }
+        // For the report in [`prove_uart_sections`]: this writer found that the UART had
+        // stopped, and it has drawn everything up to the line that says so.
+        if UART_GIVEN_UP_AFTER.load(Ordering::Relaxed) != polls_given {
+            let shown = with_sinks(flow, |sinks| sinks.backlog.painted() >= sinks.stop_notice);
+            STOP_SHOWN_AT_ONCE.store(shown, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Runs `f` on the console's state for a report: with the lock, which it waits for only
+/// [`URGENT_ATTEMPTS`] times, and `None` if it could not be got.
+fn urgent_section<T>(f: impl FnOnce(&mut Sinks) -> T) -> Option<T> {
+    let mut guard = (0..URGENT_ATTEMPTS).find_map(|_| {
+        let guard = SINKS.try_lock();
+        if guard.is_none() {
+            core::hint::spin_loop();
+        }
+        guard
+    })?;
+    // A report before `init` (a very early panic) programs the UART first.
+    Some(f(guard.get_or_insert_with(Sinks::default_console)))
+}
+
+/// A report through the console's own queues: handed over, sent, then drawn, each a section
+/// at a time, with the lock let go between them. `None` if the lock could not be got.
+fn send_report(bytes: &[u8]) -> Option<()> {
+    let (uart, screen) = loop {
+        let sent = urgent_section(|sinks| {
+            let sent = sinks.send(bytes, true);
+            if sent == Sent::NoRoom {
+                sinks.make_room(bytes.len());
+            }
+            sent
+        })?;
+        if let Sent::Queued { uart, screen } = sent {
+            break (uart, screen);
+        }
+    };
+    if let Some(end) = uart {
+        while urgent_section(|sinks| sinks.pump_uart() && sinks.tx.sent() < end)? {
+            core::hint::spin_loop();
+        }
+    }
+    if let Some(end) = screen {
+        while urgent_section(|sinks| {
+            sinks.paint_section() && sinks.backlog.painted() < end.max(sinks.stop_notice)
+        })? {}
+    }
+    Some(())
 }
 
 /// An exception or panic report: on the UART first and then, whatever it takes, on the screen,
 /// after everything queued before it. See the module documentation.
 fn send_urgent(bytes: &[u8]) {
     crate::cpu::without_interrupts(|| {
-        let guard = (0..URGENT_ATTEMPTS).find_map(|_| {
-            let g = SINKS.try_lock();
-            if g.is_none() {
-                core::hint::spin_loop();
-            }
-            g
-        });
-        match guard {
-            Some(mut held) => {
-                let sinks = held.get_or_insert_with(Sinks::default_console);
-                while sinks.send(bytes, true) == Sent::NoRoom {
-                    sinks.paint_section();
-                }
-                while sinks.paint_section() {}
-            }
+        if send_report(bytes).is_none() {
             // The holder is stuck (this processor faulted inside a section, or another died
             // holding the lock): send without it.
-            None => {
-                let _ = emit(&mut unowned_uart(), bytes);
-                draw(bytes);
-            }
+            let _ = emit(&mut unowned_uart(), bytes);
+            draw(bytes);
         }
     });
 }
@@ -831,6 +1031,11 @@ fn move_to(out: &mut Console, spcr: &Spcr, uart: KernelUart) {
 /// old one stays. Returns the speed setup used, the bytes replayed, the bytes that did not
 /// fit in the log, and whether the console stayed where it was.
 fn move_uart(sinks: &mut Sinks, spcr: &Spcr, uart: KernelUart) -> (LineSetup, usize, u64, bool) {
+    // Nothing should be queued (the boot flow waits for its own lines and nothing else runs
+    // yet), but a byte accepted for one UART must not go to another.
+    sinks.drain_uart();
+    sinks.tx.clear();
+    let com1_alive = sinks.uart_alive;
     let same_port = matches!(uart, KernelUart::Port(COM1_BASE));
     let mut new = Uart16550::new(uart);
     // COM1 is the UART the console has been writing to: its latch was read before the
@@ -882,10 +1087,10 @@ fn move_uart(sinks: &mut Sinks, spcr: &Spcr, uart: KernelUart) -> (LineSetup, us
                 sinks.uart = unowned_com1();
                 UNOWNED[0].store(u64::from(COM1_BASE), Ordering::Release);
                 UNOWNED[1].store(0, Ordering::Release);
-                sinks.uart_alive = true;
+                sinks.uart_alive = com1_alive;
                 return (setup, 0, dropped, true);
             }
-            Err(_) => sinks.uart_alive = false,
+            Err(_) => sinks.give_up_on_uart(),
         }
     }
     (setup, replayed, dropped, false)
@@ -948,12 +1153,12 @@ impl Console {
 
     /// Sends the buffered bytes, if any.
     fn flush(&mut self) {
-        self.flush_with(&mut |_| {});
+        self.flush_with(&mut |_, _| {});
     }
 
     /// As [`flush`](Self::flush), running `between` after each section but the last of this
     /// line, for [`prove`].
-    fn flush_with(&mut self, between: &mut dyn FnMut(u32)) {
+    fn flush_with(&mut self, between: &mut dyn FnMut(Sink, u32)) {
         let Some(bytes) = self.line.get(..self.len) else {
             return;
         };
@@ -969,7 +1174,7 @@ impl Console {
     }
 
     /// Ends the line, running `between` as for [`flush_with`](Self::flush_with).
-    fn end_line_with(&mut self, between: &mut dyn FnMut(u32)) {
+    fn end_line_with(&mut self, between: &mut dyn FnMut(Sink, u32)) {
         if let Some(slot) = self.line.get_mut(self.len) {
             *slot = b'\n';
             self.len += 1;
@@ -982,7 +1187,9 @@ impl Console {
 fn unowned_com1() -> Uart16550<KernelUart> {
     // SAFETY: CPL 0; COM1 is the console's own UART, and only `move_uart`, under the console
     // lock, comes back to it.
-    Uart16550::new(unsafe { KernelUart::port(COM1_BASE) })
+    let mut com1 = Uart16550::new(unsafe { KernelUart::port(COM1_BASE) });
+    com1.detect_fifo();
+    com1
 }
 
 /// The console's UART outside the console's own state: for urgent reports that cannot get
@@ -1039,8 +1246,9 @@ static PRINTERS_DONE: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 static PRINT_GO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Asks the proof's interrupt to print: see [`on_proof_interrupt`].
 static PRINT_IN_INTERRUPT: AtomicBool = AtomicBool::new(false);
-/// The thread of [`prove_thread_line`]: how many sections it counted, whether interrupts were
-/// on between all of them, and that it finished.
+/// The thread of [`prove_thread_line`]: how many sections of the UART's and of the screen's it
+/// counted, whether interrupts were on between all of them, and that it finished.
+static THREAD_UART_SECTIONS: AtomicU64 = AtomicU64::new(0);
 static THREAD_SECTIONS: AtomicU64 = AtomicU64::new(0);
 static THREAD_INTERRUPTS_ON: AtomicBool = AtomicBool::new(false);
 static THREAD_DONE: AtomicBool = AtomicBool::new(false);
@@ -1087,7 +1295,7 @@ pub(crate) fn on_proof_interrupt() {
 
 /// A line with [`PROOF_FILL`] characters after `prefix`, with `between` run after each of its
 /// sections but the last.
-fn print_long(out: &mut Console, prefix: &str, between: &mut dyn FnMut(u32)) {
+fn print_long(out: &mut Console, prefix: &str, between: &mut dyn FnMut(Sink, u32)) {
     use core::fmt::Write as _;
     let _ = out.write_str(prefix);
     for _ in 0..PROOF_FILL {
@@ -1096,18 +1304,22 @@ fn print_long(out: &mut Console, prefix: &str, between: &mut dyn FnMut(u32)) {
     out.end_line_with(between);
 }
 
-/// A thread drawing a line: threads run with interrupts on, so they must be on between the
-/// line's sections.
+/// A thread printing a line: threads run with interrupts on, so they must be on between the
+/// line's sections, on both sinks.
 extern "sysv64" fn section_printer(_: u64) -> ! {
-    let (mut sections, mut interrupts_on) = (0, true);
+    let (mut uart_sections, mut sections, mut interrupts_on) = (0, 0, true);
     print_long(
         &mut Console::new(),
         "origin-kernel: console: a line drawn by a thread: ",
-        &mut |section| {
-            sections = section;
+        &mut |sink, section| {
+            match sink {
+                Sink::Uart => uart_sections = section,
+                Sink::Screen => sections = section,
+            }
             interrupts_on &= crate::cpu::interrupts_enabled();
         },
     );
+    THREAD_UART_SECTIONS.store(u64::from(uart_sections), Ordering::Relaxed);
     THREAD_SECTIONS.store(u64::from(sections), Ordering::Relaxed);
     THREAD_INTERRUPTS_ON.store(interrupts_on, Ordering::Relaxed);
     THREAD_DONE.store(true, Ordering::Release);
@@ -1115,7 +1327,7 @@ extern "sysv64" fn section_printer(_: u64) -> ! {
 }
 
 /// A thread (one on the first processor other than the boot processor, or on the boot
-/// processor if it is alone) draws a line; interrupts must be on between its sections.
+/// processor if it is alone) prints a line; interrupts must be on between its sections.
 fn prove_thread_line(
     com1: &mut Console,
     cpus: &[crate::cpu::CpuIndex],
@@ -1123,39 +1335,111 @@ fn prove_thread_line(
     tsc_hz: u64,
 ) -> bool {
     use core::fmt::Write as _;
-    if !has_screen() {
-        return true;
-    }
     let far = cpus.iter().copied().find(|&id| id != bsp).unwrap_or(bsp);
     if crate::sched::spawn(far, section_printer, 0).is_ok() {
         crate::sched::yield_until(|| THREAD_DONE.load(Ordering::Acquire), tsc_hz, 5);
     }
+    let uart_sections = THREAD_UART_SECTIONS.load(Ordering::Relaxed);
     let sections = THREAD_SECTIONS.load(Ordering::Relaxed);
+    // A sink that is not there has no sections to count.
     let ok = THREAD_DONE.load(Ordering::Acquire)
-        && sections > 1
+        && (uart_sections > 1 || !uart_is_on())
+        && (sections > 1 || !has_screen())
         && THREAD_INTERRUPTS_ON.load(Ordering::Relaxed);
     let _ = writeln!(
         com1,
-        "origin-kernel: console: a thread's line took {sections} sections with interrupts on between them{}",
+        "origin-kernel: console: a thread's line took {uart_sections} sections on the UART and {sections} on the screen with interrupts on between them{}",
         if ok { "" } else { ": console failed" }
     );
     ok
 }
 
-/// Proves what [`SECTION_PIXELS`] promises, from the boot flow, last thing before the halt:
-/// that way what it prints is still on the screen when the boot test compares the screen with
-/// the serial log, row by row, so the order the lines keep is checked there, too.
+/// Fills the UART's queue with lines from a writer that cannot wait, each of which sends one
+/// section and leaves. Then a writer that can wait prints a line that does not fit: it must wait
+/// for room, without its line being lost or sent twice, and go on only when everything queued
+/// before it and the line itself are on the UART. The boot test reads every one of those lines
+/// back from the UART, in order and whole.
 ///
-/// An interrupt is made pending while the boot flow has interrupts off, so only a window the
-/// drawing itself opens can let it in: it must be taken while the line is still being drawn.
-/// Its handler prints a line from interrupt context, which must queue behind that line and
-/// leave the painting to the writer that can wait. A breakpoint in the middle of the next
-/// line tests the urgent path the same way. The sections' sizes are counted at the sink.
-pub(crate) fn prove_sections(com1: &mut Console) {
+/// Called from the boot flow, with interrupts off, so a plain [`Console`] really cannot wait.
+fn prove_room(com1: &mut Console) -> bool {
     use core::fmt::Write as _;
-    if !has_screen() || !WINDOWS_ALLOWED.load(Ordering::Acquire) {
+    const ROOM: &str = "origin-kernel: console: a line that had to wait for room: ";
+    /// More than the queue can hold, however many sections are sent meanwhile.
+    const MOST_LINES: u32 = 100;
+    if !uart_is_on() {
+        return true;
+    }
+    let flow = com1.flow();
+    let needed = ROOM.len() + PROOF_FILL + 1;
+    let mut lines = 0;
+    while lines < MOST_LINES && with_sinks(flow, |sinks| sinks.tx.has_room(needed)) {
+        let mut out = Console::new();
+        let _ = write!(
+            out,
+            "origin-kernel: console: a line that cannot wait: {lines}: "
+        );
+        for _ in 0..PROOF_FILL {
+            let _ = out.write_char('.');
+        }
+        let _ = out.write_char('\n');
+        lines += 1;
+    }
+    let no_room = UART_NO_ROOM.load(Ordering::Relaxed);
+    let before = UART_BYTES.load(Ordering::Relaxed);
+    print_long(com1, ROOM, &mut |_, _| {});
+    let waited = UART_NO_ROOM.load(Ordering::Relaxed) > no_room;
+    let written = UART_BYTES.load(Ordering::Relaxed).wrapping_sub(before);
+    let emptied = with_sinks(com1.flow(), |sinks| sinks.tx.is_empty());
+    // CR LF at the end of it, on top of what was in front of it.
+    let ok = lines > 1 && waited && emptied && written > (needed + 1) as u64;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: console: {lines} lines from a writer that cannot wait filled the UART's queue; the next writer waited for room: {waited}, and when it went on the queue was empty: {emptied}{}",
+        if ok { "" } else { ": console failed" }
+    );
+    ok
+}
+
+/// Whether the console still sends to its UART.
+fn uart_is_on() -> bool {
+    crate::cpu::without_interrupts(|| SINKS.lock().as_ref().is_some_and(|sinks| sinks.uart_alive))
+}
+
+/// Proves what [`TX_FIFO_BYTES`] promises, from the boot flow, just before [`prove_sections`]
+/// and for the same reason: what it prints is still on the screen for the boot test to compare
+/// with the serial log.
+///
+/// A line must be on the UART when its writer goes on, counted at the UART's data register. An
+/// interrupt made pending while the boot flow has interrupts off can only come in through a
+/// window the sending itself opens, so it must be taken while the line is still going out. Its
+/// handler prints a line, which must come after that line on the wire, whole. A breakpoint in
+/// the middle of the next line tests the urgent path the same way. The sections' sizes are
+/// counted at the sink. QEMU's UART takes bytes instantly, so what this proves is the bound in
+/// bytes, the windows and the order: what a section costs on a real UART it cannot show.
+pub(crate) fn prove_uart_sections(com1: &mut Console) {
+    use core::fmt::Write as _;
+    if !WINDOWS_ALLOWED.load(Ordering::Acquire) {
         return;
     }
+    if !uart_is_on() {
+        let given_up = UART_GIVEN_UP_AFTER.load(Ordering::Relaxed);
+        if given_up != 0 {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: console: the UART was given up on after {given_up} polls; nothing more is sent to it, and the screen said so at once: {}",
+                STOP_SHOWN_AT_ONCE.load(Ordering::Relaxed)
+            );
+        }
+        return;
+    }
+    const PLAIN: &str = "origin-kernel: console: a line sent on the UART a section at a time: ";
+    let before = UART_BYTES.load(Ordering::Relaxed);
+    print_long(com1, PLAIN, &mut |_, _| {});
+    let written = UART_BYTES.load(Ordering::Relaxed).wrapping_sub(before);
+    // CR LF at the end of it.
+    let whole_line = (PLAIN.len() + PROOF_FILL + 2) as u64;
+    let on_the_uart = written >= whole_line;
+
     let bsp = crate::cpu::this_cpu();
     let irqs = crate::cpu::ioapic_irqs_on(bsp);
     PRINT_IN_INTERRUPT.store(true, Ordering::Release);
@@ -1163,8 +1447,89 @@ pub(crate) fn prove_sections(com1: &mut Console) {
     let (mut taken_after, mut sections) = (None, 0);
     print_long(
         com1,
+        "origin-kernel: console: a line sent in sections while an interrupt waits: ",
+        &mut |sink, section| {
+            if sink == Sink::Uart {
+                sections = section;
+                if taken_after.is_none() && crate::cpu::ioapic_irqs_on(bsp) > irqs {
+                    taken_after = Some(section);
+                }
+            }
+        },
+    );
+    let handler_waited = with_sinks(com1.flow(), |sinks| !sinks.tx.is_empty());
+
+    let flow = com1.flow();
+    let mut report_out = false;
+    print_long(
+        com1,
+        "origin-kernel: console: a line sent in sections with a breakpoint in the middle: ",
+        &mut |sink, section| {
+            if sink == Sink::Uart && section == BREAK_AT {
+                crate::cpu::breakpoint();
+                report_out = with_sinks(flow, |sinks| sinks.tx.is_empty());
+            }
+        },
+    );
+
+    let taken = taken_after.is_some_and(|after| after < sections);
+    let worst_bytes = UART_SECTION_WORST_BYTES.load(Ordering::Relaxed);
+    let bounded = (1..=u64::from(TX_FIFO_BYTES)).contains(&worst_bytes);
+    let ok = on_the_uart && taken && handler_waited && report_out && bounded;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: console: a line took {} sections on the UART, none over {worst_bytes} bytes (the limit is {TX_FIFO_BYTES}); an interrupt waiting at its start was taken after section {}, and its handler's line waited its turn: {handler_waited}; a whole line ({written} of {whole_line} bytes) was on the UART before its writer went on: {on_the_uart}; a report left nothing queued behind it: {report_out}{}",
+        sections + 1,
+        taken_after.unwrap_or(0),
+        if ok { "" } else { ": console failed" }
+    );
+    // What a section costs on this machine (CLAUDE.md rule 21). QEMU's emulated UART says little
+    // about a real one: see the provenance record.
+    let sent = UART_SECTIONS.load(Ordering::Relaxed);
+    let cycles = UART_SECTION_CYCLES.load(Ordering::Relaxed);
+    if let Some(per_section) = cycles.checked_div(sent) {
+        let tsc_hz = u128::from(crate::time::tsc_hz().max(1));
+        let micros = |cycles: u64| u128::from(cycles) * 1_000_000 / tsc_hz;
+        let nanos = |cycles: u64| u128::from(cycles) * 1_000_000_000 / tsc_hz;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: console: UART: {sent} sections since the timer started, {} ns with interrupts off on average and {} us at worst, and {} polls found it busy",
+            nanos(per_section),
+            micros(UART_SECTION_WORST_CYCLES.load(Ordering::Relaxed)),
+            UART_BUSY_POLLS.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// Proves what [`SECTION_PIXELS`] promises, from the boot flow, last thing before the halt:
+/// that way what it prints is still on the screen when the boot test compares the screen with
+/// the serial log, row by row, so the order the lines keep is checked there, too.
+///
+/// While the line is drawn an interrupt is made pending, with the boot flow's interrupts off
+/// (after the line's UART sections, whose windows it would otherwise come in through), so only
+/// a window the drawing itself opens can let it in: it must be taken while the line is still
+/// being drawn. Its handler prints a line from interrupt context, which must queue behind that
+/// line and leave the painting to the writer that can wait. A breakpoint in the middle of the
+/// next line tests the urgent path the same way. The sections' sizes are counted at the sink.
+pub(crate) fn prove_sections(com1: &mut Console) {
+    use core::fmt::Write as _;
+    if !has_screen() || !WINDOWS_ALLOWED.load(Ordering::Acquire) {
+        return;
+    }
+    let bsp = crate::cpu::this_cpu();
+    let irqs = crate::cpu::ioapic_irqs_on(bsp);
+    let (mut taken_after, mut sections) = (None, 0);
+    print_long(
+        com1,
         "origin-kernel: console: a line drawn in sections while an interrupt waits: ",
-        &mut |section| {
+        &mut |sink, section| {
+            if sink != Sink::Screen {
+                return;
+            }
+            if section == 1 {
+                PRINT_IN_INTERRUPT.store(true, Ordering::Release);
+                crate::interrupt_self(crate::cpu::IOAPIC_VECTOR);
+            }
             sections = section;
             if taken_after.is_none() && crate::cpu::ioapic_irqs_on(bsp) > irqs {
                 taken_after = Some(section);
@@ -1176,8 +1541,8 @@ pub(crate) fn prove_sections(com1: &mut Console) {
     print_long(
         com1,
         "origin-kernel: console: a line drawn in sections with a breakpoint in the middle: ",
-        &mut |section| {
-            if section == BREAK_AT {
+        &mut |sink, section| {
+            if sink == Sink::Screen && section == BREAK_AT {
                 crate::cpu::breakpoint();
             }
         },
@@ -1189,7 +1554,7 @@ pub(crate) fn prove_sections(com1: &mut Console) {
     let ok = taken && handler_left_work && bounded;
     let _ = writeln!(
         com1,
-        "origin-kernel: console: a line took {} sections, none over {worst_pixels} pixels (the limit is {SECTION_PIXELS}); an interrupt waiting at its start was taken after section {}, and its handler's line waited its turn: {handler_left_work}{}",
+        "origin-kernel: console: a line took {} sections on the screen, none over {worst_pixels} pixels (the limit is {SECTION_PIXELS}); an interrupt made pending after its first section was taken after section {}, and its handler's line waited its turn: {handler_left_work}{}",
         sections + 1,
         taken_after.unwrap_or(0),
         if ok { "" } else { ": console failed" }
@@ -1251,5 +1616,6 @@ pub(crate) fn prove(
         if printed { "" } else { ": console failed" }
     );
     let thread_line = prove_thread_line(com1, cpus, bsp, tsc_hz);
-    printed && thread_line
+    let room = prove_room(com1);
+    printed && thread_line && room
 }

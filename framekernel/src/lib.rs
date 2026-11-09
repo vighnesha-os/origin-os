@@ -54,6 +54,7 @@
 //! - [`ivrs`]: the ACPI IVRS table (AMD IOMMUs, their device entries, memory definitions);
 //! - [`json`]: a depth-limited JSON parser (config, manifests, SDK data);
 //! - [`klog`]: a bounded kernel log ring (level + inline message, drop-oldest);
+//! - [`linequeue`]: the bounded text queue behind each of the console's two sinks;
 //! - [`net`]: Ethernet/IPv4/ICMP/ARP headers and the Internet checksum;
 //! - [`numa`]: a locality map (CPU/address → node, nearest-node order) from the SRAT/SLIT;
 //! - [`originfs`]: a read-only OriginFS on-disk parser and image builder (ADR-0006,
@@ -135,6 +136,7 @@ pub mod ioapic;
 pub mod ivrs;
 pub mod json;
 pub mod klog;
+pub mod linequeue;
 pub mod net;
 pub mod numa;
 pub mod nvme;

@@ -33,6 +33,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use origin_boot_info::{Framebuffer, FramebufferError};
 
 use crate::font;
+use crate::linequeue::LineQueue;
 
 /// Where a console's pixels go: one 32-bit pixel at a byte offset from the first pixel.
 pub trait PixelSink {
@@ -436,74 +437,39 @@ const LOST_NOTICE: &[u8] =
 /// how far it has got.
 #[derive(Debug)]
 pub struct Backlog<const N: usize> {
-    /// A ring of bytes, `len` of them from index `start`, not yet started.
-    text: [u8; N],
-    start: usize,
-    len: usize,
-    /// Bytes ever accepted.
-    queued: u64,
+    /// The text not yet started.
+    lines: LineQueue<N>,
     /// Bytes ever finished: a byte counts once every pixel of it is written.
     painted: u64,
     /// The character in progress.
     painting: Option<Painting>,
-    /// A line was refused: the next one that fits says so first.
-    lost: bool,
 }
 
 impl<const N: usize> Backlog<N> {
     /// An empty backlog.
     pub const fn new() -> Self {
-        const { assert!(N > 0, "a backlog needs room for at least one byte") };
         Self {
-            text: [0; N],
-            start: 0,
-            len: 0,
-            queued: 0,
+            lines: LineQueue::new(LOST_NOTICE),
             painted: 0,
             painting: None,
-            lost: false,
         }
+    }
+
+    /// Whether [`Self::push`] would take `bytes` more bytes now.
+    pub const fn has_room(&self, bytes: usize) -> bool {
+        self.lines.has_room(bytes)
     }
 
     /// Accepts `text`, whole or not at all, and returns the position at which it will be
     /// fully on the screen. `None` when there is no room.
     pub fn push(&mut self, text: &[u8]) -> Option<u64> {
-        let notice = if self.lost { LOST_NOTICE.len() } else { 0 };
-        if N - self.len < notice.saturating_add(text.len()) {
-            return None;
-        }
-        if self.lost {
-            self.lost = false;
-            self.push_bytes(LOST_NOTICE);
-        }
-        self.push_bytes(text);
-        Some(self.queued)
-    }
-
-    fn push_bytes(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            if let Some(slot) = self.text.get_mut((self.start + self.len) % N) {
-                *slot = byte;
-                self.len += 1;
-                self.queued += 1;
-            }
-        }
+        self.lines.push(text)
     }
 
     /// Records that a line had to be dropped because a caller could not wait for room: the
     /// next line that fits is preceded by a notice saying so.
-    pub fn note_lost(&mut self) {
-        self.lost = true;
-    }
-
-    fn pop(&mut self) -> Option<u8> {
-        if self.len == 0 {
-            return None;
-        }
-        let byte = self.text.get(self.start).copied();
-        self.start = (self.start + 1) % N;
-        self.len -= 1;
-        byte
+    pub const fn note_lost(&mut self) {
+        self.lines.note_lost();
     }
 
     /// Paints at most `pixels` more pixels of what is queued, oldest first, starting where the
@@ -524,7 +490,7 @@ impl<const N: usize> Backlog<N> {
                 self.painting = None;
                 self.painted += 1;
             }
-            match self.pop() {
+            match self.lines.pop() {
                 Some(byte) => self.painting = Some(screen.begin(cursor, byte)),
                 None => return false,
             }
@@ -538,16 +504,14 @@ impl<const N: usize> Backlog<N> {
 
     /// Whether everything accepted is on the screen.
     pub const fn is_empty(&self) -> bool {
-        self.len == 0 && self.painting.is_none()
+        self.lines.is_empty() && self.painting.is_none()
     }
 
     /// Forgets everything queued: the screen is gone.
     pub fn clear(&mut self) {
-        self.start = 0;
-        self.len = 0;
+        self.lines.clear();
         self.painting = None;
-        self.painted = self.queued;
-        self.lost = false;
+        self.painted = self.lines.queued();
     }
 }
 
@@ -1027,8 +991,7 @@ mod tests {
         assert_eq!(backlog.painted(), 8);
         // Drawn, so there is room again, and the ring wraps.
         assert_eq!(backlog.push(b"abcdefgh"), Some(16));
-        assert_eq!(backlog.len, 8);
-        assert!(backlog.start <= 8);
+        assert!(!backlog.has_room(1), "full again");
         while backlog.paint(&s, &cursor, &mut m, u32::MAX) {}
         assert_eq!(m.pixels, written(&s, &f, b"12345678abcdefgh").pixels);
     }

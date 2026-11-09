@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-08, as proposed (E1–E6, and the recommended answer to each of the three questions below; decision sheet items 27–29). It changes the boot-info structure (CLAUDE.md §84). The code is built and boot-tested under QEMU, and was merged into `claude/interesting-carson-ae7c83` on 2026-11-09 on the owner's word. Nothing here has shipped. **Amendment 1 (below, to E3) is Proposed**, not accepted: it records a change waiting for the owner's word. |
+| Status | **Accepted** by the owner on 2026-11-08, as proposed (E1–E6, and the recommended answer to each of the three questions below; decision sheet items 27–29). It changes the boot-info structure (CLAUDE.md §84). The code is built and boot-tested under QEMU, and was merged into `claude/interesting-carson-ae7c83` on 2026-11-09 on the owner's word. Nothing here has shipped. **Amendments 1 and 2 (below, to E3) are Proposed**, not accepted: they record changes waiting for the owner's word. |
 | Requires | CLAUDE.md §13 (checked parsing), §19 (boot-info structure, early diagnostics), §51 (font provenance), §58 (threat-model privileged interfaces), §69 (diagnostics), §74, rules 14, 30 and 40 |
 | Implements | ADR-0009 H6, third bullet: a console that does not depend on a 16550 at `0x3F8` |
 | Code | `boot/info` (`Framebuffer`), `boot/uefi` (the Graphics Output Protocol hand-off), `framekernel/paging` (the mapping), `framekernel/src/{fbconsole,font,spcr,serial,console}.rs`, `developer-tools/xtask` |
@@ -36,7 +36,7 @@ The loader maps the framebuffer's visible rows in the first page tables (ADR-000
 
 ### E3. The console: framebuffer first, then the UART
 
-Every line goes to the framebuffer, then to the UART, under the existing console lock. (Amendment 1, below, proposes changing this order.) `framekernel::fbconsole` draws text through an abstract pixel sink, in 8 by 16 cells scaled by a whole number on panels taller than 1439 rows. Text never scrolls and the framebuffer is never read: the next line goes to the row below, painted first as a bar, and the screen wraps at the bottom. Scrolling would read or rewrite the whole screen for each line, with interrupts off, on memory that may be uncached. This way a line costs at most two rows of writes: its own and the bar's.
+Every line goes to the framebuffer, then to the UART, under the existing console lock. (Amendments 1 and 2, below, propose changing this order and sending a line a section at a time.) `framekernel::fbconsole` draws text through an abstract pixel sink, in 8 by 16 cells scaled by a whole number on panels taller than 1439 rows. Text never scrolls and the framebuffer is never read: the next line goes to the row below, painted first as a bar, and the screen wraps at the bottom. Scrolling would read or rewrite the whole screen for each line, with interrupts off, on memory that may be uncached. This way a line costs at most two rows of writes: its own and the bar's.
 
 ### E4. The UART: from the SPCR when the firmware names one
 
@@ -126,3 +126,34 @@ The framebuffer mapping is kernel-only, writable and never executable, in the ke
 | Spend fewer pixels on a line (a thinner bar) | Less to do | No bound either, and it changes what E3 and the screen check specify |
 
 **Evidence.** `docs/engineering/SOURCE_PROVENANCE.md`, "The console: a line drawn a section at a time". The KVM figure has not been taken again; the measurements in that entry are TCG only.
+
+## Amendment 2 (Proposed, 2026-11-09): the UART a section at a time
+
+**Status: Proposed, not accepted (branch `claude/uart-bounded-send`, on top of Amendment 1's branch, local, not pushed).** The code on that branch already behaves as below. E3 as accepted, and Amendment 1 until the owner decides on it, stand until then.
+
+**Why.** Amendment 1 made the pixels of a line go out a section at a time and left the UART in one critical section: the line's bytes, polled one at a time, with interrupts off and the console lock held. At 115 200 baud a byte takes 87 µs on the wire (10 bits), so 100 bytes take 8.7 ms, as long as the 10 ms timer tick. QEMU's UART takes a byte instantly, so no QEMU boot showed it.
+
+**The change.** A line's hand-over no longer touches the UART: it joins a bounded queue of text for the UART (4 KiB) in the same critical section as the screen's backlog, so the two sinks still get lines in one order. Then the UART is worked at a section at a time, like the screen:
+
+- Each section holds the console lock with interrupts off, reads the line status once, and, if the transmitter reports empty, writes one load: at most 16 bytes, the 16550's transmit FIFO, or 1 byte on a UART with no working FIFO. **The bound is 1 status read and 16 data writes, 17 register accesses. It does not depend on the line's speed**, because the 16 bytes need no further look at the status: `LSR.THRE` means the FIFO is empty, and the CPU never waits for the wire inside a section.
+- A section that finds the transmitter busy writes nothing and ends. Waiting for a load to leave (1.4 ms at 115 200 baud) is done between sections, with the lock free and interrupts as the writer has them (on for a thread; a window between sections for the boot flow once interrupts can be taken).
+- Whoever holds the lock takes the next section. Positions count bytes in the queue, as for the screen: a writer goes on when its own line's last byte has been written to the UART, whichever processor sent it.
+- A writer that cannot wait (an interrupt handler) hands its line over, sends one section and leaves. The rest of its line goes out with the next writer that can wait, or the next report.
+- A report (`Console::urgent`) keeps interrupts off from start to finish and takes the lock a section at a time like everyone else, so two reports at once queue behind each other instead of waiting each other out. It goes on until everything queued before it, and the report itself, are on the UART and on the screen. On a working UART its wait is bounded by the queue's size (355 ms at 115 200 baud); a UART that stops is given the one wait below.
+- A UART that stops taking bytes is given up on after one bounded wait, however many sections it is spread over: `TX_POLL_LIMIT` polls in a row, per byte of the last load (the wait a transmitter was allowed when polled byte by byte). It is reported on the screen, as E5 requires, and the writer that found it out goes on only when that line has been drawn, even if nothing is printed again.
+- Amendment 1 says a line is on the wire before any pixel of it is drawn. That is now true of the writer that can wait: it sends its line before it draws. One writer's last section of drawing can run on into the line queued behind its own, so a little of that later line may be drawn before it has gone out.
+- The replay of the early log (E4) is not sent in sections: it runs once, before the timer starts and before any other processor does.
+
+**What it changes.** `framekernel/src/console.rs`, `framekernel/src/serial.rs` (`TxQueue`, `Uart16550::detect_fifo`), `framekernel/src/linequeue.rs` (the ring both sinks use, taken out of `fbconsole::Backlog`), and `developer-tools/xtask`.
+
+**Alternatives.**
+
+| | Gain | Why not |
+|---|---|---|
+| Wait for the FIFO inside the section | A section is one load and one wait, and no queue is needed for the wait | The section lasts 1.4 ms at 115 200 baud (the wait), 16 ms at 9600, all of it with interrupts off: a shorter version of the same problem |
+| Sections of less than 16 bytes | Shorter still | A section is already 17 register accesses; below that the lock, the status read and the interrupt toggle cost about as much as the bytes |
+| One writer owns the UART across its line, nobody else may touch it | No queue | A preempted owner blocks every other writer; an interrupt handler cannot wait for it |
+| UART interrupts feed the FIFO | No polling, and the writer sleeps | Needs an interrupt line and routing for every UART the SPCR can name, and makes the development console depend on interrupts working; §69 says production logging will be a ring drained by a thread, which is a different design |
+| One queue for both sinks | Less memory | A slow screen would hold the UART back and the other way round; today each sink can fall behind on its own |
+
+**Evidence.** `docs/engineering/SOURCE_PROVENANCE.md`, "The console: the UART a section at a time". QEMU's UART is effectively instant: what the boot proofs show is the bound in bytes, the windows between sections and the order on the wire, not the real time a section takes or the time a real line takes to drain.
