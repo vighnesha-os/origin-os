@@ -123,10 +123,19 @@ struct ReportLog {
     count: usize,
 }
 
+/// What a running user thread stands on, held by the scheduler from the thread's start until
+/// it is reaped.
+pub(crate) struct UserContext {
+    /// The thread's process.
+    pub(crate) process: ObjectRef<Process>,
+    /// The address space it runs in.
+    pub(crate) space: ObjectRef<UserSpace>,
+}
+
 /// One process.
 pub(crate) struct Process {
-    /// Its page tables and the user frames they map, freed with it.
-    space: UserSpace,
+    /// Its page tables and the user frames they map, shared with its threads.
+    space: ObjectRef<UserSpace>,
     /// Its handles (P1).
     pub(crate) handles: SpinLock<HandleTable<Object>>,
     /// What it may hold (P11).
@@ -152,7 +161,7 @@ impl Process {
     /// code may issue system calls only from `[syscall_origin.0, syscall_origin.1)`.
     pub(crate) fn new(limits: Limits, syscall_origin: (u64, u64)) -> Option<Self> {
         Some(Self {
-            space: UserSpace::new()?,
+            space: ObjectRef::try_new(UserSpace::new()?).ok()?,
             handles: SpinLock::new(HandleTable::new(limits.handles)),
             account: ObjectRef::try_new(Account {
                 channels: AtomicUsize::new(0),
@@ -175,19 +184,22 @@ impl Process {
     }
 
     /// The PML4 (physical), the value for CR3.
-    pub(crate) const fn root(&self) -> u64 {
+    pub(crate) fn root(&self) -> u64 {
         self.space.root()
     }
 
-    /// This process's address space.
-    pub(crate) const fn space(&self) -> &UserSpace {
-        &self.space
+    /// A reference to its address space, for a thread about to run in it.
+    pub(crate) fn memory(&self) -> ObjectRef<UserSpace> {
+        self.space.clone()
     }
 
     /// Maps the user page `virt` to a fresh zeroed frame this process owns, and returns it.
-    /// Only inside the user half (ADR-0004 H1). Before the process has threads.
+    /// Only inside the user half (ADR-0004 H1). Before the process has threads, while its
+    /// creator holds the only reference to the address space.
     pub(crate) fn map_page(&mut self, virt: u64, access: Access) -> Result<UserFrame, MapError> {
-        self.space.map_page(virt, access)
+        ObjectRef::get_mut(&mut self.space).map_or(Err(MapError::OutOfMemory), |space| {
+            space.map_page(virt, access)
+        })
     }
 
     /// Copies `bytes` to `offset` bytes into the frame `frame` (from [`Process::map_page`]).
@@ -282,8 +294,13 @@ impl Process {
         rsp: u64,
         rdi: u64,
     ) -> Result<(), QueueError> {
+        let user = ObjectRef::try_new(UserContext {
+            process: process.clone(),
+            space: process.memory(),
+        })
+        .map_err(|_| QueueError::Full)?;
         process.threads.fetch_add(1, Ordering::AcqRel);
-        match sched::spawn_user(cpu, process.clone(), rip, rsp, rdi) {
+        match sched::spawn_user(cpu, user, rip, rsp, rdi) {
             Ok(_) => Ok(()),
             Err(e) => {
                 process.threads.fetch_sub(1, Ordering::AcqRel);
