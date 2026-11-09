@@ -125,7 +125,7 @@ The framebuffer mapping is kernel-only, writable and never executable, in the ke
 | Send the UART through the same backlog | One queue | A line is no longer on the wire when `flush` returns, so a crash can lose it |
 | Spend fewer pixels on a line (a thinner bar) | Less to do | No bound either, and it changes what E3 and the screen check specify |
 
-**Evidence.** `docs/engineering/SOURCE_PROVENANCE.md`, "The console: a line drawn a section at a time". The KVM figure has not been taken again; the measurements in that entry are TCG only.
+**Evidence.** `docs/engineering/SOURCE_PROVENANCE.md`, "The console: a line drawn a section at a time": under KVM on an AMD EPYC 9V74 runner (Actions run 42561010289) one section, the most that holds interrupts off for pixels, took 23.4 to 24.6 us on average, where a whole line took 4.3 to 4.6 ms on the EPYC 7763 that found the problem. Those are different processor models; no real machine has been tested.
 
 ## Amendment 2 (Proposed, 2026-11-09): the UART a section at a time
 
