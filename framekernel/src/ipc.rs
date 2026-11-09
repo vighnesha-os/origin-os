@@ -506,8 +506,9 @@ pub(crate) fn channel_read(
 pub(crate) fn handle_close(
     table: &SpinLock<HandleTable<Object>>,
     handle: Handle,
+    need: Need,
 ) -> Result<(), Error> {
-    let (object, _) = without_interrupts(|| table.lock().remove(handle, Need::NOTHING))?;
+    let (object, _) = without_interrupts(|| table.lock().remove(handle, need))?;
     // The handle is gone from the table: a waiter on it sees that when it is woken here. If
     // this was the end's last reference, the drop below closes the end and wakes its peer.
     let Object::Channel(end) = &object;

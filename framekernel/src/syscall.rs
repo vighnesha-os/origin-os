@@ -26,6 +26,7 @@
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
+use crate::handles::Need;
 use crate::usercopy::UserAccess;
 use origin_abi::{Error, Handle};
 use origin_frame::trap::SyscallOutcome;
@@ -92,6 +93,14 @@ fn declared<E: rt::MethodError>(otherwise: E) -> impl FnOnce(Error) -> E {
     move |e| E::from_status(e.raw()).unwrap_or(otherwise)
 }
 
+/// What the definition asks of this handle.
+const fn need(handle: rt::HandleArg) -> Need {
+    Need {
+        rights: handle.need_rights(),
+        object: handle.need_object(),
+    }
+}
+
 /// The kernel's side of the generated interface: each call on behalf of this process.
 impl server::Calls for Process {
     fn holds(&self, capability: oidl::Capability) -> bool {
@@ -116,7 +125,7 @@ impl server::Calls for Process {
     }
 
     fn handle_close(&self, handle: rt::HandleArg) -> Result<(), server::HandleCloseError> {
-        ipc::handle_close(&self.handles, handle.value())
+        ipc::handle_close(&self.handles, handle.value(), need(handle))
             .map_err(declared(server::HandleCloseError::BadHandle))
     }
 
@@ -242,7 +251,7 @@ fn handle_duplicate(
     checked(p, new_handle.addr(), HANDLE_BYTES as u64, UserAccess::Write)?;
     let new = ipc::handle_duplicate(&p.handles, handle.value(), rights.bits())?;
     copy_out(p, new_handle.addr(), &new.to_le_bytes()).inspect_err(|_| {
-        let _ = ipc::handle_close(&p.handles, new);
+        let _ = ipc::handle_close(&p.handles, new, Need::NOTHING);
     })
 }
 
@@ -255,13 +264,13 @@ fn channel_create(p: &Process, ends: rt::UserRef<[rt::Handle; 2]>) -> Result<(),
     let b = match p.grant(ipc::Object::Channel(second), rights) {
         Ok(b) => b,
         Err(e) => {
-            let _ = ipc::handle_close(&p.handles, a);
+            let _ = ipc::handle_close(&p.handles, a, Need::NOTHING);
             return Err(e);
         }
     };
     copy_out_handles(p, ends.addr(), &[a, b]).inspect_err(|_| {
-        let _ = ipc::handle_close(&p.handles, a);
-        let _ = ipc::handle_close(&p.handles, b);
+        let _ = ipc::handle_close(&p.handles, a, Need::NOTHING);
+        let _ = ipc::handle_close(&p.handles, b, Need::NOTHING);
     })
 }
 
@@ -358,7 +367,7 @@ fn channel_read(
             // call could fail here. Then the handles the program cannot see are closed.
             delivered.inspect_err(|_| {
                 for &value in &installed {
-                    let _ = ipc::handle_close(&p.handles, value);
+                    let _ = ipc::handle_close(&p.handles, value, Need::NOTHING);
                 }
             })
         }
