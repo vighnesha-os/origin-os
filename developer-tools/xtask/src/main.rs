@@ -1193,12 +1193,21 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: processes: PML4 ".into(),
             "at once and read back 0x400800 from 0x500000 (own values only: 0x400800); not mapped in the kernel's tables: true".into(),
             format!("origin-kernel: clock: TSC consistent across {cpus} processors: "),
+            // ADR-0012: no caller is ever given less than before, on any processor; and what a
+            // read costs, measured (CLAUDE.md rule 21).
+            format!("origin-kernel: clock: monotonic across {cpus} processors: "),
+            "origin-kernel: clock: reading it costs ".into(),
             // Every CPU printed its lines at once; `console_lines_intact` checks each one.
             format!(
                 "origin-kernel: console: {cpus} processors printed {CONSOLE_LINES} lines each at once"
             ),
-            // What drawing a line costs, measured (CLAUDE.md rule 21).
-            "origin-kernel: console: framebuffer: ".into(),
+            // A thread's line, drawn a section at a time with interrupts on between them.
+            "origin-kernel: console: a line drawn by a thread: ".into(),
+            "origin-kernel: console: a thread's line took ".into(),
+            // Lines from a writer that cannot wait fill the UART's queue, and the next writer
+            // waits for room: `unwaited_lines_whole` reads each of them back.
+            "origin-kernel: console: a line that had to wait for room: ".into(),
+            " lines from a writer that cannot wait filled the UART's queue".into(),
             // ADR-0004 H5: global kernel pages on every CPU, nothing global in the lower
             // half; and TLB shootdowns: every other CPU's next read of each unmapped page
             // faults.
@@ -1409,12 +1418,39 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // Integration: a /sys tree built in the VFS from live discovered facts.
             "origin-kernel: sysfs: built /sys with 4 facts (4 subtrees): ".into(),
             "bus/pci/count=7, block/nvme0/size_mib=16; read back pci count Some(7)".into(),
+            // A line sent to the UART in sections (`console::prove_uart_sections`, near the
+            // end so its lines are on the screen for the screen check): on the UART before
+            // its writer goes on; an interrupt taken before it was all sent, whose handler's
+            // line came after it on the wire; a breakpoint in the middle of another; every
+            // section one FIFO load at most; and what a section costs, measured (rule 21).
+            "origin-kernel: console: a line sent on the UART a section at a time: ".into(),
+            "origin-kernel: console: a line sent in sections while an interrupt waits: ".into(),
+            "origin-kernel: console: this line comes from an interrupt handler".into(),
+            "origin-kernel: console: a line sent in sections with a breakpoint in the middle: ".into(),
+            "origin-kernel: exception 3 (#BP breakpoint) at rip".into(),
+            "origin-kernel: breakpoint handled; resuming".into(),
+            "origin-kernel: console: a line took ".into(),
+            "origin-kernel: console: UART: ".into(),
+            // A line drawn in sections (`console::prove_sections`, last so its lines are
+            // on the screen for the screen check): an interrupt taken before it was finished,
+            // whose handler's line queued behind it; a breakpoint in the middle of another;
+            // every section at most 1 KiB of pixels; and what drawing a line costs, measured
+            // (CLAUDE.md rule 21).
+            "origin-kernel: console: a line drawn in sections while an interrupt waits: ".into(),
+            "origin-kernel: console: this line comes from an interrupt handler".into(),
+            "origin-kernel: console: a line drawn in sections with a breakpoint in the middle: ".into(),
+            "origin-kernel: exception 3 (#BP breakpoint) at rip".into(),
+            "origin-kernel: breakpoint handled; resuming".into(),
+            "origin-kernel: console: a line took ".into(),
+            "origin-kernel: console: framebuffer: ".into(),
             "origin-kernel: M1 entry complete; halting".into(),
         ])
         .collect(),
         failures: boot_failures(),
         check: Some(|done| {
             console_lines_intact(&done.serial, self::machine().cpus() as usize)?;
+            long_lines_whole(&done.serial)?;
+            unwaited_lines_whole(&done.serial)?;
             check_screen(done)
         }),
         stderr: vec![],
@@ -1518,18 +1554,40 @@ const CLOCK_FAILED: &str = ": clock failed";
 /// console writes one line at a time to both).
 fn check_screen(done: &Completed) -> Result {
     let image = done.screen.as_ref().ok_or("no screen dump was taken")?;
-    let start = done
-        .serial
+    check_screen_text(image, &done.serial)
+}
+
+/// The check itself: `image` against everything the log says the console printed.
+fn check_screen_text(image: &screen::Image, serial: &str) -> Result {
+    let start = serial
         .find("origin-kernel: console: framebuffer")
         .ok_or("the serial log has no framebuffer console line")?;
-    let text = done.serial.get(start..).ok_or("serial log out of bounds")?;
+    let text = serial.get(start..).ok_or("serial log out of bounds")?;
     // The markers can be seen a moment before the serial port's last newline arrives; the
-    // console drew that whole last line before any of it left through the UART.
+    // whole last line is on the screen by then or very soon after ([`settled_screen`]).
     let mut text = text.to_string();
     if !text.ends_with('\n') {
         text.push('\n');
     }
     screen::check_frame(image, &text)
+}
+
+/// How long [`settled_screen`] gives the screen to catch up with the log.
+const SCREEN_SETTLE: Duration = Duration::from_secs(5);
+
+/// The screen dump to check, once it has caught up with the log. The console sends each line
+/// to the UART before it draws it (ADR-0010 Amendment 1), so a dump taken the moment the markers appear can be a line or so behind
+/// the log: this takes dumps until one matches or the time is up. Whichever comes first, the
+/// last one is returned for [`check_screen`] to judge, so a frame that never matches fails
+/// the same way as before, with the difference named.
+fn settled_screen(monitor: &mut ChildStdin, path: &Path, serial: &str) -> Result<screen::Image> {
+    let mut image = dump_screen(monitor, path, true)?;
+    let deadline = Instant::now() + SCREEN_SETTLE;
+    while check_screen_text(&image, serial).is_err() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+        image = dump_screen(monitor, path, false)?;
+    }
+    Ok(image)
 }
 
 /// Developer mode: an unsigned kernel still boots (ADR-0002 B8), and the loader says so.
@@ -1691,6 +1749,64 @@ fn console_lines_intact(text: &str, cpus: usize) -> Result {
         return Err(format!(
             "console proof: expected lines 0..{CONSOLE_LINES} from each of {cpus} CPUs, got {seen:?}"
         ));
+    }
+    Ok(())
+}
+
+/// How many dots follow the prefix of each of the kernel's long proof lines
+/// (`framekernel/src/console.rs`: `PROOF_FILL`).
+const LONG_LINE_FILL: usize = 60;
+/// The long lines the console's proofs print, by their prefixes. Interrupts and reports come
+/// in the middle of them, and each is many sections long on both sinks.
+const LONG_LINES: [&str; 7] = [
+    "origin-kernel: console: a line drawn by a thread: ",
+    "origin-kernel: console: a line that had to wait for room: ",
+    "origin-kernel: console: a line sent on the UART a section at a time: ",
+    "origin-kernel: console: a line sent in sections while an interrupt waits: ",
+    "origin-kernel: console: a line sent in sections with a breakpoint in the middle: ",
+    "origin-kernel: console: a line drawn in sections while an interrupt waits: ",
+    "origin-kernel: console: a line drawn in sections with a breakpoint in the middle: ",
+];
+
+/// Every long line must have reached the UART once and whole: the dots, all of them and
+/// nothing else, where a load that overran the UART's FIFO would lose some, and an interrupt's
+/// or a report's line sent in the middle would show. (Such a line also has two `origin-kernel:`
+/// prefixes on it, which [`console_lines_intact`] refuses.)
+fn long_lines_whole(text: &str) -> Result {
+    for prefix in LONG_LINES {
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains(prefix)).collect();
+        let [line] = lines.as_slice() else {
+            return Err(format!(
+                "long proof line {prefix:?} appears {} times",
+                lines.len()
+            ));
+        };
+        let dots = line.strip_prefix(prefix);
+        if dots.is_none_or(|d| d.len() != LONG_LINE_FILL || d.bytes().any(|b| b != b'.')) {
+            return Err(format!("a long proof line is not whole: {line:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// The lines of a writer that cannot wait (`console::prove_room`), `0..n`, each with its dots:
+/// the queue must lose none of them, send none twice and keep their order.
+fn unwaited_lines_whole(text: &str) -> Result {
+    const PREFIX: &str = "origin-kernel: console: a line that cannot wait: ";
+    let mut next = 0;
+    for line in text.lines().filter(|l| l.contains(PREFIX)) {
+        let whole = line.strip_prefix(PREFIX).and_then(|rest| {
+            let (k, dots) = rest.split_once(": ")?;
+            (dots.len() == LONG_LINE_FILL && dots.bytes().all(|b| b == b'.'))
+                .then(|| k.parse::<usize>().ok())?
+        });
+        if whole != Some(next) {
+            return Err(format!("line {next} that could not wait: got {line:?}"));
+        }
+        next += 1;
+    }
+    if next == 0 {
+        return Err("no lines from a writer that could not wait".into());
     }
     Ok(())
 }
@@ -1976,6 +2092,27 @@ fn console_scenarios() -> Vec<Scenario> {
             }),
             None,
         ),
+        // COM1's status port answers and never reports room to transmit, and there is no UART
+        // behind it: the kernel must give up after one bounded wait and say so on the screen,
+        // the only place left to say it. The wait is the whole of the first line's, whoever
+        // polls: the count is the limit, not the limit once for each line.
+        console_scenario(
+            "console: a UART that stops taking bytes",
+            Capture::Screen,
+            console_markers(&[&format!(
+                "origin-kernel: console: the UART was given up on after {} polls; nothing more is sent to it, and the screen said so at once: true",
+                framekernel::serial::TX_POLL_LIMIT
+            )]),
+            Some(|_| {
+                Ok(vec![
+                    "-chardev".into(),
+                    "null,id=wedged".into(),
+                    "-device".into(),
+                    "isa-debugcon,iobase=0x3fd,readback=0,chardev=wedged".into(),
+                ])
+            }),
+            None,
+        ),
         console_scenario(
             "console: no display",
             Capture::Com1,
@@ -2015,7 +2152,7 @@ fn boot_console() -> Result {
         run_scenario(scenario, kernel)?;
     }
     println!(
-        "xtask: boot-console passed ({} of {} scenarios: the UART the SPCR names, COM1 named, refused tables, a UART that takes no bytes, no display, no UART)",
+        "xtask: boot-console passed ({} of {} scenarios: the UART the SPCR names, COM1 named, refused tables, a UART that takes no bytes, one that stops taking them, no display, no UART)",
         chosen.len(),
         scenarios.len()
     );
@@ -3724,7 +3861,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
     let mut screen = None;
     if verdict.is_ok() && scenario.capture == Capture::Com1AndScreen {
         match stdin.as_mut() {
-            Some(monitor) => match dump_screen(monitor, &screen_path, true) {
+            Some(monitor) => match settled_screen(monitor, &screen_path, &text) {
                 Ok(image) => screen = Some(image),
                 Err(e) => verdict = Err(format!("no screen dump: {e}")),
             },
@@ -4660,6 +4797,65 @@ mod tests {
             spcr::parse(&spcr_table(3, gas_io(SPCR_PORT), 7)),
             Err(spcr::SpcrError::Interface(3))
         );
+    }
+
+    fn long_lines() -> String {
+        LONG_LINES
+            .iter()
+            .map(|prefix| format!("{prefix}{}\n", ".".repeat(LONG_LINE_FILL)))
+            .collect()
+    }
+
+    fn unwaited(count: usize) -> String {
+        (0..count)
+            .map(|k| {
+                format!(
+                    "origin-kernel: console: a line that cannot wait: {k}: {}\n",
+                    ".".repeat(LONG_LINE_FILL)
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unwaited_lines_pass_only_if_all_are_there_once_and_whole_in_order() {
+        assert_eq!(unwaited_lines_whole(&unwaited(40)), Ok(()));
+        assert!(unwaited_lines_whole("").is_err());
+        let good = unwaited(4);
+        let lines: Vec<&str> = good.lines().collect();
+        // Lost, twice, out of order, cut short.
+        let lost = [lines[0], lines[2], lines[3]].join("\n");
+        assert!(unwaited_lines_whole(&lost).is_err());
+        let twice = [lines[0], lines[1], lines[1], lines[2]].join("\n");
+        assert!(unwaited_lines_whole(&twice).is_err());
+        let swapped = [lines[1], lines[0], lines[2]].join("\n");
+        assert!(unwaited_lines_whole(&swapped).is_err());
+        let short = good.replacen(&".".repeat(LONG_LINE_FILL), ".", 1);
+        assert!(unwaited_lines_whole(&short).is_err());
+    }
+
+    #[test]
+    fn long_lines_pass_only_if_every_one_is_whole() {
+        assert_eq!(long_lines_whole(&long_lines()), Ok(()));
+        // One whole line is missing, or there twice.
+        let good = long_lines();
+        let first = good.lines().next().unwrap();
+        assert!(long_lines_whole(good.strip_prefix(first).unwrap()).is_err());
+        assert!(long_lines_whole(&format!("{first}\n{good}")).is_err());
+        // A dot lost, as a burst that overran the FIFO would.
+        let short = good.replacen(&format!(": {}", ".".repeat(LONG_LINE_FILL)), ": .", 1);
+        assert!(long_lines_whole(&short).is_err());
+        // A report in the middle of a line.
+        let mixed = good.replacen(
+            &format!(": {}", ".".repeat(LONG_LINE_FILL)),
+            &format!(
+                ": {}origin-kernel: exception 3\n{}",
+                ".".repeat(10),
+                ".".repeat(LONG_LINE_FILL - 10)
+            ),
+            1,
+        );
+        assert!(long_lines_whole(&mixed).is_err());
     }
 
     #[test]

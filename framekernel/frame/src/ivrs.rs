@@ -73,8 +73,8 @@ pub mod entry {
     pub const ACPI_HID: u8 = 0xF0;
 }
 
-/// The IVHD flags (spec Tables 92 and 97): the control-register settings the platform
-/// recommends.
+/// The IVHD flags (spec Tables 92, 97 and 101, one layout for types 10h, 11h and 40h): the
+/// control-register settings the platform recommends.
 pub mod ivhd_flags {
     pub const HT_TUNNEL: u8 = 1 << 0;
     pub const PASS_PW: u8 = 1 << 1;
@@ -490,6 +490,32 @@ impl<'a> Unit<'a> {
     /// Whether the platform recommends snooped device-table reads.
     pub fn coherent(&self) -> bool {
         self.flags & ivhd_flags::COHERENT != 0
+    }
+
+    /// HATDis (types 11h and 40h, attributes bit 0; Tables 98 and 102): the IOMMU does no
+    /// host address translation, so it can remap interrupts but cannot confine DMA. Only a
+    /// virtual IOMMU reports it; hardware must not.
+    pub fn host_translation_disabled(&self) -> bool {
+        self.kind != kind::IVHD_LEGACY && self.attributes & 1 != 0
+    }
+
+    /// Whether the IOMMU has performance counters, which make its register set 512 KiB
+    /// instead of 16 KiB (§2.3): PCSup (bit 9) in the EFR image of a type 11h or 40h block,
+    /// or, in a type 10h block, PNBanks (22:17) or PNCounters (16:13) not zero (Table 94).
+    pub fn performance_counters(&self) -> bool {
+        match self.efr {
+            Some(efr) => efr & 1 << 9 != 0,
+            None => self.attributes & (0x3F << 17 | 0xF << 13) != 0,
+        }
+    }
+
+    /// The bytes of physical address space its registers occupy (§2.3).
+    pub fn register_span(&self) -> u64 {
+        if self.performance_counters() {
+            512 * 1024
+        } else {
+            16 * 1024
+        }
     }
 
     /// How this IOMMU sees `id`: an entry naming it first, then a range holding it, then an
@@ -1443,6 +1469,51 @@ mod tests {
             })
         );
         assert!(u.efr.is_none());
+    }
+
+    #[test]
+    fn host_translation_and_register_span_follow_the_block_type() {
+        let sel = e4(entry::SELECT, 0x10, 0);
+        let one = |kind: u8, attributes: u32, efr: u64| {
+            let t = table(
+                2,
+                info::EFR_SUPPORTED,
+                &[ivhd(
+                    kind,
+                    0,
+                    2,
+                    0x40,
+                    0xFEB8_0000,
+                    0,
+                    0,
+                    attributes,
+                    efr,
+                    0,
+                    core::slice::from_ref(&sel),
+                )],
+            );
+            let u = parse(&t).unwrap().units().next().unwrap();
+            (u.host_translation_disabled(), u.register_span())
+        };
+        const SMALL: u64 = 16 * 1024;
+        const LARGE: u64 = 512 * 1024;
+        // 11h and 40h: HATDis is attributes bit 0; PCSup is EFR bit 9 (Tables 98, 102; §2.3).
+        for k in [kind::IVHD, kind::IVHD_MIXED] {
+            assert_eq!(one(k, 0, 0), (false, SMALL));
+            assert_eq!(one(k, 1, 0), (true, SMALL));
+            assert_eq!(one(k, 0, 1 << 9), (false, LARGE));
+            assert_eq!(
+                one(k, 1 << 13, 0),
+                (false, SMALL),
+                "attribute bits are not counters"
+            );
+        }
+        // 10h: the same field reports features; bit 0 is XTSup, not HATDis, and counters show
+        // as PNCounters (16:13) or PNBanks (22:17) (Table 94).
+        assert_eq!(one(kind::IVHD_LEGACY, 1, 0), (false, SMALL));
+        assert_eq!(one(kind::IVHD_LEGACY, 1 << 13, 0), (false, LARGE));
+        assert_eq!(one(kind::IVHD_LEGACY, 1 << 22, 0), (false, LARGE));
+        assert_eq!(one(kind::IVHD_LEGACY, 1 << 23 | 1 << 12, 0), (false, SMALL));
     }
 
     #[test]

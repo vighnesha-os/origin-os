@@ -5,8 +5,8 @@
 | As of | 2026-11-09, on `main`, after the pre-merge review. Everything that was on a side branch is merged. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38 and 40–51. |
-| Still open | Items 30, 31 and 39 below. Buying the machines ADR-0009 chose. |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38 and 40–54. |
+| Still open | Items 30, 31 and 39 below. Buying machines is off for now (ADR-0009's update of 2026-11-09). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -105,6 +105,8 @@ ADR-0009 H6 asked for a console that does not depend on a 16550 at `0x3F8`. The 
 | 27, answered | Boot info 0.4: the framebuffer appended as 48 bytes (`Framebuffer`, E1) | **Accepted by the owner, 2026-11-08** | This is the §84 ABI decision for this work. It adds one field group, with no compatibility promise at major 0, and matches ADR-0002 B4 (the loader translates firmware structures). Alternatives and trade-offs are in the ADR |
 | 28, answered | The framebuffer mapped uncached in the first 2 GiB of the MMIO window, by the loader, and kept at that address by the kernel (E2) | **Accepted by the owner, 2026-11-08** | Draws from the first kernel line and across the page-table switch. ADR-0004's layout keeps MMIO out of the direct map; drivers' MMIO now starts 2 GiB higher |
 | 29, answered | The UART: COM1 until the ACPI tables can be read, then the SPCR's UART with earlier output replayed; 0x3F8 only when firmware gives nothing better (E4) | **Accepted by the owner, 2026-11-08** | A hang before the tables are readable still shows on the screen and on COM1; once firmware names a UART, COM1 is not used |
+| 52, answered | ADR-0010 Amendment 1: each line to the UART first, then drawn at most 256 pixels per interrupts-off section, instead of E3's screen first | **Accepted by the owner, 2026-11-09** | The UART is the log of last resort and no longer waits behind pixels. Under KVM on an AMD EPYC 9V74 a section holds interrupts off for about 24 µs; a whole line took 4.3 to 4.6 ms on a different EPYC model. No real machine has been measured |
+| 53, answered | ADR-0010 Amendment 2: the UART sent at most 16 bytes (one FIFO load) per interrupts-off section, the wait for the wire between sections; a line from an interrupt handler leaves with the next writer or report | **Accepted by the owner, 2026-11-09** | At most 17 register accesses with interrupts off, whatever the line speed, against about 8.7 ms per 100 bytes at 115 200 baud. What a section costs on a real UART is not measured yet; the kernel prints it on every boot |
 
 ## From the pre-merge review (2026-11-09)
 
@@ -112,7 +114,7 @@ ADR-0009 H6 asked for a console that does not depend on a 16550 at `0x3F8`. The 
 |---|---|---|---|
 | 30 | ADR-0007 question 10: clear bus mastering on every function at enumeration (I12), bridges included, and leave an AMD IOMMU's own function alone until hardware shows what it needs? | **Accept** | §32 and §58. It is built and boot-proven, and it merged on your word. It may stop firmware-owned controllers (USB legacy, a firmware framebuffer) until drivers or exceptions exist, which hardware must settle (§74). |
 | 31 | The Loom download went beyond what you approved: 26 crate files and 3.36 MiB, against the 24 and 3.09 MiB you were told, and `memchr` and `aho-corasick` were said not to be fetched | **Accept** | §5. All are host-only and no shipping crate reaches them, and since the review they sit outside the kernel's workspace. The record should match what happened. |
-| 32, answered | Add CI: a GitHub workflow running `cargo xtask check` and the boot tests on every pull request? | **Yes: the owner's decision, 2026-11-09** | §8 and §82 put CI in M0, and until then every gate depended on one Mac. §80 forbids silent external costs, so it needed the owner's word. It uses only GitHub's standard runners, free for this public repository. Built in `.github/workflows/ci.yml`, with the boots on a real processor through KVM as well as on QEMU's software CPU. |
+| 32, answered | Add CI: a GitHub workflow running `cargo xtask check` and the boot tests on every pull request? | **Yes: the owner's decision, 2026-11-09** | §8 and §82 put CI in M0, and until then every gate depended on one Mac. §80 forbids silent external costs, so it needed the owner's word. It uses only GitHub's standard runners, free for this public repository. Built in `.github/workflows/ci.yml`, with the boots on a real processor through KVM as well as on QEMU's software CPU. A trial branch first booted the kernel on a real AMD EPYC on those runners (`docs/research/2026-11-09-testing-without-buying-hardware.md`) and showed costs QEMU's software CPU had hidden. |
 
 ## The native SDK (ADR-0011): Accepted 2026-11-09, nothing built
 
@@ -146,5 +148,13 @@ The specification is `docs/spec/OIDL.md`, accepted by the owner on 2026-11-09. T
 | 49 (Q10), answered | C symbols are `<library>_<method>`, with no special case for the kernel? | **Accept** |
 | 50 (Q11), answered | Keep `event_create` and `object_signal` as `@reserved`? | **Keep them** |
 | 51 (Q12), answered | A type from another library is read with all its members known, because only the interface's own library is negotiated? | **Accept** |
+
+## The monotonic clock (ADR-0012): built, boot-proven, Accepted 2026-11-09
+
+CI caught one processor's TSC stepping back by 16 ticks on an EPYC 9V45 under KVM. Neither Intel nor AMD promises that two processors' counters agree, so the kernel now makes that promise itself, with a floor every read passes through. Proven under QEMU only (§74).
+
+| # | Question | Recommendation | Why |
+|---|---|---|---|
+| 54, answered | Accept ADR-0012: the monotonic clock never goes backwards, whatever the processors' TSCs say (C1), through a floor on every read, always on (C2); a machine without an invariant TSC keeps order but not rate (C3); `IA32_TSC_ADJUST` unused until a physical machine shows a constant offset (C5)? | **Accepted by the owner, 2026-11-09** ("Accept both", answering "Accept ADR-0012 (clock) and ADR-0013 (boot-check policy)?") | §68 and §66. Nothing else makes the promise on every machine, and no caller is hot today: alone a read costs one more variable access, and it does not scale when everything reads at once (C8). `ADR-0013` is item 55. |
 
 **Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.

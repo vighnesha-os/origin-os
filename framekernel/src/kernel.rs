@@ -49,7 +49,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
     }
     // From here on every processor prints through the console, a line at a time.
     console::init(uart, firmware_line);
-    let mut com1 = console::Console::new();
+    let mut com1 = console::Console::boot_flow();
 
     let mut early = match entry.read_boot_info() {
         Ok(early) => early,
@@ -196,6 +196,9 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
     // against the PIT and proven by taking periodic interrupts.
     let tsc_hz = timer::init(&mut com1);
     if let Some(hz) = tsc_hz {
+        // The timer runs and every vector that can arrive has a gate: from here on, the
+        // boot flow takes interrupts between the sections of the lines it prints.
+        console::allow_interrupt_windows();
         if let Some(q) = quiesced.as_mut() {
             pcie::settle(&mut com1, q, hz);
         }
@@ -319,6 +322,10 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
     prove_timers(&mut com1);
     // Integration: a read-only /sys tree in the VFS carrying live discovered facts.
     prove_sysfs(&mut com1);
+    // The console's sending and drawing in sections, proven last so that what it prints is
+    // still on the screen when the boot test compares the screen with the serial log.
+    console::prove_uart_sections(&mut com1);
+    console::prove_sections(&mut com1);
 
     let _ = report::write_halt(&mut com1);
     halt()

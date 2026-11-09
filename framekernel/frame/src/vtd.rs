@@ -255,6 +255,10 @@ pub mod sl {
     pub const READ: u64 = 1 << 0;
     /// W: writes allowed through this entry.
     pub const WRITE: u64 = 1 << 1;
+    /// SNP (bit 11, a leaf only): accesses to the page snoop the processor's caches even
+    /// when the device asks for No Snoop (§3.10). Only where `ECAP.SC` is set; otherwise,
+    /// and in every non-leaf entry, the bit is reserved (§3.7, §9.8).
+    pub const SNOOP: u64 = 1 << 11;
 }
 
 /// What a mapping allows the device to do.
@@ -342,7 +346,10 @@ fn check(levels: u8, iova: u64) -> Result<(), MapError> {
 
 /// Maps the 4 KiB page at `iova` to physical `phys` with `access`, in the `levels`-deep
 /// tables rooted at `root`, creating table pages as needed. Non-leaf entries allow reading
-/// and writing, so the leaf alone decides. An IOVA that is already mapped is refused.
+/// and writing, so the leaf alone decides. With `snoop` (pass `ECAP.SC`) the leaf sets SNP,
+/// so a device that asks for No Snoop still sees, and updates, what the processor's caches
+/// hold; without SC the hardware gives no such control. An IOVA that is already mapped is
+/// refused.
 pub fn map(
     mem: &mut impl TableMemory,
     root: u64,
@@ -350,6 +357,7 @@ pub fn map(
     iova: u64,
     phys: u64,
     access: Access,
+    snoop: bool,
 ) -> Result<(), MapError> {
     check(levels, iova)?;
     if phys & !ADDRESS != 0 {
@@ -381,7 +389,8 @@ pub fn map(
     if present(mem.read(table, i)) {
         return Err(MapError::AlreadyMapped);
     }
-    mem.write(table, i, phys | access.bits());
+    let snoop = if snoop { sl::SNOOP } else { 0 };
+    mem.write(table, i, phys | access.bits() | snoop);
     Ok(())
 }
 
@@ -1028,9 +1037,32 @@ mod tests {
     fn second_level_tables_map_translate_and_unmap() {
         let (mut m, root) = Memory::new(64);
         let a = IOVA_BASE;
-        map(&mut m, root, 4, a, 0x7_6543_2000, Access::READ_WRITE).unwrap();
+        map(&mut m, root, 4, a, 0x7_6543_2000, Access::READ_WRITE, false).unwrap();
         // One table per level below the root.
         assert_eq!(m.tables.len(), 4);
+        // Without snoop control, SNP stays clear everywhere (it is reserved then, §3.7). With
+        // it, only the leaf carries SNP: in a non-leaf entry it is always reserved.
+        let walk = |m: &mut Memory, iova: u64| {
+            let mut entries = [0u64; 4];
+            let mut table = root;
+            for level in (1..=4u8).rev() {
+                let e = m.read(table, index(iova, level));
+                entries[usize::from(level - 1)] = e;
+                table = e & ADDRESS;
+            }
+            entries
+        };
+        assert!(walk(&mut m, a).iter().all(|e| e & sl::SNOOP == 0));
+        let s = a + 5 * PAGE;
+        map(&mut m, root, 4, s, 0x4000, Access::READ_WRITE, true).unwrap();
+        let [leaf, upper @ ..] = walk(&mut m, s);
+        assert_eq!(leaf, 0x4000 | sl::READ | sl::WRITE | sl::SNOOP);
+        assert!(upper.iter().all(|e| e & sl::SNOOP == 0));
+        assert_eq!(
+            translate(&mut m, root, 4, s),
+            Some((0x4000, Access::READ_WRITE))
+        );
+        assert_eq!(unmap(&mut m, root, 4, s), Ok(0x4000));
         assert_eq!(
             translate(&mut m, root, 4, a),
             Some((0x7_6543_2000, Access::READ_WRITE))
@@ -1042,9 +1074,9 @@ mod tests {
         );
         // The neighbour shares every table; a page 1 GiB away needs new level-2 and
         // level-1 tables (the level-3 table is shared: both are under one PML4 slot).
-        map(&mut m, root, 4, a + PAGE, 0x2000, Access::READ).unwrap();
+        map(&mut m, root, 4, a + PAGE, 0x2000, Access::READ, false).unwrap();
         assert_eq!(m.tables.len(), 4);
-        map(&mut m, root, 4, a + (1 << 30), 0x3000, Access::WRITE).unwrap();
+        map(&mut m, root, 4, a + (1 << 30), 0x3000, Access::WRITE, false).unwrap();
         assert_eq!(m.tables.len(), 6);
         assert_eq!(
             translate(&mut m, root, 4, a + PAGE),
@@ -1063,31 +1095,31 @@ mod tests {
         }
         // A live mapping is never replaced; refusals.
         assert_eq!(
-            map(&mut m, root, 4, a, 0x9000, Access::READ),
+            map(&mut m, root, 4, a, 0x9000, Access::READ, false),
             Err(MapError::AlreadyMapped)
         );
         assert_eq!(
-            map(&mut m, root, 4, a + 1, 0x9000, Access::READ),
+            map(&mut m, root, 4, a + 1, 0x9000, Access::READ, false),
             Err(MapError::Misaligned)
         );
         assert_eq!(
-            map(&mut m, root, 4, a, 0x9001, Access::READ),
+            map(&mut m, root, 4, a, 0x9001, Access::READ, false),
             Err(MapError::Misaligned)
         );
         assert_eq!(
-            map(&mut m, root, 4, a + 3 * PAGE, 1 << 52, Access::READ),
+            map(&mut m, root, 4, a + 3 * PAGE, 1 << 52, Access::READ, false),
             Err(MapError::Misaligned)
         );
         assert_eq!(
-            map(&mut m, root, 4, 1 << 48, 0x9000, Access::READ),
+            map(&mut m, root, 4, 1 << 48, 0x9000, Access::READ, false),
             Err(MapError::OutOfRange)
         );
         assert_eq!(
-            map(&mut m, root, 3, 1 << 39, 0x9000, Access::READ),
+            map(&mut m, root, 3, 1 << 39, 0x9000, Access::READ, false),
             Err(MapError::OutOfRange)
         );
         assert_eq!(
-            map(&mut m, root, 2, a, 0x9000, Access::READ),
+            map(&mut m, root, 2, a, 0x9000, Access::READ, false),
             Err(MapError::Levels)
         );
         let none = Access {
@@ -1095,7 +1127,7 @@ mod tests {
             write: false,
         };
         assert_eq!(
-            map(&mut m, root, 4, a + 3 * PAGE, 0x9000, none),
+            map(&mut m, root, 4, a + 3 * PAGE, 0x9000, none, false),
             Err(MapError::NoAccess)
         );
         // Unmap returns the page, and the IOVA no longer translates.
@@ -1107,7 +1139,7 @@ mod tests {
             Err(MapError::NotMapped)
         );
         // It can be mapped again afterwards.
-        map(&mut m, root, 4, a, 0x5000, Access::READ_WRITE).unwrap();
+        map(&mut m, root, 4, a, 0x5000, Access::READ_WRITE, false).unwrap();
         assert_eq!(
             translate(&mut m, root, 4, a),
             Some((0x5000, Access::READ_WRITE))
@@ -1118,14 +1150,14 @@ mod tests {
     fn running_out_of_table_pages_is_reported() {
         let (mut m, root) = Memory::new(2);
         assert_eq!(
-            map(&mut m, root, 4, IOVA_BASE, 0x1000, Access::READ),
+            map(&mut m, root, 4, IOVA_BASE, 0x1000, Access::READ, false),
             Err(MapError::NoMemory)
         );
         assert_eq!(translate(&mut m, root, 4, IOVA_BASE), None);
         // Three-level tables need one page less.
         let (mut m, root) = Memory::new(2);
         assert_eq!(
-            map(&mut m, root, 3, IOVA_BASE, 0x1000, Access::READ),
+            map(&mut m, root, 3, IOVA_BASE, 0x1000, Access::READ, false),
             Ok(())
         );
     }
@@ -1148,7 +1180,7 @@ mod tests {
                 }
             } else {
                 let phys = (rng.below(1 << 20) as u64 + 1) * PAGE;
-                let got = map(&mut m, root, 4, iova, phys, Access::READ_WRITE);
+                let got = map(&mut m, root, 4, iova, phys, Access::READ_WRITE, false);
                 if let std::collections::btree_map::Entry::Vacant(v) = model.entry(iova) {
                     assert_eq!(got, Ok(()), "step {step}");
                     v.insert(phys);
