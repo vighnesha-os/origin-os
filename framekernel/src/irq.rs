@@ -15,13 +15,13 @@
 //! The register encodings are `framekernel::ioapic`; this module does the indirect MMIO
 //! (IOREGSEL/IOWIN) and the PIT programming. Only the boot processor runs this, with the
 //! local APIC already in x2APIC mode and the 8259 PICs masked (`timer::init`).
+#![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use framekernel::acpi::{self, IoApic, SourceOverride};
-use framekernel::apic;
 use framekernel::ioapic::{self, RemappableEntry};
 use framekernel::vtd::{Irte, SourceCheck};
 use origin_frame::addr::PhysAddr;
@@ -32,14 +32,8 @@ use origin_frame::sync::SpinLock;
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
 use crate::iommu::{Detail, Fault, Recorded};
-use crate::outb;
+use crate::timer;
 
-/// The PIT's command port and channel-0 data port.
-const PIT_CHANNEL0: u16 = 0x40;
-/// Channel 0, access lo/hi byte, mode 2 (rate generator), binary.
-const PIT_CHANNEL0_MODE2: u8 = 0x34;
-/// Channel 0, access lo/hi byte, mode 0 (one-shot): used to stop the rate generator.
-const PIT_CHANNEL0_MODE0: u8 = 0x30;
 /// The routed rate, and how many interrupts the proof waits for.
 const HZ: u64 = 100;
 const PROOF_TICKS: u64 = 20;
@@ -141,27 +135,6 @@ struct PitPin {
 
 static PIT_PIN: SpinLock<Option<PitPin>> = SpinLock::new(None);
 
-/// Programs the PIT channel 0 as a `HZ` rate generator (mode 2).
-fn start_pit() {
-    let divisor = (apic::PIT_HZ / HZ) as u16;
-    // SAFETY: CPL 0, boot processor; the PIT command port cannot affect memory.
-    unsafe { outb(apic::PIT_COMMAND, PIT_CHANNEL0_MODE2) };
-    // SAFETY: as above; the PIT channel-0 data port.
-    unsafe { outb(PIT_CHANNEL0, (divisor & 0xFF) as u8) };
-    // SAFETY: as above; the high byte of the divisor.
-    unsafe { outb(PIT_CHANNEL0, (divisor >> 8) as u8) };
-}
-
-/// Stops the PIT channel 0 (mode 0, count 0: it fires once and then idles).
-fn stop_pit() {
-    // SAFETY: as for `start_pit`; the PIT command port.
-    unsafe { outb(apic::PIT_COMMAND, PIT_CHANNEL0_MODE0) };
-    // SAFETY: as above; channel-0 data, low then high byte of a zero count.
-    unsafe { outb(PIT_CHANNEL0, 0) };
-    // SAFETY: as above.
-    unsafe { outb(PIT_CHANNEL0, 0) };
-}
-
 /// Discovers the I/O APIC, routes the PIT's IRQ0 through it to the boot processor, and
 /// proves periodic interrupts arrive. `rsdp` is the ACPI RSDP, `bsp` the boot processor's
 /// APIC ID, `tsc_hz` the TSC rate. Returns whether the proof passed (no I/O APIC at all is
@@ -252,7 +225,7 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
     let (low, high) =
         ioapic::redirection_entry(cpu::IOAPIC_VECTOR, destination, active_low, level, false);
     mapped.set_redirection(index, low, high);
-    start_pit();
+    timer::pit_channel0_start(HZ);
 
     // Count interrupts, polling with interrupt windows (never halting), within two seconds.
     let start = rdtsc();
@@ -266,7 +239,7 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
     let (masked_low, _) =
         ioapic::redirection_entry(cpu::IOAPIC_VECTOR, destination, active_low, level, true);
     mapped.set_redirection(index, masked_low, high);
-    stop_pit();
+    timer::pit_channel0_stop();
 
     let taken = ioapic_irqs() - before;
     let micros = elapsed.saturating_mul(1_000_000) / tsc_hz.max(1);
@@ -504,7 +477,7 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
     // 2. Delivered: the PIT's interrupts arrive on the target, through the IRTE.
     let before = taken(&ids);
     let start = rdtsc();
-    start_pit();
+    timer::pit_channel0_start(HZ);
     let from = ioapic_irqs_on(target);
     crate::sched::yield_until(
         || ioapic_irqs_on(target).wrapping_sub(from) >= PROOF_TICKS,
@@ -610,7 +583,7 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
     if let Some((low, high)) = encoded {
         pin.io.set_redirection(pin.entry, low | MASKED, high);
     }
-    stop_pit();
+    timer::pit_channel0_stop();
     let masked = ioapic::is_masked(pin.io.redirection(pin.entry).0);
     let released = crate::iommu::release_pin(&route).is_ok();
     let (after, _) = crate::iommu::take_faults();

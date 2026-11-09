@@ -183,6 +183,37 @@ impl LegacyPorts {
 /// x2APIC interrupt command register.
 const X2APIC_ICR: u32 = 0x830;
 
+/// PIT channel 0's data port (the PIT is reserved to this module: `port::PortRange`).
+const PIT_CHANNEL0: u16 = 0x40;
+/// Channel 0, access lo/hi byte, mode 2 (rate generator), binary.
+const PIT_CHANNEL0_MODE2: u8 = 0x34;
+/// Channel 0, access lo/hi byte, mode 0 (one-shot): used to stop the rate generator.
+const PIT_CHANNEL0_MODE0: u8 = 0x30;
+
+/// Programs the PIT's channel 0 as a rate generator at `hz` (the interrupt-routing proofs).
+/// Only the boot processor uses channel 0, and only after [`init`] (channel 2 and
+/// calibration are done by then).
+pub fn pit_channel0_start(hz: u64) {
+    let divisor = (apic::PIT_HZ / hz.max(1)) as u16;
+    // SAFETY: CPL 0; the PIT is reserved to this module (`port::PortRange` refuses its ports),
+    // and it cannot affect memory.
+    unsafe { outb(apic::PIT_COMMAND, PIT_CHANNEL0_MODE2) };
+    // SAFETY: as above; the low byte of the divisor.
+    unsafe { outb(PIT_CHANNEL0, (divisor & 0xFF) as u8) };
+    // SAFETY: as above; the high byte.
+    unsafe { outb(PIT_CHANNEL0, (divisor >> 8) as u8) };
+}
+
+/// Stops the PIT's channel 0 (mode 0, count 0: it fires once and then idles).
+pub fn pit_channel0_stop() {
+    // SAFETY: as for `pit_channel0_start`; the command port.
+    unsafe { outb(apic::PIT_COMMAND, PIT_CHANNEL0_MODE0) };
+    // SAFETY: as above; a zero count, low then high byte.
+    unsafe { outb(PIT_CHANNEL0, 0) };
+    // SAFETY: as above.
+    unsafe { outb(PIT_CHANNEL0, 0) };
+}
+
 /// The calibrated initial count for [`HZ`] interrupts per second, once known (0 before).
 static PERIOD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 

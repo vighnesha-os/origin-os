@@ -27,8 +27,8 @@
 //! The TSC is the clock source on every supported platform, whose TSCs are invariant
 //! (CPUID 8000_0007h EDX bit 8: constant rate in every P-, C- and T-state). Without that
 //! bit (QEMU's TCG does not report it) the clock still runs, and the boot report says so.
+#![forbid(unsafe_code)]
 
-use core::arch::asm;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -42,7 +42,7 @@ use origin_frame::sync::SpinLock;
 
 use crate::console::Console;
 use crate::cpu::{self, rdtsc};
-use crate::{inb, outb};
+use origin_frame::port;
 
 /// Unix time in nanoseconds at monotonic zero; 0 while unknown.
 static BOOT_WALL: AtomicU64 = AtomicU64::new(0);
@@ -75,9 +75,6 @@ fn rdtscp_supported() -> bool {
     cpu::cpuid(0x8000_0000)[0] >= 0x8000_0001 && cpu::cpuid(0x8000_0001)[3] & (1 << 27) != 0
 }
 
-/// CMOS index and data ports.
-const CMOS_INDEX: u16 = 0x70;
-const CMOS_DATA: u16 = 0x71;
 /// Register B bit 7: updates are inhibited while the clock is being set.
 const STATUS_B_SET: u8 = 0x80;
 /// How long [`measure_rtc`] may take, in tenths of a second: the two seconds that two
@@ -89,27 +86,13 @@ const RTC_BUDGET_TENTHS: u64 = 32;
 /// thousand (1 %).
 const RTC_TOLERANCE_PPT: u16 = 10;
 
-/// The CMOS RTC, through ports 70h and 71h.
-struct Cmos(());
+/// The CMOS real-time clock's registers (the framework's single [`port::Cmos`] handle).
+struct Cmos(port::Cmos);
 
 impl Cmos {
-    /// # Safety
-    ///
-    /// CPL 0, and nothing else drives ports 70h–71h while the value lives (only the boot
-    /// processor reads the clock, at boot). Bit 7 of the index port masks NMIs on some
-    /// chipsets; every index written here has it clear, so NMIs stay enabled.
-    unsafe fn new() -> Self {
-        Self(())
-    }
-
-    /// Reads CMOS register `index` (below 80h). No register read here has a side effect:
-    /// register C, whose read acknowledges RTC interrupts, is never read.
+    /// Reads RTC register `index` (the NMI-mask bit stays clear).
     fn read(&mut self, index: u8) -> u8 {
-        // SAFETY: the constructor's contract; selecting a register only latches an index.
-        unsafe { outb(CMOS_INDEX, index & 0x7F) };
-        // SAFETY: as above; the read returns the selected register and cannot affect
-        // memory.
-        unsafe { inb(CMOS_DATA) }
+        self.0.read(index)
     }
 
     fn updating(&mut self) -> bool {
@@ -222,12 +205,10 @@ pub(crate) fn init(com1: &mut Console, calibrated_hz: u64, rsdp: u64) -> bool {
     let rtc_present = !fadt.is_some_and(|f| f.cmos_rtc_absent);
     let mut ok = true;
     // One RTC second on the TSC, and a reading of the clock just after an update.
-    let measured = rtc_present.then(|| {
-        // SAFETY: CPL 0, the boot processor, interrupts disabled; no other code uses the
-        // CMOS ports.
-        let mut cmos = unsafe { Cmos::new() };
-        measure_rtc(&mut cmos, calibrated_hz, century)
-    });
+    let measured = rtc_present
+        .then(|| port::Cmos::take().map(Cmos))
+        .flatten()
+        .map(|mut cmos| measure_rtc(&mut cmos, calibrated_hz, century));
     let second = measured.as_ref().and_then(|m| m.second);
     let cpuid_hz = cpuid_tsc_hz();
     let (hz, source) = match (cpuid_hz, second.map(|s| s.ticks())) {
@@ -394,11 +375,17 @@ fn prove_pm_timer(com1: &mut Console, rsdp: u64, scale: Scale) -> bool {
         return true;
     };
     let mask: u32 = if wide { 0xFFFF_FFFF } else { 0x00FF_FFFF };
+    // The FADT's PM_TMR_BLK: a read-only 32-bit timer port. A first claim of it succeeds.
+    let Some(timer) = origin_frame::port::PortRange::claim(port, 4) else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: PM timer: its port {port:#x} is not available: PM timer failed"
+        );
+        return false;
+    };
     let read = move || {
         let before = rdtsc();
-        // SAFETY: CPL 0, boot processor; `port` is the FADT's PM_TMR_BLK, a read-only
-        // 32-bit timer port that cannot affect memory.
-        let value = u64::from((unsafe { crate::ind(port) }) & mask);
+        let value = u64::from(timer.read32(0) & mask);
         (before, value, rdtsc())
     };
     let tight = pair_tight_ticks(scale);
@@ -546,24 +533,10 @@ static LATEST: AtomicU64 = AtomicU64::new(0);
 /// interleaved.
 const MIN_HANDOFFS: u64 = 100;
 
-/// The TSC, read only once every earlier instruction has executed, so a reading cannot be
-/// taken before the lock that orders it is held: RDTSCP (Intel SDM Vol. 2B, RDTSCP; AMD
-/// APM Vol. 3), else LFENCE then RDTSC.
+/// The TSC, read only once every earlier instruction has executed (RDTSCP, else LFENCE and
+/// RDTSC): the framework's `cpu::ordered_tsc`.
 fn ordered_tsc(rdtscp: bool) -> u64 {
-    let (low, high): (u32, u32);
-    if rdtscp {
-        // SAFETY: RDTSCP exists (the caller checked CPUID); it writes EDX:EAX and ECX
-        // (IA32_TSC_AUX, unused here) and reads no memory.
-        unsafe {
-            asm!("rdtscp", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack, preserves_flags));
-        }
-    } else {
-        // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory.
-        unsafe {
-            asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags));
-        }
-    }
-    (u64::from(high) << 32) | u64::from(low)
+    cpu::ordered_tsc(rdtscp)
 }
 
 /// Takes ordered TSC readings under [`TURN`]'s lock until [`UNTIL`], comparing each with

@@ -1189,6 +1189,29 @@ pub fn capture_backtrace(out: &mut [u64]) -> usize {
     )
 }
 
+/// The TSC, read only once every earlier instruction has executed, so a reading cannot be
+/// taken before the lock that orders it is held: RDTSCP (Intel SDM Vol. 2B, RDTSCP; AMD
+/// APM Vol. 3) if `use_rdtscp` and this processor has it, else LFENCE then RDTSC.
+pub fn ordered_tsc(use_rdtscp: bool) -> u64 {
+    let has_rdtscp = use_rdtscp
+        && cpuid(0x8000_0000)[0] >= 0x8000_0001
+        && cpuid(0x8000_0001)[3] & (1 << 27) != 0;
+    let (low, high): (u32, u32);
+    if has_rdtscp {
+        // SAFETY: RDTSCP exists on this processor (just checked); it writes EDX:EAX and ECX
+        // (IA32_TSC_AUX, unused here) and reads no memory.
+        unsafe {
+            asm!("rdtscp", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack, preserves_flags));
+        }
+    } else {
+        // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory.
+        unsafe {
+            asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags));
+        }
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
 /// The time-stamp counter.
 pub fn rdtsc() -> u64 {
     let (low, high): (u32, u32);

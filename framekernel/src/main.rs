@@ -1640,7 +1640,7 @@ fn relocations_applied() -> bool {
 
 pub(crate) use cpu::halt;
 
-pub(crate) use origin_frame::port::{inb, ind, outb};
+pub(crate) use origin_frame::port::{inb, outb};
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
