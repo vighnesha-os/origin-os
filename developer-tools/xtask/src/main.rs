@@ -1806,6 +1806,8 @@ fn object_markers(far: &str) -> Vec<String> {
     }
     markers.extend([
         "origin-kernel: ipc: a thread waiting for another thread: a thread still running -> TIMED_OUT, joined -> OK, observed -> 0x10, and it stays raised -> OK".to_string(),
+        "origin-kernel: ipc: a thread in wait_one on a process handle another thread closes completes with CANCELED".into(),
+        "origin-kernel: ipc: a thread in wait_one on a process handle another thread sends away completes with CANCELED".into(),
         "origin-kernel: ipc: every process and thread object and all they held are gone: heap ".into(),
     ]);
     markers

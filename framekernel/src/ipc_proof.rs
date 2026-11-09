@@ -1797,6 +1797,89 @@ fn thread_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_h
     done && groups_ok && process.ending() == Some(Ending::Exited(0))
 }
 
+/// A thread blocked on a handle to a process completes with `CANCELED` when another thread of
+/// its process closes that handle, or sends it away (ADR-0005 A2): cancellation does not
+/// depend on the object being a channel.
+fn cancel_on_any_object(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let mut ok = true;
+    for (how, sends) in [("closes", false), ("sends away", true)] {
+        // Never started, so nothing else can end the wait.
+        let Some(never_runs) = Process::new(LIMITS, (CODE, CODE + PAGE)) else {
+            return false;
+        };
+        let Ok(never_runs) = ObjectRef::try_new(never_runs) else {
+            return false;
+        };
+        let Some(mut image) = Image::new(LIMITS, proof_programs::script()) else {
+            return false;
+        };
+        if image.map(STACK_1, 1, Access::ReadWrite).is_none() {
+            return false;
+        }
+        let Ok((a, b)) = ipc::create_channel(&image.process.account) else {
+            return false;
+        };
+        let (Ok(held), Ok(carrier), Ok(_)) = (
+            image
+                .process
+                .grant(Object::Process(never_runs.clone()), PROCESS_RIGHTS),
+            image.process.grant(Object::Channel(a), rights::CHANNEL),
+            image.process.grant(Object::Channel(b), rights::CHANNEL),
+        ) else {
+            return false;
+        };
+        let waited = Imm(u64::from(held));
+        let first = alloc::vec![wait(
+            "",
+            waited,
+            signals::TERMINATED,
+            DEADLINE_INFINITE,
+            Error::Canceled.raw()
+        )];
+        let second = if sends {
+            if image.write(LIST, &held.to_le_bytes()).is_none() {
+                return false;
+            }
+            alloc::vec![send("", Imm(u64::from(carrier)), 1, OK)]
+        } else {
+            alloc::vec![close("", waited, OK)]
+        };
+        if image.scratch().is_none()
+            || image.script(&first).is_none()
+            || image.write_script(SECOND_SCRIPT, &second).is_none()
+        {
+            return false;
+        }
+        let Some(process) = image.finish() else {
+            return false;
+        };
+        if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
+            return false;
+        }
+        sched::yield_until(|| process.waiting.load(Ordering::Acquire) > 0, tsc_hz, 5);
+        let in_wait = process.waiting.load(Ordering::Acquire) > 0;
+        if Process::start_thread(&process, far, CODE, STACK_1 + PAGE, SECOND_SCRIPT).is_err() {
+            return false;
+        }
+        let done = await_end(&process, tsc_hz, 10);
+        let canceled = process.reports().contains(&(Error::Canceled.raw() as u64));
+        let right = done && in_wait && canceled && process.ending() == Some(Ending::Exited(0));
+        ok &= right;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: ipc: a thread in wait_one on a process handle another thread {how} completes with {}{}",
+            if canceled {
+                "CANCELED"
+            } else {
+                "something else"
+            },
+            if right { "" } else { ": ipc failed" }
+        );
+    }
+    ok
+}
+
 /// Runs the proofs of process and thread objects, with a leak check of their own: every one of
 /// them is dropped by the end, and the memory is back to the frame. Called from the boot flow
 /// with every scheduler running, after [`prove`], which leaves nothing behind.
@@ -1811,6 +1894,7 @@ pub(crate) fn prove_objects(
     ok &= object_types(com1, bsp, tsc_hz);
     ok &= process_terminated(com1, cpus, bsp, tsc_hz);
     ok &= thread_terminated(com1, cpus, bsp, tsc_hz);
+    ok &= cancel_on_any_object(com1, cpus, bsp, tsc_hz);
     let same = || {
         memory::stats().map(|(h, f)| (h.bytes_in_use, f))
             == before.map(|(h, f)| (h.bytes_in_use, f))
