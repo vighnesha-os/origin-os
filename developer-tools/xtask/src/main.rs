@@ -47,10 +47,8 @@ commands:
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
-  unsafe-list print the current `unsafe` sites outside the framework, one `COUNT PATH` line per
-              file, in the format of developer-tools/xtask/unsafe-allowlist.txt (ADR-0011)
   unsafe-gate only the gate on `unsafe` and on the kernel's dependency direction (part of
-              check; quick, for use while migrating a module)
+              check; quick)
 
 environment:
   ORIGIN_LOOM_DEEP                    if set, the Loom models search to their deeper bounds
@@ -849,6 +847,8 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
                 "origin-kernel: CPU state: machine checks raise #MC, x87 errors raise #MF, ring 3 has no RDPMC, FSGSBASE or SYSENTER, no debug breakpoint armed: {cpus} of {cpus} processors"
             ),
             "origin-kernel: reclaimed ".into(),
+            // A boot step out of turn, or run twice, does nothing (ADR-0011 N6).
+            "origin-kernel: boot steps: out of turn refused true; a second run refused true".into(),
         ]
         .into_iter()
         // CPU topology from CPUID (leaf 1Fh, 0Bh): each processor, the layout, the MADT.
@@ -1159,6 +1159,7 @@ fn boot_failures() -> Vec<&'static str> {
         "origin-kernel: ACPI processor discovery failed",
         "origin-kernel: AP start-up not possible",
         ": AP start-up failed",
+        ": boot steps failed",
         ": scheduler failed",
         ": topology failed",
         ": CPU baseline failed",
@@ -1410,7 +1411,6 @@ fn main() -> ExitCode {
         .as_slice()
     {
         ["check"] => check(),
-        ["unsafe-list"] => unsafety::print_list(),
         ["unsafe-gate"] => unsafety::gate(),
         ["build"] => build_loader(Loader::Developer).and_then(|loader| {
             let kernel = pack_kernel(&build_kernel()?)?;

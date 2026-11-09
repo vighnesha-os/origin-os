@@ -54,9 +54,9 @@ impl PageSource for Frames<'_> {
 }
 
 /// Takes ownership of the frame allocator and starts the heap, once (a later call does
-/// nothing). The first call is the boot flow's, after the kernel's own page tables are live
-/// (the direct map makes heap addresses usable as pointers).
-pub fn init(frames: FrameAllocator<'static>) {
+/// nothing). Only `early` calls this, after the kernel's own page tables are live (the direct
+/// map makes heap addresses usable as pointers).
+pub(crate) fn init(frames: FrameAllocator<'static>) {
     if MEMORY_STARTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
         return;
     }

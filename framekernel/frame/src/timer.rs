@@ -259,6 +259,18 @@ pub fn pit_channel0_stop() {
     unsafe { outb(PIT_CHANNEL0, 0) };
 }
 
+/// The TSC rate [`init`] measured, in Hz (0 before it has): the framework's own, for the AP
+/// start-up delays, so that nothing above it can shorten them.
+static CALIBRATED_TSC_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The TSC rate [`init`] measured, once it has.
+pub fn calibrated_tsc_hz() -> Option<u64> {
+    match CALIBRATED_TSC_HZ.load(core::sync::atomic::Ordering::Acquire) {
+        0 => None,
+        hz => Some(hz),
+    }
+}
+
 /// The calibrated initial count for [`HZ`] interrupts per second, once known (0 before).
 static PERIOD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -291,6 +303,14 @@ impl X2Apic {
 /// Brings up the local APIC and proves its timer. Returns the TSC rate in Hz if every step
 /// passed.
 pub fn init(com1: &mut dyn Write) -> Option<u64> {
+    // Every vector this can make arrive needs the kernel's own IDT.
+    if !cpu::tables_ready() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: the APIC cannot start before the CPU's tables"
+        );
+        return None;
+    }
     if !cpu::x2apic_supported() {
         let _ = writeln!(com1, "origin-kernel: the processor has no x2APIC");
         return None;
@@ -368,6 +388,13 @@ pub fn init(com1: &mut dyn Write) -> Option<u64> {
         micros / 1000
     );
     PERIOD.store(count, core::sync::atomic::Ordering::Release);
+    // The first measurement stands.
+    let _ = CALIBRATED_TSC_HZ.compare_exchange(
+        0,
+        tsc_hz,
+        core::sync::atomic::Ordering::AcqRel,
+        core::sync::atomic::Ordering::Acquire,
+    );
     Some(tsc_hz)
 }
 

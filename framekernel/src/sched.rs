@@ -20,7 +20,7 @@ use alloc::sync::Arc;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use framekernel::runqueue::{QueueError, RunQueue, per_mille, share_near_weight};
+use crate::runqueue::{QueueError, RunQueue, per_mille, share_near_weight};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
@@ -121,21 +121,21 @@ struct Zombie {
 /// Per CPU: each slot's stack, and the stacks of threads that exited and await
 /// [`reap`]. Locked after the run queue, always with interrupts disabled.
 struct Threads {
-    stacks: [Option<GuardedStack>; framekernel::runqueue::CAPACITY],
+    stacks: [Option<GuardedStack>; crate::runqueue::CAPACITY],
     /// Exited threads awaiting [`reap`].
-    zombies: [Option<Zombie>; framekernel::runqueue::CAPACITY],
+    zombies: [Option<Zombie>; crate::runqueue::CAPACITY],
     /// Each slot's FPU/SIMD save area; slot 0 is the boot or idle context.
-    fpu: [Option<FpuArea>; framekernel::runqueue::CAPACITY],
+    fpu: [Option<FpuArea>; crate::runqueue::CAPACITY],
     /// The process each slot's thread belongs to (`None`: a kernel thread).
-    process: [Option<Arc<Process>>; framekernel::runqueue::CAPACITY],
+    process: [Option<Arc<Process>>; crate::runqueue::CAPACITY],
 }
 
 static THREADS: [SpinLock<Threads>; MAX_CPUS] = [const {
     SpinLock::new(Threads {
-        stacks: [const { None }; framekernel::runqueue::CAPACITY],
-        zombies: [const { None }; framekernel::runqueue::CAPACITY],
-        fpu: [const { None }; framekernel::runqueue::CAPACITY],
-        process: [const { None }; framekernel::runqueue::CAPACITY],
+        stacks: [const { None }; crate::runqueue::CAPACITY],
+        zombies: [const { None }; crate::runqueue::CAPACITY],
+        fpu: [const { None }; crate::runqueue::CAPACITY],
+        process: [const { None }; crate::runqueue::CAPACITY],
     })
 }; MAX_CPUS];
 
@@ -375,7 +375,7 @@ pub(crate) fn spawn(
     spawn_with(
         cpu,
         ThreadStart::Kernel { entry, arg },
-        framekernel::runqueue::DEFAULT_WEIGHT,
+        crate::runqueue::DEFAULT_WEIGHT,
         None,
     )
 }
@@ -393,7 +393,7 @@ pub(crate) fn spawn_user(
     spawn_with(
         cpu,
         ThreadStart::User { rip, rsp, rdi },
-        framekernel::runqueue::DEFAULT_WEIGHT,
+        crate::runqueue::DEFAULT_WEIGHT,
         Some(process),
     )
 }
@@ -920,13 +920,13 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
             entry: quitter,
             arg: 0,
         },
-        framekernel::runqueue::DEFAULT_WEIGHT,
+        crate::runqueue::DEFAULT_WEIGHT,
         None,
         || None,
     );
     let no_area_clean =
         no_area == Err(QueueError::Full) && in_use() <= before && live() == contexts;
-    let free = framekernel::runqueue::CAPACITY.saturating_sub(contexts);
+    let free = crate::runqueue::CAPACITY.saturating_sub(contexts);
     let mut filled = 0;
     for _ in 0..free {
         if spawn(bsp, quitter, 0).is_ok() {

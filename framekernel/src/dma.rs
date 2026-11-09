@@ -8,7 +8,7 @@
 //! which by virtio 1.1 §6 uses physical addresses — the bus address is the physical address.
 #![forbid(unsafe_code)]
 
-use framekernel::pci::{self, Address, DmaPath};
+use crate::pci::{self, Address, DmaPath};
 use origin_frame::addr::Iova;
 use origin_frame::dma::{DmaFrame, DmaPage};
 

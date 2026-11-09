@@ -25,9 +25,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use framekernel::handles::HandleTable;
-use framekernel::paging::{Access, MapError, Translation};
-use framekernel::runqueue::QueueError;
+use crate::handles::HandleTable;
+use crate::paging::{Access, MapError, Translation};
+use crate::runqueue::QueueError;
 use origin_abi::{Error, Handle};
 use origin_frame::sync::SpinLock;
 use origin_frame::userspace::{UserFrame, UserSpace};

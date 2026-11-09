@@ -32,10 +32,10 @@
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use framekernel::acpi;
-use framekernel::clock::{self, NANOS_PER_SECOND, Scale};
-use framekernel::hpet;
-use framekernel::rtc::{self, DateTime, Registers, SecondMeasurement, SecondVerdict, register};
+use crate::acpi;
+use crate::clock::{self, NANOS_PER_SECOND, Scale};
+use crate::hpet;
+use crate::rtc::{self, DateTime, Registers, SecondMeasurement, SecondVerdict, register};
 use origin_frame::addr::PhysAddr;
 use origin_frame::mmio::MmioRegion;
 use origin_frame::sync::SpinLock;

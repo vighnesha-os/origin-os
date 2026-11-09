@@ -5,8 +5,7 @@
 //! drivers and the services included, is safe Rust (`#![forbid(unsafe_code)]`) built on the
 //! typed interfaces below, so a memory-safety argument for the kernel only has to be made
 //! here. `cargo xtask check` enforces that: `unsafe` outside `framekernel/frame/` fails the
-//! build, except in the files named in `developer-tools/xtask/unsafe-allowlist.txt`, which
-//! are the modules not yet migrated and which that list can only ever shrink by. Dependencies
+//! build (the kernel image's link root, `entry/main.rs`, is here for that reason). Dependencies
 //! run one way: nothing this crate depends on may depend on the rest of the kernel.
 //!
 //! The rule for every safe item exported here: **no safe caller can break memory safety
@@ -32,6 +31,7 @@ pub mod amdvi;
 pub mod apic;
 pub mod apstart;
 pub mod bitmap;
+pub mod boot;
 pub mod clock;
 pub mod cpumap;
 pub mod descriptors;
@@ -59,6 +59,8 @@ mod testing;
 pub mod cpu;
 #[cfg(target_os = "none")]
 pub mod dma;
+#[cfg(target_os = "none")]
+pub mod early;
 #[cfg(target_os = "none")]
 pub mod firmware;
 #[cfg(target_os = "none")]

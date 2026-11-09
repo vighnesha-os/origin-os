@@ -1,70 +1,28 @@
-//! `_start`, the entry point of the Origin OS Framekernel (M1).
+//! The boot flow (M1 onwards): everything the kernel does between the boot loader's hand-over
+//! and the end of its proofs, in order.
 //!
-//! The Origin boot loader calls `_start` after `ExitBootServices`, with:
-//! - the physical address of a [`BootInfo`] in `rdi` (System V);
-//! - interrupts disabled, and the processor at CPL 0;
-//! - the firmware's identity-mapped page tables still active (physical == virtual);
-//! - `rsp` 16-byte aligned before the `call`, on the stack `BootInfo` describes;
-//! - the direction flag clear;
-//! - the image's relocations applied.
-//!
-//! The kernel assumes nothing else about memory. It programs COM1 (its UART until the ACPI
-//! tables name a better one), checks that its own relocations were applied, validates the
-//! boot info, attaches the firmware's framebuffer if the loader passed one, and prints a
-//! summary. Then come the
-//! first M2 steps: its own GDT, TSS and IDT (proven with a breakpoint), the frame
-//! allocator, and its own page tables with a W^X kernel image (proven with deliberate
-//! faults), after which it halts. Only the boot processor runs, and nothing here enables
-//! interrupts.
-#![no_std]
-#![no_main]
-
-extern crate alloc;
+//! The kernel programs COM1 (its UART until the ACPI tables name a better one), checks that its
+//! own relocations were applied, validates the boot info, attaches the firmware's framebuffer
+//! if the loader passed one, and prints a summary. Then come the M2 steps, through the
+//! framework's [`Early`]: its own GDT, TSS and IDT (proven with a breakpoint), the frame
+//! allocator, and its own page tables with a W^X kernel image (proven with deliberate faults);
+//! then the heap, the application processors, the drivers, and the proofs that each works.
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
-use core::ptr;
-use core::slice;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use framekernel::boot::{self, InvalidBootInfo, MemorySummary};
+use origin_boot_info::{BootInfo, SEGMENT_EXECUTE, SEGMENT_WRITE};
+use origin_frame::early::{Early, Entry};
 
 use crate::console::Console;
-use framekernel::report;
-
-mod block;
-mod console;
-mod dma;
-mod i8042;
-mod ipc;
-mod ipc_proof;
-mod irq;
-mod pcie;
-mod process;
-mod sched;
-mod storage;
-mod syscall;
-mod time;
-mod tlb;
-mod user;
-mod virtionet;
-mod wait;
-
-// The framework (ADR-0011 N6): every use of these goes through a typed, safe interface.
-use framekernel::frames::{self, FrameAllocator};
-use framekernel::paging::layout::{self, Placement};
-use framekernel::paging::{PAGE, Table, TablePool};
-use framekernel::serial::Uart16550;
-use origin_boot_info::{
-    BootInfo, KernelSegment, MemoryRegion, RegionKind, SEGMENT_EXECUTE, SEGMENT_WRITE,
+use crate::cpu::halt;
+use crate::report;
+use crate::serial::Uart16550;
+use crate::{
+    console, cpu, i8042, iommu, irq, memory, pcie, sched, smp, storage, syscall, time, timer,
+    virtionet,
 };
-pub(crate) use origin_frame::{cpu, firmware, iommu, memory, phys, smp, timer, vm};
-
-/// The fewest frames reserved, next to the frame bitmap, for the kernel's page tables.
-const TABLE_POOL_MIN_FRAMES: u64 = 256;
-/// Frames kept beyond what the boot's own tables can need (`layout::table_frames`), for what
-/// is mapped afterwards: device registers, firmware tables and guard pages that split a leaf.
-const TABLE_POOL_RESERVE: u64 = 235;
 
 /// I/O port base of COM1 on PC-compatible platforms.
 pub(crate) const COM1_BASE: u16 = 0x3F8;
@@ -72,42 +30,9 @@ pub(crate) const COM1_BASE: u16 = 0x3F8;
 /// Set by the first panic. A panic while reporting a panic only halts.
 static PANICKING: AtomicBool = AtomicBool::new(false);
 
-/// The object [`RELOCATION_PROBE`] points at.
-static RELOCATION_TARGET: [u8; 8] = *b"ORIGRELO";
-/// A pointer stored in the image. The ELF has an `R_X86_64_RELATIVE` relocation for it, so
-/// its run-time value equals the run-time address of [`RELOCATION_TARGET`] only if the
-/// loader applied the image's relocations.
-static RELOCATION_PROBE: &[u8; 8] = &RELOCATION_TARGET;
-
-/// The ELF entry. A tiny naked shim so every backtrace terminates here: it zeroes RBP (so
-/// the frame-pointer chain ends), aligns the stack, and calls [`kernel_main`] with the boot
-/// info the loader left in RDI. It never returns.
-///
-/// # Safety
-///
-/// Only the Origin boot loader may jump here, once, under the entry contract in the module
-/// documentation.
-#[unsafe(no_mangle)]
-#[unsafe(naked)]
-pub unsafe extern "sysv64" fn _start() -> ! {
-    core::arch::naked_asm!(
-        "xor ebp, ebp",
-        "and rsp, -16",
-        "call {main}",
-        "ud2",
-        main = sym kernel_main,
-    );
-}
-
-/// The kernel's Rust entry, called by [`_start`] with RBP zero and the boot-info pointer in
-/// RDI.
-///
-/// # Safety
-///
-/// Called once by `_start`, under the entry contract in the module documentation.
-/// `boot_info` must be null or the address of a readable `BootInfo` whose region array, if
-/// the header is valid, is readable and is not written while the kernel runs.
-unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
+/// The kernel's Rust entry: `_start` jumps here with RBP zero, the stack aligned, and the
+/// loader's boot-info pointer as the [`Entry`] in RDI.
+pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
     // The monotonic clock's zero (CLAUDE.md §68).
     time::mark_entry();
     // COM1 is the UART of last resort: nothing better is known until the ACPI tables can
@@ -116,7 +41,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     let firmware_line = uart.line_settings();
     uart.init();
 
-    if !relocations_applied() {
+    if !entry.relocations_applied() {
         // `core::fmt` would call through unrelocated vtables. `write_str` on the concrete
         // type is a direct call, and the string is addressed RIP-relative.
         let _ = uart.write_str(report::RELOCATIONS_NOT_APPLIED);
@@ -126,15 +51,20 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     console::init(uart, firmware_line);
     let mut com1 = console::Console::new();
 
-    // SAFETY: `boot_info` is the loader's pointer, passed on unchanged, and this function's
-    // contract is exactly `read_boot_info`'s.
-    let (info, regions, segments, memory) = match unsafe { read_boot_info(boot_info) } {
-        Ok(v) => v,
+    let mut early = match entry.read_boot_info() {
+        Ok(early) => early,
         Err(err) => {
             let _ = report::write_invalid(&mut com1, err);
             halt();
         }
     };
+    let data = early.data();
+    let (info, regions, segments, memory) = (
+        *data.info(),
+        data.regions(),
+        data.segments(),
+        data.summary(),
+    );
     // The firmware's framebuffer, drawn on from here on (ADR-0010). The earlier lines of a
     // boot this far can only have been a report of an invalid boot info, on the UART.
     console::attach_framebuffer(&mut com1, &info, regions);
@@ -157,6 +87,13 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         );
     }
 
+    // Out of turn the boot steps do nothing, whoever calls them (`Early`): proven here, before
+    // any of them has run, and below for a second run of each.
+    let out_of_turn = !early.start_heap(&mut com1)
+        && !early.prove_user_isolation(&mut com1)
+        && early.build_kernel_tables(&mut com1).is_none()
+        && timer::init(&mut com1).is_none();
+
     // The trap entry (in `cpu`) knows the layers above only through these upcalls.
     origin_frame::trap::install(origin_frame::trap::Hooks {
         tick: sched::on_tick,
@@ -171,18 +108,15 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     });
     // M2, first step: the kernel's own GDT, TSS and IDT, proven with a breakpoint whose
     // handler reports it and resumes here.
-    // SAFETY: called once, at CPL 0, on the boot processor, with interrupts disabled (entry
-    // contract), before anything depends on the firmware's tables.
-    unsafe { cpu::init() };
+    early.load_cpu_tables();
     let _ = report::write_cpu_tables(&mut com1);
     cpu::breakpoint();
 
     // CPU features and the x86-64-v3 baseline (CLAUDE.md §14, §24), then SSE/AVX enabled on
     // the boot processor.
     let cpuid = cpu::gather_cpuid();
-    let features = framekernel::features::Features::decode(&cpuid);
-    // SAFETY: CPL 0, boot processor, once, before any SIMD runs on it.
-    let xcr0 = unsafe { cpu::enable_simd(&cpuid) };
+    let features = crate::features::Features::decode(&cpuid);
+    let xcr0 = early.enable_simd();
     let _ = writeln!(
         com1,
         "origin-kernel: CPU: x86-64 level {} (baseline v3 {}); SSE {}, AVX2 {}, FMA {}, BMI2 {}, RDSEED {}, PCID {}, INVPCID {}, FSGSBASE {}; XSAVE area {} bytes, XCR0 {:#x}",
@@ -221,15 +155,14 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
 
     // M2, second step: the physical frame allocator over the boot-info regions, with a
     // pool of frames for page tables beside its bitmap.
-    let Some((mut alloc, pool, pool_base)) = init_memory(&mut com1, regions, info.kernel_span)
-    else {
+    if !early.init_memory(&mut com1) {
         halt();
-    };
+    }
 
     // M2, third step: the kernel's own page tables, proven with deliberate faults; then
     // the frame allocator is proven again through the new direct map.
     let mut heap_ok = false;
-    let paging = init_paging(&mut com1, &info, regions, segments, pool, pool_base);
+    let paging = init_paging(&mut com1, &mut early);
     // The kernel's own tables are loaded, so firmware tables can be mapped: the console's
     // UART is the one the firmware names, if it names one (ADR-0010).
     console::adopt_firmware_uart(&mut com1, info.acpi_rsdp, regions);
@@ -237,10 +170,9 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // reach configuration space, before it claims any more memory for itself.
     let mut quiesced = None;
     if paging {
-        prove_frames(&mut com1, &mut alloc);
         // M2: the kernel heap, which takes over the frame allocator; from here on the
         // `alloc` crate works in the kernel.
-        memory::init(alloc);
+        early.start_heap(&mut com1);
         quiesced = pcie::quiesce(
             &mut com1,
             info.acpi_rsdp,
@@ -248,7 +180,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
             &iommu::own_functions(info.acpi_rsdp),
         );
         heap_ok = prove_heap(&mut com1);
-        if heap_ok && !prove_user_isolation(&mut com1) {
+        if heap_ok && !early.prove_user_isolation(&mut com1) {
             // Ring 3 comes next: a kernel that cannot keep itself from user pages must not
             // run it, any more than a processor below the baseline (and `prove_user_isolation`
             // has said why).
@@ -298,15 +230,10 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                 time::monotonic_nanos() / 1_000_000
             );
         }
-        let online = smp::start(&mut com1, &info, regions, tsc_hz, sched::run_ap);
+        let online = smp::start(&mut com1, sched::run_ap);
         // M2 completion: once every enabled processor has left firmware code, the loader's
         // and the firmware's boot-time memory belongs to the kernel.
-        // SAFETY: the kernel's own tables replaced the firmware's long ago (`init_paging`), and
-        // every enabled processor has left firmware code: `online.complete` says so.
-        let reclaimed = online
-            .complete()
-            .then(|| unsafe { memory::reclaim_loader_memory() })
-            .flatten();
+        let reclaimed = early.reclaim_loader_memory(&online);
         if let Some((added, free)) = reclaimed {
             let _ = writeln!(
                 com1,
@@ -315,6 +242,27 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                 (free * memory::FRAME) >> 20
             );
         }
+        // Every boot step, and the two that bring up hardware for good, run once: a repeat
+        // changes nothing (`smp::start` would otherwise reset running processors).
+        let again = smp::start(&mut com1, sched::run_ap);
+        let once = again.cpus().len() == 1
+            && !again.complete()
+            && early.reclaim_loader_memory(&online).is_none()
+            && !early.init_memory(&mut com1)
+            && early.build_kernel_tables(&mut com1).is_none()
+            && !early.start_heap(&mut com1)
+            && !early.prove_user_isolation(&mut com1)
+            && early.enable_simd() == xcr0
+            && !iommu::init(&mut com1, info.acpi_rsdp, pcie::read_config32);
+        let _ = writeln!(
+            com1,
+            "origin-kernel: boot steps: out of turn refused {out_of_turn}; a second run refused {once}{}",
+            if out_of_turn && once {
+                ""
+            } else {
+                ": boot steps failed"
+            }
+        );
         // CPU topology from CPUID, each processor's on itself, checked against the MADT
         // (CLAUDE.md §24, §27).
         let apic_ids = online.apic_ids();
@@ -381,7 +329,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
 /// then reads values back and checks they parse to the discovered numbers. This shows the
 /// VFS carrying a live system namespace built from real hardware state.
 fn prove_sysfs(com1: &mut console::Console) {
-    use framekernel::vfs::Vfs;
+    use crate::vfs::Vfs;
     // Gather the facts.
     let free_mib = memory::stats().map_or(0, |(_, free)| (free * memory::FRAME) >> 20);
     let tsc_mhz = time::tsc_hz() / 1_000_000;
@@ -451,7 +399,7 @@ fn format_u64(value: u64, buf: &mut [u8; 20]) -> &[u8] {
 /// left undecided is measured again, up to `TIMER_ATTEMPTS` runs; a timer that fires in the
 /// wrong order, or one decisively late, fails at once.
 fn prove_timers(com1: &mut console::Console) {
-    use framekernel::timers::{Firing, TimerQueue, Verdict, judge};
+    use crate::timers::{Firing, TimerQueue, Verdict, judge};
     /// Runs the proof may make; each costs about 15 ms, and only a run a stall left undecided
     /// leads to another, so an undisturbed boot pays for one. Measured with two `yes` per
     /// logical core, a run was undecided in 55 % of cases, in streaks of up to 12 (six runs,
@@ -529,7 +477,7 @@ fn prove_timers(com1: &mut console::Console) {
 /// carries a payload and closes (CLAUDE.md §54).
 fn prove_tcp(com1: &mut console::Console) {
     let payload = b"origin-os tcp loopback payload";
-    let ok = framekernel::tcp::loopback_demo(payload);
+    let ok = crate::tcp::loopback_demo(payload);
     let _ = writeln!(
         com1,
         "origin-kernel: tcp: loopback connection established, {}-byte payload delivered, and closed: {ok}{}",
@@ -542,7 +490,7 @@ fn prove_tcp(com1: &mut console::Console) {
 /// from host A to host B, has B parse it and build a reply, and checks A matches the reply
 /// to its request with the payload intact and the checksums valid (CLAUDE.md §54).
 fn prove_net(com1: &mut console::Console) {
-    use framekernel::net::{
+    use crate::net::{
         EthFrame, IcmpEcho, Ipv4, Ipv4Packet, Mac, Udp, ethertype, icmp_type, protocol,
     };
     let a_mac = Mac([0x52, 0x54, 0, 0, 0, 0x0A]);
@@ -626,7 +574,7 @@ fn prove_net(com1: &mut console::Console) {
 /// CRC-32 equals the constant the host test proved, so the kernel and host renderers agree
 /// bit for bit (CLAUDE.md §52 the software fallback).
 fn prove_raster(com1: &mut console::Console) {
-    use framekernel::raster::{DEMO_CRC, DEMO_HEIGHT, DEMO_WIDTH, Surface, demo_scene};
+    use crate::raster::{DEMO_CRC, DEMO_HEIGHT, DEMO_WIDTH, Surface, demo_scene};
     let mut buf = alloc::vec![0u32; (DEMO_WIDTH * DEMO_HEIGHT) as usize];
     let Some(mut surface) = Surface::new(&mut buf, DEMO_WIDTH, DEMO_HEIGHT, DEMO_WIDTH) else {
         let _ = writeln!(com1, "origin-kernel: raster: bad surface: raster failed");
@@ -635,7 +583,7 @@ fn prove_raster(com1: &mut console::Console) {
     demo_scene(&mut surface);
     let mut running = 0xFFFF_FFFFu32;
     for px in &buf {
-        running = framekernel::gpt::crc32_update(running, &px.to_le_bytes());
+        running = crate::gpt::crc32_update(running, &px.to_le_bytes());
     }
     let crc = !running;
     let ok = crc == DEMO_CRC;
@@ -650,7 +598,7 @@ fn prove_raster(com1: &mut console::Console) {
 /// through `..`, lists and removes, and checks the node count returns to the root alone
 /// (no leak). A failure in any step shows in the reported counts.
 fn prove_vfs(com1: &mut console::Console) {
-    use framekernel::vfs::{Kind, Vfs};
+    use crate::vfs::{Kind, Vfs};
     let mut fs = Vfs::new(1 << 20, 64);
     let start = fs.node_count();
     let steps = [
@@ -729,10 +677,10 @@ pub(crate) struct InitramfsCheck {
 /// archive never lists, so it must have been created implicitly. Used for the embedded image
 /// and for the copy fetched over the network.
 pub(crate) fn check_initramfs(image: &[u8]) -> InitramfsCheck {
-    use framekernel::vfs::Vfs;
+    use crate::vfs::Vfs;
 
     let mut fs = Vfs::new(1 << 20, 256);
-    let result = framekernel::initramfs::extract(image, &mut fs);
+    let result = crate::initramfs::extract(image, &mut fs);
     let entries = result.unwrap_or(0);
     let mut buf = [0u8; 32];
     let read = fs.read("/etc/hostname", 0, &mut buf).unwrap_or(0);
@@ -762,14 +710,14 @@ pub(crate) fn check_initramfs(image: &[u8]) -> InitramfsCheck {
 ///
 /// None of this reads the QEMU machine definition; the counts are only printed here.
 fn prove_topology(com1: &mut console::Console, rsdp: u64, online: &smp::Online) {
-    use framekernel::topology::{self, CpuTopology, Layout, Source};
+    use crate::topology::{self, CpuTopology, Layout, Source};
 
     // The boot processor's own record; every AP wrote its own before it came online.
     smp::record_topology();
     // The cache hierarchy from leaf 04h.
-    let mut caches = [framekernel::cache::Cache {
+    let mut caches = [crate::cache::Cache {
         level: 0,
-        kind: framekernel::cache::CacheType::Data,
+        kind: crate::cache::CacheType::Data,
         size: 0,
         line_size: 0,
         ways: 0,
@@ -785,7 +733,7 @@ fn prove_topology(com1: &mut console::Console, rsdp: u64, online: &smp::Online) 
             cache_subs.push(sub);
         }
     }
-    let n_cache = framekernel::cache::decode_all(&cache_subs, &mut caches);
+    let n_cache = crate::cache::decode_all(&cache_subs, &mut caches);
     let caches_ok = caches[..n_cache]
         .iter()
         .all(|c| c.size > 0 && c.line_size > 0);
@@ -912,7 +860,7 @@ fn prove_topology(com1: &mut console::Console, rsdp: u64, online: &smp::Online) 
 /// must appear as an enabled CPU affinity and some memory must be present, or the line reads
 /// `consistent false`.
 fn prove_numa(com1: &mut console::Console, rsdp: u64, ids: &[u32]) {
-    use framekernel::acpi::{self, CpuAffinity, MemoryAffinity};
+    use crate::acpi::{self, CpuAffinity, MemoryAffinity};
 
     let Ok(srat) = crate::firmware::acpi_table(rsdp, b"SRAT") else {
         let _ = writeln!(
@@ -993,7 +941,7 @@ fn prove_slit(com1: &mut console::Console, rsdp: u64) {
         );
         return;
     };
-    let Ok(slit) = framekernel::acpi::parse_slit(table) else {
+    let Ok(slit) = crate::acpi::parse_slit(table) else {
         let _ = writeln!(
             com1,
             "origin-kernel: slit: invalid SLIT; consistent false: slit failed"
@@ -1016,9 +964,9 @@ fn prove_slit(com1: &mut console::Console, rsdp: u64) {
     }
     // The locality map derived from this SLIT: every node's nearest node must be itself,
     // and node 0's nodes in ascending distance.
-    let self_nearest = framekernel::numa::self_is_nearest(&slit);
+    let self_nearest = crate::numa::self_is_nearest(&slit);
     let mut order = [0usize; 64];
-    let k = framekernel::numa::nearest_nodes(&slit, 0, &mut order);
+    let k = crate::numa::nearest_nodes(&slit, 0, &mut order);
     let consistent = n >= 1 && local_ok && off_ok && self_nearest;
     let across = slit.distance(0, 1.min(n.saturating_sub(1))).unwrap_or(0);
     let _ = write!(
@@ -1042,8 +990,8 @@ fn prove_slit(com1: &mut console::Console, rsdp: u64) {
 /// distinct — the smoke test that distinguishes a live entropy source from a dead one that
 /// returns a constant. A processor that reports neither instruction is reported honestly,
 /// not failed.
-fn prove_entropy(com1: &mut console::Console, features: &framekernel::features::Features) {
-    use framekernel::entropy::{self, Source};
+fn prove_entropy(com1: &mut console::Console, features: &crate::features::Features) {
+    use crate::entropy::{self, Source};
 
     if !features.rdseed && !features.rdrand {
         let _ = writeln!(
@@ -1148,232 +1096,18 @@ fn prove_backtrace(com1: &mut Console, info: &BootInfo) {
     );
 }
 
-/// Builds the kernel's address space, loads it, and proves its protections on the
-/// processor. Returns whether the kernel now runs on its own tables.
-fn init_paging(
-    com1: &mut Console,
-    info: &BootInfo,
-    regions: &'static [MemoryRegion],
-    segments: &[KernelSegment],
-    pool: &'static [Table],
-    pool_base: u64,
-) -> bool {
-    if !cpu::nx_supported() {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: the processor has no NX bit; W^X cannot be enforced"
-        );
+/// The kernel's page tables, built, the framebuffer kept, loaded and proven. Returns whether
+/// the kernel now runs on them.
+fn init_paging(com1: &mut Console, early: &mut Early) -> bool {
+    let Some(mut tables) = early.build_kernel_tables(com1) else {
         return false;
-    }
-    let mut tables = TablePool::new(pool, pool_base);
-    let stack_guard = info.stack_base.wrapping_sub(PAGE);
-    let at = Placement {
-        direct_map_base: info.direct_map_base,
-        kernel_virtual_base: info.kernel_virtual_base,
-        kernel_physical_base: info.kernel_base,
-        stack_guard,
-    };
-    let (mut space, stats) = match layout::build(&mut tables, &at, regions, segments) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = writeln!(com1, "origin-kernel: page tables not built: {e:?}");
-            return false;
-        }
     };
     // The console keeps drawing through the switch to these tables, at the address the
     // loader used (ADR-0010). Last, so that it costs nothing else if it fails.
-    if console::has_screen() {
-        let mapped = layout::framebuffer_mapping(&info.framebuffer)
-            .is_some_and(|m| layout::map_framebuffer(&mut space, &mut tables, &m));
-        if !mapped {
-            console::withdraw_framebuffer(com1);
-        }
+    if console::has_screen() && !early.map_framebuffer(&mut tables) {
+        console::withdraw_framebuffer(com1);
     }
-    // SAFETY: boot processor, CPL 0, interrupts disabled (entry contract); NX is supported
-    // (checked above). `kernel_space::build` mapped the kernel image segments, the stack
-    // this code runs on, the boot info and region and segment arrays, the frame bitmap and
-    // this table pool (all in direct-mapped regions), and the kernel's statics (the GDT,
-    // IDT, TSS and double-fault stack are in the RW segment). The console's framebuffer is
-    // mapped at the same address in these tables (or was withdrawn above), and COM1 is port
-    // I/O.
-    unsafe { cpu::load_page_tables(space.root()) };
-    // SAFETY: CPL 0; the tables just loaded mark only the kernel half global (`layout`).
-    // Toggling CR4.PGE also drops every translation cached under the loader's tables.
-    let global = unsafe { tlb::enable_global_pages() };
-    let used = tables.used();
-    // SAFETY: once, here, with the tables `load_page_tables` just loaded: they map everything
-    // running now, and from here on every mapping goes through them.
-    unsafe { vm::install(space, tables, regions) };
-    let _ = writeln!(
-        com1,
-        "origin-kernel: page tables loaded: {} tables, {} MiB direct map, {} image pages, {} 4 KiB and {} 2 MiB leaves; global pages {global}",
-        used,
-        stats.direct_bytes >> 20,
-        stats.image_pages,
-        stats.small_pages,
-        stats.large_pages
-    );
-    // ADR-0004: nothing of the kernel is left in the lower half, and its physical pages
-    // have no second mapping in the direct map.
-    let identity = vm::is_mapped(info.kernel_base);
-    let alias = vm::is_mapped(phys::to_virt(info.kernel_base));
-    let _ = writeln!(
-        com1,
-        "origin-kernel: higher half: kernel image identity address mapped {identity}, direct-map alias mapped {alias}{}",
-        if identity || alias {
-            ": higher half failed"
-        } else {
-            ""
-        }
-    );
-    !identity && !alias && prove_protections(com1, info, segments)
-}
-
-/// Deliberate accesses that the new tables must refuse: a write to kernel code, a write to
-/// read-only kernel data, an instruction fetch from writable data and a read of page 0.
-/// Each must raise #PF with the expected error code (SDM Vol. 3A §4.7: bit 0 present,
-/// bit 1 write, bit 4 instruction fetch). Returns whether all four did.
-fn prove_protections(com1: &mut Console, info: &BootInfo, segments: &[KernelSegment]) -> bool {
-    let first = |want: u32, avoid: u32| {
-        segments
-            .iter()
-            .find(|s| s.access & want == want && s.access & avoid == 0)
-            .map(|s| info.kernel_virtual_base + s.rva)
-    };
-    let (Some(text), Some(rodata)) = (
-        first(SEGMENT_EXECUTE, SEGMENT_WRITE),
-        first(0, SEGMENT_WRITE | SEGMENT_EXECUTE),
-    ) else {
-        let _ = writeln!(com1, "origin-kernel: no code or read-only segment to probe");
-        return false;
-    };
-    let read = |addr: u64| {
-        // SAFETY: `addr` is the first byte of a mapped, readable kernel segment.
-        unsafe { ptr::with_exposed_provenance::<u8>(addr as usize).read_volatile() }
-    };
-    let (exec_addr, exec) = cpu::probe_execute_data();
-    let cases = [
-        ("write to kernel code", text, 0x3, {
-            let byte = read(text);
-            // SAFETY: `byte` is the value at `text`, kernel code that nothing modifies, and
-            // `text` is RAM, not MMIO.
-            unsafe { cpu::probe_write(text, byte) }
-        }),
-        ("write to read-only kernel data", rodata, 0x3, {
-            let byte = read(rodata);
-            // SAFETY: as above, for read-only data.
-            unsafe { cpu::probe_write(rodata, byte) }
-        }),
-        (
-            "instruction fetch from writable data",
-            exec_addr,
-            0x11,
-            exec,
-        ),
-        ("read of page 0", 0, 0x0, cpu::probe_read(0)),
-        (
-            "read of the boot stack's guard page",
-            phys::to_virt(info.stack_base - PAGE),
-            0x0,
-            cpu::probe_read(phys::to_virt(info.stack_base - PAGE)),
-        ),
-    ];
-    let mut all = true;
-    for (what, addr, expected, probe) in cases {
-        match probe {
-            cpu::Probe::Faulted { error, address } if error == expected && address == addr => {
-                let _ = writeln!(
-                    com1,
-                    "origin-kernel: page protection: {what} at {addr:#x} faulted (#PF error {error:#x})"
-                );
-            }
-            other => {
-                all = false;
-                let _ = writeln!(
-                    com1,
-                    "origin-kernel: page protection violated: {what} at {addr:#x}: {other:?}"
-                );
-            }
-        }
-    }
-    all
-}
-
-/// Builds the frame allocator, with its bitmap and then the page-table pool at the start of
-/// the first usable region that can hold both. Returns the allocator, the pool and the
-/// pool's physical address.
-fn init_memory(
-    com1: &mut Console,
-    regions: &'static [MemoryRegion],
-    kernel_span: u64,
-) -> Option<(FrameAllocator<'static>, &'static [Table], u64)> {
-    let words = frames::words_for(frames::covered_end(regions));
-    let bitmap_pages = (words * 8).div_ceil(frames::FRAME);
-    // As large as the memory map can need, so a machine the loader could map is one the kernel
-    // can map too.
-    let Some(table_frames) = layout::table_frames(regions, regions.len() as u64, kernel_span)
-        .and_then(|needed| needed.checked_add(TABLE_POOL_RESERVE))
-        .map(|frames| frames.max(TABLE_POOL_MIN_FRAMES))
-    else {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: the memory map needs more page tables than can be counted"
-        );
-        return None;
-    };
-    let pages = bitmap_pages + table_frames;
-    let usable = RegionKind::Usable as u32;
-    let Some(home) = regions
-        .iter()
-        .find(|r| r.kind == usable && r.base != 0 && r.pages >= pages)
-    else {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: no usable region can hold the {pages}-page frame bitmap and table pool"
-        );
-        return None;
-    };
-    let bitmap_ptr = ptr::with_exposed_provenance_mut::<u64>(phys::to_virt(home.base) as usize);
-    // SAFETY: `home` is a `Usable` region from the validated boot info, so nothing else
-    // owns it; the firmware's identity mapping is active, so its physical address is
-    // directly writable; it holds at least `pages` pages, which cover the bitmap's `words`
-    // words and the pool after it.
-    unsafe { bitmap_ptr.write_bytes(0, (pages * frames::FRAME / 8) as usize) };
-    // SAFETY: as above; the words were just zeroed, and the bitmap frames are reserved
-    // below, so the allocator never hands them out. The slice lives for the rest of the
-    // kernel's run, and nothing else refers to these frames.
-    let bitmap = unsafe { slice::from_raw_parts_mut(bitmap_ptr, words as usize) };
-    let pool_base = home.base + bitmap_pages * frames::FRAME;
-    // SAFETY: the pool's `table_frames` frames follow the bitmap inside `home`, were
-    // zeroed above and are reserved below, so only the pool uses them. `Table` is 4 KiB of
-    // `AtomicU64`, valid for any bits and aligned (the frames are 4 KiB aligned); accesses
-    // through the shared slice are atomic, so the processor's own accessed/dirty updates
-    // do not race with them.
-    let pool = unsafe {
-        slice::from_raw_parts(
-            ptr::with_exposed_provenance::<Table>(phys::to_virt(pool_base) as usize),
-            table_frames as usize,
-        )
-    };
-    // The AP trampoline's code and data frames (M3) are never handed out.
-    let trampoline = (smp::TRAMPOLINE, 2);
-    let alloc = match FrameAllocator::new(bitmap, regions, &[(home.base, pages), trampoline]) {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = writeln!(com1, "origin-kernel: frame allocator: {e:?}");
-            return None;
-        }
-    };
-    let _ = writeln!(
-        com1,
-        "origin-kernel: frame allocator: {} free frames ({} MiB), bitmap of {} pages at {:#x}",
-        alloc.free_frames(),
-        (alloc.free_frames() * frames::FRAME) >> 20,
-        bitmap_pages,
-        home.base
-    );
-    debug_assert_eq!(PAGE, frames::FRAME);
-    Some((alloc, pool, pool_base))
+    early.load_kernel_tables(com1, tables)
 }
 
 /// Proves the heap with real `alloc` collections: a large vector (a frame run), thousands
@@ -1455,189 +1189,6 @@ fn prove_nmi_ist(com1: &mut Console) -> bool {
     );
     on_ist
 }
-
-/// Where the SMEP/SMAP probe maps its temporary user page: the top of the lower half.
-const USER_PROBE_PAGE: u64 = 0x0000_7FFF_FFFF_E000;
-
-/// Enables SMEP and SMAP and proves both: a temporary user page holding `mov rax, -1;
-/// ret`, which a supervisor fetch (SMEP) and a supervisor read (SMAP) must both fault on.
-/// The page is removed afterwards.
-fn prove_user_isolation(com1: &mut Console) -> bool {
-    use alloc::alloc::{Layout, alloc_zeroed, dealloc};
-    // SAFETY: CPL 0, and the kernel has no user mappings yet.
-    let (smep, smap) = unsafe { cpu::enable_smep_smap() };
-    if !(smep && smap) {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: SMEP {smep}, SMAP {smap}: supervisor isolation from user pages incomplete"
-        );
-        return false;
-    }
-    let Ok(layout) = Layout::from_size_align(4096, 4096) else {
-        return false;
-    };
-    // SAFETY: `layout` has a non-zero size.
-    let frame = unsafe { alloc_zeroed(layout) };
-    if frame.is_null() {
-        return false;
-    }
-    // SAFETY: `frame` is a fresh, writable 4 KiB allocation.
-    unsafe {
-        ptr::copy_nonoverlapping(cpu::PROBE_RETURN.as_ptr(), frame, cpu::PROBE_RETURN.len());
-    }
-    let phys = phys::to_phys(frame.expose_provenance() as u64);
-    let mut ok = true;
-    // SAFETY: the page is the proof's own fresh frame, about to be probed and unmapped: nothing
-    // else ever uses it, and ring 3 runs no code in this address space yet.
-    let mapped = unsafe {
-        vm::map_user(
-            USER_PROBE_PAGE,
-            phys,
-            framekernel::paging::Access::ReadExecute,
-        )
-    };
-    if mapped.is_err() {
-        let _ = writeln!(com1, "origin-kernel: cannot map the user probe page");
-        ok = false;
-    } else {
-        // SAFETY: the user page holds `PROBE_RETURN`.
-        let fetch = unsafe { cpu::probe_execute(USER_PROBE_PAGE) };
-        let read = cpu::probe_read(USER_PROBE_PAGE);
-        for (what, probe, expected) in [
-            ("SMEP: supervisor fetch from a user page", fetch, 0x11),
-            ("SMAP: supervisor read of a user page", read, 0x1),
-        ] {
-            match probe {
-                cpu::Probe::Faulted { error, address }
-                    if error == expected && address == USER_PROBE_PAGE =>
-                {
-                    let _ = writeln!(
-                        com1,
-                        "origin-kernel: page protection: {what} at {USER_PROBE_PAGE:#x} faulted (#PF error {error:#x})"
-                    );
-                }
-                other => {
-                    ok = false;
-                    let _ = writeln!(
-                        com1,
-                        "origin-kernel: page protection violated: {what}: {other:?}"
-                    );
-                }
-            }
-        }
-        // SAFETY: `USER_PROBE_PAGE` is the page this function mapped above, used by nothing
-        // else, and nothing relies on it being mapped.
-        if unsafe { vm::unmap(USER_PROBE_PAGE) }.is_err() {
-            ok = false;
-        }
-    }
-    // SAFETY: `frame` came from `alloc_zeroed(layout)` and is no longer mapped as a user
-    // page.
-    unsafe { dealloc(frame, layout) };
-    ok
-}
-
-/// Proves the allocator by allocating, writing, reading back and freeing three frames.
-fn prove_frames(com1: &mut Console, alloc: &mut FrameAllocator<'_>) {
-    let mut got = [0u64; 3];
-    for (i, slot) in got.iter_mut().enumerate() {
-        let Some(addr) = alloc.allocate() else {
-            let _ = writeln!(com1, "origin-kernel: frame allocator exhausted");
-            return;
-        };
-        let p = ptr::with_exposed_provenance_mut::<u64>(phys::to_virt(addr) as usize);
-        let pattern = 0x4F52_4947_494E_0000 | i as u64;
-        // SAFETY: the allocator just handed out this usable frame, which the kernel's
-        // direct map covers read/write, and nothing else uses it; a volatile write and read
-        // prove the RAM really holds it.
-        unsafe { p.write_volatile(pattern) };
-        // SAFETY: as above.
-        let back = unsafe { p.read_volatile() };
-        if back != pattern {
-            let _ = writeln!(
-                com1,
-                "origin-kernel: frame {addr:#x} did not keep its contents"
-            );
-            return;
-        }
-        *slot = addr;
-    }
-    for &addr in &got {
-        if alloc.free(addr).is_err() {
-            let _ = writeln!(com1, "origin-kernel: frame {addr:#x} could not be freed");
-            return;
-        }
-    }
-    let _ = writeln!(
-        com1,
-        "origin-kernel: allocated, wrote and freed 3 frames at {:#x}, {:#x}, {:#x}",
-        got[0], got[1], got[2]
-    );
-}
-
-/// What [`read_boot_info`] returns: the copied header, the region and kernel segment
-/// arrays, and the memory summary.
-type BootData = (
-    BootInfo,
-    &'static [MemoryRegion],
-    &'static [KernelSegment],
-    MemorySummary,
-);
-
-/// Copies and validates the boot info, then checks its kernel segment list and summarizes
-/// its region array.
-///
-/// # Safety
-///
-/// `boot_info` must be null or the address of a readable `BootInfo` whose region and
-/// segment arrays, if the header is valid, are readable and are never written afterwards:
-/// the returned slices are `'static`, which holds because the loader leaves that memory to
-/// the kernel for good.
-unsafe fn read_boot_info(boot_info: *const BootInfo) -> Result<BootData, InvalidBootInfo> {
-    boot::check_address(boot_info.addr())?;
-    // SAFETY: `boot_info` is non-null and aligned (checked above) and readable (the
-    // caller's contract). `BootInfo` has only integer fields, so every bit pattern is a
-    // valid value. The header is copied, so no reference into loader memory is kept.
-    let info = unsafe { boot_info.read() };
-    let array = boot::validate(&info)?;
-    // Boot info 0.3: the arrays are given by physical address; read them through the direct
-    // map the loader built.
-    phys::init(&info);
-    let first =
-        ptr::with_exposed_provenance::<MemoryRegion>(phys::to_virt(array.addr as u64) as usize);
-    // SAFETY: `validate` checked that the array is non-null, aligned, at most `isize::MAX`
-    // bytes long and does not wrap. The caller's contract makes it readable and unchanging
-    // while the slice lives. `MemoryRegion` has only integer fields, so every bit pattern
-    // is a valid value.
-    let regions = unsafe { slice::from_raw_parts(first, array.len) };
-    let memory = boot::summarize(regions)?;
-    let segment_array = boot::segment_array(&info)?;
-    let first = ptr::with_exposed_provenance::<KernelSegment>(phys::to_virt(
-        segment_array.addr as u64,
-    ) as usize);
-    // SAFETY: as for the regions: `segment_array` checked the layout requirements, the
-    // caller's contract makes the memory readable and unchanging, and `KernelSegment` has
-    // only integer fields.
-    let segments = unsafe { slice::from_raw_parts(first, segment_array.len) };
-    boot::check_kernel_segments(segments, &info)?;
-    Ok((info, regions, segments, memory))
-}
-
-/// Whether the loader applied the image's relocations.
-///
-/// The compiler knows the link-time value of [`RELOCATION_PROBE`], so the load must be
-/// volatile to observe what is really in memory. The address of [`RELOCATION_TARGET`] is
-/// computed RIP-relative and is correct wherever the image was loaded.
-fn relocations_applied() -> bool {
-    let probe = (&raw const RELOCATION_PROBE).cast::<*const u8>();
-    // SAFETY: `probe` points to a live, aligned static of pointer size. It is read as a
-    // raw pointer, which is valid for any bit pattern, so an unrelocated value is never
-    // treated as a reference.
-    let stored = unsafe { ptr::read_volatile(probe) };
-    ptr::eq(stored, RELOCATION_TARGET.as_ptr())
-}
-
-pub(crate) use cpu::halt;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

@@ -31,12 +31,12 @@
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use framekernel::fbconsole::{Cursor, PixelSink, Screen, ScreenError};
-use framekernel::paging::layout;
-use framekernel::serial::{
+use crate::fbconsole::{Cursor, PixelSink, Screen, ScreenError};
+use crate::paging::layout;
+use crate::serial::{
     DIVISOR, EarlyLog, LCR_8N1, LineSettings, LineSetup, Register, Uart16550, UartRegisters,
 };
-use framekernel::spcr::{self, Access, Spcr, UartAddress};
+use crate::spcr::{self, Access, Spcr, UartAddress};
 use origin_boot_info::{BootInfo, Framebuffer, MemoryRegion, overlaps_ram};
 use origin_frame::addr::PhysAddr;
 use origin_frame::mmio::MmioRegion;
@@ -555,7 +555,7 @@ fn move_uart(sinks: &mut Sinks, spcr: &Spcr, uart: KernelUart) -> (LineSetup, us
     }
     // A new UART, or a new speed on the same one: the log so far has not been readable there.
     // Send it again. If a new UART will not take it, the old one stays.
-    let log = core::mem::replace(&mut sinks.early, EarlyLog::new());
+    let log = core::mem::take(&mut sinks.early);
     sinks.early_open = false;
     let dropped = log.dropped();
     let mut replayed = 0;
@@ -680,8 +680,8 @@ impl Drop for Console {
 /// One exception report, from the trap entry's hook: it gets out even if this processor
 /// faulted inside the console.
 pub(crate) fn report_exception(r: &origin_frame::trap::ExceptionReport<'_>) {
+    use crate::descriptors::exception_name;
     use core::fmt::Write as _;
-    use framekernel::descriptors::exception_name;
     let mut com1 = Console::urgent();
     let _ = writeln!(
         com1,

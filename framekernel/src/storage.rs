@@ -42,12 +42,12 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{Ordering, compiler_fence, fence};
 
+use crate::blockcache::{QueueGate, Transfer, test_disk};
+use crate::gpt;
+use crate::nvme::{self, Capabilities, Command, Completion, NamespaceInfo, Queues, register};
+use crate::pci::{self, BarKind};
+use crate::vtd;
 use core::sync::atomic::AtomicU64;
-use framekernel::blockcache::{QueueGate, Transfer, test_disk};
-use framekernel::gpt;
-use framekernel::nvme::{self, Capabilities, Command, Completion, NamespaceInfo, Queues, register};
-use framekernel::pci::{self, BarKind};
-use framekernel::vtd;
 use origin_frame::addr::PhysAddr;
 use origin_frame::dma::DmaPage;
 use origin_frame::mmio::MmioRegion;
@@ -59,7 +59,7 @@ use crate::wait::WaitQueue;
 
 use crate::console::Console;
 
-pub(crate) use framekernel::blockcache::test_disk::pattern;
+pub(crate) use crate::blockcache::test_disk::pattern;
 
 /// Entries in the admin queues and the I/O queues.
 const ADMIN_ENTRIES: u16 = 32;
@@ -1648,7 +1648,7 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
     //    destination is the target processor's APIC ID.
     let bsp = crate::cpu::this_cpu();
     let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
-    let apic = |c: CpuIndex| c.apic_id().unwrap_or(framekernel::cpumap::BROADCAST);
+    let apic = |c: CpuIndex| c.apic_id().unwrap_or(crate::cpumap::BROADCAST);
     let mut routes: Vec<(pci::Address, vtd::MsiMessage, u8, u32)> = Vec::new();
     if let Some((table, capability)) = msix {
         routes.push((

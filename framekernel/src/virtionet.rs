@@ -22,10 +22,10 @@
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
 
-use framekernel::net::{self, Arp, EthFrame, Ipv4, Mac, arp_op, ethertype};
-use framekernel::pci::{self, Address};
-use framekernel::virtio::{self, feature, status};
-use framekernel::virtqueue::{self, Descriptor, F_WRITE, RingMemory};
+use crate::net::{self, Arp, EthFrame, Ipv4, Mac, arp_op, ethertype};
+use crate::pci::{self, Address};
+use crate::virtio::{self, feature, status};
+use crate::virtqueue::{self, Descriptor, F_WRITE, RingMemory};
 use origin_frame::addr::PhysAddr;
 use origin_frame::dma::{DmaFrame, DmaPage};
 use origin_frame::mmio::MmioRegion;
@@ -52,7 +52,7 @@ static NET_MSIX: SpinLock<Option<(Address, MmioRegion, u32)>> = SpinLock::new(No
 
 /// The messages in the NIC's receive and transmit MSI-X entries, each with the vector and
 /// the processor it must reach (for the interrupt-remapping proof); empty before bring-up.
-pub(crate) fn msix_routes() -> alloc::vec::Vec<(Address, framekernel::vtd::MsiMessage, u8, u32)> {
+pub(crate) fn msix_routes() -> alloc::vec::Vec<(Address, crate::vtd::MsiMessage, u8, u32)> {
     let Some((at, table, target)) = crate::cpu::without_interrupts(|| *NET_MSIX.lock()) else {
         return alloc::vec::Vec::new();
     };
@@ -64,7 +64,7 @@ pub(crate) fn msix_routes() -> alloc::vec::Vec<(Address, framekernel::vtd::MsiMe
     ]
     .into_iter()
     .map(|(entry, vector)| {
-        let message = framekernel::vtd::MsiMessage {
+        let message = crate::vtd::MsiMessage {
             address: u64::from(word(entry, 0)) | u64::from(word(entry, 1)) << 32,
             data: word(entry, 2),
         };
@@ -768,8 +768,8 @@ fn transmit_dhcp(our_mac: Mac, dhcp: &[u8], damage: bool) -> bool {
     let Some(un) = net::Udp::write(
         any,
         bcast,
-        framekernel::dhcp::CLIENT_PORT,
-        framekernel::dhcp::SERVER_PORT,
+        crate::dhcp::CLIENT_PORT,
+        crate::dhcp::SERVER_PORT,
         dhcp,
         &mut udp,
     ) else {
@@ -1028,8 +1028,8 @@ fn reply_deadline() -> u64 {
 /// TFTP port. `None` when the processor gives none; the caller stops rather than use a
 /// predictable value.
 fn random_u64() -> Option<u64> {
-    use framekernel::entropy::{self, Source};
-    use framekernel::features::Features;
+    use crate::entropy::{self, Source};
+    use crate::features::Features;
 
     struct Hardware(Features);
     impl Source for Hardware {
@@ -1086,7 +1086,7 @@ fn timeout_note(step: u64) -> alloc::string::String {
         waiting::DHCP_REFUSED => {
             return alloc::format!(
                 "; the DHCP server refused the lease through {} restarts",
-                framekernel::dhcp::MAX_RESTARTS
+                crate::dhcp::MAX_RESTARTS
             );
         }
         _ => {
@@ -1170,7 +1170,7 @@ fn await_udp(
 /// outcome and whether the file matches the image built into the kernel; only then is it
 /// handed on to be unpacked.
 fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
-    use framekernel::tftp;
+    use crate::tftp;
 
     let mut request = [0u8; 64];
     let Some(n) = tftp::read_request(TFTP_FILE, &mut request) else {
@@ -1274,7 +1274,7 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
 /// and an attempt is renewed only by a retransmission or a step forward, whatever else
 /// arrives.
 fn dhcp_lease(rx: &mut RxRing, our_mac: Mac) -> Option<Ipv4> {
-    use framekernel::dhcp::{self, Action};
+    use crate::dhcp::{self, Action};
 
     /// A new transaction ID, or `None` (recorded) with no entropy to draw one from.
     fn new_xid() -> Option<u32> {
@@ -1784,7 +1784,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
     let _ = writeln!(
         com1,
         "origin-kernel: virtio-net TFTP: {TFTP_FILE} from 10.0.2.2: {bytes} bytes in {blocks} blocks{}, {outcome}; {retransmits} retransmitted after a {} ms timeout (the first read request is dropped on purpose); the receive ring's {N_RX} buffers carried {frames} frames ({recycled} recycled){tftp_note}; consistent {}{}",
-        if complete && bytes.is_multiple_of(framekernel::tftp::BLOCK as u64) {
+        if complete && bytes.is_multiple_of(crate::tftp::BLOCK as u64) {
             " (the last empty)"
         } else {
             ""

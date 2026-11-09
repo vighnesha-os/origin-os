@@ -12,9 +12,9 @@ static KERNEL_PHYSICAL: AtomicU64 = AtomicU64::new(0);
 /// Whether [`init`] has run.
 static PHYS_SET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Records the loader's placement. Called once, first thing after the boot info is read; a
-/// later call changes nothing (the direct map's base is fixed for the kernel's lifetime).
-pub fn init(info: &BootInfo) {
+/// Records the loader's placement. Only `early` calls this, first thing after the boot info is
+/// read; a later call changes nothing (the direct map's base is fixed for the kernel's lifetime).
+pub(crate) fn init(info: &BootInfo) {
     if PHYS_SET.swap(true, Ordering::AcqRel) {
         return;
     }

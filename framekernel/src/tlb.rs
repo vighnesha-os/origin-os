@@ -6,7 +6,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use origin_frame::stack::GuardablePage;
-pub(crate) use origin_frame::tlb::{GLOBAL_PAGES, LAST_CYCLES, enable_global_pages, mark_online};
+pub(crate) use origin_frame::tlb::{GLOBAL_PAGES, LAST_CYCLES, mark_online};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex};

@@ -23,7 +23,7 @@
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use framekernel::runqueue::{RoundTrips, judge_round_trips, per_mille};
+use crate::runqueue::{RoundTrips, judge_round_trips, per_mille};
 use origin_frame::sync::SpinLock;
 use origin_frame::sync::wait::{self, TimedOut};
 

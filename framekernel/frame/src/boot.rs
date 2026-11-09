@@ -4,6 +4,7 @@
 //! The kernel copies the [`BootInfo`] header out of loader memory, then validates it here
 //! before it reads anything else the header points to. Every check is total: no function in
 //! this module can panic, whatever the loader wrote.
+#![forbid(unsafe_code)]
 
 use core::mem::{align_of, size_of};
 

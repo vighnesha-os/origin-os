@@ -1,8 +1,0 @@
-# Kernel source files that still hold `unsafe` outside the framework (ADR-0011 N6, N13).
-# One line per file: the number of `unsafe` sites in it, then its repository path.
-#
-# `cargo xtask check` fails if a file with `unsafe` is not listed here with exactly its count,
-# if a listed file has no `unsafe` left, or if this list has ever grown in its git history: it can
-# only shrink. When a file is migrated, lower its count or remove its line in the same commit.
-# `cargo xtask unsafe-list` prints what should be here.
-31 framekernel/src/main.rs

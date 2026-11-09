@@ -16,7 +16,7 @@
 
 use core::fmt::Write;
 
-use framekernel::blockcache::{BlockCache, Request, Transfer};
+use crate::blockcache::{BlockCache, Request, Transfer};
 use origin_frame::dma::DmaPage;
 
 use crate::console::Console;

@@ -31,9 +31,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use framekernel::channel::{Channel, Message, QUEUE_BYTES, QUEUE_DEPTH, ReadError, other};
-use framekernel::handles::HandleTable;
-use framekernel::heap::{MAX_BLOCK, MIN_BLOCK, PAGE};
+use crate::channel::{Channel, Message, QUEUE_BYTES, QUEUE_DEPTH, ReadError, other};
+use crate::handles::HandleTable;
+use crate::heap::{MAX_BLOCK, MIN_BLOCK, PAGE};
 use origin_abi::{Error, Handle, rights};
 use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;

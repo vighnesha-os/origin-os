@@ -31,7 +31,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
 
-use framekernel::paging::{Access, PAGE};
+use crate::paging::{Access, PAGE};
 use origin_abi::limits::{DEADLINE_INFINITE, MAX_MESSAGE_BYTES};
 use origin_abi::{Error, OK, read_sizes, rights, signals, status_name, syscall as sys};
 
@@ -804,7 +804,7 @@ fn hostile_groups(kernel: u64, foreign: u64) -> Vec<Group> {
 /// Sixteen writes fill a queue; the seventeenth is refused until a read makes room.
 fn full_queue_steps(timed_out: i64, wait_status: i64) -> Vec<Step> {
     let mut steps = alloc::vec![create(26)];
-    for _ in 0..framekernel::channel::QUEUE_DEPTH {
+    for _ in 0..crate::channel::QUEUE_DEPTH {
         steps.push(write("", h(26), MSG, 16, OK));
     }
     steps.push(write(

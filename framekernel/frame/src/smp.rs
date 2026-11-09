@@ -51,7 +51,7 @@ use core::fmt::Write;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 
-use origin_boot_info::{BootInfo, MemoryRegion, RegionKind};
+use origin_boot_info::{MemoryRegion, RegionKind};
 use origin_paging::{Access, PAGE};
 
 use crate::acpi::{self, Processor};
@@ -64,7 +64,7 @@ use crate::topology::CpuTopology;
 use crate::vm;
 
 /// Physical address of the trampoline code; the start-up IPI vector is `TRAMPOLINE >> 12`.
-pub const TRAMPOLINE: u64 = 0x8000;
+pub(crate) const TRAMPOLINE: u64 = 0x8000;
 /// Physical address of the trampoline's data page.
 pub(crate) const TRAMPOLINE_DATA: u64 = 0x9000;
 /// Each AP's kernel stack.
@@ -230,14 +230,19 @@ impl Online {
 
 /// Brings up every enabled AP the MADT lists. Returns the processors online, the boot
 /// processor included.
-pub fn start(
-    com1: &mut dyn Write,
-    info: &BootInfo,
-    regions: &[MemoryRegion],
-    tsc_hz: u64,
-    ap_main: fn(&X2Apic) -> !,
-) -> Online {
+pub fn start(com1: &mut dyn Write, ap_main: fn(&X2Apic) -> !) -> Online {
     let mut online = Online::one();
+    // Read here, never taken from a caller: the delays below are what lets a processor settle
+    // before the data page is rewritten, and the memory map says where the trampoline may go.
+    let (Some(boot), Some(tsc_hz)) = (crate::early::boot_data(), crate::timer::calibrated_tsc_hz())
+    else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: AP start-up needs the boot data and a calibrated TSC: AP start-up failed"
+        );
+        return online;
+    };
+    let (info, regions) = (boot.info(), boot.regions());
     // The timer bring-up switched this APIC to x2APIC mode; without it no AP is started.
     let Some(lapic) = X2Apic::this_cpu() else {
         let _ = writeln!(
@@ -260,7 +265,7 @@ pub fn start(
     if STARTED.swap(true, Ordering::AcqRel) {
         let _ = writeln!(
             com1,
-            "origin-kernel: AP start-up already ran: AP start-up failed"
+            "origin-kernel: AP start-up has run already: nothing started"
         );
         return online;
     }

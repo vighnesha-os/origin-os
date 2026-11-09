@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::ptr;
 
-use framekernel::paging::{Access, PAGE};
+use crate::paging::{Access, PAGE};
 use origin_abi::{Error, status_name};
 
 use crate::console::Console;

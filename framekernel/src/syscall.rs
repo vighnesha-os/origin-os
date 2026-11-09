@@ -20,7 +20,7 @@
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use framekernel::usercopy::UserAccess;
+use crate::usercopy::UserAccess;
 use origin_abi::limits::{MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES};
 use origin_abi::{Error, Handle, OK, read_sizes, signals, syscall as number};
 use origin_frame::trap::SyscallOutcome;

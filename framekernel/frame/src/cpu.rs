@@ -195,6 +195,16 @@ pub unsafe fn init() {
     assign(CpuIndex::BOOT, cpuid_apic_id());
     // SAFETY: `BSP_TABLES` is used only by the boot processor, and only from here on.
     unsafe { load_tables(&raw mut BSP_TABLES, CpuIndex::BOOT) };
+    TABLES_READY.store(true, Ordering::Release);
+}
+
+/// Set when [`init`] has loaded the kernel's IDT: until then every vector would go to the
+/// firmware's, so nothing that can let an interrupt in runs.
+static TABLES_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the kernel's own IDT is loaded.
+pub fn tables_ready() -> bool {
+    TABLES_READY.load(Ordering::Acquire)
 }
 
 /// Loads an application processor's own GDT and TSS from `tables`, and the shared IDT, and
@@ -846,14 +856,18 @@ pub fn thread_block(ticks: u64) {
 /// Halts with interrupts enabled until the next interrupt, then returns with interrupts enabled.
 /// The idle context of a processor.
 pub fn idle() {
-    // SAFETY: CPL 0; every vector that can arrive has a gate.
-    unsafe { asm!("sti", "hlt", options(nostack)) };
+    if tables_ready() {
+        // SAFETY: CPL 0; every vector that can arrive has a gate (`tables_ready`).
+        unsafe { asm!("sti", "hlt", options(nostack)) };
+    }
 }
 
 /// As [`idle`], returning with interrupts disabled again.
 pub fn idle_disabling() {
-    // SAFETY: as for `idle`; CLI after the halt.
-    unsafe { asm!("sti", "hlt", "cli", options(nostack)) };
+    if tables_ready() {
+        // SAFETY: as for `idle`; CLI after the halt.
+        unsafe { asm!("sti", "hlt", "cli", options(nostack)) };
+    }
 }
 
 /// Loads `values` into XMM0, XMM3, XMM7 and XMM15 (the SIMD state the boot proof checks).
@@ -898,9 +912,11 @@ pub fn ticks() -> u64 {
 
 /// Executes `int3`; the breakpoint handler reports it and returns here.
 pub fn breakpoint() {
-    // SAFETY: `int3` raises #BP, whose gate `init` installed; the handler returns with
-    // `iretq` to the instruction after `int3`, preserving every register.
-    unsafe { asm!("int3") };
+    if tables_ready() {
+        // SAFETY: `int3` raises #BP, whose gate `init` installed (`tables_ready`); the handler
+        // returns with `iretq` to the instruction after `int3`, preserving every register.
+        unsafe { asm!("int3") };
+    }
 }
 
 /// Called by [`exception_common`] with the saved frame.
@@ -1438,11 +1454,12 @@ pub fn rdtsc() -> u64 {
 /// come (a missing EOI blocks every later one at the same priority), so the caller could
 /// never check its own deadline.
 pub fn interrupt_window() {
-    // SAFETY: CPL 0. Interrupts are recognized after the instruction that follows STI, so
-    // a pending one is taken after the NOP and before CLI. Every vector that can arrive has
-    // a gate (the timer, the spurious vector and the exceptions), and the 8259 PICs are
-    // masked.
-    unsafe { asm!("sti", "nop", "cli", options(nostack)) };
+    if tables_ready() {
+        // SAFETY: CPL 0. Interrupts are recognized after the instruction that follows STI, so
+        // a pending one is taken after the NOP and before CLI. Every vector that can arrive
+        // has a gate (`tables_ready`: the timer, the spurious vector and the exceptions).
+        unsafe { asm!("sti", "nop", "cli", options(nostack)) };
+    }
 }
 
 /// IA32_EFER.
@@ -1625,9 +1642,11 @@ pub fn probe_user_copy_fault(buffer: &mut [u8; 16]) -> bool {
 
 /// Turns interrupts on for a system call, which runs on its own thread's stack.
 pub fn enable_interrupts() {
-    // SAFETY: CPL 0; every vector that can arrive has a gate, and the caller holds no lock
-    // that an interrupt handler on this processor may take.
-    unsafe { asm!("sti", options(nostack)) };
+    if tables_ready() {
+        // SAFETY: CPL 0; every vector that can arrive has a gate (`tables_ready`). A lock held
+        // across this is a deadlock of the caller's, not a memory-safety matter.
+        unsafe { asm!("sti", options(nostack)) };
+    }
 }
 
 /// Turns interrupts off on the way back out of a system call.

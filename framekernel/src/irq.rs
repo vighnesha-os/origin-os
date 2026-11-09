@@ -21,9 +21,9 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use framekernel::acpi::{self, IoApic, SourceOverride};
-use framekernel::ioapic::{self, RemappableEntry};
-use framekernel::vtd::{Irte, SourceCheck};
+use crate::acpi::{self, IoApic, SourceOverride};
+use crate::ioapic::{self, RemappableEntry};
+use crate::vtd::{Irte, SourceCheck};
 use origin_frame::addr::PhysAddr;
 use origin_frame::irq::{self as vectors, Action};
 use origin_frame::mmio::MmioRegion;

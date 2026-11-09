@@ -32,10 +32,10 @@ use core::fmt::{self, Write};
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use framekernel::acpi::{self, IoApic};
-use framekernel::hpet;
-pub(crate) use framekernel::pci::Device;
-use framekernel::pci::{self, Address, Bar, BarKind, ConfigSpace, Ecam, Function};
+use crate::acpi::{self, IoApic};
+use crate::hpet;
+pub(crate) use crate::pci::Device;
+use crate::pci::{self, Address, Bar, BarKind, ConfigSpace, Ecam, Function};
 use origin_boot_info::{MemoryRegion, RegionKind};
 use origin_frame::addr::PhysAddr;
 use origin_frame::mmio::MmioRegion;

@@ -6,16 +6,17 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-# Boot-info validation, the memory summary, the UART driver and the console text: the
-# logic that is unit-tested on the build host.
+# The kernel above the framework: the logic that is unit-tested on the build host, and, for
+# x86_64-unknown-none only, the boot flow and the services. `forbid(unsafe_code)` at its root.
 [lib]
 path = "src/lib.rs"
 
-# The kernel image. Build it only for x86_64-unknown-none; `build.rs` adds the link
-# arguments that give it the ELF shape `onbf-pack` accepts.
+# The kernel image: its link root, which holds `_start` and so sits in the framework's directory
+# (ADR-0011 N6). Build it only for x86_64-unknown-none; `build.rs` adds the link arguments that
+# give it the ELF shape `onbf-pack` accepts.
 [[bin]]
 name = "framekernel"
-path = "src/main.rs"
+path = "frame/entry/main.rs"
 test = false
 bench = false
 
