@@ -21,12 +21,23 @@
 //!
 //! The page-table memory of a space is freed only with the space, and no page is freed while
 //! `state` could still lead to it, so a walk of the tables never reaches freed memory.
+//!
+//! An unmap edits the tables under `state`, then shoots down the processors that have this
+//! space loaded, then releases the frames: a frame leaves its old owner only once no TLB can
+//! lead to it (`Shootdown::retire`). If a processor does not answer, the frames are leaked, and
+//! the caller is told.
+//!
+//! A map adds a translation that was not present, which no TLB can hold: it needs no shootdown.
+//! Every other change does, and each reports what it cost ([`Change`]), so the layer above can
+//! charge for it or limit it (a program that maps and unmaps in a loop interrupts every other
+//! processor its threads run on, each time).
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use origin_abi::Error;
 use origin_paging::{Access, AddressSpace, MapError, PAGE, Table, TableMemory, Translation};
+use origin_sync::shootdown::{Completed, Request, Stalled};
 use origin_sync::{SpinGuard, SpinLock};
 
 use crate::addr::PhysAddr;
@@ -89,11 +100,59 @@ impl UserFrame {
     }
 }
 
+/// The most pages one round of a change handles: how long it holds `state` with interrupts off,
+/// and how many pages a shootdown covers at most.
+const CHUNK: usize = 128;
+
 /// One mapped page, and the frame it maps.
 #[derive(Debug)]
 struct Mapping {
     virt: u64,
     frame: OwnedFrame,
+}
+
+/// What a change to a space cost, for whoever pays for it (N14 step 3, S3-5b): each shootdown
+/// interrupted `interrupts` processors, between them, while they ran.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Change {
+    /// The pages it removed or changed.
+    pub pages: u64,
+    /// The TLB shootdowns it took (one per [`CHUNK`] pages at most).
+    pub shootdowns: u32,
+    /// The interrupts those sent to other processors.
+    pub interrupts: u32,
+}
+
+impl Change {
+    fn add(&mut self, done: Completed) {
+        self.shootdowns += 1;
+        self.interrupts += done.processors;
+    }
+}
+
+/// Why a change to a space failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeError {
+    /// The tables refused it, or it asked for addresses this space cannot map.
+    Map(MapError),
+    /// A processor did not answer within the shootdown's patience, so it may still hold a
+    /// translation. The change is made; frames already taken out are leaked, not reused.
+    Stalled {
+        /// The processor.
+        cpu: usize,
+    },
+}
+
+impl From<MapError> for ChangeError {
+    fn from(e: MapError) -> Self {
+        Self::Map(e)
+    }
+}
+
+impl From<Stalled> for ChangeError {
+    fn from(stalled: Stalled) -> Self {
+        Self::Stalled { cpu: stalled.cpu }
+    }
 }
 
 /// What `state` holds.
@@ -103,6 +162,9 @@ struct State {
     /// What this space maps, by ascending address: each entry is a present user leaf, and each
     /// present user leaf has an entry.
     mapped: Vec<Mapping>,
+    /// Empty, and with room for everything in `mapped`: what an unmap moves its records into,
+    /// so that giving memory back never needs memory.
+    spare: Vec<Mapping>,
 }
 
 impl State {
@@ -115,6 +177,7 @@ impl State {
             space,
             tables,
             mapped: Vec::new(),
+            spare: Vec::new(),
         })
     }
 
@@ -138,7 +201,8 @@ impl State {
         frame: OwnedFrame,
         access: Access,
     ) -> Result<(), (MapError, OwnedFrame)> {
-        if self.mapped.try_reserve(1).is_err() {
+        let needed = self.mapped.len() + 1;
+        if self.mapped.try_reserve(1).is_err() || self.spare.try_reserve(needed).is_err() {
             return Err((MapError::OutOfMemory, frame));
         }
         let at = self.position(virt);
@@ -151,6 +215,55 @@ impl State {
         self.mapped.insert(at, Mapping { virt, frame });
         Ok(())
     }
+
+    /// Takes the next [`CHUNK`] pages of `[start, end)` out of the tables and out of the records:
+    /// what it took, the translations that can still lead to it and where the next round
+    /// starts, or `None` if there is nothing left to take. The frames stay allocated, and the
+    /// caller gives them back only after a shootdown (`Shootdown::retire`).
+    fn retire(&mut self, start: u64, end: u64) -> Result<Option<Retired>, MapError> {
+        let lo = self.position(start);
+        let hi = self.position(end).min(lo + CHUNK);
+        if lo == hi {
+            return Ok(None);
+        }
+        let count = hi - lo;
+        if self.spare.capacity() < count {
+            // Only after a stalled shootdown has lost the spare vector: an unmap normally has
+            // the room it needs from the map that made the record.
+            self.spare
+                .try_reserve(count)
+                .map_err(|_| MapError::OutOfMemory)?;
+        }
+        let mut cleared = lo;
+        let (mut first, mut last) = (u64::MAX, 0);
+        for mapping in self.mapped.get(lo..hi).unwrap_or(&[]) {
+            if self.space.unmap(&mut self.tables, mapping.virt).is_err() {
+                break;
+            }
+            first = first.min(mapping.virt);
+            last = last.max(mapping.virt);
+            cleared += 1;
+        }
+        if cleared == lo {
+            return Err(MapError::UnknownTable(start));
+        }
+        let mut retired = core::mem::take(&mut self.spare);
+        retired.extend(self.mapped.drain(lo..cleared));
+        Ok(Some(Retired {
+            mappings: retired,
+            request: Request::covering(first, last),
+            next: last + PAGE,
+        }))
+    }
+}
+
+/// What one round of an unmap took out of the tables (`State::retire`).
+struct Retired {
+    mappings: Vec<Mapping>,
+    /// The translations that can still lead to it.
+    request: Request,
+    /// Where the next round starts.
+    next: u64,
 }
 
 /// One user address space: its own lower half and the kernel's half.
@@ -168,6 +281,21 @@ impl core::fmt::Debug for UserSpace {
             .field("root", &self.root)
             .finish_non_exhaustive()
     }
+}
+
+/// The end of the `pages` pages from `virt`, if they are whole pages of the user half.
+fn user_range_end(virt: u64, pages: u64) -> Result<u64, MapError> {
+    if !virt.is_multiple_of(PAGE) {
+        return Err(MapError::Misaligned(virt));
+    }
+    if !usercopy::is_user_address(virt) {
+        return Err(MapError::NonCanonical(virt));
+    }
+    pages
+        .checked_mul(PAGE)
+        .and_then(|bytes| virt.checked_add(bytes))
+        .filter(|&end| end <= usercopy::USER_END)
+        .ok_or(MapError::Overflow)
 }
 
 /// A fresh zeroed frame, or `None`.
@@ -278,6 +406,43 @@ impl UserSpace {
                 Err(e)
             }
         }
+    }
+
+    /// Removes every mapping in the `pages` pages from `virt`, and gives back their frames.
+    /// When it returns, no processor can reach them through this space, and a frame this
+    /// space alone mapped is free. Pages not mapped are left alone. Safe with this space's
+    /// threads running: one that touches a page after its translation is gone takes a fault.
+    ///
+    /// Must not be called holding a lock another processor may wait for with interrupts off.
+    pub fn unmap(&self, virt: u64, pages: u64) -> Result<Change, ChangeError> {
+        let end = user_range_end(virt, pages)?;
+        let _turn = self.edit();
+        let mut change = Change::default();
+        let mut cursor = virt;
+        while let Some(retired) = self.with_state(|s| s.retire(cursor, end))? {
+            let Retired {
+                mappings,
+                request,
+                next,
+            } = retired;
+            cursor = next;
+            change.pages += mappings.len() as u64;
+            let done =
+                crate::tlb::retire_in_space(self.root, request, mappings, |mut mappings| {
+                    for mapping in mappings.drain(..) {
+                        let _ = memory::free_frame(mapping.frame);
+                    }
+                    self.with_state(|s| s.spare = mappings);
+                })?;
+            change.add(done);
+        }
+        Ok(change)
+    }
+
+    /// How many processors have this space loaded: what the next change would interrupt, so
+    /// that a caller can price it before making it.
+    pub fn processors_loaded(&self) -> u32 {
+        crate::tlb::processors_holding(self.root)
     }
 
     /// Copies `bytes` into the frame `frame` of this space, at `offset`, with volatile

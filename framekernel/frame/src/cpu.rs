@@ -968,7 +968,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     }
     // Another processor changed a kernel mapping: invalidate it here, then acknowledge.
     if frame.vector == u64::from(crate::tlb::SHOOTDOWN_VECTOR) {
-        crate::tlb::service();
+        crate::tlb::interrupted();
         // SAFETY: as for the timer: x2APIC mode is on (only processors with an active
         // scheduler are sent this vector), and the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };

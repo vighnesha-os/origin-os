@@ -127,10 +127,45 @@ pub(crate) fn root_loaded(root: u64) -> bool {
     SHOOTDOWN.processors_holding(root) != 0
 }
 
-/// Serves the request in progress, if this processor has not yet. Runs in the shootdown
-/// interrupt.
+/// Serves the request in progress, if this processor has not yet: for a loop that may be
+/// holding up the processor that made it.
 pub fn service() {
     SHOOTDOWN.service(&Hardware);
+}
+
+/// How many shootdown interrupts each processor has taken.
+static INTERRUPTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// The shootdown interrupt.
+pub(crate) fn interrupted() {
+    if let Some(taken) = INTERRUPTS.get(this_cpu()) {
+        taken.fetch_add(1, Ordering::Relaxed);
+    }
+    service();
+}
+
+/// How many shootdown interrupts processor `cpu` has taken: for the proof that a request for
+/// one address space leaves the processors outside it alone.
+pub fn interrupts_taken(cpu: CpuIndex) -> u64 {
+    INTERRUPTS
+        .get(cpu.get())
+        .map_or(0, |taken| taken.load(Ordering::Relaxed))
+}
+
+/// The deferred free of a user mapping: `value` is what the caller took out of `root`'s page
+/// tables, and `release` gets it back once no processor can reach it (`Shootdown::retire`).
+pub(crate) fn retire_in_space<T>(
+    root: u64,
+    request: Request,
+    value: T,
+    release: impl FnOnce(T),
+) -> Result<Completed, Stalled> {
+    SHOOTDOWN.retire(&Hardware, value, request, Scope::Space(root), release)
+}
+
+/// How many processors have the address space `root` loaded now.
+pub(crate) fn processors_holding(root: u64) -> u32 {
+    SHOOTDOWN.processors_holding(root)
 }
 
 /// The result of a kernel request. A processor that never answers is left holding a
