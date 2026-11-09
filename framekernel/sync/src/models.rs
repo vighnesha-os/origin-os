@@ -8,8 +8,9 @@
 //! # What is the real code, and what is a copy of it
 //!
 //! Real, and compiled in unchanged: the two locks with their orderings (`lib.rs`), `crate::wait`
-//! (the protocol `framekernel/src/wait.rs` instantiates) and the run queue
-//! (`framekernel/src/runqueue.rs`). What differs under `--cfg loom` is `prim` in `lib.rs`, which
+//! (the protocol `framekernel/src/wait.rs` instantiates), the run queue
+//! (`framekernel/src/runqueue.rs`) and the monotonic clock's floor (`floor.rs`, which
+//! `framekernel/src/time.rs` reads through). What differs under `--cfg loom` is `prim` in `lib.rs`, which
 //! swaps `core`'s atomics, cell and spin hint for Loom's, and that the constructors are not
 //! `const`.
 //!
@@ -60,6 +61,14 @@
 //!   waiter's wake-up; and a thread that cannot register (a full queue, or the boot flow) still
 //!   sees the condition by polling. A timed wait on the boot flow polls, never blocks or registers,
 //!   and ends with the condition or at the deadline.
+//! - The clock's floor: the readings are constants that disagree, so a processor whose counter is
+//!   behind reads the floor. A call that happens after another (through the release/acquire
+//!   handoff a caller supplies, here standing for a lock or a wake-up) returns at least as much,
+//!   also along a chain of processors, and each thread's own results never go down. Racing
+//!   readers lose no update: the floor ends at the largest reading. The floor's own `Relaxed`
+//!   orderings are enough for all of this. What carries the ordering between the two calls is the
+//!   caller's handoff; a negative control weakens the handoff to `Relaxed` and the model then sees
+//!   a stale floor taken at face value.
 //!
 //! # What is not proved
 //!
@@ -98,7 +107,9 @@
 //! Nothing that orders memory where the real code does not: the models' own counters, tokens
 //! and clock are `Relaxed`. `Notify`, the stand-in for what restarts a halted processor,
 //! does synchronize, but the resumed thread goes on to take the run queue's lock, which carries
-//! the ordering the real resumption gets from that lock anyway.
+//! the ordering the real resumption gets from that lock anyway. The floor's models hand a value
+//! over with release and acquire, because that handoff is the caller's ordering, which the
+//! property is about.
 //!
 //! # Bounds
 //!
@@ -119,6 +130,7 @@ use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use loom::sync::{Arc, Notify};
 use loom::thread::{self, JoinHandle};
 
+use crate::floor::MonotonicFloor;
 use crate::runqueue::RunQueue;
 use crate::wait::{Scheduler, TimedOut, WaitQueue};
 use crate::{RwLock, SpinLock};
@@ -1225,5 +1237,141 @@ fn wait_queue_timed_stale_wake_up_is_harmless() {
         preempted(3, SPINS),
         preempted(4, SPINS),
         || stale_wake_up(Wait::Timed),
+    );
+}
+
+// ---------------------------------------------------------------- The clock's floor
+
+/// Two processors whose counters disagree. One reads 7, then 100, hands over (a lock or a
+/// wake-up in the kernel, a release/acquire pair here) and reads 110; the other is far behind
+/// and reads 5, then 120. A read after the handoff is given at least what the handoff carried,
+/// and neither thread's own results go down. The first reader's 7 exists so that there is an
+/// older value of the floor to be stale with: a stale floor at or above a reading is taken at
+/// face value, with no compare-exchange to correct it.
+#[test]
+fn floor_handoff_between_two_processors() {
+    check(
+        "floor_handoff_between_two_processors",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let floor = Arc::new(MonotonicFloor::new());
+            let handed = Arc::new(AtomicU64::new(0));
+            let ahead = {
+                let (floor, handed) = (Arc::clone(&floor), Arc::clone(&handed));
+                thread::spawn(move || {
+                    let older = floor.advance(7);
+                    let first = floor.advance(100);
+                    assert!(
+                        first >= older,
+                        "the clock went backwards: {first} after {older}"
+                    );
+                    handed.store(first + 1, Release);
+                    let second = floor.advance(110);
+                    assert!(
+                        second >= first,
+                        "the clock went backwards: {second} after {first}"
+                    );
+                })
+            };
+            let seen = handed.load(Acquire);
+            let behind = floor.advance(5);
+            if seen != 0 {
+                let given = seen - 1;
+                assert!(
+                    behind >= given,
+                    "the clock went backwards across a handoff: {behind} after {given}"
+                );
+            }
+            let later = floor.advance(120);
+            assert!(
+                later >= behind,
+                "the clock went backwards: {later} after {behind}"
+            );
+            ahead.join().unwrap();
+            let last = floor.advance(1);
+            assert!(
+                last >= later,
+                "the clock went backwards: {last} after {later}"
+            );
+        },
+    );
+}
+
+/// The same across a chain of three processors, each further behind than the last: what one
+/// was given binds the next, and so the one after that.
+#[test]
+fn floor_handoff_chain() {
+    check(
+        "floor_handoff_chain",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let floor = Arc::new(MonotonicFloor::new());
+            let first_to_second = Arc::new(AtomicU64::new(0));
+            let second_to_third = Arc::new(AtomicU64::new(0));
+            let first = {
+                let (floor, handed) = (Arc::clone(&floor), Arc::clone(&first_to_second));
+                thread::spawn(move || {
+                    let got = floor.advance(100);
+                    handed.store(got + 1, Release);
+                })
+            };
+            let second = {
+                let (floor, seen, handed) = (
+                    Arc::clone(&floor),
+                    Arc::clone(&first_to_second),
+                    Arc::clone(&second_to_third),
+                );
+                thread::spawn(move || {
+                    let seen = seen.load(Acquire);
+                    let got = floor.advance(50);
+                    if seen != 0 {
+                        assert!(got >= seen - 1, "the clock went backwards across a handoff");
+                    }
+                    handed.store(got + 1, Release);
+                })
+            };
+            let seen = second_to_third.load(Acquire);
+            let got = floor.advance(10);
+            if seen != 0 {
+                assert!(got >= seen - 1, "the clock went backwards across a handoff");
+            }
+            first.join().unwrap();
+            second.join().unwrap();
+        },
+    );
+}
+
+/// Readers racing with readings 3, 1 and 2: no update is lost and each is given at least what
+/// it read.
+#[test]
+fn floor_racing_readers_end_at_the_largest_reading() {
+    check(
+        "floor_racing_readers_end_at_the_largest_reading",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let floor = Arc::new(MonotonicFloor::new());
+            let readers: Vec<_> = [3u64, 1]
+                .into_iter()
+                .map(|reading| {
+                    let floor = Arc::clone(&floor);
+                    thread::spawn(move || {
+                        let got = floor.advance(reading);
+                        assert!(
+                            got >= reading,
+                            "the clock went backwards: {got} after reading {reading}"
+                        );
+                    })
+                })
+                .collect();
+            let got = floor.advance(2);
+            assert!(got >= 2, "the clock went backwards: {got} after reading 2");
+            for reader in readers {
+                reader.join().unwrap();
+            }
+            assert_eq!(floor.advance(0), 3, "the floor is the largest reading");
+        },
     );
 }

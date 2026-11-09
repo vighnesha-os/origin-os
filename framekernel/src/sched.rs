@@ -1320,6 +1320,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
     ok &= prove_spawn_refused(com1, bsp, tsc_hz);
     ok &= crate::user::prove(com1, bsp, tsc_hz);
     ok &= crate::time::prove_consistent(com1, cpus, bsp, tsc_hz);
+    ok &= crate::time::prove_monotonic(com1, cpus, bsp, tsc_hz);
     ok &= crate::console::prove(com1, cpus, bsp, tsc_hz);
     ok &= crate::tlb::prove(com1, cpus, bsp, tsc_hz);
     ok &= crate::wait::prove(com1, cpus, bsp, tsc_hz);

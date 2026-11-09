@@ -890,6 +890,10 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: processes: PML4 ".into(),
             "at once and read back 0x400800 from 0x500000 (own values only: 0x400800); not mapped in the kernel's tables: true".into(),
             format!("origin-kernel: clock: TSC consistent across {cpus} processors: "),
+            // ADR-0012: no caller is ever given less than before, on any processor; and what a
+            // read costs, measured (CLAUDE.md rule 21).
+            format!("origin-kernel: clock: monotonic across {cpus} processors: "),
+            "origin-kernel: clock: reading it costs ".into(),
             // Every CPU printed its lines at once; `console_lines_intact` checks each one.
             format!(
                 "origin-kernel: console: {cpus} processors printed {CONSOLE_LINES} lines each at once"

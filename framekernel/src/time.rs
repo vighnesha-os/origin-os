@@ -21,12 +21,16 @@
 //!
 //! [`prove_consistent`] then checks, on every online processor at once, that ordered TSC
 //! readings never go backwards from one processor to the next (cross-CPU time
-//! consistency): the monotonic clock is only monotonic across processors if their TSCs
-//! agree.
+//! consistency). Nothing depends on that being true, because neither Intel nor AMD promises
+//! it: every reading of the monotonic clock passes through a floor shared by all processors
+//! ([`MonotonicFloor`], ADR-0012), so no caller on any processor can be given less than a
+//! caller has been given before, whatever the TSCs do. [`prove_monotonic`] proves that, and
+//! shows on a counter skewed on purpose that a clock without a floor steps back.
 //!
 //! The TSC is the clock source on every supported platform, whose TSCs are invariant
 //! (CPUID 8000_0007h EDX bit 8: constant rate in every P-, C- and T-state). Without that
-//! bit (QEMU's TCG does not report it) the clock still runs, and the boot report says so.
+//! bit (QEMU's TCG does not report it) the clock still runs and still never steps back, but
+//! its rate is only what the boot measured, and the boot report says so.
 
 use core::arch::asm;
 use core::fmt::Write;
@@ -37,6 +41,7 @@ use framekernel::clock::{self, NANOS_PER_SECOND, Scale, SharedScale};
 use framekernel::hpet;
 use framekernel::rtc::{self, DateTime, Registers, SecondMeasurement, SecondVerdict, register};
 use origin_sync::SpinLock;
+use origin_sync::floor::MonotonicFloor;
 
 use crate::console::Console;
 use crate::cpu::{self, rdtsc};
@@ -46,6 +51,8 @@ use crate::{inb, outb};
 static ENTRY_TSC: AtomicU64 = AtomicU64::new(0);
 /// TSC ticks to nanoseconds, once [`init`] has chosen the rate.
 static SCALE: SharedScale = SharedScale::new();
+/// The latest time any caller has been given, on any processor (ADR-0012).
+static FLOOR: MonotonicFloor = MonotonicFloor::new();
 /// Unix time in nanoseconds at monotonic zero; 0 while unknown.
 static BOOT_WALL: AtomicU64 = AtomicU64::new(0);
 
@@ -60,11 +67,21 @@ pub(crate) fn entry_tsc() -> u64 {
 }
 
 /// Nanoseconds since kernel entry; 0 until [`init`] has chosen the TSC rate.
+///
+/// Never less than any value this function has returned earlier, on any processor, whatever
+/// the processors' TSCs say (ADR-0012). Two calls can return the same value. Safe in any
+/// context, interrupt and NMI handlers included.
 pub(crate) fn monotonic_nanos() -> u64 {
-    let Some(scale) = SCALE.get() else {
-        return 0;
-    };
-    scale.nanos(rdtsc().saturating_sub(ENTRY_TSC.load(Ordering::Relaxed)))
+    monotonic_reading().map_or(0, |(_, given)| given)
+}
+
+/// What this processor's TSC says in nanoseconds since kernel entry, and what the clock gives
+/// out for that: the same, or the floor if the floor is above it. `None` before [`init`].
+#[inline]
+fn monotonic_reading() -> Option<(u64, u64)> {
+    let scale = SCALE.get()?;
+    let counted = scale.nanos(rdtsc().saturating_sub(ENTRY_TSC.load(Ordering::Relaxed)));
+    Some((counted, FLOOR.advance(counted)))
 }
 
 /// The chosen TSC rate in Hz (1 before the clock is set up), for spin-wait budgets.
@@ -271,6 +288,12 @@ pub(crate) fn init(com1: &mut Console, calibrated_hz: u64, rsdp: u64) -> bool {
         calibrated_hz / 1000,
         Khz(cpuid_hz)
     );
+    if !invariant_tsc() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: clock: this processor does not report an invariant TSC (CPUID 8000_0007h EDX bit 8): the monotonic clock still never steps back, but its rate is only what this boot measured"
+        );
+    }
     // The proof that the calibration is right: an independent oscillator agrees with it.
     match second {
         Some(second) => {
@@ -564,6 +587,8 @@ static WORST: AtomicU64 = AtomicU64::new(0);
 /// Readings taken right after another processor's.
 static HANDOFFS: AtomicU64 = AtomicU64::new(0);
 static READINGS: AtomicU64 = AtomicU64::new(0);
+/// Readings a floor gave back higher than they were read.
+static HELD: AtomicU64 = AtomicU64::new(0);
 /// Turn-takers on the application processors that are ready, and that have finished.
 static READY: AtomicU64 = AtomicU64::new(0);
 static DONE: AtomicU64 = AtomicU64::new(0);
@@ -571,9 +596,63 @@ static DONE: AtomicU64 = AtomicU64::new(0);
 static UNTIL: AtomicU64 = AtomicU64::new(0);
 /// The TSC value at which they stop whatever else has happened.
 static LATEST: AtomicU64 = AtomicU64::new(0);
+/// How many handoffs a run keeps going for, up to [`LATEST`].
+static WANTED_HANDOFFS: AtomicU64 = AtomicU64::new(0);
 /// Handoffs needed for the check to mean anything: the processors must really have
 /// interleaved.
 const MIN_HANDOFFS: u64 = 100;
+/// Handoffs a control run keeps going for: it only has to see the skewed counters disagree.
+const CONTROL_HANDOFFS: u64 = 16;
+/// The floor the control runs use, so that their skew never reaches the real clock's.
+static CONTROL_FLOOR: MonotonicFloor = MonotonicFloor::new();
+
+/// What the processors read and compare in one run of turns (`repr(u64)`: a turn-taker
+/// thread gets it as its argument).
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+enum Reading {
+    /// Ordered TSC readings: do the counters themselves agree?
+    Tsc,
+    /// The monotonic clock: does what callers are given ever go back?
+    Clock,
+    /// The control: each processor's ordered TSC, skewed by a second of ticks per processor
+    /// index, with no floor. It must step back, or the proof cannot see what it looks for.
+    Skewed,
+    /// The same skewed counters through [`CONTROL_FLOOR`]. It must never step back.
+    SkewedThroughFloor,
+}
+
+impl Reading {
+    /// The reading a turn-taker's argument names.
+    fn of(argument: u64) -> Self {
+        match argument {
+            0 => Self::Tsc,
+            1 => Self::Clock,
+            2 => Self::Skewed,
+            _ => Self::SkewedThroughFloor,
+        }
+    }
+
+    /// What processor `me` reads at TSC `now`. Counts in [`HELD`] a reading a floor raised.
+    fn value(self, now: u64, me: u64) -> u64 {
+        let skewed = || now.wrapping_add(me.wrapping_mul(tsc_hz()));
+        let through = |counted: u64, given: u64| {
+            HELD.fetch_add(u64::from(given > counted), Ordering::Relaxed);
+            given
+        };
+        match self {
+            Self::Tsc => now,
+            Self::Clock => {
+                monotonic_reading().map_or(0, |(counted, given)| through(counted, given))
+            }
+            Self::Skewed => skewed(),
+            Self::SkewedThroughFloor => {
+                let counted = skewed();
+                through(counted, CONTROL_FLOOR.advance(counted))
+            }
+        }
+    }
+}
 
 /// The TSC, read only once every earlier instruction has executed, so a reading cannot be
 /// taken before the lock that orders it is held: RDTSCP (Intel SDM Vol. 2B, RDTSCP; AMD
@@ -595,11 +674,11 @@ fn ordered_tsc(rdtscp: bool) -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
 
-/// Takes ordered TSC readings under [`TURN`]'s lock until [`UNTIL`], comparing each with
-/// the reading before it, whichever processor took that one. While fewer than
-/// `min_handoffs` handoffs have happened it keeps going, to [`LATEST`] at most: on a loaded
-/// host the virtual CPUs rarely run at the same moment.
-fn take_turns(me: u64, min_handoffs: u64) {
+/// Reads `reading` under [`TURN`]'s lock until [`UNTIL`], comparing each value with the one
+/// before it, whichever processor took that one. While fewer than `min_handoffs` handoffs have
+/// happened it keeps going, to [`LATEST`] at most: on a loaded host the virtual CPUs rarely
+/// run at the same moment.
+fn take_turns(me: u64, min_handoffs: u64, reading: Reading) {
     let rdtscp = rdtscp_supported();
     let until = UNTIL.load(Ordering::Acquire);
     let latest = LATEST.load(Ordering::Relaxed);
@@ -607,16 +686,17 @@ fn take_turns(me: u64, min_handoffs: u64) {
         let finished = cpu::without_interrupts(|| {
             let mut turn = TURN.lock();
             let now = ordered_tsc(rdtscp);
+            let value = reading.value(now, me);
             let (last, by) = *turn;
-            if now < last {
+            if value < last {
                 BACKWARDS.fetch_add(1, Ordering::Relaxed);
-                WORST.fetch_max(last - now, Ordering::Relaxed);
+                WORST.fetch_max(last - value, Ordering::Relaxed);
             }
             if by != me && by != u64::MAX {
                 HANDOFFS.fetch_add(1, Ordering::Relaxed);
             }
             READINGS.fetch_add(1, Ordering::Relaxed);
-            *turn = (now, me);
+            *turn = (value, me);
             now >= until && (HANDOFFS.load(Ordering::Relaxed) >= min_handoffs || now >= latest)
         });
         if finished {
@@ -629,15 +709,91 @@ fn take_turns(me: u64, min_handoffs: u64) {
     }
 }
 
-/// An application processor's turn-taker thread.
-extern "sysv64" fn turn_taker(_: u64) -> ! {
+/// An application processor's turn-taker thread; its argument names what to read.
+extern "sysv64" fn turn_taker(reading: u64) -> ! {
     READY.fetch_add(1, Ordering::AcqRel);
     while UNTIL.load(Ordering::Acquire) == 0 {
         core::hint::spin_loop();
     }
-    take_turns(cpu::this_cpu().get() as u64, MIN_HANDOFFS);
+    take_turns(
+        cpu::this_cpu().get() as u64,
+        WANTED_HANDOFFS.load(Ordering::Relaxed),
+        Reading::of(reading),
+    );
     DONE.fetch_add(1, Ordering::AcqRel);
     crate::sched::exit()
+}
+
+/// What one run of turns saw.
+struct Turns {
+    readings: u64,
+    handoffs: u64,
+    backwards: u64,
+    worst: u64,
+    held: u64,
+    /// Every turn-taker finished.
+    done: bool,
+}
+
+/// One run of turns with every online processor reading `reading`, for `window` ticks and on
+/// to 500 ms until `wanted` handoffs have happened. `None`, reported, if the turn-takers cannot
+/// be started. Runs from the boot flow with every scheduler active, after any earlier run has
+/// finished: nothing else reads or writes this state.
+fn run_turns(
+    com1: &mut Console,
+    cpus: &[cpu::CpuIndex],
+    bsp: cpu::CpuIndex,
+    tsc_hz: u64,
+    reading: Reading,
+    window: u64,
+    wanted: u64,
+) -> Option<Turns> {
+    *TURN.lock() = (0, u64::MAX);
+    for counter in [
+        &BACKWARDS, &WORST, &HANDOFFS, &READINGS, &HELD, &READY, &DONE, &UNTIL,
+    ] {
+        counter.store(0, Ordering::Release);
+    }
+    WANTED_HANDOFFS.store(wanted, Ordering::Relaxed);
+    let mut aps = 0u64;
+    for &id in cpus.iter().filter(|&&id| id != bsp) {
+        if crate::sched::spawn(id, turn_taker, reading as u64).is_err() {
+            // Release any that did start: they would otherwise spin for the whole boot.
+            UNTIL.store(1, Ordering::Release);
+            let _ = writeln!(
+                com1,
+                "origin-kernel: clock: cannot spawn on CPU {id}: clock failed"
+            );
+            return None;
+        }
+        aps += 1;
+    }
+    crate::sched::yield_until(|| READY.load(Ordering::Acquire) == aps, tsc_hz, 2);
+    if READY.load(Ordering::Acquire) != aps {
+        UNTIL.store(1, Ordering::Release);
+        let _ = writeln!(
+            com1,
+            "origin-kernel: clock: turn-takers did not start: clock failed"
+        );
+        return None;
+    }
+    let start = rdtsc();
+    LATEST.store(start.saturating_add(tsc_hz / 2), Ordering::Relaxed);
+    UNTIL.store(start.saturating_add(window), Ordering::Release);
+    take_turns(
+        bsp.get() as u64,
+        if cpus.len() < 2 { 0 } else { wanted },
+        reading,
+    );
+    crate::sched::yield_until(|| DONE.load(Ordering::Acquire) == aps, tsc_hz, 2);
+    Some(Turns {
+        readings: READINGS.load(Ordering::Relaxed),
+        handoffs: HANDOFFS.load(Ordering::Relaxed),
+        backwards: BACKWARDS.load(Ordering::Relaxed),
+        worst: WORST.load(Ordering::Relaxed),
+        held: HELD.load(Ordering::Relaxed),
+        done: DONE.load(Ordering::Acquire) == aps,
+    })
 }
 
 /// Proves that the TSC readings of every online processor are consistent: for 100 ms
@@ -650,45 +806,177 @@ pub(crate) fn prove_consistent(
     bsp: cpu::CpuIndex,
     tsc_hz: u64,
 ) -> bool {
-    let mut aps = 0u64;
-    for &id in cpus.iter().filter(|&&id| id != bsp) {
-        if crate::sched::spawn(id, turn_taker, 0).is_err() {
-            let _ = writeln!(
-                com1,
-                "origin-kernel: clock: cannot spawn on CPU {id}: clock failed"
-            );
-            return false;
+    let Some(run) = run_turns(
+        com1,
+        cpus,
+        bsp,
+        tsc_hz,
+        Reading::Tsc,
+        tsc_hz / 10,
+        MIN_HANDOFFS,
+    ) else {
+        return false;
+    };
+    let interleaved = cpus.len() < 2 || run.handoffs >= MIN_HANDOFFS;
+    let ok = run.done && run.backwards == 0 && interleaved;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: clock: TSC consistent across {} processors: {} ordered readings, {} handoffs between processors, {} backwards (worst {} ticks){}",
+        cpus.len(),
+        run.readings,
+        run.handoffs,
+        run.backwards,
+        run.worst,
+        if ok { "" } else { ": clock failed" }
+    );
+    ok
+}
+
+/// Reads each processor makes in the cost measurement: long enough to see through QEMU's
+/// TSC, which on the development host moves in 42-tick steps, and about a millisecond on
+/// real hardware.
+const COST_READS: u64 = 1 << 16;
+/// The per-processor means of a cost measurement, summed.
+static COST_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// The mean ticks one call of `read` takes, over [`COST_READS`] calls with interrupts off.
+fn ticks_per_read(read: impl Fn() -> u64) -> u64 {
+    let rdtscp = rdtscp_supported();
+    cpu::without_interrupts(|| {
+        let start = ordered_tsc(rdtscp);
+        for _ in 0..COST_READS {
+            core::hint::black_box(read());
         }
+        ordered_tsc(rdtscp).wrapping_sub(start) / COST_READS
+    })
+}
+
+/// An application processor's thread in the cost measurement.
+extern "sysv64" fn cost_reader(_: u64) -> ! {
+    READY.fetch_add(1, Ordering::AcqRel);
+    while UNTIL.load(Ordering::Acquire) == 0 {
+        core::hint::spin_loop();
+    }
+    COST_TICKS.fetch_add(ticks_per_read(monotonic_nanos), Ordering::Relaxed);
+    DONE.fetch_add(1, Ordering::AcqRel);
+    crate::sched::exit()
+}
+
+/// Measures and reports what a read of the monotonic clock costs (CLAUDE.md §66, rule 21): on
+/// this processor alone, beside a bare RDTSC and the same read without the floor; and with
+/// every processor reading at once, the case the shared floor makes expensive. This reports;
+/// it decides nothing.
+fn report_read_cost(com1: &mut Console, cpus: &[cpu::CpuIndex], bsp: cpu::CpuIndex, tsc_hz: u64) {
+    let entry = ENTRY_TSC.load(Ordering::Relaxed);
+    let bare = ticks_per_read(rdtsc);
+    let unfloored = SCALE.get().map_or(0, |scale| {
+        ticks_per_read(|| scale.nanos(rdtsc().saturating_sub(entry)))
+    });
+    let floored = ticks_per_read(monotonic_nanos);
+    let mut started = true;
+    let mut aps = 0;
+    for counter in [&READY, &DONE, &UNTIL, &COST_TICKS] {
+        counter.store(0, Ordering::Release);
+    }
+    for &id in cpus.iter().filter(|&&id| id != bsp) {
+        started &= crate::sched::spawn(id, cost_reader, 0).is_ok();
         aps += 1;
     }
     crate::sched::yield_until(|| READY.load(Ordering::Acquire) == aps, tsc_hz, 2);
-    if READY.load(Ordering::Acquire) != aps {
+    started &= READY.load(Ordering::Acquire) == aps;
+    // Whatever happened, release those that did start: they would otherwise spin for the
+    // whole boot.
+    UNTIL.store(1, Ordering::Release);
+    if !started {
         let _ = writeln!(
             com1,
-            "origin-kernel: clock: turn-takers did not start: clock failed"
+            "origin-kernel: clock: reading it costs {floored} ticks alone (RDTSC {bare}, without the floor {unfloored}); processors could not be started to read it at once"
         );
-        return false;
+        return;
     }
-    let start = rdtsc();
-    LATEST.store(start.saturating_add(tsc_hz / 2), Ordering::Relaxed);
-    UNTIL.store(start.saturating_add(tsc_hz / 10), Ordering::Release);
-    take_turns(
-        bsp.get() as u64,
-        if cpus.len() < 2 { 0 } else { MIN_HANDOFFS },
-    );
+    COST_TICKS.fetch_add(ticks_per_read(monotonic_nanos), Ordering::Relaxed);
     crate::sched::yield_until(|| DONE.load(Ordering::Acquire) == aps, tsc_hz, 2);
-    let done = DONE.load(Ordering::Acquire) == aps;
-    let readings = READINGS.load(Ordering::Relaxed);
-    let handoffs = HANDOFFS.load(Ordering::Relaxed);
-    let backwards = BACKWARDS.load(Ordering::Relaxed);
-    let interleaved = cpus.len() < 2 || handoffs >= MIN_HANDOFFS;
-    let ok = done && backwards == 0 && interleaved;
+    let finished = DONE.load(Ordering::Acquire) == aps;
+    let together = COST_TICKS.load(Ordering::Relaxed) / (aps + 1);
     let _ = writeln!(
         com1,
-        "origin-kernel: clock: TSC consistent across {} processors: {readings} ordered readings, {handoffs} handoffs between processors, {backwards} backwards (worst {} ticks){}",
-        cpus.len(),
-        WORST.load(Ordering::Relaxed),
-        if ok { "" } else { ": clock failed" }
+        "origin-kernel: clock: reading it costs {floored} ticks alone (RDTSC {bare}, without the floor {unfloored}) and {together} ticks with {} processors reading at once{}",
+        aps + 1,
+        if finished {
+            ""
+        } else {
+            " (some processors did not finish)"
+        }
     );
+}
+
+/// Proves the monotonic clock's contract (ADR-0012): every online processor reads
+/// [`monotonic_nanos`] in turn, and no value may be below the one before it, whichever
+/// processor took that one.
+///
+/// Then the same check on counters made to disagree: each processor's TSC offset by a second
+/// of ticks per processor index. Read as they are they must step back, or this proof could not
+/// see what it looks for; read through a floor of their own they must not. The skew never
+/// reaches the real clock, and a machine with one processor has nothing to compare.
+pub(crate) fn prove_monotonic(
+    com1: &mut Console,
+    cpus: &[cpu::CpuIndex],
+    bsp: cpu::CpuIndex,
+    tsc_hz: u64,
+) -> bool {
+    let window = tsc_hz / 50;
+    let run = |com1: &mut Console, reading, wanted| {
+        run_turns(com1, cpus, bsp, tsc_hz, reading, window, wanted)
+    };
+    let Some(clock) = run(com1, Reading::Clock, MIN_HANDOFFS) else {
+        return false;
+    };
+    let controls = if cpus.len() >= 2 {
+        let (Some(bare), Some(floored)) = (
+            run(com1, Reading::Skewed, CONTROL_HANDOFFS),
+            run(com1, Reading::SkewedThroughFloor, CONTROL_HANDOFFS),
+        ) else {
+            return false;
+        };
+        Some((bare, floored))
+    } else {
+        None
+    };
+    let interleaved = controls.is_none() || clock.handoffs >= MIN_HANDOFFS;
+    let ok = clock.done
+        && clock.backwards == 0
+        && interleaved
+        && controls.as_ref().is_none_or(|(bare, floored)| {
+            bare.done
+                && bare.backwards > 0
+                && floored.done
+                && floored.backwards == 0
+                && floored.held > 0
+        });
+    let outcome = if ok { "" } else { ": clock failed" };
+    let _ = match controls {
+        Some((bare, floored)) => writeln!(
+            com1,
+            "origin-kernel: clock: monotonic across {} processors: {} readings, {} handoffs between processors, {} backwards, {} held at the floor; control, counters skewed by a second per processor: {} backwards without a floor, {} through one ({} held){outcome}",
+            cpus.len(),
+            clock.readings,
+            clock.handoffs,
+            clock.backwards,
+            clock.held,
+            bare.backwards,
+            floored.backwards,
+            floored.held,
+        ),
+        None => writeln!(
+            com1,
+            "origin-kernel: clock: monotonic across {} processors: {} readings, {} handoffs between processors, {} backwards, {} held at the floor; the controls need a second processor{outcome}",
+            cpus.len(),
+            clock.readings,
+            clock.handoffs,
+            clock.backwards,
+            clock.held,
+        ),
+    };
+    report_read_cost(com1, cpus, bsp, tsc_hz);
     ok
 }
