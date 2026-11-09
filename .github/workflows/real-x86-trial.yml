@@ -58,7 +58,6 @@ jobs:
           echo "exit status with +cet-ss,enforce: $? (124 means it was running when the timeout stopped it)"
 
   kvm:
-    if: ${{ false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
