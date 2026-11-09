@@ -28,6 +28,28 @@ pub enum MapError {
     NotContained(u64),
 }
 
+/// `EFI_MEMORY_SP` (UEFI 2.8): specific-purpose memory, not for general use.
+pub const EFI_MEMORY_SP: u64 = 0x0000_0000_0004_0000;
+/// `EFI_MEMORY_HOT_PLUGGABLE` (UEFI 2.11): memory that can be removed at run time.
+pub const EFI_MEMORY_HOT_PLUGGABLE: u64 = 0x0000_0000_0010_0000;
+
+/// The Origin region kind for a descriptor's type and attributes. Conventional memory
+/// (type 7) that firmware marks specific-purpose or hot-pluggable is not handed to the kernel
+/// as general RAM (UEFI 2.11 §7.2, the memory attribute definitions); specific-purpose wins
+/// when both are set. Every other type keeps the kind its type gives, because the kernel uses
+/// no other type as general RAM yet.
+pub const fn kind_for(uefi_type: u32, attribute: u64) -> RegionKind {
+    if uefi_type == 7 {
+        if attribute & EFI_MEMORY_SP != 0 {
+            return RegionKind::SpecificPurpose;
+        }
+        if attribute & EFI_MEMORY_HOT_PLUGGABLE != 0 {
+            return RegionKind::HotPluggable;
+        }
+    }
+    kind_of(uefi_type)
+}
+
 /// The Origin region kind for an `EFI_MEMORY_TYPE`.
 pub const fn kind_of(uefi_type: u32) -> RegionKind {
     match uefi_type {
@@ -83,6 +105,7 @@ pub fn translate(
         let uefi_type = u32_at(desc, 0);
         let base = u64_at(desc, 8);
         let pages = u64_at(desc, 24);
+        let attribute = u64_at(desc, 32);
         if pages == 0 {
             continue;
         }
@@ -97,7 +120,7 @@ pub fn translate(
         *slot = MemoryRegion {
             base,
             pages,
-            kind: kind_of(uefi_type) as u32,
+            kind: kind_for(uefi_type, attribute) as u32,
             reserved: 0,
         };
         n = n.saturating_add(1);
@@ -204,11 +227,16 @@ mod tests {
     use super::*;
 
     fn desc(stride: usize, ty: u32, base: u64, pages: u64) -> Vec<u8> {
+        desc_attr(stride, ty, base, pages, 0xF) // UC, WC, WT and WB: cacheable RAM
+    }
+
+    fn desc_attr(stride: usize, ty: u32, base: u64, pages: u64, attribute: u64) -> Vec<u8> {
         let mut d = vec![0u8; stride];
         d[0..4].copy_from_slice(&ty.to_le_bytes());
         d[8..16].copy_from_slice(&base.to_le_bytes());
         d[16..24].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes()); // VirtualStart, ignored
         d[24..32].copy_from_slice(&pages.to_le_bytes());
+        d[32..40].copy_from_slice(&attribute.to_le_bytes());
         d
     }
 
@@ -244,6 +272,52 @@ mod tests {
                 region(0x10_0000, 0x100, RegionKind::Usable),
                 region(0x20_0000, 3, RegionKind::KernelStack),
                 region(0xFEC0_0000, 1, RegionKind::Mmio),
+            ]
+        );
+    }
+
+    #[test]
+    fn attributes_keep_special_conventional_memory_out_of_general_use() {
+        // Conventional memory: plain, specific-purpose (UEFI 2.8), hot-pluggable (2.11), both
+        // (specific-purpose wins), and the caching attributes alone (still usable).
+        assert_eq!(kind_for(7, 0xF), RegionKind::Usable);
+        assert_eq!(
+            kind_for(7, 0xF | EFI_MEMORY_SP),
+            RegionKind::SpecificPurpose
+        );
+        assert_eq!(
+            kind_for(7, 0xF | EFI_MEMORY_HOT_PLUGGABLE),
+            RegionKind::HotPluggable
+        );
+        assert_eq!(
+            kind_for(7, EFI_MEMORY_SP | EFI_MEMORY_HOT_PLUGGABLE),
+            RegionKind::SpecificPurpose
+        );
+        // Other types keep their kind: the kernel uses none of them as general RAM yet.
+        assert_eq!(
+            kind_for(1, EFI_MEMORY_HOT_PLUGGABLE),
+            RegionKind::LoaderReclaimable
+        );
+        assert_eq!(kind_for(14, EFI_MEMORY_SP), RegionKind::Persistent);
+        // Through the whole translation: specific-purpose and hot-pluggable ranges stay
+        // separate from the RAM around them, and like ranges still merge.
+        let map = [
+            desc(48, 7, 0x10_0000, 0x100),
+            desc_attr(48, 7, 0x20_0000, 0x10, 0xF | EFI_MEMORY_SP),
+            desc_attr(48, 7, 0x21_0000, 0x10, 0xF | EFI_MEMORY_SP),
+            desc_attr(48, 7, 0x22_0000, 0x20, 0xF | EFI_MEMORY_HOT_PLUGGABLE),
+            desc(48, 7, 0x24_0000, 0x40),
+        ]
+        .concat();
+        let mut out = [region(0, 0, RegionKind::Reserved); 8];
+        let n = translate(&map, 48, &mut out).unwrap();
+        assert_eq!(
+            &out[..n],
+            &[
+                region(0x10_0000, 0x100, RegionKind::Usable),
+                region(0x20_0000, 0x20, RegionKind::SpecificPurpose),
+                region(0x22_0000, 0x20, RegionKind::HotPluggable),
+                region(0x24_0000, 0x40, RegionKind::Usable),
             ]
         );
     }

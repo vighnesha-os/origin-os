@@ -5,7 +5,7 @@
 | As of | 2026-11-09, on `main`, after the pre-merge review. Everything that was on a side branch is merged. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38 and 40–68. |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38 and 40–69. |
 | Still open | Items 30, 31 and 39 below. Buying machines is off for now (ADR-0009's update of 2026-11-09). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -184,5 +184,13 @@ Step 3 adds system calls and structures, so these are ABI and format decisions (
 | 66, answered | C11: append `not_found = -14`? | **Accept** |
 | 67, answered | C12: `origin.directory` 0.1, keyed by OIDL interface ID and major, with a pipelined `connect`? | **Accept** |
 | 68, answered | C13: a `clock_read` system call now, a shared clock page later? | **Accept** |
+
+## Memory the firmware sets apart (ADR-0002, boot info 0.5; Accepted 2026-11-09)
+
+UEFI added two memory attributes after 2.7 that a 2026+ kernel must respect, and the loader read only the memory type. Changing what the loader hands the kernel is a boot-info format change (§84). Research: `docs/research/2026-11-09-uefi-2.8-to-2.11.md`.
+
+| # | Question | Answer |
+|---|---|---|
+| 69, answered | After the landing, make the loader honour `EFI_MEMORY_SP` (UEFI 2.8) and `EFI_MEMORY_HOT_PLUGGABLE` (UEFI 2.11): conventional memory carrying either becomes its own region kind, `SpecificPurpose` or `HotPluggable`, which the kernel neither allocates from nor direct-maps (boot info 0.5)? | **Yes, after the landing (2026-11-09)** |
 
 **Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.
