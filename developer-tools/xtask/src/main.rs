@@ -1329,6 +1329,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         // M4's first slice (ADR-0005 P1–P5, P8, P9): system calls between ring-3 processes.
         .chain(ipc_markers(machine.named(0), target.clone()))
         .chain(object_markers(&target))
+        .chain(address_space_markers())
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
@@ -1614,6 +1615,7 @@ fn boot_failures() -> Vec<&'static str> {
         ": ipc failed",
         ": console failed",
         ": TLB failed",
+        ": address spaces failed",
         ": wait queues failed",
         ": PCIe failed",
         // No BAR on the test machines is refused, and the exhaustive quiesce sees every
@@ -1742,6 +1744,13 @@ fn refusal_scenario(
 
 /// What the kernel's first system-call slice must report, in order: a line per group of
 /// hostile calls, each naming the status its call returned.
+/// N14 step 3, S3-5a: address spaces (ADR-0004 H2), each boot proof's own lines.
+fn address_space_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: address spaces: the kernel half is the same tables in every space: true; a kernel mapping made at 0xfffff00000000000, in a top-level slot of its own, after a space was created is visible from that space: true; from a space lacking the slot, the same read faults: true".into(),
+    ]
+}
+
 fn ipc_markers(boot: String, far: String) -> Vec<String> {
     let mut markers = vec![
         format!(

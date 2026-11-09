@@ -103,6 +103,35 @@ impl UserSpace {
         })
     }
 
+    /// As [`new`](Self::new), with the top-level entry of the kernel probe page's slot empty:
+    /// what every space used to look like when a kernel mapping was made in a slot of its own
+    /// after the space was created. For the in-boot control of that proof. Loading this space
+    /// is harmless: nothing but a `KernelProbe` is ever mapped in that slot, so all the code,
+    /// stacks and data the kernel touches stay mapped.
+    pub fn without_probe_slot() -> Option<Self> {
+        let mut tables = Tables { frames: Vec::new() };
+        let mut space = AddressSpace::new(&mut tables).ok()?;
+        let mut half = *crate::vm::kernel_half()?;
+        *half.get_mut(crate::vm::PROBE_SLOT)? = 0;
+        space.set_upper_half(&tables, &half).ok()?;
+        Some(Self {
+            space,
+            tables,
+            pages: Vec::new(),
+        })
+    }
+
+    /// Whether this space's PML4 entries 256–511 are the ones the kernel fixed at boot
+    /// (ADR-0004 H2).
+    #[must_use]
+    pub fn shares_kernel_half(&self) -> bool {
+        let own = self.space.upper_half(&self.tables);
+        match (own, crate::vm::kernel_half()) {
+            (Some(own), Some(fixed)) => origin_paging::same_kernel_half(&own, fixed),
+            _ => false,
+        }
+    }
+
     /// The physical address of this space's top-level table (the value for CR3), for reports
     /// and proofs; the scheduler loads the space through [`activate`](Self::activate).
     pub const fn root(&self) -> u64 {
