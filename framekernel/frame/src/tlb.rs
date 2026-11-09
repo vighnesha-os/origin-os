@@ -152,6 +152,12 @@ pub fn interrupts_taken(cpu: CpuIndex) -> u64 {
         .map_or(0, |taken| taken.load(Ordering::Relaxed))
 }
 
+/// Drops what `request` names from every processor that has the address space `root` loaded,
+/// after a change to one of its user mappings. The caller changed the page tables first.
+pub(crate) fn shootdown_space(root: u64, request: Request) -> Result<Completed, Stalled> {
+    SHOOTDOWN.shoot(&Hardware, request, Scope::Space(root))
+}
+
 /// The deferred free of a user mapping: `value` is what the caller took out of `root`'s page
 /// tables, and `release` gets it back once no processor can reach it (`Shootdown::retire`).
 pub(crate) fn retire_in_space<T>(

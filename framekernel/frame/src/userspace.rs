@@ -28,7 +28,9 @@
 //! the caller is told.
 //!
 //! A map adds a translation that was not present, which no TLB can hold: it needs no shootdown.
-//! Every other change does, and each reports what it cost ([`Change`]), so the layer above can
+//! A protect does, also when it only adds access: a processor that still caches the old
+//! permissions would take a page fault for an access now allowed, and a fault ends a user thread.
+//! Every change that needs one reports what it cost ([`Change`]), so the layer above can
 //! charge for it or limit it (a program that maps and unmaps in a loop interrupts every other
 //! processor its threads run on, each time).
 
@@ -216,6 +218,26 @@ impl State {
         Ok(())
     }
 
+    /// Gives the next [`CHUNK`] mapped pages of `[start, end)` the permissions `access`, or says
+    /// there are none left.
+    fn protect(&mut self, start: u64, end: u64, access: Access) -> Option<Reprotected> {
+        let lo = self.position(start);
+        let hi = self.position(end).min(lo + CHUNK);
+        let round = self.mapped.get(lo..hi)?;
+        let (first, last) = (round.first()?.virt, round.last()?.virt);
+        let mut changed = 0;
+        for mapping in round {
+            if self.space.protect(&mut self.tables, mapping.virt, access) == Ok(true) {
+                changed += 1;
+            }
+        }
+        Some(Reprotected {
+            changed,
+            request: Request::covering(first, last),
+            next: last + PAGE,
+        })
+    }
+
     /// Takes the next [`CHUNK`] pages of `[start, end)` out of the tables and out of the records:
     /// what it took, the translations that can still lead to it and where the next round
     /// starts, or `None` if there is nothing left to take. The frames stay allocated, and the
@@ -255,6 +277,16 @@ impl State {
             next: last + PAGE,
         }))
     }
+}
+
+/// What one round of a change of permissions did (`State::protect`).
+struct Reprotected {
+    /// The pages whose permissions it changed.
+    changed: u64,
+    /// The translations that may still hold the old permissions.
+    request: Request,
+    /// Where the next round starts.
+    next: u64,
 }
 
 /// What one round of an unmap took out of the tables (`State::retire`).
@@ -435,6 +467,25 @@ impl UserSpace {
                     self.with_state(|s| s.spare = mappings);
                 })?;
             change.add(done);
+        }
+        Ok(change)
+    }
+
+    /// Gives every page mapped in the `pages` pages from `virt` the permissions `access`. When
+    /// it returns, no processor can use the old ones. Pages not mapped are left alone. Safe
+    /// with this space's threads running: one whose access the new permissions refuse takes a
+    /// fault. Must not be called holding a lock as [`unmap`](Self::unmap) says.
+    pub fn protect(&self, virt: u64, pages: u64, access: Access) -> Result<Change, ChangeError> {
+        let end = user_range_end(virt, pages)?;
+        let _turn = self.edit();
+        let mut change = Change::default();
+        let mut cursor = virt;
+        while let Some(round) = self.with_state(|s| s.protect(cursor, end, access)) {
+            cursor = round.next;
+            change.pages += round.changed;
+            if round.changed != 0 {
+                change.add(crate::tlb::shootdown_space(self.root, round.request)?);
+            }
         }
         Ok(change)
     }
