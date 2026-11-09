@@ -67,6 +67,8 @@ environment:
                                       negative control)
   ORIGIN_QEMU_BRIDGE                  on: the NIC behind a PCIe root port (the boot-bridge
                                       machine)
+  ORIGIN_QEMU_ACCEL                   tcg (default) or kvm: run on a real x86-64 processor (needs
+                                      an x86-64 host with /dev/kvm)
   ORIGIN_QEMU_DEBUG                   if set, QEMU logs interrupts and resets to
                                       target/xtask/qemu-debug.log";
 
@@ -176,6 +178,19 @@ struct Completed {
 /// test also checks that the release identity reached both.
 /// The QEMU CPU model: `ORIGIN_QEMU_CPU` (for example `max,-avx2` to boot a CPU below the
 /// x86-64-v3 baseline), or `max`.
+/// The `-machine` value for an `ORIGIN_QEMU_ACCEL` setting: `tcg` (the default) or `kvm`. With
+/// KVM the guest's instructions run on a real x86-64 processor. Interrupt remapping needs the
+/// I/O APIC in QEMU, not in the host kernel, hence the split irqchip.
+fn qemu_machine(accel: Option<&str>) -> Result<&'static str> {
+    match accel.filter(|a| !a.is_empty()) {
+        None | Some("tcg") => Ok("q35"),
+        Some("kvm") => Ok("q35,accel=kvm,kernel-irqchip=split"),
+        Some(other) => Err(format!(
+            "ORIGIN_QEMU_ACCEL must be tcg or kvm, not {other:?}"
+        )),
+    }
+}
+
 fn qemu_cpu_model() -> String {
     std::env::var("ORIGIN_QEMU_CPU")
         .ok()
@@ -3041,7 +3056,9 @@ fn qemu_path_arg(options: &str, path: &Path) -> Result<String> {
 fn qemu_command(s: &Staged) -> Result<Command> {
     let machine = machine();
     let mut c = Command::new(QEMU);
-    c.args(["-machine", "q35", "-cpu"])
+    c.arg("-machine")
+        .arg(qemu_machine(env::var("ORIGIN_QEMU_ACCEL").ok().as_deref())?)
+        .arg("-cpu")
         .arg(qemu_cpu_model())
         .args(["-m", "512M", "-smp"])
         .arg(&machine.smp);
@@ -4010,6 +4027,18 @@ mod tests {
         );
         assert!(!plain.geometry.has_extended_levels());
         assert!(sparse.geometry.has_extended_levels());
+    }
+
+    #[test]
+    fn the_accelerator_is_tcg_unless_kvm_is_asked_for() {
+        assert_eq!(qemu_machine(None), Ok("q35"));
+        assert_eq!(qemu_machine(Some("")), Ok("q35"));
+        assert_eq!(qemu_machine(Some("tcg")), Ok("q35"));
+        assert_eq!(
+            qemu_machine(Some("kvm")),
+            Ok("q35,accel=kvm,kernel-irqchip=split")
+        );
+        assert!(qemu_machine(Some("hvf")).is_err());
     }
 
     /// The table the boot proof hands QEMU means what the proof claims, by the kernel's own

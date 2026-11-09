@@ -1,0 +1,78 @@
+# A one-off trial, not CI: can the kernel run on real x86-64 silicon, through KVM on GitHub's free
+# hosted runners? Runs only on pushes to this trial branch. Whether Origin OS gets CI at all is
+# still the owner's decision (docs/engineering/OWNER_DECISIONS.md, item 32).
+name: real-x86-trial
+
+on:
+  push:
+    branches: ['trial/real-x86']
+
+permissions:
+  contents: read
+
+jobs:
+  kvm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Describe this machine
+        run: |
+          lscpu
+          ls -l /dev/kvm || echo 'no /dev/kvm on this runner'
+          grep -m1 -o -w -E 'vmx|svm' /proc/cpuinfo || echo 'no hardware virtualization flag'
+          for f in /sys/module/kvm_intel/parameters/nested /sys/module/kvm_amd/parameters/nested; do
+            [ -e "$f" ] && echo "$f: $(cat "$f")"
+          done
+          grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(smep|smap|umip|avx2|avx512f|x2apic|shstk|ibt|ibrs|ibpb|stibp|arch_capabilities|la57|pdpe1gb|fsgsbase)$' | sort | tr '\n' ' '
+          echo
+
+      - name: Let this user open KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Build QEMU 11.1.3, the version the boot proofs are pinned to
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config python3-venv libglib2.0-dev libpixman-1-dev libslirp-dev flex bison
+          curl -fsSLO https://download.qemu.org/qemu-11.1.3.tar.xz
+          tar xf qemu-11.1.3.tar.xz
+          cd qemu-11.1.3
+          ./configure --prefix="$HOME/qemu" --target-list=x86_64-softmmu --enable-kvm --enable-slirp --disable-docs --disable-gtk --disable-sdl --disable-vnc --disable-tools
+          make -j"$(nproc)"
+          make install
+          echo "$HOME/qemu/bin" >> "$GITHUB_PATH"
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version --verbose
+
+      - name: Boot the kernel, under TCG as a control and then on real silicon
+        shell: bash
+        run: |
+          qemu-system-x86_64 --version | head -1
+          mkdir -p logs
+          boot() {
+            local name=$1; shift
+            echo "::group::$name"
+            env ORIGIN_BOOT_TEST_ONLY='kernel boot' "$@" cargo xtask boot-test
+            local rc=$?
+            cp target/xtask/boot-test-kernel-boot.log "logs/$name.log" || true
+            echo "::endgroup::"
+            echo "$name: exit $rc" | tee -a logs/summary.txt
+          }
+          boot tcg-intel-2 ORIGIN_QEMU_SMP=2
+          boot kvm-intel-2 ORIGIN_QEMU_ACCEL=kvm ORIGIN_QEMU_SMP=2
+          boot kvm-intel-4 ORIGIN_QEMU_ACCEL=kvm ORIGIN_QEMU_SMP=4
+          boot kvm-amd-4 ORIGIN_QEMU_ACCEL=kvm ORIGIN_QEMU_SMP=4 ORIGIN_QEMU_IOMMU=amd
+          echo '=== results'
+          cat logs/summary.txt
+          for f in logs/*.log; do
+            echo "=== $f ($(wc -l < "$f") lines)"
+            sed -n '1,400p' "$f"
+          done
