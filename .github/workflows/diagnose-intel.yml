@@ -51,7 +51,7 @@ jobs:
             env "$@" cargo xtask boot-test > "/tmp/$name.log" 2>&1
             local rc=$?
             echo "$name: exit $rc" | tee -a /tmp/summary.txt
-            grep -E 'SMEP diagnosis|page protection: SMEP|xtask: error' "/tmp/$name.log" | cut -c1-420
+            grep -E 'SMEP diagnosis|page protection: SMEP|xtask: error| failed$' "/tmp/$name.log" | cut -c1-420
             if [ "$rc" != 0 ]; then tail -30 "/tmp/$name.log" | cut -c1-260; fi
           }
           export ORIGIN_BOOT_TEST_ONLY='kernel boot'
@@ -66,9 +66,14 @@ jobs:
           boot sparse-intel ORIGIN_QEMU_TOPOLOGY=x2apic ORIGIN_QEMU_CPU=max,vendor=GenuineIntel
           boot bridge ORIGIN_QEMU_BRIDGE=on
           unset ORIGIN_BOOT_TEST_ONLY
-          cargo xtask boot-console > /tmp/console.log 2>&1
-          echo "console: exit $?" | tee -a /tmp/summary.txt
-          grep -E 'passed in|xtask: error' /tmp/console.log | cut -c1-200
+          for label in 'UART named by the SPCR' 'SPCR naming COM1 itself' \
+            'SPCR naming a UART that takes no bytes' 'SPCR for an interface this kernel cannot drive' \
+            'SPCR naming a port with no UART' 'SPCR naming registers in RAM' 'no display' 'no UART at all'; do
+            ORIGIN_BOOT_TEST_ONLY="$label" cargo xtask boot-console > /tmp/console.log 2>&1
+            rc=$?
+            echo "console $label: exit $rc" | tee -a /tmp/summary.txt
+            grep -E 'xtask: error| failed$' /tmp/console.log | cut -c1-420
+          done
           echo '=== results'
           cat /tmp/summary.txt
 

@@ -323,12 +323,12 @@ impl Accel {
 
     /// The failure messages a screen is searched for. A screen wraps long lines, so under KVM
     /// the lines [`kvm_forgives`] describes cannot be told from the rest there, and the
-    /// screen-only boot leaves those two messages to the boots with a serial port.
+    /// screen-only boot leaves those messages to the boots with a serial port.
     fn screen_failures(self, failures: &[&'static str]) -> Vec<&'static str> {
         failures
             .iter()
             .copied()
-            .filter(|f| self == Accel::Tcg || (*f != IOAPIC_FAILED && *f != CLOCK_FAILED))
+            .filter(|f| self == Accel::Tcg || !KVM_FORGIVEN_MESSAGES.contains(f))
             .collect()
     }
 }
@@ -631,7 +631,93 @@ fn host_is_intel() -> bool {
 /// True for a line reporting a failure under KVM that says nothing about the kernel. Every
 /// other failure fails the boot.
 fn kvm_forgives(line: &str) -> bool {
-    is_pin_limit(line) || is_small_tsc_step(line)
+    is_pin_limit(line)
+        || is_small_tsc_step(line)
+        || is_unfilled_tx_ring(line)
+        || is_uneven_fair_share(line)
+}
+
+/// The failure messages of the lines [`kvm_forgives`] lets pass.
+const KVM_FORGIVEN_MESSAGES: [&str; 4] = [
+    IOAPIC_FAILED,
+    CLOCK_FAILED,
+    ": virtio-net failed",
+    ": scheduler failed",
+];
+
+/// The virtio-net TX proof's line when the only thing missing is a ring that filled. The
+/// proof queues one frame more than the ring holds, without a kick, expecting the ring to
+/// fill. QEMU's device runs in its own thread and, after an earlier kick, can go on taking
+/// frames as they appear, so on a fast enough processor the batch drains as it is queued.
+/// Everything else the proof asks for must still be there.
+fn is_unfilled_tx_ring(line: &str) -> bool {
+    if !line.starts_with("origin-kernel: virtio-net TX: ")
+        || !line.contains("; the ring was full 0 times and senders slept ")
+        || !line.ends_with("; consistent false: virtio-net failed")
+    {
+        return false;
+    }
+    let number = |word| number_before(line, word);
+    match (
+        number(" frames through "),
+        number(" descriptors ("),
+        number(" completions reclaimed"),
+        number(" of "),
+        number(" free at the end"),
+        number(" times, woken by"),
+        number(" (of "),
+        number("); consistent"),
+    ) {
+        (
+            Some(sent),
+            Some(descriptors),
+            Some(reclaimed),
+            Some(free),
+            Some(of),
+            Some(slept),
+            Some(woken),
+            Some(interrupts),
+        ) => {
+            sent > descriptors
+                && reclaimed == sent
+                && free == descriptors
+                && of == descriptors
+                && slept > 0
+                && woken > 0
+                && interrupts > 0
+        }
+        _ => false,
+    }
+}
+
+/// How unequal two workers' counts [`is_uneven_fair_share`] lets pass: the larger under this
+/// many times the smaller.
+const KVM_FAIR_SHARE_FACTOR: u64 = 4;
+
+/// The scheduler proof's line for a processor whose two workers both ran, for enough rounds,
+/// but got unequal amounts done. The proof counts loop iterations, not processor time, and a
+/// runner's virtual processors share physical cores: a Xeon 8370C showed 2.1 to 2.5 times.
+/// TCG holds the proof to a factor of two.
+fn is_uneven_fair_share(line: &str) -> bool {
+    if !line.starts_with("origin-kernel: scheduler: CPU ")
+        || !line.ends_with(" context switches: scheduler failed")
+    {
+        return false;
+    }
+    let Some((_, counts)) = line.split_once(" counted ") else {
+        return false;
+    };
+    match (
+        number_before(counts, " and "),
+        number_before(counts, ", "),
+        number_before(counts, " context switches"),
+    ) {
+        (Some(first), Some(second), Some(switches)) => {
+            let (low, high) = (first.min(second), first.max(second));
+            low > 0 && high < low.saturating_mul(KVM_FAIR_SHARE_FACTOR) && switches >= 15
+        }
+        _ => false,
+    }
 }
 
 /// The two lines of [`kvm_pin_markers`], exactly as KVM leaves them: no fault was recorded and
@@ -4275,6 +4361,51 @@ mod tests {
         ));
     }
 
+    /// As the kernel printed it on an AMD EPYC 9V45 (Actions run 42561135158).
+    const KVM_TX_UNFILLED: &str = "origin-kernel: virtio-net TX: 25 frames through 4 descriptors (buffers allocated once), 25 completions reclaimed, 4 of 4 free at the end; the ring was full 0 times and senders slept 2 times, woken by the TX-completion interrupt 2 (of 22); consistent false: virtio-net failed";
+
+    #[test]
+    fn kvm_forgives_only_a_tx_ring_that_never_filled() {
+        assert!(kvm_forgives(KVM_TX_UNFILLED));
+        for line in [
+            // Frames were lost or still in flight.
+            KVM_TX_UNFILLED.replace("25 completions", "24 completions"),
+            KVM_TX_UNFILLED.replace("4 of 4 free", "3 of 4 free"),
+            // No more frames than descriptors went through, so nothing was reused.
+            KVM_TX_UNFILLED
+                .replace("25 frames", "4 frames")
+                .replace("25 completions", "4 completions"),
+            // Nobody slept, or the interrupt never came.
+            KVM_TX_UNFILLED.replace("slept 2 times", "slept 0 times"),
+            KVM_TX_UNFILLED.replace("interrupt 2 (of 22)", "interrupt 0 (of 22)"),
+            KVM_TX_UNFILLED.replace("interrupt 2 (of 22)", "interrupt 2 (of 0)"),
+            // The ring did fill, so it failed for another reason.
+            KVM_TX_UNFILLED.replace("full 0 times", "full 1 times"),
+        ] {
+            assert!(!kvm_forgives(&line), "{line}");
+        }
+    }
+
+    /// As the kernel printed it on a Xeon 8370C (Actions run 42561135174).
+    const KVM_UNEVEN_SHARE: &str = "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted 1600936 and 653292, 51 context switches: scheduler failed";
+
+    #[test]
+    fn kvm_forgives_only_a_moderately_uneven_share() {
+        assert!(kvm_forgives(KVM_UNEVEN_SHARE));
+        for line in [
+            // One worker hardly ran, or never did.
+            KVM_UNEVEN_SHARE.replace("653292", "400234"),
+            KVM_UNEVEN_SHARE.replace("653292", "0"),
+            // Too few rounds to mean anything.
+            KVM_UNEVEN_SHARE.replace("51 context", "14 context"),
+            // Other scheduler failures.
+            "origin-kernel: workers did not exit: scheduler failed".to_string(),
+            "origin-kernel: cannot spawn on CPU 1: scheduler failed".to_string(),
+        ] {
+            assert!(!kvm_forgives(&line), "{line}");
+        }
+    }
+
     #[test]
     fn number_before_reads_the_digits_right_before_the_word() {
         assert_eq!(number_before("a 12 b", " b"), Some(12));
@@ -4300,8 +4431,11 @@ mod tests {
         );
         let on_kvm = Accel::Kvm.screen_failures(&failures);
         assert!(!on_kvm.contains(&IOAPIC_FAILED));
-        assert!(!on_kvm.contains(&CLOCK_FAILED));
-        assert_eq!(on_kvm.len(), failures.len() - 2);
+        for message in KVM_FORGIVEN_MESSAGES {
+            assert!(failures.contains(&message), "{message}");
+            assert!(!on_kvm.contains(&message), "{message}");
+        }
+        assert_eq!(on_kvm.len(), failures.len() - KVM_FORGIVEN_MESSAGES.len());
     }
 
     /// The KVM markers replace those two steps, and only those: they match what KVM prints and
