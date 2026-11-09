@@ -21,7 +21,6 @@
 
 extern crate alloc;
 
-use core::arch::asm;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 use core::ptr;
@@ -165,6 +164,18 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         );
     }
 
+    // The trap entry (in `cpu`) knows the layers above only through these upcalls.
+    origin_frame::trap::install(origin_frame::trap::Hooks {
+        tick: sched::on_tick,
+        reschedule: sched::on_reschedule,
+        yield_now: sched::on_yield,
+        sleep: sched::on_sleep,
+        block: sched::on_block,
+        exit: sched::on_exit,
+        syscall: syscall::run,
+        user_fault: syscall::user_fault,
+        report_exception: console::report_exception,
+    });
     // M2, first step: the kernel's own GDT, TSS and IDT, proven with a breakpoint whose
     // handler reports it and resumes here.
     // SAFETY: called once, at CPL 0, on the boot processor, with interrupts disabled (entry
@@ -1629,15 +1640,7 @@ fn relocations_applied() -> bool {
     ptr::eq(stored, RELOCATION_TARGET.as_ptr())
 }
 
-/// Disables interrupts and halts this processor forever.
-pub(crate) fn halt() -> ! {
-    loop {
-        // SAFETY: the kernel runs at CPL 0 (entry contract). `cli; hlt` touches no memory
-        // and needs no stack. An NMI or SMI can still resume the processor, so it halts
-        // again.
-        unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
-    }
-}
+pub(crate) use cpu::halt;
 
 pub(crate) use origin_frame::port::{inb, ind, outb};
 

@@ -24,5 +24,9 @@
 
 pub use origin_sync as sync;
 
+pub mod irq;
+pub mod once;
+pub mod trap;
+
 #[cfg(target_os = "none")]
 pub mod port;

@@ -86,9 +86,9 @@ static NET_WAIT: WaitQueue = WaitQueue::new();
 /// NIC interrupts that found the receive thread asleep and woke it.
 static NET_WAKES: AtomicU64 = AtomicU64::new(0);
 
-/// Called from the NIC's interrupt vector (`cpu::NET_VECTOR`): records the used-buffer
-/// interrupt and wakes the receive thread, which then reads the used ring itself.
-pub(crate) fn on_interrupt() {
+/// The NIC's interrupt vector (`cpu::NET_VECTOR`), registered at bring-up: records the
+/// used-buffer interrupt and wakes the receive thread, which then reads the used ring itself.
+fn on_interrupt() -> origin_frame::irq::Action {
     NET_IRQS.fetch_add(1, Ordering::Relaxed);
     NET_IRQ_CPU.store(
         (crate::cpu::this_cpu().get() as u64).saturating_add(1),
@@ -97,6 +97,7 @@ pub(crate) fn on_interrupt() {
     if NET_WAIT.wake_one() {
         NET_WAKES.fetch_add(1, Ordering::Relaxed);
     }
+    origin_frame::irq::Action::Reschedule
 }
 
 /// The bytes of the common configuration structure this driver uses: through the 64-bit
@@ -313,13 +314,15 @@ static TX_SLEPT: AtomicU64 = AtomicU64::new(0);
 /// How often the device claimed more completions than a ring holds.
 static DEVICE_FAULTS: AtomicU64 = AtomicU64::new(0);
 
-/// Called from the NIC's TX-completion vector (`cpu::NET_TX_VECTOR`): counts it and wakes
-/// a transmitter waiting for a descriptor, which then reclaims the completions itself.
-pub(crate) fn on_tx_interrupt() {
+/// The NIC's TX-completion vector (`cpu::NET_TX_VECTOR`), registered at bring-up: counts it
+/// and wakes a transmitter waiting for a descriptor, which then reclaims the completions
+/// itself.
+fn on_tx_interrupt() -> origin_frame::irq::Action {
     TX_IRQS.fetch_add(1, Ordering::Relaxed);
     if TX_WAIT.wake_one() {
         TX_WAKES.fetch_add(1, Ordering::Relaxed);
     }
+    origin_frame::irq::Action::Reschedule
 }
 
 /// Set by the receive thread once its buffers are posted, just before it sleeps for the
@@ -1432,6 +1435,16 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
         return;
     }
     let at: Address = dev.function.at;
+    // Its two interrupts reach this driver: registered before the device can send them.
+    if origin_frame::irq::register(crate::cpu::NET_VECTOR, on_interrupt).is_err()
+        || origin_frame::irq::register(crate::cpu::NET_TX_VECTOR, on_tx_interrupt).is_err()
+    {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: virtio-net: its interrupt vectors are taken: virtio-net failed"
+        );
+        return;
+    }
     // Memory-space decoding for the registers. Bus mastering waits until the device has a
     // DMA path (ADR-0007 I12).
     if crate::pcie::enable_memory(at).is_none() {

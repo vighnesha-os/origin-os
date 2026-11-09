@@ -397,9 +397,9 @@ static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 /// The CPU index the last completion interrupt arrived on, plus one (0: none yet).
 static INTERRUPT_CPU: AtomicU64 = AtomicU64::new(0);
 
-/// The completion interrupt (`cpu::DEVICE_VECTOR`): counts it on the processor that took it
-/// and wakes the waiter there, which then reads the completion itself.
-pub(crate) fn on_interrupt() {
+/// The completion interrupt (`cpu::DEVICE_VECTOR`, registered by [`init`]): counts it on the
+/// processor that took it and wakes the waiter there, which then reads the completion itself.
+fn on_interrupt() -> origin_frame::irq::Action {
     let me = crate::cpu::this_cpu().get();
     INTERRUPTS.fetch_add(1, Ordering::Relaxed);
     INTERRUPT_CPU.store((me as u64).saturating_add(1), Ordering::Relaxed);
@@ -412,6 +412,7 @@ pub(crate) fn on_interrupt() {
     {
         n.fetch_add(1, Ordering::Relaxed);
     }
+    origin_frame::irq::Action::Reschedule
 }
 
 /// Counts `blocks` waits for a completion by a thread on this processor.
@@ -430,6 +431,13 @@ pub(crate) fn init(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
         let _ = writeln!(com1, "origin-kernel: NVMe: no controller");
         return true;
     };
+    if origin_frame::irq::register(crate::cpu::DEVICE_VECTOR, on_interrupt).is_err() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: NVMe: its interrupt vector is taken: NVMe failed"
+        );
+        return false;
+    }
     let (polled, on_test_disk) = match bind(com1, &dev, cpus.len()) {
         Ok((nvme, ok, namespace, test_disk)) => {
             let Some(page) = DmaPage::new(nvme.dma) else {

@@ -22,29 +22,22 @@ use core::fmt::Write as _;
 use framekernel::usercopy::{self, UserAccess, UserRange};
 use origin_abi::limits::{MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES};
 use origin_abi::{Error, Handle, OK, read_sizes, signals, syscall as number};
+use origin_frame::trap::SyscallOutcome;
 
 use crate::console::Console;
 use crate::process::{Ending, Process};
 use crate::{cpu, ipc, sched};
 
-/// What a system call left to do on its way out of the kernel.
-pub(crate) enum Outcome {
-    /// Return this status in RAX.
-    Status(i64),
-    /// The thread is over: the handler switches away and never returns to it.
-    ThreadExit,
-}
-
 /// Runs one system call from ring 3: the number, its six arguments, and the address after
 /// the `syscall` instruction. Interrupts are off on entry and on return.
-pub(crate) fn run(call: u64, args: [u64; 6], rip: u64) -> Outcome {
+pub(crate) fn run(call: u64, args: [u64; 6], rip: u64) -> SyscallOutcome {
     let Some(process) = sched::current_process() else {
         // A thread in user mode always has a process. If that ever failed, ending the
         // thread is the only safe thing: it can do nothing without one.
-        return Outcome::ThreadExit;
+        return SyscallOutcome::ThreadExit;
     };
     if !process.may_call_from(rip) {
-        return Outcome::Status(Error::AccessDenied.raw());
+        return SyscallOutcome::Status(Error::AccessDenied.raw());
     }
     cpu::enable_interrupts();
     let outcome = dispatch(&process, call, args);
@@ -75,11 +68,11 @@ pub(crate) fn user_fault(vector: u64, error: u64, address: u64, stack_fixed: boo
     cpu::disable_interrupts();
 }
 
-fn dispatch(p: &Process, call: u64, [a0, a1, a2, a3, a4, a5]: [u64; 6]) -> Outcome {
+fn dispatch(p: &Process, call: u64, [a0, a1, a2, a3, a4, a5]: [u64; 6]) -> SyscallOutcome {
     let result = match call {
         number::THREAD_EXIT => {
             p.thread_ended(Ending::Exited(a0));
-            return Outcome::ThreadExit;
+            return SyscallOutcome::ThreadExit;
         }
         number::DEBUG_REPORT | number::DEBUG_WRITE if !p.debug_calls() => Err(Error::NotSupported),
         number::DEBUG_REPORT => {
@@ -95,7 +88,7 @@ fn dispatch(p: &Process, call: u64, [a0, a1, a2, a3, a4, a5]: [u64; 6]) -> Outco
         number::WAIT_ONE => wait_one(p, a0, a1, a2, a3),
         _ => Err(Error::NotSupported),
     };
-    Outcome::Status(match result {
+    SyscallOutcome::Status(match result {
         Ok(()) => OK,
         Err(e) => e.raw(),
     })

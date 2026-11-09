@@ -771,6 +771,34 @@ impl Drop for Console {
     }
 }
 
+/// One exception report, from the trap entry's hook: it gets out even if this processor
+/// faulted inside the console.
+pub(crate) fn report_exception(r: &origin_frame::trap::ExceptionReport<'_>) {
+    use core::fmt::Write as _;
+    use framekernel::descriptors::exception_name;
+    let mut com1 = Console::urgent();
+    let _ = writeln!(
+        com1,
+        "origin-kernel: exception {} ({}) at rip {:#x}, error code {:#x}",
+        r.vector,
+        exception_name(r.vector),
+        r.rip,
+        r.error_code
+    );
+    if r.vector == 3 {
+        let _ = writeln!(com1, "origin-kernel: breakpoint handled; resuming");
+        return;
+    }
+    let _ = writeln!(
+        com1,
+        "origin-kernel: rsp {:#x} rflags {:#x} cs {:#x} rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x}",
+        r.rsp, r.rflags, r.cs, r.rax, r.rbx, r.rcx, r.rdx
+    );
+    if let Some(report) = r.machine_check {
+        let _ = writeln!(com1, "origin-kernel: machine check: {report}");
+    }
+}
+
 /// Lines each processor prints in the proof.
 const PROOF_LINES: u64 = 20;
 /// Letters after each proof line's prefix: one letter per processor, repeated, so a line

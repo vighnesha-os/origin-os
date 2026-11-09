@@ -12,7 +12,6 @@
 //! prove on the real processor that the page protections hold.
 
 use core::arch::{asm, naked_asm};
-use core::fmt::Write;
 use core::ptr;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -682,22 +681,6 @@ pub(crate) const NET_VECTOR: u8 = 0x42;
 /// The virtio-net NIC's transmit-completion interrupt (an MSI-X message).
 pub(crate) const NET_TX_VECTOR: u8 = 0x43;
 
-/// Interrupts taken on [`IOAPIC_VECTOR`].
-static IOAPIC_IRQS: AtomicU64 = AtomicU64::new(0);
-/// Interrupts taken on [`IOAPIC_VECTOR`], by the CPU index of the processor that took them.
-static IOAPIC_IRQS_ON: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
-
-/// How many I/O APIC-routed interrupts have been taken.
-pub(crate) fn ioapic_irqs() -> u64 {
-    IOAPIC_IRQS.load(Ordering::Relaxed)
-}
-
-/// How many I/O APIC-routed interrupts the processor with CPU index `cpu` has taken.
-pub(crate) fn ioapic_irqs_on(cpu: CpuIndex) -> u64 {
-    IOAPIC_IRQS_ON
-        .get(cpu.get())
-        .map_or(0, |n| n.load(Ordering::Relaxed))
-}
 /// The vector in a system call's frame (no gate has it: `syscall` builds the frame itself,
 /// and `int 0x80` from ring 3 faults).
 pub(crate) const SYSCALL_VECTOR: u8 = 0x80;
@@ -738,6 +721,15 @@ pub(crate) fn bsp_debug_stack() -> (u64, u64) {
     (low, low + IST_STACK_SIZE as u64)
 }
 
+/// Disables interrupts and halts this processor forever.
+pub(crate) fn halt() -> ! {
+    loop {
+        // SAFETY: the kernel runs at CPL 0. `cli; hlt` touches no memory and needs no stack.
+        // An NMI or SMI can still resume the processor, so it halts again.
+        unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
+    }
+}
+
 /// Local APIC timer interrupts taken since boot.
 pub(crate) fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
@@ -751,13 +743,19 @@ pub(crate) fn breakpoint() {
 }
 
 /// Called by [`exception_common`] with the saved frame.
+///
+/// Everything above the framework is reached through [`origin_frame::trap::hooks`] and
+/// [`origin_frame::irq`]: this function does not know the scheduler, the system-call layer,
+/// the console or any driver.
 extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
+    use origin_frame::irq::{self, Action};
     // The frame to resume: this one, unless the scheduler switches to another thread.
     let here = ptr::from_mut(frame).addr() as u64;
     // A program can set RFLAGS.AC; the entry path must have cleared it for the kernel.
     if frame.cs & 3 == 3 && SMAP_ON.load(Ordering::Relaxed) && read_rflags() & RFLAGS_AC != 0 {
         AC_LEAKS.fetch_add(1, Ordering::Relaxed);
     }
+    let hooks = origin_frame::trap::hooks();
     // Device interrupts: the timer counts and acknowledges; a spurious interrupt needs no
     // EOI (SDM Vol. 3A, spurious interrupt).
     if frame.vector == u64::from(TIMER_VECTOR) {
@@ -765,47 +763,23 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // SAFETY: x2APIC mode is enabled before the timer is unmasked (`timer::init`), and
         // writing 0 to the EOI register only acknowledges the interrupt in service.
         unsafe { wrmsr(X2APIC_EOI, 0) };
-        return crate::sched::on_tick(here);
+        return hooks.map_or(here, |h| (h.tick)(here));
     }
     if frame.vector == u64::from(SPURIOUS_VECTOR) {
         return here;
     }
-    // A legacy IRQ routed through the I/O APIC (the PIT, for the routing proof): count and
-    // acknowledge.
-    if frame.vector == u64::from(IOAPIC_VECTOR) {
-        IOAPIC_IRQS.fetch_add(1, Ordering::Relaxed);
-        if let Some(n) = IOAPIC_IRQS_ON.get(this_cpu().get()) {
-            n.fetch_add(1, Ordering::Relaxed);
-        }
-        // SAFETY: as for the timer; x2APIC mode is on, and the write only acknowledges the
-        // interrupt in service.
-        unsafe { wrmsr(X2APIC_EOI, 0) };
-        return here;
-    }
-    // A device's MSI-X message (the NVMe I/O queue): acknowledge, let the driver wake its
-    // waiter, and switch to it if it should run now.
-    if frame.vector == u64::from(DEVICE_VECTOR) {
-        // SAFETY: as for the timer: MSI-X messages are only routed to processors whose
+    // A device's interrupt message, or a legacy IRQ routed through the I/O APIC: acknowledge,
+    // run the handler its driver registered, and let the scheduler switch to a thread it woke.
+    if let Ok(vector) = u8::try_from(frame.vector)
+        && irq::is_device_vector(vector)
+    {
+        // SAFETY: as for the timer: interrupt messages are only routed to processors whose
         // APIC is in x2APIC mode; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
-        crate::storage::on_interrupt();
-        return crate::sched::on_reschedule(here);
-    }
-    // The virtio-net NIC's used-buffer MSI-X message: acknowledge, let the driver wake its
-    // receive thread, and switch to it if it should run now.
-    if frame.vector == u64::from(NET_VECTOR) {
-        // SAFETY: as for the NVMe device vector; the write only acknowledges the interrupt.
-        unsafe { wrmsr(X2APIC_EOI, 0) };
-        crate::virtionet::on_interrupt();
-        return crate::sched::on_reschedule(here);
-    }
-    // The virtio-net NIC's transmit-completion MSI-X message: acknowledge, let the driver wake
-    // a sender waiting for a descriptor, and switch to it if it should run now.
-    if frame.vector == u64::from(NET_TX_VECTOR) {
-        // SAFETY: as for the NVMe device vector; the write only acknowledges the interrupt.
-        unsafe { wrmsr(X2APIC_EOI, 0) };
-        crate::virtionet::on_tx_interrupt();
-        return crate::sched::on_reschedule(here);
+        return match irq::run(vector) {
+            Action::Resume => here,
+            Action::Reschedule => hooks.map_or(here, |h| (h.reschedule)(here)),
+        };
     }
     // Another processor woke a thread queued here: acknowledge, then switch to it if it
     // should run now, rather than at the next timer tick.
@@ -813,7 +787,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // SAFETY: as for the timer: only processors with an active scheduler are sent this
         // vector, so x2APIC mode is on; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
-        return crate::sched::on_reschedule(here);
+        return hooks.map_or(here, |h| (h.reschedule)(here));
     }
     // Another processor changed a kernel mapping: invalidate it here, then acknowledge.
     if frame.vector == u64::from(crate::tlb::SHOOTDOWN_VECTOR) {
@@ -831,27 +805,30 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     }
     // Scheduler requests from kernel threads (`sched::yield_now`, `sleep`, `exit`).
     if frame.vector == u64::from(YIELD_VECTOR) {
-        return crate::sched::on_yield(here);
+        return hooks.map_or(here, |h| (h.yield_now)(here));
     }
     if frame.vector == u64::from(SLEEP_VECTOR) {
-        return crate::sched::on_sleep(here, frame.rdi);
+        return hooks.map_or(here, |h| (h.sleep)(here, frame.rdi));
     }
     if frame.vector == u64::from(EXIT_VECTOR) {
-        return crate::sched::on_exit(here);
+        return hooks.map_or(here, |h| (h.exit)(here));
     }
     if frame.vector == u64::from(BLOCK_VECTOR) {
-        return crate::sched::on_block(here, frame.rdi);
+        return hooks.map_or(here, |h| (h.block)(here, frame.rdi));
     }
     if frame.vector == u64::from(SYSCALL_VECTOR) {
         let args = [
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ];
-        return match crate::syscall::run(frame.rax, args, frame.rip) {
-            crate::syscall::Outcome::Status(status) => {
+        let Some(hooks) = hooks else {
+            halt();
+        };
+        return match (hooks.syscall)(frame.rax, args, frame.rip) {
+            origin_frame::trap::SyscallOutcome::Status(status) => {
                 frame.rax = status as u64;
                 here
             }
-            crate::syscall::Outcome::ThreadExit => crate::sched::on_exit(here),
+            origin_frame::trap::SyscallOutcome::ThreadExit => (hooks.exit)(here),
         };
     }
     // A machine check is the hardware reporting on itself: it says nothing about the program
@@ -876,8 +853,11 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         if on_exception_stack {
             DEBUG_FRAME.store(here, Ordering::SeqCst);
         }
-        crate::syscall::user_fault(frame.vector, frame.error_code, address, on_exception_stack);
-        return crate::sched::on_exit(here);
+        let Some(hooks) = hooks else {
+            halt();
+        };
+        (hooks.user_fault)(frame.vector, frame.error_code, address, on_exception_stack);
+        return (hooks.exit)(here);
     }
     // A page fault at the user-copy instruction, on a user address: resume at
     // `probe_recover`, which returns "failed" to `copy_user`'s caller.
@@ -902,35 +882,34 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
             return here;
         }
     }
-    // An exception report must get out even if this processor faulted inside the console.
-    let mut com1 = crate::console::Console::urgent();
+    // A report must get out even if this processor faulted inside the console (the hook,
+    // `console::report_exception`, uses the console's urgent path). Only #BP resumes.
     let vector = frame.vector as u8;
-    let _ = writeln!(
-        com1,
-        "origin-kernel: exception {} ({}) at rip {:#x}, error code {:#x}",
-        vector,
-        d::exception_name(vector),
-        frame.rip,
-        frame.error_code
-    );
+    if let Some(hooks) = hooks {
+        let _ = (
+            frame.rsi, frame.rdi, frame.rbp, frame.r8, frame.r9, frame.r10, frame.r11,
+        );
+        let _ = (frame.r12, frame.r13, frame.r14, frame.r15, frame.ss);
+        (hooks.report_exception)(&origin_frame::trap::ExceptionReport {
+            vector,
+            error_code: frame.error_code,
+            rip: frame.rip,
+            rsp: frame.rsp,
+            rflags: frame.rflags,
+            cs: frame.cs,
+            rax: frame.rax,
+            rbx: frame.rbx,
+            rcx: frame.rcx,
+            rdx: frame.rdx,
+            machine_check: machine_check_report
+                .as_ref()
+                .map(|report| report as &dyn core::fmt::Display),
+        });
+    }
     if vector == 3 {
-        let _ = writeln!(com1, "origin-kernel: breakpoint handled; resuming");
         return here;
     }
-    let _ = writeln!(
-        com1,
-        "origin-kernel: rsp {:#x} rflags {:#x} cs {:#x} rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x}",
-        frame.rsp, frame.rflags, frame.cs, frame.rax, frame.rbx, frame.rcx, frame.rdx
-    );
-    let _ = (
-        frame.rsi, frame.rdi, frame.rbp, frame.r8, frame.r9, frame.r10, frame.r11,
-    );
-    let _ = (frame.r12, frame.r13, frame.r14, frame.r15, frame.ss);
-    if let Some(report) = machine_check_report {
-        let _ = writeln!(com1, "origin-kernel: machine check: {report}");
-    }
-    drop(com1);
-    crate::halt()
+    halt()
 }
 
 /// The machine-check MSRs and bits (Intel SDM Vol. 3B §16.3): CPUID.1:EDX.MCA, the number of

@@ -6,7 +6,7 @@
 # only shrink. When a file is migrated, lower its count or remove its line in the same commit.
 # `cargo xtask unsafe-list` prints what should be here.
 18 framekernel/src/console.rs
-124 framekernel/src/cpu.rs
+122 framekernel/src/cpu.rs
 1 framekernel/src/dma.rs
 1 framekernel/src/firmware.rs
 7 framekernel/src/i8042.rs
@@ -15,7 +15,7 @@
 9 framekernel/src/ipc.rs
 4 framekernel/src/ipc_proof.rs
 10 framekernel/src/irq.rs
-35 framekernel/src/main.rs
+34 framekernel/src/main.rs
 4 framekernel/src/memory.rs
 2 framekernel/src/pcie.rs
 5 framekernel/src/process.rs

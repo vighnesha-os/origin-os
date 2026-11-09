@@ -18,15 +18,17 @@
 
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use framekernel::acpi::{self, IoApic, SourceOverride};
 use framekernel::apic;
 use framekernel::ioapic::{self, RemappableEntry};
 use framekernel::vtd::{Irte, SourceCheck};
+use origin_frame::irq::{self as vectors, Action};
 use origin_frame::sync::SpinLock;
 
 use crate::console::Console;
-use crate::cpu::{self, CpuIndex, rdtsc};
+use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
 use crate::iommu::{Detail, Fault, Recorded};
 use crate::outb;
 
@@ -108,6 +110,32 @@ impl MappedIoApic {
 
 /// A redirection entry's mask bit (low dword bit 16).
 const MASKED: u32 = 1 << 16;
+
+/// Interrupts taken on the I/O APIC's vector.
+static IOAPIC_IRQS: AtomicU64 = AtomicU64::new(0);
+/// Interrupts taken on the I/O APIC's vector, by the CPU index of the processor that took them.
+static IOAPIC_IRQS_ON: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// How many I/O APIC-routed interrupts have been taken.
+fn ioapic_irqs() -> u64 {
+    IOAPIC_IRQS.load(Ordering::Relaxed)
+}
+
+/// How many I/O APIC-routed interrupts the processor with CPU index `cpu` has taken.
+fn ioapic_irqs_on(cpu: CpuIndex) -> u64 {
+    IOAPIC_IRQS_ON
+        .get(cpu.get())
+        .map_or(0, |n| n.load(Ordering::Relaxed))
+}
+
+/// An I/O APIC-routed interrupt: counted, and the interrupted context resumes.
+fn on_interrupt() -> Action {
+    IOAPIC_IRQS.fetch_add(1, Ordering::Relaxed);
+    if let Some(n) = IOAPIC_IRQS_ON.get(cpu::this_cpu().get()) {
+        n.fetch_add(1, Ordering::Relaxed);
+    }
+    Action::Resume
+}
 
 /// The pin the PIT's IRQ0 reaches, as [`prove`] found it, kept for [`prove_remapped`].
 #[derive(Clone, Copy)]
@@ -224,7 +252,14 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
         cpu::IOAPIC_VECTOR
     );
 
-    let before = cpu::ioapic_irqs();
+    if vectors::register(cpu::IOAPIC_VECTOR, on_interrupt).is_err() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: I/O APIC: its interrupt vector is already taken: I/O APIC failed"
+        );
+        return false;
+    }
+    let before = ioapic_irqs();
     let (low, high) =
         ioapic::redirection_entry(cpu::IOAPIC_VECTOR, destination, active_low, level, false);
     mapped.set_redirection(index, low, high);
@@ -233,7 +268,7 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
     // Count interrupts, polling with interrupt windows (never halting), within two seconds.
     let start = rdtsc();
     let limit = tsc_hz.saturating_mul(2);
-    while cpu::ioapic_irqs() - before < PROOF_TICKS && rdtsc().wrapping_sub(start) < limit {
+    while ioapic_irqs() - before < PROOF_TICKS && rdtsc().wrapping_sub(start) < limit {
         cpu::interrupt_window();
         core::hint::spin_loop();
     }
@@ -244,7 +279,7 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
     mapped.set_redirection(index, masked_low, high);
     stop_pit();
 
-    let taken = cpu::ioapic_irqs() - before;
+    let taken = ioapic_irqs() - before;
     let micros = elapsed.saturating_mul(1_000_000) / tsc_hz.max(1);
     let ok = taken >= PROOF_TICKS;
     let _ = writeln!(
@@ -258,7 +293,7 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
 
 /// Interrupts each of `cpus` has taken on the I/O APIC vector so far.
 fn taken(cpus: &[CpuIndex]) -> Vec<u64> {
-    cpus.iter().map(|&c| cpu::ioapic_irqs_on(c)).collect()
+    cpus.iter().map(|&c| ioapic_irqs_on(c)).collect()
 }
 
 /// Interrupts taken since `before` (from [`taken`] over the same `cpus`): on `target`, and
@@ -266,7 +301,7 @@ fn taken(cpus: &[CpuIndex]) -> Vec<u64> {
 fn since(cpus: &[CpuIndex], before: &[u64], target: CpuIndex) -> (u64, u64) {
     let (mut on, mut elsewhere) = (0, 0);
     for (&c, &b) in cpus.iter().zip(before) {
-        let n = cpu::ioapic_irqs_on(c).wrapping_sub(b);
+        let n = ioapic_irqs_on(c).wrapping_sub(b);
         if c == target {
             on += n;
         } else {
@@ -290,8 +325,8 @@ fn wait_ms(ms: u64, tsc_hz: u64) {
 /// Waits, for at most a second, until `cpu` has taken `n` more interrupts on the I/O APIC
 /// vector; returns whether it did.
 fn wait_for(cpu: CpuIndex, n: u64, tsc_hz: u64) -> bool {
-    let from = cpu::ioapic_irqs_on(cpu);
-    let more = || cpu::ioapic_irqs_on(cpu).wrapping_sub(from) >= n;
+    let from = ioapic_irqs_on(cpu);
+    let more = || ioapic_irqs_on(cpu).wrapping_sub(from) >= n;
     crate::sched::yield_until(more, tsc_hz, 1);
     more()
 }
@@ -481,9 +516,9 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
     let before = taken(&ids);
     let start = rdtsc();
     start_pit();
-    let from = cpu::ioapic_irqs_on(target);
+    let from = ioapic_irqs_on(target);
     crate::sched::yield_until(
-        || cpu::ioapic_irqs_on(target).wrapping_sub(from) >= PROOF_TICKS,
+        || ioapic_irqs_on(target).wrapping_sub(from) >= PROOF_TICKS,
         tsc_hz,
         2,
     );
