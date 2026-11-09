@@ -16,7 +16,6 @@
 //! reschedule IPI goes to the APIC ID recorded for the target's index.
 #![forbid(unsafe_code)]
 
-use alloc::sync::Arc;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -27,6 +26,7 @@ use crate::console::Console;
 use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
 use crate::process::Process;
 use crate::timer::{self, X2Apic};
+use origin_frame::objref::ObjectRef;
 use origin_frame::stack::{FpuArea, GuardedStack, ThreadStart};
 use origin_frame::sync::SpinLock;
 
@@ -116,7 +116,7 @@ static FIRST_GUARD: AtomicU64 = AtomicU64::new(0);
 struct Zombie {
     stack: GuardedStack,
     fpu: Option<FpuArea>,
-    process: Option<Arc<Process>>,
+    process: Option<ObjectRef<Process>>,
 }
 
 /// Per CPU: each slot's stack, and the stacks of threads that exited and await
@@ -128,7 +128,7 @@ struct Threads {
     /// Each slot's FPU/SIMD save area; slot 0 is the boot or idle context.
     fpu: [Option<FpuArea>; crate::runqueue::CAPACITY],
     /// The process each slot's thread belongs to (`None`: a kernel thread).
-    process: [Option<Arc<Process>>; crate::runqueue::CAPACITY],
+    process: [Option<ObjectRef<Process>>; crate::runqueue::CAPACITY],
 }
 
 static THREADS: [SpinLock<Threads>; MAX_CPUS] = [const {
@@ -345,7 +345,7 @@ pub(crate) fn exit() -> ! {
 }
 
 /// The process of the running thread, or `None` for a kernel thread.
-pub(crate) fn current_process() -> Option<Arc<Process>> {
+pub(crate) fn current_process() -> Option<ObjectRef<Process>> {
     let id = this_cpu();
     let (queue, threads) = (QUEUES.get(id)?, THREADS.get(id)?);
     without_interrupts(|| {
@@ -386,7 +386,7 @@ pub(crate) fn spawn(
 /// scheduled (there is no kernel half to the thread until it enters the kernel).
 pub(crate) fn spawn_user(
     cpu: CpuIndex,
-    process: Arc<Process>,
+    process: ObjectRef<Process>,
     rip: u64,
     rsp: u64,
     rdi: u64,
@@ -414,7 +414,7 @@ fn spawn_with(
     cpu: CpuIndex,
     start: ThreadStart,
     weight: u32,
-    process: Option<Arc<Process>>,
+    process: Option<ObjectRef<Process>>,
 ) -> Result<usize, QueueError> {
     spawn_with_fpu(cpu, start, weight, process, FpuArea::new)
 }
@@ -426,7 +426,7 @@ fn spawn_with_fpu(
     cpu: CpuIndex,
     start: ThreadStart,
     weight: u32,
-    process: Option<Arc<Process>>,
+    process: Option<ObjectRef<Process>>,
     fpu_area: impl FnOnce() -> Option<FpuArea>,
 ) -> Result<usize, QueueError> {
     let queue = QUEUES.get(cpu.get()).ok_or(QueueError::Full)?;

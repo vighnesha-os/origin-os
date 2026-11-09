@@ -21,7 +21,6 @@
 //! change while it lives.
 #![forbid(unsafe_code)]
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -277,7 +276,7 @@ impl Process {
     /// Starts a thread of this process on processor `cpu`, at the user address `rip` with
     /// the stack pointer `rsp` and `rdi` as its RDI; every other register is zero.
     pub(crate) fn start_thread(
-        process: &Arc<Self>,
+        process: &ObjectRef<Self>,
         cpu: CpuIndex,
         rip: u64,
         rsp: u64,

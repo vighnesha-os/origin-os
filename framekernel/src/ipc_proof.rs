@@ -26,7 +26,6 @@
 
 #![forbid(unsafe_code)]
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
@@ -35,6 +34,7 @@ use crate::paging::{Access, PAGE};
 use origin_abi::limits::{DEADLINE_INFINITE, MAX_MESSAGE_BYTES};
 use origin_abi::{Error, OK, read_sizes, rights, signals, status_name, syscall as sys};
 
+use origin_frame::objref::ObjectRef;
 use origin_frame::proof_programs::{self, DATA, STACK};
 use origin_frame::userspace::UserFrame;
 
@@ -338,8 +338,9 @@ impl Image {
         self.write(at, &encoded)
     }
 
-    fn finish(self) -> Arc<Process> {
-        Arc::new(self.process)
+    /// The process, now shared; `None` without the memory to share it.
+    fn finish(self) -> Option<ObjectRef<Process>> {
+        ObjectRef::try_new(self.process).ok()
     }
 }
 
@@ -489,10 +490,10 @@ fn ping_pong(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) 
 }
 
 /// The process of `image`, its round count written (handles are written after the grants).
-fn build_pinger(image: Image, rounds: u64) -> Option<Arc<Process>> {
+fn build_pinger(image: Image, rounds: u64) -> Option<ObjectRef<Process>> {
     image.write_u64(DATA + 8, rounds)?;
     image.write(SIZES, &read_sizes::SIZE.to_le_bytes())?;
-    Some(image.finish())
+    image.finish()
 }
 
 /// Writes `value` to the `u64` at `offset` of the process's data page, before it starts.
@@ -859,7 +860,9 @@ fn hostile(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     if image.scratch().is_none() || image.script(&steps).is_none() {
         return false;
     }
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -933,7 +936,9 @@ fn exit_closes(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64
         {
             return false;
         }
-        let (waiter, ender) = (waiter.finish(), ender.finish());
+        let (Some(waiter), Some(ender)) = (waiter.finish(), ender.finish()) else {
+            return false;
+        };
         let wakes_before = ipc::cross_cpu_wakes();
         if Process::start_thread(&waiter, far, CODE, STACK + PAGE, SCRIPT).is_err() {
             return false;
@@ -1008,7 +1013,9 @@ fn cancel(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> 
     if image.write_script(second_script, &second).is_none() {
         return false;
     }
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -1077,7 +1084,9 @@ fn quotas(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     if image.scratch().is_none() || image.script(&group[0].steps).is_none() {
         return false;
     }
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -1153,7 +1162,9 @@ fn byte_quota(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64)
     {
         return false;
     }
-    let (writer, peer) = (writer.finish(), peer.finish());
+    let (Some(writer), Some(peer)) = (writer.finish(), peer.finish()) else {
+        return false;
+    };
     if Process::start_thread(&writer, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -1226,7 +1237,9 @@ fn transfer_depth(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     if image.scratch().is_none() || image.script(&group[0].steps).is_none() {
         return false;
     }
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -1269,7 +1282,9 @@ fn big_message(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
             return false;
         }
     }
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -1304,7 +1319,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let Some(image) = Image::new(LIMITS, code) else {
         return false;
     };
-    let regs = image.finish();
+    let Some(regs) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&regs, bsp, CODE, STACK + PAGE, 0).is_err() {
         return false;
     }
@@ -1328,7 +1345,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     if image.scratch().is_none() || image.script(&script).is_none() {
         return false;
     }
-    let pinned = image.finish();
+    let Some(pinned) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&pinned, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -1354,7 +1373,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let Some(image) = Image::new(LIMITS, gs) else {
         return false;
     };
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
         return false;
     }
@@ -1373,7 +1394,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let Some(image) = Image::new(LIMITS, ac) else {
         return false;
     };
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     let leaks_before = cpu::ac_leaks();
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
         return false;
@@ -1400,7 +1423,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let Some(image) = Image::new(limits, nodebug) else {
         return false;
     };
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
         return false;
     }
@@ -1420,7 +1445,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let Some(image) = Image::new(LIMITS, sidt) else {
         return false;
     };
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
         return false;
     }
@@ -1447,7 +1474,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let Some(image) = Image::new(LIMITS, step) else {
         return false;
     };
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
         return false;
     }
