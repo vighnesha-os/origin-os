@@ -700,8 +700,8 @@ const CONTROLS: &[Control] = &[
         // Nobody is told, so nobody answers.
         name: "shootdown_skips_its_target",
         file: SHOOTDOWN,
-        from: "                if id != me && self.must_answer(id) {\n",
-        to: "                if false && id != me && self.must_answer(id) {\n",
+        from: "                if id != me && self.must_answer(id, scope) {\n",
+        to: "                if false && id != me && self.must_answer(id, scope) {\n",
         models: &[("shootdown_reaches_an_online_processor", STALE)],
     },
     Control {
@@ -744,7 +744,10 @@ const CONTROLS: &[Control] = &[
         file: SHOOTDOWN,
         from: "            prim::fence(Ordering::SeqCst);\n            let mut targets = [false; CPUS];\n",
         to: "            let mut targets = [false; CPUS];\n",
-        models: &[("shootdown_and_a_processor_coming_online", STALE)],
+        models: &[
+            ("shootdown_and_a_processor_coming_online", STALE),
+            ("shootdown_and_a_processor_entering_the_space", STALE),
+        ],
     },
     Control {
         // A processor comes online and walks tables without ordering that after the flag.
@@ -753,6 +756,54 @@ const CONTROLS: &[Control] = &[
         from: "        prim::fence(Ordering::SeqCst);\n        hardware.invalidate(Request::Everything);\n",
         to: "        hardware.invalidate(Request::Everything);\n",
         models: &[("shootdown_and_a_processor_coming_online", STALE)],
+    },
+    Control {
+        // A processor enters the space and walks its tables without ordering that after
+        // saying so: the initiator can miss it while its walks still see the old entry.
+        name: "entering_a_space_without_a_fence",
+        file: SHOOTDOWN,
+        from: "        prim::fence(Ordering::SeqCst);\n        let result = load();\n",
+        to: "        let result = load();\n",
+        models: &[("shootdown_and_a_processor_entering_the_space", STALE)],
+    },
+    Control {
+        // A processor still on the old tables counts as gone once it has announced the new ones.
+        name: "a_processor_leaving_is_not_counted",
+        file: SHOOTDOWN,
+        from: "            || self
+                .leaving
+                .get(id)
+                .is_some_and(|leaving| leaving.load(Ordering::Acquire) == root)
+",
+        to: "",
+        models: &[("shootdown_and_a_processor_leaving_the_space", STALE)],
+    },
+    Control {
+        // The old root is forgotten before the CR3 write, not after it.
+        name: "the_old_root_forgotten_before_the_switch",
+        file: SHOOTDOWN,
+        from: "        prim::fence(Ordering::SeqCst);\n        let result = load();\n        if let Some(leaving) = self.leaving.get(me) {\n            leaving.store(0, Ordering::Release);\n        }\n",
+        to: "        prim::fence(Ordering::SeqCst);\n        if let Some(leaving) = self.leaving.get(me) {\n            leaving.store(0, Ordering::Release);\n        }\n        let result = load();\n",
+        models: &[("shootdown_and_a_processor_leaving_the_space", STALE)],
+    },
+    Control {
+        // A request for one space interrupts everyone.
+        name: "a_space_request_asks_everyone",
+        file: SHOOTDOWN,
+        from: "                Scope::Space(root) => self.holds(id, root),\n",
+        to: "                Scope::Space(root) => root == root,\n",
+        models: &[(
+            "shootdown_for_a_space_asks_only_the_processors_in_it",
+            &["a shootdown for one space reached a processor in another", "deadlock", "Model exceeded maximum number of branches"],
+        )],
+    },
+    Control {
+        // Nobody is in the space, as far as the initiator can tell.
+        name: "a_space_request_asks_nobody",
+        file: SHOOTDOWN,
+        from: "                Scope::Space(root) => self.holds(id, root),\n",
+        to: "                Scope::Space(root) => root != root,\n",
+        models: &[("shootdown_for_a_space_asks_only_the_processors_in_it", STALE)],
     },
 ];
 

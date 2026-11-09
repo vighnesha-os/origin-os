@@ -75,7 +75,9 @@
 //!   a stale floor taken at face value.
 //! - TLB shootdown: when `shoot` returns, every online processor that held the translation has
 //!   dropped it, also one coming online at that moment; the invalidation it does is the one the
-//!   initiator asked for; and two initiators shooting at each other both finish.
+//!   initiator asked for; and two initiators shooting at each other both finish. A request for
+//!   one address space asks a processor in another for nothing, and still leaves no stale
+//!   translation on a processor entering or leaving that space as it runs.
 //!
 //! # What is not proved
 //!
@@ -139,7 +141,7 @@ use loom::thread::{self, JoinHandle};
 
 use crate::floor::MonotonicFloor;
 use crate::runqueue::RunQueue;
-use crate::shootdown::{Request, Shootdown, TlbHardware};
+use crate::shootdown::{Request, Scope, Shootdown, TlbHardware};
 use crate::wait::{Scheduler, TimedOut, WaitQueue};
 use crate::{RwLock, SpinLock};
 
@@ -1511,12 +1513,13 @@ impl TlbCpu {
         }
     }
 
-    /// Takes the page away everywhere, as `vm::unmap` does: the entry first, then the shootdown.
-    fn take_the_page_away(&self) {
+    /// Takes the page away everywhere `scope` covers, as `vm::unmap` and a space's unmap do:
+    /// the entry first, then the shootdown.
+    fn take_the_page_away(&self, scope: Scope) {
         self.world.pte.store(0, Relaxed);
         self.world
             .shootdown
-            .shoot(self, Request::page(THE_PAGE))
+            .shoot(self, Request::page(THE_PAGE), scope)
             .unwrap();
     }
 }
@@ -1535,7 +1538,7 @@ fn shootdown_reaches_an_online_processor() {
             world.shootdown.mark_online(&far);
             world.tlb[1].store(true, Relaxed);
             let serving = far.serving();
-            near.take_the_page_away();
+            near.take_the_page_away(Scope::Kernel);
             assert!(!far.holds(), "{STALE}");
             world.finish(vec![serving]);
         },
@@ -1567,7 +1570,7 @@ fn shootdown_and_a_processor_coming_online() {
                     }),
                 )
             };
-            near.take_the_page_away();
+            near.take_the_page_away(Scope::Kernel);
             world.finish(vec![serving]);
             assert!(!far.holds(), "{STALE}");
         },
@@ -1598,7 +1601,7 @@ fn shootdown_two_initiators_serve_each_other() {
                     (
                         cpu.id,
                         thread::spawn(move || {
-                            me.take_the_page_away();
+                            me.take_the_page_away(Scope::Kernel);
                             assert!(!me.world.tlb[other].load(Relaxed), "{STALE}");
                             finished.0.fetch_add(1, Release);
                             finished.1.notify();
@@ -1612,6 +1615,114 @@ fn shootdown_two_initiators_serve_each_other() {
                 finished.1.wait();
             }
             world.finish(handles);
+        },
+    );
+}
+
+/// The address space of the targeted models.
+const THE_SPACE: u64 = 0xA000;
+/// Another address space: the kernel's, or a process's that has nothing to do with this.
+const OTHER_SPACE: u64 = 0xC000;
+
+/// A processor in the space holds the translation: it is asked, and it answers. A processor in
+/// another space, which also holds a translation of that address of its own, is not asked: it
+/// is never interrupted and keeps it.
+#[test]
+fn shootdown_for_a_space_asks_only_the_processors_in_it() {
+    check(
+        "shootdown_for_a_space_asks_only_the_processors_in_it",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let (near, inside, elsewhere) =
+                (tlb_cpu(&world, 0), tlb_cpu(&world, 1), tlb_cpu(&world, 2));
+            for cpu in [&near, &inside, &elsewhere] {
+                world.shootdown.mark_online(cpu);
+            }
+            world.shootdown.switch_space(1, 0, THE_SPACE, || ());
+            world.tlb[1].store(true, Relaxed);
+            world.shootdown.switch_space(2, 0, OTHER_SPACE, || ());
+            world.tlb[2].store(true, Relaxed);
+            let serving = vec![inside.serving()];
+            near.take_the_page_away(Scope::Space(THE_SPACE));
+            assert!(!inside.holds(), "{STALE}");
+            assert!(
+                elsewhere.holds(),
+                "a shootdown for one space reached a processor in another"
+            );
+            world.finish(serving);
+        },
+    );
+}
+
+/// A processor enters the space while the page is taken away: the initiator either sees it
+/// arriving and waits for its answer, or the walks it does on arrival see the entry gone.
+#[test]
+fn shootdown_and_a_processor_entering_the_space() {
+    check(
+        "shootdown_and_a_processor_entering_the_space",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let (near, entering) = (tlb_cpu(&world, 0), tlb_cpu(&world, 1));
+            world.shootdown.mark_online(&near);
+            world.shootdown.mark_online(&entering);
+            world.shootdown.switch_space(1, 0, OTHER_SPACE, || ());
+            let serving = {
+                let me = entering.clone();
+                (
+                    1,
+                    thread::spawn(move || {
+                        let world = Arc::clone(&me.world);
+                        world
+                            .shootdown
+                            .switch_space(1, OTHER_SPACE, THE_SPACE, || me.walk());
+                        me.serve();
+                    }),
+                )
+            };
+            near.take_the_page_away(Scope::Space(THE_SPACE));
+            world.finish(vec![serving]);
+            assert!(!entering.holds(), "{STALE}");
+        },
+    );
+}
+
+/// A processor leaves the space while the page is taken away, with the translation still
+/// cached until its CR3 write. When `shoot` returns the translation must be gone: either it
+/// has left, or the initiator saw it leaving and waited.
+#[test]
+fn shootdown_and_a_processor_leaving_the_space() {
+    check(
+        "shootdown_and_a_processor_leaving_the_space",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let (near, leaving) = (tlb_cpu(&world, 0), tlb_cpu(&world, 1));
+            world.shootdown.mark_online(&near);
+            world.shootdown.mark_online(&leaving);
+            world.shootdown.switch_space(1, 0, THE_SPACE, || ());
+            world.tlb[1].store(true, Relaxed);
+            let serving = {
+                let me = leaving.clone();
+                (
+                    1,
+                    thread::spawn(move || {
+                        let world = Arc::clone(&me.world);
+                        world.shootdown.switch_space(1, THE_SPACE, OTHER_SPACE, || {
+                            // The CR3 load drops every non-global translation.
+                            me.invalidate(Request::NonGlobal);
+                        });
+                        me.serve();
+                    }),
+                )
+            };
+            near.take_the_page_away(Scope::Space(THE_SPACE));
+            assert!(!leaving.holds(), "{STALE}");
+            world.finish(vec![serving]);
         },
     );
 }

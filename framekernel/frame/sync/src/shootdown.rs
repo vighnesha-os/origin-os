@@ -17,8 +17,18 @@
 //!   initiator waits until every target's record reaches its own: a target has dropped the
 //!   translation by the time it answers.
 //! - The caller changes the page tables first. The initiator's change must be visible to whatever
-//!   it is racing with before it reads who is online: that is the `SeqCst` fence in
-//!   [`Shootdown::shoot`], which pairs with the one in [`Shootdown::mark_online`].
+//!   it is racing with before it reads who must answer: that is the `SeqCst` fence in
+//!   [`Shootdown::shoot`], which pairs with those in [`Shootdown::mark_online`] and
+//!   [`Shootdown::switch_space`].
+//!
+//! # Who must answer
+//!
+//! A kernel mapping is in every address space, so [`Scope::Kernel`] asks every online processor.
+//! A user mapping is only in its own space, and these processors use no PCIDs, so a CR3 load
+//! drops every non-global translation of the space it leaves: [`Scope::Space`] asks only the
+//! processors that have the space loaded or are in the middle of leaving it. A processor that
+//! has not reached the space yet needs nothing: its page walks start after its fence in
+//! `switch_space`, so if the initiator read that it had not arrived, those walks see the change.
 //!
 //! # What the caller must uphold
 //!
@@ -134,6 +144,16 @@ pub trait TlbHardware {
 
     /// How much of [`TlbHardware::now`] an initiator waits for one processor's answer.
     fn patience(&self) -> u64;
+}
+
+/// Which processors a request is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// Every online processor: a kernel mapping changed.
+    Kernel,
+    /// The processors that have the address space with this root loaded: one of its user
+    /// mappings changed.
+    Space(u64),
 }
 
 /// A completed shootdown: every processor it was for has dropped the translations.
@@ -280,15 +300,19 @@ impl<const CPUS: usize> Shootdown<CPUS> {
         });
     }
 
-    /// Whether processor `id` must answer a request made now.
-    fn must_answer(&self, id: usize) -> bool {
+    /// Whether processor `id` must answer a request for `scope` made now.
+    fn must_answer(&self, id: usize, scope: Scope) -> bool {
         self.online
             .get(id)
             .is_some_and(|online| online.load(Ordering::Acquire))
+            && match scope {
+                Scope::Kernel => true,
+                Scope::Space(root) => self.holds(id, root),
+            }
     }
 
-    /// Drops what `request` names from this processor's TLB and every online processor's, and
-    /// waits until each has.
+    /// Drops what `request` names from this processor's TLB and from every other processor
+    /// `scope` covers, and waits until each has.
     ///
     /// The caller changes the page tables first. On [`Stalled`] a processor may still hold the
     /// translation: what it maps must then never be reused.
@@ -296,6 +320,7 @@ impl<const CPUS: usize> Shootdown<CPUS> {
         &self,
         hardware: &impl TlbHardware,
         request: Request,
+        scope: Scope,
     ) -> Result<Completed, Stalled> {
         hardware.without_interrupts(|| {
             let turn = loop {
@@ -310,13 +335,14 @@ impl<const CPUS: usize> Shootdown<CPUS> {
             let me = hardware.this_cpu();
             self.request.store(request.encode(), Ordering::Relaxed);
             let generation = self.generation.fetch_add(1, Ordering::Release) + 1;
-            // The caller's page-table change and this request must be visible before the online
-            // set is read: a processor that is not yet online flushes after this.
+            // The caller's page-table change and this request must be visible before anyone is
+            // ruled out: a processor not yet online flushes after this, and one not yet in the
+            // space walks its tables after this (`mark_online`, `switch_space`).
             prim::fence(Ordering::SeqCst);
             let mut targets = [false; CPUS];
             let mut processors = 0;
             for (id, target) in targets.iter_mut().enumerate() {
-                if id != me && self.must_answer(id) {
+                if id != me && self.must_answer(id, scope) {
                     *target = true;
                     processors += 1;
                     hardware.send_ipi(id);
@@ -490,7 +516,7 @@ mod tests {
         let shootdown = Shootdown::<4>::new();
         shootdown.mark_online(&cpu(0, &machine));
         let done = shootdown
-            .shoot(&cpu(0, &machine), Request::page(0x1000))
+            .shoot(&cpu(0, &machine), Request::page(0x1000), Scope::Kernel)
             .unwrap();
         assert_eq!(done.processors, 0);
         assert!(machine.ipis.lock().unwrap().is_empty());
@@ -513,7 +539,7 @@ mod tests {
                 1
             }
             fn invalidate(&self, _: Request) {
-                let online = self.shootdown.must_answer(1);
+                let online = self.shootdown.must_answer(1, Scope::Kernel);
                 self.saw_online.store(online, Ordering::Relaxed);
             }
             fn send_ipi(&self, _: usize) {}
@@ -555,7 +581,7 @@ mod tests {
                     }
                 });
             }
-            let done = shootdown.shoot(&cpu(0, &machine), Request::page(0x5000));
+            let done = shootdown.shoot(&cpu(0, &machine), Request::page(0x5000), Scope::Kernel);
             stop.store(true, Ordering::Relaxed);
             done
         })
@@ -582,10 +608,10 @@ mod tests {
         let shootdown = Shootdown::<3>::new();
         shootdown.mark_online(&cpu(0, &machine));
         shootdown.mark_online(&cpu(2, &machine));
-        let outcome = shootdown.shoot(&cpu(0, &machine), Request::NonGlobal);
+        let outcome = shootdown.shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Kernel);
         assert_eq!(outcome, Err(Stalled { cpu: 2 }));
         // The turn is given back, so the next request can be made.
-        let next = shootdown.shoot(&cpu(2, &machine), Request::Everything);
+        let next = shootdown.shoot(&cpu(2, &machine), Request::Everything, Scope::Kernel);
         assert_eq!(next, Err(Stalled { cpu: 0 }));
     }
 
@@ -610,7 +636,7 @@ mod tests {
                         // its own requests, as a real one would in its handler.
                         shootdown.service(&me);
                         shootdown
-                            .shoot(&me, Request::page(0x1000 * (round + 1)))
+                            .shoot(&me, Request::page(0x1000 * (round + 1)), Scope::Kernel)
                             .unwrap();
                     }
                     finished.fetch_add(1, Ordering::Relaxed);
@@ -646,6 +672,89 @@ mod tests {
         shootdown.switch_space(5, 1, 2, || ran = true);
         assert!(ran);
         assert_eq!(shootdown.processors_holding(2), 0);
+    }
+
+    /// A processor that is not in the space is left alone: no interrupt, nothing invalidated,
+    /// and nothing to wait for, even if it never answers anything.
+    #[test]
+    fn a_space_request_asks_only_the_processors_in_that_space() {
+        const SPACE: u64 = 0x7000;
+        let machine = Machine::default();
+        let shootdown = Shootdown::<4>::new();
+        for id in 0..4 {
+            shootdown.mark_online(&cpu(id, &machine));
+        }
+        machine.invalidated.lock().unwrap().clear();
+        shootdown.switch_space(1, 0, SPACE, || ());
+        shootdown.switch_space(2, 0, 0x9000, || ());
+        let stop = AtomicBool::new(false);
+        let done = thread::scope(|s| {
+            let (shootdown, machine, stop) = (&shootdown, &machine, &stop);
+            s.spawn(move || {
+                let me = cpu(1, machine);
+                while !stop.load(Ordering::Relaxed) {
+                    shootdown.service(&me);
+                    thread::yield_now();
+                }
+            });
+            let done = shootdown.shoot(&cpu(0, machine), Request::NonGlobal, Scope::Space(SPACE));
+            stop.store(true, Ordering::Relaxed);
+            done
+        })
+        .unwrap();
+        assert_eq!(done.processors, 1);
+        assert_eq!(*machine.ipis.lock().unwrap(), [(0, 1)]);
+        let invalidated = machine.invalidated.lock().unwrap();
+        assert!(
+            invalidated.contains(&(0, Request::NonGlobal)),
+            "the initiator's own"
+        );
+        assert!(invalidated.contains(&(1, Request::NonGlobal)));
+        assert!(
+            !invalidated.iter().any(|(id, _)| *id >= 2),
+            "{invalidated:?}"
+        );
+    }
+
+    #[test]
+    fn a_processor_leaving_the_space_must_still_answer() {
+        const SPACE: u64 = 0x7000;
+        let machine = Machine::default();
+        machine.ticking.store(true, Ordering::Relaxed);
+        let shootdown = Shootdown::<2>::new();
+        shootdown.mark_online(&cpu(0, &machine));
+        shootdown.mark_online(&cpu(1, &machine));
+        shootdown.switch_space(1, 0, SPACE, || ());
+        shootdown.switch_space(1, SPACE, 0x9000, || {
+            // It has not loaded the other space yet: its TLB still holds this one's.
+            assert_eq!(
+                shootdown.shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Space(SPACE)),
+                Err(Stalled { cpu: 1 })
+            );
+        });
+        // Gone, and nobody needs it any more.
+        assert_eq!(
+            shootdown
+                .shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Space(SPACE))
+                .map(|done| done.processors),
+            Ok(0)
+        );
+    }
+
+    /// A processor that has the space loaded but has not come online takes no requests: it
+    /// flushes when it does come online.
+    #[test]
+    fn a_space_request_never_interrupts_a_processor_that_is_not_online() {
+        const SPACE: u64 = 0x7000;
+        let machine = Machine::default();
+        let shootdown = Shootdown::<2>::new();
+        shootdown.mark_online(&cpu(0, &machine));
+        shootdown.switch_space(1, 0, SPACE, || ());
+        let done = shootdown
+            .shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Space(SPACE))
+            .unwrap();
+        assert_eq!(done.processors, 0);
+        assert!(machine.ipis.lock().unwrap().is_empty());
     }
 
     #[test]

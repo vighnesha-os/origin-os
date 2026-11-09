@@ -1757,6 +1757,23 @@ pub fn flush_tlb_all() {
     });
 }
 
+/// Invalidates this processor's TLB entries that are not global: a CR3 reload with its own value.
+pub fn flush_tlb_non_global() {
+    without_interrupts(|| {
+        // SAFETY: CPL 0. CR3 is reloaded with the value it holds, so nothing about what is
+        // mapped changes, only what the TLB holds. Interrupts are off, so no handler sees the
+        // processor between the two instructions.
+        unsafe {
+            asm!(
+                "mov {tmp}, cr3",
+                "mov cr3, {tmp}",
+                tmp = out(reg) _,
+                options(nostack, preserves_flags),
+            );
+        }
+    });
+}
+
 /// Invalidates this processor's TLB entries for the page holding `addr`, whatever its size
 /// and whether or not it is global (Intel SDM Vol. 2A, INVLPG).
 pub fn invlpg(addr: u64) {

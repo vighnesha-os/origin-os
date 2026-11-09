@@ -18,7 +18,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use origin_sync::shootdown::{Completed, Request, Shootdown, Stalled, TlbHardware};
+use origin_sync::shootdown::{Completed, Request, Scope, Shootdown, Stalled, TlbHardware};
 
 use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
 use crate::timer::X2Apic;
@@ -56,7 +56,8 @@ impl TlbHardware for Hardware {
                     cpu::invlpg(base + page * origin_sync::shootdown::PAGE);
                 }
             }
-            Request::NonGlobal | Request::Everything => cpu::flush_tlb_all(),
+            Request::NonGlobal => cpu::flush_tlb_non_global(),
+            Request::Everything => cpu::flush_tlb_all(),
         }
     }
 
@@ -152,7 +153,7 @@ fn finished(outcome: Result<Completed, Stalled>) -> u64 {
 /// If a processor does not answer within about a second. The caller is about to reuse
 /// memory that processor may still reach, so carrying on would not be memory-safe.
 pub fn shootdown(addr: u64) -> u64 {
-    finished(SHOOTDOWN.shoot(&Hardware, Request::page(addr)))
+    finished(SHOOTDOWN.shoot(&Hardware, Request::page(addr), Scope::Kernel))
 }
 
 /// Flushes every TLB entry on every online processor: for changes to many pages at once.
@@ -161,5 +162,5 @@ pub fn shootdown(addr: u64) -> u64 {
 ///
 /// As for [`shootdown`].
 pub fn shootdown_all() -> u64 {
-    finished(SHOOTDOWN.shoot(&Hardware, Request::Everything))
+    finished(SHOOTDOWN.shoot(&Hardware, Request::Everything, Scope::Kernel))
 }
