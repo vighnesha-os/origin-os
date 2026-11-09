@@ -1,10 +1,10 @@
 # ORIGIN OS — DEFINITIVE PRODUCTION ENGINEERING DIRECTIVE
-## Version 7.1 — Original-Source, Rust 1.99.1, Research-Verified Operating System
+## Version 7.2 — Original-Source, Rust 1.99.1, Research-Verified Operating System
 
 **Product:** Origin OS  
 **Kernel:** Framekernel  
 **Research baseline:** November 7, 2026  
-**Revision:** 7.1, 2026-11-07. Adds the ONBF decisions (`docs/adr/ADR-0001-onbf.md`) and toolchain and standards corrections (`docs/research/2026-11-07-onbf.md` §5). v7.0 is kept at `docs/engineering/CLAUDE-v7.0.md`.  
+**Revision:** 7.2, 2026-11-09. Amends §48 and §70 to match ADR-0011, the native SDK (decision sheet item 39). Revision 7.1 (2026-11-07) added the ONBF decisions (`docs/adr/ADR-0001-onbf.md`) and toolchain and standards corrections (`docs/research/2026-11-07-onbf.md` §5). v7.1 is kept at `docs/engineering/CLAUDE-v7.1.md` and v7.0 at `docs/engineering/CLAUDE-v7.0.md`.  
 **Mandatory compiler:** Rust 1.99.1 stable  
 **Rust edition:** 2024  
 **Processor architecture:** x86-64 exclusively: 64-bit long mode only. No 32-bit or x32 code, and no Windows `.exe` or `.msi` compatibility.  
@@ -1092,19 +1092,25 @@ Third-party drivers run only in user mode, confined by the IOMMU and signed with
 
 ## 48. Absolute SDK-first requirement
 
-First-party GUI applications must call genuine native Origin SDK interfaces.
+Every first-party component must obtain OS functionality only through genuine native Origin SDK interfaces (ADR-0011).
+
+This binds GUI applications, the desktop, the installer, Origin Setup, the recovery console, command-line tools, the shell, the terminal and system services calling one another. None has a private door: a command-line tool has no power the SDK does not offer.
 
 The valid architecture is:
 
-GUI → Origin SDK → authenticated native service → Framekernel/driver.
+Client → Origin SDK → authenticated native service → Framekernel/driver.
 
 The following is prohibited for ordinary OS functionality:
 
-GUI → hidden shell command → CLI program → operating-system operation.
+Client → hidden shell command → CLI program → operating-system operation.
 
-The terminal may exist as an optional development tool.
+No first-party component starts another program to do its work or parses another program's text output.
 
-The terminal is not the graphical desktop's control plane.
+Programs reach the Framekernel only through the SDK, by way of `origin.core`. The Framekernel does not call the SDK.
+
+The terminal may exist as an optional development tool. It is an ordinary SDK client and is not the graphical desktop's control plane.
+
+The only exceptions are ADR-0011 N12's closed list: code that implements the SDK's guarantees or runs where no SDK can exist yet.
 
 ## 49. Origin SDK
 
@@ -1579,9 +1585,11 @@ Create native developer tools for:
 - UI inspection.
 - Conformance testing.
 
-Developer command-line tools are permitted.
+Developer command-line tools are permitted. On Origin OS they are SDK clients like any other program (§48).
 
 They must not become mandatory hidden backends for ordinary graphical OS administration.
+
+Host tools that run on macOS or Linux are outside §48 until Origin hosts its own builds (ADR-0011 N12).
 
 ## 71. Native application development
 
