@@ -51,6 +51,8 @@ Memory types:
 
 *0.4 (2026-11-08, ADR-0010 E1, **accepted by the owner on 2026-11-08**, CLAUDE.md §84):* the firmware's framebuffer is appended (48 bytes, `size` 176): physical base, size, the virtual address the loader mapped it at, width, height, stride and the channel masks of a 32-bit pixel, or all zero if there is none. A missing or unusable framebuffer never stops the boot. `origin-version.toml` carries 0.4 on the branch that implements it.
 
+*0.5 (2026-11-09, **accepted by the owner on 2026-11-09**, decision sheet item 69, CLAUDE.md §84):* two region kinds, `SpecificPurpose` (14) and `HotPluggable` (15). The loader gives them to conventional memory (type 7) whose descriptor carries `EFI_MEMORY_SP` (UEFI 2.8: memory set aside for one purpose, such as high-bandwidth or CXL-attached memory) or `EFI_MEMORY_HOT_PLUGGABLE` (UEFI 2.11: memory that can be removed while the machine runs); specific-purpose wins when both are set. The kernel allocates from neither and does not direct-map them, so neither reaches general use until the kernel can manage it. Other types keep the kind their type gives, since the kernel uses no other type as general RAM yet; when it reclaims `LoaderReclaimable` memory, that reclaim must consult the same attributes. Research: `docs/research/2026-11-09-uefi-2.8-to-2.11.md`.
+
 `origin-boot-info` defines the structure, at version 0.2 (`origin-version.toml [compatibility] boot-info`); major 0 means unstable, so the kernel accepts only its exact version. It contains:
 - a magic number, the version and the structure's size;
 - the physical memory regions, using Origin's own kinds: the loader translates the UEFI map so the kernel never sees UEFI structures;

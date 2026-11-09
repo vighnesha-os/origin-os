@@ -428,6 +428,9 @@ mod tests {
                 kind: 99, // unknown: counts as reserved
                 reserved: 0,
             },
+            // Specific-purpose and hot-pluggable memory are not general RAM (UEFI 2.8, 2.11).
+            region(0x200_0000, 0x100, RegionKind::SpecificPurpose),
+            region(0x300_0000, 0x100, RegionKind::HotPluggable),
         ];
         let summary = summarize(&regions).unwrap();
         assert_eq!(summary.usable_pages, 255 + 0x201);
