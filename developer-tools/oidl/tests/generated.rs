@@ -269,20 +269,52 @@ const C_STANDARDS: &[&str] = &["c11", "c17", "c23"];
 /// The C++ standards, likewise.
 const CXX_STANDARDS: &[&str] = &["c++11", "c++17", "c++20", "c++23"];
 
-/// Compiles `source` under one standard, with every warning an error.
+fn compiler(language: &str) -> &'static str {
+    if language == "c" { "cc" } else { "c++" }
+}
+
+/// The `-std` flag this host's compiler takes for `standard`: the published name where it
+/// knows it, else the provisional name older compilers use for the same standard (GCC 13, for
+/// one, takes `c2x` and `c++2b` but not `c23` and `c++23`).
+fn std_flag(language: &str, standard: &str) -> String {
+    let provisional = match standard {
+        "c23" => "c2x",
+        "c++20" => "c++2a",
+        "c++23" => "c++2b",
+        other => other,
+    };
+    let accepts = |name: &str| {
+        Command::new(compiler(language))
+            .arg(format!("-std={name}"))
+            .args(["-fsyntax-only", "-x", language, "-"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| out.status.success())
+    };
+    if provisional == standard || accepts(standard) {
+        format!("-std={standard}")
+    } else {
+        format!("-std={provisional}")
+    }
+}
+
+/// Compiles `source` under one standard with every warning enabled, and, with `strict`, every
+/// warning an error.
 fn try_compile_c(
     language: &str,
     standard: &str,
+    strict: bool,
     dir: &Path,
     source: &str,
     name: &str,
 ) -> Result<(), String> {
     let path = dir.join(name);
     fs::write(&path, source).expect("write");
-    let compiler = if language == "c" { "cc" } else { "c++" };
+    let compiler = compiler(language);
     let mut cmd = Command::new(compiler);
-    cmd.args(["-Wall", "-Wextra", "-Werror", "-pedantic", "-fsyntax-only"])
-        .arg(format!("-std={standard}"))
+    cmd.args(["-Wall", "-Wextra", "-pedantic", "-fsyntax-only"])
+        .args(strict.then_some("-Werror"))
+        .arg(std_flag(language, standard))
         .arg("-I")
         .arg(dir.join("c"))
         .args(["-x", language])
@@ -297,7 +329,7 @@ fn try_compile_c(
 }
 
 fn compile_c(language: &str, standard: &str, dir: &Path, source: &str, name: &str) {
-    if let Err(message) = try_compile_c(language, standard, dir, source, name) {
+    if let Err(message) = try_compile_c(language, standard, true, dir, source, name) {
         panic!("{language} {standard} failed:\n{message}");
     }
 }
@@ -330,15 +362,21 @@ fn the_c_headers_compile_under_every_standard_from_the_oldest_to_the_newest() {
 #[test]
 fn the_standards_really_change_the_language_being_compiled() {
     // The control for the test above: if a `-std` flag were ignored, that test would prove
-    // nothing. `bool` is a keyword only from C23, and `consteval` only from C++20.
+    // nothing. `bool` is a keyword only from C23, and `consteval` only from C++20. Under the
+    // older standard the identifier must compile; a compiler may still warn that a later
+    // standard reserves it (GCC's -Wc++20-compat, in -Wall), so that half is not strict.
     let dir = scratch("c-standards");
     let c = "int bool = 1;\nint main(void) { return bool - 1; }\n";
-    assert_eq!(try_compile_c("c", "c11", &dir, c, "key.c"), Ok(()));
-    let error = try_compile_c("c", "c23", &dir, c, "key.c").expect_err("C23 reserves bool");
+    assert_eq!(try_compile_c("c", "c11", false, &dir, c, "key.c"), Ok(()));
+    let error = try_compile_c("c", "c23", true, &dir, c, "key.c").expect_err("C23 reserves bool");
     assert!(error.contains("error"), "{error}");
     let cxx = "int consteval = 1;\nint main() { return consteval - 1; }\n";
-    assert_eq!(try_compile_c("c++", "c++11", &dir, cxx, "key.cpp"), Ok(()));
-    let error = try_compile_c("c++", "c++23", &dir, cxx, "key.cpp").expect_err("C++20 reserves it");
+    assert_eq!(
+        try_compile_c("c++", "c++11", false, &dir, cxx, "key.cpp"),
+        Ok(())
+    );
+    let error =
+        try_compile_c("c++", "c++23", true, &dir, cxx, "key.cpp").expect_err("C++20 reserves it");
     assert!(error.contains("error"), "{error}");
 }
 
