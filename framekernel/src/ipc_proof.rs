@@ -1875,6 +1875,27 @@ fn memory_goes_with_the_last_thread(
     right
 }
 
+/// Process IDs are never 0, which is the kernel, and never used twice (ADR-0005 C1).
+fn process_ids(com1: &mut Console) -> bool {
+    const PROCESSES: usize = 16;
+    let mut previous = 0;
+    let mut ascending = true;
+    for _ in 0..PROCESSES {
+        let Some(process) = Process::new(LIMITS, (CODE, CODE + PAGE)) else {
+            return false;
+        };
+        ascending &= process.id() > previous;
+        previous = process.id();
+        drop(process);
+    }
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: process IDs: {PROCESSES} processes created and dropped in turn, each ID above the last and none of them 0: {ascending}{}",
+        if ascending { "" } else { ": ipc failed" }
+    );
+    ascending
+}
+
 /// A thread blocked on a handle to a process completes with `CANCELED` when another thread of
 /// its process closes that handle, or sends it away (ADR-0005 A2): cancellation does not
 /// depend on the object being a channel.
@@ -1975,6 +1996,7 @@ pub(crate) fn prove_objects(
     ok &= process_terminated(com1, cpus, bsp, tsc_hz);
     ok &= thread_terminated(com1, cpus, bsp, tsc_hz);
     ok &= cancel_on_any_object(com1, cpus, bsp, tsc_hz);
+    ok &= process_ids(com1);
     let same = || {
         memory::stats().map(|(h, f)| (h.bytes_in_use, f))
             == before.map(|(h, f)| (h.bytes_in_use, f))

@@ -219,8 +219,13 @@ struct Lifecycle {
     ended: bool,
 }
 
+/// The next process ID: 0 is the kernel, and an ID is never used twice (ADR-0005 C1).
+static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
+
 /// One process.
 pub(crate) struct Process {
+    /// Unique for the boot and never reused (ADR-0005 C1). Grants nothing.
+    id: u64,
     /// The creator's reference to its address space, given up when its last thread ends.
     space: SpinLock<Option<ObjectRef<UserSpace>>>,
     /// Its handles (P1).
@@ -250,6 +255,7 @@ impl Process {
     /// code may issue system calls only from `[syscall_origin.0, syscall_origin.1)`.
     pub(crate) fn new(limits: Limits, syscall_origin: (u64, u64)) -> Option<Self> {
         Some(Self {
+            id: NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed),
             space: SpinLock::new(Some(ObjectRef::try_new(UserSpace::new()?).ok()?)),
             handles: SpinLock::new(HandleTable::new(limits.handles)),
             account: ObjectRef::try_new(Account {
@@ -276,6 +282,11 @@ impl Process {
             blocked: AtomicU64::new(0),
             waiting: AtomicU32::new(0),
         })
+    }
+
+    /// This process's ID.
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
     }
 
     /// Its `TERMINATED` signal.
