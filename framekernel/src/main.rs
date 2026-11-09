@@ -34,7 +34,6 @@ use framekernel::report;
 
 mod block;
 mod console;
-mod cpu;
 mod dma;
 mod firmware;
 mod i8042;
@@ -42,21 +41,19 @@ mod iommu;
 mod ipc;
 mod ipc_proof;
 mod irq;
-mod memory;
 mod pcie;
-mod phys;
 mod process;
 mod sched;
 mod smp;
 mod storage;
 mod syscall;
 mod time;
-mod timer;
 mod tlb;
 mod user;
 mod virtionet;
-mod vm;
 mod wait;
+
+// The framework (ADR-0011 N6): every use of these goes through a typed, safe interface.
 use framekernel::frames::{self, FrameAllocator};
 use framekernel::paging::layout::{self, Placement};
 use framekernel::paging::{PAGE, Table, TablePool};
@@ -64,6 +61,7 @@ use framekernel::serial::Uart16550;
 use origin_boot_info::{
     BootInfo, KernelSegment, MemoryRegion, RegionKind, SEGMENT_EXECUTE, SEGMENT_WRITE,
 };
+pub(crate) use origin_frame::{cpu, memory, phys, timer, vm};
 
 /// The fewest frames reserved, next to the frame bitmap, for the kernel's page tables.
 const TABLE_POOL_MIN_FRAMES: u64 = 256;
@@ -768,7 +766,7 @@ fn prove_topology(com1: &mut console::Console, rsdp: u64, online: &smp::Online) 
     use framekernel::topology::{self, CpuTopology, Layout, Source};
 
     // The boot processor's own record; every AP wrote its own before it came online.
-    cpu::record_topology();
+    smp::record_topology();
     // The cache hierarchy from leaf 04h.
     let mut caches = [framekernel::cache::Cache {
         level: 0,
@@ -809,7 +807,7 @@ fn prove_topology(com1: &mut console::Console, rsdp: u64, online: &smp::Online) 
     let records: alloc::vec::Vec<(u32, Option<CpuTopology>)> = online
         .cpus()
         .iter()
-        .map(|&c| (c.apic_id().unwrap_or(u32::MAX), cpu::topology_of(c)))
+        .map(|&c| (c.apic_id().unwrap_or(u32::MAX), smp::topology_of(c)))
         .collect();
     let boot = records.first().and_then(|r| r.1);
     let source = boot.map_or(Source::None, |b| b.source);

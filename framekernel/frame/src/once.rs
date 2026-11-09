@@ -60,7 +60,9 @@ impl<T> SetOnce<T> {
         // SAFETY: READY was published after the value was written and nothing writes it again,
         // so this shared reference aliases no mutation; the Acquire load above orders the
         // value's initialization before this read.
-        Some(unsafe { (*self.value.get()).assume_init_ref() })
+        let slot = unsafe { &*self.value.get() };
+        // SAFETY: as above: READY means `set` finished writing a valid `T`.
+        Some(unsafe { slot.assume_init_ref() })
     }
 }
 

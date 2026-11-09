@@ -49,6 +49,7 @@ use framekernel::acpi::{self, Processor};
 use framekernel::apstart::{Handshake, Outcome, Refusal};
 use framekernel::cpumap::CpuMap;
 use framekernel::paging::{Access, PAGE};
+use framekernel::topology::CpuTopology;
 use origin_boot_info::{BootInfo, MemoryRegion, RegionKind};
 
 use crate::console::Console;
@@ -372,6 +373,26 @@ pub(crate) fn start(
         }
     );
     online
+}
+
+/// What each processor read from CPUID about its own topology, by CPU index (CLAUDE.md §24,
+/// §27; ADR-0008 C2). A hybrid part's leaves can differ between logical processors, so each
+/// processor writes its own slot on itself ([`record_topology`]), before it reports online.
+static TOPOLOGY: [origin_frame::sync::SpinLock<Option<CpuTopology>>; MAX_CPUS] =
+    [const { origin_frame::sync::SpinLock::new(None) }; MAX_CPUS];
+
+/// Reads this processor's topology from CPUID and records it under its CPU index. The
+/// boot processor and every AP call this once, on themselves.
+pub(crate) fn record_topology() {
+    let own = CpuTopology::detect(cpu::cpuid_subleaf);
+    if let Some(slot) = TOPOLOGY.get(cpu::this_cpu().get()) {
+        *slot.lock() = Some(own);
+    }
+}
+
+/// What processor `index` recorded about itself, if it has.
+pub(crate) fn topology_of(index: CpuIndex) -> Option<CpuTopology> {
+    *TOPOLOGY.get(index.get())?.lock()
 }
 
 /// Guard pages proven unmapped, for the boot report.
@@ -764,7 +785,7 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
         crate::halt();
     }
     // This processor's topology, read on itself: its leaves are its own (CLAUDE.md §24, §27).
-    cpu::record_topology();
+    record_topology();
     // Join only if this answer settles the start-up. If the boot processor stopped waiting
     // first, CPU `index` stays offline and this processor is being parked: do nothing more.
     if !start.handshake.answer(id) {

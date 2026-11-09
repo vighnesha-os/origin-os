@@ -9,10 +9,10 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 
-use framekernel::frames::{self, FrameAllocator};
-use framekernel::heap::{Heap, HeapStats, PageSource, Slab};
+use crate::frames::{self, FrameAllocator};
+use crate::heap::{Heap, HeapStats, PageSource, Slab};
 
-use origin_frame::sync::SpinLock;
+use origin_sync::SpinLock;
 
 use crate::cpu::without_interrupts;
 
@@ -52,7 +52,7 @@ impl PageSource for Frames<'_> {
 
 /// Takes ownership of the frame allocator and starts the heap. Call once, after the kernel's
 /// own page tables are live (the direct map makes heap addresses usable as pointers).
-pub(crate) fn init(frames: FrameAllocator<'static>) {
+pub fn init(frames: FrameAllocator<'static>) {
     // SAFETY: `init` runs once, on the boot processor, before anything allocates, so this is
     // the only reference ever made to `SLAB_TABLE` (non-null and aligned: it is a static);
     // it then lives inside `MEMORY`.
@@ -68,7 +68,7 @@ pub(crate) fn init(frames: FrameAllocator<'static>) {
 }
 
 /// Heap totals and free frames, or `None` before [`init`].
-pub(crate) fn stats() -> Option<(HeapStats, u64)> {
+pub fn stats() -> Option<(HeapStats, u64)> {
     without_interrupts(|| {
         MEMORY
             .lock()
@@ -83,7 +83,7 @@ pub(crate) fn stats() -> Option<(HeapStats, u64)> {
 ///
 /// Call only when nothing there is in use: after the kernel's own page tables replaced the
 /// firmware's, and after every enabled processor has left firmware code (INIT).
-pub(crate) fn reclaim_loader_memory() -> Option<(u64, u64)> {
+pub fn reclaim_loader_memory() -> Option<(u64, u64)> {
     without_interrupts(|| {
         let mut guard = MEMORY.lock();
         let m = guard.as_mut()?;
@@ -95,12 +95,12 @@ pub(crate) fn reclaim_loader_memory() -> Option<(u64, u64)> {
 }
 
 /// One free 4 KiB frame (physical address), or `None`.
-pub(crate) fn allocate_frame() -> Option<u64> {
+pub fn allocate_frame() -> Option<u64> {
     without_interrupts(|| MEMORY.lock().as_mut()?.frames.allocate())
 }
 
 /// Returns a frame from [`allocate_frame`]; `false` if the allocator refused it.
-pub(crate) fn free_frame(frame: u64) -> bool {
+pub fn free_frame(frame: u64) -> bool {
     without_interrupts(|| {
         MEMORY
             .lock()
@@ -152,4 +152,4 @@ unsafe impl GlobalAlloc for KernelAllocator {
 static ALLOCATOR: KernelAllocator = KernelAllocator;
 
 /// Frame size, for callers that report in bytes.
-pub(crate) const FRAME: u64 = frames::FRAME;
+pub const FRAME: u64 = frames::FRAME;

@@ -1,7 +1,7 @@
 //! The kernel's own GDT, TSS and IDT, and CPU exception dispatch: the first M2 step
 //! (CLAUDE.md §24; Intel SDM Vol. 3A §3.4, §6.10–§6.14, §7.2, §7.7).
 //!
-//! The descriptor encodings live in the library (`framekernel::descriptors`) and are
+//! The descriptor encodings live in the library (`crate::descriptors`) and are
 //! unit-tested there; this module only places them in memory and loads them. Exception
 //! entry uses one naked stub per vector, which normalises the frame (pushing a dummy error
 //! code where the processor does not push one, then the vector number), and a common stub
@@ -15,13 +15,11 @@ use core::arch::{asm, naked_asm};
 use core::ptr;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use framekernel::apic::{SPURIOUS_VECTOR, TIMER_VECTOR, X2APIC_EOI};
-use framekernel::descriptors::{
+use crate::apic::{SPURIOUS_VECTOR, TIMER_VECTOR, X2APIC_EOI};
+use crate::descriptors::{
     self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, MACHINE_CHECK_IST, NMI_IST,
     TSS, TSS_SIZE,
 };
-use framekernel::topology::CpuTopology;
-use origin_frame::sync::SpinLock;
 
 /// Size of each interrupt stack (#DF, NMI, #MC, #DB).
 const IST_STACK_SIZE: usize = 16 * 1024;
@@ -65,13 +63,19 @@ struct TablePointer {
 /// One processor's GDT, TSS and interrupt stacks. The IDT is shared. The GDT and TSS have the
 /// first page to themselves, and every interrupt stack starts on a page boundary.
 #[repr(C, align(4096))]
-pub(crate) struct CpuTables {
+pub struct CpuTables {
     gdt: Gdt,
     tss: TssImage,
     double_fault: IstStack,
     nmi: IstStack,
     machine_check: IstStack,
     debug: IstStack,
+}
+
+impl core::fmt::Debug for CpuTables {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CpuTables").finish_non_exhaustive()
+    }
 }
 
 /// The boot processor's tables. Application processors get theirs from the heap.
@@ -86,7 +90,7 @@ static mut BSP_TABLES: CpuTables = CpuTables {
 static mut IDT: Idt = Idt([[0; 2]; 256]);
 
 /// The guard pages of the four interrupt stacks in `tables`.
-pub(crate) fn interrupt_stack_guards(tables: *const CpuTables) -> [u64; 4] {
+pub fn interrupt_stack_guards(tables: *const CpuTables) -> [u64; 4] {
     let base = tables.addr() as u64;
     [
         base + core::mem::offset_of!(CpuTables, double_fault.guard) as u64,
@@ -97,7 +101,7 @@ pub(crate) fn interrupt_stack_guards(tables: *const CpuTables) -> [u64; 4] {
 }
 
 /// The boot processor's tables, for [`interrupt_stack_guards`].
-pub(crate) fn bsp_tables() -> *const CpuTables {
+pub fn bsp_tables() -> *const CpuTables {
     &raw const BSP_TABLES
 }
 
@@ -137,7 +141,7 @@ struct ExceptionFrame {
 ///
 /// Call once, at CPL 0, on the boot processor, with interrupts disabled, before anything
 /// else depends on the firmware's GDT or IDT.
-pub(crate) unsafe fn init() {
+pub unsafe fn init() {
     let mut idt = Idt([[0; 2]; 256]);
     for (vector, (gate, stub)) in idt.0.iter_mut().zip(STUBS.iter()).enumerate() {
         let ist = match vector {
@@ -185,7 +189,7 @@ pub(crate) unsafe fn init() {
 /// Call once per application processor, at CPL 0 with interrupts disabled, after [`init`]
 /// ran on the boot processor. `tables` must be writable, live for ever, and used by no
 /// other processor; no other processor may be CPU `index`.
-pub(crate) unsafe fn init_ap(tables: *mut CpuTables, index: CpuIndex) {
+pub unsafe fn init_ap(tables: *mut CpuTables, index: CpuIndex) {
     // SAFETY: the caller's contract is `load_tables`'s.
     unsafe { load_tables(tables, index) };
 }
@@ -285,7 +289,7 @@ unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex) {
 
 /// Processors the kernel indexes: every per-CPU array, the CPU-local areas included, has
 /// this many slots (`framekernel::cpumap`).
-pub(crate) use framekernel::cpumap::MAX_CPUS;
+pub use crate::limits::MAX_CPUS;
 /// IA32_GS_BASE: the base of GS in 64-bit mode.
 const GS_BASE: u32 = 0xC000_0101;
 /// IA32_KERNEL_GS_BASE: what `swapgs` exchanges with the base of GS.
@@ -296,14 +300,14 @@ const KERNEL_GS_BASE: u32 = 0xC000_0102;
 /// (`framekernel::cpumap`). It is not the APIC ID, which IPIs and interrupt destinations
 /// use ([`CpuIndex::apic_id`]): x2APIC IDs are 32-bit, sparse, and may exceed 255.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct CpuIndex(usize);
+pub struct CpuIndex(usize);
 
 impl CpuIndex {
     /// The boot processor.
-    pub(crate) const BOOT: Self = Self(0);
+    pub const BOOT: Self = Self(0);
 
     /// Index `index`, if an array has that slot (below [`MAX_CPUS`]).
-    pub(crate) const fn new(index: usize) -> Option<Self> {
+    pub const fn new(index: usize) -> Option<Self> {
         if index < MAX_CPUS {
             Some(Self(index))
         } else {
@@ -312,18 +316,18 @@ impl CpuIndex {
     }
 
     /// The array slot.
-    pub(crate) const fn get(self) -> usize {
+    pub const fn get(self) -> usize {
         self.0
     }
 
     /// The x2APIC ID of the processor with this index, once discovery assigned one.
-    pub(crate) fn apic_id(self) -> Option<u32> {
+    pub fn apic_id(self) -> Option<u32> {
         let id = APIC_IDS.get(self.0)?.load(Ordering::Acquire);
         (id != UNASSIGNED).then_some(id)
     }
 
     /// `CPU {index} (APIC ID {id})`, for reports.
-    pub(crate) fn named(self) -> Named {
+    pub fn named(self) -> Named {
         Named(self)
     }
 }
@@ -335,7 +339,8 @@ impl core::fmt::Display for CpuIndex {
 }
 
 /// A CPU index shown with its APIC ID: `CPU 1 (APIC ID 256)`.
-pub(crate) struct Named(CpuIndex);
+#[derive(Debug)]
+pub struct Named(CpuIndex);
 
 impl core::fmt::Display for Named {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -347,7 +352,7 @@ impl core::fmt::Display for Named {
 }
 
 /// What an unassigned slot of [`APIC_IDS`] holds: the broadcast ID, never one processor's.
-const UNASSIGNED: u32 = framekernel::cpumap::BROADCAST;
+const UNASSIGNED: u32 = crate::limits::BROADCAST;
 /// Each CPU index's x2APIC ID, or [`UNASSIGNED`]. Written once per index, before that
 /// processor runs any kernel code that reads it.
 static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(UNASSIGNED) }; MAX_CPUS];
@@ -355,30 +360,10 @@ static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(UNASSIGNED) }; 
 /// Records that the processor with CPU index `index` has x2APIC ID `apic_id`. The boot
 /// processor records itself in [`init`]; `smp` records every other processor at discovery,
 /// before it starts any (an AP checks its own entry in [`init_ap`]).
-pub(crate) fn assign(index: CpuIndex, apic_id: u32) {
+pub fn assign(index: CpuIndex, apic_id: u32) {
     if let Some(slot) = APIC_IDS.get(index.0) {
         slot.store(apic_id, Ordering::Release);
     }
-}
-
-/// What each processor read from CPUID about its own topology, by CPU index (CLAUDE.md §24,
-/// §27; ADR-0008 C2). A hybrid part's leaves can differ between logical processors, so each
-/// processor writes its own slot on itself ([`record_topology`]), before it reports online.
-static TOPOLOGY: [SpinLock<Option<CpuTopology>>; MAX_CPUS] =
-    [const { SpinLock::new(None) }; MAX_CPUS];
-
-/// Reads this processor's topology from CPUID and records it under its CPU index. The
-/// boot processor and every AP call this once, on themselves.
-pub(crate) fn record_topology() {
-    let own = CpuTopology::detect(cpuid_subleaf);
-    if let Some(slot) = TOPOLOGY.get(this_cpu().0) {
-        *slot.lock() = Some(own);
-    }
-}
-
-/// What processor `index` recorded about itself, if it has.
-pub(crate) fn topology_of(index: CpuIndex) -> Option<CpuTopology> {
-    *TOPOLOGY.get(index.0)?.lock()
 }
 
 /// One processor's CPU-local area, reached through GS. A cache line each, so processors
@@ -424,7 +409,7 @@ static OUT_OF_RANGE: CpuLocal = CpuLocal {
 
 /// This processor's x2APIC ID from CPUID (leaf 0Bh EDX, else leaf 1 EBX bits 31:24), which
 /// does not depend on the local APIC's mode.
-pub(crate) fn cpuid_apic_id() -> u32 {
+pub fn cpuid_apic_id() -> u32 {
     if cpuid(0)[0] >= 0xB {
         cpuid(0xB)[3]
     } else {
@@ -556,14 +541,14 @@ static CPU_STATE_HOLDS: [core::sync::atomic::AtomicBool; MAX_CPUS] =
 /// Records whether this processor's control state holds, after `enable_simd`. The boot
 /// processor and every AP do it on themselves; an AP before its handshake, which orders the
 /// mark before the boot processor sees it online.
-pub(crate) fn record_cpu_state() {
+pub fn record_cpu_state() {
     if let Some(holds) = CPU_STATE_HOLDS.get(this_cpu().get()) {
         holds.store(cpu_state_holds(), Ordering::Relaxed);
     }
 }
 
 /// How many of `cpus` recorded a control state that holds.
-pub(crate) fn cpu_states_holding(cpus: &[CpuIndex]) -> usize {
+pub fn cpu_states_holding(cpus: &[CpuIndex]) -> usize {
     cpus.iter()
         .filter(|c| {
             CPU_STATE_HOLDS
@@ -633,7 +618,7 @@ fn local() -> &'static CpuLocal {
 
 /// Sets this processor's TSS.RSP0: the stack an interrupt or exception from user mode
 /// switches to. It must be the kernel stack of the thread about to run in user mode.
-pub(crate) fn set_kernel_stack(top: u64) {
+pub fn set_kernel_stack(top: u64) {
     let local = this_cpu().0;
     let Some(tss) = CPU_LOCAL.get(local).map(|l| l.tss.load(Ordering::Relaxed)) else {
         return;
@@ -654,7 +639,7 @@ pub(crate) fn set_kernel_stack(top: u64) {
 
 /// This processor's CPU index: one GS-relative load from its CPU-local area. On a
 /// processor without one ([`OUT_OF_RANGE`]) it is an index no array has.
-pub(crate) fn this_cpu() -> CpuIndex {
+pub fn this_cpu() -> CpuIndex {
     let id: u64;
     // SAFETY: `load_tables` set GS's base to a live `CpuLocal` on every processor before
     // any code that calls this runs, and offset 0 is its `id`, a `u64`.
@@ -663,27 +648,27 @@ pub(crate) fn this_cpu() -> CpuIndex {
 }
 
 /// Software interrupt a kernel thread raises to yield the processor.
-pub(crate) const YIELD_VECTOR: u8 = 0x81;
+pub const YIELD_VECTOR: u8 = 0x81;
 /// Software interrupt to sleep for RDI timer ticks.
-pub(crate) const SLEEP_VECTOR: u8 = 0x82;
+pub const SLEEP_VECTOR: u8 = 0x82;
 /// Software interrupt to end the running thread.
-pub(crate) const EXIT_VECTOR: u8 = 0x83;
+pub const EXIT_VECTOR: u8 = 0x83;
 /// Software interrupt: the running kernel thread blocks until woken (`sched::block`).
-pub(crate) const BLOCK_VECTOR: u8 = 0x84;
+pub const BLOCK_VECTOR: u8 = 0x84;
 /// IPI: a thread queued on this processor was woken by another (`sched::wake`).
-pub(crate) const RESCHEDULE_VECTOR: u8 = 0xF1;
+pub const RESCHEDULE_VECTOR: u8 = 0xF1;
 /// The NVMe controller's I/O completion interrupt (an MSI-X message).
-pub(crate) const DEVICE_VECTOR: u8 = 0x40;
+pub const DEVICE_VECTOR: u8 = 0x40;
 /// A legacy IRQ routed through the I/O APIC (the PIT, in the routing proof).
-pub(crate) const IOAPIC_VECTOR: u8 = 0x41;
+pub const IOAPIC_VECTOR: u8 = 0x41;
 /// The virtio-net NIC's receive used-buffer interrupt (an MSI-X message).
-pub(crate) const NET_VECTOR: u8 = 0x42;
+pub const NET_VECTOR: u8 = 0x42;
 /// The virtio-net NIC's transmit-completion interrupt (an MSI-X message).
-pub(crate) const NET_TX_VECTOR: u8 = 0x43;
+pub const NET_TX_VECTOR: u8 = 0x43;
 
 /// The vector in a system call's frame (no gate has it: `syscall` builds the frame itself,
 /// and `int 0x80` from ring 3 faults).
-pub(crate) const SYSCALL_VECTOR: u8 = 0x80;
+pub const SYSCALL_VECTOR: u8 = 0x80;
 
 /// Local APIC timer interrupts taken since boot.
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -692,7 +677,7 @@ static NMIS: AtomicU64 = AtomicU64::new(0);
 static NMI_FRAME: AtomicU64 = AtomicU64::new(0);
 
 /// NMIs taken so far and the frame address of the last.
-pub(crate) fn nmis() -> (u64, u64) {
+pub fn nmis() -> (u64, u64) {
     (
         NMIS.load(Ordering::SeqCst),
         NMI_FRAME.load(Ordering::SeqCst),
@@ -700,7 +685,7 @@ pub(crate) fn nmis() -> (u64, u64) {
 }
 
 /// The boot processor's NMI stack, as `[low, high)`.
-pub(crate) fn bsp_nmi_stack() -> (u64, u64) {
+pub fn bsp_nmi_stack() -> (u64, u64) {
     // SAFETY: only the address of the static's field is taken; no reference is made.
     let low = unsafe { &raw const BSP_TABLES.nmi.stack }.addr() as u64;
     (low, low + IST_STACK_SIZE as u64)
@@ -710,19 +695,19 @@ pub(crate) fn bsp_nmi_stack() -> (u64, u64) {
 static DEBUG_FRAME: AtomicU64 = AtomicU64::new(0);
 
 /// Where the last #DB in user mode saved its frame.
-pub(crate) fn last_debug_frame() -> u64 {
+pub fn last_debug_frame() -> u64 {
     DEBUG_FRAME.load(Ordering::SeqCst)
 }
 
 /// The boot processor's #DB stack, as `[low, high)`.
-pub(crate) fn bsp_debug_stack() -> (u64, u64) {
+pub fn bsp_debug_stack() -> (u64, u64) {
     // SAFETY: only the address of the static's field is taken; no reference is made.
     let low = unsafe { &raw const BSP_TABLES.debug.stack }.addr() as u64;
     (low, low + IST_STACK_SIZE as u64)
 }
 
 /// Disables interrupts and halts this processor forever.
-pub(crate) fn halt() -> ! {
+pub fn halt() -> ! {
     loop {
         // SAFETY: the kernel runs at CPL 0. `cli; hlt` touches no memory and needs no stack.
         // An NMI or SMI can still resume the processor, so it halts again.
@@ -731,12 +716,12 @@ pub(crate) fn halt() -> ! {
 }
 
 /// Local APIC timer interrupts taken since boot.
-pub(crate) fn ticks() -> u64 {
+pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
 /// Executes `int3`; the breakpoint handler reports it and returns here.
-pub(crate) fn breakpoint() {
+pub fn breakpoint() {
     // SAFETY: `int3` raises #BP, whose gate `init` installed; the handler returns with
     // `iretq` to the instruction after `int3`, preserving every register.
     unsafe { asm!("int3") };
@@ -744,18 +729,18 @@ pub(crate) fn breakpoint() {
 
 /// Called by [`exception_common`] with the saved frame.
 ///
-/// Everything above the framework is reached through [`origin_frame::trap::hooks`] and
+/// Everything above the framework is reached through [`crate::trap::hooks`] and
 /// [`origin_frame::irq`]: this function does not know the scheduler, the system-call layer,
 /// the console or any driver.
 extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
-    use origin_frame::irq::{self, Action};
+    use crate::irq::{self, Action};
     // The frame to resume: this one, unless the scheduler switches to another thread.
     let here = ptr::from_mut(frame).addr() as u64;
     // A program can set RFLAGS.AC; the entry path must have cleared it for the kernel.
     if frame.cs & 3 == 3 && SMAP_ON.load(Ordering::Relaxed) && read_rflags() & RFLAGS_AC != 0 {
         AC_LEAKS.fetch_add(1, Ordering::Relaxed);
     }
-    let hooks = origin_frame::trap::hooks();
+    let hooks = crate::trap::hooks();
     // Device interrupts: the timer counts and acknowledges; a spurious interrupt needs no
     // EOI (SDM Vol. 3A, spurious interrupt).
     if frame.vector == u64::from(TIMER_VECTOR) {
@@ -824,11 +809,11 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
             halt();
         };
         return match (hooks.syscall)(frame.rax, args, frame.rip) {
-            origin_frame::trap::SyscallOutcome::Status(status) => {
+            crate::trap::SyscallOutcome::Status(status) => {
                 frame.rax = status as u64;
                 here
             }
-            origin_frame::trap::SyscallOutcome::ThreadExit => (hooks.exit)(here),
+            crate::trap::SyscallOutcome::ThreadExit => (hooks.exit)(here),
         };
     }
     // A machine check is the hardware reporting on itself: it says nothing about the program
@@ -864,7 +849,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     if frame.vector == 14
         && frame.cs & 3 == 0
         && frame.rip == (user_copy as *const ()).addr() as u64
-        && framekernel::usercopy::is_user_address(read_cr2())
+        && crate::usercopy::is_user_address(read_cr2())
     {
         USER_COPY_FAULTS.fetch_add(1, Ordering::Relaxed);
         frame.rax = 0;
@@ -890,7 +875,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
             frame.rsi, frame.rdi, frame.rbp, frame.r8, frame.r9, frame.r10, frame.r11,
         );
         let _ = (frame.r12, frame.r13, frame.r14, frame.r15, frame.ss);
-        (hooks.report_exception)(&origin_frame::trap::ExceptionReport {
+        (hooks.report_exception)(&crate::trap::ExceptionReport {
             vector,
             error_code: frame.error_code,
             rip: frame.rip,
@@ -996,7 +981,7 @@ const RFLAGS_AC: u64 = 1 << 18;
 static AC_LEAKS: AtomicU64 = AtomicU64::new(0);
 
 /// How many entries from ring 3 reached kernel code with RFLAGS.AC set, for the boot proof.
-pub(crate) fn ac_leaks() -> u64 {
+pub fn ac_leaks() -> u64 {
     AC_LEAKS.load(Ordering::Relaxed)
 }
 
@@ -1017,7 +1002,7 @@ fn read_cr2() -> u64 {
 }
 
 /// CPUID `leaf`, sub-leaf 0: `[eax, ebx, ecx, edx]`.
-pub(crate) fn cpuid(leaf: u32) -> [u32; 4] {
+pub fn cpuid(leaf: u32) -> [u32; 4] {
     let (eax, ebx, ecx, edx): (u32, u32, u32, u32);
     // SAFETY: CPUID is available on every x86-64 processor and reads no memory. RBX is
     // reserved by LLVM, so it is moved out through another register and restored.
@@ -1037,7 +1022,7 @@ pub(crate) fn cpuid(leaf: u32) -> [u32; 4] {
 }
 
 /// CPUID `leaf` with sub-leaf `sub` in ECX: `[eax, ebx, ecx, edx]`.
-pub(crate) fn cpuid_subleaf(leaf: u32, sub: u32) -> [u32; 4] {
+pub fn cpuid_subleaf(leaf: u32, sub: u32) -> [u32; 4] {
     let (eax, ebx, ecx, edx): (u32, u32, u32, u32);
     // SAFETY: CPUID is available on every x86-64 processor and reads no memory. RBX is
     // reserved by LLVM, so it is moved out through another register and restored.
@@ -1058,7 +1043,7 @@ pub(crate) fn cpuid_subleaf(leaf: u32, sub: u32) -> [u32; 4] {
 
 /// One `RDRAND` attempt: the 64-bit value on success (carry set), or `None` on a transient
 /// failure a retry may satisfy. The caller must have confirmed `Features::rdrand`.
-pub(crate) fn rdrand() -> Option<u64> {
+pub fn rdrand() -> Option<u64> {
     let (value, ok): (u64, u8);
     // SAFETY: RDRAND writes only its destination register and the carry flag, reads no
     // memory, and is defined on every long-mode processor that reports it in CPUID (which
@@ -1078,7 +1063,7 @@ pub(crate) fn rdrand() -> Option<u64> {
 /// One `RDSEED` attempt: a full-entropy 64-bit value on success, or `None`. `RDSEED` draws
 /// directly from the entropy source and fails more often than `RDRAND` under load, so it
 /// needs the same bounded retry. The caller must have confirmed `Features::rdseed`.
-pub(crate) fn rdseed() -> Option<u64> {
+pub fn rdseed() -> Option<u64> {
     let (value, ok): (u64, u8);
     // SAFETY: as `rdrand`; RDSEED has the same register/flag-only effect and CPUID gate.
     unsafe {
@@ -1094,12 +1079,12 @@ pub(crate) fn rdseed() -> Option<u64> {
 }
 
 /// Whether the processor supports the execute-disable bit (CPUID 8000_0001h EDX bit 20).
-pub(crate) fn nx_supported() -> bool {
+pub fn nx_supported() -> bool {
     cpuid(0x8000_0000)[0] >= 0x8000_0001 && cpuid(0x8000_0001)[3] & (1 << 20) != 0
 }
 
 /// Whether the processor supports x2APIC mode (CPUID 1 ECX bit 21).
-pub(crate) fn x2apic_supported() -> bool {
+pub fn x2apic_supported() -> bool {
     cpuid(1)[2] & (1 << 21) != 0
 }
 
@@ -1109,7 +1094,7 @@ pub(crate) fn x2apic_supported() -> bool {
 ///
 /// CPL 0, and `msr` must exist on this processor (else #GP) and have no read side effects
 /// this code does not expect.
-pub(crate) unsafe fn rdmsr(msr: u32) -> u64 {
+pub unsafe fn rdmsr(msr: u32) -> u64 {
     let (low, high): (u32, u32);
     // SAFETY: the caller's contract; RDMSR reads no memory.
     unsafe {
@@ -1124,7 +1109,7 @@ pub(crate) unsafe fn rdmsr(msr: u32) -> u64 {
 ///
 /// CPL 0, `msr` must exist and `value` must be valid for it, and the write's effect on the
 /// processor must be one the caller intends and keeps memory-safe.
-pub(crate) unsafe fn wrmsr(msr: u32, value: u64) {
+pub unsafe fn wrmsr(msr: u32, value: u64) {
     // SAFETY: the caller's contract; WRMSR reads no memory.
     unsafe {
         asm!(
@@ -1143,7 +1128,7 @@ pub(crate) unsafe fn wrmsr(msr: u32, value: u64) {
 /// thread preempted while holding it makes every other thread on the same processor that
 /// wants it spin away its whole time slice. The `cli` and `sti` are compiler barriers (no
 /// `nomem`): a lock's atomics must not move outside the disabled region.
-pub(crate) fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
+pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
     let flags: u64;
     // SAFETY: reads RFLAGS and disables interrupts; CPL 0. Restored below.
     unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags, options(preserves_flags)) };
@@ -1156,7 +1141,7 @@ pub(crate) fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// CR3: the physical address of the live PML4 (and, with PCIDs off, nothing else).
-pub(crate) fn read_cr3() -> u64 {
+pub fn read_cr3() -> u64 {
     let value: u64;
     // SAFETY: reading CR3 at CPL 0 has no side effect.
     unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags)) };
@@ -1169,7 +1154,7 @@ pub(crate) fn read_cr3() -> u64 {
 ///
 /// `root` must be a complete PML4 that maps everything the running code touches next (its
 /// code, stack and data): in practice the kernel's, or a process PML4 sharing its half.
-pub(crate) unsafe fn write_cr3(root: u64) {
+pub unsafe fn write_cr3(root: u64) {
     // SAFETY: the caller's contract.
     unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
 }
@@ -1182,12 +1167,13 @@ const BACKTRACE_MAX_FRAME: u64 = 64 * 1024;
 /// Captures the current call stack's return addresses into `out` (innermost first) by
 /// walking the frame-pointer chain, and returns how many it found. It reads only words in
 /// a bounded window above the starting frame, so a corrupt chain cannot make it fault.
-pub(crate) fn capture_backtrace(out: &mut [u64]) -> usize {
+#[inline(always)]
+pub fn capture_backtrace(out: &mut [u64]) -> usize {
     let rbp: u64;
     // SAFETY: reads RBP; no memory, no stack, flags preserved.
     unsafe { asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack, preserves_flags)) };
     let base = rbp;
-    framekernel::unwind::walk(
+    crate::unwind::walk(
         rbp,
         BACKTRACE_MAX_FRAME,
         |addr| {
@@ -1204,7 +1190,7 @@ pub(crate) fn capture_backtrace(out: &mut [u64]) -> usize {
 }
 
 /// The time-stamp counter.
-pub(crate) fn rdtsc() -> u64 {
+pub fn rdtsc() -> u64 {
     let (low, high): (u32, u32);
     // SAFETY: RDTSC is available on every x86-64 processor (CR4.TSD is clear: the kernel
     // runs at CPL 0 anyway) and reads no memory.
@@ -1220,7 +1206,7 @@ pub(crate) fn rdtsc() -> u64 {
 /// Callers poll with this rather than halting: a halt waits for an interrupt that may never
 /// come (a missing EOI blocks every later one at the same priority), so the caller could
 /// never check its own deadline.
-pub(crate) fn interrupt_window() {
+pub fn interrupt_window() {
     // SAFETY: CPL 0. Interrupts are recognized after the instruction that follows STI, so
     // a pending one is taken after the NOP and before CLI. Every vector that can arrive has
     // a gate (the timer, the spurious vector and the exceptions), and the 8259 PICs are
@@ -1243,7 +1229,7 @@ const CR0_WP: u64 = 1 << 16;
 /// [`nx_supported`]. `root` must be the PML4 of complete tables that map, with the right
 /// permissions, everything the kernel touches from here on: its code, its stack, its data,
 /// the boot info and the memory it allocates from, and the tables themselves.
-pub(crate) unsafe fn load_page_tables(root: u64) {
+pub unsafe fn load_page_tables(root: u64) {
     // SAFETY: the caller's contract. EFER is read and written back with only NXE added
     // (NX is supported, so the bit is defined). WP only restricts supervisor writes to
     // pages already marked read-only. Loading CR3 switches to tables the caller vouches
@@ -1280,7 +1266,7 @@ static mut PROBE_CODE: [u8; 8] = PROBE_RETURN;
 
 /// What a probe access did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Probe {
+pub enum Probe {
     /// The access completed: the page allowed it.
     Completed,
     /// It raised #PF with this error code at this linear address (CR2).
@@ -1314,7 +1300,7 @@ fn run_probe(fault_rip: u64, access: impl FnOnce() -> u64) -> Probe {
 /// # Safety
 ///
 /// Reading `addr` must have no side effect if it succeeds: not MMIO.
-pub(crate) unsafe fn probe_read(addr: u64) -> Probe {
+pub unsafe fn probe_read(addr: u64) -> Probe {
     // SAFETY: the caller's contract; `read_byte` faults at its first instruction or reads
     // one byte and returns.
     run_probe((read_byte as *const ()).addr() as u64, || unsafe {
@@ -1328,7 +1314,7 @@ pub(crate) unsafe fn probe_read(addr: u64) -> Probe {
 ///
 /// `value` must be the byte already at `addr` and nothing may change it concurrently, so a
 /// write that completes changes nothing; `addr` must not be MMIO.
-pub(crate) unsafe fn probe_write(addr: u64, value: u8) -> Probe {
+pub unsafe fn probe_write(addr: u64, value: u8) -> Probe {
     // SAFETY: the caller's contract; `write_byte` faults at its first instruction or
     // stores `value` (unchanged memory) and returns.
     run_probe((write_byte as *const ()).addr() as u64, || unsafe {
@@ -1338,7 +1324,7 @@ pub(crate) unsafe fn probe_write(addr: u64, value: u8) -> Probe {
 
 /// Jumps into [`PROBE_CODE`], writable data, which NX must refuse to execute. Returns the
 /// probed address too.
-pub(crate) fn probe_execute_data() -> (u64, Probe) {
+pub fn probe_execute_data() -> (u64, Probe) {
     let target = (&raw const PROBE_CODE).addr() as u64;
     // SAFETY: `PROBE_CODE` holds `mov rax, -1; ret`, so the jump either faults or runs it.
     let probe = unsafe { probe_execute(target) };
@@ -1351,7 +1337,7 @@ static SMAP_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool:
 static UMIP_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Whether UMIP is on, for the boot proof.
-pub(crate) fn umip_on() -> bool {
+pub fn umip_on() -> bool {
     UMIP_ON.load(Ordering::Relaxed)
 }
 
@@ -1359,7 +1345,7 @@ pub(crate) fn umip_on() -> bool {
 static USER_COPY_FAULTS: AtomicU64 = AtomicU64::new(0);
 
 /// How many user copies a page fault cut short.
-pub(crate) fn user_copy_faults() -> u64 {
+pub fn user_copy_faults() -> u64 {
     USER_COPY_FAULTS.load(Ordering::Relaxed)
 }
 
@@ -1374,7 +1360,7 @@ pub(crate) fn user_copy_faults() -> u64 {
 /// read or write. The other must be a range the caller checked against the calling
 /// process's own tables, on this processor's live address space: user memory, so that a
 /// fault in it is recovered (a fault on the kernel side is a kernel bug, and stops here).
-pub(crate) unsafe fn copy_user(dst: u64, src: u64, len: u64) -> bool {
+pub unsafe fn copy_user(dst: u64, src: u64, len: u64) -> bool {
     let smap = SMAP_ON.load(Ordering::Relaxed);
     if smap {
         // SAFETY: STAC only sets RFLAGS.AC, allowing supervisor access to user pages until
@@ -1393,14 +1379,14 @@ pub(crate) unsafe fn copy_user(dst: u64, src: u64, len: u64) -> bool {
 }
 
 /// Turns interrupts on for a system call, which runs on its own thread's stack.
-pub(crate) fn enable_interrupts() {
+pub fn enable_interrupts() {
     // SAFETY: CPL 0; every vector that can arrive has a gate, and the caller holds no lock
     // that an interrupt handler on this processor may take.
     unsafe { asm!("sti", options(nostack)) };
 }
 
 /// Turns interrupts off on the way back out of a system call.
-pub(crate) fn disable_interrupts() {
+pub fn disable_interrupts() {
     // SAFETY: CPL 0; CLI only clears RFLAGS.IF.
     unsafe { asm!("cli", options(nostack)) };
 }
@@ -1413,14 +1399,14 @@ unsafe extern "sysv64" fn user_copy(_dst: u64, _src: u64, _unused: u64, _len: u6
 }
 
 /// The bytes of `mov rax, -1; ret`, for a probe target that must not be executable.
-pub(crate) const PROBE_RETURN: [u8; 8] = [0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3];
+pub const PROBE_RETURN: [u8; 8] = [0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3];
 
 /// Jumps to `target` and reports whether the fetch faulted.
 ///
 /// # Safety
 ///
 /// If the fetch is allowed, the code at `target` runs: it must be [`PROBE_RETURN`].
-pub(crate) unsafe fn probe_execute(target: u64) -> Probe {
+pub unsafe fn probe_execute(target: u64) -> Probe {
     // SAFETY: the fetch at `target` either faults (and resumes at `probe_recover`, which
     // returns to this caller) or runs `PROBE_RETURN` (the caller's contract), which only
     // sets RAX and returns.
@@ -1439,7 +1425,7 @@ static PAT_READY: [core::sync::atomic::AtomicBool; MAX_CPUS] =
 /// reset values; a firmware that changed them would make uncached mappings cacheable, so the
 /// kernel then refuses to map device registers rather than reprogramming caches it cannot
 /// see. Returns the PAT.
-pub(crate) fn check_pat() -> u64 {
+pub fn check_pat() -> u64 {
     // SAFETY: CPL 0; IA32_PAT exists on every x86-64 processor (CPUID 1 EDX bit 16) and
     // reading it has no side effect.
     let pat = unsafe { rdmsr(IA32_PAT) };
@@ -1456,7 +1442,7 @@ pub(crate) fn check_pat() -> u64 {
 /// that checked its PAT but never came online (it was parked, `smp::park`) is not counted.
 /// An AP marks its index before its start-up handshake, which orders the mark before the
 /// boot processor sees it online.
-pub(crate) fn pat_ready(cpus: &[CpuIndex]) -> usize {
+pub fn pat_ready(cpus: &[CpuIndex]) -> usize {
     cpus.iter()
         .filter(|c| {
             PAT_READY
@@ -1478,7 +1464,7 @@ const CR4_PGE: u64 = 1 << 7;
 ///
 /// CPL 0, and the live tables mark global only mappings that every address space shares
 /// (the kernel half); a global user mapping would leak between processes.
-pub(crate) unsafe fn enable_global_pages() -> bool {
+pub unsafe fn enable_global_pages() -> bool {
     if cpuid(1)[3] & (1 << 13) == 0 {
         return false;
     }
@@ -1502,7 +1488,7 @@ pub(crate) unsafe fn enable_global_pages() -> bool {
 
 /// Invalidates every TLB entry on this processor, global ones included: CR4.PGE toggled
 /// when it is set (a CR3 load keeps global entries), else a CR3 reload.
-pub(crate) fn flush_tlb_all() {
+pub fn flush_tlb_all() {
     without_interrupts(|| {
         // SAFETY: CPL 0. CR4 is written back with the value it had, after a write that
         // differs only in PGE; CR3 is reloaded with its own value. Neither changes which
@@ -1533,7 +1519,7 @@ pub(crate) fn flush_tlb_all() {
 
 /// Invalidates this processor's TLB entries for the page holding `addr`, whatever its size
 /// and whether or not it is global (Intel SDM Vol. 2A, INVLPG).
-pub(crate) fn invlpg(addr: u64) {
+pub fn invlpg(addr: u64) {
     // SAFETY: CPL 0. INVLPG only drops cached translations; it never faults, even for an
     // unmapped or non-canonical address (a non-canonical one is a no-op).
     unsafe { asm!("invlpg [{}]", in(reg) addr, options(nostack, preserves_flags)) };
@@ -1548,7 +1534,7 @@ const CR4_SMAP: u64 = 1 << 21;
 const CR4_UMIP: u64 = 1 << 11;
 
 /// Which of SMEP and SMAP this processor supports (CPUID 7.0 EBX bits 7 and 20).
-pub(crate) fn smep_smap_supported() -> (bool, bool) {
+pub fn smep_smap_supported() -> (bool, bool) {
     if cpuid(0)[0] < 7 {
         return (false, false);
     }
@@ -1556,12 +1542,6 @@ pub(crate) fn smep_smap_supported() -> (bool, bool) {
     (ebx & (1 << 7) != 0, ebx & (1 << 20) != 0)
 }
 
-/// Enables SMEP and SMAP on this processor, where supported; returns which were enabled.
-///
-/// # Safety
-///
-/// CPL 0. The kernel must not rely on executing or accessing user pages from supervisor
-/// mode (it has none; a future user-copy path must set RFLAGS.AC around its accesses).
 /// CR0 bits: EM (emulate FPU: must be clear for SSE), MP, TS. NE is set on every processor
 /// for its own sake: see [`CR0_NE`].
 const CR0_EM: u64 = 1 << 2;
@@ -1575,11 +1555,11 @@ const CR4_OSXSAVE: u64 = 1 << 18;
 /// Whether this processor's SIMD state is managed with XSAVE (else FXSAVE).
 static USE_XSAVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// The XSAVE/FXSAVE area size the kernel allocates per thread, once known.
-static FPU_AREA_SIZE: AtomicU64 = AtomicU64::new(framekernel::features::FXSAVE_SIZE as u64);
+static FPU_AREA_SIZE: AtomicU64 = AtomicU64::new(crate::features::FXSAVE_SIZE as u64);
 
 /// Gathers the CPUID leaves `features` decodes.
-pub(crate) fn gather_cpuid() -> framekernel::features::Cpuid {
-    framekernel::features::Cpuid {
+pub fn gather_cpuid() -> crate::features::Cpuid {
+    crate::features::Cpuid {
         leaf1: cpuid(1),
         leaf7: cpuid(7),
         leaf_d0: cpuid(0x0D),
@@ -1625,8 +1605,8 @@ unsafe fn xsetbv(reg: u32, value: u64) {
 /// # Safety
 ///
 /// CPL 0. Must run once per processor before any code on it uses SSE or XSAVE.
-pub(crate) unsafe fn enable_simd(id: &framekernel::features::Cpuid) -> u64 {
-    use framekernel::features::{Features, wanted_xcr0, xsave_area_size};
+pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
+    use crate::features::{Features, wanted_xcr0, xsave_area_size};
     let features = Features::decode(id);
     // CR0: clear EM and TS, set MP, so SSE instructions run and do not fault to an
     // emulator or a (nonexistent) lazy-FPU handler; set NE, so an x87 error raises #MF
@@ -1678,7 +1658,7 @@ pub(crate) unsafe fn enable_simd(id: &framekernel::features::Cpuid) -> u64 {
 }
 
 /// The per-thread FPU save area size (bytes) and alignment (64).
-pub(crate) fn fpu_area_size() -> usize {
+pub fn fpu_area_size() -> usize {
     FPU_AREA_SIZE.load(core::sync::atomic::Ordering::Relaxed) as usize
 }
 
@@ -1689,7 +1669,7 @@ pub(crate) fn fpu_area_size() -> usize {
 /// # Safety
 ///
 /// `area` must point at a writable buffer of at least [`fpu_area_size`] bytes.
-pub(crate) unsafe fn fpu_init_area(area: u64) {
+pub unsafe fn fpu_init_area(area: u64) {
     let size = fpu_area_size();
     // SAFETY: the caller vouches for the buffer and its size.
     unsafe {
@@ -1717,7 +1697,7 @@ pub(crate) unsafe fn fpu_init_area(area: u64) {
 ///
 /// CPL 0, SSE/XSAVE enabled (`enable_simd`), and `area` a writable [`fpu_area_size`]-byte,
 /// 64-byte-aligned buffer not aliased by another save in progress.
-pub(crate) unsafe fn fpu_save(area: u64) {
+pub unsafe fn fpu_save(area: u64) {
     if USE_XSAVE.load(core::sync::atomic::Ordering::Relaxed) {
         // XSAVE with the full mask (EDX:EAX = all ones): save every enabled component.
         // SAFETY: the caller's contract; the area is large enough (CPUID's maximum).
@@ -1737,7 +1717,7 @@ pub(crate) unsafe fn fpu_save(area: u64) {
 /// # Safety
 ///
 /// As for [`fpu_save`]; `area` must hold state written by [`fpu_save`] or [`fpu_init_area`].
-pub(crate) unsafe fn fpu_restore(area: u64) {
+pub unsafe fn fpu_restore(area: u64) {
     if USE_XSAVE.load(core::sync::atomic::Ordering::Relaxed) {
         // SAFETY: the caller's contract; the area holds a valid XSAVE image.
         unsafe {
@@ -1751,7 +1731,13 @@ pub(crate) unsafe fn fpu_restore(area: u64) {
     }
 }
 
-pub(crate) unsafe fn enable_smep_smap() -> (bool, bool) {
+/// Enables SMEP and SMAP on this processor, where supported; returns which were enabled.
+///
+/// # Safety
+///
+/// CPL 0. The kernel must not rely on executing or accessing user pages from supervisor
+/// mode (it has none; a future user-copy path must set RFLAGS.AC around its accesses).
+pub unsafe fn enable_smep_smap() -> (bool, bool) {
     let (smep, smap) = smep_smap_supported();
     // The boot processor's answer decides what the kernel assumes: an AP that lacks SMAP
     // refuses to start (`smp::ap_entry`) and must not turn it off for everyone else.

@@ -3386,8 +3386,10 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    let text = serial::clean(&raw);
+                    let missing = serial::first_missing(&text, &markers).unwrap_or("(none)");
                     break Err(format!(
-                        "no complete loader output within {}s",
+                        "first missing marker {missing:?}; no complete loader output within {}s",
                         timeout.as_secs()
                     ));
                 }

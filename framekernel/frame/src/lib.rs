@@ -22,11 +22,39 @@
 //! (`#[cfg(target_os = "none")]`).
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
 pub use origin_sync as sync;
 
+pub mod apic;
+pub mod clock;
+pub mod descriptors;
+pub mod features;
+pub mod frames;
+pub mod heap;
 pub mod irq;
+pub mod limits;
 pub mod once;
 pub mod trap;
+pub mod unwind;
+pub mod usercopy;
+
+#[cfg(test)]
+mod testing;
 
 #[cfg(target_os = "none")]
+pub mod cpu;
+#[cfg(target_os = "none")]
+pub mod memory;
+#[cfg(target_os = "none")]
+pub mod monotonic;
+#[cfg(target_os = "none")]
+pub mod phys;
+#[cfg(target_os = "none")]
 pub mod port;
+#[cfg(target_os = "none")]
+pub mod timer;
+#[cfg(target_os = "none")]
+pub mod tlb;
+#[cfg(target_os = "none")]
+pub mod vm;

@@ -11,24 +11,24 @@ static KERNEL_VIRTUAL: AtomicU64 = AtomicU64::new(0);
 static KERNEL_PHYSICAL: AtomicU64 = AtomicU64::new(0);
 
 /// Records the loader's placement. Called once, first thing after the boot info is read.
-pub(crate) fn init(info: &BootInfo) {
+pub fn init(info: &BootInfo) {
     DIRECT.store(info.direct_map_base, Ordering::Relaxed);
     KERNEL_VIRTUAL.store(info.kernel_virtual_base, Ordering::Relaxed);
     KERNEL_PHYSICAL.store(info.kernel_base, Ordering::Relaxed);
 }
 
 /// The direct-map address of physical `phys`.
-pub(crate) fn to_virt(phys: u64) -> u64 {
+pub fn to_virt(phys: u64) -> u64 {
     DIRECT.load(Ordering::Relaxed).wrapping_add(phys)
 }
 
 /// The kernel image's virtual base (0 before `init`).
-pub(crate) fn kernel_virtual_base() -> u64 {
+pub fn kernel_virtual_base() -> u64 {
     KERNEL_VIRTUAL.load(Ordering::Relaxed)
 }
 
 /// The physical address behind a direct-map or kernel-image address.
-pub(crate) fn to_phys(virt: u64) -> u64 {
+pub fn to_phys(virt: u64) -> u64 {
     let kernel = KERNEL_VIRTUAL.load(Ordering::Relaxed);
     if virt >= kernel {
         virt - kernel + KERNEL_PHYSICAL.load(Ordering::Relaxed)

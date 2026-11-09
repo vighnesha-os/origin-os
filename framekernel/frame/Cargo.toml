@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 origin-boot-info = { path = "../../boot/info" }
 origin-paging = { path = "../paging" }
+origin-abi = { path = "../../runtime/abi" }
 origin-sync = { path = "sync" }
 
 [lints]

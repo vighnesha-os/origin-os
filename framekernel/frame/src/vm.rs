@@ -9,21 +9,21 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use framekernel::paging::{
+use origin_paging::{
     Access, AddressSpace, Attributes, LARGE_PAGE, LeafCensus, MapError, PAGE, TablePool,
     Translation,
 };
 
 /// The MMIO window (ADR-0004 H2): device registers, mapped uncached on demand. It starts
 /// after the 2 GiB reserved for the framebuffer (ADR-0010).
-const MMIO_BASE: u64 = framekernel::paging::layout::FRAMEBUFFER_WINDOW
-    + framekernel::paging::layout::FRAMEBUFFER_WINDOW_SIZE;
+const MMIO_BASE: u64 =
+    origin_paging::layout::FRAMEBUFFER_WINDOW + origin_paging::layout::FRAMEBUFFER_WINDOW_SIZE;
 const MMIO_END: u64 = 0xFFFF_F000_0000_0000;
 /// The next free address in the MMIO window.
 static MMIO_NEXT: AtomicU64 = AtomicU64::new(MMIO_BASE);
 
 use origin_boot_info::{MemoryRegion, overlaps_ram};
-use origin_frame::sync::SpinLock;
+use origin_sync::SpinLock;
 
 struct KernelSpace {
     space: AddressSpace,
@@ -39,12 +39,12 @@ static KERNEL_SPACE: SpinLock<Option<KernelSpace>> = SpinLock::new(None);
 static KERNEL_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The kernel's PML4 (physical), without taking a lock.
-pub(crate) fn kernel_root() -> u64 {
+pub fn kernel_root() -> u64 {
     KERNEL_ROOT.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// The kernel half (PML4 entries 256–511) every process address space shares.
-pub(crate) fn kernel_half() -> Option<[u64; 256]> {
+pub fn kernel_half() -> Option<[u64; 256]> {
     crate::cpu::without_interrupts(|| {
         let guard = KERNEL_SPACE.lock();
         let k = guard.as_ref()?;
@@ -53,7 +53,7 @@ pub(crate) fn kernel_half() -> Option<[u64; 256]> {
 }
 
 /// Keeps the live address space (`init_paging` calls this right after loading CR3).
-pub(crate) fn install(space: AddressSpace, tables: TablePool<'static>) {
+pub fn install(space: AddressSpace, tables: TablePool<'static>) {
     KERNEL_ROOT.store(space.root(), core::sync::atomic::Ordering::Release);
     crate::cpu::without_interrupts(|| {
         *KERNEL_SPACE.lock() = Some(KernelSpace {
@@ -66,7 +66,7 @@ pub(crate) fn install(space: AddressSpace, tables: TablePool<'static>) {
 
 /// Records the firmware's memory map for [`map_mmio`], as soon as the first caller that needs
 /// the check runs (`pcie::quiesce`); the console's UART, mapped earlier, checks for itself.
-pub(crate) fn set_memory_map(regions: &'static [MemoryRegion]) {
+pub fn set_memory_map(regions: &'static [MemoryRegion]) {
     crate::cpu::without_interrupts(|| {
         if let Some(k) = KERNEL_SPACE.lock().as_mut() {
             k.memory_map = regions;
@@ -75,14 +75,14 @@ pub(crate) fn set_memory_map(regions: &'static [MemoryRegion]) {
 }
 
 /// Physical address of the live PML4.
-pub(crate) fn root() -> Option<u64> {
+pub fn root() -> Option<u64> {
     crate::cpu::without_interrupts(|| KERNEL_SPACE.lock().as_ref().map(|k| k.space.root()))
 }
 
 /// Makes physical `[addr, addr + len)` readable at its direct-map address: pages not mapped
 /// yet are mapped read-only and never executable; mapped pages keep their mapping.
 /// Returns the direct-map address of `addr`.
-pub(crate) fn map_firmware(addr: u64, len: u64) -> Result<u64, MapError> {
+pub fn map_firmware(addr: u64, len: u64) -> Result<u64, MapError> {
     crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
@@ -107,7 +107,7 @@ pub(crate) fn map_firmware(addr: u64, len: u64) -> Result<u64, MapError> {
 
 /// Maps the 4 KiB page `virt` to `phys` as a **user** page with `access`: only for probes
 /// that prove supervisor protections (SMEP, SMAP); the kernel has no user mappings otherwise.
-pub(crate) fn map_user(virt: u64, phys: u64, access: Access) -> Result<(), MapError> {
+pub fn map_user(virt: u64, phys: u64, access: Access) -> Result<(), MapError> {
     crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
@@ -115,14 +115,14 @@ pub(crate) fn map_user(virt: u64, phys: u64, access: Access) -> Result<(), MapEr
             access,
             user: true,
             global: false,
-            cache: framekernel::paging::Cache::WriteBack,
+            cache: origin_paging::Cache::WriteBack,
         };
         k.space.map(&mut k.tables, virt, phys, attributes)
     })
 }
 
 /// Removes the leaf at `virt`; once this returns, no processor's TLB holds it.
-pub(crate) fn unmap(virt: u64) -> Result<u64, MapError> {
+pub fn unmap(virt: u64) -> Result<u64, MapError> {
     let phys = crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
@@ -135,7 +135,7 @@ pub(crate) fn unmap(virt: u64) -> Result<u64, MapError> {
 /// Turns the direct-map page `page` into a guard page: unmapped, so any access faults,
 /// on every processor once this returns. A 2 MiB leaf covering it is split first (one
 /// INVLPG in the page drops the old 2 MiB translation too).
-pub(crate) fn make_guard(page: u64) -> Result<(), MapError> {
+pub fn make_guard(page: u64) -> Result<(), MapError> {
     unmap_guards(&[page])?;
     crate::tlb::shootdown(page);
     Ok(())
@@ -143,7 +143,7 @@ pub(crate) fn make_guard(page: u64) -> Result<(), MapError> {
 
 /// As [`make_guard`] for several pages, with one full TLB flush on every processor instead
 /// of one shootdown per page.
-pub(crate) fn make_guards(pages: &[u64]) -> Result<(), MapError> {
+pub fn make_guards(pages: &[u64]) -> Result<(), MapError> {
     unmap_guards(pages)?;
     crate::tlb::shootdown_all();
     Ok(())
@@ -164,7 +164,7 @@ fn unmap_guards(pages: &[u64]) -> Result<(), MapError> {
 
 /// Why [`map_mmio`] refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MmioError {
+pub enum MmioError {
     /// The firmware's memory map says part of the range is RAM.
     OverlapsRam,
     /// The tables refused the mapping; none of it is left behind.
@@ -183,7 +183,7 @@ impl From<MapError> for MmioError {
 /// pages. A range the firmware's memory map calls RAM is refused: writing device registers
 /// through an uncached mapping there would corrupt memory. On any failure no leaf remains
 /// and the window does not advance, so the next mapping starts clean.
-pub(crate) fn map_mmio(phys: u64, len: u64) -> Result<u64, MmioError> {
+pub fn map_mmio(phys: u64, len: u64) -> Result<u64, MmioError> {
     let first = phys & !(PAGE - 1);
     let end = phys
         .checked_add(len)
@@ -225,7 +225,7 @@ pub(crate) fn map_mmio(phys: u64, len: u64) -> Result<u64, MmioError> {
 }
 
 /// How the live tables translate `virt`.
-pub(crate) fn translate(virt: u64) -> Option<Translation> {
+pub fn translate(virt: u64) -> Option<Translation> {
     crate::cpu::without_interrupts(|| {
         let guard = KERNEL_SPACE.lock();
         let k = guard.as_ref()?;
@@ -234,7 +234,7 @@ pub(crate) fn translate(virt: u64) -> Option<Translation> {
 }
 
 /// Counts the live tables' leaves by half and global bit (`tlb::prove`).
-pub(crate) fn leaf_census() -> Option<LeafCensus> {
+pub fn leaf_census() -> Option<LeafCensus> {
     crate::cpu::without_interrupts(|| {
         let guard = KERNEL_SPACE.lock();
         let k = guard.as_ref()?;
@@ -243,7 +243,7 @@ pub(crate) fn leaf_census() -> Option<LeafCensus> {
 }
 
 /// Maps a guard page back (read/write, never executable) before its memory is freed.
-pub(crate) fn unguard(page: u64) -> Result<(), MapError> {
+pub fn unguard(page: u64) -> Result<(), MapError> {
     crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
@@ -258,7 +258,7 @@ pub(crate) fn unguard(page: u64) -> Result<(), MapError> {
 
 /// Maps the 4 KiB page at physical `page` at its identity address (the lower half) with
 /// `access`: only for the AP trampoline, which runs there while paging comes on.
-pub(crate) fn map_identity(page: u64, access: Access) -> Result<(), MapError> {
+pub fn map_identity(page: u64, access: Access) -> Result<(), MapError> {
     crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
@@ -268,7 +268,7 @@ pub(crate) fn map_identity(page: u64, access: Access) -> Result<(), MapError> {
 }
 
 /// Whether `virt` is mapped in the live address space.
-pub(crate) fn is_mapped(virt: u64) -> bool {
+pub fn is_mapped(virt: u64) -> bool {
     crate::cpu::without_interrupts(|| {
         KERNEL_SPACE
             .lock()

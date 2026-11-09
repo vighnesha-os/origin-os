@@ -33,7 +33,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use framekernel::acpi;
-use framekernel::clock::{self, NANOS_PER_SECOND, Scale, SharedScale};
+use framekernel::clock::{self, NANOS_PER_SECOND, Scale};
 use framekernel::hpet;
 use framekernel::rtc::{self, DateTime, Registers, SecondMeasurement, SecondVerdict, register};
 use origin_frame::sync::SpinLock;
@@ -42,35 +42,10 @@ use crate::console::Console;
 use crate::cpu::{self, rdtsc};
 use crate::{inb, outb};
 
-/// The TSC when the kernel was entered: the monotonic clock's zero.
-static ENTRY_TSC: AtomicU64 = AtomicU64::new(0);
-/// TSC ticks to nanoseconds, once [`init`] has chosen the rate.
-static SCALE: SharedScale = SharedScale::new();
 /// Unix time in nanoseconds at monotonic zero; 0 while unknown.
 static BOOT_WALL: AtomicU64 = AtomicU64::new(0);
 
-/// Records the monotonic clock's zero: the first thing `_start` does.
-pub(crate) fn mark_entry() {
-    ENTRY_TSC.store(rdtsc(), Ordering::Relaxed);
-}
-
-/// The TSC when the kernel was entered.
-pub(crate) fn entry_tsc() -> u64 {
-    ENTRY_TSC.load(Ordering::Relaxed)
-}
-
-/// Nanoseconds since kernel entry; 0 until [`init`] has chosen the TSC rate.
-pub(crate) fn monotonic_nanos() -> u64 {
-    let Some(scale) = SCALE.get() else {
-        return 0;
-    };
-    scale.nanos(rdtsc().saturating_sub(ENTRY_TSC.load(Ordering::Relaxed)))
-}
-
-/// The chosen TSC rate in Hz (1 before the clock is set up), for spin-wait budgets.
-pub(crate) fn tsc_hz() -> u64 {
-    SCALE.get().map_or(1, |s| s.hz())
-}
+pub(crate) use origin_frame::monotonic::{entry_tsc, mark_entry, monotonic_nanos, tsc_hz};
 
 /// Unix time in nanoseconds, or `None` if the wall clock was never set.
 pub(crate) fn wall_nanos() -> Option<u64> {
@@ -262,7 +237,7 @@ pub(crate) fn init(com1: &mut Console, calibrated_hz: u64, rsdp: u64) -> bool {
         let _ = writeln!(com1, "origin-kernel: clock: TSC rate 0: clock failed");
         return false;
     };
-    SCALE.publish(scale);
+    origin_frame::monotonic::publish_scale(scale);
     let _ = writeln!(
         com1,
         "origin-kernel: clock: TSC at {} kHz, from {source}; invariant TSC {}; PIT calibration {} kHz; CPUID 15h {}",
@@ -499,7 +474,7 @@ fn set_wall_clock(
         );
         return false;
     };
-    let at = scale.nanos(t1.saturating_sub(ENTRY_TSC.load(Ordering::Relaxed)));
+    let at = scale.nanos(t1.saturating_sub(entry_tsc()));
     let base = unix.saturating_sub(at);
     BOOT_WALL.store(base, Ordering::Relaxed);
     let now = wall_nanos().unwrap_or(0);

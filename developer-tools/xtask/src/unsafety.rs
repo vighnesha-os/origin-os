@@ -59,6 +59,7 @@ const LAYERS: &[(&str, &[&str])] = &[
     (
         "origin-frame",
         &[
+            "origin-abi",
             "origin-boot-info",
             "origin-paging",
             "origin-sync",

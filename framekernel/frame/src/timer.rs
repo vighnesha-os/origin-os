@@ -1,7 +1,7 @@
 //! The local APIC timer (M2: interrupts; CLAUDE.md §24, §68): x2APIC mode, calibration
 //! against the 8254 PIT, and a periodic interrupt proven by counting it.
 //!
-//! The register encodings and the calibration arithmetic are in `framekernel::apic`, tested
+//! The register encodings and the calibration arithmetic are in `crate::apic`, tested
 //! on the host. This module does the MSR and port I/O, in this order:
 //! 1. mask both legacy 8259 PICs, so no firmware-programmed IRQ reaches a vector without a
 //!    gate;
@@ -16,20 +16,19 @@
 
 use core::fmt::Write;
 
-use framekernel::apic::{
+use crate::apic::{
     self, CalibrationWindow, IA32_APIC_BASE, SPURIOUS_VECTOR, TIMER_VECTOR, TimerMode, X2APIC_ID,
     X2APIC_LVT_TIMER, X2APIC_SVR, X2APIC_TIMER_CURRENT, X2APIC_TIMER_DIVIDE, X2APIC_TIMER_INITIAL,
     X2APIC_VERSION,
 };
 
-use crate::console::Console;
 use crate::cpu::{self, rdmsr, rdtsc, wrmsr};
-use crate::{inb, outb};
+use crate::port::{inb, outb};
 
 /// Periodic timer rate for the proof. 10 ms periods tolerate an emulator's wake-up latency
 /// (QEMU's TCG coalesces timer expiries that a halted vCPU is late to take, which at 1 kHz
 /// showed as 100 interrupts in 125 ms on the development host).
-pub(crate) const HZ: u64 = 100;
+pub const HZ: u64 = 100;
 /// Interrupts to take.
 const PROOF_TICKS: u64 = 50;
 /// Calibration window.
@@ -49,8 +48,8 @@ const PIC_MASTER_DATA: u16 = 0x21;
 const PIC_SLAVE_DATA: u16 = 0xA1;
 
 /// x2APIC registers this module reads. None has a read side effect.
-#[derive(Clone, Copy)]
-pub(crate) enum ApicRead {
+#[derive(Clone, Copy, Debug)]
+pub enum ApicRead {
     Id,
     Version,
     TimerCurrent,
@@ -68,7 +67,8 @@ enum ApicWrite {
 
 /// The local APIC, in x2APIC mode: holding one proves the mode switch happened, so its
 /// register MSRs exist.
-pub(crate) struct X2Apic(());
+#[derive(Debug)]
+pub struct X2Apic(());
 
 impl X2Apic {
     /// Switches the local APIC to x2APIC mode through the legal transitions and
@@ -78,7 +78,7 @@ impl X2Apic {
     ///
     /// CPL 0, boot processor only, interrupts disabled, and x2APIC supported
     /// ([`cpu::x2apic_supported`]); the spurious vector must have an IDT gate.
-    pub(crate) unsafe fn enable() -> Self {
+    pub unsafe fn enable() -> Self {
         // SAFETY: the caller's contract; IA32_APIC_BASE exists on every x86-64 processor.
         let current = unsafe { rdmsr(IA32_APIC_BASE) };
         let (writes, count) = apic::x2apic_transition(current);
@@ -98,11 +98,11 @@ impl X2Apic {
     /// # Safety
     ///
     /// CPL 0, and [`X2Apic::enable`] has run on this processor.
-    pub(crate) unsafe fn assume_enabled() -> Self {
+    pub unsafe fn assume_enabled() -> Self {
         Self(())
     }
 
-    pub(crate) fn read(&self, reg: ApicRead) -> u64 {
+    pub fn read(&self, reg: ApicRead) -> u64 {
         let msr = match reg {
             ApicRead::Id => X2APIC_ID,
             ApicRead::Version => X2APIC_VERSION,
@@ -133,7 +133,7 @@ impl X2Apic {
     ///
     /// The IPI's effect on the destination must be one the caller intends and has prepared
     /// for; an INIT or start-up IPI, for example, needs a ready trampoline.
-    pub(crate) unsafe fn send_ipi(&self, destination: u32, command: u32) {
+    pub unsafe fn send_ipi(&self, destination: u32, command: u32) {
         let value = (u64::from(destination) << 32) | u64::from(command & 0xF_FFFF);
         // SAFETY: x2APIC mode is on (type invariant), so the ICR exists; the caller vouches
         // for the IPI's effect.
@@ -188,7 +188,7 @@ static PERIOD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::ne
 
 /// Starts this processor's APIC timer at the calibrated [`HZ`]. Returns false if the
 /// boot processor has not calibrated it.
-pub(crate) fn start_periodic(lapic: &X2Apic) -> bool {
+pub fn start_periodic(lapic: &X2Apic) -> bool {
     let count = PERIOD.load(core::sync::atomic::Ordering::Acquire);
     if count == 0 {
         return false;
@@ -207,14 +207,14 @@ pub(crate) fn start_periodic(lapic: &X2Apic) -> bool {
 
 impl X2Apic {
     /// Stops this processor's APIC timer.
-    pub(crate) fn stop(&self) {
+    pub fn stop(&self) {
         self.stop_timer();
     }
 }
 
 /// Brings up the local APIC and proves its timer. Returns the TSC rate in Hz if every step
 /// passed.
-pub(crate) fn init(com1: &mut Console) -> Option<u64> {
+pub fn init(com1: &mut dyn Write) -> Option<u64> {
     if !cpu::x2apic_supported() {
         let _ = writeln!(com1, "origin-kernel: the processor has no x2APIC");
         return None;
