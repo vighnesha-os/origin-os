@@ -13,17 +13,23 @@ use framekernel::paging::{
     Translation,
 };
 
-/// The MMIO window (ADR-0004 H2): device registers, mapped uncached on demand.
-const MMIO_BASE: u64 = 0xFFFF_E000_0000_0000;
+/// The MMIO window (ADR-0004 H2): device registers, mapped uncached on demand. It starts
+/// after the 2 GiB reserved for the framebuffer (ADR-0010).
+const MMIO_BASE: u64 = framekernel::paging::layout::FRAMEBUFFER_WINDOW
+    + framekernel::paging::layout::FRAMEBUFFER_WINDOW_SIZE;
 const MMIO_END: u64 = 0xFFFF_F000_0000_0000;
 /// The next free address in the MMIO window.
 static MMIO_NEXT: AtomicU64 = AtomicU64::new(MMIO_BASE);
 
+use origin_boot_info::{MemoryRegion, overlaps_ram};
 use origin_sync::SpinLock;
 
 struct KernelSpace {
     space: AddressSpace,
     tables: TablePool<'static>,
+    /// The firmware's memory map, once [`set_memory_map`] has recorded it: [`map_mmio`]
+    /// refuses to map anything it calls RAM.
+    memory_map: &'static [MemoryRegion],
 }
 
 static KERNEL_SPACE: SpinLock<Option<KernelSpace>> = SpinLock::new(None);
@@ -49,8 +55,22 @@ pub(crate) fn kernel_half() -> Option<[u64; 256]> {
 pub(crate) fn install(space: AddressSpace, tables: TablePool<'static>) {
     KERNEL_ROOT.store(space.root(), core::sync::atomic::Ordering::Release);
     crate::cpu::without_interrupts(|| {
-        *KERNEL_SPACE.lock() = Some(KernelSpace { space, tables });
+        *KERNEL_SPACE.lock() = Some(KernelSpace {
+            space,
+            tables,
+            memory_map: &[],
+        });
     })
+}
+
+/// Records the firmware's memory map for [`map_mmio`], as soon as the first caller that needs
+/// the check runs (`pcie::quiesce`); the console's UART, mapped earlier, checks for itself.
+pub(crate) fn set_memory_map(regions: &'static [MemoryRegion]) {
+    crate::cpu::without_interrupts(|| {
+        if let Some(k) = KERNEL_SPACE.lock().as_mut() {
+            k.memory_map = regions;
+        }
+    });
 }
 
 /// Physical address of the live PML4.
@@ -141,20 +161,41 @@ fn unmap_guards(pages: &[u64]) -> Result<(), MapError> {
     })
 }
 
+/// Why [`map_mmio`] refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MmioError {
+    /// The firmware's memory map says part of the range is RAM.
+    OverlapsRam,
+    /// The tables refused the mapping; none of it is left behind.
+    Map(MapError),
+}
+
+impl From<MapError> for MmioError {
+    fn from(e: MapError) -> Self {
+        Self::Map(e)
+    }
+}
+
 /// Maps the device registers at physical `[phys, phys + len)` uncached, read/write and
 /// never executable into the MMIO window, and returns the virtual address of `phys`. The
 /// window keeps the physical address's offset within 2 MiB, so aligned ranges get 2 MiB
-/// pages. The caller vouches that the range is device memory, not RAM.
-pub(crate) fn map_mmio(phys: u64, len: u64) -> Result<u64, MapError> {
+/// pages. A range the firmware's memory map calls RAM is refused: writing device registers
+/// through an uncached mapping there would corrupt memory. On any failure no leaf remains
+/// and the window does not advance, so the next mapping starts clean.
+pub(crate) fn map_mmio(phys: u64, len: u64) -> Result<u64, MmioError> {
     let first = phys & !(PAGE - 1);
     let end = phys
         .checked_add(len)
         .and_then(|e| e.checked_next_multiple_of(PAGE))
         .ok_or(MapError::Overflow)?;
     let bytes = end - first;
-    let virt = crate::cpu::without_interrupts(|| {
+    let mut removed = false;
+    let mapped = crate::cpu::without_interrupts(|| -> Result<u64, MmioError> {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
+        if overlaps_ram(k.memory_map, first, bytes) {
+            return Err(MmioError::OverlapsRam);
+        }
         let start = MMIO_NEXT
             .load(Ordering::Relaxed)
             .checked_next_multiple_of(LARGE_PAGE)
@@ -162,14 +203,24 @@ pub(crate) fn map_mmio(phys: u64, len: u64) -> Result<u64, MapError> {
             .ok_or(MapError::Overflow)?;
         let stop = start.checked_add(bytes).ok_or(MapError::Overflow)?;
         if stop > MMIO_END {
-            return Err(MapError::OutOfMemory);
+            return Err(MapError::OutOfMemory.into());
         }
-        k.space
-            .map_range(&mut k.tables, start, first, bytes, Attributes::mmio())?;
+        if let Err(e) = k
+            .space
+            .map_range(&mut k.tables, start, first, bytes, Attributes::mmio())
+        {
+            removed = true;
+            return Err(e.into());
+        }
         MMIO_NEXT.store(stop, Ordering::Relaxed);
         Ok(start)
-    })?;
-    Ok(virt + (phys - first))
+    });
+    // `map_range` took back what it had installed, and the next mapping will reuse these
+    // addresses: no processor may keep a translation of the failed attempt.
+    if removed {
+        crate::tlb::shootdown_all();
+    }
+    Ok(mapped? + (phys - first))
 }
 
 /// How the live tables translate `virt`.
@@ -201,30 +252,6 @@ pub(crate) fn unguard(page: u64) -> Result<(), MapError> {
             crate::phys::to_phys(page),
             Attributes::kernel_global(Access::ReadWrite),
         )
-    })
-}
-
-/// Whether every page of `[addr, addr + len)` is mapped as a **user** page. A system call
-/// must check this before touching a user pointer: while the kernel is identity-mapped in
-/// the lower half (ADR-0003 K2), a lower-half address can name kernel memory.
-pub(crate) fn user_readable(addr: u64, len: u64) -> bool {
-    let Some(end) = addr.checked_add(len) else {
-        return false;
-    };
-    crate::cpu::without_interrupts(|| {
-        let guard = KERNEL_SPACE.lock();
-        let Some(k) = guard.as_ref() else {
-            return false;
-        };
-        let mut page = addr & !(PAGE - 1);
-        while page < end {
-            match k.space.translate(&k.tables, page) {
-                Some(t) if t.user => {}
-                _ => return false,
-            }
-            page += PAGE;
-        }
-        true
     })
 }
 

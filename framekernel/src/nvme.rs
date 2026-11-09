@@ -87,6 +87,13 @@ pub const fn doorbell(queue: u16, completion: bool, stride: u64) -> u64 {
     0x1000 + (2 * queue as u64 + completion as u64) * stride
 }
 
+/// Whether the doorbells of queues up to `queue` lie inside a `bar_size`-byte register
+/// window. CAP's stride is the device's word: at its largest (128 KiB) a few queues' doorbells
+/// are already megabytes past a normal BAR.
+pub const fn doorbells_fit(queue: u16, stride: u64, bar_size: u64) -> bool {
+    doorbell(queue, true, stride) + 4 <= bar_size
+}
+
 /// CC to enable the controller: NVM command set, round-robin arbitration, 4 KiB pages
 /// (`page_shift` 12), 64-byte submission and 16-byte completion entries.
 pub const fn cc_enable(page_shift: u32) -> u32 {
@@ -436,8 +443,18 @@ pub struct NamespaceInfo {
     pub metadata: u16,
 }
 
+impl NamespaceInfo {
+    /// Whether each logical block fits in one `page`-byte memory page. Longer blocks would
+    /// need a PRP list per block, which this driver does not build.
+    pub const fn block_fits_page(&self, page: u64) -> bool {
+        self.block_size as u64 <= page
+    }
+}
+
 /// Parses Identify Namespace data, or `None` for an inactive namespace (size 0), a format
-/// index beyond the formats listed, or a block size outside 512 B–64 KiB.
+/// index beyond the formats listed, a block size outside 512 B–64 KiB, or a namespace whose
+/// byte size does not fit in 64 bits (NSZE is the device's word, and every use of it
+/// multiplies by the block size).
 pub fn identify_namespace(data: &[u8; 4096]) -> Option<NamespaceInfo> {
     let mut size = [0u8; 8];
     size.copy_from_slice(data.get(0..8)?);
@@ -456,9 +473,11 @@ pub fn identify_namespace(data: &[u8; 4096]) -> Option<NamespaceInfo> {
     if !(9..=16).contains(&lbads) {
         return None;
     }
+    let block_size: u32 = 1 << lbads;
+    blocks.checked_mul(u64::from(block_size))?;
     Some(NamespaceInfo {
         blocks,
-        block_size: 1 << lbads,
+        block_size,
         metadata: lbaf as u16,
     })
 }
@@ -656,6 +675,169 @@ mod tests {
             ]);
         }
         assert!(accepted > 1000, "{accepted}");
+    }
+
+    /// The fields both Identify parsers read are mutated directly (a uniform mutation of
+    /// the 4 KiB page rarely lands on them), and anything accepted keeps its invariants.
+    #[test]
+    fn mutated_identify_fields_keep_their_invariants() {
+        use crate::testing::{Rng, mutate_window};
+        let mut rng = Rng::new(0x4944_4E54);
+        let (mut namespaces, mut refused) = (0u32, 0u32);
+        for case in 0..crate::testing::cases(10_000) {
+            let mut d = identify_data();
+            d[0..8].copy_from_slice(&32768u64.to_le_bytes());
+            d[25] = 3;
+            d[26] = 1;
+            d[128..132].copy_from_slice(&(9u32 << 16).to_le_bytes());
+            d[132..136].copy_from_slice(&((12u32 << 16) | 8).to_le_bytes());
+            d[136..140].copy_from_slice(&(16u32 << 16).to_le_bytes());
+            match case % 4 {
+                0 => mutate_window(&mut d, 0..32, &mut rng),
+                1 => mutate_window(&mut d, 128..152, &mut rng),
+                2 => mutate_window(&mut d, 0..80, &mut rng),
+                _ => mutate_window(&mut d, 516..520, &mut rng),
+            }
+            let c = identify_controller(&d);
+            assert_eq!(c.vendor.to_le_bytes(), d[0..2], "case {case}");
+            assert_eq!(c.namespaces.to_le_bytes(), d[516..520], "case {case}");
+            for field in [&c.serial[..], &c.model[..], &c.firmware[..]] {
+                let t = text(field);
+                assert!(t.bytes().all(|b| (0x20..0x7F).contains(&b)), "case {case}");
+                assert!(!t.ends_with(' '), "case {case}: {t:?}");
+                assert!(field.starts_with(t.as_bytes()), "case {case}: {t:?}");
+            }
+            let Some(ns) = identify_namespace(&d) else {
+                refused += 1;
+                continue;
+            };
+            namespaces += 1;
+            let formats = usize::from(d[25]) + 1;
+            let flbas = d[26];
+            let index = usize::from(flbas & 0xF) | (usize::from((flbas >> 5) & 3) << 4);
+            assert!(index < formats && index < 64, "case {case}");
+            let f = u32::from_le_bytes(d[128 + 4 * index..132 + 4 * index].try_into().unwrap());
+            let lbads = (f >> 16) & 0xFF;
+            assert!((9..=16).contains(&lbads), "case {case}");
+            assert_eq!(ns.block_size, 1 << lbads, "case {case}");
+            assert_eq!(ns.metadata, f as u16, "case {case}");
+            assert_eq!(ns.blocks.to_le_bytes(), d[0..8], "case {case}");
+            assert!(ns.blocks > 0, "case {case}");
+            assert!(
+                ns.blocks.checked_mul(u64::from(ns.block_size)).is_some(),
+                "case {case}"
+            );
+        }
+        assert!(namespaces > 2000 && refused > 500, "{namespaces}/{refused}");
+    }
+
+    /// A namespace whose size in bytes needs more than 64 bits is refused: the driver and the
+    /// block layer multiply NSZE by the block size.
+    #[test]
+    fn a_namespace_too_large_for_64_bits_is_refused() {
+        let page = |blocks: u64, lbads: u32| {
+            let mut d = [0u8; 4096];
+            d[0..8].copy_from_slice(&blocks.to_le_bytes());
+            d[128..132].copy_from_slice(&(lbads << 16).to_le_bytes());
+            d
+        };
+        // 2^55 blocks of 512 bytes is exactly 2^64 bytes: one too many.
+        assert_eq!(identify_namespace(&page(1 << 55, 9)), None);
+        assert_eq!(
+            identify_namespace(&page((1 << 55) - 1, 9)).map(|n| n.blocks),
+            Some((1 << 55) - 1)
+        );
+        assert_eq!(identify_namespace(&page(u64::MAX, 16)), None);
+        assert_eq!(identify_namespace(&page(1 << 48, 16)), None);
+    }
+
+    /// Controller registers and queue indexes hold together over any register or completion
+    /// values, with the queue arithmetic in range after each step.
+    #[test]
+    fn hostile_registers_and_completions_never_break_the_queues() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0x514E_564D);
+        for case in 0..crate::testing::cases(20_000) {
+            let v = rng.edge_u64();
+            let cap = Capabilities::decode(v);
+            assert!(
+                (1..=65536).contains(&cap.max_entries),
+                "case {case}: {v:#x}"
+            );
+            assert!(cap.doorbell_stride.is_power_of_two(), "case {case}: {v:#x}");
+            assert!((4..=4 << 15).contains(&cap.doorbell_stride), "case {case}");
+            assert!(cap.timeout_ms <= 0xFF * 500, "case {case}");
+            assert!((12..=27).contains(&cap.min_page_shift), "case {case}");
+            assert!((12..=27).contains(&cap.max_page_shift), "case {case}");
+            let _ = version(rng.edge_u32());
+            let (sq, cq) = allocated_queues(rng.edge_u32());
+            assert!(
+                (1..=65536).contains(&sq) && (1..=65536).contains(&cq),
+                "case {case}"
+            );
+            let queue = rng.edge_u32() as u16;
+            let at = doorbell(queue, rng.below(2) == 0, cap.doorbell_stride);
+            assert!(at >= 0x1000, "case {case}");
+            let bar = rng.edge_u64() >> 1;
+            let fits = doorbells_fit(queue, cap.doorbell_stride, bar);
+            assert_eq!(
+                fits,
+                doorbell(queue, true, cap.doorbell_stride) + 4 <= bar,
+                "case {case}"
+            );
+            if let Some((p1, p2)) = prps(rng.edge_u64(), rng.edge_u64(), 1 << (12 + rng.below(4))) {
+                assert!(p1.is_multiple_of(4), "case {case}");
+                let _ = p2;
+            }
+        }
+        for case in 0..crate::testing::cases(600) {
+            let entries = match case % 3 {
+                0 => 2,
+                1 => 64,
+                _ => u16::MAX,
+            };
+            let mut q = Queues::new(entries);
+            for step in 0..200 {
+                if rng.below(2) == 0
+                    && let Some(slot) = q.submit()
+                {
+                    assert!(slot < entries, "case {case}.{step}: {slot}");
+                }
+                let c = Completion::decode([
+                    rng.edge_u32(),
+                    rng.edge_u32(),
+                    rng.edge_u32(),
+                    rng.edge_u32(),
+                ]);
+                let _ = c.status.ok();
+                q.complete(&c);
+                assert!(q.cq_head() < entries, "case {case}.{step}");
+                assert!(q.sq_tail() < entries, "case {case}.{step}");
+            }
+        }
+    }
+
+    #[test]
+    fn doorbells_must_fit_their_bar() {
+        // QEMU's controller: stride 4, 16 KiB of registers.
+        assert!(doorbells_fit(9, 4, 16 << 10));
+        // A controller claiming the largest stride: the doorbells of queue 1 alone are
+        // 256 KiB past the start of a 16 KiB BAR.
+        assert!(!doorbells_fit(1, 4 << 15, 16 << 10));
+        // Queue 1's completion doorbell is the dword at 100Ch.
+        assert!(doorbells_fit(1, 4, 0x1010));
+        assert!(!doorbells_fit(1, 4, 0x100F));
+    }
+
+    #[test]
+    fn a_block_must_fit_one_page() {
+        let ns = |block_size| NamespaceInfo {
+            blocks: 8,
+            block_size,
+            metadata: 0,
+        };
+        assert!(ns(512).block_fits_page(4096) && ns(4096).block_fits_page(4096));
+        assert!(!ns(8192).block_fits_page(4096) && !ns(65536).block_fits_page(4096));
     }
 
     #[test]

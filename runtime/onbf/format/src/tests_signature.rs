@@ -217,6 +217,120 @@ fn statement_rules_are_enforced() {
     );
 }
 
+/// Errata O1: a statement's `id` is printable ASCII, so the parser needs no NFC tables.
+#[test]
+fn a_statement_id_must_be_printable_ascii() {
+    let parse = |id: &str| {
+        let mut s = statement(4);
+        s[3].1 = text(id);
+        let mut e = entry(4, 2, 4627);
+        e[4].1 = map(&s);
+        SignatureBlock::parse(&block(&[map(&e)])).map(|_| ())
+    };
+    for good in ["origin.framekernel", " ", "~", "a b"] {
+        assert_eq!(parse(good), Ok(()), "{good:?}");
+    }
+    let refused = Err(SignatureError::Field { entry: 0, key: 53 });
+    // Composed and decomposed forms of one letter, and the control characters on each side
+    // of the printable range.
+    for bad in ["\u{e9}", "e\u{301}", "\u{7f}", "\u{1f}", "\0", "a\nb"] {
+        assert_eq!(parse(bad), refused, "{bad:?}");
+    }
+}
+
+/// Found by the multi-fault soak: Appendix A limits a chain to four certificates.
+#[test]
+fn a_chain_of_five_certificates_is_refused() {
+    let with_chain = |n: u64| {
+        let cert = map(&[(0, uint(1))]);
+        let mut e = entry(4, 2, 4627);
+        e[3].1 = [head(4, n), cert.repeat(n as usize)].concat();
+        map(&e)
+    };
+    let four = block(&[with_chain(4)]);
+    let parsed = SignatureBlock::parse(&four).unwrap();
+    assert_eq!(parsed.entries().next().unwrap().chain_len, 4);
+    assert_eq!(
+        SignatureBlock::parse(&block(&[with_chain(5)])).unwrap_err(),
+        SignatureError::Field { entry: 0, key: 4 }
+    );
+}
+
+/// Found by the multi-fault soak: S3 requires a SemVer 2.0 version, not any text.
+#[test]
+fn the_statement_version_must_be_semver() {
+    let parse = |version: &str| {
+        let mut s = statement(4);
+        s[4].1 = text(version);
+        let mut e = entry(4, 2, 4627);
+        e[4].1 = map(&s);
+        SignatureBlock::parse(&block(&[map(&e)])).map(|_| ())
+    };
+    for good in [
+        "0.1.0-dev",
+        "1.0.0",
+        "10.20.30",
+        "0.0.0",
+        "1.2.3-alpha.1",
+        "1.2.3-0",
+        "1.2.3-0a",
+        "1.2.3--",
+        "1.2.3+build",
+        "1.2.3+001",
+        "1.2.3-rc.1+exp.sha.5114f85",
+        "99999999999999999999.0.0",
+    ] {
+        assert_eq!(parse(good), Ok(()), "{good}");
+    }
+    let refused = SignatureError::Field { entry: 0, key: 54 };
+    for bad in [
+        "1",
+        "1.2",
+        "1.2.3.4",
+        "01.2.3",
+        "1.02.3",
+        "1.2.03",
+        "1.2.3-",
+        "1.2.3-01",
+        "1.2.3-a..b",
+        "1.2.3+",
+        "1.2.3+a..b",
+        "1.2.3+a+b",
+        "a.b.c",
+        "1.2.x",
+        "1.2.3-\u{e9}",
+        "1.2.3 ",
+        "\u{0}.1.0",
+        " 1.2.3",
+    ] {
+        assert_eq!(parse(bad), Err(refused), "{bad:?}");
+    }
+}
+
+/// Found by the multi-fault soak: Appendix A limits the block to 1 MiB. `Image::parse`
+/// applies that to the header's size; the block parser applies it to its own input.
+#[test]
+fn a_block_over_one_mebibyte_is_refused() {
+    let with_fill = |key: u8, fill: usize| {
+        let mut e = entry(4, 2, 4627);
+        e[2].1 = bytes(&[key; 32]);
+        e[3].1 = [head(4, 1), map(&[(0, bytes(&vec![0x44; fill]))])].concat();
+        map(&e)
+    };
+    let (a, b) = (500_000, 500_000);
+    let probe = block(&[with_fill(1, a), with_fill(2, b)]).len();
+    let exact = a + (1 << 20) - probe;
+    let at_limit = block(&[with_fill(1, exact), with_fill(2, b)]);
+    assert_eq!(at_limit.len(), 1 << 20);
+    assert!(SignatureBlock::parse(&at_limit).is_ok());
+    let over = block(&[with_fill(1, exact + 1), with_fill(2, b)]);
+    assert_eq!(over.len(), (1 << 20) + 1);
+    assert_eq!(
+        SignatureBlock::parse(&over).unwrap_err(),
+        SignatureError::TooLarge
+    );
+}
+
 #[test]
 fn duplicates_and_non_canonical_entries_are_refused() {
     assert_eq!(

@@ -11,21 +11,24 @@
 //! Locking: each queue has its own spin lock, taken by that processor's timer interrupt and
 //! by [`spawn`] from any processor. `spawn` holds it with interrupts disabled, so the
 //! processor's own timer can never spin on a lock it interrupted.
+//!
+//! Queues are indexed by CPU index (`cpu::CpuIndex`, ADR-0008), never by APIC ID; a
+//! reschedule IPI goes to the APIC ID recorded for the target's index.
 
+use alloc::sync::Arc;
 use core::arch::asm;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use framekernel::descriptors::{KERNEL_CODE, KERNEL_DATA};
-use framekernel::runqueue::{QueueError, RunQueue};
+use framekernel::descriptors::{KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
+use framekernel::runqueue::{QueueError, RunQueue, per_mille, share_near_weight};
 
 use crate::console::Console;
-use crate::cpu::{self, rdtsc};
-use crate::timer::{self, ApicRead, X2Apic};
+use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
+use crate::process::Process;
+use crate::timer::{self, X2Apic};
 use origin_sync::SpinLock;
 
-/// Processors with a run queue, indexed by x2APIC ID.
-pub(crate) const MAX_CPUS: usize = 64;
 /// Each kernel thread's stack.
 const THREAD_STACK: usize = 16 * 1024;
 /// Words in a saved frame: 15 registers, vector, error code, RIP, CS, RFLAGS, RSP, SS.
@@ -41,9 +44,9 @@ static ACTIVE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_C
 /// Set by the boot processor once every AP's threads are queued.
 static GO: AtomicBool = AtomicBool::new(false);
 
-/// This processor's x2APIC ID, as a queue index (from its GS-based CPU-local area).
+/// This processor's CPU index, as a queue index (from its GS-based CPU-local area).
 fn this_cpu() -> usize {
-    usize::try_from(cpu::cpu_id()).unwrap_or(usize::MAX)
+    cpu::this_cpu().get()
 }
 
 use crate::cpu::without_interrupts;
@@ -96,8 +99,8 @@ fn free_fpu_area(area: u64) {
 
 /// Makes sure CPU `cpu`'s boot/idle context (slot 0) has an FPU area, so the first switch
 /// away from it can save its state. Called before the processor's scheduler runs.
-pub(crate) fn init_cpu_fpu(cpu: usize) {
-    if let Some(threads) = THREADS.get(cpu) {
+pub(crate) fn init_cpu_fpu(cpu: CpuIndex) {
+    if let Some(threads) = THREADS.get(cpu.get()) {
         without_interrupts(|| {
             let mut t = threads.lock();
             if t.fpu[0] == 0
@@ -145,8 +148,15 @@ fn follow_thread(id: usize, slot: usize) {
             t.roots.get(slot).copied().unwrap_or(0),
         )
     };
-    if let Some(stack) = stack {
-        cpu::set_kernel_stack((stack.guard + 4096 + stack.bytes as u64) & !0xF);
+    match stack {
+        Some(stack) => cpu::set_kernel_stack((stack.guard + 4096 + stack.bytes as u64) & !0xF),
+        // Every thread but the boot or idle flow has a stack: a slot without one means a
+        // thread was made runnable before its state was written, which `spawn_with` rules
+        // out by writing it under the queue lock. Counted for the boot proof.
+        None if slot != 0 => {
+            UNREADY_SWITCHES.fetch_add(1, Ordering::Relaxed);
+        }
+        None => {}
     }
     let want = if root == 0 {
         crate::vm::kernel_root()
@@ -164,7 +174,7 @@ fn follow_thread(id: usize, slot: usize) {
 /// lowest page) is unmapped, so running off the end of the stack faults instead of
 /// overwriting a neighbour. Returns the stack (above the guard) and the guard's address.
 pub(crate) fn guarded_stack(bytes: usize) -> Option<(&'static mut [u8], u64)> {
-    use alloc::alloc::{Layout, alloc_zeroed};
+    use alloc::alloc::{Layout, alloc_zeroed, dealloc};
     let layout = Layout::from_size_align(bytes + 4096, 4096).ok()?;
     // SAFETY: `layout` has a non-zero size; the allocation is never freed (threads do not
     // exit yet), so the slice below is `'static`.
@@ -173,7 +183,12 @@ pub(crate) fn guarded_stack(bytes: usize) -> Option<(&'static mut [u8], u64)> {
         return None;
     }
     let guard = base.expose_provenance() as u64;
-    crate::vm::make_guard(guard).ok()?;
+    if crate::vm::make_guard(guard).is_err() {
+        // SAFETY: `base` is the allocation made just above with this layout, and nothing
+        // else refers to it; a failed `make_guard` left its first page mapped.
+        unsafe { dealloc(base, layout) };
+        return None;
+    }
     // SAFETY: `base + 4096 .. base + 4096 + bytes` lies inside the fresh allocation, is
     // still mapped read/write, and nothing else refers to it.
     let stack = unsafe { core::slice::from_raw_parts_mut(base.wrapping_add(4096), bytes) };
@@ -190,60 +205,108 @@ struct ThreadStack {
     bytes: usize,
 }
 
+/// A thread that has exited, awaiting [`reap`]: its stack, FPU area and, for a user
+/// thread, the reference that keeps its process alive until this processor has left it.
+struct Zombie {
+    stack: ThreadStack,
+    fpu: u64,
+    process: Option<Arc<Process>>,
+}
+
 /// Per CPU: each slot's stack, and the stacks of threads that exited and await
 /// [`reap`]. Locked after the run queue, always with interrupts disabled.
 struct Threads {
     stacks: [Option<ThreadStack>; framekernel::runqueue::CAPACITY],
-    /// Exited threads' stacks and FPU areas, awaiting [`reap`].
-    zombies: [Option<(ThreadStack, u64)>; framekernel::runqueue::CAPACITY],
+    /// Exited threads awaiting [`reap`].
+    zombies: [Option<Zombie>; framekernel::runqueue::CAPACITY],
     /// Each slot's address space (its PML4); 0 means the kernel's.
     roots: [u64; framekernel::runqueue::CAPACITY],
     /// Each slot's FPU/SIMD save area (0: none); slot 0 is the boot or idle context.
     fpu: [u64; framekernel::runqueue::CAPACITY],
+    /// The process each slot's thread belongs to (`None`: a kernel thread).
+    process: [Option<Arc<Process>>; framekernel::runqueue::CAPACITY],
 }
 
 static THREADS: [SpinLock<Threads>; MAX_CPUS] = [const {
     SpinLock::new(Threads {
         stacks: [None; framekernel::runqueue::CAPACITY],
-        zombies: [None; framekernel::runqueue::CAPACITY],
+        zombies: [const { None }; framekernel::runqueue::CAPACITY],
         roots: [0; framekernel::runqueue::CAPACITY],
         fpu: [0; framekernel::runqueue::CAPACITY],
+        process: [const { None }; framekernel::runqueue::CAPACITY],
     })
 }; MAX_CPUS];
+
+/// Times a processor picked a thread whose state was not complete (never, if the queue
+/// lock is held as it must be; the boot proof requires 0).
+static UNREADY_SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+/// How many switches have found a thread with no recorded stack.
+pub(crate) fn unready_switches() -> u64 {
+    UNREADY_SWITCHES.load(Ordering::Relaxed)
+}
+
+/// Threads that exited on each processor and await [`reap`], so a processor can tell cheaply
+/// that it has none.
+static ZOMBIES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// Frees the stacks of threads that exited on **this** processor. Only this processor may
 /// do it, and only from thread context: by then its exit handler, which ran on the dead
 /// stack, has certainly switched away. Returns how many stacks were freed.
 pub(crate) fn reap() -> usize {
-    use alloc::alloc::{Layout, dealloc};
     let Some(threads) = THREADS.get(this_cpu()) else {
         return 0;
     };
+    if ZOMBIES
+        .get(this_cpu())
+        .is_some_and(|z| z.load(Ordering::Acquire) == 0)
+    {
+        return 0;
+    }
     let mut freed = 0;
     loop {
         let next = without_interrupts(|| threads.lock().zombies.iter_mut().find_map(Option::take));
-        let Some((stack, fpu)) = next else {
+        let Some(Zombie {
+            stack,
+            fpu,
+            process,
+        }) = next
+        else {
             return freed;
         };
-        free_fpu_area(fpu);
-        let Ok(layout) = Layout::from_size_align(stack.bytes + 4096, 4096) else {
-            continue;
-        };
-        // The guard must be mapped again before its frame returns to the heap.
-        if crate::vm::unguard(stack.guard).is_err() {
-            continue; // leak rather than free memory that is not mapped
+        if let Some(z) = ZOMBIES.get(this_cpu()) {
+            z.fetch_sub(1, Ordering::AcqRel);
         }
-        // SAFETY: `guard` is the start of a `guarded_stack` allocation with this layout;
-        // its thread exited on this processor and this processor has switched away from
-        // it, so nothing uses the memory any more.
-        unsafe {
-            dealloc(
-                core::ptr::with_exposed_provenance_mut(stack.guard as usize),
-                layout,
-            )
-        };
-        freed += 1;
+        free_fpu_area(fpu);
+        // Possibly the process's last reference, which frees its address space: this
+        // processor left it when the thread exited, and no processor still runs in it.
+        drop(process);
+        if free_thread_stack(stack) {
+            freed += 1;
+        }
     }
+}
+
+/// Frees a stack from [`guarded_stack`] that no thread uses (one that was never started, or
+/// one whose thread has exited and whose processor has switched away from it).
+fn free_thread_stack(stack: ThreadStack) -> bool {
+    use alloc::alloc::{Layout, dealloc};
+    let Ok(layout) = Layout::from_size_align(stack.bytes + 4096, 4096) else {
+        return false;
+    };
+    // The guard must be mapped again before its frame returns to the heap.
+    if crate::vm::unguard(stack.guard).is_err() {
+        return false; // leak rather than free memory that is not mapped
+    }
+    // SAFETY: `guard` is the start of a `guarded_stack` allocation with this layout, and
+    // nothing uses that memory any more (this function's contract).
+    unsafe {
+        dealloc(
+            core::ptr::with_exposed_provenance_mut(stack.guard as usize),
+            layout,
+        )
+    };
+    true
 }
 
 /// The running thread's queue request, made with interrupts disabled (the gate cleared IF).
@@ -284,29 +347,32 @@ pub(crate) fn on_block(interrupted: u64, ticks: u64) -> u64 {
     })
 }
 
-/// `RESCHEDULE_VECTOR`: another processor made a thread here ready; switch now.
+/// A device interrupt whose driver may have woken a waiter, or `RESCHEDULE_VECTOR` (another
+/// processor made a thread here ready). The interrupted context is charged nothing: this
+/// switches only if a thread that was woken should run now
+/// ([`RunQueue::preempt_for_wake`]), and otherwise resumes what the interrupt interrupted.
 pub(crate) fn on_reschedule(interrupted: u64) -> u64 {
-    with_queue(interrupted, |q| Some(q.yield_now(interrupted)))
+    with_queue(interrupted, |q| Some(q.preempt_for_wake(interrupted)))
 }
 
-/// A kernel thread: its processor (x2APIC ID), run-queue slot, and the slot's generation,
+/// A kernel thread: its processor (CPU index), run-queue slot, and the slot's generation,
 /// so a reference that outlives its thread never names the slot's next one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ThreadRef {
-    cpu: u32,
+    cpu: CpuIndex,
     slot: u32,
     generation: u32,
 }
 
 /// The running kernel thread, or `None` for the boot or idle flow (which cannot block).
 pub(crate) fn current_thread() -> Option<ThreadRef> {
-    let id = this_cpu();
-    let queue = QUEUES.get(id)?;
+    let cpu = cpu::this_cpu();
+    let queue = QUEUES.get(cpu.get())?;
     without_interrupts(|| {
         let q = queue.lock();
         let slot = q.current();
         (slot != 0).then(|| ThreadRef {
-            cpu: id as u32,
+            cpu,
             slot: slot as u32,
             generation: q.generation(slot),
         })
@@ -338,26 +404,32 @@ pub(crate) fn block_until(deadline: u64) {
 const ICR_ASSERT: u32 = 1 << 14;
 
 /// Makes `thread` ready. If it was blocked on another processor, that processor is sent a
-/// reschedule IPI, so it switches to the thread now rather than at its next timer tick.
-pub(crate) fn wake(thread: ThreadRef) {
-    let cpu = thread.cpu as usize;
-    let Some(queue) = QUEUES.get(cpu) else {
-        return;
+/// reschedule IPI (to its APIC ID), so it switches to the thread now rather than at its
+/// next timer tick. Returns whether an IPI was sent, so a wake-up across processors can be
+/// counted.
+pub(crate) fn wake(thread: ThreadRef) -> bool {
+    let Some(queue) = QUEUES.get(thread.cpu.get()) else {
+        return false;
     };
     let woke = without_interrupts(|| queue.lock().wake(thread.slot as usize, thread.generation));
-    if woke && cpu != this_cpu() {
+    if woke
+        && thread.cpu != cpu::this_cpu()
+        && let Some(apic_id) = thread.cpu.apic_id()
+    {
         // SAFETY: CPL 0; this processor's APIC is in x2APIC mode (it runs kernel threads).
         let lapic = unsafe { X2Apic::assume_enabled() };
         // SAFETY: a fixed IPI with the reschedule vector, whose handler acknowledges and
         // switches through the target's own run queue; the target ran this thread, so its
-        // scheduler is active.
+        // scheduler is active, and `apic_id` is the one recorded for its index.
         unsafe {
             lapic.send_ipi(
-                thread.cpu,
+                apic_id,
                 ICR_ASSERT | u32::from(crate::cpu::RESCHEDULE_VECTOR),
             )
         };
+        return true;
     }
+    false
 }
 
 /// `EXIT_VECTOR`: the running thread ends. Its stack becomes a zombie, freed later by
@@ -378,8 +450,22 @@ pub(crate) fn on_exit(interrupted: u64) -> u64 {
                 .get_mut(slot)
                 .map(|f| core::mem::replace(f, 0))
                 .unwrap_or(0);
-            if let (Some(free), Some(stack)) = (t.zombies.iter_mut().find(|z| z.is_none()), stack) {
-                *free = Some((stack, fpu));
+            let process = t.process.get_mut(slot).and_then(Option::take);
+            match (t.zombies.iter_mut().find(|z| z.is_none()), stack) {
+                (Some(free), Some(stack)) => {
+                    *free = Some(Zombie {
+                        stack,
+                        fpu,
+                        process,
+                    });
+                    if let Some(z) = ZOMBIES.get(id) {
+                        z.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+                // No record of it can be kept. The process reference is leaked deliberately:
+                // this processor is still in the process's address space, and dropping the
+                // last reference here would free the tables it is running on.
+                _ => core::mem::forget(process),
             }
         }
         Some(next)
@@ -408,28 +494,32 @@ pub(crate) fn exit() -> ! {
     }
 }
 
-/// The top of the running thread's kernel stack, or `None` for the boot or idle flow.
-pub(crate) fn current_stack_top() -> Option<u64> {
+/// The process of the running thread, or `None` for a kernel thread.
+pub(crate) fn current_process() -> Option<Arc<Process>> {
     let id = this_cpu();
     let (queue, threads) = (QUEUES.get(id)?, THREADS.get(id)?);
     without_interrupts(|| {
         let slot = queue.lock().current();
-        let stack = threads.lock().stacks.get(slot).copied().flatten()?;
-        Some((stack.guard + 4096 + stack.bytes as u64) & !0xF)
+        threads.lock().process.get(slot).cloned().flatten()
     })
 }
 
 /// This CPU's tick count, as its run queue sees it.
 fn queue_ticks() -> u64 {
+    queue_ticks_of(this_cpu())
+}
+
+/// Processor `cpu`'s tick count, as its run queue sees it.
+fn queue_ticks_of(cpu: usize) -> u64 {
     QUEUES
-        .get(this_cpu())
+        .get(cpu)
         .map_or(0, |q| without_interrupts(|| q.lock().ticks()))
 }
 
-/// Creates a kernel thread on processor `cpu` (an x2APIC ID) that runs `entry(arg)`, and
-/// returns its run-queue slot.
+/// Creates a kernel thread on processor `cpu` that runs `entry(arg)`, and returns its
+/// run-queue slot.
 pub(crate) fn spawn(
-    cpu: usize,
+    cpu: CpuIndex,
     entry: extern "sysv64" fn(u64) -> !,
     arg: u64,
 ) -> Result<usize, QueueError> {
@@ -439,35 +529,85 @@ pub(crate) fn spawn(
 /// As [`spawn`], in the address space whose PML4 is `root` (0: the kernel's). The thread
 /// starts in kernel mode; a process thread then enters user mode in that space.
 pub(crate) fn spawn_in(
-    cpu: usize,
+    cpu: CpuIndex,
     entry: extern "sysv64" fn(u64) -> !,
     arg: u64,
     root: u64,
 ) -> Result<usize, QueueError> {
-    spawn_with(cpu, entry, arg, root, framekernel::runqueue::DEFAULT_WEIGHT)
+    spawn_with(
+        cpu,
+        Start::Kernel { entry, arg },
+        root,
+        framekernel::runqueue::DEFAULT_WEIGHT,
+        None,
+    )
+}
+
+/// Creates a user thread of `process` on processor `cpu`: it enters ring 3 at `rip` with the
+/// stack pointer `rsp` and `rdi` in RDI, every other register zero, the first time it is
+/// scheduled (there is no kernel half to the thread until it enters the kernel).
+pub(crate) fn spawn_user(
+    cpu: CpuIndex,
+    process: Arc<Process>,
+    rip: u64,
+    rsp: u64,
+    rdi: u64,
+) -> Result<usize, QueueError> {
+    let root = process.root();
+    spawn_with(
+        cpu,
+        Start::User { rip, rsp, rdi },
+        root,
+        framekernel::runqueue::DEFAULT_WEIGHT,
+        Some(process),
+    )
 }
 
 /// As [`spawn`], with a scheduling weight (stride scheduling: the thread's share of its
 /// processor is its share of the weights there).
 pub(crate) fn spawn_weighted(
-    cpu: usize,
+    cpu: CpuIndex,
     entry: extern "sysv64" fn(u64) -> !,
     arg: u64,
     weight: u32,
 ) -> Result<usize, QueueError> {
-    spawn_with(cpu, entry, arg, 0, weight)
+    spawn_with(cpu, Start::Kernel { entry, arg }, 0, weight, None)
+}
+
+/// Where a new thread starts.
+enum Start {
+    /// In kernel mode at `entry(arg)`.
+    Kernel {
+        entry: extern "sysv64" fn(u64) -> !,
+        arg: u64,
+    },
+    /// In ring 3 at `rip`, with the stack pointer `rsp` and `rdi` in RDI.
+    User { rip: u64, rsp: u64, rdi: u64 },
 }
 
 fn spawn_with(
-    cpu: usize,
-    entry: extern "sysv64" fn(u64) -> !,
-    arg: u64,
+    cpu: CpuIndex,
+    start: Start,
     root: u64,
     weight: u32,
+    process: Option<Arc<Process>>,
 ) -> Result<usize, QueueError> {
-    let queue = QUEUES.get(cpu).ok_or(QueueError::Full)?;
+    spawn_with_fpu(cpu, start, root, weight, process, alloc_fpu_area)
+}
+
+/// [`spawn_with`], with `fpu_area` the source of the thread's FPU area (the boot proof gives
+/// it one that has none). A thread is created whole or not at all: every way this fails
+/// returns the stack, its guard page and the FPU area.
+fn spawn_with_fpu(
+    cpu: CpuIndex,
+    start: Start,
+    root: u64,
+    weight: u32,
+    process: Option<Arc<Process>>,
+    fpu_area: impl FnOnce() -> Option<u64>,
+) -> Result<usize, QueueError> {
+    let queue = QUEUES.get(cpu.get()).ok_or(QueueError::Full)?;
     let (stack, guard) = guarded_stack(THREAD_STACK).ok_or(QueueError::Full)?;
-    let _ = FIRST_GUARD.compare_exchange(0, guard, Ordering::Relaxed, Ordering::Relaxed);
     let base = stack.as_ptr().addr() as u64;
     // The thread starts with RSP = top − 8 holding a zero return address, as if `entry` had
     // been called: RSP + 8 is then 16-byte aligned (System V).
@@ -475,12 +615,25 @@ fn spawn_with(
     let rsp = top - 8;
     let frame_at = rsp - (FRAME_WORDS as u64) * 8;
     let mut frame = [0u64; FRAME_WORDS];
-    frame[RDI] = arg;
-    frame[17] = (entry as *const ()).addr() as u64; // RIP
-    frame[18] = u64::from(KERNEL_CODE); // CS
+    match start {
+        Start::Kernel { entry, arg } => {
+            frame[RDI] = arg;
+            frame[17] = (entry as *const ()).addr() as u64; // RIP
+            frame[18] = u64::from(KERNEL_CODE); // CS
+            frame[20] = rsp;
+            frame[21] = u64::from(KERNEL_DATA); // SS
+        }
+        // The common return path enters ring 3 from this frame: `swapgs` when the frame's
+        // CS is a user one, then IRETQ, which leaves the segment registers usable at CPL 3.
+        Start::User { rip, rsp, rdi } => {
+            frame[RDI] = rdi;
+            frame[17] = rip;
+            frame[18] = u64::from(USER_CODE); // CS
+            frame[20] = rsp;
+            frame[21] = u64::from(USER_DATA); // SS
+        }
+    }
     frame[19] = NEW_RFLAGS;
-    frame[20] = rsp;
-    frame[21] = u64::from(KERNEL_DATA); // SS
     let offset = (frame_at - base) as usize;
     for (i, word) in frame.iter().chain(core::iter::once(&0u64)).enumerate() {
         let at = offset + i * 8;
@@ -492,10 +645,27 @@ fn spawn_with(
         guard,
         bytes: THREAD_STACK,
     };
-    let fpu_area = alloc_fpu_area().unwrap_or(0);
-    without_interrupts(|| {
-        let slot = queue.lock().push_weighted(frame_at, weight)?;
-        if let Some(threads) = THREADS.get(cpu) {
+    // A thread without its own FPU save area would run on the previous thread's registers
+    // (`switch_fpu` then has nothing to restore), which may be another process's data; it
+    // is refused instead.
+    let Some(fpu_area) = fpu_area() else {
+        free_thread_stack(record);
+        return Err(QueueError::Full);
+    };
+    let spawned = without_interrupts(|| {
+        // The queue lock is held until the thread's state is complete: the moment the slot
+        // is Ready the target processor can pick it, and `follow_thread` needs the state.
+        let mut queue = queue.lock();
+        let slot = match queue.push_weighted(frame_at, weight) {
+            Ok(slot) => slot,
+            Err(e) => {
+                drop(queue);
+                free_thread_stack(record);
+                free_fpu_area(fpu_area);
+                return Err(e);
+            }
+        };
+        if let Some(threads) = THREADS.get(cpu.get()) {
             let mut t = threads.lock();
             if let Some(s) = t.stacks.get_mut(slot) {
                 *s = Some(record);
@@ -506,9 +676,16 @@ fn spawn_with(
             if let Some(f) = t.fpu.get_mut(slot) {
                 *f = fpu_area;
             }
+            if let Some(p) = t.process.get_mut(slot) {
+                *p = process;
+            }
         }
         Ok(slot)
-    })
+    });
+    if spawned.is_ok() {
+        let _ = FIRST_GUARD.compare_exchange(0, guard, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    spawned
 }
 
 /// An application processor's scheduler: waits until the boot processor has queued its
@@ -533,13 +710,13 @@ pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
         reap();
         // SAFETY: CPL 0; every vector that can arrive has a gate. Halting with interrupts
         // on just waits for the next timer tick, which may switch to a thread.
-        unsafe { asm!("sti", "hlt", options(nomem, nostack)) };
+        unsafe { asm!("sti", "hlt", options(nostack)) };
     }
 }
 
 /// Iterations each worker thread has made, indexed by worker.
 static PROGRESS: [AtomicU64; 2 * MAX_CPUS] = [const { AtomicU64::new(0) }; 2 * MAX_CPUS];
-/// The x2APIC ID each worker last ran on, plus one (0: never ran).
+/// The CPU index each worker last ran on, plus one (0: never ran).
 static RAN_ON: [AtomicU64; 2 * MAX_CPUS] = [const { AtomicU64::new(0) }; 2 * MAX_CPUS];
 /// Tells the workers to stop counting.
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -608,7 +785,7 @@ extern "sysv64" fn bencher(_: u64) -> ! {
 
 /// TSC cycles per context switch: the boot flow and two threads that only yield, so each
 /// boot-flow yield is three switches (boot → A → B → boot).
-fn measure_switch(bsp: usize) -> Option<u64> {
+fn measure_switch(bsp: CpuIndex) -> Option<u64> {
     let before = FINISHED.load(Ordering::Relaxed);
     spawn(bsp, bencher, 0).ok()?;
     spawn(bsp, bencher, 1).ok()?;
@@ -639,12 +816,32 @@ extern "sysv64" fn quitter(_: u64) -> ! {
 /// time (and every sleeper) would stand still. Each round therefore also opens an interrupt
 /// window.
 pub(crate) fn yield_until(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) {
+    let _ = yield_until_away(done, tsc_hz, seconds);
+}
+
+/// As [`yield_until`], and returns how long the boot flow went without a turn while it
+/// waited, in TSC ticks: the sum of the steps of this loop of at least
+/// [`RUNNING_STEP_MICROS`]. A step that long means the virtual CPU was descheduled (a loaded
+/// host) or that another thread on this processor ran for that long, and this loop cannot
+/// tell which. So the result is only a hint: it may earn a repeat of a measurement, never
+/// a more lenient verdict.
+pub(crate) fn yield_until_away(done: impl Fn() -> bool, tsc_hz: u64, seconds: u64) -> u64 {
+    let limit = (tsc_hz / 1_000_000).max(1) * RUNNING_STEP_MICROS;
     let start = rdtsc();
+    let mut last = start;
+    let mut away = 0;
     while !done() && rdtsc().wrapping_sub(start) < tsc_hz.saturating_mul(seconds) {
         yield_now();
         cpu::interrupt_window();
         reap();
+        let now = rdtsc();
+        let step = now.wrapping_sub(last);
+        last = now;
+        if step >= limit {
+            away += step;
+        }
     }
+    away
 }
 
 /// SIMD workers for [`prove_simd`].
@@ -707,7 +904,7 @@ extern "sysv64" fn simd_worker(index: u64) -> ! {
 /// Proves that FPU/SIMD state is private to each thread across preemption: [`SIMD_WORKERS`]
 /// workers on one processor each hold four XMM values and spin checking them for 300 ms
 /// while the timer preempts them. None may ever see another's values.
-fn prove_simd(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
+fn prove_simd(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     for i in 0..SIMD_WORKERS {
         if spawn(bsp, simd_worker, i as u64).is_err() {
             let _ = writeln!(
@@ -731,7 +928,7 @@ fn prove_simd(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
     let corrupt: u64 = SIMD_CORRUPT.iter().map(|c| c.load(Ordering::Relaxed)).sum();
     let iters: u64 = SIMD_ITERS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
     let switches = QUEUES
-        .get(bsp)
+        .get(bsp.get())
         .map_or(0, |q| without_interrupts(|| q.lock().switches()));
     let ok =
         SIMD_EXITED.load(Ordering::Relaxed) == SIMD_WORKERS as u64 && corrupt == 0 && iters > 0;
@@ -745,16 +942,36 @@ fn prove_simd(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
 
 /// The weights of the three workers of [`prove_weights`].
 const WEIGHTS: [u32; 3] = [1, 4, 16];
-/// Iterations each weighted worker made.
+/// TSC ticks each weighted worker saw itself run (see [`weighted_worker`]).
 static WEIGHTED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static WEIGHTED_STOP: AtomicBool = AtomicBool::new(false);
 static WEIGHTED_EXITED: AtomicU64 = AtomicU64::new(0);
+/// A step between two of a worker's clock readings counts as time it ran only if it is
+/// shorter than this: a longer one means it was preempted or its virtual CPU was away.
+/// Three milliseconds, about a third of a timer tick: a loaded host takes a virtual CPU away for
+/// milliseconds many times a second, and a limit much below this would count only the
+/// luck of when those stalls fell (measured, 100 µs: twice the noise of 3 ms), while a
+/// thread preempted by another's slice is gone for a whole 10 ms tick.
+const RUNNING_STEP_MICROS: u64 = 3000;
+/// [`RUNNING_STEP_MICROS`] in TSC ticks, set before the workers start.
+static RUNNING_STEP: AtomicU64 = AtomicU64::new(0);
 
-/// A worker that never yields, counting into `WEIGHTED[index]` until told to stop.
+/// A worker that never yields. Until told to stop, it adds to `WEIGHTED[index]` the time it
+/// sees itself running: every step of the TSC shorter than [`RUNNING_STEP`]. Time, not
+/// iterations: on an emulated processor the iterations done in one 10 ms slice vary by an
+/// order of magnitude with the host's load, whatever the scheduler did, and the lightest
+/// thread's share is the sum of only about ten slices.
 extern "sysv64" fn weighted_worker(index: u64) -> ! {
+    let limit = RUNNING_STEP.load(Ordering::Relaxed);
+    let mut last = rdtsc();
     while !WEIGHTED_STOP.load(Ordering::Relaxed) {
-        if let Some(c) = WEIGHTED.get(index as usize) {
-            c.fetch_add(1, Ordering::Relaxed);
+        let now = rdtsc();
+        let step = now.wrapping_sub(last);
+        last = now;
+        if step < limit
+            && let Some(ran) = WEIGHTED.get(index as usize)
+        {
+            ran.fetch_add(step, Ordering::Relaxed);
         }
         core::hint::spin_loop();
     }
@@ -762,49 +979,108 @@ extern "sysv64" fn weighted_worker(index: u64) -> ! {
     exit()
 }
 
-/// Proves proportional shares (stride scheduling): three never-yielding workers with
-/// weights 1, 4 and 16 share one processor for 2 s; each one's share of the work must be
-/// near its share of the weights (1/21, 4/21, 16/21), and the lightest must not starve.
-fn prove_weights(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -> bool {
-    let far = cpus
-        .iter()
-        .map(|&id| id as usize)
-        .find(|&id| id != bsp)
-        .unwrap_or(bsp);
+/// How long the workers of [`prove_weights`] share the processor, in seconds.
+const WEIGHTS_SECONDS: u64 = 2;
+/// Runs [`prove_weights`] may make: an extra one only after a wrong result from a visibly
+/// disturbed run (see [`TICKS_LOST_TO_A_STALL`]).
+const WEIGHTS_ATTEMPTS: u32 = 3;
+/// A run counts as disturbed if its processor took at least this many ticks fewer than the
+/// window holds, because a late timer interrupt coalesced with the next (on a loaded host,
+/// the virtual CPU or QEMU's main loop was descheduled); one or two can go missing to the
+/// window's phase and the calibration's rounding. It also counts as disturbed if the
+/// workers saw themselves run for less than nine tenths of the window: their processor was
+/// away for the rest of it.
+const TICKS_LOST_TO_A_STALL: u64 = 3;
+
+/// One run of the workers of [`prove_weights`].
+struct WeightedRun {
+    /// The time each worker saw itself run, in TSC ticks.
+    ran: [u64; 3],
+    exited: bool,
+    /// Timer ticks the workers' processor took in the window.
+    ticks: u64,
+}
+
+/// Starts the three weighted workers on `far`, lets them run for [`WEIGHTS_SECONDS`], stops
+/// them and returns what they measured, or `None` if a worker could not be spawned.
+fn run_weighted(far: CpuIndex, tsc_hz: u64) -> Option<WeightedRun> {
+    RUNNING_STEP.store(
+        (tsc_hz / 1_000_000).max(1) * RUNNING_STEP_MICROS,
+        Ordering::Relaxed,
+    );
+    for ran in &WEIGHTED {
+        ran.store(0, Ordering::Relaxed);
+    }
+    WEIGHTED_STOP.store(false, Ordering::Relaxed);
+    WEIGHTED_EXITED.store(0, Ordering::Relaxed);
     for (i, &w) in WEIGHTS.iter().enumerate() {
-        if spawn_weighted(far, weighted_worker, i as u64, w).is_err() {
+        spawn_weighted(far, weighted_worker, i as u64, w).ok()?;
+    }
+    let ticks_before = queue_ticks_of(far.get());
+    let start = rdtsc();
+    while rdtsc().wrapping_sub(start) < WEIGHTS_SECONDS * tsc_hz {
+        yield_now();
+        cpu::interrupt_window();
+    }
+    let ticks = queue_ticks_of(far.get()).wrapping_sub(ticks_before);
+    WEIGHTED_STOP.store(true, Ordering::Relaxed);
+    yield_until(|| WEIGHTED_EXITED.load(Ordering::Relaxed) == 3, tsc_hz, 2);
+    Some(WeightedRun {
+        ran: core::array::from_fn(|i| WEIGHTED[i].load(Ordering::Relaxed)),
+        exited: WEIGHTED_EXITED.load(Ordering::Relaxed) == 3,
+        ticks,
+    })
+}
+
+/// Proves proportional shares (stride scheduling): three never-yielding workers with
+/// weights 1, 4 and 16 share one processor for 2 s; each one's share of the time they ran
+/// must be near its share of the weights (1/21, 4/21, 16/21), and the lightest must not
+/// starve.
+///
+/// On a loaded host a late timer interrupt lets the running worker run on, and that alone
+/// can swing the lightest thread's share. Such a run says nothing about the scheduler: if
+/// the shares are wrong and the processor lost ticks or was away for over a tenth of the
+/// window, it is measured again, within a small budget. A wrong result with the ticks all
+/// there and the processor present fails at once.
+fn prove_weights(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let window_ticks = WEIGHTS_SECONDS * timer::HZ;
+    let mut attempts = 0;
+    let (shares, ran_ms, ok) = loop {
+        attempts += 1;
+        let Some(run) = run_weighted(far, tsc_hz) else {
             let _ = writeln!(
                 com1,
                 "origin-kernel: scheduler: cannot spawn: scheduler failed"
             );
             return false;
+        };
+        let total: u64 = run.ran.iter().sum();
+        let sum_weights: u32 = WEIGHTS.iter().sum();
+        let mut ok = run.exited && total > 0;
+        let mut shares = [0u64; 3];
+        for (i, (&ran, &w)) in run.ran.iter().zip(&WEIGHTS).enumerate() {
+            let share = per_mille(ran, total);
+            shares[i] = share;
+            ok &= ran > 0 && share_near_weight(share, w, sum_weights);
         }
-    }
-    let start = rdtsc();
-    while rdtsc().wrapping_sub(start) < 2 * tsc_hz {
-        yield_now();
-        cpu::interrupt_window();
-    }
-    WEIGHTED_STOP.store(true, Ordering::Relaxed);
-    yield_until(|| WEIGHTED_EXITED.load(Ordering::Relaxed) == 3, tsc_hz, 2);
-    let counts: [u64; 3] = core::array::from_fn(|i| WEIGHTED[i].load(Ordering::Relaxed));
-    let total: u64 = counts.iter().sum();
-    let sum_weights: u32 = WEIGHTS.iter().sum();
-    let mut ok = WEIGHTED_EXITED.load(Ordering::Relaxed) == 3 && total > 0;
-    let mut shares = [0u64; 3];
-    for (i, (&c, &w)) in counts.iter().zip(&WEIGHTS).enumerate() {
-        // Per mille: the share measured, and the share of the weights.
-        let share = c * 1000 / total.max(1);
-        let ideal = u64::from(w) * 1000 / u64::from(sum_weights);
-        shares[i] = share;
-        ok &= c > 0 && share.abs_diff(ideal) <= ideal / 3 + 15;
-    }
+        let disturbed = run.ticks + TICKS_LOST_TO_A_STALL <= window_ticks
+            || total.saturating_mul(10) < (WEIGHTS_SECONDS * tsc_hz).saturating_mul(9);
+        if ok || !run.exited || !disturbed || attempts == WEIGHTS_ATTEMPTS {
+            break (shares, total / (tsc_hz / 1000).max(1), ok);
+        }
+    };
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: weights 1, 4 and 16 on CPU {far} for 2 s: shares {}, {} and {} per mille (ideal 47, 190 and 761){}",
+        "origin-kernel: scheduler: weights 1, 4 and 16 on CPU {far} for {WEIGHTS_SECONDS} s: shares {}, {} and {} per mille (ideal 47, 190 and 761) over {ran_ms} ms of running{}{}",
         shares[0],
         shares[1],
         shares[2],
+        if attempts > 1 {
+            " (after a stalled run)"
+        } else {
+            ""
+        },
         if ok { "" } else { ": scheduler failed" }
     );
     ok
@@ -812,10 +1088,10 @@ fn prove_weights(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -> b
 
 /// On the boot processor, with its timer running: yields must alternate two threads, a
 /// sleep must last its ticks, and exited threads must free their slots for reuse.
-fn prove_lifecycle(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
+fn prove_lifecycle(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let live = || {
         QUEUES
-            .get(bsp)
+            .get(bsp.get())
             .map_or(0, |q| without_interrupts(|| q.lock().live()))
     };
     if live() != 1 {
@@ -868,21 +1144,80 @@ fn prove_lifecycle(com1: &mut Console, bsp: usize, tsc_hz: u64) -> bool {
     ok
 }
 
+/// A spawn that cannot be completed leaves nothing behind: refused for want of an FPU area
+/// (without one the thread would inherit another's SIMD registers), or because the queue
+/// is full, it hands back the stack, its guard page and the FPU area. The processor must
+/// hold only its boot context when this runs. (Anything a refusal leaks would also fail the
+/// final check in [`prove`], which holds the heap to the byte.)
+fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let live = || {
+        QUEUES
+            .get(bsp.get())
+            .map_or(0, |q| without_interrupts(|| q.lock().live()))
+    };
+    let in_use = || crate::memory::stats().map_or(0, |(h, _)| h.bytes_in_use);
+    let started = FINISHED.load(Ordering::Relaxed);
+    let contexts = live();
+    let before = in_use();
+    let no_area = spawn_with_fpu(
+        bsp,
+        Start::Kernel {
+            entry: quitter,
+            arg: 0,
+        },
+        0,
+        framekernel::runqueue::DEFAULT_WEIGHT,
+        None,
+        || None,
+    );
+    let no_area_clean =
+        no_area == Err(QueueError::Full) && in_use() <= before && live() == contexts;
+    let free = framekernel::runqueue::CAPACITY.saturating_sub(contexts);
+    let mut filled = 0;
+    for _ in 0..free {
+        if spawn(bsp, quitter, 0).is_ok() {
+            filled += 1;
+        }
+    }
+    let full_use = in_use();
+    let full = spawn(bsp, quitter, 0);
+    let full_clean =
+        full == Err(QueueError::Full) && in_use() <= full_use && live() == contexts + free;
+    let finished = started + filled as u64;
+    yield_until(
+        || FINISHED.load(Ordering::Relaxed) == finished && live() == contexts,
+        tsc_hz,
+        3,
+    );
+    reap();
+    let ok = no_area_clean
+        && full_clean
+        && filled == free
+        && live() == contexts
+        && FINISHED.load(Ordering::Relaxed) == finished;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: scheduler: spawns refused for want of an FPU area ({no_area:?}) and on a full queue ({full:?}) give back the stack, its guard page and the FPU area{}",
+        if ok { "" } else { ": scheduler failed" }
+    );
+    ok
+}
+
 /// Proves preemptive multitasking on every online processor: two non-yielding workers per
 /// processor run for 500 ms while the boot flow (itself one of the boot processor's
 /// contexts) waits. On each processor, both workers must have run there, with shares
 /// within a factor of two, over at least five full rounds of context switches. Returns
 /// whether the proof passed.
-pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
+pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
     // Give every online processor's boot/idle context an FPU area before the baseline is
     // measured, so the first switch on it can save its state and the leak check is fair.
     for &id in cpus {
-        init_cpu_fpu(id as usize);
+        init_cpu_fpu(id);
     }
     let heap_before = crate::memory::stats().map(|(h, _)| h.bytes_in_use);
     for (i, &id) in cpus.iter().enumerate() {
         for k in 0..2 {
-            if spawn(id as usize, worker, (2 * i + k) as u64).is_err() {
+            if spawn(id, worker, (2 * i + k) as u64).is_err() {
                 let _ = writeln!(
                     com1,
                     "origin-kernel: cannot spawn on CPU {id}: scheduler failed"
@@ -894,9 +1229,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
     // SAFETY: the boot processor is in x2APIC mode (the timer bring-up), and `start` was
     // already called on it; the transition is a no-op that yields the handle.
     let lapic = unsafe { X2Apic::enable() };
-    let bsp = lapic.read(ApicRead::Id) as usize;
+    let bsp = cpu::this_cpu();
     GO.store(true, Ordering::Release);
-    if let Some(active) = ACTIVE.get(bsp) {
+    if let Some(active) = ACTIVE.get(bsp.get()) {
         active.store(true, Ordering::Release);
     }
     crate::tlb::mark_online();
@@ -928,13 +1263,13 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
         // Interrupts on only while halted: the timer may switch to a worker here, and this
         // flow resumes after `hlt` when its turn comes round again.
         // SAFETY: as in `run_ap`.
-        unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+        unsafe { asm!("sti", "hlt", "cli", options(nostack)) };
     }
     let elapsed_ms = rdtsc().wrapping_sub(start) / (tsc_hz / 1000).max(1);
     let mut switches_at_stop = [0u64; MAX_CPUS];
     for (slot, &id) in switches_at_stop.iter_mut().zip(cpus) {
         *slot = QUEUES
-            .get(id as usize)
+            .get(id.get())
             .map_or(0, |q| without_interrupts(|| q.lock().switches()));
     }
     STOP.store(true, Ordering::Relaxed);
@@ -956,7 +1291,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
         let (a, b) = (2 * i, 2 * i + 1);
         let count = |w: usize| PROGRESS.get(w).map_or(0, |p| p.load(Ordering::Relaxed));
         let place = |w: usize| RAN_ON.get(w).map_or(0, |r| r.load(Ordering::Relaxed));
-        let right_cpu = place(a) == u64::from(id) + 1 && place(b) == u64::from(id) + 1;
+        let right_cpu = place(a) == id.get() as u64 + 1 && place(b) == id.get() as u64 + 1;
         // Both workers ran, with comparable shares (within a factor of two).
         let (lo, hi) = (count(a).min(count(b)), count(a).max(count(b)));
         let fair = lo > 0 && lo * 2 >= hi;
@@ -982,11 +1317,13 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) -> bool {
     ok &= prove_weights(com1, cpus, bsp, tsc_hz);
     ok &= prove_simd(com1, bsp, tsc_hz);
     ok &= prove_lifecycle(com1, bsp, tsc_hz);
+    ok &= prove_spawn_refused(com1, bsp, tsc_hz);
     ok &= crate::user::prove(com1, bsp, tsc_hz);
     ok &= crate::time::prove_consistent(com1, cpus, bsp, tsc_hz);
     ok &= crate::console::prove(com1, cpus, bsp, tsc_hz);
     ok &= crate::tlb::prove(com1, cpus, bsp, tsc_hz);
     ok &= crate::wait::prove(com1, cpus, bsp, tsc_hz);
+    ok &= crate::ipc_proof::prove(com1, cpus, bsp, tsc_hz);
     // Every thread has exited: once each processor has reaped its own, the heap is back
     // exactly where it was before the first spawn.
     let back = || crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before;

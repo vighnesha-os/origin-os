@@ -13,8 +13,9 @@
 //!   serves the request in progress meanwhile, so two initiators never wait on each other.
 //! - Each request has a generation. A processor records the last generation it served, and
 //!   the initiator waits until every target's record reaches its own.
-//! - Targets are the processors whose schedulers run ([`mark_online`]), each named by its
-//!   x2APIC ID: nothing is broadcast to processors that never started.
+//! - Targets are the processors whose schedulers run ([`mark_online`]), recorded by CPU
+//!   index and sent the IPI at the x2APIC ID recorded for that index: nothing is
+//!   broadcast to processors that never started.
 //! - The caller must hold no lock that another processor may wait for with interrupts
 //!   disabled: that processor could then never take the interrupt. `vm` releases its own
 //!   lock before it shoots down.
@@ -30,16 +31,20 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use origin_sync::SpinLock;
 
 use crate::console::Console;
-use crate::cpu::{self, rdtsc};
-use crate::sched::MAX_CPUS;
+use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
 use crate::timer::X2Apic;
 
 /// The shootdown interrupt's vector: a fixed IPI, above every device vector in use.
 pub(crate) const SHOOTDOWN_VECTOR: u8 = 0xF0;
 /// A request to flush everything rather than one page.
 const ALL: u64 = u64::MAX;
-/// Polls before an initiator gives up waiting: on the order of a second.
-const WAIT_POLLS: u64 = 1 << 26;
+/// An initiator gives up waiting after this many seconds of the TSC (for its turn, and for
+/// every other processor's answer): time, not polls, so the bound does not depend on what
+/// PAUSE costs on this processor.
+const WAIT_SECONDS: u64 = 1;
+/// The TSC rate to assume before the clock has measured one (`time::tsc_hz` is then 1, and
+/// no other processor is running to wait for).
+const MIN_TSC_HZ: u64 = 1_000_000_000;
 /// ICR level bit: assert (the only meaningful level for fixed IPIs).
 const ICR_ASSERT: u32 = 1 << 14;
 
@@ -55,14 +60,16 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 static SERVED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// TSC cycles the last completed shootdown took, for the boot report.
 static LAST_CYCLES: AtomicU64 = AtomicU64::new(0);
-/// Processors that turned on global pages.
-static GLOBAL_PAGES: AtomicU64 = AtomicU64::new(0);
+/// Each CPU index whose processor turned on global pages.
+static GLOBAL_PAGES: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
 fn this_cpu() -> usize {
-    usize::try_from(cpu::cpu_id()).unwrap_or(usize::MAX)
+    cpu::this_cpu().get()
 }
 
-/// Turns on global pages on this processor and counts it, for the boot report.
+/// Turns on global pages on this processor and marks its CPU index, for the boot report.
+/// [`prove`] counts only the processors online, so an AP that got this far but never came
+/// online (it was parked, `smp::park`) is not counted.
 ///
 /// # Safety
 ///
@@ -70,8 +77,8 @@ fn this_cpu() -> usize {
 pub(crate) unsafe fn enable_global_pages() -> bool {
     // SAFETY: the caller's contract.
     let on = unsafe { cpu::enable_global_pages() };
-    if on {
-        GLOBAL_PAGES.fetch_add(1, Ordering::Relaxed);
+    if on && let Some(global) = GLOBAL_PAGES.get(this_cpu()) {
+        global.store(true, Ordering::Relaxed);
     }
     on
 }
@@ -133,15 +140,17 @@ pub(crate) fn shootdown_all() -> u64 {
 
 fn shoot(request: u64) -> u64 {
     let outcome = cpu::without_interrupts(|| {
-        let mut polls = 0u64;
+        let limit = crate::time::tsc_hz()
+            .max(MIN_TSC_HZ)
+            .saturating_mul(WAIT_SECONDS);
+        let waiting_since = rdtsc();
         let turn = loop {
             if let Some(turn) = INITIATOR.try_lock() {
                 break turn;
             }
             service();
             core::hint::spin_loop();
-            polls += 1;
-            if polls == WAIT_POLLS {
+            if rdtsc().wrapping_sub(waiting_since) >= limit {
                 return Err(usize::MAX);
             }
         };
@@ -159,12 +168,17 @@ fn shoot(request: u64) -> u64 {
         let mut targets = [false; MAX_CPUS];
         for (id, (online, target)) in ONLINE.iter().zip(targets.iter_mut()).enumerate() {
             if id != me && online.load(Ordering::SeqCst) {
+                // Every online processor is waited for. One without an APIC ID on record
+                // (impossible: `smp` records it before the processor starts) gets no IPI,
+                // so the wait below times out and panics rather than skipping it.
                 *target = true;
-                // SAFETY: a fixed IPI with the shootdown vector, whose handler only
-                // invalidates TLB entries and acknowledges; `id` is an online processor's
-                // x2APIC ID.
-                unsafe {
-                    lapic.send_ipi(id as u32, ICR_ASSERT | u32::from(SHOOTDOWN_VECTOR));
+                if let Some(apic_id) = CpuIndex::new(id).and_then(CpuIndex::apic_id) {
+                    // SAFETY: a fixed IPI with the shootdown vector, whose handler only
+                    // invalidates TLB entries and acknowledges; `apic_id` is the x2APIC ID
+                    // recorded for online processor `id`.
+                    unsafe {
+                        lapic.send_ipi(apic_id, ICR_ASSERT | u32::from(SHOOTDOWN_VECTOR));
+                    }
                 }
             }
         }
@@ -172,10 +186,12 @@ fn shoot(request: u64) -> u64 {
             if !target {
                 continue;
             }
-            let mut polls = 0u64;
             while served.load(Ordering::Acquire) < generation {
-                polls += 1;
-                if polls == WAIT_POLLS {
+                if rdtsc().wrapping_sub(start) >= limit {
+                    // Looked at once more: this processor may have been the one away.
+                    if served.load(Ordering::Acquire) >= generation {
+                        break;
+                    }
                     return Err(id);
                 }
                 core::hint::spin_loop();
@@ -244,13 +260,20 @@ extern "sysv64" fn toucher(_: u64) -> ! {
 /// - every application processor caches three pages; the boot processor unmaps one with a
 ///   single-page shootdown and two with one full flush; every processor's next read of
 ///   each page must fault.
-pub(crate) fn prove(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -> bool {
+pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
     let mut ok = true;
     let census = crate::vm::leaf_census();
-    let global = GLOBAL_PAGES.load(Ordering::Relaxed);
+    let global = cpus
+        .iter()
+        .filter(|c| {
+            GLOBAL_PAGES
+                .get(c.get())
+                .is_some_and(|g| g.load(Ordering::Relaxed))
+        })
+        .count();
     let census_ok =
         census.is_some_and(|c| c.upper_local == 0 && c.lower_global == 0 && c.upper_global > 0);
-    ok &= census_ok && global == cpus.len() as u64;
+    ok &= census_ok && global == cpus.len();
     let _ = writeln!(
         com1,
         "origin-kernel: TLB: global pages on {global} of {} processors; kernel's tables: {:?}{}",
@@ -272,8 +295,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -
         page.store(*slot, Ordering::Release);
     }
     let mut aps = 0u64;
-    for &id in cpus.iter().filter(|&&id| id as usize != bsp) {
-        if crate::sched::spawn(id as usize, toucher, 0).is_err() {
+    for &id in cpus.iter().filter(|&&id| id != bsp) {
+        if crate::sched::spawn(id, toucher, 0).is_err() {
             let _ = writeln!(
                 com1,
                 "origin-kernel: TLB: cannot spawn on CPU {id}: TLB failed"

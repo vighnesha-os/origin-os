@@ -26,6 +26,12 @@ pub const PORT: u16 = 69;
 /// is the last.
 pub const BLOCK: usize = 512;
 
+/// A client port (RFC 1350 §4's transfer identifier) from `random` bits: one of the 16 384
+/// dynamic ports, 49152 and up (RFC 6335 §6), so that the low 14 bits pick it without bias.
+pub fn client_port(random: u64) -> u16 {
+    0xC000 | (random as u16 & 0x3FFF)
+}
+
 /// Builds a read request for `filename` in octet mode into `out`. Returns the length, or
 /// `None` if the name is empty or contains a NUL, or `out` is too small.
 pub fn read_request(filename: &str, out: &mut [u8]) -> Option<usize> {
@@ -270,6 +276,20 @@ mod tests {
         assert_eq!(read_request("initramfs.tar", &mut out[..10]), None);
     }
 
+    /// The port chosen from any random bits is a dynamic port, and the random bits reach it.
+    #[test]
+    fn client_ports_are_random_dynamic_ports() {
+        for random in [0, 1, 0x3FFF, 0x4000, 0xBFFF, 0xC000, 0xFFFF, u64::MAX] {
+            assert!(client_port(random) >= 49152, "{random:#x}");
+        }
+        assert_eq!(client_port(0), 49152);
+        assert_eq!(client_port(u64::MAX), 65535);
+        let mut rng = crate::testing::Rng::new(0x5446_504F);
+        let ports: alloc::collections::BTreeSet<u16> =
+            (0..1000).map(|_| client_port(rng.next())).collect();
+        assert!(ports.len() > 900, "{} distinct ports of 1000", ports.len());
+    }
+
     #[test]
     fn ack_encodes_the_block() {
         let mut out = [0u8; 4];
@@ -414,6 +434,54 @@ mod tests {
             Step::Failed(Failure::TooLarge)
         );
         assert_eq!(d.data().len(), BLOCK, "nothing past the limit is kept");
+    }
+
+    /// A mutated transfer stays bounded, and a block the reader accepts is the next one in
+    /// order (CLAUDE.md §72).
+    #[test]
+    fn mutated_transfers_stay_in_order_and_in_bounds() {
+        use crate::testing::{Rng, mutate};
+        let mut rng = Rng::new(0x5446_5032);
+        let content = file(1500);
+        let mut steps = 0u32;
+        for case in 0..crate::testing::cases(2000) {
+            let mut d = Download::new(4096);
+            let mut expected: u16 = 1;
+            for i in 0..6 {
+                let start = (expected as usize - 1) * BLOCK;
+                let end = (start + BLOCK).min(content.len());
+                let mut packet = if start <= content.len() {
+                    data(expected, &content[start..end])
+                } else {
+                    data(expected, b"")
+                };
+                if i % 2 == 1 {
+                    mutate(&mut packet, &mut rng);
+                }
+                let parsed = parse(&packet);
+                match d.on_packet(&packet) {
+                    Step::Ack { block, last } => {
+                        steps += 1;
+                        if let Some(Packet::Data {
+                            block: b,
+                            data: payload,
+                        }) = parsed
+                        {
+                            assert_eq!(b, block, "case {case}");
+                            if b == expected {
+                                expected = expected.wrapping_add(1);
+                                assert_eq!(last, payload.len() < BLOCK, "case {case}");
+                            }
+                        }
+                    }
+                    Step::Failed(Failure::TooLarge) => panic!("case {case}: over the limit"),
+                    Step::Failed(Failure::Server(_)) | Step::Ignore => {}
+                }
+                assert!(d.data().len() <= 4096, "case {case}");
+                let _ = (d.blocks(), d.is_complete(), d.failure());
+            }
+        }
+        assert!(steps > 3000, "{steps}");
     }
 
     #[test]

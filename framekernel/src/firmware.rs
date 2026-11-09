@@ -25,8 +25,11 @@ pub(crate) fn bytes(addr: u64, len: usize) -> Result<&'static [u8], &'static str
     })
 }
 
-/// The first table with signature `sig` that the XSDT lists, checked (signature, length,
-/// checksum): RSDP → XSDT → table.
+/// The first valid table with signature `sig` that the XSDT lists, checked (signature,
+/// length, checksum): RSDP → XSDT → table. One bad entry does not hide the entries after it;
+/// the error is why the last table with this signature was refused, if there was one. An
+/// entry that could not be read at all might have been this table, so a search that finds
+/// nothing then says so, and does not claim the table is absent. A null entry names nothing.
 pub(crate) fn acpi_table(rsdp_addr: u64, sig: &[u8; 4]) -> Result<&'static [u8], &'static str> {
     let rsdp =
         acpi::parse_rsdp(bytes(rsdp_addr, acpi::RSDP_LENGTH)?).map_err(|_| "invalid RSDP")?;
@@ -38,11 +41,23 @@ pub(crate) fn acpi_table(rsdp_addr: u64, sig: &[u8; 4]) -> Result<&'static [u8],
         Ok(all)
     };
     let xsdt = table(rsdp.xsdt, b"XSDT")?;
-    for addr in acpi::xsdt_entries(xsdt) {
-        let header = bytes(addr, acpi::HEADER_LENGTH)?;
+    let (mut refused, mut unreadable) = (None, false);
+    for addr in acpi::xsdt_entries(xsdt).filter(|&addr| addr != 0) {
+        // An entry the kernel cannot read says nothing about the entries after it.
+        let Ok(header) = bytes(addr, acpi::HEADER_LENGTH) else {
+            unreadable = true;
+            continue;
+        };
         if acpi::signature(header) == Some(*sig) {
-            return table(addr, sig);
+            match table(addr, sig) {
+                Ok(all) => return Ok(all),
+                Err(why) => refused = Some(why),
+            }
         }
     }
-    Err("table not listed in the XSDT")
+    Err(refused.unwrap_or(if unreadable {
+        "an XSDT entry could not be read"
+    } else {
+        "table not listed in the XSDT"
+    }))
 }

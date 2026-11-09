@@ -11,7 +11,11 @@
 //! 6. ML-DSA (FIPS 204, strict) verifies over the same bytes with the role's context string
 //!    `origin/onbf/1/<role>`.
 //!
-//! Which keys are trusted, and certificate chains, are the trust store's business (§7.3, B7).
+//! [`verify_krn_block`] adds what a KRN image needs on top of that: which keys are trusted
+//! (a caller-supplied trust store, ONBF §8.1), and that the block holds exactly one entry
+//! by a trusted key in the role `origin-kernel` (§7.5). Certificate chains (§7.3–§7.4) are
+//! not implemented yet: an entry that carries one is refused, never verified without it
+//! (errata V1, Proposed).
 //!
 //! Contract, as for the other freestanding libraries: `no_std`, no allocation, no `unsafe`,
 //! no panics.
@@ -30,7 +34,8 @@
     )
 )]
 
-use onbf_format::signature::{Entry, Suite};
+use onbf_format::Profile;
+use onbf_format::signature::{Entry, Role, SignatureBlock, SignatureError, Suite};
 use origin_crypto::{
     Ed25519Error, MlDsaError, Sha256, ed25519_verify, mldsa65_verify, mldsa87_verify,
 };
@@ -138,5 +143,70 @@ pub fn verify_entry(
     }
 }
 
+/// A key a verifier trusts, and the one role it is trusted for (ONBF §7.4, §8.1).
+#[derive(Clone, Copy, Debug)]
+pub struct TrustedKey<'a> {
+    /// The only role this key may sign in.
+    pub role: Role,
+    /// The public keys.
+    pub key: PublicKey<'a>,
+}
+
+/// Why a KRN image's signature block was refused (ONBF §7.1, §7.5; ADR-0002 B2 step 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KrnBlockError {
+    /// The block does not parse.
+    Malformed(SignatureError),
+    /// A KRN block holds exactly one entry (errata V2); this one holds this many.
+    EntryCount(usize),
+    /// The entry's role is not `origin-kernel` (§7.5).
+    Role(Role),
+    /// The entry carries a certificate chain. OKC validation does not exist yet, so the
+    /// chain cannot be honoured and the entry is refused (errata V1).
+    ChainNotSupported,
+    /// No key in the trust store has this entry's key ID and the `origin-kernel` role.
+    UntrustedKey,
+    /// The key was found, but the entry did not verify under it.
+    Entry(VerifyError),
+}
+
+/// Verifies the signature block of a KRN image whose content digest is `content_digest`:
+/// exactly one entry, in the role `origin-kernel`, with no certificate chain, by a key in
+/// `store`, with both signatures good (ONBF §7.1, §7.5; errata V1, V2). Returns the signer's
+/// key ID.
+pub fn verify_krn_block(
+    block: &[u8],
+    store: &[TrustedKey<'_>],
+    content_digest: &[u8; 64],
+) -> Result<[u8; 32], KrnBlockError> {
+    let parsed = SignatureBlock::parse(block).map_err(KrnBlockError::Malformed)?;
+    let count = parsed.entries().count();
+    let (Some(entry), 1) = (parsed.entries().next(), count) else {
+        return Err(KrnBlockError::EntryCount(count));
+    };
+    if entry.role != Role::Kernel {
+        return Err(KrnBlockError::Role(entry.role));
+    }
+    if entry.chain_len != 0 {
+        return Err(KrnBlockError::ChainNotSupported);
+    }
+    let found = store
+        .iter()
+        .filter(|trusted| trusted.role == Role::Kernel)
+        .map(|trusted| (trusted, key_id(&trusted.key)))
+        .find(|(_, id)| entry.key_id == id);
+    let Some((trusted, id)) = found else {
+        return Err(KrnBlockError::UntrustedKey);
+    };
+    verify_entry(entry, &trusted.key, content_digest, Profile::Krn as u64)
+        .map_err(KrnBlockError::Entry)?;
+    Ok(id)
+}
+
+#[cfg(test)]
+#[path = "../../format/src/testing.rs"]
+mod testing;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_soak;

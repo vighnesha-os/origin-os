@@ -8,8 +8,10 @@
 //! - the direction flag clear;
 //! - the image's relocations applied.
 //!
-//! The kernel assumes nothing else about memory. It programs COM1, checks that its own
-//! relocations were applied, validates the boot info and prints a summary. Then come the
+//! The kernel assumes nothing else about memory. It programs COM1 (its UART until the ACPI
+//! tables name a better one), checks that its own relocations were applied, validates the
+//! boot info, attaches the firmware's framebuffer if the loader passed one, and prints a
+//! summary. Then come the
 //! first M2 steps: its own GDT, TSS and IDT (proven with a breakpoint), the frame
 //! allocator, and its own page tables with a W^X kernel image (proven with deliberate
 //! faults), after which it halts. Only the boot processor runs, and nothing here enables
@@ -34,8 +36,12 @@ use framekernel::report;
 mod block;
 mod console;
 mod cpu;
+mod dma;
 mod firmware;
 mod i8042;
+mod iommu;
+mod ipc;
+mod ipc_proof;
 mod irq;
 mod memory;
 mod pcie;
@@ -44,6 +50,7 @@ mod process;
 mod sched;
 mod smp;
 mod storage;
+mod syscall;
 mod time;
 mod timer;
 mod tlb;
@@ -54,17 +61,19 @@ mod wait;
 use framekernel::frames::{self, FrameAllocator};
 use framekernel::paging::layout::{self, Placement};
 use framekernel::paging::{PAGE, Table, TablePool};
-use framekernel::serial::{Register, Uart16550, UartRegisters};
+use framekernel::serial::Uart16550;
 use origin_boot_info::{
     BootInfo, KernelSegment, MemoryRegion, RegionKind, SEGMENT_EXECUTE, SEGMENT_WRITE,
 };
 
-/// Frames reserved, next to the frame bitmap, for the kernel's page tables: enough for a
-/// direct map of well over 100 GiB with 2 MiB pages plus 4 KiB edges at every region.
-const TABLE_POOL_FRAMES: u64 = 256;
+/// The fewest frames reserved, next to the frame bitmap, for the kernel's page tables.
+const TABLE_POOL_MIN_FRAMES: u64 = 256;
+/// Frames kept beyond what the boot's own tables can need (`layout::table_frames`), for what
+/// is mapped afterwards: device registers, firmware tables and guard pages that split a leaf.
+const TABLE_POOL_RESERVE: u64 = 235;
 
 /// I/O port base of COM1 on PC-compatible platforms.
-const COM1_BASE: u16 = 0x3F8;
+pub(crate) const COM1_BASE: u16 = 0x3F8;
 
 /// Set by the first panic. A panic while reporting a panic only halts.
 static PANICKING: AtomicBool = AtomicBool::new(false);
@@ -109,8 +118,10 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     time::mark_entry();
     // SAFETY: the entry contract: CPL 0, boot processor only, interrupts disabled. The
     // firmware and the loader stopped using COM1 at `ExitBootServices`, and no other kernel
-    // code drives it.
-    let mut uart = Uart16550::new(unsafe { Com1::new() });
+    // code drives it. COM1 is the UART of last resort: nothing better is known until the
+    // ACPI tables can be read, which `console::adopt_firmware_uart` does.
+    let mut uart = Uart16550::new(unsafe { console::KernelUart::port(COM1_BASE) });
+    let firmware_line = uart.line_settings();
     uart.init();
 
     if !relocations_applied() {
@@ -120,7 +131,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         halt();
     }
     // From here on every processor prints through the console, a line at a time.
-    console::init(uart);
+    console::init(uart, firmware_line);
     let mut com1 = console::Console::new();
 
     // SAFETY: `boot_info` is the loader's pointer, passed on unchanged, and this function's
@@ -132,6 +143,9 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
             halt();
         }
     };
+    // The firmware's framebuffer, drawn on from here on (ADR-0010). The earlier lines of a
+    // boot this far can only have been a report of an invalid boot info, on the UART.
+    console::attach_framebuffer(&mut com1, &info, regions);
     let _ = report::write_report(&mut com1, &info, &memory);
     for (i, s) in segments.iter().enumerate() {
         let access = match (
@@ -203,21 +217,42 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
 
     // M2, second step: the physical frame allocator over the boot-info regions, with a
     // pool of frames for page tables beside its bitmap.
-    let Some((mut alloc, pool, pool_base)) = init_memory(&mut com1, regions) else {
+    let Some((mut alloc, pool, pool_base)) = init_memory(&mut com1, regions, info.kernel_span)
+    else {
         halt();
     };
 
     // M2, third step: the kernel's own page tables, proven with deliberate faults; then
     // the frame allocator is proven again through the new direct map.
     let mut heap_ok = false;
-    if init_paging(&mut com1, &info, regions, segments, pool, pool_base) {
+    let paging = init_paging(&mut com1, &info, regions, segments, pool, pool_base);
+    // The kernel's own tables are loaded, so firmware tables can be mapped: the console's
+    // UART is the one the firmware names, if it names one (ADR-0010).
+    console::adopt_firmware_uart(&mut com1, info.acpi_rsdp, regions);
+    // Threat T4: stop every device the firmware left bus-mastering as soon as the kernel can
+    // reach configuration space, before it claims any more memory for itself.
+    let mut quiesced = None;
+    if paging {
         prove_frames(&mut com1, &mut alloc);
         // M2: the kernel heap, which takes over the frame allocator; from here on the
         // `alloc` crate works in the kernel.
         memory::init(alloc);
+        quiesced = pcie::quiesce(
+            &mut com1,
+            info.acpi_rsdp,
+            regions,
+            &iommu::own_functions(info.acpi_rsdp),
+        );
         heap_ok = prove_heap(&mut com1);
-        if heap_ok {
-            prove_user_isolation(&mut com1);
+        if heap_ok && !prove_user_isolation(&mut com1) {
+            // Ring 3 comes next: a kernel that cannot keep itself from user pages must not
+            // run it, any more than a processor below the baseline (and `prove_user_isolation`
+            // has said why).
+            let _ = writeln!(
+                com1,
+                "origin-kernel: supervisor protection from user pages is not in force: user isolation failed"
+            );
+            halt();
         }
     }
 
@@ -225,6 +260,9 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // against the PIT and proven by taking periodic interrupts.
     let tsc_hz = timer::init(&mut com1);
     if let Some(hz) = tsc_hz {
+        if let Some(q) = quiesced.as_mut() {
+            pcie::settle(&mut com1, q, hz);
+        }
         prove_nmi_ist(&mut com1);
         // The clocks: the monotonic clock's TSC rate, proven against the RTC, and the wall
         // clock from the RTC (CLAUDE.md §68).
@@ -240,6 +278,22 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     if let Some(tsc_hz) = tsc_hz
         && heap_ok
     {
+        // DMA and interrupt remapping (Intel VT-d or AMD-Vi) before the application
+        // processors start, the loader's memory is reclaimed or any driver binds: translation
+        // on with no device attached, so every DMA faults until a driver attaches its device,
+        // including a device that ignored its cleared Bus Master Enable (CLAUDE.md §32, §58;
+        // ADR-0007). It needs the clock (`time::init`) for its timeouts, and comes after the
+        // compatibility-format I/O APIC proof above, which interrupt remapping would block.
+        // It runs whether or not the bus-master quiesce succeeded: confining a device that kept
+        // mastering the bus is exactly what a failed quiesce leaves to it.
+        iommu::init(&mut com1, info.acpi_rsdp);
+        if iommu::translating() {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: IOMMU: translating {} ms after kernel entry",
+                time::monotonic_nanos() / 1_000_000
+            );
+        }
         let online = smp::start(&mut com1, &info, regions, tsc_hz);
         // M2 completion: once every enabled processor has left firmware code, the loader's
         // and the firmware's boot-time memory belongs to the kernel.
@@ -253,23 +307,41 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                 (free * memory::FRAME) >> 20
             );
         }
-        // CPU topology from CPUID leaf 0Bh (CLAUDE.md §24, §27).
-        prove_topology(&mut com1, online.ids());
+        // CPU topology from CPUID, each processor's on itself, checked against the MADT
+        // (CLAUDE.md §24, §27).
+        let apic_ids = online.apic_ids();
+        prove_topology(&mut com1, info.acpi_rsdp, &online);
         // NUMA affinities from the ACPI SRAT (CLAUDE.md §24, §28).
-        prove_numa(&mut com1, info.acpi_rsdp, online.ids());
+        prove_numa(&mut com1, info.acpi_rsdp, &apic_ids);
         // Inter-node distances from the ACPI SLIT (CLAUDE.md §27, §28).
         prove_slit(&mut com1, info.acpi_rsdp);
         // Hardware entropy from RDSEED/RDRAND (CLAUDE.md §59).
         prove_entropy(&mut com1, &features);
         // M3, second step: preemptive kernel threads on every online processor.
-        sched::prove(&mut com1, online.ids(), tsc_hz);
+        sched::prove(&mut com1, online.cpus(), tsc_hz);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
-        if pcie::init(&mut com1, info.acpi_rsdp, regions, online.ids().len()) {
+        if let Some(q) = quiesced.as_mut()
+            && let Some(reserved) = pcie::reserved_ranges(&mut com1, q, info.acpi_rsdp)
+            && pcie::init(&mut com1, q, online.cpus(), regions, &reserved)
+        {
+            // Anything that turned bus mastering back on is stopped again before any driver
+            // attaches.
+            pcie::check_quiet(&mut com1, q);
             // M5: the NVMe driver and block I/O, polled and then interrupt-driven.
-            storage::init(&mut com1, online.ids(), tsc_hz);
+            storage::init(&mut com1, online.cpus(), tsc_hz);
             // M10: bring up the virtio-net NIC; an interrupt-driven receive thread takes the
             // OS onto the network (CLAUDE.md §31, §54).
-            virtionet::prove(&mut com1, online.ids(), tsc_hz);
+            virtionet::prove(&mut com1, online.cpus(), tsc_hz);
+            // The IOMMU's own proofs, through the bound NVMe controller: translated DMA, a
+            // blocked and recorded DMA, remapped and blocked interrupts.
+            storage::prove_iommu(&mut com1, online.cpus(), tsc_hz);
+            // Legacy interrupts under interrupt remapping: the PIT's IRQ0 through the I/O
+            // APIC in remappable format and an IRTE that checks the I/O APIC's source ID,
+            // with the IRTE made not present and given a wrong source ID (CLAUDE.md §24,
+            // §32; ADR-0007 I8).
+            irq::prove_remapped(&mut com1, online.cpus(), tsc_hz);
+            // Bus mastering is on exactly for what the drivers attached to a domain.
+            pcie::prove_bus_mastering(&mut com1, q);
         }
         sched::stop_boot_processor();
     }
@@ -362,38 +434,85 @@ fn format_u64(value: u64, buf: &mut [u8; 20]) -> &[u8] {
 /// Proves the monotonic timer queue against the real clock: three timers armed at
 /// increasing deadlines (plus one cancelled) must fire in order, each close to its
 /// deadline, and the cancelled one never (CLAUDE.md §68).
+///
+/// The queue looks at the time only when polled, and on a loaded host the polling loop's
+/// virtual CPU can be away for milliseconds: a timer fired after such a stall is a late
+/// look, not a late timer. So what the polls say about a firing is an interval, and a run
+/// decides only if every firing is inside the limit (`Verdict::OnTime`) or one is outside it
+/// (`Verdict::Late`: a poll that did not fire a timer already that overdue). A run a stall
+/// left undecided is measured again, up to `TIMER_ATTEMPTS` runs; a timer that fires in the
+/// wrong order, or one decisively late, fails at once.
 fn prove_timers(com1: &mut console::Console) {
-    use framekernel::timers::TimerQueue;
-    let mut q = TimerQueue::new();
-    let base = time::monotonic_nanos();
+    use framekernel::timers::{Firing, TimerQueue, Verdict, judge};
+    /// Runs the proof may make; each costs about 15 ms, and only a run a stall left undecided
+    /// leads to another, so an undisturbed boot pays for one. Measured with two `yes` per
+    /// logical core, a run was undecided in 55 % of cases, in streaks of up to 12 (six runs,
+    /// the old budget, ran out in 4.4 % of cases); with four per core in 82 %, streaks up
+    /// to 21. 24 runs never ran out in those measurements; this is that with room to spare.
+    const TIMER_ATTEMPTS: usize = 64;
+    /// How late a timer may be delivered, in nanoseconds.
+    const LATENESS_LIMIT: u64 = 2_000_000;
     let step = 5_000_000u64; // 5 ms
     let ids = [10u64, 20, 30];
-    for (i, &id) in ids.iter().enumerate() {
-        q.arm(id, base + (i as u64 + 1) * step);
-    }
-    q.arm(99, base + 2 * step);
-    q.cancel(99); // this one must never fire
-    let mut order = alloc::vec::Vec::new();
-    let mut fired = alloc::vec::Vec::new();
-    let mut worst_late = 0u64;
-    let start = cpu::rdtsc();
     let tsc_hz = time::tsc_hz();
-    while !q.is_empty() && cpu::rdtsc().wrapping_sub(start) < tsc_hz {
-        let now = time::monotonic_nanos();
-        if q.expire(now, &mut fired) > 0 {
-            for id in fired.drain(..) {
-                let deadline = base + (order.len() as u64 + 1) * step;
-                worst_late = worst_late.max(now.saturating_sub(deadline));
-                order.push(id);
-            }
+    let mut order = alloc::vec::Vec::new();
+    let mut worst_late = 0u64;
+    let mut verdict = Verdict::Undecided;
+    let mut attempts = 0;
+    while attempts < TIMER_ATTEMPTS && verdict == Verdict::Undecided {
+        attempts += 1;
+        let mut q = TimerQueue::new();
+        let base = time::monotonic_nanos();
+        for (i, &id) in ids.iter().enumerate() {
+            q.arm(id, base + (i as u64 + 1) * step);
         }
-        core::hint::spin_loop();
+        q.arm(99, base + 2 * step);
+        q.cancel(99); // this one must never fire
+        order.clear();
+        let mut firings: [Firing; 3] = core::array::from_fn(|i| Firing {
+            deadline: base + (i as u64 + 1) * step,
+            previous_poll: base,
+            fired_at: None,
+        });
+        let mut fired = alloc::vec::Vec::new();
+        let mut last_poll = base;
+        let start = cpu::rdtsc();
+        while !q.is_empty() && cpu::rdtsc().wrapping_sub(start) < tsc_hz {
+            let now = time::monotonic_nanos();
+            if q.expire(now, &mut fired) > 0 {
+                for id in fired.drain(..) {
+                    if let Some(firing) = firings.get_mut(order.len()) {
+                        firing.previous_poll = last_poll;
+                        firing.fired_at = Some(now);
+                    }
+                    order.push(id);
+                }
+            }
+            last_poll = now;
+            core::hint::spin_loop();
+        }
+        // A timer the queue still holds was last looked at by the final poll.
+        for firing in firings.iter_mut().filter(|f| f.fired_at.is_none()) {
+            firing.previous_poll = last_poll;
+        }
+        worst_late = firings.iter().filter_map(Firing::latest).max().unwrap_or(0);
+        verdict = if ids.starts_with(&order) {
+            judge(&firings, LATENESS_LIMIT)
+        } else {
+            // A stall cannot reorder the queue or fire a cancelled timer.
+            Verdict::Late
+        };
     }
-    let ok = order == ids && worst_late < 2_000_000; // within 2 ms
+    let ok = verdict == Verdict::OnTime && order == ids;
     let _ = writeln!(
         com1,
-        "origin-kernel: timers: 3 deadlines (1 cancelled) fired in order {order:?}, worst lateness {} us{}",
+        "origin-kernel: timers: 3 deadlines (1 cancelled) fired in order {order:?}, worst lateness {} us{}{}",
         worst_late / 1000,
+        if attempts > 1 {
+            " (after a stalled run)"
+        } else {
+            ""
+        },
         if ok { "" } else { ": timers failed" }
     );
 }
@@ -619,27 +738,26 @@ pub(crate) fn check_initramfs(image: &[u8]) -> InitramfsCheck {
     }
 }
 
-/// Reports the CPU topology from CPUID leaf 0Bh and checks that the online processors'
-/// x2APIC IDs decompose consistently (every package/core/thread triple unique), the
-/// groundwork for topology-aware scheduling (CLAUDE.md §24, §27).
-fn prove_topology(com1: &mut console::Console, ids: &[u32]) {
-    use framekernel::topology::Topology;
-    // Read leaf 0Bh sub-leaves until one reports level type 0 (or four, enough for SMT and
-    // core).
-    let mut subs = [[0u32; 4]; 4];
-    let mut n = 0;
-    if cpu::cpuid(0)[0] >= 0x0B {
-        for (i, slot) in subs.iter_mut().enumerate() {
-            *slot = cpu::cpuid_subleaf(0x0B, i as u32);
-            n = i + 1;
-            if (slot[2] >> 8) & 0xFF == 0 {
-                break;
-            }
-        }
-    }
-    let topology = Topology::decode(&subs[..n]);
-    let mut scratch = [(0u32, 0u32, 0u32); crate::sched::MAX_CPUS];
-    let (counts, consistent) = framekernel::topology::analyze(&topology, ids, &mut scratch);
+/// Reports the CPU topology each online processor read about itself from CPUID, package
+/// down to thread, and checks it against the ACPI MADT (CLAUDE.md §24, §27; research ledger
+/// `docs/research/2026-11-08-cpu-topology-leaf-1fh.md`).
+///
+/// Every processor recorded its own leaves on itself (a hybrid part's differ between
+/// processors), before it reported online. The checks:
+/// - each processor's own CPUID x2APIC ID is the one the MADT lists for its CPU index;
+/// - every processor decoded its leaves, and they all draw the same layout (the thread
+///   field may differ only on a hybrid part);
+/// - a hybrid processor reports a core type (the SDM makes leaf 1Ah present on all of them);
+/// - no two processors have one placement;
+/// - and the layout is applied to everything the MADT lists, so `cargo xtask` can compare
+///   the resulting package, die, module and core counts with the machine it asked QEMU for.
+///
+/// None of this reads the QEMU machine definition; the counts are only printed here.
+fn prove_topology(com1: &mut console::Console, rsdp: u64, online: &smp::Online) {
+    use framekernel::topology::{self, CpuTopology, Layout, Source};
+
+    // The boot processor's own record; every AP wrote its own before it came online.
+    cpu::record_topology();
     // The cache hierarchy from leaf 04h.
     let mut caches = [framekernel::cache::Cache {
         level: 0,
@@ -676,14 +794,105 @@ fn prove_topology(com1: &mut console::Console, ids: &[u32]) {
     }
     let _ = writeln!(com1, "; consistent {caches_ok}");
 
+    // Each online processor: the APIC ID the MADT gave its CPU index, and what it recorded.
+    let records: alloc::vec::Vec<(u32, Option<CpuTopology>)> = online
+        .cpus()
+        .iter()
+        .map(|&c| (c.apic_id().unwrap_or(u32::MAX), cpu::topology_of(c)))
+        .collect();
+    let boot = records.first().and_then(|r| r.1);
+    let source = boot.map_or(Source::None, |b| b.source);
+    let layout = boot.map_or(Layout::FLAT, |b| b.layout);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: topology: layout from {source}: {layout}"
+    );
+    for (c, (_, own)) in online.cpus().iter().zip(&records) {
+        match own {
+            Some(own) => {
+                let _ = write!(
+                    com1,
+                    "origin-kernel: topology: {}: {}",
+                    c.named(),
+                    own.place()
+                );
+                if let Some(core) = own.core {
+                    let _ = write!(com1, "; core type {:#x}", core.core_type);
+                }
+                let _ = writeln!(com1);
+            }
+            None => {
+                let _ = writeln!(
+                    com1,
+                    "origin-kernel: topology: {}: it recorded nothing about itself",
+                    c.named()
+                );
+            }
+        }
+    }
+
+    // The layout over everything the MADT lists. Counts only: xtask knows the machine.
+    let listed = smp::listed_apic_ids(rsdp);
+    let madt_read = listed.is_ok();
+    match listed {
+        Ok(mut ids) => {
+            let census = layout.census(&mut ids);
+            let _ = writeln!(
+                com1,
+                "origin-kernel: topology: the MADT lists {} processors: {} packages, {} dies, {} modules, {} cores, {} threads",
+                ids.len(),
+                census.packages,
+                census.dies,
+                census.modules,
+                census.cores,
+                census.threads
+            );
+        }
+        Err(why) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: topology: the MADT is unreadable: {why}"
+            );
+        }
+    }
+
+    // Core types: only what the processors themselves report (§24: capabilities, never
+    // marketing names).
+    let reporting = records
+        .iter()
+        .filter(|r| r.1.is_some_and(|o| o.core.is_some()))
+        .count();
+    let hybrid = records.iter().any(|r| r.1.is_some_and(|o| o.hybrid));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: topology: core types: reported by {reporting} of {} processors; hybrid {hybrid}",
+        records.len()
+    );
+
+    // The checks.
+    let agreement = topology::agree(&records);
+    let mut online_ids: alloc::vec::Vec<u32> = records.iter().map(|r| r.0).collect();
+    let counts = layout.census(&mut online_ids);
+    let consistent = agreement.holds() && madt_read && counts.threads == records.len();
+    let _ = writeln!(
+        com1,
+        "origin-kernel: topology: against the MADT: {} processors checked, {} recorded nothing, {} have another APIC ID, {} another layout, {} an undecodable leaf, {} no core type although hybrid, {} a duplicate placement; consistent {consistent}",
+        agreement.checked,
+        agreement.missing,
+        agreement.wrong_apic_id,
+        agreement.layout_differs,
+        agreement.undecodable,
+        agreement.unidentified,
+        agreement.duplicates,
+    );
     let _ = writeln!(
         com1,
         "origin-kernel: topology: {} logical, {} cores, {} packages ({} threads/core, {} logical/package); consistent {}{}",
         counts.threads,
         counts.cores,
         counts.packages,
-        topology.threads_per_core(),
-        topology.logical_per_package(),
+        layout.threads_per_core(),
+        layout.logical_per_package(),
         consistent,
         if consistent { "" } else { ": topology failed" }
     );
@@ -705,8 +914,11 @@ fn prove_numa(com1: &mut console::Console, rsdp: u64, ids: &[u32]) {
         return;
     };
 
-    let mut cpus = [CpuAffinity::default(); crate::sched::MAX_CPUS];
-    let mut mems = [MemoryAffinity::default(); 32];
+    // The SRAT lists every processor the platform may have (QEMU: all of `maxcpus`, each
+    // marked enabled), so the lists are sized from the table, on the heap: a CPU affinity
+    // structure is at least 16 bytes long, a memory affinity structure 40.
+    let mut cpus = alloc::vec![CpuAffinity::default(); srat.len() / 16];
+    let mut mems = alloc::vec![MemoryAffinity::default(); srat.len() / 40];
     let (Ok(ncpu), Ok(nmem)) = (
         acpi::srat_cpu_affinities(srat, &mut cpus),
         acpi::srat_memory_affinities(srat, &mut mems),
@@ -738,7 +950,11 @@ fn prove_numa(com1: &mut console::Console, rsdp: u64, ids: &[u32]) {
     }
 
     let enabled_cpus = cpus.iter().filter(|c| c.enabled).count();
-    let mem_bytes: u64 = mems.iter().filter(|m| m.enabled).map(|m| m.length).sum();
+    // The lengths are firmware data, so the total must not wrap.
+    let mem_bytes = mems
+        .iter()
+        .filter(|m| m.enabled)
+        .fold(0u64, |sum, m| sum.saturating_add(m.length));
     // Every online processor must have an enabled affinity entry.
     let all_online_placed = ids
         .iter()
@@ -949,18 +1165,29 @@ fn init_paging(
         kernel_physical_base: info.kernel_base,
         stack_guard,
     };
-    let (space, stats) = match layout::build(&mut tables, &at, regions, segments) {
+    let (mut space, stats) = match layout::build(&mut tables, &at, regions, segments) {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(com1, "origin-kernel: page tables not built: {e:?}");
             return false;
         }
     };
+    // The console keeps drawing through the switch to these tables, at the address the
+    // loader used (ADR-0010). Last, so that it costs nothing else if it fails.
+    if console::has_screen() {
+        let mapped = layout::framebuffer_mapping(&info.framebuffer)
+            .is_some_and(|m| layout::map_framebuffer(&mut space, &mut tables, &m));
+        if !mapped {
+            console::withdraw_framebuffer(com1);
+        }
+    }
     // SAFETY: boot processor, CPL 0, interrupts disabled (entry contract); NX is supported
     // (checked above). `kernel_space::build` mapped the kernel image segments, the stack
     // this code runs on, the boot info and region and segment arrays, the frame bitmap and
     // this table pool (all in direct-mapped regions), and the kernel's statics (the GDT,
-    // IDT, TSS and double-fault stack are in the RW segment). COM1 is port I/O.
+    // IDT, TSS and double-fault stack are in the RW segment). The console's framebuffer is
+    // mapped at the same address in these tables (or was withdrawn above), and COM1 is port
+    // I/O.
     unsafe { cpu::load_page_tables(space.root()) };
     // SAFETY: CPL 0; the tables just loaded mark only the kernel half global (`layout`).
     // Toggling CR4.PGE also drops every translation cached under the loader's tables.
@@ -1070,10 +1297,23 @@ fn prove_protections(com1: &mut Console, info: &BootInfo, segments: &[KernelSegm
 fn init_memory(
     com1: &mut Console,
     regions: &'static [MemoryRegion],
+    kernel_span: u64,
 ) -> Option<(FrameAllocator<'static>, &'static [Table], u64)> {
     let words = frames::words_for(frames::covered_end(regions));
     let bitmap_pages = (words * 8).div_ceil(frames::FRAME);
-    let pages = bitmap_pages + TABLE_POOL_FRAMES;
+    // As large as the memory map can need, so a machine the loader could map is one the kernel
+    // can map too.
+    let Some(table_frames) = layout::table_frames(regions, regions.len() as u64, kernel_span)
+        .and_then(|needed| needed.checked_add(TABLE_POOL_RESERVE))
+        .map(|frames| frames.max(TABLE_POOL_MIN_FRAMES))
+    else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: the memory map needs more page tables than can be counted"
+        );
+        return None;
+    };
+    let pages = bitmap_pages + table_frames;
     let usable = RegionKind::Usable as u32;
     let Some(home) = regions
         .iter()
@@ -1096,7 +1336,7 @@ fn init_memory(
     // kernel's run, and nothing else refers to these frames.
     let bitmap = unsafe { slice::from_raw_parts_mut(bitmap_ptr, words as usize) };
     let pool_base = home.base + bitmap_pages * frames::FRAME;
-    // SAFETY: the pool's `TABLE_POOL_FRAMES` frames follow the bitmap inside `home`, were
+    // SAFETY: the pool's `table_frames` frames follow the bitmap inside `home`, were
     // zeroed above and are reserved below, so only the pool uses them. `Table` is 4 KiB of
     // `AtomicU64`, valid for any bits and aligned (the frames are 4 KiB aligned); accesses
     // through the shared slice are atomic, so the processor's own accessed/dirty updates
@@ -1104,7 +1344,7 @@ fn init_memory(
     let pool = unsafe {
         slice::from_raw_parts(
             ptr::with_exposed_provenance::<Table>(phys::to_virt(pool_base) as usize),
-            TABLE_POOL_FRAMES as usize,
+            table_frames as usize,
         )
     };
     // The AP trampoline's code and data frames (M3) are never handed out.
@@ -1396,33 +1636,6 @@ pub(crate) fn halt() -> ! {
         // and needs no stack. An NMI or SMI can still resume the processor, so it halts
         // again.
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
-    }
-}
-
-/// COM1's registers, reached through x86 port I/O.
-pub(crate) struct Com1(());
-
-impl Com1 {
-    /// # Safety
-    ///
-    /// The caller must run at CPL 0, and no other processor or driver may program COM1
-    /// while the value is used. Accesses through it reach only COM1's registers
-    /// 0x3F8–0x3FD, which cannot affect memory.
-    pub(crate) unsafe fn new() -> Self {
-        Self(())
-    }
-}
-
-impl UartRegisters for Com1 {
-    fn read(&mut self, reg: Register) -> u8 {
-        // SAFETY: `Com1::new`'s contract (CPL 0, COM1 owned by the kernel), and the port is
-        // one of COM1's registers, so the read cannot affect memory.
-        unsafe { inb(COM1_BASE + reg.offset()) }
-    }
-
-    fn write(&mut self, reg: Register, value: u8) {
-        // SAFETY: as for `read`.
-        unsafe { outb(COM1_BASE + reg.offset(), value) }
     }
 }
 

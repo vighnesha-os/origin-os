@@ -9,9 +9,14 @@
 //! Ethernet/IPv4/UDP frames) — and receive is interrupt-driven: for every frame the thread
 //! sleeps on a wait queue that only the NIC's interrupt handler wakes.
 //!
-//! The ring memory is zeroed DMA pages (`storage::dma_page`): the direct map makes them
-//! physically contiguous and gives their physical addresses, and x86 DMA is cache-coherent.
-//! The `unsafe` here is volatile MMIO and forming slices over those DMA pages.
+//! The ring memory is zeroed DMA pages (`dma::DeviceDma`). When the device offers
+//! `VIRTIO_F_ACCESS_PLATFORM` its DMA goes through the IOMMU: the driver accepts the feature,
+//! attaches the device to a domain of its own and gives it IOVAs (ADR-0007); otherwise the
+//! device uses physical addresses (virtio 1.1 §6). x86 DMA is cache-coherent. The MSI-X
+//! entries are programmed through `iommu::msi_message` (remappable handles when interrupts
+//! are remapped). The `unsafe` here is volatile MMIO and volatile access to those DMA pages
+//! (`DeviceMem`): the device can write them at any moment, so no reference ever covers them
+//! and a received frame is copied out once, into kernel memory, before anything parses it.
 
 use core::fmt::Write;
 use core::ptr;
@@ -20,10 +25,11 @@ use core::sync::atomic::{AtomicU64, Ordering, fence};
 use framekernel::net::{self, Arp, EthFrame, Ipv4, Mac, arp_op, ethertype};
 use framekernel::pci::{self, Address};
 use framekernel::virtio::{self, feature, status};
-use framekernel::virtqueue::{self, Descriptor, F_WRITE};
+use framekernel::virtqueue::{self, Descriptor, F_WRITE, RingMemory};
 use origin_sync::SpinLock;
 
 use crate::console::Console;
+use crate::dma::{DeviceDma, DmaPage};
 use crate::wait::WaitQueue;
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
@@ -38,9 +44,42 @@ const TX_MSIX_ENTRY: u16 = 2;
 /// virtio's "no MSI-X vector" sentinel.
 const NO_VECTOR: u16 = 0xFFFF;
 
+/// The device, its MSI-X table (mapped) and the x2APIC ID its entries target, once set up.
+static NET_MSIX: SpinLock<Option<(Address, u64, u32)>> = SpinLock::new(None);
+
+/// The messages in the NIC's receive and transmit MSI-X entries, each with the vector and
+/// the processor it must reach (for the interrupt-remapping proof); empty before bring-up.
+pub(crate) fn msix_routes() -> alloc::vec::Vec<(Address, framekernel::vtd::MsiMessage, u8, u32)> {
+    let Some((at, table, target)) = crate::cpu::without_interrupts(|| *NET_MSIX.lock()) else {
+        return alloc::vec::Vec::new();
+    };
+    let word = |entry: u16, w: u64| {
+        let p = ptr::with_exposed_provenance::<u32>(
+            (table + u64::from(entry) * pci::MSIX_ENTRY + 4 * w) as usize,
+        );
+        // SAFETY: inside the MSI-X table (`enable_msix_table` checked it against its BAR and
+        // mapped it uncached; both entries are below its entry count). Reading an entry has
+        // no effect on the device.
+        unsafe { p.read_volatile() }
+    };
+    [
+        (RX_MSIX_ENTRY, crate::cpu::NET_VECTOR),
+        (TX_MSIX_ENTRY, crate::cpu::NET_TX_VECTOR),
+    ]
+    .into_iter()
+    .map(|(entry, vector)| {
+        let message = framekernel::vtd::MsiMessage {
+            address: u64::from(word(entry, 0)) | u64::from(word(entry, 1)) << 32,
+            data: word(entry, 2),
+        };
+        (at, message, vector, target)
+    })
+    .collect()
+}
+
 /// Counts the virtio-net MSI-X interrupts the device has raised.
 static NET_IRQS: AtomicU64 = AtomicU64::new(0);
-/// The processor the last NIC interrupt arrived on, plus one (0: none yet).
+/// The CPU index the last NIC interrupt arrived on, plus one (0: none yet).
 static NET_IRQ_CPU: AtomicU64 = AtomicU64::new(0);
 /// The receive thread sleeps here until a used-buffer interrupt wakes it.
 static NET_WAIT: WaitQueue = WaitQueue::new();
@@ -51,11 +90,20 @@ static NET_WAKES: AtomicU64 = AtomicU64::new(0);
 /// interrupt and wakes the receive thread, which then reads the used ring itself.
 pub(crate) fn on_interrupt() {
     NET_IRQS.fetch_add(1, Ordering::Relaxed);
-    NET_IRQ_CPU.store(crate::cpu::cpu_id() + 1, Ordering::Relaxed);
+    NET_IRQ_CPU.store(
+        (crate::cpu::this_cpu().get() as u64).saturating_add(1),
+        Ordering::Relaxed,
+    );
     if NET_WAIT.wake_one() {
         NET_WAKES.fetch_add(1, Ordering::Relaxed);
     }
 }
+
+/// The bytes of the common configuration structure this driver uses: through the 64-bit
+/// device-area address at 30h.
+const COMMON_CONFIG_LEN: u32 = 56;
+/// The bytes of the device configuration it reads: the MAC and the status word.
+const DEVICE_CONFIG_LEN: u32 = 8;
 
 // Common-configuration register offsets (virtio 1.1 §4.1.4.3).
 mod reg {
@@ -107,13 +155,94 @@ fn w64(a: u64, v: u64) {
     w32(a + 4, (v >> 32) as u32);
 }
 
-/// A byte-slice view over a DMA page (for the virtqueue helpers to read and write).
-fn page(virt: u64, len: usize) -> &'static mut [u8] {
-    // SAFETY: `virt` is a live, kept-forever DMA page from `storage::dma_page` of at least
-    // one 4 KiB page; `len` is within it. The device accesses it coherently by physical
-    // address; this view is used only while no request is outstanding on it.
-    unsafe {
-        core::slice::from_raw_parts_mut(ptr::with_exposed_provenance_mut::<u8>(virt as usize), len)
+/// The bytes of one DMA page.
+const DMA_PAGE: usize = 4096;
+
+/// One DMA page the device may write at any moment: a ring, or a frame buffer. The kernel
+/// touches it only through the volatile accesses here, so no Rust reference ever covers
+/// device-writable memory. A ring field is one aligned load or store of its own width, so it
+/// cannot tear; frame bytes are copied once, into or out of kernel memory.
+#[derive(Clone, Copy)]
+struct DeviceMem {
+    virt: u64,
+}
+
+impl DeviceMem {
+    /// The page `DeviceDma::page` handed out (kept for ever, so the address stays valid).
+    fn of(page: DmaPage) -> Self {
+        Self { virt: page.virt }
+    }
+
+    /// Where a `T` at byte offset `at` lives, if it is inside the page and aligned.
+    fn field<T>(self, at: usize) -> Option<*mut T> {
+        let end = at.checked_add(size_of::<T>())?;
+        (end <= DMA_PAGE && at.is_multiple_of(align_of::<T>()))
+            .then(|| ptr::with_exposed_provenance_mut::<T>(self.virt as usize + at))
+    }
+
+    /// Reads a `T` at `at`; zero for one outside the page or misaligned. (`virtqueue` keeps
+    /// every field inside a page and aligned.)
+    fn load<T: Copy + Default>(self, at: usize) -> T {
+        self.field::<T>(at).map_or_else(T::default, |p| {
+            // SAFETY: `p` is aligned and inside this page (`field`), which stays allocated for
+            // ever. A volatile load forms no reference; the device may write it concurrently.
+            unsafe { p.read_volatile() }
+        })
+    }
+
+    /// Writes a `T` at `at`, if that is inside the page and aligned.
+    fn store<T: Copy>(self, at: usize, value: T) {
+        if let Some(p) = self.field::<T>(at) {
+            // SAFETY: as `load`; the kernel owns this field's value until it publishes it.
+            unsafe { p.write_volatile(value) };
+        }
+    }
+
+    /// Copies `out.len()` bytes from offset `at` into `out` with volatile reads; `false` if
+    /// they are not all inside the page.
+    fn copy_out(self, at: usize, out: &mut [u8]) -> bool {
+        if at.checked_add(out.len()).is_none_or(|end| end > DMA_PAGE) {
+            return false;
+        }
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = self.load(at + i);
+        }
+        true
+    }
+
+    /// Copies `bytes` to offset `at` with volatile writes; `false` if they do not fit.
+    fn copy_in(self, at: usize, bytes: &[u8]) -> bool {
+        if at.checked_add(bytes.len()).is_none_or(|end| end > DMA_PAGE) {
+            return false;
+        }
+        for (i, &byte) in bytes.iter().enumerate() {
+            self.store(at + i, byte);
+        }
+        true
+    }
+}
+
+impl RingMemory for DeviceMem {
+    fn byte_len(&self) -> usize {
+        DMA_PAGE
+    }
+    fn read_u16(&self, at: usize) -> u16 {
+        u16::from_le(self.load(at))
+    }
+    fn read_u32(&self, at: usize) -> u32 {
+        u32::from_le(self.load(at))
+    }
+    fn read_u64(&self, at: usize) -> u64 {
+        u64::from_le(self.load(at))
+    }
+    fn write_u16(&mut self, at: usize, value: u16) {
+        self.store(at, value.to_le());
+    }
+    fn write_u32(&mut self, at: usize, value: u32) {
+        self.store(at, value.to_le());
+    }
+    fn write_u64(&mut self, at: usize, value: u64) {
+        self.store(at, value.to_le());
     }
 }
 
@@ -121,9 +250,9 @@ fn page(virt: u64, len: usize) -> &'static mut [u8] {
 #[derive(Clone, Copy)]
 struct Queue {
     size: usize,
-    desc: u64,
-    avail: u64,
-    used: u64,
+    desc: DeviceMem,
+    avail: DeviceMem,
+    used: DeviceMem,
     notify_off: u16,
 }
 
@@ -135,6 +264,8 @@ struct Setup {
     mul: u32,
     rx: Queue,
     mac: [u8; 6],
+    /// How the device reaches memory: the receive buffers are mapped through it.
+    dma: DeviceDma,
 }
 static SETUP: SpinLock<Option<Setup>> = SpinLock::new(None);
 
@@ -153,12 +284,14 @@ struct TxRing {
     q: Queue,
     notify_base: u64,
     mul: u32,
-    /// Each descriptor's buffer: (virtual, physical).
-    bufs: [(u64, u64); N_TX],
+    /// Each descriptor's buffer: (where the kernel reaches it, bus address).
+    bufs: [(DeviceMem, u64); N_TX],
     free: virtqueue::FreeList,
     in_flight: [bool; N_TX],
     /// The used ring is consumed up to here.
     last_used: u16,
+    /// The device broke the ring's rules: nothing more is sent or reclaimed.
+    fault: bool,
     sent: u64,
     reclaimed: u64,
 }
@@ -177,6 +310,8 @@ static TX_WAKES: AtomicU64 = AtomicU64::new(0);
 static TX_FULL: AtomicU64 = AtomicU64::new(0);
 /// How often a transmitter blocked on [`TX_WAIT`].
 static TX_SLEPT: AtomicU64 = AtomicU64::new(0);
+/// How often the device claimed more completions than a ring holds.
+static DEVICE_FAULTS: AtomicU64 = AtomicU64::new(0);
 
 /// Called from the NIC's TX-completion vector (`cpu::NET_TX_VECTOR`): counts it and wakes
 /// a transmitter waiting for a descriptor, which then reclaims the completions itself.
@@ -199,39 +334,45 @@ static RX_LEASE: AtomicU64 = AtomicU64::new(0);
 /// How often the receive thread blocked waiting for a frame.
 static RX_BLOCKED: AtomicU64 = AtomicU64::new(0);
 
-/// Maps the BAR holding capability `loc` and returns the virtual address of its structure.
-fn map_structure(dev: &crate::pcie::Device, loc: virtio::CfgLocation) -> Option<u64> {
-    let bar = dev.bars.get(loc.bar as usize)?.as_ref()?;
+/// Maps the BAR holding capability `loc` and returns the virtual address of its structure,
+/// which must lie inside that memory BAR and be at least `min` bytes long: the offset and
+/// length are the device's, and the driver reads and writes through this address.
+fn map_structure(dev: &crate::pcie::Device, loc: virtio::CfgLocation, min: u32) -> Option<u64> {
+    let bar = dev.bars.get(usize::from(loc.bar))?.as_ref()?;
+    let address = loc.address_in(bar, min)?;
     let base = crate::vm::map_mmio(bar.address, bar.size).ok()?;
-    Some(base + u64::from(loc.offset))
+    Some(base + (address - bar.address))
 }
 
-/// Sets up queue `q`: a smaller-of device size and 256 ring in three DMA pages, with the
-/// physical addresses programmed, its MSI-X `vector` assigned (`NO_VECTOR` for none), and
+/// Sets up queue `q`: a smaller-of device size and 256 ring in three DMA pages (from `dma`),
+/// with their bus addresses programmed, its MSI-X `vector` assigned (`NO_VECTOR` for none), and
 /// the queue enabled. MSI-X must already be enabled on the function for a real vector to
-/// take.
-fn setup_queue(common: u64, q: u16, vector: u16) -> Option<Queue> {
+/// take. `None` if the device offers no queue, one whose size is not a power of two, or a
+/// notification register outside its notification structure `notify`.
+fn setup_queue(
+    common: u64,
+    q: u16,
+    vector: u16,
+    dma: DeviceDma,
+    notify: virtio::CfgLocation,
+    mul: u32,
+) -> Option<Queue> {
     w16(common + reg::QUEUE_SELECT, q);
-    let dev_size = r16(common + reg::QUEUE_SIZE);
-    if dev_size == 0 {
-        return None; // queue not available
-    }
-    let size = dev_size.min(256) as usize;
+    let size = virtqueue::queue_size(r16(common + reg::QUEUE_SIZE), 256)?;
     w16(common + reg::QUEUE_SIZE, size as u16);
     let notify_off = r16(common + reg::QUEUE_NOTIFY_OFF);
-    let (dv, dp) = crate::storage::dma_page()?;
-    let (av, ap) = crate::storage::dma_page()?;
-    let (uv, up) = crate::storage::dma_page()?;
-    w64(common + reg::QUEUE_DESC, dp);
-    w64(common + reg::QUEUE_DRIVER, ap);
-    w64(common + reg::QUEUE_DEVICE, up);
+    notify.notify_offset(notify_off, mul)?;
+    let (d, a, u) = (dma.page()?, dma.page()?, dma.page()?);
+    w64(common + reg::QUEUE_DESC, d.bus);
+    w64(common + reg::QUEUE_DRIVER, a.bus);
+    w64(common + reg::QUEUE_DEVICE, u.bus);
     w16(common + reg::QUEUE_MSIX_VECTOR, vector);
     w16(common + reg::QUEUE_ENABLE, 1);
     Some(Queue {
         size,
-        desc: dv,
-        avail: av,
-        used: uv,
+        desc: DeviceMem::of(d),
+        avail: DeviceMem::of(a),
+        used: DeviceMem::of(u),
         notify_off,
     })
 }
@@ -251,17 +392,16 @@ fn enable_msix_table(dev: &crate::pcie::Device, target: u32) -> bool {
         return false;
     };
     let table_len = u64::from(msix.entries) * pci::MSIX_ENTRY;
-    if u64::from(msix.table_offset) + table_len > bar.size {
-        return false;
-    }
-    let Ok(table) = crate::vm::map_mmio(bar.address + u64::from(msix.table_offset), table_len)
-    else {
+    let Some(table_address) = msix.table_address(&bar) else {
         return false;
     };
-    let (Some(address), Some(rx_data), Some(tx_data)) = (
-        pci::msi_address(target),
-        pci::msi_data(crate::cpu::NET_VECTOR),
-        pci::msi_data(crate::cpu::NET_TX_VECTOR),
+    let Ok(table) = crate::vm::map_mmio(table_address, table_len) else {
+        return false;
+    };
+    let at = dev.function.at;
+    let (Ok(rx_message), Ok(tx_message)) = (
+        crate::iommu::msi_message(at, target, crate::cpu::NET_VECTOR),
+        crate::iommu::msi_message(at, target, crate::cpu::NET_TX_VECTOR),
     ) else {
         return false;
     };
@@ -278,13 +418,16 @@ fn enable_msix_table(dev: &crate::pcie::Device, target: u32) -> bool {
     }
     // Receive completions on `NET_VECTOR`, transmit completions on `NET_TX_VECTOR`, both to
     // `target`; every other entry stays masked.
-    for (index, data) in [(RX_MSIX_ENTRY, rx_data), (TX_MSIX_ENTRY, tx_data)] {
+    for (index, message) in [(RX_MSIX_ENTRY, rx_message), (TX_MSIX_ENTRY, tx_message)] {
         let i = u64::from(index);
-        entry(i, 0, address as u32);
-        entry(i, 1, (address >> 32) as u32);
-        entry(i, 2, data);
+        entry(i, 0, message.address as u32);
+        entry(i, 1, (message.address >> 32) as u32);
+        entry(i, 2, message.data);
         entry(i, 3, 0); // unmask
     }
+    crate::cpu::without_interrupts(|| {
+        *NET_MSIX.lock() = Some((at, table, target));
+    });
     let Some(control) = crate::pcie::enable_msix(dev.function.at, &msix) else {
         return false;
     };
@@ -303,22 +446,25 @@ const N_RX: usize = 8;
 const RX_BUF: usize = 2048;
 
 /// Posts [`N_RX`] device-writable receive buffers on the RX queue (descriptor `i` → buffer
-/// `i`), returning their virtual addresses, then notifies the device.
-fn post_rx(rx: &Queue, notify_base: u64, mul: u32) -> Option<[u64; N_RX]> {
-    let mut pages = [0u64; N_RX];
-    let desc = page(rx.desc, virtqueue::desc_bytes(rx.size));
-    let avail = page(rx.avail, virtqueue::avail_bytes(rx.size));
+/// `i`), returning those buffers, then notifies the device.
+fn post_rx(rx: &Queue, notify_base: u64, mul: u32, dma: DeviceDma) -> Option<[DeviceMem; N_RX]> {
+    // The queue's size is the device's: a shorter ring has no descriptor `i` for every buffer.
+    if rx.size < N_RX {
+        return None;
+    }
+    let mut pages = [DeviceMem { virt: 0 }; N_RX];
+    let (mut desc, mut avail) = (rx.desc, rx.avail);
     for (i, slot) in pages.iter_mut().enumerate() {
-        let (v, p) = crate::storage::dma_page()?;
-        *slot = v;
+        let page = dma.page()?;
+        *slot = DeviceMem::of(page);
         Descriptor {
-            addr: p,
+            addr: page.bus,
             len: RX_BUF as u32,
             flags: F_WRITE,
             next: 0,
         }
-        .write(desc, i);
-        virtqueue::avail_push(avail, rx.size, i as u16);
+        .write(&mut desc, i);
+        virtqueue::avail_push(&mut avail, rx.size, i as u16);
     }
     notify(notify_base, rx.notify_off, mul, Q_RX);
     Some(pages)
@@ -327,13 +473,14 @@ fn post_rx(rx: &Queue, notify_base: u64, mul: u32) -> Option<[u64; N_RX]> {
 impl TxRing {
     /// A ring over `q` with one buffer page, allocated now and kept, for each of its first
     /// [`N_TX`] descriptors.
-    fn new(q: Queue, notify_base: u64, mul: u32) -> Option<Self> {
+    fn new(q: Queue, notify_base: u64, mul: u32, dma: DeviceDma) -> Option<Self> {
         if q.size < N_TX {
             return None;
         }
-        let mut bufs = [(0, 0); N_TX];
+        let mut bufs = [(DeviceMem { virt: 0 }, 0); N_TX];
         for buf in &mut bufs {
-            *buf = crate::storage::dma_page()?;
+            let page = dma.page()?;
+            *buf = (DeviceMem::of(page), page.bus);
         }
         Some(Self {
             q,
@@ -343,6 +490,7 @@ impl TxRing {
             free: virtqueue::FreeList::new(N_TX),
             in_flight: [false; N_TX],
             last_used: 0,
+            fault: false,
             sent: 0,
             reclaimed: 0,
         })
@@ -350,25 +498,35 @@ impl TxRing {
 
     /// Whether the device has completed frames that are not reclaimed yet.
     fn completion_pending(&self) -> bool {
-        r16(self.q.used + 2) != self.last_used
+        virtqueue::used_idx(&self.q.used) != self.last_used
     }
 
-    /// Returns every completed frame's descriptor to the free list. The device reports the
-    /// ids: one out of range or not in flight is consumed but never freed (so never twice).
+    /// Returns completed frames' descriptors to the free list: at most a ring's worth per
+    /// call, however the device moves its index, since this runs with interrupts off. The
+    /// device reports the ids: one out of range or not in flight is consumed but never freed
+    /// (so never twice). An index that claims more than the ring holds is a device fault, and
+    /// the ring is finished.
     fn reclaim(&mut self) {
-        while self.completion_pending() {
-            fence(Ordering::SeqCst);
-            let slot = usize::from(self.last_used) % self.q.size;
-            let (id, _) =
-                virtqueue::used_elem(page(self.q.used, virtqueue::used_bytes(self.q.size)), slot);
-            self.last_used = self.last_used.wrapping_add(1);
-            if let Some(busy) = self.in_flight.get_mut(id as usize)
-                && *busy
-            {
-                *busy = false;
-                self.free.free(id as u16);
-                self.reclaimed += 1;
-            }
+        if self.fault {
+            return;
+        }
+        let reaped = virtqueue::reap(
+            &self.q.used,
+            self.q.size,
+            &mut self.last_used,
+            |id, _len| {
+                if let Some(busy) = self.in_flight.get_mut(id as usize)
+                    && *busy
+                {
+                    *busy = false;
+                    self.free.free(id as u16);
+                    self.reclaimed += 1;
+                }
+            },
+        );
+        if reaped.is_err() {
+            self.fault = true;
+            DEVICE_FAULTS.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -385,31 +543,28 @@ impl TxRing {
             return false;
         };
         let i = usize::from(id);
-        let Some(&(virt, phys)) = self.bufs.get(i) else {
+        let Some(&(buffer, bus)) = self.bufs.get(i) else {
             self.free.free(id); // cannot happen: the free list holds only 0..N_TX
             return false;
         };
         // The descriptor is free, so the device is done with this buffer.
         let hdr = virtio::NetHeader::plain().encode();
         let total = hdr.len() + frame.len();
-        let buf = page(virt, 4096);
-        buf[..hdr.len()].copy_from_slice(&hdr);
-        buf[hdr.len()..total].copy_from_slice(frame);
+        if !(buffer.copy_in(0, &hdr) && buffer.copy_in(hdr.len(), frame)) {
+            self.free.free(id); // cannot happen: `transmit_with` checked the frame fits
+            return false;
+        }
         Descriptor {
-            addr: phys,
+            addr: bus,
             len: total as u32,
             flags: 0,
             next: 0,
         }
-        .write(page(self.q.desc, virtqueue::desc_bytes(self.q.size)), i);
+        .write(&mut self.q.desc, i);
         if let Some(busy) = self.in_flight.get_mut(i) {
             *busy = true;
         }
-        virtqueue::avail_push(
-            page(self.q.avail, virtqueue::avail_bytes(self.q.size)),
-            self.q.size,
-            id,
-        );
+        virtqueue::avail_push(&mut self.q.avail, self.q.size, id);
         self.sent += 1;
         if kick {
             self.kick();
@@ -434,34 +589,48 @@ fn tx_kick_then_pending() -> bool {
     })
 }
 
-/// Sleeps on [`TX_WAIT`] until a TX completion is pending (see [`tx_kick_then_pending`]).
-fn tx_sleep_for_completion() {
-    let blocked = TX_WAIT.wait_until(tx_kick_then_pending);
-    TX_SLEPT.fetch_add(blocked, Ordering::Relaxed);
+/// Sleeps on [`TX_WAIT`] until a TX completion is pending (see [`tx_kick_then_pending`]);
+/// `false` once `deadline` (monotonic nanoseconds) has passed. Checked first as well as
+/// inside the wait, so a device that always reports another completion cannot hold a
+/// transmitter past it.
+fn tx_sleep_for_completion(deadline: u64) -> bool {
+    if crate::time::monotonic_nanos() >= deadline {
+        return false;
+    }
+    match TX_WAIT.wait_until_deadline(tx_kick_then_pending, deadline) {
+        Ok(blocked) => {
+            TX_SLEPT.fetch_add(blocked, Ordering::Relaxed);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Transmits `frame` (a complete Ethernet frame) through the TX ring, kicking the device now
 /// when `kick`, or leaving it queued for a later kick (a batch). It reclaims completed
 /// descriptors first, and while every descriptor is in flight sleeps on [`TX_WAIT`] until
 /// the NIC's TX-completion interrupt reports one done (a kernel thread sleeps; the boot flow
-/// yields). Returns whether the frame was queued.
+/// yields), for at most [`REPLY_TIMEOUT_NS`]. Returns whether the frame was queued.
 fn transmit_with(frame: &[u8], kick: bool) -> bool {
-    if virtio::NET_HDR_LEN + frame.len() > 4096 {
+    if virtio::NET_HDR_LEN + frame.len() > DMA_PAGE {
         return false;
     }
+    let deadline = reply_deadline();
     loop {
         let queued = crate::cpu::without_interrupts(|| {
             let mut ring = TX.lock();
             let ring = ring.as_mut()?;
             ring.reclaim();
-            Some(ring.enqueue(frame, kick))
+            (!ring.fault).then(|| ring.enqueue(frame, kick))
         });
         match queued {
             None => return false,
             Some(true) => return true,
             Some(false) => {
                 TX_FULL.fetch_add(1, Ordering::Relaxed);
-                tx_sleep_for_completion();
+                if !tx_sleep_for_completion(deadline) {
+                    return false;
+                }
             }
         }
     }
@@ -473,19 +642,20 @@ fn transmit(frame: &[u8]) -> bool {
 }
 
 /// Kicks the device and sleeps on [`TX_WAIT`] until every queued frame has completed and
-/// its descriptor is back in the pool.
+/// its descriptor is back in the pool, or [`REPLY_TIMEOUT_NS`] has passed (or the device has
+/// faulted): what is still in flight then shows in the TX report.
 fn tx_flush() {
+    let deadline = reply_deadline();
     loop {
         let idle = crate::cpu::without_interrupts(|| {
             TX.lock().as_mut().is_none_or(|ring| {
                 ring.reclaim();
-                ring.free.available() == N_TX
+                ring.fault || ring.free.available() == N_TX
             })
         });
-        if idle {
+        if idle || !tx_sleep_for_completion(deadline) {
             return;
         }
-        tx_sleep_for_completion();
     }
 }
 
@@ -494,7 +664,7 @@ fn tx_flush() {
 /// returned goes back to the device at the next `recv`, so the ring never runs dry.
 struct RxRing {
     q: Queue,
-    pages: [u64; N_RX],
+    pages: [DeviceMem; N_RX],
     notify_base: u64,
     mul: u32,
     /// The used ring is consumed up to here.
@@ -504,13 +674,18 @@ struct RxRing {
     posted: [bool; N_RX],
     /// The buffer holding the frame the last `recv` returned.
     held: Option<u16>,
+    /// Where each received frame is copied, once, for everything after `recv` to parse: the
+    /// device cannot write here.
+    frame: [u8; RX_BUF],
+    /// The device broke the ring's rules: nothing more is read from it.
+    fault: bool,
     received: u64,
     recycled: u64,
 }
 
 impl RxRing {
     /// The ring over `q` whose buffers `post_rx` posted at `pages`.
-    fn new(q: Queue, pages: [u64; N_RX], notify_base: u64, mul: u32) -> Self {
+    fn new(q: Queue, pages: [DeviceMem; N_RX], notify_base: u64, mul: u32) -> Self {
         Self {
             q,
             pages,
@@ -519,16 +694,20 @@ impl RxRing {
             last_used: 0,
             posted: [true; N_RX],
             held: None,
+            frame: [0; RX_BUF],
+            fault: false,
             received: 0,
             recycled: 0,
         }
     }
 
     /// Hands the previous frame's buffer back to the device, then sleeps until the next
-    /// received frame and returns its Ethernet bytes (the virtio-net header stripped), or
-    /// `None` if none arrives by `deadline` (monotonic nanoseconds). The slice is valid until
-    /// the next `recv` (the borrow of `self` enforces it). An empty slice means a malformed
-    /// completion the caller should skip.
+    /// received frame, copies it once into kernel memory and returns its Ethernet bytes (the
+    /// virtio-net header stripped), or `None` by `deadline` (monotonic nanoseconds), whether
+    /// nothing came or the device keeps reporting frames, and from then on if the device
+    /// breaks the ring's rules. The slice is valid until the next `recv` (the borrow of
+    /// `self` enforces it). An empty slice means a malformed completion the caller should
+    /// skip.
     ///
     /// The running kernel thread blocks on [`NET_WAIT`]; the NIC's used-buffer interrupt
     /// (`on_interrupt`) wakes it as a frame arrives, and the deadline is only a backstop for
@@ -536,32 +715,44 @@ impl RxRing {
     /// reads the used ring itself, so a frame that arrived before the thread registered is
     /// seen at once and no wake-up is lost.
     fn recv(&mut self, deadline: u64) -> Option<&[u8]> {
+        if self.fault {
+            return None;
+        }
         if let Some(id) = self.held.take() {
             // Its descriptor still describes the same page, so publishing the id is enough.
             if let Some(posted) = self.posted.get_mut(usize::from(id)) {
                 *posted = true;
             }
-            virtqueue::avail_push(
-                page(self.q.avail, virtqueue::avail_bytes(self.q.size)),
-                self.q.size,
-                id,
-            );
+            virtqueue::avail_push(&mut self.q.avail, self.q.size, id);
             notify(self.notify_base, self.q.notify_off, self.mul, Q_RX);
             self.recycled += 1;
         }
+        // Checked first as well as inside the wait: otherwise a device whose index always
+        // shows another frame would keep a caller looping past its deadline.
+        if crate::time::monotonic_nanos() >= deadline {
+            return None;
+        }
         let (used, last) = (self.q.used, self.last_used);
         let blocked = NET_WAIT
-            .wait_until_deadline(|| r16(used + 2) != last, deadline)
+            .wait_until_deadline(|| virtqueue::used_idx(&used) != last, deadline)
             .ok()?;
         RX_BLOCKED.fetch_add(blocked, Ordering::Relaxed);
+        // The index moved, so a conforming device is now between 1 and a ring's worth ahead.
+        if !matches!(
+            virtqueue::used_advance(virtqueue::used_idx(&used), last, self.q.size),
+            Ok(1..)
+        ) {
+            self.fault = true;
+            DEVICE_FAULTS.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         fence(Ordering::SeqCst);
         let slot = usize::from(self.last_used) % self.q.size;
-        let (id, len) =
-            virtqueue::used_elem(page(self.q.used, virtqueue::used_bytes(self.q.size)), slot);
+        let (id, len) = virtqueue::used_elem(&used, slot);
         self.last_used = self.last_used.wrapping_add(1);
         self.received += 1;
         let (i, len) = (id as usize, len as usize);
-        let (Some(posted), Some(&virt)) = (self.posted.get_mut(i), self.pages.get(i)) else {
+        let (Some(posted), Some(&buffer)) = (self.posted.get_mut(i), self.pages.get(i)) else {
             return Some(&[]); // an id we never posted: nothing to read or recycle
         };
         if !*posted {
@@ -572,7 +763,10 @@ impl RxRing {
         if !(virtio::NET_HDR_LEN..=RX_BUF).contains(&len) {
             return Some(&[]);
         }
-        Some(&page(virt, RX_BUF)[virtio::NET_HDR_LEN..len])
+        let frame = self.frame.get_mut(..len - virtio::NET_HDR_LEN)?;
+        buffer
+            .copy_out(virtio::NET_HDR_LEN, frame)
+            .then_some(&*frame)
     }
 }
 
@@ -595,7 +789,14 @@ fn transmit_dhcp(our_mac: Mac, dhcp: &[u8], damage: bool) -> bool {
     let any = Ipv4([0, 0, 0, 0]);
     let bcast = Ipv4([255, 255, 255, 255]);
     let mut udp = [0u8; 640];
-    let Some(un) = net::Udp::write(any, bcast, 68, 67, dhcp, &mut udp) else {
+    let Some(un) = net::Udp::write(
+        any,
+        bcast,
+        framekernel::dhcp::CLIENT_PORT,
+        framekernel::dhcp::SERVER_PORT,
+        dhcp,
+        &mut udp,
+    ) else {
         return false;
     };
     if damage {
@@ -621,38 +822,32 @@ fn transmit_dhcp(our_mac: Mac, dhcp: &[u8], damage: bool) -> bool {
     transmit(&frame[..fl])
 }
 
-/// Extracts the DHCP message (the UDP payload) from a received Ethernet frame addressed to
-/// the client port (68), or `None` if it is not such a datagram. The UDP checksum is not
-/// re-verified here (the IPv4 header checksum is, by `parse`).
-fn dhcp_payload(frame: &[u8]) -> Option<&[u8]> {
-    let eth = EthFrame::parse(frame)?;
-    if eth.ethertype != ethertype::IPV4 {
-        return None;
-    }
-    let ip = net::Ipv4Packet::parse(eth.payload)?;
-    if ip.protocol != net::protocol::UDP || ip.payload.len() < net::UDP_HEADER {
-        return None;
-    }
-    let dst_port = u16::from_be_bytes([ip.payload[2], ip.payload[3]]);
-    (dst_port == 68).then(|| &ip.payload[net::UDP_HEADER..])
-}
-
 /// QEMU's user-networking gateway, the address the datapath resolves by ARP.
 const GATEWAY: Ipv4 = Ipv4([10, 0, 2, 2]);
+/// The address the boot's ARP request for [`GATEWAY`] names as its sender: QEMU's user
+/// networking gives its first guest this address, and the lease comes only later.
+const ARP_REQUEST_SENDER: Ipv4 = Ipv4([10, 0, 2, 15]);
+
+/// The ARP request (operation 1) from `sender_ip` for `target_ip`.
+fn arp_request(our_mac: Mac, sender_ip: Ipv4, target_ip: Ipv4) -> Arp {
+    Arp {
+        operation: arp_op::REQUEST,
+        sender_mac: our_mac,
+        sender_ip,
+        target_mac: Mac([0; 6]),
+        target_ip,
+    }
+}
 
 /// Transmits an ARP request (a broadcast Ethernet frame) asking for `target_ip`, from
 /// `sender_ip`, kicking the device at once when `kick` (else it joins a batch). With both
 /// addresses equal it is a gratuitous announcement (RFC 5227 §2.3).
 fn send_arp(our_mac: Mac, sender_ip: Ipv4, target_ip: Ipv4, kick: bool) -> bool {
     let mut req = [0u8; net::ARP_LEN];
-    let request = Arp {
-        operation: arp_op::REQUEST,
-        sender_mac: our_mac,
-        sender_ip,
-        target_mac: Mac([0; 6]),
-        target_ip,
-    };
-    if request.write(&mut req).is_none() {
+    if arp_request(our_mac, sender_ip, target_ip)
+        .write(&mut req)
+        .is_none()
+    {
         return false;
     }
     let mut frame = [0u8; net::ETH_HEADER + net::ARP_LEN];
@@ -662,25 +857,20 @@ fn send_arp(our_mac: Mac, sender_ip: Ipv4, target_ip: Ipv4, kick: bool) -> bool 
     transmit_with(&frame[..fl], kick)
 }
 
-/// Sleeps for received frames until [`GATEWAY`]'s ARP reply arrives (at most four frames),
-/// returning the gateway's MAC.
-fn await_arp_reply(rx: &mut RxRing) -> Option<Mac> {
+/// Sleeps for received frames until the reply to `request` arrives, however many others
+/// come first, or its deadline passes; returns the MAC it gives. `Arp::answer_in` checks the
+/// reply against the request.
+fn await_arp_reply(rx: &mut RxRing, request: &Arp) -> Option<Mac> {
     let deadline = reply_deadline();
-    for _ in 0..4 {
+    loop {
         let Some(eth) = rx.recv(deadline) else {
             timed_out(waiting::ARP, 0);
             return None;
         };
-        if let Some(parsed) = EthFrame::parse(eth)
-            && parsed.ethertype == ethertype::ARP
-            && let Some(arp) = Arp::parse(parsed.payload)
-            && arp.operation == arp_op::REPLY
-            && arp.sender_ip == GATEWAY
-        {
-            return Some(arp.sender_mac);
+        if let Some(mac) = request.answer_in(eth) {
+            return Some(mac);
         }
     }
-    None
 }
 
 /// The identifier our echo requests carry ("OR").
@@ -736,12 +926,13 @@ fn send_ping(our_mac: Mac, dst_mac: Mac, src: Ipv4, dst: Ipv4, sequence: u16) ->
 }
 
 /// Sleeps for received frames until the echo reply to request `sequence` arrives from
-/// `from` to `to` (at most four frames). The reply must carry our identifier, the sequence
-/// and the request's data, with valid IPv4 and ICMP checksums.
+/// `from` to `to`, however many others come first, or its deadline passes. The reply must
+/// carry our identifier, the sequence and the request's data, with valid IPv4 and ICMP
+/// checksums.
 fn await_echo_reply(rx: &mut RxRing, from: Ipv4, to: Ipv4, sequence: u16) -> bool {
     let data = ping_data(sequence);
     let deadline = reply_deadline();
-    for _ in 0..4 {
+    loop {
         let Some(eth) = rx.recv(deadline) else {
             timed_out(waiting::ECHO, u64::from(sequence));
             return false;
@@ -761,7 +952,6 @@ fn await_echo_reply(rx: &mut RxRing, from: Ipv4, to: Ipv4, sequence: u16) -> boo
             return true;
         }
     }
-    false
 }
 
 /// Pings the gateway [`PINGS`] times from the leased address `ours`, unicast to the MAC the
@@ -788,14 +978,15 @@ fn ping_gateway(rx: &mut RxRing, our_mac: Mac, gateway_mac: Mac, ours: Ipv4) {
 /// The file fetched over TFTP: `xtask` points slirp's built-in TFTP server (`tftp=`) at
 /// `framekernel/assets`, the directory the kernel's own initramfs image comes from.
 const TFTP_FILE: &str = "initramfs.tar";
-/// Our UDP port for the transfer.
-const TFTP_CLIENT_PORT: u16 = 49152;
 /// The largest file the fetch accepts.
 const TFTP_LIMIT: usize = 64 * 1024;
 /// How long the reader waits for each packet before retransmitting what it sent last, and
 /// how many attempts it makes before giving up: together the 2 s budget of any other reply.
 const TFTP_ATTEMPT_NS: u64 = 500_000_000;
 const TFTP_ATTEMPTS: u32 = 4;
+/// The whole transfer's budget: far more than the largest file needs, and short of the boot
+/// flow's 10 s wait, so a server that keeps a transfer alive with repeats still ends it.
+const TFTP_TRANSFER_NS: u64 = 8_000_000_000;
 /// The boot proof drops the first read request on purpose — it goes out with a corrupted UDP
 /// checksum, which the server discards — so the reader's timeout-and-retransmit path runs on
 /// every boot, and the file must still arrive whole.
@@ -821,9 +1012,9 @@ static FETCHED: SpinLock<Option<alloc::vec::Vec<u8>>> = SpinLock::new(None);
 /// a reply that is not coming — quickly, and saying which.
 const REPLY_TIMEOUT_NS: u64 = 2_000_000_000;
 
-/// What the receive thread was waiting for when a wait timed out: the step in the high half,
-/// a detail (an echo sequence, a TFTP block) in the low half; 0 when none did. The first
-/// timeout wins.
+/// What the receive thread was waiting for when a wait timed out, or why it stopped short of
+/// a wait: the step in the high half, a detail (an echo sequence, a TFTP block) in the low
+/// half; 0 when neither happened. The first one wins.
 static TIMED_OUT: AtomicU64 = AtomicU64::new(0);
 
 /// The steps whose replies the receive thread waits for.
@@ -832,6 +1023,10 @@ mod waiting {
     pub(super) const DHCP: u64 = 2;
     pub(super) const ECHO: u64 = 3;
     pub(super) const TFTP: u64 = 4;
+    /// Not a wait: no hardware entropy for a transaction ID or port.
+    pub(super) const NO_ENTROPY: u64 = 5;
+    /// Not a wait: the DHCP server refused every restart.
+    pub(super) const DHCP_REFUSED: u64 = 6;
 }
 
 /// How long the DHCP exchange waits for each reply before retransmitting its last message,
@@ -852,7 +1047,36 @@ fn reply_deadline() -> u64 {
     crate::time::monotonic_nanos().saturating_add(REPLY_TIMEOUT_NS)
 }
 
-/// Records that the wait for `step` (with `detail`) timed out, unless an earlier one did.
+/// 64 bits of hardware entropy (RDSEED, else RDRAND, with `entropy::draw`'s bounded retries)
+/// for an identifier an off-path sender must not be able to guess: a DHCP transaction ID, a
+/// TFTP port. `None` when the processor gives none; the caller stops rather than use a
+/// predictable value.
+fn random_u64() -> Option<u64> {
+    use framekernel::entropy::{self, Source};
+    use framekernel::features::Features;
+
+    struct Hardware(Features);
+    impl Source for Hardware {
+        fn try_next(&mut self) -> Option<u64> {
+            if self.0.rdseed
+                && let Some(v) = crate::cpu::rdseed()
+            {
+                return Some(v);
+            }
+            if self.0.rdrand {
+                crate::cpu::rdrand()
+            } else {
+                None
+            }
+        }
+    }
+
+    let features = Features::decode(&crate::cpu::gather_cpuid());
+    entropy::draw(&mut Hardware(features), entropy::RDRAND_RETRIES)
+}
+
+/// Records why the receive thread stopped waiting for `step` (with `detail`), unless an
+/// earlier one did.
 fn timed_out(step: u64, detail: u64) {
     let _ = TIMED_OUT.compare_exchange(
         0,
@@ -878,6 +1102,17 @@ fn timeout_note(step: u64) -> alloc::string::String {
             );
         }
         waiting::ECHO => alloc::format!("the reply to echo request {detail}"),
+        waiting::NO_ENTROPY => {
+            return alloc::string::String::from(
+                "; no hardware entropy for a transaction ID or port",
+            );
+        }
+        waiting::DHCP_REFUSED => {
+            return alloc::format!(
+                "; the DHCP server refused the lease through {} restarts",
+                framekernel::dhcp::MAX_RESTARTS
+            );
+        }
         _ => {
             return alloc::format!(
                 "; timed out after {TFTP_ATTEMPTS} attempts of {} ms waiting for TFTP block {detail}",
@@ -923,22 +1158,19 @@ fn send_udp(
     transmit(&frame[..fl])
 }
 
-/// Sleeps for received frames until a UDP datagram from `from` to `to`:`port` arrives (at
-/// most `tries` frames, within `timeout_ns`), copies its payload into `out` and returns its
-/// source port and length. The IPv4 header checksum and the UDP checksum are verified; a datagram whose
-/// payload does not fit `out` is skipped.
+/// Sleeps for received frames until a UDP datagram from `from` to `to`:`port` arrives,
+/// however many others come first, copies its payload into `out` and returns its source port
+/// and length; `None` once `deadline` (monotonic nanoseconds) passes. The IPv4 header
+/// checksum and the UDP checksum are verified; a datagram whose payload does not fit `out`
+/// is skipped.
 fn await_udp(
     rx: &mut RxRing,
     (from, to, port): (Ipv4, Ipv4, u16),
-    tries: usize,
     out: &mut [u8],
-    timeout_ns: u64,
-) -> Result<(u16, usize), Missed> {
-    let deadline = crate::time::monotonic_nanos().saturating_add(timeout_ns);
-    for _ in 0..tries {
-        let Some(eth) = rx.recv(deadline) else {
-            return Err(Missed::TimedOut);
-        };
+    deadline: u64,
+) -> Option<(u16, usize)> {
+    loop {
+        let eth = rx.recv(deadline)?;
         if let Some(frame) = EthFrame::parse(eth)
             && frame.ethertype == ethertype::IPV4
             && let Some(packet) = net::Ipv4Packet::parse(frame.payload)
@@ -950,26 +1182,17 @@ fn await_udp(
             && let Some(dst) = out.get_mut(..udp.payload.len())
         {
             dst.copy_from_slice(udp.payload);
-            return Ok((udp.src_port, udp.payload.len()));
+            return Some((udp.src_port, udp.payload.len()));
         }
     }
-    Err(Missed::Strays)
-}
-
-/// Why [`await_udp`] came back without the datagram.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Missed {
-    /// Nothing arrived within the timeout.
-    TimedOut,
-    /// Frames arrived, none of them the datagram awaited.
-    Strays,
 }
 
 /// Fetches [`TFTP_FILE`] from the TFTP server on the gateway (`tftp::Download` drives the
-/// protocol): a read request to port 69 from the leased address, then each DATA block
-/// acknowledged to the port the server answers from, until the short final block — the
-/// thread sleeping on the receive interrupt for every block. Records the outcome and
-/// whether the file matches the image built into the kernel.
+/// protocol): a read request to port 69 from the leased address and a random client port,
+/// then each DATA block acknowledged to the port the server answers from, until the short
+/// final block — the thread sleeping on the receive interrupt for every block. Records the
+/// outcome and whether the file matches the image built into the kernel; only then is it
+/// handed on to be unpacked.
 fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
     use framekernel::tftp;
 
@@ -977,7 +1200,12 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
     let Some(n) = tftp::read_request(TFTP_FILE, &mut request) else {
         return;
     };
-    let ours_port = (ours, TFTP_CLIENT_PORT);
+    let Some(random) = random_u64() else {
+        timed_out(waiting::NO_ENTROPY, 0);
+        return;
+    };
+    let client_port = tftp::client_port(random);
+    let ours_port = (ours, client_port);
     // What was sent last and to which port: retransmitted when nothing comes back in time
     // (RFC 1350: the side waiting for a packet times out and retransmits its last one).
     let (mut last, mut last_len, mut last_port) = (request, n, tftp::PORT);
@@ -994,37 +1222,32 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
     let mut download = tftp::Download::new(TFTP_LIMIT);
     let mut server_port = None;
     let mut packet = [0u8; 4 + tftp::BLOCK];
-    let mut misses = 0;
-    // One frame per block, plus room for strays, for every attempt.
-    for _ in 0..(TFTP_LIMIT / tftp::BLOCK + 8) * TFTP_ATTEMPTS as usize {
-        let (port, len) = match await_udp(
-            rx,
-            (GATEWAY, ours, TFTP_CLIENT_PORT),
-            4,
-            &mut packet,
-            TFTP_ATTEMPT_NS,
-        ) {
-            Ok(got) => got,
-            Err(Missed::Strays) => continue,
-            Err(Missed::TimedOut) => {
-                misses += 1;
-                if misses >= TFTP_ATTEMPTS {
-                    timed_out(waiting::TFTP, u64::from(download.blocks()) + 1);
-                    break;
-                }
-                TFTP_RETRANSMITS.fetch_add(1, Ordering::Relaxed);
-                send_udp(
-                    our_mac,
-                    server_mac,
-                    ours_port,
-                    (GATEWAY, last_port),
-                    &last[..last_len],
-                    false,
-                );
-                continue;
+    let attempt = || crate::time::monotonic_nanos().saturating_add(TFTP_ATTEMPT_NS);
+    let transfer = crate::time::monotonic_nanos().saturating_add(TFTP_TRANSFER_NS);
+    // A packet that gets an answer (new data, or a repeat of a block, which must be acknowledged
+    // again) buys a new attempt; anything else (a stray, a packet from the wrong port) only uses
+    // up the current one. The whole transfer is bounded by `TFTP_TRANSFER_NS` either way.
+    let (mut deadline, mut misses) = (attempt(), 0);
+    while crate::time::monotonic_nanos() < transfer {
+        let Some((port, len)) = await_udp(rx, (GATEWAY, ours, client_port), &mut packet, deadline)
+        else {
+            misses += 1;
+            if misses >= TFTP_ATTEMPTS {
+                timed_out(waiting::TFTP, u64::from(download.blocks()) + 1);
+                break;
             }
+            TFTP_RETRANSMITS.fetch_add(1, Ordering::Relaxed);
+            send_udp(
+                our_mac,
+                server_mac,
+                ours_port,
+                (GATEWAY, last_port),
+                &last[..last_len],
+                false,
+            );
+            deadline = attempt();
+            continue;
         };
-        misses = 0;
         // The transfer continues with the port the server first answered from (its TID).
         if *server_port.get_or_insert(port) != port {
             continue;
@@ -1034,6 +1257,7 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
                 block,
                 last: final_block,
             } => {
+                (deadline, misses) = (attempt(), 0);
                 if let Some(an) = tftp::ack(block, &mut last) {
                     (last_len, last_port) = (an, port);
                     send_udp(
@@ -1061,23 +1285,38 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
     if let Some(tftp::Failure::Server(code)) = download.failure() {
         TFTP_ERROR.store(u64::from(code) + 1, Ordering::Relaxed);
     }
-    if download.is_complete() {
+    // Only bytes identical to the expected image go on to be parsed as an initramfs.
+    if identical {
         let file = download.into_data();
         crate::cpu::without_interrupts(|| *FETCHED.lock() = Some(file));
     }
 }
 
 /// Obtains a DHCP lease over the NIC: DISCOVER → OFFER → REQUEST → ACK with QEMU's built-in
-/// server, returning the leased address.
+/// server, returning the leased address. The transaction ID is random. A NAK starts over as a
+/// new transaction, a bounded number of times; every wait is bounded by its attempt deadline,
+/// and an attempt is renewed only by a retransmission or a step forward, whatever else
+/// arrives.
 fn dhcp_lease(rx: &mut RxRing, our_mac: Mac) -> Option<Ipv4> {
-    let mut client = framekernel::dhcp::Client::new(our_mac.0);
+    use framekernel::dhcp::{self, Action};
+
+    /// A new transaction ID, or `None` (recorded) with no entropy to draw one from.
+    fn new_xid() -> Option<u32> {
+        let random = random_u64();
+        if random.is_none() {
+            timed_out(waiting::NO_ENTROPY, 0);
+        }
+        random.map(|r| r as u32)
+    }
+
+    let mut client = dhcp::Client::new(our_mac.0);
     // The message sent last (the DISCOVER, then the REQUEST): retransmitted when no reply
     // comes within an attempt.
-    let mut last = client.start(0x4F52_4947);
+    let mut last = client.start(new_xid()?);
     transmit_dhcp(our_mac, &last, DHCP_INJECT_LOST_DISCOVER);
     let attempt = || crate::time::monotonic_nanos().saturating_add(DHCP_ATTEMPT_NS);
     let (mut deadline, mut misses) = (attempt(), 0);
-    for _ in 0..8 * DHCP_ATTEMPTS {
+    loop {
         let Some(eth) = rx.recv(deadline) else {
             misses += 1;
             if misses >= DHCP_ATTEMPTS {
@@ -1089,20 +1328,28 @@ fn dhcp_lease(rx: &mut RxRing, our_mac: Mac) -> Option<Ipv4> {
             deadline = attempt();
             continue;
         };
-        let Some(message) = dhcp_payload(eth) else {
+        let Some(message) = dhcp::message_in_frame(eth, our_mac.0) else {
             continue;
         };
         match client.on_receive(message) {
-            framekernel::dhcp::Action::Send(request) => {
+            Action::Send(request) => {
                 transmit_dhcp(our_mac, &request, false);
                 last = request;
                 (deadline, misses) = (attempt(), 0);
             }
-            framekernel::dhcp::Action::Bound(lease) => return Some(lease.address),
-            _ => {}
+            Action::Bound(lease) => return Some(lease.address),
+            Action::Restart => {
+                let Some(discover) = client.restart(new_xid()?) else {
+                    timed_out(waiting::DHCP_REFUSED, 0);
+                    return None;
+                };
+                transmit_dhcp(our_mac, &discover, false);
+                last = discover;
+                (deadline, misses) = (attempt(), 0);
+            }
+            Action::Ignore => {}
         }
     }
-    None
 }
 
 /// The receive thread: runs the live datapath over the queues the bring-up handed over,
@@ -1114,11 +1361,14 @@ fn dhcp_lease(rx: &mut RxRing, our_mac: Mac) -> Option<Ipv4> {
 extern "sysv64" fn net_thread(_: u64) -> ! {
     let setup = crate::cpu::without_interrupts(|| *SETUP.lock());
     if let Some(s) = setup
-        && let Some(rx_pages) = post_rx(&s.rx, s.notify_base, s.mul)
+        && let Some(rx_pages) = post_rx(&s.rx, s.notify_base, s.mul, s.dma)
     {
         let mut rx = RxRing::new(s.rx, rx_pages, s.notify_base, s.mul);
         RX_ARMED.store(1, Ordering::Release);
-        let gateway = await_arp_reply(&mut rx);
+        let gateway = await_arp_reply(
+            &mut rx,
+            &arp_request(Mac(s.mac), ARP_REQUEST_SENDER, GATEWAY),
+        );
         if let Some(gateway) = gateway {
             let packed = gateway.0.iter().fold(0u64, |a, &b| (a << 8) | u64::from(b));
             RX_GATEWAY.store(packed, Ordering::Relaxed);
@@ -1153,9 +1403,19 @@ extern "sysv64" fn net_thread(_: u64) -> ! {
     crate::sched::exit()
 }
 
+/// Polls the status register for 0 after a reset, with a bound: a device may take a moment, and
+/// one that never finishes must not hang the boot.
+fn reset_completed(common: u64) -> bool {
+    const POLLS: u32 = 1 << 20;
+    (0..POLLS).any(|_| {
+        core::hint::spin_loop();
+        r8(common + reg::DEVICE_STATUS) == 0
+    })
+}
+
 /// Brings up the virtio-net device, hands its queues to a receive thread on another
 /// processor (the boot one when there is no other), and reports the result (CLAUDE.md §54).
-pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
+pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u64) {
     let Some(dev) = crate::pcie::find(0x02, 0x00, 0x00) else {
         let _ = writeln!(
             com1,
@@ -1172,10 +1432,28 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         return;
     }
     let at: Address = dev.function.at;
-    // Enable memory-space decoding and bus mastering for DMA.
-    crate::pcie::enable(at, (1 << 1) | (1 << 2));
+    // Memory-space decoding for the registers. Bus mastering waits until the device has a
+    // DMA path (ADR-0007 I12).
+    if crate::pcie::enable_memory(at).is_none() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: virtio-net: memory decoding did not turn on: virtio-net failed"
+        );
+        return;
+    }
 
-    let caps = virtio::find_caps(|off| crate::pcie::read_config32(at, off).unwrap_or(0));
+    // Only structures in a memory BAR and inside it: this driver has no port I/O paths, and
+    // a device may list an I/O-BAR instance first (virtio 1.1 §4.1.4.1).
+    let bars = dev.bars;
+    let caps = virtio::find_caps(
+        |off| crate::pcie::read_config32(at, off).unwrap_or(0),
+        |loc| {
+            bars.get(usize::from(loc.bar))
+                .copied()
+                .flatten()
+                .is_some_and(|bar| loc.address_in(&bar, 1).is_some())
+        },
+    );
     let (Some(common_loc), Some(notify_loc), Some(dev_loc)) =
         (caps.common, caps.notify, caps.device)
     else {
@@ -1186,9 +1464,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         return;
     };
     let (Some(common), Some(notify_base), Some(devcfg)) = (
-        map_structure(&dev, common_loc),
-        map_structure(&dev, notify_loc),
-        map_structure(&dev, dev_loc),
+        map_structure(&dev, common_loc, COMMON_CONFIG_LEN),
+        map_structure(&dev, notify_loc, 2),
+        map_structure(&dev, dev_loc, DEVICE_CONFIG_LEN),
     ) else {
         let _ = writeln!(
             com1,
@@ -1197,8 +1475,16 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         return;
     };
 
-    // Status handshake: reset, acknowledge, driver.
+    // Status handshake: reset, acknowledge, driver. A device that does not read back 0 has not
+    // finished resetting (virtio 1.1 §2.1.2) and cannot be called idle below.
     w8(common + reg::DEVICE_STATUS, 0);
+    if !reset_completed(common) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: virtio-net: the device did not finish its reset: virtio-net failed"
+        );
+        return;
+    }
     let mut st = status::ACKNOWLEDGE;
     w8(common + reg::DEVICE_STATUS, st);
     st |= status::DRIVER;
@@ -1210,7 +1496,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     w32(common + reg::DEVICE_FEATURE_SELECT, 1);
     let fhi = r32(common + reg::DEVICE_FEATURE);
     let device_features = u64::from(fhi) << 32 | u64::from(flo);
-    let wanted = feature::VERSION_1 | feature::NET_MAC | feature::NET_STATUS;
+    let wanted =
+        feature::VERSION_1 | feature::NET_MAC | feature::NET_STATUS | feature::ACCESS_PLATFORM;
     let Some(accepted) = virtio::negotiate(device_features, wanted) else {
         let _ = writeln!(
             com1,
@@ -1226,22 +1513,58 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     st |= status::FEATURES_OK;
     w8(common + reg::DEVICE_STATUS, st);
     let features_ok = r8(common + reg::DEVICE_STATUS) & status::FEATURES_OK != 0;
+    if !features_ok {
+        // A device that refuses the features is unusable (virtio 1.1 §3.1.1): no bus mastering.
+        let _ = writeln!(
+            com1,
+            "origin-kernel: virtio-net: the device refused the negotiated features: virtio-net failed"
+        );
+        return;
+    }
+
+    // Behind the IOMMU (ACCESS_PLATFORM accepted), the device gets a domain of its own
+    // before its first DMA page; otherwise it uses physical addresses (virtio 1.1 §6).
+    let dma = if accepted & feature::ACCESS_PLATFORM != 0 {
+        match DeviceDma::attach(at) {
+            Ok(d) => d,
+            Err(why) => {
+                let _ = writeln!(com1, "origin-kernel: virtio-net: {why}: virtio-net failed");
+                return;
+            }
+        }
+    } else {
+        DeviceDma::Direct
+    };
+    // Bus mastering only now (ADR-0007 I12): the driver reset the device above, so it is idle
+    // and owns no queue yet. A device without VIRTIO_F_ACCESS_PLATFORM behind a translating
+    // IOMMU is refused here: it could not be confined.
+    match dma.enable_bus_master(at) {
+        Ok(command) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: virtio-net: bus mastering on after the device got its DMA path: command register {command:#06x}"
+            );
+        }
+        Err(why) => {
+            let _ = writeln!(com1, "origin-kernel: virtio-net: {why}: virtio-net failed");
+            return;
+        }
+    }
 
     // The receive thread runs on another processor when there is one (as the NVMe interrupt
     // proof does), and the NIC's MSI-X message is routed to that processor, so it idles until
     // the interrupt wakes it. Turn MSI-X on (so the queues can take vectors), with no
     // config-change interrupt, then set up the receive queue (interrupt on entry
     // RX_MSIX_ENTRY) and the transmit queue (no interrupt; its completion is polled).
-    let bsp = crate::cpu::cpu_id();
-    let target = cpus
-        .iter()
-        .copied()
-        .find(|&id| u64::from(id) != bsp)
-        .unwrap_or(bsp as u32);
-    let msix_enabled = enable_msix_table(&dev, target);
+    let bsp = crate::cpu::this_cpu();
+    let target = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let msix_enabled = target
+        .apic_id()
+        .is_some_and(|apic_id| enable_msix_table(&dev, apic_id));
     w16(common + reg::CONFIG_MSIX_VECTOR, NO_VECTOR);
-    let rx = setup_queue(common, Q_RX, RX_MSIX_ENTRY);
-    let tx = setup_queue(common, Q_TX, TX_MSIX_ENTRY);
+    let mul = caps.notify_off_multiplier;
+    let rx = setup_queue(common, Q_RX, RX_MSIX_ENTRY, dma, notify_loc, mul);
+    let tx = setup_queue(common, Q_TX, TX_MSIX_ENTRY, dma, notify_loc, mul);
     let queues_ok = rx.is_some() && tx.is_some();
     // Confirm each queue kept its vector (NO_VECTOR back means none was available).
     w16(common + reg::QUEUE_SELECT, Q_RX);
@@ -1267,10 +1590,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     // here, so the reply's interrupt is what wakes the sleeping thread. It then obtains a DHCP
     // lease itself. The boot flow waits for it, bounded, so a NIC whose interrupt never wakes
     // the thread fails here instead of hanging.
-    let mul = caps.notify_off_multiplier;
     let (mut spawned, mut arp_sent) = (false, false);
     if let (Some(rxq), Some(txq)) = (rx, tx)
-        && let Some(ring) = TxRing::new(txq, notify_base, mul)
+        && let Some(ring) = TxRing::new(txq, notify_base, mul, dma)
     {
         crate::cpu::without_interrupts(|| {
             *TX.lock() = Some(ring);
@@ -1279,9 +1601,10 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
                 mul,
                 rx: rxq,
                 mac,
+                dma,
             });
         });
-        spawned = crate::sched::spawn(target as usize, net_thread, 0).is_ok();
+        spawned = crate::sched::spawn(target, net_thread, 0).is_ok();
         if spawned {
             let armed_or_done =
                 || RX_ARMED.load(Ordering::Acquire) != 0 || RX_DONE.load(Ordering::Acquire) != 0;
@@ -1293,7 +1616,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
                 1,
             );
             if RX_ARMED.load(Ordering::Acquire) != 0 {
-                arp_sent = send_arp(Mac(mac), Ipv4([10, 0, 2, 15]), GATEWAY, true);
+                arp_sent = send_arp(Mac(mac), ARP_REQUEST_SENDER, GATEWAY, true);
             }
             crate::sched::yield_until(|| RX_DONE.load(Ordering::Acquire) != 0, tsc_hz, 10);
         }
@@ -1303,13 +1626,23 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
     let lease = RX_LEASE.load(Ordering::Relaxed);
     let blocked = RX_BLOCKED.load(Ordering::Relaxed);
     let wakes = NET_WAKES.load(Ordering::Relaxed);
+    let device_faults = DEVICE_FAULTS.load(Ordering::Relaxed);
+    let unarmed = RX_ARMED.load(Ordering::Acquire) == 0;
+    if !spawned || (finished && (device_faults != 0 || unarmed)) {
+        // Nothing drives the device: reset it and take bus mastering away again (I12).
+        w8(common + reg::DEVICE_STATUS, 0);
+        let _ = crate::pcie::clear_bus_master(at);
+    }
     let dhcp_retransmits = DHCP_RETRANSMITS.load(Ordering::Relaxed);
     let irqs = NET_IRQS.load(Ordering::Relaxed);
     let on = NET_IRQ_CPU.load(Ordering::Relaxed).saturating_sub(1);
     let last = if irqs == 0 {
         alloc::string::String::from("none arrived")
     } else {
-        alloc::format!("the last on CPU {on}")
+        match usize::try_from(on).ok().and_then(crate::cpu::CpuIndex::new) {
+            Some(c) => alloc::format!("the last on {}", c.named()),
+            None => alloc::string::String::from("the last on a processor without a CPU index"),
+        }
     };
 
     let mac_ok = mac == EXPECTED_MAC;
@@ -1327,19 +1660,27 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         && blocked > 0
         && wakes > 0
         && irqs > 0
-        && on == u64::from(target)
+        && on == target.get() as u64
+        && device_faults == 0
         && dhcp_retransmits == u64::from(DHCP_INJECT_LOST_DISCOVER);
     let g = gateway.to_be_bytes();
     let dhcp_ms = DHCP_ATTEMPT_NS / 1_000_000;
+    let fault_note = if device_faults != 0 {
+        "; device fault: a ring's used index ran past the ring"
+    } else {
+        ""
+    };
     let rx_note = alloc::format!(
-        "{}{}",
+        "{}{}{}{}{fault_note}",
         timeout_note(waiting::ARP),
-        timeout_note(waiting::DHCP)
+        timeout_note(waiting::DHCP),
+        timeout_note(waiting::DHCP_REFUSED),
+        timeout_note(waiting::NO_ENTROPY)
     );
     let ip = (lease as u32).to_be_bytes();
     let _ = writeln!(
         com1,
-        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; DHCP lease {}.{}.{}.{} ({dhcp_retransmits} retransmitted after a {dhcp_ms} ms timeout, the first DISCOVER dropped on purpose); receive thread on CPU {target}: slept {blocked}, woken by the NIC's interrupt {wakes} (of {irqs} MSI-X interrupts, {last}){rx_note}; consistent {}{}",
+        "origin-kernel: virtio-net: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, features_ok {features_ok}, link_up {link_up}, DRIVER_OK {driver_ok}; ARP 10.0.2.2 -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; DHCP lease {}.{}.{}.{} ({dhcp_retransmits} retransmitted after a {dhcp_ms} ms timeout, the first DISCOVER dropped on purpose); receive thread on {}: slept {blocked}, woken by the NIC's interrupt {wakes} (of {irqs} MSI-X interrupts, {last}){rx_note}; consistent {}{}",
         mac[0],
         mac[1],
         mac[2],
@@ -1356,6 +1697,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], tsc_hz: u64) {
         ip[1],
         ip[2],
         ip[3],
+        target.named(),
         consistent,
         if consistent {
             ""

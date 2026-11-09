@@ -193,6 +193,7 @@ mod tests {
             direct_map_base: 0xFFFF_8000_0000_0000,
             kernel_virtual_base: 0xFFFF_FFFF_8000_0000,
             flags: 1,
+            framebuffer: origin_boot_info::Framebuffer::NONE,
         }
     }
 
@@ -218,6 +219,96 @@ mod tests {
         for addr in [8, 0x1000, 0x7fff_fff8] {
             assert_eq!(check_address(addr), Ok(()), "{addr:#x}");
         }
+    }
+
+    /// Whatever the loader hands over, validation is total and what it accepts really
+    /// has the layout it promises (CLAUDE.md §72: the boot info is one word from the loader
+    /// and its region list comes straight from the firmware's memory map).
+    #[test]
+    fn hostile_boot_info_is_total_and_keeps_its_promises() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0x424F_4F54);
+        let (mut accepted, mut summed) = (0u32, 0u32);
+        for case in 0..crate::testing::cases(30_000) {
+            let mut info = header();
+            // A few header words edited each round, the rest left valid.
+            for _ in 0..1 + rng.below(4) {
+                match rng.below(9) {
+                    0 => info.regions = rng.edge_u64(),
+                    1 => info.region_count = rng.edge_u64(),
+                    2 => info.kernel_base = rng.edge_u64(),
+                    3 => info.kernel_span = rng.edge_u64(),
+                    4 => info.kernel_segments = rng.edge_u64(),
+                    5 => info.kernel_segment_count = rng.edge_u64(),
+                    6 => info.size = rng.edge_u32(),
+                    7 => info.magic = rng.edge_u64(),
+                    _ => {}
+                }
+            }
+            let _ = check_address(rng.edge_u64() as usize);
+            if let Ok(a) = validate(&info) {
+                accepted += 1;
+                assert!(a.addr != 0, "case {case}: {a:?}");
+                assert!(
+                    a.addr.is_multiple_of(align_of::<MemoryRegion>()),
+                    "case {case}"
+                );
+                let bytes = a.len * size_of::<MemoryRegion>();
+                assert!(bytes <= isize::MAX.unsigned_abs(), "case {case}");
+                assert!(a.addr.checked_add(bytes).is_some(), "case {case}");
+                assert!(info.kernel_base.is_multiple_of(PAGE_SIZE), "case {case}");
+                assert!(
+                    info.kernel_base.checked_add(info.kernel_span).is_some(),
+                    "case {case}"
+                );
+                if let Ok(s) = segment_array(&info) {
+                    assert!(s.addr != 0, "case {case}: {s:?}");
+                    assert!(
+                        s.addr.is_multiple_of(align_of::<KernelSegment>()),
+                        "case {case}"
+                    );
+                    assert!(s.len as u64 == info.kernel_segment_count, "case {case}");
+                }
+            }
+
+            let regions: Vec<MemoryRegion> = (0..rng.below(8))
+                .map(|_| MemoryRegion {
+                    base: rng.edge_u64() & !0xFFF,
+                    pages: rng.edge_u64() >> rng.below(64),
+                    kind: rng.below(8) as u32,
+                    reserved: 0,
+                })
+                .collect();
+            if let Ok(summary) = summarize(&regions) {
+                summed += 1;
+                let usable: u128 = regions
+                    .iter()
+                    .filter(|r| r.kind == RegionKind::Usable as u32)
+                    .map(|r| u128::from(r.pages))
+                    .sum();
+                assert_eq!(u128::from(summary.usable_pages), usable, "case {case}");
+                let mut end = 0u128;
+                for r in &regions {
+                    assert!(u128::from(r.base) >= end, "case {case}: {r:?}");
+                    end = u128::from(r.base) + u128::from(r.pages) * 4096;
+                    assert!(end <= 1 << 64, "case {case}: {r:?}");
+                }
+            }
+
+            let segments: Vec<KernelSegment> = (0..rng.below(5))
+                .map(|_| KernelSegment {
+                    rva: rng.edge_u64() & !0xFFF,
+                    pages: rng.edge_u64() >> rng.below(64),
+                    access: rng.next() as u32,
+                    reserved: 0,
+                })
+                .collect();
+            let _ = check_kernel_segments(&segments, &info);
+        }
+        assert!(
+            accepted > 1000 && summed > 500,
+            "{accepted} accepted, {summed} summed"
+        );
     }
 
     #[test]

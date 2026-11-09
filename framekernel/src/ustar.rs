@@ -53,10 +53,21 @@ pub enum UstarError {
 pub struct Entry<'a> {
     /// The full path (`prefix/name` when the prefix field is used).
     pub name: String,
+    /// The file's size: 0 for an entry that stores no data ([`stores_data`]).
     pub size: usize,
     pub typeflag: u8,
-    /// The file's bytes (empty for a directory).
+    /// The file's bytes (empty for a directory or any other entry without data).
     pub data: &'a [u8],
+}
+
+/// Whether entries of `typeflag` are followed by data blocks. POSIX stores none for links,
+/// devices, FIFOs and directories, whatever their size field says; reading a size there
+/// would take the next header for this entry's data.
+pub fn stores_data(typeflag: u8) -> bool {
+    !matches!(
+        typeflag,
+        typeflag::HARDLINK | typeflag::SYMLINK | b'3' | b'4' | typeflag::DIRECTORY | b'6'
+    )
 }
 
 impl Entry<'_> {
@@ -148,11 +159,12 @@ impl<'a> Reader<'a> {
             return Err(UstarError::BadChecksum);
         }
 
+        let typeflag = header[OFF_TYPEFLAG];
         let size = usize::try_from(
             parse_octal(&header[OFF_SIZE..OFF_SIZE + 12]).ok_or(UstarError::BadField)?,
         )
         .map_err(|_| UstarError::BadField)?;
-        let typeflag = header[OFF_TYPEFLAG];
+        let size = if stores_data(typeflag) { size } else { 0 };
 
         let name = field_str(&header[OFF_NAME..OFF_NAME + 100]).ok_or(UstarError::BadName)?;
         let prefix = field_str(&header[OFF_PREFIX..OFF_PREFIX + 155]).ok_or(UstarError::BadName)?;
@@ -302,6 +314,98 @@ mod tests {
         let entries = parse(&archive).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "a");
+    }
+
+    /// Link, device and directory entries carry no data blocks: a size field on one must
+    /// not swallow the following header (POSIX pax, ustar format).
+    #[test]
+    fn entries_without_data_blocks_ignore_their_size_field() {
+        let mut b = Builder::new();
+        b.entry("", "d", typeflag::DIRECTORY, b"");
+        b.entry("", "hello.txt", typeflag::REGULAR, b"Hello!\n");
+        let mut archive = b.finish();
+        // The directory's header claims a 512-byte body.
+        archive[OFF_SIZE..OFF_SIZE + 12].copy_from_slice(b"00000001000\0");
+        let sum = header_checksum(&archive[..BLOCK]);
+        let chk = alloc::format!("{sum:06o}\0 ");
+        archive[OFF_CHKSUM..OFF_CHKSUM + 8].copy_from_slice(chk.as_bytes());
+        let entries = parse(&archive).unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "the file after the directory is still seen"
+        );
+        assert!(entries[0].is_dir() && entries[0].data.is_empty() && entries[0].size == 0);
+        assert_eq!(entries[1].data, b"Hello!\n");
+        // The types that do carry data, and an unknown one, keep their blocks.
+        assert!(stores_data(typeflag::REGULAR) && stores_data(typeflag::REGULAR_ALT));
+        assert!(stores_data(b'7') && stores_data(b'x'));
+        for t in [
+            typeflag::HARDLINK,
+            typeflag::SYMLINK,
+            b'3',
+            b'4',
+            b'5',
+            b'6',
+        ] {
+            assert!(!stores_data(t), "{t}");
+        }
+    }
+
+    /// An accepted archive really is that archive: the entries' sizes and data stay inside
+    /// the bytes given and each entry's header checksum holds (CLAUDE.md §72).
+    #[test]
+    fn mutated_archives_keep_their_invariants() {
+        use crate::testing::{Rng, mutate, mutate_window};
+        let mut b = Builder::new();
+        b.entry("", "hello.txt", typeflag::REGULAR, b"Hello, tar!\n");
+        b.entry(
+            "usr/local",
+            "bin.dat",
+            typeflag::REGULAR,
+            &alloc::vec![7u8; 700],
+        );
+        b.entry("", "d", typeflag::DIRECTORY, b"");
+        b.entry("", "s", typeflag::SYMLINK, b"");
+        let base = b.finish();
+        let mut rng = Rng::new(0x5553_5432);
+        let (mut accepted, mut resealed) = (0u32, 0u32);
+        for case in 0..crate::testing::cases(8000) {
+            let mut data = base.clone();
+            if case % 2 == 0 {
+                mutate(&mut data, &mut rng);
+            } else {
+                // Edit a field of any header (the file's, the long file's, the directory's
+                // or the link's) and restore its checksum, so the field checks are what
+                // answers; a directory's or link's size field is one of them.
+                let h = BLOCK * [0usize, 2, 5, 6][rng.below(4)];
+                let (from, to) = if case % 4 == 3 {
+                    (h + OFF_SIZE, h + OFF_SIZE + 12)
+                } else {
+                    (h, h + OFF_CHKSUM)
+                };
+                mutate_window(&mut data, from..to, &mut rng);
+                if case % 4 == 3 {
+                    data[h + OFF_SIZE..h + OFF_SIZE + 12].copy_from_slice(b"00000001000\0");
+                }
+                let sum = header_checksum(&data[h..h + BLOCK]);
+                let chk = alloc::format!("{sum:06o}\0 ");
+                data[h + OFF_CHKSUM..h + OFF_CHKSUM + 8].copy_from_slice(chk.as_bytes());
+                resealed += 1;
+            }
+            let Ok(entries) = parse(&data) else { continue };
+            accepted += 1;
+            for e in entries {
+                assert_eq!(e.data.len(), e.size, "case {case}");
+                if !stores_data(e.typeflag) {
+                    assert!(e.data.is_empty() && e.size == 0, "case {case}");
+                }
+                assert!(e.data.len() <= data.len(), "case {case}");
+                assert!(e.name.len() <= 100 + 155 + 1, "case {case}");
+                let _ = (e.is_file(), e.is_dir());
+            }
+        }
+        assert!(accepted > 1000 && resealed > 1000, "{accepted}/{resealed}");
     }
 
     #[test]

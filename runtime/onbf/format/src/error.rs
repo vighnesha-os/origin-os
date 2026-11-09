@@ -70,6 +70,11 @@ pub enum SectionError {
     PermissionsOnNonSegment,
     /// A SEGMENT without MAPPABLE.
     SegmentNotMappable,
+    /// A SEGMENT whose permission bits are not exactly R, RW (optionally RELRO) or RX
+    /// (§6.1): for example no READ, RELRO without WRITE, or RELRO on RX.
+    SegmentPermissions(u32),
+    /// MAPPABLE on a section that is never mapped: a DWARF section (errata G1).
+    MappableNotAllowed,
     /// A kind not in §4.4, with or without REQUIRED (errata C13).
     UnknownKind(u32),
     /// A known kind that §4.4 does not allow in this profile.

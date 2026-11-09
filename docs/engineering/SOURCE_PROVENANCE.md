@@ -5,13 +5,13 @@
 | Required by | CLAUDE.md §6 |
 | Rule | One entry per original module. Automated similarity scanning cannot prove independent authorship, so this file records how each module was produced. |
 
-**Open item for the owner:** the repository has no LICENSE file yet. Every entry below therefore reads "project licence not chosen yet".
+**Licence:** MIT OR Apache-2.0, chosen by the owner on 2026-11-08 (`LICENSE-MIT`, `LICENSE-APACHE`). Third-party test data keeps its own licence, stated beside it.
 
 ## `rust-toolchain.toml`
 
 - **Content:** copied verbatim from CLAUDE.md §8 (v7.1).
 - **Author / date:** Claude (cloud session), 2026-11-07.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `developer-tools/toolchain/verify.sh`
 
@@ -28,7 +28,7 @@
   - POSIX utilities: `od`, `grep`, `sed`, `sort`, `mktemp`, `date`, `head`, plus `shasum` (macOS) or `sha256sum` (Linux) for firmware hashes.
 - **Toolchain:** bash 3.2 or later (the macOS default), and Rust 1.99.1 per `rust-toolchain.toml`.
 - **Review:** not yet independently reviewed.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 - **Test evidence.** Run on 2026-11-07 in the cloud sandbox: Linux x86-64, rustc 1.97.0, no network.
   - The syntax check passes.
   - Failure paths are reported correctly, with the expected exit codes:
@@ -70,7 +70,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `default-members` is the host `xtask` only. Freestanding crates are built for their own target through the xtask, because per-package targets are unstable in Cargo.
   - No `version` field: generated version metadata comes in T5 (CLAUDE.md §62).
 - **Dependencies:** none. `Cargo.lock` lists only workspace crates.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `boot/uefi/` (`origin-boot-uefi`), the UEFI loader, M1 steps 1 and 2
 
@@ -119,14 +119,14 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - OVMF reported `failed to start Boot0001 …: Unsupported`, so the returned status reached the firmware intact.
   - After T5 the banner reads `Origin OS 0.1.0-dev UEFI loader (build 0)`. `boot-test` builds the expected banner from the same generated constants, and it passes (1.8 s).
   - QEMU only. No physical hardware yet (CLAUDE.md §74).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Step 2: read, verify, place and enter the Framekernel (ADR-0002, Proposed)
 
 - **What (2026-11-07):**
   - `protocols`: the UEFI 2.11 boot-services table (offsets of the functions used are pinned), `EFI_LOADED_IMAGE_PROTOCOL`, `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL`, `EFI_FILE_PROTOCOL`, `EFI_FILE_INFO`, the configuration table and the ACPI 2.0 GUID.
   - `main`: reads `\EFI\ORIGIN\KERNEL.ONBF` from the loader's own volume (B1), verifies it, allocates `EfiLoaderCode` pages for the span and places it, allocates a 64 KiB stack and the boot-info pages (OS types 0x8000_0003 and 0x8000_0002), finds the RSDP, clears the panic console, then `GetMemoryMap` → translate → `ExitBootServices` with one retry (B5), and enters the kernel with `call` on the new stack, RDI = boot info (B6).
-  - `kernel::verify` (B2): parse, KRN profile, no signature block yet (refused unless `developer-mode`), SHA-512 content digest, manifest SHA-256 and decode, `boot_info_abi` equal to the loader's, `cpu_features` = 0, every section's digest or Merkle root, no compression.
+  - `kernel::verify` (B2): parse, KRN profile, SHA-512 content digest, the signature block (added 2026-11-08, see "Step 3" below), manifest SHA-256 and decode, `boot_info_abi` equal to the loader's, `cpu_features` = 0, every section's digest or Merkle root, no compression.
   - `place`: copies SEGMENTs, zero-fills tails, applies RELR with every slot checked to lie in a writable, non-executable segment's content; `kernel_segments` builds the boot-info 0.2 segment table (RELRO drops W).
   - `memmap`: UEFI → Origin region kinds, sort, overlap check, merge, and `carve` to mark the kernel image by address.
 - **Specifications:** UEFI 2.11 §4.4 (boot services), §7.2 (memory allocation, `GetMemoryMap`), §7.4 (`ExitBootServices`), §9.1 (loaded image), §13.4–§13.5 (simple file system, file protocol), §4.6 (configuration table); ONBF §3–§6, §8.1; boot-info 0.2.
@@ -137,7 +137,27 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `cargo xtask boot-test`, both scenarios, QEMU 11.1.3 + OVMF (q35, TCG, `-cpu max`): the loader reads, verifies and places the real KRN (7 sections, 3 segments, 128 relocations at the time of writing) and enters the kernel; a KRN with one byte of its first SEGMENT flipped is rejected with "section 1 does not match its digest" and the kernel never runs.
   - QEMU only. No physical hardware yet (CLAUDE.md §74).
 
-## `boot/info/` (`origin-boot-info`), the boot-info contract v0.3 (Proposed)
+### Step 3: the kernel's signature, verified before anything of it is used (ADR-0002 B2 step 3, B8; ONBF §7; TASKS item 6; 2026-11-08)
+
+- **What:** the slice of TASKS item 6 recorded in `docs/research/2026-11-08-krn-signature-verification.md`: direct trust in a compiled-in store, with certificate chains refused.
+  - `onbf-verify`: `verify_krn_block(block, store, content_digest)`, the KRN policy over a trust store: the block parses, exactly one entry (errata V2), the role is `origin-kernel` (§7.5), no chain (V1: refused, never ignored), the key is in the store for that role (`TrustedKey`, a key and the one role it may sign in), and the entry verifies (`verify_entry`). Each refusal is its own `KrnBlockError`.
+  - `boot/uefi`: `trust::STORE`, compiled in, empty unless the `test-trust-store` feature is on (errata V4), and such a build does not compile with a non-zero build number (`origin-version.toml`), so a released loader cannot hold the test key; `kernel::verify(bytes, developer_mode, store)` in B2's order, with a message per refusal (`KernelError`): unsigned, malformed image, malformed block, entry count, role, chain, untrusted key, the statement's digest and profile, Ed25519, ML-DSA. A signed image is verified in every mode (V5); developer mode only allows an image with no signature. `main` prints which key verified, and warns on every boot if the build holds a test key.
+  - `developer-mode` now implies `test-trust-store`, so a developer-mode loader can verify a test-signed kernel too.
+- **Specifications:** ONBF §4.2, §4.5, §7.1, §7.2, §7.5, §8.1, ONBF-R1, R6, R9; ADR-0001 D3; ADR-0002 B2, B7, B8; S1–S4; errata C3, C4, E1, M1. **Decided readings:** errata V1–V6 (`ONBF-errata.md`, decided by the owner on 2026-11-08).
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08, branch `claude/adoring-hopper-a8f66b` (on `6a2b29c`). Original code, `no_std` for the verifier, no third-party crates.
+- **Unsafe inventory:** none added. `trust` and the new `kernel` code have no `unsafe`; `main.rs` gained none; `onbf-verify` stays `forbid(unsafe_code)`.
+- **Test evidence (2026-11-08):**
+  - `onbf-verify`: 6 new tests (11 → 17): the reference-signed block passes, the trust store decides who signs (empty, wrong role, wrong key, unknown key ID), one entry only, role and chain refused, a tampered statement or signature refused for what it is, a wrong digest refused before any signature is checked. New soak `the_krn_policy_holds_over_mutated_blocks_and_stores` (600 cases): each verdict compared with the policy written out independently, and nothing verifies except the pristine block with its signer.
+  - The loader's host tests: 5 new (29 → 34), on a minimal image around the same reference-signed block: each refusal's message pinned.
+  - Boot, `cargo xtask boot-test`, 11 scenarios: **the signed kernel with developer mode off (every kernel proof)**; an unsigned kernel in developer mode; a tampered unsigned kernel; a bad signature in developer mode; an unsigned kernel, a wrong key, a tampered statement, a tampered Ed25519 signature, a tampered ML-DSA signature, tampered content, and a substituted kernel (digests recomputed so only the statement can tell), each with its own message, the kernel never reached. Signatures made by `onbf-sign` (original Rust; its entry under `developer-tools/`), verified by `origin-crypto`. QEMU only (CLAUDE.md §74).
+  - **Negative controls** (36, in total across the signing work), each applied, shown to fail the named check, and restored byte-identical. In the loader and the policy: exactly-one-entry check removed, the role check removed, the chain refusal removed, the store's role ignored, the statement digest not compared, the loader's unsigned refusal removed (each failing a named unit test); a loader outside developer mode accepting unsigned images, an untrusted key waved through, the statement digest not compared (a substituted kernel boots), the Ed25519 and the ML-DSA check skipped (each tampered signature boots), developer mode skipping verification, the section digests skipped, the loader without the feature refusing the signed kernel, a stale committed test key caught before any boot, a non-zero build number stopping the compile of a loader with the test key; in `xtask`, a scenario filter that matches nothing. In the signer: see its entry.
+  - No measurable boot-time change: the signed kernel's boot 16.8 s against 17.0 s unsigned, and the refusal boots that run both verifications 2.3 s, the same as the refusals that run neither, at this timing's resolution (about 0.1 s under TCG).
+  - On the final code, with the signatures made by `onbf-sign`: `cargo xtask check` passes (719 tests, 0 failures, 6 ignored), `boot-test` passes 11 of 11, `boot-matrix` passes (Intel VT-d and AMD-Vi, each at 1, 2 and 4 CPUs), and `boot-x2apic` passes under both CPU models, each on its first attempt, once the host was quiet (load 13–28). Earlier runs on a host with several other sessions (load average 70–140) failed in kernel proofs this work does not touch, which need QEMU to keep real time: `clock failed` (`boot-matrix` once, `boot-x2apic` four times) and `timers failed` (`boot-x2apic` twice), each time after the loader's signature line had passed. The RTC wait is being fixed separately (branch `claude/musing-hamilton-587f7b`).
+- **Security review:** by the author, and by one fresh reviewing agent (2026-11-08) given the code, the specification and no conclusions. It found no way to get a refused image accepted and no refusal of a valid one, and six low-severity points. Five are fixed: a scenario filter that matches nothing now fails; `keygen` never overwrites any path; the self-check's documentation says what it covers (it does not repeat the loader's own `cpu_features` and boot-info limits); and a loader holding the test key does not compile with a non-zero build number. The sixth is pre-existing and recorded: the loader does not read MERKLE sections' bytes, because nothing uses them yet (`docs/research/2026-11-08-krn-signature-verification.md` §5). This is agent review, not the independent security review CLAUDE.md §59 requires for a release. What it covers: the order of checks (ONBF-R1: only the header, the table and padding are read before the signature), and what a developer-mode build can and cannot do.
+- **Not done:** OKC chains (errata O2–O5 are decided; O3 makes them wait for the SYS profile's signed time), Origin's real root and kernel keys, release signing (HSM), B7's Secure Boot first stage, anti-rollback and TPM measurement (§7.6, §8.1). SYS and other profiles have no signature policy yet.
+- **Licensing:** MIT OR Apache-2.0.
+
+## `boot/info/` (`origin-boot-info`), the boot-info contract v0.4 (accepted)
 
 - **What:** the one structure the loader hands the Framekernel (ADR-0002 B4):
   - `BootInfo`: `repr(C)`, 80 bytes, every field explicitly sized, offsets pinned at compile time;
@@ -146,6 +166,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `BootInfo::check`: validates magic, version, size and region count before anything else is trusted.
 
   The version is `[compatibility] boot-info` in `origin-version.toml`. Major 0 means unstable until ADR-0002 is accepted.
+- **0.4 (2026-11-08, ADR-0010 E1, accepted by the owner the same day):** `Framebuffer` (physical base, size, the address the loader mapped it at, dimensions, stride and the channel masks of a 32-bit pixel, 48 bytes) appended to `BootInfo`, now 176 bytes; `Framebuffer::check` and `overlaps_ram`. See "The early console" under `framekernel/`.
 - **0.2 (2026-11-07):** `KernelSegment` (rva, pages, R/W/X access, 24 bytes; at most 16) appended to `BootInfo`, now 96 bytes; `check` bounds the count; `check_segments` enforces aligned, non-empty, sorted, disjoint, inside the span, readable, never W and X, no unknown bits, `reserved` zero. 6 unit tests.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code.
 - **Dependencies:** `core` and `origin-version`. `no_std`, `forbid(unsafe_code)`.
@@ -153,7 +174,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - 4 unit tests: magic, header acceptance and rejection, region-kind round trip, version source.
   - Clippy on the host, UEFI and kernel targets.
   - **No panic paths:** the kernel-target object references 0 external symbols.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `framekernel/` (`framekernel`), the Framekernel: M1 entry and M2
 
@@ -194,7 +215,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - 38 RELATIVE relocations.
   - Two clean builds in the same path were byte-identical.
   - Boot evidence is in the `boot/uefi` step 2 entry.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Higher half and KASLR (ADR-0004, accepted and implemented 2026-11-07)
 
@@ -304,6 +325,194 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - QEMU only.
 - **Not done:** HPET or ACPI PM timer fallbacks; resynchronising TSCs (IA32_TSC_ADJUST) when the check fails; TSC-deadline timers; time zones and network time; the user-visible clock calls.
 
+### The clock proofs under host load (`rtc::UpdateWatcher`, `rtc::SecondMeter`, `apic::CalibrationWindow`, `clock::closest_read`; `time::measure_rtc`, `time::prove_consistent`, `timer::calibrate`, `prove_timers`; CLAUDE.md §68, §72; task TIME-RTC-UIP; 2026-11-08)
+
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08, task TIME-RTC-UIP, on `claude/musing-hamilton-587f7b` from `b3efe8a`. Original code.
+- **Why.** The boot proofs that time one clock against another failed `cargo xtask boot-test` on a loaded development host: first `clock: the RTC did not complete two updates in 1.2 s`, then, once that was fixed and measured, the same stall sensitivity in the proofs around it. Every one of these proofs polls a clock on the boot processor and assumed the processor was running the whole time; on a loaded host a virtual CPU is descheduled for milliseconds, which looks to such a proof like the clock misbehaving.
+- **Measured (M1 Max host, QEMU 11.1.3 TCG, `-smp 2`, `cargo xtask boot-test`; one `yes` process per logical core, 10, plus other sessions' work; load averages from about 5 to over 250). Each row is 30 boots; the experiments alternate the two kernels boot by boot, so both see the same background load. The failure classes are each boot's first failure:**
+
+  | Experiment (each row 30 boots, every core busy) | Kernel | Pass | RTC wait timed out | RTC second v. PIT rate | TSC consistency | HPET | `timers` | scheduler | Failure rate |
+  |---|---|---|---|---|---|---|---|---|---|
+  | Sequential baseline | original | 5 | 12 | 11 | | | 2 | | 83 % |
+  | RTC fix alone, alternating | original | 6 | 17 | 7 | | | | | 80 % |
+  | | RTC fix only | 9 | **0** | 19 | | | 2 | | 70 % |
+  | RTC and PIT fixes, alternating | original | 3 | 21 | 6 | | | | | 90 % |
+  | | RTC + PIT fixes | 15 | **0** | 1 | 6 | 1 | 6 | 1 | 50 % |
+  | Final, alternating | original | 5 | 11 | 13 | | | 1 | | 83 % |
+  | | **final (this commit)** | **29** | **0** | **0** | **0** | **0** | **0** | 1 | **3 %** |
+
+
+  "RTC second v. PIT rate" means `one RTC second lasted X us: clock failed`: in all but one of these boots (one original kernel, where a long stall made the second itself read 3 s) the RTC second in TSC ticks was within 0.02 % of 1 GHz and the PIT calibration was wrong (19 of the 30 boots in the sequential baseline had a PIT rate off by at least 1 %, up to 38 %). The final kernel's remaining failure is the scheduler's weighted-share bound (`weights 1, 4 and 16 … for 2 s`), which this work does not touch; the same boot's clock proofs all passed.
+
+- **The causes, in the order the measurements exposed them:**
+  1. The RTC wait (`time.rs`): the proof waited to see register A's update-in-progress bit rise and fall, twice, with 1.2 s per edge. QEMU 11.1 shows that bit only for the last 244 µs of each second (`UIP_HOLD_LENGTH` in `hw/rtc/mc146818rtc.c`), and a virtual CPU descheduled across it missed the pulse. A probe kernel (not committed) that polled the clock for 12 s per boot under the same load saw the pulse missed at 29 % of about 110 updates, and a stall across an update of up to about 5 ms.
+  2. The PIT calibration (`timer.rs`): the 10 ms window that calibrates the TSC is polled, and a stall at either end, or between programming the count and raising the gate, corrupts the TSC rate by as much as the stall. The proof then reports the disagreement: `one RTC second lasted 746585 us on the PIT-calibrated TSC: clock failed`. In all but one such failure the RTC second itself, in TSC ticks, was within 0.02 % of 1 GHz: these "one RTC second" failures were the PIT window, not the RTC or the 1 % tolerance. A probe of 400 windows per boot found 5 % disturbed at light load and about 60 % under full load (about a quarter of those by under 200 µs, the rest up to several milliseconds). QEMU's PIT counts from the count's last byte, not the gate's rise (`pit_set_channel_gate` in `hw/timer/i8254.c` ignores the gate in mode 0), which the code now brackets too.
+  3. The TSC-consistency proof (`time.rs`, `prove_consistent`): it requires at least 100 handoffs between processors in 100 ms, to prove they interleaved; on a loaded host two virtual CPUs rarely run at once.
+  4. The HPET and PM-timer cross-checks (`time.rs`): a stall between reading the counter and reading the TSC made the two clocks appear to disagree (one boot: 24 ms by the HPET, 20 ms by the TSC).
+  5. `prove_timers` (`main.rs`): a timer "late" by more than 2 ms, when in fact the processor polling the queue was stalled.
+- **Options weighed for the RTC (the task's question).**
+  - *Keep waiting for the bit, retry on a miss:* it still depends on catching a 244 µs pulse, and costs a whole second per miss.
+  - *Treat a change of the seconds register as the edge* (chosen as the detector): every update is visible, however long the processor was away. Alone it moves the failure: a stall just after an update stretches one measured second by the stall, and the proof's 1 % is 10 ms, about the size of a bad stall.
+  - *Bracket each edge, and decide only on a whole interval* (chosen): an edge lies between the last poll showing the old second (or the update bit) and the first poll showing the new one, so a measurement is an interval that certainly contains the true second, and it decides only if the whole interval is inside, or outside, 1 % of the PIT rate. No stall can produce a wrong verdict, in either direction. The boot line shows the interval: `one RTC second lasted X us (+/- E us, over N s)`.
+  - *Measure across more than one second* (used when needed): a pair too vague to decide gives way to the next edge, over a longer baseline, with the seconds counted from the register so that a stall which hides an update still counts it. The proof stops at the second edge when nothing stalls, at most two seconds as before; the budget is 3.2 s (about one second more than before), used only when an edge was spoiled.
+- **What (library, host-tested, `forbid(unsafe_code)`):** `rtc`: `Poll`, `UpdateWatcher` (polls to edges), `UpdateEdge`, `SecondMeter` (edges to a `SecondMeasurement` with min/max ticks per RTC second and a `SecondVerdict`), `seconds_value`. `apic::CalibrationWindow`: the TSC readings around a PIT one-shot and whether it was observed closely. `clock::closest_read`: a counter read paired with the time stamp around it, retried until the bracket is tight.
+- **What (kernel binary):** `time::measure_rtc` replaces `update_end` (and reads the wall clock just after the sharpest edge, only if the registers still show that edge's second). `timer::calibrate` measures up to 32 windows, keeping the first clean one (each bracket within 1/500 of the window, 20 µs) or else the least disturbed, and reports how many it discarded. The HPET and PM-timer cross-checks pair each counter read with the TSC through `closest_read`. `prove_consistent` keeps going up to 500 ms while there are fewer than 100 handoffs. `prove_timers` repeats a run (at most six; since replaced, see "The wait-queue ping-pong and the timer queue under host load") whose polling loop stalled and went wrong, and fails at once if a timer is late with the poller running normally. None of the proofs got looser: every bound is unchanged, a wrong rate still fails, and only a stall that demonstrably corrupted a measurement is forgiven.
+- **Specifications and behaviour relied on.** The RTC: ST M48T86 data sheet, Rev. 4.0 (April 2004), "UIP. Update in Progress" and "Update Cycle" (the MC146818-compatible PC clock): a clear bit means the update transfer is at least 244 µs away, and a read during an update may not be valid; the update advances the seconds register. So a seconds reading is believed only if the bit was read clear first and the poll took under 244 µs, and a set bit is used only as evidence that the update has not ended. **Gaps:** the original Motorola MC146818 data sheet and the Intel PCH RTC chapter were not read; Intel's register description (document 795260) gives 488 µs, seen only in a search excerpt, and only the smaller 244 µs is relied on. QEMU's models were read in `hw/rtc/mc146818rtc.c` and `hw/timer/i8254.c` (11.1.0): they are the test machine, not operating-system implementations. Intel's and AMD's PIT and PM-timer interfaces are as already recorded.
+- **Unsafe:** no new `unsafe` blocks. `Cmos::new`'s use moved into a closure with the same contract; the PM-timer `ind` keeps its block and contract inside the read closure; `measure_window` is the same port and MSR accesses as before, split out.
+- **Test evidence:**
+  - Library tests (all `framekernel --lib`, 426 passing): the watcher (brackets, a missed pulse, readings a clear bit cannot vouch for, stalls across the minute wrap in BCD and binary); the meter (decisions only on a whole interval, a longer baseline, a stall hiding a second, keeping sharp edges); a simulator of a clock (QEMU's timing and a real part's) and a polling processor with stalls, on which every edge contains its update and every measurement's interval contains the clock's true period over 4000 seeded cases at any rate from a tenth to ten times the expected and any stall pattern (`ORIGIN_MUTATION_SCALE=20` passes too), verdicts are never wrong, a frozen clock gives no measurement, a good clock decides at the second edge without stalls, and within the budget with them; `CalibrationWindow`, `closest_read` (hand cases and arbitrary inputs).
+  - Negative controls, each a temporary edit on a scratch copy of the final tree, each failing the boot as stated (positive controls in italics):
+    - the seconds frozen → `the RTC did not complete two updates in 3.2 s: clock failed`;
+    - the update bit stuck set → the same;
+    - TSC timestamps skewed 3 % (an RTC 3 % slow against the TSC) → `one RTC second lasted 1029962 us (+/- 29 us, over 1 s): clock failed`;
+    - seconds doubled (twice the rate) → `one RTC second lasted 500015 us (+/- 3 us, over 2 s): clock failed`;
+    - seconds halved (half the rate) → `one RTC second lasted 2000162 us (+/- 1 us, over 1 s): clock failed`;
+    - the PIT-calibrated TSC rate 3 % high → `one RTC second lasted 970911 us (+/- 13 us, over 1 s): clock failed`;
+    - *a 30 ms stall in the first PIT window → the window is discarded and the boot passes;* with the clean check removed, the same stall → `: APIC timer is wrong` (the window read as a TSC of 1505 MHz);
+    - an AP's TSC readings 5000 ticks ahead → `3189 backwards (worst 5000 ticks): clock failed`;
+    - handoffs set unreachably high → `… 36279 handoffs … : clock failed`;
+    - the HPET 3 % fast → `: HPET failed`; the PM timer 3 % fast → `: PM timer failed`;
+    - *a 5 ms stall between an HPET read and its TSC read → discarded, the boot passes;*
+    - a timer genuinely 3 ms late with the poller running → `worst lateness 3000 us: timers failed`; *one polling run stalled 9 ms → repeated, "worst lateness 0 us (after a stalled run)", boot passes.*
+  - `cargo xtask check` passes (701 tests, 0 failures, 6 ignored); `cargo xtask boot-matrix` passes (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs, then `boot-x2apic` on leaves 1Fh and 0Bh). In the final comparison the calibration discarded at most 12 of 32 windows (a window is 10 ms), `prove_timers` needed a second run in 2 boots of 30, and the RTC second's uncertainty had a median of +/- 759 µs and a maximum of +/- 3663 µs; every measurement took one second, none needed a longer baseline.
+- **Not done:** the scheduler's weighted-share bound (`weights 1, 4 and 16 on CPU 1 for 2 s`) failed once in 30 boots at the highest load and is unchanged (since addressed: "The weighted-share proof under host load", next); the HPET and PM-timer proofs' 2 % windows (read-paired now, and they held in the final run) were not injected with host-sized stalls beyond the positive control; the TSC-consistency window extends to 500 ms under load; everything here is QEMU only (CLAUDE.md §74), and the real-hardware RTC timing is covered by the data sheet and the simulator's hardware model, not by a measurement.
+- **Licensing:** project licence not chosen yet.
+
+### The weighted-share proof under host load (`sched::prove_weights`, `sched::run_weighted`, `sched::weighted_worker`, `runqueue::per_mille`, `runqueue::share_near_weight`; CLAUDE.md §26, §72; task SCHED-SHARE-LOAD; 2026-11-08)
+
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08, task SCHED-SHARE-LOAD, on `claude/elegant-thompson-48edc8` from `20b8817` (the clock proofs, `claude/musing-hamilton-587f7b`). Original code.
+- **Why.** The proof that weighted threads share a processor in proportion to their weights (three never-yielding workers, weights 1, 4 and 16, on one processor for 2 s; each share within a third of its ideal plus 15 per mille) was the last boot proof still failing on a loaded host: 1 boot in 30 with every core loaded (`shares 81, 195 and 722 per mille`, ideal 47, 190 and 761).
+- **The cause, measured.** The proof counted loop iterations. A probe kernel (not committed) repeated the proof 30 times per boot and logged every timer tick on the workers' processor, with one `yes` per logical core and other sessions' work on the machine (load averages from about 15 to about 190):
+  - The slices came on time: the median gap between ticks was 9.9 ms and the 99th percentile 17 ms.
+  - The work done in a slice did not. Over 5992 slices the rate was 0.27 iterations per microsecond at the 10th percentile, 0.71 at the median and 1.53 at the 90th (extremes 0.001 and 4.1).
+  - The lightest worker's share is the sum of about ten such slices. In the probe's failing run its share read 80 per mille by iterations (the bound is 77), while the same run's time between ticks read 53 and its slice count 50.
+
+  So the proof was measuring how fast the host happened to run the virtual CPU during those ten slices, not how much processor the scheduler gave each thread.
+- **What changed (kernel binary, `sched.rs`).**
+  - `weighted_worker` reports the time it saw itself running instead of an iteration count: every turn of its loop reads the TSC and adds the step since the last reading if it is shorter than 3 ms (about a third of a tick). A longer step is a preemption, or the virtual CPU being away, and counts for nothing. `prove_weights` applies the bound to these times exactly as it was applied to the iteration counts.
+  - `prove_weights` believes a wrong result only from an undisturbed run. If the workers' processor took at least 3 of the window's 200 timer ticks fewer than it should (a late tick coalesced with the next, as a stalled vCPU or QEMU main loop causes), or the workers saw themselves run for under nine tenths of the window, the run says nothing about the scheduler and is measured again, at most three runs in all (`run_weighted` repeats the whole 2 s). A wrong result with the ticks and the processor present fails at once, the rule of `prove_timers`.
+  - The boot line now says how long the workers ran and whether a run was repeated: `… per mille (ideal 47, 190 and 761) over N ms of running (after a stalled run)`; the `boot-test` markers still match.
+- **What changed (library, host-tested).** `runqueue::per_mille` and `runqueue::share_near_weight` hold the proof's arithmetic, with a test pinning the bound at its edges: 17–77, 112–268 and 493–1029 per mille for weights 1, 4 and 16 of 21.
+- **Why time, and why the 3 ms limit.** Time rather than iterations: an emulated processor's iterations per slice measure the host, while stride scheduling allocates processor time. The measure stays end to end: each worker reports what it saw of itself, so a thread that is starved, or a wrong thread run in its place, shows up (see the controls), and a thread that does not run has nothing to report. The limit decides how long a gap in a worker's own clock still counts as running. It was chosen from a probe of the candidate's own loop that measured every limit on identical runs. At 50 µs the worker sees itself run for 38 % of the window and the lightest share's spread is 8.0 per mille; at 1 ms, 62 % and 6.0; at 3 ms, 89 % and 3.8; beyond that the spread stops improving (3.4 at 5 ms, against 3.2 for the time between ticks) while a slight bias toward the heaviest worker grows (a worker preempted by a catch-up slice shorter than the limit counts the gap as running: 0.5 % of slices at 3 ms, 16 % at 8 ms). The time between ticks would be steadier still, but it is the scheduler's own account of itself, not the thread's.
+- **Measured (M1 Max host, QEMU 11.1.3 TCG, `-smp 2`).** Probe kernels (not committed) repeated the proof 30 times per boot; "1×" is one `yes` per logical core (10) with other sessions running too, load averages from about 15 to about 190; "2×" is two `yes` per logical core. Each row is the runs named, all on the same load:
+
+  | Probe, load | Runs | Measure | Outside the bound | Weight-1 share, per mille: mean ± sd (range) | Worst distance / tolerance |
+  |---|---|---|---|---|---|
+  | The original worker loop, 1× | 150 | iterations (the proof before this change) | 0 | 48.7 ± 6.8 (31–67) | 0.67 |
+  | The candidate's loop, 1× | 150 | iterations | 1 (0.7 %) | 50.9 ± 9.3 (31–78) | 1.03 |
+  | | 150 | time seen running, limit 100 µs | 0 | 50.4 ± 7.8 (32–71) | 0.80 |
+  | | 150 | time seen running, limit 1 ms | 0 | 49.6 ± 6.0 (36–63) | 0.53 |
+  | | 150 | **time seen running, limit 3 ms (this change)** | **0** | **48.1 ± 3.8 (37–56)** | **0.38** |
+  | | 150 | time seen running, limit 5 ms | 0 | 47.8 ± 3.4 (37–55) | 0.33 |
+  | | 150 | time between ticks (reference) | 0 | 49.8 ± 3.2 (40–57) | 0.33 |
+  | | 150 | slice counts (reference) | 0 | 50.2 ± 0.7 (47–55) | 0.27 |
+  | The candidate's loop, 2× | 150 | iterations | 9 (6.0 %) | 51.7 ± 16.0 (15–120) | 2.43 |
+  | | 150 | time seen running, limit 1 ms | 4 (2.7 %) | 50.1 ± 12.3 (22–97) | 1.67 |
+  | | 150 | **time seen running, limit 3 ms (this change)** | **2 (1.3 %)** | **47.9 ± 9.7 (25–94)** | **1.57** |
+  | | 150 | time seen running, limit 5 ms | 1 (0.7 %) | 46.9 ± 8.5 (26–86) | 1.30 |
+  | | 150 | time between ticks (reference) | 0 | 50.0 ± 7.4 (36–71) | 0.80 |
+  | | 150 | slice counts (reference) | 0 | 49.6 ± 1.9 (47–57) | 0.33 |
+
+  The time rows measure the candidate's worker loop and each row's iterations are from the same runs, so the comparison is between measures on one load. The bound's tolerance for weight 1 is ±30 per mille around 47. At 1× an earlier probe boot (the original loop, 30 runs, whose iteration spread was 12.0 per mille against 6.8 for the 150 runs above) broke the bound once by iterations (80, 166 and 753 per mille) and an instrumented probe once in 150 (84, 215 and 699); the time between ticks read 53 and 51 for the weight-1 worker in those two runs. The workers' processor lost at least 3 of the window's 200 ticks in 25 % of the 1× runs (median 199 taken, minimum 190) and in 144 of the 150 runs at 2× (median 184, minimum 161), where a wrong result is therefore always repeated. The accounted running time (`over N ms of running`) is about 1985 ms of the 2 s window on a quiet host (the boots of the controls and of the boot matrix, 1982 to 2026 ms; the window itself overruns a little on one processor), and 89 % of the window on average at 1× load (minimum 73 %).
+
+  `cargo xtask boot-test`, the parent kernel `20b8817` and this change alternating boot by boot, each boot's first failure:
+
+  | Experiment (alternating boot by boot) | Kernel | Boots | Pass | First failure: this proof | First failure: another proof | Failure rate | Weight-1 share in the boot lines (range, per mille) | Mean boot time |
+  |---|---|---|---|---|---|---|---|---|
+  | 1×, 30 pairs (1-minute load averages 8 to 89) | original (`20b8817`) | 30 | 30 | 0 | 0 | 0 % | 34–64 | 26 s |
+  | | **this change** | 30 | 30 | 0 | 0 | **0 %** | 40–53 | 24 s |
+  | 2×, 15 pairs (1-minute load averages 30 to 130) | original (`20b8817`) | 15 | 12 | 2 | 1 (`timers`) | 20 % | 19–90 | 34 s |
+  | | **this change** | 15 | 14 | **0** | 1 (`timers`) | 7 % | 17–52 | 38 s |
+
+  At one `yes` per core neither kernel failed in 30 boots: a failure rate of one in thirty, as seen before, does not show up reliably in so few boots, and the host was calmer than in the probe runs (other sessions had gone idle); the 150-run probe above is the discriminating measurement at this load. At double load the original kernel failed this proof in 2 boots of 15 (`shares 90, 203 and 706` and `85, 172 and 741`), this change in none. Five of this change's 45 boots repeated a run (one at 1×, four at 2×) and all of them passed this proof. The `timers` failures are `prove_timers` at double load (worst lateness 3.3 and 7.0 ms, after a stalled run): another proof with its own load sensitivity, one boot in each arm, not touched here.
+
+- **Negative and positive controls** (each a temporary edit on a scratch copy of the final tree, each booted with `cargo xtask boot-test`; positive controls in italics):
+  - a worker with the wrong weight (16 instead of 1) → `shares 449, 109 and 441 per mille … over 1982 ms of running: scheduler failed`, at the first run (the ticks were all there);
+  - a smaller wrong weight (2 instead of 1) → `shares 93, 178 and 728 … scheduler failed`;
+  - weights ignored (one stride for every thread) → `shares 337, 334 and 328 … scheduler failed`;
+  - one weighted worker never picked by the run queue → `shares 208, 791 and 0 … scheduler failed`;
+  - the run queue picking the highest pass instead of the lowest, and a tick that never preempts → `workers did not exit: scheduler failed` (the earlier preemption proof catches both before this one runs);
+  - the step limit one second instead of 3 ms, so preemptions count as running → `shares 326, 335 and 338 … over 5822 ms of running: scheduler failed`;
+  - *one worker holding the timer off for 70 ms in the first run (interrupts masked while it keeps running, as a late tick looks) → the run is repeated and the boot passes: `shares 50, 196 and 753 … over 1989 ms of running (after a stalled run)`;*
+  - the same stall with the repeat disabled → `shares 83, 184 and 732 … scheduler failed` (the stall really would have failed the proof);
+  - a stall in every run → `shares 81, 180 and 738 … (after a stalled run): scheduler failed`, after three runs (the budget is bounded).
+- **Unsafe:** none added.
+- **Gates:** `cargo xtask check` passes (702 tests, 0 failures, 6 ignored, one test more than before); `cargo xtask boot-matrix` passes (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs, then `boot-x2apic` on leaves 1Fh and 0Bh), every boot within 47–51, 189–194 and 755–760 per mille over 1984 to 2026 ms of running, none repeated.
+- **Not done:** the fairness check in `sched::prove` (two workers on each CPU within a factor of two) still counts iterations; it is far from failing (median ratio 1.10, worst 1.52 over 30 samples at 1× and 1.43 over 10 at 2×, bound 2). At double load, `wait queues: ping-pong` (1000 round trips, each under 2000 µs) failed 3 boots of 5 in the probe runs (2003, 2045 and 2084 µs) and `prove_timers` (a timer at most 2 ms late) failed 2 boots of 30 in the A/B: different proofs, different mechanisms, not touched here (since addressed: "The wait-queue ping-pong and the timer queue under host load", next). The window was not lengthened, so nothing here costs a normal boot any time. The step limit fits this host's stalls (milliseconds); on physical hardware (CLAUDE.md §74) the limit does not matter because a worker is not descheduled. QEMU only.
+- **Licensing:** project licence not chosen yet.
+
+### The wait-queue ping-pong and the timer queue under host load (`wait::prove_ping_pong`, `wait::run_ping_pong`, `prove_timers`, `timers::Firing`, `timers::Verdict`, `timers::judge`, `runqueue::judge_round_trips`, `runqueue::RoundTrips`, `runqueue::ROUND_TRIP_LIMIT_MICROS`, `runqueue::DISTURBED_PER_MILLE`, `sched::yield_until_away`; CLAUDE.md §26, §30, §68, §72; task WAIT-TIMERS-LOAD; 2026-11-08)
+
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08, task WAIT-TIMERS-LOAD, on `claude/priceless-einstein-d6f3b9` from `118834b` (the weighted-share proof, `claude/elegant-thompson-48edc8`). Original code. The ping-pong's first rule (`05deb69`) was replaced after review, in the commit that follows it; see "The first two designs" below.
+- **Merged:** into `claude/interesting-carson-ae7c83` on 2026-11-09, on the owner's word (`31c3d39`; `framekernel/src/main.rs`, also changed by the early console, merged automatically). On that tree `cargo xtask check` passes (827 tests, 0 failures, 6 ignored) and `cargo xtask boot-matrix` passes on a quiet host: all 15 ping-pongs passed at their first run (41 to 56 µs on two or more processors, 5 µs on one) and all 15 `prove_timers` runs decided at their first run (worst lateness 0 µs in 14, 38 µs in one).
+- **Why.** The two boot proofs still failing on a loaded host, seen at double load (two `yes` per logical core, about 20 processes on this 10-core M1 Max) by the session before this one: the wake-up ping-pong in `wait::prove` (1000 round trips between two processors, each woken by the other; a round trip must average under 2000 µs) failed in 3 boots of 5 of that session's probe kernels (2003, 2045 and 2084 µs), and `prove_timers` (a timer at most 2 ms late) failed in 2 boots of 30 of its A/B (worst lateness 3300 and 6979 µs), each after six runs.
+- **The cause, measured.** A probe kernel (not committed) added, to each boot, 20 more ping-pongs timing every round trip and 600 more runs of the timer loop recording the polls around every firing. Each row below is the boots named, one at a time, with the named number of `yes` per logical core and, as in the earlier sections, whatever else other sessions ran on the machine (1-minute load averages from about 5, quiet, to over 250). The 3× and 4× rows go beyond the requested load to show where each mean finally gives way.
+
+  The timer proof, per run of three firings (a run is "undecided" if a firing's poll was 2 ms or more after its deadline with the previous poll before it: `timers::Verdict::Undecided`; the probe runs back to back, so a budget of *n* runs is measured on *n* consecutive runs, over every starting point; the old rule itself, replayed on the same logs, gives the same failure rates to within 0.1 of a percentage point):
+
+  | Load | Runs (boots) | Firings on time / decisively late (`Verdict::Late`) / undecided | Runs undecided | Longest streak of undecided runs | Budget of 6 runs ran out (the old budget) | 12 runs | 24 runs |
+  |---|---|---|---|---|---|---|---|
+  | quiet | 1200 (2) | 3600 / 0 / 0 | 0 | 0 | 0 | 0 | 0 |
+  | 1× | 3600 (6) | 10314 / 0 / 486 | 11.0 % | 7 | 0.14 % | 0 | 0 |
+  | 2× | 3600 (6) | 7678 / 0 / 3122 | 55.0 % | 12 | 4.4 % | 0.08 % | 0 |
+  | 3× | 2400 (4) | 4248 / 0 / 2952 | 75.0 % | 22 | 20.8 % | 3.6 % | 0 |
+  | 4× | 1200 (2) | 1966 / 0 / 1634 | 81.6 % | 21 | 29.6 % | 6.1 % | 0 |
+
+  In all 36 000 firings, none was decisively late. In the 27 609 firings of the runs whose polls were logged (every run with a firing at least 200 µs late or a poll gap of at least 500 µs), none had its deadline already passed at the poll before the one that fired it, and the other 8 391 firings came within 200 µs of their deadlines: the queue did not hold a due timer. Every lateness the proof reported was a late look. (The queue is polled, and on this host the polling loop's vCPU is simply away for milliseconds; a stall across a deadline makes the poll that follows report the stall's length.)
+
+  The ping-pong, per run of 1000 round trips (microseconds; "slow" means a round trip of at least 2 ms; the boot flow's away time is the sum of its spin loop's steps of at least 3 ms, as a share of the run; the 4× row's 60 runs are 3 boots, the fourth stopped at another proof):
+
+  | Load | Runs (boots) | Mean round trip: average of the runs (range) | Runs ≥ 2000 µs | Median round trip: average (worst run) | Slow round trips per 1000: average (worst) | Boot flow's processor away, per mille of the run: average (lowest) | Far CPU's reschedule IPIs per run: lowest, median |
+  |---|---|---|---|---|---|---|---|
+  | quiet | 40 (2) | 38 (28–46) | 0 | 27 (33) | 1 (1) | 0 (0) | 908, 948 |
+  | 1× | 120 (6) | 258 (68–519) | 0 | 102 (184) | 23 (65) | 119 (0) | 824, 904 |
+  | 2× | 120 (6) | 583 (145–1713) | 0 | 170 (638) | 66 (220) | 284 (0) | 852, 918 |
+  | 3× | 80 (4) | 861 (486–1387) | 0 | 208 (343) | 108 (186) | 433 (268) | 887, 918 |
+  | 4× | 60 (3) | 1255 (738–2563) | 4 | 276 (758) | 155 (312) | 561 (399) | 894, 922 |
+
+  The mean is the host's tail, not the kernel: at 2× the slowest tenth of the round trips carries 60 % of the time, and the mean of a run varies from 145 to 1713 µs while the worst run's median is 638 µs and the median across runs is about a third of the mean. Quiet, the median round trip is 27 µs; loading the host does not change what the kernel does for a round trip, only when the host lets it happen. At 4× the mean finally crosses the bound (2563, 2474, 2044 and 2005 µs in 4 runs of 60, medians 578, 758, 514 and 507 µs); in those four runs the boot flow's processor was away for at least 65 % of the run, and the far CPU took at least 900 reschedule IPIs. (In every run at every load, the far CPU took at least 824; in the 72 runs whose mean was at least 1 ms, the boot flow's processor was away for at least 34 % of the run.) The 75th percentile, by contrast, would have failed 6 of the 60 runs at 4× (up to 312 slow round trips per 1000), so a percentile higher than the median does not survive this host.
+- **What changed (kernel binary).**
+  - `prove_timers` (`main.rs`): every firing's lateness is an interval from the polls around it, and a run decides only if the whole interval of every firing is inside or outside the 2 ms limit (`timers::judge`). A firing whose previous poll is already past the deadline by the limit means the queue held a due timer (`Late`): a stall cannot make that happen, and it fails at once, as does a firing in the wrong order (a stall cannot reorder a queue or fire a cancelled timer). A stall across a deadline leaves the firing `Undecided`, and the whole run is measured again, up to 64 runs; each run is about 15 ms and only an undecided run leads to another, so an undisturbed boot pays for one run, as before. The boot line is unchanged except that `(after a stalled run)` now means any undecided run came first.
+  - `wait::prove` (`wait.rs`): the ping-pong moves into `prove_ping_pong` and `run_ping_pong`. **The bound did not change, and only the bound can pass a run: its mean round trip must be under 2000 µs** (`runqueue::judge_round_trips`). The boot flow, which spins in `yield_until_away` while it waits, adds up the steps of its own loop of at least 3 ms (the same 3 ms the weighted-share proof uses). A run over the bound during which that came to at least a tenth of the run (`runqueue::DISTURBED_PER_MILLE`) says nothing either way and is measured again, at most 8 runs in all, each against the same bound. A run over the bound without that reading fails at once, as before. The reading is only a hint: a thread under test on the boot flow's processor can produce it just by running, which is why it can earn a repeat and never a pass. A run on one processor never earns a repeat: there the boot flow takes turns with the two threads, so the reading is about 80 % on a quiet boot and says nothing about the host. The boot line reports the reading and the run number, `… 1000 round trips, N us each, woken by IPI (boot flow away for A per mille of the run, run R of 8)`, ending in `(after a stalled run)` when a run was repeated, and on one processor `… N us each (one processor)`; the `boot-test` markers still match.
+  - `sched::yield_until_away`: `yield_until`'s loop, returning the sum of its steps of at least `RUNNING_STEP_MICROS` (3 ms). `yield_until` calls it and discards the result; the cost is one more `rdtsc` a turn. A step that long means the virtual CPU was descheduled or that another thread on that processor ran for that long, and the loop cannot tell which, as its comment now says: its result may earn a repeat of a measurement, never a more lenient verdict.
+- **What changed (library, host-tested).** `timers::Firing` (the polls around a firing, with `latest`, `earliest` and `verdict`), `timers::Verdict` and `timers::judge`, with hand cases at the limit's edges, undecided, on-time, late, a timer that never fired, a closely polled run deciding exactly, and a seeded property test (4000 cases of random stalls) that a correct queue is never judged `Late` and a queue holding timers past the limit is never `OnTime`. `runqueue::judge_round_trips` and `RoundTrips`, with a test that a disturbance earns a repeat and never a pass: the bound's edges, the tenth, and, over a grid of inputs, that only a mean under the bound passes.
+- **Why these rules, and not others.**
+  - *The timer proof:* the two polls around a firing bound its lateness, so the verdict needs no assumption about the host: the interval either fits inside the 2 ms or does not, and a stall can only widen it. A run decides only when every firing is decided (three deadlines in one run, as before; the whole-run rule rather than accumulating per deadline, because 24 runs were never exhausted at any load measured and the code is simpler), and the budget of 64 is cheap: an undisturbed boot still pays one 15 ms run. The bound (2 ms) did not change: a queue that is late with the poller looking fails at once, as the controls show.
+  - *The ping-pong:* every run that passes has met the old bound. What changed is only what happens to a run over it. On a quiet host such a run fails at once, as it always did. On a loaded host the mean of a run can be carried by stalls of the host (the table above: at 4× the mean reached 2563 µs with medians under 760 µs), and such a run says nothing about the kernel, so it is measured again, against the same bound: the method of the clock proofs and the weighted-share proof, where evidence of a disturbance buys a repeat and nothing else. How far that carries is in the boot-level table below. The budget is 8 runs because a repeat costs nothing unless it is used: an undisturbed boot pays for one run, two of the boots measured at 4× below passed only at their fifth and eighth runs, and a genuinely slow kernel still fails, later rather than sooner (at most 8 runs of at most 5 s). The price of the rule is that a kernel which is too slow in only some of its runs, and keeps the boot flow away while it is, can pass on a repeat; the first two designs below show what it costs to try to do better.
+  - A percentile or a trimmed mean instead of the mean, used always, was rejected: the 75th percentile fails at 4× (the slow share reaches 31 %), and either statistic would throw away part of what the old bound was sensitive to on a quiet host.
+- **The first two designs, and why they were not shipped.** `05deb69`, the first version of this rule, judged a run by its median and by the share of its round trips that came by reschedule IPI, instead of its mean, whenever the boot flow was away for at least a tenth of the run. That was wrong, and its record's statement that the bound was unchanged did not hold for such a run: the pinger runs on the boot flow's processor, so a step of 3 ms there can be the pinger running, and false evidence bought a looser verdict, not only a repeat. Two reviewing sessions found it (the reviewer's control is below: with the pinger spinning 10 ms on every fourth round trip and no host load, `05deb69` passed both boots, 2555 and 2554 µs, medians 55 and 56 µs, away for 893 and 891 per mille, where `118834b` failed both). A second design was built and not shipped: keep the looser verdict, on evidence neither thread can produce on the other's processor, both processors losing at least 3 timer ticks (`prove_weights`' threshold). It fired on all four runs over the bound at 4× (at least 18 ticks lost on one processor and 9 on the other) and never on a quiet or 1× run. But a kernel holding interrupts off on both processors produces it too: with both threads spinning 25 ms with interrupts off on every twentieth round trip and no host load, it passed (`2553 us each (median 55 us, 916 reschedule IPIs, 73 and 80 ticks lost, …)`). And it is weakest where a repeat is enough: on the eight longest runs at 2×, the far processor lost under 3 ticks in five. Hence the shipped rule: a disturbance earns a repeat, and only the bound earns a pass (CLAUDE.md P0: a ping-pong that can still fail under heavy load is better than one that passes a slow kernel).
+- **Measured at boot level.** `cargo xtask boot-test`, the parent kernel `118834b` and the final rule alternating boot by boot, each boot's first failure. The load in the first column is the range and median of the 1-minute load average when each boot ended.
+
+  | Experiment (alternating boot by boot) | Kernel | Boots | Pass | First failure: ping-pong | First failure: timers | First failure: another proof | Failure rate | Ping-pong mean in the boot lines (range, µs) | Timer proof repeated a run | Mean boot time |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | 1×, 10 pairs (load 21 to 32, median 25) | original (`118834b`) | 10 | 10 | 0 | 0 | 0 | 0 % | 89–1030 | 2 of 10 | 30 s |
+  | | **final rule** | 10 | 9 | **0** | **0** | 1 (`clock`) | 10 % | 64–1014 | 1 of 9 | 29 s |
+  | 2×, 15 pairs (load 27 to 34, median 30) | original (`118834b`) | 15 | 13 | 0 | 1 | 1 (the timed wait, 81 ms, bound 80) | 13 % | 1389–1722 | 5 of 14 | 41 s |
+  | | **final rule** | 15 | 14 | **0** | **0** | 1 (`scheduler`) | 7 % | 1287–1683 | 7 of 14 | 42 s |
+  | 4×, 20 pairs (load 33 to 58, median 53) | original (`118834b`) | 20 | 0 | 5 | 0 | 15 (`clock` 9, APIC timer 6) | 100 % | 2823–3408 (5 boots reached it) | none reached it | 21 s |
+  | | **final rule** | 20 | 2 | **4** | 0 | 14 (APIC timer 8, `clock` 5, `scheduler` 1) | 90 % | 391–2982 (6 boots reached it) | 1 of 2 | 30 s |
+
+  The host was not the one of the earlier measurements in this section: other sessions had gone idle, and the same kernel `118834b` took about 2.5 times as long per round trip (the median of its boot-line means was 796 µs at 1×, 1540 at 2× and 3110 at 4×, against 314, 559 and 1356 earlier the same day). A count of `yes` does not by itself fix the stress.
+
+  At 2×, the load this task is for, no boot of either kernel failed the ping-pong: the final rule's 14 boots all passed at the first run, with means of 1287 to 1683 µs, not far under the bound. Its timer proof passed all 14, seven of them after a stalled run, where the old kernel's failed 1 of 14 (`worst lateness 3111 us (after a stalled run): timers failed`, the failure this task started from). At 1× neither kernel failed either proof.
+
+  At 4× the host's ordinary round trip in this batch is over the bound (means of 2761 to 3408 µs), and repeats cannot change that. The final rule passed 2 of the 6 boots that reached the proof, at runs 5 and 8, and failed 4 after all 8 runs (for example `2761 us each, woken by IPI (boot flow away for 703 per mille of the run, run 8 of 8) (after a stalled run): wait queues failed`); the old kernel failed all 5 it reached. That is the cost of refusing a looser verdict: at that load the proof measures the host, and says so by failing. Most boots at 4× stopped earlier in both kernels, at the APIC timer proof (`50 interrupts in 756124 us, expected 50 in 500000 us`; 6 and 8 boots) and the clock proofs (the RTC rule and the cross-CPU check's 100 handoffs; 9 and 5): other proofs, not touched.
+
+  The `scheduler` failures in the final arm are the two-worker fairness check of `sched::prove` (iterations within a factor of 2: `counted 549175 and 253257` at 2×, `133233 and 359113` at 4×), already recorded as sensitive to load. The only change on its path is one more `rdtsc` per turn of `yield_until`. Over every batch of this section it failed 0 of 105 boots of the old kernel and 2 of 105 of the new; over the last batch the ratios match (median 1.11 to 1.22, 90th percentile 1.27 to 1.70, in both arms), so the sample cannot tell a change from chance, and it is reported here rather than explained away. The RTC failure at 1× in the final arm (`too uncertain to confirm within 1 %`) is the clock proof's, unrelated and not touched.
+- **Negative and positive controls** (each a temporary edit on a scratch copy of the final tree, booted with `cargo xtask boot-test`; positive controls in italics; quiet host unless noted):
+  - timer queue: a timer genuinely 3 ms late with the poller running → `worst lateness 3000 us: timers failed`, at the first run; the cancelled timer fires → `fired in order [10, 20, 99, 30], … : timers failed`; a queue that never fires → `fired in order [], … : timers failed`;
+  - *a 9 ms stall across a deadline in the first run → repeated, the boot passes: `worst lateness 0 us (after a stalled run)`;*
+  - the same stall with the repeat disabled → `worst lateness 8919 us: timers failed` (the stall really would have failed the proof); a stall in every run → `worst lateness 8900 us (after a stalled run): timers failed` after 64 runs (the budget is bounded);
+  - ping-pong, a kernel that delays itself with no host load (the reviewing sessions' control and its neighbours): the pinger spinning 10 ms on every fourth round trip, interrupts on → `2541 us each, woken by IPI (boot flow away for 895 per mille of the run, run 8 of 8) (after a stalled run): wait queues failed`, the same on four processors (`2552 us each`, 903 per mille, run 8 of 8) and at 2× load (`4568 us each`, 852 per mille, run 8 of 8); the ponger doing the same → `2560 us each, woken by IPI (boot flow away for 15 per mille of the run, run 1 of 8): wait queues failed`, at once; a 25 ms hold with interrupts off on every tenth round trip, pinger `2552 us each` (979 per mille, run 8 of 8) and ponger `2554 us each` (5 per mille, run 1 of 8), both fail; both threads holding interrupts off for 25 ms on every twentieth round trip → `2552 us each` (489 per mille, run 8 of 8), fails: the hold that passed the second design. On one processor (`ORIGIN_QEMU_SMP=1`), every fourth round trip 10 ms slow → `2506 us each (one processor): wait queues failed`, at once;
+  - ping-pong, the wake-up path: no reschedule IPI at all → `… did not finish within 5 s: wait queues failed` (quiet and at 2×: woken only by ticks, each round trip takes a tick period); every second wake's IPI lost → the same; every fourth wake's IPI lost → `3026 us each, woken by IPI (boot flow away for 0 per mille of the run, run 1 of 8): wait queues failed` (the undisturbed mean, at once), at 2× `4722 us each` (441 per mille, run 8 of 8), fails; a wake-up path 3 ms slow → `3066 us each, … run 1 of 8): wait queues failed` at once; 2.5 ms slow at 2× → `… did not finish within 5 s: wait queues failed`;
+  - *a 2.5 s stall of the boot flow's processor in the first run → repeated, the boot passes: `49 us each, woken by IPI (boot flow away for 0 per mille of the run, run 2 of 8) (after a stalled run)`; both processors stalled 2.5 s with interrupts off in the first run (a descheduled vCPU, as the guest sees it) → the same, `51 us each, … run 2 of 8) (after a stalled run)`; the first run stalled 1 s and slow (a 3 ms slow wake path) → `46 us each, … run 2 of 8) (after a stalled run)`;*
+  - the same 2.5 s stall with the repeat disabled → `2544 us each, woken by IPI (boot flow away for 982 per mille of the run, run 1 of 1): wait queues failed` (the stall really would have failed the proof);
+  - a 2.5 s stall in every run → `2542 us each, woken by IPI (boot flow away for 983 per mille of the run, run 8 of 8) (after a stalled run): wait queues failed`; both processors stalled 1 s and a 3 ms slow wake path in every run → `4046 us each, … run 8 of 8) (after a stalled run): wait queues failed` (the budget is bounded).
+- **Unsafe:** none added.
+- **Gates:** `cargo xtask check` passes (710 tests, 0 failures, 6 ignored, eight tests more than `118834b`); `cargo xtask boot-matrix` passes (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs, then `boot-x2apic` on leaves 1Fh and 0Bh). In that matrix every ping-pong passed at its first run, with means of 41 to 55 µs on two or more processors (boot flow away for 0 per mille) and 4 and 5 µs on one, and every `prove_timers` line read `worst lateness 0 us`.
+- **Not done:** the 5 s limit on the ping-pong (`did not finish within 5 s`) is unchanged, so a run with a mean round trip above 5 ms fails on time rather than on the bound; the worst mean measured was 3408 µs, at 4×. The other proofs this comparison shows failing under load were not touched: the timed wait (`prove_timed`, 81 ms against a bound of 80 in one boot of the old kernel at 2×, 69 ms at worst otherwise); the RTC proof (`too uncertain to confirm within 1 %`, one boot of the final kernel at 1×, and it stopped one control boot at 2×); the two-worker fairness check; and, at 4×, the APIC timer proof and the cross-CPU TSC check's 100 handoffs. At 4× in the last batch the ping-pong itself failed most boots that reached it, as described above. A kernel too slow in only some of its runs, with the boot flow kept away while it is, can pass on a repeat. Everything here is QEMU only (CLAUDE.md §74).
+- **Licensing:** project licence not chosen yet.
+
 ### Serialized kernel console (2026-11-07)
 
 - **What:**
@@ -319,6 +528,47 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Control:** with the lock bypassed, two CPUs' bytes mix mid-line, and the boot test fails with "two kernel lines ran together".
 - **Evidence:** `cargo xtask check` and `boot-matrix` (1, 2 and 4 CPUs) pass; boot to halt takes 4.8, 5.4 and 7.1 s.
 - **Limitation:** interrupts stay off while one line is sent. In QEMU that is microseconds; at 115 200 baud on real hardware it is about 9 ms per 100 bytes. Production logging will go to a memory ring drained by a thread (CLAUDE.md §69).
+
+### The early console: the firmware's framebuffer and a UART from the SPCR (ADR-0010, accepted by the owner; `boot/info`, `boot/uefi`, `paging::layout`, `fbconsole`, `font`, `spcr`, `serial`, `console`; xtask; CLAUDE.md §13, §19, §51, §58, §69; 2026-11-08)
+
+ADR-0009 H6 required a console that does not depend on a 16550 at I/O port `0x3F8`, because neither first machine documents its COM port's address and a failed boot would have shown nothing.
+
+- **Author / date:** Claude Code (local, session `funny-benz-fa7d10`), 2026-11-08. Original code and font, no third-party crates (§3, §5).
+- **Merged:** into `claude/interesting-carson-ae7c83` on 2026-11-09, on the owner's word (`8040882`; the merge changed no code from `a96bf7b`). On the merged tree `31c3d39`, `cargo xtask check` passes (827 tests, 0 failures, 6 ignored) and `cargo xtask boot-matrix` passes on a quiet host, the 8 `boot-console` scenarios included. Drawing a line took 226 to 245 µs on average and at most 808 µs (14 boots, QEMU TCG).
+- **ABI:** boot info **0.4** appends `Framebuffer` (48 bytes at offset 128, `size_of::<BootInfo>() == 176`), with pixel format as channel masks. Written as Proposed under §84 and **accepted by the owner on 2026-11-08** (ADR-0010 E1, `docs/engineering/OWNER_DECISIONS.md` item 27), together with the mapping window and the UART policy (items 28 and 29).
+- **What:**
+  - `origin-boot-info`: `Framebuffer`, `FramebufferError`, `Framebuffer::check` (the contract: both the loader and the kernel run it), `overlaps_ram` (the "is it RAM" question for a device range).
+  - `origin-boot-uefi`: `protocols` (GOP structures, `LocateHandle`), `framebuffer::describe` (GOP mode → boot-info framebuffer; RGB, BGR and bit-mask formats become masks), and `find_framebuffer`/`framebuffer_of` in `main.rs`: every Graphics Output handle is examined and the first usable one the firmware uses as a console wins (`EFI_CONSOLE_OUT_DEVICE`), else the first usable one. The mode is never changed. A framebuffer that overlaps RAM or cannot be mapped is dropped, not fatal.
+  - `origin-paging::layout`: `framebuffer_mapping` (the first 2 GiB of the MMIO window, keeping the physical offset within 2 MiB so large leaves work), and `map_framebuffer` (run after everything else in both the loader's and the kernel's tables, so a failure costs only the framebuffer). Mapped uncached, kernel-only, writable, never executable. `MMIO_BASE` starts above the 2 GiB.
+  - `framekernel::font`: an original 8 by 16 ASCII font, 96 cells (95 printable characters and a replacement glyph), written in the source as a "contact sheet" of `.`/`#` rows, compiled at build time, with tests that every printable glyph exists, is distinct and is the only ink in its cell. **Drawn by hand for this project** (glyph by glyph on the grid, as the source shows); no existing font's data, file, image or table was consulted or copied (§3, §51). `0` is slashed and `1`, `l`, `I` differ, for reading addresses and logs.
+  - `framekernel::fbconsole`: `Screen` (geometry from a validated `Framebuffer`; scale 1 below 1440 rows, 2 below 2880, else 3), `Cursor` (one atomic, lock-free for urgent reports), drawing through `PixelSink`. The console never scrolls and never reads video memory: a newline paints a bar on the next row and the screen wraps, so a line costs one row's writes (ADR-0010 E3). Each UTF-8 lead byte draws the replacement glyph once, continuation bytes draw nothing, other non-printable bytes draw the replacement, `\r` does nothing.
+  - `framekernel::spcr`: `parse` (revisions 1–4; interfaces 0/1 in revision 1 and DBG2 subtypes 0x0, 0x1, 0x12, 0x14 otherwise; the Generic Address Structure in I/O or memory space, stride and access width per the DBG2 notes; I/O ports below `0x1000` other than the four standard COM blocks refused; every other value refused by name), `UartAddress`, `Spcr::line_setup` (a stated rate and clock are programmed; otherwise a programmed latch is left alone, and a zero latch gets the table's rate on the PC clock for an I/O UART).
+  - `framekernel::serial`: `configure(LineSetup)` (program a divisor or keep the firmware's settings), `write_bytes`, `line_settings`/`restore`, `divisor_for`, `EarlyLog`. `init` programs what it did before, after clearing a stray DLAB.
+  - `console` (binary): `Sinks` under the console lock (UART, the early log, the firmware's own COM1 settings), `KernelUart` (port or MMIO registers), `ScreenCell` (the screen, set once), `CURSOR`, `UNOWNED` (the UART address for urgent reports with no lock), `attach_framebuffer`, `withdraw_framebuffer`, `adopt_firmware_uart`, `move_to`/`move_uart`. Every line: screen first, then the UART, then at most the log. A UART that stops taking bytes costs one bounded wait and is dropped (`uart_alive`), with a report on the screen; one that will not take the replayed log at the move leaves COM1 in charge; a screen that cannot be mapped is withdrawn before the kernel's tables load. The console measures its own drawing (`DRAWN_LINES`, `DRAW_CYCLES`, `DRAW_WORST`) and reports the average and worst per line in the console proof (rule 21).
+  - `main.rs`: `uart.line_settings()` before the first programming, `attach_framebuffer` right after the boot info is validated, `adopt_firmware_uart` right after `init_paging`, the `Placement` for the kernel's own tables.
+  - `xtask`: `screen` (`parse_ppm`; `model_rows`, which computes what the screen must show from the console's written rules (wrap, lazy wrap, the rule for every byte class) **independently of `fbconsole`'s code**; `decode`, which reads a dump back cell by cell against the font in the specification's literal colors; `check_frame`, `screen_text`), `dump_screen`, `Capture`, `Completed`, `boot-console` with six scenarios (below), and `boot-matrix` running them once. The main `kernel boot` scenario checks a screen dump in every cell of the matrix.
+- **Specifications:** Microsoft "Serial Port Console Redirection Table" (spec revision 1.10, table revision 4, read in full 2026-11-08), Microsoft "Debug Port Table 2" (2023-04-10; subtypes, GAS notes for 16550), UEFI 2.11 §12.9 for GOP (the page refused the fetch; the ABI was confirmed against EDK II's `GraphicsOutput.h` and by the boot); ADR-0002 B4, ADR-0004 H2. Research: `docs/research/2026-11-08-early-console.md`.
+- **Unsafe code:**
+  - `console::KernelUart` (8 sites): port and MMIO register access; the invariant is `port`/`mmio`'s contract, established by `spcr::parse` (allowed ports, alignment) and `map_mmio` (uncached mapping), with `uart_for` checking RAM overlap.
+  - `FramebufferMemory::write32`: a bounds- and alignment-checked volatile write; `attach_framebuffer` established the mapping.
+  - `ScreenCell`: `Sync` over an `UnsafeCell` that is written once before readers exist (documented at the impl).
+  - `boot/uefi/src/main.rs` (`find_framebuffer`, `console_device`, `framebuffer_of`): firmware calls and reads of firmware-owned protocol data, each checked for null and alignment; `describe` validates the values. `KernelUart`'s 8 register-access blocks in `console.rs`.
+- **Tests:**
+  - `framekernel` (host): `spcr` 8 tests including `hostile_tables_keep_every_promise` (200 000 mutated tables, sealed, on `crate::testing`, every accepted table keeps its invariants, and a divisor is only produced from a stated rate and a known clock); `fbconsole` 11 tests including `any_accepted_description_and_any_bytes_stay_inside_the_display` (15 000 hostile descriptions, arbitrary bytes, every pixel inside the visible rows and aligned); `font` 5 tests; `serial` six new tests.
+  - `origin-boot-info` 2 new tests (`check` over 15 refusals and valid modes; `overlaps_ram`); `origin-paging` 3 new tests (mapping uncached with the physical offset kept, a mapping that does not fit is not a failed boot, largest framebuffer fits); `origin-boot-uefi` 4 new tests (`describe`); `xtask` 5 new tests (`parse_ppm`, the frame comparison and its negative cases, decoding oldest-first, noise cells).
+- **Boot proofs (QEMU 11.1.3, OVMF edk2-stable202408):**
+  - `cargo xtask boot-test`, every run: the kernel scenario adds the loader line and the kernel's `console: framebuffer ...` line, boots with COM1 and the monitor on stdio (`-serial mon:stdio`), and after `M1 entry complete` takes a screen dump (Ctrl-A C, `screendump`) and checks it **cell for cell, in the specification's literal colors**, against the rows the serial log implies, computed by `xtask` from the console's rules rather than with its code (`check_screen`, `screen::check_frame`). The console never moves what it has drawn, so a row only matches if every earlier line took the rows it should. The picture was also looked at by eye: legible text and the cursor bar right after the last line.
+  - `cargo xtask boot-console` (each a whole signed boot): **the UART named by the SPCR** (a table added with `-acpitable`, a 16550 at port `0x2F8`, COM1's output in a file): all the kernel's output arrives on that UART, starting with the replay of the first lines, and COM1's log ends at the move line; **COM1 named by the SPCR itself** (the same-port path: left "as the firmware set it", nothing replayed); **a UART that answers but takes no bytes** (`isa-debugcon` on its status port, reading back 0): the replay fails, COM1 is given back, and the boot carries on; **an SPCR for an interface this kernel cannot drive**, **one naming a port with no UART** and **one naming registers in RAM**, each refused and named, leaving COM1 in use; **no display** (`-vga none`) and **no UART at all** (`-serial none`, the boot is judged only from screen dumps): both boot to the halt line.
+  - **Cost** (rule 21): the console proof reports what drawing a line cost on that boot. At 1280x800 under QEMU's TCG on a quiet host, about 240 µs per line on average (233–243 µs over the first ten boots of a `boot-matrix` run) and under 1 ms at worst; a line drawn during a host stall takes as long as the stall (over 9 ms was seen under load). A line is drawn with interrupts off, like a serial line, and takes no longer on a big screen than one row's pixels; at real panels' widths the uncached writes are the bound, and write-combining (ADR-0010 trade-offs) would shrink them.
+- **Negative controls** (each applied to the source or the table, run, shown to fail its proof, and restored from the git index): each applied, its proof run, the failure recorded, and the file restored from the git index.
+  - *The framebuffer proof (`boot-test`'s screen check).* FB1, the kernel draws nothing: the bar is still on row 0, the log puts it on row 16. FB2, red and blue swapped: no row is the bar's color. FB3, the stride four bytes off: no bar. FB4, one line lost mid-boot: the bar is one row early. FB5, the kernel's own tables do not map the framebuffer: the bar stops where the framebuffer was withdrawn. FB6, glyphs drawn one pixel to the right: "the screen differs from the serial log at text row 0".
+  - **FB2 and FB6 passed against the first version of the screen check**, which compared the dump with a frame rendered by the kernel's own drawing code, so a bug in that code could vouch for itself. That is why `screen::model_rows` and the literal colors exist; both controls were run against the new check and fail. The first version's other controls (FB1, FB3, FB4, FB5) had also failed.
+  - *The SPCR proof (`boot-console`, a table naming a UART at `0x2F8`).* SP1, the kernel ignores the SPCR: nothing reaches the named UART. SP2, the parser reads the address one byte off: "nothing answers" there and the console stays on COM1, so the named UART receives nothing. SP3, the earlier output not replayed: the first lines are missing from the named UART. SP4, the console stays on COM1 after the move: the named UART receives nothing. SP5, the table says `0x3E8` while the UART is at `0x2F8`. SP6, a table for another interface accepted (the refusal the scenario expects never comes). SP7, COM1 not given back when the new UART takes no bytes. SP8, COM1 named by the SPCR treated as a new UART (its log replayed).
+  - Host: `screen::every_wrong_picture_fails` (a lost line, a black frame, swapped channels, one row shifted a pixel, one wrong pixel, a second bar) and the SPCR tables each proof uses parse as the UART they name.
+- **Gates:** `cargo xtask check` passes: 819 tests, 0 failed, 6 ignored. `cargo xtask boot-matrix` passes in full on a quiet host: Intel VT-d and AMD-Vi at 1, 2 and 4 processors, each `boot-test` with all 11 scenarios (the kernel scenario's screen check in each), `boot-x2apic` under leaves 1Fh and 0Bh, and `boot-console` (8 of 8 scenarios). Every kernel boot took 16–26 s. An earlier full run stopped in `boot-console`'s third scenario when another session's host-load test started during it (`an unsignalled 50 ms timed wait timed out after 82 ms`: a host-load failure of a proof this work does not touch, in a boot whose first lines were this work's own); the eight `boot-test` runs before it had passed. The rerun on a quiet host passed.
+- **Security review:** by the author, and by one fresh reviewing agent (a read-only pass over the staged diff, given the ADR and the SPCR specifications, not my conclusions). It found no memory-safety bug. Its findings, all fixed: a UART that answers but takes no bytes silently lost the serial console (COM1 is now given back and a boot scenario proves it); a saved divisor of 0 could be restored onto COM1 (never restored now, and the format is compared as well as the divisor); the loader's entry stub could run out of table pages because the framebuffer's tables were allocated first (the framebuffer is mapped last on both sides); the reason a screen is withdrawn did not reach it (printed first now); a stray DLAB at the first programming (cleared first); a too-permissive I/O port list (now the four COM blocks and above `0xFFF`); and the rate logic, which replaced a working divisor from an assumed clock (a programmed latch is now left alone). Its observation that `wait_for_screen` sees failures only while they are on screen is documented at the function.  This is agent review, not an independent security review.
+- **Limitations:** as ADR-0010, "What this does not prove": QEMU only. A wedged UART is shown with a debug-console port that answers the status register with 0, not a real device. **The firmware framebuffer may go dark on a real integrated GPU when `iommu::init` enables translation (scan-out by DMA through the unit; T14) or when the T4 work clears its bus mastering.** The MMIO UART path has no boot proof (QEMU has none on x86; tested with mocks). Output before `adopt_firmware_uart` reaches COM1 and the screen only; the UART named by the SPCR gets it replayed once the tables can be read, up to 8 KiB, with a count of what did not fit.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### TLB shootdown and global kernel pages (ADR-0004 H5; CLAUDE.md §28, 2026-11-07)
 
@@ -348,7 +598,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **What:**
   - `runqueue` (library): a `Blocked` state; a per-slot generation, bumped by every `push`, so a wake-up names its thread exactly and a stale one never wakes the slot's next thread; and a pending-wake flag, so a wake-up that arrives before its thread has blocked makes the next `block` return at once.
   - `sched`: `block` (software interrupt 0x84), `current_thread`, `ThreadRef`, and `wake`. Waking a thread blocked on another processor sends that processor a reschedule IPI (vector 0xF1), whose handler acknowledges and switches.
-  - `wait` (binary): `WaitQueue::wait_until(condition)` checks the condition under the queue's lock and registers the thread there before blocking; `wake_one` takes a waiter under the lock, releases it, then wakes it. Lock order: a wait queue's lock, then what its condition reads. These queues are kernel-internal.
+  - `wait` (binary): `WaitQueue::wait_until(condition)` checks the condition under the queue's lock and registers the thread there before blocking; `wake_one` takes a waiter under the lock, releases it, then wakes it. Lock order: a wait queue's lock, then what its condition reads. These queues are kernel-internal. (The protocol moved unchanged to `origin_sync::wait` on 2026-11-08, where Loom can run it: see "Loom models" under `origin-sync`.)
 - **Proof** (every boot):
   - A producer on CPU 1 sends 10 000 numbers through an 8-slot ring to a consumer on CPU 0, each blocking when the ring is full or empty. All arrive in order, in 19–32 ms.
   - Two threads on CPUs 0 and 1 pass a turn back and forth 1000 times: 44–73 µs per round trip, woken by IPI, against a bound of 2 ms.
@@ -387,7 +637,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   Whether sizing turns decoding off is invisible in QEMU; a host test checks it on a device model that records any probe made while decoding is on.
 - **A mistake in the boot test, caught by the matrix:** the PCIe markers were first listed before the scheduler's last line, which the boot prints earlier, so every boot would have failed. The controls had failed on their own failure strings, so they did not show it. The markers now follow the boot order. Lesson: run the good path after adding markers, before running controls.
 - **Test evidence:** 4 `pci` tests and 1 more `origin-paging` test; 83 library tests in all; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
-- **Not done:** bridges' bus numbers and hot-plug, MSI/MSI-X, PCIe capabilities, AER, an IOMMU (no DMA confinement yet), and segments other than 0.
+- **Not done:** bridges' bus numbers and hot-plug, MSI/MSI-X, PCIe capabilities, AER, an IOMMU (no DMA confinement yet; done 2026-11-08, see "Intel VT-d DMA and interrupt remapping"), and segments other than 0.
 
 ### NVMe driver (M5; CLAUDE.md §33; 2026-11-07)
 
@@ -410,7 +660,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - Bus mastering really off → "a command timed out". The driver reports the timeout; it does not hang.
   - A first version of that control only left out the bus-mastering bit. OVMF had already set it, so the control passed and proved nothing; it was redone so that it clears the bit.
 - **Test evidence:** 7 `nvme` tests (91 library tests in all) and 3 xtask `disk` tests (CRC-32 check value, GUID byte order, a self-consistent GPT); `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
-- **Not done:** MSI-X interrupts, several I/O queues (one per CPU), PRP lists for transfers over 8 KiB, controller-reset recovery, power states, health logs (SMART), an IOMMU, and a block layer above the driver.
+- **Not done:** MSI-X interrupts, several I/O queues (one per CPU), PRP lists for transfers over 8 KiB, controller-reset recovery, power states, health logs (SMART), an IOMMU (done 2026-11-08, see "Intel VT-d DMA and interrupt remapping"), and a block layer above the driver.
 
 ### GUID Partition Tables (CLAUDE.md §39; UEFI 2.11 §5.3; 2026-11-07)
 
@@ -461,7 +711,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Negative control:** vector 1 left masked → no interrupt arrives, and the first wait times out → "0 reads … none arrived … NVMe failed".
 - **Process note:** the MSI-X markers were first placed before the GPT markers, which the boot prints earlier. This time the good-path run made before the controls caught it, as the lesson from the PCIe step requires.
 - **Test evidence:** 1 more `pci` test (capability walk, loops, header pointers, bad BIRs, messages) and 1 more `nvme` assertion; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
-- **Not done:** per-CPU queues with a vector each, interrupt remapping (x2APIC IDs above 255), MSI (non-X) devices, and moving the admin queue to interrupts.
+- **Not done:** per-CPU queues with a vector each, interrupt remapping (x2APIC IDs above 255; done 2026-11-08, see "Intel VT-d DMA and interrupt remapping"), MSI (non-X) devices, and moving the admin queue to interrupts.
 
 ### Per-CPU NVMe queues and concurrent I/O (CLAUDE.md §33 multiqueue, §66 per-CPU queues; 2026-11-07)
 
@@ -629,6 +879,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Negative control** (failing the boot test): the redirection entry left masked → 0 interrupts in 2 s → "I/O APIC failed".
 - **Test evidence:** 7 `acpi` tests (I/O APIC and overrides among them) and 3 `ioapic` tests; 163 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs.
 - **Not done:** routing the keyboard IRQ1 to a handler for live keystrokes (the i8042 bring-up is done; this is the remaining link), level-triggered PCI INTx routing, per-CPU interrupt affinity and balancing, and an EOI path for the I/O APIC's own remote-IRR on level interrupts.
+- **Under interrupt remapping (2026-11-08):** this proof still runs before the IOMMU, in compatibility format. Once the IOMMU is up, the same pin is routed again in remappable format through an IRTE; see "I/O APIC interrupts through VT-d interrupt remapping".
 
 ### The ACPI PM timer: a second time-source cross-check (CLAUDE.md §68; 2026-11-08)
 
@@ -646,6 +897,48 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence:** 3 `topology` tests (width decode and ID splitting, the flat fallback, and `analyze`'s package/core/thread counts with a duplicate-ID rejection); 166 library tests; `cargo xtask check`; `boot-matrix` at 1, 2 and 4 CPUs (and an earlier 8-CPU boot).
 - **Not done:** using the topology for scheduler placement (SMT-aware and cache-aware, §27), the cache hierarchy from leaf 04h, and hybrid-core capacity (§27).
 
+### CPU topology from CPUID leaves 1Fh, 0Bh and 80000026h (`topology`; `cpu`, `smp`, `main`; xtask; library + kernel; CLAUDE.md §24, §27, §72, §74; ADR-0008 C2; 2026-11-08)
+
+- **What:** an extension of the entry above (which read leaf 0Bh only) in `framekernel::topology` (library, `forbid(unsafe_code)`):
+  - `CpuTopology::detect(cpuid)`, driven by a CPUID reader: the kernel passes `cpu::cpuid_subleaf`, host tests a modelled processor;
+  - `Layout`: from thread to package, the bits below each domain's ID field, one type for three encodings. Leaves 1Fh and 0Bh give upper bounds (the shift to the next wider domain); AMD's 80000026h gives lower bounds (the shift to each level's own ID), so the two are decoded apart. AMD's complex is the module domain. Leaf 0Bh shows the core field reaching to the package;
+  - the choice of leaf: 80000026h, then 1Fh, then 0Bh, then none, each checked against its maximum and its own validity rule, never by vendor. A malformed leaf is skipped and recorded in `problem`;
+  - unknown domain types absorbed into the known domain directly below (Intel's paper §1.3.2);
+  - `CoreIdentity`: leaf 1Ah's or leaf 80000026h's core type as a raw code, native model, and AMD's efficiency ranking. No names (§24); Intel's text says the code implies nothing;
+  - `Placement` (package, die group, die, tile, module, core, thread), `Census`, and `agree` (each processor against its MADT APIC ID and against the first processor).
+- **Kernel:** `cpu::record_topology` runs on every processor on itself (the boot processor in `prove_topology`, each AP in `smp::ap_entry` before its handshake answer) and stores the decoded record under its `CpuIndex` (`cpu::topology_of`, a spin lock per slot; no new `unsafe`). `smp::listed_apic_ids` gives the MADT's whole list. `prove_topology` reports the layout, each online processor's placement, the MADT census, the core types, and the checks.
+- **Research ledger:** `docs/research/2026-11-08-cpu-topology-leaf-1fh.md`.
+- **Specifications:** Intel SDM Vol. 1 Chapter 21 (253665-093US, September 2026; CPUID.0BH, 1AH, 1FH), Intel *Processor Topology Enumeration* (337015-002), AMD APM Vol. 3 (24594 Rev 3.39, October 2026, read from a mirror and since confirmed byte-identical to AMD's own copy; SHA-256 in the ledger).
+- **Host tests:** 19 `topology` tests: QEMU's exact leaves and census; a leaf above the maximum not believed (the XSAVE reply, and 80000026h reading 1Fh's list); every domain; unknown domains (Intel's Examples B, C, D); every malformed list skipped and reported; 80000026h's convention, hybrid flag, core type and ranking; the leaf 1Ah rules; each way `agree` can fail; mixed thread widths on a hybrid only; and a randomized test over 3000 layouts through all three encodings. xtask: `the_topology_markers_follow_the_machine`. `cargo xtask check`: 596 tests, 0 failures, 6 ignored (579 before).
+- **Boot proof, `cargo xtask boot-x2apic`** (two boots, one machine: `-smp 1,maxcpus=150,sockets=2,dies=3,modules=5,cores=5,threads=1` with processors at APIC IDs 256 and 412, cold-plugged). With `-cpu max,vendor=GenuineIntel`, which raises QEMU's CPUID maximum to 1Fh:
+  - `topology: layout from leaf 1Fh: thread bits 0, core bits 3, module bits 3, die bits 2, package from bit 8`
+  - `topology: CPU 2 (APIC ID 412): package 1, die 2, module 3, core 4, thread 0`
+  - `topology: the MADT lists 150 processors: 2 packages, 6 dies, 30 modules, 150 cores, 150 threads`
+  - `topology: core types: reported by 0 of 3 processors; hybrid false`
+  - `topology: against the MADT: 3 processors checked, 0 recorded nothing, 0 have another APIC ID, 0 another layout, 0 an undecodable leaf, 0 no core type although hybrid, 0 a duplicate placement; consistent true`
+  - `topology: 3 logical, 3 cores, 2 packages (1 threads/core, 256 logical/package); consistent true`
+
+  With the default `-cpu max` (AMD vendor, maximum leaf 0Dh) the same machine reads through leaf 0Bh alone: `layout from leaf 0Bh: thread bits 0, core bits 8, module bits 0, die bits 0, package from bit 8`, `CPU 2 (APIC ID 412): package 1, die 0, module 0, core 156, thread 0`, and `2 packages, 2 dies, 2 modules, 150 cores, 150 threads`. xtask derives every expected value from the `-smp` fields alone. A third processor exists so that a die, module and core mix-up shows: at APIC ID 256 they are all 0.
+- **`cargo xtask boot-matrix`** (Intel and AMD IOMMUs, 1, 2 and 4 CPUs): each CPU's placement through leaf 0Bh, e.g. `CPU 3 (APIC ID 3): package 0, die 0, module 0, core 3, thread 0` at `-smp 4`.
+- **Negative controls.** Each is a temporary change. With it applied, `cargo xtask boot-test` (`ORIGIN_BOOT_TEST_TIMEOUT=45`) exited 1 on the sparse machine with `-cpu max,vendor=GenuineIntel`, and C9 and C10 on the default machine; it was then restored and `git diff` was empty:
+  - **C1, an AP that never records itself** (no `cpu::record_topology()` in `ap_entry`): `CPU 1 (APIC ID 256): it recorded nothing about itself`, `2 recorded nothing`, `consistent false: topology failed`.
+  - **C2, leaf 1Fh ignored** (1Fh removed from the leaves tried): `layout from leaf 0Bh`, so the `leaf 1Fh` markers never appear and the boot times out at its deadline.
+  - **C3, the module and die codes swapped**: the list is then out of order (die before module): `3 an undecodable leaf`, the fallback to 0Bh, `consistent false: topology failed`.
+  - **C4, an APIC ID that is not the MADT's** (the recorded MADT value off by one on each AP): `2 have another APIC ID`, `consistent false: topology failed`.
+  - **C5, an AP that draws another layout** (EAX of leaf 1Fh sub-leaf 1 raised by one on the APs): `CPU 2 (APIC ID 412): package 1, die 2, module 1, core 12, thread 0`, `2 another layout`, `consistent false: topology failed`.
+  - **C6, the census counts modules as dies**: `2 packages, 30 dies, 30 modules`, so the `6 dies` marker never appears and the boot times out.
+  - **C7, a hybrid claim with no core type** (CPUID.07H:EDX\[15\] forced set for every processor): `core types: reported by 0 of 3 processors; hybrid true`, `3 no core type although hybrid`, `consistent false: topology failed`.
+  - **C8, an AP that reports the boot processor's ID** (EDX forced to 0 on the APs): `CPU 2 (APIC ID 412): package 0, die 0, module 0, core 0, thread 0`, `2 have another APIC ID, ... 2 a duplicate placement`, `consistent false: topology failed`.
+  - **C9, leaf 0Bh ignored** (default `-smp 2` machine): `layout from no topology leaf`, `2 packages`, so the `core bits 1` markers never appear and the boot times out.
+  - **C10, no maximum-leaf check** (default machine, so leaf 1Fh is read beyond level 0Dh and returns leaf 0Dh's XSAVE data): `2 an undecodable leaf`, `consistent false: topology failed`.
+- **QEMU facts worth keeping** (ledger §3): `-cpu max` under TCG is AuthenticAMD with maximum basic leaf 0Dh, so leaf 1Fh is out of its range even with dies and modules; an Intel-vendor model (or `min-level=0x1f`) reaches it; a read above a maximum returns the highest basic leaf's data, never zeros; leaf 80000026h does not exist in QEMU 11.1.3 (`xlevel=0x80000026` gives zeros); leaf 1Ah reads zero and the hybrid bit has no name; `max` and `EPYC-Genoa` leave TopologyExtensions clear under TCG.
+- **Unsafe inventory:** nothing new. `framekernel::topology` is `forbid(unsafe_code)`; the per-CPU table is a spin lock per slot; CPUID goes through the existing `cpu::cpuid_subleaf`.
+- **Not done:** topology-aware placement (§27); hybrid-core capacity, which needs the CPUID.06H feedback interface or ACPI CPPC; leaf 8000001Eh, deliberately (AMD processors without 80000026h or 0Bh are below the 2026+ target, and they fall back to a flat layout); the ACPI PPTT; the MADT's "online capable" processors; **QEMU-only (§74): leaf 80000026h, leaf 1Ah, mixed SMT widths, tiles, die groups and any hybrid processor are host-tested from the specifications and were not run on hardware.** `hybrid false` under QEMU says nothing about hybrid processors.
+- **Review:** not yet independently reviewed.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code, written from the Intel SDM, Intel's topology paper and AMD's APM (T1, T2, A1 in the ledger); no operating-system code was read or copied (CLAUDE.md §3).
+- **Commit:** `d1984cd` (code and ledger), and the records commit after it.
+- **Licensing:** MIT OR Apache-2.0.
+
 ### CPU cache hierarchy from CPUID leaf 04h (CLAUDE.md §24, §27; 2026-11-08)
 
 - **What:** `cache` (library) decodes leaf-04h deterministic-cache sub-leaves into each cache's level, type (data/instruction/unified), size, line size, ways and how many logical processors share it. The size is the product of ways, partitions, line size and sets. Pure, no `unsafe`. The kernel reports the hierarchy in its topology step.
@@ -660,7 +953,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code, written from the classic Unix inode-filesystem design (a superblock, a fixed inode table, direct and single-indirect block pointers, linked directory entries with `rec_len`) described conceptually in the BSD FFS / ext2 lineage; no source is used (CLAUDE.md §3). Reuses the first-party `gpt::crc32` and `vfs::components`.
 - **Test evidence (2026-11-08):** 4 `originfs` tests — build→parse→list→read a directory tree (a small file, a nested file, and a 15-block+123-byte file that exercises the single-indirect block, read whole byte-exact and with a block-straddling partial read); `.`/`..` resolution; distinct `NotFound`/`BadPath`/`IsDirectory`/`NotDirectory`/`BadInode`/`Io` errors; a corrupt-superblock rejection (flipped magic byte, and a flipped CRC-covered field with a stale CRC) and a too-small device as `Io`; and a punched direct pointer reading back as a zero-filled hole. 172 library tests in all; `cargo xtask check`.
 - **Not done (ADR-0006 F6):** the write path, allocation bitmap, journalling and crash consistency (§41), double-indirect (so files are capped at ~2 MiB in v0), snapshots, permissions beyond the kind, and mounting beneath the VFS (pending owner acceptance). The CRC is the first-party IEEE CRC-32 used for internal consistency; it is not a cryptographic integrity check.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### NUMA from the ACPI SRAT (CLAUDE.md §24 NUMA topology, §28 NUMA policies; 2026-11-08)
 
@@ -671,7 +964,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code, written from ACPI 6.6 §5.2.16 (SRAT and its three x86-relevant affinity structures); no source is used (CLAUDE.md §3). Reuses the first-party `acpi` table-checking (`check_table`, `xsdt_entries`) and `firmware::acpi_table`.
 - **Test evidence (2026-11-08):** 2 new `acpi` tests — a two-node SRAT with type-0, type-2 and type-1 structures (the 32-bit type-0 domain split, a present-but-disabled CPU, an x2APIC affinity, 64-bit memory base/length, hot-plug/NV flags, and an unknown type skipped), and malformed/overflow rejection (a short type-0, a length running past the table, a full buffer → `TooManyEntries`, and a short type-1). 9 `acpi` tests and 174 library tests in all; `cargo xtask check`; `boot-test`; `boot-matrix` (1, 2, 4) and an 8-CPU boot; the negative control above.
 - **Not done:** using the affinities for memory-allocator placement and scheduler locality (§27, §28, §66) — this is the discovery half; a NUMA-aware frame allocator and placement policy come next. The SLIT inter-node distance matrix is parsed (below); the HMAT memory-latency table is not.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### NUMA distances from the ACPI SLIT (CLAUDE.md §27 migration cost, §28 NUMA policies; 2026-11-08)
 
@@ -682,7 +975,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from ACPI 6.6 §5.2.17; no source used (CLAUDE.md §3). Reuses the `acpi` table-checking and `firmware::acpi_table`.
 - **Test evidence (2026-11-08):** 2 `acpi` tests — a 2-locality `[10,21,21,10]` matrix and a 3-locality asymmetric matrix round-tripped cell for cell with out-of-range `distance` returning `None`; a truncated matrix and a `u64::MAX` locality count both refused as `Length`. 11 `acpi` tests and 176 library tests in all; `cargo xtask check`; `boot-test`; `boot-matrix` (1, 2, 4) and an 8-CPU boot; the negative control above.
 - **Not done:** using the distances to order NUMA-aware placement and migration decisions (§27, §66); the HMAT table (bandwidth/latency) is not parsed.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### NUMA locality map (CLAUDE.md §27, §28, §66; 2026-11-08)
 
@@ -692,7 +985,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3), building only on the first-party `acpi` types.
 - **Test evidence (2026-11-08):** 4 `numa` tests — CPU and address lookup (a disabled affinity and an unlisted/unmapped address return `None`, a range is half-open), distance ordering from two different origin nodes with a capped output buffer, stable ordering of equal distances, and a broken SLIT (a remote node closer than self) failing `self_is_nearest`. 180 library tests in all; `cargo xtask check`; `boot-test`; `boot-matrix` (1, 2, 4); the negative control above.
 - **Not done:** wiring the map into the frame allocator (local-node-first allocation) and the scheduler (locality-aware placement/migration, §66) — the map is the decision layer; the allocator and scheduler changes that consume it come next.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Streaming UTF-8 decoder for the text engine (CLAUDE.md §51; 2026-11-08)
 
@@ -701,7 +994,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the Unicode 18.0 well-formed byte-sequence table (§3.9, Table 3-7) and the recommended U+FFFD substitution (TR#36 / the WHATWG Encoding rule); no implementation source is used (CLAUDE.md §3), and no Unicode data tables are needed (the rules are expressed as byte-range constraints).
 - **Test evidence (2026-11-08):** 5 `text` tests. Besides the hand-written cases (every sequence length and the U+0080/07FF/0800/FFFF/10000/10FFFF boundaries; overlong, surrogate, over-max, stray-continuation, truncated and bad-continuation rejection with the exact `Incomplete`/`Invalid` lengths; lossy substitution), an oracle test runs 20 000 biased-random byte strings through both `validate` and `core::str::from_utf8` and asserts they agree on validity, `valid_up_to` and `error_len`, and that `chars_lossy` equals `String::from_utf8_lossy` and, for valid input, `str::chars` — a byte-exact equivalence to the standard library's decoder, used only as a test oracle (CLAUDE.md §4/§5). 185 library tests in all; `cargo xtask check`. Host-only, so no boot proof or negative control (there is no boot path to break; the std oracle is the control).
 - **Not done:** grapheme-cluster and word segmentation (UAX #29), line breaking (UAX #14), normalization, bidi and shaping (§51) — this is the byte→scalar layer those build on; UTF-16/UTF-32 transcoding; and East Asian width. These need Unicode property data (permitted infrastructure, §4) with provenance, added when the segmentation work lands.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Gap buffer for editable text (CLAUDE.md §51 text editing, caret movement; 2026-11-08)
 
@@ -710,7 +1003,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); the gap-buffer technique is textbook, no source used.
 - **Test evidence (2026-11-08):** 4 `editbuffer` tests. Besides the hand-written cases (ASCII editing with backspace/forward-delete at both ends; a non-ASCII string — `café ∀😀` — edited mid-string with scalar-correct lengths and `get`; caret clamping and mid-gap insertion), a model-based test runs 50 000 random operations (insert, both deletes, both moves, jump-to) against a `Vec<char>` + cursor oracle and asserts the text length and caret match after **every** operation, then the whole text and every position at the end. 189 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the oracle is the control).
 - **Not done:** selection ranges, undo/redo, line-aware operations, and grapheme-granular movement (needs UAX #29). Wiring it into a terminal line editor or a text-field control comes with the UI milestone (§50).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Hardware entropy source: RDSEED/RDRAND with bounded retries (CLAUDE.md §59; 2026-11-08)
 
@@ -722,7 +1015,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence (2026-11-08):** 5 `entropy` tests over a scripted mock source — `draw` stops at the first success, counts exactly `retries + 1` attempts, and gives up with `None`; `fill` writes a partial final chunk from a word's low bytes (one draw per 8-byte chunk), fails cleanly when the source dies mid-buffer, and an empty fill makes no attempt. 194 library tests in all; `cargo xtask check`; `boot-test`; `boot-matrix` (1, 2, 4); the negative control above.
 - **Unsafe:** two inline-asm blocks (`cpu::rdrand`, `cpu::rdseed`), each a single instruction + SETC writing only a register and the carry flag, CPUID-gated, with SAFETY notes; neither is `pure`.
 - **Not done:** a DRBG for a reseedable stream (§59), wiring entropy into user-process ASLR, stack canaries and TCP ISN (§54, §58), and a health/continuous test (SP 800-90B). The loader's KASLR entropy stays separate for now.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Glob pattern matching (CLAUDE.md §39; 2026-11-08)
 
@@ -731,7 +1024,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); POSIX `fnmatch`-style semantics, standard algorithm, no source used.
 - **Test evidence (2026-11-08):** 6 `glob` tests — literals and `?` (exactly one, never `/`); stars (empty, extensions, no crossing `/`, collapsed runs, `src/*/*.rs`); classes (sets, ranges, double ranges, `!`/`^` negation, literal leading `]` and trailing `-`, never `/`, unterminated `[` as a literal); escaping of `*`/`?`/`[]` and inside a class; Unicode (`café`, a Greek range) and the `filter` helper; and a pathological-backtracking case (`*a*a*…*b` on 64 `a`s) that must terminate with the right answer. 200 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the cases are the control).
 - **Not done:** `**` (crossing `/`), brace expansion `{a,b}`, case-insensitive matching, and a directory-walk that applies a multi-segment pattern against the VFS. These are callers of `matches`, added with the shell/package work.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### IPv4 longest-prefix-match routing table (CLAUDE.md §54 routing; 2026-11-08)
 
@@ -740,7 +1033,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); the LPM bit-trie is textbook, no source used.
 - **Test evidence (2026-11-08):** 4 `route` tests — most-specific wins (default < /8 < /16 < /24), no default means no match, host bits ignored and re-insert replaces plus a /32 host route; and an **oracle test** building 2 000 random tables (up to 24 routes, lengths 0–32, a crowded prefix space so nesting and collisions are common) and checking `lookup` against a brute-force longest-match scan over 30 random addresses each — the trie must agree with the reference on every (table, address). 204 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the brute-force scan is the control).
 - **Not done:** route deletion and prefix aggregation, path-compressed (Patricia) nodes for memory, ECMP, metrics/administrative distance, IPv6 (a 128-bit trie), and wiring it into an IP forwarding/output path with ARP/NDP next-hop resolution (§54).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### DNS message parsing with bounded name decompression (CLAUDE.md §54 DNS; 2026-11-08)
 
@@ -750,14 +1043,14 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 1035 §4; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `dns` tests — a round-trip (a no-compression builder writes a response with a question, an A record and a CNAME; parse recovers the header flags/rcode, the names, the A address and the CNAME target) which **caught a real rdlength offset bug** (read at `pos+8`, not `pos+6`); a backward compression pointer (an answer whose name points to the question) resolved correctly; hostile/truncated names refused (a self-pointer, a forward pointer, a label past the end, a short header — all `None`); and a 50-deep chain of strictly-backward pointers that must terminate at the root. 208 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the round-trip and the malformed cases are the control).
 - **Not done:** a message builder/encoder for sending queries (the test builder is minimal and test-only), EDNS(0), DNSSEC, the full record-type set, and wiring into a resolver with UDP/TCP transport and a cache (§54).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Mutation soaks for the new parsers, and a `read_whole` allocation cap (CLAUDE.md §72; 2026-11-08)
 
 - **What:** seeded "never panics on mutated input" soaks (the existing `crate::testing` `Rng`/`mutate`/`cases` harness, scaled by `ORIGIN_MUTATION_SCALE`) for the untrusted-input parsers added this run: `acpi::srat_and_slit_mutations_never_panic` (SRAT and SLIT, 10 000 cases × 2 bases), `dns::mutations_never_panic` (`parse` and `read_name` over 20 000 mutated messages), and `originfs::mutations_never_panic` (4 000 mutated images through `Fs::open`, `entries`, `read_whole`, `read_file` and `resolve`). All parse paths use `.get`/checked arithmetic, so arbitrary bytes yield `Ok`/`Err`, never a panic.
 - **Hardening found by the soak:** `originfs::Fs::read_whole` allocated `inode.size` bytes from the on-disk inode; a mutated (or malicious) inode with a huge `size` would drive an unbounded allocation (an abort). It now refuses a size beyond what v0 can address (12 direct + 512 single-indirect blocks, ~2 MiB) with `OutOfRange` before allocating. `read_file` was already bounded by the caller's buffer, and `entries` by the 524-block addressing limit.
 - **Test evidence (2026-11-08):** the three soaks pass at scale 1 and at `ORIGIN_MUTATION_SCALE=10` (≈340 000 parser cases); 211 library tests in all; `cargo xtask check`.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Fixed-size bit allocator (CLAUDE.md §40 allocation bitmap, §29 resource allocation; 2026-11-08)
 
@@ -766,7 +1059,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); standard bitmap technique, no source used.
 - **Test evidence (2026-11-08):** 4 `bitmap` tests — lowest-free allocation with reuse after a free; filling exactly `len` bits across a partial final word (every index once, no padding bit, then full); `set`/`get` tracking the free count and out-of-range no-ops; and a model-based test running 60 000 random `alloc`/`set`/`clear`/`get` operations against a `[bool; 200]` oracle (spanning three words with a partial last), asserting `alloc` returns the lowest free index and the free count matches after every op. 215 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the oracle is the control).
 - **Not done:** multi-bit (contiguous run) allocation for extents, a hint/cursor to avoid rescanning from 0, and a two-level summary for very large maps. Wiring into OriginFS's (future) write path and a pid/handle allocator.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### ustar (tar) archive reader (CLAUDE.md §21 initial deployment, §46 package parsing; 2026-11-08)
 
@@ -775,7 +1068,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the POSIX ustar header layout; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `ustar` tests — a builder round-trip (a regular file, a directory, and a >512-byte file in a subdirectory via the `prefix` field, checking names, sizes and bytes across block padding); rejection of a flipped checksum, corrupt magic, a short header (`Truncated`), and a size running past the archive (`BadSize`); stopping at the zero block with trailing garbage ignored; and a 20 000-case mutation soak (`parse` over mutated archives never panics). 219 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the round-trip, the malformed cases and the soak are the control).
 - **Not done:** pax/GNU extended headers (long names, large sizes, xattrs), symlink/hardlink target handling beyond the type flag, writing archives, and extracting into the VFS (§21/§46).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### UTF-16 transcoding (CLAUDE.md §51; UEFI/CHAR16 interop; 2026-11-08)
 
@@ -784,7 +1077,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the UTF-16 surrogate rules (Unicode 18.0 §3.9); no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `utf16` tests — BMP and supplementary scalars encode/decode (incl. the U+FFFF and U+10FFFF boundaries); lone/incomplete/mis-ordered surrogates rejected with the right `Incomplete`/`Invalid`; `encode_str_into` reports a too-small buffer; and an oracle test over six mixed-script samples (and four deliberately broken unit streams) asserting `encode_str_into` equals `str::encode_utf16`, a valid stream round-trips, and `decode_lossy` equals `char::decode_utf16` mapped to U+FFFD — byte-exact agreement with std. 223 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the std oracle is the control).
 - **Not done:** little/big-endian byte-order handling and BOM detection (this works on `u16` units, not bytes), and UTF-32. Wiring into the loader's existing CHAR16 handling.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Fixed-capacity ring buffer (CLAUDE.md §56 input queues, §55 audio, §69 log retention; 2026-11-08)
 
@@ -793,7 +1086,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); standard circular-buffer technique, no source used.
 - **Test evidence (2026-11-08):** 5 `ring` tests — FIFO order and fullness (push refused when full, room after a pop); `force_push` dropping the oldest; capacity clamped to 1 and `clear`; and a model-based test running 80 000 random `push`/`force_push`/`pop`/`peek` against a `VecDeque` with the same bounded drop-oldest policy, asserting the returned/dropped values, `len` and `is_full` match after every operation. 227 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the oracle is the control).
 - **Not done:** a lock-free single-producer/single-consumer variant for the IRQ-handler/consumer split (this one is `&mut`-synchronised by its holder's lock), bulk push/pop, and wiring into the i8042 keyboard IRQ and a kernel log.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### initramfs: extracting a ustar archive into the VFS (CLAUDE.md §21; 2026-11-08)
 
@@ -805,7 +1098,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Boot proof** (every boot): the kernel includes a small committed ustar image (`framekernel/assets/initramfs.tar`, built deterministically by hand-written header bytes, validated by system `tar` and this reader) and `prove_initramfs` extracts it into a fresh VFS, then reads `/etc/hostname` back and confirms `/boot/banner.txt` exists even though the archive never lists a `boot/` directory: `origin-kernel: initramfs: 4 entries into the VFS; /etc/hostname true, implicit /boot dir true; consistent true` at `-smp` 1/2/4. This proves `ustar` + `initramfs` + `vfs` end-to-end in the kernel on a real image. Gated marker; `: initramfs failed` is a failure marker.
 - **Negative control:** changing the kernel's expected entry count (`n == 4` → `n == 5`) makes the line read `consistent false: initramfs failed` and `cargo xtask boot-test` fails (exit 1); restored, it passes.
 - **Not done:** symlink/hardlink/device entries, file permissions and mtimes, streaming extraction for a large image, and loading the initramfs over the real block device/filesystem rather than an embedded demo image.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### DHCP client: message build/parse and the lease state machine (CLAUDE.md §54 DHCP; 2026-11-08)
 
@@ -814,7 +1107,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 2131/2132; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `dhcp` tests — a full DISCOVER→OFFER→REQUEST→ACK exchange (the client's DISCOVER fields and options, the REQUEST it sends for the offered address with the server id, and the bound lease's address/mask/router/DNS/lease-time); wrong-`xid` and out-of-state (an early ACK) replies ignored, plus garbage/empty input ignored without panic; a NAK restarting to INIT with no lease; and a 20 000-case mutation soak over `parse` and `on_receive`. 234 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the scripted exchange and the soak are the control).
 - **Not done:** the renewing/rebinding (T1/T2) timers and lease expiry, retransmission/backoff, DECLINE after an ARP conflict check, RFC 3927 link-local fallback, and wiring onto a real UDP socket and NIC (§54).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### DEFLATE decompression (RFC 1951; CLAUDE.md §17 compression, §46 package payloads; 2026-11-08)
 
@@ -824,7 +1117,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 1951; the algorithm and constants are the public specification, no source copied.
 - **Test evidence (2026-11-08):** 4 `deflate` tests. The vectors are **known-answer vectors**: raw DEFLATE produced by Python's `zlib` (`wbits=-15`), each the compression of a plaintext the test reconstructs — the implementation is independent of them (CLAUDE.md §72). `inflates_reference_vectors` covers the empty stream, a fixed-Huffman block, a back-reference block (`abc`×40), a level-0 stored block (300 zeros) and a long-back-reference block (300 zeros); `a_dynamic_block_round_trips` decodes a **dynamic-Huffman** block (`lorem`×8, 992 bytes → 104, verified `BTYPE=2`) exactly, exercising the code-length-code table and the length RLE; `rejects_malformed_and_bombs` refuses empty, reserved-block-type, bad-`NLEN` and over-the-cap streams; `adler32_known_values` checks the Adler-32 of `""` and `"Wikipedia"`; `zlib_and_gzip_wrappers` decompresses a real Python-`zlib.compress` stream and a `gzip.compress` stream (verifying their Adler-32 and CRC-32/ISIZE trailers) and rejects corrupted trailers and bad headers; and a 20 000-case mutation soak over the reference streams and arbitrary bytes — through `inflate`, `zlib_decompress` and `gzip_decompress` — never panics. 240 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the zlib/gzip vectors and the soak are the control).
 - **Not done:** a `deflate` *compressor* (the project needs only decompression for reading packages/images), and the eventual Zstandard decoder (§17 names it as the target). CAVP-style NIST validation does not apply (this is not cryptographic); the zlib/gzip differential vectors are the validation.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Base64 encode/decode (RFC 4648; CLAUDE.md §59 PEM/tokens; 2026-11-08)
 
@@ -833,7 +1126,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 4648; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `base64` tests — the **RFC 4648 §10 vectors** (`""`, `f`, `fo`, `foo`, `foob`, `fooba`, `foobar`) encoded and decoded both ways; whitespace tolerance (a PEM-style wrapped body with newlines/spaces/tabs); rejection of a short length, a character after padding, over-padding, an invalid character, misplaced padding, and the URL-safe `-_` alphabet; and a round-trip over arbitrary byte strings of every length 0–199 (output always a multiple of four). 244 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the RFC vectors and the round-trip are the control).
 - **Not done:** the URL-safe alphabet (`-_`) and no-padding variants (RFC 4648 §5), Base32/Base16, and streaming (incremental) codecs.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### JSON parser (RFC 8259; CLAUDE.md §23 config, §46 manifests, §49 SDK; 2026-11-08)
 
@@ -843,7 +1136,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 8259; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 5 `json` tests — a full document (nested objects/arrays, a kept number text, `as_i64`/`as_str`/`get`, and `é`+a `😀` surrogate pair decoding to `café 😀`); scalars and edge numbers (`0`, `-0`, a 12-digit integer, empty string/array/object); rejection of 16 malformed inputs (unterminated, trailing comma, missing value/colon, leading zero, bare `-`/`1.`/`1e`, bad escape, unescaped control, trailing garbage, lone high surrogate); a 10 000-deep nesting refused without overflow (and just-under-the-limit accepted); and a 20 000-case mutation soak. 249 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the documents and the soak are the control).
 - **Not done:** a serializer, `f64`/decimal interpretation of non-integer numbers (needs a `no_std` float parser), duplicate-key policy, and JSON5/JSONC extensions.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Semantic versioning (semver.org 2.0.0; CLAUDE.md §46 dependency resolution; 2026-11-08)
 
@@ -852,7 +1145,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the semver.org 2.0.0 specification; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `semver` tests — field/prerelease/build parsing with build-metadata equality; rejection of 14 malformed strings (too few/many fields, leading zeros, non-digits, empty/underscore prerelease, a bare `-`, a leading `v`, trailing space); the **canonical semver.org §11 precedence chain** (`1.0.0-alpha` < `-alpha.1` < `-alpha.beta` < `-beta` < `-beta.2` < `-beta.11` < `-rc.1` < `1.0.0`) plus core precedence, prerelease-below-normal, numeric-below-alphanumeric and build-ignored; and sorting a list into precedence order. Three more cover the requirement matcher — caret/tilde/range/exact (`^1.2.3`, `^0.2.3`, `^0.0.3`, `~1.2.3`, `>=1.0.0, <2.0.0`, `=1.2.3`, bare), the prerelease gate (a prerelease never matching a normal requirement, even at a range boundary, and matching only when opted in via a same-core prerelease comparator), and rejection of 8 malformed requirements. 260 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the spec chain is the control).
 - **Not done:** wiring into a package dependency resolver (§46) — this is the comparator and matcher the resolver will call; the resolution algorithm (selecting a consistent set across a dependency graph) is the next step.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### String-keyed hash map (CLAUDE.md §29 resource tables, §30 handle lookup; 2026-11-08)
 
@@ -861,7 +1154,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3); FNV-1a is the published non-cryptographic hash, standard open addressing.
 - **Test evidence (2026-11-08):** 4 `hashmap` tests — the FNV-1a **known-answer values** (`""`, `"a"`, `"foobar"`, verified against the FNV spec); insert/get/remove with replace-returns-old and a tombstone not hiding a later key; 500 inserts then 250 removes then 250 reinserts, exercising tombstone reuse across several grows; and a model-based test of 50 000 random `insert`/`remove`/`get` against a `BTreeMap` oracle over a small (collision-heavy) key space, asserting the returned values and `len` match throughout, then that every live entry agrees. 257 library tests in all; `cargo xtask check`. Host-only, so no boot proof (the oracle is the control).
 - **Not done:** a generic key type (this is `String`-keyed; a `Hash`-like trait would generalize it), a keyed hash to resist collision-flooding from untrusted keys (SipHash, which needs its own test vectors and review, §58/§59), backward-shift deletion to avoid tombstone buildup, and adopting it inside `vfs`/`handles`.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Bounded kernel log buffer (CLAUDE.md §69 structured logging and failure records; 2026-11-08)
 
@@ -870,7 +1163,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `klog` tests — retaining the most recent N records and dropping the oldest (with the drop and total counts, and the kept lines in order); levels and messages recorded and read back; a long multi-byte message truncated on a UTF-8 boundary (valid, no split scalar, the exact scalar count that fits); and capacity-one keeping only the latest. 264 library tests in all; `cargo xtask check`. Host-only groundwork — **not yet wired to the console or `/sys`** (that integration touches the boot output path and is a separate, careful change).
 - **Not done:** teeing the kernel console into the log, exposing it through `/sys`, a global logger behind a lock, and persisting the buffer across a panic for crash diagnostics (§69).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### virtio split virtqueue (virtio 1.1 §2.6; CLAUDE.md §31 driver framework, §54; 2026-11-08)
 
@@ -879,7 +1172,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the virtio 1.1 specification; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 4 `virtqueue` tests — descriptor LE round-trip at the right offset; the free list; `add_chain` linking two buffers with the correct `F_NEXT`/`F_WRITE` flags and refusing an over-large request without leaking; and a full driver↔device round trip over the three byte-buffer rings (post a TX chain and an RX writable buffer, a mock device completes both in the used ring, the driver reaps and returns every descriptor to the free list). 268 library tests in all; `cargo xtask check`. Host-only so far; the kernel device bring-up and its boot proof are the next step.
 - **Not done:** indirect descriptors (`F_INDIRECT`), event-index (`used_event`/`avail_event`) suppression, and the kernel integration (mapping the rings as DMA, programming their physical addresses into a device). Those land with virtio-net.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### virtio device negotiation and virtio-net structures (virtio 1.1; CLAUDE.md §31, §54; 2026-11-08)
 
@@ -888,7 +1181,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the virtio 1.1 spec; no source used (CLAUDE.md §3).
 - **Test evidence (2026-11-08):** 5 `virtio` tests — feature negotiation (intersection, VERSION_1 required, never accepting an unasked feature); config parsing per accepted feature (mac/status/mtu read, link-up derived, fields left `None` when their feature is off even though the bytes exist, and a truncated config refused without panic); the net-header round trip (plain and offload-flagged); distinct status bits; and `find_caps` discovering the four virtio structures (bar/offset/length and the notify multiplier) from a mock capability list, and finding nothing when the capabilities bit is clear. 273 library tests in all; `cargo xtask check`. Host-only; the kernel driver and its boot proof are next.
 - **Not done:** the full receive datapath and the control virtqueue / multiqueue (the bring-up and a transmit are done — below).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### virtio-net kernel driver: bring-up, ARP, a live DHCP lease, and an interrupt-driven receive thread (kernel; CLAUDE.md §25, §26, §31, §54; 2026-11-08)
 
@@ -900,7 +1193,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence (2026-11-08):** the boot proof and the controls above; `boot-matrix` at `-smp` 1/2/4; the transport, device, Ethernet/ARP/IP/UDP and DHCP logic are host-tested in `virtqueue` (4), `virtio` (5), `net` and `dhcp` (4). 273 framekernel host library tests; `cargo xtask check`; `boot-test`.
 - **Not done:** a general send/receive socket API and a receive service other code calls (the receive thread here runs one fixed datapath and exits); DHCP retransmission, timeouts and lease renewal; the control virtqueue and multiqueue; and routing real traffic on the lease (ping, DNS). (Transmit — a recycled descriptor ring with TX-completion interrupts — has its own entry below.) **QEMU-only; no physical NIC qualification (§74).**
 - **Unsafe:** volatile MMIO reads/writes over the mapped BAR (`r8`/`w8`/… ) and the MSI-X table writes (inside the table, bounds-checked against its BAR), and `core::slice::from_raw_parts_mut` views over the kept-forever DMA pages, each documented; DMA is cache-coherent on x86 and a `SeqCst` fence orders the ring writes before the notify. The hand-off to the thread is a `SpinLock<Option<Setup>>` taken with interrupts disabled; results return through atomics with `RX_DONE` stored last (Release) and read first (Acquire).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### virtio-net transmit ring: recycled descriptors, batched kicks, TX-completion interrupts (kernel; CLAUDE.md §31, §54; 2026-11-08)
 
@@ -919,7 +1212,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Test evidence (2026-11-08):** the boot proof and the two controls; `boot-matrix` at `-smp` 1/2/4; `virtqueue`'s 4 host tests still pass with the barrier; `cargo xtask check`; `boot-test`.
 - **Not done:** freeing the ring (it lives for the boot); larger and multi-descriptor (scatter-gather) frames — each frame must fit one page behind the header; event-index notification suppression (`VIRTIO_F_EVENT_IDX`) to cut interrupts; and a transmit API for other kernel code (the datapath here is fixed). **QEMU-only (§74).**
 - **Unsafe:** none new beyond the existing documented volatile MMIO and DMA-page views; the TX buffers are kept-forever DMA pages, and a buffer is rewritten only while its descriptor is free.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### virtio-net: traffic on the lease — pinging the gateway (kernel; CLAUDE.md §54; 2026-11-08)
 
@@ -929,7 +1222,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Negative control:** each request sent with its **ICMP checksum corrupted** (one byte flipped) fails `cargo xtask boot-test` (exit 1): slirp verifies the checksum and drops the requests, so no reply arrives — the receive line shows only the 3 MSI-X interrupts of ARP and DHCP instead of 7 — the thread sleeps on the first reply, never finishes, and the boot fails through the boot flow's bounded wait (`consistent false`). This shows the gateway really checks what we send (so the normal path's checksums are right) and that a pass depends on real replies. Restored, it passes.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 792 (ICMP echo), RFC 791 (IPv4) and RFC 894 (IPv4 over Ethernet), on the existing `net` library.
 - **Not done:** answering ARP requests and echo requests addressed to us (slirp learned our MAC from our own ARP request and DHCP, so it never had to ask); a timeout per reply (a lost reply leaves the thread asleep until the boot flow's bounded wait gives up); and anything beyond the gateway (routing through it, DNS). **QEMU-only (§74).**
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### TFTP reader (`tftp`), receive-buffer recycling, and a file over the lease (library + kernel; CLAUDE.md §21, §54; 2026-11-08)
 
@@ -942,7 +1235,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from RFC 1350 (TFTP), RFC 768 (UDP) and virtio 1.1 §2.7 (returning buffers to the available ring).
 - **Using the fetched file (added the same morning):** the completed download moves out of the reader (`Download::into_data`) to the boot flow through a one-slot hand-off (`FETCHED`), which unpacks it as an initramfs into a fresh VFS and reads it back — the first filesystem content the OS takes from the network. The checks are shared with the embedded-image proof (`check_initramfs` in `main.rs`: four entries, `/etc/hostname` reads `origin-os\n`, and `/boot/banner.txt` resolves although the archive never lists `/boot/`), so both are judged by exactly the same rules; the embedded proof's output is unchanged. Boot proof: `virtio-net initramfs: the fetched image extracted into a fresh VFS: 4 entries; /etc/hostname true, implicit /boot dir true; consistent true`. **Negative control:** one byte of the *downloaded* buffer flipped before unpacking — the TFTP line still reports the download identical (the corruption comes after it), but the first ustar header's checksum no longer matches and extraction refuses the archive: `0 entries; /etc/hostname false, implicit /boot dir false; consistent false` (the network proof reads the fetched bytes, not the embedded copy). Restored, it passes.
 - **Not done:** retransmission and timeouts (a lost block leaves the reader waiting; slirp does not lose packets here); option negotiation (RFC 2347 block size and transfer size); writing (WRQ); and mounting or booting from fetched content (it is unpacked and checked, then dropped) or the update path. **QEMU-only (§74).**
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### virtio-net: reply timeouts (kernel; CLAUDE.md §54, §69 diagnostics; 2026-11-08)
 
@@ -952,7 +1245,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Negative controls:** (A) echo requests sent with a corrupted ICMP checksum, which slirp drops — the run now fails fast and says why: `virtio-net ping: … 0 of 4 echo replies …; timed out after 2000 ms waiting for the reply to echo request 1; consistent false`, while the receive and transmit lines before it stay `consistent true`, and the datapath went on to fetch the whole file (20 frames sent, 13 receive interrupts: ARP, DHCP and the ten TFTP blocks); the failing boot took 16 s in all instead of stalling on the 10 s bound. (B) The receive interrupt counted but **waking nobody** — each receive now ends only at its 2 s deadline, so the thread crawls (`slept 5, woken by the NIC's interrupt 0 (of 12 MSI-X interrupts …)`) and cannot finish inside the boot flow's bound: `consistent false`. This replaces the earlier permanent sleep as that control's outcome: the receive still depends on the interrupt to make timely progress, and the count of interrupt wake-ups (0 here) is part of the proof.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. On the kernel's `wait::WaitQueue::wait_until_deadline` and `sched::block_until`.
 - **Not done:** retransmitting an echo request (DHCP and TFTP retransmit, see the next entries); backoff; per-step timeouts other than one constant. **QEMU-only (§74).**
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### TFTP retransmission, with a loss injected on every boot (kernel; CLAUDE.md §54; 2026-11-08)
 
@@ -962,7 +1255,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Negative control:** a single attempt (no retransmission) with the same injected loss fails `cargo xtask boot-test` (exit 1): `0 bytes in 0 blocks, incomplete; 0 retransmitted …; timed out after 1 attempts of 500 ms waiting for TFTP block 1; consistent false` — the retransmission is what recovers the file. Restored, it passes.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. From RFC 1350 §2 (timeouts and retransmission) and RFC 768 (the UDP checksum the server verifies).
 - **Not done:** an adaptive timeout (RFC 1123 §4.2.3.2) and backoff. The "Sorcerer's Apprentice" problem (RFC 1123 §4.2.3.1) is a sender's: a sender must not retransmit DATA on a duplicate ACK. This reader acknowledges each duplicate block once, as RFC 1350 expects, and retransmits only on a timeout, but its behaviour against a server prone to that problem is not tested. **QEMU-only (§74).**
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### DHCP retransmission, with a lost DISCOVER injected on every boot (kernel; CLAUDE.md §54; 2026-11-08)
 
@@ -972,6 +1265,592 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Negative control:** a single attempt with the same injected loss fails `cargo xtask boot-test` (exit 1): `DHCP lease 0.0.0.0 (0 retransmitted …); … timed out after 1 attempts of 500 ms waiting for a DHCP reply; consistent false` — without the retransmission there is no lease. Restored, it passes.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-08. From RFC 2131 §4.1 (retransmission) and RFC 768.
 - **Not done:** the backoff and the `secs` field RFC 2131 describes; renewal (T1/T2). **QEMU-only (§74).**
+- **Licensing:** MIT OR Apache-2.0.
+
+### The ACPI DMAR and VT-d encodings (`dmar`, `vtd`; library; CLAUDE.md §16, §32, §72; 2026-11-08)
+
+- **Why:** the audit against CLAUDE.md's 2026+ target named the IOMMU, with interrupt remapping, as the top missing piece QEMU can test (DMA protection, §32 and §58; MSI to APIC IDs above 255). Research came first (§16): `docs/research/2026-11-08-vt-d-iommu.md`.
+- **What:**
+  - **`dmar`: the ACPI DMA Remapping Reporting table.** One `parse` checks the whole table before any view of it is returned:
+    - the 48-byte header, and a host address width of 32–64 bits;
+    - each remapping structure's header, its type minimum (DRHD 16, RMRR 24, RHSA 20, others 8) and its placement; unknown types are skipped by their length;
+    - DRHD register bases: non-zero, 4 KiB aligned, unique;
+    - at most one INCLUDE_PCI_ALL unit per segment, naming no PCI device;
+    - RMRR ranges on 4 KiB boundaries, never ending before they start;
+    - every device scope: a 6-byte header, inside its structure, and (for the known types) a non-empty, even path of devices 0–31 and functions 0–7.
+
+    The views are units (with register-set size), scopes, RMRR, ATSR, RHSA and ANDD. The iterators also stop on a zero length, so they cannot loop even over unchecked bytes. `Dmar::unit_for` resolves a requester to the unit that translates it: an endpoint scope first, then a bridge sub-hierarchy (the bridge's secondary to subordinate buses), then the segment's INCLUDE_PCI_ALL unit. Multi-step paths follow each bridge's secondary bus through a `BridgeBuses` trait (the kernel reads type 1 headers; tests use a model). `Requester::source_id` gives the 16-bit requester ID.
+  - **`vtd`: pure VT-d encodings.**
+    - register offsets and CAP/ECAP decoding (domain-ID width, SAGAW, MGAW, FRO/NFR, PSI, MAMV, drain, CM, RWBF, ESRTPS/ESIRTPS; C, QI, DT, IR, EIM, PT, SC, IRO, MHMV, SMTS);
+    - the GCMD rule (keep the enables, drop the one-shot status bits, change one field);
+    - legacy root and context entries (translation type 0, AW from 3–5 levels, domain ID);
+    - a second-level page-table walker over an abstract `TableMemory`. It maps 4 KiB pages, creating tables, with non-leaf entries R|W so the leaf decides. It never replaces a live mapping, unmaps returning the page, and translates as hardware would, checking permissions at every level;
+    - IRTEs for remapped interrupts: fixed, physical, edge; a 32-bit x2APIC destination under EIME, else 8-bit; SVT/SQ source checks (requester ID or bus range);
+    - remappable-format MSI messages (the handle in address bits 19:5 and 2, SHV, the sub-handle) and the index hardware derives from a message;
+    - IRTA and IQA;
+    - the 128-bit queued-invalidation descriptors: context (global, domain, device), IOTLB (global, domain, page with address mask, IH and drain), interrupt entry cache (global, index), and wait (status write, fence);
+    - fault-record decoding (F, T, reason, source ID, the page, or the interrupt index for 20h–2Fh) and reason names;
+    - the IOVA window [1 GiB, 2 GiB) and a bump allocator over it.
+- **Specifications:** Intel VT-d Architecture Specification Rev 5.20 (D51397-019, 2026-05-14), chapters 3, 5, 6, 7, 8, 9 and 10. The PDF itself could not be read through the research tools: a 10 MB fetch limit, and saving it is a download needing approval. The encodings are the legacy-mode ones, stable since rev 2.x, and were cross-checked against how QEMU 11.1's device model decodes each field (`hw/i386/intel_iommu.c`, `acpi-build.c`; read, not copied). **Re-check against Rev 5.20 before hardware qualification.**
+- **Test evidence (2026-11-08), 17 host tests:**
+  - `dmar` (5):
+    - the exact table QEMU builds for q35 (one unit at 0xfed90000 listing the I/O APIC on bus 0xff and seven endpoints; I/O APIC source ID 0xff00);
+    - a three-unit platform with every structure type (an endpoint unit, a root-port sub-hierarchy unit, and an INCLUDE_PCI_ALL unit with I/O APIC and HPET scopes; an RMRR for the USB controller; ATSR, RHSA, ANDD, an unknown type), resolving devices on the port's secondary and subordinate buses and falling back to INCLUDE_PCI_ALL;
+    - three-step paths through two bridges, and a path whose middle step is not a bridge (unresolved, so it covers nothing);
+    - every refusal at its offset;
+    - a 12,000-case mutation soak (`crate::testing`, two thirds re-sealed). More than 1,000 tables are accepted per default run, and each keeps every invariant `parse` promises.
+  - `vtd` (12):
+    - CAP/ECAP decoding against the values QEMU builds;
+    - the GCMD rule;
+    - golden root, context, IRTE, message, IRTA/IQA and descriptor encodings, with refusals;
+    - the walker: table sharing and creation, permissions, double maps, out-of-range, misaligned and no-access requests, and table-page exhaustion; plus a 20,000-step model check against a map;
+    - 20,000 random fault registers decode without panicking.
+- **Not done:** scalable-mode structures (PASID tables, first-level entries), large-page mappings, device-TLB descriptors, posted-interrupt IRTEs, the SATC/SIDP structures beyond skipping them, and a Kani proof of the parser (§73).
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the specification. QEMU's device model was read only to learn what it emulates. No operating system's IOMMU code was read or copied (CLAUDE.md §3).
+- **Licensing:** MIT OR Apache-2.0.
+
+### Intel VT-d DMA and interrupt remapping (`iommu`, `dma`; kernel; CLAUDE.md §31, §32, §58; ADR-0007 Proposed; 2026-11-08)
+
+- **What:**
+  - **`iommu` (kernel).** After PCIe enumeration, and before any driver binds, each DMAR unit is brought up:
+    1. its registers are mapped uncached (the DRHD's register-set size) and checked: the fault-recording and IOTLB registers must lie inside them, a 3- or 4-level table depth must be supported, queued invalidation must exist, and the firmware must not have left the unit enabled;
+    2. stale faults are cleared;
+    3. queued invalidation goes on (one page, 256 descriptors);
+    4. an empty legacy root table is set (SRTP), and the context and IOTLB caches are invalidated globally;
+    5. with ECAP.IR and the DMAR's INTR_REMAP flag, a 256-entry interrupt remapping table is set (EIME when ECAP.EIM), its cache invalidated, and IRE turned on. CFI stays clear, and is cleared in its own write if the firmware had set it;
+    6. TE goes on.
+
+    With no context entry present, every device's DMA faults until its driver attaches it. If a unit fails, the units already running are turned off again.
+    - `attach`: one domain per requester ID, with a domain ID from 1, a 4-level table and the IOVA window; the context table is made on demand. The context entry is written high half first, so it turns present last. Under CM, a device-selective context invalidation with domain 0 and a domain IOTLB invalidation follow; otherwise a write-buffer flush where RWBF requires one. A device named by an RMRR is refused (identity maps are not implemented).
+    - `map`: one 4 KiB read/write page at the next IOVA (a page-selective invalidation under CM).
+    - `unmap`: clears the leaf, then queues a page-selective IOTLB invalidation (leaf-only hint, drain reads and writes as CAP allows) and a wait descriptor, and returns only when the unit wrote the wait's status.
+    - `msi_message`: allocates an IRTE (the vector, the 32-bit destination, SVT 1 with the device's source ID), writes it high half first, invalidates its cache entry, and returns a remappable handle with SHV and data 0. Without remapping it falls back to compatibility format, which still refuses APIC IDs above 255.
+    - Faults are read and cleared from the fault-recording registers (`take_faults`); fault events stay masked.
+    - With ECAP.C clear (QEMU), every written structure line is CLFLUSHed and fenced; new table pages are flushed whole.
+    - Every invalidation is a batch of descriptors plus a wait descriptor (status write, fence). It polls the status for at most 100 ms and fails on FSTS.IQE.
+  - **`dma::DeviceDma`.** A driver attaches its device once. Every page it then allocates comes mapped, as `virt` plus `bus`; the bus address is the IOVA, or the physical address without an IOMMU.
+  - **NVMe** (`storage`): attached before its admin queue. Its admin, I/O, per-CPU and data queues, and the block cache's pages, all live in its domain, and its MSI-X entries (vector 1, and one per CPU) go through `msi_message`.
+  - **virtio-net**: accepts `VIRTIO_F_ACCESS_PLATFORM` (bit 33; QEMU refuses FEATURES_OK otherwise) and then attaches. Its rings and RX/TX buffers live in its domain, and its RX and TX MSI-X entries go through IRTEs. A device without the feature is given physical addresses (virtio 1.1 §6).
+  - **xtask**: `-device intel-iommu,intremap=on,eim=on` before the PCI devices, `iommu_platform=on` on virtio-net, markers for every line below, and `": IOMMU failed"` as a failure marker.
+- **Boot proof** (every boot; `boot-matrix` at `-smp` 1, 2 and 4; quoted at 2). Every existing NVMe, GPT, block cache and virtio-net proof passes unchanged through the IOMMU. Then:
+  - `IOMMU: DMAR: host address width 48 bits, interrupt remapping true, x2APIC opt-out false, DMA protection opt-in false; 1 remapping unit(s), 0 reserved memory region(s)`
+  - `IOMMU: unit 0 at 0xfed90000 (segment 0, 4 KiB of registers): 7 PCI scope(s), I/O APIC 0 (source ID 0xff00)`
+  - `IOMMU: unit 0: VT-d 1.0; CAP 0x80d2008c222f0606: 16-bit domain IDs, 4-level tables (48-bit), 1 fault record(s) at 0x220, page-selective invalidation true, drain reads/writes true/true, caching mode false, write-buffer flush false; ECAP 0xf00f5a: queued invalidation true, interrupt remapping true, extended interrupt mode true, coherent walks false`
+  - `… interrupt remapping on (256 entries, 32-bit x2APIC destinations, compatibility format blocked); translation on (GSTS 0xc7000000): every device's DMA faults until its driver attaches it; 0 stale fault(s) cleared`
+  - **Translated DMA:** `the NVMe controller (00:02.0, source ID 0x0010) read LBA 2048 into IOVA 0x40012000, which its domain maps to physical 0x75000 (not the same address): 8 of 8 blocks landed in that physical page`. Under QEMU's 512 MiB nothing is backed at the IOVA, so the data can only have arrived through translation.
+  - **Blocked DMA:** `IOVA 0x40012000 unmapped (IOTLB invalidated page-selectively, reads and writes drained), the same read completed with status type 0 code 0x0, and the page kept its canary true; fault recorded: source ID 0x0010, write at 0x40012000, reason 0x5 (write to a page not mapped writable)`. The command "completes" because QEMU's device model drops the blocked DMA without telling the device, as a posted write on hardware would. The proof is the untouched canary and the fault record.
+  - **Interrupt remapping:** `5 of 5 MSI-X entries (NVMe 3, virtio-net 2) hold only a remappable handle with data 0 whose IRTE holds the vector, the x2APIC destination and the device's source ID; 5 IRTEs in use; APIC ID 300 accepted (its IRTE reads back destination 300), which compatibility format refuses: true`. Every NVMe and virtio-net interrupt the earlier proofs counted arrived at the right vector and CPU, yet these entries' data is 0: as compatibility-format messages they would be vector 0, which the APIC drops. Those interrupts can only have come through the IRTEs.
+  - **Blocked interrupt:** `NVMe MSI-X vector 1 pointed at IRTE 5, left not present: a read on I/O queue 2 completed true, 0 interrupts arrived; fault recorded: source ID 0x0010, interrupt index 5, reason 0x22 (interrupt table entry not present); vector 1 restored`.
+  - **Domains:** `00:02.0 domain 1 (18 pages mapped, 19 ever, 4 table pages); 00:03.0 domain 2 (18 pages mapped, 18 ever, 4 table pages); no other function has a context entry, so its DMA faults; IOVAs from 0x40000000; faults recorded before the proofs: 0`.
+
+  The matrix gives the same results at 1 and 4 CPUs: 4 and 7 MSI-X entries remapped, 15 and 24 NVMe pages. Kernel boots: 13.2 s, 15.4 s and 21.8 s (13.0 s at 2 CPUs before this work).
+- **Negative controls.** Each is a temporary change. With it applied, `cargo xtask boot-test` exited 1; the change was then restored from git (the scripts are in the session's scratchpad; the patches are quoted here):
+  - **C1, unmap without the IOTLB invalidation:** the stale IOTLB entry lets the "blocked" DMA through: `blocked DMA: … the page kept its canary false; fault recorded: none; consistent false: IOMMU failed`. QEMU caches translations, so the proof tests the invalidation path, not only the page table.
+  - **C3, IOVAs handed out but never mapped:** the controller cannot fetch its first admin command: `NVMe: a command timed out: NVMe failed`. The drivers' own DMA really goes through translation.
+  - **C4, virtio-net never attached (no context entry), although it accepted ACCESS_PLATFORM:** its DMA faults, so no frame moves: `virtio-net: … ARP 10.0.2.2 -> 00:00:00:00:00:00; DHCP lease 0.0.0.0 (3 retransmitted …); … (of 0 MSI-X interrupts, none arrived) …: virtio-net failed`. This is default deny.
+  - **C5, IRE never set, while the drivers still program remappable handles:** QEMU passes the handles through unremapped, as vector-0 messages its APIC drops: `NVMe: interrupt-driven: 0 reads … 0 interrupts (none arrived) …: NVMe failed`. Every interrupt depends on the IRTE translation.
+  - **C6, every IRTE checks a source ID one function off its device's:** the source-ID check blocks every NVMe MSI, with the same `0 interrupts (none arrived) …: NVMe failed`. Source validation is enforced.
+  - **C7, the blocked-interrupt probe sent through a present IRTE:** `blocked interrupt: … 1 interrupts arrived; fault recorded: none; … consistent false: IOMMU failed`. The proof notices an interrupt that gets through.
+
+  **A blind spot, measured.** C8, no interrupt-entry-cache invalidation after an IRTE is written, **passes** the boot test: QEMU's TCG path reads the IRTE from memory on every interrupt, so a missing IEC invalidation cannot be detected under QEMU. CFI blocking cannot be shown either, because QEMU passes compatibility-format messages through. The code follows the specification on both points; both need hardware to verify (§74).
+- **QEMU facts worth keeping:**
+  - `eim=auto` is off under TCG;
+  - virtio devices bypass the IOMMU without `iommu_platform=on`;
+  - QEMU collapses repeated faults from one source ID while a record is pending, so clear records before provoking one;
+  - QEMU passes compatibility-format MSIs through even with IR on, so the CFI protection cannot be shown under QEMU;
+  - a vector-0 MSI is silently dropped by QEMU's APIC;
+  - QEMU's DMA bounce path completes a device's command whose DMA the IOMMU blocked.
+- **Unsafe inventory (reviewed by the author, not independently):**
+  - `iommu`: volatile 32/64-bit MMIO to the unit's register set (`Regs`, bounds-checked against the mapped size); volatile access to the kernel's own remapping pages (`Page`, bounds-checked; `Tables`, through the direct map at indexes below 512); `alloc_zeroed` for kept-forever structure pages; `CLFLUSH` on lines of those live pages.
+  - `dma`: `alloc_zeroed`, and `dealloc` of a page no device was given.
+  - `storage`/`virtionet`: volatile reads and writes of MSI-X table entries inside tables already checked against their BARs.
+  Each block has a SAFETY note.
+- **Not done:**
+  - AMD-Vi (done 2026-11-08: see "AMD-Vi DMA and interrupt remapping");
+  - scalable mode;
+  - RMRR identity maps (such devices are refused);
+  - taking over a unit the firmware left enabled (pre-boot DMA protection);
+  - ~~I/O APIC entries in remappable format~~ — done 2026-11-08, see "I/O APIC interrupts through VT-d interrupt remapping" below;
+  - a fault-event interrupt into `klog`;
+  - freeing IOVAs and table pages;
+  - device-TLBs/ATS;
+  - hot-plug.
+  - **No CPU with an APIC ID above 255 exists in the test configuration.** The kernel indexes per-CPU state by APIC ID with `MAX_CPUS` 64, so delivery to one is shown by the IRTE encoding, not by a live interrupt. Decoupling CPU index from APIC ID is a separate task. *(Done 2026-11-08: see "CPU indexes and processors above x2APIC ID 255" below; `cargo xtask boot-x2apic` delivers NVMe MSI-X to APIC ID 256 live.)*
+  - **QEMU-only (§74).**
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the VT-d specification and virtio 1.1 §6.
+- **Licensing:** MIT OR Apache-2.0.
+
+### CPU indexes and processors above x2APIC ID 255 (`cpumap`; `cpu`, `smp`, `sched`, `tlb`, `storage`, `virtionet`; library + kernel; CLAUDE.md §24, §32; ADR-0008 Proposed; 2026-11-08)
+
+- **Why:** per-CPU state was indexed by x2APIC ID in 64-slot arrays, and the MADT and SRAT were read into 64-entry buffers. With interrupt remapping, an MSI could already reach any 32-bit APIC ID (ADR-0007 I8), but no processor above 255 could run. On a QEMU machine whose second package starts at APIC ID 256 (`docs/research/2026-11-08-x2apic-above-255.md` §2), the kernel at `1c790fe` reported `ACPI processor discovery failed: invalid MADT` (150 processor structures) and `numa: invalid SRAT; consistent false: numa failed`.
+- **What:**
+  - **`cpumap` (library, safe, host-tested).** `CpuMap::new(boot, processors)` gives the boot processor index 0, wherever and whether the MADT lists it. Then each enabled processor gets the next index, in table order. An enabled processor listed twice is indexed once. Processors beyond `MAX_CPUS` (64) are counted as unindexed, and the broadcast ID `0xFFFFFFFF` is refused and counted. It also reports processors listed and enabled, whether the boot processor is listed, and the largest ID. Lookups go both ways.
+  - **`cpu`.** `CpuIndex` is a newtype, so an APIC ID cannot index an array by mistake; it shows as `CPU n (APIC ID m)` through `named`. The GS-based CPU-local area holds the index at offset 0: `this_cpu`, which replaces `cpu_id`. A lock-free table of `AtomicU32` holds each index's APIC ID, written once by `assign` (the boot processor in `init`, each AP by `smp` before it starts).
+    - `init_cpu_local` takes the index and gives this processor that index's area only if CPUID's x2APIC ID matches the record. Otherwise GS points at an area whose index names no slot.
+  - **`smp`.** The MADT list is sized from the table (length / 8) on the heap, then mapped with `CpuMap`. Every AP's APIC ID is assigned before the first AP starts, and the AP's start record carries its index. An AP that is not the processor its index names answers with a refusal and halts with interrupts off. "Every enabled processor online" now means every indexed processor online, with none unindexed or refused; it gates reclaiming loader memory.
+  - **`sched`.** The queues, `ACTIVE` and the thread tables are indexed by CPU index. `ThreadRef.cpu` is a `CpuIndex`, and the reschedule IPI goes to its recorded APIC ID. `spawn` takes a `CpuIndex`.
+  - **`tlb`.** `ONLINE` and `SERVED` are indexed by CPU index, and the shootdown IPI goes to the recorded APIC ID. An online target without a record is still waited for, so the wait panics rather than skipping a processor that may hold a stale translation.
+  - **`storage`.**
+    - The per-CPU wait queues, interrupt counts and queue pairs are indexed by CPU index. MSI-X destinations are APIC IDs.
+    - Per CPU, it counts the blocks of threads waiting for a completion, and the interrupts that woke them.
+    - A new **x2APIC proof** for each online processor above 255:
+      - the compatibility format refuses its ID;
+      - its per-CPU MSI-X entry holds only a remappable handle, and the IRTE behind it holds destination = its APIC ID, the vector and the source-ID check (`routed_through_irte`);
+      - its queue's interrupts arrived there;
+      - its threads' blocks equal the wake-ups by interrupts taken there, and are not zero.
+    - With no such processor, it reports that there is nothing to prove.
+  - **`virtionet`.** Its target is a `CpuIndex`, and its MSI-X entries go to that index's APIC ID.
+  - **`main`.** The SRAT lists are sized from the table (length / 16 for CPU affinities, length / 40 for memory). Topology and NUMA get APIC IDs, and everything else gets indexes.
+  - **`wait`, `console`, `time`, `user`.** `CpuIndex` throughout.
+  - **xtask.**
+    - A `Machine`: the `-smp` value, cold-plugged `-device` processors, the expected APIC ID of each CPU index, and the MADT's count and largest ID.
+    - `ORIGIN_QEMU_TOPOLOGY=x2apic` selects the sparse machine: `-smp 1,maxcpus=150,sockets=2,dies=3,modules=5,cores=5,threads=1` and `-device max-x86_64-cpu,socket-id=1,die-id=0,module-id=0,core-id=0,thread-id=0`.
+    - A **`boot-x2apic`** command runs `boot-test` on that machine.
+    - `ORIGIN_QEMU_IOMMU` overrides the IOMMU device, for controls.
+    - Markers name `CPU n (APIC ID m)`. Every AP's start-up line is required in index order, and so is the x2APIC line, or its "nothing to prove" line.
+- **Host tests:** 8 `cpumap` tests:
+  - the boot processor first, then table order;
+  - the boot processor anywhere, or not listed;
+  - QEMU's 150-processor table, where index 1 is APIC ID 256 and 75 IDs need type 9;
+  - capacity: 70 enabled gives 64 indexed and 7 unindexed;
+  - a duplicate is indexed once;
+  - the broadcast ID is refused;
+  - a randomized test over 2000 tables (`ORIGIN_MUTATION_SCALE` scales it) checking every invariant.
+
+  `cargo xtask check`: 550 tests, 0 failures, 6 ignored (542 before).
+- **Boot proof, `cargo xtask boot-x2apic`** (16.9 s for the kernel boot):
+  - `ACPI MADT: 150 processors, 2 enabled (largest APIC ID listed 420); CPU index 0 for the boot processor (APIC ID 0), 1 for the other enabled processor`
+  - `CPU 1 (APIC ID 256) online after 10641 us: own GDT, TSS and IDT, x2APIC`
+  - `SMP: 2 of 2 enabled processors online; trampoline identity pages removed true`
+  - `topology: 2 logical, 2 cores, 2 packages (1 threads/core, 256 logical/package); consistent true`
+  - `numa: 2 nodes, 150 cpus, 3 memory ranges, 511 MiB; consistent true`
+  - `scheduler: CPU 1: workers 2 and 3 counted 1157688 and 1265397, 51 context switches`
+  - `TLB: 1 other processors cached 3 pages; after one single-page shootdown (9000 TSC cycles) and one full flush of two pages (82000 cycles), 3 of their 3 reads faulted and 0 saw a stale translation`
+  - `wait queues: ping-pong between CPU 0 and CPU 1: 1000 round trips, 39 us each, woken by IPI`
+  - `NVMe: MSI-X: 65 vectors, table in BAR0 at offset 0x2000; I/O queue 2 completes to vector 1, sent to CPU 1 (APIC ID 256) as IDT vector 0x40`
+  - `NVMe: interrupt-driven: 64 reads of 8 blocks by a thread on CPU 1 (APIC ID 256), each blocking until its completion interrupt: 64 interrupts (the last on CPU 1 (APIC ID 256)), 512 of 512 blocks match, 81 us per read`
+  - `NVMe: CPU 1 (APIC ID 256): 32 reads through its own queue pair, 256 of 256 blocks match, its write read back true, 35 interrupts on CPU 1`
+  - `x2APIC: CPU 1 (APIC ID 256) is above 255, which a compatibility-format MSI address cannot carry (refused true); its NVMe MSI-X entry 3 holds only remappable handle 2, whose IRTE sends vector 0x40 to destination 256 after checking source ID 0x0010: true; 99 NVMe interrupts arrived there, and its threads blocked 98 times for a completion and were woken 98 times by an interrupt taken there; consistent true`
+  - `… receive thread on CPU 1 (APIC ID 256): slept 11, woken by the NIC's interrupt 11 (of 17 MSI-X interrupts, the last on CPU 1 (APIC ID 256)); consistent true`
+  Every other proof passes unchanged on this machine, with CPU 1 at APIC ID 256: the weights on CPU 1, SIMD state, user mode, TSC consistency, the console (both CPUs' lines whole), TLB shootdowns, GPT, the block cache, virtio-net's lease, ping and TFTP, and every IOMMU proof.
+- **`cargo xtask boot-matrix`** (1, 2 and 4 CPUs; APIC IDs equal indexes there) passes with every earlier proof, the new names (`CPU 1 (APIC ID 1)`) and `x2APIC: no online processor has an APIC ID above 255 (the largest is 3)` at 4. Kernel boots: 14.2 s, 16.8 s and 23.3 s at 1, 2 and 4 CPUs (the IOMMU entry above recorded 13.2 s, 15.4 s and 21.8 s; TCG boot times vary by about a second between runs). `cargo xtask boot-test` passes.
+- **Negative controls.** Each is a temporary change. With it applied, `cargo xtask boot-x2apic` exited 1; it was then restored, and `git diff` was empty again:
+  - **X1, the IRTE destination truncated to 8 bits** (`destination: apic & 0xFF` in `iommu::route`): APIC ID 256 becomes 0, so the interrupts land on the boot processor and the thread on CPU 1 sleeps until each 2 s deadline: `NVMe: interrupt-driven: 0 reads of 8 blocks by a thread on CPU 1 (APIC ID 256), each blocking until its completion interrupt: 6 interrupts (the last on CPU 0 (APIC ID 0)), 0 of 512 blocks match, 0 us per read: NVMe failed`.
+  - **X2, interrupt remapping off** (`ORIGIN_QEMU_IOMMU=intel-iommu,intremap=off`; QEMU accepts it under TCG). The AP still comes online, since IPIs need no remapping, but the kernel refuses to program the MSI: `IOMMU: unit 0: … interrupt remapping off …` then `NVMe: MSI-X: APIC IDs above 255 need interrupt remapping: NVMe failed`.
+  - **X3, a wrong APIC ID on record for CPU 1** (`assign(index, apic_id ^ 1)` in `smp`). The AP finds that index 1 is not its own, refuses and halts: `CPU 1 (APIC ID 256): a different processor answered: AP start-up failed`.
+- **QEMU facts worth keeping** (research ledger §2–§3):
+  - under TCG, QEMU 11.1 needs only the x2APIC CPU feature for APIC IDs above 255. It accepts `intremap=off`, `eim=off` or no IOMMU, so the kernel must refuse those itself;
+  - the MADT and SRAT list every possible processor. The MADT uses type 9 from ID 255 up and never sets "online capable"; the SRAT flags them all enabled;
+  - `-cpu max` reports an AMD vendor, so `threads=3` draws a hyperthreading warning;
+  - q35 allows at most 4096 possible processors.
+- **Unsafe inventory:** nothing new. The GS load in `this_cpu` is `cpu_id`'s, unchanged. `init_ap` and `load_tables` gained an index argument, and their SAFETY notes now say no other processor may be that index. The shootdown IPI's SAFETY note names the recorded APIC ID.
+- **Not done:**
+  - more than 64 processors: the per-CPU state is static, so extra ones are reported and left in firmware (ADR-0008 C6);
+  - CPU hot-plug (MADT "online capable");
+  - CPUID leaf 1Fh topology (dies and modules), which §27 needs;
+  - I/O APIC destinations are still 8-bit physical (`ioapic`). They go to the boot processor until I/O APIC entries go through IRTEs;
+  - **QEMU-only (§74).**
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the Intel SDM (x2APIC, MSI address format), ACPI 6.6 §5.2.12 and §5.2.16, and VT-d (IRTE destination with EIME).
+- **Licensing:** MIT OR Apache-2.0.
+
+### AP start-up: parking an AP that misses its handshake (`apstart`; `smp`; library + kernel; CLAUDE.md §24, §72; ADR-0008 C7 Proposed; 2026-11-08)
+
+- **Why:** APs start one at a time through one trampoline data page at 0x9000 (stack, entry, start record), which `start_one` rewrote for the next AP as soon as one missed its 200 ms handshake (ADR-0003 K6). An AP that was only slow could then run the trampoline with the next AP's stack and `ApStart`, so two processors shared one kernel stack and one set of tables. `351e630` made such an AP refuse its index and halt, but only after it had run on the shared stack. Control N1 below shows the hazard live on `91688a1`.
+- **Decision (CLAUDE.md §16, §24; ADR-0003 K6):** park the AP with INIT before the page is reused, and settle each start-up once. Per-AP trampoline data was the larger alternative. It was rejected for now: an AP that times out still runs on later, after `start` has removed the trampoline's identity mapping (ADR-0004 H1), where it faults with no IDT (a triple fault). So it must be stopped anyway, and INIT is the protocol's own way to stop it. Per-AP data stays with parallel start-up (K6's listed alternative), and would also close the residual risk below. K6's design (one at a time, one shared data page, INIT-SIPI-SIPI) is unchanged; ADR-0008 C7 records the failure path.
+- **What:**
+  - **`apstart` (library, safe, host-tested).** `Handshake` is one `AtomicU64` per start-up, settled once by a compare-and-swap from "undecided". The AP calls `answer(apic_id)` or `refuse(NoX2Apic | NotMine)`, and the boot processor calls `abandon()` at its deadline. Whichever comes first wins. `answer` returns false once the boot processor has given up, and `abandon` returns the AP's answer if it came first. Answers are encoded as the x2APIC ID + 1 (at most 2^32); the other outcomes are above 2^32, so no ID can be mistaken for one.
+  - **`smp`.**
+    - `wake` is the INIT, 10 ms, SIPI, 200 µs, SIPI, 200 ms protocol, shared by the start-up and the drill (`unsafe fn`: the trampoline must be ready).
+    - `park` (`unsafe fn`: the AP must not be online) sends INIT (level assert, `0x4500`) and waits 10 ms. The AP is left in wait-for-SIPI.
+    - `start_one` settles the handshake with `abandon()` after `wake`. Any outcome other than its own answer (a missed handshake, a refusal, a different ID) parks the AP before returning: `CPU n (APIC ID m): no answer within 200 ms; parked by INIT: AP start-up failed`. The next AP then starts as usual.
+    - `ap_entry` answers through the handshake and joins the scheduler only if its answer settled the start-up. Otherwise it halts with interrupts off until it is parked.
+    - **The park drill.** Before the first start-up, the first AP is started into `ap_drill`, a loop that only counts, on a 4 KiB guarded stack of its own. Once its count is seen moving, it is parked. The count must not move in the 1 ms after INIT plus 10 ms. If it does, INIT cannot be relied on, so no AP is started (`parked false … no AP is started: AP start-up failed`). The drill AP then waits in wait-for-SIPI and is started for real like any other. About 22 ms of boot, by construction.
+    - `poke`'s SAFETY note now names the invariant: every AP started before is online (it answered after reading its data) or parked.
+  - **xtask.** With two or more CPUs, the drill's line is required between the MADT line and CPU 1's start-up line, ending `its count moved 0 in 1000 us: parked true`.
+- **Host tests:** 7 `apstart` tests:
+  - an answer in time stands;
+  - after the deadline an answer does not join;
+  - a refusal settles like an answer;
+  - only the first of two answers counts;
+  - every APIC ID round-trips and differs from the other outcomes (edges, and 10 000 random IDs scaled by `ORIGIN_MUTATION_SCALE`);
+  - a word no outcome encodes never reads as an answer;
+  - the race: in 2000 rounds on real threads, the answer and the deadline start together with random jitter. Exactly one side wins each round, both sides agree, and both kinds of winner occur. A barrier start was tried first: it let the AP thread win 1994–2000 of 2000 rounds, so the start was changed to a spin; five runs then split 1041–1056 answered against 944–959 abandoned.
+
+  `cargo xtask check`: 557 tests, 0 failures, 6 ignored (550 before).
+- **Boot proof** (QEMU 11.1.3 TCG):
+  - `boot-test` (2 CPUs, kernel boot 15.3 s): `SMP: park drill: CPU 1 (APIC ID 1) ran a counting loop from the trampoline (count 122 at INIT); 10 ms after INIT, its count moved 0 in 1000 us: parked true`, then `CPU 1 (APIC ID 1) online after 10736 us`.
+  - `boot-matrix`: at 1 CPU there is no AP and no drill (13.4 s). At 2 CPUs, count 146, then CPU 1 online after 10670 us (15.9 s). At 4 CPUs, count 75, then CPUs 1, 2 and 3 online after 10787, 10148 and 10101 us (21.7 s).
+  - `boot-x2apic` (17.3 s): `park drill: CPU 1 (APIC ID 256) … (count 252 at INIT); … moved 0 in 1000 us: parked true`, then `CPU 1 (APIC ID 256) online after 10677 us`. INIT reaches a 32-bit destination, and a parked AP restarts.
+  - Every earlier proof passes unchanged. Kernel boot times are within TCG's run-to-run noise of the previous entry.
+- **Controls.** Each is a temporary change; afterwards `smp.rs` was restored and compared byte for byte. The slow AP of N1, P1 and N3 is a test-only hook (never committed). In the trampoline, before it reads its stack, entry and argument, the processor at APIC ID 2 waits until the boot processor rewrites the argument for another AP, then carries on, counting that at data offset 0x50 and recording the argument it went on with. This is the worst case of a slow AP. The boot uses 4 CPUs, under `cargo xtask run` so the whole log is kept.
+  - **N1, the hazard on the unfixed code** (`91688a1` plus the hook):
+    - `CPU 2 (APIC ID 2): no answer within 200 ms: AP start-up failed`;
+    - `CPU 3 (APIC ID 3): a different processor answered: AP start-up failed`;
+    - `the slow processor (APIC ID 2) read the data page after it was rewritten 1 times, and went on with the start record of CPU 3 (APIC ID 3)`;
+    - `SMP: 2 of 4 enabled processors online`.
+
+    Both processors ran `ap_entry` on CPU 3's stack and tables. Later checks counted them both: `TLB: global pages on 4 of 2 processors … TLB failed` and `PCIe: PAT entry 3 is uncached on only 4 of 2 processors … PCIe failed`.
+  - **P1, the fix with the same hook:**
+    - `CPU 2 (APIC ID 2): no answer within 200 ms; parked by INIT: AP start-up failed`;
+    - `CPU 3 (APIC ID 3) online after 10114 us`;
+    - `the slow processor (APIC ID 2) read the data page after it was rewritten 0 times`;
+    - `SMP: 3 of 4 enabled processors online`.
+
+    The boot then carries on with CPUs 0, 1 and 3 (`TLB: global pages on 3 of 3 processors`, schedulers on CPUs 0, 1 and 3, the TSC consistent across 3 processors). The only failure line is CPU 2's.
+  - **N2, `park` without its INIT** (no hook, 2 CPUs; `boot-test` exits 1): `park drill: CPU 1 (APIC ID 1) ran a counting loop from the trampoline (count 134 at INIT); 10 ms after INIT, its count moved 5189 in 1000 us: parked false; INIT does not stop a running processor, so no AP is started: AP start-up failed`. The proof line can fail.
+  - **N3, the settled handshake without the park** (the fix, minus `park` after a missed handshake, plus the hook): `CPU 3 (APIC ID 3): a different processor answered` and `the slow processor … went on with the start record of CPU 3 (APIC ID 3)`. Settling the handshake keeps a late AP out of the scheduler, but only INIT keeps it off the next AP's data. (The CPU 2 line still reads `parked by INIT`, because the control removed only the call.)
+- **Research:** Intel SDM (version 093, cited by chapter as in `docs/research/2026-11-08-x2apic-above-255.md`):
+  - Vol. 3A, MP initialization: INIT, a 10 ms delay, then start-up IPIs; an AP that takes INIT waits for a SIPI.
+  - Vol. 3A, the ICR: INIT is delivery mode 101b, sent as level assert; processors since the Pentium 4 support no INIT level de-assert.
+  - Vol. 3C, VMX: INIT is blocked in VMX root operation.
+  - SMM: INIT is inhibited on SMM entry and held until the processor leaves SMM.
+
+  The last two were read second-hand, from SDM page mirrors and a comment in EDK2's OVMF; the SDM PDF is still beyond the fetch limit. No operating-system code was read. QEMU's own INIT behaviour was measured, not read: the drill and N2.
+- **Security review:** a processor that misses its handshake can no longer write another AP's GDT, TSS or stack, take its CPU-local area or scheduler, or bring CPU indexes out of step with the processors online. The drill runs kernel code on an AP with interrupts off and no IDT, as the trampoline already did, for about 1 ms.
+- **Unsafe inventory:**
+  - new `unsafe fn wake` and `unsafe fn park`, each with a `# Safety` contract and one `send_ipi` per block;
+  - the existing INIT and SIPI sends moved into them;
+  - `ap_drill` is safe code.
+- **Not done / known limits:**
+  - **Residual risk:** INIT waits while a processor is in SMM. An SMI longer than 10 ms on a timed-out AP could still let it read the rewritten page. Per-AP trampoline data with parallel start-up would close it.
+  - `ap_entry` added to the PAT and global-page counters before its handshake, so an AP parked after reaching them was still counted (seen in N1 and N3; none was in P1, where the AP stalled earlier). Fixed in the next entry.
+  - A parked AP is not retried, and `online.complete` stays false, so loader memory is not reclaimed.
+  - The drill covers only the first AP.
+  - **QEMU-only (§74).**
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the Intel SDM (MP initialization, the ICR's INIT and start-up delivery modes).
+- **Licensing:** MIT OR Apache-2.0.
+
+### The PAT and global-page checks count online processors only (`cpu`, `tlb`, `pcie`; kernel; CLAUDE.md §24, §69; ADR-0008 C2 and C7; 2026-11-08)
+
+- **Why:** every processor that ran `ap_entry` as far as `tlb::enable_global_pages` and `cpu::check_pat` added to two global counters, before its start-up handshake. The TLB proof and `pcie::init` compared those counters with the number of processors online. So an AP that was parked after reaching them (ADR-0008 C7) was still counted. Both checks then failed with impossible counts, and the failed PCIe check took NVMe, the IOMMU and the network down with it: one slow AP cost the boot its devices.
+- **What:**
+  - `cpu::PAT_READY` and `tlb::GLOBAL_PAGES` are now one flag per CPU index, as ADR-0008 C2 wants for per-CPU state. A processor marks its own index (`this_cpu`).
+  - A processor with no index cannot mark: its CPU-local area names no slot (ADR-0008 C4).
+  - `cpu::pat_ready(cpus)` and `tlb::prove` count the flags of the processors online only.
+  - `pcie::init` takes the online CPU indexes instead of a count.
+  - An AP marks its index before its handshake, so the release and acquire of the handshake order the mark before the boot processor sees the AP online.
+- **Controls** (4 CPUs, `cargo xtask run`, whole log kept). Each is a temporary change, then restored: C1 and C2 add a test-only hook; C3 changes `check_pat` and `tlb::enable_global_pages` for the run only. The hook (never committed) makes the processor at APIC ID 2 stall in `ap_entry` right after both checks, until the boot processor settles its start-up without it. So it is parked after it marked.
+  - **C1, before the fix** (`e430ee5` plus the hook): `CPU 2 (APIC ID 2): no answer within 200 ms; parked by INIT`, then `TLB: global pages on 4 of 3 processors … TLB failed` and `PCIe: PAT entry 3 is uncached on only 4 of 3 processors (IA32_PAT 0x7040600070406): PCIe failed`. No NVMe or network proof ran.
+  - **C2, the fix with the same hook:** `TLB: global pages on 3 of 3 processors`; `PCIe: ECAM for segment 0 … IA32_PAT 0x7040600070406 on 3 processors`; then the NVMe interrupt-driven proof on CPU 1 and the rest of the boot. CPU 2's line is the only failure.
+  - **C3, APs never mark their index** (2 CPUs, no hook): `TLB: global pages on 1 of 2 processors … TLB failed` and `PCIe: PAT entry 3 is uncached on only 1 of 2 processors … PCIe failed`. Counting over the online processors still catches an online processor that did not pass.
+- **Gates:** `cargo xtask check`, `boot-test`, `boot-matrix` (1, 2, 4) and `boot-x2apic` pass, with their TLB and PCIe lines unchanged.
+- **Unsafe inventory:** nothing new.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code.
+
+### I/O APIC interrupts through VT-d interrupt remapping (`ioapic`, `vtd`, `dmar` libraries; `iommu`, `irq`, `cpu` kernel; CLAUDE.md §24, §32, §72; ADR-0007 I8, Proposed; 2026-11-08)
+
+- **Why:** once interrupt remapping is on with compatibility format blocked (CFI clear, ADR-0007 I8), hardware drops every I/O APIC interrupt whose redirection entry is in compatibility format. The keyboard IRQ and every other legacy IRQ need their entries in remappable format, naming IRTEs. QEMU passes compatibility format through, so until now the boot test could not show the gap: the only I/O APIC proof ran before the IOMMU came up.
+- **What:**
+  - **`ioapic` (library): `RemappableEntry`**, the remappable-format redirection entry (VT-d chapter 5, programming the I/OxAPIC):
+    - the IRTE index's bits 14:0 in entry bits 63:49 and its bit 15 in bit 11 (where compatibility format keeps the destination mode);
+    - the format bit, 48;
+    - bits 10:8 000 (fixed), so the message's SHV stays clear and the handle alone selects the IRTE;
+    - polarity (13), trigger mode (15) and mask (16) where compatibility format keeps them, because they govern how the I/O APIC samples its pin;
+    - reserved bits 47:17 zero.
+
+    `encode` refuses vectors 0–15. `decode` refuses compatibility format, a non-zero delivery mode, any reserved bit and vectors 0–15, and ignores the read-only delivery-status and remote-IRR bits. `agrees_with_irte` holds when the trigger modes are equal and, for a level-triggered pin, the vectors too: the I/O APIC clears a level pin's remote IRR on an EOI broadcast that names its own vector, while the processor broadcasts the IRTE's. `is_remappable` tells the formats apart.
+  - **`vtd` (library):** `Irte` gains `level` (TM, low-qword bit 4). An MSI stays edge-triggered; an I/O APIC pin's IRTE takes the pin's trigger mode. `decode` now accepts TM and still refuses logical destinations (DM), the redirection hint and non-fixed delivery modes.
+  - **`dmar` (library): `Dmar::ioapic(id)`**: the unit whose device scope lists the I/O APIC with that enumeration ID (its MADT I/O APIC ID), and the requester its scope's path resolves to — the source ID an IRTE for one of its pins must check. INCLUDE_PCI_ALL never covers an I/O APIC (chapter 8). Refused (`IoApicScopeError`) when no scope lists it, when two do (the source ID would be ambiguous), or when the path does not resolve.
+  - **`iommu` (kernel):**
+    - `route_ioapic_pin(ioapic, apic, vector, level)`: an IRTE on the unit `Dmar::ioapic` names, with the vector, the 32-bit x2APIC destination, the pin's trigger mode and SVT 1/SQ 0 on the DMAR's source ID; written high half first, its interrupt-entry-cache entry invalidated. If the write or the invalidation fails, the entry is cleared before its slot is freed.
+    - `pin_irte` reads the entry back; `rewrite_pin` (for the proofs) writes another entry or clears it, with the invalidation; `release_pin` clears and frees it.
+  - **`irq` (kernel): `prove_remapped`.** The first I/O APIC proof (before the IOMMU) now keeps the pin it found and its single MMIO mapping. After the IOMMU proofs, the pin is routed through `route_ioapic_pin` to a target CPU, another than the boot processor when there is one, and its redirection entry rewritten in remappable format. Every redirection write is now masked first, then the high dword, then the low one, so an entry is never live half written.
+  - **`cpu`:** a per-CPU count of the I/O APIC vector (`ioapic_irqs_on`, by x2APIC ID), so the proof can say which CPU took each interrupt.
+  - **xtask:** markers for the five new lines, after the IOMMU proofs.
+- **Boot proof** (every boot; `boot-matrix` at `-smp` 1, 2 and 4; quoted at 2):
+  - `I/O APIC: remapped: the PIT's IRQ0 (GSI 2, edge-triggered, active-high) through IRTE 5: the redirection entry reads back in remappable format with that index, vector 0x41 and mask clear: true; the IRTE reads back vector 0x41 to CPU 1, edge-triggered like the pin, checking source ID 0xff00 (I/O APIC 0's, from the DMAR): true; the two agree: true; 0 earlier fault(s) cleared`
+  - `I/O APIC: remapped: 20 PIT interrupts arrived on CPU 1 through IRTE 5 in 200 ms, 0 on other CPUs; fault recorded: none; consistent true`
+  - **The IRTE not present:** `I/O APIC: IRTE 5 not present: 0 interrupts arrived in 100 ms; fault recorded: source ID 0xffff, interrupt index 5, reason 0x22 (interrupt table entry not present), from a message without a requester ID (the DMAR names 0xff00); IRTE restored, 5 interrupts arrived on CPU 1 again: true; consistent true`
+  - **A wrong source ID:** `I/O APIC: IRTE 5 checking source ID 0xff01 instead of 0xff00: 10 interrupts arrived in 100 ms; fault recorded: none; the source-ID check cannot be shown on this platform: its I/O APIC's messages carry no requester ID (0xffff above), so the unit skips the check (hardware blocks them, reason 0x26); IRTE restored, 5 interrupts arrived on CPU 1 again: true; consistent true`
+  - `I/O APIC: remapped: the entry masked, the PIT stopped and IRTE 5 released: true; 0 fault(s) recorded after`
+
+  At `-smp` 1 the IRTE is 4 and the target CPU 0; at 4, IRTE 7 and CPU 1; the results are otherwise the same. Kernel boots on the committed code: 15.0 s, 16.6 s and 20.6 s (13.2 s, 15.4 s and 21.8 s before this work; TCG timings vary by about a second between runs). The new proof takes about 0.7 s.
+
+  **Why the not-present probe is the proof.** Under QEMU a compatibility-format entry's interrupts arrive whatever the IRTEs say, and a read-back only shows what the I/O APIC holds. With the IRTE cleared, nothing may arrive and the unit must record a fault for that index. The interrupts stop, then resume when the IRTE is restored, so they went through it. Control N1 below shows the probe catching a compatibility-format entry that delivers perfectly well.
+- **A QEMU blind spot, measured and then confirmed in QEMU's source.** QEMU 11.1's I/O APIC writes its interrupt messages with `MEMTXATTRS_UNSPECIFIED` (`hw/intc/ioapic.c`, `ioapic_service`). They carry no requester ID, so the VT-d model sees `X86_IOMMU_SID_INVALID` (0xffff) and:
+  - records a fault from them with source ID 0xffff, not the DMAR's 0xff00;
+  - skips the IRTE's source-ID check (`hw/i386/intel_iommu.c`, `vtd_irte_get`: validation only `if (sid != X86_IOMMU_SID_INVALID)`). A wrong source ID — reason 0x26 on hardware — goes unnoticed: the probe saw 10 interrupts arrive and nothing recorded.
+
+  The kernel stays strict where the messages carry a source ID. If the not-present fault shows the I/O APIC's own source ID, as on hardware, the wrong-ID probe must block every interrupt and record reason 0x26 with that source ID. Only if it shows none (0xffff, while the DMAR names another) is the probe allowed to see the interrupts arrive, and only with nothing recorded; the line then says the check cannot be shown. Any other source ID fails the proof. So **the source-ID check on I/O APIC interrupts (and the 0xff00 in the fault) needs hardware (§74)**, like CFI blocking and the interrupt-entry-cache invalidation before it. The IRTE's source check itself is read back and checked against the DMAR on every boot (control N4).
+- **Negative controls.** Each is a temporary change; with it applied `cargo xtask boot-test` exited 1 (except N4b, a measured probe that passes), and the files were restored from git (the script is in the session's scratchpad; the changes are described here). Because xtask stops at the first failure marker, the `b` variants disable an earlier read-back so a later check is reached:
+  - **N1, the redirection entry left in compatibility format** (its destination the target CPU): `the redirection entry reads back in remappable format …: false; the IRTE reads back …: true; the two agree: false; … I/O APIC failed`.
+  - **N1b, the same with the read-back checks disabled.** QEMU delivers compatibility format perfectly well: `20 PIT interrupts arrived on CPU 1 through IRTE 5 in 201 ms, 0 on other CPUs; fault recorded: none; consistent true`. Only the not-present probe catches it: `IRTE 5 not present: 10 interrupts arrived in 100 ms; fault recorded: none; … consistent false: I/O APIC failed`. This is the control that shows the probe, not a read-back, proves the path through the IRTE.
+  - **N2, the pin's IRTE never written:** `the IRTE reads back …: false; the two agree: false; … I/O APIC failed`.
+  - **N2b, the same with the IRTE read-back disabled:** `0 PIT interrupts arrived on CPU 1 through IRTE 5 in 2000 ms, 0 on other CPUs; fault recorded: source ID 0xffff, interrupt index 5, reason 0x22 (interrupt table entry not present); consistent false: I/O APIC failed`. The task asked for this control with source ID 0xff00; QEMU records 0xffff (the blind spot above).
+  - **N3, the not-present probe leaves the IRTE present:** `IRTE 5 not present: 10 interrupts arrived in 100 ms; fault recorded: none; … consistent false: I/O APIC failed`.
+  - **N4, the pin's IRTE checks a source ID one function off (0xff01):** `the IRTE reads back … checking source ID 0xff00 (I/O APIC 0's, from the DMAR): false; the two agree: true; … I/O APIC failed`. Under QEMU it is this read-back against the DMAR that catches a wrong source ID, not the unit.
+  - **N4b, the same with the IRTE read-back disabled, passes the boot test**, as expected: a measured probe, not a control. With the IRTE checking 0xff01 instead of the I/O APIC's 0xff00, every interrupt still arrives through it (`20 PIT interrupts arrived on CPU 1 through IRTE 5 in 200 ms, 0 on other CPUs; fault recorded: none; consistent true`): QEMU's unit cannot check a source ID its I/O APIC never sends. On hardware that IRTE would block every interrupt with reason 0x26.
+  - **N5, the pin's IRTE level-triggered while the pin is edge-triggered:** `the IRTE reads back …: false; the two agree: false; … I/O APIC failed`.
+- **Test evidence (2026-11-08):** 7 new host tests and two extended:
+  - `ioapic` (5): golden remappable encodings (index 0, 5, 0x8000 and 0xFFFF; polarity, trigger and mask where compatibility format keeps them; delivery bits 000) and the refusal of vectors 0–15; 20,000 random entries round-trip, the status bits ignored; every refusal (compatibility format, each delivery mode, each reserved bit, a low vector), plus 20,000 random register pairs that decode only to what re-encodes; a model of the I/O APIC's message wiring, showing a remappable entry's message selects its IRTE through `vtd::interrupt_index` with SHV clear (and that a lowest-priority entry would set SHV and shift the index); and `agrees_with_irte`;
+  - `vtd` (1 new, 1 extended): a pin's IRTE (golden, edge and level), 10,000 random IRTEs round-trip with TM; logical destination, RH and each non-fixed delivery mode refused;
+  - `dmar` (1 new, 1 extended): QEMU's I/O APIC 0 → 0xff00; an INCLUDE_PCI_ALL unit's I/O APIC 2 → 0xf0f8; an HPET with the same ID is not one; listed by two units, or twice by one, refused; an I/O APIC behind a bridge resolves through its secondary bus, and without the bridge does not. The 12,000-case mutation soak also runs the lookup, and every I/O APIC it returns is listed exactly once, by the unit returned.
+
+  308 framekernel library tests (301 before); `cargo xtask check` (549 tests, 0 failures, 6 ignored); `boot-test`; `boot-matrix` (1, 2, 4).
+- **Unsafe:** none added. The new kernel code reaches the I/O APIC through the existing `MappedIoApic` register access and the IRTEs through the existing `iommu` page access.
+- **Not done:**
+  - the keyboard's IRQ1 to a handler (the route and the entry format are ready; the i8042 driver is not interrupt-driven yet);
+  - a level-triggered pin in a live proof (PCI INTx). The encodings and the vector rule are host-tested; the EOI path for a level-triggered remapped interrupt (an EOI broadcast that names the RTE's vector, or a directed EOI) is not exercised;
+  - more than one I/O APIC (only the first in the MADT is routed), and HPET MSIs (the DMAR's HPET scopes);
+  - ~~the per-CPU count is indexed by x2APIC ID~~ — done at the merge with the CPU-index work: the count is indexed by `CpuIndex` (`this_cpu()`), and the IRTE's destination is the target's recorded APIC ID, so in `boot-x2apic` the pin is routed to APIC ID 256;
+  - **QEMU-only (§74).** The source-ID check on I/O APIC interrupts and the 0xff00 in their faults need hardware.
+- **Specifications:** Intel VT-d Architecture Specification, chapter 5 (I/OxAPIC programming, the remappable interrupt request) and chapters 7–9 (fault reasons, the IRTE, the DRHD device scope). As for the rest of the VT-d work, the Rev 5.20 PDF itself was not read (download approval pending); the layout has been stable since early revisions and QEMU's I/O APIC builds its messages from exactly these fields. **Re-check against Rev 5.20 before hardware qualification.**
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the VT-d specification (chapter 5, I/OxAPIC programming; chapters 7–9). QEMU's I/O APIC and VT-d models were read only to learn what they do with these messages. No operating system's code was read or copied (CLAUDE.md §3).
+
+### The ACPI IVRS and AMD-Vi encodings (`ivrs`, `amdvi`; library; CLAUDE.md §16, §32, §72; 2026-11-08)
+
+- **Why:** CLAUDE.md §32 asks for the AMD IOMMU beside Intel VT-d, and the VT-d work named AMD-Vi as the next, separate step. Research came first (§16): `docs/research/2026-11-08-amd-vi-iommu.md`.
+- **What:**
+  - **`ivrs`: the ACPI I/O Virtualization Reporting Structure.** One `parse` checks the whole table before any view of it is returned:
+    - the 48-byte header and the revision (1 or 2);
+    - each definition block's header, its type's length (IVHD 10h 24 bytes, 11h and 40h 40, IVMD exactly 32) and its placement; unknown types are skipped by their length;
+    - IVHD types against the header: 11h and 40h need IVinfo EFRSup, and 40h needs revision 2;
+    - register bases: non-zero and 16 KiB aligned; a second IVHD with the same base must be another type naming the same segment and DeviceID (the same IOMMU described again);
+    - every device entry: a known length (4, 8, or an ACPI HID entry's 22 plus its UID), inside its IVHD; ACPI HID entries only in type 40h, with a UID format of 0–2 that agrees with the UID length;
+    - range starts (03h, 43h, 47h) followed at once by an end (04h) at or above them, and no end alone;
+    - at most one "all" entry per IVHD, and one IOMMU per segment that claims all;
+    - IVMDs after some IVHD, below 2^64, with ranges that do not end before they start, and no identity mapping without access.
+
+    The views are the IOMMUs (each once, from its richest IVHD: 40h, 11h, 10h, as the specification's §4.5 recommends), their device entries with ranges joined (select, range, alias select and range, extended select and range, special I/O APIC and HPET, ACPI HID, reserved types), the DTE settings, and the memory definitions with the IOMMU they follow. `Ivrs::unit_for` resolves a DeviceID to the IOMMU and the requester (alias) it is seen as: an entry naming it first, then a range, then "all"; `Ivrs::special` finds the I/O APIC's DeviceID.
+  - **`amdvi`: pure AMD-Vi encodings.**
+    - register offsets, Control and Status bits; capability-header, EFR and EFR2 decoding;
+    - the device-table, command-buffer and event-log base registers and ring pointers;
+    - the 256-bit device table entry as the kernel writes it: DMA blocked (V set, TV clear) or translated (Mode, root, IR, IW), interrupts blocked (IV, IntCtl 00b) or remapped through a table (IV, IntCtl 10b, IntTabLen, the 128-byte aligned root), the IVRS pass bits and SysMgt, the domain; decoding refuses every entry the kernel never writes;
+    - a host page-table walker over the VT-d walker's `TableMemory`: 4 KiB pages, directory entries naming the next level with read and write, the leaf deciding; it never replaces a live mapping and translates as the IOMMU would;
+    - IRTEs: the basic 32-bit entry (8-bit destination) and the 128-bit entry with GuestMode 0 (32-bit x2APIC destination under XTEn); remapped MSI messages (data = the index, kept below 256 so the message type stays fixed) and the index the IOMMU derives;
+    - commands: COMPLETION_WAIT (store, f), INVALIDATE_DEVTAB_ENTRY, INVALIDATE_IOMMU_PAGES (one page or the whole domain), INVALIDATE_INTERRUPT_TABLE, INVALIDATE_IOMMU_ALL;
+    - events: code, DeviceID, domain, address and the I, PR, RW, PE, RZ and TR flags; event names.
+- **Specifications:** AMD I/O Virtualization Technology (IOMMU) Specification, 48882 Rev 3.11 (April 2026): §2.2.2, §2.2.3, §2.2.5, §2.4, §2.5, §3.2, §3.4 and §5. Read from a mirror of AMD's PDF, since confirmed byte-identical to AMD's own copy (SHA-256 in the research ledger). The specification's agreement forbids duplicating it, so the code cites sections and copies no text.
+- **Test evidence (2026-11-08), 14 host tests:**
+  - `ivrs` (6):
+    - QEMU 11.1.3's exact table for the AMD boot (192 bytes as the kernel read them): one IOMMU at 0xfed80000 described by an IVHD 10h and an IVHD 11h, eight select entries and the I/O APIC as DeviceID 0x00a0;
+    - a two-IOMMU, two-segment platform with every block and entry type, one IOMMU described twice (10h and 40h);
+    - resolution by rank, aliases (select and range), extended ranges, segments, special devices and memory definitions;
+    - a named entry beating a range beating "all";
+    - every refusal at its offset;
+    - a 12,000-case mutation soak over three tables (two thirds re-sealed); more than 1,000 tables are accepted per default run, and each keeps every invariant `parse` promises.
+  - `amdvi` (7): capability, EFR and EFR2 decoding with the base registers; DTE round-trips and refusals; the walker (sharing, permissions, double maps, skipped levels, exhaustion) and a 20,000-step model check against a map; both IRTE formats and the messages; every command's encoding; event decoding (QEMU's form too) and 20,000 random entries.
+- **Not done:** guest translation (GCR3 tables, PASIDs), guest virtual APIC IRTEs (GuestMode 1), 2048-entry interrupt tables, device-table segmentation, PPR and GA logs, large-page mappings, and a Kani proof of the parser (§73).
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the specification. QEMU's device model was read and driven only to learn what it emulates. No operating system's IOMMU code was read or copied (CLAUDE.md §3).
+- **Licensing:** MIT OR Apache-2.0.
+
+### AMD-Vi DMA and interrupt remapping (`iommu::amd`, `iommu`; kernel; CLAUDE.md §31, §32, §58; ADR-0007 Proposed; 2026-11-08)
+
+- **What:**
+  - **One set of entry points.** `iommu::{attach, map, unmap, translate, msi_message, route, reserve_blocked_interrupt, release_interrupt, take_faults, domains, source_id}` dispatch to the AMD-Vi driver when the firmware provides an IVRS and no DMAR. `dma::DeviceDma`, NVMe and virtio-net are unchanged. Faults reach callers as a neutral `iommu::Fault` (page not mapped, page denied, interrupt blocked, other) carrying the vendor's record; `iommu::route` reads an MSI's IRTE back for either vendor. The IOMMU proofs in `storage.rs` use these, so one proof serves both; every VT-d line is unchanged.
+  - **`iommu::amd` (kernel).** After PCIe enumeration, and before any driver binds, each IOMMU the IVRS names is brought up:
+    1. its capability block is read from its PCI function (it must be an IOMMU block) and its registers mapped uncached (16 KiB: every register used lies there); the firmware must have left IOMMUEn clear;
+    2. its features are the EFR register ANDed with the IVHD's image of it; 4-level host tables must be supported;
+    3. a device table to the highest DeviceID the IVHD names (rounded to a page) is built with every entry blocking: V set and TV clear (every DMA aborted and logged), IV set with IntCtl 00b (fixed and arbitrated interrupts aborted), and the IVRS pass bits and SysMgt on the entry each device's requests use;
+    4. a command buffer and an event log (one page, 256 entries each), no exclusion range, the control settings the IVHD recommends, then EventLogEn, CmdBufEn and IOMMUEn in one write — with GAEn and XTEn (128-bit IRTEs, 32-bit x2APIC destinations) where GASup and XTSup;
+    5. INVALIDATE_IOMMU_ALL (with IASup) and every device table entry and interrupt table invalidated, batches closed by COMPLETION_WAIT stores; stale events drained.
+
+    If an IOMMU fails, those already running are turned off again.
+    - `attach`: one domain per requester DeviceID (the IVRS alias where named), domain IDs from 1, a 4-level table, the IOVA window [1 GiB, 2 GiB); the device's interrupt table first, then its DTE's domain and translation words (word 0 last), then INVALIDATE_DEVTAB_ENTRY and INVALIDATE_IOMMU_PAGES for the domain. A device an IVMD names is refused (unity maps and exclusion ranges are not implemented).
+    - `map`: one 4 KiB read/write page at the next IOVA; a page invalidation follows where the capability block reports NpCache (QEMU does).
+    - `unmap`: clears the leaf, then INVALIDATE_IOMMU_PAGES for the page and a COMPLETION_WAIT, and returns only when the IOMMU stored its value.
+    - `msi_message`: an index into the device's own 256-entry interrupt remapping table (made on first use; IV, IntCtl 10b, IntTabLen 8); the IRTE (fixed, physical, the vector, the destination) is written high word first so RemapEn turns on last, then INVALIDATE_INTERRUPT_TABLE; the message is `0xFEE0_0000` with data = the index.
+    - Faults are drained from the event log (event interrupts off; logging restarted after an overflow). An I/O page fault counts as an interrupt only if I is set and its address is in the interrupt range.
+  - **xtask**: `ORIGIN_QEMU_IOMMU=amd` boots with `-device AMDVI-PCI,id=iommupci0,addr=05.0 -device amd-iommu,pci-id=iommupci0,intremap=on,xtsup=on,dma-remap=on` (pinned so the NVMe and NIC keep their slots; `dma-remap=on` because without it QEMU 11.1 translates no emulated device's DMA). The AMD marker set replaces only the vendor-specific lines; a scenario can now require text on QEMU's stderr; `boot-matrix` runs both IOMMUs at 1, 2 and 4 CPUs. PCI class 08:06 is named "IOMMU".
+- **Boot proof** (`ORIGIN_QEMU_IOMMU=amd`; `boot-matrix` at `-smp` 1, 2 and 4; quoted at 2). Every existing NVMe, GPT, block cache and virtio-net proof passes unchanged through the IOMMU. Then:
+  - `IOMMU: IVRS revision 1, IVinfo 0x2801 (EFR support true, 40-bit physical and 0-bit virtual addresses, pre-boot DMA protection false); 1 IOMMU(s) in 2 IVHD(s), 0 memory definition(s)`
+  - `IOMMU: unit 0 at 0xfed80000 (segment 0, IVHD type 0x11 of 2, IOMMU function 00:05.0, capability at 0x40): 9 device entries up to DeviceID 0x00fb, I/O APIC 0 (DeviceID 0x00a0)`
+  - `IOMMU: unit 0: AMD-Vi capability revision 0, IOTLB true, not-present entries cached true; EFR 0x29d7 (register 0x29d7, IVRS image 0x29d7): x2APIC true, guest APIC true, INVALIDATE_IOMMU_ALL true, 6-level host tables, performance counters false; EFR2 0x0: 512 interrupts per function`
+  - `IOMMU: unit 0: device table of 256 entries at 0x…, every entry blocking DMA and fixed interrupts; command buffer and event log on (256 entries each); interrupt remapping per device (128-bit entries, 32-bit x2APIC destinations); translation on (control 0x4000000021007, status 0x18): every device's DMA is blocked until its driver attaches it; caches invalidated (INVALIDATE_IOMMU_ALL, then every device table entry and interrupt table); 0 stale event(s) cleared`
+  - **Translated DMA:** `the NVMe controller (00:02.0, source ID 0x0010) read LBA 2048 into IOVA 0x40012000, which its domain maps to physical 0x76000 (not the same address): 8 of 8 blocks landed in that physical page`.
+  - **Blocked DMA:** `IOVA 0x40012000 unmapped (the translation cache invalidated page-selectively and the completion awaited), the same read completed with status type 0 code 0x0, and the page kept its canary true; fault recorded: DeviceID 0x0010, access at 0x0, domain 0, event 0x2 (I/O page fault: page not present)`. The record names the controller and the fault; the address and domain read 0 because QEMU 11.1's event encoder drops them (research ledger §2.5). The proof accepts address 0 only under AMD-Vi, never another address, and the boot test expects 0, so a QEMU that starts recording the IOVA is noticed.
+  - **Interrupt remapping:** `5 of 5 MSI-X entries (NVMe 3, virtio-net 2) hold only an index into their device's own interrupt remapping table, whose IRTE holds the vector and the x2APIC destination; 5 IRTEs in use; APIC ID 300 accepted (its IRTE reads back destination 300), which compatibility format refuses: true`. These entries' data is the index (0–4) to destination 0: delivered as plain messages, they would be vectors 0–4 on CPU 0, which the APIC drops, yet every NVMe and virtio-net interrupt the earlier proofs counted arrived at the right vector and CPU.
+  - **Blocked interrupt:** `NVMe MSI-X vector 1 pointed at IRTE 3, left not present: a read on I/O queue 2 completed true, 0 interrupts arrived; fault recorded: none; vector 1 restored`. QEMU 11.1 logs no interrupt-remapping fault; the boot test requires QEMU's own stderr line, `failed to remap interrupt from devid 0x10`, as evidence that its IOMMU refused the message.
+  - **Domains:** `00:02.0 domain 1 (18 pages mapped, 19 ever, 4 table pages); 00:03.0 domain 2 (18 pages mapped, 18 ever, 4 table pages); every other function's device table entry blocks its DMA and fixed interrupts; IOVAs from 0x40000000; faults recorded before the proofs: 0`.
+
+  The matrix gives the same results at 1 and 4 CPUs: 4 and 7 MSI-X entries remapped, 15 and 24 NVMe pages. Kernel boots: 13.0 s, 15.6 s and 20.9 s; the VT-d boot in the same matrix, unchanged: 14.1 s, 15.6 s and 20.2 s.
+- **Negative controls.** Each is a temporary change. With it applied, `ORIGIN_QEMU_IOMMU=amd cargo xtask boot-test` exited 1; the file was then restored from git (the script, with every patch, is in the session's scratchpad; the patches are described here):
+  - **N1, unmap without INVALIDATE_IOMMU_PAGES:** QEMU's IOTLB still holds the translation, so the "blocked" read goes through: `blocked DMA: … the page kept its canary false; fault recorded: none; consistent false: IOMMU failed`. The proof tests the invalidation path, not only the page table.
+  - **N2, IOVAs handed out but never mapped:** `NVMe: a command timed out: NVMe failed`. The drivers' own DMA goes through translation.
+  - **N3, virtio-net never attached, DMAing to physical addresses although it accepted ACCESS_PLATFORM:** its blocking entry stops every frame: `ARP 10.0.2.2 -> 00:00:00:00:00:00; DHCP lease 0.0.0.0 …; (of 0 MSI-X interrupts, none arrived) …: virtio-net failed`. This is default deny.
+  - **N4, the device's interrupt table made but its DTE never pointed at it (IntCtl stays 00b):** every MSI is target aborted: `NVMe: interrupt-driven: 0 reads … 0 interrupts (none arrived) …: NVMe failed`, and QEMU prints `failed to remap interrupt from devid 0x10`.
+  - **N5, every IRTE's vector one too high:** `NVMe: interrupt-driven: 0 reads … 0 interrupts (none arrived) …: NVMe failed`. The vector comes from the IRTE; the message carries only the index.
+  - **N6, the blocked-interrupt probe sent through a present IRTE:** `blocked interrupt: … 1 interrupts arrived; fault recorded: none; … consistent false: IOMMU failed`. The proof notices an interrupt that gets through.
+  - **N7, GAEn and XTEn off (32-bit IRTEs, 8-bit destinations):** every NVMe and virtio-net interrupt still arrives through the 32-bit IRTEs — the fallback path works — but `APIC ID 300 … (its IRTE reads back destination none) … consistent false: IOMMU failed`. The x2APIC destination needs the 128-bit format.
+
+  **Probes.** N8, no INVALIDATE_INTERRUPT_TABLE after an IRTE is written, **passes** the boot test: QEMU keeps no IRTE cache, so the missing invalidation cannot be seen under QEMU (the VT-d C8 blind spot again); the code follows the specification. N9, N3 with the bring-up's per-entry invalidation removed, fails like N3: virtio-net's own interrupt-table setup invalidates its entry, which is enough for QEMU to put it under the blocking entry. The bring-up invalidation therefore protects only functions no driver touches, and none of those DMA in this machine; the device-model experiment in the research ledger (§2.4) shows the pass-through it prevents.
+- **QEMU facts worth keeping** (research ledger §2):
+  - `dma-remap=on` or no emulated device's DMA is translated; a device is put under translation only by an INVALIDATE_DEVTAB_ENTRY for its DeviceID;
+  - Mode 0 passes DMA through without checking IR and IW (V=1/TV=0 blocks);
+  - the AMDVI-PCI function takes the first free slot unless pinned with `pci-id`;
+  - every event has address 0 and DomainID 0, I is set on DMA faults, and interrupt-remapping faults are never logged (only printed on stderr);
+  - one page fault is logged per bounced 4-byte access, so a blocked 4 KiB write fills the 256-entry log; EventOverflow is set only with EventIntEn;
+  - no IRTE cache; INVALIDATE_IOMMU_PAGES flushes the whole domain; illegal commands never stop processing.
+- **Unsafe inventory (reviewed by the author, not independently):**
+  - `iommu::amd`: `alloc_zeroed` of the device table (a run of frames, kept for ever); volatile 64-bit access to it (`Region`, bounds- and alignment-checked); the command, event, status and interrupt-table pages and the page tables through the parent's `Page`, `Regs` and `Tables` (unchanged); `CLFLUSH` of device table lines when device-table reads are not snooped.
+  Each block has a SAFETY note.
+- **Not done:**
+  - IVMD unity maps and exclusion ranges (such devices are refused);
+  - segments other than 0;
+  - taking over an IOMMU the firmware left enabled (pre-boot DMA protection, IVinfo bit 1);
+  - the I/O APIC under AMD-Vi: its entry (DeviceID 0x00a0 from the IVRS) blocks fixed interrupts until it gets an interrupt table; the kernel uses the I/O APIC only before the IOMMU comes up;
+  - the event-log interrupt; guest translation, guest virtual APIC, ATS, PPR; 2048-entry interrupt tables; device-table segmentation; hot-plug; freeing IOVAs and table pages;
+  - **QEMU-only (§74).** Hardware qualification must require the IOVA in the fault record and the interrupt fault event, which QEMU 11.1 cannot show.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code from the AMD IOMMU specification.
+- **Licensing:** MIT OR Apache-2.0.
+
+### Parser hardening: seeded mutation soaks over every firmware and device parser (`acpi`, `pci`, `nvme`, `gpt`, `rtc`, `hpet`, `numa`, `virtio`, `virtqueue`, `cache`, `topology`, `clock`, `features`, `boot`, `ustar`, `initramfs`, `originfs`, `net`, `tcp`, `dhcp`, `dns`, `tftp`, `deflate`, `ps2`, `vtd`, `amdvi`; `storage`, `virtionet`, kernel; library + kernel; CLAUDE.md §13, §72; 2026-11-08)
+
+- **What:** every parser in the host-tested library that reads firmware or device data now has a deterministic, seeded mutation soak on `crate::testing` (no fuzzing crates, §5). Each soak runs mutated input through the parser and checks that it never panics (overflow checks are on in the host tests), never reads out of bounds, and either refuses the input or returns a view that meets its documented invariants, round-tripping where an encoder exists. Checksummed structures are re-sealed after mutation, so the checks behind the checksum are reached. `ConfigSpace` and `find_caps` models assert every access stays in bounds and are also driven with answers that change on each read. `testing` gained boundary-biased integers (`Rng::edge_u32`/`edge_u64`: `u32::MAX` is what a missing overflow check needs, and a uniform draw never gives it) and `mutate_window` (for records whose fields are a small part of a 4 KiB page or a sector).
+
+- **Inventory and results** (`ORIGIN_MUTATION_SCALE` scales every count; one default run is about 1.3 million mutated inputs plus about 240 000 steps of hostile ring and queue sequences):
+
+| Parser | Reads | Soak before this work | Now | Result |
+|---|---|---|---|---|
+| `acpi::parse_rsdp` | RSDP (firmware) | yes, 6 000 mutations, no reseal | + `mutated_rsdps_reach_every_check` (6 000, checksums re-sealed, every refusal reached) | clean |
+| `acpi::table_length`/`check_table`/`signature` | table headers | via MADT only | every table's soak; bound on the length field | **bug 13** |
+| `acpi::xsdt_entries` | XSDT | none | `mutated_xsdts_list_exactly_their_whole_entries` (4 000, exact) | clean |
+| `acpi::parse_fadt` | FADT | yes, century only | `mutated_fadts_read_their_fields_from_the_right_bytes` (6 000) | clean |
+| `acpi::madt_processors`/`madt_ioapics`/`madt_overrides`, `gsi_for_irq` | MADT | processors only | `mutated_madts_match_an_independent_walk` (8 000; a differential against an independent structure walker) | clean |
+| `acpi::srat_*`, `parse_slit`, `Slit::distance` | SRAT, SLIT | yes, no-panic only | `srat_and_slit_mutations_keep_their_invariants` (10 000; differential) | clean |
+| `hpet::parse`, counter arithmetic | HPET table, capabilities register | none | `mutated_tables_and_registers_never_panic` (10 000) | clean |
+| `numa::*` | SRAT/SLIT consumers | none | `mutated_tables_keep_the_map_sound` (8 000), `self_nearest_looks_at_every_locality` | **bug 12** |
+| `pci::mcfg_allocations`, `Ecam` | MCFG | yes | `ecam_offsets_stay_inside_the_window` (20 000) | clean |
+| `pci::read_function`/`enumerate`/`capabilities`/`find_capability`/`msix`/`size_bars` | configuration space | none | `hostile_configuration_space_never_breaks_the_walks` (12 000, a device that changes its answers), `hostile_enumeration_stays_in_bounds` (1 500) | **bug 6**; `Msix::table_address` |
+| `nvme::Capabilities`, `Completion`, `Queues`, `allocated_queues`, `identify_*`, `text` | controller registers, Identify, completions | Identify only, 3 000 mutations spread over 4 KiB | `mutated_identify_fields_keep_their_invariants` (10 000, field-focused), `hostile_registers_and_completions_never_break_the_queues` (20 000 + 600 × 200 steps) | **bug 5**, doorbell and page bounds |
+| `gpt::parse_header`/`parse_entries`/`agrees_with`/`Partition` | disk | yes, 4 000 | `mutated_copies_keep_the_layout_and_agree_symmetrically` (6 000, both copies, any disk size) | **bug 7** |
+| `rtc::decode`, calendar | CMOS | yes, one register at a time | `fully_random_registers_decode_only_to_real_dates` (200 000), `calendar_arithmetic_is_total_over_any_input` (20 000) | clean |
+| `virtio::find_caps`/`parse_net_config`/`NetHeader`/`negotiate`, `CfgLocation` | capability list, device config, headers | none | `hostile_capability_lists_never_break_the_walk` (12 000), `mutated_net_structures_decode_exactly_their_bytes` (10 000) | **bugs 4, 14** |
+| `virtqueue::*` | rings the device writes | none | `hostile_rings_never_break_the_driver` (1 500 × 80 steps) | **bug 3** |
+| `cache::decode`/`decode_all` | CPUID | none | `any_cpuid_words_decode_without_overflow` (30 000) | **bug 1** |
+| `topology`, `clock::cpuid_tsc_hz`, `features` | CPUID | `features` only | `hostile_cpuid_always_gives_a_layout_that_partitions_ids` (the soak for the leaves-based decoder, ported when CPU topology was merged), `any_cpuid_tsc_leaf_is_total`, `any_cpuid_values_decode` (20 000 each) | clean |
+| `boot::validate`/`segment_array`/`summarize` | boot info (a loader-supplied, firmware-derived region list) | none | `hostile_boot_info_is_total_and_keeps_its_promises` (30 000) | clean |
+| `spcr::parse`, `Spcr::line_setup` (2026-11-08) | SPCR table (firmware) | new | `hostile_tables_keep_every_promise` (200 000, tables re-sealed; every accepted table keeps its invariants, a divisor comes only from a stated rate and a known clock); every refusal named in the unit tests | clean |
+| `fbconsole::Screen` over `Framebuffer::check` (2026-11-08) | GOP mode (firmware, through the loader) | new | `any_accepted_description_and_any_bytes_stay_inside_the_display` (15 000 hostile descriptions and arbitrary bytes, every pixel inside the visible rows) | clean |
+| `ustar::parse`, `initramfs::extract` | archive from the disk or the network | ustar: no invariants; initramfs: none | `mutated_archives_keep_their_invariants` (8 000), `mutated_archives_extract_safely_or_not_at_all` (6 000) | **bug 8** |
+| `originfs` | disk | yes, but the CRC stopped it | `hostile_superblocks_with_valid_checksums_are_refused_or_safe` (8 000, re-sealed) | **bug 2** |
+| `deflate` | compressed payload | yes | `mutated_wrappers_reach_their_trailer_checks` (10 000) | clean |
+| `net`, `tcp`, `dhcp`, `dns`, `tftp` | network | yes, no invariants | repaired-checksum and round-trip soaks (10 000 / 10 000 / 10 000 / 20 000 / 2 000 × 6) | **bugs 9, 10** |
+| `ps2::Decoder`, `Modifiers`, `to_char` | keyboard bytes | none | `any_scancode_stream_decodes_consistently` (4 000) | clean |
+| `vtd`, `amdvi` register and entry decoders | IOMMU registers and tables read back | fault/event only | `any_register_and_entry_words_decode` (20 000 / 30 000, `decode` then `encode`) | **bug 11** |
+| `ioapic` | redirection entries | yes (round trip, 20 000) | unchanged (the rest of the file is bit operations) | — |
+| `dmar`, `ivrs` | ACPI | yes: 12 000 mutations each, two thirds re-sealed, every invariant `parse` promises, device-scope resolution and lookups | not redone; passed at scale 10 | clean |
+| `onbf-format`, `onbf-verify`, `onbf-merkle` | the signed image | exhaustive single-fault sweeps (every truncation, padding byte and bit flip), corpus tests; no multi-fault random soak (the helper is `framekernel`-only) | not redone here; done afterwards, see "Seeded multi-fault mutation soaks over the ONBF parsers" | see that entry |
+
+- **Bugs found** (each with a regression test; each test was confirmed to fail with its fix reverted, 28 controls in all, in a scratch copy of the tree):
+  1. `cache::decode`: `sub[2] + 1` overflowed `u32` for `ECX = FFFFFFFFh` (a value a hypervisor can return): a panic with overflow checks on, a wrong cache size with them off; the size product could overflow `u64` at the fields' maxima (exactly 2^64 bytes). Now checked in `u64`; a sub-leaf whose size does not fit ends the list.
+  2. `originfs::Superblock::parse`: `inode_table_start + table_blocks` overflowed on a superblock with a valid CRC. In the release kernel the wrap would pass the check; the earlier soak could not reach it because a mutated superblock failed its CRC first. Now `checked_add`.
+  3. `virtqueue::free_chain`/`FreeList::free`: a device-reported head outside the table, or a `next` leaving it, panicked (out-of-bounds); a repeated or cycling id freed descriptors twice. Now every index is checked, `FreeList` refuses out-of-range and already-free indices, and the chain walk stops at the first bad one. New `virtqueue::queue_size` (a power of two, virtio 1.1 §2.6).
+  4. `virtio::find_caps`: a capability at F4h–FCh read 100h–10Ch (past the 256-byte capability area); the last instance of each structure was taken where virtio 1.1 §4.1.4.1 says the first the driver can support; a capability shorter than its structure, or with a reserved BAR (6 and up, "must ignore"), was accepted. Now `find_caps(read, usable)` applies all of those.
+  5. `nvme::identify_namespace`: a namespace whose byte size overflows 64 bits (NSZE × block size) was accepted, and the driver multiplies them. Now refused. New `nvme::doorbells_fit` and `NamespaceInfo::block_fits_page` for the driver.
+  6. `pci::msix`: an MSI-X capability at F8h or FCh read its table and PBA registers past 100h. Now refused. New `Msix::table_address` (memory BAR only, the whole table inside it, no address overflow).
+  7. `gpt::parse_header`: a header whose own or alternate LBA lies inside the usable range, or whose own LBA is past the disk, was accepted (a partition could overlap the backup header). `parse_entries`: a hand-built header with `entry_size` 0 panicked in `chunks_exact`.
+  8. `ustar`: a directory, link or device entry with a non-zero size field took the following blocks for its data and swallowed the next header (POSIX stores no data blocks for those types), contradicting `Entry.data` ("empty for a directory").
+  9. `dns`: a CNAME, NS or PTR name could run past its RDLENGTH into the next record.
+  10. `net::checksum`/`checksum_parts`: the `u32` sum overflows on buffers of 131 KiB or more (a panic with overflow checks on, a wrong sum without). Widened to `u64`.
+  11. `amdvi::Irte::decode_basic`/`decode_wide`: accepted vectors below 16, which `encode_*` never write, against their documented contract.
+  12. `numa::self_is_nearest`: used a 256-entry order array, so any SLIT with more than 256 localities reported "not self-nearest", and a tie with a lower-numbered node read as false. Now compares every pair directly.
+  13. `acpi::table_length`: no upper bound on the length field, so firmware could drive a 4 GiB mapping and walk before the checksum is checked. Now refused above `MAX_TABLE_LENGTH` (16 MiB).
+  14. Kernel, the checks that use the above (`virtionet`, `storage`): a virtio structure's offset and length were never checked against its BAR, and an I/O BAR's port number was mapped and written as if it were a memory address; the same for the MSI-X table; a queue's notification register (`queue_notify_off × notify_off_multiplier`) was never checked against its structure; a queue size that is not a power of two was accepted; a receive queue shorter than the eight receive buffers panicked; NVMe doorbells could lie past BAR 0 for a large stride; a namespace with blocks larger than a page made PRP1 alone overrun the page; the NUMA memory total could wrap. Each now goes through the host-tested library check above; the driver refuses the device or the path instead.
+- **What soaks do not show:** the checks in the kernel binary (item 14) are exercised by their library functions' tests and accepted by `boot-matrix` on QEMU's real devices. One refusal was shown live: QEMU booted with an NVMe namespace of 8 KiB blocks (`logical_block_size=8192`) reports `namespace 1's blocks are larger than a page: NVMe failed` and the boot test fails. QEMU will not present the other malformed devices (a capability outside its BAR, a queue size of 3, a stride of 128 KiB); those need a fault-injecting device model or hardware.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code, from the specifications named in each module (virtio 1.1 §2.6, §4.1.4; UEFI 2.11 §5.3; POSIX pax ustar format; RFC 1035). No source copied (CLAUDE.md §3).
+- **Test evidence (2026-11-08):**
+  - 55 new tests (the `framekernel` library went from 336 to 391; the workspace from 579 to 634, 0 failures, 6 ignored).
+  - The soaks' floors (cases accepted, each outcome reached) are asserted, so a soak that stops reaching its parser fails.
+  - `ORIGIN_MUTATION_SCALE=10` in the debug build, overflow checks on: all 391 library tests in 10.3 s. `ORIGIN_MUTATION_SCALE=100` in the release build: 24.6 s, 0 failures.
+  - A negative control for each of the 13 library fixes and the checks the kernel shares with them (28 controls: each fix reverted alone in a scratch copy, its regression test or soak failing as it should). The first run showed three soaks too shallow to find their bug (MSI-X and virtio capabilities at the top of the capability area, a directory's size field); those soaks were strengthened until each caught it.
+  - `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d and AMD-Vi) and `cargo xtask boot-matrix` (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs) pass. The `framekernel` library tests take 1.0 s (0.92 s before); `cargo xtask check` is about 25 s incremental.
+- **Not done:** coverage-guided fuzzing (nightly-only, §12) and Kani bounds (§73); the malformed-device paths above need a fault-injecting device model or hardware (§74). (The multi-fault soak over the ONBF parsers, listed here at the time, has since been done: see its entry under `onbf-format`.)
+- **Licensing:** MIT OR Apache-2.0.
+
+### Bus mastering cleared at enumeration, set again only after a device is attached (`pci` library; `pcie`, `dma`, `iommu`, `iommu::amd`, `storage`, `virtionet`, `time`, `main`; xtask; CLAUDE.md §31, §32, §58, §72; ADR-0007 I12, Proposed; threat T4; 2026-11-08)
+
+- **Why:** a device the firmware left bus-mastering can write memory until translation turns on. OVMF leaves Bus Master Enable set on **every** function (read by the kernel at hand-off; QEMU resets them all clear, read through the monitor before any firmware ran, research ledger `docs/research/2026-11-08-bus-master-quiesce.md` §4). The old boot turned it on before attaching and enumerated after SMP start. So every driver's device was unconfined for seconds, and the IOMMU came up last.
+- **What:**
+  - `framekernel::pci` (host-tested, `forbid(unsafe_code)`): `for_each_function` (the walk `enumerate` is built on), `clear_bus_master` (write, then a read-back that also pushes out the function's posted writes), `bus_master_on`, `transactions_pending`, `bridge_buses`, `bus_master_allowed`.
+  - `pcie::quiesce` (before anything but the kernel's page tables and heap): every function of every MCFG window cleared and read back, bridges included; the IOMMU's own function, named by the IVRS and never by class code, left alone. `pcie::settle`, once the TSC is calibrated: Transactions Pending waited for, 100 ms at most for all functions together. `pcie::check_quiet`, before any driver binds: nothing is on. `pcie::prove_bus_mastering`, after the drivers ran: on exactly for the attached functions and the bridges above them, and the IOMMU function's bit unchanged.
+  - `dma::DeviceDma::enable_bus_master` is the only way to set the bit (`pcie::enable` is gone; `pcie::enable_memory` does decoding only). It requires the function attached to the domain it holds, or no IOMMU translating; refuses if the bit is already on; and opens every bridge above the function, nearest the root first. The NVMe driver calls it after the controller is attached and reset. virtio-net calls it after its domain exists, and a device without `VIRTIO_F_ACCESS_PLATFORM` behind a translating IOMMU is refused.
+  - `iommu::init` moved before `smp::start`, after the compatibility-format I/O APIC proof: translation is on before any application processor starts and before the loader's memory is reclaimed.
+  - xtask: the markers below; `cargo xtask boot-bridge` (`ORIGIN_QEMU_BRIDGE=on`): the NIC behind a PCIe root port, both IOMMUs.
+- **Test evidence (host):** six new `pci` tests, including a seeded soak of hostile configuration space (writes only to the command register, with a zero status half; only bit 2 ever cleared; everything else reported). `cargo xtask check`: 687 tests, 0 failures, 6 ignored (681 before).
+- **Boot proof (markers, in boot order):** `PCIe: bus mastering: the firmware left it on for 7 of 7 functions (…); every function reads back clear: true`, then `… 1 of 7 functions have a PCI Express capability; Transactions Pending clear on 1 of them after waiting … us (limit 100 ms); clearing took … us and finished … us after kernel entry`, `IOMMU: translating … ms after kernel entry` (before the MADT line), `PCIe: bus mastering: off on all 7 functions before any driver attached: true`, `NVMe: bus mastering on after the controller was attached and reset: command register 0x0007`, `virtio-net: bus mastering on after the device got its DMA path: command register 0x0007`, and after every driver proof `PCIe: bus mastering: on for exactly the 2 attached function(s) (00:02.0 domain 1, 00:03.0 domain 2) and the 0 bridge(s) above them, off on the other 5; IOMMU translating true; consistent true`.
+- **Negative controls**, each a temporary change restored afterwards with `git checkout`, each failing the boot test (the run's own `failed` line quoted; attempts that the unrelated `clock failed` flake under host load interrupted were repeated; C2–C10 run on `ffbc42f`, C1 on `35a5189`):
+  - **C1, the Command write skipped** (the clear does nothing): `PCIe: bus mastering: the firmware left it on for 7 of 7 functions (…); every cleared function reads back clear: false; these ignored the write: 00:00.0, …: PCIe failed`.
+  - **C2, one function's bit set again after the quiesce** (00:1f.3): `PCIe: bus mastering: off on all 7 functions before any driver attached: false (on for 00:1f.3): PCIe failed`.
+  - **C3, the NVMe driver never enables bus mastering:** `NVMe: a command timed out: NVMe failed`. This is the proof that the clear really stops a device: unlike the old lesson ("OVMF had already set bus mastering"), the bit is off now, so a driver that does not set it cannot run.
+  - **C4, the NVMe driver asks before attaching** (`DeviceDma::Direct.enable_bus_master`): `NVMe: the IOMMU translates and the device has no domain of its own: NVMe failed`.
+  - **C5, a stray function enabled through the raw path, without a domain** (00:1f.3): `… consistent false; wrong: 00:1f.3: PCIe failed`.
+  - **C6, the bridge above the attached NIC not opened** (`boot-bridge`, the only case QEMU cannot show by itself: QEMU ignores the bridge's bit): `… (00:02.0 domain 1, 01:00.0 domain 2) and the 0 bridge(s) above them, off on the other 6; IOMMU translating true; consistent false; wrong: 00:04.0: PCIe failed`.
+  - **C7, Transactions Pending forced on:** `PCIe: bus mastering: 1 of 7 functions have a PCI Express capability; Transactions Pending clear on 0 of them after waiting 100000 us (limit 100 ms); …; still pending: 00:02.0: PCIe failed`.
+  - **C8, `iommu_platform=off` on the NIC** (no ACCESS_PLATFORM): `virtio-net: the IOMMU translates and the device has no domain of its own: virtio-net failed`.
+  - **C9, the IOMMU's own function's bit cleared after it was recorded** (`ORIGIN_QEMU_IOMMU=amd`): `… consistent false; wrong: 00:05.0: PCIe failed`.
+  - **C10, bus mastering already on when the driver asks:** `NVMe: bus mastering was already on before the driver attached the device: NVMe failed`.
+- **Measured cost:** one walk of the 256-bus window, 6.6–7.4 ms of boot time on the idle host (66–69 ms with the host saturated by another session's stress run), and 124–159 µs for the Transactions Pending pass (the time to read each capability; nothing was pending); the clearing finished 17.9–19.3 ms after kernel entry, and translation is on 2.3–2.4 s after entry (it was about 5.9 s after entry in the old order). No hot-path cost: nothing here runs after boot except what a driver bind does once, and the only per-boot additions are the first walk and the re-reads.
+- **What QEMU cannot show** (ledger §3): a bridge's Bus Master Enable stopping traffic (QEMU's DMA path never consults it, so `boot-bridge` proves the kernel's path logic and the read-backs only), and a real Transactions Pending bit (never set: the wait is host-tested and exercised by control C7 alone).
+- **Unsafe inventory:** nothing new. The two `unsafe` blocks in `pcie.rs` are the existing ECAM accesses, with their SAFETY notes.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code; the ordering and bridge semantics are from the vendor sources in the ledger, and the two Linux threads were read for reasoning only (no code).
+
+### M4, first slice: processes, the system-call layer, and channels through it (`process`, `syscall`, `ipc`, `ipc_proof`, `user`, `cpu`, `sched`, `wait`, kernel; `usercopy`, `handles`, `channel`, library; `origin-abi`; CLAUDE.md §29, §30, §42; ADR-0005 P1–P5, P8, P9, Amendment 1; 2026-11-08)
+
+- **What:** every ring-3 program is now a process, and the only way into the kernel from ring 3 is `syscall`, which reaches one dispatcher.
+  - `process`: a process owns its PML4 and page-table frames, the user frames it maps, its handle table, and a thread count. When its last thread ends (by `exit` or by a fault) its handles close at once and its peers see that; its memory goes with the last reference, which the scheduler keeps until the exiting thread's processor has left the address space, so no processor can be running on a freed table.
+  - `syscall`, the layer (P4, P5): `origin_abi` is the one definition of call numbers and status codes. RAX carries the number and returns a status; RDI, RSI, RDX, R10, R8, R9 carry the arguments; further results go through out pointers. Every user pointer is checked against the *calling* process's tables (the page walk in `usercopy`) and copied once, with fault recovery; a bad out pointer is found before a message is consumed. System calls run with interrupts on, on the thread's own stack, and each kernel lock disables them for the moment it is held. Calls are accepted only from the process's system-call code range (P4, ONBF §6.1); until `origin.core` exists the creator names that range.
+  - The boundary (`cpu`): `swapgs` on every crossing (interrupt entry from ring 3, `syscall`, and the common return path), so a program's GS never reaches the kernel; `clac` on every entry when SMAP is on, so a program's RFLAGS.AC cannot switch SMAP off for kernel code; the user-copy fault recovery no longer depends on per-CPU state, so a long copy can be preempted. A user thread starts from an `iretq` frame the scheduler builds; the DPL-3 `int 0x80` gate and the ad hoc calls in `cpu::dispatch` are gone (`int 0x80` from ring 3 is now #GP, error code `0x402`).
+  - `ipc` (P1, P2, P8, P9): kernel channels over the library's `channel`, handle transfer, `wait_one`. Queues are bounded in messages and bytes, with `SHOULD_WAIT` backpressure. Allocation on these paths is fallible (`NO_MEMORY`), via `try_reserve` and, for the channel object (where `Arc::try_new` is unstable on 1.99.1), a small counted reference, `ObjectRef`. A process's channel quota counts channels in flight in messages, so moving them out of the table cannot escape it.
+  - Closing never recurses: a close parks undelivered messages, and each system call and each process exit drains them iteratively (`reap_closed`), because a hostile process can nest channel ends in queues as deep as it likes and the kernel stack is 16 KiB.
+  - Handle transfer keeps the object graph collectable (ADR-0005 Amendment 1, A3): a channel end cannot be sent through its own channel, cannot be sent while it has another handle, and cannot end up inside its own queue, checked by walking which queue holds each end. So no reference cycle can keep a dead end alive.
+  - `handles`: 16-bit generations retire rather than wrap, so a stale handle never names a reused slot, however long a process runs (P1); `take_all` and `reserve` move handles all-or-nothing.
+  - `user`: the M4-groundwork programs (good, reader, privileged, concurrent, `int 0x80`, writers) are now real processes on the ABI; `ipc_proof` carries its programs as assembly in the image and runs scripted hostile sequences from tables in the Rust source. Everything executes in ring 3 through `syscall`.
+- **An independent, read-only review** (a fresh reviewer given the code and the contract, not this entry's reasoning) traced the ring boundary, the lifetimes and the locking as sound, and found, all fixed here unless marked otherwise:
+  - a new thread was made runnable before its stack, CR3, FPU area and process were recorded (an old race, harmless for kernel threads but dangerous for ring 3): `spawn_with` now holds the queue lock until they are, and `follow_thread` counts any switch that finds no state, which the boot proof requires to be 0;
+  - exited threads were reaped only when a processor went idle: now also from every system call (a processor running only threads that never make one still waits for its idle loop; a per-CPU reaper thread is the complete fix, left for the scheduling work);
+  - a user thread whose FPU save area cannot be allocated would have run on the previous thread's registers: refused;
+  - the developer-only calls were open to every process: gated per process (`Limits::debug_calls`);
+  - `sidt` from ring 3 revealed the KASLR slide: UMIP is on where supported;
+  - `cli`/`sti` were not compiler barriers (`options(nomem)`): removed;
+  - **open, recorded:** a process's kernel half is a snapshot at creation, so a new top-level kernel mapping made while a process exists would be missing from it (not reachable in today's boot order: proof processes are gone before PCIe and MMIO mapping start, TASKS item 5 needs this when processes outlive that); the transfer check's walk under its lock is bounded by the channel quota, so raising quotas much needs a limit on chain depth.
+- **Design decisions outside P1–P12:** ADR-0005 Amendment 1, accepted by the owner on 2026-11-08 with the recommended options: A1 (a new channel end's rights), A2 (cancellation of waits), A3 (transfer rules), A4 (`out_sizes`), A5 (a process ends with its last thread), A6 (the syscall origin before `origin.core`). Implemented as decided.
+- **The boolean rule (§10):** `origin_abi::decode_bool` accepts exactly 0 and 1 (all 256 values tested). No call in this slice has a boolean parameter, so the dispatcher does not call it yet; the first call that does must.
+- **`unsafe`:** `ipc::ObjectRef` (allocate, initialize, deref, drop in place, free), `process` (zeroing frames, table reference, `write_frame`, `read_u64` of a proof process's memory), `syscall` (two `copy_user` calls), `cpu` (`copy_user`, `stac`/`clac`, `sti`/`cli`, `pushfq`, the IA32_KERNEL_GS_BASE write), `ipc_proof` (reading the embedded programs, one deliberately unchecked `copy_user`), and the naked `syscall_entry`, `exception_common`, `exception_saved`. Each block has a safety comment (`clippy::undocumented_unsafe_blocks` is deny). `cargo xtask check` passes clippy on both targets with `-D warnings`.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08, from ADR-0005, the Intel SDM (Vol. 2: SYSCALL, SWAPGS, IRET; Vol. 3A: SMAP, interrupt delivery) and AMD APM Vol. 2 and Vol. 3. Original code. No third-party code (CLAUDE.md §3).
+- **Test evidence (2026-11-08):**
+  - Library: `origin-abi` (status names, `decode_bool`, the sizes structure), `handles` (seeded model of insert/get/remove/duplicate; generation retirement; atomic batches), `channel` (seeded model of writes, reads, closes and signals; the byte bound; `peek`), `usercopy` (seeded byte-by-byte reference over random ranges and page maps; the address bounds). `cargo xtask check`: 698 tests, 0 failures, 6 ignored.
+  - Boot, in ring 3 (`ipc_proof`; the xtask markers name every status):
+    - two processes on two processors exchange 1000 messages over a channel, each checked in ring 3, blocking in `wait_one` and woken across processors (blocked 1124 and 1059 times, 2104 cross-processor wake-ups in one run; 381 µs per round trip under TCG, on a host loaded by other work);
+    - 117 hostile calls, each with its required status: bad handles (`handle 0`, never issued, bits above 32, closed, stale after slot reuse), another process's handle value, too few rights (write, read, wait, duplicate, send), rights that only shrink, pointers (kernel, unmapped, across the end of a mapped range, address 0, wrapping, the top page, into code, into read-only memory, every out pointer), sizes and unknown numbers, queues (empty, too small a buffer, a full queue and `WRITABLE`), a closed peer, and the transfers A3 refuses;
+    - a process that exits and a process that faults: its handles close (0 left in its table), and the peer, blocked in `wait_one` on another processor, wakes, sees `PEER_CLOSED`, and its write and read return `PEER_CLOSED`;
+    - a thread in `wait_one` on a handle another thread closes completes with `CANCELED`; quotas (`LIMIT`, then recovery); a 64 KiB message byte for byte; every register but RAX, RCX and R11 preserved across a call; calls refused from outside the pinned range; a program with a null GS and one with RFLAGS.AC set; a page fault inside a user copy recovered directly;
+    - afterwards the heap and the frame count are exactly where they started, so nothing leaked: not the messages, not the channels, not the page tables.
+  - `cargo xtask boot-test`, `boot-matrix` (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs) and `boot-x2apic` (APIC IDs 256 and 412, under leaves 1Fh and 0Bh) pass.
+  - **Negative controls** (31; each mutation applied alone, the kernel built, `boot-test` run and required to fail for that mutation's reason, then the file restored): 
+    - no wake-up after a write: the reader never wakes: the ping-pong proof times out;
+    - a blocked wait polls instead: no thread blocks, so no wake-up crosses processors;
+    - a stale handle generation accepted: "stale, slot reused" is no longer `BAD_HANDLE`;
+    - rights never checked: the rights lines return `OK`;
+    - one handle namespace for all processes: another process's handle value works;
+    - no range check and no table check: a kernel pointer is accepted (the earlier copy proof catches it first);
+    - no check against the caller's tables: bad pointers still return `FAULT`, by fault recovery, so the recovered-faults count is not 0;
+    - no writable check: a read-only page is written: recovered, count not 0;
+    - no recovery from a user-copy fault: the direct recovery proof takes the kernel down;
+    - a closing end is never marked closed: `PEER_CLOSED` never appears;
+    - handles survive process exit: the peer of an exiting process stays blocked;
+    - a fault does not end the process's handles: a faulting process never ends (the first faulting program catches it);
+    - duplicate can add rights: "adding WRITE" returns `OK`;
+    - transfer leaves the handle with the sender: the sender's handle still works;
+    - a received handle loses its rights: "it kept its rights" fails;
+    - an end can be sent through its own channel: the transfer is accepted;
+    - a duplicated end can be sent: the transfer is accepted;
+    - a transfer can close a cycle: the transfer is accepted;
+    - no swapgs anywhere: a program's GS reaches the kernel: a double fault at the first program with a user GS;
+    - no clac on kernel entry: RFLAGS.AC reaches kernel code;
+    - no system-call origin pin: a call from outside the pinned range is accepted;
+    - a register clobbered by a system call: the register check fails in ring 3;
+    - undelivered messages never reaped: the heap does not return to its starting value;
+    - a process's frames are not freed: the free-frame count does not return;
+    - wait deadlines ignored: the deadline-0 wait never returns;
+    - a closed handle does not cancel a wait: the waiter stays blocked;
+    - a message's first byte corrupted: the ring-3 check in the ping-pong fails;
+    - both ping-pong processes on one processor: the marker naming the second processor never appears;
+    - a thread runnable before its state exists: a thread runs with no stack on record (the count of such switches must be 0);
+    - the developer calls open to any process: a process without them makes one;
+    - no UMIP: `sidt` from ring 3 succeeds.
+- **What QEMU cannot show (§74):** real interrupt and SMAP timing; CET shadow stacks (P6, not in this slice); physical hardware.
+- **Not done:** the start record, memory objects, the Loader Service, `.ose` loading, PCIDs (the remaining TASKS item 5); events, ports and timers; termination by handle and the crash record (P10, P11); memory and thread quotas (P11); the `Process` object as a handle-named object (no `TERMINATED` signal raised yet).
 - **Licensing:** project licence not chosen yet.
 
 ## `framekernel/sync/` (`origin-sync`), kernel synchronization primitives
@@ -983,8 +1862,130 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code.
 - **Dependencies:** `core` only. `no_std`; the no-panic lints are denied outside tests. One `unsafe impl Sync` and two `unsafe` blocks (the guard's `Deref`/`DerefMut`), each with a SAFETY argument.
 - **Test evidence (2026-11-07):** 3 host tests with real threads: 8 × 20,000 non-atomic increments under the lock (exact total), a writer/reader pair that never sees a torn two-field update, re-locking after a drop. Clippy on the host, UEFI and kernel targets; the no-panic object check references 0 external symbols.
-- **Not done:** Loom models (the `loom` crate needs the owner's approval to download), a fairness (ticket or MCS) lock, interrupt-disabling guards as a type.
-- **Licensing:** project licence not chosen yet.
+- **Not done:** a fairness (ticket or MCS) lock, interrupt-disabling guards as a type. (The Loom models: below.)
+- **Licensing:** MIT OR Apache-2.0.
+
+### Loom models of `SpinLock`, `RwLock` and the wait-queue protocol (`origin-sync`; xtask; CLAUDE.md §5, §6, §13, §73; 2026-11-08)
+
+- **What:** `cargo xtask loom`, part of `cargo xtask check`, model-checks the real `SpinLock`, the real `RwLock`, the real wait-queue protocol and the real run queue under Loom. To make that possible the protocol moved out of the kernel binary, without changing it, into `origin_sync::wait` (`framekernel/sync/src/wait.rs`): `WaitQueue<T, N>`, generic over a `Scheduler` trait that the kernel implements for kernel threads (`framekernel/src/wait.rs`, four forwarding methods). Boot proofs of the wait queues pass unchanged.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code.
+- **Specifications:** CLAUDE.md §13, §73. The C11 memory model as Loom implements it, read in Loom 0.7.2's source (see "What is not proved").
+- **Architecture decisions:**
+  - The model runs the real source, not a copy. `prim` (`lib.rs`) is the only switch: `core`'s atomics and cell in every real build, Loom's under `all(test, loom)`. `Ordering` is the same type in both, so the orderings at the call sites are the ones the models check (§13). The lock's own source changes only in reaching the cell through `with`/`with_mut` closures, which the release build inlines. The kernel still boots and passes its proofs on the real build.
+  - The real `RunQueue` (`framekernel/src/runqueue.rs`) is compiled into the model by `#[path]`, because the no-lost-wake-up guarantee is half the queue's lock and half the run queue's pending wake-up.
+  - `loom` is a `[target.'cfg(loom)'.dev-dependencies]` entry of `origin-sync` only. The library sees a dev-dependency only when it is built for its own unit tests (`cfg(test)`), which is why the models live in `src/models.rs` under `all(test, loom)`.
+  - Spinning is bounded in the model only (see "Bounds").
+  - Negative controls change a scratch copy of the source (`target/loom-controls`), never the working tree. Each is an exact text replacement that must match exactly once, so a control that no longer applies stops the run instead of silently passing.
+- **Dependencies and supply chain (CLAUDE.md §4, §5, §60):** `loom` **0.7.2** (MIT, tokio-rs/loom, published 2024-04-23), the owner's decision 20. Its version, licence, transitive crates and sizes were stated to the owner and approved in the session on 2026-11-08, with four crates held back so that every locked crate was at least two weeks old (generator 0.8.11 instead of 0.8.12, cc 1.10.0, smallvec 1.16.4, log 0.4.34). OSV (which carries RustSec) lists no advisory for any of the 30 at these versions, as of that date.
+
+  | Crate | Version | On this Mac | `.crate` size (KiB) | Licence | Published |
+  |---|---|---|---:|---|---|
+  | aho-corasick | 1.1.5 | downloaded, not compiled | 180.0 | Unlicense OR MIT | 2026-08-03 |
+  | cc | 1.10.0 | compiled | 145.0 | MIT OR Apache-2.0 | 2026-10-23 |
+  | cfg-if | 1.0.5 | compiled | 9.4 | MIT OR Apache-2.0 | 2026-09-16 |
+  | find-msvc-tools | 0.1.15 | compiled | 30.9 | MIT OR Apache-2.0 | 2026-10-19 |
+  | generator | 0.8.11 | compiled | 42.8 | MIT/Apache-2.0 | 2026-10-14 |
+  | lazy_static | 1.5.1 | compiled | 13.6 | MIT OR Apache-2.0 | 2026-10-01 |
+  | libc | 0.2.191 | compiled | 835.4 | MIT OR Apache-2.0 | 2026-10-16 |
+  | log | 0.4.34 | compiled | 52.1 | MIT OR Apache-2.0 | 2026-08-22 |
+  | loom | 0.7.2 | compiled | 72.3 | MIT | 2024-04-23 |
+  | matchers | 0.2.0 | compiled | 6.9 | MIT | 2024-07-01 |
+  | memchr | 2.8.3 | downloaded, not compiled | 96.8 | Unlicense OR MIT | 2026-07-08 |
+  | nu-ansi-term | 0.50.3 | compiled | 28.9 | MIT | 2025-10-10 |
+  | once_cell | 1.21.4 | compiled | 34.2 | MIT OR Apache-2.0 | 2026-03-12 |
+  | pin-project-lite | 0.2.17 | compiled | 30.3 | Apache-2.0 OR MIT | 2026-02-27 |
+  | regex-automata | 0.4.18 | compiled | 614.0 | MIT OR Apache-2.0 | 2026-08-04 |
+  | regex-syntax | 0.8.11 | compiled | 350.6 | MIT OR Apache-2.0 | 2026-06-09 |
+  | rustversion | 1.0.23 | compiled | 20.5 | MIT OR Apache-2.0 | 2026-07-07 |
+  | scoped-tls | 1.0.1 | compiled | 8.0 | MIT/Apache-2.0 | 2022-10-31 |
+  | sharded-slab | 0.1.7 | compiled | 56.9 | MIT | 2023-10-04 |
+  | shlex | 2.0.1 | compiled | 18.9 | MIT OR Apache-2.0 | 2026-05-17 |
+  | smallvec | 1.16.4 | compiled | 34.0 | MIT OR Apache-2.0 | 2026-10-23 |
+  | thread_local | 1.1.10 | compiled | 16.0 | MIT OR Apache-2.0 | 2026-07-10 |
+  | tracing | 0.1.44 | compiled | 452.3 | MIT | 2025-12-18 |
+  | tracing-core | 0.1.36 | compiled | 62.5 | MIT | 2025-12-18 |
+  | tracing-log | 0.2.0 | compiled | 17.1 | MIT | 2023-10-25 |
+  | tracing-subscriber | 0.3.23 | compiled | 208.8 | MIT | 2026-03-13 |
+  | valuable | 0.1.1 | not downloaded (other platforms or features) | 28.0 | MIT | 2025-01-17 |
+  | windows-link | 0.2.1 | not downloaded (other platforms or features) | 6.0 | MIT OR Apache-2.0 | 2025-10-06 |
+  | windows-result | 0.4.1 | not downloaded (other platforms or features) | 13.1 | MIT OR Apache-2.0 | 2025-10-06 |
+  | windows-sys | 0.61.2 | not downloaded (other platforms or features) | 2458.2 | MIT OR Apache-2.0 | 2025-10-06 |
+
+  Compiled: 24 crates, 3.09 MiB of `.crate` files. Locked: 30 crates, 5.80 MiB. `Cargo.lock` holds each crate's checksum.
+  - Cargo compiled exactly the 24 crates marked above on this Mac. It also downloaded `memchr` and `aho-corasick` without compiling them: 26 `.crate` files, 3.36 MiB, **two more than the owner was told** (24, 3.09 MiB). The owner was told these two would not be fetched here. The compiled set is exactly what was approved.
+  - On this host, build time runs code from `generator` (`build.rs`), `libc` (`build.rs`) and `rustversion` (`build/build.rs`, proc-macro). `cc` is only a build-dependency of `generator` and its build script calls it only for powerpc64.
+  - `generator` contains hand-written context-switching assembly and runs only inside these tests.
+  - Nothing here reaches a shipping crate. `cargo xtask check` now enforces it: every shipping crate's normal and build dependencies (`cargo tree --target all`) must be first-party, and every third-party package in `Cargo.lock` must be on `APPROVED_THIRD_PARTY` at its exact version.
+  - **A side effect to weigh:** because `Cargo.lock` now lists third-party crates, any `cargo` command in this workspace on a machine with an empty registry cache fetches crates.io *index metadata* for them (1.6 MB in a test with an empty `CARGO_HOME`). It fetches no `.crate` file unless a build uses `--cfg loom` (the same test: 0 `.crate` files, for both a host test build of `origin-sync` and a kernel-target build).
+
+| Model | Scenario (the real code) | Default search (`check`) | Deep search (`ORIGIN_LOOM_DEEP=1`) |
+|---|---|---|---|
+| `spin_lock_two_threads_two_rounds` | two threads, two critical sections each: exclusion (a counter, and Loom's cell checks) and no lost update | exhaustive, spin bound 4: 19,785 executions | exhaustive, spin bound 4: 19,785 executions |
+| `spin_lock_three_threads` | three threads, one critical section each: the same | at most 3 preemptions, spin bound 4: 46,070 executions | at most 4 preemptions, spin bound 4: 411,984 executions |
+| `spin_lock_passes_writes_to_the_next_holder` | a two-field write is seen whole by the next holder | exhaustive, spin bound 4: 17 executions | exhaustive, spin bound 4: 17 executions |
+| `try_lock_leaves_a_held_lock_held` | a failed `try_lock` leaves the holder's lock held; a successful one excludes | exhaustive, spin bound 4: 123 executions | exhaustive, spin bound 4: 123 executions |
+| `try_lock_passes_writes_to_the_next_holder` | a successful `try_lock` sees the last holder's writes whole | exhaustive, spin bound 4: 12 executions | exhaustive, spin bound 4: 12 executions |
+| `rwlock_writer_excludes_readers` | one writer, two readers: a writer overlaps nobody, readers see its update whole, reads and writes are ordered | at most 2 preemptions, spin bound 4: 15,060 executions | at most 4 preemptions, spin bound 4: 1,862,280 executions |
+| `rwlock_writers_exclude_each_other` | two writers, each a non-atomic read-modify-write | exhaustive, spin bound 4: 63 executions | exhaustive, spin bound 4: 63 executions |
+| `rwlock_readers_share` | two readers each hold the lock while waiting for the other to have it too | exhaustive, spin bound 4: 17,711 executions | exhaustive, spin bound 4: 17,711 executions |
+| `wait_queue_waker_and_waiter_release_acquire` | one waiter, one waker, `Release`/`Acquire` on the condition (the boot proof's orderings) | at most 6 preemptions, spin bound 4: 25,061 executions | exhaustive, spin bound 4: 365,323 executions |
+| `wait_queue_waker_and_waiter_relaxed` | the same with `Relaxed` on the condition, the weakest a caller could use | at most 6 preemptions, spin bound 4: 25,061 executions | exhaustive, spin bound 4: 365,323 executions |
+| `wait_queue_ping_pong` | the boot proof's ping-pong, one round: each thread both waits and wakes | at most 3 preemptions, spin bound 4: 21,116 executions | at most 4 preemptions, spin bound 4: 142,182 executions |
+| `wait_queue_producer_consumer` | the boot proof's ring, one slot, two items: each side blocks on the other, the condition takes the ring's lock under the queue's | at most 3 preemptions, spin bound 4: 44,503 executions | at most 4 preemptions, spin bound 4: 383,635 executions |
+| `wait_queue_two_waiters` | two waiters, one waker with two tokens and two wake-ups | at most 2 preemptions, spin bound 2: 75,798 executions | at most 3 preemptions, spin bound 3: 3,447,974 executions |
+| `wait_queue_full_queue_polls` | a queue with one slot: the second waiter cannot register and polls | at most 2 preemptions, spin bound 2: 64,437 executions | at most 3 preemptions, spin bound 3: 3,330,439 executions |
+| `wait_queue_boot_flow_polls` | the boot or idle flow polls and never blocks | exhaustive, spin bound 4: 45,318 executions | exhaustive, spin bound 4: 45,318 executions |
+| `wait_queue_boot_flow_timed_wait` | the boot flow with a deadline: polls, never blocks or registers, ends with the condition or the deadline | at most 3 preemptions, spin bound 4: 16,913 executions | exhaustive, spin bound 4: 11,741,254 executions |
+| `wait_queue_timed_wait_gives_way` | a timed waiter, an untimed waiter, one token and one wake-up: giving up must not swallow the wake-up | at most 2 preemptions, spin bound 2: 72,918 executions | at most 3 preemptions, spin bound 3: 3,705,610 executions |
+| `wait_queue_stale_wake_up_is_harmless` | a wake-up outlives a timed wait and ends the next wait's first block: the wait re-checks | at most 3 preemptions, spin bound 4: 40,186 executions | at most 4 preemptions, spin bound 4: 335,371 executions |
+
+- **What is proved (CLAUDE.md §73):** for the code above, **within the bounds in the table**, over every thread interleaving (up to Loom's removal of equivalent ones) and every store a `Relaxed` load may see in Loom's model of the C11 memory model:
+  - `SpinLock`: at most one holder at a time; every access to the protected value is ordered by happens-before with every other (Loom's cell checks this: no data race); each holder sees all earlier holders' writes, whole. `try_lock`: a failure leaves the holder's lock held; a success is a real holder.
+  - `RwLock`: a writer overlaps nobody; readers can hold it together; a reader sees a writer's update whole or not at all; every access is ordered by happens-before with every conflicting one (a reader's reads with the next writer's writes, a writer's with the next reader's or writer's).
+  - The wait queue, **no lost wake-ups**: a thread in `wait_until` or `wait_until_deadline` whose condition is made true by a thread that then calls `wake_one` does not stay blocked (a lost wake-up leaves every thread blocked, and Loom reports that as a deadlock). That holds with `Relaxed` on the condition, the weakest ordering a caller could use: the queue's lock carries the ordering. A wait returns only with its condition true, also after a wake-up that outlived an earlier wait. A timed wait that gives up leaves no registration, so it cannot swallow the next waiter's wake-up. A thread that cannot register (a full queue, or the boot flow) still sees the condition by polling. A timed wait on the boot flow polls, never blocks or registers, and ends with the condition or at the deadline.
+- **What is not proved:**
+  - Anything past the bounds: more threads or rounds (at most three spawned threads and the model's own; Loom's limit is five in all), more preemptions than a model's bound, more spin iterations than its spin bound (below).
+  - Anything Loom's memory model omits: load buffering is not modelled (Loom's own documentation says so), and `compare_exchange_weak` never fails spuriously in Loom (`loom-0.7.2/src/sync/atomic/bool.rs`), so `lock` is not explored taking a spurious failure (it would only loop again).
+  - Interrupts. `without_interrupts` does nothing in the models, so the rule that no handler may take a lock interrupted code can hold is not checked. A handler that wakes is modelled as another thread.
+  - The scheduler around the run queue: the context switch, `sched::on_block`, the reschedule IPI and the timer are stood in for by a `Notify` and the run-queue calls they make. That a ready thread eventually runs is assumed. Fairness and starvation are not modelled: Loom's checks here are safety and deadlock, not progress of one thread among many.
+  - The machine. These are host builds against Loom's atomics; the x86-64 code the kernel runs, `pause` and TSO are not examined. Boot proofs (QEMU, TCG) cover the running kernel; hardware is §74.
+  - `RwLock` writer starvation (its documentation accepts it), a timed waiter that finds the queue full (the other way to reach `Step::Poll`, the same loop as the boot flow's), and what callers must uphold themselves: the state changes before `wake_one` (control `waker_wakes_before_setting_the_flag` shows it matters), one condition per queue.
+  - Models add no ordering of their own: their counters, tokens and clock are `Relaxed`. `Notify` synchronizes, but the resumed thread then takes the run queue's lock, which carries the same ordering in the real resumption.
+- **Bounds:** two threads spinning on one lock can take turns for ever, and Loom counts each turn as a new execution whatever the preemption bound (found here: the first three-thread models exceeded Loom's 1000 branches per execution). So each thread's spin iterations are explored up to a bound; past it the execution still runs to its end, with all its checks, but branches no further (`prim::spin_loop`, `loom::skip_branch`). A spin changes nothing and can only observe the lock change hands, so the bound limits how many such changes a thread can wait through. Raising it from 4 to 8 changed nothing for `spin_lock_two_threads_two_rounds` and the waker/waiter models (19,785 and 365,323 executions, the same as with no bound at all), and those two-thread runs are exhaustive. Three-thread counts do grow with the bound (for `wait_queue_two_waiters`, 75,798 / 148,125 / 291,717 at 2 / 4 / 8, all at two preemptions), so those results are bounded in both senses.
+- **Negative controls:** 22, each applied to a scratch copy and required to make the named models fail with the named report. Every model has at least one; 29 model runs in all.
+
+| Control | The bug | Model(s) that find it | Report |
+|---|---|---|---|
+| `lock_acquire_relaxed` | `lock()`'s successful exchange `Acquire` → `Relaxed` | `spin_lock_two_threads_two_rounds`, `spin_lock_three_threads`, `wait_queue_waker_and_waiter_relaxed` | `Causality violation` |
+| `unlock_release_relaxed` | the guard's unlock `Release` → `Relaxed` | `spin_lock_two_threads_two_rounds`, `spin_lock_passes_writes_to_the_next_holder`, `wait_queue_waker_and_waiter_relaxed` | `Causality violation` |
+| `try_lock_acquire_relaxed` | `try_lock`'s exchange `Acquire` → `Relaxed` | `try_lock_passes_writes_to_the_next_holder` | `Causality violation` |
+| `failed_try_lock_unlocks` | a failed `try_lock` builds and drops a guard (the bug its comment warns of) | `try_lock_leaves_a_held_lock_held` | `Causality violation` |
+| `lock_not_atomic` | checking and then setting in two steps | `spin_lock_two_threads_two_rounds` | `Causality violation` |
+| `rwlock_read_acquire_relaxed` | `RwLock::read`'s exchange `Acquire` → `Relaxed` | `rwlock_writer_excludes_readers` | `Causality violation` |
+| `rwlock_write_acquire_relaxed` | `RwLock::write`'s exchange `Acquire` → `Relaxed` | `rwlock_writers_exclude_each_other` | `Causality violation` |
+| `rwlock_read_unlock_release_relaxed` | a reader's unlock `Release` → `Relaxed` | `rwlock_writer_excludes_readers` | `Causality violation` |
+| `rwlock_write_unlock_release_relaxed` | a writer's unlock `Release` → `Relaxed` | `rwlock_writers_exclude_each_other` | `Causality violation` |
+| `rwlock_reader_ignores_the_writer` | a reader does not check for a writer | `rwlock_writer_excludes_readers` | `Causality violation` |
+| `rwlock_writer_ignores_the_readers` | a writer does not wait for the readers to drain | `rwlock_writer_excludes_readers` | `Causality violation` |
+| `rwlock_readers_exclude_each_other` | a reader takes the lock exclusively | `rwlock_readers_share` | `Model exceeded maximum number of branches` |
+| `wake_one_never_wakes` | `wake_one` takes the waiter and does not wake it | `wait_queue_waker_and_waiter_release_acquire`, `wait_queue_ping_pong`, `wait_queue_producer_consumer`, `wait_queue_two_waiters` | `deadlock` |
+| `run_queue_forgets_an_early_wake` | `RunQueue::wake` does not keep a wake-up for a thread that has not blocked yet | `wait_queue_waker_and_waiter_release_acquire` | `deadlock` |
+| `condition_checked_before_the_lock` | the condition read before taking the queue's lock | `wait_queue_waker_and_waiter_relaxed` | `deadlock` |
+| `registered_after_unlocking` | the check and the registration in separate critical sections | `wait_queue_waker_and_waiter_relaxed` | `deadlock` |
+| `full_queue_blocks_unregistered` | a thread that found the queue full blocks without registering | `wait_queue_full_queue_polls` | `deadlock` |
+| `boot_flow_blocks` | the boot flow blocks instead of polling | `wait_queue_boot_flow_polls` | `deadlock` |
+| `boot_flow_timed_wait_blocks` | a timed wait on the boot flow blocks instead of polling | `wait_queue_boot_flow_timed_wait` | `the boot flow must never block` |
+| `timeout_leaves_its_registration` | a timed-out wait leaves its registration | `wait_queue_timed_wait_gives_way` | `deadlock` |
+| `no_recheck_after_a_block` | `wait_until` returns after a block without re-checking | `wait_queue_stale_wake_up_is_harmless` | `returned with the condition false` |
+| `waker_wakes_before_setting_the_flag` | the model's waker wakes before changing the state (the rule for callers) | `wait_queue_waker_and_waiter_release_acquire` | `deadlock` |
+
+- **Test evidence (2026-11-08):** `cargo xtask loom` and `cargo xtask check`: 18 models pass in the default search (530,152 executions), and all 22 controls are caught (29 model runs). A deep run (`ORIGIN_LOOM_DEEP=1 cargo xtask loom`) passes the 18 models over 26,174,404 executions in about 20 minutes, with the two-thread `SpinLock`, `RwLock` and waker/waiter models and the boot-flow timed wait exhaustive. `cargo xtask check` passes on the final code: 26 test binaries, 702 passed, 0 failed, 6 ignored (the download-gated crypto vectors). `cargo xtask boot-matrix` passes on this code (VT-d and AMD-Vi at 1, 2 and 4 CPUs, then the sparse machine under leaves 1Fh and 0Bh), and with it the default `boot-test` configuration, with the wait-queue boot proofs unchanged. Boots during another session's CPU stress test (load average above 100) failed at the `clock` proof, before any wait-queue code runs; that is the RTC flake recorded in the handoff, and these passing runs came on a quiet machine.
+- **Toolchain:** stable Rust 1.99.1, no nightly features: `RUSTFLAGS="--cfg loom"` and a target directory of its own (`target/loom`). The models need `--release` to be practical.
+- **Known external firmware/data dependencies:** none.
+- **Performance (measured on this Mac):** `cargo xtask loom` takes 35 s (14 s of models, 22 control builds and 29 model runs). The first run also builds Loom's 24 crates (19 s) once. All of `cargo xtask check` took 55–70 s. The default search is bounded per model for that reason; the deep run took about 20 minutes (the exhaustive boot-flow timed wait alone is 11.7 million executions).
+- **Code review:** not yet independently reviewed.
+- **Reproduce:** `cargo xtask loom` (or `cargo xtask check`). `ORIGIN_LOOM_DEEP=1 cargo xtask loom` runs each model at its deeper bound.
+- **Licensing:** project licence not chosen yet. The 30 locked crates are MIT, Apache-2.0 or Unlicense, as listed above, and none of them ships.
 
 ## `origin-version.toml` and `runtime/version/` (`origin-version`), T5
 
@@ -1008,7 +2009,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - changing the version to `0.2.0-rc.1` reaches the rebuilt `.efi`, which proves the build script's `rerun-if-changed` works;
     - `version = "0.2"` fails the build with `origin-version.toml:16: … expected MAJOR.MINOR.PATCH`;
     - a hand-written `version` in a crate manifest fails `xtask check`, naming the file and line.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `runtime/onbf/format/` (`onbf-format`), the ONBF parser: container, OCBOR-1, KRN manifest
 
@@ -1080,7 +2081,92 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - **Canonical-encoding property (ONBF-R6):** all 1,208 single-bit flips of a KRN manifest were tried. Every flip the decoder accepts re-encodes to exactly the flipped bytes, so no accepted document has a second reading. Every truncation is rejected.
   - **No panic paths:** the release object for `x86_64-unknown-none` references only `memset` and `core::str::from_utf8` (`xtask check`, no-panic step). The latter was added to the allowlist with a justification: it is total and RFC 3629-strict, and under `forbid(unsafe_code)` it is the only way to turn bytes into `&str`.
   - Not done yet: fuzzing (§13 item 3), Kani bounds (item 5) and the N-version check (item 6).
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
+
+### Integration: the IOMMU follow-ups merged (`irq`, `cpu`, `iommu`; xtask; CLAUDE.md §24, §32, §72; ADR-0007 and ADR-0008, Proposed; 2026-11-08)
+
+- **What was merged** into `claude/interesting-carson-ae7c83`, the VT-d branch that all four started from at `1c790fe`:
+  - `claude/eloquent-kapitsa-840594` (`91688a1`: dense CPU indexes and a processor at APIC ID 256) and `claude/priceless-cartwright-2c1803` (`db16a9c`: parking an AP that misses its start-up handshake, on top of the first): a fast-forward;
+  - `claude/bold-williams-a8e3ff` (`29a6d59`: I/O APIC pins through VT-d IRTEs): merge `56c6c90`;
+  - `claude/upbeat-dijkstra-0d25fe` (`6cd511e`: AMD-Vi): merge `3aa34e4`.
+- **What the merges needed.** Each branch was correct on its own; these changes are where they met:
+  - **CPU indexes in the I/O APIC proof.** The per-CPU count of the I/O APIC vector is indexed by `CpuIndex` (`this_cpu()`), not by x2APIC ID. `irq::prove_remapped` takes the online CPU indexes, gives the IRTE the target's recorded APIC ID, and names the target `CPU n (APIC ID m)`, as the xtask markers now do. So `boot-x2apic` routes the PIT's IRQ0 to the processor at APIC ID 256: 20 interrupts arrived there through IRTE 5, none elsewhere. That is an I/O APIC interrupt delivered above APIC ID 255, which only interrupt remapping makes possible.
+  - **The vendor-neutral fault record.** The I/O APIC proof reads AMD-Vi's neutral `iommu::Fault` instead of `vtd::FaultRecord`, takes the VT-d reason from `Detail::Vtd`, and prints faults through `iommu::Recorded`. Its VT-d lines are unchanged byte for byte.
+  - **The I/O APIC under AMD-Vi.** The pin functions have no AMD-Vi path: the I/O APIC's device table entry blocks its fixed interrupts until it is given an interrupt table. `iommu::route_ioapic_pin` refuses under AMD-Vi, the new `iommu::routes_ioapic_pins` says whether pins are routed, and `irq::prove_remapped` reports "not under AMD-Vi yet" and leaves the pin masked. The AMD-Vi markers swap the VT-d proof's 14 markers for that one line, which `the_amd_markers_replace_every_vt_d_one` checks.
+  - **`ORIGIN_QEMU_IOMMU`.** On the AMD-Vi branch it was a preset (`intel` or `amd`); on the CPU-index branch it was a raw `-device` value, which that branch's control X2 uses (`intel-iommu,intremap=off`). Now `intel` (the default) and `amd` are presets, any other value must be an `intel-iommu` `-device` value and is booted with the VT-d markers, and anything else is refused before QEMU starts. `parse_iommu` and `check_iommu` are host-tested.
+  - **The AMD-Vi markers follow the machine.** `amd_iommu_markers` takes the CPU-index branch's `Machine`, so its MSI-X counts follow the processors actually booted.
+  - **Records:** both sides kept everywhere (STATUS, TASKS, this file, the handoff, ADR-0007's evidence and consequences).
+- **Test evidence (2026-11-08):**
+  - `cargo xtask check`: 579 tests, 0 failures, 6 ignored. 564 after the first merge; the AMD-Vi branch brought its own tests, and the merge added `the_iommu_variable_takes_presets_and_intel_iommu_devices`.
+  - `cargo xtask boot-matrix`: Intel VT-d at 1, 2 and 4 CPUs (kernel boots in 14.7, 16.3 and 22.6 s) and AMD-Vi at 1, 2 and 4 CPUs (14.1, 15.6 and 19.7 s), each with the tampered-kernel scenario.
+  - `cargo xtask boot-x2apic`: passes in 17.3 s. CPU 1, at APIC ID 256, takes NVMe MSI-X through IRTEs and now also the I/O APIC's IRQ0 through IRTE 5.
+  - After the first merge alone (`56c6c90`): `check`, `boot-test` and `boot-x2apic`.
+  - **Controls for what the merge changed:**
+    - `ORIGIN_QEMU_IOMMU=intel-iommu,intremap=off cargo xtask boot-x2apic` still fails, as the CPU-index branch's control X2 does ("NVMe: MSI-X: APIC IDs above 255 need interrupt remapping: NVMe failed").
+    - `ORIGIN_QEMU_IOMMU=virtio-iommu-pci cargo xtask boot-test` is refused before QEMU starts.
+  - Each branch's own negative controls were run on its branch (see their entries) and are not repeated here. The probes built into every boot ran in every boot above: the not-present IRTEs, the blocked DMA, the I/O APIC pin's wrong source ID and the AP park drill.
+- **Not done:**
+  - the I/O APIC under AMD-Vi: an interrupt table for its DeviceID, with the redirection entry's vector field carrying the IRTE index (the AMD-Vi entry above);
+  - `boot-x2apic` under AMD-Vi: the x2APIC proof's wording assumes VT-d's remappable handles;
+  - whether `boot-x2apic` joins `boot-matrix` is still ADR-0008's question for the owner.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Merge resolution and the adaptations above; no new mechanism. No operating system's code was read or copied (CLAUDE.md §3).
+- **Licensing:** MIT OR Apache-2.0.
+
+### Integration: parser hardening, the ONBF soak and CPU topology merged (`topology`; CLAUDE.md §24, §27, §72; 2026-11-08)
+
+- **What was merged** into `claude/interesting-carson-ae7c83` at `0b9c3e0`:
+  - `claude/heuristic-chandrasekhar-6a46a1` (`6a50bf5`: the ONBF multi-fault soak), which carries `claude/gifted-maxwell-7e8a3f` (`62dc630`: parser hardening): a fast-forward;
+  - `claude/zealous-lovelace-301ef1` (`d1f78e5`: CPU topology from CPUID leaves 1Fh, 0Bh and 80000026h): merge `cdcdde7`.
+- **What the merge needed:**
+  - **The topology soak, ported.** Parser hardening had added `any_subleaves_split_ids_consistently` against the old leaf-0Bh decoder (`Topology::decode`, `split`, `analyze`), which the topology branch replaced. Git merged the file without a conflict, but the library's tests would not have compiled. It is now `hostile_cpuid_always_gives_a_layout_that_partitions_ids`, over `CpuTopology::detect`. Its 20 000 default cases use arbitrary CPUID words, levels of any type and shift, runs that end just in time or too late, and valid lists as they are or with a few words corrupted, for leaves 1Fh, 0Bh and 80000026h and the maximum leaves. The test requires that:
+    - `detect` never panics;
+    - every layout's fields partition the 32 bits of an ID, so any ID reassembles from its domain IDs;
+    - the census matches an independently written count, and its domains nest;
+    - the ID, the source and the core identity come from the leaf the record names;
+    - `agree` stays within its counts over any records.
+  - Floors show that the soak reaches every `Source` and every `LayoutError`.
+  - **Records:** STATUS's header and TASKS items 3 and 4 combined. The "Parser hardening" table names the new soak.
+- **Test evidence (2026-11-08):**
+  - `cargo xtask check`: 681 tests, 0 failures, 6 ignored.
+  - `cargo xtask boot-matrix`: Intel VT-d at 1, 2 and 4 CPUs (kernel boots in 15.1, 17.6 and 23.0 s) and AMD-Vi at 1, 2 and 4 CPUs (14.3, 16.6 and 21.9 s).
+  - `cargo xtask boot-x2apic`: processors at APIC IDs 0, 256 and 412 of 150 possible, on `-cpu max,vendor=GenuineIntel` (leaf 1Fh, 21.0 s) and `-cpu max` (leaf 0Bh, 19.5 s).
+  - **Controls on the ported soak**, each a temporary edit of the decoder, restored from a saved copy that `cmp` confirmed identical. All eight were caught:
+    - no shifts-decrease check in leaves 1Fh/0Bh, or in leaf 80000026h;
+    - no out-of-order check in 1Fh/0Bh;
+    - no 5-bit mask on the shift;
+    - an unlisted AMD level starting at bit 0;
+    - the fallback ID keeping leaf 1's EBX whole;
+    - the census counting distinct IDs at every domain;
+    - a leaf 1Ah core identity without checking EAX.
+  - **`ORIGIN_QEMU_IOMMU`, re-checked because the topology branch changed xtask:** `intel-iommu,intremap=off` still fails `boot-x2apic` ("APIC IDs above 255 need interrupt remapping"), and `virtio-iommu-pci` is refused before QEMU starts.
+  - Each branch's own negative controls were run on its branch (see their entries) and are not repeated here.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Merge resolution and the ported soak; no new mechanism. No operating system's code was read or copied (CLAUDE.md §3).
+- **Licensing:** MIT OR Apache-2.0.
+
+### The owner's decisions of 2026-11-08 applied (`onbf-format` signature parser; xtask; errata O1; ADR-0008 question 3)
+
+- **What:**
+  - A signature statement's `id` must be non-empty printable ASCII (0x20–0x7E). `SignatureBlock::parse` refuses anything else with the field error for key 3. This is errata O1, the same rule as R4, so the parser needs no Unicode tables.
+  - `cargo xtask boot-matrix` ends with `boot-x2apic`.
+- **Test evidence (2026-11-08):**
+  - `cargo xtask check`: 682 tests, 0 failures, 6 ignored.
+  - `a_statement_id_must_be_printable_ascii` covers both ends of the printable range, composed and decomposed non-ASCII forms, and control characters. The multi-fault soak's model was updated to the same rule.
+  - **Negative control:** with the check removed, both that test and `mutated_signature_blocks_get_the_models_verdict` fail. Restored from a saved copy.
+  - `cargo xtask boot-matrix`: a full run passes (Intel VT-d and AMD-Vi at 1, 2 and 4 CPUs, then `boot-x2apic` on leaves 1Fh and 0Bh).
+  - **Two earlier full runs failed,** at different configurations, with `clock: the RTC did not complete two updates in 1.2 s`, while other sessions were loading the machine. Running each of the eight configurations alone then passed every one first time. The cause is in `time.rs`'s `update_end`, unchanged here: QEMU's RTC shows its update bit only for the last 244 µs of each second (`UIP_HOLD_LENGTH`), and a descheduled virtual CPU can miss it.
+- **Licensing:** MIT OR Apache-2.0.
+
+### VT-d encodings checked against Rev 5.20 (`vtd`, `dmar`, `iommu`; CLAUDE.md §3, §16, §72; 2026-11-08)
+
+- **What:** every encoding in `vtd.rs`, `dmar.rs` and `ioapic.rs`, and the bring-up order in `iommu.rs`, compared with the specification's own text. The table is the last section of `docs/research/2026-11-08-vt-d-iommu.md`.
+- **Corrections:**
+  - A fault record's interrupt index is `None` for reasons 20h, 25h, 29h, 2Ah and 2Bh, whose FI field is undefined. Such a fault is still reported as an interrupt fault.
+  - The fault event mask is set at bring-up instead of relying on the reset value.
+  - A DRHD's register base must be aligned to its register set's size.
+  - `DMA_REMAP_OPT_OUT` is decoded and reported, and not honoured.
+  - Names added for fault reasons 27h–2Bh. The reserved GCMD names SFL and EAFL removed, with the specification's mask used directly. Chapter references and the revision's date corrected.
+- **Test evidence (2026-11-08):** `cargo xtask check`: 682 tests, 0 failures, 6 ignored. `cargo xtask boot-matrix`: a full run passes, at a host load average of about 12. Four earlier full runs failed on timing proofs (`clock`, and once `timers`) while other sessions were loading the machine (load averages above 100). No failure was in code this change touches, and each of the eight configurations also passed alone. Negative controls: without the fault-index rule, `fault_records_decode` fails; without the alignment rule, `malformed_tables_are_refused_at_their_offset` fails; both restored from saved copies. The fault-event mask and the opt-out report have no separate proof: QEMU sets neither condition.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### Signature-block parser (ONBF §7.1–§7.2, encodings S1–S4), added 2026-11-07
 
@@ -1088,15 +2174,54 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07, right after the owner decided S1–S4. Original code.
 - **Test evidence:** 6 tests: a two-entry block with the exact statement bytes; framing (magic, version, counts 0 and 9, truncation, trailing data, every strict prefix); each entry rule; each statement rule; duplicates and a non-minimal integer head; every single-bit flip of a valid block is refused or reads a different entry, and nothing panics. The no-panic object check still passes (4 allowed external symbols).
 
+### Seeded multi-fault mutation soaks over the ONBF parsers (`onbf-format`, `onbf-merkle`, `onbf-verify`; ONBF §13 item 3, CLAUDE.md §13, §72; 2026-11-08)
+
+- **What:** ONBF parsing runs in the boot loader on data read before any signature is checked. Those parsers had exhaustive single-fault sweeps and corpus tests. This adds seeded random multi-fault soaks: one to four faults per case, xorshift64\*, deterministic, no fuzzing crate (§5). The helper is `runtime/onbf/format/src/testing.rs`, test-only; `onbf-merkle` and `onbf-verify` include it by path, so there is one copy and no new dependency or feature. `ORIGIN_MUTATION_SCALE` scales every soak; `ORIGIN_MUTATION_REPORT` prints what each one reached. A failure is reproduced by its seed and case number (a case's generator depends only on those two). Overflow checks are on in every run (a test asserts it where the crate is built at opt-level 3).
+- **Re-sealing:** a share of the cases rebuild what would otherwise hide the checks behind it: the content digest, the section layout (offsets, sizes, padding, via the test builder), a manifest's SHA-256, signature-entry length prefixes, and, for the verifier, a key's own ID and the statement's own digest and profile as the expected values. No test can re-sign the reference fixture (Origin OS has verification code only, §7.2), so those last two are what lets hostile statements, signatures and keys reach the signature code.
+- **Inventory** (default case counts; each soak asserts a floor on accepted cases and a floor of one on every refusal it can reach):
+
+| Parser | Soak | Judged by | Result |
+|---|---|---|---|
+| `Image::parse` (header, section table, layout; §4.1–§4.4) | `mutated_images_are_refused_or_keep_every_section_4_rule` (12 000; 19 image shapes, three fault layers) | an accepted image must re-encode byte for byte from its parsed view (ONBF-R6) and satisfy every §4.1–§4.4, C1–C14, G1, G4, G5 rule, re-derived in the test; scrambling section content and the signature block must not change the verdict (ONBF-R1); a poked padding byte, a cut file and a one-byte-longer file must be refused; digests compared independently | **bugs 1, 2** |
+| the loader's order (`parse` → content digest → manifest SHA-256 → `KrnManifest::decode` → `check_against`) | `mutated_kernels_follow_the_loader_order` (4 000) | every stage reached; `check_against` judged by its own definition | clean |
+| `ocbor::validate`, `Cursor` (§5) | `mutated_documents_get_the_oracles_verdict` (24 000) | a recursive oracle written from §5 and R5: exact verdict, offset and rule on every input; an accepted document re-encodes to itself and a cursor reads exactly its value tree; a cursor over unvalidated input still terminates | clean |
+| `KrnManifest::decode` (K1–K4, R4) | `mutated_krn_manifests_decode_only_what_the_registry_allows` (10 000) | a key-lookup model of the registry on the value tree, in both directions; decoded fields re-encode to the document (extensions aside) | clean |
+| `SignatureBlock::parse` (S1–S4, Appendix A) | `mutated_signature_blocks_get_the_models_verdict` (12 000) | a model of S1–S4 and Appendix A on the OCBOR-1 oracle, in both directions; accepted blocks re-encode from the parsed view | **bugs 3, 4, 5** |
+| `onbf-merkle` `verify_block`, `Shape`, `build`, `root` (§4.6, G2, G3, R1–R3) | `mutated_paths_verify_exactly_when_the_model_says_so` (2 500), `built_trees_match_the_model_and_survive_multi_fault_damage` (120), `shapes_are_total_and_match_the_model` (30 000) | a §4.6 model with its own shape arithmetic and hashing: exact verdict, exact error, exact cache contents; sparse paths reach every tree height to 4 levels and 8 GiB without materializing the content; `build` must be byte-identical to the model's section | clean |
+| `onbf-verify` `verify_entry`, `key_id` (§7.1–§7.2, S4) | `mutated_signatures_keys_and_statements_never_verify` (1 500), `key_ids_follow_the_canonical_encoding` (1 500), `hand_built_entries_with_wrong_signature_lengths_are_refused` | the cheap checks in their documented order, exactly; nothing verifies except what was signed; every Ed25519 and ML-DSA refusal reached, via hostile signatures and hostile keys under their own IDs | clean |
+
+- **Bugs found** (each fixed with a regression test; both the test and the soak fail with the fix reverted):
+  1. `SectionEntry::parse`: a MAPPABLE MERKLE section was accepted, against errata C8 and the `IntegrityNotAllowed` doc. Flipping MAPPABLE alone misaligns the section, so the single-fault sweep could not reach it; the layout must also change, as the soak's rebuilt layouts do. Now `IntegrityNotAllowed(2)`.
+  2. `SectionEntry::parse`: a MAPPABLE DWARF section was accepted, against G1 ("never MAPPABLE"). It needs MAPPABLE and Merkle integrity together. New `SectionError::MappableNotAllowed`.
+  3. `parse_entry`: a certificate chain of more than four was accepted, against Appendix A and ONBF-R10. Now `Field { key: 4 }`, with `MAX_CHAIN`.
+  4. `parse_statement`: any non-empty text was accepted as `version`, against S3 ("SemVer 2.0"). Now the SemVer 2.0.0 grammar (`is_semver`), allocation-free and syntax-only, so numbers of any length pass and no conversion can overflow.
+  5. `SignatureBlock::parse`: no 1 MiB limit of its own; only `Image::parse` applied it, to the header's size field. Called directly, a block of 1.2 MiB (two entries, each within the 1 MiB OCBOR-1 limit) parsed. New `SignatureError::TooLarge`.
+- **Negative controls:** 30 edits, each applied alone to a scratch copy of the tree (the script is not committed), 36 expected test failures, 0 misses:
+  - the five fixes reverted, each failing its regression test and its soak;
+  - 25 parser edits removing one check each (reserved bytes, padding, canonical offsets, W+X, C8's SHA-256 rule, segment order, MERKLE size, shortest integers, depth limit, key order, text limit, IBT, commit shape, unknown keys, duplicates, role binding, the hash-slot comparison, trusting before the root check, the root comparison, the hash-block order, the statement's profile, the key-ID head, a section slice off by one, a content digest that always passes, and a parser that refuses everything), each failing the named soak.
+- **What the soaks do not show:** that every malformed image is refused, only that these inputs and the properties above held; nothing is proved (§73: Kani bounds are not done). `verify_block`'s cache contract covers one tree: handed another tree's shape, a warm cache can accept (the soak found this; it is the caller's contract, now stated on `TrustCache`). The real kernel image exercises the same parsers on every boot.
+- **Not done:** coverage-guided fuzzing (nightly, §12) and Kani bounds (§73, §13 item 5); the N-version second parser (§13 item 6; this soak's model is a partial, test-only stand-in). Statement `id` must be NFC (S3), which needs Unicode tables the parser does not have: an open gap for the owner (errata O1), with `id` checked only as non-empty valid UTF-8. §6.1's EXE rules (1–16 segments; permissions exactly R, RW or RX; relocation targets) are for the `.ose` loader, not this container parser. A compressed section's `stored_size` of 0 parses (it can only fail at decompression, which does not exist yet).
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08. Original code, from `docs/spec/ONBF.md` §4–§5, §7, Appendix A, the errata, `ONBF-manifest-keys.md`, `ONBF-signature-encoding.md`, FIPS 204's signature layout and semver.org 2.0.0. No source copied (CLAUDE.md §3).
+- **Test evidence (2026-11-08):**
+  - 30 new tests: `onbf-format` 38 → 52, `onbf-merkle` 13 → 21 (1 ignored as before), `onbf-verify` 3 → 11; the workspace 634 → 664, 0 failures, 6 ignored.
+  - `cargo test` at the default scale: `onbf-format` 0.9 s (0.3 s before), `onbf-merkle` 1.1 s (unchanged: its soaks run beside the existing three-level-tree test), `onbf-verify` 0.2 s. In `cargo xtask check` (51 s clean, about 25 s incremental) the soaks add about 1 s.
+  - A default run is about 98,000 cases (66,000 mutated images, documents, signature blocks and tree paths, 30,000 shape computations, 1,500 key IDs). `ORIGIN_MUTATION_SCALE=30`, debug, overflow checks on: about 2.9 million cases, 0 failures, 45 s. `ORIGIN_MUTATION_SCALE=100`, release: about 9.8 million cases, 0 failures. An earlier 100x run stopped on a `below(0)` in the sparse Merkle soak (a harness fault: a later fault chose a position in a block an earlier one had truncated to nothing; fixed). It is the only soak bug the scale runs exposed.
+  - `cargo xtask check` and `cargo xtask boot-test` (both IOMMU configurations) pass; the crates stay on the no-panic list (`onbf-format` still references only the allowed symbols with the SemVer check added).
+- **Licensing:** MIT OR Apache-2.0.
+
 ## `runtime/onbf/verify/` (`onbf-verify`), signature-entry verification
+
+Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" under `onbf-format`.
 
 - **What:** `verify_entry(entry, key, content_digest, profile)`, in order: the key ID is SHA-256 of the key's canonical encoding (the OCBOR-1 `keys` map, S4); the ML-DSA key length fits the suite; the statement's digest and profile match the image; Ed25519 (strict) over the exact statement bytes; ML-DSA-65 or -87 (strict) over the same bytes with the role's context string. Trust decisions (which keys, certificate chains) are left to the trust store (B7).
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code. `no_std`, no allocation, `forbid(unsafe_code)`, no-panic lints; depends only on `onbf-format` and `origin-crypto`.
 - **Test evidence:** `tools/make_fixture.py` builds a Kernel-role (OSS-1R) block signed by the independent pure-Python references (Ed25519 RFC 8032 and ML-DSA-87 FIPS 204, deterministic keys; byte-identical on every run, SHA-256 `aa9e76c0…2e72`). 3 tests: the block verifies under the Rust verifiers (two implementations agreeing end to end); a wrong digest, profile or key and a flipped byte in either signature fail with their own errors; every single-bit flip inside the statement fails. The no-panic object check passes (6 allowed external symbols).
-- **Not done:** wiring into the loader (B2 step 3), the trust store and OKC chain verification, the host signer, vectors from an independent author.
-- **Licensing:** project licence not chosen yet.
+- **Not done:** OKC chain verification (errata O2–O5), vectors from an independent author. The loader wiring and the KRN policy (`verify_krn_block`) are in `boot/uefi/`, "Step 3".
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `runtime/onbf/merkle/` (`onbf-merkle`), Merkle-SHA256-4K
+
+Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" under `onbf-format`.
 
 - **What:** the ONBF §4.6 trees, with the owner's G2 and G3 decisions and readings R1–R3 (`docs/spec/ONBF-errata.md`):
   - `Shape`: leaves, levels and MERKLE-section positions, highest level first;
@@ -1129,7 +2254,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - **No panic paths:** the release object for `x86_64-unknown-none` references only `memcpy`, `memset` and `origin_crypto`'s `Sha256::update`/`finalize`, which are themselves checked. A planted latent `split_at` passed Clippy and the tests, and was caught only by the no-panic step (`core::panicking::panic_fmt`).
   - **Throughput on the M1 Max host, portable SHA-256, release:** `root` 279 MiB/s, against 285 MiB/s for plain SHA-256. That is about 2% tree overhead, as expected from 1 extra hash per 128 blocks.
   - Not done: a second Merkle implementation by a different author (§13 item 6), integration of `verify_block` with `onbf-format` sections, and Kani bounds.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `security/crypto/` (`origin-crypto`), SHA-2, SHA-3, SHAKE, Ed25519 and ML-DSA
 
@@ -1148,7 +2273,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
 - **Side-channel assessment (CLAUDE.md §59):**
   - No data-dependent branches or memory indices. Round constants are indexed by round number, and branches depend only on public lengths.
   - In Origin's verification paths SHA-2 hashes public data.
-  - **Not done:** zeroizing the state on drop, which needs volatile writes and therefore a reviewed `unsafe`. Add it before any secret is hashed (for example HMAC keys or password hashing, §57).
+  - **Not done:** zeroizing the state on drop, which needs volatile writes and therefore a reviewed `unsafe`. Add it before any secret is hashed (for example HMAC keys or password hashing, §57). *2026-11-08: `onbf-sign` (host only) hashes secrets with these hashers without it. The owner accepted best-effort zeroization for host development keys the same day, so no volatile wipe is added for that use. A secret hashed inside the OS itself would still need one.*
 - **Dependencies:** `core` only.
 - **Toolchain:** Rust 1.99.1. Clippy-clean on the host, `x86_64-unknown-uefi` and `x86_64-unknown-none`.
 - **Test evidence (2026-11-07):** 8 tests, plus 1 ignored benchmark.
@@ -1160,8 +2285,8 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
     - The first version referenced `copy_from_slice`'s length-mismatch panic, which no lint flags. It was replaced with a non-panicking copy.
     - Putting it back makes `xtask check` fail and name the symbol.
   - **Throughput on the M1 Max host (aarch64, portable code, release, single thread):** SHA-256 285 MiB/s, SHA-512 462 MiB/s. This is indicative only: the target is x86-64, and SHA-NI is not used yet.
-  - Not done: NIST CAVP/ACVP vector files (downloading them needs the owner's approval), SHA-NI, and an independent review.
-- **Licensing:** project licence not chosen yet.
+  - External vectors: NIST ACVP (see "External known-answer vectors" below). Not done: SHA-NI and an independent review.
+- **Licensing:** MIT OR Apache-2.0.
 
 ### SHA-3 and SHAKE (FIPS 202)
 
@@ -1187,7 +2312,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - **Mutation check:** five planted faults, one at a time; all were caught.
   - **No panic paths:** the kernel-target object references only `memcpy`, `memset` and `Formatter::write_str`.
   - **Throughput:** SHA3-256 581 MiB/s and SHAKE256 about 580 MiB/s on the M1 host (aarch64, portable code). Indicative only.
-  - Not done: NIST CAVP/ACVP files, and an independent review.
+  - External vectors: NIST ACVP (see "External known-answer vectors" below). Not done: an independent review.
 
 ### Ed25519 verification (RFC 8032 §5.1, pure variant; ONBF §7.1), added 2026-11-07
 
@@ -1203,7 +2328,7 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - **Fault injection:** six deliberate faults, each caught.
   - **No panic paths:** the `x86_64-unknown-none` release object references only `memcpy`, `memset` and `Formatter::write_str`.
   - **Throughput:** 16,625 verifications/s on the M1 Max host (aarch64, release, single thread). Indicative only; the target is x86-64.
-  - **Not done:** Wycheproof vectors (downloading them needs the owner's approval); an N-version check by a different author (ONBF §13 item 6); Kani and fuzzing; an x86-64 benchmark; independent review.
+  - **External vectors:** Wycheproof (see "External known-answer vectors" below). **Not done:** an N-version check by a different author (ONBF §13 item 6); Kani and fuzzing; an x86-64 benchmark; independent review.
 
 ### ML-DSA verification (FIPS 204), added 2026-11-07
 
@@ -1222,7 +2347,69 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - **Mutation check:** 13 planted faults, one at a time; 12 caught, and the 13th (accepting ω + 1 hints) cannot change a verdict because the position-slice bound returns the same error.
   - **No panic paths:** the kernel-target object references only `memcpy`, `memset` and `Formatter::write_str`.
   - **Throughput:** ML-DSA-65 about 14,000 and ML-DSA-87 about 8,400 verifications/s on the M1 host (aarch64, portable code). Indicative only.
-  - **Not done:** NIST ACVP vectors and the FIPS 204 errata sheet (downloading needs the owner's approval), an AVX2 path, an independent review. The oracle has the same author as the code.
+  - **External vectors:** NIST ACVP and the FIPS 204 errata sheet (see "External known-answer vectors" below). **Not done:** an AVX2 path, an independent review. The oracle has the same author as the code.
+
+### External known-answer vectors: NIST ACVP and Wycheproof (CRYPTO-KAT), added 2026-11-08
+
+- **What:** `security/crypto/tests/kat/`, a host-only integration-test crate that runs the public API of `origin-crypto` against NIST's ACVP vector sets (SHA-2, SHA-3, SHAKE, ML-DSA signature verification) and Wycheproof's Ed25519 vectors (CLAUDE.md §59). The library is unchanged. Besides the new test crate, the converter and the data, the only code edit tightens one assertion in `src/tests_mldsa.rs` (the errata table below).
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08, on `claude/amazing-einstein-4eb320`. Original test code, written from the ACVP test specifications (`draft-celi-acvp-sha`, `draft-celi-acvp-sha3`, `draft-celi-acvp-ml-dsa`) and the Wycheproof vector format; no source copied (§3).
+- **Approval and sources:** owner decision 19 (`OWNER_DECISIONS.md`). Each file's name, source and size was stated to the owner and confirmed before anything was fetched, on 2026-11-08. Revisions pinned, each download checked against its git blob hash.
+
+  | Committed file (`security/crypto/tests/vectors/`) | Upstream file | Upstream SHA-256 | Bytes | Kept | Excluded |
+  |---|---|---|---|---|---|
+  | `acvp/sha2-256.txt` | `SHA2-256-1.0/internalProjection.json` | `a7e0bf4f5c661f1787b343bf3ae1a809b1e62f8fb2c8a627791510d03a570a6c` | 1,006,446 | 512 AFT, 1 MCT, 4 LDT | — |
+  | `acvp/sha2-512.txt` | `SHA2-512-1.0/internalProjection.json` | `2b514c517a2ef150d240efc52fdb2c4127925f0b4291b5a5b9153515e0ec7478` | 2,020,454 | 1,024 AFT, 1 MCT, 4 LDT | — |
+  | `acvp/sha3-256.txt` | `SHA3-256-2.0/internalProjection.json` | `dba4689436c7e440e61dc517210def3e8e09e50c0e9eff29ea66d89bdd0f2c63` | 1,217,364 | 151 AFT, 1 MCT, 4 LDT | 1,043 AFT, bit-oriented input |
+  | `acvp/sha3-512.txt` | `SHA3-512-2.0/internalProjection.json` | `b0521468a178f7fd362d63319aa69b708885d08f0c71cee99ac70729f5bdf64b` | 1,148,507 | 86 AFT, 1 MCT, 4 LDT | 596 AFT, bit-oriented input |
+  | `acvp/shake128-1.0.txt` | `SHAKE-128-1.0/internalProjection.json` | `ec2f9da6b146ae58fde2b73e552d3b29753fdfce7e05fbbb66329a075fa5d103` | 1,282,487 | 174 AFT, 512 VOT, 1 MCT | 1,218 AFT, bit-oriented input |
+  | `acvp/shake128-fips202.txt` | `SHAKE-128-FIPS202/internalProjection.json` | `1cbebb33db1f7e86ca265f89705dfac95cf90e8e0807b378e088af42cd0ae5db` | 871,436 | 269 AFT | — |
+  | `acvp/shake256-1.0.txt` | `SHAKE-256-1.0/internalProjection.json` | `94d0992ed2acbebe45f359cb1ffaceaf881a170339935ba9d2d36c8388005d26` | 1,319,076 | 143 AFT, 512 VOT, 1 MCT | 1,005 AFT, bit-oriented input |
+  | `acvp/shake256-fips202.txt` | `SHAKE-256-FIPS202/internalProjection.json` | `a9348d17e009cad62a2baa70160353f5bca936a27116f60dd5811f39b91c6991` | 953,531 | 237 AFT | — |
+  | `acvp/mldsa-sigver.txt` | `ML-DSA-sigVer-FIPS204/internalProjection.json` | `47cdd6314c7f746d02421ffcba89d4dbc7bb875ac49e07a029fdfc26fba55437` | 4,533,178 | 15 ML-DSA-65, 15 ML-DSA-87 (external, pure) | 60 ML-DSA-44, 30 HashML-DSA, 60 internal interface |
+  | `wycheproof/ed25519.txt` | `testvectors_v1/ed25519_test.json` | `ea80ffebac085e21cb9d3e903e7fa2b448d96702da5b31f061d0b83b430b74b3` | 172,628 | all 210 | — |
+  - ACVP files: <https://github.com/usnistgov/ACVP-Server>, commit `975de31eb83d87039ec88934fdc47d8c312b892d` (release v1.1.0.43, 2026-08-12), under `gen-val/json-files/`. `internalProjection.json` holds inputs and answers together, and gives ML-DSA vectors their `reason`, which the tests use.
+  - Wycheproof: <https://github.com/C2SP/wycheproof>, commit `d17cc89fa5c8f4f4d378b5385ebf75da5d0926c9` (2026-10-23).
+  - FIPS 204 errata: <https://csrc.nist.gov/files/pubs/fips/204/final/docs/fips-204-potential-updates.xlsx>, "Last updated 7/31/2026" (HTTP `Last-Modified` 2026-07-31), SHA-256 `5bc93ce63bc647e6d1d456cb2d3a171426c15aca4a7a0e0edd40d08b7a34c793`, 23,071 bytes. Read for this work and not committed.
+- **Licensing of the data (checked before committing, because the repository is public):** both licences allow redistribution.
+  - ACVP-Server has no licence file; its README's License section lets anyone use, copy and distribute copies, provided the notice stays intact, with changes marked by date and nature and NIST acknowledged. `tests/vectors/acvp/NOTICE.md` reproduces that notice in full, and it and every file header state the change. (NIST's separate data statement, for work of NIST employees, is to the same effect.)
+  - Wycheproof is Apache-2.0. `tests/vectors/wycheproof/LICENSE` is the upstream file, byte for byte; `NOTICE.md` and the `ed25519.txt` header mark the file as modified (§4(b)). The upstream repository has no NOTICE file.
+  - The data is included only by this host-only test crate, so it never reaches the shipping runtime (§5). The project's own licence is still not chosen; these files carry their own terms.
+- **Conversion:** `tools/convert_kat_vectors.py` (standard library only) reads the upstream JSON, refuses anything but the pinned bytes, filters by the applicability rules below, and writes the line format described in each file's header. Re-running it on the pinned files reproduces every committed byte (`diff -r`, 2026-11-08). No value in a kept vector was changed.
+- **What runs (3,882 vectors):** 1,773 AFT and 4 MCT and 16 LDT for SHA-2 and SHA-3, 823 AFT, 1,024 VOT and 2 MCT for SHAKE, 30 ML-DSA and 210 Ed25519. The counts are asserted in the tests, so a vector cannot silently vanish.
+  - SHAKE digests of a non-whole number of bytes (1,091 vectors) are applicable and run: the test squeezes whole bytes and truncates. The two ACVP revisions write the partial last byte differently (revision 1.0 keeps the bits in place, FIPS202 moves them to the top of the byte), which was determined from the data and confirmed against OpenSSL on every one of those vectors (`hashes.rs`, `PartialByte`).
+- **Exceptions, each justified:**
+  - 3,862 SHA-3 and SHAKE messages that are not a whole number of bytes. `origin-crypto` takes `&[u8]` input because everything Origin OS hashes is bytes (ONBF digests, FIPS 204's framing), so no bit-granular code exists to test.
+  - 60 ML-DSA-44, 30 HashML-DSA and 60 internal-interface vectors. The crate provides pure ML-DSA-65 and ML-DSA-87 only (§59, ADR-0001); the internal interface is Verify_internal with a caller-chosen M′ or µ, which the public API deliberately does not expose. The algorithm steps those vectors share are the same ones the 30 applicable vectors exercise.
+  - ACVP's rule that a large message must go through one `Update` call applies to submissions to the server. The test feeds the repeated pattern in pieces of about 1 MiB, to stay within modest memory.
+- **Results:** every applicable vector passes; no vector disagrees with the crate.
+  - Wycheproof under E1: all 117 valid verify; all 64 invalid are refused (12 for a wrong signature length at the `&[u8; 64]` boundary); of the 29 acceptable, E1 refuses the 8 small-order keys and accepts the 21 mixed-order keys, whose signatures satisfy the cofactorless equation. The tally of exact errors is pinned.
+  - ACVP ML-DSA: the exact `MlDsaError` for each vector's class is asserted, not only the verdict.
+  - **Independent cross-checks of the data, before the Rust ran:** OpenSSL through Python `hashlib` reproduced all hash AFT, VOT and MCT answers; `tools/mldsa_reference.py` agreed with NIST on all 30 applicable vectors (and on the 30 internal-interface vectors with a message, which the crate does not cover); `tools/ed25519_reference.py` matched the Wycheproof outcomes and error tally.
+- **FIPS 204 errata sheet** (12 entries; NIST calls them potential updates, "not official changes"; the sheet was last updated 2026-07-31):
+
+  | Identified | Location | Effect on `origin-crypto` |
+  |---|---|---|
+  | 2024-09-20 | §2.5, §7.5: ζ_j in the NTT definition | None: `ntt_by_definition` (tests) evaluates w once at ζ^(2·BitRev8(i)+1), as corrected. |
+  | 2024-10-17 | §6.2, §6.3: M should be M′ in two sentences | None: the code hashes M′ (`mldsa/mod.rs`), which the external vectors exercise. |
+  | 2025-12-02 | Broken links | None. |
+  | 2025-12-02 | §2: unused AES acronym, typography | None. |
+  | 2025-12-02 | §3.3: c̃ is over µ ‖ w1 (the text had them reversed) | None in the code, which absorbs µ first as Algorithm 8 says. A planted fault reversing them fails the vectors. |
+  | 2025-12-02 | §5: NULL → ⊥ in Algorithms 1, 2, 4 | None: those are signing. |
+  | 2025-12-02 | §6: naming, Algorithm 8 line 7 parentheses | None. |
+  | 2025-12-02 | §7: where w1Encode is used | None. |
+  | 2025-12-02 | App. A: Montgomery reduction | None: `field.rs` uses Barrett reduction. |
+  | 2026-02-23 | §5.3: Algorithm 3 step 2 returns false, not ⊥ | None: `ContextTooLong` is an `Err`, a rejection; the API has no third outcome. |
+  | 2026-02-27 | §7.4: UseHint's output is at most (q − 1)/(2γ2) − 1 | **Check tightened:** `decompose_and_use_hint_match_their_definitions_exhaustively` now asserts this bound for every element of Z_q and both hint values. `w1_encode_row`'s 4-bit fields depend on it. |
+  | 2026-07-31 | §4, App. C: signing repetition counts, Table 3's limit 821 | None: no signing here, and verification rejection loops are unbounded (M1). |
+- **Negative controls in the tests (`negative_controls`, one test per algorithm and per ACVP revision):** a corrupted digest, message, seed, checkpoint, signature, context or public key, run through the same check, must fail; a rejection claimed as valid, or a pass claimed as rejected, must fail; the piecewise large-message path must match a one-shot digest and fail when corrupted; a wrong partial-byte reading must fail.
+- **Planted faults (a scratch copy of the crate; none in the tree), one at a time:** 23 faults, 21 caught by these vectors.
+  - Caught: SHA-256 and SHA-512 rotations; a 32-bit message-length field in SHA-256 and in SHA-512 (only the 1 GiB LDT vector can see that); SHA-3's and SHAKE's domain bits; 23 Keccak rounds; SHAKE output without the permutation between blocks; ML-DSA without its 0 domain byte, ignoring the context, absorbing w1 before µ, hint order and hint padding unchecked, UseHint not wrapping, the challenge always matching; Ed25519 without its S range check, the small-order checks for A and R, the y < p check and the x = 0 sign-bit check, and with R and A swapped in the hash.
+  - Not caught by these vectors, caught by the crate's own tests: the z bound (`negative_corpus_gives_the_exact_error`, `z_decoding_and_its_bound`): ACVP's modified z values stay in range; and a cofactored Ed25519 equation (`negative_corpus_gives_the_exact_error`): no Wycheproof vector separates it from the cofactorless one.
+- **Performance:** the default run adds about 4 s (4.14 s measured) to `cargo xtask check`, which took 80 s from a cold build and 31 s incrementally. `ORIGIN_KAT_SCALE=8` runs all 16 LDT vectors, 60 GiB hashed, in 57 s wall and 175 s of CPU on the M1 Max; it passes. The default, 1, runs each hash's 1 GiB vector, past the 2^32-bit length boundary; 0 runs none.
+- **Dependencies:** none added; the tests use `std` and the crate's public API.
+- **Reproduce:** `cargo test --package origin-crypto --test kat` (or `cargo xtask check`); `ORIGIN_KAT_SCALE=8 cargo test --package origin-crypto --test kat -- large_data` for the long run. To re-derive the data, fetch the pinned upstream files into `<raw>/<ACVP set>/internalProjection.json` and `<raw>/wycheproof/ed25519_test.json`, then `python3 -I security/crypto/tools/convert_kat_vectors.py <raw> security/crypto/tests/vectors`.
+- **Review:** not independently reviewed yet. The Python cross-checks have the same author as the crate.
+- **Not done:** an independent review (§59); ACVP coverage of FIPS 204's external µ and HashML-DSA paths, which Origin OS does not use.
 
 ## `developer-tools/xtask/` (`xtask`)
 
@@ -1240,39 +2427,72 @@ Author, date, toolchain, review and licensing are as for `verify.sh`.
   - `build`.
   - `boot-test`: stages a fresh ESP (`\EFI\BOOT\BOOTX64.EFI`, UEFI 2.11 §3.5.1.1) and a fresh NVRAM copy; boots QEMU with serial on a pipe; requires the loader's lines and OVMF's status line in order; then stops QEMU.
     - *Since M1 step 2:* builds the Framekernel, packs it with `onbf-pack krn` into `\EFI\ORIGIN\KERNEL.ONBF`, and runs two scenarios: the real kernel (every loader and kernel milestone line in order; any failure marker, matched in complete lines only, fails at once) and a tampered kernel (one SEGMENT byte flipped: the loader must reject it and the kernel must never run). `ORIGIN_QEMU_DEBUG=1` adds QEMU's interrupt log.
-    - `check` also covers the Framekernel (host and kernel-target clippy, tests, release build), the developer-mode loader, and `onbf-pack` (clippy and tests).
+    - `check` also covers the Framekernel (host and kernel-target clippy, tests, release build), the developer-mode and test-trust-store loaders, and `onbf-pack` (clippy and tests).
+    - *Since 2026-11-08 (the early console, ADR-0010):* `boot-test`'s kernel scenario keeps its serial and monitor multiplexed on stdio, takes a screen dump when the kernel halts and checks it cell by cell against the rows the serial log implies (`screen`, computed independently of the kernel's drawing code); `boot-console` boots eight machines for the console (a UART named by an SPCR, COM1 named, a refused table, a dead port, registers in RAM, a UART that takes no bytes, no display, no UART at all), and `boot-matrix` runs it last.
+    - *Since 2026-11-08 (signature verification, `boot/uefi/`, "Step 3"):* `boot-test` derives two test keys, signs the kernel with both, and runs 11 scenarios, each naming the loader build it boots (`Loader::Developer`, or `Loader::Verifying` with developer mode off). `ORIGIN_BOOT_TEST_ONLY` selects scenarios by label. `check` also runs `onbf-sign`'s clippy and tests, fails if the loader or the kernel can reach `onbf-sign` (CLAUDE.md §59, over every target and feature), and counts the conditional branches of `ed25519::sign` in its release assembly on the build host (only the three loop counters).
   - `run`.
 
   It is not part of the shipping OS.
 - **Author / date:** Claude Code (local, M1 Max), 2026-11-07. Original code.
-- **Dependencies:** Rust `std` (CLAUDE.md §4) and the first-party `origin-version` crate; no third-party crates. `#![forbid(unsafe_code)]`. At run time it needs QEMU and the EDK2 firmware, found next to `qemu-system-x86_64` or through `ORIGIN_OVMF_CODE` and `ORIGIN_OVMF_VARS`.
+- **Dependencies:** Rust `std` (CLAUDE.md §4) and the first-party `origin-version`, `onbf-format`, `onbf-merkle` and `origin-crypto` crates, and (since 2026-11-08, for the screen check) `framekernel`'s library and `origin-boot-info`; no third-party crates. `#![forbid(unsafe_code)]`. At run time it needs QEMU and the EDK2 firmware, found next to `qemu-system-x86_64` or through `ORIGIN_OVMF_CODE` and `ORIGIN_OVMF_VARS`.
 - **Test evidence (2026-11-07):**
   - 3 unit tests: escape-sequence stripping and in-order matching.
   - Failure paths checked by hand:
     - a timeout below the boot time fails with exit 1 and QEMU is killed;
     - missing firmware is reported by path;
     - an unknown command exits 2.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
+
+## `developer-tools/onbf-sign/` (`onbf-sign`), Ed25519 and ML-DSA-87 signing for the build host
+
+- **What:** the signing half of ONBF §7.2, in original Rust (the owner's decision of 2026-11-08; `docs/research/2026-11-08-krn-signature-verification.md` §3). Host only: `cargo xtask check` fails if the loader or the kernel can reach it (CLAUDE.md §59, Origin OS contains verification code only).
+  - `ed25519`: `public_key`, `sign` (RFC 8032 §5.1.5, §5.1.6): field arithmetic in 51-bit limbs, complete addition formulas, base-point multiplication that doubles and adds on every bit and selects by mask, scalar reduction by shift and conditional subtraction by mask.
+  - `mldsa87`: `SigningKey::from_seed` (FIPS 204 Algorithm 6) and `sign` (Algorithms 2 and 7), with the sampling, rounding and encodings they need. ML-DSA-87 only: the kernel role's suite, OSS-1R.
+  - The hashes are `origin-crypto`'s SHA-512, SHAKE128 and SHAKE256; the arithmetic is separate from the verifiers, so a signature they accept is agreement between two implementations.
+  - `os_random` reads `/dev/urandom`; a read failure aborts the signing. `/dev/urandom` does not wait for the pool to be seeded on Linux.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-08, branch `claude/adoring-hopper-a8f66b`. Original code, written from RFC 8032 and FIPS 204 (August 2024). `#![forbid(unsafe_code)]`, no third-party crates.
+- **Dependencies:** Rust `std`, the first-party `origin-crypto`. Its test vectors: `tests/vectors/ed25519-sign.txt` (from `ed25519_reference.py signvectors`) and `security/crypto/tests/vectors/mldsa-differential.txt`.
+- **Test evidence (2026-11-08):** 16 tests.
+  - Known answers and differential: RFC 8032 §7.1 and 296 more Ed25519 vectors, keys and signatures byte for byte; all 13 ML-DSA-87 keys and 52 signatures (deterministic and hedged) of `mldsa-differential.txt` byte for byte, from an independent pure-Python implementation that OpenSSL 4.1.0 matched. `origin-crypto`'s strict verifiers accept every signature, and those of 200 further Ed25519 and 40 ML-DSA-87 keys.
+  - Arithmetic: `decompose` and `power2round` checked against FIPS 204's definitions for every coefficient below q; the NTT against schoolbook multiplication; Barrett reduction, the scalar reduction at its extremes (including a value computed outside the crate), masks, the hint and the challenge.
+  - The review below drove 20,000 more signatures with overflow checks on, including 156 hint-count retries and 57 accepted at exactly ω = 75, and matched 90 rare-path cases to the Python reference byte for byte.
+  - OpenSSL verifies the signatures and refuses a flipped one (`openssl_accepts_these_signatures`, skipped if no OpenSSL with ML-DSA is installed). `test_keys_come_from_their_seed_only` shows the Rust key generation equal to OpenSSL's from the same seeds, on the committed test keys.
+- **Side channels** (assessment in `src/lib.rs`): no branch or memory index depends on the Ed25519 scalar or nonce, or on ML-DSA's s1, s2, t0, K or y; the two masks that protect the Ed25519 reduction go through `black_box`, after LLVM was shown to compile one of them into two data-dependent branches per bit (seen on aarch64 and x86-64, and checked gone on both). `cargo xtask check` counts the conditional branches of `ed25519::sign` in its release assembly on the build host, so that regression shows up. ML-DSA's rejection decisions are the documented exception (FIPS 204 §3.6). Not established: a future compiler keeping this, and the processor's own behaviour (Apple's PSTATE.DIT, the M-series data-memory-dependent prefetcher). No timing measurement has been made.
+- **Secret zeroization:** best effort, because the crate forbids `unsafe` and so has no volatile writes. Secrets are written in place to avoid copies from returns and moves, and overwritten at the end of use, but `origin-crypto`'s hasher state is not wiped (its SHA-2 entry notes that a wipe was to be added before any secret is hashed; this crate now does hash secrets) and Rust moves leave old bytes behind. **The owner accepted best effort for host development keys on 2026-11-08:** no reviewed `unsafe` volatile wipe will be added for this crate. Release keys belong in an HSM.
+- **Security review:** agent review only, not the independent security review §59 requires for a release. One fresh reviewer, given the code and no conclusions, found no signature-correctness bug, and three real problems, all fixed: the compiled branch above, gaps in what was wiped, and a `keygen` path that could overwrite its own new key.
+- **Negative controls** (each applied, shown to fail, restored byte-identical): a broken mask select, an inverted conditional subtraction, `decompose` without its wrap case, no rejection on z, no rejection on the low bits, the hint from the wrong value, key generation without its domain separation (each failing a named test); hedging off, a damaged key file loaded anyway, a key file written world-readable, a world-readable key file loaded anyway, keygen writing over an existing path, a test key not marked as one (each failing a named test); the loader made to depend on this crate, and the reduction's mask taken out of `black_box` (each failing `cargo xtask check`).
+- **Not done:** ML-DSA-65 (OSS-1, when a role needs it), a measured timing check, an HSM path for release keys.
+- **Licensing:** MIT OR Apache-2.0.
 
 ## `developer-tools/onbf-pack/` (`onbf-pack`), ELF64 PIE → KRN
 
-- **What:** the host tool that converts the Framekernel's `rust-lld` output into an unsigned (developer-mode) KRN image (ONBF §6.1.2, §6.5; D1):
+- **What:** the host tool that converts the Framekernel's `rust-lld` output into an unsigned KRN image (ONBF §6.1.2, §6.5; D1), and since 2026-11-08 signs one (`sign`, below):
   - `elf`: an ELF64 x86-64 `ET_DYN` parser for the conversion contract. Every field is decoded from bytes, and each hard error has its own typed error. ELFCLASS32, EM_386 and x32 are rejected explicitly (ONBF-R11). PT_GNU_EH_FRAME is accepted and ignored (coordinator amendment, 2026-11-07);
   - `relr`: the SHT_RELR encoder (greedy, shortest) and decoder;
   - `ocbor`: a canonical OCBOR-1 encoder (shortest heads, `BTreeMap` keys);
   - `krn`: MANIFEST (with `boot_info_abi` from `origin-version`), one SEGMENT per PT_LOAD with RELA addends written in, RELOCS, MERKLE; the canonical container (C1–C4, C7, C10, C12, C14, G4, G5); and `verify`, which re-checks the finished image with `onbf-format` and `onbf-merkle` before anything is written;
   - CLI `onbf-pack krn`: exit 0, 1 or 2; output is written through a temporary file and a rename.
+  - `sign` (2026-11-08; `docs/research/2026-11-08-krn-signature-verification.md`, ONBF §7.1–§7.2, S1–S3; errata C3, V1, V3, V6): `sign_krn` builds the statement, the entry and the block, gets both signatures from a `Signer`, appends the block at its canonical offset (C3; the content digest excludes the header fields it fills), and re-verifies the result with `onbf_verify::verify_krn_block` and `krn::verify`. `HostKey` signs with `onbf-sign`: the key is a 104-byte file (magic `ONBFKEY1`, or `ONBFTKEY` for a test key, then two seeds and the key ID, checked on load) that must be mode 0600 and is created exclusively. `generate_keys` and the CLI `keygen` make a fresh key from the system's random source (or, with `--insecure-test-seed`, a test key from public text) and never overwrite any path; the CLI `sign` needs an explicit `--signing-time`, because a build must not read the clock, and refuses an `--output` equal to the key.
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-07, in its own worktree, merged by the coordinator (91334ee). Original code, written from the ELF gABI (ELF header, program headers, dynamic section, `Elf64_Rela`, SHT_RELR), the x86-64 psABI (`EM_X86_64`, `R_X86_64_RELATIVE`), RFC 8949 §4.2.1, ONBF §3–§6 and the errata.
 - **Architecture decisions:** ADR-0001 D1; errata C1–C14, G2–G5 and R1–R5; manifest keys K1–K4. Its readings of the conversion contract (program-header policy, segment order by page-rounded end, `DT_INIT`/`DT_FINI` rejected, relocation-tag completeness, wrapping addends, `flags_digest` over the exact `--flags` bytes, and others) are listed in its report and await the owner in the errata.
-- **Dependencies:** Rust `std` and the first-party `onbf-format`, `onbf-merkle`, `origin-crypto` and `origin-version`; no third-party crates. `#![forbid(unsafe_code)]`. The library denies the no-panic Clippy lints in non-test builds. At run time it uses `rustc -vV`, unless all three toolchain values are given.
+- **Dependencies:** Rust `std` and the first-party `onbf-format`, `onbf-merkle`, `onbf-sign`, `onbf-verify`, `origin-crypto` and `origin-version`; no third-party crates. `#![forbid(unsafe_code)]`. The library denies the no-panic Clippy lints in non-test builds. At run time it uses `rustc -vV`, unless all three toolchain values are given.
 - **Toolchain:** Rust 1.99.1; clippy-clean on the host.
-- **Test evidence (2026-11-07):** 57 unit tests and 4 integration tests, now part of `cargo xtask check`.
+- **Test evidence (2026-11-07; signing added 2026-11-08):** 67 unit tests and 4 integration tests, part of `cargo xtask check`. The 11 for signing: the encoders byte-identical to the independent Python encoder; the block's placement; the self-check refuses what the loader's signature code would; wrong signature lengths, an already-signed or invalid input; hedging (two signatures of one statement differ, and both verify); another key refused; the test key derived only from its seed, and equal to the public keys OpenSSL made from the same seeds; keys never overwritten, even for the same path given twice; a damaged, foreign or world-readable key file refused; and OpenSSL verifying the signatures when an OpenSSL with ML-DSA is installed.
   - **Negative tests:** each hard error of the contract is rejected with its own error; every strict prefix of a valid ELF is rejected as truncated.
   - **Valid conversions:** with and without relocations, RELA, RELR and both merged, a bss-only segment, one- and two-level MERKLE sections, and a fixture of the Framekernel's shape, each checked independently with `onbf-format`, `onbf-merkle` and the RELR decoder.
   - **RELR:** round trips over 2000 generated sets, and a brute-force check that the encoding is minimal on 3000 small sets.
   - **Integrity and determinism:** flipping any byte of a packed image makes `verify` fail; packing twice, in one process or two, gives identical bytes.
   - **Integration:** a `no_std` program linked with the Framekernel's flags by the pinned rustc and rust-lld 23.1.1, packed with DT_RELA and with `-zpack-relative-relocs`, and relocated at two bases by a simulated loader.
   - **Real kernel:** `cargo xtask boot-test` packs the real Framekernel ELF (7 sections, 3 segments, 128 relocations at the time of writing), which the loader verifies and boots.
-  - **Not done:** fuzzing, Kani bounds, an independent second implementation (§13), signatures, EXE/LIB profiles, UNWIND/DEBUG_LINK sections.
+  - **Not done:** fuzzing, Kani bounds, an independent second implementation (§13), certificate chains and release signing, EXE/LIB profiles, UNWIND/DEBUG_LINK sections.
 - **Review:** not yet independently reviewed.
-- **Licensing:** project licence not chosen yet.
+- **Licensing:** MIT OR Apache-2.0.
+
+## Pre-merge review fixes (2026-11-09)
+
+- **What:** the fixes from the review recorded in `docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md`, made on separate branches and merged in `4eaeb07` (network, firmware tables, filesystems), `643144e` (storage), `b5c89d7` (boot chain and tooling), `318f03c` (PCI, IOMMU, DMA), `1fed0a3` (Loom and dependencies), `8c433f5` (CPU, scheduler, system calls), and the commits around them up to `c465fe6`.
+- **Author / date:** Claude Code agents (local, M1 Max), 2026-11-09. Original code from the specifications those modules already cite. No third-party crate and no operating system's code was read or copied (CLAUDE.md §3).
+- **Review:** by AI agents only, two of them reading the combined fixes afterwards. Not the independent review §59 requires.
+- **Test evidence:** each fix that can be tested on the host has a test that fails with the fix reverted. Kernel-only paths were shown by temporary QEMU fault injections, which are not committed, or could not be shown; the review record and the fix commits say which. On `c465fe6`: `cargo xtask check` 968 passed, 0 failed, 6 ignored; Loom 26 models and 35 negative controls; `cargo xtask boot-matrix` a full pass.
+- **Supersedes:** where older entries in this file say the kernel links with `-znorelro`, has no `PT_GNU_RELRO`, or that Loom is a dev-dependency of `origin-sync` with its crates in the root `Cargo.lock`, those were true when written and are no longer.
+- **Licensing:** MIT OR Apache-2.0.

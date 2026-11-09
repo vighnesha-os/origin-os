@@ -4,6 +4,12 @@
 //! generation in the high 16 bits, so a handle is never 0 and a stale handle (its slot
 //! freed and reused) never names the new object. Each entry holds an object and its rights;
 //! every lookup states the rights it needs, and a duplicate can only remove rights.
+//!
+//! A slot whose generations are used up is retired rather than reused, so "a stale handle
+//! never names a reused slot" holds however long a process runs. The table allocates only
+//! with `try_reserve`: a hostile process that fills it gets [`Error::Limit`] or
+//! [`Error::NoMemory`], never an allocation failure that stops the kernel.
+//!
 //! Generic over the object type, safe, tested on the host.
 
 use alloc::vec::Vec;
@@ -70,6 +76,28 @@ impl<T> HandleTable<T> {
         self.limit.saturating_sub(self.live)
     }
 
+    /// Makes sure `count` further [`HandleTable::insert`]s cannot fail: a handle count over
+    /// the quota is [`Error::Limit`], and memory for the slots is taken now.
+    pub fn reserve(&mut self, count: usize) -> Result<(), Error> {
+        if count > self.free_slots() {
+            return Err(Error::Limit);
+        }
+        let fresh = count.saturating_sub(self.free.len());
+        if self.slots.len().saturating_add(fresh) > MAX_HANDLES {
+            return Err(Error::Limit);
+        }
+        self.slots.try_reserve(fresh).map_err(|_| Error::NoMemory)?;
+        self.ensure_free_room(fresh)
+    }
+
+    /// Makes room in the free list for every slot, plus `fresh` more slots, so that
+    /// [`HandleTable::remove`] never allocates.
+    fn ensure_free_room(&mut self, fresh: usize) -> Result<(), Error> {
+        let want = self.slots.len().saturating_add(fresh);
+        let more = want.saturating_sub(self.free.len());
+        self.free.try_reserve(more).map_err(|_| Error::NoMemory)
+    }
+
     /// Adds `object` with `rights`; on failure the object is handed back.
     pub fn insert(&mut self, object: T, rights: u32) -> Result<Handle, (Error, T)> {
         if self.live >= self.limit {
@@ -78,6 +106,12 @@ impl<T> HandleTable<T> {
         let index = match self.free.pop() {
             Some(i) => usize::from(i),
             None => {
+                if self.slots.len() >= MAX_HANDLES {
+                    return Err((Error::Limit, object));
+                }
+                if self.slots.try_reserve(1).is_err() || self.ensure_free_room(1).is_err() {
+                    return Err((Error::NoMemory, object));
+                }
                 self.slots.push(Slot {
                     generation: 1,
                     entry: None,
@@ -116,10 +150,42 @@ impl<T> HandleTable<T> {
         let (index, _) = split(handle).ok_or(Error::BadHandle)?;
         let slot = self.slots.get_mut(index).ok_or(Error::BadHandle)?;
         let entry = slot.entry.take().ok_or(Error::BadHandle)?;
-        slot.generation = slot.generation.wrapping_add(1);
-        self.free.push(index as u16);
+        // A slot whose generations are used up is retired: reusing it would let a stale
+        // handle name a later object, which P1 rules out.
+        if let Some(next) = slot.generation.checked_add(1) {
+            slot.generation = next;
+            // Never grows: `insert` made room for every slot.
+            self.free.push(index as u16);
+        }
         self.live -= 1;
         Ok(entry)
+    }
+
+    /// Whether every handle in `list` is valid, distinct and has every right in `need`.
+    /// Changes nothing: a caller that also needs the objects can inspect them before it
+    /// commits with [`HandleTable::take_all`].
+    pub fn check_all(&self, list: &[Handle], need: u32) -> Result<(), Error> {
+        for (i, &handle) in list.iter().enumerate() {
+            self.get(handle, need)?;
+            if list.get(i + 1..).is_some_and(|rest| rest.contains(&handle)) {
+                return Err(Error::InvalidArgs);
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves every handle in `list` out of the table, or none of them: each must be valid
+    /// and distinct and have every right in `need`.
+    pub fn take_all(&mut self, list: &[Handle], need: u32) -> Result<Vec<(T, u32)>, Error> {
+        self.check_all(list, need)?;
+        let mut taken = Vec::new();
+        taken
+            .try_reserve_exact(list.len())
+            .map_err(|_| Error::NoMemory)?;
+        for &handle in list {
+            taken.push(self.remove(handle, need)?);
+        }
+        Ok(taken)
     }
 }
 
@@ -139,7 +205,9 @@ impl<T: Clone> HandleTable<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{Rng, cases};
     use origin_abi::rights::{DUPLICATE, READ, TRANSFER, WRITE};
+    use std::collections::HashMap;
 
     #[test]
     fn handles_are_never_zero_and_name_their_object() {
@@ -193,6 +261,21 @@ mod tests {
     }
 
     #[test]
+    fn a_slot_is_retired_before_its_generation_can_repeat() {
+        let mut t = HandleTable::new(4);
+        let mut seen = std::collections::HashSet::new();
+        // Every generation of the one slot, and a few more: none may repeat a value.
+        for i in 0..0x1_0010u32 {
+            let h = t.insert(i, READ).unwrap();
+            assert!(seen.insert(h), "handle {h:#x} issued twice");
+            assert_eq!(t.remove(h, 0), Ok((i, READ)));
+            assert_eq!(t.get(h, 0), Err(Error::BadHandle));
+        }
+        assert_eq!(t.len(), 0);
+        assert!(t.insert(1, READ).is_ok(), "the table keeps working");
+    }
+
+    #[test]
     fn the_limit_is_a_quota_and_returns_the_object() {
         let mut t = HandleTable::new(2);
         t.insert(1, 0).unwrap();
@@ -202,5 +285,125 @@ mod tests {
         t.remove(h, 0).unwrap();
         assert_eq!(t.free_slots(), 1);
         assert!(t.insert(4, 0).is_ok());
+    }
+
+    #[test]
+    fn reserve_guarantees_the_inserts_and_refuses_past_the_quota() {
+        let mut t = HandleTable::new(3);
+        assert_eq!(t.reserve(4), Err(Error::Limit));
+        t.reserve(3).unwrap();
+        assert_eq!(t.reserve(3), Ok(()));
+        let hs: Vec<_> = (0..3).map(|i| t.insert(i, 0).unwrap()).collect();
+        assert_eq!(t.reserve(1), Err(Error::Limit));
+        t.remove(hs[1], 0).unwrap();
+        assert_eq!(t.reserve(1), Ok(()));
+        assert!(t.insert(9, 0).is_ok());
+    }
+
+    #[test]
+    fn a_batch_moves_entirely_or_not_at_all() {
+        let mut t = HandleTable::new(8);
+        let a = t.insert(1, TRANSFER | READ).unwrap();
+        let b = t.insert(2, TRANSFER).unwrap();
+        let no_transfer = t.insert(3, READ).unwrap();
+        // One handle without the right, or one twice, or one bad: nothing moves.
+        assert_eq!(
+            t.take_all(&[a, no_transfer], TRANSFER),
+            Err(Error::AccessDenied)
+        );
+        assert_eq!(t.take_all(&[a, b, a], TRANSFER), Err(Error::InvalidArgs));
+        assert_eq!(
+            t.take_all(&[a, 0x7777_0009], TRANSFER),
+            Err(Error::BadHandle)
+        );
+        assert_eq!(t.check_all(&[a, a], TRANSFER), Err(Error::InvalidArgs));
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get(a, TRANSFER).map(|(o, _)| *o), Ok(1));
+        // Rights travel with the objects, unchanged.
+        assert_eq!(
+            t.take_all(&[b, a], TRANSFER),
+            Ok(vec![(2, TRANSFER), (1, TRANSFER | READ)])
+        );
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.get(a, 0), Err(Error::BadHandle));
+    }
+
+    /// Any sequence of operations, against a map of what should be there. Rights only
+    /// shrink, stale values stay dead, and the live count and quota agree.
+    #[test]
+    fn a_random_operation_sequence_matches_a_model() {
+        const LIMIT: usize = 24;
+        for seed in 1..=cases(40) as u64 {
+            let mut rng = Rng::new(seed);
+            let mut table = HandleTable::new(LIMIT);
+            let mut model: HashMap<Handle, (u64, u32)> = HashMap::new();
+            let mut dead: Vec<Handle> = Vec::new();
+            let mut next = 0u64;
+            for _ in 0..2000 {
+                let live: Vec<Handle> = model.keys().copied().collect();
+                let pick = (!live.is_empty()).then(|| live[rng.below(live.len())]);
+                match rng.below(8) {
+                    0..=2 => {
+                        let r = rng.next() as u32 & rights::ALL;
+                        next += 1;
+                        match table.insert(next, r) {
+                            Ok(h) => {
+                                assert!(model.insert(h, (next, r)).is_none());
+                                assert!(!dead.contains(&h), "a stale value came back");
+                            }
+                            Err((e, v)) => {
+                                assert_eq!((e, v), (Error::Limit, next));
+                                assert_eq!(model.len(), LIMIT);
+                            }
+                        }
+                    }
+                    3 => {
+                        if let Some(h) = pick {
+                            let (obj, r) = model[&h];
+                            let need = rng.next() as u32 & rights::ALL;
+                            let got = table.get(h, need);
+                            if r & need == need {
+                                assert_eq!(got, Ok((&obj, r)));
+                            } else {
+                                assert_eq!(got, Err(Error::AccessDenied));
+                            }
+                        }
+                    }
+                    4 | 5 => {
+                        if let Some(h) = pick {
+                            let (obj, r) = model.remove(&h).unwrap();
+                            assert_eq!(table.remove(h, 0), Ok((obj, r)));
+                            dead.push(h);
+                        }
+                    }
+                    6 => {
+                        if let Some(h) = pick {
+                            let (obj, r) = model[&h];
+                            let wanted = rng.next() as u32 & rights::ALL;
+                            let got = table.duplicate(h, wanted);
+                            match got {
+                                Ok(d) => {
+                                    assert!(r & DUPLICATE != 0);
+                                    assert_eq!(wanted & !r, 0, "a duplicate added a right");
+                                    assert!(model.insert(d, (obj, wanted)).is_none());
+                                }
+                                Err(Error::AccessDenied) => assert_eq!(r & DUPLICATE, 0),
+                                Err(Error::InvalidArgs) => assert_ne!(wanted & !r, 0),
+                                Err(Error::Limit) => assert_eq!(model.len(), LIMIT),
+                                Err(e) => panic!("unexpected {e:?}"),
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(&h) = dead.get(rng.below(dead.len().max(1))) {
+                            assert_eq!(table.get(h, 0), Err(Error::BadHandle), "stale {h:#x}");
+                            assert_eq!(table.remove(h, 0), Err(Error::BadHandle));
+                        }
+                    }
+                }
+                assert_eq!(table.len(), model.len());
+                assert_eq!(table.free_slots(), LIMIT - model.len());
+            }
+        }
     }
 }

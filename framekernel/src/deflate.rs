@@ -556,6 +556,65 @@ eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
         assert_eq!(gzip_decompress(&[]), None);
     }
 
+    /// The wrappers fed valid headers around mutated bodies, so the trailer and header
+    /// checks are reached, not only the first-byte tests (CLAUDE.md §72).
+    #[test]
+    fn mutated_wrappers_reach_their_trailer_checks() {
+        use crate::testing::{Rng, mutate};
+        let seeds = vectors();
+        let mut rng = Rng::new(0x5A4C_4942);
+        let mut accepted = 0u32;
+        for case in 0..crate::testing::cases(10_000) {
+            let (_, compressed) = seeds[case % seeds.len()];
+            let mut body = compressed.to_vec();
+            if case % 2 == 0 {
+                mutate(&mut body, &mut rng);
+            }
+            // zlib: CMF 78h, FLG with a correct check; an Adler-32 of what we hope comes out.
+            let mut z = alloc::vec![0x78, 0x9C];
+            z.extend_from_slice(&body);
+            if let Some(out) = inflate_limit(&body, 1 << 20) {
+                z.extend_from_slice(&adler32(&out).to_be_bytes());
+                if zlib_decompress_limit(&z, 1 << 20).is_some() {
+                    accepted += 1;
+                }
+                // A corrupted trailer is refused.
+                let n = z.len();
+                z[n - 1] ^= 1;
+                assert_eq!(zlib_decompress_limit(&z, 1 << 20), None, "case {case}");
+            }
+            // gzip: the fixed header, flags chosen to walk every optional field.
+            let mut g = alloc::vec![0x1F, 0x8B, 0x08];
+            let flg = (rng.byte() & 0x1E) >> 1 << 1;
+            g.push(flg);
+            g.extend_from_slice(&[0; 6]);
+            if flg & 0x04 != 0 {
+                let xlen = rng.below(8);
+                g.extend_from_slice(&(xlen as u16).to_le_bytes());
+                g.extend(core::iter::repeat_n(0xAAu8, xlen));
+            }
+            for name in [flg & 0x08 != 0, flg & 0x10 != 0] {
+                if name {
+                    g.extend_from_slice(b"n\0");
+                }
+            }
+            if flg & 0x02 != 0 {
+                g.extend_from_slice(&[0, 0]);
+            }
+            g.extend_from_slice(&body);
+            if let Some(out) = inflate_limit(&body, 1 << 20) {
+                g.extend_from_slice(&crate::gpt::crc32(&out).to_le_bytes());
+                g.extend_from_slice(&(out.len() as u32).to_le_bytes());
+                if gzip_decompress_limit(&g, 1 << 20).is_some() {
+                    accepted += 1;
+                }
+            }
+            mutate(&mut g, &mut rng);
+            let _ = gzip_decompress_limit(&g, 1 << 16);
+        }
+        assert!(accepted > 1000, "{accepted}");
+    }
+
     #[test]
     fn mutations_never_panic() {
         let base: Vec<u8> = (0..64u16).map(|i| i as u8).collect();
@@ -566,14 +625,18 @@ eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
             for (_, compressed) in &seeds {
                 let mut data = compressed.to_vec();
                 crate::testing::mutate(&mut data, &mut rng);
-                let _ = inflate_limit(&data, 1 << 16);
+                let out = inflate_limit(&data, 1 << 16);
+                assert!(out.is_none_or(|o| o.len() <= 1 << 16));
             }
             let mut data = base.clone();
             crate::testing::mutate(&mut data, &mut rng);
-            let _ = inflate_limit(&data, 1 << 16);
+            let out = inflate_limit(&data, 1 << 16);
+            assert!(out.is_none_or(|o| o.len() <= 1 << 16));
             // The zlib and gzip wrappers must also never panic on mutated input.
-            let _ = zlib_decompress_limit(&data, 1 << 16);
-            let _ = gzip_decompress_limit(&data, 1 << 16);
+            let out = zlib_decompress_limit(&data, 1 << 16);
+            assert!(out.is_none_or(|o| o.len() <= 1 << 16));
+            let out = gzip_decompress_limit(&data, 1 << 16);
+            assert!(out.is_none_or(|o| o.len() <= 1 << 16));
         }
     }
 }

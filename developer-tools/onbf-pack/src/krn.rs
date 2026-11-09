@@ -2,9 +2,10 @@
 //!
 //! Section table, in order:
 //! 1. `[0]` MANIFEST: OCBOR-1, integrity 0 (SHA-256), never compressed (errata C12);
-//! 2. one SEGMENT per `PT_LOAD`, ascending RVA: MAPPABLE plus R, R+X or R+W; `mem_offset =
-//!    p_vaddr`; `mem_size = p_memsz` rounded up to 4 KiB (G4); content = the `p_filesz`
-//!    file bytes with the RELA addends written in; integrity 1 (Merkle);
+//! 2. one SEGMENT per `PT_LOAD`, ascending RVA: MAPPABLE plus R, R+X or R+W, and RELRO on the
+//!    part of an R+W `PT_LOAD` that `PT_GNU_RELRO` covers, which is a segment of its own;
+//!    `mem_offset = p_vaddr`; `mem_size = p_memsz` rounded up to 4 KiB (G4); content = the
+//!    `p_filesz` file bytes with the RELA addends written in; integrity 1 (Merkle);
 //! 3. RELOCS, if there are relocations: RELR words (ONBF §6.1), integrity 0. Omitted when
 //!    there are none, because an empty section is not allowed (C14);
 //! 4. one MERKLE section per segment whose tree has hash blocks, in segment order. A
@@ -23,7 +24,7 @@ use onbf_merkle::Shape;
 use origin_crypto::{Sha256, Sha512};
 
 use crate::container::{self, SectionSpec};
-use crate::elf::{self, Elf, Permissions};
+use crate::elf::{self, Elf, LoadSegment, Permissions};
 use crate::ocbor::Value;
 use crate::relr::{self, RelrError};
 use crate::toolchain::Toolchain;
@@ -209,11 +210,12 @@ fn sha512_parts(parts: &[&[u8]; 3]) -> [u8; 64] {
 }
 
 /// The section flags for a segment's permissions.
-fn segment_flags(permissions: Permissions) -> u32 {
+fn segment_flags(segment: &LoadSegment) -> u32 {
     let base = Flags::REQUIRED | Flags::MAPPABLE | Flags::READ;
-    match permissions {
+    match segment.permissions {
         Permissions::Read => base,
         Permissions::ReadExecute => base | Flags::EXECUTE,
+        Permissions::ReadWrite if segment.relro => base | Flags::WRITE | Flags::RELRO,
         Permissions::ReadWrite => base | Flags::WRITE,
     }
 }
@@ -351,7 +353,7 @@ pub fn pack(file: &[u8], options: &KrnOptions) -> Result<Packed, Error> {
         };
         sections.push(SectionSpec {
             kind: kind::SEGMENT,
-            flags: segment_flags(segment.permissions),
+            flags: segment_flags(segment),
             content,
             mem_offset: segment.vaddr,
             mem_size: segment.mapped_size,
@@ -414,7 +416,7 @@ fn check_matches(
     for ((got, want), elf_segment) in v.segments.iter().zip(specs).zip(&elf.segments) {
         let same = got.rva == elf_segment.vaddr
             && got.mem_size == elf_segment.mapped_size
-            && got.flags == segment_flags(elf_segment.permissions)
+            && got.flags == segment_flags(elf_segment)
             && got.content == want.content;
         if !same {
             return Err(mismatch("segment contents or placement"));

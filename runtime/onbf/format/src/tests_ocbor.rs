@@ -558,7 +558,7 @@ fn every_truncation_and_bit_flip_of_a_manifest_is_handled() {
 
 /// Canonical OCBOR-1 encoding of a decoded KRN manifest (test-only; `onbf-pack` will own
 /// the real encoder).
-fn encode_krn(m: &KrnManifest<'_>) -> Vec<u8> {
+pub(crate) fn encode_krn(m: &KrnManifest<'_>) -> Vec<u8> {
     let b = |v: bool| if v { cbor_true() } else { cbor_false() };
     map(&[
         (0, uint(1)),

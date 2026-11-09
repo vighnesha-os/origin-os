@@ -12,9 +12,11 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod console;
+pub mod framebuffer;
 pub mod kernel;
 pub mod memmap;
 pub mod place;
 pub mod protocols;
 pub mod text;
+pub mod trust;
 pub mod uefi;

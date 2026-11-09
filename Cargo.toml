@@ -14,6 +14,7 @@ members = [
     "boot/info",
     "boot/uefi",
     "developer-tools/onbf-pack",
+    "developer-tools/onbf-sign",
     "developer-tools/xtask",
     "framekernel",
     "framekernel/paging",
@@ -30,6 +31,7 @@ members = [
 default-members = [
     "boot/info",
     "developer-tools/onbf-pack",
+    "developer-tools/onbf-sign",
     "developer-tools/xtask",
     "framekernel/paging",
     "framekernel/sync",
@@ -48,7 +50,7 @@ publish = false
 # No `version` here or in any member, on purpose: the release identity lives only in
 # `origin-version.toml` and reaches code through the generated `origin-version` crate
 # (CLAUDE.md §62). `cargo xtask check` rejects a hand-written crate version.
-# No `license` yet: the project licence has not been chosen (SOURCE_PROVENANCE.md).
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 origin-version = { path = "runtime/version" }
@@ -56,11 +58,16 @@ origin-boot-info = { path = "boot/info" }
 origin-crypto = { path = "security/crypto" }
 onbf-format = { path = "runtime/onbf/format" }
 onbf-merkle = { path = "runtime/onbf/merkle" }
+onbf-verify = { path = "runtime/onbf/verify" }
+onbf-sign = { path = "developer-tools/onbf-sign" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
+# `cfg(loom)`: `cargo xtask loom` builds `origin-sync`'s tests against Loom (CLAUDE.md §73), in a
+# scratch workspace of its own: nothing in this workspace depends on Loom.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [workspace.lints.clippy]
 # CLAUDE.md §13 and final rule 5: every unsafe boundary documents its invariants.
@@ -80,4 +87,7 @@ codegen-units = 1
 opt-level = 3
 
 [profile.dev.package.onbf-merkle]
+opt-level = 3
+
+[profile.dev.package.onbf-sign]
 opt-level = 3

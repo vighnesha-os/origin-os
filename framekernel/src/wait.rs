@@ -14,73 +14,73 @@
 //! Lock order: a wait queue's lock, then whatever its condition reads. A waker never holds
 //! a wait queue's lock while it takes another one.
 //!
-//! These queues are kernel-internal. The user-visible waiting of ADR-0005 P9 builds on them
-//! later.
+//! The user-visible waiting of ADR-0005 P9 (`ipc::wait_one`) is built on these queues.
+//!
+//! The protocol itself is `origin_sync::wait`, generic over the scheduler so the Loom models
+//! run it (`cargo xtask loom`); this module instantiates it for kernel threads.
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use framekernel::runqueue::{RoundTrips, judge_round_trips, per_mille};
 use origin_sync::SpinLock;
+use origin_sync::wait::{self, TimedOut};
 
 use crate::console::Console;
-use crate::cpu::{self, rdtsc};
+use crate::cpu::{self, CpuIndex, rdtsc};
 use crate::sched::{self, ThreadRef};
 
 /// Threads one queue can hold. A thread that finds it full polls by yielding instead.
 const WAITERS: usize = 16;
 
-/// Threads waiting for one condition.
-pub(crate) struct WaitQueue {
-    waiters: SpinLock<[Option<ThreadRef>; WAITERS]>,
+/// The kernel's scheduler and clock, as a wait queue sees them.
+struct KernelThreads;
+
+impl wait::Scheduler for KernelThreads {
+    type Thread = ThreadRef;
+
+    fn current_thread(&self) -> Option<ThreadRef> {
+        sched::current_thread()
+    }
+
+    fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R {
+        cpu::without_interrupts(f)
+    }
+
+    fn block(&self) {
+        sched::block();
+    }
+
+    fn block_until(&self, deadline: u64) {
+        sched::block_until(deadline);
+    }
+
+    fn yield_now(&self) {
+        sched::yield_now();
+    }
+
+    fn wake(&self, thread: ThreadRef) {
+        sched::wake(thread);
+    }
+
+    fn monotonic_nanos(&self) -> u64 {
+        crate::time::monotonic_nanos()
+    }
 }
+
+/// Threads waiting for one condition.
+pub(crate) struct WaitQueue(wait::WaitQueue<ThreadRef, WAITERS>);
 
 impl WaitQueue {
     pub(crate) const fn new() -> Self {
-        Self {
-            waiters: SpinLock::new([None; WAITERS]),
-        }
+        Self(wait::WaitQueue::new())
     }
 
     /// Returns once `condition()` holds, blocking the running kernel thread meanwhile.
     /// `condition` runs under this queue's lock, with interrupts disabled. Returns how often
     /// the thread blocked. The boot or idle flow, which cannot block, polls by yielding.
     pub(crate) fn wait_until(&self, condition: impl Fn() -> bool) -> u64 {
-        let me = sched::current_thread();
-        let mut blocked = 0;
-        loop {
-            let registered = cpu::without_interrupts(|| {
-                let mut waiters = self.waiters.lock();
-                if condition() {
-                    // Leave no registration behind (a wake-up that raced with the
-                    // condition becoming true is harmless: the next block consumes it).
-                    if let Some(slot) = waiters.iter_mut().find(|w| **w == me && me.is_some()) {
-                        *slot = None;
-                    }
-                    return None;
-                }
-                let Some(thread) = me else {
-                    return Some(false);
-                };
-                if waiters.contains(&Some(thread)) {
-                    return Some(true);
-                }
-                match waiters.iter_mut().find(|w| w.is_none()) {
-                    Some(free) => {
-                        *free = Some(thread);
-                        Some(true)
-                    }
-                    None => Some(false),
-                }
-            });
-            match registered {
-                None => return blocked,
-                Some(true) => {
-                    sched::block();
-                    blocked += 1;
-                }
-                Some(false) => sched::yield_now(),
-            }
-        }
+        self.0.wait_until(&KernelThreads, condition)
     }
 
     /// As [`WaitQueue::wait_until`], but gives up when the monotonic clock reaches
@@ -91,65 +91,25 @@ impl WaitQueue {
         condition: impl Fn() -> bool,
         deadline: u64,
     ) -> Result<u64, TimedOut> {
-        let me = sched::current_thread();
-        let mut blocked = 0;
-        loop {
-            let step = cpu::without_interrupts(|| {
-                let mut waiters = self.waiters.lock();
-                let done = condition();
-                if done || crate::time::monotonic_nanos() >= deadline {
-                    if let Some(slot) = waiters.iter_mut().find(|w| **w == me && me.is_some()) {
-                        *slot = None;
-                    }
-                    return Step::Finished(done);
-                }
-                let Some(thread) = me else {
-                    return Step::Poll;
-                };
-                if waiters.contains(&Some(thread)) {
-                    return Step::Block;
-                }
-                match waiters.iter_mut().find(|w| w.is_none()) {
-                    Some(free) => {
-                        *free = Some(thread);
-                        Step::Block
-                    }
-                    None => Step::Poll,
-                }
-            });
-            match step {
-                Step::Finished(true) => return Ok(blocked),
-                Step::Finished(false) => return Err(TimedOut),
-                Step::Block => {
-                    sched::block_until(deadline);
-                    blocked += 1;
-                }
-                Step::Poll => sched::yield_now(),
-            }
-        }
+        self.0
+            .wait_until_deadline(&KernelThreads, condition, deadline)
     }
 
     /// Wakes one waiter, if there is one; returns whether there was.
     pub(crate) fn wake_one(&self) -> bool {
-        let thread =
-            cpu::without_interrupts(|| self.waiters.lock().iter_mut().find_map(Option::take));
-        if let Some(t) = thread {
-            sched::wake(t);
-        }
-        thread.is_some()
+        self.0.wake_one(&KernelThreads)
     }
-}
 
-/// A timed wait whose deadline passed with its condition still false.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TimedOut;
-
-/// What one round of a timed wait decided.
-enum Step {
-    /// The condition held (`true`), or the deadline passed (`false`).
-    Finished(bool),
-    Block,
-    Poll,
+    /// Wakes every waiter (each re-checks its own condition) and returns how many of them
+    /// were blocked on another processor, and so took an IPI to wake.
+    pub(crate) fn wake_all(&self) -> usize {
+        self.0
+            .take_all(&KernelThreads)
+            .into_iter()
+            .flatten()
+            .filter(|&thread| sched::wake(thread))
+            .count()
+    }
 }
 
 /// The ring the producer fills and the consumer drains.
@@ -226,6 +186,11 @@ static TURN: AtomicU64 = AtomicU64::new(0);
 static PING: WaitQueue = WaitQueue::new();
 static PONG: WaitQueue = WaitQueue::new();
 static PING_CYCLES: AtomicU64 = AtomicU64::new(0);
+/// Runs of the ping-pong [`prove_ping_pong`] may make: an extra one only after a run over
+/// the bound that shows a disturbance (`judge_round_trips`). A generous budget costs
+/// nothing where it is not used: an undisturbed boot pays for one run, and every run has
+/// the same bound to meet.
+const PING_ATTEMPTS: u32 = 8;
 
 extern "sysv64" fn pinger(_: u64) -> ! {
     let start = rdtsc();
@@ -287,7 +252,7 @@ extern "sysv64" fn timed_waiter(which: u64) -> ! {
 
 /// A timed wait that nobody ends must time out at its deadline (within two ticks), and one
 /// that is signalled first must return then, long before its deadline.
-fn prove_timed(com1: &mut Console, far: usize, tsc_hz: u64) -> bool {
+fn prove_timed(com1: &mut Console, far: CpuIndex, tsc_hz: u64) -> bool {
     let before = FINISHED.load(Ordering::Acquire);
     let spawned = [
         sched::spawn(far, timed_waiter, 0),
@@ -340,21 +305,107 @@ fn prove_timed(com1: &mut Console, far: usize, tsc_hz: u64) -> bool {
     ok
 }
 
+/// One run of the ping-pong, as the boot flow measured it.
+struct PingPongRun {
+    /// Whether both threads finished within 5 s.
+    done: bool,
+    /// The mean round trip, in microseconds.
+    mean: u64,
+    /// How much of the run the boot flow went without a turn, in parts per thousand.
+    away: u64,
+}
+
+/// Starts the two threads of the ping-pong on `bsp` and `far`, waits at most 5 s for them
+/// and returns what the run measured, or `None` if a thread could not be spawned.
+fn run_ping_pong(bsp: CpuIndex, far: CpuIndex, tsc_hz: u64) -> Option<PingPongRun> {
+    TURN.store(0, Ordering::Release);
+    let before = FINISHED.load(Ordering::Acquire);
+    sched::spawn(bsp, pinger, 0).ok()?;
+    sched::spawn(far, ponger, 0).ok()?;
+    let finished = || FINISHED.load(Ordering::Acquire) == before + 2;
+    let start = rdtsc();
+    let away = sched::yield_until_away(finished, tsc_hz, 5);
+    let elapsed = rdtsc().wrapping_sub(start);
+    Some(PingPongRun {
+        done: finished(),
+        mean: PING_CYCLES.load(Ordering::Relaxed) / ROUNDS / (tsc_hz / 1_000_000).max(1),
+        away: per_mille(away, elapsed),
+    })
+}
+
+/// Proves a thread blocked on another processor is woken at once by its IPI, not at that
+/// processor's next timer tick: two threads pass a turn back and forth [`ROUNDS`] times,
+/// each waking the other, and a round trip must average under
+/// [`framekernel::runqueue::ROUND_TRIP_LIMIT_MICROS`] (woken only by the other's timer
+/// tick, it would take milliseconds).
+///
+/// On a loaded host a virtual CPU is descheduled for milliseconds, and a stall that falls
+/// into a round trip lengthens it by as much, so the mean of a run can be the host's tail
+/// and not the kernel. Such a run says nothing either way, and is measured again, at most
+/// [`PING_ATTEMPTS`] runs in all, each against the same bound. What earns the repeat is the
+/// boot flow going without a turn for at least a tenth of the run. A thread on its
+/// processor can produce that reading just by running, so it can earn a repeat and never a
+/// pass: every run that passes has its mean under the bound. A run over the bound without
+/// that reading fails at once, and so does any run on one processor, where the boot flow
+/// takes turns with the two threads and the reading says nothing about the host.
+fn prove_ping_pong(com1: &mut Console, bsp: CpuIndex, far: CpuIndex, tsc_hz: u64) -> bool {
+    let mut attempts = 0;
+    let (run, ok) = loop {
+        attempts += 1;
+        let Some(run) = run_ping_pong(bsp, far, tsc_hz) else {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: wait queues: cannot spawn: wait queues failed"
+            );
+            return false;
+        };
+        let away = if far == bsp { 0 } else { run.away };
+        let verdict = if run.done {
+            judge_round_trips(run.mean, away)
+        } else {
+            RoundTrips::Fail
+        };
+        if verdict != RoundTrips::Repeat || attempts == PING_ATTEMPTS {
+            break (run, verdict == RoundTrips::Pass);
+        }
+    };
+    let (mean, away) = (run.mean, run.away);
+    let failed = if ok { "" } else { ": wait queues failed" };
+    if run.done && far == bsp {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips, {mean} us each (one processor){failed}"
+        );
+    } else if run.done {
+        let retried = if attempts > 1 {
+            " (after a stalled run)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            com1,
+            "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips, {mean} us each, woken by IPI (boot flow away for {away} per mille of the run, run {attempts} of {PING_ATTEMPTS}){retried}{failed}"
+        );
+    } else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips did not finish within 5 s: wait queues failed"
+        );
+    }
+    ok
+}
+
 /// Proves the wait queues:
 /// - a producer on one processor sends [`ITEMS`] numbers through an 8-slot ring to a
 ///   consumer on another, each blocking when the ring is full or empty: every item must
 ///   arrive, in order, within 5 s;
 /// - two threads on different processors pass a turn back and forth [`ROUNDS`] times,
-///   each waking the other: a round trip must average under 2 ms. Woken only by the
-///   other's timer tick (10 ms), a round trip would take milliseconds.
+///   each waking the other ([`prove_ping_pong`]);
+/// - timed waits time out when nobody signals them and return early when somebody does.
 ///
 /// Runs from the boot flow with every scheduler active.
-pub(crate) fn prove(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -> bool {
-    let far = cpus
-        .iter()
-        .map(|&id| id as usize)
-        .find(|&id| id != bsp)
-        .unwrap_or(bsp);
+pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let spawned = [
         sched::spawn(far, producer, 0),
         sched::spawn(bsp, consumer, 0),
@@ -386,35 +437,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[u32], bsp: usize, tsc_hz: u64) -
             ": wait queues failed"
         }
     );
-    let spawned = [sched::spawn(bsp, pinger, 0), sched::spawn(far, ponger, 0)];
-    if spawned.iter().any(Result::is_err) {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: wait queues: cannot spawn: wait queues failed"
-        );
-        return false;
-    }
-    sched::yield_until(|| FINISHED.load(Ordering::Acquire) == 4, tsc_hz, 5);
-    let done = FINISHED.load(Ordering::Acquire) == 4;
-    let each = PING_CYCLES.load(Ordering::Relaxed) / ROUNDS / (tsc_hz / 1_000_000).max(1);
-    let ping_ok = done && each < 2000;
-    let where_ = if far == bsp {
-        " (one processor)"
-    } else {
-        ", woken by IPI"
-    };
-    if done {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips, {each} us each{where_}{}",
-            if ping_ok { "" } else { ": wait queues failed" }
-        );
-    } else {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: wait queues: ping-pong between CPU {bsp} and CPU {far}: {ROUNDS} round trips did not finish within 5 s: wait queues failed"
-        );
-    }
+    let ping_ok = prove_ping_pong(com1, bsp, far, tsc_hz);
     let timed_ok = prove_timed(com1, far, tsc_hz);
     transfer_ok && ping_ok && timed_ok
 }

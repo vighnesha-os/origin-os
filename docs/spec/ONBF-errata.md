@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Applies to | `docs/spec/ONBF.md` v1.0 (design), accepted 2026-11-07 |
-| Status | **C1–C14 and G2–G5 decided by the owner on 2026-11-07. G1 and the readings below were decided the same day under the owner's instruction of 2026-11-07 to finalise the design with the recommended options.** |
+| Status | **C1–C14 and G2–G5 decided by the owner on 2026-11-07. G1 and the readings below were decided the same day under the owner's instruction of 2026-11-07 to finalise the design with the recommended options. O1, V1–V6 and O2–O5 were decided by the owner on 2026-11-08.** |
 | Found by | Implementing `runtime/onbf/format` (`onbf-format`) against §4, 2026-11-07 |
 | Byte layouts | Unchanged. Every item below is a validation rule or a missing definition, not a new field. |
 
@@ -41,6 +41,7 @@ ONBF-R6 requires that a file have exactly one valid reading, and §13 item 6 say
 | G4 | §4.3, §6.1 | Segment `mem_size` alignment, and the order and overlap of segment memory ranges, were not stated. | **Page-multiple, sorted, disjoint.** A SEGMENT's `mem_size`, like its `mem_offset`, is a multiple of 4 KiB. SEGMENT sections appear in ascending `mem_offset` order (table order) and never overlap. Unmapped gaps, such as guard pages, are allowed. Every segment ends within the 2 GiB image span (`mem_offset + mem_size ≤ 2^31`) in EXE, LIB and KRN. The Appendix A limit of 16 segments applies to EXE and LIB. | `onbf-format` (`MemoryLayout`, `SegmentOrder`, `SegmentSpan`, `TooManySegments`) |
 | G1 | §6.5, §4.4 | The SYM profile holds "DWARF and line tables", but §4.4 had no section kind for them. | **A new kind, `0x00F2 DWARF`, allowed only in SYM.** One section per DWARF section, never MAPPABLE (SYM is never mapped), so it may be compressed; REQUIRED like every section (G5). The SYM manifest's `dwarf_sections` key (25) lists `[section_index, name]` pairs in ascending index order, each name one of `.debug_info`, `.debug_abbrev`, `.debug_line`, `.debug_line_str`, `.debug_str`, `.debug_str_offsets`, `.debug_addr`, `.debug_rnglists`, `.debug_loclists`, `.debug_frame` and `.debug_aranges`, each at most once. ONBF stays 1.0: no SYM image existed before this decision. | `onbf-format` (`Kind::Dwarf`, SYM only) |
 | G5 | §4.3, §4.4 | After C13, REQUIRED no longer changed anything for a v1 reader except on MANIFEST. | **REQUIRED is set on every section.** That is truthful in v1, because every section must be understood, and gives one encoding. Writers (`onbf-pack`, the SDK tools) always set it. The bit keeps its meaning in case a future major version brings optional kinds back. | `onbf-format` (`RequiredNotSet`) |
+| O1 | S3, §5 | A statement's `id` is `text (NFC)`, but the signature-block parser has no Unicode normalization tables. Found by the multi-fault soak (2026-11-08). | **Decided 2026-11-08: non-empty printable ASCII (0x20–0x7E)**, the rule R4 applies to the manifest's text, which is trivially NFC. An `id` is a machine identifier; human-readable names belong in localized metadata. | `onbf-format` signature-block parser (`SignatureBlock::parse`); the Package Service's ID-namespace checks |
 
 ## Readings applied without a separate decision
 
@@ -71,12 +72,33 @@ Applied in code on 2026-11-07 and pinned by tests. **Accepted as normative the s
 | M1 | `origin-crypto`, ML-DSA | Strict FIPS 204 verification, first failure wins: context > 255 bytes; HintBitUnpack per polynomial (count range, then strictly increasing positions), then non-zero padding; ‖z‖∞ ≥ γ1 − β; c̃ mismatch. SampleInBall uses all λ/4 bytes of c̃; the ExpandA nonce is ρ ‖ column ‖ row; rejection loops are unbounded (no Appendix C bound). The host signer must produce only signatures this accepts. |
 | L1 | loader, boot info 0.2 | A RELRO segment is passed to the kernel without write access, because the loader has applied every relocation (ADR-0002 B4). |
 
+## Decided readings of §7 (owner, 2026-11-08)
+
+Found while wiring signature verification into the boot loader (`docs/research/2026-11-08-krn-signature-verification.md`). **Decided by the owner on 2026-11-08; normative.** Each was the recommended option; the column on the right is what was rejected.
+
+| # | Spec | Gap | Decision (applied) | Rejected |
+|---|---|---|---|---|
+| V1 | §7.1 `chain`, §7.4 | Whether an entry may have no certificates, and what that means. The parser accepts a chain of length 0, and §7.1 only says the chain ends "below a trust-store root". | **An empty chain means the signer's own key is in the trust store.** It is direct trust, for that key and role. A non-empty chain is refused until OKC validation exists; it is never ignored. | Forbid empty chains, once a Kernel CA exists. Then every signed KRN would need a chain, and no key could be trusted directly. |
+| V2 | §7.5, §7.1 | How many entries a KRN block holds, and whether others are ignored. | **Exactly one entry, in the role `origin-kernel`.** Any other block is refused, so nothing in the block goes unchecked (ONBF-R6). The rule can be relaxed later; a looser one could not be tightened without breaking images. | Accept extra entries if one trusted entry verifies. |
+| V3 | S3 key 3–4, K4 | The statement carries the "artifact's ID from its manifest", but a KRN manifest has no `id` and no version (K4). | **`id` is `origin.framekernel`; `version` is the release version from `origin-version.toml`.** The loader compares neither: §7.1 lists no check on them, and the namespace check belongs to chains. | Derive `id` from a new manifest key. That is an ABI change for no present use. |
+| V4 | §7.4, §8.1 | What a "root compiled into the loader" is in practice before Origin has keys. | **The trust store is a compiled-in list of (role, public key).** A release build's list is empty until Origin's own kernel key exists, so it refuses every kernel (the safe failure of B8). A build with the `test-trust-store` feature adds the test key of `boot/uefi/trust/` and warns on every boot, and such a build cannot be compiled with a non-zero build number (`origin-version.toml`), so a released loader cannot hold it. | Require a real key before any build can boot. Then no signed boot could be tested. |
+| V5 | ADR-0002 B8 | What developer mode does with a *signed* image. | **A signed image is verified in every mode.** Developer mode only allows an image with no signature at all: a signature that does not verify is a refusal, not a warning. | Skip verification in developer mode. |
+| V6 | §7.1, ONBF-R9 | `claimed_signing_time` is in the signed statement, and R9 forbids build timestamps in signed content. | **The caller supplies it** (`onbf-pack sign --signing-time`), and no tool reads the clock. It stays informational (§7.6). | Forbid the field in KRN statements. That changes S3. |
+
+## Decided for certificate chains (owner, 2026-11-08)
+
+These four were open gaps blocking chain validation. **Decided by the owner on 2026-11-08; normative when chains are built.** Chains are not implemented yet (V1 still refuses them).
+
+| # | Spec | Gap | Decision | Consequence |
+|---|---|---|---|---|
+| O2 | S4 key 10 | An OKC is signed with both algorithms, but S4 defined no ML-DSA context string for that signature (§7.1's `origin/onbf/1/<role>` is for signature-block entries). | **The context string is `origin/onbf/1/okc`.** One fixed string in the same family as the roles, so a certificate signature can never pass as a statement signature. | Issuance and validation use it. |
+| O3 | §7.6, §7.3 | `not_before`/`not_after` need trusted time, and the boot loader has only the firmware's RTC, which an attacker can set. | **Validity is checked against a signed time carried in signed release metadata**, as §7.6 asks for trusted time; never against the firmware clock. | Chain validation at boot waits for the SYS profile (§6.5), which carries that time. A chain cannot be checked before SYS exists. |
+| O4 | §7.1, S4 key 6 | How an `id_namespaces` entry matches a statement's `id` was undefined. | **Exact IDs only:** a certificate lists every ID it covers, and an `id` matches one entry by equality. | A publisher needs a new certificate for each new ID. §6.2's "falls inside a namespace" now means membership in that list. |
+| O5 | §7.4, §8.1 | What a trust-store *root* is. | **Bare public keys,** per role, compiled into the loader; a chain ends at one of them. | Root rotation (§7.4) can be layered on with signed metadata later. |
+
 ## Open gaps
 
-None at present.
-
-| # | Spec | Gap | Who needs it |
-|---|---|---|---|
+None at present. O1 is under "Decided gaps" and O2–O5 under "Decided for certificate chains".
 
 ## Observed by the bit-flip sweep
 

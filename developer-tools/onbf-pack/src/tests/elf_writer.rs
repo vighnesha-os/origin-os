@@ -9,6 +9,7 @@
 pub(crate) const PT_LOAD: u32 = 1;
 pub(crate) const PT_DYNAMIC: u32 = 2;
 pub(crate) const PT_GNU_STACK: u32 = 0x6474_E551;
+pub(crate) const PT_GNU_RELRO: u32 = 0x6474_E552;
 pub(crate) const R: u32 = 4;
 pub(crate) const RX: u32 = 5;
 pub(crate) const RW: u32 = 6;
@@ -37,6 +38,16 @@ impl Phdr {
             filesz: 0,
             memsz: 0,
             align: 8,
+        }
+    }
+
+    /// `PT_GNU_RELRO` over `[vaddr, vaddr + memsz)`, as `rust-lld` writes it.
+    pub(crate) fn relro(vaddr: u64, memsz: u64) -> Self {
+        Self {
+            vaddr,
+            memsz,
+            align: 1,
+            ..Self::other(PT_GNU_RELRO, R)
         }
     }
 }

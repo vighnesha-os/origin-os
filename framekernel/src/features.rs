@@ -388,6 +388,56 @@ mod tests {
         }
     }
 
+    /// Arbitrary CPUID values for every leaf: nothing panics, an absent leaf contributes no
+    /// feature, and the XSAVE size is what the leaf says or nothing (CLAUDE.md §72).
+    #[test]
+    fn any_cpuid_values_decode() {
+        use crate::testing::Rng;
+        let mut rng = Rng::new(0x4350_5549);
+        let words = |rng: &mut Rng| {
+            [
+                rng.edge_u32(),
+                rng.edge_u32(),
+                rng.edge_u32(),
+                rng.edge_u32(),
+            ]
+        };
+        for case in 0..crate::testing::cases(20_000) {
+            let id = Cpuid {
+                leaf1: words(&mut rng),
+                leaf7: words(&mut rng),
+                leaf_d0: words(&mut rng),
+                ext1: words(&mut rng),
+                max_basic: rng.edge_u32(),
+                max_ext: rng.edge_u32(),
+            };
+            let f = Features::decode(&id);
+            assert_eq!(
+                f.meets_baseline(),
+                f.missing_baseline().next().is_none(),
+                "case {case}"
+            );
+            if id.max_basic < 7 {
+                assert_eq!(
+                    Features::decode(&Cpuid {
+                        leaf7: [u32::MAX; 4],
+                        ..id
+                    }),
+                    f,
+                    "case {case}: leaf 7 ignored when absent"
+                );
+            }
+            let _ = wanted_xcr0(&f);
+            match xsave_area_size(&id) {
+                Some(n) => {
+                    assert!(id.max_basic >= 0x0D && n >= 576, "case {case}");
+                    assert_eq!(n, id.leaf_d0[2] as usize, "case {case}");
+                }
+                None => assert!(id.max_basic < 0x0D || id.leaf_d0[2] < 576, "case {case}"),
+            }
+        }
+    }
+
     #[test]
     fn missing_leaves_read_as_absent() {
         let id = Cpuid {

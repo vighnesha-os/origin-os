@@ -2,8 +2,13 @@
 name = "origin-sync"
 description = "Origin OS kernel synchronization primitives (no_std), stress-tested on the host"
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+# `loom` is deliberately not named here (CLAUDE.md §5, §60, §73, §75; owner decision 20):
+# `cargo xtask loom` adds it to a scratch copy of this crate in a workspace of its own
+# (`developer-tools/xtask/src/loom.rs`), so no build of this workspace resolves it.
 
 [lints]
 workspace = true

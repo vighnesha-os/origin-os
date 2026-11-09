@@ -31,6 +31,10 @@
 //! so a stale one never wakes a later thread in the same slot. A wake-up that arrives
 //! before its thread has blocked (it registered with a wait queue and is about to block) is
 //! kept, and its next `block` returns at once: no wake-up is lost.
+//!
+//! An interrupt or IPI that may have woken a thread goes through
+//! [`RunQueue::preempt_for_wake`]: it charges nothing, and switches only if a thread woken
+//! since the last choice should run now.
 
 /// Contexts one queue holds, its boot context included.
 pub const CAPACITY: usize = 16;
@@ -39,6 +43,55 @@ pub const STRIDE_ONE: u64 = 1 << 20;
 /// The weight of a context nobody chose one for; the largest weight.
 pub const DEFAULT_WEIGHT: u32 = 8;
 pub const MAX_WEIGHT: u32 = 1024;
+
+/// `part` of `whole`, in parts per thousand (a `whole` of 0 counts as 1).
+pub fn per_mille(part: u64, whole: u64) -> u64 {
+    part.saturating_mul(1000) / whole.max(1)
+}
+
+/// Whether a measured `share` (per mille) is near the share `weight` is due of `total`
+/// weights: within a third of that ideal, plus 15 per mille. This is the bound of the
+/// weighted-share boot proof (`sched::prove_weights`).
+pub fn share_near_weight(share: u64, weight: u32, total: u32) -> bool {
+    let ideal = u64::from(weight) * 1000 / u64::from(total.max(1));
+    share.abs_diff(ideal) <= ideal / 3 + 15
+}
+
+/// The bound of the wake-up ping-pong boot proof (`wait::prove`): the round trip between
+/// two processors, each woken by the other, in microseconds. Woken only by the other's
+/// timer tick (10 ms), a round trip would take milliseconds.
+pub const ROUND_TRIP_LIMIT_MICROS: u64 = 2000;
+
+/// A ping-pong run over the bound is measured again if the boot flow went without a turn
+/// for at least this much of it, in parts per thousand: on a loaded host, a virtual CPU
+/// descheduled. A tenth, as for the weighted-share proof. The boot flow shares its processor
+/// with a thread under test, which can produce the same reading just by running, so this can
+/// earn a repeat and nothing more.
+pub const DISTURBED_PER_MILLE: u64 = 100;
+
+/// What one run of the ping-pong boot proof calls for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundTrips {
+    /// The mean round trip is under the bound.
+    Pass,
+    /// Over the bound, on a run that shows a disturbance: it says nothing, measure again.
+    Repeat,
+    /// Over the bound, on a run that shows none.
+    Fail,
+}
+
+/// Judges a ping-pong run by its mean round trip (microseconds). A disturbance
+/// (`away_per_mille`, see [`DISTURBED_PER_MILLE`]) can earn a run over the bound a repeat;
+/// it can never pass one.
+pub const fn judge_round_trips(mean_micros: u64, away_per_mille: u64) -> RoundTrips {
+    if mean_micros < ROUND_TRIP_LIMIT_MICROS {
+        RoundTrips::Pass
+    } else if away_per_mille >= DISTURBED_PER_MILLE {
+        RoundTrips::Repeat
+    } else {
+        RoundTrips::Fail
+    }
+}
 
 /// Why a request was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +124,8 @@ pub struct RunQueue {
     generation: [u32; CAPACITY],
     /// A wake-up that arrived while the slot's thread was not blocked.
     wake_pending: [bool; CAPACITY],
+    /// The slots a wake-up made ready since this queue last chose what to run.
+    woken: [bool; CAPACITY],
     /// Each slot's weight and pass (stride scheduling).
     weight: [u32; CAPACITY],
     pass: [u64; CAPACITY],
@@ -97,6 +152,7 @@ impl RunQueue {
             state,
             generation: [0; CAPACITY],
             wake_pending: [false; CAPACITY],
+            woken: [false; CAPACITY],
             weight: [DEFAULT_WEIGHT; CAPACITY],
             pass: [0; CAPACITY],
             idle: false,
@@ -240,21 +296,56 @@ impl RunQueue {
         }
         let ready = |i: usize| self.state.get(i) == Some(&State::Ready);
         let others = (1..CAPACITY).any(ready);
-        let mut next = 0;
-        let mut best = u64::MAX;
-        for i in (1..=CAPACITY).map(|k| (self.current + k) % CAPACITY) {
-            if !ready(i) || (self.idle && i == 0 && others) {
-                continue;
-            }
-            let pass = self.pass.get(i).copied().unwrap_or(u64::MAX);
-            if pass < best {
-                best = pass;
-                next = i;
-            }
-        }
+        let next = self
+            .lowest_pass(|i| ready(i) && !(self.idle && i == 0 && others))
+            .unwrap_or(0);
+        // Whatever was woken has had its say in this choice.
+        self.woken = [false; CAPACITY];
         if next != self.current {
             self.switches += 1;
         }
+        self.current = next;
+        self.saved.get(next).copied().unwrap_or(interrupted)
+    }
+
+    /// Of the contexts `eligible` admits, the one with the lowest pass, ties going
+    /// round-robin from the current one (so the current one wins only if alone at the lowest).
+    fn lowest_pass(&self, eligible: impl Fn(usize) -> bool) -> Option<usize> {
+        let mut found = None;
+        let mut best = u64::MAX;
+        for i in (1..=CAPACITY).map(|k| (self.current + k) % CAPACITY) {
+            let pass = self.pass.get(i).copied().unwrap_or(u64::MAX);
+            if eligible(i) && pass < best {
+                best = pass;
+                found = Some(i);
+            }
+        }
+        found
+    }
+
+    /// An interrupt or IPI that may have woken a thread arrived while the context whose
+    /// frame is at `interrupted` ran. That context is charged nothing. If a thread woken
+    /// since the last choice should run now, it runs: the woken one with the lowest pass, if
+    /// the running context is the idle one or its pass is no lower than that thread's (the
+    /// woken thread winning a tie). A ready context that was not woken is not considered: it
+    /// waits for the next tick. Otherwise `interrupted` is returned and nothing here changes.
+    pub fn preempt_for_wake(&mut self, interrupted: u64) -> u64 {
+        let woken = core::mem::replace(&mut self.woken, [false; CAPACITY]);
+        let pass = |slot: usize| self.pass.get(slot).copied().unwrap_or(u64::MAX);
+        let running = pass(self.current);
+        let idle = self.idle && self.current == 0;
+        let next = self
+            .lowest_pass(|i| {
+                woken.get(i) == Some(&true) && self.state.get(i) == Some(&State::Ready)
+            })
+            .filter(|&slot| idle || pass(slot) <= running);
+        let Some(next) = next else {
+            return interrupted;
+        };
+        if let Some(slot) = self.saved.get_mut(self.current) {
+            *slot = interrupted;
+        }
+        self.switches += 1;
         self.current = next;
         self.saved.get(next).copied().unwrap_or(interrupted)
     }
@@ -326,6 +417,9 @@ impl RunQueue {
                     *s = State::Ready;
                 }
                 self.admit(slot, floor);
+                if let Some(w) = self.woken.get_mut(slot) {
+                    *w = true;
+                }
                 true
             }
             Some(State::Ready | State::Sleeping(_)) => {
@@ -595,6 +689,198 @@ mod tests {
         assert_eq!(q.weight(c), 1);
         q.set_weight(c, u32::MAX);
         assert_eq!(q.weight(c), MAX_WEIGHT);
+    }
+
+    #[test]
+    fn the_share_bound_is_the_one_the_boot_proof_always_used() {
+        assert_eq!(per_mille(1, 21), 47);
+        assert_eq!(per_mille(4, 21), 190);
+        assert_eq!(per_mille(16, 21), 761);
+        assert_eq!(per_mille(0, 0), 0, "nothing of nothing is nothing");
+        // Ideal 47: 17 to 77 per mille; 190: 112 to 268; 761: 493 to 1029.
+        for (weight, low, high) in [(1, 17, 77), (4, 112, 268), (16, 493, 1029)] {
+            assert!(share_near_weight(low, weight, 21), "{weight}: {low}");
+            assert!(share_near_weight(high, weight, 21), "{weight}: {high}");
+            assert!(!share_near_weight(low - 1, weight, 21), "{weight}: below");
+            assert!(!share_near_weight(high + 1, weight, 21), "{weight}: above");
+        }
+    }
+
+    #[test]
+    fn a_disturbance_earns_a_repeat_and_never_a_pass() {
+        assert_eq!(ROUND_TRIP_LIMIT_MICROS, 2000);
+        // Under the bound passes, disturbed or not.
+        assert_eq!(judge_round_trips(1999, 0), RoundTrips::Pass);
+        assert_eq!(judge_round_trips(1999, 1000), RoundTrips::Pass);
+        // At or over it, a run that shows no disturbance fails at once...
+        assert_eq!(judge_round_trips(2000, 0), RoundTrips::Fail);
+        assert_eq!(
+            judge_round_trips(2000, DISTURBED_PER_MILLE - 1),
+            RoundTrips::Fail
+        );
+        assert_eq!(judge_round_trips(50_000, 0), RoundTrips::Fail);
+        // ... and one that shows a disturbance is measured again, however disturbed.
+        assert_eq!(
+            judge_round_trips(2000, DISTURBED_PER_MILLE),
+            RoundTrips::Repeat
+        );
+        assert_eq!(judge_round_trips(50_000, 1000), RoundTrips::Repeat);
+        // Over any mix of inputs, only a mean under the bound passes.
+        for mean in [0, 1, 1999, 2000, 2001, 1_000_000, u64::MAX] {
+            for away in [0, 99, 100, 101, 1000, u64::MAX] {
+                assert_eq!(
+                    judge_round_trips(mean, away) == RoundTrips::Pass,
+                    mean < 2000
+                );
+            }
+        }
+        // The tenth of a run away that earns a repeat.
+        assert_eq!(DISTURBED_PER_MILLE, 100);
+        assert_eq!(per_mille(99, 1000), 99);
+        assert_eq!(per_mille(100, 1000), DISTURBED_PER_MILLE);
+    }
+
+    #[test]
+    fn an_interrupt_that_woke_nothing_charges_nothing_and_resumes_the_same_context() {
+        let mut q = RunQueue::new();
+        q.push(0xA000).unwrap();
+        q.push(0xB000).unwrap();
+        assert_eq!(q.tick(0x1000), 0xA000);
+        let before = (q.switches(), q.pass);
+        for _ in 0..1000 {
+            assert_eq!(
+                q.preempt_for_wake(0xA100),
+                0xA100,
+                "the same thread goes on"
+            );
+        }
+        assert_eq!((q.switches(), q.pass), before, "no switch, nothing charged");
+    }
+
+    #[test]
+    fn interrupts_change_neither_the_shares_nor_the_number_of_switches() {
+        let mut quiet = RunQueue::new();
+        let mut busy = RunQueue::new();
+        for q in [&mut quiet, &mut busy] {
+            q.set_idle(true);
+            for (i, w) in [1u32, 4, 16].into_iter().enumerate() {
+                q.push_weighted(0x1000 * (i as u64 + 1), w).unwrap();
+            }
+        }
+        // 21 quanta make one full cycle of strides 16 : 4 : 1. On `busy`, the running thread
+        // also takes ten interrupts every quantum, none of them waking anything.
+        let mut runs = [0u32; CAPACITY];
+        let mut running = busy.saved[busy.current()];
+        for _ in 0..2100 {
+            quiet.tick(quiet.saved[quiet.current()]);
+            running = busy.tick(running);
+            for _ in 0..10 {
+                assert_eq!(busy.preempt_for_wake(running), running);
+            }
+            runs[busy.current()] += 1;
+        }
+        assert_eq!((runs[0], runs[1], runs[2], runs[3]), (0, 100, 400, 1600));
+        assert_eq!(busy.switches(), quiet.switches());
+        assert_eq!(busy.pass, quiet.pass);
+    }
+
+    #[test]
+    fn a_woken_thread_that_should_run_now_takes_over_uncharged() {
+        let mut q = RunQueue::new();
+        q.set_idle(true);
+        let a = q.push(0xA000).unwrap();
+        q.push(0xB000).unwrap();
+        let generation = q.generation(a);
+        assert_eq!(q.tick(0x1000), 0xA000);
+        assert_eq!(q.block(0xA100), Ok(0xB000), "A blocks; B runs");
+        let before = q.pass;
+        assert!(q.wake(a, generation));
+        assert_eq!(q.preempt_for_wake(0xB100), 0xA100, "A is level: it runs");
+        assert_eq!(q.current(), a);
+        assert_eq!(q.pass, before, "and neither of them is charged for it");
+        // B's interrupted frame was saved: it is B's turn again after A blocks.
+        assert_eq!(q.block(0xA200), Ok(0xB100));
+    }
+
+    #[test]
+    fn a_woken_thread_behind_the_running_context_waits_for_its_turn() {
+        let mut q = RunQueue::new();
+        q.set_idle(true);
+        let a = q.push(0xA000).unwrap();
+        q.push(0xB000).unwrap();
+        let generation = q.generation(a);
+        assert_eq!(q.tick(0x1000), 0xA000);
+        assert_eq!(q.block(0xA100), Ok(0xB000));
+        q.pass[a] = 5 * STRIDE_ONE; // A has used far more than B
+        let switches = q.switches();
+        assert!(q.wake(a, generation));
+        assert_eq!(
+            q.preempt_for_wake(0xB100),
+            0xB100,
+            "not ahead of B: B goes on"
+        );
+        assert_eq!(q.switches(), switches);
+        // It is ready all the same: B runs until A's pass is the lowest.
+        let mut running = 0xB100;
+        for _ in 0..50 {
+            running = q.tick(running);
+            if q.current() == a {
+                break;
+            }
+        }
+        assert_eq!(q.current(), a, "A gets its turn at a tick");
+    }
+
+    #[test]
+    fn the_idle_context_gives_way_to_any_woken_thread_whatever_its_pass() {
+        let mut q = RunQueue::new();
+        q.set_idle(true);
+        let a = q.push(0xA000).unwrap();
+        let generation = q.generation(a);
+        assert_eq!(q.tick(0x1000), 0xA000);
+        assert_eq!(q.block(0xA100), Ok(0x1000), "A blocks; only idle is left");
+        q.pass[a] = 1 << 40;
+        q.pass[0] = 0;
+        assert!(q.wake(a, generation));
+        assert_eq!(q.preempt_for_wake(0x1100), 0xA100);
+        assert_eq!(q.current(), a);
+    }
+
+    #[test]
+    fn the_woken_thread_wins_a_tie_ahead_of_another_ready_one() {
+        let mut q = RunQueue::new();
+        q.set_idle(true);
+        let woken = q.push(0xA000).unwrap();
+        let running = q.push(0xB000).unwrap();
+        let other = q.push(0xC000).unwrap();
+        let generation = q.generation(woken);
+        assert_eq!(q.tick(0x1000), 0xA000);
+        assert_eq!(q.block(0xA100), Ok(0xB000));
+        assert_eq!(q.current(), running);
+        assert_eq!(q.pass[running], q.pass[other]);
+        assert!(q.wake(woken, generation));
+        assert_eq!(q.pass[woken], q.pass[running]);
+        // `other` comes first round-robin from `running`, but only `woken` was woken.
+        assert_eq!(q.preempt_for_wake(0xB100), 0xA100);
+        assert_eq!(q.current(), woken);
+    }
+
+    #[test]
+    fn a_wake_up_a_later_choice_has_seen_does_not_preempt_again() {
+        let mut q = RunQueue::new();
+        q.set_idle(true);
+        let a = q.push(0xA000).unwrap();
+        q.push(0xB000).unwrap();
+        let generation = q.generation(a);
+        assert_eq!(q.tick(0x1000), 0xA000);
+        assert_eq!(q.block(0xA100), Ok(0xB000));
+        assert!(q.wake(a, generation));
+        // The next timer tick chooses before the IPI arrives; the IPI then finds nothing.
+        q.tick(0xB100);
+        let current = q.current();
+        let switches = q.switches();
+        assert_eq!(q.preempt_for_wake(0xF000), 0xF000);
+        assert_eq!((q.current(), q.switches()), (current, switches));
     }
 
     #[test]

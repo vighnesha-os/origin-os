@@ -111,6 +111,7 @@ mod tests {
             direct_map_base: 0xFFFF_8000_0000_0000,
             kernel_virtual_base: 0xFFFF_FFFF_8000_0000,
             flags: 1,
+            framebuffer: origin_boot_info::Framebuffer::NONE,
         }
     }
 

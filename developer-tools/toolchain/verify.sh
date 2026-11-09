@@ -359,4 +359,12 @@ out="$WORK/qemu.txt"
 } > "$out" 2>&1
 record INFO "QEMU and x86-64 UEFI firmware (needed from M1; install separately)" "$out"
 
+# ---------------------------------------------------------------- OpenSSL (test cross-checks only)
+out="$WORK/openssl.txt"
+{
+  if have openssl; then openssl version
+  else echo "openssl: not installed"; fi
+} > "$out" 2>&1
+record INFO "OpenSSL, 3.5 or later with ML-DSA (optional: cross-checks of the signer and verifier; install separately)" "$out"
+
 finish

@@ -5,9 +5,11 @@ use crate::{BLOCK_SIZE, Error, HASH_SIZE, MAX_LEVELS, Shape, leaf_hash, node_has
 /// Remembers hash blocks that have already been verified, so later blocks stop at the first
 /// trusted ancestor instead of re-hashing up to the root (§4.6).
 ///
-/// An entry is valid only for the exact MERKLE-section bytes it was verified against. The
-/// caller must keep that memory unchanged, for example in read-only kernel pages, and must
-/// clear the cache whenever the bytes are reloaded.
+/// An entry is valid only for the tree it was verified against: those exact MERKLE-section
+/// bytes and that content size. A hit ends the walk before the root, which is what binds
+/// the content size. The caller must keep that memory unchanged, for example in read-only
+/// kernel pages, and must clear the cache whenever the bytes are reloaded or the cache is
+/// used for another tree.
 pub trait TrustCache {
     /// True if hash block `index` of `level` was verified before.
     fn is_trusted(&self, level: u8, index: u64) -> bool;

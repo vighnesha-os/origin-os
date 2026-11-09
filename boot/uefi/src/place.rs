@@ -24,10 +24,19 @@ pub enum PlaceError {
     Misaligned(u64),
     /// A relocation slot is not inside the content of a writable, non-executable segment.
     NotWritable(u64),
-    /// `slot + base` overflows.
+    /// A relocation location runs past the top of the address space.
     Overflow(u64),
     /// The image has more segments than the boot info can describe.
     TooManySegments,
+}
+
+/// CR4.LA57 (Intel SDM Vol. 3A §2.5): the processor walks 5-level tables.
+const CR4_LA57: u64 = 1 << 12;
+
+/// Whether `cr4` has 5-level paging on. The loader's tables are 4-level (ADR-0004 H1): with
+/// LA57 set the processor would walk their root as a PML5 and fault with no way to report it.
+pub const fn five_level_paging(cr4: u64) -> bool {
+    cr4 & CR4_LA57 != 0
 }
 
 /// The boot-info access bits for a segment with ONBF `flags`. RELRO drops write access:
@@ -105,7 +114,9 @@ fn writable_slot(image: &Image<'_>, rva: u64) -> bool {
     })
 }
 
-/// Adds `base` to the u64 at `rva` in `dest`, after checking the slot.
+/// Adds `base` to the u64 at `rva` in `dest`, after checking the slot. The addition wraps:
+/// a negative addend is stored as u64 two's complement (errata P5), so a slot legitimately
+/// holds a value that only comes back into range once the base is added.
 fn relocate(
     writable: &impl Fn(u64) -> bool,
     dest: &mut [u8],
@@ -125,9 +136,7 @@ fn relocate(
         .ok_or(PlaceError::NotWritable(rva))?;
     let mut word = [0u8; 8];
     copy(&mut word, slot);
-    let value = u64::from_le_bytes(word)
-        .checked_add(base)
-        .ok_or(PlaceError::Overflow(rva))?;
+    let value = u64::from_le_bytes(word).wrapping_add(base);
     copy(slot, &value.to_le_bytes());
     Ok(())
 }
@@ -202,6 +211,11 @@ pub fn place(image: &Image<'_>, dest: &mut [u8], base: u64) -> Result<u64, Place
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::AtomicU64;
+    use onbf_format::ParseOptions;
+    use origin_boot_info::{MemoryRegion, RegionKind, SEGMENT_READ};
+    use origin_paging::layout::{self, Placement};
+    use origin_paging::{Table, TablePool};
 
     const BASE: u64 = 0x20_0000;
 
@@ -219,6 +233,120 @@ mod tests {
     }
 
     const ALL: fn(u64) -> bool = |rva| rva + 8 <= 4096;
+
+    /// A developer-mode KRN container: an 8-byte manifest, an RX page, a RELRO page, an RW page
+    /// and a RELOCS section with one slot in each writable page. Digests are not looked at here.
+    fn relro_image() -> Vec<u8> {
+        let code = Flags::REQUIRED | Flags::MAPPABLE | Flags::READ | Flags::EXECUTE;
+        let relro = Flags::REQUIRED | Flags::MAPPABLE | Flags::READ | Flags::WRITE | Flags::RELRO;
+        let data = Flags::REQUIRED | Flags::MAPPABLE | Flags::READ | Flags::WRITE;
+        let (manifest, relocs) = (4096usize, 16448usize);
+        let mut out = vec![0u8; relocs + 16];
+        out[..8].copy_from_slice(&onbf_format::MAGIC);
+        out[8..10].copy_from_slice(&1u16.to_le_bytes());
+        out[12..14].copy_from_slice(&(onbf_format::Profile::Krn as u16).to_le_bytes());
+        out[14..16].copy_from_slice(&128u16.to_le_bytes());
+        out[20..24].copy_from_slice(&5u32.to_le_bytes());
+        out[24..32].copy_from_slice(&128u64.to_le_bytes());
+        out[112..114].copy_from_slice(&1u16.to_le_bytes());
+        let mut entry = |i: usize, kind: u32, flags: u32, at: usize, len: u64, rva: u64| {
+            let e = 128 + 128 * i;
+            out[e..e + 4].copy_from_slice(&kind.to_le_bytes());
+            out[e + 4..e + 8].copy_from_slice(&flags.to_le_bytes());
+            out[e + 8..e + 16].copy_from_slice(&(at as u64).to_le_bytes());
+            out[e + 16..e + 24].copy_from_slice(&len.to_le_bytes());
+            out[e + 24..e + 32].copy_from_slice(&len.to_le_bytes());
+            out[e + 32..e + 40].copy_from_slice(&rva.to_le_bytes());
+            let mem_size = if kind == 0x10 { 4096 } else { len };
+            out[e + 40..e + 48].copy_from_slice(&mem_size.to_le_bytes());
+            out[e + 49] = u8::from(kind == 0x10); // integrity: Merkle
+            out[e + 52..e + 56].copy_from_slice(&onbf_format::NO_MERKLE.to_le_bytes());
+        };
+        entry(0, 0x01, Flags::REQUIRED, manifest, 8, 0);
+        entry(1, 0x10, code, 8192, 64, 0);
+        entry(2, 0x10, relro, 12288, 64, 0x1000);
+        entry(3, 0x10, data, 16384, 64, 0x2000);
+        entry(4, 0x11, Flags::REQUIRED, relocs, 16, 0);
+        // The two addends, and the RELR words naming their slots.
+        out[12288 + 16..12288 + 24].copy_from_slice(&0x10u64.to_le_bytes());
+        out[16384 + 32..16384 + 40].copy_from_slice(&0x20u64.to_le_bytes());
+        out[relocs..relocs + 8].copy_from_slice(&0x1010u64.to_le_bytes());
+        out[relocs + 8..relocs + 16].copy_from_slice(&0x2020u64.to_le_bytes());
+        out
+    }
+
+    /// ADR-0001 default 9, errata L1: the loader relocates a RELRO segment first, then hands it to
+    /// the kernel without write access, and the tables built from that list, the loader's and
+    /// (with the same `layout::build`) the kernel's own, map it read-only.
+    #[test]
+    fn a_relro_segment_is_relocated_and_then_mapped_read_only() {
+        let bytes = relro_image();
+        let options = ParseOptions {
+            developer_mode: true,
+            ..ParseOptions::default()
+        };
+        let image = Image::parse(&bytes, options).unwrap();
+        let virtual_base = 0xFFFF_FFFF_8460_0000u64;
+        let mut memory = vec![0u8; span(&image).unwrap() as usize];
+        assert_eq!(place(&image, &mut memory, virtual_base), Ok(2));
+        assert_eq!(
+            slot(&memory, 0x1010 / 8),
+            virtual_base + 0x10,
+            "the RELRO slot"
+        );
+        assert_eq!(
+            slot(&memory, 0x2020 / 8),
+            virtual_base + 0x20,
+            "the RW slot"
+        );
+
+        let mut list = [KernelSegment {
+            rva: 0,
+            pages: 0,
+            access: 0,
+            reserved: 0,
+        }; 16];
+        let count = kernel_segments(&image, &mut list).unwrap();
+        let list = &list[..count];
+        assert_eq!(
+            list.iter().map(|s| s.access).collect::<Vec<_>>(),
+            [
+                SEGMENT_READ | SEGMENT_EXECUTE,
+                SEGMENT_READ,
+                SEGMENT_READ | SEGMENT_WRITE
+            ]
+        );
+
+        let pool: Vec<Table> = (0..64)
+            .map(|_| core::array::from_fn(|_| AtomicU64::new(0)))
+            .collect();
+        let mut tables = TablePool::new(&pool, 0x80_0000);
+        let at = Placement {
+            direct_map_base: 0xFFFF_8040_0000_0000,
+            kernel_virtual_base: virtual_base,
+            kernel_physical_base: 0x20_0000,
+            stack_guard: 0,
+        };
+        let regions = [MemoryRegion {
+            base: 0x10_0000,
+            pages: 16,
+            kind: RegionKind::Usable as u32,
+            reserved: 0,
+        }];
+        let (space, _) = layout::build(&mut tables, &at, &regions, list).unwrap();
+        let relro = space.translate(&tables, virtual_base + 0x1010).unwrap();
+        assert!(!relro.writable && !relro.executable, "{relro:?}");
+        let data = space.translate(&tables, virtual_base + 0x2020).unwrap();
+        assert!(data.writable && !data.executable, "{data:?}");
+    }
+
+    #[test]
+    fn five_level_paging_is_bit_12_of_cr4() {
+        assert!(five_level_paging(1 << 12));
+        assert!(five_level_paging(u64::MAX));
+        assert!(!five_level_paging(0));
+        assert!(!five_level_paging(!(1 << 12)));
+    }
 
     #[test]
     fn segment_access_follows_the_flags_and_relro_drops_write() {
@@ -298,12 +426,20 @@ mod tests {
             apply_relr(&some, 0, &words(&[0, u64::MAX]), &mut small, BASE),
             Err(PlaceError::NotWritable(32))
         );
-        // An addend that overflows when relocated.
+    }
+
+    /// Errata P5: addends are u64 two's complement, so the loader adds with wrapping.
+    #[test]
+    fn a_negative_addend_wraps_to_its_address() {
+        let kernel_base = 0xFFFF_FFFF_8460_0000_u64;
         let mut d = dest();
-        d[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        d[..8].copy_from_slice(&(-0x1000_i64 as u64).to_le_bytes());
+        d[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(
-            apply_relr(&ALL, 0, &words(&[0]), &mut d, BASE),
-            Err(PlaceError::Overflow(0))
+            apply_relr(&ALL, 0, &words(&[0, 0b11]), &mut d, kernel_base),
+            Ok(2)
         );
+        assert_eq!(slot(&d, 0), kernel_base - 0x1000);
+        assert_eq!(slot(&d, 1), kernel_base - 1);
     }
 }

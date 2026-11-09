@@ -2,6 +2,7 @@
 name = "onbf-pack"
 description = "Converts linker output into ONBF images; this version writes KRN (docs/spec/ONBF.md §6.1.2, §6.5). Host only."
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
@@ -9,6 +10,8 @@ publish.workspace = true
 [dependencies]
 onbf-format.workspace = true
 onbf-merkle.workspace = true
+onbf-sign.workspace = true
+onbf-verify.workspace = true
 origin-crypto.workspace = true
 origin-version.workspace = true
 
