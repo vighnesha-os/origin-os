@@ -39,7 +39,7 @@
 | M4: process address spaces | own PML4 per process, shared kernel half, CR3 per thread | two-process isolation proof; negative control |
 | M4 groundwork: user mode | ring 3, one DPL-3 system-call gate and `syscall`, RSP0 per switch, user faults end the thread, NMI/#MC on IST | 5 user-program proofs, a self-NMI proof; four negative controls |
 | M4: real system calls between isolated processes (first slice of ADR-0005, 2026-11-08, merged 2026-11-09) | process objects; the system-call layer (dispatcher, status codes, copies against the caller's own tables, fault-safe); handles and channels through it, with transfer, rights that only shrink, and `wait_one` blocking and waking across CPUs; `swapgs`/`clac` at every boundary; `int 0x80` gone | ring-3 boot proofs in `boot-test`, `boot-matrix`, `boot-x2apic`; 31 negative controls; `origin-abi`, `handles`, `channel`, `usercopy` host-tested |
-| Clocks (§68) | monotonic TSC clock (rate proven against one RTC second; the proofs tolerate a loaded host), UTC wall clock from the CMOS RTC, TSC consistency across CPUs | boot-matrix; twelve negative controls (frozen and wrong-rate RTCs, a wrong PIT rate, a skewed AP, late timers and more) and three positive ones |
+| Clocks (§68) | monotonic TSC clock (rate proven against one RTC second; the proofs tolerate a loaded host), a floor on every read so no caller on any processor is ever given less than before (ADR-0012, Accepted), UTC wall clock from the CMOS RTC, TSC consistency across CPUs | boot-matrix; `prove_monotonic` with an in-boot control; Loom models; twelve negative controls (frozen and wrong-rate RTCs, a wrong PIT rate, a skewed AP, late timers and more) and three positive ones |
 | Serialized console | whole lines from every CPU; urgent path for exceptions and panics | xtask whole-log check; negative control |
 | TLB shootdown, global pages (ADR-0004 H5) | IPIs with per-request generations; kernel half global | every AP's read of an unmapped page faults; two negative controls |
 | Kernel wait queues | blocking, cross-CPU wake-ups by IPI, pending wake-ups | 10 000-item transfer in order; 44–73 µs ping-pong; two negative controls |
@@ -83,6 +83,6 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 
 | # | Decision | Blocks |
 |---|---|---|
-| — | Buy the first test machines ADR-0009 chose: #2, then #5 once its serial option is confirmed (H5) | The first physical boot (§74) |
+| — | The owner cannot buy machines for now. The steps that need the owner (sign-ups and small rentals) are in `docs/research/2026-11-09-testing-without-buying-hardware.md`; ADR-0009's choices (#2, then #5 once its serial option is confirmed, H5) stand for when that changes | The first physical boot (§74) |
 | — | Sheet items 30 and 31: ADR-0007's bus-mastering question and the Loom download's deviation (`docs/engineering/OWNER_DECISIONS.md`) | Accepting I12; an honest record |
 | — | Sheet item 39: whether to amend CLAUDE.md §48 and §70 to match ADR-0011 | Keeping the directive and the design in step |
