@@ -7,9 +7,9 @@
 //!   from `sdk/interfaces/origin.kernel.oidl`, through the generated crate `origin-syscalls`
 //!   (ADR-0011 N14). This module implements its `Calls` for [`Process`] and converts at that
 //!   boundary: the layers below keep `origin-abi`'s types.
-//! - The rights a handle must have are declared in the definition and enforced by the handle
-//!   table (`docs/spec/OIDL.md` §6), in `ipc` and `handles`, with the same rights; a host test
-//!   in `origin-syscalls` holds the two equal.
+//! - What a call asks of a handle, its rights and object type, is declared in the definition
+//!   and enforced by the handle table (`docs/spec/OIDL.md` §6): the decoder carries it here,
+//!   and [`need`] hands it to the lookup, so there is no second list of rights.
 //! - A call runs with interrupts on, on its thread's kernel stack, so a long copy or close
 //!   stays preemptible and shootdowns are served; every kernel lock it takes disables them
 //!   for the moment it is held.
