@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-08, as proposed (E1–E6, and the recommended answer to each of the three questions below; decision sheet items 27–29). It changes the boot-info structure (CLAUDE.md §84). The code is built and boot-tested under QEMU, and was merged into `claude/interesting-carson-ae7c83` on 2026-11-09 on the owner's word. Nothing here has shipped. **Amendments 1 and 2 (below, to E3) are Proposed**, not accepted: they record changes waiting for the owner's word. |
+| Status | **Accepted** by the owner on 2026-11-08, as proposed (E1–E6, and the recommended answer to each of the three questions below; decision sheet items 27–29). It changes the boot-info structure (CLAUDE.md §84). The code is built and boot-tested under QEMU, and was merged into `claude/interesting-carson-ae7c83` on 2026-11-09 on the owner's word. Nothing here has shipped. **Amendments 1 and 2 (below, to E3) were accepted by the owner on 2026-11-09**, as proposed (decision sheet items 52 and 53). |
 | Requires | CLAUDE.md §13 (checked parsing), §19 (boot-info structure, early diagnostics), §51 (font provenance), §58 (threat-model privileged interfaces), §69 (diagnostics), §74, rules 14, 30 and 40 |
 | Implements | ADR-0009 H6, third bullet: a console that does not depend on a 16550 at `0x3F8` |
 | Code | `boot/info` (`Framebuffer`), `boot/uefi` (the Graphics Output Protocol hand-off), `framekernel/paging` (the mapping), `framekernel/src/{fbconsole,font,spcr,serial,console}.rs`, `developer-tools/xtask` |
@@ -36,7 +36,7 @@ The loader maps the framebuffer's visible rows in the first page tables (ADR-000
 
 ### E3. The console: framebuffer first, then the UART
 
-Every line goes to the framebuffer, then to the UART, under the existing console lock. (Amendments 1 and 2, below, propose changing this order and sending a line a section at a time.) `framekernel::fbconsole` draws text through an abstract pixel sink, in 8 by 16 cells scaled by a whole number on panels taller than 1439 rows. Text never scrolls and the framebuffer is never read: the next line goes to the row below, painted first as a bar, and the screen wraps at the bottom. Scrolling would read or rewrite the whole screen for each line, with interrupts off, on memory that may be uncached. This way a line costs at most two rows of writes: its own and the bar's.
+Every line goes to the framebuffer, then to the UART, under the existing console lock. (Amendments 1 and 2, below, change this order and send a line a section at a time.) `framekernel::fbconsole` draws text through an abstract pixel sink, in 8 by 16 cells scaled by a whole number on panels taller than 1439 rows. Text never scrolls and the framebuffer is never read: the next line goes to the row below, painted first as a bar, and the screen wraps at the bottom. Scrolling would read or rewrite the whole screen for each line, with interrupts off, on memory that may be uncached. This way a line costs at most two rows of writes: its own and the bar's.
 
 ### E4. The UART: from the SPCR when the firmware names one
 
@@ -103,9 +103,9 @@ The framebuffer mapping is kernel-only, writable and never executable, in the ke
 2. Accept reserving the first 2 GiB of the MMIO window for the framebuffer (E2)? **Yes (2026-11-08).**
 3. Accept the UART policy: COM1 until the ACPI tables can be read, then the SPCR's UART with the earlier output replayed, 0x3F8 only when firmware gives nothing better (E4)? **Yes (2026-11-08).**
 
-## Amendment 1 (Proposed, 2026-11-09): the UART first, then the screen a section at a time
+## Amendment 1 (Accepted by the owner, 2026-11-09): the UART first, then the screen a section at a time
 
-**Status: Proposed, not accepted (branch `claude/epic-joliot-bff82c`, local, not pushed).** The code on that branch already behaves as below, because the question only arose while building it; the owner can accept or reject it when the branch comes to be merged, and E3 as accepted above stands until then.
+**Status: Accepted by the owner on 2026-11-09, as proposed (decision sheet item 52).** The code already behaved as below when it was accepted, because the question only arose while building it.
 
 **Why.** Under KVM on a real AMD EPYC 7763 (free GitHub runner, Actions run 42547942738) one console line took 4.3 to 4.6 ms on average and up to 10 ms at worst, with interrupts off. TCG, QEMU's software CPU, had hidden it (about 0.2 to 0.6 ms). The line is about 40,960 pixels of uncached memory, and one line can cost a whole 10 ms timer tick. E3's text ("Every line goes to the framebuffer, then to the UART, under the existing console lock") is what made a line one critical section.
 
@@ -127,9 +127,9 @@ The framebuffer mapping is kernel-only, writable and never executable, in the ke
 
 **Evidence.** `docs/engineering/SOURCE_PROVENANCE.md`, "The console: a line drawn a section at a time": under KVM on an AMD EPYC 9V74 runner (Actions run 42561010289) one section, the most that holds interrupts off for pixels, took 23.4 to 24.6 us on average, where a whole line took 4.3 to 4.6 ms on the EPYC 7763 that found the problem. Those are different processor models; no real machine has been tested.
 
-## Amendment 2 (Proposed, 2026-11-09): the UART a section at a time
+## Amendment 2 (Accepted by the owner, 2026-11-09): the UART a section at a time
 
-**Status: Proposed, not accepted (branch `claude/uart-bounded-send`, on top of Amendment 1's branch, local, not pushed).** The code on that branch already behaves as below. E3 as accepted, and Amendment 1 until the owner decides on it, stand until then.
+**Status: Accepted by the owner on 2026-11-09, as proposed (decision sheet item 53).** The code already behaved as below when it was accepted.
 
 **Why.** Amendment 1 made the pixels of a line go out a section at a time and left the UART in one critical section: the line's bytes, polled one at a time, with interrupts off and the console lock held. At 115 200 baud a byte takes 87 µs on the wire (10 bits), so 100 bytes take 8.7 ms, as long as the 10 ms timer tick. QEMU's UART takes a byte instantly, so no QEMU boot showed it.
 
