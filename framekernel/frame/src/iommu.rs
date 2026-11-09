@@ -953,6 +953,8 @@ impl Iommu {
             coherent: unit.ecap.coherent,
             made: 0,
         };
+        // SNP where the unit offers snoop control: a device's No Snoop cannot then bypass
+        // the caches every DMA buffer lives in (VT-d §3.10).
         vtd::map(
             &mut tables,
             dom.top,
@@ -960,6 +962,7 @@ impl Iommu {
             iova,
             phys,
             Access::READ_WRITE,
+            unit.ecap.snoop_control,
         )
         .map_err(|_| "the page could not be mapped")?;
         dom.tables += tables.made;
@@ -1497,7 +1500,8 @@ pub enum FaultKind {
     /// A DMA to a present page without the access it needed (AMD-Vi PR set).
     PageDenied,
     /// An interrupt through a remapping entry that is not present (VT-d reason 22h; AMD-Vi
-    /// an I/O page fault for an interrupt, PR clear: RemapEn clear).
+    /// an I/O page fault for an interrupt, PR clear: RemapEn clear), or, under AMD-Vi, from
+    /// a device whose interrupts its DTE blocks (an invalid device request, Type 101b).
     InterruptBlocked,
     Other,
 }
@@ -1586,16 +1590,17 @@ impl core::fmt::Display for Fault {
                     (false, Some(false)) => "read",
                     (false, None) => "access",
                 };
-                write!(
-                    f,
-                    "{access} at {:#x}, domain {}, event {:#x} ({}",
-                    e.address,
-                    e.domain,
-                    e.code,
-                    amdvi::event_name(e.code)
-                )?;
+                write!(f, "{access} at {:#x}", e.address)?;
+                // Only some entries record a DomainID (Tables 57, 60).
+                if let Some(domain) = e.domain() {
+                    write!(f, ", domain {domain}")?;
+                }
+                write!(f, ", event {:#x} ({}", e.code, amdvi::event_name(e.code))?;
                 if e.code == amdvi::event::IO_PAGE_FAULT {
                     write!(f, ": {}", amd_cause(&e, self.interrupt))?;
+                }
+                if let Some(kind) = e.kind() {
+                    write!(f, ", type {kind:#05b}")?;
                 }
                 f.write_str(")")
             }
@@ -1636,7 +1641,7 @@ pub fn unmap_words() -> &'static str {
 
 /// Whether the interrupt proof must find the blocked interrupt in the IOMMU's fault record.
 /// VT-d records it (reason 22h), and QEMU's model does. AMD-Vi logs it too (an I/O page fault,
-/// §2.2.5.2), but QEMU 11.1's `amd-iommu` logs no interrupt-remapping fault (it only prints
+/// §2.5.3, Table 44), but QEMU 11.1's `amd-iommu` logs no interrupt-remapping fault (it only prints
 /// one on its stderr), so under AMD-Vi the proof requires only that the interrupt was not
 /// delivered, and the boot test expects the record to be absent: a QEMU that starts logging is
 /// noticed. Hardware qualification must require the record (§74).

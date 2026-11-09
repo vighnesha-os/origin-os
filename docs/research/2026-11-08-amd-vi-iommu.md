@@ -19,6 +19,8 @@
 
 **How A1 was obtained.** `docs.amd.com` answers 401 to automated readers and the older `amd.com` PDF address is 404. The PDF was read from the kib.kiev.ua mirror of AMD's documents (`x86docs/AMD/IOMMU/48882-3.11.pdf`, 7,705,637 bytes, SHA-256 `f7c375a15db5ed63de760356867211063d164a2ed59f2d38613daec95894ce22`), with text extracted by macOS PDFKit. **Checked against AMD's own copy on 2026-11-08: identical.** AMD's Technical Information Portal lists it as `48882_3.11_IOMMU_PUB.pdf`, Revision 3.11, released 2026-04-08, and the file it serves has the same size and SHA-256. It was hashed in the browser's memory and not saved.
 
+**The owner's copy (2026-11-09).** The owner placed `48882_3.11_IOMMU_PUB.pdf` (7,705,637 bytes) in their checkout's `specifications/` folder as the reference for this work. Its SHA-256 is the same `f7c375a1…94ce22`, so the check in §7 compares the code with the very text it was written from. That folder is outside version control for AMD's documents (`.git/info/exclude`), because the agreement forbids copying or sharing them.
+
 **Licence.** The specification's agreement allows reviewing it to design products that interface with AMD products and forbids duplicating it. The repository therefore cites it by section and table and implements from it; it reproduces none of its text or figures.
 
 **Errata and inconsistencies found in Rev 3.11** (no separate errata document exists): the revision history calls Control register bit 57 `CXLMemAttrEn` while the register table still marks it reserved; Table 42 gives event code 1001b to both INVALID_PPR_REQUEST and EVENT_COUNTER_ZERO. Neither touches what this kernel uses.
@@ -42,7 +44,7 @@
 ### 2.3 Registers and features (A2)
 
 - **EFR** 0x29D3: PreFSup, PPRSup, GTSup, IASup, GASup, HESup, HATS 10b (6 levels), GATS 10b; `xtsup=on` adds XTSup (0x29D7). EFR2 (01A0h) is not implemented and reads 0; so are the exclusion registers and the hardware-error and counter registers.
-- **Capability header**: IotlbSup, HtTunnel, **NpCache** (entries marked not present may be cached), EFRSup.
+- **Capability header**: IotlbSup, HtTunnel, **NpCache** (entries marked not present may be cached), EFRSup. CapRev reads **0**, where Rev 3.11 gives 1 as the reset value (§3.2), so the kernel refuses only a revision above 1. The capability block holds the register base (0xFED80000) but leaves Enable clear, while the registers answer there anyway; the kernel compares the base and does not require Enable.
 - **Control bits acted on**: IOMMUEn, EventLogEn, EventIntEn, CmdBufEn, GAEn (128-bit IRTEs), XTEn (with xtsup and GAEn), IntCapXTEn. ComWaitIntEn, Coherent, HtTunEn, PassPW, Isoc and the PPR bits are ignored.
 - **Status**: bits 0–2, 5, 6 are write-1-to-clear; CmdBufRun and EventLogRun mirror their enables. **EventOverflow and EventLogInt are set only with EventIntEn**: with it clear (this kernel), a full log drops events without telling software.
 - Commands run **synchronously** inside the tail write.
@@ -105,3 +107,39 @@ A second agent drove the device model directly (`-accel qtest`, `iommu-testdev` 
 - The specification was read from a mirror (§1); its hash has since been checked against AMD's copy and is identical.
 - Not implemented: IVMD unity maps and exclusion ranges (such devices are refused), segments other than 0, taking over an IOMMU the firmware left enabled (pre-boot DMA protection, IVinfo bit 1), guest translation, guest virtual APIC (posted interrupts), ATS and device IOTLBs, PPR, the event-log interrupt, 2048-entry interrupt tables, device-table segmentation, and hot-plug. The register window mapped is the 16 KiB every register used lies in; with PCSup the window is 512 KiB.
 - **The I/O APIC is blocked under AMD-Vi.** Its DTE (DeviceID 0x00A0 from the IVRS) aborts fixed interrupts. The kernel uses the I/O APIC only before the IOMMU comes up; routing an I/O APIC line afterwards needs an IRTE in that DeviceID's table (the redirection entry's vector field then holds the index). Under QEMU, a level-triggered line also needs an explicit I/O APIC EOI, because QEMU drops the trigger mode.
+
+## 7. Every encoding checked against Rev 3.11 (2026-11-09)
+
+**Method.** The owner's copy of the specification (§1; the same SHA-256) was read as text extracted with PDFKit. Three reviewers, each given one part of the code, compared every constant, field, offset, width, reserved-bit rule, required sequence and citation with the section named, and listed what software must do that the code did not. Every finding was then checked against the text again before anything changed. Where the extraction ran a figure's or table's columns together, the field lists were read instead. About 320 items were checked: in `amdvi.rs`, the registers, commands and events (137) and the device table entry, page tables, IRTEs and MSI format (65); in `ivrs.rs` and `iommu/amd.rs`, the IVRS parser and the bring-up and runtime sequence (118). **No bit position, field width or offset was wrong.** The findings are about what the code did around them.
+
+**Fixed:**
+
+| Finding | Rev 3.11 | Fix |
+|---|---|---|
+| Enabling the IOMMU wrote the whole Control register, so a firmware-enabled SMI filter (SmiFEn, SmiFLogEn) was switched off and BlkStopMrkEn cleared. With IV set no DTE field controls SMIs, so any device could then raise them | §3.4.1 bits 22–24 and 41; §2.1.5.1, §2.1.5.3; Table 10; §2.3.1 | The firmware's bits are read before enabling and kept, also when the kernel turns the IOMMU off (`control::FIRMWARE`) |
+| Leaf page-table entries left FC clear, so a device's No Snoop request reached memory without snooping the caches every DMA buffer lives in | §2.2.3, Table 17 (FC, bit 60); Table 18 (reserved in a directory entry) | Every leaf sets FC; no directory entry does. The VT-d counterpart, SNP under `ECAP.SC`, was missing too (VT-d ledger) |
+| Each IOMMU chose its IRTE size by itself | §2.2.5.2 | Every IOMMU is probed before any is enabled; 128-bit IRTEs (GAEn, XTEn) only if all support them |
+| The register range kept free of BARs was always 16 KiB | §2.3 (512 KiB with PCSup) | 512 KiB where the IVHD reports performance counters (the EFR image's PCSup, or Table 94's PNBanks and PNCounters) |
+| HATDis (IVHD attributes bit 0, types 11h and 40h) was ignored | Tables 98, 102 | Such an IOMMU is refused: it cannot confine DMA |
+| With NpCache, a map that made new directory entries invalidated leaf entries only (PDE clear) | §3.2 (NpCache); §2.4.3 (PDE) | A map that makes a table page invalidates the whole domain, PDE set |
+| The command ring was written without reading the head, and was still written after the IOMMU stopped fetching | MMIO 2008h; §2.4 | Room is checked before each batch; after a halt or a lost completion the unit refuses every later command |
+| The event decoder read every event with the I/O page fault's layout (PR, I, RW, the DomainID) | Tables 56, 57, 59, 60, 64, 65 | Each accessor answers only for the codes whose entry has the field; Type, S and code 8's interrupt case are decoded; each code's reserved low address bits are cleared |
+| An interrupt from a device whose DTE blocks interrupts (INVALID_DEVICE_REQUEST, Type 101b) was recorded as a DMA "access" | Table 64 | Recorded as a blocked interrupt |
+| Interrupt faults were recognised only at `0xFEEx_xxxx` | Table 3; §2.2.5; §2.2.9 | The HyperTransport form and its sign-extended form count too. The specification does not say which form a fault records; a hardware run must show it |
+| The capability revision and the capability block's base were not checked | §3.2 (CapRev; Capability Offsets 04h, 08h) | A revision above 1 (QEMU reports 0), a capability base other than the IVHD's, or registers that read as all ones refuse the IOMMU; Enable is not required, because QEMU leaves it clear (§2.3) |
+| Codes 9–14 were named as "invalid PPR request or event counter zero" and "reserved" | §2.5.10–§2.5.15 | Named as their own sections number them (errata below) |
+| The page-table model translated through entries with reserved bits set; the walker accepted special addresses as IOVAs or as pages | Tables 17, 18, 44; §2.1.4.2; Table 3 | Both refused |
+| Comments and citations: GASup's role, the HATS test comment, the RW test case, a DTE test label, `msi_index`'s description, the interrupt range's citation, the module comment's claim about SMIs, the reason for invalidating at bring-up, the RemapEn fault's citation, the IVHD flag tables | as named | Corrected |
+
+**Found, not changed** (each needs a decision or a hardware run):
+- **IVMDs.** One with neither access nor unity nor exclusion means "never map this range" (the text around Tables 112 and 113), yet the devices it names are refused like a unity map's (ADR-0007 question 8). Types 21h and 22h carry their own DeviceID but are matched only after their own IVHD, while type 20h applies to every device. Both fail closed. Settle with question 4's identity maps.
+- **IVRS strictness.** The parser refuses the whole table for things the specification calls reserved or does not cover: an unknown variable-length entry type (no length to skip it by, Table 103), an 11h or 40h block when IVinfo reports no EFR support, a HID entry whose UID format and length disagree, and a few more. That fails closed, but a future entry type would leave every device without a driver; stopping only that IVHD's walk is the alternative.
+- **Several entries for one DeviceID.** The first entry's DTE setting wins, and settings of devices sharing an alias are ORed, which can turn two SysMgt values into a third. The specification gives no precedence.
+- **Type 10h only.** An IOMMU described only by a type 10h block uses its EFR register alone; §4.5 and chapter 5 rank the IVRS feature field (Table 94) above the register. Firmware for 2026 platforms carries 11h or 40h blocks.
+- **Faulting addresses are not invalidated** (§2.1.3 recommends it). IOVAs are never reused, so no fault can repeat on a later mapping.
+- The event-log restart ignores a timeout of EventLogRun; the order used is the safer reading of §2.5.1 and MMIO 2020h. `ring_offset` does not bound its index; every caller reduces it first.
+- **VT-d without snoop control.** Where `ECAP.SC` is clear nothing stops No Snoop; clearing Enable No Snoop in each attached function's PCIe Device Control register would.
+
+**Errata and inconsistencies in Rev 3.11** (adding to §1's): §2.5.15's field table names RMP_PAGE_FAULT where its own event, RMP_HARDWARE_ERROR, is meant; §2.2.7.9 refers to a DTE FC bit that does not exist (FC is a PTE bit; the DTE has Mode0FC); Table 43 and Table 7 disagree on whether a reserved IntTabLen is reported under IntCtl 10b or under IV set; Table 60's text gives a page-table entry's address as bits 31:4 and its figure as 31:3; Table 102 prints its reserved bits as 12:0, overlapping HATDis; the descriptions of Capability Offset 04h disagree on BaseAddress[18:14]; Tables 35 and 38 describe fewer reserved bits than Figures 45 and 48 show. Only the address masks above depend on any of them.
+
+**Limits of this check.** It compares the code with the text; it does not show that hardware behaves as the text says (§74). Guest translation, the guest virtual APIC, PPR, ATS, MARC, SEV-SNP and the virtual IOMMU are not implemented, and were checked only as far as the code must keep them off.
