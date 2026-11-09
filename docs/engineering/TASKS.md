@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Required by | CLAUDE.md §79 (persistent engineering memory) |
-| Updated | 2026-11-08 |
+| Updated | 2026-11-09 |
 | Rule | Status words mean what they say. "Done" means built, tested and committed; QEMU is not hardware (CLAUDE.md §74). |
 
 ## Done (branch `m0/toolchain-verification`)
@@ -52,6 +52,8 @@
 | Early console, ADR-0009 H6 (2026-11-08, merged 2026-11-09, ADR-0010, accepted by the owner) | The loader passes the UEFI GOP framebuffer in boot info 0.4; the kernel draws everything it prints on it in an original 8×16 font; the console's UART comes from the ACPI SPCR when firmware names one (I/O or memory-mapped), with 0x3F8 only as a fallback; no console can stop a boot | `spcr`, `fbconsole` and `font` host tests, a 200 000-case SPCR mutation soak; `boot-test` checks a QEMU screen dump cell by cell against the rows the serial log implies, independently of the drawing code; `boot-console` proves the SPCR UART at a non-default port, COM1 named, refused tables, a UART that takes no bytes, no display and no UART; 14 negative controls (`SOURCE_PROVENANCE.md`). The owner accepted ADR-0010 on 2026-11-08 (sheet items 27–29) and told Claude to merge it on 2026-11-09 |
 | External known-answer vectors, CRYPTO-KAT (2026-11-08, branch `claude/amazing-einstein-4eb320`) | `security/crypto/tests/kat`, host-only: NIST ACVP SHA-2, SHA-3, SHAKE and ML-DSA signature verification, and Wycheproof Ed25519, from vectors converted at pinned revisions and hashes and committed with their notices; FIPS 204 errata sheet applied (one check tightened) | 3,882 vectors pass, each exception justified; negative controls per algorithm; planted faults; `SOURCE_PROVENANCE.md` |
 
+| OIDL and its generator, ADR-0011 N14 step 2 (2026-11-09, branch `claude/sad-lalande-b83a31`; **format Proposed**) | `docs/spec/OIDL.md`, the Proposed interface language and fixed-layout wire format; `developer-tools/oidl`, a host-only parser, validator and generator (Rust, C header, docs, ABI fingerprint, hostile corpus); the kernel's system calls defined in `sdk/interfaces/origin.kernel.oidl` and generated into scratch only | `cargo xtask check`: malformed definitions, mutation soaks, generated code compiled and clippy-clean for three targets, 34 planted faults all detected, the comparison in `docs/engineering/OIDL_KERNEL_COMPARISON.md` |
+
 ## In progress
 
 | Task | Notes |
@@ -60,7 +62,7 @@
 
 ## Next, in order
 
-**First, per ADR-0011 N14 (accepted 2026-11-09), before the items below add to the kernel:** the Framekernel framework crate and its gate; then the interface language and its generator, with the kernel's own calls as the first consumer; then caller identity, the start record and the service directory, with memory objects and ports; then `origin.core` and one end-to-end service domain (Diagnostics), measured before a second is built.
+**First, per ADR-0011 N14 (accepted 2026-11-09), before the items below add to the kernel:** the Framekernel framework crate and its gate; the interface language and its generator, with the kernel's own calls as the first consumer — **the specification and the generator exist (see Done), the owner has not yet accepted the format, and the kernel does not use the output**; then caller identity, the start record and the service directory, with memory objects and ports; then `origin.core` and one end-to-end service domain (Diagnostics), measured before a second is built.
 
 1. **NVMe interrupts:** the PCI capability list, MSI-X, a vector per queue, and completions that wake a wait queue instead of polling; timed waits (deadlines on the monotonic clock).
 2. **IOMMU (§32):** VT-d under QEMU's `intel-iommu` — **done 2026-11-08** (ADR-0007, Accepted): the DMAR table, DMA remapping for NVMe and virtio-net with blocked-DMA and fault proofs, and interrupt remapping (see STATUS and `SOURCE_PROVENANCE.md`). Delivery to an APIC ID above 255 is proven live since the CPU-index work (ADR-0008, `boot-x2apic`). I/O APIC entries in remappable format, through IRTEs that check the I/O APIC's source ID — **done 2026-11-08**. AMD-Vi under QEMU's `amd-iommu` — **done 2026-11-08** (ADR-0007's AMD-Vi section, Accepted): the IVRS, default-deny device tables, DMA and per-device interrupt remapping with x2APIC destinations, the same proofs and drivers, `boot-matrix` over both IOMMUs. Remaining: RMRR and IVMD identity maps, scalable mode; an interrupt table for the I/O APIC's DeviceID under AMD-Vi (its pins stay masked there until then); the keyboard IRQ1 to a handler through `iommu::route_ioapic_pin`; a live level-triggered pin (PCI INTx) with its EOI path; the source-ID check on I/O APIC interrupts on hardware (QEMU's I/O APIC sends no requester ID). Threat T4 (bus mastering cleared at enumeration, drivers enable it only after attaching, translation before SMP start; windows remain, threat model) — **done 2026-11-08** (merged 2026-11-09).
@@ -83,3 +85,4 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 | — | Buy the first test machines ADR-0009 chose: #2, then #5 once its serial option is confirmed (H5) | The first physical boot (§74) |
 | — | Sheet items 30–32: ADR-0007's bus-mastering question, the Loom download's deviation, and CI (`docs/engineering/OWNER_DECISIONS.md`) | Accepting I12; an honest record; §82's M0 |
 | — | Sheet item 39: whether to amend CLAUDE.md §48 and §70 to match ADR-0011 | Keeping the directive and the design in step |
+| — | Sheet items 40–51: the OIDL wire format and rules (`docs/spec/OIDL.md` §19) | Adopting generated code in the kernel and any service; the fingerprint gate (ADR-0011 N13) |

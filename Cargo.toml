@@ -14,6 +14,7 @@ members = [
     "boot/info",
     "boot/uefi",
     "developer-tools/onbf-pack",
+    "developer-tools/oidl",
     "developer-tools/onbf-sign",
     "developer-tools/xtask",
     "framekernel",
@@ -30,6 +31,7 @@ members = [
 # built for the host.
 default-members = [
     "boot/info",
+    "developer-tools/oidl",
     "developer-tools/onbf-pack",
     "developer-tools/onbf-sign",
     "developer-tools/xtask",
@@ -91,3 +93,7 @@ opt-level = 3
 
 [profile.dev.package.onbf-sign]
 opt-level = 3
+
+# The mutation soaks walk tens of thousands of definitions.
+[profile.dev.package.oidl]
+opt-level = 2

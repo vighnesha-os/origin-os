@@ -85,6 +85,8 @@ const KERNEL_PACKAGE: &str = "framekernel";
 const PACK_PACKAGE: &str = "onbf-pack";
 /// The host-only signing code (CLAUDE.md §59): never linked into the OS.
 const SIGN_PACKAGE: &str = "onbf-sign";
+/// The interface-language tool (docs/spec/OIDL.md): host only.
+const OIDL_PACKAGE: &str = "oidl";
 const FREESTANDING_LIBS: &[&str] = &[
     BOOT_INFO_PACKAGE,
     ONBF_FORMAT_PACKAGE,
@@ -1874,11 +1876,22 @@ fn check() -> Result {
             "-D",
             "warnings",
         ],
+        // The interface-language tool (a host tool): parser, generators and their tests.
+        &[
+            "clippy",
+            "--package",
+            OIDL_PACKAGE,
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
         &["test", "--package", "xtask"],
         &["test", "--package", LOADER_PACKAGE, "--lib"],
         &["test", "--package", VERSION_PACKAGE],
         &["test", "--package", PACK_PACKAGE],
         &["test", "--package", SIGN_PACKAGE],
+        &["test", "--package", OIDL_PACKAGE],
     ];
     for step in steps {
         run_step(cargo().args(*step))?;

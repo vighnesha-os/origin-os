@@ -1,0 +1,135 @@
+// Fixture for the generator's own tests: every syscall-transport construct. It defines no
+// shipping interface, and nothing in the tree depends on it.
+
+/// System calls used only by the generator's tests.
+library origin.fixture.calls;
+transport syscall;
+version 2.1;
+use origin.kernel;
+
+/// A set of flags.
+bits mode: u16 {
+    /// The low bit.
+    read_only = 0;
+    /// Bit 4.
+    fast = 4;
+    /// Bit 9, added in minor 1.
+    @since(2.1) later = 9;
+}
+
+/// A signed enumeration.
+enum kind: i32 {
+    /// One.
+    one = 1;
+    /// A negative value.
+    minus = -5;
+}
+
+/// A growable structure.
+sized struct options {
+    /// A 16-bit value.
+    a: u16;
+    /// A count.
+    n: u32;
+    /// Added in minor 1.
+    @since(2.1) b: u64;
+}
+
+/// A frozen structure.
+struct pair {
+    /// A 16-bit value.
+    x: u16;
+    /// A byte.
+    y: u8;
+}
+
+/// Lets a process use the privileged calls.
+capability calls.admin;
+
+/// The fixture's calls.
+interface calls {
+    /// Every scalar argument.
+    method scalars = 1 (
+        /// One byte.
+        a: u8,
+        /// A signed 16-bit value.
+        b: i16,
+        /// A 32-bit value.
+        c: u32,
+        /// A signed 64-bit value.
+        d: i64,
+        /// A boolean.
+        e: bool,
+        /// An enumeration.
+        f: kind,
+    ) errors(invalid_args) requires none;
+
+    /// Non-zero flags and a non-zero 64-bit value.
+    method modes = 2 (
+        /// Flags.
+        @nonzero g: mode,
+        /// Unchecked.
+        h: u64,
+        /// Never zero.
+        @nonzero n: u64,
+    ) errors(invalid_args) requires none;
+
+    /// Slices, an optional handle and a struct by pointer.
+    method buffers = 3 (
+        /// A string.
+        text: string<32>,
+        /// Numbers.
+        data: vector<u32, 8>,
+        /// A handle that may be absent.
+        opt: optional<handle<any>>,
+        /// A struct.
+        p: pair,
+    ) errors(invalid_args, bad_handle, fault) requires none;
+
+    /// A sized struct in and out, and a result buffer.
+    method struct_io = 4 (
+        /// The options in.
+        input: options,
+    ) -> (
+        /// The options out.
+        output: options,
+        /// Filled, with its count in `output.n`.
+        @count(output.n) buffer: vector<u8, 16>,
+    ) errors(invalid_args, fault) requires none;
+
+    /// Gated by a capability.
+    method gated = 5 () errors(access_denied) requires calls.admin;
+
+    /// A handle with rights and an object type.
+    method rights = 6 (
+        /// The channel.
+        h: handle<channel, read | write>,
+    ) errors(bad_handle, access_denied, wrong_type) requires none;
+
+    /// Added in minor 1.
+    @since(2.1)
+    method newer = 7 (
+        /// Anything.
+        x: u64,
+    ) errors() requires none;
+
+    /// Declared but not implemented.
+    @reserved
+    method unimplemented = 8 () errors(not_supported) requires none;
+
+    /// Results of each scalar kind.
+    method results = 9 () -> (
+        /// A boolean.
+        r_bool: bool,
+        /// An enumeration.
+        r_kind: kind,
+        /// Flags.
+        r_mode: mode,
+        /// A handle.
+        r_handle: handle<any>,
+        /// An optional handle.
+        r_opt: optional<handle<any>>,
+        /// A number.
+        r_num: u64,
+    ) errors(fault) requires none;
+}
