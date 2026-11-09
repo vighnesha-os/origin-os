@@ -1,0 +1,40 @@
+[package]
+name = "origin-boot-uefi"
+description = "Origin OS UEFI boot loader (x86_64-unknown-uefi)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# UEFI definitions and the logic that is unit-tested on the build host.
+[lib]
+path = "src/lib.rs"
+
+# The EFI application. Build it only for x86_64-unknown-uefi (`cargo xtask build`).
+[[bin]]
+name = "origin-boot"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+# Trust the test kernel key committed in boot/uefi/trust (TEST ONLY: its private half can be
+# recomputed from public text). For development and boot tests; a release build must never
+# have it. Without it the trust store is empty and every kernel is refused.
+test-trust-store = []
+# Accept an unsigned KRN image and say so on the console (ADR-0002 B8). A signed image is
+# still verified, against the test key above, so this includes it. The xtask boot test
+# builds this variant too; a loader without it refuses unsigned kernels.
+developer-mode = ["test-trust-store"]
+
+[dependencies]
+origin-version.workspace = true
+origin-boot-info.workspace = true
+onbf-format.workspace = true
+origin-crypto.workspace = true
+onbf-merkle.workspace = true
+onbf-verify.workspace = true
+origin-paging = { path = "../../framekernel/paging" }
+
+[lints]
+workspace = true

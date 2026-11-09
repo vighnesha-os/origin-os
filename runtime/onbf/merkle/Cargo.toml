@@ -1,0 +1,17 @@
+[package]
+name = "onbf-merkle"
+description = "ONBF Merkle-SHA256-4K trees: roots, MERKLE sections, per-block verification (docs/spec/ONBF.md §4.6)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+origin-crypto.workspace = true
+
+# Cross-check MERKLE section sizes against the container parser's count.
+[dev-dependencies]
+onbf-format.workspace = true
+
+[lints]
+workspace = true

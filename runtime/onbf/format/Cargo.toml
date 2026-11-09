@@ -1,0 +1,17 @@
+[package]
+name = "onbf-format"
+description = "Origin Native Binary Format container parser (docs/spec/ONBF.md §4)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+origin-version.workspace = true
+
+[lints]
+workspace = true
+
+# Real SHA-512 for content-digest tests; the parser itself takes the hash from its caller.
+[dev-dependencies]
+origin-crypto.workspace = true

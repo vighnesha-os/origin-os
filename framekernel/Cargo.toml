@@ -1,0 +1,30 @@
+[package]
+name = "framekernel"
+description = "Origin OS Framekernel (x86_64-unknown-none)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Boot-info validation, the memory summary, the UART driver and the console text: the
+# logic that is unit-tested on the build host.
+[lib]
+path = "src/lib.rs"
+
+# The kernel image. Build it only for x86_64-unknown-none; `build.rs` adds the link
+# arguments that give it the ELF shape `onbf-pack` accepts.
+[[bin]]
+name = "framekernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+origin-abi = { path = "../runtime/abi" }
+origin-boot-info.workspace = true
+origin-paging = { path = "paging" }
+origin-sync = { path = "sync" }
+origin-version.workspace = true
+
+[lints]
+workspace = true

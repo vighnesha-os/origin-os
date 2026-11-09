@@ -1,0 +1,21 @@
+[package]
+name = "xtask"
+description = "Origin OS build orchestration and QEMU boot tests (host only)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Std plus first-party crates only; no third-party dependencies (CLAUDE.md §5).
+[dependencies]
+origin-version.workspace = true
+origin-crypto.workspace = true
+onbf-format.workspace = true
+onbf-merkle.workspace = true
+# For the boot tests: the framebuffer console's drawing and the font (the screen-dump proof
+# compares QEMU's picture against them) and the boot-info layout it reads.
+framekernel = { path = "../../framekernel" }
+origin-boot-info.workspace = true
+
+[lints]
+workspace = true
