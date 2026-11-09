@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-09, as recommended: questions 1–6 below, decision sheet items 33–38 (CLAUDE.md §18, §84). Question 7 is still the owner's. N6 and N13's `unsafe` gate are partly built (2026-11-09: the framework crate `framekernel/frame/`, `cargo xtask check`'s gate, and most of the kernel migrated; `docs/engineering/SOURCE_PROVENANCE.md`); N1–N5, N7–N12 and the rest of N14 are not built. The owner set the direction the same day: "100% native SDK (if possible)", with the console, the terminal and the kernel included, and "every module as SDK" |
+| Status | **Accepted** by the owner on 2026-11-09, as recommended: questions 1–6 below, decision sheet items 33–38 (CLAUDE.md §18, §84). Question 7 is still the owner's. N6, and N13's gates on `unsafe` and on dependency direction, are built (2026-11-09: the framework crate `framekernel/frame/`, with no `unsafe` left outside it; `docs/engineering/SOURCE_PROVENANCE.md`), which is step 1 of N14; N1–N5, N7–N12, the rest of N13 and the rest of N14 are not built. The owner set the direction the same day: "100% native SDK (if possible)", with the console, the terminal and the kernel included, and "every module as SDK" |
 | Requires | CLAUDE.md P1, P2, P3, P8; §3, §5, §7, §13, §22, §30, §42, §44, §45, §47–§50, §53, §58, §62, §63, §66, §70, §72; final rules 5, 10, 11, 12, 20, 21, 36 |
 | Evidence | `docs/research/2026-11-09-native-sdk.md`; `docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md` |
 | Builds on | ADR-0001 (framekernel argument R1, user-mode drivers D2, default 10); ADR-0003 K1; ADR-0005 (P1, P4, P6, P8, P12, A6); ONBF §6.1 |
