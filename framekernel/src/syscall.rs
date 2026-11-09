@@ -297,7 +297,18 @@ fn channel_write(
         *value = u32::from_le_bytes(*chunk);
     }
     let transfer = values.get(..count).ok_or(Error::InvalidArgs)?;
-    ipc::channel_write(&p.handles, &p.account, end.value(), payload, transfer)
+    ipc::channel_write(
+        &p.handles,
+        &p.account,
+        end.value(),
+        need(end),
+        payload,
+        transfer,
+        Need {
+            rights: handles.need_rights,
+            object: handles.need_object,
+        },
+    )
 }
 
 /// `channel_read`. The decoder has clamped both capacities to what a message can hold.

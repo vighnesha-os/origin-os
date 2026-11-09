@@ -332,13 +332,16 @@ fn inside(
 }
 
 /// `channel_write`: queues `bytes` and moves the handles in `transfer` out of `table`, or
-/// does nothing and says why.
+/// does nothing and says why. `need` is what the end must meet, and `transfer_need` what each
+/// listed handle must.
 pub(crate) fn channel_write(
     table: &SpinLock<HandleTable<Object>>,
     account: &Arc<Account>,
     handle: Handle,
+    need: Need,
     bytes: Vec<u8>,
     transfer: &[Handle],
+    transfer_need: Need,
 ) -> Result<(), Error> {
     // Threads blocked on a handle this message takes away must wake and see it gone (P9),
     // and that happens after the locks are released.
@@ -348,9 +351,9 @@ pub(crate) fn channel_write(
         .map_err(|_| Error::NoMemory)?;
     let wake_side = without_interrupts(|| {
         let mut table = table.lock();
-        let (channel, side) = channel_of(&table, handle, Need::rights(rights::WRITE))?;
+        let (channel, side) = channel_of(&table, handle, need)?;
         let reader = other(side);
-        table.check_all(transfer, Need::rights(rights::TRANSFER))?;
+        table.check_all(transfer, transfer_need)?;
         // An end may be sent only if that keeps every end reachable (amendment A3). Every
         // listed handle was just checked to exist.
         let moves_an_end = !transfer.is_empty();
@@ -375,7 +378,7 @@ pub(crate) fn channel_write(
             account: account.clone(),
             bytes: cost,
         };
-        let moved = table.take_all(transfer, Need::rights(rights::TRANSFER))?;
+        let moved = table.take_all(transfer, transfer_need)?;
         // The reader's queue holds them now, recorded before anyone can see the message.
         for (object, _) in &moved {
             let Object::Channel(end) = object;
