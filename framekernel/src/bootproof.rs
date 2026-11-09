@@ -83,6 +83,7 @@ proofs! {
     Iommu "IOMMU bring-up" => Withdraw("no device drivers");
     Processors "application processors" => Withdraw("fewer processors");
     CpuState "per-processor control state" => Refuse;
+    BootSteps "boot steps run once" => Refuse;
     Topology "CPU topology" => Report;
     Numa "NUMA affinities" => Report;
     NumaDistances "NUMA distances" => Report;
@@ -96,6 +97,7 @@ proofs! {
     SpawnRefusal "refused spawns" => Report;
     UserIsolation "ring-3 isolation" => Refuse;
     TscConsistency "TSC consistency" => Report;
+    ClockMonotonic "monotonic clock" => Report;
     ConsoleLines "concurrent console" => Report;
     Tlb "TLB shootdown" => Refuse;
     WaitQueues "wait queues" => Refuse;
@@ -118,6 +120,8 @@ proofs! {
     Tcp "TCP" => Report;
     TimerQueue "timer queue" => Report;
     Sysfs "/sys" => Report;
+    ConsoleUartSections "console UART sections" => Report;
+    ConsoleSections "console screen sections" => Report;
 }
 
 // A proof's bit in the tally's two words.
@@ -220,13 +224,14 @@ mod tests {
 
     /// Every proof whose failure stops the boot (ADR-0013 R1). Changing this list changes
     /// what a real machine does: change the ADR with it.
-    const REFUSING: [Proof; 12] = [
+    const REFUSING: [Proof; 13] = [
         Proof::PageTables,
         Proof::FrameAllocator,
         Proof::Heap,
         Proof::ApicTimer,
         Proof::NmiStack,
         Proof::CpuState,
+        Proof::BootSteps,
         Proof::Preemption,
         Proof::SimdState,
         Proof::UserIsolation,
@@ -267,7 +272,7 @@ mod tests {
 
     #[test]
     fn the_table_has_one_row_per_proof_in_order() {
-        assert_eq!(Proof::ALL.len(), 46);
+        assert_eq!(Proof::ALL.len(), 50);
         for (i, &proof) in Proof::ALL.iter().enumerate() {
             assert_eq!(proof as usize, i, "{proof:?} is out of order");
             assert!(!proof.name().is_empty(), "{proof:?} has no name");
@@ -349,7 +354,7 @@ mod tests {
     fn the_verdict_of_a_clean_boot_is_exact() {
         assert_eq!(
             verdict(passed_all()),
-            "origin-kernel: boot verdict: 46 of 46 proofs passed\n"
+            "origin-kernel: boot verdict: 50 of 50 proofs passed\n"
         );
     }
 
@@ -361,7 +366,7 @@ mod tests {
         tally.record(Proof::Nvme, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 43 of 46 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
+            "origin-kernel: boot verdict: degraded: 47 of 50 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
         );
     }
 
@@ -372,7 +377,7 @@ mod tests {
         tally.record(Proof::PageTables, true);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 44 did not run\n"
+            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 48 did not run\n"
         );
     }
 
@@ -383,7 +388,7 @@ mod tests {
         tally.record(Proof::Raster, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 45 of 46 proofs passed; failed: rasterizer\n"
+            "origin-kernel: boot verdict: degraded: 49 of 50 proofs passed; failed: rasterizer\n"
         );
     }
 

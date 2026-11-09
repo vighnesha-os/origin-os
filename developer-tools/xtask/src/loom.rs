@@ -91,6 +91,8 @@ fn search_settings() -> Vec<OsString> {
 /// Which failure text a control may produce.
 const CAUSALITY: &[&str] = &["Causality violation"];
 const DEADLOCK: &[&str] = &["deadlock"];
+const WENT_BACK: &[&str] = &["the clock went backwards"];
+const LOST_UPDATE: &[&str] = &["the floor is the largest reading"];
 
 /// One deliberate bug, and the models that must find it.
 struct Control {
@@ -105,10 +107,11 @@ struct Control {
     models: &'static [(&'static str, &'static [&'static str])],
 }
 
-const SPIN_LOCK: &str = "framekernel/sync/src/lib.rs";
-const WAIT: &str = "framekernel/sync/src/wait.rs";
+const SPIN_LOCK: &str = "framekernel/frame/sync/src/lib.rs";
+const WAIT: &str = "framekernel/frame/sync/src/wait.rs";
 const RUN_QUEUE: &str = "framekernel/src/runqueue.rs";
-const MODELS: &str = "framekernel/sync/src/models.rs";
+const MODELS: &str = "framekernel/frame/sync/src/models.rs";
+const FLOOR: &str = "framekernel/frame/sync/src/floor.rs";
 
 /// `WaitQueue::take_all`'s one critical section.
 const TAKE_ALL: &str = "        scheduler.without_interrupts(|| core::mem::replace(&mut *self.waiters.lock(), [None; N]))\n";
@@ -614,13 +617,76 @@ const CONTROLS: &[Control] = &[
             ("wait_queue_wake_all_keeps_a_concurrent_timed_registration", DEADLOCK),
         ],
     },
+    // The monotonic clock's floor (ADR-0012).
+    Control {
+        // A reading below the floor comes back as it was read: no floor at all.
+        name: "floor_gives_back_the_reading",
+        file: FLOOR,
+        from: "                return floor;\n",
+        to: "                return reading;\n",
+        models: &[
+            ("floor_handoff_between_two_processors", WENT_BACK),
+            ("floor_handoff_chain", WENT_BACK),
+        ],
+    },
+    Control {
+        // The floor is never raised, so every reading above it is given out and forgotten.
+        name: "floor_never_rises",
+        file: FLOOR,
+        from: "                floor,\n                reading,\n",
+        to: "                floor,\n                floor,\n",
+        models: &[
+            ("floor_handoff_between_two_processors", WENT_BACK),
+            ("floor_handoff_chain", WENT_BACK),
+        ],
+    },
+    Control {
+        // Raising the floor with a load and a store instead of one atomic step: two readers
+        // can both act on the same old floor, and the smaller reading can land last.
+        name: "floor_raised_by_a_plain_store",
+        file: FLOOR,
+        from: "        let mut floor = self.latest.load(Ordering::Relaxed);
+        loop {
+            if reading <= floor {
+                return floor;
+            }
+            match self.latest.compare_exchange_weak(
+                floor,
+                reading,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return reading,
+                Err(newer) => floor = newer,
+            }
+        }
+",
+        to: "        let floor = self.latest.load(Ordering::Relaxed);
+        if reading <= floor {
+            return floor;
+        }
+        self.latest.store(reading, Ordering::Relaxed);
+        reading
+",
+        models: &[("floor_racing_readers_end_at_the_largest_reading", LOST_UPDATE)],
+    },
+    Control {
+        // The caller's handoff weakened to `Relaxed`: the later call no longer happens after
+        // the earlier one, so a stale floor at or above its reading is taken at face value.
+        // The guarantee is for calls the caller has ordered, and the model can tell.
+        name: "floor_handoff_not_ordered",
+        file: MODELS,
+        from: "                    handed.store(first + 1, Release);\n",
+        to: "                    handed.store(first + 1, Relaxed);\n",
+        models: &[("floor_handoff_between_two_processors", WENT_BACK)],
+    },
 ];
 
 /// The scratch copy's workspace: just the crate under test. The tables `scratch_manifest` adds
 /// come from the real workspace's manifest, so that they cannot drift from it.
 const SCRATCH_WORKSPACE: &str = r#"[workspace]
 resolver = "3"
-members = ["framekernel/sync"]
+members = ["framekernel/frame/sync"]
 
 "#;
 
@@ -939,7 +1005,7 @@ fn populate(root: &Path, scratch: &Path, profile: &str) -> Result {
     )?;
     write(Path::new("Cargo.lock"), MODEL_LOCK.as_bytes())?;
     copy(Path::new(RUN_QUEUE))?;
-    let crate_dir = root.join("framekernel/sync");
+    let crate_dir = root.join("framekernel/frame/sync");
     let mut files: Vec<PathBuf> = Vec::new();
     collect_files(&crate_dir, &|_| false, &|_| true, &mut files)
         .map_err(|e| format!("{}: {e}", crate_dir.display()))?;
@@ -950,7 +1016,7 @@ fn populate(root: &Path, scratch: &Path, profile: &str) -> Result {
         copy(relative)?;
     }
     // Only here, in the scratch copy of the crate's manifest, does Loom exist.
-    let manifest = Path::new("framekernel/sync/Cargo.toml");
+    let manifest = Path::new("framekernel/frame/sync/Cargo.toml");
     let mut text = fs::read_to_string(scratch.join(manifest))
         .map_err(|e| format!("{}: {e}", scratch.join(manifest).display()))?;
     text.push_str(LOOM_DEV_DEPENDENCY);
@@ -1069,7 +1135,7 @@ mod tests {
     fn the_scratch_workspace_is_linted_as_the_real_one_is() {
         let manifest = scratch_manifest(&repo_root(), CONTROL_PROFILE).unwrap();
         for line in [
-            "members = [\"framekernel/sync\"]",
+            "members = [\"framekernel/frame/sync\"]",
             "unsafe_op_in_unsafe_fn = \"deny\"",
             "undocumented_unsafe_blocks = \"deny\"",
             "codegen-units = 1",

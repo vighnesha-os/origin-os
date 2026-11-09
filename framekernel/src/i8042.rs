@@ -11,14 +11,15 @@
 //! Only the boot processor touches these ports, at CPL 0, and nothing else drives them, so
 //! the port I/O is sound. This brings the controller up and proves it answers; delivering
 //! live keystrokes needs the keyboard IRQ (vector routing), which is not wired yet.
+#![forbid(unsafe_code)]
 
 use core::fmt::Write;
 
+use origin_frame::port::PortRange;
+
 use crate::console::Console;
-use crate::{inb, outb};
 
 const DATA: u16 = 0x60;
-const STATUS: u16 = 0x64;
 const COMMAND: u16 = 0x64;
 
 /// Status register bits: output buffer full (data to read), input buffer full (do not
@@ -42,35 +43,27 @@ const CONFIG_PORT1_TRANSLATE: u8 = 1 << 6;
 /// Polls before a wait gives up (each poll is one status read).
 const POLL_LIMIT: u32 = 1_000_000;
 
-/// The controller, owned by the kernel after `ExitBootServices`.
-struct Controller(());
+/// The controller's ports, owned by the kernel after `ExitBootServices`: the data port and
+/// the status/command port.
+struct Controller {
+    data: PortRange,
+    status_command: PortRange,
+}
 
 impl Controller {
-    /// # Safety
-    ///
-    /// CPL 0, the boot processor, and nothing else may drive ports 0x60/0x64 while this
-    /// value lives.
-    unsafe fn new() -> Self {
-        Self(())
-    }
-
     fn status(&self) -> u8 {
-        // SAFETY: the type invariant; reading the status port has no memory effect.
-        unsafe { inb(STATUS) }
+        self.status_command.read8(0)
     }
 
     fn command(&self, cmd: u8) {
-        // SAFETY: the type invariant; `cmd` is a controller command, which affects only
-        // the controller.
-        unsafe { outb(COMMAND, cmd) };
+        self.status_command.write8(0, cmd);
     }
 
     /// Waits until the output buffer has a byte, then reads it; `None` if none arrives.
     fn read(&self) -> Option<u8> {
         for _ in 0..POLL_LIMIT {
             if self.status() & OUTPUT_FULL != 0 {
-                // SAFETY: a byte is waiting; reading the data port consumes it.
-                return Some(unsafe { inb(DATA) });
+                return Some(self.data.read8(0));
             }
             core::hint::spin_loop();
         }
@@ -81,8 +74,7 @@ impl Controller {
     fn write_data(&self, byte: u8) -> bool {
         for _ in 0..POLL_LIMIT {
             if self.status() & INPUT_FULL == 0 {
-                // SAFETY: the controller is ready for a byte; this writes the data port.
-                unsafe { outb(DATA, byte) };
+                self.data.write8(0, byte);
                 return true;
             }
             core::hint::spin_loop();
@@ -108,8 +100,7 @@ impl Controller {
             if self.status() & OUTPUT_FULL == 0 {
                 return;
             }
-            // SAFETY: a byte is waiting; discard it.
-            let _ = unsafe { inb(DATA) };
+            let _ = self.data.read8(0);
         }
     }
 }
@@ -119,7 +110,7 @@ impl Controller {
 pub(crate) fn init(com1: &mut Console, rsdp: u64) -> bool {
     let fadt = crate::firmware::acpi_table(rsdp, b"FACP")
         .ok()
-        .and_then(|t| framekernel::acpi::parse_fadt(t).ok());
+        .and_then(|t| crate::acpi::parse_fadt(t).ok());
     if fadt.is_some_and(|f| f.i8042 == Some(false)) {
         let _ = writeln!(
             com1,
@@ -127,9 +118,20 @@ pub(crate) fn init(com1: &mut Console, rsdp: u64) -> bool {
         );
         return true;
     }
-    // SAFETY: CPL 0, boot processor, interrupts disabled during bring-up; nothing else
-    // uses these ports.
-    let c = unsafe { Controller::new() };
+    // The controller's two ports; a first claim, so it cannot have been taken.
+    let (Some(data), Some(status_command)) =
+        (PortRange::claim(DATA, 1), PortRange::claim(COMMAND, 1))
+    else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: i8042: its ports are not available: i8042 failed"
+        );
+        return false;
+    };
+    let c = Controller {
+        data,
+        status_command,
+    };
     // Disable both ports so no device traffic races the configuration, and flush.
     c.command(DISABLE_PORT1);
     c.command(DISABLE_PORT2);

@@ -1,5 +1,7 @@
 # Hardware shortlist for the first physical tests
 
+> **2026-11-09:** the owner cannot buy machines for now. See `docs/research/2026-11-09-testing-without-buying-hardware.md` for what can be tested without buying. This list stays as the record of what would be bought if that changes.
+
 | | |
 |---|---|
 | Answers | Owner sheet item 24 ("Research a shortlist", 2026-11-08) |

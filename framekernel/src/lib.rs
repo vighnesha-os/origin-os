@@ -1,6 +1,6 @@
 //! Origin OS Framekernel: M1 entry, M2, and the first M3 steps (CLAUDE.md §19, §24–§28).
 //!
-//! The Origin boot loader jumps to `_start` (`src/main.rs`) after `ExitBootServices`, with
+//! The Origin boot loader jumps to `_start` (`frame/entry/main.rs`) after `ExitBootServices`, with
 //! the physical address of an [`origin_boot_info::BootInfo`] in `rdi`. The kernel brings up
 //! its console (the firmware's framebuffer and a UART, ADR-0010), checks that the loader
 //! applied its relocations, validates the boot info, prints a summary of it, loads its own
@@ -13,8 +13,10 @@
 //! periodic interrupts, then starts every application processor the ACPI MADT lists (M3),
 //! proves preemptive kernel threads on every processor, and halts.
 //!
-//! This library holds everything that can be unit-tested on the build host, all of it safe
-//! code (`forbid(unsafe_code)`):
+//! This library is the kernel above the privileged framework (`origin-frame`, the
+//! `framekernel/frame/` crate, ADR-0011 N6), all of it safe code: `forbid(unsafe_code)` at the
+//! crate root covers every module. What the framework needs is re-exported here from it.
+//! The logic unit-tested on the build host:
 //! - [`acpi`]: RSDP, XSDT and MADT parsing (checksummed) for processor discovery;
 //! - [`amdvi`]: AMD IOMMU (AMD-Vi) register, table, command and event encodings and a host
 //!   page-table walker (DMA and interrupt remapping);
@@ -55,6 +57,7 @@
 //! - [`ivrs`]: the ACPI IVRS table (AMD IOMMUs, their device entries, memory definitions);
 //! - [`json`]: a depth-limited JSON parser (config, manifests, SDK data);
 //! - [`klog`]: a bounded kernel log ring (level + inline message, drop-oldest);
+//! - [`linequeue`]: the bounded text queue behind each of the console's two sinks;
 //! - [`net`]: Ethernet/IPv4/ICMP/ARP headers and the Internet checksum;
 //! - [`numa`]: a locality map (CPU/address → node, nearest-node order) from the SRAT/SLIT;
 //! - [`originfs`]: a read-only OriginFS on-disk parser and image builder (ADR-0006,
@@ -91,58 +94,46 @@
 //! - [`vtd`]: Intel VT-d register, table and descriptor encodings and a second-level
 //!   page-table walker (DMA and interrupt remapping).
 //!
-//! The binary holds the entry point, x86 port I/O, the descriptor tables, exception and
-//! interrupt stubs, MSR access and fault probes (`src/cpu.rs`), the APIC timer bring-up
-//! (`src/timer.rs`), the spin lock (`src/sync.rs`), the global allocator (`src/memory.rs`),
-//! the live address space (`src/vm.rs`), AP start-up and its trampoline (`src/smp.rs`), the
-//! per-CPU scheduler (`src/sched.rs`), and the panic handler. All of it is original code written for this
-//! project, with no third-party crates (CLAUDE.md §3, §5).
+//! For the kernel's own target it also holds the kernel proper: the boot flow ([`kernel_main`])
+//! and the services (scheduler, processes, IPC, system calls, drivers), on top of the
+//! framework's typed interfaces. All of it is original code written for this project, with no
+//! third-party crates (CLAUDE.md §3, §5).
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
-pub mod acpi;
-pub mod amdvi;
-pub mod apic;
-pub mod apstart;
 pub mod base64;
-pub mod bitmap;
 pub mod blockcache;
-pub mod boot;
 pub mod bootproof;
 pub mod cache;
 pub mod channel;
-pub mod clock;
-pub mod cpumap;
 pub mod deflate;
-pub mod descriptors;
 pub mod dhcp;
-pub mod dmar;
 pub mod dns;
 pub mod editbuffer;
 pub mod entropy;
 pub mod fbconsole;
-pub mod features;
 pub mod font;
-pub mod frames;
 pub mod glob;
 pub mod gpt;
 pub mod handles;
 pub mod hashmap;
-pub mod heap;
 pub mod hpet;
 pub mod initramfs;
 pub mod ioapic;
-pub mod ivrs;
 pub mod json;
 pub mod klog;
+pub mod linequeue;
 pub mod net;
 pub mod numa;
 pub mod nvme;
 pub mod originfs;
+pub use origin_frame::{
+    acpi, amdvi, apic, apstart, bitmap, boot, clock, cpumap, descriptors, dmar, features, frames,
+    heap, ivrs, pci, topology, unwind, usercopy, vtd,
+};
 pub use origin_paging as paging;
-pub mod pci;
 pub mod ps2;
 pub mod raster;
 pub mod report;
@@ -155,16 +146,59 @@ pub mod serial;
 pub mod spcr;
 pub mod tcp;
 #[cfg(test)]
+#[path = "../frame/src/testing.rs"]
 mod testing;
 pub mod text;
 pub mod tftp;
 pub mod timers;
-pub mod topology;
-pub mod unwind;
-pub mod usercopy;
 pub mod ustar;
 pub mod utf16;
 pub mod vfs;
 pub mod virtio;
 pub mod virtqueue;
-pub mod vtd;
+
+// The kernel proper, for its own target only: the boot flow and the services, on the
+// framework's typed interfaces.
+#[cfg(target_os = "none")]
+mod block;
+#[cfg(target_os = "none")]
+mod console;
+#[cfg(target_os = "none")]
+mod dma;
+#[cfg(target_os = "none")]
+mod i8042;
+#[cfg(target_os = "none")]
+mod ipc;
+#[cfg(target_os = "none")]
+mod ipc_proof;
+#[cfg(target_os = "none")]
+mod irq;
+#[cfg(target_os = "none")]
+mod kernel;
+#[cfg(target_os = "none")]
+mod pcie;
+#[cfg(target_os = "none")]
+mod process;
+#[cfg(target_os = "none")]
+mod sched;
+#[cfg(target_os = "none")]
+mod storage;
+#[cfg(target_os = "none")]
+mod syscall;
+#[cfg(target_os = "none")]
+mod time;
+#[cfg(target_os = "none")]
+mod tlb;
+#[cfg(target_os = "none")]
+mod user;
+#[cfg(target_os = "none")]
+mod virtionet;
+#[cfg(target_os = "none")]
+mod wait;
+
+#[cfg(target_os = "none")]
+pub use kernel::kernel_main;
+#[cfg(target_os = "none")]
+pub(crate) use kernel::{COM1_BASE, INITRAMFS_IMAGE, check_initramfs};
+#[cfg(target_os = "none")]
+pub(crate) use origin_frame::{cpu, firmware, iommu, memory, phys, smp, timer, vm};

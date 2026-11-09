@@ -10,7 +10,9 @@ mod disk;
 mod loom;
 mod screen;
 mod serial;
+mod unsafety;
 
+use std::borrow::Cow;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -50,6 +52,8 @@ commands:
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
+  unsafe-gate only the gate on `unsafe` and on the kernel's dependency direction (part of
+              check; quick)
 
 environment:
   ORIGIN_LOOM_DEEP                    if set, the Loom models search to their deeper bounds
@@ -74,6 +78,9 @@ environment:
                                       machine)
   ORIGIN_QEMU_BRIDGE                  on: the NIC behind a PCIe root port (the boot-bridge
                                       machine)
+  ORIGIN_QEMU_ACCEL                   tcg (default) or kvm: run on a real x86-64 processor (needs
+                                      an x86-64 host with /dev/kvm); the devices and firmware
+                                      stay QEMU's
   ORIGIN_QEMU_DEBUG                   if set, QEMU logs interrupts and resets to
                                       target/xtask/qemu-debug.log";
 
@@ -89,9 +96,13 @@ const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// clippy-clean on every target and free of panic paths (ONBF §12).
 const BOOT_INFO_PACKAGE: &str = "origin-boot-info";
 const KERNEL_PACKAGE: &str = "framekernel";
+/// The Framekernel's privileged framework (ADR-0011 N6).
+const FRAMEWORK_PACKAGE: &str = "origin-frame";
 const PACK_PACKAGE: &str = "onbf-pack";
 /// The host-only signing code (CLAUDE.md §59): never linked into the OS.
 const SIGN_PACKAGE: &str = "onbf-sign";
+/// The interface-language tool (docs/spec/OIDL.md): host only.
+const OIDL_PACKAGE: &str = "oidl";
 const FREESTANDING_LIBS: &[&str] = &[
     BOOT_INFO_PACKAGE,
     ONBF_FORMAT_PACKAGE,
@@ -181,12 +192,13 @@ struct Completed {
 /// The good path: the loader verifies and enters the kernel, and the kernel reports on
 /// COM1. The banners are built from the same generated constants as the binaries, so the
 /// test also checks that the release identity reached both.
-/// QEMU's machine option: q35, with what `ORIGIN_QEMU_MACHINE` adds (for example
-/// `pit=off,i8042=off` for a machine with no 8254 or 8042).
-fn qemu_machine_options() -> String {
+/// QEMU's machine option: `base` (what the accelerator needs), with what
+/// `ORIGIN_QEMU_MACHINE` adds (for example `pit=off,i8042=off` for a machine with no 8254 or
+/// 8042).
+fn qemu_machine_options(base: &str) -> String {
     match env::var("ORIGIN_QEMU_MACHINE") {
-        Ok(extra) if !extra.is_empty() => format!("q35,{extra}"),
-        _ => "q35".to_string(),
+        Ok(extra) if !extra.is_empty() => format!("{base},{extra}"),
+        _ => base.to_string(),
     }
 }
 
@@ -260,6 +272,7 @@ fn parse_iommu(value: Option<&str>) -> Iommu {
 /// IOMMU: a raw `-device` value is booted with the VT-d markers, so it must be an
 /// `intel-iommu`.
 fn check_environment() -> Result {
+    Accel::from_env()?;
     check_iommu(&qemu_iommu())
 }
 
@@ -287,6 +300,67 @@ fn qemu_cpus() -> u32 {
         .and_then(|v| v.parse().ok())
         .filter(|n| (1..=64).contains(n))
         .unwrap_or(2)
+}
+
+/// How QEMU runs the guest's instructions (`ORIGIN_QEMU_ACCEL`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Accel {
+    /// QEMU's software CPU: the default, and all an Apple Silicon host has.
+    Tcg,
+    /// The host's real x86-64 processor, through KVM. The devices and the firmware stay QEMU's.
+    Kvm,
+}
+
+impl Accel {
+    /// The accelerator a value of `ORIGIN_QEMU_ACCEL` names: unset, empty or `tcg` is TCG.
+    fn named(value: Option<&str>) -> Result<Accel> {
+        match value.filter(|v| !v.is_empty()) {
+            None | Some("tcg") => Ok(Accel::Tcg),
+            Some("kvm") => Ok(Accel::Kvm),
+            Some(other) => Err(format!(
+                "ORIGIN_QEMU_ACCEL must be tcg or kvm, not {other:?}"
+            )),
+        }
+    }
+
+    fn from_env() -> Result<Accel> {
+        Accel::named(env::var("ORIGIN_QEMU_ACCEL").ok().as_deref())
+    }
+
+    /// The `-machine` value. Interrupt remapping needs the I/O APIC in QEMU, not in the host
+    /// kernel, hence the split irqchip.
+    fn machine(self) -> &'static str {
+        match self {
+            Accel::Tcg => "q35",
+            Accel::Kvm => "q35,accel=kvm,kernel-irqchip=split",
+        }
+    }
+
+    /// The complete lines of a boot that failure messages are looked for in: under KVM,
+    /// without the lines [`kvm_forgives`] describes.
+    fn judged(self, complete: &str) -> Cow<'_, str> {
+        match self {
+            Accel::Tcg => Cow::Borrowed(complete),
+            Accel::Kvm => Cow::Owned(
+                complete
+                    .lines()
+                    .filter(|l| !kvm_forgives(l))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        }
+    }
+
+    /// The failure messages a screen is searched for. A screen wraps long lines, so under KVM
+    /// the lines [`kvm_forgives`] describes cannot be told from the rest there, and the
+    /// screen-only boot leaves those messages to the boots with a serial port.
+    fn screen_failures(self, failures: &[&'static str]) -> Vec<&'static str> {
+        failures
+            .iter()
+            .copied()
+            .filter(|f| self == Accel::Tcg || !KVM_FORGIVEN_MESSAGES.contains(f))
+            .collect()
+    }
 }
 
 /// The processors QEMU presents, and what the kernel must find.
@@ -522,6 +596,9 @@ fn boot_scenario() -> Scenario {
     if qemu_iommu() == Iommu::Amd {
         amd_iommu_markers(&mut scenario, &machine);
     }
+    if Accel::from_env() == Ok(Accel::Kvm) {
+        kvm_markers(&mut scenario, qemu_iommu() != Iommu::Amd);
+    }
     if qemu_bridge() {
         bridge_markers(&mut scenario);
     }
@@ -589,6 +666,227 @@ fn no_i8042_markers(scenario: &mut Scenario) {
         "self-test 0x55 (want 0x55), keyboard port test 0x00 (want 0x00)",
         "origin-kernel: i8042: the FADT says this platform has none".into(),
     );
+}
+
+/// The markers of a boot under KVM: what the VT-d pin proof can show there, and without two
+/// things a forgiven line leaves out. The kernel prints [`EVEN_SHARES_LINE`] only when every
+/// processor's workers got even shares ([`is_uneven_fair_share`]), and the TX proof's line
+/// ends `consistent true` only when its ring filled ([`is_unfilled_tx_ring`]). Each
+/// processor's own line and the TX line itself are still required.
+fn kvm_markers(scenario: &mut Scenario, vt_d: bool) {
+    if vt_d {
+        kvm_pin_markers(scenario);
+    }
+    scenario
+        .markers
+        .retain(|m| !m.starts_with(EVEN_SHARES_LINE));
+    let tx = scenario
+        .markers
+        .iter()
+        .position(|m| m == "origin-kernel: virtio-net TX: ");
+    match tx {
+        Some(at)
+            if scenario.markers.get(at + 1).map(String::as_str) == Some("; consistent true") =>
+        {
+            scenario.markers.remove(at + 1);
+        }
+        _ => scenario
+            .markers
+            .push("xtask: the virtio-net TX markers are not as expected".to_string()),
+    }
+}
+
+/// What the VT-d pin proof can show under KVM. Its last two steps take a remapped pin's IRTE
+/// away and then make it check the wrong source ID, and expect the interrupts to stop. With
+/// KVM's split irqchip QEMU keeps the route it already has when the IRTE goes away, so they
+/// keep arriving, no fault is recorded and the kernel rightly reports a failure. TCG proves
+/// those two steps; here the rest of each line must still hold, the restored IRTE carrying
+/// interrupts again. Every other marker and failure message stays in force.
+fn kvm_pin_markers(scenario: &mut Scenario) {
+    let first = " not present: 0 interrupts arrived in 100 ms; fault recorded: source ID 0xffff, interrupt index ";
+    let after = "origin-kernel: I/O APIC: remapped: the entry masked, the PIT stopped and IRTE ";
+    let start = scenario.markers.iter().position(|m| m == first);
+    let end = start.and_then(|s| {
+        scenario.markers[s..]
+            .iter()
+            .position(|m| m == after)
+            .map(|n| s + n)
+    });
+    match (start, end) {
+        (Some(s), Some(e)) => {
+            let restored = "; fault recorded: none; IRTE restored, ";
+            let failed = " again: true; consistent false: I/O APIC failed";
+            scenario.markers.splice(
+                s..e,
+                [
+                    " not present: ",
+                    restored,
+                    failed,
+                    "origin-kernel: I/O APIC: IRTE ",
+                    " checking source ID 0xff01 instead of 0xff00: ",
+                    restored,
+                    failed,
+                ]
+                .map(String::from),
+            );
+        }
+        _ => scenario
+            .markers
+            .push(format!("xtask: the VT-d marker {first:?} is missing")),
+    }
+}
+
+/// Whether a boot's processor says it is Intel's: a `vendor=` in the model decides. Without
+/// one, TCG's `max` is AMD's, and under KVM the processor reports the host's vendor.
+fn guest_is_intel(model: &str, accel: Accel, host_is_intel: bool) -> bool {
+    if model.contains("vendor=") {
+        return model.contains("vendor=GenuineIntel");
+    }
+    accel == Accel::Kvm && host_is_intel
+}
+
+/// Whether this host's processor is Intel's (read only for KVM, which needs a Linux host).
+fn host_is_intel() -> bool {
+    fs::read_to_string("/proc/cpuinfo").is_ok_and(|info| info.contains("GenuineIntel"))
+}
+
+/// True for a line reporting a failure under KVM that says nothing about the kernel. Every
+/// other failure fails the boot.
+fn kvm_forgives(line: &str) -> bool {
+    is_pin_limit(line)
+        || is_small_tsc_step(line)
+        || is_unfilled_tx_ring(line)
+        || is_uneven_fair_share(line)
+}
+
+/// The failure messages of the lines [`kvm_forgives`] lets pass.
+const KVM_FORGIVEN_MESSAGES: [&str; 4] = [
+    IOAPIC_FAILED,
+    CLOCK_FAILED,
+    ": virtio-net failed",
+    ": scheduler failed",
+];
+
+/// The virtio-net TX proof's line when the only thing missing is a ring that filled. The
+/// proof queues one frame more than the ring holds, without a kick, expecting the ring to
+/// fill. QEMU's device runs in its own thread and, after an earlier kick, can go on taking
+/// frames as they appear, so on a fast enough processor the batch drains as it is queued.
+/// Everything else the proof asks for must still be there.
+fn is_unfilled_tx_ring(line: &str) -> bool {
+    if !line.starts_with("origin-kernel: virtio-net TX: ")
+        || !line.contains("; the ring was full 0 times and senders slept ")
+        || !line.ends_with("; consistent false: virtio-net failed")
+    {
+        return false;
+    }
+    let number = |word| number_before(line, word);
+    match (
+        number(" frames through "),
+        number(" descriptors ("),
+        number(" completions reclaimed"),
+        number(" of "),
+        number(" free at the end"),
+        number(" times, woken by"),
+        number(" (of "),
+        number("); consistent"),
+    ) {
+        (
+            Some(sent),
+            Some(descriptors),
+            Some(reclaimed),
+            Some(free),
+            Some(of),
+            Some(slept),
+            Some(woken),
+            Some(interrupts),
+        ) => {
+            sent > descriptors
+                && reclaimed == sent
+                && free == descriptors
+                && of == descriptors
+                && slept > 0
+                && woken > 0
+                && interrupts > 0
+        }
+        _ => false,
+    }
+}
+
+/// How unequal two workers' counts [`is_uneven_fair_share`] lets pass: the larger under this
+/// many times the smaller.
+const KVM_FAIR_SHARE_FACTOR: u64 = 4;
+
+/// The scheduler proof's line for a processor whose two workers both ran, for enough rounds,
+/// but got unequal amounts done. The proof counts loop iterations, not processor time, and a
+/// runner's virtual processors share physical cores: a Xeon 8370C showed 2.1 to 2.5 times.
+/// TCG holds the proof to a factor of two.
+fn is_uneven_fair_share(line: &str) -> bool {
+    if !line.starts_with("origin-kernel: scheduler: CPU ")
+        || !line.ends_with(" context switches: scheduler failed")
+    {
+        return false;
+    }
+    let Some((_, counts)) = line.split_once(" counted ") else {
+        return false;
+    };
+    match (
+        number_before(counts, " and "),
+        number_before(counts, ", "),
+        number_before(counts, " context switches"),
+    ) {
+        (Some(first), Some(second), Some(switches)) => {
+            let (low, high) = (first.min(second), first.max(second));
+            low > 0 && high < low.saturating_mul(KVM_FAIR_SHARE_FACTOR) && switches >= 15
+        }
+        _ => false,
+    }
+}
+
+/// The two lines of [`kvm_pin_markers`], exactly as KVM leaves them: no fault was recorded and
+/// the interrupts came back.
+fn is_pin_limit(line: &str) -> bool {
+    line.starts_with("origin-kernel: I/O APIC: IRTE ")
+        && (line.contains(" not present: ") || line.contains(" checking source ID "))
+        && line.contains("; fault recorded: none; IRTE restored, ")
+        && line.ends_with(" again: true; consistent false: I/O APIC failed")
+}
+
+/// The largest step back in the TSC [`is_small_tsc_step`] lets pass: under half a microsecond
+/// at the rates these machines run.
+const KVM_TSC_STEP_LIMIT: u64 = 1000;
+
+/// The TSC proof's line when all it saw was a rare, tiny step back. On a runner the guest's
+/// processors are virtual processors of a virtual machine, which the hypervisors below can
+/// move between physical processors whose counters agree only to within nanoseconds: an AMD
+/// EPYC 9V45 runner showed one step of 16 ticks in 261,083 handoffs. A steady offset between
+/// two processors would step back on nearly every handoff one way, and a large step is not
+/// this, so neither is forgiven. TCG, whose processors share one clock, holds the proof to
+/// zero.
+fn is_small_tsc_step(line: &str) -> bool {
+    if !line.starts_with("origin-kernel: clock: TSC consistent across ") {
+        return false;
+    }
+    let tail = " ticks): clock failed";
+    match (
+        number_before(line, " handoffs between"),
+        number_before(line, " backwards (worst "),
+        number_before(line, tail),
+    ) {
+        (Some(handoffs), Some(backwards), Some(worst)) => {
+            line.ends_with(tail)
+                && backwards >= 1
+                && backwards.saturating_mul(1000) <= handoffs
+                && worst < KVM_TSC_STEP_LIMIT
+        }
+        _ => false,
+    }
+}
+
+/// The decimal number written immediately before the first `word` in `text`.
+fn number_before(text: &str, word: &str) -> Option<u64> {
+    let head = text.get(..text.find(word)?)?;
+    let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    head.get(head.len() - digits..)?.parse().ok()
 }
 
 /// The `boot-bridge` machine (`ORIGIN_QEMU_BRIDGE=on`): the NIC at 01:00.0 behind a PCIe root
@@ -927,13 +1225,19 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
                 "origin-kernel: CPU state: machine checks raise #MC, x87 errors raise #MF, ring 3 has no RDPMC, FSGSBASE or SYSENTER, no debug breakpoint armed: {cpus} of {cpus} processors"
             ),
             "origin-kernel: reclaimed ".into(),
+            // A boot step out of turn, or run twice, does nothing (ADR-0011 N6).
+            "origin-kernel: boot steps: out of turn refused true; a second run refused true".into(),
         ]
         .into_iter()
         // CPU topology from CPUID (leaf 1Fh, 0Bh): each processor, the layout, the MADT.
         .chain(topology_markers(
             machine,
             machine.geometry.has_extended_levels()
-                && qemu_cpu_model().contains("vendor=GenuineIntel"),
+                && guest_is_intel(
+                    &qemu_cpu_model(),
+                    Accel::from_env().unwrap_or(Accel::Tcg),
+                    host_is_intel(),
+                ),
         ))
         .chain([
             // NUMA from the ACPI SRAT (QEMU is booted with two -numa nodes): every online
@@ -975,12 +1279,21 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: processes: PML4 ".into(),
             "at once and read back 0x400800 from 0x500000 (own values only: 0x400800); not mapped in the kernel's tables: true".into(),
             format!("origin-kernel: clock: TSC consistent across {cpus} processors: "),
+            // ADR-0012: no caller is ever given less than before, on any processor; and what a
+            // read costs, measured (CLAUDE.md rule 21).
+            format!("origin-kernel: clock: monotonic across {cpus} processors: "),
+            "origin-kernel: clock: reading it costs ".into(),
             // Every CPU printed its lines at once; `console_lines_intact` checks each one.
             format!(
                 "origin-kernel: console: {cpus} processors printed {CONSOLE_LINES} lines each at once"
             ),
-            // What drawing a line costs, measured (CLAUDE.md rule 21).
-            "origin-kernel: console: framebuffer: ".into(),
+            // A thread's line, drawn a section at a time with interrupts on between them.
+            "origin-kernel: console: a line drawn by a thread: ".into(),
+            "origin-kernel: console: a thread's line took ".into(),
+            // Lines from a writer that cannot wait fill the UART's queue, and the next writer
+            // waits for room: `unwaited_lines_whole` reads each of them back.
+            "origin-kernel: console: a line that had to wait for room: ".into(),
+            " lines from a writer that cannot wait filled the UART's queue".into(),
             // ADR-0004 H5: global kernel pages on every CPU, nothing global in the lower
             // half; and TLB shootdowns: every other CPU's next read of each unmapped page
             // faults.
@@ -1191,6 +1504,31 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // Integration: a /sys tree built in the VFS from live discovered facts.
             "origin-kernel: sysfs: built /sys with 4 facts (4 subtrees): ".into(),
             "bus/pci/count=7, block/nvme0/size_mib=16; read back pci count Some(7)".into(),
+            // A line sent to the UART in sections (`console::prove_uart_sections`, near the
+            // end so its lines are on the screen for the screen check): on the UART before
+            // its writer goes on; an interrupt taken before it was all sent, whose handler's
+            // line came after it on the wire; a breakpoint in the middle of another; every
+            // section one FIFO load at most; and what a section costs, measured (rule 21).
+            "origin-kernel: console: a line sent on the UART a section at a time: ".into(),
+            "origin-kernel: console: a line sent in sections while an interrupt waits: ".into(),
+            "origin-kernel: console: this line comes from an interrupt handler".into(),
+            "origin-kernel: console: a line sent in sections with a breakpoint in the middle: ".into(),
+            "origin-kernel: exception 3 (#BP breakpoint) at rip".into(),
+            "origin-kernel: breakpoint handled; resuming".into(),
+            "origin-kernel: console: a line took ".into(),
+            "origin-kernel: console: UART: ".into(),
+            // A line drawn in sections (`console::prove_sections`, last so its lines are
+            // on the screen for the screen check): an interrupt taken before it was finished,
+            // whose handler's line queued behind it; a breakpoint in the middle of another;
+            // every section at most 1 KiB of pixels; and what drawing a line costs, measured
+            // (CLAUDE.md rule 21).
+            "origin-kernel: console: a line drawn in sections while an interrupt waits: ".into(),
+            "origin-kernel: console: this line comes from an interrupt handler".into(),
+            "origin-kernel: console: a line drawn in sections with a breakpoint in the middle: ".into(),
+            "origin-kernel: exception 3 (#BP breakpoint) at rip".into(),
+            "origin-kernel: breakpoint handled; resuming".into(),
+            "origin-kernel: console: a line took ".into(),
+            "origin-kernel: console: framebuffer: ".into(),
             // ADR-0013: every proof was recorded. Whether it passed is the failure list's
             // job, line by line: a proof a machine forgives can fail here too.
             "origin-kernel: boot verdict: ".into(),
@@ -1204,6 +1542,8 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         failures: boot_failures(),
         check: Some(|done| {
             console_lines_intact(&done.serial, self::machine().cpus() as usize)?;
+            long_lines_whole(&done.serial)?;
+            unwaited_lines_whole(&done.serial)?;
             check_screen(done)
         }),
         stderr: vec![],
@@ -1246,6 +1586,7 @@ fn boot_failures() -> Vec<&'static str> {
         "origin-kernel: ACPI processor discovery failed",
         "origin-kernel: AP start-up not possible",
         ": AP start-up failed",
+        ": boot steps failed",
         ": scheduler failed",
         ": topology failed",
         ": CPU baseline failed",
@@ -1260,9 +1601,9 @@ fn boot_failures() -> Vec<&'static str> {
         ": NMI stack failed",
         ": higher half failed",
         ": process isolation failed",
-        ": clock failed",
+        CLOCK_FAILED,
         ": HPET failed",
-        ": I/O APIC failed",
+        IOAPIC_FAILED,
         ": PM timer failed",
         ": ipc failed",
         ": console failed",
@@ -1297,22 +1638,51 @@ const NO_SPCR: &str =
 /// Every scenario here boots the whole kernel, so it ends with this line.
 const HALT_LINE: &str = "origin-kernel: M1 entry complete; halting";
 
+/// How the line starts that the scheduler proof prints when every worker's share was even.
+const EVEN_SHARES_LINE: &str = "origin-kernel: preemptive multitasking: ";
+/// How every I/O APIC proof ends a line that failed.
+const IOAPIC_FAILED: &str = ": I/O APIC failed";
+/// How every clock proof ends a line that failed.
+const CLOCK_FAILED: &str = ": clock failed";
+
 /// The screen after a whole boot: exactly what the serial log says it must show (the
 /// console writes one line at a time to both).
 fn check_screen(done: &Completed) -> Result {
     let image = done.screen.as_ref().ok_or("no screen dump was taken")?;
-    let start = done
-        .serial
+    check_screen_text(image, &done.serial)
+}
+
+/// The check itself: `image` against everything the log says the console printed.
+fn check_screen_text(image: &screen::Image, serial: &str) -> Result {
+    let start = serial
         .find("origin-kernel: console: framebuffer")
         .ok_or("the serial log has no framebuffer console line")?;
-    let text = done.serial.get(start..).ok_or("serial log out of bounds")?;
+    let text = serial.get(start..).ok_or("serial log out of bounds")?;
     // The markers can be seen a moment before the serial port's last newline arrives; the
-    // console drew that whole last line before any of it left through the UART.
+    // whole last line is on the screen by then or very soon after ([`settled_screen`]).
     let mut text = text.to_string();
     if !text.ends_with('\n') {
         text.push('\n');
     }
     screen::check_frame(image, &text)
+}
+
+/// How long [`settled_screen`] gives the screen to catch up with the log.
+const SCREEN_SETTLE: Duration = Duration::from_secs(5);
+
+/// The screen dump to check, once it has caught up with the log. The console sends each line
+/// to the UART before it draws it (ADR-0010 Amendment 1), so a dump taken the moment the markers appear can be a line or so behind
+/// the log: this takes dumps until one matches or the time is up. Whichever comes first, the
+/// last one is returned for [`check_screen`] to judge, so a frame that never matches fails
+/// the same way as before, with the difference named.
+fn settled_screen(monitor: &mut ChildStdin, path: &Path, serial: &str) -> Result<screen::Image> {
+    let mut image = dump_screen(monitor, path, true)?;
+    let deadline = Instant::now() + SCREEN_SETTLE;
+    while check_screen_text(&image, serial).is_err() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+        image = dump_screen(monitor, path, false)?;
+    }
+    Ok(image)
 }
 
 /// Developer mode: an unsigned kernel still boots (ADR-0002 B8), and the loader says so.
@@ -1478,6 +1848,64 @@ fn console_lines_intact(text: &str, cpus: usize) -> Result {
     Ok(())
 }
 
+/// How many dots follow the prefix of each of the kernel's long proof lines
+/// (`framekernel/src/console.rs`: `PROOF_FILL`).
+const LONG_LINE_FILL: usize = 60;
+/// The long lines the console's proofs print, by their prefixes. Interrupts and reports come
+/// in the middle of them, and each is many sections long on both sinks.
+const LONG_LINES: [&str; 7] = [
+    "origin-kernel: console: a line drawn by a thread: ",
+    "origin-kernel: console: a line that had to wait for room: ",
+    "origin-kernel: console: a line sent on the UART a section at a time: ",
+    "origin-kernel: console: a line sent in sections while an interrupt waits: ",
+    "origin-kernel: console: a line sent in sections with a breakpoint in the middle: ",
+    "origin-kernel: console: a line drawn in sections while an interrupt waits: ",
+    "origin-kernel: console: a line drawn in sections with a breakpoint in the middle: ",
+];
+
+/// Every long line must have reached the UART once and whole: the dots, all of them and
+/// nothing else, where a load that overran the UART's FIFO would lose some, and an interrupt's
+/// or a report's line sent in the middle would show. (Such a line also has two `origin-kernel:`
+/// prefixes on it, which [`console_lines_intact`] refuses.)
+fn long_lines_whole(text: &str) -> Result {
+    for prefix in LONG_LINES {
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains(prefix)).collect();
+        let [line] = lines.as_slice() else {
+            return Err(format!(
+                "long proof line {prefix:?} appears {} times",
+                lines.len()
+            ));
+        };
+        let dots = line.strip_prefix(prefix);
+        if dots.is_none_or(|d| d.len() != LONG_LINE_FILL || d.bytes().any(|b| b != b'.')) {
+            return Err(format!("a long proof line is not whole: {line:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// The lines of a writer that cannot wait (`console::prove_room`), `0..n`, each with its dots:
+/// the queue must lose none of them, send none twice and keep their order.
+fn unwaited_lines_whole(text: &str) -> Result {
+    const PREFIX: &str = "origin-kernel: console: a line that cannot wait: ";
+    let mut next = 0;
+    for line in text.lines().filter(|l| l.contains(PREFIX)) {
+        let whole = line.strip_prefix(PREFIX).and_then(|rest| {
+            let (k, dots) = rest.split_once(": ")?;
+            (dots.len() == LONG_LINE_FILL && dots.bytes().all(|b| b == b'.'))
+                .then(|| k.parse::<usize>().ok())?
+        });
+        if whole != Some(next) {
+            return Err(format!("line {next} that could not wait: got {line:?}"));
+        }
+        next += 1;
+    }
+    if next == 0 {
+        return Err("no lines from a writer that could not wait".into());
+    }
+    Ok(())
+}
+
 /// Parses `{id} line {k} of 20: {letters}`.
 fn parse_console_line(rest: &str) -> Option<(u64, usize)> {
     let (id, rest) = rest.split_once(" line ")?;
@@ -1497,6 +1925,7 @@ fn main() -> ExitCode {
         .as_slice()
     {
         ["check"] => check(),
+        ["unsafe-gate"] => unsafety::gate(),
         ["build"] => build_loader(Loader::Developer).and_then(|loader| {
             let kernel = pack_kernel(&build_kernel()?)?;
             println!("{}\n{}", loader.display(), kernel.display());
@@ -1760,6 +2189,27 @@ fn console_scenarios() -> Vec<Scenario> {
             }),
             None,
         ),
+        // COM1's status port answers and never reports room to transmit, and there is no UART
+        // behind it: the kernel must give up after one bounded wait and say so on the screen,
+        // the only place left to say it. The wait is the whole of the first line's, whoever
+        // polls: the count is the limit, not the limit once for each line.
+        console_scenario(
+            "console: a UART that stops taking bytes",
+            Capture::Screen,
+            console_markers(&[&format!(
+                "origin-kernel: console: the UART was given up on after {} polls; nothing more is sent to it, and the screen said so at once: true",
+                framekernel::serial::TX_POLL_LIMIT
+            )]),
+            Some(|_| {
+                Ok(vec![
+                    "-chardev".into(),
+                    "null,id=wedged".into(),
+                    "-device".into(),
+                    "isa-debugcon,iobase=0x3fd,readback=0,chardev=wedged".into(),
+                ])
+            }),
+            None,
+        ),
         console_scenario(
             "console: no display",
             Capture::Com1,
@@ -1799,7 +2249,7 @@ fn boot_console() -> Result {
         run_scenario(scenario, kernel)?;
     }
     println!(
-        "xtask: boot-console passed ({} of {} scenarios: the UART the SPCR names, COM1 named, refused tables, a UART that takes no bytes, no display, no UART)",
+        "xtask: boot-console passed ({} of {} scenarios: the UART the SPCR names, COM1 named, refused tables, a UART that takes no bytes, one that stops taking them, no display, no UART)",
         chosen.len(),
         scenarios.len()
     );
@@ -1990,11 +2440,22 @@ fn check() -> Result {
             "-D",
             "warnings",
         ],
+        // The interface-language tool (a host tool): parser, generators and their tests.
+        &[
+            "clippy",
+            "--package",
+            OIDL_PACKAGE,
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
         &["test", "--package", "xtask"],
         &["test", "--package", LOADER_PACKAGE, "--lib"],
         &["test", "--package", VERSION_PACKAGE],
         &["test", "--package", PACK_PACKAGE],
         &["test", "--package", SIGN_PACKAGE],
+        &["test", "--package", OIDL_PACKAGE],
     ];
     for step in steps {
         run_step(cargo().args(*step))?;
@@ -2027,6 +2488,28 @@ fn check() -> Result {
         }
         run_step(cargo().args(["test", "--package", package]))?;
     }
+    // The framework: its logic on the host (with tests), and for the kernel's own target.
+    run_step(cargo().args([
+        "clippy",
+        "--package",
+        FRAMEWORK_PACKAGE,
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run_step(cargo().args([
+        "clippy",
+        "--package",
+        FRAMEWORK_PACKAGE,
+        "--lib",
+        "--target",
+        KERNEL_TARGET,
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run_step(cargo().args(["test", "--package", FRAMEWORK_PACKAGE]))?;
     // The Framekernel: its library on the host (with tests), the binary on its target.
     run_step(cargo().args([
         "clippy",
@@ -2069,6 +2552,7 @@ fn check() -> Result {
     no_panic_check()?;
     dependency_check()?;
     linux_cfg_lint()?;
+    unsafety::gate()?;
     manifest_version_lint()?;
     signing_stays_off_the_os_lint()?;
     signing_has_no_secret_branches()?;
@@ -3158,7 +3642,7 @@ fn qemu_command(s: &Staged) -> Result<Command> {
     let machine = machine();
     let mut c = Command::new(QEMU);
     c.arg("-machine")
-        .arg(qemu_machine_options())
+        .arg(qemu_machine_options(Accel::from_env()?.machine()))
         .arg("-cpu")
         .arg(qemu_cpu_model())
         .args(["-m", "512M", "-smp"])
@@ -3377,6 +3861,7 @@ fn select_scenarios<'a>(
 fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
     let staged = stage(kernel, scenario.loader)?;
     let timeout = boot_test_timeout()?;
+    let accel = Accel::from_env()?;
     let work = target_dir().join("xtask");
     let mut cmd = qemu_command(&staged)?;
     if let Some(args) = scenario.qemu_args {
@@ -3450,7 +3935,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
             monitor,
             &screen_path,
             &markers,
-            &scenario.failures,
+            &accel.screen_failures(&scenario.failures),
             deadline,
         )
     } else {
@@ -3464,7 +3949,8 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
                     let complete = text
                         .get(..text.rfind('\n').map_or(0, |i| i + 1))
                         .unwrap_or("");
-                    if let Some(m) = scenario.failures.iter().find(|m| complete.contains(**m)) {
+                    let judged = accel.judged(complete);
+                    if let Some(m) = scenario.failures.iter().find(|m| judged.contains(**m)) {
                         break Err(format!("the serial output contains {m:?}"));
                     }
                     if serial::contains_in_order(&text, &markers) {
@@ -3472,8 +3958,10 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    let text = serial::clean(&raw);
+                    let missing = serial::first_missing(&text, &markers).unwrap_or("(none)");
                     break Err(format!(
-                        "no complete loader output within {}s",
+                        "first missing marker {missing:?}; no complete loader output within {}s",
                         timeout.as_secs()
                     ));
                 }
@@ -3490,7 +3978,7 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
     let mut screen = None;
     if verdict.is_ok() && scenario.capture == Capture::Com1AndScreen {
         match stdin.as_mut() {
-            Some(monitor) => match dump_screen(monitor, &screen_path, true) {
+            Some(monitor) => match settled_screen(monitor, &screen_path, &text) {
                 Ok(image) => screen = Some(image),
                 Err(e) => verdict = Err(format!("no screen dump: {e}")),
             },
@@ -4130,6 +4618,267 @@ mod tests {
         assert!(sparse.geometry.has_extended_levels());
     }
 
+    #[test]
+    fn the_accelerator_is_tcg_unless_kvm_is_asked_for() {
+        assert_eq!(Accel::named(None), Ok(Accel::Tcg));
+        assert_eq!(Accel::named(Some("")), Ok(Accel::Tcg));
+        assert_eq!(Accel::named(Some("tcg")), Ok(Accel::Tcg));
+        assert_eq!(Accel::named(Some("kvm")), Ok(Accel::Kvm));
+        assert!(Accel::named(Some("hvf")).is_err());
+        assert_eq!(Accel::Tcg.machine(), "q35");
+        assert_eq!(Accel::Kvm.machine(), "q35,accel=kvm,kernel-irqchip=split");
+    }
+
+    #[test]
+    fn the_guest_is_intel_when_its_model_or_under_kvm_its_host_says_so() {
+        // A vendor in the model decides, on any host.
+        for host in [false, true] {
+            for accel in [Accel::Tcg, Accel::Kvm] {
+                assert!(guest_is_intel("max,vendor=GenuineIntel", accel, host));
+                assert!(!guest_is_intel("max,vendor=AuthenticAMD", accel, host));
+            }
+        }
+        // TCG's `max` is AMD's, whatever runs it.
+        assert!(!guest_is_intel("max", Accel::Tcg, true));
+        assert!(!guest_is_intel("max", Accel::Tcg, false));
+        // Under KVM, the host's.
+        assert!(guest_is_intel("max", Accel::Kvm, true));
+        assert!(!guest_is_intel("max", Accel::Kvm, false));
+        assert!(guest_is_intel("host", Accel::Kvm, true));
+    }
+
+    /// As the kernel printed them on a real AMD EPYC (Actions run 42547942738).
+    const KVM_NOT_PRESENT: &str = "origin-kernel: I/O APIC: IRTE 5 not present: 10 interrupts arrived in 100 ms; fault recorded: none; IRTE restored, 5 interrupts arrived on CPU 1 (APIC ID 1) again: true; consistent false: I/O APIC failed";
+    const KVM_WRONG_SOURCE: &str = "origin-kernel: I/O APIC: IRTE 5 checking source ID 0xff01 instead of 0xff00: 10 interrupts arrived in 100 ms; fault recorded: none; IRTE restored, 5 interrupts arrived on CPU 1 (APIC ID 1) again: true; consistent false: I/O APIC failed";
+
+    #[test]
+    fn kvm_forgives_only_the_two_lines_qemu_cannot_pass() {
+        assert!(kvm_forgives(KVM_NOT_PRESENT));
+        assert!(kvm_forgives(KVM_WRONG_SOURCE));
+        for line in [
+            // The interrupts did not come back.
+            KVM_NOT_PRESENT.replace("again: true", "again: false"),
+            KVM_WRONG_SOURCE.replace("again: true", "again: false"),
+            // A fault was recorded, so QEMU did act on the entry: not this limit.
+            KVM_NOT_PRESENT.replace("fault recorded: none", "fault recorded: source ID 0x0010"),
+            // Every other I/O APIC proof.
+            "origin-kernel: I/O APIC: remapped: the entry masked, the PIT stopped and IRTE 5 released: false; 0 fault(s) recorded after: I/O APIC failed".to_string(),
+            "origin-kernel: I/O APIC: remapped: 0 PIT interrupts arrived on CPU 1 (APIC ID 1) through IRTE 5 in 200 ms, 0 on other CPUs; fault recorded: none; consistent false: I/O APIC failed".to_string(),
+        ] {
+            assert!(!kvm_forgives(&line), "{line}");
+        }
+    }
+
+    /// As the kernel printed it on an AMD EPYC 9V45 (Actions run 42555218264).
+    const KVM_TSC_STEP: &str = "origin-kernel: clock: TSC consistent across 2 processors: 261609 ordered readings, 261083 handoffs between processors, 1 backwards (worst 16 ticks): clock failed";
+
+    #[test]
+    fn kvm_forgives_only_a_rare_tiny_step_back_in_the_tsc() {
+        assert!(kvm_forgives(KVM_TSC_STEP));
+        for line in [
+            // At the limit.
+            KVM_TSC_STEP.replace("worst 16 ticks", "worst 1000 ticks"),
+            // A steady offset: backwards on far more than one handoff in a thousand.
+            KVM_TSC_STEP.replace("1 backwards", "262 backwards"),
+            // It failed for another reason: too few handoffs, or a thread that never ended.
+            KVM_TSC_STEP.replace("1 backwards (worst 16", "0 backwards (worst 0"),
+            // Another clock proof.
+            "origin-kernel: clock: TSC rate 0: clock failed".to_string(),
+        ] {
+            assert!(!kvm_forgives(&line), "{line}");
+        }
+        // The most the ratio allows passes.
+        assert!(kvm_forgives(
+            &KVM_TSC_STEP.replace("1 backwards", "261 backwards")
+        ));
+    }
+
+    /// As the kernel printed it on an AMD EPYC 9V45 (Actions run 42561135158).
+    const KVM_TX_UNFILLED: &str = "origin-kernel: virtio-net TX: 25 frames through 4 descriptors (buffers allocated once), 25 completions reclaimed, 4 of 4 free at the end; the ring was full 0 times and senders slept 2 times, woken by the TX-completion interrupt 2 (of 22); consistent false: virtio-net failed";
+
+    #[test]
+    fn kvm_forgives_only_a_tx_ring_that_never_filled() {
+        assert!(kvm_forgives(KVM_TX_UNFILLED));
+        for line in [
+            // Frames were lost or still in flight.
+            KVM_TX_UNFILLED.replace("25 completions", "24 completions"),
+            KVM_TX_UNFILLED.replace("4 of 4 free", "3 of 4 free"),
+            // No more frames than descriptors went through, so nothing was reused.
+            KVM_TX_UNFILLED
+                .replace("25 frames", "4 frames")
+                .replace("25 completions", "4 completions"),
+            // Nobody slept, or the interrupt never came.
+            KVM_TX_UNFILLED.replace("slept 2 times", "slept 0 times"),
+            KVM_TX_UNFILLED.replace("interrupt 2 (of 22)", "interrupt 0 (of 22)"),
+            KVM_TX_UNFILLED.replace("interrupt 2 (of 22)", "interrupt 2 (of 0)"),
+            // The ring did fill, so it failed for another reason.
+            KVM_TX_UNFILLED.replace("full 0 times", "full 1 times"),
+        ] {
+            assert!(!kvm_forgives(&line), "{line}");
+        }
+    }
+
+    /// As the kernel printed it on a Xeon 8370C (Actions run 42561135174).
+    const KVM_UNEVEN_SHARE: &str = "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted 1600936 and 653292, 51 context switches: scheduler failed";
+
+    #[test]
+    fn kvm_forgives_only_a_moderately_uneven_share() {
+        assert!(kvm_forgives(KVM_UNEVEN_SHARE));
+        for line in [
+            // One worker hardly ran, or never did.
+            KVM_UNEVEN_SHARE.replace("653292", "400234"),
+            KVM_UNEVEN_SHARE.replace("653292", "0"),
+            // Too few rounds to mean anything.
+            KVM_UNEVEN_SHARE.replace("51 context", "14 context"),
+            // Other scheduler failures.
+            "origin-kernel: workers did not exit: scheduler failed".to_string(),
+            "origin-kernel: cannot spawn on CPU 1: scheduler failed".to_string(),
+        ] {
+            assert!(!kvm_forgives(&line), "{line}");
+        }
+    }
+
+    #[test]
+    fn number_before_reads_the_digits_right_before_the_word() {
+        assert_eq!(number_before("a 12 b", " b"), Some(12));
+        assert_eq!(number_before("12 b", " b"), Some(12));
+        assert_eq!(number_before("a b", " b"), None);
+        assert_eq!(number_before("a 1x b", " b"), None);
+        assert_eq!(number_before("a 12", " b"), None);
+    }
+
+    #[test]
+    fn only_kvm_leaves_those_lines_out_of_the_failure_search() {
+        let known = format!("a\n{KVM_NOT_PRESENT}\n{KVM_WRONG_SOURCE}\nb\n");
+        assert!(Accel::Tcg.judged(&known).contains(IOAPIC_FAILED));
+        assert!(!Accel::Kvm.judged(&known).contains(IOAPIC_FAILED));
+        let another = format!("{known}origin-kernel: I/O APIC: x{IOAPIC_FAILED}\n");
+        assert!(Accel::Kvm.judged(&another).contains(IOAPIC_FAILED));
+
+        let failures = boot_failures();
+        assert!(
+            Accel::Tcg
+                .screen_failures(&failures)
+                .contains(&IOAPIC_FAILED)
+        );
+        let on_kvm = Accel::Kvm.screen_failures(&failures);
+        assert!(!on_kvm.contains(&IOAPIC_FAILED));
+        for message in KVM_FORGIVEN_MESSAGES {
+            assert!(failures.contains(&message), "{message}");
+            assert!(!on_kvm.contains(&message), "{message}");
+        }
+        assert_eq!(on_kvm.len(), failures.len() - KVM_FORGIVEN_MESSAGES.len());
+    }
+
+    /// The KVM markers replace those two steps, and only those: they match what KVM prints and
+    /// not what TCG prints, so the boot that proves the steps cannot be mistaken for this one.
+    #[test]
+    fn the_kvm_markers_replace_the_two_pin_steps() {
+        let m = machine();
+        let mut s = boot_scenario_markers(&m);
+        let (before, target) = (s.markers.clone(), m.named(m.cpus().min(2) - 1));
+        kvm_pin_markers(&mut s);
+        assert!(
+            !s.markers
+                .iter()
+                .any(|m| m.starts_with("xtask: the VT-d marker"))
+        );
+        // Six out, seven in.
+        assert_eq!(s.markers.len(), before.len() + 1);
+        let at = s
+            .markers
+            .iter()
+            .position(|m| m == " not present: ")
+            .unwrap();
+        assert_eq!(s.markers[..at], before[..at]);
+        assert_eq!(s.markers[at + 7..], before[at + 6..]);
+
+        let window: Vec<&str> = s.markers[at..at + 7].iter().map(String::as_str).collect();
+        let on_kvm = format!("{KVM_NOT_PRESENT}\n{KVM_WRONG_SOURCE}\n");
+        assert!(serial::contains_in_order(&on_kvm, &window));
+        let on_tcg = format!(
+            "origin-kernel: I/O APIC: IRTE 5 not present: 0 interrupts arrived in 100 ms; fault recorded: source ID 0xffff, interrupt index 5, reason 0x22 (interrupt table entry not present), from a message without a requester ID (the DMAR names 0xff00); IRTE restored, 5 interrupts arrived on {target} again: true; consistent true\n"
+        );
+        assert!(!serial::contains_in_order(&on_tcg, &window));
+    }
+
+    /// The TX line a forgiven boot prints must not eat the `consistent true` of a later line,
+    /// so its own is gone and the rest of the list still matches that boot's order.
+    #[test]
+    fn kvm_does_not_ask_the_unfilled_ring_line_to_be_consistent() {
+        let m = machine();
+        let mut s = boot_scenario_markers(&m);
+        kvm_markers(&mut s, true);
+        let at = s
+            .markers
+            .iter()
+            .position(|m| m == "origin-kernel: virtio-net TX: ")
+            .unwrap();
+        assert_ne!(s.markers[at + 1], "; consistent true");
+        let boot = format!("{KVM_TX_UNFILLED}\norigin-kernel: virtio-net ping: x; consistent true");
+        let window = [
+            s.markers[at].as_str(),
+            "origin-kernel: virtio-net ping: ",
+            "; consistent true",
+        ];
+        assert!(serial::contains_in_order(&boot, &window));
+
+        // A list that has changed shape is reported, not silently accepted.
+        let mut other = boot_scenario_markers(&m);
+        let tx = other
+            .markers
+            .iter()
+            .position(|m| m == "origin-kernel: virtio-net TX: ")
+            .unwrap();
+        other.markers[tx + 1] = "something else".to_string();
+        kvm_markers(&mut other, true);
+        assert_eq!(
+            other.markers.last().map(String::as_str),
+            Some("xtask: the virtio-net TX markers are not as expected")
+        );
+    }
+
+    /// Under KVM, and only there, the even-shares line is not required: the proof prints it
+    /// only when no processor's shares were uneven.
+    #[test]
+    fn kvm_does_not_wait_for_the_even_shares_line() {
+        let m = machine();
+        let plain = boot_scenario_markers(&m);
+        assert!(
+            plain
+                .markers
+                .iter()
+                .any(|m| m.starts_with(EVEN_SHARES_LINE))
+        );
+        let per_cpu = "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted ";
+        assert!(plain.markers.iter().any(|m| m == per_cpu));
+
+        for vt_d in [true, false] {
+            let mut s = boot_scenario_markers(&m);
+            if !vt_d {
+                amd_iommu_markers(&mut s, &m);
+            }
+            kvm_markers(&mut s, vt_d);
+            assert!(!s.markers.iter().any(|m| m.starts_with(EVEN_SHARES_LINE)));
+            assert!(s.markers.iter().any(|m| m == per_cpu));
+            assert!(!s.markers.iter().any(|m| m.starts_with("xtask: ")));
+        }
+    }
+
+    /// A marker list without the proof's lines is reported, not silently left alone.
+    #[test]
+    fn the_kvm_markers_say_so_when_the_vt_d_lines_are_gone() {
+        let m = machine();
+        let mut s = boot_scenario_markers(&m);
+        amd_iommu_markers(&mut s, &m);
+        kvm_pin_markers(&mut s);
+        assert!(
+            s.markers
+                .last()
+                .is_some_and(|m| m.starts_with("xtask: the VT-d marker"))
+        );
+    }
+
     /// The table the boot proof hands QEMU means what the proof claims, by the kernel's own
     /// parser and the ACPI checks every table goes through.
     #[test]
@@ -4165,6 +4914,65 @@ mod tests {
             spcr::parse(&spcr_table(3, gas_io(SPCR_PORT), 7)),
             Err(spcr::SpcrError::Interface(3))
         );
+    }
+
+    fn long_lines() -> String {
+        LONG_LINES
+            .iter()
+            .map(|prefix| format!("{prefix}{}\n", ".".repeat(LONG_LINE_FILL)))
+            .collect()
+    }
+
+    fn unwaited(count: usize) -> String {
+        (0..count)
+            .map(|k| {
+                format!(
+                    "origin-kernel: console: a line that cannot wait: {k}: {}\n",
+                    ".".repeat(LONG_LINE_FILL)
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unwaited_lines_pass_only_if_all_are_there_once_and_whole_in_order() {
+        assert_eq!(unwaited_lines_whole(&unwaited(40)), Ok(()));
+        assert!(unwaited_lines_whole("").is_err());
+        let good = unwaited(4);
+        let lines: Vec<&str> = good.lines().collect();
+        // Lost, twice, out of order, cut short.
+        let lost = [lines[0], lines[2], lines[3]].join("\n");
+        assert!(unwaited_lines_whole(&lost).is_err());
+        let twice = [lines[0], lines[1], lines[1], lines[2]].join("\n");
+        assert!(unwaited_lines_whole(&twice).is_err());
+        let swapped = [lines[1], lines[0], lines[2]].join("\n");
+        assert!(unwaited_lines_whole(&swapped).is_err());
+        let short = good.replacen(&".".repeat(LONG_LINE_FILL), ".", 1);
+        assert!(unwaited_lines_whole(&short).is_err());
+    }
+
+    #[test]
+    fn long_lines_pass_only_if_every_one_is_whole() {
+        assert_eq!(long_lines_whole(&long_lines()), Ok(()));
+        // One whole line is missing, or there twice.
+        let good = long_lines();
+        let first = good.lines().next().unwrap();
+        assert!(long_lines_whole(good.strip_prefix(first).unwrap()).is_err());
+        assert!(long_lines_whole(&format!("{first}\n{good}")).is_err());
+        // A dot lost, as a burst that overran the FIFO would.
+        let short = good.replacen(&format!(": {}", ".".repeat(LONG_LINE_FILL)), ": .", 1);
+        assert!(long_lines_whole(&short).is_err());
+        // A report in the middle of a line.
+        let mixed = good.replacen(
+            &format!(": {}", ".".repeat(LONG_LINE_FILL)),
+            &format!(
+                ": {}origin-kernel: exception 3\n{}",
+                ".".repeat(10),
+                ".".repeat(LONG_LINE_FILL - 10)
+            ),
+            1,
+        );
+        assert!(long_lines_whole(&mixed).is_err());
     }
 
     #[test]

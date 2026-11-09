@@ -2,9 +2,9 @@
 
 | | |
 |---|---|
-| Status | **Proposed**, 2026-11-09. It decides what a machine does when the kernel's own checks fail, so it awaits the owner (CLAUDE.md §18). It is not an ABI or format decision (§84). Everything below is built and boot-tested under QEMU, on a local branch, except what Migration says is left for later; the follow-ups F1 to F6 this inventory found are fixed in the same branch. Nothing here has shipped. |
+| Status | **Accepted** by the owner on 2026-11-09, as proposed, with the recommended answer to each of the five questions below (decision sheet item 55). The owner's answer was "Accept both" to one question covering ADR-0012 and this ADR, relayed by the session that asked it. It decides what a machine does when the kernel's own checks fail (CLAUDE.md §18), and is not an ABI or format decision (§84). Everything below is built and boot-tested under QEMU, except what Migration says is left for later; the follow-ups F1 to F6 this inventory found are fixed. Nothing here has shipped, and nothing has run on physical hardware (§74). |
 | Requires | CLAUDE.md P0, P8, §13 (explicit panic handling), §18, §19 (early diagnostics), §20 (boot-failure detection), §24–§26, §28–§31, §58, §59, §65, §68, §69 (safe mode, boot recovery), §74, rules 14, 16, 30, 34, 35, 40 |
-| Code | `framekernel/src/bootproof.rs` (the policy table and the tally), `framekernel/src/main.rs` (`kernel_main`), `framekernel/src/sched.rs`, `framekernel/src/wait.rs`, `framekernel/src/{timer,time,irq,i8042,storage,pcie,acpi,apic}.rs`, `developer-tools/xtask/src/main.rs` |
+| Code | `framekernel/src/bootproof.rs` (the policy table and the tally), `framekernel/src/kernel.rs` (`kernel_main`), `framekernel/src/{sched,wait,time,irq,i8042,storage,pcie,console}.rs`, `framekernel/frame/src/{timer,early,port,acpi,apic}.rs`, `developer-tools/xtask/src/main.rs` |
 | Evidence | `docs/research/2026-11-09-boot-proof-failures.md`; `docs/engineering/SOURCE_PROVENANCE.md`, "What a failed boot proof means" |
 | Related | ADR-0003, ADR-0007 (the driver gate), ADR-0009 (hardware targets), ADR-0010 E5 (a console problem never stops the boot), ADR-0011, ADR-0012 C4 (which left this question open) |
 
@@ -60,9 +60,9 @@ It does not reset. Nothing yet records a boot attempt (§20), so a reset would o
 
 Before the halt line the kernel prints what its proofs found, on every console, because a real machine's operator has no `xtask` and the individual lines scroll away:
 
-- `origin-kernel: boot verdict: 46 of 46 proofs passed`
-- `origin-kernel: boot verdict: degraded: 43 of 46 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042`
-- `origin-kernel: boot verdict: degraded: 33 of 33 proofs passed; 13 did not run`
+- `origin-kernel: boot verdict: 50 of 50 proofs passed`
+- `origin-kernel: boot verdict: degraded: 47 of 50 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042`
+- `origin-kernel: boot verdict: degraded: 33 of 33 proofs passed; 17 did not run`
 
 It claims only what was recorded. "Passed" means the proof found nothing wrong: a proof that finds the hardware it needs absent says so on its own line and counts as passed, the proofs' existing convention (no HPET, no NVMe controller, no 8042). "Did not run" counts proofs a failure prevented, and is what "degraded" means there. The virtio-net proof is the one proof it does not cover (see Migration).
 
@@ -98,6 +98,7 @@ It claims only what was recorded. "Passed" means the proof found nothing wrong: 
 | APIC timer (`timer::init`) | No x2APIC, or no calibration source worked (the 8254, then the ACPI PM timer, then CPUID 15h's TSC rate), or the tick rate is wrong: no preemption, clock or timeouts. Refused under R1(a): nothing can run without a tick | **Only with no working source at all**, since F3 | Everything |
 | NMI stack (`prove_nmi_ist`, split) | An NMI ran somewhere other than its own stack, IST2: a kernel that would take an NMI on a user-chosen stack (ADR-0003) | No: it is decided by where the frame landed, once one arrived | Every NMI |
 | Per-processor control state (`smp::start`) | A processor allows ring 3 RDPMC or FSGSBASE, leaves SYSENTER or a debug breakpoint armed, or will not raise #MC or #MF | No: register reads | Ring 3 |
+| Boot steps run once (`kernel_main`) | A boot step ran out of turn or a second time when the framework's guards should have refused it: the heap, the allocator or running processors reset under the kernel | No: the guards are one flag each, with no measurement | Everything after them |
 | Preemption (`sched::prove`, split) | A processor's two workers did not both run there, or switched fewer than 15 times, or a thread stack's guard did not fault | Only with the tick already broken: passes at any load seen | Everything |
 | SIMD state (`prove_simd`) | One thread saw another's registers | No: a corruption count | Every thread |
 | Ring-3 isolation (`user::prove`) | A user program read kernel memory or ran a privileged instruction, or two processes shared an address space | No | Ring 3 |
@@ -132,7 +133,8 @@ Apart from the SMEP proof's stale translation above (Intel, fixed on the CI bran
 | Scheduler weights | Shares off under load | **Seen** failing under load (1 boot in 30, all cores loaded) |
 | Thread lifecycle, refused spawns, thread reaping | Accounting or a leak; a yield or sleep out of bounds | Yes: timing bounds. A leak is a bug, not a safety failure |
 | TSC consistency (`prove_consistent`) | Counters disagree. The clock does not rest on this (ADR-0012 C2, C4) | **Seen**: 16 ticks on an EPYC 9V45 |
-| Concurrent console | A processor's lines did not all print | Yes |
+| Concurrent console, and the console's interrupt and screen sections | A processor's lines did not all print, or a line sent or drawn in sections did not behave: diagnostics, nothing rests on them | Yes |
+| Monotonic clock (`prove_monotonic`) | The clock's own contract (ADR-0012 C1) did not hold, or its in-boot control did not catch a skew. Report because it also needs processors to interleave, and nothing P0 rests on the clock's order today | Yes: interleaving |
 | Wait timing | Round-trip or wake-up latency out of bounds | Yes |
 | IOMMU proofs through NVMe (`storage::prove_iommu`) | Translation or blocking did not behave. Skipped on a disk that is not the boot test's, and on a machine with no NVMe controller, which is reported and passes (F4) | Not on a machine that merely lacks the controller, since F4 |
 | Remapped I/O APIC (`irq::prove_remapped`) | Interrupt remapping of the PIT's pin. Skipped on a machine whose 8254 does not count, which is reported and passes (F3) | **Seen**: KVM's split irqchip fails both IRTE steps every boot |
@@ -145,7 +147,7 @@ Apart from the SMEP proof's stale translation above (Intel, fixed on the CI bran
 
 ## Follow-ups this inventory found
 
-Each was a proof that could not tell a fault from an absent device or a machine difference. **F1 to F6 are fixed** (Evidence); F7 is left for the framework merge.
+Each was a proof that could not tell a fault from an absent device or a machine difference. **F1 to F6 are fixed** (Evidence); F7 is left.
 
 - **F1, fixed.** `prove_nmi_ist` sent itself an NMI through the Self shorthand (ICR bits 19:18 = 01b with delivery mode NMI), which Intel's table of valid combinations marks invalid. It now sends to the processor's own APIC ID with no shorthand and the assert bit set, and waits up to a second. The result is split: where the NMI ran (Refuse, under R1(b)) and whether one arrived at all (Report). A second's wait covers what R1(b) calls a budget of seconds.
 - **F2, fixed.** `i8042::init` failed on a machine with no controller. The FADT's IAPC_BOOT_ARCH bit 1 is now read (revision 2 and later); a machine that says it has none reports that and passes. Firmware that says it has one and a controller that does not answer is still a failure.
@@ -153,11 +155,11 @@ Each was a proof that could not tell a fault from an absent device or a machine 
 - **F4, fixed.** `storage::prove_iommu` no longer fails when the IOMMU translates and no NVMe controller is present: nothing was disproved.
 - **F5, fixed.** `pcie::prove_bus_mastering` skips on a platform with no IOMMU (no domains exist to compare against), and with an IOMMU that failed it fails only for a real wrong state.
 - **F6, fixed.** Fairness now adds up each worker's own running time, as the weights proof already did, so a processor sharing a physical core cannot skew it.
-- **F7, left.** `smp::start`'s interrupt-stack guards and trampoline pages are printed but not visible to `kernel_main`. They belong to the table after the framework branch moves that file.
+- **F7, left.** `smp::start`'s interrupt-stack guards and trampoline pages are printed but not visible to `kernel_main`, so they are not in the table. The framework crate has landed, so nothing blocks this any more.
 
 ## Evidence
 
-**Controls (2026-11-09, QEMU 11.1.3 TCG, 2 processors, Intel VT-d):** temporary edits on the final code, each booted once with `boot_failures` emptied so the boot runs past a failing line. The serial log is what was checked.
+**Controls (2026-11-09, QEMU 11.1.3 TCG, 2 processors, Intel VT-d):** temporary edits, each booted once with `boot_failures` emptied so the boot runs past a failing line. The serial log is what was checked. C1 to C17 were run on the merged tree, after the framework crate, the console and the clock; C0 is of the code before this ADR.
 
 | # | Edit | Result |
 |---|---|---|
@@ -166,22 +168,25 @@ Each was a proof that could not tell a fault from an absent device or a machine 
 | C2 | `timer::init` forced to `None` | `boot refused: APIC timer failed ...`, last line. |
 | C3 | `user::prove` really failing (it expects the wrong fault) | The group runs on, IPC and all, then `boot refused: ring-3 isolation failed ...`, last line. PCIe, NVMe and the rest did not run. |
 | C4 | `tlb::prove` recorded as failed | The group runs on, wait queues and IPC included, then `boot refused: TLB shootdown failed ...`, last line. |
-| C5 | Scheduler weights recorded as failed | The boot goes on to the end: `boot verdict: degraded: 45 of 46 proofs passed; failed: scheduler weights`, then the halt line. |
-| C6 | Fairness forced off, with both workers running and switching | `: scheduler failed` printed on each processor as before, preemption not refused; the boot goes on and ends `boot verdict: degraded: 45 of 46 proofs passed; failed: scheduler fairness`. |
-| C7 | `iommu::init` returns failure (the real driver gate, not the tally) | Drivers refused where they are used (`NVMe: an IOMMU is present but did not come up, so no driver may bind`, the same for the NIC); `boot verdict: degraded: 44 of 46 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage)`. |
+| C5 | Scheduler weights recorded as failed | The boot goes on to the end: `boot verdict: degraded: 49 of 50 proofs passed; failed: scheduler weights`, then the halt line. |
+| C6 | Fairness forced off, with both workers running and switching | `: scheduler failed` printed on each processor as before, preemption not refused; the boot goes on and ends `boot verdict: degraded: 49 of 50 proofs passed; failed: scheduler fairness`. |
+| C7 | `iommu::init` returns failure (the real driver gate, not the tally) | Drivers refused where they are used (`NVMe: an IOMMU is present but did not come up, so no driver may bind`, the same for the NIC); `boot verdict: degraded: 48 of 50 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage)`. |
 | C8 | F1: the NMI forced onto the wrong stack | `boot refused: NMI stack failed ...`, last line. |
-| C9 | F1: the NMI never sent | `origin-kernel: NMI: none arrived ...`, then the boot goes on: `boot verdict: degraded: 44 of 45 proofs passed; 1 did not run; failed: NMI delivery`. |
-| C10 | F3: the 8254's OUT2 never read high | Falls back after the window's budget: `APIC timer calibrated against the ACPI PM timer: ...`; `boot verdict: 46 of 46 proofs passed`. |
-| C11 | F3: the PIT and PM timer unusable, CPUID's rate forced | `APIC timer calibrated against CPUID 15h: 62500 kHz ... TSC 999 MHz`; `boot verdict: 46 of 46 proofs passed`. |
-| C12 | F4: no NVMe device on the machine | `IOMMU: no NVMe controller is bound, so the proofs through one did not run`; `boot verdict: 46 of 46 proofs passed`. |
-| C13 | F5: no IOMMU on the machine | `PCIe: bus mastering: no IOMMU on this platform ...`; `boot verdict: 46 of 46 proofs passed`. |
-| C14 | F6: one worker of each pair under-reports its time by a factor of four | `workers 0 and 1 counted 171296000 and 41383500, ...: scheduler failed`; the fairness proof sees it, the boot goes on: `degraded: 45 of 46 proofs passed; failed: scheduler fairness`. |
+| C9 | F1: the NMI never sent | `origin-kernel: NMI: none arrived ...`, then the boot goes on: `boot verdict: degraded: 48 of 49 proofs passed; 1 did not run; failed: NMI delivery`. |
+| C10 | F3: the 8254's OUT2 never read high | Falls back after the window's budget: `APIC timer calibrated against the ACPI PM timer: ...`; `boot verdict: 50 of 50 proofs passed`. |
+| C11 | F3: the PIT and PM timer unusable, CPUID's rate forced | `APIC timer calibrated against CPUID 15h: 62500 kHz ... TSC 999 MHz`; `boot verdict: 50 of 50 proofs passed`. |
+| C12 | F4: no NVMe device on the machine | `IOMMU: no NVMe controller is bound, so the proofs through one did not run`; `boot verdict: 50 of 50 proofs passed`. |
+| C13 | F5: no IOMMU on the machine | `PCIe: bus mastering: no IOMMU on this platform ...`; `boot verdict: 50 of 50 proofs passed`. |
+| C14 | F6: one worker of each pair under-reports its time by a factor of four | `workers 0 and 1 counted 171296000 and 41383500, ...: scheduler failed`; the fairness proof sees it, the boot goes on: `degraded: 49 of 50 proofs passed; failed: scheduler fairness`. |
+| C15 | The boot-step guards recorded as failing | `boot refused: boot steps run once failed ...`, last line. |
+| C16 | The monotonic clock's proof recorded as failed | The boot goes on to the end: `degraded: 49 of 50 proofs passed; failed: monotonic clock`. |
+| C17 | The console's screen sections recorded as failed | The boot goes on to the end: `degraded: 49 of 50 proofs passed; failed: console screen sections`. |
 
-**The legacy-free machine (`boot-legacy-free`, in `boot-matrix`):** `-machine pit=off,i8042=off` boots the whole kernel. Before F3 it read the absent port 61h as 0xFF and reported `calibrated against the PIT: 0 kHz`, and failed. After, it calibrates against the ACPI PM timer (agreeing with one RTC second to 0.006 %), reports that it cannot prove the two PIT-based I/O APIC proofs, that the FADT says it has no 8042, and `boot verdict: 46 of 46 proofs passed`.
+**The legacy-free machine (`boot-legacy-free`, in `boot-matrix`):** `-machine pit=off,i8042=off` boots the whole kernel. Before F3 it read the absent port 61h as 0xFF and reported `calibrated against the PIT: 0 kHz`, and failed. After, it calibrates against the ACPI PM timer (agreeing with one RTC second to 0.006 %), reports that it cannot prove the two PIT-based I/O APIC proofs, that the FADT says it has no 8042, and `boot verdict: 50 of 50 proofs passed`.
 
 **Real processors:** research ledger §3 (CI through KVM).
 
-**Host and gates (the final tree):** `framekernel::bootproof`'s unit tests pin the table and the exact text of both lines. `cargo xtask check` (982 host tests, 0 failed; 26 Loom models, 35 controls), `boot-test` (11 of 11) and `boot-matrix` (both IOMMUs at 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, the console machines) pass. Every one of the 18 full boots in `boot-matrix` ended `boot verdict: 46 of 46 proofs passed`. One earlier `boot-matrix` run stopped at the developer-mode scenario with no serial output for 120 s, straight after the same machine's kernel boot passed; it is a different scenario from anything here and did not recur.
+**Host and gates (the merged tree):** `framekernel::bootproof`'s unit tests pin the table and the exact text of both lines. `cargo xtask check` passes (1111 host tests, 0 failed, 7 ignored; the unsafe gate, with no `unsafe` outside the framework; 29 Loom models and 39 negative controls); `cargo xtask boot-test` passes under Intel and under `ORIGIN_QEMU_IOMMU=amd` (11 of 11 each); `cargo xtask boot-matrix` passes (both IOMMUs at 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, the console machines). All 18 full boots in `boot-matrix`, and the boot-test boots under each IOMMU, ended `boot verdict: 50 of 50 proofs passed`. An earlier `boot-matrix` run, before the merge, stopped at the developer-mode scenario with no serial output for 120 s; it did not recur on any later run.
 
 ## Alternatives
 
@@ -204,13 +209,13 @@ The Refuse list costs a stricter boot on real machines than the proofs had befor
 ## Migration consequences
 
 - `sched::prove` and `wait::prove` take a `&mut Tally` and return nothing. The other proofs that returned nothing now return `bool`.
-- **The framework branch (`claude/silly-bose-b3bc0a`)** moves `kernel_main` to `kernel.rs`, turns `framekernel::` into `crate::`, and moves `prove_frames` into `origin_frame::early`, which must return its result (`start_heap` is the natural place). `smp.rs`, `iommu.rs` and `virtionet.rs` were left alone so that it could merge. The table is one new file. Each call site is a one-line edit, and the hand-over note lists them.
-- **ADR-0012** adds `prove_monotonic` to `sched::prove`: it needs a row in the table.
-- **The CI branch (PR vighnesha-os/origin-os#4)** forgives four lines under KVM: none of them is a Refuse-class failure, and the boot test only requires the verdict line to exist, so a forgiven proof failing does not fail the boot. The SMEP fix on that branch matters more now: without it, a Refuse-class proof falsely stops Intel machines.
+- **The framework crate (ADR-0011 N14 step 1)** landed before this ADR, which was merged onto it: `kernel_main` is in `kernel.rs`, `framekernel::` became `crate::`, and everything `unsafe` is in `framekernel/frame`. In the port, `prove_frames` runs inside `Early::start_heap`, whose result `Early::frames_proven` gives; the 8254's channel-0 check is `timer::pit_channel0_counting`; `timer::send_nmi_to_self` sends to the processor's own APIC ID; the PM timer is read with `port::ind` after `port::reserved` has refused a system-owned port (the clock proof claims the port, which can happen only once).
+- **ADR-0012** added `prove_monotonic` to `sched::prove`: it has a row in the table (`ClockMonotonic`, Report).
+- **CI (PR vighnesha-os/origin-os#4)** forgives four lines under KVM: none of them is a Refuse-class failure, and the boot test only requires the verdict line to exist, so a forgiven proof failing does not fail the boot. The SMEP fix it carries is why that Refuse-class proof does not stop Intel machines. `boot-legacy-free` runs in `boot-matrix`, so CI's KVM job runs it too; that has not been tried under KVM.
 - The nesting in `kernel_main` (`if paging`, `if let Some(tsc_hz)`, `heap_ok`) is now mostly unreachable. It stays to keep this change small; it can be flattened when the framework branch lands.
 - `timer::init` and `i8042::init` take the RSDP; `prove_nmi_ist` takes the TSC rate; `timer::cpuid_tsc_hz` moved from `time.rs` to `timer.rs`, where the framework branch's `timer` must make it `pub`. The lines that named the PIT's calibration now name what the timers were calibrated against.
 - The boot test has one more machine, `boot-legacy-free`, in `boot-matrix`: no 8254 and no 8042.
-- The virtio-net driver needs its proof to return a result, then a row in the table; that file is being rewritten by the framework branch, so it waits for that.
+- The virtio-net driver needs its proof to return a result, then a row in the table.
 
 ## Threat model (§58)
 
@@ -228,10 +233,10 @@ The Refuse list costs a stricter boot on real machines than the proofs had befor
 - **Persistent records.** A refusal is not recorded anywhere that survives the halt (§20, §69).
 - **That the Refuse proofs detect what they name** beyond each proof's own controls.
 
-## Questions for the owner
+## Questions for the owner (answered 2026-11-09: the recommended answer to all five)
 
-1. Accept R1's two cases (nothing can run without it; or a P0 property with a structural proof), and R2 and R3 as the rest of the policy? **Recommended: yes.** It is the smallest policy that does not stop working machines.
-2. Accept the Refuse list as above? **Recommended: yes.** The entries most likely to be revisited are the ones with a budget of seconds (preemption, wait queues); the NMI stack joined it when F1 was fixed.
-3. Accept that a refusal halts rather than resets until a boot manager records boot attempts (R5)? **Recommended: yes.**
-4. No "continue past a refusal" switch for first physical boots? **Recommended: yes, no switch.** A one-line local edit does it for a bring-up session, and a switch can be left on.
-5. Which proofs should a production boot still run? They were written for development and cost several seconds of deliberate waiting on every boot (the 2 s weights proof alone, the 1 to 3.2 s RTC second). **Recommended: decide before M9** and keep them all until then; the table above is the list to prune.
+1. Accept R1's two cases (nothing can run without it; or a P0 property with a structural proof), and R2 and R3 as the rest of the policy? **Recommended: yes.** It is the smallest policy that does not stop working machines. **Yes (2026-11-09).**
+2. Accept the Refuse list as above? **Recommended: yes.** The entries most likely to be revisited are the ones with a budget of seconds (preemption, wait queues); the NMI stack joined it when F1 was fixed. **Yes (2026-11-09).**
+3. Accept that a refusal halts rather than resets until a boot manager records boot attempts (R5)? **Recommended: yes.** **Yes (2026-11-09).**
+4. No "continue past a refusal" switch for first physical boots? **Recommended: yes, no switch.** A one-line local edit does it for a bring-up session, and a switch can be left on. **Yes (2026-11-09).**
+5. Which proofs should a production boot still run? They were written for development and cost several seconds of deliberate waiting on every boot (the 2 s weights proof alone, the 1 to 3.2 s RTC second). **Recommended: decide before M9** and keep them all until then; the table above is the list to prune. **Yes: decide before M9 (2026-11-09).**

@@ -85,3 +85,15 @@ This follows the directive's words at the cost of the easiest first machines. #1
 ## Migration consequences
 
 None in code or on disk: no binary format, ABI or persistent data depends on this. A later change is an edit to this ADR and the declared list. Removing a platform after a release has claimed support for it is a support change and must follow rule 39.
+
+## Update, 2026-11-09: the machines cannot be bought for now
+
+The owner cannot buy test machines. H4 and H5 stay as the list of what to get if that changes, but no work waits on a purchase.
+
+Evidence now comes from these, in order, and the plan and its sources are in `docs/research/2026-11-09-testing-without-buying-hardware.md`:
+
+1. **Free KVM on GitHub's hosted runners:** a real CPU with software devices. Tried on 2026-11-09: the kernel booted to its last line on an AMD EPYC 7763 in all seven KVM configurations.
+2. **Whole servers rented by the hour:** real firmware, IOMMU and NVMe. These need the owner to sign up and pay a few hundred rupees at most.
+3. **Volunteers' own machines,** with a safe USB image: client firmware, sleep and USB, and the only route to 2026 laptops.
+
+A rented or borrowed machine outside H1's scope is bench equipment (H2). No support claim can rest on it. CLAUDE.md §74, §76 and rules 30 and 40 are unchanged: a release still needs the declared machines.
