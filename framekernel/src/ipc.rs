@@ -32,9 +32,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::channel::{Channel, Message, QUEUE_BYTES, QUEUE_DEPTH, ReadError, other};
-use crate::handles::HandleTable;
+use crate::handles::{HandleTable, Need, Typed};
 use crate::heap::{MAX_BLOCK, MIN_BLOCK, PAGE};
-use origin_abi::{Error, Handle, rights};
+use origin_abi::{Error, Handle, ObjectType, rights};
 use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
 
@@ -47,6 +47,14 @@ use crate::wait::WaitQueue;
 pub(crate) enum Object {
     /// One end of a channel.
     Channel(ChannelEnd),
+}
+
+impl Typed for Object {
+    fn object_type(&self) -> u32 {
+        match self {
+            Self::Channel(_) => ObjectType::Channel as u32,
+        }
+    }
 }
 
 /// A handle in a message: its object and its rights, preserved in transit (P2).
@@ -290,7 +298,7 @@ pub(crate) fn create_channel(account: &Arc<Account>) -> Result<(ChannelEnd, Chan
 fn channel_of(
     table: &HandleTable<Object>,
     handle: Handle,
-    need: u32,
+    need: Need,
 ) -> Result<(ObjectRef<KernelChannel>, usize), Error> {
     let (object, _) = table.get(handle, need)?;
     let Object::Channel(end) = object;
@@ -340,15 +348,15 @@ pub(crate) fn channel_write(
         .map_err(|_| Error::NoMemory)?;
     let wake_side = without_interrupts(|| {
         let mut table = table.lock();
-        let (channel, side) = channel_of(&table, handle, rights::WRITE)?;
+        let (channel, side) = channel_of(&table, handle, Need::rights(rights::WRITE))?;
         let reader = other(side);
-        table.check_all(transfer, rights::TRANSFER)?;
+        table.check_all(transfer, Need::rights(rights::TRANSFER))?;
         // An end may be sent only if that keeps every end reachable (amendment A3). Every
         // listed handle was just checked to exist.
         let moves_an_end = !transfer.is_empty();
         let _order = moves_an_end.then(|| TRANSFERS.lock());
         for &value in transfer {
-            let (object, _) = table.get(value, 0)?;
+            let (object, _) = table.get(value, Need::NOTHING)?;
             let Object::Channel(end) = object;
             let references = end.channel.open.get(end.side);
             if ObjectRef::same(&end.channel, &channel)
@@ -367,7 +375,7 @@ pub(crate) fn channel_write(
             account: account.clone(),
             bytes: cost,
         };
-        let moved = table.take_all(transfer, rights::TRANSFER)?;
+        let moved = table.take_all(transfer, Need::rights(rights::TRANSFER))?;
         // The reader's queue holds them now, recorded before anyone can see the message.
         for (object, _) in &moved {
             let Object::Channel(end) = object;
@@ -436,7 +444,7 @@ pub(crate) fn channel_read(
 ) -> Result<Read, Error> {
     let read = without_interrupts(|| {
         let mut table = table.lock();
-        let (channel, side) = channel_of(&table, handle, rights::READ)?;
+        let (channel, side) = channel_of(&table, handle, Need::rights(rights::READ))?;
         let mut state = channel.state.lock();
         let (bytes, handles) = state.peek(side)?;
         if bytes > byte_capacity || handles > handle_capacity {
@@ -499,7 +507,7 @@ pub(crate) fn handle_close(
     table: &SpinLock<HandleTable<Object>>,
     handle: Handle,
 ) -> Result<(), Error> {
-    let (object, _) = without_interrupts(|| table.lock().remove(handle, 0))?;
+    let (object, _) = without_interrupts(|| table.lock().remove(handle, Need::NOTHING))?;
     // The handle is gone from the table: a waiter on it sees that when it is woken here. If
     // this was the end's last reference, the drop below closes the end and wakes its peer.
     let Object::Channel(end) = &object;
@@ -539,11 +547,12 @@ pub(crate) fn wait_one(
     mask: u32,
     deadline: u64,
 ) -> Result<Waited, Error> {
-    let (channel, side) = without_interrupts(|| channel_of(&table.lock(), handle, rights::WAIT))?;
+    let (channel, side) =
+        without_interrupts(|| channel_of(&table.lock(), handle, Need::rights(rights::WAIT)))?;
     let waiters = channel.waiters.get(side).ok_or(Error::BadHandle)?;
     waiting.fetch_add(1, Ordering::Release);
     let signals = || without_interrupts(|| channel.state.lock().signals(side));
-    let still_open = || without_interrupts(|| table.lock().get(handle, 0).is_ok());
+    let still_open = || without_interrupts(|| table.lock().get(handle, Need::NOTHING).is_ok());
     let result = waiters.wait_until_deadline(|| signals() & mask != 0 || !still_open(), deadline);
     waiting.fetch_sub(1, Ordering::AcqRel);
     let observed = signals();
