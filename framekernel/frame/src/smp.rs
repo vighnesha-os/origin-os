@@ -5,9 +5,9 @@
 //! protocol: INIT, then two start-up IPIs; real-address mode at `vector << 12`) and
 //! "Initializing IA-32e Mode" (PAE, CR3, EFER.LME, then CR0.PG); ACPI 6.6 §5.2.12 (MADT).
 //!
-//! 1. The processors come from the ACPI MADT (`framekernel::acpi`), so only enabled
+//! 1. The processors come from the ACPI MADT (`crate::acpi`), so only enabled
 //!    processors are started; nothing is broadcast. Each gets a dense CPU index
-//!    (`framekernel::cpumap`, ADR-0008): the boot processor 0, the others in table order.
+//!    (`crate::cpumap`, ADR-0008): the boot processor 0, the others in table order.
 //!    Per-CPU state is indexed by it; the x2APIC ID, which may exceed 255, stays the
 //!    processor's address for IPIs and interrupts. The MADT may list far more processors
 //!    than are enabled (QEMU lists every possible one), so its list is read onto the heap.
@@ -25,7 +25,7 @@
 //! 4. The data page is then rewritten for the next AP. An AP that missed its handshake may
 //!    only be slow, so before that it must be made unable both to join late and to read
 //!    the page again (ADR-0008 C7):
-//!    - each start-up is settled once (`framekernel::apstart`): an answer that comes after
+//!    - each start-up is settled once (`crate::apstart`): an answer that comes after
 //!      the boot processor stopped waiting does not join, and the AP halts;
 //!    - every AP that is not online is parked ([`park`]): INIT, which stops it wherever it
 //!      is and leaves it in wait-for-SIPI, then the 10 ms the MP protocol gives INIT. Only
@@ -36,31 +36,35 @@
 //!    still. It waits in wait-for-SIPI for its real start-up.
 //! 5. The trampoline page goes back to read/write, never executable.
 //!
-//! Each AP then enters its own scheduler (`sched::run_ap`).
+//! Each AP then enters what the layers above named: its own scheduler.
+//!
+//! Sound against safe callers (ADR-0011 N6, N12: the AP trampoline is the framework's): [`start`]
+//! is the only way in, it runs once, on the boot processor, and what it starts comes from the
+//! firmware's MADT. Every processor it sends INIT or a start-up IPI to is one that has never run
+//! kernel code, or is being parked after failing to join, so no safe call can reach a processor
+//! that is running.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::fmt::Write;
 use core::ptr;
-use core::sync::atomic::{AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 
-use framekernel::acpi::{self, Processor};
-use framekernel::apstart::{Handshake, Outcome, Refusal};
-use framekernel::cpumap::CpuMap;
-use framekernel::paging::{Access, PAGE};
-use framekernel::topology::CpuTopology;
 use origin_boot_info::{BootInfo, MemoryRegion, RegionKind};
+use origin_paging::{Access, PAGE};
 
-use origin_frame::stack::GuardedStack;
-
-use crate::console::Console;
+use crate::acpi::{self, Processor};
+use crate::apstart::{Handshake, Outcome, Refusal};
 use crate::cpu::{self, CpuIndex, CpuTables, MAX_CPUS, rdtsc};
+use crate::cpumap::CpuMap;
+use crate::stack::GuardedStack;
 use crate::timer::{ApicRead, X2Apic};
+use crate::topology::CpuTopology;
 use crate::vm;
 
 /// Physical address of the trampoline code; the start-up IPI vector is `TRAMPOLINE >> 12`.
-pub(crate) const TRAMPOLINE: u64 = 0x8000;
+pub const TRAMPOLINE: u64 = 0x8000;
 /// Physical address of the trampoline's data page.
 pub(crate) const TRAMPOLINE_DATA: u64 = 0x9000;
 /// Each AP's kernel stack.
@@ -168,6 +172,8 @@ struct ApStart {
     tables: *mut CpuTables,
     /// The CPU index the AP takes; discovery assigned it the AP's APIC ID.
     index: CpuIndex,
+    /// Where the AP goes once it is online: the layers above's scheduler.
+    main: fn(&X2Apic) -> !,
     /// What the AP found it lacks, set before it refuses (`Refusal` has room only for its
     /// x2APIC), so the boot processor can name it: 0, [`LACKS_SMEP_SMAP`] or
     /// [`LACKS_BASELINE`].
@@ -181,7 +187,8 @@ const LACKS_SMEP_SMAP: u64 = 1;
 const LACKS_BASELINE: u64 = 2;
 
 /// The processors online, by CPU index, the boot processor first.
-pub(crate) struct Online {
+#[derive(Debug)]
+pub struct Online {
     cpus: [CpuIndex; MAX_CPUS],
     count: usize,
     /// Every processor the MADT marks enabled is online: none can still be running
@@ -206,39 +213,54 @@ impl Online {
     }
 
     /// Whether every enabled processor came online.
-    pub(crate) const fn complete(&self) -> bool {
+    pub const fn complete(&self) -> bool {
         self.complete
     }
 
     /// Their CPU indexes, the boot processor first: where threads are spawned.
-    pub(crate) fn cpus(&self) -> &[CpuIndex] {
+    pub fn cpus(&self) -> &[CpuIndex] {
         self.cpus.get(..self.count).unwrap_or(&[])
     }
 
     /// Their x2APIC IDs, in the same order: for topology and NUMA affinity.
-    pub(crate) fn apic_ids(&self) -> Vec<u32> {
+    pub fn apic_ids(&self) -> Vec<u32> {
         self.cpus().iter().filter_map(|c| c.apic_id()).collect()
     }
 }
 
 /// Brings up every enabled AP the MADT lists. Returns the processors online, the boot
 /// processor included.
-pub(crate) fn start(
-    com1: &mut Console,
+pub fn start(
+    com1: &mut dyn Write,
     info: &BootInfo,
     regions: &[MemoryRegion],
     tsc_hz: u64,
+    ap_main: fn(&X2Apic) -> !,
 ) -> Online {
-    // SAFETY: CPL 0, boot processor, interrupts disabled, x2APIC supported (the timer
-    // bring-up checked it and already switched this APIC; the transition is then a no-op).
-    let lapic = unsafe { X2Apic::enable() };
-    let bsp = lapic.read(ApicRead::Id) as u32;
     let mut online = Online::one();
+    // The timer bring-up switched this APIC to x2APIC mode; without it no AP is started.
+    let Some(lapic) = X2Apic::this_cpu() else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: the local APIC is not in x2APIC mode: AP start-up failed"
+        );
+        return online;
+    };
+    let bsp = lapic.read(ApicRead::Id) as u32;
     if cpu::this_cpu() != CpuIndex::BOOT || CpuIndex::BOOT.apic_id() != Some(bsp) {
         let _ = writeln!(
             com1,
             "origin-kernel: the CPU-local area names {}, not APIC ID {bsp}: AP start-up failed",
             cpu::this_cpu().named()
+        );
+        return online;
+    }
+    // One start-up for the whole boot, only ever from the boot processor (checked above): a
+    // second would send INIT to processors that are running.
+    if STARTED.swap(true, Ordering::AcqRel) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: AP start-up already ran: AP start-up failed"
         );
         return online;
     }
@@ -317,7 +339,7 @@ pub(crate) fn start(
         let Some(index) = CpuIndex::new(i) else {
             continue;
         };
-        match start_one(&lapic, index, apic_id, tsc_hz) {
+        match start_one(&lapic, index, apic_id, tsc_hz, ap_main) {
             Ok(micros) => {
                 online.add(index);
                 let _ = writeln!(
@@ -381,15 +403,18 @@ pub(crate) fn start(
     online
 }
 
+/// Whether [`start`] has begun.
+static STARTED: AtomicBool = AtomicBool::new(false);
+
 /// What each processor read from CPUID about its own topology, by CPU index (CLAUDE.md §24,
 /// §27; ADR-0008 C2). A hybrid part's leaves can differ between logical processors, so each
 /// processor writes its own slot on itself ([`record_topology`]), before it reports online.
-static TOPOLOGY: [origin_frame::sync::SpinLock<Option<CpuTopology>>; MAX_CPUS] =
-    [const { origin_frame::sync::SpinLock::new(None) }; MAX_CPUS];
+static TOPOLOGY: [crate::sync::SpinLock<Option<CpuTopology>>; MAX_CPUS] =
+    [const { crate::sync::SpinLock::new(None) }; MAX_CPUS];
 
 /// Reads this processor's topology from CPUID and records it under its CPU index. The
 /// boot processor and every AP call this once, on themselves.
-pub(crate) fn record_topology() {
+pub fn record_topology() {
     let own = CpuTopology::detect(cpu::cpuid_subleaf);
     if let Some(slot) = TOPOLOGY.get(cpu::this_cpu().get()) {
         *slot.lock() = Some(own);
@@ -397,7 +422,7 @@ pub(crate) fn record_topology() {
 }
 
 /// What processor `index` recorded about itself, if it has.
-pub(crate) fn topology_of(index: CpuIndex) -> Option<CpuTopology> {
+pub fn topology_of(index: CpuIndex) -> Option<CpuTopology> {
     *TOPOLOGY.get(index.get())?.lock()
 }
 
@@ -450,7 +475,7 @@ fn madt_listing(rsdp_addr: u64) -> Result<Vec<Processor>, &'static str> {
 
 /// The x2APIC ID of every processor the MADT lists, enabled or not: the topology proof
 /// checks the CPUID layout against them (CLAUDE.md §24, §27).
-pub(crate) fn listed_apic_ids(rsdp_addr: u64) -> Result<Vec<u32>, &'static str> {
+pub fn listed_apic_ids(rsdp_addr: u64) -> Result<Vec<u32>, &'static str> {
     Ok(madt_listing(rsdp_addr)?.iter().map(|p| p.apic_id).collect())
 }
 
@@ -593,6 +618,7 @@ fn start_one(
     index: CpuIndex,
     apic_id: u32,
     tsc_hz: u64,
+    main: fn(&X2Apic) -> !,
 ) -> Result<u64, &'static str> {
     // SAFETY: an all-zero `CpuTables` is valid (integers only); `init_ap` writes it before
     // the processor uses it.
@@ -606,6 +632,7 @@ fn start_one(
         handshake: Handshake::new(),
         tables,
         index,
+        main,
         lacks: AtomicU64::new(0),
     }));
     poke(STACK, stack_top);
@@ -709,7 +736,7 @@ fn drill(lapic: &X2Apic, apic_id: u32, tsc_hz: u64) -> Result<Drill, &'static st
 /// Runs the park drill on CPU `index` (APIC ID `apic_id`) and reports it. Returns whether
 /// parking can be relied on: false only if INIT did not stop the running processor.
 fn drill_and_report(
-    com1: &mut Console,
+    com1: &mut dyn Write,
     lapic: &X2Apic,
     index: CpuIndex,
     apic_id: u32,
@@ -764,7 +791,7 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     // Every processor is held to what the boot processor is held to. One that falls short
     // does not come online: it refuses, and the boot processor reports why and parks it.
     let baseline =
-        framekernel::features::Features::decode(&cpuid).meets_baseline() && xcr0 & 0b111 == 0b111;
+        crate::features::Features::decode(&cpuid).meets_baseline() && xcr0 & 0b111 == 0b111;
     if !(smep && smap) || !baseline {
         let lacks = if smep && smap {
             LACKS_BASELINE
@@ -773,11 +800,11 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
         };
         start.lacks.store(lacks, Ordering::Release);
         let _ = start.handshake.refuse(Refusal::NoX2Apic);
-        crate::halt();
+        cpu::halt();
     }
     if !cpu::x2apic_supported() {
         let _ = start.handshake.refuse(Refusal::NoX2Apic);
-        crate::halt();
+        cpu::halt();
     }
     // SAFETY: CPL 0, this AP only, interrupts disabled, x2APIC supported, and the spurious
     // vector has a gate in the shared IDT.
@@ -791,15 +818,15 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
         // Not the processor this index was given to: refuse, and do nothing more (no
         // timer, no scheduler; interrupts stay disabled) until the boot processor parks it.
         let _ = start.handshake.refuse(Refusal::NotMine);
-        crate::halt();
+        cpu::halt();
     }
     // This processor's topology, read on itself: its leaves are its own (CLAUDE.md §24, §27).
     record_topology();
     // Join only if this answer settles the start-up. If the boot processor stopped waiting
     // first, CPU `index` stays offline and this processor is being parked: do nothing more.
     if !start.handshake.answer(id) {
-        crate::halt();
+        cpu::halt();
     }
     // M3: this processor's scheduler.
-    crate::sched::run_ap(&lapic)
+    (start.main)(&lapic)
 }

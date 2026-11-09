@@ -18,10 +18,11 @@
 //!
 //! The APIC ID stays the processor's address: IPIs and interrupt destinations use
 //! [`CpuMap::apic_id`]. Safe code, host-tested.
+#![forbid(unsafe_code)]
 
 use crate::acpi::Processor;
 
-pub use origin_frame::limits::{BROADCAST, MAX_CPUS};
+pub use crate::limits::{BROADCAST, MAX_CPUS};
 
 /// The processors the kernel indexes, and what the MADT listed.
 #[derive(Clone, Debug, PartialEq, Eq)]

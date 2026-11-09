@@ -42,7 +42,6 @@ mod irq;
 mod pcie;
 mod process;
 mod sched;
-mod smp;
 mod storage;
 mod syscall;
 mod time;
@@ -59,7 +58,7 @@ use framekernel::serial::Uart16550;
 use origin_boot_info::{
     BootInfo, KernelSegment, MemoryRegion, RegionKind, SEGMENT_EXECUTE, SEGMENT_WRITE,
 };
-pub(crate) use origin_frame::{cpu, firmware, iommu, memory, phys, timer, vm};
+pub(crate) use origin_frame::{cpu, firmware, iommu, memory, phys, smp, timer, vm};
 
 /// The fewest frames reserved, next to the frame bitmap, for the kernel's page tables.
 const TABLE_POOL_MIN_FRAMES: u64 = 256;
@@ -299,7 +298,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                 time::monotonic_nanos() / 1_000_000
             );
         }
-        let online = smp::start(&mut com1, &info, regions, tsc_hz);
+        let online = smp::start(&mut com1, &info, regions, tsc_hz, sched::run_ap);
         // M2 completion: once every enabled processor has left firmware code, the loader's
         // and the firmware's boot-time memory belongs to the kernel.
         // SAFETY: the kernel's own tables replaced the firmware's long ago (`init_paging`), and

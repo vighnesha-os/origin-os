@@ -97,14 +97,16 @@ static mut IDT: Idt = Idt([[0; 2]; 256]);
 /// `tables` must point at a live `CpuTables` whose interrupt stacks and guard pages nothing is
 /// using: an AP's tables before it starts, or the boot processor's (its stacks are above the
 /// guards and have not been used down that far).
-pub unsafe fn protect_interrupt_stacks(tables: *const CpuTables) -> Result<[u64; 4], &'static str> {
+pub(crate) unsafe fn protect_interrupt_stacks(
+    tables: *const CpuTables,
+) -> Result<[u64; 4], &'static str> {
     let guards = interrupt_stack_guards(tables);
     crate::vm::make_guards(&guards).map_err(|_| "cannot unmap the guard pages")?;
     Ok(guards)
 }
 
 /// The guard pages of the four interrupt stacks in `tables`.
-pub fn interrupt_stack_guards(tables: *const CpuTables) -> [u64; 4] {
+pub(crate) fn interrupt_stack_guards(tables: *const CpuTables) -> [u64; 4] {
     let base = tables.addr() as u64;
     [
         base + core::mem::offset_of!(CpuTables, double_fault.guard) as u64,
@@ -115,7 +117,7 @@ pub fn interrupt_stack_guards(tables: *const CpuTables) -> [u64; 4] {
 }
 
 /// The boot processor's tables, for [`interrupt_stack_guards`].
-pub fn bsp_tables() -> *const CpuTables {
+pub(crate) fn bsp_tables() -> *const CpuTables {
     &raw const BSP_TABLES
 }
 
@@ -374,7 +376,7 @@ static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(UNASSIGNED) }; 
 /// Records that the processor with CPU index `index` has x2APIC ID `apic_id`. The boot
 /// processor records itself in [`init`]; `smp` records every other processor at discovery,
 /// before it starts any (an AP checks its own entry in [`init_ap`]).
-pub fn assign(index: CpuIndex, apic_id: u32) {
+pub(crate) fn assign(index: CpuIndex, apic_id: u32) {
     if let Some(slot) = APIC_IDS.get(index.0) {
         slot.store(apic_id, Ordering::Release);
     }

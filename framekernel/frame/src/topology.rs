@@ -35,6 +35,7 @@
 //! core type's numeric value "has no significance, neither large nor small", and that it
 //! implies no other attribute: capacity must come from elsewhere (§24: capabilities, never
 //! marketing names).
+#![forbid(unsafe_code)]
 
 use core::fmt;
 

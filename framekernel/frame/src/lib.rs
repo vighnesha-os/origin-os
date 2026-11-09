@@ -30,8 +30,10 @@ pub mod acpi;
 pub mod addr;
 pub mod amdvi;
 pub mod apic;
+pub mod apstart;
 pub mod bitmap;
 pub mod clock;
+pub mod cpumap;
 pub mod descriptors;
 pub mod dmar;
 pub mod features;
@@ -44,6 +46,7 @@ pub mod mmio;
 pub mod objref;
 pub mod once;
 pub mod pci;
+pub mod topology;
 pub mod trap;
 pub mod unwind;
 pub mod usercopy;
@@ -69,6 +72,8 @@ pub mod phys;
 pub mod port;
 #[cfg(target_os = "none")]
 pub mod proof_programs;
+#[cfg(target_os = "none")]
+pub mod smp;
 #[cfg(target_os = "none")]
 pub mod stack;
 #[cfg(target_os = "none")]

@@ -426,13 +426,13 @@ pub(crate) fn unguard(page: u64) -> Result<(), MapError> {
 /// the holder can do with it.
 #[must_use]
 #[derive(Debug)]
-pub struct IdentityMapping {
+pub(crate) struct IdentityMapping {
     virt: u64,
 }
 
 impl IdentityMapping {
     /// Removes the mapping; once this returns, no processor's TLB holds it.
-    pub fn unmap(self) -> Result<u64, MapError> {
+    pub(crate) fn unmap(self) -> Result<u64, MapError> {
         // SAFETY: `self.virt` is the identity page `map_identity` mapped for this token,
         // used only by the AP trampoline, which has finished: nothing relies on it now.
         unsafe { unmap(self.virt) }
@@ -443,7 +443,7 @@ impl IdentityMapping {
 /// `access`: only for the AP trampoline, which runs there while paging comes on. Safe: a
 /// kernel mapping creates no access for safe code, and what it maps is removed through the
 /// returned token.
-pub fn map_identity(page: u64, access: Access) -> Result<IdentityMapping, MapError> {
+pub(crate) fn map_identity(page: u64, access: Access) -> Result<IdentityMapping, MapError> {
     crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;

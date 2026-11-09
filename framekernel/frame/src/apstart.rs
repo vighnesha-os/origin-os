@@ -15,6 +15,7 @@
 //!
 //! This module is the first half. Safe code, host-tested, including the race between the
 //! two sides on real threads.
+#![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
