@@ -7,6 +7,7 @@
 | Outcome | No tool was adopted and no design changed. §5 is a recommendation; the spending and licence questions are the owner's. |
 | Method | CLAUDE.md §16: vendor pages first, dates recorded, local experiments recorded |
 | Scope note | Nothing was installed and no licence was accepted. Web sources were opened through a fetch tool that answers questions about a page, so they were not all read line by line. R4 was read in part (clauses 2, 4 and 5) as extracted text. Sources marked ‡ were seen only as search-result text. |
+| Since | The owner cannot buy machines for now (ADR-0009's update of 2026-11-09), so §5's machine is on hold. What can be done without buying one is in [`2026-11-09-testing-without-buying-hardware.md`](2026-11-09-testing-without-buying-hardware.md). |
 
 ## 1. Sources
 
