@@ -86,5 +86,4 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 | # | Decision | Blocks |
 |---|---|---|
 | — | The owner cannot buy machines for now. The steps that need the owner (sign-ups and small rentals) are in `docs/research/2026-11-09-testing-without-buying-hardware.md`; ADR-0009's choices (#2, then #5 once its serial option is confirmed, H5) stand for when that changes | The first physical boot (§74) |
-| — | Sheet items 30 and 31: ADR-0007's bus-mastering question and the Loom download's deviation (`docs/engineering/OWNER_DECISIONS.md`) | Accepting I12; an honest record |
-| — | Sheet item 39: whether to amend CLAUDE.md §48 and §70 to match ADR-0011 | Keeping the directive and the design in step |
+| — | Sheet item 39, answered 2026-11-09: amend CLAUDE.md §48 and §70 to match ADR-0011. Claude drafts the wording; the owner approves it before it goes in | Keeping the directive and the design in step |

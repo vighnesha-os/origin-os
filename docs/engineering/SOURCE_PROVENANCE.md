@@ -2056,7 +2056,7 @@ The console sent a line to the 16550 byte by byte, polling the transmit-holding 
   | windows-sys | 0.61.2 | not downloaded (other platforms or features) | 2458.2 | MIT OR Apache-2.0 | 2025-10-06 |
 
   Compiled: 24 crates, 3.09 MiB of `.crate` files. Locked: 30 crates, 5.80 MiB. `Cargo.lock` holds each crate's checksum.
-  - Cargo compiled exactly the 24 crates marked above on this Mac. It also downloaded `memchr` and `aho-corasick` without compiling them: 26 `.crate` files, 3.36 MiB, **two more than the owner was told** (24, 3.09 MiB). The owner was told these two would not be fetched here. The compiled set is exactly what was approved.
+  - Cargo compiled exactly the 24 crates marked above on this Mac. It also downloaded `memchr` and `aho-corasick` without compiling them: 26 `.crate` files, 3.36 MiB, **two more than the owner was told** (24, 3.09 MiB). The owner was told these two would not be fetched here. The compiled set is exactly what was approved. The owner accepted the deviation on 2026-11-09 (decision sheet item 31).
   - On this host, build time runs code from `generator` (`build.rs`), `libc` (`build.rs`) and `rustversion` (`build/build.rs`, proc-macro). `cc` is only a build-dependency of `generator` and its build script calls it only for powerpc64.
   - `generator` contains hand-written context-switching assembly and runs only inside these tests.
   - Nothing here reaches a shipping crate. `cargo xtask check` now enforces it: every shipping crate's normal and build dependencies (`cargo tree --target all`) must be first-party, and every third-party package in `Cargo.lock` must be on `APPROVED_THIRD_PARTY` at its exact version.

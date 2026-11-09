@@ -5,8 +5,8 @@
 | As of | 2026-11-09, on `main`, after the pre-merge review. Everything that was on a side branch is merged. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38 and 40–69. |
-| Still open | Items 30, 31 and 39 below. Buying machines is off for now (ADR-0009's update of 2026-11-09). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. |
+| Still open | No item. The wording of the CLAUDE.md amendment item 39 asks for awaits the owner's approval. Buying machines is off for now (ADR-0009's update of 2026-11-09). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -112,8 +112,8 @@ ADR-0009 H6 asked for a console that does not depend on a 16550 at `0x3F8`. The 
 
 | # | Question | Recommendation | Why |
 |---|---|---|---|
-| 30 | ADR-0007 question 10: clear bus mastering on every function at enumeration (I12), bridges included, and leave an AMD IOMMU's own function alone until hardware shows what it needs? | **Accept** | §32 and §58. It is built and boot-proven, and it merged on your word. It may stop firmware-owned controllers (USB legacy, a firmware framebuffer) until drivers or exceptions exist, which hardware must settle (§74). |
-| 31 | The Loom download went beyond what you approved: 26 crate files and 3.36 MiB, against the 24 and 3.09 MiB you were told, and `memchr` and `aho-corasick` were said not to be fetched | **Accept** | §5. All are host-only and no shipping crate reaches them, and since the review they sit outside the kernel's workspace. The record should match what happened. |
+| 30, answered | ADR-0007 question 10: clear bus mastering on every function at enumeration (I12), bridges included, and leave an AMD IOMMU's own function alone until hardware shows what it needs? | **Accepted by the owner, 2026-11-09** | §32 and §58. It is built and boot-proven, and it merged on your word. It may stop firmware-owned controllers (USB legacy, a firmware framebuffer) until drivers or exceptions exist, which hardware must settle (§74). |
+| 31, answered | The Loom download went beyond what you approved: 26 crate files and 3.36 MiB, against the 24 and 3.09 MiB you were told, and `memchr` and `aho-corasick` were said not to be fetched | **Accepted by the owner, 2026-11-09** | §5. All are host-only and no shipping crate reaches them, and since the review they sit outside the kernel's workspace. The record should match what happened. |
 | 32, answered | Add CI: a GitHub workflow running `cargo xtask check` and the boot tests on every pull request? | **Yes: the owner's decision, 2026-11-09** | §8 and §82 put CI in M0, and until then every gate depended on one Mac. §80 forbids silent external costs, so it needed the owner's word. It uses only GitHub's standard runners, free for this public repository. Built in `.github/workflows/ci.yml`, with the boots on a real processor through KVM as well as on QEMU's software CPU. A trial branch first booted the kernel on a real AMD EPYC on those runners (`docs/research/2026-11-09-testing-without-buying-hardware.md`) and showed costs QEMU's software CPU had hidden. |
 
 ## The native SDK (ADR-0011): Accepted 2026-11-09, nothing built
@@ -128,7 +128,7 @@ Every recommendation below was checked against the whole of CLAUDE.md. The secti
 | 36, answered | A small original interface language (N7)? | **Yes** | One source of truth for Rust, C, IPC, the kernel's calls and documentation (§42, §49). Adopting one would put third-party generated code in the runtime (§3, §5). |
 | 37, answered | Kernel-stamped caller identity on every channel message (N9, an ADR-0005 amendment)? | **Yes** | §30 and §48 require authenticated IPC, and a capability says what may be done, not who asked. |
 | 38, answered | Each system-call number accepted only from its own address in `origin.core` (N5)? | **Yes** | Enforces §42's private door. It is hardening, not authorization (§58). |
-| 39 | If accepted, will you amend CLAUDE.md §48 and §70 to say this? | Your text, your call | Claude has not changed the directive. |
+| 39, answered | If accepted, will you amend CLAUDE.md §48 and §70 to say this? | **Yes, with Claude drafting the wording and the owner approving it before it goes in (2026-11-09)** | The directive is the owner's text: nothing in it changes until the owner approves the exact wording. |
 
 ## The interface language (OIDL): accepted 2026-11-09, as recommended
 
