@@ -104,7 +104,7 @@ It claims only what was recorded. "Passed" means the proof found nothing wrong: 
 | Ring-3 isolation (`user::prove`) | A user program read kernel memory or ran a privileged instruction, or two processes shared an address space | No | Ring 3 |
 | TLB shootdown (`tlb::prove`) | A processor kept a stale translation after an unmap | No | Every unmap |
 | Wait queues (`wait::prove`, split) | Items lost or reordered, or a thread never woke | No | IPC, drivers |
-| IPC and handles (`ipc_proof::prove`) | A handle or quota check let a hostile call through. This one result also covers a leak check | No | Ring 3 |
+| IPC and handles (`ipc_proof::prove`) | A handle or quota check let a hostile call through, or a call produced a status its definition does not declare. This one result also covers a leak check | No | Ring 3 |
 | Process and thread objects (`ipc_proof::prove_objects`) | A handle of the wrong type or with too few rights was accepted, a process's memory outlived its last thread, `TERMINATED` came before the memory went or did not come, a process ID was reused, or a wait on a process handle was not cancelled. This one result also covers a leak check | No: a failure is a wrong status or a count, and every wait in it has a deadline far above any load seen | Ring 3 |
 
 Apart from the SMEP proof's stale translation above (Intel, fixed on the CI branch), none of the Refuse proofs has failed on a real processor in the runs read: 59 complete boots on AMD EPYC processors through KVM (research ledger §3). AMD only, and virtual machines, so this is the strongest evidence the project has rather than proof.

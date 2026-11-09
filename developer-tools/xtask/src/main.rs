@@ -1789,6 +1789,7 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
         "origin-kernel: ipc: a fault inside a user copy comes back as a failed copy, not a dead kernel: 1 fault recovered".into(),
         "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap ".into(),
         "; threads run before their state existed: 0".into(),
+        "origin-kernel: ipc: a status its call does not declare reached the system-call boundary 0 times".into(),
     ]);
     markers
 }

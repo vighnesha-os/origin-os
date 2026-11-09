@@ -28,7 +28,9 @@ use core::fmt::Write as _;
 
 use crate::handles::Need;
 use crate::usercopy::UserAccess;
+use core::sync::atomic::{AtomicU64, Ordering};
 use origin_abi::{Error, Handle};
+use origin_frame::once::SetOnce;
 use origin_frame::trap::SyscallOutcome;
 use origin_syscalls::oidl_rt as rt;
 use origin_syscalls::origin_kernel::kernel::server;
@@ -89,11 +91,32 @@ pub(crate) fn user_fault(vector: u64, error: u64, address: u64, stack_fixed: boo
     cpu::disable_interrupts();
 }
 
+/// How often a call's implementation produced a status its definition does not declare.
+static UNDECLARED: AtomicU64 = AtomicU64::new(0);
+/// The first such status, and which call's error type it did not fit.
+static FIRST_UNDECLARED: SetOnce<(&'static str, Error)> = SetOnce::new();
+
 /// A status from the layers below, as one of the errors the definition declares for this call.
-/// Every status they can return for it is declared (`docs/engineering/OIDL_KERNEL_COMPARISON.md`);
-/// were that ever wrong, the caller still gets a failure its call can report: `otherwise`.
+/// Every status they can return for it should be declared, so one that does not fit is a kernel
+/// bug. The caller still gets a failure its call can report, `otherwise`, and that is all it
+/// sees; the bug is counted, and a boot in which any happened fails its IPC proof.
 fn declared<E: rt::MethodError>(otherwise: E) -> impl FnOnce(Error) -> E {
-    move |e| E::from_status(e.raw()).unwrap_or(otherwise)
+    move |e| {
+        E::from_status(e.raw()).unwrap_or_else(|| {
+            UNDECLARED.fetch_add(1, Ordering::Relaxed);
+            let _ = FIRST_UNDECLARED.set((core::any::type_name::<E>(), e));
+            otherwise
+        })
+    }
+}
+
+/// How often a system call's implementation has produced a status its definition does not
+/// declare, and the first it produced: the error type it did not fit, and the status.
+pub(crate) fn undeclared_statuses() -> (u64, Option<(&'static str, Error)>) {
+    (
+        UNDECLARED.load(Ordering::Relaxed),
+        FIRST_UNDECLARED.get().copied(),
+    )
 }
 
 /// What the definition asks of this handle.

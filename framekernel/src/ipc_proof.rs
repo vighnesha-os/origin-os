@@ -42,7 +42,7 @@ use crate::console::Console;
 use crate::cpu::{self, CpuIndex};
 use crate::ipc::{self, Object};
 use crate::process::{Ending, Limits, Process};
-use crate::{memory, sched, time};
+use crate::{memory, sched, syscall, time};
 
 /// Where every proof process's code begins.
 const CODE: u64 = 0x40_0000;
@@ -2053,5 +2053,18 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
             ": ipc failed"
         }
     );
-    ok && back && unready == 0
+    // Every call above returned a status its definition declares: a bug here is invisible from
+    // ring 3, where a fallback status stands in for it.
+    let (undeclared, first) = syscall::undeclared_statuses();
+    let declared = undeclared == 0;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: a status its call does not declare reached the system-call boundary {undeclared} times{}{}",
+        match first {
+            Some((call, status)) => alloc::format!(" (the first: {} from {call})", status.name()),
+            None => alloc::string::String::new(),
+        },
+        if declared { "" } else { ": ipc failed" }
+    );
+    ok && back && unready == 0 && declared
 }
