@@ -1,0 +1,65 @@
+# TEMPORARY: catches an Intel runner, to find why the SMEP proof sees #PF error 0x10 there.
+name: diagnose-intel
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  boot:
+    name: try ${{ matrix.attempt }} on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-26.04, ubuntu-24.04]
+        attempt: [1, 2, 3, 4, 5, 6, 7, 8]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Is this an Intel runner?
+        id: cpu
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          if grep -q GenuineIntel /proc/cpuinfo; then echo 'intel=true'; else echo 'intel=false'; fi >> "$GITHUB_OUTPUT"
+      - if: steps.cpu.outputs.intel == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: steps.cpu.outputs.intel == 'true'
+        run: bash .github/ci/install-rust.sh
+      - if: steps.cpu.outputs.intel == 'true'
+        run: bash .github/ci/install-qemu.sh
+      - if: steps.cpu.outputs.intel == 'true'
+        run: bash .github/ci/enable-kvm.sh
+      - name: What KVM uses here
+        if: steps.cpu.outputs.intel == 'true'
+        run: |
+          for f in /sys/module/kvm_intel/parameters/* /sys/module/kvm/parameters/*; do
+            printf '%s: ' "$f"; cat "$f" 2>/dev/null || echo unreadable
+          done
+      - name: Boot
+        if: steps.cpu.outputs.intel == 'true'
+        env:
+          ORIGIN_QEMU_ACCEL: kvm
+          ORIGIN_BOOT_TEST_ONLY: kernel boot
+          ORIGIN_BOOT_TEST_TIMEOUT: 300
+        run: |
+          set +e
+          for cpu in max host; do
+            for smp in 1 2; do
+              echo "=== -cpu $cpu, $smp processor(s)"
+              ORIGIN_QEMU_CPU=$cpu ORIGIN_QEMU_SMP=$smp cargo xtask boot-test 2>&1 | grep -E 'SMEP|page protection violated|supervisor|passed in|xtask: error'
+            done
+          done
+
+  # Fails on purpose once every try has ended, so the pull request's monitor reports it.
+  done:
+    needs: boot
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          echo '::error::diagnostics finished: read the try jobs'
+          exit 1

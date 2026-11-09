@@ -1512,6 +1512,7 @@ fn prove_user_isolation(com1: &mut Console) -> bool {
                 }
                 other => {
                     ok = false;
+                    diagnose_user_probe(com1);
                     let _ = writeln!(
                         com1,
                         "origin-kernel: page protection violated: {what}: {other:?}"
@@ -1527,6 +1528,51 @@ fn prove_user_isolation(com1: &mut Console) -> bool {
     // page.
     unsafe { dealloc(frame, layout) };
     ok
+}
+
+/// TEMPORARY, to find why an Intel runner reports 0x10 for the SMEP fetch: what the tables
+/// hold, and what the same access does again, after INVLPG, after a CR3 reload and without
+/// SMEP.
+fn diagnose_user_probe(com1: &mut Console) {
+    let translation = vm::translate(USER_PROBE_PAGE);
+    let cr3 = cpu::read_cr3();
+    let mut table = cr3 & 0x000F_FFFF_FFFF_F000;
+    let mut entries = [0u64; 4];
+    for (entry, shift) in entries.iter_mut().zip([39u32, 30, 21, 12]) {
+        let index = (USER_PROBE_PAGE >> shift) & 0x1FF;
+        let at = phys::to_virt(table + index * 8);
+        // SAFETY: the direct map covers every page table, and this only reads one entry.
+        *entry = unsafe { ptr::with_exposed_provenance::<u64>(at as usize).read_volatile() };
+        table = *entry & 0x000F_FFFF_FFFF_F000;
+    }
+    let mut cr4: u64;
+    // SAFETY: CPL 0; reads CR4.
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags))
+    };
+    // SAFETY: the page holds `PROBE_RETURN`.
+    let again = unsafe { cpu::probe_execute(USER_PROBE_PAGE) };
+    // SAFETY: the page is RAM.
+    let read = unsafe { cpu::probe_read(USER_PROBE_PAGE) };
+    cpu::invlpg(USER_PROBE_PAGE);
+    // SAFETY: as above.
+    let after_invlpg = unsafe { cpu::probe_execute(USER_PROBE_PAGE) };
+    // SAFETY: CPL 0; reloading CR3 with its own value flushes the non-global TLB entries.
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags)) };
+    // SAFETY: as above.
+    let after_cr3 = unsafe { cpu::probe_execute(USER_PROBE_PAGE) };
+    // SAFETY: CPL 0; SMEP is restored right after the one fetch below.
+    unsafe {
+        core::arch::asm!("mov cr4, {}", in(reg) cr4 & !(1 << 20), options(nostack, preserves_flags));
+    }
+    // SAFETY: the page holds only `PROBE_RETURN`.
+    let without_smep = unsafe { cpu::probe_execute(USER_PROBE_PAGE) };
+    // SAFETY: CPL 0; restores the value read above.
+    unsafe { core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags)) };
+    let _ = writeln!(
+        com1,
+        "origin-kernel: SMEP diagnosis: {translation:?}; entries {entries:#x?}; CR3 {cr3:#x}, CR4 {cr4:#x}; fetch again {again:?}; data read {read:?}; after INVLPG {after_invlpg:?}; after CR3 reload {after_cr3:?}; without SMEP {without_smep:?}"
+    );
 }
 
 /// Proves the allocator by allocating, writing, reading back and freeing three frames.
