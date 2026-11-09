@@ -92,6 +92,9 @@ fn search_settings() -> Vec<OsString> {
 const CAUSALITY: &[&str] = &["Causality violation"];
 const DEADLOCK: &[&str] = &["deadlock"];
 const WENT_BACK: &[&str] = &["the clock went backwards"];
+const STALE: &[&str] = &["a processor kept a translation the shootdown took away"];
+/// A wait that can never end: to Loom, a processor spinning for ever.
+const NEVER_ENDS: &[&str] = &["Model exceeded maximum number of branches", "deadlock"];
 const LOST_UPDATE: &[&str] = &["the floor is the largest reading"];
 
 /// One deliberate bug, and the models that must find it.
@@ -112,6 +115,7 @@ const WAIT: &str = "framekernel/frame/sync/src/wait.rs";
 const RUN_QUEUE: &str = "framekernel/src/runqueue.rs";
 const MODELS: &str = "framekernel/frame/sync/src/models.rs";
 const FLOOR: &str = "framekernel/frame/sync/src/floor.rs";
+const SHOOTDOWN: &str = "framekernel/frame/sync/src/shootdown.rs";
 
 /// `WaitQueue::take_all`'s one critical section.
 const TAKE_ALL: &str = "        scheduler.without_interrupts(|| core::mem::replace(&mut *self.waiters.lock(), [None; N]))\n";
@@ -679,6 +683,76 @@ const CONTROLS: &[Control] = &[
         from: "                    handed.store(first + 1, Release);\n",
         to: "                    handed.store(first + 1, Relaxed);\n",
         models: &[("floor_handoff_between_two_processors", WENT_BACK)],
+    },
+    // TLB shootdown (N14 step 3, S3-5a).
+    Control {
+        // The initiator goes on without waiting for the answers.
+        name: "shootdown_does_not_wait",
+        file: SHOOTDOWN,
+        from: "                while served.load(Ordering::Acquire) < generation {\n",
+        to: "                while false && served.load(Ordering::Acquire) < generation {\n",
+        models: &[
+            ("shootdown_reaches_an_online_processor", STALE),
+            ("shootdown_two_initiators_serve_each_other", STALE),
+        ],
+    },
+    Control {
+        // Nobody is told, so nobody answers.
+        name: "shootdown_skips_its_target",
+        file: SHOOTDOWN,
+        from: "                if id != me && self.must_answer(id) {\n",
+        to: "                if false && id != me && self.must_answer(id) {\n",
+        models: &[("shootdown_reaches_an_online_processor", STALE)],
+    },
+    Control {
+        // The target answers without doing what it was asked.
+        name: "shootdown_answer_without_invalidating",
+        file: SHOOTDOWN,
+        from: "            hardware.invalidate(Request::decode(self.request.load(Ordering::Relaxed)));\n",
+        to: "            let _ = self.request.load(Ordering::Relaxed);\n",
+        models: &[("shootdown_reaches_an_online_processor", STALE)],
+    },
+    Control {
+        // The answer is not ordered with the invalidation it reports.
+        name: "shootdown_answer_relaxed",
+        file: SHOOTDOWN,
+        from: "            served.store(generation, Ordering::Release);\n",
+        to: "            served.store(generation, Ordering::Relaxed);\n",
+        models: &[("shootdown_reaches_an_online_processor", STALE)],
+    },
+    Control {
+        // The request is not published with its generation: a target can read the previous
+        // one and invalidate the wrong page.
+        name: "shootdown_generation_relaxed",
+        file: SHOOTDOWN,
+        from: "self.generation.fetch_add(1, Ordering::Release)",
+        to: "self.generation.fetch_add(1, Ordering::Relaxed)",
+        models: &[("shootdown_reaches_an_online_processor", STALE)],
+    },
+    Control {
+        // An initiator waiting for its turn does not serve the one that has it: each waits
+        // for the other's answer.
+        name: "shootdown_waiting_initiator_does_not_serve",
+        file: SHOOTDOWN,
+        from: "                self.service(hardware);\n                prim::spin_loop();\n",
+        to: "                prim::spin_loop();\n",
+        models: &[("shootdown_two_initiators_serve_each_other", NEVER_ENDS)],
+    },
+    Control {
+        // The initiator reads who is online without ordering that after its change.
+        name: "shootdown_no_fence_before_reading_the_online_set",
+        file: SHOOTDOWN,
+        from: "            prim::fence(Ordering::SeqCst);\n            let mut targets = [false; CPUS];\n",
+        to: "            let mut targets = [false; CPUS];\n",
+        models: &[("shootdown_and_a_processor_coming_online", STALE)],
+    },
+    Control {
+        // A processor comes online and walks tables without ordering that after the flag.
+        name: "online_no_fence_before_the_first_flush",
+        file: SHOOTDOWN,
+        from: "        prim::fence(Ordering::SeqCst);\n        hardware.invalidate(Request::Everything);\n",
+        to: "        hardware.invalidate(Request::Everything);\n",
+        models: &[("shootdown_and_a_processor_coming_online", STALE)],
     },
 ];
 

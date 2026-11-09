@@ -14,6 +14,10 @@
 //! swaps `core`'s atomics, cell and spin hint for Loom's, and that the constructors are not
 //! `const`.
 //!
+//! The TLB shootdown protocol (`shootdown.rs`, which `origin_frame::tlb` instantiates) is real
+//! too. What stands in for the machine there is `TlbCpu`: a boolean for what its TLB holds, a
+//! relaxed load for a page walk, `Notify` for the interrupt, and a clock that never runs out.
+//!
 //! Copies, written by hand here, standing in for kernel code; nothing compares them with it:
 //!
 //! - `ThreadName` is `sched::ThreadRef`, and `OnCpu::current_thread` is `sched::current_thread`.
@@ -69,6 +73,9 @@
 //!   orderings are enough for all of this. What carries the ordering between the two calls is the
 //!   caller's handoff; a negative control weakens the handoff to `Relaxed` and the model then sees
 //!   a stale floor taken at face value.
+//! - TLB shootdown: when `shoot` returns, every online processor that held the translation has
+//!   dropped it, also one coming online at that moment; the invalidation it does is the one the
+//!   initiator asked for; and two initiators shooting at each other both finish.
 //!
 //! # What is not proved
 //!
@@ -132,6 +139,7 @@ use loom::thread::{self, JoinHandle};
 
 use crate::floor::MonotonicFloor;
 use crate::runqueue::RunQueue;
+use crate::shootdown::{Request, Shootdown, TlbHardware};
 use crate::wait::{Scheduler, TimedOut, WaitQueue};
 use crate::{RwLock, SpinLock};
 
@@ -1372,6 +1380,238 @@ fn floor_racing_readers_end_at_the_largest_reading() {
                 reader.join().unwrap();
             }
             assert_eq!(floor.advance(0), 3, "the floor is the largest reading");
+        },
+    );
+}
+
+// ---------------------------------------------------------------- TLB shootdown
+
+/// Processors in a shootdown model.
+const SHOOT_CPUS: usize = 3;
+/// The one page the shootdown models care about.
+const THE_PAGE: u64 = 0x40_0000;
+/// The page table entry of [`THE_PAGE`] while it is mapped; not mapped, it is 0.
+const MAPPED: u64 = 1;
+/// What a model's assertion says when a shootdown failed to do its job.
+const STALE: &str = "a processor kept a translation the shootdown took away";
+
+/// The machine of a shootdown model: a page table entry and each processor's TLB.
+struct TlbWorld {
+    shootdown: Shootdown<SHOOT_CPUS>,
+    /// Whether each processor holds a translation of [`THE_PAGE`].
+    tlb: [AtomicBool; SHOOT_CPUS],
+    /// The shootdown interrupt.
+    kick: [Notify; SHOOT_CPUS],
+    /// The model is over: serving processors stop.
+    stop: AtomicBool,
+    /// [`THE_PAGE`]'s page table entry.
+    pte: AtomicU64,
+}
+
+/// One processor of a [`TlbWorld`].
+#[derive(Clone)]
+struct TlbCpu {
+    id: usize,
+    world: Arc<TlbWorld>,
+}
+
+/// Processor `id` of `world`.
+fn tlb_cpu(world: &Arc<TlbWorld>, id: usize) -> TlbCpu {
+    TlbCpu {
+        id,
+        world: Arc::clone(world),
+    }
+}
+
+impl TlbHardware for TlbCpu {
+    fn this_cpu(&self) -> usize {
+        self.id
+    }
+
+    /// Drops the translation if this request names the page. A request for any other page
+    /// (a torn or stale one, say) leaves it cached, as `invlpg` would.
+    fn invalidate(&self, request: Request) {
+        let names_the_page = match request {
+            Request::Pages { base, pages } => {
+                base <= THE_PAGE && THE_PAGE < base + pages * crate::shootdown::PAGE
+            }
+            Request::NonGlobal | Request::Everything => true,
+        };
+        if names_the_page {
+            self.world.tlb[self.id].store(false, Relaxed);
+        }
+    }
+
+    fn send_ipi(&self, cpu: usize) {
+        self.world.kick[cpu].notify();
+    }
+
+    fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R {
+        f()
+    }
+
+    fn now(&self) -> u64 {
+        0
+    }
+
+    /// A model never gives up: a target that never answers shows as a hang.
+    fn patience(&self) -> u64 {
+        u64::MAX
+    }
+}
+
+impl TlbWorld {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            shootdown: Shootdown::new(),
+            tlb: core::array::from_fn(|_| AtomicBool::new(false)),
+            kick: core::array::from_fn(|_| Notify::new()),
+            stop: AtomicBool::new(false),
+            pte: AtomicU64::new(MAPPED),
+        })
+    }
+
+    /// Ends the model: every serving processor stops.
+    fn finish(&self, serving: Vec<(usize, JoinHandle<()>)>) {
+        self.stop.store(true, Relaxed);
+        for (cpu, handle) in serving {
+            self.kick[cpu].notify();
+            handle.join().unwrap();
+        }
+    }
+}
+
+impl TlbCpu {
+    /// A processor with interrupts on: takes the shootdown interrupt whenever it comes.
+    fn serve(&self) {
+        loop {
+            self.world.kick[self.id].wait();
+            if self.world.stop.load(Relaxed) {
+                return;
+            }
+            self.world.shootdown.service(self);
+        }
+    }
+
+    /// `serve`, on a thread of its own.
+    fn serving(&self) -> (usize, JoinHandle<()>) {
+        let me = self.clone();
+        (self.id, thread::spawn(move || me.serve()))
+    }
+
+    /// Whether this processor holds the translation.
+    fn holds(&self) -> bool {
+        self.world.tlb[self.id].load(Relaxed)
+    }
+
+    /// A page walk, as far as this model needs one: a present entry fills the TLB.
+    fn walk(&self) {
+        if self.world.pte.load(Relaxed) == MAPPED {
+            self.world.tlb[self.id].store(true, Relaxed);
+        }
+    }
+
+    /// Takes the page away everywhere, as `vm::unmap` does: the entry first, then the shootdown.
+    fn take_the_page_away(&self) {
+        self.world.pte.store(0, Relaxed);
+        self.world
+            .shootdown
+            .shoot(self, Request::page(THE_PAGE))
+            .unwrap();
+    }
+}
+
+/// When `shoot` returns, a processor that was online and held the translation has dropped it.
+#[test]
+fn shootdown_reaches_an_online_processor() {
+    check(
+        "shootdown_reaches_an_online_processor",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let (near, far) = (tlb_cpu(&world, 0), tlb_cpu(&world, 1));
+            world.shootdown.mark_online(&near);
+            world.shootdown.mark_online(&far);
+            world.tlb[1].store(true, Relaxed);
+            let serving = far.serving();
+            near.take_the_page_away();
+            assert!(!far.holds(), "{STALE}");
+            world.finish(vec![serving]);
+        },
+    );
+}
+
+/// A processor coming online while the shootdown runs ends up without the translation: either
+/// the initiator saw it online and waited for it, or its own first flush and the page walks
+/// after it see the entry gone. It held the translation from before it came online.
+#[test]
+fn shootdown_and_a_processor_coming_online() {
+    check(
+        "shootdown_and_a_processor_coming_online",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let (near, far) = (tlb_cpu(&world, 0), tlb_cpu(&world, 1));
+            world.shootdown.mark_online(&near);
+            world.tlb[1].store(true, Relaxed);
+            let serving = {
+                let me = far.clone();
+                (
+                    1,
+                    thread::spawn(move || {
+                        me.world.shootdown.mark_online(&me);
+                        me.walk();
+                        me.serve();
+                    }),
+                )
+            };
+            near.take_the_page_away();
+            world.finish(vec![serving]);
+            assert!(!far.holds(), "{STALE}");
+        },
+    );
+}
+
+/// Two processors each take the page away while the other holds it: each serves the other's
+/// request while it waits for its turn, and neither finishes before the other has dropped it.
+#[test]
+fn shootdown_two_initiators_serve_each_other() {
+    check(
+        "shootdown_two_initiators_serve_each_other",
+        preempted(2, SPINS),
+        preempted(3, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let cpus = [tlb_cpu(&world, 0), tlb_cpu(&world, 1)];
+            for cpu in &cpus {
+                world.shootdown.mark_online(cpu);
+                world.tlb[cpu.id].store(true, Relaxed);
+            }
+            let finished = Arc::new((AtomicU64::new(0), Notify::new()));
+            let handles: Vec<_> = cpus
+                .iter()
+                .map(|cpu| {
+                    let (me, finished) = (cpu.clone(), Arc::clone(&finished));
+                    let other = 1 - cpu.id;
+                    (
+                        cpu.id,
+                        thread::spawn(move || {
+                            me.take_the_page_away();
+                            assert!(!me.world.tlb[other].load(Relaxed), "{STALE}");
+                            finished.0.fetch_add(1, Release);
+                            finished.1.notify();
+                            me.serve();
+                        }),
+                    )
+                })
+                .collect();
+            // Loom's `Notify` can wake a waiter with nothing to report, so the count decides.
+            while finished.0.load(Acquire) < 2 {
+                finished.1.wait();
+            }
+            world.finish(handles);
         },
     );
 }
