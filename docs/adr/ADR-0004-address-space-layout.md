@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-07, as proposed (H1–H5, and the recommended answer to each of the four questions below). **H1–H4 implemented the same day** (boot info 0.3; loader-built tables; KASLR from RDSEED/RDRAND; the kernel in the higher half with its own tables). H5's global kernel pages, with cross-processor TLB shootdown, were implemented later the same day; PCIDs are not done yet. |
+| Status | **Accepted** by the owner on 2026-11-07, as proposed (H1–H5, and the recommended answer to each of the four questions below). **H1–H4 implemented the same day** (boot info 0.3; loader-built tables; KASLR from RDSEED/RDRAND; the kernel in the higher half with its own tables). H5's global kernel pages, with cross-processor TLB shootdown, were implemented later the same day; PCIDs are not done yet. H2's last clause, that the kernel-half entries point at tables allocated once at boot, was not honoured until N14 step 3, task S3-5a (2026-11-09): each process used to copy whatever entries existed when it was created. Now every entry 256–511 gets a table before the kernel's tables go live, and a boot proof holds a mapping made in a fresh slot after a process exists to being visible from that process. |
 | Supersedes | ADR-0003 K2's identity mapping, once implemented |
 | Related | ADR-0002 B3 (KASLR deferred to here), B4 (boot info), ADR-0003 K2, K8 |
 

@@ -491,6 +491,9 @@ impl UserSpace {
     }
 
     /// Takes this space's turn to change, serving TLB requests meanwhile (module documentation).
+    /// System calls come here with interrupts on, and a waiter that the holder has been
+    /// preempted under is preempted in turn; with interrupts off (the boot flow) nothing
+    /// preempts the waiter, so it must not contend with a holder on its own processor.
     fn edit(&self) -> SpinGuard<'_, ()> {
         loop {
             if let Some(turn) = self.editor.try_lock() {
