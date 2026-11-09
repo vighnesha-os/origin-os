@@ -565,13 +565,42 @@ fn boot_scenario() -> Scenario {
     }
     if qemu_iommu() == Iommu::Amd {
         amd_iommu_markers(&mut scenario, &machine);
-    } else if Accel::from_env() == Ok(Accel::Kvm) {
-        kvm_pin_markers(&mut scenario);
+    }
+    if Accel::from_env() == Ok(Accel::Kvm) {
+        kvm_markers(&mut scenario, qemu_iommu() != Iommu::Amd);
     }
     if qemu_bridge() {
         bridge_markers(&mut scenario);
     }
     scenario
+}
+
+/// The markers of a boot under KVM: what the VT-d pin proof can show there, and without two
+/// things a forgiven line leaves out. The kernel prints [`EVEN_SHARES_LINE`] only when every
+/// processor's workers got even shares ([`is_uneven_fair_share`]), and the TX proof's line
+/// ends `consistent true` only when its ring filled ([`is_unfilled_tx_ring`]). Each
+/// processor's own line and the TX line itself are still required.
+fn kvm_markers(scenario: &mut Scenario, vt_d: bool) {
+    if vt_d {
+        kvm_pin_markers(scenario);
+    }
+    scenario
+        .markers
+        .retain(|m| !m.starts_with(EVEN_SHARES_LINE));
+    let tx = scenario
+        .markers
+        .iter()
+        .position(|m| m == "origin-kernel: virtio-net TX: ");
+    match tx {
+        Some(at)
+            if scenario.markers.get(at + 1).map(String::as_str) == Some("; consistent true") =>
+        {
+            scenario.markers.remove(at + 1);
+        }
+        _ => scenario
+            .markers
+            .push("xtask: the virtio-net TX markers are not as expected".to_string()),
+    }
 }
 
 /// What the VT-d pin proof can show under KVM. Its last two steps take a remapped pin's IRTE
@@ -1468,6 +1497,8 @@ const NO_SPCR: &str =
 /// Every scenario here boots the whole kernel, so it ends with this line.
 const HALT_LINE: &str = "origin-kernel: M1 entry complete; halting";
 
+/// How the line starts that the scheduler proof prints when every worker's share was even.
+const EVEN_SHARES_LINE: &str = "origin-kernel: preemptive multitasking: ";
 /// How every I/O APIC proof ends a line that failed.
 const IOAPIC_FAILED: &str = ": I/O APIC failed";
 /// How every clock proof ends a line that failed.
@@ -4468,6 +4499,69 @@ mod tests {
             "origin-kernel: I/O APIC: IRTE 5 not present: 0 interrupts arrived in 100 ms; fault recorded: source ID 0xffff, interrupt index 5, reason 0x22 (interrupt table entry not present), from a message without a requester ID (the DMAR names 0xff00); IRTE restored, 5 interrupts arrived on {target} again: true; consistent true\n"
         );
         assert!(!serial::contains_in_order(&on_tcg, &window));
+    }
+
+    /// The TX line a forgiven boot prints must not eat the `consistent true` of a later line,
+    /// so its own is gone and the rest of the list still matches that boot's order.
+    #[test]
+    fn kvm_does_not_ask_the_unfilled_ring_line_to_be_consistent() {
+        let m = machine();
+        let mut s = boot_scenario_markers(&m);
+        kvm_markers(&mut s, true);
+        let at = s
+            .markers
+            .iter()
+            .position(|m| m == "origin-kernel: virtio-net TX: ")
+            .unwrap();
+        assert_ne!(s.markers[at + 1], "; consistent true");
+        let boot = format!("{KVM_TX_UNFILLED}\norigin-kernel: virtio-net ping: x; consistent true");
+        let window = [
+            s.markers[at].as_str(),
+            "origin-kernel: virtio-net ping: ",
+            "; consistent true",
+        ];
+        assert!(serial::contains_in_order(&boot, &window));
+
+        // A list that has changed shape is reported, not silently accepted.
+        let mut other = boot_scenario_markers(&m);
+        let tx = other
+            .markers
+            .iter()
+            .position(|m| m == "origin-kernel: virtio-net TX: ")
+            .unwrap();
+        other.markers[tx + 1] = "something else".to_string();
+        kvm_markers(&mut other, true);
+        assert_eq!(
+            other.markers.last().map(String::as_str),
+            Some("xtask: the virtio-net TX markers are not as expected")
+        );
+    }
+
+    /// Under KVM, and only there, the even-shares line is not required: the proof prints it
+    /// only when no processor's shares were uneven.
+    #[test]
+    fn kvm_does_not_wait_for_the_even_shares_line() {
+        let m = machine();
+        let plain = boot_scenario_markers(&m);
+        assert!(
+            plain
+                .markers
+                .iter()
+                .any(|m| m.starts_with(EVEN_SHARES_LINE))
+        );
+        let per_cpu = "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted ";
+        assert!(plain.markers.iter().any(|m| m == per_cpu));
+
+        for vt_d in [true, false] {
+            let mut s = boot_scenario_markers(&m);
+            if !vt_d {
+                amd_iommu_markers(&mut s, &m);
+            }
+            kvm_markers(&mut s, vt_d);
+            assert!(!s.markers.iter().any(|m| m.starts_with(EVEN_SHARES_LINE)));
+            assert!(s.markers.iter().any(|m| m == per_cpu));
+            assert!(!s.markers.iter().any(|m| m.starts_with("xtask: ")));
+        }
     }
 
     /// A marker list without the proof's lines is reported, not silently left alone.
