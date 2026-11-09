@@ -20,6 +20,7 @@ use alloc::sync::Arc;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::bootproof::{Proof, Tally};
 use crate::runqueue::{QueueError, RunQueue, per_mille, share_near_weight};
 
 use crate::console::Console;
@@ -492,7 +493,10 @@ pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
     }
 }
 
-/// Iterations each worker thread has made, indexed by worker.
+/// The time each worker has seen itself run, in TSC ticks, indexed by worker: every step of
+/// the TSC shorter than [`RUNNING_STEP`], like [`weighted_worker`]. Time, not iterations: on a
+/// processor sharing a physical core, or an emulated one, how many iterations a slice holds
+/// varies with what else is running, whatever the scheduler did.
 static PROGRESS: [AtomicU64; 2 * MAX_CPUS] = [const { AtomicU64::new(0) }; 2 * MAX_CPUS];
 /// The CPU index each worker last ran on, plus one (0: never ran).
 static RAN_ON: [AtomicU64; 2 * MAX_CPUS] = [const { AtomicU64::new(0) }; 2 * MAX_CPUS];
@@ -501,13 +505,20 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// Workers that have stopped and exited.
 static EXITED: AtomicU64 = AtomicU64::new(0);
 
-/// A worker that never yields: it counts until [`STOP`], so it only ever gives up its
-/// processor when the timer preempts it.
+/// A worker that never yields: until [`STOP`] it adds up the time it sees itself run, so it
+/// only ever gives up its processor when the timer preempts it.
 extern "sysv64" fn worker(slot: u64) -> ! {
     let slot = slot as usize;
+    let limit = RUNNING_STEP.load(Ordering::Relaxed);
+    let mut last = rdtsc();
     while !STOP.load(Ordering::Relaxed) {
+        let now = rdtsc();
+        let step = now.wrapping_sub(last);
+        last = now;
         if let (Some(p), Some(r)) = (PROGRESS.get(slot), RAN_ON.get(slot)) {
-            p.fetch_add(1, Ordering::Relaxed);
+            if step < limit {
+                p.fetch_add(step, Ordering::Relaxed);
+            }
             r.store(this_cpu() as u64 + 1, Ordering::Relaxed);
         }
         core::hint::spin_loop();
@@ -960,15 +971,21 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
 /// Proves preemptive multitasking on every online processor: two non-yielding workers per
 /// processor run for 500 ms while the boot flow (itself one of the boot processor's
 /// contexts) waits. On each processor, both workers must have run there, with shares
-/// within a factor of two, over at least five full rounds of context switches. Returns
-/// whether the proof passed.
-pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool {
+/// within a factor of two, over at least five full rounds of context switches. Then the
+/// rest of the thread proofs; each result goes into `proofs`, and `kernel_main` decides
+/// what they mean (ADR-0013). Fairness counts loop iterations, which a processor sharing a
+/// physical core skews with nothing wrong, so it is a separate result from preemption.
+pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: &mut Tally) {
     // Give every online processor's boot/idle context an FPU area before the baseline is
     // measured, so the first switch on it can save its state and the leak check is fair.
     for &id in cpus {
         init_cpu_fpu(id);
     }
     let heap_before = crate::memory::stats().map(|(h, _)| h.bytes_in_use);
+    RUNNING_STEP.store(
+        (tsc_hz / 1_000_000).max(1) * RUNNING_STEP_MICROS,
+        Ordering::Relaxed,
+    );
     for (i, &id) in cpus.iter().enumerate() {
         for k in 0..2 {
             if spawn(id, worker, (2 * i + k) as u64).is_err() {
@@ -976,7 +993,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
                     com1,
                     "origin-kernel: cannot spawn on CPU {id}: scheduler failed"
                 );
-                return false;
+                proofs.record(Proof::Preemption, false);
+                return;
             }
         }
     }
@@ -985,7 +1003,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
             com1,
             "origin-kernel: the local APIC is not in x2APIC mode: scheduler failed"
         );
-        return false;
+        proofs.record(Proof::Preemption, false);
+        return;
     };
     let bsp = cpu::this_cpu();
     GO.store(true, Ordering::Release);
@@ -1008,7 +1027,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
                 com1,
                 "origin-kernel: page protection violated: stack guard page at {guard:#x}: {other:?}"
             );
-            return false;
+            proofs.record(Proof::Preemption, false);
+            return;
         }
     }
     let workers = 2 * cpus.len();
@@ -1042,6 +1062,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
             "origin-kernel: workers did not exit: scheduler failed"
         );
     }
+    let mut fair_everywhere = true;
     for (i, &id) in cpus.iter().enumerate() {
         let switches = switches_at_stop.get(i).copied().unwrap_or(0);
         let (a, b) = (2 * i, 2 * i + 1);
@@ -1054,7 +1075,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
         // At least five full rounds of the three contexts.
         let rounds = switches >= 15;
         let passed = right_cpu && fair && rounds;
-        ok &= passed;
+        ok &= right_cpu && lo > 0 && rounds;
+        fair_everywhere &= fair;
         let _ = writeln!(
             com1,
             "origin-kernel: scheduler: CPU {id}: workers {a} and {b} counted {} and {}, {switches} context switches{}",
@@ -1063,31 +1085,38 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
             if passed { "" } else { ": scheduler failed" }
         );
     }
-    if ok {
+    if ok && fair_everywhere {
         let _ = writeln!(
             com1,
             "origin-kernel: preemptive multitasking: {workers} non-yielding threads on {} CPUs all ran, in {elapsed_ms} ms",
             cpus.len()
         );
     }
-    ok &= prove_weights(com1, cpus, bsp, tsc_hz);
-    ok &= prove_simd(com1, bsp, tsc_hz);
-    ok &= prove_lifecycle(com1, bsp, tsc_hz);
-    ok &= prove_spawn_refused(com1, bsp, tsc_hz);
-    ok &= crate::user::prove(com1, bsp, tsc_hz);
-    ok &= crate::time::prove_consistent(com1, cpus, bsp, tsc_hz);
-    ok &= crate::time::prove_monotonic(com1, cpus, bsp, tsc_hz);
-    ok &= crate::console::prove(com1, cpus, bsp, tsc_hz);
-    ok &= crate::tlb::prove(com1, cpus, bsp, tsc_hz);
-    ok &= crate::wait::prove(com1, cpus, bsp, tsc_hz);
-    ok &= crate::ipc_proof::prove(com1, cpus, bsp, tsc_hz);
+    proofs.record(Proof::Preemption, ok);
+    proofs.record(Proof::Fairness, fair_everywhere);
+    proofs.record(Proof::Weights, prove_weights(com1, cpus, bsp, tsc_hz));
+    proofs.record(Proof::SimdState, prove_simd(com1, bsp, tsc_hz));
+    proofs.record(Proof::ThreadLifecycle, prove_lifecycle(com1, bsp, tsc_hz));
+    proofs.record(Proof::SpawnRefusal, prove_spawn_refused(com1, bsp, tsc_hz));
+    proofs.record(Proof::UserIsolation, crate::user::prove(com1, bsp, tsc_hz));
+    let consistent = crate::time::prove_consistent(com1, cpus, bsp, tsc_hz);
+    proofs.record(Proof::TscConsistency, consistent);
+    let monotonic = crate::time::prove_monotonic(com1, cpus, bsp, tsc_hz);
+    proofs.record(Proof::ClockMonotonic, monotonic);
+    proofs.record(
+        Proof::ConsoleLines,
+        crate::console::prove(com1, cpus, bsp, tsc_hz),
+    );
+    proofs.record(Proof::Tlb, crate::tlb::prove(com1, cpus, bsp, tsc_hz));
+    crate::wait::prove(com1, cpus, bsp, tsc_hz, proofs);
+    proofs.record(Proof::Ipc, crate::ipc_proof::prove(com1, cpus, bsp, tsc_hz));
     // Every thread has exited: once each processor has reaped its own, the heap is back
     // exactly where it was before the first spawn.
     let back = || crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before;
     yield_until(back, tsc_hz, 2);
     let reaped = back();
     let now = crate::memory::stats().map_or(0, |(h, _)| h.bytes_in_use);
-    ok &= reaped;
+    proofs.record(Proof::ThreadsReaped, reaped);
     let _ = writeln!(
         com1,
         "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap {} KiB, {} KiB before the first spawn{}",
@@ -1095,7 +1124,6 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
         heap_before.unwrap_or(0) >> 10,
         if reaped { "" } else { ": scheduler failed" }
     );
-    ok
 }
 
 /// Stops the boot processor's scheduler and timer once the boot proofs are done, so the

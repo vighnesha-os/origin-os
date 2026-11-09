@@ -19,7 +19,7 @@
 
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::acpi::{self, IoApic, SourceOverride};
 use crate::ioapic::{self, RemappableEntry};
@@ -137,6 +137,9 @@ struct PitPin {
 
 static PIT_PIN: SpinLock<Option<PitPin>> = SpinLock::new(None);
 
+/// Whether [`prove`] found the PIT counting, for [`prove_remapped`].
+static PIT_COUNTING: AtomicBool = AtomicBool::new(false);
+
 /// Discovers the I/O APIC, routes the PIT's IRQ0 through it to the boot processor, and
 /// proves periodic interrupts arrive. `rsdp` is the ACPI RSDP, `bsp` the boot processor's
 /// APIC ID, `tsc_hz` the TSC rate. Returns whether the proof passed (no I/O APIC at all is
@@ -237,6 +240,9 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
         core::hint::spin_loop();
     }
     let elapsed = rdtsc().wrapping_sub(start);
+    // Checked only when nothing arrived: it decides what no interrupts mean, and a healthy
+    // boot does not pay for it.
+    let counting = ioapic_irqs() - before != 0 || timer::pit_channel0_counting(tsc_hz);
     // Mask the entry and stop the PIT: nothing schedules on this yet.
     let (masked_low, _) =
         ioapic::redirection_entry(cpu::IOAPIC_VECTOR, destination, active_low, level, true);
@@ -245,6 +251,14 @@ pub(crate) fn prove(com1: &mut Console, rsdp: u64, bsp: u32, tsc_hz: u64) -> boo
 
     let taken = ioapic_irqs() - before;
     let micros = elapsed.saturating_mul(1_000_000) / tsc_hz.max(1);
+    PIT_COUNTING.store(counting, Ordering::Relaxed);
+    if !counting {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: I/O APIC: routing not proven: the 8254 is not counting on this machine (absent or gated), so there are no PIT interrupts to route"
+        );
+        return true;
+    }
     let ok = taken >= PROOF_TICKS;
     let _ = writeln!(
         com1,
@@ -382,6 +396,13 @@ pub(crate) fn prove_remapped(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64)
         );
         return true;
     };
+    if !PIT_COUNTING.load(Ordering::Relaxed) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: I/O APIC: remapped: not proven: the 8254 is not counting on this machine (absent or gated)"
+        );
+        return true;
+    }
     if !crate::iommu::remapping() {
         let _ = writeln!(
             com1,

@@ -169,6 +169,7 @@ impl Entry {
             xcr0: None,
             memory: None,
             memory_taken: false,
+            frames_proven: false,
             tables_built: false,
             paged: false,
             heap: false,
@@ -208,6 +209,8 @@ pub struct Early {
     memory: Option<BootMemory>,
     /// [`Early::init_memory`] has run (`memory` is `None` again once the heap has it).
     memory_taken: bool,
+    /// [`Early::start_heap`]'s proof of the frame allocator passed.
+    frames_proven: bool,
     tables_built: bool,
     /// The kernel's own tables are live and proven.
     paged: bool,
@@ -450,10 +453,15 @@ impl Early {
         let Some(mut boot) = self.memory.take() else {
             return false;
         };
-        prove_frames(com1, &mut boot.frames);
+        self.frames_proven = prove_frames(com1, &mut boot.frames);
         memory::init(boot.frames);
         self.heap = true;
         true
+    }
+
+    /// Whether [`Early::start_heap`]'s proof of the frame allocator passed (ADR-0013).
+    pub const fn frames_proven(&self) -> bool {
+        self.frames_proven
     }
 
     /// Enables SMEP and SMAP on the boot processor and proves both, on a temporary user page
@@ -619,12 +627,12 @@ fn prove_protections(com1: &mut dyn Write, info: &BootInfo, segments: &[KernelSe
 }
 
 /// Proves the allocator by allocating, writing, reading back and freeing three frames.
-fn prove_frames(com1: &mut dyn Write, alloc: &mut FrameAllocator<'_>) {
+fn prove_frames(com1: &mut dyn Write, alloc: &mut FrameAllocator<'_>) -> bool {
     let mut got = [0u64; 3];
     for (i, slot) in got.iter_mut().enumerate() {
         let Some(addr) = alloc.allocate() else {
             let _ = writeln!(com1, "origin-kernel: frame allocator exhausted");
-            return;
+            return false;
         };
         let p = ptr::with_exposed_provenance_mut::<u64>(phys::to_virt(addr) as usize);
         let pattern = 0x4F52_4947_494E_0000 | i as u64;
@@ -639,14 +647,14 @@ fn prove_frames(com1: &mut dyn Write, alloc: &mut FrameAllocator<'_>) {
                 com1,
                 "origin-kernel: frame {addr:#x} did not keep its contents"
             );
-            return;
+            return false;
         }
         *slot = addr;
     }
     for &addr in &got {
         if alloc.free(addr).is_err() {
             let _ = writeln!(com1, "origin-kernel: frame {addr:#x} could not be freed");
-            return;
+            return false;
         }
     }
     let _ = writeln!(
@@ -654,4 +662,5 @@ fn prove_frames(com1: &mut dyn Write, alloc: &mut FrameAllocator<'_>) {
         "origin-kernel: allocated, wrote and freed 3 frames at {:#x}, {:#x}, {:#x}",
         got[0], got[1], got[2]
     );
+    true
 }

@@ -164,6 +164,10 @@ pub struct Fadt {
     pub century: Option<u8>,
     /// `IAPC_BOOT_ARCH` (offset 109) bit 5: the platform has no CMOS RTC.
     pub cmos_rtc_absent: bool,
+    /// Whether the firmware says the platform has an 8042 keyboard controller
+    /// (`IAPC_BOOT_ARCH` bit 1), or `None` if the table predates that flag (FADT revision 1,
+    /// ACPI 1.0, where the byte is reserved).
+    pub i8042: Option<bool>,
     /// The ACPI power-management timer's I/O port (`PM_TMR_BLK`, offset 76), if the
     /// firmware provides one (nonzero and `PM_TMR_LEN` is 4).
     pub pm_timer_port: Option<u16>,
@@ -175,6 +179,10 @@ pub struct Fadt {
 const FADT_CENTURY: usize = 108;
 /// Offset of the FADT's 16-bit `IAPC_BOOT_ARCH` flags.
 const FADT_IAPC_BOOT_ARCH: usize = 109;
+/// `IAPC_BOOT_ARCH` bit 1: the platform has an 8042 or equivalent (ACPI 2.0 and later).
+const HAS_8042: u16 = 1 << 1;
+/// Offset of the FADT's revision in its table header.
+const FADT_REVISION: usize = 8;
 /// Offset of `PM_TMR_BLK` (the PM timer's 32-bit I/O port address).
 const FADT_PM_TMR_BLK: usize = 76;
 /// Offset of `PM_TMR_LEN`.
@@ -199,11 +207,13 @@ pub fn parse_fadt(fadt: &[u8]) -> Result<Fadt, AcpiError> {
     let pm_tmr_blk = u32_at(fadt, FADT_PM_TMR_BLK).ok_or_else(short)?;
     let pm_tmr_len = *fadt.get(FADT_PM_TMR_LEN).ok_or_else(short)?;
     let flags = u32_at(fadt, FADT_FLAGS).ok_or_else(short)?;
+    let revision = *fadt.get(FADT_REVISION).ok_or_else(short)?;
     let pm_timer_port =
         (pm_tmr_len == 4 && pm_tmr_blk != 0 && pm_tmr_blk <= 0xFFFF).then_some(pm_tmr_blk as u16);
     Ok(Fadt {
         century: (0x0E..=0x7F).contains(&century).then_some(century),
         cmos_rtc_absent: arch & CMOS_RTC_NOT_PRESENT != 0,
+        i8042: (revision >= 2).then_some(arch & HAS_8042 != 0),
         pm_timer_port,
         pm_timer_32bit: flags & (1 << 8) != 0,
     })
@@ -689,6 +699,33 @@ mod tests {
         // The flags dword ends at offset 116, so a shorter table is refused.
         assert_eq!(parse_fadt(&qemu[..115]), Err(AcpiError::Length(115)));
         assert!(parse_fadt(&qemu[..116]).is_ok());
+    }
+
+    #[test]
+    fn the_fadt_says_whether_there_is_an_8042_from_revision_2() {
+        let fadt = |revision: u8, arch: u16| {
+            let mut body = vec![0u8; 240];
+            body[FADT_IAPC_BOOT_ARCH - 36..FADT_IAPC_BOOT_ARCH - 34]
+                .copy_from_slice(&arch.to_le_bytes());
+            let mut t = table(b"FACP", &body);
+            t[FADT_REVISION] = revision;
+            t
+        };
+        // ACPI 1.0's table has no such flag: the byte is reserved, so zero means nothing.
+        assert_eq!(parse_fadt(&fadt(1, 0)).unwrap().i8042, None);
+        assert_eq!(parse_fadt(&fadt(1, 1 << 1)).unwrap().i8042, None);
+        for revision in [2, 3, 5, 6] {
+            assert_eq!(
+                parse_fadt(&fadt(revision, 1 << 1)).unwrap().i8042,
+                Some(true)
+            );
+            assert_eq!(parse_fadt(&fadt(revision, 0)).unwrap().i8042, Some(false));
+            assert_eq!(
+                parse_fadt(&fadt(revision, !(1 << 1))).unwrap().i8042,
+                Some(false),
+                "only bit 1 decides"
+            );
+        }
     }
 
     /// Random firmware tables never panic the parsers, and anything accepted is

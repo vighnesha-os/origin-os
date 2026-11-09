@@ -1350,10 +1350,10 @@ fn uart_is_on() -> bool {
 /// the middle of the next line tests the urgent path the same way. The sections' sizes are
 /// counted at the sink. QEMU's UART takes bytes instantly, so what this proves is the bound in
 /// bytes, the windows and the order: what a section costs on a real UART it cannot show.
-pub(crate) fn prove_uart_sections(com1: &mut Console) {
+pub(crate) fn prove_uart_sections(com1: &mut Console) -> bool {
     use core::fmt::Write as _;
     if !WINDOWS_ALLOWED.load(Ordering::Acquire) {
-        return;
+        return true;
     }
     if !uart_is_on() {
         let given_up = UART_GIVEN_UP_AFTER.load(Ordering::Relaxed);
@@ -1364,7 +1364,7 @@ pub(crate) fn prove_uart_sections(com1: &mut Console) {
                 STOP_SHOWN_AT_ONCE.load(Ordering::Relaxed)
             );
         }
-        return;
+        return true;
     }
     const PLAIN: &str = "origin-kernel: console: a line sent on the UART a section at a time: ";
     let before = UART_BYTES.load(Ordering::Relaxed);
@@ -1433,6 +1433,7 @@ pub(crate) fn prove_uart_sections(com1: &mut Console) {
             UART_BUSY_POLLS.load(Ordering::Relaxed)
         );
     }
+    ok
 }
 
 /// Proves what [`SECTION_PIXELS`] promises, from the boot flow, last thing before the halt:
@@ -1445,10 +1446,10 @@ pub(crate) fn prove_uart_sections(com1: &mut Console) {
 /// being drawn. Its handler prints a line from interrupt context, which must queue behind that
 /// line and leave the painting to the writer that can wait. A breakpoint in the middle of the
 /// next line tests the urgent path the same way. The sections' sizes are counted at the sink.
-pub(crate) fn prove_sections(com1: &mut Console) {
+pub(crate) fn prove_sections(com1: &mut Console) -> bool {
     use core::fmt::Write as _;
     if !has_screen() || !WINDOWS_ALLOWED.load(Ordering::Acquire) {
-        return;
+        return true;
     }
     let bsp = crate::cpu::this_cpu();
     let irqs = crate::irq::ioapic_irqs_on(bsp);
@@ -1514,6 +1515,7 @@ pub(crate) fn prove_sections(com1: &mut Console) {
             micros(SECTION_WORST_CYCLES.load(Ordering::Relaxed))
         );
     }
+    ok
 }
 
 /// Every online processor prints [`PROOF_LINES`] lines at the same time; the boot test

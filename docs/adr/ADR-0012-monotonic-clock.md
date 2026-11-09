@@ -42,7 +42,7 @@ Without the invariant bit a counter may change rate with P-states or stop in dee
 
 `time::prove_consistent` stays exactly as strict as it was and keeps its boot line: it is how the kernel finds out whether a machine's raw counters agree, and CI's tolerance of a tiny step under KVM remains in `xtask` only (`kvm_forgives`, PR vighnesha-os/origin-os#4). It decides nothing about the clock: the floor does not depend on it passing.
 
-`sched::prove` returns the proof's result and `kernel_main` ignores that, as it ignores every proof's. Nothing in the clock needs to act on the result now, since the floor is unconditional. A real machine failing `prove_consistent` still prints `: clock failed`, and the boot still continues. What a real boot should do about any failed proof is a wider question and is outside this ADR.
+`sched::prove` records the proof's result in the boot's tally, and ADR-0013 decides what it means: Report, because nothing in the clock needs to act on it, the floor being unconditional. A real machine failing `prove_consistent` still prints `: clock failed`, the boot still continues, and the boot's verdict names the proof.
 
 A new boot proof, `time::prove_monotonic`, proves the contract rather than the counters: every processor reads the clock in turn, and no value may be below the one before it. It carries its own negative control in every boot (Evidence).
 

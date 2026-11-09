@@ -105,8 +105,19 @@ impl Controller {
     }
 }
 
-/// Brings the controller up and proves it answers. Returns whether the self-tests passed.
-pub(crate) fn init(com1: &mut Console) -> bool {
+/// Brings the controller up and proves it answers, unless the FADT at `rsdp` says this
+/// platform has none, which is reported and passes. Returns whether the self-tests passed.
+pub(crate) fn init(com1: &mut Console, rsdp: u64) -> bool {
+    let fadt = crate::firmware::acpi_table(rsdp, b"FACP")
+        .ok()
+        .and_then(|t| crate::acpi::parse_fadt(t).ok());
+    if fadt.is_some_and(|f| f.i8042 == Some(false)) {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: i8042: the FADT says this platform has none"
+        );
+        return true;
+    }
     // The controller's two ports; a first claim, so it cannot have been taken.
     let (Some(data), Some(status_command)) =
         (PortRange::claim(DATA, 1), PortRange::claim(COMMAND, 1))

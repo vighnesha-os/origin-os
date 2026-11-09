@@ -32,6 +32,15 @@ const RESERVED: &[(u16, u16)] = &[
     (0xCF8, 0x008), // PCI configuration, reset control
 ];
 
+/// Whether `[base, base + len)` includes a port only the framework's own interfaces may
+/// reach ([`RESERVED`]).
+pub(crate) fn reserved(base: u16, len: u16) -> bool {
+    let end = u32::from(base) + u32::from(len);
+    RESERVED.iter().any(|&(start, count)| {
+        u32::from(base) < u32::from(start) + u32::from(count) && end > u32::from(start)
+    })
+}
+
 /// A claimed range of I/O ports. Reads and writes outside it do nothing (a read returns 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortRange {
@@ -51,11 +60,8 @@ impl PortRange {
             return None;
         }
         // Refuse the system's ports.
-        for &(start, count) in RESERVED {
-            let reserved_end = u32::from(start) + u32::from(count);
-            if u32::from(base) < reserved_end && end > u32::from(start) {
-                return None;
-            }
+        if reserved(base, len) {
+            return None;
         }
         // Claim every port, or none: a racing claim that overlaps is undone.
         for port in u32::from(base)..end {

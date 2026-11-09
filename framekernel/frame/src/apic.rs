@@ -135,6 +135,33 @@ pub const fn pit_nanos(count: u16) -> u64 {
     count as u64 * 1_000_000_000 / PIT_HZ
 }
 
+/// How far a free-running counter of `mask`'s width advanced from `from` to `to`, across
+/// one wrap if it wrapped (`mask` is `0xFF_FFFF` for a 24-bit counter).
+pub const fn counter_elapsed(from: u64, to: u64, mask: u64) -> u64 {
+    to.wrapping_sub(from) & mask
+}
+
+/// The counter ticks of a `micros`-microsecond window on a counter running at `hz`, or `None`
+/// if it rounds to nothing.
+pub const fn window_ticks(hz: u64, micros: u64) -> Option<u64> {
+    let ticks = hz.saturating_mul(micros) / 1_000_000;
+    if ticks == 0 { None } else { Some(ticks) }
+}
+
+/// The nanoseconds `ticks` ticks of a counter at `hz` take, or `None` if `hz` is zero or the
+/// result does not fit.
+pub const fn ticks_nanos(ticks: u64, hz: u64) -> Option<u64> {
+    if hz == 0 {
+        return None;
+    }
+    let nanos = ticks as u128 * 1_000_000_000 / hz as u128;
+    if nanos > u64::MAX as u128 {
+        None
+    } else {
+        Some(nanos as u64)
+    }
+}
+
 /// Ticks per second of a counter that advanced `ticks` during `nanos` nanoseconds, or
 /// `None` if the window is empty or the result overflows.
 pub const fn rate(ticks: u64, nanos: u64) -> Option<u64> {
@@ -297,6 +324,30 @@ mod tests {
     }
 
     /// A 10 ms window on a 1 GHz counter, observed as closely as the code does.
+    #[test]
+    fn a_counter_wraps_at_its_own_width() {
+        const PM24: u64 = 0xFF_FFFF;
+        assert_eq!(counter_elapsed(100, 150, PM24), 50);
+        assert_eq!(counter_elapsed(0xFF_FFF0, 0x10, PM24), 0x20);
+        assert_eq!(counter_elapsed(5, 5, PM24), 0);
+        const PM32: u64 = 0xFFFF_FFFF;
+        assert_eq!(counter_elapsed(0xFFFF_FFF0, 0x10, PM32), 0x20);
+        assert_eq!(counter_elapsed(10, 2, u64::MAX), u64::MAX - 7);
+    }
+
+    #[test]
+    fn a_window_on_a_reference_is_as_long_as_its_rate_says() {
+        // The ACPI PM timer's 3.579545 MHz over 10 ms.
+        assert_eq!(window_ticks(3_579_545, 10_000), Some(35_795));
+        assert_eq!(ticks_nanos(35_795, 3_579_545), Some(9_999_874));
+        assert_eq!(window_ticks(0, 10_000), None);
+        assert_eq!(window_ticks(1, 1), None, "rounds to nothing");
+        assert_eq!(ticks_nanos(1, 0), None);
+        assert_eq!(ticks_nanos(u64::MAX, 1), None, "does not fit");
+        // A TSC rate as a reference: 10 ms of it is 10 ms.
+        assert_eq!(ticks_nanos(10_000_000, 1_000_000_000), Some(10_000_000));
+    }
+
     fn close_window() -> CalibrationWindow {
         CalibrationWindow {
             before_start: 1_000_000,

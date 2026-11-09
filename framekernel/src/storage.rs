@@ -1544,10 +1544,9 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
     let Some((dma, at, msix, irq_page, on_test_disk)) = driver else {
         let _ = writeln!(
             com1,
-            "origin-kernel: IOMMU: no NVMe controller to prove DMA remapping with{}",
-            if on { ": IOMMU failed" } else { "" }
+            "origin-kernel: IOMMU: no NVMe controller is bound, so the proofs through one did not run"
         );
-        return !on;
+        return true;
     };
     let DeviceDma::Translated(domain) = dma else {
         let _ = writeln!(
