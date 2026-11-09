@@ -2,9 +2,9 @@
 
 | | |
 |---|---|
-| Status | **Proposed**, 2026-11-09. It changes the kernel clock's contract and awaits the owner (CLAUDE.md §18). The code is built and boot-tested under QEMU only, on a local branch. Nothing here has shipped. |
+| Status | **Accepted** by the owner on 2026-11-09, as proposed, with the recommended answer to each of the three questions below (decision sheet item 54). It changes the kernel clock's contract (CLAUDE.md §18). The code is built and boot-tested under QEMU only. Nothing here has shipped. |
 | Requires | CLAUDE.md §68 (monotonic clock, cross-CPU time consistency), §13 (explicit memory ordering), §66 and rule 21 (measure), §73 (Loom), §74 and rule 30 (QEMU is not hardware) |
-| Code | `framekernel/sync/src/floor.rs` (`origin_sync::floor::MonotonicFloor`), `framekernel/src/time.rs`, `framekernel/sync/src/models.rs`, `developer-tools/xtask/src/{main,loom}.rs` |
+| Code | `framekernel/frame/sync/src/floor.rs` (`origin_sync::floor::MonotonicFloor`, re-exported as `origin_frame::sync::floor`), `framekernel/frame/src/monotonic.rs` (the clock's read path), `framekernel/src/time.rs` (the proof and the cost report), `framekernel/frame/sync/src/models.rs`, `developer-tools/xtask/src/{main,loom}.rs` |
 | Evidence | `docs/research/2026-11-09-tsc-consistency.md`; `docs/engineering/SOURCE_PROVENANCE.md`, "The monotonic clock's floor" |
 | Related | ADR-0003 (the APIC timer), ADR-0008 (CPU indexes), ADR-0009 (hardware targets) |
 
@@ -123,7 +123,7 @@ A shared cache line is written on every read, so the clock is not scalable under
 
 ## Migration consequences
 
-`monotonic_nanos`'s signature and meaning for existing callers are unchanged except that it can no longer step back. Nothing persistent depends on it. The Framekernel framework branch moves the monotonic clock into `origin_frame::monotonic`, so a merge must keep the floor on that path; the hand-over note says how.
+`monotonic_nanos`'s signature and meaning for existing callers are unchanged except that it can no longer step back. Nothing persistent depends on it. The clock and the floor live in the framework crate (`origin_frame::monotonic`, ADR-0011 N14), since reading the TSC is `unsafe`; the boot proof above the framework reads through `monotonic_reading`.
 
 ## Threat model (§58)
 
@@ -140,8 +140,8 @@ The floor is kernel-only memory. No user code reads or writes it. The clock's va
 - **`IA32_TSC_ADJUST` behaviour** on any machine (C5).
 - **Rate** on any machine lacking an invariant TSC (C3).
 
-## Questions for the owner
+## Questions for the owner (answered 2026-11-09: yes to all three)
 
-1. Accept the contract (C1) and an unconditional floor (C2), at the cost shown in C8? **Recommended: yes**. Nothing else makes the promise on every machine, and no caller is hot today.
-2. Accept that a machine without an invariant TSC keeps order but not rate (C3), rather than failing or moving to a platform timer? **Recommended: yes.** Supported hardware has the bit; a machine without it is outside the supported set, and it is how the kernel is tested.
-3. Accept leaving IA32_TSC_ADJUST unused until a physical machine shows a constant offset (C5)? **Recommended: yes.** It is not needed for the contract, and code for it could not have run anywhere yet.
+1. Accept the contract (C1) and an unconditional floor (C2), at the cost shown in C8? Recommended: yes. Nothing else makes the promise on every machine, and no caller is hot today. **Yes (2026-11-09).**
+2. Accept that a machine without an invariant TSC keeps order but not rate (C3), rather than failing or moving to a platform timer? Recommended: yes. Supported hardware has the bit; a machine without it is outside the supported set, and it is how the kernel is tested. **Yes (2026-11-09).**
+3. Accept leaving IA32_TSC_ADJUST unused until a physical machine shows a constant offset (C5)? Recommended: yes. It is not needed for the contract, and code for it could not have run anywhere yet. **Yes (2026-11-09).**

@@ -5,7 +5,7 @@
 | As of | 2026-11-09, on `main`, after the pre-merge review. Everything that was on a side branch is merged. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38 and 40–53. |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38 and 40–54. |
 | Still open | Items 30, 31 and 39 below. Buying machines is off for now (ADR-0009's update of 2026-11-09). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -148,5 +148,13 @@ The specification is `docs/spec/OIDL.md`, accepted by the owner on 2026-11-09. T
 | 49 (Q10), answered | C symbols are `<library>_<method>`, with no special case for the kernel? | **Accept** |
 | 50 (Q11), answered | Keep `event_create` and `object_signal` as `@reserved`? | **Keep them** |
 | 51 (Q12), answered | A type from another library is read with all its members known, because only the interface's own library is negotiated? | **Accept** |
+
+## The monotonic clock (ADR-0012): built, boot-proven, Accepted 2026-11-09
+
+CI caught one processor's TSC stepping back by 16 ticks on an EPYC 9V45 under KVM. Neither Intel nor AMD promises that two processors' counters agree, so the kernel now makes that promise itself, with a floor every read passes through. Proven under QEMU only (§74).
+
+| # | Question | Recommendation | Why |
+|---|---|---|---|
+| 54, answered | Accept ADR-0012: the monotonic clock never goes backwards, whatever the processors' TSCs say (C1), through a floor on every read, always on (C2); a machine without an invariant TSC keeps order but not rate (C3); `IA32_TSC_ADJUST` unused until a physical machine shows a constant offset (C5)? | **Accepted by the owner, 2026-11-09** ("Accept both", answering "Accept ADR-0012 (clock) and ADR-0013 (boot-check policy)?") | §68 and §66. Nothing else makes the promise on every machine, and no caller is hot today: alone a read costs one more variable access, and it does not scale when everything reads at once (C8). `ADR-0013` is item 55. |
 
 **Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.

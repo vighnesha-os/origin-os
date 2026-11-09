@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Date | 2026-11-09 |
-| For | `framekernel/src/time.rs`, `origin_sync::floor`, and `docs/adr/ADR-0012-monotonic-clock.md` (**Proposed**) |
+| For | `origin_frame::monotonic`, `framekernel/src/time.rs`, `origin_sync::floor`, and `docs/adr/ADR-0012-monotonic-clock.md` (Accepted 2026-11-09) |
 | Requires | CLAUDE.md §16 (research first), §68 (monotonic clock, cross-CPU time consistency), §66 (measure scaling), §74 and rule 30 (QEMU is not hardware) |
 | Method | Primary sources first: the current Intel SDM and AMD's manuals. Other kernels and hypervisors were studied through their published documentation, for concepts only; no operating-system source was opened or copied (CLAUDE.md §3). QEMU was queried and booted as the test machine. |
 
@@ -64,7 +64,7 @@ All of it on the M1 Max development host (QEMU 11.1.3 TCG, Rust 1.99.1), so none
 
 ## 6. Who reads the TSC today
 
-Audit of every `rdtsc` and `monotonic_nanos` caller in `framekernel/src` on `411b183`:
+Audit of every `rdtsc` and `monotonic_nanos` caller in `framekernel/src` on `411b183`. Re-checked after the merge onto the framework crate (`land/top` at `bf13d90`): the same call sites moved into `framekernel/frame/src` and `framekernel/src/kernel.rs`, and the console's new spans each measure one call on one processor:
 
 | Call | Used for | Across processors? |
 |---|---|---|
