@@ -53,6 +53,12 @@ pub enum RegionKind {
     Unusable = 12,
     /// Persistent memory.
     Persistent = 13,
+    /// Specific-purpose memory (UEFI 2.8 `EFI_MEMORY_SP`), such as high-bandwidth or
+    /// CXL-attached memory set aside for one use: never general-purpose RAM.
+    SpecificPurpose = 14,
+    /// Memory that can be removed while the machine runs (UEFI 2.11
+    /// `EFI_MEMORY_HOT_PLUGGABLE`): not used until the kernel can move its contents off it.
+    HotPluggable = 15,
 }
 
 impl RegionKind {
@@ -72,6 +78,8 @@ impl RegionKind {
             11 => Self::RuntimeData,
             12 => Self::Unusable,
             13 => Self::Persistent,
+            14 => Self::SpecificPurpose,
+            15 => Self::HotPluggable,
             _ => return None,
         })
     }
@@ -552,16 +560,18 @@ mod tests {
 
     #[test]
     fn region_kinds_round_trip() {
-        for raw in 1..=13 {
+        for raw in 1..=15 {
             assert_eq!(RegionKind::from_raw(raw).map(|k| k as u32), Some(raw));
         }
+        assert_eq!(RegionKind::from_raw(14), Some(RegionKind::SpecificPurpose));
+        assert_eq!(RegionKind::from_raw(15), Some(RegionKind::HotPluggable));
         assert_eq!(RegionKind::from_raw(0), None);
-        assert_eq!(RegionKind::from_raw(14), None);
+        assert_eq!(RegionKind::from_raw(16), None);
     }
 
     #[test]
     fn version_comes_from_origin_version_toml() {
-        assert_eq!(VERSION, (0, 4));
+        assert_eq!(VERSION, (0, 5));
     }
 
     #[test]
