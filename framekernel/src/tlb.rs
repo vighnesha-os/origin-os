@@ -1,10 +1,11 @@
 //! The boot proof of TLB shootdown and global kernel pages (CLAUDE.md §28, ADR-0004 H5). The
 //! mechanism is the framework's (`origin_frame::tlb`).
+#![forbid(unsafe_code)]
 
-use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use origin_frame::stack::GuardablePage;
 pub(crate) use origin_frame::tlb::{GLOBAL_PAGES, LAST_CYCLES, enable_global_pages, mark_online};
 
 use crate::console::Console;
@@ -21,28 +22,26 @@ static PROBED: AtomicU64 = AtomicU64::new(0);
 static FAULTED: AtomicU64 = AtomicU64::new(0);
 static STALE: AtomicU64 = AtomicU64::new(0);
 
-/// An application processor's thread: reads the proof pages, so its TLB holds their
-/// translations; stops touching them; then, once they are unmapped, probes each.
+/// An application processor's thread: reads the proof pages (`probe_read` both reads a byte
+/// and proves it mapped), so its TLB holds their translations; stops touching them; then, once
+/// they are unmapped, probes each.
 extern "sysv64" fn toucher(_: u64) -> ! {
-    let mut sum = 0u64;
+    let mut touched = 0u64;
     for _ in 0..64 {
         for page in &PAGES {
-            let p =
-                core::ptr::with_exposed_provenance::<u64>(page.load(Ordering::Acquire) as usize);
-            // SAFETY: each proof page is a live, mapped heap page until stage 2, which this
-            // thread waits for before touching the pages again.
-            sum = sum.wrapping_add(unsafe { p.read_volatile() });
+            if cpu::probe_read(page.load(Ordering::Acquire)) == cpu::Probe::Completed {
+                touched += 1;
+            }
         }
     }
-    core::hint::black_box(sum);
+    core::hint::black_box(touched);
     CACHED.fetch_add(1, Ordering::AcqRel);
     while STAGE.load(Ordering::Acquire) < 2 {
         core::hint::spin_loop();
     }
     for page in &PAGES {
         let addr = page.load(Ordering::Acquire);
-        // SAFETY: the page is RAM (a heap page), not MMIO; the probe only reads it.
-        match unsafe { cpu::probe_read(addr) } {
+        match cpu::probe_read(addr) {
             cpu::Probe::Faulted { error: 0, address } if address == addr => {
                 FAULTED.fetch_add(1, Ordering::Relaxed);
             }
@@ -82,18 +81,15 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
         census,
         if ok { "" } else { ": TLB failed" }
     );
-    let Ok(layout) = Layout::from_size_align(4096, 4096) else {
+    let (Some(mut one), Some(mut two), Some(mut three)) = (
+        GuardablePage::new(),
+        GuardablePage::new(),
+        GuardablePage::new(),
+    ) else {
         return false;
     };
-    let mut pages = [0u64; 3];
-    for (slot, page) in pages.iter_mut().zip(&PAGES) {
-        // SAFETY: `layout` has a non-zero size.
-        let p = unsafe { alloc_zeroed(layout) };
-        if p.is_null() {
-            return false;
-        }
-        *slot = p.expose_provenance() as u64;
-        page.store(*slot, Ordering::Release);
+    for (slot, page) in PAGES.iter().zip([&one, &two, &three]) {
+        slot.store(page.addr(), Ordering::Release);
     }
     let mut aps = 0u64;
     for &id in cpus.iter().filter(|&&id| id != bsp) {
@@ -108,10 +104,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
     }
     STAGE.store(1, Ordering::Release);
     crate::sched::yield_until(|| CACHED.load(Ordering::Acquire) == aps, tsc_hz, 2);
-    let [one, two, three] = pages;
-    let single = crate::vm::make_guard(one).is_ok();
+    let single = one.unmap();
     let single_cycles = LAST_CYCLES.load(Ordering::Relaxed);
-    let batch = crate::vm::make_guards(&[two, three]).is_ok();
+    let batch = GuardablePage::unmap_all(&mut [&mut two, &mut three]);
     let batch_cycles = LAST_CYCLES.load(Ordering::Relaxed);
     STAGE.store(2, Ordering::Release);
     crate::sched::yield_until(|| PROBED.load(Ordering::Acquire) == aps, tsc_hz, 2);
@@ -131,16 +126,5 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
         3 * aps,
         if probes_ok { "" } else { ": TLB failed" }
     );
-    for page in pages {
-        if crate::vm::unguard(page).is_ok() {
-            // SAFETY: `page` came from `alloc_zeroed(layout)` and is mapped again.
-            unsafe {
-                dealloc(
-                    core::ptr::with_exposed_provenance_mut(page as usize),
-                    layout,
-                )
-            };
-        }
-    }
     ok
 }

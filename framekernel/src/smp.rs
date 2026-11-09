@@ -52,6 +52,8 @@ use framekernel::paging::{Access, PAGE};
 use framekernel::topology::CpuTopology;
 use origin_boot_info::{BootInfo, MemoryRegion, RegionKind};
 
+use origin_frame::stack::GuardedStack;
+
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, CpuTables, MAX_CPUS, rdtsc};
 use crate::timer::{ApicRead, X2Apic};
@@ -296,10 +298,13 @@ pub(crate) fn start(
             cpu::assign(index, apic_id);
         }
     }
-    if let Err(why) = prepare(regions) {
-        let _ = writeln!(com1, "origin-kernel: AP start-up not possible: {why}");
-        return online;
-    }
+    let identity = match prepare(regions) {
+        Ok(identity) => identity,
+        Err(why) => {
+            let _ = writeln!(com1, "origin-kernel: AP start-up not possible: {why}");
+            return online;
+        }
+    };
     // Every start-up below relies on parking an AP that misses its handshake: the drill
     // proves that first, on the first AP. If INIT did not stop it, no AP is started.
     let mut parks = true;
@@ -329,7 +334,8 @@ pub(crate) fn start(
         }
     }
     // The identity mappings go: the lower half belongs to user space (ADR-0004 H1).
-    if let Err(e) = vm::unmap(TRAMPOLINE).and_then(|_| vm::unmap(TRAMPOLINE_DATA)) {
+    let [code, data] = identity;
+    if let Err(e) = code.unmap().and_then(|_| data.unmap()) {
         let _ = writeln!(
             com1,
             "origin-kernel: trampoline mappings not removed: {e:?}: AP start-up failed"
@@ -402,12 +408,12 @@ static INTERRUPT_STACK_GUARDS: AtomicU64 = AtomicU64::new(0);
 /// boot processor each guard page lies below anything those stacks have used so far), proves
 /// that each one faults, and returns how many did.
 fn guard_interrupt_stacks(tables: *const CpuTables) -> Result<u64, &'static str> {
-    let guards = cpu::interrupt_stack_guards(tables);
-    vm::make_guards(&guards).map_err(|_| "cannot unmap the guard pages")?;
+    // SAFETY: `tables` is an AP's own tables, before the AP starts, or the boot processor's,
+    // whose interrupt stacks lie above the guard pages (`cpu::protect_interrupt_stacks`).
+    let guards = unsafe { cpu::protect_interrupt_stacks(tables) }?;
     let mut proven = 0;
     for guard in guards {
-        // SAFETY: the page is RAM of `tables`, not MMIO; the probe only reads it.
-        match unsafe { cpu::probe_read(guard) } {
+        match cpu::probe_read(guard) {
             cpu::Probe::Faulted { error: 0, address } if address == guard => {
                 proven += 1;
             }
@@ -461,7 +467,7 @@ fn poke(offset: u64, value: u64) {
 }
 
 /// Copies the trampoline, makes its page read/execute, and writes the GDT and CR3.
-fn prepare(regions: &[MemoryRegion]) -> Result<(), &'static str> {
+fn prepare(regions: &[MemoryRegion]) -> Result<[vm::IdentityMapping; 2], &'static str> {
     let usable = |addr: u64| {
         regions.iter().any(|r| {
             r.kind == RegionKind::Usable as u32
@@ -494,9 +500,10 @@ fn prepare(regions: &[MemoryRegion]) -> Result<(), &'static str> {
     }
     // While APs start, the two frames also appear at their identity addresses, where the
     // trampoline runs as paging comes on: code read/execute, data read/write.
-    vm::map_identity(TRAMPOLINE, Access::ReadExecute)
-        .and_then(|()| vm::map_identity(TRAMPOLINE_DATA, Access::ReadWrite))
+    let code = vm::map_identity(TRAMPOLINE, Access::ReadExecute)
         .map_err(|_| "cannot map the trampoline")?;
+    let data = vm::map_identity(TRAMPOLINE_DATA, Access::ReadWrite)
+        .map_err(|_| "cannot map the trampoline data")?;
     // Null, 32-bit code, data, 64-bit code; all pre-marked accessed (type 0x9B / 0x93).
     for (i, d) in [
         0,
@@ -511,7 +518,7 @@ fn prepare(regions: &[MemoryRegion]) -> Result<(), &'static str> {
     }
     poke(GDTR, (TRAMPOLINE_DATA << 16) | 31);
     poke(CR3, root);
-    Ok(())
+    Ok([code, data])
 }
 
 /// Busy-waits `micros` microseconds on the TSC.
@@ -591,9 +598,10 @@ fn start_one(
     // the processor uses it.
     let tables = Box::into_raw(unsafe { Box::<CpuTables>::new_zeroed().assume_init() });
     let guards = guard_interrupt_stacks(tables)?;
-    let (stack, _guard) =
-        crate::sched::guarded_stack(AP_STACK_BYTES).ok_or("no memory for the AP stack")?;
-    let stack_top = (stack.as_mut_ptr().addr() + AP_STACK_BYTES) as u64 & !0xF;
+    let stack = GuardedStack::new(AP_STACK_BYTES).ok_or("no memory for the AP stack")?;
+    let stack_top = stack.top();
+    // Kept for ever: the AP runs on it (its idle context).
+    core::mem::forget(stack);
     let start: &'static ApStart = Box::leak(Box::new(ApStart {
         handshake: Handshake::new(),
         tables,
@@ -663,9 +671,10 @@ struct Drill {
 /// the count must then stand still. The AP is left in wait-for-SIPI, from which
 /// [`start_one`] starts it for real.
 fn drill(lapic: &X2Apic, apic_id: u32, tsc_hz: u64) -> Result<Drill, &'static str> {
-    let (stack, _guard) =
-        crate::sched::guarded_stack(DRILL_STACK_BYTES).ok_or("no memory for its stack")?;
-    let stack_top = (stack.as_mut_ptr().addr() + DRILL_STACK_BYTES) as u64 & !0xF;
+    let stack = GuardedStack::new(DRILL_STACK_BYTES).ok_or("no memory for its stack")?;
+    let stack_top = stack.top();
+    // Kept for ever: the drill's loop runs on it, and only INIT stops it.
+    core::mem::forget(stack);
     poke(STACK, stack_top);
     poke(ENTRY, (ap_drill as *const ()).addr() as u64);
     poke(ARG, 0);

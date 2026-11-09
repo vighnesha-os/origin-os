@@ -7,11 +7,6 @@
 # `cargo xtask unsafe-list` prints what should be here.
 8 framekernel/src/iommu.rs
 3 framekernel/src/iommu/amd.rs
-9 framekernel/src/ipc.rs
-4 framekernel/src/ipc_proof.rs
-33 framekernel/src/main.rs
-5 framekernel/src/process.rs
-24 framekernel/src/sched.rs
+3 framekernel/src/ipc_proof.rs
+32 framekernel/src/main.rs
 22 framekernel/src/smp.rs
-2 framekernel/src/syscall.rs
-4 framekernel/src/tlb.rs

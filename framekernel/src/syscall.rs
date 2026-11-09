@@ -15,11 +15,12 @@
 //!   checked before anything is consumed, so a bad out pointer does not lose a message.
 //! - Only a call from the process's system-call code range is accepted (P4, ONBF §6.1,
 //!   "syscall-origin pinning"). Until `origin.core` exists the creator names that range.
+#![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use framekernel::usercopy::{self, UserAccess, UserRange};
+use framekernel::usercopy::UserAccess;
 use origin_abi::limits::{MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES};
 use origin_abi::{Error, Handle, OK, read_sizes, signals, syscall as number};
 use origin_frame::trap::SyscallOutcome;
@@ -100,43 +101,18 @@ fn handle_arg(raw: u64) -> Result<Handle, Error> {
 }
 
 /// A pointer and length, checked against the caller's tables.
-fn checked(p: &Process, addr: u64, len: u64, access: UserAccess) -> Result<UserRange, Error> {
-    let range = UserRange::new(addr, len)?;
-    usercopy::check_mapped(&range, access, |page| p.translate(page))?;
-    Ok(range)
+fn checked(p: &Process, addr: u64, len: u64, access: UserAccess) -> Result<(), Error> {
+    p.space().check_user(addr, len, access)
 }
 
 /// Fills `dst` from the caller's memory at `src`.
 fn copy_in(p: &Process, dst: &mut [u8], src: u64) -> Result<(), Error> {
-    let range = checked(p, src, dst.len() as u64, UserAccess::Read)?;
-    if range.is_empty() {
-        return Ok(());
-    }
-    let target = dst.as_mut_ptr().expose_provenance() as u64;
-    // SAFETY: `dst` is a live kernel buffer of `range.len()` bytes that this call owns; the
-    // source was checked to be present user memory of the calling process, whose tables are
-    // the live ones; and a page fault during the copy is recovered.
-    if unsafe { cpu::copy_user(target, src, range.len()) } {
-        Ok(())
-    } else {
-        Err(Error::Fault)
-    }
+    p.space().copy_in(dst, src)
 }
 
 /// Copies `src` into the caller's memory at `dst`.
 fn copy_out(p: &Process, dst: u64, src: &[u8]) -> Result<(), Error> {
-    let range = checked(p, dst, src.len() as u64, UserAccess::Write)?;
-    if range.is_empty() {
-        return Ok(());
-    }
-    let source = src.as_ptr().expose_provenance() as u64;
-    // SAFETY: as in `copy_in`, the other way round: the destination was checked to be
-    // present, writable user memory of the calling process, and `src` is a kernel buffer.
-    if unsafe { cpu::copy_user(dst, source, range.len()) } {
-        Ok(())
-    } else {
-        Err(Error::Fault)
-    }
+    p.space().copy_out(dst, src)
 }
 
 /// The little-endian `u32` at `addr` in the caller's memory, read once.

@@ -89,6 +89,20 @@ static mut BSP_TABLES: CpuTables = CpuTables {
 };
 static mut IDT: Idt = Idt([[0; 2]; 256]);
 
+/// Unmaps the guard page below each of the four interrupt stacks in `tables` and returns
+/// their addresses (`smp::guard_interrupt_stacks` probes each one).
+///
+/// # Safety
+///
+/// `tables` must point at a live `CpuTables` whose interrupt stacks and guard pages nothing is
+/// using: an AP's tables before it starts, or the boot processor's (its stacks are above the
+/// guards and have not been used down that far).
+pub unsafe fn protect_interrupt_stacks(tables: *const CpuTables) -> Result<[u64; 4], &'static str> {
+    let guards = interrupt_stack_guards(tables);
+    crate::vm::make_guards(&guards).map_err(|_| "cannot unmap the guard pages")?;
+    Ok(guards)
+}
+
 /// The guard pages of the four interrupt stacks in `tables`.
 pub fn interrupt_stack_guards(tables: *const CpuTables) -> [u64; 4] {
     let base = tables.addr() as u64;
@@ -616,9 +630,11 @@ fn local() -> &'static CpuLocal {
     CPU_LOCAL.get(this_cpu().0).unwrap_or(&OUT_OF_RANGE)
 }
 
-/// Sets this processor's TSS.RSP0: the stack an interrupt or exception from user mode
-/// switches to. It must be the kernel stack of the thread about to run in user mode.
-pub fn set_kernel_stack(top: u64) {
+/// Sets this processor's TSS.RSP0 to `stack`'s top: the stack an interrupt or exception from
+/// user mode switches to. `stack` is the kernel stack of the thread about to run in user mode;
+/// taking it by reference means a stale or invented value cannot be installed.
+pub fn set_kernel_stack(stack: &crate::stack::GuardedStack) {
+    let top = stack.top();
     let local = this_cpu().0;
     let Some(tss) = CPU_LOCAL.get(local).map(|l| l.tss.load(Ordering::Relaxed)) else {
         return;
@@ -635,6 +651,87 @@ pub fn set_kernel_stack(top: u64) {
     unsafe { field.write_volatile(top as u32) };
     // SAFETY: as above, the high word.
     unsafe { field.wrapping_add(1).write_volatile((top >> 32) as u32) };
+}
+
+/// Records that this processor is running a context with no kernel stack of its own (the
+/// boot or idle flow): nothing is on any freed stack's account (`stack_in_use`).
+pub fn clear_kernel_stack() {
+    if let Some(l) = CPU_LOCAL.get(this_cpu().0) {
+        l.kernel_stack.store(0, Ordering::Relaxed);
+    }
+}
+
+/// How many thread frames one processor can have saved at once: the run queue's capacity
+/// (`RunQueue` holds 16 contexts) and some.
+const SAVED_FRAME_SLOTS: usize = 32;
+/// Each processor's saved thread frames: addresses the trap entry saved (a thread preempted,
+/// yielding, sleeping or blocked) or a new thread's first frame. Only these are ever
+/// resumed, so a wrong answer from the scheduler above cannot make the trap entry load anything
+/// else. 0 is an empty slot.
+static SAVED_FRAMES: [[AtomicU64; SAVED_FRAME_SLOTS]; MAX_CPUS] =
+    [const { [const { AtomicU64::new(0) }; SAVED_FRAME_SLOTS] }; MAX_CPUS];
+
+/// Records `frame` as a saved frame of processor `cpu`: a thread's first frame, or one the
+/// trap entry saved. `false` if the table is full (it cannot be: see the slot count).
+pub(crate) fn record_saved_frame(cpu: CpuIndex, frame: u64) -> bool {
+    SAVED_FRAMES.get(cpu.get()).is_some_and(|table| {
+        table.iter().any(|slot| {
+            slot.compare_exchange(0, frame, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })
+    })
+}
+
+/// Consumes `frame` from this processor's saved frames; `false` if it is not one of them.
+fn take_saved_frame(frame: u64) -> bool {
+    let me = this_cpu().get();
+    SAVED_FRAMES.get(me).is_some_and(|table| {
+        table.iter().any(|slot| {
+            slot.compare_exchange(frame, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })
+    })
+}
+
+/// What the trap entry resumes after a scheduler upcall: `next`, the frame the scheduler
+/// answered for the interrupted context at `here`. Unless they are the same, `next` must be one
+/// of the frames this processor saved (the scheduler can name no other), and `here` becomes
+/// one, unless the interrupted thread is ending (`exiting`).
+fn resume(here: u64, next: u64, exiting: bool) -> u64 {
+    if next == here {
+        return here;
+    }
+    if !take_saved_frame(next) {
+        panic!("the scheduler returned a frame the kernel never saved: {next:#x}");
+    }
+    if !exiting && !record_saved_frame(this_cpu(), here) {
+        panic!("too many saved thread frames on this processor");
+    }
+    next
+}
+
+/// Whether a processor is using the kernel stack `[start, end)`: it is some processor's current
+/// kernel stack, or a saved thread frame is on it. Only a stack that no processor is using
+/// can be freed.
+pub(crate) fn stack_in_use(start: u64, end: u64, top: u64) -> bool {
+    let used = |value: u64| value >= start && value < end;
+    let here = {
+        let rsp: u64;
+        // SAFETY: reads the stack pointer; no memory, no stack, flags preserved.
+        unsafe { asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
+        rsp
+    };
+    used(here)
+        // `kernel_stack` holds the top of the stack the processor runs on: this stack's top is
+        // one past its end, so compare it exactly (another stack's top can equal our guard
+        // page's address).
+        || CPU_LOCAL
+            .iter()
+            .any(|l| l.kernel_stack.load(Ordering::Relaxed) == top)
+        || SAVED_FRAMES
+            .iter()
+            .flatten()
+            .any(|f| used(f.load(Ordering::Acquire)))
 }
 
 /// This processor's CPU index: one GS-relative load from its CPU-local area. On a
@@ -715,6 +812,83 @@ pub fn halt() -> ! {
     }
 }
 
+/// Gives up the processor to the next ready context (`sched::yield_now`).
+pub fn thread_yield() {
+    // SAFETY: the gate for this vector is installed; the handler saves and restores every
+    // register, and returns here when this context is next scheduled.
+    unsafe { asm!("int 0x81") };
+}
+
+/// Sleeps for `ticks` timer ticks of this processor.
+pub fn thread_sleep(ticks: u64) {
+    // SAFETY: as for `thread_yield`; RDI carries the argument and is restored.
+    unsafe { asm!("int 0x82", in("rdi") ticks) };
+}
+
+/// Ends the running thread: never returns.
+pub fn thread_exit() -> ! {
+    loop {
+        // SAFETY: as for `thread_yield`; the handler frees this thread's slot and never
+        // resumes it. If the request is refused (no active queue), it is retried.
+        unsafe { asm!("int 0x83") };
+    }
+}
+
+/// Blocks the running thread until it is woken, or for `ticks` timer ticks if non-zero.
+pub fn thread_block(ticks: u64) {
+    // SAFETY: as for `thread_yield`; the handler saves and restores every register, and
+    // this context resumes here once it is woken. RDI carries the tick limit.
+    unsafe { asm!("int 0x84", in("rdi") ticks) };
+}
+
+/// Halts with interrupts enabled until the next interrupt, then returns with interrupts enabled.
+/// The idle context of a processor.
+pub fn idle() {
+    // SAFETY: CPL 0; every vector that can arrive has a gate.
+    unsafe { asm!("sti", "hlt", options(nostack)) };
+}
+
+/// As [`idle`], returning with interrupts disabled again.
+pub fn idle_disabling() {
+    // SAFETY: as for `idle`; CLI after the halt.
+    unsafe { asm!("sti", "hlt", "cli", options(nostack)) };
+}
+
+/// Loads `values` into XMM0, XMM3, XMM7 and XMM15 (the SIMD state the boot proof checks).
+/// Touches only those registers: kernel code is soft-float, so nothing else uses them.
+pub fn xmm_load(values: [u64; 4]) {
+    // SAFETY: SSE is enabled on this processor (`enable_simd`); these instructions only load
+    // the named XMM registers from general registers.
+    unsafe {
+        asm!(
+            "movq xmm0, {0}",
+            "movq xmm3, {1}",
+            "movq xmm7, {2}",
+            "movq xmm15, {3}",
+            in(reg) values[0], in(reg) values[1], in(reg) values[2], in(reg) values[3],
+            out("xmm0") _, out("xmm3") _, out("xmm7") _, out("xmm15") _,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+/// Reads XMM0, XMM3, XMM7 and XMM15 (the SIMD state the boot proof checks).
+pub fn xmm_read() -> [u64; 4] {
+    let (a, b, c, d): (u64, u64, u64, u64);
+    // SAFETY: reads the named XMM registers; no memory, no stack.
+    unsafe {
+        asm!(
+            "movq {0}, xmm0",
+            "movq {1}, xmm3",
+            "movq {2}, xmm7",
+            "movq {3}, xmm15",
+            out(reg) a, out(reg) b, out(reg) c, out(reg) d,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    [a, b, c, d]
+}
+
 /// Local APIC timer interrupts taken since boot.
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
@@ -748,7 +922,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // SAFETY: x2APIC mode is enabled before the timer is unmasked (`timer::init`), and
         // writing 0 to the EOI register only acknowledges the interrupt in service.
         unsafe { wrmsr(X2APIC_EOI, 0) };
-        return hooks.map_or(here, |h| (h.tick)(here));
+        return hooks.map_or(here, |h| resume(here, (h.tick)(here), false));
     }
     if frame.vector == u64::from(SPURIOUS_VECTOR) {
         return here;
@@ -763,7 +937,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         unsafe { wrmsr(X2APIC_EOI, 0) };
         return match irq::run(vector) {
             Action::Resume => here,
-            Action::Reschedule => hooks.map_or(here, |h| (h.reschedule)(here)),
+            Action::Reschedule => hooks.map_or(here, |h| resume(here, (h.reschedule)(here), false)),
         };
     }
     // Another processor woke a thread queued here: acknowledge, then switch to it if it
@@ -772,7 +946,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // SAFETY: as for the timer: only processors with an active scheduler are sent this
         // vector, so x2APIC mode is on; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
-        return hooks.map_or(here, |h| (h.reschedule)(here));
+        return hooks.map_or(here, |h| resume(here, (h.reschedule)(here), false));
     }
     // Another processor changed a kernel mapping: invalidate it here, then acknowledge.
     if frame.vector == u64::from(crate::tlb::SHOOTDOWN_VECTOR) {
@@ -790,16 +964,16 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     }
     // Scheduler requests from kernel threads (`sched::yield_now`, `sleep`, `exit`).
     if frame.vector == u64::from(YIELD_VECTOR) {
-        return hooks.map_or(here, |h| (h.yield_now)(here));
+        return hooks.map_or(here, |h| resume(here, (h.yield_now)(here), false));
     }
     if frame.vector == u64::from(SLEEP_VECTOR) {
-        return hooks.map_or(here, |h| (h.sleep)(here, frame.rdi));
+        return hooks.map_or(here, |h| resume(here, (h.sleep)(here, frame.rdi), false));
     }
     if frame.vector == u64::from(EXIT_VECTOR) {
-        return hooks.map_or(here, |h| (h.exit)(here));
+        return hooks.map_or(here, |h| resume(here, (h.exit)(here), true));
     }
     if frame.vector == u64::from(BLOCK_VECTOR) {
-        return hooks.map_or(here, |h| (h.block)(here, frame.rdi));
+        return hooks.map_or(here, |h| resume(here, (h.block)(here, frame.rdi), false));
     }
     if frame.vector == u64::from(SYSCALL_VECTOR) {
         let args = [
@@ -813,7 +987,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
                 frame.rax = status as u64;
                 here
             }
-            crate::trap::SyscallOutcome::ThreadExit => (hooks.exit)(here),
+            crate::trap::SyscallOutcome::ThreadExit => resume(here, (hooks.exit)(here), true),
         };
     }
     // A machine check is the hardware reporting on itself: it says nothing about the program
@@ -842,7 +1016,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
             halt();
         };
         (hooks.user_fault)(frame.vector, frame.error_code, address, on_exception_stack);
-        return (hooks.exit)(here);
+        return resume(here, (hooks.exit)(here), true);
     }
     // A page fault at the user-copy instruction, on a user address: resume at
     // `probe_recover`, which returns "failed" to `copy_user`'s caller.
@@ -1155,8 +1329,24 @@ pub fn read_cr3() -> u64 {
 /// `root` must be a complete PML4 that maps everything the running code touches next (its
 /// code, stack and data): in practice the kernel's, or a process PML4 sharing its half.
 pub unsafe fn write_cr3(root: u64) {
+    if let Some(slot) = LOADED_ROOT.get(this_cpu().get()) {
+        slot.store(root, Ordering::Release);
+    }
     // SAFETY: the caller's contract.
     unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+}
+
+/// Each CPU index's currently loaded root (0 before the first switch): what [`root_loaded`]
+/// answers from.
+static LOADED_ROOT: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Whether any processor has the address space `root` loaded. A user space's tables are freed
+/// only when this is false (a processor that is still running in it would be left on freed
+/// tables).
+pub fn root_loaded(root: u64) -> bool {
+    LOADED_ROOT
+        .iter()
+        .any(|slot| slot.load(Ordering::Acquire) == root)
 }
 
 /// The furthest a backtrace reads above the starting frame pointer, and the largest single
@@ -1299,6 +1489,8 @@ pub enum Probe {
         /// CR2.
         address: u64,
     },
+    /// The address is in a window of device memory: not read.
+    Refused,
 }
 
 /// Arms the probe for a fault at `fault_rip`, runs `access`, and disarms it.
@@ -1318,14 +1510,15 @@ fn run_probe(fault_rip: u64, access: impl FnOnce() -> u64) -> Probe {
     }
 }
 
-/// Reads the byte at `addr`.
-///
-/// # Safety
-///
-/// Reading `addr` must have no side effect if it succeeds: not MMIO.
-pub unsafe fn probe_read(addr: u64) -> Probe {
-    // SAFETY: the caller's contract; `read_byte` faults at its first instruction or reads
-    // one byte and returns.
+/// Reads the byte at `addr` through a fault-tolerant instruction and reports what happened.
+/// One byte of RAM read this way harms nothing (the value only goes into the report);
+/// device memory is refused, because reading it could have side effects.
+pub fn probe_read(addr: u64) -> Probe {
+    if crate::vm::in_device_window(addr) {
+        return Probe::Refused;
+    }
+    // SAFETY: `read_byte` faults at its first instruction or reads one byte and returns;
+    // `addr` is not in the device windows, so a successful read has no side effect.
     run_probe((read_byte as *const ()).addr() as u64, || unsafe {
         read_byte(addr)
     })
@@ -1399,6 +1592,17 @@ pub unsafe fn copy_user(dst: u64, src: u64, len: u64) -> bool {
         unsafe { asm!("clac", options(nomem, nostack)) };
     }
     result == COMPLETED
+}
+
+/// The boot proof of user-copy fault recovery: copies 16 bytes from a user address that no
+/// address space maps into `buffer`, and returns whether the copy completed (it must not).
+pub fn probe_user_copy_fault(buffer: &mut [u8; 16]) -> bool {
+    const NOWHERE: u64 = 0x0000_2000_0000_0000;
+    let destination = buffer.as_mut_ptr().expose_provenance() as u64;
+    // SAFETY: `buffer` is a live 16-byte kernel buffer; `NOWHERE` is a user address not mapped
+    // in the kernel's tables, the ones in force here, so the first access faults and the
+    // fault is recovered at the copy instruction.
+    unsafe { copy_user(destination, NOWHERE, 16) }
 }
 
 /// Turns interrupts on for a system call, which runs on its own thread's stack.

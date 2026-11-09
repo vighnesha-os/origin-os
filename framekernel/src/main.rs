@@ -1267,14 +1267,12 @@ fn prove_protections(com1: &mut Console, info: &BootInfo, segments: &[KernelSegm
             0x11,
             exec,
         ),
-        // SAFETY: page 0 is RAM or unmapped, never MMIO.
-        ("read of page 0", 0, 0x0, unsafe { cpu::probe_read(0) }),
+        ("read of page 0", 0, 0x0, cpu::probe_read(0)),
         (
             "read of the boot stack's guard page",
             phys::to_virt(info.stack_base - PAGE),
             0x0,
-            // SAFETY: the guard is a RAM page of the KernelStack region, not MMIO.
-            unsafe { cpu::probe_read(phys::to_virt(info.stack_base - PAGE)) },
+            cpu::probe_read(phys::to_virt(info.stack_base - PAGE)),
         ),
     ];
     let mut all = true;
@@ -1490,20 +1488,22 @@ fn prove_user_isolation(com1: &mut Console) -> bool {
     }
     let phys = phys::to_phys(frame.expose_provenance() as u64);
     let mut ok = true;
-    if vm::map_user(
-        USER_PROBE_PAGE,
-        phys,
-        framekernel::paging::Access::ReadExecute,
-    )
-    .is_err()
-    {
+    // SAFETY: the page is the proof's own fresh frame, about to be probed and unmapped: nothing
+    // else ever uses it, and ring 3 runs no code in this address space yet.
+    let mapped = unsafe {
+        vm::map_user(
+            USER_PROBE_PAGE,
+            phys,
+            framekernel::paging::Access::ReadExecute,
+        )
+    };
+    if mapped.is_err() {
         let _ = writeln!(com1, "origin-kernel: cannot map the user probe page");
         ok = false;
     } else {
         // SAFETY: the user page holds `PROBE_RETURN`.
         let fetch = unsafe { cpu::probe_execute(USER_PROBE_PAGE) };
-        // SAFETY: the user page is RAM, not MMIO.
-        let read = unsafe { cpu::probe_read(USER_PROBE_PAGE) };
+        let read = cpu::probe_read(USER_PROBE_PAGE);
         for (what, probe, expected) in [
             ("SMEP: supervisor fetch from a user page", fetch, 0x11),
             ("SMAP: supervisor read of a user page", read, 0x1),
@@ -1526,7 +1526,9 @@ fn prove_user_isolation(com1: &mut Console) -> bool {
                 }
             }
         }
-        if vm::unmap(USER_PROBE_PAGE).is_err() {
+        // SAFETY: `USER_PROBE_PAGE` is the page this function mapped above, used by nothing
+        // else, and nothing relies on it being mapped.
+        if unsafe { vm::unmap(USER_PROBE_PAGE) }.is_err() {
             ok = false;
         }
     }

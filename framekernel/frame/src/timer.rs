@@ -89,7 +89,19 @@ impl X2Apic {
         }
         let apic = Self(());
         apic.write(ApicWrite::SpuriousVector, apic::svr(SPURIOUS_VECTOR));
+        if let Some(ready) = X2APIC_READY.get(crate::cpu::this_cpu().get()) {
+            ready.store(true, core::sync::atomic::Ordering::Release);
+        }
         apic
+    }
+
+    /// This processor's handle, if its local APIC has been switched to x2APIC mode
+    /// ([`X2Apic::enable`] has run here): the safe way to get one.
+    pub fn this_cpu() -> Option<Self> {
+        X2APIC_READY
+            .get(crate::cpu::this_cpu().get())
+            .is_some_and(|ready| ready.load(core::sync::atomic::Ordering::Acquire))
+            .then_some(Self(()))
     }
 
     /// The handle for a processor whose local APIC is already in x2APIC mode, without
@@ -147,6 +159,29 @@ impl X2Apic {
             apic::lvt_timer(TIMER_VECTOR, TimerMode::OneShot, true),
         );
         self.write(ApicWrite::TimerInitial, 0);
+    }
+}
+
+/// ICR level bit: assert (the only meaningful level for fixed IPIs).
+const ICR_ASSERT: u32 = 1 << 14;
+
+/// Each CPU index whose local APIC [`X2Apic::enable`] switched to x2APIC mode.
+static X2APIC_READY: [core::sync::atomic::AtomicBool; crate::limits::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::limits::MAX_CPUS];
+
+/// Sends the reschedule IPI to the processor with APIC ID `apic_id`: its handler acknowledges
+/// and switches through that processor's own run queue. Nothing happens if this processor's
+/// APIC is not in x2APIC mode yet. Safe: an IPI with this fixed vector does nothing a timer
+/// interrupt could not do, and the destination cannot be harmed by a stray one (its handler
+/// only reschedules).
+pub fn send_reschedule_ipi(apic_id: u32) {
+    if let Some(lapic) = X2Apic::this_cpu() {
+        let value = (u64::from(apic_id) << 32)
+            | u64::from(ICR_ASSERT | u32::from(crate::cpu::RESCHEDULE_VECTOR));
+        // SAFETY: x2APIC mode is on (`this_cpu`), so the ICR exists; a fixed IPI with the
+        // reschedule vector only reschedules its destination.
+        unsafe { crate::cpu::wrmsr(X2APIC_ICR, value) };
+        let _ = lapic;
     }
 }
 

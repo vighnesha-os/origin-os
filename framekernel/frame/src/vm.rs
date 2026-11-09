@@ -142,7 +142,12 @@ pub fn map_firmware(addr: u64, len: u64) -> Result<u64, MapError> {
 
 /// Maps the 4 KiB page `virt` to `phys` as a **user** page with `access`: only for probes
 /// that prove supervisor protections (SMEP, SMAP); the kernel has no user mappings otherwise.
-pub fn map_user(virt: u64, phys: u64, access: Access) -> Result<(), MapError> {
+///
+/// # Safety
+///
+/// `phys` must be memory that ring 3 may see (the proofs use a fresh page of its own), or
+/// every process could read or write it; `virt` must be free in the kernel's tables.
+pub unsafe fn map_user(virt: u64, phys: u64, access: Access) -> Result<(), MapError> {
     crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
@@ -157,7 +162,13 @@ pub fn map_user(virt: u64, phys: u64, access: Access) -> Result<(), MapError> {
 }
 
 /// Removes the leaf at `virt`; once this returns, no processor's TLB holds it.
-pub fn unmap(virt: u64) -> Result<u64, MapError> {
+///
+/// # Safety
+///
+/// `virt` must be a page nothing relies on being mapped: the kernel's code, its data, a live
+/// stack or any Rust object must not lie there. (A mapping this code made is removed through
+/// its token instead: [`IdentityMapping::unmap`].)
+pub unsafe fn unmap(virt: u64) -> Result<u64, MapError> {
     let phys = crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
@@ -170,7 +181,7 @@ pub fn unmap(virt: u64) -> Result<u64, MapError> {
 /// Turns the direct-map page `page` into a guard page: unmapped, so any access faults,
 /// on every processor once this returns. A 2 MiB leaf covering it is split first (one
 /// INVLPG in the page drops the old 2 MiB translation too).
-pub fn make_guard(page: u64) -> Result<(), MapError> {
+pub(crate) fn make_guard(page: u64) -> Result<(), MapError> {
     unmap_guards(&[page])?;
     crate::tlb::shootdown(page);
     Ok(())
@@ -178,7 +189,7 @@ pub fn make_guard(page: u64) -> Result<(), MapError> {
 
 /// As [`make_guard`] for several pages, with one full TLB flush on every processor instead
 /// of one shootdown per page.
-pub fn make_guards(pages: &[u64]) -> Result<(), MapError> {
+pub(crate) fn make_guards(pages: &[u64]) -> Result<(), MapError> {
     unmap_guards(pages)?;
     crate::tlb::shootdown_all();
     Ok(())
@@ -353,6 +364,27 @@ pub fn framebuffer_region(
     })
 }
 
+/// Whether `addr` is in a window of device memory (the MMIO window or the framebuffer's): a
+/// probe must not read there.
+pub(crate) fn in_device_window(addr: u64) -> bool {
+    use origin_paging::layout::{FRAMEBUFFER_WINDOW, FRAMEBUFFER_WINDOW_SIZE};
+    (FRAMEBUFFER_WINDOW..FRAMEBUFFER_WINDOW + FRAMEBUFFER_WINDOW_SIZE).contains(&addr)
+        || (MMIO_BASE..MMIO_END).contains(&addr)
+}
+
+/// Switches this processor to the kernel's own address space, if it isn't on it yet: the space
+/// of every kernel thread. Safe: the kernel's tables are complete (`install` keeps them for
+/// ever), and this replaces whatever the processor was using, which the switching code
+/// (the scheduler) has given up.
+pub fn activate_kernel_space() {
+    let root = kernel_root();
+    if root != 0 && crate::cpu::read_cr3() != root {
+        // SAFETY: `root` is the kernel's complete PML4, which maps everything kernel code
+        // touches next; it lives for ever.
+        unsafe { crate::cpu::write_cr3(root) };
+    }
+}
+
 /// How the live tables translate `virt`.
 pub fn translate(virt: u64) -> Option<Translation> {
     crate::cpu::without_interrupts(|| {
@@ -372,7 +404,7 @@ pub fn leaf_census() -> Option<LeafCensus> {
 }
 
 /// Maps a guard page back (read/write, never executable) before its memory is freed.
-pub fn unguard(page: u64) -> Result<(), MapError> {
+pub(crate) fn unguard(page: u64) -> Result<(), MapError> {
     crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
@@ -385,14 +417,34 @@ pub fn unguard(page: u64) -> Result<(), MapError> {
     })
 }
 
+/// The identity mapping of one low page (the AP trampoline's): removing it is the only thing
+/// the holder can do with it.
+#[must_use]
+#[derive(Debug)]
+pub struct IdentityMapping {
+    virt: u64,
+}
+
+impl IdentityMapping {
+    /// Removes the mapping; once this returns, no processor's TLB holds it.
+    pub fn unmap(self) -> Result<u64, MapError> {
+        // SAFETY: `self.virt` is the identity page `map_identity` mapped for this token,
+        // used only by the AP trampoline, which has finished: nothing relies on it now.
+        unsafe { unmap(self.virt) }
+    }
+}
+
 /// Maps the 4 KiB page at physical `page` at its identity address (the lower half) with
-/// `access`: only for the AP trampoline, which runs there while paging comes on.
-pub fn map_identity(page: u64, access: Access) -> Result<(), MapError> {
+/// `access`: only for the AP trampoline, which runs there while paging comes on. Safe: a
+/// kernel mapping creates no access for safe code, and what it maps is removed through the
+/// returned token.
+pub fn map_identity(page: u64, access: Access) -> Result<IdentityMapping, MapError> {
     crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
         k.space
-            .map(&mut k.tables, page, page, Attributes::kernel(access))
+            .map(&mut k.tables, page, page, Attributes::kernel(access))?;
+        Ok(IdentityMapping { virt: page })
     })
 }
 

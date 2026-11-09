@@ -34,6 +34,8 @@ use framekernel::paging::{Access, PAGE};
 use origin_abi::limits::{DEADLINE_INFINITE, MAX_MESSAGE_BYTES};
 use origin_abi::{Error, OK, read_sizes, rights, signals, status_name, syscall as sys};
 
+use origin_frame::userspace::UserFrame;
+
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex};
 use crate::ipc::{self, Object};
@@ -680,7 +682,7 @@ struct Group {
 struct Image {
     process: Process,
     /// Every page mapped so far: its user address and frame.
-    pages: Vec<(u64, u64)>,
+    pages: Vec<(u64, UserFrame)>,
 }
 
 impl Image {
@@ -934,8 +936,9 @@ fn build_pinger(image: Image, rounds: u64) -> Option<Arc<Process>> {
 
 /// Writes `value` to the `u64` at `offset` of the process's data page, before it starts.
 fn write_param(process: &Process, offset: usize, value: u64) -> bool {
-    let frame = process.translate(DATA).map(|t| t.phys);
-    frame.is_some_and(|f| process.write_frame(f & !(PAGE - 1), offset, &value.to_le_bytes()))
+    process
+        .frame_of(DATA)
+        .is_some_and(|f| process.write_frame(f, offset, &value.to_le_bytes()))
 }
 
 /// The hostile script. `kernel` is an address of kernel data; `foreign` a handle value that
@@ -1914,14 +1917,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
 /// system-call path checks every pointer first, so nothing else ever exercises this; it
 /// copies here without a check, on purpose, from a user address no address space maps.
 fn copy_fault_recovered(com1: &mut Console) -> bool {
-    const NOWHERE: u64 = 0x0000_2000_0000_0000;
     let mut buffer = [0u8; 16];
-    let destination = buffer.as_mut_ptr().expose_provenance() as u64;
     let before = cpu::user_copy_faults();
-    // SAFETY: `buffer` is a live 16-byte kernel buffer; `NOWHERE` is a user address that is
-    // not mapped in the kernel's tables, the ones in force here, so the first access
-    // faults and the fault is recovered.
-    let completed = unsafe { cpu::copy_user(destination, NOWHERE, 16) };
+    let completed = cpu::probe_user_copy_fault(&mut buffer);
     let recovered = cpu::user_copy_faults().wrapping_sub(before);
     let right = !completed && recovered == 1 && buffer == [0; 16];
     let _ = writeln!(

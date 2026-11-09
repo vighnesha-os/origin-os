@@ -36,6 +36,7 @@ pub mod heap;
 pub mod irq;
 pub mod limits;
 pub mod mmio;
+pub mod objref;
 pub mod once;
 pub mod trap;
 pub mod unwind;
@@ -57,8 +58,12 @@ pub mod phys;
 #[cfg(target_os = "none")]
 pub mod port;
 #[cfg(target_os = "none")]
+pub mod stack;
+#[cfg(target_os = "none")]
 pub mod timer;
 #[cfg(target_os = "none")]
 pub mod tlb;
+#[cfg(target_os = "none")]
+pub mod userspace;
 #[cfg(target_os = "none")]
 pub mod vm;

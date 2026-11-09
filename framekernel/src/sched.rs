@@ -14,29 +14,23 @@
 //!
 //! Queues are indexed by CPU index (`cpu::CpuIndex`, ADR-0008), never by APIC ID; a
 //! reschedule IPI goes to the APIC ID recorded for the target's index.
+#![forbid(unsafe_code)]
 
 use alloc::sync::Arc;
-use core::arch::asm;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use framekernel::descriptors::{KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
 use framekernel::runqueue::{QueueError, RunQueue, per_mille, share_near_weight};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
 use crate::process::Process;
 use crate::timer::{self, X2Apic};
+use origin_frame::stack::{FpuArea, GuardedStack, ThreadStart};
 use origin_frame::sync::SpinLock;
 
 /// Each kernel thread's stack.
 const THREAD_STACK: usize = 16 * 1024;
-/// Words in a saved frame: 15 registers, vector, error code, RIP, CS, RFLAGS, RSP, SS.
-const FRAME_WORDS: usize = 22;
-/// Index of RDI in a saved frame (r15 is first; see `cpu::ExceptionFrame`).
-const RDI: usize = 9;
-/// RFLAGS of a new thread: IF (interrupts on) and the always-one bit 1.
-const NEW_RFLAGS: u64 = 0x202;
 
 static QUEUES: [SpinLock<RunQueue>; MAX_CPUS] =
     [const { SpinLock::new(RunQueue::new()) }; MAX_CPUS];
@@ -57,182 +51,90 @@ pub(crate) fn on_tick(interrupted: u64) -> u64 {
     with_queue(interrupted, |q| Some(q.tick(interrupted)))
 }
 
-/// Prepares CPU `id` to resume the thread in `slot`: TSS.RSP0 points at its kernel stack,
-/// so an interrupt from user mode always lands on the running thread's own stack (the boot
-/// or idle flow, with no recorded stack, never runs in user mode), and CR3 holds its
-/// address space (the kernel's for kernel threads), loaded only when it differs.
-/// Allocates and initializes a thread's FPU/SIMD save area (so a restore yields a clean
-/// FPU), or `None` if there is no memory. Never zeroed by the allocator; `fpu_init_area`
-/// sets it.
-fn alloc_fpu_area() -> Option<u64> {
-    use alloc::alloc::{Layout, alloc};
-    let size = cpu::fpu_area_size().max(framekernel::features::FXSAVE_SIZE);
-    let layout = Layout::from_size_align(size, 64).ok()?;
-    // SAFETY: `size` is non-zero.
-    let p = unsafe { alloc(layout) };
-    if p.is_null() {
-        return None;
-    }
-    let area = p.expose_provenance() as u64;
-    // SAFETY: `area` is a fresh buffer of `size` >= `fpu_area_size()` bytes.
-    unsafe { cpu::fpu_init_area(area) };
-    Some(area)
-}
-
-/// Frees an FPU area from [`alloc_fpu_area`].
-fn free_fpu_area(area: u64) {
-    use alloc::alloc::{Layout, dealloc};
-    let size = cpu::fpu_area_size().max(framekernel::features::FXSAVE_SIZE);
-    if area != 0
-        && let Ok(layout) = Layout::from_size_align(size, 64)
-    {
-        // SAFETY: `area` came from `alloc_fpu_area` with this exact layout, and its thread
-        // has exited and been switched away from, so nothing uses the state any more.
-        unsafe {
-            dealloc(
-                core::ptr::with_exposed_provenance_mut(area as usize),
-                layout,
-            )
-        };
-    }
-}
-
 /// Makes sure CPU `cpu`'s boot/idle context (slot 0) has an FPU area, so the first switch
 /// away from it can save its state. Called before the processor's scheduler runs.
 pub(crate) fn init_cpu_fpu(cpu: CpuIndex) {
     if let Some(threads) = THREADS.get(cpu.get()) {
         without_interrupts(|| {
             let mut t = threads.lock();
-            if t.fpu[0] == 0
-                && let Some(area) = alloc_fpu_area()
-            {
-                t.fpu[0] = area;
+            if t.fpu[0].is_none() {
+                t.fpu[0] = FpuArea::new();
             }
         });
     }
 }
 
 /// Saves the outgoing context's FPU/SIMD state and restores the incoming one's, so SIMD
-/// registers belong to one thread at a time. An exiting thread's area is already 0 (moved
+/// registers belong to one thread at a time. An exiting thread's area is already gone (moved
 /// to its zombie), so its dead state is not saved.
 fn switch_fpu(id: usize, old: usize, new: usize) {
     let Some(threads) = THREADS.get(id) else {
         return;
     };
-    let (old_area, new_area) = {
-        let t = threads.lock();
-        (
-            t.fpu.get(old).copied().unwrap_or(0),
-            t.fpu.get(new).copied().unwrap_or(0),
-        )
-    };
-    if old_area != 0 {
-        // SAFETY: SSE/XSAVE are enabled on this processor, `old_area` is this thread's own
-        // `fpu_area_size()`-byte aligned buffer, and interrupts are off here.
-        unsafe { cpu::fpu_save(old_area) };
+    let mut t = threads.lock();
+    if let Some(area) = t.fpu.get_mut(old).and_then(Option::as_mut) {
+        area.save();
     }
-    if new_area != 0 {
-        // SAFETY: as above, for the incoming thread's area.
-        unsafe { cpu::fpu_restore(new_area) };
+    if let Some(area) = t.fpu.get(new).and_then(Option::as_ref) {
+        area.restore();
     }
 }
 
+/// Prepares CPU `id` to resume the thread in `slot`: TSS.RSP0 points at its kernel stack, so
+/// an interrupt from user mode always lands on the running thread's own stack (the boot or
+/// idle flow, with no stack of its own, never runs in user mode), and the page tables are its
+/// process's (the kernel's for a kernel thread).
 fn follow_thread(id: usize, slot: usize) {
     let Some(threads) = THREADS.get(id) else {
         return;
     };
-    let (stack, root) = {
-        let t = threads.lock();
-        (
-            t.stacks.get(slot).copied().flatten(),
-            t.roots.get(slot).copied().unwrap_or(0),
-        )
-    };
-    match stack {
-        Some(stack) => cpu::set_kernel_stack((stack.guard + 4096 + stack.bytes as u64) & !0xF),
+    let t = threads.lock();
+    match t.stacks.get(slot).and_then(Option::as_ref) {
+        Some(stack) => cpu::set_kernel_stack(stack),
         // Every thread but the boot or idle flow has a stack: a slot without one means a
         // thread was made runnable before its state was written, which `spawn_with` rules
         // out by writing it under the queue lock. Counted for the boot proof.
         None if slot != 0 => {
             UNREADY_SWITCHES.fetch_add(1, Ordering::Relaxed);
         }
-        None => {}
+        // The boot or idle flow has no stack of its own: no thread's stack is current here
+        // any more, and an exited thread's stack can be freed.
+        None => cpu::clear_kernel_stack(),
     }
-    let want = if root == 0 {
-        crate::vm::kernel_root()
-    } else {
-        root
-    };
-    if want != 0 && cpu::read_cr3() != want {
-        // SAFETY: `want` is the kernel's PML4 or a process PML4 whose kernel half is the
-        // kernel's, so the code, stacks and data this handler is using stay mapped.
-        unsafe { cpu::write_cr3(want) };
+    match t.process.get(slot).and_then(Option::as_ref) {
+        Some(process) => process.space().activate(),
+        None => crate::vm::activate_kernel_space(),
     }
-}
-
-/// A page-aligned heap allocation of a guard page plus `bytes` of stack. The guard (the
-/// lowest page) is unmapped, so running off the end of the stack faults instead of
-/// overwriting a neighbour. Returns the stack (above the guard) and the guard's address.
-pub(crate) fn guarded_stack(bytes: usize) -> Option<(&'static mut [u8], u64)> {
-    use alloc::alloc::{Layout, alloc_zeroed, dealloc};
-    let layout = Layout::from_size_align(bytes + 4096, 4096).ok()?;
-    // SAFETY: `layout` has a non-zero size; the allocation is never freed (threads do not
-    // exit yet), so the slice below is `'static`.
-    let base = unsafe { alloc_zeroed(layout) };
-    if base.is_null() {
-        return None;
-    }
-    let guard = base.expose_provenance() as u64;
-    if crate::vm::make_guard(guard).is_err() {
-        // SAFETY: `base` is the allocation made just above with this layout, and nothing
-        // else refers to it; a failed `make_guard` left its first page mapped.
-        unsafe { dealloc(base, layout) };
-        return None;
-    }
-    // SAFETY: `base + 4096 .. base + 4096 + bytes` lies inside the fresh allocation, is
-    // still mapped read/write, and nothing else refers to it.
-    let stack = unsafe { core::slice::from_raw_parts_mut(base.wrapping_add(4096), bytes) };
-    Some((stack, guard))
 }
 
 /// The guard page of the first thread `spawn` created, for the boot proof.
 static FIRST_GUARD: AtomicU64 = AtomicU64::new(0);
 
-/// A thread stack from [`guarded_stack`]: its guard page and its usable bytes.
-#[derive(Clone, Copy)]
-struct ThreadStack {
-    guard: u64,
-    bytes: usize,
-}
-
 /// A thread that has exited, awaiting [`reap`]: its stack, FPU area and, for a user
 /// thread, the reference that keeps its process alive until this processor has left it.
 struct Zombie {
-    stack: ThreadStack,
-    fpu: u64,
+    stack: GuardedStack,
+    fpu: Option<FpuArea>,
     process: Option<Arc<Process>>,
 }
 
 /// Per CPU: each slot's stack, and the stacks of threads that exited and await
 /// [`reap`]. Locked after the run queue, always with interrupts disabled.
 struct Threads {
-    stacks: [Option<ThreadStack>; framekernel::runqueue::CAPACITY],
+    stacks: [Option<GuardedStack>; framekernel::runqueue::CAPACITY],
     /// Exited threads awaiting [`reap`].
     zombies: [Option<Zombie>; framekernel::runqueue::CAPACITY],
-    /// Each slot's address space (its PML4); 0 means the kernel's.
-    roots: [u64; framekernel::runqueue::CAPACITY],
-    /// Each slot's FPU/SIMD save area (0: none); slot 0 is the boot or idle context.
-    fpu: [u64; framekernel::runqueue::CAPACITY],
+    /// Each slot's FPU/SIMD save area; slot 0 is the boot or idle context.
+    fpu: [Option<FpuArea>; framekernel::runqueue::CAPACITY],
     /// The process each slot's thread belongs to (`None`: a kernel thread).
     process: [Option<Arc<Process>>; framekernel::runqueue::CAPACITY],
 }
 
 static THREADS: [SpinLock<Threads>; MAX_CPUS] = [const {
     SpinLock::new(Threads {
-        stacks: [None; framekernel::runqueue::CAPACITY],
+        stacks: [const { None }; framekernel::runqueue::CAPACITY],
         zombies: [const { None }; framekernel::runqueue::CAPACITY],
-        roots: [0; framekernel::runqueue::CAPACITY],
-        fpu: [0; framekernel::runqueue::CAPACITY],
+        fpu: [const { None }; framekernel::runqueue::CAPACITY],
         process: [const { None }; framekernel::runqueue::CAPACITY],
     })
 }; MAX_CPUS];
@@ -277,36 +179,13 @@ pub(crate) fn reap() -> usize {
         if let Some(z) = ZOMBIES.get(this_cpu()) {
             z.fetch_sub(1, Ordering::AcqRel);
         }
-        free_fpu_area(fpu);
+        drop(fpu);
         // Possibly the process's last reference, which frees its address space: this
         // processor left it when the thread exited, and no processor still runs in it.
         drop(process);
-        if free_thread_stack(stack) {
-            freed += 1;
-        }
+        drop(stack);
+        freed += 1;
     }
-}
-
-/// Frees a stack from [`guarded_stack`] that no thread uses (one that was never started, or
-/// one whose thread has exited and whose processor has switched away from it).
-fn free_thread_stack(stack: ThreadStack) -> bool {
-    use alloc::alloc::{Layout, dealloc};
-    let Ok(layout) = Layout::from_size_align(stack.bytes + 4096, 4096) else {
-        return false;
-    };
-    // The guard must be mapped again before its frame returns to the heap.
-    if crate::vm::unguard(stack.guard).is_err() {
-        return false; // leak rather than free memory that is not mapped
-    }
-    // SAFETY: `guard` is the start of a `guarded_stack` allocation with this layout, and
-    // nothing uses that memory any more (this function's contract).
-    unsafe {
-        dealloc(
-            core::ptr::with_exposed_provenance_mut(stack.guard as usize),
-            layout,
-        )
-    };
-    true
 }
 
 /// The running thread's queue request, made with interrupts disabled (the gate cleared IF).
@@ -382,9 +261,7 @@ pub(crate) fn current_thread() -> Option<ThreadRef> {
 /// Blocks the running kernel thread until [`wake`]. Returns at once if a wake-up arrived
 /// first. Use it through `wait::WaitQueue`, which makes sure the wake-up comes.
 pub(crate) fn block() {
-    // SAFETY: as for `yield_now`; the handler saves and restores every register, and this
-    // context resumes here once it is woken. RDI 0: no time limit.
-    unsafe { asm!("int 0x84", in("rdi") 0u64) };
+    cpu::thread_block(0);
 }
 
 /// Nanoseconds per timer tick.
@@ -396,12 +273,8 @@ const TICK_NANOS: u64 = 1_000_000_000 / crate::timer::HZ;
 pub(crate) fn block_until(deadline: u64) {
     let left = deadline.saturating_sub(crate::time::monotonic_nanos());
     let ticks = left.div_ceil(TICK_NANOS).max(1);
-    // SAFETY: as in `block`; RDI carries the tick limit and is restored.
-    unsafe { asm!("int 0x84", in("rdi") ticks) };
+    cpu::thread_block(ticks);
 }
-
-/// ICR level bit: assert (the only meaningful level for fixed IPIs).
-const ICR_ASSERT: u32 = 1 << 14;
 
 /// Makes `thread` ready. If it was blocked on another processor, that processor is sent a
 /// reschedule IPI (to its APIC ID), so it switches to the thread now rather than at its
@@ -416,17 +289,7 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
         && thread.cpu != cpu::this_cpu()
         && let Some(apic_id) = thread.cpu.apic_id()
     {
-        // SAFETY: CPL 0; this processor's APIC is in x2APIC mode (it runs kernel threads).
-        let lapic = unsafe { X2Apic::assume_enabled() };
-        // SAFETY: a fixed IPI with the reschedule vector, whose handler acknowledges and
-        // switches through the target's own run queue; the target ran this thread, so its
-        // scheduler is active, and `apic_id` is the one recorded for its index.
-        unsafe {
-            lapic.send_ipi(
-                apic_id,
-                ICR_ASSERT | u32::from(crate::cpu::RESCHEDULE_VECTOR),
-            )
-        };
+        timer::send_reschedule_ipi(apic_id);
         return true;
     }
     false
@@ -442,14 +305,7 @@ pub(crate) fn on_exit(interrupted: u64) -> u64 {
         if let Some(threads) = THREADS.get(id) {
             let mut t = threads.lock();
             let stack = t.stacks.get_mut(slot).and_then(Option::take);
-            if let Some(r) = t.roots.get_mut(slot) {
-                *r = 0;
-            }
-            let fpu = t
-                .fpu
-                .get_mut(slot)
-                .map(|f| core::mem::replace(f, 0))
-                .unwrap_or(0);
+            let fpu = t.fpu.get_mut(slot).and_then(Option::take);
             let process = t.process.get_mut(slot).and_then(Option::take);
             match (t.zombies.iter_mut().find(|z| z.is_none()), stack) {
                 (Some(free), Some(stack)) => {
@@ -474,24 +330,17 @@ pub(crate) fn on_exit(interrupted: u64) -> u64 {
 
 /// Gives up the processor to the next ready context on this CPU.
 pub(crate) fn yield_now() {
-    // SAFETY: the gate for this vector is installed; the handler saves and restores every
-    // register, and returns here when this context is next scheduled.
-    unsafe { asm!("int 0x81") };
+    cpu::thread_yield();
 }
 
 /// Sleeps for `ticks` timer ticks of this CPU (at least one).
 pub(crate) fn sleep(ticks: u64) {
-    // SAFETY: as for `yield_now`; RDI carries the argument and is restored.
-    unsafe { asm!("int 0x82", in("rdi") ticks) };
+    cpu::thread_sleep(ticks);
 }
 
 /// Ends the running thread.
 pub(crate) fn exit() -> ! {
-    loop {
-        // SAFETY: as for `yield_now`; the handler frees this thread's slot and never
-        // resumes it. If the request is refused (no active queue), it is retried.
-        unsafe { asm!("int 0x83") };
-    }
+    cpu::thread_exit()
 }
 
 /// The process of the running thread, or `None` for a kernel thread.
@@ -523,21 +372,9 @@ pub(crate) fn spawn(
     entry: extern "sysv64" fn(u64) -> !,
     arg: u64,
 ) -> Result<usize, QueueError> {
-    spawn_in(cpu, entry, arg, 0)
-}
-
-/// As [`spawn`], in the address space whose PML4 is `root` (0: the kernel's). The thread
-/// starts in kernel mode; a process thread then enters user mode in that space.
-pub(crate) fn spawn_in(
-    cpu: CpuIndex,
-    entry: extern "sysv64" fn(u64) -> !,
-    arg: u64,
-    root: u64,
-) -> Result<usize, QueueError> {
     spawn_with(
         cpu,
-        Start::Kernel { entry, arg },
-        root,
+        ThreadStart::Kernel { entry, arg },
         framekernel::runqueue::DEFAULT_WEIGHT,
         None,
     )
@@ -553,11 +390,9 @@ pub(crate) fn spawn_user(
     rsp: u64,
     rdi: u64,
 ) -> Result<usize, QueueError> {
-    let root = process.root();
     spawn_with(
         cpu,
-        Start::User { rip, rsp, rdi },
-        root,
+        ThreadStart::User { rip, rsp, rdi },
         framekernel::runqueue::DEFAULT_WEIGHT,
         Some(process),
     )
@@ -571,110 +406,53 @@ pub(crate) fn spawn_weighted(
     arg: u64,
     weight: u32,
 ) -> Result<usize, QueueError> {
-    spawn_with(cpu, Start::Kernel { entry, arg }, 0, weight, None)
-}
-
-/// Where a new thread starts.
-enum Start {
-    /// In kernel mode at `entry(arg)`.
-    Kernel {
-        entry: extern "sysv64" fn(u64) -> !,
-        arg: u64,
-    },
-    /// In ring 3 at `rip`, with the stack pointer `rsp` and `rdi` in RDI.
-    User { rip: u64, rsp: u64, rdi: u64 },
+    spawn_with(cpu, ThreadStart::Kernel { entry, arg }, weight, None)
 }
 
 fn spawn_with(
     cpu: CpuIndex,
-    start: Start,
-    root: u64,
+    start: ThreadStart,
     weight: u32,
     process: Option<Arc<Process>>,
 ) -> Result<usize, QueueError> {
-    spawn_with_fpu(cpu, start, root, weight, process, alloc_fpu_area)
+    spawn_with_fpu(cpu, start, weight, process, FpuArea::new)
 }
 
 /// [`spawn_with`], with `fpu_area` the source of the thread's FPU area (the boot proof gives
 /// it one that has none). A thread is created whole or not at all: every way this fails
-/// returns the stack, its guard page and the FPU area.
+/// gives back the stack, its guard page and the FPU area, through their `Drop`s.
 fn spawn_with_fpu(
     cpu: CpuIndex,
-    start: Start,
-    root: u64,
+    start: ThreadStart,
     weight: u32,
     process: Option<Arc<Process>>,
-    fpu_area: impl FnOnce() -> Option<u64>,
+    fpu_area: impl FnOnce() -> Option<FpuArea>,
 ) -> Result<usize, QueueError> {
     let queue = QUEUES.get(cpu.get()).ok_or(QueueError::Full)?;
-    let (stack, guard) = guarded_stack(THREAD_STACK).ok_or(QueueError::Full)?;
-    let base = stack.as_ptr().addr() as u64;
-    // The thread starts with RSP = top − 8 holding a zero return address, as if `entry` had
-    // been called: RSP + 8 is then 16-byte aligned (System V).
-    let top = (base + THREAD_STACK as u64) & !0xF;
-    let rsp = top - 8;
-    let frame_at = rsp - (FRAME_WORDS as u64) * 8;
-    let mut frame = [0u64; FRAME_WORDS];
-    match start {
-        Start::Kernel { entry, arg } => {
-            frame[RDI] = arg;
-            frame[17] = (entry as *const ()).addr() as u64; // RIP
-            frame[18] = u64::from(KERNEL_CODE); // CS
-            frame[20] = rsp;
-            frame[21] = u64::from(KERNEL_DATA); // SS
-        }
-        // The common return path enters ring 3 from this frame: `swapgs` when the frame's
-        // CS is a user one, then IRETQ, which leaves the segment registers usable at CPL 3.
-        Start::User { rip, rsp, rdi } => {
-            frame[RDI] = rdi;
-            frame[17] = rip;
-            frame[18] = u64::from(USER_CODE); // CS
-            frame[20] = rsp;
-            frame[21] = u64::from(USER_DATA); // SS
-        }
-    }
-    frame[19] = NEW_RFLAGS;
-    let offset = (frame_at - base) as usize;
-    for (i, word) in frame.iter().chain(core::iter::once(&0u64)).enumerate() {
-        let at = offset + i * 8;
-        if let Some(dst) = stack.get_mut(at..at + 8) {
-            dst.copy_from_slice(&word.to_le_bytes());
-        }
-    }
-    let record = ThreadStack {
-        guard,
-        bytes: THREAD_STACK,
-    };
+    let mut stack = GuardedStack::new(THREAD_STACK).ok_or(QueueError::Full)?;
+    let guard = stack.guard_addr();
+    let frame_at = stack.build_first_frame(start).ok_or(QueueError::Full)?;
     // A thread without its own FPU save area would run on the previous thread's registers
     // (`switch_fpu` then has nothing to restore), which may be another process's data; it
     // is refused instead.
-    let Some(fpu_area) = fpu_area() else {
-        free_thread_stack(record);
-        return Err(QueueError::Full);
-    };
+    let fpu_area = fpu_area().ok_or(QueueError::Full)?;
     let spawned = without_interrupts(|| {
         // The queue lock is held until the thread's state is complete: the moment the slot
         // is Ready the target processor can pick it, and `follow_thread` needs the state.
         let mut queue = queue.lock();
-        let slot = match queue.push_weighted(frame_at, weight) {
-            Ok(slot) => slot,
-            Err(e) => {
-                drop(queue);
-                free_thread_stack(record);
-                free_fpu_area(fpu_area);
-                return Err(e);
-            }
-        };
+        let mut stack = stack;
+        let slot = queue.push_weighted(frame_at, weight)?;
+        // Published before the slot can be picked: the lock is held until the thread is whole.
+        if !stack.publish_first_frame(cpu) {
+            return Err(QueueError::Full);
+        }
         if let Some(threads) = THREADS.get(cpu.get()) {
             let mut t = threads.lock();
             if let Some(s) = t.stacks.get_mut(slot) {
-                *s = Some(record);
-            }
-            if let Some(r) = t.roots.get_mut(slot) {
-                *r = root;
+                *s = Some(stack);
             }
             if let Some(f) = t.fpu.get_mut(slot) {
-                *f = fpu_area;
+                *f = Some(fpu_area);
             }
             if let Some(p) = t.process.get_mut(slot) {
                 *p = process;
@@ -708,9 +486,9 @@ pub(crate) fn run_ap(lapic: &X2Apic) -> ! {
     timer::start_periodic(lapic);
     loop {
         reap();
-        // SAFETY: CPL 0; every vector that can arrive has a gate. Halting with interrupts
-        // on just waits for the next timer tick, which may switch to a thread.
-        unsafe { asm!("sti", "hlt", options(nostack)) };
+        // Halting with interrupts on just waits for the next timer tick, which may switch to
+        // a thread.
+        cpu::idle();
     }
 }
 
@@ -861,32 +639,9 @@ extern "sysv64" fn simd_worker(index: u64) -> ! {
         index.rotate_left(23) ^ 0xA5A5_A5A5,
         index.wrapping_mul(0x9E37_79B9_7F4A_7C15),
     ];
-    // SAFETY: SSE is enabled on this processor (`enable_simd`); these instructions only
-    // load the named XMM registers from general registers.
-    unsafe {
-        core::arch::asm!(
-            "movq xmm0, {0}",
-            "movq xmm3, {1}",
-            "movq xmm7, {2}",
-            "movq xmm15, {3}",
-            in(reg) v[0], in(reg) v[1], in(reg) v[2], in(reg) v[3],
-            out("xmm0") _, out("xmm3") _, out("xmm7") _, out("xmm15") _,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
+    cpu::xmm_load(v);
     while !SIMD_STOP.load(Ordering::Relaxed) {
-        let (a, b, c, d): (u64, u64, u64, u64);
-        // SAFETY: reads the XMM registers this thread set; no memory, no stack.
-        unsafe {
-            core::arch::asm!(
-                "movq {0}, xmm0",
-                "movq {1}, xmm3",
-                "movq {2}, xmm7",
-                "movq {3}, xmm15",
-                out(reg) a, out(reg) b, out(reg) c, out(reg) d,
-                options(nomem, nostack, preserves_flags),
-            );
-        }
+        let [a, b, c, d] = cpu::xmm_read();
         if [a, b, c, d] != v
             && let Some(cnt) = SIMD_CORRUPT.get(index as usize)
         {
@@ -1161,11 +916,10 @@ fn prove_spawn_refused(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let before = in_use();
     let no_area = spawn_with_fpu(
         bsp,
-        Start::Kernel {
+        ThreadStart::Kernel {
             entry: quitter,
             arg: 0,
         },
-        0,
         framekernel::runqueue::DEFAULT_WEIGHT,
         None,
         || None,
@@ -1226,9 +980,13 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
             }
         }
     }
-    // SAFETY: the boot processor is in x2APIC mode (the timer bring-up), and `start` was
-    // already called on it; the transition is a no-op that yields the handle.
-    let lapic = unsafe { X2Apic::enable() };
+    let Some(lapic) = X2Apic::this_cpu() else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: the local APIC is not in x2APIC mode: scheduler failed"
+        );
+        return false;
+    };
     let bsp = cpu::this_cpu();
     GO.store(true, Ordering::Release);
     if let Some(active) = ACTIVE.get(bsp.get()) {
@@ -1238,8 +996,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
     timer::start_periodic(&lapic);
     // The first thread's guard page must be unmapped.
     let guard = FIRST_GUARD.load(Ordering::Relaxed);
-    // SAFETY: the guard is RAM of a heap allocation, not MMIO.
-    match unsafe { cpu::probe_read(guard) } {
+    match cpu::probe_read(guard) {
         cpu::Probe::Faulted { error: 0, address } if address == guard => {
             let _ = writeln!(
                 com1,
@@ -1262,8 +1019,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
     while rdtsc().wrapping_sub(start) < window {
         // Interrupts on only while halted: the timer may switch to a worker here, and this
         // flow resumes after `hlt` when its turn comes round again.
-        // SAFETY: as in `run_ap`.
-        unsafe { asm!("sti", "hlt", "cli", options(nostack)) };
+        cpu::idle_disabling();
     }
     let elapsed_ms = rdtsc().wrapping_sub(start) / (tsc_hz / 1000).max(1);
     let mut switches_at_stop = [0u64; MAX_CPUS];
@@ -1344,9 +1100,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) -> bool 
 /// Stops the boot processor's scheduler and timer once the boot proofs are done, so the
 /// boot flow can halt.
 pub(crate) fn stop_boot_processor() {
-    // SAFETY: CPL 0, the boot processor, already in x2APIC mode (`timer::init`).
-    let lapic = unsafe { X2Apic::assume_enabled() };
-    lapic.stop();
+    if let Some(lapic) = X2Apic::this_cpu() {
+        lapic.stop();
+    }
     if let Some(active) = ACTIVE.get(this_cpu()) {
         active.store(false, Ordering::Release);
     }

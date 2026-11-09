@@ -14,6 +14,7 @@ use crate::heap::{Heap, HeapStats, PageSource, Slab};
 
 use origin_sync::SpinLock;
 
+use crate::addr::PhysAddr;
 use crate::cpu::without_interrupts;
 
 /// Capacity of the slab table: 1024 slabs of 4 KiB, 4 MiB of small blocks.
@@ -94,18 +95,40 @@ pub fn reclaim_loader_memory() -> Option<(u64, u64)> {
     })
 }
 
-/// One free 4 KiB frame (physical address), or `None`.
-pub fn allocate_frame() -> Option<u64> {
-    without_interrupts(|| MEMORY.lock().as_mut()?.frames.allocate())
+/// One 4 KiB physical frame handed out by the allocator: its holder owns it until it gives it
+/// back with [`free_frame`]. Not `Copy` and not `Clone`: a frame has one owner, so a free cannot
+/// be doubled and a freed frame cannot still be named by anyone.
+#[derive(Debug)]
+pub struct OwnedFrame {
+    phys: PhysAddr,
 }
 
-/// Returns a frame from [`allocate_frame`]; `false` if the allocator refused it.
-pub fn free_frame(frame: u64) -> bool {
+impl OwnedFrame {
+    /// The frame's physical address.
+    pub const fn phys(&self) -> PhysAddr {
+        self.phys
+    }
+
+    /// Where the kernel reaches it, through the direct map.
+    pub(crate) fn virt(&self) -> usize {
+        crate::phys::to_virt(self.phys.raw()) as usize
+    }
+}
+
+/// One free 4 KiB frame, or `None`.
+pub fn allocate_frame() -> Option<OwnedFrame> {
+    without_interrupts(|| MEMORY.lock().as_mut()?.frames.allocate()).map(|addr| OwnedFrame {
+        phys: PhysAddr::new(addr),
+    })
+}
+
+/// Gives back a frame from [`allocate_frame`]; `false` if the allocator refused it.
+pub fn free_frame(frame: OwnedFrame) -> bool {
     without_interrupts(|| {
         MEMORY
             .lock()
             .as_mut()
-            .is_some_and(|m| m.frames.free(frame).is_ok())
+            .is_some_and(|m| m.frames.free(frame.phys.raw()).is_ok())
     })
 }
 

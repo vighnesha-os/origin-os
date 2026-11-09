@@ -98,7 +98,7 @@ impl KernelUart {
 impl UartRegisters for KernelUart {
     fn read(&mut self, reg: Register) -> u8 {
         match *self {
-            Self::Port(ports) => ports.read8(u16::from(reg.offset())),
+            Self::Port(ports) => ports.read8(reg.offset()),
             Self::Mmio {
                 region,
                 stride,
@@ -117,7 +117,7 @@ impl UartRegisters for KernelUart {
 
     fn write(&mut self, reg: Register, value: u8) {
         match *self {
-            Self::Port(ports) => ports.write8(u16::from(reg.offset()), value),
+            Self::Port(ports) => ports.write8(reg.offset(), value),
             Self::Mmio {
                 region,
                 stride,
