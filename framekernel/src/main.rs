@@ -113,11 +113,9 @@ pub unsafe extern "sysv64" fn _start() -> ! {
 unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // The monotonic clock's zero (CLAUDE.md §68).
     time::mark_entry();
-    // SAFETY: the entry contract: CPL 0, boot processor only, interrupts disabled. The
-    // firmware and the loader stopped using COM1 at `ExitBootServices`, and no other kernel
-    // code drives it. COM1 is the UART of last resort: nothing better is known until the
-    // ACPI tables can be read, which `console::adopt_firmware_uart` does.
-    let mut uart = Uart16550::new(unsafe { console::KernelUart::port(COM1_BASE) });
+    // COM1 is the UART of last resort: nothing better is known until the ACPI tables can
+    // be read, which `console::adopt_firmware_uart` does.
+    let mut uart = Uart16550::new(console::KernelUart::com1());
     let firmware_line = uart.line_settings();
     uart.init();
 
@@ -1639,8 +1637,6 @@ fn relocations_applied() -> bool {
 }
 
 pub(crate) use cpu::halt;
-
-pub(crate) use origin_frame::port::{inb, outb};
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

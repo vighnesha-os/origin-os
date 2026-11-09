@@ -327,28 +327,27 @@ pub fn firmware_bytes(addr: PhysAddr, len: u64) -> Result<&'static [u8], MapErro
     })
 }
 
-/// The MMIO region describing the framebuffer the kernel's tables mapped (ADR-0010), for the
-/// console's pixel writes. Refused if `fb` is not what the loader passed and was placed at
-/// `framebuffer_mapping`'s address, so this cannot be made to point at anything else.
-pub fn framebuffer_region(fb: &origin_boot_info::Framebuffer) -> Option<MmioRegion> {
+/// The firmware framebuffer as a typed region (ADR-0010): the mapping the loader made, which
+/// the kernel's own tables keep at the same address (`layout::map_framebuffer`), or `None` if
+/// `fb` does not describe it. A forged description can only name addresses in the framebuffer
+/// window, never kernel memory, and the memory map must say it is not RAM.
+pub fn framebuffer_region(
+    fb: &origin_boot_info::Framebuffer,
+    regions: &[MemoryRegion],
+) -> Option<MmioRegion> {
     let mapping = origin_paging::layout::framebuffer_mapping(fb)?;
-    if mapping.first_pixel != fb.virtual_base {
+    if mapping.first_pixel != fb.virtual_base
+        || fb.virtual_base == 0
+        || overlaps_ram(regions, fb.base, fb.visible_bytes())
+    {
         return None;
     }
     let bytes = usize::try_from(fb.visible_bytes()).ok()?;
-    // Everything the console will draw is mapped: its first page (checked here) and the
-    // visible rows (`layout::build` maps the framebuffer's whole visible part, or the
-    // console withdraws it before these tables are used).
-    let first = translate(fb.virtual_base).filter(|t| t.uncached && t.writable && !t.executable)?;
-    if first.phys != fb.base & !(PAGE - 1) {
-        return None;
-    }
-    // SAFETY: the loader mapped the framebuffer uncached at `virtual_base` and `layout::build`
-    // keeps that mapping (or the console was withdrawn before these tables loaded, in which
-    // case `translate` above found nothing); the memory map says it is not RAM (checked by
-    // `console::screen_for`, which constructs the screen before calling this); video memory
-    // is device memory, not a Rust object, so 32-bit volatile pixel writes through the
-    // region are fine.
+    // SAFETY: `first_pixel` is where `layout::map_framebuffer` (and the loader, for the tables
+    // in force now) maps the framebuffer, uncached, for its visible bytes; it is not RAM
+    // (checked above), so 32-bit volatile pixel writes through the region touch only video
+    // memory. A forged `fb` can only produce an address inside the reserved framebuffer
+    // window (checked by `framebuffer_mapping`), where nothing else is mapped.
     Some(unsafe {
         MmioRegion::from_mapped(fb.virtual_base as usize, bytes, PhysAddr::new(fb.base))
     })
