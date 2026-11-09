@@ -123,6 +123,17 @@ struct ReportLog {
     count: usize,
 }
 
+/// Where a process's threads are, under one lock so that "the last one has ended" and "no more
+/// may start" are one decision.
+struct Lifecycle {
+    /// Threads started that have not ended.
+    running: u32,
+    /// What ended the most recent thread, once one has.
+    latest: Option<Ending>,
+    /// Its last thread has ended: no thread may start in it again.
+    ended: bool,
+}
+
 /// What a running user thread stands on, held by the scheduler from the thread's start until
 /// it is reaped.
 pub(crate) struct UserContext {
@@ -144,8 +155,8 @@ pub(crate) struct Process {
     syscall_origin: (u64, u64),
     /// May it use the developer-only calls?
     debug_calls: bool,
-    /// Threads running in it.
-    threads: AtomicU32,
+    /// Its threads.
+    lifecycle: SpinLock<Lifecycle>,
     /// Developer-only output of `DEBUG_REPORT`.
     reports: SpinLock<ReportLog>,
     /// Its last thread's ending, once it has ended.
@@ -172,7 +183,11 @@ impl Process {
             .ok()?,
             syscall_origin,
             debug_calls: limits.debug_calls,
-            threads: AtomicU32::new(0),
+            lifecycle: SpinLock::new(Lifecycle {
+                running: 0,
+                latest: None,
+                ended: false,
+            }),
             reports: SpinLock::new(ReportLog {
                 values: [0; REPORTS],
                 count: 0,
@@ -299,22 +314,61 @@ impl Process {
             space: process.memory(),
         })
         .map_err(|_| QueueError::Full)?;
-        process.threads.fetch_add(1, Ordering::AcqRel);
+        // Counted before it can run, so that its own end always finds itself counted.
+        without_interrupts(|| {
+            let mut life = process.lifecycle.lock();
+            if life.ended {
+                return Err(QueueError::Full);
+            }
+            life.running += 1;
+            Ok(())
+        })?;
         match sched::spawn_user(cpu, user, rip, rsp, rdi) {
             Ok(_) => Ok(()),
             Err(e) => {
-                process.threads.fetch_sub(1, Ordering::AcqRel);
+                process.start_failed();
                 Err(e)
             }
+        }
+    }
+
+    /// A counted thread never started. If every other thread ended in the meantime, this is
+    /// what makes the process end: the thread that thought it was not the last did not.
+    fn start_failed(&self) {
+        let finished = without_interrupts(|| {
+            let mut life = self.lifecycle.lock();
+            life.running -= 1;
+            let finished = if life.running == 0 && !life.ended {
+                life.latest
+            } else {
+                None
+            };
+            life.ended |= finished.is_some();
+            finished
+        });
+        if let Some(ending) = finished {
+            self.close_out(ending);
         }
     }
 
     /// The calling thread is ending, for the reason `ending`. If it was the last, every
     /// handle closes now, and peers see that.
     pub(crate) fn thread_ended(&self, ending: Ending) {
-        if self.threads.fetch_sub(1, Ordering::AcqRel) != 1 {
-            return;
+        let last = without_interrupts(|| {
+            let mut life = self.lifecycle.lock();
+            life.running -= 1;
+            life.latest = Some(ending);
+            let last = life.running == 0;
+            life.ended |= last;
+            last
+        });
+        if last {
+            self.close_out(ending);
         }
+    }
+
+    /// The last thread has ended: its handles close.
+    fn close_out(&self, ending: Ending) {
         // An empty table of limit 0 replaces this one, so nothing can be added afterwards
         // and the old table is dropped outside its lock.
         let table = without_interrupts(|| {
