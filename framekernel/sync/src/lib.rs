@@ -29,6 +29,7 @@
     )
 )]
 
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::Ordering;
 
@@ -161,7 +162,10 @@ impl<T> SpinLock<T> {
                 prim::spin_loop();
             }
         }
-        SpinGuard { lock: self }
+        SpinGuard {
+            lock: self,
+            _shares_t: PhantomData,
+        }
     }
 
     /// Takes the lock if it is free, without waiting.
@@ -172,16 +176,36 @@ impl<T> SpinLock<T> {
             .locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         {
-            Ok(_) => Some(SpinGuard { lock: self }),
+            Ok(_) => Some(SpinGuard {
+                lock: self,
+                _shares_t: PhantomData,
+            }),
             Err(_) => None,
         }
     }
 }
 
 /// Access to the value while the lock is held.
+///
+/// A value that is `Send` but not `Sync` can be kept in a lock, but a guard for it cannot be
+/// shared between threads:
+///
+/// ```compile_fail
+/// fn needs_sync<T: Sync>(_: &T) {}
+/// let lock = origin_sync::SpinLock::new(core::cell::Cell::new(0));
+/// needs_sync(&lock.lock());
+/// ```
 pub struct SpinGuard<'a, T> {
     lock: &'a SpinLock<T>,
+    /// A guard hands out `&T`, so sharing one needs `T: Sync`. The reference above would only
+    /// ask for `T: Send`, which is all [`SpinLock`] needs: this marker removes the automatic
+    /// impl, and the explicit one below states the real requirement.
+    _shares_t: PhantomData<*mut T>,
 }
+
+// SAFETY: through `&SpinGuard` other threads get only `&T` (`Deref`), which is exactly what
+// `T: Sync` permits. The lock is held for the guard's whole life, so no `&mut T` exists.
+unsafe impl<T: Sync> Sync for SpinGuard<'_, T> {}
 
 impl<T> core::fmt::Debug for SpinGuard<'_, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
