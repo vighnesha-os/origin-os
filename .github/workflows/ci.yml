@@ -71,6 +71,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # First, so the processor is on record even if a boot fails.
+      - name: Which processor is this?
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: bash .github/ci/processor-report.sh "processor/${{ matrix.runner }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: processor-${{ matrix.runner }}
+          path: processor/${{ matrix.runner }}
+          retention-days: 7
       - name: Install the pinned Rust toolchain
         run: bash .github/ci/install-rust.sh
       - name: Build QEMU
@@ -85,3 +95,23 @@ jobs:
           ORIGIN_QEMU_SMP: 4
           ORIGIN_BOOT_TEST_ONLY: kernel boot
         run: cargo xtask boot-test
+
+  # Which vendors and models this run's real-CPU boots ran on, in one table on the run's summary
+  # page, with a notice on the pull request. A record only: it never fails the run.
+  processors:
+    name: processors tested on
+    needs: boot-real-cpu
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: processor-*
+          path: processor
+          merge-multiple: true
+      - name: Processor coverage
+        run: bash .github/ci/processor-coverage.sh processor
