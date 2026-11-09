@@ -302,10 +302,10 @@ const CONTROLS: &[Control] = &[
                     *s = State::Ready;
                 }
                 self.admit(slot, floor);
-                true
+                if let Some(w) = self.woken.get_mut(slot) {
 ",
         to: "                self.admit(slot, floor);
-                true
+                if let Some(w) = self.woken.get_mut(slot) {
 ",
         models: &[
             ("wait_queue_waker_and_waiter_relaxed", DEADLOCK),
