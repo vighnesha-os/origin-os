@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Updated | 2026-11-09, ~06:30 IST (the pre-merge review and its fixes; early-boot DMA, M4's first slice and the Loom models merged; landing on `main`) |
+| Updated | 2026-11-09, ~07:00 IST (the pre-merge review and its fixes landed on `main`; ADR-0011, the native SDK, accepted and landed. Nothing in ADR-0011 is built yet) |
 | Branch | Merged into `main` on the owner's word, through PR vighnesha-os/origin-os#2 and PR vighnesha-os/origin-os#1, after the pre-merge review (`docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md`). It holds the IOMMU work (Intel VT-d and AMD-Vi), dense CPU indexes and a processor above APIC ID 255, AP parking, I/O APIC interrupt remapping, parser hardening, the ONBF multi-fault soak, CPU topology, the external crypto vectors, the loader's signature check, Rust host signing, the boot proofs' tolerance of a loaded host, the early console (ADR-0010), early-boot DMA (threat T4), M4's first slice (system calls, handles and channels) and the Loom models. |
 | Reproduce | `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs in QEMU 11.1.3 (TCG) + OVMF only; nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
@@ -103,7 +103,7 @@ ADR-0002 with B7, ADR-0003, G1 and the errata readings were decided on 2026-11-0
 
 The owner accepted ADR-0006 (OriginFS v0, as a bring-up format that never ships in an approved release), ADR-0008 (dense CPU indexes) and ADR-0010 (the early console, including boot info 0.4) on 2026-11-08.
 
-The owner accepted **ADR-0007** (DMA isolation and interrupt remapping, Intel VT-d and AMD-Vi) the same day, once AMD's manuals were confirmed byte-identical to the copies that were read. No ADR is waiting on the owner (`docs/engineering/OWNER_DECISIONS.md`).
+The owner accepted **ADR-0007** (DMA isolation and interrupt remapping, Intel VT-d and AMD-Vi) the same day, once AMD's manuals were confirmed byte-identical to the copies that were read. The owner accepted **ADR-0011** (the native SDK as the only way to the OS) on 2026-11-09, with ADR-0005's Amendment 2. Nothing in either is built yet.
 
 Errata **V1–V6 and O2–O5** were decided by the owner on 2026-11-08, along with Rust host signing: `docs/spec/ONBF-errata.md`. Certificate chains are specified but wait for the SYS profile's signed time (O3). **O1** was decided the same day: a statement's `id` is printable ASCII.
 
