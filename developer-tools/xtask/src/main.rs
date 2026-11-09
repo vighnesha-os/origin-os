@@ -1329,7 +1329,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         // M4's first slice (ADR-0005 P1–P5, P8, P9): system calls between ring-3 processes.
         .chain(ipc_markers(machine.named(0), target.clone()))
         .chain(object_markers(&target))
-        .chain(address_space_markers())
+        .chain(address_space_markers(cpus))
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
@@ -1745,9 +1745,33 @@ fn refusal_scenario(
 /// What the kernel's first system-call slice must report, in order: a line per group of
 /// hostile calls, each naming the status its call returned.
 /// N14 step 3, S3-5a: address spaces (ADR-0004 H2), each boot proof's own lines.
-fn address_space_markers() -> Vec<String> {
+fn address_space_markers(cpus: u32) -> Vec<String> {
+    let (far, one) = if cpus > 1 {
+        ("another processor", 1)
+    } else {
+        ("this processor", 0)
+    };
+    let cost = format!("Ok(Change {{ pages: 1, shootdowns: 1, interrupts: {one} }})");
     vec![
         "origin-kernel: address spaces: the kernel half is the same tables in every space: true; a kernel mapping made at 0xfffff00000000000, in a top-level slot of its own, after a space was created is visible from that space: true; from a space lacking the slot, the same read faults: true".into(),
+        format!(
+            "origin-kernel: address spaces: a page unmapped under a running thread on {far}: frame free when the unmap returned: true; reused with a secret: true; the thread faulted at 0x500000 (#PF error 0x4): true; it read the secret: false; {cost}"
+        ),
+        "origin-kernel: address spaces: control: a thread whose page is still mapped reads the same secret: true".into(),
+        format!(
+            "origin-kernel: address spaces: a page made read-only under a running writer on {far}: the writer faulted at 0x500000 (#PF error 0x7): true; {cost}"
+        ),
+        format!(
+            "origin-kernel: address spaces: a page made writable under a running reader on {far}: it wrote without a fault: true; {cost}"
+        ),
+        "origin-kernel: address spaces: a page mapped under a running thread: it read 0x1234 and exited".into(),
+        "origin-kernel: address spaces: a frame shared by two spaces: unmapped from the first, its thread faulted: true, the other went on: true, the frame still in use: true; unmapped from the second, its thread faulted: true, the frame free when the unmap returned: true".into(),
+        format!(
+            "origin-kernel: address spaces: 64 maps and unmaps of a page under a thread on {far}: {} interrupts, 0 on processors not in the space; ",
+            64 * one
+        ),
+        " us each (QEMU, no budget)".into(),
+        "origin-kernel: address spaces: every process and frame of these proofs is gone: ".into(),
     ]
 }
 
