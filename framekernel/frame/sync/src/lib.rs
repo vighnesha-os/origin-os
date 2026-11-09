@@ -34,6 +34,7 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::Ordering;
 
 pub mod floor;
+pub mod refcount;
 pub mod shootdown;
 pub mod wait;
 
