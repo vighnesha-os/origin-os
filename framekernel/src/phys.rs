@@ -1,5 +1,6 @@
 //! Physical and virtual addresses (ADR-0004): RAM is reached through the direct map at
 //! `direct_map_base + physical`, the kernel image at `kernel_virtual_base + rva`.
+#![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

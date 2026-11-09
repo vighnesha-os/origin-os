@@ -29,7 +29,7 @@ use framekernel::paging::{Access, AddressSpace, MapError, PAGE, Table, TableMemo
 use framekernel::runqueue::QueueError;
 use framekernel::usercopy;
 use origin_abi::{Error, Handle};
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
 
 use crate::cpu::{CpuIndex, without_interrupts};
 use crate::ipc::{self, Object};

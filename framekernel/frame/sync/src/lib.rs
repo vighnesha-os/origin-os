@@ -41,7 +41,7 @@ mod models;
 // lives in the Framekernel library; compiled in here, the wait-queue model runs that file.
 #[cfg(all(test, loom))]
 #[allow(dead_code, unreachable_pub)]
-#[path = "../../src/runqueue.rs"]
+#[path = "../../../src/runqueue.rs"]
 mod runqueue;
 
 /// What the locks are built on: `core` in every real build, Loom's checked versions when

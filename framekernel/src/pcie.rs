@@ -37,7 +37,7 @@ use framekernel::hpet;
 pub(crate) use framekernel::pci::Device;
 use framekernel::pci::{self, Address, Bar, BarKind, ConfigSpace, Ecam, Function};
 use origin_boot_info::{MemoryRegion, RegionKind};
-use origin_sync::{RwLock, SpinLock};
+use origin_frame::sync::{RwLock, SpinLock};
 
 use crate::console::Console;
 use crate::cpu::CpuIndex;

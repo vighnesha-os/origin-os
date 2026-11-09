@@ -10,6 +10,7 @@ mod disk;
 mod loom;
 mod screen;
 mod serial;
+mod unsafety;
 
 use std::env;
 use std::fs;
@@ -46,6 +47,10 @@ commands:
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
+  unsafe-list print the current `unsafe` sites outside the framework, one `COUNT PATH` line per
+              file, in the format of developer-tools/xtask/unsafe-allowlist.txt (ADR-0011)
+  unsafe-gate only the gate on `unsafe` and on the kernel's dependency direction (part of
+              check; quick, for use while migrating a module)
 
 environment:
   ORIGIN_LOOM_DEEP                    if set, the Loom models search to their deeper bounds
@@ -82,6 +87,8 @@ const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// clippy-clean on every target and free of panic paths (ONBF §12).
 const BOOT_INFO_PACKAGE: &str = "origin-boot-info";
 const KERNEL_PACKAGE: &str = "framekernel";
+/// The Framekernel's privileged framework (ADR-0011 N6).
+const FRAMEWORK_PACKAGE: &str = "origin-frame";
 const PACK_PACKAGE: &str = "onbf-pack";
 /// The host-only signing code (CLAUDE.md §59): never linked into the OS.
 const SIGN_PACKAGE: &str = "onbf-sign";
@@ -1403,6 +1410,8 @@ fn main() -> ExitCode {
         .as_slice()
     {
         ["check"] => check(),
+        ["unsafe-list"] => unsafety::print_list(),
+        ["unsafe-gate"] => unsafety::gate(),
         ["build"] => build_loader(Loader::Developer).and_then(|loader| {
             let kernel = pack_kernel(&build_kernel()?)?;
             println!("{}\n{}", loader.display(), kernel.display());
@@ -1911,6 +1920,28 @@ fn check() -> Result {
         }
         run_step(cargo().args(["test", "--package", package]))?;
     }
+    // The framework: its logic on the host (with tests), and for the kernel's own target.
+    run_step(cargo().args([
+        "clippy",
+        "--package",
+        FRAMEWORK_PACKAGE,
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run_step(cargo().args([
+        "clippy",
+        "--package",
+        FRAMEWORK_PACKAGE,
+        "--lib",
+        "--target",
+        KERNEL_TARGET,
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run_step(cargo().args(["test", "--package", FRAMEWORK_PACKAGE]))?;
     // The Framekernel: its library on the host (with tests), the binary on its target.
     run_step(cargo().args([
         "clippy",
@@ -1953,6 +1984,7 @@ fn check() -> Result {
     no_panic_check()?;
     dependency_check()?;
     linux_cfg_lint()?;
+    unsafety::gate()?;
     manifest_version_lint()?;
     signing_stays_off_the_os_lint()?;
     signing_has_no_secret_branches()?;

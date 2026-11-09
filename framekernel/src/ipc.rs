@@ -37,7 +37,7 @@ use framekernel::channel::{Channel, Message, QUEUE_BYTES, QUEUE_DEPTH, ReadError
 use framekernel::handles::HandleTable;
 use framekernel::heap::{MAX_BLOCK, MIN_BLOCK, PAGE};
 use origin_abi::{Error, Handle, rights};
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
 
 use crate::cpu::without_interrupts;
 use crate::process::Account;

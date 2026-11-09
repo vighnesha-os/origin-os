@@ -49,7 +49,7 @@ use framekernel::vtd::{
     self, Access, Capability, ContextEntry, Descriptor, Drain, ExtCapability, FaultRecord,
     IovaWindow, Irte, MsiMessage, SourceCheck, TableMemory, fsts, gcmd, reg,
 };
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
 
 use crate::console::Console;
 

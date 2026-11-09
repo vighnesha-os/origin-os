@@ -105,10 +105,10 @@ struct Control {
     models: &'static [(&'static str, &'static [&'static str])],
 }
 
-const SPIN_LOCK: &str = "framekernel/sync/src/lib.rs";
-const WAIT: &str = "framekernel/sync/src/wait.rs";
+const SPIN_LOCK: &str = "framekernel/frame/sync/src/lib.rs";
+const WAIT: &str = "framekernel/frame/sync/src/wait.rs";
 const RUN_QUEUE: &str = "framekernel/src/runqueue.rs";
-const MODELS: &str = "framekernel/sync/src/models.rs";
+const MODELS: &str = "framekernel/frame/sync/src/models.rs";
 
 /// `WaitQueue::take_all`'s one critical section.
 const TAKE_ALL: &str = "        scheduler.without_interrupts(|| core::mem::replace(&mut *self.waiters.lock(), [None; N]))\n";
@@ -620,7 +620,7 @@ const CONTROLS: &[Control] = &[
 /// come from the real workspace's manifest, so that they cannot drift from it.
 const SCRATCH_WORKSPACE: &str = r#"[workspace]
 resolver = "3"
-members = ["framekernel/sync"]
+members = ["framekernel/frame/sync"]
 
 "#;
 
@@ -939,7 +939,7 @@ fn populate(root: &Path, scratch: &Path, profile: &str) -> Result {
     )?;
     write(Path::new("Cargo.lock"), MODEL_LOCK.as_bytes())?;
     copy(Path::new(RUN_QUEUE))?;
-    let crate_dir = root.join("framekernel/sync");
+    let crate_dir = root.join("framekernel/frame/sync");
     let mut files: Vec<PathBuf> = Vec::new();
     collect_files(&crate_dir, &|_| false, &|_| true, &mut files)
         .map_err(|e| format!("{}: {e}", crate_dir.display()))?;
@@ -950,7 +950,7 @@ fn populate(root: &Path, scratch: &Path, profile: &str) -> Result {
         copy(relative)?;
     }
     // Only here, in the scratch copy of the crate's manifest, does Loom exist.
-    let manifest = Path::new("framekernel/sync/Cargo.toml");
+    let manifest = Path::new("framekernel/frame/sync/Cargo.toml");
     let mut text = fs::read_to_string(scratch.join(manifest))
         .map_err(|e| format!("{}: {e}", scratch.join(manifest).display()))?;
     text.push_str(LOOM_DEV_DEPENDENCY);
@@ -1069,7 +1069,7 @@ mod tests {
     fn the_scratch_workspace_is_linted_as_the_real_one_is() {
         let manifest = scratch_manifest(&repo_root(), CONTROL_PROFILE).unwrap();
         for line in [
-            "members = [\"framekernel/sync\"]",
+            "members = [\"framekernel/frame/sync\"]",
             "unsafe_op_in_unsafe_fn = \"deny\"",
             "undocumented_unsafe_blocks = \"deny\"",
             "codegen-units = 1",

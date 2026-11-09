@@ -1,0 +1,15 @@
+[package]
+name = "origin-frame"
+description = "Origin OS Framekernel framework: the one privileged kernel crate (no_std; ADR-0011 N6)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+origin-boot-info = { path = "../../boot/info" }
+origin-paging = { path = "../paging" }
+origin-sync = { path = "sync" }
+
+[lints]
+workspace = true

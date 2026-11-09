@@ -12,7 +12,7 @@ use core::ptr;
 use framekernel::frames::{self, FrameAllocator};
 use framekernel::heap::{Heap, HeapStats, PageSource, Slab};
 
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
 
 use crate::cpu::without_interrupts;
 

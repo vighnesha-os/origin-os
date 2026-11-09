@@ -12,6 +12,7 @@
 //! Driven from the boot flow, over the polled I/O queue: the proof below holds the block
 //! lock across the I/O it does. A production block layer routes each request to the
 //! submitting processor's queue and blocks instead of polling (not done).
+#![forbid(unsafe_code)]
 
 use core::fmt::Write;
 

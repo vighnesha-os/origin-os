@@ -36,7 +36,7 @@ use framekernel::acpi;
 use framekernel::clock::{self, NANOS_PER_SECOND, Scale, SharedScale};
 use framekernel::hpet;
 use framekernel::rtc::{self, DateTime, Registers, SecondMeasurement, SecondVerdict, register};
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
 
 use crate::console::Console;
 use crate::cpu::{self, rdtsc};

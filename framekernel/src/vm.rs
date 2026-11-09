@@ -5,6 +5,7 @@
 //! Every change that removes access is followed by a TLB shootdown (`tlb`) once the lock is
 //! released, so no processor keeps the old translation; changes that only add access need
 //! none. Kernel-half mappings are global; the identity pages of the AP trampoline are not.
+#![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,7 +23,7 @@ const MMIO_END: u64 = 0xFFFF_F000_0000_0000;
 static MMIO_NEXT: AtomicU64 = AtomicU64::new(MMIO_BASE);
 
 use origin_boot_info::{MemoryRegion, overlaps_ram};
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
 
 struct KernelSpace {
     space: AddressSpace,

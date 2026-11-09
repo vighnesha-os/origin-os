@@ -26,7 +26,7 @@ use framekernel::net::{self, Arp, EthFrame, Ipv4, Mac, arp_op, ethertype};
 use framekernel::pci::{self, Address};
 use framekernel::virtio::{self, feature, status};
 use framekernel::virtqueue::{self, Descriptor, F_WRITE, RingMemory};
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
 
 use crate::console::Console;
 use crate::dma::{DeviceDma, DmaPage};

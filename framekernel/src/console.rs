@@ -40,7 +40,7 @@ use framekernel::serial::{
 };
 use framekernel::spcr::{self, Access, Spcr, UartAddress};
 use origin_boot_info::{BootInfo, Framebuffer, MemoryRegion, overlaps_ram};
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
 
 use crate::COM1_BASE;
 

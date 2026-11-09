@@ -22,8 +22,8 @@ bench = false
 [dependencies]
 origin-abi = { path = "../runtime/abi" }
 origin-boot-info.workspace = true
+origin-frame = { path = "frame" }
 origin-paging = { path = "paging" }
-origin-sync = { path = "sync" }
 origin-version.workspace = true
 
 [lints]

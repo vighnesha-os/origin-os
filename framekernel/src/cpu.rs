@@ -22,7 +22,7 @@ use framekernel::descriptors::{
     TSS, TSS_SIZE,
 };
 use framekernel::topology::CpuTopology;
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
 
 /// Size of each interrupt stack (#DF, NMI, #MC, #DB).
 const IST_STACK_SIZE: usize = 16 * 1024;

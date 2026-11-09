@@ -49,7 +49,7 @@ use framekernel::bitmap::Bitmap;
 use framekernel::ivrs::{self, Ivrs, Special};
 use framekernel::pci::Address;
 use framekernel::vtd::{Access, IovaWindow};
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
 
 use super::{Domain, DomainInfo, Fault, FaultKind, PAGE, Page, Regs, Route, Tables, poll};
 use crate::console::Console;

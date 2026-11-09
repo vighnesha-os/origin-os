@@ -23,7 +23,7 @@ use framekernel::acpi::{self, IoApic, SourceOverride};
 use framekernel::apic;
 use framekernel::ioapic::{self, RemappableEntry};
 use framekernel::vtd::{Irte, SourceCheck};
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, rdtsc};

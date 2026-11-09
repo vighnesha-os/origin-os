@@ -28,7 +28,7 @@ use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};

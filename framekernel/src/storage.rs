@@ -48,7 +48,7 @@ use framekernel::gpt;
 use framekernel::nvme::{self, Capabilities, Command, Completion, NamespaceInfo, Queues, register};
 use framekernel::pci::{self, BarKind};
 use framekernel::vtd;
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
 
 use crate::cpu::{CpuIndex, MAX_CPUS};
 use crate::dma::DeviceDma;

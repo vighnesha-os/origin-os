@@ -27,7 +27,7 @@ use crate::console::Console;
 use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
 use crate::process::Process;
 use crate::timer::{self, X2Apic};
-use origin_sync::SpinLock;
+use origin_frame::sync::SpinLock;
 
 /// Each kernel thread's stack.
 const THREAD_STACK: usize = 16 * 1024;
