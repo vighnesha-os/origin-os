@@ -357,6 +357,7 @@ fn channel_read(
     match ipc::channel_read(
         &p.handles,
         end.value(),
+        need(end),
         bytes.capacity(),
         handles.capacity(),
     )? {

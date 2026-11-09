@@ -438,16 +438,18 @@ pub(crate) enum Read {
     },
 }
 
-/// `channel_read`: the next message, its handles moved into `table`.
+/// `channel_read`: the next message, its handles moved into `table`. `need` is what the end
+/// must meet.
 pub(crate) fn channel_read(
     table: &SpinLock<HandleTable<Object>>,
     handle: Handle,
+    need: Need,
     byte_capacity: usize,
     handle_capacity: usize,
 ) -> Result<Read, Error> {
     let read = without_interrupts(|| {
         let mut table = table.lock();
-        let (channel, side) = channel_of(&table, handle, Need::rights(rights::READ))?;
+        let (channel, side) = channel_of(&table, handle, need)?;
         let mut state = channel.state.lock();
         let (bytes, handles) = state.peek(side)?;
         if bytes > byte_capacity || handles > handle_capacity {
