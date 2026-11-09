@@ -70,7 +70,7 @@
 6. **Signature block (ONBF §7.1):** host signing in original Rust (`onbf-sign`), the loader requiring a signed KRN outside developer mode, and a compiled-in trust store with a test key — **done 2026-11-08** (`docs/research/2026-11-08-krn-signature-verification.md`; errata V1–V6 and O2–O5 decided by the owner). A loader built without `test-trust-store` trusts nothing and refuses every kernel, until Origin has its own keys. Remaining: OKC chains (O3 makes them wait for the SYS profile's signed time), Origin's real root and kernel keys and the signing ceremony (HSM, §60), and B7's Secure Boot first stage. Anti-rollback and TPM measurement (§7.6, §8.1) stay with the SYS profile.
 7. **Block layer and filesystem (§39–§41):** one I/O queue per CPU, a block cache, then a filesystem ADR.
 8. **Formal and concurrency checks:** Loom models for `SpinLock`, `RwLock` and the wait-queue protocol (§73) — **done 2026-11-08** (`cargo xtask loom`, part of `check`): the real locks, the real wait-queue protocol and the real run queue, 18 models and 22 negative controls, the protocol moved out of the kernel binary into `origin_sync::wait` so it can run under Loom. What each model proves, what it leaves unproved and the approved crates are in `SOURCE_PROVENANCE.md`, "Loom models". Remaining: Kani bounds for `paging`, `frames`, `heap`.
-9. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks; **M1 follow-ups** (A/B deployment, boot-attempt recording, CI).
+9. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks; **M1 follow-ups** (A/B deployment, boot-attempt recording).
 
 10. **The pre-merge review's open list:** the Framekernel's trusted base, speculation controls, CET, TCP's acceptance checks, the open IOMMU threats, NVMe reset, scheduling and allocator scaling (`docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md`, "Not fixed").
 
@@ -81,5 +81,5 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 | # | Decision | Blocks |
 |---|---|---|
 | — | Buy the first test machines ADR-0009 chose: #2, then #5 once its serial option is confirmed (H5) | The first physical boot (§74) |
-| — | Sheet items 30–32: ADR-0007's bus-mastering question, the Loom download's deviation, and CI (`docs/engineering/OWNER_DECISIONS.md`) | Accepting I12; an honest record; §82's M0 |
+| — | Sheet items 30 and 31: ADR-0007's bus-mastering question and the Loom download's deviation (`docs/engineering/OWNER_DECISIONS.md`) | Accepting I12; an honest record |
 | — | Sheet item 39: whether to amend CLAUDE.md §48 and §70 to match ADR-0011 | Keeping the directive and the design in step |
