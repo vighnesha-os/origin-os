@@ -82,3 +82,10 @@ pub fn generate(comp: &Compilation) -> Vec<Generated> {
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files
 }
+
+/// The server side alone (`docs/spec/OIDL.md` §11), sorted by path.
+pub fn generate_server(comp: &Compilation) -> Vec<Generated> {
+    let mut files = rust::generate_server(comp);
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}

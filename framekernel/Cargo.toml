@@ -25,6 +25,7 @@ origin-abi = { path = "../runtime/abi" }
 origin-boot-info.workspace = true
 origin-frame = { path = "frame" }
 origin-paging = { path = "paging" }
+origin-syscalls = { path = "syscalls" }
 origin-version.workspace = true
 
 [lints]

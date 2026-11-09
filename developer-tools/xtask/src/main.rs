@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod disk;
+mod interfaces;
 mod loom;
 mod screen;
 mod serial;
@@ -54,6 +55,9 @@ commands:
               check (CLAUDE.md §73)
   unsafe-gate only the gate on `unsafe` and on the kernel's dependency direction (part of
               check; quick)
+  interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
+              (part of check; quick)
+  regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
 
 environment:
   ORIGIN_LOOM_DEEP                    if set, the Loom models search to their deeper bounds
@@ -112,6 +116,7 @@ const FREESTANDING_LIBS: &[&str] = &[
     "onbf-verify",
     "origin-paging",
     "origin-abi",
+    "origin-syscalls",
 ];
 const QEMU: &str = "qemu-system-x86_64";
 /// Where the emulated RTC starts (UTC), so the boot test can check the wall clock the
@@ -1926,6 +1931,8 @@ fn main() -> ExitCode {
     {
         ["check"] => check(),
         ["unsafe-gate"] => unsafety::gate(),
+        ["interface-gate"] => interfaces::gate(),
+        ["regenerate"] => interfaces::regenerate(),
         ["build"] => build_loader(Loader::Developer).and_then(|loader| {
             let kernel = pack_kernel(&build_kernel()?)?;
             println!("{}\n{}", loader.display(), kernel.display());
@@ -2553,6 +2560,7 @@ fn check() -> Result {
     dependency_check()?;
     linux_cfg_lint()?;
     unsafety::gate()?;
+    interfaces::gate()?;
     manifest_version_lint()?;
     signing_stays_off_the_os_lint()?;
     signing_has_no_secret_branches()?;

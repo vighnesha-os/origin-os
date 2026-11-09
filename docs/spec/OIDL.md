@@ -487,6 +487,8 @@ Generated Rust is `no_std`, allocates nothing and passes the project's no-panic 
 
 Channel-transport C entry points are **not generated in this revision**: they would sit on `origin.core`'s call helper (ADR-0005 P8), which does not exist. The header carries their types and message sizes.
 
+`oidl generate --server-only` writes one crate at the top of the output directory, and nothing else: `lib.rs`, `oidl_rt.rs`, `<lib>/types.rs` and each interface's `server.rs`. There is no client, C, documentation or corpus, and so no shim: the crate's root is `#![forbid(unsafe_code)]`. The files it shares with the full output are identical to it. Its modules are marked `#[rustfmt::skip]`, because what the tool wrote is what a repository commits and compares. The Framekernel's crate is made this way (`framekernel/syscalls`, ADR-0011 N14).
+
 ---
 
 ## 12. The generator is a parser of untrusted input
@@ -509,7 +511,7 @@ For each library and each minor `m` from 0 to its current minor, the tool render
 
 A lock file records `<library> <M.m> sha256:<hex>`, one line per minor. `oidl fingerprint --lock FILE` fails if, for the current major, a recorded minor's fingerprint has changed or a recorded minor has gone; if a recorded major is higher than the library's (the version went backwards); if the lock names a library that is not among the inputs; if a line is malformed; or if the file is missing and `--update` was not given. A minor that is not recorded yet is reported. At major 0 a changed or removed minor is a warning (§9). `--update` records new minors and refuses to run while there are errors.
 
-Each minor's fingerprint is frozen once it is recorded, which is what makes additions compatible and everything else detectable (ADR-0011 N13).
+Each minor's fingerprint is frozen once it is recorded, which is what makes additions compatible and everything else detectable (ADR-0011 N13). `cargo xtask check` is stricter than the tool: it fails if re-recording a repository's lock would change it, even at major 0, so that a change to an ABI is always recorded in the commit that makes it (`developer-tools/xtask/src/interfaces.rs`).
 
 ---
 

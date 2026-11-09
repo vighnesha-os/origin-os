@@ -1,10 +1,11 @@
 // The Framekernel's system calls as OIDL (docs/spec/OIDL.md): the first consumer of the
-// generator, ADR-0011 N14 step 2.
+// generator, ADR-0011 N14 steps 2 and 3.
 //
-// The owner accepted the format on 2026-11-09, but **nothing is generated from this file
-// into the tree yet, and the kernel does not use it**: adopting it is a later step (ADR-0011
-// N14), and the kernel may be restructured first (N6). The comparison with runtime/abi and
-// framekernel/src/syscall.rs is in docs/engineering/OIDL_KERNEL_COMPARISON.md.
+// The kernel's call table, argument decoding and statuses are generated from this file, into
+// framekernel/syscalls (`cargo xtask regenerate`). `cargo xtask check` fails if that code is not
+// what this file generates, or if this file's ABI is not the one origin.kernel.lock records.
+// Nothing else is generated from it yet: origin.core and its C entry points come with step 4. The
+// comparison with the hand-written ABI is in docs/engineering/OIDL_KERNEL_COMPARISON.md.
 
 /// The Framekernel's system calls: what the kernel offers a process (ADR-0005).
 /// Everything here reaches a program only through origin.core (ADR-0011 N5); the numbers are

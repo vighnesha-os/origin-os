@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! oidl check [--versions FILE] FILE...
-//! oidl generate --out DIR [--versions FILE] FILE...
+//! oidl generate --out DIR [--server-only] [--versions FILE] FILE...
 //! oidl fingerprint [--versions FILE] [--lock FILE [--update]] FILE...
 //! ```
 //!
@@ -21,7 +21,7 @@ use oidl::{Input, codegen, compile};
 
 const USAGE: &str = "usage:
   oidl check [--versions FILE] FILE...
-  oidl generate --out DIR [--versions FILE] FILE...
+  oidl generate --out DIR [--server-only] [--versions FILE] FILE...
   oidl fingerprint [--versions FILE] [--lock FILE [--update]] FILE...";
 
 #[derive(Default)]
@@ -30,6 +30,7 @@ struct Options {
     out: Option<PathBuf>,
     lock: Option<PathBuf>,
     update: bool,
+    server_only: bool,
     files: Vec<PathBuf>,
 }
 
@@ -47,6 +48,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<(String, Options), S
             "--out" => options.out = Some(PathBuf::from(value("--out")?)),
             "--lock" => options.lock = Some(PathBuf::from(value("--lock")?)),
             "--update" => options.update = true,
+            "--server-only" => options.server_only = true,
             other if other.starts_with('-') => {
                 return Err(format!("unknown option {other}\n{USAGE}"));
             }
@@ -93,6 +95,14 @@ fn generate(options: &Options) -> Result<(), String> {
     let compilation = load(options)?;
     let out = options.out.as_ref().ok_or("generate needs --out DIR")?;
     let mut count = 0usize;
+    if options.server_only {
+        for file in codegen::generate_server(&compilation) {
+            write_file(out, &file.path, &file.text)?;
+            count = count.saturating_add(1);
+        }
+        println!("oidl: {count} files written to {}", out.display());
+        return Ok(());
+    }
     for file in codegen::generate(&compilation) {
         write_file(out, &file.path, &file.text)?;
         count = count.saturating_add(1);

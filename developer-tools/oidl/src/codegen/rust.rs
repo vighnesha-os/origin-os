@@ -26,6 +26,25 @@ fn status_enum(comp: &Compilation) -> Option<&Enum> {
     comp.status.as_deref()
 }
 
+/// Which part of the output to write.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// Everything, under `rust/`.
+    Everything,
+    /// The server side alone, at the top of the output directory.
+    Server,
+}
+
+impl Side {
+    /// The directory the crate is written under, with its slash.
+    const fn top(self) -> &'static str {
+        match self {
+            Self::Everything => "rust/",
+            Self::Server => "",
+        }
+    }
+}
+
 struct Gen<'a> {
     comp: &'a Compilation,
     lib: &'a Library,
@@ -2675,9 +2694,10 @@ fn gen_channel_client_method(g: &Gen<'_>, t: &mut Text, method: &Method) {
 
 // --- Files ---------------------------------------------------------------------------------
 
-fn gen_library(comp: &Compilation, lib: &Library, files: &mut Vec<Generated>) {
+fn gen_library(comp: &Compilation, lib: &Library, side: Side, files: &mut Vec<Generated>) {
     let m = module(&lib.name);
     let g = Gen { comp, lib };
+    let top = side.top();
     let mut root = Text::default();
     root.line(format!(
         "//! `{}`, generated from its definition.",
@@ -2690,51 +2710,53 @@ fn gen_library(comp: &Compilation, lib: &Library, files: &mut Vec<Generated>) {
         root.line(format!("pub mod {};", interface.name));
     }
     files.push(Generated {
-        path: format!("rust/{m}/mod.rs"),
+        path: format!("{top}{m}/mod.rs"),
         text: format!("{HEADER}{}", root.finish()),
     });
     files.push(Generated {
-        path: format!("rust/{m}/types.rs"),
+        path: format!("{top}{m}/types.rs"),
         text: format!("{HEADER}{}", gen_types(&g)),
     });
     for interface in &lib.interfaces {
-        let dir = format!("rust/{m}/{}", interface.name);
+        let dir = format!("{top}{m}/{}", interface.name);
         let mut module_text = Text::default();
         module_text.line(format!("//! The `{}` interface.", interface.name));
         module_text.blank();
         module_text.line("pub mod server;");
-        module_text.line("pub mod client;");
-        match lib.transport {
-            Transport::Syscall => {
-                module_text.line("mod abi;");
-                module_text.line("#[cfg(target_arch = \"x86_64\")]");
-                module_text.line("pub mod core_stubs;");
-                files.push(Generated {
-                    path: format!("{dir}/server.rs"),
-                    text: format!("{HEADER}{}", gen_sys_server(&g, interface)),
-                });
-                files.push(Generated {
-                    path: format!("{dir}/client.rs"),
-                    text: format!("{HEADER}{}", gen_sys_client(&g, interface)),
-                });
-                files.push(Generated {
-                    path: format!("{dir}/abi.rs"),
-                    text: format!("{HEADER}{}", gen_sys_abi(&g, interface)),
-                });
-                files.push(Generated {
-                    path: format!("{dir}/core_stubs.rs"),
-                    text: format!("{HEADER}{}", gen_sys_core_stubs(&g, interface)),
-                });
-            }
-            Transport::Channel => {
-                files.push(Generated {
-                    path: format!("{dir}/server.rs"),
-                    text: format!("{HEADER}{}", gen_channel_server(&g, interface)),
-                });
-                files.push(Generated {
-                    path: format!("{dir}/client.rs"),
-                    text: format!("{HEADER}{}", gen_channel_client(&g, interface)),
-                });
+        let server = match lib.transport {
+            Transport::Syscall => gen_sys_server(&g, interface),
+            Transport::Channel => gen_channel_server(&g, interface),
+        };
+        files.push(Generated {
+            path: format!("{dir}/server.rs"),
+            text: format!("{HEADER}{server}"),
+        });
+        if side == Side::Everything {
+            module_text.line("pub mod client;");
+            match lib.transport {
+                Transport::Syscall => {
+                    module_text.line("mod abi;");
+                    module_text.line("#[cfg(target_arch = \"x86_64\")]");
+                    module_text.line("pub mod core_stubs;");
+                    files.push(Generated {
+                        path: format!("{dir}/client.rs"),
+                        text: format!("{HEADER}{}", gen_sys_client(&g, interface)),
+                    });
+                    files.push(Generated {
+                        path: format!("{dir}/abi.rs"),
+                        text: format!("{HEADER}{}", gen_sys_abi(&g, interface)),
+                    });
+                    files.push(Generated {
+                        path: format!("{dir}/core_stubs.rs"),
+                        text: format!("{HEADER}{}", gen_sys_core_stubs(&g, interface)),
+                    });
+                }
+                Transport::Channel => {
+                    files.push(Generated {
+                        path: format!("{dir}/client.rs"),
+                        text: format!("{HEADER}{}", gen_channel_client(&g, interface)),
+                    });
+                }
             }
         }
         files.push(Generated {
@@ -2940,30 +2962,49 @@ fn corpus_path(ty: &str, module_name: &str) -> String {
 
 /// Every Rust file.
 pub fn generate(comp: &Compilation) -> Vec<Generated> {
+    let mut files = gen_crate(comp, Side::Everything);
+    files.push(Generated {
+        path: "rust/bin/corpus_check.rs".to_string(),
+        text: format!("{HEADER}{}", gen_corpus_check(comp)),
+    });
+    files
+}
+
+/// The server side alone (`docs/spec/OIDL.md` §11), as a crate of its own: the runtime, the types
+/// and the server modules, with no client, no C entry points and so no `unsafe` at all. The
+/// compiler holds it to that: its root is `forbid(unsafe_code)`.
+pub fn generate_server(comp: &Compilation) -> Vec<Generated> {
+    gen_crate(comp, Side::Server)
+}
+
+fn gen_crate(comp: &Compilation, side: Side) -> Vec<Generated> {
+    let top = side.top();
     let mut files = vec![Generated {
-        path: "rust/oidl_rt.rs".to_string(),
+        path: format!("{top}oidl_rt.rs"),
         text: format!("{HEADER}{}", include_str!("oidl_rt.rs.in")),
     }];
     let mut root = Text::default();
     root.line("//! Generated from the OIDL definitions. `docs/spec/OIDL.md`.");
     root.line("//!");
     root.line("#![no_std]");
-    root.line("#![deny(unsafe_op_in_unsafe_fn)]");
+    root.line(match side {
+        Side::Everything => "#![deny(unsafe_op_in_unsafe_fn)]",
+        Side::Server => "#![forbid(unsafe_code)]",
+    });
     root.blank();
+    // What the tool wrote is what is committed and compared, so rustfmt leaves it alone.
+    root.line("#[rustfmt::skip]");
     root.line("pub mod oidl_rt;");
     for lib in &comp.libraries {
+        root.line("#[rustfmt::skip]");
         root.line(format!("pub mod {};", module(&lib.name)));
     }
     files.push(Generated {
-        path: "rust/lib.rs".to_string(),
+        path: format!("{top}lib.rs"),
         text: format!("{HEADER}{}", root.finish()),
     });
     for lib in &comp.libraries {
-        gen_library(comp, lib, &mut files);
+        gen_library(comp, lib, side, &mut files);
     }
-    files.push(Generated {
-        path: "rust/bin/corpus_check.rs".to_string(),
-        text: format!("{HEADER}{}", gen_corpus_check(comp)),
-    });
     files
 }

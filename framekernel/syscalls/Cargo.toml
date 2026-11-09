@@ -1,0 +1,17 @@
+[package]
+name = "origin-syscalls"
+description = "The Framekernel's system-call table and decoders, generated from sdk/interfaces/origin.kernel.oidl (kernel-private)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Everything under `src/` is written by `cargo xtask regenerate` and compared with a fresh
+# generation by `cargo xtask check`: nothing there is edited by hand. It holds the runtime, the
+# types and the server side only: the client and the two named `unsafe` shims are not generated
+# here (docs/spec/OIDL.md §11), so no `unsafe` can reach the kernel through this crate.
+[dev-dependencies]
+origin-abi = { path = "../../runtime/abi" }
+
+[lints]
+workspace = true

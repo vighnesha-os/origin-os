@@ -10,6 +10,7 @@ dependencies = [
  "origin-boot-info",
  "origin-frame",
  "origin-paging",
+ "origin-syscalls",
  "origin-version",
 ]
 
@@ -115,6 +116,13 @@ dependencies = [
 [[package]]
 name = "origin-sync"
 version = "0.0.0"
+
+[[package]]
+name = "origin-syscalls"
+version = "0.0.0"
+dependencies = [
+ "origin-abi",
+]
 
 [[package]]
 name = "origin-version"
