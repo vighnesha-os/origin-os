@@ -170,7 +170,7 @@ The ledger `docs/research/2026-11-09-native-sdk.md` records the sources and what
 
 The OIDL grammar, the Driver ABI, the graphics path, any POSIX layer, how `std` maps onto the SDK (§44), and numeric performance budgets.
 
-## Questions for the owner (1–6 answered 2026-11-09; 7 open)
+## Questions for the owner (all answered 2026-11-09)
 
 1. Are command-line tools, the shell, the terminal and the recovery console SDK clients with no private doors, going further than §48 and §70 (N1, N2)? **Yes (2026-11-09).**
 2. Stable promises per capability, with every module having a typed interface, rather than a stable SDK per module (N3, N4)? **Yes (2026-11-09).**
@@ -178,4 +178,4 @@ The OIDL grammar, the Driver ABI, the graphics path, any POSIX layer, how `std` 
 4. A small original interface language rather than adopting one (N7)? **Yes (2026-11-09).**
 5. Kernel-stamped caller identity on every channel message, as an amendment to ADR-0005 (N9)? **Yes (2026-11-09).**
 6. Each system-call number accepted only from its own address in `origin.core` (N5)? **Yes (2026-11-09).**
-7. If accepted, will you amend CLAUDE.md §48 and §70 to say this? They are your text, so Claude has not changed them.
+7. If accepted, will you amend CLAUDE.md §48 and §70 to say this? They are your text, so Claude has not changed them. **Yes (2026-11-09; decision sheet item 39): Claude drafts the wording and the owner approves it before it goes in. Until then the directive is unchanged.**
