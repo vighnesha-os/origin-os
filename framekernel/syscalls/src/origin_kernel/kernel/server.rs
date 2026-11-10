@@ -511,7 +511,7 @@ pub trait Calls {
     fn channel_write(&self, end: rt::HandleArg, bytes: rt::UserSlice<u8>, handles: rt::HandleSlice) -> Result<(), ChannelWriteError>;
     /// Reads the next message from a channel. If the buffers are too small the message stays
     /// queued and sizes reports what is needed.
-    fn channel_read(&self, end: rt::HandleArg, bytes: rt::UserBuffer<u8>, handles: rt::UserBuffer<rt::Handle>, sizes: rt::UserRef<ReadSizes>) -> Result<(), ChannelReadError>;
+    fn channel_read(&self, end: rt::HandleArg, bytes: rt::UserBuffer<u8>, handles: rt::UserBuffer<ReceivedHandle>, sizes: rt::UserRef<ReadSizes>) -> Result<(), ChannelReadError>;
     /// Blocks until a signal is raised on the object, the deadline passes, or the handle is
     /// closed (ADR-0005 P9).
     fn wait_one(&self, handle: rt::HandleArg, signals: Signals, deadline: u64, observed: rt::UserRef<Signals>) -> Result<(), WaitOneError>;
@@ -590,7 +590,7 @@ fn call_channel_read<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> 
     let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, oidl_a4, oidl_a5] = oidl_args;
     let end = rt::HandleArg::from_reg(oidl_a0, 0x1, 4).ok_or(ChannelReadError::BadHandle)?;
     let bytes = rt::UserBuffer::<u8>::new(oidl_a1, oidl_a2, 65536);
-    let handles = rt::UserBuffer::<rt::Handle>::new(oidl_a3, oidl_a4, 64);
+    let handles = rt::UserBuffer::<ReceivedHandle>::new(oidl_a3, oidl_a4, 64);
     let sizes = rt::UserRef::new(oidl_a5);
     oidl_calls.channel_read(end, bytes, handles, sizes)
 }

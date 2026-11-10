@@ -32,7 +32,10 @@ use core::sync::atomic::Ordering;
 
 use crate::paging::{Access, PAGE};
 use origin_abi::limits::{DEADLINE_INFINITE, MAX_MESSAGE_BYTES};
-use origin_abi::{Error, OK, read_sizes, rights, signals, status_name, syscall as sys};
+use origin_abi::{
+    Error, OK, ObjectType, read_sizes, received_handle, rights, signals, status_name,
+    syscall as sys,
+};
 
 use origin_frame::objref::ObjectRef;
 use origin_frame::proof_programs::{self, DATA, STACK};
@@ -41,7 +44,7 @@ use origin_frame::userspace::{self, UserFrame};
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex};
 use crate::ipc::{self, Object};
-use crate::process::{Ending, Limits, Process};
+use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, Process};
 use crate::{memory, sched, syscall, time};
 
 /// Where every proof process's code begins.
@@ -71,13 +74,15 @@ const MSG: u64 = DATA + 0x100;
 const RBUF: u64 = DATA + 0x140;
 /// `wait_one`'s output.
 const OBS: u64 = DATA + 0x240;
-/// `channel_read`'s sizes structure (`size` set to the known 12 before the process starts).
+/// `channel_read`'s sizes structure, given its first version's size, 12, before the process
+/// starts: every read through it gets the counts and nothing past them (C2).
 const SIZES: u64 = DATA + 0x248;
 /// A sizes structure too small for the kernel to use.
 const BAD_SIZES: u64 = DATA + 0x260;
 /// A handle list to send.
 const LIST: u64 = DATA + 0x300;
-/// Handles received.
+/// Handles received: a `received_handle` record each (ADR-0005 B3), so the first handle's
+/// value is the `u32` here.
 const RECV: u64 = DATA + 0x400;
 
 /// A test message.
@@ -256,9 +261,19 @@ impl Image {
 
     /// As [`Image::new`], but system calls are accepted only from `origin`.
     fn with_origin(limits: Limits, code: &[u8], origin: (u64, u64)) -> Option<Self> {
+        Self::build(limits, code, origin, BOOT_PROOF_PRINCIPAL)
+    }
+
+    /// As [`Image::new`], acting for `principal` (ADR-0005 C1).
+    fn acting_for(limits: Limits, code: &[u8], principal: u64) -> Option<Self> {
+        let code_pages = code.len().div_ceil(PAGE as usize).max(1) as u64;
+        Self::build(limits, code, (CODE, CODE + code_pages * PAGE), principal)
+    }
+
+    fn build(limits: Limits, code: &[u8], origin: (u64, u64), principal: u64) -> Option<Self> {
         let code_pages = code.len().div_ceil(PAGE as usize).max(1) as u64;
         let mut image = Self {
-            process: Process::new(limits, origin)?,
+            process: Process::new(limits, origin, principal)?,
             pages: Vec::new(),
         };
         image.map(CODE, code_pages, Access::ReadExecute)?;
@@ -303,7 +318,7 @@ impl Image {
     /// The scratch memory every scripted process starts with.
     fn scratch(&self) -> Option<()> {
         self.write(MSG, TEXT)?;
-        self.write(SIZES, &read_sizes::SIZE.to_le_bytes())?;
+        self.write(SIZES, &read_sizes::BASE_SIZE.to_le_bytes())?;
         self.write(BAD_SIZES, &8u32.to_le_bytes())
     }
 
@@ -492,7 +507,7 @@ fn ping_pong(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) 
 /// The process of `image`, its round count written (handles are written after the grants).
 fn build_pinger(image: Image, rounds: u64) -> Option<ObjectRef<Process>> {
     image.write_u64(DATA + 8, rounds)?;
-    image.write(SIZES, &read_sizes::SIZE.to_le_bytes())?;
+    image.write(SIZES, &read_sizes::BASE_SIZE.to_le_bytes())?;
     image.finish()
 }
 
@@ -608,6 +623,13 @@ fn hostile_groups(kernel: u64, foreign: u64) -> Vec<Group> {
                     "sizes in the kernel",
                     sys::CHANNEL_READ,
                     &[b, Imm(RBUF), Imm(16), Imm(0), Imm(0), Imm(kernel)],
+                    fault,
+                ),
+                // Room for one handle is a whole record, 12 bytes, not a 4-byte value (B3).
+                step(
+                    "a handle record across the end of mapped",
+                    sys::CHANNEL_READ,
+                    &[b, Imm(RBUF), Imm(16), Imm(data_end - 4), Imm(1), Imm(SIZES)],
                     fault,
                 ),
                 step(
@@ -767,6 +789,17 @@ fn hostile_groups(kernel: u64, foreign: u64) -> Vec<Group> {
                 write("the sender's handle is gone", h(18), MSG, 4, bad),
                 read_handles("received", h(17), OK),
                 value_at("with one handle", SIZES + read_sizes::HANDLES_AT as u64, 1),
+                // Its record says what it names and what it may do (B3).
+                value_at(
+                    "its record names a channel",
+                    RECV + received_handle::OBJECT_TYPE_AT as u64,
+                    ObjectType::Channel as u64
+                ),
+                value_at(
+                    "with the rights it was sent with",
+                    RECV + received_handle::RIGHTS_AT as u64,
+                    u64::from(full)
+                ),
                 write("the moved handle writes", Hd(RECV), MSG, 4, OK),
                 read("and the other end reads", h(19), RBUF, 16, OK),
                 dup("it kept its rights", Hd(RECV), full, 20, OK),
@@ -832,7 +865,7 @@ fn full_queue_steps(timed_out: i64, wait_status: i64) -> Vec<Step> {
 fn hostile(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     // Another process with a live handle whose value is not live in the hostile process:
     // slot 40, which the hostile process's table never reaches.
-    let Some(other) = Process::new(LIMITS, (CODE, CODE + PAGE)) else {
+    let Some(other) = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL) else {
         return false;
     };
     let Ok((end, peer)) = ipc::create_channel(&other.account) else {
@@ -1881,7 +1914,7 @@ fn process_ids(com1: &mut Console) -> bool {
     let mut previous = 0;
     let mut ascending = true;
     for _ in 0..PROCESSES {
-        let Some(process) = Process::new(LIMITS, (CODE, CODE + PAGE)) else {
+        let Some(process) = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL) else {
             return false;
         };
         ascending &= process.id() > previous;
@@ -1904,7 +1937,8 @@ fn cancel_on_any_object(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, ts
     let mut ok = true;
     for (how, sends) in [("closes", false), ("sends away", true)] {
         // Never started, so nothing else can end the wait.
-        let Some(never_runs) = Process::new(LIMITS, (CODE, CODE + PAGE)) else {
+        let Some(never_runs) = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)
+        else {
             return false;
         };
         let Ok(never_runs) = ObjectRef::try_new(never_runs) else {
@@ -2009,6 +2043,254 @@ pub(crate) fn prove_objects(
     let _ = writeln!(
         com1,
         "origin-kernel: ipc: every process and thread object and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){}",
+        if back { "" } else { ": ipc failed" }
+    );
+    ok && back
+}
+
+// ------------------------------------------------------------------ a message's writer
+
+/// The reader's `read_sizes` structures in the identity proof, each the current 32 bytes: for
+/// a read too small for its message, then one per message read.
+const IDENT_SMALL: u64 = DATA + 0x500;
+const IDENT_FIRST: u64 = DATA + 0x520;
+const IDENT_SECOND: u64 = DATA + 0x540;
+/// One given the first version's 12 bytes (C2), and what fills it past them.
+const IDENT_OLD: u64 = DATA + 0x560;
+/// What fills each structure before the reads, so that a field the kernel did not write
+/// shows.
+const UNWRITTEN: u32 = 0xC5C5_C5C5;
+/// The principals of the identity proof's two writers and its reader: both halves of each
+/// non-zero, so a field that arrives with only 32 of its 64 bits shows (C1).
+const PRINCIPAL_A: u64 = 0xA11C_E000_0000_0001;
+const PRINCIPAL_B: u64 = 0x0000_0002_B0B0_0002;
+const PRINCIPAL_READER: u64 = 0x5EAD_E500_0000_0003;
+/// The lengths of the three messages, each different.
+const FIRST_LEN: u64 = 6;
+const SECOND_LEN: u64 = 8;
+const THIRD_LEN: u64 = 7;
+
+/// The `u64` a script reported as two `report32` halves, low first, starting at `at`.
+fn reported_u64(reports: &[u64], at: usize) -> Option<u64> {
+    let low = *reports.get(at)?;
+    let high = *reports.get(at + 1)?;
+    Some((low & 0xFFFF_FFFF) | (high << 32))
+}
+
+/// Reports the identity fields of the `read_sizes` at `sizes`: four `report32` steps.
+fn report_identity(sizes: u64) -> [Step; 4] {
+    [
+        value_at("", sizes + read_sizes::SENDER_PROCESS_AT as u64, 0),
+        value_at("", sizes + read_sizes::SENDER_PROCESS_AT as u64 + 4, 0),
+        value_at("", sizes + read_sizes::SENDER_PRINCIPAL_AT as u64, 0),
+        value_at("", sizes + read_sizes::SENDER_PRINCIPAL_AT as u64 + 4, 0),
+    ]
+}
+
+/// Every message carries its writer's identity, stamped when it is written, and a read
+/// reports it through the caller's `read_sizes` as far as its `size` reaches (ADR-0005 B1,
+/// C1, C2). Writer A writes the first message on its end of a channel, then sends that end to
+/// writer B, which writes the second and third. The reader, told by B that it is done, reads
+/// them: first with a buffer too small, then each in turn, the last with the first version's
+/// 12-byte `read_sizes`. Each process acts for its own principal.
+fn writer_identity(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let script = proof_programs::script();
+    let (Some(mut a), Some(mut b), Some(mut reader)) = (
+        Image::acting_for(LIMITS, script, PRINCIPAL_A),
+        Image::acting_for(LIMITS, script, PRINCIPAL_B),
+        Image::acting_for(LIMITS, script, PRINCIPAL_READER),
+    ) else {
+        return false;
+    };
+    // X carries the messages, Y carries X's writing end from A to B, Z tells the reader.
+    let (Ok((x0, x1)), Ok((y0, y1)), Ok((z0, z1))) = (
+        ipc::create_channel(&a.process.account),
+        ipc::create_channel(&a.process.account),
+        ipc::create_channel(&b.process.account),
+    ) else {
+        return false;
+    };
+    let full = rights::CHANNEL;
+    let (Ok(ax), Ok(ay), Ok(by), Ok(bz), Ok(rx), Ok(rz)) = (
+        a.process.grant(Object::Channel(x0), full),
+        a.process.grant(Object::Channel(y0), full),
+        b.process.grant(Object::Channel(y1), full),
+        b.process.grant(Object::Channel(z0), full),
+        reader.process.grant(Object::Channel(x1), full),
+        reader.process.grant(Object::Channel(z1), full),
+    ) else {
+        return false;
+    };
+    // A's end of X goes in its list to send.
+    let moved = ax.to_le_bytes();
+    let (ax, ay, by, bz, rx, rz) = (
+        Imm(u64::from(ax)),
+        Imm(u64::from(ay)),
+        Imm(u64::from(by)),
+        Imm(u64::from(bz)),
+        Imm(u64::from(rx)),
+        Imm(u64::from(rz)),
+    );
+    let a_steps = alloc::vec![
+        write("", ax, MSG, FIRST_LEN, OK),
+        // The end the first message was written on goes to B.
+        step(
+            "",
+            sys::CHANNEL_WRITE,
+            &[ay, Imm(MSG), Imm(4), Imm(LIST), Imm(1)],
+            OK
+        ),
+    ];
+    let b_steps = alloc::vec![
+        wait("", by, signals::READABLE, DEADLINE_INFINITE, OK),
+        read_handles("", by, OK),
+        write("", Hd(RECV), MSG, SECOND_LEN, OK),
+        write("", Hd(RECV), MSG, THIRD_LEN, OK),
+        write("", bz, MSG, 4, OK),
+    ];
+    let read_into = |sizes: u64, room: u64, want: i64| {
+        step(
+            "",
+            sys::CHANNEL_READ,
+            &[rx, Imm(RBUF), Imm(room), Imm(0), Imm(0), Imm(sizes)],
+            want,
+        )
+    };
+    let mut reader_steps = alloc::vec![
+        wait("", rz, signals::READABLE, DEADLINE_INFINITE, OK),
+        read_into(IDENT_SMALL, 2, Error::BufferTooSmall.raw()),
+    ];
+    reader_steps.extend(report_identity(IDENT_SMALL));
+    reader_steps.push(read_into(IDENT_FIRST, 16, OK));
+    reader_steps.extend(report_identity(IDENT_FIRST));
+    reader_steps.push(read_into(IDENT_SECOND, 16, OK));
+    reader_steps.extend(report_identity(IDENT_SECOND));
+    reader_steps.push(read_into(IDENT_OLD, 16, OK));
+    reader_steps.push(value_at("", IDENT_OLD + read_sizes::BYTES_AT as u64, 0));
+    for past in [12, 16, 20, 24, 28] {
+        reader_steps.push(value_at("", IDENT_OLD + past, 0));
+    }
+    // Each structure starts filled with UNWRITTEN, then its `size`.
+    let unwritten = UNWRITTEN.to_le_bytes();
+    let filled: [u8; read_sizes::SIZE as usize] =
+        core::array::from_fn(|i| unwritten.get(i % 4).copied().unwrap_or(0));
+    let structure = |at: u64, size: u32| {
+        reader.write(at, &filled).is_some() && reader.write(at, &size.to_le_bytes()).is_some()
+    };
+    let structures = structure(IDENT_SMALL, read_sizes::SIZE)
+        && structure(IDENT_FIRST, read_sizes::SIZE)
+        && structure(IDENT_SECOND, read_sizes::SIZE)
+        && structure(IDENT_OLD, read_sizes::BASE_SIZE);
+    let ready = structures
+        && a.scratch().is_some()
+        && a.write(LIST, &moved).is_some()
+        && a.script(&a_steps).is_some()
+        && b.scratch().is_some()
+        && b.script(&b_steps).is_some()
+        && reader.scratch().is_some()
+        && reader.script(&reader_steps).is_some();
+    if !ready {
+        return false;
+    }
+    let (Some(a), Some(b), Some(reader)) = (a.finish(), b.finish(), reader.finish()) else {
+        return false;
+    };
+    let started = Process::start_thread(&reader, far, CODE, STACK + PAGE, SCRIPT).is_ok()
+        && Process::start_thread(&b, far, CODE, STACK + PAGE, SCRIPT).is_ok()
+        && Process::start_thread(&a, bsp, CODE, STACK + PAGE, SCRIPT).is_ok();
+    let ended = started
+        && await_end(&a, tsc_hz, 10)
+        && await_end(&b, tsc_hz, 10)
+        && await_end(&reader, tsc_hz, 10);
+    let all_ok = |p: &Process, steps: &[Step]| {
+        let reports = p.reports();
+        p.ending() == Some(Ending::Exited(0))
+            && reports.len()
+                == steps
+                    .iter()
+                    .filter(|s| !matches!(s.want, Want::Nothing))
+                    .count()
+            && steps
+                .iter()
+                .filter(|s| !matches!(s.want, Want::Nothing))
+                .zip(&reports)
+                .all(|(s, &got)| match s.want {
+                    Want::Status(w) => got == w as u64,
+                    _ => true,
+                })
+    };
+    let writers_ok = ended && all_ok(&a, &a_steps) && all_ok(&b, &b_steps);
+    let reports = reader.reports();
+    let identity_at = |at: usize| reported_u64(&reports, at).zip(reported_u64(&reports, at + 2));
+    let (a_is, b_is) = (Some((a.id(), PRINCIPAL_A)), Some((b.id(), PRINCIPAL_B)));
+    // Report positions: each status, then each `report32`, in script order.
+    let statuses_ok = all_ok(&reader, &reader_steps);
+    let too_small = identity_at(2);
+    let first_seen = identity_at(7);
+    let second_seen = identity_at(12);
+    let counted = reports.get(17).copied();
+    let untouched = reports
+        .get(18..23)
+        .is_some_and(|past| past.iter().all(|&w| w == u64::from(UNWRITTEN)));
+    let not_reader = [too_small, first_seen, second_seen].iter().all(|seen| {
+        seen.is_some_and(|(process, principal)| {
+            process != reader.id() && principal != PRINCIPAL_READER
+        })
+    });
+    let names_a = first_seen == a_is;
+    let names_b = second_seen == b_is;
+    let too_small_names_a = too_small == a_is;
+    let identity_right =
+        ended && writers_ok && statuses_ok && names_a && names_b && too_small_names_a && not_reader;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: a message's writer: the message written before its end moved to another process names its writer, process and principal: {names_a}; the one written after names the new writer: {names_b}; a read too small for it names the writer too: {too_small_names_a}; none names the reader: {not_reader}{}",
+        if identity_right { "" } else { ": ipc failed" }
+    );
+    if !identity_right {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: ipc: a message's writer: A is ({:#x}, {PRINCIPAL_A:#x}), B is ({:#x}, {PRINCIPAL_B:#x}); seen {too_small:x?}, {first_seen:x?}, {second_seen:x?}; ended {ended}, writers {writers_ok}, statuses {statuses_ok}",
+            a.id(),
+            b.id()
+        );
+    }
+    let old_right = ended && statuses_ok && counted == Some(THIRD_LEN) && untouched;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: a reader that gives read_sizes' first size, 12: its read -> {}, its counts -> {} bytes, and nothing written past them: {untouched}{}",
+        reports
+            .get(16)
+            .map_or("nothing", |&s| status_name(s as i64)),
+        counted.unwrap_or(0),
+        if old_right { "" } else { ": ipc failed" }
+    );
+    identity_right && old_right
+}
+
+/// Runs the proof of a message's writer (ADR-0005 B1, C1, C2), with a leak check of its own.
+/// Called from the boot flow with every scheduler running, after [`prove_objects`].
+pub(crate) fn prove_identity(
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    bsp: CpuIndex,
+    tsc_hz: u64,
+) -> bool {
+    let before = memory::stats();
+    let ok = writer_identity(com1, cpus, bsp, tsc_hz);
+    let same = || {
+        memory::stats().map(|(h, f)| (h.bytes_in_use, f))
+            == before.map(|(h, f)| (h.bytes_in_use, f))
+    };
+    ipc::reap_closed();
+    sched::yield_until(same, tsc_hz, 2);
+    let back = same();
+    let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: the identity proof's processes and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){}",
         if back { "" } else { ": ipc failed" }
     );
     ok && back

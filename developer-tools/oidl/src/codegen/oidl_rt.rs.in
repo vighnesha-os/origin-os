@@ -203,6 +203,53 @@ pub fn put_field<T: Fixed>(out: &mut [u8], at: usize, value: T) -> Result<(), Wi
     value.write(out.get_mut(at..end).ok_or(WireError::Size)?)
 }
 
+/// Encodes `items` one after another at the start of `out`, each field by field: how a
+/// system-call vector of structs crosses (§10). Returns the bytes written; `Count` if they do
+/// not fit.
+pub fn encode_elements<'o, T: Fixed>(
+    items: &[T],
+    out: &'o mut [u8],
+) -> Result<&'o [u8], WireError> {
+    let len = items.len().checked_mul(T::SIZE).ok_or(WireError::Count)?;
+    let filled = out.get_mut(..len).ok_or(WireError::Count)?;
+    for (index, item) in items.iter().enumerate() {
+        put_field(filled, index.saturating_mul(T::SIZE), *item)?;
+    }
+    Ok(filled)
+}
+
+/// The start of `raw` that holds `capacity` whole elements, or as many as fit: the buffer a
+/// system-call result of structs is written into (§10).
+pub fn element_room<T: Fixed>(raw: &mut [u8], capacity: usize) -> &mut [u8] {
+    let whole = raw
+        .len()
+        .checked_div(T::SIZE)
+        .unwrap_or(0)
+        .min(capacity)
+        .saturating_mul(T::SIZE);
+    let (room, _) = raw.split_at_mut_checked(whole).unwrap_or_default();
+    room
+}
+
+/// Decodes the first `count` elements of `raw` into `out`, each checked at `minor` (§10).
+/// `Count` if `out` or `raw` holds fewer.
+pub fn decode_elements<T: Fixed>(
+    raw: &[u8],
+    out: &mut [T],
+    count: usize,
+    minor: u16,
+) -> Result<(), WireError> {
+    let len = count.checked_mul(T::SIZE).ok_or(WireError::Count)?;
+    if len > raw.len() {
+        return Err(WireError::Count);
+    }
+    let slots = out.get_mut(..count).ok_or(WireError::Count)?;
+    for (index, slot) in slots.iter_mut().enumerate() {
+        *slot = field::<T>(raw, index.saturating_mul(T::SIZE), minor)?;
+    }
+    Ok(())
+}
+
 macro_rules! fixed_int {
     ($($ty:ty),*) => {$(
         impl Fixed for $ty {

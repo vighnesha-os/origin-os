@@ -43,6 +43,18 @@ struct pair {
     y: u8;
 }
 
+/// A frozen structure of an integer, flags and an enumeration, with padding: an element of a
+/// system-call vector or array (ADR-0005 C3).
+@since(2.1)
+struct record {
+    /// A number.
+    a: u32;
+    /// Flags.
+    m: mode;
+    /// An enumeration.
+    k: kind;
+}
+
 /// Lets a process use the privileged calls.
 capability calls.admin;
 
@@ -132,4 +144,24 @@ interface calls {
         /// A number.
         r_num: u64,
     ) errors(fault) requires none;
+
+    /// Structs as vector and array elements, in (ADR-0005 C3).
+    @since(2.1)
+    method records_in = 10 (
+        /// Up to four records.
+        input: vector<record, 4>,
+        /// Exactly two.
+        two: array<record, 2>,
+    ) errors(invalid_args, fault) requires none;
+
+    /// Structs as vector and array elements, out.
+    @since(2.1)
+    method records_out = 11 () -> (
+        /// Filled, with its count in `sizes.n`.
+        @count(sizes.n) output: vector<record, 4>,
+        /// Exactly two.
+        pair_out: array<record, 2>,
+        /// The sizes.
+        sizes: options,
+    ) errors(invalid_args, fault) requires none;
 }

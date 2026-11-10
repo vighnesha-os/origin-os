@@ -131,6 +131,35 @@ fn the_limits_layouts_and_version_are_the_same() {
         generated::ReadSizes::HANDLES_AT,
         origin_abi::read_sizes::HANDLES_AT
     );
+    assert_eq!(
+        generated::ReadSizes::BASE_SIZE,
+        origin_abi::read_sizes::BASE_SIZE
+    );
+    assert_eq!(
+        generated::ReadSizes::SENDER_PROCESS_AT,
+        origin_abi::read_sizes::SENDER_PROCESS_AT
+    );
+    assert_eq!(
+        generated::ReadSizes::SENDER_PRINCIPAL_AT,
+        origin_abi::read_sizes::SENDER_PRINCIPAL_AT
+    );
+    // The record `channel_read` writes for each handle (ADR-0005 B3).
+    assert_eq!(
+        <generated::ReceivedHandle as rt::Fixed>::SIZE,
+        origin_abi::received_handle::SIZE
+    );
+    assert_eq!(
+        generated::ReceivedHandle::HANDLE_AT,
+        origin_abi::received_handle::HANDLE_AT
+    );
+    assert_eq!(
+        generated::ReceivedHandle::OBJECT_TYPE_AT,
+        origin_abi::received_handle::OBJECT_TYPE_AT
+    );
+    assert_eq!(
+        generated::ReceivedHandle::RIGHTS_AT,
+        origin_abi::received_handle::RIGHTS_AT
+    );
     assert_eq!(generated::VERSION, origin_abi::ABI_VERSION);
     assert_eq!(rt::Handle::INVALID.to_abi(), origin_abi::INVALID_HANDLE);
     for raw in 0..=u8::MAX {
@@ -196,7 +225,7 @@ impl Calls for Recorder {
         &self,
         _: rt::HandleArg,
         _: rt::UserBuffer<u8>,
-        _: rt::UserBuffer<rt::Handle>,
+        _: rt::UserBuffer<generated::ReceivedHandle>,
         _: rt::UserRef<generated::ReadSizes>,
     ) -> Result<(), server::ChannelReadError> {
         self.ran.set(true);

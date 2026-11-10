@@ -574,10 +574,11 @@ fn gen_sized_struct(g: &Gen<'_>, t: &mut Text, s: &Struct, lib_version: Version)
         let size = layout::fixed_layout(&field.ty).0;
         let end = u64::from(field.offset).saturating_add(size);
         if is_later(field.since) {
-            t.open(format!("if u64::from(limit) >= {end} {{"));
-            t.open(format!("if let Some(value) = self.{} {{", field.name));
+            t.open(format!(
+                "if u64::from(limit) >= {end} && let Some(value) = self.{} {{",
+                field.name
+            ));
             t.line(format!("rt::put_field(out, {}, value)?;", field.offset));
-            t.shut("}");
             t.shut("}");
         } else {
             t.open(format!("if u64::from(limit) >= {end} {{"));
@@ -1187,6 +1188,16 @@ fn abi_element(ty: &Type) -> String {
     }
 }
 
+/// The size of a struct element of a `syscall` vector or array, which crosses as bytes encoded
+/// field by field (§10, ADR-0005 C3); `None` for an integer or a handle, which crosses as its
+/// in-memory form.
+fn record_size(elem: &Type) -> Option<u64> {
+    match elem {
+        Type::Struct(s) => Some(u64::from(s.size)),
+        _ => None,
+    }
+}
+
 /// One abi-level parameter: `(name, Rust type, conversion to u64 for the stub)`.
 fn abi_params(g: &Gen<'_>, method: &Method) -> Vec<(String, String, &'static str)> {
     let mut out = Vec::new();
@@ -1280,18 +1291,32 @@ fn gen_sys_abi(g: &Gen<'_>, interface: &Interface) -> String {
                 }
                 Type::Array(elem, count) => {
                     let e = abi_element(elem);
-                    args.push(format!("{n}: &[{e}; {count}]"));
+                    match record_size(elem) {
+                        Some(size) => {
+                            let bytes = u64::from(*count).saturating_mul(size);
+                            args.push(format!("{n}: &[u8; {bytes}]"));
+                        }
+                        None => args.push(format!("{n}: &[{e}; {count}]")),
+                    }
                     call.push(format!("{n}.as_ptr()"));
                 }
                 Type::Vector(elem, _) => {
                     let e = abi_element(elem);
-                    let t = match elem.as_ref() {
-                        Type::Handle(_) => "rt::Handle".to_string(),
-                        _ => e.clone(),
-                    };
-                    args.push(format!("{n}: &[{t}]"));
-                    call.push(format!("{n}.as_ptr().cast::<{e}>()"));
-                    call.push(format!("{n}.len() as u64"));
+                    if let Some(size) = record_size(elem) {
+                        // Encoded records: the count is in elements, never more than the
+                        // bytes passed hold.
+                        args.push(format!("{n}: &[u8]"));
+                        call.push(format!("{n}.as_ptr()"));
+                        call.push(format!("{n}.len().checked_div({size}).unwrap_or(0) as u64"));
+                    } else {
+                        let t = match elem.as_ref() {
+                            Type::Handle(_) => "rt::Handle".to_string(),
+                            _ => e.clone(),
+                        };
+                        args.push(format!("{n}: &[{t}]"));
+                        call.push(format!("{n}.as_ptr().cast::<{e}>()"));
+                        call.push(format!("{n}.len() as u64"));
+                    }
                 }
                 Type::String(_) => {
                     args.push(format!("{n}: &str"));
@@ -1313,22 +1338,36 @@ fn gen_sys_abi(g: &Gen<'_>, interface: &Interface) -> String {
                 }
                 Type::Array(elem, count) => {
                     let e = abi_element(elem);
-                    let t = match elem.as_ref() {
-                        Type::Handle(_) => "rt::Handle".to_string(),
-                        _ => e.clone(),
-                    };
-                    args.push(format!("{n}: &mut [{t}; {count}]"));
-                    call.push(format!("{n}.as_mut_ptr().cast::<{e}>()"));
+                    if let Some(size) = record_size(elem) {
+                        let bytes = u64::from(*count).saturating_mul(size);
+                        args.push(format!("{n}: &mut [u8; {bytes}]"));
+                        call.push(format!("{n}.as_mut_ptr()"));
+                    } else {
+                        let t = match elem.as_ref() {
+                            Type::Handle(_) => "rt::Handle".to_string(),
+                            _ => e.clone(),
+                        };
+                        args.push(format!("{n}: &mut [{t}; {count}]"));
+                        call.push(format!("{n}.as_mut_ptr().cast::<{e}>()"));
+                    }
                 }
                 Type::Vector(elem, _) => {
                     let e = abi_element(elem);
-                    let t = match elem.as_ref() {
-                        Type::Handle(_) => "rt::Handle".to_string(),
-                        _ => e.clone(),
-                    };
-                    args.push(format!("{n}: &mut [{t}]"));
-                    call.push(format!("{n}.as_mut_ptr().cast::<{e}>()"));
-                    call.push(format!("{n}.len() as u64"));
+                    if let Some(size) = record_size(elem) {
+                        // Room for encoded records: the capacity is in elements, never more
+                        // than the bytes passed hold.
+                        args.push(format!("{n}: &mut [u8]"));
+                        call.push(format!("{n}.as_mut_ptr()"));
+                        call.push(format!("{n}.len().checked_div({size}).unwrap_or(0) as u64"));
+                    } else {
+                        let t = match elem.as_ref() {
+                            Type::Handle(_) => "rt::Handle".to_string(),
+                            _ => e.clone(),
+                        };
+                        args.push(format!("{n}: &mut [{t}]"));
+                        call.push(format!("{n}.as_mut_ptr().cast::<{e}>()"));
+                        call.push(format!("{n}.len() as u64"));
+                    }
                 }
                 Type::String(_) => {
                     args.push(format!("{n}: &mut [u8]"));
@@ -1511,6 +1550,31 @@ fn gen_sys_client_method(g: &Gen<'_>, t: &mut Text, method: &Method) {
             }
         }
     }
+    // Encode vectors and arrays of structs, element by element (C3).
+    for param in &method.params {
+        let name = &param.name;
+        match &param.ty {
+            Type::Vector(elem, bound) => {
+                if let Some(size) = record_size(elem) {
+                    let bytes = u64::from(*bound).saturating_mul(size);
+                    t.line(format!("let mut oidl_buf_{name} = [0u8; {bytes}];"));
+                    t.line(format!(
+                        "let oidl_wire_{name} = rt::encode_elements({name}, &mut oidl_buf_{name}).map_err(rt::CallError::Protocol)?;"
+                    ));
+                }
+            }
+            Type::Array(elem, count) => {
+                if let Some(size) = record_size(elem) {
+                    let bytes = u64::from(*count).saturating_mul(size);
+                    t.line(format!("let mut oidl_buf_{name} = [0u8; {bytes}];"));
+                    t.line(format!(
+                        "rt::Fixed::write(*{name}, &mut oidl_buf_{name}).map_err(rt::CallError::Protocol)?;"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
     // Result storage.
     for result in &returned {
         match &result.ty {
@@ -1533,14 +1597,29 @@ fn gen_sys_client_method(g: &Gen<'_>, t: &mut Text, method: &Method) {
                     result.name
                 ));
             }
-            Type::Array(elem, count) => match elem.as_ref() {
-                Type::Handle(_) => t.line(format!(
+            Type::Array(elem, count) => match (elem.as_ref(), record_size(elem)) {
+                (Type::Handle(_), _) => t.line(format!(
                     "let mut oidl_{} = [rt::Handle::INVALID; {count}];",
                     result.name
                 )),
+                (_, Some(size)) => {
+                    let bytes = u64::from(*count).saturating_mul(size);
+                    t.line(format!("let mut oidl_{} = [0u8; {bytes}];", result.name));
+                }
                 _ => t.line(format!("let mut oidl_{} = [0; {count}];", result.name)),
             },
-            Type::Vector(..) | Type::String(_) => {}
+            Type::Vector(elem, bound) => {
+                // Structs arrive encoded, into room here, and are decoded into the caller's
+                // slice after the call.
+                if let Some(size) = record_size(elem) {
+                    let bytes = u64::from(*bound).saturating_mul(size);
+                    t.line(format!(
+                        "let mut oidl_raw_{} = [0u8; {bytes}];",
+                        result.name
+                    ));
+                }
+            }
+            Type::String(_) => {}
             Type::Bool => t.line(format!("let mut oidl_{}: u8 = 0;", result.name)),
             Type::Int(_) | Type::Enum(_) | Type::Bits(_) => {
                 t.line(format!(
@@ -1557,6 +1636,11 @@ fn gen_sys_client_method(g: &Gen<'_>, t: &mut Text, method: &Method) {
     }
     for result in &returned {
         call.push(match &result.ty {
+            Type::Vector(elem, _) if record_size(elem).is_some() => format!(
+                "rt::element_room::<{}>(&mut oidl_raw_{name}, {name}.len())",
+                g.fixed(3, elem),
+                name = result.name
+            ),
             Type::Vector(..) | Type::String(_) => format!("&mut *{}", result.name),
             _ => format!("&mut oidl_{}", result.name),
         });
@@ -1614,6 +1698,21 @@ fn gen_sys_client_method(g: &Gen<'_>, t: &mut Text, method: &Method) {
             ));
         }
     }
+    // Then structs that arrived encoded go into the caller's slice, each one checked.
+    for result in &returned {
+        if let Type::Vector(elem, bound) = &result.ty
+            && record_size(elem).is_some()
+        {
+            let name = &result.name;
+            t.line(format!(
+                "let oidl_{name}_count = {}.min({name}.len()).min({bound});",
+                result_count(result)
+            ));
+            t.line(format!(
+                "rt::decode_elements(&oidl_raw_{name}, {name}, oidl_{name}_count, u16::MAX).map_err(rt::CallError::Protocol)?;"
+            ));
+        }
+    }
     match returned.as_slice() {
         [] => t.line("Ok(())"),
         [single] if !matches!(single.ty, Type::Vector(..) | Type::String(_)) => {
@@ -1633,8 +1732,20 @@ fn gen_sys_client_method(g: &Gen<'_>, t: &mut Text, method: &Method) {
     t.blank();
 }
 
+/// The count a `vector` or `string` result reports through its `@count` field.
+fn result_count(r: &Param) -> String {
+    match &r.count {
+        Some((result, field)) => {
+            format!("usize::try_from(oidl_{result}_decoded.{field}).unwrap_or(usize::MAX)")
+        }
+        None => "0".to_string(),
+    }
+}
+
 fn sys_client_value(p: &Param) -> String {
     match &p.ty {
+        Type::Vector(elem, _) if record_size(elem).is_some() => format!("oidl_wire_{}", p.name),
+        Type::Array(elem, _) if record_size(elem).is_some() => format!("&oidl_buf_{}", p.name),
         Type::Handle(h) => {
             if h.optional {
                 format!("{}.map_or(0, |h| h.to_abi())", p.name)
@@ -1695,6 +1806,10 @@ fn sys_client_result_value(g: &Gen<'_>, r: &Param, checked: bool) -> String {
                 format!("<{path} as rt::Fixed>::read(&{local}.0, u16::MAX)")
             }
         }
+        Type::Array(elem, count) if record_size(elem).is_some() => finish(format!(
+            "<[{}; {count}] as rt::Fixed>::read(&{local}, u16::MAX)",
+            g.fixed(3, elem)
+        )),
         Type::Array(..) => {
             if checked {
                 local
@@ -1702,14 +1817,9 @@ fn sys_client_result_value(g: &Gen<'_>, r: &Param, checked: bool) -> String {
                 format!("Ok::<_, rt::WireError>({local})")
             }
         }
+        Type::Vector(elem, _) if record_size(elem).is_some() => format!("oidl_{}_count", r.name),
         Type::Vector(..) | Type::String(_) => {
-            let count = match &r.count {
-                Some((result, field)) => {
-                    format!("usize::try_from(oidl_{result}_decoded.{field}).unwrap_or(usize::MAX)")
-                }
-                None => "0".to_string(),
-            };
-            format!("{count}.min({name}.len())", name = r.name)
+            format!("{}.min({name}.len())", result_count(r), name = r.name)
         }
         Type::Bool => finish(format!(
             "rt::decode_bool({local}).ok_or(rt::WireError::Bool)"

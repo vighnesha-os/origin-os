@@ -860,11 +860,34 @@ fn contains_status(ty: &Type) -> bool {
     }
 }
 
-/// A `syscall` array or vector crosses as its in-memory form, so its elements are limited to
-/// what has one in both languages: integers and handles. A struct element would need the
-/// compiler's layout (§42); such an interface uses a pointer to a struct instead.
+/// What a `syscall` array or vector may hold (§3.1). Integers and handles cross as their
+/// in-memory form. A plain struct of integers, enums and bits crosses as its fields, encoded one
+/// by one and never in the compiler's layout (ADR-0005 C3); nothing else in it would have one
+/// form in both languages.
 fn syscall_element_ok(elem: &Type) -> bool {
-    matches!(elem, Type::Int(_)) || matches!(elem, Type::Handle(h) if !h.optional)
+    match elem {
+        Type::Int(_) => true,
+        Type::Handle(h) => !h.optional,
+        Type::Struct(s) => {
+            !s.sized
+                && s.fields
+                    .iter()
+                    .all(|f| matches!(f.ty, Type::Int(_) | Type::Enum(_) | Type::Bits(_)))
+        }
+        _ => false,
+    }
+}
+
+/// The bytes a `syscall` vector of structs takes at its bound: the client encodes it into a
+/// buffer of that size, so it is held to the 64 KiB an array may have.
+fn syscall_records_too_large(ty: &Type) -> bool {
+    match ty {
+        Type::Vector(elem, bound) => match elem.as_ref() {
+            Type::Struct(s) => u64::from(s.size).saturating_mul(u64::from(*bound)) > MAX_FIXED,
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn check_param_position(
@@ -874,6 +897,14 @@ fn check_param_position(
     is_result: bool,
 ) -> Result<(), Diagnostic> {
     let syscall = scope.transport == Transport::Syscall;
+    if syscall && syscall_records_too_large(ty) {
+        return fail(
+            scope.file,
+            pos,
+            Code::TooLarge,
+            "a system-call vector of structs is too large",
+        );
+    }
     let ok = !contains_status(ty)
         && match ty {
             Type::Struct(s) if s.sized => syscall,

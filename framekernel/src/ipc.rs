@@ -30,7 +30,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use crate::channel::{Channel, Message, QUEUE_BYTES, QUEUE_DEPTH, ReadError, other};
+use crate::channel::{Channel, Identity, Message, QUEUE_BYTES, QUEUE_DEPTH, ReadError, other};
 use crate::handles::{HandleTable, Need, Typed};
 use crate::heap::{MAX_BLOCK, MIN_BLOCK, PAGE};
 use origin_abi::{Error, Handle, ObjectType};
@@ -397,10 +397,16 @@ fn inside(
 
 /// `channel_write`: queues `bytes` and moves the handles in `transfer` out of `table`, or
 /// does nothing and says why. `need` is what the end must meet, and `transfer_need` what each
-/// listed handle must.
+/// listed handle must. The message carries `sender`, the writing process's identity, which
+/// the caller takes from that process and never from what the writer passed (ADR-0005 B1).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one fact the write needs"
+)]
 pub(crate) fn channel_write(
     table: &SpinLock<HandleTable<Object>>,
     account: &ObjectRef<Account>,
+    sender: Identity,
     handle: Handle,
     need: Need,
     bytes: Vec<u8>,
@@ -458,6 +464,7 @@ pub(crate) fn channel_write(
         let message = Message {
             bytes,
             handles: moved,
+            sender,
         };
         // Beside the message, in step with the queue; its storage was taken at creation.
         if let Some(list) = channel.charges.lock().get_mut(reader) {
@@ -488,21 +495,37 @@ pub(crate) fn channel_write(
     Ok(())
 }
 
+/// A handle `channel_read` put in the reader's table, with what the table holds for it: the
+/// record the reader receives (ADR-0005 B3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Received {
+    /// Its value in the reader's table.
+    pub(crate) handle: Handle,
+    /// The type of the object it names.
+    pub(crate) object_type: u32,
+    /// Its rights there: the ones it had in the message.
+    pub(crate) rights: u32,
+}
+
 /// What a `channel_read` found.
 pub(crate) enum Read {
-    /// A message, now out of the queue, with the values of its handles in the reader's table.
+    /// A message, now out of the queue, with its handles in the reader's table.
     Message {
         /// The payload.
         bytes: Vec<u8>,
-        /// The handles' new values.
-        handles: Vec<Handle>,
+        /// The handles, as the reader's table now holds them.
+        handles: Vec<Received>,
+        /// Who wrote it (B1).
+        sender: Identity,
     },
-    /// The next message does not fit; it stays queued. Its sizes.
+    /// The next message does not fit; it stays queued. Its sizes and its writer.
     TooSmall {
         /// Bytes of the message.
         bytes: usize,
         /// Handles with it.
         handles: usize,
+        /// Who wrote it.
+        sender: Identity,
     },
 }
 
@@ -519,10 +542,16 @@ pub(crate) fn channel_read(
         let mut table = table.lock();
         let (channel, side) = channel_of(&table, handle, need)?;
         let mut state = channel.state.lock();
-        let (bytes, handles) = state.peek(side)?;
+        let next = state.peek(side)?;
+        let (bytes, handles, sender) = (next.bytes.len(), next.handles.len(), next.sender);
         if bytes > byte_capacity || handles > handle_capacity {
             drop(state);
-            return Ok((None, Read::TooSmall { bytes, handles }, None));
+            let too_small = Read::TooSmall {
+                bytes,
+                handles,
+                sender,
+            };
+            return Ok((None, too_small, None));
         }
         // Room for its handles first: if the table is full, or memory is out, the message
         // stays queued.
@@ -551,8 +580,13 @@ pub(crate) fn channel_read(
             {
                 *holder.lock() = None;
             }
+            let object_type = object.object_type();
             match table.insert(object, entry_rights) {
-                Ok(h) => values.push(h),
+                Ok(handle) => values.push(Received {
+                    handle,
+                    object_type,
+                    rights: entry_rights,
+                }),
                 // `reserve` above makes this unreachable. Were it reached, nothing may
                 // close here, under the table lock: the objects are leaked instead.
                 Err((e, object)) => {
@@ -565,6 +599,7 @@ pub(crate) fn channel_read(
         let read = Read::Message {
             bytes: message.bytes,
             handles: values,
+            sender: message.sender,
         };
         Ok::<_, Error>((Some((channel, other(side))), read, charge))
     })?;

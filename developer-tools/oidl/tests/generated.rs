@@ -420,10 +420,15 @@ fn the_c_headers_compile_under_every_standard_from_the_oldest_to_the_newest() {
     }
     // The compilers check the layout assertions; pin one, so a removed assertion is noticed.
     let kernel = &tree.files["c/origin/kernel.h"];
-    assert!(kernel.contains("ORIGIN_OIDL_ASSERT(sizeof(origin_kernel_read_sizes_t) == 12"));
+    assert!(kernel.contains("ORIGIN_OIDL_ASSERT(sizeof(origin_kernel_read_sizes_t) == 32"));
+    assert!(kernel.contains(
+        "ORIGIN_OIDL_ASSERT(offsetof(origin_kernel_read_sizes_t, sender_principal) == 24"
+    ));
     assert!(
         kernel.contains("ORIGIN_OIDL_ASSERT(offsetof(origin_kernel_read_sizes_t, handles) == 8")
     );
+    // channel_read's handles are records, which C passes as the generated struct (ADR-0005 B3).
+    assert!(kernel.contains("origin_kernel_received_handle_t *handles, uint64_t handles_capacity"));
     // Booleans cross the C ABI as bytes (CLAUDE.md §10).
     let echo = &tree.files["c/origin/fixture/calls.h"];
     assert!(echo.contains("uint8_t e"), "{echo}");
@@ -912,7 +917,9 @@ fn map_of(output: &str) -> BTreeMap<String, String> {
 
 #[test]
 fn the_generated_values_equal_the_hand_written_abi() {
-    use origin_abi::{Error, OK, ObjectType, limits, read_sizes, rights, signals, syscall};
+    use origin_abi::{
+        Error, OK, ObjectType, limits, read_sizes, received_handle, rights, signals, syscall,
+    };
     let tree = tree();
     let out = run_program(
         &tree.dir,
@@ -1007,6 +1014,34 @@ fn the_generated_values_equal_the_hand_written_abi() {
     assert_eq!(
         map["read_sizes HANDLES_AT"],
         read_sizes::HANDLES_AT.to_string()
+    );
+    assert_eq!(
+        map["read_sizes BASE_SIZE"],
+        read_sizes::BASE_SIZE.to_string()
+    );
+    assert_eq!(
+        map["read_sizes SENDER_PROCESS_AT"],
+        read_sizes::SENDER_PROCESS_AT.to_string()
+    );
+    assert_eq!(
+        map["read_sizes SENDER_PRINCIPAL_AT"],
+        read_sizes::SENDER_PRINCIPAL_AT.to_string()
+    );
+    assert_eq!(
+        map["received_handle SIZE"],
+        received_handle::SIZE.to_string()
+    );
+    assert_eq!(
+        map["received_handle HANDLE_AT"],
+        received_handle::HANDLE_AT.to_string()
+    );
+    assert_eq!(
+        map["received_handle OBJECT_TYPE_AT"],
+        received_handle::OBJECT_TYPE_AT.to_string()
+    );
+    assert_eq!(
+        map["received_handle RIGHTS_AT"],
+        received_handle::RIGHTS_AT.to_string()
     );
     assert_eq!(
         map["handle INVALID"],

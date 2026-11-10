@@ -60,9 +60,9 @@ It does not reset. Nothing yet records a boot attempt (§20), so a reset would o
 
 Before the halt line the kernel prints what its proofs found, on every console, because a real machine's operator has no `xtask` and the individual lines scroll away:
 
-- `origin-kernel: boot verdict: 51 of 51 proofs passed`
-- `origin-kernel: boot verdict: degraded: 48 of 51 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042`
-- `origin-kernel: boot verdict: degraded: 33 of 33 proofs passed; 18 did not run`
+- `origin-kernel: boot verdict: 54 of 54 proofs passed`
+- `origin-kernel: boot verdict: degraded: 51 of 54 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042`
+- `origin-kernel: boot verdict: degraded: 33 of 33 proofs passed; 21 did not run`
 
 It claims only what was recorded. "Passed" means the proof found nothing wrong: a proof that finds the hardware it needs absent says so on its own line and counts as passed, the proofs' existing convention (no HPET, no NVMe controller, no 8042). "Did not run" counts proofs a failure prevented, and is what "degraded" means there. The virtio-net proof is the one proof it does not cover (see Migration).
 
@@ -108,6 +108,7 @@ It claims only what was recorded. "Passed" means the proof found nothing wrong: 
 | Process and thread objects (`ipc_proof::prove_objects`) | A handle of the wrong type or with too few rights was accepted, a process's memory outlived its last thread, `TERMINATED` came before the memory went or did not come, a process ID was reused, or a wait on a process handle was not cancelled. This one result also covers a leak check | No: a failure is a wrong status or a count, and every wait in it has a deadline far above any load seen | Ring 3 |
 | Kernel half fixed at boot (`aspace::prove_kernel_half`) | A process's top-level entries are not the ones the kernel fixed at boot, or a kernel mapping made after the process was created is missing from it: kernel code that reaches such a mapping from that process faults, with the kernel's own tables correct | No: 256 table entries compared and one read, with no timing | Ring 3, and every kernel mapping made after boot |
 | Live address spaces (`aspace::prove`) | A thread kept using a page after its unmap returned, or a frame was reused while a processor could still reach it, a permission stayed in force after it was withdrawn, a frame shared by two spaces was freed while one still mapped it, or a shootdown interrupted a processor that does not have the space loaded. This one result also covers a leak check | No: a fault, a report or a count, and every wait has a five-second budget far above any load seen | Everything that maps memory in a running process |
+| A message's writer (`ipc_proof::prove_identity`, added by task S3-2) | A message named someone other than the process that wrote it, a read too small for its message did not name the writer, or the kernel wrote past the `size` a reader gave: a service would apply its per-user policy and audit to the wrong process (ADR-0005 B1, C1, C2). This one result also covers a leak check | No: a failure is a wrong value in a fixed order of calls, and every wait in it is for a message another process is certain to write | Ring 3 services (ADR-0011 N9, step 4) |
 
 Apart from the SMEP proof's stale translation above (Intel, fixed on the CI branch), none of the Refuse proofs has failed on a real processor in the runs read: 59 complete boots on AMD EPYC processors through KVM (research ledger §3). AMD only, and virtual machines, so this is the strongest evidence the project has rather than proof.
 

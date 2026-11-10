@@ -14,7 +14,7 @@
 use super::super::oidl_rt as rt;
 
 /// This library's version: `(major, minor)` (§9).
-pub const VERSION: (u16, u16) = (0, 1);
+pub const VERSION: (u16, u16) = (0, 2);
 
 /// The rights of a new channel end: everything that applies to a channel (ADR-0005 P2, P8,
 /// amendment A1).
@@ -336,28 +336,40 @@ impl rt::Fixed for Signals {
     }
 }
 
-/// What channel_read reports (ADR-0005 P4, amendment A4).
+/// What channel_read reports (ADR-0005 P4, amendment A4): the next message's sizes and, from
+/// minor 2, who wrote it (B1, C1, C2). A caller whose size predates a field gets nothing in its
+/// place, and no error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadSizes {
     /// The message's byte count.
     pub bytes: u32,
     /// The message's handle count.
     pub handles: u32,
+    /// The writer's process ID, stamped by the kernel when the message was written: unique for
+    /// the boot and never reused. It names the process and grants nothing.
+    pub sender_process: Option<u64>,
+    /// The writer's principal, stamped with it: opaque, set when the writer's process was
+    /// created.
+    pub sender_principal: Option<u64>,
 }
 
 impl ReadSizes {
     /// Bytes of the newest version of this structure.
-    pub const SIZE: u32 = 12;
+    pub const SIZE: u32 = 32;
     /// Bytes of the oldest version.
     pub const BASE_SIZE: u32 = 12;
     /// The size of each version, ascending.
-    pub const SIZES: [u32; 1] = [12];
+    pub const SIZES: [u32; 2] = [12, 32];
     /// Byte offset of `size`.
     pub const SIZE_AT: usize = 0;
     /// Byte offset of `bytes`.
     pub const BYTES_AT: usize = 4;
     /// Byte offset of `handles`.
     pub const HANDLES_AT: usize = 8;
+    /// Byte offset of `sender_process`.
+    pub const SENDER_PROCESS_AT: usize = 16;
+    /// Byte offset of `sender_principal`.
+    pub const SENDER_PRINCIPAL_AT: usize = 24;
 
     /// Whether the caller's `size` is valid for this structure as a parameter (§5.3).
     pub fn accepts_param_size(size: u32) -> bool {
@@ -382,7 +394,10 @@ impl ReadSizes {
         }
         let bytes: u32 = rt::field(oidl_bytes, 4, oidl_minor)?;
         let handles: u32 = rt::field(oidl_bytes, 8, oidl_minor)?;
-        Ok(Self { bytes, handles })
+        if oidl_size >= 32 { rt::check_zero(oidl_bytes, 12, 4)?; }
+        let sender_process = if oidl_size >= 32 { Some(rt::field::<u64>(oidl_bytes, 16, oidl_minor)?) } else { None };
+        let sender_principal = if oidl_size >= 32 { Some(rt::field::<u64>(oidl_bytes, 24, oidl_minor)?) } else { None };
+        Ok(Self { bytes, handles, sender_process, sender_principal })
     }
 
     /// Writes the fields that fit in `limit` bytes into `out`, leaving `size` alone.
@@ -390,12 +405,70 @@ impl ReadSizes {
         if out.len() < usize::try_from(Self::SIZE).unwrap_or(usize::MAX) {
             return Err(rt::WireError::Size);
         }
+        if u64::from(limit) >= 16 {
+            rt::zero_fill(out, 12, 4)?;
+        }
         if u64::from(limit) >= 8 {
             rt::put_field(out, 4, self.bytes)?;
         }
         if u64::from(limit) >= 12 {
             rt::put_field(out, 8, self.handles)?;
         }
+        if u64::from(limit) >= 24 && let Some(value) = self.sender_process {
+            rt::put_field(out, 16, value)?;
+        }
+        if u64::from(limit) >= 32 && let Some(value) = self.sender_principal {
+            rt::put_field(out, 24, value)?;
+        }
+        Ok(())
+    }
+}
+
+/// A handle channel_read moved into the caller's table: its value there, what it names and the
+/// rights it has, so a receiver can check both before using it (ADR-0005 B3, C3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceivedHandle {
+    /// Its value in the caller's table.
+    pub handle: u32,
+    /// The type of the object it names.
+    pub object_type: ObjectType,
+    /// Its rights in the caller's table.
+    pub rights: Rights,
+}
+
+impl ReceivedHandle {
+    /// Byte offset of `handle`.
+    pub const HANDLE_AT: usize = 0;
+    /// Byte offset of `object_type`.
+    pub const OBJECT_TYPE_AT: usize = 4;
+    /// Byte offset of `rights`.
+    pub const RIGHTS_AT: usize = 8;
+}
+
+impl rt::Fixed for ReceivedHandle {
+    const SIZE: usize = 12;
+    const FILLER: Self = Self {
+        handle: <u32 as rt::Fixed>::FILLER,
+        object_type: <ObjectType as rt::Fixed>::FILLER,
+        rights: <Rights as rt::Fixed>::FILLER,
+    };
+    fn read(oidl_bytes: &[u8], oidl_minor: u16) -> Result<Self, rt::WireError> {
+        if oidl_bytes.len() != Self::SIZE {
+            return Err(rt::WireError::Size);
+        }
+        let handle: u32 = rt::field(oidl_bytes, 0, oidl_minor)?;
+        let object_type: ObjectType = rt::field(oidl_bytes, 4, oidl_minor)?;
+        let rights: Rights = rt::field(oidl_bytes, 8, oidl_minor)?;
+        Ok(Self { handle, object_type, rights })
+    }
+    fn write(self, out: &mut [u8]) -> Result<(), rt::WireError> {
+        if out.len() != Self::SIZE {
+            return Err(rt::WireError::Size);
+        }
+        out.fill(0);
+        rt::put_field(out, 0, self.handle)?;
+        rt::put_field(out, 4, self.object_type)?;
+        rt::put_field(out, 8, self.rights)?;
         Ok(())
     }
 }

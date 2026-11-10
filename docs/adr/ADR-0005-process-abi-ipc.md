@@ -100,7 +100,7 @@ The implementation records each decision's consequences in `docs/engineering/SOU
 
 ## Amendment 2 (Accepted, 2026-11-09): caller identity and per-call pinning
 
-**Status: Accepted by the owner on 2026-11-09, through ADR-0011 questions 5 and 6 (CLAUDE.md §84). Neither item is built.** The ADR's accepted text is otherwise unchanged.
+**Status: Accepted by the owner on 2026-11-09, through ADR-0011 questions 5 and 6 (CLAUDE.md §84). B1 is built (task S3-2, 2026-11-10, as C1 and C2 decide); B2 is not.** The ADR's accepted text is otherwise unchanged.
 
 | # | Decision | What it changes |
 |---|---|---|
@@ -109,7 +109,7 @@ The implementation records each decision's consequences in `docs/engineering/SOU
 
 ## Amendment 3 (Accepted, 2026-11-09): what `channel_read` reports about handles
 
-**Status: Accepted by the owner on 2026-11-09, through `docs/spec/OIDL.md` question Q8 (CLAUDE.md §84). Not built.** The ADR's accepted text and Amendment 1's A4 are otherwise unchanged.
+**Status: Accepted by the owner on 2026-11-09, through `docs/spec/OIDL.md` question Q8 (CLAUDE.md §84). Built by task S3-2 (2026-11-10), through C3.** The ADR's accepted text and Amendment 1's A4 are otherwise unchanged.
 
 | # | Decision | What it changes |
 |---|---|---|
@@ -117,7 +117,7 @@ The implementation records each decision's consequences in `docs/engineering/SOU
 
 ## Amendment 4 (Accepted, 2026-11-09): what ADR-0011 N14 step 3 needs
 
-**Status: Accepted by the owner on 2026-11-09, all thirteen items with the recommended answer (decision sheet items 56–68; CLAUDE.md §84). Not built.** The scoping is `docs/research/2026-11-09-n14-step3-scope.md`. The ADR's accepted text and Amendments 1–3 are otherwise unchanged; where an item below refines a P decision, the item governs.
+**Status: Accepted by the owner on 2026-11-09, all thirteen items with the recommended answer (decision sheet items 56–68; CLAUDE.md §84). C1, C2 and C3 are built (task S3-2, 2026-11-10, with B1 and B3); the other ten are not.** The scoping is `docs/research/2026-11-09-n14-step3-scope.md`. The ADR's accepted text and Amendments 1–3 are otherwise unchanged; where an item below refines a P decision, the item governs.
 
 | # | Decision | Refines |
 |---|---|---|

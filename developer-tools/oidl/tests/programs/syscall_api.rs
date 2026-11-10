@@ -16,12 +16,19 @@ use oidl_generated::origin_kernel::kernel::server as ks;
 #[derive(Debug, Default, Clone)]
 struct Log {
     calls: Vec<String>,
-    /// What the next channel_read should do: (message bytes, handles).
-    next_read: Option<(Vec<u8>, Vec<u32>)>,
+    /// What the next channel_read should do: the message's bytes, and a record of each handle
+    /// (its value, object type and rights).
+    next_read: Option<(Vec<u8>, Vec<(u32, u32, u32)>)>,
+    /// The writer the next channel_read reports: (process, principal).
+    sender: (u64, u64),
     /// What the next wait_one should report: (status, observed).
     next_wait: (i64, u32),
     /// The status the next call should return.
     status: i64,
+    /// What the last `records_in` passed: its count, the records' bytes and the array's bytes.
+    records_in: Option<(u64, Vec<u8>, Vec<u8>)>,
+    /// What the next `records_out` writes: the records' bytes, `n` and the array's bytes.
+    next_records: Option<(Vec<u8>, u32, Vec<u8>)>,
 }
 
 static MOCK: Mutex<Option<Log>> = Mutex::new(None);
@@ -105,7 +112,7 @@ pub unsafe extern "C" fn origin_kernel_channel_read(
     end: u32,
     bytes: *mut u8,
     bytes_capacity: u64,
-    handles: *mut u32,
+    handles: *mut u8,
     handles_capacity: u64,
     sizes: *mut u8,
 ) -> i64 {
@@ -117,18 +124,26 @@ pub unsafe extern "C" fn origin_kernel_channel_read(
         let Some((message, list)) = m.next_read.clone() else {
             return k::Error::ShouldWait.raw();
         };
+        // The counts and the writer, also when the buffers are too small (ADR-0005 C2).
+        let (process, principal) = m.sender;
+        unsafe {
+            (sizes.add(4) as *mut u32).write_unaligned(message.len() as u32);
+            (sizes.add(8) as *mut u32).write_unaligned(list.len() as u32);
+            (sizes.add(k::ReadSizes::SENDER_PROCESS_AT) as *mut u64).write_unaligned(process);
+            (sizes.add(k::ReadSizes::SENDER_PRINCIPAL_AT) as *mut u64).write_unaligned(principal);
+        }
         if message.len() > bytes_capacity as usize || list.len() > handles_capacity as usize {
-            unsafe {
-                (sizes.add(4) as *mut u32).write_unaligned(message.len() as u32);
-                (sizes.add(8) as *mut u32).write_unaligned(list.len() as u32);
-            }
             return k::Error::BufferTooSmall.raw();
         }
         unsafe {
             core::ptr::copy_nonoverlapping(message.as_ptr(), bytes, message.len());
-            core::ptr::copy_nonoverlapping(list.as_ptr(), handles, list.len());
-            (sizes.add(4) as *mut u32).write_unaligned(message.len() as u32);
-            (sizes.add(8) as *mut u32).write_unaligned(list.len() as u32);
+            // A record per handle: three little-endian u32s (ADR-0005 B3).
+            for (index, (value, object, rights)) in list.iter().enumerate() {
+                let record = handles.add(index * 12);
+                (record as *mut u32).write_unaligned(*value);
+                (record.add(4) as *mut u32).write_unaligned(*object);
+                (record.add(8) as *mut u32).write_unaligned(*rights);
+            }
         }
         0
     })
@@ -156,6 +171,102 @@ pub extern "C" fn origin_kernel_object_signal(_o: u32, _clear: u32, _set: u32) -
     k::Error::NotSupported.raw()
 }
 
+// The fixture's entry points. Only the records calls run here; the others exist for the link.
+#[unsafe(no_mangle)]
+pub extern "C" fn origin_fixture_calls_scalars(_a: u8, _b: i16, _c: u32, _d: i64, _e: u8, _f: i32) -> i64 {
+    unreachable!()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn origin_fixture_calls_modes(_g: u16, _h: u64, _n: u64) -> i64 {
+    unreachable!()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn origin_fixture_calls_buffers(
+    _text: *const u8,
+    _text_count: u64,
+    _data: *const u32,
+    _data_count: u64,
+    _opt: u32,
+    _p: *const u8,
+) -> i64 {
+    unreachable!()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn origin_fixture_calls_struct_io(
+    _input: *const u8,
+    _output: *mut u8,
+    _buffer: *mut u8,
+    _buffer_capacity: u64,
+) -> i64 {
+    unreachable!()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn origin_fixture_calls_gated() -> i64 {
+    unreachable!()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn origin_fixture_calls_rights(_h: u32) -> i64 {
+    unreachable!()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn origin_fixture_calls_newer(_x: u64) -> i64 {
+    unreachable!()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn origin_fixture_calls_unimplemented() -> i64 {
+    unreachable!()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn origin_fixture_calls_results(
+    _r_bool: *mut u8,
+    _r_kind: *mut i32,
+    _r_mode: *mut u16,
+    _r_handle: *mut u32,
+    _r_opt: *mut u32,
+    _r_num: *mut u64,
+) -> i64 {
+    unreachable!()
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn origin_fixture_calls_records_in(
+    input: *const u8,
+    input_count: u64,
+    two: *const u8,
+) -> i64 {
+    let size = <f::Record as rt::Fixed>::SIZE;
+    let records = unsafe { core::slice::from_raw_parts(input, input_count as usize * size) }.to_vec();
+    let pair = unsafe { core::slice::from_raw_parts(two, 2 * size) }.to_vec();
+    with(|m| {
+        m.calls.push(format!("records_in {input_count}"));
+        m.records_in = Some((input_count, records, pair));
+        m.status
+    })
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn origin_fixture_calls_records_out(
+    output: *mut u8,
+    output_capacity: u64,
+    pair_out: *mut u8,
+    sizes: *mut u8,
+) -> i64 {
+    with(|m| {
+        m.calls.push(format!("records_out {output_capacity}"));
+        let Some((records, n, pair)) = m.next_records.clone() else {
+            return k::Error::NotSupported.raw();
+        };
+        // Never more than the capacity the client passed.
+        let room = output_capacity as usize * <f::Record as rt::Fixed>::SIZE;
+        let written = records.len().min(room);
+        unsafe {
+            assert_eq!((sizes as *const u32).read_unaligned(), f::Options::SIZE, "the client sets size");
+            core::ptr::copy_nonoverlapping(records.as_ptr(), output, written);
+            core::ptr::copy_nonoverlapping(pair.as_ptr(), pair_out, pair.len());
+            (sizes.add(f::Options::N_AT) as *mut u32).write_unaligned(n);
+        }
+        m.status
+    })
+}
+
 fn handle(raw: u32) -> rt::Handle {
     rt::Handle::from_abi(raw)
 }
@@ -175,27 +286,62 @@ fn client_paths() {
     assert_eq!(kc::channel_create(), Ok([handle(77), handle(78)]));
     assert_eq!(kc::channel_write(handle(3), b"abc", &[handle(4), handle(5)]), Ok(()));
 
-    // channel_read: success fills the buffers and reports the counts through @count.
-    with(|m| m.next_read = Some((b"xyz".to_vec(), vec![9])));
+    // channel_read: success fills the buffers and reports the counts through @count, and each
+    // handle arrives as a checked record of its value, object type and rights (ADR-0005 B3).
+    let channel = k::ObjectType::Channel.raw();
+    let rights_of_a_channel = k::CHANNEL_RIGHTS.bits();
+    // The writer's identity comes with the sizes, all 64 bits of each (ADR-0005 B1, C2).
+    with(|m| m.sender = (0x0000_0001_0000_0029, 0xA11C_E000_0000_0001));
+    with(|m| m.next_read = Some((b"xyz".to_vec(), vec![(9, channel, rights_of_a_channel)])));
+    let filler = <k::ReceivedHandle as rt::Fixed>::FILLER;
     let mut bytes = [0u8; 8];
-    let mut handles = [rt::Handle::INVALID; 2];
+    let mut handles = [filler; 2];
     let out = kc::channel_read(handle(3), &mut bytes, &mut handles).expect("read");
     assert_eq!(out.bytes, 3);
     assert_eq!(out.handles, 1);
-    assert_eq!(out.sizes, k::ReadSizes { bytes: 3, handles: 1 });
+    assert_eq!(
+        out.sizes,
+        k::ReadSizes {
+            bytes: 3,
+            handles: 1,
+            sender_process: Some(0x0000_0001_0000_0029),
+            sender_principal: Some(0xA11C_E000_0000_0001),
+        }
+    );
     assert_eq!(&bytes[..3], b"xyz");
-    assert_eq!(handles[0], handle(9));
+    assert_eq!(
+        handles[0],
+        k::ReceivedHandle { handle: 9, object_type: k::ObjectType::Channel, rights: k::CHANNEL_RIGHTS }
+    );
+    // A record the definition cannot hold is a protocol error, not a handle.
+    with(|m| m.next_read = Some((b"x".to_vec(), vec![(9, 99, rights_of_a_channel)])));
+    assert_eq!(
+        kc::channel_read(handle(3), &mut bytes, &mut handles),
+        Err(rt::CallError::Protocol(rt::WireError::Enum)),
+        "an object type that does not exist"
+    );
+    with(|m| m.next_read = Some((b"x".to_vec(), vec![(9, channel, 1 << 20)])));
+    assert_eq!(
+        kc::channel_read(handle(3), &mut bytes, &mut handles),
+        Err(rt::CallError::Protocol(rt::WireError::Bits)),
+        "a right that does not exist"
+    );
 
     // channel_read: too small writes the sizes (@also_on).
-    with(|m| m.next_read = Some((vec![1; 20], vec![1, 2, 3])));
+    with(|m| m.next_read = Some((vec![1; 20], vec![(1, channel, 1), (2, channel, 1), (3, channel, 1)])));
     let mut bytes = [0u8; 8];
-    let mut handles = [rt::Handle::INVALID; 2];
+    let mut handles = [filler; 2];
     let failure = kc::channel_read(handle(3), &mut bytes, &mut handles).expect_err("too small");
     assert_eq!(
         failure,
         rt::CallError::Method(kc::ChannelReadFailure {
             error: ks::ChannelReadError::BufferTooSmall,
-            sizes: Some(k::ReadSizes { bytes: 20, handles: 3 }),
+            sizes: Some(k::ReadSizes {
+                bytes: 20,
+                handles: 3,
+                sender_process: Some(0x0000_0001_0000_0029),
+                sender_principal: Some(0xA11C_E000_0000_0001),
+            }),
         })
     );
 
@@ -315,6 +461,26 @@ impl cs::Calls for Calls {
         self.push(format!("newer {x}"));
         Ok(())
     }
+    fn records_in(&self, input: rt::UserSlice<f::Record>, two: rt::UserRef<[f::Record; 2]>) -> Result<(), cs::RecordsInError> {
+        self.push(format!("records_in {:x} {} {} {:x}", input.addr(), input.count(), input.byte_len(), two.addr()));
+        Ok(())
+    }
+    fn records_out(
+        &self,
+        output: rt::UserBuffer<f::Record>,
+        pair_out: rt::UserRef<[f::Record; 2]>,
+        sizes: rt::UserRef<f::Options>,
+    ) -> Result<(), cs::RecordsOutError> {
+        self.push(format!(
+            "records_out {:x} {} {} {:x} {:x}",
+            output.addr(),
+            output.capacity(),
+            output.byte_len(),
+            pair_out.addr(),
+            sizes.addr()
+        ));
+        Ok(())
+    }
     fn results(
         &self,
         _a: rt::UserRef<bool>,
@@ -334,6 +500,71 @@ fn status(outcome: cs::Outcome) -> i64 {
         cs::Outcome::Status(status) => status,
         cs::Outcome::ThreadExit => panic!("no call here exits"),
     }
+}
+
+/// Vectors and arrays of structs through the safe client (ADR-0005 C3): encoded and decoded
+/// field by field, each record checked, never more than the bound or the caller's slice.
+fn records() {
+    use oidl_generated::origin_fixture_calls::calls::client as fc;
+    let filler = <f::Record as rt::Fixed>::FILLER;
+    reset();
+    let first = f::Record { a: 0x0102_0304, m: f::Mode::READ_ONLY.union(f::Mode::FAST), k: f::Kind::Minus };
+    let second = f::Record { a: 7, m: f::Mode::LATER, k: f::Kind::One };
+    // In: each record's fields in place, its padding zero.
+    assert_eq!(fc::records_in(&[first, second], &[second, first]), Ok(()));
+    let (count, bytes, pair) = with(|m| m.records_in.clone()).expect("called");
+    assert_eq!(count, 2, "the count is in records, not bytes");
+    assert_eq!(&bytes[..12], &[4, 3, 2, 1, 0x11, 0, 0, 0, 0xFB, 0xFF, 0xFF, 0xFF]);
+    assert_eq!(&bytes[12..], &[7, 0, 0, 0, 0, 2, 0, 0, 1, 0, 0, 0]);
+    assert_eq!(&pair[..12], &bytes[12..]);
+    assert_eq!(&pair[12..], &bytes[..12]);
+    // More records than the bound never reach the kernel.
+    with(|m| m.calls.clear());
+    assert_eq!(
+        fc::records_in(&[first; 5], &[first, first]),
+        Err(rt::CallError::Protocol(rt::WireError::Count))
+    );
+    assert!(with(|m| m.calls.is_empty()), "refused before the call");
+
+    // Out: decoded into the caller's slice.
+    let mut raw = Vec::new();
+    for record in [first, second, first] {
+        let mut encoded = [0u8; 12];
+        rt::Fixed::write(record, &mut encoded).expect("encode");
+        raw.extend_from_slice(&encoded);
+    }
+    let mut pair_raw = [0u8; 24];
+    rt::Fixed::write([second, second], &mut pair_raw).expect("encode");
+    with(|m| m.next_records = Some((raw.clone(), 3, pair_raw.to_vec())));
+    let mut out = [filler; 4];
+    let got = fc::records_out(&mut out).expect("records_out");
+    assert_eq!(got.output, 3);
+    assert_eq!(&out[..3], &[first, second, first]);
+    assert_eq!(got.pair_out, [second, second]);
+    assert_eq!(got.sizes.n, 3);
+    // The capacity passed is the caller's slice, and never more than the bound.
+    let mut short = [filler; 2];
+    with(|m| m.next_records = Some((raw[..24].to_vec(), 2, pair_raw.to_vec())));
+    assert_eq!(fc::records_out(&mut short).expect("short").output, 2);
+    let mut long = [filler; 6];
+    with(|m| m.next_records = Some((raw.clone(), 3, pair_raw.to_vec())));
+    assert_eq!(fc::records_out(&mut long).expect("long").output, 3);
+    let log = with(|m| m.calls.clone());
+    assert!(log.contains(&"records_out 2".to_string()), "{log:?}");
+    assert!(log.contains(&"records_out 4".to_string()), "the bound, not 6: {log:?}");
+    // A record that is not valid is a protocol error, not a value.
+    let mut padded = raw.clone();
+    padded[6] = 1;
+    with(|m| m.next_records = Some((padded, 3, pair_raw.to_vec())));
+    assert_eq!(fc::records_out(&mut out), Err(rt::CallError::Protocol(rt::WireError::Padding)));
+    let mut unknown = raw.clone();
+    unknown[8] = 9;
+    with(|m| m.next_records = Some((unknown, 3, pair_raw.to_vec())));
+    assert_eq!(fc::records_out(&mut out), Err(rt::CallError::Protocol(rt::WireError::Enum)));
+    let mut bad_pair = pair_raw;
+    bad_pair[17] = 0x80; // bit 15 of the second record's flags: not declared
+    with(|m| m.next_records = Some((raw.clone(), 3, bad_pair.to_vec())));
+    assert_eq!(fc::records_out(&mut out), Err(rt::CallError::Protocol(rt::WireError::Bits)));
 }
 
 fn decoded_values() {
@@ -358,7 +589,13 @@ fn decoded_values() {
     // A result buffer's capacity is clamped, never refused.
     assert_eq!(run(4, [0x1000, 0x2000, 0x3000, 100, 0, 0]), 0);
     assert_eq!(run(6, [5, 0, 0, 0, 0, 0]), 0);
+    // Vectors and arrays of structs: lengths in bytes are the wire size of each record.
+    assert_eq!(run(10, [0x1000, 4, 0x2000, 0, 0, 0]), 0);
+    assert_eq!(run(10, [0x1000, 5, 0x2000, 0, 0, 0]), k::Error::InvalidArgs.raw(), "over the vector bound");
+    assert_eq!(run(11, [0x1000, 100, 0x2000, 0x3000, 0, 0]), 0);
     let log = calls.log.lock().expect("lock").clone();
+    assert!(log.contains(&"records_in 1000 4 48 2000".to_string()), "{log:?}");
+    assert!(log.contains(&"records_out 1000 4 48 2000 3000".to_string()), "clamped to the bound: {log:?}");
     assert!(log.contains(&format!("scalars 200 -2 7 -2 true One")), "{log:?}");
     assert!(log.contains(&format!("scalars 200 -2 7 0 true Minus")), "{log:?}");
     assert!(log.contains(&"modes 17 5 9".to_string()), "{log:?}");
@@ -459,6 +696,7 @@ fn strings_are_checked_after_the_copy() {
 
 fn main() {
     client_paths();
+    records();
     strings_are_checked_after_the_copy();
     decoded_values();
     sized_structs();

@@ -36,6 +36,7 @@ use origin_syscalls::oidl_rt as rt;
 use origin_syscalls::origin_kernel::kernel::server;
 use origin_syscalls::origin_kernel::types as oidl;
 
+use crate::channel::Identity;
 use crate::console::Console;
 use crate::process::{Ending, UserContext};
 use crate::{cpu, ipc, sched};
@@ -44,6 +45,8 @@ use crate::{cpu, ipc, sched};
 const MAX_HANDLES: usize = oidl::MAX_MESSAGE_HANDLES as usize;
 /// Bytes of one handle in user memory.
 const HANDLE_BYTES: usize = <rt::Handle as rt::Fixed>::SIZE;
+/// Bytes of one received handle's record in user memory (ADR-0005 B3).
+const RECORD_BYTES: usize = <oidl::ReceivedHandle as rt::Fixed>::SIZE;
 
 /// Runs one system call from ring 3: the number, its six arguments, and the address after
 /// the `syscall` instruction. Interrupts are off on entry and on return.
@@ -187,7 +190,7 @@ impl server::Calls for UserContext {
         &self,
         end: rt::HandleArg,
         bytes: rt::UserBuffer<u8>,
-        handles: rt::UserBuffer<rt::Handle>,
+        handles: rt::UserBuffer<oidl::ReceivedHandle>,
         sizes: rt::UserRef<oidl::ReadSizes>,
     ) -> Result<(), server::ChannelReadError> {
         channel_read(self, end, bytes, handles, sizes)
@@ -237,6 +240,29 @@ fn copy_out_handles(p: &UserContext, addr: u64, values: &[Handle]) -> Result<(),
     let (chunks, _) = dst.as_chunks_mut::<HANDLE_BYTES>();
     for (chunk, value) in chunks.iter_mut().zip(values) {
         *chunk = value.to_le_bytes();
+    }
+    copy_out(p, addr, dst)
+}
+
+/// Writes a `received_handle` record for each of `received` to the caller's memory at `addr`
+/// (ADR-0005 B3): each field little-endian at its offset in the definition. The table holds
+/// only object types and rights the definition declares (`origin-abi`'s values are the
+/// definition's, which `origin-syscalls` tests), so the reader accepts every record.
+fn copy_out_records(p: &UserContext, addr: u64, received: &[ipc::Received]) -> Result<(), Error> {
+    let mut bytes = [0; RECORD_BYTES * MAX_HANDLES];
+    let dst = bytes
+        .get_mut(..RECORD_BYTES * received.len())
+        .ok_or(Error::InvalidArgs)?;
+    let (records, _) = dst.as_chunks_mut::<RECORD_BYTES>();
+    for (record, r) in records.iter_mut().zip(received) {
+        let fields = [
+            (oidl::ReceivedHandle::HANDLE_AT, r.handle),
+            (oidl::ReceivedHandle::OBJECT_TYPE_AT, r.object_type),
+            (oidl::ReceivedHandle::RIGHTS_AT, r.rights),
+        ];
+        for (at, value) in fields {
+            rt::put_field(record, at, value).map_err(|_| Error::InvalidArgs)?;
+        }
     }
     copy_out(p, addr, dst)
 }
@@ -326,9 +352,11 @@ fn channel_write(
         *value = u32::from_le_bytes(*chunk);
     }
     let transfer = values.get(..count).ok_or(Error::InvalidArgs)?;
+    // The writer's identity comes from its process, never from an argument (B1).
     ipc::channel_write(
         &p.process.handles,
         &p.process.account,
+        p.process.identity(),
         end.value(),
         need(end),
         payload,
@@ -345,10 +373,11 @@ fn channel_read(
     p: &UserContext,
     end: rt::HandleArg,
     bytes: rt::UserBuffer<u8>,
-    handles: rt::UserBuffer<rt::Handle>,
+    handles: rt::UserBuffer<oidl::ReceivedHandle>,
     out_sizes: rt::UserRef<oidl::ReadSizes>,
 ) -> Result<(), Error> {
-    // The out pointers are checked before a message is taken: a bad one leaves it queued.
+    // The out pointers are checked before a message is taken: a bad one leaves it queued. The
+    // handles' room is whole records (B3).
     checked(p, bytes.addr(), bytes.byte_len(), UserAccess::Write)?;
     checked(p, handles.addr(), handles.byte_len(), UserAccess::Write)?;
     let size = read_u32(p, out_sizes.addr())?;
@@ -368,11 +397,15 @@ fn channel_read(
         u64::from(limit) - first as u64,
         UserAccess::Write,
     )?;
-    let sizes = |p: &UserContext, byte_count: usize, handle_count: usize| {
+    // The counts and the writer (B1, C2), as far as the caller's `size` reaches: a caller
+    // that gives the first version's 12 gets the counts and nothing past them.
+    let sizes = |p: &UserContext, byte_count: usize, handle_count: usize, sender: Identity| {
         let mut fields = [0; oidl::ReadSizes::SIZE as usize];
         let reported = oidl::ReadSizes {
             bytes: byte_count as u32,
             handles: handle_count as u32,
+            sender_process: Some(sender.process),
+            sender_principal: Some(sender.principal),
         };
         reported
             .encode_fields(&mut fields, limit)
@@ -391,25 +424,28 @@ fn channel_read(
         bytes.capacity(),
         handles.capacity(),
     )? {
+        // Too small: the counts and the writer still reach the caller (C2).
         ipc::Read::TooSmall {
             bytes: byte_count,
             handles: handle_count,
+            sender,
         } => {
-            sizes(p, byte_count, handle_count)?;
+            sizes(p, byte_count, handle_count, sender)?;
             Err(Error::BufferTooSmall)
         }
         ipc::Read::Message {
             bytes: payload,
             handles: installed,
+            sender,
         } => {
             let delivered = copy_out(p, bytes.addr(), &payload)
-                .and_then(|()| copy_out_handles(p, handles.addr(), &installed))
-                .and_then(|()| sizes(p, payload.len(), installed.len()));
+                .and_then(|()| copy_out_records(p, handles.addr(), &installed))
+                .and_then(|()| sizes(p, payload.len(), installed.len(), sender));
             // The ranges were checked above; only an address space changing under the
             // call could fail here. Then the handles the program cannot see are closed.
             delivered.inspect_err(|_| {
-                for &value in &installed {
-                    let _ = ipc::handle_close(table, value, Need::NOTHING);
+                for received in &installed {
+                    let _ = ipc::handle_close(table, received.handle, Need::NOTHING);
                 }
             })
         }

@@ -1,3 +1,4 @@
 # oidl-fingerprint 1: one line per library and minor (docs/spec/OIDL.md §13)
-origin.kernel 0.0 sha256:95678d509e515e4c0cf9d548735cf4d61e347dff6653f9d35113aae9bb65feb9
-origin.kernel 0.1 sha256:95678d509e515e4c0cf9d548735cf4d61e347dff6653f9d35113aae9bb65feb9
+origin.kernel 0.0 sha256:e80b392edbbec45ca16e5fffcbcb8a1137e12030b151b961cd7d392b739fb012
+origin.kernel 0.1 sha256:e80b392edbbec45ca16e5fffcbcb8a1137e12030b151b961cd7d392b739fb012
+origin.kernel 0.2 sha256:701ab4f62c6062d0d84caaada5b83d6a069b1c5ac203e94f4c43ce970dc910bd

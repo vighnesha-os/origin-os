@@ -9,6 +9,7 @@
 | Implementation | `developer-tools/oidl` (host only). First consumer: `sdk/interfaces/origin.kernel.oidl` |
 | Evidence | `docs/research/2026-11-09-native-sdk.md`, `docs/research/2026-11-09-oidl-wire-format.md`, and the comparison with the hand-written ABI, `docs/engineering/OIDL_KERNEL_COMPARISON.md` |
 | Compatibility | Every byte layout here is revision 1 of the format, accepted by the owner on 2026-11-09. A change to any of them needs the owner's acceptance again (CLAUDE.md §84) |
+| Revisions | 2026-11-10: plain structs of integers, enums and bits as `syscall` vector and array elements (§3.1, §10), ADR-0005 C3, accepted by the owner on 2026-11-09 (decision sheet item 58). Existing definitions and the `channel` wire format are unchanged |
 
 The keywords MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
@@ -148,7 +149,7 @@ There is no floating-point type, union or nullable pointer in this revision. A l
 
 Nesting is never variable-length, so no decoder recurses over message data, and no generated structure holds a pointer.
 
-In a `syscall` library the elements of a `vector` or `array` are integers or handles only, because those cross as their in-memory form. A struct element would need the compiler's layout (§42); an interface that wants one passes a pointer to a struct instead.
+In a `syscall` library the elements of a `vector` or `array` are integers, handles, or plain structs whose fields are integers, enums and bits (ADR-0005 C3). Integers and handles cross as their in-memory form. A struct element crosses as its fields, each at its §5.3 offset with zero padding, and never in a compiler's layout (§42): the Rust client encodes and decodes each element field by field, the kernel's server reads each one as a fixed-size value, and in C each element is the generated struct, whose layout the header's assertions pin to the same bytes. A `bool`, a nested struct, an array or a handle inside the element is refused. A vector of structs is at most 64 KiB at its bound, because the client encodes it into a buffer of that size.
 
 ---
 
@@ -437,6 +438,8 @@ Parameters take registers first, in declaration order, then results, in declarat
 | struct, `array` | one pointer | one out pointer |
 | `vector`, `string` | pointer, then count | pointer, then capacity (`@count` is required) |
 
+A vector's count and a result's capacity are in elements. A struct element is its bytes as §3.1 lays them out, so the kernel's length in bytes is the count times the struct's §5.3 size.
+
 A method that needs more than six registers is refused by the generator; ADR-0005 P4 says such a call takes a pointer to a structure.
 
 **Register decoding** happens after the `@reserved` check (which answers `not_supported`) and the capability check (§6), in declaration order, the first failure winning:
@@ -587,7 +590,7 @@ An implementation of this specification MUST: pass the malformed-definition suit
 - Events: a server-initiated message.
 - Floating-point types, unions, nested variable-length data.
 - C entry points for the `channel` transport (§11).
-- The fields of ADR-0005 B1's stamped identity, how a message delivers it and where a stub puts it. The generated server takes an opaque `Caller` until that slice exists.
+- Where a `channel` stub puts ADR-0005 B1's stamped identity. Its fields (C1) and how a read delivers them, through `origin.kernel`'s `read_sizes` (C2), are decided and built (task S3-2, 2026-11-10); the generated server takes an opaque `Caller` until the first ring-3 service (ADR-0011 N14 step 4).
 - Per-number pinning, which needs the number-to-address table the linker produces, and generation of the kernel's `syscall` table from this definition: the kernel's switch to generated code, which ADR-0011 N14 orders after this.
 - The Driver SDK (ADR-0001 D2): its own ADR.
 
