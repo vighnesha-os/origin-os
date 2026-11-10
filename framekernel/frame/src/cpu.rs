@@ -290,6 +290,8 @@ unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex) {
             "lea {tmp}, [rip + 2f]",
             "push {tmp}",
             "retfq",
+            // Never reached: the far return goes to `2:` (ADR-0017 Z10).
+            "int3",
             "2:",
             "mov ds, {data:x}",
             "mov es, {data:x}",
@@ -1661,7 +1663,7 @@ pub fn disable_interrupts() {
 /// so a fault has RIP = `user_copy` and resumes at `probe_recover`.
 #[unsafe(naked)]
 unsafe extern "sysv64" fn user_copy(_dst: u64, _src: u64, _unused: u64, _len: u64) -> u64 {
-    naked_asm!("rep movsb", "mov rax, -1", "ret");
+    naked_asm!("rep movsb", "mov rax, -1", "ret", "int3");
 }
 
 /// The bytes of `mov rax, -1; ret`, for a probe target that must not be executable.
@@ -2054,13 +2056,13 @@ pub unsafe fn enable_smep_smap() -> (bool, bool) {
 /// `movzx eax, byte ptr [rdi]` is the first instruction, so a fault has RIP = `read_byte`.
 #[unsafe(naked)]
 unsafe extern "sysv64" fn read_byte(_addr: u64) -> u64 {
-    naked_asm!("movzx eax, byte ptr [rdi]", "mov rax, -1", "ret");
+    naked_asm!("movzx eax, byte ptr [rdi]", "mov rax, -1", "ret", "int3");
 }
 
 /// `mov byte ptr [rdi], sil` is the first instruction, so a fault has RIP = `write_byte`.
 #[unsafe(naked)]
 unsafe extern "sysv64" fn write_byte(_addr: u64, _value: u8) -> u64 {
-    naked_asm!("mov byte ptr [rdi], sil", "mov rax, -1", "ret");
+    naked_asm!("mov byte ptr [rdi], sil", "mov rax, -1", "ret", "int3");
 }
 
 /// Jumps to `addr` with the caller's return address on the stack.
@@ -2073,7 +2075,7 @@ unsafe extern "sysv64" fn jump(_addr: u64) -> u64 {
 /// holds the error code, so `ret` returns the code to that caller.
 #[unsafe(naked)]
 extern "sysv64" fn probe_recover() {
-    naked_asm!("ret");
+    naked_asm!("ret", "int3");
 }
 
 /// The common entry of every vector: swaps the kernel's GS base in if the processor came
@@ -2134,6 +2136,7 @@ extern "sysv64" fn exception_saved() {
         "swapgs",
         "4:",
         "iretq",
+        "int3",
         smap = sym SMAP_ON,
         dispatch = sym dispatch,
     );
