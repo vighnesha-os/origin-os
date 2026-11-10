@@ -176,7 +176,7 @@ fn difference(first: &[u8], second: &[u8]) -> Option<String> {
         && stamp.clone().any(differs)
     {
         report.push(format!(
-            "  bytes {:#x} to {:#x} are the PE header's time stamp. `/DEBUG:NONE` and `/Brepro` make it a hash of the image (`.cargo/config.toml`), so it differs whenever anything else does. If little else differs, those arguments did not reach the linker: RUSTFLAGS in the environment replaces the list they are in",
+            "  bytes {:#x} to {:#x} are the PE header's time stamp, which `/TIMESTAMP:0` sets to zero (`.cargo/config.toml`). If it differs, the loader's link arguments did not reach the linker: RUSTFLAGS in the environment replaces the list they are in",
             stamp.start,
             stamp.end - 1
         ));
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn the_same_bytes_are_no_difference() {
-        let image = pe_image(0x1793_9D58, &[7; 300]);
+        let image = pe_image(0, &[7; 300]);
         assert_eq!(difference(&image, &image.clone()), None);
         assert_eq!(difference(&[1], &[1]), None);
     }
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn a_difference_elsewhere_in_a_pe_image_is_not_called_its_time_stamp() {
-        let first = pe_image(0x1793_9D58, &[9; 64]);
+        let first = pe_image(0, &[9; 64]);
         let mut second = first.clone();
         // The byte before the stamp, the byte after it, and one far away.
         for at in [0x7F, 0x84, 0xA0] {

@@ -10,16 +10,19 @@ xtask = "run --quiet --package xtask --"
 # record's identifier (a hash of the PDB, which holds the path of a directory rustc creates
 # under a random name for each link). The two arguments come after rustc's own, and of two
 # `/DEBUG` options the linker obeys the last:
-# - `/DEBUG:NONE`: no PDB, and no CodeView record in the image;
-# - `/Brepro`: the time stamp is a hash of the image's content, and the debug directory holds
-#   one empty entry of type 16 (IMAGE_DEBUG_TYPE_REPRO), which is how a PE image says so.
-# Either one alone leaves two builds different. `cargo xtask check` builds the loader twice
-# and fails if the images differ. RUSTFLAGS in the environment replaces this whole list.
+# - `/DEBUG:NONE`: no PDB, no CodeView record, and so no debug directory in the image;
+# - `/TIMESTAMP:0`: the header's time stamp is zero.
+# Either one alone leaves two builds different. The image then holds nothing but what
+# UEFI 2.11 §2.1.1 says firmware uses: the header, the sections and the relocations.
+# `/Brepro` in place of `/TIMESTAMP:0` also gives the same bytes twice, and leaves a debug
+# directory with one entry (type 16) that a firmware's loader may read. `cargo xtask check`
+# builds the loader twice and fails if the images differ. RUSTFLAGS in the environment
+# replaces this whole list.
 [target.x86_64-unknown-uefi]
 rustflags = [
     "-C", "force-frame-pointers=yes",
     "-C", "link-arg=/DEBUG:NONE",
-    "-C", "link-arg=/Brepro",
+    "-C", "link-arg=/TIMESTAMP:0",
 ]
 
 [target.x86_64-unknown-none]
