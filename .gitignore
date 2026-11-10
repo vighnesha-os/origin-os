@@ -26,3 +26,9 @@ rustc-ice-*.txt
 # Claude Code agent worktrees (temporary, per session)
 .claude/worktrees/
 __pycache__/
+
+# Specifications and other documents whose terms may forbid redistribution stay out of the
+# public repository (CLAUDE.md §17; decision items 18 and 107). Keep local copies in
+# specifications/, which is never committed.
+specifications/
+*.pdf
