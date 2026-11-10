@@ -737,6 +737,19 @@ const CONTROLS: &[Control] = &[
         ],
     },
     Control {
+        // The initiator reads the answers without acquiring them: what a target did before it
+        // answered, its invalidation and its last use of the page, is not ordered before what the
+        // initiator does next, the frame's release included (review finding 7).
+        name: "initiator_reads_answers_relaxed",
+        file: SHOOTDOWN,
+        from: "                while served.load(Ordering::Acquire) < generation {\n",
+        to: "                while served.load(Ordering::Relaxed) < generation {\n",
+        models: &[
+            ("shootdown_reaches_an_online_processor", STALE),
+            ("deferred_free_comes_after_the_last_use_of_a_stale_translation", REUSED_TOO_SOON),
+        ],
+    },
+    Control {
         // The request is not published with its generation: a target can read the previous
         // one and invalidate the wrong page.
         name: "shootdown_generation_relaxed",
@@ -792,6 +805,30 @@ const CONTROLS: &[Control] = &[
                 .is_some_and(|leaving| leaving.load(Ordering::Acquire) == root)
 ",
         to: "",
+        models: &[("shootdown_and_a_processor_leaving_the_space", STALE)],
+    },
+    Control {
+        // `holds` reads `leaving` first, in the order `switch_space` writes the two: a switch
+        // that writes both between its reads is missed by each, the old root no longer in
+        // `loaded` and not yet in `leaving` (review finding 7).
+        name: "holds_reads_leaving_first",
+        file: SHOOTDOWN,
+        from: "        self.loaded
+            .get(id)
+            .is_some_and(|loaded| loaded.load(Ordering::Acquire) == root)
+            || self
+                .leaving
+                .get(id)
+                .is_some_and(|leaving| leaving.load(Ordering::Acquire) == root)
+",
+        to: "        self.leaving
+            .get(id)
+            .is_some_and(|leaving| leaving.load(Ordering::Acquire) == root)
+            || self
+                .loaded
+                .get(id)
+                .is_some_and(|loaded| loaded.load(Ordering::Acquire) == root)
+",
         models: &[("shootdown_and_a_processor_leaving_the_space", STALE)],
     },
     Control {
