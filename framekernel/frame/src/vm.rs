@@ -10,9 +10,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use origin_paging::layout::{
-    DIRECT_MAP_WINDOW, DIRECT_MAP_WINDOW_SIZE, STACK_REGION, STACK_REGION_SIZE,
-};
+use origin_paging::layout::{DIRECT_MAP_WINDOW, DIRECT_MAP_WINDOW_SIZE, STACK_REGION_SIZE};
 use origin_paging::{
     Access, AddressSpace, Attributes, LARGE_PAGE, LeafCensus, LeafSizes, MapError, PAGE, TablePool,
     Translation, kernel_half_is_complete, same_kernel_half,
@@ -271,14 +269,16 @@ pub(crate) fn make_guards(pages: &[u64]) -> Result<(), MapError> {
     Ok(())
 }
 
-/// Whether the `pages` pages from `virt` lie in the kernel stacks' region.
+/// Whether the `pages` pages from `virt` lie in the kernel stacks' region, wherever it was
+/// placed (`stack::region`).
 fn in_stack_region(virt: u64, pages: usize) -> bool {
+    let base = crate::stack::region().base;
     let end = (pages as u64)
         .checked_mul(PAGE)
         .and_then(|bytes| virt.checked_add(bytes));
     virt.is_multiple_of(PAGE)
-        && virt >= STACK_REGION
-        && end.is_some_and(|end| end <= STACK_REGION + STACK_REGION_SIZE)
+        && virt >= base
+        && end.is_some_and(|end| end <= base + STACK_REGION_SIZE)
 }
 
 /// Maps `frames` at consecutive pages from `virt` in the kernel stacks' region (`stack`):

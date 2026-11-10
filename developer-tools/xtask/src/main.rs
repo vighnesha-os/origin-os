@@ -1812,6 +1812,9 @@ fn stack_markers(machine: &Machine) -> Vec<String> {
     // The processor that caches the freed stack: the first after the boot processor, if any.
     let reader = machine.named(cpus.min(2) - 1);
     vec![
+        // ADR-0004 Amendment 2: every machine here has RDSEED or RDRAND, so its region's base is
+        // drawn. The line names neither the base nor the instruction's value (A6).
+        "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: true; drawn from the processor's entropy, so not its fixed base: true".into(),
         format!(
             "origin-kernel: kernel stacks: stacks of 4, 16 and 64 KiB each in a slot of its own in the region, every page read/write, not executable and global: true; the page below each, the bottom of its slot and the bottom of the next faulted: 9 of 9; the application processors' interrupt stacks, as their TSSs name them, in the region with the page below each faulting: {interrupt_stacks} of {interrupt_stacks}"
         ),

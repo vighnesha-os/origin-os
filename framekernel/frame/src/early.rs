@@ -373,6 +373,9 @@ impl Early {
             kernel_physical_base: info.kernel_base,
             stack_guard: info.stack_base.wrapping_sub(PAGE),
         };
+        // The kernel stacks' region slides (ADR-0004 Amendment 2): its base is drawn now, when
+        // the kernel builds its tables.
+        let region = crate::stack::draw_region();
         let built = layout::build(&mut tables, &at, self.data.regions, self.data.segments)
             // ADR-0004 H2: every slot of the kernel half gets its table now, while nothing can
             // have copied the half yet; then the kernel stacks' region gets every table its
@@ -380,19 +383,34 @@ impl Early {
             // was sized for both (`init_memory`).
             .and_then(|(mut space, stats)| {
                 space.reserve_upper_half(&mut tables)?;
-                space.reserve_tables(
-                    &mut tables,
-                    layout::STACK_REGION,
-                    layout::STACK_REGION_SIZE,
-                )?;
+                space.reserve_tables(&mut tables, region.base, layout::STACK_REGION_SIZE)?;
                 Ok((space, stats))
             });
         match built {
-            Ok((space, stats)) => Some(KernelTables {
-                space,
-                tables,
-                stats,
-            }),
+            Ok((space, stats)) => {
+                // Placed only with its tables made. The boot says what drew the base (A5),
+                // never the base (A6).
+                crate::stack::place(region);
+                let _ = match region.drawn {
+                    Some(entropy) => writeln!(
+                        com1,
+                        "origin-kernel: kernel stacks: the region's base is drawn from {}",
+                        match entropy {
+                            crate::stack::Entropy::Rdseed => "RDSEED",
+                            crate::stack::Entropy::Rdrand => "RDRAND",
+                        }
+                    ),
+                    None => writeln!(
+                        com1,
+                        "origin-kernel: kernel stacks: no entropy from RDSEED or RDRAND: the region is at its fixed base"
+                    ),
+                };
+                Some(KernelTables {
+                    space,
+                    tables,
+                    stats,
+                })
+            }
             Err(e) => {
                 let _ = writeln!(com1, "origin-kernel: page tables not built: {e:?}");
                 None

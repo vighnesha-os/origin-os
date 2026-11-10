@@ -2,13 +2,19 @@
 //!
 //! # Where a stack lives
 //!
-//! Every [`GuardedStack`] is in the kernel stacks' region (`origin_paging::layout::STACK_REGION`,
-//! PML4 slot 384), in a slot of its own: [`SLOT`] bytes of address space with the stack's pages
-//! mapped at the top and the rest left unmapped. Running off the bottom of a stack faults on that
-//! unmapped space, which is no other stack's (a frame larger than a page is probed a page at a
-//! time, so none can step over it), and which costs no frame: nothing in the direct map is split
-//! or unmapped for it. The region's page tables are made at boot (`early`), so mapping a stack
-//! only fills in entries. The slots are `origin_sync::slots`; this module maps and unmaps them.
+//! Every [`GuardedStack`] is in the kernel stacks' region, in a slot of its own: [`SLOT`] bytes of
+//! address space with the stack's pages mapped at the top and the rest left unmapped. Running off
+//! the bottom of a stack faults on that unmapped space, which is no other stack's (a frame larger
+//! than a page is probed a page at a time, so none can step over it), and which costs no frame:
+//! nothing in the direct map is split or unmapped for it. The region's page tables are made at
+//! boot (`early`), so mapping a stack only fills in entries. The slots are `origin_sync::slots`;
+//! this module maps and unmaps them.
+//!
+//! The region's base is random (ADR-0004 Amendment 2): drawn once, from RDSEED or else RDRAND,
+//! when the kernel builds its page tables ([`draw_region`]), 2 MiB-aligned within PML4 slots
+//! 384–447. With neither instruction it is the fixed base, `layout::STACK_REGION`, and the boot
+//! says so. After boot the kernel prints neither the base nor an address in the region (A6):
+//! [`Region`]'s `Debug` leaves the base out.
 //!
 //! # Giving a stack back
 //!
@@ -27,12 +33,13 @@
 use alloc::alloc::{Layout, alloc, dealloc};
 
 use origin_paging::PAGE;
-use origin_paging::layout::{STACK_REGION, STACK_REGION_SIZE};
+use origin_paging::layout::{self, STACK_REGION, STACK_REGION_SIZE};
 use origin_sync::slots::{Counts, Slots, State, Taken};
 
 use crate::cpu::{self, CpuIndex, without_interrupts};
 use crate::descriptors::{KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
 use crate::memory::{self, OwnedFrame};
+use crate::once::SetOnce;
 
 /// The address space each stack has: the stack at its top, unmapped space below.
 pub const SLOT: u64 = 128 * 1024;
@@ -56,22 +63,104 @@ const _: () = assert!(
 /// The region's slots.
 static REGION: Slots<SLOTS, IDLE> = Slots::new();
 
+/// An instruction that gives the processor's entropy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entropy {
+    /// `RDSEED`.
+    Rdseed,
+    /// `RDRAND`.
+    Rdrand,
+}
+
+/// Where the kernel stacks' region is (ADR-0004 Amendment 2).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Region {
+    /// The region's base: 2 MiB-aligned, with the whole region in PML4 slots 384–447. Never
+    /// printed after boot (A6).
+    pub base: u64,
+    /// What drew the base, or `None`: the processor has neither instruction, and the region is
+    /// at its fixed base.
+    pub drawn: Option<Entropy>,
+}
+
+/// Shows what drew the base, never the base (A6).
+impl core::fmt::Debug for Region {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Region")
+            .field("drawn", &self.drawn)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where the region is, once the kernel's tables are made for it (`early`).
+static PLACED: SetOnce<Region> = SetOnce::new();
+
+/// RDSEED attempts before RDRAND, and RDRAND attempts before the fixed base: the loader's, for
+/// the image's slide (ADR-0004 H3).
+const RDSEED_TRIES: u32 = 64;
+const RDRAND_TRIES: u32 = 16;
+
+/// Draws the region's base (ADR-0004 Amendment 2, A4 and A5): from RDSEED, else RDRAND, or the
+/// fixed base with neither. For `early`, which makes the region's tables there and then
+/// records it ([`place`]).
+pub(crate) fn draw_region() -> Region {
+    let features = crate::features::Features::decode(&cpu::gather_cpuid());
+    let draw = |available: bool, tries: u32, instruction: fn() -> Option<u64>| {
+        if available {
+            (0..tries).find_map(|_| instruction())
+        } else {
+            None
+        }
+    };
+    let drawn = draw(features.rdseed, RDSEED_TRIES, cpu::rdseed)
+        .map(|random| (random, Entropy::Rdseed))
+        .or_else(|| {
+            draw(features.rdrand, RDRAND_TRIES, cpu::rdrand).map(|random| (random, Entropy::Rdrand))
+        });
+    match drawn {
+        Some((random, entropy)) => Region {
+            base: layout::stack_region_base(random),
+            drawn: Some(entropy),
+        },
+        None => Region {
+            base: STACK_REGION,
+            drawn: None,
+        },
+    }
+}
+
+/// Records where the region is, once its page tables are made: before then, and if this has run
+/// already, nothing changes.
+pub(crate) fn place(region: Region) -> bool {
+    PLACED.set(region).is_ok()
+}
+
+/// Where the region is: at its fixed base until `early` has placed it, which it does before the
+/// first stack is made.
+pub fn region() -> Region {
+    PLACED.get().copied().unwrap_or(Region {
+        base: STACK_REGION,
+        drawn: None,
+    })
+}
+
 /// The first address of slot `slot`.
-const fn slot_base(slot: usize) -> u64 {
-    STACK_REGION + slot as u64 * SLOT
+fn slot_base(slot: usize) -> u64 {
+    region().base + slot as u64 * SLOT
 }
 
 /// The lowest of the top `pages` pages of slot `slot`: where a stack of that many pages starts.
-const fn stack_low(slot: usize, pages: u32) -> u64 {
-    slot_base(slot) + SLOT - pages as u64 * PAGE
+fn stack_low(slot: usize, pages: u32) -> u64 {
+    slot_base(slot) + SLOT - u64::from(pages) * PAGE
 }
 
 /// The slot holding `addr`, if `addr` is in the stack region.
-const fn slot_of(addr: u64) -> Option<usize> {
-    if addr < STACK_REGION || addr >= STACK_REGION + STACK_REGION_SIZE {
+fn slot_of(addr: u64) -> Option<usize> {
+    let base = region().base;
+    if addr < base || addr - base >= STACK_REGION_SIZE {
         return None;
     }
-    Some(((addr - STACK_REGION) / SLOT) as usize)
+    Some(((addr - base) / SLOT) as usize)
 }
 
 /// Whether the slot holding `addr` is free: nothing is mapped there, and no processor holds a
@@ -83,11 +172,8 @@ pub fn slot_is_free(addr: u64) -> bool {
 
 /// The top of the slot holding `addr`, if `addr` is in the stack region: past it lies the next
 /// slot's unmapped space. For the backtrace (`cpu::capture_backtrace`).
-pub const fn slot_top(addr: u64) -> Option<u64> {
-    if addr < STACK_REGION || addr >= STACK_REGION + STACK_REGION_SIZE {
-        return None;
-    }
-    Some(addr - (addr - STACK_REGION) % SLOT + SLOT)
+pub fn slot_top(addr: u64) -> Option<u64> {
+    slot_of(addr).map(|slot| slot_base(slot) + SLOT)
 }
 
 /// A kernel stack in the stack region, with unmapped space below it. Owned; given back on drop.
@@ -129,12 +215,12 @@ impl GuardedStack {
 
     /// The page just below the stack: the first an overflow reaches, unmapped like the rest of
     /// the slot below it.
-    pub const fn guard_addr(&self) -> u64 {
+    pub fn guard_addr(&self) -> u64 {
         self.top() - self.bytes as u64 - PAGE
     }
 
     /// The first address of the stack's slot: the bottom of the unmapped space below it.
-    pub const fn slot_base(&self) -> u64 {
+    pub fn slot_base(&self) -> u64 {
         slot_base(self.slot)
     }
 
@@ -144,7 +230,7 @@ impl GuardedStack {
     }
 
     /// The first address past the stack, 16-byte aligned: the top of its slot.
-    pub const fn top(&self) -> u64 {
+    pub fn top(&self) -> u64 {
         slot_base(self.slot) + SLOT
     }
 
@@ -373,7 +459,7 @@ impl GuardablePage {
     }
 
     /// The page's address, for probes.
-    pub const fn addr(&self) -> u64 {
+    pub fn addr(&self) -> u64 {
         stack_low(self.slot, 1)
     }
 
