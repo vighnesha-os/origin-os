@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Date | 2026-11-10 |
-| For | `docs/adr/ADR-0016-kernel-random-numbers.md` (Proposed); `security/crypto/src/hmac.rs` and `hmac_drbg.rs`; TASKS item 18 (task 18a) |
+| For | `docs/adr/ADR-0016-kernel-random-numbers.md` (accepted by the owner on 2026-11-10, after this ledger was written); `security/crypto/src/hmac.rs` and `hmac_drbg.rs`; TASKS item 18 (task 18a) |
 | Requires | CLAUDE.md §3, §16, §17, §59; decision items 93, 96, 97, 113 |
 | Method | NIST's four documents and one errata sheet were read from NIST's own servers, in memory: each PDF was piped from `curl` into a text extractor and nothing was written to disk. §2 gives each one's size, SHA-256 and the pages read. NIST's vector file for HMAC_DRBG was fetched on the owner's word (decision item 145; §11). NIST's publication pages, three RFCs and Intel's guide were read through a fetch tool, which returns a language model's reading of a page and not the page itself, so every hexadecimal value taken that way was confirmed by recomputing it (§9). AMD's bulletin was read in the in-app browser as the page's own text. §11 lists what was not read. Vendor and RFC text is given in Origin's words, not quoted |
 

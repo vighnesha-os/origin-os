@@ -340,3 +340,26 @@ The work these create is in `TASKS.md`, items 17 to 30.
 - Read revision 7.4's wording and say whether the records pull request may merge (item 106). CLAUDE.md is your text, and merging takes your word.
 - Confirm ADR-0009's text, which you delegated and have not reviewed, and ADR-0007's two additions marked "for the owner's review" (item 122).
 - Name the person who signs off the first driver written from reference reading, when one exists (item 121).
+
+## The kernel's random-number generator (ADR-0016): Accepted 2026-11-10, the mechanism built, nothing in the kernel
+
+Decision item 113 accepted one generator in outline. [ADR-0016](../adr/ADR-0016-kernel-random-numbers.md) filled the outline in and ended with seven questions, each with a recommended answer checked against CLAUDE.md 7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C. The seventh, a download, is item 145 above. You answered **"Accept all"** to the other six on 2026-11-10, in the session that wrote the ADR.
+
+Three of them change something you had already accepted. The ADR said so before you answered:
+
+- item 147 changes ADR-0002 B4: boot info goes to 0.6;
+- items 147 and 148 change ADR-0004 H3: the loader's slides come from a generator of its own, as two requests, and the firmware's generator is never a source by itself;
+- item 146 carries out ADR-0013 Amendment 1, which you accepted with item 113: one row of its table moves when the generator lands.
+
+| # | Question | Answer | Where it is recorded, and its state |
+|---|---|---|---|
+| 146, answered | The design (R1 to R9, R11 to R13): one HMAC_DRBG over SHA-512; a root generator and one for each processor, in the shape of SP 800-90C's tree of generators with two named differences; health tests on the instructions' outputs; no generator and no randomness without a healthy seed; overwriting in three layers; a new crate for the policy? | **Accept** | ADR-0016. The mechanism is built and tested on the host. Everything else is task 18b |
+| 147, answered | Boot info 0.6 (§84): one appended field, `boot_seed`, the physical address of 64 secret bytes inside the boot-info region or 0, which the kernel overwrites once it has taken them? | **Accept** | ADR-0016 R10; ADR-0002 B4. Not built: `origin-version.toml` stays at 0.5 until 18b |
+| 148, answered | What may seed, and what happens when the sources fail? RDRAND with no RDSEED: the generator runs, the boot says so, and requests for prediction resistance are refused. The firmware's seed with neither instruction: no generator. Every instruction failing after boot: the root stops and the processors' generators go on with the seeds they have. | **Accept, as stated.** The stricter alternative to the third part, stopping all randomness, was offered and not chosen | ADR-0016 R3, R6, R8; ADR-0004 H3's note. Not built |
+| 149, answered | What "health tests on the raw source" (CLAUDE.md §59) can mean: tests on the instructions' outputs, because the noise behind them cannot be reached; gross failure only; no SP 800-90B conformance claimed? | **Accept** | ADR-0016 R4. Not built |
+| 150, answered | Keep `unsafe` out of `origin-crypto`: best-effort overwriting there, and the guarantee in the framework, by volatile writes over the state and an overwrite of the stack after every request? | **Accept** | ADR-0016 R9. The best-effort part is built; the framework's part is 18b |
+| 151, answered | CLAUDE.md §17: pin SP 800-90A to Rev. 1 (June 2015) and SP 800-90B to January 2018, and add SP 800-90C (September 2025) and FIPS 198-1 (July 2008)? | **Accept** | ADR-0016 R1. **CLAUDE.md is not yet changed:** it is your text, and the wording goes into its next revision |
+
+**Yours to do:** nothing new. §17's wording reaches you with the directive's next revision.
+
+The numbers start at 146 because 142 to 144 are in use on `land/s3-part2` and 145 is the download above. The header of this sheet still counts items to 123: it is brought up to date when the branches that hold items 124 to 151 meet.
