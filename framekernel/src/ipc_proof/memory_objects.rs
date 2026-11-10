@@ -19,6 +19,11 @@
 //!   taken back, whatever the caller's budget, and what that cost is charged to it. The kernel
 //!   makes the report fail itself: ring 3 cannot make the write of the address fail at will
 //!   (its page must go between the call's check and its write).
+//! - **Runs, whole or not at all:** through the kernel's own calls, which then look at what was
+//!   left. A fixed run over a page of the program's own is refused and maps none of its pages;
+//!   a mapping from an object's second page maps those pages' frames and no more; and in a
+//!   space whose page tables are used up a run is refused with `limit`, leaving no page and no
+//!   record.
 //! - **Costs:** map, protect and unmap through the kernel's own calls, as QEMU figures; and the
 //!   unmap of a shared object's page from a space a thread is reading it in, on another
 //!   processor where there is one, after which the thread faults there and the object stays
@@ -30,6 +35,7 @@ use core::fmt::Write;
 use origin_abi::{Error, OK, map_access, map_flags, rights, syscall as sys};
 use origin_frame::objref::ObjectRef;
 use origin_frame::proof_programs::{self, DATA, STACK};
+use origin_frame::userspace::UserFrame;
 
 use super::Arg::{Handle as Hd, Imm};
 use super::{
@@ -43,6 +49,7 @@ use crate::handles::Need;
 use crate::ipc::{self, Object};
 use crate::mapping::{PAGE, PLACE_HIGH, PLACE_LOW, Rate, Request};
 use crate::memory_object::{self, MemoryObject};
+use crate::paging::{Access, LARGE_PAGE};
 use crate::process::{Ending, Limits, MemoryLimits, Process};
 use crate::{memory, sched, time};
 
@@ -54,6 +61,10 @@ const FIXED_C: u64 = 0x0000_0003_0000_0000;
 const FIXED_T: u64 = 0x0000_0004_0000_0000;
 const FIXED_H: u64 = 0x0000_0005_0000_0000;
 const FIXED_K: u64 = 0x0000_0006_0000_0000;
+const FIXED_O: u64 = 0x0000_0007_0000_0000;
+const FIXED_W: u64 = 0x0000_0008_0000_0000;
+const FIXED_L: u64 = 0x0000_0009_0000_0000;
+const FIXED_S: u64 = 0x0000_000A_0000_0000;
 /// Where the reading program maps the shared object: below 2 GiB, so that its code can name
 /// the address in an immediate.
 const READ_AT: u64 = 0x0000_0000_4000_0000;
@@ -695,6 +706,99 @@ fn unreported() -> Option<Unreported> {
     })
 }
 
+// ------------------------------------------------------------------ runs, whole or not at all
+
+/// What [`runs`] found.
+struct Runs {
+    /// A fixed run over a page of the program's own mapped none of its pages, left that page
+    /// as it was and left no record.
+    own: bool,
+    /// A mapping of an object's second and third pages maps those pages' frames, and no more.
+    later: bool,
+    /// A run that needs a page table past the space's bound is refused with `limit`, and leaves
+    /// no page and no record.
+    tables: bool,
+}
+
+/// Fixed maps through the kernel's own calls, which then look at the pages and records left.
+fn runs() -> Option<Runs> {
+    /// How many mappings two mebibytes apart the last part tries: each needs a page table of
+    /// its own, and a space is allowed fewer tables than that.
+    const APART: u64 = 64;
+    let map = |process: &Process,
+               object: &ObjectRef<MemoryObject>,
+               first: u64,
+               pages: u64,
+               address: u64| {
+        let request = Request {
+            access: READ,
+            flags: FIXED,
+            offset: first * PAGE,
+            length: pages * PAGE,
+            address,
+        };
+        memory_object::map(
+            process,
+            process,
+            object,
+            rights::MEMORY_OBJECT,
+            &request,
+            &told,
+        )
+    };
+    let object = |process: &Process, pages: u64| {
+        ObjectRef::try_new(MemoryObject::create(&process.account, pages * PAGE).ok()?).ok()
+    };
+
+    // A page of the process's own, as its creator maps its code, data and stack, where the
+    // second page of a run would go.
+    let mut process = Process::new(limits(6, 3, PLENTY), (CODE, CODE + PAGE), 0)?;
+    let mine = process
+        .map_page(FIXED_O + PAGE, Access::ReadWrite)
+        .ok()?
+        .phys();
+    let frame = |at: u64| process.frame_of(at).map(UserFrame::phys);
+    let two = object(&process, 2)?;
+    let own = map(&process, &two, 0, 2, FIXED_O) == Err(Error::InvalidArgs)
+        && !process.is_mapped(FIXED_O)
+        && frame(FIXED_O + PAGE) == Some(mine)
+        // No record was left: the run's first page alone is mapped there.
+        && map(&process, &two, 0, 1, FIXED_O) == Ok(FIXED_O)
+        && frame(FIXED_O + PAGE) == Some(mine);
+
+    // The object whole at one place and its second and third pages at another: the same frames.
+    let four = object(&process, 4)?;
+    let later = map(&process, &four, 0, 4, FIXED_W) == Ok(FIXED_W)
+        && map(&process, &four, 1, 2, FIXED_L) == Ok(FIXED_L)
+        && (0..2).all(|k| {
+            let through = frame(FIXED_L + k * PAGE);
+            through.is_some() && through == frame(FIXED_W + (1 + k) * PAGE)
+        })
+        && !process.is_mapped(FIXED_L + 2 * PAGE);
+
+    // Mappings two mebibytes apart, until the space's bound on page tables refuses one.
+    let wide = Process::new(
+        limits(1, APART as usize + 1, PLENTY),
+        (CODE, CODE + PAGE),
+        0,
+    )?;
+    let one = object(&wide, 1)?;
+    let at = |k: u64| FIXED_S + k * LARGE_PAGE;
+    let refusal = (0..APART).find_map(|k| map(&wide, &one, 0, 1, at(k)).err().map(|e| (k, e)));
+    let tables = refusal.is_some_and(|(k, e)| {
+        e == Error::Limit
+            && k > 0
+            && !wide.is_mapped(at(k))
+            // No record was left: the run is refused for its table again, not for a mapping
+            // in its place.
+            && map(&wide, &one, 0, 1, at(k)) == Err(Error::Limit)
+            // And it was the tables that ran out, not the mappings: a page beside the first
+            // mapping, in a table the space has, is mapped.
+            && map(&wide, &one, 0, 1, at(0) + PAGE) == Ok(at(0) + PAGE)
+    });
+    Some(Runs { own, later, tables })
+}
+
 // ------------------------------------------------------------------ costs
 
 /// Map, protect and unmap of 16 pages through the kernel's own calls, in a process no
@@ -929,6 +1033,21 @@ fn parts(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> b
         verdict(nothing_left && charged)
     );
 
+    let Some(runs) = runs() else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: memory: the runs through the kernel's own calls could not be set up{}",
+            verdict(false)
+        );
+        return false;
+    };
+    let (own, later, tables) = (runs.own, runs.later, runs.tables);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: memory: a fixed run over a page of the program's own is refused whole, and the page stays: {own}; a mapping of an object's later pages maps those pages' frames: {later}; a run past the space's page tables is refused with limit and leaves no page and no record: {tables}{}",
+        verdict(own && later && tables)
+    );
+
     let scripts = a.statuses()
         && b.statuses()
         && q.statuses()
@@ -1000,6 +1119,9 @@ fn parts(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> b
         && served
         && nothing_left
         && charged
+        && own
+        && later
+        && tables
 }
 
 /// The memory-object proof (ADR-0005 P7, P11, C6–C8), with a leak check of its own. Called from
