@@ -47,6 +47,7 @@ use crate::{cpu, memory, phys, tlb, vm};
 const TABLE_POOL_MIN_FRAMES: u64 = 256;
 /// Frames kept beyond what the boot's own tables can need (`layout::table_frames`), for what
 /// is mapped afterwards: device registers, firmware tables and guard pages that split a leaf.
+/// The kernel stacks' region has tables of its own, made at boot (`layout::STACK_REGION_TABLES`).
 const TABLE_POOL_RESERVE: u64 = 235;
 /// Where the SMEP/SMAP probe maps its temporary user page: the top of the lower half.
 const USER_PROBE_PAGE: u64 = 0x0000_7FFF_FFFF_E000;
@@ -279,6 +280,7 @@ impl Early {
         let Some(table_frames) = layout::table_frames(regions, regions.len() as u64, kernel_span)
             .and_then(|needed| needed.checked_add(TABLE_POOL_RESERVE))
             .and_then(|needed| needed.checked_add(layout::KERNEL_HALF_SLOTS))
+            .and_then(|needed| needed.checked_add(layout::STACK_REGION_TABLES))
             .map(|frames| frames.max(TABLE_POOL_MIN_FRAMES))
         else {
             let _ = writeln!(
@@ -373,9 +375,16 @@ impl Early {
         };
         let built = layout::build(&mut tables, &at, self.data.regions, self.data.segments)
             // ADR-0004 H2: every slot of the kernel half gets its table now, while nothing can
-            // have copied the half yet. The pool was sized for this (`init_memory`).
+            // have copied the half yet; then the kernel stacks' region gets every table its
+            // pages will need (Amendment 1, A2), so mapping a stack never takes one. The pool
+            // was sized for both (`init_memory`).
             .and_then(|(mut space, stats)| {
                 space.reserve_upper_half(&mut tables)?;
+                space.reserve_tables(
+                    &mut tables,
+                    layout::STACK_REGION,
+                    layout::STACK_REGION_SIZE,
+                )?;
                 Ok((space, stats))
             });
         match built {
