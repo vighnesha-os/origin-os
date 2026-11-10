@@ -33,17 +33,19 @@ use core::sync::atomic::Ordering;
 use crate::paging::{Access, PAGE};
 use origin_abi::limits::{DEADLINE_INFINITE, MAX_MESSAGE_BYTES};
 use origin_abi::{
-    Error, OK, ObjectType, read_sizes, received_handle, rights, signals, status_name,
+    Error, OK, ObjectType, read_sizes, received_handle, rights, signals, start, status_name,
     syscall as sys,
 };
 
 use origin_frame::objref::ObjectRef;
-use origin_frame::proof_programs::{self, DATA, SCRIPT, STACK};
+use origin_frame::proof_programs::{self, DATA, ENTRY_RDI, SCRIPT, STACK};
 use origin_frame::userspace::{self, UserFrame};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex};
+use crate::handles::Need;
 use crate::ipc::{self, Object};
+use crate::launch::{self, Given};
 use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, Process};
 use crate::{memory, sched, syscall, time};
 
@@ -269,9 +271,15 @@ impl Image {
     }
 
     fn build(limits: Limits, code: &[u8], origin: (u64, u64), principal: u64) -> Option<Self> {
+        Self::from_process(Process::new(limits, origin, principal)?, code)
+    }
+
+    /// An image for `process`, made by its caller (a launched child, say): `program` at
+    /// [`CODE`], its data pages, and one stack page.
+    fn from_process(process: Process, code: &[u8]) -> Option<Self> {
         let code_pages = code.len().div_ceil(PAGE as usize).max(1) as u64;
         let mut image = Self {
-            process: Process::new(limits, origin, principal)?,
+            process,
             pages: Vec::new(),
         };
         image.map(CODE, code_pages, Access::ReadExecute)?;
@@ -2290,6 +2298,284 @@ pub(crate) fn prove_identity(
         com1,
         "origin-kernel: ipc: the identity proof's processes and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){}",
         if back { "" } else { ": ipc failed" }
+    );
+    ok && back
+}
+
+// ------------------------------------------------------------------ process start
+
+/// The launch proof's creator's principal: both halves non-zero, so a child that took only part
+/// of it, or any other, shows (C1).
+const PRINCIPAL_CREATOR: u64 = 0xC4EA_7012_0000_0007;
+/// The arguments and environment every launched child gets.
+const LAUNCH_ARGS: [&[u8]; 2] = [b"origin", b"start record"];
+const LAUNCH_ENV: [&[u8]; 1] = [b"ROLE=child"];
+/// The start-record entries in the order the launch path writes them, with what each must be:
+/// role, object type and rights (C5, C6).
+const START_ENTRIES: [(u32, u32, u32); 4] = [
+    (
+        start::role::SELF_PROCESS,
+        ObjectType::Process as u32,
+        rights::PROCESS,
+    ),
+    (
+        start::role::SELF_THREAD,
+        ObjectType::Thread as u32,
+        rights::THREAD,
+    ),
+    (
+        start::role::BOOTSTRAP,
+        ObjectType::Channel as u32,
+        rights::CHANNEL,
+    ),
+    (
+        start::role::DIRECTORY,
+        ObjectType::Channel as u32,
+        rights::CHANNEL,
+    ),
+];
+
+/// The address of entry `i`'s handle in a start record at `record`.
+const fn entry_handle(record: u64, i: u64) -> u64 {
+    record + start::HEADER as u64 + i * start::ENTRY as u64 + start::ENTRY_HANDLE_AT as u64
+}
+
+/// What one launched child showed.
+struct Launch {
+    /// Its start record's address.
+    record: u64,
+    /// RDI held it, and the record it read in ring 3 is the one the launch wrote: its size,
+    /// version, entries (C5, C6), arguments and environment.
+    record_right: bool,
+    /// Its handles did what their rights allow.
+    handles_work: bool,
+    /// Its message on BOOTSTRAP named it and its creator's principal.
+    names_creator: bool,
+    /// Its write to its own record faulted at the record's address.
+    faulted_there: bool,
+}
+
+/// Launches one child from `creator` through the launch path, with a BOOTSTRAP end whose peer
+/// the creator holds and a DIRECTORY end, and checks what it saw and did. `None` if the
+/// launch itself could not run.
+fn launch_one(creator: &Process, cpu: CpuIndex, tsc_hz: u64) -> Option<Launch> {
+    let code = proof_programs::launched();
+    let code_pages = code.len().div_ceil(PAGE as usize).max(1) as u64;
+    let child = Process::child_of(creator, LIMITS, (CODE, CODE + code_pages * PAGE))?;
+    let mut image = Image::from_process(child, code)?;
+    let (Ok((boot_child, boot_creator)), Ok((dir_child, dir_other))) = (
+        ipc::create_channel(&creator.account),
+        ipc::create_channel(&creator.account),
+    ) else {
+        return None;
+    };
+    let held = creator
+        .grant(Object::Channel(boot_creator), rights::CHANNEL)
+        .ok()?;
+    let given = Given {
+        bootstrap: Some(boot_child),
+        directory: Some(dir_child),
+        args: &LAUNCH_ARGS,
+        env: &LAUNCH_ENV,
+    };
+    let placed = launch::place(&mut image.process, &given).ok()?;
+    let record = placed.record;
+    let words = placed.size as u64 / 4;
+    // The child reports the RDI it started with and its whole record, word by word; uses each
+    // handle; then writes its record, which must fault.
+    let mut steps = alloc::vec![value_at("", ENTRY_RDI, 0), value_at("", ENTRY_RDI + 4, 0),];
+    for w in 0..words {
+        steps.push(value_at("", record + 4 * w, 0));
+    }
+    steps.extend([
+        write("", Hd(entry_handle(record, 2)), MSG, 4, OK),
+        dup("", Hd(entry_handle(record, 0)), rights::WAIT, 0, OK),
+        wait(
+            "",
+            Hd(entry_handle(record, 1)),
+            signals::TERMINATED,
+            0,
+            Error::TimedOut.raw(),
+        ),
+        wait("", Hd(entry_handle(record, 3)), signals::WRITABLE, 0, OK),
+        copy32(DATA, record),
+    ]);
+    if image.scratch().is_none() || image.script(&steps).is_none() {
+        return None;
+    }
+    let launched = launch::start(image.process, placed, given, cpu, CODE, STACK + PAGE).ok()?;
+    let ended = await_end(&launched.process, tsc_hz, 10);
+    drop(dir_other);
+    let reports = launched.process.reports();
+    // RDI, then the record as the child read it.
+    let rdi = reported_u64(&reports, 0);
+    let mut bytes = Vec::new();
+    for word in reports.get(2..2 + words as usize).unwrap_or(&[]) {
+        bytes.extend_from_slice(&(*word as u32).to_le_bytes());
+    }
+    let decoded = start::decode(&bytes).ok();
+    let record_right = rdi == Some(record)
+        && bytes.len() == launched.size
+        && decoded.is_some_and(|r| {
+            let entries: Vec<start::Entry> = r.entries().collect();
+            r.abi == origin_abi::ABI_VERSION
+                && r.abi_min_minor == origin_abi::ABI_VERSION.1
+                && entries.len() == START_ENTRIES.len()
+                && entries
+                    .iter()
+                    .zip(START_ENTRIES)
+                    .all(|(e, (role, ty, rights))| {
+                        e.role == role && e.object_type == ty && e.rights == rights && e.handle != 0
+                    })
+                && r.args.iter().eq(LAUNCH_ARGS)
+                && r.env.iter().eq(LAUNCH_ENV)
+        });
+    let statuses = reports.get(2 + words as usize..).unwrap_or(&[]);
+    let handles_work = statuses
+        == [
+            OK as u64,
+            OK as u64,
+            Error::TimedOut.raw() as u64,
+            OK as u64,
+        ];
+    let names_creator = match ipc::channel_read(&creator.handles, held, Need::NOTHING, 64, 0) {
+        Ok(ipc::Read::Message { sender, .. }) => {
+            sender.process == launched.process.id() && sender.principal == PRINCIPAL_CREATOR
+        }
+        _ => false,
+    };
+    let faulted_there = ended
+        && matches!(
+            launched.process.ending(),
+            Some(Ending::Faulted { vector: 14, address, .. }) if address == record
+        );
+    Some(Launch {
+        record,
+        record_right,
+        handles_work,
+        names_creator,
+        faulted_there,
+    })
+}
+
+/// A launch whose start record would pass 64 KiB is refused before anything is mapped, and a
+/// launch that fails after its child holds something gives it all back: here, a child whose
+/// table holds one handle, so the second start handle is refused. Each passes the BOOTSTRAP
+/// end of a channel whose other end the creator holds, which must close.
+fn refused_launches(creator: &Process) -> (bool, bool) {
+    let code = proof_programs::launched();
+    let code_pages = code.len().div_ceil(PAGE as usize).max(1) as u64;
+    let origin = (CODE, CODE + code_pages * PAGE);
+    let attempt = |limits: Limits, args: &[&[u8]]| -> Option<(Result<(), Error>, bool)> {
+        let child = Process::child_of(creator, limits, origin)?;
+        let mut image = Image::from_process(child, code)?;
+        let (child_end, creator_end) = ipc::create_channel(&creator.account).ok()?;
+        let held = creator
+            .grant(Object::Channel(creator_end), rights::CHANNEL)
+            .ok()?;
+        let given = Given {
+            bootstrap: Some(child_end),
+            directory: None,
+            args,
+            env: &[],
+        };
+        let outcome = match launch::place(&mut image.process, &given) {
+            // Refused before the child held anything: what it was to be given goes back now.
+            Err(e) => {
+                drop(given);
+                Err(e)
+            }
+            Ok(placed) => launch::start(
+                image.process,
+                placed,
+                given,
+                CpuIndex::BOOT,
+                CODE,
+                STACK + PAGE,
+            )
+            .map(|_| ()),
+        };
+        // The end the child would have had is closed either way.
+        let closed = ipc::wait_one(
+            &creator.handles,
+            &creator.waiting,
+            held,
+            Need::NOTHING,
+            signals::PEER_CLOSED,
+            0,
+        )
+        .is_ok_and(|w| w.status.is_ok());
+        let _ = ipc::handle_close(&creator.handles, held, Need::NOTHING);
+        Some((outcome, closed))
+    };
+    let large = alloc::vec![7u8; start::MAX_SIZE];
+    let too_large = attempt(LIMITS, &[&large])
+        .is_some_and(|(outcome, closed)| outcome == Err(Error::Limit) && closed);
+    let one_handle = Limits {
+        handles: 1,
+        ..LIMITS
+    };
+    let gave_back = attempt(one_handle, &[])
+        .is_some_and(|(outcome, closed)| outcome == Err(Error::Limit) && closed);
+    (too_large, gave_back)
+}
+
+/// The process start proof (ADR-0005 P6, C1, C4–C6): two children launched from one creator
+/// through the launch path, and two launches that must be refused, with a leak check of its
+/// own. Called from the boot flow with every scheduler running, after [`prove_identity`].
+pub(crate) fn prove_launch(
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    bsp: CpuIndex,
+    tsc_hz: u64,
+) -> bool {
+    let before = memory::stats();
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let ok = {
+        let Some(creator) = Process::new(LIMITS, (CODE, CODE + PAGE), PRINCIPAL_CREATOR) else {
+            return false;
+        };
+        let first = launch_one(&creator, far, tsc_hz);
+        let second = launch_one(&creator, bsp, tsc_hz);
+        let (too_large, gave_back) = refused_launches(&creator);
+        let each = |check: fn(&Launch) -> bool| {
+            first.as_ref().is_some_and(check) && second.as_ref().is_some_and(check)
+        };
+        let record_right = each(|l| l.record_right);
+        let handles_work = each(|l| l.handles_work);
+        let names_creator = each(|l| l.names_creator);
+        let faulted_there = each(|l| l.faulted_there);
+        let apart = match (&first, &second) {
+            (Some(a), Some(b)) => a.record != b.record,
+            _ => false,
+        };
+        let launched_right = record_right && handles_work && names_creator && faulted_there;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: start: two children launched from their creator found their start records in RDI, read-only at random addresses: each record, read back in ring 3, has its size, version, 4 entries with C6's rights, 2 arguments and 1 environment string: {record_right}; each start handle works: {handles_work}; each child's message names it and its creator's principal: {names_creator}; writing its record faulted there: {faulted_there}{}",
+            if launched_right { "" } else { ": start failed" }
+        );
+        let refused_right = apart && too_large && gave_back;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: start: the two records are at different addresses: {apart}; a record over 64 KiB is refused: {too_large}; a launch refused after its child held a handle gives everything back: {gave_back}{}",
+            if refused_right { "" } else { ": start failed" }
+        );
+        launched_right && refused_right
+    };
+    let same = || {
+        memory::stats().map(|(h, f)| (h.bytes_in_use, f))
+            == before.map(|(h, f)| (h.bytes_in_use, f))
+    };
+    ipc::reap_closed();
+    sched::yield_until(same, tsc_hz, 2);
+    let back = same();
+    let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: start: every launched process and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){}",
+        if back { "" } else { ": start failed" }
     );
     ok && back
 }

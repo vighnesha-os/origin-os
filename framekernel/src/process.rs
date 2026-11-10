@@ -189,7 +189,8 @@ pub(crate) struct ThreadObject {
 }
 
 impl ThreadObject {
-    const fn new() -> Self {
+    /// A thread not yet started: the launch path names it in a start record before it runs.
+    pub(crate) const fn new() -> Self {
         Self {
             termination: Termination::new(),
         }
@@ -298,6 +299,17 @@ impl Process {
             blocked: AtomicU64::new(0),
             waiting: AtomicU32::new(0),
         })
+    }
+
+    /// A new process that `creator` starts: it acts for the creator's principal, and there is no
+    /// way to give it another (ADR-0005 C1; no capability for one exists). The launch path's way
+    /// in; only kernel code that creates a process with no creator names a principal.
+    pub(crate) fn child_of(
+        creator: &Self,
+        limits: Limits,
+        syscall_origin: (u64, u64),
+    ) -> Option<Self> {
+        Self::new(limits, syscall_origin, creator.principal)
     }
 
     /// This process's ID.
@@ -431,6 +443,20 @@ impl Process {
         rsp: u64,
         rdi: u64,
     ) -> Result<ObjectRef<ThreadObject>, QueueError> {
+        let thread = ObjectRef::try_new(ThreadObject::new()).map_err(|_| QueueError::Full)?;
+        Self::start_thread_as(process, cpu, rip, rsp, rdi, thread)
+    }
+
+    /// As [`Process::start_thread`], as the thread `thread`, made before it runs: the launch
+    /// path names it in the start record first.
+    pub(crate) fn start_thread_as(
+        process: &ObjectRef<Self>,
+        cpu: CpuIndex,
+        rip: u64,
+        rsp: u64,
+        rdi: u64,
+        thread: ObjectRef<ThreadObject>,
+    ) -> Result<ObjectRef<ThreadObject>, QueueError> {
         // Counted before it takes anything, and before it can run, so that its own end always
         // finds itself counted. While it is counted the process cannot end, and its last reaping
         // cannot raise `TERMINATED`, so the reference to the address space taken below is always
@@ -444,7 +470,7 @@ impl Process {
             life.unreaped += 1;
             Ok(())
         })?;
-        let Some(user) = Self::context_for(process) else {
+        let Some(user) = Self::context_for(process, thread) else {
             process.start_failed();
             return Err(QueueError::Full);
         };
@@ -462,9 +488,11 @@ impl Process {
     /// What a new thread of `process` stands on: the process, a reference to its address space
     /// and the thread object. `None` without the memory for them, having dropped whatever it
     /// took.
-    fn context_for(process: &ObjectRef<Self>) -> Option<ObjectRef<UserContext>> {
+    fn context_for(
+        process: &ObjectRef<Self>,
+        thread: ObjectRef<ThreadObject>,
+    ) -> Option<ObjectRef<UserContext>> {
         let space = process.memory()?;
-        let thread = ObjectRef::try_new(ThreadObject::new()).ok()?;
         ObjectRef::try_new(UserContext {
             process: process.clone(),
             space,
@@ -530,6 +558,17 @@ impl Process {
         without_interrupts(|| *self.ending.lock() = Some(ending));
         let creators = without_interrupts(|| self.space.lock().take());
         drop(creators);
+    }
+
+    /// A launch that failed before the first thread ran gives back everything granted to this
+    /// process: its table closes, and with it the process's handle to itself, which would
+    /// otherwise keep the process alive for ever. Nothing can be added to the table afterwards.
+    pub(crate) fn abandon(&self) {
+        let table = without_interrupts(|| {
+            core::mem::replace(&mut *self.handles.lock(), HandleTable::new(0))
+        });
+        drop(table);
+        ipc::reap_closed();
     }
 
     /// A thread of this process has been reaped, and its reference to the address space is

@@ -1331,6 +1331,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(object_markers(&target))
         .chain(address_space_markers(cpus))
         .chain(identity_markers())
+        .chain(launch_markers())
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
@@ -1614,6 +1615,7 @@ fn boot_failures() -> Vec<&'static str> {
         IOAPIC_FAILED,
         ": PM timer failed",
         ": ipc failed",
+        ": start failed",
         ": console failed",
         ": TLB failed",
         ": address spaces failed",
@@ -1863,6 +1865,15 @@ fn identity_markers() -> Vec<String> {
         "origin-kernel: ipc: a message's writer: the message written before its end moved to another process names its writer, process and principal: true; the one written after names the new writer: true; a read too small for it names the writer too: true; none names the reader: true".into(),
         "origin-kernel: ipc: a reader that gives read_sizes' first size, 12: its read -> OK, its counts -> 7 bytes, and nothing written past them: true".into(),
         "origin-kernel: ipc: the identity proof's processes and all they held are gone: heap ".into(),
+    ]
+}
+
+/// The process start proof (ADR-0005 P6, C1, C4-C6; `ipc_proof::prove_launch`).
+fn launch_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: start: two children launched from their creator found their start records in RDI, read-only at random addresses: each record, read back in ring 3, has its size, version, 4 entries with C6's rights, 2 arguments and 1 environment string: true; each start handle works: true; each child's message names it and its creator's principal: true; writing its record faulted there: true".into(),
+        "origin-kernel: start: the two records are at different addresses: true; a record over 64 KiB is refused: true; a launch refused after its child held a handle gives everything back: true".into(),
+        "origin-kernel: start: every launched process and all they held are gone: heap ".into(),
     ]
 }
 
