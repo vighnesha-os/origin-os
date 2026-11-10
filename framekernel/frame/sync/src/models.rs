@@ -108,7 +108,11 @@
 //!   same-processor wake stands for the next tick, which the real timer always brings. Fairness
 //!   and starvation are not modelled.
 //! - The machine: these are host builds against Loom's atomics. The x86-64 code the kernel runs,
-//!   the `pause` instruction and TSO are not examined.
+//!   the `pause` instruction and TSO are not examined. In the shootdown models the page walker is
+//!   a relaxed load at the points a model calls `walk`, where a real one may walk at any moment;
+//!   a TLB is a boolean; and speculative use of a stale translation is not modelled.
+//! - A processor that does not answer: the models' clock never runs out. `Stalled` and the leak
+//!   that follows it are tested on the host only.
 //! - `RwLock` writer starvation, which its documentation accepts; a timed waiter that finds the
 //!   queue full (the other way to reach `Step::Poll`, the same loop as the boot flow's); and what
 //!   callers must uphold themselves: the state changes before `wake_one`, and one condition per
