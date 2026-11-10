@@ -10,9 +10,16 @@
 //!   caller's own included (C6). The address space's operations run with no lock of this module
 //!   held, since they may wait for a shootdown (`UserSpace::unmap`): a mapping is reserved, busy,
 //!   in the process's records first, and changed while it is busy.
+//! - **A map's pages are entered all or none**, in one call to the address space, which refuses
+//!   a run over any page it maps (`UserSpace::map_shared_run`). A refused map leaves no entry
+//!   that was ever present, so it needs no shootdown and costs its caller's budget nothing.
 //! - **Unmap and protect are priced before they run** against the caller's budget, and refused
 //!   with `should_wait`, changing nothing, if it cannot pay (T15, T16); what each cost
-//!   (`Change`) is charged afterwards.
+//!   (`Change`) is charged afterwards. A mapping another call is making or changing at that
+//!   moment is `should_wait` too, before anything is priced (the note on D5).
+//! - **A map tells its caller the address before the mapping can be used by any other call.**
+//!   If that fails, the mapping is taken back whatever the budget holds, and its cost charged
+//!   afterwards: a mapping nobody was told of does not stay.
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
@@ -24,12 +31,9 @@ use origin_frame::userspace::{Change, ChangeError, SharedFrame, UserSpace};
 use crate::cpu::without_interrupts;
 use crate::handles::Need;
 use crate::ipc::Object;
-use crate::mapping::{self, Allow, Asked, PAGE, Place, Request};
+use crate::mapping::{self, Allow, Asked, Place, Refused, Request};
 use crate::paging::{Access, MapError};
 use crate::process::{Account, Process};
-
-/// Draws of a random place before a map gives up on finding a free one.
-const PLACEMENT_TRIES: u32 = 8;
 
 /// A memory object (C7): its frames, committed at creation, and their charge.
 pub(crate) struct MemoryObject {
@@ -83,9 +87,9 @@ impl MemoryObject {
         self.frames.len() as u64
     }
 
-    /// Its frame at page `page`, for a proof.
-    pub(crate) fn frame(&self, page: u64) -> Option<&SharedFrame> {
-        self.frames.get(usize::try_from(page).ok()?)
+    /// The frames `asked` maps: its pages of this object, in order.
+    fn run(&self, asked: &Asked) -> Option<&[SharedFrame]> {
+        self.frames.get(mapping::frames(asked)?)
     }
 }
 
@@ -122,38 +126,88 @@ const fn access(allow: Allow) -> Access {
     }
 }
 
+/// Why the address space refused a run, in the rules' words ([`Refused::status`] has the status
+/// of each).
+const fn refused(e: ChangeError) -> Refused {
+    match e {
+        ChangeError::Map(MapError::AlreadyMapped(_)) => Refused::Mapped,
+        ChangeError::Limit => Refused::Tables,
+        ChangeError::Map(MapError::OutOfMemory) => Refused::Memory,
+        // Not reached in this version: the run's addresses were checked (`mapping::check`), no
+        // mapping of an object is executable, and entering a run waits for no processor.
+        _ => Refused::Other,
+    }
+}
+
 /// `memory_map`: maps what `request` asks of `object`, held with the rights `held`, into
 /// `target`'s address space, and returns where (C7, C8).
+///
+/// `report` tells the caller the address while the mapping is still reserved: until its caller
+/// knows of it, no other call can change it or put another mapping in its place. If the report
+/// fails the mapping goes again ([`withdraw`]), charged to `caller`, and the map fails with the
+/// report's error. The report is a `dyn`, so the kernel holds this path once, whoever calls it.
 pub(crate) fn map(
+    caller: &Process,
     target: &Process,
     object: &ObjectRef<MemoryObject>,
     held: u32,
     request: &Request,
+    report: &dyn Fn(u64) -> Result<(), Error>,
 ) -> Result<u64, Error> {
     let asked = mapping::check(request, object.pages(), held)?;
     let space = target.memory().ok_or(Error::InvalidArgs)?;
-    let base = reserve(target, &space, &asked, object)?;
-    match map_pages(&space, base, object, &asked) {
-        Ok(()) => {
-            without_interrupts(|| target.mappings.lock().made(base));
-            Ok(base)
-        }
-        Err(e) => {
-            let reserved = without_interrupts(|| target.mappings.lock().remove(base));
-            drop(reserved);
-            Err(e)
-        }
+    let base = put(target, &space, &asked, object)?;
+    if let Err(e) = report(base) {
+        withdraw(caller, target, &space, base, asked.pages);
+        return Err(e);
     }
+    without_interrupts(|| target.mappings.lock().made(base));
+    Ok(base)
 }
 
-/// Reserves where `asked` goes in `target`'s records: at its fixed address if no page of it is
-/// mapped, or at a random free place. The record is busy until the pages are mapped.
-fn reserve(
+/// Takes back the mapping reserved at `base` whose address its caller could not be told: a
+/// mapping nobody knows of must not stay. Its pages go through a shootdown, since a thread of
+/// `target` may already have touched them. The budget is not asked first, since a refusal
+/// would leave the mapping; what the change cost is charged to `caller` afterwards, so its
+/// next unmap or protect waits that much longer (T15, T16). A caller cannot make this happen
+/// for nothing: the page its address goes to has to be unmapped or made read-only between the
+/// call's check and its write, and that change is priced.
+fn withdraw(caller: &Process, target: &Process, space: &UserSpace, base: u64, pages: u64) {
+    match space.unmap(base, pages) {
+        Ok(change) => settle(caller, 0, change),
+        // As in `unmap`: every page is out of the tables, and the frames a processor may still
+        // reach are kept from reuse for good (T3).
+        Err(ChangeError::Stalled { .. }) => {}
+        // As in `unmap`, not reached in this version, and nothing changed: the record stays,
+        // as a mapping its process can unmap; it goes with the process at the latest.
+        Err(_) => {
+            without_interrupts(|| target.mappings.lock().made(base));
+            return;
+        }
+    }
+    let object = without_interrupts(|| target.mappings.lock().remove(base));
+    drop(object);
+}
+
+/// Puts `asked`'s pages of `object` into `target`'s space, at its fixed address or at a random
+/// free place, and returns where. The mapping's record is reserved first and is still busy on
+/// return. Its pages are then entered all or none, in one call to the address space
+/// (`UserSpace::map_shared_run`).
+///
+/// The space refuses a run over any page it maps, from its own records. Those hold every user
+/// page of the space: the program's own and its start record's (`UserSpace::map_page`), which
+/// the mappings' records do not know, as well as every mapping's. So nothing looks at the page
+/// tables first, and there is no time between a look and the map for another page to appear
+/// in. A refused run was never entered: its record goes, and there is nothing to unmap and no
+/// shootdown.
+fn put(
     target: &Process,
     space: &UserSpace,
     asked: &Asked,
     object: &ObjectRef<MemoryObject>,
 ) -> Result<u64, Error> {
+    let frames = object.run(asked).ok_or(Error::InvalidArgs)?;
+    // Whether the run went in at `base`: `Ok(false)` if that place is taken.
     let take = |base: u64| -> Result<bool, Error> {
         let reserved = without_interrupts(|| {
             target
@@ -169,54 +223,25 @@ fn reserve(
             }
             Err((e, _)) => return Err(e),
         }
-        // Pages the records do not know, the program's own and its start record's, are in the
-        // space alone: a mapping goes nowhere any page is mapped.
-        if (0..asked.pages).any(|k| space.translate(base + k * PAGE).is_some()) {
-            let reserved = without_interrupts(|| target.mappings.lock().remove(base));
-            drop(reserved);
-            return Ok(false);
-        }
-        Ok(true)
+        let Err(e) = space.map_shared_run(base, frames, access(asked.allow)) else {
+            return Ok(true);
+        };
+        let reserved = without_interrupts(|| target.mappings.lock().remove(base));
+        drop(reserved);
+        // Over a page of the program's own or its start record's, the place is taken.
+        refused(e).status().map_or(Ok(false), Err)
     };
     match asked.place {
-        // Never over a mapping (C7).
+        // Never over a mapping, or any other page of the space (C7).
         Place::At(base) => take(base)?.then_some(base).ok_or(Error::InvalidArgs),
         Place::Anywhere => {
             // An ended process, then the mapping limit, before the placement and its entropy
             // (D5's order).
             without_interrupts(|| target.mappings.lock().room())?;
-            for _ in 0..PLACEMENT_TRIES {
-                let random = crate::entropy::hardware_u64().ok_or(Error::NotSupported)?;
-                let base = mapping::place(random, asked.pages).ok_or(Error::InvalidArgs)?;
-                if take(base)? {
-                    return Ok(base);
-                }
-            }
-            Err(Error::Limit)
+            // Eight draws that all land on something mapped are `limit` (the note on D5).
+            mapping::place_at_random(asked.pages, crate::entropy::hardware_u64, take)
         }
     }
-}
-
-/// Maps `asked`'s pages of `object` at `base`. On a failure the pages mapped so far go again,
-/// through a shootdown, since a thread may already have touched them.
-fn map_pages(
-    space: &UserSpace,
-    base: u64,
-    object: &MemoryObject,
-    asked: &Asked,
-) -> Result<(), Error> {
-    for k in 0..asked.pages {
-        let frame = object.frame(asked.first + k).ok_or(Error::InvalidArgs)?;
-        if let Err(e) = space.map_shared(base + k * PAGE, frame, access(asked.allow)) {
-            let _ = space.unmap(base, k);
-            return Err(match e {
-                // The space's page tables are full (`MAX_TABLES`) or out of frames.
-                ChangeError::Map(MapError::OutOfMemory) => Error::Limit,
-                _ => Error::InvalidArgs,
-            });
-        }
-    }
-    Ok(())
 }
 
 /// What a change cost, in the budget's units: its shootdowns and the interrupts they sent.
@@ -244,7 +269,9 @@ fn settle(caller: &Process, paid: u64, change: Change) {
 }
 
 /// `memory_unmap`: removes `target`'s whole mapping that is exactly `length` bytes from `base`
-/// (C7), charged to `caller`.
+/// (C7), charged to `caller`. A mapping another call is making or changing at this moment is
+/// `ShouldWait`, before anything is priced: nothing is changed and nothing spent (the note on
+/// D5).
 pub(crate) fn unmap(
     caller: &Process,
     target: &Process,
@@ -266,12 +293,14 @@ pub(crate) fn unmap(
             settle(caller, paid, change);
             Ok(())
         }
-        // The change is made and its frames are kept from reuse for good (T3): the mapping is
-        // gone all the same.
+        // A processor did not answer. The change is made all the same: every page of the
+        // mapping is out of the tables, and the frames a processor may still reach are kept
+        // from reuse for good (T3). The mapping is gone, as `timed_out` says (D5).
         Err(ChangeError::Stalled { .. }) => Err(Error::TimedOut),
         Err(e) => {
-            // Only after an earlier stall, without memory for the records: some pages may be
-            // gone. The mapping stays, to be unmapped again.
+            // Not reached in this version: the space refuses only a range it cannot have,
+            // before anything changes, and a mapping's range was checked when it was made.
+            // Nothing changed, so the mapping stays.
             without_interrupts(|| target.mappings.lock().end(base, allow));
             return Err(match e {
                 ChangeError::Map(MapError::OutOfMemory) => Error::NoMemory,
@@ -285,7 +314,9 @@ pub(crate) fn unmap(
 }
 
 /// `memory_protect`: reduces what `target`'s whole mapping that is exactly `length` bytes from
-/// `base` allows to `access` bits (C7), charged to `caller`.
+/// `base` allows to `access` bits (C7), charged to `caller`. A busy mapping is `ShouldWait`, as
+/// in [`unmap`], before `access` is compared with what the mapping allows: that is not settled
+/// while another call changes it.
 pub(crate) fn protect(
     caller: &Process,
     target: &Process,
@@ -317,6 +348,7 @@ pub(crate) fn protect(
             settle(caller, paid, change);
             Ok(())
         }
+        // As in `unmap`: every page has its new permissions, and the mapping now allows `new`.
         Err(ChangeError::Stalled { .. }) => Err(Error::TimedOut),
         // Nothing changed: a shared frame would be writable through one mapping and executable
         // through another, which this version never maps, or the range was refused.

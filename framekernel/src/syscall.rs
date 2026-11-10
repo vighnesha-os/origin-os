@@ -574,12 +574,12 @@ fn memory_map(
     };
     let target = memory_object::process_of(&p.process, process.value(), need(process))?;
     let (object, held) = memory_object::object_of(&p.process, object.value(), need(object))?;
-    let at = memory_object::map(&target, &object, held, &request)?;
     // The pointer was checked above; only the caller's own space changing under the call can
-    // fail here. Then the mapping it cannot learn of goes again.
-    copy_out(p, address.addr(), &at.to_le_bytes()).inspect_err(|_| {
-        let _ = memory_object::unmap(&p.process, &target, at, request.length);
-    })
+    // make this write fail. The map then takes the mapping back, which nothing else could
+    // touch before its address was written, and fails with the write's error: a result is
+    // written only by a call that succeeds (OIDL `@also_on`).
+    let tell = |at: u64| copy_out(p, address.addr(), &at.to_le_bytes());
+    memory_object::map(&p.process, &target, &object, held, &request, &tell).map(|_| ())
 }
 
 /// `wait_one`. The decoder has refused an empty mask and undefined signals.

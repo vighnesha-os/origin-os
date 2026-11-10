@@ -11,7 +11,9 @@
 //!   or the user half, or not in whole pages, is `invalid_args`.
 //! - **A process's mappings** are whole: unmap and protect act on exactly one (C7). A record is
 //!   reserved, busy, before its pages are mapped, and is busy again while it changes, so the
-//!   address space's own work runs with none of these records' locks held.
+//!   address space's own work runs with none of these records' locks held. An unmap or protect
+//!   that names a busy mapping is `should_wait`, with nothing changed: a retry takes the mapping
+//!   or finds it gone (the note on D5, the owner's item 155).
 //! - **The budget** is a generic cell rate: each unit (one shootdown, or one processor it
 //!   interrupts) costs an interval of credit, and at most `burst` units can be spent ahead of
 //!   time. A change is priced before it runs and refused if the budget cannot pay.
@@ -165,11 +167,75 @@ pub fn check(request: &Request, object_pages: u64, held: u32) -> Result<Asked, E
     })
 }
 
+/// Which of an object's frames `asked` maps: the places of its pages among them, in order.
+/// `None` if they cannot be counted; `check` has refused a request past the object's end.
+pub fn frames(asked: &Asked) -> Option<core::ops::Range<usize>> {
+    let first = usize::try_from(asked.first).ok()?;
+    let end = first.checked_add(usize::try_from(asked.pages).ok()?)?;
+    Some(first..end)
+}
+
 /// Where a random draw places `pages` pages: a page of `[PLACE_LOW, PLACE_HIGH)` at which they
 /// fit, or `None` if they cannot fit there at all.
 pub fn place(random: u64, pages: u64) -> Option<u64> {
     let slots = ((PLACE_HIGH - PLACE_LOW) / PAGE).checked_sub(pages)? + 1;
     Some(PLACE_LOW + (random % slots) * PAGE)
+}
+
+/// Draws of a random place before a map gives up on finding a free one.
+pub const PLACEMENT_TRIES: u32 = 8;
+
+/// Finds `pages` pages a place at random. Up to [`PLACEMENT_TRIES`] times, `draw` gives a
+/// random number and `take` is given the place it makes ([`place`]): `Ok(true)` if the pages
+/// went in there, `Ok(false)` if the place is taken. Returns the first place that took them.
+///
+/// `NotSupported` if a draw has no entropy to give, and `InvalidArgs` if the pages fit nowhere
+/// in the region; an error of `take` ends the search with that error. `Limit` if every draw
+/// landed on something mapped: that is a bound of the process's own address space, and
+/// `no_memory` stays for frames and the kernel's heap (ADR-0005, the notes on D4 and D5; the
+/// owner's item 156).
+pub fn place_at_random(
+    pages: u64,
+    mut draw: impl FnMut() -> Option<u64>,
+    mut take: impl FnMut(u64) -> Result<bool, Error>,
+) -> Result<u64, Error> {
+    for _ in 0..PLACEMENT_TRIES {
+        let random = draw().ok_or(Error::NotSupported)?;
+        let base = place(random, pages).ok_or(Error::InvalidArgs)?;
+        if take(base)? {
+            return Ok(base);
+        }
+    }
+    Err(Error::Limit)
+}
+
+/// Why an address space refused to map a run of pages. The framework's own errors are not built
+/// on the host; `memory_object` names each of them in these words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// A page of the run is mapped already.
+    Mapped,
+    /// The space has as many page tables as one space may have, and the run needs another.
+    Tables,
+    /// No free frame for a page table, or no kernel memory for the space's records.
+    Memory,
+    /// Anything else: addresses the space cannot map, or a frame that would be writable and
+    /// executable. `check` and this version's mappings rule both out.
+    Other,
+}
+
+impl Refused {
+    /// The status of a map whose run was refused (ADR-0005 D4): `limit` at the bound on a
+    /// space's page tables, `no_memory` for a want of memory. `None` if only the place is
+    /// taken: a fixed address there is `invalid_args` (D5), and a random draw is made again.
+    pub const fn status(self) -> Option<Error> {
+        match self {
+            Self::Mapped => None,
+            Self::Tables => Some(Error::Limit),
+            Self::Memory => Some(Error::NoMemory),
+            Self::Other => Some(Error::InvalidArgs),
+        }
+    }
 }
 
 /// What an unmap or protect of `pages` pages may cost at most: one unit per shootdown and per
@@ -201,14 +267,19 @@ pub struct Budget {
 }
 
 impl Budget {
-    /// A full budget at `rate`. A rate of 0 per second refills once a second at most.
+    /// A full budget at `rate`. A rate of 0 per second refills once a second at most. A rate
+    /// above a unit a nanosecond counts as a unit a nanosecond: its interval would be 0, every
+    /// unit free and the burst no bound at all.
     pub const fn new(rate: Rate) -> Self {
+        const SECOND: u64 = 1_000_000_000;
         let per_second = if rate.per_second == 0 {
             1
+        } else if rate.per_second as u64 > SECOND {
+            SECOND
         } else {
             rate.per_second as u64
         };
-        let interval = 1_000_000_000 / per_second;
+        let interval = SECOND / per_second;
         Self {
             interval,
             tau: (rate.burst as u64).saturating_mul(interval),
@@ -249,7 +320,8 @@ struct Record<T> {
     base: u64,
     pages: u64,
     allow: Allow,
-    /// Being mapped, unmapped or protected: no other change may touch it.
+    /// Being mapped, unmapped or protected: no other change may touch it, and one that tries
+    /// is told to wait.
     busy: bool,
     object: T,
 }
@@ -345,14 +417,19 @@ impl<T> Mappings<T> {
         }
     }
 
-    /// Takes the whole mapping that is exactly the `pages` pages from `base`, made and not
-    /// changing, for a change: what it allows. `InvalidArgs` if there is none.
+    /// Takes the whole mapping that is exactly the `pages` pages from `base` for a change: what
+    /// it allows. `InvalidArgs` if there is none. `ShouldWait` if another call is making or
+    /// changing it at this moment: it is not taken and stays as it was, and a retry takes it
+    /// or finds it gone (ADR-0005, the note on D5; the owner's item 155).
     pub fn begin(&mut self, base: u64, pages: u64) -> Result<Allow, Error> {
         let r = self
             .records
             .iter_mut()
-            .find(|r| r.base == base && r.pages == pages && !r.busy)
+            .find(|r| r.base == base && r.pages == pages)
             .ok_or(Error::InvalidArgs)?;
+        if r.busy {
+            return Err(Error::ShouldWait);
+        }
         r.busy = true;
         Ok(r.allow)
     }
@@ -540,6 +617,43 @@ mod tests {
     }
 
     #[test]
+    fn a_request_maps_its_own_pages_of_the_object() {
+        let later = check(&request(RW, 0, 3 * PAGE, 2 * PAGE, 0), 8, ALL_RIGHTS).expect("valid");
+        assert_eq!(frames(&later), Some(3..5));
+        let whole = check(&request(RW, 0, 0, 8 * PAGE, 0), 8, ALL_RIGHTS).expect("valid");
+        assert_eq!(frames(&whole), Some(0..8));
+        let last = check(&request(RW, 0, 7 * PAGE, PAGE, 0), 8, ALL_RIGHTS).expect("valid");
+        assert_eq!(frames(&last), Some(7..8));
+        let uncountable = Asked {
+            allow: Allow::Read,
+            first: u64::MAX,
+            pages: 2,
+            place: Place::Anywhere,
+        };
+        assert_eq!(frames(&uncountable), None);
+    }
+
+    #[test]
+    fn a_refused_run_has_the_status_of_what_refused_it() {
+        assert_eq!(
+            Refused::Tables.status(),
+            Some(Error::Limit),
+            "a bound of the space"
+        );
+        assert_eq!(
+            Refused::Memory.status(),
+            Some(Error::NoMemory),
+            "a want of memory"
+        );
+        assert_eq!(Refused::Other.status(), Some(Error::InvalidArgs));
+        assert_eq!(
+            Refused::Mapped.status(),
+            None,
+            "the place is taken: its map says what that means"
+        );
+    }
+
+    #[test]
     fn a_random_place_fits_in_the_region() {
         for random in [0, 1, u64::MAX, 0x1234_5678_9ABC_DEF0] {
             for pages in [1, 2, 512] {
@@ -551,6 +665,120 @@ mod tests {
         let all = (PLACE_HIGH - PLACE_LOW) / PAGE;
         assert_eq!(place(u64::MAX, all), Some(PLACE_LOW));
         assert_eq!(place(0, all + 1), None);
+    }
+
+    #[test]
+    fn eight_taken_places_in_a_row_are_limit() {
+        // The owner's item 156: a bound of the process's own address space, not a want of
+        // memory, and not a ninth draw.
+        assert_eq!(PLACEMENT_TRIES, 8);
+        let (mut draws, mut takes) = (0u64, 0usize);
+        let mut seen = [0u64; 8];
+        let got = place_at_random(
+            3,
+            || {
+                draws += 1;
+                Some(draws)
+            },
+            |base| {
+                seen[takes] = base;
+                takes += 1;
+                Ok(false)
+            },
+        );
+        assert_eq!(got, Err(Error::Limit));
+        assert_eq!(
+            (draws, takes),
+            (8, 8),
+            "eight draws, each one tried, and no ninth"
+        );
+        // Each try was the place its own draw made.
+        for (random, base) in (1u64..).zip(seen) {
+            assert_eq!(Some(base), place(random, 3));
+        }
+    }
+
+    #[test]
+    fn a_random_place_is_drawn_until_one_is_free() {
+        // Seven taken and the eighth free: the eighth draw's place.
+        let (mut draws, mut takes) = (0u64, 0u32);
+        let got = place_at_random(
+            2,
+            || {
+                draws += 1;
+                Some(draws * 1000)
+            },
+            |_| {
+                takes += 1;
+                Ok(takes == 8)
+            },
+        );
+        assert_eq!(got, Ok(place(8000, 2).expect("fits")));
+        assert_eq!((draws, takes), (8, 8));
+        // A free place ends the search: nothing more is drawn.
+        let mut draws = 0u32;
+        let got = place_at_random(
+            1,
+            || {
+                draws += 1;
+                Some(5)
+            },
+            |_| Ok(true),
+        );
+        assert_eq!(got, Ok(place(5, 1).expect("fits")));
+        assert_eq!(draws, 1);
+        // No entropy: nothing is tried.
+        let mut takes = 0u32;
+        let got = place_at_random(
+            1,
+            || None,
+            |_| {
+                takes += 1;
+                Ok(false)
+            },
+        );
+        assert_eq!(got, Err(Error::NotSupported));
+        assert_eq!(takes, 0);
+        // Entropy that gives out after three draws: not `limit`, which is for eight taken.
+        let (mut draws, mut takes) = (0u64, 0u32);
+        let got = place_at_random(
+            1,
+            || {
+                draws += 1;
+                (draws <= 3).then_some(draws)
+            },
+            |_| {
+                takes += 1;
+                Ok(false)
+            },
+        );
+        assert_eq!(got, Err(Error::NotSupported));
+        assert_eq!(takes, 3);
+        // A try that fails ends the search with its own status, and nothing more is drawn.
+        let mut draws = 0u32;
+        let got = place_at_random(
+            1,
+            || {
+                draws += 1;
+                Some(9)
+            },
+            |_| Err(Error::NoMemory),
+        );
+        assert_eq!(got, Err(Error::NoMemory));
+        assert_eq!(draws, 1);
+        // Pages that fit nowhere in the region: a bad argument, and nothing is tried.
+        let all = (PLACE_HIGH - PLACE_LOW) / PAGE;
+        let mut takes = 0u32;
+        let got = place_at_random(
+            all + 1,
+            || Some(0),
+            |_| {
+                takes += 1;
+                Ok(true)
+            },
+        );
+        assert_eq!(got, Err(Error::InvalidArgs));
+        assert_eq!(takes, 0);
     }
 
     #[test]
@@ -604,12 +832,39 @@ mod tests {
     }
 
     #[test]
+    fn no_rate_makes_a_unit_free() {
+        // At and above a unit a nanosecond. Above it the interval would be 0 without the bound.
+        for per_second in [1_000_000_000, 1_000_000_001, u32::MAX] {
+            let mut budget = Budget::new(Rate {
+                burst: 2,
+                per_second,
+            });
+            assert!(!budget.try_spend(7, 3), "{per_second}: above the burst");
+            assert!(budget.try_spend(7, 2), "{per_second}");
+            assert!(!budget.try_spend(7, 1), "{per_second}: the burst is spent");
+            // A nanosecond later one unit is earned back, not two.
+            assert!(!budget.try_spend(8, 2), "{per_second}");
+            assert!(budget.try_spend(8, 1), "{per_second}");
+            // What a change cost beyond its price still delays the next one.
+            budget.charge(8, 5);
+            assert!(!budget.try_spend(13, 1), "{per_second}: the charge is owed");
+            assert!(budget.try_spend(14, 1), "{per_second}");
+            // No burst allows nothing, at any rate.
+            let mut none = Budget::new(Rate {
+                burst: 0,
+                per_second,
+            });
+            assert!(!none.try_spend(7, 1), "{per_second}: no burst");
+        }
+    }
+
+    #[test]
     fn mappings_are_whole_bounded_and_never_overlap() {
         let mut m: Mappings<u32> = Mappings::new(2);
         let a = 0x0000_2000_0000_0000;
         assert_eq!(m.reserve(a, 2, Allow::ReadWrite, 1), Ok(()));
         // Busy until made: nothing may change it.
-        assert_eq!(m.begin(a, 2), Err(Error::InvalidArgs));
+        assert_eq!(m.begin(a, 2), Err(Error::ShouldWait));
         m.made(a);
         // Overlaps, at either end and inside.
         for (base, pages) in [(a, 1), (a + PAGE, 1), (a - PAGE, 2), (a - PAGE, 4)] {
@@ -629,7 +884,7 @@ mod tests {
         assert_eq!(m.begin(a, 1), Err(Error::InvalidArgs));
         assert_eq!(m.begin(a + PAGE, 1), Err(Error::InvalidArgs));
         assert_eq!(m.begin(a, 2), Ok(Allow::ReadWrite));
-        assert_eq!(m.begin(a, 2), Err(Error::InvalidArgs), "already changing");
+        assert_eq!(m.begin(a, 2), Err(Error::ShouldWait), "already changing");
         m.end(a, Allow::Read);
         assert_eq!(m.get(a), Some((2, Allow::Read, false)));
         assert_eq!(m.remove(a), Some(1));
@@ -642,6 +897,37 @@ mod tests {
             m.reserve(a, 1, Allow::Read, 4),
             Err((Error::InvalidArgs, 4))
         );
+    }
+
+    #[test]
+    fn a_mapping_another_call_is_changing_says_wait() {
+        let mut m: Mappings<u32> = Mappings::new(2);
+        let a = 0x0000_2000_0000_0000;
+        // Being made: the call that maps it has not told its caller yet.
+        assert_eq!(m.reserve(a, 2, Allow::ReadWrite, 1), Ok(()));
+        assert_eq!(m.begin(a, 2), Err(Error::ShouldWait), "being made");
+        assert_eq!(
+            m.get(a),
+            Some((2, Allow::ReadWrite, true)),
+            "the refusal took nothing: it is still its maker's"
+        );
+        m.made(a);
+        // Being changed.
+        assert_eq!(m.begin(a, 2), Ok(Allow::ReadWrite));
+        assert_eq!(m.begin(a, 2), Err(Error::ShouldWait), "being changed");
+        assert_eq!(m.begin(a, 2), Err(Error::ShouldWait), "and again");
+        assert_eq!(m.get(a), Some((2, Allow::ReadWrite, true)));
+        // What is no one mapping is a bad argument, busy or not.
+        assert_eq!(m.begin(a, 1), Err(Error::InvalidArgs));
+        assert_eq!(m.begin(a + PAGE, 1), Err(Error::InvalidArgs));
+        assert_eq!(m.begin(a + 2 * PAGE, 2), Err(Error::InvalidArgs));
+        // A retry takes the mapping once the change is over, with what it now allows ...
+        m.end(a, Allow::Read);
+        assert_eq!(m.begin(a, 2), Ok(Allow::Read));
+        // ... or finds it gone.
+        assert_eq!(m.begin(a, 2), Err(Error::ShouldWait));
+        assert_eq!(m.remove(a), Some(1));
+        assert_eq!(m.begin(a, 2), Err(Error::InvalidArgs));
     }
 
     #[test]

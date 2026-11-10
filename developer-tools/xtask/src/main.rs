@@ -2130,10 +2130,13 @@ fn directory_markers() -> Vec<String> {
 fn memory_markers() -> Vec<String> {
     vec![
         "origin-kernel: memory: two processes share an object by passing its handle, and each reads what the other wrote: true; protect to read-only refuses an increase and makes a write fault at the mapping: true; unmap makes a read fault there: true".into(),
-        "origin-kernel: memory: a fixed address over a mapping is refused, and the mapping keeps what was written to it: true; execute is refused: true; two random placements are apart, page-aligned and in their region: true; closing the handle leaves the mapping working: true".into(),
+        "origin-kernel: memory: a fixed address over a mapping is refused, and the mapping keeps what was written to it: true; execute is refused: true; a handle without write maps nothing writable, and one without read maps nothing: true; two random placements are apart, page-aligned and in their region: true; closing the handle leaves the mapping working: true".into(),
         "origin-kernel: memory: the quota refuses an object past its bound and takes one again once an object is closed; a closed object still mapped keeps its charge; a third mapping past the limit of two is refused: true; once the process has ended its account owes nothing: true".into(),
         "origin-kernel: memory: mapping into another process needs write on its handle, and with it the two share the frame: true; unmapping there needs it too, and the other's next read faults: true".into(),
         "origin-kernel: memory: a hostile unmap loop is refused with should_wait once its budget is spent, changing nothing: true; it is served again once the budget refills: true".into(),
+        "origin-kernel: memory: a map whose address cannot be written to its caller leaves no page and no record, though the caller's budget pays for nothing: true; what taking it back cost is charged, and the caller's next unmap must wait: true".into(),
+        "origin-kernel: memory: a fixed run over a page of the program's own is refused whole, and the page stays: true; a mapping of an object's later pages maps those pages' frames: true; a run past the space's page tables is refused with limit and leaves no page and no record: true".into(),
+        "origin-kernel: memory: an unmap and a protect of a mapping whose map has not returned yet are told to wait (should_wait): true; so are those of a mapping another change holds: true; the refusals changed nothing and spent nothing: true".into(),
         "origin-kernel: memory: every other call of the proof's programs returned what its script says, and each program ended as it should: true".into(),
         "origin-kernel: memory: map, protect and unmap of 16 pages took ".into(),
         " us (QEMU; the kernel's own calls, in a space no processor holds)".into(),
