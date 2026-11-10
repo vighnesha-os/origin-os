@@ -389,3 +389,12 @@ Nothing is built. The work is TASKS item 19b, which writes its contract first (i
 **Left for the next revision of CLAUDE.md, which is your text:** §14 and §24 do not yet name ADR-0017.
 
 **Coming back to you:** item 134, with the storage-encryption ADR; and the trust classes that would let item 125 cost less, with measurements.
+
+## What building ADR-0017's first half found (items 152 and 153): Accepted 2026-11-10
+
+TASKS item 19b built Z1, Z2, Z3, Z5, Z9 and Z10 of ADR-0017, and its gate on the kernel's image found two things the ADR had not foreseen. Both were put to you in the coordinating session, with six of ADR-0016's (items 146 to 151, recorded by the session that wrote that ADR). You answered **"Accept all"** to one question covering the eight. The coordinating session relayed the answer, and the words each was put in, to the session that built 19b, which records the two here. Items 142 to 151 are on other branches.
+
+| # | Question | Answer |
+|---|---|---|
+| 152, answered | The toolchain's prebuilt `core`, `alloc` and `compiler_builtins` are outside ADR-0017 Z10's "an INT3 after every RET" and "no jump table": stable Rust cannot rebuild them, and in the kernel of that day they hold 113 returns, 33 without an INT3, and 2 jump tables. Accept the gap by name, with the count printed on every run and looked at again at each toolchain upgrade, as ADR-0017 Amendment 1? A pinned nightly compiler under §12 was offered and not chosen. | **Accept** |
+| 153, answered | More than half the kernel's calls go through the global offset table, because the compiler emits a relocation the linker cannot turn into a direct call. Make it a task of its own, not a condition of ADR-0011 N14 step 4: find a fix on stable Rust (link-time optimization is the candidate, untried), measure before and after, then have the image gate hold the count? | **Accept.** TASKS item 33; not started |

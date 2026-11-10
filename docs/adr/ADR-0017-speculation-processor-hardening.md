@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-10, as proposed, with the recommended answer to each of the nine questions at the end (decision sheet items 124 to 132; CLAUDE.md §18). The owner's answer was "Accept all", to one question that covered these nine and the nine acceptances of `THREAT_MODEL_SYSTEM.md`, in the session that wrote both. **Nothing here is built,** and no processor in scope has been run. No user-visible ABI changes (§84). Two answers touch accepted ADRs when the work is built: ADR-0003 K8 and ADR-0005 P4 will be amended to describe the FRED entry path (item 127), and ADR-0013's table gains a Report row (item 131). It is the ADR decision item 112 asked for. ADR-0011 N14 step 4 still waits for Z2, Z3, Z5, Z9 and Z10 to be built |
+| Status | **Accepted** by the owner on 2026-11-10, as proposed, with the recommended answer to each of the nine questions at the end (decision sheet items 124 to 132; CLAUDE.md §18). The owner's answer was "Accept all", to one question that covered these nine and the nine acceptances of `THREAT_MODEL_SYSTEM.md`, in the session that wrote both. **Z1, Z2, Z3, Z5, Z9 and Z10 are built** (TASKS item 19b; "As built" below), under QEMU's software processor, which has none of the controls: no control has been written on a processor that has it. Z4, Z6, Z7, Z8 and Z12 are not built. No processor in scope has been run. No user-visible ABI changes (§84). Two answers touch accepted ADRs when the work is built: ADR-0003 K8 and ADR-0005 P4 will be amended to describe the FRED entry path (item 127), and ADR-0013's table gains a Report row (item 131). It is the ADR decision item 112 asked for. ADR-0011 N14 step 4 waited for Z2, Z3, Z5, Z9 and Z10; it now waits for them to be run on a processor that has the controls. **Amendment 1 (below): Accepted** by the owner on 2026-11-10 (item 152): the toolchain's prebuilt libraries are outside Z10, by name |
 | Requires | CLAUDE.md P0, P1, §12 to §14, §16, §18 ("Speculation and processor hardening"), §24, §58, §74, rules 14, 16, 21, 30 and 40 |
 | Evidence | `docs/research/2026-11-10-speculation-processor-hardening.md` ("the ledger"). Documents only: **no processor in scope has been run**, and no cost below is measured |
 | Code | None changed. The code half (TASKS item 19b) would change `framekernel/frame/src/cpu.rs`, `trap.rs`, `usercopy.rs` and `smp.rs`, add one framework module, and touch `framekernel/src/handles.rs`, the OIDL generator's dispatcher, `.cargo/config.toml` and `developer-tools/xtask` |
@@ -215,9 +215,52 @@ On the path Z6 keeps for processors without FRED:
 | A hypervisor above Origin | To withhold or misreport a control | Nothing: a guest cannot check its host | Accepted in the system model |
 | A processor outside the scope | To be affected by what Z11 does not build | Z1 reports it | The machine is unprotected and says so |
 
+## As built: task 19b (2026-11-10)
+
+The decisions above stand as accepted. This section records what building six of them found, so that the text above is not read as more than the code does. One finding was put to the owner and is Amendment 1, at the end.
+
+| Decision | Where it is | What the code does that the text above does not say |
+|---|---|---|
+| Z1 | `origin_frame::speculation` (the decision and the record, safe code), `cpu::read_speculation` and `cpu::init_speculation` | Each processor runs it from `load_tables`, before anything else. The plan and whether the registers read back are kept per processor in one atomic word. **Not built:** the pass after a resume from sleep (there is no sleep yet), and the typed interface |
+| Z2 | The same; the trap entry in `cpu.rs` | `IA32_SPEC_CTRL` is written whole, once, where any bit of it is enumerated. The entry zeroes every general-purpose register but RSP and RDI, on every entry, not only from ring 3: the saved values come back from the frame. RBP is zeroed by a conditional move for an entry from ring 3 only, because from ring 0 it is the chain a backtrace follows |
+| Z3 | `speculation::Ledger`, `cpu::entering_process`, one call in the scheduler's `follow_thread` | The first process a processor takes up counts as a change. The barrier is issued at the switch, which is before the thread can reach ring 3 |
+| Z5 | The same plan | STIBP follows AMD's two bits (Fn8000_0008_EBX[15] and [17]) whatever the maker's name, as every setting follows its own bit |
+| Z9 | `origin_frame::nospec`; two sequences in `cpu.rs` | **The form's table is `nospec::choose`,** because the CPU identification table (TASKS item 16) does not exist yet. The mask is CMP and CMOVAE, which is on both vendors' lists. **A third thing goes through it besides an index and an address: a count** that sizes a piece of a kernel buffer (`nospec::length`), at three places in `syscall.rs`. `THREAT_MODEL_SYSCALLS.md` has the list. **AMD's LFENCE control** is set only where the processor does not report Fn8000_0021_EAX[2], its family is one AMD's mitigation G-2 says has the register, and no hypervisor runs it (ledger §3.14) |
+| Z10 | `.cargo/config.toml`; `developer-tools/xtask/src/image.rs` | See Amendment 1 below. The gate also reads the trap entry, since no boot proof can see Z2's register clearing from inside. It found one return nobody had listed: the far return that reloads CS in `load_tables` |
+
+**Boot proofs and their rows (ADR-0013):** "speculation controls" (Report, item 131), "index and address clamps" (Refuse) and "IBPB at each change of process" (Refuse).
+
+**What no test here shows.** What a processor does on a wrongly guessed path: no boot proof can, and QEMU's processor does not speculate. That any control takes effect: the development machine's emulator has none, so every write is unexercised until CI's boots under KVM. The costs: the figures the boot prints are an emulator's.
+
+### Amendment 1: the toolchain's prebuilt libraries are outside Z10 (decision item 152)
+
+**Status: Accepted by the owner on 2026-11-10, as recommended (decision sheet item 152; CLAUDE.md §18).** The owner's answer was "Accept all" to eight recommendations put in the coordinating session, which relayed it to the session that built 19b. Built: the gate already behaves this way.
+
+**What Z10 now says.** "An INT3 after every RET" and "no jump table" hold for **the code the build compiles**. The toolchain ships `core`, `alloc` and `compiler_builtins` already compiled for the kernel's target, without the kernel's options, and stable Rust cannot rebuild them. Their functions that are not generic arrive in the image as built, and are outside both rules, **accepted by name**.
+
+- The gate holds every function the build compiles, and fails on one that breaks either rule.
+- It prints the libraries' count on every run. In the kernel of 2026-11-10: 113 returns, 33 of them without an INT3, and 2 jump tables, both in `core::fmt::Formatter` (`pad` and `pad_integral`).
+- **The question is looked at again at every toolchain upgrade (§15):** whether the new compiler can rebuild them on stable, and what the count has become.
+
+**Evidence.** The image, read by the gate and by a second script in the coordinating session, which found 32 returns in 27 functions where the gate finds 33. The thirty-third is `memmove`'s last return, the last instruction of the code section: nothing follows it there, and the gate counts that as no INT3. Half are in `core::fmt` (16); the rest are in `core`'s string and byte searches (5), `alloc` (4), `__udivti3` (3), `compiler_builtins`' byte comparison (2), `memcmp` and `memmove`. AMD asks for an INT3 after a return on every one of its processors (ledger §3.6, mitigation G-5).
+
+**Alternatives.**
+
+| Option | Why not |
+|---|---|
+| Pin a nightly compiler for `-Z build-std` | It closes the gap. It also changes the compiler baseline: §12's exception process, a second toolchain in CI, and a build the stable compiler cannot reproduce. Offered and not chosen |
+| Origin's own `memcpy`, `memmove`, `memset` and `memcmp` in the framework | Shrinks the gap by a few returns. `core::fmt` and the division helper stay. Not ruled out for later |
+| Let the gate fail on the libraries | No build would pass |
+
+**Trade-offs.** A stated part of the accepted Z10 does not reach the 113 returns in those libraries, about a tenth of the image's, and 33 of them have no INT3. What stands against it: the exposure is straight-line speculation past a return, on AMD processors, in formatting, byte searching and comparison, vector growth and 128-bit division, and two tables indexed by a formatter's alignment, which no program chooses directly. What it buys: one compiler, the stable one.
+
+**Migration consequences.** None in the code. `THREAT_MODEL_SYSCALLS.md` row I2 names the gap. The toolchain-upgrade task (§15) gains a step. If a later compiler can rebuild the libraries on stable, the gate's exception is removed and this amendment is closed.
+
+**Threat model.** No new interface. The attacker is the hostile program of `THREAT_MODEL_SYSTEM.md`, steering the kernel's speculation; this is a residue of row I2, named there.
+
 ## What this does not prove
 
-- **Anything.** It is a decision, not code, and no processor in scope has been run (§74, rule 30). Accepting it changed neither.
+- **Anything about a processor.** No processor in scope has been run (§74, rule 30). Six of the decisions are code now ("As built" above), run only under an emulator that has none of the controls.
 - That Panther Lake, Wildcat Lake or Clearwater Forest set the bits Intel's table implies. The table's own key says a processor that is not affected may not report it.
 - That AMD's FRED behaves as Intel's chapter describes.
 - That masking holds on Intel's 2026 family 6 models. It rests on a statement written before they existed.
