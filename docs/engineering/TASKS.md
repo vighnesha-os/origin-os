@@ -139,6 +139,11 @@
     | Acceptance conditions | The threat model, the ledger and the Proposed ADR are committed on this branch, unpushed. The threat model does what the objective lists, and marks the acceptances that are the owner's. The ADR has §18's sections, a threat model (§58) and numbered questions with a recommended answer each. Every claim about a processor has its citation. The final report gives the questions and what is unverified |
 
     **Result of 19a, 2026-11-10.** Written and committed on the branch, unpushed: the ledger (`docs/research/2026-11-10-speculation-processor-hardening.md`), `THREAT_MODEL_SYSTEM.md`, row E12 of `THREAT_MODEL_SYSCALLS.md` (a nested NMI: Open) and `ADR-0017` (**Proposed**). The ADR ends in nine questions for the owner, and the system model proposes nine acceptances that are the owner's to make. Nothing was built, booted or measured, and no processor in scope was run: every statement about a processor is a vendor document's. The index-masking primitive and everything else in the ADR are 19b, which does not start until the owner has answered.
+
+    **Accepted, 2026-11-10.** The owner answered "Accept all" to the ADR's nine questions and the system model's nine acceptances (decision items 124 to 141). ADR-0017 is **Accepted** and not built. 19b may start once it has written its contract (item 122). Three things it must fit around:
+    - it changes `framekernel/frame/src/cpu.rs`, so it follows task 17's edits to that file, and its new framework module holds `unsafe`, so it joins the list task 17's gate reads;
+    - the form its index primitive takes comes from the CPU identification table (item 16), or from a stand-in that reads the vendor and family until that table exists;
+    - N14 step 4 needs Z2, Z3, Z5, Z9 and Z10. FRED, LASS, shadow stacks and the nested-NMI guard (Z6, Z7, Z8, Z12) are needed before any claim about real hardware, not before step 4.
 20. **The clock experiment (item 114):** `prove_consistent` with `LFENCE; RDTSC`, on the CI runners that showed the step, from a trial branch. The result goes in the TSC ledger. If it supports one, a fast-path amendment to ADR-0012 is put to the owner.
 21. **The four statements (item 120):**
     - `origin-version.toml`'s comment says what the loader does today;

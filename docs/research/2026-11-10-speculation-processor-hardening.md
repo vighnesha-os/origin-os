@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Date | 2026-11-10 |
-| For | `docs/adr/ADR-0017-speculation-processor-hardening.md` (Proposed); `docs/engineering/THREAT_MODEL_SYSTEM.md`; row E12 of `docs/engineering/THREAT_MODEL_SYSCALLS.md`; TASKS item 19 (decision item 112) |
+| For | `docs/adr/ADR-0017-speculation-processor-hardening.md` (the owner accepted it on 2026-11-10, after this ledger was written); `docs/engineering/THREAT_MODEL_SYSTEM.md`; row E12 of `docs/engineering/THREAT_MODEL_SYSCALLS.md`; TASKS item 19 (decision item 112) |
 | Requires | CLAUDE.md §3 (original source), §9 (verify the compiler locally), §14, §16 (research first, at today's revision), §24, §58, §74 and rule 30 (QEMU is not hardware) |
 | Method | Intel's and AMD's own documents only, read on 2026-11-10 from their own servers. Each PDF was fetched into memory, hashed and searched there; none was saved (decision items 18 to 20 and 23). Web pages were read in a browser. No operating system's source was opened (§3), and no secondary source is used below. Section 8 says how, and what went wrong. |
 | Scope | The processors CLAUDE.md's header and ADR-0009 Amendment 1 declare: Intel generations launched in 2026 or later, and AMD generations launched in 2026 or later with Zen 5 or newer cores |
