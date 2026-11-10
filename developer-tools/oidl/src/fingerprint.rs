@@ -165,13 +165,27 @@ fn write_struct(out: &mut String, s: &Struct, minor: u16) {
     }
 }
 
+/// How a parameter's or result's type is rendered at `minor`. A `sized struct` of this library
+/// is named with its size at that minor: a field it gains in a later minor is not part of this
+/// one (§9, §13), so its size must not reach this minor's digest either. Only a parameter or
+/// result can be a sized struct, never a field or an element, so this is the one place it
+/// needs the minor.
+fn param_type_text(ty: &Type, library: &str, minor: u16) -> String {
+    match ty {
+        Type::Struct(s) if s.sized && s.library == library => {
+            format!("struct({},{})", s.name, s.size_at(minor))
+        }
+        other => type_text(other, library),
+    }
+}
+
 fn write_params(out: &mut String, label: &str, params: &[Param], minor: u16, library: &str) {
     for param in params.iter().filter(|p| p.since.minor <= minor) {
         let _ = write!(
             out,
             " {label} {} {} since={}",
             param.name,
-            type_text(&param.ty, library),
+            param_type_text(&param.ty, library, minor),
             param.since
         );
         if param.nonzero {
