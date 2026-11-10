@@ -4,7 +4,7 @@
 |---|---|
 | Required by | CLAUDE.md §58 ("Threat-model every privileged interface"), §28, §29, §73; ADR-0011 N14 step 3, task S3-5a |
 | Covers | `framekernel/frame/src/userspace.rs`, `framekernel/frame/src/tlb.rs`, `framekernel/frame/sync/src/shootdown.rs`, `framekernel/frame/sync/src/refcount.rs`, `framekernel/frame/src/vm.rs` (the kernel half), `framekernel/paging`; ADR-0004 H2 |
-| Written | 2026-11-09, with the implementation. S3-7 combines it with the threat model of the system-call boundary. |
+| Written | 2026-11-10, with the implementation. S3-7 combines it with the threat model of the system-call boundary. |
 | Evidence | QEMU only. "Proven" means a boot proof with a negative control under QEMU 11.1 TCG. "Modelled" means a Loom model of the real code, with a committed negative control, within the bounds it prints. Nothing has run on hardware (§74). The paging rules are as the code cites them, from Intel SDM Vol. 3A §4.10 ("Caching Translation Information"), §4.10.4 and §4.10.5; those sections were not re-read for this document. |
 
 ## What is being protected
