@@ -30,8 +30,9 @@ pub(crate) struct Hit {
     pub(crate) what: String,
 }
 
-/// The names that are refused wherever they stand, in any letter case and inside longer names.
-const REFUSED_NAMES: &[&str] = &["target_family", "target_env"];
+/// The names that are refused wherever they stand, in any letter case and inside longer names,
+/// each with what the userspace triple answers.
+const REFUSED_NAMES: &[(&str, &str)] = &[("target_family", "unix"), ("target_env", "gnu")];
 /// What a build script reads to ask the questions `cfg(unix)` and `cfg(windows)` ask.
 const REFUSED_VARIABLES: &[&str] = &["CARGO_CFG_UNIX", "CARGO_CFG_WINDOWS"];
 /// The predicates that are short for a `target_family`.
@@ -51,8 +52,18 @@ pub(crate) fn rust_hits(source: &str) -> Vec<Hit> {
         // Names that are refused wherever they stand.
         if matches!(token.kind, Kind::Ident | Kind::Str { .. }) {
             let lower = token.text.to_ascii_lowercase();
-            if let Some(name) = REFUSED_NAMES.iter().find(|name| lower.contains(**name)) {
-                hit(token, format!("`{}` names `{name}`", token.text));
+            if let Some(&(name, answer)) =
+                REFUSED_NAMES.iter().find(|(name, _)| lower.contains(name))
+            {
+                let named = if lower == name {
+                    format!("`{name}`")
+                } else {
+                    format!("`{}` names `{name}`", token.text)
+                };
+                hit(
+                    token,
+                    format!("{named}: on the userspace triple it is \"{answer}\""),
+                );
             } else if let Some(variable) = REFUSED_VARIABLES
                 .iter()
                 .find(|variable| token.text.contains(**variable))
@@ -290,7 +301,8 @@ mod tests {
                 "target_env",
             ),
         ] {
-            assert_caught(source, &format!("names `{name}`"));
+            assert_caught(source, &format!("`{name}`"));
+            assert_caught(source, "on the userspace triple it is");
         }
         assert_caught(
             r#"if std::env::var_os("CARGO_CFG_UNIX").is_some() {}"#,
@@ -374,11 +386,11 @@ mod tests {
             ),
             (
                 "[target.'cfg(target_env = \"gnu\")'.dependencies]\n",
-                "names `target_env`",
+                "`target_env`: on the userspace triple it is \"gnu\"",
             ),
             (
                 "[target.'cfg(target_family = \"unix\")'.build-dependencies]\n",
-                "names `target_family`",
+                "`target_family`: on the userspace triple it is \"unix\"",
             ),
         ] {
             let hits = manifest_hits(text);
@@ -408,8 +420,14 @@ mod tests {
         assert!(real.contains(condition));
         for (planted, needle) in [
             ("#[cfg(not(unix))]", "`unix` as a `cfg` predicate"),
-            ("#[cfg(target_family = \"unix\")]", "names `target_family`"),
-            ("#[cfg(not(target_env = \"gnu\"))]", "names `target_env`"),
+            (
+                "#[cfg(target_family = \"unix\")]",
+                "`target_family`: on the userspace",
+            ),
+            (
+                "#[cfg(not(target_env = \"gnu\"))]",
+                "`target_env`: on the userspace",
+            ),
             (
                 "#[cfg(not(target_os = \"linux\"))]",
                 "`target_os = \"linux\"`",
