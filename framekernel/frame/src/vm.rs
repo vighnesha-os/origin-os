@@ -1,10 +1,12 @@
 //! The kernel's address space once it is live, behind a lock, so pages can be mapped or
 //! remapped later: firmware tables the kernel reads (ACPI), the kernel stacks in their region
-//! (`stack`, ADR-0004 Amendment 1, A2), guard pages and the AP start-up trampoline.
+//! (`stack`, ADR-0004 Amendment 1, A2), the guard pages of the boot processor's interrupt
+//! stacks and the AP start-up trampoline.
 //!
 //! Every change that removes access is followed by a TLB shootdown (`tlb`) once the lock is
 //! released, so no processor keeps the old translation; changes that only add access need
 //! none. Kernel-half mappings are global; the identity pages of the AP trampoline are not.
+//! Nothing here splits a page of the direct map after boot.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -244,16 +246,18 @@ pub unsafe fn unmap(virt: u64) -> Result<u64, MapError> {
     Ok(phys)
 }
 
-/// Turns `pages` into guard pages: unmapped, so any access faults, on every processor once this
-/// returns, with one full TLB flush. A 2 MiB leaf covering one is split first.
+/// Turns pages of the kernel's image into guard pages: unmapped, so any access faults, on every
+/// processor once this returns, with one full TLB flush. A 2 MiB leaf covering one is split
+/// first. Only the boot processor's interrupt stacks have guards in the image (`cpu`), since
+/// they exist before anything else; every other guard is the unmapped space below a stack in
+/// the stack region (`stack`). A page outside the image window is refused, with nothing
+/// changed: nothing splits a page of the direct map after boot (ADR-0004 Amendment 1, A2).
 pub(crate) fn make_guards(pages: &[u64]) -> Result<(), MapError> {
-    unmap_guards(pages)?;
-    crate::tlb::shootdown_all();
-    Ok(())
-}
-
-/// Splits and unmaps each page under the lock; the caller shoots down.
-fn unmap_guards(pages: &[u64]) -> Result<(), MapError> {
+    // The image window is the top of the address space: it ends where the addresses do.
+    use origin_paging::layout::KERNEL_WINDOW;
+    if let Some(&outside) = pages.iter().find(|&&page| page < KERNEL_WINDOW) {
+        return Err(MapError::NotMapped(outside));
+    }
     crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
@@ -261,8 +265,10 @@ fn unmap_guards(pages: &[u64]) -> Result<(), MapError> {
             k.space.split_large(&mut k.tables, page)?;
             k.space.unmap(&mut k.tables, page)?;
         }
-        Ok(())
-    })
+        Ok::<(), MapError>(())
+    })?;
+    crate::tlb::shootdown_all();
+    Ok(())
 }
 
 /// Whether the `pages` pages from `virt` lie in the kernel stacks' region.
