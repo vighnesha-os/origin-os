@@ -136,6 +136,30 @@ With the early console and the wait-queue and timer fixes merged (`31c3d39`), `c
 | Signature block, certificate chain, trust store | encodings decided (S1–S4); parser (`onbf-format`), entry verification and the KRN policy (`onbf-verify`, proven against reference-signed vectors and `onbf-sign`'s signatures) and the loader's compiled-in store done, with a test key only; OKC chains specified (errata O2–O5) and waiting for the SYS profile's signed time; trust anchor decided (B7) |
 | Signing (host) | `onbf-pack sign` and `keygen`, with Ed25519 and ML-DSA-87 signing written in Rust (`onbf-sign`, host only: the loader and kernel cannot reach it). Keygen and signing match the independent Python references and OpenSSL byte for byte; every image is self-verified with the loader's code. Side-channel assessment recorded; zeroization is best effort, accepted by the owner for development keys; agent-reviewed, not independently audited. A test key is derived from public text; no release key exists |
 
+## The design review (2026-11-10): accepted, recorded, almost nothing built
+
+The owner asked for a very careful review of CLAUDE.md and the design documents. `docs/engineering/DESIGN_REVIEW_2026-11-10.md` has 19 findings, each checked against the code at `land/s3-part2` (`02d9ba8`) and `docs/editions-device-sdk` (`a95d05b`). The owner accepted its 18 decisions the same day. They are:
+
+- decision sheet items 106–123;
+- CLAUDE.md revision 7.4;
+- ADR-0005 Amendment 6, ADR-0011 Amendment 1, ADR-0013 Amendment 1 and ADR-0014 Amendment 1;
+- notes in ADR-0004, ADR-0012 and ADR-0015.
+
+**Done:**
+
+- The editions branch (revision 7.3, ADR-0014, ADR-0015, items 71–97) is committed, pushed and merged with the landing line.
+- The commit that held Intel's VT-d PDF is on no branch, and it was never pushed. `.gitignore` now keeps `specifications/` and PDFs out.
+
+**Not built, and needed before ADR-0011 N14 step 4 puts a real program in ring 3:**
+
+- Twelve `asm!` blocks declare `preserves_flags`, and five of them write the flags (TASKS item 17).
+- Randomness comes straight from the processor's instructions, with no generator and no health gate (TASKS item 18).
+- There is no system threat model, and no decision on speculative execution (TASKS item 19).
+
+The rest is TASKS items 20 to 30. One of them is an ABI limit: a 32-bit handle still gives a process about 4.29 billion handle creations in its life (item 24).
+
+No human has reviewed the review. Nothing was built, tested or booted for it.
+
 ## Waiting on the owner
 
 ADR-0002 with B7, ADR-0003, G1 and the errata readings were decided on 2026-11-07, under the owner's instruction to finalise with the recommended options. The owner accepted ADR-0004 and ADR-0005, and on 2026-11-08 ADR-0005's Amendment 1 (what the first system-call slice needed and P1–P12 did not say), with the recommended options.
