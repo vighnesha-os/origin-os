@@ -1917,6 +1917,7 @@ fn memory_markers() -> Vec<String> {
         "origin-kernel: memory: the quota refuses an object past its bound and takes one again once an object is closed; a closed object still mapped keeps its charge; a third mapping past the limit of two is refused: true; once the process has ended its account owes nothing: true".into(),
         "origin-kernel: memory: mapping into another process needs write on its handle, and with it the two share the frame: true; unmapping there needs it too, and the other's next read faults: true".into(),
         "origin-kernel: memory: a hostile unmap loop is refused with should_wait once its budget is spent, changing nothing: true; it is served again once the budget refills: true".into(),
+        "origin-kernel: memory: every other call of the proof's programs returned what its script says, and each program ended as it should: true".into(),
         "origin-kernel: memory: map, protect and unmap of 16 pages took ".into(),
         " us (QEMU; the kernel's own calls, in a space no processor holds)".into(),
         "origin-kernel: memory: every process, object and mapping of the proof is gone: heap ".into(),

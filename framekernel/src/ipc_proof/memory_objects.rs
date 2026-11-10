@@ -264,8 +264,8 @@ impl<T> Run<T> {
     }
 
     /// Whether the call it reported at `at` returned `status`.
-    fn returned(&self, at: usize, status: Error) -> bool {
-        self.process.reports().get(at) == Some(&(status.raw() as u64))
+    fn returned(&self, at: usize, status: i64) -> bool {
+        self.process.reports().get(at) == Some(&(status as u64))
     }
 }
 
@@ -282,23 +282,31 @@ fn start<T>(program: Program, marks: T, cpu: CpuIndex) -> Option<Run<T>> {
 // ------------------------------------------------------------------ sharing
 
 struct AMarks {
+    /// Its map of the object.
+    map: usize,
     /// B's word, read through A's mapping.
     seen_b: usize,
-    /// The protect that would add write back.
-    increase: usize,
+    /// The protect to read-only, and the one that would add write back after it.
+    protect: usize,
     /// A's own word, still readable once the mapping is read-only.
     readable: usize,
 }
 
 struct BMarks {
+    /// Its map of the object A passed, and A's word read through it.
+    map: usize,
     seen_a: usize,
     /// The fixed map over B's own mapping, and what that mapping reads after it.
     over: usize,
     kept: usize,
     /// The map that asks for execute.
     execute: usize,
+    /// The two random maps' statuses, then their addresses, each in two words.
     random: usize,
-    after_close: usize,
+    /// The handle's close, and what the mapping reads after it.
+    close: usize,
+    /// The unmap, before the read that must fault.
+    unmap: usize,
 }
 
 /// A and B share an object by passing its handle (see the module documentation).
@@ -320,6 +328,7 @@ fn sharing(cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> Option<(Run<AMarks>
     ));
     let s = &mut a.script;
     s.call(create_object(OBJECT_2, 1, OK));
+    let a_map = s.reported();
     s.call(map_object(h(0), h(1), A_MAP, out(0), OK));
     s.call(copy32(VALUE_A_AT, FIXED_A));
     // The handle moves to B: sharing is by passing it.
@@ -333,8 +342,8 @@ fn sharing(cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> Option<(Run<AMarks>
     s.call(read("", to_b, RBUF, 16, OK));
     let seen_b = s.reported();
     s.call(value_at("", FIXED_A + 4, 0));
+    let protect = s.reported();
     s.call(protect_mapping(h(0), FIXED_A, 2 * PAGE, READ, OK));
-    let increase = s.reported();
     s.call(protect_mapping(
         h(0),
         FIXED_A,
@@ -351,6 +360,7 @@ fn sharing(cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> Option<(Run<AMarks>
     s.call(readable(from_a));
     s.call(read_handles("", from_a, OK));
     let object = Hd(RECV);
+    let b_map = s.reported();
     s.call(map_object(h(0), object, B_MAP, out(0), OK));
     let seen_a = s.reported();
     s.call(value_at("", FIXED_B, 0));
@@ -375,17 +385,18 @@ fn sharing(cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> Option<(Run<AMarks>
         out(1),
         Error::AccessDenied.raw(),
     ));
+    let random = s.reported();
     s.call(map_object(h(0), object, B_ANYWHERE, out(2), OK));
     s.call(map_object(h(0), object, B_ANYWHERE, out(3), OK));
-    let random = s.reported();
     for k in [2, 3] {
         s.call(value_at("", out(k), 0));
         s.call(value_at("", out(k) + 4, 0));
     }
     // Closing the handle leaves the mapping; unmapping it does not.
+    let close_at = s.reported();
     s.call(close("", object, OK));
-    let after_close = s.reported();
     s.call(value_at("", FIXED_B, 0));
+    let unmap = s.reported();
     s.call(unmap_mapping(h(0), FIXED_B, 2 * PAGE, OK));
     s.call(faulting_read(FIXED_B));
 
@@ -393,20 +404,23 @@ fn sharing(cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> Option<(Run<AMarks>
     let b = start(
         b,
         BMarks {
+            map: b_map,
             seen_a,
             over,
             kept,
             execute,
             random,
-            after_close,
+            close: close_at,
+            unmap,
         },
         bsp,
     )?;
     let a = start(
         a,
         AMarks {
+            map: a_map,
             seen_b,
-            increase,
+            protect,
             readable: readable_at,
         },
         far,
@@ -440,8 +454,15 @@ fn quotas(bsp: CpuIndex, tsc_hz: u64) -> Option<Run<()>> {
 
 // ------------------------------------------------------------------ another process
 
+/// Where C's reports of its maps into T, and of its unmaps there, begin: each the weak
+/// handle's, then the strong one's.
+struct CMarks {
+    map: usize,
+    unmap: usize,
+}
+
 /// C maps its object into T (see the module documentation).
-fn into_another(bsp: CpuIndex, tsc_hz: u64) -> Option<(Run<()>, Run<usize>)> {
+fn into_another(bsp: CpuIndex, tsc_hz: u64) -> Option<(Run<CMarks>, Run<usize>)> {
     let mut t = Program::new(limits(0, 1, PLENTY))?;
     let mut c = Program::new(limits(1, 1, PLENTY))?;
     let (c_end, t_end) = ipc::create_channel(&c.image.process.account).ok()?;
@@ -488,15 +509,17 @@ fn into_another(bsp: CpuIndex, tsc_hz: u64) -> Option<(Run<()>, Run<usize>)> {
     s.call(create_object(OBJECT_1, 1, OK));
     s.call(map_object(h(0), h(1), C_MAP, out(0), OK));
     s.call(copy32(VALUE_C_AT, FIXED_C));
+    let map = s.reported();
     s.call(map_object(weak, h(1), T_MAP, out(1), denied));
     s.call(map_object(strong, h(1), T_MAP, out(1), OK));
     s.call(write("", to_t, MSG, 4, OK));
     s.call(readable(to_t));
     s.call(read("", to_t, RBUF, 16, OK));
+    let unmap = s.reported();
     s.call(unmap_mapping(weak, FIXED_T, PAGE, denied));
     s.call(unmap_mapping(strong, FIXED_T, PAGE, OK));
     s.call(write("", to_t, MSG, 4, OK));
-    let c = start(c, (), bsp)?;
+    let c = start(c, CMarks { map, unmap }, bsp)?;
     let _ = await_end(&c.process, tsc_hz, 10) && await_end(&t.process, tsc_hz, 10);
     Some((c, t))
 }
@@ -508,6 +531,8 @@ struct HMarks {
     refused: usize,
     /// What the still-mapped page reads.
     still: usize,
+    /// The unmap served once the budget has refilled.
+    served: usize,
 }
 
 /// H's loop, refused once its budget is spent and served again once it has refilled (see the
@@ -538,8 +563,17 @@ fn hostile_loop(bsp: CpuIndex, tsc_hz: u64) -> Option<Run<HMarks>> {
     let still = s.reported();
     s.call(value_at("", FIXED_H, 0));
     s.call(readable(from_kernel));
+    let served = s.reported();
     s.call(unmap_mapping(h(0), FIXED_H, PAGE, OK));
-    let run = start(hp, HMarks { refused, still }, bsp)?;
+    let run = start(
+        hp,
+        HMarks {
+            refused,
+            still,
+            served,
+        },
+        bsp,
+    )?;
     // Once H has been refused, its budget gets the time to refill; then H goes on.
     sched::yield_until(|| run.process.reports().len() > still, tsc_hz, 10);
     let until = time::monotonic_nanos().saturating_add(REFILL_NANOS);
@@ -607,14 +641,17 @@ fn parts(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> b
         return false;
     };
 
-    let shared = a.statuses()
-        && b.statuses()
+    // Each detail reads only the reports it is about; the summary line after them checks
+    // every other call and how each program ended.
+    let shared = a.returned(a.marks.map, OK)
+        && b.returned(b.marks.map, OK)
         && b.word(b.marks.seen_a) == Some(VALUE_A)
         && a.word(a.marks.seen_b) == Some(VALUE_B);
-    let write_fault = a.faulted_at(FIXED_A)
-        && a.returned(a.marks.increase, Error::AccessDenied)
-        && a.word(a.marks.readable) == Some(VALUE_A);
-    let read_fault = b.faulted_at(FIXED_B);
+    let write_fault = a.returned(a.marks.protect, OK)
+        && a.returned(a.marks.protect + 1, Error::AccessDenied.raw())
+        && a.word(a.marks.readable) == Some(VALUE_A)
+        && a.faulted_at(FIXED_A);
+    let read_fault = b.returned(b.marks.unmap, OK) && b.faulted_at(FIXED_B);
     let _ = writeln!(
         com1,
         "origin-kernel: memory: two processes share an object by passing its handle, and each reads what the other wrote: {shared}; protect to read-only refuses an increase and makes a write fault at the mapping: {write_fault}; unmap makes a read fault there: {read_fault}{}",
@@ -623,28 +660,31 @@ fn parts(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> b
 
     let reports = b.process.reports();
     let placed = [
-        reported_u64(&reports, b.marks.random),
         reported_u64(&reports, b.marks.random + 2),
+        reported_u64(&reports, b.marks.random + 4),
     ];
-    let random = match placed {
-        [Some(one), Some(two)] => {
-            one != two
-                && [one, two]
-                    .iter()
-                    .all(|&at| at % PAGE == 0 && (PLACE_LOW..PLACE_HIGH).contains(&at))
-        }
-        _ => false,
-    };
+    let maps_ok = b.returned(b.marks.random, OK) && b.returned(b.marks.random + 1, OK);
+    let random = maps_ok
+        && match placed {
+            [Some(one), Some(two)] => {
+                one != two
+                    && [one, two]
+                        .iter()
+                        .all(|&at| at % PAGE == 0 && (PLACE_LOW..PLACE_HIGH).contains(&at))
+            }
+            _ => false,
+        };
     let no_replace =
-        b.returned(b.marks.over, Error::InvalidArgs) && b.word(b.marks.kept) == Some(VALUE_A);
-    let no_execute = b.returned(b.marks.execute, Error::AccessDenied);
-    let kept = b.word(b.marks.after_close) == Some(VALUE_A);
+        b.returned(b.marks.over, Error::InvalidArgs.raw()) && b.word(b.marks.kept) == Some(VALUE_A);
+    let no_execute = b.returned(b.marks.execute, Error::AccessDenied.raw());
+    let kept = b.returned(b.marks.close, OK) && b.word(b.marks.close + 1) == Some(VALUE_A);
     let _ = writeln!(
         com1,
         "origin-kernel: memory: a fixed address over a mapping is refused, and the mapping keeps what was written to it: {no_replace}; execute is refused: {no_execute}; two random placements are apart, page-aligned and in their region: {random}; closing the handle leaves the mapping working: {kept}{}",
         verdict(no_replace && no_execute && random && kept)
     );
 
+    // Every call of Q's is about its quota.
     let quota = q.statuses() && q.exited();
     // Its objects went with its handles and mappings, and their charge with them.
     let owes_nothing = q.process.account.committed() == 0;
@@ -654,25 +694,44 @@ fn parts(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> b
         verdict(quota && owes_nothing)
     );
 
-    let cross = c.statuses() && c.exited() && t.word(t.marks) == Some(VALUE_C);
-    let cross_unmap = t.statuses() && t.faulted_at(FIXED_T);
+    let denied = Error::AccessDenied.raw();
+    let cross = c.returned(c.marks.map, denied)
+        && c.returned(c.marks.map + 1, OK)
+        && t.word(t.marks) == Some(VALUE_C);
+    let cross_unmap = c.returned(c.marks.unmap, denied)
+        && c.returned(c.marks.unmap + 1, OK)
+        && t.faulted_at(FIXED_T);
     let _ = writeln!(
         com1,
         "origin-kernel: memory: mapping into another process needs write on its handle, and with it the two share the frame: {cross}; unmapping there needs it too, and the other's next read faults: {cross_unmap}{}",
         verdict(cross && cross_unmap)
     );
 
-    let refused = hp
-        .process
-        .reports()
-        .get(hp.marks.refused)
-        .is_some_and(|&s| s == Error::ShouldWait.raw() as u64)
+    let refused = hp.returned(hp.marks.refused, Error::ShouldWait.raw())
         && hp.word(hp.marks.still) == Some(0);
-    let served = hp.statuses() && hp.exited();
+    let served = hp.returned(hp.marks.served, OK) && hp.exited();
     let _ = writeln!(
         com1,
         "origin-kernel: memory: a hostile unmap loop is refused with should_wait once its budget is spent, changing nothing: {refused}; it is served again once the budget refills: {served}{}",
         verdict(refused && served)
+    );
+
+    let scripts = a.statuses()
+        && b.statuses()
+        && q.statuses()
+        && c.statuses()
+        && t.statuses()
+        && hp.statuses()
+        && a.faulted_at(FIXED_A)
+        && b.faulted_at(FIXED_B)
+        && t.faulted_at(FIXED_T)
+        && q.exited()
+        && c.exited()
+        && hp.exited();
+    let _ = writeln!(
+        com1,
+        "origin-kernel: memory: every other call of the proof's programs returned what its script says, and each program ended as it should: {scripts}{}",
+        verdict(scripts)
     );
 
     match costs(tsc_hz) {
@@ -691,7 +750,8 @@ fn parts(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> b
             return false;
         }
     }
-    shared
+    scripts
+        && shared
         && write_fault
         && read_fault
         && no_replace
