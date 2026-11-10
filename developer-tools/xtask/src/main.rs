@@ -1765,6 +1765,13 @@ fn address_space_markers(cpus: u32) -> Vec<String> {
             "origin-kernel: address spaces: a page made writable under a running reader on {far}: it wrote without a fault: true; {cost}"
         ),
         "origin-kernel: address spaces: a page mapped under a running thread: it read 0x1234 and exited".into(),
+        format!(
+            "origin-kernel: address spaces: 5 pages unmapped at once under a running thread on {far}: it faulted at its page among them: true; Ok(Change {{ pages: 5, shootdowns: 1, interrupts: {one} }})"
+        ),
+        format!(
+            "origin-kernel: address spaces: 200 pages unmapped at once under a running thread on {far}: it faulted at its page among them: true; Ok(Change {{ pages: 200, shootdowns: 2, interrupts: {} }})",
+            2 * one
+        ),
         "origin-kernel: address spaces: a frame shared by two spaces: unmapped from the first, its thread faulted: true, the other went on: true, the frame still in use: true; unmapped from the second, its thread faulted: true, the frame free when the unmap returned: true".into(),
         format!(
             "origin-kernel: address spaces: 64 maps and unmaps of a page under a thread on {far}: {} interrupts, 0 on processors not in the space; ",

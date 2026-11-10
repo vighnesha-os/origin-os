@@ -27,6 +27,8 @@ const DATA: u64 = 0x50_0000;
 const TALK: u64 = 0x51_0000;
 /// A page mapped only after the program has started.
 const LATER: u64 = 0x52_0000;
+/// Where the many-page proofs map: a region of its own.
+const WIDE: u64 = 0x100_0000;
 /// The second word of [`TALK`].
 const GO: usize = 8;
 /// What the kernel writes at [`GO`].
@@ -73,12 +75,17 @@ fn talk_and(address: u64) -> Vec<u8> {
     p
 }
 
-/// Reads [`DATA`] in a loop, raising its count each time, and reports [`SAW_THE_SECRET`] if
-/// it ever reads [`SECRET`]. A fault at the read ends it.
+/// Reads [`DATA`] in a loop, as [`reader_at`] does.
 fn reader() -> Vec<u8> {
+    reader_at(DATA)
+}
+
+/// Reads `address` in a loop, raising its count each time, and reports [`SAW_THE_SECRET`] if
+/// it ever reads [`SECRET`]. A fault at the read ends it.
+fn reader_at(address: u64) -> Vec<u8> {
     let mut p = alloc::vec![0x48, 0xB9]; // movabs rcx, SECRET
     p.extend_from_slice(&SECRET.to_le_bytes());
-    p.extend_from_slice(&talk_and(DATA)); // rbx: TALK, rdx: DATA
+    p.extend_from_slice(&talk_and(address)); // rbx: TALK, rdx: the page
     // loop:
     p.extend_from_slice(&[0x48, 0x8B, 0x02]); // mov rax, [rdx]
     p.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
@@ -382,6 +389,49 @@ fn map_under_a_running_thread(com1: &mut Console, far: CpuIndex, tsc_hz: u64) ->
     right
 }
 
+/// A range of pages goes at once, with a thread running on the last of them. Up to 128 pages
+/// is one round, and more than the 32 a shootdown can name one by one is a flush of the space's
+/// translations: this proof reaches both.
+fn unmap_many(com1: &mut Console, pages: u64, far: CpuIndex, bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let target = WIDE + (pages - 1) * PAGE;
+    let Some(subject) = Subject::new(&reader_at(target)) else {
+        return false;
+    };
+    for page in 0..pages {
+        if subject
+            .memory
+            .map_page(WIDE + page * PAGE, Access::Read)
+            .is_err()
+        {
+            return false;
+        }
+    }
+    if !subject.start(far) || !subject.runs_past(0, tsc_hz) {
+        return false;
+    }
+    let cost = subject.memory.unmap(WIDE, pages);
+    let faulted = subject.ending(tsc_hz)
+        == Some(Ending::Faulted {
+            vector: 14,
+            error: 0x4,
+            address: target,
+        });
+    let rounds = pages.div_ceil(128) as u32;
+    let expected = Change {
+        pages,
+        shootdowns: rounds,
+        interrupts: if far == bsp { 0 } else { rounds },
+    };
+    let right = faulted && cost == Ok(expected);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: address spaces: {pages} pages unmapped at once under a running thread on {}: it faulted at its page among them: {faulted}; {cost:?}{}",
+        on_which(far, bsp),
+        verdict(right)
+    );
+    right
+}
+
 /// One frame in two address spaces, each with a thread reading it. Each unmap ends only that
 /// space's thread, and the frame is still in use until the last has gone: then it is free as
 /// soon as the unmap returns.
@@ -506,7 +556,7 @@ fn the_loop_interrupts_only_the_space(
         .map(|(&c, &b)| origin_frame::tlb::interrupts_taken(c).wrapping_sub(b))
         .sum::<u64>();
     // It is still running, and its own page is what ends it.
-    let still_running = subject.ending_within_a_moment_is_none(tsc_hz);
+    let still_running = subject.still_running(tsc_hz);
     let unmapped = subject.memory.unmap(DATA, 1).is_ok();
     let ended = subject.ending(tsc_hz).is_some();
     let rounds = u64::from(LOOP_ROUNDS);
@@ -535,7 +585,7 @@ fn the_loop_interrupts_only_the_space(
 
 impl Subject {
     /// Whether its thread is still running a moment from now: its loop does not end by itself.
-    fn ending_within_a_moment_is_none(&self, tsc_hz: u64) -> bool {
+    fn still_running(&self, tsc_hz: u64) -> bool {
         let count = self.count();
         self.runs_past(count, tsc_hz) && self.process.ending().is_none()
     }
@@ -603,6 +653,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
     ok &= protect_stops_a_writer(com1, far, bsp, tsc_hz);
     ok &= protect_lets_a_reader_write(com1, far, bsp, tsc_hz);
     ok &= map_under_a_running_thread(com1, far, tsc_hz);
+    ok &= unmap_many(com1, 5, far, bsp, tsc_hz);
+    ok &= unmap_many(com1, 200, far, bsp, tsc_hz);
     ok &= shared_between_spaces(com1, far, third, tsc_hz);
     ok &= the_loop_interrupts_only_the_space(com1, cpus, bsp, far, tsc_hz);
     // Each processor reaps what its own threads left, on its own time.
