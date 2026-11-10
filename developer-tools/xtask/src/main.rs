@@ -14,6 +14,7 @@ mod lex;
 mod loom;
 mod screen;
 mod serial;
+mod targetcfg;
 mod turns;
 mod unsafety;
 
@@ -59,6 +60,8 @@ commands:
               check (CLAUDE.md §73)
   unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction and on the
               `preserves_flags` option of assembly blocks (part of check; quick)
+  cfg-lint    only the CLAUDE.md §11 lint: no Origin code outside developer-tools/ asks
+              whether its target is Linux or Unix (part of check; quick)
   document-gate only the gate on documents and archives: none is tracked, or left in this
               branch's history, outside a short allowlist (part of check; quick)
   interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
@@ -2047,6 +2050,7 @@ fn main() -> ExitCode {
         ["check"] => in_turn("check", check),
         ["unsafe-gate"] => unsafety::gate(),
         ["document-gate"] => documents::gate(),
+        ["cfg-lint"] => linux_cfg_lint(),
         ["interface-gate"] => interfaces::gate(),
         ["regenerate"] => interfaces::regenerate(),
         ["build"] => in_turn("build", || {
@@ -3355,41 +3359,69 @@ fn manifest_version_lint() -> Result {
 }
 
 /// CLAUDE.md §11: Origin code compiles for the `x86_64-unknown-linux-gnu` triple only as a
-/// code generator, so it must never use `cfg(target_os = "linux")`. Host developer tools
-/// (`developer-tools/`) run on Linux or macOS build hosts and are exempt.
+/// code generator, so it must never ask whether its target is Linux, or Unix, or which C
+/// library it has: `target_os = "linux"`, `cfg(unix)`, `target_family` and `target_env`
+/// (`targetcfg` has the rule). Host developer tools (`developer-tools/`) run on Linux or macOS
+/// build hosts and are exempt.
 fn linux_cfg_lint() -> Result {
     let root = repo_root();
-    let mut files = Vec::new();
     let dev_tools = root.join("developer-tools");
+    let mut sources = Vec::new();
     collect_files(
         &root,
         &|dir| dir == dev_tools,
         &|name| name.ends_with(".rs"),
-        &mut files,
+        &mut sources,
     )
     .map_err(|e| format!("cfg lint: {e}"))?;
+    // The manifests, and Cargo's own configuration, which can set flags by `cfg` too.
+    let mut manifests = Vec::new();
+    collect_files(
+        &root,
+        &|dir| dir == dev_tools,
+        &|name| name == "Cargo.toml",
+        &mut manifests,
+    )
+    .map_err(|e| format!("cfg lint: {e}"))?;
+    let cargo_config = root.join(".cargo").join("config.toml");
+    if cargo_config.is_file() {
+        manifests.push(cargo_config);
+    }
+    if sources.is_empty() || manifests.is_empty() {
+        return Err(format!(
+            "cfg lint: {} Rust files and {} manifests found outside developer-tools/: nothing was checked",
+            sources.len(),
+            manifests.len()
+        ));
+    }
     let mut hits = Vec::new();
-    for file in &files {
-        let text =
-            fs::read_to_string(file).map_err(|e| format!("cfg lint: {}: {e}", file.display()))?;
-        for (n, line) in text.lines().enumerate() {
-            let squeezed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-            if squeezed.contains("target_os=\"linux\"") {
-                let shown = file.strip_prefix(&root).unwrap_or(file);
-                hits.push(format!("{}:{}: {}", shown.display(), n + 1, line.trim()));
+    for (files, read) in [
+        (
+            &sources,
+            targetcfg::rust_hits as fn(&str) -> Vec<targetcfg::Hit>,
+        ),
+        (&manifests, targetcfg::manifest_hits),
+    ] {
+        for file in files {
+            let text = fs::read_to_string(file)
+                .map_err(|e| format!("cfg lint: {}: {e}", file.display()))?;
+            let shown = file.strip_prefix(&root).unwrap_or(file);
+            for hit in read(&text) {
+                hits.push(format!("{}:{}: {}", shown.display(), hit.line, hit.what));
             }
         }
     }
     println!(
-        "xtask: §11 cfg lint scanned {} Rust files outside developer-tools/",
-        files.len()
+        "xtask: §11 cfg lint scanned {} Rust files and {} manifests outside developer-tools/",
+        sources.len(),
+        manifests.len()
     );
     if hits.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "target_os = \"linux\" is not allowed in Origin code (CLAUDE.md §11):\n{}",
-            hits.join("\n")
+            "Origin code is compiled for the Linux triple only as a code generator, and must not ask whether its target is Linux or Unix (CLAUDE.md §11):\n  {}\nuse `target_os = \"none\"` for the kernel, `target_os = \"uefi\"` for the loader, or no condition at all",
+            hits.join("\n  ")
         ))
     }
 }
