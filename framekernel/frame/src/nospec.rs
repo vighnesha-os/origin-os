@@ -126,6 +126,28 @@ pub fn index_in(form: Form, index: usize, len: usize) -> Option<usize> {
     }
 }
 
+/// `len` if it is at most `max`, and nothing if it is more: for a count a program supplies
+/// that sizes a piece of a kernel buffer. On a path the processor took by guessing this check
+/// wrong the count is 0 (Mask), so nothing is copied past the buffer, or that path does not
+/// run (Fence).
+#[inline]
+#[must_use]
+pub fn length(len: usize, max: usize) -> Option<usize> {
+    length_in(form(), len, max)
+}
+
+/// [`length`] in a form the caller names.
+#[inline]
+#[must_use]
+pub fn length_in(form: Form, len: usize, max: usize) -> Option<usize> {
+    match max.checked_add(1) {
+        // `len <= max` is `len < max + 1`.
+        Some(limit) => index_in(form, len, limit),
+        // Every length is at most the largest: there is nothing to keep in range.
+        None => Some(len),
+    }
+}
+
 /// An address for a copy to or from a program's memory, **after** the range check has passed.
 /// On a path the processor took by guessing that check wrong, an address at or above the end
 /// of the user half is 0 (Mask), which is never mapped, or the path does not run (Fence).
@@ -220,6 +242,31 @@ mod tests {
     }
 
     #[test]
+    fn a_length_may_reach_its_limit_and_not_pass_it() {
+        for form in FORMS {
+            for max in [0usize, 1, 64, 256, usize::MAX - 1] {
+                for len in [
+                    0usize,
+                    1,
+                    63,
+                    64,
+                    65,
+                    255,
+                    256,
+                    257,
+                    usize::MAX - 1,
+                    usize::MAX,
+                ] {
+                    let want = (len <= max).then_some(len);
+                    assert_eq!(length_in(form, len, max), want, "{form:?}: {len} of {max}");
+                }
+            }
+            assert_eq!(length_in(form, usize::MAX, usize::MAX), Some(usize::MAX));
+            assert_eq!(length_in(form, 0, usize::MAX), Some(0));
+        }
+    }
+
+    #[test]
     fn random_indexes_and_lengths_agree_with_the_plain_check() {
         // A fixed seed: the same hundred thousand pairs on every run.
         let mut state = 0x9E37_79B9_7F4A_7C15_u64;
@@ -242,6 +289,11 @@ mod tests {
                     index_in(form, index, len),
                     (index < len).then_some(index),
                     "{form:?}: index {index} of {len}"
+                );
+                assert_eq!(
+                    length_in(form, index, len),
+                    (index <= len).then_some(index),
+                    "{form:?}: length {index} of {len}"
                 );
             }
         }

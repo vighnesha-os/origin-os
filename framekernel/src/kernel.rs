@@ -487,6 +487,12 @@ fn prove_nospec(com1: &mut Console) -> bool {
                 sound &= got == (index < len).then_some(index);
             }
         }
+        // A count may reach its limit, and an index may not.
+        for max in [0, 1, 64, usize::MAX - 1, usize::MAX] {
+            for len in [0, 1, 64, 65, usize::MAX - 1, usize::MAX] {
+                sound &= nospec::length_in(form, len, max) == (len <= max).then_some(len);
+            }
+        }
         for address in [USER_START, USER_END - 1] {
             sound &= nospec::user_address_in(form, address) == address;
         }
