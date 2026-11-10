@@ -4,7 +4,7 @@
 |---|---|
 | Required by | CLAUDE.md §58 ("Threat-model every privileged interface"), §29, §30, §42 |
 | Covers | The way into the kernel from ring 3 and back (`framekernel/frame/src/cpu.rs`, `trap.rs`, `usercopy.rs`, `userspace.rs`); the calls (`framekernel/src/syscall.rs`, `handles.rs`, `ipc.rs`, `channel.rs`, `process.rs`, `wait.rs`); the decoder generated from `sdk/interfaces/origin.kernel.oidl` (`framekernel/syscalls`); ADR-0005 P1–P12 and Amendments 1–4 |
-| Written | 2026-11-10, against S3-1's code (c3ccacf). §58 and §83 expect a threat model during design; P4–P11 were designed and built without one, so this is written after them. S3-2's changes are added in the last section. |
+| Written | 2026-11-10, against S3-1's code (c3ccacf). §58 and §83 expect a threat model during design; P4–P11 were designed and built without one, so this is written after them. S3-2's changes (a message's writer, handle records) are added in their own section, written with them. |
 | Evidence | QEMU only. Nothing has run on hardware (§74). The boot proofs named below are ADR-0013 rows: "ring-3 isolation", "per-processor control state", "IPC and handles" and "process and thread objects" all stop the boot when they fail. The IPC proof makes 117 hostile calls and checks each status. |
 
 ## What is being protected
@@ -13,6 +13,7 @@
 - Other processes: their memory, their handles and objects, and the messages queued for them.
 - Rights. A handle never gains a right (P2), and a call does only what its handle's type and rights allow.
 - The kernel's availability: its memory, the locks it holds with interrupts off, and the processors.
+- Since S3-2, the truth of what a read reports: who wrote each message, and each received handle's type and rights.
 
 ## Who the attackers are
 
@@ -99,6 +100,25 @@ Status: **Proven** (a boot proof whose negative control is recorded in `SOURCE_P
 | I2 | Speculative execution: a call number or handle index used out of bounds speculatively, poisoned indirect branches, or a Meltdown-type read of the kernel half, which is mapped in every address space | None: no index masking, no indirect-branch mitigation, no page-table isolation, and `IA32_ARCH_CAPABILITIES` is not read | **Open** |
 | I3 | Process IDs are sequential, so a program learns roughly how many processes were created between two of its observations | Accepted by ADR-0005 C1, since an ID grants nothing | **Open** (accepted) |
 
+### A message's writer and handle records (S3-2)
+
+ADR-0005 B1 and B3, as C1–C3 decide. The ledger is `docs/research/2026-11-10-caller-identity.md`. "Proven" here means the boot proofs "a message's writer" and "IPC and handles", with the controls recorded for S3-2 in `SOURCE_PROVENANCE.md`.
+
+| # | Threat | Defence | Status |
+|---|---|---|---|
+| W1 | A writer forges its identity | `channel_write` stamps the message with the writing process's identity, which never changes, and queues the two together. No argument carries it | **Proven** (controls 4, 5) |
+| W2 | The identity is stale: it names whoever held the end when the channel was made, or holds it when the message is read | Each message is stamped when it is written, and keeps its stamp while its end moves | **Proven** (control 6) |
+| W3 | A recorded process ID comes to name a later process | IDs are never reused (O7) | **Proven** (S3-1 control 8) |
+| W4 | Only part of a 64-bit field reaches the reader | Both fields are 64 bits end to end, and the proof's values have both halves set | **Proven** (control 9) |
+| W5 | A reader that gives an older `size` has memory written past it | The kernel writes only what fits in the caller's `size`; the first version's 12 gets the counts and nothing past them, with no error | **Proven** (control 8) |
+| W6 | A read too small for its message hides who wrote it, so a reader must take an unwanted message to learn its writer | The identity is written on `buffer_too_small` too | **Proven** (control 7) |
+| W7 | Identity is taken for authority | A process ID or principal names nothing and opens nothing (P1, C1). Acting on the writer needs a handle the writer gave | **By design** |
+| W8 | A relayed message names the relay, not the first sender | Intended: the stamp is the last writer. A relay that vouches for an earlier sender says so in its own protocol, and the reader trusts that only as far as it trusts the relay | **By design** |
+| W9 | A received handle's type or rights are misreported, so a receiver trusts a handle it should not | Each record is made from what the reader's table now holds for the handle | **Proven** (controls 2, 3) |
+| W10 | Records are written past the caller's buffer | Room for whole 12-byte records is checked before a message is taken | **Proven** (control 1) |
+| W11 | A record or `read_sizes` value outside the definition reaches a client as a value | The generated client decodes each record and the sizes checked; an undeclared type, right or padding byte is a protocol error | **Host** |
+| W12 | The writer's principal tells the reader more than it should | Intended: B1 delivers it. Principals are opaque numbers the creator chose; what they may encode is for the accounts design (§57) | **Open**, with I3 |
+
 ## What must be closed
 
 Before any program that is not a boot proof runs in ring 3 (N14 step 4):
@@ -113,4 +133,4 @@ Before release: **E11** (CET) and **V2**.
 - Intel 64 and IA-32 Architectures Software Developer's Manual, Vol. 2B (`SYSCALL`, `SYSENTER`, `IRET`) and Vol. 3A (privilege levels and gates, SMEP, SMAP, UMIP).
 - CERT/CC, Vulnerability Note VU#649219, the SYSRET return to a non-canonical address (2012): <https://www.kb.cert.org/vuls/id/649219>
 - Kocher et al., *Spectre Attacks: Exploiting Speculative Execution*, IEEE S&P 2019; Lipp et al., *Meltdown: Reading Kernel Memory from User Space*, USENIX Security 2018.
-- `docs/research/2026-11-10-caller-identity.md`, for the sender identity S3-2 adds.
+- `docs/research/2026-11-10-caller-identity.md`, for the writer's identity S3-2 adds.
