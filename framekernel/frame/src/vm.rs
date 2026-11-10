@@ -244,17 +244,8 @@ pub unsafe fn unmap(virt: u64) -> Result<u64, MapError> {
     Ok(phys)
 }
 
-/// Turns the direct-map page `page` into a guard page: unmapped, so any access faults,
-/// on every processor once this returns. A 2 MiB leaf covering it is split first (one
-/// INVLPG in the page drops the old 2 MiB translation too).
-pub(crate) fn make_guard(page: u64) -> Result<(), MapError> {
-    unmap_guards(&[page])?;
-    crate::tlb::shootdown(page);
-    Ok(())
-}
-
-/// As [`make_guard`] for several pages, with one full TLB flush on every processor instead
-/// of one shootdown per page.
+/// Turns `pages` into guard pages: unmapped, so any access faults, on every processor once this
+/// returns, with one full TLB flush. A 2 MiB leaf covering one is split first.
 pub(crate) fn make_guards(pages: &[u64]) -> Result<(), MapError> {
     unmap_guards(pages)?;
     crate::tlb::shootdown_all();
@@ -626,20 +617,6 @@ pub fn leaf_census() -> Option<LeafCensus> {
         let guard = KERNEL_SPACE.lock();
         let k = guard.as_ref()?;
         Some(k.space.leaf_census(&k.tables))
-    })
-}
-
-/// Maps a guard page back (read/write, never executable) before its memory is freed.
-pub(crate) fn unguard(page: u64) -> Result<(), MapError> {
-    crate::cpu::without_interrupts(|| {
-        let mut guard = KERNEL_SPACE.lock();
-        let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
-        k.space.map(
-            &mut k.tables,
-            page,
-            crate::phys::to_phys(page),
-            Attributes::kernel_global(Access::ReadWrite),
-        )
     })
 }
 

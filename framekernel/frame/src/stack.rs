@@ -24,7 +24,7 @@
 //! trap entry recorded (`cpu::record_saved_frame`). A stack in either is leaked rather than freed,
 //! which is the safe failure for a safe caller that drops one too early.
 
-use alloc::alloc::{Layout, alloc, alloc_zeroed, dealloc};
+use alloc::alloc::{Layout, alloc, dealloc};
 
 use origin_paging::PAGE;
 use origin_paging::layout::{STACK_REGION, STACK_REGION_SIZE};
@@ -33,9 +33,6 @@ use origin_sync::slots::{Counts, Slots, Taken};
 use crate::cpu::{self, CpuIndex, without_interrupts};
 use crate::descriptors::{KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
 use crate::memory::{self, OwnedFrame};
-
-/// A guarded page of the TLB proof ([`GuardablePage`]).
-const GUARD: usize = 4096;
 
 /// The address space each stack has: the stack at its top, unmapped space below.
 pub const SLOT: u64 = 128 * 1024;
@@ -334,76 +331,92 @@ pub enum ThreadStart {
     User { rip: u64, rsp: u64, rdi: u64 },
 }
 
-/// A heap page that can be unmapped and mapped back: what the TLB boot proof caches, unmaps
-/// and probes on every processor. It is never a Rust object anyone holds a reference to:
-/// the holder sees it only through [`crate::cpu::probe_read`], so taking the mapping away
-/// breaks nothing. Dropping it gives the page back (mapped first, if it isn't).
+/// A kernel page that can be unmapped and mapped back: what the TLB boot proof caches, unmaps
+/// and probes on every processor. It is in the stack region, in a slot of its own like a
+/// one-page stack, so taking it away splits nothing in the direct map. It is never a Rust object
+/// anyone holds a reference to: the holder sees it only through [`crate::cpu::probe_read`], so
+/// taking the mapping away breaks nothing. Dropping it gives the slot back.
 #[derive(Debug)]
 pub struct GuardablePage {
-    addr: u64,
+    /// Its slot: the page at the top, nothing below.
+    slot: usize,
+    /// The page has left the tables and every processor's TLB, and its frame is free.
     unmapped: bool,
 }
 
 impl GuardablePage {
-    /// A new zeroed, mapped page, or `None`.
+    /// A new mapped page, or `None`. What it holds is never read: only probes touch it.
     pub fn new() -> Option<Self> {
-        let layout = Layout::from_size_align(GUARD, GUARD).ok()?;
-        // SAFETY: `layout` has a non-zero size; the allocation is freed in `Drop`.
-        let page = unsafe { alloc_zeroed(layout) };
-        if page.is_null() {
+        let Taken { slot, mapped } = without_interrupts(|| REGION.take(1))?;
+        if !mapped && !map_fresh(slot, 1) {
             return None;
         }
         Some(Self {
-            addr: page.expose_provenance() as u64,
+            slot,
             unmapped: false,
         })
     }
 
     /// The page's address, for probes.
     pub const fn addr(&self) -> u64 {
-        self.addr
+        stack_low(self.slot, 1)
     }
 
-    /// Unmaps it on every processor with a single-page shootdown. `false` if that was refused.
+    /// Takes the page out of the tables, if it is still there, and its frame with it; returns
+    /// the frame. The caller shoots down before freeing it.
+    fn take_out(&self) -> Option<OwnedFrame> {
+        if self.unmapped {
+            return None;
+        }
+        let mut frame = [None];
+        crate::vm::unmap_stack_pages(self.addr(), &mut frame);
+        let [frame] = frame;
+        frame
+    }
+
+    /// Unmaps it on every processor with a single-page shootdown. `false` if it was not mapped.
     pub fn unmap(&mut self) -> bool {
-        let ok = crate::vm::make_guard(self.addr).is_ok();
-        self.unmapped |= ok;
-        ok
-    }
-
-    /// Unmaps several pages with one full flush on every processor. `false` if that was
-    /// refused.
-    pub fn unmap_all(pages: &mut [&mut Self]) -> bool {
-        let mut addrs = [0u64; 8];
-        let Some(slots) = addrs.get_mut(..pages.len()) else {
+        let Some(frame) = self.take_out() else {
             return false;
         };
-        for (slot, page) in slots.iter_mut().zip(pages.iter()) {
-            *slot = page.addr;
+        crate::tlb::shootdown(self.addr());
+        let _ = memory::free_frame(frame);
+        self.unmapped = true;
+        true
+    }
+
+    /// Unmaps several pages with one full flush on every processor. `false` if one of them was
+    /// not mapped, or there are more than eight.
+    pub fn unmap_all(pages: &mut [&mut Self]) -> bool {
+        let mut frames: [Option<OwnedFrame>; 8] = [const { None }; 8];
+        let Some(taken) = frames.get_mut(..pages.len()) else {
+            return false;
+        };
+        for (frame, page) in taken.iter_mut().zip(pages.iter()) {
+            *frame = page.take_out();
         }
-        let ok = crate::vm::make_guards(slots).is_ok();
+        crate::tlb::shootdown_all();
+        let all = taken.iter().all(Option::is_some);
+        for frame in frames.into_iter().flatten() {
+            let _ = memory::free_frame(frame);
+        }
         for page in pages.iter_mut() {
-            page.unmapped |= ok;
+            page.unmapped = true;
         }
-        ok
+        all
     }
 }
 
 impl Drop for GuardablePage {
     fn drop(&mut self) {
-        if self.unmapped && crate::vm::unguard(self.addr).is_err() {
-            return; // leak rather than free memory that is not mapped
-        }
-        if let Ok(layout) = Layout::from_size_align(GUARD, GUARD) {
-            // SAFETY: `addr` is the allocation made in `new` with this layout, mapped again
-            // above if it was unmapped, and only this owner ever knew it.
-            unsafe {
-                dealloc(
-                    core::ptr::with_exposed_provenance_mut(self.addr as usize),
-                    layout,
-                )
-            };
-        }
+        without_interrupts(|| {
+            if self.unmapped {
+                // Nothing is mapped in the slot, and no processor holds a translation of it.
+                REGION.abandon(self.slot);
+            } else {
+                REGION.give_back(self.slot, false);
+            }
+        });
     }
 }
 

@@ -252,10 +252,12 @@ impl<const N: usize, const IDLE: usize> Slots<N, IDLE> {
         Some(Given::Retired)
     }
 
-    /// Frees a Live slot in which its taker mapped nothing at all ([`Taken::mapped`] was false,
-    /// and mapping failed before its first page). A slot with anything mapped in it must go
-    /// through [`Slots::give_back`] and [`Slots::reclaim`] instead: some processor may have
-    /// cached what was mapped. Returns whether the slot was Live.
+    /// Frees a Live slot with nothing mapped in it and no translation of it left on any
+    /// processor: its taker mapped nothing at all ([`Taken::mapped`] was false, and mapping
+    /// failed before the first page), or took out what it mapped and has completed a shootdown
+    /// of it. A slot with anything else in it must go through [`Slots::give_back`] and
+    /// [`Slots::reclaim`] instead: some processor may have cached what was mapped. Returns
+    /// whether the slot was Live.
     pub fn abandon(&self, slot: usize) -> bool {
         let mut table = self.table.lock();
         if table.state(slot) != Some(State::Live) {
