@@ -314,6 +314,16 @@ fn cases() -> Vec<(Code, Case)> {
         (TooLarge, Case::Sources(sys("/// t\nstruct t { x: u32; y: u32; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (a: vector<t, 8193>) errors(invalid_args, fault) requires none;\n}"))),
         (TooLarge, Case::Sources(sys("/// s\nstruct t { x: array<u64, 8192>; }\n/// t\nstruct s { a: array<t, 2>; }"))),
         (SinceNotIncreasing, Case::Sources(sys("/// s\nsized struct s { @since(1.2) a: u32; @since(1.1) b: u32; }"))),
+        // From major 1 nothing names an item of its library from a later minor (§9): a
+        // parameter, an array element, a field, a constant's bits and members, a capability and
+        // a status.
+        (NewerReference, Case::Sources(sys("/// e\n@since(1.2) enum e: u8 { a = 1; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (x: e) errors(invalid_args) requires none;\n}"))),
+        (NewerReference, Case::Sources(sys("/// t\n@since(1.1) struct t { x: u8; }\n/// i\ninterface i {\n/// m\nmethod m = 1 () -> (a: array<t, 2>) errors(fault) requires none;\n}"))),
+        (NewerReference, Case::Sources(sys("/// e\n@since(1.2) enum e: u8 { a = 1; }\n/// t\nstruct t { x: e; }"))),
+        (NewerReference, Case::Sources(sys("/// b\n@since(1.2) bits b: u8 { a = 0; }\n/// c\nconst c: b = a;"))),
+        (NewerReference, Case::Sources(sys("/// b\nbits b: u8 { a = 0; @since(1.2) z = 1; }\n/// c\nconst c: b = a | z;"))),
+        (NewerReference, Case::Sources(sys("/// k\n@since(1.2) capability t.k;\n/// i\ninterface i {\n/// m\nmethod m = 1 () errors(access_denied) requires t.k;\n}"))),
+        (NewerReference, s("/// d\nlibrary a.b; transport syscall; version 1.2;\n/// s\nenum status: i64 { ok = 0; @since(1.2) late = -20; }\n/// i\ninterface i {\n/// m\nmethod m = 1 () errors(late) requires none;\n}\n")),
         (SinceNotIncreasing, Case::Sources(chan(&one("method m = 1 (@since(1.2) a: u32, @since(1.1) b: u32) errors() requires none;")))),
         (SinceNotIncreasing, Case::Sources(chan(&one("method m = 1 () -> (@since(1.2) a: u32, @since(1.1) b: u32) errors() requires none;")))),
         (BadSince, Case::Sources(sys("/// e\nenum e: u8 { @since(2.0) a = 1; }"))),
@@ -431,6 +441,18 @@ fn an_item_may_be_added_in_a_later_minor() {
         "/// c\n@since(1.1) const c: u32 = 1;\n/// e\n@since(1.2) enum e: u8 { a = 1; }\n/// b\n@since(1.1) bits b: u8 { x = 0; @since(1.2) y = 1; }\n/// s\n@since(1.2) struct t { x: u8; }\n/// z\n@since(1.1) sized struct z { @since(1.1) x: u8; }\n/// k\n@since(1.1) capability k.m;",
     );
     assert_eq!(compile_all(&source, None), Ok(()));
+}
+
+#[test]
+fn a_reference_to_a_newer_item_is_a_recorded_break_at_major_0_and_fine_within_one_minor() {
+    // At major 0 nothing is promised (§9): the fingerprint gate reports the change instead.
+    let major_0 = "/// d\nlibrary a.b; transport syscall; version 0.2;\n/// s\nenum status: i64 { ok = 0; invalid_args = -1; }\n/// e\n@since(0.2) enum e: u8 { a = 1; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (x: e) errors(invalid_args) requires none;\n}\n";
+    assert_eq!(run(&s(major_0)), Ok(()));
+    // From major 1, an item added in the same minor as what it names is fine.
+    let same_minor = sys(
+        "/// e\n@since(1.2) enum e: u8 { a = 1; }\n/// t\n@since(1.2) struct t { x: e; }\n/// i\ninterface i {\n/// m\n@since(1.2) method m = 1 (x: e) errors(invalid_args) requires none;\n}",
+    );
+    assert_eq!(compile_all(&same_minor, None), Ok(()));
 }
 
 #[test]

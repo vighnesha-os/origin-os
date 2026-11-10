@@ -300,6 +300,58 @@ impl Scope<'_> {
         }
     }
 
+    /// From major 1, an item may not name an item of its own library that a later minor added
+    /// (§9): no version of the definition has both, so the reference cannot be kept
+    /// compatibly. `named` is when the named item was added, `than` when the naming one was.
+    /// At major 0 such a reference is a break the fingerprint gate reports, not a refusal.
+    fn refuse_newer(
+        &self,
+        pos: Pos,
+        library: &str,
+        named: Version,
+        than: Version,
+        what: &str,
+    ) -> Result<(), Diagnostic> {
+        if self.version.major >= 1 && library == self.name && named > than {
+            return fail(
+                self.file,
+                pos,
+                Code::NewerReference,
+                format!("{what} is from {named}, which is newer than {than}"),
+            );
+        }
+        Ok(())
+    }
+
+    /// As [`Scope::refuse_newer`], for the item a type names, if it names one.
+    fn refuse_newer_type(&self, pos: Pos, ty: &Type, than: Version) -> Result<(), Diagnostic> {
+        match ty {
+            Type::Enum(e) => self.refuse_newer(pos, &e.library, e.since, than, &e.name),
+            Type::Bits(b) => self.refuse_newer(pos, &b.library, b.since, than, &b.name),
+            Type::Struct(s) => self.refuse_newer(pos, &s.library, s.since, than, &s.name),
+            Type::Array(elem, _) | Type::Vector(elem, _) => self.refuse_newer_type(pos, elem, than),
+            Type::Bool | Type::Int(_) | Type::String(_) | Type::Handle(_) => Ok(()),
+        }
+    }
+
+    /// As [`Scope::refuse_newer`], for a status the item names, through this library's own
+    /// status enumeration.
+    fn refuse_newer_status(
+        &self,
+        name: &crate::ast::Ident,
+        than: Version,
+    ) -> Result<(), Diagnostic> {
+        let Some(status) = &self.status else {
+            return Ok(());
+        };
+        match status.members.iter().find(|m| m.name == name.text) {
+            Some(member) => {
+                self.refuse_newer(name.pos, &status.library, member.since, than, &member.name)
+            }
+            None => Ok(()),
+        }
+    }
+
     fn status_member(&self, name: &crate::ast::Ident) -> Result<StatusRef, Diagnostic> {
         let Some(status) = &self.status else {
             return fail(
@@ -623,11 +675,13 @@ fn const_decl(scope: &Scope<'_>, decl: &ConstDecl) -> Result<Const, Diagnostic> 
             (ConstKind::Int(int), value)
         }
         (ConstValue::Bits(names), None, Some(bits)) => {
+            scope.refuse_newer(decl.ty.pos, &bits.library, bits.since, since, &bits.name)?;
             let mut mask = 0u64;
             for name in names {
                 let Some(member) = bits.members.iter().find(|m| m.name == name.text) else {
                     return fail(file, name.pos, Code::BadConstValue, name.text.clone());
                 };
+                scope.refuse_newer(name.pos, &bits.library, member.since, since, &member.name)?;
                 mask |= 1u64 << member.value;
             }
             (ConstKind::Bits(bits), i128::from(mask))
@@ -777,6 +831,7 @@ fn check_field(
     if since < *last_since {
         return fail(file, field.name.pos, Code::SinceNotIncreasing, "");
     }
+    scope.refuse_newer_type(field.ty.pos(), &ty, since)?;
     *last_since = since;
     fields.push(Field {
         name: field.name.text.clone(),
@@ -956,6 +1011,7 @@ fn build_param(
     if since < method_since {
         return fail(file, decl.name.pos, Code::BadSince, "older than its method");
     }
+    scope.refuse_newer_type(decl.ty.pos(), &ty, since)?;
     let nonzero = if let Some(attr) = find_attr(&decl.attrs, "nonzero") {
         no_args(file, attr)?;
         if !matches!(ty, Type::Int(_) | Type::Bits(_)) {
@@ -1213,6 +1269,7 @@ fn build_method(scope: &mut Scope<'_>, decl: &MethodDecl) -> Result<Method, Diag
             return fail(file, error.pos, Code::DuplicateError, error.text.clone());
         }
         errors.push(scope.status_member(error)?);
+        scope.refuse_newer_status(error, since)?;
     }
 
     if reserved && !errors.iter().any(|e| e.name == "not_supported") {
@@ -1223,6 +1280,14 @@ fn build_method(scope: &mut Scope<'_>, decl: &MethodDecl) -> Result<Method, Diag
         Requires::None => None,
         Requires::Capability { name, otherwise } => {
             let capability = find_capability(scope, name)?;
+            // Capabilities are declared by the library that requires them.
+            scope.refuse_newer(
+                name.pos,
+                scope.name,
+                capability.since,
+                since,
+                &capability.name,
+            )?;
             if channel && otherwise.is_some() {
                 return fail(file, name.pos, Code::ElseNotAllowed, "");
             }

@@ -2756,6 +2756,14 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
 - **Known limits:** where a channel stub puts the identity (the generated server's `Caller`) waits for the first ring-3 service (step 4). Program identity is a later minor (C1). A reader cannot drop an unwanted message without room for it. Nothing ran on physical hardware.
 - **Licensing:** MIT OR Apache-2.0.
 
+## OIDL: no reference to a newer item from major 1 (2026-11-10)
+
+- **What:** `developer-tools/oidl/src/sema.rs` refuses, from major 1, an item that names an item of its own library added in a later minor: a parameter's or result's type (and an element type inside it), a field's type, a constant's bits type and the members it combines, a method's capability and its statuses. New diagnostic `NewerReference`. At major 0 the reference stays allowed, as a break the fingerprint gate reports: `origin.kernel`'s `channel_read` (minor 0) names `received_handle` (minor 2), and that definition still compiles unchanged. `docs/spec/OIDL.md` §9 records the rule.
+- **Why:** the review of S3-2 asked whether such a reference should be refused once the ABI is stable. No version of a definition has both items, so a client at the older minor would see a method or field whose type does not exist for it; the fingerprint gate cannot catch it when both items are new minors. Decided in the session that built the fingerprint fix, as the review asked: the rule follows from §9's promise that a minor's contents are fixed, so it needs no owner decision.
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-10, branch `claude/s3-3-start-record`, from the step-3 batch at c04cc79. Original code.
+- **Test evidence:** seven malformed definitions, one per kind of reference, each refused with `NewerReference` at major 1; a test that the same reference compiles at major 0 and that an item may name one from its own minor; every existing definition and the fixtures still compile. 49 unit and 17 generated-code tests, clippy, rustfmt and the interface gate pass. **Control:** with the rule switched off, the first `NewerReference` case is accepted and the malformed-definition test fails.
+- **Licensing:** MIT OR Apache-2.0.
+
 ## Pre-merge review fixes (2026-11-09)
 
 - **What:** the fixes from the review recorded in `docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md`, made on separate branches and merged in `4eaeb07` (network, firmware tables, filesystems), `643144e` (storage), `b5c89d7` (boot chain and tooling), `318f03c` (PCI, IOMMU, DMA), `1fed0a3` (Loom and dependencies), `8c433f5` (CPU, scheduler, system calls), and the commits around them up to `c465fe6`.

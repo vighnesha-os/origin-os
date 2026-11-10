@@ -9,7 +9,7 @@
 | Implementation | `developer-tools/oidl` (host only). First consumer: `sdk/interfaces/origin.kernel.oidl` |
 | Evidence | `docs/research/2026-11-09-native-sdk.md`, `docs/research/2026-11-09-oidl-wire-format.md`, and the comparison with the hand-written ABI, `docs/engineering/OIDL_KERNEL_COMPARISON.md` |
 | Compatibility | Every byte layout here is revision 1 of the format, accepted by the owner on 2026-11-09. A change to any of them needs the owner's acceptance again (CLAUDE.md §84) |
-| Revisions | 2026-11-10: plain structs of integers, enums and bits as `syscall` vector and array elements (§3.1, §10), ADR-0005 C3, accepted by the owner on 2026-11-09 (decision sheet item 58). Existing definitions and the `channel` wire format are unchanged. 2026-11-10: the fingerprint names a library's own `sized struct` with its size at the minor described (§13), as §9 requires; the owner asked for the fix |
+| Revisions | 2026-11-10: plain structs of integers, enums and bits as `syscall` vector and array elements (§3.1, §10), ADR-0005 C3, accepted by the owner on 2026-11-09 (decision sheet item 58). Existing definitions and the `channel` wire format are unchanged. 2026-11-10: the fingerprint names a library's own `sized struct` with its size at the minor described (§13), as §9 requires; the owner asked for the fix. 2026-11-10: from major 1, an item may not name one of its library's items from a later minor (§9) |
 
 The keywords MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
@@ -415,6 +415,8 @@ Within a major version only additions are allowed (ADR-0011 N10):
 | A new `const`, `struct`, or capability | Reordering |
 
 `@since(M.m)` names the current major, with `1 ≤ m ≤` the current minor. An item without it dates from `M.0`. Bumping the major therefore forces every `@since` to be removed.
+
+From major 1, an item may not name an item of its own library that a later minor added: a parameter or result its type (or the element type inside it), a field its type, a constant its bits type or the members it combines, a method its capability or its statuses. No version of the definition has both, so the reference could not be kept compatibly, and the tool refuses it (`NewerReference`). At major 0 it is allowed, and the fingerprint gate reports the minors it changes instead: `origin.kernel`'s `channel_read`, from minor 0, names `received_handle`, from minor 2 (ADR-0005 B3). Decided 2026-11-10 with the fingerprint fix (§13); items of another library are versioned by that library, so they are outside this rule.
 
 Major `0` promises nothing, like ADR-0005 P12's `user-abi` today: a change at major 0 is reported and not refused.
 

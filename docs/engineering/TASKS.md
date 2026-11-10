@@ -66,7 +66,6 @@
 | — | nothing in progress at the end of the session |
 
 **Found during S3-2 (2026-11-10):**
-- **OIDL fingerprint, fixed the same day at the owner's request:** a method's reference to a sized struct of its own library carried the struct's newest size, so growing it changed every earlier minor's fingerprint, which the gate would refuse from major 1. It now carries the size at the minor described (§13), with a test that fails on the old rendering; `origin.kernel`'s 0.0 and 0.1 are back to the values recorded before `read_sizes` grew. Still open: a sized struct from another library is expanded at its newest layout (nothing uses one yet), and whether its later fields belong to that library alone is not decided (§13).
 - **Reading without room:** a reader cannot drop a message it does not want without making room for it (Zircon has a discard option). Neither B1 nor B3 needs it; a service domain may.
 
 ## Next, in order
