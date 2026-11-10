@@ -886,7 +886,8 @@ pub fn idle_disabling() {
 /// Touches only those registers: kernel code is soft-float, so nothing else uses them.
 pub fn xmm_load(values: [u64; 4]) {
     // SAFETY: SSE is enabled on this processor (`enable_simd`); these instructions only load
-    // the named XMM registers from general registers.
+    // the named XMM registers from general registers. No `preserves_flags`: `movq` is an SSE
+    // instruction, and none is on the list of the module documentation.
     unsafe {
         asm!(
             "movq xmm0, {0}",
@@ -895,7 +896,7 @@ pub fn xmm_load(values: [u64; 4]) {
             "movq xmm15, {3}",
             in(reg) values[0], in(reg) values[1], in(reg) values[2], in(reg) values[3],
             out("xmm0") _, out("xmm3") _, out("xmm7") _, out("xmm15") _,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
 }
@@ -903,7 +904,8 @@ pub fn xmm_load(values: [u64; 4]) {
 /// Reads XMM0, XMM3, XMM7 and XMM15 (the SIMD state the boot proof checks).
 pub fn xmm_read() -> [u64; 4] {
     let (a, b, c, d): (u64, u64, u64, u64);
-    // SAFETY: reads the named XMM registers; no memory, no stack.
+    // SAFETY: reads the named XMM registers; no memory, no stack. No `preserves_flags`, as in
+    // `xmm_load`.
     unsafe {
         asm!(
             "movq {0}, xmm0",
@@ -911,7 +913,7 @@ pub fn xmm_read() -> [u64; 4] {
             "movq {2}, xmm7",
             "movq {3}, xmm15",
             out(reg) a, out(reg) b, out(reg) c, out(reg) d,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
     [a, b, c, d]
@@ -1442,9 +1444,10 @@ pub fn ordered_tsc(use_rdtscp: bool) -> u64 {
             asm!("rdtscp", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack, preserves_flags));
         }
     } else {
-        // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory.
+        // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory. No
+        // `preserves_flags`: Intel's entry for LFENCE does not say what it does to the flags.
         unsafe {
-            asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags));
+            asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
         }
     }
     (u64::from(high) << 32) | u64::from(low)
@@ -1998,14 +2001,16 @@ pub unsafe fn fpu_init_area(area: u64) {
 pub unsafe fn fpu_save(area: u64) {
     if USE_XSAVE.load(core::sync::atomic::Ordering::Relaxed) {
         // XSAVE with the full mask (EDX:EAX = all ones): save every enabled component.
-        // SAFETY: the caller's contract; the area is large enough (CPUID's maximum).
+        // SAFETY: the caller's contract; the area is large enough (CPUID's maximum). No
+        // `preserves_flags` on any of the four blocks that save or restore this state: the
+        // option also covers the x87 status word and MXCSR, which is the state they handle.
         unsafe {
-            asm!("xsave [{a}]", a = in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, preserves_flags));
+            asm!("xsave [{a}]", a = in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
         }
     } else {
         // SAFETY: as above; FXSAVE needs 512 bytes, 16-byte aligned.
         unsafe {
-            asm!("fxsave [{a}]", a = in(reg) area, options(nostack, preserves_flags));
+            asm!("fxsave [{a}]", a = in(reg) area, options(nostack));
         }
     }
 }
@@ -2017,14 +2022,15 @@ pub unsafe fn fpu_save(area: u64) {
 /// As for [`fpu_save`]; `area` must hold state written by [`fpu_save`] or [`fpu_init_area`].
 pub unsafe fn fpu_restore(area: u64) {
     if USE_XSAVE.load(core::sync::atomic::Ordering::Relaxed) {
-        // SAFETY: the caller's contract; the area holds a valid XSAVE image.
+        // SAFETY: the caller's contract; the area holds a valid XSAVE image. The restore
+        // replaces the x87 status word and MXCSR, so it cannot claim to preserve the flags.
         unsafe {
-            asm!("xrstor [{a}]", a = in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, preserves_flags));
+            asm!("xrstor [{a}]", a = in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
         }
     } else {
         // SAFETY: as above.
         unsafe {
-            asm!("fxrstor [{a}]", a = in(reg) area, options(nostack, preserves_flags));
+            asm!("fxrstor [{a}]", a = in(reg) area, options(nostack));
         }
     }
 }
