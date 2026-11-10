@@ -102,6 +102,12 @@ impl Sha512 {
         self.state = H512;
         self.bytes = 0;
     }
+
+    /// Whether the hasher is as [`Self::new`] and [`Self::wipe`] leave it.
+    #[cfg(test)]
+    pub(crate) fn is_fresh(&self) -> bool {
+        self.state == H512 && self.bytes == 0 && self.buffer.is_blank()
+    }
 }
 
 // FIPS 180-4 §4.1.3.

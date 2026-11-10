@@ -1,6 +1,6 @@
 [package]
 name = "origin-crypto"
-description = "Origin OS cryptography: SHA-2 (FIPS 180-4), SHA-3/SHAKE (FIPS 202), Ed25519 verification (RFC 8032) and ML-DSA-65/87 verification (FIPS 204)"
+description = "Origin OS cryptography: SHA-2 (FIPS 180-4), SHA-3/SHAKE (FIPS 202), Ed25519 verification (RFC 8032), ML-DSA-65/87 verification (FIPS 204), HMAC-SHA-512 (FIPS 198-1) and HMAC_DRBG (SP 800-90A)"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

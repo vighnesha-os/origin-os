@@ -100,6 +100,13 @@ impl<const B: usize> BlockBuffer<B> {
         self.len = 0;
     }
 
+    /// Whether the buffer is empty and holds zeros only, as [`Self::new`] and [`Self::wipe`]
+    /// leave it.
+    #[cfg(test)]
+    pub(crate) fn is_blank(&self) -> bool {
+        self.len == 0 && self.buf.iter().all(|&byte| byte == 0)
+    }
+
     /// Pads the buffered tail with the FIPS 202 sponge padding and returns the final block.
     /// `suffix` holds the domain-separation bits and the first bit of pad10*1 (§5.1), first
     /// bit least significant (Appendix B.2). The last bit of pad10*1 is the top bit of the

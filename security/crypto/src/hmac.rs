@@ -96,6 +96,12 @@ impl Key {
         self.inner.wipe();
         self.outer.wipe();
     }
+
+    /// Whether no key is held: as [`Self::unset`] and [`Self::wipe`] leave it.
+    #[cfg(test)]
+    pub(crate) fn is_unset(&self) -> bool {
+        self.inner.is_fresh() && self.outer.is_fresh()
+    }
 }
 
 /// Streaming HMAC-SHA-512.
