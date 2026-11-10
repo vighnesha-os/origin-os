@@ -39,7 +39,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use origin_abi::Error;
 use origin_paging::{Access, AddressSpace, MapError, PAGE, Table, TableMemory, Translation};
-use origin_sync::shootdown::{Completed, Request, Stalled};
+use origin_sync::shootdown::{Completed, Confirmation, Request, Stalled};
 use origin_sync::{SpinGuard, SpinLock};
 
 use crate::addr::PhysAddr;
@@ -425,6 +425,9 @@ pub struct UserSpace {
     /// Changes to the space go one at a time: see the module documentation.
     editor: SpinLock<()>,
     state: SpinLock<State>,
+    /// Whether a stalled shootdown of this space has not been made good yet (review finding
+    /// 3). Changed only under `editor`.
+    confirmation: Confirmation,
 }
 
 impl core::fmt::Debug for UserSpace {
@@ -482,6 +485,7 @@ impl UserSpace {
             root: state.space.root(),
             editor: SpinLock::new(()),
             state: SpinLock::new(state),
+            confirmation: Confirmation::new(),
         })
     }
 
@@ -616,6 +620,7 @@ impl UserSpace {
         let end = user_range_end(virt, pages)?;
         let _turn = self.edit();
         let mut change = Change::default();
+        self.confirm(&mut change)?;
         let mut cursor = virt;
         while let Some(retired) = self.with_state(|s| s.retire(cursor, end))? {
             let Retired {
@@ -625,16 +630,33 @@ impl UserSpace {
             } = retired;
             cursor = next;
             change.pages += mappings.len() as u64;
-            let done =
-                crate::tlb::retire_in_space(self.root, request, mappings, |mut mappings| {
-                    for mapping in mappings.drain(..) {
-                        mapping.frame.release();
-                    }
-                    self.with_state(|s| s.spare = mappings);
-                })?;
-            change.add(done);
+            let done = crate::tlb::retire_in_space(self.root, request, mappings, |mut mappings| {
+                for mapping in mappings.drain(..) {
+                    mapping.frame.release();
+                }
+                self.with_state(|s| s.spare = mappings);
+            });
+            change.add(self.confirmation.record(done)?);
         }
         Ok(change)
+    }
+
+    /// Whether a change to this space is not known to have reached every processor: a
+    /// shootdown stalled, and no flush has completed since (review finding 3).
+    pub fn change_unconfirmed(&self) -> bool {
+        self.confirmation.is_unconfirmed()
+    }
+
+    /// Before a change: if an earlier shootdown stalled, every processor with this space loaded
+    /// must first drop everything it holds of it (review finding 3). Called under `editor`.
+    fn confirm(&self, change: &mut Change) -> Result<(), ChangeError> {
+        let flushed = self
+            .confirmation
+            .settle(|| crate::tlb::shootdown_space(self.root, Request::NonGlobal))?;
+        if let Some(done) = flushed {
+            change.add(done);
+        }
+        Ok(())
     }
 
     /// Gives every page mapped in the `pages` pages from `virt` the permissions `access`. When
@@ -645,12 +667,14 @@ impl UserSpace {
         let end = user_range_end(virt, pages)?;
         let _turn = self.edit();
         let mut change = Change::default();
+        self.confirm(&mut change)?;
         let mut cursor = virt;
         while let Some(round) = self.with_state(|s| s.protect(cursor, end, access)) {
             cursor = round.next;
             change.pages += round.changed;
             if round.changed != 0 {
-                change.add(crate::tlb::shootdown_space(self.root, round.request)?);
+                let done = crate::tlb::shootdown_space(self.root, round.request);
+                change.add(self.confirmation.record(done)?);
             }
         }
         Ok(change)

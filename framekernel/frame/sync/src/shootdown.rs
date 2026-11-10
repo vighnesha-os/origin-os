@@ -181,6 +181,68 @@ pub struct Stalled {
     pub cpu: usize,
 }
 
+/// Whether every change to one address space is known to have reached every processor
+/// (review finding 3). After a stalled shootdown some processor may still hold a translation the
+/// tables no longer give; a retry that finds nothing left to change would send nothing and report
+/// success. So a stall is remembered, and the next change starts with a flush of the whole space,
+/// and the mark goes only when such a flush completes. The caller serializes changes to the space.
+#[derive(Debug)]
+pub struct Confirmation {
+    unconfirmed: prim::AtomicBool,
+}
+
+impl Confirmation {
+    /// Nothing unconfirmed.
+    #[cfg(not(all(test, loom)))]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            unconfirmed: prim::AtomicBool::new(false),
+        }
+    }
+
+    /// Nothing unconfirmed. Loom's atomics cannot be built in a `const`.
+    #[cfg(all(test, loom))]
+    pub fn new() -> Self {
+        Self {
+            unconfirmed: prim::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether a stalled shootdown has not been made good yet.
+    pub fn is_unconfirmed(&self) -> bool {
+        self.unconfirmed.load(Ordering::Relaxed)
+    }
+
+    /// Before a change: if a shootdown stalled, runs `flush` (every translation of the space,
+    /// on every processor in it), and clears the mark only if that completes.
+    pub fn settle(
+        &self,
+        flush: impl FnOnce() -> Result<Completed, Stalled>,
+    ) -> Result<Option<Completed>, Stalled> {
+        if !self.is_unconfirmed() {
+            return Ok(None);
+        }
+        let done = self.record(flush())?;
+        self.unconfirmed.store(false, Ordering::Relaxed);
+        Ok(Some(done))
+    }
+
+    /// A shootdown's outcome: a stall is remembered.
+    pub fn record(&self, done: Result<Completed, Stalled>) -> Result<Completed, Stalled> {
+        if done.is_err() {
+            self.unconfirmed.store(true, Ordering::Relaxed);
+        }
+        done
+    }
+}
+
+impl Default for Confirmation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The shootdown state of a machine with up to `CPUS` processors.
 pub struct Shootdown<const CPUS: usize> {
     /// Held by the processor whose request is in progress.
@@ -1005,6 +1067,44 @@ mod tests {
         assert_eq!(outcome, Err(Stalled { cpu: 1 }));
         assert_eq!(released.load(Ordering::Relaxed), 0);
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_stall_is_remembered_until_a_flush_completes() {
+        let confirmation = Confirmation::new();
+        let done = Completed {
+            processors: 1,
+            ticks: 5,
+        };
+        let stall = Stalled { cpu: 3 };
+        let mut flushes = 0;
+        // Nothing to settle: no flush.
+        assert_eq!(confirmation.settle(|| unreachable!("no flush")), Ok(None));
+        assert_eq!(confirmation.record(Ok(done)), Ok(done));
+        assert!(!confirmation.is_unconfirmed());
+        // A stall is remembered...
+        assert_eq!(confirmation.record(Err(stall)), Err(stall));
+        assert!(confirmation.is_unconfirmed());
+        // ... through a flush that stalls too...
+        assert_eq!(
+            confirmation.settle(|| {
+                flushes += 1;
+                Err(stall)
+            }),
+            Err(stall)
+        );
+        assert!(confirmation.is_unconfirmed());
+        // ... and goes with the first flush that completes, which the next change pays for.
+        assert_eq!(
+            confirmation.settle(|| {
+                flushes += 1;
+                Ok(done)
+            }),
+            Ok(Some(done))
+        );
+        assert!(!confirmation.is_unconfirmed());
+        assert_eq!(flushes, 2);
+        assert_eq!(confirmation.settle(|| unreachable!("settled")), Ok(None));
     }
 
     #[test]
