@@ -80,6 +80,12 @@ Firmware the chips need is shipped under its own licence, as §38 requires.
 
 This is the clean-room process route 2 above asks for. So a Wi-Fi or Bluetooth driver may start once the gaps in the vendor documents are filled this way, without a further ADR.
 
+*Added 2026-11-10, items 94–96:*
+
+- The same terms cover other open-source projects. Ubuntu is one: its wpa_supplicant (BSD-licensed) and BlueZ are references for WPA3 and the Bluetooth host. So are the BSDs, Zephyr and NimBLE. ReactOS is excluded.
+- The order is free specifications and vendor documents first, vendor-written open-source code second, other systems third. Nothing is paid for.
+- Every reference is read at its current release on the day, with its tag or commit recorded.
+
 Bluetooth's host-to-controller interface (HCI) is standard, but each vendor's firmware-loading step is not public, so Bluetooth controllers have the same question on a smaller scale.
 
 Meanwhile, these can be built and tested on the host from public specifications:
@@ -97,7 +103,7 @@ Before either radio ships, two things need research:
 
 ### D7. Displays and restricted documents (item 80)
 
-- **DisplayPort comes first.** HDMI 2.1's high-rate (FRL) modes wait until their licensing allows an open implementation. The HDMI Forum refused AMD's open-source implementation in 2024, and AMD posted partial patches only in May 2026 (§36).
+- **DisplayPort comes first.** HDMI 2.1's high-rate (FRL) modes wait until their licensing allows an open implementation. The HDMI Forum refused AMD's open-source implementation in 2024. AMD posted patches in May 2026, and Linux 7.4 (rc1, 2026-11-01) enables HDMI 2.1 by default in AMD's driver. That arrangement covers AMD's code, not Origin's, and as far as was found HDMI's specification is open only to paying adopters, so the order here stands (§36).
 - **Read the Thunderbolt licence before its specification** (D5).
 - **Keep documents whose terms forbid redistribution out of Git.** AMD's IOMMU specification 48882 is the precedent: it is excluded locally and never committed (§17).
 
@@ -134,7 +140,7 @@ Checked 2026-11-10:
 - Bluetooth Core 6.2 was published on 2025-11-03 ([Bluetooth SIG](https://www.bluetooth.com/bluetooth-core-6-2-feature-overview); [Nordic](https://devzone.nordicsemi.com/nordic/nordic-blog/b/blog/posts/whats-new-in-bluetooth-core-6-2-an-overview)). Whether 6.3 has appeared since is unconfirmed.
 - IEEE 802.11be was approved on 2024-09-26 and published on 2025-07-22. It is free through the IEEE GET program ([IEEE](https://standards.ieee.org/ieee/802.11/10548/)).
 - Bluetooth qualification and the patent and copyright licence ([qualification](https://www.bluetooth.com/develop-with-bluetooth/qualify/), [do I need to qualify?](https://support.bluetooth.com/hc/en-us/articles/360049018272), [PCLA](https://www.bluetooth.com/wp-content/uploads/2019/03/PCLA-ESign-Version-Version-11.pdf)).
-- HDMI 2.1 and open source ([PCGH, 2024](https://www.pcgameshardware.de/Monitor-Display-Hardware-154105/News/HDMI-Open-Source-Implementierung-1441978/); [Phoronix, May 2026](https://phoronix.com/news/amdgpu-hdmi-2.1-frl-patches)).
+- HDMI 2.1 and open source ([PCGH, 2024](https://www.pcgameshardware.de/Monitor-Display-Hardware-154105/News/HDMI-Open-Source-Implementierung-1441978/); [Phoronix, May 2026](https://phoronix.com/news/amdgpu-hdmi-2.1-frl-patches); [Phoronix, Linux 7.4-rc1, checked 2026-11-10](https://phoronix.com/news/Linux-7.4-rc1)).
 - Thunderbolt 4/5 specifications are not public and need an Intel licence (CLAUDE.md §17).
 - That no major Wi-Fi vendor publishes its chips' programming interface comes from Claude's knowledge, not from a fresh search. It is to be re-checked vendor by vendor before D6's first driver.
 

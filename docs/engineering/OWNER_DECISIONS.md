@@ -5,7 +5,7 @@
 | As of | 2026-11-09, on `main`, after the pre-merge review. Everything that was on a side branch is merged. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–93. |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–96. |
 | Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do (see the last section). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -252,7 +252,7 @@ You asked for a strict rule: "we are building for 2026+ hardware and in AMD Zen5
 | 89, answered | The kernel names the core generation from CPUID (AMD family 1Ah or higher; Intel family 18 or higher, or family 6 model CCh, D5h, DDh or E5h), from one table built from Intel's and AMD's documents, and reports the scope at boot without ever refusing to boot (A2)? | **Accept** |
 | 90, answered | At M9, decide whether the production installer warns on or refuses machines outside the scope, with developer builds exempt (A3)? | **Accept**, to be decided at M9 |
 
-## Linux as a reference only (CLAUDE.md §3, §6, §16): decided by the owner 2026-11-10
+## Linux and other open-source code as a reference only (CLAUDE.md §3, §6, §16): decided by the owner 2026-11-10
 
 Claude had proposed five items allowing Linux drivers to be studied for how they handle hardware. You narrowed that in your own words: "in any case if need to refer Linux code that should be completely as reference, Don't copy just to understand if anything missing from Vendor or official specifications or standards". That replaces Claude's proposal.
 
@@ -261,3 +261,11 @@ Claude had proposed five items allowing Linux drivers to be studied for how they
 | 91, answered | When may Linux source be read? | **Only as a reference, to understand what the vendor's documents or the official specifications and standards leave out. Never copied** (your rule, 2026-11-10) |
 | 92, answered | So that code is never written with Linux source open: the reading step writes the missing facts into Origin's specification or research ledger in Origin's own words, citing file, commit and licence; the code is then written from that, in a separate session, without the Linux source? | **Yes, as recommended** ("keep 92 as before you said", 2026-11-10). Claude writes Origin's code and was trained on Linux's code, so this split is what keeps "don't copy" true. It is also the clean-room process ADR-0015 D6 asked for |
 | 93, answered | Record per driver which Linux files were consulted, their licence, and which gap each one filled (§6)? | **Yes** ("accept 93", 2026-11-10) |
+
+You then asked whether public sources, Linux and other open-source operating systems, Ubuntu included, could cover these drivers without spending, as of today rather than from Claude's training data. You answered **"Accept all"** to these.
+
+| # | Question | Answer |
+|---|---|---|
+| 94, answered | Extend items 91–93 to other open-source projects on the same terms (gaps only, never copied, Origin's own specification first, licence recorded)? <br>• **Ubuntu:** its kernel patches, packaged firmware and user-space stacks such as wpa_supplicant, BlueZ and fwupd. <br>• **Others:** the BSDs, Haiku, Redox, Fuchsia, illumos, EDK2, coreboot, SeaBIOS, QEMU's device models, SPDK, `libspdm`, Zephyr and NimBLE. <br>• **Excluded:** ReactOS (§3 names it, and it reimplements Windows). Leaked or proprietary code is never opened. | **Accept** |
+| 95, answered | The source order, with no spending: free official specifications and vendor documents first; then open-source code the vendor wrote itself (EDK2, SPDK, `libspdm`, Intel's Linux drivers); then other open-source systems? The paid PCIe specification stays unread, and a feature with no free legitimate source is reported "not supported" (ADR-0015 D2). | **Accept** |
+| 96, answered | Always today's version: read each reference from the newest release on the day (on 2026-11-10 that was Linux 7.4-rc2 or 7.3.3, and Ubuntu 26.10 or 26.04.1 LTS); record its tag or commit and the date; re-check specification revisions the same day; never rely on Claude's memory of older code? | **Accept** |
