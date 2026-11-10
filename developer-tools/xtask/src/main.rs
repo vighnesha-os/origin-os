@@ -9,6 +9,7 @@
 mod disk;
 mod interfaces;
 mod loom;
+mod reproducible;
 mod screen;
 mod serial;
 mod turns;
@@ -59,6 +60,9 @@ commands:
   interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
               (part of check; quick)
   regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
+  reproducible-gate only the gate on reproducible builds: the loader, each way it is built,
+              and the kernel are built twice from nothing in two target directories, and the
+              two files of each must be the same bytes (part of check; CLAUDE.md §75)
   exclusive -- <command> [args...]
               runs any command in a turn on the machine, as check, the boots, run and loom
               take theirs: one at a time across every checkout of this repository on this
@@ -2043,6 +2047,7 @@ fn main() -> ExitCode {
         ["unsafe-gate"] => unsafety::gate(),
         ["interface-gate"] => interfaces::gate(),
         ["regenerate"] => interfaces::regenerate(),
+        ["reproducible-gate"] => in_turn("reproducible-gate", reproducible::gate),
         ["build"] => in_turn("build", || {
             build_loader(Loader::Developer).and_then(|loader| {
                 let kernel = pack_kernel(&build_kernel()?)?;
@@ -2715,6 +2720,7 @@ fn check() -> Result {
         build_loader(loader)?;
     }
     build_kernel()?;
+    reproducible::gate()?;
     no_panic_check()?;
     dependency_check()?;
     linux_cfg_lint()?;
@@ -3417,7 +3423,15 @@ fn collect_files(
 /// Builds the EFI application with `loader`'s feature and returns the path of
 /// `origin-boot.efi`.
 fn build_loader(loader: Loader) -> Result<PathBuf> {
-    run_step(cargo().args([
+    build_loader_in(Some(loader.feature()), None)
+}
+
+/// Builds the EFI application with `feature`, or with none, into `target`, or into Cargo's own
+/// target directory, and returns the path of `origin-boot.efi`. With no feature the trust
+/// store is empty: the loader a release builds, until Origin has keys of its own.
+fn build_loader_in(feature: Option<&str>, target: Option<&Path>) -> Result<PathBuf> {
+    let mut build = cargo();
+    build.args([
         "build",
         "--package",
         LOADER_PACKAGE,
@@ -3426,10 +3440,16 @@ fn build_loader(loader: Loader) -> Result<PathBuf> {
         "--target",
         UEFI_TARGET,
         "--release",
-        "--features",
-        loader.feature(),
-    ]))?;
-    let efi = target_dir()
+    ]);
+    if let Some(feature) = feature {
+        build.args(["--features", feature]);
+    }
+    if let Some(target) = target {
+        build.arg("--target-dir").arg(target);
+    }
+    run_step(&mut build)?;
+    let efi = target
+        .map_or_else(target_dir, Path::to_path_buf)
         .join(UEFI_TARGET)
         .join("release")
         .join(format!("{LOADER_BIN}.efi"));
@@ -3445,7 +3465,14 @@ fn build_loader(loader: Loader) -> Result<PathBuf> {
 
 /// Builds the Framekernel ELF for `x86_64-unknown-none` and returns its path.
 fn build_kernel() -> Result<PathBuf> {
-    run_step(cargo().args([
+    build_kernel_in(None)
+}
+
+/// Builds the Framekernel ELF into `target`, or into Cargo's own target directory, and returns
+/// its path.
+fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
+    let mut build = cargo();
+    build.args([
         "build",
         "--package",
         KERNEL_PACKAGE,
@@ -3454,8 +3481,13 @@ fn build_kernel() -> Result<PathBuf> {
         "--target",
         KERNEL_TARGET,
         "--release",
-    ]))?;
-    let elf = target_dir()
+    ]);
+    if let Some(target) = target {
+        build.arg("--target-dir").arg(target);
+    }
+    run_step(&mut build)?;
+    let elf = target
+        .map_or_else(target_dir, Path::to_path_buf)
         .join(KERNEL_TARGET)
         .join("release")
         .join(KERNEL_PACKAGE);
