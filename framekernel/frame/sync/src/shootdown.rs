@@ -145,6 +145,9 @@ pub trait TlbHardware {
     /// Runs `f` with interrupts disabled on this processor.
     fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R;
 
+    /// The root of the address space this processor runs on now (CR3).
+    fn current_root(&self) -> u64;
+
     /// A clock for [`TlbHardware::patience`].
     fn now(&self) -> u64;
 
@@ -178,6 +181,68 @@ pub struct Stalled {
     pub cpu: usize,
 }
 
+/// Whether every change to one address space is known to have reached every processor
+/// (review finding 3). After a stalled shootdown some processor may still hold a translation the
+/// tables no longer give; a retry that finds nothing left to change would send nothing and report
+/// success. So a stall is remembered, and the next change starts with a flush of the whole space,
+/// and the mark goes only when such a flush completes. The caller serializes changes to the space.
+#[derive(Debug)]
+pub struct Confirmation {
+    unconfirmed: prim::AtomicBool,
+}
+
+impl Confirmation {
+    /// Nothing unconfirmed.
+    #[cfg(not(all(test, loom)))]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            unconfirmed: prim::AtomicBool::new(false),
+        }
+    }
+
+    /// Nothing unconfirmed. Loom's atomics cannot be built in a `const`.
+    #[cfg(all(test, loom))]
+    pub fn new() -> Self {
+        Self {
+            unconfirmed: prim::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether a stalled shootdown has not been made good yet.
+    pub fn is_unconfirmed(&self) -> bool {
+        self.unconfirmed.load(Ordering::Relaxed)
+    }
+
+    /// Before a change: if a shootdown stalled, runs `flush` (every translation of the space,
+    /// on every processor in it), and clears the mark only if that completes.
+    pub fn settle(
+        &self,
+        flush: impl FnOnce() -> Result<Completed, Stalled>,
+    ) -> Result<Option<Completed>, Stalled> {
+        if !self.is_unconfirmed() {
+            return Ok(None);
+        }
+        let done = self.record(flush())?;
+        self.unconfirmed.store(false, Ordering::Relaxed);
+        Ok(Some(done))
+    }
+
+    /// A shootdown's outcome: a stall is remembered.
+    pub fn record(&self, done: Result<Completed, Stalled>) -> Result<Completed, Stalled> {
+        if done.is_err() {
+            self.unconfirmed.store(true, Ordering::Relaxed);
+        }
+        done
+    }
+}
+
+impl Default for Confirmation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The shootdown state of a machine with up to `CPUS` processors.
 pub struct Shootdown<const CPUS: usize> {
     /// Held by the processor whose request is in progress.
@@ -194,6 +259,9 @@ pub struct Shootdown<const CPUS: usize> {
     loaded: [prim::AtomicU64; CPUS],
     /// The root a processor is switching away from, while its switch is in flight (else 0).
     leaving: [prim::AtomicU64; CPUS],
+    /// The root a processor is visiting, without leaving `loaded` (else 0): see
+    /// [`Shootdown::visit`].
+    visiting: [prim::AtomicU64; CPUS],
 }
 
 impl<const CPUS: usize> core::fmt::Debug for Shootdown<CPUS> {
@@ -215,6 +283,7 @@ impl<const CPUS: usize> Shootdown<CPUS> {
             online: [const { prim::AtomicBool::new(false) }; CPUS],
             loaded: [const { prim::AtomicU64::new(0) }; CPUS],
             leaving: [const { prim::AtomicU64::new(0) }; CPUS],
+            visiting: [const { prim::AtomicU64::new(0) }; CPUS],
         }
     }
 
@@ -229,6 +298,7 @@ impl<const CPUS: usize> Shootdown<CPUS> {
             online: core::array::from_fn(|_| prim::AtomicBool::new(false)),
             loaded: core::array::from_fn(|_| prim::AtomicU64::new(0)),
             leaving: core::array::from_fn(|_| prim::AtomicU64::new(0)),
+            visiting: core::array::from_fn(|_| prim::AtomicU64::new(0)),
         }
     }
 
@@ -243,14 +313,31 @@ impl<const CPUS: usize> Shootdown<CPUS> {
         hardware.invalidate(Request::Everything);
     }
 
-    /// Moves processor `me` from address space `from` to `to`, by running `load` (the CR3
-    /// write). Both count as loaded while the switch is in flight: the old one until the
-    /// processor has really left it, the new one from before it arrives.
+    /// Moves this processor to the address space `to`, by running `load` (the CR3 write), and
+    /// keeps the record of it; nothing happens if `to` is what it runs on already. Both spaces
+    /// count as loaded while the switch is in flight: the old one until the processor has really
+    /// left it, the new one from before it arrives.
+    ///
+    /// All of it with interrupts off, the processor and the root it leaves read inside: an
+    /// interrupt between the record and the CR3 write could switch this processor itself (the
+    /// scheduler does, on a timer tick), and the write resumed after it would leave the record
+    /// naming a space the processor no longer runs on, so that a shootdown passed it over and a
+    /// space could be freed under it (review finding 1).
     ///
     /// The fence is what lets an initiator skip a processor that has not reached the space it
     /// is changing: this processor's page walks start after the fence, so if the initiator
     /// read the old `loaded`, its own fence came first, and the walks see its change.
-    pub fn switch_space<R>(&self, me: usize, from: u64, to: u64, load: impl FnOnce() -> R) -> R {
+    pub fn switch_space(&self, hardware: &impl TlbHardware, to: u64, load: impl FnOnce()) {
+        hardware.without_interrupts(|| self.switch_here(hardware, to, load));
+    }
+
+    /// [`switch_space`](Self::switch_space)'s work, with interrupts already off.
+    fn switch_here(&self, hardware: &impl TlbHardware, to: u64, load: impl FnOnce()) {
+        let me = hardware.this_cpu();
+        let from = hardware.current_root();
+        if from == to {
+            return;
+        }
         if let Some(leaving) = self.leaving.get(me) {
             leaving.store(from, Ordering::Release);
         }
@@ -258,16 +345,52 @@ impl<const CPUS: usize> Shootdown<CPUS> {
             loaded.store(to, Ordering::Release);
         }
         prim::fence(Ordering::SeqCst);
-        let result = load();
+        load();
         if let Some(leaving) = self.leaving.get(me) {
             leaving.store(0, Ordering::Release);
         }
-        result
     }
 
-    /// Whether processor `id` has `root` loaded, or is in the middle of leaving it. `loaded`
-    /// is read before `leaving`, the reverse of the order [`switch_space`] writes them, so a
-    /// processor in the middle of a switch counts as holding both.
+    /// Runs `f` on this processor with the address space `visiting` loaded, then puts back the
+    /// space it was on, with interrupts off throughout: nothing can switch it meanwhile. `load`
+    /// is the CR3 write, run once each way. For a visit that must not outlast the call, such as
+    /// a proof's read through another space's tables (review finding 2).
+    ///
+    /// The visit is recorded in `visiting` alone, from before its CR3 write until after the one
+    /// that ends it, and `loaded` keeps naming the space the processor returns to: each space
+    /// is in one field for as long as the processor can reach it, whatever order a reader reads
+    /// the fields in. A shootdown for the visited space waits for the visit to end, since the
+    /// processor answers only with interrupts on again.
+    pub fn visit<R>(
+        &self,
+        hardware: &impl TlbHardware,
+        visiting: u64,
+        load: impl Fn(u64),
+        f: impl FnOnce() -> R,
+    ) -> R {
+        hardware.without_interrupts(|| {
+            let home = hardware.current_root();
+            if home == visiting {
+                return f();
+            }
+            let slot = self.visiting.get(hardware.this_cpu());
+            if let Some(slot) = slot {
+                slot.store(visiting, Ordering::Release);
+            }
+            prim::fence(Ordering::SeqCst);
+            load(visiting);
+            let result = f();
+            load(home);
+            if let Some(slot) = slot {
+                slot.store(0, Ordering::Release);
+            }
+            result
+        })
+    }
+
+    /// Whether processor `id` has `root` loaded, is in the middle of leaving it, or is visiting
+    /// it. `loaded` is read before `leaving`, the reverse of the order [`switch_space`] writes
+    /// them, so a processor in the middle of a switch counts as holding both.
     ///
     /// [`switch_space`]: Self::switch_space
     fn holds(&self, id: usize, root: u64) -> bool {
@@ -278,6 +401,10 @@ impl<const CPUS: usize> Shootdown<CPUS> {
                 .leaving
                 .get(id)
                 .is_some_and(|leaving| leaving.load(Ordering::Acquire) == root)
+            || self
+                .visiting
+                .get(id)
+                .is_some_and(|visiting| visiting.load(Ordering::Acquire) == root)
     }
 
     /// How many processors have the address space `root` loaded.
@@ -433,6 +560,8 @@ mod tests {
         ipis: Mutex<Vec<(usize, usize)>>,
         clock: AtomicU64,
         ticking: AtomicBool,
+        /// Each processor's CR3.
+        cr3: [AtomicU64; 8],
     }
 
     impl TlbHardware for Cpu<'_> {
@@ -467,10 +596,27 @@ mod tests {
         fn patience(&self) -> u64 {
             1000
         }
+
+        fn current_root(&self) -> u64 {
+            self.machine.cr3[self.id].load(Ordering::Relaxed)
+        }
     }
 
     fn cpu(id: usize, machine: &Machine) -> Cpu<'_> {
         Cpu { id, machine }
+    }
+
+    /// Switches `cpu` to `to` through `shootdown`, the CR3 write running `during` too.
+    fn switch<const N: usize>(
+        shootdown: &Shootdown<N>,
+        cpu: &Cpu<'_>,
+        to: u64,
+        during: impl FnOnce(),
+    ) {
+        shootdown.switch_space(cpu, to, || {
+            cpu.machine.cr3[cpu.id].store(to, Ordering::Relaxed);
+            during();
+        });
     }
 
     #[test]
@@ -587,6 +733,9 @@ mod tests {
             fn patience(&self) -> u64 {
                 1
             }
+            fn current_root(&self) -> u64 {
+                0
+            }
         }
         let shootdown = Shootdown::<2>::new();
         let saw_online = AtomicBool::new(false);
@@ -687,26 +836,80 @@ mod tests {
 
     #[test]
     fn a_switch_counts_as_holding_both_spaces_until_it_is_done() {
+        let machine = Machine::default();
         let shootdown = Shootdown::<3>::new();
+        let (one, two) = (cpu(1, &machine), cpu(2, &machine));
         assert_eq!(shootdown.processors_holding(7), 0);
-        shootdown.switch_space(1, 0, 7, || {
+        switch(&shootdown, &one, 7, || {
             assert_eq!(shootdown.processors_holding(7), 1, "arriving");
         });
         assert_eq!(shootdown.processors_holding(7), 1);
-        shootdown.switch_space(1, 7, 9, || {
+        switch(&shootdown, &one, 9, || {
             assert_eq!(shootdown.processors_holding(7), 1, "leaving");
             assert_eq!(shootdown.processors_holding(9), 1, "arriving");
         });
         assert_eq!(shootdown.processors_holding(7), 0, "gone");
         assert_eq!(shootdown.processors_holding(9), 1);
         // A second processor in the same space.
-        shootdown.switch_space(2, 0, 9, || ());
+        switch(&shootdown, &two, 9, || ());
         assert_eq!(shootdown.processors_holding(9), 2);
-        // An index past the table counts nothing, and still runs the load.
+        // An index past the table counts nothing, and still loads.
         let mut ran = false;
-        shootdown.switch_space(5, 1, 2, || ran = true);
+        switch(&shootdown, &cpu(5, &machine), 2, || ran = true);
         assert!(ran);
         assert_eq!(shootdown.processors_holding(2), 0);
+    }
+
+    /// A visit is recorded while it lasts, puts the processor back, and leaves `loaded` alone.
+    #[test]
+    fn a_visit_is_recorded_while_it_lasts_and_ends_where_it_began() {
+        let machine = Machine::default();
+        let shootdown = Shootdown::<2>::new();
+        let one = cpu(1, &machine);
+        switch(&shootdown, &one, 7, || ());
+        let load = |to: u64| machine.cr3[1].store(to, Ordering::Relaxed);
+        let seen = shootdown.visit(&one, 9, load, || {
+            (
+                machine.cr3[1].load(Ordering::Relaxed),
+                shootdown.processors_holding(9),
+                shootdown.processors_holding(7),
+            )
+        });
+        assert_eq!(seen, (9, 1, 1), "on the visited space, both recorded");
+        assert_eq!(
+            machine.cr3[1].load(Ordering::Relaxed),
+            7,
+            "back where it was"
+        );
+        assert_eq!(shootdown.processors_holding(9), 0);
+        assert_eq!(shootdown.processors_holding(7), 1);
+        // A visit to where it already is changes nothing.
+        let loads = AtomicUsize::new(0);
+        let mut f_ran = false;
+        shootdown.visit(
+            &one,
+            7,
+            |_| {
+                loads.fetch_add(1, Ordering::Relaxed);
+            },
+            || f_ran = true,
+        );
+        assert!(f_ran);
+        assert_eq!(loads.load(Ordering::Relaxed), 0);
+    }
+
+    /// A switch to the space the processor is on does nothing, not even the CR3 write (which
+    /// would drop every non-global translation for nothing).
+    #[test]
+    fn a_switch_to_where_it_is_does_nothing() {
+        let machine = Machine::default();
+        let shootdown = Shootdown::<2>::new();
+        let one = cpu(1, &machine);
+        switch(&shootdown, &one, 7, || ());
+        let mut loaded_again = false;
+        shootdown.switch_space(&one, 7, || loaded_again = true);
+        assert!(!loaded_again);
+        assert_eq!(shootdown.processors_holding(7), 1);
     }
 
     /// A processor that is not in the space is left alone: no interrupt, nothing invalidated,
@@ -720,8 +923,8 @@ mod tests {
             shootdown.mark_online(&cpu(id, &machine));
         }
         machine.invalidated.lock().unwrap().clear();
-        shootdown.switch_space(1, 0, SPACE, || ());
-        shootdown.switch_space(2, 0, 0x9000, || ());
+        switch(&shootdown, &cpu(1, &machine), SPACE, || ());
+        switch(&shootdown, &cpu(2, &machine), 0x9000, || ());
         let stop = AtomicBool::new(false);
         let done = thread::scope(|s| {
             let (shootdown, machine, stop) = (&shootdown, &machine, &stop);
@@ -759,8 +962,9 @@ mod tests {
         let shootdown = Shootdown::<2>::new();
         shootdown.mark_online(&cpu(0, &machine));
         shootdown.mark_online(&cpu(1, &machine));
-        shootdown.switch_space(1, 0, SPACE, || ());
-        shootdown.switch_space(1, SPACE, 0x9000, || {
+        let one = cpu(1, &machine);
+        switch(&shootdown, &one, SPACE, || ());
+        switch(&shootdown, &one, 0x9000, || {
             // It has not loaded the other space yet: its TLB still holds this one's.
             assert_eq!(
                 shootdown.shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Space(SPACE)),
@@ -784,7 +988,7 @@ mod tests {
         let machine = Machine::default();
         let shootdown = Shootdown::<2>::new();
         shootdown.mark_online(&cpu(0, &machine));
-        shootdown.switch_space(1, 0, SPACE, || ());
+        switch(&shootdown, &cpu(1, &machine), SPACE, || ());
         let done = shootdown
             .shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Space(SPACE))
             .unwrap();
@@ -863,6 +1067,44 @@ mod tests {
         assert_eq!(outcome, Err(Stalled { cpu: 1 }));
         assert_eq!(released.load(Ordering::Relaxed), 0);
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_stall_is_remembered_until_a_flush_completes() {
+        let confirmation = Confirmation::new();
+        let done = Completed {
+            processors: 1,
+            ticks: 5,
+        };
+        let stall = Stalled { cpu: 3 };
+        let mut flushes = 0;
+        // Nothing to settle: no flush.
+        assert_eq!(confirmation.settle(|| unreachable!("no flush")), Ok(None));
+        assert_eq!(confirmation.record(Ok(done)), Ok(done));
+        assert!(!confirmation.is_unconfirmed());
+        // A stall is remembered...
+        assert_eq!(confirmation.record(Err(stall)), Err(stall));
+        assert!(confirmation.is_unconfirmed());
+        // ... through a flush that stalls too...
+        assert_eq!(
+            confirmation.settle(|| {
+                flushes += 1;
+                Err(stall)
+            }),
+            Err(stall)
+        );
+        assert!(confirmation.is_unconfirmed());
+        // ... and goes with the first flush that completes, which the next change pays for.
+        assert_eq!(
+            confirmation.settle(|| {
+                flushes += 1;
+                Ok(done)
+            }),
+            Ok(Some(done))
+        );
+        assert!(!confirmation.is_unconfirmed());
+        assert_eq!(flushes, 2);
+        assert_eq!(confirmation.settle(|| unreachable!("settled")), Ok(None));
     }
 
     #[test]

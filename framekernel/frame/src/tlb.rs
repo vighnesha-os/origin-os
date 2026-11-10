@@ -89,6 +89,10 @@ impl TlbHardware for Hardware {
             .max(MIN_TSC_HZ)
             .saturating_mul(WAIT_SECONDS)
     }
+
+    fn current_root(&self) -> u64 {
+        cpu::read_cr3()
+    }
 }
 
 fn this_cpu() -> usize {
@@ -116,9 +120,25 @@ pub fn mark_online() {
     SHOOTDOWN.mark_online(&Hardware);
 }
 
-/// Runs `load` (the CR3 write) as processor `me`'s move from address space `from` to `to`.
-pub(crate) fn switch_space<R>(me: usize, from: u64, to: u64, load: impl FnOnce() -> R) -> R {
-    SHOOTDOWN.switch_space(me, from, to, load)
+/// Runs `load` (the CR3 write) as this processor's move to address space `to`, with the record
+/// of it, all with interrupts off (`Shootdown::switch_space`).
+pub(crate) fn switch_space(to: u64, load: impl FnOnce()) {
+    SHOOTDOWN.switch_space(&Hardware, to, load);
+}
+
+/// Runs `f` with the address space `root` loaded on this processor, then puts back what was
+/// there, with interrupts off throughout (`Shootdown::visit`).
+pub(crate) fn visit<R>(root: u64, f: impl FnOnce() -> R) -> R {
+    SHOOTDOWN.visit(
+        &Hardware,
+        root,
+        |to| {
+            // SAFETY: `to` is the root a caller of `visit` vouches for (a complete space that
+            // stays alive for the call), or the one this processor was running on before it.
+            unsafe { cpu::load_cr3(to) }
+        },
+        f,
+    )
 }
 
 /// Whether any processor has the address space `root` loaded. A user space's tables are freed

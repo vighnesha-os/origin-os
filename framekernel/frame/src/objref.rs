@@ -78,10 +78,19 @@ impl<T> Deref for ObjectRef<T> {
 }
 
 impl<T> Clone for ObjectRef<T> {
+    /// One more reference.
+    ///
+    /// # Panics
+    ///
+    /// With more references than the count can hold (`origin_sync::refcount::MAX_REFERENCES`),
+    /// as `Arc` aborts: in the kernel a panic halts and never unwinds, so the count can never
+    /// be brought back down to zero while references remain.
     fn clone(&self) -> Self {
         // SAFETY: as in `deref`.
         let counted = unsafe { self.inner.as_ref() };
-        counted.count.retain();
+        if counted.count.retain().is_err() {
+            panic!("origin-frame: an object has more references than its count can hold");
+        }
         Self { inner: self.inner }
     }
 }
