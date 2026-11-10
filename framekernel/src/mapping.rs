@@ -180,6 +180,35 @@ pub fn place(random: u64, pages: u64) -> Option<u64> {
     Some(PLACE_LOW + (random % slots) * PAGE)
 }
 
+/// Why an address space refused to map a run of pages. The framework's own errors are not built
+/// on the host; `memory_object` names each of them in these words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// A page of the run is mapped already.
+    Mapped,
+    /// The space has as many page tables as one space may have, and the run needs another.
+    Tables,
+    /// No free frame for a page table, or no kernel memory for the space's records.
+    Memory,
+    /// Anything else: addresses the space cannot map, or a frame that would be writable and
+    /// executable. `check` and this version's mappings rule both out.
+    Other,
+}
+
+impl Refused {
+    /// The status of a map whose run was refused (ADR-0005 D4): `limit` at the bound on a
+    /// space's page tables, `no_memory` for a want of memory. `None` if only the place is
+    /// taken: a fixed address there is `invalid_args` (D5), and a random draw is made again.
+    pub const fn status(self) -> Option<Error> {
+        match self {
+            Self::Mapped => None,
+            Self::Tables => Some(Error::Limit),
+            Self::Memory => Some(Error::NoMemory),
+            Self::Other => Some(Error::InvalidArgs),
+        }
+    }
+}
+
 /// What an unmap or protect of `pages` pages may cost at most: one unit per shootdown and per
 /// processor each one may interrupt, with `loaded` processors holding the space, and one more
 /// round first if an earlier change stalled (`unconfirmed`).
@@ -567,6 +596,26 @@ mod tests {
             place: Place::Anywhere,
         };
         assert_eq!(frames(&uncountable), None);
+    }
+
+    #[test]
+    fn a_refused_run_has_the_status_of_what_refused_it() {
+        assert_eq!(
+            Refused::Tables.status(),
+            Some(Error::Limit),
+            "a bound of the space"
+        );
+        assert_eq!(
+            Refused::Memory.status(),
+            Some(Error::NoMemory),
+            "a want of memory"
+        );
+        assert_eq!(Refused::Other.status(), Some(Error::InvalidArgs));
+        assert_eq!(
+            Refused::Mapped.status(),
+            None,
+            "the place is taken: its map says what that means"
+        );
     }
 
     #[test]

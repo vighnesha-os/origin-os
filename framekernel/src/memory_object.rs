@@ -27,7 +27,7 @@ use origin_frame::userspace::{Change, ChangeError, SharedFrame, UserSpace};
 use crate::cpu::without_interrupts;
 use crate::handles::Need;
 use crate::ipc::Object;
-use crate::mapping::{self, Allow, Asked, PAGE, Place, Request};
+use crate::mapping::{self, Allow, Asked, PAGE, Place, Refused, Request};
 use crate::paging::{Access, MapError};
 use crate::process::{Account, Process};
 
@@ -122,6 +122,19 @@ const fn access(allow: Allow) -> Access {
     match allow {
         Allow::Read => Access::Read,
         Allow::ReadWrite => Access::ReadWrite,
+    }
+}
+
+/// Why the address space refused a run, in the rules' words ([`Refused::status`] has the status
+/// of each).
+const fn refused(e: ChangeError) -> Refused {
+    match e {
+        ChangeError::Map(MapError::AlreadyMapped(_)) => Refused::Mapped,
+        ChangeError::Limit => Refused::Tables,
+        ChangeError::Map(MapError::OutOfMemory) => Refused::Memory,
+        // Not reached in this version: the run's addresses were checked (`mapping::check`), no
+        // mapping of an object is executable, and entering a run waits for no processor.
+        _ => Refused::Other,
     }
 }
 
@@ -246,14 +259,8 @@ fn map_pages(
     let frames = object.run(asked).ok_or(Error::InvalidArgs)?;
     space
         .map_shared_run(base, frames, access(asked.allow))
-        .map_err(|e| match e {
-            // The space is out of frames for its page tables.
-            ChangeError::Map(MapError::OutOfMemory) => Error::Limit,
-            // Not reached in this version: the place is reserved and was found unmapped
-            // (`reserve`), its addresses were checked (`mapping::check`), and no mapping of an
-            // object is executable.
-            _ => Error::InvalidArgs,
-        })
+        // Over a mapped page is `invalid_args`; not reached, since `reserve` has looked.
+        .map_err(|e| refused(e).status().unwrap_or(Error::InvalidArgs))
 }
 
 /// What a change cost, in the budget's units: its shootdowns and the interrupts they sent.
