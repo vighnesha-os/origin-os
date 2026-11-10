@@ -1406,6 +1406,8 @@ const THE_PAGE: u64 = 0x40_0000;
 const MAPPED: u64 = 1;
 /// What a model's assertion says when a shootdown failed to do its job.
 const STALE: &str = "a processor kept a translation the shootdown took away";
+/// What a model says when a request for one address space interrupted a processor in another.
+const OUTSIDE: &str = "a shootdown for one space reached a processor in another";
 
 /// The machine of a shootdown model: a page table entry and each processor's TLB.
 struct TlbWorld {
@@ -1422,6 +1424,9 @@ struct TlbWorld {
     cr3: [AtomicU64; SHOOT_CPUS],
     /// Each processor's interrupt flag, for [`IrqCpu`]: held while interrupts are off there.
     interrupts: [SpinLock<()>; SHOOT_CPUS],
+    /// A processor that no request of the model is for: interrupting it fails the model with
+    /// [`OUTSIDE`], at the moment the interrupt is sent.
+    bystander: Option<usize>,
 }
 
 /// One processor of a [`TlbWorld`].
@@ -1459,6 +1464,7 @@ impl TlbHardware for TlbCpu {
     }
 
     fn send_ipi(&self, cpu: usize) {
+        assert_ne!(self.world.bystander, Some(cpu), "{OUTSIDE}");
         self.world.kick[cpu].notify();
     }
 
@@ -1482,6 +1488,11 @@ impl TlbHardware for TlbCpu {
 
 impl TlbWorld {
     fn new() -> Arc<Self> {
+        Self::with_bystander(None)
+    }
+
+    /// A world in which sending processor `bystander` an interrupt fails the model.
+    fn with_bystander(bystander: Option<usize>) -> Arc<Self> {
         Arc::new(Self {
             shootdown: Shootdown::new(),
             tlb: core::array::from_fn(|_| AtomicBool::new(false)),
@@ -1490,6 +1501,7 @@ impl TlbWorld {
             pte: AtomicU64::new(MAPPED),
             cr3: core::array::from_fn(|_| AtomicU64::new(KERNEL_SPACE)),
             interrupts: core::array::from_fn(|_| SpinLock::new(())),
+            bystander,
         })
     }
 
@@ -1656,7 +1668,7 @@ const OTHER_SPACE: u64 = 0xC000;
 
 /// A processor in the space holds the translation: it is asked, and it answers. A processor in
 /// another space, which also holds a translation of that address of its own, is not asked: it
-/// is never interrupted and keeps it.
+/// is never sent the interrupt (the model fails at the moment it would be) and keeps it.
 #[test]
 fn shootdown_for_a_space_asks_only_the_processors_in_it() {
     check(
@@ -1664,7 +1676,7 @@ fn shootdown_for_a_space_asks_only_the_processors_in_it() {
         preempted(3, SPINS),
         preempted(4, SPINS),
         || {
-            let world = TlbWorld::new();
+            let world = TlbWorld::with_bystander(Some(2));
             let (near, inside, elsewhere) =
                 (tlb_cpu(&world, 0), tlb_cpu(&world, 1), tlb_cpu(&world, 2));
             for cpu in [&near, &inside, &elsewhere] {
@@ -1677,10 +1689,7 @@ fn shootdown_for_a_space_asks_only_the_processors_in_it() {
             let serving = vec![inside.serving()];
             near.take_the_page_away(Scope::Space(THE_SPACE));
             assert!(!inside.holds(), "{STALE}");
-            assert!(
-                elsewhere.holds(),
-                "a shootdown for one space reached a processor in another"
-            );
+            assert!(elsewhere.holds(), "{OUTSIDE}");
             world.finish(serving);
         },
     );

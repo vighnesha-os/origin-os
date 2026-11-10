@@ -95,6 +95,8 @@ const WENT_BACK: &[&str] = &["the clock went backwards"];
 const STALE: &[&str] = &["a processor kept a translation the shootdown took away"];
 /// A wait that can never end: to Loom, a processor spinning for ever.
 const NEVER_ENDS: &[&str] = &["Model exceeded maximum number of branches", "deadlock"];
+/// A request for one address space interrupted a processor in another.
+const OUTSIDE: &[&str] = &["a shootdown for one space reached a processor in another"];
 /// The frame was reused while something could still reach it, or two things reused it.
 const REUSED_TOO_SOON: &[&str] = &[
     "Causality violation",
@@ -827,10 +829,7 @@ const CONTROLS: &[Control] = &[
         file: SHOOTDOWN,
         from: "                Scope::Space(root) => self.holds(id, root),\n",
         to: "                Scope::Space(root) => root == root,\n",
-        models: &[(
-            "shootdown_for_a_space_asks_only_the_processors_in_it",
-            &["a shootdown for one space reached a processor in another", "deadlock", "Model exceeded maximum number of branches"],
-        )],
+        models: &[("shootdown_for_a_space_asks_only_the_processors_in_it", OUTSIDE)],
     },
     // The deferred free (N14 step 3, S3-5a).
     Control {
