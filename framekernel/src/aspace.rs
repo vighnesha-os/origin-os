@@ -644,14 +644,18 @@ fn read_from(space: &UserSpace, addr: u64) -> Probe {
 /// - The test of the defect this rule closes: a space is created first, a kernel mapping is
 ///   then made in a top-level slot of its own, and the kernel, on that space's tables, reads it.
 /// - The control, in every boot: from a space that lacks that slot, which is what every space
-///   used to be, the same read faults. So the read can tell the two apart.
+///   used to be, the same read faults. So the read can tell the two apart. The framework builds
+///   that space and drops it within the read (`KernelProbe::read_without_its_slot`).
 pub(crate) fn prove_kernel_half(com1: &mut Console) -> bool {
-    let (Some(space), Some(lacking)) = (UserSpace::new(), UserSpace::without_probe_slot()) else {
+    let no_memory = |com1: &mut Console| {
         let _ = writeln!(
             com1,
             "origin-kernel: address spaces: no memory for the kernel-half proof: address spaces failed"
         );
-        return false;
+        false
+    };
+    let Some(space) = UserSpace::new() else {
+        return no_memory(com1);
     };
     let Some(probe) = KernelProbe::new() else {
         let _ = writeln!(
@@ -665,7 +669,9 @@ pub(crate) fn prove_kernel_half(com1: &mut Console) -> bool {
     // The control can only work if no translation of the probe outlives a CR3 load (finding 4).
     let local = vm::translate(addr).is_some_and(|t| !t.global);
     let from_space = read_from(&space, addr);
-    let from_lacking = read_from(&lacking, addr);
+    let Some(from_lacking) = probe.read_without_its_slot() else {
+        return no_memory(com1);
+    };
     let visible = from_space == Probe::Completed;
     let control = matches!(from_lacking, Probe::Faulted { error: 0, address } if address == addr);
     let right = fixed && local && visible && control;

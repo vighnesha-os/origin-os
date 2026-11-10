@@ -597,10 +597,11 @@ impl UserSpace {
 
     /// As [`new`](Self::new), with the top-level entry of the kernel probe page's slot empty:
     /// what every space used to look like when a kernel mapping was made in a slot of its own
-    /// after the space was created. For the in-boot control of that proof. Loading this space
-    /// is harmless: nothing but a `KernelProbe` is ever mapped in that slot, so all the code,
-    /// stacks and data the kernel touches stay mapped.
-    pub fn without_probe_slot() -> Option<Self> {
+    /// after the space was created. Only for `KernelProbe::read_without_its_slot`, the in-boot
+    /// control of that proof, which drops it before it returns: a space that breaks H2 is never
+    /// handed out (review housekeeping). Visiting it is harmless: nothing but a `KernelProbe` is
+    /// ever mapped in that slot, so all the code, stacks and data the kernel touches stay mapped.
+    pub(crate) fn without_probe_slot() -> Option<Self> {
         let mut half = *crate::vm::kernel_half()?;
         *half.get_mut(crate::vm::PROBE_SLOT)? = 0;
         Self::from_state(State::new(&half)?)

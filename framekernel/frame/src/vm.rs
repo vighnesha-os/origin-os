@@ -304,6 +304,20 @@ impl KernelProbe {
     pub const fn addr(&self) -> u64 {
         PROBE_PAGE
     }
+
+    /// Reads the probe page through a space like every space before ADR-0004 H2: built as
+    /// [`UserSpace::new`] builds one, but with the probe page's top-level slot empty, as when a
+    /// kernel mapping was made in a slot of its own after the space was created. The in-boot
+    /// control of the kernel-half proof, which expects a fault. The space is made and dropped
+    /// inside this call, so no space that lacks part of the kernel half ever reaches a caller
+    /// (review housekeeping). `None` without memory for it.
+    ///
+    /// [`UserSpace::new`]: crate::userspace::UserSpace::new
+    #[must_use]
+    pub fn read_without_its_slot(&self) -> Option<crate::cpu::Probe> {
+        let lacking = crate::userspace::UserSpace::without_probe_slot()?;
+        Some(lacking.probe_read(self.addr()))
+    }
 }
 
 impl Drop for KernelProbe {
