@@ -590,7 +590,7 @@ An implementation of this specification MUST: pass the malformed-definition suit
 - Events: a server-initiated message.
 - Floating-point types, unions, nested variable-length data.
 - C entry points for the `channel` transport (§11).
-- The fields of ADR-0005 B1's stamped identity, how a message delivers it and where a stub puts it. The generated server takes an opaque `Caller` until that slice exists.
+- Where a `channel` stub puts ADR-0005 B1's stamped identity. Its fields (C1) and how a read delivers them, through `origin.kernel`'s `read_sizes` (C2), are decided and built (task S3-2, 2026-11-10); the generated server takes an opaque `Caller` until the first ring-3 service (ADR-0011 N14 step 4).
 - Per-number pinning, which needs the number-to-address table the linker produces, and generation of the kernel's `syscall` table from this definition: the kernel's switch to generated code, which ADR-0011 N14 orders after this.
 - The Driver SDK (ADR-0001 D2): its own ADR.
 
