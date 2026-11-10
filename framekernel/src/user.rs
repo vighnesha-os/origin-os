@@ -11,7 +11,6 @@
 //! - **`int 0x80`:** reports 77, then tries the old gate, which is gone: a #GP.
 #![forbid(unsafe_code)]
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::ptr;
@@ -24,6 +23,7 @@ use crate::cpu::CpuIndex;
 use crate::process::{Ending, Limits, Process};
 use crate::sched;
 use crate::vm;
+use origin_frame::objref::ObjectRef;
 
 /// User virtual address of each program's code page.
 const CODE: u64 = 0x40_0000;
@@ -83,8 +83,8 @@ fn build(program: &[u8]) -> Option<Process> {
 }
 
 /// Starts `program` on `cpu` and returns its process.
-fn start(program: &[u8], cpu: CpuIndex) -> Option<Arc<Process>> {
-    let process = Arc::new(build(program)?);
+fn start(program: &[u8], cpu: CpuIndex) -> Option<ObjectRef<Process>> {
+    let process = ObjectRef::try_new(build(program)?).ok()?;
     Process::start_thread(&process, cpu, CODE, STACK + PAGE, 0).ok()?;
     Some(process)
 }
@@ -321,7 +321,10 @@ fn processes(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         if p.map_page(DATA, Access::ReadWrite).is_err() {
             return false;
         }
-        procs[k] = Some(Arc::new(p));
+        let Ok(shared) = ObjectRef::try_new(p) else {
+            return false;
+        };
+        procs[k] = Some(shared);
     }
     let [Some(a), Some(b)] = procs else {
         return false;

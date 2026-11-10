@@ -49,6 +49,21 @@ impl<T> ObjectRef<T> {
     pub fn same(a: &Self, b: &Self) -> bool {
         a.inner == b.inner
     }
+
+    /// The object itself, if this is the only reference to it: a creator setting up what no
+    /// one else can see yet.
+    pub fn get_mut(this: &mut Self) -> Option<&mut T> {
+        // SAFETY: as in `deref`; the count is read through a shared reference, so nothing here
+        // aliases a `&mut` someone else may hold while the check is still undecided.
+        let unique = unsafe { this.inner.as_ref() }.count.load(Ordering::Acquire) == 1;
+        if !unique {
+            return None;
+        }
+        // SAFETY: the count is 1, and this reference is it. Another can only be made through a
+        // `&self` of this one, which the `&mut` borrow excludes for as long as the result lives,
+        // and the Acquire load above orders every earlier holder's accesses before this one.
+        Some(unsafe { &mut this.inner.as_mut().value })
+    }
 }
 
 impl<T> Deref for ObjectRef<T> {
@@ -84,5 +99,22 @@ impl<T> Drop for ObjectRef<T> {
         // SAFETY: allocated by `try_new` with this layout, destroyed just above, never freed
         // before: only the holder that takes the count to zero gets here.
         unsafe { dealloc(self.inner.as_ptr().cast(), Layout::new::<Counted<T>>()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_sole_reference_gets_the_object_itself() {
+        let mut only = ObjectRef::try_new(1u32).unwrap();
+        *ObjectRef::get_mut(&mut only).unwrap() = 2;
+        assert_eq!(*only, 2);
+        let mut second = only.clone();
+        assert!(ObjectRef::get_mut(&mut only).is_none(), "two references");
+        assert!(ObjectRef::get_mut(&mut second).is_none(), "two references");
+        drop(second);
+        assert!(ObjectRef::get_mut(&mut only).is_some(), "one again");
     }
 }

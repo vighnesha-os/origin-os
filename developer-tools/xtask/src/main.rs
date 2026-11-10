@@ -1328,6 +1328,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         ])
         // M4's first slice (ADR-0005 P1–P5, P8, P9): system calls between ring-3 processes.
         .chain(ipc_markers(machine.named(0), target.clone()))
+        .chain(object_markers(&target))
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
@@ -1788,6 +1789,29 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
         "origin-kernel: ipc: a fault inside a user copy comes back as a failed copy, not a dead kernel: 1 fault recovered".into(),
         "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap ".into(),
         "; threads run before their state existed: 0".into(),
+        "origin-kernel: ipc: a status its call does not declare reached the system-call boundary 0 times".into(),
+    ]);
+    markers
+}
+
+/// The proofs of process and thread objects (ADR-0005 P3, P9, P11; `ipc_proof::prove_objects`).
+fn object_markers(far: &str) -> Vec<String> {
+    let mut markers = vec![
+        "origin-kernel: ipc: a process's memory goes when its last thread is reaped, with the process object still held: 0 spaces freed while a thread ran, 1 when TERMINATED was raised".to_string(),
+        "origin-kernel: ipc: object types: a process is no channel -> WRONG_TYPE, a thread is no channel -> WRONG_TYPE, the type comes before the rights -> WRONG_TYPE, a live process -> TIMED_OUT, raises nothing -> 0x0, a live thread -> TIMED_OUT, raises nothing either -> 0x0, waiting needs WAIT -> ACCESS_DENIED, a duplicate waits -> TIMED_OUT, and cannot duplicate -> ACCESS_DENIED, a process handle travels -> OK, the sender's is gone -> BAD_HANDLE, the received one waits -> TIMED_OUT, a thread handle closes -> OK".into(),
+    ];
+    for how in ["exits", "faults"] {
+        markers.extend([
+            "origin-kernel: ipc: the waiter on a process that: woken -> OK, observed -> 0x10, and it stays raised -> OK".to_string(),
+            format!("origin-kernel: ipc: when a process {how}: TERMINATED reached the thread waiting on it on {far}, blocked "),
+        ]);
+    }
+    markers.extend([
+        "origin-kernel: ipc: a thread waiting for another thread: a thread still running -> TIMED_OUT, joined -> OK, observed -> 0x10, and it stays raised -> OK".to_string(),
+        "origin-kernel: ipc: a thread in wait_one on a process handle another thread closes completes with CANCELED".into(),
+        "origin-kernel: ipc: a thread in wait_one on a process handle another thread sends away completes with CANCELED".into(),
+        "origin-kernel: ipc: process IDs: 16 processes created and dropped in turn, each ID above the last and none of them 0: true".into(),
+        "origin-kernel: ipc: every process and thread object and all they held are gone: heap ".into(),
     ]);
     markers
 }

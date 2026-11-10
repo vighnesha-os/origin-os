@@ -27,7 +27,7 @@ Each method now has a closed set of errors (spec §8). The kernel's code was rea
 
 | Method | Declared in OIDL | The kernel today | Difference |
 |---|---|---|---|
-| `channel_write` | … and `wrong_type` | Only channels exist, so `wrong_type` is unreachable (`let Object::Channel(end) = object` is irrefutable) | Declared for the future, not returned today |
+| `channel_write` | … and `wrong_type` | At this comparison only channels existed, so `wrong_type` was unreachable. Since S3-1 a process or thread handle gets it | Reachable since S3-1 |
 | `channel_read` | … and `wrong_type` | The same | The same |
 | every other call | exactly the statuses its code can return | — | none |
 
@@ -66,12 +66,12 @@ The hand-written kernel also answers `ACCESS_DENIED` before `dispatch` when a ca
 | The `start` module of `origin-abi` (the start record: `HEADER`, `ENTRY`, `MAX_HANDLES`, `role`, `encode`, `decode`) | It is not a system call. Its variable-length tail after a header is not a form the language has: variable-length data exists only as a method's parameters (§3.1). Its header and entries would fit as plain structs |
 | `run()` in `syscall.rs` (interrupts on, `reap_closed`, `sched::reap`, `may_call_from`) | The kernel's entry path, outside any interface |
 | The user-memory checks (`checked`, `copy_in`, `copy_out`) | They need the calling process's page tables. The decoder produces typed descriptors, and the kernel does the copy, as today |
-| The rights a call needs | Declared in OIDL and carried to the kernel in `HandleArg::need_rights()` and `HandleSlice::need_rights`, but the check stays in the kernel's handle table |
+| The rights a call needs | Declared in OIDL and carried to the kernel in `HandleArg` and `HandleSlice`; the check is the kernel's handle table's, which since S3-1 takes both the rights and the object type from the decoder (`framekernel::syscall::need`) |
 
 ## What switching took (S3-0, 2026-11-09)
 
 1. `framekernel::syscall` implements the generated `Calls` for `Process` and converts at that boundary, so `ipc.rs`, `handles.rs` and `channel.rs` did not change and keep `origin_abi`'s types.
 2. `origin_abi` keeps every public item (the call numbers leave it with step 4 of ADR-0011 N14); a host test in `framekernel/syscalls` holds them equal to the generated values.
-3. The rights each handle needs are still enforced by the handle table with `origin_abi`'s constants, as §6 of the specification says for this transport. The decoder's `need_rights` and `need_object` are not read by the kernel yet: that host test holds them equal to what the table enforces, and threading them into the lookup belongs with the typed objects of S3-1.
+3. In S3-0 the rights were still enforced with `origin_abi`'s constants. Since S3-1 the handle table takes the rights and the object type from the decoder (`need_rights`, `need_object`), so the definition is the one source of what a call asks of a handle.
 4. Item 5 is adopted: the definition's stricter order.
 5. `cargo xtask check` fails if the generated code is out of date or the ABI is not the recorded one (`developer-tools/xtask/src/interfaces.rs`; ADR-0011 N13).

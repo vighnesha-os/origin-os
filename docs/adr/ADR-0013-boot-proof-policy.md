@@ -60,9 +60,9 @@ It does not reset. Nothing yet records a boot attempt (§20), so a reset would o
 
 Before the halt line the kernel prints what its proofs found, on every console, because a real machine's operator has no `xtask` and the individual lines scroll away:
 
-- `origin-kernel: boot verdict: 50 of 50 proofs passed`
-- `origin-kernel: boot verdict: degraded: 47 of 50 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042`
-- `origin-kernel: boot verdict: degraded: 33 of 33 proofs passed; 17 did not run`
+- `origin-kernel: boot verdict: 51 of 51 proofs passed`
+- `origin-kernel: boot verdict: degraded: 48 of 51 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042`
+- `origin-kernel: boot verdict: degraded: 33 of 33 proofs passed; 18 did not run`
 
 It claims only what was recorded. "Passed" means the proof found nothing wrong: a proof that finds the hardware it needs absent says so on its own line and counts as passed, the proofs' existing convention (no HPET, no NVMe controller, no 8042). "Did not run" counts proofs a failure prevented, and is what "degraded" means there. The virtio-net proof is the one proof it does not cover (see Migration).
 
@@ -104,7 +104,8 @@ It claims only what was recorded. "Passed" means the proof found nothing wrong: 
 | Ring-3 isolation (`user::prove`) | A user program read kernel memory or ran a privileged instruction, or two processes shared an address space | No | Ring 3 |
 | TLB shootdown (`tlb::prove`) | A processor kept a stale translation after an unmap | No | Every unmap |
 | Wait queues (`wait::prove`, split) | Items lost or reordered, or a thread never woke | No | IPC, drivers |
-| IPC and handles (`ipc_proof::prove`) | A handle or quota check let a hostile call through. This one result also covers a leak check | No | Ring 3 |
+| IPC and handles (`ipc_proof::prove`) | A handle or quota check let a hostile call through, or a call produced a status its definition does not declare. This one result also covers a leak check | No | Ring 3 |
+| Process and thread objects (`ipc_proof::prove_objects`) | A handle of the wrong type or with too few rights was accepted, a process's memory outlived its last thread, `TERMINATED` came before the memory went or did not come, a process ID was reused, or a wait on a process handle was not cancelled. This one result also covers a leak check | No: a failure is a wrong status or a count, and every wait in it has a deadline far above any load seen | Ring 3 |
 
 Apart from the SMEP proof's stale translation above (Intel, fixed on the CI branch), none of the Refuse proofs has failed on a real processor in the runs read: 59 complete boots on AMD EPYC processors through KVM (research ledger §3). AMD only, and virtual machines, so this is the strongest evidence the project has rather than proof.
 

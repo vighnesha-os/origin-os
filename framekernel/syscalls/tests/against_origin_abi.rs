@@ -1,12 +1,11 @@
-//! The generated values against `origin-abi`'s, and the generated decoders' demands against the
-//! kernel's handle table (ADR-0011 N14).
+//! The generated values against `origin-abi`'s (ADR-0011 N14).
 //!
 //! The kernel takes its call table and statuses from the definition. `origin-abi` keeps its public
 //! items for what still uses them, the layers below the system-call boundary and the ring-3 proof
 //! programs, so the two must stay equal. Moving the call numbers out of the stable crate waits for
 //! step 4.
 
-use std::cell::RefCell;
+use std::cell::Cell;
 
 use origin_syscalls::oidl_rt as rt;
 use origin_syscalls::origin_kernel::kernel::server::{self, Calls, number};
@@ -143,129 +142,75 @@ fn the_limits_layouts_and_version_are_the_same() {
     }
 }
 
-/// An implementation of the interface that records what the decoders asked of each handle, as
-/// `(rights, object type)`, in parameter order.
+/// An implementation of the interface that only records that it ran.
 #[derive(Default)]
 struct Recorder {
-    demands: RefCell<Vec<(u32, u32)>>,
-}
-
-impl Recorder {
-    fn handle(&self, handle: rt::HandleArg) {
-        self.demands
-            .borrow_mut()
-            .push((handle.need_rights(), handle.need_object()));
-    }
+    ran: Cell<bool>,
 }
 
 impl Calls for Recorder {
     fn holds(&self, _: generated::Capability) -> bool {
         true
     }
-    fn thread_exit(&self, _: u64) {}
+    fn thread_exit(&self, _: u64) {
+        self.ran.set(true);
+    }
     fn debug_report(&self, _: u64) -> Result<(), server::DebugReportError> {
+        self.ran.set(true);
         Ok(())
     }
     fn debug_write(&self, _: rt::UserSlice<u8>) -> Result<(), server::DebugWriteError> {
+        self.ran.set(true);
         Ok(())
     }
-    fn handle_close(&self, handle: rt::HandleArg) -> Result<(), server::HandleCloseError> {
-        self.handle(handle);
+    fn handle_close(&self, _: rt::HandleArg) -> Result<(), server::HandleCloseError> {
+        self.ran.set(true);
         Ok(())
     }
     fn handle_duplicate(
         &self,
-        handle: rt::HandleArg,
+        _: rt::HandleArg,
         _: generated::Rights,
         _: rt::UserRef<rt::Handle>,
     ) -> Result<(), server::HandleDuplicateError> {
-        self.handle(handle);
+        self.ran.set(true);
         Ok(())
     }
     fn channel_create(
         &self,
         _: rt::UserRef<[rt::Handle; 2]>,
     ) -> Result<(), server::ChannelCreateError> {
+        self.ran.set(true);
         Ok(())
     }
     fn channel_write(
         &self,
-        end: rt::HandleArg,
+        _: rt::HandleArg,
         _: rt::UserSlice<u8>,
-        handles: rt::HandleSlice,
+        _: rt::HandleSlice,
     ) -> Result<(), server::ChannelWriteError> {
-        self.handle(end);
-        self.demands
-            .borrow_mut()
-            .push((handles.need_rights, handles.need_object));
+        self.ran.set(true);
         Ok(())
     }
     fn channel_read(
         &self,
-        end: rt::HandleArg,
+        _: rt::HandleArg,
         _: rt::UserBuffer<u8>,
         _: rt::UserBuffer<rt::Handle>,
         _: rt::UserRef<generated::ReadSizes>,
     ) -> Result<(), server::ChannelReadError> {
-        self.handle(end);
+        self.ran.set(true);
         Ok(())
     }
     fn wait_one(
         &self,
-        handle: rt::HandleArg,
+        _: rt::HandleArg,
         _: generated::Signals,
         _: u64,
         _: rt::UserRef<generated::Signals>,
     ) -> Result<(), server::WaitOneError> {
-        self.handle(handle);
+        self.ran.set(true);
         Ok(())
-    }
-}
-
-/// What the decoders ask of the handles of one valid call.
-fn demands(call: u64, args: [u64; 6]) -> Vec<(u32, u32)> {
-    let recorder = Recorder::default();
-    assert_eq!(
-        server::dispatch(&recorder, call, args),
-        server::Outcome::Status(generated::OK)
-    );
-    recorder.demands.take()
-}
-
-/// The handle table enforces rights with its own constants, in `framekernel/src/ipc.rs` and
-/// `handles.rs` (`docs/spec/OIDL.md` §6: for this transport the kernel's table enforces them).
-/// Until those layers take the requirement from the decoder, this holds the definition to what
-/// they enforce, and the boot proofs' "too few rights" lines hold them to enforcing it.
-#[test]
-fn each_handle_is_asked_for_exactly_what_the_handle_table_enforces() {
-    use origin_abi::rights::{DUPLICATE, READ, TRANSFER, WAIT, WRITE};
-    let channel = origin_abi::ObjectType::Channel as u32;
-    let table = [
-        // `ipc::handle_close` removes with no right needed.
-        (number::HANDLE_CLOSE, [1, 0, 0, 0, 0, 0], vec![(0, 0)]),
-        // `HandleTable::duplicate` needs DUPLICATE on any object.
-        (
-            number::HANDLE_DUPLICATE,
-            [1, u64::from(READ), 0x1000, 0, 0, 0],
-            vec![(DUPLICATE, 0)],
-        ),
-        // `ipc::channel_write`: WRITE on the end and TRANSFER on each handle it moves.
-        (
-            number::CHANNEL_WRITE,
-            [1, 0x1000, 8, 0x2000, 1, 0],
-            vec![(WRITE, channel), (TRANSFER, 0)],
-        ),
-        // `ipc::channel_read`: READ on the end.
-        (
-            number::CHANNEL_READ,
-            [1, 0x1000, 8, 0x2000, 1, 0x3000],
-            vec![(READ, channel)],
-        ),
-        // `ipc::wait_one`: WAIT, on any waitable object.
-        (number::WAIT_ONE, [1, 1, 0, 0x1000, 0, 0], vec![(WAIT, 0)]),
-    ];
-    for (call, args, expected) in table {
-        assert_eq!(demands(call, args), expected, "call {call}");
     }
 }
 
@@ -287,8 +232,5 @@ fn an_undefined_right_is_refused_before_the_out_pointer_is_looked_at() {
         outcome,
         server::Outcome::Status(generated::Error::InvalidArgs.raw())
     );
-    assert!(
-        recorder.demands.borrow().is_empty(),
-        "the implementation ran"
-    );
+    assert!(!recorder.ran.get(), "the implementation ran");
 }
