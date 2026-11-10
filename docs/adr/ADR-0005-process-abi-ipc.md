@@ -117,7 +117,7 @@ The implementation records each decision's consequences in `docs/engineering/SOU
 
 ## Amendment 4 (Accepted, 2026-11-09): what ADR-0011 N14 step 3 needs
 
-**Status: Accepted by the owner on 2026-11-09, all thirteen items with the recommended answer (decision sheet items 56–68; CLAUDE.md §84). C1, C2 and C3 are built (task S3-2, 2026-11-10, with B1 and B3), C4, C5 and C6 (task S3-3, 2026-11-10: the start record and its launch path), and C11 and C12 (task S3-4, 2026-11-10: `not_found` and the service directory, `origin.directory` 0.1); the other five are not.** The scoping is `docs/research/2026-11-09-n14-step3-scope.md`. The ADR's accepted text and Amendments 1–3 are otherwise unchanged; where an item below refines a P decision, the item governs.
+**Status: Accepted by the owner on 2026-11-09, all thirteen items with the recommended answer (decision sheet items 56–68; CLAUDE.md §84). C1, C2 and C3 are built (task S3-2, 2026-11-10, with B1 and B3), C4, C5 and C6 (task S3-3, 2026-11-10: the start record and its launch path), C11 and C12 (task S3-4, 2026-11-10: `not_found` and the service directory, `origin.directory` 0.1), and C7 and C8, with C6's rights for a memory object and its rule for another process's address space (task S3-5b, 2026-11-10: memory objects, `origin.kernel` 0.5, as Amendment 5 decides); the other three are not.** The scoping is `docs/research/2026-11-09-n14-step3-scope.md`. The ADR's accepted text and Amendments 1–3 are otherwise unchanged; where an item below refines a P decision, the item governs.
 
 | # | Decision | Refines |
 |---|---|---|
@@ -137,7 +137,7 @@ The implementation records each decision's consequences in `docs/engineering/SOU
 
 ## Amendment 5 (Accepted, 2026-11-10): what S3-5b's memory objects need and C6–C8 do not fix
 
-**Status: Accepted by the owner on 2026-11-10, all five items with the recommended answer (decision sheet items 101–105; CLAUDE.md §84). None is built yet: task S3-5b builds them.** The options, and what was rejected for each, are in task S3-5b's research ledger, `docs/research/2026-11-10-memory-objects.md`. C6–C8 stand; where an item below refines one, the item governs.
+**Status: Accepted by the owner on 2026-11-10, all five items with the recommended answer (decision sheet items 101–105; CLAUDE.md §84). All five are built (task S3-5b, 2026-11-10: `origin.kernel` 0.5 and `user-abi` 0.5, the memory calls and their boot proof).** The options, and what was rejected for each, are in task S3-5b's research ledger, `docs/research/2026-11-10-memory-objects.md`. C6–C8 stand; where an item below refines one, the item governs.
 
 | # | Decision | Refines |
 |---|---|---|

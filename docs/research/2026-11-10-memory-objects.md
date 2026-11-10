@@ -29,7 +29,7 @@ Backing notes for task S3-5b (CLAUDE.md §16): `memory_object_create`, `memory_m
 
 ## What this means for Origin
 
-1. **The interface** (`origin.kernel` 0.5, `user-abi` 0.5): four calls, numbers 11 to 14; `map_access` bits (`read`, `write`, `execute`); `map_flags` bits (`fixed`); a sized `map_request` (`access`, `flags`, `offset`, `length`, `address`), as C8 says; C6's rights for a memory object as a constant. Every shape C6–C8 do not fix is the owner's (CLAUDE.md §84): see "Shapes for the owner" below.
+1. **The interface** (`origin.kernel` 0.5, `user-abi` 0.5): four calls, numbers 11 to 14; `map_access` bits (`read`, `write`, `execute`); `map_flags` bits (`fixed`); a sized `map_request` (`access`, `flags`, `offset`, `length`, `address`), as C8 says; C6's rights for a memory object as a constant. Every shape C6–C8 do not fix went to the owner (CLAUDE.md §84), who accepted the five items below on 2026-11-10: ADR-0005 Amendment 5, D1–D5.
 2. **Rights.** A new object's handle has C6's rights: read, write, map, duplicate and transfer. Every map, unmap and protect names a process and needs `write` on that handle, the caller's own included (C6). A map needs `map` on the object, `read` for any mapping and `write` for a writable one. `execute` is refused with `access_denied`, since an anonymous object never has it; write and execute together, or a mapping without read, with `invalid_args`.
 3. **Placement.** Without `fixed`, at a random page of the user half's upper part from RDSEED or RDRAND, as `launch::place` does, clear of every mapping; without entropy the map fails with `not_supported`. With `fixed`, at a page-aligned address in the user half, refused with `invalid_args` if any page of the range is mapped: it never replaces.
 4. **Whole mappings.** Unmap and protect take an address and a length and act only on exactly one whole mapping; anything else is `invalid_args`. A later minor can allow parts without a new method. Protect only reduces: an increase is `access_denied`.
@@ -39,9 +39,9 @@ Backing notes for task S3-5b (CLAUDE.md §16): `memory_object_create`, `memory_m
 8. **Sharing** only by passing the handle, whose rights only shrink (P2). A mapping keeps its object, as Zircon's does, so closing a handle never unmaps.
 9. **Concurrency.** The new state is a process's list of mappings and its budget, under one spin lock, and the account's committed bytes, with the account's existing `try_update`. No new lock-free code, so no new Loom model; an object's life is `ObjectRef`'s, already modelled.
 
-## Shapes for the owner (asked 2026-11-10)
+## Shapes for the owner (asked and accepted 2026-11-10)
 
-C6–C8 leave these shapes open. They went to the owner as one list, each with its recommendation and the alternatives rejected; the answers are recorded in ADR-0005 and the decision sheet. No system-call code or lock change is committed before them.
+C6–C8 leave these shapes open. They went to the owner as one list, each with its recommendation and the alternatives rejected, and the owner accepted all five as recommended ("Accept all", 2026-11-10): ADR-0005 Amendment 5, D1–D5, decision sheet items 101–105. No system-call code or lock change was committed before the answers.
 
 1. **Creation calls take their arguments in a sized request,** so a later minor can add an option by P4's own mechanism: `memory_object_create(request: object_request)`, `object_request { length }`. OIDL refuses an empty `bits` and an empty struct, so S3-6's `event_create` and `port_create`, which take nothing yet, keep no parameters until they have one; the rule binds from major 1. Rejected: an options `u32` that must be 0; a `bits` with a member v1 refuses; the length alone.
 2. **`map_request`** is `{access, flags, offset, length, address}`, 40 bytes; bytes in whole pages, never rounded; `map_access` (`read`, `write`, `execute`; read required, never write with execute, execute refused) and `map_flags` (`fixed`). Rejected: access as `rights`; read implied; placement as an enum; page counts; rounding up.
