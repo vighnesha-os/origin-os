@@ -23,7 +23,7 @@ use crate::descriptors::{
 use crate::trap::Switch;
 
 /// Size of each interrupt stack (#DF, NMI, #MC, #DB).
-const IST_STACK_SIZE: usize = 16 * 1024;
+pub const IST_STACK_SIZE: usize = 16 * 1024;
 /// IST slot used for #DB: a debug exception can be taken with no usable kernel stack (a pending
 /// one is delivered on the first instruction of `syscall_entry`, still on the user's).
 const DEBUG_IST: u8 = 4;
@@ -40,9 +40,9 @@ struct TssImage([u32; 26]);
 #[repr(C, align(4096))]
 struct Idt([[u64; 2]; 256]);
 
-/// One interrupt stack and the page below it. That page is unmapped once the kernel's own
-/// page tables are live (`smp::start`), so running off the end of the stack faults instead of
-/// overwriting what lies below: another stack, the TSS or the GDT.
+/// One of the boot processor's interrupt stacks and the page below it. That page is unmapped
+/// once the kernel's own page tables are live (`smp::start`), so running off the end of the
+/// stack faults instead of overwriting what lies below: another stack, or the kernel's data.
 #[repr(C, align(4096))]
 struct IstStack {
     guard: [u8; 4096],
@@ -54,6 +54,17 @@ const ZERO_IST_STACK: IstStack = IstStack {
     stack: [0; IST_STACK_SIZE],
 };
 
+/// The boot processor's interrupt stacks, in the kernel's image: they must exist from the first
+/// boot step, before the kernel's tables or the stack region do. An application processor's are
+/// in the stack region (`smp`, ADR-0004 Amendment 1, A2).
+#[repr(C, align(4096))]
+struct BspStacks {
+    double_fault: IstStack,
+    nmi: IstStack,
+    machine_check: IstStack,
+    debug: IstStack,
+}
+
 /// The operand of `lgdt` and `lidt`: a 16-bit limit followed by a 64-bit base.
 #[repr(C, packed)]
 struct TablePointer {
@@ -61,16 +72,13 @@ struct TablePointer {
     base: u64,
 }
 
-/// One processor's GDT, TSS and interrupt stacks. The IDT is shared. The GDT and TSS have the
-/// first page to themselves, and every interrupt stack starts on a page boundary.
+/// One processor's GDT and TSS, on a page of their own. The IDT is shared, and the interrupt
+/// stacks are elsewhere: the boot processor's in [`BspStacks`], an application processor's in
+/// the stack region.
 #[repr(C, align(4096))]
 pub struct CpuTables {
     gdt: Gdt,
     tss: TssImage,
-    double_fault: IstStack,
-    nmi: IstStack,
-    machine_check: IstStack,
-    debug: IstStack,
 }
 
 impl core::fmt::Debug for CpuTables {
@@ -83,6 +91,9 @@ impl core::fmt::Debug for CpuTables {
 static mut BSP_TABLES: CpuTables = CpuTables {
     gdt: Gdt([0; GDT_ENTRIES]),
     tss: TssImage([0; 26]),
+};
+/// The boot processor's interrupt stacks.
+static mut BSP_STACKS: BspStacks = BspStacks {
     double_fault: ZERO_IST_STACK,
     nmi: ZERO_IST_STACK,
     machine_check: ZERO_IST_STACK,
@@ -90,36 +101,45 @@ static mut BSP_TABLES: CpuTables = CpuTables {
 };
 static mut IDT: Idt = Idt([[0; 2]; 256]);
 
-/// Unmaps the guard page below each of the four interrupt stacks in `tables` and returns
+/// The address of the field at `offset` in [`BSP_STACKS`]: no reference is made.
+fn bsp_stacks_at(offset: usize) -> u64 {
+    (&raw const BSP_STACKS).addr() as u64 + offset as u64
+}
+
+/// The tops of the boot processor's interrupt stacks: #DF, NMI, #MC, #DB.
+fn bsp_interrupt_stack_tops() -> [u64; 4] {
+    use core::mem::offset_of;
+    let top = |offset: usize| bsp_stacks_at(offset) + IST_STACK_SIZE as u64;
+    [
+        top(offset_of!(BspStacks, double_fault.stack)),
+        top(offset_of!(BspStacks, nmi.stack)),
+        top(offset_of!(BspStacks, machine_check.stack)),
+        top(offset_of!(BspStacks, debug.stack)),
+    ]
+}
+
+/// Unmaps the guard page below each of the boot processor's four interrupt stacks and returns
 /// their addresses (`smp::guard_interrupt_stacks` probes each one).
 ///
 /// # Safety
 ///
-/// `tables` must point at a live `CpuTables` whose interrupt stacks and guard pages nothing is
-/// using: an AP's tables before it starts, or the boot processor's (its stacks are above the
-/// guards and have not been used down that far).
-pub(crate) unsafe fn protect_interrupt_stacks(
-    tables: *const CpuTables,
-) -> Result<[u64; 4], &'static str> {
-    let guards = interrupt_stack_guards(tables);
+/// Nothing may use the guard pages: the boot processor's interrupt stacks lie above them and
+/// have not been used down that far, and nothing else ever touches a guard page.
+pub(crate) unsafe fn protect_interrupt_stacks() -> Result<[u64; 4], &'static str> {
+    let guards = interrupt_stack_guards();
     crate::vm::make_guards(&guards).map_err(|_| "cannot unmap the guard pages")?;
     Ok(guards)
 }
 
-/// The guard pages of the four interrupt stacks in `tables`.
-pub(crate) fn interrupt_stack_guards(tables: *const CpuTables) -> [u64; 4] {
-    let base = tables.addr() as u64;
+/// The guard pages of the boot processor's four interrupt stacks.
+pub(crate) fn interrupt_stack_guards() -> [u64; 4] {
+    use core::mem::offset_of;
     [
-        base + core::mem::offset_of!(CpuTables, double_fault.guard) as u64,
-        base + core::mem::offset_of!(CpuTables, nmi.guard) as u64,
-        base + core::mem::offset_of!(CpuTables, machine_check.guard) as u64,
-        base + core::mem::offset_of!(CpuTables, debug.guard) as u64,
+        bsp_stacks_at(offset_of!(BspStacks, double_fault.guard)),
+        bsp_stacks_at(offset_of!(BspStacks, nmi.guard)),
+        bsp_stacks_at(offset_of!(BspStacks, machine_check.guard)),
+        bsp_stacks_at(offset_of!(BspStacks, debug.guard)),
     ]
-}
-
-/// The boot processor's tables, for [`interrupt_stack_guards`].
-pub(crate) fn bsp_tables() -> *const CpuTables {
-    &raw const BSP_TABLES
 }
 
 /// Registers saved by [`exception_common`], then the vector and error code the stubs push,
@@ -194,8 +214,15 @@ pub unsafe fn init() {
     unsafe { (&raw mut IDT).write(idt) };
     // The boot processor is CPU index 0, whatever its APIC ID.
     assign(CpuIndex::BOOT, cpuid_apic_id());
-    // SAFETY: `BSP_TABLES` is used only by the boot processor, and only from here on.
-    unsafe { load_tables(&raw mut BSP_TABLES, CpuIndex::BOOT) };
+    // SAFETY: `BSP_TABLES` is used only by the boot processor, and only from here on; so are
+    // `BSP_STACKS`, whose tops these are.
+    unsafe {
+        load_tables(
+            &raw mut BSP_TABLES,
+            CpuIndex::BOOT,
+            bsp_interrupt_stack_tops(),
+        )
+    };
     TABLES_READY.store(true, Ordering::Release);
 }
 
@@ -209,45 +236,36 @@ pub fn tables_ready() -> bool {
 }
 
 /// Loads an application processor's own GDT and TSS from `tables`, and the shared IDT, and
-/// makes it CPU `index` (if its APIC ID is the one [`assign`]ed to `index`).
+/// makes it CPU `index` (if its APIC ID is the one [`assign`]ed to `index`). `interrupt_stacks`
+/// are the tops of its four interrupt stacks: #DF, NMI, #MC and #DB.
 ///
 /// # Safety
 ///
 /// Call once per application processor, at CPL 0 with interrupts disabled, after [`init`]
 /// ran on the boot processor. `tables` must be writable, live for ever, and used by no
-/// other processor; no other processor may be CPU `index`.
-pub unsafe fn init_ap(tables: *mut CpuTables, index: CpuIndex) {
+/// other processor; no other processor may be CPU `index`. Each of `interrupt_stacks` must be
+/// the top of a stack of [`IST_STACK_SIZE`] bytes mapped read/write for ever, used by no other
+/// processor and by nothing else on this one.
+pub unsafe fn init_ap(tables: *mut CpuTables, index: CpuIndex, interrupt_stacks: [u64; 4]) {
     // SAFETY: the caller's contract is `load_tables`'s.
-    unsafe { load_tables(tables, index) };
+    unsafe { load_tables(tables, index, interrupt_stacks) };
 }
 
-/// Writes the GDT and TSS in `tables` and loads them, the segment registers and the IDT.
+/// Writes the GDT and TSS in `tables`, with `interrupt_stacks` in the TSS (#DF, NMI and #MC in
+/// IST1–3, #DB in IST4), and loads them, the segment registers and the IDT.
 ///
 /// # Safety
 ///
-/// As for [`init_ap`]; for the boot processor, `tables` is `BSP_TABLES` and `index` is
-/// [`CpuIndex::BOOT`].
-unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex) {
+/// As for [`init_ap`]; for the boot processor, `tables` is `BSP_TABLES`, `index` is
+/// [`CpuIndex::BOOT`] and `interrupt_stacks` are the tops of `BSP_STACKS`'s.
+unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex, interrupt_stacks: [u64; 4]) {
     // SAFETY: the caller's contract: `tables` is valid, writable and this processor's own.
     // Projecting to a field creates no reference.
-    let stack = unsafe { &raw mut (*tables).double_fault.stack };
-    // SAFETY: as above.
-    let nmi = unsafe { &raw mut (*tables).nmi.stack };
-    // SAFETY: as above.
-    let mc = unsafe { &raw mut (*tables).machine_check.stack };
-    // SAFETY: as above.
-    let debug = unsafe { &raw mut (*tables).debug.stack };
-    // SAFETY: as above.
     let tss_field = unsafe { &raw mut (*tables).tss };
     // SAFETY: as above.
     let gdt_ptr_raw = unsafe { &raw mut (*tables).gdt };
-    let top = |p: usize| (p + IST_STACK_SIZE) as u64;
-    let mut tss_image = TssImage(d::tss_image([
-        top(stack.addr()),
-        top(nmi.addr()),
-        top(mc.addr()),
-    ]));
-    let debug_top = top(debug.addr());
+    let [double_fault, nmi, machine_check, debug_top] = interrupt_stacks;
+    let mut tss_image = TssImage(d::tss_image([double_fault, nmi, machine_check]));
     if let Some([low, high]) = tss_image
         .0
         .get_mut(TSS_IST4_WORD..TSS_IST4_WORD + 2)
@@ -796,8 +814,7 @@ pub fn nmis() -> (u64, u64) {
 
 /// The boot processor's NMI stack, as `[low, high)`.
 pub fn bsp_nmi_stack() -> (u64, u64) {
-    // SAFETY: only the address of the static's field is taken; no reference is made.
-    let low = unsafe { &raw const BSP_TABLES.nmi.stack }.addr() as u64;
+    let low = bsp_stacks_at(core::mem::offset_of!(BspStacks, nmi.stack));
     (low, low + IST_STACK_SIZE as u64)
 }
 
@@ -811,8 +828,7 @@ pub fn last_debug_frame() -> u64 {
 
 /// The boot processor's #DB stack, as `[low, high)`.
 pub fn bsp_debug_stack() -> (u64, u64) {
-    // SAFETY: only the address of the static's field is taken; no reference is made.
-    let low = unsafe { &raw const BSP_TABLES.debug.stack }.addr() as u64;
+    let low = bsp_stacks_at(core::mem::offset_of!(BspStacks, debug.stack));
     (low, low + IST_STACK_SIZE as u64)
 }
 
