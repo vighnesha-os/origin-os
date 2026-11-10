@@ -153,3 +153,10 @@ The implementation records each decision's consequences in `docs/engineering/SOU
 - A map that fails because the machine has no free frame, or because the kernel heap cannot grow, returns **`no_memory`**.
 
 `memory_map` already declares both statuses, so `user-abi` stays 0.5. **Not built yet:** the framework reports the three causes as one error, and the kernel returns `limit` for each.
+
+**Note on D5 (Accepted by the owner on 2026-11-10, "Accept all"; decision sheet items 155 and 156).** The review of S3-5b found two cases D5 does not name (`docs/engineering/REVIEW_S3-5B_2026-11-10.md`, the low observations). The owner decided what each returns:
+
+- `memory_unmap` or `memory_protect` on a mapping that another thread is changing at that moment returns **`should_wait`**. Nothing has changed, and a retry either succeeds or finds the mapping gone. It is the status both calls already return when the caller's budget cannot pay, so a caller handles the two alike. Until this is built the kernel returns `invalid_args`, which wrongly says there is no such mapping.
+- `memory_map` with a random placement returns **`limit`** when eight draws in a row land on something mapped. It is a bound of the process's own address space; `no_memory` stays for frames and the kernel heap (the note on D4). This is what the kernel does today.
+
+Each call already declares its status, so `user-abi` stays 0.5. **Not built yet:** the first.

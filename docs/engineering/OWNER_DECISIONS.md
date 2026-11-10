@@ -248,3 +248,23 @@ Task H2-stacks built ADR-0004 Amendment 1's A2 on its own branch and left two th
 |---|---|---|
 | 143, answered | Update ADR-0004 to say what H2-stacks built, when it lands: A2 is built; the region is 2048 slots of 128 KiB (256 MiB), each stack at the top of its slot with at least 64 KiB below it never mapped; the boot processor's interrupt stacks stay in the kernel image and the boot stack is the loader's? | **Accept** |
 | 144, answered | Give the kernel stack region a random base: drawn by the kernel when it builds its tables, 2 MiB-aligned within PML4 slots 384–447 (about 24 bits), from RDSEED, else RDRAND, and with neither the fixed base, reported; never printed after boot; built as a framework task of its own after H2-stacks lands? | **Accept** |
+
+## S3-5b: two statuses D5 does not name (Accepted 2026-11-10)
+
+The review of S3-5b's low observations left two cases whose status D5 (item 105) does not name (`REVIEW_S3-5B_2026-11-10.md`). What a status means is the owner's (CLAUDE.md §84). The coordinating session put both to the owner with a recommendation each, and the owner answered **"Accept all"** on 2026-11-10. They are a note on D5 in ADR-0005 Amendment 5. Item 155 is not built yet; item 156 is what the kernel does. Items 145–154 are in use on unmerged branches (ADR-0016, ADR-0017, the design review).
+
+| # | Question | Answer |
+|---|---|---|
+| 155, answered | `memory_unmap` or `memory_protect` on a mapping another thread is changing: return `should_wait`, since nothing changed and a retry gives the true answer, instead of today's `invalid_args`? | **Accept** |
+| 156, answered | A random placement whose eight draws all collide: keep `limit` and write it into D5, with `no_memory` staying for frames and the kernel heap? | **Accept** |
+
+## The stack region's slide: what A6 leaves open (Accepted 2026-11-10)
+
+The framework session building ADR-0004 Amendment 2 (item 144) found four cases its no-printing rule, A6, does not settle, and two more boot lines that fall under them (`sched.rs`'s stack-guard line, under 159; `kernel.rs`'s NMI stack line, under 158). The coordinating session put them to the owner with a recommendation each, and the owner answered **"Accept all"** on 2026-11-10. They are notes A6.1–A6.4 in ADR-0004 Amendment 2. Not built yet.
+
+| # | Question | Answer |
+|---|---|---|
+| 157, answered | A6 allows printing in developer mode and the kernel has none: add none now, so A6 means never until one exists for its own reasons? | **Accept** |
+| 158, answered | Crash reports: print offsets in every mode (`stack region +0x…`, `image +0x…`, a backtrace as image offsets, no base), the image part included, which brings it under H3's rule? | **Accept** |
+| 159, answered | The boot log: print neither the stack region's base nor an address in it, during boot either? | **Accept** |
+| 160, answered | Showing that boots differ with nothing printed: required, a host test of the draw, a true-or-false boot line, a forced no-entropy boot and controls; in addition a read through QEMU's monitor across the matrix, dropped and recorded as not done if it is unreliable on CI? | **Accept** |
