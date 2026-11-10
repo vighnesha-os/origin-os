@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–123. Items up to 70: 2026-11-09, after the pre-merge review. |
-| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. |
+| As of | 2026-11-10 for items 71–141. Items up to 70: 2026-11-09, after the pre-merge review. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–123 (item 97 delegated to Claude). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 (item 97 delegated to Claude). |
 | Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -339,3 +339,53 @@ The work these create is in `TASKS.md`, items 17 to 30.
 - Read revision 7.4's wording and say whether the records pull request may merge (item 106). CLAUDE.md is your text, and merging takes your word.
 - Confirm ADR-0009's text, which you delegated and have not reviewed, and ADR-0007's two additions marked "for the owner's review" (item 122).
 - Name the person who signs off the first driver written from reference reading, when one exists (item 121).
+
+## Speculation and processor hardening (ADR-0017), and what the system threat model accepts (items 124–141): Accepted 2026-11-10, nothing built
+
+Item 112 asked for a system threat model and an ADR on speculation and processor hardening, both before ADR-0011 N14 step 4. TASKS item 19a wrote them on 2026-11-10:
+
+- `docs/engineering/THREAT_MODEL_SYSTEM.md`;
+- `docs/adr/ADR-0017-speculation-processor-hardening.md`;
+- the ledger they rest on, `docs/research/2026-11-10-speculation-processor-hardening.md`, from Intel's and AMD's own documents read that day.
+
+No processor in scope was run, and no cost is measured. Each recommendation was checked against CLAUDE.md 7.4 and the accepted ADRs before it was put. You answered **"Accept all"** in that session, to one question that covered both lists below.
+
+Three of the answers reach past ADR-0017. The ADR said so before you answered:
+
+- item 127 has ADR-0003 K8 and ADR-0005 P4 amended when the FRED entry path is built;
+- item 131 adds a Report row to ADR-0013's table when the proof exists;
+- item 129 uses a compiler feature that is not nightly and not supported either, which CLAUDE.md §12 does not foresee.
+
+**ADR-0017's nine questions.**
+
+| # | Question | Answer |
+|---|---|---|
+| 124, answered | Z1 to Z12 as the policy, built as TASKS item 19b with its own contract? | **Accept** |
+| 125, answered | An IBPB at every change of process, until trust classes exist and the cost is measured (Z3)? IBPB only between different principals was offered and not chosen. | **Accept** |
+| 126, answered | SMT on, with branch isolation between sibling threads, and the remaining timing channels accepted by name (Z5; item 137)? SMT off by default on Origin Server was offered and not chosen. | **Accept** |
+| 127, answered | FRED wherever every processor reports it, with the IDT path kept for the rest, AMD's Zen 5 among them (Z6); ADR-0003 K8 and ADR-0005 P4 amended to say so when it is built? | **Accept** |
+| 128, answered | On AMD, FRED waits for AMD's own text or for proofs on a machine that has it (Z6)? | **Accept** |
+| 129, answered | An INT3 after every RET, through a target feature the stable compiler accepts with a warning, with a gate that reads the kernel's image (Z10)? Hardening only the hand-written assembly was offered and not chosen. | **Accept** |
+| 130, answered | Supervisor shadow stacks under FRED first, and on the IDT path only on evidence (Z8)? | **Accept** |
+| 131, answered | A processor that lacks a control boots and the boot says so, as a Report row in ADR-0013's table (Z1); whether the production installer refuses such a machine is decided with item 90 at M9? | **Accept** |
+| 132, answered | Index masking on AMD and on Intel family 6, LFENCE on Intel family 18 and above and on anything unknown (Z9)? LFENCE on every Intel processor was offered and not chosen. | **Accept** |
+
+**The system threat model's nine acceptances.** Each says what the product does not promise.
+
+| # | What is accepted | Answer |
+|---|---|---|
+| 133, answered | AC1: the platform firmware, system management mode and the processor's microcode are trusted; so is the hypervisor under an Origin guest, and a server's baseboard controller | **Accept** |
+| 134, answered | AC2: while a machine is locked or asleep its secrets are in memory, and someone who can read memory with equipment gets them | **Accept for now.** Decided again in the storage-encryption ADR |
+| 135, answered | AC3: tampering with tools: implants, debug ports, bus probes, chips rewritten off the board, and anything measured at the machine | **Accept** |
+| 136, answered | AC4: a program that induces faults in memory hardware | **Accept.** Revisited when the list of declared machines exists |
+| 137, answered | AC5: timing and contention channels between programs, the two threads of one core included | **Accept for programs in general.** First-party code that handles secrets must be constant-time, and that is not waived |
+| 138, answered | AC6: on a processor that lacks the controls ADR-0017 needs, programs are not protected from each other's speculation | **Accept, for bench machines only** |
+| 139, answered | AC7: an administrator of an Origin Server can read whatever the system can read | **Accept,** with attribution and an audit record as the defence |
+| 140, answered | AC8: whoever operates the host of an Origin Server guest, or the building a server stands in, can read and change everything | **Accept** |
+| 141, answered | AC9: a compromised update server can withhold updates until the signed metadata it serves has expired | **Accept** |
+
+Nothing is built. The work is TASKS item 19b, which writes its contract first (item 122). ADR-0011 N14 step 4 still waits for Z2, Z3, Z5, Z9 and Z10.
+
+**Left for the next revision of CLAUDE.md, which is your text:** §14 and §24 do not yet name ADR-0017.
+
+**Coming back to you:** item 134, with the storage-encryption ADR; and the trust classes that would let item 125 cost less, with measurements.

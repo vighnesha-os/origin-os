@@ -6,7 +6,7 @@
 | Covers | Origin Desktop and Origin Server as whole systems: who attacks them, what they hold, what each edition defends, and which component is answerable for each attacker. The three component models stay the authority for their own boundaries: `THREAT_MODEL_SYSCALLS.md`, `THREAT_MODEL_IOMMU.md`, `THREAT_MODEL_ADDRESS_SPACES.md` |
 | Written | 2026-11-10, by TASKS item 19a. Most of what it points at is not built: it is written now so that each component is designed against a stated attacker, as §58 and §83 expect |
 | Evidence | None of its own. Where a row says **Proven**, the proof is the component model's, under QEMU only. Nothing has run on hardware (§74). Statements about a processor come from `docs/research/2026-11-10-speculation-processor-hardening.md` |
-| Status | The coverage tables record what the documents and the code say today. The nine acceptances at the end are **proposed**: each is the owner's to make, and none is made until the owner answers |
+| Status | The coverage tables record what the documents and the code say today. **The owner accepted the nine acceptances at the end on 2026-11-10, as recommended** ("Accept all", to one question that covered them and ADR-0017's nine; decision sheet items 133 to 141). Accepting them built nothing: every state below is unchanged |
 
 ## Words used for state
 
@@ -16,7 +16,6 @@
 | **Boot-tested** | A boot proof exists; no control is recorded |
 | **Built** | Code exists and runs in the boots; no proof is aimed at this attacker |
 | **Designed** | An accepted ADR or a rule of CLAUDE.md says what to build; nothing is built |
-| **Proposed** | An ADR awaiting the owner |
 | **Nothing** | No design and no code |
 
 ## What is being protected
@@ -59,11 +58,11 @@ Two parties are not attackers here because nothing defends against them: the pla
 | A hostile program | **Defends** other programs' memory, objects and authority, and the kernel. **Limits** what leaks through timing and speculation | The same. Its programs are fewer and chosen by an administrator, and they include services that face the network |
 | A hostile device | **Defends** memory and interrupts from any device. An external device gets nothing until it is authorized | The same. The devices a baseboard controller presents are its console, and are trusted as the console is (AC1) |
 | A thief, machine off | **Defends** what is stored, once storage encryption exists. **Accepts** the loss of the hardware | **Defends** the same: disks leave data centres |
-| A thief, machine locked | **Limits.** The session stays locked. This model asks one thing of §32's design: a device attached to a locked machine gets no DMA and no driver. **Accepts**, as proposed, that secrets in memory can be read with equipment (AC2) | A running server in someone else's building is that operator's (AC8) |
+| A thief, machine locked | **Limits.** The session stays locked. This model asks one thing of §32's design: a device attached to a locked machine gets no DMA and no driver. **Accepts** that secrets in memory can be read with equipment (AC2) | A running server in someone else's building is that operator's (AC8) |
 | Someone with brief access | **Limits.** A changed boot chain does not start, or starts and is seen to have changed. **Accepts** added hardware (AC3) | The same, and a baseboard controller is a standing form of this access (AC1) |
 | A stolen publisher key | **Limits.** The software can do only what its manifest declares and the user or administrator grants; revocation quarantines it | The same |
 | A compromised update server | **Defends** what is installed, its freshness and its direction: only signed, unexpired and never older. **Accepts** that updates can be withheld for a while (AC9) | The same |
-| A server's own administrator | Not an attacker: on a desktop the owner is the administrator | **Defends** two things: every action is tied to the person who took it, and the rules for signed code hold against an administrator too. **Accepts**, as proposed, that an administrator can read what the system can read (AC7) |
+| A server's own administrator | Not an attacker: on a desktop the owner is the administrator | **Defends** two things: every action is tied to the person who took it, and the rules for signed code hold against an administrator too. **Accepts** that an administrator can read what the system can read (AC7) |
 
 ## Which component covers each attacker
 
@@ -77,7 +76,7 @@ Two parties are not attackers here because nothing defends against them: the pla
 | | The services it can reach | The directory its launcher builds; the kernel's stamp on every message (ADR-0011 N9; the system-call model's D and W rows) | **Proven** in part. Open: D11 |
 | | Starting other programs | The launch capability, a base image with no command interpreter, an empty environment (ADR-0011 Amendment 1) | **Designed** |
 | | Other programs' windows, input and clipboard | The compositor's rules (CLAUDE.md §52, decision item 116) | **Designed** as rules. No compositor |
-| | The processor's speculation, and timing | `ADR-0017` | **Proposed** |
+| | The processor's speculation, and timing | `ADR-0017`, accepted on 2026-11-10 | **Designed** |
 | | Its package, and what it asks for when installed | ONBF's tiers, declared capabilities and sandbox (ADR-0001 Decision 4; `ONBF.md` §7.7) | **Designed**. The container's parsers are built and host-tested; nothing installs a package |
 | | Devices, through the SDK | Rights for dangerous operations (ADR-0015 D3) | **Designed** |
 | | Using everything up | Quotas (ADR-0005 P11) | **Boot-tested** for channels and queued messages (O1). Open: O2 |
@@ -104,44 +103,44 @@ Each of the three models excludes physical attacks, firmware and side channels, 
 | # | Excluded | By | For the product |
 |---|---|---|---|
 | EX1 | Physical attack with the machine off | All three | **To be covered** by storage encryption, and by a verified boot chain for what cannot be encrypted. Not an acceptance: it is a requirement before M9. Until then whoever holds the disk reads everything on it |
-| EX2 | Physical attack on memory while the machine runs or sleeps | All three; the IOMMU model names memory | **Not covered.** Two possible covers, neither designed: dropping storage keys from memory when the session locks or the machine sleeps, and memory encryption where firmware turns it on. Proposed acceptance AC2 |
+| EX2 | Physical attack on memory while the machine runs or sleeps | All three; the IOMMU model names memory | **Not covered.** Two possible covers, neither designed: dropping storage keys from memory when the session locks or the machine sleeps, and memory encryption where firmware turns it on. **Accepted by name** for now: AC2, to be decided again with the storage-encryption ADR |
 | EX3 | Debug ports; hardware added or swapped; signals measured at the machine | The IOMMU model names debug ports | **Accepted by name:** AC3. No software sees or closes a hardware debug port |
 | EX4 | DMA through an external port | The system-call and address-space models point to the IOMMU model | **Covered there** (T1, T4 to T9), with that model's open rows. Nothing exists for external devices yet |
 | EX5 | A boot chain or firmware setting changed by brief access | All three, as "physical" | **Covered in part:** Secure Boot (Designed) and measured boot (Nothing). What is left is AC3 |
-| EX6 | Faults a program induces in memory hardware by how it reads and writes | Named by none of them | **Not covered.** It is a hostile program's attack on a physical weakness. AMD lists a 2025 bulletin on such attacks against DDR5 (AMD-SB-7048; its title and date only were read). Proposed acceptance AC4 |
+| EX6 | Faults a program induces in memory hardware by how it reads and writes | Named by none of them | **Not covered.** It is a hostile program's attack on a physical weakness. AMD lists a 2025 bulletin on such attacks against DDR5 (AMD-SB-7048; its title and date only were read). **Accepted by name:** AC4 |
 | EX7 | Malicious firmware; system management mode; a baseboard controller; a hypervisor under a guest | The system-call and IOMMU models | **Buggy firmware is covered:** its tables are parsed as hostile input (the IOMMU model's T21 and T22; TASKS item 3). **Malicious firmware is accepted by name:** AC1. Measured boot will make a changed firmware visible to whoever checks. Calls into firmware after boot are for ADR-0002's Amendment 2 |
 | EX8 | Malicious microcode | The system-call and IOMMU models | Origin loads none today. When it does: only from the signed release (§38), and by the kernel alone; loading it belongs in ADR-0015 D3's list of dangerous operations. Microcode that the firmware loaded is accepted with the firmware (AC1). A vendor's own check can fail: AMD-SB-7033, 2025 |
 | EX9 | A kernel already compromised another way | All three | **Accepted with the design:** in a framekernel everything in ring 0 is one trust domain (ADR-0011 N6). What reduces the chance: less code in ring 0 (TASKS item 23), the `unsafe` and no-panic gates, shadow stacks (ADR-0017 Z8). What limits the aftermath: a change on disk fails verification at the next boot (ONBF-R2); a change in memory is not detected |
-| EX10 | Speculative execution | The system-call model lists it as open (I2) | **Covered by ADR-0017**, which is Proposed. Until it is accepted and built this is open, and it holds up ADR-0011 N14 step 4 |
+| EX10 | Speculative execution | The system-call model lists it as open (I2) | **Covered by ADR-0017**, which the owner accepted on 2026-11-10 and which is not built. Until it is built this is open, and it holds up ADR-0011 N14 step 4 |
 | EX11 | Speculative use of a stale translation before a shootdown completes | The address-space model | **Covered by that model's own rule,** by design. A frame is released only after every processor that could hold its translation has answered (T1). So a stale translation, followed for real or on a wrong guess, reaches a frame that still belongs to the space giving it up, or to one that still maps it. No boot can show this: QEMU's processor does not speculate. PCIDs (ADR-0004 H5) would change the argument and reopen it |
 | EX12 | Other side channels: caches and timing, contention between the two threads of a core, power | The IOMMU and address-space models | **Covered in part.** Code that handles secrets is written constant-time (§59; the cryptographic profile). Sibling threads cannot steer each other's branches (ADR-0017 Z5). Energy counters are not given to unprivileged programs (ADR-0017 Z11). **The rest is accepted by name:** AC5 |
 
 ## Acceptances, by name
 
-Each is proposed. Each is the owner's to make, because each says what the product does not promise.
+Each says what the product does not promise, so each was the owner's to make. **The owner accepted all nine on 2026-11-10, as recommended** ("Accept all"). The last column is the decision sheet's item.
 
-| # | What is accepted | Recommended | Why |
-|---|---|---|---|
-| AC1 | The platform firmware, system management mode and the processor's microcode are trusted. So is the hypervisor under an Origin guest, and the baseboard controller of a server | **Accept** | Nothing above them can check them. Measured boot is the answer to a changed firmware, and it detects without preventing |
-| AC2 | While a machine is locked or asleep, its secrets are in memory, and someone who can read memory with equipment gets them | **Accept for now, and decide again in the storage-encryption ADR** | The two covers each have a price: a locked machine that cannot touch its own encrypted data, or a requirement on the hardware. Neither has been researched |
-| AC3 | Tampering with tools: implants, debug ports, bus probes, chips rewritten off the board, and anything measured at the machine | **Accept** | No software defence exists |
-| AC4 | A program that induces faults in memory hardware | **Accept, and revisit when the list of declared machines exists** | The defences are in the memory and the platform. Whether declared server machines must have error-correcting memory is a hardware decision (ADR-0009) |
-| AC5 | Timing and contention channels between programs, the two threads of one core included. A program can time what it shares with others | **Accept for programs in general.** First-party code that handles secrets must be constant-time, and that is not waived | AMD's 2026 bulletins on such channels recommend exactly this and no other change, and Intel's guidance for code that handles secrets is of the same kind (the ledger, §3.5 and §3.13) |
-| AC6 | On a processor that lacks the controls ADR-0017 needs, programs are not protected from each other's speculation | **Accept, for bench machines only** | ADR-0009 already lets no claim rest on such a machine. ADR-0017's question 8 asks the same thing |
-| AC7 | An administrator of an Origin Server can read whatever the system can read | **Accept, with attribution and an audit record as the defence** | The alternative is storage keys held by each user and not by the system, which is a decision for the storage and accounts designs |
-| AC8 | Whoever operates the host of an Origin Server guest, or the building a server stands in, can read and change everything | **Accept** | The first server platform is a virtual machine (ADR-0014 S3). Guests the host cannot read would need an ADR and hardware Origin does not target yet |
-| AC9 | A compromised update server can withhold updates until the signed metadata it serves has expired | **Accept** | It cannot be prevented from outside, only noticed |
+| # | What is accepted | Accepted as | Why | Item |
+|---|---|---|---|---|
+| AC1 | The platform firmware, system management mode and the processor's microcode are trusted. So is the hypervisor under an Origin guest, and the baseboard controller of a server | **Accepted** | Nothing above them can check them. Measured boot is the answer to a changed firmware, and it detects without preventing | 133 |
+| AC2 | While a machine is locked or asleep, its secrets are in memory, and someone who can read memory with equipment gets them | **Accepted for now; decided again in the storage-encryption ADR** | The two covers each have a price: a locked machine that cannot touch its own encrypted data, or a requirement on the hardware. Neither has been researched | 134 |
+| AC3 | Tampering with tools: implants, debug ports, bus probes, chips rewritten off the board, and anything measured at the machine | **Accepted** | No software defence exists | 135 |
+| AC4 | A program that induces faults in memory hardware | **Accepted; revisited when the list of declared machines exists** | The defences are in the memory and the platform. Whether declared server machines must have error-correcting memory is a hardware decision (ADR-0009) | 136 |
+| AC5 | Timing and contention channels between programs, the two threads of one core included. A program can time what it shares with others | **Accepted for programs in general.** First-party code that handles secrets must be constant-time, and that is not waived | AMD's 2026 bulletins on such channels recommend exactly this and no other change, and Intel's guidance for code that handles secrets is of the same kind (the ledger, §3.5 and §3.13) | 137 |
+| AC6 | On a processor that lacks the controls ADR-0017 needs, programs are not protected from each other's speculation | **Accepted, for bench machines only** | ADR-0009 already lets no claim rest on such a machine. ADR-0017's question 8 is the same decision (item 131) | 138 |
+| AC7 | An administrator of an Origin Server can read whatever the system can read | **Accepted, with attribution and an audit record as the defence** | The alternative is storage keys held by each user and not by the system, which is a decision for the storage and accounts designs | 139 |
+| AC8 | Whoever operates the host of an Origin Server guest, or the building a server stands in, can read and change everything | **Accepted** | The first server platform is a virtual machine (ADR-0014 S3). Guests the host cannot read would need an ADR and hardware Origin does not target yet | 140 |
+| AC9 | A compromised update server can withhold updates until the signed metadata it serves has expired | **Accepted** | It cannot be prevented from outside, only noticed | 141 |
 
 ## What must exist, and when
 
 | Before | What |
 |---|---|
-| The first program that is not a boot proof runs in ring 3 (ADR-0011 N14 step 4) | ADR-0017 accepted, and its Z2, Z3, Z5, Z9 and Z10 built. The system-call model's own list: E8, O2, D11 |
+| The first program that is not a boot proof runs in ring 3 (ADR-0011 N14 step 4) | ADR-0017's Z2, Z3, Z5, Z9 and Z10 built (the ADR itself is accepted). The system-call model's own list: E8, O2, D11 |
 | Anything but a boot proof uses the network | A decision on where the stack runs (TASKS item 23), and a model of a hostile peer |
 | The compositor is designed (M8) | A threat model for §52's four rules |
-| Origin can be installed (M9) | Storage encryption designed and built (EX1); AC2 decided; accounts and credentials (§57); the Secure Boot keys |
+| Origin can be installed (M9) | Storage encryption designed and built (EX1), and AC2 decided again with it; accounts and credentials (§57); the Secure Boot keys |
 | Any claim about real hardware | The IOMMU model's list; ADR-0017's proofs on a processor in scope |
-| Origin Server ships | The remote administration and remote desktop ADRs, each with a threat model; AC7 and AC8 answered; an audit record |
+| Origin Server ships | The remote administration and remote desktop ADRs, each with a threat model; the audit record AC7 rests on |
 | The first public release | The update path (M12) with its threat model; the key ceremony (§60) |
 
 ## What this does not prove
@@ -154,5 +153,5 @@ Each is proposed. Each is the owner's to make, because each says what the produc
 ## References
 
 - `docs/research/2026-11-10-speculation-processor-hardening.md`, for every statement about a processor, and for the two AMD bulletins named above (its §6).
-- `docs/adr/ADR-0017-speculation-processor-hardening.md` (Proposed).
+- `docs/adr/ADR-0017-speculation-processor-hardening.md` (accepted on 2026-11-10; not built).
 - The three component models, and the ADRs and sections named in each row.

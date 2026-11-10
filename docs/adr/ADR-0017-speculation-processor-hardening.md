@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Proposed** on 2026-11-10. Nothing here is built, and nothing is decided until the owner answers the nine questions at the end (CLAUDE.md §18, §84). Questions 4 and 8 would change the wording of accepted ADRs (ADR-0003 K8, ADR-0005 P4, ADR-0013's table). No user-visible ABI changes. It is the ADR decision item 112 asked for, to be settled before ADR-0011 N14 step 4 runs the first program that is not a boot proof |
+| Status | **Accepted** by the owner on 2026-11-10, as proposed, with the recommended answer to each of the nine questions at the end (decision sheet items 124 to 132; CLAUDE.md §18). The owner's answer was "Accept all", to one question that covered these nine and the nine acceptances of `THREAT_MODEL_SYSTEM.md`, in the session that wrote both. **Nothing here is built,** and no processor in scope has been run. No user-visible ABI changes (§84). Two answers touch accepted ADRs when the work is built: ADR-0003 K8 and ADR-0005 P4 will be amended to describe the FRED entry path (item 127), and ADR-0013's table gains a Report row (item 131). It is the ADR decision item 112 asked for. ADR-0011 N14 step 4 still waits for Z2, Z3, Z5, Z9 and Z10 to be built |
 | Requires | CLAUDE.md P0, P1, §12 to §14, §16, §18 ("Speculation and processor hardening"), §24, §58, §74, rules 14, 16, 21, 30 and 40 |
 | Evidence | `docs/research/2026-11-10-speculation-processor-hardening.md` ("the ledger"). Documents only: **no processor in scope has been run**, and no cost below is measured |
 | Code | None changed. The code half (TASKS item 19b) would change `framekernel/frame/src/cpu.rs`, `trap.rs`, `usercopy.rs` and `smp.rs`, add one framework module, and touch `framekernel/src/handles.rs`, the OIDL generator's dispatcher, `.cargo/config.toml` and `developer-tools/xtask` |
@@ -70,7 +70,7 @@ Each decision names the processors it applies to by what CPUID reports, never by
 
 - Sibling threads may run different processes.
 - Intel: enhanced IBRS already stops one thread steering its sibling's indirect branches. AMD: automatic IBRS covers ring 0 only, so the kernel sets STIBP once on every processor and leaves it, where Fn8000_0008_EBX[17] recommends that.
-- What is left between two threads of a core is timing and contention on shared hardware. Neither vendor asks for SMT to be off on these processors; both ask for constant-time code where secrets are handled. `THREAT_MODEL_SYSTEM.md` accepts the remainder by name (its AC5), and that acceptance is the owner's.
+- What is left between two threads of a core is timing and contention on shared hardware. Neither vendor asks for SMT to be off on these processors; both ask for constant-time code where secrets are handled. `THREAT_MODEL_SYSTEM.md` accepts the remainder by name (its AC5; the owner's acceptance, item 137).
 - Not in this version: placing only one process's threads on a core, and a setting that takes sibling threads offline. The first belongs with the scheduler's policy (TASKS item 4), the second with processor offlining (§24).
 
 ### Z6. FRED where the processor has it; today's path where it does not
@@ -134,7 +134,7 @@ On stable Rust 1.99.1, checked on the day (ledger §3.12):
 | `-C jump-tables=no` | **On** | Stable. A `match` on a number from ring 3 then compiles to comparisons, not to an indirect jump through a table |
 | `-C force-frame-pointers=yes`, overflow checks | On, as §14 and decision item 123 already say | |
 | Retpolines | **Off** | The only way is a target feature the compiler warns will become an error. Z2 uses the hardware control instead |
-| An INT3 after every RET | **On, if the owner agrees (question 6)** | AMD recommends it for every processor. The only way is a target feature the stable compiler accepts with a warning that it is unsupported. A gate reads the kernel's image and fails if a RET is not followed by INT3, so the option cannot stop working unnoticed |
+| An INT3 after every RET | **On** (question 6, accepted: item 129) | AMD recommends it for every processor. The only way is a target feature the stable compiler accepts with a warning that it is unsupported. A gate reads the kernel's image and fails if a RET is not followed by INT3, so the option cannot stop working unnoticed |
 | The same in hand-written assembly | On | The framework's own RET, IRETQ, ERETS and ERETU are each followed by an INT3, and a gate checks it |
 | IBT, a stack protector | Off | No stable flag (§14, confirmed) |
 
@@ -192,7 +192,7 @@ On the path Z6 keeps for processors without FRED:
 ## Migration consequences
 
 - **No user-visible ABI changes.** SYSCALL stays the one way in, with the same registers (ADR-0005 P4). `user-abi` does not move. An interface for a program to ask for SSBD comes later and is its own decision (Z4).
-- **Accepted ADRs whose wording would change** (questions 4 and 8): ADR-0003 K8 and ADR-0005 P4 describe one entry path; ADR-0013's table gains rows.
+- **Accepted ADRs whose wording changes when this is built** (questions 4 and 8, items 127 and 131): ADR-0003 K8 and ADR-0005 P4 describe one entry path; ADR-0013's table gains rows.
 - **`THREAT_MODEL_SYSCALLS.md`:** rows E1, E3, E4, E5, E11, E12 and I2 change as each part is built.
 - **The boot proofs** gain: the controls of Z2, Z3 and Z5 read back on every processor; the FRED path's ring-3 proofs, the same programs as today; an NMI inside the NMI handler; a masked lookup that stays in bounds; a kernel image with no jump table. Proofs that probe user addresses from ring 0 change under LASS (Z7).
 - **`onbf-pack`:** `cet.shstk` follows Z8 (decision item 120).
@@ -217,21 +217,21 @@ On the path Z6 keeps for processors without FRED:
 
 ## What this does not prove
 
-- **Anything.** It is a decision, not code, and no processor in scope has been run (§74, rule 30).
+- **Anything.** It is a decision, not code, and no processor in scope has been run (§74, rule 30). Accepting it changed neither.
 - That Panther Lake, Wildcat Lake or Clearwater Forest set the bits Intel's table implies. The table's own key says a processor that is not affected may not report it.
 - That AMD's FRED behaves as Intel's chapter describes.
 - That masking holds on Intel's 2026 family 6 models. It rests on a statement written before they existed.
 - What any control costs.
 - That QEMU can show any of this. Its software processor does not speculate, and it models none of these registers' effects.
 
-## Questions for the owner
+## Questions for the owner (answered 2026-11-10: the recommended answer to all nine)
 
-1. **Accept Z1 to Z12 as the policy,** to be built as TASKS item 19b with its own contract? **Recommended: yes.**
-2. **IBPB at every change of process** until trust classes exist and the cost is measured (Z3)? **Recommended: yes.** P0 comes before P1, and there is no number yet to argue from. The alternative is IBPB only between different principals, which leaves a sandboxed program free to aim at the same user's other programs.
-3. **SMT on,** with branch isolation between sibling threads, and the remaining timing channels accepted by name (Z5)? **Recommended: yes.** The alternative is SMT off by default on Origin Server.
-4. **FRED wherever every processor reports it, with the IDT path kept for the rest** (Z6), and ADR-0003 K8 and ADR-0005 P4 amended to say so when it is built? **Recommended: yes.**
-5. **On AMD, FRED waits** for AMD's own text or for proofs on a machine that has it (Z6)? **Recommended: yes.**
-6. **An INT3 after every RET through a target feature the stable compiler accepts with a warning** (Z10)? §12 keeps the build on stable features, and this one is in between: not nightly, not supported. **Recommended: yes, with the gate that reads the image.** The alternative is to harden only the hand-written assembly.
-7. **Supervisor shadow stacks under FRED first, and on the IDT path only on evidence** (Z8)? **Recommended: yes.**
-8. **A processor that lacks a control boots, and the boot says so** (Z1), as a Report row in ADR-0013's table; whether the production installer refuses such a machine is decided with decision item 90 at M9? **Recommended: yes.**
-9. **Masking on AMD and on Intel family 6, LFENCE on Intel family 18 and above and on anything unknown** (Z9)? **Recommended: yes.** The stricter alternative is LFENCE on every Intel processor until Intel renews its statement; it costs a barrier on every handle lookup on Panther Lake.
+1. **Accept Z1 to Z12 as the policy,** to be built as TASKS item 19b with its own contract? **Recommended: yes.** **Yes (2026-11-10, item 124).**
+2. **IBPB at every change of process** until trust classes exist and the cost is measured (Z3)? **Recommended: yes.** P0 comes before P1, and there is no number yet to argue from. The alternative is IBPB only between different principals, which leaves a sandboxed program free to aim at the same user's other programs. **Yes (2026-11-10, item 125).**
+3. **SMT on,** with branch isolation between sibling threads, and the remaining timing channels accepted by name (Z5)? **Recommended: yes.** The alternative is SMT off by default on Origin Server. **Yes (2026-11-10, item 126).**
+4. **FRED wherever every processor reports it, with the IDT path kept for the rest** (Z6), and ADR-0003 K8 and ADR-0005 P4 amended to say so when it is built? **Recommended: yes.** **Yes (2026-11-10, item 127).**
+5. **On AMD, FRED waits** for AMD's own text or for proofs on a machine that has it (Z6)? **Recommended: yes.** **Yes (2026-11-10, item 128).**
+6. **An INT3 after every RET through a target feature the stable compiler accepts with a warning** (Z10)? §12 keeps the build on stable features, and this one is in between: not nightly, not supported. **Recommended: yes, with the gate that reads the image.** The alternative is to harden only the hand-written assembly. **Yes (2026-11-10, item 129).**
+7. **Supervisor shadow stacks under FRED first, and on the IDT path only on evidence** (Z8)? **Recommended: yes.** **Yes (2026-11-10, item 130).**
+8. **A processor that lacks a control boots, and the boot says so** (Z1), as a Report row in ADR-0013's table; whether the production installer refuses such a machine is decided with decision item 90 at M9? **Recommended: yes.** **Yes (2026-11-10, item 131).**
+9. **Masking on AMD and on Intel family 6, LFENCE on Intel family 18 and above and on anything unknown** (Z9)? **Recommended: yes.** The stricter alternative is LFENCE on every Intel processor until Intel renews its statement; it costs a barrier on every handle lookup on Panther Lake. **Yes (2026-11-10, item 132).**
