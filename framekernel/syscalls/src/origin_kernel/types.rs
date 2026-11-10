@@ -14,7 +14,7 @@
 use super::super::oidl_rt as rt;
 
 /// This library's version: `(major, minor)` (§9).
-pub const VERSION: (u16, u16) = (0, 3);
+pub const VERSION: (u16, u16) = (0, 4);
 
 /// The rights of a new channel end: everything that applies to a channel (ADR-0005 P2, P8,
 /// amendment A1).
@@ -80,11 +80,14 @@ pub enum Error {
     Limit = -12,
     /// The caller's buffer is too small; the sizes it needs were written to the out pointer.
     BufferTooSmall = -13,
+    /// Nothing by that name or key is here: a service directory holds no provider of the
+    /// interface and major asked for (ADR-0005 C11).
+    NotFound = -14,
 }
 
 impl Error {
     /// Every member, in declaration order.
-    pub const ALL: [Self; 13] = [Self::InvalidArgs, Self::BadHandle, Self::WrongType, Self::AccessDenied, Self::NoMemory, Self::Fault, Self::ShouldWait, Self::TimedOut, Self::PeerClosed, Self::Canceled, Self::NotSupported, Self::Limit, Self::BufferTooSmall];
+    pub const ALL: [Self; 14] = [Self::InvalidArgs, Self::BadHandle, Self::WrongType, Self::AccessDenied, Self::NoMemory, Self::Fault, Self::ShouldWait, Self::TimedOut, Self::PeerClosed, Self::Canceled, Self::NotSupported, Self::Limit, Self::BufferTooSmall, Self::NotFound];
 
     /// The value on the wire or in a register.
     pub const fn raw(self) -> i64 {
@@ -112,6 +115,7 @@ impl Error {
             Self::NotSupported => "NOT_SUPPORTED",
             Self::Limit => "LIMIT",
             Self::BufferTooSmall => "BUFFER_TOO_SMALL",
+            Self::NotFound => "NOT_FOUND",
         }
     }
 

@@ -1,15 +1,15 @@
 //! `cargo xtask check`'s gates on the generated interface code (ADR-0011 N13,
-//! `docs/spec/OIDL.md` §13):
+//! `docs/spec/OIDL.md` §13), for each crate in [`CRATES`]:
 //!
-//! - **Fresh.** [`COMMITTED`] is byte for byte what the generator writes from [`DEFINITIONS`] and
-//!   `origin-version.toml`: no file missing, none added, none changed.
-//! - **Recorded.** [`LOCK`] holds the definitions' fingerprints: re-recording it into a scratch
+//! - **Fresh.** The crate's committed source is byte for byte what the generator writes from its
+//!   definitions and `origin-version.toml`: no file missing, none added, none changed.
+//! - **Recorded.** Its lock holds its library's fingerprints: re-recording the lock into a scratch
 //!   copy changes nothing. A definition's ABI therefore cannot change without the lock changing
 //!   in the same commit, where a reviewer sees it, even at major 0, where `oidl` itself only
 //!   warns (§9).
 //!
-//! `cargo xtask regenerate` rewrites [`COMMITTED`]. It never touches the lock: re-recording an ABI
-//! is a decision, and the gate names the command for it.
+//! `cargo xtask regenerate` rewrites every crate's source. It never touches a lock: re-recording an
+//! ABI is a decision, and the gate names the command for it.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -18,70 +18,113 @@ use std::process::Command;
 
 use crate::{OIDL_PACKAGE, Result, cargo, collect_files, read_file, repo_root, target_dir};
 
-/// The definitions the kernel's system calls are generated from.
-const DEFINITIONS: &[&str] = &["sdk/interfaces/origin.kernel.oidl"];
 /// Where `version compatibility "..."` is read from.
 const VERSIONS: &str = "origin-version.toml";
-/// The generated source of the kernel-private crate: nothing here is written by hand.
-const COMMITTED: &str = "framekernel/syscalls/src";
-/// The recorded fingerprints.
-const LOCK: &str = "sdk/interfaces/origin.kernel.lock";
+
+/// A crate generated from OIDL definitions, and the lock that records its library.
+struct Generated {
+    /// The library the crate is for and the lock records.
+    library: &'static str,
+    /// The definitions given to the generator: the library's, and every library it uses.
+    definitions: &'static [&'static str],
+    /// What kind of crate (`docs/spec/OIDL.md` §11).
+    mode: &'static [&'static str],
+    /// Its source: nothing here is written by hand.
+    committed: &'static str,
+    /// The library's recorded fingerprints.
+    lock: &'static str,
+}
+
+/// Every generated crate.
+const CRATES: &[Generated] = &[
+    // The kernel's system calls: the server side alone, kernel-private.
+    Generated {
+        library: "origin.kernel",
+        definitions: &["sdk/interfaces/origin.kernel.oidl"],
+        mode: &["--server-only"],
+        committed: "framekernel/syscalls/src",
+        lock: "sdk/interfaces/origin.kernel.lock",
+    },
+    // The service directory (ADR-0005 C12): its server and client, and origin.kernel's types.
+    Generated {
+        library: "origin.directory",
+        definitions: &[
+            "sdk/interfaces/origin.kernel.oidl",
+            "sdk/interfaces/origin.directory.oidl",
+        ],
+        mode: &["--library", "origin.directory"],
+        committed: "sdk/directory/src",
+        lock: "sdk/interfaces/origin.directory.lock",
+    },
+];
 
 /// A tree of files: relative path to contents.
 type Tree = BTreeMap<String, Vec<u8>>;
 
-/// Both gates: see the module documentation.
+/// Both gates on every crate: see the module documentation.
 pub(crate) fn gate() -> Result {
-    let scratch = scratch()?;
-    let generated = generate(&scratch)?;
-    let committed = read_tree(&repo_root().join(COMMITTED))?;
-    let stale = differences(&committed, &generated);
-    if !stale.is_empty() {
-        return Err(format!(
-            "{COMMITTED} is not what the generator writes from {} (ADR-0011 N13); run `cargo xtask regenerate`:\n  {}",
-            DEFINITIONS.join(", "),
-            stale.join("\n  ")
-        ));
-    }
-    recorded(&scratch)?;
-    println!(
-        "xtask: interface gates: {COMMITTED} is the generator's output, byte for byte ({} files), and {LOCK} records it",
-        generated.len()
-    );
-    Ok(())
-}
-
-/// Rewrites [`COMMITTED`] from the definitions, and removes what the generator no longer writes.
-/// The generator runs first, into a scratch directory, because the workspace does not load
-/// without the crate's `lib.rs`.
-pub(crate) fn regenerate() -> Result {
-    let generated = generate(&scratch()?)?;
-    let target = repo_root().join(COMMITTED);
-    for path in read_tree(&target)?
-        .keys()
-        .filter(|path| !generated.contains_key(*path))
-    {
-        let file = target.join(path);
-        fs::remove_file(&file).map_err(|e| format!("{}: {e}", file.display()))?;
-    }
-    for (path, text) in &generated {
-        let file = target.join(path);
-        if let Some(parent) = file.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    for (index, krate) in CRATES.iter().enumerate() {
+        let scratch = scratch(index)?;
+        let generated = generate(krate, &scratch)?;
+        let committed = read_tree(&repo_root().join(krate.committed))?;
+        let stale = differences(&committed, &generated);
+        if !stale.is_empty() {
+            return Err(format!(
+                "{} is not what the generator writes from {} (ADR-0011 N13); run `cargo xtask regenerate`:\n  {}",
+                krate.committed,
+                krate.definitions.join(", "),
+                stale.join("\n  ")
+            ));
         }
-        fs::write(&file, text).map_err(|e| format!("{}: {e}", file.display()))?;
+        recorded(krate, &scratch)?;
+        println!(
+            "xtask: interface gates: {} is the generator's output, byte for byte ({} files), and {} records {}",
+            krate.committed,
+            generated.len(),
+            krate.lock,
+            krate.library
+        );
     }
-    println!(
-        "xtask: regenerated {COMMITTED} ({} files); if the ABI changed, the lock must be re-recorded too: {}",
-        generated.len(),
-        record_command()
-    );
     Ok(())
 }
 
-/// An empty scratch directory.
-fn scratch() -> Result<PathBuf> {
-    let dir = target_dir().join("xtask").join("interfaces");
+/// Rewrites every crate's source from its definitions, and removes what the generator no longer
+/// writes. The generator runs first, into a scratch directory, because the workspace does not
+/// load without each crate's `lib.rs`.
+pub(crate) fn regenerate() -> Result {
+    for (index, krate) in CRATES.iter().enumerate() {
+        let generated = generate(krate, &scratch(index)?)?;
+        let target = repo_root().join(krate.committed);
+        for path in read_tree(&target)?
+            .keys()
+            .filter(|path| !generated.contains_key(*path))
+        {
+            let file = target.join(path);
+            fs::remove_file(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+        }
+        for (path, text) in &generated {
+            let file = target.join(path);
+            if let Some(parent) = file.parent() {
+                fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+            }
+            fs::write(&file, text).map_err(|e| format!("{}: {e}", file.display()))?;
+        }
+        println!(
+            "xtask: regenerated {} ({} files); if the ABI changed, the lock must be re-recorded too: {}",
+            krate.committed,
+            generated.len(),
+            record_command(krate)
+        );
+    }
+    Ok(())
+}
+
+/// An empty scratch directory for crate `index`.
+fn scratch(index: usize) -> Result<PathBuf> {
+    let dir = target_dir()
+        .join("xtask")
+        .join("interfaces")
+        .join(index.to_string());
     if dir.exists() {
         fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -111,15 +154,17 @@ fn run_quietly(mut command: Command, what: &str) -> Result {
     ))
 }
 
-/// The server side of the definitions, generated under `scratch`.
-fn generate(scratch: &Path) -> Result<Tree> {
+/// `krate` as the generator writes it, under `scratch`.
+fn generate(krate: &Generated, scratch: &Path) -> Result<Tree> {
     let out = scratch.join("generated");
     let mut command = oidl();
     command
-        .args(["generate", "--server-only", "--out"])
+        .arg("generate")
+        .args(krate.mode)
+        .arg("--out")
         .arg(&out)
         .args(["--versions", VERSIONS])
-        .args(DEFINITIONS);
+        .args(krate.definitions);
     run_quietly(command, "oidl generate")?;
     let tree = read_tree(&out)?;
     if tree.is_empty() {
@@ -181,31 +226,35 @@ fn first_different_line(a: &[u8], b: &[u8]) -> usize {
     1 + a.iter().take(at).filter(|byte| **byte == b'\n').count()
 }
 
-/// How a developer re-records the lock.
-fn record_command() -> String {
+/// How a developer re-records `krate`'s lock.
+fn record_command(krate: &Generated) -> String {
     format!(
-        "cargo run --package {OIDL_PACKAGE} -- fingerprint --versions {VERSIONS} --lock {LOCK} --update {}",
-        DEFINITIONS.join(" ")
+        "cargo run --package {OIDL_PACKAGE} -- fingerprint --library {} --versions {VERSIONS} --lock {} --update {}",
+        krate.library,
+        krate.lock,
+        krate.definitions.join(" ")
     )
 }
 
-/// Fails unless re-recording [`LOCK`] leaves it as it is.
-fn recorded(scratch: &Path) -> Result {
-    let recorded = read_file(&repo_root().join(LOCK))?;
+/// Fails unless re-recording `krate`'s lock leaves it as it is.
+fn recorded(krate: &Generated, scratch: &Path) -> Result {
+    let recorded = read_file(&repo_root().join(krate.lock))?;
     let copy = scratch.join("recorded.lock");
     fs::write(&copy, &recorded).map_err(|e| format!("{}: {e}", copy.display()))?;
     let mut command = oidl();
     command
-        .args(["fingerprint", "--versions", VERSIONS, "--lock"])
+        .args(["fingerprint", "--library", krate.library])
+        .args(["--versions", VERSIONS, "--lock"])
         .arg(&copy)
         .arg("--update")
-        .args(DEFINITIONS);
+        .args(krate.definitions);
     run_quietly(command, "oidl fingerprint")?;
     if read_file(&copy)? != recorded {
         return Err(format!(
-            "the ABI in {} is not the one {LOCK} records (ADR-0011 N13). If the change is meant, record it in the same commit, citing the decision: {}",
-            DEFINITIONS.join(", "),
-            record_command()
+            "the ABI of {} is not the one {} records (ADR-0011 N13). If the change is meant, record it in the same commit, citing the decision: {}",
+            krate.library,
+            krate.lock,
+            record_command(krate)
         ));
     }
     Ok(())
@@ -256,26 +305,34 @@ mod tests {
         assert_eq!(first_different_line(b"", b"a"), 1);
     }
 
-    /// The real tree: the gate's paths name what is there, and the kernel crate holds no shims.
+    /// The real tree: each crate's paths name what is there, no crate holds a shim, and the
+    /// kernel's crate holds no client either.
     #[test]
     fn the_paths_name_the_real_tree() {
         let root = repo_root();
-        let committed = read_tree(&root.join(COMMITTED)).expect("the committed tree");
-        assert!(committed.contains_key("lib.rs"), "{:?}", committed.keys());
-        assert!(
-            committed.keys().any(|path| path.ends_with("/server.rs")),
-            "{:?}",
-            committed.keys()
-        );
-        for shim in ["abi.rs", "core_stubs.rs", "client.rs"] {
+        for krate in CRATES {
+            let committed = read_tree(&root.join(krate.committed)).expect("the committed tree");
+            assert!(committed.contains_key("lib.rs"), "{:?}", committed.keys());
             assert!(
-                !committed.keys().any(|path| path.ends_with(shim)),
-                "{shim} must not be generated into the kernel's crate"
+                committed.keys().any(|path| path.ends_with("/server.rs")),
+                "{:?}",
+                committed.keys()
             );
-        }
-        assert!(root.join(LOCK).is_file());
-        for definition in DEFINITIONS {
-            assert!(root.join(definition).is_file(), "{definition}");
+            let server_only = krate.mode.contains(&"--server-only");
+            for shim in ["abi.rs", "core_stubs.rs", "client.rs"] {
+                if shim == "client.rs" && !server_only {
+                    continue;
+                }
+                assert!(
+                    !committed.keys().any(|path| path.ends_with(shim)),
+                    "{shim} must not be generated into {}",
+                    krate.committed
+                );
+            }
+            assert!(root.join(krate.lock).is_file(), "{}", krate.lock);
+            for definition in krate.definitions {
+                assert!(root.join(definition).is_file(), "{definition}");
+            }
         }
     }
 }

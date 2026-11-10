@@ -12,7 +12,9 @@ fn main() {
         println!("status {} {}", e.name(), e.raw());
     }
     println!("status_name {}", k::status_name(k::OK));
-    println!("status_name {}", k::status_name(-14));
+    // One below the lowest status: no status has it.
+    let unknown = k::Error::ALL.iter().map(|e| e.raw()).min().unwrap_or(0) - 1;
+    println!("status_name {}", k::status_name(unknown));
     println!("status_name {}", k::status_name(k::Error::Limit.raw()));
 
     let rights = [

@@ -2,12 +2,14 @@
 //!
 //! ```text
 //! oidl check [--versions FILE] FILE...
-//! oidl generate --out DIR [--server-only] [--versions FILE] FILE...
-//! oidl fingerprint [--versions FILE] [--lock FILE [--update]] FILE...
+//! oidl generate --out DIR [--server-only | --library NAME] [--versions FILE] FILE...
+//! oidl fingerprint [--library NAME] [--versions FILE] [--lock FILE [--update]] FILE...
 //! ```
 //!
 //! Every `use`d library must be named on the command line: nothing is searched for, so an
-//! output depends on exactly its inputs (CLAUDE.md §75).
+//! output depends on exactly its inputs (CLAUDE.md §75). `--library` picks one of them: for
+//! `generate`, the channel library whose bindings crate is written; for `fingerprint`, the one
+//! library printed, and checked against or recorded in the lock.
 #![forbid(unsafe_code)]
 
 use std::fs;
@@ -21,8 +23,8 @@ use oidl::{Input, codegen, compile};
 
 const USAGE: &str = "usage:
   oidl check [--versions FILE] FILE...
-  oidl generate --out DIR [--server-only] [--versions FILE] FILE...
-  oidl fingerprint [--versions FILE] [--lock FILE [--update]] FILE...";
+  oidl generate --out DIR [--server-only | --library NAME] [--versions FILE] FILE...
+  oidl fingerprint [--library NAME] [--versions FILE] [--lock FILE [--update]] FILE...";
 
 #[derive(Default)]
 struct Options {
@@ -31,6 +33,7 @@ struct Options {
     lock: Option<PathBuf>,
     update: bool,
     server_only: bool,
+    library: Option<String>,
     files: Vec<PathBuf>,
 }
 
@@ -49,13 +52,33 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<(String, Options), S
             "--lock" => options.lock = Some(PathBuf::from(value("--lock")?)),
             "--update" => options.update = true,
             "--server-only" => options.server_only = true,
+            "--library" => options.library = Some(value("--library")?),
             other if other.starts_with('-') => {
                 return Err(format!("unknown option {other}\n{USAGE}"));
             }
             other => options.files.push(PathBuf::from(other)),
         }
     }
+    if options.server_only && options.library.is_some() {
+        return Err(format!(
+            "--server-only and --library are different crates: give one\n{USAGE}"
+        ));
+    }
     Ok((command, options))
+}
+
+/// The compilation narrowed to the library `--library` names, for printing and the lock: the
+/// others were given only so that it compiles.
+fn selected(compilation: &Compilation, options: &Options) -> Result<Compilation, String> {
+    let Some(name) = &options.library else {
+        return Ok(compilation.clone());
+    };
+    let mut only = compilation.clone();
+    only.libraries.retain(|library| &library.name == name);
+    if only.libraries.is_empty() {
+        return Err(format!("{name} is not among the definitions given"));
+    }
+    Ok(only)
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, String> {
@@ -95,8 +118,15 @@ fn generate(options: &Options) -> Result<(), String> {
     let compilation = load(options)?;
     let out = options.out.as_ref().ok_or("generate needs --out DIR")?;
     let mut count = 0usize;
-    if options.server_only {
-        for file in codegen::generate_server(&compilation) {
+    let one_crate = if options.server_only {
+        Some(codegen::generate_server(&compilation))
+    } else if let Some(name) = &options.library {
+        Some(codegen::generate_library(&compilation, name)?)
+    } else {
+        None
+    };
+    if let Some(files) = one_crate {
+        for file in files {
             write_file(out, &file.path, &file.text)?;
             count = count.saturating_add(1);
         }
@@ -122,7 +152,7 @@ fn generate(options: &Options) -> Result<(), String> {
 }
 
 fn fingerprint_command(options: &Options) -> Result<bool, String> {
-    let compilation = load(options)?;
+    let compilation = selected(&load(options)?, options)?;
     for library in &compilation.libraries {
         print!("{}", fingerprint::fingerprint_file(library));
     }

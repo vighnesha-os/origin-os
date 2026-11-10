@@ -45,6 +45,9 @@ enum status: i64 {
     limit = -12;
     /// The caller's buffer is too small; the sizes it needs were written to the out pointer.
     buffer_too_small = -13;
+    /// Nothing by that name or key is here: a service directory holds no provider of the
+    /// interface and major asked for (ADR-0005 C11).
+    @since(0.4) not_found = -14;
 }
 
 /// Handle rights (ADR-0005 P2). A right can be removed, never added.

@@ -1131,6 +1131,10 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         Proof::Launch,
         crate::ipc_proof::prove_launch(com1, cpus, bsp, tsc_hz),
     );
+    proofs.record(
+        Proof::Directory,
+        crate::ipc_proof::prove_directory(com1, cpus, bsp, tsc_hz),
+    );
     // Every thread has exited: once each processor has reaped its own, the heap is back
     // exactly where it was before the first spawn.
     let back = || crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before;

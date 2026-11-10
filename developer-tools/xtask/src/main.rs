@@ -105,7 +105,8 @@ const ONBF_FORMAT_PACKAGE: &str = "onbf-format";
 const CRYPTO_PACKAGE: &str = "origin-crypto";
 const MERKLE_PACKAGE: &str = "onbf-merkle";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
-/// `no_std` libraries embedded in the boot loader and the Framekernel. Each must be
+/// `no_std` libraries embedded in the boot loader and the Framekernel, and the generated crates of
+/// the SDK's interfaces, which the Framekernel's boot proofs use and programs will. Each must be
 /// clippy-clean on every target and free of panic paths (ONBF §12).
 const BOOT_INFO_PACKAGE: &str = "origin-boot-info";
 const KERNEL_PACKAGE: &str = "framekernel";
@@ -126,7 +127,10 @@ const FREESTANDING_LIBS: &[&str] = &[
     "origin-paging",
     "origin-abi",
     "origin-syscalls",
+    "origin-directory",
 ];
+/// The services' `no_std` logic, which programs will run in ring 3 and the host tests until then.
+const SERVICE_LIBS: &[&str] = &["origin-directory-service"];
 const QEMU: &str = "qemu-system-x86_64";
 /// Where the emulated RTC starts (UTC), so the boot test can check the wall clock the
 /// kernel reads from it: BCD decoding, the FADT century register and the calendar.
@@ -1341,6 +1345,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(address_space_markers(cpus))
         .chain(identity_markers())
         .chain(launch_markers())
+        .chain(directory_markers())
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
@@ -1625,6 +1630,7 @@ fn boot_failures() -> Vec<&'static str> {
         ": PM timer failed",
         ": ipc failed",
         ": start failed",
+        ": directory failed",
         ": console failed",
         ": TLB failed",
         ": address spaces failed",
@@ -1884,6 +1890,15 @@ fn launch_markers() -> Vec<String> {
         "origin-kernel: start: two children launched from their creator found their start records in RDI, read-only at random addresses: each record, read back in ring 3, has its size, version, 4 entries with C6's rights, 2 arguments and 1 environment string: true; each start handle works: true; each child's message names it and its creator's principal: true; writing its record faulted there: true".into(),
         "origin-kernel: start: the two records are at different addresses: true; a record over 64 KiB is refused: true; a launch refused after its child held a handle gives everything back: true".into(),
         "origin-kernel: start: every launched process and all they held are gone: heap ".into(),
+    ]
+}
+
+/// The service directory proof (ADR-0005 C11, C12; ADR-0011 N9; `ipc_proof::prove_directory`).
+fn directory_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: directory: a launcher started a directory, a service and a client; the client's connect, and the request it wrote on its own end before any reply, reached the service through the directory: true; the service read that request stamped with the client's process and principal, not the directory's: true; the client read the service's reply stamped with the service's process: true".into(),
+        "origin-kernel: directory: the client's replies, read in ring 3 and decoded by the generated client: ok for the interface and major the directory holds: true; not_found (-14) for a major it does not hold: true; that connection's end reports peer_closed: true; the service answered ok for the end passed to it: true".into(),
+        "origin-kernel: directory: the directory, the service, the client and all they held are gone: heap ".into(),
     ]
 }
 
@@ -2611,6 +2626,32 @@ fn check() -> Result {
                 "warnings",
             ]))?;
         }
+        run_step(cargo().args(["test", "--package", package]))?;
+    }
+    // The services' logic: `no_std`, tested on the host until programs run it in ring 3 (ADR-0011
+    // N14 step 4). Clippy on the host (with tests) and, as a `no_std` build, for the kernel's
+    // target, then their tests.
+    for &package in SERVICE_LIBS {
+        run_step(cargo().args([
+            "clippy",
+            "--package",
+            package,
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
+        run_step(cargo().args([
+            "clippy",
+            "--package",
+            package,
+            "--lib",
+            "--target",
+            KERNEL_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
         run_step(cargo().args(["test", "--package", package]))?;
     }
     // The framework: its logic on the host (with tests), and for the kernel's own target.

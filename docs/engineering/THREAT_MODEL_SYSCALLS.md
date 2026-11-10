@@ -4,7 +4,7 @@
 |---|---|
 | Required by | CLAUDE.md §58 ("Threat-model every privileged interface"), §29, §30, §42 |
 | Covers | The way into the kernel from ring 3 and back (`framekernel/frame/src/cpu.rs`, `trap.rs`, `usercopy.rs`, `userspace.rs`); the calls (`framekernel/src/syscall.rs`, `handles.rs`, `ipc.rs`, `channel.rs`, `process.rs`, `wait.rs`); the decoder generated from `sdk/interfaces/origin.kernel.oidl` (`framekernel/syscalls`); ADR-0005 P1–P12 and Amendments 1–4 |
-| Written | 2026-11-10, against S3-1's code (c3ccacf). §58 and §83 expect a threat model during design; P4–P11 were designed and built without one, so this is written after them. S3-2's changes (a message's writer, handle records) are added in their own section, written with them, and S3-3's (process start) before its code. |
+| Written | 2026-11-10, against S3-1's code (c3ccacf). §58 and §83 expect a threat model during design; P4–P11 were designed and built without one, so this is written after them. S3-2's changes (a message's writer, handle records) are added in their own section, written with them, and S3-3's (process start) and S3-4's (the service directory) before their code. |
 | Evidence | QEMU only. Nothing has run on hardware (§74). The boot proofs named below are ADR-0013 rows: "ring-3 isolation", "per-processor control state", "IPC and handles" and "process and thread objects" all stop the boot when they fail. The IPC proof makes 117 hostile calls and checks each status. |
 
 ## What is being protected
@@ -136,12 +136,31 @@ ADR-0005 P6, as C4–C6 decide, and C1's inheritance of the principal. The ledge
 | P9 | Arguments or environment take unbounded kernel or user memory | At most 64 handles and 64 KiB per record, checked before anything is mapped | **Boot**, **Host**: a launch over 64 KiB is refused before anything is mapped; host tests of both limits to the byte |
 | P10 | DIRECTORY is a channel to whatever the creator chose | Intended: a creator decides what its child can reach (P1 of ADR-0005: no ambient authority). The service directory comes with S3-4 | **By design** |
 
+### The service directory (S3-4)
+
+ADR-0011 N9 and S9, as C11 and C12 decide: `origin.directory` 0.1, served by a process over the channel a program's start record names DIRECTORY. The directory is not in the kernel, but it is the only way a program finds services, so it is modelled here with the boundary it extends. The ledger is `docs/research/2026-11-10-service-directory.md`. Written before the code (§58, §83), then given the status the boot proof "the service directory", its controls (recorded for S3-4 in `SOURCE_PROVENANCE.md`) and the host tests of `services/directory` earned.
+
+| # | Threat | Defence | Status |
+|---|---|---|---|
+| D1 | A program reaches a service its launcher did not give it | Its only way to services is its DIRECTORY handle (N9; C5 retired SERVICE). A directory passes on only what its table holds, and its table comes from the launcher | **Host**: a key the table does not hold is `not_found`, and its end is closed. **Proven** (control 4) that the answer reaches a client in ring 3 as `not_found` |
+| D2 | A service claims a name to intercept other programs' clients (squatting) | Entries are keyed by interface ID and major and made by the launcher. `connect` is the only method, and it never changes the table | **Host**: a connect never changes the table, and a second provider for a key is refused |
+| D3 | A malformed connect, or a server end that is not a channel or lacks read, write, wait or transfer, reaches directory code | The generated stub checks the hello (`not_supported` for another interface or major), the message and the end's type and rights (`invalid_args`) before the directory runs, and the stub's caller closes the handles of a refused message (OIDL §7.5, §7.8) | **Host**: an end without `transfer`, or an event, never reaches the directory; a hello for another interface or major is `not_supported`; a connect before the hello closes the connection; the hostile corpus runs against `origin.directory`'s stub |
+| D4 | A directory poses as its client to the service, or reads what the client sends it | The client writes on the end the directory passed on; the end leaves the directory's table when it is passed, and an end with another reference cannot be passed at all (O4). The service sees each message stamped with its writer's identity (B1) | **Proven** (control 3): the service reads the client's request, written before any reply, stamped with the client's process and principal; a directory that passes on an end of its own, carrying a request it wrote, is caught by the stamp |
+| D5 | A directory hands a program a fake service (S9) | The launcher builds the directory. The service's replies are stamped with its identity, so the client can check who serves it | **Proven** (control 2): the client reads the service's reply stamped with the service's process, and a directory that keeps the end and answers for the service is caught. What the client checks it against is **Open** (step 4) |
+| D6 | The server end of a refused connect stays open, so the client waits for ever, or it stays in the directory | On `not_found` and `limit` the directory closes the end before it replies, and the client's end reports `PEER_CLOSED` | **Proven** (control 5): the `not_found` connection's end reports `PEER_CLOSED` in ring 3. **Host**: the end is closed for `not_found` and for `limit` |
+| D7 | A provider that stops reading makes the directory wait or grow | The directory never waits on a provider: an end it cannot pass on (a full queue, its own quota spent, a transfer the kernel refuses) is `limit`, closed, and nothing is kept past the call | **Host**: a provider that cannot take the end is `limit`, its end closed, and one that is gone is forgotten |
+| D8 | A client exhausts the directory | The table is bounded and filled by the launcher; a connect keeps nothing once it is answered; the kernel charges every queued message to its writer (O1) | **Host**: the table's bound is refused, and every end a connect is given is passed on or closed, once. Fairness between one directory's clients is its loop's, **Open** until step 4 |
+| D9 | A client gets a provider of another major than it asked for | The key includes the major, and the provider's own stub refuses a hello for another major on the passed end | **Host**: another major is another key. **Proven** (control 4): the connect for major 1 is `not_found` in ring 3 |
+| D10 | `not_found` tells a program what its directory holds | Intended: a directory is its program's own, built from what the program declared (N9), so it tells the program nothing it was not given | **By design** |
+| D11 | The back side: how a launcher fills a directory and how a provider receives connections | Not decided (step 4, ABI decisions then). The boot proof's arrangement, used by nothing else: the launcher writes the table on the directory's BOOTSTRAP, and the directory passes each connection on as a `connect` call on the provider's channel | **Open** |
+
 ## What must be closed
 
 Before any program that is not a boot proof runs in ring 3 (N14 step 4):
 1. **E8**, the per-call pin (Amendment 2, B2).
 2. **O2**, quotas on threads, processes and memory (P11), with the calls that create them.
 3. **I2**: a speculative-execution review against the declared processors.
+4. **D11**, the directory's back side, decided before the first directory that is a program runs.
 
 Before release: **E11** (CET) and **V2**.
 
@@ -151,3 +170,4 @@ Before release: **E11** (CET) and **V2**.
 - CERT/CC, Vulnerability Note VU#649219, the SYSRET return to a non-canonical address (2012): <https://www.kb.cert.org/vuls/id/649219>
 - Kocher et al., *Spectre Attacks: Exploiting Speculative Execution*, IEEE S&P 2019; Lipp et al., *Meltdown: Reading Kernel Memory from User Space*, USENIX Security 2018.
 - `docs/research/2026-11-10-caller-identity.md`, for the writer's identity S3-2 adds.
+- `docs/research/2026-11-10-start-record.md` and `docs/research/2026-11-10-service-directory.md`, for process start (S3-3) and the service directory (S3-4).

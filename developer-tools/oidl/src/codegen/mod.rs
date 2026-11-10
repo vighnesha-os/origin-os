@@ -89,3 +89,11 @@ pub fn generate_server(comp: &Compilation) -> Vec<Generated> {
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files
 }
+
+/// One `channel` library's bindings (`docs/spec/OIDL.md` §11), sorted by path; refused for an
+/// unknown or `syscall` library.
+pub fn generate_library(comp: &Compilation, name: &str) -> Result<Vec<Generated>, String> {
+    let mut files = rust::generate_library(comp, name)?;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}

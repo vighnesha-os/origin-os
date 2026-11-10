@@ -232,6 +232,7 @@ fn cases() -> Vec<(Code, Case)> {
         (NameCollision, Case::Sources(sys("/// e\nenum e: u8 { a_1 = 1; a1 = 2; }"))),
         (NameCollision, Case::Sources(sys("/// i\ninterface types {\n/// m\nmethod m = 1 () errors() requires none;\n}"))),
         (NameCollision, Case::Sources(sys(&one("method holds = 1 () errors() requires none;")))),
+        (NameCollision, Case::Sources(sys(&one("method transport = 1 () errors() requires none;")))),
         (DuplicateRole, Case::Sources(sys("/// s\nenum status: i64 { ok = 0; }"))),
         (DuplicateRole, Case::Sources(sys("/// r\nbits rights: u32 { a = 0; }"))),
         (DuplicateRole, Case::Sources(sys("/// o\nenum object_type: u32 { a = 1; }"))),
@@ -482,6 +483,7 @@ fn a_diagnostic_says_where_the_problem_is() {
 }
 
 const KERNEL: &str = include_str!("../../../../sdk/interfaces/origin.kernel.oidl");
+const DIRECTORY: &str = include_str!("../../../../sdk/interfaces/origin.directory.oidl");
 const ECHO: &str = include_str!("../../tests/fixtures/echo.oidl");
 const CALLS: &str = include_str!("../../tests/fixtures/calls.oidl");
 
@@ -492,6 +494,7 @@ const VERSIONS: &str = include_str!("../../../../origin-version.toml");
 fn good_inputs() -> Vec<Input> {
     [
         ("origin.kernel.oidl", KERNEL),
+        ("origin.directory.oidl", DIRECTORY),
         ("echo.oidl", ECHO),
         ("calls.oidl", CALLS),
     ]
@@ -506,7 +509,7 @@ fn good_inputs() -> Vec<Input> {
 #[test]
 fn the_shipped_definitions_compile() {
     let comp = compile(&good_inputs(), Some(VERSIONS)).expect("valid");
-    assert_eq!(comp.libraries.len(), 3);
+    assert_eq!(comp.libraries.len(), 4);
     assert!(comp.status.is_some());
     assert!(comp.rights.is_some());
     assert!(comp.object_type.is_some());

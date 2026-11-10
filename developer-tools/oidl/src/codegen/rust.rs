@@ -33,6 +33,9 @@ enum Side {
     Everything,
     /// The server side alone, at the top of the output directory.
     Server,
+    /// One channel library's server and client, at the top of the output directory, with only
+    /// the types of the libraries it uses.
+    Library,
 }
 
 impl Side {
@@ -40,7 +43,7 @@ impl Side {
     const fn top(self) -> &'static str {
         match self {
             Self::Everything => "rust/",
-            Self::Server => "",
+            Self::Server | Self::Library => "",
         }
     }
 }
@@ -2644,8 +2647,10 @@ fn gen_channel_client(g: &Gen<'_>, interface: &Interface) -> String {
     t.shut("}");
     t.blank();
     t.open(format!("impl<T: rt::Transport> {name}<T> {{"));
-    t.line("/// Runs the hello (§7.7).");
-    t.open("pub fn connect(mut transport: T, scratch: &mut rt::Scratch<'_>) -> Result<Self, rt::CallError<core::convert::Infallible>> {");
+    // `new`, a C++ keyword and so never a method's name (§2): any other name would take one from
+    // the interfaces.
+    t.line("/// Runs the hello (§7.7), and on success is the connection.");
+    t.open("pub fn new(mut transport: T, scratch: &mut rt::Scratch<'_>) -> Result<Self, rt::CallError<core::convert::Infallible>> {");
     t.line("let oidl_hello = rt::Hello { interface_id: INTERFACE_ID, major: VERSION.0, minor: VERSION.1 };");
     t.line("let oidl_total = rt::write_hello(scratch.bytes, rt::KIND_REQUEST, 1, oidl_hello).map_err(rt::CallError::Protocol)?;");
     t.line("let (oidl_n, oidl_h) = transport.call(scratch.bytes, oidl_total, &[], scratch.received).map_err(rt::CallError::Transport)?;");
@@ -2841,7 +2846,8 @@ fn gen_library(comp: &Compilation, lib: &Library, side: Side, files: &mut Vec<Ge
             path: format!("{dir}/server.rs"),
             text: format!("{HEADER}{server}"),
         });
-        if side == Side::Everything {
+        // A library crate is made only for a channel library, whose client needs no shim.
+        if side != Side::Server {
             module_text.line("pub mod client;");
             match lib.transport {
                 Transport::Syscall => {
@@ -3072,7 +3078,8 @@ fn corpus_path(ty: &str, module_name: &str) -> String {
 
 /// Every Rust file.
 pub fn generate(comp: &Compilation) -> Vec<Generated> {
-    let mut files = gen_crate(comp, Side::Everything);
+    let all: Vec<&Library> = comp.libraries.iter().collect();
+    let mut files = gen_crate(comp, Side::Everything, &all, None);
     files.push(Generated {
         path: "rust/bin/corpus_check.rs".to_string(),
         text: format!("{HEADER}{}", gen_corpus_check(comp)),
@@ -3084,10 +3091,52 @@ pub fn generate(comp: &Compilation) -> Vec<Generated> {
 /// and the server modules, with no client, no C entry points and so no `unsafe` at all. The
 /// compiler holds it to that: its root is `forbid(unsafe_code)`.
 pub fn generate_server(comp: &Compilation) -> Vec<Generated> {
-    gen_crate(comp, Side::Server)
+    let all: Vec<&Library> = comp.libraries.iter().collect();
+    gen_crate(comp, Side::Server, &all, None)
 }
 
-fn gen_crate(comp: &Compilation, side: Side) -> Vec<Generated> {
+/// One `channel` library's bindings (`docs/spec/OIDL.md` §11), as a crate of its own: the
+/// runtime, the library's types, and each of its interfaces' server and client; of the libraries
+/// it uses, directly or not, only their types. A channel client needs no shim, so there is no
+/// `unsafe` at all, and the root is `forbid(unsafe_code)`. Refused for a library that is not
+/// among the definitions, and for a `syscall` library, whose client is the shims.
+pub fn generate_library(comp: &Compilation, name: &str) -> Result<Vec<Generated>, String> {
+    let Some(selected) = comp.libraries.iter().find(|lib| lib.name == name) else {
+        return Err(format!("{name} is not among the definitions given"));
+    };
+    if selected.transport != Transport::Channel {
+        return Err(format!(
+            "{name} is a syscall library: its client is the C-ABI shims, which only the full output writes"
+        ));
+    }
+    // What it uses, directly or not. `libraries` lists each after every library it uses, so one
+    // pass from the end finds them all.
+    let mut wanted = vec![name];
+    for lib in comp.libraries.iter().rev() {
+        if wanted.contains(&lib.name.as_str()) {
+            for used in &lib.uses {
+                if !wanted.contains(&used.as_str()) {
+                    wanted.push(used.as_str());
+                }
+            }
+        }
+    }
+    let included: Vec<&Library> = comp
+        .libraries
+        .iter()
+        .filter(|lib| wanted.contains(&lib.name.as_str()))
+        .collect();
+    Ok(gen_crate(comp, Side::Library, &included, Some(name)))
+}
+
+/// A crate of `libraries`: in full where `selected` is `None` or names it, otherwise only its
+/// types.
+fn gen_crate(
+    comp: &Compilation,
+    side: Side,
+    libraries: &[&Library],
+    selected: Option<&str>,
+) -> Vec<Generated> {
     let top = side.top();
     let mut files = vec![Generated {
         path: format!("{top}oidl_rt.rs"),
@@ -3099,13 +3148,13 @@ fn gen_crate(comp: &Compilation, side: Side) -> Vec<Generated> {
     root.line("#![no_std]");
     root.line(match side {
         Side::Everything => "#![deny(unsafe_op_in_unsafe_fn)]",
-        Side::Server => "#![forbid(unsafe_code)]",
+        Side::Server | Side::Library => "#![forbid(unsafe_code)]",
     });
     root.blank();
     // What the tool wrote is what is committed and compared, so rustfmt leaves it alone.
     root.line("#[rustfmt::skip]");
     root.line("pub mod oidl_rt;");
-    for lib in &comp.libraries {
+    for lib in libraries {
         root.line("#[rustfmt::skip]");
         root.line(format!("pub mod {};", module(&lib.name)));
     }
@@ -3113,8 +3162,35 @@ fn gen_crate(comp: &Compilation, side: Side) -> Vec<Generated> {
         path: format!("{top}lib.rs"),
         text: format!("{HEADER}{}", root.finish()),
     });
-    for lib in &comp.libraries {
-        gen_library(comp, lib, side, &mut files);
+    for lib in libraries {
+        if selected.is_none_or(|name| name == lib.name) {
+            gen_library(comp, lib, side, &mut files);
+        } else {
+            gen_types_only(comp, lib, side, &mut files);
+        }
     }
     files
+}
+
+/// A used library in a library crate: its types, and none of its interfaces.
+fn gen_types_only(comp: &Compilation, lib: &Library, side: Side, files: &mut Vec<Generated>) {
+    let m = module(&lib.name);
+    let g = Gen { comp, lib };
+    let top = side.top();
+    let mut root = Text::default();
+    root.line(format!(
+        "//! `{}`'s types, generated from its definition. Its interfaces are not part of this crate.",
+        lib.name
+    ));
+    root.blank();
+    root.line("pub mod types;");
+    root.line("pub use types::*;");
+    files.push(Generated {
+        path: format!("{top}{m}/mod.rs"),
+        text: format!("{HEADER}{}", root.finish()),
+    });
+    files.push(Generated {
+        path: format!("{top}{m}/types.rs"),
+        text: format!("{HEADER}{}", gen_types(&g)),
+    });
 }
