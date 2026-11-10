@@ -148,6 +148,16 @@ Errata **V1–V6 and O2–O5** were decided by the owner on 2026-11-08, along wi
 
 For the host signer the owner accepted best-effort zeroization of development keys (2026-11-08); release keys belong in an HSM.
 
+On 2026-11-10 the owner accepted decision items 71–96 and delegated item 97 to Claude (CLAUDE.md revision 7.3). Nothing in them is built.
+
+- **ADR-0014:** Origin Server, an edition of the same release with the full native desktop.
+- **ADR-0015:** every device standard through the SDK.
+- **ADR-0002 Amendment 1:** Origin-owned Secure Boot keys by default.
+- **ADR-0009 Amendment 1:** Intel 2026+ and AMD 2026+ with Zen 5 or newer. The kernel will name the core generation at boot and never refuse.
+- **References:** Linux and other open-source code are read for gaps, or for a named reason where vendor documents already cover a topic (item 97). Never copied, and always at today's version (CLAUDE.md §3).
+
+Still the owner's from those: a trademark search for the name (item 77) and turning on GitHub's private vulnerability reporting (item 79).
+
 Both AMD manuals the kernel's AMD code was written from (48882 Rev 3.11, 24594 Rev 3.39) were read from a mirror and are confirmed byte-identical to AMD's own copies (2026-11-08). Still the owner's, because they are not design: merging PR #1 into `main`; and buying the physical x86 test machines. **ADR-0009** declares what "introduced in 2026 or later" covers and chooses the first two (Claude decided, at the owner's request); nothing has been bought, and nothing is qualified on hardware until those machines have run (CLAUDE.md §74, §76). Details: `docs/engineering/TASKS.md`.
 
 ## Where the evidence is

@@ -2,9 +2,9 @@
 
 | | |
 |---|---|
-| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). |
-| Date | 2026-11-07 |
-| Owner decisions still open | B7, the boot trust anchor (carried over from ADR-0001). The other items are proposals the owner may change. |
+| Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). B7's default was changed by Amendment 1, accepted by the owner on 2026-11-10 (decision sheet item 78). |
+| Date | 2026-11-07; Amendment 1 2026-11-10 |
+| Owner decisions still open | None. B7, carried over from ADR-0001, was decided on 2026-11-07 and amended on 2026-11-10. |
 | Implements | CLAUDE.md §19 (UEFI boot chain), §20 (boot manager, later), §58 (Secure Boot), ONBF §8.1 (chain of trust) |
 | Code | `boot/info` (`origin-boot-info`), `boot/uefi` (`origin-boot-uefi`), `framekernel/`, `developer-tools/onbf-pack` |
 
@@ -86,7 +86,7 @@ After that, the loader calls nothing in the firmware.
 - The firmware's identity mapping stays active. The kernel then installs its own page tables (M2, done 2026-11-07): it sets EFER.NXE and CR0.WP and loads CR3, then proves the protections with four deliberate faults: a write to code, a write to read-only data, a fetch from writable data and a read of page 0.
 - If the kernel ever returns, the loader halts the CPU.
 
-### B7. Boot trust anchor (decided 2026-11-07)
+### B7. Boot trust anchor (decided 2026-11-07; default order reversed by Amendment 1, 2026-11-10)
 **Both, in this order of preference for shipping:**
 1. **Default: a first stage signed under Microsoft UEFI CA 2023.** A minimal first-stage loader carries the Microsoft signature so Origin boots on stock PCs with Secure Boot on. That stage trusts nothing but Origin's own release keys: it verifies the Origin loader and every later stage with the ONBF hybrid suite (Ed25519 + ML-DSA-87, ADR-0001 D3), so Microsoft's key vouches only for the first stage. The annual audit the CA requires is a cost to plan for.
 2. **Supported: Origin-owned machines.** OEMs and users may enroll Origin's keys in the firmware's `db` (and remove others), which drops the Microsoft link entirely; the same Origin chain applies from the first stage on.
@@ -106,3 +106,34 @@ Developer mode is a build feature, never a runtime choice. A developer-mode load
 - The kernel binary is a static-PIE ELF converted by `onbf-pack`. The loader never parses ELF (ADR-0001 D1).
 - QEMU + OVMF proves this path end to end. Physical hardware is still unproven (CLAUDE.md §74).
 - The kernel's signature is verified (B2 step 3), but no protection against physical tampering exists yet: there is no release key, and the loader itself is not checked until B7's first stage exists.
+
+## Amendment 1 (2026-11-10): Origin-owned keys first
+
+*Accepted by the owner on 2026-11-10, as recommended (decision sheet item 78; CLAUDE.md §18, §19, §58).*
+
+**Change.** B7's two shipping paths swap order. **The default is now B7 item 2:** users and OEMs enroll Origin's keys in the firmware's `db`. The Microsoft-signed first stage (B7 item 1) stays the plan, and it starts once an organisation exists that can hold the signature.
+
+**Why.** Getting a first stage signed under Microsoft's third-party UEFI CA takes three things a public open-source project run by one person cannot provide today:
+
+- **A Partner Center account and an EV code-signing certificate.** Microsoft's published UEFI signing requirements ask for both ([Microsoft, 2021](https://techcommunity.microsoft.com/blog/hardwaredevcenter/updated-uefi-signing-requirements/1062916)). EV certificates are issued to organisations, not individuals.
+- **An annual security audit.** Since October 2025, submitters to the third-party CA must pass one every year, run by an independent partner Microsoft approves. Microsoft's page lists this under "Coming soon" ([Microsoft, posted 2025-09-21, updated 2026-06-26](https://techcommunity.microsoft.com/t5/hardware-dev-center/signing-with-the-new-2023-microsoft-uefi-certificates-what/ba-p/4455787)).
+- **No shim exemption for Origin.** Shim submissions avoid the separate audit through the shim review board, but shipping `shim` would put third-party boot code in Origin's chain (§3).
+
+The 2011 CA expired in June 2026, so only the 2023 CA matters ([Microsoft](https://support.microsoft.com/help/5062710)).
+
+**Alternatives.**
+
+| Alternative | Why not |
+|---|---|
+| Keep B7 as decided | The default would depend on a signature the project cannot obtain yet |
+| Ship `shim` | Breaks §3 |
+| Drop the Microsoft path for good | Most PCs could then never boot Origin without a firmware change. B7 rejected this, and nothing has changed that |
+
+**Consequences.**
+
+- On most PCs, booting Origin with Secure Boot on means putting the firmware into its custom key mode and enrolling Origin's keys. Secured-core PCs were already in that position (B7). The installer must guide this step (§21, §22). It is not yet built.
+- Enrolment needs Origin's own release keys, which do not exist yet (TASKS item 6: the signing ceremony, §60).
+- Developer mode (B8) is unchanged.
+- B7's first stage is still worth building small and stable, because the same first stage is what Microsoft would later sign.
+
+**Migration.** Nothing built changes: neither path exists yet. CLAUDE.md §19 says which path is the default (revision 7.3).

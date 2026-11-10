@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| As of | 2026-11-09, on `main`, after the pre-merge review. Everything that was on a side branch is merged. |
-| Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
+| As of | 2026-11-10 for items 71–97. Items up to 70: 2026-11-09, after the pre-merge review. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. |
-| Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–97 (item 97 delegated to Claude). |
+| Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do (see the last section). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -208,7 +208,68 @@ What this means in practice:
 - Merge commits from `main` don't count toward the 100, and nothing is padded to reach it (CLAUDE.md §7).
 - Merging still takes the owner's word.
 
-**Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.
+**Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists and an organisation can hold the signature (Amendment 1, item 78); USB-IF and Thunderbolt licensing (§35), when that work starts.
+
+## Editions, device standards and the public repository (ADR-0014, ADR-0015, ADR-0002 Amendment 1): Accepted 2026-11-10, nothing built
+
+On 2026-11-10 you said you are building a Desktop and a Server OS. You want:
+
+- both with the native GUI, "not terminal";
+- the server running the full native desktop;
+- the kernel, NVMe, USB4, Thunderbolt 4/5, Wi-Fi 6/7 and Bluetooth "with all features as Native SDK".
+
+Claude recommended these seventeen items, each checked against CLAUDE.md v7.2. Items 1–5 were revised twice as your direction became clearer. You answered **"Accept all"** in the same session. They are recorded in CLAUDE.md revision 7.3.
+
+| # | Question | Answer |
+|---|---|---|
+| 71, answered | Server is an edition of the same release and installs the full desktop by default; editions differ only in defaults (ADR-0014 S1)? | **Accept** |
+| 72, answered | Desktop through M9 first; server-only work after M9 (S2)? | **Accept** |
+| 73, answered | The first server platform is a KVM guest with its GUI on the VM's display; physical servers later on 2026 platforms (S3)? | **Accept** |
+| 74, answered | Administration only through the native GUI (console, management app, remote desktop); remote desktop built before the server ships; no terminal needed; no web administration page (S4)? | **Accept** |
+| 75, answered | Server sessions cheap and closed: login screen only when idle, unprivileged, nothing in the UI listening on a network (S5)? | **Accept** |
+| 76, answered | Software written for other systems decided later: Rust `std` first, a POSIX library only through its own ADR at M6 (S6)? | **Accept** |
+| 77, answered | A trademark search for the product name before the first public release (CLAUDE.md §76)? vivo has shipped "OriginOS" worldwide since 2025-10-15. | **Accept.** The search is yours to arrange |
+| 78, answered | Secure Boot defaults to Origin-owned keys; the Microsoft-signed first stage waits for an organisation (ADR-0002 Amendment 1)? This reverses B7's default order of 2026-11-07, which Claude had not pointed out when recommending it. | **Accept** |
+| 79, answered | Add `CONTRIBUTING.md` (DCO sign-off, an original-source declaration), `SECURITY.md` and `CODEOWNERS` (CLAUDE.md §6)? | **Accept.** Turning on GitHub's private vulnerability reporting is a repository setting, so it is yours |
+| 80, answered | DisplayPort first; read the Thunderbolt licence before its specification; keep restricted documents out of Git (ADR-0015 D7)? | **Accept** |
+| 81, answered | Add remote administration, service management, hardware health and remote desktop to §49 (ADR-0014 S7)? | **Accept** |
+| 82, answered | Three typed layers per device technology (class, the whole standard, documented vendor extras), with each device reporting its features truthfully (ADR-0015 D1, D2)? | **Accept** |
+| 83, answered | Separate rights for dangerous operations; raw access for administrator diagnostics only; unprivileged radio stacks; fuzzed parsers (D3, D4)? | **Accept** |
+| 84, answered | Thunderbolt 4/5 inside the USB4 interface; the name only after certification (D5)? | **Accept** |
+| 85, answered | Wi-Fi and Bluetooth drivers wait for vendor documentation or an approved clean-room ADR; host stacks first; licensing and regulation checked before shipping (D6)? | **Accept** |
+| 86, answered | Add IEEE 802.11-2024 with 802.11be, and Bluetooth Core 6.2 or later, to §17 (D8)? | **Accept** |
+| 87, answered | NVMe and xHCI first; USB4, Thunderbolt, Wi-Fi and Bluetooth at M10 on physical hardware (D9)? | **Accept** |
+
+**Yours to do:** the trademark search (item 77), and turning on private vulnerability reporting under the repository's Settings → Security (item 79).
+
+## A strict hardware scope (ADR-0009 Amendment 1): Accepted 2026-11-10, nothing built
+
+You asked for a strict rule: "we are building for 2026+ hardware and in AMD Zen5 and Zen5+ / For Intel also 2026+ hardware". Then, since a CPU reports no year, you asked whether Panther Lake, Nova Lake, Zen 5, Zen 6 and so on could be checked instead. Claude checked the CPUID family and model numbers and recommended these. You answered **"Accept all"**.
+
+| # | Question | Answer |
+|---|---|---|
+| 88, answered | The scope: Intel platforms launched in 2026 or later; AMD platforms launched in 2026 or later with Zen 5 or newer cores; everything else is bench equipment only (A1)? Zen 5 itself launched in 2024. Counting Zen 5 from any year was offered and not chosen. | **Accept** |
+| 89, answered | The kernel names the core generation from CPUID (AMD family 1Ah or higher; Intel family 18 or higher, or family 6 model CCh, D5h, DDh or E5h), from one table built from Intel's and AMD's documents, and reports the scope at boot without ever refusing to boot (A2)? | **Accept** |
+| 90, answered | At M9, decide whether the production installer warns on or refuses machines outside the scope, with developer builds exempt (A3)? | **Accept**, to be decided at M9 |
+
+## Linux and other open-source code as a reference only (CLAUDE.md §3, §6, §16): decided by the owner 2026-11-10
+
+Claude had proposed five items allowing Linux drivers to be studied for how they handle hardware. You narrowed that in your own words: "in any case if need to refer Linux code that should be completely as reference, Don't copy just to understand if anything missing from Vendor or official specifications or standards". That replaces Claude's proposal.
+
+| # | Question | Answer |
+|---|---|---|
+| 91, answered | When may Linux source be read? | **Only as a reference, to understand what the vendor's documents or the official specifications and standards leave out. Never copied** (your rule, 2026-11-10) |
+| 92, answered | So that code is never written with Linux source open: the reading step writes the missing facts into Origin's specification or research ledger in Origin's own words, citing file, commit and licence; the code is then written from that, in a separate session, without the Linux source? | **Yes, as recommended** ("keep 92 as before you said", 2026-11-10). Claude writes Origin's code and was trained on Linux's code, so this split is what keeps "don't copy" true. It is also the clean-room process ADR-0015 D6 asked for |
+| 93, answered | Record per driver which Linux files were consulted, their licence, and which gap each one filled (§6)? | **Yes** ("accept 93", 2026-11-10) |
+
+You then asked whether public sources, Linux and other open-source operating systems, Ubuntu included, could cover these drivers without spending, as of today rather than from Claude's training data. You answered **"Accept all"** to these.
+
+| # | Question | Answer |
+|---|---|---|
+| 94, answered | Extend items 91–93 to other open-source projects on the same terms (gaps only, never copied, Origin's own specification first, licence recorded)? <br>• **Ubuntu:** its kernel patches, packaged firmware and user-space stacks such as wpa_supplicant, BlueZ and fwupd. <br>• **Others:** the BSDs, Haiku, Redox, Fuchsia, illumos, EDK2, coreboot, SeaBIOS, QEMU's device models, SPDK, `libspdm`, Zephyr and NimBLE. <br>• **Excluded:** ReactOS (§3 names it, and it reimplements Windows). Leaked or proprietary code is never opened. | **Accept** |
+| 95, answered | The source order, with no spending: free official specifications and vendor documents first; then open-source code the vendor wrote itself (EDK2, SPDK, `libspdm`, Intel's Linux drivers); then other open-source systems? The paid PCIe specification stays unread, and a feature with no free legitimate source is reported "not supported" (ADR-0015 D2). | **Accept** |
+| 96, answered | Always today's version: read each reference from the newest release on the day (on 2026-11-10 that was Linux 7.4-rc2 or 7.3.3, and Ubuntu 26.10 or 26.04.1 LTS); record its tag or commit and the date; re-check specification revisions the same day; never rely on Claude's memory of older code? | **Accept** |
+| 97, answered | Where vendor documents already cover a topic, may Linux (or another allowed project) still be read? | **Delegated to Claude**: "If vendor fie already covers, then your choice why do you want to read, take decision appropriately" (2026-11-10). <br>**Claude's decision:** only for a named reason, recorded with the reference (§6): <br>• device quirks, errata workarounds or firmware behaviour the documents do not describe; <br>• a specification ambiguity, where interoperability depends on how deployed systems read it; <br>• research into what Linux supports; <br>• debugging a difference between Origin and Linux on the same hardware. <br>Never just to see how Linux structured something the documents already explain: Origin's design differs, so that adds copying risk and nothing else. Items 92, 93 and 96 still apply. In CLAUDE.md §3 |
 
 ## ADR-0004 H2: the heap, the stacks and the probe page (Accepted 2026-11-10)
 
