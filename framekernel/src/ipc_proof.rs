@@ -1566,15 +1566,6 @@ fn copy_fault_recovered(com1: &mut Console) -> bool {
 
 // ------------------------------------------------------------------ process and thread objects
 
-/// The rights a process handle carries (ADR-0005 C6).
-const PROCESS_RIGHTS: u32 = rights::READ
-    | rights::WRITE
-    | rights::MANAGE
-    | rights::WAIT
-    | rights::DUPLICATE
-    | rights::TRANSFER;
-/// The rights a thread handle carries (ADR-0005 C6).
-const THREAD_RIGHTS: u32 = rights::WAIT | rights::MANAGE | rights::DUPLICATE | rights::TRANSFER;
 /// Where a second thread's script starts, on the script pages.
 const SECOND_SCRIPT: u64 = SCRIPT + SCRIPT_PAGES * PAGE / 2;
 
@@ -1629,11 +1620,11 @@ fn object_types(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let granted = (
         prober
             .process
-            .grant(Object::Process(target.clone()), PROCESS_RIGHTS),
+            .grant(Object::Process(target.clone()), rights::PROCESS),
         prober
             .process
             .grant(Object::Process(target.clone()), rights::READ),
-        prober.process.grant(Object::Thread(thread), THREAD_RIGHTS),
+        prober.process.grant(Object::Thread(thread), rights::THREAD),
     );
     let (Ok(process_handle), Ok(read_only), Ok(thread_handle)) = granted else {
         return false;
@@ -1714,7 +1705,7 @@ fn process_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_
         };
         let Ok(held) = waiter
             .process
-            .grant(Object::Process(ender.clone()), PROCESS_RIGHTS)
+            .grant(Object::Process(ender.clone()), rights::PROCESS)
         else {
             return false;
         };
@@ -1819,7 +1810,7 @@ fn thread_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_h
     else {
         return false;
     };
-    let Ok(value) = process.grant(Object::Thread(thread), THREAD_RIGHTS) else {
+    let Ok(value) = process.grant(Object::Thread(thread), rights::THREAD) else {
         return false;
     };
     if !write_slot(&process, 3, value)
@@ -1962,7 +1953,7 @@ fn cancel_on_any_object(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, ts
         let (Ok(held), Ok(carrier), Ok(_)) = (
             image
                 .process
-                .grant(Object::Process(never_runs.clone()), PROCESS_RIGHTS),
+                .grant(Object::Process(never_runs.clone()), rights::PROCESS),
             image.process.grant(Object::Channel(a), rights::CHANNEL),
             image.process.grant(Object::Channel(b), rights::CHANNEL),
         ) else {
