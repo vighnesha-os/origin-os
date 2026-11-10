@@ -153,7 +153,7 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 | 106 | Read revision 7.4's wording, and say whether the records pull request may merge | CLAUDE.md 7.4, ADR-0014, ADR-0015 and items 71–123 reaching `main` |
 | 122 | Confirm ADR-0009's text, which was delegated and not reviewed, and ADR-0007's two additions marked "for the owner's review" | Their acceptance being the owner's own (§18) |
 | 121 | Name the person who signs off the first driver written from reference reading, when one exists | Publishing that driver (CLAUDE.md §3) |
-| 151 | Nothing to decide: you accepted pinning SP 800-90A Rev. 1 and SP 800-90B and adding SP 800-90C and FIPS 198-1 to CLAUDE.md §17. The directive is your text, so the wording reaches you with its next revision | §17 naming the revisions ADR-0016 is built on |
+| 149, 151 | Nothing new to decide: you accepted both with ADR-0016. Their wording for CLAUDE.md §59 and §17 is in draft 7.4 on `docs/design-review-2026-11-10` (`44de977`), not on this branch, and reaches `main` on your word with that draft's pull request (item 106) | The directive naming the standards ADR-0016 is built on, and saying what its health tests are |
 
 ## Task contracts (CLAUDE.md §78; decision item 122)
 
