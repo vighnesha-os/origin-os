@@ -323,7 +323,7 @@ Checked against the tree at `2fbaea6`.
 ## 8. Method, and what went wrong
 
 - **Reading.** PDFs were fetched by `curl` into a pipe, parsed in memory with `pypdf`, and searched there; nothing was written to disk. AMD's manual Volume 2 was read from the owner's local copy after its hash matched AMD's. Pages on `intel.com` and `amd.com` were read in the desktop app's browser, because both sites refuse a plainly named command-line reader and that refusal was not worked around.
-- **Three pages of A3** hold their text as pictures. They were drawn to PNG files in the session's scratch directory, read, and are deleted with it.
+- **Three pages of A3** hold their text as pictures. They were drawn to PNG files in the session's scratch directory, read, and deleted.
 - **A save dialog.** Opening A3's address in the browser made the browser offer to save the file. Nothing was saved by this session, and the address was not opened again.
 - **A cached copy.** The web-fetch tool, tried on A3 once, kept a copy of the PDF in its own results folder outside the repository. It was deleted at once.
 - **No operating system's source** was opened. Intel's own pages name Linux in places; nothing here rests on those passages.
