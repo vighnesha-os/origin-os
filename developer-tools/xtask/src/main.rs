@@ -1697,6 +1697,173 @@ fn stack_window_lines(serial: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The start of the kernel stacks proof's line about the region's base: a boot that printed it
+/// placed the region, so its base can be read (A6.4).
+const STACK_PROOF_LINE: &str = "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned";
+
+/// Where each full kernel boot records the base it placed the kernel stacks' region at, read
+/// through QEMU's monitor (ADR-0004 Amendment 2, A6.4). `boot-matrix` empties it and then checks
+/// that its boots placed the region apart. The kernel prints nothing of a base; this file is the
+/// host's, and nothing prints it.
+fn stack_bases_file() -> PathBuf {
+    target_dir().join("xtask").join("stack-region-bases")
+}
+
+/// The kernel's physical base, from its boot line `loaded at … (physical 0x…)`.
+fn kernel_physical_base(serial: &str) -> Option<u64> {
+    let line = serial
+        .lines()
+        .find(|l| l.starts_with("origin-kernel: loaded at "))?;
+    let from = line.find("(physical 0x")? + "(physical 0x".len();
+    let digits = line.get(from..)?;
+    let end = digits.find(|c: char| !c.is_ascii_hexdigit())?;
+    u64::from_str_radix(digits.get(..end)?, 16).ok()
+}
+
+/// The value of the first symbol whose name contains `part` in the ELF64 image `elf`. Only the
+/// section headers, the symbol tables and their string tables are read; any other shape gives
+/// `None`. The kernel is linked at 0, so a symbol's value is its RVA (`onbf-pack`).
+fn elf_symbol(elf: &[u8], part: &str) -> Option<u64> {
+    let bytes = |at: u64, n: usize| elf.get(usize::try_from(at).ok()?..)?.get(..n);
+    let u16_at = |at: u64| bytes(at, 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let u32_at = |at: u64| bytes(at, 4)?.try_into().ok().map(u32::from_le_bytes);
+    let u64_at = |at: u64| bytes(at, 8)?.try_into().ok().map(u64::from_le_bytes);
+    if elf.get(..5)? != b"\x7fELF\x02" {
+        return None;
+    }
+    let (table, entry, count) = (u64_at(0x28)?, u64::from(u16_at(0x3A)?), u16_at(0x3C)?);
+    let section = |i: u64| table.checked_add(i.checked_mul(entry)?);
+    (0..u64::from(count)).find_map(|i| {
+        let header = section(i)?;
+        if u32_at(header + 4)? != 2 {
+            return None;
+        }
+        let (symbols, size) = (u64_at(header + 24)?, u64_at(header + 32)?);
+        let strings = u64_at(section(u64::from(u32_at(header + 40)?))? + 24)?;
+        (0..size / 24).find_map(|k| {
+            let symbol = symbols.checked_add(k * 24)?;
+            let name = elf.get(usize::try_from(strings + u64::from(u32_at(symbol)?)).ok()?..)?;
+            let name = name.get(..name.iter().position(|&b| b == 0)?)?;
+            std::str::from_utf8(name)
+                .ok()?
+                .contains(part)
+                .then(|| u64_at(symbol + 8))?
+        })
+    })
+}
+
+/// Reads the base this boot placed the kernel stacks' region at, out of the halted kernel's
+/// memory through QEMU's monitor, which the scenario has switched to (A6.4). The word is the
+/// framework's `STACK_REGION_BASE`: the kernel's physical base, from its boot line, plus the
+/// symbol's RVA in the kernel ELF. `rx` brings QEMU's output. Only a base a draw can give is
+/// accepted: 2 MiB-aligned, the whole region in its window, and not the fixed base.
+fn read_stack_base(
+    monitor: &mut ChildStdin,
+    rx: &mpsc::Receiver<Vec<u8>>,
+    serial: &str,
+) -> Result<u64> {
+    use framekernel::paging::layout::{STACK_REGION, is_stack_region_base};
+    let path = target_dir()
+        .join(KERNEL_TARGET)
+        .join("release")
+        .join(KERNEL_PACKAGE);
+    let elf = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let rva = elf_symbol(&elf, "STACK_REGION_BASE")
+        .ok_or("the kernel ELF has no STACK_REGION_BASE symbol")?;
+    let physical =
+        kernel_physical_base(serial).ok_or("the kernel's boot line gives no physical base")?;
+    let addr = physical
+        .checked_add(rva)
+        .ok_or("the word's physical address overflows")?;
+    monitor
+        .write_all(format!("xp /1gx {addr:#x}\n").as_bytes())
+        .and_then(|()| monitor.flush())
+        .map_err(|e| format!("cannot write to the monitor: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    loop {
+        let chunk = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| format!("the monitor did not answer xp at {addr:#x}"))?;
+        out.extend_from_slice(&chunk);
+        let text = String::from_utf8_lossy(&out);
+        // Split at newlines only: a whole answer line keeps the carriage return QEMU ends it with.
+        let Some(digits) = text.split('\n').find_map(|line| xp_answer(line, addr)) else {
+            continue;
+        };
+        // Only a whole number: the line goes on past its last digit.
+        let Some(end) = digits.find(|c: char| !c.is_ascii_hexdigit()) else {
+            continue;
+        };
+        let base = u64::from_str_radix(&digits[..end], 16)
+            .map_err(|e| format!("the monitor's answer is not a number: {e}"))?;
+        if !is_stack_region_base(base) || base == STACK_REGION {
+            return Err("the word read is not a base a draw can give".into());
+        }
+        return Ok(base);
+    }
+}
+
+/// The digits of the word `xp` printed for `addr`, from its answer line `<addr>: 0x<word>`. QEMU
+/// pads the address to a width of its own choosing (8 digits below 4 GiB with QEMU 11.1), and its
+/// line editor leaves escape codes before it, so the address is matched by value: the last run of
+/// hexadecimal digits before the colon.
+fn xp_answer(line: &str, addr: u64) -> Option<&str> {
+    let (left, right) = line.split_once(": 0x")?;
+    let digits = left.rsplit(|c: char| !c.is_ascii_hexdigit()).next()?;
+    (u64::from_str_radix(digits, 16).ok()? == addr).then_some(right)
+}
+
+/// Appends this boot's base to the file `boot-matrix` compares (A6.4).
+fn record_stack_base(label: &str, base: u64) -> Result {
+    let path = stack_bases_file();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| writeln!(file, "{label}\t{base:#x}"))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// How many boots `recorded` (the lines of [`stack_bases_file`]) holds, if each placed the kernel
+/// stacks' region at a base no other did (A6.4).
+fn stack_bases_apart(recorded: &str) -> Result<usize> {
+    let bases: Vec<&str> = recorded
+        .lines()
+        .filter_map(|line| line.split('\t').nth(1))
+        .collect();
+    let distinct: std::collections::HashSet<&str> = bases.iter().copied().collect();
+    if distinct.len() != bases.len() {
+        return Err(format!(
+            "the kernel stacks' region was at {} distinct bases in {} boots: boots placed it alike",
+            distinct.len(),
+            bases.len()
+        ));
+    }
+    Ok(bases.len())
+}
+
+/// As [`stack_bases_apart`], and there are at least two boots to compare: the end of
+/// `boot-matrix`.
+fn distinct_stack_bases(recorded: &str) -> Result<usize> {
+    let boots = stack_bases_apart(recorded)?;
+    if boots < 2 {
+        return Err(format!(
+            "{boots} boot(s) recorded where they placed the kernel stacks' region: nothing to compare"
+        ));
+    }
+    Ok(boots)
+}
+
+/// Fails `boot-matrix` as soon as two of its boots so far placed the kernel stacks' region alike.
+fn check_stack_bases_so_far(path: &Path) -> Result {
+    let recorded = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    stack_bases_apart(&recorded).map(drop)
+}
+
 /// The screen after a whole boot: exactly what the serial log says it must show (the
 /// console writes one line at a time to both).
 fn check_screen(done: &Completed) -> Result {
@@ -2176,6 +2343,11 @@ fn boot_test_child(exe: &Path) -> Command {
 /// changed), and then [`boot_x2apic`] (the owner's decision on ADR-0008, question 3).
 fn boot_matrix() -> Result {
     let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    let bases = stack_bases_file();
+    if let Some(dir) = bases.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    fs::write(&bases, "").map_err(|e| format!("{}: {e}", bases.display()))?;
     for iommu in ["intel", "amd"] {
         for cpus in [1, 2, 4] {
             println!("xtask: boot-matrix: {iommu} IOMMU, {cpus} processor(s)");
@@ -2189,12 +2361,19 @@ fn boot_matrix() -> Result {
                     "boot-test with the {iommu} IOMMU and {cpus} processor(s) failed ({status})"
                 ));
             }
+            check_stack_bases_so_far(&bases)?;
         }
     }
     boot_x2apic()?;
     boot_bridge()?;
     boot_legacy_free()?;
     boot_console()?;
+    // ADR-0004 Amendment 2, A6.4: the boots placed the kernel stacks' region apart.
+    let recorded = fs::read_to_string(&bases).map_err(|e| format!("{}: {e}", bases.display()))?;
+    let boots = distinct_stack_bases(&recorded)?;
+    println!(
+        "xtask: boot-matrix: the kernel stacks' region was at {boots} distinct bases in {boots} kernel boots, read through QEMU's monitor; none is printed"
+    );
     println!(
         "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, and the console machines)"
     );
@@ -4226,6 +4405,17 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
             None => verdict = Err("QEMU stdin was not captured".into()),
         }
     }
+    // Where this boot placed the kernel stacks' region, read through the monitor, for
+    // `boot-matrix` to compare across boots (ADR-0004 Amendment 2, A6.4).
+    if verdict.is_ok()
+        && scenario.capture == Capture::Com1AndScreen
+        && text.contains(STACK_PROOF_LINE)
+        && let Some(monitor) = stdin.as_mut()
+    {
+        verdict = read_stack_base(monitor, &rx, &text)
+            .and_then(|base| record_stack_base(scenario.label, base))
+            .map_err(|e| format!("the kernel stacks' region's base: {e}"));
+    }
     drop(stdin);
 
     // QEMU keeps running after the scenario ends (the kernel halts; a rejecting loader hands
@@ -4699,6 +4889,115 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
             ]
         );
         assert!(stack_window_lines("origin-kernel: 0x").is_empty());
+    }
+
+    #[test]
+    fn the_kernels_physical_base_is_read_from_its_boot_line() {
+        let line = "origin-kernel: loaded at 0xffffffff80600000 (physical 0x7e50000), span 0x13000 bytes; direct map at 0xffff800000000000 (KASLR)\n";
+        assert_eq!(kernel_physical_base(line), Some(0x7e5_0000));
+        assert_eq!(
+            kernel_physical_base("origin-kernel: loaded at somewhere\n"),
+            None
+        );
+    }
+
+    /// A hand-made ELF64: a null section, a symbol table and its string table.
+    fn elf_with(symbols: &[(&str, u64)]) -> Vec<u8> {
+        let mut strings = vec![0u8];
+        let mut table = vec![0u8; 24];
+        for (name, value) in symbols {
+            let at = u32::try_from(strings.len()).unwrap();
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            let mut symbol = [0u8; 24];
+            symbol[..4].copy_from_slice(&at.to_le_bytes());
+            symbol[8..16].copy_from_slice(&value.to_le_bytes());
+            table.extend_from_slice(&symbol);
+        }
+        let symbols_at = 64u64;
+        let strings_at = symbols_at + table.len() as u64;
+        let sections_at = strings_at + strings.len() as u64;
+        let mut elf = vec![0u8; 64];
+        elf[..5].copy_from_slice(b"\x7fELF\x02");
+        elf[0x28..0x30].copy_from_slice(&sections_at.to_le_bytes());
+        elf[0x3A..0x3C].copy_from_slice(&64u16.to_le_bytes());
+        elf[0x3C..0x3E].copy_from_slice(&3u16.to_le_bytes());
+        elf.extend_from_slice(&table);
+        elf.extend_from_slice(&strings);
+        let section = |kind: u32, offset: u64, size: u64, link: u32| {
+            let mut header = [0u8; 64];
+            header[4..8].copy_from_slice(&kind.to_le_bytes());
+            header[24..32].copy_from_slice(&offset.to_le_bytes());
+            header[32..40].copy_from_slice(&size.to_le_bytes());
+            header[40..44].copy_from_slice(&link.to_le_bytes());
+            header
+        };
+        elf.extend_from_slice(&[0u8; 64]);
+        elf.extend_from_slice(&section(2, symbols_at, table.len() as u64, 2));
+        elf.extend_from_slice(&section(3, strings_at, strings.len() as u64, 0));
+        elf
+    }
+
+    #[test]
+    fn a_kernel_symbol_is_found_by_part_of_its_name() {
+        let elf = elf_with(&[
+            ("_ZN4core3fmt5write17h0123E", 0x1000),
+            (
+                "_ZN12origin_frame5stack17STACK_REGION_BASE17h4567E",
+                0x13_6008,
+            ),
+        ]);
+        assert_eq!(elf_symbol(&elf, "STACK_REGION_BASE"), Some(0x13_6008));
+        assert_eq!(elf_symbol(&elf, "NOT_THERE"), None);
+        assert_eq!(
+            elf_symbol(&elf[..100], "STACK_REGION_BASE"),
+            None,
+            "cut short"
+        );
+        assert_eq!(elf_symbol(b"not an ELF", "STACK_REGION_BASE"), None);
+    }
+
+    /// What QEMU 11.1's monitor sends back for `xp /1gx`: its line editor's redraw of the
+    /// command, then the answer, its address padded to 8 digits.
+    #[test]
+    fn the_monitors_answer_is_matched_by_its_address() {
+        let answer =
+            "\u{1b}[Dxp /1gx 0x1dcffd30\u{1b}[K\r\n1dcffd30: 0xffffd8a4c0000000\r\n(qemu) ";
+        let line = answer
+            .split('\n')
+            .find_map(|line| xp_answer(line, 0x1dcf_fd30));
+        assert_eq!(line, Some("ffffd8a4c0000000\r"));
+        assert_eq!(
+            xp_answer("000000001dcffd30: 0x10\r", 0x1dcf_fd30),
+            Some("10\r")
+        );
+        assert_eq!(
+            xp_answer("1dcffd38: 0x10\r", 0x1dcf_fd30),
+            None,
+            "another word"
+        );
+        assert_eq!(
+            xp_answer("xp /1gx 0x1dcffd30", 0x1dcf_fd30),
+            None,
+            "the command"
+        );
+    }
+
+    #[test]
+    fn boots_must_place_the_stack_region_apart() {
+        let three = "kernel boot\t0xffffc00000200000\nkernel boot\t0xffffd00000400000\nx2APIC\t0xffffd8a4c0000000\n";
+        assert_eq!(distinct_stack_bases(three), Ok(3));
+        let alike = "kernel boot\t0xffffc00000200000\nkernel boot\t0xffffc00000200000\n";
+        assert!(distinct_stack_bases(alike).is_err());
+        assert!(distinct_stack_bases("kernel boot\t0xffffc00000200000\n").is_err());
+        assert!(distinct_stack_bases("").is_err());
+        // So far, during the matrix: one boot, or none, is no failure; two alike are.
+        assert_eq!(
+            stack_bases_apart("kernel boot\t0xffffc00000200000\n"),
+            Ok(1)
+        );
+        assert_eq!(stack_bases_apart(""), Ok(0));
+        assert!(stack_bases_apart(alike).is_err());
     }
 
     fn proof(cpus: u64) -> String {

@@ -31,6 +31,7 @@
 //! which is the safe failure for a safe caller that drops one too early.
 
 use alloc::alloc::{Layout, alloc, dealloc};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use origin_paging::PAGE;
 use origin_paging::layout::{self, STACK_REGION, STACK_REGION_SIZE};
@@ -39,7 +40,6 @@ use origin_sync::slots::{Counts, Slots, State, Taken};
 use crate::cpu::{self, CpuIndex, without_interrupts};
 use crate::descriptors::{KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
 use crate::memory::{self, OwnedFrame};
-use crate::once::SetOnce;
 
 /// The address space each stack has: the stack at its top, unmapped space below.
 pub const SLOT: u64 = 128 * 1024;
@@ -92,8 +92,13 @@ impl core::fmt::Debug for Region {
     }
 }
 
-/// Where the region is, once the kernel's tables are made for it (`early`).
-static PLACED: SetOnce<Region> = SetOnce::new();
+/// The region's base once `early` has placed it, 0 before; written once ([`place`]). A word of
+/// its own under a name of its own, so that the boot tests can read it through QEMU's monitor
+/// and check that boots place the region apart (ADR-0004 Amendment 2, A6.4), while the kernel
+/// prints nothing of it.
+static STACK_REGION_BASE: AtomicU64 = AtomicU64::new(0);
+/// What drew it: 0 nothing, 1 RDSEED, 2 RDRAND. Written before the base is published.
+static STACK_REGION_DRAWN: AtomicU8 = AtomicU8::new(0);
 
 /// RDSEED attempts before RDRAND, and RDRAND attempts before the fixed base: the loader's, for
 /// the image's slide (ADR-0004 H3).
@@ -132,16 +137,38 @@ pub(crate) fn draw_region() -> Region {
 /// Records where the region is, once its page tables are made: before then, and if this has run
 /// already, nothing changes.
 pub(crate) fn place(region: Region) -> bool {
-    PLACED.set(region).is_ok()
+    if STACK_REGION_BASE.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    let drawn = match region.drawn {
+        None => 0,
+        Some(Entropy::Rdseed) => 1,
+        Some(Entropy::Rdrand) => 2,
+    };
+    STACK_REGION_DRAWN.store(drawn, Ordering::Relaxed);
+    // Release: whoever reads the base reads what drew it too.
+    STACK_REGION_BASE
+        .compare_exchange(0, region.base, Ordering::Release, Ordering::Relaxed)
+        .is_ok()
 }
 
 /// Where the region is: at its fixed base until `early` has placed it, which it does before the
 /// first stack is made.
 pub fn region() -> Region {
-    PLACED.get().copied().unwrap_or(Region {
-        base: STACK_REGION,
-        drawn: None,
-    })
+    match STACK_REGION_BASE.load(Ordering::Acquire) {
+        0 => Region {
+            base: STACK_REGION,
+            drawn: None,
+        },
+        base => Region {
+            base,
+            drawn: match STACK_REGION_DRAWN.load(Ordering::Relaxed) {
+                1 => Some(Entropy::Rdseed),
+                2 => Some(Entropy::Rdrand),
+                _ => None,
+            },
+        },
+    }
 }
 
 /// The first address of slot `slot`.
