@@ -110,6 +110,7 @@ proofs! {
     Launch "process start" => Refuse;
     Directory "the service directory" => Refuse;
     Memory "memory objects" => Refuse;
+    Stacks "kernel stacks" => Refuse;
     ThreadsReaped "thread reaping" => Report;
     // Devices.
     Pcie "PCIe enumeration" => Withdraw("no device drivers");
@@ -231,7 +232,7 @@ mod tests {
 
     /// Every proof whose failure stops the boot (ADR-0013 R1). Changing this list changes
     /// what a real machine does: change the ADR with it.
-    const REFUSING: [Proof; 20] = [
+    const REFUSING: [Proof; 21] = [
         Proof::PageTables,
         Proof::FrameAllocator,
         Proof::Heap,
@@ -252,6 +253,7 @@ mod tests {
         Proof::Launch,
         Proof::Directory,
         Proof::Memory,
+        Proof::Stacks,
     ];
 
     /// Every proof whose failure withholds a capability (ADR-0013 R2).
@@ -286,7 +288,7 @@ mod tests {
 
     #[test]
     fn the_table_has_one_row_per_proof_in_order() {
-        assert_eq!(Proof::ALL.len(), 57);
+        assert_eq!(Proof::ALL.len(), 58);
         for (i, &proof) in Proof::ALL.iter().enumerate() {
             assert_eq!(proof as usize, i, "{proof:?} is out of order");
             assert!(!proof.name().is_empty(), "{proof:?} has no name");
@@ -368,7 +370,7 @@ mod tests {
     fn the_verdict_of_a_clean_boot_is_exact() {
         assert_eq!(
             verdict(passed_all()),
-            "origin-kernel: boot verdict: 57 of 57 proofs passed\n"
+            "origin-kernel: boot verdict: 58 of 58 proofs passed\n"
         );
     }
 
@@ -380,7 +382,7 @@ mod tests {
         tally.record(Proof::Nvme, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 54 of 57 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
+            "origin-kernel: boot verdict: degraded: 55 of 58 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
         );
     }
 
@@ -391,7 +393,7 @@ mod tests {
         tally.record(Proof::PageTables, true);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 55 did not run\n"
+            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 56 did not run\n"
         );
     }
 
@@ -402,7 +404,7 @@ mod tests {
         tally.record(Proof::Raster, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 56 of 57 proofs passed; failed: rasterizer\n"
+            "origin-kernel: boot verdict: degraded: 57 of 58 proofs passed; failed: rasterizer\n"
         );
     }
 
