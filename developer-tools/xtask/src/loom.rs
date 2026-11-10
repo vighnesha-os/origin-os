@@ -93,8 +93,8 @@ const CAUSALITY: &[&str] = &["Causality violation"];
 const DEADLOCK: &[&str] = &["deadlock"];
 const WENT_BACK: &[&str] = &["the clock went backwards"];
 const STALE: &[&str] = &["a processor kept a translation the shootdown took away"];
-/// A wait that can never end: to Loom, a processor spinning for ever.
-const NEVER_ENDS: &[&str] = &["Model exceeded maximum number of branches", "deadlock"];
+/// An initiator gave up waiting for an answer that could never come (`PATIENCE` in `models.rs`).
+const NO_ANSWER: &[&str] = &["a processor the shootdown asked never answered"];
 /// A request for one address space interrupted a processor in another.
 const OUTSIDE: &[&str] = &["a shootdown for one space reached a processor in another"];
 /// The frame was reused while something could still reach it, or two things reused it.
@@ -752,7 +752,7 @@ const CONTROLS: &[Control] = &[
         file: SHOOTDOWN,
         from: "                self.service(hardware);\n                prim::spin_loop();\n",
         to: "                prim::spin_loop();\n",
-        models: &[("shootdown_two_initiators_serve_each_other", NEVER_ENDS)],
+        models: &[("shootdown_two_initiators_serve_each_other", NO_ANSWER)],
     },
     Control {
         // The initiator reads who is online without ordering that after its change.

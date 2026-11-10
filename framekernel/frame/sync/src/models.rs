@@ -16,7 +16,8 @@
 //!
 //! The TLB shootdown protocol (`shootdown.rs`, which `origin_frame::tlb` instantiates) is real
 //! too. What stands in for the machine there is `TlbCpu`: a boolean for what its TLB holds, a
-//! relaxed load for a page walk, `Notify` for the interrupt, and a clock that never runs out.
+//! relaxed load for a page walk, `Notify` for the interrupt, and a clock that ticks once each
+//! time it is read, so that an initiator gives up after `PATIENCE` polls.
 //!
 //! Copies, written by hand here, standing in for kernel code; nothing compares them with it:
 //!
@@ -111,8 +112,11 @@
 //!   the `pause` instruction and TSO are not examined. In the shootdown models the page walker is
 //!   a relaxed load at the points a model calls `walk`, where a real one may walk at any moment;
 //!   a TLB is a boolean; and speculative use of a stale translation is not modelled.
-//! - A processor that does not answer: the models' clock never runs out. `Stalled` and the leak
-//!   that follows it are tested on the host only.
+//! - A processor that does not answer, beyond the models' own use of it: an initiator gives up
+//!   after `PATIENCE` polls and the model fails with `NO_ANSWER`, which is how a bug that stops
+//!   an answer shows (the control `shootdown_waiting_initiator_does_not_serve`). No correct
+//!   execution gets there (`PATIENCE` says why). The leak that follows a `Stalled` is tested on
+//!   the host only.
 //! - `RwLock` writer starvation, which its documentation accepts; a timed waiter that finds the
 //!   queue full (the other way to reach `Step::Poll`, the same loop as the boot flow's); and what
 //!   callers must uphold themselves: the state changes before `wake_one`, and one condition per
@@ -1406,8 +1410,18 @@ const THE_PAGE: u64 = 0x40_0000;
 const MAPPED: u64 = 1;
 /// What a model's assertion says when a shootdown failed to do its job.
 const STALE: &str = "a processor kept a translation the shootdown took away";
+/// What a model says when an initiator gave up waiting for an answer: see [`PATIENCE`].
+const NO_ANSWER: &str = "a processor the shootdown asked never answered";
 /// What a model says when a request for one address space interrupted a processor in another.
 const OUTSIDE: &str = "a shootdown for one space reached a processor in another";
+
+/// How many readings of its clock an initiator waits for its answers before it gives up: about
+/// one per poll. Far more than an execution can poll while it is explored, which the spin bound
+/// ends after [`SPINS`]; after that, Loom runs another thread at each of the initiator's spins,
+/// and every target answers within a few of its own steps. So a correct model never gives up,
+/// and one in which an answer can never come gives up and fails with [`NO_ANSWER`], instead of
+/// spinning until Loom's limit on branches says only that something never ended.
+const PATIENCE: u64 = 64;
 
 /// The machine of a shootdown model: a page table entry and each processor's TLB.
 struct TlbWorld {
@@ -1429,11 +1443,14 @@ struct TlbWorld {
     bystander: Option<usize>,
 }
 
-/// One processor of a [`TlbWorld`].
+/// One processor of a [`TlbWorld`], as one thread of the model sees it.
 #[derive(Clone)]
 struct TlbCpu {
     id: usize,
     world: Arc<TlbWorld>,
+    /// This thread's clock: one tick per reading (see [`PATIENCE`]). Not an atomic, so that
+    /// reading it is no step Loom has to interleave.
+    clock: core::cell::Cell<u64>,
 }
 
 /// Processor `id` of `world`.
@@ -1441,6 +1458,7 @@ fn tlb_cpu(world: &Arc<TlbWorld>, id: usize) -> TlbCpu {
     TlbCpu {
         id,
         world: Arc::clone(world),
+        clock: core::cell::Cell::new(0),
     }
 }
 
@@ -1472,13 +1490,15 @@ impl TlbHardware for TlbCpu {
         f()
     }
 
+    /// The clock moves only as it is read, so an initiator's wait is counted in its polls.
     fn now(&self) -> u64 {
-        0
+        let now = self.clock.get();
+        self.clock.set(now + 1);
+        now
     }
 
-    /// A model never gives up: a target that never answers shows as a hang.
     fn patience(&self) -> u64 {
-        u64::MAX
+        PATIENCE
     }
 
     fn current_root(&self) -> u64 {
@@ -1560,7 +1580,7 @@ impl TlbCpu {
         self.world
             .shootdown
             .shoot(self, Request::page(THE_PAGE), scope)
-            .unwrap();
+            .expect(NO_ANSWER);
     }
 }
 
@@ -1879,7 +1899,7 @@ fn deferred_free_comes_after_the_last_use_of_a_stale_translation() {
                     Scope::Space(THE_SPACE),
                     |frame| reuse(&frame),
                 )
-                .unwrap();
+                .expect(NO_ANSWER);
             assert!(!user.holds(), "{STALE}");
             world.finish(vec![running]);
         },
@@ -1951,7 +1971,7 @@ fn deferred_free_of_a_frame_shared_by_two_spaces() {
                             Scope::Space(OTHER_SPACE),
                             |shared| shared.release(),
                         )
-                        .unwrap();
+                        .expect(NO_ANSWER);
                 })
             };
             world.pte.store(0, Relaxed);
@@ -1964,7 +1984,7 @@ fn deferred_free_of_a_frame_shared_by_two_spaces() {
                     Scope::Space(THE_SPACE),
                     |shared| shared.release(),
                 )
-                .unwrap();
+                .expect(NO_ANSWER);
             unmap_second.join().unwrap();
             world.finish(vec![running]);
             assert_eq!(
