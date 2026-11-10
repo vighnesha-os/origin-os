@@ -85,6 +85,81 @@ pub const fn stack_region_base(random: u64) -> u64 {
     STACK_WINDOW + (1 + random % STACK_PLACEMENTS) * LARGE_PAGE
 }
 
+/// The bases of the windows that slide (H3; Amendment 2): what a crash report tells an address
+/// against, so that it prints offsets and never a base (ADR-0004 Amendment 2, A6.2). Its `Debug`
+/// shows none of them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Bases {
+    /// The kernel image's virtual base.
+    pub image: u64,
+    /// The direct map's base: the virtual address of physical 0.
+    pub direct_map: u64,
+    /// The kernel stacks' region's base.
+    pub stack_region: u64,
+}
+
+/// Names no base (A6.2), and writes only through `Formatter::write_str`, which this crate's
+/// no-panic check allows (ONBF §12).
+impl core::fmt::Debug for Bases {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Bases { .. }")
+    }
+}
+
+/// How far an address is from a base, and on which side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Offset {
+    /// The address is below the base.
+    pub below: bool,
+    /// By how many bytes.
+    pub by: u64,
+}
+
+impl Offset {
+    const fn between(addr: u64, base: u64) -> Self {
+        if addr >= base {
+            Self {
+                below: false,
+                by: addr - base,
+            }
+        } else {
+            Self {
+                below: true,
+                by: base - addr,
+            }
+        }
+    }
+}
+
+/// An address as a crash report prints it (ADR-0004 Amendment 2, A6.2): its offset from the
+/// base of the sliding window it is in, or the address itself when it is in none, which then
+/// gives no base away. The framework prints it (`origin_frame::told`); this crate does no
+/// formatting, which its no-panic check forbids (ONBF §12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Told {
+    /// In the kernel image's window: from the image's base.
+    Image(Offset),
+    /// In the kernel stacks' window: from the region's base.
+    StackRegion(Offset),
+    /// In the direct map's window: from its base, which makes it the physical address.
+    DirectMap(Offset),
+    /// In no sliding window: the address.
+    Address(u64),
+}
+
+/// Tells `addr` against `bases` (A6.2).
+pub const fn tell(addr: u64, bases: &Bases) -> Told {
+    if addr >= KERNEL_WINDOW {
+        Told::Image(Offset::between(addr, bases.image))
+    } else if addr >= STACK_WINDOW && addr - STACK_WINDOW < STACK_WINDOW_SIZE {
+        Told::StackRegion(Offset::between(addr, bases.stack_region))
+    } else if addr >= DIRECT_MAP_WINDOW && addr - DIRECT_MAP_WINDOW < DIRECT_MAP_WINDOW_SIZE {
+        Told::DirectMap(Offset::between(addr, bases.direct_map))
+    } else {
+        Told::Address(addr)
+    }
+}
+
 /// Whether `base` is a base the stack region can have: 2 MiB-aligned, with the whole region in
 /// the stack window.
 pub const fn is_stack_region_base(base: u64) -> bool {
@@ -741,6 +816,59 @@ mod tests {
             );
             assert!(direct.small > 0 && direct.large > 0, "{direct:?}");
         }
+    }
+
+    /// ADR-0004 Amendment 2, A6.2: a crash report tells an address in a sliding window as its
+    /// offset from that window's base, above or below it, and any other address as itself
+    /// (`origin_frame::told` prints it).
+    #[test]
+    fn a_crash_report_tells_addresses_as_offsets_from_the_bases() {
+        let bases = Bases {
+            image: KERNEL_WINDOW + 0x60_0000,
+            direct_map: DIRECT_MAP_WINDOW + (7 << 30),
+            stack_region: stack_region_base(0x1234_5678),
+        };
+        let told = |addr: u64| tell(addr, &bases);
+        let above = |by| Offset { below: false, by };
+        assert_eq!(told(bases.image + 0x1f20), Told::Image(above(0x1f20)));
+        assert_eq!(
+            told(KERNEL_WINDOW),
+            Told::Image(Offset {
+                below: true,
+                by: 0x60_0000
+            })
+        );
+        assert_eq!(told(u64::MAX), Told::Image(above(u64::MAX - bases.image)));
+        assert_eq!(
+            told(bases.stack_region + 0x1_fff8),
+            Told::StackRegion(above(0x1_fff8))
+        );
+        assert_eq!(
+            told(STACK_WINDOW + STACK_WINDOW_SIZE - 1),
+            Told::StackRegion(above(
+                STACK_WINDOW + STACK_WINDOW_SIZE - 1 - bases.stack_region
+            ))
+        );
+        assert!(matches!(
+            told(STACK_WINDOW),
+            Told::StackRegion(Offset { below: true, .. })
+        ));
+        assert_eq!(
+            told(bases.direct_map + 0x7e5_0000),
+            Told::DirectMap(above(0x7e5_0000))
+        );
+        // Windows that do not slide, the user half, and the hole between the halves.
+        for addr in [
+            FRAMEBUFFER_WINDOW,
+            STACK_WINDOW + STACK_WINDOW_SIZE + 0x1000,
+            0xFFFF_F000_0000_0000,
+            0x40_0000,
+            0x0000_8000_0000_0000,
+            DIRECT_MAP_WINDOW - 1,
+        ] {
+            assert_eq!(told(addr), Told::Address(addr), "{addr:#x}");
+        }
+        assert_eq!(format!("{bases:?}"), "Bases { .. }", "no base in its Debug");
     }
 
     /// ADR-0004 Amendment 2, A4: every base is 2 MiB-aligned with the whole region in PML4
