@@ -24,7 +24,7 @@
 | A buggy or compromised `origin.core` | Issue any call with any arguments from the pinned code range | `origin.core` does not exist yet (step 4). Until it does, the creator names each process's range (A6) |
 | Code outside `origin.core` | Run `syscall` from its own pages | Refused by the range pin (A6). The per-call pin (B2) is not built |
 
-**Out of scope:** a kernel already compromised another way, physical attacks, malicious firmware or microcode, and DMA (`THREAT_MODEL_IOMMU.md`). Speculative execution is listed as open (I2) but not modelled in detail. What each exclusion means for the product, where it is covered and what is accepted by name, is in `THREAT_MODEL_SYSTEM.md` (EX1 to EX12). Speculation is decided in `docs/adr/ADR-0017-speculation-processor-hardening.md`, which the owner accepted on 2026-11-10 and which is not built.
+**Out of scope:** a kernel already compromised another way, physical attacks, malicious firmware or microcode, and DMA (`THREAT_MODEL_IOMMU.md`). Speculative execution is listed as open (I2) but not modelled in detail. What each exclusion means for the product, where it is covered and what is accepted by name, is in `THREAT_MODEL_SYSTEM.md` (EX1 to EX12). Speculation is decided in `docs/adr/ADR-0017-speculation-processor-hardening.md`, which the owner accepted on 2026-11-10. Its Z1, Z2, Z3, Z5, Z9 and Z10 are built (TASKS item 19b); row I2 and the list under it say what that covers and what it does not.
 
 ## Threats
 
@@ -98,8 +98,23 @@ Status: **Proven** (a boot proof whose negative control is recorded in `SOURCE_P
 | # | Threat | Defence | Status |
 |---|---|---|---|
 | I1 | Uninitialized kernel memory is copied out | Results are built in zeroed buffers, and the generated encoders zero padding (OIDL §5.2) | **Host** |
-| I2 | Speculative execution: a call number or handle index used out of bounds speculatively, poisoned indirect branches, or a Meltdown-type read of the kernel half, which is mapped in every address space | None: no index masking, no indirect-branch mitigation, no page-table isolation, and `IA32_ARCH_CAPABILITIES` is not read | **Open** |
+| I2 | Speculative execution: a handle index, a count or an address used out of bounds on a wrongly guessed path; indirect branches steered from ring 3 or from a sibling thread; one process's branch history used against the next; a Meltdown-type read of the kernel half, which is mapped in every address space | ADR-0017, as built by task 19b. **Lookups:** every index, count and address in the list below goes through `origin_frame::nospec`, as a conditional move or as LFENCE, by the processor's maker and family. **Indirect branches:** each processor sets enhanced IBRS with `BHI_DIS_S` and `RRSBA_DIS_S`, or automatic IBRS with STIBP, where it reports them, and the boot says what it lacks. **Between processes:** an IBPB when a processor takes up a different process. **On entry:** the general-purpose registers are zeroed once saved. **In the image:** no jump table and an INT3 after every return, in the code the build compiles. **The kernel half:** no page-table isolation; the declared processors do not have the Meltdown behaviour (ADR-0017 Z11) | **Partly.** Host-tested and boot-tested under QEMU's software processor, which has none of these controls: **no control has been written on a processor that has it**, and nothing can test what a processor does on a wrongly guessed path. Not covered: the toolchain's prebuilt `core`, `alloc` and `compiler_builtins` (33 returns without an INT3 and 2 jump tables in today's image), which the owner accepted by name (ADR-0017 Amendment 1, item 152); FRED, LASS, shadow stacks and the nested-NMI guard (19c) |
 | I3 | Process IDs are sequential, so a program learns roughly how many processes were created between two of its observations | Accepted by ADR-0005 C1, since an ID grants nothing | **Open** (accepted) |
+
+### What a program chooses that the kernel then indexes or copies with (ADR-0017 Z9)
+
+Z9's rule: a lookup whose index, count or address comes from ring 3 goes through `origin_frame::nospec`. No lint can tell where a value came from, so this list is the record, and **each new system call adds its own to it.**
+
+| What the program chooses | Where the kernel uses it | Through |
+|---|---|---|
+| A handle's slot | `HandleTable::get` and `remove` (`framekernel/src/handles.rs`): every call that takes a handle, and every handle a `channel_write` carries | `nospec::index` |
+| The address of anything copied in or out | `UserSpace::copy_in` and `copy_out` (`framekernel/frame/src/userspace.rs`), after the range check: the only two places the kernel copies to or from a program | `nospec::user_address` |
+| The length of `debug_write`'s text | The copy into a buffer on the kernel's stack (`syscall.rs`, `debug_write`) | `nospec::length` |
+| The number of handles a `channel_write` carries | The copy into `raw` and the list read from `values`, both on the kernel's stack (`syscall.rs`, `channel_write`) | `nospec::length` |
+| The `size` a reader writes in its `read_sizes` record | The piece of the encoded record copied out (`syscall.rs`, `channel_read`) | `nospec::length` |
+| The call number | The generated dispatcher's `match`: comparisons, with no table (the image gate holds that). A wrong guess among them runs another call's decoder on this call's arguments, and that decoder's lookups are in this list | Not an index |
+
+Looked at and left alone, because the value is the kernel's own by the time it is used: the lengths `copy_out_handles` and `copy_out_records` take (set when the message was written, within the limit checked then); the size of `channel_write`'s payload, which sizes the buffer it is copied into; rights, signals and deadlines, which index nothing.
 
 ### A message's writer and handle records (S3-2)
 
@@ -160,7 +175,7 @@ ADR-0011 N9 and S9, as C11 and C12 decide: `origin.directory` 0.1, served by a p
 Before any program that is not a boot proof runs in ring 3 (N14 step 4):
 1. **E8**, the per-call pin (Amendment 2, B2).
 2. **O2**, quotas on threads, processes and memory (P11), with the calls that create them.
-3. **I2**: a speculative-execution review against the declared processors. The review is `docs/research/2026-11-10-speculation-processor-hardening.md`, and ADR-0017, accepted on 2026-11-10, decides from it. I2 closes when its Z2, Z3, Z5, Z9 and Z10 are built.
+3. **I2**: a speculative-execution review against the declared processors. The review is `docs/research/2026-11-10-speculation-processor-hardening.md`, and ADR-0017, accepted on 2026-11-10, decides from it. Its Z2, Z3, Z5, Z9 and Z10 are built (task 19b), under QEMU's software processor only. **I2 stays Partly until a boot on a processor that has the controls shows each one read back as written** (CI's KVM boots, when the branch lands).
 4. **D11**, the directory's back side, decided before the first directory that is a program runs.
 
 Before any claim about real hardware: **E12**, the nested NMI.
