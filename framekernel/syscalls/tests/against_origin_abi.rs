@@ -107,6 +107,52 @@ fn the_call_numbers_are_the_same() {
 }
 
 #[test]
+fn the_start_record_is_the_same() {
+    use origin_abi::start;
+    use origin_abi::start::role;
+    type Header = generated::StartHeader;
+    type Entry = generated::StartEntry;
+    // The hand-written codec writes the layout the definition states (ADR-0005 C4).
+    assert_eq!(<Header as rt::Fixed>::SIZE, start::HEADER);
+    assert_eq!(<Entry as rt::Fixed>::SIZE, start::ENTRY);
+    for (ours, theirs) in [
+        (Header::SIZE_AT, start::SIZE_AT),
+        (Header::ABI_MAJOR_AT, start::ABI_MAJOR_AT),
+        (Header::ABI_MINOR_AT, start::ABI_MINOR_AT),
+        (Header::ABI_MIN_MINOR_AT, start::ABI_MIN_MINOR_AT),
+        (Header::RESERVED_AT, start::RESERVED_AT),
+        (Header::HANDLE_COUNT_AT, start::HANDLE_COUNT_AT),
+        (Header::ARG_COUNT_AT, start::ARG_COUNT_AT),
+        (Header::ARG_BYTES_AT, start::ARG_BYTES_AT),
+        (Header::ENV_COUNT_AT, start::ENV_COUNT_AT),
+        (Header::ENV_BYTES_AT, start::ENV_BYTES_AT),
+        (Entry::HANDLE_AT, start::ENTRY_HANDLE_AT),
+        (Entry::OBJECT_TYPE_AT, start::ENTRY_OBJECT_TYPE_AT),
+        (Entry::RIGHTS_AT, start::ENTRY_RIGHTS_AT),
+        (Entry::ROLE_AT, start::ENTRY_ROLE_AT),
+    ] {
+        assert_eq!(ours, theirs);
+    }
+    assert_eq!(generated::START_MAX_HANDLES as usize, start::MAX_HANDLES);
+    assert_eq!(generated::START_MAX_BYTES as usize, start::MAX_SIZE);
+    // The roles (C5), with 4 retired, and the rights of a process and a thread (C6).
+    assert_eq!(generated::StartRole::Bootstrap.raw(), role::BOOTSTRAP);
+    assert_eq!(generated::StartRole::SelfProcess.raw(), role::SELF_PROCESS);
+    assert_eq!(generated::StartRole::SelfThread.raw(), role::SELF_THREAD);
+    assert_eq!(generated::StartRole::Directory.raw(), role::DIRECTORY);
+    assert_eq!(
+        generated::StartRole::from_raw(4),
+        None,
+        "4 was SERVICE, and is retired"
+    );
+    assert_eq!(
+        generated::PROCESS_RIGHTS.bits(),
+        origin_abi::rights::PROCESS
+    );
+    assert_eq!(generated::THREAD_RIGHTS.bits(), origin_abi::rights::THREAD);
+}
+
+#[test]
 fn the_limits_layouts_and_version_are_the_same() {
     use origin_abi::limits as abi;
     assert_eq!(

@@ -14,11 +14,18 @@
 use super::super::oidl_rt as rt;
 
 /// This library's version: `(major, minor)` (§9).
-pub const VERSION: (u16, u16) = (0, 2);
+pub const VERSION: (u16, u16) = (0, 3);
 
 /// The rights of a new channel end: everything that applies to a channel (ADR-0005 P2, P8,
 /// amendment A1).
 pub const CHANNEL_RIGHTS: Rights = match Rights::from_bits(0x73) { Some(value) => value, None => Rights::NONE };
+
+/// The rights of a process's handle to itself (ADR-0005 C6). Changing another process's
+/// address space needs write; manage is for termination and thread control.
+pub const PROCESS_RIGHTS: Rights = match Rights::from_bits(0x173) { Some(value) => value, None => Rights::NONE };
+
+/// The rights of a thread's handle to itself (ADR-0005 C6).
+pub const THREAD_RIGHTS: Rights = match Rights::from_bits(0x170) { Some(value) => value, None => Rights::NONE };
 
 /// Most bytes in one channel message (ADR-0005 P8).
 pub const MAX_MESSAGE_BYTES: u32 = 65536;
@@ -31,6 +38,12 @@ pub const DEADLINE_INFINITE: u64 = 18446744073709551615;
 
 /// Longest line a developer build's debug write takes (framekernel/src/syscall.rs).
 pub const DEBUG_WRITE_MAX: u32 = 128;
+
+/// Most handles a start record carries (ADR-0005 C4).
+pub const START_MAX_HANDLES: u32 = 64;
+
+/// Most bytes a start record takes, all of it (ADR-0005 C4).
+pub const START_MAX_BYTES: u32 = 65536;
 
 /// The success status.
 pub const OK: i64 = 0;
@@ -181,6 +194,73 @@ impl ObjectType {
 impl rt::Fixed for ObjectType {
     const SIZE: usize = 4;
     const FILLER: Self = Self::Process;
+    fn read(bytes: &[u8], minor: u16) -> Result<Self, rt::WireError> {
+        let raw = <u32 as rt::Fixed>::read(bytes, minor)?;
+        let value = Self::from_raw(raw).ok_or(rt::WireError::Enum)?;
+        if minor < value.since_minor() {
+            return Err(rt::WireError::Enum);
+        }
+        Ok(value)
+    }
+    fn write(self, out: &mut [u8]) -> Result<(), rt::WireError> {
+        rt::Fixed::write(self.raw(), out)
+    }
+}
+
+/// What a handle in a start record is for (ADR-0005 C5). 4 was SERVICE: it is retired and never
+/// reused, because a process finds services through its directory (ADR-0011 N9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+#[non_exhaustive]
+pub enum StartRole {
+    /// The channel to whoever started the process.
+    Bootstrap = 1,
+    /// The process itself.
+    SelfProcess = 2,
+    /// Its first thread.
+    SelfThread = 3,
+    /// The channel to the service directory.
+    Directory = 5,
+}
+
+impl StartRole {
+    /// Every member, in declaration order.
+    pub const ALL: [Self; 4] = [Self::Bootstrap, Self::SelfProcess, Self::SelfThread, Self::Directory];
+
+    /// The value on the wire or in a register.
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+
+    /// The member with this value, if there is one.
+    pub fn from_raw(raw: u32) -> Option<Self> {
+        Self::ALL.iter().copied().find(|e| e.raw() == raw)
+    }
+
+    /// This value's name in the C ABI.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bootstrap => "BOOTSTRAP",
+            Self::SelfProcess => "SELF_PROCESS",
+            Self::SelfThread => "SELF_THREAD",
+            Self::Directory => "DIRECTORY",
+        }
+    }
+
+    /// The first minor it is valid at.
+    const fn since_minor(self) -> u16 {
+        match self {
+            Self::Bootstrap => 3,
+            Self::SelfProcess => 3,
+            Self::SelfThread => 3,
+            Self::Directory => 3,
+        }
+    }
+}
+
+impl rt::Fixed for StartRole {
+    const SIZE: usize = 4;
+    const FILLER: Self = Self::Bootstrap;
     fn read(bytes: &[u8], minor: u16) -> Result<Self, rt::WireError> {
         let raw = <u32 as rt::Fixed>::read(bytes, minor)?;
         let value = Self::from_raw(raw).ok_or(rt::WireError::Enum)?;
@@ -469,6 +549,162 @@ impl rt::Fixed for ReceivedHandle {
         rt::put_field(out, 0, self.handle)?;
         rt::put_field(out, 4, self.object_type)?;
         rt::put_field(out, 8, self.rights)?;
+        Ok(())
+    }
+}
+
+/// The start record's header (ADR-0005 P6, C4). The kernel writes the record before a process's
+/// first thread runs, read-only, at a random address that RDI holds at entry. The handle entries
+/// follow, then the arguments and the environment, each string a u32 length and its bytes padded
+/// to 8 with zeros. Exact size, zero padding, at most start_max_handles entries and
+/// start_max_bytes in all. origin-abi's codec reads and writes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartHeader {
+    /// Bytes of the whole record, exactly.
+    pub size: u32,
+    /// The kernel's userspace ABI.
+    pub abi_major: u16,
+    /// Its minor.
+    pub abi_minor: u16,
+    /// The oldest minor of abi_major the kernel serves.
+    pub abi_min_minor: u16,
+    /// Zero.
+    pub reserved: u16,
+    /// Handle entries after the header.
+    pub handle_count: u32,
+    /// Argument strings.
+    pub arg_count: u32,
+    /// Bytes of the arguments, prefixes and padding included.
+    pub arg_bytes: u32,
+    /// Environment strings.
+    pub env_count: u32,
+    /// Bytes of the environment, prefixes and padding included.
+    pub env_bytes: u32,
+}
+
+impl StartHeader {
+    /// Byte offset of `size`.
+    pub const SIZE_AT: usize = 0;
+    /// Byte offset of `abi_major`.
+    pub const ABI_MAJOR_AT: usize = 4;
+    /// Byte offset of `abi_minor`.
+    pub const ABI_MINOR_AT: usize = 6;
+    /// Byte offset of `abi_min_minor`.
+    pub const ABI_MIN_MINOR_AT: usize = 8;
+    /// Byte offset of `reserved`.
+    pub const RESERVED_AT: usize = 10;
+    /// Byte offset of `handle_count`.
+    pub const HANDLE_COUNT_AT: usize = 12;
+    /// Byte offset of `arg_count`.
+    pub const ARG_COUNT_AT: usize = 16;
+    /// Byte offset of `arg_bytes`.
+    pub const ARG_BYTES_AT: usize = 20;
+    /// Byte offset of `env_count`.
+    pub const ENV_COUNT_AT: usize = 24;
+    /// Byte offset of `env_bytes`.
+    pub const ENV_BYTES_AT: usize = 28;
+}
+
+impl rt::Fixed for StartHeader {
+    const SIZE: usize = 32;
+    const FILLER: Self = Self {
+        size: <u32 as rt::Fixed>::FILLER,
+        abi_major: <u16 as rt::Fixed>::FILLER,
+        abi_minor: <u16 as rt::Fixed>::FILLER,
+        abi_min_minor: <u16 as rt::Fixed>::FILLER,
+        reserved: <u16 as rt::Fixed>::FILLER,
+        handle_count: <u32 as rt::Fixed>::FILLER,
+        arg_count: <u32 as rt::Fixed>::FILLER,
+        arg_bytes: <u32 as rt::Fixed>::FILLER,
+        env_count: <u32 as rt::Fixed>::FILLER,
+        env_bytes: <u32 as rt::Fixed>::FILLER,
+    };
+    fn read(oidl_bytes: &[u8], oidl_minor: u16) -> Result<Self, rt::WireError> {
+        if oidl_bytes.len() != Self::SIZE {
+            return Err(rt::WireError::Size);
+        }
+        let size: u32 = rt::field(oidl_bytes, 0, oidl_minor)?;
+        let abi_major: u16 = rt::field(oidl_bytes, 4, oidl_minor)?;
+        let abi_minor: u16 = rt::field(oidl_bytes, 6, oidl_minor)?;
+        let abi_min_minor: u16 = rt::field(oidl_bytes, 8, oidl_minor)?;
+        let reserved: u16 = rt::field(oidl_bytes, 10, oidl_minor)?;
+        let handle_count: u32 = rt::field(oidl_bytes, 12, oidl_minor)?;
+        let arg_count: u32 = rt::field(oidl_bytes, 16, oidl_minor)?;
+        let arg_bytes: u32 = rt::field(oidl_bytes, 20, oidl_minor)?;
+        let env_count: u32 = rt::field(oidl_bytes, 24, oidl_minor)?;
+        let env_bytes: u32 = rt::field(oidl_bytes, 28, oidl_minor)?;
+        Ok(Self { size, abi_major, abi_minor, abi_min_minor, reserved, handle_count, arg_count, arg_bytes, env_count, env_bytes })
+    }
+    fn write(self, out: &mut [u8]) -> Result<(), rt::WireError> {
+        if out.len() != Self::SIZE {
+            return Err(rt::WireError::Size);
+        }
+        out.fill(0);
+        rt::put_field(out, 0, self.size)?;
+        rt::put_field(out, 4, self.abi_major)?;
+        rt::put_field(out, 6, self.abi_minor)?;
+        rt::put_field(out, 8, self.abi_min_minor)?;
+        rt::put_field(out, 10, self.reserved)?;
+        rt::put_field(out, 12, self.handle_count)?;
+        rt::put_field(out, 16, self.arg_count)?;
+        rt::put_field(out, 20, self.arg_bytes)?;
+        rt::put_field(out, 24, self.env_count)?;
+        rt::put_field(out, 28, self.env_bytes)?;
+        Ok(())
+    }
+}
+
+/// One handle a start record names (ADR-0005 C4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartEntry {
+    /// Its value in the process's table.
+    pub handle: u32,
+    /// The type of the object it names.
+    pub object_type: ObjectType,
+    /// Its rights.
+    pub rights: Rights,
+    /// What it is for.
+    pub role: StartRole,
+}
+
+impl StartEntry {
+    /// Byte offset of `handle`.
+    pub const HANDLE_AT: usize = 0;
+    /// Byte offset of `object_type`.
+    pub const OBJECT_TYPE_AT: usize = 4;
+    /// Byte offset of `rights`.
+    pub const RIGHTS_AT: usize = 8;
+    /// Byte offset of `role`.
+    pub const ROLE_AT: usize = 12;
+}
+
+impl rt::Fixed for StartEntry {
+    const SIZE: usize = 16;
+    const FILLER: Self = Self {
+        handle: <u32 as rt::Fixed>::FILLER,
+        object_type: <ObjectType as rt::Fixed>::FILLER,
+        rights: <Rights as rt::Fixed>::FILLER,
+        role: <StartRole as rt::Fixed>::FILLER,
+    };
+    fn read(oidl_bytes: &[u8], oidl_minor: u16) -> Result<Self, rt::WireError> {
+        if oidl_bytes.len() != Self::SIZE {
+            return Err(rt::WireError::Size);
+        }
+        let handle: u32 = rt::field(oidl_bytes, 0, oidl_minor)?;
+        let object_type: ObjectType = rt::field(oidl_bytes, 4, oidl_minor)?;
+        let rights: Rights = rt::field(oidl_bytes, 8, oidl_minor)?;
+        let role: StartRole = rt::field(oidl_bytes, 12, oidl_minor)?;
+        Ok(Self { handle, object_type, rights, role })
+    }
+    fn write(self, out: &mut [u8]) -> Result<(), rt::WireError> {
+        if out.len() != Self::SIZE {
+            return Err(rt::WireError::Size);
+        }
+        out.fill(0);
+        rt::put_field(out, 0, self.handle)?;
+        rt::put_field(out, 4, self.object_type)?;
+        rt::put_field(out, 8, self.rights)?;
+        rt::put_field(out, 12, self.role)?;
         Ok(())
     }
 }
