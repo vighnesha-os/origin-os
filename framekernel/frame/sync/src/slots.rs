@@ -81,7 +81,10 @@ pub struct Counts {
     pub retired: usize,
     /// Lost slots: never reused.
     pub lost: usize,
-    /// Pages mapped in Live, Idle and Retired slots, and in slots being reclaimed.
+    /// Pages mapped in the region: those of Live, Idle and Retired slots, of slots being
+    /// reclaimed, and of slots lost by [`Slots::leak`], which stay mapped because a processor
+    /// may still run on them. A slot lost by a stalled [`Slots::reclaim`] counts none: its pages
+    /// had left the tables before the shootdown.
     pub pages: u64,
 }
 
@@ -535,6 +538,25 @@ mod tests {
                 ..Counts::default()
             }
         );
+    }
+
+    /// A slot lost by `leak` stays mapped, so its pages stay counted; one lost by a stalled
+    /// reclaim had left the tables, so its pages do not (the test above).
+    #[test]
+    fn a_leaked_slot_keeps_its_pages_counted() {
+        let slots = Slots::<2, 0>::new();
+        let taken = slots.take(3).unwrap();
+        assert!(slots.leak(taken.slot));
+        assert_eq!(slots.state(taken.slot), Some(State::Lost));
+        assert_eq!(
+            slots.counts(),
+            Counts {
+                lost: 1,
+                pages: 3,
+                ..Counts::default()
+            }
+        );
+        assert!(!slots.leak(taken.slot), "only a Live slot is leaked");
     }
 
     #[test]
