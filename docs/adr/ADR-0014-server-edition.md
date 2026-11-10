@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-10, as recommended ("Accept all", decision sheet items 71–76 and 81; CLAUDE.md §18). Nothing here is built. It is not an ABI or format decision: how an edition is written into the release manifest is left to a later format decision (§84). |
+| Status | **Accepted** by the owner on 2026-11-10, as recommended ("Accept all", decision sheet items 71–76 and 81; CLAUDE.md §18). **Amendment 1 (below): Accepted** by the owner on 2026-11-10 (item 117); it rewords S4. Nothing here is built. It is not an ABI or format decision: how an edition is written into the release manifest is left to a later format decision (§84). |
 | Requires | CLAUDE.md P0, P1, P2, P3, P6, P8; header (production objective, target hardware); §1, §11, §26, §44, §48–§50, §52–§54, §57–§59, §61, §62, §64, §69, §74, §76, §82; final rules 10–12, 14, 19, 30, 40 |
 | Evidence | The owner's direction (below); ADR-0009's KVM boots on GitHub's runners; ADR-0010's screen-dump test; the checks in Evidence |
 | Builds on | ADR-0009 (hardware targets, H2), ADR-0010 (the GOP framebuffer console), ADR-0011 (N1, N2, N7, N9, N11) |
@@ -138,3 +138,36 @@ Virtualization and containers come later, with their own ADR.
 5. Server sessions cheap and closed (S5)? **Yes** (item 75).
 6. Software written for other systems decided later, Rust `std` first (S6)? **Yes** (item 76).
 7. Four server SDK areas added to §49 (S7)? **Yes** (item 81).
+
+## Amendment 1 (Accepted, 2026-11-10): what "only through the native GUI" means, and three requirements on remote administration
+
+**Status: Accepted by the owner on 2026-11-10, as recommended ("Accept all", decision sheet item 117; CLAUDE.md §18). It rewords S4 and item 74. Nothing is built.** The evidence is finding 12 of `docs/engineering/DESIGN_REVIEW_2026-11-10.md`.
+
+| # | Decision |
+|---|---|
+| A1 | **S4's rule is that the GUI is always enough.** Every administrative operation is available in the native GUI, and none needs a terminal. S4's three routes stand. The rule does not forbid other SDK clients, which ADR-0011 N2 and CLAUDE.md §70 already allow. |
+| A2 | **Installing without an operator, and configuring many machines, are done through the SDK.** Origin Setup applies a signed, declarative provisioning document. No script runs (ONBF-R3). The document's format is a decision of its own (§84). |
+| A3 | **The remote-administration ADR (S7) must provide three things.** (a) Each remote session is a process of its own under the authenticated principal, holding only that session's handles, so the kernel's stamp names the administrator and not the endpoint (ADR-0011 N9). (b) A stated list of the interfaces that may be carried to a remote caller. This narrows S7's "any SDK interface". (c) A published protocol, with a hybrid key exchange (X25519 with ML-KEM-768, FIPS 203) to match the signature profile. FIPS 203 joins CLAUDE.md §17 with that ADR. |
+
+**Why.**
+
+- "Only" left no place for a machine nobody sits at when it is installed, or for a hundred machines that need the same setting. Neither needs a terminal, and neither is a GUI.
+- The kernel stamps each message with the process that wrote it. An endpoint that relays a remote caller's calls is stamped as itself, so every service would apply its policy and its audit to the endpoint.
+
+**Alternatives.**
+
+| Alternative | For | Against |
+|---|---|---|
+| Keep "GUI only" to the letter | The simplest reading of the owner's words | Every server is installed and configured by hand, one at a time |
+| A scripting interface for administrators | Familiar to administrators | It is the second control plane ADR-0011 N1 removes |
+| One endpoint process that names the administrator in each message it relays | Fewer processes | Services would trust a claim in the data, not the kernel's stamp; one flaw in the endpoint speaks for every administrator |
+
+**Trade-offs.** A process for each remote session costs memory, and the list of carried interfaces has to be kept as interfaces are added. In return a remote administrator has exactly the rights of the same person at the console, and no more.
+
+**Migration consequences.** None: nothing is built, and no interface or format exists for any of it. CLAUDE.md §48 says A1 and A2 in revision 7.4.
+
+**Threat model (§58), one more row.**
+
+| Interface | Attacker | Defence |
+|---|---|---|
+| The remote administration endpoint, as a deputy | A remote caller who gets the endpoint to use its own authority for the caller's request | Each session is a process under the caller's principal with only that session's handles (A3a); only listed interfaces are carried (A3b) |
