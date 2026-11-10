@@ -91,7 +91,7 @@
 14. **Radio cryptography (§59, ADR-0015 D6), when Wi-Fi or Bluetooth work starts:** P-256, AES-CCM and AES-GCM, AES-CMAC and HMAC-based key derivation, each with known-answer and differential tests like the existing verifiers.
 15. **Origin Server (ADR-0014), after M9:** OIDL interfaces for remote administration, service management, hardware health and remote desktop (S7); the remote desktop ADR (S4); the release manifest's edition field (§84); an ADR-0009 amendment for 2026-generation server targets (S3).
 16. **The CPU identification table (ADR-0009 Amendment 1, items 88–89):**
-    - one table from vendor, family and model to core generation, built from Intel's SDM Volume 4 and AMD's processor references, and the home for errata keyed by family, model and stepping;
+    - one table from vendor, family and model to core generation, built from Intel's and AMD's own publications (the numbers the rule uses are confirmed in `docs/research/2026-11-10-cpu-identification.md`; Diamond Rapids is not), and the home for errata keyed by family, model and stepping;
     - the kernel's one-line scope report at boot, with no refusal;
     - two QEMU boots that set `family=` and `model=`, one in scope and one outside it.
 

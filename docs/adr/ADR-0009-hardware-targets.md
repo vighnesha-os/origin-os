@@ -126,11 +126,11 @@ CPUID reports a vendor, a family and a model, which identify the core generation
 
 | Answer | Rule |
 |---|---|
-| AMD, Zen 5 or newer | Vendor `AuthenticAMD` and family 1Ah or higher. Family 1Ah holds only Zen 5 and Zen 6, and later generations take higher families, so no model list is needed |
-| Intel, a 2026 generation | Vendor `GenuineIntel` and family 18 (12h) or higher (Nova Lake is 18, Diamond Rapids 19); or family 6 with model CCh or E5h (Panther Lake), D5h (Wildcat Lake) or DDh (Clearwater Forest) |
+| AMD, Zen 5 or newer | Vendor `AuthenticAMD` and family 1Ah or higher. AMD lists every older core in family 17h or 19h. Family 1Ah begins with Zen 5 (EPYC 9005) and continues into models first documented from December 2025. So no model list is needed |
+| Intel, a 2026 generation | Vendor `GenuineIntel` and family 18 (12h) or higher (Nova Lake is 18); or family 6 with model CCh or E5h (Panther Lake cores), D5h (Wildcat Lake) or DDh (Clearwater Forest) |
 | Anything else | Outside the scope, including other vendors and every older family or model |
 
-- **Where the numbers come from.** They come from one CPU identification table built from Intel's SDM Volume 4 and AMD's processor references. On 2026-11-10 they were cross-checked against the Linux kernel's tables, which serve as evidence only (§3). The same table holds the errata workarounds keyed by family, model and stepping (P0). New 2026+ family-6 models are added to it as Intel publishes them.
+- **Where the numbers come from.** They come from one CPU identification table built from Intel's and AMD's own publications. The numbers above were confirmed on 2026-11-10 against Intel's microcode release notes and perfmon map, and against AMD's uProf guide and processor references (`docs/research/2026-11-10-cpu-identification.md`). The same table holds the errata workarounds keyed by family, model and stepping (P0). New 2026+ family-6 models are added to it as Intel publishes them.
 - **At boot.** The kernel prints one line saying whether the machine is in scope or a bench machine, and why.
 - **It never refuses to boot.** Every machine Origin can be tested on today is outside the scope: GitHub's runners, QEMU on the Mac, and every rentable server found on 2026-11-09. A refusal would stop all testing.
 - **Features still come from feature bits.** Instructions are chosen from CPUID feature bits (§14, §24). The generation decides only the scope line.
@@ -147,7 +147,7 @@ At M9, the owner decides whether the production installer warns on or refuses ma
 | Alternative | Why not |
 |---|---|
 | Check the launch year | CPUID reports none |
-| A model list for AMD | Unneeded: family 1Ah or higher is exactly Zen 5 or newer |
+| A model list for AMD | Unneeded: family 1Ah or higher is Zen 5 or newer |
 | A feature floor instead of the generation | One floor cannot fit both vendors: what is new in Intel's 2026 cores (FRED, for example) is missing from Zen 5 |
 | Refuse to boot outside the scope | Stops every test available today |
 | No check (H2 as written) | The owner asked for a strict rule, and the scope could not be reported |
@@ -157,13 +157,15 @@ At M9, the owner decides whether the production installer warns on or refuses ma
 
 Checked 2026-11-10:
 
-- **Intel family and model numbers:** Linux's [`intel-family.h`](https://github.com/torvalds/linux/blob/master/arch/x86/include/asm/intel-family.h).
-- **AMD Zen 5 and Zen 6 model ranges in family 1Ah:** Linux's [`amd.c`](https://github.com/torvalds/linux/blob/master/arch/x86/kernel/cpu/amd.c).
-- **Gorgon Point is Zen 5, family 1Ah:** [Wikipedia](https://en.wikipedia.org/wiki/Zen_5).
+- **Family and model numbers, from Intel's and AMD's own publications:** `docs/research/2026-11-10-cpu-identification.md`.
+  - Intel confirms every Intel number above. Diamond Rapids, which Linux lists as family 19, is not confirmed by Intel, and the rule does not depend on it.
+  - AMD confirms family 1Ah for EPYC 9005 and for the models documented in 2026, and family 17h and 19h for the older EPYC generations.
+  - Before this, the numbers were first read from two Linux source files. That ledger's section 4 records it, and they are no longer the evidence.
+- **Gorgon Point is Zen 5, family 1Ah:** [Wikipedia](https://en.wikipedia.org/wiki/Zen_5). Its model number is still unconfirmed.
 - **Gorgon Point is a refresh:** [Igor'sLAB](https://www.igorslab.de/amd-ryzen-ai-400-alias-gorgon-point-viel-neue-etiketten-aber-nach-bisherigem-stand-eher-ein-refresh-von-strix-und-krackan/), [Tom's Hardware](https://www.tomshardware.com/pc-components/cpus/amds-ryzen-ai-400-series-includes-the-first-copilot-desktop-cpu-team-red-refreshes-zen-5-apus-and-strix-halo).
 - **Launches:** Zen 6 EPYC in July 2026 ([Club386](https://www.club386.com/amd-confirms-zen-6-launch-date/)); Intel's 2026–2028 roadmap ([Tom's Hardware](https://www.tomshardware.com/tech-industry/semiconductors/intel-chip-roadmap-2026-2028)).
 
-Before the table is built, every number must be confirmed against Intel's and AMD's own documents.
+Each row the table adds later needs the same kind of vendor source, recorded beside it.
 
 ### Trade-offs and migration
 
