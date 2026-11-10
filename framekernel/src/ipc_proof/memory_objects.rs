@@ -5,9 +5,9 @@
 //! - **Sharing:** A makes an object, maps it at a fixed address, writes to it and passes the
 //!   handle to B, which maps it too, reads A's word and writes its own, which A then reads. A
 //!   reduces its mapping to read-only: an increase is refused, and A's next write faults at the
-//!   mapping. B is refused a fixed address over its own mapping, and execute; places two
-//!   mappings at random; closes the handle and still reads through its mapping; unmaps it, and
-//!   its next read faults there.
+//!   mapping. B is refused a fixed address over its own mapping, execute, and a mapping that
+//!   allows what the handle it is made through does not; places two mappings at random; closes
+//!   the handle and still reads through its mapping; unmaps it, and its next read faults there.
 //! - **Quotas:** Q's objects are refused past its bound and taken again once one is closed; a
 //!   closed object it still maps keeps its charge; a third mapping past its limit of two is
 //!   refused.
@@ -34,7 +34,7 @@ use origin_frame::proof_programs::{self, DATA, STACK};
 use super::Arg::{Handle as Hd, Imm};
 use super::{
     Arg, CODE, Image, LIMITS, MSG, PSEUDO_REPORT32, RBUF, RECV, Script, Step, Want, await_end,
-    close, copy32, h, map_request, object_request, read, read_handles, readable, reported_u64,
+    close, copy32, dup, h, map_request, object_request, read, read_handles, readable, reported_u64,
     slot_addr, statuses_right, step, value_at, write, write_slot,
 };
 use crate::console::Console;
@@ -311,6 +311,9 @@ struct BMarks {
     kept: usize,
     /// The map that asks for execute.
     execute: usize,
+    /// The writable map through a handle without `write`, then the map through one without
+    /// `read`.
+    by_rights: usize,
     /// The two random maps' statuses, then their addresses, each in two words.
     random: usize,
     /// The handle's close, and what the mapping reads after it.
@@ -395,6 +398,26 @@ fn sharing(cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> Option<(Run<AMarks>
         out(1),
         Error::AccessDenied.raw(),
     ));
+    // What a handle allows bounds what a mapping made through it allows (C7): nothing
+    // writable without `write`, and nothing at all without `read`. Each handle has `map`, and
+    // each place is free.
+    s.call(dup("", object, rights::READ | rights::MAP, 1, OK));
+    s.call(dup("", object, rights::WRITE | rights::MAP, 2, OK));
+    let by_rights = s.reported();
+    s.call(map_object(
+        h(0),
+        h(1),
+        A_MAP,
+        out(1),
+        Error::AccessDenied.raw(),
+    ));
+    s.call(map_object(
+        h(0),
+        h(2),
+        B_ANYWHERE,
+        out(1),
+        Error::AccessDenied.raw(),
+    ));
     let random = s.reported();
     s.call(map_object(h(0), object, B_ANYWHERE, out(2), OK));
     s.call(map_object(h(0), object, B_ANYWHERE, out(3), OK));
@@ -419,6 +442,7 @@ fn sharing(cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> Option<(Run<AMarks>
             over,
             kept,
             execute,
+            by_rights,
             random,
             close: close_at,
             unmap,
@@ -849,11 +873,13 @@ fn parts(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> b
     let no_replace =
         b.returned(b.marks.over, Error::InvalidArgs.raw()) && b.word(b.marks.kept) == Some(VALUE_A);
     let no_execute = b.returned(b.marks.execute, Error::AccessDenied.raw());
+    let by_rights = b.returned(b.marks.by_rights, Error::AccessDenied.raw())
+        && b.returned(b.marks.by_rights + 1, Error::AccessDenied.raw());
     let kept = b.returned(b.marks.close, OK) && b.word(b.marks.close + 1) == Some(VALUE_A);
     let _ = writeln!(
         com1,
-        "origin-kernel: memory: a fixed address over a mapping is refused, and the mapping keeps what was written to it: {no_replace}; execute is refused: {no_execute}; two random placements are apart, page-aligned and in their region: {random}; closing the handle leaves the mapping working: {kept}{}",
-        verdict(no_replace && no_execute && random && kept)
+        "origin-kernel: memory: a fixed address over a mapping is refused, and the mapping keeps what was written to it: {no_replace}; execute is refused: {no_execute}; a handle without write maps nothing writable, and one without read maps nothing: {by_rights}; two random placements are apart, page-aligned and in their region: {random}; closing the handle leaves the mapping working: {kept}{}",
+        verdict(no_replace && no_execute && by_rights && random && kept)
     );
 
     // Every call of Q's is about its quota.
@@ -963,6 +989,7 @@ fn parts(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> b
         && read_fault
         && no_replace
         && no_execute
+        && by_rights
         && random
         && kept
         && quota

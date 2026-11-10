@@ -1913,7 +1913,7 @@ fn directory_markers() -> Vec<String> {
 fn memory_markers() -> Vec<String> {
     vec![
         "origin-kernel: memory: two processes share an object by passing its handle, and each reads what the other wrote: true; protect to read-only refuses an increase and makes a write fault at the mapping: true; unmap makes a read fault there: true".into(),
-        "origin-kernel: memory: a fixed address over a mapping is refused, and the mapping keeps what was written to it: true; execute is refused: true; two random placements are apart, page-aligned and in their region: true; closing the handle leaves the mapping working: true".into(),
+        "origin-kernel: memory: a fixed address over a mapping is refused, and the mapping keeps what was written to it: true; execute is refused: true; a handle without write maps nothing writable, and one without read maps nothing: true; two random placements are apart, page-aligned and in their region: true; closing the handle leaves the mapping working: true".into(),
         "origin-kernel: memory: the quota refuses an object past its bound and takes one again once an object is closed; a closed object still mapped keeps its charge; a third mapping past the limit of two is refused: true; once the process has ended its account owes nothing: true".into(),
         "origin-kernel: memory: mapping into another process needs write on its handle, and with it the two share the frame: true; unmapping there needs it too, and the other's next read faults: true".into(),
         "origin-kernel: memory: a hostile unmap loop is refused with should_wait once its budget is spent, changing nothing: true; it is served again once the budget refills: true".into(),
