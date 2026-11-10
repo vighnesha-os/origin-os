@@ -232,6 +232,7 @@ fn cases() -> Vec<(Code, Case)> {
         (NameCollision, Case::Sources(sys("/// e\nenum e: u8 { a_1 = 1; a1 = 2; }"))),
         (NameCollision, Case::Sources(sys("/// i\ninterface types {\n/// m\nmethod m = 1 () errors() requires none;\n}"))),
         (NameCollision, Case::Sources(sys(&one("method holds = 1 () errors() requires none;")))),
+        (NameCollision, Case::Sources(sys(&one("method transport = 1 () errors() requires none;")))),
         (DuplicateRole, Case::Sources(sys("/// s\nenum status: i64 { ok = 0; }"))),
         (DuplicateRole, Case::Sources(sys("/// r\nbits rights: u32 { a = 0; }"))),
         (DuplicateRole, Case::Sources(sys("/// o\nenum object_type: u32 { a = 1; }"))),

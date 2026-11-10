@@ -2647,8 +2647,10 @@ fn gen_channel_client(g: &Gen<'_>, interface: &Interface) -> String {
     t.shut("}");
     t.blank();
     t.open(format!("impl<T: rt::Transport> {name}<T> {{"));
-    t.line("/// Runs the hello (§7.7).");
-    t.open("pub fn connect(mut transport: T, scratch: &mut rt::Scratch<'_>) -> Result<Self, rt::CallError<core::convert::Infallible>> {");
+    // `new`, a C++ keyword and so never a method's name (§2): any other name would take one from
+    // the interfaces.
+    t.line("/// Runs the hello (§7.7), and on success is the connection.");
+    t.open("pub fn new(mut transport: T, scratch: &mut rt::Scratch<'_>) -> Result<Self, rt::CallError<core::convert::Infallible>> {");
     t.line("let oidl_hello = rt::Hello { interface_id: INTERFACE_ID, major: VERSION.0, minor: VERSION.1 };");
     t.line("let oidl_total = rt::write_hello(scratch.bytes, rt::KIND_REQUEST, 1, oidl_hello).map_err(rt::CallError::Protocol)?;");
     t.line("let (oidl_n, oidl_h) = transport.call(scratch.bytes, oidl_total, &[], scratch.received).map_err(rt::CallError::Transport)?;");

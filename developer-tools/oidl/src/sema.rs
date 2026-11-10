@@ -1583,7 +1583,9 @@ fn check_generated_names(library: &Library, file: &str) -> Result<(), Diagnostic
         }
         let mut local = HashSet::new();
         for method in &interface.methods {
-            if matches!(method.name.as_str(), "holds" | "connect" | "transport") {
+            // The server trait's `holds` and the client's `transport`. The client's hello is
+            // `new`, which is reserved already as a C++ keyword.
+            if matches!(method.name.as_str(), "holds" | "transport") {
                 return fail(file, pos, Code::NameCollision, method.name.clone());
             }
             let base = pascal(&method.name);
