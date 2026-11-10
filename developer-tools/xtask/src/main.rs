@@ -1676,10 +1676,11 @@ fn boot_failures() -> Vec<&'static str> {
         ": sysfs failed",
         ": GPT failed",
         ": IOMMU failed",
-        // ADR-0017: a control that did not read back, a processor that recorded nothing, a
+        // ADR-0017: a control that did not read back, a processor that left no record, a
         // lookup out of range, an IBPB miscounted. A control the machine lacks is not here.
-        "did not read back as written",
-        "recorded nothing",
+        // (The topology proof's healthy line says "0 recorded nothing": not that phrase.)
+        "a control register did not read back as written",
+        "left no record of its controls",
         ": nospec failed",
         ": ibpb failed",
     ]

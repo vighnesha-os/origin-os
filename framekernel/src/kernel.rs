@@ -419,7 +419,7 @@ fn prove_speculation(com1: &mut Console, cpus: &[cpu::CpuIndex]) -> bool {
         let Some((plan, held)) = speculation::recorded(c.get()) else {
             let _ = writeln!(
                 com1,
-                "origin-kernel: speculation: processor {} recorded nothing",
+                "origin-kernel: speculation: processor {} left no record of its controls",
                 c.get()
             );
             sound = false;
@@ -428,7 +428,7 @@ fn prove_speculation(com1: &mut Console, cpus: &[cpu::CpuIndex]) -> bool {
         if !held {
             let _ = writeln!(
                 com1,
-                "origin-kernel: speculation: processor {}: a control did not read back as written",
+                "origin-kernel: speculation: processor {}: a control register did not read back as written",
                 c.get()
             );
         }
