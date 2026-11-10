@@ -1160,7 +1160,8 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: kernel segment 2: R at ".into(),
             "origin-kernel: kernel segment 3: RW at ".into(),
             "origin-kernel: GDT, TSS and IDT loaded (32 exception vectors)".into(),
-            "origin-kernel: exception 3 (#BP breakpoint) at rip ".into(),
+            // An image offset, never the image's base (ADR-0004 Amendment 2, A6.2).
+            "origin-kernel: exception 3 (#BP breakpoint) at rip image +0x".into(),
             "origin-kernel: breakpoint handled; resuming".into(),
             // CPU features: QEMU's `max` CPU has every x86-64-v3 feature, so the kernel must
             // find the baseline met (CLAUDE.md §14); below it, the kernel refuses to boot.
@@ -1198,7 +1199,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: APIC timer: 50 interrupts at 100 Hz in ".into(),
             // The wait for Transactions Pending, once the TSC is calibrated: none is pending.
             "origin-kernel: PCIe: bus mastering: 1 of 7 functions have a PCI Express capability; Transactions Pending clear on 1 of them after waiting ".into(),
-            "origin-kernel: NMI taken on its own stack (IST2): frame at ".into(),
+            "origin-kernel: NMI taken on its own stack (IST2): frame at image +0x".into(),
             // The clocks (CLAUDE.md §68): the TSC rate proven against one RTC second, and
             // the wall clock read from the RTC, which `qemu_command` starts at RTC_BASE.
             "origin-kernel: clock: TSC at ".into(),

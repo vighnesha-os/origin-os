@@ -1137,17 +1137,20 @@ impl Drop for Console {
 }
 
 /// One exception report, from the trap entry's hook: it gets out even if this processor
-/// faulted inside the console.
+/// faulted inside the console. Every value that may be an address is printed as the framework
+/// tells it: an offset from the base of the sliding window it is in, never a base, in every mode
+/// (ADR-0004 Amendment 2, A6.2).
 pub(crate) fn report_exception(r: &origin_frame::trap::ExceptionReport<'_>) {
     use crate::descriptors::exception_name;
+    use crate::phys::told;
     use core::fmt::Write as _;
     let mut com1 = Console::urgent();
     let _ = writeln!(
         com1,
-        "origin-kernel: exception {} ({}) at rip {:#x}, error code {:#x}",
+        "origin-kernel: exception {} ({}) at rip {}, error code {:#x}",
         r.vector,
         exception_name(r.vector),
-        r.rip,
+        told(r.rip),
         r.error_code
     );
     if r.vector == 3 {
@@ -1156,8 +1159,14 @@ pub(crate) fn report_exception(r: &origin_frame::trap::ExceptionReport<'_>) {
     }
     let _ = writeln!(
         com1,
-        "origin-kernel: rsp {:#x} rflags {:#x} cs {:#x} rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x}",
-        r.rsp, r.rflags, r.cs, r.rax, r.rbx, r.rcx, r.rdx
+        "origin-kernel: rsp {} rflags {:#x} cs {:#x} rax {} rbx {} rcx {} rdx {}",
+        told(r.rsp),
+        r.rflags,
+        r.cs,
+        told(r.rax),
+        told(r.rbx),
+        told(r.rcx),
+        told(r.rdx)
     );
     if let Some(report) = r.machine_check {
         let _ = writeln!(com1, "origin-kernel: machine check: {report}");
