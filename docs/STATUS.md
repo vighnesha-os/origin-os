@@ -149,10 +149,10 @@ The owner asked for a very careful review of CLAUDE.md and the design documents.
 
 - The editions branch (revision 7.3, ADR-0014, ADR-0015, items 71–97) is committed, pushed and merged with the landing line.
 - The commit that held Intel's VT-d PDF is on no branch, and it was never pushed. `.gitignore` now keeps `specifications/` and PDFs out.
+- **TASKS item 17 (2026-11-10, branch `claude/funny-torvalds-9a28a0`):** no assembly block of the kernel or the loader declares `preserves_flags` unless every instruction in it is one that both Intel's and AMD's manuals say changes no status flag. The review named 12 blocks; 22 lost the option, and no instruction changed. Four gates in `cargo xtask check` now hold the rules: that one; only 22 listed files of the framework hold `unsafe`, and every other file there forbids it; no document or archive is tracked or left in a branch's history; and the §11 lint also refuses `cfg(unix)`, `target_family` and `target_env`. QEMU only, and no human has reviewed it.
 
 **Not built, and needed before ADR-0011 N14 step 4 puts a real program in ring 3:**
 
-- Twelve `asm!` blocks declare `preserves_flags`, and five of them write the flags (TASKS item 17).
 - Randomness comes straight from the processor's instructions, with no generator and no health gate (TASKS item 18).
 - There is no system threat model, and no decision on speculative execution (TASKS item 19).
 
