@@ -15,7 +15,8 @@
 //!   that was ever present, so it needs no shootdown and costs its caller's budget nothing.
 //! - **Unmap and protect are priced before they run** against the caller's budget, and refused
 //!   with `should_wait`, changing nothing, if it cannot pay (T15, T16); what each cost
-//!   (`Change`) is charged afterwards.
+//!   (`Change`) is charged afterwards. A mapping another call is making or changing at that
+//!   moment is `should_wait` too, before anything is priced (the note on D5).
 //! - **A map tells its caller the address before the mapping can be used by any other call.**
 //!   If that fails, the mapping is taken back whatever the budget holds, and its cost charged
 //!   afterwards: a mapping nobody was told of does not stay.
@@ -277,7 +278,9 @@ fn settle(caller: &Process, paid: u64, change: Change) {
 }
 
 /// `memory_unmap`: removes `target`'s whole mapping that is exactly `length` bytes from `base`
-/// (C7), charged to `caller`.
+/// (C7), charged to `caller`. A mapping another call is making or changing at this moment is
+/// `ShouldWait`, before anything is priced: nothing is changed and nothing spent (the note on
+/// D5).
 pub(crate) fn unmap(
     caller: &Process,
     target: &Process,
@@ -320,7 +323,9 @@ pub(crate) fn unmap(
 }
 
 /// `memory_protect`: reduces what `target`'s whole mapping that is exactly `length` bytes from
-/// `base` allows to `access` bits (C7), charged to `caller`.
+/// `base` allows to `access` bits (C7), charged to `caller`. A busy mapping is `ShouldWait`, as
+/// in [`unmap`], before `access` is compared with what the mapping allows: that is not settled
+/// while another call changes it.
 pub(crate) fn protect(
     caller: &Process,
     target: &Process,

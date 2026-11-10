@@ -11,7 +11,9 @@
 //!   or the user half, or not in whole pages, is `invalid_args`.
 //! - **A process's mappings** are whole: unmap and protect act on exactly one (C7). A record is
 //!   reserved, busy, before its pages are mapped, and is busy again while it changes, so the
-//!   address space's own work runs with none of these records' locks held.
+//!   address space's own work runs with none of these records' locks held. An unmap or protect
+//!   that names a busy mapping is `should_wait`, with nothing changed: a retry takes the mapping
+//!   or finds it gone (the note on D5, the owner's item 155).
 //! - **The budget** is a generic cell rate: each unit (one shootdown, or one processor it
 //!   interrupts) costs an interval of credit, and at most `burst` units can be spent ahead of
 //!   time. A change is priced before it runs and refused if the budget cannot pay.
@@ -291,7 +293,8 @@ struct Record<T> {
     base: u64,
     pages: u64,
     allow: Allow,
-    /// Being mapped, unmapped or protected: no other change may touch it.
+    /// Being mapped, unmapped or protected: no other change may touch it, and one that tries
+    /// is told to wait.
     busy: bool,
     object: T,
 }
@@ -387,14 +390,19 @@ impl<T> Mappings<T> {
         }
     }
 
-    /// Takes the whole mapping that is exactly the `pages` pages from `base`, made and not
-    /// changing, for a change: what it allows. `InvalidArgs` if there is none.
+    /// Takes the whole mapping that is exactly the `pages` pages from `base` for a change: what
+    /// it allows. `InvalidArgs` if there is none. `ShouldWait` if another call is making or
+    /// changing it at this moment: it is not taken and stays as it was, and a retry takes it
+    /// or finds it gone (ADR-0005, the note on D5; the owner's item 155).
     pub fn begin(&mut self, base: u64, pages: u64) -> Result<Allow, Error> {
         let r = self
             .records
             .iter_mut()
-            .find(|r| r.base == base && r.pages == pages && !r.busy)
+            .find(|r| r.base == base && r.pages == pages)
             .ok_or(Error::InvalidArgs)?;
+        if r.busy {
+            return Err(Error::ShouldWait);
+        }
         r.busy = true;
         Ok(r.allow)
     }
@@ -715,7 +723,7 @@ mod tests {
         let a = 0x0000_2000_0000_0000;
         assert_eq!(m.reserve(a, 2, Allow::ReadWrite, 1), Ok(()));
         // Busy until made: nothing may change it.
-        assert_eq!(m.begin(a, 2), Err(Error::InvalidArgs));
+        assert_eq!(m.begin(a, 2), Err(Error::ShouldWait));
         m.made(a);
         // Overlaps, at either end and inside.
         for (base, pages) in [(a, 1), (a + PAGE, 1), (a - PAGE, 2), (a - PAGE, 4)] {
@@ -735,7 +743,7 @@ mod tests {
         assert_eq!(m.begin(a, 1), Err(Error::InvalidArgs));
         assert_eq!(m.begin(a + PAGE, 1), Err(Error::InvalidArgs));
         assert_eq!(m.begin(a, 2), Ok(Allow::ReadWrite));
-        assert_eq!(m.begin(a, 2), Err(Error::InvalidArgs), "already changing");
+        assert_eq!(m.begin(a, 2), Err(Error::ShouldWait), "already changing");
         m.end(a, Allow::Read);
         assert_eq!(m.get(a), Some((2, Allow::Read, false)));
         assert_eq!(m.remove(a), Some(1));
@@ -748,6 +756,37 @@ mod tests {
             m.reserve(a, 1, Allow::Read, 4),
             Err((Error::InvalidArgs, 4))
         );
+    }
+
+    #[test]
+    fn a_mapping_another_call_is_changing_says_wait() {
+        let mut m: Mappings<u32> = Mappings::new(2);
+        let a = 0x0000_2000_0000_0000;
+        // Being made: the call that maps it has not told its caller yet.
+        assert_eq!(m.reserve(a, 2, Allow::ReadWrite, 1), Ok(()));
+        assert_eq!(m.begin(a, 2), Err(Error::ShouldWait), "being made");
+        assert_eq!(
+            m.get(a),
+            Some((2, Allow::ReadWrite, true)),
+            "the refusal took nothing: it is still its maker's"
+        );
+        m.made(a);
+        // Being changed.
+        assert_eq!(m.begin(a, 2), Ok(Allow::ReadWrite));
+        assert_eq!(m.begin(a, 2), Err(Error::ShouldWait), "being changed");
+        assert_eq!(m.begin(a, 2), Err(Error::ShouldWait), "and again");
+        assert_eq!(m.get(a), Some((2, Allow::ReadWrite, true)));
+        // What is no one mapping is a bad argument, busy or not.
+        assert_eq!(m.begin(a, 1), Err(Error::InvalidArgs));
+        assert_eq!(m.begin(a + PAGE, 1), Err(Error::InvalidArgs));
+        assert_eq!(m.begin(a + 2 * PAGE, 2), Err(Error::InvalidArgs));
+        // A retry takes the mapping once the change is over, with what it now allows ...
+        m.end(a, Allow::Read);
+        assert_eq!(m.begin(a, 2), Ok(Allow::Read));
+        // ... or finds it gone.
+        assert_eq!(m.begin(a, 2), Err(Error::ShouldWait));
+        assert_eq!(m.remove(a), Some(1));
+        assert_eq!(m.begin(a, 2), Err(Error::InvalidArgs));
     }
 
     #[test]

@@ -741,10 +741,11 @@ pub trait Calls {
     fn memory_map(&self, process: rt::HandleArg, object: rt::HandleArg, request: rt::UserRef<MapRequest>, address: rt::UserRef<u64>) -> Result<(), MemoryMapError>;
     /// Removes one whole mapping (ADR-0005 P7, C7, D3). When it returns, no processor reaches its
     /// pages through this process. invalid_args: address and length are not exactly one
-    /// mapping. should_wait: the process's budget of shootdowns cannot pay for it now, and
-    /// nothing changed. timed_out: a processor did not answer the shootdown; the mapping is
-    /// gone, and its frames are kept from reuse for good. no_memory: only after such a stall,
-    /// when the kernel heap cannot replace the bookkeeping it leaked (D5).
+    /// mapping. should_wait: the process's budget of shootdowns cannot pay for it now, or
+    /// another call is making or changing the mapping at this moment; either way nothing
+    /// changed. timed_out: a processor did not answer the shootdown; the mapping is gone, and
+    /// its frames are kept from reuse for good. no_memory: only after such a stall, when the
+    /// kernel heap cannot replace the bookkeeping it leaked (D5).
     fn memory_unmap(&self, process: rt::HandleArg, address: u64, length: u64) -> Result<(), MemoryUnmapError>;
     /// Reduces what one whole mapping allows (ADR-0005 P7, C7, D3). When it returns, no processor
     /// uses the old access. access_denied: the new access is not within the old one.
