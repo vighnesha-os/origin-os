@@ -8,10 +8,26 @@
 //! The orderings are the classic ones. Taking a reference needs none: the taker already holds
 //! one. Releasing one is `Release`, so everything its holder did is published, and the last
 //! release is followed by an `Acquire` fence, so that whoever destroys the object sees all of it.
+//!
+//! The count cannot wrap round to zero, which would free the object under its holders: past
+//! [`MAX_REFERENCES`], [`RefCount::retain`] reports [`TooMany`] and its caller stops, as `Arc`
+//! aborts (review housekeeping of S3-5a). This crate cannot panic (`cargo xtask check`'s
+//! no-panic check), so the stop is the caller's.
 
 use core::sync::atomic::Ordering;
 
 use crate::prim;
+
+/// The most references a [`RefCount`] keeps counting, as for `Arc`: half the range of the
+/// count, so that it cannot wrap even if every processor took one more reference at once
+/// before any of them stopped.
+pub const MAX_REFERENCES: usize = isize::MAX as usize;
+
+/// The count went past [`MAX_REFERENCES`]. Whoever took the reference must not go on: the
+/// kernel's `ObjectRef` panics, and a kernel panic halts and never unwinds, so no holder can
+/// later bring the count down to zero early.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooMany;
 
 /// How many references to one object exist.
 #[derive(Debug)]
@@ -38,8 +54,16 @@ impl RefCount {
     }
 
     /// One more reference. The caller holds one already, so the object cannot go away.
-    pub fn retain(&self) {
-        self.count.fetch_add(1, Ordering::Relaxed);
+    ///
+    /// # Errors
+    ///
+    /// [`TooMany`] once the count has passed [`MAX_REFERENCES`]: the caller must stop rather
+    /// than use or give back the reference (see [`TooMany`]).
+    pub fn retain(&self) -> Result<(), TooMany> {
+        if self.count.fetch_add(1, Ordering::Relaxed) > MAX_REFERENCES {
+            return Err(TooMany);
+        }
+        Ok(())
     }
 
     /// Gives up one reference, and says whether it was the last: the caller of the last release
@@ -70,7 +94,7 @@ mod tests {
     fn only_the_last_release_says_so() {
         let count = RefCount::one();
         assert!(count.is_unique());
-        count.retain();
+        count.retain().unwrap();
         assert!(!count.is_unique());
         assert!(!count.release());
         assert!(count.is_unique());
@@ -82,7 +106,7 @@ mod tests {
         for _ in 0..100 {
             let count = RefCount::one();
             for _ in 1..8 {
-                count.retain();
+                count.retain().unwrap();
             }
             let last: u32 = std::thread::scope(|s| {
                 let handles: Vec<_> = (0..8)
@@ -92,5 +116,18 @@ mod tests {
             });
             assert_eq!(last, 1);
         }
+    }
+
+    /// A count cannot be driven round to zero: the reference after `MAX_REFERENCES` is
+    /// refused, and so is every one after it.
+    #[test]
+    fn past_the_limit_retain_says_stop() {
+        let count = RefCount {
+            count: prim::AtomicUsize::new(MAX_REFERENCES),
+        };
+        assert_eq!(count.retain(), Ok(()), "the last one that is counted");
+        assert_eq!(count.retain(), Err(TooMany));
+        assert_eq!(count.retain(), Err(TooMany));
+        assert!(!count.release(), "nowhere near zero");
     }
 }

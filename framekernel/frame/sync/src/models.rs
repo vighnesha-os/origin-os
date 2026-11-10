@@ -1946,7 +1946,7 @@ fn deferred_free_of_a_frame_shared_by_two_spaces() {
                 mappings: RefCount::one(),
                 frees: AtomicU64::new(0),
             });
-            shared.mappings.retain();
+            shared.mappings.retain().unwrap();
             let running = {
                 let (me, shared) = (user.clone(), Arc::clone(&shared));
                 (
