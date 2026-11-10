@@ -83,6 +83,10 @@
 //!   when the page left the tables happens before the frame is released (Loom's cell reports any
 //!   pair that is not ordered), and an unmap that shoots down releases exactly once, also for a
 //!   frame mapped in two spaces and unmapped from each by a different processor (`RefCount`).
+//! - The slots of a region (`slots.rs`, which `origin_frame::stack` instantiates for the kernel
+//!   stacks): a slot given back and reclaimed is taken again only once its shootdown has
+//!   completed, so its next holder finds no processor still holding the old translation, and
+//!   what it held is released only after every access through such a translation.
 //!
 //! # What is not proved
 //!
@@ -156,6 +160,7 @@ use crate::floor::MonotonicFloor;
 use crate::refcount::RefCount;
 use crate::runqueue::RunQueue;
 use crate::shootdown::{Request, Scope, Shootdown, TlbHardware};
+use crate::slots::Slots;
 use crate::wait::{Scheduler, TimedOut, WaitQueue};
 use crate::{RwLock, SpinLock};
 
@@ -2084,4 +2089,72 @@ fn world_switch(me: &IrqCpu, to: u64) {
     me.0.world.shootdown.switch_space(me, to, || {
         me.0.world.cr3[me.0.id].store(to, Relaxed);
     });
+}
+
+// ---------------------------------------------------------------- the slots of a region
+
+/// A one-slot region whose page is [`THE_PAGE`], given back and reclaimed by one processor while
+/// another holds the page's translation and touches the frame, and a third tries to take the
+/// slot: `origin_frame::stack`'s reclaim, with `vm`'s unmap and `tlb`'s shootdown stood in for
+/// by the world's. What the slot held is released only after every access through the old
+/// translation, and the taker gets the slot only once no processor holds that translation.
+#[test]
+fn slots_reclaimed_slot_is_taken_only_after_its_shootdown() {
+    check(
+        "slots_reclaimed_slot_is_taken_only_after_its_shootdown",
+        preempted(2, SPINS),
+        preempted(3, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let (near, holder, taker) =
+                (tlb_cpu(&world, 0), tlb_cpu(&world, 1), tlb_cpu(&world, 2));
+            for cpu in [&near, &holder, &taker] {
+                world.shootdown.mark_online(cpu);
+            }
+            world.tlb[1].store(true, Relaxed);
+            let slots = Arc::new(Slots::<1, 0>::new());
+            let taken = slots.take(1).expect("the slot is free");
+            // Nothing is kept for reuse (`IDLE` is 0): the slot is retired.
+            slots.give_back(taken.slot, true);
+            let frame = Arc::new(ModelFrame::new(0));
+            let holding = {
+                let (me, frame) = (holder.clone(), Arc::clone(&frame));
+                (
+                    1,
+                    thread::spawn(move || {
+                        me.touch(&frame);
+                        me.take_interrupt_then_touch(&frame);
+                        me.serve();
+                    }),
+                )
+            };
+            let taking = {
+                let (me, slots) = (taker.clone(), Arc::clone(&slots));
+                (
+                    2,
+                    thread::spawn(move || {
+                        if slots.take(1).is_some() {
+                            // Free again: no processor may still reach what was mapped there.
+                            assert!(!me.world.tlb[1].load(Relaxed), "{STALE}");
+                        }
+                        me.serve();
+                    }),
+                )
+            };
+            let outcome = slots.reclaim(
+                |_, _| {
+                    world.pte.store(0, Relaxed);
+                    Arc::clone(&frame)
+                },
+                |_, _| {
+                    world
+                        .shootdown
+                        .shoot(&near, Request::page(THE_PAGE), Scope::Kernel)
+                },
+                |frame| reuse(&frame),
+            );
+            assert!(matches!(outcome, Some(Ok(_))), "{NO_ANSWER}");
+            world.finish(vec![holding, taking]);
+        },
+    );
 }

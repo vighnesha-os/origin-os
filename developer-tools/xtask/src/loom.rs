@@ -125,6 +125,7 @@ const MODELS: &str = "framekernel/frame/sync/src/models.rs";
 const FLOOR: &str = "framekernel/frame/sync/src/floor.rs";
 const SHOOTDOWN: &str = "framekernel/frame/sync/src/shootdown.rs";
 const REFCOUNT: &str = "framekernel/frame/sync/src/refcount.rs";
+const SLOTS: &str = "framekernel/frame/sync/src/slots.rs";
 
 /// `WaitQueue::take_all`'s one critical section.
 const TAKE_ALL: &str = "        scheduler.without_interrupts(|| core::mem::replace(&mut *self.waiters.lock(), [None; N]))\n";
@@ -923,6 +924,47 @@ const CONTROLS: &[Control] = &[
         from: "                Scope::Space(root) => self.holds(id, root),\n",
         to: "                Scope::Space(root) => root != root,\n",
         models: &[("shootdown_for_a_space_asks_only_the_processors_in_it", STALE)],
+    },
+    Control {
+        // A slot being reclaimed is free before its shootdown: the next taker can have it while
+        // another processor still holds the old translation (ADR-0004 Amendment 1, A2).
+        name: "slot_free_before_the_shootdown",
+        file: SLOTS,
+        from: "            table.set(slot, State::Reclaiming);\n",
+        to: "            table.free(slot);\n",
+        models: &[("slots_reclaimed_slot_is_taken_only_after_its_shootdown", STALE)],
+    },
+    Control {
+        // What a reclaimed slot held goes back as soon as it leaves the tables.
+        name: "slot_released_before_the_shootdown",
+        file: SLOTS,
+        from: "        let unmapped = unmap(slot, pages);
+        let outcome = shoot(slot, pages);
+        match outcome {
+            Ok(_) => release(unmapped),
+            Err(_) => core::mem::forget(unmapped),
+        }
+",
+        to: "        release(unmap(slot, pages));
+        let outcome = shoot(slot, pages);
+",
+        models: &[(
+            "slots_reclaimed_slot_is_taken_only_after_its_shootdown",
+            REUSED_TOO_SOON,
+        )],
+    },
+    Control {
+        // A taker takes a slot that is being reclaimed as if it were free.
+        name: "slot_taken_while_it_is_reclaimed",
+        file: SLOTS,
+        from: "                let from = table.first_free;
+                let slot = (from..N).find(|&s| table.state(s) == Some(State::Free))?;
+",
+        to: "                let from = 0;
+                let slot = (from..N)
+                    .find(|&s| matches!(table.state(s), Some(State::Free | State::Reclaiming)))?;
+",
+        models: &[("slots_reclaimed_slot_is_taken_only_after_its_shootdown", STALE)],
     },
 ];
 
