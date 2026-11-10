@@ -12,6 +12,7 @@ mod documents;
 mod interfaces;
 mod lex;
 mod loom;
+mod reproducible;
 mod screen;
 mod serial;
 mod targetcfg;
@@ -55,6 +56,9 @@ commands:
               named by an ACPI SPCR table, a table that must be refused, no display, and no
               UART at all (with a framebuffer the only way to see the boot)
   run         boot under QEMU with the serial console on this terminal (Ctrl-A X quits)
+  reproducible-gate only the gate on reproducible builds: the loader, each way it is built,
+              and the kernel are built twice from nothing in two target directories, and the
+              two files of each must be the same bytes (part of check; CLAUDE.md §75)
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
@@ -2068,6 +2072,7 @@ fn main() -> ExitCode {
         ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
         ["run"] => in_turn("run", run),
         ["loom"] => in_turn("loom", loom::run),
+        ["reproducible-gate"] => in_turn("reproducible-gate", reproducible::gate),
         ["exclusive", "--", command @ ..] => {
             let command: Vec<String> = command.iter().map(|s| (*s).to_string()).collect();
             return match turns::exclusive(&command) {
@@ -2734,6 +2739,7 @@ fn check() -> Result {
     manifest_version_lint()?;
     signing_stays_off_the_os_lint()?;
     signing_has_no_secret_branches()?;
+    reproducible::gate()?;
     loom::run()?;
     println!("xtask: check passed");
     Ok(())
@@ -3456,7 +3462,15 @@ fn collect_files(
 /// Builds the EFI application with `loader`'s feature and returns the path of
 /// `origin-boot.efi`.
 fn build_loader(loader: Loader) -> Result<PathBuf> {
-    run_step(cargo().args([
+    build_loader_in(Some(loader.feature()), None)
+}
+
+/// Builds the EFI application with `feature`, or with none, into `target`, or into Cargo's own
+/// target directory, and returns the path of `origin-boot.efi`. With no feature the trust
+/// store is empty: the loader a release builds, until Origin has keys of its own.
+fn build_loader_in(feature: Option<&str>, target: Option<&Path>) -> Result<PathBuf> {
+    let mut build = cargo();
+    build.args([
         "build",
         "--package",
         LOADER_PACKAGE,
@@ -3465,10 +3479,16 @@ fn build_loader(loader: Loader) -> Result<PathBuf> {
         "--target",
         UEFI_TARGET,
         "--release",
-        "--features",
-        loader.feature(),
-    ]))?;
-    let efi = target_dir()
+    ]);
+    if let Some(feature) = feature {
+        build.args(["--features", feature]);
+    }
+    if let Some(target) = target {
+        build.arg("--target-dir").arg(target);
+    }
+    run_step(&mut build)?;
+    let efi = target
+        .map_or_else(target_dir, Path::to_path_buf)
         .join(UEFI_TARGET)
         .join("release")
         .join(format!("{LOADER_BIN}.efi"));
@@ -3484,7 +3504,14 @@ fn build_loader(loader: Loader) -> Result<PathBuf> {
 
 /// Builds the Framekernel ELF for `x86_64-unknown-none` and returns its path.
 fn build_kernel() -> Result<PathBuf> {
-    run_step(cargo().args([
+    build_kernel_in(None)
+}
+
+/// Builds the Framekernel ELF into `target`, or into Cargo's own target directory, and returns
+/// its path.
+fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
+    let mut build = cargo();
+    build.args([
         "build",
         "--package",
         KERNEL_PACKAGE,
@@ -3493,8 +3520,13 @@ fn build_kernel() -> Result<PathBuf> {
         "--target",
         KERNEL_TARGET,
         "--release",
-    ]))?;
-    let elf = target_dir()
+    ]);
+    if let Some(target) = target {
+        build.arg("--target-dir").arg(target);
+    }
+    run_step(&mut build)?;
+    let elf = target
+        .map_or_else(target_dir, Path::to_path_buf)
         .join(KERNEL_TARGET)
         .join("release")
         .join(KERNEL_PACKAGE);
