@@ -2837,3 +2837,20 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
 - **Not proven:** physical hardware; past the Loom models' bounds; the spurious fault after a permission upgrade, which QEMU's TLB does not produce; a processor that does not answer, which no boot can arrange (host tests only); any limit on a hostile loop, which is S3-5b's.
 - **Review:** none independent yet.
 - **Licensing:** MIT OR Apache-2.0.
+
+## Heavy xtask runs take turns across every checkout on one machine (2026-11-10)
+
+- **What:** `developer-tools/xtask/src/turns.rs` and its use in `main.rs`, on `claude/xtask-turns`. Each worktree builds into its own target directory, so two sessions' builds and QEMU boots overlapped; at a host load of 70 on a 10-core Mac the clock, timer and preemption proofs failed under TCG with nothing wrong in the kernel, and reruns waited hours. Now `check`, `build`, every boot command, `run` and `loom` hold an exclusive lock on `origin-xtask-turn.lock` in the repository's common git directory (`git rev-parse --git-common-dir`), which every worktree shares; outside a git checkout, in the target directory.
+  - The lock is `flock` through `std::fs::File::lock` (stable since Rust 1.89): the system releases it when the process ends, however it ends, so none can be left behind.
+  - The holder writes its process ID, worktree, command and start time into the file and clears it on release; a waiter prints them once, then about once a minute, and says when it goes on.
+  - The xtask children of a run (`boot-matrix` and the other boot families) get `ORIGIN_XTASK_LOCK_HELD` with the holder's process ID. A child that finds the lock held by exactly that process runs inside the turn; any other value, stale or copied, names another process, so that child waits like everyone else. A lock that is free is simply taken, so a child of a holder that has died does not run unlocked.
+  - `cargo xtask exclusive -- <command> [args...]` runs any command in a turn and exits with its exit code, for scripts that call cargo directly.
+  - Light commands stay unlocked: `unsafe-gate`, `interface-gate`, `regenerate`.
+- **Limits:** it orders only xtask builds made from this change onward; an xtask built from an older tree takes no lock. A run holds the machine for as long as it lasts, `check` included, and `run` for the whole interactive session. It shares the machine fairly only in order of polling, not first come first served.
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-10. Original code; Rust `std` only.
+- **Test evidence (2026-11-10):**
+  - Host tests (`cargo test -p xtask turns`): a second taker waits, says whom it waits for and goes on when the first lets go; the lock goes with the turn, and with a process killed while holding it (the test binary runs a helper test as a child process and kills it); a child of the holder runs in its turn while children with a stale or a malformed variable wait; the turn is passed to children; a record reads back the same; UTC dates across leap years.
+  - Two real runs from two worktrees of the repository, started a second apart, each `cargo xtask exclusive -- python3` printing when its command starts and ends with an 8 s sleep between: the second printed `xtask: waiting for the machine: process 63325, `cargo xtask exclusive -- python3 ...` in .../turns-a, since 2026-11-10 02:48:37 UTC (0 min ago)`, then `the machine is free after 7 s of waiting: going on`, and its command started 0.068 s after the first ended. **Negative control:** the same with the lock removed in both worktrees overlapped by 6.993 s.
+  - Nested: `cargo xtask exclusive -- cargo xtask exclusive -- sh -c '...; exit 3'` ran without waiting on itself and exited 3; the lock file was empty again afterwards.
+- **CI:** unchanged. A job has its runner to itself, so the lock is never contended; `flock` is the same call on Linux and macOS.
+- **Licensing:** MIT OR Apache-2.0.
