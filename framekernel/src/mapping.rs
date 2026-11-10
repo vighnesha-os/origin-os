@@ -201,14 +201,19 @@ pub struct Budget {
 }
 
 impl Budget {
-    /// A full budget at `rate`. A rate of 0 per second refills once a second at most.
+    /// A full budget at `rate`. A rate of 0 per second refills once a second at most. A rate
+    /// above a unit a nanosecond counts as a unit a nanosecond: its interval would be 0, every
+    /// unit free and the burst no bound at all.
     pub const fn new(rate: Rate) -> Self {
+        const SECOND: u64 = 1_000_000_000;
         let per_second = if rate.per_second == 0 {
             1
+        } else if rate.per_second as u64 > SECOND {
+            SECOND
         } else {
             rate.per_second as u64
         };
-        let interval = 1_000_000_000 / per_second;
+        let interval = SECOND / per_second;
         Self {
             interval,
             tau: (rate.burst as u64).saturating_mul(interval),
@@ -601,6 +606,33 @@ mod tests {
         // A huge charge saturates rather than wraps.
         budget.charge(second, u64::MAX);
         assert!(!budget.try_spend(u64::MAX - 1, 1));
+    }
+
+    #[test]
+    fn no_rate_makes_a_unit_free() {
+        // At and above a unit a nanosecond. Above it the interval would be 0 without the bound.
+        for per_second in [1_000_000_000, 1_000_000_001, u32::MAX] {
+            let mut budget = Budget::new(Rate {
+                burst: 2,
+                per_second,
+            });
+            assert!(!budget.try_spend(7, 3), "{per_second}: above the burst");
+            assert!(budget.try_spend(7, 2), "{per_second}");
+            assert!(!budget.try_spend(7, 1), "{per_second}: the burst is spent");
+            // A nanosecond later one unit is earned back, not two.
+            assert!(!budget.try_spend(8, 2), "{per_second}");
+            assert!(budget.try_spend(8, 1), "{per_second}");
+            // What a change cost beyond its price still delays the next one.
+            budget.charge(8, 5);
+            assert!(!budget.try_spend(13, 1), "{per_second}: the charge is owed");
+            assert!(budget.try_spend(14, 1), "{per_second}");
+            // No burst allows nothing, at any rate.
+            let mut none = Budget::new(Rate {
+                burst: 0,
+                per_second,
+            });
+            assert!(!none.try_spend(7, 1), "{per_second}: no burst");
+        }
     }
 
     #[test]
