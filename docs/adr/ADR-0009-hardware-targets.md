@@ -126,7 +126,7 @@ CPUID reports a vendor, a family and a model, which identify the core generation
 
 | Answer | Rule |
 |---|---|
-| AMD, Zen 5 or newer | Vendor `AuthenticAMD` and family 1Ah or higher. AMD lists every older core in family 17h or 19h. Family 1Ah begins with Zen 5 (EPYC 9005) and continues into models first documented from December 2025. So no model list is needed |
+| AMD, Zen 5 or newer | Vendor `AuthenticAMD` and family 1Ah or higher. Every earlier AMD core is below it: Zen to Zen 4 in families 17h and 19h, per AMD's own documents, and the cores before Zen in 0Fh to 16h. Family 1Ah begins with Zen 5 (EPYC 9005) and continues into models first documented from December 2025. So no model list is needed |
 | Intel, a 2026 generation | Vendor `GenuineIntel` and family 18 (12h) or higher (Nova Lake is 18); or family 6 with model CCh or E5h (Panther Lake cores), D5h (Wildcat Lake) or DDh (Clearwater Forest) |
 | Anything else | Outside the scope, including other vendors and every older family or model |
 

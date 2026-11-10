@@ -37,11 +37,11 @@ Can the kernel tell from CPUID whether a processor belongs to the declared scope
 | Family 18 (12h), models 1 and 3: Nova Lake | I2 | Intel writes the family in decimal |
 | Family 19 (13h): Diamond Rapids | **Not confirmed** by Intel | The rule does not depend on it: family 18 or higher is enough |
 
-No Intel product before 2026 reports a family above 15 (0Fh), so "family 18 or higher" admits only Nova Lake and later.
+Intel's x86-64 processors before Nova Lake report family 6, or 15 (0Fh) for the Pentium 4 generation, so "family 18 or higher" admits only Nova Lake and later. *(Corrected 2026-11-10: the first version said "no Intel product", which overstated it.)*
 
 **AMD.** AMD's documents put every pre-Zen 5 product it lists (EPYC 7002, 7003 and 9004) in family 17h or 19h (A1). Family 1Ah holds the EPYC 9005 generation (A1, A2, A3), which is Zen 5 (A6, and AMD's product naming), and models first documented from December 2025 (A4, A5).
 
-So "vendor AMD and family 1Ah or higher" means Zen 5 or newer. The rule does not need AMD to say which family 1Ah models are Zen 6: anything at or above 1Ah is Zen 5 or later.
+AMD's cores before Zen used lower families still (0Fh to 16h). So "vendor AMD and family 1Ah or higher" means Zen 5 or newer. The rule does not need AMD to say which family 1Ah models are Zen 6: anything at or above 1Ah is Zen 5 or later.
 
 **Not found:**
 

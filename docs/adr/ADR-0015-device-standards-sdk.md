@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-10, as recommended ("Accept all", decision sheet items 80 and 82–87; CLAUDE.md §18). Nothing here is built. It sets how device interfaces are shaped, not their binary layout: each interface's OIDL definition is its own decision when it is written (§84). |
+| Status | **Accepted** by the owner on 2026-11-10, as recommended ("Accept all", decision sheet items 80 and 82–87; CLAUDE.md §18). D6 gained notes for items 91–97 (references) the same day. Nothing here is built. It sets how device interfaces are shaped, not their binary layout: each interface's OIDL definition is its own decision when it is written (§84). |
 | Requires | CLAUDE.md P0, P3, P5, P9; §3, §5, §6, §16–§18, §30–§36, §38, §49, §54, §56, §58, §59, §72, §74, §82; final rules 2, 3, 10, 14, 26, 30, 35 |
 | Evidence | The checks in Evidence, 2026-11-10 |
 | Builds on | ADR-0001 D2 (third-party drivers in user mode), ADR-0007 (the IOMMU), ADR-0011 (N3, N4, N7, N9) |
@@ -82,9 +82,10 @@ This is the clean-room process route 2 above asks for. So a Wi-Fi or Bluetooth d
 
 *Added 2026-11-10, items 94–96:*
 
-- The same terms cover other open-source projects. Ubuntu is one: its wpa_supplicant (BSD-licensed) and BlueZ are references for WPA3 and the Bluetooth host. So are the BSDs, Zephyr and NimBLE. ReactOS is excluded.
+- The same terms cover other open-source projects. Ubuntu is one: its wpa_supplicant (BSD-3-Clause) and BlueZ are references for WPA3 and the Bluetooth host. So are the BSDs, Zephyr and NimBLE. ReactOS is excluded.
 - The order is free specifications and vendor documents first, vendor-written open-source code second, other systems third. Nothing is paid for.
 - Every reference is read at its current release on the day, with its tag or commit recorded.
+- Where vendor documents already cover a topic, a reference is read only for a named reason (item 97, delegated to Claude): quirks and errata, a specification ambiguity, coverage research, or debugging a difference on the same hardware.
 
 Bluetooth's host-to-controller interface (HCI) is standard, but each vendor's firmware-loading step is not public, so Bluetooth controllers have the same question on a smaller scale.
 
@@ -142,6 +143,7 @@ Checked 2026-11-10:
 - Bluetooth qualification and the patent and copyright licence ([qualification](https://www.bluetooth.com/develop-with-bluetooth/qualify/), [do I need to qualify?](https://support.bluetooth.com/hc/en-us/articles/360049018272), [PCLA](https://www.bluetooth.com/wp-content/uploads/2019/03/PCLA-ESign-Version-Version-11.pdf)).
 - HDMI 2.1 and open source ([PCGH, 2024](https://www.pcgameshardware.de/Monitor-Display-Hardware-154105/News/HDMI-Open-Source-Implementierung-1441978/); [Phoronix, May 2026](https://phoronix.com/news/amdgpu-hdmi-2.1-frl-patches); [Phoronix, Linux 7.4-rc1, checked 2026-11-10](https://phoronix.com/news/Linux-7.4-rc1)).
 - Thunderbolt 4/5 specifications are not public and need an Intel licence (CLAUDE.md §17).
+- What Linux 7.4-rc2, 7.3.3 and Ubuntu 26.10 support for these devices, and what they lack, as of 2026-11-10: `docs/research/2026-11-10-linux-ubuntu-device-coverage.md`.
 - That no major Wi-Fi vendor publishes its chips' programming interface comes from Claude's knowledge, not from a fresh search. It is to be re-checked vendor by vendor before D6's first driver.
 
 ## Trade-offs

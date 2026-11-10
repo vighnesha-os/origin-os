@@ -87,7 +87,8 @@
     - the Bluetooth SIG's membership, qualification and patent licence, and how they treat an open-source host stack;
     - whether any Wi-Fi or Bluetooth chip maker publishes documentation Origin may use;
     - radio regulatory duties (country setting, 5 GHz radar avoidance, 6 GHz);
-    - re-checking IEEE 802.11 and Bluetooth Core revisions (§16, §17).
+    - re-checking IEEE 802.11 and Bluetooth Core revisions (§16, §17);
+    - re-checking Linux and Ubuntu coverage at Linux 7.4 final and when each driver starts. The snapshot of 2026-11-10 is `docs/research/2026-11-10-linux-ubuntu-device-coverage.md`; its section 6 lists the open points.
 14. **Radio cryptography (§59, ADR-0015 D6), when Wi-Fi or Bluetooth work starts:** P-256, AES-CCM and AES-GCM, AES-CMAC and HMAC-based key derivation, each with known-answer and differential tests like the existing verifiers.
 15. **Origin Server (ADR-0014), after M9:** OIDL interfaces for remote administration, service management, hardware health and remote desktop (S7); the remote desktop ADR (S4); the release manifest's edition field (§84); an ADR-0009 amendment for 2026-generation server targets (S3).
 16. **The CPU identification table (ADR-0009 Amendment 1, items 88–89):**

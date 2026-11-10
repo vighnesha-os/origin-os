@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| As of | 2026-11-09, on `main`, after the pre-merge review. Everything that was on a side branch is merged. |
-| Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
+| As of | 2026-11-10 for items 71–97. Items up to 70: 2026-11-09, after the pre-merge review. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–96. |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–97 (item 97 delegated to Claude). |
 | Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do (see the last section). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -269,3 +269,4 @@ You then asked whether public sources, Linux and other open-source operating sys
 | 94, answered | Extend items 91–93 to other open-source projects on the same terms (gaps only, never copied, Origin's own specification first, licence recorded)? <br>• **Ubuntu:** its kernel patches, packaged firmware and user-space stacks such as wpa_supplicant, BlueZ and fwupd. <br>• **Others:** the BSDs, Haiku, Redox, Fuchsia, illumos, EDK2, coreboot, SeaBIOS, QEMU's device models, SPDK, `libspdm`, Zephyr and NimBLE. <br>• **Excluded:** ReactOS (§3 names it, and it reimplements Windows). Leaked or proprietary code is never opened. | **Accept** |
 | 95, answered | The source order, with no spending: free official specifications and vendor documents first; then open-source code the vendor wrote itself (EDK2, SPDK, `libspdm`, Intel's Linux drivers); then other open-source systems? The paid PCIe specification stays unread, and a feature with no free legitimate source is reported "not supported" (ADR-0015 D2). | **Accept** |
 | 96, answered | Always today's version: read each reference from the newest release on the day (on 2026-11-10 that was Linux 7.4-rc2 or 7.3.3, and Ubuntu 26.10 or 26.04.1 LTS); record its tag or commit and the date; re-check specification revisions the same day; never rely on Claude's memory of older code? | **Accept** |
+| 97, answered | Where vendor documents already cover a topic, may Linux (or another allowed project) still be read? | **Delegated to Claude**: "If vendor fie already covers, then your choice why do you want to read, take decision appropriately" (2026-11-10). <br>**Claude's decision:** only for a named reason, recorded with the reference (§6): <br>• device quirks, errata workarounds or firmware behaviour the documents do not describe; <br>• a specification ambiguity, where interoperability depends on how deployed systems read it; <br>• research into what Linux supports; <br>• debugging a difference between Origin and Linux on the same hardware. <br>Never just to see how Linux structured something the documents already explain: Origin's design differs, so that adds copying risk and nothing else. Items 92, 93 and 96 still apply. In CLAUDE.md §3 |
