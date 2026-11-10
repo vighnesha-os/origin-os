@@ -1677,6 +1677,26 @@ const IOAPIC_FAILED: &str = ": I/O APIC failed";
 /// How every clock proof ends a line that failed.
 const CLOCK_FAILED: &str = ": clock failed";
 
+/// The lines of `serial` that name an address in the window the kernel stacks' region slides
+/// in, PML4 slots 384–447: a boot log must have none, during boot or after (ADR-0004 Amendment 2,
+/// A6.3), or it gives the region's base away.
+fn stack_window_lines(serial: &str) -> Vec<&str> {
+    use framekernel::paging::layout::{STACK_WINDOW, STACK_WINDOW_SIZE};
+    serial
+        .lines()
+        .filter(|line| {
+            line.match_indices("0x").any(|(at, _)| {
+                let digits = line.get(at + 2..).unwrap_or("");
+                let end = digits
+                    .find(|c: char| !c.is_ascii_hexdigit())
+                    .unwrap_or(digits.len());
+                u64::from_str_radix(&digits[..end], 16)
+                    .is_ok_and(|v| v >= STACK_WINDOW && v - STACK_WINDOW < STACK_WINDOW_SIZE)
+            })
+        })
+        .collect()
+}
+
 /// The screen after a whole boot: exactly what the serial log says it must show (the
 /// console writes one line at a time to both).
 fn check_screen(done: &Completed) -> Result {
@@ -4233,6 +4253,13 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
         com1,
     };
     let verdict = verdict
+        .and_then(|()| match stack_window_lines(&done.serial).first() {
+            Some(line) => Err(format!(
+                "the serial log names an address in the kernel stacks' window, which no boot may \
+                 print (ADR-0004 Amendment 2, A6.3): {line:?}"
+            )),
+            None => Ok(()),
+        })
         .and_then(|()| scenario.check.map_or(Ok(()), |check| check(&done)))
         .and_then(
             |()| match scenario.stderr.iter().find(|m| !qemu_stderr.contains(**m)) {
@@ -4650,6 +4677,29 @@ mod gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0004 Amendment 2, A6.3: a boot log names no address in the stack window, PML4 slots
+    /// 384–447, in any case and anywhere in a line; its edges and the windows beside it are fine.
+    #[test]
+    fn a_boot_log_naming_a_stack_window_address_is_caught() {
+        let log = "\
+origin-kernel: loaded at 0xffffffff80600000 (physical 0x7e50000), span 0x13000 bytes\n\
+origin-kernel: direct map at 0xffff800000000000 and 0xffffbfffffffffff\n\
+origin-kernel: page protection: stack guard page at 0xffffc00000001000 faulted\n\
+origin-kernel: framebuffer at 0xffffe00000000000\n\
+origin-kernel: the last page 0xFFFFDFFFFFFFF000, in capitals\n\
+origin-kernel: two numbers, 0x1000 then 0xffffd8a4c0000000, in a line\n\
+origin-kernel: a long run 0xffffc00000000000123 is no address\n";
+        assert_eq!(
+            stack_window_lines(log),
+            [
+                "origin-kernel: page protection: stack guard page at 0xffffc00000001000 faulted",
+                "origin-kernel: the last page 0xFFFFDFFFFFFFF000, in capitals",
+                "origin-kernel: two numbers, 0x1000 then 0xffffd8a4c0000000, in a line",
+            ]
+        );
+        assert!(stack_window_lines("origin-kernel: 0x").is_empty());
+    }
 
     fn proof(cpus: u64) -> String {
         let mut text = String::from("origin-kernel: SMP: up\n");
