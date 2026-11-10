@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 
 use origin_frame::objref::ObjectRef;
-use origin_frame::userspace::{Change, SharedFrame, UserFrame, UserSpace};
+use origin_frame::userspace::{Change, ChangeError, SharedFrame, UserFrame, UserSpace};
 use origin_frame::vm::{self, KernelProbe};
 
 use crate::console::Console;
@@ -503,6 +503,46 @@ fn shared_between_spaces(
     right
 }
 
+/// W^X across the mappings of one frame (review finding 5): a shared frame is never writable
+/// through one mapping and executable through another, in one space or two, and never goes
+/// from writable to executable in one step. Each refusal changes nothing.
+fn shared_frames_keep_w_xor_x(com1: &mut Console) -> bool {
+    let (Some(a), Some(b), Some(frame)) = (UserSpace::new(), UserSpace::new(), SharedFrame::new())
+    else {
+        return false;
+    };
+    fn refused<T>(outcome: Result<T, ChangeError>) -> bool {
+        matches!(outcome, Err(ChangeError::WriteAndExecute))
+    }
+    let writable = a.map_shared(DATA, &frame, Access::ReadWrite).is_ok();
+    let executable_elsewhere = refused(b.map_shared(DATA, &frame, Access::ReadExecute));
+    let executable_beside = refused(a.map_shared(LATER, &frame, Access::ReadExecute));
+    let read_only = b.map_shared(DATA, &frame, Access::Read).is_ok();
+    let no_longer_writable = a.protect(DATA, 1, Access::Read).is_ok();
+    let executable = b.protect(DATA, 1, Access::ReadExecute).is_ok();
+    let writable_again = refused(a.protect(DATA, 1, Access::ReadWrite));
+    let flipped = refused(b.protect(DATA, 1, Access::ReadWrite));
+    let counted = frame.mappings() == (0, 1);
+    let unmapped = a.unmap(DATA, 1).is_ok() && b.unmap(DATA, 1).is_ok();
+    let right = writable
+        && executable_elsewhere
+        && executable_beside
+        && read_only
+        && no_longer_writable
+        && executable
+        && writable_again
+        && flipped
+        && counted
+        && unmapped
+        && frame.mappings() == (0, 0);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: address spaces: W^X across a shared frame's mappings: executable in another space while writable in one, refused: {executable_elsewhere}; at another address in the same space, refused: {executable_beside}; read-only beside it: {read_only}; executable once nothing writes it: {executable}; writable again while executable elsewhere, refused: {writable_again}; from executable to writable in one step, refused: {flipped}{}",
+        verdict(right)
+    );
+    right
+}
+
 /// A program maps and unmaps a page in a loop while a thread of its own runs on another
 /// processor (done by the kernel here: no system call exists yet). Each unmap interrupts only
 /// the processor that has the space loaded; the others take nothing. Reports what it costs
@@ -653,6 +693,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
     ok &= unmap_many(com1, 5, far, bsp, tsc_hz);
     ok &= unmap_many(com1, 200, far, bsp, tsc_hz);
     ok &= shared_between_spaces(com1, far, third, tsc_hz);
+    ok &= shared_frames_keep_w_xor_x(com1);
     ok &= the_loop_interrupts_only_the_space(com1, cpus, bsp, far, tsc_hz);
     // Each processor reaps what its own threads left, on its own time.
     let same = || memory::stats().map(|(h, f)| (h.bytes_in_use, f)) == before;
