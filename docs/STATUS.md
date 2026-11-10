@@ -7,6 +7,14 @@
 | Reproduce | Heavy runs wait for their turn on the machine; `cargo xtask exclusive -- <command>` takes one for anything else. `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs under QEMU 11.1.3 + OVMF: on its software CPU (TCG) and, in CI, on real AMD EPYC and Intel Xeon processors through KVM, with the devices and firmware still QEMU's. Nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
 
+## The kernel's random-number generator: the mechanism, and a proposed design (TASKS 18a; 2026-11-10)
+
+The first half of TASKS item 18 (decision item 113), on `claude/objective-gould-4ac8c1`. **Nothing here is in the kernel yet.** The kernel and the loader still draw from RDSEED and RDRAND directly, and the "hardware entropy" proof is still Report.
+
+- **Built and tested on the host:** HMAC-SHA-512 (FIPS 198-1, RFC 2104) and NIST's HMAC_DRBG over SHA-512 (SP 800-90A Rev. 1 §10.1.2) in `origin-crypto`, with no `unsafe`, no allocation and no panic path. The generator makes no entropy and has no default seed. It passes RFC 4231's seven HMAC test cases and six generator outputs published in RFC 6979, and a differential corpus from an independent Python implementation by the same author. 51 of 53 planted faults fail a test; the other two cannot be observed from safe code.
+- **Proposed, not accepted:** `docs/adr/ADR-0016-kernel-random-numbers.md`. A root generator and one for each processor; seeds from RDSEED, RDRAND and 64 bytes the loader hands over in boot info 0.6; health tests on the instructions' outputs; no generator and no randomness without a healthy seed; overwriting in three layers. Its seven questions are the owner's.
+- **Not verified:** the standards' own text was not read, because they are PDFs and a download needs the owner's word, which was asked for. NIST's HMAC_DRBG vectors wait on the same word. Until then reseeding, additional input and prediction resistance rest on the author's reading of the standard, checked only against the author's own reference. The research is `docs/research/2026-11-10-kernel-random-numbers.md`; the evidence is in `docs/engineering/SOURCE_PROVENANCE.md`, "HMAC-SHA-512 and HMAC_DRBG".
+
 ## Address spaces that change while they run (ADR-0011 N14 step 3, task S3-5a; 2026-11-10)
 
 The framework's half of step 3's memory work, with no system call yet (S3-5b adds `memory_map`, `memory_unmap` and `memory_protect` on top of it):

@@ -66,7 +66,7 @@
 
 | Task | Notes |
 |---|---|
-| 18a: the kernel's random-number generator, first half (item 18; decision item 113) | Branch `claude/objective-gould-4ac8c1`, cut from `docs/design-review-2026-11-10`. The research ledger, ADR-0016 (Proposed) and the host-tested generator in `origin-crypto`. Nothing is wired into the kernel. Its contract is under "Task contracts" below |
+| 18a: the kernel's random-number generator, first half (item 18; decision item 113) | Branch `claude/objective-gould-4ac8c1`, cut from `docs/design-review-2026-11-10`. **Built and tested on the host (2026-11-10):** HMAC-SHA-512 and HMAC_DRBG in `origin-crypto`; the research ledger; ADR-0016, **Proposed**. Nothing is wired into the kernel. **Waits on the owner:** ADR-0016's seven questions, the last of which is the download of the standards' PDFs and of NIST's vectors. Until those are read and run the task is not finished: its ledger says which requirements rest on the author's knowledge. Its contract is under "Task contracts" below; its evidence is in `SOURCE_PROVENANCE.md`, "HMAC-SHA-512 and HMAC_DRBG" |
 
 **Found during S3-2 (2026-11-10):**
 - **Reading without room:** a reader cannot drop a message it does not want without making room for it (Zircon has a discard option). Neither B1 nor B3 needs it; a service domain may.
@@ -116,6 +116,8 @@
     - then HMAC_DRBG over `origin-crypto`'s SHA-512, with NIST's vectors, as a framework service;
     - every consumer draws from it: `launch.rs`, `virtionet.rs`, the loader's KASLR draw and S3-5b's mappings;
     - "hardware entropy" becomes Withdraw in `bootproof.rs`, its host test and ADR-0013's inventory, in one commit (ADR-0013 Amendment 1).
+
+    **State, 2026-11-10.** The first half, 18a, is built: the mechanism (HMAC-SHA-512 and HMAC_DRBG in `origin-crypto`, host-tested), the ledger (`docs/research/2026-11-10-kernel-random-numbers.md`) and ADR-0016, Proposed. The second half, 18b, starts when the owner has answered ADR-0016's questions, and writes its own contract. In order: read SP 800-90A, 90B and 90C and correct the ledger and the ADR against them; add NIST's HMAC_DRBG vectors to `tests/kat`; the policy crate (`security/random`: the health tests, retries, seeding and reseeding, host-tested); the framework's service with a generator for each processor, the volatile overwrites and the stack overwrite; the gate that keeps `rdrand` and `rdseed` to two files; boot info 0.6 and the loader's generator; the three consumers; the Withdraw row with its controls; the cost of a request printed at boot.
 19. **The system threat model, and the ADR on speculation and processor hardening (item 112), before ADR-0011 N14 step 4:**
     - `docs/engineering/THREAT_MODEL_SYSTEM.md`: the attackers, what each edition defends, which component covers each, and each component model's exclusions covered or accepted by name;
     - the ADR, from Intel's and AMD's documents read under §16: `IA32_ARCH_CAPABILITIES`, enhanced and automatic IBRS, IBPB, the SMT policy, supervisor shadow stacks, FRED and LASS where CPUID reports them, and the compiler's options;
@@ -150,6 +152,7 @@ Every design decision was finalised on 2026-11-07, under the owner's instruction
 | 106 | Read revision 7.4's wording, and say whether the records pull request may merge | CLAUDE.md 7.4, ADR-0014, ADR-0015 and items 71–123 reaching `main` |
 | 122 | Confirm ADR-0009's text, which was delegated and not reviewed, and ADR-0007's two additions marked "for the owner's review" | Their acceptance being the owner's own (§18) |
 | 121 | Name the person who signs off the first driver written from reference reading, when one exists | Publishing that driver (CLAUDE.md §3) |
+| not yet numbered | ADR-0016's seven questions (the kernel's random-number generator): the design; boot info 0.6; what may seed the generator alone; what the health tests can mean; no `unsafe` in `origin-crypto`; §17's revisions; and six downloads from NIST (five PDFs to read, one vector file to convert and commit) | Task 18b, and S3-5b landing after it. The session that relays the answers gives them their item numbers |
 
 ## Task contracts (CLAUDE.md §78; decision item 122)
 
