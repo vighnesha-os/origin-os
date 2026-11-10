@@ -18,10 +18,15 @@
 //!   a handle to the process: each thread holds a reference to the space through the scheduler
 //!   and gives it up when it is reaped, so by then no processor runs in it, and each that ran
 //!   one has loaded another CR3, which flushes its translations (no PCIDs yet).
-//! - Only then is `TERMINATED` raised (P11's order: handles, memory, signal), so whoever sees
-//!   it knows all of that has happened. The scheduler reaps a thread once its processor has
-//!   left it: on a processor kept busy by a program that never enters the kernel, that waits
-//!   until something gives the processor up, as the reaping of any thread's stack does.
+//! - Only then is `TERMINATED` raised (P11's order: handles, memory, signal): whoever sees it
+//!   knows the process's handles have closed and that neither it nor any of its threads holds
+//!   the address space any more. A thread is counted before it takes its reference, so one being
+//!   started cannot keep the space past `TERMINATED`. A kernel helper that took a reference of
+//!   its own through [`Process::memory`] (`root`, `write_frame`, `frame_of`, `translate`, and the
+//!   boot proof that reads a process's memory after it has ended) keeps the space until it lets
+//!   go. The scheduler reaps a thread once its processor has left it: on a processor kept busy
+//!   by a program that never enters the kernel, that waits until something gives the processor
+//!   up, as the reaping of any thread's stack does.
 //! - A thread is an object too ([`ThreadObject`]): `TERMINATED` on a thread is raised as soon
 //!   as it has ended, without waiting to be reaped.
 //!
@@ -407,15 +412,10 @@ impl Process {
         rsp: u64,
         rdi: u64,
     ) -> Result<ObjectRef<ThreadObject>, QueueError> {
-        let space = process.memory().ok_or(QueueError::Full)?;
-        let thread = ObjectRef::try_new(ThreadObject::new()).map_err(|_| QueueError::Full)?;
-        let user = ObjectRef::try_new(UserContext {
-            process: process.clone(),
-            space,
-            thread: thread.clone(),
-        })
-        .map_err(|_| QueueError::Full)?;
-        // Counted before it can run, so that its own end always finds itself counted.
+        // Counted before it takes anything, and before it can run, so that its own end always
+        // finds itself counted. While it is counted the process cannot end, and its last reaping
+        // cannot raise `TERMINATED`, so the reference to the address space taken below is always
+        // given up first: by the reaper, or here before `start_failed`.
         without_interrupts(|| {
             let mut life = process.lifecycle.lock();
             if life.ended {
@@ -425,13 +425,33 @@ impl Process {
             life.unreaped += 1;
             Ok(())
         })?;
+        let Some(user) = Self::context_for(process) else {
+            process.start_failed();
+            return Err(QueueError::Full);
+        };
+        let thread = user.thread.clone();
         match sched::spawn_user(cpu, user, rip, rsp, rdi) {
             Ok(_) => Ok(thread),
             Err(e) => {
+                // The scheduler has dropped the context, and this thread's reference with it.
                 process.start_failed();
                 Err(e)
             }
         }
+    }
+
+    /// What a new thread of `process` stands on: the process, a reference to its address space
+    /// and the thread object. `None` without the memory for them, having dropped whatever it
+    /// took.
+    fn context_for(process: &ObjectRef<Self>) -> Option<ObjectRef<UserContext>> {
+        let space = process.memory()?;
+        let thread = ObjectRef::try_new(ThreadObject::new()).ok()?;
+        ObjectRef::try_new(UserContext {
+            process: process.clone(),
+            space,
+            thread,
+        })
+        .ok()
     }
 
     /// A counted thread never started. If every other thread ended in the meantime, this is
