@@ -4,7 +4,7 @@
 |---|---|
 | Required by | CLAUDE.md §58 ("Threat-model every privileged interface"), §29, §30, §42 |
 | Covers | The way into the kernel from ring 3 and back (`framekernel/frame/src/cpu.rs`, `trap.rs`, `usercopy.rs`, `userspace.rs`); the calls (`framekernel/src/syscall.rs`, `handles.rs`, `ipc.rs`, `channel.rs`, `process.rs`, `wait.rs`); the decoder generated from `sdk/interfaces/origin.kernel.oidl` (`framekernel/syscalls`); ADR-0005 P1–P12 and Amendments 1–4 |
-| Written | 2026-11-10, against S3-1's code (c3ccacf). §58 and §83 expect a threat model during design; P4–P11 were designed and built without one, so this is written after them. S3-2's changes (a message's writer, handle records) are added in their own section, written with them, and S3-3's (process start) and S3-4's (the service directory) before their code. |
+| Written | 2026-11-10, against S3-1's code (c3ccacf). §58 and §83 expect a threat model during design; P4–P11 were designed and built without one, so this is written after them. S3-2's changes (a message's writer, handle records) are added in their own section, written with them, and S3-3's (process start), S3-4's (the service directory) and S3-5b's (memory objects) before their code. |
 | Evidence | QEMU only. Nothing has run on hardware (§74). The boot proofs named below are ADR-0013 rows: "ring-3 isolation", "per-processor control state", "IPC and handles" and "process and thread objects" all stop the boot when they fail. The IPC proof makes 117 hostile calls and checks each status. |
 
 ## What is being protected
@@ -153,6 +153,28 @@ ADR-0011 N9 and S9, as C11 and C12 decide: `origin.directory` 0.1, served by a p
 | D9 | A client gets a provider of another major than it asked for | The key includes the major, and the provider's own stub refuses a hello for another major on the passed end | **Host**: another major is another key. **Proven** (control 4): the connect for major 1 is `not_found` in ring 3 |
 | D10 | `not_found` tells a program what its directory holds | Intended: a directory is its program's own, built from what the program declared (N9), so it tells the program nothing it was not given | **By design** |
 | D11 | The back side: how a launcher fills a directory and how a provider receives connections | Not decided (step 4, ABI decisions then). The boot proof's arrangement, used by nothing else: the launcher writes the table on the directory's BOOTSTRAP, and the directory passes each connection on as a `connect` call on the provider's channel | **Open** |
+
+### Memory objects (S3-5b)
+
+ADR-0005 P7 and P11, as C6, C7 and C8 decide: `memory_object_create`, `memory_map`, `memory_unmap` and `memory_protect`, on S3-5a's address spaces (`THREAT_MODEL_ADDRESS_SPACES.md`, whose T15, T16 and T18 this task was left). The ledger is `docs/research/2026-11-10-memory-objects.md`. Written before the code (§58, §83); each row names what will prove it, and its status is updated as each is built.
+
+| # | Threat | Defence | Status |
+|---|---|---|---|
+| M1 | A mapping is executable, or writable and executable | v1 maps nothing executable: `execute` is refused with `access_denied`, since an anonymous object never has the right (C6, C7), and write with execute is `invalid_args`. Across every mapping of a frame, in any space, W^X is S3-5a's (T27) | Planned: execute refused in ring 3; the hostile corpus for write with execute |
+| M2 | A fixed address replaces a mapping (code, data, the start record, another object), so a process loses memory or swaps it under itself, or a creator rewrites its child's | A fixed request whose range holds any mapped page is refused with `invalid_args`, before anything is mapped: it never replaces (C7) | Planned: a fixed map over a mapping is refused, and the mapping keeps what was written to it |
+| M3 | A mapping reaches outside the user half, wraps, or starts or ends inside a page | Address, length and offset are page-aligned; the length is not zero; every sum is checked for overflow; the range lies in the user half and inside the object | Planned: the hostile corpus |
+| M4 | A mapping gives more access than the handle that made it | A map needs `map`, `read` for any mapping and `write` for a writable one, on the object's handle; protect only reduces (`access_denied` for an increase). Rights only shrink (P2) | Planned: the hostile corpus for each missing right; protect's increase refused in ring 3 |
+| M5 | A process changes another's address space without authority | Every call names a process and needs `write` on that handle (C6), the caller's own included | Planned: a handle to another process without `write` is refused, and with it the map succeeds |
+| M6 | Exhaustion through memory objects or mappings (O2) | An object is committed in full at creation and charged to its creator (`limit` past the quota, `no_memory` without frames). A mapping holds its object, so the charge returns only with the last handle and mapping. Each process holds at most the mappings its creator allows | Planned: the quota refuses past its bound in ring 3; host tests to the unit |
+| M7 | A frame is reused while a processor can still reach it | Frames go back only after a completed shootdown, and a stall leaks them (S3-5a, T3–T6) | **By design** here; S3-5a's proofs and models |
+| M8 | A hostile map and unmap loop interrupts processors or holds the shootdown turn (T15, T16) | A budget of shootdowns and interrupts per process, refilled with time at a rate its creator sets. An unmap or protect is priced before it runs, from its pages and `processors_loaded`, and refused with `should_wait` if the budget cannot pay, before any change or turn; afterwards its `Change` is charged | Planned: a loop refused before its budget is overrun, and served again once it refills |
+| M9 | A mapping placed where an attacker can predict it | A random page from RDSEED or RDRAND, clear of every mapping; without entropy the map fails with `not_supported` | Planned: two placements differ |
+| M10 | An object shows kernel memory or another process's | Its frames are zeroed at creation | Planned: a new object reads zero in ring 3 |
+| M11 | A frame is freed while it is mapped, or an object outlives its charge | Each mapped page holds its frame (`SharedFrame`), each mapping its object, and the object its charge; each goes with its last reference | Planned: the leak check; host tests |
+| M12 | Closing a handle unmaps another process's memory, or a mapping outlives its process | A mapping holds its object, so a close never unmaps; a process's mappings go with its address space when its last thread ends (P11) | Planned: the sharer's mapping keeps working after the creator closes its handle; the leak check |
+| M13 | A request changes between its check and its use | `map_request` is copied once, its `size` checked first (OIDL §5.3), and decoded from the copy | **By design** |
+| M14 | A stalled shootdown is reported as a success | The call returns `timed_out`; the change is made and the frames leak (T3) | **By design** (no boot can stall a processor) |
+| M15 | The bookkeeping done with interrupts off grows without bound (T18) | Each process's mappings are limited; `MAX_TABLES` is not raised | Planned: the cost of map, unmap and protect measured |
 
 ## What must be closed
 
