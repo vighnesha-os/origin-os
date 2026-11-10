@@ -13,6 +13,9 @@
 //! - **Unmap and protect are priced before they run** against the caller's budget, and refused
 //!   with `should_wait`, changing nothing, if it cannot pay (T15, T16); what each cost
 //!   (`Change`) is charged afterwards.
+//! - **A map tells its caller the address before the mapping can be used by any other call.**
+//!   If that fails, the mapping is taken back whatever the budget holds, and its cost charged
+//!   afterwards: a mapping nobody was told of does not stay.
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
@@ -124,26 +127,57 @@ const fn access(allow: Allow) -> Access {
 
 /// `memory_map`: maps what `request` asks of `object`, held with the rights `held`, into
 /// `target`'s address space, and returns where (C7, C8).
+///
+/// `report` tells the caller the address while the mapping is still reserved: until its caller
+/// knows of it, no other call can change it or put another mapping in its place. If the report
+/// fails the mapping goes again ([`withdraw`]), charged to `caller`, and the map fails with the
+/// report's error.
 pub(crate) fn map(
+    caller: &Process,
     target: &Process,
     object: &ObjectRef<MemoryObject>,
     held: u32,
     request: &Request,
+    report: impl FnOnce(u64) -> Result<(), Error>,
 ) -> Result<u64, Error> {
     let asked = mapping::check(request, object.pages(), held)?;
     let space = target.memory().ok_or(Error::InvalidArgs)?;
     let base = reserve(target, &space, &asked, object)?;
-    match map_pages(&space, base, object, &asked) {
-        Ok(()) => {
+    if let Err(e) = map_pages(&space, base, object, &asked) {
+        let reserved = without_interrupts(|| target.mappings.lock().remove(base));
+        drop(reserved);
+        return Err(e);
+    }
+    if let Err(e) = report(base) {
+        withdraw(caller, target, &space, base, asked.pages);
+        return Err(e);
+    }
+    without_interrupts(|| target.mappings.lock().made(base));
+    Ok(base)
+}
+
+/// Takes back the mapping reserved at `base` whose address its caller could not be told: a
+/// mapping nobody knows of must not stay. Its pages go through a shootdown, since a thread of
+/// `target` may already have touched them. The budget is not asked first, since a refusal
+/// would leave the mapping; what the change cost is charged to `caller` afterwards, so its
+/// next unmap or protect waits that much longer (T15, T16). A caller cannot make this happen
+/// for nothing: the page its address goes to has to be unmapped or made read-only between the
+/// call's check and its write, and that change is priced.
+fn withdraw(caller: &Process, target: &Process, space: &UserSpace, base: u64, pages: u64) {
+    match space.unmap(base, pages) {
+        Ok(change) => settle(caller, 0, change),
+        // As in `unmap`: the change is made and its frames are kept from reuse for good (T3).
+        Err(ChangeError::Stalled { .. }) => {}
+        // As in `unmap`, only after an earlier stall, without memory for the records: some
+        // pages may still be mapped. The record stays, as a mapping its process can unmap; it
+        // goes with the process at the latest.
+        Err(_) => {
             without_interrupts(|| target.mappings.lock().made(base));
-            Ok(base)
-        }
-        Err(e) => {
-            let reserved = without_interrupts(|| target.mappings.lock().remove(base));
-            drop(reserved);
-            Err(e)
+            return;
         }
     }
+    let object = without_interrupts(|| target.mappings.lock().remove(base));
+    drop(object);
 }
 
 /// Reserves where `asked` goes in `target`'s records: at its fixed address if no page of it is
