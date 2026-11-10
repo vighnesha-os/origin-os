@@ -247,23 +247,34 @@ pub mod limits {
 /// `u32 size`, which the caller sets, so a later minor version can append fields.
 ///
 /// ```text
-/// 0  u32 size      set by the caller: bytes of the structure it knows
-/// 4  u32 bytes     the message's byte count
-/// 8  u32 handles   the message's handle count
+/// 0  u32 size              set by the caller: bytes of the structure it knows
+/// 4  u32 bytes             the message's byte count
+/// 8  u32 handles           the message's handle count
+/// 12 u32                   zero (from minor 2)
+/// 16 u64 sender_process    from minor 2: the writer's process ID (B1, C1)
+/// 24 u64 sender_principal  from minor 2: the writer's principal
 /// ```
 ///
-/// The kernel refuses a `size` below [`read_sizes::SIZE`], and never reads or writes past the
-/// fields it knows. Both counts are also written when the buffers are too small
-/// ([`Error::BufferTooSmall`]).
+/// The kernel refuses a `size` below [`read_sizes::BASE_SIZE`], and writes only what fits in
+/// the caller's `size`: a caller that gives 12 gets the counts, nothing past them, and no
+/// error (C2). The counts and the writer are also written when the buffers are too small
+/// ([`Error::BufferTooSmall`]). The writer is stamped by the kernel when the message is
+/// written, from the writing process; nothing the writer passes reaches it.
 pub mod read_sizes {
-    /// Bytes of this version of the structure.
-    pub const SIZE: u32 = 12;
+    /// Bytes of this version of the structure, with the writer's identity.
+    pub const SIZE: u32 = 32;
+    /// Bytes of the first version: the counts alone.
+    pub const BASE_SIZE: u32 = 12;
     /// Byte offset of `size`.
     pub const SIZE_AT: usize = 0;
     /// Byte offset of `bytes`.
     pub const BYTES_AT: usize = 4;
     /// Byte offset of `handles`.
     pub const HANDLES_AT: usize = 8;
+    /// Byte offset of `sender_process`.
+    pub const SENDER_PROCESS_AT: usize = 16;
+    /// Byte offset of `sender_principal`.
+    pub const SENDER_PRINCIPAL_AT: usize = 24;
 }
 
 /// What `channel_read` writes for each handle it moves into the caller's table (B3): the
@@ -540,7 +551,11 @@ mod tests {
         assert_eq!(read_sizes::SIZE_AT, 0);
         assert_eq!(read_sizes::BYTES_AT, 4);
         assert_eq!(read_sizes::HANDLES_AT, 8);
-        assert_eq!(read_sizes::SIZE, 12);
+        assert_eq!(read_sizes::BASE_SIZE, 12);
+        // The writer's identity follows, each `u64` aligned (B1, C2).
+        assert_eq!(read_sizes::SENDER_PROCESS_AT, 16);
+        assert_eq!(read_sizes::SENDER_PRINCIPAL_AT, 24);
+        assert_eq!(read_sizes::SIZE, 32);
         // Three `u32`s, in order, with no padding (B3).
         assert_eq!(received_handle::HANDLE_AT, 0);
         assert_eq!(received_handle::OBJECT_TYPE_AT, 4);

@@ -41,6 +41,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use crate::channel::Identity;
 use crate::handles::HandleTable;
 use crate::paging::{Access, MapError, Translation};
 use crate::runqueue::QueueError;
@@ -224,6 +225,10 @@ struct Lifecycle {
     ended: bool,
 }
 
+/// The principal the boot proofs give the processes they make. The kernel gives principals
+/// no meaning (ADR-0005 C1): this one only marks a process as a boot proof's.
+pub(crate) const BOOT_PROOF_PRINCIPAL: u64 = 0xB007_0000_0000_0000;
+
 /// The next process ID: 0 is the kernel, and an ID is never used twice (ADR-0005 C1).
 static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -231,6 +236,9 @@ static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct Process {
     /// Unique for the boot and never reused (ADR-0005 C1). Grants nothing.
     id: u64,
+    /// Who it acts for (ADR-0005 C1): opaque to the kernel, given by its creator and never
+    /// changed. A plain field: written before the process is shared, never after.
+    principal: u64,
     /// The creator's reference to its address space, given up when its last thread ends.
     space: SpinLock<Option<ObjectRef<UserSpace>>>,
     /// Its handles (P1).
@@ -257,10 +265,13 @@ pub(crate) struct Process {
 
 impl Process {
     /// A new process with an empty lower half and the kernel's half, under `limits`, whose
-    /// code may issue system calls only from `[syscall_origin.0, syscall_origin.1)`.
-    pub(crate) fn new(limits: Limits, syscall_origin: (u64, u64)) -> Option<Self> {
+    /// code may issue system calls only from `[syscall_origin.0, syscall_origin.1)`, acting
+    /// for `principal` (C1). Only kernel code creates processes yet, so the creator names the
+    /// principal; a launch path will pass its own by default.
+    pub(crate) fn new(limits: Limits, syscall_origin: (u64, u64), principal: u64) -> Option<Self> {
         Some(Self {
             id: NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed),
+            principal,
             space: SpinLock::new(Some(ObjectRef::try_new(UserSpace::new()?).ok()?)),
             handles: SpinLock::new(HandleTable::new(limits.handles)),
             account: ObjectRef::try_new(Account {
@@ -292,6 +303,14 @@ impl Process {
     /// This process's ID.
     pub(crate) const fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Who this process is, as a message it writes carries it (ADR-0005 B1, C1).
+    pub(crate) const fn identity(&self) -> Identity {
+        Identity {
+            process: self.id,
+            principal: self.principal,
+        }
     }
 
     /// Its `TERMINATED` signal.

@@ -36,6 +36,7 @@ use origin_syscalls::oidl_rt as rt;
 use origin_syscalls::origin_kernel::kernel::server;
 use origin_syscalls::origin_kernel::types as oidl;
 
+use crate::channel::Identity;
 use crate::console::Console;
 use crate::process::{Ending, UserContext};
 use crate::{cpu, ipc, sched};
@@ -351,9 +352,11 @@ fn channel_write(
         *value = u32::from_le_bytes(*chunk);
     }
     let transfer = values.get(..count).ok_or(Error::InvalidArgs)?;
+    // The writer's identity comes from its process, never from an argument (B1).
     ipc::channel_write(
         &p.process.handles,
         &p.process.account,
+        p.process.identity(),
         end.value(),
         need(end),
         payload,
@@ -394,11 +397,15 @@ fn channel_read(
         u64::from(limit) - first as u64,
         UserAccess::Write,
     )?;
-    let sizes = |p: &UserContext, byte_count: usize, handle_count: usize| {
+    // The counts and the writer (B1, C2), as far as the caller's `size` reaches: a caller
+    // that gives the first version's 12 gets the counts and nothing past them.
+    let sizes = |p: &UserContext, byte_count: usize, handle_count: usize, sender: Identity| {
         let mut fields = [0; oidl::ReadSizes::SIZE as usize];
         let reported = oidl::ReadSizes {
             bytes: byte_count as u32,
             handles: handle_count as u32,
+            sender_process: Some(sender.process),
+            sender_principal: Some(sender.principal),
         };
         reported
             .encode_fields(&mut fields, limit)
@@ -417,20 +424,23 @@ fn channel_read(
         bytes.capacity(),
         handles.capacity(),
     )? {
+        // Too small: the counts and the writer still reach the caller (C2).
         ipc::Read::TooSmall {
             bytes: byte_count,
             handles: handle_count,
+            sender,
         } => {
-            sizes(p, byte_count, handle_count)?;
+            sizes(p, byte_count, handle_count, sender)?;
             Err(Error::BufferTooSmall)
         }
         ipc::Read::Message {
             bytes: payload,
             handles: installed,
+            sender,
         } => {
             let delivered = copy_out(p, bytes.addr(), &payload)
                 .and_then(|()| copy_out_records(p, handles.addr(), &installed))
-                .and_then(|()| sizes(p, payload.len(), installed.len()));
+                .and_then(|()| sizes(p, payload.len(), installed.len(), sender));
             // The ranges were checked above; only an address space changing under the
             // call could fail here. Then the handles the program cannot see are closed.
             delivered.inspect_err(|_| {

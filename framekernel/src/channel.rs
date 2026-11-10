@@ -6,6 +6,10 @@
 //! its reader gets [`Error::ShouldWait`] rather than growing the kernel's memory (backpressure,
 //! P8). Queue storage is taken once at creation, with `try_reserve`: writing never allocates.
 //! Message limits are the ABI's; the depth and byte bound are this kernel's choice.
+//!
+//! Every message carries its writer's [`Identity`], which the kernel stamps when the message is
+//! written (ADR-0005 B1): the queue keeps it with the message, a reader learns it with the
+//! message or with its sizes, and nothing in the message can change it.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -19,13 +23,25 @@ pub const QUEUE_DEPTH: usize = 16;
 /// or a maximal write could never succeed.
 pub const QUEUE_BYTES: usize = 4 * MAX_MESSAGE_BYTES;
 
-/// One message: bytes and the objects moved with it.
+/// Who wrote a message (ADR-0005 B1, C1): the writing process's ID and principal, taken by the
+/// kernel when the message is written. Nothing the writer passes reaches it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Identity {
+    /// The writer's process ID: unique for the boot and never reused; 0 is the kernel.
+    pub process: u64,
+    /// The writer's principal: opaque, given when its process was created, never changed.
+    pub principal: u64,
+}
+
+/// One message: bytes, the objects moved with it, and who wrote it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Message<H> {
     /// The payload, at most 64 KiB.
     pub bytes: Vec<u8>,
     /// Transferred objects, at most 64.
     pub handles: Vec<H>,
+    /// Its writer, as stamped when it was written.
+    pub sender: Identity,
 }
 
 /// Why a read returned no message.
@@ -34,12 +50,14 @@ pub enum ReadError {
     /// Empty and the peer is open ([`Error::ShouldWait`]), or empty and the peer closed
     /// ([`Error::PeerClosed`]).
     Status(Error),
-    /// The next message does not fit; it stays queued. Its sizes are given.
+    /// The next message does not fit; it stays queued. Its sizes and writer are given.
     TooSmall {
         /// Bytes the caller must make room for.
         bytes: usize,
         /// Handles the caller must make room for.
         handles: usize,
+        /// Who wrote it.
+        sender: Identity,
     },
 }
 
@@ -114,12 +132,12 @@ impl<H> Channel<H> {
         }
     }
 
-    /// The sizes (bytes, handles) of the next message for side `at`; an empty queue is
-    /// [`Error::ShouldWait`], or [`Error::PeerClosed`] once the peer has closed.
-    pub fn peek(&self, at: usize) -> Result<(usize, usize), Error> {
+    /// The next message for side `at`, left queued; an empty queue is [`Error::ShouldWait`],
+    /// or [`Error::PeerClosed`] once the peer has closed.
+    pub fn peek(&self, at: usize) -> Result<&Message<H>, Error> {
         let peer_open = self.open.get(other(at)).copied().unwrap_or(false);
         match self.queues.get(at & 1).and_then(VecDeque::front) {
-            Some(next) => Ok((next.bytes.len(), next.handles.len())),
+            Some(next) => Ok(next),
             None if peer_open => Err(Error::ShouldWait),
             None => Err(Error::PeerClosed),
         }
@@ -133,9 +151,14 @@ impl<H> Channel<H> {
         byte_capacity: usize,
         handle_capacity: usize,
     ) -> Result<Message<H>, ReadError> {
-        let (bytes, handles) = self.peek(at).map_err(ReadError::Status)?;
+        let next = self.peek(at).map_err(ReadError::Status)?;
+        let (bytes, handles) = (next.bytes.len(), next.handles.len());
         if bytes > byte_capacity || handles > handle_capacity {
-            return Err(ReadError::TooSmall { bytes, handles });
+            return Err(ReadError::TooSmall {
+                bytes,
+                handles,
+                sender: next.sender,
+            });
         }
         if let Some(queued) = self.queued_bytes.get_mut(at & 1) {
             *queued = queued.saturating_sub(bytes);
@@ -184,11 +207,27 @@ mod tests {
     use crate::testing::{Rng, cases};
     use std::collections::VecDeque as Deque;
 
+    /// The writer most tests use.
+    const WRITER: Identity = Identity {
+        process: 7,
+        principal: 0x7000_0000_0000_0007,
+    };
+
     fn msg(b: &[u8], h: &[u32]) -> Message<u32> {
+        msg_from(b, h, WRITER)
+    }
+
+    fn msg_from(b: &[u8], h: &[u32], sender: Identity) -> Message<u32> {
         Message {
             bytes: b.to_vec(),
             handles: h.to_vec(),
+            sender,
         }
+    }
+
+    /// The sizes of the next message, as a reader learns them.
+    fn sizes(c: &Channel<u32>, at: usize) -> Result<(usize, usize), Error> {
+        c.peek(at).map(|m| (m.bytes.len(), m.handles.len()))
     }
 
     fn channel(depth: usize) -> Channel<u32> {
@@ -240,30 +279,69 @@ mod tests {
             c.read(0, 4, 2),
             Err(ReadError::TooSmall {
                 bytes: 5,
-                handles: 2
+                handles: 2,
+                sender: WRITER
             })
         );
         assert_eq!(
             c.read(0, 5, 1),
             Err(ReadError::TooSmall {
                 bytes: 5,
-                handles: 2
+                handles: 2,
+                sender: WRITER
             })
         );
-        assert_eq!(c.peek(0), Ok((5, 2)));
+        assert_eq!(sizes(&c, 0), Ok((5, 2)));
         assert_eq!(c.read(0, 5, 2), Ok(msg(b"hello", &[1, 2])));
+    }
+
+    #[test]
+    fn each_message_keeps_the_identity_it_was_written_with() {
+        let a = Identity {
+            process: 3,
+            principal: 0xA11C_E000_0000_0001,
+        };
+        let b = Identity {
+            process: 9,
+            principal: 0xB0B0_0000_0000_0002,
+        };
+        let mut c = channel(4);
+        c.write(0, msg_from(b"from a", &[], a)).unwrap();
+        c.write(0, msg_from(b"from b", &[1], b)).unwrap();
+        // A buffer too small leaves the message queued, and names its writer.
+        assert_eq!(
+            c.read(1, 2, 0),
+            Err(ReadError::TooSmall {
+                bytes: 6,
+                handles: 0,
+                sender: a
+            })
+        );
+        assert_eq!(c.peek(1).map(|m| m.sender), Ok(a));
+        assert_eq!(c.read(1, 64, 4), Ok(msg_from(b"from a", &[], a)));
+        assert_eq!(
+            c.read(1, 64, 0),
+            Err(ReadError::TooSmall {
+                bytes: 6,
+                handles: 1,
+                sender: b
+            })
+        );
+        // What a closing end gives back keeps its writers too.
+        let back = c.close(1);
+        assert_eq!(back.front().map(|m| m.sender), Some(b));
     }
 
     #[test]
     fn peek_reports_an_empty_queue_and_a_closed_peer() {
         let mut c = channel(2);
-        assert_eq!(c.peek(1), Err(Error::ShouldWait));
+        assert_eq!(sizes(&c, 1), Err(Error::ShouldWait));
         c.write(0, msg(b"last", &[])).unwrap();
         drop(c.close(0));
         // What was queued before the close can still be read; then the peer is closed.
-        assert_eq!(c.peek(1), Ok((4, 0)));
+        assert_eq!(sizes(&c, 1), Ok((4, 0)));
         assert_eq!(c.read(1, 8, 0), Ok(msg(b"last", &[])));
-        assert_eq!(c.peek(1), Err(Error::PeerClosed));
+        assert_eq!(sizes(&c, 1), Err(Error::PeerClosed));
     }
 
     #[test]
@@ -272,16 +350,19 @@ mod tests {
         let big = Message {
             bytes: alloc::vec![0; MAX_MESSAGE_BYTES + 1],
             handles: Vec::new(),
+            sender: WRITER,
         };
         assert_eq!(c.write(0, big).unwrap_err().0, Error::InvalidArgs);
         let many = Message {
             bytes: Vec::new(),
             handles: alloc::vec![0; MAX_MESSAGE_HANDLES + 1],
+            sender: WRITER,
         };
         assert_eq!(c.write(0, many).unwrap_err().0, Error::InvalidArgs);
         let exact = Message {
             bytes: alloc::vec![1; MAX_MESSAGE_BYTES],
             handles: alloc::vec![0; MAX_MESSAGE_HANDLES],
+            sender: WRITER,
         };
         assert!(c.write(0, exact).is_ok());
     }
@@ -293,6 +374,7 @@ mod tests {
         let full = |v: u8| Message {
             bytes: alloc::vec![v; MAX_MESSAGE_BYTES],
             handles: Vec::new(),
+            sender: WRITER,
         };
         c.write(0, full(1)).unwrap();
         assert_ne!(c.signals(0) & signals::WRITABLE, 0);
@@ -315,6 +397,7 @@ mod tests {
         let exact = Message {
             bytes: alloc::vec![9; MAX_MESSAGE_BYTES],
             handles: Vec::new(),
+            sender: WRITER,
         };
         assert!(c.write(0, exact).is_ok());
     }
@@ -327,8 +410,12 @@ mod tests {
         assert_eq!(c.queued_bytes[1], 0);
     }
 
+    /// A message as the model keeps it: bytes, handles and writer.
+    type Queued = (Vec<u8>, Vec<u32>, Identity);
+
     /// Any interleaving of writes, reads and closes, against a model of two queues. Order,
-    /// the bounds, what each side sees and what a closure gives back must all agree.
+    /// the bounds, each message's writer, what each side sees and what a closure gives back
+    /// must all agree.
     #[test]
     fn a_random_operation_sequence_matches_a_model() {
         const DEPTH: usize = 6;
@@ -338,7 +425,7 @@ mod tests {
             let mut c: Channel<u32> =
                 Channel::try_new(DEPTH, LIMIT.max(MAX_MESSAGE_BYTES)).unwrap();
             c.byte_limit = LIMIT;
-            let mut model: [Deque<(Vec<u8>, Vec<u32>)>; 2] = [Deque::new(), Deque::new()];
+            let mut model: [Deque<Queued>; 2] = [Deque::new(), Deque::new()];
             let mut bytes = [0usize; 2];
             let mut open = [true, true];
             let mut tag = 0u32;
@@ -348,15 +435,18 @@ mod tests {
                 match rng.below(9) {
                     0..=3 => {
                         tag += 1;
-                        let m = (vec![tag as u8; rng.below(80)], vec![tag; rng.below(4)]);
-                        let len = m.0.len();
-                        let got = c.write(
-                            side,
-                            Message {
-                                bytes: m.0.clone(),
-                                handles: m.1.clone(),
-                            },
+                        // Each message has its own writer, as if ends moved between processes.
+                        let writer = Identity {
+                            process: 100 + side as u64,
+                            principal: u64::from(tag) << 32 | rng.below(1000) as u64,
+                        };
+                        let m = (
+                            vec![tag as u8; rng.below(80)],
+                            vec![tag; rng.below(4)],
+                            writer,
                         );
+                        let len = m.0.len();
+                        let got = c.write(side, msg_from(&m.0, &m.1, writer));
                         if !open[side] {
                             // The kernel never writes through a closed end; skip the model.
                             if got.is_ok() {
@@ -385,23 +475,18 @@ mod tests {
                                     Error::PeerClosed
                                 }))
                             ),
-                            Some((b, h)) if b.len() > bc || h.len() > hc => assert_eq!(
+                            Some((b, h, w)) if b.len() > bc || h.len() > hc => assert_eq!(
                                 got,
                                 Err(ReadError::TooSmall {
                                     bytes: b.len(),
-                                    handles: h.len()
+                                    handles: h.len(),
+                                    sender: *w
                                 })
                             ),
                             Some(_) => {
-                                let (b, h) = model[side].pop_front().unwrap();
+                                let (b, h, w) = model[side].pop_front().unwrap();
                                 bytes[side] -= b.len();
-                                assert_eq!(
-                                    got,
-                                    Ok(Message {
-                                        bytes: b,
-                                        handles: h
-                                    })
-                                );
+                                assert_eq!(got, Ok(msg_from(&b, &h, w)));
                             }
                         }
                     }
@@ -409,6 +494,9 @@ mod tests {
                         if open[side] {
                             let back = c.close(side);
                             assert_eq!(back.len(), model[side].len());
+                            for (m, (_, _, w)) in back.iter().zip(&model[side]) {
+                                assert_eq!(m.sender, *w, "seed {seed}: a closure keeps writers");
+                            }
                             model[side].clear();
                             bytes[side] = 0;
                             open[side] = false;

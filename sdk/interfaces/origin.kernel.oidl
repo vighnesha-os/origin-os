@@ -121,12 +121,20 @@ const debug_write_max: u32 = 128;
 /// with this permission or without it; a process without it is refused.
 capability kernel.debug;
 
-/// What channel_read reports (ADR-0005 P4, amendment A4).
+/// What channel_read reports (ADR-0005 P4, amendment A4): the next message's sizes and, from
+/// minor 2, who wrote it (B1, C1, C2). A caller whose size predates a field gets nothing in its
+/// place, and no error.
 sized struct read_sizes {
     /// The message's byte count.
     bytes: u32;
     /// The message's handle count.
     handles: u32;
+    /// The writer's process ID, stamped by the kernel when the message was written: unique for
+    /// the boot and never reused. It names the process and grants nothing.
+    @since(0.2) sender_process: u64;
+    /// The writer's principal, stamped with it: opaque, set when the writer's process was
+    /// created.
+    @since(0.2) sender_principal: u64;
 }
 
 /// A handle channel_read moved into the caller's table: its value there, what it names and the
@@ -205,7 +213,8 @@ interface kernel {
         @count(sizes.bytes) bytes: vector<u8, max_message_bytes>,
         /// Filled with a record of each handle moved to the caller's table (ADR-0005 B3).
         @count(sizes.handles) handles: vector<received_handle, max_message_handles>,
-        /// The message's sizes; set size before the call.
+        /// The message's sizes and writer; set size before the call. Written on
+        /// buffer_too_small too, so a reader can decide from both whether to make room.
         @also_on(buffer_too_small) sizes: read_sizes,
     ) errors(bad_handle, wrong_type, access_denied, fault, invalid_args, should_wait, peer_closed, buffer_too_small, limit, no_memory) requires none;
 

@@ -30,7 +30,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use crate::channel::{Channel, Message, QUEUE_BYTES, QUEUE_DEPTH, ReadError, other};
+use crate::channel::{Channel, Identity, Message, QUEUE_BYTES, QUEUE_DEPTH, ReadError, other};
 use crate::handles::{HandleTable, Need, Typed};
 use crate::heap::{MAX_BLOCK, MIN_BLOCK, PAGE};
 use origin_abi::{Error, Handle, ObjectType};
@@ -397,10 +397,16 @@ fn inside(
 
 /// `channel_write`: queues `bytes` and moves the handles in `transfer` out of `table`, or
 /// does nothing and says why. `need` is what the end must meet, and `transfer_need` what each
-/// listed handle must.
+/// listed handle must. The message carries `sender`, the writing process's identity, which
+/// the caller takes from that process and never from what the writer passed (ADR-0005 B1).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one fact the write needs"
+)]
 pub(crate) fn channel_write(
     table: &SpinLock<HandleTable<Object>>,
     account: &ObjectRef<Account>,
+    sender: Identity,
     handle: Handle,
     need: Need,
     bytes: Vec<u8>,
@@ -458,6 +464,7 @@ pub(crate) fn channel_write(
         let message = Message {
             bytes,
             handles: moved,
+            sender,
         };
         // Beside the message, in step with the queue; its storage was taken at creation.
         if let Some(list) = channel.charges.lock().get_mut(reader) {
@@ -508,13 +515,17 @@ pub(crate) enum Read {
         bytes: Vec<u8>,
         /// The handles, as the reader's table now holds them.
         handles: Vec<Received>,
+        /// Who wrote it (B1).
+        sender: Identity,
     },
-    /// The next message does not fit; it stays queued. Its sizes.
+    /// The next message does not fit; it stays queued. Its sizes and its writer.
     TooSmall {
         /// Bytes of the message.
         bytes: usize,
         /// Handles with it.
         handles: usize,
+        /// Who wrote it.
+        sender: Identity,
     },
 }
 
@@ -531,10 +542,16 @@ pub(crate) fn channel_read(
         let mut table = table.lock();
         let (channel, side) = channel_of(&table, handle, need)?;
         let mut state = channel.state.lock();
-        let (bytes, handles) = state.peek(side)?;
+        let next = state.peek(side)?;
+        let (bytes, handles, sender) = (next.bytes.len(), next.handles.len(), next.sender);
         if bytes > byte_capacity || handles > handle_capacity {
             drop(state);
-            return Ok((None, Read::TooSmall { bytes, handles }, None));
+            let too_small = Read::TooSmall {
+                bytes,
+                handles,
+                sender,
+            };
+            return Ok((None, too_small, None));
         }
         // Room for its handles first: if the table is full, or memory is out, the message
         // stays queued.
@@ -582,6 +599,7 @@ pub(crate) fn channel_read(
         let read = Read::Message {
             bytes: message.bytes,
             handles: values,
+            sender: message.sender,
         };
         Ok::<_, Error>((Some((channel, other(side))), read, charge))
     })?;

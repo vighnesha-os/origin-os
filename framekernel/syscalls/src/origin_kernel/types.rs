@@ -336,28 +336,40 @@ impl rt::Fixed for Signals {
     }
 }
 
-/// What channel_read reports (ADR-0005 P4, amendment A4).
+/// What channel_read reports (ADR-0005 P4, amendment A4): the next message's sizes and, from
+/// minor 2, who wrote it (B1, C1, C2). A caller whose size predates a field gets nothing in its
+/// place, and no error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadSizes {
     /// The message's byte count.
     pub bytes: u32,
     /// The message's handle count.
     pub handles: u32,
+    /// The writer's process ID, stamped by the kernel when the message was written: unique for
+    /// the boot and never reused. It names the process and grants nothing.
+    pub sender_process: Option<u64>,
+    /// The writer's principal, stamped with it: opaque, set when the writer's process was
+    /// created.
+    pub sender_principal: Option<u64>,
 }
 
 impl ReadSizes {
     /// Bytes of the newest version of this structure.
-    pub const SIZE: u32 = 12;
+    pub const SIZE: u32 = 32;
     /// Bytes of the oldest version.
     pub const BASE_SIZE: u32 = 12;
     /// The size of each version, ascending.
-    pub const SIZES: [u32; 1] = [12];
+    pub const SIZES: [u32; 2] = [12, 32];
     /// Byte offset of `size`.
     pub const SIZE_AT: usize = 0;
     /// Byte offset of `bytes`.
     pub const BYTES_AT: usize = 4;
     /// Byte offset of `handles`.
     pub const HANDLES_AT: usize = 8;
+    /// Byte offset of `sender_process`.
+    pub const SENDER_PROCESS_AT: usize = 16;
+    /// Byte offset of `sender_principal`.
+    pub const SENDER_PRINCIPAL_AT: usize = 24;
 
     /// Whether the caller's `size` is valid for this structure as a parameter (§5.3).
     pub fn accepts_param_size(size: u32) -> bool {
@@ -382,7 +394,10 @@ impl ReadSizes {
         }
         let bytes: u32 = rt::field(oidl_bytes, 4, oidl_minor)?;
         let handles: u32 = rt::field(oidl_bytes, 8, oidl_minor)?;
-        Ok(Self { bytes, handles })
+        if oidl_size >= 32 { rt::check_zero(oidl_bytes, 12, 4)?; }
+        let sender_process = if oidl_size >= 32 { Some(rt::field::<u64>(oidl_bytes, 16, oidl_minor)?) } else { None };
+        let sender_principal = if oidl_size >= 32 { Some(rt::field::<u64>(oidl_bytes, 24, oidl_minor)?) } else { None };
+        Ok(Self { bytes, handles, sender_process, sender_principal })
     }
 
     /// Writes the fields that fit in `limit` bytes into `out`, leaving `size` alone.
@@ -390,11 +405,20 @@ impl ReadSizes {
         if out.len() < usize::try_from(Self::SIZE).unwrap_or(usize::MAX) {
             return Err(rt::WireError::Size);
         }
+        if u64::from(limit) >= 16 {
+            rt::zero_fill(out, 12, 4)?;
+        }
         if u64::from(limit) >= 8 {
             rt::put_field(out, 4, self.bytes)?;
         }
         if u64::from(limit) >= 12 {
             rt::put_field(out, 8, self.handles)?;
+        }
+        if u64::from(limit) >= 24 && let Some(value) = self.sender_process {
+            rt::put_field(out, 16, value)?;
+        }
+        if u64::from(limit) >= 32 && let Some(value) = self.sender_principal {
+            rt::put_field(out, 24, value)?;
         }
         Ok(())
     }

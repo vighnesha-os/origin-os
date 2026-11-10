@@ -131,6 +131,18 @@ fn the_limits_layouts_and_version_are_the_same() {
         generated::ReadSizes::HANDLES_AT,
         origin_abi::read_sizes::HANDLES_AT
     );
+    assert_eq!(
+        generated::ReadSizes::BASE_SIZE,
+        origin_abi::read_sizes::BASE_SIZE
+    );
+    assert_eq!(
+        generated::ReadSizes::SENDER_PROCESS_AT,
+        origin_abi::read_sizes::SENDER_PROCESS_AT
+    );
+    assert_eq!(
+        generated::ReadSizes::SENDER_PRINCIPAL_AT,
+        origin_abi::read_sizes::SENDER_PRINCIPAL_AT
+    );
     // The record `channel_read` writes for each handle (ADR-0005 B3).
     assert_eq!(
         <generated::ReceivedHandle as rt::Fixed>::SIZE,

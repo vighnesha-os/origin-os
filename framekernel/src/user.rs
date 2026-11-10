@@ -20,7 +20,7 @@ use origin_abi::{Error, status_name};
 
 use crate::console::Console;
 use crate::cpu::CpuIndex;
-use crate::process::{Ending, Limits, Process};
+use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, Process};
 use crate::sched;
 use crate::vm;
 use origin_frame::objref::ObjectRef;
@@ -73,7 +73,7 @@ fn spinner(value: u8, stack_top: u64) -> Vec<u8> {
 /// A process running `program` at [`CODE`] with one stack page, not started yet. System
 /// calls are accepted only from its code page.
 fn build(program: &[u8]) -> Option<Process> {
-    let mut p = Process::new(LIMITS, (CODE, CODE + PAGE))?;
+    let mut p = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)?;
     let frame = p.map_page(CODE, Access::ReadExecute).ok()?;
     if !p.write_frame(frame, 0, program) {
         return None;

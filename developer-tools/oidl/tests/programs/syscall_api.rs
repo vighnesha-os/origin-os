@@ -19,6 +19,8 @@ struct Log {
     /// What the next channel_read should do: the message's bytes, and a record of each handle
     /// (its value, object type and rights).
     next_read: Option<(Vec<u8>, Vec<(u32, u32, u32)>)>,
+    /// The writer the next channel_read reports: (process, principal).
+    sender: (u64, u64),
     /// What the next wait_one should report: (status, observed).
     next_wait: (i64, u32),
     /// The status the next call should return.
@@ -122,11 +124,15 @@ pub unsafe extern "C" fn origin_kernel_channel_read(
         let Some((message, list)) = m.next_read.clone() else {
             return k::Error::ShouldWait.raw();
         };
+        // The counts and the writer, also when the buffers are too small (ADR-0005 C2).
+        let (process, principal) = m.sender;
+        unsafe {
+            (sizes.add(4) as *mut u32).write_unaligned(message.len() as u32);
+            (sizes.add(8) as *mut u32).write_unaligned(list.len() as u32);
+            (sizes.add(k::ReadSizes::SENDER_PROCESS_AT) as *mut u64).write_unaligned(process);
+            (sizes.add(k::ReadSizes::SENDER_PRINCIPAL_AT) as *mut u64).write_unaligned(principal);
+        }
         if message.len() > bytes_capacity as usize || list.len() > handles_capacity as usize {
-            unsafe {
-                (sizes.add(4) as *mut u32).write_unaligned(message.len() as u32);
-                (sizes.add(8) as *mut u32).write_unaligned(list.len() as u32);
-            }
             return k::Error::BufferTooSmall.raw();
         }
         unsafe {
@@ -138,8 +144,6 @@ pub unsafe extern "C" fn origin_kernel_channel_read(
                 (record.add(4) as *mut u32).write_unaligned(*object);
                 (record.add(8) as *mut u32).write_unaligned(*rights);
             }
-            (sizes.add(4) as *mut u32).write_unaligned(message.len() as u32);
-            (sizes.add(8) as *mut u32).write_unaligned(list.len() as u32);
         }
         0
     })
@@ -286,6 +290,8 @@ fn client_paths() {
     // handle arrives as a checked record of its value, object type and rights (ADR-0005 B3).
     let channel = k::ObjectType::Channel.raw();
     let rights_of_a_channel = k::CHANNEL_RIGHTS.bits();
+    // The writer's identity comes with the sizes, all 64 bits of each (ADR-0005 B1, C2).
+    with(|m| m.sender = (0x0000_0001_0000_0029, 0xA11C_E000_0000_0001));
     with(|m| m.next_read = Some((b"xyz".to_vec(), vec![(9, channel, rights_of_a_channel)])));
     let filler = <k::ReceivedHandle as rt::Fixed>::FILLER;
     let mut bytes = [0u8; 8];
@@ -293,7 +299,15 @@ fn client_paths() {
     let out = kc::channel_read(handle(3), &mut bytes, &mut handles).expect("read");
     assert_eq!(out.bytes, 3);
     assert_eq!(out.handles, 1);
-    assert_eq!(out.sizes, k::ReadSizes { bytes: 3, handles: 1 });
+    assert_eq!(
+        out.sizes,
+        k::ReadSizes {
+            bytes: 3,
+            handles: 1,
+            sender_process: Some(0x0000_0001_0000_0029),
+            sender_principal: Some(0xA11C_E000_0000_0001),
+        }
+    );
     assert_eq!(&bytes[..3], b"xyz");
     assert_eq!(
         handles[0],
@@ -322,7 +336,12 @@ fn client_paths() {
         failure,
         rt::CallError::Method(kc::ChannelReadFailure {
             error: ks::ChannelReadError::BufferTooSmall,
-            sizes: Some(k::ReadSizes { bytes: 20, handles: 3 }),
+            sizes: Some(k::ReadSizes {
+                bytes: 20,
+                handles: 3,
+                sender_process: Some(0x0000_0001_0000_0029),
+                sender_principal: Some(0xA11C_E000_0000_0001),
+            }),
         })
     );
 

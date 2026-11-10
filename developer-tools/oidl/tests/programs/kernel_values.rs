@@ -68,6 +68,9 @@ fn main() {
     println!("read_sizes SIZE_AT {}", k::ReadSizes::SIZE_AT);
     println!("read_sizes BYTES_AT {}", k::ReadSizes::BYTES_AT);
     println!("read_sizes HANDLES_AT {}", k::ReadSizes::HANDLES_AT);
+    println!("read_sizes BASE_SIZE {}", k::ReadSizes::BASE_SIZE);
+    println!("read_sizes SENDER_PROCESS_AT {}", k::ReadSizes::SENDER_PROCESS_AT);
+    println!("read_sizes SENDER_PRINCIPAL_AT {}", k::ReadSizes::SENDER_PRINCIPAL_AT);
     println!("received_handle SIZE {}", <k::ReceivedHandle as rt::Fixed>::SIZE);
     println!("received_handle HANDLE_AT {}", k::ReceivedHandle::HANDLE_AT);
     println!("received_handle OBJECT_TYPE_AT {}", k::ReceivedHandle::OBJECT_TYPE_AT);

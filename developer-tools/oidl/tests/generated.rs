@@ -420,7 +420,10 @@ fn the_c_headers_compile_under_every_standard_from_the_oldest_to_the_newest() {
     }
     // The compilers check the layout assertions; pin one, so a removed assertion is noticed.
     let kernel = &tree.files["c/origin/kernel.h"];
-    assert!(kernel.contains("ORIGIN_OIDL_ASSERT(sizeof(origin_kernel_read_sizes_t) == 12"));
+    assert!(kernel.contains("ORIGIN_OIDL_ASSERT(sizeof(origin_kernel_read_sizes_t) == 32"));
+    assert!(kernel.contains(
+        "ORIGIN_OIDL_ASSERT(offsetof(origin_kernel_read_sizes_t, sender_principal) == 24"
+    ));
     assert!(
         kernel.contains("ORIGIN_OIDL_ASSERT(offsetof(origin_kernel_read_sizes_t, handles) == 8")
     );
@@ -1011,6 +1014,18 @@ fn the_generated_values_equal_the_hand_written_abi() {
     assert_eq!(
         map["read_sizes HANDLES_AT"],
         read_sizes::HANDLES_AT.to_string()
+    );
+    assert_eq!(
+        map["read_sizes BASE_SIZE"],
+        read_sizes::BASE_SIZE.to_string()
+    );
+    assert_eq!(
+        map["read_sizes SENDER_PROCESS_AT"],
+        read_sizes::SENDER_PROCESS_AT.to_string()
+    );
+    assert_eq!(
+        map["read_sizes SENDER_PRINCIPAL_AT"],
+        read_sizes::SENDER_PRINCIPAL_AT.to_string()
     );
     assert_eq!(
         map["received_handle SIZE"],

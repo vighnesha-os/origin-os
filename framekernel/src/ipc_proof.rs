@@ -44,7 +44,7 @@ use origin_frame::userspace::{self, UserFrame};
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex};
 use crate::ipc::{self, Object};
-use crate::process::{Ending, Limits, Process};
+use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, Process};
 use crate::{memory, sched, syscall, time};
 
 /// Where every proof process's code begins.
@@ -74,7 +74,8 @@ const MSG: u64 = DATA + 0x100;
 const RBUF: u64 = DATA + 0x140;
 /// `wait_one`'s output.
 const OBS: u64 = DATA + 0x240;
-/// `channel_read`'s sizes structure (`size` set to the known 12 before the process starts).
+/// `channel_read`'s sizes structure, given its first version's size, 12, before the process
+/// starts: every read through it gets the counts and nothing past them (C2).
 const SIZES: u64 = DATA + 0x248;
 /// A sizes structure too small for the kernel to use.
 const BAD_SIZES: u64 = DATA + 0x260;
@@ -262,7 +263,7 @@ impl Image {
     fn with_origin(limits: Limits, code: &[u8], origin: (u64, u64)) -> Option<Self> {
         let code_pages = code.len().div_ceil(PAGE as usize).max(1) as u64;
         let mut image = Self {
-            process: Process::new(limits, origin)?,
+            process: Process::new(limits, origin, BOOT_PROOF_PRINCIPAL)?,
             pages: Vec::new(),
         };
         image.map(CODE, code_pages, Access::ReadExecute)?;
@@ -307,7 +308,7 @@ impl Image {
     /// The scratch memory every scripted process starts with.
     fn scratch(&self) -> Option<()> {
         self.write(MSG, TEXT)?;
-        self.write(SIZES, &read_sizes::SIZE.to_le_bytes())?;
+        self.write(SIZES, &read_sizes::BASE_SIZE.to_le_bytes())?;
         self.write(BAD_SIZES, &8u32.to_le_bytes())
     }
 
@@ -496,7 +497,7 @@ fn ping_pong(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) 
 /// The process of `image`, its round count written (handles are written after the grants).
 fn build_pinger(image: Image, rounds: u64) -> Option<ObjectRef<Process>> {
     image.write_u64(DATA + 8, rounds)?;
-    image.write(SIZES, &read_sizes::SIZE.to_le_bytes())?;
+    image.write(SIZES, &read_sizes::BASE_SIZE.to_le_bytes())?;
     image.finish()
 }
 
@@ -854,7 +855,7 @@ fn full_queue_steps(timed_out: i64, wait_status: i64) -> Vec<Step> {
 fn hostile(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     // Another process with a live handle whose value is not live in the hostile process:
     // slot 40, which the hostile process's table never reaches.
-    let Some(other) = Process::new(LIMITS, (CODE, CODE + PAGE)) else {
+    let Some(other) = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL) else {
         return false;
     };
     let Ok((end, peer)) = ipc::create_channel(&other.account) else {
@@ -1903,7 +1904,7 @@ fn process_ids(com1: &mut Console) -> bool {
     let mut previous = 0;
     let mut ascending = true;
     for _ in 0..PROCESSES {
-        let Some(process) = Process::new(LIMITS, (CODE, CODE + PAGE)) else {
+        let Some(process) = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL) else {
             return false;
         };
         ascending &= process.id() > previous;
@@ -1926,7 +1927,8 @@ fn cancel_on_any_object(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, ts
     let mut ok = true;
     for (how, sends) in [("closes", false), ("sends away", true)] {
         // Never started, so nothing else can end the wait.
-        let Some(never_runs) = Process::new(LIMITS, (CODE, CODE + PAGE)) else {
+        let Some(never_runs) = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)
+        else {
             return false;
         };
         let Ok(never_runs) = ObjectRef::try_new(never_runs) else {
