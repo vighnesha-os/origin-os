@@ -8,6 +8,7 @@
 
 mod asmflags;
 mod disk;
+mod documents;
 mod interfaces;
 mod lex;
 mod loom;
@@ -58,6 +59,8 @@ commands:
               check (CLAUDE.md §73)
   unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction and on the
               `preserves_flags` option of assembly blocks (part of check; quick)
+  document-gate only the gate on documents and archives: none is tracked, or left in this
+              branch's history, outside a short allowlist (part of check; quick)
   interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
               (part of check; quick)
   regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
@@ -2043,6 +2046,7 @@ fn main() -> ExitCode {
     {
         ["check"] => in_turn("check", check),
         ["unsafe-gate"] => unsafety::gate(),
+        ["document-gate"] => documents::gate(),
         ["interface-gate"] => interfaces::gate(),
         ["regenerate"] => interfaces::regenerate(),
         ["build"] => in_turn("build", || {
@@ -2720,6 +2724,7 @@ fn check() -> Result {
     no_panic_check()?;
     dependency_check()?;
     linux_cfg_lint()?;
+    documents::gate()?;
     unsafety::gate()?;
     interfaces::gate()?;
     manifest_version_lint()?;
