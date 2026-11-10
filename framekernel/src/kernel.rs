@@ -436,6 +436,9 @@ fn prove_speculation(com1: &mut Console, cpus: &[cpu::CpuIndex]) -> bool {
         alike &= *first.get_or_insert(plan) == plan;
     }
     match first {
+        Some(plan) if alike && cpus.len() == 1 => {
+            let _ = writeln!(com1, "origin-kernel: speculation: 1 processor: {plan}");
+        }
         Some(plan) if alike => {
             let _ = writeln!(
                 com1,
@@ -568,8 +571,9 @@ fn prove_ibpb(com1: &mut Console, cpus: &[cpu::CpuIndex]) -> bool {
     sound &= changes >= 2;
     let _ = write!(
         com1,
-        "origin-kernel: ibpb: {changes} changes of process on {} processors, {barriers} barriers, {resumes} resumes without one",
-        cpus.len()
+        "origin-kernel: ibpb: {changes} changes of process on {} processor{}, {barriers} barriers, {resumes} resumes without one",
+        cpus.len(),
+        if cpus.len() == 1 { "" } else { "s" }
     );
     const SAMPLES: u64 = 16;
     let start = time::monotonic_nanos();

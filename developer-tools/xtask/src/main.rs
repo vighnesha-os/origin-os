@@ -1250,7 +1250,11 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // ADR-0017: what the processors reported and set as they started (which controls
             // depends on the machine, so only the line's start is fixed), and the lookup
             // that every index and address from ring 3 goes through, in both its forms.
-            format!("origin-kernel: speculation: {cpus} processors alike: on: "),
+            if cpus == 1 {
+                "origin-kernel: speculation: 1 processor: on: ".into()
+            } else {
+                format!("origin-kernel: speculation: {cpus} processors alike: on: ")
+            },
             "; lookups: ".into(),
             "; not offered: ".into(),
             "origin-kernel: nospec: both forms keep an index and an address in range: yes; in use: ".into(),
@@ -1364,7 +1368,10 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // ADR-0017 Z3: the scheduler noted each change of process, with one barrier for
             // each where the processor has IBPB and none where it has not.
             "origin-kernel: ibpb: ".into(),
-            format!(" changes of process on {cpus} processors, "),
+            format!(
+                " changes of process on {cpus} processor{}, ",
+                if cpus == 1 { "" } else { "s" }
+            ),
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
             "origin-kernel: PCIe: 00:00.0 8086:29c0 class 06:00:00 host bridge".into(),
             "origin-kernel: PCIe: 00:01.0 1234:1111 class 03:00:00 VGA-compatible display controller; BAR0 mem32 prefetchable 16 MiB at ".into(),
