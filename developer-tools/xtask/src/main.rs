@@ -1247,6 +1247,14 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             format!(
                 "origin-kernel: CPU state: machine checks raise #MC, x87 errors raise #MF, ring 3 has no RDPMC, FSGSBASE or SYSENTER, no debug breakpoint armed: {cpus} of {cpus} processors"
             ),
+            // ADR-0017: what the processors reported and set as they started (which controls
+            // depends on the machine, so only the line's start is fixed), and the lookup
+            // that every index and address from ring 3 goes through, in both its forms.
+            format!("origin-kernel: speculation: {cpus} processors alike: on: "),
+            "; lookups: ".into(),
+            "; not offered: ".into(),
+            "origin-kernel: nospec: both forms keep an index and an address in range: yes; in use: ".into(),
+            " ns masked and ".into(),
             "origin-kernel: reclaimed ".into(),
             // A boot step out of turn, or run twice, does nothing (ADR-0011 N6).
             "origin-kernel: boot steps: out of turn refused true; a second run refused true".into(),
@@ -1353,6 +1361,10 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(directory_markers())
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
+            // ADR-0017 Z3: the scheduler noted each change of process, with one barrier for
+            // each where the processor has IBPB and none where it has not.
+            "origin-kernel: ibpb: ".into(),
+            format!(" changes of process on {cpus} processors, "),
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
             "origin-kernel: PCIe: 00:00.0 8086:29c0 class 06:00:00 host bridge".into(),
             "origin-kernel: PCIe: 00:01.0 1234:1111 class 03:00:00 VGA-compatible display controller; BAR0 mem32 prefetchable 16 MiB at ".into(),
@@ -1657,6 +1669,12 @@ fn boot_failures() -> Vec<&'static str> {
         ": sysfs failed",
         ": GPT failed",
         ": IOMMU failed",
+        // ADR-0017: a control that did not read back, a processor that recorded nothing, a
+        // lookup out of range, an IBPB miscounted. A control the machine lacks is not here.
+        "did not read back as written",
+        "recorded nothing",
+        ": nospec failed",
+        ": ibpb failed",
     ]
 }
 
