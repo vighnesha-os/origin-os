@@ -17,12 +17,12 @@
 //!    descriptors are pre-marked accessed, so loading them never writes. So W^X holds even
 //!    while an AP starts.
 //! 3. For each AP, in turn: a stack and four interrupt stacks in the stack region
-//!    (`crate::stack`), each guard below them proven to fault, and heap `CpuTables`; then
-//!    INIT, 10 ms, start-up IPI, 200 µs, a second start-up IPI if it is not up yet, and up to 200 ms for its
-//!    handshake. The AP runs the trampoline (real → protected → long mode with the
-//!    kernel's own page tables), then [`ap_entry`]: its own GDT and TSS, the shared IDT,
-//!    the CPU-local area of its index (only if that index's APIC ID is its own), SMEP and
-//!    SMAP, its local APIC in x2APIC mode, and the handshake with its APIC ID.
+//!    (`crate::stack`), the page below each interrupt stack proven to fault, and heap
+//!    `CpuTables`; then INIT, 10 ms, start-up IPI, 200 µs, a second start-up IPI if it is not
+//!    up yet, and up to 200 ms for its handshake. The AP runs the trampoline (real → protected
+//!    → long mode with the kernel's own page tables), then [`ap_entry`]: its own GDT and TSS,
+//!    the shared IDT, the CPU-local area of its index (only if that index's APIC ID is its
+//!    own), SMEP and SMAP, its local APIC in x2APIC mode, and the handshake with its APIC ID.
 //! 4. The data page is then rewritten for the next AP. An AP that missed its handshake may
 //!    only be slow, so before that it must be made unable both to join late and to read
 //!    the page again (ADR-0008 C7):

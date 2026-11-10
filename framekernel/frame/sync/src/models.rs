@@ -121,6 +121,9 @@
 //!   an answer shows (the control `shootdown_waiting_initiator_does_not_serve`). No correct
 //!   execution gets there (`PATIENCE` says why). The leak that follows a `Stalled` is tested on
 //!   the host only.
+//! - The slots of a region beyond a reclaim and a take: a slot kept with its mapping for reuse,
+//!   `abandon`, `leak`, `trim`, and a reclaim whose shootdown stalls are tested on the host only
+//!   (`slots.rs`), and so is more than one slot.
 //! - `RwLock` writer starvation, which its documentation accepts; a timed waiter that finds the
 //!   queue full (the other way to reach `Step::Poll`, the same loop as the boot flow's); and what
 //!   callers must uphold themselves: the state changes before `wake_one`, and one condition per
