@@ -101,6 +101,13 @@ name = "origin-directory"
 version = "0.0.0"
 
 [[package]]
+name = "origin-directory-service"
+version = "0.0.0"
+dependencies = [
+ "origin-directory",
+]
+
+[[package]]
 name = "origin-frame"
 version = "0.0.0"
 dependencies = [

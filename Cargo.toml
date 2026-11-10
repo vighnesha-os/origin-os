@@ -29,6 +29,7 @@ members = [
     "runtime/version",
     "sdk/directory",
     "security/crypto",
+    "services/directory",
 ]
 # Host-buildable crates only. The UEFI loader's and the Framekernel's binaries cannot be
 # built for the host.

@@ -120,6 +120,8 @@ const FREESTANDING_LIBS: &[&str] = &[
     "origin-syscalls",
     "origin-directory",
 ];
+/// The services' `no_std` logic, which programs will run in ring 3 and the host tests until then.
+const SERVICE_LIBS: &[&str] = &["origin-directory-service"];
 const QEMU: &str = "qemu-system-x86_64";
 /// Where the emulated RTC starts (UTC), so the boot test can check the wall clock the
 /// kernel reads from it: BCD decoding, the FADT century register and the calendar.
@@ -2580,6 +2582,32 @@ fn check() -> Result {
                 "warnings",
             ]))?;
         }
+        run_step(cargo().args(["test", "--package", package]))?;
+    }
+    // The services' logic: `no_std`, tested on the host until programs run it in ring 3 (ADR-0011
+    // N14 step 4). Clippy on the host (with tests) and, as a `no_std` build, for the kernel's
+    // target, then their tests.
+    for &package in SERVICE_LIBS {
+        run_step(cargo().args([
+            "clippy",
+            "--package",
+            package,
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
+        run_step(cargo().args([
+            "clippy",
+            "--package",
+            package,
+            "--lib",
+            "--target",
+            KERNEL_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
         run_step(cargo().args(["test", "--package", package]))?;
     }
     // The framework: its logic on the host (with tests), and for the kernel's own target.

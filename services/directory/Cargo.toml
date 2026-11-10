@@ -1,0 +1,15 @@
+[package]
+name = "origin-directory-service"
+description = "The service directory's lookup (ADR-0005 C12, ADR-0011 N9): what a directory does with each connect, behind origin.directory's generated stub"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# `no_std` and without `unsafe`. It runs on the host only, in its tests, until ADR-0011 N14 step 4
+# brings Rust to ring 3 and a directory process serves it.
+[dependencies]
+origin-directory = { path = "../../sdk/directory" }
+
+[lints]
+workspace = true
