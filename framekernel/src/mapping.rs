@@ -265,6 +265,8 @@ impl<T> Record<T> {
 pub struct Mappings<T> {
     records: Vec<Record<T>>,
     limit: usize,
+    /// The process has ended: nothing more is taken.
+    closed: bool,
 }
 
 impl<T> Mappings<T> {
@@ -273,6 +275,7 @@ impl<T> Mappings<T> {
         Self {
             records: Vec::new(),
             limit,
+            closed: false,
         }
     }
 
@@ -292,9 +295,23 @@ impl<T> Mappings<T> {
         self.records.iter().any(|r| r.base < end && base < r.end())
     }
 
+    /// Whether one more mapping may be made: `InvalidArgs` once the process has ended, then
+    /// `Limit` at the limit. In D5's order, what is asked comes before the quotas, and the
+    /// quotas before the placement.
+    pub fn room(&self) -> Result<(), Error> {
+        if self.closed {
+            Err(Error::InvalidArgs)
+        } else if self.records.len() >= self.limit {
+            Err(Error::Limit)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Reserves the `pages` pages from `base` for a mapping of `object` being made, busy until
-    /// [`made`](Self::made). `Limit` past the limit (or without memory for the record),
-    /// `InvalidArgs` over another mapping; the object comes back with the refusal.
+    /// [`made`](Self::made). Refused as [`room`](Self::room) says, then `InvalidArgs` over
+    /// another mapping, and `NoMemory` without memory for the record; the object comes back
+    /// with the refusal.
     pub fn reserve(
         &mut self,
         base: u64,
@@ -302,11 +319,14 @@ impl<T> Mappings<T> {
         allow: Allow,
         object: T,
     ) -> Result<(), (Error, T)> {
-        if self.records.len() >= self.limit || self.records.try_reserve(1).is_err() {
-            return Err((Error::Limit, object));
+        if let Err(e) = self.room() {
+            return Err((e, object));
         }
         if self.overlaps(base, pages) {
             return Err((Error::InvalidArgs, object));
+        }
+        if self.records.try_reserve(1).is_err() {
+            return Err((Error::NoMemory, object));
         }
         self.records.push(Record {
             base,
@@ -363,7 +383,7 @@ impl<T> Mappings<T> {
     /// Takes every record out and refuses any more: the process has ended. The objects come
     /// back to be dropped with no lock held.
     pub fn close(&mut self) -> Vec<T> {
-        self.limit = 0;
+        self.closed = true;
         core::mem::take(&mut self.records)
             .into_iter()
             .map(|r| r.object)
@@ -615,9 +635,32 @@ mod tests {
         assert_eq!(m.remove(a), Some(1));
         assert_eq!(m.remove(a), None);
         assert_eq!(m.len(), 1);
-        // Once closed, everything comes back and nothing more is taken.
+        // Once closed, everything comes back and nothing more is taken: the process has ended.
         assert_eq!(m.close(), [2]);
         assert!(m.is_empty());
-        assert_eq!(m.reserve(a, 1, Allow::Read, 4), Err((Error::Limit, 4)));
+        assert_eq!(
+            m.reserve(a, 1, Allow::Read, 4),
+            Err((Error::InvalidArgs, 4))
+        );
+    }
+
+    #[test]
+    fn room_says_why_not_in_d5s_order() {
+        let mut m: Mappings<u32> = Mappings::new(1);
+        assert_eq!(m.room(), Ok(()));
+        assert_eq!(m.reserve(0x0000_2000_0000_0000, 1, Allow::Read, 1), Ok(()));
+        assert_eq!(m.room(), Err(Error::Limit));
+        assert_eq!(
+            m.reserve(0x0000_3000_0000_0000, 1, Allow::Read, 2),
+            Err((Error::Limit, 2)),
+            "the quota before the placement"
+        );
+        let _ = m.close();
+        // Ended, with room again: what is asked comes before the quota.
+        assert_eq!(m.room(), Err(Error::InvalidArgs));
+        let mut none: Mappings<u32> = Mappings::new(0);
+        assert_eq!(none.room(), Err(Error::Limit));
+        let _ = none.close();
+        assert_eq!(none.room(), Err(Error::InvalidArgs));
     }
 }

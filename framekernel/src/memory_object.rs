@@ -163,7 +163,10 @@ fn reserve(
         });
         match reserved {
             Ok(()) => {}
-            Err((Error::InvalidArgs, _)) => return Ok(false),
+            // Over another mapping, unless the process has ended meanwhile.
+            Err((Error::InvalidArgs, _)) => {
+                return without_interrupts(|| target.mappings.lock().room()).map(|()| false);
+            }
             Err((e, _)) => return Err(e),
         }
         // Pages the records do not know, the program's own and its start record's, are in the
@@ -179,6 +182,9 @@ fn reserve(
         // Never over a mapping (C7).
         Place::At(base) => take(base)?.then_some(base).ok_or(Error::InvalidArgs),
         Place::Anywhere => {
+            // An ended process, then the mapping limit, before the placement and its entropy
+            // (D5's order).
+            without_interrupts(|| target.mappings.lock().room())?;
             for _ in 0..PLACEMENT_TRIES {
                 let random = crate::entropy::hardware_u64().ok_or(Error::NotSupported)?;
                 let base = mapping::place(random, asked.pages).ok_or(Error::InvalidArgs)?;
