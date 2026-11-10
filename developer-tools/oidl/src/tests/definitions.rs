@@ -463,7 +463,9 @@ const KERNEL: &str = include_str!("../../../../sdk/interfaces/origin.kernel.oidl
 const ECHO: &str = include_str!("../../tests/fixtures/echo.oidl");
 const CALLS: &str = include_str!("../../tests/fixtures/calls.oidl");
 
-const VERSIONS: &str = "[compatibility]\nuser-abi = \"0.1\"\n";
+/// The versions file the kernel's definition names its version from (§9): the real one, the
+/// one place each number is written (§62).
+const VERSIONS: &str = include_str!("../../../../origin-version.toml");
 
 fn good_inputs() -> Vec<Input> {
     [
@@ -552,7 +554,11 @@ fn a_method_may_name_a_later_version_and_a_version_key_is_read() {
         .iter()
         .find(|l| l.name == "origin.kernel")
         .expect("kernel");
-    assert_eq!((kernel.version.major, kernel.version.minor), (0, 1));
+    assert_eq!(
+        (kernel.version.major, kernel.version.minor),
+        origin_abi::ABI_VERSION,
+        "read from origin-version.toml"
+    );
     assert_eq!(kernel.version_key.as_deref(), Some("user-abi"));
     let echo = comp
         .libraries
