@@ -172,6 +172,17 @@ pub struct LeafCensus {
     pub lower_local: u64,
 }
 
+/// Present leaves in part of an address space, by the size of the page each maps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LeafSizes {
+    /// 4 KiB leaves.
+    pub small: u64,
+    /// 2 MiB leaves.
+    pub large: u64,
+    /// 1 GiB leaves.
+    pub huge: u64,
+}
+
 /// Why a mapping change was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapError {
@@ -316,6 +327,47 @@ fn census_below(
     }
 }
 
+/// Adds to `sizes` the present leaves under the table at `table`, which is at `level` (3: the
+/// PML4) and maps from `base`, whose pages overlap `[first, last]`.
+fn sizes_below(
+    mem: &impl TableMemory,
+    table: u64,
+    level: u32,
+    base: u64,
+    (first, last): (u64, u64),
+    sizes: &mut LeafSizes,
+) {
+    let Some(entries) = mem.table(table) else {
+        return;
+    };
+    let span = PAGE << (9 * level);
+    for (i, entry) in entries.iter().enumerate() {
+        let mut at = base + i as u64 * span;
+        if level == 3 && i >= ENTRIES / 2 {
+            // The kernel half: bits 63:48 copy bit 47.
+            at |= 0xFFFF_0000_0000_0000;
+        }
+        // The entry's last byte: no overflow, since `at` is at most 2^64 - `span`.
+        if at + (span - 1) < first || at > last {
+            continue;
+        }
+        let value = entry.load(Ordering::Relaxed);
+        if value & PRESENT == 0 {
+            continue;
+        }
+        if level == 0 || (level <= 2 && value & LARGE != 0) {
+            let count = match level {
+                0 => &mut sizes.small,
+                1 => &mut sizes.large,
+                _ => &mut sizes.huge,
+            };
+            *count = count.saturating_add(1);
+        } else if let Some(below) = level.checked_sub(1) {
+            sizes_below(mem, value & ADDRESS, below, at, (first, last), sizes);
+        }
+    }
+}
+
 /// One 4-level address space, identified by the physical address of its PML4. Tables are
 /// never freed when they become empty.
 #[derive(Debug)]
@@ -386,6 +438,48 @@ impl AddressSpace {
                 .ok_or(MapError::UnknownTable(self.root))?
                 .store(table | PRESENT | WRITABLE, Ordering::Relaxed);
             made += 1;
+        }
+        Ok(made)
+    }
+
+    /// Makes every table that 4 KiB leaves in `[start, start + bytes)` would need, down to the
+    /// page tables, maps nothing, and returns how many tables it made. For a region whose leaves
+    /// come and go while the kernel runs (ADR-0004 Amendment 1, A2: the kernel stacks): once this
+    /// has run, a mapping there never needs a table, so it cannot fail for want of one, and its
+    /// tables are counted at boot.
+    ///
+    /// `start` and `bytes` must be 2 MiB aligned, and the range in one half. On
+    /// [`MapError::OutOfMemory`] the tables already made stay, and a later call makes the rest.
+    pub fn reserve_tables(
+        &mut self,
+        mem: &mut impl TableMemory,
+        start: u64,
+        bytes: u64,
+    ) -> Result<u32, MapError> {
+        if !start.is_multiple_of(LARGE_PAGE) {
+            return Err(MapError::Misaligned(start));
+        }
+        if !bytes.is_multiple_of(LARGE_PAGE) {
+            return Err(MapError::Misaligned(bytes));
+        }
+        let end = start.checked_add(bytes).ok_or(MapError::Overflow)?;
+        if let Some(last) = end.checked_sub(1).filter(|_| bytes > 0)
+            && (!is_canonical(start) || !is_canonical(last) || (start >> 47) != (last >> 47))
+        {
+            return Err(MapError::NonCanonical(start));
+        }
+        let mut made = 0u32;
+        let mut at = start;
+        while at < end {
+            let mut table = self.root;
+            for level in (1..=3).rev() {
+                let present = slot(mem, table, at, level)?.load(Ordering::Relaxed) & PRESENT != 0;
+                table = Self::next_table(mem, table, at, level, false)?;
+                if !present {
+                    made = made.saturating_add(1);
+                }
+            }
+            at += LARGE_PAGE;
         }
         Ok(made)
     }
@@ -600,6 +694,16 @@ impl AddressSpace {
             census_below(mem, entry.load(Ordering::Relaxed), 3, upper, &mut census);
         }
         census
+    }
+
+    /// Counts the present leaves whose pages overlap `[start, end)`, by size: the direct map's
+    /// page sizes, which nothing may split after boot (ADR-0004 Amendment 1, A2).
+    pub fn leaf_sizes(&self, mem: &impl TableMemory, start: u64, end: u64) -> LeafSizes {
+        let mut sizes = LeafSizes::default();
+        if let Some(last) = end.checked_sub(1).filter(|&last| last >= start) {
+            sizes_below(mem, self.root, 3, 0, (start, last), &mut sizes);
+        }
+        sizes
     }
 
     /// Splits the 2 MiB leaf covering `virt` into 512 4 KiB leaves with the same physical
@@ -1377,5 +1481,145 @@ mod tests {
                 Some(phys + 7)
             );
         }
+    }
+
+    /// A kernel-half address of the tests: the stack region's (ADR-0004 Amendment 1, A2).
+    const REGION: u64 = 0xFFFF_C000_0000_0000;
+
+    #[test]
+    fn reserved_tables_let_every_page_of_the_range_be_mapped_without_one() {
+        let tables = arena(16);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        // A PDPT, a page directory, and a page table for each of the two 2 MiB pieces.
+        assert_eq!(
+            space.reserve_tables(&mut mem, REGION, 2 * LARGE_PAGE),
+            Ok(4)
+        );
+        assert_eq!(mem.used(), 5);
+        assert_eq!(
+            space.reserve_tables(&mut mem, REGION, 2 * LARGE_PAGE),
+            Ok(0),
+            "made once"
+        );
+        // Nothing is mapped, and mapping anywhere in the range takes no table.
+        assert_eq!(space.leaf_census(&mem), LeafCensus::default());
+        let rw = Attributes::kernel_global(Access::ReadWrite);
+        for virt in [
+            REGION,
+            REGION + LARGE_PAGE - PAGE,
+            REGION + 2 * LARGE_PAGE - PAGE,
+        ] {
+            space.map(&mut mem, virt, 0x5000, rw).unwrap();
+        }
+        assert_eq!(mem.used(), 5, "no table made by the mappings");
+        // Past the range, a mapping makes its own page table.
+        space
+            .map(&mut mem, REGION + 2 * LARGE_PAGE, 0x5000, rw)
+            .unwrap();
+        assert_eq!(mem.used(), 6);
+        // A later range in the same directory makes only its page tables.
+        assert_eq!(
+            space.reserve_tables(&mut mem, REGION + 4 * LARGE_PAGE, LARGE_PAGE),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn reserving_tables_refuses_what_it_cannot_honour() {
+        let tables = arena(8);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        assert_eq!(
+            space.reserve_tables(&mut mem, REGION + PAGE, LARGE_PAGE),
+            Err(MapError::Misaligned(REGION + PAGE))
+        );
+        assert_eq!(
+            space.reserve_tables(&mut mem, REGION, PAGE),
+            Err(MapError::Misaligned(PAGE))
+        );
+        // Into the hole between the halves, or off the top of the address space.
+        let below = (1 << 47) - LARGE_PAGE;
+        assert_eq!(
+            space.reserve_tables(&mut mem, below, 2 * LARGE_PAGE),
+            Err(MapError::NonCanonical(below))
+        );
+        assert_eq!(
+            space.reserve_tables(&mut mem, 0xFFFF_FFFF_FFE0_0000, 2 * LARGE_PAGE),
+            Err(MapError::Overflow)
+        );
+        // A 2 MiB leaf where a page table would go.
+        let rw = Attributes::kernel_global(Access::ReadWrite);
+        space.map_large(&mut mem, REGION, 0x20_0000, rw).unwrap();
+        assert_eq!(
+            space.reserve_tables(&mut mem, REGION, LARGE_PAGE),
+            Err(MapError::LargePage(REGION))
+        );
+        // Running out: what was made stays, and a later call with room makes the rest.
+        let few = arena(2);
+        let mut small = TablePool::new(&few, ARENA_BASE);
+        let mut other = AddressSpace::new(&mut small).unwrap();
+        assert_eq!(
+            other.reserve_tables(&mut small, REGION, LARGE_PAGE),
+            Err(MapError::OutOfMemory)
+        );
+        assert_eq!(small.used(), 2, "the PDPT stays");
+    }
+
+    #[test]
+    fn leaf_sizes_count_only_the_range_asked_for() {
+        let tables = arena(16);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        let rw = Attributes::kernel_global(Access::ReadWrite);
+        let direct = 0xFFFF_8040_0000_0000;
+        // Two 2 MiB leaves and three 4 KiB ones in the direct map; one of each elsewhere.
+        let (small, large) = space
+            .map_range(&mut mem, direct, 0x20_0000, 2 * LARGE_PAGE + 3 * PAGE, rw)
+            .unwrap();
+        assert_eq!((small, large), (3, 2));
+        space.map(&mut mem, REGION, 0x9000, rw).unwrap();
+        space
+            .map_large(&mut mem, REGION + LARGE_PAGE, 0x60_0000, rw)
+            .unwrap();
+        space
+            .map(&mut mem, 0x40_0000, 0xA000, kernel(Access::Read))
+            .unwrap();
+        let window = (0xFFFF_8000_0000_0000, REGION);
+        assert_eq!(
+            space.leaf_sizes(&mem, window.0, window.1),
+            LeafSizes {
+                small: 3,
+                large: 2,
+                huge: 0
+            }
+        );
+        // The whole address space has every leaf; an empty range has none.
+        assert_eq!(
+            space.leaf_sizes(&mem, 0, u64::MAX),
+            LeafSizes {
+                small: 5,
+                large: 3,
+                huge: 0
+            }
+        );
+        assert_eq!(space.leaf_sizes(&mem, REGION, REGION), LeafSizes::default());
+        // A leaf that only partly overlaps the range counts.
+        assert_eq!(
+            space
+                .leaf_sizes(&mem, direct + LARGE_PAGE - 1, direct + LARGE_PAGE)
+                .large,
+            1
+        );
+        // Splitting a 2 MiB leaf turns it into 512 4 KiB ones, and the count shows it.
+        space.split_large(&mut mem, direct).unwrap();
+        assert_eq!(
+            space.leaf_sizes(&mem, window.0, window.1),
+            LeafSizes {
+                small: 3 + 512,
+                large: 1,
+                huge: 0
+            }
+        );
     }
 }
