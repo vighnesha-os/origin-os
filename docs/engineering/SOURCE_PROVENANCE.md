@@ -3183,3 +3183,30 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
   - *Costs, as QEMU TCG figures with no budget (rule 21):* a lookup, its loop included, 4.1 to 5.6 ns masked and 4.3 to 5.0 ns fenced over the boots read. An emulator does not speculate, and its LFENCE costs no more than the mask here, so these say only that the proof ran. No IBPB cost: the processor has none.
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-10. Original code; Rust `core` and `alloc` only in the kernel, `std` in the host tool.
 - **Licensing:** MIT OR Apache-2.0.
+
+## The many-page unmap proof no longer depends on timing (the review batch's first CI run; 2026-11-10)
+
+- **What:** `framekernel/src/aspace.rs`, the boot proof `unmap_many` and one new program for it, `read_again_when_told`. No kernel code outside the proof changes, and the line the proof prints and the boot test expects is the same.
+  - **Before:** the proof's thread read its page, the last of the range, in a loop while the range was unmapped, and the proof expected one interrupt for each round of 128 pages.
+  - **What went wrong:** with more than one round, an earlier round flushes every translation of the space on the thread's processor, its own page's among them. If that processor was then slow to go back to its thread, the last round had cleared the entries by the time the thread read again: it faulted by itself and left the space, no processor held the space when the round asked, and the round interrupted none. The kernel did nothing wrong, and the proof failed the boot.
+  - **Now:** the thread reads its page once, so that its processor holds a translation for it, keeps off the page until `unmap` has returned, and reads it again when told. Every round finds it running, so the count is exact, and the fault it takes at the second read shows that the translation it held is gone.
+- **Where it was seen:** the first CI run of pull request 15, at `9de1def`, job "boots on a real CPU (ubuntu-24.04)", the boot with the AMD IOMMU and the NIC behind a bridge: `200 pages unmapped at once under a running thread on another processor: it faulted at its page among them: true; Ok(Change { pages: 200, shootdowns: 2, interrupts: 1 }): address spaces failed`. Seven other boots of the same job printed `interrupts: 2`. The proof is task S3-5a's and was the same on every branch.
+- **Specifications:** none new. The rounds, and the flush for more than 32 pages, are `UserSpace::unmap`'s and `origin_sync::shootdown`'s own (the section "Address spaces that change while they run" above).
+- **Architecture decisions:** ADR-0013 R1 (a proof must not fail on a correct kernel) and its controls C34 to C36. ADR-0004 H2 and ADR-0011 N14 step 3 are unchanged.
+- **Open-source references consulted (§3, §6):** none.
+- **`unsafe`:** none. The new program is 48 bytes of ring-3 machine code in a `Vec`: `read_later_when_told` with one read added before its loop, in the instruction encodings the file's other programs use.
+- **A first attempt, not kept:** accepting one interrupt fewer on the last of several rounds. A control showed what it cost: with every round after the first asking nobody while the thread still ran, the count was one the relaxed check accepted, and the boot failed only because the thread did not fault within the wait. The exact count catches that outright, so the proof was changed to keep it exact.
+- **Limits, stated plainly:**
+  - The interleaving was reproduced only by planting two waits (C34). Without them no boot on the development machine has shown it.
+  - No boot on a real processor has run the changed proof yet. CI's are the first.
+  - The single-round proofs in the same file still have a thread reading its page throughout. No earlier round flushes its translation there, and none has been seen to fail. A processor that lost the translation another way in the few instructions between the change and the request would fail them the same way.
+  - A thread that still held a stale translation could lose it another way before it is told to read (a processor that reloads CR3 drops it), and would then fault although the shootdown did nothing. C36 was caught on its one boot; that catch depends on the translation surviving until the read.
+  - No human has reviewed this.
+- **Test evidence (2026-11-10; Rust 1.99.1, QEMU 11.1.3 TCG + OVMF, 2 processors, Intel VT-d):** each control is a temporary edit to an exported copy of the tree that has the change, built and booted once, with the proof's own failing line taken out of the copy's `boot_failures` so that the boot ran on to the refusal. The lines are from the serial logs.
+  - *C34, the interleaving forced against the proof as it was:* `... interrupts: 1 }): address spaces failed`, CI's line. With the same two waits and the changed proof: `... interrupts: 2 })`, and `cargo xtask boot-test` passes, 11 of 11.
+  - *C35, every round after the first asks nobody:* `... it faulted at its page among them: true; Ok(Change { pages: 200, shootdowns: 2, interrupts: 1 }): address spaces failed`.
+  - *C36, a processor answers without dropping anything:* `... it faulted at its page among them: false; Ok(Change { pages: 200, shootdowns: 2, interrupts: 2 }): address spaces failed`.
+  - *C19 and C21 again, on the changed proof:* `interrupts: 0` with no fault on the 5-page and 200-page lines; `interrupts: 3` and `6` with 4 processors. Each ends `boot refused: live address spaces failed`.
+  - *The unedited copy:* `5 pages ... interrupts: 1 })`, `200 pages ... interrupts: 2 })`, and `cargo xtask boot-test` passes, 11 of 11.
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-10, on the owner's word ("Fix it here"). Original code; Rust `core` and `alloc` only.
+- **Licensing:** MIT OR Apache-2.0.
