@@ -165,6 +165,14 @@ pub fn check(request: &Request, object_pages: u64, held: u32) -> Result<Asked, E
     })
 }
 
+/// Which of an object's frames `asked` maps: the places of its pages among them, in order.
+/// `None` if they cannot be counted; `check` has refused a request past the object's end.
+pub fn frames(asked: &Asked) -> Option<core::ops::Range<usize>> {
+    let first = usize::try_from(asked.first).ok()?;
+    let end = first.checked_add(usize::try_from(asked.pages).ok()?)?;
+    Some(first..end)
+}
+
 /// Where a random draw places `pages` pages: a page of `[PLACE_LOW, PLACE_HIGH)` at which they
 /// fit, or `None` if they cannot fit there at all.
 pub fn place(random: u64, pages: u64) -> Option<u64> {
@@ -542,6 +550,23 @@ mod tests {
         );
         assert_eq!(user_range_end(USER_START, 1), Some(USER_START + PAGE));
         assert_eq!(user_range_end(PAGE, u64::MAX), None);
+    }
+
+    #[test]
+    fn a_request_maps_its_own_pages_of_the_object() {
+        let later = check(&request(RW, 0, 3 * PAGE, 2 * PAGE, 0), 8, ALL_RIGHTS).expect("valid");
+        assert_eq!(frames(&later), Some(3..5));
+        let whole = check(&request(RW, 0, 0, 8 * PAGE, 0), 8, ALL_RIGHTS).expect("valid");
+        assert_eq!(frames(&whole), Some(0..8));
+        let last = check(&request(RW, 0, 7 * PAGE, PAGE, 0), 8, ALL_RIGHTS).expect("valid");
+        assert_eq!(frames(&last), Some(7..8));
+        let uncountable = Asked {
+            allow: Allow::Read,
+            first: u64::MAX,
+            pages: 2,
+            place: Place::Anywhere,
+        };
+        assert_eq!(frames(&uncountable), None);
     }
 
     #[test]

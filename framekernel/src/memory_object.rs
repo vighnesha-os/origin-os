@@ -86,9 +86,9 @@ impl MemoryObject {
         self.frames.len() as u64
     }
 
-    /// Its frame at page `page`, for a proof.
-    pub(crate) fn frame(&self, page: u64) -> Option<&SharedFrame> {
-        self.frames.get(usize::try_from(page).ok()?)
+    /// The frames `asked` maps: its pages of this object, in order.
+    fn run(&self, asked: &Asked) -> Option<&[SharedFrame]> {
+        self.frames.get(mapping::frames(asked)?)
     }
 }
 
@@ -234,29 +234,26 @@ fn reserve(
     }
 }
 
-/// Maps `asked`'s pages of `object` at `base`. On a failure the pages mapped so far go again,
-/// through a shootdown, since a thread may already have touched them.
+/// Maps `asked`'s pages of `object` at `base`, all of them or none, in one call to the address
+/// space (`UserSpace::map_shared_run`). A refused run was never entered: there is nothing to
+/// take out again, and no shootdown.
 fn map_pages(
     space: &UserSpace,
     base: u64,
     object: &MemoryObject,
     asked: &Asked,
 ) -> Result<(), Error> {
-    for k in 0..asked.pages {
-        let frame = object.frame(asked.first + k).ok_or(Error::InvalidArgs)?;
-        if let Err(e) = space.map_shared(base + k * PAGE, frame, access(asked.allow)) {
-            let _ = space.unmap(base, k);
-            return Err(match e {
-                // The space's page tables are full (`MAX_TABLES`) or out of frames.
-                ChangeError::Map(MapError::OutOfMemory) => Error::Limit,
-                // Not reached in this version: the place is reserved and was found unmapped
-                // (`reserve`), its addresses were checked (`mapping::check`), and no mapping
-                // of an object is executable.
-                _ => Error::InvalidArgs,
-            });
-        }
-    }
-    Ok(())
+    let frames = object.run(asked).ok_or(Error::InvalidArgs)?;
+    space
+        .map_shared_run(base, frames, access(asked.allow))
+        .map_err(|e| match e {
+            // The space is out of frames for its page tables.
+            ChangeError::Map(MapError::OutOfMemory) => Error::Limit,
+            // Not reached in this version: the place is reserved and was found unmapped
+            // (`reserve`), its addresses were checked (`mapping::check`), and no mapping of an
+            // object is executable.
+            _ => Error::InvalidArgs,
+        })
 }
 
 /// What a change cost, in the budget's units: its shootdowns and the interrupts they sent.
