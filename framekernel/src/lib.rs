@@ -125,6 +125,7 @@ pub mod ioapic;
 pub mod json;
 pub mod klog;
 pub mod linequeue;
+pub mod mapping;
 pub mod net;
 pub mod numa;
 pub mod nvme;
