@@ -19,7 +19,9 @@
 //! rebuild them (`-Z build-std` is the nightly compiler's; CLAUDE.md §12). Their functions
 //! that are not generic arrive in the image as they were built. The gate counts what it
 //! finds in them and prints the count on every run. It fails only for code this build
-//! compiled. See [`prebuilt`] for how it tells the two apart.
+//! compiled. See [`prebuilt`] for how it tells the two apart. The owner accepted that gap by
+//! name (ADR-0017 Amendment 1, decision item 152), and it is looked at again at every
+//! toolchain upgrade (CLAUDE.md §15): when stable Rust can rebuild them, the exception goes.
 //!
 //! **One more thing it reads** is the trap entry itself. ADR-0017 Z2 has the entry zero every
 //! general-purpose register once a program's values are saved, so that a wrongly guessed path
