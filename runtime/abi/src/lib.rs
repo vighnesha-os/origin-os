@@ -70,11 +70,14 @@ pub enum Error {
     Limit = -12,
     /// The caller's buffer is too small; the sizes it needs were written to the out pointer.
     BufferTooSmall = -13,
+    /// Nothing by that name or key is here: a service directory holds no provider of the
+    /// interface and major asked for (amendment C11).
+    NotFound = -14,
 }
 
 impl Error {
     /// Every error, in value order.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::InvalidArgs,
         Self::BadHandle,
         Self::WrongType,
@@ -88,6 +91,7 @@ impl Error {
         Self::NotSupported,
         Self::Limit,
         Self::BufferTooSmall,
+        Self::NotFound,
     ];
 
     /// The raw status value.
@@ -116,6 +120,7 @@ impl Error {
             Self::NotSupported => "NOT_SUPPORTED",
             Self::Limit => "LIMIT",
             Self::BufferTooSmall => "BUFFER_TOO_SMALL",
+            Self::NotFound => "NOT_FOUND",
         }
     }
 }
@@ -658,7 +663,7 @@ mod tests {
     #[test]
     fn status_values_are_stable_and_distinct() {
         // Pinned: these values are the C ABI (P5); changing one breaks every program.
-        let expected: [(Error, i64); 13] = [
+        let expected: [(Error, i64); 14] = [
             (Error::InvalidArgs, -1),
             (Error::BadHandle, -2),
             (Error::WrongType, -3),
@@ -672,20 +677,22 @@ mod tests {
             (Error::NotSupported, -11),
             (Error::Limit, -12),
             (Error::BufferTooSmall, -13),
+            (Error::NotFound, -14),
         ];
         for (e, v) in expected {
             assert_eq!(e.raw(), v);
             assert_eq!(Error::from_raw(v), Some(e));
         }
         assert_eq!(Error::from_raw(OK), None);
-        assert_eq!(Error::from_raw(-14), None);
+        assert_eq!(Error::from_raw(-15), None);
         assert_eq!(Error::ALL.len(), expected.len());
     }
 
     #[test]
     fn every_status_has_a_distinct_name() {
         assert_eq!(status_name(OK), "OK");
-        assert_eq!(status_name(-14), "UNKNOWN");
+        assert_eq!(status_name(-14), "NOT_FOUND");
+        assert_eq!(status_name(-15), "UNKNOWN");
         assert_eq!(status_name(1), "UNKNOWN");
         let mut names: Vec<&str> = Error::ALL.iter().map(|e| e.name()).collect();
         for e in Error::ALL {
