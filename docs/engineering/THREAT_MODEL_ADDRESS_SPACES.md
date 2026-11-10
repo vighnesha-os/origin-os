@@ -57,7 +57,7 @@ Status: **Proven**, **Modelled**, **By design** (no proof), **Partly**, **Open**
 
 | # | Threat | Defence | Status |
 |---|---|---|---|
-| T12 | A kernel mapping made after a process was created is missing from that process, so the kernel faults while on its tables | Every entry 256–511 of the kernel's PML4 has a table before anything can copy it (ADR-0004 H2); the entries are recorded once and never change | **Proven** under QEMU TCG: boot proof `prove_kernel_half`, with an in-boot control (a space lacking the slot faults) and a control that restores the old behaviour. Review finding 4: on a real processor (CI, AMD EPYC under KVM) the in-boot control did not fault, because the probe page was global and its translation survived the CR3 load. The probe page is now not global, each read drops its translation first, and the proof checks the G bit, which a TCG boot can see (control C24). That the control now faults on a real processor is for CI's next KVM run to show |
+| T12 | A kernel mapping made after a process was created is missing from that process, so the kernel faults while on its tables | Every entry 256–511 of the kernel's PML4 has a table before anything can copy it (ADR-0004 H2); the entries are recorded once and never change | **Proven** under QEMU TCG: boot proof `prove_kernel_half`, with an in-boot control (a space lacking the slot faults) and a control that restores the old behaviour. Review finding 4: on a real processor (CI, AMD EPYC under KVM) the in-boot control did not fault, because the probe page was global and its translation survived the CR3 load. The probe page is now not global, each read drops its translation first, and the proof checks the G bit, which a TCG boot can see (control C24). CI's real-CPU boots at `81cb61c` show the control now faults on a real processor: an AMD EPYC 7763 under KVM, in all 38 boots of both jobs |
 | T29 | A safe caller builds a space that lacks part of the kernel half, and the kernel runs on it (review housekeeping) | `UserSpace::without_probe_slot` is crate-private, used only inside `KernelProbe::read_without_its_slot`, which visits the space for one read and drops it before it returns | **By design** |
 | T13 | The kernel half differs between spaces | Every space copies the recorded 256 entries; the proof compares each space with them, ignoring only the bit the processor sets | **Proven** |
 | T14 | A kernel page is unmapped and a stale copy lingers | Unchanged: `Scope::Kernel` reaches every online processor | **Proven** by the TLB proof, unchanged |
@@ -109,7 +109,7 @@ An independent review of S3-5a by one AI reviewer (`docs/engineering/REVIEW_S3-5
 
 ## What this does not prove
 
-- Anything on physical hardware (§74, rule 30). Finding 4 was found on a real processor under KVM in CI, and its fix has not yet run there.
+- Anything on physical hardware (§74, rule 30). Finding 4 was found on a real processor under KVM in CI, and its fix passed there at `81cb61c`. CI's processors are not the declared hardware.
 - Anything past each Loom model's printed bounds, or what Loom's memory model leaves out (`models.rs`, "What is not proved").
 - That the stand-in machine in the Loom models behaves like a processor's page walker: it is a boolean and a relaxed load.
 - The frame contents' confidentiality against side channels.
