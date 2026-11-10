@@ -101,7 +101,9 @@ enum Arg {
 use Arg::{Handle as Hd, Imm};
 
 mod directory;
+mod memory_objects;
 pub(crate) use directory::prove_directory;
+pub(crate) use memory_objects::prove_memory;
 
 /// What a step must do.
 #[derive(Clone, Copy)]
@@ -237,6 +239,84 @@ const fn fault() -> Step {
         args: [Imm(0); 6],
         want: Want::Nothing,
     }
+}
+
+/// A script, and where each value it reports lands among its reports: every call reports its
+/// status, and every `report32` its value, in order.
+#[derive(Default)]
+struct Script {
+    steps: Vec<Step>,
+}
+
+impl Script {
+    fn call(&mut self, step: Step) {
+        self.steps.push(step);
+    }
+
+    /// How many reports the steps so far make.
+    fn reported(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|s| !matches!(s.want, Want::Nothing))
+            .count()
+    }
+
+    /// Reports the `len` bytes at `at`, a word at a time; returns where they start.
+    fn report_bytes(&mut self, at: u64, len: usize) -> usize {
+        let start = self.reported();
+        for word in 0..len.div_ceil(4) as u64 {
+            self.steps.push(value_at("", at + 4 * word, 0));
+        }
+        start
+    }
+}
+
+/// A blocking wait for a message on `x`.
+fn readable(x: Arg) -> Step {
+    wait("", x, signals::READABLE, DEADLINE_INFINITE, OK)
+}
+
+/// Whether every call among `steps` returned the status it must, in `reports`, whatever the
+/// values reported between them.
+fn statuses_right(steps: &[Step], reports: &[u64]) -> bool {
+    let wanted: Vec<&Step> = steps
+        .iter()
+        .filter(|s| !matches!(s.want, Want::Nothing))
+        .collect();
+    reports.len() == wanted.len()
+        && wanted.iter().zip(reports).all(|(s, &got)| match s.want {
+            Want::Status(status) => got == status as u64,
+            _ => true,
+        })
+}
+
+/// An `object_request` (ADR-0005 C7) whose `size` field says `size`, for `length` bytes.
+fn object_request(size: u32, length: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&size.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&length.to_le_bytes());
+    bytes
+}
+
+/// A `map_request` (ADR-0005 C8) whose `size` field says `size`.
+fn map_request(
+    size: u32,
+    access: u32,
+    flags: u32,
+    offset: u64,
+    length: u64,
+    address: u64,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&size.to_le_bytes());
+    bytes.extend_from_slice(&access.to_le_bytes());
+    bytes.extend_from_slice(&flags.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&offset.to_le_bytes());
+    bytes.extend_from_slice(&length.to_le_bytes());
+    bytes.extend_from_slice(&address.to_le_bytes());
+    bytes
 }
 
 /// A named group of steps, printed on one line.

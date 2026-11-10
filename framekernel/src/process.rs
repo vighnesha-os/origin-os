@@ -130,6 +130,11 @@ impl Account {
     pub(crate) fn refund_committed(&self, bytes: usize) {
         self.committed.fetch_sub(bytes, Ordering::AcqRel);
     }
+
+    /// Bytes of committed memory charged to this account now.
+    pub(crate) fn committed(&self) -> usize {
+        self.committed.load(Ordering::Acquire)
+    }
 }
 
 /// What a process may commit and map, and how fast it may change its mappings (P11, C7;

@@ -1346,6 +1346,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(identity_markers())
         .chain(launch_markers())
         .chain(directory_markers())
+        .chain(memory_markers())
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
@@ -1631,6 +1632,7 @@ fn boot_failures() -> Vec<&'static str> {
         ": ipc failed",
         ": start failed",
         ": directory failed",
+        ": memory failed",
         ": console failed",
         ": TLB failed",
         ": address spaces failed",
@@ -1899,6 +1901,20 @@ fn directory_markers() -> Vec<String> {
         "origin-kernel: directory: a launcher started a directory, a service and a client; the client's connect, and the request it wrote on its own end before any reply, reached the service through the directory: true; the service read that request stamped with the client's process and principal, not the directory's: true; the client read the service's reply stamped with the service's process: true".into(),
         "origin-kernel: directory: the client's replies, read in ring 3 and decoded by the generated client: ok for the interface and major the directory holds: true; not_found (-14) for a major it does not hold: true; that connection's end reports peer_closed: true; the service answered ok for the end passed to it: true".into(),
         "origin-kernel: directory: the directory, the service, the client and all they held are gone: heap ".into(),
+    ]
+}
+
+/// The memory-object proof (ADR-0005 P7, P11, C6-C8; `ipc_proof::prove_memory`).
+fn memory_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: memory: two processes share an object by passing its handle, and each reads what the other wrote: true; protect to read-only refuses an increase and makes a write fault at the mapping: true; unmap makes a read fault there: true".into(),
+        "origin-kernel: memory: a fixed address over a mapping is refused, and the mapping keeps what was written to it: true; execute is refused: true; two random placements are apart, page-aligned and in their region: true; closing the handle leaves the mapping working: true".into(),
+        "origin-kernel: memory: the quota refuses an object past its bound and takes one again once an object is closed; a closed object still mapped keeps its charge; a third mapping past the limit of two is refused: true; once the process has ended its account owes nothing: true".into(),
+        "origin-kernel: memory: mapping into another process needs write on its handle, and with it the two share the frame: true; unmapping there needs it too, and the other's next read faults: true".into(),
+        "origin-kernel: memory: a hostile unmap loop is refused with should_wait once its budget is spent, changing nothing: true; it is served again once the budget refills: true".into(),
+        "origin-kernel: memory: map, protect and unmap of 16 pages took ".into(),
+        " us (QEMU; the kernel's own calls, in a space no processor holds)".into(),
+        "origin-kernel: memory: every process, object and mapping of the proof is gone: heap ".into(),
     ]
 }
 
