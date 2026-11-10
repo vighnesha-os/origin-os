@@ -18,9 +18,9 @@ use crate::wipe::wipe;
 
 /// SHA-512's block length: the length of `K0`.
 const BLOCK: usize = Sha512::BLOCK_LEN;
-/// RFC 2104 §2: "the byte 0x36 repeated B times".
+/// RFC 2104 §2: the byte 0x36, repeated to the block length.
 const IPAD: u8 = 0x36;
-/// RFC 2104 §2: "the byte 0x5C repeated B times".
+/// RFC 2104 §2: the byte 0x5C, repeated to the block length.
 const OPAD: u8 = 0x5c;
 
 /// An HMAC key, held as the two hash states every MAC under it starts from: SHA-512 after

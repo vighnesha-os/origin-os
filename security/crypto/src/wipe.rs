@@ -5,11 +5,11 @@
 //! are read. The functions are never inlined: a caller holds a call to code with an opaque
 //! use in it, which the optimizer cannot drop as a dead store.
 //!
-//! **What it does not promise.** `black_box` is documented as best effort, with "no
-//! guarantees for cryptographic or security purposes" (`core::hint`, Rust 1.99.1). A write
-//! the compiler may never remove is a volatile write, which is `unsafe`, and this crate
-//! forbids `unsafe`. The compiler may also keep copies of a secret in registers and in stack
-//! slots of its own, which no source-level overwrite reaches.
+//! **What it does not promise.** `black_box` is documented as best effort, and as giving no
+//! guarantee for cryptographic or security purposes (`core::hint`, Rust 1.99.1). A write the
+//! compiler may never remove is a volatile write, which is `unsafe`, and this crate forbids
+//! `unsafe`. The compiler may also keep copies of a secret in registers and in stack slots of
+//! its own, which no source-level overwrite reaches.
 //!
 //! So this is the first of two layers. The second is the caller's: the Framekernel keeps the
 //! generator's state in storage it overwrites with volatile writes, and overwrites the stack a
