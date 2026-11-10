@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod disk;
+mod image;
 mod interfaces;
 mod loom;
 mod screen;
@@ -59,6 +60,10 @@ commands:
   interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
               (part of check; quick)
   regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
+  image-gate [kernel ELF]
+              only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
+              and no jump table, in the code this build compiled. Builds the kernel first, or
+              reads the ELF it is given (part of check)
   exclusive -- <command> [args...]
               runs any command in a turn on the machine, as check, the boots, run and loom
               take theirs: one at a time across every checkout of this repository on this
@@ -2043,6 +2048,8 @@ fn main() -> ExitCode {
         ["unsafe-gate"] => unsafety::gate(),
         ["interface-gate"] => interfaces::gate(),
         ["regenerate"] => interfaces::regenerate(),
+        ["image-gate"] => in_turn("image-gate", image::build_and_gate),
+        ["image-gate", elf] => image::gate(Path::new(elf)),
         ["build"] => in_turn("build", || {
             build_loader(Loader::Developer).and_then(|loader| {
                 let kernel = pack_kernel(&build_kernel()?)?;
@@ -2714,7 +2721,7 @@ fn check() -> Result {
         ]))?;
         build_loader(loader)?;
     }
-    build_kernel()?;
+    image::gate(&build_kernel()?)?;
     no_panic_check()?;
     dependency_check()?;
     linux_cfg_lint()?;
