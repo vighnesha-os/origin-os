@@ -24,12 +24,17 @@
 //!   a mapping from an object's second page maps those pages' frames and no more; and in a
 //!   space whose page tables are used up a run is refused with `limit`, leaving no page and no
 //!   record.
+//! - **A mapping in another call's hands:** through the kernel's own calls. An unmap and a
+//!   protect of a mapping whose map has not returned yet, and of one a change holds, are told
+//!   to wait (`should_wait`); they change nothing and spend nothing, so a budget of one unit
+//!   still pays for the mapping's one unmap.
 //! - **Costs:** map, protect and unmap through the kernel's own calls, as QEMU figures; and the
 //!   unmap of a shared object's page from a space a thread is reading it in, on another
 //!   processor where there is one, after which the thread faults there and the object stays
 //!   mapped in its creator's space.
 
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::fmt::Write;
 
 use origin_abi::{Error, OK, map_access, map_flags, rights, syscall as sys};
@@ -47,7 +52,7 @@ use crate::console::Console;
 use crate::cpu::{self, CpuIndex};
 use crate::handles::Need;
 use crate::ipc::{self, Object};
-use crate::mapping::{PAGE, PLACE_HIGH, PLACE_LOW, Rate, Request};
+use crate::mapping::{Allow, PAGE, PLACE_HIGH, PLACE_LOW, Rate, Request};
 use crate::memory_object::{self, MemoryObject};
 use crate::paging::{Access, LARGE_PAGE};
 use crate::process::{Ending, Limits, MemoryLimits, Process};
@@ -65,6 +70,7 @@ const FIXED_O: u64 = 0x0000_0007_0000_0000;
 const FIXED_W: u64 = 0x0000_0008_0000_0000;
 const FIXED_L: u64 = 0x0000_0009_0000_0000;
 const FIXED_S: u64 = 0x0000_000A_0000_0000;
+const FIXED_Y: u64 = 0x0000_000B_0000_0000;
 /// Where the reading program maps the shared object: below 2 GiB, so that its code can name
 /// the address in an immediate.
 const READ_AT: u64 = 0x0000_0000_4000_0000;
@@ -799,6 +805,85 @@ fn runs() -> Option<Runs> {
     Some(Runs { own, later, tables })
 }
 
+// ------------------------------------------------------------------ a mapping in other hands
+
+/// What [`busy`] found.
+struct Busy {
+    /// An unmap and a protect of a mapping whose map had not returned yet were told to wait,
+    /// and the map was then made as asked.
+    making: bool,
+    /// An unmap and a protect of a mapping a change held were told to wait.
+    changing: bool,
+    /// The refusals changed nothing and spent nothing: the page stayed on its frame and the
+    /// record as it was, and a budget of one unit still paid for the mapping's one unmap.
+    untouched: bool,
+}
+
+/// An unmap and a protect of a mapping another call holds (ADR-0005, the note on D5; the
+/// owner's item 155), by the kernel's own calls. No second thread is needed to hold one: a
+/// map's report runs while its mapping is still being made, and the proof takes the record for
+/// a change as `unmap` and `protect` take it. The process's budget pays for one unit, which is
+/// what unmapping its one page costs in a space no processor holds: had a refusal spent
+/// anything, the unmap at the end would have to wait.
+fn busy() -> Option<Busy> {
+    let request = Request {
+        access: READ_WRITE,
+        flags: FIXED,
+        offset: 0,
+        length: PAGE,
+        address: FIXED_Y,
+    };
+    let once = Rate {
+        burst: 1,
+        per_second: 1,
+    };
+    let process = Process::new(limits(1, 1, once), (CODE, CODE + PAGE), 0)?;
+    let object = ObjectRef::try_new(MemoryObject::create(&process.account, PAGE).ok()?).ok()?;
+    let record = || cpu::without_interrupts(|| process.mappings.lock().get(FIXED_Y));
+    let frame = || process.frame_of(FIXED_Y).map(UserFrame::phys);
+    // Both calls, on the mapping as it stands: each must be told to wait.
+    let both_wait = || {
+        memory_object::unmap(&process, &process, FIXED_Y, PAGE) == Err(Error::ShouldWait)
+            && memory_object::protect(&process, &process, FIXED_Y, PAGE, READ)
+                == Err(Error::ShouldWait)
+    };
+
+    // Being made: a map's report runs before the mapping is anyone's to change.
+    let during = Cell::new(false);
+    let report = |_at: u64| -> Result<(), Error> {
+        during.set(both_wait());
+        Ok(())
+    };
+    let mapped = memory_object::map(
+        &process,
+        &process,
+        &object,
+        rights::MEMORY_OBJECT,
+        &request,
+        &report,
+    ) == Ok(FIXED_Y);
+    let first = frame();
+    let making =
+        mapped && during.get() && first.is_some() && record() == Some((1, Allow::ReadWrite, false));
+
+    // Being changed: the record is taken as a change takes it, and given back as it was.
+    let held = cpu::without_interrupts(|| process.mappings.lock().begin(FIXED_Y, 1));
+    let changing = held == Ok(Allow::ReadWrite) && both_wait();
+    let kept = record() == Some((1, Allow::ReadWrite, true)) && frame() == first;
+    cpu::without_interrupts(|| process.mappings.lock().end(FIXED_Y, Allow::ReadWrite));
+
+    // Nothing was spent: the budget's one unit pays for the unmap, and the mapping goes.
+    let untouched = kept
+        && memory_object::unmap(&process, &process, FIXED_Y, PAGE) == Ok(())
+        && record().is_none()
+        && !process.is_mapped(FIXED_Y);
+    Some(Busy {
+        making,
+        changing,
+        untouched,
+    })
+}
+
 // ------------------------------------------------------------------ costs
 
 /// Map, protect and unmap of 16 pages through the kernel's own calls, in a process no
@@ -1048,6 +1133,21 @@ fn parts(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> b
         verdict(own && later && tables)
     );
 
+    let Some(busy) = busy() else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: memory: the mapping in another call's hands could not be set up{}",
+            verdict(false)
+        );
+        return false;
+    };
+    let (making, changing, untouched) = (busy.making, busy.changing, busy.untouched);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: memory: an unmap and a protect of a mapping whose map has not returned yet are told to wait (should_wait): {making}; so are those of a mapping another change holds: {changing}; the refusals changed nothing and spent nothing: {untouched}{}",
+        verdict(making && changing && untouched)
+    );
+
     let scripts = a.statuses()
         && b.statuses()
         && q.statuses()
@@ -1122,6 +1222,9 @@ fn parts(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> b
         && own
         && later
         && tables
+        && making
+        && changing
+        && untouched
 }
 
 /// The memory-object proof (ADR-0005 P7, P11, C6–C8), with a leak check of its own. Called from
