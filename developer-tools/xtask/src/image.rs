@@ -21,8 +21,13 @@
 //! finds in them and prints the count on every run. It fails only for code this build
 //! compiled. See [`prebuilt`] for how it tells the two apart.
 //!
+//! **One more thing it reads** is the trap entry itself. ADR-0017 Z2 has the entry zero every
+//! general-purpose register once a program's values are saved, so that a wrongly guessed path
+//! in the kernel has none of them to work with. No boot proof can see that from inside, so the
+//! gate reads the entry stub and fails if one of those instructions has gone ([`ENTRY`]).
+//!
 //! It reads a listing, so it sees what a linear disassembly sees. It is a check that two
-//! options still do their work, not a proof about every byte of the image.
+//! options and one stub still do their work, not a proof about every byte of the image.
 
 use std::path::Path;
 use std::process::Command;
@@ -46,6 +51,30 @@ const NOT_LONG_MODE: &[&str] = &["origin_ap_trampoline_start", "origin_ap_trampo
 /// How far back from an indirect jump the load of a table entry is looked for.
 const WINDOW: usize = 8;
 
+/// The trap entry: every exception, interrupt and system call saves its registers here and
+/// calls the kernel's dispatcher (`framekernel/frame/src/cpu.rs`).
+const ENTRY: &str = "origin_frame::cpu::exception_saved";
+
+/// What the entry must run before that call, once the registers are saved (ADR-0017 Z2):
+/// each general-purpose register zeroed, and RBP by a conditional move, which no processor
+/// guesses, for an entry from ring 3. RDI is not here: it carries the frame to the dispatcher.
+const ENTRY_CLEARS: &[&str] = &[
+    "xor eax, eax",
+    "xor ebx, ebx",
+    "xor ecx, ecx",
+    "xor edx, edx",
+    "xor esi, esi",
+    "xor r8d, r8d",
+    "xor r9d, r9d",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
+    "xor r12d, r12d",
+    "xor r13d, r13d",
+    "xor r14d, r14d",
+    "xor r15d, r15d",
+    "cmovne rbp, rax",
+];
+
 /// What the listing holds.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Findings {
@@ -61,6 +90,8 @@ struct Findings {
     prebuilt_bare: usize,
     /// Jump tables in the prebuilt libraries.
     prebuilt_tables: usize,
+    /// Whether the listing holds the trap entry ([`ENTRY`]).
+    entry_seen: bool,
 }
 
 /// Whether a function came from the toolchain's prebuilt libraries, by its demangled name.
@@ -271,6 +302,9 @@ fn read(listing: &str) -> Findings {
     let mut skipped = false;
     let mut before: Vec<&str> = Vec::new();
     let mut pending: Option<Pending> = None;
+    // The trap entry: which of its clearing instructions have been seen, until its call.
+    let mut cleared = [false; ENTRY_CLEARS.len()];
+    let mut in_entry = false;
 
     let settle = |pending: &mut Option<Pending>, next: Option<&str>, findings: &mut Findings| {
         let Some(waiting) = pending.take() else {
@@ -307,6 +341,8 @@ fn read(listing: &str) -> Findings {
                 library = prebuilt(name);
                 skipped = NOT_LONG_MODE.contains(name);
                 before.clear();
+                in_entry = *name == ENTRY;
+                findings.entry_seen |= in_entry;
             }
             Line::Instruction(address, text) => {
                 let text: &str = text;
@@ -317,6 +353,20 @@ fn read(listing: &str) -> Findings {
                 }
                 settle(&mut pending, Some(text), &mut findings);
                 let place = format!("{address} in {function}");
+                if in_entry {
+                    if let Some(at) = ENTRY_CLEARS.iter().position(|clear| *clear == text) {
+                        cleared[at] = true;
+                    } else if mnemonic(text) == "call" {
+                        // What is not cleared by now reaches the dispatcher.
+                        in_entry = false;
+                        for (clear, _) in ENTRY_CLEARS.iter().zip(cleared).filter(|(_, c)| !c) {
+                            findings.problems.push(format!(
+                                "{place}: the trap entry calls the dispatcher without `{clear}` \
+                                 before it: a program's value stays in a register (ADR-0017 Z2)"
+                            ));
+                        }
+                    }
+                }
                 if text.starts_with('<') {
                     // `<unknown>`: bytes that are not an instruction, where one was expected.
                     if !library {
@@ -380,10 +430,19 @@ fn verdict(findings: &Findings) -> Result<Vec<String>> {
                 .to_string(),
         );
     }
+    if !findings.entry_seen {
+        return Err(format!(
+            "image gate: the trap entry `{ENTRY}` is not in the image under that name, so its \
+             clearing of the registers was not checked (ADR-0017 Z2)"
+        ));
+    }
     let mut lines = vec![format!(
         "xtask: image gate: {} returns in the code this build compiled, an INT3 after each; \
-         no jump table among its {} indirect jumps (ADR-0017 Z10)",
-        findings.returns, findings.indirect_jumps
+         no jump table among its {} indirect jumps (ADR-0017 Z10); the trap entry zeroes the \
+         {} registers it must before it calls the dispatcher (Z2)",
+        findings.returns,
+        findings.indirect_jumps,
+        ENTRY_CLEARS.len()
     )];
     lines.push(format!(
         "xtask: image gate: NOT covered: the toolchain's prebuilt core, alloc and \
@@ -451,13 +510,33 @@ mod tests {
     const OURS: &str = "<framekernel::handles::HandleTable<u8>>::get";
     const THEIRS: &str = "<core::fmt::Formatter>::pad";
 
+    /// The trap entry as the kernel's image holds it, between the last push and the return.
+    fn entry() -> Vec<&'static str> {
+        let mut stub = vec!["push r14", "push r15"];
+        stub.extend_from_slice(ENTRY_CLEARS);
+        stub.extend_from_slice(&[
+            "test byte ptr [rsp + 0x90], 0x3",
+            "mov rdi, rsp",
+            "cld",
+            "call 0xb9340 <origin_frame::cpu::dispatch>",
+            "mov rsp, rax",
+            "pop r15",
+            "iretq",
+            "int3",
+        ]);
+        stub
+    }
+
     #[test]
     fn a_hardened_function_passes_and_is_counted() {
-        let found = read(&listing(&[(
-            OURS,
-            &["push rbp", "mov rbp, rsp", "pop rbp", "ret", "int3"],
-        )]));
-        assert_eq!(found.returns, 1);
+        let found = read(&listing(&[
+            (
+                OURS,
+                &["push rbp", "mov rbp, rsp", "pop rbp", "ret", "int3"],
+            ),
+            (ENTRY, &entry()),
+        ]));
+        assert_eq!(found.returns, 2);
         assert!(found.problems.is_empty(), "{:?}", found.problems);
         assert!(verdict(&found).is_ok());
     }
@@ -524,7 +603,7 @@ mod tests {
     #[test]
     fn the_prebuilt_libraries_are_counted_and_do_not_fail() {
         let found = read(&listing(&[
-            (OURS, &["ret", "int3"]),
+            (ENTRY, &entry()),
             (THEIRS, &["test al, al", "ret", "mov eax, 1", "ret", "int3"]),
             ("memmove", &["ret", "mov rax, rdi"]),
         ]));
@@ -655,6 +734,49 @@ mod tests {
         let found = read(&listing(&[(OURS, &["<unknown>", "ret", "int3"])]));
         assert_eq!(found.problems.len(), 1);
         assert!(found.problems[0].contains("cannot read"));
+    }
+
+    /// The third negative control: the entry with one register's clearing taken out, with
+    /// the conditional move turned into something else, and with the clearing after the call.
+    #[test]
+    fn a_trap_entry_that_leaves_a_register_fails() {
+        let whole = read(&listing(&[(ENTRY, &entry())]));
+        assert!(
+            whole.entry_seen && whole.problems.is_empty(),
+            "{:?}",
+            whole.problems
+        );
+
+        let without = |gone: &str| {
+            let stub: Vec<&str> = entry().into_iter().filter(|text| *text != gone).collect();
+            read(&listing(&[(ENTRY, &stub)])).problems
+        };
+        for gone in ["xor esi, esi", "xor r11d, r11d", "cmovne rbp, rax"] {
+            let problems = without(gone);
+            assert_eq!(problems.len(), 1, "{gone}: {problems:?}");
+            assert!(problems[0].contains(gone) && problems[0].contains("ADR-0017 Z2"));
+        }
+
+        // Cleared too late: the dispatcher has run with the program's value by then.
+        let mut late = entry();
+        let at = late
+            .iter()
+            .position(|text| *text == "xor ebx, ebx")
+            .unwrap();
+        let moved = late.remove(at);
+        late.insert(late.len() - 2, moved);
+        let problems = read(&listing(&[(ENTRY, &late)])).problems;
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("xor ebx, ebx"));
+
+        // The same instructions in another function are not the entry.
+        let elsewhere = read(&listing(&[(OURS, &entry())]));
+        assert!(!elsewhere.entry_seen);
+        assert!(
+            verdict(&elsewhere)
+                .unwrap_err()
+                .contains("is not in the image")
+        );
     }
 
     #[test]

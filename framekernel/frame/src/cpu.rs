@@ -2276,11 +2276,24 @@ extern "sysv64" fn exception_common() {
 /// RFLAGS.AC is cleared if SMAP is on, whatever the interrupted code left in it: otherwise
 /// a program could set AC and turn SMAP off for the kernel code an interrupt runs (an
 /// interrupted user copy keeps its AC in the saved frame, and gets it back from IRETQ).
+///
+/// Once saved, every general-purpose register but RSP is zeroed before `dispatch` runs, so a
+/// wrongly guessed path in the kernel has no value a program chose to work with (ADR-0017 Z2;
+/// AMD's mitigation G-1). The system call's arguments are read from the frame.
 #[unsafe(naked)]
 extern "sysv64" fn exception_saved() {
     naked_asm!(
         "push rax", "push rbx", "push rcx", "push rdx", "push rsi", "push rdi", "push rbp",
         "push r8", "push r9", "push r10", "push r11", "push r12", "push r13", "push r14", "push r15",
+        // ADR-0017 Z2: nothing the interrupted code chose stays in a register. `dispatch`
+        // reads the frame. RBP is cleared by a conditional move, not a branch a processor
+        // could guess, and only for an entry from ring 3 (the saved CS, 144 bytes up): from
+        // ring 0 it is the frame-pointer chain a backtrace follows.
+        "xor eax, eax", "xor ebx, ebx", "xor ecx, ecx", "xor edx, edx", "xor esi, esi",
+        "xor r8d, r8d", "xor r9d, r9d", "xor r10d, r10d", "xor r11d, r11d",
+        "xor r12d, r12d", "xor r13d, r13d", "xor r14d, r14d", "xor r15d, r15d",
+        "test byte ptr [rsp + 144], 3",
+        "cmovnz rbp, rax",
         "mov rdi, rsp",
         "cld",
         "cmp byte ptr [rip + {smap}], 0",
