@@ -117,7 +117,7 @@ The implementation records each decision's consequences in `docs/engineering/SOU
 
 ## Amendment 4 (Accepted, 2026-11-09): what ADR-0011 N14 step 3 needs
 
-**Status: Accepted by the owner on 2026-11-09, all thirteen items with the recommended answer (decision sheet items 56–68; CLAUDE.md §84). C1, C2 and C3 are built (task S3-2, 2026-11-10, with B1 and B3); the other ten are not.** The scoping is `docs/research/2026-11-09-n14-step3-scope.md`. The ADR's accepted text and Amendments 1–3 are otherwise unchanged; where an item below refines a P decision, the item governs.
+**Status: Accepted by the owner on 2026-11-09, all thirteen items with the recommended answer (decision sheet items 56–68; CLAUDE.md §84). C1, C2 and C3 are built (task S3-2, 2026-11-10, with B1 and B3), and C4, C5 and C6 (task S3-3, 2026-11-10: the start record and its launch path); the other seven are not.** The scoping is `docs/research/2026-11-09-n14-step3-scope.md`. The ADR's accepted text and Amendments 1–3 are otherwise unchanged; where an item below refines a P decision, the item governs.
 
 | # | Decision | Refines |
 |---|---|---|
