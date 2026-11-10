@@ -291,7 +291,12 @@ fn cases() -> Vec<(Code, Case)> {
         (BadPosition, Case::Sources(chan(&one("method m = 1 (a: vector<optional<handle<any>>, 2>) errors() requires none;")))),
         (BadPosition, Case::Sources(sys(&one("method m = 1 (a: vector<bool, 2>) errors(invalid_args, fault) requires none;")))),
         (BadPosition, Case::Sources(sys(&one("method m = 1 (a: array<bool, 2>) errors(fault) requires none;")))),
-        (BadPosition, Case::Sources(sys("/// t\nstruct t { x: u8; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (a: vector<t, 2>) errors(invalid_args, fault) requires none;\n}"))),
+        // A system-call vector or array element may be a plain struct of integers, enums and
+        // bits only (ADR-0005 C3): a bool, a nested struct or an array in it is refused.
+        (BadPosition, Case::Sources(sys("/// t\nstruct t { x: bool; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (a: vector<t, 2>) errors(invalid_args, fault) requires none;\n}"))),
+        (BadPosition, Case::Sources(sys("/// u\nstruct u { y: u8; }\n/// t\nstruct t { x: u; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (a: vector<t, 2>) errors(invalid_args, fault) requires none;\n}"))),
+        (BadPosition, Case::Sources(sys("/// t\nstruct t { x: array<u8, 2>; }\n/// i\ninterface i {\n/// m\nmethod m = 1 () -> (a: array<t, 2>) errors(fault) requires none;\n}"))),
+        (BadPosition, Case::Sources(sys("/// t\nstruct t { x: bool; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (a: array<t, 2>) errors(fault) requires none;\n}"))),
         (BadPosition, Case::Sources(chan(&one("method m = 1 (e: kernel.status) errors() requires none;")))),
         // A handle array crosses with no way to state its rights (§3.1).
         (BadPosition, Case::Sources(sys(&one("method m = 1 (a: array<handle<channel, read>, 2>) errors(fault, bad_handle, access_denied, wrong_type) requires none;")))),
@@ -305,6 +310,8 @@ fn cases() -> Vec<(Code, Case)> {
         (BoundOutOfRange, Case::Sources(sys(&one("method m = 1 (a: vector<u8, 4294967296>) errors(invalid_args, fault) requires none;")))),
         (BoundOutOfRange, Case::Sources(sys("/// c\nconst c: i32 = 3;\n/// s\nstruct s { a: array<u8, c>; }"))),
         (TooLarge, Case::Sources(sys("/// s\nstruct s { a: array<u32, 20000>; }"))),
+        // A system-call vector of structs is encoded into a buffer of its bound: 64 KiB at most.
+        (TooLarge, Case::Sources(sys("/// t\nstruct t { x: u32; y: u32; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (a: vector<t, 8193>) errors(invalid_args, fault) requires none;\n}"))),
         (TooLarge, Case::Sources(sys("/// s\nstruct t { x: array<u64, 8192>; }\n/// t\nstruct s { a: array<t, 2>; }"))),
         (SinceNotIncreasing, Case::Sources(sys("/// s\nsized struct s { @since(1.2) a: u32; @since(1.1) b: u32; }"))),
         (SinceNotIncreasing, Case::Sources(chan(&one("method m = 1 (@since(1.2) a: u32, @since(1.1) b: u32) errors() requires none;")))),
