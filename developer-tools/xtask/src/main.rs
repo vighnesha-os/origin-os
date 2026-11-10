@@ -11,6 +11,7 @@ mod interfaces;
 mod loom;
 mod screen;
 mod serial;
+mod turns;
 mod unsafety;
 
 use std::borrow::Cow;
@@ -1993,23 +1994,25 @@ fn main() -> ExitCode {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["check"] => check(),
+        ["check"] => in_turn("check", check),
         ["unsafe-gate"] => unsafety::gate(),
         ["interface-gate"] => interfaces::gate(),
         ["regenerate"] => interfaces::regenerate(),
-        ["build"] => build_loader(Loader::Developer).and_then(|loader| {
-            let kernel = pack_kernel(&build_kernel()?)?;
-            println!("{}\n{}", loader.display(), kernel.display());
-            Ok(())
+        ["build"] => in_turn("build", || {
+            build_loader(Loader::Developer).and_then(|loader| {
+                let kernel = pack_kernel(&build_kernel()?)?;
+                println!("{}\n{}", loader.display(), kernel.display());
+                Ok(())
+            })
         }),
-        ["boot-test"] => boot_test(),
-        ["boot-matrix"] => boot_matrix(),
-        ["boot-x2apic"] => boot_x2apic(),
-        ["boot-console"] => boot_console(),
-        ["boot-bridge"] => boot_bridge(),
-        ["boot-legacy-free"] => boot_legacy_free(),
-        ["run"] => run(),
-        ["loom"] => loom::run(),
+        ["boot-test"] => in_turn("boot-test", boot_test),
+        ["boot-matrix"] => in_turn("boot-matrix", boot_matrix),
+        ["boot-x2apic"] => in_turn("boot-x2apic", boot_x2apic),
+        ["boot-console"] => in_turn("boot-console", boot_console),
+        ["boot-bridge"] => in_turn("boot-bridge", boot_bridge),
+        ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
+        ["run"] => in_turn("run", run),
+        ["loom"] => in_turn("loom", loom::run),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -2024,6 +2027,21 @@ fn main() -> ExitCode {
     }
 }
 
+/// Runs `run` in this process's turn on the machine: heavy runs go one at a time across every
+/// checkout of the repository (`turns`).
+fn in_turn(command: &str, run: impl FnOnce() -> Result) -> Result {
+    let _turn = turns::take(command)?;
+    run()
+}
+
+/// `xtask boot-test`, as a child process inside this run's turn on the machine.
+fn boot_test_child(exe: &Path) -> Command {
+    let mut command = Command::new(exe);
+    command.arg("boot-test");
+    turns::pass(&mut command);
+    command
+}
+
 /// Runs `boot-test` in a child process for each IOMMU and processor count, so each gets its
 /// own `ORIGIN_QEMU_IOMMU` and `ORIGIN_QEMU_SMP` (the environment of this process is never
 /// changed), and then [`boot_x2apic`] (the owner's decision on ADR-0008, question 3).
@@ -2032,8 +2050,7 @@ fn boot_matrix() -> Result {
     for iommu in ["intel", "amd"] {
         for cpus in [1, 2, 4] {
             println!("xtask: boot-matrix: {iommu} IOMMU, {cpus} processor(s)");
-            let status = Command::new(&exe)
-                .arg("boot-test")
+            let status = boot_test_child(&exe)
                 .env("ORIGIN_QEMU_IOMMU", iommu)
                 .env("ORIGIN_QEMU_SMP", cpus.to_string())
                 .status()
@@ -2332,8 +2349,7 @@ fn boot_console() -> Result {
 fn boot_legacy_free() -> Result {
     let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
     println!("xtask: boot-legacy-free: no 8254 and no 8042");
-    let status = Command::new(&exe)
-        .arg("boot-test")
+    let status = boot_test_child(&exe)
         .env("ORIGIN_QEMU_MACHINE", "pit=off,i8042=off")
         .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
         .status()
@@ -2356,8 +2372,7 @@ fn boot_bridge() -> Result {
     let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
     for iommu in ["intel", "amd"] {
         println!("xtask: boot-bridge: the {iommu} IOMMU, the NIC behind a PCIe root port");
-        let status = Command::new(&exe)
-            .arg("boot-test")
+        let status = boot_test_child(&exe)
             .env("ORIGIN_QEMU_IOMMU", iommu)
             .env("ORIGIN_QEMU_BRIDGE", "on")
             .status()
@@ -2387,8 +2402,7 @@ fn boot_x2apic() -> Result {
         println!(
             "xtask: boot-x2apic: processors at APIC IDs 0, 256 and 412 of 150 possible, -cpu {model} ({leaf})"
         );
-        let status = Command::new(&exe)
-            .arg("boot-test")
+        let status = boot_test_child(&exe)
             .env("ORIGIN_QEMU_TOPOLOGY", "x2apic")
             .env("ORIGIN_QEMU_CPU", model)
             .status()
