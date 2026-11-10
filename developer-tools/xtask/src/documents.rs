@@ -48,8 +48,10 @@ fn named(path: &str) -> Option<&'static str> {
         "ps" | "eps" | "dvi" => "a PostScript or DVI document",
         "djvu" | "djv" => "a DjVu document",
         "epub" | "mobi" | "azw" | "azw3" => "an e-book",
-        "doc" | "docx" | "docm" | "dot" | "dotx" | "xls" | "xlsx" | "xlsm" | "ppt" | "pptx"
-        | "pps" | "ppsx" | "odt" | "ods" | "odp" | "odg" | "pages" | "numbers" | "xps" | "oxps" => {
+        // Not `dot`: that is also a Graphviz drawing, which is source. An old Word template of
+        // that name is still caught by its first bytes.
+        "doc" | "docx" | "docm" | "dotx" | "xls" | "xlsx" | "xlsm" | "ppt" | "pptx" | "pps"
+        | "ppsx" | "odt" | "ods" | "odp" | "odg" | "pages" | "numbers" | "xps" | "oxps" => {
             "an office document"
         }
         "rtf" => "a rich-text document",
@@ -477,6 +479,8 @@ mod tests {
                 b"interface origin.kernel",
             ),
             file("developer-tools/toolchain/verify.sh", b"#!/bin/sh\n"),
+            // A Graphviz drawing is source, whatever Word once called its templates.
+            file("docs/layers.dot", b"digraph layers {\n"),
             // Text that mentions a signature without starting with it.
             file(
                 "docs/a.md",
