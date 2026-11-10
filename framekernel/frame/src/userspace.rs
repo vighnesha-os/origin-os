@@ -48,6 +48,7 @@ use crate::addr::PhysAddr;
 use crate::aliases::{Aliases, Mode};
 use crate::memory::{self, OwnedFrame};
 use crate::objref::ObjectRef;
+use crate::tablebound::{self, Refusal};
 use crate::usercopy::{self, UserAccess, UserRange};
 
 /// Page-table frames one space may own (enough for a few scattered megabytes).
@@ -64,22 +65,26 @@ pub fn spaces_freed() -> u64 {
 /// The page-table frames of one space.
 struct Tables {
     frames: Vec<OwnedFrame>,
+    /// Why the last table asked for was refused, if it was: the space's bound of [`MAX_TABLES`],
+    /// or a want of memory (S3-5b's review, finding C).
+    refused: Option<Refusal>,
 }
 
 impl TableMemory for Tables {
     fn allocate_table(&mut self) -> Option<u64> {
-        if self.frames.len() >= MAX_TABLES {
-            return None;
-        }
-        self.frames.try_reserve(1).ok()?;
-        let frame = memory::allocate_frame()?;
+        let frame = match tablebound::one_more(&mut self.frames, MAX_TABLES, memory::allocate_frame)
+        {
+            Ok(frame) => frame,
+            Err(refusal) => {
+                self.refused = Some(refusal);
+                return None;
+            }
+        };
         let p = core::ptr::with_exposed_provenance_mut::<u8>(frame.virt());
         // SAFETY: the allocator just handed out this frame, which only this space now owns;
         // the direct map makes it writable at `p`.
         unsafe { p.write_bytes(0, PAGE as usize) };
-        let addr = frame.phys().raw();
-        self.frames.push(frame);
-        Some(addr)
+        Some(frame.phys().raw())
     }
 
     fn table(&self, addr: u64) -> Option<&Table> {
@@ -296,7 +301,12 @@ impl Change {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChangeError {
     /// The tables refused it, or it asked for addresses this space cannot map.
+    /// [`MapError::OutOfMemory`] is a want of memory: no free frame, or no room for records.
     Map(MapError),
+    /// The space has used up the frames one space may have for its page tables (`MAX_TABLES`,
+    /// 32), and the change needs another: a limit of the space, not a want of memory (S3-5b's
+    /// review, finding C; ADR-0005 D4's `limit` where `Map(OutOfMemory)` is its `no_memory`).
+    Limit,
     /// A processor did not answer within the shootdown's patience, and the flush of the whole
     /// space that ends such a change did not complete either, so a processor may still hold a
     /// translation. The change is made all the same: every page it names has its final entry
@@ -340,7 +350,10 @@ struct State {
 impl State {
     /// A new, empty space with the kernel half `half`, or `None` without memory.
     fn new(half: &[u64; 256]) -> Option<Self> {
-        let mut tables = Tables { frames: Vec::new() };
+        let mut tables = Tables {
+            frames: Vec::new(),
+            refused: None,
+        };
         let mut space = AddressSpace::new(&mut tables).ok()?;
         space.set_upper_half(&tables, half).ok()?;
         Some(Self {
@@ -385,13 +398,13 @@ impl State {
     /// and makes the room for their records and every page table they need, so that
     /// [`map_run`](Self::map_run) cannot fail for want of either. On a failure, what it made
     /// stays, unused: room in two vectors, and empty tables this space frees with the rest.
-    fn prepare_run(&mut self, base: u64, end: u64, count: usize) -> Result<(), MapError> {
+    fn prepare_run(&mut self, base: u64, end: u64, count: usize) -> Result<(), ChangeError> {
         if let Some(mapped) = self
             .mapped
             .get(self.position(base))
             .filter(|m| m.virt < end)
         {
-            return Err(MapError::AlreadyMapped(mapped.virt));
+            return Err(MapError::AlreadyMapped(mapped.virt).into());
         }
         let records = self
             .mapped
@@ -399,11 +412,19 @@ impl State {
             .checked_add(count)
             .ok_or(MapError::OutOfMemory)?;
         if self.mapped.try_reserve(count).is_err() || self.spare.try_reserve(records).is_err() {
-            return Err(MapError::OutOfMemory);
+            return Err(MapError::OutOfMemory.into());
         }
-        self.space
+        self.tables.refused = None;
+        match self
+            .space
             .prepare_user(&mut self.tables, base, count as u64)
-            .map(drop)
+        {
+            Ok(_) => Ok(()),
+            Err(MapError::OutOfMemory) if self.tables.refused == Some(Refusal::Limit) => {
+                Err(ChangeError::Limit)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Maps `frames`, one page each from `virt`, with `access`, after
@@ -895,7 +916,9 @@ impl UserSpace {
     ///
     /// - [`ChangeError::Map`]: `base` is not a page of the user half, or the run does not fit
     ///   there; [`MapError::AlreadyMapped`] with the first page of the run that is mapped;
-    ///   [`MapError::OutOfMemory`] without a frame for a table, or memory for the records.
+    ///   [`MapError::OutOfMemory`] without a free frame for a table, or memory for the records.
+    /// - [`ChangeError::Limit`]: the run needs a page table, and this space has as many as one
+    ///   space may have (finding C).
     /// - [`ChangeError::WriteAndExecute`] if a frame would then be writable through one mapping
     ///   and executable through another, in any space (review finding 5).
     pub fn map_shared_run(

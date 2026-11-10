@@ -547,11 +547,11 @@ fn shared_frames_keep_w_xor_x(com1: &mut Console) -> bool {
 /// Where the page-table proof maps a page every 2 MiB, each needing a page table of its own.
 const TABLES: u64 = 0x4000_0000;
 
-/// A run of shared frames is mapped whole or not at all (S3-5b's review, finding B).
+/// A run of shared frames is mapped whole or not at all (S3-5b's review, findings B and C).
 /// Each refusal comes before any entry of the run is written, so it leaves none of the run
 /// mapped and no frame counted, and needs no shootdown: over a page already mapped, with a
 /// frame executable in another space, and when the run needs a page table and the space has
-/// made as many as one space may.
+/// made as many as one space may, which is a limit and not a want of memory.
 fn a_run_is_mapped_whole_or_not_at_all(com1: &mut Console) -> bool {
     let (Some(space), Some(elsewhere)) = (UserSpace::new(), UserSpace::new()) else {
         return false;
@@ -594,7 +594,7 @@ fn a_run_is_mapped_whole_or_not_at_all(com1: &mut Console) -> bool {
     let across = TABLES + made * LARGE_PAGE - PAGE;
     let limit = made > 0
         && space.map_shared_run(across, &[first.clone(), second.clone()], Access::ReadWrite)
-            == Err(ChangeError::Map(MapError::OutOfMemory))
+            == Err(ChangeError::Limit)
         && unmapped(across, 2)
         && uncounted();
     // And a run that can be mapped is, whole.
@@ -611,7 +611,7 @@ fn a_run_is_mapped_whole_or_not_at_all(com1: &mut Console) -> bool {
     let right = over && both && limit && whole;
     let _ = writeln!(
         com1,
-        "origin-kernel: address spaces: a run of shared frames is mapped whole or not at all: over a page already mapped, refused with none of it mapped: {over}; with a frame executable in another space, refused with none of it mapped and no count taken: {both}; into 2 MiB that needs a page table once the space has made all it may, refused with none of it mapped: {limit}; mapped whole: {whole}{}",
+        "origin-kernel: address spaces: a run of shared frames is mapped whole or not at all: over a page already mapped, refused with none of it mapped: {over}; with a frame executable in another space, refused with none of it mapped and no count taken: {both}; into 2 MiB that needs a page table once the space has made all it may, refused as a limit with none of it mapped: {limit}; mapped whole: {whole}{}",
         verdict(right)
     );
     right
