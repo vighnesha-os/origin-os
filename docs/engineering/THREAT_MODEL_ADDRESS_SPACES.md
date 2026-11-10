@@ -97,7 +97,7 @@ An independent review of S3-5a by one AI reviewer (`docs/engineering/REVIEW_S3-5
 | 7: gaps in the models and controls | An interrupted switch modelled (finding 1); a visit modelled (finding 2); controls for `holds()`'s read order and the initiator's Acquire; the two controls that counted Loom's branch limit as a catch now fail with their property's message (a bystander that fails the model when interrupted; an initiator that gives up after `PATIENCE` polls) | T1, T8, T15, T19, T24, T25 | `de67a7c`, `e00402b`, `20d0259`, `53b7b32`, `67948b5` |
 | Housekeeping: a public constructor of a space without the probe slot | Crate-private, used only within one read | T29 | `51c6823` |
 | Housekeeping: no overflow guard on `RefCount::retain` | `TooMany` past `isize::MAX`; `ObjectRef::clone` panics, which halts | T28 | `090d069` |
-| Housekeeping: ADR-0004 H2's table and the code disagree on where the heap and stacks live | A recommendation to the coordinator; the accepted ADR is not edited here | none | none |
+| Housekeeping: ADR-0004 H2's table and the code disagree on where the heap and stacks live | Decided by the owner on 2026-11-10 (ADR-0004 Amendment 1, items 98–100): the heap stays in the direct map, as the ADR now says; the stacks move to their region, which is not built yet; slot 480 is recorded | none | the amendment |
 
 ## What must be closed before real hardware and real programs
 

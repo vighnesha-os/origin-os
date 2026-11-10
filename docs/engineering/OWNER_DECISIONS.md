@@ -209,3 +209,13 @@ What this means in practice:
 - Merging still takes the owner's word.
 
 **Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.
+
+## ADR-0004 H2: the heap, the stacks and the probe page (Accepted 2026-11-10)
+
+The independent review of S3-5a found that ADR-0004 H2's table puts the kernel heap and stacks at `0xFFFF_C000_0000_0000`, while the code keeps both in the direct map. Changing an accepted ADR is the owner's decision. The owner answered **"Accept all"** on 2026-11-10. These are ADR-0004 Amendment 1, A1–A3. They are numbered from 98 because items 71–97 are in use on the `docs/editions-device-sdk` branch, which has not been merged yet.
+
+| # | Question | Answer |
+|---|---|---|
+| 98, answered | A1: amend H2 so the kernel heap stays in the direct map, as the code has it (no mapping work or shootdown when it is freed, and the large pages kept)? | **Accept** |
+| 99, answered | A2: keep H2 for the stacks, and move them to `0xFFFF_C000_0000_0000` with guard pages in virtual space, as a task of their own that the framework session starts now? | **Accept** |
+| 100, answered | A3: record PML4 slot 480 (`0xFFFF_F000_0000_0000`), the kernel-half proof's probe page, in H2's table? | **Accept** |
