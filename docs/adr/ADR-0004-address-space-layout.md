@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-07, as proposed (H1–H5, and the recommended answer to each of the four questions below). **H1–H4 implemented the same day** (boot info 0.3; loader-built tables; KASLR from RDSEED/RDRAND; the kernel in the higher half with its own tables). H5's global kernel pages, with cross-processor TLB shootdown, were implemented later the same day; PCIDs are not done yet. H2's last clause, that the kernel-half entries point at tables allocated once at boot, was not honoured until N14 step 3, task S3-5a (2026-11-10): each process used to copy whatever entries existed when it was created. Now every entry 256–511 gets a table before the kernel's tables go live, and a boot proof holds a mapping made in a fresh slot after a process exists to being visible from that process. **Amendment 1, accepted by the owner on 2026-11-10** (decision sheet items 98–100): the kernel heap stays in the direct map, the stacks move to their own region (not yet done), and PML4 slot 480 holds the kernel-half proof's probe page. **Amendment 2, accepted by the owner on 2026-11-10** (decision sheet item 144): the stack region gets a slide, chosen by the kernel (not yet done). |
+| Status | **Accepted** by the owner on 2026-11-07, as proposed (H1–H5, and the recommended answer to each of the four questions below). **H1–H4 implemented the same day** (boot info 0.3; loader-built tables; KASLR from RDSEED/RDRAND; the kernel in the higher half with its own tables). H5's global kernel pages, with cross-processor TLB shootdown, were implemented later the same day; PCIDs are not done yet. H2's last clause, that the kernel-half entries point at tables allocated once at boot, was not honoured until N14 step 3, task S3-5a (2026-11-10): each process used to copy whatever entries existed when it was created. Now every entry 256–511 gets a table before the kernel's tables go live, and a boot proof holds a mapping made in a fresh slot after a process exists to being visible from that process. **Amendment 1, accepted by the owner on 2026-11-10** (decision sheet items 98–100): the kernel heap stays in the direct map, the stacks move to their own region (built by task H2-stacks, 2026-11-10), and PML4 slot 480 holds the kernel-half proof's probe page. **Amendment 2, accepted by the owner on 2026-11-10** (decision sheet item 144): the stack region gets a slide, chosen by the kernel (not yet done). |
 | Supersedes | ADR-0003 K2's identity mapping, once implemented |
 | Related | ADR-0002 B3 (KASLR deferred to here), B4 (boot info), ADR-0003 K2, K8 |
 
@@ -20,7 +20,7 @@ User addresses are `0x0000_0000_0000_1000` to `0x0000_7FFF_FFFF_E000` (page 0 an
 | Range | Use |
 |---|---|
 | `0xFFFF_8000_0000_0000` + slide | direct map of all RAM, read/write, never executable (1 GiB or 2 MiB pages; holes as in K2). The kernel heap is in it (Amendment 1, A1) |
-| `0xFFFF_C000_0000_0000` … | kernel stacks (per-thread stacks with guard pages in virtual space, not in the direct map). Until Amendment 1's A2 is built they are still in the direct map; the heap is there for good (A1) |
+| `0xFFFF_C000_0000_0000` … | kernel stacks (Amendment 1, A2): 2048 slots of 128 KiB (256 MiB), each stack at the top of its own slot with at least 64 KiB below it never mapped; the region's page tables are made at boot. Kernel threads' stacks and each application processor's own stack and four interrupt stacks are here. The boot processor's interrupt stacks are in the kernel image, since they must exist at the first boot step; the boot stack is the loader's (H4). The heap is in the direct map for good (A1) |
 | `0xFFFF_E000_0000_0000` … | MMIO windows, mapped uncached on demand by drivers. Since ADR-0010: the first 2 GiB hold the firmware framebuffer, mapped by the loader; drivers' MMIO starts above them |
 | `0xFFFF_F000_0000_0000` (PML4 slot 480) | one page and nothing else: the kernel-half proof's probe page (Amendment 1, A3) |
 | `0xFFFF_FFFF_8000_0000` + slide | the kernel image, with its segment permissions from the signed ONBF table |
@@ -41,7 +41,7 @@ Kernel mappings are global (CR4.PGE); user address spaces use PCIDs where availa
 
 - Boot info 0.3 and ADR-0002 B3/B4 change (both still Proposed).
 - Every physical-to-virtual conversion goes through the direct-map offset (`phys_to_virt`), replacing today's identity assumption; `kernel_space`, `vm`, the AP trampoline (which must still start in low memory, then jump high) and the heap change accordingly.
-- Kernel stacks move to the stack region with virtual guard pages.
+- Kernel stacks move to the stack region with virtual guard pages (done: task H2-stacks, 2026-11-10, Amendment 1 A2).
 
 ## Questions for the owner (answered 2026-11-07: yes to 1–3, loader-built tables for 4)
 
@@ -52,12 +52,12 @@ Kernel mappings are global (CR4.PGE); user address spaces use PCIDs where availa
 
 ## Amendment 1 (Accepted, 2026-11-10): the heap, the stacks and the probe page
 
-**Status: Accepted by the owner on 2026-11-10 ("Accept all", decision sheet items 98–100).** The independent review of S3-5a (`docs/engineering/REVIEW_S3-5A_2026-11-10.md`, housekeeping) found that H2's table put the kernel heap and stacks at `0xFFFF_C000_0000_0000`, while the code kept both in the direct map. Its author recommended these answers. A1 and A3 describe what is built; A2 is not built yet. H2's table above now follows them; the rest of the ADR is unchanged.
+**Status: Accepted by the owner on 2026-11-10 ("Accept all", decision sheet items 98–100).** The independent review of S3-5a (`docs/engineering/REVIEW_S3-5A_2026-11-10.md`, housekeeping) found that H2's table put the kernel heap and stacks at `0xFFFF_C000_0000_0000`, while the code kept both in the direct map. Its author recommended these answers. A1–A3 describe what is built (A2 by task H2-stacks, 2026-11-10). H2's table above now follows them; the rest of the ADR is unchanged.
 
 | # | Decision |
 |---|---|
 | A1 | **The kernel heap is in the direct map,** as built. Its memory is frames reached through the direct-map offset. Freeing it changes no mapping and needs no shootdown, and it keeps the direct map's large pages. Like the rest of the direct map it is read/write and never executable, and it moves with the direct map's slide (H3). |
-| A2 | **Kernel thread stacks move to `0xFFFF_C000_0000_0000` …,** each with an unmapped guard page below it in virtual space. A guard then costs no frame and splits no page of the direct map. Today each guard is a direct-map page unmapped, which costs a frame and splits a 2 MiB page into 4 KiB pages. Built as a framework task of its own. |
+| A2 | **Kernel thread stacks move to `0xFFFF_C000_0000_0000` …,** each with an unmapped guard page below it in virtual space. A guard then costs no frame and splits no page of the direct map. Until task H2-stacks each guard was a direct-map page unmapped, which cost a frame and split a 2 MiB page into 4 KiB pages. The TLB proof's three pages use the region too while that proof runs, so after boot nothing cuts a page out of the direct map. |
 | A3 | **PML4 slot 480 (`0xFFFF_F000_0000_0000`) holds one page and nothing else:** the kernel-half proof's probe page. It is read-only, never executable and not global (S3-5a review finding 4), and mapped only while that proof runs. |
 
 ## Amendment 2 (Accepted, 2026-11-10): a slide for the stack region
