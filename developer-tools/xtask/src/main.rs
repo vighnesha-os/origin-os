@@ -6,8 +6,10 @@
 //! `.cargo/config.toml`: `cargo xtask <command>`.
 #![forbid(unsafe_code)]
 
+mod asmflags;
 mod disk;
 mod interfaces;
+mod lex;
 mod loom;
 mod screen;
 mod serial;
@@ -54,8 +56,8 @@ commands:
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
-  unsafe-gate only the gate on `unsafe` and on the kernel's dependency direction (part of
-              check; quick)
+  unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction and on the
+              `preserves_flags` option of assembly blocks (part of check; quick)
   interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
               (part of check; quick)
   regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces

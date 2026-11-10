@@ -14,12 +14,15 @@
 //! A "site" here is one `unsafe` token (or `global_asm!`) outside comments, strings and
 //! character literals, whatever it heads: a block, an `unsafe fn`, an `unsafe impl`, an
 //! `unsafe extern` or an attribute such as `#[unsafe(no_mangle)]`.
+//!
+//! The gate ends with the one on what assembly blocks promise the compiler about the flags
+//! (`asmflags`, CLAUDE.md §13).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use crate::{Result, cargo, collect_files, repo_root};
+use crate::{Result, asmflags, cargo, collect_files, lex, repo_root};
 
 /// Under this directory is the privileged framework, the one place `unsafe` may appear: the
 /// crate `origin-frame`, and its lock package, `origin-sync`, kept as a package of its own
@@ -113,7 +116,8 @@ pub(crate) fn gate() -> Result {
     println!(
         "xtask: unsafe gate: no `unsafe` outside the framework ({framework_sites} sites in it, {scanned} kernel source files scanned)"
     );
-    Ok(())
+    // What the assembly inside those sites promises the compiler about the flags.
+    asmflags::gate()
 }
 
 /// Every kernel source file's `unsafe` count: those outside the framework by repository
@@ -156,143 +160,16 @@ fn scan(root: &Path) -> Result<(BTreeMap<String, usize>, usize, usize)> {
 /// Counts `unsafe` tokens and `global_asm!` invocations in `source`, outside comments, strings
 /// and character literals. Raw identifiers (`r#unsafe`) are not the keyword and do not count.
 pub(crate) fn count_sites(source: &str) -> usize {
-    let bytes = source.as_bytes();
-    let mut i = 0;
-    let mut count = 0;
-    while let Some(&byte) = bytes.get(i) {
-        match byte {
-            b'/' if bytes.get(i + 1) == Some(&b'/') => i = line_end(bytes, i),
-            b'/' if bytes.get(i + 1) == Some(&b'*') => i = block_comment_end(bytes, i + 2),
-            b'"' => i = string_end(bytes, i + 1),
-            b'\'' => i = char_or_lifetime_end(bytes, i),
-            b'_' | b'a'..=b'z' | b'A'..=b'Z' => {
-                let (word, end) = identifier(bytes, i);
-                match word {
-                    "r" | "br" | "cr" if raw_string_start(bytes, end).is_some() => {
-                        i = raw_string_end(bytes, end).unwrap_or(bytes.len());
-                    }
-                    "b" | "c" if bytes.get(end) == Some(&b'"') => {
-                        i = string_end(bytes, end + 1);
-                    }
-                    "b" if bytes.get(end) == Some(&b'\'') => {
-                        i = char_or_lifetime_end(bytes, end);
-                    }
-                    "r" if bytes.get(end) == Some(&b'#') => {
-                        // A raw identifier: `r#unsafe` names an ordinary identifier.
-                        let (_, after) = identifier(bytes, end + 1);
-                        i = after;
-                    }
-                    _ => {
-                        if word == "unsafe"
-                            || (word == "global_asm" && bytes.get(end) == Some(&b'!'))
-                        {
-                            count += 1;
-                        }
-                        i = end;
-                    }
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    count
-}
-
-fn is_identifier_byte(byte: u8) -> bool {
-    byte == b'_' || byte.is_ascii_alphanumeric()
-}
-
-/// The identifier starting at `start` and the index just after it.
-fn identifier(bytes: &[u8], start: usize) -> (&str, usize) {
-    let mut end = start;
-    while bytes.get(end).copied().is_some_and(is_identifier_byte) {
-        end += 1;
-    }
-    // Only ASCII bytes were accepted, so this cannot fail.
-    (core::str::from_utf8(&bytes[start..end]).unwrap_or(""), end)
-}
-
-fn line_end(bytes: &[u8], mut i: usize) -> usize {
-    while bytes.get(i).is_some_and(|&b| b != b'\n') {
-        i += 1;
-    }
-    i
-}
-
-/// The index after the nested block comment whose body starts at `i` (after `/*`).
-fn block_comment_end(bytes: &[u8], mut i: usize) -> usize {
-    let mut depth = 1;
-    while depth > 0 && i < bytes.len() {
-        if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
-            depth += 1;
-            i += 2;
-        } else if bytes.get(i) == Some(&b'*') && bytes.get(i + 1) == Some(&b'/') {
-            depth -= 1;
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    i
-}
-
-/// The index after the string whose body starts at `i` (after its opening quote).
-fn string_end(bytes: &[u8], mut i: usize) -> usize {
-    while let Some(&byte) = bytes.get(i) {
-        match byte {
-            b'\\' => i += 2,
-            b'"' => return i + 1,
-            _ => i += 1,
-        }
-    }
-    i
-}
-
-/// The hash count if `at` starts a raw string's delimiter (`#*"`).
-fn raw_string_start(bytes: &[u8], at: usize) -> Option<usize> {
-    let mut hashes = 0;
-    while bytes.get(at + hashes) == Some(&b'#') {
-        hashes += 1;
-    }
-    (bytes.get(at + hashes) == Some(&b'"')).then_some(hashes)
-}
-
-/// The index after the raw string whose delimiter starts at `at`.
-fn raw_string_end(bytes: &[u8], at: usize) -> Option<usize> {
-    let hashes = raw_string_start(bytes, at)?;
-    let mut i = at + hashes + 1;
-    while i < bytes.len() {
-        if bytes.get(i) == Some(&b'"') && (0..hashes).all(|k| bytes.get(i + 1 + k) == Some(&b'#')) {
-            return Some(i + 1 + hashes);
-        }
-        i += 1;
-    }
-    Some(bytes.len())
-}
-
-/// The index after a character literal, or after the `'` if this is a lifetime. A character
-/// literal is either escaped (`'\…'`) or has a closing quote within a code point (`'x'`,
-/// up to four bytes of UTF-8 between the quotes).
-fn char_or_lifetime_end(bytes: &[u8], at: usize) -> usize {
-    let start = at + 1;
-    match bytes.get(start) {
-        Some(b'\\') => {
-            let mut i = start + 2;
-            // Skip to the closing quote: an escape may be longer than one byte.
-            while let Some(&byte) = bytes.get(i) {
-                if byte == b'\'' {
-                    return i + 1;
-                }
-                i += 1;
-            }
-            i
-        }
-        Some(_) => match (1..=4).find(|n| bytes.get(start + n) == Some(&b'\'')) {
-            Some(n) => start + n + 1,
-            None => start,
-        },
-        None => start,
-    }
+    let tokens = lex::tokens(source);
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|&(i, token)| {
+            token.is_ident("unsafe")
+                || (token.is_ident("global_asm")
+                    && tokens.get(i + 1).is_some_and(|next| next.is_punct('!')))
+        })
+        .count()
 }
 
 /// What is wrong with the `unsafe` the scan found: any of it outside the framework, or none
