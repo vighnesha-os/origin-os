@@ -736,8 +736,9 @@ pub trait Calls {
     /// The mapping holds the object: closing a handle never unmaps. access_denied: the
     /// object's handle lacks read, or write for a writable mapping, or execute was asked.
     /// invalid_args: a malformed request, or a fixed address any page of which is mapped.
-    /// limit: past the process's mappings, or its page tables are full. not_supported: no
-    /// hardware entropy to place it at random.
+    /// limit: past the process's mappings, or its page tables are full, or eight places
+    /// drawn at random in a row were all taken. not_supported: no hardware entropy to place
+    /// it at random.
     fn memory_map(&self, process: rt::HandleArg, object: rt::HandleArg, request: rt::UserRef<MapRequest>, address: rt::UserRef<u64>) -> Result<(), MemoryMapError>;
     /// Removes one whole mapping (ADR-0005 P7, C7, D3). When it returns, no processor reaches its
     /// pages through this process. invalid_args: address and length are not exactly one

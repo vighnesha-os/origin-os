@@ -182,6 +182,33 @@ pub fn place(random: u64, pages: u64) -> Option<u64> {
     Some(PLACE_LOW + (random % slots) * PAGE)
 }
 
+/// Draws of a random place before a map gives up on finding a free one.
+pub const PLACEMENT_TRIES: u32 = 8;
+
+/// Finds `pages` pages a place at random. Up to [`PLACEMENT_TRIES`] times, `draw` gives a
+/// random number and `take` is given the place it makes ([`place`]): `Ok(true)` if the pages
+/// went in there, `Ok(false)` if the place is taken. Returns the first place that took them.
+///
+/// `NotSupported` if a draw has no entropy to give, and `InvalidArgs` if the pages fit nowhere
+/// in the region; an error of `take` ends the search with that error. `Limit` if every draw
+/// landed on something mapped: that is a bound of the process's own address space, and
+/// `no_memory` stays for frames and the kernel's heap (ADR-0005, the notes on D4 and D5; the
+/// owner's item 156).
+pub fn place_at_random(
+    pages: u64,
+    mut draw: impl FnMut() -> Option<u64>,
+    mut take: impl FnMut(u64) -> Result<bool, Error>,
+) -> Result<u64, Error> {
+    for _ in 0..PLACEMENT_TRIES {
+        let random = draw().ok_or(Error::NotSupported)?;
+        let base = place(random, pages).ok_or(Error::InvalidArgs)?;
+        if take(base)? {
+            return Ok(base);
+        }
+    }
+    Err(Error::Limit)
+}
+
 /// Why an address space refused to map a run of pages. The framework's own errors are not built
 /// on the host; `memory_object` names each of them in these words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -638,6 +665,120 @@ mod tests {
         let all = (PLACE_HIGH - PLACE_LOW) / PAGE;
         assert_eq!(place(u64::MAX, all), Some(PLACE_LOW));
         assert_eq!(place(0, all + 1), None);
+    }
+
+    #[test]
+    fn eight_taken_places_in_a_row_are_limit() {
+        // The owner's item 156: a bound of the process's own address space, not a want of
+        // memory, and not a ninth draw.
+        assert_eq!(PLACEMENT_TRIES, 8);
+        let (mut draws, mut takes) = (0u64, 0usize);
+        let mut seen = [0u64; 8];
+        let got = place_at_random(
+            3,
+            || {
+                draws += 1;
+                Some(draws)
+            },
+            |base| {
+                seen[takes] = base;
+                takes += 1;
+                Ok(false)
+            },
+        );
+        assert_eq!(got, Err(Error::Limit));
+        assert_eq!(
+            (draws, takes),
+            (8, 8),
+            "eight draws, each one tried, and no ninth"
+        );
+        // Each try was the place its own draw made.
+        for (random, base) in (1u64..).zip(seen) {
+            assert_eq!(Some(base), place(random, 3));
+        }
+    }
+
+    #[test]
+    fn a_random_place_is_drawn_until_one_is_free() {
+        // Seven taken and the eighth free: the eighth draw's place.
+        let (mut draws, mut takes) = (0u64, 0u32);
+        let got = place_at_random(
+            2,
+            || {
+                draws += 1;
+                Some(draws * 1000)
+            },
+            |_| {
+                takes += 1;
+                Ok(takes == 8)
+            },
+        );
+        assert_eq!(got, Ok(place(8000, 2).expect("fits")));
+        assert_eq!((draws, takes), (8, 8));
+        // A free place ends the search: nothing more is drawn.
+        let mut draws = 0u32;
+        let got = place_at_random(
+            1,
+            || {
+                draws += 1;
+                Some(5)
+            },
+            |_| Ok(true),
+        );
+        assert_eq!(got, Ok(place(5, 1).expect("fits")));
+        assert_eq!(draws, 1);
+        // No entropy: nothing is tried.
+        let mut takes = 0u32;
+        let got = place_at_random(
+            1,
+            || None,
+            |_| {
+                takes += 1;
+                Ok(false)
+            },
+        );
+        assert_eq!(got, Err(Error::NotSupported));
+        assert_eq!(takes, 0);
+        // Entropy that gives out after three draws: not `limit`, which is for eight taken.
+        let (mut draws, mut takes) = (0u64, 0u32);
+        let got = place_at_random(
+            1,
+            || {
+                draws += 1;
+                (draws <= 3).then_some(draws)
+            },
+            |_| {
+                takes += 1;
+                Ok(false)
+            },
+        );
+        assert_eq!(got, Err(Error::NotSupported));
+        assert_eq!(takes, 3);
+        // A try that fails ends the search with its own status, and nothing more is drawn.
+        let mut draws = 0u32;
+        let got = place_at_random(
+            1,
+            || {
+                draws += 1;
+                Some(9)
+            },
+            |_| Err(Error::NoMemory),
+        );
+        assert_eq!(got, Err(Error::NoMemory));
+        assert_eq!(draws, 1);
+        // Pages that fit nowhere in the region: a bad argument, and nothing is tried.
+        let all = (PLACE_HIGH - PLACE_LOW) / PAGE;
+        let mut takes = 0u32;
+        let got = place_at_random(
+            all + 1,
+            || Some(0),
+            |_| {
+                takes += 1;
+                Ok(true)
+            },
+        );
+        assert_eq!(got, Err(Error::InvalidArgs));
+        assert_eq!(takes, 0);
     }
 
     #[test]

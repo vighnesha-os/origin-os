@@ -35,9 +35,6 @@ use crate::mapping::{self, Allow, Asked, Place, Refused, Request};
 use crate::paging::{Access, MapError};
 use crate::process::{Account, Process};
 
-/// Draws of a random place before a map gives up on finding a free one.
-const PLACEMENT_TRIES: u32 = 8;
-
 /// A memory object (C7): its frames, committed at creation, and their charge.
 pub(crate) struct MemoryObject {
     frames: Vec<SharedFrame>,
@@ -241,14 +238,8 @@ fn put(
             // An ended process, then the mapping limit, before the placement and its entropy
             // (D5's order).
             without_interrupts(|| target.mappings.lock().room())?;
-            for _ in 0..PLACEMENT_TRIES {
-                let random = crate::entropy::hardware_u64().ok_or(Error::NotSupported)?;
-                let base = mapping::place(random, asked.pages).ok_or(Error::InvalidArgs)?;
-                if take(base)? {
-                    return Ok(base);
-                }
-            }
-            Err(Error::Limit)
+            // Eight draws that all land on something mapped are `limit` (the note on D5).
+            mapping::place_at_random(asked.pages, crate::entropy::hardware_u64, take)
         }
     }
 }
