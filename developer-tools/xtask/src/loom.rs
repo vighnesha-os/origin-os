@@ -776,8 +776,8 @@ const CONTROLS: &[Control] = &[
         // saying so: the initiator can miss it while its walks still see the old entry.
         name: "entering_a_space_without_a_fence",
         file: SHOOTDOWN,
-        from: "        prim::fence(Ordering::SeqCst);\n        let result = load();\n",
-        to: "        let result = load();\n",
+        from: "        prim::fence(Ordering::SeqCst);\n        load();\n",
+        to: "        load();\n",
         models: &[("shootdown_and_a_processor_entering_the_space", STALE)],
     },
     Control {
@@ -796,9 +796,21 @@ const CONTROLS: &[Control] = &[
         // The old root is forgotten before the CR3 write, not after it.
         name: "the_old_root_forgotten_before_the_switch",
         file: SHOOTDOWN,
-        from: "        prim::fence(Ordering::SeqCst);\n        let result = load();\n        if let Some(leaving) = self.leaving.get(me) {\n            leaving.store(0, Ordering::Release);\n        }\n",
-        to: "        prim::fence(Ordering::SeqCst);\n        if let Some(leaving) = self.leaving.get(me) {\n            leaving.store(0, Ordering::Release);\n        }\n        let result = load();\n",
+        from: "        prim::fence(Ordering::SeqCst);\n        load();\n        if let Some(leaving) = self.leaving.get(me) {\n            leaving.store(0, Ordering::Release);\n        }\n",
+        to: "        prim::fence(Ordering::SeqCst);\n        if let Some(leaving) = self.leaving.get(me) {\n            leaving.store(0, Ordering::Release);\n        }\n        load();\n",
         models: &[("shootdown_and_a_processor_leaving_the_space", STALE)],
+    },
+    Control {
+        // The record and the CR3 write with interrupts on: the scheduler's switch, in an
+        // interrupt on the same processor, can land between them (review finding 1).
+        name: "a_switch_that_can_be_interrupted",
+        file: SHOOTDOWN,
+        from: "        hardware.without_interrupts(|| self.switch_here(hardware, to, load));\n",
+        to: "        self.switch_here(hardware, to, load);\n",
+        models: &[(
+            "a_switch_and_the_scheduler_on_one_processor",
+            &["the record names a space this processor has left"],
+        )],
     },
     Control {
         // A request for one space interrupts everyone.

@@ -145,6 +145,9 @@ pub trait TlbHardware {
     /// Runs `f` with interrupts disabled on this processor.
     fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R;
 
+    /// The root of the address space this processor runs on now (CR3).
+    fn current_root(&self) -> u64;
+
     /// A clock for [`TlbHardware::patience`].
     fn now(&self) -> u64;
 
@@ -243,14 +246,31 @@ impl<const CPUS: usize> Shootdown<CPUS> {
         hardware.invalidate(Request::Everything);
     }
 
-    /// Moves processor `me` from address space `from` to `to`, by running `load` (the CR3
-    /// write). Both count as loaded while the switch is in flight: the old one until the
-    /// processor has really left it, the new one from before it arrives.
+    /// Moves this processor to the address space `to`, by running `load` (the CR3 write), and
+    /// keeps the record of it; nothing happens if `to` is what it runs on already. Both spaces
+    /// count as loaded while the switch is in flight: the old one until the processor has really
+    /// left it, the new one from before it arrives.
+    ///
+    /// All of it with interrupts off, the processor and the root it leaves read inside: an
+    /// interrupt between the record and the CR3 write could switch this processor itself (the
+    /// scheduler does, on a timer tick), and the write resumed after it would leave the record
+    /// naming a space the processor no longer runs on, so that a shootdown passed it over and a
+    /// space could be freed under it (review finding 1).
     ///
     /// The fence is what lets an initiator skip a processor that has not reached the space it
     /// is changing: this processor's page walks start after the fence, so if the initiator
     /// read the old `loaded`, its own fence came first, and the walks see its change.
-    pub fn switch_space<R>(&self, me: usize, from: u64, to: u64, load: impl FnOnce() -> R) -> R {
+    pub fn switch_space(&self, hardware: &impl TlbHardware, to: u64, load: impl FnOnce()) {
+        hardware.without_interrupts(|| self.switch_here(hardware, to, load));
+    }
+
+    /// [`switch_space`](Self::switch_space)'s work, with interrupts already off.
+    fn switch_here(&self, hardware: &impl TlbHardware, to: u64, load: impl FnOnce()) {
+        let me = hardware.this_cpu();
+        let from = hardware.current_root();
+        if from == to {
+            return;
+        }
         if let Some(leaving) = self.leaving.get(me) {
             leaving.store(from, Ordering::Release);
         }
@@ -258,11 +278,10 @@ impl<const CPUS: usize> Shootdown<CPUS> {
             loaded.store(to, Ordering::Release);
         }
         prim::fence(Ordering::SeqCst);
-        let result = load();
+        load();
         if let Some(leaving) = self.leaving.get(me) {
             leaving.store(0, Ordering::Release);
         }
-        result
     }
 
     /// Whether processor `id` has `root` loaded, or is in the middle of leaving it. `loaded`
@@ -433,6 +452,8 @@ mod tests {
         ipis: Mutex<Vec<(usize, usize)>>,
         clock: AtomicU64,
         ticking: AtomicBool,
+        /// Each processor's CR3.
+        cr3: [AtomicU64; 8],
     }
 
     impl TlbHardware for Cpu<'_> {
@@ -467,10 +488,27 @@ mod tests {
         fn patience(&self) -> u64 {
             1000
         }
+
+        fn current_root(&self) -> u64 {
+            self.machine.cr3[self.id].load(Ordering::Relaxed)
+        }
     }
 
     fn cpu(id: usize, machine: &Machine) -> Cpu<'_> {
         Cpu { id, machine }
+    }
+
+    /// Switches `cpu` to `to` through `shootdown`, the CR3 write running `during` too.
+    fn switch<const N: usize>(
+        shootdown: &Shootdown<N>,
+        cpu: &Cpu<'_>,
+        to: u64,
+        during: impl FnOnce(),
+    ) {
+        shootdown.switch_space(cpu, to, || {
+            cpu.machine.cr3[cpu.id].store(to, Ordering::Relaxed);
+            during();
+        });
     }
 
     #[test]
@@ -587,6 +625,9 @@ mod tests {
             fn patience(&self) -> u64 {
                 1
             }
+            fn current_root(&self) -> u64 {
+                0
+            }
         }
         let shootdown = Shootdown::<2>::new();
         let saw_online = AtomicBool::new(false);
@@ -687,26 +728,42 @@ mod tests {
 
     #[test]
     fn a_switch_counts_as_holding_both_spaces_until_it_is_done() {
+        let machine = Machine::default();
         let shootdown = Shootdown::<3>::new();
+        let (one, two) = (cpu(1, &machine), cpu(2, &machine));
         assert_eq!(shootdown.processors_holding(7), 0);
-        shootdown.switch_space(1, 0, 7, || {
+        switch(&shootdown, &one, 7, || {
             assert_eq!(shootdown.processors_holding(7), 1, "arriving");
         });
         assert_eq!(shootdown.processors_holding(7), 1);
-        shootdown.switch_space(1, 7, 9, || {
+        switch(&shootdown, &one, 9, || {
             assert_eq!(shootdown.processors_holding(7), 1, "leaving");
             assert_eq!(shootdown.processors_holding(9), 1, "arriving");
         });
         assert_eq!(shootdown.processors_holding(7), 0, "gone");
         assert_eq!(shootdown.processors_holding(9), 1);
         // A second processor in the same space.
-        shootdown.switch_space(2, 0, 9, || ());
+        switch(&shootdown, &two, 9, || ());
         assert_eq!(shootdown.processors_holding(9), 2);
-        // An index past the table counts nothing, and still runs the load.
+        // An index past the table counts nothing, and still loads.
         let mut ran = false;
-        shootdown.switch_space(5, 1, 2, || ran = true);
+        switch(&shootdown, &cpu(5, &machine), 2, || ran = true);
         assert!(ran);
         assert_eq!(shootdown.processors_holding(2), 0);
+    }
+
+    /// A switch to the space the processor is on does nothing, not even the CR3 write (which
+    /// would drop every non-global translation for nothing).
+    #[test]
+    fn a_switch_to_where_it_is_does_nothing() {
+        let machine = Machine::default();
+        let shootdown = Shootdown::<2>::new();
+        let one = cpu(1, &machine);
+        switch(&shootdown, &one, 7, || ());
+        let mut loaded_again = false;
+        shootdown.switch_space(&one, 7, || loaded_again = true);
+        assert!(!loaded_again);
+        assert_eq!(shootdown.processors_holding(7), 1);
     }
 
     /// A processor that is not in the space is left alone: no interrupt, nothing invalidated,
@@ -720,8 +777,8 @@ mod tests {
             shootdown.mark_online(&cpu(id, &machine));
         }
         machine.invalidated.lock().unwrap().clear();
-        shootdown.switch_space(1, 0, SPACE, || ());
-        shootdown.switch_space(2, 0, 0x9000, || ());
+        switch(&shootdown, &cpu(1, &machine), SPACE, || ());
+        switch(&shootdown, &cpu(2, &machine), 0x9000, || ());
         let stop = AtomicBool::new(false);
         let done = thread::scope(|s| {
             let (shootdown, machine, stop) = (&shootdown, &machine, &stop);
@@ -759,8 +816,9 @@ mod tests {
         let shootdown = Shootdown::<2>::new();
         shootdown.mark_online(&cpu(0, &machine));
         shootdown.mark_online(&cpu(1, &machine));
-        shootdown.switch_space(1, 0, SPACE, || ());
-        shootdown.switch_space(1, SPACE, 0x9000, || {
+        let one = cpu(1, &machine);
+        switch(&shootdown, &one, SPACE, || ());
+        switch(&shootdown, &one, 0x9000, || {
             // It has not loaded the other space yet: its TLB still holds this one's.
             assert_eq!(
                 shootdown.shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Space(SPACE)),
@@ -784,7 +842,7 @@ mod tests {
         let machine = Machine::default();
         let shootdown = Shootdown::<2>::new();
         shootdown.mark_online(&cpu(0, &machine));
-        shootdown.switch_space(1, 0, SPACE, || ());
+        switch(&shootdown, &cpu(1, &machine), SPACE, || ());
         let done = shootdown
             .shoot(&cpu(0, &machine), Request::NonGlobal, Scope::Space(SPACE))
             .unwrap();

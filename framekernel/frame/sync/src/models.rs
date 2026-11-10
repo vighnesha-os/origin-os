@@ -1418,6 +1418,10 @@ struct TlbWorld {
     stop: AtomicBool,
     /// [`THE_PAGE`]'s page table entry.
     pte: AtomicU64,
+    /// Each processor's CR3: what it runs on.
+    cr3: [AtomicU64; SHOOT_CPUS],
+    /// Each processor's interrupt flag, for [`IrqCpu`]: held while interrupts are off there.
+    interrupts: [SpinLock<()>; SHOOT_CPUS],
 }
 
 /// One processor of a [`TlbWorld`].
@@ -1470,6 +1474,10 @@ impl TlbHardware for TlbCpu {
     fn patience(&self) -> u64 {
         u64::MAX
     }
+
+    fn current_root(&self) -> u64 {
+        self.world.cr3[self.id].load(Relaxed)
+    }
 }
 
 impl TlbWorld {
@@ -1480,6 +1488,8 @@ impl TlbWorld {
             kick: core::array::from_fn(|_| Notify::new()),
             stop: AtomicBool::new(false),
             pte: AtomicU64::new(MAPPED),
+            cr3: core::array::from_fn(|_| AtomicU64::new(KERNEL_SPACE)),
+            interrupts: core::array::from_fn(|_| SpinLock::new(())),
         })
     }
 
@@ -1494,6 +1504,14 @@ impl TlbWorld {
 }
 
 impl TlbCpu {
+    /// Switches this processor to `to`: its CR3 write also runs `then`.
+    fn switch_to(&self, to: u64, then: impl FnOnce()) {
+        self.world.shootdown.switch_space(self, to, || {
+            self.world.cr3[self.id].store(to, Relaxed);
+            then();
+        });
+    }
+
     /// A processor with interrupts on: takes the shootdown interrupt whenever it comes.
     fn serve(&self) {
         loop {
@@ -1631,7 +1649,9 @@ fn shootdown_two_initiators_serve_each_other() {
 
 /// The address space of the targeted models.
 const THE_SPACE: u64 = 0xA000;
-/// Another address space: the kernel's, or a process's that has nothing to do with this.
+/// The kernel's address space: where every model processor starts.
+const KERNEL_SPACE: u64 = 0xF000;
+/// Another address space: a process's that has nothing to do with this.
 const OTHER_SPACE: u64 = 0xC000;
 
 /// A processor in the space holds the translation: it is asked, and it answers. A processor in
@@ -1650,9 +1670,9 @@ fn shootdown_for_a_space_asks_only_the_processors_in_it() {
             for cpu in [&near, &inside, &elsewhere] {
                 world.shootdown.mark_online(cpu);
             }
-            world.shootdown.switch_space(1, 0, THE_SPACE, || ());
+            inside.switch_to(THE_SPACE, || ());
             world.tlb[1].store(true, Relaxed);
-            world.shootdown.switch_space(2, 0, OTHER_SPACE, || ());
+            elsewhere.switch_to(OTHER_SPACE, || ());
             world.tlb[2].store(true, Relaxed);
             let serving = vec![inside.serving()];
             near.take_the_page_away(Scope::Space(THE_SPACE));
@@ -1679,16 +1699,13 @@ fn shootdown_and_a_processor_entering_the_space() {
             let (near, entering) = (tlb_cpu(&world, 0), tlb_cpu(&world, 1));
             world.shootdown.mark_online(&near);
             world.shootdown.mark_online(&entering);
-            world.shootdown.switch_space(1, 0, OTHER_SPACE, || ());
+            entering.switch_to(OTHER_SPACE, || ());
             let serving = {
                 let me = entering.clone();
                 (
                     1,
                     thread::spawn(move || {
-                        let world = Arc::clone(&me.world);
-                        world
-                            .shootdown
-                            .switch_space(1, OTHER_SPACE, THE_SPACE, || me.walk());
+                        me.switch_to(THE_SPACE, || me.walk());
                         me.serve();
                     }),
                 )
@@ -1714,18 +1731,15 @@ fn shootdown_and_a_processor_leaving_the_space() {
             let (near, leaving) = (tlb_cpu(&world, 0), tlb_cpu(&world, 1));
             world.shootdown.mark_online(&near);
             world.shootdown.mark_online(&leaving);
-            world.shootdown.switch_space(1, 0, THE_SPACE, || ());
+            leaving.switch_to(THE_SPACE, || ());
             world.tlb[1].store(true, Relaxed);
             let serving = {
                 let me = leaving.clone();
                 (
                     1,
                     thread::spawn(move || {
-                        let world = Arc::clone(&me.world);
-                        world.shootdown.switch_space(1, THE_SPACE, OTHER_SPACE, || {
-                            // The CR3 load drops every non-global translation.
-                            me.invalidate(Request::NonGlobal);
-                        });
+                        // The CR3 load drops every non-global translation.
+                        me.switch_to(OTHER_SPACE, || me.invalidate(Request::NonGlobal));
                         me.serve();
                     }),
                 )
@@ -1785,7 +1799,7 @@ fn deferred_free_comes_after_the_last_use_of_a_stale_translation() {
             let (near, user) = (tlb_cpu(&world, 0), tlb_cpu(&world, 1));
             world.shootdown.mark_online(&near);
             world.shootdown.mark_online(&user);
-            world.shootdown.switch_space(1, 0, THE_SPACE, || ());
+            user.switch_to(THE_SPACE, || ());
             world.tlb[1].store(true, Relaxed);
             let frame = Arc::new(ModelFrame::new(0));
             let running = {
@@ -1849,7 +1863,7 @@ fn deferred_free_of_a_frame_shared_by_two_spaces() {
             for cpu in [&first, &second, &user] {
                 world.shootdown.mark_online(cpu);
             }
-            world.shootdown.switch_space(2, 0, THE_SPACE, || ());
+            user.switch_to(THE_SPACE, || ());
             world.tlb[2].store(true, Relaxed);
             let shared = Arc::new(SharedModelFrame {
                 frame: ModelFrame::new(0),
@@ -1904,4 +1918,94 @@ fn deferred_free_of_a_frame_shared_by_two_spaces() {
             );
         },
     );
+}
+
+// ---------------------------------------------------------------- a switch, interrupted
+
+/// A [`TlbCpu`] whose interrupt flag is real: `without_interrupts` holds its processor's lock,
+/// and whatever stands for an interrupt on that processor takes the same lock to run. So an
+/// interrupt cannot land inside an interrupts-off section, as on the machine.
+struct IrqCpu(TlbCpu);
+
+impl TlbHardware for IrqCpu {
+    fn this_cpu(&self) -> usize {
+        self.0.this_cpu()
+    }
+
+    fn invalidate(&self, request: Request) {
+        self.0.invalidate(request);
+    }
+
+    fn send_ipi(&self, cpu: usize) {
+        self.0.send_ipi(cpu);
+    }
+
+    fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _off = self.0.world.interrupts[self.0.id].lock();
+        f()
+    }
+
+    fn now(&self) -> u64 {
+        self.0.now()
+    }
+
+    fn patience(&self) -> u64 {
+        self.0.patience()
+    }
+
+    fn current_root(&self) -> u64 {
+        self.0.current_root()
+    }
+}
+
+/// What the record says when it disagrees with CR3.
+const RECORD_WRONG: &str = "the record names a space this processor has left";
+
+/// A thread on processor 1 switches to one space while the scheduler, in an interrupt on the
+/// same processor, switches it to another (review finding 1). Whichever ends last decides CR3,
+/// and the record must name that space and no other: otherwise a shootdown would pass the
+/// processor over, and a space it runs on could be freed.
+#[test]
+fn a_switch_and_the_scheduler_on_one_processor() {
+    check(
+        "a_switch_and_the_scheduler_on_one_processor",
+        EXHAUSTIVE,
+        EXHAUSTIVE,
+        || {
+            let world = TlbWorld::new();
+            let cpu = |to: u64| {
+                let me = IrqCpu(tlb_cpu(&world, 1));
+                move || {
+                    world_switch(&me, to);
+                }
+            };
+            let scheduler = thread::spawn(cpu(OTHER_SPACE));
+            cpu(THE_SPACE)();
+            scheduler.join().unwrap();
+            let now = world.cr3[1].load(Relaxed);
+            let left = if now == THE_SPACE {
+                OTHER_SPACE
+            } else {
+                THE_SPACE
+            };
+            assert_eq!(world.shootdown.processors_holding(now), 1, "{RECORD_WRONG}");
+            assert_eq!(
+                world.shootdown.processors_holding(left),
+                0,
+                "{RECORD_WRONG}"
+            );
+            assert_eq!(
+                world.shootdown.processors_holding(KERNEL_SPACE),
+                0,
+                "{RECORD_WRONG}"
+            );
+        },
+    );
+}
+
+/// Switches `me` to `to`, its CR3 write storing the new root.
+fn world_switch(me: &IrqCpu, to: u64) {
+    me.0.world.shootdown.switch_space(me, to, || {
+        me.0.world.cr3[me.0.id].store(to, Relaxed);
+    });
 }

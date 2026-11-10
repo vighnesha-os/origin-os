@@ -1352,8 +1352,8 @@ pub fn read_cr3() -> u64 {
 /// `root` must be a complete PML4 that maps everything the running code touches next (its
 /// code, stack and data): in practice the kernel's, or a process PML4 sharing its half.
 pub unsafe fn write_cr3(root: u64) {
-    let me = this_cpu().get();
-    crate::tlb::switch_space(me, read_cr3(), root, || {
+    // The record and the write together, with interrupts off (review finding 1).
+    crate::tlb::switch_space(root, || {
         // SAFETY: the caller's contract.
         unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
     });
