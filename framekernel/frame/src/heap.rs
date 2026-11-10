@@ -11,6 +11,7 @@
 //! Every free is checked: the address must lie in a known slab of the right size class, on
 //! a block boundary, and the block must be allocated. A large free must not name a slab
 //! frame. The frame allocator then checks large runs itself.
+#![forbid(unsafe_code)]
 
 /// Smallest block.
 pub const MIN_BLOCK: u64 = 16;

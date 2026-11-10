@@ -128,10 +128,12 @@ fn problems_in(source: &str) -> (Vec<Problem>, Seen) {
         let opens = token.kind == Kind::Ident
             && MACROS.contains(&token.text)
             && tokens.get(i + 1).is_some_and(|t| t.is_punct('!'))
-            && tokens.get(i + 2).is_some_and(|t| delimiter(t) == Some(1));
+            && tokens
+                .get(i + 2)
+                .is_some_and(|t| lex::bracket(t) == Some(1));
         if opens {
             let line = lex::line_of(source, token.start);
-            let Some(close) = closing(&tokens, i + 2) else {
+            let Some(close) = lex::closing(&tokens, i + 2) else {
                 problems.push(Problem {
                     line,
                     what: format!("`{}!` is never closed: the gate cannot read it", token.text),
@@ -164,37 +166,13 @@ fn problems_in(source: &str) -> (Vec<Problem>, Seen) {
     (problems, seen)
 }
 
-/// `Some(1)` for an opening bracket, `Some(-1)` for a closing one.
-fn delimiter(token: &Token<'_>) -> Option<i32> {
-    if token.kind != Kind::Punct {
-        return None;
-    }
-    match token.text {
-        "(" | "[" | "{" => Some(1),
-        ")" | "]" | "}" => Some(-1),
-        _ => None,
-    }
-}
-
-/// The index of the bracket that closes the one at `open`.
-fn closing(tokens: &[Token<'_>], open: usize) -> Option<usize> {
-    let mut depth = 0;
-    for (i, token) in tokens.iter().enumerate().skip(open) {
-        depth += delimiter(token).unwrap_or(0);
-        if depth == 0 {
-            return Some(i);
-        }
-    }
-    None
-}
-
 /// The arguments of a macro: its body split at the commas outside every bracket.
 fn arguments<'t, 'a>(body: &'t [Token<'a>]) -> Vec<&'t [Token<'a>]> {
     let mut out = Vec::new();
     let mut depth = 0;
     let mut start = 0;
     for (i, token) in body.iter().enumerate() {
-        depth += delimiter(token).unwrap_or(0);
+        depth += lex::bracket(token).unwrap_or(0);
         if depth == 0 && token.is_punct(',') {
             out.push(body.get(start..i).unwrap_or(&[]));
             start = i + 1;

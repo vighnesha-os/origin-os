@@ -13,6 +13,7 @@
 //! [`MAX_REFERENCES`], [`RefCount::retain`] reports [`TooMany`] and its caller stops, as `Arc`
 //! aborts (review housekeeping of S3-5a). This crate cannot panic (`cargo xtask check`'s
 //! no-panic check), so the stop is the caller's.
+#![forbid(unsafe_code)]
 
 use core::sync::atomic::Ordering;
 

@@ -5,6 +5,7 @@
 //! the kernel safe is that the framework's safe operations take them only as a reference to
 //! something the framework already owns or has checked (a page it allocated, a range it
 //! claimed), never as bare authority to reach memory.
+#![forbid(unsafe_code)]
 
 use core::fmt;
 

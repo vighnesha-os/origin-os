@@ -126,6 +126,30 @@ pub(crate) fn tokens(source: &str) -> Vec<Token<'_>> {
     out
 }
 
+/// `Some(1)` for an opening bracket of any kind, `Some(-1)` for a closing one.
+pub(crate) fn bracket(token: &Token<'_>) -> Option<i32> {
+    if token.kind != Kind::Punct {
+        return None;
+    }
+    match token.text {
+        "(" | "[" | "{" => Some(1),
+        ")" | "]" | "}" => Some(-1),
+        _ => None,
+    }
+}
+
+/// The index of the bracket that closes the one at `open`, or `None` if nothing does.
+pub(crate) fn closing(tokens: &[Token<'_>], open: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (i, token) in tokens.iter().enumerate().skip(open) {
+        depth += bracket(token).unwrap_or(0);
+        if depth <= 0 {
+            return (depth == 0).then_some(i);
+        }
+    }
+    None
+}
+
 /// The line `offset` is on, counting from 1.
 pub(crate) fn line_of(source: &str, offset: usize) -> usize {
     let upto = offset.min(source.len());
@@ -382,6 +406,18 @@ mod tests {
             let _ = tokens(cut);
         }
         assert_eq!(kinds("\"open"), [(Kind::Str { raw: false }, "open")]);
+    }
+
+    #[test]
+    fn a_bracket_finds_the_one_that_closes_it() {
+        let found = tokens("f(a[0], \"(\", ')') { x }");
+        assert_eq!(closing(&found, 1), Some(10));
+        assert_eq!(closing(&found, 3), Some(5));
+        assert_eq!(closing(&found, 11), Some(13));
+        // Nothing closes the last one, and a token that opens nothing closes at once or not at
+        // all.
+        assert_eq!(closing(&tokens("f(a"), 1), None);
+        assert_eq!(closing(&tokens(") x"), 0), None);
     }
 
     #[test]

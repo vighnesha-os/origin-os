@@ -5,6 +5,7 @@
 //! regions of the boot info ever start free; everything else (firmware, ACPI, MMIO, the
 //! kernel image, its stack, the boot info, loader memory) stays used. The bitmap lives in
 //! memory the caller provides, so this module needs no `unsafe` and is tested on the host.
+#![forbid(unsafe_code)]
 
 use origin_boot_info::{MemoryRegion, RegionKind};
 
