@@ -10,7 +10,8 @@
 //!   resistance, and the lengths around every block boundary.
 //! - The state machine: what is refused, in which order, and that a refusal changes nothing.
 //!
-//! NIST's own validation vectors are in `tests/kat` once the owner allows their download.
+//! NIST's own validation vectors, which give published answers for reseeding, additional input
+//! and prediction resistance, are run by `tests/kat/drbg.rs`.
 
 use crate::{DrbgError, HmacDrbgSha512, HmacSha512, Sha512};
 
