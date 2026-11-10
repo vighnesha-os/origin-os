@@ -3,7 +3,8 @@
 //!
 //! `HMAC(K, text) = H((K0 ^ opad) || H((K0 ^ ipad) || text))`, where `K0` is the key made one
 //! hash block long (hashed first if it is longer than a block, then filled with zeros), `ipad`
-//! is the byte `0x36` repeated and `opad` the byte `0x5c` repeated (RFC 2104 §2).
+//! is the byte `0x36` repeated and `opad` the byte `0x5c` repeated (FIPS 198-1 §4, Table 1;
+//! RFC 2104 §2).
 //!
 //! A key is secret, and from the first block on so is everything the two hashes hold. This
 //! module therefore hashes through SHA-512's secret-material paths and overwrites every
@@ -45,7 +46,8 @@ impl Key {
 
     /// Replaces the key with `key`, in place.
     pub(crate) fn set(&mut self, key: &[u8]) {
-        // K0: a key longer than a block is hashed first; the rest of the block is zeros.
+        // K0 (FIPS 198-1 §4, steps 1 to 3): a key longer than a block is hashed first; the rest
+        // of the block is zeros.
         let mut k0 = [0u8; BLOCK];
         if key.len() > BLOCK {
             let mut hash = Sha512::new();

@@ -70,7 +70,7 @@ FAULTS = [
  ("drbg: the nonce's length is not checked", [(D, "if nonce.len() < Self::MIN_NONCE_LEN {", "if nonce.len() > usize::MAX - 1 {")]),
  ("drbg: a request may be 65537 bytes", [(D, "pub const MAX_REQUEST_LEN: usize = 1 << 16;", "pub const MAX_REQUEST_LEN: usize = (1 << 16) + 1;")]),
  ("drbg: a second instantiation replaces the state", [(D, "        if self.instantiated {\n            return Err(DrbgError::AlreadyInstantiated);\n        }\n", "")]),
- ("drbg: a reseed works with no state", [(D, "        if !self.instantiated {\n            return Err(DrbgError::NotInstantiated);\n        }\n        check_entropy(entropy_input)?;", "        check_entropy(entropy_input)?;")]),
+ ("drbg: a reseed works with no state", [(D, "        if !self.instantiated {\n            return Err(DrbgError::NotInstantiated);\n        }\n        // §9.2's order", "        // §9.2's order")]),
  ("drbg: an interval of zero is accepted", [(D, "if reseed_interval == 0 || reseed_interval > Self::MAX_RESEED_INTERVAL {", "if reseed_interval > Self::MAX_RESEED_INTERVAL {")]),
  ("drbg: an interval above 2^48 is accepted", [(D, "if reseed_interval == 0 || reseed_interval > Self::MAX_RESEED_INTERVAL {", "if reseed_interval == 0 {")]),
  ("drbg: the given interval is ignored", [(D, "            reseed_counter: 0,\n            reseed_interval,\n", "            reseed_counter: 0,\n            reseed_interval: Self::MAX_RESEED_INTERVAL,\n")]),

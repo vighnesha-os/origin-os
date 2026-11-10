@@ -156,9 +156,10 @@ impl HmacDrbgSha512 {
     /// from `entropy_input || nonce || personalization_string`.
     ///
     /// `entropy_input` must hold at least 256 bits of entropy in at least
-    /// [`Self::MIN_ENTROPY_LEN`] bytes. `nonce` must be at least [`Self::MIN_NONCE_LEN`] bytes
-    /// that hold 128 bits of entropy or do not repeat (§8.6.7). `personalization_string` may be
-    /// empty; it is how one instantiation is told from another, and need not be secret.
+    /// [`Self::MIN_ENTROPY_LEN`] bytes, and must not be a seed any other instantiation was
+    /// given (§8.6.9). `nonce` must be at least [`Self::MIN_NONCE_LEN`] bytes that hold 128
+    /// bits of entropy or do not repeat (§8.6.7). `personalization_string` may be empty; it is
+    /// how one instantiation is told from another, and need not be secret (§8.7.1).
     pub fn instantiate(
         &mut self,
         entropy_input: &[u8],
@@ -168,12 +169,13 @@ impl HmacDrbgSha512 {
         if self.instantiated {
             return Err(DrbgError::AlreadyInstantiated);
         }
+        // §9.1's order: the personalization string, then the entropy input, then the nonce.
+        check_input(personalization_string)?;
         check_entropy(entropy_input)?;
         if nonce.len() < Self::MIN_NONCE_LEN {
             return Err(DrbgError::NonceTooShort);
         }
         check_input(nonce)?;
-        check_input(personalization_string)?;
         self.key.set(&[0x00; OUT]);
         self.v = [0x01; OUT];
         self.update([entropy_input, nonce, personalization_string]);
@@ -185,8 +187,8 @@ impl HmacDrbgSha512 {
     /// The standard's reseed function (§10.1.2.4): mixes `entropy_input || additional_input`
     /// into the state and starts the count of requests again.
     ///
-    /// `entropy_input` is held to what [`Self::instantiate`] asks of its own. `additional_input`
-    /// may be empty.
+    /// `entropy_input` is held to what [`Self::instantiate`] asks of its own, and is never this
+    /// generator's own output (§9.2). `additional_input` may be empty.
     pub fn reseed(
         &mut self,
         entropy_input: &[u8],
@@ -195,8 +197,9 @@ impl HmacDrbgSha512 {
         if !self.instantiated {
             return Err(DrbgError::NotInstantiated);
         }
-        check_entropy(entropy_input)?;
+        // §9.2's order: the additional input, then the entropy input.
         check_input(additional_input)?;
+        check_entropy(entropy_input)?;
         self.update([entropy_input, additional_input, &[]]);
         self.reseed_counter = 1;
         Ok(())
