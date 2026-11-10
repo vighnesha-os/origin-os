@@ -878,6 +878,9 @@ impl UserSpace {
             return Ok(());
         }
         let target = dst.as_mut_ptr().expose_provenance() as u64;
+        // The address is a program's: it stays in the user half on a wrongly guessed path too
+        // (ADR-0017 Z9). After the check it is unchanged.
+        let src = crate::nospec::user_address(src);
         // SAFETY: `dst` is a live kernel buffer of `range.len()` bytes that this call owns;
         // `src` was checked against this space's own tables, and this space is the one loaded
         // here (`checked`); a fault during the copy is recovered at the copy instruction.
@@ -895,6 +898,8 @@ impl UserSpace {
             return Ok(());
         }
         let source = src.as_ptr().expose_provenance() as u64;
+        // As in `copy_in`: unchanged after the check, and in the user half without it.
+        let dst = crate::nospec::user_address(dst);
         // SAFETY: as in `copy_in`: `src` is a live kernel buffer, and the destination was
         // checked to be present, writable user memory of this space, the one loaded here.
         if unsafe { crate::cpu::copy_user(dst, source, range.len()) } {

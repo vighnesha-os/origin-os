@@ -29,6 +29,22 @@ The framework's half of step 3's memory work, with no system call yet (S3-5b add
 
 **Its independent review (one AI reviewer, 2026-11-10)** found seven issues; findings 1–5 and 7 and the housekeeping are fixed on `claude/s3-5a-review-fixes`. A space's record and the CR3 write now change together with interrupts off; only the scheduler activates a space, and proofs visit one instead; a stalled shootdown is remembered until a flush completes; the kernel-half proof's probe page is no longer global, the defect CI's run on a real processor exposed, and CI's next run passed on one (`81cb61c`, an AMD EPYC 7763 under KVM); W^X holds across every mapping of a shared frame; and the Loom controls fail with their property's own message. Finding 6, an unbounded wait, is documented and unchanged. The owner settled ADR-0004 H2's table as Amendment 1 (decision sheet items 98–100): the heap stays in the direct map, the stacks move to their own region with guard pages that take no memory (not built yet), and slot 480 holds only the probe page. Each fix by finding: the threat model and `SOURCE_PROVENANCE.md`.
 
+## Speculation and processor hardening (ADR-0017; TASKS item 19; 2026-11-10)
+
+**Decided:** `docs/adr/ADR-0017-speculation-processor-hardening.md` and `docs/engineering/THREAT_MODEL_SYSTEM.md`, both accepted by the owner (decision items 124 to 141), from a ledger of Intel's and AMD's own documents read that day. Amendment 1 (item 152): the toolchain's prebuilt libraries are outside the image rules, by name.
+
+**Built (task 19b), on branch `claude/intelligent-dhawan-a7f6d4`, not merged:**
+
+- Every index, count and address a program chooses goes through one framework primitive, `origin_frame::nospec`, before the kernel looks anything up or copies anything with it: a conditional move, or LFENCE, by the processor's maker and family. The list is in `THREAT_MODEL_SYSCALLS.md`.
+- Each processor reads what it reports as it starts, sets the controls it enumerates (enhanced IBRS with `BHI_DIS_S` and `RRSBA_DIS_S`, or automatic IBRS with STIBP), reads them back and records the result. The boot prints what is on and what the processor lacks, and never refuses on it.
+- An IBPB when a processor takes up a different process.
+- The trap entry zeroes the general-purpose registers once it has saved them.
+- The kernel is built with no jump tables and an INT3 after every return, and `cargo xtask check` reads the built image to hold both, and the entry's register clearing.
+
+**What is shown, and it is little:** host tests of the decision against AMD's published register values for two family 1Ah models and against Intel values built from the SDM's bit positions; boot proofs under QEMU 11.1.3's software processor. **That processor has none of these controls**, so every boot there prints `on: nothing` and ends `degraded: 58 of 59 proofs passed; failed: speculation controls`, and **no control has ever been written on a processor that has it.** CI's boots under KVM will be the first, when the branch lands. No test can show what a processor does on a wrongly guessed path. No processor in the declared scope has been run (§74).
+
+**Not built:** FRED, LASS, shadow stacks, the nested-NMI guard (row E12 of the system-call threat model stays Open) and the per-thread `SPEC_CTRL` value: task 19c. Direct calls between the kernel's crates: TASKS item 33 (decision item 153).
+
 ## The Framekernel framework crate (ADR-0011 N6, N14 step 1; 2026-11-09)
 
 The kernel now has one privileged crate, `framekernel/frame/`, and `cargo xtask check` fails if `unsafe` appears in the kernel outside it or a kernel dependency runs the wrong way. There is none outside it: 351 sites (by the gate's count, of `unsafe` tokens and `global_asm!`; the review's earlier count was 310) became 0, and the allowlist that tracked the migration is gone. Above the framework is one library, `framekernel`, with `#![forbid(unsafe_code)]` at its root: drivers, services and the boot flow are safe code on typed framework interfaces (`PhysAddr`, `Iova`, `MmioRegion`, `DmaPage`, `OwnedFrame`, `UserSpace`, `GuardedStack`, `PortRange`), device interrupts and the scheduler's upcalls are registered (`origin_frame::irq`, `origin_frame::trap`), and early boot is a capability (`origin_frame::early`) whose steps run once and refuse out of turn. The AP trampoline, IOMMU programming and page-table set-up are in the framework, as N12 lists them. The image's link root, `framekernel/frame/entry/main.rs`, holds `_start`. Not done: the OIDL generator and the rest of ADR-0011, and no independent review of the framework's soundness arguments, whose evidence is in `docs/engineering/SOURCE_PROVENANCE.md`. Everything still runs under QEMU TCG + OVMF only.
@@ -163,7 +179,7 @@ The owner asked for a very careful review of CLAUDE.md and the design documents.
 **Not built, and needed before ADR-0011 N14 step 4 puts a real program in ring 3:**
 
 - Randomness comes straight from the processor's instructions, with no generator and no health gate (TASKS item 18).
-- There is no system threat model, and no decision on speculative execution (TASKS item 19).
+- Speculative execution (TASKS item 19): the system threat model and ADR-0017 are written and accepted, and the half that step 4 waits for is built on an unmerged branch (see "Speculation and processor hardening" above). Its controls have not run on a processor that has them.
 
 The rest is TASKS items 20 to 30. One of them is an ABI limit: a 32-bit handle still gives a process about 4.29 billion handle creations in its life (item 24).
 

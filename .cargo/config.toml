@@ -25,5 +25,14 @@ rustflags = [
     "-C", "link-arg=/TIMESTAMP:0",
 ]
 
+# The kernel's two further options are ADR-0017 Z10's. `cargo xtask check` reads the built
+# image to hold both (developer-tools/xtask/src/image.rs), because the second is a feature
+# the stable compiler passes to the code generator with a warning, not one it supports.
 [target.x86_64-unknown-none]
-rustflags = ["-C", "force-frame-pointers=yes"]
+rustflags = [
+    "-C", "force-frame-pointers=yes",
+    # No `match` compiles to an indirect jump through a table.
+    "-C", "jump-tables=no",
+    # An INT3 follows every RET, so a processor that runs past one stops there.
+    "-C", "target-feature=+harden-sls-ret",
+]
