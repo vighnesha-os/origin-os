@@ -41,3 +41,23 @@
 ## Resolution
 
 Landed on the step-3 batch's local branch as `759d319`. ADR-0004's wording now says the stack region is built (decision sheet item 143; five edits, applied with this record). The slide for the region (ADR-0004 Amendment 2, item 144) is accepted and not built. The stacks have run under QEMU's software CPU only.
+
+## Addendum, 2026-11-11: the stack region's slide
+
+**Scope.** Branch `claude/stack-slide` at `5abb120` (9 commits from `cdf4ed9`), merged into `land/s3-part2` as `685e34c`: ADR-0004 Amendment 2, A4–A6 with notes A6.1–A6.4 (decision sheet items 144 and 157–160), and the fix for observation 1 above (`40a013b`: the comment on `Counts::pages` now says what it counts, with a host test). Reviewed by the coordinating AI session by reading, with the author's report in hand. **No human has reviewed this code.**
+
+**Read as changes:** `layout.rs`, `stack.rs`, `early.rs`, `told.rs`, `phys.rs`, `vm.rs`, `slots.rs`, and the kernel's `console.rs`, `kernel.rs`, `sched.rs` and `stacks.rs`; xtask's scan of the serial log. **Not read:** xtask's read through QEMU's monitor (`9f882e8`) and the records commit; the gates cover the first only where it runs.
+
+**Run by the reviewer on the merged tree `685e34c`:** `cargo xtask check` passed (all 42 Loom models, all 68 controls caught); `cargo xtask boot-test` passed 11 of 11 scenarios, with the kernel boot saying its region's base was drawn from RDSEED and is not the fixed one (QEMU's software CPU). **Reported by the author, not repeated:** `cargo xtask boot-matrix` (18 boots, 58 of 58 each, 11 distinct bases read through the monitor, none printed), controls C30–C34 and H1–H3, and the forced boot without entropy.
+
+**Checked and found sound.**
+- The draw: `1 + random % placements` steps of 2 MiB from the window's start, so every base is aligned, keeps the whole region in PML4 slots 384–447, and is never the fixed base; the extremes are tested.
+- The tables: 130 are counted and the early pool is sized from that count; the region is recorded (`place`) only after its tables are made, once.
+- Every user of the region's bounds (`slot_of`, `slot_top`, `in_stack_region`, the proof) reads the placed base, with the range check written so it cannot overflow.
+- Printing: `Region`'s and `Bases`' `Debug` leave the bases out; the exception report, the panic backtrace and the NMI line go through `phys::told`, which reads only atomics; every boot test now fails if its log holds a number in the stack window.
+
+**Observations.**
+1. A6.2 was built wider than its words: direct-map addresses and the exception report's general registers print as offsets too. Kept, and written into note A6.2.
+2. Low. A register that holds a non-address value that happens to fall in a sliding window prints as an offset. Nothing is lost, since the base is known offline to nobody; a report's reader must know it.
+3. Not covered: the monitor read on CI's QEMU (nothing is pushed), a boot without entropy that gets past the start-record proof, and any real processor.
+
