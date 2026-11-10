@@ -239,3 +239,12 @@ The review of S3-5b found that `memory_map` returns `limit` for three causes tha
 | # | Question | Answer |
 |---|---|---|
 | 142, answered | When a map runs out: `limit` when the address space's 32 page-table frames are used up, and `no_memory` when the machine has no free frame or the kernel heap cannot grow? `memory_map` already declares both, so `user-abi` stays 0.5. | **Accept** |
+
+## H2-stacks: ADR-0004's wording, and a slide for the stack region (Accepted 2026-11-10)
+
+Task H2-stacks built ADR-0004 Amendment 1's A2 on its own branch and left two things to the owner: the ADR's wording for what it built, and whether the stack region is slid. The coordinating session put both to the owner with a recommendation each, and the owner answered **"Accept all"** on 2026-11-10. Item 143 changes no decision; its five edits are applied when H2-stacks lands on the step-3 batch. Item 144 is ADR-0004 Amendment 2 (A4–A6). Not built yet.
+
+| # | Question | Answer |
+|---|---|---|
+| 143, answered | Update ADR-0004 to say what H2-stacks built, when it lands: A2 is built; the region is 2048 slots of 128 KiB (256 MiB), each stack at the top of its slot with at least 64 KiB below it never mapped; the boot processor's interrupt stacks stay in the kernel image and the boot stack is the loader's? | **Accept** |
+| 144, answered | Give the kernel stack region a random base: drawn by the kernel when it builds its tables, 2 MiB-aligned within PML4 slots 384–447 (about 24 bits), from RDSEED, else RDRAND, and with neither the fixed base, reported; never printed after boot; built as a framework task of its own after H2-stacks lands? | **Accept** |
