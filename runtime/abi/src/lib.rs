@@ -222,7 +222,8 @@ pub mod syscall {
     pub const CHANNEL_CREATE: u64 = 5;
     /// `channel_write(handle, bytes, length, handles, count)`.
     pub const CHANNEL_WRITE: u64 = 6;
-    /// `channel_read(handle, bytes, capacity, handles, capacity, out_sizes)`.
+    /// `channel_read(handle, bytes, capacity, records, capacity, out_sizes)`: each handle
+    /// received is a [`super::received_handle`] record (B3).
     pub const CHANNEL_READ: u64 = 7;
     /// `wait_one(handle, signals, deadline, out_observed)`.
     pub const WAIT_ONE: u64 = 8;
@@ -263,6 +264,27 @@ pub mod read_sizes {
     pub const BYTES_AT: usize = 4;
     /// Byte offset of `handles`.
     pub const HANDLES_AT: usize = 8;
+}
+
+/// What `channel_read` writes for each handle it moves into the caller's table (B3): the
+/// handle, the type of the object it names and its rights there, so a receiver can check both
+/// before it uses the handle. Each record is 12 bytes, every field a little-endian `u32`, and
+/// the capacity passed is in records.
+///
+/// ```text
+/// 0  u32 handle        its value in the caller's table
+/// 4  u32 object_type   an [`ObjectType`]
+/// 8  u32 rights        [`rights`]
+/// ```
+pub mod received_handle {
+    /// Bytes of one record.
+    pub const SIZE: usize = 12;
+    /// Byte offset of `handle`.
+    pub const HANDLE_AT: usize = 0;
+    /// Byte offset of `object_type`.
+    pub const OBJECT_TYPE_AT: usize = 4;
+    /// Byte offset of `rights`.
+    pub const RIGHTS_AT: usize = 8;
 }
 
 /// The start record (P6): what a process begins with, at the address RDI holds.
@@ -519,6 +541,11 @@ mod tests {
         assert_eq!(read_sizes::BYTES_AT, 4);
         assert_eq!(read_sizes::HANDLES_AT, 8);
         assert_eq!(read_sizes::SIZE, 12);
+        // Three `u32`s, in order, with no padding (B3).
+        assert_eq!(received_handle::HANDLE_AT, 0);
+        assert_eq!(received_handle::OBJECT_TYPE_AT, 4);
+        assert_eq!(received_handle::RIGHTS_AT, 8);
+        assert_eq!(received_handle::SIZE, 12);
     }
 
     #[test]

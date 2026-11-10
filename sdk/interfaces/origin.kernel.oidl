@@ -129,6 +129,18 @@ sized struct read_sizes {
     handles: u32;
 }
 
+/// A handle channel_read moved into the caller's table: its value there, what it names and the
+/// rights it has, so a receiver can check both before using it (ADR-0005 B3, C3).
+@since(0.2)
+struct received_handle {
+    /// Its value in the caller's table.
+    handle: u32;
+    /// The type of the object it names.
+    object_type: object_type;
+    /// Its rights in the caller's table.
+    rights: rights;
+}
+
 /// Calls made by a thread on its process's behalf (ADR-0005 P4). Every number here is private
 /// to the release; the C entry points below are the stable interface.
 interface kernel {
@@ -191,8 +203,8 @@ interface kernel {
     ) -> (
         /// Filled with the message's bytes.
         @count(sizes.bytes) bytes: vector<u8, max_message_bytes>,
-        /// Filled with the handles moved to the caller's table.
-        @count(sizes.handles) handles: vector<handle<any>, max_message_handles>,
+        /// Filled with a record of each handle moved to the caller's table (ADR-0005 B3).
+        @count(sizes.handles) handles: vector<received_handle, max_message_handles>,
         /// The message's sizes; set size before the call.
         @also_on(buffer_too_small) sizes: read_sizes,
     ) errors(bad_handle, wrong_type, access_denied, fault, invalid_args, should_wait, peer_closed, buffer_too_small, limit, no_memory) requires none;

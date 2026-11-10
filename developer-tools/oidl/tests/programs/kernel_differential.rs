@@ -135,7 +135,7 @@ impl s::Calls for Reached {
         &self,
         _end: rt::HandleArg,
         _bytes: rt::UserBuffer<u8>,
-        _handles: rt::UserBuffer<rt::Handle>,
+        _handles: rt::UserBuffer<k::ReceivedHandle>,
         _sizes: rt::UserRef<k::ReadSizes>,
     ) -> Result<(), s::ChannelReadError> {
         Ok(())

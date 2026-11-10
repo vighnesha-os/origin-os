@@ -16,8 +16,9 @@ use oidl_generated::origin_kernel::kernel::server as ks;
 #[derive(Debug, Default, Clone)]
 struct Log {
     calls: Vec<String>,
-    /// What the next channel_read should do: (message bytes, handles).
-    next_read: Option<(Vec<u8>, Vec<u32>)>,
+    /// What the next channel_read should do: the message's bytes, and a record of each handle
+    /// (its value, object type and rights).
+    next_read: Option<(Vec<u8>, Vec<(u32, u32, u32)>)>,
     /// What the next wait_one should report: (status, observed).
     next_wait: (i64, u32),
     /// The status the next call should return.
@@ -109,7 +110,7 @@ pub unsafe extern "C" fn origin_kernel_channel_read(
     end: u32,
     bytes: *mut u8,
     bytes_capacity: u64,
-    handles: *mut u32,
+    handles: *mut u8,
     handles_capacity: u64,
     sizes: *mut u8,
 ) -> i64 {
@@ -130,7 +131,13 @@ pub unsafe extern "C" fn origin_kernel_channel_read(
         }
         unsafe {
             core::ptr::copy_nonoverlapping(message.as_ptr(), bytes, message.len());
-            core::ptr::copy_nonoverlapping(list.as_ptr(), handles, list.len());
+            // A record per handle: three little-endian u32s (ADR-0005 B3).
+            for (index, (value, object, rights)) in list.iter().enumerate() {
+                let record = handles.add(index * 12);
+                (record as *mut u32).write_unaligned(*value);
+                (record.add(4) as *mut u32).write_unaligned(*object);
+                (record.add(8) as *mut u32).write_unaligned(*rights);
+            }
             (sizes.add(4) as *mut u32).write_unaligned(message.len() as u32);
             (sizes.add(8) as *mut u32).write_unaligned(list.len() as u32);
         }
@@ -275,21 +282,41 @@ fn client_paths() {
     assert_eq!(kc::channel_create(), Ok([handle(77), handle(78)]));
     assert_eq!(kc::channel_write(handle(3), b"abc", &[handle(4), handle(5)]), Ok(()));
 
-    // channel_read: success fills the buffers and reports the counts through @count.
-    with(|m| m.next_read = Some((b"xyz".to_vec(), vec![9])));
+    // channel_read: success fills the buffers and reports the counts through @count, and each
+    // handle arrives as a checked record of its value, object type and rights (ADR-0005 B3).
+    let channel = k::ObjectType::Channel.raw();
+    let rights_of_a_channel = k::CHANNEL_RIGHTS.bits();
+    with(|m| m.next_read = Some((b"xyz".to_vec(), vec![(9, channel, rights_of_a_channel)])));
+    let filler = <k::ReceivedHandle as rt::Fixed>::FILLER;
     let mut bytes = [0u8; 8];
-    let mut handles = [rt::Handle::INVALID; 2];
+    let mut handles = [filler; 2];
     let out = kc::channel_read(handle(3), &mut bytes, &mut handles).expect("read");
     assert_eq!(out.bytes, 3);
     assert_eq!(out.handles, 1);
     assert_eq!(out.sizes, k::ReadSizes { bytes: 3, handles: 1 });
     assert_eq!(&bytes[..3], b"xyz");
-    assert_eq!(handles[0], handle(9));
+    assert_eq!(
+        handles[0],
+        k::ReceivedHandle { handle: 9, object_type: k::ObjectType::Channel, rights: k::CHANNEL_RIGHTS }
+    );
+    // A record the definition cannot hold is a protocol error, not a handle.
+    with(|m| m.next_read = Some((b"x".to_vec(), vec![(9, 99, rights_of_a_channel)])));
+    assert_eq!(
+        kc::channel_read(handle(3), &mut bytes, &mut handles),
+        Err(rt::CallError::Protocol(rt::WireError::Enum)),
+        "an object type that does not exist"
+    );
+    with(|m| m.next_read = Some((b"x".to_vec(), vec![(9, channel, 1 << 20)])));
+    assert_eq!(
+        kc::channel_read(handle(3), &mut bytes, &mut handles),
+        Err(rt::CallError::Protocol(rt::WireError::Bits)),
+        "a right that does not exist"
+    );
 
     // channel_read: too small writes the sizes (@also_on).
-    with(|m| m.next_read = Some((vec![1; 20], vec![1, 2, 3])));
+    with(|m| m.next_read = Some((vec![1; 20], vec![(1, channel, 1), (2, channel, 1), (3, channel, 1)])));
     let mut bytes = [0u8; 8];
-    let mut handles = [rt::Handle::INVALID; 2];
+    let mut handles = [filler; 2];
     let failure = kc::channel_read(handle(3), &mut bytes, &mut handles).expect_err("too small");
     assert_eq!(
         failure,

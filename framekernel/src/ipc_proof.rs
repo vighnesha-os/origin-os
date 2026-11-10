@@ -32,7 +32,10 @@ use core::sync::atomic::Ordering;
 
 use crate::paging::{Access, PAGE};
 use origin_abi::limits::{DEADLINE_INFINITE, MAX_MESSAGE_BYTES};
-use origin_abi::{Error, OK, read_sizes, rights, signals, status_name, syscall as sys};
+use origin_abi::{
+    Error, OK, ObjectType, read_sizes, received_handle, rights, signals, status_name,
+    syscall as sys,
+};
 
 use origin_frame::objref::ObjectRef;
 use origin_frame::proof_programs::{self, DATA, STACK};
@@ -77,7 +80,8 @@ const SIZES: u64 = DATA + 0x248;
 const BAD_SIZES: u64 = DATA + 0x260;
 /// A handle list to send.
 const LIST: u64 = DATA + 0x300;
-/// Handles received.
+/// Handles received: a `received_handle` record each (ADR-0005 B3), so the first handle's
+/// value is the `u32` here.
 const RECV: u64 = DATA + 0x400;
 
 /// A test message.
@@ -610,6 +614,13 @@ fn hostile_groups(kernel: u64, foreign: u64) -> Vec<Group> {
                     &[b, Imm(RBUF), Imm(16), Imm(0), Imm(0), Imm(kernel)],
                     fault,
                 ),
+                // Room for one handle is a whole record, 12 bytes, not a 4-byte value (B3).
+                step(
+                    "a handle record across the end of mapped",
+                    sys::CHANNEL_READ,
+                    &[b, Imm(RBUF), Imm(16), Imm(data_end - 4), Imm(1), Imm(SIZES)],
+                    fault,
+                ),
                 step(
                     "create out to the kernel",
                     sys::CHANNEL_CREATE,
@@ -767,6 +778,17 @@ fn hostile_groups(kernel: u64, foreign: u64) -> Vec<Group> {
                 write("the sender's handle is gone", h(18), MSG, 4, bad),
                 read_handles("received", h(17), OK),
                 value_at("with one handle", SIZES + read_sizes::HANDLES_AT as u64, 1),
+                // Its record says what it names and what it may do (B3).
+                value_at(
+                    "its record names a channel",
+                    RECV + received_handle::OBJECT_TYPE_AT as u64,
+                    ObjectType::Channel as u64
+                ),
+                value_at(
+                    "with the rights it was sent with",
+                    RECV + received_handle::RIGHTS_AT as u64,
+                    u64::from(full)
+                ),
                 write("the moved handle writes", Hd(RECV), MSG, 4, OK),
                 read("and the other end reads", h(19), RBUF, 16, OK),
                 dup("it kept its rights", Hd(RECV), full, 20, OK),

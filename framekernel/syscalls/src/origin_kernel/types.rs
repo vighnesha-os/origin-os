@@ -14,7 +14,7 @@
 use super::super::oidl_rt as rt;
 
 /// This library's version: `(major, minor)` (§9).
-pub const VERSION: (u16, u16) = (0, 1);
+pub const VERSION: (u16, u16) = (0, 2);
 
 /// The rights of a new channel end: everything that applies to a channel (ADR-0005 P2, P8,
 /// amendment A1).
@@ -396,6 +396,55 @@ impl ReadSizes {
         if u64::from(limit) >= 12 {
             rt::put_field(out, 8, self.handles)?;
         }
+        Ok(())
+    }
+}
+
+/// A handle channel_read moved into the caller's table: its value there, what it names and the
+/// rights it has, so a receiver can check both before using it (ADR-0005 B3, C3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceivedHandle {
+    /// Its value in the caller's table.
+    pub handle: u32,
+    /// The type of the object it names.
+    pub object_type: ObjectType,
+    /// Its rights in the caller's table.
+    pub rights: Rights,
+}
+
+impl ReceivedHandle {
+    /// Byte offset of `handle`.
+    pub const HANDLE_AT: usize = 0;
+    /// Byte offset of `object_type`.
+    pub const OBJECT_TYPE_AT: usize = 4;
+    /// Byte offset of `rights`.
+    pub const RIGHTS_AT: usize = 8;
+}
+
+impl rt::Fixed for ReceivedHandle {
+    const SIZE: usize = 12;
+    const FILLER: Self = Self {
+        handle: <u32 as rt::Fixed>::FILLER,
+        object_type: <ObjectType as rt::Fixed>::FILLER,
+        rights: <Rights as rt::Fixed>::FILLER,
+    };
+    fn read(oidl_bytes: &[u8], oidl_minor: u16) -> Result<Self, rt::WireError> {
+        if oidl_bytes.len() != Self::SIZE {
+            return Err(rt::WireError::Size);
+        }
+        let handle: u32 = rt::field(oidl_bytes, 0, oidl_minor)?;
+        let object_type: ObjectType = rt::field(oidl_bytes, 4, oidl_minor)?;
+        let rights: Rights = rt::field(oidl_bytes, 8, oidl_minor)?;
+        Ok(Self { handle, object_type, rights })
+    }
+    fn write(self, out: &mut [u8]) -> Result<(), rt::WireError> {
+        if out.len() != Self::SIZE {
+            return Err(rt::WireError::Size);
+        }
+        out.fill(0);
+        rt::put_field(out, 0, self.handle)?;
+        rt::put_field(out, 4, self.object_type)?;
+        rt::put_field(out, 8, self.rights)?;
         Ok(())
     }
 }

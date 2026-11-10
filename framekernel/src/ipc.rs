@@ -488,14 +488,26 @@ pub(crate) fn channel_write(
     Ok(())
 }
 
+/// A handle `channel_read` put in the reader's table, with what the table holds for it: the
+/// record the reader receives (ADR-0005 B3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Received {
+    /// Its value in the reader's table.
+    pub(crate) handle: Handle,
+    /// The type of the object it names.
+    pub(crate) object_type: u32,
+    /// Its rights there: the ones it had in the message.
+    pub(crate) rights: u32,
+}
+
 /// What a `channel_read` found.
 pub(crate) enum Read {
-    /// A message, now out of the queue, with the values of its handles in the reader's table.
+    /// A message, now out of the queue, with its handles in the reader's table.
     Message {
         /// The payload.
         bytes: Vec<u8>,
-        /// The handles' new values.
-        handles: Vec<Handle>,
+        /// The handles, as the reader's table now holds them.
+        handles: Vec<Received>,
     },
     /// The next message does not fit; it stays queued. Its sizes.
     TooSmall {
@@ -551,8 +563,13 @@ pub(crate) fn channel_read(
             {
                 *holder.lock() = None;
             }
+            let object_type = object.object_type();
             match table.insert(object, entry_rights) {
-                Ok(h) => values.push(h),
+                Ok(handle) => values.push(Received {
+                    handle,
+                    object_type,
+                    rights: entry_rights,
+                }),
                 // `reserve` above makes this unreachable. Were it reached, nothing may
                 // close here, under the table lock: the objects are leaked instead.
                 Err((e, object)) => {
