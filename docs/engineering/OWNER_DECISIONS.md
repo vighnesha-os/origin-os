@@ -219,3 +219,15 @@ The independent review of S3-5a found that ADR-0004 H2's table puts the kernel h
 | 98, answered | A1: amend H2 so the kernel heap stays in the direct map, as the code has it (no mapping work or shootdown when it is freed, and the large pages kept)? | **Accept** |
 | 99, answered | A2: keep H2 for the stacks, and move them to `0xFFFF_C000_0000_0000` with guard pages in virtual space, as a task of their own that the framework session starts now? | **Accept** |
 | 100, answered | A3: record PML4 slot 480 (`0xFFFF_F000_0000_0000`), the kernel-half proof's probe page, in H2's table? | **Accept** |
+
+## S3-5b: memory objects' interface (Accepted 2026-11-10)
+
+Task S3-5b (memory objects) needs five interface decisions that C6–C8 (items 61–63) leave open. They are ABI decisions, so they are the owner's (CLAUDE.md §84). The session building S3-5b proposed them, with the options it rejected, and the coordinating session checked them against CLAUDE.md, ADR-0004 and ADR-0005 before asking. The owner answered **"Accept all"** on 2026-11-10. They are ADR-0005 Amendment 5, D1–D5. Items 71–97 are in use on the unmerged `docs/editions-device-sdk` branch.
+
+| # | Question | Answer |
+|---|---|---|
+| 101, answered | D1: creation calls take their arguments in a sized request, so `memory_object_create(request: object_request { length })`, and a creation call with no argument yet takes none? | **Accept** |
+| 102, answered | D2: `map_request` holds the access (read, write, execute: read required, never write with execute, execute refused for now), a `fixed` flag (otherwise a random address), and the offset, length and address in bytes, in whole 4 KiB pages, never rounded? | **Accept** |
+| 103, answered | D3: `memory_unmap` and `memory_protect` name the process, the mapping's start and its length; in v1 exactly one whole mapping; protect only reduces access? | **Accept** |
+| 104, answered | D4: quotas set by the creator: committed bytes, mappings, and a rate for unmap and protect; `limit` past a quota, `no_memory` without frames, `should_wait` past the rate with nothing changed? | **Accept** |
+| 105, answered | D5: the rest: `write` on the process handle for every call, the caller's own included; existing statuses only, in a fixed order; ADR-0004 H1's addresses and the start records' random region; a mapping holds its object; two new constants; `user-abi` 0.5 in one step? | **Accept** |
