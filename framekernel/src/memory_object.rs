@@ -204,7 +204,10 @@ fn reserve(
             Err((e, _)) => return Err(e),
         }
         // Pages the records do not know, the program's own and its start record's, are in the
-        // space alone: a mapping goes nowhere any page is mapped.
+        // space alone: a mapping goes nowhere any page is mapped. No page can appear here
+        // between this look and `map_pages`: those pages are all mapped before the process has
+        // a thread (`Process::map_page` needs the only reference to the space), and every later
+        // page is mapped under its mapping's reserved record, as this one's are.
         if (0..asked.pages).any(|k| space.translate(base + k * PAGE).is_some()) {
             let reserved = without_interrupts(|| target.mappings.lock().remove(base));
             drop(reserved);
@@ -246,6 +249,9 @@ fn map_pages(
             return Err(match e {
                 // The space's page tables are full (`MAX_TABLES`) or out of frames.
                 ChangeError::Map(MapError::OutOfMemory) => Error::Limit,
+                // Not reached in this version: the place is reserved and was found unmapped
+                // (`reserve`), its addresses were checked (`mapping::check`), and no mapping
+                // of an object is executable.
                 _ => Error::InvalidArgs,
             });
         }
