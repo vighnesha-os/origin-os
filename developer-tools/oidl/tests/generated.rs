@@ -13,6 +13,7 @@ use oidl::model::{Compilation, ConstKind};
 use oidl::{Input, codegen, compile, corpus, fingerprint};
 
 const KERNEL: &str = include_str!("../../../sdk/interfaces/origin.kernel.oidl");
+const DIRECTORY: &str = include_str!("../../../sdk/interfaces/origin.directory.oidl");
 const ECHO: &str = include_str!("fixtures/echo.oidl");
 const CALLS: &str = include_str!("fixtures/calls.oidl");
 const VERSIONS: &str = include_str!("../../../origin-version.toml");
@@ -20,6 +21,7 @@ const VERSIONS: &str = include_str!("../../../origin-version.toml");
 fn inputs() -> Vec<Input> {
     [
         ("origin.kernel.oidl", KERNEL),
+        ("origin.directory.oidl", DIRECTORY),
         ("echo.oidl", ECHO),
         ("calls.oidl", CALLS),
     ]
@@ -355,7 +357,7 @@ fn a_library_crate_is_its_server_and_client_and_the_types_it_uses() {
     assert_eq!(echo.uses.len(), 2, "{:?}", echo.uses);
     assert_eq!(
         files.len(),
-        2 + 2 * comp.libraries.len() + 3 * echo.interfaces.len()
+        2 + 2 * (echo.uses.len() + 1) + 3 * echo.interfaces.len()
     );
     for file in &files {
         let name = file.path.rsplit('/').next().expect("a name");

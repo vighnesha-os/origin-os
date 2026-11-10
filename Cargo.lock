@@ -97,6 +97,10 @@ name = "origin-crypto"
 version = "0.0.0"
 
 [[package]]
+name = "origin-directory"
+version = "0.0.0"
+
+[[package]]
 name = "origin-frame"
 version = "0.0.0"
 dependencies = [

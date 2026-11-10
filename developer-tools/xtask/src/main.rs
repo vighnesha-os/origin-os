@@ -96,7 +96,8 @@ const ONBF_FORMAT_PACKAGE: &str = "onbf-format";
 const CRYPTO_PACKAGE: &str = "origin-crypto";
 const MERKLE_PACKAGE: &str = "onbf-merkle";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
-/// `no_std` libraries embedded in the boot loader and the Framekernel. Each must be
+/// `no_std` libraries embedded in the boot loader and the Framekernel, and the generated crates of
+/// the SDK's interfaces, which the Framekernel's boot proofs use and programs will. Each must be
 /// clippy-clean on every target and free of panic paths (ONBF §12).
 const BOOT_INFO_PACKAGE: &str = "origin-boot-info";
 const KERNEL_PACKAGE: &str = "framekernel";
@@ -117,6 +118,7 @@ const FREESTANDING_LIBS: &[&str] = &[
     "origin-paging",
     "origin-abi",
     "origin-syscalls",
+    "origin-directory",
 ];
 const QEMU: &str = "qemu-system-x86_64";
 /// Where the emulated RTC starts (UTC), so the boot test can check the wall clock the

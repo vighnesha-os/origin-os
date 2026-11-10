@@ -27,6 +27,7 @@ members = [
     "runtime/onbf/merkle",
     "runtime/onbf/verify",
     "runtime/version",
+    "sdk/directory",
     "security/crypto",
 ]
 # Host-buildable crates only. The UEFI loader's and the Framekernel's binaries cannot be

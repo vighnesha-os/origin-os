@@ -1,0 +1,36 @@
+// The service directory's interface (ADR-0005 C12, ADR-0011 N9): the way a program reaches the
+// services its launcher gave it.
+//
+// Its types, server and client are generated into sdk/directory (`cargo xtask regenerate`, with
+// `oidl generate --library origin.directory`). `cargo xtask check` fails if that code is not what
+// this file generates, or if this file's ABI is not the one origin.directory.lock records. The
+// directory's logic is services/directory. How a launcher fills a directory, and how a provider
+// receives the connections a directory passes it, are not decided yet (step 4): they are not here.
+
+/// The service directory (ADR-0005 C12, ADR-0011 N9). A program finds services only through the
+/// channel its start record names DIRECTORY, and the process its launcher chose serves this
+/// interface on it. What the directory holds is the launcher's choice.
+library origin.directory;
+transport channel;
+version 0.1;
+use origin.kernel;
+
+/// A program's service directory.
+interface directory {
+    /// Passes server, the server end of a channel the caller made, to the provider of the
+    /// interface interface_id at major major: the identity a hello names (docs/spec/OIDL.md
+    /// §7.7). The caller may use the other end at once, before this replies: the kernel holds
+    /// what it writes until the provider reads it. Success means the end was passed on, not that
+    /// the provider has read it. not_found: this directory holds no provider of that interface
+    /// and major. limit: the provider cannot take the end now. On either error the end is closed,
+    /// so the caller's end reports peer_closed.
+    method connect = 1 (
+        /// The interface, as its hello names it.
+        interface_id: u64,
+        /// Its major version.
+        major: u16,
+        /// The end the provider serves: it reads, writes and waits on it, and the directory
+        /// passes it on.
+        server: handle<channel, read | write | wait | transfer>,
+    ) errors(not_found, limit) requires none;
+}

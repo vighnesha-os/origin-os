@@ -1,0 +1,3 @@
+# oidl-fingerprint 1: one line per library and minor (docs/spec/OIDL.md §13)
+origin.directory 0.0 sha256:89605f3d3dae2aa7b61d495e27f1315e1ab8110a961ea749725c7d04362864a2
+origin.directory 0.1 sha256:89605f3d3dae2aa7b61d495e27f1315e1ab8110a961ea749725c7d04362864a2
