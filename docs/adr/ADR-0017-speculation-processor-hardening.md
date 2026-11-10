@@ -19,7 +19,7 @@
 **What the vendors' documents say,** in short (the ledger has each with its source):
 
 - Intel's 2026 generations and AMD's family 1Ah isolate the kernel's indirect branch predictions in hardware, once a bit is set: enhanced IBRS on Intel, automatic IBRS on AMD. Neither isolates one program from another. That takes IBPB.
-- Intel's table of affected processors gives Panther Lake, Wildcat Lake and Clearwater Forest as not affected by Meltdown, L1TF, the data-sampling families, Indirect Target Selection and the 2025 and 2026 predictor advisories. What still applies needs software: bounds check bypass, branch history injection, speculative store bypass, the SWAPGS case.
+- Intel's table of affected processors gives Panther Lake, Wildcat Lake and Clearwater Forest as not affected by Meltdown, L1TF, the data-sampling families, Indirect Target Selection and the processor advisories of 2025 and 2026. What still applies needs software: bounds check bypass, branch history injection, speculative store bypass, the SWAPGS case.
 - Both vendors guarantee LFENCE as a barrier after a bounds check. AMD also guarantees masking with a conditional move or an AND on all its processors. Intel guarantees masking only for the family 6 processors current when it wrote, and Nova Lake is family 18.
 - FRED replaces the IDT, the interrupt stack table and SWAPGS with one delivery and two returns. It ends the nested-NMI hazard by design. Intel lists it for Panther Lake, Clearwater Forest and Diamond Rapids. AMD's Model 51h reports it; Zen 5 does not.
 - LASS refuses an access to the wrong half of the address space before any page walk, speculative accesses included. Intel only.
