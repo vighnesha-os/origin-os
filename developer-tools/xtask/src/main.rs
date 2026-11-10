@@ -1329,6 +1329,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         // M4's first slice (ADR-0005 P1–P5, P8, P9): system calls between ring-3 processes.
         .chain(ipc_markers(machine.named(0), target.clone()))
         .chain(object_markers(&target))
+        .chain(identity_markers())
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
@@ -1814,6 +1815,15 @@ fn object_markers(far: &str) -> Vec<String> {
         "origin-kernel: ipc: every process and thread object and all they held are gone: heap ".into(),
     ]);
     markers
+}
+
+/// The proof of a message's writer (ADR-0005 B1, C1, C2; `ipc_proof::prove_identity`).
+fn identity_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: ipc: a message's writer: the message written before its end moved to another process names its writer, process and principal: true; the one written after names the new writer: true; a read too small for it names the writer too: true; none names the reader: true".into(),
+        "origin-kernel: ipc: a reader that gives read_sizes' first size, 12: its read -> OK, its counts -> 7 bytes, and nothing written past them: true".into(),
+        "origin-kernel: ipc: the identity proof's processes and all they held are gone: heap ".into(),
+    ]
 }
 
 /// The tampered path: one byte of a SEGMENT changed on disk. The loader must refuse it, and
