@@ -59,8 +59,16 @@ commands:
   interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
               (part of check; quick)
   regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
+  exclusive -- <command> [args...]
+              runs any command in a turn on the machine, as check, the boots, run and loom
+              take theirs: one at a time across every checkout of this repository on this
+              machine. A waiter says once, and about once a minute, which run it waits for.
+              For scripts that call cargo directly (per-commit verification, say)
 
 environment:
+  ORIGIN_XTASK_LOCK_HELD              set by a run that holds the turn, for its own child
+                                      processes: a child that finds the turn held by that
+                                      process runs inside it instead of waiting for it
   ORIGIN_LOOM_DEEP                    if set, the Loom models search to their deeper bounds
                                       (a long run; the default search is part of check)
   ORIGIN_OVMF_CODE, ORIGIN_OVMF_VARS  firmware code image and NVRAM template
@@ -2013,6 +2021,16 @@ fn main() -> ExitCode {
         ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
         ["run"] => in_turn("run", run),
         ["loom"] => in_turn("loom", loom::run),
+        ["exclusive", "--", command @ ..] => {
+            let command: Vec<String> = command.iter().map(|s| (*s).to_string()).collect();
+            return match turns::exclusive(&command) {
+                Ok(code) => ExitCode::from(code),
+                Err(e) => {
+                    eprintln!("xtask: error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);

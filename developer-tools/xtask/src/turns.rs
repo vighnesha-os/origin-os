@@ -16,6 +16,8 @@
 //! - **A waiter says what it is waiting for.** The holder writes its process ID, worktree,
 //!   command and start time into the lock file, and a waiter prints them once, then about once
 //!   a minute.
+//! - **Anything can take a turn:** `cargo xtask exclusive -- <command> [args...]` runs a command
+//!   under the lock, so scripts that call cargo directly can wait their turn too.
 //!
 //! On CI each job has its runner to itself, so the lock is never contended there.
 
@@ -296,12 +298,31 @@ fn wait(file: &mut File, out: &mut dyn Write) -> std::io::Result<()> {
 }
 
 /// Tells `command` that it runs inside this process's turn, if it has one: for the xtask
-/// children of a heavy run.
+/// children of a heavy run, and for whatever `exclusive` runs.
 pub(crate) fn pass(command: &mut Command) -> &mut Command {
     if let Some(pid) = TURN_OF.get() {
         command.env(HELD, pid.to_string());
     }
     command
+}
+
+/// `cargo xtask exclusive -- <command> [args...]`: runs the command in this process's turn,
+/// and gives back its exit code.
+pub(crate) fn exclusive(command: &[String]) -> Result<u8> {
+    let Some((program, args)) = command.split_first() else {
+        return Err(
+            "exclusive: no command to run (`cargo xtask exclusive -- <command> ...`)".into(),
+        );
+    };
+    let shown = command.join(" ");
+    let _turn = take(&format!("exclusive -- {shown}"))?;
+    let status = pass(&mut Command::new(program))
+        .args(args)
+        .status()
+        .map_err(|e| format!("cannot run `{shown}`: {e}"))?;
+    Ok(status
+        .code()
+        .map_or(1, |code| u8::try_from(code).unwrap_or(1)))
 }
 
 #[cfg(test)]
@@ -499,5 +520,10 @@ mod tests {
             .filter_map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
             .collect();
         assert_eq!(passed, [TURN_OF.get().unwrap().to_string()]);
+    }
+
+    #[test]
+    fn exclusive_needs_a_command_and_gives_back_its_exit_code() {
+        assert!(exclusive(&[]).is_err());
     }
 }
