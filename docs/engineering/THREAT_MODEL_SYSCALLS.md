@@ -4,7 +4,7 @@
 |---|---|
 | Required by | CLAUDE.md §58 ("Threat-model every privileged interface"), §29, §30, §42 |
 | Covers | The way into the kernel from ring 3 and back (`framekernel/frame/src/cpu.rs`, `trap.rs`, `usercopy.rs`, `userspace.rs`); the calls (`framekernel/src/syscall.rs`, `handles.rs`, `ipc.rs`, `channel.rs`, `process.rs`, `wait.rs`); the decoder generated from `sdk/interfaces/origin.kernel.oidl` (`framekernel/syscalls`); ADR-0005 P1–P12 and Amendments 1–4 |
-| Written | 2026-11-10, against S3-1's code (c3ccacf). §58 and §83 expect a threat model during design; P4–P11 were designed and built without one, so this is written after them. S3-2's changes (a message's writer, handle records) are added in their own section, written with them. |
+| Written | 2026-11-10, against S3-1's code (c3ccacf). §58 and §83 expect a threat model during design; P4–P11 were designed and built without one, so this is written after them. S3-2's changes (a message's writer, handle records) are added in their own section, written with them, and S3-3's (process start) before its code. |
 | Evidence | QEMU only. Nothing has run on hardware (§74). The boot proofs named below are ADR-0013 rows: "ring-3 isolation", "per-processor control state", "IPC and handles" and "process and thread objects" all stop the boot when they fail. The IPC proof makes 117 hostile calls and checks each status. |
 
 ## What is being protected
@@ -118,6 +118,23 @@ ADR-0005 B1 and B3, as C1–C3 decide. The ledger is `docs/research/2026-11-10-c
 | W10 | Records are written past the caller's buffer | Room for whole 12-byte records is checked before a message is taken | **Proven** (control 1) |
 | W11 | A record or `read_sizes` value outside the definition reaches a client as a value | The generated client decodes each record and the sizes checked; an undeclared type, right or padding byte is a protocol error | **Host** |
 | W12 | The writer's principal tells the reader more than it should | Intended: B1 delivers it. Principals are opaque numbers the creator chose; what they may encode is for the accounts design (§57) | **Open**, with I3 |
+
+### Process start (S3-3)
+
+ADR-0005 P6, as C4–C6 decide, and C1's inheritance of the principal. The ledger is `docs/research/2026-11-10-start-record.md`. Written before the code (§58, §83); each row names the boot line that will prove it, and its status is updated as each is built.
+
+| # | Threat | Defence | Status |
+|---|---|---|---|
+| P1 | A child acts for a principal its creator chose instead of the creator's own, so per-user policy and audit name the wrong user (C1) | The launch path reads the principal from the creator and takes none of its own; no capability to choose another exists | Planned: the message the child writes on BOOTSTRAP names the creator's principal (B1) |
+| P2 | The process changes its start record, and code that reads it later trusts what the process wrote | The record's pages are mapped read-only and not executable | Planned: the child's write to its record faults at the record's address |
+| P3 | The record sits where an attacker can predict it | A random page in the upper user half, from RDSEED or RDRAND, clear of every other mapping. Without entropy the launch fails rather than use a predictable address | Planned: two launches place their records at different addresses |
+| P4 | The record carries kernel memory or stale bytes | Fresh zeroed frames, an exact size and zero padding, from the `origin-abi` encoder | Planned: the size read back; host tests of every padding byte |
+| P5 | A start handle has more rights than C6 gives its role | Each role's rights are fixed in the launch path: C6 for the process and thread, a channel's for BOOTSTRAP and DIRECTORY | Planned: each entry's rights read back in ring 3 |
+| P6 | An entry misreports a handle's role or type | Each entry is made from what the child's table holds for that handle | Planned: each entry read back and each handle used |
+| P7 | The first thread runs before the record exists, or finds something else in RDI | The record is written, then the first thread starts with RDI holding its address; every other general-purpose register is zero (the first frame is built zeroed) | Planned: RDI read back in ring 3 |
+| P8 | A failed launch keeps the never-started child alive through its handle to itself, or leaks what its creator passed | A launch that fails after granting closes the child's table | Planned: a launch over 64 KiB is refused, and the leak check holds |
+| P9 | Arguments or environment take unbounded kernel or user memory | At most 64 handles and 64 KiB per record, checked before anything is mapped | Planned: host tests; the refused launch above |
+| P10 | DIRECTORY is a channel to whatever the creator chose | Intended: a creator decides what its child can reach (P1 of ADR-0005: no ambient authority). The service directory comes with S3-4 | **By design** |
 
 ## What must be closed
 
