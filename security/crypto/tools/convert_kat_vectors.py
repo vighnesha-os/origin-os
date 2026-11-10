@@ -3,22 +3,26 @@
 
 Inputs are the NIST ACVP-Server `internalProjection.json` files and Wycheproof's
 `ed25519_test.json`, at the pinned revisions and SHA-256 hashes in the tables below (owner
-decision 19, 2026-11-08). A file whose hash differs is refused. The tool keeps the vectors that
-apply to `origin-crypto`, counts the rest with the reason, and writes one text file per input.
+decision 19, 2026-11-08; the HMAC_DRBG set, owner decision 145, 2026-11-10). A file whose hash
+differs is refused. The tool keeps the vectors that apply to `origin-crypto`, counts the rest
+with the reason, and writes one text file per input.
 
 Applicability (each exclusion is recorded in the output header and pinned by the Rust tests):
 - SHA-3 and SHAKE messages that are not a whole number of bytes: `origin-crypto` has no
   bit-granular input, because everything Origin OS hashes is bytes.
 - ML-DSA-44, HashML-DSA and the internal interface (Verify_internal, external mu): the crate has
   none of them; Origin OS verifies pure ML-DSA-65 and ML-DSA-87 only (CLAUDE.md §59).
+- HMAC_DRBG over any hash but SHA-512: the crate's generator is over SHA-512 only (ADR-0016).
 
 SHAKE digests whose length is not a whole number of bytes ARE kept: squeezing whole bytes and
 truncating is exactly what those vectors test. The two ACVP revisions write the partial last byte
 differently (`tests/kat/hashes.rs`, `PartialByte`).
 
-Usage: python3 -I convert_kat_vectors.py RAW_DIR OUT_DIR
+Usage: python3 -I convert_kat_vectors.py RAW_DIR OUT_DIR [NAME ...]
   RAW_DIR  holds <ACVP set>/internalProjection.json and wycheproof/ed25519_test.json
   OUT_DIR  is security/crypto/tests/vectors
+  NAME     an output's name (`sha2-256`, `hmac-drbg-sha2-512`, `ed25519`, ...), to convert only
+           those; with none, every input is converted and every input must be there
 
 Standard library only. Host-only engineering tool: nothing here ships or runs in the build.
 """
@@ -31,6 +35,8 @@ from pathlib import Path
 # The date the conversion rules were last changed, so that re-running the tool reproduces the
 # committed files byte for byte. NIST's notice asks for the date of any change.
 CONVERTED = "2026-11-08"
+# The same, for the HMAC_DRBG set, which was added later.
+DRBG_CONVERTED = "2026-11-10"
 
 ACVP_URL = "https://github.com/usnistgov/ACVP-Server"
 ACVP_COMMIT = "975de31eb83d87039ec88934fdc47d8c312b892d"
@@ -61,6 +67,8 @@ SHAKE = [
 ]
 MLDSA = ("mldsa-sigver", "ML-DSA-sigVer-FIPS204",
          "47cdd6314c7f746d02421ffcba89d4dbc7bb875ac49e07a029fdfc26fba55437", 4533178)
+DRBG = ("hmac-drbg-sha2-512", "hmacDRBG-1.0",
+        "e448746775d602cf1e445f0d100601752fb33f29b1baad0915acd45f8f908e66", 1160048)
 WYCHEPROOF_ED25519 = ("ed25519_test.json",
                       "ea80ffebac085e21cb9d3e903e7fa2b448d96702da5b31f061d0b83b430b74b3", 172628)
 
@@ -93,14 +101,15 @@ def message_of(test: dict) -> str | None:
     return lower(test["msg"])
 
 
-def acvp_header(name: str, acvp_set: str, sha256: str, size: int, doc: dict) -> list[str]:
+def acvp_header(name: str, acvp_set: str, sha256: str, size: int, doc: dict,
+                converted: str = CONVERTED) -> list[str]:
     return [
         f"# NIST ACVP vectors: {doc['algorithm']}{' ' + doc['mode'] if 'mode' in doc else ''}, "
         f"revision {doc['revision']}, for origin-crypto's known-answer tests.",
         f"# Source: {ACVP_URL} commit {ACVP_COMMIT} ({ACVP_RELEASE}),",
         f"#   gen-val/json-files/{acvp_set}/internalProjection.json",
         f"#   SHA-256 {sha256}, {size} bytes, vsId {doc['vsId']}, isSample {doc['isSample']}.",
-        f"# Changed by Origin OS on {CONVERTED}: converted from JSON to these lines by",
+        f"# Changed by Origin OS on {converted}: converted from JSON to these lines by",
         "#   security/crypto/tools/convert_kat_vectors.py, keeping only the vectors that apply to",
         "#   origin-crypto; hex is lower-case and the empty string is `-`. Acknowledgement to NIST",
         "#   as the source, and NIST's notice: NOTICE.md beside this file.",
@@ -232,6 +241,65 @@ def convert_mldsa(name, acvp_set, sha256, size, raw, out):
     print(f"{name}: kept {kept}, excluded {excluded}")
 
 
+def convert_drbg(name, acvp_set, sha256, size, raw, out):
+    """HMAC_DRBG: the SHA2-512 groups. A vector is an instantiation and what is then asked of it.
+
+    NIST's test (draft-vassilev-acvp-drbg, Table 7) instantiates, reseeds where the group has no
+    prediction resistance, generates twice, and gives the second output as the answer. With
+    prediction resistance each generate request brings its own entropy input instead.
+    """
+    doc = load(raw / acvp_set / "internalProjection.json", sha256, size)
+    assert doc["algorithm"] == "hmacDRBG"
+    lines, kept, excluded = [], {"pr": 0, "reseed": 0}, 0
+    for group in doc["testGroups"]:
+        tests = group["tests"]
+        if group["mode"] != "SHA2-512":
+            excluded += len(tests)
+            continue
+        assert group["testType"] == "AFT" and not group["derFunc"] and group["reSeed"], group["tgId"]
+        kind = "pr" if group["predResistance"] else "reseed"
+        uses = ["generate", "generate"] if kind == "pr" else ["reSeed", "generate", "generate"]
+        bits = {
+            "entropyInput": group["entropyInputLen"],
+            "nonce": group["nonceLen"],
+            "persoString": group["persoStringLen"],
+            "returnedBits": group["returnedBitsLen"],
+        }
+        assert all(length % 8 == 0 for length in bits.values()), group["tgId"]
+        for test in tests:
+            tc = test["tcId"]
+            assert all(len(test[field]) * 4 == length for field, length in bits.items()), tc
+            assert [other["intendedUse"] for other in test["otherInput"]] == uses, tc
+            lines.append(
+                f"drbg {tc} {kind} {lower(test['entropyInput'])} {lower(test['nonce'])} "
+                f"{lower(test['persoString'])} {lower(test['returnedBits'])}"
+            )
+            for other in test["otherInput"]:
+                assert len(other["additionalInput"]) * 4 == group["additionalInputLen"], tc
+                fresh = other["intendedUse"] == "reSeed" or kind == "pr"
+                assert len(other["entropyInput"]) * 4 == (group["entropyInputLen"] if fresh else 0), tc
+                use = "reseed" if other["intendedUse"] == "reSeed" else "generate"
+                lines.append(
+                    f"in {use} {lower(other['entropyInput'])} {lower(other['additionalInput'])}"
+                )
+            kept[kind] += 1
+    header = acvp_header(name, acvp_set, sha256, size, doc, DRBG_CONVERTED) + [
+        f"# Kept: the SHA2-512 groups: {kept['pr']} vectors with prediction resistance and "
+        f"{kept['reseed']} with a reseed.",
+        f"# Excluded: {excluded} vectors over the other ten hash functions, which the crate's "
+        "generator is not built on.",
+        "# A vector: instantiate; do each `in` line in order; the last request's output is the answer.",
+        "#   in reseed <e> <a>     reseed with entropy input e and additional input a",
+        "#   in generate - <a>     request as many bytes as the answer has, with additional input a",
+        "#   in generate <e> <a>   the same with prediction resistance: reseed with e and a, then",
+        "#                         request with no additional input (SP 800-90A 9.3.1, step 7)",
+        "# Lines: drbg <tcId> <pr|reseed> <entropy input> <nonce> <personalization string> <answer>",
+        "#        in <reseed|generate> <entropy input> <additional input>",
+    ]
+    write(out / "acvp" / f"{name}.txt", header + lines)
+    print(f"{name}: kept {kept}, excluded {excluded}")
+
+
 def convert_wycheproof(raw, out):
     file_name, sha256, size = WYCHEPROOF_ED25519
     doc = load(raw / "wycheproof" / file_name, sha256, size)
@@ -272,15 +340,19 @@ def write(path: Path, lines: list[str]) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 3:
-        sys.exit(f"usage: {sys.argv[0]} RAW_DIR OUT_DIR")
-    raw, out = Path(sys.argv[1]), Path(sys.argv[2])
-    for entry in FIXED_OUTPUT:
-        convert_fixed(*entry, raw, out)
-    for entry in SHAKE:
-        convert_shake(*entry, raw, out)
-    convert_mldsa(*MLDSA, raw, out)
-    convert_wycheproof(raw, out)
+    if len(sys.argv) < 3:
+        sys.exit(f"usage: {sys.argv[0]} RAW_DIR OUT_DIR [NAME ...]")
+    raw, out, only = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3:]
+    jobs = [(entry[0], convert_fixed, entry) for entry in FIXED_OUTPUT]
+    jobs += [(entry[0], convert_shake, entry) for entry in SHAKE]
+    jobs += [(MLDSA[0], convert_mldsa, MLDSA), (DRBG[0], convert_drbg, DRBG)]
+    jobs.append(("ed25519", convert_wycheproof, ()))
+    unknown = [name for name in only if name not in [job[0] for job in jobs]]
+    if unknown:
+        sys.exit(f"no such output: {', '.join(unknown)}")
+    for name, convert, entry in jobs:
+        if not only or name in only:
+            convert(*entry, raw, out)
 
 
 if __name__ == "__main__":

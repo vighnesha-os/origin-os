@@ -274,7 +274,7 @@ The Refuse list costs a stricter boot on real machines than the proofs had befor
 
 Each consumer refuses when a draw fails. None of them sees what the proof checks: a source that is stuck but still reports success.
 
-**The decision.** When the kernel's random-number generator lands (CLAUDE.md §59), "hardware entropy" becomes a Withdraw row. What is withheld is randomness. With no healthy seed, nothing is launched and nothing is placed at a random address. The generator's ADR decides the health tests that replace today's proof.
+**The decision.** When the kernel's random-number generator lands (CLAUDE.md §59), "hardware entropy" becomes a Withdraw row. What is withheld is randomness. With no healthy seed, nothing is launched and nothing is placed at a random address. The generator's ADR decides the health tests that replace today's proof. *(2026-11-10: it is ADR-0016, accepted by the owner the same day. Its R4 gives the tests and its R8 what this row withholds. Still not built: task 18b.)*
 
 **Alternatives.**
 

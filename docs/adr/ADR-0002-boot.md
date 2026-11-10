@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Status | **Accepted** on 2026-11-07, under the owner's instruction of 2026-11-07 to finalise the design with the recommended options (B1–B8 as written, boot info 0.3, and B7 as decided below). B7's default was changed by Amendment 1, accepted by the owner on 2026-11-10 (decision sheet item 78). |
-| Date | 2026-11-07; Amendment 1 2026-11-10 |
+| Date | 2026-11-07; Amendment 1 2026-11-10; boot info 0.6 accepted 2026-11-10 (B4; not built) |
 | Owner decisions still open | None. B7, carried over from ADR-0001, was decided on 2026-11-07 and amended on 2026-11-10. |
 | Implements | CLAUDE.md §19 (UEFI boot chain), §20 (boot manager, later), §58 (Secure Boot), ONBF §8.1 (chain of trust) |
 | Code | `boot/info` (`origin-boot-info`), `boot/uefi` (`origin-boot-uefi`), `framekernel/`, `developer-tools/onbf-pack` |
@@ -52,6 +52,8 @@ Memory types:
 *0.4 (2026-11-08, ADR-0010 E1, **accepted by the owner on 2026-11-08**, CLAUDE.md §84):* the firmware's framebuffer is appended (48 bytes, `size` 176): physical base, size, the virtual address the loader mapped it at, width, height, stride and the channel masks of a 32-bit pixel, or all zero if there is none. A missing or unusable framebuffer never stops the boot. `origin-version.toml` carries 0.4 on the branch that implements it.
 
 *0.5 (2026-11-09, **accepted by the owner on 2026-11-09**, decision sheet item 69, CLAUDE.md §84):* two region kinds, `SpecificPurpose` (14) and `HotPluggable` (15). The loader gives them to conventional memory (type 7) whose descriptor carries `EFI_MEMORY_SP` (UEFI 2.8: memory set aside for one purpose, such as high-bandwidth or CXL-attached memory) or `EFI_MEMORY_HOT_PLUGGABLE` (UEFI 2.11: memory that can be removed while the machine runs); specific-purpose wins when both are set. The kernel allocates from neither and does not direct-map them, so neither reaches general use until the kernel can manage it. Other types keep the kind their type gives, since the kernel uses no other type as general RAM yet; when it reclaims `LoaderReclaimable` memory, that reclaim must consult the same attributes. Research: `docs/research/2026-11-09-uefi-2.8-to-2.11.md`.
+
+*0.6 (2026-11-10, **accepted by the owner on 2026-11-10**, decision sheet item 147, CLAUDE.md §84; **not built**):* one field is appended, `boot_seed`, a `u64`: the physical address of 64 bytes inside the region that holds the boot info, or 0 when the loader has none to give (`size` 184). The bytes are secret: output of the loader's own random-number generator, for the kernel's to take as extra input. The kernel checks they lie inside the boot-info region, takes them, and overwrites them before another processor starts. Neither side prints them. They are given by address because `BootInfo` is copied and printed. The decision and its reasons are ADR-0016 R10; `origin-version.toml` stays at 0.5 until task 18b builds it.
 
 `origin-boot-info` defines the structure, at version 0.2 (`origin-version.toml [compatibility] boot-info`); major 0 means unstable, so the kernel accepts only its exact version. It contains:
 - a magic number, the version and the structure's size;
