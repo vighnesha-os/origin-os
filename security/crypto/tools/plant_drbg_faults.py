@@ -4,7 +4,9 @@
 A check of the tests, not of the code (CLAUDE.md §72): each entry of FAULTS is a small wrong
 edit, a step left out, a constant changed, a check dropped. The script makes the edit, runs the
 HMAC and HMAC_DRBG tests, puts the file back, and reports which tests failed. A fault is caught
-when a test fails or the crate no longer compiles.
+when a test fails or the crate no longer compiles. The tests are the crate's own and, apart from
+them, NIST's vectors for the generator (`tests/kat`), so the report also says which faults NIST's
+answers catch by themselves.
 
 Two faults at the end cannot be caught and are listed to say so: leaving a stack buffer
 un-overwritten changes nothing a test in safe code can observe. That those overwrites are in
@@ -89,12 +91,17 @@ FAULTS = [
 ]
 
 def run():
-    r = subprocess.run(["cargo", "test", "-j", "2", "--quiet", "--package", "origin-crypto", "--lib", "hmac"],
-                       cwd=ROOT, capture_output=True, text=True)
-    out = r.stdout + r.stderr
-    failed = sorted(set(re.findall(r"^test (tests_\S+) \.\.\. FAILED", out, re.M)) | set(re.findall(r"^---- (tests_\S+) stdout ----", out, re.M)))
-    compile_error = "error[" in out or "error: could not compile" in out
-    return r.returncode, failed, compile_error
+    """The crate's HMAC and HMAC_DRBG tests, then NIST's vectors for the generator."""
+    code, failed, compile_error = 0, set(), False
+    for selection in (["--lib", "hmac"], ["--test", "kat", "drbg"]):
+        r = subprocess.run(["cargo", "test", "-j", "2", "--quiet", "--package", "origin-crypto", *selection],
+                           cwd=ROOT, capture_output=True, text=True)
+        out = r.stdout + r.stderr
+        failed |= set(re.findall(r"^test (\S+) \.\.\. FAILED", out, re.M))
+        failed |= set(re.findall(r"^---- (\S+) stdout ----", out, re.M))
+        compile_error |= "error[" in out or "error: could not compile" in out
+        code |= r.returncode
+    return code, sorted(failed), compile_error
 
 originals = {f: (SRC / f).read_text() for f in (H, D, S, W, B)}
 try:
@@ -102,7 +109,7 @@ try:
     if code != 0:
         sys.exit(f"the unmodified tree does not pass: {failed}")
     print("baseline: passes", flush=True)
-    caught = 0
+    caught = by_nist = 0
     for n, (name, edits) in enumerate(FAULTS, 1):
         try:
             for f, old, new in edits:
@@ -119,9 +126,14 @@ try:
         elif compile_error and not failed:
             verdict = "caught: does not compile"; caught += 1
         else:
-            verdict = f"caught by {len(failed)} test(s): " + ", ".join(t.split('::')[-1] for t in failed[:4]) + (" ..." if len(failed) > 4 else ""); caught += 1
+            nist = any(t.startswith("drbg::") for t in failed)
+            own = [t.split("::")[-1] for t in failed if not t.startswith("drbg::")]
+            verdict = f"caught by {len(own)} of the crate's test(s)" + (": " + ", ".join(own[:4]) if own else "")
+            verdict += (" ..." if len(own) > 4 else "") + ("; and by NIST's vectors" if nist else "")
+            caught += 1
+            by_nist += nist
         print(f"{n:2}. {name}: {verdict}", flush=True)
-    print(f"{caught} of {len(FAULTS)} caught", flush=True)
+    print(f"{caught} of {len(FAULTS)} caught; NIST's vectors alone catch {by_nist}", flush=True)
 finally:
     for f, text in originals.items():
         (SRC / f).write_text(text)
