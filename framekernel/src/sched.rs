@@ -1035,20 +1035,36 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     }
     crate::tlb::mark_online();
     timer::start_periodic(&lapic);
-    // The first thread's guard page must be unmapped.
+    // The first thread's guard page must be unmapped. It is in the kernel stacks' region, so
+    // these lines name neither it nor anything else there (ADR-0004 Amendment 2, A6.3).
     let guard = FIRST_GUARD.load(Ordering::Relaxed);
     match cpu::probe_read(guard) {
         cpu::Probe::Faulted { error: 0, address } if address == guard => {
             let _ = writeln!(
                 com1,
-                "origin-kernel: page protection: stack guard page at {guard:#x} faulted (#PF error 0x0)"
+                "origin-kernel: page protection: the first thread's stack guard page faulted (#PF error 0x0)"
             );
         }
         other => {
-            let _ = writeln!(
-                com1,
-                "origin-kernel: page protection violated: stack guard page at {guard:#x}: {other:?}"
-            );
+            let _ = match other {
+                cpu::Probe::Faulted { error, address } => writeln!(
+                    com1,
+                    "origin-kernel: page protection violated: the first thread's stack guard page faulted with #PF error {error:#x}{}",
+                    if address == guard {
+                        ""
+                    } else {
+                        ", at another address"
+                    }
+                ),
+                cpu::Probe::Completed => writeln!(
+                    com1,
+                    "origin-kernel: page protection violated: the first thread's stack guard page was read"
+                ),
+                cpu::Probe::Refused => writeln!(
+                    com1,
+                    "origin-kernel: page protection violated: the first thread's stack guard page is in a device window"
+                ),
+            };
             proofs.record(Proof::Preemption, false);
             return;
         }

@@ -24,7 +24,7 @@ use origin_frame::stack::{self, GuardedStack};
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, Probe, rdtsc};
 use crate::paging::PAGE;
-use crate::paging::layout::{STACK_REGION, STACK_REGION_SIZE};
+use crate::paging::layout::{self, STACK_REGION_SIZE};
 
 /// Stacks the cost measurement makes, then frees.
 const ROUNDS: usize = 64;
@@ -60,8 +60,9 @@ fn stack_page(addr: u64) -> bool {
 fn guarded(stack: &GuardedStack) -> (bool, u32) {
     let top = stack.top();
     let low = top - stack.bytes() as u64;
-    let placed = stack.slot_base() >= STACK_REGION
-        && top <= STACK_REGION + STACK_REGION_SIZE
+    let base = stack::region().base;
+    let placed = stack.slot_base() >= base
+        && top <= base + STACK_REGION_SIZE
         && top - stack.slot_base() == stack::SLOT;
     let below = [stack.guard_addr(), stack.slot_base(), top]
         .into_iter()
@@ -69,6 +70,36 @@ fn guarded(stack: &GuardedStack) -> (bool, u32) {
         .count() as u32;
     let pages = (low..top).step_by(PAGE as usize).all(stack_page);
     (placed && pages, below)
+}
+
+/// The region's slide (ADR-0004 Amendment 2): its base is one the slide can give,
+/// 2 MiB-aligned with the whole region in PML4 slots 384–447. On a processor with RDSEED or
+/// RDRAND it was drawn, and so is not the fixed base, which a draw never gives; on one with
+/// neither, it is the fixed base. Nothing it prints names the base or an address in the region
+/// (A6).
+fn placed_at_random(com1: &mut Console) -> bool {
+    let region = stack::region();
+    let features = crate::features::Features::decode(&cpu::gather_cpuid());
+    let in_window = layout::is_stack_region_base(region.base);
+    let fixed = region.base == layout::STACK_REGION;
+    let right = in_window
+        && match region.drawn {
+            Some(_) => !fixed,
+            None => !features.rdseed && !features.rdrand && fixed,
+        };
+    let verdict = if right { "" } else { ": kernel stacks failed" };
+    let _ = match region.drawn {
+        Some(entropy) => writeln!(
+            com1,
+            "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: {in_window}; drawn from the processor's entropy, so not its fixed base: {} ({entropy:?}){verdict}",
+            !fixed
+        ),
+        None => writeln!(
+            com1,
+            "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: {in_window}; no entropy from RDSEED or RDRAND, and the region is at its fixed base: {fixed}{verdict}"
+        ),
+    };
+    right
 }
 
 /// The guard proof for an application processor's interrupt stacks, as its TSS names them:
@@ -147,6 +178,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
     settle(tsc_hz);
     let before = stack::counts();
     let mut ok = true;
+
+    // Where the region is, said without its base.
+    ok &= placed_at_random(com1);
 
     // The guards.
     let mut placed = true;

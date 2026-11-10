@@ -1287,9 +1287,14 @@ fn prove_nmi_ist(com1: &mut Console, tsc_hz: u64) -> NmiProof {
     }
     let (low, high) = cpu::bsp_nmi_stack();
     let on_own_stack = (low..high).contains(&frame);
+    // The boot processor's interrupt stacks are in the kernel image, so these are image
+    // offsets: no base is printed (ADR-0004 Amendment 2, A6.2).
     let _ = writeln!(
         com1,
-        "origin-kernel: NMI taken on its own stack (IST2): frame at {frame:#x}, stack {low:#x}..{high:#x}{}",
+        "origin-kernel: NMI taken on its own stack (IST2): frame at {}, stack {}..{}{}",
+        crate::phys::told(frame),
+        crate::phys::told(low),
+        crate::phys::told(high),
         if on_own_stack {
             ""
         } else {
@@ -1311,10 +1316,16 @@ fn panic(info: &PanicInfo) -> ! {
         let _ = report::write_panic(&mut out, info);
         let mut frames = [0u64; 16];
         let n = cpu::capture_backtrace(&mut frames);
-        let base = crate::phys::kernel_virtual_base();
-        let _ = write!(out, "origin-kernel: backtrace (kernel base {base:#x}):");
-        for addr in frames.iter().take(n) {
-            let _ = write!(out, " {addr:#x}");
+        // As image offsets, which are what a symbol table needs; the base is never printed, in
+        // any mode (ADR-0004 Amendment 2, A6.2).
+        let _ = write!(out, "origin-kernel: backtrace:");
+        for (i, &addr) in frames.iter().take(n).enumerate() {
+            let _ = write!(
+                out,
+                "{} {}",
+                if i == 0 { "" } else { "," },
+                crate::phys::told(addr)
+            );
         }
         let _ = writeln!(out);
     }

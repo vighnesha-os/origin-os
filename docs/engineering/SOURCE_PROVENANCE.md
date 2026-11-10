@@ -3132,3 +3132,79 @@ Multi-fault soak: see "Seeded multi-fault mutation soaks over the ONBF parsers" 
 - **Not proven:** a stall on real hardware, or in a boot (no boot can stall a processor on purpose): the stall paths are modelled and host-tested only. Beyond the Loom models' bounds: two rounds, one processor in the space. `map_shared_run`'s path for corrupt tables is not exercised.
 - **Review:** the coordinating session's review found A–C. No human has reviewed this code.
 - **Licensing:** MIT OR Apache-2.0.
+
+## The kernel stacks' region at a random base, and no slide printed (ADR-0004 Amendment 2, A4–A6; 2026-11-10)
+
+- **What:** on `claude/stack-slide`, from `land/s3-part2` at `cdf4ed9`.
+  - `40a013b` **`Counts::pages`.** Its comment now says what it counts: the pages mapped in the region. A slot lost by `leak` stays mapped and counted; one lost by a stalled reclaim does not. This answers an observation in the coordinating session's review of H2-stacks. A host test pins it.
+  - `79b91d0` **The window and the draw.** `origin_paging::layout` gains:
+    - `STACK_WINDOW` (PML4 slots 384–447);
+    - `stack_region_base(random)`: 2 MiB-aligned, the whole region in the window, about 2^24 placements, never the fixed base `STACK_REGION`, which is kept for a boot without entropy;
+    - `is_stack_region_base`;
+    - `STACK_REGION_TABLES` of 130, because a slid region may cross a 1 GiB boundary.
+  - `72e56a7` **The base drawn at boot (A4, A5).** `early::build_kernel_tables` draws the base through `stack::draw_region`: RDSEED with 64 tries, else RDRAND with 16, as the loader does for H3; with neither, the fixed base. It makes the region's tables there, and only then places it (`stack::place`).
+    - Every slot address, `vm`'s region check and the backtrace's slot top follow the drawn base.
+    - The boot says what drew it, never the base.
+    - The kernel stacks proof gains a first line that checks the base and prints only true or false.
+  - `e52be7e` **The guard probe's line (A6.3).** It names no address, and the early marker list matches.
+  - `420c1fd`, `ad8c869` **Offsets in crash reports (A6.2).**
+    - `origin_paging::layout::tell` gives an address as an offset from the base of the sliding window it is in (image, stack region, direct map), or as itself in none.
+    - It formats nothing: the no-panic check of `origin-paging` forbids formatting (ONBF §12). `Bases`' `Debug` writes `Bases { .. }` through `write_str` only.
+    - The framework prints a told address (`origin_frame::told::Shown`, host-tested), and `phys::told` tells against the live bases.
+    - The exception report (`rip`, `rsp`, the general registers), the panic backtrace and the NMI line use it. The panic handler no longer prints the kernel base. The breakpoint's and the NMI's markers expect `image +0x`.
+  - `b489a5a` **xtask's scan (A6.3).** Every boot test fails on any number in the stack window anywhere in its serial log.
+  - `9f882e8` **Placements across boots (A6.4).**
+    - The framework keeps the placed base in one word, `stack::STACK_REGION_BASE`.
+    - After each full kernel boot, xtask reads that word through QEMU's monitor (`xp`). Its physical address is the kernel's physical base, from its boot line, plus the symbol's RVA from a small ELF symbol-table reader.
+    - xtask accepts only a base a draw can give, and records it in `target/xtask/stack-region-bases`.
+    - `boot-matrix` fails as soon as two of its boots placed the region alike, and at the end requires at least two. It prints how many, never a base.
+- **The owner's decisions it follows:** ADR-0004 Amendment 2, A4–A6, and its notes A6.1–A6.4 (decision sheet items 144, 157–160):
+  - A6.1: there is no developer mode, so nothing is printed.
+  - A6.2: offsets in crash reports, in every mode; the image part too.
+  - A6.3: no region base or address in the boot log, during boot either. The boot report's lines for the image's and the direct map's bases during boot stay, as H3 permits.
+  - A6.4: the evidence is a host test of the draw, the in-boot true-or-false line, a forced boot without entropy and controls; the monitor read across the matrix in addition.
+- **One reading the decisions left to me, flagged for the coordinator:** the direct map's addresses are also printed as offsets ("direct map +0x…", which is the physical address), beside the image's and the region's that A6.2 names. The general registers in the exception report go through the same telling as `rip` and `rsp`, since any of them may hold an address.
+- **Soundness of the new and changed safe interfaces:** by reading each against "no safe caller can break memory safety through it". The author's reasoning, not an independent review.
+  - The base is placed once, with its tables made, before any stack exists. So every stack address agrees with the tables made for it. `draw_region` and `place` are crate-private.
+  - `phys::told` reads only atomics, so an exception handler may call it whatever lock the interrupted code holds.
+- **`unsafe`:** none new. The gate counts 311 sites.
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-10. Original code; no third-party source was read or copied (§3).
+- **Specifications:** ADR-0004 H3 and Amendment 2; QEMU 11.1's monitor command `xp`, as it answers on this machine; RDSEED and RDRAND as `cpu.rs` cites them (Intel SDM), not re-read.
+- **Dependencies:** none new.
+- **Toolchain:** Rust 1.99.1 (stable, edition 2024), QEMU 11.1.3 (TCG) + OVMF.
+- **Test evidence:**
+  - **Each commit on its own**, in a scratch worktree: rustfmt; clippy for the host and the kernel target, and UEFI for `origin-sync` and `origin-paging`; the kernel's release build; the host tests. Each commit that changes what the kernel prints or does boots the kernel scenario on 2 processors, 58 of 58.
+  - **Host tests:**
+    - the draw: 10,004 values in the window, 2 MiB-aligned, never the fixed base, more than 9,990 distinct;
+    - 129 tables at the fixed base and 130 across a GiB boundary;
+    - `tell`;
+    - `Counts::pages`;
+    - xtask's scan, ELF reader, monitor answer and cross-boot comparison.
+  - **Boot controls**, each caught on its first run (ADR-0013 C30–C34):
+    - C30: a draw that always gives the fixed base;
+    - C31: a drawn base recorded as undrawn;
+    - C32: the guard's address printed again, caught by the scan;
+    - C33: `rip` printed as an address;
+    - C34: one base for every boot, caught by `boot-matrix` after its second run.
+  - **Host-test controls:**
+    - H1: a draw that can give the fixed base;
+    - H2: placements past the window's end, caught by the window check;
+    - H3: 129 tables.
+  - **A forced boot without RDSEED or RDRAND** (`ORIGIN_QEMU_CPU=max,-rdrand,-rdseed`):
+    - the loader says `no entropy source: fixed placement`;
+    - the kernel says `kernel stacks: no entropy from RDSEED or RDRAND: the region is at its fixed base`, with no address;
+    - the boot is then refused by the start-record proof, whose records need entropy for their random addresses (ADR-0005 C4), so the stacks proof never runs;
+    - the log names no stack-window address.
+  - **Gates at the code tip `9f882e8`:**
+    - `cargo xtask check` passed on a byte-identical tree, before the last history rebuild only moved the same changes into the commits that introduced them: 1,243 test results, 0 failed, 8 ignored, the 42 Loom models' run among them; the no-panic check (`origin-paging` references 2 external symbols, both allowed); the unsafe gate (311 sites, 152 kernel source files); Loom, all 42 models passed and all 68 controls were caught (98 runs).
+    - `cargo xtask boot-test` passed, 11 of 11 scenarios. Its kernel boot ended `58 of 58`, with the breakpoint's and the NMI's lines as image offsets and the slide's lines naming no base. `cargo xtask boot-matrix` passed on its first attempt: all 18 full boots `58 of 58`. In the 11 whose console shares QEMU's stdio with the monitor, xtask read the region's base after the boot and found 11 distinct bases, none printed.
+  - **Defects the gates found, each fixed in the commit that introduced it** (the branch is local, so its history was rebuilt rather than patched):
+    - The first `cargo xtask check` at the tip failed `origin-paging`'s no-panic check. `Told`'s `Display` and a `Debug` for `Bases` built with `debug_struct` pulled in `core::fmt`. The printing moved to the framework (`told.rs`).
+    - Clippy then refused `Bases` without `Debug` (`missing_debug_implementations`). It now has one that writes only through `write_str`.
+    - Before the first commit of A6.4, the monitor read timed out. QEMU 11.1 prints `xp`'s address with 8 digits below 4 GiB, where 16 were expected. The answer is now matched by the address's value, and a unit test pins QEMU's form.
+- **Not proven:**
+  - physical hardware;
+  - a boot without entropy that runs past `process start`;
+  - that QEMU's monitor answers the same way in CI's QEMU, which the matrix there will show.
+- **Review:** none yet. No human has reviewed this code.
+- **Licensing:** MIT OR Apache-2.0.

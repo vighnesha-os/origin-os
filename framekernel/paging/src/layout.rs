@@ -46,24 +46,127 @@ pub const KERNEL_ALIGN: u64 = LARGE_PAGE;
 pub const FRAMEBUFFER_WINDOW: u64 = 0xFFFF_E000_0000_0000;
 /// Size of the framebuffer window. Device registers are mapped above it.
 pub const FRAMEBUFFER_WINDOW_SIZE: u64 = 2 << 30;
-/// Start of the kernel stacks' region (ADR-0004 H2, Amendment 1 A2): PML4 slot 384, where the
-/// direct-map window ends. Each stack is mapped there with unmapped space below it, so a guard
-/// costs no frame and splits no page of the direct map. [`build`] maps nothing there.
-pub const STACK_REGION: u64 = 0xFFFF_C000_0000_0000;
-/// The part of the stack region the kernel uses: 256 MiB, every page of it covered by page
+/// Start of the window the kernel stacks' region slides in (ADR-0004 Amendment 2, A4): PML4
+/// slot 384, where the direct-map window ends.
+pub const STACK_WINDOW: u64 = 0xFFFF_C000_0000_0000;
+/// Size of that window: PML4 slots 384–447, the 32 TiB below the MMIO windows.
+pub const STACK_WINDOW_SIZE: u64 = 64 << PDPT_SHIFT;
+/// Where the kernel stacks' region is without entropy (ADR-0004 Amendment 1 A2, Amendment 2
+/// A5): the start of its window. Each stack is mapped in the region with unmapped space below
+/// it, so a guard costs no frame and splits no page of the direct map. [`build`] maps nothing
+/// there.
+pub const STACK_REGION: u64 = STACK_WINDOW;
+/// The part of the stack window the region takes: 256 MiB, every page of it covered by page
 /// tables made at boot ([`STACK_REGION_TABLES`]).
 pub const STACK_REGION_SIZE: u64 = 256 << 20;
 /// The tables the stack region's leaves need, made once at boot
-/// (`AddressSpace::reserve_tables`): a page table per 2 MiB and a page directory per GiB. Its
-/// PDPT is one of the kernel half's ([`KERNEL_HALF_SLOTS`]).
+/// (`AddressSpace::reserve_tables`): a page table per 2 MiB and a page directory per GiB it
+/// touches, which is one more than its size in GiB, because a region at 2 MiB alignment may
+/// cross a 1 GiB boundary (Amendment 2). Its PDPTs are the kernel half's
+/// ([`KERNEL_HALF_SLOTS`]).
 pub const STACK_REGION_TABLES: u64 =
-    STACK_REGION_SIZE / LARGE_PAGE + STACK_REGION_SIZE.div_ceil(1 << GIB_SHIFT);
+    STACK_REGION_SIZE / LARGE_PAGE + STACK_REGION_SIZE.div_ceil(1 << GIB_SHIFT) + 1;
+/// The bases a draw can give the stack region: every 2 MiB step with the whole region in its
+/// window but the window's start, which is the fixed base and so says that no entropy was
+/// drawn. About 2^24 of them.
+pub const STACK_PLACEMENTS: u64 = (STACK_WINDOW_SIZE - STACK_REGION_SIZE) / LARGE_PAGE;
 const _: () = assert!(
-    STACK_REGION == DIRECT_MAP_WINDOW + DIRECT_MAP_WINDOW_SIZE
-        && STACK_REGION + STACK_REGION_SIZE <= FRAMEBUFFER_WINDOW
-        && STACK_REGION_SIZE.is_multiple_of(LARGE_PAGE),
-    "the stack region lies between the direct-map window and the MMIO window"
+    STACK_WINDOW == DIRECT_MAP_WINDOW + DIRECT_MAP_WINDOW_SIZE
+        && STACK_WINDOW + STACK_WINDOW_SIZE == FRAMEBUFFER_WINDOW
+        && STACK_REGION_SIZE.is_multiple_of(LARGE_PAGE)
+        && STACK_REGION_SIZE <= STACK_WINDOW_SIZE,
+    "the stack window lies between the direct-map window and the MMIO window"
 );
+
+/// The stack region's base for `random`, 64 bits of hardware entropy (ADR-0004 Amendment 2,
+/// A4): 2 MiB-aligned, with the whole region in the stack window, and never the fixed base.
+/// Not printed after boot (A6).
+pub const fn stack_region_base(random: u64) -> u64 {
+    STACK_WINDOW + (1 + random % STACK_PLACEMENTS) * LARGE_PAGE
+}
+
+/// The bases of the windows that slide (H3; Amendment 2): what a crash report tells an address
+/// against, so that it prints offsets and never a base (ADR-0004 Amendment 2, A6.2). Its `Debug`
+/// shows none of them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Bases {
+    /// The kernel image's virtual base.
+    pub image: u64,
+    /// The direct map's base: the virtual address of physical 0.
+    pub direct_map: u64,
+    /// The kernel stacks' region's base.
+    pub stack_region: u64,
+}
+
+/// Names no base (A6.2), and writes only through `Formatter::write_str`, which this crate's
+/// no-panic check allows (ONBF §12).
+impl core::fmt::Debug for Bases {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Bases { .. }")
+    }
+}
+
+/// How far an address is from a base, and on which side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Offset {
+    /// The address is below the base.
+    pub below: bool,
+    /// By how many bytes.
+    pub by: u64,
+}
+
+impl Offset {
+    const fn between(addr: u64, base: u64) -> Self {
+        if addr >= base {
+            Self {
+                below: false,
+                by: addr - base,
+            }
+        } else {
+            Self {
+                below: true,
+                by: base - addr,
+            }
+        }
+    }
+}
+
+/// An address as a crash report prints it (ADR-0004 Amendment 2, A6.2): its offset from the
+/// base of the sliding window it is in, or the address itself when it is in none, which then
+/// gives no base away. The framework prints it (`origin_frame::told`); this crate does no
+/// formatting, which its no-panic check forbids (ONBF §12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Told {
+    /// In the kernel image's window: from the image's base.
+    Image(Offset),
+    /// In the kernel stacks' window: from the region's base.
+    StackRegion(Offset),
+    /// In the direct map's window: from its base, which makes it the physical address.
+    DirectMap(Offset),
+    /// In no sliding window: the address.
+    Address(u64),
+}
+
+/// Tells `addr` against `bases` (A6.2).
+pub const fn tell(addr: u64, bases: &Bases) -> Told {
+    if addr >= KERNEL_WINDOW {
+        Told::Image(Offset::between(addr, bases.image))
+    } else if addr >= STACK_WINDOW && addr - STACK_WINDOW < STACK_WINDOW_SIZE {
+        Told::StackRegion(Offset::between(addr, bases.stack_region))
+    } else if addr >= DIRECT_MAP_WINDOW && addr - DIRECT_MAP_WINDOW < DIRECT_MAP_WINDOW_SIZE {
+        Told::DirectMap(Offset::between(addr, bases.direct_map))
+    } else {
+        Told::Address(addr)
+    }
+}
+
+/// Whether `base` is a base the stack region can have: 2 MiB-aligned, with the whole region in
+/// the stack window.
+pub const fn is_stack_region_base(base: u64) -> bool {
+    base >= STACK_WINDOW
+        && base.is_multiple_of(LARGE_PAGE)
+        && base - STACK_WINDOW <= STACK_WINDOW_SIZE - STACK_REGION_SIZE
+}
 /// Tables the kernel half's top level can take (ADR-0004 H2): one for each of PML4 entries
 /// 256–511. [`AddressSpace::reserve_upper_half`] makes the ones [`build`] did not.
 pub const KERNEL_HALF_SLOTS: u64 = (crate::ENTRIES / 2) as u64;
@@ -679,30 +782,145 @@ mod tests {
 
     #[test]
     fn the_stack_region_is_a_slot_of_its_own_whose_tables_are_counted() {
-        assert_eq!((STACK_REGION >> 39) & 0x1FF, 384, "PML4 slot 384");
-        assert_eq!(STACK_REGION_TABLES, 128 + 1);
+        assert_eq!((STACK_WINDOW >> 39) & 0x1FF, 384, "PML4 slot 384");
+        assert_eq!(((STACK_WINDOW + STACK_WINDOW_SIZE - 1) >> 39) & 0x1FF, 447);
+        assert_eq!(STACK_REGION_TABLES, 128 + 2);
         // The kernel's order (`early`): its tables, the kernel half's top-level entries, then
-        // the stack region's tables, exactly as many as counted, with nothing mapped there.
-        let tables = pool(64 + KERNEL_HALF_SLOTS as usize + STACK_REGION_TABLES as usize);
-        let mut mem = TablePool::new(&tables, POOL_BASE);
-        let (mut space, _) = build(&mut mem, &at(), &regions(), &segments()).unwrap();
-        space.reserve_upper_half(&mut mem).unwrap();
-        let before = mem.used();
+        // the stack region's tables, never more than counted, with nothing mapped there. At
+        // its fixed base the region lies in one GiB; across a GiB boundary it takes them all.
+        let across = STACK_WINDOW + (1 << GIB_SHIFT) - LARGE_PAGE;
+        for (base, made) in [
+            (STACK_REGION, STACK_REGION_TABLES - 1),
+            (across, STACK_REGION_TABLES),
+        ] {
+            assert!(is_stack_region_base(base));
+            let tables = pool(64 + KERNEL_HALF_SLOTS as usize + STACK_REGION_TABLES as usize);
+            let mut mem = TablePool::new(&tables, POOL_BASE);
+            let (mut space, _) = build(&mut mem, &at(), &regions(), &segments()).unwrap();
+            space.reserve_upper_half(&mut mem).unwrap();
+            let before = mem.used();
+            assert_eq!(
+                space.reserve_tables(&mut mem, base, STACK_REGION_SIZE),
+                Ok(made as u32)
+            );
+            assert_eq!(mem.used() - before, made as usize);
+            assert_eq!(
+                space.leaf_sizes(&mem, base, base + STACK_REGION_SIZE),
+                crate::LeafSizes::default()
+            );
+            // The direct map is all the build put in its window.
+            let direct = space.leaf_sizes(
+                &mem,
+                DIRECT_MAP_WINDOW,
+                DIRECT_MAP_WINDOW + DIRECT_MAP_WINDOW_SIZE,
+            );
+            assert!(direct.small > 0 && direct.large > 0, "{direct:?}");
+        }
+    }
+
+    /// ADR-0004 Amendment 2, A6.2: a crash report tells an address in a sliding window as its
+    /// offset from that window's base, above or below it, and any other address as itself
+    /// (`origin_frame::told` prints it).
+    #[test]
+    fn a_crash_report_tells_addresses_as_offsets_from_the_bases() {
+        let bases = Bases {
+            image: KERNEL_WINDOW + 0x60_0000,
+            direct_map: DIRECT_MAP_WINDOW + (7 << 30),
+            stack_region: stack_region_base(0x1234_5678),
+        };
+        let told = |addr: u64| tell(addr, &bases);
+        let above = |by| Offset { below: false, by };
+        assert_eq!(told(bases.image + 0x1f20), Told::Image(above(0x1f20)));
         assert_eq!(
-            space.reserve_tables(&mut mem, STACK_REGION, STACK_REGION_SIZE),
-            Ok(STACK_REGION_TABLES as u32)
+            told(KERNEL_WINDOW),
+            Told::Image(Offset {
+                below: true,
+                by: 0x60_0000
+            })
         );
-        assert_eq!(mem.used() - before, STACK_REGION_TABLES as usize);
+        assert_eq!(told(u64::MAX), Told::Image(above(u64::MAX - bases.image)));
         assert_eq!(
-            space.leaf_sizes(&mem, STACK_REGION, STACK_REGION + STACK_REGION_SIZE),
-            crate::LeafSizes::default()
+            told(bases.stack_region + 0x1_fff8),
+            Told::StackRegion(above(0x1_fff8))
         );
-        // The direct map is all the build put in its window.
-        let direct = space.leaf_sizes(
-            &mem,
-            DIRECT_MAP_WINDOW,
-            DIRECT_MAP_WINDOW + DIRECT_MAP_WINDOW_SIZE,
+        assert_eq!(
+            told(STACK_WINDOW + STACK_WINDOW_SIZE - 1),
+            Told::StackRegion(above(
+                STACK_WINDOW + STACK_WINDOW_SIZE - 1 - bases.stack_region
+            ))
         );
-        assert!(direct.small > 0 && direct.large > 0, "{direct:?}");
+        assert!(matches!(
+            told(STACK_WINDOW),
+            Told::StackRegion(Offset { below: true, .. })
+        ));
+        assert_eq!(
+            told(bases.direct_map + 0x7e5_0000),
+            Told::DirectMap(above(0x7e5_0000))
+        );
+        // Windows that do not slide, the user half, and the hole between the halves.
+        for addr in [
+            FRAMEBUFFER_WINDOW,
+            STACK_WINDOW + STACK_WINDOW_SIZE + 0x1000,
+            0xFFFF_F000_0000_0000,
+            0x40_0000,
+            0x0000_8000_0000_0000,
+            DIRECT_MAP_WINDOW - 1,
+        ] {
+            assert_eq!(told(addr), Told::Address(addr), "{addr:#x}");
+        }
+        assert_eq!(format!("{bases:?}"), "Bases { .. }", "no base in its Debug");
+    }
+
+    /// ADR-0004 Amendment 2, A4: every base is 2 MiB-aligned with the whole region in PML4
+    /// slots 384–447, the extremes included, and the bases vary with the entropy: about 24
+    /// bits of them.
+    #[test]
+    fn stack_region_bases_stay_inside_their_window_and_aligned() {
+        const { assert!(STACK_PLACEMENTS > 1 << 23 && STACK_PLACEMENTS < 1 << 24) };
+        assert_eq!(stack_region_base(0), STACK_REGION + LARGE_PAGE);
+        let last = stack_region_base(STACK_PLACEMENTS - 1);
+        assert_eq!(last + STACK_REGION_SIZE, STACK_WINDOW + STACK_WINDOW_SIZE);
+        assert_eq!(
+            stack_region_base(STACK_PLACEMENTS),
+            stack_region_base(0),
+            "wraps round"
+        );
+        assert!(
+            is_stack_region_base(STACK_REGION),
+            "the fixed base is a base"
+        );
+        let mut seen = std::collections::HashSet::new();
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        for random in [0, 1, u64::MAX, STACK_PLACEMENTS - 1]
+            .into_iter()
+            .chain((0..10_000).map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            }))
+        {
+            let base = stack_region_base(random);
+            assert!(is_stack_region_base(base), "{random:#x} gave {base:#x}");
+            assert_ne!(base, STACK_REGION, "a draw never gives the fixed base");
+            assert!((384..448).contains(&((base >> 39) & 0x1FF)));
+            assert!(((base + STACK_REGION_SIZE - 1) >> 39) & 0x1FF < 448);
+            seen.insert(base);
+        }
+        assert!(seen.len() > 9_990, "the bases vary: {}", seen.len());
+        // What a base must be, and what it must not.
+        assert!(
+            !is_stack_region_base(STACK_WINDOW - LARGE_PAGE),
+            "below the window"
+        );
+        assert!(
+            !is_stack_region_base(STACK_WINDOW + PAGE),
+            "not 2 MiB-aligned"
+        );
+        assert!(
+            !is_stack_region_base(last + LARGE_PAGE),
+            "the region would cross into the MMIO window"
+        );
+        assert!(!is_stack_region_base(FRAMEBUFFER_WINDOW));
     }
 }
