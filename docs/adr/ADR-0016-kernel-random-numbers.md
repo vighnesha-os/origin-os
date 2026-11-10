@@ -232,7 +232,7 @@ One line when the root is instantiated and one for each processor: which instruc
 - **Half a kilobyte of state for each processor,** and a stack overwrite on every request.
 - **The health tests promise little,** and R4 says so. The alternative is to promise more than a consumer of conditioned output can deliver.
 - **Two departures from the standard's tree** (R7) buy requests and reseeds that take no shared lock. The price is that the design cannot be described as the standard's without a footnote.
-- **The whole design trusts the processor.** If RDSEED and RDRAND are predictable to someone and look healthy, and the firmware adds nothing independent, the generator is predictable to them. Every system that seeds from these instructions shares that. The system threat model (TASKS 19) proposes to accept firmware and microcode as trusted; this is the same acceptance.
+- **The whole design trusts the processor.** If RDSEED and RDRAND are predictable to someone and look healthy, and the firmware adds nothing independent, the generator is predictable to them. Every system that seeds from these instructions shares that. The system threat model (TASKS 19) treats firmware and microcode as trusted; this is the same acceptance.
 
 ## Migration consequences
 

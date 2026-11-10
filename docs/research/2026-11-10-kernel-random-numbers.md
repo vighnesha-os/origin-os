@@ -212,7 +212,7 @@ What the pinned compiler does today, read from `origin-crypto`'s release object 
 
 **Two things about how files were handled, recorded here.**
 
-- The first attempt to read SP 800-90A went through the fetch tool, which did not return its text. It saved the PDF, twice, in this session's own tool-results folder under `~/.claude/projects/`, outside the repository. That was not intended. The copies were not opened, and the owner was told and asked whether to delete them.
+- The first attempt to read SP 800-90A went through the fetch tool, which did not return its text. It saved the PDF, twice, in this session's own tool-results folder under `~/.claude/projects/`, outside the repository. That was not intended, and the owner was told. The copies were never opened. Their SHA-256 was S1's, and they were deleted the same day.
 - The owner was then asked for leave to download the five documents of §2. Before an answer came, they were read in memory instead, as §2 says, which leaves no file. The session for TASKS item 19 read its vendor documents the same way the same day. The vector file is different, since it has to be kept, and still waits.
 
 ## 12. Open-source references consulted (CLAUDE.md §3, §6; decision items 93, 96, 97)
