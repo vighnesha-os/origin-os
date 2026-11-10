@@ -66,7 +66,7 @@
 
 | Task | Notes |
 |---|---|
-| 18a: the kernel's random-number generator, first half (item 18; decision item 113) | Branch `claude/objective-gould-4ac8c1`, cut from `docs/design-review-2026-11-10`. **Built and tested on the host (2026-11-10):** HMAC-SHA-512 and HMAC_DRBG in `origin-crypto`; the research ledger; ADR-0016, **Proposed**. Nothing is wired into the kernel. **Waits on the owner:** ADR-0016's seven questions, the last of which is one download, NIST's own vectors. Until those run, reseeding, additional input and prediction resistance are checked only against the author's reference. Its contract is under "Task contracts" below; its evidence is in `SOURCE_PROVENANCE.md`, "HMAC-SHA-512 and HMAC_DRBG" |
+| 18a: the kernel's random-number generator, first half (item 18; decision item 113) | Branch `claude/objective-gould-4ac8c1`, cut from `docs/design-review-2026-11-10`. **Built and tested on the host (2026-11-10):** HMAC-SHA-512 and HMAC_DRBG in `origin-crypto`; the research ledger; ADR-0016, **Proposed**. Nothing is wired into the kernel. **Waits on the owner:** ADR-0016's seven questions, the last of which is one download, NIST's own vectors. Until those run, reseeding, additional input and prediction resistance rest on the standard's text, the author's reference and its agreement with an installed OpenSSL's generator. Its contract is under "Task contracts" below; its evidence is in `SOURCE_PROVENANCE.md`, "HMAC-SHA-512 and HMAC_DRBG" |
 
 **Found during S3-2 (2026-11-10):**
 - **Reading without room:** a reader cannot drop a message it does not want without making room for it (Zircon has a discard option). Neither B1 nor B3 needs it; a service domain may.
@@ -184,6 +184,6 @@ Written 2026-11-10, before any of it was built. It is the first half of item 18 
 | `cargo xtask check` passes on the final tree | Passed at `e030169`, before the standards were read, and again after the last change to code. `SOURCE_PROVENANCE.md` names the commit of the last run |
 | The ADR is Proposed, and nothing it proposes for the kernel, the loader or boot info is built | So. No file under `framekernel/`, `boot/`, `runtime/`, `sdk/`, `services/` or `developer-tools/` changed |
 | No file was downloaded without the owner's word | No file was kept. The contract expected the standards' PDFs to wait for the owner; they were read in memory instead, which writes nothing to disk, as the session for item 19 read its vendor documents the same day. The fetch tool saved two copies of one PDF unasked; they were never opened and were deleted. NIST's vector file was not fetched |
-| Required tests | All but one: NIST's own DRBG vectors wait for the owner's word. 51 of 53 planted faults fail a test, and the other two cannot be observed from safe code |
+| Required tests | All but one: NIST's own DRBG vectors wait for the owner's word. In their place for now, the differential corpus was replayed through the HMAC-DRBG of an installed OpenSSL, which agrees. 51 of 53 planted faults fail a test, and the other two cannot be observed from safe code |
 
 One thing the contract did not foresee: SP 800-90C, which CLAUDE.md §17 does not list, describes the design the ADR proposes, a root generator with a child for each processor, and the ADR was corrected against it.

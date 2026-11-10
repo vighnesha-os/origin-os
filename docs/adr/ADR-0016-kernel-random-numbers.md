@@ -10,7 +10,7 @@
 | Evidence | `docs/research/2026-11-10-kernel-random-numbers.md` (the ledger, cited below by its row numbers A, B and C); `docs/engineering/SOURCE_PROVENANCE.md`, "HMAC-SHA-512 and HMAC_DRBG" |
 | Related | ADR-0001 D3, ADR-0002 B4, ADR-0004 H3, ADR-0008, ADR-0009 Amendment 1, ADR-0011 N6, ADR-0012, ADR-0013 Amendment 1 |
 
-**What stands behind this.** SP 800-90A Rev. 1, SP 800-90B and SP 800-90C were read in the parts that bear on it (ledger §2), and the built mechanism was compared with the standard's text step by step. One check is missing: NIST's own test vectors, which need the owner's word because the file has to be kept (question 7). Until they run, the mechanism's reseeding, additional input and prediction resistance are checked only against a reference by the same author.
+**What stands behind this.** SP 800-90A Rev. 1, SP 800-90B and SP 800-90C were read in the parts that bear on it (ledger §2), and the built mechanism was compared with the standard's text step by step. Where no published answer was at hand, for reseeding, additional input and prediction resistance, it agrees with a reference by the same author and with the HMAC-DRBG of an installed OpenSSL. One check is missing: NIST's own test vectors, which need the owner's word because the file has to be kept (question 7).
 
 ## Context
 
@@ -273,7 +273,7 @@ One line when the root is instantiated and one for each processor: which instruc
 - **Conformance or validation** of any kind (R1). The sources are not validated, and two rules of the standard's tree are departed from (R7).
 - **Anything about hardware.** Not one line of this has run on a processor. The start-up tests' cost, RDSEED's behaviour when sixty-four processors ask at once, and the cost of a request on x86-64 are all unmeasured.
 - **That the overwrites survive the compiler** beyond what one build shows (R9 Z2).
-- **That the mechanism is right where only the author's reference checked it:** reseeding, additional input and prediction resistance. The code was compared with the standard's text; NIST's vectors are the check that is independent of the author (question 7).
+- **The mechanism against NIST's published answers** for reseeding, additional input and prediction resistance. It agrees there with the standard's text, with the author's reference and with OpenSSL's generator (ledger §9). NIST's vectors have not been run (question 7).
 
 ## Questions for the owner
 
@@ -285,4 +285,4 @@ Each has a recommended answer. None is answered.
 4. **Accept what "health tests on the raw source" can mean here** (§59): the tests run on the instructions' outputs, because the noise behind them cannot be reached; they catch gross failure only; and Origin claims no SP 800-90B conformance? **Recommended: yes.** If you want more, the only route is a source of Origin's own with its own assessment, which is research.
 5. **Keep `unsafe` out of `origin-crypto`:** best-effort overwriting there, and the guarantee in the framework, by volatile writes over the state and an overwrite of the stack after every request (R9)? **Recommended: yes.**
 6. **§17 of CLAUDE.md,** which is your text: pin SP 800-90A to Rev. 1 (June 2015) and SP 800-90B to January 2018, and add SP 800-90C (September 2025) and FIPS 198-1 (July 2008)? **Recommended: yes.**
-7. **One download:** NIST's HMAC_DRBG vectors, `hmacDRBG-1.0/internalProjection.json`, 1,160,048 bytes, from github.com/usnistgov/ACVP-Server at commit `975de31`, the release decision item 19's vectors are pinned to. It would be converted and committed as host-only test data with NIST's notice, as item 19's were. **Recommended: yes.** It is the one check of the mechanism that does not rest on the author.
+7. **One download:** NIST's HMAC_DRBG vectors, `hmacDRBG-1.0/internalProjection.json`, 1,160,048 bytes, from github.com/usnistgov/ACVP-Server at commit `975de31`, the release decision item 19's vectors are pinned to. It would be converted and committed as host-only test data with NIST's notice, as item 19's were. **Recommended: yes.** They are NIST's published answers for the paths RFC 6979's values do not reach, and they are to be the answers of the start-up self-test (R5).
