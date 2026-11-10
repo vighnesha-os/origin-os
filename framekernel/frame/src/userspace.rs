@@ -22,10 +22,12 @@
 //! The page-table memory of a space is freed only with the space, and no page is freed while
 //! `state` could still lead to it, so a walk of the tables never reaches freed memory.
 //!
-//! An unmap edits the tables under `state`, then shoots down the processors that have this
-//! space loaded, then releases the frames: a frame leaves its old owner only once no TLB can
-//! lead to it (`Shootdown::retire`). If a processor does not answer, the frames are leaked, and
-//! the caller is told.
+//! An unmap edits the tables under `state` a round at a time, and shoots each round down on the
+//! processors that have this space loaded before it releases that round's frames: a frame
+//! leaves its old owner only once no TLB can lead to it (`Confirmation::change`). If a
+//! processor does not answer, the unmap is still made to its end. One flush of the whole space
+//! then decides whether the frames taken out since are released or leaked, and the caller is
+//! told if they were leaked (S3-5b's review, finding A). A protect goes the same way.
 //!
 //! A map adds a translation that was not present, which no TLB can hold: it needs no shootdown.
 //! A protect does, also when it only adds access: a processor that still caches the old
@@ -39,7 +41,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use origin_abi::Error;
 use origin_paging::{Access, AddressSpace, MapError, PAGE, Table, TableMemory, Translation};
-use origin_sync::shootdown::{Completed, Confirmation, Request, Stalled};
+use origin_sync::shootdown::{Confirmation, Cost, Request, Rounds, Stalled};
 use origin_sync::{SpinGuard, SpinLock};
 
 use crate::addr::PhysAddr;
@@ -280,9 +282,13 @@ pub struct Change {
 }
 
 impl Change {
-    fn add(&mut self, done: Completed) {
-        self.shootdowns += 1;
-        self.interrupts += done.processors;
+    /// A change of `pages` pages that cost `cost`.
+    const fn of(pages: u64, cost: Cost) -> Self {
+        Self {
+            pages,
+            shootdowns: cost.shootdowns,
+            interrupts: cost.interrupts,
+        }
     }
 }
 
@@ -291,8 +297,13 @@ impl Change {
 pub enum ChangeError {
     /// The tables refused it, or it asked for addresses this space cannot map.
     Map(MapError),
-    /// A processor did not answer within the shootdown's patience, so it may still hold a
-    /// translation. The change is made; frames already taken out are leaked, not reused.
+    /// A processor did not answer within the shootdown's patience, and the flush of the whole
+    /// space that ends such a change did not complete either, so a processor may still hold a
+    /// translation. The change is made all the same: every page it names has its final entry
+    /// in the tables. Nothing it took out after the first stall is reused: an unmap's frames
+    /// are leaked, and a protect's old modes stay counted until a later flush of the space
+    /// completes. The space stays unconfirmed, so the next change starts with that flush
+    /// (S3-5b's review, finding A).
     Stalled {
         /// The processor.
         cpu: usize,
@@ -421,10 +432,23 @@ impl State {
         for mapping in round {
             if self.space.protect(&mut self.tables, mapping.virt, access) == Ok(true) {
                 changed += 1;
-                if let Frame::Shared { mode, pending, .. } = &mut mapping.frame
+                if let Frame::Shared {
+                    frame,
+                    mode,
+                    pending,
+                } = &mut mapping.frame
                     && *mode != new
                 {
-                    *pending = *mode;
+                    match (*pending, *mode) {
+                        (Mode::Plain, old) => *pending = old,
+                        // A mode an earlier change left pending (its shootdown stalled, and no
+                        // flush has completed since) stays, and keeps the frame's kind counted:
+                        // the old mode's own count can go.
+                        (kept, old) if kept == old => frame.inner.aliases.give_back(old),
+                        // The old mode is read-only, which is not counted. The other kind
+                        // cannot be counted beside the pending one (`claim_modes`).
+                        _ => {}
+                    }
                     *mode = new;
                 }
             }
@@ -445,24 +469,26 @@ impl State {
         }
     }
 
-    /// Takes the next [`CHUNK`] pages of `[start, end)` out of the tables and out of the records:
-    /// what it took, the translations that can still lead to it and where the next round
-    /// starts, or `None` if there is nothing left to take. The frames stay allocated, and the
-    /// caller gives them back only after a shootdown (`Shootdown::retire`).
-    fn retire(&mut self, start: u64, end: u64) -> Result<Option<Retired>, MapError> {
+    /// Takes the next [`CHUNK`] pages of `[start, end)` out of the tables and moves their
+    /// records into `into`: the translations that can still lead to them, how many there were
+    /// and where the next round starts, or `None` if there is nothing left to take. The frames
+    /// stay allocated, and the caller gives them back only once no processor can reach them
+    /// (`Confirmation::change`).
+    fn retire(
+        &mut self,
+        start: u64,
+        end: u64,
+        into: &mut Vec<Mapping>,
+    ) -> Result<Option<Retired>, MapError> {
         let lo = self.position(start);
         let hi = self.position(end).min(lo + CHUNK);
         if lo == hi {
             return Ok(None);
         }
-        let count = hi - lo;
-        if self.spare.capacity() < count {
-            // Only after a stalled shootdown has lost the spare vector: an unmap normally has
-            // the room it needs from the map that made the record.
-            self.spare
-                .try_reserve(count)
-                .map_err(|_| MapError::OutOfMemory)?;
-        }
+        // No allocation: `into` is the spare vector, which every map leaves with room for all
+        // the records.
+        into.try_reserve(hi - lo)
+            .map_err(|_| MapError::OutOfMemory)?;
         let mut cleared = lo;
         let (mut first, mut last) = (u64::MAX, 0);
         for mapping in self.mapped.get(lo..hi).unwrap_or(&[]) {
@@ -476,10 +502,9 @@ impl State {
         if cleared == lo {
             return Err(MapError::UnknownTable(start));
         }
-        let mut retired = core::mem::take(&mut self.spare);
-        retired.extend(self.mapped.drain(lo..cleared));
+        into.extend(self.mapped.drain(lo..cleared));
         Ok(Some(Retired {
-            mappings: retired,
+            pages: (cleared - lo) as u64,
             request: Request::covering(first, last),
             next: last + PAGE,
         }))
@@ -498,11 +523,121 @@ struct Reprotected {
 
 /// What one round of an unmap took out of the tables (`State::retire`).
 struct Retired {
-    mappings: Vec<Mapping>,
-    /// The translations that can still lead to it.
+    /// The pages it took out.
+    pages: u64,
+    /// The translations that can still lead to them.
     request: Request,
     /// Where the next round starts.
     next: u64,
+}
+
+/// An unmap of `[cursor, end)`, as [`Confirmation::change`] makes it: each round takes up to
+/// [`CHUNK`] mapped pages out of the tables, and their records, with their frames, wait in
+/// `taken` until no processor can reach them.
+struct Unmapping<'a> {
+    space: &'a UserSpace,
+    cursor: u64,
+    end: u64,
+    /// The space's spare vector while the unmap runs, with room for every record it can take.
+    taken: Vec<Mapping>,
+    /// The pages taken out so far.
+    pages: u64,
+}
+
+impl Unmapping<'_> {
+    /// Gives back every frame waiting: no processor can reach one through this space any more.
+    fn release(&mut self) {
+        for mapping in self.taken.drain(..) {
+            mapping.frame.release();
+        }
+    }
+}
+
+impl Rounds for Unmapping<'_> {
+    type Error = ChangeError;
+
+    fn prepare(&mut self) -> Result<(), ChangeError> {
+        Ok(())
+    }
+
+    fn round(&mut self) -> Result<Option<Request>, ChangeError> {
+        let (cursor, end, taken) = (self.cursor, self.end, &mut self.taken);
+        let Some(retired) = self.space.with_state(|s| s.retire(cursor, end, taken))? else {
+            return Ok(None);
+        };
+        self.cursor = retired.next;
+        self.pages += retired.pages;
+        Ok(Some(retired.request))
+    }
+
+    fn shot(&mut self) {
+        self.release();
+    }
+
+    fn flushed(&mut self) {
+        self.release();
+        // Every old permission is gone everywhere too, including any a stall left counted.
+        self.space.with_state(|s| s.give_back_pending(0, u64::MAX));
+    }
+
+    fn lost(&mut self) {
+        // A processor may still reach these frames: they stay allocated, for good.
+        for mapping in self.taken.drain(..) {
+            core::mem::forget(mapping);
+        }
+    }
+}
+
+/// A change of the permissions of `[start, end)` to `access`, as [`Confirmation::change`]
+/// makes it: each round changes up to [`CHUNK`] mapped pages, and a shared frame's old mode
+/// stays counted, as pending, until no processor can use the old permissions.
+struct Reprotecting<'a> {
+    space: &'a UserSpace,
+    access: Access,
+    start: u64,
+    end: u64,
+    /// Where the round just made began, and where the next one begins.
+    round: u64,
+    cursor: u64,
+    /// The pages whose permissions changed so far.
+    pages: u64,
+}
+
+impl Rounds for Reprotecting<'_> {
+    type Error = ChangeError;
+
+    fn prepare(&mut self) -> Result<(), ChangeError> {
+        self.space.claim_modes(self.start, self.end, self.access)
+    }
+
+    fn round(&mut self) -> Result<Option<Request>, ChangeError> {
+        let (end, access) = (self.end, self.access);
+        loop {
+            let cursor = self.cursor;
+            let Some(round) = self.space.with_state(|s| s.protect(cursor, end, access)) else {
+                return Ok(None);
+            };
+            (self.round, self.cursor) = (cursor, round.next);
+            self.pages += round.changed;
+            // A round that changed nothing needs no shootdown: it left nothing pending.
+            if round.changed != 0 {
+                return Ok(Some(round.request));
+            }
+        }
+    }
+
+    fn shot(&mut self) {
+        let (start, stop) = (self.round, self.cursor);
+        self.space.with_state(|s| s.give_back_pending(start, stop));
+    }
+
+    fn flushed(&mut self) {
+        self.space.with_state(|s| s.give_back_pending(0, u64::MAX));
+    }
+
+    fn lost(&mut self) {
+        // The old modes stay counted, as pending, until a flush of the whole space completes.
+    }
 }
 
 /// One user address space: its own lower half and the kernel's half.
@@ -700,29 +835,30 @@ impl UserSpace {
     /// threads running: one that touches a page after its translation is gone takes a fault.
     ///
     /// Must not be called holding a lock another processor may wait for with interrupts off.
+    ///
+    /// # Errors
+    ///
+    /// - [`ChangeError::Map`] for a range this space cannot have, before anything changes.
+    /// - [`ChangeError::Stalled`]: a processor did not answer, and every page of the range is
+    ///   unmapped all the same; the frames taken out after the stall are leaked.
     pub fn unmap(&self, virt: u64, pages: u64) -> Result<Change, ChangeError> {
         let end = user_range_end(virt, pages)?;
         let _turn = self.edit();
-        let mut change = Change::default();
-        self.confirm(&mut change)?;
-        let mut cursor = virt;
-        while let Some(retired) = self.with_state(|s| s.retire(cursor, end))? {
-            let Retired {
-                mappings,
-                request,
-                next,
-            } = retired;
-            cursor = next;
-            change.pages += mappings.len() as u64;
-            let done = crate::tlb::retire_in_space(self.root, request, mappings, |mut mappings| {
-                for mapping in mappings.drain(..) {
-                    mapping.frame.release();
-                }
-                self.with_state(|s| s.spare = mappings);
-            });
-            change.add(self.confirmation.record(done)?);
-        }
-        Ok(change)
+        let taken = self.with_state(|s| core::mem::take(&mut s.spare));
+        let mut unmapping = Unmapping {
+            space: self,
+            cursor: virt,
+            end,
+            taken,
+            pages: 0,
+        };
+        let outcome = self.confirmation.change(&mut unmapping, |request| {
+            crate::tlb::shootdown_space(self.root, request)
+        });
+        // Every record it took has been given back or lost by now: the vector is empty again.
+        let Unmapping { taken, pages, .. } = unmapping;
+        self.with_state(|s| s.spare = taken);
+        Ok(Change::of(pages, outcome?))
     }
 
     /// Whether a change to this space is not known to have reached every processor: a
@@ -731,47 +867,35 @@ impl UserSpace {
         self.confirmation.is_unconfirmed()
     }
 
-    /// Before a change: if an earlier shootdown stalled, every processor with this space loaded
-    /// must first drop everything it holds of it (review finding 3). Called under `editor`.
-    fn confirm(&self, change: &mut Change) -> Result<(), ChangeError> {
-        let flushed = self
-            .confirmation
-            .settle(|| crate::tlb::shootdown_space(self.root, Request::NonGlobal))?;
-        if let Some(done) = flushed {
-            change.add(done);
-            // Every old permission is gone everywhere now, including any a stall left counted.
-            self.with_state(|s| s.give_back_pending(0, u64::MAX));
-        }
-        Ok(())
-    }
-
     /// Gives every page mapped in the `pages` pages from `virt` the permissions `access`. When
     /// it returns, no processor can use the old ones. Pages not mapped are left alone. Safe
     /// with this space's threads running: one whose access the new permissions refuse takes a
     /// fault. Must not be called holding a lock as [`unmap`](Self::unmap) says.
     ///
-    /// Refused with [`ChangeError::WriteAndExecute`], before anything changes, if a shared frame
-    /// would then be writable through one mapping and executable through another, in any space,
-    /// or if it would go from writable to executable or back in one step (review finding 5).
+    /// # Errors
+    ///
+    /// - [`ChangeError::Map`] for a range this space cannot have, before anything changes.
+    /// - [`ChangeError::WriteAndExecute`], before anything changes, if a shared frame would then
+    ///   be writable through one mapping and executable through another, in any space, or if it
+    ///   would go from writable to executable or back in one step (review finding 5).
+    /// - [`ChangeError::Stalled`]: a processor did not answer, and every page of the range has
+    ///   its new permissions all the same; the old ones stay counted until a later flush.
     pub fn protect(&self, virt: u64, pages: u64, access: Access) -> Result<Change, ChangeError> {
         let end = user_range_end(virt, pages)?;
         let _turn = self.edit();
-        let mut change = Change::default();
-        self.confirm(&mut change)?;
-        self.claim_modes(virt, end, access)?;
-        let mut cursor = virt;
-        while let Some(round) = self.with_state(|s| s.protect(cursor, end, access)) {
-            let start = cursor;
-            cursor = round.next;
-            change.pages += round.changed;
-            if round.changed != 0 {
-                let done = crate::tlb::shootdown_space(self.root, round.request);
-                change.add(self.confirmation.record(done)?);
-            }
-            // The old permissions are gone everywhere: their modes stop counting.
-            self.with_state(|s| s.give_back_pending(start, cursor));
-        }
-        Ok(change)
+        let mut reprotecting = Reprotecting {
+            space: self,
+            access,
+            start: virt,
+            end,
+            round: virt,
+            cursor: virt,
+            pages: 0,
+        };
+        let cost = self.confirmation.change(&mut reprotecting, |request| {
+            crate::tlb::shootdown_space(self.root, request)
+        })?;
+        Ok(Change::of(reprotecting.pages, cost))
     }
 
     /// Counts the mode `access` gives every shared frame mapped in `[start, end)`, or counts

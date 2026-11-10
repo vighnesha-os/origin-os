@@ -36,6 +36,11 @@
 //! [`Shootdown::retire`], which runs the release only after every processor has answered, and
 //! never at all if one does not: a frame nobody may reuse is leaked, for good.
 //!
+//! A change to a user address space is made in rounds, each shot down before what it took out is
+//! given back ([`Confirmation::change`]). A stall does not stop such a change half made: the
+//! rounds after it are still made, and one flush of the whole space at the end decides whether
+//! what they took out is given back or leaked.
+//!
 //! # What the caller must uphold
 //!
 //! It must hold no lock that another processor may wait for with interrupts disabled: that
@@ -223,9 +228,17 @@ impl Confirmation {
         if !self.is_unconfirmed() {
             return Ok(None);
         }
+        self.flush(flush).map(Some)
+    }
+
+    /// Runs `flush`, and clears the mark only if it completes.
+    fn flush(
+        &self,
+        flush: impl FnOnce() -> Result<Completed, Stalled>,
+    ) -> Result<Completed, Stalled> {
         let done = self.record(flush())?;
         self.unconfirmed.store(false, Ordering::Relaxed);
-        Ok(Some(done))
+        Ok(done)
     }
 
     /// A shootdown's outcome: a stall is remembered.
@@ -235,12 +248,133 @@ impl Confirmation {
         }
         done
     }
+
+    /// Makes the change `rounds` describes to the space this is for, round by round, with
+    /// `shoot` as each round's shootdown (S3-5b review, finding A). The caller serializes the
+    /// changes to the space, as for [`settle`](Self::settle).
+    ///
+    /// A stall never leaves the change half made: every round is still made, so the tables end
+    /// as the change asks. Until the first stall, each round is shot down and then what it took
+    /// out is given back. After it, the rounds keep what they take without a shootdown of their
+    /// own, and one flush of the whole space ends the change. If that flush completes,
+    /// everything kept is given back, the space is confirmed again and the change succeeds. If
+    /// it stalls too, what is kept is lost for good, the space stays unconfirmed and the change
+    /// returns [`Stalled`]. A stall that an earlier change left is met the same way: the flush
+    /// that makes it good comes first, and if that stalls, the change goes on as after a stall
+    /// of its own.
+    ///
+    /// # Errors
+    ///
+    /// - [`Stalled`] (as `R::Error`) only if the flush at the end stalled: the change is made,
+    ///   and what it took out after the first stall is lost.
+    /// - A refusal from [`Rounds::prepare`], before anything changed.
+    /// - A refusal from [`Rounds::round`]: the rounds before it are made, and what they kept is
+    ///   given back or lost as above.
+    pub fn change<R: Rounds>(
+        &self,
+        rounds: &mut R,
+        mut shoot: impl FnMut(Request) -> Result<Completed, Stalled>,
+    ) -> Result<Cost, R::Error> {
+        let mut cost = Cost::default();
+        // A space's own translations are never global, so this flush drops every one of them.
+        let mut stalled = match self.settle(|| shoot(Request::NonGlobal)) {
+            Ok(flushed) => {
+                if let Some(done) = flushed {
+                    cost.add(done);
+                    rounds.flushed();
+                }
+                false
+            }
+            Err(_) => true,
+        };
+        rounds.prepare()?;
+        let refused = loop {
+            match rounds.round() {
+                Ok(Some(request)) if !stalled => match self.record(shoot(request)) {
+                    Ok(done) => {
+                        cost.add(done);
+                        rounds.shot();
+                    }
+                    // Kept, with what every later round takes, until the flush at the end.
+                    Err(_) => stalled = true,
+                },
+                Ok(Some(_)) => {}
+                Ok(None) => break None,
+                Err(e) => break Some(e),
+            }
+        };
+        if stalled {
+            match self.flush(|| shoot(Request::NonGlobal)) {
+                Ok(done) => {
+                    cost.add(done);
+                    rounds.flushed();
+                }
+                Err(stall) => {
+                    rounds.lost();
+                    return Err(refused.unwrap_or_else(|| stall.into()));
+                }
+            }
+        }
+        refused.map_or(Ok(cost), Err)
+    }
 }
 
 impl Default for Confirmation {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What the completed shootdowns of a change cost: how many there were, and the interrupts they
+/// sent to other processors between them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cost {
+    /// The shootdowns that completed.
+    pub shootdowns: u32,
+    /// The interrupts those sent.
+    pub interrupts: u32,
+}
+
+impl Cost {
+    fn add(&mut self, done: Completed) {
+        self.shootdowns = self.shootdowns.saturating_add(1);
+        self.interrupts = self.interrupts.saturating_add(done.processors);
+    }
+}
+
+/// A change to one address space, made in rounds by [`Confirmation::change`]. Each round takes
+/// something out of the space's page tables, or out of what they allow, and keeps it until no
+/// processor can still use it through a translation it cached.
+pub trait Rounds {
+    /// Why the change could not be made, [`Stalled`] among the reasons.
+    type Error: From<Stalled>;
+
+    /// Runs once before the first round, after the flush that makes an earlier stall good has
+    /// completed or stalled.
+    ///
+    /// # Errors
+    ///
+    /// A refusal of the whole change, which must have changed nothing.
+    fn prepare(&mut self) -> Result<(), Self::Error>;
+
+    /// Makes the next round of the change in the tables and keeps what it took out. Returns the
+    /// translations that may still lead to it, or `None` once the change is complete.
+    ///
+    /// # Errors
+    ///
+    /// A round that could not be made, which must have kept nothing.
+    fn round(&mut self) -> Result<Option<Request>, Self::Error>;
+
+    /// The shootdown of the round just made has completed: give back what that round took out.
+    fn shot(&mut self);
+
+    /// A flush of every translation of the space has completed: give back everything still
+    /// kept, by this change or by an earlier one.
+    fn flushed(&mut self);
+
+    /// What the change still keeps may stay in some processor's TLB for good: never give it
+    /// back.
+    fn lost(&mut self);
 }
 
 /// The shootdown state of a machine with up to `CPUS` processors.
@@ -1105,6 +1239,254 @@ mod tests {
         assert!(!confirmation.is_unconfirmed());
         assert_eq!(flushes, 2);
         assert_eq!(confirmation.settle(|| unreachable!("settled")), Ok(None));
+    }
+
+    /// Why a [`Pages`] change failed.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Refused {
+        Prepare,
+        Round(u64),
+        Stalled(Stalled),
+    }
+
+    impl From<Stalled> for Refused {
+        fn from(stalled: Stalled) -> Self {
+            Self::Stalled(stalled)
+        }
+    }
+
+    /// A change of `rounds` rounds of one page each, made as a space's unmap makes them: a
+    /// round's page leaves the tables when the round is made, and is kept until given back.
+    #[derive(Default)]
+    struct Pages {
+        rounds: u64,
+        /// The round that fails, if one does, and whether `prepare` refuses.
+        fails: Option<u64>,
+        refuses: bool,
+        /// The pages out of the tables: every round made so far.
+        made: u64,
+        kept: Vec<u64>,
+        given_back: Vec<u64>,
+        lost: Vec<u64>,
+        /// Whole flushes completed, and the pages made when each completed.
+        flushes: Vec<u64>,
+    }
+
+    impl Pages {
+        fn of(rounds: u64) -> Self {
+            Self {
+                rounds,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl Rounds for Pages {
+        type Error = Refused;
+
+        fn prepare(&mut self) -> Result<(), Refused> {
+            if self.refuses {
+                return Err(Refused::Prepare);
+            }
+            Ok(())
+        }
+
+        fn round(&mut self) -> Result<Option<Request>, Refused> {
+            if self.made == self.rounds {
+                return Ok(None);
+            }
+            if self.fails == Some(self.made) {
+                return Err(Refused::Round(self.made));
+            }
+            let page = self.made;
+            self.made += 1;
+            self.kept.push(page);
+            Ok(Some(Request::page(page * PAGE)))
+        }
+
+        fn shot(&mut self) {
+            assert_eq!(self.kept.len(), 1, "only the round just shot is kept");
+            self.given_back.append(&mut self.kept);
+        }
+
+        fn flushed(&mut self) {
+            self.flushes.push(self.made);
+            self.given_back.append(&mut self.kept);
+        }
+
+        fn lost(&mut self) {
+            self.lost.append(&mut self.kept);
+        }
+    }
+
+    /// Runs `pages`' change on a space marked unconfirmed or not, with shootdowns that complete
+    /// or stall as `script` says, in order. Returns the outcome, the requests and whether the
+    /// space ends unconfirmed.
+    fn change(
+        pages: &mut Pages,
+        unconfirmed: bool,
+        script: &[bool],
+    ) -> (Result<Cost, Refused>, Vec<Request>, bool) {
+        let confirmation = Confirmation::new();
+        if unconfirmed {
+            let _ = confirmation.record(Err(Stalled { cpu: 1 }));
+        }
+        let mut asked = Vec::new();
+        let outcome = confirmation.change(pages, |request| {
+            let completes = script[asked.len()];
+            asked.push(request);
+            if completes {
+                Ok(Completed {
+                    processors: 2,
+                    ticks: 1,
+                })
+            } else {
+                Err(Stalled { cpu: 1 })
+            }
+        });
+        assert_eq!(
+            asked.len(),
+            script.len(),
+            "every scripted shootdown was asked for"
+        );
+        (outcome, asked, confirmation.is_unconfirmed())
+    }
+
+    const fn page(n: u64) -> Request {
+        Request::page(n * PAGE)
+    }
+
+    const fn cost(shootdowns: u32) -> Cost {
+        Cost {
+            shootdowns,
+            interrupts: 2 * shootdowns,
+        }
+    }
+
+    #[test]
+    fn without_a_stall_each_round_is_shot_down_then_given_back() {
+        let mut pages = Pages::of(3);
+        let (outcome, asked, unconfirmed) = change(&mut pages, false, &[true; 3]);
+        assert_eq!(outcome, Ok(cost(3)));
+        assert_eq!(asked, [page(0), page(1), page(2)]);
+        assert_eq!(pages.given_back, [0, 1, 2]);
+        assert!(pages.lost.is_empty() && pages.flushes.is_empty() && !unconfirmed);
+    }
+
+    /// Finding A, case b: a round in the middle stalls. The rounds after it are still made, and
+    /// what they and the stalled round took out waits for one flush of the whole space.
+    #[test]
+    fn a_round_that_stalls_does_not_stop_the_change() {
+        let mut pages = Pages::of(3);
+        let (outcome, asked, unconfirmed) = change(&mut pages, false, &[true, false, true]);
+        assert_eq!(outcome, Ok(cost(2)));
+        assert_eq!(asked, [page(0), page(1), Request::NonGlobal]);
+        assert_eq!(pages.made, 3, "every page left the tables");
+        assert_eq!(pages.given_back, [0, 1, 2]);
+        assert_eq!(
+            pages.flushes,
+            [3],
+            "given back after the flush, with every round made"
+        );
+        assert!(pages.lost.is_empty() && !unconfirmed);
+    }
+
+    #[test]
+    fn when_the_flush_at_the_end_stalls_too_what_was_kept_is_lost() {
+        let mut pages = Pages::of(3);
+        let (outcome, asked, unconfirmed) = change(&mut pages, false, &[true, false, false]);
+        assert_eq!(outcome, Err(Refused::Stalled(Stalled { cpu: 1 })));
+        assert_eq!(asked, [page(0), page(1), Request::NonGlobal]);
+        assert_eq!(pages.made, 3, "every page left the tables");
+        assert_eq!(
+            pages.given_back,
+            [0],
+            "only what a completed shootdown covered"
+        );
+        assert_eq!(pages.lost, [1, 2]);
+        assert!(unconfirmed, "the space stays unconfirmed");
+    }
+
+    #[test]
+    fn a_stall_an_earlier_change_left_is_flushed_before_the_first_round() {
+        let mut pages = Pages::of(2);
+        let (outcome, asked, unconfirmed) = change(&mut pages, true, &[true; 3]);
+        assert_eq!(outcome, Ok(cost(3)));
+        assert_eq!(asked, [Request::NonGlobal, page(0), page(1)]);
+        assert_eq!(
+            pages.flushes,
+            [0],
+            "what earlier changes kept goes back first"
+        );
+        assert_eq!(pages.given_back, [0, 1]);
+        assert!(!unconfirmed);
+    }
+
+    /// Finding A, case a: the flush that should make an earlier stall good stalls again. The
+    /// change is still made, without a shootdown per round, and one flush at its end decides.
+    #[test]
+    fn a_first_flush_that_stalls_does_not_stop_the_change() {
+        let mut pages = Pages::of(3);
+        let (outcome, asked, unconfirmed) = change(&mut pages, true, &[false, true]);
+        assert_eq!(outcome, Ok(cost(1)));
+        assert_eq!(asked, [Request::NonGlobal, Request::NonGlobal]);
+        assert_eq!(pages.made, 3, "every page left the tables");
+        assert_eq!(pages.given_back, [0, 1, 2]);
+        assert_eq!(pages.flushes, [3]);
+        assert!(!unconfirmed);
+
+        let mut pages = Pages::of(3);
+        let (outcome, _, unconfirmed) = change(&mut pages, true, &[false, false]);
+        assert_eq!(outcome, Err(Refused::Stalled(Stalled { cpu: 1 })));
+        assert_eq!(pages.made, 3, "every page left the tables");
+        assert!(pages.given_back.is_empty());
+        assert_eq!(pages.lost, [0, 1, 2]);
+        assert!(unconfirmed);
+    }
+
+    #[test]
+    fn a_refusal_before_the_first_round_changes_nothing() {
+        let mut pages = Pages {
+            refuses: true,
+            ..Pages::of(2)
+        };
+        let (outcome, asked, unconfirmed) = change(&mut pages, false, &[]);
+        assert_eq!(outcome, Err(Refused::Prepare));
+        assert!(asked.is_empty() && pages.made == 0 && !unconfirmed);
+        // After a first flush that stalled: still nothing made, and the mark stays.
+        let mut pages = Pages {
+            refuses: true,
+            ..Pages::of(2)
+        };
+        let (outcome, _, unconfirmed) = change(&mut pages, true, &[false]);
+        assert_eq!(outcome, Err(Refused::Prepare));
+        assert!(pages.made == 0 && unconfirmed);
+    }
+
+    #[test]
+    fn a_round_refused_after_a_stall_still_settles_what_was_kept() {
+        let mut pages = Pages {
+            fails: Some(2),
+            ..Pages::of(3)
+        };
+        let (outcome, asked, unconfirmed) = change(&mut pages, false, &[false, true]);
+        assert_eq!(outcome, Err(Refused::Round(2)));
+        assert_eq!(asked, [page(0), Request::NonGlobal]);
+        assert_eq!(pages.given_back, [0, 1]);
+        assert!(pages.lost.is_empty() && !unconfirmed);
+
+        let mut pages = Pages {
+            fails: Some(2),
+            ..Pages::of(3)
+        };
+        let (outcome, _, unconfirmed) = change(&mut pages, false, &[false, false]);
+        assert_eq!(
+            outcome,
+            Err(Refused::Round(2)),
+            "the refusal says more than the stall"
+        );
+        assert_eq!(pages.lost, [0, 1]);
+        assert!(unconfirmed);
     }
 
     #[test]

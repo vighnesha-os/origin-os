@@ -104,6 +104,20 @@ const REUSED_TOO_SOON: &[&str] = &[
     "a processor kept a translation the shootdown took away",
 ];
 const LOST_UPDATE: &[&str] = &["the floor is the largest reading"];
+/// A change to a space returned with a page of it as it was (S3-5b's review, finding A).
+const UNFINISHED: &[&str] = &["a change that stalled left a page as it was"];
+/// A change gave back a frame a processor could still reach through a stale translation.
+const GIVEN_BACK: &[&str] = &[
+    "Causality violation",
+    "a change gave back what a stalled shootdown left reachable",
+];
+/// A change that returned a stall left its space confirmed.
+const FORGOTTEN: &[&str] = &["a change that stalled left its space confirmed"];
+
+/// The models of a change to a space whose shootdowns may stall (`models.rs`).
+const ROUND_STALLS: &str =
+    "a_change_whose_round_stalls_is_still_made_and_frees_only_what_a_flush_covered";
+const FIRST_FLUSH_STALLS: &str = "a_change_whose_first_flush_stalls_is_still_made";
 
 /// One deliberate bug, and the models that must find it.
 struct Control {
@@ -965,6 +979,75 @@ const CONTROLS: &[Control] = &[
                     .find(|&s| matches!(table.state(s), Some(State::Free | State::Reclaiming)))?;
 ",
         models: &[("slots_reclaimed_slot_is_taken_only_after_its_shootdown", STALE)],
+    },
+    Control {
+        // S3-5b's review, finding A, case a, as the code was: a change returns when the flush
+        // that should make an earlier stall good stalls again, with nothing of it made.
+        name: "change_stops_at_a_stalled_first_flush",
+        file: SHOOTDOWN,
+        from: "            Err(_) => true,
+        };
+        rounds.prepare()?;
+",
+        to: "            Err(stall) => return Err(stall.into()),
+        };
+        rounds.prepare()?;
+",
+        models: &[(FIRST_FLUSH_STALLS, UNFINISHED)],
+    },
+    Control {
+        // Finding A, case b, as the code was: a change returns at the first round whose
+        // shootdown stalls, and the rounds after it are never made.
+        name: "change_stops_at_a_stalled_round",
+        file: SHOOTDOWN,
+        from: "                    // Kept, with what every later round takes, until the flush at the end.
+                    Err(_) => stalled = true,
+",
+        to: "                    Err(stall) => {
+                        rounds.lost();
+                        return Err(stall.into());
+                    }
+",
+        models: &[(ROUND_STALLS, UNFINISHED)],
+    },
+    Control {
+        // A round whose shootdown stalled gives back what it took at once.
+        name: "change_gives_back_a_stalled_round_at_once",
+        file: SHOOTDOWN,
+        from: "                    Err(_) => stalled = true,
+",
+        to: "                    Err(_) => {
+                        rounds.shot();
+                        stalled = true;
+                    }
+",
+        models: &[(ROUND_STALLS, GIVEN_BACK)],
+    },
+    Control {
+        // The flush at the end of a change stalls, and what the change kept is given back anyway.
+        name: "change_gives_back_what_a_stalled_flush_left",
+        file: SHOOTDOWN,
+        from: "                Err(stall) => {
+                    rounds.lost();
+",
+        to: "                Err(stall) => {
+                    rounds.flushed();
+",
+        models: &[(ROUND_STALLS, GIVEN_BACK), (FIRST_FLUSH_STALLS, GIVEN_BACK)],
+    },
+    Control {
+        // A change that returns a stall leaves its space confirmed, so the next change would
+        // not flush first.
+        name: "change_forgets_its_stall",
+        file: SHOOTDOWN,
+        from: "                    rounds.lost();
+                    return Err(refused.unwrap_or_else(|| stall.into()));
+",
+        to: "                    rounds.lost();
+                    self.unconfirmed.store(false, Ordering::Relaxed);
+                    return Err(refused.unwrap_or_else(|| stall.into()));
+",
+        models: &[(ROUND_STALLS, FORGOTTEN), (FIRST_FLUSH_STALLS, FORGOTTEN)],
     },
 ];
 

@@ -178,17 +178,6 @@ pub(crate) fn shootdown_space(root: u64, request: Request) -> Result<Completed, 
     SHOOTDOWN.shoot(&Hardware, request, Scope::Space(root))
 }
 
-/// The deferred free of a user mapping: `value` is what the caller took out of `root`'s page
-/// tables, and `release` gets it back once no processor can reach it (`Shootdown::retire`).
-pub(crate) fn retire_in_space<T>(
-    root: u64,
-    request: Request,
-    value: T,
-    release: impl FnOnce(T),
-) -> Result<Completed, Stalled> {
-    SHOOTDOWN.retire(&Hardware, value, request, Scope::Space(root), release)
-}
-
 /// How many processors have the address space `root` loaded now.
 pub(crate) fn processors_holding(root: u64) -> u32 {
     SHOOTDOWN.processors_holding(root)

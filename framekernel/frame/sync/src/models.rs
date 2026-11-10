@@ -87,6 +87,15 @@
 //!   stacks): a slot given back and reclaimed is taken again only once its shootdown has
 //!   completed, so its next holder finds no processor still holding the old translation, and
 //!   what it held is released only after every access through such a translation.
+//! - A change to a space made in rounds (`Confirmation::change`, which `origin_frame::userspace`
+//!   runs for an unmap and a protect), with an initiator that gives up after `IMPATIENCE` polls,
+//!   so that its shootdowns do stall in some executions. However they go, the change ends with
+//!   every page it names out of the tables, whether a round's shootdown stalls (S3-5b's review,
+//!   finding A, case b) or the flush that should make an earlier stall good does (case a). The
+//!   frame is released only if a completed shootdown covered it after its round, its own or a
+//!   flush of the whole space, as the model's own record of the shootdowns says, and then once,
+//!   after every access through the old translation. A change that succeeds leaves the space
+//!   confirmed; one that returns a stall leaves it unconfirmed.
 //!
 //! # What is not proved
 //!
@@ -120,7 +129,9 @@
 //!   after `PATIENCE` polls and the model fails with `NO_ANSWER`, which is how a bug that stops
 //!   an answer shows (the control `shootdown_waiting_initiator_does_not_serve`). No correct
 //!   execution gets there (`PATIENCE` says why). The leak that follows a `Stalled` is tested on
-//!   the host only.
+//!   the host only, except in a change made in rounds, whose models give up after `IMPATIENCE`
+//!   polls on purpose. Those have two rounds and one processor in the space; more rounds, a
+//!   round refused, and `prepare` are tested on the host (`shootdown.rs`).
 //! - The slots of a region beyond a reclaim and a take: a slot kept with its mapping for reuse,
 //!   `abandon`, `leak`, `trim`, and a reclaim whose shootdown stalls are tested on the host only
 //!   (`slots.rs`), and so is more than one slot.
@@ -162,7 +173,7 @@ use loom::thread::{self, JoinHandle};
 use crate::floor::MonotonicFloor;
 use crate::refcount::RefCount;
 use crate::runqueue::RunQueue;
-use crate::shootdown::{Request, Scope, Shootdown, TlbHardware};
+use crate::shootdown::{Confirmation, Request, Rounds, Scope, Shootdown, Stalled, TlbHardware};
 use crate::slots::Slots;
 use crate::wait::{Scheduler, TimedOut, WaitQueue};
 use crate::{RwLock, SpinLock};
@@ -2159,5 +2170,227 @@ fn slots_reclaimed_slot_is_taken_only_after_its_shootdown() {
             assert!(matches!(outcome, Some(Ok(_))), "{NO_ANSWER}");
             world.finish(vec![holding, taking]);
         },
+    );
+}
+
+// ---------------------------------------------------------------- a change that stalls
+
+/// How many readings of its clock the initiator of a stalling change waits for its answers
+/// before it gives up: fewer than the spin bound lets it poll, so that executions in which a
+/// shootdown stalls are explored. [`PATIENCE`] keeps every other model from stalling.
+const IMPATIENCE: u64 = 2;
+
+/// A [`TlbCpu`] that gives up on a shootdown after [`IMPATIENCE`] polls.
+struct ImpatientCpu(TlbCpu);
+
+impl TlbHardware for ImpatientCpu {
+    fn this_cpu(&self) -> usize {
+        self.0.this_cpu()
+    }
+
+    fn invalidate(&self, request: Request) {
+        self.0.invalidate(request);
+    }
+
+    fn send_ipi(&self, cpu: usize) {
+        self.0.send_ipi(cpu);
+    }
+
+    fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.0.without_interrupts(f)
+    }
+
+    fn now(&self) -> u64 {
+        self.0.now()
+    }
+
+    fn patience(&self) -> u64 {
+        IMPATIENCE
+    }
+
+    fn current_root(&self) -> u64 {
+        self.0.current_root()
+    }
+}
+
+/// The page after [`THE_PAGE`]: what the second round of a stalling change takes.
+const NEXT_PAGE: u64 = THE_PAGE + crate::shootdown::PAGE;
+/// What a model says when a change returned with a page of it as it was.
+const UNFINISHED: &str = "a change that stalled left a page as it was";
+/// What a model says when a change gave back a frame that no completed shootdown covered.
+const GIVEN_BACK: &str = "a change gave back what a stalled shootdown left reachable";
+/// What a model says when a change that returned a stall left its space confirmed.
+const FORGOTTEN: &str = "a change that stalled left its space confirmed";
+
+/// A space's unmap of [`THE_PAGE`] and [`NEXT_PAGE`], one round each, as `UserSpace::unmap`
+/// makes it: each round takes its page's entry out of the tables, and the frame of
+/// [`THE_PAGE`] is kept until a completed shootdown or flush covers it, then released, or lost.
+struct TwoPages<'a> {
+    world: Arc<TlbWorld>,
+    frame: Arc<ModelFrame>,
+    /// [`NEXT_PAGE`]'s entry ([`THE_PAGE`]'s is the world's).
+    next_mapped: bool,
+    rounds: u32,
+    /// Whether the first round has taken [`THE_PAGE`] out of the tables: what the model's own
+    /// record of the shootdowns reads, apart from the code under test.
+    first_made: &'a core::cell::Cell<bool>,
+    kept: bool,
+    released: u32,
+}
+
+impl TwoPages<'_> {
+    fn give_back(&mut self) {
+        if core::mem::take(&mut self.kept) {
+            reuse(&self.frame);
+            self.released += 1;
+        }
+    }
+}
+
+impl Rounds for TwoPages<'_> {
+    type Error = Stalled;
+
+    fn prepare(&mut self) -> Result<(), Stalled> {
+        Ok(())
+    }
+
+    fn round(&mut self) -> Result<Option<Request>, Stalled> {
+        self.rounds += 1;
+        Ok(match self.rounds {
+            1 => {
+                self.world.pte.store(0, Relaxed);
+                self.first_made.set(true);
+                self.kept = true;
+                Some(Request::page(THE_PAGE))
+            }
+            2 => {
+                self.next_mapped = false;
+                Some(Request::page(NEXT_PAGE))
+            }
+            _ => None,
+        })
+    }
+
+    fn shot(&mut self) {
+        self.give_back();
+    }
+
+    fn flushed(&mut self) {
+        self.give_back();
+    }
+
+    fn lost(&mut self) {
+        self.kept = false;
+    }
+}
+
+/// Unmaps [`THE_PAGE`] and [`NEXT_PAGE`] with an impatient initiator, while a processor in the
+/// space holds [`THE_PAGE`]'s translation and touches its frame before and after the interrupt.
+/// `unconfirmed`: an earlier change's shootdown stalled, so the change starts with a flush.
+///
+/// However the shootdowns go, the change ends with both pages out of the tables, and the frame
+/// is released only if a completed shootdown covered it after its round: its own, or a flush of
+/// the whole space. Then it is released once, after every access through the old translation
+/// (Loom's cell). If the change succeeds, the space is confirmed. If it returns a stall, the
+/// space stays unconfirmed, and the frame was released only if its own round's shootdown
+/// completed before a later one stalled.
+fn stalling_change(unconfirmed: bool) {
+    let world = TlbWorld::new();
+    let (near, user) = (ImpatientCpu(tlb_cpu(&world, 0)), tlb_cpu(&world, 1));
+    world.shootdown.mark_online(&near);
+    world.shootdown.mark_online(&user);
+    user.switch_to(THE_SPACE, || ());
+    world.tlb[1].store(true, Relaxed);
+    let frame = Arc::new(ModelFrame::new(0));
+    let running = {
+        let (me, frame) = (user.clone(), Arc::clone(&frame));
+        (
+            1,
+            thread::spawn(move || {
+                me.touch(&frame);
+                // Each interrupt is served, and the user code it interrupted touches the page
+                // again. Every wake checks for the end first: when every shootdown stalled
+                // before this thread ran, their interrupts and the end's are one wake.
+                loop {
+                    me.world.kick[1].wait();
+                    if me.world.stop.load(Relaxed) {
+                        return;
+                    }
+                    me.world.shootdown.service(&me);
+                    me.touch(&frame);
+                }
+            }),
+        )
+    };
+    let confirmation = Confirmation::new();
+    if unconfirmed {
+        let _ = confirmation.record(Err(Stalled { cpu: 1 }));
+    }
+    let first_made = core::cell::Cell::new(false);
+    let mut change = TwoPages {
+        world: Arc::clone(&world),
+        frame: Arc::clone(&frame),
+        next_mapped: true,
+        rounds: 0,
+        first_made: &first_made,
+        kept: false,
+        released: 0,
+    };
+    // The model's own record: whether a shootdown that names the frame's page completed after
+    // its round took the page out of the tables.
+    let mut covered = false;
+    let outcome = confirmation.change(&mut change, |request| {
+        let done = world
+            .shootdown
+            .shoot(&near, request, Scope::Space(THE_SPACE));
+        covered |= first_made.get()
+            && done.is_ok()
+            && (request == Request::page(THE_PAGE) || request == Request::NonGlobal);
+        done
+    });
+    assert!(
+        world.pte.load(Relaxed) == 0 && !change.next_mapped,
+        "{UNFINISHED}"
+    );
+    if covered {
+        assert_eq!(change.released, 1, "the frame was not freed once");
+    } else {
+        assert_eq!(change.released, 0, "{GIVEN_BACK}");
+    }
+    if outcome.is_ok() {
+        assert!(covered, "a change succeeded with its frame not covered");
+        assert!(!user.holds(), "{STALE}");
+        assert!(
+            !confirmation.is_unconfirmed(),
+            "a confirmed change left a mark"
+        );
+    } else {
+        assert!(confirmation.is_unconfirmed(), "{FORGOTTEN}");
+    }
+    world.finish(vec![running]);
+}
+
+/// S3-5b's review, finding A, case b: the first round's shootdown may stall. The second round
+/// is still made, and the frame waits for the flush at the end.
+#[test]
+fn a_change_whose_round_stalls_is_still_made_and_frees_only_what_a_flush_covered() {
+    check(
+        "a_change_whose_round_stalls_is_still_made_and_frees_only_what_a_flush_covered",
+        preempted(2, SPINS),
+        preempted(3, SPINS),
+        || stalling_change(false),
+    );
+}
+
+/// Finding A, case a: the space is unconfirmed when the change starts, and the flush that
+/// should make that good may stall too. The change is still made, and the flush at its end
+/// decides what happens to the frame.
+#[test]
+fn a_change_whose_first_flush_stalls_is_still_made() {
+    check(
+        "a_change_whose_first_flush_stalls_is_still_made",
+        preempted(2, SPINS),
+        preempted(3, SPINS),
+        || stalling_change(true),
     );
 }
