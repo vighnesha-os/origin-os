@@ -236,6 +236,21 @@ impl<'a> FrameAllocator<'a> {
                 .is_some_and(|w| w & (1 << (frame % BITS)) == 0)
     }
 
+    /// Whether the frame at `addr` is allocatable and free right now.
+    pub fn frame_is_free(&self, addr: u64) -> bool {
+        addr.is_multiple_of(FRAME) && self.allocatable(addr / FRAME) && self.is_free(addr / FRAME)
+    }
+
+    /// Allocates exactly the frame at `addr`, if it is free: for a proof that needs one
+    /// particular frame back. `false` otherwise, and nothing changes.
+    pub fn claim(&mut self, addr: u64) -> bool {
+        if !self.frame_is_free(addr) {
+            return false;
+        }
+        self.set_free(addr / FRAME, false);
+        true
+    }
+
     /// Allocates `count` physically contiguous frames whose first frame number is a
     /// multiple of `align` (in frames; 0 or 1 means any), and returns the address of the
     /// first. First fit, scanning from frame 1; for the rare large allocations only.
@@ -315,6 +330,33 @@ impl<'a> FrameAllocator<'a> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn a_frame_can_be_claimed_only_while_it_is_free() {
+        let regions = [MemoryRegion {
+            base: FRAME,
+            pages: 8,
+            kind: RegionKind::Usable as u32,
+            reserved: 0,
+        }];
+        let mut bitmap = vec![0u64; 4];
+        let mut a = FrameAllocator::new(&mut bitmap, &regions, &[]).unwrap();
+        let before = a.free_frames();
+        let frame = 4 * FRAME;
+        assert!(a.frame_is_free(frame));
+        assert!(a.claim(frame));
+        assert!(!a.frame_is_free(frame), "taken");
+        assert_eq!(a.free_frames(), before - 1);
+        assert!(!a.claim(frame), "twice");
+        assert_eq!(a.free_frames(), before - 1);
+        a.free(frame).unwrap();
+        assert!(a.claim(frame), "free again");
+        // What the allocator does not own, or is not a frame, cannot be claimed.
+        assert!(!a.claim(frame + 1));
+        assert!(!a.claim(0));
+        assert!(!a.claim(100 * FRAME));
+        assert!(!a.frame_is_free(100 * FRAME));
+    }
 
     fn region(base: u64, pages: u64, kind: RegionKind) -> MemoryRegion {
         MemoryRegion {

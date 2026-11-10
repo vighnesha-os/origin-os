@@ -4,7 +4,8 @@
 use alloc::alloc::{Layout, alloc, dealloc};
 use core::ops::Deref;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering, fence};
+
+use origin_sync::refcount::RefCount;
 
 /// A counted reference to a kernel object, created with [`ObjectRef::try_new`], which
 /// reports an allocation failure instead of stopping the kernel the way `Arc::new` would
@@ -15,7 +16,7 @@ pub struct ObjectRef<T> {
 }
 
 struct Counted<T> {
-    count: AtomicUsize,
+    count: RefCount,
     value: T,
 }
 
@@ -38,7 +39,7 @@ impl<T> ObjectRef<T> {
         // one there is in bounds, aligned, and overwrites nothing that needs dropping.
         unsafe {
             inner.write(Counted {
-                count: AtomicUsize::new(1),
+                count: RefCount::one(),
                 value,
             })
         };
@@ -55,7 +56,7 @@ impl<T> ObjectRef<T> {
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
         // SAFETY: as in `deref`; the count is read through a shared reference, so nothing here
         // aliases a `&mut` someone else may hold while the check is still undecided.
-        let unique = unsafe { this.inner.as_ref() }.count.load(Ordering::Acquire) == 1;
+        let unique = unsafe { this.inner.as_ref() }.count.is_unique();
         if !unique {
             return None;
         }
@@ -80,7 +81,7 @@ impl<T> Clone for ObjectRef<T> {
     fn clone(&self) -> Self {
         // SAFETY: as in `deref`.
         let counted = unsafe { self.inner.as_ref() };
-        counted.count.fetch_add(1, Ordering::Relaxed);
+        counted.count.retain();
         Self { inner: self.inner }
     }
 }
@@ -89,11 +90,11 @@ impl<T> Drop for ObjectRef<T> {
     fn drop(&mut self) {
         // SAFETY: as in `deref`; this reference is still counted here.
         let counted = unsafe { self.inner.as_ref() };
-        if counted.count.fetch_sub(1, Ordering::Release) != 1 {
+        // Everything the other holders did with the object happens before it is destroyed:
+        // the count's own ordering (`RefCount::release`).
+        if !counted.count.release() {
             return;
         }
-        // Everything the other holders did with the object happens before it is destroyed.
-        fence(Ordering::Acquire);
         // SAFETY: this was the last reference, so nothing else can reach the object.
         unsafe { self.inner.drop_in_place() };
         // SAFETY: allocated by `try_new` with this layout, destroyed just above, never freed

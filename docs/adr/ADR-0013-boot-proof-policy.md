@@ -106,6 +106,8 @@ It claims only what was recorded. "Passed" means the proof found nothing wrong: 
 | Wait queues (`wait::prove`, split) | Items lost or reordered, or a thread never woke | No | IPC, drivers |
 | IPC and handles (`ipc_proof::prove`) | A handle or quota check let a hostile call through, or a call produced a status its definition does not declare. This one result also covers a leak check | No | Ring 3 |
 | Process and thread objects (`ipc_proof::prove_objects`) | A handle of the wrong type or with too few rights was accepted, a process's memory outlived its last thread, `TERMINATED` came before the memory went or did not come, a process ID was reused, or a wait on a process handle was not cancelled. This one result also covers a leak check | No: a failure is a wrong status or a count, and every wait in it has a deadline far above any load seen | Ring 3 |
+| Kernel half fixed at boot (`aspace::prove_kernel_half`) | A process's top-level entries are not the ones the kernel fixed at boot, or a kernel mapping made after the process was created is missing from it: kernel code that reaches such a mapping from that process faults, with the kernel's own tables correct | No: 256 table entries compared and one read, with no timing | Ring 3, and every kernel mapping made after boot |
+| Live address spaces (`aspace::prove`) | A thread kept using a page after its unmap returned, or a frame was reused while a processor could still reach it, a permission stayed in force after it was withdrawn, a frame shared by two spaces was freed while one still mapped it, or a shootdown interrupted a processor that does not have the space loaded. This one result also covers a leak check | No: a fault, a report or a count, and every wait has a five-second budget far above any load seen | Everything that maps memory in a running process |
 
 Apart from the SMEP proof's stale translation above (Intel, fixed on the CI branch), none of the Refuse proofs has failed on a real processor in the runs read: 59 complete boots on AMD EPYC processors through KVM (research ledger §3). AMD only, and virtual machines, so this is the strongest evidence the project has rather than proof.
 
@@ -182,6 +184,19 @@ Each was a proof that could not tell a fault from an absent device or a machine 
 | C15 | The boot-step guards recorded as failing | `boot refused: boot steps run once failed ...`, last line. |
 | C16 | The monotonic clock's proof recorded as failed | The boot goes on to the end: `degraded: 49 of 50 proofs passed; failed: monotonic clock`. |
 | C17 | The console's screen sections recorded as failed | The boot goes on to the end: `degraded: 49 of 50 proofs passed; failed: console screen sections`. |
+
+**Controls of the address-space proofs (N14 step 3, S3-5a; 2026-11-10, QEMU 11.1.3 TCG, Intel VT-d, 2 processors unless stated):** temporary edits to the framework, each booted with the ordinary `boot_failures`, so the boot stops at the first failing line. The serial log is what was checked. Some needed a second to sixth boot because the host, at load averages of 10 to 70 from other sessions' work, failed the clock or timer proofs first; those boots are not counted.
+
+| # | Edit | Result |
+|---|---|---|
+| C18 | ADR-0004 H2 undone: no `reserve_upper_half`, and a kernel half with empty slots accepted (the code before S3-5a) | `the kernel half is the same tables in every space: false; ... visible from that space: false ...: address spaces failed`. |
+| C19 | A shootdown for one address space asks nobody (`Scope::Space` matches no processor) | The reader on the other processor is never interrupted: `the thread faulted at 0x500000 (#PF error 0x4): false; it read the secret: true ...: address spaces failed`. |
+| C20 | `protect` sends no shootdown | The writer on the other processor goes on writing through its cached translation: `a page made read-only under a running writer on another processor: the writer faulted at 0x500000 (#PF error 0x7): false; Ok(Change { pages: 1, shootdowns: 1, interrupts: 0 }): address spaces failed`. |
+| C21 | A shootdown for one address space asks every processor (4 processors) | The unmap's cost is three interrupts, not one: `... Ok(Change { pages: 1, shootdowns: 1, interrupts: 3 }): address spaces failed`. |
+| C22 | `map_shared` maps a private copy instead of the shared frame | `a frame shared by two spaces: ... the frame still in use: false ...: address spaces failed`. |
+| C23 | `unmap` takes the record and frees the frame but leaves the leaf present | `the thread faulted at 0x500000 (#PF error 0x4): false; it read the secret: true ...: address spaces failed`: the frame was reused while still mapped, and the old owner read the new owner's data. |
+
+Two controls run in every boot and need no edit: a space lacking the probe page's slot faults where every space must not, and a reader whose page is still mapped does read the secret that the unmapped reader must not. The order "free only after the shootdown" cannot be seen from a boot, since the frame is claimed only after `unmap` returns: its control is Loom's (`released_before_the_shootdown`).
 
 **The legacy-free machine (`boot-legacy-free`, in `boot-matrix`):** `-machine pit=off,i8042=off` boots the whole kernel. Before F3 it read the absent port 61h as 0xFF and reported `calibrated against the PIT: 0 kHz`, and failed. After, it calibrates against the ACPI PM timer (agreeing with one RTC second to 0.006 %), reports that it cannot prove the two PIT-based I/O APIC proofs, that the FADT says it has no 8042, and `boot verdict: 50 of 50 proofs passed`.
 

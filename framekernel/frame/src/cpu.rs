@@ -968,7 +968,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     }
     // Another processor changed a kernel mapping: invalidate it here, then acknowledge.
     if frame.vector == u64::from(crate::tlb::SHOOTDOWN_VECTOR) {
-        crate::tlb::service();
+        crate::tlb::interrupted();
         // SAFETY: as for the timer: x2APIC mode is on (only processors with an active
         // scheduler are sent this vector), and the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
@@ -1353,39 +1353,10 @@ pub fn read_cr3() -> u64 {
 /// code, stack and data): in practice the kernel's, or a process PML4 sharing its half.
 pub unsafe fn write_cr3(root: u64) {
     let me = this_cpu().get();
-    // Both roots count as loaded while the switch is in flight: `root_loaded` must see the
-    // old one until the processor has really left it, and the new one from before it arrives.
-    if let Some(previous) = PREVIOUS_ROOT.get(me) {
-        previous.store(read_cr3(), Ordering::Release);
-    }
-    if let Some(loaded) = LOADED_ROOT.get(me) {
-        loaded.store(root, Ordering::Release);
-    }
-    // SAFETY: the caller's contract.
-    unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
-    if let Some(previous) = PREVIOUS_ROOT.get(me) {
-        previous.store(0, Ordering::Release);
-    }
-}
-
-/// Each CPU index's currently loaded root (0 before the first switch): what [`root_loaded`]
-/// answers from.
-static LOADED_ROOT: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
-/// The root a processor is switching away from, while its CR3 write is in flight (0 otherwise).
-static PREVIOUS_ROOT: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
-
-/// Whether any processor has the address space `root` loaded. A user space's tables are freed
-/// only when this is false (a processor that is still running in it would be left on freed
-/// tables). Each processor's current root is read before the root it may be leaving, the
-/// reverse of the order `write_cr3` writes them, so a processor in the middle of a switch
-/// counts as holding both.
-pub fn root_loaded(root: u64) -> bool {
-    LOADED_ROOT
-        .iter()
-        .zip(PREVIOUS_ROOT.iter())
-        .any(|(loaded, previous)| {
-            loaded.load(Ordering::Acquire) == root || previous.load(Ordering::Acquire) == root
-        })
+    crate::tlb::switch_space(me, read_cr3(), root, || {
+        // SAFETY: the caller's contract.
+        unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+    });
 }
 
 /// The furthest a backtrace reads above the starting frame pointer, and the largest single
@@ -1781,6 +1752,23 @@ pub fn flush_tlb_all() {
                 cr4 = out(reg) _,
                 tmp = out(reg) _,
                 options(nostack),
+            );
+        }
+    });
+}
+
+/// Invalidates this processor's TLB entries that are not global: a CR3 reload with its own value.
+pub fn flush_tlb_non_global() {
+    without_interrupts(|| {
+        // SAFETY: CPL 0. CR3 is reloaded with the value it holds, so nothing about what is
+        // mapped changes, only what the TLB holds. Interrupts are off, so no handler sees the
+        // processor between the two instructions.
+        unsafe {
+            asm!(
+                "mov {tmp}, cr3",
+                "mov cr3, {tmp}",
+                tmp = out(reg) _,
+                options(nostack, preserves_flags),
             );
         }
     });

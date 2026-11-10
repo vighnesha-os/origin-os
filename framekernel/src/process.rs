@@ -4,8 +4,8 @@
 //! A process owns its address space, its handle table, the user frames it maps and the
 //! threads the kernel started in it:
 //! - Its own PML4, whose lower half holds only its own pages and whose kernel half (entries
-//!   256–511) is a copy of the kernel's (ADR-0004 H2), so the kernel is mapped the same in
-//!   every address space.
+//!   256–511) points at the kernel's tables, allocated once at boot (ADR-0004 H2): so the
+//!   kernel is mapped the same in every address space, whenever the mapping was made.
 //! - Its page tables come from the frame allocator. Their [`TableMemory`] answers only for
 //!   frames it allocated itself, so the paging library can never be led into a frame the
 //!   process does not own.
@@ -34,8 +34,8 @@
 //! cannot be created is an error for its creator, never a stopped kernel.
 //!
 //! The first slice has no process-creation or memory system calls: the kernel builds each
-//! process and maps its pages before any of its threads runs, so the page tables do not
-//! change while it lives.
+//! process and maps its pages before any of its threads runs. A space can change while its
+//! threads run (`origin_frame::userspace`), but only the boot proofs change one so far.
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
