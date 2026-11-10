@@ -5,6 +5,7 @@
 //! way), so they install their entry points once at boot, before interrupts can arrive. A
 //! *frame* here is the address of a thread's saved register frame on its kernel stack: the trap
 //! entry passes the interrupted one, and the scheduler hook answers which to resume.
+#![forbid(unsafe_code)]
 
 use core::marker::PhantomData;
 

@@ -6,6 +6,7 @@
 //! result is the exact `ticks × 10⁹ / hz` rounded down or up (so exact whenever that is a
 //! whole number of nanoseconds), and it never decreases as `ticks` grows. The kernel binary (`src/clock.rs`) holds the clock
 //! state and the hardware access.
+#![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 

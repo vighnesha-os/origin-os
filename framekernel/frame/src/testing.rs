@@ -2,6 +2,7 @@
 //! (CLAUDE.md §72: fuzzing; malicious-input handling). Deterministic, so a failure is
 //! reproduced by its seed and case number; no fuzzing crate, so it runs on stable Rust
 //! with `cargo test`.
+#![forbid(unsafe_code)]
 
 /// xorshift64* (Vigna, 2016): small, fast and good enough to choose mutations.
 pub(crate) struct Rng(u64);

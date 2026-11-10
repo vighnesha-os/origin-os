@@ -5,6 +5,7 @@
 //! Neither Intel nor AMD promises that two processors' counters agree, so every reading passes
 //! through a floor shared by all processors ([`MonotonicFloor`], ADR-0012): no caller on any
 //! processor can be given less than a caller has been given before, whatever the TSCs do.
+#![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

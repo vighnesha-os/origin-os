@@ -41,6 +41,7 @@
 //! It must hold no lock that another processor may wait for with interrupts disabled: that
 //! processor could then never take the interrupt. And what the shootdown is for must have left
 //! the page tables before the call.
+#![forbid(unsafe_code)]
 
 use core::sync::atomic::Ordering;
 

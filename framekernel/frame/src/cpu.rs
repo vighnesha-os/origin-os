@@ -10,6 +10,15 @@
 //! It also switches to the kernel's own page tables ([`load_page_tables`]) and provides
 //! *probes*: single deliberate accesses that report a page fault instead of taking it, which
 //! prove on the real processor that the page protections hold.
+//!
+//! # The flags, and `preserves_flags`
+//!
+//! An `asm!` block declares `preserves_flags` only if every instruction in it is on the list
+//! that `cargo xtask check` keeps (`developer-tools/xtask/src/asmflags.rs`): the instructions
+//! that both Intel's and AMD's manuals say change no status flag (CLAUDE.md §13). A move to or
+//! from a control or debug register is not on it: AMD says it affects no flag, and Intel says it
+//! leaves all six status flags undefined (`docs/research/2026-11-10-asm-flags.md`). Without the
+//! option the compiler assumes the block may change the flags, which is always true.
 
 use core::arch::{asm, naked_asm};
 use core::ptr;
@@ -512,8 +521,9 @@ fn init_cpu_state() {
             options(nostack),
         );
     }
-    // SAFETY: CPL 0; DR7's reset value disarms every breakpoint, and nothing here uses one.
-    unsafe { asm!("mov dr7, {}", in(reg) DR7_CLEAR, options(nostack, preserves_flags)) };
+    // SAFETY: CPL 0; DR7's reset value disarms every breakpoint, and nothing here uses one. The
+    // flags are not preserved: Intel leaves them undefined after a move to a debug register.
+    unsafe { asm!("mov dr7, {}", in(reg) DR7_CLEAR, options(nostack)) };
     if has_sysenter() {
         // SAFETY: CPL 0; SEP says the MSR exists, and a zero selector only makes SYSENTER
         // raise #GP (Intel SDM Vol. 2B, SYSENTER).
@@ -524,24 +534,25 @@ fn init_cpu_state() {
 /// CR4.
 fn read_cr4() -> u64 {
     let value: u64;
-    // SAFETY: reading CR4 at CPL 0 has no side effect.
-    unsafe { asm!("mov {}, cr4", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: reading CR4 at CPL 0 has no side effect but the one on the flags (see the module
+    // documentation), which this block does not claim to preserve.
+    unsafe { asm!("mov {}, cr4", out(reg) value, options(nomem, nostack)) };
     value
 }
 
 /// CR0.
 fn read_cr0() -> u64 {
     let value: u64;
-    // SAFETY: reading CR0 at CPL 0 has no side effect.
-    unsafe { asm!("mov {}, cr0", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: as `read_cr4`.
+    unsafe { asm!("mov {}, cr0", out(reg) value, options(nomem, nostack)) };
     value
 }
 
 /// DR7.
 fn read_dr7() -> u64 {
     let value: u64;
-    // SAFETY: reading DR7 at CPL 0 has no side effect.
-    unsafe { asm!("mov {}, dr7", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: as `read_cr4`; Intel says the same of the debug registers.
+    unsafe { asm!("mov {}, dr7", out(reg) value, options(nomem, nostack)) };
     value
 }
 
@@ -875,7 +886,8 @@ pub fn idle_disabling() {
 /// Touches only those registers: kernel code is soft-float, so nothing else uses them.
 pub fn xmm_load(values: [u64; 4]) {
     // SAFETY: SSE is enabled on this processor (`enable_simd`); these instructions only load
-    // the named XMM registers from general registers.
+    // the named XMM registers from general registers. No `preserves_flags`: `movq` is an SSE
+    // instruction, and none is on the list of the module documentation.
     unsafe {
         asm!(
             "movq xmm0, {0}",
@@ -884,7 +896,7 @@ pub fn xmm_load(values: [u64; 4]) {
             "movq xmm15, {3}",
             in(reg) values[0], in(reg) values[1], in(reg) values[2], in(reg) values[3],
             out("xmm0") _, out("xmm3") _, out("xmm7") _, out("xmm15") _,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
 }
@@ -892,7 +904,8 @@ pub fn xmm_load(values: [u64; 4]) {
 /// Reads XMM0, XMM3, XMM7 and XMM15 (the SIMD state the boot proof checks).
 pub fn xmm_read() -> [u64; 4] {
     let (a, b, c, d): (u64, u64, u64, u64);
-    // SAFETY: reads the named XMM registers; no memory, no stack.
+    // SAFETY: reads the named XMM registers; no memory, no stack. No `preserves_flags`, as in
+    // `xmm_load`.
     unsafe {
         asm!(
             "movq {0}, xmm0",
@@ -900,7 +913,7 @@ pub fn xmm_read() -> [u64; 4] {
             "movq {2}, xmm7",
             "movq {3}, xmm15",
             out(reg) a, out(reg) b, out(reg) c, out(reg) d,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
     [a, b, c, d]
@@ -1208,8 +1221,8 @@ pub fn interrupts_enabled() -> bool {
 /// CR2: the linear address of the last page fault.
 fn read_cr2() -> u64 {
     let value: u64;
-    // SAFETY: reading CR2 at CPL 0 has no side effects.
-    unsafe { asm!("mov {}, cr2", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: as `read_cr4`.
+    unsafe { asm!("mov {}, cr2", out(reg) value, options(nomem, nostack)) };
     value
 }
 
@@ -1355,8 +1368,8 @@ pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
 /// CR3: the physical address of the live PML4 (and, with PCIDs off, nothing else).
 pub fn read_cr3() -> u64 {
     let value: u64;
-    // SAFETY: reading CR3 at CPL 0 has no side effect.
-    unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: as `read_cr4`.
+    unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack)) };
     value
 }
 
@@ -1381,8 +1394,9 @@ pub unsafe fn write_cr3(root: u64) {
 ///
 /// As for [`write_cr3`].
 pub(crate) unsafe fn load_cr3(root: u64) {
-    // SAFETY: the caller's contract.
-    unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+    // SAFETY: the caller's contract. The flags are not preserved: Intel leaves them undefined
+    // after a move to a control register.
+    unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack)) };
 }
 
 /// The furthest a backtrace reads above the starting frame pointer, and the largest single
@@ -1430,9 +1444,10 @@ pub fn ordered_tsc(use_rdtscp: bool) -> u64 {
             asm!("rdtscp", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack, preserves_flags));
         }
     } else {
-        // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory.
+        // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory. No
+        // `preserves_flags`: Intel's entry for LFENCE does not say what it does to the flags.
         unsafe {
-            asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags));
+            asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
         }
     }
     (u64::from(high) << 32) | u64::from(low)
@@ -1483,7 +1498,7 @@ pub unsafe fn load_page_tables(root: u64) {
     // SAFETY: the caller's contract. EFER is read and written back with only NXE added
     // (NX is supported, so the bit is defined). WP only restricts supervisor writes to
     // pages already marked read-only. Loading CR3 switches to tables the caller vouches
-    // for and flushes every non-global TLB entry.
+    // for and flushes every non-global TLB entry. The flags are not preserved: `or` writes them.
     unsafe {
         asm!(
             "mov ecx, {efer}",
@@ -1502,7 +1517,7 @@ pub unsafe fn load_page_tables(root: u64) {
             out("eax") _,
             out("ecx") _,
             out("edx") _,
-            options(nostack, preserves_flags),
+            options(nostack),
         );
     }
 }
@@ -1735,7 +1750,7 @@ pub unsafe fn enable_global_pages() -> bool {
         return false;
     }
     // SAFETY: the caller's contract. Each write changes only CR4.PGE, which affects only
-    // which translations the TLB keeps.
+    // which translations the TLB keeps. The flags are not preserved: `and` and `or` write them.
     unsafe {
         asm!(
             "mov {tmp}, cr4",
@@ -1746,7 +1761,7 @@ pub unsafe fn enable_global_pages() -> bool {
             clear = in(reg) !CR4_PGE,
             pge = in(reg) CR4_PGE,
             tmp = out(reg) _,
-            options(nostack, preserves_flags),
+            options(nostack),
         );
     }
     true
@@ -1788,13 +1803,14 @@ pub fn flush_tlb_non_global() {
     without_interrupts(|| {
         // SAFETY: CPL 0. CR3 is reloaded with the value it holds, so nothing about what is
         // mapped changes, only what the TLB holds. Interrupts are off, so no handler sees the
-        // processor between the two instructions.
+        // processor between the two instructions. The flags are not preserved: Intel leaves
+        // them undefined after a move to or from a control register.
         unsafe {
             asm!(
                 "mov {tmp}, cr3",
                 "mov cr3, {tmp}",
                 tmp = out(reg) _,
-                options(nostack, preserves_flags),
+                options(nostack),
             );
         }
     });
@@ -1894,7 +1910,8 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
     // CR0: clear EM and TS, set MP, so SSE instructions run and do not fault to an
     // emulator or a (nonexistent) lazy-FPU handler; set NE, so an x87 error raises #MF
     // (INIT leaves it clear on an AP).
-    // SAFETY: the caller's contract; these CR0 bits only configure FPU/SSE behaviour.
+    // SAFETY: the caller's contract; these CR0 bits only configure FPU/SSE behaviour. The flags
+    // are not preserved: `and` and `or` write them.
     unsafe {
         asm!(
             "mov {t}, cr0",
@@ -1904,7 +1921,7 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
             clear = in(reg) !(CR0_EM | CR0_TS),
             set = in(reg) CR0_MP | CR0_NE,
             t = out(reg) _,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
     // CR4: OSFXSR and OSXMMEXCPT for SSE; OSXSAVE when the CPU has XSAVE.
@@ -1912,7 +1929,8 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
     if features.xsave {
         cr4_bits |= CR4_OSXSAVE;
     }
-    // SAFETY: the caller's contract; these CR4 bits enable FXSAVE/SSE and XSAVE.
+    // SAFETY: the caller's contract; these CR4 bits enable FXSAVE/SSE and XSAVE. The flags are
+    // not preserved: `or` writes them.
     unsafe {
         asm!(
             "mov {t}, cr4",
@@ -1920,7 +1938,7 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
             "mov cr4, {t}",
             bits = in(reg) cr4_bits,
             t = out(reg) _,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
     let mut xcr0 = 0;
@@ -1983,14 +2001,16 @@ pub unsafe fn fpu_init_area(area: u64) {
 pub unsafe fn fpu_save(area: u64) {
     if USE_XSAVE.load(core::sync::atomic::Ordering::Relaxed) {
         // XSAVE with the full mask (EDX:EAX = all ones): save every enabled component.
-        // SAFETY: the caller's contract; the area is large enough (CPUID's maximum).
+        // SAFETY: the caller's contract; the area is large enough (CPUID's maximum). No
+        // `preserves_flags` on any of the four blocks that save or restore this state: the
+        // option also covers the x87 status word and MXCSR, which is the state they handle.
         unsafe {
-            asm!("xsave [{a}]", a = in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, preserves_flags));
+            asm!("xsave [{a}]", a = in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
         }
     } else {
         // SAFETY: as above; FXSAVE needs 512 bytes, 16-byte aligned.
         unsafe {
-            asm!("fxsave [{a}]", a = in(reg) area, options(nostack, preserves_flags));
+            asm!("fxsave [{a}]", a = in(reg) area, options(nostack));
         }
     }
 }
@@ -2002,14 +2022,15 @@ pub unsafe fn fpu_save(area: u64) {
 /// As for [`fpu_save`]; `area` must hold state written by [`fpu_save`] or [`fpu_init_area`].
 pub unsafe fn fpu_restore(area: u64) {
     if USE_XSAVE.load(core::sync::atomic::Ordering::Relaxed) {
-        // SAFETY: the caller's contract; the area holds a valid XSAVE image.
+        // SAFETY: the caller's contract; the area holds a valid XSAVE image. The restore
+        // replaces the x87 status word and MXCSR, so it cannot claim to preserve the flags.
         unsafe {
-            asm!("xrstor [{a}]", a = in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, preserves_flags));
+            asm!("xrstor [{a}]", a = in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
         }
     } else {
         // SAFETY: as above.
         unsafe {
-            asm!("fxrstor [{a}]", a = in(reg) area, options(nostack, preserves_flags));
+            asm!("fxrstor [{a}]", a = in(reg) area, options(nostack));
         }
     }
 }
@@ -2037,7 +2058,8 @@ pub unsafe fn enable_smep_smap() -> (bool, bool) {
         | if smap { CR4_SMAP } else { 0 }
         | if umip { CR4_UMIP } else { 0 };
     // SAFETY: the caller's contract; setting supported CR4 bits only adds restrictions on
-    // supervisor accesses to user pages and on user-mode descriptor reads.
+    // supervisor accesses to user pages and on user-mode descriptor reads. The flags are not
+    // preserved: `or` writes them.
     unsafe {
         asm!(
             "mov {tmp}, cr4",
@@ -2045,7 +2067,7 @@ pub unsafe fn enable_smep_smap() -> (bool, bool) {
             "mov cr4, {tmp}",
             bits = in(reg) bits,
             tmp = out(reg) _,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
     (smep, smap)

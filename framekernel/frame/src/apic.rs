@@ -10,6 +10,7 @@
 //! Origin targets 2026-era Intel and AMD platforms, which all implement x2APIC, so only
 //! x2APIC mode (MSR access, no MMIO mapping) is supported. Everything here is arithmetic
 //! and register encodings, tested on the host; the binary does the MSR and port I/O.
+#![forbid(unsafe_code)]
 
 /// IA32_APIC_BASE MSR.
 pub const IA32_APIC_BASE: u32 = 0x1B;
