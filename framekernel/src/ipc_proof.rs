@@ -925,6 +925,287 @@ fn hostile_groups(kernel: u64, foreign: u64) -> Vec<Group> {
     ]
 }
 
+/// The hostile process's own process handle, its object, and the weaker handles it makes.
+const HOSTILE_SELF: u64 = 56;
+const HOSTILE_OBJECT: u64 = 57;
+const HOSTILE_READ_ONLY_SELF: u64 = 59;
+const HOSTILE_NO_MAP: u64 = 60;
+const HOSTILE_NO_WRITE: u64 = 61;
+/// Where the hostile process maps its object, and where the kernel tells it.
+const HOSTILE_FIXED: u64 = 0x0000_0007_0000_0000;
+const HOSTILE_OUT: u64 = DATA + 0x2800;
+
+/// Where the hostile process keeps request `k`.
+const fn hostile_request(k: u64) -> u64 {
+    DATA + 0x2000 + 0x40 * k
+}
+
+/// The hostile process's memory requests, each at `hostile_request(k)`.
+fn hostile_requests() -> [Vec<u8>; 20] {
+    use origin_abi::{map_flags::FIXED, object_request as object};
+    const SIZE: u32 = origin_abi::map_request::SIZE;
+    const READ: u32 = origin_abi::map_access::READ;
+    const WRITE: u32 = origin_abi::map_access::WRITE;
+    const EXECUTE: u32 = origin_abi::map_access::EXECUTE;
+    [
+        object_request(object::SIZE, PAGE),
+        object_request(12, PAGE),
+        object_request(object::SIZE, 0),
+        object_request(object::SIZE, PAGE + 1),
+        object_request(object::SIZE, 3 * PAGE),
+        map_request(SIZE, READ | WRITE, FIXED, 0, PAGE, HOSTILE_FIXED),
+        map_request(39, READ | WRITE, FIXED, 0, PAGE, HOSTILE_FIXED),
+        map_request(SIZE, READ | 1 << 3, 0, 0, PAGE, 0),
+        map_request(SIZE, READ, 1 << 1, 0, PAGE, 0),
+        map_request(SIZE, WRITE, 0, 0, PAGE, 0),
+        map_request(SIZE, READ | WRITE | EXECUTE, 0, 0, PAGE, 0),
+        map_request(SIZE, READ | EXECUTE, 0, 0, PAGE, 0),
+        map_request(SIZE, READ, 0, 1, PAGE, 0),
+        map_request(SIZE, READ, 0, 0, 0, 0),
+        map_request(SIZE, READ, 0, 0, 2 * PAGE, 0),
+        map_request(SIZE, READ, FIXED, 0, PAGE, 0xFFFF_8000_0000_0000),
+        map_request(SIZE, READ, FIXED, 0, PAGE, 0),
+        map_request(SIZE, READ, FIXED, 0, PAGE, crate::usercopy::USER_END),
+        map_request(SIZE, READ, 0, 0, PAGE, HOSTILE_FIXED),
+        map_request(SIZE, READ | WRITE, 0, 0, PAGE, 0),
+    ]
+}
+
+/// Making memory objects: every malformed request refused for its reason, the quota, a pointer
+/// into the kernel; then one made, which cannot be waited on or made executable.
+fn memory_object_steps(kernel: u64) -> Vec<Step> {
+    let invalid = Error::InvalidArgs.raw();
+    let make = |name, request: u64, out: u64, want| {
+        step(
+            name,
+            sys::MEMORY_OBJECT_CREATE,
+            &[Imm(request), Imm(out)],
+            want,
+        )
+    };
+    let object = slot_addr(HOSTILE_OBJECT);
+    alloc::vec![
+        make(
+            "a request in the kernel",
+            kernel,
+            object,
+            Error::Fault.raw()
+        ),
+        make(
+            "a request of the wrong size",
+            hostile_request(1),
+            object,
+            invalid
+        ),
+        make("no bytes", hostile_request(2), object, invalid),
+        make("not whole pages", hostile_request(3), object, invalid),
+        make(
+            "past the quota",
+            hostile_request(4),
+            object,
+            Error::Limit.raw()
+        ),
+        make(
+            "its handle into the kernel",
+            hostile_request(0),
+            kernel,
+            Error::Fault.raw()
+        ),
+        make("one page", hostile_request(0), object, OK),
+        wait(
+            "wait on it",
+            h(HOSTILE_OBJECT),
+            signals::READABLE,
+            0,
+            Error::AccessDenied.raw()
+        ),
+        dup(
+            "give it EXECUTE",
+            h(HOSTILE_OBJECT),
+            rights::MEMORY_OBJECT | rights::EXECUTE,
+            58,
+            invalid
+        ),
+    ]
+}
+
+/// Mapping it: the wrong handles and too few rights, each malformed request, the user half's
+/// bounds; then mapped, and refused a second mapping over the first.
+fn memory_map_steps(kernel: u64) -> Vec<Step> {
+    let invalid = Error::InvalidArgs.raw();
+    let denied = Error::AccessDenied.raw();
+    let wrong = Error::WrongType.raw();
+    let (own, object) = (h(HOSTILE_SELF), h(HOSTILE_OBJECT));
+    let channel = h(4);
+    let map = |name, process: Arg, object: Arg, request: u64, out: u64, want| {
+        step(
+            name,
+            sys::MEMORY_MAP,
+            &[process, object, Imm(request), Imm(out)],
+            want,
+        )
+    };
+    let asking = |name, k: u64, want| map(name, own, object, hostile_request(k), HOSTILE_OUT, want);
+    alloc::vec![
+        create(4),
+        map(
+            "a bad process handle",
+            Imm(0),
+            object,
+            hostile_request(5),
+            HOSTILE_OUT,
+            Error::BadHandle.raw()
+        ),
+        map(
+            "a channel for the process",
+            channel,
+            object,
+            hostile_request(5),
+            HOSTILE_OUT,
+            wrong
+        ),
+        dup("", own, rights::READ, HOSTILE_READ_ONLY_SELF, OK),
+        map(
+            "a process handle without WRITE",
+            h(HOSTILE_READ_ONLY_SELF),
+            object,
+            hostile_request(5),
+            HOSTILE_OUT,
+            denied
+        ),
+        map(
+            "a channel for the object",
+            own,
+            channel,
+            hostile_request(5),
+            HOSTILE_OUT,
+            wrong
+        ),
+        dup("", object, rights::READ | rights::WRITE, HOSTILE_NO_MAP, OK),
+        map(
+            "an object handle without MAP",
+            own,
+            h(HOSTILE_NO_MAP),
+            hostile_request(5),
+            HOSTILE_OUT,
+            denied
+        ),
+        map(
+            "a request in the kernel",
+            own,
+            object,
+            kernel,
+            HOSTILE_OUT,
+            Error::Fault.raw()
+        ),
+        map(
+            "the address into the kernel",
+            own,
+            object,
+            hostile_request(5),
+            kernel,
+            Error::Fault.raw()
+        ),
+        asking("a request of the wrong size", 6, invalid),
+        asking("an undefined access", 7, invalid),
+        asking("an undefined flag", 8, invalid),
+        asking("write without read", 9, invalid),
+        asking("write and execute", 10, invalid),
+        asking("execute", 11, denied),
+        dup("", object, rights::READ | rights::MAP, HOSTILE_NO_WRITE, OK),
+        map(
+            "write without WRITE",
+            own,
+            h(HOSTILE_NO_WRITE),
+            hostile_request(19),
+            HOSTILE_OUT,
+            denied
+        ),
+        asking("a misaligned offset", 12, invalid),
+        asking("no length", 13, invalid),
+        asking("past the object", 14, invalid),
+        asking("in the kernel half", 15, invalid),
+        asking("at address 0", 16, invalid),
+        asking("at the top page", 17, invalid),
+        asking("an address without FIXED", 18, invalid),
+        asking("mapped", 5, OK),
+        asking("over it", 5, invalid),
+    ]
+}
+
+/// Unmapping and protecting it: without WRITE, anything but the whole mapping, accesses that
+/// are malformed or add something; then reduced, refused an increase, unmapped, and gone.
+fn memory_change_steps() -> Vec<Step> {
+    use origin_abi::map_access::{EXECUTE, READ, WRITE};
+    let invalid = Error::InvalidArgs.raw();
+    let denied = Error::AccessDenied.raw();
+    let own = h(HOSTILE_SELF);
+    let unmap = |name, process: Arg, at: u64, length: u64, want| {
+        step(
+            name,
+            sys::MEMORY_UNMAP,
+            &[process, Imm(at), Imm(length)],
+            want,
+        )
+    };
+    let protect = |name, at: u64, access: u32, want| {
+        step(
+            name,
+            sys::MEMORY_PROTECT,
+            &[own, Imm(at), Imm(PAGE), Imm(u64::from(access))],
+            want,
+        )
+    };
+    alloc::vec![
+        unmap(
+            "unmap without WRITE",
+            h(HOSTILE_READ_ONLY_SELF),
+            HOSTILE_FIXED,
+            PAGE,
+            denied
+        ),
+        unmap(
+            "unmap where nothing is",
+            own,
+            HOSTILE_FIXED + PAGE,
+            PAGE,
+            invalid
+        ),
+        unmap("unmap none of it", own, HOSTILE_FIXED, 0, invalid),
+        unmap("unmap more than it", own, HOSTILE_FIXED, 2 * PAGE, invalid),
+        unmap(
+            "unmap not whole pages",
+            own,
+            HOSTILE_FIXED,
+            PAGE + 1,
+            invalid
+        ),
+        protect("protect to nothing", HOSTILE_FIXED, 0, invalid),
+        protect(
+            "protect with an undefined bit",
+            HOSTILE_FIXED,
+            READ | 1 << 3,
+            invalid
+        ),
+        protect("protect to execute", HOSTILE_FIXED, READ | EXECUTE, denied),
+        protect(
+            "protect where nothing is",
+            HOSTILE_FIXED + PAGE,
+            READ,
+            invalid
+        ),
+        protect("protect to read-only", HOSTILE_FIXED, READ, OK),
+        protect(
+            "protect back to writable",
+            HOSTILE_FIXED,
+            READ | WRITE,
+            denied
+        ),
+        unmap("unmap", own, HOSTILE_FIXED, PAGE, OK),
+        unmap("unmap again", own, HOSTILE_FIXED, PAGE, invalid),
+    ]
+}
+
 /// Sixteen writes fill a queue; the seventeenth is refused until a read makes room.
 fn full_queue_steps(timed_out: i64, wait_status: i64) -> Vec<Step> {
     let mut steps = alloc::vec![create(26)];
@@ -1005,6 +1286,75 @@ fn hostile(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     );
     // It never ran: only its handle table mattered. It is dropped with its handles.
     drop(other);
+    right
+}
+
+/// The memory calls' hostile corpus (task S3-5b), in a process of its own, since the first
+/// corpus fills a process's report log: it may commit two pages and hold two mappings, and
+/// names its own process handle, in slot [`HOSTILE_SELF`], for every call.
+fn hostile_memory(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let kernel = core::ptr::from_ref(&ROUNDS_MARKER).addr() as u64;
+    let groups = alloc::vec![
+        Group {
+            title: "memory objects",
+            steps: memory_object_steps(kernel),
+        },
+        Group {
+            title: "memory maps",
+            steps: memory_map_steps(kernel),
+        },
+        Group {
+            title: "memory unmap and protect",
+            steps: memory_change_steps(),
+        },
+    ];
+    let steps: Vec<Step> = groups
+        .iter()
+        .flat_map(|g| g.steps.iter().copied())
+        .collect();
+    let limits = Limits {
+        memory: MemoryLimits {
+            committed: 2 * PAGE as usize,
+            mappings: 2,
+            changes: crate::mapping::Rate {
+                burst: 1024,
+                per_second: 1024,
+            },
+        },
+        ..LIMITS
+    };
+    let Some(mut image) = Image::new(limits, proof_programs::script()) else {
+        return false;
+    };
+    if image.scratch().is_none() || image.script(&steps).is_none() {
+        return false;
+    }
+    for (k, request) in hostile_requests().iter().enumerate() {
+        if image.write(hostile_request(k as u64), request).is_none() {
+            return false;
+        }
+    }
+    let Some(process) = image.finish() else {
+        return false;
+    };
+    // Its own handle; the table closes it when the process ends.
+    let own = process.grant(Object::Process(process.clone()), rights::PROCESS);
+    if !own.is_ok_and(|own| write_slot(&process, HOSTILE_SELF, own)) {
+        return false;
+    }
+    if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
+        return false;
+    }
+    let ended = await_end(&process, tsc_hz, 10);
+    let reports = process.reports();
+    let groups_ok = check_groups(com1, &groups, &reports);
+    let right = ended && groups_ok && process.ending() == Some(Ending::Exited(0));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: every hostile memory call returned its status and the process exited by itself ({} calls){}",
+        reports.len(),
+        if right { "" } else { ": ipc failed" }
+    );
     right
 }
 
@@ -2680,6 +3030,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
     let mut ok = true;
     ok &= ping_pong(com1, cpus, bsp, tsc_hz);
     ok &= hostile(com1, bsp, tsc_hz);
+    ok &= hostile_memory(com1, bsp, tsc_hz);
     ok &= exit_closes(com1, cpus, bsp, tsc_hz);
     ok &= cancel(com1, cpus, bsp, tsc_hz);
     ok &= quotas(com1, bsp, tsc_hz);
