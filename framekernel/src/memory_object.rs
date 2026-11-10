@@ -131,14 +131,14 @@ const fn access(allow: Allow) -> Access {
 /// `report` tells the caller the address while the mapping is still reserved: until its caller
 /// knows of it, no other call can change it or put another mapping in its place. If the report
 /// fails the mapping goes again ([`withdraw`]), charged to `caller`, and the map fails with the
-/// report's error.
+/// report's error. The report is a `dyn`, so the kernel holds this path once, whoever calls it.
 pub(crate) fn map(
     caller: &Process,
     target: &Process,
     object: &ObjectRef<MemoryObject>,
     held: u32,
     request: &Request,
-    report: impl FnOnce(u64) -> Result<(), Error>,
+    report: &dyn Fn(u64) -> Result<(), Error>,
 ) -> Result<u64, Error> {
     let asked = mapping::check(request, object.pages(), held)?;
     let space = target.memory().ok_or(Error::InvalidArgs)?;

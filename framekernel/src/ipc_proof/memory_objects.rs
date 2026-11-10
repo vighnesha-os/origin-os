@@ -665,7 +665,7 @@ fn unreported() -> Option<Unreported> {
     let lost = |changes: Rate| {
         let process = Process::new(limits(1, 1, changes), (CODE, CODE + PAGE), 0)?;
         let object = ObjectRef::try_new(MemoryObject::create(&process.account, PAGE).ok()?).ok()?;
-        let map = |report: fn(u64) -> Result<(), Error>| {
+        let map = |report: &dyn Fn(u64) -> Result<(), Error>| {
             memory_object::map(
                 &process,
                 &process,
@@ -675,9 +675,9 @@ fn unreported() -> Option<Unreported> {
                 report,
             )
         };
-        let failed = map(untold) == Err(Error::Fault);
+        let failed = map(&untold) == Err(Error::Fault);
         let unmapped = process.memory()?.translate(FIXED_K).is_none();
-        let free = failed && unmapped && map(told) == Ok(FIXED_K);
+        let free = failed && unmapped && map(&told) == Ok(FIXED_K);
         Some((process, object, free))
     };
     let (_broke, _object, nothing_left) = lost(Rate {
@@ -712,7 +712,7 @@ fn costs(tsc_hz: u64) -> Option<[u64; 3]> {
     };
     let per_micro = (tsc_hz / 1_000_000).max(1);
     let t0 = cpu::rdtsc();
-    let at = memory_object::map(&k, &k, &object, rights::MEMORY_OBJECT, &request, told).ok()?;
+    let at = memory_object::map(&k, &k, &object, rights::MEMORY_OBJECT, &request, &told).ok()?;
     let t1 = cpu::rdtsc();
     memory_object::protect(&k, &k, at, PAGES * PAGE, READ).ok()?;
     let t2 = cpu::rdtsc();
@@ -769,7 +769,7 @@ fn shared_unmap(cpu: CpuIndex, tsc_hz: u64) -> Option<SharedUnmap> {
         &object,
         rights::MEMORY_OBJECT,
         &fixed(FIXED_K),
-        told,
+        &told,
     )
     .ok()?;
     let image = Image::new(limits(0, 1, PLENTY), &reading_loop(READ_AT, DATA))?;
@@ -781,7 +781,7 @@ fn shared_unmap(cpu: CpuIndex, tsc_hz: u64) -> Option<SharedUnmap> {
         &object,
         rights::MEMORY_OBJECT,
         &fixed(READ_AT),
-        told,
+        &told,
     )
     .ok()?;
     Process::start_thread(&reader, cpu, CODE, STACK + PAGE, 0).ok()?;

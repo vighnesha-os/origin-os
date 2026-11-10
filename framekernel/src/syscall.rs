@@ -579,7 +579,7 @@ fn memory_map(
     // touch before its address was written, and fails with the write's error: a result is
     // written only by a call that succeeds (OIDL `@also_on`).
     let tell = |at: u64| copy_out(p, address.addr(), &at.to_le_bytes());
-    memory_object::map(&p.process, &target, &object, held, &request, tell).map(|_| ())
+    memory_object::map(&p.process, &target, &object, held, &request, &tell).map(|_| ())
 }
 
 /// `wait_one`. The decoder has refused an empty mask and undefined signals.
