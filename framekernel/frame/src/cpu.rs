@@ -20,6 +20,7 @@ use crate::descriptors::{
     self as d, DOUBLE_FAULT_IST, GDT_ENTRIES, KERNEL_CODE, KERNEL_DATA, MACHINE_CHECK_IST, NMI_IST,
     TSS, TSS_SIZE,
 };
+use crate::trap::Switch;
 
 /// Size of each interrupt stack (#DF, NMI, #MC, #DB).
 const IST_STACK_SIZE: usize = 16 * 1024;
@@ -940,7 +941,9 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // SAFETY: x2APIC mode is enabled before the timer is unmasked (`timer::init`), and
         // writing 0 to the EOI register only acknowledges the interrupt in service.
         unsafe { wrmsr(X2APIC_EOI, 0) };
-        return hooks.map_or(here, |h| resume(here, (h.tick)(here), false));
+        return hooks.map_or(here, |h| {
+            resume(here, (h.tick)(here, &Switch::new()), false)
+        });
     }
     if frame.vector == u64::from(SPURIOUS_VECTOR) {
         return here;
@@ -955,7 +958,9 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         unsafe { wrmsr(X2APIC_EOI, 0) };
         return match irq::run(vector) {
             Action::Resume => here,
-            Action::Reschedule => hooks.map_or(here, |h| resume(here, (h.reschedule)(here), false)),
+            Action::Reschedule => hooks.map_or(here, |h| {
+                resume(here, (h.reschedule)(here, &Switch::new()), false)
+            }),
         };
     }
     // Another processor woke a thread queued here: acknowledge, then switch to it if it
@@ -964,7 +969,9 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
         // SAFETY: as for the timer: only processors with an active scheduler are sent this
         // vector, so x2APIC mode is on; the write only acknowledges the interrupt.
         unsafe { wrmsr(X2APIC_EOI, 0) };
-        return hooks.map_or(here, |h| resume(here, (h.reschedule)(here), false));
+        return hooks.map_or(here, |h| {
+            resume(here, (h.reschedule)(here, &Switch::new()), false)
+        });
     }
     // Another processor changed a kernel mapping: invalidate it here, then acknowledge.
     if frame.vector == u64::from(crate::tlb::SHOOTDOWN_VECTOR) {
@@ -982,16 +989,22 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
     }
     // Scheduler requests from kernel threads (`sched::yield_now`, `sleep`, `exit`).
     if frame.vector == u64::from(YIELD_VECTOR) {
-        return hooks.map_or(here, |h| resume(here, (h.yield_now)(here), false));
+        return hooks.map_or(here, |h| {
+            resume(here, (h.yield_now)(here, &Switch::new()), false)
+        });
     }
     if frame.vector == u64::from(SLEEP_VECTOR) {
-        return hooks.map_or(here, |h| resume(here, (h.sleep)(here, frame.rdi), false));
+        return hooks.map_or(here, |h| {
+            resume(here, (h.sleep)(here, frame.rdi, &Switch::new()), false)
+        });
     }
     if frame.vector == u64::from(EXIT_VECTOR) {
-        return hooks.map_or(here, |h| resume(here, (h.exit)(here), true));
+        return hooks.map_or(here, |h| resume(here, (h.exit)(here, &Switch::new()), true));
     }
     if frame.vector == u64::from(BLOCK_VECTOR) {
-        return hooks.map_or(here, |h| resume(here, (h.block)(here, frame.rdi), false));
+        return hooks.map_or(here, |h| {
+            resume(here, (h.block)(here, frame.rdi, &Switch::new()), false)
+        });
     }
     if frame.vector == u64::from(SYSCALL_VECTOR) {
         let args = [
@@ -1005,7 +1018,9 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
                 frame.rax = status as u64;
                 here
             }
-            crate::trap::SyscallOutcome::ThreadExit => resume(here, (hooks.exit)(here), true),
+            crate::trap::SyscallOutcome::ThreadExit => {
+                resume(here, (hooks.exit)(here, &Switch::new()), true)
+            }
         };
     }
     // A machine check is the hardware reporting on itself: it says nothing about the program
@@ -1034,7 +1049,7 @@ extern "sysv64" fn dispatch(frame: &mut ExceptionFrame) -> u64 {
             halt();
         };
         (hooks.user_fault)(frame.vector, frame.error_code, address, on_exception_stack);
-        return resume(here, (hooks.exit)(here), true);
+        return resume(here, (hooks.exit)(here, &Switch::new()), true);
     }
     // A page fault at the user-copy instruction, on a user address: resume at
     // `probe_recover`, which returns "failed" to `copy_user`'s caller.
@@ -1355,8 +1370,19 @@ pub unsafe fn write_cr3(root: u64) {
     // The record and the write together, with interrupts off (review finding 1).
     crate::tlb::switch_space(root, || {
         // SAFETY: the caller's contract.
-        unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+        unsafe { load_cr3(root) };
     });
+}
+
+/// The CR3 write alone, which also flushes every non-global TLB entry: the shootdown protocol's
+/// record of what this processor runs on is the caller's to keep (`tlb`).
+///
+/// # Safety
+///
+/// As for [`write_cr3`].
+pub(crate) unsafe fn load_cr3(root: u64) {
+    // SAFETY: the caller's contract.
+    unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
 }
 
 /// The furthest a backtrace reads above the starting frame pointer, and the largest single

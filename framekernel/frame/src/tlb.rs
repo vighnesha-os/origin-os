@@ -126,6 +126,21 @@ pub(crate) fn switch_space(to: u64, load: impl FnOnce()) {
     SHOOTDOWN.switch_space(&Hardware, to, load);
 }
 
+/// Runs `f` with the address space `root` loaded on this processor, then puts back what was
+/// there, with interrupts off throughout (`Shootdown::visit`).
+pub(crate) fn visit<R>(root: u64, f: impl FnOnce() -> R) -> R {
+    SHOOTDOWN.visit(
+        &Hardware,
+        root,
+        |to| {
+            // SAFETY: `to` is the root a caller of `visit` vouches for (a complete space that
+            // stays alive for the call), or the one this processor was running on before it.
+            unsafe { cpu::load_cr3(to) }
+        },
+        f,
+    )
+}
+
 /// Whether any processor has the address space `root` loaded. A user space's tables are freed
 /// only when this is false.
 pub(crate) fn root_loaded(root: u64) -> bool {

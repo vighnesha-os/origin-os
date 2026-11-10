@@ -197,6 +197,9 @@ pub struct Shootdown<const CPUS: usize> {
     loaded: [prim::AtomicU64; CPUS],
     /// The root a processor is switching away from, while its switch is in flight (else 0).
     leaving: [prim::AtomicU64; CPUS],
+    /// The root a processor is visiting, without leaving `loaded` (else 0): see
+    /// [`Shootdown::visit`].
+    visiting: [prim::AtomicU64; CPUS],
 }
 
 impl<const CPUS: usize> core::fmt::Debug for Shootdown<CPUS> {
@@ -218,6 +221,7 @@ impl<const CPUS: usize> Shootdown<CPUS> {
             online: [const { prim::AtomicBool::new(false) }; CPUS],
             loaded: [const { prim::AtomicU64::new(0) }; CPUS],
             leaving: [const { prim::AtomicU64::new(0) }; CPUS],
+            visiting: [const { prim::AtomicU64::new(0) }; CPUS],
         }
     }
 
@@ -232,6 +236,7 @@ impl<const CPUS: usize> Shootdown<CPUS> {
             online: core::array::from_fn(|_| prim::AtomicBool::new(false)),
             loaded: core::array::from_fn(|_| prim::AtomicU64::new(0)),
             leaving: core::array::from_fn(|_| prim::AtomicU64::new(0)),
+            visiting: core::array::from_fn(|_| prim::AtomicU64::new(0)),
         }
     }
 
@@ -284,9 +289,46 @@ impl<const CPUS: usize> Shootdown<CPUS> {
         }
     }
 
-    /// Whether processor `id` has `root` loaded, or is in the middle of leaving it. `loaded`
-    /// is read before `leaving`, the reverse of the order [`switch_space`] writes them, so a
-    /// processor in the middle of a switch counts as holding both.
+    /// Runs `f` on this processor with the address space `visiting` loaded, then puts back the
+    /// space it was on, with interrupts off throughout: nothing can switch it meanwhile. `load`
+    /// is the CR3 write, run once each way. For a visit that must not outlast the call, such as
+    /// a proof's read through another space's tables (review finding 2).
+    ///
+    /// The visit is recorded in `visiting` alone, from before its CR3 write until after the one
+    /// that ends it, and `loaded` keeps naming the space the processor returns to: each space
+    /// is in one field for as long as the processor can reach it, whatever order a reader reads
+    /// the fields in. A shootdown for the visited space waits for the visit to end, since the
+    /// processor answers only with interrupts on again.
+    pub fn visit<R>(
+        &self,
+        hardware: &impl TlbHardware,
+        visiting: u64,
+        load: impl Fn(u64),
+        f: impl FnOnce() -> R,
+    ) -> R {
+        hardware.without_interrupts(|| {
+            let home = hardware.current_root();
+            if home == visiting {
+                return f();
+            }
+            let slot = self.visiting.get(hardware.this_cpu());
+            if let Some(slot) = slot {
+                slot.store(visiting, Ordering::Release);
+            }
+            prim::fence(Ordering::SeqCst);
+            load(visiting);
+            let result = f();
+            load(home);
+            if let Some(slot) = slot {
+                slot.store(0, Ordering::Release);
+            }
+            result
+        })
+    }
+
+    /// Whether processor `id` has `root` loaded, is in the middle of leaving it, or is visiting
+    /// it. `loaded` is read before `leaving`, the reverse of the order [`switch_space`] writes
+    /// them, so a processor in the middle of a switch counts as holding both.
     ///
     /// [`switch_space`]: Self::switch_space
     fn holds(&self, id: usize, root: u64) -> bool {
@@ -297,6 +339,10 @@ impl<const CPUS: usize> Shootdown<CPUS> {
                 .leaving
                 .get(id)
                 .is_some_and(|leaving| leaving.load(Ordering::Acquire) == root)
+            || self
+                .visiting
+                .get(id)
+                .is_some_and(|visiting| visiting.load(Ordering::Acquire) == root)
     }
 
     /// How many processors have the address space `root` loaded.
@@ -750,6 +796,44 @@ mod tests {
         switch(&shootdown, &cpu(5, &machine), 2, || ran = true);
         assert!(ran);
         assert_eq!(shootdown.processors_holding(2), 0);
+    }
+
+    /// A visit is recorded while it lasts, puts the processor back, and leaves `loaded` alone.
+    #[test]
+    fn a_visit_is_recorded_while_it_lasts_and_ends_where_it_began() {
+        let machine = Machine::default();
+        let shootdown = Shootdown::<2>::new();
+        let one = cpu(1, &machine);
+        switch(&shootdown, &one, 7, || ());
+        let load = |to: u64| machine.cr3[1].store(to, Ordering::Relaxed);
+        let seen = shootdown.visit(&one, 9, load, || {
+            (
+                machine.cr3[1].load(Ordering::Relaxed),
+                shootdown.processors_holding(9),
+                shootdown.processors_holding(7),
+            )
+        });
+        assert_eq!(seen, (9, 1, 1), "on the visited space, both recorded");
+        assert_eq!(
+            machine.cr3[1].load(Ordering::Relaxed),
+            7,
+            "back where it was"
+        );
+        assert_eq!(shootdown.processors_holding(9), 0);
+        assert_eq!(shootdown.processors_holding(7), 1);
+        // A visit to where it already is changes nothing.
+        let loads = AtomicUsize::new(0);
+        let mut f_ran = false;
+        shootdown.visit(
+            &one,
+            7,
+            |_| {
+                loads.fetch_add(1, Ordering::Relaxed);
+            },
+            || f_ran = true,
+        );
+        assert!(f_ran);
+        assert_eq!(loads.load(Ordering::Relaxed), 0);
     }
 
     /// A switch to the space the processor is on does nothing, not even the CR3 write (which

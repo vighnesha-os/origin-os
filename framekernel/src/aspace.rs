@@ -591,18 +591,11 @@ impl Subject {
     }
 }
 
-/// What reading `addr` does with `space` loaded on this processor. Interrupts stay off from
-/// the switch to the switch back: a preemption would load another thread's tables under the
-/// probe, and the probe would be testing those. The page's translation is dropped first, so the
-/// read walks this space's tables whatever an earlier read left in the TLB (finding 4).
+/// What reading `addr` does with `space` loaded on this processor: the framework's visit, with
+/// interrupts off from the switch to the switch back and the page's translation dropped first
+/// (review findings 2 and 4).
 fn read_from(space: &UserSpace, addr: u64) -> Probe {
-    cpu::without_interrupts(|| {
-        space.activate();
-        cpu::invlpg(addr);
-        let probe = cpu::probe_read(addr);
-        vm::activate_kernel_space();
-        probe
-    })
+    space.probe_read(addr)
 }
 
 /// ADR-0004 H2: the kernel half of every address space is tables allocated once at boot.

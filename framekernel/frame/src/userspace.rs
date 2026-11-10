@@ -532,16 +532,30 @@ impl UserSpace {
         self.root
     }
 
-    /// Makes this space the current one on the calling processor. Safe: the space is complete
-    /// (it maps the kernel's half, built by [`new`](Self::new)), and it stays alive for this
-    /// borrow; the scheduler holds a reference per thread that runs in it, and a dropped
-    /// space's memory is not freed while a processor still has it loaded.
-    pub fn activate(&self) {
-        if crate::cpu::read_cr3() != self.root {
-            // SAFETY: `root` is the PML4 of this complete address space, whose kernel half is the
-            // kernel's (built by `new`), so the code, stacks and data running now stay mapped.
-            unsafe { crate::cpu::write_cr3(self.root) };
-        }
+    /// Makes this space the current one on the calling processor, for the thread the
+    /// scheduler is about to resume: only at the scheduler's switch point (`trap::Switch`),
+    /// so that nothing else can leave a processor on a space the scheduler did not choose
+    /// (review finding 2). Safe: the space is complete (it maps the kernel's half, built by
+    /// [`new`](Self::new)), and it stays alive for this borrow; the scheduler holds a reference
+    /// per thread that runs in it, and a dropped space's memory is not freed while a processor
+    /// still has it loaded.
+    pub fn activate(&self, _switch: &crate::trap::Switch) {
+        // SAFETY: `root` is the PML4 of this complete address space, whose kernel half is the
+        // kernel's (built by `new`), so the code, stacks and data running now stay mapped.
+        unsafe { crate::cpu::write_cr3(self.root) };
+    }
+
+    /// Reads a byte at `addr` through this space's own tables, on this processor, and says what
+    /// happened (`cpu::probe_read`): for the boot proofs. The processor visits this space with
+    /// interrupts off and goes back to the one it was on, so the scheduler's choice stands
+    /// (review finding 2). The page's translation is dropped first, so the read walks these
+    /// tables whatever an earlier read left in the TLB (finding 4).
+    pub fn probe_read(&self, addr: u64) -> crate::cpu::Probe {
+        // The space stays alive for this borrow, and is complete (`new`).
+        crate::tlb::visit(self.root, || {
+            crate::cpu::invlpg(addr);
+            crate::cpu::probe_read(addr)
+        })
     }
 
     /// The frame mapped at the user page holding `virt` in this space, if any.

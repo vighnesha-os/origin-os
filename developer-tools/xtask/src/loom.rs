@@ -813,6 +813,15 @@ const CONTROLS: &[Control] = &[
         )],
     },
     Control {
+        // A visit that leaves no record: a shootdown for the visited space passes the
+        // processor over while it still holds the translation (review finding 2).
+        name: "a_visit_that_is_not_recorded",
+        file: SHOOTDOWN,
+        from: "            if let Some(slot) = slot {\n                slot.store(visiting, Ordering::Release);\n            }\n",
+        to: "",
+        models: &[("shootdown_and_a_processor_visiting_the_space", STALE)],
+    },
+    Control {
         // A request for one space interrupts everyone.
         name: "a_space_request_asks_everyone",
         file: SHOOTDOWN,

@@ -1751,6 +1751,53 @@ fn shootdown_and_a_processor_leaving_the_space() {
     );
 }
 
+/// A processor visits the space (a proof's read through its tables, with interrupts off) and
+/// caches the translation there; the page is taken away while it is inside. The visit is in the
+/// record, so the shootdown waits for the processor's answer, which comes only once the visit
+/// is over and its CR3 write has dropped the translation (review finding 2).
+#[test]
+fn shootdown_and_a_processor_visiting_the_space() {
+    check(
+        "shootdown_and_a_processor_visiting_the_space",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let (near, visitor) = (tlb_cpu(&world, 0), tlb_cpu(&world, 1));
+            world.shootdown.mark_online(&near);
+            world.shootdown.mark_online(&visitor);
+            let inside = Arc::new((AtomicBool::new(false), Notify::new()));
+            let serving = {
+                let (me, inside) = (visitor.clone(), Arc::clone(&inside));
+                (
+                    1,
+                    thread::spawn(move || {
+                        let load = |to: u64| {
+                            me.world.cr3[1].store(to, Relaxed);
+                            if to != THE_SPACE {
+                                // Back home: the CR3 load drops every non-global translation.
+                                me.invalidate(Request::NonGlobal);
+                            }
+                        };
+                        me.world.shootdown.visit(&me, THE_SPACE, load, || {
+                            me.walk();
+                            inside.0.store(true, Release);
+                            inside.1.notify();
+                        });
+                        me.serve();
+                    }),
+                )
+            };
+            while !inside.0.load(Acquire) {
+                inside.1.wait();
+            }
+            near.take_the_page_away(Scope::Space(THE_SPACE));
+            assert!(!visitor.holds(), "{STALE}");
+            world.finish(vec![serving]);
+        },
+    );
+}
+
 // ---------------------------------------------------------------- the deferred free
 
 /// What the frame holds once it has been reused: not anything its old mapping should see.

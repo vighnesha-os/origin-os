@@ -484,12 +484,12 @@ pub(crate) fn in_device_window(addr: u64) -> bool {
 }
 
 /// Switches this processor to the kernel's own address space, if it isn't on it yet: the space
-/// of every kernel thread. Safe: the kernel's tables are complete (`install` keeps them for
-/// ever), and this replaces whatever the processor was using, which the switching code
-/// (the scheduler) has given up.
-pub fn activate_kernel_space() {
+/// of every kernel thread. Only at the scheduler's switch point (`trap::Switch`, review finding
+/// 2). Safe: the kernel's tables are complete (`install` keeps them for ever), and this replaces
+/// whatever the processor was using, which the switching code (the scheduler) has given up.
+pub fn activate_kernel_space(_switch: &crate::trap::Switch) {
     let root = kernel_root();
-    if root != 0 && crate::cpu::read_cr3() != root {
+    if root != 0 {
         // SAFETY: `root` is the kernel's complete PML4, which maps everything kernel code
         // touches next; it lives for ever.
         unsafe { crate::cpu::write_cr3(root) };
