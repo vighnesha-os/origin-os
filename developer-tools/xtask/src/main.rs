@@ -1753,7 +1753,7 @@ fn address_space_markers(cpus: u32) -> Vec<String> {
     };
     let cost = format!("Ok(Change {{ pages: 1, shootdowns: 1, interrupts: {one} }})");
     vec![
-        "origin-kernel: address spaces: the kernel half is the same tables in every space: true; a kernel mapping made at 0xfffff00000000000, in a top-level slot of its own, after a space was created is visible from that space: true; from a space lacking the slot, the same read faults: true".into(),
+        "origin-kernel: address spaces: the kernel half is the same tables in every space: true; a kernel mapping made at 0xfffff00000000000, in a top-level slot of its own, after a space was created is visible from that space: true; from a space lacking the slot, the same read faults: true; the probe page is not global: true".into(),
         format!(
             "origin-kernel: address spaces: a page unmapped under a running thread on {far}: frame free when the unmap returned: true; reused with a secret: true; the thread faulted at 0x500000 (#PF error 0x4): true; it read the secret: false; {cost}"
         ),

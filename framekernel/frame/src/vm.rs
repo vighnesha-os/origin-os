@@ -256,14 +256,19 @@ static PROBE_TAKEN: AtomicBool = AtomicBool::new(false);
 /// A kernel page in a top-level slot of its own, for the proof that a mapping made after an
 /// address space was created is visible from that space. Unmapped (on every processor) and
 /// freed when dropped.
+///
+/// Unlike the rest of the kernel half it is **not global**: the proof reads it through one space
+/// and then through another, and a global translation cached by the first read would survive
+/// the CR3 load and answer the second without a walk of that space's tables (review finding 4,
+/// seen on an AMD EPYC under KVM; QEMU's software CPU flushes everything on a CR3 load).
 #[derive(Debug)]
 pub struct KernelProbe {
     frame: Option<OwnedFrame>,
 }
 
 impl KernelProbe {
-    /// Maps a fresh frame at the probe page, read-only and never executable. `None` if one
-    /// exists already, or if the frame or the tables cannot be had.
+    /// Maps a fresh frame at the probe page, read-only, never executable and not global.
+    /// `None` if one exists already, or if the frame or the tables cannot be had.
     pub fn new() -> Option<Self> {
         if PROBE_TAKEN.swap(true, Ordering::AcqRel) {
             return None;
@@ -277,7 +282,7 @@ impl KernelProbe {
                         &mut k.tables,
                         PROBE_PAGE,
                         frame.phys().raw(),
-                        Attributes::kernel_global(Access::Read),
+                        Attributes::kernel(Access::Read),
                     )
                     .ok()
             });

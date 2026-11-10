@@ -593,10 +593,12 @@ impl Subject {
 
 /// What reading `addr` does with `space` loaded on this processor. Interrupts stay off from
 /// the switch to the switch back: a preemption would load another thread's tables under the
-/// probe, and the probe would be testing those.
+/// probe, and the probe would be testing those. The page's translation is dropped first, so the
+/// read walks this space's tables whatever an earlier read left in the TLB (finding 4).
 fn read_from(space: &UserSpace, addr: u64) -> Probe {
     cpu::without_interrupts(|| {
         space.activate();
+        cpu::invlpg(addr);
         let probe = cpu::probe_read(addr);
         vm::activate_kernel_space();
         probe
@@ -627,14 +629,16 @@ pub(crate) fn prove_kernel_half(com1: &mut Console) -> bool {
     };
     let addr = probe.addr();
     let fixed = space.shares_kernel_half() && vm::kernel_half_unchanged();
+    // The control can only work if no translation of the probe outlives a CR3 load (finding 4).
+    let local = vm::translate(addr).is_some_and(|t| !t.global);
     let from_space = read_from(&space, addr);
     let from_lacking = read_from(&lacking, addr);
     let visible = from_space == Probe::Completed;
     let control = matches!(from_lacking, Probe::Faulted { error: 0, address } if address == addr);
-    let right = fixed && visible && control;
+    let right = fixed && local && visible && control;
     let _ = writeln!(
         com1,
-        "origin-kernel: address spaces: the kernel half is the same tables in every space: {fixed}; a kernel mapping made at {addr:#x}, in a top-level slot of its own, after a space was created is visible from that space: {visible}; from a space lacking the slot, the same read faults: {control}{}",
+        "origin-kernel: address spaces: the kernel half is the same tables in every space: {fixed}; a kernel mapping made at {addr:#x}, in a top-level slot of its own, after a space was created is visible from that space: {visible}; from a space lacking the slot, the same read faults: {control}; the probe page is not global: {local}{}",
         if right { "" } else { ": address spaces failed" }
     );
     right
