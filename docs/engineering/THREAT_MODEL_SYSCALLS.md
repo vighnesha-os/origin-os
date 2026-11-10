@@ -24,7 +24,7 @@
 | A buggy or compromised `origin.core` | Issue any call with any arguments from the pinned code range | `origin.core` does not exist yet (step 4). Until it does, the creator names each process's range (A6) |
 | Code outside `origin.core` | Run `syscall` from its own pages | Refused by the range pin (A6). The per-call pin (B2) is not built |
 
-**Out of scope:** a kernel already compromised another way, physical attacks, malicious firmware or microcode, and DMA (`THREAT_MODEL_IOMMU.md`). Speculative execution is listed as open (I2) but not modelled in detail.
+**Out of scope:** a kernel already compromised another way, physical attacks, malicious firmware or microcode, and DMA (`THREAT_MODEL_IOMMU.md`). Speculative execution is listed as open (I2) but not modelled in detail. What each exclusion means for the product, where it is covered and what is accepted by name, is in `THREAT_MODEL_SYSTEM.md` (EX1 to EX12). Speculation is decided in `docs/adr/ADR-0017-speculation-processor-hardening.md`, which is Proposed.
 
 ## Threats
 
@@ -45,6 +45,7 @@ Status: **Proven** (a boot proof whose negative control is recorded in `SOURCE_P
 | E9 | A program uses the developer calls to hold the serial line with interrupts off | `debug_report` and `debug_write` need the `kernel.debug` capability, given only to proof processes; others get `not_supported`. A line is at most 128 bytes | **Boot** (`nodebug`) |
 | E10 | A program reads the descriptor tables' addresses to find the KASLR slide | UMIP is on, so `sidt` and `sgdt` fault in ring 3 | **Boot** (`sidt`) |
 | E11 | The CET shadow stack is not enabled, although P6 asks for it at entry | None | **Open**, a recorded deviation |
+| E12 | **A nested NMI.** After an NMI is delivered, further NMIs are blocked until the next IRET executes, whoever executes it. If the NMI handler takes an exception of its own, that exception's return unblocks them while the handler is still on its stack. The next NMI enters through IST2, which loads the same top of stack every time, and overwrites the frame and the saved registers the first handler has yet to restore. The interrupted context is lost | None in the entry path: `exception_common` and `exception_saved` treat vector 2 like any other, with no mark that the handler is running and no second place for its frame. What keeps the window shut today is how little the handler does. For vector 2, `dispatch` records a count and the frame's address and returns: it reads no CPU-local data and no user memory, takes no lock and prints nothing. No breakpoint is armed (DR7 is cleared on every processor), and its code and its stack are always mapped. Two ways in remain. The kernel's own: a machine check during those instructions that `machine_check` judges recoverable returns with IRETQ. And one below the kernel: an SMI on an AMD processor, where the manual read does not say that NMIs blocked before the SMI stay blocked after it (Intel's says they do) | **Open.** Ring 3 cannot reach it: no call raises an NMI or a machine check, and the kernel's only NMI source is its own boot proof. The "NMI stack" proof behind E3 takes one NMI on IST2 and never two. FRED closes it where the processor has FRED; the path kept for processors without it needs a guard (ADR-0017 Z6 and Z12, Proposed) |
 
 ### Arguments and user memory
 
@@ -159,14 +160,17 @@ ADR-0011 N9 and S9, as C11 and C12 decide: `origin.directory` 0.1, served by a p
 Before any program that is not a boot proof runs in ring 3 (N14 step 4):
 1. **E8**, the per-call pin (Amendment 2, B2).
 2. **O2**, quotas on threads, processes and memory (P11), with the calls that create them.
-3. **I2**: a speculative-execution review against the declared processors.
+3. **I2**: a speculative-execution review against the declared processors. The review is `docs/research/2026-11-10-speculation-processor-hardening.md`, and ADR-0017 (Proposed) decides from it. I2 closes when the owner has accepted that ADR and its Z2, Z3, Z5, Z9 and Z10 are built.
 4. **D11**, the directory's back side, decided before the first directory that is a program runs.
+
+Before any claim about real hardware: **E12**, the nested NMI.
 
 Before release: **E11** (CET) and **V2**.
 
 ## References
 
 - Intel 64 and IA-32 Architectures Software Developer's Manual, Vol. 2B (`SYSCALL`, `SYSENTER`, `IRET`) and Vol. 3A (privilege levels and gates, SMEP, SMAP, UMIP).
+- For E12, read on 2026-11-10: Intel SDM Volume 3, order 325384-093, September 2026, §7.7.2 (NMI blocking), §7.14.5 (the interrupt stack table) and §34.8 (NMIs and SMM); AMD64 APM Volume 2, publication 24593, Rev. 3.46, October 2026, §8.2.3, §8.9.4 and §10.3.3. The ledger is `docs/research/2026-11-10-speculation-processor-hardening.md`, §3.10.
 - CERT/CC, Vulnerability Note VU#649219, the SYSRET return to a non-canonical address (2012): <https://www.kb.cert.org/vuls/id/649219>
 - Kocher et al., *Spectre Attacks: Exploiting Speculative Execution*, IEEE S&P 2019; Lipp et al., *Meltdown: Reading Kernel Memory from User Space*, USENIX Security 2018.
 - `docs/research/2026-11-10-caller-identity.md`, for the writer's identity S3-2 adds.
