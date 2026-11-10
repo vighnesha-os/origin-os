@@ -52,6 +52,9 @@ commands:
               named by an ACPI SPCR table, a table that must be refused, no display, and no
               UART at all (with a framebuffer the only way to see the boot)
   run         boot under QEMU with the serial console on this terminal (Ctrl-A X quits)
+  reproducible-gate only the gate on reproducible builds: the loader, each way it is built,
+              and the kernel are built twice from nothing in two target directories, and the
+              two files of each must be the same bytes (part of check; CLAUDE.md §75)
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
@@ -60,9 +63,6 @@ commands:
   interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
               (part of check; quick)
   regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
-  reproducible-gate only the gate on reproducible builds: the loader, each way it is built,
-              and the kernel are built twice from nothing in two target directories, and the
-              two files of each must be the same bytes (part of check; CLAUDE.md §75)
   exclusive -- <command> [args...]
               runs any command in a turn on the machine, as check, the boots, run and loom
               take theirs: one at a time across every checkout of this repository on this
@@ -2047,7 +2047,6 @@ fn main() -> ExitCode {
         ["unsafe-gate"] => unsafety::gate(),
         ["interface-gate"] => interfaces::gate(),
         ["regenerate"] => interfaces::regenerate(),
-        ["reproducible-gate"] => in_turn("reproducible-gate", reproducible::gate),
         ["build"] => in_turn("build", || {
             build_loader(Loader::Developer).and_then(|loader| {
                 let kernel = pack_kernel(&build_kernel()?)?;
@@ -2063,6 +2062,7 @@ fn main() -> ExitCode {
         ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
         ["run"] => in_turn("run", run),
         ["loom"] => in_turn("loom", loom::run),
+        ["reproducible-gate"] => in_turn("reproducible-gate", reproducible::gate),
         ["exclusive", "--", command @ ..] => {
             let command: Vec<String> = command.iter().map(|s| (*s).to_string()).collect();
             return match turns::exclusive(&command) {
@@ -2720,7 +2720,6 @@ fn check() -> Result {
         build_loader(loader)?;
     }
     build_kernel()?;
-    reproducible::gate()?;
     no_panic_check()?;
     dependency_check()?;
     linux_cfg_lint()?;
@@ -2729,6 +2728,7 @@ fn check() -> Result {
     manifest_version_lint()?;
     signing_stays_off_the_os_lint()?;
     signing_has_no_secret_branches()?;
+    reproducible::gate()?;
     loom::run()?;
     println!("xtask: check passed");
     Ok(())
