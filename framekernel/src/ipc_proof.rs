@@ -100,6 +100,9 @@ enum Arg {
 }
 use Arg::{Handle as Hd, Imm};
 
+mod directory;
+pub(crate) use directory::prove_directory;
+
 /// What a step must do.
 #[derive(Clone, Copy)]
 enum Want {

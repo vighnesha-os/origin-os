@@ -8,6 +8,7 @@ version = "0.0.0"
 dependencies = [
  "origin-abi",
  "origin-boot-info",
+ "origin-directory",
  "origin-frame",
  "origin-paging",
  "origin-syscalls",
