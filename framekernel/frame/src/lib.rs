@@ -44,6 +44,7 @@ pub mod irq;
 pub mod ivrs;
 pub mod limits;
 pub mod mmio;
+pub mod nospec;
 pub mod objref;
 pub mod once;
 pub mod pci;

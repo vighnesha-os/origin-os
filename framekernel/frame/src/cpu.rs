@@ -1336,6 +1336,42 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
     }
 }
 
+/// `value` if it is below `limit`, and 0 if it is not, chosen by a conditional move that
+/// depends on the comparison and on no prediction: the Mask form of [`crate::nospec`]
+/// (ADR-0017 Z9). It is written in assembly because a compiler may turn the same thing
+/// written in Rust back into a branch.
+#[inline]
+#[must_use]
+pub fn below_or_zero(value: u64, limit: u64) -> u64 {
+    let mut kept = value;
+    // SAFETY: a comparison and a conditional move between registers. Nothing reads or writes
+    // memory or the stack. The flags change, so the block does not say it preserves them.
+    unsafe {
+        asm!(
+            "cmp {kept}, {limit}",
+            "cmovae {kept}, {zero}",
+            kept = inout(reg) kept,
+            limit = in(reg) limit,
+            zero = in(reg) 0u64,
+            options(pure, nomem, nostack),
+        );
+    }
+    kept
+}
+
+/// `value`, once every instruction before this one has completed: LFENCE, the Fence form of
+/// [`crate::nospec`] (ADR-0017 Z9). The value passes through the block, so nothing that
+/// uses the result can be placed before the LFENCE.
+#[inline]
+#[must_use]
+pub fn after_fence(value: u64) -> u64 {
+    let mut kept = value;
+    // SAFETY: LFENCE reads and writes no register, no memory and no flag. RAX is named only
+    // to carry the value through the block.
+    unsafe { asm!("lfence", inout("rax") kept, options(nomem, nostack)) };
+    kept
+}
+
 /// Runs `f` with interrupts disabled on this processor, restoring the previous state.
 ///
 /// Every lock that a thread can hold while preemptible is taken inside this: otherwise a
