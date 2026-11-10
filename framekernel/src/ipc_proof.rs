@@ -38,7 +38,7 @@ use origin_abi::{
 };
 
 use origin_frame::objref::ObjectRef;
-use origin_frame::proof_programs::{self, DATA, STACK};
+use origin_frame::proof_programs::{self, DATA, SCRIPT, STACK};
 use origin_frame::userspace::{self, UserFrame};
 
 use crate::console::Console;
@@ -51,8 +51,6 @@ use crate::{memory, sched, syscall, time};
 const CODE: u64 = 0x40_0000;
 /// Pages of scratch memory.
 const DATA_PAGES: u64 = 4;
-/// The script, on read-only pages.
-const SCRIPT: u64 = 0x54_0000;
 /// Pages of script (64 calls per page).
 const SCRIPT_PAGES: u64 = 4;
 /// A second read-write region for the 64 KiB message test.
