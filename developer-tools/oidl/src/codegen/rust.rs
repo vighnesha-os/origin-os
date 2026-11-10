@@ -574,10 +574,11 @@ fn gen_sized_struct(g: &Gen<'_>, t: &mut Text, s: &Struct, lib_version: Version)
         let size = layout::fixed_layout(&field.ty).0;
         let end = u64::from(field.offset).saturating_add(size);
         if is_later(field.since) {
-            t.open(format!("if u64::from(limit) >= {end} {{"));
-            t.open(format!("if let Some(value) = self.{} {{", field.name));
+            t.open(format!(
+                "if u64::from(limit) >= {end} && let Some(value) = self.{} {{",
+                field.name
+            ));
             t.line(format!("rt::put_field(out, {}, value)?;", field.offset));
-            t.shut("}");
             t.shut("}");
         } else {
             t.open(format!("if u64::from(limit) >= {end} {{"));
