@@ -139,14 +139,14 @@ impl Drop for SharedInner {
 impl SharedFrame {
     /// A fresh frame, zeroed, or `None` without memory.
     pub fn new() -> Option<Self> {
-        Self::adopt(zeroed_frame()?)
+        Self::adopt(memory::zeroed_frame()?)
     }
 
     /// The frame at `phys`, if it is free, zeroed: for a proof that needs to see one particular
     /// frame reused. Any free frame is as good as another to the rest of the kernel.
     pub fn claim(phys: PhysAddr) -> Option<Self> {
         let frame = memory::claim_frame(phys)?;
-        zero_frame(&frame);
+        memory::zero_frame(&frame);
         Self::adopt(frame)
     }
 
@@ -545,21 +545,6 @@ fn direct_map(phys: PhysAddr) -> *mut u8 {
     core::ptr::with_exposed_provenance_mut(crate::phys::to_virt(phys.raw()) as usize)
 }
 
-/// Zeroes a frame nothing else holds.
-fn zero_frame(frame: &OwnedFrame) {
-    let p = direct_map(frame.phys());
-    // SAFETY: an `OwnedFrame` has one owner, the caller, which has mapped it nowhere yet; the
-    // direct map makes it writable at `p`, and it spans `PAGE` bytes.
-    unsafe { p.write_bytes(0, PAGE as usize) };
-}
-
-/// A fresh zeroed frame, or `None`.
-fn zeroed_frame() -> Option<OwnedFrame> {
-    let frame = memory::allocate_frame()?;
-    zero_frame(&frame);
-    Some(frame)
-}
-
 impl UserSpace {
     /// A new, empty space with the kernel's half mapped, or `None` without memory.
     pub fn new() -> Option<Self> {
@@ -665,7 +650,7 @@ impl UserSpace {
         if !usercopy::is_user_address(virt) || usercopy::USER_END - virt < PAGE {
             return Err(MapError::NonCanonical(virt));
         }
-        let frame = zeroed_frame().ok_or(MapError::OutOfMemory)?;
+        let frame = memory::zeroed_frame().ok_or(MapError::OutOfMemory)?;
         let phys = frame.phys();
         let _turn = self.edit();
         match self.with_state(|s| s.map(virt, Frame::Private(frame), access)) {

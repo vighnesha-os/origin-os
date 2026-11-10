@@ -130,6 +130,21 @@ pub fn allocate_frame() -> Option<OwnedFrame> {
     })
 }
 
+/// Zeroes a frame nothing else holds.
+pub(crate) fn zero_frame(frame: &OwnedFrame) {
+    let p = ptr::with_exposed_provenance_mut::<u8>(frame.virt());
+    // SAFETY: an `OwnedFrame` has one owner, the caller, which has mapped it nowhere yet; the
+    // direct map makes it writable at `p`, and it spans `FRAME` bytes.
+    unsafe { p.write_bytes(0, FRAME as usize) };
+}
+
+/// A fresh zeroed frame, or `None`.
+pub(crate) fn zeroed_frame() -> Option<OwnedFrame> {
+    let frame = allocate_frame()?;
+    zero_frame(&frame);
+    Some(frame)
+}
+
 /// The frame at `phys`, if it is free: for a boot proof that needs to see one particular frame
 /// reused. Safe: only a free frame can be claimed, and nothing else then owns it.
 pub fn claim_frame(phys: PhysAddr) -> Option<OwnedFrame> {
