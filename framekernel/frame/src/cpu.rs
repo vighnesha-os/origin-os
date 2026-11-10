@@ -1483,7 +1483,7 @@ pub unsafe fn load_page_tables(root: u64) {
     // SAFETY: the caller's contract. EFER is read and written back with only NXE added
     // (NX is supported, so the bit is defined). WP only restricts supervisor writes to
     // pages already marked read-only. Loading CR3 switches to tables the caller vouches
-    // for and flushes every non-global TLB entry.
+    // for and flushes every non-global TLB entry. The flags are not preserved: `or` writes them.
     unsafe {
         asm!(
             "mov ecx, {efer}",
@@ -1502,7 +1502,7 @@ pub unsafe fn load_page_tables(root: u64) {
             out("eax") _,
             out("ecx") _,
             out("edx") _,
-            options(nostack, preserves_flags),
+            options(nostack),
         );
     }
 }
@@ -1735,7 +1735,7 @@ pub unsafe fn enable_global_pages() -> bool {
         return false;
     }
     // SAFETY: the caller's contract. Each write changes only CR4.PGE, which affects only
-    // which translations the TLB keeps.
+    // which translations the TLB keeps. The flags are not preserved: `and` and `or` write them.
     unsafe {
         asm!(
             "mov {tmp}, cr4",
@@ -1746,7 +1746,7 @@ pub unsafe fn enable_global_pages() -> bool {
             clear = in(reg) !CR4_PGE,
             pge = in(reg) CR4_PGE,
             tmp = out(reg) _,
-            options(nostack, preserves_flags),
+            options(nostack),
         );
     }
     true
@@ -1894,7 +1894,8 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
     // CR0: clear EM and TS, set MP, so SSE instructions run and do not fault to an
     // emulator or a (nonexistent) lazy-FPU handler; set NE, so an x87 error raises #MF
     // (INIT leaves it clear on an AP).
-    // SAFETY: the caller's contract; these CR0 bits only configure FPU/SSE behaviour.
+    // SAFETY: the caller's contract; these CR0 bits only configure FPU/SSE behaviour. The flags
+    // are not preserved: `and` and `or` write them.
     unsafe {
         asm!(
             "mov {t}, cr0",
@@ -1904,7 +1905,7 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
             clear = in(reg) !(CR0_EM | CR0_TS),
             set = in(reg) CR0_MP | CR0_NE,
             t = out(reg) _,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
     // CR4: OSFXSR and OSXMMEXCPT for SSE; OSXSAVE when the CPU has XSAVE.
@@ -1912,7 +1913,8 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
     if features.xsave {
         cr4_bits |= CR4_OSXSAVE;
     }
-    // SAFETY: the caller's contract; these CR4 bits enable FXSAVE/SSE and XSAVE.
+    // SAFETY: the caller's contract; these CR4 bits enable FXSAVE/SSE and XSAVE. The flags are
+    // not preserved: `or` writes them.
     unsafe {
         asm!(
             "mov {t}, cr4",
@@ -1920,7 +1922,7 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
             "mov cr4, {t}",
             bits = in(reg) cr4_bits,
             t = out(reg) _,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
     let mut xcr0 = 0;
@@ -2037,7 +2039,8 @@ pub unsafe fn enable_smep_smap() -> (bool, bool) {
         | if smap { CR4_SMAP } else { 0 }
         | if umip { CR4_UMIP } else { 0 };
     // SAFETY: the caller's contract; setting supported CR4 bits only adds restrictions on
-    // supervisor accesses to user pages and on user-mode descriptor reads.
+    // supervisor accesses to user pages and on user-mode descriptor reads. The flags are not
+    // preserved: `or` writes them.
     unsafe {
         asm!(
             "mov {tmp}, cr4",
@@ -2045,7 +2048,7 @@ pub unsafe fn enable_smep_smap() -> (bool, bool) {
             "mov cr4, {tmp}",
             bits = in(reg) bits,
             tmp = out(reg) _,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
     (smep, smap)
