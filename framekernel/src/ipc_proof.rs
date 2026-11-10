@@ -2344,6 +2344,8 @@ struct Launch {
     names_creator: bool,
     /// Its write to its own record faulted at the record's address.
     faulted_there: bool,
+    /// What the launch path took: placing the record, then granting, writing and starting.
+    micros: u64,
 }
 
 /// Launches one child from `creator` through the launch path, with a BOOTSTRAP end whose peer
@@ -2369,7 +2371,9 @@ fn launch_one(creator: &Process, cpu: CpuIndex, tsc_hz: u64) -> Option<Launch> {
         args: &LAUNCH_ARGS,
         env: &LAUNCH_ENV,
     };
+    let placing = cpu::rdtsc();
     let placed = launch::place(&mut image.process, &given).ok()?;
+    let placing = cpu::rdtsc().wrapping_sub(placing);
     let record = placed.record;
     let words = placed.size as u64 / 4;
     // The child reports the RDI it started with and its whole record, word by word; uses each
@@ -2394,7 +2398,10 @@ fn launch_one(creator: &Process, cpu: CpuIndex, tsc_hz: u64) -> Option<Launch> {
     if image.scratch().is_none() || image.script(&steps).is_none() {
         return None;
     }
+    let starting = cpu::rdtsc();
     let launched = launch::start(image.process, placed, given, cpu, CODE, STACK + PAGE).ok()?;
+    let starting = cpu::rdtsc().wrapping_sub(starting);
+    let micros = placing.saturating_add(starting) / (tsc_hz / 1_000_000).max(1);
     let ended = await_end(&launched.process, tsc_hz, 10);
     drop(dir_other);
     let reports = launched.process.reports();
@@ -2446,6 +2453,7 @@ fn launch_one(creator: &Process, cpu: CpuIndex, tsc_hz: u64) -> Option<Launch> {
         handles_work,
         names_creator,
         faulted_there,
+        micros,
     })
 }
 
@@ -2551,6 +2559,13 @@ pub(crate) fn prove_launch(
             com1,
             "origin-kernel: start: the two records are at different addresses: {apart}; a record over 64 KiB is refused: {too_large}; a launch refused after its child held a handle gives everything back: {gave_back}{}",
             if refused_right { "" } else { ": start failed" }
+        );
+        let took = |launch: &Option<Launch>| launch.as_ref().map_or(0, |l| l.micros);
+        let _ = writeln!(
+            com1,
+            "origin-kernel: start: the launch path took {} us and {} us (placing the record, then granting, writing and starting)",
+            took(&first),
+            took(&second)
         );
         launched_right && refused_right
     };
