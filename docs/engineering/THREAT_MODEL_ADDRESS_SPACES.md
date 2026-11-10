@@ -2,9 +2,9 @@
 
 | | |
 |---|---|
-| Required by | CLAUDE.md §58 ("Threat-model every privileged interface"), §28, §29, §73; ADR-0011 N14 step 3, task S3-5a |
-| Covers | `framekernel/frame/src/userspace.rs`, `framekernel/frame/src/aliases.rs`, `framekernel/frame/src/tlb.rs`, `framekernel/frame/src/trap.rs` (the `Switch` token), `framekernel/frame/sync/src/shootdown.rs`, `framekernel/frame/sync/src/refcount.rs`, `framekernel/frame/src/vm.rs` (the kernel half), `framekernel/paging`; ADR-0004 H2 |
-| Written | 2026-11-10, with the implementation. Updated the same day with the fixes of its independent review (below, "Review findings"). S3-7 combines it with the threat model of the system-call boundary. |
+| Required by | CLAUDE.md §58 ("Threat-model every privileged interface"), §28, §29, §73; ADR-0011 N14 step 3, task S3-5a; ADR-0004 Amendment 1 A2 (the kernel stacks) |
+| Covers | `framekernel/frame/src/userspace.rs`, `framekernel/frame/src/aliases.rs`, `framekernel/frame/src/tlb.rs`, `framekernel/frame/src/trap.rs` (the `Switch` token), `framekernel/frame/sync/src/shootdown.rs`, `framekernel/frame/sync/src/refcount.rs`, `framekernel/frame/src/vm.rs` (the kernel half), `framekernel/paging`; ADR-0004 H2. Since the stack region: `framekernel/frame/src/stack.rs`, `framekernel/frame/sync/src/slots.rs`, and the interrupt stacks in `framekernel/frame/src/{cpu,smp}.rs` |
+| Written | 2026-11-10, with the implementation. Updated the same day with the fixes of its independent review (below, "Review findings"), and with the kernel stacks' region ("The kernel stacks", rows T30–T38). S3-7 combines it with the threat model of the system-call boundary. |
 | Evidence | QEMU only. "Proven" means a boot proof with a negative control under QEMU 11.1 TCG. "Modelled" means a Loom model of the real code, with a committed negative control, within the bounds it prints. Nothing has run on hardware (§74). The paging rules are as the code cites them, from Intel SDM Vol. 3A §4.10 ("Caching Translation Information"), §4.10.4 and §4.10.5; those sections were not re-read for this document. |
 
 ## What is being protected
@@ -82,6 +82,22 @@ Status: **Proven**, **Modelled**, **By design** (no proof), **Partly**, **Open**
 | T22 | A process maps something of the kernel's | The API maps only frames the kernel gave it, into the user half; `user_range_end` refuses anything else | **By design** |
 | T23 | The kernel reads a user frame as a Rust object while ring 3 changes it | Frames shared with ring 3 are reached by volatile copies only (`write_frame`, `read_u64`, `SharedFrame`) | **By design** |
 
+### The kernel stacks (ADR-0004 Amendment 1, A2)
+
+Every kernel stack the framework makes is in the stack region (`0xFFFF_C000_0000_0000`), in a 128 KiB slot of its own: its pages at the top, the rest never mapped. That includes kernel threads' stacks, each application processor's own stack and its four interrupt stacks, and the TLB proof's pages. The boot processor's interrupt stacks stay in the kernel image and the boot stack stays the loader's (`docs/research/2026-11-10-kernel-stack-region.md` says why). The attackers are the same as above: a buggy first-party caller, and a process whose threads' kernel stacks are made and freed as it runs.
+
+| # | Threat | Defence | Status |
+|---|---|---|---|
+| T30 | A kernel stack overflows into another stack, or into memory used for something else | At least 64 KiB below every stack is never mapped, and a frame larger than a page is probed a page at a time (Rust 1.99.1 on `x86_64-unknown-none`, checked), so the first access past the end faults. The #PF cannot be pushed onto the stack that overflowed, so the processor raises #DF, which runs on its own interrupt stack, and the kernel stops with a report | **Proven** for the unmapped space: the boot proof `stacks::prove` reads the page below each stack, the bottom of its slot and the bottom of the next for stacks of 4, 16 and 64 KiB and for each application processor's interrupt stacks (as its TSS names them), and each read faults; controls C26 (every stack's guard mapped, caught by the earlier probes of the application processors' interrupt stacks and of a thread's stack) and C27 (the 64 KiB stacks' guards mapped, caught by this proof). **By design** for the #DF path: a boot cannot overflow a stack and go on |
+| T31 | A freed stack's frames or addresses are reused while a processor still holds a translation of them, so a new stack, or another owner's data, is reached through the old one | A freed stack is either kept with its mapping, and then reused at the same addresses over the same frames, so no translation changes; or retired. A retired stack's pages leave the tables, a kernel shootdown of exactly those pages completes, and only then are its frames released and its slot free (`Slots::reclaim`). A stall loses both for good | **Proven** and **Modelled**: the boot proof (another processor's reads of a freed stack fault once it is reclaimed, and its slot is free again, which a slot is only after its frames were released), control C28; Loom `slots_reclaimed_slot_is_taken_only_after_its_shootdown`, with controls `slot_free_before_the_shootdown`, `slot_released_before_the_shootdown` and `slot_taken_while_it_is_reclaimed`. The stall: host tests only |
+| T32 | A stack is freed while a processor still runs on it, or while a suspended thread's saved frame is on it | Unchanged: `cpu::stack_in_use` looks at this processor's stack pointer, every processor's TSS RSP0 and every saved frame; a stack in use is leaked (`Slots::leak`), never given back | **By design**, as before; the thread proofs check that the processors hold as many stacks as before the first spawn |
+| T33 | Freeing a stack waits for other processors under a lock one of them spins on with interrupts off, so a refused spawn, which drops its stack under the run queue's lock, stops the kernel | Dropping a stack never shoots down and never waits for another processor. Only `stack::reclaim` does, and the scheduler calls it in `reap`, with no lock held | **By design** |
+| T34 | A stack's guard is cut out of the direct map, costing a frame and splitting a 2 MiB page for good (what A2 removes) | No guard is in the direct map: the application processors' interrupt stacks and the TLB proof's pages are in the region too, `make_guards` refuses a page below the kernel image, and the boot processor's interrupt stacks' guards are image pages | **Proven**: the boot proof checks that the direct map has every 2 MiB page it was built with; control C29 |
+| T35 | A stack page is executable, user-accessible, or mapped outside the region | Every stack page is `kernel_global(ReadWrite)`: writable, never executable, supervisor; `vm::map_stack_pages` and `unmap_stack_pages` refuse a range outside the region | **Proven**: the boot proof checks every page of its stacks' translations |
+| T36 | A panic's backtrace faults on the unmapped space above a stack, and the report is lost | For a frame pointer in the region, the backtrace's window ends at the top of the stack's slot | **By design**: a boot does not corrupt a frame chain |
+| T37 | Stacks use up the page tables that device registers and firmware tables need | The region's 129 tables are made at boot from a pool sized for them; mapping a stack never takes a table | **By design**; the boot line counts the kernel's tables |
+| T38 | Many stacks at once use up memory or the region | 2048 slots; a spawn beyond them is refused, like one into a full run queue; at most 16 freed stacks stay mapped | **By design** |
+
 ## Review findings (2026-11-10)
 
 An independent review of S3-5a by one AI reviewer (`docs/engineering/REVIEW_S3-5A_2026-11-10.md`; no human has reviewed this code). The fixes are on `claude/s3-5a-review-fixes`, one commit per change.
@@ -105,11 +121,13 @@ An independent review of S3-5a by one AI reviewer (`docs/engineering/REVIEW_S3-5
 2. **T10**: a spurious fault after `protect` is the one behaviour QEMU cannot show.
 3. **T3**: a stalled processor leaks memory silently but for the caller's error; nothing records it (§69).
 4. **PCIDs (ADR-0004 H5):** the targeting in `Scope::Space` rests on a CR3 load dropping a space's translations. With PCIDs it does not, and the shootdown must then also reach processors that have left the space, or use a generation per space.
-5. **Device DMA to shared frames:** before a memory-object frame enters an IOMMU domain, it needs pinning and an IOTLB invalidation in the same place as the shootdown (the research ledger's note on `iommu::map`).
+5. **The stack region has no slide** (T30, T31): stack addresses are predictable, since the lowest free slot is taken first, while the direct map and the kernel image are slid (ADR-0004 H3). Put to the coordinator as a question.
+6. **Device DMA to shared frames:** before a memory-object frame enters an IOMMU domain, it needs pinning and an IOTLB invalidation in the same place as the shootdown (the research ledger's note on `iommu::map`).
 
 ## What this does not prove
 
 - Anything on physical hardware (§74, rule 30). Finding 4 was found on a real processor under KVM in CI, and its fix has not yet run there.
+- That an overflow of a running stack ends in the #DF report (T30): a boot cannot overflow a stack and go on. What is proven is that the space below each stack does not translate.
 - Anything past each Loom model's printed bounds, or what Loom's memory model leaves out (`models.rs`, "What is not proved").
 - That the stand-in machine in the Loom models behaves like a processor's page walker: it is a boolean and a relaxed load.
 - The frame contents' confidentiality against side channels.
