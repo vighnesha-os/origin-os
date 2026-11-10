@@ -36,6 +36,7 @@ use core::sync::atomic::Ordering;
 pub mod floor;
 pub mod refcount;
 pub mod shootdown;
+pub mod slots;
 pub mod wait;
 
 #[cfg(all(test, loom))]

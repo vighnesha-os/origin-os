@@ -13,6 +13,8 @@
 //! - **The firmware framebuffer** (ADR-0010), when there is one: uncached, at the
 //!   start of the MMIO window ([`FRAMEBUFFER_WINDOW`]), so a console can draw from the
 //!   kernel's first instruction and across the switch to its own tables.
+//! - **Kernel stacks** at [`STACK_REGION`] (ADR-0004 Amendment 1, A2): nothing here; the
+//!   kernel makes the region's page tables with its own and maps each stack as it makes it.
 //! - **Nothing else**: firmware runtime memory, ACPI NVS, other MMIO, reserved and unknown
 //!   regions stay unmapped until a driver maps what it owns.
 
@@ -44,6 +46,24 @@ pub const KERNEL_ALIGN: u64 = LARGE_PAGE;
 pub const FRAMEBUFFER_WINDOW: u64 = 0xFFFF_E000_0000_0000;
 /// Size of the framebuffer window. Device registers are mapped above it.
 pub const FRAMEBUFFER_WINDOW_SIZE: u64 = 2 << 30;
+/// Start of the kernel stacks' region (ADR-0004 H2, Amendment 1 A2): PML4 slot 384, where the
+/// direct-map window ends. Each stack is mapped there with unmapped space below it, so a guard
+/// costs no frame and splits no page of the direct map. [`build`] maps nothing there.
+pub const STACK_REGION: u64 = 0xFFFF_C000_0000_0000;
+/// The part of the stack region the kernel uses: 256 MiB, every page of it covered by page
+/// tables made at boot ([`STACK_REGION_TABLES`]).
+pub const STACK_REGION_SIZE: u64 = 256 << 20;
+/// The tables the stack region's leaves need, made once at boot
+/// (`AddressSpace::reserve_tables`): a page table per 2 MiB and a page directory per GiB. Its
+/// PDPT is one of the kernel half's ([`KERNEL_HALF_SLOTS`]).
+pub const STACK_REGION_TABLES: u64 =
+    STACK_REGION_SIZE / LARGE_PAGE + STACK_REGION_SIZE.div_ceil(1 << GIB_SHIFT);
+const _: () = assert!(
+    STACK_REGION == DIRECT_MAP_WINDOW + DIRECT_MAP_WINDOW_SIZE
+        && STACK_REGION + STACK_REGION_SIZE <= FRAMEBUFFER_WINDOW
+        && STACK_REGION_SIZE.is_multiple_of(LARGE_PAGE),
+    "the stack region lies between the direct-map window and the MMIO window"
+);
 /// Tables the kernel half's top level can take (ADR-0004 H2): one for each of PML4 entries
 /// 256–511. [`AddressSpace::reserve_upper_half`] makes the ones [`build`] did not.
 pub const KERNEL_HALF_SLOTS: u64 = (crate::ENTRIES / 2) as u64;
@@ -655,5 +675,34 @@ mod tests {
         );
         let wx = segment(0, 1, SEGMENT_READ | SEGMENT_WRITE | SEGMENT_EXECUTE);
         assert_eq!(segment_access(&wx), Access::ReadExecute);
+    }
+
+    #[test]
+    fn the_stack_region_is_a_slot_of_its_own_whose_tables_are_counted() {
+        assert_eq!((STACK_REGION >> 39) & 0x1FF, 384, "PML4 slot 384");
+        assert_eq!(STACK_REGION_TABLES, 128 + 1);
+        // The kernel's order (`early`): its tables, the kernel half's top-level entries, then
+        // the stack region's tables, exactly as many as counted, with nothing mapped there.
+        let tables = pool(64 + KERNEL_HALF_SLOTS as usize + STACK_REGION_TABLES as usize);
+        let mut mem = TablePool::new(&tables, POOL_BASE);
+        let (mut space, _) = build(&mut mem, &at(), &regions(), &segments()).unwrap();
+        space.reserve_upper_half(&mut mem).unwrap();
+        let before = mem.used();
+        assert_eq!(
+            space.reserve_tables(&mut mem, STACK_REGION, STACK_REGION_SIZE),
+            Ok(STACK_REGION_TABLES as u32)
+        );
+        assert_eq!(mem.used() - before, STACK_REGION_TABLES as usize);
+        assert_eq!(
+            space.leaf_sizes(&mem, STACK_REGION, STACK_REGION + STACK_REGION_SIZE),
+            crate::LeafSizes::default()
+        );
+        // The direct map is all the build put in its window.
+        let direct = space.leaf_sizes(
+            &mem,
+            DIRECT_MAP_WINDOW,
+            DIRECT_MAP_WINDOW + DIRECT_MAP_WINDOW_SIZE,
+        );
+        assert!(direct.small > 0 && direct.large > 0, "{direct:?}");
     }
 }

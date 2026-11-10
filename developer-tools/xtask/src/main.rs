@@ -1347,6 +1347,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(launch_markers())
         .chain(directory_markers())
         .chain(memory_markers())
+        .chain(stack_markers(machine))
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
@@ -1794,12 +1795,35 @@ fn address_space_markers(cpus: u32) -> Vec<String> {
         ),
         "origin-kernel: address spaces: a frame shared by two spaces: unmapped from the first, its thread faulted: true, the other went on: true, the frame still in use: true; unmapped from the second, its thread faulted: true, the frame free when the unmap returned: true".into(),
         "origin-kernel: address spaces: W^X across a shared frame's mappings: executable in another space while writable in one, refused: true; at another address in the same space, refused: true; read-only beside it: true; executable once nothing writes it: true; writable again while executable elsewhere, refused: true; from executable to writable in one step, refused: true".into(),
+        "origin-kernel: address spaces: a run of shared frames is mapped whole or not at all: over a page already mapped, refused with none of it mapped: true; with a frame executable in another space, refused with none of it mapped and no count taken: true; into 2 MiB that needs a page table once the space has made all it may, refused as a limit with none of it mapped: true; mapped whole: true".into(),
         format!(
             "origin-kernel: address spaces: 64 maps and unmaps of a page under a thread on {far}: {} interrupts, 0 on processors not in the space; ",
             64 * one
         ),
         " us each (QEMU, no budget)".into(),
         "origin-kernel: address spaces: every process and frame of these proofs is gone: ".into(),
+    ]
+}
+
+/// ADR-0004 Amendment 1, A2: the kernel stacks' region, each of its boot proof's lines.
+fn stack_markers(machine: &Machine) -> Vec<String> {
+    let cpus = machine.cpus();
+    let interrupt_stacks = 4 * (cpus - 1);
+    // The processor that caches the freed stack: the first after the boot processor, if any.
+    let reader = machine.named(cpus.min(2) - 1);
+    vec![
+        format!(
+            "origin-kernel: kernel stacks: stacks of 4, 16 and 64 KiB each in a slot of its own in the region, every page read/write, not executable and global: true; the page below each, the bottom of its slot and the bottom of the next faulted: 9 of 9; the application processors' interrupt stacks, as their TSSs name them, in the region with the page below each faulting: {interrupt_stacks} of {interrupt_stacks}"
+        ),
+        "origin-kernel: kernel stacks: the direct map has every 2 MiB page it was built with: true (".into(),
+        format!(
+            "origin-kernel: kernel stacks: a stack's 4 pages read on {reader}, then the stack freed and reclaimed: 4 of 4 reads there faulted and 0 saw the old pages; its slot free again: true"
+        ),
+        "origin-kernel: kernel stacks: 64 stacks of 16384 bytes made and freed: all made true; making one took ".into(),
+        " (QEMU, no budget)".into(),
+        "origin-kernel: kernel stacks: every stack the proof made is given back: Counts { live: ".into(),
+        ", idle: 0, retired: 0, lost: 0, pages: ".into(),
+        " }, as before: true".into(),
     ]
 }
 
