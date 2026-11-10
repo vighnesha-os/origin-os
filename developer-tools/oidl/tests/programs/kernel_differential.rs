@@ -16,6 +16,7 @@ const MAX_MESSAGE_BYTES: u64 = 65_536;
 const MAX_MESSAGE_HANDLES: u64 = 64;
 const RIGHTS_ALL: u32 = 0x1FF;
 const SIGNALS_ALL: u32 = 0x1F;
+const MAP_ACCESS_ALL: u32 = 0x7;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
@@ -77,10 +78,26 @@ fn hand_written(call: u64, a: [u64; 6], debug_calls: bool) -> Verdict {
             }
             Ok(())
         })(),
+        // The memory calls (S3-5b) came after 9ca0438, with the definition; their register checks
+        // are OIDL §10's. memory_object_create: only pointers.
+        11 => Ok(()),
+        // memory_map: two handles, then pointers.
+        12 => handle_arg(a0).and_then(|_| handle_arg(a1)).map(|_| ()),
+        // memory_unmap: the handle, then two u64s.
+        13 => handle_arg(a0).map(|_| ()),
+        // memory_protect: the handle, two u64s, then access: it must fit, declare no unknown bit
+        // and not be zero.
+        14 => (|| {
+            handle_arg(a0)?;
+            let access = u32::try_from(a3).map_err(|_| INVALID_ARGS)?;
+            if access == 0 || access & !MAP_ACCESS_ALL != 0 {
+                return Err(INVALID_ARGS);
+            }
+            Ok(())
+        })(),
         // event_create and object_signal have numbers but no match arm: the catch-all.
         _ => Err(NOT_SUPPORTED),
     };
-    let _ = a3;
     Verdict::Status(match result {
         Ok(()) => 0,
         Err(status) => status,
@@ -147,6 +164,39 @@ impl s::Calls for Reached {
         _deadline: u64,
         _observed: rt::UserRef<k::Signals>,
     ) -> Result<(), s::WaitOneError> {
+        Ok(())
+    }
+    fn memory_object_create(
+        &self,
+        _request: rt::UserRef<k::ObjectRequest>,
+        _object: rt::UserRef<rt::Handle>,
+    ) -> Result<(), s::MemoryObjectCreateError> {
+        Ok(())
+    }
+    fn memory_map(
+        &self,
+        _process: rt::HandleArg,
+        _object: rt::HandleArg,
+        _request: rt::UserRef<k::MapRequest>,
+        _address: rt::UserRef<u64>,
+    ) -> Result<(), s::MemoryMapError> {
+        Ok(())
+    }
+    fn memory_unmap(
+        &self,
+        _process: rt::HandleArg,
+        _address: u64,
+        _length: u64,
+    ) -> Result<(), s::MemoryUnmapError> {
+        Ok(())
+    }
+    fn memory_protect(
+        &self,
+        _process: rt::HandleArg,
+        _address: u64,
+        _length: u64,
+        _access: k::MapAccess,
+    ) -> Result<(), s::MemoryProtectError> {
         Ok(())
     }
 }

@@ -29,7 +29,12 @@ pub(crate) const FRAMEWORK: &str = "framekernel/frame";
 const KERNEL_ROOT: &str = "framekernel";
 /// Leaf crates outside [`KERNEL_ROOT`] that the kernel links (the rest of the workspace is
 /// the UEFI loader and host tools, N12's listed exceptions).
-const KERNEL_LEAVES: &[&str] = &["boot/info", "runtime/abi", "runtime/version"];
+const KERNEL_LEAVES: &[&str] = &[
+    "boot/info",
+    "runtime/abi",
+    "runtime/version",
+    "sdk/directory",
+];
 /// The kernel library's crate root, whose `forbid(unsafe_code)` covers every module above the
 /// framework.
 const KERNEL_LIB_ROOT: &str = "framekernel/src/lib.rs";
@@ -44,6 +49,8 @@ const LAYERS: &[(&str, &[&str])] = &[
     ("origin-abi", &["origin-version"]),
     ("origin-sync", &[]),
     ("origin-syscalls", &[]),
+    // The service directory's generated client and stub, which a boot proof uses.
+    ("origin-directory", &[]),
     ("origin-paging", &["origin-boot-info", "origin-version"]),
     (
         "origin-frame",
@@ -62,6 +69,7 @@ const LAYERS: &[(&str, &[&str])] = &[
             "origin-boot-info",
             "origin-frame",
             "origin-paging",
+            "origin-directory",
             "origin-sync",
             "origin-syscalls",
             "origin-version",

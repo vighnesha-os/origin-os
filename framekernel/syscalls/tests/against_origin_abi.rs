@@ -99,6 +99,10 @@ fn the_call_numbers_are_the_same() {
         (number::WAIT_ONE, abi::WAIT_ONE),
         (number::EVENT_CREATE, abi::EVENT_CREATE),
         (number::OBJECT_SIGNAL, abi::OBJECT_SIGNAL),
+        (number::MEMORY_OBJECT_CREATE, abi::MEMORY_OBJECT_CREATE),
+        (number::MEMORY_MAP, abi::MEMORY_MAP),
+        (number::MEMORY_UNMAP, abi::MEMORY_UNMAP),
+        (number::MEMORY_PROTECT, abi::MEMORY_PROTECT),
     ];
     assert_eq!(server::CALLS.len(), pairs.len());
     for (ours, theirs) in pairs {
@@ -217,6 +221,42 @@ fn the_limits_layouts_and_version_are_the_same() {
     }
 }
 
+/// Memory objects (ADR-0005 C6-C8): their rights, bits, page size and request layouts.
+#[test]
+fn memory_objects_are_the_same() {
+    use origin_abi::{map_access, map_flags, map_request, object_request};
+    assert_eq!(
+        generated::MEMORY_OBJECT_RIGHTS.bits(),
+        origin_abi::rights::MEMORY_OBJECT
+    );
+    assert_eq!(generated::PAGE_SIZE, origin_abi::PAGE_SIZE);
+    assert_eq!(generated::MapAccess::READ.bits(), map_access::READ);
+    assert_eq!(generated::MapAccess::WRITE.bits(), map_access::WRITE);
+    assert_eq!(generated::MapAccess::EXECUTE.bits(), map_access::EXECUTE);
+    assert_eq!(generated::MapAccess::ALL.bits(), map_access::ALL);
+    assert_eq!(generated::MapFlags::FIXED.bits(), map_flags::FIXED);
+    assert_eq!(generated::MapFlags::ALL.bits(), map_flags::ALL);
+    assert_eq!(generated::ObjectRequest::SIZE, object_request::SIZE);
+    assert_eq!(
+        generated::ObjectRequest::LENGTH_AT,
+        object_request::LENGTH_AT
+    );
+    assert_eq!(generated::MapRequest::SIZE, map_request::SIZE);
+    assert_eq!(generated::MapRequest::ACCESS_AT, map_request::ACCESS_AT);
+    assert_eq!(generated::MapRequest::FLAGS_AT, map_request::FLAGS_AT);
+    assert_eq!(generated::MapRequest::OFFSET_AT, map_request::OFFSET_AT);
+    assert_eq!(generated::MapRequest::LENGTH_AT, map_request::LENGTH_AT);
+    assert_eq!(generated::MapRequest::ADDRESS_AT, map_request::ADDRESS_AT);
+    // Only the sizes of versions the kernel knows are taken (OIDL §5.3).
+    assert!(generated::MapRequest::accepts_param_size(map_request::SIZE));
+    assert!(!generated::MapRequest::accepts_param_size(
+        map_request::SIZE - 1
+    ));
+    assert!(!generated::MapRequest::accepts_param_size(
+        map_request::SIZE + 8
+    ));
+}
+
 /// An implementation of the interface that only records that it ran.
 #[derive(Default)]
 struct Recorder {
@@ -286,6 +326,66 @@ impl Calls for Recorder {
     ) -> Result<(), server::WaitOneError> {
         self.ran.set(true);
         Ok(())
+    }
+    fn memory_object_create(
+        &self,
+        _: rt::UserRef<generated::ObjectRequest>,
+        _: rt::UserRef<rt::Handle>,
+    ) -> Result<(), server::MemoryObjectCreateError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn memory_map(
+        &self,
+        _: rt::HandleArg,
+        _: rt::HandleArg,
+        _: rt::UserRef<generated::MapRequest>,
+        _: rt::UserRef<u64>,
+    ) -> Result<(), server::MemoryMapError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn memory_unmap(
+        &self,
+        _: rt::HandleArg,
+        _: u64,
+        _: u64,
+    ) -> Result<(), server::MemoryUnmapError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn memory_protect(
+        &self,
+        _: rt::HandleArg,
+        _: u64,
+        _: u64,
+        _: generated::MapAccess,
+    ) -> Result<(), server::MemoryProtectError> {
+        self.ran.set(true);
+        Ok(())
+    }
+}
+
+/// `memory_protect`'s access is `@nonzero` and its bits are checked: zero, or a bit the
+/// definition does not declare, is refused before the implementation runs.
+#[test]
+fn a_protect_with_no_access_or_an_undefined_bit_never_runs() {
+    for access in [0, 1 << 3] {
+        let recorder = Recorder::default();
+        let outcome = server::dispatch(
+            &recorder,
+            number::MEMORY_PROTECT,
+            [1, 0x1000, 0x1000, access, 0, 0],
+        );
+        assert_eq!(
+            outcome,
+            server::Outcome::Status(generated::Error::InvalidArgs.raw()),
+            "{access:#x}"
+        );
+        assert!(
+            !recorder.ran.get(),
+            "the implementation ran for {access:#x}"
+        );
     }
 }
 

@@ -105,7 +105,8 @@ const ONBF_FORMAT_PACKAGE: &str = "onbf-format";
 const CRYPTO_PACKAGE: &str = "origin-crypto";
 const MERKLE_PACKAGE: &str = "onbf-merkle";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
-/// `no_std` libraries embedded in the boot loader and the Framekernel. Each must be
+/// `no_std` libraries embedded in the boot loader and the Framekernel, and the generated crates of
+/// the SDK's interfaces, which the Framekernel's boot proofs use and programs will. Each must be
 /// clippy-clean on every target and free of panic paths (ONBF §12).
 const BOOT_INFO_PACKAGE: &str = "origin-boot-info";
 const KERNEL_PACKAGE: &str = "framekernel";
@@ -126,7 +127,10 @@ const FREESTANDING_LIBS: &[&str] = &[
     "origin-paging",
     "origin-abi",
     "origin-syscalls",
+    "origin-directory",
 ];
+/// The services' `no_std` logic, which programs will run in ring 3 and the host tests until then.
+const SERVICE_LIBS: &[&str] = &["origin-directory-service"];
 const QEMU: &str = "qemu-system-x86_64";
 /// Where the emulated RTC starts (UTC), so the boot test can check the wall clock the
 /// kernel reads from it: BCD decoding, the FADT century register and the calendar.
@@ -1341,6 +1345,8 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(address_space_markers(cpus))
         .chain(identity_markers())
         .chain(launch_markers())
+        .chain(directory_markers())
+        .chain(memory_markers())
         .chain(stack_markers(machine))
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
@@ -1626,6 +1632,8 @@ fn boot_failures() -> Vec<&'static str> {
         ": PM timer failed",
         ": ipc failed",
         ": start failed",
+        ": directory failed",
+        ": memory failed",
         ": console failed",
         ": TLB failed",
         ": address spaces failed",
@@ -1838,6 +1846,11 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
         "origin-kernel: ipc: transfers that would break the graph: an end through its own channel -> INVALID_ARGS, the peer end through its own channel -> INVALID_ARGS, the same handle twice -> INVALID_ARGS, an end with another handle -> INVALID_ARGS, that end, alone again -> OK, into the first channel -> OK, a cycle through two queues -> INVALID_ARGS, a stale handle in the list -> BAD_HANDLE".into(),
         "origin-kernel: ipc: every hostile call returned its status and the process exited by itself (".into(),
         "; user-copy faults recovered: 0".into(),
+        // N14 step 3, S3-5b: the memory calls' corpus, in a process of its own.
+        "origin-kernel: ipc: memory objects: a request in the kernel -> FAULT, a request of the wrong size -> INVALID_ARGS, no bytes -> INVALID_ARGS, not whole pages -> INVALID_ARGS, past the quota -> LIMIT, its handle into the kernel -> FAULT, one page -> OK, wait on it -> ACCESS_DENIED, give it EXECUTE -> INVALID_ARGS".into(),
+        "origin-kernel: ipc: memory maps: a bad process handle -> BAD_HANDLE, a channel for the process -> WRONG_TYPE, a process handle without WRITE -> ACCESS_DENIED, a channel for the object -> WRONG_TYPE, an object handle without MAP -> ACCESS_DENIED, a request in the kernel -> FAULT, the address into the kernel -> FAULT, a request of the wrong size -> INVALID_ARGS, an undefined access -> INVALID_ARGS, an undefined flag -> INVALID_ARGS, write without read -> INVALID_ARGS, write and execute -> INVALID_ARGS, execute -> ACCESS_DENIED, write without WRITE -> ACCESS_DENIED, a misaligned offset -> INVALID_ARGS, no length -> INVALID_ARGS, past the object -> INVALID_ARGS, in the kernel half -> INVALID_ARGS, at address 0 -> INVALID_ARGS, at the top page -> INVALID_ARGS, an address without FIXED -> INVALID_ARGS, mapped -> OK, over it -> INVALID_ARGS".into(),
+        "origin-kernel: ipc: memory unmap and protect: unmap without WRITE -> ACCESS_DENIED, unmap where nothing is -> INVALID_ARGS, unmap none of it -> INVALID_ARGS, unmap more than it -> INVALID_ARGS, unmap not whole pages -> INVALID_ARGS, protect to nothing -> INVALID_ARGS, protect with an undefined bit -> INVALID_ARGS, protect to execute -> ACCESS_DENIED, protect where nothing is -> INVALID_ARGS, protect to read-only -> OK, protect back to writable -> ACCESS_DENIED, unmap -> OK, unmap again -> INVALID_ARGS".into(),
+        "origin-kernel: ipc: every hostile memory call returned its status and the process exited by itself (49 calls)".into(),
     ]);
     for how in ["exits", "faults"] {
         markers.extend([
@@ -1907,6 +1920,32 @@ fn launch_markers() -> Vec<String> {
         "origin-kernel: start: two children launched from their creator found their start records in RDI, read-only at random addresses: each record, read back in ring 3, has its size, version, 4 entries with C6's rights, 2 arguments and 1 environment string: true; each start handle works: true; each child's message names it and its creator's principal: true; writing its record faulted there: true".into(),
         "origin-kernel: start: the two records are at different addresses: true; a record over 64 KiB is refused: true; a launch refused after its child held a handle gives everything back: true".into(),
         "origin-kernel: start: every launched process and all they held are gone: heap ".into(),
+    ]
+}
+
+/// The service directory proof (ADR-0005 C11, C12; ADR-0011 N9; `ipc_proof::prove_directory`).
+fn directory_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: directory: a launcher started a directory, a service and a client; the client's connect, and the request it wrote on its own end before any reply, reached the service through the directory: true; the service read that request stamped with the client's process and principal, not the directory's: true; the client read the service's reply stamped with the service's process: true".into(),
+        "origin-kernel: directory: the client's replies, read in ring 3 and decoded by the generated client: ok for the interface and major the directory holds: true; not_found (-14) for a major it does not hold: true; that connection's end reports peer_closed: true; the service answered ok for the end passed to it: true".into(),
+        "origin-kernel: directory: the directory, the service, the client and all they held are gone: heap ".into(),
+    ]
+}
+
+/// The memory-object proof (ADR-0005 P7, P11, C6-C8; `ipc_proof::prove_memory`).
+fn memory_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: memory: two processes share an object by passing its handle, and each reads what the other wrote: true; protect to read-only refuses an increase and makes a write fault at the mapping: true; unmap makes a read fault there: true".into(),
+        "origin-kernel: memory: a fixed address over a mapping is refused, and the mapping keeps what was written to it: true; execute is refused: true; two random placements are apart, page-aligned and in their region: true; closing the handle leaves the mapping working: true".into(),
+        "origin-kernel: memory: the quota refuses an object past its bound and takes one again once an object is closed; a closed object still mapped keeps its charge; a third mapping past the limit of two is refused: true; once the process has ended its account owes nothing: true".into(),
+        "origin-kernel: memory: mapping into another process needs write on its handle, and with it the two share the frame: true; unmapping there needs it too, and the other's next read faults: true".into(),
+        "origin-kernel: memory: a hostile unmap loop is refused with should_wait once its budget is spent, changing nothing: true; it is served again once the budget refills: true".into(),
+        "origin-kernel: memory: every other call of the proof's programs returned what its script says, and each program ended as it should: true".into(),
+        "origin-kernel: memory: map, protect and unmap of 16 pages took ".into(),
+        " us (QEMU; the kernel's own calls, in a space no processor holds)".into(),
+        "origin-kernel: memory: unmapping a page of a shared object from a space a thread is reading it in took ".into(),
+        " us (QEMU, no budget); the thread then faulted at the page: true; the object stays mapped in its creator's space: true".into(),
+        "origin-kernel: memory: every process, object and mapping of the proof is gone: heap ".into(),
     ]
 }
 
@@ -2634,6 +2673,32 @@ fn check() -> Result {
                 "warnings",
             ]))?;
         }
+        run_step(cargo().args(["test", "--package", package]))?;
+    }
+    // The services' logic: `no_std`, tested on the host until programs run it in ring 3 (ADR-0011
+    // N14 step 4). Clippy on the host (with tests) and, as a `no_std` build, for the kernel's
+    // target, then their tests.
+    for &package in SERVICE_LIBS {
+        run_step(cargo().args([
+            "clippy",
+            "--package",
+            package,
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
+        run_step(cargo().args([
+            "clippy",
+            "--package",
+            package,
+            "--lib",
+            "--target",
+            KERNEL_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
         run_step(cargo().args(["test", "--package", package]))?;
     }
     // The framework: its logic on the host (with tests), and for the kernel's own target.

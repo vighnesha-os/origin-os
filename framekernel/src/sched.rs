@@ -1149,6 +1149,14 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         Proof::Launch,
         crate::ipc_proof::prove_launch(com1, cpus, bsp, tsc_hz),
     );
+    proofs.record(
+        Proof::Directory,
+        crate::ipc_proof::prove_directory(com1, cpus, bsp, tsc_hz),
+    );
+    proofs.record(
+        Proof::Memory,
+        crate::ipc_proof::prove_memory(com1, cpus, bsp, tsc_hz),
+    );
     proofs.record(Proof::Stacks, crate::stacks::prove(com1, cpus, bsp, tsc_hz));
     // Every thread has exited: once each processor has reaped its own, the heap is back
     // exactly where it was before the first spawn, and so are the stacks held.

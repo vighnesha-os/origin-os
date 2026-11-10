@@ -33,9 +33,10 @@
 //! Every object here is allocated fallibly ([`ObjectRef::try_new`]): a process or thread that
 //! cannot be created is an error for its creator, never a stopped kernel.
 //!
-//! The first slice has no process-creation or memory system calls: the kernel builds each
-//! process and maps its pages before any of its threads runs. A space can change while its
-//! threads run (`origin_frame::userspace`), but only the boot proofs change one so far.
+//! Only the kernel creates processes and maps their code, data and stacks, before any of their
+//! threads runs. After that a space changes through the memory calls (`memory_object`): a
+//! process's whole mappings of memory objects are recorded here, and the memory it commits is
+//! charged to its account (P11, C7).
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
@@ -43,6 +44,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use crate::channel::Identity;
 use crate::handles::HandleTable;
+use crate::mapping::{Budget, Mappings, Rate};
+use crate::memory_object::MemoryObject;
 use crate::paging::{Access, MapError, Translation};
 use crate::runqueue::QueueError;
 use origin_abi::{Error, Handle, signals};
@@ -68,6 +71,10 @@ pub(crate) struct Account {
     /// Bytes of kernel heap held by messages this process has queued and nobody has read.
     queued_bytes: AtomicUsize,
     max_queued_bytes: usize,
+    /// Bytes of memory objects this process created that still exist (C7): charged when one is
+    /// made, refunded when its last handle and mapping are gone.
+    committed: AtomicUsize,
+    max_committed: usize,
 }
 
 impl Account {
@@ -107,10 +114,56 @@ impl Account {
     pub(crate) fn queued_bytes(&self) -> usize {
         self.queued_bytes.load(Ordering::Acquire)
     }
+
+    /// `bytes` more of committed memory, or [`Error::Limit`] past the quota (C7).
+    pub(crate) fn charge_committed(&self, bytes: usize) -> Result<(), Error> {
+        self.committed
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                n.checked_add(bytes)
+                    .filter(|&total| total <= self.max_committed)
+            })
+            .map(|_| ())
+            .map_err(|_| Error::Limit)
+    }
+
+    /// A memory object charged to this account is gone, and its `bytes` with it.
+    pub(crate) fn refund_committed(&self, bytes: usize) {
+        self.committed.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    /// Bytes of committed memory charged to this account now.
+    pub(crate) fn committed(&self) -> usize {
+        self.committed.load(Ordering::Acquire)
+    }
 }
 
-/// A process's quotas: at most `handles` entries in its table, `channels` live channels and
-/// `message_bytes` of kernel heap in messages it has queued.
+/// What a process may commit and map, and how fast it may change its mappings (P11, C7;
+/// `THREAT_MODEL_ADDRESS_SPACES.md` T15, T16). [`MemoryLimits::NONE`] allows nothing: a creator
+/// gives memory to a process deliberately.
+#[derive(Clone, Copy)]
+pub(crate) struct MemoryLimits {
+    /// Bytes of memory objects it may have committed at once.
+    pub(crate) committed: usize,
+    /// Whole mappings its address space may hold.
+    pub(crate) mappings: usize,
+    /// Its budget of shootdowns and interrupts for unmap and protect.
+    pub(crate) changes: Rate,
+}
+
+impl MemoryLimits {
+    /// No memory objects, no mappings and no changes.
+    pub(crate) const NONE: Self = Self {
+        committed: 0,
+        mappings: 0,
+        changes: Rate {
+            burst: 0,
+            per_second: 1,
+        },
+    };
+}
+
+/// A process's quotas: at most `handles` entries in its table, `channels` live channels,
+/// `message_bytes` of kernel heap in messages it has queued, and its memory.
 #[derive(Clone, Copy)]
 pub(crate) struct Limits {
     pub(crate) handles: usize,
@@ -120,6 +173,8 @@ pub(crate) struct Limits {
     /// builds: an ordinary process that calls them gets `NOT_SUPPORTED`, so it cannot hold
     /// the serial line (at 115200 baud, a line for many milliseconds) with interrupts off.
     pub(crate) debug_calls: bool,
+    /// Its memory objects and mappings.
+    pub(crate) memory: MemoryLimits,
 }
 
 /// What ended the process's last thread, for the boot proofs.
@@ -246,6 +301,10 @@ pub(crate) struct Process {
     pub(crate) handles: SpinLock<HandleTable<Object>>,
     /// What it may hold (P11).
     pub(crate) account: ObjectRef<Account>,
+    /// Its whole mappings of memory objects (C7), each holding its object.
+    pub(crate) mappings: SpinLock<Mappings<ObjectRef<MemoryObject>>>,
+    /// Its budget for the unmaps and protects it asks for, in any process (T15, T16).
+    pub(crate) changes: SpinLock<Budget>,
     /// The only code range that may issue system calls (P4, ONBF §6.1): `[start, end)`.
     syscall_origin: (u64, u64),
     /// May it use the developer-only calls?
@@ -280,8 +339,12 @@ impl Process {
                 max_channels: limits.channels,
                 queued_bytes: AtomicUsize::new(0),
                 max_queued_bytes: limits.message_bytes,
+                committed: AtomicUsize::new(0),
+                max_committed: limits.memory.committed,
             })
             .ok()?,
+            mappings: SpinLock::new(Mappings::new(limits.memory.mappings)),
+            changes: SpinLock::new(Budget::new(limits.memory.changes)),
             syscall_origin,
             debug_calls: limits.debug_calls,
             lifecycle: SpinLock::new(Lifecycle {
@@ -552,6 +615,10 @@ impl Process {
         });
         drop(table);
         ipc::reap_closed();
+        // Its mappings' objects go with it, and no more can be made (P11): before it counts as
+        // ended, so whoever sees the ending sees their charges back.
+        let objects = without_interrupts(|| self.mappings.lock().close());
+        drop(objects);
         // "Ended" means its handles are closed and its peers can see that. (Ends that were only
         // reachable through an undelivered message another processor is reaping this instant
         // close a moment later: they are delayed, never lost.)

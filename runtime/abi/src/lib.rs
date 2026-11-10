@@ -70,11 +70,14 @@ pub enum Error {
     Limit = -12,
     /// The caller's buffer is too small; the sizes it needs were written to the out pointer.
     BufferTooSmall = -13,
+    /// Nothing by that name or key is here: a service directory holds no provider of the
+    /// interface and major asked for (amendment C11).
+    NotFound = -14,
 }
 
 impl Error {
     /// Every error, in value order.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::InvalidArgs,
         Self::BadHandle,
         Self::WrongType,
@@ -88,6 +91,7 @@ impl Error {
         Self::NotSupported,
         Self::Limit,
         Self::BufferTooSmall,
+        Self::NotFound,
     ];
 
     /// The raw status value.
@@ -116,6 +120,7 @@ impl Error {
             Self::NotSupported => "NOT_SUPPORTED",
             Self::Limit => "LIMIT",
             Self::BufferTooSmall => "BUFFER_TOO_SMALL",
+            Self::NotFound => "NOT_FOUND",
         }
     }
 }
@@ -173,6 +178,9 @@ pub mod rights {
     pub const PROCESS: u32 = READ | WRITE | MANAGE | WAIT | DUPLICATE | TRANSFER;
     /// The rights of a thread's handle to itself (amendment C6).
     pub const THREAD: u32 = WAIT | MANAGE | DUPLICATE | TRANSFER;
+    /// The rights of a new memory object (amendment C6): never `EXECUTE`, since an anonymous
+    /// object is never executable; `WAIT`, `SIGNAL` and `MANAGE` do not apply.
+    pub const MEMORY_OBJECT: u32 = READ | WRITE | MAP | DUPLICATE | TRANSFER;
 }
 
 /// Object signals (P9).
@@ -237,6 +245,86 @@ pub mod syscall {
     pub const EVENT_CREATE: u64 = 9;
     /// `object_signal(handle, clear, set)`: user signals ([`super::signals::SIGNALED`]).
     pub const OBJECT_SIGNAL: u64 = 10;
+    /// `memory_object_create(request, out_object)`: a [`super::object_request`].
+    pub const MEMORY_OBJECT_CREATE: u64 = 11;
+    /// `memory_map(process, object, request, out_address)`: a [`super::map_request`].
+    pub const MEMORY_MAP: u64 = 12;
+    /// `memory_unmap(process, address, length)`: one whole mapping.
+    pub const MEMORY_UNMAP: u64 = 13;
+    /// `memory_protect(process, address, length, access)`: one whole mapping, its access only
+    /// reduced ([`super::map_access`]).
+    pub const MEMORY_PROTECT: u64 = 14;
+}
+
+/// Bytes in a page: memory objects, mappings, offsets and fixed addresses are whole pages of
+/// this size (P7).
+pub const PAGE_SIZE: u64 = 4096;
+
+/// What a mapping allows (P7, amendments C7 and D2): `READ` always, and at most one of `WRITE` and
+/// `EXECUTE`; nothing is executable until the Code Integrity Table exists.
+pub mod map_access {
+    /// Read.
+    pub const READ: u32 = 1 << 0;
+    /// Write.
+    pub const WRITE: u32 = 1 << 1;
+    /// Execute (refused in this version).
+    pub const EXECUTE: u32 = 1 << 2;
+    /// Every bit defined in this version.
+    pub const ALL: u32 = READ | WRITE | EXECUTE;
+}
+
+/// How a mapping is placed (P7, amendments C7 and D2).
+pub mod map_flags {
+    /// At the request's address, whose pages must all be free: a mapping is never replaced.
+    pub const FIXED: u32 = 1 << 0;
+    /// Every bit defined in this version.
+    pub const ALL: u32 = FIXED;
+}
+
+/// The structure `memory_object_create` reads (amendments C7 and D1), which begins with its own
+/// `u32 size`, set by the caller to a version it knows (P4).
+///
+/// ```text
+/// 0  u32 size     16
+/// 4  u32          zero
+/// 8  u64 length   bytes of the object: a non-zero multiple of PAGE_SIZE
+/// ```
+pub mod object_request {
+    /// Bytes of this version of the structure.
+    pub const SIZE: u32 = 16;
+    /// Byte offset of `size`.
+    pub const SIZE_AT: usize = 0;
+    /// Byte offset of `length`.
+    pub const LENGTH_AT: usize = 8;
+}
+
+/// The structure `memory_map` reads (amendments C7, C8 and D2), which begins with its own
+/// `u32 size` (P4).
+///
+/// ```text
+/// 0  u32 size      40
+/// 4  u32 access    map_access bits
+/// 8  u32 flags     map_flags bits
+/// 12 u32           zero
+/// 16 u64 offset    where the mapping starts in the object: a multiple of PAGE_SIZE
+/// 24 u64 length    bytes mapped: a non-zero multiple of PAGE_SIZE
+/// 32 u64 address   with FIXED, where it goes; otherwise zero
+/// ```
+pub mod map_request {
+    /// Bytes of this version of the structure.
+    pub const SIZE: u32 = 40;
+    /// Byte offset of `size`.
+    pub const SIZE_AT: usize = 0;
+    /// Byte offset of `access`.
+    pub const ACCESS_AT: usize = 4;
+    /// Byte offset of `flags`.
+    pub const FLAGS_AT: usize = 8;
+    /// Byte offset of `offset`.
+    pub const OFFSET_AT: usize = 16;
+    /// Byte offset of `length`.
+    pub const LENGTH_AT: usize = 24;
+    /// Byte offset of `address`.
+    pub const ADDRESS_AT: usize = 32;
 }
 
 /// Limits (P8, P9).
@@ -658,7 +746,7 @@ mod tests {
     #[test]
     fn status_values_are_stable_and_distinct() {
         // Pinned: these values are the C ABI (P5); changing one breaks every program.
-        let expected: [(Error, i64); 13] = [
+        let expected: [(Error, i64); 14] = [
             (Error::InvalidArgs, -1),
             (Error::BadHandle, -2),
             (Error::WrongType, -3),
@@ -672,20 +760,22 @@ mod tests {
             (Error::NotSupported, -11),
             (Error::Limit, -12),
             (Error::BufferTooSmall, -13),
+            (Error::NotFound, -14),
         ];
         for (e, v) in expected {
             assert_eq!(e.raw(), v);
             assert_eq!(Error::from_raw(v), Some(e));
         }
         assert_eq!(Error::from_raw(OK), None);
-        assert_eq!(Error::from_raw(-14), None);
+        assert_eq!(Error::from_raw(-15), None);
         assert_eq!(Error::ALL.len(), expected.len());
     }
 
     #[test]
     fn every_status_has_a_distinct_name() {
         assert_eq!(status_name(OK), "OK");
-        assert_eq!(status_name(-14), "UNKNOWN");
+        assert_eq!(status_name(-14), "NOT_FOUND");
+        assert_eq!(status_name(-15), "UNKNOWN");
         assert_eq!(status_name(1), "UNKNOWN");
         let mut names: Vec<&str> = Error::ALL.iter().map(|e| e.name()).collect();
         for e in Error::ALL {
@@ -804,6 +894,33 @@ mod tests {
         );
         assert_eq!(rights::PROCESS & !rights::ALL, 0);
         assert_eq!(rights::THREAD & !rights::ALL, 0);
+    }
+
+    #[test]
+    fn a_memory_object_has_c6s_rights_and_never_execute() {
+        assert_eq!(
+            rights::MEMORY_OBJECT,
+            rights::READ | rights::WRITE | rights::MAP | rights::DUPLICATE | rights::TRANSFER
+        );
+        assert_eq!(rights::MEMORY_OBJECT & rights::EXECUTE, 0);
+        assert_eq!(rights::MEMORY_OBJECT & !rights::ALL, 0);
+    }
+
+    #[test]
+    fn the_memory_requests_are_laid_out_field_by_field() {
+        // Each field at its alignment after the implicit size, with no hole but the one named.
+        assert_eq!(object_request::SIZE_AT, 0);
+        assert_eq!(object_request::LENGTH_AT, 8);
+        assert_eq!(object_request::SIZE as usize, object_request::LENGTH_AT + 8);
+        assert_eq!(map_request::ACCESS_AT, 4);
+        assert_eq!(map_request::FLAGS_AT, 8);
+        assert_eq!(map_request::OFFSET_AT, 16);
+        assert_eq!(map_request::LENGTH_AT, 24);
+        assert_eq!(map_request::ADDRESS_AT, 32);
+        assert_eq!(map_request::SIZE as usize, map_request::ADDRESS_AT + 8);
+        assert_eq!(map_access::ALL, 0b111);
+        assert_eq!(map_flags::ALL, 0b1);
+        assert!(PAGE_SIZE.is_power_of_two());
     }
 
     #[test]

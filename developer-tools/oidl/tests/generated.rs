@@ -13,6 +13,7 @@ use oidl::model::{Compilation, ConstKind};
 use oidl::{Input, codegen, compile, corpus, fingerprint};
 
 const KERNEL: &str = include_str!("../../../sdk/interfaces/origin.kernel.oidl");
+const DIRECTORY: &str = include_str!("../../../sdk/interfaces/origin.directory.oidl");
 const ECHO: &str = include_str!("fixtures/echo.oidl");
 const CALLS: &str = include_str!("fixtures/calls.oidl");
 const VERSIONS: &str = include_str!("../../../origin-version.toml");
@@ -20,6 +21,7 @@ const VERSIONS: &str = include_str!("../../../origin-version.toml");
 fn inputs() -> Vec<Input> {
     [
         ("origin.kernel.oidl", KERNEL),
+        ("origin.directory.oidl", DIRECTORY),
         ("echo.oidl", ECHO),
         ("calls.oidl", CALLS),
     ]
@@ -335,6 +337,137 @@ fn the_server_side_is_the_same_code_without_the_client_or_the_shims() {
     .arg(dir.join("lib.rs"))
     .current_dir(&dir);
     run_ok(cmd, "the server side alone");
+}
+
+/// One channel library's crate (§11), for its services and their clients: its types, servers and
+/// clients exactly as the full output writes them; of the libraries it uses, directly or not, only
+/// their types; no shim and no `unsafe`; and it builds alone, for the kernel's target too.
+#[test]
+fn a_library_crate_is_its_server_and_client_and_the_types_it_uses() {
+    const ECHO_LIBRARY: &str = "origin.fixture.echo";
+    let comp = compilation();
+    let everything = all_files(&comp);
+    let files = codegen::generate_library(&comp, ECHO_LIBRARY).expect("a channel library");
+    let echo = comp
+        .libraries
+        .iter()
+        .find(|library| library.name == ECHO_LIBRARY)
+        .expect("the fixture");
+    // The fixture uses both other libraries, so each is in the crate, by its types alone.
+    assert_eq!(echo.uses.len(), 2, "{:?}", echo.uses);
+    assert_eq!(
+        files.len(),
+        2 + 2 * (echo.uses.len() + 1) + 3 * echo.interfaces.len()
+    );
+    for file in &files {
+        let name = file.path.rsplit('/').next().expect("a name");
+        assert!(
+            !["abi.rs", "core_stubs.rs"].contains(&name),
+            "{}",
+            file.path
+        );
+        let code: String = file
+            .text
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//") && !trimmed.starts_with("#![")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("unsafe"), "{}: unsafe", file.path);
+        let full = everything.get(&format!("rust/{}", file.path));
+        if file.path.starts_with("origin_fixture_echo/") || file.path == "oidl_rt.rs" {
+            assert_eq!(full, Some(&file.text), "{}", file.path);
+        } else if file.path != "lib.rs" {
+            // A used library: its types as the full output writes them, and no interface.
+            assert!(
+                name == "types.rs" || name == "mod.rs",
+                "{}: only types",
+                file.path
+            );
+            if name == "types.rs" {
+                assert_eq!(full, Some(&file.text), "{}", file.path);
+            } else {
+                assert!(
+                    file.text.contains("pub mod types;")
+                        && file.text.matches("pub mod ").count() == 1,
+                    "{}: {}",
+                    file.path,
+                    file.text
+                );
+            }
+        }
+    }
+    let clients = files
+        .iter()
+        .filter(|file| file.path.ends_with("/client.rs"))
+        .count();
+    assert_eq!(clients, echo.interfaces.len());
+    let root = files
+        .iter()
+        .find(|file| file.path == "lib.rs")
+        .expect("a crate root");
+    assert!(
+        root.text.contains("#![forbid(unsafe_code)]"),
+        "{}",
+        root.text
+    );
+
+    // A syscall library's client is the shims, and an unknown library is no library.
+    let refused = codegen::generate_library(&comp, "origin.kernel").expect_err("syscall");
+    assert!(refused.contains("syscall"), "{refused}");
+    assert!(codegen::generate_library(&comp, "origin.no.such").is_err());
+
+    // A library given but not used is left out: here one that uses only origin.kernel.
+    let mut with_other = inputs();
+    with_other.push(Input {
+        file: "other.oidl".to_string(),
+        text: b"/// o\nlibrary origin.fixture.other;\ntransport channel;\nversion 0.1;\nuse origin.kernel;\n/// i\ninterface other {\n    /// m\n    method ping = 1 () errors() requires none;\n}\n".to_vec(),
+    });
+    let wider = compile(&with_other, Some(VERSIONS)).expect("valid");
+    let other = codegen::generate_library(&wider, "origin.fixture.other").expect("channel");
+    let other_paths: Vec<&str> = other.iter().map(|file| file.path.as_str()).collect();
+    assert_eq!(
+        other_paths,
+        [
+            "lib.rs",
+            "oidl_rt.rs",
+            "origin_fixture_other/mod.rs",
+            "origin_fixture_other/other/client.rs",
+            "origin_fixture_other/other/mod.rs",
+            "origin_fixture_other/other/server.rs",
+            "origin_fixture_other/types.rs",
+            "origin_kernel/mod.rs",
+            "origin_kernel/types.rs",
+        ]
+    );
+
+    // It builds alone, for the kernel's target.
+    let dir = scratch("library-crate");
+    let tree: BTreeMap<String, String> = files
+        .into_iter()
+        .map(|file| (file.path, file.text))
+        .collect();
+    write_tree(&dir, &tree);
+    let mut cmd = Command::new(rustc());
+    cmd.args([
+        "--edition",
+        "2024",
+        "--crate-type",
+        "rlib",
+        "--crate-name",
+        "oidl_library",
+        "--target",
+        "x86_64-unknown-none",
+        "-D",
+        "warnings",
+        "-o",
+    ])
+    .arg(dir.join("library.rlib"))
+    .arg(dir.join("lib.rs"))
+    .current_dir(&dir);
+    run_ok(cmd, "a library crate alone");
 }
 
 /// The C standards the headers are compiled under: from the first with `_Static_assert` to the
@@ -1081,7 +1214,7 @@ fn the_definition_has_exactly_the_hand_written_abi_s_statuses_rights_signals_and
         .iter()
         .map(|m| (m.name.as_str(), m.ordinal))
         .collect();
-    assert_eq!(numbers.len(), 11);
+    assert_eq!(numbers.len(), 15);
     assert_eq!(u64::from(numbers["thread_exit"]), syscall::THREAD_EXIT);
     assert_eq!(u64::from(numbers["debug_report"]), syscall::DEBUG_REPORT);
     assert_eq!(u64::from(numbers["debug_write"]), syscall::DEBUG_WRITE);
@@ -1099,6 +1232,16 @@ fn the_definition_has_exactly_the_hand_written_abi_s_statuses_rights_signals_and
     assert_eq!(u64::from(numbers["wait_one"]), syscall::WAIT_ONE);
     assert_eq!(u64::from(numbers["event_create"]), syscall::EVENT_CREATE);
     assert_eq!(u64::from(numbers["object_signal"]), syscall::OBJECT_SIGNAL);
+    assert_eq!(
+        u64::from(numbers["memory_object_create"]),
+        syscall::MEMORY_OBJECT_CREATE
+    );
+    assert_eq!(u64::from(numbers["memory_map"]), syscall::MEMORY_MAP);
+    assert_eq!(u64::from(numbers["memory_unmap"]), syscall::MEMORY_UNMAP);
+    assert_eq!(
+        u64::from(numbers["memory_protect"]),
+        syscall::MEMORY_PROTECT
+    );
     let object_type = comp.object_type.as_ref().expect("object_type");
     assert_eq!(
         object_type

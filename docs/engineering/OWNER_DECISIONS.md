@@ -167,7 +167,7 @@ CI caught one processor's TSC stepping back by 16 ticks on an EPYC 9V45 under KV
 
 ## ADR-0011 N14 step 3: caller identity, the start record, the directory, memory objects and ports (Accepted 2026-11-09)
 
-Step 3 adds system calls and structures, so these are ABI and format decisions (CLAUDE.md §84). The owner accepted all thirteen with the recommended answer on 2026-11-09 ("Accept all 13"). They are ADR-0005 Amendment 4, C1–C13; the scoping is `docs/research/2026-11-09-n14-step3-scope.md`. C1–C3 are built (task S3-2, 2026-11-10: a message's writer and handle records), and C4–C6 (task S3-3, 2026-11-10: the start record and its launch path); the rest are not.
+Step 3 adds system calls and structures, so these are ABI and format decisions (CLAUDE.md §84). The owner accepted all thirteen with the recommended answer on 2026-11-09 ("Accept all 13"). They are ADR-0005 Amendment 4, C1–C13; the scoping is `docs/research/2026-11-09-n14-step3-scope.md`. C1–C3 are built (task S3-2, 2026-11-10: a message's writer and handle records), C4–C6 (task S3-3, 2026-11-10: the start record and its launch path), C11 and C12 (task S3-4, 2026-11-10: `not_found` and the service directory, `origin.directory` 0.1), and C7 and C8, with C6's rights for a memory object (task S3-5b, 2026-11-10: memory objects, `origin.kernel` 0.5, as items 101–105 decide); C9, C10 and C13 are not.
 
 | # | Question | Answer |
 |---|---|---|
@@ -219,3 +219,15 @@ The independent review of S3-5a found that ADR-0004 H2's table puts the kernel h
 | 98, answered | A1: amend H2 so the kernel heap stays in the direct map, as the code has it (no mapping work or shootdown when it is freed, and the large pages kept)? | **Accept** |
 | 99, answered | A2: keep H2 for the stacks, and move them to `0xFFFF_C000_0000_0000` with guard pages in virtual space, as a task of their own that the framework session starts now? | **Accept** |
 | 100, answered | A3: record PML4 slot 480 (`0xFFFF_F000_0000_0000`), the kernel-half proof's probe page, in H2's table? | **Accept** |
+
+## S3-5b: memory objects' interface (Accepted 2026-11-10)
+
+Task S3-5b (memory objects) needs five interface decisions that C6–C8 (items 61–63) leave open. They are ABI decisions, so they are the owner's (CLAUDE.md §84). The session building S3-5b proposed them, with the options it rejected, and the coordinating session checked them against CLAUDE.md, ADR-0004 and ADR-0005 before asking. The owner answered **"Accept all"** on 2026-11-10. They are ADR-0005 Amendment 5, D1–D5, all built by task S3-5b on 2026-11-10 (`origin.kernel` 0.5, `user-abi` 0.5). Items 71–97 are in use on the unmerged `docs/editions-device-sdk` branch.
+
+| # | Question | Answer |
+|---|---|---|
+| 101, answered | D1: creation calls take their arguments in a sized request, so `memory_object_create(request: object_request { length })`, and a creation call with no argument yet takes none? | **Accept** |
+| 102, answered | D2: `map_request` holds the access (read, write, execute: read required, never write with execute, execute refused for now), a `fixed` flag (otherwise a random address), and the offset, length and address in bytes, in whole 4 KiB pages, never rounded? | **Accept** |
+| 103, answered | D3: `memory_unmap` and `memory_protect` name the process, the mapping's start and its length; in v1 exactly one whole mapping; protect only reduces access? | **Accept** |
+| 104, answered | D4: quotas set by the creator: committed bytes, mappings, and a rate for unmap and protect; `limit` past a quota, `no_memory` without frames, `should_wait` past the rate with nothing changed? | **Accept** |
+| 105, answered | D5: the rest: `write` on the process handle for every call, the caller's own included; existing statuses only, in a fixed order; ADR-0004 H1's addresses and the start records' random region; a mapping holds its object; two new constants; `user-abi` 0.5 in one step? | **Accept** |

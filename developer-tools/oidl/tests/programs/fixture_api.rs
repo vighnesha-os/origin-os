@@ -264,7 +264,7 @@ fn known_answer() {
 fn round_trips() {
     buffers!(b, h, r);
     let mut s0 = scratch(&mut b, &mut h, &mut r);
-    let mut client = EchoClient::connect(loopback(true), &mut s0).unwrap();
+    let mut client = EchoClient::new(loopback(true), &mut s0).unwrap();
     assert_eq!(client.minor(), 2);
 
     client
@@ -422,7 +422,7 @@ fn errors_are_reported_separately() {
     let mut s0 = scratch(&mut b, &mut h, &mut r);
     let mut transport = loopback(false);
     transport.service.fail_put = true;
-    let mut client = EchoClient::connect(transport, &mut s0).unwrap();
+    let mut client = EchoClient::new(transport, &mut s0).unwrap();
     let put = s::PutRequestArgs { flag: true, count: 0x0102, name: "hi", h: rt::Handle::from_abi(9) };
     assert_eq!(
         client.put(&mut s0, put),
@@ -748,7 +748,7 @@ fn a_client_validates_what_it_receives() {
         buffers!(b, h, r);
         let mut s0 = scratch(&mut b, &mut h, &mut r);
         let count = Rc::new(Cell::new(0));
-        let mut client = EchoClient::connect(fake(message, vec![], &count), &mut s0).unwrap();
+        let mut client = EchoClient::new(fake(message, vec![], &count), &mut s0).unwrap();
         client.ping(&mut s0, s::PingRequestArgs {}).map(|r| r.value)
     };
     // Two-way ping is txid 2 (the hello was 1).
@@ -787,7 +787,7 @@ fn a_client_validates_what_it_receives() {
         buffers!(b, h, r);
         let mut s0 = scratch(&mut b, &mut h, &mut r);
         let count = Rc::new(Cell::new(0));
-        let mut client = EchoClient::connect(fake(message, handles, &count), &mut s0).unwrap();
+        let mut client = EchoClient::new(fake(message, handles, &count), &mut s0).unwrap();
         let result = client.ping(&mut s0, s::PingRequestArgs {}).map(|r| r.value);
         (result, count.get())
     };
@@ -821,7 +821,7 @@ fn a_client_validates_what_it_receives() {
             hello: Some(hello),
             hello_handles: handles,
         };
-        let result = EchoClient::connect(transport, &mut s0).map(|client| client.minor());
+        let result = EchoClient::new(transport, &mut s0).map(|client| client.minor());
         (result, count.get())
     }
     let good = |kind: u8, minor: u16| {

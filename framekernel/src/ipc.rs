@@ -38,6 +38,7 @@ use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
 
 use crate::cpu::without_interrupts;
+use crate::memory_object::MemoryObject;
 use crate::process::{Account, Process, ThreadObject};
 use crate::wait::WaitQueue;
 
@@ -50,6 +51,8 @@ pub(crate) enum Object {
     Process(ObjectRef<Process>),
     /// A thread.
     Thread(ObjectRef<ThreadObject>),
+    /// A memory object (C7).
+    Memory(ObjectRef<MemoryObject>),
 }
 
 impl Typed for Object {
@@ -58,6 +61,7 @@ impl Typed for Object {
             Self::Channel(_) => ObjectType::Channel,
             Self::Process(_) => ObjectType::Process,
             Self::Thread(_) => ObjectType::Thread,
+            Self::Memory(_) => ObjectType::MemoryObject,
         }) as u32
     }
 }
@@ -72,6 +76,8 @@ enum Waitable {
     Process(ObjectRef<Process>),
     /// A thread.
     Thread(ObjectRef<ThreadObject>),
+    /// An object with no signals and no waiters: a memory object. No handle to one has `wait`.
+    Silent,
 }
 
 impl Waitable {
@@ -80,6 +86,7 @@ impl Waitable {
             Object::Channel(end) => Self::Channel(end.channel.clone(), end.side),
             Object::Process(process) => Self::Process(process.clone()),
             Object::Thread(thread) => Self::Thread(thread.clone()),
+            Object::Memory(_) => Self::Silent,
         }
     }
 
@@ -91,6 +98,7 @@ impl Waitable {
             }
             Self::Process(process) => process.termination().signals(),
             Self::Thread(thread) => thread.termination().signals(),
+            Self::Silent => 0,
         }
     }
 
@@ -100,6 +108,7 @@ impl Waitable {
             Self::Channel(channel, side) => channel.waiters.get(*side),
             Self::Process(process) => Some(process.termination().waiters()),
             Self::Thread(thread) => Some(thread.termination().waiters()),
+            Self::Silent => None,
         }
     }
 
@@ -365,7 +374,7 @@ fn channel_of(
     let (object, _) = table.get(handle, need)?;
     match object {
         Object::Channel(end) => Ok((end.channel.clone(), end.side)),
-        Object::Process(_) | Object::Thread(_) => Err(Error::WrongType),
+        Object::Process(_) | Object::Thread(_) | Object::Memory(_) => Err(Error::WrongType),
     }
 }
 
