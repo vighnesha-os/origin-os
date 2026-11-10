@@ -1269,7 +1269,9 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // Hardware entropy from RDSEED/RDRAND: a batch of draws, all distinct and non-zero.
             "origin-kernel: entropy: ".into(),
             "; consistent true".into(),
-            "origin-kernel: page protection: stack guard page at ".into(),
+            // The guard is in the kernel stacks' region, whose addresses the boot never prints
+            // (ADR-0004 Amendment 2, A6.3).
+            "origin-kernel: page protection: the first thread's stack guard page faulted (#PF error 0x0)".into(),
             // M3: two non-yielding threads per processor, all preempted and all running.
             "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted ".into(),
             format!(
