@@ -4,7 +4,7 @@
 **Product:** Origin OS, in two editions of one release: Origin Desktop and Origin Server  
 **Kernel:** Framekernel  
 **Research baseline:** November 7, 2026  
-**Revision:** 7.3, 2026-11-10. Adds the Server edition (`docs/adr/ADR-0014-server-edition.md`), every device standard through the SDK (`docs/adr/ADR-0015-device-standards-sdk.md`), Origin-owned Secure Boot keys as the default (ADR-0002 Amendment 1), rules for the public repository, and a stricter hardware scope with the core generation named at boot (ADR-0009 Amendment 1) (decision sheet items 71–90). Revision 7.2 (2026-11-09) amended §48 and §70 to match ADR-0011, the native SDK (item 39). Revision 7.1 (2026-11-07) added the ONBF decisions (`docs/adr/ADR-0001-onbf.md`) and toolchain and standards corrections (`docs/research/2026-11-07-onbf.md` §5). v7.2 is kept at `docs/engineering/CLAUDE-v7.2.md`, v7.1 at `docs/engineering/CLAUDE-v7.1.md` and v7.0 at `docs/engineering/CLAUDE-v7.0.md`.  
+**Revision:** 7.3, 2026-11-10. Adds the Server edition (`docs/adr/ADR-0014-server-edition.md`), every device standard through the SDK (`docs/adr/ADR-0015-device-standards-sdk.md`), Origin-owned Secure Boot keys as the default (ADR-0002 Amendment 1), rules for the public repository, a stricter hardware scope with the core generation named at boot (ADR-0009 Amendment 1), and Linux source as a reference only, kept apart from the code and recorded (§3, §6) (decision sheet items 71–93). Revision 7.2 (2026-11-09) amended §48 and §70 to match ADR-0011, the native SDK (item 39). Revision 7.1 (2026-11-07) added the ONBF decisions (`docs/adr/ADR-0001-onbf.md`) and toolchain and standards corrections (`docs/research/2026-11-07-onbf.md` §5). v7.2 is kept at `docs/engineering/CLAUDE-v7.2.md`, v7.1 at `docs/engineering/CLAUDE-v7.1.md` and v7.0 at `docs/engineering/CLAUDE-v7.0.md`.  
 **Mandatory compiler:** Rust 1.99.1 stable  
 **Rust edition:** 2024  
 **Processor architecture:** x86-64 exclusively: 64-bit long mode only. No 32-bit or x32 code, and no Windows `.exe` or `.msi` compatibility.  
@@ -155,6 +155,10 @@ Do not claim code is original merely because it has been renamed, translated int
 
 Derive the implementation from legitimate specifications, independently developed architecture contracts and verified requirements.
 
+Linux source may be read only as a reference, to understand what the vendor's documents or the official specifications and standards leave out. Never copy it, translate it or reproduce its structure (owner's rule, decision item 91).
+
+Keep that reading apart from the code (item 92). The session that reads Linux writes what it learned into Origin's own specification or research ledger, in Origin's words, citing file, commit and licence. A separate session then writes the code from that and the vendor documents, without the Linux source. Claude, which writes Origin's code, was trained on Linux's code, so this split is what keeps the code from drifting toward Linux's.
+
 Use normal software-engineering knowledge, documented algorithms and hardware interfaces, but author project source independently.
 
 ## 4. Permitted external infrastructure
@@ -220,6 +224,7 @@ For each original implementation module, record:
 - Licensing status.
 - Test evidence.
 - Known external firmware/data dependencies.
+- Linux references consulted under §3: each file, its commit and licence, and the gap it filled (decision item 93).
 
 Preserve traceability to Git commits.
 
@@ -1315,7 +1320,7 @@ Implement standards-based interoperability testing.
 A Wi-Fi or Bluetooth driver needs a legitimate source for its chip's programming interface (ADR-0015 D6):
 
 - vendor documentation that lets Origin publish source written from it; or
-- a clean-room process approved in an original-source-exception ADR (§3, §18).
+- §3's process for gaps: Linux read only as a reference, what it explains written into Origin's own specification first, and the code written from that in a separate session (decision items 91–93).
 
 Never translate another operating system's driver. Host stacks may be built from the public specifications first. Before either radio ships, check Bluetooth SIG qualification and licensing and the radio regulations.
 

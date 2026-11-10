@@ -72,6 +72,14 @@ The major Wi-Fi chip makers (Intel, MediaTek, Qualcomm, Realtek) publish no prog
 
 Firmware the chips need is shipped under its own licence, as §38 requires.
 
+*Added 2026-11-10, decision item 91 (the owner's rule):* Linux source may be read only as a reference, to understand what vendor documents and the official specifications and standards leave out. It is never copied. Items 92 and 93 (accepted the same day) set how such reading reaches Origin's code:
+
+- what was learned goes first into Origin's own specification, in Origin's words, citing file, commit and licence;
+- the code is then written from that in a separate session, without the Linux source;
+- each driver's provenance lists the Linux files consulted and the gap each one filled.
+
+This is the clean-room process route 2 above asks for. So a Wi-Fi or Bluetooth driver may start once the gaps in the vendor documents are filled this way, without a further ADR.
+
 Bluetooth's host-to-controller interface (HCI) is standard, but each vendor's firmware-loading step is not public, so Bluetooth controllers have the same question on a smaller scale.
 
 Meanwhile, these can be built and tested on the host from public specifications:
