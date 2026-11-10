@@ -1399,16 +1399,25 @@ pub fn capture_backtrace(out: &mut [u64]) -> usize {
     // SAFETY: reads RBP; no memory, no stack, flags preserved.
     unsafe { asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack, preserves_flags)) };
     let base = rbp;
+    // On a stack in the stack region the window ends at the top of the stack's slot: the next
+    // slot's unmapped space lies past it (ADR-0004 Amendment 1, A2).
+    let last = match crate::stack::slot_top(base) {
+        Some(top) => top
+            .saturating_sub(8)
+            .min(base.saturating_add(BACKTRACE_SPAN)),
+        None => base.saturating_add(BACKTRACE_SPAN),
+    };
     crate::unwind::walk(
         rbp,
         BACKTRACE_MAX_FRAME,
         |addr| {
-            if addr < base || addr > base.saturating_add(BACKTRACE_SPAN) || addr & 7 != 0 {
+            if addr < base || addr > last || addr & 7 != 0 {
                 return None;
             }
             let p = ptr::with_exposed_provenance::<u64>(addr as usize);
-            // SAFETY: `addr` is 8-aligned and within `BACKTRACE_SPAN` bytes above the
-            // starting frame pointer, so it lies in the running stack, which is mapped.
+            // SAFETY: `addr` is 8-aligned and within `BACKTRACE_SPAN` bytes above the starting
+            // frame pointer, and, on a stack in the stack region, below the top of its slot, so
+            // it lies in the running stack, which is mapped.
             Some(unsafe { p.read_volatile() })
         },
         out,

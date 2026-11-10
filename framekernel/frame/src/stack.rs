@@ -10,11 +10,26 @@
 
 use alloc::alloc::{Layout, alloc, alloc_zeroed, dealloc};
 
+use origin_paging::layout::{STACK_REGION, STACK_REGION_SIZE};
+
 use crate::cpu::{self, CpuIndex};
 use crate::descriptors::{KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
 
 /// The guard page below every stack.
 const GUARD: usize = 4096;
+
+/// The address space each stack has in the kernel stacks' region (ADR-0004 Amendment 1, A2):
+/// the stack at its top, unmapped space below.
+pub const SLOT: u64 = 128 * 1024;
+
+/// The top of the slot holding `addr`, if `addr` is in the stack region: past it lies the next
+/// slot's unmapped space. For the backtrace (`cpu::capture_backtrace`).
+pub const fn slot_top(addr: u64) -> Option<u64> {
+    if addr < STACK_REGION || addr >= STACK_REGION + STACK_REGION_SIZE {
+        return None;
+    }
+    Some(addr - (addr - STACK_REGION) % SLOT + SLOT)
+}
 
 /// A kernel stack with an unmapped guard page below it. Owned; freed on drop.
 #[derive(Debug)]
