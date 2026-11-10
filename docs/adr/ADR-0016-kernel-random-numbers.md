@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Proposed** on 2026-11-10. Not accepted: the questions at the end are the owner's (CLAUDE.md §18, §84). **Built so far:** HMAC-SHA-512 and the HMAC_DRBG mechanism in `origin-crypto`, tested on the host and linked into nothing that boots. Everything this ADR proposes for the kernel, the loader and boot info is unbuilt, and stays unbuilt until the owner answers. Nothing here has run in a kernel, under QEMU or on hardware. **No human has reviewed it.** |
+| Status | **Proposed** on 2026-11-10. Not accepted: questions 1 to 6 at the end are the owner's (CLAUDE.md §18, §84). Question 7, a download, was answered the same day (decision item 145). **Built so far:** HMAC-SHA-512 and the HMAC_DRBG mechanism in `origin-crypto`, tested on the host and linked into nothing that boots. Everything this ADR proposes for the kernel, the loader and boot info is unbuilt, and stays unbuilt until the owner answers. Nothing here has run in a kernel, under QEMU or on hardware. **No human has reviewed it.** |
 | Decides | Decision item 113 and finding 8 of `docs/engineering/DESIGN_REVIEW_2026-11-10.md`; TASKS item 18. It carries out ADR-0013 Amendment 1 and the note of 2026-11-10 in ADR-0004 H3 |
 | Changes accepted decisions | Three, each named where it happens: ADR-0002 B4 (boot info 0.6, R10); ADR-0004 H3 (the firmware's generator is an addition and never a source of its own; two slides, two draws; R3, R10); ADR-0013's inventory (one row, which Amendment 1 already accepted; R8) |
 | Requires | CLAUDE.md P0, P1, §3, §4, §13, §14, §16 to §19, §24, §58, §59, §61, §72, §84; rules 14, 16, 17, 21, 35 |
@@ -10,7 +10,7 @@
 | Evidence | `docs/research/2026-11-10-kernel-random-numbers.md` (the ledger, cited below by its row numbers A, B and C); `docs/engineering/SOURCE_PROVENANCE.md`, "HMAC-SHA-512 and HMAC_DRBG" |
 | Related | ADR-0001 D3, ADR-0002 B4, ADR-0004 H3, ADR-0008, ADR-0009 Amendment 1, ADR-0011 N6, ADR-0012, ADR-0013 Amendment 1 |
 
-**What stands behind this.** SP 800-90A Rev. 1, SP 800-90B and SP 800-90C were read in the parts that bear on it (ledger §2), and the built mechanism was compared with the standard's text step by step. Where no published answer was at hand, for reseeding, additional input and prediction resistance, it agrees with a reference by the same author and with the HMAC-DRBG of an installed OpenSSL. One check is missing: NIST's own test vectors, which need the owner's word because the file has to be kept (question 7).
+**What stands behind this.** SP 800-90A Rev. 1, SP 800-90B and SP 800-90C were read in the parts that bear on it (ledger §2). The built mechanism was compared with the standard's text step by step, and it gives NIST's own answers on NIST's test vectors for it. Nothing stands behind the rest: R3 to R13 are design, and unbuilt.
 
 ## Context
 
@@ -212,7 +212,7 @@ Only R1's mechanism is built, so only it has evidence. The detail is in `SOURCE_
 | HMAC-SHA-512 | RFC 4231's seven test cases; 273 lengths on which Python's `hmac` and RFC 2104's formula agree; every key length to 260 against the formula |
 | The generator against published values | The six SHA-512 values of RFC 6979 appendix A.2.5 to A.2.7: instantiation, and a request of one output block and of two |
 | The generator against the standard | Read beside SP 800-90A §9 and §10.1.2 after it was written: every step and limit agreed, and the order of two checks was changed to the standard's |
-| Reseeding, additional input, prediction resistance | A corpus of 145 instantiations from an independent Python implementation by the same author, which the HMAC-DRBG of an installed OpenSSL 4.1.0 reproduces. **NIST's own vectors: not run** |
+| Reseeding, additional input, prediction resistance | NIST's ACVP vectors for HMAC_DRBG over SHA-512: all 30, 15 with prediction resistance and 15 with a reseed. Also a corpus of 145 instantiations from an independent Python implementation by the same author, which the HMAC-DRBG of an installed OpenSSL 4.1.0 reproduces |
 | The tests themselves | 53 faults planted one at a time: 51 fail a test, and the other 2 leave a stack buffer un-overwritten, which safe code cannot observe |
 | No panic path, no `unsafe` | The kernel-target release object references `memcpy`, `memset` and one formatter function; the crate forbids `unsafe` |
 | Overwriting (R9 Z2) | The same object holds the overwrite calls. One build, not a promise |
@@ -289,11 +289,11 @@ Only R1's mechanism is built, so only it has evidence. The detail is in `SOURCE_
 - **Conformance or validation** of any kind (R1). The sources are not validated, and two rules of the standard's tree are departed from (R7).
 - **Anything about hardware.** Not one line of this has run on a processor. The start-up tests' cost, RDSEED's behaviour when sixty-four processors ask at once, and the cost of a request on x86-64 are all unmeasured.
 - **That the overwrites survive the compiler** beyond what one build shows (R9 Z2).
-- **The mechanism against NIST's published answers** for reseeding, additional input and prediction resistance. It agrees there with the standard's text, with the author's reference and with OpenSSL's generator (ledger §9). NIST's vectors have not been run (question 7).
+- **More of the mechanism than its vectors reach.** NIST's 30 vectors for SHA-512 all use one shape of input (ledger §9). Other lengths, and a request of no bytes, are checked against the author's reference, OpenSSL's generator and the standard's text.
 
 ## Questions for the owner
 
-Each has a recommended answer. None is answered.
+Each has a recommended answer. Questions 1 to 6 are open. Question 7 is answered.
 
 1. **Accept the design, R1 to R9 and R11 to R13:** one HMAC_DRBG over SHA-512; a root and a generator for each processor, in the shape of SP 800-90C's tree with the two differences R7 names; the health tests of R4; seeding and reseeding as R5 and R6 give them; no generator and no randomness without a healthy seed; the three layers of overwriting; a new crate for the policy? **Recommended: yes.**
 2. **Boot info 0.6** (§84): one appended field, `boot_seed`, the physical address of 64 secret bytes inside the boot-info region or 0, which the kernel overwrites once it has taken them? **Recommended: yes.** The alternative, the bytes inside the structure, puts a secret in a type that is copied and printed.
@@ -301,4 +301,4 @@ Each has a recommended answer. None is answered.
 4. **Accept what "health tests on the raw source" can mean here** (§59): the tests run on the instructions' outputs, because the noise behind them cannot be reached; they catch gross failure only; and Origin claims no SP 800-90B conformance? **Recommended: yes.** If you want more, the only route is a source of Origin's own with its own assessment, which is research.
 5. **Keep `unsafe` out of `origin-crypto`:** best-effort overwriting there, and the guarantee in the framework, by volatile writes over the state and an overwrite of the stack after every request (R9)? **Recommended: yes.**
 6. **§17 of CLAUDE.md,** which is your text: pin SP 800-90A to Rev. 1 (June 2015) and SP 800-90B to January 2018, and add SP 800-90C (September 2025) and FIPS 198-1 (July 2008)? **Recommended: yes.**
-7. **One download:** NIST's HMAC_DRBG vectors, `hmacDRBG-1.0/internalProjection.json`, 1,160,048 bytes, from github.com/usnistgov/ACVP-Server at commit `975de31`, the release decision item 19's vectors are pinned to. It would be converted and committed as host-only test data with NIST's notice, as item 19's were. **Recommended: yes.** They are NIST's published answers for the paths RFC 6979's values do not reach, and they are to be the answers of the start-up self-test (R5).
+7. **One download:** NIST's HMAC_DRBG vectors, `hmacDRBG-1.0/internalProjection.json`, 1,160,048 bytes, from github.com/usnistgov/ACVP-Server at commit `975de31`, the release decision item 19's vectors are pinned to. It would be converted and committed as host-only test data with NIST's notice, as item 19's were. **Recommended: yes.** They are NIST's published answers for the paths RFC 6979's values do not reach, and they are to be the answers of the start-up self-test (R5). **Answered 2026-11-10: approved** ("Approve all six", to a question that also covered five documents to read; decision item 145). The file was fetched, its two SHA2-512 groups are committed, and the mechanism gives NIST's answer on all 30 vectors.
