@@ -2,8 +2,25 @@
 xtask = "run --quiet --package xtask --"
 
 # CLAUDE.md §14: frame pointers on every Origin-owned freestanding image.
+#
+# CLAUDE.md §75: the loader's image is the same bytes from one build to the next
+# (docs/research/2026-11-10-loader-reproducible-build.md). For this target rustc 1.99.1 runs
+# rust-lld's COFF driver with `/DEBUG`, whatever `-C strip` says, and two links of the same
+# objects then differ in the PE header's time stamp (the time of the link) and in the CodeView
+# record's identifier (a hash of the PDB, which holds the path of a directory rustc creates
+# under a random name for each link). The two arguments come after rustc's own, and of two
+# `/DEBUG` options the linker obeys the last:
+# - `/DEBUG:NONE`: no PDB, and no CodeView record in the image;
+# - `/Brepro`: the time stamp is a hash of the image's content, and the debug directory holds
+#   one empty entry of type 16 (IMAGE_DEBUG_TYPE_REPRO), which is how a PE image says so.
+# Either one alone leaves two builds different. `cargo xtask check` builds the loader twice
+# and fails if the images differ. RUSTFLAGS in the environment replaces this whole list.
 [target.x86_64-unknown-uefi]
-rustflags = ["-C", "force-frame-pointers=yes"]
+rustflags = [
+    "-C", "force-frame-pointers=yes",
+    "-C", "link-arg=/DEBUG:NONE",
+    "-C", "link-arg=/Brepro",
+]
 
 [target.x86_64-unknown-none]
 rustflags = ["-C", "force-frame-pointers=yes"]
