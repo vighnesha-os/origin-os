@@ -3208,5 +3208,6 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
   - *C36, a processor answers without dropping anything:* `... it faulted at its page among them: false; Ok(Change { pages: 200, shootdowns: 2, interrupts: 2 }): address spaces failed`.
   - *C19 and C21 again, on the changed proof:* `interrupts: 0` with no fault on the 5-page and 200-page lines; `interrupts: 3` and `6` with 4 processors. Each ends `boot refused: live address spaces failed`.
   - *The unedited copy:* `5 pages ... interrupts: 1 })`, `200 pages ... interrupts: 2 })`, and `cargo xtask boot-test` passes, 11 of 11.
+  - *The landing tree at `3138dd9`, with a clean tree before and after:* `cargo xtask check` passes (1,312 host tests, 0 failed, 10 ignored; the gates; Loom), and `cargo xtask boot-test` passes, 11 of 11, with 2 processors and again with 1, where the thread shares the unmapping processor: `200 pages ... on this processor: ... Ok(Change { pages: 200, shootdowns: 2, interrupts: 0 })`. `boot-matrix` was not run on the development machine.
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-10, on the owner's word ("Fix it here"). Original code; Rust `core` and `alloc` only.
 - **Licensing:** MIT OR Apache-2.0.
