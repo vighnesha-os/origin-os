@@ -13,7 +13,7 @@ use crate::console::Console;
 use crate::cpu::{self, CpuIndex, Probe};
 use crate::memory;
 use crate::paging::{Access, PAGE};
-use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, Process};
+use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, MemoryLimits, Process};
 use crate::sched;
 
 /// Where each proof program's code runs.
@@ -53,6 +53,7 @@ const LIMITS: Limits = Limits {
     channels: 4,
     message_bytes: 1 << 20,
     debug_calls: true,
+    memory: MemoryLimits::NONE,
 };
 
 /// `mov edi, value; mov eax, DEBUG_REPORT; syscall`.

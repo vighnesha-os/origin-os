@@ -14,7 +14,7 @@
 use super::super::oidl_rt as rt;
 
 /// This library's version: `(major, minor)` (§9).
-pub const VERSION: (u16, u16) = (0, 4);
+pub const VERSION: (u16, u16) = (0, 5);
 
 /// The rights of a new channel end: everything that applies to a channel (ADR-0005 P2, P8,
 /// amendment A1).
@@ -26,6 +26,14 @@ pub const PROCESS_RIGHTS: Rights = match Rights::from_bits(0x173) { Some(value) 
 
 /// The rights of a thread's handle to itself (ADR-0005 C6).
 pub const THREAD_RIGHTS: Rights = match Rights::from_bits(0x170) { Some(value) => value, None => Rights::NONE };
+
+/// The rights of a new memory object (ADR-0005 C6): never execute, since an anonymous object
+/// is never executable.
+pub const MEMORY_OBJECT_RIGHTS: Rights = match Rights::from_bits(0x37) { Some(value) => value, None => Rights::NONE };
+
+/// Bytes in a page: every memory object, mapping, offset and fixed address is counted in
+/// whole pages of this size (ADR-0005 P7, D2).
+pub const PAGE_SIZE: u64 = 4096;
 
 /// Most bytes in one channel message (ADR-0005 P8).
 pub const MAX_MESSAGE_BYTES: u32 = 65536;
@@ -420,6 +428,135 @@ impl rt::Fixed for Signals {
     }
 }
 
+/// What a mapping allows (ADR-0005 P7, C7, D2). Every mapping can be read; write and execute
+/// are never given together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct MapAccess(u32);
+
+impl MapAccess {
+    /// Read. Every mapping has it.
+    pub const READ: Self = Self(0x1);
+    /// Write.
+    pub const WRITE: Self = Self(0x2);
+    /// Execute: refused until the Code Integrity Table exists (ONBF §8.2), and an anonymous
+    /// object never has the right.
+    pub const EXECUTE: Self = Self(0x4);
+    /// No bits.
+    pub const NONE: Self = Self(0);
+    /// Every bit defined in this version.
+    pub const ALL: Self = Self(0x7);
+
+    /// The raw value.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// The value with these bits, or `None` if a bit is undefined.
+    pub const fn from_bits(raw: u32) -> Option<Self> {
+        if raw & !Self::ALL.0 == 0 {
+            Some(Self(raw))
+        } else {
+        None
+    }
+}
+
+/// Whether every bit of `other` is set.
+pub const fn contains(self, other: Self) -> bool {
+    self.0 & other.0 == other.0
+}
+
+/// The bits of both.
+pub const fn union(self, other: Self) -> Self {
+    Self(self.0 | other.0)
+}
+
+/// The bits known at `minor`.
+pub const fn known(minor: u16) -> u32 {
+    let mut mask = Self::ALL.0;
+    if minor < 5 { mask &= !0x1; }
+    if minor < 5 { mask &= !0x2; }
+    if minor < 5 { mask &= !0x4; }
+    mask
+}
+}
+
+impl rt::Fixed for MapAccess {
+    const SIZE: usize = 4;
+    const FILLER: Self = Self(0);
+    fn read(bytes: &[u8], minor: u16) -> Result<Self, rt::WireError> {
+        let raw = <u32 as rt::Fixed>::read(bytes, minor)?;
+        if raw & !Self::known(minor) != 0 {
+            return Err(rt::WireError::Bits);
+        }
+        Ok(Self(raw))
+    }
+    fn write(self, out: &mut [u8]) -> Result<(), rt::WireError> {
+        rt::Fixed::write(self.0, out)
+    }
+}
+
+/// How a mapping is placed (ADR-0005 P7, C7, D2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct MapFlags(u32);
+
+impl MapFlags {
+    /// At the request's address, whose pages must all be free: a mapping is never replaced.
+    /// Without it the kernel places the mapping at a random free address.
+    pub const FIXED: Self = Self(0x1);
+    /// No bits.
+    pub const NONE: Self = Self(0);
+    /// Every bit defined in this version.
+    pub const ALL: Self = Self(0x1);
+
+    /// The raw value.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// The value with these bits, or `None` if a bit is undefined.
+    pub const fn from_bits(raw: u32) -> Option<Self> {
+        if raw & !Self::ALL.0 == 0 {
+            Some(Self(raw))
+        } else {
+        None
+    }
+}
+
+/// Whether every bit of `other` is set.
+pub const fn contains(self, other: Self) -> bool {
+    self.0 & other.0 == other.0
+}
+
+/// The bits of both.
+pub const fn union(self, other: Self) -> Self {
+    Self(self.0 | other.0)
+}
+
+/// The bits known at `minor`.
+pub const fn known(minor: u16) -> u32 {
+    let mut mask = Self::ALL.0;
+    if minor < 5 { mask &= !0x1; }
+    mask
+}
+}
+
+impl rt::Fixed for MapFlags {
+    const SIZE: usize = 4;
+    const FILLER: Self = Self(0);
+    fn read(bytes: &[u8], minor: u16) -> Result<Self, rt::WireError> {
+        let raw = <u32 as rt::Fixed>::read(bytes, minor)?;
+        if raw & !Self::known(minor) != 0 {
+            return Err(rt::WireError::Bits);
+        }
+        Ok(Self(raw))
+    }
+    fn write(self, out: &mut [u8]) -> Result<(), rt::WireError> {
+        rt::Fixed::write(self.0, out)
+    }
+}
+
 /// What channel_read reports (ADR-0005 P4, amendment A4): the next message's sizes and, from
 /// minor 2, who wrote it (B1, C1, C2). A caller whose size predates a field gets nothing in its
 /// place, and no error.
@@ -709,6 +846,160 @@ impl rt::Fixed for StartEntry {
         rt::put_field(out, 4, self.object_type)?;
         rt::put_field(out, 8, self.rights)?;
         rt::put_field(out, 12, self.role)?;
+        Ok(())
+    }
+}
+
+/// What memory_object_create makes (ADR-0005 C7). A sized struct, so that a later minor can
+/// add an option without a new call (P4, D1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectRequest {
+    /// Bytes of the object: a non-zero multiple of page_size. They are committed at creation,
+    /// zeroed, and charged to the caller.
+    pub length: Option<u64>,
+}
+
+impl ObjectRequest {
+    /// Bytes of the newest version of this structure.
+    pub const SIZE: u32 = 16;
+    /// Bytes of the oldest version.
+    pub const BASE_SIZE: u32 = 16;
+    /// The size of each version, ascending.
+    pub const SIZES: [u32; 1] = [16];
+    /// Byte offset of `size`.
+    pub const SIZE_AT: usize = 0;
+    /// Byte offset of `length`.
+    pub const LENGTH_AT: usize = 8;
+
+    /// Whether the caller's `size` is valid for this structure as a parameter (§5.3).
+    pub fn accepts_param_size(size: u32) -> bool {
+        Self::SIZES.contains(&size)
+    }
+
+    /// Whether the caller's `size` is valid for this structure as a result (§5.3).
+    pub const fn accepts_result_size(size: u32) -> bool {
+        size >= Self::BASE_SIZE
+    }
+
+    /// How many bytes of this structure the server may write, given the caller's `size`.
+    pub const fn writable(size: u32) -> u32 {
+        if size < Self::SIZE { size } else { Self::SIZE }
+    }
+
+    /// Decodes the fields present in `size` bytes; `size` is already checked.
+    pub fn decode(oidl_bytes: &[u8], oidl_size: u32, oidl_minor: u16) -> Result<Self, rt::WireError> {
+        let oidl_len = usize::try_from(oidl_size).map_err(|_| rt::WireError::Size)?;
+        if oidl_bytes.len() < oidl_len || oidl_size < Self::BASE_SIZE {
+            return Err(rt::WireError::Size);
+        }
+        rt::check_zero(oidl_bytes, 4, 4)?;
+        let length = if oidl_size >= 16 { Some(rt::field::<u64>(oidl_bytes, 8, oidl_minor)?) } else { None };
+        Ok(Self { length })
+    }
+
+    /// Writes the fields that fit in `limit` bytes into `out`, leaving `size` alone.
+    pub fn encode_fields(&self, out: &mut [u8], limit: u32) -> Result<(), rt::WireError> {
+        if out.len() < usize::try_from(Self::SIZE).unwrap_or(usize::MAX) {
+            return Err(rt::WireError::Size);
+        }
+        if u64::from(limit) >= 8 {
+            rt::zero_fill(out, 4, 4)?;
+        }
+        if u64::from(limit) >= 16 && let Some(value) = self.length {
+            rt::put_field(out, 8, value)?;
+        }
+        Ok(())
+    }
+}
+
+/// What memory_map maps and how (ADR-0005 P7, C7, C8, D2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapRequest {
+    /// What the mapping allows: read, and at most one of write and execute.
+    pub access: Option<MapAccess>,
+    /// How it is placed.
+    pub flags: Option<MapFlags>,
+    /// Where it starts in the object, in bytes: a multiple of page_size.
+    pub offset: Option<u64>,
+    /// How many bytes it maps: a non-zero multiple of page_size, inside the object.
+    pub length: Option<u64>,
+    /// With fixed, where it is placed: a multiple of page_size, in the user half. Otherwise 0.
+    pub address: Option<u64>,
+}
+
+impl MapRequest {
+    /// Bytes of the newest version of this structure.
+    pub const SIZE: u32 = 40;
+    /// Bytes of the oldest version.
+    pub const BASE_SIZE: u32 = 40;
+    /// The size of each version, ascending.
+    pub const SIZES: [u32; 1] = [40];
+    /// Byte offset of `size`.
+    pub const SIZE_AT: usize = 0;
+    /// Byte offset of `access`.
+    pub const ACCESS_AT: usize = 4;
+    /// Byte offset of `flags`.
+    pub const FLAGS_AT: usize = 8;
+    /// Byte offset of `offset`.
+    pub const OFFSET_AT: usize = 16;
+    /// Byte offset of `length`.
+    pub const LENGTH_AT: usize = 24;
+    /// Byte offset of `address`.
+    pub const ADDRESS_AT: usize = 32;
+
+    /// Whether the caller's `size` is valid for this structure as a parameter (§5.3).
+    pub fn accepts_param_size(size: u32) -> bool {
+        Self::SIZES.contains(&size)
+    }
+
+    /// Whether the caller's `size` is valid for this structure as a result (§5.3).
+    pub const fn accepts_result_size(size: u32) -> bool {
+        size >= Self::BASE_SIZE
+    }
+
+    /// How many bytes of this structure the server may write, given the caller's `size`.
+    pub const fn writable(size: u32) -> u32 {
+        if size < Self::SIZE { size } else { Self::SIZE }
+    }
+
+    /// Decodes the fields present in `size` bytes; `size` is already checked.
+    pub fn decode(oidl_bytes: &[u8], oidl_size: u32, oidl_minor: u16) -> Result<Self, rt::WireError> {
+        let oidl_len = usize::try_from(oidl_size).map_err(|_| rt::WireError::Size)?;
+        if oidl_bytes.len() < oidl_len || oidl_size < Self::BASE_SIZE {
+            return Err(rt::WireError::Size);
+        }
+        let access = if oidl_size >= 40 { Some(rt::field::<MapAccess>(oidl_bytes, 4, oidl_minor)?) } else { None };
+        let flags = if oidl_size >= 40 { Some(rt::field::<MapFlags>(oidl_bytes, 8, oidl_minor)?) } else { None };
+        rt::check_zero(oidl_bytes, 12, 4)?;
+        let offset = if oidl_size >= 40 { Some(rt::field::<u64>(oidl_bytes, 16, oidl_minor)?) } else { None };
+        let length = if oidl_size >= 40 { Some(rt::field::<u64>(oidl_bytes, 24, oidl_minor)?) } else { None };
+        let address = if oidl_size >= 40 { Some(rt::field::<u64>(oidl_bytes, 32, oidl_minor)?) } else { None };
+        Ok(Self { access, flags, offset, length, address })
+    }
+
+    /// Writes the fields that fit in `limit` bytes into `out`, leaving `size` alone.
+    pub fn encode_fields(&self, out: &mut [u8], limit: u32) -> Result<(), rt::WireError> {
+        if out.len() < usize::try_from(Self::SIZE).unwrap_or(usize::MAX) {
+            return Err(rt::WireError::Size);
+        }
+        if u64::from(limit) >= 16 {
+            rt::zero_fill(out, 12, 4)?;
+        }
+        if u64::from(limit) >= 8 && let Some(value) = self.access {
+            rt::put_field(out, 4, value)?;
+        }
+        if u64::from(limit) >= 12 && let Some(value) = self.flags {
+            rt::put_field(out, 8, value)?;
+        }
+        if u64::from(limit) >= 24 && let Some(value) = self.offset {
+            rt::put_field(out, 16, value)?;
+        }
+        if u64::from(limit) >= 32 && let Some(value) = self.length {
+            rt::put_field(out, 24, value)?;
+        }
+        if u64::from(limit) >= 40 && let Some(value) = self.address {
+            rt::put_field(out, 32, value)?;
+        }
         Ok(())
     }
 }

@@ -38,6 +38,14 @@ pub mod number {
     pub const EVENT_CREATE: u64 = 9;
     /// `object_signal`.
     pub const OBJECT_SIGNAL: u64 = 10;
+    /// `memory_object_create`.
+    pub const MEMORY_OBJECT_CREATE: u64 = 11;
+    /// `memory_map`.
+    pub const MEMORY_MAP: u64 = 12;
+    /// `memory_unmap`.
+    pub const MEMORY_UNMAP: u64 = 13;
+    /// `memory_protect`.
+    pub const MEMORY_PROTECT: u64 = 14;
 }
 
 /// One entry of the call table.
@@ -54,7 +62,7 @@ pub struct CallInfo {
 }
 
 /// Every call, in number order.
-pub const CALLS: [CallInfo; 11] = [
+pub const CALLS: [CallInfo; 15] = [
     CallInfo { number: 0, name: "thread_exit", registers: 1, reserved: false },
     CallInfo { number: 1, name: "debug_report", registers: 1, reserved: false },
     CallInfo { number: 2, name: "debug_write", registers: 2, reserved: false },
@@ -66,6 +74,10 @@ pub const CALLS: [CallInfo; 11] = [
     CallInfo { number: 8, name: "wait_one", registers: 4, reserved: false },
     CallInfo { number: 9, name: "event_create", registers: 1, reserved: true },
     CallInfo { number: 10, name: "object_signal", registers: 3, reserved: true },
+    CallInfo { number: 11, name: "memory_object_create", registers: 2, reserved: false },
+    CallInfo { number: 12, name: "memory_map", registers: 4, reserved: false },
+    CallInfo { number: 13, name: "memory_unmap", registers: 3, reserved: false },
+    CallInfo { number: 14, name: "memory_protect", registers: 4, reserved: false },
 ];
 
 /// What `debug_report` can fail with.
@@ -482,6 +494,206 @@ impl rt::MethodError for ObjectSignalError {
     }
 }
 
+/// What `memory_object_create` can fail with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemoryObjectCreateError {
+    /// `INVALID_ARGS`.
+    InvalidArgs,
+    /// `FAULT`.
+    Fault,
+    /// `LIMIT`.
+    Limit,
+    /// `NO_MEMORY`.
+    NoMemory,
+}
+
+impl MemoryObjectCreateError {
+    /// The status this error is reported as.
+    pub const fn error(self) -> Error {
+        match self {
+            Self::InvalidArgs => Error::InvalidArgs,
+            Self::Fault => Error::Fault,
+            Self::Limit => Error::Limit,
+            Self::NoMemory => Error::NoMemory,
+        }
+    }
+}
+
+impl rt::MethodError for MemoryObjectCreateError {
+    fn from_status(status: i64) -> Option<Self> {
+        match Error::from_raw(status)? {
+            Error::InvalidArgs => Some(Self::InvalidArgs),
+            Error::Fault => Some(Self::Fault),
+            Error::Limit => Some(Self::Limit),
+            Error::NoMemory => Some(Self::NoMemory),
+            _ => None,
+        }
+    }
+    fn status(self) -> i64 {
+        self.error().raw()
+    }
+}
+
+/// What `memory_map` can fail with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemoryMapError {
+    /// `BAD_HANDLE`.
+    BadHandle,
+    /// `WRONG_TYPE`.
+    WrongType,
+    /// `ACCESS_DENIED`.
+    AccessDenied,
+    /// `INVALID_ARGS`.
+    InvalidArgs,
+    /// `FAULT`.
+    Fault,
+    /// `LIMIT`.
+    Limit,
+    /// `NO_MEMORY`.
+    NoMemory,
+    /// `NOT_SUPPORTED`.
+    NotSupported,
+}
+
+impl MemoryMapError {
+    /// The status this error is reported as.
+    pub const fn error(self) -> Error {
+        match self {
+            Self::BadHandle => Error::BadHandle,
+            Self::WrongType => Error::WrongType,
+            Self::AccessDenied => Error::AccessDenied,
+            Self::InvalidArgs => Error::InvalidArgs,
+            Self::Fault => Error::Fault,
+            Self::Limit => Error::Limit,
+            Self::NoMemory => Error::NoMemory,
+            Self::NotSupported => Error::NotSupported,
+        }
+    }
+}
+
+impl rt::MethodError for MemoryMapError {
+    fn from_status(status: i64) -> Option<Self> {
+        match Error::from_raw(status)? {
+            Error::BadHandle => Some(Self::BadHandle),
+            Error::WrongType => Some(Self::WrongType),
+            Error::AccessDenied => Some(Self::AccessDenied),
+            Error::InvalidArgs => Some(Self::InvalidArgs),
+            Error::Fault => Some(Self::Fault),
+            Error::Limit => Some(Self::Limit),
+            Error::NoMemory => Some(Self::NoMemory),
+            Error::NotSupported => Some(Self::NotSupported),
+            _ => None,
+        }
+    }
+    fn status(self) -> i64 {
+        self.error().raw()
+    }
+}
+
+/// What `memory_unmap` can fail with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemoryUnmapError {
+    /// `BAD_HANDLE`.
+    BadHandle,
+    /// `WRONG_TYPE`.
+    WrongType,
+    /// `ACCESS_DENIED`.
+    AccessDenied,
+    /// `INVALID_ARGS`.
+    InvalidArgs,
+    /// `NO_MEMORY`.
+    NoMemory,
+    /// `SHOULD_WAIT`.
+    ShouldWait,
+    /// `TIMED_OUT`.
+    TimedOut,
+}
+
+impl MemoryUnmapError {
+    /// The status this error is reported as.
+    pub const fn error(self) -> Error {
+        match self {
+            Self::BadHandle => Error::BadHandle,
+            Self::WrongType => Error::WrongType,
+            Self::AccessDenied => Error::AccessDenied,
+            Self::InvalidArgs => Error::InvalidArgs,
+            Self::NoMemory => Error::NoMemory,
+            Self::ShouldWait => Error::ShouldWait,
+            Self::TimedOut => Error::TimedOut,
+        }
+    }
+}
+
+impl rt::MethodError for MemoryUnmapError {
+    fn from_status(status: i64) -> Option<Self> {
+        match Error::from_raw(status)? {
+            Error::BadHandle => Some(Self::BadHandle),
+            Error::WrongType => Some(Self::WrongType),
+            Error::AccessDenied => Some(Self::AccessDenied),
+            Error::InvalidArgs => Some(Self::InvalidArgs),
+            Error::NoMemory => Some(Self::NoMemory),
+            Error::ShouldWait => Some(Self::ShouldWait),
+            Error::TimedOut => Some(Self::TimedOut),
+            _ => None,
+        }
+    }
+    fn status(self) -> i64 {
+        self.error().raw()
+    }
+}
+
+/// What `memory_protect` can fail with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemoryProtectError {
+    /// `BAD_HANDLE`.
+    BadHandle,
+    /// `WRONG_TYPE`.
+    WrongType,
+    /// `ACCESS_DENIED`.
+    AccessDenied,
+    /// `INVALID_ARGS`.
+    InvalidArgs,
+    /// `SHOULD_WAIT`.
+    ShouldWait,
+    /// `TIMED_OUT`.
+    TimedOut,
+}
+
+impl MemoryProtectError {
+    /// The status this error is reported as.
+    pub const fn error(self) -> Error {
+        match self {
+            Self::BadHandle => Error::BadHandle,
+            Self::WrongType => Error::WrongType,
+            Self::AccessDenied => Error::AccessDenied,
+            Self::InvalidArgs => Error::InvalidArgs,
+            Self::ShouldWait => Error::ShouldWait,
+            Self::TimedOut => Error::TimedOut,
+        }
+    }
+}
+
+impl rt::MethodError for MemoryProtectError {
+    fn from_status(status: i64) -> Option<Self> {
+        match Error::from_raw(status)? {
+            Error::BadHandle => Some(Self::BadHandle),
+            Error::WrongType => Some(Self::WrongType),
+            Error::AccessDenied => Some(Self::AccessDenied),
+            Error::InvalidArgs => Some(Self::InvalidArgs),
+            Error::ShouldWait => Some(Self::ShouldWait),
+            Error::TimedOut => Some(Self::TimedOut),
+            _ => None,
+        }
+    }
+    fn status(self) -> i64 {
+        self.error().raw()
+    }
+}
+
 /// What a call left to do on its way out of the kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -515,6 +727,29 @@ pub trait Calls {
     /// Blocks until a signal is raised on the object, the deadline passes, or the handle is
     /// closed (ADR-0005 P9).
     fn wait_one(&self, handle: rt::HandleArg, signals: Signals, deadline: u64, observed: rt::UserRef<Signals>) -> Result<(), WaitOneError>;
+    /// Makes a memory object of zeroed frames, committed in full and charged to the caller's
+    /// account, and returns a handle to it with memory_object_rights (ADR-0005 C6, C7, D1).
+    /// limit: past the caller's memory quota (D4), or its handle table is full.
+    fn memory_object_create(&self, request: rt::UserRef<ObjectRequest>, object: rt::UserRef<rt::Handle>) -> Result<(), MemoryObjectCreateError>;
+    /// Maps part of a memory object into a process and returns where (ADR-0005 P7, C7, C8, D2,
+    /// D5).
+    /// The mapping holds the object: closing a handle never unmaps. access_denied: the
+    /// object's handle lacks read, or write for a writable mapping, or execute was asked.
+    /// invalid_args: a malformed request, or a fixed address any page of which is mapped.
+    /// limit: past the process's mappings, or its page tables are full. not_supported: no
+    /// hardware entropy to place it at random.
+    fn memory_map(&self, process: rt::HandleArg, object: rt::HandleArg, request: rt::UserRef<MapRequest>, address: rt::UserRef<u64>) -> Result<(), MemoryMapError>;
+    /// Removes one whole mapping (ADR-0005 P7, C7, D3). When it returns, no processor reaches its
+    /// pages through this process. invalid_args: address and length are not exactly one
+    /// mapping. should_wait: the process's budget of shootdowns cannot pay for it now, and
+    /// nothing changed. timed_out: a processor did not answer the shootdown; the mapping is
+    /// gone, and its frames are kept from reuse for good. no_memory: only after such a stall,
+    /// when the kernel heap cannot replace the bookkeeping it leaked (D5).
+    fn memory_unmap(&self, process: rt::HandleArg, address: u64, length: u64) -> Result<(), MemoryUnmapError>;
+    /// Reduces what one whole mapping allows (ADR-0005 P7, C7, D3). When it returns, no processor
+    /// uses the old access. access_denied: the new access is not within the old one.
+    /// invalid_args, should_wait and timed_out as for memory_unmap.
+    fn memory_protect(&self, process: rt::HandleArg, address: u64, length: u64, access: MapAccess) -> Result<(), MemoryProtectError>;
 }
 
 /// Decodes and runs one system call: the number and its six arguments.
@@ -535,6 +770,10 @@ pub fn dispatch<C: Calls + ?Sized>(oidl_calls: &C, oidl_number: u64, oidl_args: 
         number::WAIT_ONE => match call_wait_one(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
         number::EVENT_CREATE => Error::NotSupported.raw(),
         number::OBJECT_SIGNAL => Error::NotSupported.raw(),
+        number::MEMORY_OBJECT_CREATE => match call_memory_object_create(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
+        number::MEMORY_MAP => match call_memory_map(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
+        number::MEMORY_UNMAP => match call_memory_unmap(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
+        number::MEMORY_PROTECT => match call_memory_protect(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
         _ => Error::NotSupported.raw(),
     };
     Outcome::Status(oidl_status)
@@ -605,5 +844,41 @@ fn call_wait_one<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Resu
     let deadline: u64 = oidl_a2;
     let observed = rt::UserRef::new(oidl_a3);
     oidl_calls.wait_one(handle, signals, deadline, observed)
+}
+
+fn call_memory_object_create<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), MemoryObjectCreateError> {
+    let [oidl_a0, oidl_a1, _, _, _, _] = oidl_args;
+    let request = rt::UserRef::<ObjectRequest>::new(oidl_a0);
+    let object = rt::UserRef::new(oidl_a1);
+    oidl_calls.memory_object_create(request, object)
+}
+
+fn call_memory_map<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), MemoryMapError> {
+    let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, _, _] = oidl_args;
+    let process = rt::HandleArg::from_reg(oidl_a0, 0x2, 1).ok_or(MemoryMapError::BadHandle)?;
+    let object = rt::HandleArg::from_reg(oidl_a1, 0x4, 3).ok_or(MemoryMapError::BadHandle)?;
+    let request = rt::UserRef::<MapRequest>::new(oidl_a2);
+    let address = rt::UserRef::new(oidl_a3);
+    oidl_calls.memory_map(process, object, request, address)
+}
+
+fn call_memory_unmap<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), MemoryUnmapError> {
+    let [oidl_a0, oidl_a1, oidl_a2, _, _, _] = oidl_args;
+    let process = rt::HandleArg::from_reg(oidl_a0, 0x2, 1).ok_or(MemoryUnmapError::BadHandle)?;
+    let address: u64 = oidl_a1;
+    let length: u64 = oidl_a2;
+    oidl_calls.memory_unmap(process, address, length)
+}
+
+fn call_memory_protect<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), MemoryProtectError> {
+    let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, _, _] = oidl_args;
+    let process = rt::HandleArg::from_reg(oidl_a0, 0x2, 1).ok_or(MemoryProtectError::BadHandle)?;
+    let address: u64 = oidl_a1;
+    let length: u64 = oidl_a2;
+    let access = u32::try_from(oidl_a3).ok().and_then(MapAccess::from_bits).ok_or(MemoryProtectError::InvalidArgs)?;
+    if access.bits() == 0 {
+        return Err(MemoryProtectError::InvalidArgs);
+    }
+    oidl_calls.memory_protect(process, address, length, access)
 }
 

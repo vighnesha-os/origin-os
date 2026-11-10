@@ -1,8 +1,14 @@
-//! The rules of memory objects' mappings that need no hardware (ADR-0005 P7, P11 as C7 decides;
-//! ADR-0011 N14 step 3, task S3-5b), tested on the host: a process's records of its whole
-//! mappings, and the budget that limits unmap and protect (`THREAT_MODEL_ADDRESS_SPACES.md` T15,
-//! T16). The kernel applies them to address spaces.
+//! The rules of memory objects and their mappings that need no hardware (ADR-0005 P7, P11 as
+//! C6, C7 and C8 decide; ADR-0011 N14 step 3, task S3-5b), tested on the host: what a map
+//! request asks for, a process's records of its whole mappings, where a random placement lands,
+//! and the budget that limits unmap and protect (`THREAT_MODEL_ADDRESS_SPACES.md` T15, T16). The
+//! kernel's `memory_object` applies them to address spaces.
 //!
+//! - **A request** names what a mapping allows (read, and at most one of write and execute),
+//!   the object's pages it maps, and where: at random, or at a fixed address. Write with execute,
+//!   or no read, is `invalid_args`; execute is `access_denied`, since no anonymous object holds
+//!   the right (C6, C7); a right the handle lacks is `access_denied`; a range outside the object
+//!   or the user half, or not in whole pages, is `invalid_args`.
 //! - **A process's mappings** are whole: unmap and protect act on exactly one (C7). A record is
 //!   reserved, busy, before its pages are mapped, and is busy again while it changes, so the
 //!   address space's own work runs with none of these records' locks held.
@@ -13,15 +19,21 @@
 
 use alloc::vec::Vec;
 
-use origin_abi::Error;
+use origin_abi::{Error, map_access, map_flags};
+use origin_frame::usercopy::{USER_END, USER_START};
 
-/// Bytes in a page.
-pub const PAGE: u64 = crate::paging::PAGE;
-
+/// Bytes in a page (the definition's `page_size`).
+pub const PAGE: u64 = origin_abi::PAGE_SIZE;
 /// The most pages one shootdown covers: the framework's round of a change
 /// (`userspace::CHUNK`). Used only to price a change before it runs; what it actually cost is
 /// charged afterwards.
 pub const PAGES_PER_SHOOTDOWN: u64 = 128;
+/// A random placement lands on a page in `[PLACE_LOW, PLACE_HIGH)`: the upper part of the user
+/// half (ADR-0004 H1), clear of the low addresses programs are placed at. Start records are
+/// placed in the same region (`launch`), and a placement steps over every mapping.
+pub const PLACE_LOW: u64 = 0x0000_1000_0000_0000;
+/// One past the last address a random placement uses.
+pub const PLACE_HIGH: u64 = 0x0000_7000_0000_0000;
 
 /// What a mapping allows. In this version nothing is executable (C7), so these are all there is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +45,20 @@ pub enum Allow {
 }
 
 impl Allow {
+    /// What the definition's `map_access` bits ask for. Write with execute, no read, or a bit
+    /// this version does not define is `InvalidArgs`; execute is `AccessDenied`.
+    pub const fn from_bits(bits: u32) -> Result<Self, Error> {
+        let write = bits & map_access::WRITE != 0;
+        let execute = bits & map_access::EXECUTE != 0;
+        if bits & !map_access::ALL != 0 || bits & map_access::READ == 0 || (write && execute) {
+            return Err(Error::InvalidArgs);
+        }
+        if execute {
+            return Err(Error::AccessDenied);
+        }
+        Ok(if write { Self::ReadWrite } else { Self::Read })
+    }
+
     /// The rights a handle needs to map this.
     pub const fn needs(self) -> u32 {
         match self {
@@ -48,6 +74,102 @@ impl Allow {
             (Self::Read, _) | (Self::ReadWrite, Self::ReadWrite)
         )
     }
+}
+
+/// `bytes` as whole pages, or `InvalidArgs` if it is not a multiple of a page.
+pub const fn whole_pages(bytes: u64) -> Result<u64, Error> {
+    if !bytes.is_multiple_of(PAGE) {
+        return Err(Error::InvalidArgs);
+    }
+    Ok(bytes / PAGE)
+}
+
+/// The end of `pages` pages from `base`, if they are page-aligned and inside the user half.
+pub fn user_range_end(base: u64, pages: u64) -> Option<u64> {
+    if !base.is_multiple_of(PAGE) || base < USER_START {
+        return None;
+    }
+    pages
+        .checked_mul(PAGE)
+        .and_then(|bytes| base.checked_add(bytes))
+        .filter(|&end| end <= USER_END)
+}
+
+/// A map request's fields, as the generated decoder read them (it has refused bits the
+/// definition does not declare).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Request {
+    /// `map_access` bits.
+    pub access: u32,
+    /// `map_flags` bits.
+    pub flags: u32,
+    /// Where the mapping starts in the object, in bytes.
+    pub offset: u64,
+    /// How many bytes it maps.
+    pub length: u64,
+    /// With `FIXED`, where it goes.
+    pub address: u64,
+}
+
+/// Where a mapping goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// At a random free address.
+    Anywhere,
+    /// At this address, all of whose pages must be free.
+    At(u64),
+}
+
+/// A valid request: what the mapping allows, the object's pages it maps, and where.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Asked {
+    /// What it allows.
+    pub allow: Allow,
+    /// The object's first page it maps.
+    pub first: u64,
+    /// How many pages.
+    pub pages: u64,
+    /// Where.
+    pub place: Place,
+}
+
+/// Checks `request` against an object of `object_pages` pages held with the rights `held`, in
+/// this order: what it allows, the handle's rights for that, the range in the object, then the
+/// placement.
+pub fn check(request: &Request, object_pages: u64, held: u32) -> Result<Asked, Error> {
+    let allow = Allow::from_bits(request.access)?;
+    if held & allow.needs() != allow.needs() {
+        return Err(Error::AccessDenied);
+    }
+    let first = whole_pages(request.offset)?;
+    let pages = whole_pages(request.length)?;
+    if pages == 0
+        || first
+            .checked_add(pages)
+            .is_none_or(|end| end > object_pages)
+    {
+        return Err(Error::InvalidArgs);
+    }
+    let place = match request.flags {
+        0 if request.address == 0 => Place::Anywhere,
+        map_flags::FIXED if user_range_end(request.address, pages).is_some() => {
+            Place::At(request.address)
+        }
+        _ => return Err(Error::InvalidArgs),
+    };
+    Ok(Asked {
+        allow,
+        first,
+        pages,
+        place,
+    })
+}
+
+/// Where a random draw places `pages` pages: a page of `[PLACE_LOW, PLACE_HIGH)` at which they
+/// fit, or `None` if they cannot fit there at all.
+pub fn place(random: u64, pages: u64) -> Option<u64> {
+    let slots = ((PLACE_HIGH - PLACE_LOW) / PAGE).checked_sub(pages)? + 1;
+    Some(PLACE_LOW + (random % slots) * PAGE)
 }
 
 /// What an unmap or protect of `pages` pages may cost at most: one unit per shootdown and per
@@ -252,6 +374,41 @@ impl<T> Mappings<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use origin_abi::rights;
+
+    const RW: u32 = map_access::READ | map_access::WRITE;
+    const ALL_RIGHTS: u32 = rights::MEMORY_OBJECT;
+
+    fn request(access: u32, flags: u32, offset: u64, length: u64, address: u64) -> Request {
+        Request {
+            access,
+            flags,
+            offset,
+            length,
+            address,
+        }
+    }
+
+    #[test]
+    fn access_is_read_and_at_most_one_of_write_and_execute() {
+        assert_eq!(Allow::from_bits(map_access::READ), Ok(Allow::Read));
+        assert_eq!(Allow::from_bits(RW), Ok(Allow::ReadWrite));
+        assert_eq!(
+            Allow::from_bits(map_access::READ | map_access::EXECUTE),
+            Err(Error::AccessDenied),
+            "nothing is executable in this version"
+        );
+        for bad in [
+            0,
+            map_access::WRITE,
+            map_access::EXECUTE,
+            map_access::ALL,
+            map_access::WRITE | map_access::EXECUTE,
+            map_access::READ | 1 << 3,
+        ] {
+            assert_eq!(Allow::from_bits(bad), Err(Error::InvalidArgs), "{bad:#b}");
+        }
+    }
 
     #[test]
     fn protect_may_only_reduce() {
@@ -259,6 +416,121 @@ mod tests {
         assert!(Allow::Read.within(Allow::ReadWrite));
         assert!(Allow::ReadWrite.within(Allow::ReadWrite));
         assert!(!Allow::ReadWrite.within(Allow::Read));
+    }
+
+    #[test]
+    fn a_valid_request_names_its_pages_and_its_place() {
+        assert_eq!(
+            check(&request(RW, 0, PAGE, 2 * PAGE, 0), 4, ALL_RIGHTS),
+            Ok(Asked {
+                allow: Allow::ReadWrite,
+                first: 1,
+                pages: 2,
+                place: Place::Anywhere,
+            })
+        );
+        let at = 0x0000_3000_0000_0000;
+        assert_eq!(
+            check(
+                &request(map_access::READ, map_flags::FIXED, 0, 4 * PAGE, at),
+                4,
+                ALL_RIGHTS
+            ),
+            Ok(Asked {
+                allow: Allow::Read,
+                first: 0,
+                pages: 4,
+                place: Place::At(at),
+            })
+        );
+    }
+
+    #[test]
+    fn each_malformed_request_is_refused_for_its_own_reason() {
+        let at = 0x0000_3000_0000_0000;
+        let cases = [
+            // What it allows.
+            (request(0, 0, 0, PAGE, 0), Error::InvalidArgs),
+            (request(map_access::ALL, 0, 0, PAGE, 0), Error::InvalidArgs),
+            (
+                request(map_access::READ | map_access::EXECUTE, 0, 0, PAGE, 0),
+                Error::AccessDenied,
+            ),
+            // The range in the object.
+            (request(RW, 0, 0, 0, 0), Error::InvalidArgs),
+            (request(RW, 0, 1, PAGE, 0), Error::InvalidArgs),
+            (request(RW, 0, 0, PAGE + 1, 0), Error::InvalidArgs),
+            (request(RW, 0, 0, 5 * PAGE, 0), Error::InvalidArgs),
+            (request(RW, 0, 4 * PAGE, PAGE, 0), Error::InvalidArgs),
+            (request(RW, 0, !(PAGE - 1), PAGE, 0), Error::InvalidArgs),
+            (request(RW, 0, PAGE, !(PAGE - 1), 0), Error::InvalidArgs),
+            // The placement.
+            (request(RW, 0, 0, PAGE, at), Error::InvalidArgs),
+            (
+                request(RW, map_flags::FIXED, 0, PAGE, 0),
+                Error::InvalidArgs,
+            ),
+            (
+                request(RW, map_flags::FIXED, 0, PAGE, at + 1),
+                Error::InvalidArgs,
+            ),
+            (
+                request(RW, map_flags::FIXED, 0, PAGE, USER_END),
+                Error::InvalidArgs,
+            ),
+            (
+                request(RW, map_flags::FIXED, 0, 2 * PAGE, USER_END - PAGE),
+                Error::InvalidArgs,
+            ),
+            (
+                request(RW, map_flags::FIXED, 0, PAGE, 0xFFFF_8000_0000_0000),
+                Error::InvalidArgs,
+            ),
+            (request(RW, 1 << 1, 0, PAGE, 0), Error::InvalidArgs),
+        ];
+        for (asked, why) in cases {
+            assert_eq!(check(&asked, 4, ALL_RIGHTS), Err(why), "{asked:?}");
+        }
+    }
+
+    #[test]
+    fn a_mapping_needs_the_rights_it_gives() {
+        let read = request(map_access::READ, 0, 0, PAGE, 0);
+        let write = request(RW, 0, 0, PAGE, 0);
+        assert!(check(&read, 1, rights::READ | rights::MAP).is_ok());
+        assert_eq!(check(&read, 1, rights::MAP), Err(Error::AccessDenied));
+        assert_eq!(
+            check(&write, 1, rights::READ | rights::MAP),
+            Err(Error::AccessDenied)
+        );
+        assert!(check(&write, 1, rights::READ | rights::WRITE | rights::MAP).is_ok());
+    }
+
+    #[test]
+    fn the_last_user_page_can_be_mapped_but_nothing_past_it() {
+        assert_eq!(user_range_end(USER_END - PAGE, 1), Some(USER_END));
+        assert_eq!(user_range_end(USER_END - PAGE, 2), None);
+        assert_eq!(
+            user_range_end(0, 1),
+            None,
+            "the null page is not user memory"
+        );
+        assert_eq!(user_range_end(USER_START, 1), Some(USER_START + PAGE));
+        assert_eq!(user_range_end(PAGE, u64::MAX), None);
+    }
+
+    #[test]
+    fn a_random_place_fits_in_the_region() {
+        for random in [0, 1, u64::MAX, 0x1234_5678_9ABC_DEF0] {
+            for pages in [1, 2, 512] {
+                let at = place(random, pages).expect("fits");
+                assert!(at >= PLACE_LOW && at.is_multiple_of(PAGE));
+                assert!(at + pages * PAGE <= PLACE_HIGH);
+            }
+        }
+        let all = (PLACE_HIGH - PLACE_LOW) / PAGE;
+        assert_eq!(place(u64::MAX, all), Some(PLACE_LOW));
+        assert_eq!(place(0, all + 1), None);
     }
 
     #[test]

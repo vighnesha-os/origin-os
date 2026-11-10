@@ -1214,7 +1214,7 @@ fn the_definition_has_exactly_the_hand_written_abi_s_statuses_rights_signals_and
         .iter()
         .map(|m| (m.name.as_str(), m.ordinal))
         .collect();
-    assert_eq!(numbers.len(), 11);
+    assert_eq!(numbers.len(), 15);
     assert_eq!(u64::from(numbers["thread_exit"]), syscall::THREAD_EXIT);
     assert_eq!(u64::from(numbers["debug_report"]), syscall::DEBUG_REPORT);
     assert_eq!(u64::from(numbers["debug_write"]), syscall::DEBUG_WRITE);
@@ -1232,6 +1232,16 @@ fn the_definition_has_exactly_the_hand_written_abi_s_statuses_rights_signals_and
     assert_eq!(u64::from(numbers["wait_one"]), syscall::WAIT_ONE);
     assert_eq!(u64::from(numbers["event_create"]), syscall::EVENT_CREATE);
     assert_eq!(u64::from(numbers["object_signal"]), syscall::OBJECT_SIGNAL);
+    assert_eq!(
+        u64::from(numbers["memory_object_create"]),
+        syscall::MEMORY_OBJECT_CREATE
+    );
+    assert_eq!(u64::from(numbers["memory_map"]), syscall::MEMORY_MAP);
+    assert_eq!(u64::from(numbers["memory_unmap"]), syscall::MEMORY_UNMAP);
+    assert_eq!(
+        u64::from(numbers["memory_protect"]),
+        syscall::MEMORY_PROTECT
+    );
     let object_type = comp.object_type.as_ref().expect("object_type");
     assert_eq!(
         object_type

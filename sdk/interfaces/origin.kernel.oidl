@@ -85,6 +85,16 @@ const process_rights: rights = read | write | manage | wait | duplicate | transf
 @since(0.3)
 const thread_rights: rights = wait | manage | duplicate | transfer;
 
+/// The rights of a new memory object (ADR-0005 C6): never execute, since an anonymous object
+/// is never executable.
+@since(0.5)
+const memory_object_rights: rights = read | write | map | duplicate | transfer;
+
+/// Bytes in a page: every memory object, mapping, offset and fixed address is counted in
+/// whole pages of this size (ADR-0005 P7, D2).
+@since(0.5)
+const page_size: u64 = 4096;
+
 /// Object signals (ADR-0005 P9).
 bits signals: u32 {
     /// A message or data can be read.
@@ -225,6 +235,51 @@ struct start_entry {
     role: start_role;
 }
 
+/// What a mapping allows (ADR-0005 P7, C7, D2). Every mapping can be read; write and execute
+/// are never given together.
+@since(0.5)
+bits map_access: u32 {
+    /// Read. Every mapping has it.
+    read = 0;
+    /// Write.
+    write = 1;
+    /// Execute: refused until the Code Integrity Table exists (ONBF §8.2), and an anonymous
+    /// object never has the right.
+    execute = 2;
+}
+
+/// How a mapping is placed (ADR-0005 P7, C7, D2).
+@since(0.5)
+bits map_flags: u32 {
+    /// At the request's address, whose pages must all be free: a mapping is never replaced.
+    /// Without it the kernel places the mapping at a random free address.
+    fixed = 0;
+}
+
+/// What memory_object_create makes (ADR-0005 C7). A sized struct, so that a later minor can
+/// add an option without a new call (P4, D1).
+@since(0.5)
+sized struct object_request {
+    /// Bytes of the object: a non-zero multiple of page_size. They are committed at creation,
+    /// zeroed, and charged to the caller.
+    length: u64;
+}
+
+/// What memory_map maps and how (ADR-0005 P7, C7, C8, D2).
+@since(0.5)
+sized struct map_request {
+    /// What the mapping allows: read, and at most one of write and execute.
+    access: map_access;
+    /// How it is placed.
+    flags: map_flags;
+    /// Where it starts in the object, in bytes: a multiple of page_size.
+    offset: u64;
+    /// How many bytes it maps: a non-zero multiple of page_size, inside the object.
+    length: u64;
+    /// With fixed, where it is placed: a multiple of page_size, in the user half. Otherwise 0.
+    address: u64;
+}
+
 /// Calls made by a thread on its process's behalf (ADR-0005 P4). Every number here is private
 /// to the release; the C entry points below are the stable interface.
 interface kernel {
@@ -325,4 +380,68 @@ interface kernel {
         /// Signals to set.
         set: signals,
     ) errors(not_supported) requires none;
+
+    /// Makes a memory object of zeroed frames, committed in full and charged to the caller's
+    /// account, and returns a handle to it with memory_object_rights (ADR-0005 C6, C7, D1).
+    /// limit: past the caller's memory quota (D4), or its handle table is full.
+    @since(0.5)
+    method memory_object_create = 11 (
+        /// What to make.
+        request: object_request,
+    ) -> (
+        /// The new object.
+        object: handle<memory_object>,
+    ) errors(invalid_args, fault, limit, no_memory) requires none;
+
+    /// Maps part of a memory object into a process and returns where (ADR-0005 P7, C7, C8, D2,
+    /// D5).
+    /// The mapping holds the object: closing a handle never unmaps. access_denied: the
+    /// object's handle lacks read, or write for a writable mapping, or execute was asked.
+    /// invalid_args: a malformed request, or a fixed address any page of which is mapped.
+    /// limit: past the process's mappings, or its page tables are full. not_supported: no
+    /// hardware entropy to place it at random.
+    @since(0.5)
+    method memory_map = 12 (
+        /// The process whose address space changes: write is needed, the caller's own
+        /// included (ADR-0005 C6).
+        process: handle<process, write>,
+        /// The object.
+        object: handle<memory_object, map>,
+        /// What to map and how.
+        request: map_request,
+    ) -> (
+        /// Where the mapping starts.
+        address: u64,
+    ) errors(bad_handle, wrong_type, access_denied, invalid_args, fault, limit, no_memory, not_supported) requires none;
+
+    /// Removes one whole mapping (ADR-0005 P7, C7, D3). When it returns, no processor reaches its
+    /// pages through this process. invalid_args: address and length are not exactly one
+    /// mapping. should_wait: the process's budget of shootdowns cannot pay for it now, and
+    /// nothing changed. timed_out: a processor did not answer the shootdown; the mapping is
+    /// gone, and its frames are kept from reuse for good. no_memory: only after such a stall,
+    /// when the kernel heap cannot replace the bookkeeping it leaked (D5).
+    @since(0.5)
+    method memory_unmap = 13 (
+        /// The process whose address space changes.
+        process: handle<process, write>,
+        /// Where the mapping starts.
+        address: u64,
+        /// Its whole length, in bytes.
+        length: u64,
+    ) errors(bad_handle, wrong_type, access_denied, invalid_args, no_memory, should_wait, timed_out) requires none;
+
+    /// Reduces what one whole mapping allows (ADR-0005 P7, C7, D3). When it returns, no processor
+    /// uses the old access. access_denied: the new access is not within the old one.
+    /// invalid_args, should_wait and timed_out as for memory_unmap.
+    @since(0.5)
+    method memory_protect = 14 (
+        /// The process whose address space changes.
+        process: handle<process, write>,
+        /// Where the mapping starts.
+        address: u64,
+        /// Its whole length, in bytes.
+        length: u64,
+        /// What it allows from now on: read, and at most what it allowed before.
+        @nonzero access: map_access,
+    ) errors(bad_handle, wrong_type, access_denied, invalid_args, should_wait, timed_out) requires none;
 }

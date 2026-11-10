@@ -38,8 +38,11 @@ use origin_syscalls::origin_kernel::types as oidl;
 
 use crate::channel::Identity;
 use crate::console::Console;
+use crate::mapping::Request;
+use crate::memory_object::{self, MemoryObject};
 use crate::process::{Ending, UserContext};
 use crate::{cpu, ipc, sched};
+use origin_frame::objref::ObjectRef;
 
 /// The most handles in one message, as a length.
 const MAX_HANDLES: usize = oidl::MAX_MESSAGE_HANDLES as usize;
@@ -206,6 +209,51 @@ impl server::Calls for UserContext {
     ) -> Result<(), server::WaitOneError> {
         wait_one(self, handle, signals, deadline, observed)
             .map_err(declared(server::WaitOneError::InvalidArgs))
+    }
+
+    fn memory_object_create(
+        &self,
+        request: rt::UserRef<oidl::ObjectRequest>,
+        object: rt::UserRef<rt::Handle>,
+    ) -> Result<(), server::MemoryObjectCreateError> {
+        memory_object_create(self, request, object)
+            .map_err(declared(server::MemoryObjectCreateError::InvalidArgs))
+    }
+
+    fn memory_map(
+        &self,
+        process: rt::HandleArg,
+        object: rt::HandleArg,
+        request: rt::UserRef<oidl::MapRequest>,
+        address: rt::UserRef<u64>,
+    ) -> Result<(), server::MemoryMapError> {
+        memory_map(self, process, object, request, address)
+            .map_err(declared(server::MemoryMapError::InvalidArgs))
+    }
+
+    fn memory_unmap(
+        &self,
+        process: rt::HandleArg,
+        address: u64,
+        length: u64,
+    ) -> Result<(), server::MemoryUnmapError> {
+        memory_object::process_of(&self.process, process.value(), need(process))
+            .and_then(|target| memory_object::unmap(&self.process, &target, address, length))
+            .map_err(declared(server::MemoryUnmapError::InvalidArgs))
+    }
+
+    fn memory_protect(
+        &self,
+        process: rt::HandleArg,
+        address: u64,
+        length: u64,
+        access: oidl::MapAccess,
+    ) -> Result<(), server::MemoryProtectError> {
+        memory_object::process_of(&self.process, process.value(), need(process))
+            .and_then(|target| {
+                memory_object::protect(&self.process, &target, address, length, access.bits())
+            })
+            .map_err(declared(server::MemoryProtectError::InvalidArgs))
     }
 }
 
@@ -450,6 +498,88 @@ fn channel_read(
             })
         }
     }
+}
+
+/// Copies a sized struct a call reads (OIDL §5.3, ADR-0005 P4): its `size` is read once and must
+/// be a version this kernel knows, which `accepts` says; then exactly that many bytes are copied,
+/// once, into `bytes`, to be decoded from the copy. Returns the size.
+fn copy_request(
+    p: &UserContext,
+    addr: u64,
+    accepts: fn(u32) -> bool,
+    bytes: &mut [u8],
+) -> Result<u32, Error> {
+    let size = read_u32(p, addr)?;
+    if !accepts(size) {
+        return Err(Error::InvalidArgs);
+    }
+    let len = usize::try_from(size).map_err(|_| Error::InvalidArgs)?;
+    copy_in(p, bytes.get_mut(..len).ok_or(Error::InvalidArgs)?, addr)?;
+    Ok(size)
+}
+
+/// `memory_object_create` (C7): the out pointer is checked first, so a bad one costs nothing.
+fn memory_object_create(
+    p: &UserContext,
+    request: rt::UserRef<oidl::ObjectRequest>,
+    object: rt::UserRef<rt::Handle>,
+) -> Result<(), Error> {
+    checked(p, object.addr(), HANDLE_BYTES as u64, UserAccess::Write)?;
+    let mut bytes = [0; oidl::ObjectRequest::SIZE as usize];
+    let size = copy_request(
+        p,
+        request.addr(),
+        oidl::ObjectRequest::accepts_param_size,
+        &mut bytes,
+    )?;
+    let asked = oidl::ObjectRequest::decode(&bytes, size, oidl::VERSION.1)
+        .map_err(|_| Error::InvalidArgs)?;
+    let length = asked.length.ok_or(Error::InvalidArgs)?;
+    let made = MemoryObject::create(&p.process.account, length)?;
+    let made = ObjectRef::try_new(made).map_err(|_| Error::NoMemory)?;
+    let table = &p.process.handles;
+    let handle = p
+        .process
+        .grant(ipc::Object::Memory(made), oidl::MEMORY_OBJECT_RIGHTS.bits())?;
+    copy_out(p, object.addr(), &handle.to_le_bytes()).inspect_err(|_| {
+        let _ = ipc::handle_close(table, handle, Need::NOTHING);
+    })
+}
+
+/// `memory_map` (C7, C8): the out pointer and the request are checked and copied before
+/// anything is mapped.
+fn memory_map(
+    p: &UserContext,
+    process: rt::HandleArg,
+    object: rt::HandleArg,
+    request: rt::UserRef<oidl::MapRequest>,
+    address: rt::UserRef<u64>,
+) -> Result<(), Error> {
+    checked(p, address.addr(), 8, UserAccess::Write)?;
+    let mut bytes = [0; oidl::MapRequest::SIZE as usize];
+    let size = copy_request(
+        p,
+        request.addr(),
+        oidl::MapRequest::accepts_param_size,
+        &mut bytes,
+    )?;
+    let asked =
+        oidl::MapRequest::decode(&bytes, size, oidl::VERSION.1).map_err(|_| Error::InvalidArgs)?;
+    let request = Request {
+        access: asked.access.ok_or(Error::InvalidArgs)?.bits(),
+        flags: asked.flags.ok_or(Error::InvalidArgs)?.bits(),
+        offset: asked.offset.ok_or(Error::InvalidArgs)?,
+        length: asked.length.ok_or(Error::InvalidArgs)?,
+        address: asked.address.ok_or(Error::InvalidArgs)?,
+    };
+    let target = memory_object::process_of(&p.process, process.value(), need(process))?;
+    let (object, held) = memory_object::object_of(&p.process, object.value(), need(object))?;
+    let at = memory_object::map(&target, &object, held, &request)?;
+    // The pointer was checked above; only the caller's own space changing under the call can
+    // fail here. Then the mapping it cannot learn of goes again.
+    copy_out(p, address.addr(), &at.to_le_bytes()).inspect_err(|_| {
+        let _ = memory_object::unmap(&p.process, &target, at, request.length);
+    })
 }
 
 /// `wait_one`. The decoder has refused an empty mask and undefined signals.

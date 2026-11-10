@@ -181,6 +181,8 @@ mod kernel;
 #[cfg(target_os = "none")]
 mod launch;
 #[cfg(target_os = "none")]
+mod memory_object;
+#[cfg(target_os = "none")]
 mod pcie;
 #[cfg(target_os = "none")]
 mod process;
