@@ -10,6 +10,15 @@
 //! It also switches to the kernel's own page tables ([`load_page_tables`]) and provides
 //! *probes*: single deliberate accesses that report a page fault instead of taking it, which
 //! prove on the real processor that the page protections hold.
+//!
+//! # The flags, and `preserves_flags`
+//!
+//! An `asm!` block declares `preserves_flags` only if every instruction in it is on the list
+//! that `cargo xtask check` keeps (`developer-tools/xtask/src/asmflags.rs`): the instructions
+//! that both Intel's and AMD's manuals say change no status flag (CLAUDE.md §13). A move to or
+//! from a control or debug register is not on it: AMD says it affects no flag, and Intel says it
+//! leaves all six status flags undefined (`docs/research/2026-11-10-asm-flags.md`). Without the
+//! option the compiler assumes the block may change the flags, which is always true.
 
 use core::arch::{asm, naked_asm};
 use core::ptr;
@@ -512,8 +521,9 @@ fn init_cpu_state() {
             options(nostack),
         );
     }
-    // SAFETY: CPL 0; DR7's reset value disarms every breakpoint, and nothing here uses one.
-    unsafe { asm!("mov dr7, {}", in(reg) DR7_CLEAR, options(nostack, preserves_flags)) };
+    // SAFETY: CPL 0; DR7's reset value disarms every breakpoint, and nothing here uses one. The
+    // flags are not preserved: Intel leaves them undefined after a move to a debug register.
+    unsafe { asm!("mov dr7, {}", in(reg) DR7_CLEAR, options(nostack)) };
     if has_sysenter() {
         // SAFETY: CPL 0; SEP says the MSR exists, and a zero selector only makes SYSENTER
         // raise #GP (Intel SDM Vol. 2B, SYSENTER).
@@ -524,24 +534,25 @@ fn init_cpu_state() {
 /// CR4.
 fn read_cr4() -> u64 {
     let value: u64;
-    // SAFETY: reading CR4 at CPL 0 has no side effect.
-    unsafe { asm!("mov {}, cr4", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: reading CR4 at CPL 0 has no side effect but the one on the flags (see the module
+    // documentation), which this block does not claim to preserve.
+    unsafe { asm!("mov {}, cr4", out(reg) value, options(nomem, nostack)) };
     value
 }
 
 /// CR0.
 fn read_cr0() -> u64 {
     let value: u64;
-    // SAFETY: reading CR0 at CPL 0 has no side effect.
-    unsafe { asm!("mov {}, cr0", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: as `read_cr4`.
+    unsafe { asm!("mov {}, cr0", out(reg) value, options(nomem, nostack)) };
     value
 }
 
 /// DR7.
 fn read_dr7() -> u64 {
     let value: u64;
-    // SAFETY: reading DR7 at CPL 0 has no side effect.
-    unsafe { asm!("mov {}, dr7", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: as `read_cr4`; Intel says the same of the debug registers.
+    unsafe { asm!("mov {}, dr7", out(reg) value, options(nomem, nostack)) };
     value
 }
 
@@ -1208,8 +1219,8 @@ pub fn interrupts_enabled() -> bool {
 /// CR2: the linear address of the last page fault.
 fn read_cr2() -> u64 {
     let value: u64;
-    // SAFETY: reading CR2 at CPL 0 has no side effects.
-    unsafe { asm!("mov {}, cr2", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: as `read_cr4`.
+    unsafe { asm!("mov {}, cr2", out(reg) value, options(nomem, nostack)) };
     value
 }
 
@@ -1355,8 +1366,8 @@ pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
 /// CR3: the physical address of the live PML4 (and, with PCIDs off, nothing else).
 pub fn read_cr3() -> u64 {
     let value: u64;
-    // SAFETY: reading CR3 at CPL 0 has no side effect.
-    unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: as `read_cr4`.
+    unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack)) };
     value
 }
 
@@ -1381,8 +1392,9 @@ pub unsafe fn write_cr3(root: u64) {
 ///
 /// As for [`write_cr3`].
 pub(crate) unsafe fn load_cr3(root: u64) {
-    // SAFETY: the caller's contract.
-    unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+    // SAFETY: the caller's contract. The flags are not preserved: Intel leaves them undefined
+    // after a move to a control register.
+    unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack)) };
 }
 
 /// The furthest a backtrace reads above the starting frame pointer, and the largest single
@@ -1788,13 +1800,14 @@ pub fn flush_tlb_non_global() {
     without_interrupts(|| {
         // SAFETY: CPL 0. CR3 is reloaded with the value it holds, so nothing about what is
         // mapped changes, only what the TLB holds. Interrupts are off, so no handler sees the
-        // processor between the two instructions.
+        // processor between the two instructions. The flags are not preserved: Intel leaves
+        // them undefined after a move to or from a control register.
         unsafe {
             asm!(
                 "mov {tmp}, cr3",
                 "mov cr3, {tmp}",
                 tmp = out(reg) _,
-                options(nostack, preserves_flags),
+                options(nostack),
             );
         }
     });
