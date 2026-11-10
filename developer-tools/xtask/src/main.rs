@@ -1341,7 +1341,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(address_space_markers(cpus))
         .chain(identity_markers())
         .chain(launch_markers())
-        .chain(stack_markers())
+        .chain(stack_markers(machine))
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
@@ -1796,13 +1796,25 @@ fn address_space_markers(cpus: u32) -> Vec<String> {
     ]
 }
 
-/// ADR-0004 Amendment 1, A2: the kernel stacks' region, each of its boot lines.
-fn stack_markers() -> Vec<String> {
+/// ADR-0004 Amendment 1, A2: the kernel stacks' region, each of its boot proof's lines.
+fn stack_markers(machine: &Machine) -> Vec<String> {
+    let cpus = machine.cpus();
+    let interrupt_stacks = 4 * (cpus - 1);
+    // The processor that caches the freed stack: the first after the boot processor, if any.
+    let reader = machine.named(cpus.min(2) - 1);
     vec![
-        "origin-kernel: kernel stacks: the direct map has ".into(),
-        " when the kernel's tables went live".into(),
+        format!(
+            "origin-kernel: kernel stacks: stacks of 4, 16 and 64 KiB each in a slot of its own in the region, every page read/write, not executable and global: true; the page below each, the bottom of its slot and the bottom of the next faulted: 9 of 9; the application processors' interrupt stacks, as their TSSs name them, in the region with the page below each faulting: {interrupt_stacks} of {interrupt_stacks}"
+        ),
+        "origin-kernel: kernel stacks: the direct map has every 2 MiB page it was built with: true (".into(),
+        format!(
+            "origin-kernel: kernel stacks: a stack's 4 pages read on {reader}, then the stack freed and reclaimed: 4 of 4 reads there faulted and 0 saw the old pages; its slot free again: true"
+        ),
         "origin-kernel: kernel stacks: 64 stacks of 16384 bytes made and freed: all made true; making one took ".into(),
         " (QEMU, no budget)".into(),
+        "origin-kernel: kernel stacks: every stack the proof made is given back: Counts { live: ".into(),
+        ", idle: 0, retired: 0, lost: 0, pages: ".into(),
+        " }, as before: true".into(),
     ]
 }
 

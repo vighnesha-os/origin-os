@@ -155,6 +155,12 @@ pub(crate) fn unready_switches() -> u64 {
 /// that it has none.
 static ZOMBIES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
+/// Exited threads that await [`reap`] on any processor: for a proof that needs every stack
+/// given back before it counts them (`stacks`).
+pub(crate) fn zombies() -> u64 {
+    ZOMBIES.iter().map(|z| z.load(Ordering::Acquire)).sum()
+}
+
 /// Frees the stacks of threads that exited on **this** processor. Only this processor may
 /// do it, and only from thread context: by then its exit handler, which ran on the dead
 /// stack, has certainly switched away. Returns how many stacks were freed.
@@ -996,6 +1002,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         init_cpu_fpu(id);
     }
     let heap_before = crate::memory::stats().map(|(h, _)| h.bytes_in_use);
+    // The stacks the processors hold for good: their own and their interrupt stacks.
+    let stacks_before = origin_frame::stack::counts().live;
     RUNNING_STEP.store(
         (tsc_hz / 1_000_000).max(1) * RUNNING_STEP_MICROS,
         Ordering::Relaxed,
@@ -1141,19 +1149,24 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         Proof::Launch,
         crate::ipc_proof::prove_launch(com1, cpus, bsp, tsc_hz),
     );
-    crate::stacks::report(com1, tsc_hz);
+    proofs.record(Proof::Stacks, crate::stacks::prove(com1, cpus, bsp, tsc_hz));
     // Every thread has exited: once each processor has reaped its own, the heap is back
-    // exactly where it was before the first spawn.
-    let back = || crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before;
+    // exactly where it was before the first spawn, and so are the stacks held.
+    let stacks = || origin_frame::stack::counts().live;
+    let back = || {
+        crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before
+            && stacks() == stacks_before
+    };
     yield_until(back, tsc_hz, 2);
     let reaped = back();
     let now = crate::memory::stats().map_or(0, |(h, _)| h.bytes_in_use);
     proofs.record(Proof::ThreadsReaped, reaped);
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap {} KiB, {} KiB before the first spawn{}",
+        "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap {} KiB, {} KiB before the first spawn; {} stacks held, {stacks_before} before the first spawn{}",
         now >> 10,
         heap_before.unwrap_or(0) >> 10,
+        stacks(),
         if reaped { "" } else { ": scheduler failed" }
     );
 }

@@ -818,6 +818,28 @@ pub fn bsp_nmi_stack() -> (u64, u64) {
     (low, low + IST_STACK_SIZE as u64)
 }
 
+/// The tops of processor `cpu`'s interrupt stacks as its TSS holds them: #DF, NMI, #MC and #DB
+/// (IST1–IST4). `None` before that processor loaded its tables. For the proof that every
+/// application processor's interrupt stacks are in the stack region (ADR-0004 Amendment 1, A2).
+pub fn interrupt_stack_tops(cpu: CpuIndex) -> Option<[u64; 4]> {
+    let tss = CPU_LOCAL.get(cpu.0)?.tss.load(Ordering::Relaxed);
+    if tss == 0 {
+        return None;
+    }
+    // The two words of the TSS image from word `at`, low first.
+    let ist = |at: usize| {
+        let p = ptr::with_exposed_provenance::<[u32; 2]>(tss as usize + 4 * at);
+        // SAFETY: `tss` is a processor's TSS image (`init_cpu_local` recorded it), 26 words that
+        // live for ever (a static, or tables `smp` never frees). IST1-IST4 are written once,
+        // before `ltr`, and never again, so nothing writes these words while they are read; the
+        // image is 4-aligned, as `[u32; 2]` needs; and only these words are read, with no
+        // reference made to the TSS, whose RSP0 its processor writes.
+        let [low, high] = unsafe { p.read_volatile() };
+        u64::from(low) | u64::from(high) << 32
+    };
+    Some([ist(9), ist(11), ist(13), ist(TSS_IST4_WORD)])
+}
+
 /// The frame of the last user-mode #DB, for the boot proof that it arrives on its own stack.
 static DEBUG_FRAME: AtomicU64 = AtomicU64::new(0);
 

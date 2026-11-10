@@ -28,7 +28,7 @@ use alloc::alloc::{Layout, alloc, dealloc};
 
 use origin_paging::PAGE;
 use origin_paging::layout::{STACK_REGION, STACK_REGION_SIZE};
-use origin_sync::slots::{Counts, Slots, Taken};
+use origin_sync::slots::{Counts, Slots, State, Taken};
 
 use crate::cpu::{self, CpuIndex, without_interrupts};
 use crate::descriptors::{KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
@@ -64,6 +64,21 @@ const fn slot_base(slot: usize) -> u64 {
 /// The lowest of the top `pages` pages of slot `slot`: where a stack of that many pages starts.
 const fn stack_low(slot: usize, pages: u32) -> u64 {
     slot_base(slot) + SLOT - pages as u64 * PAGE
+}
+
+/// The slot holding `addr`, if `addr` is in the stack region.
+const fn slot_of(addr: u64) -> Option<usize> {
+    if addr < STACK_REGION || addr >= STACK_REGION + STACK_REGION_SIZE {
+        return None;
+    }
+    Some(((addr - STACK_REGION) / SLOT) as usize)
+}
+
+/// Whether the slot holding `addr` is free: nothing is mapped there, and no processor holds a
+/// translation of what was. For a proof that a freed stack's reclaim has completed, whichever
+/// processor did it.
+pub fn slot_is_free(addr: u64) -> bool {
+    slot_of(addr).is_some_and(|slot| without_interrupts(|| REGION.state(slot)) == Some(State::Free))
 }
 
 /// The top of the slot holding `addr`, if `addr` is in the stack region: past it lies the next
