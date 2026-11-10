@@ -1,18 +1,19 @@
 # ORIGIN OS — DEFINITIVE PRODUCTION ENGINEERING DIRECTIVE
-## Version 7.2 — Original-Source, Rust 1.99.1, Research-Verified Operating System
+## Version 7.3 — Original-Source, Rust 1.99.1, Research-Verified Operating System
 
-**Product:** Origin OS  
+**Product:** Origin OS, in two editions of one release: Origin Desktop and Origin Server  
 **Kernel:** Framekernel  
 **Research baseline:** November 7, 2026  
-**Revision:** 7.2, 2026-11-09. Amends §48 and §70 to match ADR-0011, the native SDK (decision sheet item 39). Revision 7.1 (2026-11-07) added the ONBF decisions (`docs/adr/ADR-0001-onbf.md`) and toolchain and standards corrections (`docs/research/2026-11-07-onbf.md` §5). v7.1 is kept at `docs/engineering/CLAUDE-v7.1.md` and v7.0 at `docs/engineering/CLAUDE-v7.0.md`.  
+**Revision:** 7.3, 2026-11-10. Adds the Server edition (`docs/adr/ADR-0014-server-edition.md`), every device standard through the SDK (`docs/adr/ADR-0015-device-standards-sdk.md`), Origin-owned Secure Boot keys as the default (ADR-0002 Amendment 1), rules for the public repository, and a stricter hardware scope with the core generation named at boot (ADR-0009 Amendment 1) (decision sheet items 71–90). Revision 7.2 (2026-11-09) amended §48 and §70 to match ADR-0011, the native SDK (item 39). Revision 7.1 (2026-11-07) added the ONBF decisions (`docs/adr/ADR-0001-onbf.md`) and toolchain and standards corrections (`docs/research/2026-11-07-onbf.md` §5). v7.2 is kept at `docs/engineering/CLAUDE-v7.2.md`, v7.1 at `docs/engineering/CLAUDE-v7.1.md` and v7.0 at `docs/engineering/CLAUDE-v7.0.md`.  
 **Mandatory compiler:** Rust 1.99.1 stable  
 **Rust edition:** 2024  
 **Processor architecture:** x86-64 exclusively: 64-bit long mode only. No 32-bit or x32 code, and no Windows `.exe` or `.msi` compatibility.  
-**Target hardware:** Intel and AMD platforms introduced in 2026 or later  
+**Target hardware:** Intel platforms introduced in 2026 or later, and AMD platforms introduced in 2026 or later with Zen 5 or newer cores. Older machines are bench equipment only: no support or qualification claim rests on them (ADR-0009, Amendment 1)  
 **Primary development host:** Apple M1 Max with 64 GB RAM  
 **Engineering platform:** Claude Code, specialist agents, Git, QEMU/OVMF, automated CI and physical x86-64 validation  
 **Development policy:** Original, independently authored Origin OS implementation  
-**Production objective:** A complete, secure, exceptionally responsive, high-performance, multicore, multithreaded, preemptively multitasking, GUI-first, SDK-native, maintainable desktop operating system.
+**Licence and repository:** MIT OR Apache-2.0, developed in a public GitHub repository  
+**Production objective:** A complete, secure, exceptionally responsive, high-performance, multicore, multithreaded, preemptively multitasking, GUI-first, SDK-native, maintainable operating system, in a Desktop and a Server edition that share one kernel, one SDK and the full native desktop (ADR-0014).
 
 ### Native Origin OS formats
 
@@ -225,6 +226,12 @@ Preserve traceability to Git commits.
 Use automated provenance and license checks where practical.
 
 Never claim that automated similarity scanning can mathematically prove independent authorship.
+
+The repository is public, so outside contributions need the same traceability. Keep in it:
+
+- `CONTRIBUTING.md`: Developer Certificate of Origin sign-off, and a declaration that each contribution is original under §3.
+- `SECURITY.md`: how to report a vulnerability privately (§60).
+- `CODEOWNERS`: owners for the kernel and SDK interfaces (§78).
 
 ## 7. No artificial LOC targets
 
@@ -461,12 +468,16 @@ Initial reference baseline:
 - System V x86-64 psABI (pin the revision after verification).
 - FIPS 180-4, FIPS 202, FIPS 204 (with the NIST errata), FIPS 205 and NIST SP 800-208.
 - RFC 8032 (Ed25519), RFC 8949 (CBOR) and RFC 8878 (Zstandard).
+- IEEE 802.11-2024 with the 802.11be amendment (Wi-Fi 7). Re-verify when Wi-Fi work starts.
+- Bluetooth Core 6.2 or later. Re-verify when Bluetooth work starts.
 
 Target actual PCIe Gen 5/6 hardware initially.
 
 A published PCIe 7.x standard does not establish physical hardware support.
 
 Respect standards licensing, patent obligations and certification restrictions.
+
+Keep specifications whose terms forbid redistribution out of the repository. The repository is public.
 
 ## 18. Architecture Decision Records
 
@@ -515,6 +526,8 @@ Required:
 - Recovery boot support.
 
 The UEFI loader, kernel image and `.ose` user executable are distinct binary concepts.
+
+Secure Boot trust: by default, users and OEMs enroll Origin's keys. A first stage signed by Microsoft follows once an organisation exists that can hold that signature (ADR-0002 B7, Amendment 1).
 
 ## 20. Boot manager
 
@@ -612,6 +625,13 @@ Implement:
 - FPU/SIMD state management.
 
 Use hardware capability discovery, not processor marketing names.
+
+The kernel names the core generation from CPUID's vendor, family and model, using one table built from Intel's and AMD's documents. That table also holds errata. The kernel reports at boot whether the machine is in the declared scope (ADR-0009 Amendment 1):
+
+- AMD family 1Ah or higher is Zen 5 or newer.
+- Intel family 18 or higher, or a listed 2026 family-6 model, is a 2026 generation.
+
+It never refuses to boot on that basis, and instructions are still chosen from feature bits.
 
 ## 25. Kernel threading
 
@@ -756,6 +776,16 @@ Implement:
 
 Drivers must use a documented Origin Driver ABI.
 
+Programs reach every device technology through typed SDK interfaces in three layers (ADR-0015):
+
+- the device class;
+- everything the published standard defines;
+- vendor extras, only where the vendor documents them.
+
+Each device reports truthfully which features it supports. An unsupported feature returns "not supported", never a pretended success.
+
+Dangerous operations need rights of their own: firmware update, format, sanitize, device approval and radio transmit settings. Raw device access is a diagnostics right for administrators only. Radio host stacks and the USB4 connection manager run unprivileged.
+
 ## 32. PCIe and IOMMU
 
 Support:
@@ -839,6 +869,8 @@ Implement:
 
 Record USB-IF and Thunderbolt licensing/certification requirements.
 
+Thunderbolt 4/5 is part of the USB4 interface, not a separate SDK. Read Intel's Thunderbolt licence before its specification. Use the Thunderbolt name only after Intel certification (ADR-0015 D5).
+
 ## 36. GPU
 
 Implement a native graphics-driver architecture for selected Intel, AMD and NVIDIA devices.
@@ -858,6 +890,8 @@ Required capabilities include:
 - GPU reset and recovery.
 
 Begin with a validated display fallback and one supported GPU target.
+
+Support DisplayPort first. HDMI 2.1's high-rate (FRL) modes wait until their licensing allows an open implementation (ADR-0015 D7).
 
 Do not claim full acceleration without a functional native driver.
 
@@ -1030,6 +1064,8 @@ Plan a controlled route toward Rust standard-library platform support.
 
 Do not claim Rust `std` support before implementing the required OS services.
 
+Software written for other systems: Rust `std` comes first. A POSIX library over the SDK would need its own ADR at M6 (ADR-0014 S6). Linux APIs stay banned (§11).
+
 ## 45. `.oapp`
 
 Define:
@@ -1112,6 +1148,14 @@ The terminal may exist as an optional development tool. It is an ordinary SDK cl
 
 The only exceptions are ADR-0011 N12's closed list: code that implements the SDK's guarantees or runs where no SDK can exist yet.
 
+Origin Server is administered the same way, through the native GUI only (ADR-0014 S4):
+
+- on its own console;
+- from the native management app on another Origin machine, over an authenticated, encrypted connection;
+- in a remote desktop session, which must exist before the Server edition ships.
+
+Neither edition needs a terminal or a web page to administer.
+
 ## 49. Origin SDK
 
 Implement typed SDKs for:
@@ -1141,6 +1185,12 @@ Implement typed SDKs for:
 - Localization.
 - Compute.
 - Diagnostics.
+- Remote administration.
+- Service management.
+- Hardware health.
+- Remote desktop.
+
+The last four serve Origin Server first (ADR-0014 S7). Device technologies follow §31's three layers (ADR-0015).
 
 Support stable versioned APIs and a C-compatible ABI.
 
@@ -1261,6 +1311,13 @@ Implement:
 - VPN extension interfaces.
 
 Implement standards-based interoperability testing.
+
+A Wi-Fi or Bluetooth driver needs a legitimate source for its chip's programming interface (ADR-0015 D6):
+
+- vendor documentation that lets Origin publish source written from it; or
+- a clean-room process approved in an original-source-exception ADR (§3, §18).
+
+Never translate another operating system's driver. Host stacks may be built from the public specifications first. Before either radio ships, check Bluetooth SIG qualification and licensing and the radio regulations.
 
 ## 55. Audio
 
@@ -1675,8 +1732,9 @@ Test defined configurations covering:
 - Audio devices.
 - Sleep/resume.
 - Power interruptions.
+- Origin Server: a KVM guest first, then physical servers on 2026-generation platforms, through the server's BMC console (ADR-0014 S3).
 
-Do not claim physical hardware support from QEMU alone.
+Do not claim physical hardware support from QEMU alone. A virtual machine is a declared scope of its own, not hardware qualification.
 
 ## 75. Reproducibility
 
@@ -1713,6 +1771,9 @@ Require:
 - SDK compatibility checks.
 - Documentation.
 - Maintenance policy.
+- Before the first public release: a trademark search for the product name.
+
+Each edition is qualified for its own declared scope.
 
 No test count alone establishes production readiness.
 
@@ -1981,6 +2042,12 @@ Implement secure unified releases, atomic upgrades, recovery and rollback.
 
 Complete release security review, performance testing, reliability tests, physical hardware qualification, documentation and maintenance planning.
 
+**Origin Server** follows the same milestones (ADR-0014 S2):
+
+- Its GUI comes with M8.
+- Server-only work starts after M9: remote administration, remote desktop, service management and hardware health.
+- USB4, Thunderbolt, Wi-Fi and Bluetooth come at M10, on physical hardware (ADR-0015 D9).
+
 Milestones may overlap where architecture contracts permit safe parallel development.
 
 Do not mark a milestone complete without its exit tests.
@@ -2076,7 +2143,7 @@ Never fabricate test results or implementation status.
 9. Scheduling must be scalable and hardware-aware.
 10. Origin SDK must provide real native APIs.
 11. Origin UI must not depend on hidden CLI calls.
-12. Origin Desktop must provide genuine native interaction.
+12. Origin Desktop must provide genuine native interaction, in both editions.
 13. `.ose`, `.osl`, `.osi`, `.oapp` and `.od` must be implemented as actual validated ONBF formats.
 14. Hardware functionality must not be fabricated.
 15. Filesystem integrity and recovery are mandatory.

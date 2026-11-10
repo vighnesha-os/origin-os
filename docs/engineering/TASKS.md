@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Required by | CLAUDE.md §79 (persistent engineering memory) |
-| Updated | 2026-11-09 |
+| Updated | 2026-11-10 |
 | Rule | Status words mean what they say. "Done" means built, tested and committed; QEMU is not hardware (CLAUDE.md §74). |
 
 ## Done (branch `m0/toolchain-verification`)
@@ -79,12 +79,31 @@
 9. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks; **M1 follow-ups** (A/B deployment, boot-attempt recording).
 
 10. **The pre-merge review's open list:** the Framekernel's trusted base, speculation controls, CET, TCP's acceptance checks, the open IOMMU threats, NVMe reset, scheduling and allocator scaling (`docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md`, "Not fixed").
+
 11. **IOMMU after the Rev 3.11 check (2026-11-09; AMD-Vi ledger §7, "Found, not changed"):** clear Enable No Snoop in each attached function where a VT-d unit lacks snoop control; IVMD semantics and placement, with question 4's identity maps; whether the IVRS parser stops one IVHD's walk instead of refusing the table; a precedence for several entries naming one DeviceID; decoding a type 10h block's feature field. On the first AMD machine: record which address form an interrupt fault carries, and that the SMI filter the firmware set is still on after boot.
+12. **The public repository's files (decision item 79, CLAUDE.md §6):** `CONTRIBUTING.md` with DCO sign-off and an original-source declaration (§3), `SECURITY.md` for private vulnerability reports (§60), `CODEOWNERS` for the kernel and SDK interfaces (§78). Also: the README's status line still says "There is no kernel yet".
+13. **Research before M10 (ADR-0015 D5, D6), each recorded in `docs/research/`:**
+    - Intel's Thunderbolt licence terms, read before the specification;
+    - the Bluetooth SIG's membership, qualification and patent licence, and how they treat an open-source host stack;
+    - whether any Wi-Fi or Bluetooth chip maker publishes documentation Origin may use;
+    - radio regulatory duties (country setting, 5 GHz radar avoidance, 6 GHz);
+    - re-checking IEEE 802.11 and Bluetooth Core revisions (§16, §17).
+14. **Radio cryptography (§59, ADR-0015 D6), when Wi-Fi or Bluetooth work starts:** P-256, AES-CCM and AES-GCM, AES-CMAC and HMAC-based key derivation, each with known-answer and differential tests like the existing verifiers.
+15. **Origin Server (ADR-0014), after M9:** OIDL interfaces for remote administration, service management, hardware health and remote desktop (S7); the remote desktop ADR (S4); the release manifest's edition field (§84); an ADR-0009 amendment for 2026-generation server targets (S3).
+16. **The CPU identification table (ADR-0009 Amendment 1, items 88–89):**
+    - one table from vendor, family and model to core generation, built from Intel's SDM Volume 4 and AMD's processor references, and the home for errata keyed by family, model and stepping;
+    - the kernel's one-line scope report at boot, with no refusal;
+    - two QEMU boots that set `family=` and `model=`, one in scope and one outside it.
+
+    At M9, the owner decides whether the installer warns or refuses (item 90).
 
 ## Waiting on the owner
 
-Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
+Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
 
 | # | Decision | Blocks |
 |---|---|---|
 | — | The owner cannot buy machines for now. The steps that need the owner (sign-ups and small rentals) are in `docs/research/2026-11-09-testing-without-buying-hardware.md`; ADR-0009's choices (#2, then #5 once its serial option is confirmed, H5) stand for when that changes | The first physical boot (§74) |
+| 77 | A trademark search for the product name (vivo has shipped "OriginOS" worldwide since 2025-10-15) | The first public release (§76) |
+| 79 | Turn on GitHub's private vulnerability reporting (Settings → Security) | `SECURITY.md` being useful (§60) |
+| 78 | An organisation that can hold an EV certificate and pass Microsoft's annual audit | The Microsoft-signed first stage (ADR-0002 Amendment 1) |
