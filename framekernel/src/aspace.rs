@@ -13,7 +13,7 @@ use crate::console::Console;
 use crate::cpu::{self, CpuIndex, Probe};
 use crate::memory;
 use crate::paging::{Access, PAGE};
-use crate::process::{Ending, Limits, Process};
+use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, Process};
 use crate::sched;
 
 /// Where each proof program's code runs.
@@ -152,7 +152,7 @@ struct Subject {
 impl Subject {
     /// A process with `program` at [`CODE`], a stack, and the [`TALK`] page, not started yet.
     fn new(program: &[u8]) -> Option<Self> {
-        let mut process = Process::new(LIMITS, (CODE, CODE + PAGE))?;
+        let mut process = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)?;
         let code = process.map_page(CODE, Access::ReadExecute).ok()?;
         if !process.write_frame(code, 0, program) {
             return None;
