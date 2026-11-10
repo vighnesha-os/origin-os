@@ -220,7 +220,7 @@ enum Line<'a> {
     Section,
     /// `0000000000017000 <name>:`
     Function(&'a str),
-    /// `   17000:      	xor	ebp, ebp`, as the address and the instruction with single spaces.
+    /// `17000: xor ebp, ebp`, as the address and the instruction with single spaces.
     Instruction(&'a str, String),
     Other,
 }
