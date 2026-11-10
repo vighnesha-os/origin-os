@@ -142,6 +142,24 @@ fn read_later_when_told() -> Vec<u8> {
     p
 }
 
+/// Reads `address` once, so that its processor holds a translation for it, and then keeps off
+/// it: it waits, raising its count, until the kernel says go on, and reads `address` again. A
+/// fault at that read ends it. If the read succeeds, the page was still there for it: it
+/// reports the word and exits.
+fn read_again_when_told(address: u64) -> Vec<u8> {
+    let mut p = talk_and(address); // rbx: TALK, rdx: the page
+    p.extend_from_slice(&[0x48, 0x8B, 0x02]); // mov rax, [rdx]
+    // loop:
+    p.extend_from_slice(&[0x48, 0xFF, 0x03]); // inc qword ptr [rbx]
+    p.extend_from_slice(&[0x48, 0x8B, 0x43, GO as u8]); // mov rax, [rbx + GO]
+    p.extend_from_slice(&[0x48, 0x83, 0xF8, GO_ON as u8]); // cmp rax, GO_ON
+    p.extend_from_slice(&[0x75, 0xF3]); // jne loop
+    p.extend_from_slice(&[0x48, 0x8B, 0x3A]); // mov rdi, [rdx]
+    p.extend_from_slice(&[0xB8, 1, 0, 0, 0, 0x0F, 0x05]); // DEBUG_REPORT
+    p.extend_from_slice(&EXIT);
+    p
+}
+
 /// A process running one of the programs above, and what the kernel holds of it.
 struct Subject {
     process: ObjectRef<Process>,
@@ -389,12 +407,23 @@ fn map_under_a_running_thread(com1: &mut Console, far: CpuIndex, tsc_hz: u64) ->
     right
 }
 
-/// A range of pages goes at once, with a thread running on the last of them. Up to 128 pages
-/// is one round, and more than the 32 a shootdown can name one by one is a flush of the space's
-/// translations: this proof reaches both.
+/// A range of pages goes at once, under a thread whose processor holds a translation for the
+/// last of them. Up to 128 pages is one round, and more than the 32 a shootdown can name one
+/// by one is a flush of the space's translations: this proof reaches both.
+///
+/// The thread reads its page once and then keeps off it until the unmap has returned. So every
+/// round finds it running, the count of interrupts is exact, and the fault it takes when it is
+/// told to read again shows that the translation it held is gone.
+///
+/// It used to read its page in a loop throughout. With more than one round that made the count
+/// depend on timing: an earlier round's flush drops the thread's own translation, so once the
+/// last round had cleared the entries the thread could meet the missing one by itself, fault,
+/// and leave the space before that round asked. No processor then held the space, and the
+/// round interrupted none. CI's processors under KVM showed it on 2026-11-10 (`shootdowns: 2,
+/// interrupts: 1`), with the kernel doing nothing wrong.
 fn unmap_many(com1: &mut Console, pages: u64, far: CpuIndex, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let target = WIDE + (pages - 1) * PAGE;
-    let Some(subject) = Subject::new(&reader_at(target)) else {
+    let Some(subject) = Subject::new(&read_again_when_told(target)) else {
         return false;
     };
     for page in 0..pages {
@@ -410,6 +439,8 @@ fn unmap_many(com1: &mut Console, pages: u64, far: CpuIndex, bsp: CpuIndex, tsc_
         return false;
     }
     let cost = subject.memory.unmap(WIDE, pages);
+    // Only now does the thread touch its page again.
+    let told = subject.go_on();
     let faulted = subject.ending(tsc_hz)
         == Some(Ending::Faulted {
             vector: 14,
@@ -422,7 +453,7 @@ fn unmap_many(com1: &mut Console, pages: u64, far: CpuIndex, bsp: CpuIndex, tsc_
         shootdowns: rounds,
         interrupts: if far == bsp { 0 } else { rounds },
     };
-    let right = faulted && cost == Ok(expected);
+    let right = told && faulted && cost == Ok(expected);
     let _ = writeln!(
         com1,
         "origin-kernel: address spaces: {pages} pages unmapped at once under a running thread on {}: it faulted at its page among them: {faulted}; {cost:?}{}",
