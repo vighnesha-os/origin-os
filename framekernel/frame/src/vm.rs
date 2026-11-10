@@ -1,6 +1,6 @@
 //! The kernel's address space once it is live, behind a lock, so pages can be mapped or
-//! remapped later: firmware tables the kernel reads (ACPI), guard pages and the AP
-//! start-up trampoline.
+//! remapped later: firmware tables the kernel reads (ACPI), the kernel stacks in their region
+//! (`stack`, ADR-0004 Amendment 1, A2), guard pages and the AP start-up trampoline.
 //!
 //! Every change that removes access is followed by a TLB shootdown (`tlb`) once the lock is
 //! released, so no processor keeps the old translation; changes that only add access need
@@ -8,7 +8,9 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use origin_paging::layout::{DIRECT_MAP_WINDOW, DIRECT_MAP_WINDOW_SIZE};
+use origin_paging::layout::{
+    DIRECT_MAP_WINDOW, DIRECT_MAP_WINDOW_SIZE, STACK_REGION, STACK_REGION_SIZE,
+};
 use origin_paging::{
     Access, AddressSpace, Attributes, LARGE_PAGE, LeafCensus, LeafSizes, MapError, PAGE, TablePool,
     Translation, kernel_half_is_complete, same_kernel_half,
@@ -270,6 +272,76 @@ fn unmap_guards(pages: &[u64]) -> Result<(), MapError> {
         }
         Ok(())
     })
+}
+
+/// Whether the `pages` pages from `virt` lie in the kernel stacks' region.
+fn in_stack_region(virt: u64, pages: usize) -> bool {
+    let end = (pages as u64)
+        .checked_mul(PAGE)
+        .and_then(|bytes| virt.checked_add(bytes));
+    virt.is_multiple_of(PAGE)
+        && virt >= STACK_REGION
+        && end.is_some_and(|end| end <= STACK_REGION + STACK_REGION_SIZE)
+}
+
+/// Maps `frames` at consecutive pages from `virt` in the kernel stacks' region (`stack`):
+/// read/write, never executable, and global like the rest of the kernel half. Each frame it maps
+/// is taken out of `frames`: the tables hold it now. Returns how many it mapped, which is all of
+/// them unless the tables refused one; the region's tables are made at boot, so only a page
+/// that is mapped already can be. Outside the region nothing is mapped.
+///
+/// No shootdown: a page that was not present is in no TLB, since no processor caches a
+/// translation from an entry whose P flag is 0 (Intel SDM Vol. 3A §4.10.4.3).
+pub(crate) fn map_stack_pages(virt: u64, frames: &mut [Option<OwnedFrame>]) -> usize {
+    if !in_stack_region(virt, frames.len()) {
+        return 0;
+    }
+    crate::cpu::without_interrupts(|| {
+        let mut guard = KERNEL_SPACE.lock();
+        let Some(k) = guard.as_mut() else {
+            return 0;
+        };
+        let mut mapped = 0;
+        for (page, slot) in (0u64..).zip(frames.iter_mut()) {
+            let Some(frame) = slot.as_ref() else {
+                break;
+            };
+            let at = virt + page * PAGE;
+            let rw = Attributes::kernel_global(Access::ReadWrite);
+            if k.space
+                .map(&mut k.tables, at, frame.phys().raw(), rw)
+                .is_err()
+            {
+                break;
+            }
+            *slot = None;
+            mapped += 1;
+        }
+        mapped
+    })
+}
+
+/// Takes the stack-region pages from `virt` out of the kernel's tables, one for each entry of
+/// `out`, and puts there the frames they held (`None` where nothing was mapped). Their
+/// translations may still be cached: the caller shoots down before the addresses or the frames
+/// are used again (`origin_sync::slots::Slots::reclaim`). Outside the region nothing changes.
+pub(crate) fn unmap_stack_pages(virt: u64, out: &mut [Option<OwnedFrame>]) {
+    if !in_stack_region(virt, out.len()) {
+        return;
+    }
+    crate::cpu::without_interrupts(|| {
+        let mut guard = KERNEL_SPACE.lock();
+        let Some(k) = guard.as_mut() else {
+            return;
+        };
+        for (page, slot) in (0u64..).zip(out.iter_mut()) {
+            *slot = k
+                .space
+                .unmap(&mut k.tables, virt + page * PAGE)
+                .ok()
+                .map(|phys| OwnedFrame::from_mapping(PhysAddr::new(phys)));
+        }
+    });
 }
 
 /// Where a [`KernelProbe`] maps its page: PML4 entry 480, just above the MMIO window, which

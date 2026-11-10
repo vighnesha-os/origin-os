@@ -121,6 +121,13 @@ impl OwnedFrame {
     pub(crate) fn virt(&self) -> usize {
         crate::phys::to_virt(self.phys.raw()) as usize
     }
+
+    /// The frame a kernel mapping held, back from the page tables that held it: only for
+    /// `vm::unmap_stack_pages`, which has just taken the mapping, the frame's one owner, out of
+    /// the tables. Nothing else may make an `OwnedFrame` from an address.
+    pub(crate) const fn from_mapping(phys: PhysAddr) -> Self {
+        Self { phys }
+    }
 }
 
 /// One free 4 KiB frame, or `None`.

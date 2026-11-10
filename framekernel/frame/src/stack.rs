@@ -1,26 +1,73 @@
-//! Kernel thread stacks and FPU areas (CLAUDE.md §25, §28; ADR-0011 N6).
+//! Kernel stacks and FPU areas (CLAUDE.md §25, §28; ADR-0011 N6; ADR-0004 Amendment 1, A2).
 //!
-//! A [`GuardedStack`] is memory the framework owns: a guard page, unmapped so running off the
-//! end of the stack faults, and the usable bytes above it. Dropping one gives the memory back,
-//! except while a processor might still be running on it: the framework knows which stacks are
-//! in use because every kernel stack a processor runs on has its top in some processor's TSS
+//! # Where a stack lives
+//!
+//! Every [`GuardedStack`] is in the kernel stacks' region (`origin_paging::layout::STACK_REGION`,
+//! PML4 slot 384), in a slot of its own: [`SLOT`] bytes of address space with the stack's pages
+//! mapped at the top and the rest left unmapped. Running off the bottom of a stack faults on that
+//! unmapped space, which is no other stack's (a frame larger than a page is probed a page at a
+//! time, so none can step over it), and which costs no frame: nothing in the direct map is split
+//! or unmapped for it. The region's page tables are made at boot (`early`), so mapping a stack
+//! only fills in entries. The slots are `origin_sync::slots`; this module maps and unmaps them.
+//!
+//! # Giving a stack back
+//!
+//! Dropping a stack waits for nobody, so a stack may be dropped under any lock: it is kept mapped
+//! for the next stack of its size (up to [`IDLE`] of them), which gets it zeroed, or it is
+//! retired. A retired stack's pages leave the tables, and its frames and slot are reused, only in
+//! [`reclaim`], once a TLB shootdown has reached every processor. The scheduler reclaims where it
+//! reaps exited threads.
+//!
+//! A stack still in use is never given back: the framework knows which stacks are in use because
+//! every kernel stack a processor runs on has its top in some processor's TSS
 //! (`cpu::set_kernel_stack`) and every suspended thread has a saved frame on its stack that the
-//! trap entry recorded (`cpu::record_saved_frame`). A stack still in either is leaked rather than
-//! freed, which is the safe failure for a safe caller that drops one too early.
+//! trap entry recorded (`cpu::record_saved_frame`). A stack in either is leaked rather than freed,
+//! which is the safe failure for a safe caller that drops one too early.
 
 use alloc::alloc::{Layout, alloc, alloc_zeroed, dealloc};
 
+use origin_paging::PAGE;
 use origin_paging::layout::{STACK_REGION, STACK_REGION_SIZE};
+use origin_sync::slots::{Counts, Slots, Taken};
 
-use crate::cpu::{self, CpuIndex};
+use crate::cpu::{self, CpuIndex, without_interrupts};
 use crate::descriptors::{KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
+use crate::memory::{self, OwnedFrame};
 
-/// The guard page below every stack.
+/// A guarded page of the TLB proof ([`GuardablePage`]).
 const GUARD: usize = 4096;
 
-/// The address space each stack has in the kernel stacks' region (ADR-0004 Amendment 1, A2):
-/// the stack at its top, unmapped space below.
+/// The address space each stack has: the stack at its top, unmapped space below.
 pub const SLOT: u64 = 128 * 1024;
+/// Stacks the region holds at once: 32 for each processor the kernel indexes.
+const SLOTS: usize = 32 * crate::limits::MAX_CPUS;
+/// Freed stacks kept mapped for the next stack of their size.
+pub const IDLE: usize = 16;
+/// The largest stack: half its slot, so that at least as much unmapped space lies below it.
+pub const MAX_STACK: usize = (SLOT / 2) as usize;
+/// The pages of the largest stack.
+const MAX_PAGES: usize = MAX_STACK / PAGE as usize;
+const _: () = assert!(
+    SLOT * SLOTS as u64 == STACK_REGION_SIZE,
+    "the slots fill the region the kernel made tables for"
+);
+const _: () = assert!(
+    MAX_PAGES as u64 <= origin_sync::shootdown::MAX_LISTED_PAGES,
+    "a stack's shootdown names its pages"
+);
+
+/// The region's slots.
+static REGION: Slots<SLOTS, IDLE> = Slots::new();
+
+/// The first address of slot `slot`.
+const fn slot_base(slot: usize) -> u64 {
+    STACK_REGION + slot as u64 * SLOT
+}
+
+/// The lowest of the top `pages` pages of slot `slot`: where a stack of that many pages starts.
+const fn stack_low(slot: usize, pages: u32) -> u64 {
+    slot_base(slot) + SLOT - pages as u64 * PAGE
+}
 
 /// The top of the slot holding `addr`, if `addr` is in the stack region: past it lies the next
 /// slot's unmapped space. For the backtrace (`cpu::capture_backtrace`).
@@ -31,54 +78,62 @@ pub const fn slot_top(addr: u64) -> Option<u64> {
     Some(addr - (addr - STACK_REGION) % SLOT + SLOT)
 }
 
-/// A kernel stack with an unmapped guard page below it. Owned; freed on drop.
+/// A kernel stack in the stack region, with unmapped space below it. Owned; given back on drop.
 #[derive(Debug)]
 pub struct GuardedStack {
-    /// The guard page's address (the allocation's start), never 0.
-    guard: usize,
-    /// The usable bytes above the guard page.
+    /// Its slot in the stack region.
+    slot: usize,
+    /// The usable bytes: whole pages, at the top of the slot.
     bytes: usize,
     /// The first frame built on this stack, not yet published to a processor.
     first_frame: Option<u64>,
 }
 
 impl GuardedStack {
-    /// A zeroed stack of `bytes` usable bytes, or `None` if there is no memory or the guard
-    /// page could not be made.
+    /// A zeroed stack of `bytes` usable bytes, rounded up to whole pages, or `None` if `bytes` is
+    /// 0 or more than [`MAX_STACK`], every slot is taken, or there are no frames for it. Waits for
+    /// no other processor.
     pub fn new(bytes: usize) -> Option<Self> {
-        let layout = Layout::from_size_align(bytes.checked_add(GUARD)?, GUARD).ok()?;
-        // SAFETY: `layout` has a non-zero size; the allocation is freed in `Drop`.
-        let base = unsafe { alloc_zeroed(layout) };
-        if base.is_null() {
+        if bytes == 0 || bytes > MAX_STACK {
             return None;
         }
-        let guard = base.expose_provenance();
-        if crate::vm::make_guard(guard as u64).is_err() {
-            // SAFETY: `base` is the allocation made just above with this layout, nothing else
-            // refers to it, and a failed `make_guard` left its first page mapped.
-            unsafe { dealloc(base, layout) };
+        let bytes = bytes.next_multiple_of(PAGE as usize);
+        let pages = u32::try_from(bytes / PAGE as usize).ok()?;
+        let Taken { slot, mapped } = without_interrupts(|| REGION.take(pages))?;
+        if !mapped && !map_fresh(slot, pages) {
             return None;
         }
-        Some(Self {
-            guard,
+        let mut stack = Self {
+            slot,
             bytes,
             first_frame: None,
-        })
+        };
+        if mapped {
+            // A stack kept for reuse: as its last holder left it.
+            stack.bytes_mut().fill(0);
+        }
+        Some(stack)
     }
 
-    /// The guard page's address.
+    /// The page just below the stack: the first an overflow reaches, unmapped like the rest of
+    /// the slot below it.
     pub const fn guard_addr(&self) -> u64 {
-        self.guard as u64
+        self.top() - self.bytes as u64 - PAGE
     }
 
-    /// The usable bytes (above the guard page).
+    /// The first address of the stack's slot: the bottom of the unmapped space below it.
+    pub const fn slot_base(&self) -> u64 {
+        slot_base(self.slot)
+    }
+
+    /// The usable bytes.
     pub const fn bytes(&self) -> usize {
         self.bytes
     }
 
-    /// The first address past the stack, 16-byte aligned.
+    /// The first address past the stack, 16-byte aligned: the top of its slot.
     pub const fn top(&self) -> u64 {
-        ((self.guard + GUARD + self.bytes) & !0xF) as u64
+        slot_base(self.slot) + SLOT
     }
 
     /// Writes a new thread's first frame on this stack, starting at `start` with every other
@@ -116,7 +171,7 @@ impl GuardedStack {
         }
         // The thread starts with RSP = top - 8 holding a zero return address, as if its
         // entry had been called (System V: RSP + 8 is 16-byte aligned there); the word at
-        // the top stays zero because `alloc_zeroed` made the whole stack zero.
+        // the top stays zero because the stack was zeroed when it was made.
         let offset = usize::try_from(frame_at - base).ok()?;
         let dest = self.bytes_mut();
         for (i, word) in frame.iter().enumerate() {
@@ -141,37 +196,119 @@ impl GuardedStack {
     /// The stack's memory: the running thread's stack, or one being built. Only the framework
     /// hands it out, so nothing else runs on these bytes while the holder writes them.
     fn bytes_mut(&mut self) -> &mut [u8] {
-        let start = (self.guard + GUARD) as *mut u8;
-        // SAFETY: `[guard + GUARD, guard + GUARD + bytes)` is mapped (only the guard page is
-        // not) and owned by this stack, and `&mut self` means nothing else uses it: the
-        // thread that will run on it has not been started (or has ended).
+        let start =
+            core::ptr::with_exposed_provenance_mut::<u8>((self.top() - self.bytes as u64) as usize);
+        // SAFETY: `[top - bytes, top)` is this stack's pages, mapped read/write in the stack region
+        // for as long as the stack is held (`new` mapped them, or took them mapped, and only `Drop`
+        // gives them back), and `&mut self` means nothing else uses them: the thread that will run
+        // on the stack has not been started (or has ended).
         unsafe { core::slice::from_raw_parts_mut(start, self.bytes) }
-    }
-
-    fn layout(&self) -> Option<Layout> {
-        Layout::from_size_align(self.bytes.checked_add(GUARD)?, GUARD).ok()
     }
 }
 
 impl Drop for GuardedStack {
     fn drop(&mut self) {
-        let start = self.guard as u64;
-        let end = start.saturating_add((self.bytes + GUARD) as u64);
-        let Some(layout) = self.layout() else {
-            return;
-        };
-        // Leak rather than free memory a processor could still run on (see the module docs).
-        if crate::cpu::stack_in_use(start, end, self.top()) {
+        let top = self.top();
+        // Leak rather than give back memory a processor could still run on (see the module docs).
+        if cpu::stack_in_use(top - self.bytes as u64, top, top) {
+            without_interrupts(|| REGION.leak(self.slot));
             return;
         }
-        // The guard must be mapped again before its frame returns to the heap.
-        if crate::vm::unguard(start).is_err() {
-            return; // leak rather than free memory that is not mapped
-        }
-        // SAFETY: `guard` is the start of the allocation made in `new` with this layout, the
-        // guard page is mapped again, and nothing uses this memory any more (just checked).
-        unsafe { dealloc(core::ptr::with_exposed_provenance_mut(self.guard), layout) };
+        // Kept mapped or retired: either way nothing is unmapped here, so this waits for nobody.
+        without_interrupts(|| REGION.give_back(self.slot, true));
     }
+}
+
+/// Maps `pages` fresh zeroed frames at the top of slot `slot`, which [`Slots::take`] has just
+/// handed out with nothing mapped. On failure the slot goes back: abandoned if nothing was mapped
+/// in it, retired for a reclaim if something was. Returns whether every page is mapped.
+fn map_fresh(slot: usize, pages: u32) -> bool {
+    let mut frames: [Option<OwnedFrame>; MAX_PAGES] = [const { None }; MAX_PAGES];
+    let mut mapped = 0;
+    if let Some(wanted) = frames.get_mut(..pages as usize) {
+        for frame in wanted.iter_mut() {
+            *frame = memory::zeroed_frame();
+        }
+        if wanted.iter().all(Option::is_some) {
+            mapped = crate::vm::map_stack_pages(stack_low(slot, pages), wanted);
+        }
+        if mapped == wanted.len() {
+            return true;
+        }
+    }
+    // What was not mapped goes back now; what was is the slot's, for its reclaim.
+    for frame in frames.into_iter().flatten() {
+        let _ = memory::free_frame(frame);
+    }
+    without_interrupts(|| {
+        if mapped == 0 {
+            REGION.abandon(slot);
+        } else {
+            REGION.give_back(slot, false);
+        }
+    });
+    false
+}
+
+/// What [`reclaim`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reclaimed {
+    /// Retired stacks whose pages left the tables, each with a shootdown, and whose frames and
+    /// slots are free again.
+    pub stacks: u32,
+    /// The interrupts those shootdowns sent to other processors.
+    pub interrupts: u32,
+    /// Retired stacks whose shootdown stalled: their slots and frames are never reused.
+    pub lost: u32,
+}
+
+/// Gives back what every retired stack holds: its pages leave the kernel's tables, a shootdown
+/// drops their translations from every processor, and only then are its frames and its slot
+/// free. It waits for every processor, so never call it under a lock another processor may wait
+/// for with interrupts off: the scheduler calls it where it reaps exited threads. With no stack
+/// retired it takes no lock.
+pub fn reclaim() -> Reclaimed {
+    let mut done = Reclaimed::default();
+    loop {
+        let outcome = without_interrupts(|| {
+            REGION.reclaim(
+                |slot, pages| {
+                    let mut frames: [Option<OwnedFrame>; MAX_PAGES] = [const { None }; MAX_PAGES];
+                    if let Some(taken) = frames.get_mut(..pages as usize) {
+                        crate::vm::unmap_stack_pages(stack_low(slot, pages), taken);
+                    }
+                    frames
+                },
+                |slot, pages| {
+                    crate::tlb::shootdown_kernel_pages(stack_low(slot, pages), u64::from(pages))
+                },
+                |frames| {
+                    for frame in frames.into_iter().flatten() {
+                        let _ = memory::free_frame(frame);
+                    }
+                },
+            )
+        });
+        match outcome {
+            None => return done,
+            Some(Ok(completed)) => {
+                done.stacks += 1;
+                done.interrupts += completed.processors;
+            }
+            Some(Err(_)) => done.lost += 1,
+        }
+    }
+}
+
+/// Retires every freed stack that is kept mapped for reuse, so that the next [`reclaim`] gives
+/// back what they hold; returns how many. For a check that nothing is left over.
+pub fn trim() -> usize {
+    without_interrupts(|| REGION.trim())
+}
+
+/// How many stacks are held, kept for reuse, retired or lost, and the pages they map.
+pub fn counts() -> Counts {
+    without_interrupts(|| REGION.counts())
 }
 
 /// Words in a saved frame: 15 registers, vector, error code, RIP, CS, RFLAGS, RSP, SS.

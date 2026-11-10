@@ -158,7 +158,17 @@ static ZOMBIES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// Frees the stacks of threads that exited on **this** processor. Only this processor may
 /// do it, and only from thread context: by then its exit handler, which ran on the dead
 /// stack, has certainly switched away. Returns how many stacks were freed.
+///
+/// Then it gives back what retired stacks hold (`stack::reclaim`): here, with no lock held, as
+/// the shootdown that must come first waits for every processor (ADR-0004 Amendment 1, A2).
 pub(crate) fn reap() -> usize {
+    let freed = reap_zombies();
+    origin_frame::stack::reclaim();
+    freed
+}
+
+/// [`reap`]'s own processor's exited threads.
+fn reap_zombies() -> usize {
     let Some(threads) = THREADS.get(this_cpu()) else {
         return 0;
     };

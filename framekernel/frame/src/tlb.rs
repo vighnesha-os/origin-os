@@ -225,3 +225,20 @@ pub fn shootdown(addr: u64) -> u64 {
 pub fn shootdown_all() -> u64 {
     finished(SHOOTDOWN.shoot(&Hardware, Request::Everything, Scope::Kernel))
 }
+
+/// Drops the translations of the `pages` pages from `base` on every online processor, after the
+/// caller took them out of the kernel's tables; more than `MAX_LISTED_PAGES` pages flush every
+/// translation. A stall is returned rather than stopping the kernel: the stack region's caller
+/// (`stack`, through `origin_sync::slots`) then never reuses the pages or what they held.
+pub(crate) fn shootdown_kernel_pages(base: u64, pages: u64) -> Result<Completed, Stalled> {
+    let request = if (1..=origin_sync::shootdown::MAX_LISTED_PAGES).contains(&pages) {
+        Request::Pages { base, pages }
+    } else {
+        Request::Everything
+    };
+    let outcome = SHOOTDOWN.shoot(&Hardware, request, Scope::Kernel);
+    if let Ok(done) = outcome {
+        LAST_CYCLES.store(done.ticks, Ordering::Relaxed);
+    }
+    outcome
+}
