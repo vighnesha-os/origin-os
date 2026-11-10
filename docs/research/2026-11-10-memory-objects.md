@@ -29,7 +29,7 @@ Backing notes for task S3-5b (CLAUDE.md §16): `memory_object_create`, `memory_m
 
 ## What this means for Origin
 
-1. **The interface** (`origin.kernel` 0.5, `user-abi` 0.5): four calls, numbers 11 to 14; `map_access` bits (`read`, `write`, `execute`); `map_flags` bits (`fixed`); a sized `map_request` (`access`, `flags`, `offset`, `length`, `address`), as C8 says; C6's rights for a memory object as a constant. How `memory_object_create` takes options is asked of the coordinating session: OIDL refuses a `bits` with no members, and v1 has no option; a sized request that grows by P4's `size` is the recommendation.
+1. **The interface** (`origin.kernel` 0.5, `user-abi` 0.5): four calls, numbers 11 to 14; `map_access` bits (`read`, `write`, `execute`); `map_flags` bits (`fixed`); a sized `map_request` (`access`, `flags`, `offset`, `length`, `address`), as C8 says; C6's rights for a memory object as a constant. Every shape C6–C8 do not fix is the owner's (CLAUDE.md §84): see "Shapes for the owner" below.
 2. **Rights.** A new object's handle has C6's rights: read, write, map, duplicate and transfer. Every map, unmap and protect names a process and needs `write` on that handle, the caller's own included (C6). A map needs `map` on the object, `read` for any mapping and `write` for a writable one. `execute` is refused with `access_denied`, since an anonymous object never has it; write and execute together, or a mapping without read, with `invalid_args`.
 3. **Placement.** Without `fixed`, at a random page of the user half's upper part from RDSEED or RDRAND, as `launch::place` does, clear of every mapping; without entropy the map fails with `not_supported`. With `fixed`, at a page-aligned address in the user half, refused with `invalid_args` if any page of the range is mapped: it never replaces.
 4. **Whole mappings.** Unmap and protect take an address and a length and act only on exactly one whole mapping; anything else is `invalid_args`. A later minor can allow parts without a new method. Protect only reduces: an increase is `access_denied`.
@@ -38,6 +38,16 @@ Backing notes for task S3-5b (CLAUDE.md §16): `memory_object_create`, `memory_m
 7. **A stalled shootdown** makes the change and leaks the frames (S3-5a). The call reports `timed_out`, so the caller learns of it (T3).
 8. **Sharing** only by passing the handle, whose rights only shrink (P2). A mapping keeps its object, as Zircon's does, so closing a handle never unmaps.
 9. **Concurrency.** The new state is a process's list of mappings and its budget, under one spin lock, and the account's committed bytes, with the account's existing `try_update`. No new lock-free code, so no new Loom model; an object's life is `ObjectRef`'s, already modelled.
+
+## Shapes for the owner (asked 2026-11-10)
+
+C6–C8 leave these shapes open. They went to the owner as one list, each with its recommendation and the alternatives rejected; the answers are recorded in ADR-0005 and the decision sheet. No system-call code or lock change is committed before them.
+
+1. **Creation calls take their arguments in a sized request,** so a later minor can add an option by P4's own mechanism: `memory_object_create(request: object_request)`, `object_request { length }`. OIDL refuses an empty `bits` and an empty struct, so S3-6's `event_create` and `port_create`, which take nothing yet, keep no parameters until they have one; the rule binds from major 1. Rejected: an options `u32` that must be 0; a `bits` with a member v1 refuses; the length alone.
+2. **`map_request`** is `{access, flags, offset, length, address}`, 40 bytes; bytes in whole pages, never rounded; `map_access` (`read`, `write`, `execute`; read required, never write with execute, execute refused) and `map_flags` (`fixed`). Rejected: access as `rights`; read implied; placement as an enum; page counts; rounding up.
+3. **`memory_unmap(process, address, length)` and `memory_protect(process, address, length, access)`,** exactly one whole mapping in v1, the length there so a later minor can allow part of one. Rejected: naming a mapping by its base alone; a region object (none in P3); `not_found` for no mapping.
+4. **Quotas and the budget** come from the creator's `Limits`: committed bytes (held by handles and mappings), whole mappings, and a rate for unmap and protect. `limit` past a quota, `no_memory` without frames, `should_wait` for a change the budget cannot pay now. Rejected: charging the mapping process; counting pages; `no_memory` for a quota; `limit` for the budget; blocking until it refills.
+5. **The rest:** `write` on the caller's own process handle too; `invalid_args` for a fixed address over a mapping, an ended process and any range that is not one mapping; `access_denied` for execute; `timed_out` for a stalled shootdown; the order of the checks; page alignment within `[0x1000, 0x7FFF_FFFF_F000)`; random placement in `[0x1000_0000_0000, 0x7000_0000_0000)`; a mapping holding its object; the constants `memory_object_rights` and `page_size`; `user-abi` 0.4 to 0.5 in one step.
 
 ## Tests defined before the code (§16 step 12)
 
