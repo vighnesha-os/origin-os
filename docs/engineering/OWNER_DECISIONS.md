@@ -334,6 +334,11 @@ Finding 19's smaller points were not put as decisions. They stay in the review a
 
 The work these create is in `TASKS.md`, items 17 to 30.
 
+**Two later answers changed this revision's wording, on the same day.** You accepted the six questions of ADR-0016, the kernel's random-number generator, as items 146 to 151. They are recorded with that ADR, which is on the generator's branch until it lands. Two of them are in draft 7.4:
+
+- item 149: §59 says the health tests are on what each source returns, catch gross failure only, and claim no SP 800-90B conformance;
+- item 151: §17 names SP 800-90A Rev. 1, SP 800-90B (January 2018), SP 800-90C (September 2025) and FIPS 198-1.
+
 **Yours to do:**
 
 - Read revision 7.4's wording and say whether the records pull request may merge (item 106). CLAUDE.md is your text, and merging takes your word.
