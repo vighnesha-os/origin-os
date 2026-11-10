@@ -231,3 +231,11 @@ Task S3-5b (memory objects) needs five interface decisions that C6–C8 (items 6
 | 103, answered | D3: `memory_unmap` and `memory_protect` name the process, the mapping's start and its length; in v1 exactly one whole mapping; protect only reduces access? | **Accept** |
 | 104, answered | D4: quotas set by the creator: committed bytes, mappings, and a rate for unmap and protect; `limit` past a quota, `no_memory` without frames, `should_wait` past the rate with nothing changed? | **Accept** |
 | 105, answered | D5: the rest: `write` on the process handle for every call, the caller's own included; existing statuses only, in a fixed order; ADR-0004 H1's addresses and the start records' random region; a mapping holds its object; two new constants; `user-abi` 0.5 in one step? | **Accept** |
+
+## S3-5b: the status when a map runs out (Accepted 2026-11-10)
+
+The review of S3-5b found that `memory_map` returns `limit` for three causes that D4 (item 104) does not tell apart (`REVIEW_S3-5B_2026-11-10.md`, finding C). What a status means is an ABI decision, so it is the owner's (CLAUDE.md §84). The session that built S3-5b put it to the owner in its own session, with three recommendations about the order of work, and the owner answered **"Accept all"** there on 2026-11-10. That session relayed the answer; the coordinating session read that session's record of it, then numbered and recorded the decision here. It is a note on D4 in ADR-0005 Amendment 5. Not built yet. Items 106–123 are in use on the unmerged `docs/design-review-2026-11-10` branch, and items 124–141 on the unmerged `claude/intelligent-dhawan-a7f6d4` branch (ADR-0017).
+
+| # | Question | Answer |
+|---|---|---|
+| 142, answered | When a map runs out: `limit` when the address space's 32 page-table frames are used up, and `no_memory` when the machine has no free frame or the kernel heap cannot grow? `memory_map` already declares both, so `user-abi` stays 0.5. | **Accept** |
