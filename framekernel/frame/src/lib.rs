@@ -48,6 +48,7 @@ pub mod nospec;
 pub mod objref;
 pub mod once;
 pub mod pci;
+pub mod speculation;
 pub mod topology;
 pub mod trap;
 pub mod unwind;
