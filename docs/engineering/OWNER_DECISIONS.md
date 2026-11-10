@@ -343,7 +343,7 @@ The work these create is in `TASKS.md`, items 17 to 30.
 
 ## The kernel's random-number generator (ADR-0016): Accepted 2026-11-10, the mechanism built, nothing in the kernel
 
-Decision item 113 accepted one generator in outline. [ADR-0016](../adr/ADR-0016-kernel-random-numbers.md) filled the outline in and ended with seven questions, each with a recommended answer checked against CLAUDE.md 7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C. The seventh, a download, is item 145 above. You answered **"Accept all"** to the other six on 2026-11-10, in the session that wrote the ADR.
+Decision item 113 accepted one generator in outline. [ADR-0016](../adr/ADR-0016-kernel-random-numbers.md) filled the outline in and ended with seven questions, each with a recommended answer checked against CLAUDE.md 7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C. The seventh, a download, is item 145 above. You answered **"Accept all"** to the other six on 2026-11-10, in the session that wrote the ADR. The coordinating session put the same six to you the same day, in shorter words, and records the same answer (its commit `44de977`).
 
 Three of them change something you had already accepted. The ADR said so before you answered:
 
