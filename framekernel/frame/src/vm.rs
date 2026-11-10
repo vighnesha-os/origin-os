@@ -8,8 +8,9 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use origin_paging::layout::{DIRECT_MAP_WINDOW, DIRECT_MAP_WINDOW_SIZE};
 use origin_paging::{
-    Access, AddressSpace, Attributes, LARGE_PAGE, LeafCensus, MapError, PAGE, TablePool,
+    Access, AddressSpace, Attributes, LARGE_PAGE, LeafCensus, LeafSizes, MapError, PAGE, TablePool,
     Translation, kernel_half_is_complete, same_kernel_half,
 };
 
@@ -95,6 +96,32 @@ pub fn kernel_half() -> Option<&'static [u64; 256]> {
     KERNEL_HALF.get()
 }
 
+/// The direct map's leaves by size when the kernel's tables went live (`install`).
+static DIRECT_MAP_AT_BOOT: SetOnce<LeafSizes> = SetOnce::new();
+
+/// The leaves in the direct-map window of these tables, by size.
+fn direct_map_sizes(space: &AddressSpace, tables: &TablePool<'_>) -> LeafSizes {
+    space.leaf_sizes(
+        tables,
+        DIRECT_MAP_WINDOW,
+        DIRECT_MAP_WINDOW + DIRECT_MAP_WINDOW_SIZE,
+    )
+}
+
+/// The direct map's leaves by size, now and when the kernel's tables went live: the direct
+/// map's page sizes (ADR-0004 Amendment 1, A2). Firmware tables mapped since (`firmware_bytes`)
+/// add 4 KiB leaves of their own; only a split takes a 2 MiB leaf away. `None` before
+/// `install`. Walks every table of the window, with interrupts off: for proofs.
+pub fn direct_map_leaves() -> Option<(LeafSizes, LeafSizes)> {
+    let boot = *DIRECT_MAP_AT_BOOT.get()?;
+    let now = crate::cpu::without_interrupts(|| {
+        let guard = KERNEL_SPACE.lock();
+        let k = guard.as_ref()?;
+        Some(direct_map_sizes(&k.space, &k.tables))
+    })?;
+    Some((now, boot))
+}
+
 /// Whether the kernel's own tables still have the entries [`kernel_half`] gave everyone.
 pub fn kernel_half_unchanged() -> bool {
     let Some(fixed) = kernel_half() else {
@@ -126,6 +153,8 @@ pub unsafe fn install(
         // Only this call sets it, and `early` makes it once.
         let _ = KERNEL_HALF.set(half);
     }
+    // As above: set once, before anything can split a page.
+    let _ = DIRECT_MAP_AT_BOOT.set(direct_map_sizes(&space, &tables));
     crate::cpu::without_interrupts(|| {
         *KERNEL_SPACE.lock() = Some(KernelSpace {
             space,

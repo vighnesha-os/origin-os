@@ -1341,6 +1341,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(address_space_markers(cpus))
         .chain(identity_markers())
         .chain(launch_markers())
+        .chain(stack_markers())
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
@@ -1792,6 +1793,16 @@ fn address_space_markers(cpus: u32) -> Vec<String> {
         ),
         " us each (QEMU, no budget)".into(),
         "origin-kernel: address spaces: every process and frame of these proofs is gone: ".into(),
+    ]
+}
+
+/// ADR-0004 Amendment 1, A2: the kernel stacks' region, each of its boot lines.
+fn stack_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: kernel stacks: the direct map has ".into(),
+        " when the kernel's tables went live".into(),
+        "origin-kernel: kernel stacks: 64 stacks of 16384 bytes made and freed: all made true; making one took ".into(),
+        " (QEMU, no budget)".into(),
     ]
 }
 

@@ -186,6 +186,8 @@ mod process;
 #[cfg(target_os = "none")]
 mod sched;
 #[cfg(target_os = "none")]
+mod stacks;
+#[cfg(target_os = "none")]
 mod storage;
 #[cfg(target_os = "none")]
 mod syscall;
