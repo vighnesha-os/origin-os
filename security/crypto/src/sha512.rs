@@ -4,6 +4,7 @@ use core::fmt;
 
 use crate::block::BlockBuffer;
 use crate::constants::{H512, K512};
+use crate::wipe::wipe_words;
 
 /// Streaming SHA-512.
 #[derive(Clone)]
@@ -68,6 +69,39 @@ impl Sha512 {
         h.update(data);
         h.finalize()
     }
+
+    /// [`Self::update`] for a hasher whose input or chaining value is secret, as HMAC's is from
+    /// its first block on: each block's message schedule is overwritten once the block is
+    /// compressed (see [`compress_secret`]).
+    pub(crate) fn update_secret(&mut self, data: &[u8]) {
+        self.bytes = self.bytes.wrapping_add(data.len() as u128);
+        let state = &mut self.state;
+        self.buffer
+            .update(data, |block| compress_secret(state, block));
+    }
+
+    /// [`Self::finalize`] for a hasher that [`Self::update_secret`] fed: pads the message,
+    /// writes the digest to `out`, and overwrites the hasher. It works in place, where
+    /// `finalize` moves the state and the buffer and would leave those copies behind.
+    pub(crate) fn finalize_secret(&mut self, out: &mut [u8; 64]) {
+        let bits = self.bytes.wrapping_mul(8);
+        let state = &mut self.state;
+        self.buffer
+            .finish_in_place(bits.to_be_bytes(), |block| compress_secret(state, block));
+        for (dst, word) in out.as_chunks_mut::<8>().0.iter_mut().zip(self.state.iter()) {
+            *dst = word.to_be_bytes();
+        }
+        self.wipe();
+    }
+
+    /// Overwrites the chaining value and the buffered input, and leaves a hasher that has
+    /// absorbed nothing (see [`crate::wipe`] for what the overwrite guarantees).
+    pub(crate) fn wipe(&mut self) {
+        wipe_words(&mut self.state);
+        self.buffer.wipe();
+        self.state = H512;
+        self.bytes = 0;
+    }
 }
 
 // FIPS 180-4 §4.1.3.
@@ -99,19 +133,46 @@ fn w_at(w: &[u64; 16], i: usize) -> u64 {
 /// SHA-256 over 80 rounds.
 fn compress(state: &mut [u64; 8], block: &[u8; 128]) {
     let mut w = [0u64; 16];
+    rounds(state, block, &mut w);
+}
+
+/// [`compress`] for a block or a chaining value that is secret. The schedule ring is
+/// overwritten afterwards: the schedule's recurrence runs backwards as well as forwards, so
+/// the ring's last sixteen words give back the whole block, which for HMAC's first block is
+/// the key.
+///
+/// The rounds run out of line here, so that the ring this function overwrites is the memory
+/// they used and not a copy of words the optimizer kept somewhere else. The eight working
+/// variables stay the compiler's to place: `crate::wipe` says what that leaves to the caller.
+fn compress_secret(state: &mut [u64; 8], block: &[u8; 128]) {
+    let mut w = [0u64; 16];
+    rounds_out_of_line(state, block, &mut w);
+    wipe_words(&mut w);
+}
+
+/// [`rounds`] as a function of its own, for [`compress_secret`].
+#[inline(never)]
+fn rounds_out_of_line(state: &mut [u64; 8], block: &[u8; 128], w: &mut [u64; 16]) {
+    rounds(state, block, w);
+}
+
+/// The 80 rounds of §6.4.2 on the caller's schedule ring `w`, which is left holding the last
+/// sixteen schedule words.
+#[inline(always)]
+fn rounds(state: &mut [u64; 8], block: &[u8; 128], w: &mut [u64; 16]) {
     for (word, bytes) in w.iter_mut().zip(block.as_chunks::<8>().0) {
         *word = u64::from_be_bytes(*bytes);
     }
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
     for (t, &k) in K512.iter().enumerate() {
         let wt = if t < 16 {
-            w_at(&w, t)
+            w_at(w, t)
         } else {
             // W[t] = σ1(W[t-2]) + W[t-7] + σ0(W[t-15]) + W[t-16]
-            let next = small_sigma1(w_at(&w, t.wrapping_add(14)))
-                .wrapping_add(w_at(&w, t.wrapping_add(9)))
-                .wrapping_add(small_sigma0(w_at(&w, t.wrapping_add(1))))
-                .wrapping_add(w_at(&w, t));
+            let next = small_sigma1(w_at(w, t.wrapping_add(14)))
+                .wrapping_add(w_at(w, t.wrapping_add(9)))
+                .wrapping_add(small_sigma0(w_at(w, t.wrapping_add(1))))
+                .wrapping_add(w_at(w, t));
             if let Some(slot) = w.get_mut(t & 15) {
                 *slot = next;
             }

@@ -44,13 +44,16 @@
 mod block;
 mod constants;
 mod ed25519;
+mod hmac;
 mod keccak;
 mod mldsa;
 mod sha256;
 mod sha3;
 mod sha512;
+mod wipe;
 
 pub use ed25519::{Ed25519Error, verify as ed25519_verify};
+pub use hmac::HmacSha512;
 pub use mldsa::{
     MLDSA65_PUBLIC_KEY_BYTES, MLDSA65_SIGNATURE_BYTES, MLDSA87_PUBLIC_KEY_BYTES,
     MLDSA87_SIGNATURE_BYTES, MlDsaError, mldsa65_verify, mldsa87_verify,
@@ -63,6 +66,8 @@ pub use sha512::Sha512;
 mod tests;
 #[cfg(test)]
 mod tests_ed25519;
+#[cfg(test)]
+mod tests_hmac;
 #[cfg(test)]
 mod tests_mldsa;
 #[cfg(test)]

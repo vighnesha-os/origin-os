@@ -63,6 +63,17 @@ impl<const B: usize> BlockBuffer<B> {
     pub(crate) fn finish<const L: usize>(
         mut self,
         length_be: [u8; L],
+        compress: impl FnMut(&[u8; B]),
+    ) {
+        self.finish_in_place(length_be, compress);
+    }
+
+    /// [`Self::finish`] without moving the buffer, for a caller that hashes secret material and
+    /// overwrites the buffer afterwards with [`Self::wipe`]: a move would leave a second copy
+    /// behind. The buffer is left holding the last padded block.
+    pub(crate) fn finish_in_place<const L: usize>(
+        &mut self,
+        length_be: [u8; L],
         mut compress: impl FnMut(&[u8; B]),
     ) {
         let length_at = B.saturating_sub(L);
@@ -81,6 +92,12 @@ impl<const B: usize> BlockBuffer<B> {
             tail.copy_from_slice(&length_be);
         }
         compress(&self.buf);
+    }
+
+    /// Overwrites the buffered bytes and empties the buffer (see [`crate::wipe`]).
+    pub(crate) fn wipe(&mut self) {
+        crate::wipe::wipe(&mut self.buf);
+        self.len = 0;
     }
 
     /// Pads the buffered tail with the FIPS 202 sponge padding and returns the final block.
