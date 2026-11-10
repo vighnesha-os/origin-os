@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-10, as recommended ("Accept all", decision sheet items 80 and 82–87; CLAUDE.md §18). D6 gained notes for items 91–97 (references) the same day. Nothing here is built. It sets how device interfaces are shaped, not their binary layout: each interface's OIDL definition is its own decision when it is written (§84). |
+| Status | **Accepted** by the owner on 2026-11-10, as recommended ("Accept all", decision sheet items 80 and 82–87; CLAUDE.md §18). D6 gained notes for items 91–97 (references) the same day, and for item 121 after the design review. Nothing here is built. It sets how device interfaces are shaped, not their binary layout: each interface's OIDL definition is its own decision when it is written (§84). |
 | Requires | CLAUDE.md P0, P3, P5, P9; §3, §5, §6, §16–§18, §30–§36, §38, §49, §54, §56, §58, §59, §72, §74, §82; final rules 2, 3, 10, 14, 26, 30, 35 |
 | Evidence | The checks in Evidence, 2026-11-10 |
 | Builds on | ADR-0001 D2 (third-party drivers in user mode), ADR-0007 (the IOMMU), ADR-0011 (N3, N4, N7, N9) |
@@ -86,6 +86,12 @@ This is the clean-room process route 2 above asks for. So a Wi-Fi or Bluetooth d
 - The order is free specifications and vendor documents first, vendor-written open-source code second, other systems third. Nothing is paid for.
 - Every reference is read at its current release on the day, with its tag or commit recorded.
 - Where vendor documents already cover a topic, a reference is read only for a named reason (item 97, delegated to Claude): quirks and errata, a specification ambiguity, coverage research, or debugging a difference on the same hardware.
+
+*Added 2026-11-10, decision item 121 (the design review, finding 16):* route 2 asked for one person to specify and another to implement. Here both are sessions of one model, which was trained on Linux's code (CLAUDE.md §3). Three rules make the split hold:
+
+- The reading session writes down facts: register layouts, required sequences, timings, firmware messages. It writes them in Origin's own structure and names. It carries over no code, no identifiers, and not the reference's arrangement into files and functions.
+- A reference whose licence is compatible with Origin's is preferred: BSD, ISC, MIT, or a vendor driver that is dual-licensed. Its notice is recorded.
+- Before the first driver written this way is published, §6's similarity check is run against the files consulted, and a person signs it off. That person is what route 2's second person would have been.
 
 Bluetooth's host-to-controller interface (HCI) is standard, but each vendor's firmware-loading step is not public, so Bluetooth controllers have the same question on a smaller scale.
 
@@ -173,7 +179,7 @@ Checked 2026-11-10:
 
 - The OIDL interfaces themselves, technology by technology (§84).
 - The Driver SDK's binary interface (its own ADR).
-- Whether any clean-room process is approved (D6's ADR, if one is proposed).
+- Which driver is the first written from reference reading, and who signs it off (D6, item 121). The process itself is decided: items 91–97 and 121.
 - Which Wi-Fi or Bluetooth chips are supported first.
 - Wi-Fi 8 (802.11bn), still a draft.
 
