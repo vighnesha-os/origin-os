@@ -468,13 +468,53 @@ impl AddressSpace {
         {
             return Err(MapError::NonCanonical(start));
         }
+        self.make_tables(mem, start, end, false)
+    }
+
+    /// Makes every table that the 4 KiB **user** pages `[virt, virt + pages * PAGE)` would
+    /// need, down to the page tables and with the links open to user mode as
+    /// [`map_user`](Self::map_user) makes them; maps nothing, and returns how many tables it
+    /// made. Once it has run, `map_user` of any page of the range needs no table, so it cannot
+    /// fail for want of one: a run of pages can then be mapped all or nothing (S3-5b's review,
+    /// finding B).
+    ///
+    /// `virt` must be page-aligned and the range in the lower half. On
+    /// [`MapError::OutOfMemory`] the tables already made stay, and a later call makes the rest.
+    pub fn prepare_user(
+        &mut self,
+        mem: &mut impl TableMemory,
+        virt: u64,
+        pages: u64,
+    ) -> Result<u32, MapError> {
+        if !virt.is_multiple_of(PAGE) {
+            return Err(MapError::Misaligned(virt));
+        }
+        let end = pages
+            .checked_mul(PAGE)
+            .and_then(|bytes| virt.checked_add(bytes))
+            .ok_or(MapError::Overflow)?;
+        if end > 1 << 47 {
+            return Err(MapError::NonCanonical(virt.max(1 << 47)));
+        }
+        self.make_tables(mem, virt - virt % LARGE_PAGE, end, true)
+    }
+
+    /// Makes the tables that 4 KiB leaves from `start`, 2 MiB aligned, up to `end` need, their
+    /// links open to user mode if `user`, and returns how many it made.
+    fn make_tables(
+        &mut self,
+        mem: &mut impl TableMemory,
+        start: u64,
+        end: u64,
+        user: bool,
+    ) -> Result<u32, MapError> {
         let mut made = 0u32;
         let mut at = start;
         while at < end {
             let mut table = self.root;
             for level in (1..=3).rev() {
                 let present = slot(mem, table, at, level)?.load(Ordering::Relaxed) & PRESENT != 0;
-                table = Self::next_table(mem, table, at, level, false)?;
+                table = Self::next_table(mem, table, at, level, user)?;
                 if !present {
                     made = made.saturating_add(1);
                 }
@@ -1561,6 +1601,70 @@ mod tests {
         let mut other = AddressSpace::new(&mut small).unwrap();
         assert_eq!(
             other.reserve_tables(&mut small, REGION, LARGE_PAGE),
+            Err(MapError::OutOfMemory)
+        );
+        assert_eq!(small.used(), 2, "the PDPT stays");
+    }
+
+    #[test]
+    fn prepared_user_pages_map_without_a_table_through_links_open_to_user_mode() {
+        let tables = arena(16);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        // Three pages across a 2 MiB boundary: a PDPT, a page directory and two page tables.
+        let virt = 0x40_0000 - PAGE;
+        assert_eq!(space.prepare_user(&mut mem, virt, 3), Ok(4));
+        assert_eq!(space.prepare_user(&mut mem, virt, 3), Ok(0), "made once");
+        assert_eq!(space.prepare_user(&mut mem, virt, 0), Ok(0));
+        let used = mem.used();
+        for level in 1..=3 {
+            assert_eq!(raw(&mem, &space, virt, level) & USER, USER);
+            assert_eq!(raw(&mem, &space, virt + 2 * PAGE, level) & USER, USER);
+        }
+        assert!(space.translate(&mem, virt).is_none(), "nothing is mapped");
+        for k in 0..3 {
+            space
+                .map_user(
+                    &mut mem,
+                    virt + k * PAGE,
+                    0x5000 + k * PAGE,
+                    Access::ReadWrite,
+                )
+                .unwrap();
+        }
+        assert_eq!(mem.used(), used, "no table made by the mappings");
+        assert!(space.translate(&mem, virt + 2 * PAGE).unwrap().user);
+    }
+
+    #[test]
+    fn preparing_user_pages_refuses_what_it_cannot_honour() {
+        let tables = arena(8);
+        let mut mem = TablePool::new(&tables, ARENA_BASE);
+        let mut space = AddressSpace::new(&mut mem).unwrap();
+        assert_eq!(
+            space.prepare_user(&mut mem, 0x40_0001, 1),
+            Err(MapError::Misaligned(0x40_0001))
+        );
+        let top = (1 << 47) - PAGE;
+        assert_eq!(space.prepare_user(&mut mem, top, 1), Ok(3));
+        assert_eq!(
+            space.prepare_user(&mut mem, top, 2),
+            Err(MapError::NonCanonical(1 << 47))
+        );
+        assert_eq!(
+            space.prepare_user(&mut mem, 0xFFFF_8000_0000_0000, 1),
+            Err(MapError::NonCanonical(0xFFFF_8000_0000_0000))
+        );
+        assert_eq!(
+            space.prepare_user(&mut mem, 0x1000, u64::MAX / PAGE),
+            Err(MapError::Overflow)
+        );
+        // Running out: what was made stays, and a later call with room makes the rest.
+        let few = arena(2);
+        let mut small = TablePool::new(&few, ARENA_BASE);
+        let mut other = AddressSpace::new(&mut small).unwrap();
+        assert_eq!(
+            other.prepare_user(&mut small, 0x40_0000, 1),
             Err(MapError::OutOfMemory)
         );
         assert_eq!(small.used(), 2, "the PDPT stays");

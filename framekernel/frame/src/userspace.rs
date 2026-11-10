@@ -381,6 +381,72 @@ impl State {
         Ok(())
     }
 
+    /// Makes ready to map `count` pages from `base` to `end`: refuses if one of them is mapped,
+    /// and makes the room for their records and every page table they need, so that
+    /// [`map_run`](Self::map_run) cannot fail for want of either. On a failure, what it made
+    /// stays, unused: room in two vectors, and empty tables this space frees with the rest.
+    fn prepare_run(&mut self, base: u64, end: u64, count: usize) -> Result<(), MapError> {
+        if let Some(mapped) = self
+            .mapped
+            .get(self.position(base))
+            .filter(|m| m.virt < end)
+        {
+            return Err(MapError::AlreadyMapped(mapped.virt));
+        }
+        let records = self
+            .mapped
+            .len()
+            .checked_add(count)
+            .ok_or(MapError::OutOfMemory)?;
+        if self.mapped.try_reserve(count).is_err() || self.spare.try_reserve(records).is_err() {
+            return Err(MapError::OutOfMemory);
+        }
+        self.space
+            .prepare_user(&mut self.tables, base, count as u64)
+            .map(drop)
+    }
+
+    /// Maps `frames`, one page each from `virt`, with `access`, after
+    /// [`prepare_run`](Self::prepare_run) made ready for them: each frame is counted in its
+    /// aliases with `mode` already. Only corrupt tables can make an entry fail, and then the
+    /// pages before it stay mapped, recorded, and the failure says how many those are.
+    fn map_run(
+        &mut self,
+        virt: u64,
+        frames: &[SharedFrame],
+        mode: Mode,
+        access: Access,
+    ) -> Result<(), (usize, MapError)> {
+        let at = self.position(virt);
+        let before = self.mapped.len();
+        let mut failed = None;
+        for (k, frame) in (0..).zip(frames) {
+            let page = virt + k * PAGE;
+            if let Err(e) = self
+                .space
+                .map_user(&mut self.tables, page, frame.phys().raw(), access)
+            {
+                failed = Some(e);
+                break;
+            }
+            // No allocation: `prepare_run` made the room.
+            self.mapped.push(Mapping {
+                virt: page,
+                frame: Frame::Shared {
+                    frame: frame.clone(),
+                    mode,
+                    pending: Mode::Plain,
+                },
+            });
+        }
+        let mapped = self.mapped.len() - before;
+        // The new records go where `virt` belongs: every record from `at` on lies above the run.
+        if let Some(above) = self.mapped.get_mut(at..) {
+            above.rotate_right(mapped);
+        }
+        failed.map_or(Ok(()), |e| Err((mapped, e)))
+    }
+
     /// Counts the mode `access` gives the shared frames among the next [`CHUNK`] mapped pages of
     /// `[start, end)`: where it is the end of the range, `Ok(None)`; where a frame would be
     /// writable through one mapping and executable through another, the page it stopped at.
@@ -798,35 +864,78 @@ impl UserSpace {
     }
 
     /// Maps the user page `virt` to `frame`, with `access`, as this space's own mapping of a
-    /// frame others may map too. Only inside the user half. Needs no shootdown: a translation
-    /// that was not present is in no TLB.
+    /// frame others may map too: [`map_shared_run`](Self::map_shared_run) with one frame.
     ///
-    /// Refused with [`ChangeError::WriteAndExecute`] if the frame would then be writable through
-    /// one mapping and executable through another, in any space (review finding 5).
+    /// # Errors
+    ///
+    /// As `map_shared_run`'s; nothing is mapped on any of them.
     pub fn map_shared(
         &self,
         virt: u64,
         frame: &SharedFrame,
         access: Access,
     ) -> Result<(), ChangeError> {
-        if !usercopy::is_user_address(virt) || usercopy::USER_END - virt < PAGE {
-            return Err(MapError::NonCanonical(virt).into());
+        self.map_shared_run(virt, core::slice::from_ref(frame), access)
+    }
+
+    /// Maps `frames`, one page each from the user page `base`, all with `access`, as this
+    /// space's own mappings of frames others may map too: every one of them, or none (S3-5b's
+    /// review, finding B). Needs no shootdown: a translation that was not present is in no
+    /// TLB, and after a failure no entry of the run has ever been present.
+    ///
+    /// Everything that can fail is done for the whole run before its first entry is written:
+    /// the check that no page of it is mapped, the room for its records, its page tables, and
+    /// each frame's count of writable or executable mappings. The entries are then written a
+    /// round of [`CHUNK`] at a time.
+    ///
+    /// # Errors
+    ///
+    /// Each before any entry of the run is written. The page tables it needed stay made, and
+    /// empty, for this space to use later.
+    ///
+    /// - [`ChangeError::Map`]: `base` is not a page of the user half, or the run does not fit
+    ///   there; [`MapError::AlreadyMapped`] with the first page of the run that is mapped;
+    ///   [`MapError::OutOfMemory`] without a frame for a table, or memory for the records.
+    /// - [`ChangeError::WriteAndExecute`] if a frame would then be writable through one mapping
+    ///   and executable through another, in any space (review finding 5).
+    pub fn map_shared_run(
+        &self,
+        base: u64,
+        frames: &[SharedFrame],
+        access: Access,
+    ) -> Result<(), ChangeError> {
+        let end = user_range_end(base, frames.len() as u64)?;
+        if frames.is_empty() {
+            return Ok(());
         }
         let mode = Mode::of(access);
-        if !frame.inner.aliases.take(mode) {
-            return Err(ChangeError::WriteAndExecute);
-        }
-        let frame = Frame::Shared {
-            frame: frame.clone(),
-            mode,
-            pending: Mode::Plain,
-        };
         let _turn = self.edit();
-        self.with_state(|s| s.map(virt, frame, access))
-            .map_err(|(e, frame)| {
-                frame.release();
-                e.into()
-            })
+        self.with_state(|s| s.prepare_run(base, end, frames.len()))?;
+        // Counted before any entry is written; the counts taken go back if one cannot be.
+        for (counted, frame) in frames.iter().enumerate() {
+            if !frame.inner.aliases.take(mode) {
+                for frame in frames.iter().take(counted) {
+                    frame.inner.aliases.give_back(mode);
+                }
+                return Err(ChangeError::WriteAndExecute);
+            }
+        }
+        let mut virt = base;
+        for round in frames.chunks(CHUNK) {
+            if let Err((mapped, e)) = self.with_state(|s| s.map_run(virt, round, mode, access)) {
+                // Only with corrupt tables. The pages this call mapped go again, shot down,
+                // and the frames it did not reach give back their counts.
+                let stopped = virt + mapped as u64 * PAGE;
+                let _ = self.unmap_range(base, stopped);
+                let reached = ((stopped - base) / PAGE) as usize;
+                for frame in frames.iter().skip(reached) {
+                    frame.inner.aliases.give_back(mode);
+                }
+                return Err(e.into());
+            }
+            virt += round.len() as u64 * PAGE;
+        }
+        Ok(())
     }
 
     /// Removes every mapping in the `pages` pages from `virt`, and gives back their frames.
@@ -844,6 +953,12 @@ impl UserSpace {
     pub fn unmap(&self, virt: u64, pages: u64) -> Result<Change, ChangeError> {
         let end = user_range_end(virt, pages)?;
         let _turn = self.edit();
+        self.unmap_range(virt, end)
+    }
+
+    /// [`unmap`](Self::unmap)'s change of `[virt, end)`, by a caller that has this space's turn
+    /// to change (`editor`).
+    fn unmap_range(&self, virt: u64, end: u64) -> Result<Change, ChangeError> {
         let taken = self.with_state(|s| core::mem::take(&mut s.spare));
         let mut unmapping = Unmapping {
             space: self,

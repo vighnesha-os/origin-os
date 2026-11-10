@@ -1795,6 +1795,7 @@ fn address_space_markers(cpus: u32) -> Vec<String> {
         ),
         "origin-kernel: address spaces: a frame shared by two spaces: unmapped from the first, its thread faulted: true, the other went on: true, the frame still in use: true; unmapped from the second, its thread faulted: true, the frame free when the unmap returned: true".into(),
         "origin-kernel: address spaces: W^X across a shared frame's mappings: executable in another space while writable in one, refused: true; at another address in the same space, refused: true; read-only beside it: true; executable once nothing writes it: true; writable again while executable elsewhere, refused: true; from executable to writable in one step, refused: true".into(),
+        "origin-kernel: address spaces: a run of shared frames is mapped whole or not at all: over a page already mapped, refused with none of it mapped: true; with a frame executable in another space, refused with none of it mapped and no count taken: true; into 2 MiB that needs a page table once the space has made all it may, refused with none of it mapped: true; mapped whole: true".into(),
         format!(
             "origin-kernel: address spaces: 64 maps and unmaps of a page under a thread on {far}: {} interrupts, 0 on processors not in the space; ",
             64 * one
