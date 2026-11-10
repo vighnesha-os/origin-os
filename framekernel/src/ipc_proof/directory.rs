@@ -362,8 +362,10 @@ struct ClientMarks {
 }
 
 /// The client: its start record's DIRECTORY entry is the third (SELF_PROCESS, SELF_THREAD,
-/// DIRECTORY). It writes everything first, each connect followed at once by a request on its own
-/// end, then reads the answers.
+/// DIRECTORY). It writes everything first, then reads the answers. The connect the directory
+/// holds is followed at once by a request on the client's own end. The connect it refuses comes
+/// after the request on that connection's own end: the directory closes the end it is passed
+/// without waiting, so a write after the connect races with that close.
 fn client_script(record: u64, m: &Messages) -> (Script, ClientMarks) {
     let directory = Hd(entry_handle(record, 2));
     let (held, held_server, missing, missing_server) = (8, 9, 10, 11);
@@ -378,13 +380,15 @@ fn client_script(record: u64, m: &Messages) -> (Script, ClientMarks) {
     ));
     s.call(write("", h(held), HELLO_AT, m.hello.len() as u64, OK));
     s.call(create(missing));
+    // Before the other end goes, not after: the directory closes that end without waiting, and
+    // once it has, a write on this one is `peer_closed`.
+    s.call(write("", h(missing), HELLO_AT, m.hello.len() as u64, OK));
     s.call(write_with(
         directory,
         CONNECT_MISSING_AT,
         m.connect_missing.len(),
         slot_addr(missing_server),
     ));
-    s.call(write("", h(missing), HELLO_AT, m.hello.len() as u64, OK));
     for k in 0..3 {
         s.call(readable(directory));
         s.call(read("", directory, inbox(k), ROOM, OK));
