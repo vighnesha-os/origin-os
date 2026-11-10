@@ -1920,6 +1920,8 @@ fn memory_markers() -> Vec<String> {
         "origin-kernel: memory: every other call of the proof's programs returned what its script says, and each program ended as it should: true".into(),
         "origin-kernel: memory: map, protect and unmap of 16 pages took ".into(),
         " us (QEMU; the kernel's own calls, in a space no processor holds)".into(),
+        "origin-kernel: memory: unmapping a page of a shared object from a space a thread is reading it in took ".into(),
+        " us (QEMU, no budget); the thread then faulted at the page: true; the object stays mapped in its creator's space: true".into(),
         "origin-kernel: memory: every process, object and mapping of the proof is gone: heap ".into(),
     ]
 }

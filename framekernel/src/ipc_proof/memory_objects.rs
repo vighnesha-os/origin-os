@@ -15,7 +15,10 @@
 //!   T reads C's word; unmapping there needs `write` too, and T's next read faults.
 //! - **A hostile loop:** H maps and unmaps until its budget is spent; the next unmap is refused
 //!   with `should_wait` and changes nothing, and once the budget has refilled it is served.
-//! - **Costs:** map, protect and unmap through the kernel's own calls, as QEMU figures.
+//! - **Costs:** map, protect and unmap through the kernel's own calls, as QEMU figures; and the
+//!   unmap of a shared object's page from a space a thread is reading it in, on another
+//!   processor where there is one, after which the thread faults there and the object stays
+//!   mapped in its creator's space.
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -47,6 +50,9 @@ const FIXED_C: u64 = 0x0000_0003_0000_0000;
 const FIXED_T: u64 = 0x0000_0004_0000_0000;
 const FIXED_H: u64 = 0x0000_0005_0000_0000;
 const FIXED_K: u64 = 0x0000_0006_0000_0000;
+/// Where the reading program maps the shared object: below 2 GiB, so that its code can name
+/// the address in an immediate.
+const READ_AT: u64 = 0x0000_0000_4000_0000;
 
 /// The words A, B and C write, and where each program's copy of them is kept.
 const VALUE_A: u32 = 0xA11C_E5A1;
@@ -618,6 +624,83 @@ fn costs(tsc_hz: u64) -> Option<[u64; 3]> {
     Some([t1 - t0, t2 - t1, t3 - t2].map(|ticks| ticks / per_micro))
 }
 
+// ------------------------------------------------------------------ a shared object's unmap
+
+/// A ring-3 loop that reads the `u64` at `address` and counts each read in the `u64` at
+/// `count`, until the `u64` after the count is 1; then it exits. It keeps its space loaded on
+/// its processor, and a fault at the read ends it. Both addresses are below 2 GiB.
+fn reading_loop(address: u64, count: u64) -> Vec<u8> {
+    let mut p = alloc::vec![0x48, 0xC7, 0xC2]; // mov rdx, address
+    p.extend_from_slice(&(address as u32).to_le_bytes());
+    p.extend_from_slice(&[0x48, 0xC7, 0xC3]); // mov rbx, count
+    p.extend_from_slice(&(count as u32).to_le_bytes());
+    // loop:
+    p.extend_from_slice(&[0x48, 0x8B, 0x02]); // mov rax, [rdx]
+    p.extend_from_slice(&[0x48, 0xFF, 0x03]); // inc qword ptr [rbx]
+    p.extend_from_slice(&[0x48, 0x83, 0x7B, 0x08, 0x01]); // cmp qword ptr [rbx + 8], 1
+    p.extend_from_slice(&[0x75, 0xF3]); // jne loop
+    // xor edi, edi; xor eax, eax; syscall (exit 0); jmp $
+    p.extend_from_slice(&[0x31, 0xFF, 0x31, 0xC0, 0x0F, 0x05, 0xEB, 0xFE]);
+    p
+}
+
+/// What [`shared_unmap`] found.
+struct SharedUnmap {
+    /// Microseconds the unmap took.
+    micros: u64,
+    /// The reading thread then faulted at the page.
+    faulted: bool,
+    /// The object's page is still mapped in its creator's space.
+    kept: bool,
+}
+
+/// An object mapped in its creator's space and in a reader's, whose thread reads it in a loop
+/// on `cpu`: the kernel unmaps it from the reader's space while the thread runs.
+fn shared_unmap(cpu: CpuIndex, tsc_hz: u64) -> Option<SharedUnmap> {
+    let owner = Process::new(limits(1, 1, PLENTY), (CODE, CODE + PAGE), 0)?;
+    let object = ObjectRef::try_new(MemoryObject::create(&owner.account, PAGE).ok()?).ok()?;
+    let fixed = |address| Request {
+        access: READ,
+        flags: FIXED,
+        offset: 0,
+        length: PAGE,
+        address,
+    };
+    memory_object::map(&owner, &object, rights::MEMORY_OBJECT, &fixed(FIXED_K)).ok()?;
+    let image = Image::new(limits(0, 1, PLENTY), &reading_loop(READ_AT, DATA))?;
+    let &(_, data) = image.pages.iter().find(|&&(at, _)| at == DATA)?;
+    let reader = image.finish()?;
+    memory_object::map(&reader, &object, rights::MEMORY_OBJECT, &fixed(READ_AT)).ok()?;
+    Process::start_thread(&reader, cpu, CODE, STACK + PAGE, 0).ok()?;
+    let space = reader.memory()?;
+    let reads = || space.read_u64(DATA).unwrap_or(0);
+    sched::yield_until(|| reads() > 0, tsc_hz, 5);
+    let per_micro = (tsc_hz / 1_000_000).max(1);
+    let t0 = cpu::rdtsc();
+    let unmapped = memory_object::unmap(&owner, &reader, READ_AT, PAGE);
+    let micros = (cpu::rdtsc() - t0) / per_micro;
+    drop(space);
+    let faulted = unmapped.is_ok()
+        && await_end(&reader, tsc_hz, 5)
+        && matches!(
+            reader.ending(),
+            Some(Ending::Faulted { vector: 14, address, .. }) if address == READ_AT
+        );
+    if reader.ending().is_none() {
+        // Still reading: the unmap did not reach it. Let it exit.
+        let _ = reader.write_frame(data, 8, &1u64.to_le_bytes());
+        let _ = await_end(&reader, tsc_hz, 5);
+    }
+    let kept = owner
+        .memory()
+        .is_some_and(|space| space.translate(FIXED_K).is_some());
+    Some(SharedUnmap {
+        micros,
+        faulted,
+        kept,
+    })
+}
+
 // ------------------------------------------------------------------ the proof
 
 /// Each line ends `: memory failed` unless all of it holds.
@@ -750,7 +833,27 @@ fn parts(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> b
             return false;
         }
     }
-    scripts
+
+    let far = cpus.iter().copied().find(|&cpu| cpu != bsp).unwrap_or(bsp);
+    let Some(unmap) = shared_unmap(far, tsc_hz) else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: memory: the shared object's reader could not be set up{}",
+            verdict(false)
+        );
+        return false;
+    };
+    let _ = writeln!(
+        com1,
+        "origin-kernel: memory: unmapping a page of a shared object from a space a thread is reading it in took {} us (QEMU, no budget); the thread then faulted at the page: {}; the object stays mapped in its creator's space: {}{}",
+        unmap.micros,
+        unmap.faulted,
+        unmap.kept,
+        verdict(unmap.faulted && unmap.kept)
+    );
+    unmap.faulted
+        && unmap.kept
+        && scripts
         && shared
         && write_fault
         && read_fault
