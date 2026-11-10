@@ -220,6 +220,34 @@ mod tests {
     }
 
     #[test]
+    fn random_indexes_and_lengths_agree_with_the_plain_check() {
+        // A fixed seed: the same hundred thousand pairs on every run.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..100_000 {
+            // Whole-width values, and small ones, where in range and out of range are both
+            // common.
+            let (index, len) = if round % 2 == 0 {
+                (next() as usize, next() as usize)
+            } else {
+                ((next() % 300) as usize, (next() % 300) as usize)
+            };
+            for form in FORMS {
+                assert_eq!(
+                    index_in(form, index, len),
+                    (index < len).then_some(index),
+                    "{form:?}: index {index} of {len}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_user_address_passes_and_any_other_is_zero_under_the_mask() {
         for address in [USER_START, 0x40_0000, USER_END - 1] {
             for form in FORMS {
