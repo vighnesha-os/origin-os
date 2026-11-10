@@ -1023,34 +1023,6 @@ fn reply_deadline() -> u64 {
     crate::time::monotonic_nanos().saturating_add(REPLY_TIMEOUT_NS)
 }
 
-/// 64 bits of hardware entropy (RDSEED, else RDRAND, with `entropy::draw`'s bounded retries)
-/// for an identifier an off-path sender must not be able to guess: a DHCP transaction ID, a
-/// TFTP port. `None` when the processor gives none; the caller stops rather than use a
-/// predictable value.
-fn random_u64() -> Option<u64> {
-    use crate::entropy::{self, Source};
-    use crate::features::Features;
-
-    struct Hardware(Features);
-    impl Source for Hardware {
-        fn try_next(&mut self) -> Option<u64> {
-            if self.0.rdseed
-                && let Some(v) = crate::cpu::rdseed()
-            {
-                return Some(v);
-            }
-            if self.0.rdrand {
-                crate::cpu::rdrand()
-            } else {
-                None
-            }
-        }
-    }
-
-    let features = Features::decode(&crate::cpu::gather_cpuid());
-    entropy::draw(&mut Hardware(features), entropy::RDRAND_RETRIES)
-}
-
 /// Records why the receive thread stopped waiting for `step` (with `detail`), unless an
 /// earlier one did.
 fn timed_out(step: u64, detail: u64) {
@@ -1176,7 +1148,7 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
     let Some(n) = tftp::read_request(TFTP_FILE, &mut request) else {
         return;
     };
-    let Some(random) = random_u64() else {
+    let Some(random) = crate::entropy::hardware_u64() else {
         timed_out(waiting::NO_ENTROPY, 0);
         return;
     };
@@ -1278,7 +1250,7 @@ fn dhcp_lease(rx: &mut RxRing, our_mac: Mac) -> Option<Ipv4> {
 
     /// A new transaction ID, or `None` (recorded) with no entropy to draw one from.
     fn new_xid() -> Option<u32> {
-        let random = random_u64();
+        let random = crate::entropy::hardware_u64();
         if random.is_none() {
             timed_out(waiting::NO_ENTROPY, 0);
         }
