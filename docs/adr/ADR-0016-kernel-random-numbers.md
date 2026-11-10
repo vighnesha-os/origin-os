@@ -203,6 +203,22 @@ Measured on the build host (an M1 Max, portable code, a loaded machine; indicati
 
 One line when the root is instantiated and one for each processor: which instructions passed, how many draws, whether the loader gave a seed, and the cost. Counts and yes-or-no only: no draw, seed, state or output is ever printed (§61).
 
+## Evidence
+
+Only R1's mechanism is built, so only it has evidence. The detail is in `SOURCE_PROVENANCE.md`.
+
+| What | Evidence |
+|---|---|
+| HMAC-SHA-512 | RFC 4231's seven test cases; 273 lengths on which Python's `hmac` and RFC 2104's formula agree; every key length to 260 against the formula |
+| The generator against published values | The six SHA-512 values of RFC 6979 appendix A.2.5 to A.2.7: instantiation, and a request of one output block and of two |
+| The generator against the standard | Read beside SP 800-90A §9 and §10.1.2 after it was written: every step and limit agreed, and the order of two checks was changed to the standard's |
+| Reseeding, additional input, prediction resistance | A corpus of 145 instantiations from an independent Python implementation by the same author, which the HMAC-DRBG of an installed OpenSSL 4.1.0 reproduces. **NIST's own vectors: not run** |
+| The tests themselves | 53 faults planted one at a time: 51 fail a test, and the other 2 leave a stack buffer un-overwritten, which safe code cannot observe |
+| No panic path, no `unsafe` | The kernel-target release object references `memcpy`, `memset` and one formatter function; the crate forbids `unsafe` |
+| Overwriting (R9 Z2) | The same object holds the overwrite calls. One build, not a promise |
+| Cost (R12) | Measured on the build host, not on the target |
+| R3 to R13 | **None.** Nothing is built, and nothing has run in a kernel |
+
 ## Alternatives
 
 | Alternative | For | Against |
