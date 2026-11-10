@@ -11,6 +11,7 @@ mod interfaces;
 mod loom;
 mod screen;
 mod serial;
+mod turns;
 mod unsafety;
 
 use std::borrow::Cow;
@@ -58,8 +59,16 @@ commands:
   interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
               (part of check; quick)
   regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
+  exclusive -- <command> [args...]
+              runs any command in a turn on the machine, as check, the boots, run and loom
+              take theirs: one at a time across every checkout of this repository on this
+              machine. A waiter says once, and about once a minute, which run it waits for.
+              For scripts that call cargo directly (per-commit verification, say)
 
 environment:
+  ORIGIN_XTASK_LOCK_HELD              set by a run that holds the turn, for its own child
+                                      processes: a child that finds the turn held by that
+                                      process runs inside it instead of waiting for it
   ORIGIN_LOOM_DEEP                    if set, the Loom models search to their deeper bounds
                                       (a long run; the default search is part of check)
   ORIGIN_OVMF_CODE, ORIGIN_OVMF_VARS  firmware code image and NVRAM template
@@ -1762,7 +1771,7 @@ fn address_space_markers(cpus: u32) -> Vec<String> {
     };
     let cost = format!("Ok(Change {{ pages: 1, shootdowns: 1, interrupts: {one} }})");
     vec![
-        "origin-kernel: address spaces: the kernel half is the same tables in every space: true; a kernel mapping made at 0xfffff00000000000, in a top-level slot of its own, after a space was created is visible from that space: true; from a space lacking the slot, the same read faults: true".into(),
+        "origin-kernel: address spaces: the kernel half is the same tables in every space: true; a kernel mapping made at 0xfffff00000000000, in a top-level slot of its own, after a space was created is visible from that space: true; from a space lacking the slot, the same read faults: true; the probe page is not global: true".into(),
         format!(
             "origin-kernel: address spaces: a page unmapped under a running thread on {far}: frame free when the unmap returned: true; reused with a secret: true; the thread faulted at 0x500000 (#PF error 0x4): true; it read the secret: false; {cost}"
         ),
@@ -1782,6 +1791,7 @@ fn address_space_markers(cpus: u32) -> Vec<String> {
             2 * one
         ),
         "origin-kernel: address spaces: a frame shared by two spaces: unmapped from the first, its thread faulted: true, the other went on: true, the frame still in use: true; unmapped from the second, its thread faulted: true, the frame free when the unmap returned: true".into(),
+        "origin-kernel: address spaces: W^X across a shared frame's mappings: executable in another space while writable in one, refused: true; at another address in the same space, refused: true; read-only beside it: true; executable once nothing writes it: true; writable again while executable elsewhere, refused: true; from executable to writable in one step, refused: true".into(),
         format!(
             "origin-kernel: address spaces: 64 maps and unmaps of a page under a thread on {far}: {} interrupts, 0 on processors not in the space; ",
             64 * one
@@ -2029,23 +2039,35 @@ fn main() -> ExitCode {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["check"] => check(),
+        ["check"] => in_turn("check", check),
         ["unsafe-gate"] => unsafety::gate(),
         ["interface-gate"] => interfaces::gate(),
         ["regenerate"] => interfaces::regenerate(),
-        ["build"] => build_loader(Loader::Developer).and_then(|loader| {
-            let kernel = pack_kernel(&build_kernel()?)?;
-            println!("{}\n{}", loader.display(), kernel.display());
-            Ok(())
+        ["build"] => in_turn("build", || {
+            build_loader(Loader::Developer).and_then(|loader| {
+                let kernel = pack_kernel(&build_kernel()?)?;
+                println!("{}\n{}", loader.display(), kernel.display());
+                Ok(())
+            })
         }),
-        ["boot-test"] => boot_test(),
-        ["boot-matrix"] => boot_matrix(),
-        ["boot-x2apic"] => boot_x2apic(),
-        ["boot-console"] => boot_console(),
-        ["boot-bridge"] => boot_bridge(),
-        ["boot-legacy-free"] => boot_legacy_free(),
-        ["run"] => run(),
-        ["loom"] => loom::run(),
+        ["boot-test"] => in_turn("boot-test", boot_test),
+        ["boot-matrix"] => in_turn("boot-matrix", boot_matrix),
+        ["boot-x2apic"] => in_turn("boot-x2apic", boot_x2apic),
+        ["boot-console"] => in_turn("boot-console", boot_console),
+        ["boot-bridge"] => in_turn("boot-bridge", boot_bridge),
+        ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
+        ["run"] => in_turn("run", run),
+        ["loom"] => in_turn("loom", loom::run),
+        ["exclusive", "--", command @ ..] => {
+            let command: Vec<String> = command.iter().map(|s| (*s).to_string()).collect();
+            return match turns::exclusive(&command) {
+                Ok(code) => ExitCode::from(code),
+                Err(e) => {
+                    eprintln!("xtask: error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -2060,6 +2082,21 @@ fn main() -> ExitCode {
     }
 }
 
+/// Runs `run` in this process's turn on the machine: heavy runs go one at a time across every
+/// checkout of the repository (`turns`).
+fn in_turn(command: &str, run: impl FnOnce() -> Result) -> Result {
+    let _turn = turns::take(command)?;
+    run()
+}
+
+/// `xtask boot-test`, as a child process inside this run's turn on the machine.
+fn boot_test_child(exe: &Path) -> Command {
+    let mut command = Command::new(exe);
+    command.arg("boot-test");
+    turns::pass(&mut command);
+    command
+}
+
 /// Runs `boot-test` in a child process for each IOMMU and processor count, so each gets its
 /// own `ORIGIN_QEMU_IOMMU` and `ORIGIN_QEMU_SMP` (the environment of this process is never
 /// changed), and then [`boot_x2apic`] (the owner's decision on ADR-0008, question 3).
@@ -2068,8 +2105,7 @@ fn boot_matrix() -> Result {
     for iommu in ["intel", "amd"] {
         for cpus in [1, 2, 4] {
             println!("xtask: boot-matrix: {iommu} IOMMU, {cpus} processor(s)");
-            let status = Command::new(&exe)
-                .arg("boot-test")
+            let status = boot_test_child(&exe)
                 .env("ORIGIN_QEMU_IOMMU", iommu)
                 .env("ORIGIN_QEMU_SMP", cpus.to_string())
                 .status()
@@ -2368,8 +2404,7 @@ fn boot_console() -> Result {
 fn boot_legacy_free() -> Result {
     let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
     println!("xtask: boot-legacy-free: no 8254 and no 8042");
-    let status = Command::new(&exe)
-        .arg("boot-test")
+    let status = boot_test_child(&exe)
         .env("ORIGIN_QEMU_MACHINE", "pit=off,i8042=off")
         .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
         .status()
@@ -2392,8 +2427,7 @@ fn boot_bridge() -> Result {
     let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
     for iommu in ["intel", "amd"] {
         println!("xtask: boot-bridge: the {iommu} IOMMU, the NIC behind a PCIe root port");
-        let status = Command::new(&exe)
-            .arg("boot-test")
+        let status = boot_test_child(&exe)
             .env("ORIGIN_QEMU_IOMMU", iommu)
             .env("ORIGIN_QEMU_BRIDGE", "on")
             .status()
@@ -2423,8 +2457,7 @@ fn boot_x2apic() -> Result {
         println!(
             "xtask: boot-x2apic: processors at APIC IDs 0, 256 and 412 of 150 possible, -cpu {model} ({leaf})"
         );
-        let status = Command::new(&exe)
-            .arg("boot-test")
+        let status = boot_test_child(&exe)
             .env("ORIGIN_QEMU_TOPOLOGY", "x2apic")
             .env("ORIGIN_QEMU_CPU", model)
             .status()

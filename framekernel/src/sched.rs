@@ -29,6 +29,7 @@ use crate::timer::{self, X2Apic};
 use origin_frame::objref::ObjectRef;
 use origin_frame::stack::{FpuArea, GuardedStack, ThreadStart};
 use origin_frame::sync::SpinLock;
+use origin_frame::trap::Switch;
 
 /// Each kernel thread's stack.
 const THREAD_STACK: usize = 16 * 1024;
@@ -48,8 +49,8 @@ use crate::cpu::without_interrupts;
 
 /// The timer interrupted the context whose frame is at `interrupted`; returns the frame to
 /// resume. Processors without an active queue keep running what they were running.
-pub(crate) fn on_tick(interrupted: u64) -> u64 {
-    with_queue(interrupted, |q| Some(q.tick(interrupted)))
+pub(crate) fn on_tick(interrupted: u64, switch: &Switch) -> u64 {
+    with_queue(interrupted, switch, |q| Some(q.tick(interrupted)))
 }
 
 /// Makes sure CPU `cpu`'s boot/idle context (slot 0) has an FPU area, so the first switch
@@ -85,7 +86,7 @@ fn switch_fpu(id: usize, old: usize, new: usize) {
 /// an interrupt from user mode always lands on the running thread's own stack (the boot or
 /// idle flow, with no stack of its own, never runs in user mode), and the page tables are its
 /// process's (the kernel's for a kernel thread).
-fn follow_thread(id: usize, slot: usize) {
+fn follow_thread(id: usize, slot: usize, switch: &Switch) {
     let Some(threads) = THREADS.get(id) else {
         return;
     };
@@ -103,8 +104,8 @@ fn follow_thread(id: usize, slot: usize) {
         None => cpu::clear_kernel_stack(),
     }
     match t.user.get(slot).and_then(Option::as_ref) {
-        Some(user) => user.space.activate(),
-        None => crate::vm::activate_kernel_space(),
+        Some(user) => user.space.activate(switch),
+        None => crate::vm::activate_kernel_space(switch),
     }
 }
 
@@ -191,7 +192,11 @@ pub(crate) fn reap() -> usize {
 }
 
 /// The running thread's queue request, made with interrupts disabled (the gate cleared IF).
-fn with_queue(interrupted: u64, f: impl FnOnce(&mut RunQueue) -> Option<u64>) -> u64 {
+fn with_queue(
+    interrupted: u64,
+    switch: &Switch,
+    f: impl FnOnce(&mut RunQueue) -> Option<u64>,
+) -> u64 {
     let id = this_cpu();
     match (ACTIVE.get(id), QUEUES.get(id)) {
         (Some(active), Some(queue)) if active.load(Ordering::Acquire) => {
@@ -202,7 +207,7 @@ fn with_queue(interrupted: u64, f: impl FnOnce(&mut RunQueue) -> Option<u64>) ->
             if new != old {
                 switch_fpu(id, old, new);
             }
-            follow_thread(id, new);
+            follow_thread(id, new, switch);
             next
         }
         _ => interrupted,
@@ -210,20 +215,20 @@ fn with_queue(interrupted: u64, f: impl FnOnce(&mut RunQueue) -> Option<u64>) ->
 }
 
 /// `YIELD_VECTOR`: the running context gives up the processor.
-pub(crate) fn on_yield(interrupted: u64) -> u64 {
-    with_queue(interrupted, |q| Some(q.yield_now(interrupted)))
+pub(crate) fn on_yield(interrupted: u64, switch: &Switch) -> u64 {
+    with_queue(interrupted, switch, |q| Some(q.yield_now(interrupted)))
 }
 
 /// `SLEEP_VECTOR`: the running thread sleeps for `ticks` timer ticks.
-pub(crate) fn on_sleep(interrupted: u64, ticks: u64) -> u64 {
-    with_queue(interrupted, |q| q.sleep(interrupted, ticks).ok())
+pub(crate) fn on_sleep(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
+    with_queue(interrupted, switch, |q| q.sleep(interrupted, ticks).ok())
 }
 
 /// `BLOCK_VECTOR`: the running thread blocks until [`wake`] (or goes on, if a wake-up is
 /// already pending).
 /// RDI holds the most ticks to wait (0: no limit).
-pub(crate) fn on_block(interrupted: u64, ticks: u64) -> u64 {
-    with_queue(interrupted, |q| {
+pub(crate) fn on_block(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
+    with_queue(interrupted, switch, |q| {
         q.block_for(interrupted, (ticks != 0).then_some(ticks)).ok()
     })
 }
@@ -232,8 +237,10 @@ pub(crate) fn on_block(interrupted: u64, ticks: u64) -> u64 {
 /// processor made a thread here ready). The interrupted context is charged nothing: this
 /// switches only if a thread that was woken should run now
 /// ([`RunQueue::preempt_for_wake`]), and otherwise resumes what the interrupt interrupted.
-pub(crate) fn on_reschedule(interrupted: u64) -> u64 {
-    with_queue(interrupted, |q| Some(q.preempt_for_wake(interrupted)))
+pub(crate) fn on_reschedule(interrupted: u64, switch: &Switch) -> u64 {
+    with_queue(interrupted, switch, |q| {
+        Some(q.preempt_for_wake(interrupted))
+    })
 }
 
 /// A kernel thread: its processor (CPU index), run-queue slot, and the slot's generation,
@@ -299,9 +306,9 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
 
 /// `EXIT_VECTOR`: the running thread ends. Its stack becomes a zombie, freed later by
 /// [`reap`] on this processor.
-pub(crate) fn on_exit(interrupted: u64) -> u64 {
+pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
     let id = this_cpu();
-    with_queue(interrupted, |q| {
+    with_queue(interrupted, switch, |q| {
         let slot = q.current();
         let next = q.exit(interrupted).ok()?;
         if let Some(threads) = THREADS.get(id) {

@@ -93,8 +93,10 @@ const CAUSALITY: &[&str] = &["Causality violation"];
 const DEADLOCK: &[&str] = &["deadlock"];
 const WENT_BACK: &[&str] = &["the clock went backwards"];
 const STALE: &[&str] = &["a processor kept a translation the shootdown took away"];
-/// A wait that can never end: to Loom, a processor spinning for ever.
-const NEVER_ENDS: &[&str] = &["Model exceeded maximum number of branches", "deadlock"];
+/// An initiator gave up waiting for an answer that could never come (`PATIENCE` in `models.rs`).
+const NO_ANSWER: &[&str] = &["a processor the shootdown asked never answered"];
+/// A request for one address space interrupted a processor in another.
+const OUTSIDE: &[&str] = &["a shootdown for one space reached a processor in another"];
 /// The frame was reused while something could still reach it, or two things reused it.
 const REUSED_TOO_SOON: &[&str] = &[
     "Causality violation",
@@ -735,6 +737,19 @@ const CONTROLS: &[Control] = &[
         ],
     },
     Control {
+        // The initiator reads the answers without acquiring them: what a target did before it
+        // answered, its invalidation and its last use of the page, is not ordered before what the
+        // initiator does next, the frame's release included (review finding 7).
+        name: "initiator_reads_answers_relaxed",
+        file: SHOOTDOWN,
+        from: "                while served.load(Ordering::Acquire) < generation {\n",
+        to: "                while served.load(Ordering::Relaxed) < generation {\n",
+        models: &[
+            ("shootdown_reaches_an_online_processor", STALE),
+            ("deferred_free_comes_after_the_last_use_of_a_stale_translation", REUSED_TOO_SOON),
+        ],
+    },
+    Control {
         // The request is not published with its generation: a target can read the previous
         // one and invalidate the wrong page.
         name: "shootdown_generation_relaxed",
@@ -750,7 +765,7 @@ const CONTROLS: &[Control] = &[
         file: SHOOTDOWN,
         from: "                self.service(hardware);\n                prim::spin_loop();\n",
         to: "                prim::spin_loop();\n",
-        models: &[("shootdown_two_initiators_serve_each_other", NEVER_ENDS)],
+        models: &[("shootdown_two_initiators_serve_each_other", NO_ANSWER)],
     },
     Control {
         // The initiator reads who is online without ordering that after its change.
@@ -776,8 +791,8 @@ const CONTROLS: &[Control] = &[
         // saying so: the initiator can miss it while its walks still see the old entry.
         name: "entering_a_space_without_a_fence",
         file: SHOOTDOWN,
-        from: "        prim::fence(Ordering::SeqCst);\n        let result = load();\n",
-        to: "        let result = load();\n",
+        from: "        prim::fence(Ordering::SeqCst);\n        load();\n",
+        to: "        load();\n",
         models: &[("shootdown_and_a_processor_entering_the_space", STALE)],
     },
     Control {
@@ -793,12 +808,57 @@ const CONTROLS: &[Control] = &[
         models: &[("shootdown_and_a_processor_leaving_the_space", STALE)],
     },
     Control {
+        // `holds` reads `leaving` first, in the order `switch_space` writes the two: a switch
+        // that writes both between its reads is missed by each, the old root no longer in
+        // `loaded` and not yet in `leaving` (review finding 7).
+        name: "holds_reads_leaving_first",
+        file: SHOOTDOWN,
+        from: "        self.loaded
+            .get(id)
+            .is_some_and(|loaded| loaded.load(Ordering::Acquire) == root)
+            || self
+                .leaving
+                .get(id)
+                .is_some_and(|leaving| leaving.load(Ordering::Acquire) == root)
+",
+        to: "        self.leaving
+            .get(id)
+            .is_some_and(|leaving| leaving.load(Ordering::Acquire) == root)
+            || self
+                .loaded
+                .get(id)
+                .is_some_and(|loaded| loaded.load(Ordering::Acquire) == root)
+",
+        models: &[("shootdown_and_a_processor_leaving_the_space", STALE)],
+    },
+    Control {
         // The old root is forgotten before the CR3 write, not after it.
         name: "the_old_root_forgotten_before_the_switch",
         file: SHOOTDOWN,
-        from: "        prim::fence(Ordering::SeqCst);\n        let result = load();\n        if let Some(leaving) = self.leaving.get(me) {\n            leaving.store(0, Ordering::Release);\n        }\n",
-        to: "        prim::fence(Ordering::SeqCst);\n        if let Some(leaving) = self.leaving.get(me) {\n            leaving.store(0, Ordering::Release);\n        }\n        let result = load();\n",
+        from: "        prim::fence(Ordering::SeqCst);\n        load();\n        if let Some(leaving) = self.leaving.get(me) {\n            leaving.store(0, Ordering::Release);\n        }\n",
+        to: "        prim::fence(Ordering::SeqCst);\n        if let Some(leaving) = self.leaving.get(me) {\n            leaving.store(0, Ordering::Release);\n        }\n        load();\n",
         models: &[("shootdown_and_a_processor_leaving_the_space", STALE)],
+    },
+    Control {
+        // The record and the CR3 write with interrupts on: the scheduler's switch, in an
+        // interrupt on the same processor, can land between them (review finding 1).
+        name: "a_switch_that_can_be_interrupted",
+        file: SHOOTDOWN,
+        from: "        hardware.without_interrupts(|| self.switch_here(hardware, to, load));\n",
+        to: "        self.switch_here(hardware, to, load);\n",
+        models: &[(
+            "a_switch_and_the_scheduler_on_one_processor",
+            &["the record names a space this processor has left"],
+        )],
+    },
+    Control {
+        // A visit that leaves no record: a shootdown for the visited space passes the
+        // processor over while it still holds the translation (review finding 2).
+        name: "a_visit_that_is_not_recorded",
+        file: SHOOTDOWN,
+        from: "            if let Some(slot) = slot {\n                slot.store(visiting, Ordering::Release);\n            }\n",
+        to: "",
+        models: &[("shootdown_and_a_processor_visiting_the_space", STALE)],
     },
     Control {
         // A request for one space interrupts everyone.
@@ -806,10 +866,7 @@ const CONTROLS: &[Control] = &[
         file: SHOOTDOWN,
         from: "                Scope::Space(root) => self.holds(id, root),\n",
         to: "                Scope::Space(root) => root == root,\n",
-        models: &[(
-            "shootdown_for_a_space_asks_only_the_processors_in_it",
-            &["a shootdown for one space reached a processor in another", "deadlock", "Model exceeded maximum number of branches"],
-        )],
+        models: &[("shootdown_for_a_space_asks_only_the_processors_in_it", OUTSIDE)],
     },
     // The deferred free (N14 step 3, S3-5a).
     Control {

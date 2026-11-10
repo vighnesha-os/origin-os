@@ -256,14 +256,19 @@ static PROBE_TAKEN: AtomicBool = AtomicBool::new(false);
 /// A kernel page in a top-level slot of its own, for the proof that a mapping made after an
 /// address space was created is visible from that space. Unmapped (on every processor) and
 /// freed when dropped.
+///
+/// Unlike the rest of the kernel half it is **not global**: the proof reads it through one space
+/// and then through another, and a global translation cached by the first read would survive
+/// the CR3 load and answer the second without a walk of that space's tables (review finding 4,
+/// seen on an AMD EPYC under KVM; QEMU's software CPU flushes everything on a CR3 load).
 #[derive(Debug)]
 pub struct KernelProbe {
     frame: Option<OwnedFrame>,
 }
 
 impl KernelProbe {
-    /// Maps a fresh frame at the probe page, read-only and never executable. `None` if one
-    /// exists already, or if the frame or the tables cannot be had.
+    /// Maps a fresh frame at the probe page, read-only, never executable and not global.
+    /// `None` if one exists already, or if the frame or the tables cannot be had.
     pub fn new() -> Option<Self> {
         if PROBE_TAKEN.swap(true, Ordering::AcqRel) {
             return None;
@@ -277,7 +282,7 @@ impl KernelProbe {
                         &mut k.tables,
                         PROBE_PAGE,
                         frame.phys().raw(),
-                        Attributes::kernel_global(Access::Read),
+                        Attributes::kernel(Access::Read),
                     )
                     .ok()
             });
@@ -298,6 +303,20 @@ impl KernelProbe {
     #[must_use]
     pub const fn addr(&self) -> u64 {
         PROBE_PAGE
+    }
+
+    /// Reads the probe page through a space like every space before ADR-0004 H2: built as
+    /// [`UserSpace::new`] builds one, but with the probe page's top-level slot empty, as when a
+    /// kernel mapping was made in a slot of its own after the space was created. The in-boot
+    /// control of the kernel-half proof, which expects a fault. The space is made and dropped
+    /// inside this call, so no space that lacks part of the kernel half ever reaches a caller
+    /// (review housekeeping). `None` without memory for it.
+    ///
+    /// [`UserSpace::new`]: crate::userspace::UserSpace::new
+    #[must_use]
+    pub fn read_without_its_slot(&self) -> Option<crate::cpu::Probe> {
+        let lacking = crate::userspace::UserSpace::without_probe_slot()?;
+        Some(lacking.probe_read(self.addr()))
     }
 }
 
@@ -479,12 +498,12 @@ pub(crate) fn in_device_window(addr: u64) -> bool {
 }
 
 /// Switches this processor to the kernel's own address space, if it isn't on it yet: the space
-/// of every kernel thread. Safe: the kernel's tables are complete (`install` keeps them for
-/// ever), and this replaces whatever the processor was using, which the switching code
-/// (the scheduler) has given up.
-pub fn activate_kernel_space() {
+/// of every kernel thread. Only at the scheduler's switch point (`trap::Switch`, review finding
+/// 2). Safe: the kernel's tables are complete (`install` keeps them for ever), and this replaces
+/// whatever the processor was using, which the switching code (the scheduler) has given up.
+pub fn activate_kernel_space(_switch: &crate::trap::Switch) {
     let root = kernel_root();
-    if root != 0 && crate::cpu::read_cr3() != root {
+    if root != 0 {
         // SAFETY: `root` is the kernel's complete PML4, which maps everything kernel code
         // touches next; it lives for ever.
         unsafe { crate::cpu::write_cr3(root) };

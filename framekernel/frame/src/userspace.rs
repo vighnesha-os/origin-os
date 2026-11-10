@@ -39,10 +39,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use origin_abi::Error;
 use origin_paging::{Access, AddressSpace, MapError, PAGE, Table, TableMemory, Translation};
-use origin_sync::shootdown::{Completed, Request, Stalled};
+use origin_sync::shootdown::{Completed, Confirmation, Request, Stalled};
 use origin_sync::{SpinGuard, SpinLock};
 
 use crate::addr::PhysAddr;
+use crate::aliases::{Aliases, Mode};
 use crate::memory::{self, OwnedFrame};
 use crate::objref::ObjectRef;
 use crate::usercopy::{self, UserAccess, UserRange};
@@ -123,6 +124,8 @@ struct SharedInner {
     phys: PhysAddr,
     /// `Some` until it is dropped: the frame moves out to be freed.
     frame: Option<OwnedFrame>,
+    /// Its writable and executable mappings, in every space: never both (review finding 5).
+    aliases: Aliases,
 }
 
 impl Drop for SharedInner {
@@ -153,6 +156,7 @@ impl SharedFrame {
         ObjectRef::try_new(SharedInner {
             phys,
             frame: Some(frame),
+            aliases: Aliases::new(),
         })
         .ok()
         .map(|inner| Self { inner })
@@ -162,6 +166,13 @@ impl SharedFrame {
     #[must_use]
     pub fn phys(&self) -> PhysAddr {
         self.inner.phys
+    }
+
+    /// How many mappings, in every space, make this frame writable, and how many executable:
+    /// one of the two is always 0 (review finding 5).
+    #[must_use]
+    pub fn mappings(&self) -> (u32, u32) {
+        self.inner.aliases.counts()
     }
 
     /// Writes `value` at `offset`, once, as a volatile store. `false` unless that is an
@@ -206,8 +217,14 @@ impl SharedFrame {
 enum Frame {
     /// A frame only this space has: freed when it is unmapped.
     Private(OwnedFrame),
-    /// A reference to a frame other spaces may map too.
-    Shared(SharedFrame),
+    /// A reference to a frame other spaces may map too, counted in its [`Aliases`] with `mode`.
+    /// `pending` is a mode this mapping had until a change of permissions, still counted until
+    /// the shootdown of that change has completed.
+    Shared {
+        frame: SharedFrame,
+        mode: Mode,
+        pending: Mode,
+    },
 }
 
 impl Frame {
@@ -215,18 +232,30 @@ impl Frame {
     fn phys(&self) -> PhysAddr {
         match self {
             Self::Private(frame) => frame.phys(),
-            Self::Shared(frame) => frame.phys(),
+            Self::Shared { frame, .. } => frame.phys(),
+        }
+    }
+
+    /// Gives back a mode left from a change of permissions, once no processor can use it.
+    fn give_back_pending(&mut self) {
+        if let Self::Shared { frame, pending, .. } = self {
+            frame.inner.aliases.give_back(*pending);
+            *pending = Mode::Plain;
         }
     }
 
     /// Gives up this mapping's hold on the frame: only with no processor able to reach it
     /// through this mapping.
-    fn release(self) {
+    fn release(mut self) {
+        self.give_back_pending();
         match self {
             Self::Private(frame) => {
                 let _ = memory::free_frame(frame);
             }
-            Self::Shared(frame) => drop(frame),
+            Self::Shared { frame, mode, .. } => {
+                frame.inner.aliases.give_back(mode);
+                drop(frame);
+            }
         }
     }
 }
@@ -268,6 +297,9 @@ pub enum ChangeError {
         /// The processor.
         cpu: usize,
     },
+    /// A shared frame would be writable through one mapping and executable through another
+    /// (review finding 5). Nothing was changed.
+    WriteAndExecute,
 }
 
 impl From<MapError> for ChangeError {
@@ -338,17 +370,63 @@ impl State {
         Ok(())
     }
 
+    /// Counts the mode `access` gives the shared frames among the next [`CHUNK`] mapped pages of
+    /// `[start, end)`: where it is the end of the range, `Ok(None)`; where a frame would be
+    /// writable through one mapping and executable through another, the page it stopped at.
+    /// Pages before that one were counted, and `unclaim_modes` gives them back.
+    fn claim_modes(&mut self, start: u64, end: u64, access: Access) -> Result<Option<u64>, u64> {
+        let lo = self.position(start);
+        let hi = self.position(end).min(lo + CHUNK);
+        let new = Mode::of(access);
+        let mut next = None;
+        for mapping in self.mapped.get(lo..hi).unwrap_or(&[]) {
+            next = Some(mapping.virt + PAGE);
+            let Frame::Shared { frame, mode, .. } = &mapping.frame else {
+                continue;
+            };
+            let flip = matches!(
+                (*mode, new),
+                (Mode::Write, Mode::Execute) | (Mode::Execute, Mode::Write)
+            );
+            if *mode != new && (flip || !frame.inner.aliases.take(new)) {
+                return Err(mapping.virt);
+            }
+        }
+        Ok(next)
+    }
+
+    /// Gives back what `claim_modes` counted for `access` in `[start, stop)`.
+    fn unclaim_modes(&mut self, start: u64, stop: u64, access: Access) {
+        let (lo, hi) = (self.position(start), self.position(stop));
+        let new = Mode::of(access);
+        for mapping in self.mapped.get(lo..hi).unwrap_or(&[]) {
+            if let Frame::Shared { frame, mode, .. } = &mapping.frame
+                && *mode != new
+            {
+                frame.inner.aliases.give_back(new);
+            }
+        }
+    }
+
     /// Gives the next [`CHUNK`] mapped pages of `[start, end)` the permissions `access`, or says
-    /// there are none left.
+    /// there are none left. A shared frame's old mode stays counted, as `pending`, until the
+    /// caller has shot the old permissions down (`give_back_pending`).
     fn protect(&mut self, start: u64, end: u64, access: Access) -> Option<Reprotected> {
         let lo = self.position(start);
         let hi = self.position(end).min(lo + CHUNK);
-        let round = self.mapped.get(lo..hi)?;
+        let new = Mode::of(access);
+        let round = self.mapped.get_mut(lo..hi)?;
         let (first, last) = (round.first()?.virt, round.last()?.virt);
         let mut changed = 0;
         for mapping in round {
             if self.space.protect(&mut self.tables, mapping.virt, access) == Ok(true) {
                 changed += 1;
+                if let Frame::Shared { mode, pending, .. } = &mut mapping.frame
+                    && *mode != new
+                {
+                    *pending = *mode;
+                    *mode = new;
+                }
             }
         }
         Some(Reprotected {
@@ -356,6 +434,15 @@ impl State {
             request: Request::covering(first, last),
             next: last + PAGE,
         })
+    }
+
+    /// Gives back the modes left pending in `[start, stop)`: their old permissions have been
+    /// shot down.
+    fn give_back_pending(&mut self, start: u64, stop: u64) {
+        let (lo, hi) = (self.position(start), self.position(stop));
+        for mapping in self.mapped.get_mut(lo..hi).unwrap_or(&mut []) {
+            mapping.frame.give_back_pending();
+        }
     }
 
     /// Takes the next [`CHUNK`] pages of `[start, end)` out of the tables and out of the records:
@@ -425,6 +512,9 @@ pub struct UserSpace {
     /// Changes to the space go one at a time: see the module documentation.
     editor: SpinLock<()>,
     state: SpinLock<State>,
+    /// Whether a stalled shootdown of this space has not been made good yet (review finding
+    /// 3). Changed only under `editor`.
+    confirmation: Confirmation,
 }
 
 impl core::fmt::Debug for UserSpace {
@@ -482,6 +572,7 @@ impl UserSpace {
             root: state.space.root(),
             editor: SpinLock::new(()),
             state: SpinLock::new(state),
+            confirmation: Confirmation::new(),
         })
     }
 
@@ -506,10 +597,11 @@ impl UserSpace {
 
     /// As [`new`](Self::new), with the top-level entry of the kernel probe page's slot empty:
     /// what every space used to look like when a kernel mapping was made in a slot of its own
-    /// after the space was created. For the in-boot control of that proof. Loading this space
-    /// is harmless: nothing but a `KernelProbe` is ever mapped in that slot, so all the code,
-    /// stacks and data the kernel touches stay mapped.
-    pub fn without_probe_slot() -> Option<Self> {
+    /// after the space was created. Only for `KernelProbe::read_without_its_slot`, the in-boot
+    /// control of that proof, which drops it before it returns: a space that breaks H2 is never
+    /// handed out (review housekeeping). Visiting it is harmless: nothing but a `KernelProbe` is
+    /// ever mapped in that slot, so all the code, stacks and data the kernel touches stay mapped.
+    pub(crate) fn without_probe_slot() -> Option<Self> {
         let mut half = *crate::vm::kernel_half()?;
         *half.get_mut(crate::vm::PROBE_SLOT)? = 0;
         Self::from_state(State::new(&half)?)
@@ -532,16 +624,30 @@ impl UserSpace {
         self.root
     }
 
-    /// Makes this space the current one on the calling processor. Safe: the space is complete
-    /// (it maps the kernel's half, built by [`new`](Self::new)), and it stays alive for this
-    /// borrow; the scheduler holds a reference per thread that runs in it, and a dropped
-    /// space's memory is not freed while a processor still has it loaded.
-    pub fn activate(&self) {
-        if crate::cpu::read_cr3() != self.root {
-            // SAFETY: `root` is the PML4 of this complete address space, whose kernel half is the
-            // kernel's (built by `new`), so the code, stacks and data running now stay mapped.
-            unsafe { crate::cpu::write_cr3(self.root) };
-        }
+    /// Makes this space the current one on the calling processor, for the thread the
+    /// scheduler is about to resume: only at the scheduler's switch point (`trap::Switch`),
+    /// so that nothing else can leave a processor on a space the scheduler did not choose
+    /// (review finding 2). Safe: the space is complete (it maps the kernel's half, built by
+    /// [`new`](Self::new)), and it stays alive for this borrow; the scheduler holds a reference
+    /// per thread that runs in it, and a dropped space's memory is not freed while a processor
+    /// still has it loaded.
+    pub fn activate(&self, _switch: &crate::trap::Switch) {
+        // SAFETY: `root` is the PML4 of this complete address space, whose kernel half is the
+        // kernel's (built by `new`), so the code, stacks and data running now stay mapped.
+        unsafe { crate::cpu::write_cr3(self.root) };
+    }
+
+    /// Reads a byte at `addr` through this space's own tables, on this processor, and says what
+    /// happened (`cpu::probe_read`): for the boot proofs. The processor visits this space with
+    /// interrupts off and goes back to the one it was on, so the scheduler's choice stands
+    /// (review finding 2). The page's translation is dropped first, so the read walks these
+    /// tables whatever an earlier read left in the TLB (finding 4).
+    pub fn probe_read(&self, addr: u64) -> crate::cpu::Probe {
+        // The space stays alive for this borrow, and is complete (`new`).
+        crate::tlb::visit(self.root, || {
+            crate::cpu::invlpg(addr);
+            crate::cpu::probe_read(addr)
+        })
     }
 
     /// The frame mapped at the user page holding `virt` in this space, if any.
@@ -574,21 +680,32 @@ impl UserSpace {
     /// Maps the user page `virt` to `frame`, with `access`, as this space's own mapping of a
     /// frame others may map too. Only inside the user half. Needs no shootdown: a translation
     /// that was not present is in no TLB.
+    ///
+    /// Refused with [`ChangeError::WriteAndExecute`] if the frame would then be writable through
+    /// one mapping and executable through another, in any space (review finding 5).
     pub fn map_shared(
         &self,
         virt: u64,
         frame: &SharedFrame,
         access: Access,
-    ) -> Result<(), MapError> {
+    ) -> Result<(), ChangeError> {
         if !usercopy::is_user_address(virt) || usercopy::USER_END - virt < PAGE {
-            return Err(MapError::NonCanonical(virt));
+            return Err(MapError::NonCanonical(virt).into());
         }
-        let frame = Frame::Shared(frame.clone());
+        let mode = Mode::of(access);
+        if !frame.inner.aliases.take(mode) {
+            return Err(ChangeError::WriteAndExecute);
+        }
+        let frame = Frame::Shared {
+            frame: frame.clone(),
+            mode,
+            pending: Mode::Plain,
+        };
         let _turn = self.edit();
         self.with_state(|s| s.map(virt, frame, access))
             .map_err(|(e, frame)| {
                 frame.release();
-                e
+                e.into()
             })
     }
 
@@ -602,6 +719,7 @@ impl UserSpace {
         let end = user_range_end(virt, pages)?;
         let _turn = self.edit();
         let mut change = Change::default();
+        self.confirm(&mut change)?;
         let mut cursor = virt;
         while let Some(retired) = self.with_state(|s| s.retire(cursor, end))? {
             let Retired {
@@ -611,35 +729,81 @@ impl UserSpace {
             } = retired;
             cursor = next;
             change.pages += mappings.len() as u64;
-            let done =
-                crate::tlb::retire_in_space(self.root, request, mappings, |mut mappings| {
-                    for mapping in mappings.drain(..) {
-                        mapping.frame.release();
-                    }
-                    self.with_state(|s| s.spare = mappings);
-                })?;
-            change.add(done);
+            let done = crate::tlb::retire_in_space(self.root, request, mappings, |mut mappings| {
+                for mapping in mappings.drain(..) {
+                    mapping.frame.release();
+                }
+                self.with_state(|s| s.spare = mappings);
+            });
+            change.add(self.confirmation.record(done)?);
         }
         Ok(change)
+    }
+
+    /// Whether a change to this space is not known to have reached every processor: a
+    /// shootdown stalled, and no flush has completed since (review finding 3).
+    pub fn change_unconfirmed(&self) -> bool {
+        self.confirmation.is_unconfirmed()
+    }
+
+    /// Before a change: if an earlier shootdown stalled, every processor with this space loaded
+    /// must first drop everything it holds of it (review finding 3). Called under `editor`.
+    fn confirm(&self, change: &mut Change) -> Result<(), ChangeError> {
+        let flushed = self
+            .confirmation
+            .settle(|| crate::tlb::shootdown_space(self.root, Request::NonGlobal))?;
+        if let Some(done) = flushed {
+            change.add(done);
+            // Every old permission is gone everywhere now, including any a stall left counted.
+            self.with_state(|s| s.give_back_pending(0, u64::MAX));
+        }
+        Ok(())
     }
 
     /// Gives every page mapped in the `pages` pages from `virt` the permissions `access`. When
     /// it returns, no processor can use the old ones. Pages not mapped are left alone. Safe
     /// with this space's threads running: one whose access the new permissions refuse takes a
     /// fault. Must not be called holding a lock as [`unmap`](Self::unmap) says.
+    ///
+    /// Refused with [`ChangeError::WriteAndExecute`], before anything changes, if a shared frame
+    /// would then be writable through one mapping and executable through another, in any space,
+    /// or if it would go from writable to executable or back in one step (review finding 5).
     pub fn protect(&self, virt: u64, pages: u64, access: Access) -> Result<Change, ChangeError> {
         let end = user_range_end(virt, pages)?;
         let _turn = self.edit();
         let mut change = Change::default();
+        self.confirm(&mut change)?;
+        self.claim_modes(virt, end, access)?;
         let mut cursor = virt;
         while let Some(round) = self.with_state(|s| s.protect(cursor, end, access)) {
+            let start = cursor;
             cursor = round.next;
             change.pages += round.changed;
             if round.changed != 0 {
-                change.add(crate::tlb::shootdown_space(self.root, round.request)?);
+                let done = crate::tlb::shootdown_space(self.root, round.request);
+                change.add(self.confirmation.record(done)?);
             }
+            // The old permissions are gone everywhere: their modes stop counting.
+            self.with_state(|s| s.give_back_pending(start, cursor));
         }
         Ok(change)
+    }
+
+    /// Counts the mode `access` gives every shared frame mapped in `[start, end)`, or counts
+    /// none of them and refuses (review finding 5). Called under `editor`, so the records do not
+    /// change between the rounds.
+    fn claim_modes(&self, start: u64, end: u64, access: Access) -> Result<(), ChangeError> {
+        let mut cursor = start;
+        loop {
+            match self.with_state(|s| s.claim_modes(cursor, end, access)) {
+                Ok(Some(next)) => cursor = next,
+                Ok(None) => return Ok(()),
+                Err(stopped) => {
+                    self.with_state(|s| s.unclaim_modes(start, stopped, access));
+                    return Err(ChangeError::WriteAndExecute);
+                }
+            }
+        }
     }
 
     /// How many processors have this space loaded: what the next change would interrupt, so

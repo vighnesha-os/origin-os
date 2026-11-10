@@ -27,6 +27,7 @@ pub use origin_sync as sync;
 
 pub mod acpi;
 pub mod addr;
+pub mod aliases;
 pub mod amdvi;
 pub mod apic;
 pub mod apstart;
