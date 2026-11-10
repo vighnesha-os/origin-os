@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–97. Items up to 70: 2026-11-09, after the pre-merge review. |
-| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. |
+| As of | 2026-11-10 for items 71–123. Items up to 70: 2026-11-09, after the pre-merge review. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–97 (item 97 delegated to Claude). |
-| Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do (see the last section). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–123 (item 97 delegated to Claude). |
+| Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -292,3 +292,50 @@ Task S3-5b (memory objects) needs five interface decisions that C6–C8 (items 6
 | 103, answered | D3: `memory_unmap` and `memory_protect` name the process, the mapping's start and its length; in v1 exactly one whole mapping; protect only reduces access? | **Accept** |
 | 104, answered | D4: quotas set by the creator: committed bytes, mappings, and a rate for unmap and protect; `limit` past a quota, `no_memory` without frames, `should_wait` past the rate with nothing changed? | **Accept** |
 | 105, answered | D5: the rest: `write` on the process handle for every call, the caller's own included; existing statuses only, in a fixed order; ADR-0004 H1's addresses and the start records' random region; a mapping holds its object; two new constants; `user-abi` 0.5 in one step? | **Accept** |
+
+Items 71–97 and 98–105 were written on two branches that had not met. They are in one sheet since the records branch merged them on 2026-11-10 (item 106).
+
+## The design review of 2026-11-10 (items 106–123): Accepted 2026-11-10, recorded, almost nothing built
+
+On 2026-11-10 you asked for a very careful review of CLAUDE.md and the design documents: "Extreme highest security, performance, design, native SDK no calling of shell commands from GUI or UI. Check very carefully each and everything."
+
+The review is `docs/engineering/DESIGN_REVIEW_2026-11-10.md`. It read the documents at `land/s3-part2` (`02d9ba8`) and `docs/editions-device-sdk` (`a95d05b`), checked each of its 19 findings against the code, and put 18 decisions to you. Each had a recommended answer, checked against CLAUDE.md 7.3 and every accepted ADR. You answered **"Accept all"** in the same session.
+
+Five of them change something you had already accepted. The review said so before you answered:
+
+- item 106 changes item 70;
+- item 109 changes ADR-0005 P1;
+- item 113 changes one row of ADR-0013's table;
+- item 114's second step would change ADR-0012 C2, and only if the experiment supports it;
+- item 117 rewords item 74.
+
+| # | Question | Answer | Where it is recorded, and its state |
+|---|---|---|---|
+| 106, answered | Commit and push the editions branch, and land directive, ADR and decision-sheet changes on `main` in pull requests of their own, outside item 70's 100-commit rule (finding 1)? | **Accept** | CLAUDE.md §79. **Done so far:** the editions branch is committed and pushed, and merged with the landing line on the records branch. Reaching `main` waits for your word on that pull request |
+| 107, answered | Drop the commit that holds Intel's VT-d PDF, keep the gem5 ledger, and add an ignore rule and a gate (finding 2)? | **Accept** | `.gitignore`. **Done except the gate:** the commit is on no branch and was never pushed, the ledger is on the records branch, and the PDF is a local file again |
+| 108, answered | Make "no first-party component runs a command" structural: starting a program is a capability; a release gate over first-party manifests; no command interpreter in the base image; an empty environment by default; a run-time test; no interface that takes text to execute (finding 3)? | **Accept** | CLAUDE.md §48; ADR-0011 Amendment 1; ADR-0005 Amendment 6, E2. Not built. The capability's name is decided with the Loader Service's interface (§84) |
+| 109, answered | 64-bit handles, while `user-abi` is at major 0 (finding 4)? | **Accept** | ADR-0005 Amendment 6, E1. Not built |
+| 110, answered | Remove `preserves_flags` from the twelve assembly blocks and add a gate (finding 5)? | **Accept** | CLAUDE.md §13. Not built |
+| 111, answered | An ADR on what lives in the kernel; move the modules that are not the kernel's; fix which files may hold `unsafe` (finding 6)? | **Accept** | CLAUDE.md §13. The ADR is to be written |
+| 112, answered | A system threat model, and an ADR on speculation and processor hardening, both before ADR-0011 N14 step 4 (finding 7)? | **Accept** | CLAUDE.md §18, §24, §58. Both are to be written |
+| 113, answered | A kernel random-number generator (HMAC_DRBG over SHA-512) before S3-5b lands, with the entropy proof moved to Withdraw (finding 8)? | **Accept** | CLAUDE.md §17, §59; ADR-0013 Amendment 1; ADR-0004 H3's note. Not built: the row moves with the generator |
+| 114, answered | Run the fenced-read experiment on the clock now, and decide the fast path from its result (finding 9)? | **Accept** | ADR-0012's note. C1 and C2 stand until the result is in and you decide |
+| 115, answered | Provisional performance budgets, recorded from CI as trends (finding 10)? | **Accept** | CLAUDE.md §53. The file is to be written |
+| 116, answered | Security rules for the GUI (finding 11)? | **Accept** | CLAUDE.md §52 |
+| 117, answered | Reword "GUI only" as "the GUI is always enough, and nothing needs a terminal", with declarative provisioning and a process for each remote session (finding 12)? | **Accept** | CLAUDE.md §48; ADR-0014 Amendment 1 |
+| 118, answered | ADRs for locking and for the rest of the cryptographic profile; the trade-offs and migration sections missing from ADR-0002 to ADR-0005 (finding 13)? | **Accept** | CLAUDE.md §59. To be written |
+| 119, answered | ADR-0002 Amendment 2: measured boot, the rollback floor, firmware runtime calls (finding 14)? | **Accept** | ADR-0004 H3's note. To be written, with the SYS profile |
+| 120, answered | Make the four statements the build makes true, or reword them (finding 15)? | **Accept** | Not built |
+| 121, answered | Three more rules for reference code, with a person's sign-off on the first driver written that way (finding 16)? | **Accept** | CLAUDE.md §3; ADR-0015 D6 |
+| 122, answered | A checked provenance table, task contracts from S3-5b on, and exit tests for each milestone (finding 17)? | **Accept** | CLAUDE.md §6, §82. Not built |
+| 123, answered | Overflow checks in the kernel and loader; x86-64-v3's integer features once the loader checks the baseline; `verify.sh` and `--locked` in CI; a wider §11 lint (finding 18)? | **Accept** | CLAUDE.md §14. Not built |
+
+Finding 19's smaller points were not put as decisions. They stay in the review as tidying.
+
+The work these create is in `TASKS.md`, items 17 to 30.
+
+**Yours to do:**
+
+- Read revision 7.4's wording and say whether the records pull request may merge (item 106). CLAUDE.md is your text, and merging takes your word.
+- Confirm ADR-0009's text, which you delegated and have not reviewed, and ADR-0007's two additions marked "for the owner's review" (item 122).
+- Name the person who signs off the first driver written from reference reading, when one exists (item 121).
