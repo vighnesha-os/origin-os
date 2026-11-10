@@ -121,19 +121,19 @@ ADR-0005 B1 and B3, as C1–C3 decide. The ledger is `docs/research/2026-11-10-c
 
 ### Process start (S3-3)
 
-ADR-0005 P6, as C4–C6 decide, and C1's inheritance of the principal. The ledger is `docs/research/2026-11-10-start-record.md`. Written before the code (§58, §83); each row names the boot line that will prove it, and its status is updated as each is built.
+ADR-0005 P6, as C4–C6 decide, and C1's inheritance of the principal. The ledger is `docs/research/2026-11-10-start-record.md`. Written before the code (§58, §83), then given the status the boot proof "process start" and its controls (recorded for S3-3 in `SOURCE_PROVENANCE.md`) earned.
 
 | # | Threat | Defence | Status |
 |---|---|---|---|
-| P1 | A child acts for a principal its creator chose instead of the creator's own, so per-user policy and audit name the wrong user (C1) | The launch path reads the principal from the creator and takes none of its own; no capability to choose another exists | Planned: the message the child writes on BOOTSTRAP names the creator's principal (B1) |
-| P2 | The process changes its start record, and code that reads it later trusts what the process wrote | The record's pages are mapped read-only and not executable | Planned: the child's write to its record faults at the record's address |
-| P3 | The record sits where an attacker can predict it | A random page in the upper user half, from RDSEED or RDRAND, clear of every other mapping. Without entropy the launch fails rather than use a predictable address | Planned: two launches place their records at different addresses |
-| P4 | The record carries kernel memory or stale bytes | Fresh zeroed frames, an exact size and zero padding, from the `origin-abi` encoder | Planned: the size read back; host tests of every padding byte |
-| P5 | A start handle has more rights than C6 gives its role | Each role's rights are fixed in the launch path: C6 for the process and thread, a channel's for BOOTSTRAP and DIRECTORY | Planned: each entry's rights read back in ring 3 |
-| P6 | An entry misreports a handle's role or type | Each entry is made from what the child's table holds for that handle | Planned: each entry read back and each handle used |
-| P7 | The first thread runs before the record exists, or finds something else in RDI | The record is written, then the first thread starts with RDI holding its address; every other general-purpose register is zero (the first frame is built zeroed) | Planned: RDI read back in ring 3 |
-| P8 | A failed launch keeps the never-started child alive through its handle to itself, or leaks what its creator passed | A launch that fails after granting closes the child's table | Planned: a launch over 64 KiB is refused, and the leak check holds |
-| P9 | Arguments or environment take unbounded kernel or user memory | At most 64 handles and 64 KiB per record, checked before anything is mapped | Planned: host tests; the refused launch above |
+| P1 | A child acts for a principal its creator chose instead of the creator's own, so per-user policy and audit name the wrong user (C1) | The launch path reads the principal from the creator and takes none of its own; no capability to choose another exists | **Proven** (control 3): the message each child writes on BOOTSTRAP names the creator's principal (B1) |
+| P2 | The process changes its start record, and code that reads it later trusts what the process wrote | The record's pages are mapped read-only and not executable | **Proven** (control 1): each child's write to its record faults at the record's address |
+| P3 | The record sits where an attacker can predict it | A random page in the upper user half, from RDSEED or RDRAND, clear of every other mapping. Without entropy the launch fails rather than use a predictable address | **Proven** (control 5): two launches place their records at different addresses |
+| P4 | The record carries kernel memory or stale bytes | Fresh zeroed frames, an exact size and zero padding, from the `origin-abi` encoder | **Boot**, **Host**: the record each child reads back decodes with `origin-abi`'s decoder, which refuses a wrong size or a non-zero padding byte; host tests of both |
+| P5 | A start handle has more rights than C6 gives its role | Each role's rights are fixed in the launch path: C6 for the process and thread, a channel's for BOOTSTRAP and DIRECTORY | **Proven** (control 4): each entry's rights read back in ring 3 |
+| P6 | An entry misreports a handle's role or type | Each entry is made from what the child's table holds for that handle | **Proven** (control 6): each entry read back and each handle used |
+| P7 | The first thread runs before the record exists, or finds something else in RDI | The record is written, then the first thread starts with RDI holding its address; every other general-purpose register is zero (the first frame is built zeroed) | **Proven** (control 2) for RDI, read back in ring 3; **By design** for the other registers |
+| P8 | A failed launch keeps the never-started child alive through its handle to itself, or leaks what its creator passed | A launch that fails after granting closes the child's table | **Proven** (control 7): a launch refused after its child held a handle gives everything back, and the leak check holds |
+| P9 | Arguments or environment take unbounded kernel or user memory | At most 64 handles and 64 KiB per record, checked before anything is mapped | **Boot**, **Host**: a launch over 64 KiB is refused before anything is mapped; host tests of both limits to the byte |
 | P10 | DIRECTORY is a channel to whatever the creator chose | Intended: a creator decides what its child can reach (P1 of ADR-0005: no ambient authority). The service directory comes with S3-4 | **By design** |
 
 ## What must be closed
