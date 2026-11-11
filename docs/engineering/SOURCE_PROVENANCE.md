@@ -3352,7 +3352,7 @@ A fourth addition to the entry above, from another session and on a branch of it
   - **The application processors' interrupt stacks:** `smp::start_one` makes four region stacks per AP, proves each guard faults and keeps them; `cpu::init_ap` takes their tops for the TSS. `CpuTables` is the GDT and TSS, one page; the boot processor's interrupt stacks are `BspStacks`, in the image.
 - **Soundness of the new and changed safe interfaces:** by reading each against "no safe caller can break memory safety through it, whatever it passes, in whatever order, from whichever processor". The author's reasoning, not an independent review.
   - *`GuardedStack::new`, `Drop`:* a stack's pages are mapped while it is held and given back only by `Drop`; a stack any processor may run on is leaked (`stack_in_use`), as before. `bytes_mut` covers exactly the stack's pages.
-  - *`stack::{reclaim, trim, counts, slot_is_free, slot_top}`:* `reclaim` frees a frame or a slot only after the shootdown of its pages completed; with a lock held that another processor spins on with interrupts off, the shootdown stalls and leaks, which cannot corrupt memory. The rest only read or move slots between bookkeeping states.
+  - *`stack::{reclaim, trim, counts, slot_is_free, slot_top}`:* `reclaim` frees a frame or a slot only after the shootdown of its pages completed; with a lock held that another processor spins on with interrupts off, the shootdown stalls and leaks, which cannot corrupt memory. The rest only read or move slots between bookkeeping states. *(2026-11-11: since `4dc5c15`, `slot_is_free` takes a `StackSlot`, and two more safe functions make one, `stack::slot_holding` and `GuardedStack::slot`. See the third defect below.)*
   - *`GuardablePage`:* a one-page slot; `unmap` frees the frame only after its own shootdown; dropping it frees the slot only if that shootdown happened, and otherwise retires it.
   - *`vm::map_stack_pages`, `unmap_stack_pages` (crate-private):* refuse anything outside the region; `OwnedFrame::from_mapping` is used only on a frame they have just taken out of the tables.
   - *`vm::make_guards` (crate-private):* now refuses more. *`vm::direct_map_leaves`:* reads.
@@ -3379,20 +3379,32 @@ A fourth addition to the entry above, from another session and on a branch of it
 - **A third defect, brought in by the second's fix and found by CI's real-processor jobs on 2026-11-11; fixed in `4dc5c15` on `claude/stacks-proof-own-slot`:**
   - **The defect.** Since `87905fd` the proof's wait, and its clause "its slot free again", asked `stack::slot_is_free(top)`, with `top` the stack's `GuardedStack::top()`. That is the first address past the stack, the base of the next slot, so both asked about the next slot.
   - **How it failed.** With three processors or more, an idle processor can take the proof's slot to reclaim it in its idle loop (`sched::reap`), while the boot processor's own `reclaim` finds nothing more to do. The next slot was free, so the wait ended at once, and the reader on CPU 1 read the old pages before that reclaim had taken them away.
-  - **Where.** CI's two real-processor jobs on `land/s3-part2` failed this way in three runs and seven boots: the Intel and AMD IOMMU machines with 4 processors, the x2APIC machine with 3, and the host's own processor with 4. They never failed with 1 or 2 processors, and passed in one earlier run by timing. QEMU's software processor on the development Mac never showed it.
+  - **Where.** CI's two real-processor jobs on `land/s3-part2` failed this way in three runs and seven boots: the Intel and AMD IOMMU machines with 4 processors, the x2APIC machine with 3, and the host's own processor with 4. They never failed with 1 or 2 processors, and passed in one earlier run by timing. QEMU's software processor on the development Mac never showed it. *(2026-11-11, corrected: by the fix's merge into the batch, `b15f8c8`, it was four runs, on `c10ab95`, `dc50296`, `d09684a` and `059f220`, and ten failed boots. All ten had 3 or 4 processors: 10 of the 23 such boots failed, and none of the 32 with 1 or 2. The counts are the coordinating session's, from the saved job logs. The fix's commit message keeps the old count.)*
   - **The reading is the coordinating session's,** from the logs, checked here against the code. Nothing has measured the race.
-  - **The fix.** `stack::slot_is_free` takes a `StackSlot`, which only `GuardedStack::slot` makes, so it cannot be given a top. `stack::slot_holding(addr)` names the slot an address is in. The proof waits on `made.slot()`, and its line also requires `slot_holding(top - 1)` to be that slot. A wait on any other slot therefore fails the proof on every boot, under QEMU too. xtask expects the new line: "...; its slot, the one its last byte was in: true, free again: true".
+  - **The fix.** `stack::slot_is_free` takes a `StackSlot`, which only `GuardedStack::slot` makes, so it cannot be given a top. `stack::slot_holding(addr)` names the slot an address is in. The proof waits on `made.slot()`, and its line also requires `slot_holding(top - 1)` to be that slot. A wait on any other slot therefore fails the proof on every boot, under QEMU too. xtask expects the new line: "...; its slot, the one its last byte was in: true, free again: true". *(2026-11-11, corrected: `GuardedStack::slot` is not the only maker. `stack::slot_holding` is public, makes one too, and the proof calls it. So the type keeps a bare address out of `slot_is_free`, but nothing more: `slot_holding(top)` still names the next slot. The own-slot clause catches that, as the third control below shows. The fix's commit message makes the same claim and is left as it is.)*
+  - **Soundness of the new and changed safe interfaces** *(2026-11-11, added)*: by reading, as for the entry's own. The author's reasoning, not an independent review.
+    - `StackSlot` is a slot's number in a private field, and `Copy`. It names a slot and holds nothing: one kept after its stack is gone names a slot that may be in use again.
+    - `GuardedStack::slot` returns the stack's own number.
+    - `slot_holding` computes a number from an address and the region's placed base, and gives `None` outside the region.
+    - `slot_is_free` reads a slot's state with interrupts off.
+    - None of them maps, frees or writes anything.
   - **Controls,** each a change to a scratch worktree at `4dc5c15`, never committed, run on 2026-11-11 between 10:31 and 10:33 UTC, the boots on 2 processors:
     - *The old call,* `slot_is_free(top)`, no longer compiles (`E0308`, mismatched types).
     - *`GuardedStack::slot` names the next slot:* the boot fails at "...: 4 of 4 reads there faulted and 0 saw the old pages; its slot, the one its last byte was in: false, free again: true: kernel stacks failed".
     - *The proof waits on `slot_holding(top)`, the original reading in the new interface:* the same line, the same failure.
     - Both boots failed on the software processor, where the race never shows: the identity clause catches a wrong slot whatever the timing.
+  - **ADR-0013's C28 run again, its first run on the fixed proof** *(2026-11-11, added)*:
+    - The edit is the same: a reclaim that sends no shootdown.
+    - It was made in an exported copy of `4ba9fde`, the batch with task 18b, never committed. That copy was built and booted once, ending at 14:17 UTC, under QEMU 11.1.3 TCG with 2 processors and Intel VT-d.
+    - Caught: "...: 0 of 4 reads there faulted and 4 saw the old pages; its slot, the one its last byte was in: true, free again: true: kernel stacks failed", and the boot was refused.
+    - The unedited tree passed beside it.
+    - ADR-0013's row quotes both runs.
   - **Gates on `4dc5c15`,** with a clean tree, from 10:23 UTC:
     - clippy for the kernel target passed.
     - `cargo xtask check` passed: 1,370 host tests in 43 suites, none failed, 10 ignored; the unsafe gate's 324 sites in its 22 listed files; Loom, all 42 models passed and all 68 controls were caught (98 runs).
     - `cargo xtask boot-test` passed 11 of 11. The kernel boot's line was true in both clauses, and the boot ended "degraded: 60 of 61 proofs passed; failed: speculation controls" (item 154).
   - **Not shown:**
-    - that this was the whole cause of CI's failures, which only CI's real-processor jobs over several runs can show;
+    - that this was the whole cause of CI's failures, which only CI's real-processor jobs over several runs can show; *(2026-11-11: CI's first run with the fix, 43014541345 on `b15f8c8`, passed all five jobs, both real-processor jobs among them. One run.)*
     - the race itself, which QEMU's software processor does not reproduce.
 - **Review:** none yet. No human has reviewed this code.
 - **Licensing:** MIT OR Apache-2.0.
