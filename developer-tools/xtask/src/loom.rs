@@ -114,6 +114,16 @@ const GIVEN_BACK: &[&str] = &[
 /// A change that returned a stall left its space confirmed.
 const FORGOTTEN: &[&str] = &["a change that stalled left its space confirmed"];
 
+/// What the port models report (`models.rs`): a packet lost or doubled, a binding left armed
+/// after its handle closed, and a closed port left holding something.
+const PORT_LOST: &[&str] = &["a signal was lost, or one binding made two packets"];
+const PORT_STILL_ARMED: &[&str] = &["a binding stayed armed after its handle closed"];
+const PORT_CLOSED: &[&str] = &[
+    "a packet was queued in a closed port",
+    "a binding stayed armed on a closed port",
+    "a close did not take back its binding's storage",
+];
+
 /// The models of a change to a space whose shootdowns may stall (`models.rs`).
 const ROUND_STALLS: &str =
     "a_change_whose_round_stalls_is_still_made_and_frees_only_what_a_flush_covered";
@@ -140,6 +150,7 @@ const FLOOR: &str = "framekernel/frame/sync/src/floor.rs";
 const SHOOTDOWN: &str = "framekernel/frame/sync/src/shootdown.rs";
 const REFCOUNT: &str = "framekernel/frame/sync/src/refcount.rs";
 const SLOTS: &str = "framekernel/frame/sync/src/slots.rs";
+const PORTS: &str = "framekernel/frame/sync/src/ports.rs";
 
 /// `WaitQueue::take_all`'s one critical section.
 const TAKE_ALL: &str = "        scheduler.without_interrupts(|| core::mem::replace(&mut *self.waiters.lock(), [None; N]))\n";
@@ -1048,6 +1059,151 @@ const CONTROLS: &[Control] = &[
                     return Err(refused.unwrap_or_else(|| stall.into()));
 ",
         models: &[(ROUND_STALLS, FORGOTTEN), (FIRST_FLUSH_STALLS, FORGOTTEN)],
+    },
+    Control {
+        // The bind reads the signals before it takes the source's lock: a raise in between
+        // delivers to nothing, and the binding is armed after it, for a signal already raised.
+        name: "bind_reads_the_signals_before_the_lock",
+        file: PORTS,
+        from: "        let done = scheduler.without_interrupts(move || {
+            let mut arms = source.state.lock();
+            if !still_open() {
+                return Done::Refused(Refused::HandleClosed, stored, way_back, way_on);
+            }
+            let observed = signals();
+",
+        to: "        let early = signals();
+        let done = scheduler.without_interrupts(move || {
+            let mut arms = source.state.lock();
+            if !still_open() {
+                return Done::Refused(Refused::HandleClosed, stored, way_back, way_on);
+            }
+            let observed = early;
+",
+        models: &[("ports_bind_against_raise", PORT_LOST)],
+    },
+    Control {
+        // The bind asks whether the handle is open before it takes the source's lock: a close in
+        // between finds nothing armed to cancel, and the binding is armed with its handle gone.
+        name: "bind_asks_the_handle_before_the_lock",
+        file: PORTS,
+        from: "            let mut arms = source.state.lock();
+            if !still_open() {
+",
+        to: "            let open = still_open();
+            let mut arms = source.state.lock();
+            if !open {
+",
+        models: &[(
+            "ports_bind_against_a_close_of_the_bound_handle",
+            PORT_STILL_ARMED,
+        )],
+    },
+    Control {
+        // The bind does not look at whether the port has closed: a binding whose signal is
+        // already raised queues its packet in a closed port.
+        name: "bind_ignores_a_closed_port",
+        file: PORTS,
+        from: "            if state.closed || !counted {
+                return Done::Refused(Refused::PortClosed, stored, way_back, way_on);
+            }
+",
+        to: "            let _ = counted;\n",
+        models: &[("ports_close_against_a_bind_that_queues", PORT_CLOSED)],
+    },
+    Control {
+        // An explicit cancel takes the armed binding but leaves a packet already queued.
+        name: "explicit_cancel_leaves_a_queued_packet",
+        file: PORTS,
+        from: "            state.queue.remove_where(
+                |store| store.source == number && store.key == key,
+                &mut storage,
+            );
+",
+        to: "",
+        models: &[(
+            "ports_raise_against_an_explicit_cancel",
+            &[
+                "an explicit cancel did not take its binding back once",
+                "a packet from a cancelled binding",
+            ],
+        )],
+    },
+    Control {
+        // The implicit cancel picks no binding: the one made through the closed handle stays
+        // armed.
+        name: "implicit_cancel_picks_nothing",
+        file: PORTS,
+        from: "        let (queued, canceled) = self.fire(scheduler, Kind::Canceled, signals, |store, _| {
+            store.owner.as_ref().is_some_and(&which)
+        });
+",
+        to: "        let _ = &which;
+        let (queued, canceled) = self.fire(scheduler, Kind::Canceled, signals, |_, _| false);
+",
+        models: &[
+            ("ports_raise_against_an_implicit_cancel", PORT_STILL_ARMED),
+            (
+                "ports_bind_against_a_close_of_the_bound_handle",
+                PORT_STILL_ARMED,
+            ),
+        ],
+    },
+    Control {
+        // A close takes the port's queue and index but leaves each binding armed for the port
+        // on its source, where a later raise queues a packet in the closed port.
+        name: "close_leaves_the_armed_bindings",
+        file: PORTS,
+        from: "                way_back.disarm(scheduler, self, &mut storage);\n",
+        to: "                let _ = way_back;\n",
+        models: &[
+            ("ports_close_against_raise", PORT_CLOSED),
+            ("ports_close_against_a_bind_that_arms", PORT_CLOSED),
+        ],
+    },
+    Control {
+        // A delivery that finds the source's lock held gives up, as if the holder would see its
+        // signal: the holder may have read the signals already.
+        name: "delivery_gives_up_on_a_busy_source",
+        file: PORTS,
+        from: "            let mut arms = self.state.lock();
+            if arms.armed.is_empty() {
+",
+        to: "            let Some(mut arms) = self.state.try_lock() else {
+                return (0, Stack::new());
+            };
+            if arms.armed.is_empty() {
+",
+        models: &[("ports_two_raisers", PORT_LOST)],
+    },
+    Control {
+        // A delivery queues the packet and wakes no thread waiting for one.
+        name: "delivery_wakes_no_taker",
+        file: PORTS,
+        from: "        wake_ports(scheduler, &fired);\n",
+        to: "",
+        models: &[("ports_taker_against_a_delivery", DEADLOCK)],
+    },
+    Control {
+        // A close wakes no thread waiting on the port.
+        name: "close_wakes_no_waiter",
+        file: PORTS,
+        from: "        // Each finds the port closed.\n        self.wake(scheduler);\n",
+        to: "",
+        models: &[("ports_close_against_a_waiter", DEADLOCK)],
+    },
+    Control {
+        // A reservation looks only at the index's free room, not at the room the other
+        // reservations already keep: two count on the same last slot, and the second bind finds
+        // the index full.
+        name: "reservation_ignores_the_room_others_keep",
+        file: PORTS,
+        from: "                if state.index.room() > reserved {\n",
+        to: "                if state.index.room() > 0 {\n",
+        models: &[(
+            "ports_two_reservations_race_for_the_last_slot",
+            &["a bind found no room"],
+        )],
     },
 ];
 
