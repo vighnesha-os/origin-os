@@ -87,7 +87,9 @@ impl MemoryObject {
         self.frames.len() as u64
     }
 
-    /// The frames `asked` maps: its pages of this object, in order.
+    /// The frames `asked` maps: its pages of this object, in order. `mapping::check` made `asked`
+    /// from a program's offset and length, and kept its pages inside the object on a wrongly
+    /// guessed path too (ADR-0017 Z9).
     fn run(&self, asked: &Asked) -> Option<&[SharedFrame]> {
         self.frames.get(mapping::frames(asked)?)
     }
@@ -280,6 +282,10 @@ pub(crate) fn unmap(
 ) -> Result<(), Error> {
     let pages = mapping::whole_pages(length)?;
     let space = target.memory().ok_or(Error::InvalidArgs)?;
+    // The address and the length are a program's, and the space walks its page tables by them.
+    // `nospec` keeps the run in the user half on a wrongly guessed path too (ADR-0017 Z9). A run
+    // it refuses is no mapping's, and the status is the one the records give for that.
+    let (base, pages) = mapping::user_run(base, pages).ok_or(Error::InvalidArgs)?;
     let allow = without_interrupts(|| target.mappings.lock().begin(base, pages))?;
     let paid = match pay(caller, &space, pages) {
         Ok(paid) => paid,
@@ -327,6 +333,9 @@ pub(crate) fn protect(
     let new = Allow::from_bits(bits)?;
     let pages = mapping::whole_pages(length)?;
     let space = target.memory().ok_or(Error::InvalidArgs)?;
+    // As in `unmap`: the run is a program's, and `nospec` keeps it in the user half on a wrongly
+    // guessed path too (ADR-0017 Z9).
+    let (base, pages) = mapping::user_run(base, pages).ok_or(Error::InvalidArgs)?;
     let old = without_interrupts(|| target.mappings.lock().begin(base, pages))?;
     let unchanged = |result: Result<(), Error>| {
         without_interrupts(|| target.mappings.lock().end(base, old));
