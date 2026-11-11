@@ -231,7 +231,8 @@ pub const PLACEMENT_TRIES: u32 = 8;
 /// random number and `take` is given the place it makes ([`place`]): `Ok(true)` if the pages
 /// went in there, `Ok(false)` if the place is taken. Returns the first place that took them.
 ///
-/// `NotSupported` if a draw has no entropy to give, and `InvalidArgs` if the pages fit nowhere
+/// `NotSupported` if a draw gives no number (the kernel's generator refused, ADR-0016), and
+/// `InvalidArgs` if the pages fit nowhere
 /// in the region; an error of `take` ends the search with that error. `Limit` if every draw
 /// landed on something mapped: that is a bound of the process's own address space, and
 /// `no_memory` stays for frames and the kernel's heap (ADR-0005, the notes on D4 and D5; the
@@ -836,7 +837,7 @@ mod tests {
         );
         assert_eq!(got, Ok(place(5, 1).expect("fits")));
         assert_eq!(draws, 1);
-        // No entropy: nothing is tried.
+        // No number: nothing is tried.
         let mut takes = 0u32;
         let got = place_at_random(
             1,
@@ -848,7 +849,7 @@ mod tests {
         );
         assert_eq!(got, Err(Error::NotSupported));
         assert_eq!(takes, 0);
-        // Entropy that gives out after three draws: not `limit`, which is for eight taken.
+        // A generator that refuses after three draws: not `limit`, which is for eight taken.
         let (mut draws, mut takes) = (0u64, 0u32);
         let got = place_at_random(
             1,

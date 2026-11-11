@@ -1190,6 +1190,16 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
             "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, service-directory and memory-object proofs did not run"
         );
     }
+    // Events and ports, and the clock as ring 3 reads it (task S3-6), need no generator: their
+    // processes are built by the kernel at fixed addresses, and nothing is placed at random.
+    proofs.record(
+        Proof::EventsPorts,
+        crate::ipc_proof::prove_events_ports(com1, cpus, bsp, tsc_hz),
+    );
+    proofs.record(
+        Proof::UserClock,
+        crate::ipc_proof::prove_user_clock(com1, bsp, tsc_hz),
+    );
     // The kernel stacks' region needs no generator: its base is the loader's value or the
     // fixed one, and the proof says which.
     proofs.record(Proof::Stacks, crate::stacks::prove(com1, cpus, bsp, tsc_hz));

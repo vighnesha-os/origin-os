@@ -46,7 +46,7 @@ use crate::cpu::{self, CpuIndex};
 use crate::handles::Need;
 use crate::ipc::{self, Object};
 use crate::launch::{self, Given};
-use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, MemoryLimits, Process};
+use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, MemoryLimits, ObjectLimits, Process};
 use crate::{memory, sched, syscall, time};
 
 /// Where every proof process's code begins.
@@ -101,8 +101,10 @@ enum Arg {
 use Arg::{Handle as Hd, Imm};
 
 mod directory;
+mod events_ports;
 mod memory_objects;
 pub(crate) use directory::prove_directory;
+pub(crate) use events_ports::{prove_events_ports, prove_user_clock};
 pub(crate) use memory_objects::prove_memory;
 
 /// What a step must do.
@@ -455,6 +457,7 @@ const LIMITS: Limits = Limits {
     message_bytes: 1 << 20,
     debug_calls: true,
     memory: MemoryLimits::NONE,
+    objects: ObjectLimits::NONE,
 };
 
 /// Waits for `process`'s last thread to end.
@@ -808,11 +811,13 @@ fn hostile_groups(kernel: u64, foreign: u64) -> Vec<Group> {
                     &[],
                     Error::NotSupported.raw()
                 ),
+                // Events exist since task S3-6, and this process was given no quota for one
+                // (ADR-0005 D4, Amendment 7 F7).
                 step(
-                    "an object type not here yet",
+                    "an event with no quota for one",
                     sys::EVENT_CREATE,
                     &[Imm(slot_addr(9))],
-                    Error::NotSupported.raw()
+                    Error::Limit.raw()
                 ),
             ],
         },
@@ -1526,6 +1531,7 @@ fn quotas(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         message_bytes: 1 << 20,
         debug_calls: true,
         memory: MemoryLimits::NONE,
+        objects: ObjectLimits::NONE,
     };
     let limit = Error::Limit.raw();
     let steps = alloc::vec![
@@ -1583,6 +1589,7 @@ fn byte_quota(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64)
         message_bytes: 64,
         debug_calls: true,
         memory: MemoryLimits::NONE,
+        objects: ObjectLimits::NONE,
     };
     let (Some(mut writer), Some(mut peer)) = (
         Image::new(limits, proof_programs::script()),
@@ -2940,7 +2947,7 @@ fn refused_launches(creator: &Process) -> (bool, bool) {
             0,
         )
         .is_ok_and(|w| w.status.is_ok());
-        let _ = ipc::handle_close(&creator.handles, held, Need::NOTHING);
+        let _ = ipc::handle_close(creator, held, Need::NOTHING);
         Some((outcome, closed))
     };
     let large = alloc::vec![7u8; start::MAX_SIZE];

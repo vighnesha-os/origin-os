@@ -103,6 +103,11 @@ fn the_call_numbers_are_the_same() {
         (number::MEMORY_MAP, abi::MEMORY_MAP),
         (number::MEMORY_UNMAP, abi::MEMORY_UNMAP),
         (number::MEMORY_PROTECT, abi::MEMORY_PROTECT),
+        (number::PORT_CREATE, abi::PORT_CREATE),
+        (number::OBJECT_WAIT_ASYNC, abi::OBJECT_WAIT_ASYNC),
+        (number::PORT_WAIT, abi::PORT_WAIT),
+        (number::PORT_CANCEL, abi::PORT_CANCEL),
+        (number::CLOCK_READ, abi::CLOCK_READ),
     ];
     assert_eq!(server::CALLS.len(), pairs.len());
     for (ours, theirs) in pairs {
@@ -219,6 +224,36 @@ fn the_limits_layouts_and_version_are_the_same() {
             "byte {raw:#x}"
         );
     }
+}
+
+/// Events and ports (ADR-0005 C9, C10, Amendment 7 F1 and F6): their rights and the packet.
+#[test]
+fn events_and_ports_are_the_same() {
+    use origin_abi::{packet_kind, port_packet};
+    assert_eq!(generated::EVENT_RIGHTS.bits(), origin_abi::rights::EVENT);
+    assert_eq!(generated::PORT_RIGHTS.bits(), origin_abi::rights::PORT);
+    assert_eq!(
+        <generated::PortPacket as rt::Fixed>::SIZE,
+        port_packet::SIZE
+    );
+    let fields = [
+        (generated::PortPacket::KEY_AT, port_packet::KEY_AT),
+        (generated::PortPacket::KIND_AT, port_packet::KIND_AT),
+        (generated::PortPacket::TRIGGER_AT, port_packet::TRIGGER_AT),
+        (generated::PortPacket::OBSERVED_AT, port_packet::OBSERVED_AT),
+        (generated::PortPacket::RESERVED_AT, port_packet::RESERVED_AT),
+        (generated::PortPacket::DATA_AT, port_packet::DATA_AT),
+    ];
+    for (ours, theirs) in fields {
+        assert_eq!(ours, theirs);
+    }
+    assert_eq!(generated::PacketKind::Signal.raw(), packet_kind::SIGNAL);
+    assert_eq!(generated::PacketKind::Canceled.raw(), packet_kind::CANCELED);
+    assert_eq!(
+        generated::PacketKind::from_raw(0),
+        None,
+        "0 is never a kind"
+    );
 }
 
 /// Memory objects (ADR-0005 C6-C8): their rights, bits, page size and request layouts.
@@ -361,6 +396,55 @@ impl Calls for Recorder {
         _: u64,
         _: generated::MapAccess,
     ) -> Result<(), server::MemoryProtectError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn event_create(&self, _: rt::UserRef<rt::Handle>) -> Result<(), server::EventCreateError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn object_signal(
+        &self,
+        _: rt::HandleArg,
+        _: generated::Signals,
+        _: generated::Signals,
+    ) -> Result<(), server::ObjectSignalError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn port_create(&self, _: rt::UserRef<rt::Handle>) -> Result<(), server::PortCreateError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn object_wait_async(
+        &self,
+        _: rt::HandleArg,
+        _: rt::HandleArg,
+        _: u64,
+        _: generated::Signals,
+    ) -> Result<(), server::ObjectWaitAsyncError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn port_wait(
+        &self,
+        _: rt::HandleArg,
+        _: u64,
+        _: rt::UserRef<generated::PortPacket>,
+    ) -> Result<(), server::PortWaitError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn port_cancel(
+        &self,
+        _: rt::HandleArg,
+        _: rt::HandleArg,
+        _: u64,
+    ) -> Result<(), server::PortCancelError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn clock_read(&self, _: rt::UserRef<u64>) -> Result<(), server::ClockReadError> {
         self.ran.set(true);
         Ok(())
     }

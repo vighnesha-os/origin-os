@@ -1494,6 +1494,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(launch_markers())
         .chain(directory_markers())
         .chain(memory_markers())
+        .chain(events_ports_markers())
         .chain(stack_markers(machine))
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
@@ -1795,6 +1796,8 @@ fn boot_failures() -> Vec<&'static str> {
         ": start failed",
         ": directory failed",
         ": memory failed",
+        ": events and ports failed",
+        ": user clock failed",
         ": console failed",
         ": TLB failed",
         ": address spaces failed",
@@ -2231,7 +2234,7 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
         "origin-kernel: ipc: too few rights: write without WRITE -> ACCESS_DENIED, read without READ -> ACCESS_DENIED, wait without WAIT -> ACCESS_DENIED, duplicate without DUPLICATE -> ACCESS_DENIED, send without TRANSFER -> ACCESS_DENIED".into(),
         "origin-kernel: ipc: rights only shrink: adding WRITE -> INVALID_ARGS, an undefined right -> INVALID_ARGS, dropping DUPLICATE -> OK, the copy cannot write -> ACCESS_DENIED, the copy can read -> SHOULD_WAIT".into(),
         "origin-kernel: ipc: bad pointers: write from the kernel -> FAULT, from unmapped -> FAULT, across the end of mapped -> FAULT, from address 0 -> FAULT, wrapping past the top -> FAULT, from the top page -> FAULT, read into the kernel -> FAULT, into unmapped -> FAULT, into code -> FAULT, into read-only memory -> FAULT, sizes in the kernel -> FAULT, a handle record across the end of mapped -> FAULT, create out to the kernel -> FAULT, create out to read-only -> FAULT, duplicate out to the kernel -> FAULT, duplicate out to read-only -> FAULT, wait out to read-only -> FAULT, wait out to the kernel -> FAULT, handle list in the kernel -> FAULT, zero length names no memory -> OK, the empty message arrived -> 0x0".into(),
-        "origin-kernel: ipc: sizes and numbers: one byte too many -> INVALID_ARGS, one handle too many -> INVALID_ARGS, no signals -> INVALID_ARGS, an undefined signal -> INVALID_ARGS, a sizes structure too small -> INVALID_ARGS, an unknown call number -> NOT_SUPPORTED, an object type not here yet -> NOT_SUPPORTED".into(),
+        "origin-kernel: ipc: sizes and numbers: one byte too many -> INVALID_ARGS, one handle too many -> INVALID_ARGS, no signals -> INVALID_ARGS, an undefined signal -> INVALID_ARGS, a sizes structure too small -> INVALID_ARGS, an unknown call number -> NOT_SUPPORTED, an event with no quota for one -> LIMIT".into(),
         "origin-kernel: ipc: queues: empty -> SHOULD_WAIT, nothing by deadline 0 -> TIMED_OUT, written -> OK, readable -> OK, observed -> 0x3, 4-byte buffer -> BUFFER_TOO_SMALL, it needs -> 0x10, still there -> OK, received -> 0x10".into(),
         "origin-kernel: ipc: a full queue: the write after the last -> SHOULD_WAIT, not writable -> TIMED_OUT, writable again after a read -> OK".into(),
         "origin-kernel: ipc: a closed peer: sees PEER_CLOSED -> OK, observed -> 0x5, write -> PEER_CLOSED, the message sent before the close -> OK, read past the close -> PEER_CLOSED, READABLE will never rise -> TIMED_OUT".into(),
@@ -2322,6 +2325,27 @@ fn directory_markers() -> Vec<String> {
         "origin-kernel: directory: a launcher started a directory, a service and a client; the client's connect, and the request it wrote on its own end before any reply, reached the service through the directory: true; the service read that request stamped with the client's process and principal, not the directory's: true; the client read the service's reply stamped with the service's process: true".into(),
         "origin-kernel: directory: the client's replies, read in ring 3 and decoded by the generated client: ok for the interface and major the directory holds: true; not_found (-14) for a major it does not hold: true; that connection's end reports peer_closed: true; the service answered ok for the end passed to it: true".into(),
         "origin-kernel: directory: the directory, the service, the client and all they held are gone: heap ".into(),
+    ]
+}
+
+/// The events-and-ports proof and the clock as ring 3 reads it (ADR-0005 C9, C10, C13,
+/// Amendment 7; `ipc_proof::prove_events_ports`, `ipc_proof::prove_user_clock`).
+fn events_ports_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: events: an event starts with nothing raised; object_signal raises and clears SIGNALED, a signal in both masks ends set, and wait_one sees each state: true; a mask with another signal, a handle without signal and a bad pointer are refused: true".into(),
+        "origin-kernel: ports: a binding on an event and on a channel end becomes one packet when its signal is raised, at once if it already is, twice if made twice, in the order queued: true; each packet is what was bound and seen: true".into(),
+        "origin-kernel: ports: port_cancel removes an armed binding and a queued packet silently, then not_found: true; closing the handle a binding was made through queues one canceled packet, another duplicate's close cancels nothing, a move cancels, and a queued signal packet stays with nothing after it: true".into(),
+        "origin-kernel: ports: hostile binds, waits and cancels are refused in D5's order, and a port cannot be waited on: true; events, ports and bindings stop at their quotas, and closing a port gives back its bindings' charges: true; every other call returned what it must, and the three processes ended: true".into(),
+        "origin-kernel: ports: a process given no quota can make no event and no port: true".into(),
+        "origin-kernel: ports: a thread in port_wait through a handle another thread closes ends canceled, while a duplicate keeps the port open and empty: true".into(),
+        "origin-kernel: ports: a binder that exits while another process holds the port leaves its 2 bindings as canceled packets, still charged to it (2 after its exit, 0 once the holder read them): true".into(),
+        "origin-kernel: ports: 30 round trips between ".into(),
+        " us each (QEMU, through the script interpreter, no budget): true".into(),
+        "origin-kernel: ports: a bind, a signal that delivers it, a take and a clear took ".into(),
+        " ns together (QEMU, the kernel's own calls, 1000 times, no budget): true".into(),
+        "origin-kernel: ports: every process, event, port, binding and packet of the proof is gone: heap ".into(),
+        "origin-kernel: clock: 30 reads from ring 3 never went back: true; each lies between the kernel's readings before and after: true; a wait to a deadline on the same clock ended after it: true; a bad out pointer is fault: true; one read every ".into(),
+        " ns (QEMU, through the script interpreter)".into(),
     ]
 }
 

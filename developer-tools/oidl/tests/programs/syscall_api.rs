@@ -29,6 +29,10 @@ struct Log {
     records_in: Option<(u64, Vec<u8>, Vec<u8>)>,
     /// What the next `records_out` writes: the records' bytes, `n` and the array's bytes.
     next_records: Option<(Vec<u8>, u32, Vec<u8>)>,
+    /// What the next port_wait writes: a packet's 32 bytes.
+    next_packet: Option<[u8; 32]>,
+    /// What the next clock_read writes.
+    clock: u64,
 }
 
 static MOCK: Mutex<Option<Log>> = Mutex::new(None);
@@ -163,12 +167,37 @@ pub unsafe extern "C" fn origin_kernel_wait_one(
     })
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn origin_kernel_event_create(_out: *mut u32) -> i64 {
-    k::Error::NotSupported.raw()
+pub unsafe extern "C" fn origin_kernel_event_create(out: *mut u32) -> i64 {
+    with(|m| {
+        m.calls.push("event_create".to_string());
+        unsafe { out.write(21) };
+        m.status
+    })
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn origin_kernel_object_signal(_o: u32, _clear: u32, _set: u32) -> i64 {
-    k::Error::NotSupported.raw()
+pub extern "C" fn origin_kernel_object_signal(object: u32, clear: u32, set: u32) -> i64 {
+    with(|m| {
+        m.calls.push(format!("object_signal {object} {clear} {set}"));
+        m.status
+    })
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn origin_kernel_port_wait(port: u32, deadline: u64, packet: *mut u8) -> i64 {
+    with(|m| {
+        m.calls.push(format!("port_wait {port} {deadline}"));
+        if let Some(bytes) = m.next_packet {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), packet, bytes.len()) };
+        }
+        m.status
+    })
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn origin_kernel_clock_read(nanos: *mut u64) -> i64 {
+    with(|m| {
+        m.calls.push("clock_read".to_string());
+        unsafe { nanos.write(m.clock) };
+        m.status
+    })
 }
 
 // The fixture's entry points. Only the records calls run here; the others exist for the link.
@@ -380,8 +409,59 @@ fn client_paths() {
         rt::CallError::Method(kc::WaitOneFailure { error: ks::WaitOneError::Canceled, observed: None }),
         "an undecodable @also_on value is reported as absent"
     );
-    assert_eq!(kc::event_create(), Err(rt::CallError::Method(ks::EventCreateError::NotSupported)));
+    // event_create, object_signal (ADR-0005 Amendment 7, F5, F17): a handle back; a status.
+    with(|m| m.status = 0);
+    assert_eq!(kc::event_create(), Ok(handle(21)));
+    assert_eq!(kc::object_signal(handle(21), k::Signals::NONE, k::Signals::SIGNALED), Ok(()));
+    with(|m| m.status = k::Error::WrongType.raw());
+    assert_eq!(
+        kc::object_signal(handle(3), k::Signals::NONE, k::Signals::SIGNALED),
+        Err(rt::CallError::Method(ks::ObjectSignalError::WrongType))
+    );
+    // port_wait's packet is a plain 32-byte record the kernel writes (F1), decoded field by field.
+    with(|m| m.status = 0);
+    let mut packet = [0u8; 32];
+    packet[0..8].copy_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes());
+    packet[8..12].copy_from_slice(&2u32.to_le_bytes());
+    packet[12..16].copy_from_slice(&k::Signals::SIGNALED.bits().to_le_bytes());
+    packet[16..20].copy_from_slice(&k::Signals::TERMINATED.bits().to_le_bytes());
+    with(|m| m.next_packet = Some(packet));
+    assert_eq!(
+        kc::port_wait(handle(22), 99),
+        Ok(k::PortPacket {
+            key: 0x0123_4567_89AB_CDEF,
+            kind: k::PacketKind::Canceled,
+            trigger: k::Signals::SIGNALED,
+            observed: k::Signals::TERMINATED,
+            reserved: 0,
+            data: 0,
+        })
+    );
+    // A kind this minor does not know, or 0, is a protocol error at the client, not a value: a
+    // new kind is a new minor of origin.kernel.
+    for kind in [0u32, 3] {
+        packet[8..12].copy_from_slice(&kind.to_le_bytes());
+        with(|m| m.next_packet = Some(packet));
+        assert_eq!(
+            kc::port_wait(handle(22), 0),
+            Err(rt::CallError::Protocol(rt::WireError::Enum)),
+            "kind {kind}"
+        );
+    }
+    with(|m| m.status = k::Error::Canceled.raw());
+    assert_eq!(
+        kc::port_wait(handle(22), 0),
+        Err(rt::CallError::Method(ks::PortWaitError::Canceled))
+    );
+    // clock_read: the nanoseconds the kernel wrote (F10).
+    with(|m| {
+        m.status = 0;
+        m.clock = 1_234_567_890;
+    });
+    assert_eq!(kc::clock_read(), Ok(1_234_567_890));
     let log = with(|m| m.calls.clone());
+    assert!(log.contains(&"object_signal 21 0 8".to_string()), "{log:?}");
+    assert!(log.contains(&"port_wait 22 99".to_string()), "{log:?}");
     assert!(log.contains(&"handle_duplicate 5 3".to_string()), "{log:?}");
     assert!(log.contains(&"channel_write 3 [97, 98, 99] [4, 5]".to_string()), "{log:?}");
     assert!(log.contains(&"channel_read 3 8 2".to_string()), "{log:?}");

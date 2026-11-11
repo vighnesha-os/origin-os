@@ -169,6 +169,8 @@ mod console;
 #[cfg(target_os = "none")]
 mod dma;
 #[cfg(target_os = "none")]
+mod event;
+#[cfg(target_os = "none")]
 mod i8042;
 #[cfg(target_os = "none")]
 mod ipc;
@@ -184,6 +186,8 @@ mod launch;
 mod memory_object;
 #[cfg(target_os = "none")]
 mod pcie;
+#[cfg(target_os = "none")]
+mod port;
 #[cfg(target_os = "none")]
 mod process;
 #[cfg(target_os = "none")]

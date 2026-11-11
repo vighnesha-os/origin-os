@@ -47,17 +47,20 @@ use crate::handles::HandleTable;
 use crate::mapping::{Budget, Mappings, Rate};
 use crate::memory_object::MemoryObject;
 use crate::paging::{Access, MapError, Translation};
-use crate::quota::Count;
+pub(crate) use crate::quota::ObjectLimits;
+use crate::quota::{Count, ObjectCounts};
 use crate::runqueue::QueueError;
 use origin_abi::{Error, Handle, signals};
 use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
+use origin_frame::sync::ports::Source;
 use origin_frame::userspace::{UserFrame, UserSpace};
 
 use crate::cpu::{CpuIndex, without_interrupts};
 use crate::ipc::{self, Object};
+use crate::port::Ports;
 use crate::sched;
-use crate::wait::WaitQueue;
+use crate::wait::{KernelThreads, WaitQueue};
 
 /// Values a process's report log keeps, for the boot proofs.
 const REPORTS: usize = 128;
@@ -76,6 +79,9 @@ pub(crate) struct Account {
     /// made, refunded when its last handle and mapping are gone.
     committed: AtomicUsize,
     max_committed: usize,
+    /// The events and ports this process created that still exist, and the bindings it made
+    /// whose packet has not left its port.
+    objects: ObjectCounts,
 }
 
 impl Account {
@@ -131,6 +137,11 @@ impl Account {
     pub(crate) fn committed(&self) -> usize {
         self.committed.load(Ordering::Acquire)
     }
+
+    /// Its counts of events, ports and bindings, each against its own quota (F7).
+    pub(crate) fn objects(&self) -> &ObjectCounts {
+        &self.objects
+    }
 }
 
 /// What a process may commit and map, and how fast it may change its mappings (P11, C7;
@@ -159,7 +170,8 @@ impl MemoryLimits {
 }
 
 /// A process's quotas: at most `handles` entries in its table, `channels` live channels,
-/// `message_bytes` of kernel heap in messages it has queued, and its memory.
+/// `message_bytes` of kernel heap in messages it has queued, its memory, and its events, ports
+/// and bindings.
 #[derive(Clone, Copy)]
 pub(crate) struct Limits {
     pub(crate) handles: usize,
@@ -171,6 +183,8 @@ pub(crate) struct Limits {
     pub(crate) debug_calls: bool,
     /// Its memory objects and mappings.
     pub(crate) memory: MemoryLimits,
+    /// Its events, ports and bindings. [`ObjectLimits::NONE`] allows none.
+    pub(crate) objects: ObjectLimits,
 }
 
 /// What ended the process's last thread, for the boot proofs.
@@ -193,10 +207,12 @@ struct ReportLog {
     count: usize,
 }
 
-/// The signal an object raises when it has ended, and who waits for it (P9, P11).
+/// The signal an object raises when it has ended, who waits for it, and the bindings armed on
+/// it (P9, P11, C9).
 pub(crate) struct Termination {
     raised: AtomicBool,
     waiters: WaitQueue,
+    source: Source<Ports>,
 }
 
 impl Termination {
@@ -204,6 +220,7 @@ impl Termination {
         Self {
             raised: AtomicBool::new(false),
             waiters: WaitQueue::new(),
+            source: Source::new(),
         }
     }
 
@@ -221,15 +238,22 @@ impl Termination {
         &self.waiters
     }
 
+    /// The bindings armed on the object.
+    pub(crate) const fn source(&self) -> &Source<Ports> {
+        &self.source
+    }
+
     /// Whether the object has ended.
     pub(crate) fn raised(&self) -> bool {
         self.raised.load(Ordering::Acquire)
     }
 
-    /// Raises the signal: the state first, then the wake-ups, as every waker does (`wait`).
+    /// Raises the signal: the state first, then the wake-ups and the deliveries, as every waker
+    /// does (`wait`, and the ports' protocol).
     fn raise(&self) {
         self.raised.store(true, Ordering::Release);
         ipc::note_cross_cpu_wakes(self.waiters.wake_all());
+        self.source.deliver(&KernelThreads, || self.signals());
     }
 }
 
@@ -336,6 +360,7 @@ impl Process {
                 max_queued_bytes: limits.message_bytes,
                 committed: AtomicUsize::new(0),
                 max_committed: limits.memory.committed,
+                objects: ObjectCounts::new(limits.objects),
             })
             .ok()?,
             mappings: SpinLock::new(Mappings::new(limits.memory.mappings)),
@@ -608,7 +633,8 @@ impl Process {
         let table = without_interrupts(|| {
             core::mem::replace(&mut *self.handles.lock(), HandleTable::new(0))
         });
-        drop(table);
+        // The bindings it made are cancelled before its handles close (F11).
+        ipc::close_table(table, self.id);
         ipc::reap_closed();
         // Its mappings' objects go with it, and no more can be made (P11): before it counts as
         // ended, so whoever sees the ending sees their charges back.
@@ -629,7 +655,8 @@ impl Process {
         let table = without_interrupts(|| {
             core::mem::replace(&mut *self.handles.lock(), HandleTable::new(0))
         });
-        drop(table);
+        // The bindings it made are cancelled before its handles close (F11).
+        ipc::close_table(table, self.id);
         ipc::reap_closed();
     }
 
