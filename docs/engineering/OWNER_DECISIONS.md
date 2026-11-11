@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–141 and 145–154, and 2026-11-11 for item 161. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144 and 155–160 are on another branch (`land/s3-part2`) and are not in this sheet yet. |
-| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. |
+| As of | 2026-11-10 for items 71–141 and 145–154, and 2026-11-11 for items 161, 165 and 168. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144, 155–164, 166 and 167 are on another branch (`land/s3-part2`) and are not in this sheet yet. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 165 and 168: your own text for CLAUDE.md §1, in its second and third versions, read against the whole of revision 7.5 and the ADRs each change names; the check and the list of changes are `ROLES_CHECK_2026-11-11.md`. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: item 161. |
-| Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: items 161, 165 and 168 (item 168 delegated to Claude). |
+| Still open | No numbered item. One proposal on the roles of §1 is still yours to answer: whether §77's list of 26 agents should point to §1 (`ROLES_CHECK_2026-11-11.md`, proposal 11). Item 168's changes to your text are Claude's, and you have not read them. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -438,3 +438,54 @@ Item 70 offers a code pull request for review once it carries 100 commits of rea
 | 161, answered | Mark pull request 15 ready at 76 commits, once pull requests 13 and 14 are in? Waiting for task 18b, the generator in the kernel, to bring it past 100 was offered and not chosen. | **Yes, at 76** |
 
 This is for pull request 15 only. Item 70 stands for every later code pull request, and no commit was added to raise the count (CLAUDE.md §7). Merging it still takes your word, after pull requests 13 and 14, each with a merge commit.
+
+## The roles in CLAUDE.md §1 (items 165 and 168): your text, and what you left to Claude, 2026-11-11
+
+On 2026-11-11 you gave text for the start of CLAUDE.md §1, "Your mission", three times:
+
+- first with the words "update CLAUDE.md with following at line: 35": three lead roles and 28 specialist roles;
+- then with the words "Update CLAUDE.md at line: 35 with following, check carefully, if anything missing": six lead roles, 50 specialist roles and two closing paragraphs;
+- then, after the check of the second, with the words "Consider following, and improve if you can. Consider extreme security, performance, Native SDK, Native Desktop, Native GUI or UI, CPU, GPU, NPU consider these also. You can do extremely very good, You decide.": seven opening paragraphs, 64 specialist roles and 22 engineering requirements that apply to every role.
+
+Each replaced the one before it, and none had reached `main`. Revision 7.5 holds the third, with the changes of item 168.
+
+| # | What | Where |
+|---|---|---|
+| 165, your text | The sentence that opened §1 ("You are the Principal Operating System Architect, ... and Multi-Agent Engineering Coordinator for Origin OS.") is replaced by your text, in its third version | CLAUDE.md 7.5, §1. Revision 7.4 is kept at `docs/engineering/CLAUDE-v7.4.md` |
+| 168, delegated to Claude ("improve if you can ... You decide") | Your third text is improved where it could be: 47 changes, among them three new roles and four new requirements. **You have not read them. You can change any of them** | CLAUDE.md 7.5, §1. Every change, with the words before and after and the reason: `docs/engineering/ROLES_CHECK_2026-11-11.md`, its last section |
+
+What your third text keeps and adds:
+
+- **The completion target** is still 100% coverage of approved requirements. It is now measured against a versioned requirements matrix. That matrix does not exist yet: TASKS item 35.
+- **Roles 1 to 50 keep their numbers.** All but two are reworded. Roles 51 to 64 are new: a Chief Systems Architect, system integration, resource governance, platform reliability, and ten roles for driver families, with the GPU and the NPU among them.
+- **Requirements for every role** replace the two closing paragraphs.
+- **It answers most of the check of the second text.** What became of each of the twelve proposals is in the check's last section. One is still yours: §77 lists 26 engineering agents and is as it was.
+
+What item 168 changed, by the areas you named:
+
+- **Security.**
+  - A role for the compositor as a security boundary between programs (65).
+  - Role 16 is the Chief Security Architect, and accepts no change that weakens a security invariant for performance or convenience.
+  - Two requirements: deny by default, and the owner's decisions stay the owner's.
+  - Named in the roles that own them: speculation controls on every processor (4); `unsafe` confined to the listed files (3); third-party drivers in user mode only (9); the firewall, TLS and VPN (12); constant time and zeroization (17); verify before parse (18); sessions and elevation (21); no install-time code (22); Secure Boot, the TPM and measured boot (30).
+- **Performance.** Role 23 is the Chief Performance Architect, and performance budgets are routed through it. The NPU joins role 53's resource policies.
+- **Native SDK.** A requirement states the SDK-only rule in full, and role 19 enforces it. Role 19 defines each interface once in the interface language, with a stable C ABI. Role 18 owns the runtime library and the route to Rust `std`.
+- **Native desktop and GUI.**
+  - Role 20 owns the rest of the UI toolkit and allows no web view, browser engine or foreign toolkit.
+  - A role for the text engine, fonts and input methods (66).
+  - "The desktop shell", search and notifications in role 49.
+  - A management GUI that covers every administrative operation, remote administration and remote desktop in role 50.
+- **CPU, GPU, NPU.**
+  - A requirement to discover capabilities and report them truthfully.
+  - A fallback display path, and no claim of acceleration without a working driver (55).
+  - No client can read memory another client left behind.
+- **Left without an owner by the directive's own sections.** The boot manager (7); ACPI runtime evaluation (8); continuous integration and its gates (25); milestone exit tests (45); original source, provenance and licensing (67).
+- **One merge.** Your first requirement and your sixth opening paragraph said the same thing. They are one sentence now, with every element of both.
+- **Form.** Role titles and requirement headings are bold, and the apostrophe is the plain one.
+
+How the text was put in:
+
+- **Your third text was taken from your message** and compared with the second, role by role. The changes were then applied by a script, each exactly once, so the list of 47 is the whole difference in words.
+- **Line 35 is where the old sentence stands in revision 7.1,** which the main checkout still held that day. In revision 7.4 it was line 36. Your text replaces that sentence; the nine roles it named are all among your roles.
+- **Nothing else in the directive changes.** The rest of §1 follows your text as before.
+- **The first and second versions are kept only in this branch's history,** at commits `fc92eca` and `453fded`.
