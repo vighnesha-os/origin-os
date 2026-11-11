@@ -3819,3 +3819,32 @@ A fourth addition to the entry above, from another session and on a branch of it
   - *Not run:* a boot at `a856e0d`, the boot matrix, anything on a real processor.
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-11, asked for by the session landing the step-3 batch. Original code; Rust `core` only.
 - **Licensing:** MIT OR Apache-2.0.
+
+## Task S3-6, stage 2: events, ports and `clock_read`, the kernel's side and the interface at 0.6 (2026-11-11)
+
+- **What:** ADR-0005 C9, C10 and C13 as Amendment 7 decides them (F1–F19; the owner's items 169–187), on the framework's protocol `origin_frame::sync::ports` (task S3-6a, merged into this branch at `b0d6156`; its own entry is above). Commits on `claude/s3-6-events-ports`:
+  - `5157f6f` `wait.rs`: `KernelThreads` is `pub(crate)`, one word, so that the ports' protocol uses the kernel's one scheduler mapping (approved by the coordinating session; the file is the framework session's).
+  - `ec9bb0b` `handles.rs`: `HandleTable::into_objects`, for an exit that cancels bindings before its handles close. The `nospec::index` clamp in `get` is untouched.
+  - `bb37166` the kernel's objects: `port.rs` (new: the protocol's instantiation, `KernelPort`, `PortHandle`, `PortRef`, the `Binding` payload whose drop is the refund, `Owner`, and bind, wait and cancel in D5's order); `event.rs` (new); `ipc.rs` (events and ports as objects; `Waitable` as the way back and as what a wait needs; delivery after every change of a channel's signals; `Gone`, the implicit cancel when a handle is closed or moved; `close_table` for an exit); `process.rs` (a `Source` in each termination, `close_table` at the end); `handle_close` takes the process.
+  - `d94171e` the interface step: `origin.kernel.oidl`, `origin-version.toml` (`user-abi` 0.6), the regenerated code, both locks, `origin-abi`, `syscall.rs`'s seven calls, and the tests that exercise the generated code (`against_origin_abi.rs`, and the generator's `kernel_differential.rs`, `syscall_api.rs` and `generated.rs`).
+  - `ee0a9cd` the two boot results (`ipc_proof/events_ports.rs`, new), their place in `bootproof.rs`, `sched.rs` and xtask's expected lines; `4a862cb` names the failing rules process in its diagnostic.
+- **Specifications:** none outside the repository. ADR-0005 (C6, C9, C10, C11, C13, A2, D1, D4, D5, E1, Amendment 7), OIDL (`docs/spec/OIDL.md` §3.1, §9, §13), ADR-0012 for the clock, ADR-0013 for the boot results, ADR-0017 Z9 for the lookups. The ledger `docs/research/2026-11-11-events-ports.md` names what was read for it.
+- **Open-source references consulted (§3, §6):** none in this stage. No source code of any other system was read.
+- **`unsafe`:** none. `port.rs`, `event.rs` and `ipc_proof/events_ports.rs` start with `#![forbid(unsafe_code)]`, as the files they change do.
+- **Decisions this stage did not take:** none. Where the definition and the contract left a choice, it took the one written: the out pointer of `port_wait` is checked before the handle, as `wait_one`'s is; `still_open` for a bind asks after both handles, so a port handle closed during the call is `bad_handle` (F2); a refused write's moved handles are cancelled as closed ones.
+- **Limits, stated plainly:**
+  - The kernel's locks with the protocol's have no model: the order (a source, a handle table, a channel's state; a port's lock a leaf) is by reading.
+  - No measurement that delivery does not allocate on the kernel's side; S3-6a's host test counts the protocol's.
+  - A packet whose copy-out faults after it is taken is lost, as F3 says; no boot shows it, since ring 3 cannot make the write fail between the check and the copy.
+  - The round trips and the kernel's own binds are QEMU figures with no budget, and the round trip includes the script interpreter.
+  - Nothing has run on a real processor. No human has reviewed this.
+- **Test evidence (2026-11-11; Rust 1.99.1; QEMU TCG + OVMF on the M1 Max):**
+  - *Each commit, as it was made:* `cargo fmt --all -- --check`; `cargo clippy` with `-D warnings` for the kernel on the host (`--lib --tests`), on `x86_64-unknown-none`, and for xtask (`--all-targets`); `cargo test --package framekernel --lib` (423, then 424 with `into_objects`'s test, 0 failed); `cargo test --package xtask` (154 passed, 1 ignored). At the interface step also: `oidl check` (2 libraries valid); both locks checked; `origin-abi` 11, `origin-syscalls` 11, `oidl` 49 and its `generated` suite 18 passed.
+  - *`cargo xtask check` at `ff52853`*, the interface step before its amendment (that commit is not on the branch), 14:50 to 14:58 UTC: passed. Host tests 1,525 passed, 0 failed, 27 ignored; Loom, 53 models and 78 negative controls caught; the gates. Its `boot-test` then failed on one step of the IPC proof that still expected `event_create` to answer `not_supported`; the amendment (`d94171e`) changed that step to `limit`.
+  - *`cargo xtask boot-test` at `ee0a9cd`*, 15:08 to 15:10 UTC: passed, 11 of 11 scenarios. Verdict: degraded, 62 of 63 proofs, speculation controls failed, the usual one under QEMU (item 154). Every line of the two new results says true; the leak check found the heap at 37,488 bytes and 128,159 free frames, as before.
+  - *Figures from that boot (QEMU, no budget):* a round trip of signal, `port_wait` and a fresh bind between two processes on two processors, through the script interpreter, 228 µs; a bind, a signal that delivers it, a take and a clear through the kernel's own calls, 17,679 ns; one `clock_read` every 3,931 ns through the interpreter. The channel ping-pong of the IPC proof: 72,716 ns in that boot, and 70,005 ns in one boot of `199564a` (this branch before its kernel changes), each a single run.
+  - *Negative controls*, EP1 to EP11 in ADR-0013, each a temporary edit booted once in the `kernel boot` scenario and put back byte for byte: all eleven failed the boot by the proof they were aimed at.
+  - *`cargo xtask check` and `cargo xtask boot-test` on the commit that adds this entry:* run after it was written; the coordinating session's report says what they found.
+  - *Not run:* the boot matrix, `boot-console`, anything on a real processor, and a C compiler on the generated header.
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-11, the interface session, on the coordinating session's contract. Original code; Rust `core` and `alloc` only.
+- **Licensing:** MIT OR Apache-2.0.
