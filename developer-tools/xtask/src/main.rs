@@ -15,6 +15,7 @@ mod lex;
 mod loom;
 mod mnemonics;
 mod reproducible;
+mod requirements;
 mod screen;
 mod serial;
 mod targetcfg;
@@ -77,6 +78,10 @@ commands:
               branch's history, outside a short allowlist (part of check; quick)
   interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
               (part of check; quick)
+  requirements-gate only the gate on the requirements matrix under docs/requirements/: a row
+              for every statement of CLAUDE.md and every decision of an accepted ADR, each
+              true to the tree; prints the coverage figure (part of check; CLAUDE.md §1;
+              quick)
   regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
   image-gate [kernel ELF]
               only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
@@ -2512,6 +2517,7 @@ fn main() -> ExitCode {
         ["document-gate"] => documents::gate(),
         ["cfg-lint"] => linux_cfg_lint(),
         ["interface-gate"] => interfaces::gate(),
+        ["requirements-gate"] => requirements::gate(),
         ["regenerate"] => interfaces::regenerate(),
         ["image-gate"] => in_turn("image-gate", image::build_and_gate),
         ["image-gate", elf] => image::gate(Path::new(elf)),
@@ -3232,6 +3238,7 @@ fn check() -> Result {
     dependency_check()?;
     linux_cfg_lint()?;
     documents::gate()?;
+    requirements::gate()?;
     unsafety::gate()?;
     interfaces::gate()?;
     manifest_version_lint()?;
