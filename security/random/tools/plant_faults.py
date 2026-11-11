@@ -293,11 +293,11 @@ try:
             else:
                 unnoticed.append(name)
                 print("       NOT NOTICED BY THE MODEL", flush=True)
-    print(f"{planted} planted: {failing} fail a test, {uncompiled} do not compile, "
-          f"{len(missed)} not caught", flush=True)
+    print(f"{planted} planted. Fail a test: {failing}. Do not compile: {uncompiled}. "
+          f"Not caught: {len(missed)}.", flush=True)
     for name in missed:
         print(f"not caught: {name}", flush=True)
-    print(f"the model's tests fail for {by_model} of the {failing}, and for {only_model} of those "
+    print(f"a test of the model fails for {by_model} of the {failing}; for {only_model} of those "
           "no other test does", flush=True)
     print(f"the model's negative controls: {controls - len(unnoticed)} of {controls} fail a test "
           "of the model", flush=True)

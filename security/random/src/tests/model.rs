@@ -112,7 +112,7 @@ use Instruction::{Rdrand, Rdseed};
 const VALUES: u64 = 0xF00D_F00D;
 /// The draws that make one reseed (R6). This and the next two are the rules' figures as the
 /// model states them, not the crate's constants: a constant that is changed breaks a rule.
-const SEED_DRAWS: u8 = 8;
+const SEED_DRAWS: usize = 8;
 /// The most draws a plain request makes (TASKS 18b S2).
 const REQUEST_DRAWS: u32 = 16;
 /// A reseed period, in nanoseconds (R6).
@@ -478,13 +478,23 @@ impl Source for Lines<'_> {
     }
 }
 
+/// The most draws of either kind that a snapshot keeps: twice what a store should hold. The
+/// model does not name the store's size, so a size that is changed breaks a rule here and
+/// not the build.
+const KEEPS: usize = 2 * SEED_DRAWS;
+
+/// Whether every byte is zero.
+fn zeroed<const N: usize>(bytes: &[u8; N]) -> bool {
+    *bytes == [0; N]
+}
+
 /// A processor's store and counts, as a step finds them or leaves them.
 struct Snapshot {
     /// The draws in the store: first the `counted` ones that a reseed counts, then the
     /// `aside` RDSEED draws that were set aside when RDRAND took over. Zero after those.
-    draws: [u64; 16],
-    counted: u8,
-    aside: u8,
+    draws: [u64; 2 * KEEPS],
+    counted: usize,
+    aside: usize,
     /// Whether every byte of the store is zero.
     blank: bool,
     /// The instruction the counted draws are of.
@@ -499,25 +509,22 @@ struct Snapshot {
 impl Snapshot {
     fn of(node: &Node) -> Self {
         let counts = node.counts();
-        // The store has room for eight draws and for eight set aside, after the 16 bytes
+        // The draws a reseed counts, and the ones set aside: those lie after the 16 bytes
         // that a reseed stamps.
-        let counted = node.have.min(8);
-        let aside = node.aside_have.min(8);
-        let mut draws = [0; 16];
-        let mut held = 0;
-        for bytes in &node.entropy.as_chunks::<8>().0[..usize::from(counted)] {
-            draws[held] = u64::from_le_bytes(*bytes);
-            held += 1;
-        }
-        for bytes in &node.aside[16..].as_chunks::<8>().0[..usize::from(aside)] {
-            draws[held] = u64::from_le_bytes(*bytes);
-            held += 1;
+        let stored = node.entropy.as_chunks::<8>().0;
+        let set_aside = node.aside[16..].as_chunks::<8>().0;
+        let counted = usize::from(node.have).min(stored.len()).min(KEEPS);
+        let aside = usize::from(node.aside_have).min(set_aside.len()).min(KEEPS);
+        let mut draws = [0; 2 * KEEPS];
+        let held = stored[..counted].iter().chain(&set_aside[..aside]);
+        for (draw, bytes) in draws.iter_mut().zip(held) {
+            *draw = u64::from_le_bytes(*bytes);
         }
         Self {
             draws,
             counted,
             aside,
-            blank: node.entropy == [0; 64] && node.aside == [0; 80],
+            blank: zeroed(&node.entropy) && zeroed(&node.aside),
             from: node.from,
             lent: node.lent,
             own_reseeds: counts.reseeds_rdseed + counts.reseeds_rdrand,
@@ -528,7 +535,7 @@ impl Snapshot {
 
     /// The draws the store holds, the counted ones first.
     fn held(&self) -> &[u64] {
-        &self.draws[..usize::from(self.counted) + usize::from(self.aside)]
+        &self.draws[..self.counted + self.aside]
     }
 
     fn holds(&self, value: u64) -> bool {
@@ -703,7 +710,7 @@ impl Machine {
             .last()
             .map(|frame| (frame.id, frame.kind, frame.began));
         for (n, &value) in before.held().iter().enumerate() {
-            let counted = n < usize::from(before.counted);
+            let counted = n < before.counted;
             let earlier = log.used.insert(value, seed);
             if let Some(earlier) = earlier {
                 log.violation(format!(
