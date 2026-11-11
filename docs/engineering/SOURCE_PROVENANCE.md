@@ -2618,7 +2618,7 @@ The fields are §6's ten, in order.
   - **Reproduce:** `cargo test --package origin-random`; `python3 -I security/random/tools/gen_selftest.py --check`; `python3 -I security/random/tools/seed_reference.py --check`; `python3 -I security/random/tools/plant_faults.py .`; `cargo xtask unsafe-gate`; `cargo xtask boot-random`; `cargo xtask check`.
 - **External data and firmware:** none new. No file was downloaded.
 - **Open-source references consulted (§3; decision items 92, 93, 96):** none in this task. This session read EDK II's declaration of the firmware's random-number protocol on 2026-11-10 (the ledger's §12), so it did not write the loader's call to that protocol: that is left to a session that has not (TASKS, 18c).
-- **Not done:** the firmware's protocol; the consumers on `land/s3-part2`; a processor going offline; reseeding on resume and after a snapshot; an interface for programs; a check of the compiled branches; Kani or Loom models of the step and the root's lock; anything on hardware.
+- **Not done:** the firmware's protocol; the consumers on `land/s3-part2`; a processor going offline; reseeding on resume and after a snapshot; an interface for programs; a check of the compiled branches; Kani or Loom models of the step and the root's lock; anything on hardware. *(2026-11-11: the consumers on `land/s3-part2` are converted in that batch's merge of this task, `c2245ef`; the entry on the conversion has it.)*
 
 ### The stack region's value, handed over beside the seed (decision item 166; 2026-11-11)
 
@@ -2627,7 +2627,7 @@ An addition to the entry above, from the same session on the same branch. The ow
 - **Module:** `boot/info/src/lib.rs` (`BOOT_SECRET_LEN`, `BOOT_STACK_VALUE_LEN`; `boot_seed()` checks 72 bytes); `boot/uefi/src/main.rs` (the third request); `framekernel/frame/src/random.rs` (`take_stack_value`, `stack_value`, the 72-byte overwrite; `finish_start` takes its lock); `framekernel/src/kernel.rs` (`prove_stack_value`); the boot test's markers.
 - **Specifications:** none new. The value is 64 bits of the loader's HMAC_DRBG output, read through the direct map.
 - **Test evidence:** the host test of where the area may lie, with the boundaries moved to 72 bytes and two cases where the seed would fit and the value would not; and the gates: `cargo xtask check` passed on `396e9e2` (2026-11-11, 11:41 to 11:46, a clean tree before and after), whose code is `8fbd8e9`, and `cargo xtask boot-matrix` passed on it (11:46 to 12:14): `boot-test`'s 11 scenarios under both IOMMUs with 1, 2 and 4 processors, the sparse, bridge and legacy-free machines, both `boot-random` machines and the 9 console scenarios. A boot says the value was "taken here, once, and a second take was refused", and the proof fails if a take succeeds after the generator's start.
-- **Not done:** nothing uses the value on this branch. `stack::draw_region` on the next batch becomes its caller.
+- **Not done:** nothing uses the value on this branch. `stack::draw_region` on the next batch becomes its caller. *(2026-11-11: it is the caller since the batch's merge of this task, `c2245ef`.)*
 
 ### The independent review's findings (2026-11-11)
 
@@ -3444,9 +3444,9 @@ A fourth addition to the entry above, from another session and on a branch of it
     - `stack_region_base(random)`: 2 MiB-aligned, the whole region in the window, about 2^24 placements, never the fixed base `STACK_REGION`, which is kept for a boot without entropy;
     - `is_stack_region_base`;
     - `STACK_REGION_TABLES` of 130, because a slid region may cross a 1 GiB boundary.
-  - `72e56a7` **The base drawn at boot (A4, A5).** `early::build_kernel_tables` draws the base through `stack::draw_region`: RDSEED with 64 tries, else RDRAND with 16, as the loader does for H3; with neither, the fixed base. It makes the region's tables there, and only then places it (`stack::place`).
+  - `72e56a7` **The base drawn at boot (A4, A5).** `early::build_kernel_tables` draws the base through `stack::draw_region`: RDSEED with 64 tries, else RDRAND with 16, as the loader does for H3; with neither, the fixed base. It makes the region's tables there, and only then places it (`stack::place`). *(2026-11-11: since task 18b's merge, `c2245ef`, `draw_region` runs neither instruction: it takes the loader's value (decision item 166), and with none the base is the fixed one. The entry on the conversion has it.)*
     - Every slot address, `vm`'s region check and the backtrace's slot top follow the drawn base.
-    - The boot says what drew it, never the base.
+    - The boot says what drew it, never the base. *(Since `c2245ef` it says whether the loader's value drew it.)*
     - The kernel stacks proof gains a first line that checks the base and prints only true or false.
   - `e52be7e` **The guard probe's line (A6.3).** It names no address, and the early marker list matches.
   - `420c1fd`, `ad8c869` **Offsets in crash reports (A6.2).**
@@ -3497,6 +3497,7 @@ A fourth addition to the entry above, from another session and on a branch of it
     - the kernel says `kernel stacks: no entropy from RDSEED or RDRAND: the region is at its fixed base`, with no address;
     - the boot is then refused by the start-record proof, whose records need entropy for their random addresses (ADR-0005 C4), so the stacks proof never runs;
     - the log names no stack-window address.
+    - *(2026-11-11: this is the run of 2026-11-10, against the kernel's own draw. Since `c2245ef` this machine is one of `boot-random`'s two: its boot runs to a verdict, with the stacks proof run and the region at its fixed base.)*
   - **Gates at the code tip `9f882e8`:**
     - `cargo xtask check` passed on a byte-identical tree, before the last history rebuild only moved the same changes into the commits that introduced them: 1,243 test results, 0 failed, 8 ignored, the 42 Loom models' run among them; the no-panic check (`origin-paging` references 2 external symbols, both allowed); the unsafe gate (311 sites, 152 kernel source files); Loom, all 42 models passed and all 68 controls were caught (98 runs).
     - `cargo xtask boot-test` passed, 11 of 11 scenarios. Its kernel boot ended `58 of 58`, with the breakpoint's and the NMI's lines as image offsets and the slide's lines naming no base. `cargo xtask boot-matrix` passed on its first attempt: all 18 full boots `58 of 58`. In the 11 whose console shares QEMU's stdio with the monitor, xtask read the region's base after the boot and found 11 distinct bases, none printed.
@@ -3506,9 +3507,36 @@ A fourth addition to the entry above, from another session and on a branch of it
     - Before the first commit of A6.4, the monitor read timed out. QEMU 11.1 prints `xp`'s address with 8 digits below 4 GiB, where 16 were expected. The answer is now matched by the address's value, and a unit test pins QEMU's form.
 - **Not proven:**
   - physical hardware;
-  - a boot without entropy that runs past `process start`;
+  - a boot without entropy that runs past `process start`; *(2026-11-11: since `c2245ef` such a boot launches nothing and ends with a verdict, under QEMU.)*
   - that QEMU's monitor answers the same way in CI's QEMU, which the matrix there will show.
 - **Review:** none yet. No human has reviewed this code.
+
+## The batch's two direct draws moved to the kernel's generator, in task 18b's merge (decision items 166 and 167; 2026-11-11)
+
+- **What:** the merge of task 18b into the second step-3 batch, commit `c2245ef`, also changes code. 18b removes `cpu::rdrand`, `cpu::rdseed` and `entropy.rs`, so the merged tree does not compile until the batch's two draws change. 13 files are changed by hand against the plain merge, 187 lines added and 176 removed; five of them are the merge's conflicts.
+  - **The stack region's base** (`framekernel/frame/src/stack.rs`, `early.rs`): `draw_region` takes the loader's value through `origin_frame::random::take_stack_value`, once. With a value the base is `layout::stack_region_base` of it; with none the region is at its fixed base. The region records which. The boot says which and prints neither the value nor the base.
+  - **The stacks proof** (`framekernel/src/stacks.rs`, `kernel.rs`): it passes only if the region's record agrees with the generator's: a drawn region off its fixed base with the value recorded as taken, or an undrawn one at its fixed base with no value handed over. The generator's proof fails a second take that still succeeds.
+  - **A mapping's place** (`framekernel/src/memory_object.rs`): `mapping::place_at_random` draws from `origin_frame::random::next_u64`. A draw that fails gives `not_supported`.
+  - **Withheld randomness** (`framekernel/src/sched.rs`, `bootproof.rs`): with no generator the process-start, service-directory and memory-object proofs do not run, the boot says so, and the verdict names the generator. The stacks proof always runs.
+  - **Processors' stacks** (`framekernel/frame/src/smp.rs`): the batch's stacks in the region stand in place of the guarded stacks 18b's side still had from `main`, and 18b's per-processor preparation of the generator is kept.
+  - **xtask** (`developer-tools/xtask/src/main.rs`): the boot markers follow the new lines, and a fixed base is accepted only from a kernel that said its region was fixed.
+  - Comments only in `framekernel/frame/src/random.rs` and `framekernel/paging/src/layout.rs`.
+- **Author:** the landing session of pull request 16 (Claude Code on the development Mac, Apple M1 Max), 2026-11-11.
+- **Specifications and decisions:** ADR-0004 Amendment 2's note on A4 and A5 (decision item 166); ADR-0016 Amendment 1 and R8; ADR-0013 Amendment 1; CLAUDE.md §59 (decision item 113); decision item 167. Nothing was read beyond the repository: no specification, vendor document or open-source code.
+- **Dependencies:** none added.
+- **Toolchain:** Rust 1.99.1; QEMU with OVMF for the boots.
+- **`unsafe`:** the conversion adds none. The gate counts 337 sites in 23 files on the merged tree.
+- **Evidence**, all on the merged tree `8780d11a71a2`, before the merge was committed, on the development Mac:
+  - `cargo xtask build` and `cargo xtask check` passed. The host tests run on their own gave 917 passed, 0 failed, 1 ignored in 12 suites; inside `check`, 1,455 passed, 0 failed, 10 ignored. Loom ran 42 models and 68 controls. The random-instruction gate finds the instructions in 2 files.
+  - `cargo xtask boot-random`: the machine with RDRAND alone said the base was drawn and ended "degraded: 60 of 61 proofs passed; failed: speculation controls"; the machine with neither instruction said the region was at its fixed base and that randomness was withheld, and ended "degraded: 56 of 58 proofs passed; 3 did not run; failed: speculation controls, random-number generator (no randomness)".
+  - `cargo xtask boot-matrix` passed: 20 kernel boots judged, 19 with a drawn base and 1 with the fixed one; 12 distinct bases in the 12 boots whose base was read through QEMU's monitor, none printed. Verdicts: "degraded: 60 of 61 proofs passed; failed: speculation controls" in 19 boots; "degraded: 56 of 58 proofs passed; 3 did not run; failed: speculation controls, random-number generator (no randomness)" in 1 boot; 102 judged boots with no kernel verdict of their own.
+  - *Host tests added:* `a_machine_with_no_generator_reaches_a_verdict_that_names_it` (`bootproof.rs`) and `a_fixed_stack_base_is_accepted_only_from_a_kernel_that_said_so` (xtask).
+- **Not shown:**
+  - anything on an x86-64 processor: every boot ran under QEMU's software processor, and CI's KVM boots run only once the batch is pushed;
+  - the controls of A4 and A5 (ADR-0013 C44 and C45) against this code: they were run against the kernel's own draw;
+  - a map at a place the kernel chooses on a machine with no generator: the memory-object proof does not run there (TASKS item 37 (d)).
+- **Review:** none. No person has read the merge or the conversion.
+- **Licence:** MIT OR Apache-2.0. No external firmware or data.
 
 ## ADR-0017 Z9 inside the framework's address spaces: a user pointer's walk and a mapping call's address (2026-11-11)
 
