@@ -3419,6 +3419,87 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
 - **Review:** none yet. No human has reviewed this code.
 - **Licensing:** MIT OR Apache-2.0.
 
+## The ports' protocol in the framework: bind, raise, cancel and close (ADR-0005 C9, P9; task S3-6a; 2026-11-11)
+
+- **What:** on `claude/s3-6a-port-core`, cut from `land/s3-part2` at `dc50296`. The request is the section "What the kernel needs from the framework" of the S3-6 ledger (`docs/research/2026-11-11-events-ports.md` at `6c69ada`, lines 63 to 135, on the unmerged `claude/s3-6-events-ports`). The contract, and how this answers it, are in the coordinating session's task S3-6a. Nothing in the kernel crate changes: the kernel instantiates this in stage 2 of S3-6, as it instantiates `WaitQueue`.
+  - **`framekernel/frame/sync/src/ports.rs`** (new, `#![forbid(unsafe_code)]`): `Source`, `Port`, `Reservation`, `Storage`, `Removed`, `Packet`, and `Kernel`, the trait for what the kernel supplies (its scheduler, the payload, the owner, and counted references to a port and to what holds a source). Generic over the scheduler, so the host tests and the Loom models run the code the kernel runs.
+  - **What a binding is made of:**
+    - The *storage*: one allocation carrying the payload, what the binding asked for, and the packet it becomes. The source keeps it while the binding is armed, with a counted reference to the port. The port keeps it once it is queued.
+    - A *ticket*: one small allocation inside the storage. When a binding fires or is cancelled implicitly, its references leave in it, wake the port, and are dropped after every lock is released.
+    - *Room* in the port's *index*: one slot per armed binding, holding the way back to its source, so that a close finds every source with a binding armed for the port. `Reservation::try_new` grows the index fallibly until it has a free slot for every reservation made for the port and not yet bound (an atomic count, raised only under the port's lock). A bind takes a slot without allocating, and a binding gives its slot back in constant time when it fires or is cancelled.
+  - **Allocation:** each node is a `Vec` reserved for exactly one value and turned into a `Box<[T; 1]>`, which needs no `unsafe` (`Box::try_new` is unstable on Rust 1.99.1). Lists are singly linked through the nodes, safe, and dropped one node at a time. The queue is two such stacks, so packets leave in the order they were queued.
+  - **`framekernel/frame/sync/src/lib.rs`:** `extern crate alloc` and the module.
+  - **Eleven Loom models and ten controls:** `models.rs` and xtask's `CONTROLS`. The ledger's nine are among the eleven, its model 7 as two (a bind that queues at once, a bind that arms). The eleventh is for this representation's own protocol: two reservations racing for a port's last free slot. See the evidence.
+  - **`framekernel/frame/sync/tests/ports_allocation.rs`** (new): a host test with its own global allocator, on the unsafe gate's list (`developer-tools/xtask/src/unsafety.rs`).
+- **What the kernel relies on, each by the ledger's number:**
+  1. *Nothing allocates after the reservation.* The index grows only inside `Reservation::try_new`. A bind, a delivery, both cancels, a take and a close move nodes and free them. Shown by `nothing_allocates_after_the_reservation`, which counts the test thread's allocations through every operation, and by reading.
+  2. *One binding, at most one packet, of one kind:* a storage is one allocation moved by value. Host tests: one-shot, an implicit cancel after a fired binding.
+  3. *No delivery is lost:* a bind reads the signals under the source's lock, which every delivery takes after the state changed. Model `ports_bind_against_raise`, and a host test of 2,000 binds raced against a raise on real threads.
+  4. *After an explicit cancel has returned, nothing from a binding it matched exists or appears:* it holds the source's lock, then the port's, while it takes armed bindings and queued packets of either kind. Model `ports_raise_against_an_explicit_cancel`, and host tests.
+  5. *One lock order:* a source's lock before a port's; a port's lock is a leaf; a port's waiters' lock before the port's; no wake under either. The models would deadlock on an inversion. That nothing is taken under a port's lock is by reading.
+  6. *Close is flat:* it takes the port's lock, then each source's in turn, never two together. Storage carries a payload the kernel sets, and returning it closes no handle.
+  7. *Storage comes back exactly once, outside every lock:* by ownership. Each model's account ends at zero and never goes below it. Host test `storage_comes_back_exactly_once_with_its_payload`.
+  8. *No bound of the framework's:* lists and the index grow as the binders' quotas let them. Host test with 20,000 bindings on one source and port, dropped flat.
+  9. *A queued packet holds no counted reference:* a queued storage holds neither the port nor the source. Host test `references_last_only_while_a_binding_is_armed`.
+  10. *An armed binding holds its port's memory, not a handle count. The way back lasts only while armed:* the same host test, through every way a binding ends.
+  11. *The owner is opaque:* `Copy + Eq`. Host tests use a process's ID and a handle's value.
+  12. *No kernel address in a packet:* `Packet` is a key, a kind and two masks.
+- **Soundness of the new safe interfaces:** by reading each against "no safe caller can break memory safety through it, whatever it passes, in whatever order, from whichever processor". There is no `unsafe` in the protocol, so memory safety is the compiler's. What a caller can break is the kernel's accounting:
+  - giving a delivery or a bind from inside a lock the closures take (a deadlock, not memory);
+  - making a reservation for one port and dropping it unused, which gives its room back;
+  - holding a reservation without binding it, which keeps room in the port's index.
+  The author's reasoning, not an independent review.
+- **`unsafe`:** none in the protocol. One new listed file: the allocation test, whose `GlobalAlloc` needs it (5 sites, each with its `SAFETY:`), as `objref_out_of_memory.rs` does.
+- **Evidence,** with Rust 1.99.1 and Loom 0.7.2, on the development Mac (Apple M1 Max), each heavy run in its turn on the machine:
+  - **Host tests:**
+    - `origin-sync`'s library: 74 passed, 47 before and 27 new, 1 ignored as before;
+    - the allocation test binary: 2 passed;
+    - none of the 27 new tests failed on its first run.
+    - The tests cover: one shot and level-triggered; the key unchanged (0, 1, `u64::MAX`); both refusals; both cancels, with what each refunds; the implicit cancel by handle and by process; a packet already queued before an implicit cancel; the same key twice; queue order across both halves of the queue and a cancel from its middle; a close of armed and queued bindings, and of one port of a source's two; a wait through a closed handle, a timeout, a wait across threads, a wait on a port that closes; references only while armed; each storage back exactly once; 20,000 bindings dropped flat; room kept for 40 reservations; 2,000 binds raced against a raise.
+  - **clippy,** `-D warnings`: clean for the host (all targets), the kernel target and UEFI.
+  - **Loom models,** each at its ordinary bound, every one passing:
+
+    | Model | Executions | Bound |
+    |---|---|---|
+    | `ports_bind_against_raise` | 344 | 3 preemptions |
+    | `ports_raise_against_an_explicit_cancel` | 147 | 3 |
+    | `ports_raise_against_an_implicit_cancel` | 663 | 3 |
+    | `ports_close_against_raise` | 620 | 3 |
+    | `ports_two_raisers` | 366 | 3 |
+    | `ports_bind_against_a_close_of_the_bound_handle` | 344 | 3 |
+    | `ports_close_against_a_bind_that_queues` | 3,426 | 3 |
+    | `ports_close_against_a_bind_that_arms` | 2,731 | 3 |
+    | `ports_taker_against_a_delivery` | 2,514 | 4 |
+    | `ports_close_against_a_waiter` | 5,236 | 4 |
+    | `ports_two_reservations_race_for_the_last_slot` | 1,654 | 3 |
+
+    Every execution stops branching once a thread has spun more than 4 times. None of the eleven takes more than about a second.
+  - **The controls,** each caught with the text named:
+    - `bind_reads_the_signals_before_the_lock`, by `ports_bind_against_raise`: "a signal was lost, or one binding made two packets";
+    - `bind_asks_the_handle_before_the_lock`, by `ports_bind_against_a_close_of_the_bound_handle`: "a binding stayed armed after its handle closed";
+    - `bind_ignores_a_closed_port`, by `ports_close_against_a_bind_that_queues`: "a packet was queued in a closed port";
+    - `explicit_cancel_leaves_a_queued_packet`, by `ports_raise_against_an_explicit_cancel`: "an explicit cancel did not take its binding back once";
+    - `implicit_cancel_picks_nothing`, by `ports_raise_against_an_implicit_cancel` and `ports_bind_against_a_close_of_the_bound_handle`: "a binding stayed armed after its handle closed";
+    - `close_leaves_the_armed_bindings`, by `ports_close_against_raise` ("a close did not take back its binding's storage") and `ports_close_against_a_bind_that_arms` ("a binding stayed armed on a closed port");
+    - `delivery_gives_up_on_a_busy_source`, by `ports_two_raisers`: "a signal was lost, or one binding made two packets";
+    - `delivery_wakes_no_taker`, by `ports_taker_against_a_delivery`: "deadlock";
+    - `close_wakes_no_waiter`, by `ports_close_against_a_waiter`: "deadlock";
+    - `reservation_ignores_the_room_others_keep`, by `ports_two_reservations_race_for_the_last_slot`: "a bind found no room".
+  - **Two runs that taught something:**
+    - The ledger's model 7 as one model (two binders and the closer) was still searching at two preemptions after more than a minute, so it is two models of two threads each.
+    - The room control's first form took out the count's increment. It failed the model with `NoMemory` rather than at the bind, because the bind's decrement then wrapped the count, which the real code cannot do: it decrements only a counted reservation. Its committed form ignores the room the others keep.
+  - **The full gate:** on `b90f977`, the models commit, with a clean tree, from 11:08 UTC: `cargo xtask check` passed. 1,410 tests in 44 suites passed, none failed, 10 ignored: the batch's 1,370 and 40 new (27 host tests of the protocol, 2 of the heap, 11 models). The unsafe gate counts 329 sites in its 23 listed files; the 5 new ones are the allocation test's. The no-panic check passes on `origin-sync` (0 external symbols). Loom: all 53 models passed and all 78 negative controls were caught (110 model runs). The image, document, interface, assembly and reproducible-build gates pass. No kernel boot was run: nothing the kernel runs has changed.
+- **Not shown:**
+  - anything past the models' bounds (see `models.rs`, "What is not proved");
+  - the kernel's part (handles, quotas, exit, the boot proof): stage 2;
+  - any timing: no measurement was asked for at this stage.
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-11. Original code; no third-party source was read or copied (§3). The design follows the ledger's request. No other system's source was read.
+- **Specifications:** ADR-0005 C9, P9, A2; the ledger's shapes 9, 11, 12, 15 and 16 (decision items 177, 179, 180, 183, 184, proposed, not accepted).
+- **Dependencies:** none new. `alloc` is the compiler's.
+- **Toolchain:** Rust 1.99.1 (stable, edition 2024); Loom 0.7.2 for the models, as locked.
+- **Review:** none yet. No human has reviewed this code.
+- **Licensing:** MIT OR Apache-2.0.
+
 ## The assembly blocks' options, and four gates (TASKS item 17; decision items 107, 110, 111, 123; 2026-11-10)
 
 - **What:** the design review's findings 2, 5, 6 (its last point) and 18 (its fifth), on branch `claude/funny-torvalds-9a28a0`. The contract is in `TASKS.md`, under item 17.
