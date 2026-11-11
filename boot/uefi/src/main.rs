@@ -22,8 +22,8 @@ use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use origin_boot_info::{
-    BOOT_SEED_LEN, BootInfo, FLAG_KASLR, Framebuffer, KernelSegment, MAX_KERNEL_SEGMENTS,
-    MemoryRegion,
+    BOOT_SECRET_LEN, BOOT_SEED_LEN, BootInfo, FLAG_KASLR, Framebuffer, KernelSegment,
+    MAX_KERNEL_SEGMENTS, MemoryRegion,
 };
 use origin_boot_uefi::console::ConOut;
 use origin_boot_uefi::protocols::{
@@ -293,11 +293,12 @@ fn boot(
         .map_err(|s| fail(out, s, format_args!("cannot size the memory map: {s:?}")))?;
     let capacity = probe_size / descriptor_size.max(1) + MAP_SLACK;
     let segments_bytes = MAX_KERNEL_SEGMENTS as usize * size_of::<KernelSegment>();
-    // After the region array, the 64 bytes the kernel's generator is handed (boot info 0.6).
+    // After the region array, the secret area the kernel is handed (boot info 0.6): the seed
+    // for its generator, then the value its stacks' region is placed from.
     let info_bytes = size_of::<BootInfo>()
         + segments_bytes
         + capacity * size_of::<MemoryRegion>()
-        + BOOT_SEED_LEN as usize;
+        + BOOT_SECRET_LEN as usize;
     let info_pages = info_bytes.div_ceil(PAGE);
     let info_addr = allocate(&bs, memory_type::OS_BOOT_INFO, info_pages)
         .map_err(|s| fail(out, s, format_args!("cannot allocate the boot info")))?;
@@ -506,19 +507,27 @@ fn boot(
         (space.root(), direct, pool.used(), kaslr)
     };
     let _ = table_count;
-    // ADR-0016 R10 step 4: last before `ExitBootServices`, 64 bytes for the kernel's generator
-    // go into the boot-info region, and the loader's generator is uninstantiated and
-    // overwritten with its stack.
-    // SAFETY: `allocate` zeroed `info_pages` pages at `info_addr`; these 64 bytes lie after the
+    // ADR-0016 R10 step 4 and Amendment 1 (decision item 166): last before `ExitBootServices`,
+    // the secret area goes into the boot-info region: 64 bytes for the kernel's generator and,
+    // as a request of its own, the 8 bytes its stacks' region is placed from. Then the loader's
+    // generator is uninstantiated and overwritten with its stack.
+    // SAFETY: `allocate` zeroed `info_pages` pages at `info_addr`; these 72 bytes lie after the
     // region array's `capacity` entries and inside those pages (`info_bytes`), and nothing else
     // refers to them.
-    let seed = unsafe {
+    let secret = unsafe {
         core::slice::from_raw_parts_mut(
             ptr::with_exposed_provenance_mut::<u8>(seed_addr as usize),
-            BOOT_SEED_LEN as usize,
+            BOOT_SECRET_LEN as usize,
         )
     };
-    let boot_seed = if generator.fill(seed) { seed_addr } else { 0 };
+    let (seed, stack_value) = secret.split_at_mut(BOOT_SEED_LEN as usize);
+    // Both or neither: a kernel that is told of an area finds all of it.
+    let handed = generator.fill(seed) && generator.fill(stack_value);
+    if !handed {
+        seed.fill(0);
+        stack_value.fill(0);
+    }
+    let boot_seed = if handed { seed_addr } else { 0 };
     if !generator.finish() {
         return Err(fail(
             out,
@@ -532,7 +541,7 @@ fn boot(
         if boot_seed == 0 {
             "no seed for the kernel"
         } else {
-            "64 bytes for the kernel's generator are in the boot info"
+            "64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info"
         }
     );
     let _ = writeln!(

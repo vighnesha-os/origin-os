@@ -146,6 +146,9 @@ const fn condition_of(code: u64) -> Condition {
     }
 }
 
+// The seed the loader hands over is what the policy takes as a root's extra bytes.
+const _: () = assert!(seed::EXTRA_LEN as u64 == origin_boot_info::BOOT_SEED_LEN);
+
 /// Every processor's generator (R7: static, one slot for each processor index).
 static SLOTS: [Slot; MAX_CPUS] = [const { Slot::new() }; MAX_CPUS];
 /// The root (R7): behind a lock that is held for one step and never across a draw.
@@ -440,15 +443,12 @@ fn read_reports(slot: &Slot) {
 }
 
 /// Overwrites and frees this processor's seed area, and marks its start as finished.
+///
+/// It takes the lock outright. Only a step on this processor holds it, and none is running:
+/// this is the processor's own start, outside any step, with interrupts off for the taking.
 fn finish_start(slot: &Slot) {
-    let area = cpu::without_interrupts(|| {
-        slot.state
-            .try_lock()
-            .map(|mut state| core::mem::take(&mut state.area))
-    });
-    if let Some(mut area) = area {
-        overwrite(&mut area);
-    }
+    let mut area = cpu::without_interrupts(|| core::mem::take(&mut slot.state.lock().area));
+    overwrite(&mut area);
     slot.started.store(true, Ordering::Release);
 }
 
@@ -457,14 +457,86 @@ fn finish_start(slot: &Slot) {
 pub enum LoaderSeed {
     /// The loader gave none.
     None,
-    /// The boot info names one that does not lie where a seed may: it was not read.
+    /// The boot info names a secret area that does not lie where one may: it was not read.
     Refused,
-    /// Its 64 bytes went into the root's first seed, and were then overwritten where they lay,
-    /// or, if `overwritten` is false, could not be.
+    /// Its 64 bytes went into the root's first seed. The whole secret area, the seed and the
+    /// stack value after it, was then overwritten where it lay, or, if `overwritten` is false,
+    /// could not be.
     Mixed {
-        /// Whether the 64 bytes read back as zeros afterwards.
+        /// Whether all 72 bytes read back as zeros afterwards.
         overwritten: bool,
     },
+}
+
+/// What became of the value the loader handed over for the kernel stacks' region (boot info
+/// 0.6; ADR-0016 R10 Amendment 1, decision item 166).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StackValue {
+    /// There was none: the loader named no secret area, or one that does not lie where it may.
+    None,
+    /// It was taken, once, before the area was overwritten.
+    Taken,
+    /// Nothing took it before the area was overwritten with the seed.
+    Unclaimed,
+}
+
+const STACK_VALUE_THERE: u8 = 0;
+const STACK_VALUE_TAKEN: u8 = 1;
+const STACK_VALUE_GONE: u8 = 2;
+/// Whether the stack value may still be read: there, taken, or overwritten untaken.
+static STACK_VALUE: AtomicU8 = AtomicU8::new(STACK_VALUE_THERE);
+
+/// The physical address of the loader's secret area, if the boot info names one that lies
+/// where it may.
+fn secret_area() -> Option<u64> {
+    crate::early::boot_data()?.boot_seed()
+}
+
+/// The random value the loader handed over for the kernel stacks' region: 64 bits of its
+/// generator's output, which lie directly after its seed (decision item 166).
+///
+/// **Once, and early.** The first call returns the value; every later call returns `None`,
+/// and so does every call after the generator's start has overwritten the area. No instruction
+/// is run and no generator is asked: this is for the code that places that region while the
+/// kernel builds its page tables, before the kernel's generator exists. `None` also when the
+/// loader handed over nothing, which is the machine with no healthy instruction: the region
+/// then stays at its fixed base (ADR-0004 H3).
+///
+/// The value is the caller's to keep to itself. Nothing prints it.
+pub fn take_stack_value() -> Option<u64> {
+    let area = secret_area()?;
+    STACK_VALUE
+        .compare_exchange(
+            STACK_VALUE_THERE,
+            STACK_VALUE_TAKEN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .ok()?;
+    let source = ptr::with_exposed_provenance::<u8>(crate::phys::to_virt(
+        area.wrapping_add(origin_boot_info::BOOT_SEED_LEN),
+    ) as usize);
+    let mut bytes = [0u8; origin_boot_info::BOOT_STACK_VALUE_LEN as usize];
+    for (at, byte) in bytes.iter_mut().enumerate() {
+        // SAFETY: `boot_data` took the area only from inside a region of kind `BootInfo`,
+        // which is RAM the loader left to the kernel and the direct map holds, and only clear
+        // of the boot-info header and its two arrays; these are the 8 bytes after its first
+        // 64. They have not been overwritten: that happens only after `STACK_VALUE` has left
+        // `STACK_VALUE_THERE`, and this call is the one that moved it.
+        *byte = unsafe { source.wrapping_add(at).read_volatile() };
+    }
+    Some(u64::from_le_bytes(bytes))
+}
+
+/// What became of the loader's value for the kernel stacks' region.
+pub fn stack_value() -> StackValue {
+    if secret_area().is_none() {
+        return StackValue::None;
+    }
+    match STACK_VALUE.load(Ordering::Acquire) {
+        STACK_VALUE_TAKEN => StackValue::Taken,
+        _ => StackValue::Unclaimed,
+    }
 }
 
 /// What [`take_loader_seed`] found, for [`loader_seed`]: 0 none, 1 refused, 2 mixed in and
@@ -495,6 +567,14 @@ fn take_loader_seed() -> LoaderSeed {
         LOADER_SEED.store(1, Ordering::Release);
         return LoaderSeed::Refused;
     };
+    // From here on the stack value after the seed can no longer be taken: it is overwritten
+    // below with the seed.
+    let _ = STACK_VALUE.compare_exchange(
+        STACK_VALUE_THERE,
+        STACK_VALUE_GONE,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
     let source = ptr::with_exposed_provenance_mut::<u8>(crate::phys::to_virt(seed) as usize);
     // As a step, so the bytes pass through the generator's stack and no other.
     let taken = step_here(|slot, _, _, _| {
@@ -504,19 +584,22 @@ fn take_loader_seed() -> LoaderSeed {
             // SAFETY: `boot_data` took `seed` only from inside a region of kind `BootInfo`,
             // which is RAM the loader left to the kernel and the direct map holds read-write,
             // and only clear of the boot-info header and its two arrays, so no reference
-            // covers these 64 bytes. Only the boot processor runs.
+            // covers the area's 72 bytes, of which these are the first 64. Only the boot
+            // processor runs.
             *byte = unsafe { source.wrapping_add(at).read_volatile() };
         }
         Some(())
     })
     .flatten()
     .is_some();
-    for at in 0..seed::EXTRA_LEN {
-        // SAFETY: as the read above; the bytes are the kernel's to overwrite.
+    // The whole area goes: the seed, and the stack value after it.
+    let area = origin_boot_info::BOOT_SECRET_LEN as usize;
+    for at in 0..area {
+        // SAFETY: as the read above; all 72 bytes are the kernel's to overwrite.
         unsafe { source.wrapping_add(at).write_volatile(0) };
     }
     let mut overwritten = true;
-    for at in 0..seed::EXTRA_LEN {
+    for at in 0..area {
         // SAFETY: as the read above.
         overwritten &= unsafe { source.wrapping_add(at).read_volatile() } == 0;
     }
@@ -554,6 +637,8 @@ pub struct BootStart {
     pub both: bool,
     /// What became of the loader's seed.
     pub loader_seed: LoaderSeed,
+    /// What became of the loader's value for the kernel stacks' region.
+    pub stack_value: StackValue,
     /// Whether the boot processor has a generator of its own.
     pub generator: bool,
 }
@@ -588,6 +673,7 @@ pub fn start_boot() -> Option<BootStart> {
         counted,
         both,
         loader_seed,
+        stack_value: stack_value(),
         generator: own.generator,
     })
 }

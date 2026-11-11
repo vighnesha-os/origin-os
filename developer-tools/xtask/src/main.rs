@@ -707,6 +707,7 @@ fn no_generator_markers(scenario: &mut Scenario) {
         "(no generator: fixed placement)".into(),
         "origin-boot: random: no seed for the kernel; the loader's generator is uninstantiated".into(),
         "origin-boot: exiting boot services; entering the Framekernel".into(),
+        "origin-kernel: random: the loader's value for the kernel stacks' region: none: the loader handed over no secret area".into(),
         "origin-kernel: random: no generator: known-answer test passed; on the boot processor RDSEED is absent and RDRAND is absent. Nothing will be launched and nothing placed at a random address (ADR-0016 R8)".into(),
         "origin-kernel: random: processor 0: RDSEED absent (0 draws passed), RDRAND absent (0 draws passed); its generator NOT seeded".into(),
         "origin-kernel: random: no generator, so no request is answered; consistent false: random failed".into(),
@@ -1253,7 +1254,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "(two requests to the loader's generator)".into(),
             "origin-boot: page tables built: ".into(),
             // The kernel's seed is handed over and the loader's generator is gone.
-            "origin-boot: random: 64 bytes for the kernel's generator are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten".into(),
+            "origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten".into(),
             "origin-boot: exiting boot services; entering the Framekernel".into(),
             // Attached before anything else is printed, so everything below is also on the
             // screen; `check_screen` holds the kernel to that.
@@ -1339,6 +1340,10 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // The random-number generator's root and the boot processor's own generator
             // (ADR-0016 R5, R13), before another processor starts: the self-test passed and
             // an instruction passed its start-up test.
+            // The loader's value for the kernel stacks' region (decision item 166): taken once.
+            // Nothing in this tree places that region; the batch that does takes it earlier,
+            // and this line then reads "taken once before this point".
+            "origin-kernel: random: the loader's value for the kernel stacks' region: taken here, once, and a second take was refused".into(),
             "origin-kernel: random: root: known-answer test passed; ".into(),
             "; the loader's seed mixed in and overwritten where it lay; the boot processor's generator seeded".into(),
             // M3: every processor QEMU emulates (`-smp`, see `machine`) comes online. The
@@ -1726,6 +1731,7 @@ fn boot_failures() -> Vec<&'static str> {
         "origin-boot: random: known-answer test FAILED",
         "origin-boot: random: no seed for the kernel",
         "ran over its stack",
+        "kernel stacks' region: WRONG",
         "origin-kernel: invalid boot info",
         "origin-kernel: invalid image",
         // ADR-0013: a proof whose failure stops the boot said so.

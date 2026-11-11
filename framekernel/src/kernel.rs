@@ -263,6 +263,9 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         }
         // The random-number generator (ADR-0016): the root and the boot processor's own
         // generator, before another processor starts.
+        // Boot info 0.6 (decision item 166): the loader's value for the kernel stacks' region
+        // can be taken once, and only before the generator's start overwrites it with the seed.
+        let stack_value = prove_stack_value(&mut com1, info.boot_seed != 0);
         report_random_start(&mut com1, origin_frame::random::start_boot());
         let online = smp::start(&mut com1, sched::run_ap);
         proofs.record(Proof::Processors, online.complete());
@@ -326,7 +329,7 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // The random-number generator on every processor (CLAUDE.md §59; ADR-0016). If the
         // proof fails, randomness is withheld from here on (ADR-0013 R2, Amendment 1): nothing
         // is launched and nothing is placed at a random address.
-        let random = prove_random(&mut com1, online.cpus(), tsc_hz);
+        let random = prove_random(&mut com1, online.cpus(), tsc_hz) && stack_value;
         if !random {
             origin_frame::random::withhold();
         }
@@ -1284,6 +1287,42 @@ fn condition_name(condition: origin_frame::random::Condition) -> &'static str {
     }
 }
 
+/// The loader's value for the kernel stacks' region (boot info 0.6; ADR-0016 R10 Amendment 1,
+/// decision item 166): it is there when the loader handed over a secret area, it can be taken
+/// once, and a second take is refused. The value is never printed.
+///
+/// Nothing in this tree places that region, so the value taken here is dropped. Where the
+/// code that places the region takes it while the kernel builds its tables (ADR-0004
+/// Amendment 2), this call finds it taken already, which is in order too.
+fn prove_stack_value(com1: &mut Console, handed: bool) -> bool {
+    use origin_frame::random::{self, StackValue};
+    let first = random::take_stack_value().is_some();
+    let second = random::take_stack_value().is_some();
+    let (what, in_order) = match (handed, first, second, random::stack_value()) {
+        (true, true, false, StackValue::Taken) => (
+            "taken here, once, and a second take was refused; nothing in this tree places that region, so it is dropped",
+            true,
+        ),
+        (true, false, false, StackValue::Taken) => (
+            "taken once before this point, and a take here was refused",
+            true,
+        ),
+        (false, false, false, StackValue::None) => {
+            ("none: the loader handed over no secret area", true)
+        }
+        (true, false, false, StackValue::None) => (
+            "none: the secret area the loader named does not lie where one may",
+            true,
+        ),
+        _ => ("WRONG: it was not taken exactly once", false),
+    };
+    let _ = writeln!(
+        com1,
+        "origin-kernel: random: the loader's value for the kernel stacks' region: {what}"
+    );
+    in_order
+}
+
 /// Says how the generator's start went on the boot processor (ADR-0016 R13). Counts and
 /// yes-or-no only: no draw, seed, state or output is ever printed (CLAUDE.md §61).
 fn report_random_start(com1: &mut Console, start: Option<origin_frame::random::BootStart>) {
@@ -1476,8 +1515,10 @@ fn prove_random(com1: &mut Console, cpus: &[cpu::CpuIndex], tsc_hz: u64) -> bool
         }
     };
 
-    // The loader's seed, if it gave one, is gone from where it lay (R9, R10).
-    let seed_gone = random::loader_seed() != random::LoaderSeed::Mixed { overwritten: false };
+    // The loader's secret area, if it gave one, is gone from where it lay (R9, R10), and the
+    // value in it for the kernel stacks' region can no longer be taken.
+    let seed_gone = random::loader_seed() != random::LoaderSeed::Mixed { overwritten: false }
+        && random::take_stack_value().is_none();
     let consistent = every
         && answered == values.len()
         && distinct
