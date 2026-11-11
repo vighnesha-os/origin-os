@@ -90,6 +90,7 @@ dependencies = [
  "origin-boot-info",
  "origin-crypto",
  "origin-paging",
+ "origin-random",
  "origin-version",
 ]
 

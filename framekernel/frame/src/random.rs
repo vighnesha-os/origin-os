@@ -452,6 +452,90 @@ fn finish_start(slot: &Slot) {
     slot.started.store(true, Ordering::Release);
 }
 
+/// What became of the loader's seed (boot info 0.6; R10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoaderSeed {
+    /// The loader gave none.
+    None,
+    /// The boot info names one that does not lie where a seed may: it was not read.
+    Refused,
+    /// Its 64 bytes went into the root's first seed, and were then overwritten where they lay,
+    /// or, if `overwritten` is false, could not be.
+    Mixed {
+        /// Whether the 64 bytes read back as zeros afterwards.
+        overwritten: bool,
+    },
+}
+
+/// What [`take_loader_seed`] found, for [`loader_seed`]: 0 none, 1 refused, 2 mixed in and
+/// overwritten, 3 mixed in and still there.
+static LOADER_SEED: AtomicU8 = AtomicU8::new(0);
+
+/// What became of the loader's seed.
+pub fn loader_seed() -> LoaderSeed {
+    match LOADER_SEED.load(Ordering::Acquire) {
+        1 => LoaderSeed::Refused,
+        2 => LoaderSeed::Mixed { overwritten: true },
+        3 => LoaderSeed::Mixed { overwritten: false },
+        _ => LoaderSeed::None,
+    }
+}
+
+/// Moves the loader's 64 bytes from the boot-info region into the boot processor's seed area,
+/// where the root's first seed takes them (R10), and overwrites them where they lay. Called
+/// once, on the boot processor, before any other processor runs.
+fn take_loader_seed() -> LoaderSeed {
+    let Some(data) = crate::early::boot_data() else {
+        return LoaderSeed::None;
+    };
+    if data.info().boot_seed == 0 {
+        return LoaderSeed::None;
+    }
+    let Some(seed) = data.boot_seed() else {
+        LOADER_SEED.store(1, Ordering::Release);
+        return LoaderSeed::Refused;
+    };
+    let source = ptr::with_exposed_provenance_mut::<u8>(crate::phys::to_virt(seed) as usize);
+    // As a step, so the bytes pass through the generator's stack and no other.
+    let taken = step_here(|slot, _, _, _| {
+        let mut state = slot.state.try_lock()?;
+        let to = seed::extra_slot(&mut state.area)?;
+        for (at, byte) in to.iter_mut().enumerate() {
+            // SAFETY: `boot_data` took `seed` only from inside a region of kind `BootInfo`,
+            // which is RAM the loader left to the kernel and the direct map holds read-write,
+            // and only clear of the boot-info header and its two arrays, so no reference
+            // covers these 64 bytes. Only the boot processor runs.
+            *byte = unsafe { source.wrapping_add(at).read_volatile() };
+        }
+        Some(())
+    })
+    .flatten()
+    .is_some();
+    for at in 0..seed::EXTRA_LEN {
+        // SAFETY: as the read above; the bytes are the kernel's to overwrite.
+        unsafe { source.wrapping_add(at).write_volatile(0) };
+    }
+    let mut overwritten = true;
+    for at in 0..seed::EXTRA_LEN {
+        // SAFETY: as the read above.
+        overwritten &= unsafe { source.wrapping_add(at).read_volatile() } == 0;
+    }
+    let found = if taken {
+        LoaderSeed::Mixed { overwritten }
+    } else {
+        LoaderSeed::Refused
+    };
+    LOADER_SEED.store(
+        match found {
+            LoaderSeed::Mixed { overwritten: true } => 2,
+            LoaderSeed::Mixed { overwritten: false } => 3,
+            _ => 1,
+        },
+        Ordering::Release,
+    );
+    found
+}
+
 /// How the boot processor's start went: what the boot's first line about the generator says
 /// (R13). Nothing here is secret.
 #[derive(Clone, Copy, Debug)]
@@ -468,8 +552,8 @@ pub struct BootStart {
     pub counted: Option<Instruction>,
     /// Whether the other instruction's start-up draws were the root's nonce.
     pub both: bool,
-    /// Whether the loader's seed was mixed in.
-    pub loader_seed: bool,
+    /// What became of the loader's seed.
+    pub loader_seed: LoaderSeed,
     /// Whether the boot processor has a generator of its own.
     pub generator: bool,
 }
@@ -486,13 +570,15 @@ pub fn start_boot() -> Option<BootStart> {
         return None;
     }
     read_reports(slot);
+    let loader_seed = take_loader_seed();
     let mut kernel = Kernel { quick: false };
-    let root = origin_random::start_root(&mut kernel, false);
+    let root =
+        origin_random::start_root(&mut kernel, matches!(loader_seed, LoaderSeed::Mixed { .. }));
     let own = origin_random::start_processor(&mut kernel);
     finish_start(slot);
-    let (counted, both, loader_seed) = cpu::without_interrupts(|| {
+    let (counted, both) = cpu::without_interrupts(|| {
         let root = ROOT.lock();
-        (root.counted(), root.both(), root.extra())
+        (root.counted(), root.both())
     });
     Some(BootStart {
         self_test: root.self_test,

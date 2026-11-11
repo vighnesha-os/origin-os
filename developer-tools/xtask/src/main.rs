@@ -1155,13 +1155,21 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-boot: TEST trust store: this loader trusts a development key and must never ship".into(),
             "origin-boot: kernel signature verified: origin-kernel, Ed25519 and ML-DSA-87 both good, key ID ".into(),
             "origin-boot: kernel verified: ".into(),
+            // The loader's own random-number generator (ADR-0016 R10): the self-test passed
+            // and an instruction passed its start-up test.
+            "origin-boot: random: known-answer test passed; ".into(),
+            "; the loader's generator is seeded".into(),
             "origin-boot: kernel placed at ".into(),
             // The firmware's framebuffer, for the kernel's console (ADR-0010).
             format!(
                 "origin-boot: framebuffer: {QEMU_DISPLAY} at 0x"
             ),
+            // Two slides, each from its own request.
             "origin-boot: KASLR: kernel at 0xffffffff".into(),
+            "(two requests to the loader's generator)".into(),
             "origin-boot: page tables built: ".into(),
+            // The kernel's seed is handed over and the loader's generator is gone.
+            "origin-boot: random: 64 bytes for the kernel's generator are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten".into(),
             "origin-boot: exiting boot services; entering the Framekernel".into(),
             // Attached before anything else is printed, so everything below is also on the
             // screen; `check_screen` holds the kernel to that.
@@ -1248,7 +1256,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // (ADR-0016 R5, R13), before another processor starts: the self-test passed and
             // an instruction passed its start-up test.
             "origin-kernel: random: root: known-answer test passed; ".into(),
-            "; the boot processor's generator seeded".into(),
+            "; the loader's seed mixed in and overwritten where it lay; the boot processor's generator seeded".into(),
             // M3: every processor QEMU emulates (`-smp`, see `machine`) comes online. The
             // MADT lists every possible processor; each enabled one gets a CPU index.
             format!(
@@ -1630,6 +1638,10 @@ fn boot_failures() -> Vec<&'static str> {
         "origin-boot: panic:",
         "origin-kernel: panic:",
         "origin-boot: kernel rejected",
+        // The loader's generator: a failed self-test, no generator, or a stack that ran over.
+        "origin-boot: random: known-answer test FAILED",
+        "origin-boot: random: no seed for the kernel",
+        "ran over its stack",
         "origin-kernel: invalid boot info",
         "origin-kernel: invalid image",
         // ADR-0013: a proof whose failure stops the boot said so.

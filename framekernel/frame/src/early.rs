@@ -19,7 +19,9 @@
 //! The entry contract, which `_start` relies on: the Origin boot loader calls it after
 //! `ExitBootServices`, with the physical address of a [`BootInfo`] in `rdi` (System V; null, or
 //! readable, with region and segment arrays, if the header is valid, that are readable and are
-//! never written afterwards: the loader leaves that memory to the kernel for good), interrupts
+//! never written afterwards: the loader leaves that memory to the kernel for good; the one
+//! thing the kernel writes there is zeros over the loader's 64-byte seed, which lies clear of
+//! the header and both arrays), interrupts
 //! disabled, the processor at CPL 0, the loader's page tables active (a direct map of RAM at
 //! `direct_map_base`, and the kernel image at `kernel_virtual_base`), `rsp` 16-byte aligned before
 //! the `call`, on the stack `BootInfo` describes, the direction flag clear, and the image's
@@ -66,6 +68,8 @@ pub struct BootData {
     regions: &'static [MemoryRegion],
     segments: &'static [KernelSegment],
     summary: MemorySummary,
+    /// The physical address of the loader's seed, if the header names one the kernel may take.
+    boot_seed: Option<u64>,
 }
 
 impl BootData {
@@ -87,6 +91,13 @@ impl BootData {
     /// What the memory map adds up to.
     pub const fn summary(&self) -> MemorySummary {
         self.summary
+    }
+
+    /// The physical address of the loader's 64-byte seed (boot info 0.6; ADR-0016 R10), if the
+    /// header names one that lies inside the boot-info region and clear of the header and the
+    /// two arrays. Whether the loader named one at all is `info().boot_seed != 0`.
+    pub(crate) const fn boot_seed(&self) -> Option<u64> {
+        self.boot_seed
     }
 }
 
@@ -155,12 +166,19 @@ impl Entry {
         // integer fields.
         let segments = unsafe { slice::from_raw_parts(first, segment_array.len) };
         boot::check_kernel_segments(segments, &info)?;
+        // The loader's seed is taken only from where it may lie; anything else is no seed.
+        let boot_seed = origin_boot_info::boot_seed(
+            &info,
+            phys::to_phys(self.boot_info.addr() as u64),
+            regions,
+        );
         // `Entry` is made once, so this is the first and only `set`.
         let _ = BOOT_DATA.set(BootData {
             info,
             regions,
             segments,
             summary,
+            boot_seed,
         });
         let data = BOOT_DATA.get().ok_or(InvalidBootInfo::Null)?;
         Ok(Early {

@@ -1287,7 +1287,7 @@ fn condition_name(condition: origin_frame::random::Condition) -> &'static str {
 /// Says how the generator's start went on the boot processor (ADR-0016 R13). Counts and
 /// yes-or-no only: no draw, seed, state or output is ever printed (CLAUDE.md §61).
 fn report_random_start(com1: &mut Console, start: Option<origin_frame::random::BootStart>) {
-    use origin_frame::random::Instruction;
+    use origin_frame::random::{Instruction, LoaderSeed};
     let Some(start) = start else {
         let _ = writeln!(
             com1,
@@ -1325,11 +1325,12 @@ fn report_random_start(com1: &mut Console, start: Option<origin_frame::random::B
     }
     let _ = writeln!(
         com1,
-        "; loader seed {}; the boot processor's generator {}",
-        if start.loader_seed {
-            "mixed in"
-        } else {
-            "none"
+        "; the loader's seed {}; the boot processor's generator {}",
+        match start.loader_seed {
+            LoaderSeed::None => "none",
+            LoaderSeed::Refused => "refused: not inside the boot-info region",
+            LoaderSeed::Mixed { overwritten: true } => "mixed in and overwritten where it lay",
+            LoaderSeed::Mixed { overwritten: false } => "mixed in and NOT overwritten",
         },
         if start.generator {
             "seeded"
@@ -1475,8 +1476,15 @@ fn prove_random(com1: &mut Console, cpus: &[cpu::CpuIndex], tsc_hz: u64) -> bool
         }
     };
 
-    let consistent =
-        every && answered == values.len() && distinct && long_ok && fresh_ok && stack_ok;
+    // The loader's seed, if it gave one, is gone from where it lay (R9, R10).
+    let seed_gone = random::loader_seed() != random::LoaderSeed::Mixed { overwritten: false };
+    let consistent = every
+        && answered == values.len()
+        && distinct
+        && long_ok
+        && fresh_ok
+        && stack_ok
+        && seed_gone;
     let _ = writeln!(
         com1,
         "origin-kernel: random: every processor has a generator {every}; consistent {consistent}{}",
