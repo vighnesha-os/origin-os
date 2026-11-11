@@ -17,11 +17,17 @@
 //! - **The budget** is a generic cell rate: each unit (one shootdown, or one processor it
 //!   interrupts) costs an interval of credit, and at most `burst` units can be spent ahead of
 //!   time. A change is priced before it runs and refused if the budget cannot pay.
+//! - **What a program chose and the kernel then looks something up by** goes through
+//!   `origin_frame::nospec` here, so that it stays in range on a path the processor took by
+//!   guessing a check wrong (ADR-0017 Z9): a request's offset and length, which pick the
+//!   object's frames, and the address and length of a run of pages, which pick the page-table
+//!   entries an address space walks ([`check`], [`user_run`]).
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
 
 use origin_abi::{Error, map_access, map_flags};
+use origin_frame::nospec;
 use origin_frame::usercopy::{USER_END, USER_START};
 
 /// Bytes in a page (the definition's `page_size`).
@@ -97,6 +103,30 @@ pub fn user_range_end(base: u64, pages: u64) -> Option<u64> {
         .filter(|&end| end <= USER_END)
 }
 
+/// `value` if it is at most `max`. What comes back is at most `max` on a wrongly guessed path
+/// too: `nospec::length`, for a count of pages (ADR-0017 Z9).
+fn at_most(value: u64, max: u64) -> Option<u64> {
+    let max = usize::try_from(max).unwrap_or(usize::MAX);
+    nospec::length(usize::try_from(value).ok()?, max).map(|kept| kept as u64)
+}
+
+/// The run of `pages` pages from `base` to give an address space: `None` unless it is at least
+/// one page, page-aligned and inside the user half ([`user_range_end`]).
+///
+/// The address and the count are a program's, and the space walks its page tables by them. So
+/// both come back through `nospec`: on a wrongly guessed path too, the run lies in the user
+/// half (ADR-0017 Z9). On the path that is kept they are what was given.
+pub fn user_run(base: u64, pages: u64) -> Option<(u64, u64)> {
+    if pages == 0 {
+        return None;
+    }
+    user_range_end(base, pages)?;
+    // At least one page fits above it, so `base` is below `USER_END`, here and after the clamp.
+    let base = nospec::user_address(base);
+    let pages = at_most(pages, (USER_END - base) / PAGE)?;
+    Some((base, pages))
+}
+
 /// A map request's fields, as the generated decoder read them (it has refused bits the
 /// definition does not declare).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +168,10 @@ pub struct Asked {
 /// Checks `request` against an object of `object_pages` pages held with the rights `held`, in
 /// this order: what it allows, the handle's rights for that, the range in the object, then the
 /// placement.
+///
+/// The pages it returns are inside the object, and a fixed address's run inside the user half,
+/// on a wrongly guessed path too (ADR-0017 Z9): everything the map then looks up by them
+/// (the object's frames, the page tables, a random place) takes them from here.
 pub fn check(request: &Request, object_pages: u64, held: u32) -> Result<Asked, Error> {
     let allow = Allow::from_bits(request.access)?;
     if held & allow.needs() != allow.needs() {
@@ -152,11 +186,18 @@ pub fn check(request: &Request, object_pages: u64, held: u32) -> Result<Asked, E
     {
         return Err(Error::InvalidArgs);
     }
-    let place = match request.flags {
-        0 if request.address == 0 => Place::Anywhere,
-        map_flags::FIXED if user_range_end(request.address, pages).is_some() => {
-            Place::At(request.address)
-        }
+    // The offset and the length are a program's and pick the object's frames
+    // (`MemoryObject::run`). `nospec` keeps them inside the object on a wrongly guessed path
+    // too; the check above has refused whatever these would.
+    let pages = at_most(pages, object_pages).ok_or(Error::InvalidArgs)?;
+    let first = at_most(first, object_pages - pages).ok_or(Error::InvalidArgs)?;
+    let (pages, place) = match request.flags {
+        0 if request.address == 0 => (pages, Place::Anywhere),
+        // So is a fixed address, which picks the page-table entries the pages go into.
+        map_flags::FIXED => match user_run(request.address, pages) {
+            Some((base, pages)) => (pages, Place::At(base)),
+            None => return Err(Error::InvalidArgs),
+        },
         _ => return Err(Error::InvalidArgs),
     };
     Ok(Asked {
@@ -168,7 +209,8 @@ pub fn check(request: &Request, object_pages: u64, held: u32) -> Result<Asked, E
 }
 
 /// Which of an object's frames `asked` maps: the places of its pages among them, in order.
-/// `None` if they cannot be counted; `check` has refused a request past the object's end.
+/// `None` if they cannot be counted; `check` has refused a request past the object's end, and
+/// has kept `asked`'s pages inside the object on a wrongly guessed path (ADR-0017 Z9).
 pub fn frames(asked: &Asked) -> Option<core::ops::Range<usize>> {
     let first = usize::try_from(asked.first).ok()?;
     let end = first.checked_add(usize::try_from(asked.pages).ok()?)?;
@@ -601,6 +643,73 @@ mod tests {
             Err(Error::AccessDenied)
         );
         assert!(check(&write, 1, rights::READ | rights::WRITE | rights::MAP).is_ok());
+    }
+
+    #[test]
+    fn a_count_within_its_bound_comes_back_unchanged_and_one_past_it_does_not() {
+        assert_eq!(at_most(0, 0), Some(0));
+        assert_eq!(at_most(3, 3), Some(3));
+        assert_eq!(at_most(4, 3), None);
+        assert_eq!(at_most(1, 0), None);
+        assert_eq!(at_most(u64::MAX, u64::MAX), Some(u64::MAX));
+        assert_eq!(at_most(u64::MAX, u64::MAX - 1), None);
+    }
+
+    #[test]
+    fn a_run_for_an_address_space_is_whole_pages_of_the_user_half_and_comes_back_as_given() {
+        let at = 0x0000_3000_0000_0000;
+        assert_eq!(user_run(at, 4), Some((at, 4)));
+        assert_eq!(user_run(USER_START, 1), Some((USER_START, 1)));
+        // The last page of the user half, and the whole of it.
+        assert_eq!(user_run(USER_END - PAGE, 1), Some((USER_END - PAGE, 1)));
+        let all = (USER_END - USER_START) / PAGE;
+        assert_eq!(user_run(USER_START, all), Some((USER_START, all)));
+        for (base, pages) in [
+            (USER_END - PAGE, 2),
+            (USER_START, all + 1),
+            (USER_END, 1),
+            (at + 1, 1),
+            (0, 1),
+            (0xFFFF_8000_0000_0000, 1),
+            (PAGE, u64::MAX),
+            // No pages is no run, wherever it is: `USER_END` itself is no address to walk from.
+            (at, 0),
+            (USER_END, 0),
+        ] {
+            assert_eq!(user_run(base, pages), None, "{base:#x} + {pages} pages");
+        }
+    }
+
+    #[test]
+    fn a_request_keeps_its_pages_and_its_fixed_address_through_the_clamps() {
+        // Every page of the object, its last page alone, and its last page at the last page of
+        // the user half: the largest values each clamp lets through.
+        let whole = check(&request(RW, 0, 0, 8 * PAGE, 0), 8, ALL_RIGHTS).unwrap();
+        assert_eq!(
+            (whole.first, whole.pages, whole.place),
+            (0, 8, Place::Anywhere)
+        );
+        let last = USER_END - PAGE;
+        let fixed = check(
+            &request(RW, map_flags::FIXED, 7 * PAGE, PAGE, last),
+            8,
+            ALL_RIGHTS,
+        )
+        .unwrap();
+        assert_eq!(
+            (fixed.first, fixed.pages, fixed.place),
+            (7, 1, Place::At(last))
+        );
+        assert_eq!(frames(&fixed), Some(7..8));
+        // One page more than the user half has above the address is refused, as before.
+        assert_eq!(
+            check(
+                &request(RW, map_flags::FIXED, 6 * PAGE, 2 * PAGE, last),
+                8,
+                ALL_RIGHTS
+            ),
+            Err(Error::InvalidArgs)
+        );
     }
 
     #[test]
