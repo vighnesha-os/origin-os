@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (below): Accepted** by the owner on 2026-11-08, with the recommended option of each item. **Amendment 2 (below): Accepted** by the owner on 2026-11-09, through ADR-0011. **Amendment 3 (below): Accepted** by the owner on 2026-11-09, through `docs/spec/OIDL.md`'s question Q8. **Amendment 4 (below): Accepted** by the owner on 2026-11-09. **Amendment 5 (below): Accepted** by the owner on 2026-11-10. **Amendment 6 (below): Accepted** by the owner on 2026-11-10; not built. |
+| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (below): Accepted** by the owner on 2026-11-08, with the recommended option of each item. **Amendment 2 (below): Accepted** by the owner on 2026-11-09, through ADR-0011. **Amendment 3 (below): Accepted** by the owner on 2026-11-09, through `docs/spec/OIDL.md`'s question Q8. **Amendment 4 (below): Accepted** by the owner on 2026-11-09. **Amendment 5 (below): Accepted** by the owner on 2026-11-10. **Amendment 6 (below): Accepted** by the owner on 2026-11-10; not built. **Amendment 7 (below): Accepted** by the owner on 2026-11-11; not built. |
 | Scope | Kernel objects and handles, the system-call convention, status codes, process and thread start, memory mapping, IPC, waiting, faults, termination, ABI versioning |
 | Builds on | ONBF §6.1 (EXE/LIB images, syscall-origin pinning, TLS in FS), §8.2 (sealed objects, the Code Integrity Table, mapping rules), §8.3 (the user-mode Loader Service and the start record); ADR-0001 D2 (user-mode drivers); ADR-0004 (address-space layout) |
 | Requires | CLAUDE.md §29 (processes and isolation), §30 (IPC and capabilities), §42 (executable ABI), §44 (runtime), §49 (SDK) |
@@ -194,3 +194,79 @@ No status is added and no call declares a new one, so `user-abi` stays 0.5. **Bu
 **Trade-offs.** Each handle record grows, and one change touches the kernel's table, `origin-abi`, the OIDL definition and every generated crate together. In return the limit goes for good, at the only time when changing it breaks nothing outside the tree.
 
 **Migration consequences.** `user-abi` is at major 0, so no program outside the tree depends on a handle's width (P12). After the first release with third-party programs the width could change only with a new major. E2 changes no layout and no built behaviour: no system library exists yet to read an environment.
+
+## Amendment 7 (Accepted, 2026-11-11): what events, ports and `clock_read` need and C9, C10 and C13 leave open
+
+**Status: Accepted by the owner on 2026-11-11, all 19 items with the recommended answer ("Accept all", decision sheet items 169–187; CLAUDE.md §84). None is built: no behaviour below has run.** The options, and what was rejected for each, are in task S3-6's research ledger, `docs/research/2026-11-11-events-ports.md`, section "Shapes for the owner" (its shape n of 1–18 is F n; its shape 20 is F19; its shape 19, the call numbers, is recorded below and is no decision). C6, C9, C10, C11 and C13 stand. F1 makes one exception to P4, named in its row; where another item below is more exact than C9, C10 or C13, the item governs.
+
+| # | Item | Decision | Refines |
+|---|---|---|---|
+| F1 | 169 | **The packet.** `port_packet` is a fixed 32-byte record of C9's six fields in C9's order, with no padding and no `size` field: `key: u64` at 0, `kind: u32` at 8 (`signal = 1`, `canceled = 2`; 0 is never a kind), `trigger: u32` at 12, `observed: u32` at 16, `reserved: u32` at 20 (zero), `data: u64` at 24 (zero in v1). **This is an exception to P4's "Every structure crossing the boundary begins with a `u32 size`"**, for this record only; OIDL §3.1 already allows a plain record as a call's result. A different layout would be a new call. | C9; P4 |
+| F2 | 170 | **Binding.** `object_wait_async(port, object, key, signals)` needs `write` on the port and `wait` on the object and takes no options argument. `signals` is non-zero and names declared bits only. A signal already raised queues the packet before the call returns. `key` is compared, never interpreted. The first failure wins, in D5's order: the mask (`invalid_args`); the port's handle, then the object's (`bad_handle`, `wrong_type`, `access_denied`); an object that raises no signals (`bad_handle`, as `wait_one`); the quota (`limit`); the storage (`no_memory`, with the charge returned). If another thread closes the bound handle or the port during the call, the answer is `bad_handle` and nothing stays bound. | C9; D1, D5 |
+| F3 | 171 | **Reading.** `port_wait(port, deadline) -> packet` needs `read` on the port. The deadline is `wait_one`'s: absolute, monotonic, nanoseconds; 0 polls; `deadline_infinite` never expires. `timed_out` when nothing is queued by then. `canceled` when the handle waited through is closed or moved during the wait, even if a duplicate keeps the port alive; such a wait consumes no packet. The out pointer is checked before the wait and written only on `ok`. A packet is consumed when it is taken: if the copy then faults, the answer is `fault` and the packet is gone, as `channel_read` treats a message it has taken. The status `canceled` is not the packet kind `canceled`. | C9; A2 |
+| F4 | 172 | **Explicit cancel.** `port_cancel(port, object, key)` needs `write` on the port and no right on the object. It matches the port, the object behind the handle given, and the key, and silently removes every armed binding and every queued packet of either kind that matches. `not_found` when nothing matched; that status's description gains the port's case and its meaning does not change. The authority is the port's `write`: processes that share it share control of the port's bindings. | C9; C11 |
+| F5 | 173 | **`object_signal(object, clear, set)`** keeps the signature it has as a reserved call. Events only in v1 (`wrong_type` otherwise) and only `signaled` (any other declared bit in either mask is `invalid_args`). Two empty masks are `ok` and change nothing. Clear then set is one atomic update, `(old & !clear) | set`; a bit in both masks ends set; there is no pulse. Order: undeclared bits (`invalid_args`); the handle (`bad_handle`, then `access_denied`); the type (`wrong_type`); then the bits. | C10 |
+| F6 | 174 | **The default rights' names.** `event_rights = wait | signal | duplicate | transfer` and `port_rights = read | write | duplicate | transfer`: C6 word for word. | C6 |
+| F7 | 175 | **Quotas.** Three new per-process counts set by the creator: `events`, `ports`, `bindings`. C9's "charged to the binder" is the `bindings` quota of the process that called `object_wait_async`, held from the bind until that binding's one packet has left the port. Events and ports are charged to their creator until the object is destroyed, as channels are. Past a quota: `limit`. Without memory: `no_memory`. A process given no quota gets nothing (D4). No kernel-wide bound yet; that is step 4's. | C9; P11, D4 |
+| F8 | 176 | **`wait_one`** works on an event. On a port it is `access_denied` (C6 gives a port no `wait`, and P2 adds no right). A port raises no signals in v1, so a port cannot be bound to a port. | C6; P2, P9 |
+| F9 | 177 | **Binding the same thing twice** is allowed: the same port, object and key give two bindings and two packets, each with its own storage and charge. `port_cancel` removes every match. | C9 |
+| F10 | 178 | **`clock_read() -> nanos`** reads the monotonic clock only and takes no clock argument. Its one status is `fault`: the result goes through an out pointer (P4). A wall clock is a different call. What the clock does across suspend is not decided here. | C13; P4 |
+| F11 | 179 | **A port that outlives its binder.** *The port is transferred:* the binder stays charged for its bindings, and the port's own charge stays with its creator. *The port's last handle is closed:* every binding and queued packet goes, silently, and every charge is refunded. *The binder exits while another process holds the port:* exit closes every handle (P11), so each armed binding becomes a `canceled` packet; those packets, and packets already queued, stay queued and stay charged to the exited binder's account until they are read or cancelled, or the port closes. A queued message already stays charged to a sender that has exited. | C9; P11 |
+| F12 | 180 | **A binding's storage is refunded** when its packet is read, when it is explicitly cancelled, and when the port closes. An implicit cancel refunds nothing: the storage becomes the `canceled` packet. | C9 |
+| F13 | 181 | **The mask is not checked against the object's type.** `signals` may name any declared bits; a bit the object's type never raises never fires, as with `wait_one`. | C9; A2 |
+| F14 | 182 | **What a packet reports.** `trigger` is the mask the binding asked. `observed` is all of the object's signals at the moment the packet was queued; for a `canceled` packet, at the cancel. A queued packet stays if the signal later falls. | C9 |
+| F15 | 183 | **Order, and no bound per port.** Packets leave a port in the order they were queued. A port has no bound of its own: every packet is some binding's reserved storage, so the binders' quotas bound the queue. Which waiting thread receives a packet is unspecified. | C9 |
+| F16 | 184 | **An implicit cancel follows the handle, not the object.** Closing or moving the handle a binding was made through cancels it, even if a duplicate still reaches the object. Closing another duplicate does nothing; `handle_duplicate` copies no binding; a binding does not travel with a moved handle. A transfer cancels only if the `channel_write` succeeds. The port side goes by the object: closing the port handle used at bind, while another keeps the port alive, leaves the binding. A `signal` packet already queued when its handle closes stays, and no `canceled` packet follows it: one binding, one packet. | C9 |
+| F17 | 185 | **The two creation calls.** `event_create()` and `port_create()` take no argument (D1) and answer `fault`, `limit` or `no_memory`. An event starts with no signal raised. The out pointer is checked before anything is made. | C10, C9; D1 |
+| F18 | 186 | **What can be bound:** any object `wait_one` can wait on, which is channel ends, processes, threads and events. | C9; P9 |
+| F19 | 187 | **What S3-6 leaves out.** Packets a program queues itself, and edge-triggered or repeating bindings, are not in this task; each would be a new call later. The `Timer` object of P3 is not built by S3-6 either. **It stays owed under P3, unchanged**, and is tracked as TASKS item 36. Until it exists, a deadline on `port_wait` or `wait_one`, with `clock_read`, covers a timeout. | P3, P9 |
+
+**The interface these add up to**, written against the grammar of `docs/spec/OIDL.md` with the doc comments left out. The tool had not parsed it when it was accepted. A method's error set is frozen for a major version, so each list of errors is part of what was accepted.
+
+```
+@since(0.6) const event_rights: rights = wait | signal | duplicate | transfer;
+@since(0.6) const port_rights: rights = read | write | duplicate | transfer;
+
+@since(0.6) enum packet_kind: u32 { signal = 1; canceled = 2; }
+
+@since(0.6) struct port_packet {      // 32 bytes, no padding
+    key: u64;                         // @0   what the binder gave
+    kind: packet_kind;                // @8
+    trigger: signals;                 // @12  the mask the binding asked
+    observed: signals;                // @16  the object's signals when the packet was queued
+    reserved: u32;                    // @20  zero
+    data: u64;                        // @24  zero in v1
+}
+
+method event_create = 9 () -> (event: handle<event>,)
+    errors(fault, limit, no_memory) requires none;
+method object_signal = 10 (object: handle<any, signal>, clear: signals, set: signals,)
+    errors(bad_handle, invalid_args, access_denied, wrong_type) requires none;
+@since(0.6) method port_create = 15 () -> (port: handle<port>,)
+    errors(fault, limit, no_memory) requires none;
+@since(0.6) method object_wait_async = 16 (port: handle<port, write>, object: handle<any, wait>,
+                                           key: u64, @nonzero signals: signals,)
+    errors(bad_handle, wrong_type, invalid_args, access_denied, limit, no_memory) requires none;
+@since(0.6) method port_wait = 17 (port: handle<port, read>, deadline: u64,) -> (packet: port_packet,)
+    errors(bad_handle, wrong_type, access_denied, fault, timed_out, canceled) requires none;
+@since(0.6) method port_cancel = 18 (port: handle<port, write>, object: handle<any>, key: u64,)
+    errors(bad_handle, wrong_type, access_denied, not_found) requires none;
+@since(0.6) method clock_read = 19 () -> (nanos: u64,)
+    errors(fault) requires none;
+```
+
+**Recorded, and no decision.**
+
+- **Call numbers:** 9 `event_create` and 10 `object_signal`, as reserved today; 15 `port_create`, 16 `object_wait_async`, 17 `port_wait`, 18 `port_cancel`, 19 `clock_read`. They are private to the release (P4).
+- **Two error sets change:** `event_create` and `object_signal` are reserved calls today and answer only `not_supported`. They lose that status and take the sets above. Major 0 reports such a change without refusing it (OIDL §9).
+- **Versions:** `origin.kernel` 0.5 becomes 0.6, and `user-abi` 0.5 becomes 0.6.
+
+**Why F1 has no size.** The caller would have to set it before every `port_wait`, and the kernel would read and check it on the path that should be the shortest. Two plain records cross the boundary already, `received_handle` and `start_entry`, each inside a vector or a larger record. `port_packet` is the first plain record a call writes by itself, and the generator's path for that has never run; building it will show whether it works as the OIDL specification says. Room to grow is `reserved`, `data` and new kinds.
+
+**Why F11 keeps an exited binder charged.** Removing its bindings and packets silently would leave a reader on a shared port waiting for a packet that never comes, and C9 says an implicit cancel delivers. Moving the charge to whoever holds the port would be a charge nobody agreed to. So a binder's exit leaves no armed binding, and leaves no charge once the port is read, cancelled or closed. It leaves no charge at once only when the port dies with the binder.
+
+**Trade-offs.** No options word, no clock argument and no size in the packet mean that edge-triggered bindings, another clock or a larger packet each need a new call. A port has no bound of its own, so a port's queue is as long as its binders' quotas allow. Sharing a port's `write` shares control of its bindings (F4), which the system-call threat model must carry as a row. P3's `Timer` object stays owed (F19).
+
+**Migration consequences.** `user-abi` is at major 0, so no program outside the tree depends on these shapes (P12). From major 1 the packet's layout, each method's parameters and each error set are frozen. The 64-bit handles of E1 do not change the packet, which holds no handle.
+
+**What stays unknown.** Whether the packet's 12 spare bytes are enough for an I/O completion: asynchronous I/O is not designed. A deadline's resolution is the tick, 10 ms today. No order is promised among threads waiting on one port. Kernel-wide bounds and default quotas are step 4's. When built, this runs under QEMU on the development Mac only.
