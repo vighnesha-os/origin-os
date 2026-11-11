@@ -43,13 +43,17 @@ commands:
               off must refuse an unsigned image, a wrong key, a tampered statement, a bad
               signature and tampered content, each with its own message
   boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
-              one after another, then boot-x2apic, boot-bridge, boot-legacy-free and
-              boot-console
+              one after another, then boot-x2apic, boot-bridge, boot-legacy-free,
+              boot-random and boot-console
   boot-bridge boot-test with the NIC behind a PCIe root port (both IOMMUs): bus mastering is
               cleared on the bridge too and opened again above the device its driver attached
   boot-legacy-free  the kernel boot on a machine with no 8254 and no 8042: the timers
               calibrate against the ACPI PM timer, and the proofs that need those devices
               say they cannot run
+  boot-random the kernel boot on two processors that lack what the random-number generator is
+              seeded from (ADR-0016): one with RDRAND and no RDSEED, which boots and says
+              so; one with neither, which has no generator, launches nothing and still
+              reaches its verdict
   boot-x2apic boot-test on a sparse topology: the boot processor at APIC ID 0 and processors
               at APIC IDs 256 and 412, above what 8-bit APIC IDs reach (the MADT lists
               150 possible processors); twice, on a CPU model with CPUID leaf 1Fh and on
@@ -246,6 +250,15 @@ fn qemu_machine_options(base: &str) -> String {
 fn qemu_machine_lacks(device: &str) -> bool {
     let off = format!("{device}=off");
     env::var("ORIGIN_QEMU_MACHINE").is_ok_and(|extra| extra.split(',').any(|o| o == off))
+}
+
+/// Whether `ORIGIN_QEMU_CPU` takes `feature` away from the processor (`-feature` or
+/// `feature=off`).
+fn qemu_cpu_lacks(feature: &str) -> bool {
+    let (minus, off) = (format!("-{feature}"), format!("{feature}=off"));
+    qemu_cpu_model()
+        .split(',')
+        .any(|option| option == minus || option == off)
 }
 
 /// The QEMU CPU model: `ORIGIN_QEMU_CPU` (for example `max,-avx2` to boot a CPU below the
@@ -648,7 +661,76 @@ fn boot_scenario() -> Scenario {
     if qemu_machine_lacks("i8042") {
         no_i8042_markers(&mut scenario);
     }
+    match (qemu_cpu_lacks("rdseed"), qemu_cpu_lacks("rdrand")) {
+        (true, false) => rdrand_only_markers(&mut scenario),
+        (true, true) => no_generator_markers(&mut scenario),
+        _ => {}
+    }
     scenario
+}
+
+/// The markers of a boot on a processor with RDRAND and no RDSEED (`-cpu max,-rdseed`): the
+/// machine AMD's second workaround for AMD-SB-7055 produces. It boots; the root is counted on
+/// RDRAND and says its strength is no more than the processor's own generator's, and a
+/// request with prediction resistance is refused (ADR-0016 R3, R6, R8).
+fn rdrand_only_markers(scenario: &mut Scenario) {
+    swap_marker(
+        scenario,
+        "origin-boot: random: known-answer test passed; ",
+        "origin-boot: random: known-answer test passed; RDSEED absent, RDRAND healthy".into(),
+    );
+    swap_marker(
+        scenario,
+        "origin-kernel: random: root: known-answer test passed; ",
+        "origin-kernel: random: root: known-answer test passed; RDSEED absent, RDRAND healthy on the boot processor; seeded from RDRAND's 1024 start-up draws, with 4 more of its draws as the nonce; no healthy RDSEED, so its strength is no more than the processor's own generator's".into(),
+    );
+    swap_marker(
+        scenario,
+        "origin-kernel: random: processor 0: ",
+        "origin-kernel: random: processor 0: RDSEED absent (0 draws passed), RDRAND healthy (2052 draws passed)".into(),
+    );
+    swap_marker(
+        scenario,
+        "origin-kernel: random: 16 of 16 values answered, all distinct true; 300 bytes in pieces true; with prediction resistance: ",
+        "origin-kernel: random: 16 of 16 values answered, all distinct true; 300 bytes in pieces true; with prediction resistance: refused, as it must be with no healthy RDSEED here".into(),
+    );
+}
+
+/// The lines of a boot on a processor with neither instruction (`-cpu max,-rdseed,-rdrand`),
+/// in place of the whole list: there is no generator, so the kernel is placed at a fixed
+/// address, every request is refused, no process is launched, the network asks for no lease,
+/// and the boot still reaches its verdict, which names the generator (ADR-0016 R8).
+fn no_generator_markers(scenario: &mut Scenario) {
+    scenario.markers = vec![
+        "origin-boot: UEFI 2.".into(),
+        "origin-boot: random: known-answer test passed; RDSEED absent, RDRAND absent; no generator: the kernel is placed at a fixed address and is handed no seed".into(),
+        "(no generator: fixed placement)".into(),
+        "origin-boot: random: no seed for the kernel; the loader's generator is uninstantiated".into(),
+        "origin-boot: exiting boot services; entering the Framekernel".into(),
+        "origin-kernel: random: no generator: known-answer test passed; on the boot processor RDSEED is absent and RDRAND is absent. Nothing will be launched and nothing placed at a random address (ADR-0016 R8)".into(),
+        "origin-kernel: random: processor 0: RDSEED absent (0 draws passed), RDRAND absent (0 draws passed); its generator NOT seeded".into(),
+        "origin-kernel: random: no generator, so no request is answered; consistent false: random failed".into(),
+        "origin-kernel: start: there is no random-number generator, so no process is launched: the process-start and service-directory proofs did not run".into(),
+        // The network asks for no lease: a transaction ID must not be guessable.
+        "; DHCP lease 0.0.0.0 (".into(),
+        "; no random value for a transaction ID or port; consistent false: virtio-net failed".into(),
+        "origin-kernel: boot verdict: degraded: ".into(),
+        "; 2 did not run; failed: ".into(),
+        "random-number generator (no randomness)".into(),
+        HALT_LINE.into(),
+    ];
+    // What this machine is expected to say is not a failure here.
+    scenario.failures.retain(|failure| {
+        ![
+            "origin-kernel: random: no generator",
+            ": random failed",
+            "origin-boot: random: no seed for the kernel",
+            // The network driver asks for no lease without a random transaction ID.
+            ": virtio-net failed",
+        ]
+        .contains(failure)
+    });
+    scenario.check = None;
 }
 
 /// Replaces the required marker `old` with `new`, or records that it was not found, which
@@ -2132,6 +2214,7 @@ fn main() -> ExitCode {
         ["boot-console"] => in_turn("boot-console", boot_console),
         ["boot-bridge"] => in_turn("boot-bridge", boot_bridge),
         ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
+        ["boot-random"] => in_turn("boot-random", boot_random),
         ["run"] => in_turn("run", run),
         ["loom"] => in_turn("loom", loom::run),
         ["reproducible-gate"] => in_turn("reproducible-gate", reproducible::gate),
@@ -2197,9 +2280,10 @@ fn boot_matrix() -> Result {
     boot_x2apic()?;
     boot_bridge()?;
     boot_legacy_free()?;
+    boot_random()?;
     boot_console()?;
     println!(
-        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, and the console machines)"
+        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, the two machines without the random-number instructions, and the console machines)"
     );
     Ok(())
 }
@@ -2492,6 +2576,32 @@ fn boot_legacy_free() -> Result {
         ));
     }
     println!("xtask: boot-legacy-free passed (no 8254, no 8042)");
+    Ok(())
+}
+
+/// Runs the kernel boot on two processors that lack the instructions the random-number
+/// generator is seeded from (ADR-0016 R3, R8): one with RDRAND and no RDSEED, which boots and
+/// says what its generator's strength rests on; and one with neither, which has no generator,
+/// launches nothing, and still reaches its verdict.
+fn boot_random() -> Result {
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    for (model, what) in [
+        ("max,-rdseed", "RDRAND and no RDSEED"),
+        ("max,-rdseed,-rdrand", "neither RDSEED nor RDRAND"),
+    ] {
+        println!("xtask: boot-random: a processor with {what} (-cpu {model})");
+        let status = boot_test_child(&exe)
+            .env("ORIGIN_QEMU_CPU", model)
+            .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
+            .status()
+            .map_err(|e| format!("cannot run boot-test: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "boot-test on a processor with {what} failed ({status})"
+            ));
+        }
+    }
+    println!("xtask: boot-random passed (RDRAND alone; neither instruction)");
     Ok(())
 }
 
