@@ -126,7 +126,7 @@ Each says what the product does not promise, so each was the owner's to make. **
 | AC3 | Tampering with tools: implants, debug ports, bus probes, chips rewritten off the board, and anything measured at the machine | **Accepted** | No software defence exists | 135 |
 | AC4 | A program that induces faults in memory hardware | **Accepted; revisited when the list of declared machines exists** | The defences are in the memory and the platform. Whether declared server machines must have error-correcting memory is a hardware decision (ADR-0009) | 136 |
 | AC5 | Timing and contention channels between programs, the two threads of one core included. A program can time what it shares with others | **Accepted for programs in general.** First-party code that handles secrets must be constant-time, and that is not waived | AMD's 2026 bulletins on such channels recommend exactly this and no other change, and Intel's guidance for code that handles secrets is of the same kind (the ledger, §3.5 and §3.13) | 137 |
-| AC6 | On a processor that lacks the controls ADR-0017 needs, programs are not protected from each other's speculation | **Accepted, for bench machines only** | ADR-0009 already lets no claim rest on such a machine. ADR-0017's question 8 is the same decision (item 131) | 138 |
+| AC6 | On a processor that lacks the controls ADR-0017 needs, programs are not protected from each other's speculation | **Accepted, for bench machines only** | ADR-0009 already lets no claim rest on such a machine. ADR-0017's question 8 is the same decision (item 131). Step 4's first-party programs run under this acceptance, under QEMU and as KVM guests (item 213) | 138, 213 |
 | AC7 | An administrator of an Origin Server can read whatever the system can read | **Accepted, with attribution and an audit record as the defence** | The alternative is storage keys held by each user and not by the system, which is a decision for the storage and accounts designs | 139 |
 | AC8 | Whoever operates the host of an Origin Server guest, or the building a server stands in, can read and change everything | **Accepted** | The first server platform is a virtual machine (ADR-0014 S3). Guests the host cannot read would need an ADR and hardware Origin does not target yet | 140 |
 | AC9 | A compromised update server can withhold updates until the signed metadata it serves has expired | **Accepted** | It cannot be prevented from outside, only noticed | 141 |
@@ -135,7 +135,8 @@ Each says what the product does not promise, so each was the owner's to make. **
 
 | Before | What |
 |---|---|
-| The first program that is not a boot proof runs in ring 3 (ADR-0011 N14 step 4) | ADR-0017's Z2, Z3, Z5, Z9 and Z10 built (the ADR itself is accepted). The system-call model's own list: E8, O2, D11 |
+| The first program that is not a boot proof runs in ring 3 (ADR-0011 N14 step 4) | ADR-0017's Z2, Z3, Z5, Z9 and Z10 built (task 19b; under QEMU only, so no control has been read back on a processor that has it, which item 213 accepts for step 4's first-party programs). The system-call model's own list: E8 and D11. O2 is closed for step 4 by absence: no call creates a thread or a process (item 206) |
+| A program that is not first-party runs in ring 3 | ADR-0017's controls read back as written on a processor in the declared scope: row I2 of the system-call model (item 213) |
 | Anything but a boot proof uses the network | A decision on where the stack runs (TASKS item 23), and a model of a hostile peer |
 | The compositor is designed (M8) | A threat model for §52's four rules |
 | Origin can be installed (M9) | Storage encryption designed and built (EX1), and AC2 decided again with it; accounts and credentials (§57); the Secure Boot keys |
