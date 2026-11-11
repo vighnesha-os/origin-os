@@ -135,7 +135,7 @@ Each says what the product does not promise, so each was the owner's to make. **
 
 | Before | What |
 |---|---|
-| The first program that is not a boot proof runs in ring 3 (ADR-0011 N14 step 4) | ADR-0017's Z2, Z3, Z5, Z9 and Z10 built (task 19b; under QEMU only, so no control has been read back on a processor that has it, which item 213 accepts for step 4's first-party programs). The system-call model's own list: E8 and D11. O2 is closed for step 4 by absence: no call creates a thread or a process (item 206) |
+| The first program that is not a boot proof runs in ring 3 (ADR-0011 N14 step 4) | ADR-0017's Z2, Z3, Z5, Z9 and Z10 built (task 19b; under QEMU and as KVM guests in CI, neither of which offers the controls, so no control has been read back on a processor that has it, which item 213 accepts for step 4's first-party programs). The system-call model's own list: E8 and D11. O2 is closed for step 4 by absence: no call creates a thread or a process (item 206) |
 | A program that is not first-party runs in ring 3 | ADR-0017's controls read back as written on a processor in the declared scope: row I2 of the system-call model (item 213) |
 | Anything but a boot proof uses the network | A decision on where the stack runs (TASKS item 23), and a model of a hostile peer |
 | The compositor is designed (M8) | A threat model for §52's four rules |
