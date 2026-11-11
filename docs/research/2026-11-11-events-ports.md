@@ -135,7 +135,9 @@ Port::close(&self) -> Removed<P>                      // the last handle went
 
 **The proof programs.** Nothing new is needed from `proof_programs.rs`. Every line of the boot proof can be written with the script interpreter as it is: a call with up to six arguments, each an immediate or a `u32` handle loaded from a slot; a check of the status; `report_bytes` for the packet's 32 bytes and for `clock_read`'s 64-bit value. A deadline ahead is an immediate the kernel computes when it builds the script. The two-thread pattern the `wait_one` proof uses for `canceled` serves `port_wait`'s. No new assembly program.
 
-## Shapes for the owner (not yet asked)
+## Shapes for the owner (accepted 2026-11-11)
+
+**The owner accepted all of them on 2026-11-11 ("Accept all").** Shape n of 1–18 is decision item 168+n and ADR-0005 Amendment 7's F n; shape 20 is item 187 and F19; shape 19 is recorded there and is no decision. The text below is as it was put, and the line "not decision items" in it describes that day.
 
 C9, C10 and C13 are accepted; these are the points they leave open, each with one recommendation and what it rejects. **The numbers are this ledger's own, not decision items**: the coordinating session numbers what goes to the owner. Each was checked against CLAUDE.md 7.4 (§10's booleans — none crosses here; §42 — the packet's layout is declared in OIDL, not a compiler's; §48 and ADR-0011 — a program reaches these through `origin.core` like every call; §68 — monotonic time is not wall time; §7 — nothing is sized for a design that does not exist) and against ADR-0005 with its six amendments, ADR-0012, ADR-0013, ADR-0017 and `docs/spec/OIDL.md`. **Four need the owner's eye, because they strain an accepted text or the task's contract: 1 (P4's `size`), 10 (a status on a call asked to have none), 11 (what a binder's exit leaves) and 20 (the `Timer` object P3 lists is not built by this task).** A method's error set is frozen for a major version (OIDL §8), so each list of errors below is part of its shape.
 
