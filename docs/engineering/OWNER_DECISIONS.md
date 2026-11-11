@@ -203,7 +203,7 @@ Work reaches `main` through pull requests, and merging each one takes the owner'
 
 What this means in practice:
 
-- Tasks collect on one landing branch per batch, as a draft pull request. CI runs on every push to it, so each task is tested, including the real-CPU boots, as it arrives. The first batch is ADR-0011 N14 step 3, pull request 13.
+- Tasks collect on one landing branch per batch, as a draft pull request. CI runs on every push to it, so each task is tested, including the real-CPU boots, as it arrives. The first batch is the first part of ADR-0011 N14 step 3, pull request 13: merged on the owner's word on 2026-11-11, at 110 commits (`c11e6f4`). The second batch, the rest of step 3, is the landing branch `land/s3-part2`.
 - Commits are small and self-contained: each one builds and passes its tests.
 - Merge commits from `main` don't count toward the 100, and nothing is padded to reach it (CLAUDE.md §7).
 - Merging still takes the owner's word.
