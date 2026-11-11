@@ -32,6 +32,7 @@
 //! `advance` is lock-free and safe in any context, interrupt and NMI handlers included. A
 //! failed compare-exchange means another reader raised the floor, so the loop ends as soon as
 //! the floor reaches this reading.
+#![forbid(unsafe_code)]
 
 use core::sync::atomic::Ordering;
 

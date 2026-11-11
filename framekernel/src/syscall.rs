@@ -30,6 +30,7 @@ use crate::handles::Need;
 use crate::usercopy::UserAccess;
 use core::sync::atomic::{AtomicU64, Ordering};
 use origin_abi::{Error, Handle};
+use origin_frame::nospec;
 use origin_frame::once::SetOnce;
 use origin_frame::trap::SyscallOutcome;
 use origin_syscalls::oidl_rt as rt;
@@ -326,7 +327,10 @@ fn zeroed(len: usize) -> Result<Vec<u8>, Error> {
 /// `debug_write`: one console line, developer builds only.
 fn debug_write(p: &UserContext, text: rt::UserSlice<u8>) -> Result<(), Error> {
     let mut bytes = [0u8; oidl::DEBUG_WRITE_MAX as usize];
-    let dst = bytes.get_mut(..text.count()).ok_or(Error::InvalidArgs)?;
+    // The count is a program's, and sizes a copy into this buffer: `nospec` keeps it within
+    // the buffer on a wrongly guessed path too (ADR-0017 Z9).
+    let count = nospec::length(text.count(), bytes.len()).ok_or(Error::InvalidArgs)?;
+    let dst = bytes.get_mut(..count).ok_or(Error::InvalidArgs)?;
     copy_in(p, dst, text.addr())?;
     let mut line = Console::new();
     let _ = line.write_str("origin-kernel: user mode: write: ");
@@ -388,7 +392,8 @@ fn channel_write(
     // cannot change either list after the checks below.
     let mut payload = zeroed(bytes.count())?;
     copy_in(p, &mut payload, bytes.addr())?;
-    let count = handles.slice.count();
+    // A program's count again: it sizes the copy into `raw` and the list read from `values`.
+    let count = nospec::length(handles.slice.count(), MAX_HANDLES).ok_or(Error::InvalidArgs)?;
     let mut raw = [0; HANDLE_BYTES * MAX_HANDLES];
     let raw_used = raw
         .get_mut(..HANDLE_BYTES * count)
@@ -458,11 +463,9 @@ fn channel_read(
         reported
             .encode_fields(&mut fields, limit)
             .map_err(|_| Error::Fault)?;
-        copy_out(
-            p,
-            sizes_to,
-            fields.get(first..limit as usize).ok_or(Error::Fault)?,
-        )
+        // `limit` comes from the `size` the caller wrote: it stays within `fields`.
+        let end = nospec::length(limit as usize, fields.len()).ok_or(Error::Fault)?;
+        copy_out(p, sizes_to, fields.get(first..end).ok_or(Error::Fault)?)
     };
     let table = &p.process.handles;
     match ipc::channel_read(

@@ -1,4 +1,5 @@
 //! Sizes of the kernel's fixed per-CPU tables, and the one reserved APIC ID.
+#![forbid(unsafe_code)]
 
 /// Processors the kernel indexes: every per-CPU array has this many slots.
 pub const MAX_CPUS: usize = 64;

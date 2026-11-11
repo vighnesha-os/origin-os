@@ -28,6 +28,7 @@
 //! no allocation, no shootdown. So [`Slots::give_back`], which never waits for anyone, may be
 //! called under any lock, and only [`Slots::reclaim`] waits for other processors. The kernel
 //! takes the lock with interrupts off.
+#![forbid(unsafe_code)]
 
 use core::sync::atomic::Ordering;
 

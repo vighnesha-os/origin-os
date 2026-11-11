@@ -15,6 +15,9 @@ to the line format described in that file's header, keeping only the vectors tha
 `origin-crypto` and lower-casing the hexadecimal digits. No value in a kept vector was changed.
 Each file's header names its source file and its SHA-256, and says what was left out.
 
+On 2026-11-10 the same tool converted one more source file, from the same commit, in the same
+way: `hmac-drbg-sha2-512.txt`, from `hmacDRBG-1.0/internalProjection.json`.
+
 ## NIST's notice
 
 This is the notice in the source repository's README at that commit, reproduced in full:

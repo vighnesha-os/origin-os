@@ -6,11 +6,17 @@
 //! `.cargo/config.toml`: `cargo xtask <command>`.
 #![forbid(unsafe_code)]
 
+mod asmflags;
 mod disk;
+mod documents;
+mod image;
 mod interfaces;
+mod lex;
 mod loom;
+mod reproducible;
 mod screen;
 mod serial;
+mod targetcfg;
 mod turns;
 mod unsafety;
 
@@ -51,14 +57,25 @@ commands:
               named by an ACPI SPCR table, a table that must be refused, no display, and no
               UART at all (with a framebuffer the only way to see the boot)
   run         boot under QEMU with the serial console on this terminal (Ctrl-A X quits)
+  reproducible-gate only the gate on reproducible builds: the loader, each way it is built,
+              and the kernel are built twice from nothing in two target directories, and the
+              two files of each must be the same bytes (part of check; CLAUDE.md §75)
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
-  unsafe-gate only the gate on `unsafe` and on the kernel's dependency direction (part of
-              check; quick)
+  unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction and on the
+              `preserves_flags` option of assembly blocks (part of check; quick)
+  cfg-lint    only the CLAUDE.md §11 lint: no Origin code outside developer-tools/ asks
+              whether its target is Linux or Unix (part of check; quick)
+  document-gate only the gate on documents and archives: none is tracked, or left in this
+              branch's history, outside a short allowlist (part of check; quick)
   interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
               (part of check; quick)
   regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
+  image-gate [kernel ELF]
+              only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
+              and no jump table, in the code this build compiled. Builds the kernel first, or
+              reads the ELF it is given (part of check)
   exclusive -- <command> [args...]
               runs any command in a turn on the machine, as check, the boots, run and loom
               take theirs: one at a time across every checkout of this repository on this
@@ -1243,6 +1260,18 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             format!(
                 "origin-kernel: CPU state: machine checks raise #MC, x87 errors raise #MF, ring 3 has no RDPMC, FSGSBASE or SYSENTER, no debug breakpoint armed: {cpus} of {cpus} processors"
             ),
+            // ADR-0017: what the processors reported and set as they started (which controls
+            // depends on the machine, so only the line's start is fixed), and the lookup
+            // that every index and address from ring 3 goes through, in both its forms.
+            if cpus == 1 {
+                "origin-kernel: speculation: 1 processor: on: ".into()
+            } else {
+                format!("origin-kernel: speculation: {cpus} processors alike: on: ")
+            },
+            "; lookups: ".into(),
+            "; not offered: ".into(),
+            "origin-kernel: nospec: both forms keep an index and an address in range: yes; in use: ".into(),
+            " ns masked and ".into(),
             "origin-kernel: reclaimed ".into(),
             // A boot step out of turn, or run twice, does nothing (ADR-0011 N6).
             "origin-kernel: boot steps: out of turn refused true; a second run refused true".into(),
@@ -1353,6 +1382,13 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(stack_markers(machine))
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
+            // ADR-0017 Z3: the scheduler noted each change of process, with one barrier for
+            // each where the processor has IBPB and none where it has not.
+            "origin-kernel: ibpb: ".into(),
+            format!(
+                " changes of process on {cpus} processor{}, ",
+                if cpus == 1 { "" } else { "s" }
+            ),
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
             "origin-kernel: PCIe: 00:00.0 8086:29c0 class 06:00:00 host bridge".into(),
             "origin-kernel: PCIe: 00:01.0 1234:1111 class 03:00:00 VGA-compatible display controller; BAR0 mem32 prefetchable 16 MiB at ".into(),
@@ -1658,6 +1694,13 @@ fn boot_failures() -> Vec<&'static str> {
         ": sysfs failed",
         ": GPT failed",
         ": IOMMU failed",
+        // ADR-0017: a control that did not read back, a processor that left no record, a
+        // lookup out of range, an IBPB miscounted. A control the machine lacks is not here.
+        // (The topology proof's healthy line says "0 recorded nothing": not that phrase.)
+        "a control register did not read back as written",
+        "left no record of its controls",
+        ": nospec failed",
+        ": ibpb failed",
     ]
 }
 
@@ -2285,8 +2328,12 @@ fn main() -> ExitCode {
     {
         ["check"] => in_turn("check", check),
         ["unsafe-gate"] => unsafety::gate(),
+        ["document-gate"] => documents::gate(),
+        ["cfg-lint"] => linux_cfg_lint(),
         ["interface-gate"] => interfaces::gate(),
         ["regenerate"] => interfaces::regenerate(),
+        ["image-gate"] => in_turn("image-gate", image::build_and_gate),
+        ["image-gate", elf] => image::gate(Path::new(elf)),
         ["build"] => in_turn("build", || {
             build_loader(Loader::Developer).and_then(|loader| {
                 let kernel = pack_kernel(&build_kernel()?)?;
@@ -2302,6 +2349,7 @@ fn main() -> ExitCode {
         ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
         ["run"] => in_turn("run", run),
         ["loom"] => in_turn("loom", loom::run),
+        ["reproducible-gate"] => in_turn("reproducible-gate", reproducible::gate),
         ["exclusive", "--", command @ ..] => {
             let command: Vec<String> = command.iter().map(|s| (*s).to_string()).collect();
             return match turns::exclusive(&command) {
@@ -2970,15 +3018,17 @@ fn check() -> Result {
         ]))?;
         build_loader(loader)?;
     }
-    build_kernel()?;
+    image::gate(&build_kernel()?)?;
     no_panic_check()?;
     dependency_check()?;
     linux_cfg_lint()?;
+    documents::gate()?;
     unsafety::gate()?;
     interfaces::gate()?;
     manifest_version_lint()?;
     signing_stays_off_the_os_lint()?;
     signing_has_no_secret_branches()?;
+    reproducible::gate()?;
     loom::run()?;
     println!("xtask: check passed");
     Ok(())
@@ -3604,41 +3654,69 @@ fn manifest_version_lint() -> Result {
 }
 
 /// CLAUDE.md §11: Origin code compiles for the `x86_64-unknown-linux-gnu` triple only as a
-/// code generator, so it must never use `cfg(target_os = "linux")`. Host developer tools
-/// (`developer-tools/`) run on Linux or macOS build hosts and are exempt.
+/// code generator, so it must never ask whether its target is Linux, or Unix, or which C
+/// library it has: `target_os = "linux"`, `cfg(unix)`, `target_family` and `target_env`
+/// (`targetcfg` has the rule). Host developer tools (`developer-tools/`) run on Linux or macOS
+/// build hosts and are exempt.
 fn linux_cfg_lint() -> Result {
     let root = repo_root();
-    let mut files = Vec::new();
     let dev_tools = root.join("developer-tools");
+    let mut sources = Vec::new();
     collect_files(
         &root,
         &|dir| dir == dev_tools,
         &|name| name.ends_with(".rs"),
-        &mut files,
+        &mut sources,
     )
     .map_err(|e| format!("cfg lint: {e}"))?;
+    // The manifests, and Cargo's own configuration, which can set flags by `cfg` too.
+    let mut manifests = Vec::new();
+    collect_files(
+        &root,
+        &|dir| dir == dev_tools,
+        &|name| name == "Cargo.toml",
+        &mut manifests,
+    )
+    .map_err(|e| format!("cfg lint: {e}"))?;
+    let cargo_config = root.join(".cargo").join("config.toml");
+    if cargo_config.is_file() {
+        manifests.push(cargo_config);
+    }
+    if sources.is_empty() || manifests.is_empty() {
+        return Err(format!(
+            "cfg lint: {} Rust files and {} manifests found outside developer-tools/: nothing was checked",
+            sources.len(),
+            manifests.len()
+        ));
+    }
     let mut hits = Vec::new();
-    for file in &files {
-        let text =
-            fs::read_to_string(file).map_err(|e| format!("cfg lint: {}: {e}", file.display()))?;
-        for (n, line) in text.lines().enumerate() {
-            let squeezed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-            if squeezed.contains("target_os=\"linux\"") {
-                let shown = file.strip_prefix(&root).unwrap_or(file);
-                hits.push(format!("{}:{}: {}", shown.display(), n + 1, line.trim()));
+    for (files, read) in [
+        (
+            &sources,
+            targetcfg::rust_hits as fn(&str) -> Vec<targetcfg::Hit>,
+        ),
+        (&manifests, targetcfg::manifest_hits),
+    ] {
+        for file in files {
+            let text = fs::read_to_string(file)
+                .map_err(|e| format!("cfg lint: {}: {e}", file.display()))?;
+            let shown = file.strip_prefix(&root).unwrap_or(file);
+            for hit in read(&text) {
+                hits.push(format!("{}:{}: {}", shown.display(), hit.line, hit.what));
             }
         }
     }
     println!(
-        "xtask: §11 cfg lint scanned {} Rust files outside developer-tools/",
-        files.len()
+        "xtask: §11 cfg lint scanned {} Rust files and {} manifests outside developer-tools/",
+        sources.len(),
+        manifests.len()
     );
     if hits.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "target_os = \"linux\" is not allowed in Origin code (CLAUDE.md §11):\n{}",
-            hits.join("\n")
+            "Origin code is compiled for the Linux triple only as a code generator, and must not ask whether its target is Linux or Unix (CLAUDE.md §11):\n  {}\nuse `target_os = \"none\"` for the kernel, `target_os = \"uefi\"` for the loader, or no condition at all",
+            hits.join("\n  ")
         ))
     }
 }
@@ -3673,7 +3751,15 @@ fn collect_files(
 /// Builds the EFI application with `loader`'s feature and returns the path of
 /// `origin-boot.efi`.
 fn build_loader(loader: Loader) -> Result<PathBuf> {
-    run_step(cargo().args([
+    build_loader_in(Some(loader.feature()), None)
+}
+
+/// Builds the EFI application with `feature`, or with none, into `target`, or into Cargo's own
+/// target directory, and returns the path of `origin-boot.efi`. With no feature the trust
+/// store is empty: the loader a release builds, until Origin has keys of its own.
+fn build_loader_in(feature: Option<&str>, target: Option<&Path>) -> Result<PathBuf> {
+    let mut build = cargo();
+    build.args([
         "build",
         "--package",
         LOADER_PACKAGE,
@@ -3682,10 +3768,16 @@ fn build_loader(loader: Loader) -> Result<PathBuf> {
         "--target",
         UEFI_TARGET,
         "--release",
-        "--features",
-        loader.feature(),
-    ]))?;
-    let efi = target_dir()
+    ]);
+    if let Some(feature) = feature {
+        build.args(["--features", feature]);
+    }
+    if let Some(target) = target {
+        build.arg("--target-dir").arg(target);
+    }
+    run_step(&mut build)?;
+    let efi = target
+        .map_or_else(target_dir, Path::to_path_buf)
         .join(UEFI_TARGET)
         .join("release")
         .join(format!("{LOADER_BIN}.efi"));
@@ -3701,7 +3793,14 @@ fn build_loader(loader: Loader) -> Result<PathBuf> {
 
 /// Builds the Framekernel ELF for `x86_64-unknown-none` and returns its path.
 fn build_kernel() -> Result<PathBuf> {
-    run_step(cargo().args([
+    build_kernel_in(None)
+}
+
+/// Builds the Framekernel ELF into `target`, or into Cargo's own target directory, and returns
+/// its path.
+fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
+    let mut build = cargo();
+    build.args([
         "build",
         "--package",
         KERNEL_PACKAGE,
@@ -3710,8 +3809,13 @@ fn build_kernel() -> Result<PathBuf> {
         "--target",
         KERNEL_TARGET,
         "--release",
-    ]))?;
-    let elf = target_dir()
+    ]);
+    if let Some(target) = target {
+        build.arg("--target-dir").arg(target);
+    }
+    run_step(&mut build)?;
+    let elf = target
+        .map_or_else(target_dir, Path::to_path_buf)
         .join(KERNEL_TARGET)
         .join("release")
         .join(KERNEL_PACKAGE);

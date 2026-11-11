@@ -6,6 +6,7 @@
 //! (ADR-0004 H1: page 0 and the top page stay unmapped), and only if every page of it is
 //! present and user in the caller's tables, and writable when it will be written. A
 //! zero-length range names no memory, so any pointer is accepted with it.
+#![forbid(unsafe_code)]
 
 use origin_abi::Error;
 use origin_paging::{PAGE, Translation};

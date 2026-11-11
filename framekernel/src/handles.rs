@@ -17,6 +17,7 @@
 use alloc::vec::Vec;
 
 use origin_abi::{Error, Handle};
+use origin_frame::nospec;
 
 /// Most entries any table can have (the index field's range).
 pub const MAX_HANDLES: usize = 0xFFFF;
@@ -164,6 +165,9 @@ impl<T: Typed> HandleTable<T> {
     /// handle (`docs/spec/OIDL.md` §7.5).
     pub fn get(&self, handle: Handle, need: Need) -> Result<(&T, u32), Error> {
         let (index, generation) = split(handle).ok_or(Error::BadHandle)?;
+        // The index is a program's. `nospec` keeps it in the table on a wrongly guessed path
+        // too (ADR-0017 Z9).
+        let index = nospec::index(index, self.slots.len()).ok_or(Error::BadHandle)?;
         let slot = self.slots.get(index).ok_or(Error::BadHandle)?;
         match &slot.entry {
             Some((object, r)) if slot.generation == generation => {
@@ -183,6 +187,7 @@ impl<T: Typed> HandleTable<T> {
     pub fn remove(&mut self, handle: Handle, need: Need) -> Result<(T, u32), Error> {
         self.get(handle, need)?;
         let (index, _) = split(handle).ok_or(Error::BadHandle)?;
+        let index = nospec::index(index, self.slots.len()).ok_or(Error::BadHandle)?;
         let slot = self.slots.get_mut(index).ok_or(Error::BadHandle)?;
         let entry = slot.entry.take().ok_or(Error::BadHandle)?;
         // A slot whose generations are used up is retired: reusing it would let a stale

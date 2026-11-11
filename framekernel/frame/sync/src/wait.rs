@@ -13,6 +13,7 @@
 //! Loom models (`models.rs`) run this code against the real run queue. Lock order: a wait
 //! queue's lock, then whatever its condition reads. A waker never holds a wait queue's lock
 //! while it takes another one.
+#![forbid(unsafe_code)]
 
 use crate::SpinLock;
 

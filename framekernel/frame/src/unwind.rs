@@ -9,6 +9,7 @@
 //! word through a caller-supplied accessor that returns `None` for an address it will not
 //! read, and it stops at a null, unaligned or non-increasing RBP. This keeps it pure and
 //! testable on the host; the kernel supplies an accessor bounded to the running stack.
+#![forbid(unsafe_code)]
 
 /// Walks the frame-pointer chain starting at `rbp`, writing each return address into `out`
 /// (innermost caller first) and returning how many it found. `read(addr)` returns the
