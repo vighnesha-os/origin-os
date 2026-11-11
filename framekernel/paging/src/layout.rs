@@ -67,8 +67,8 @@ pub const STACK_REGION_SIZE: u64 = 256 << 20;
 pub const STACK_REGION_TABLES: u64 =
     STACK_REGION_SIZE / LARGE_PAGE + STACK_REGION_SIZE.div_ceil(1 << GIB_SHIFT) + 1;
 /// The bases a draw can give the stack region: every 2 MiB step with the whole region in its
-/// window but the window's start, which is the fixed base and so says that no entropy was
-/// drawn. About 2^24 of them.
+/// window but the window's start, which is the fixed base and so says that nothing was drawn.
+/// About 2^24 of them.
 pub const STACK_PLACEMENTS: u64 = (STACK_WINDOW_SIZE - STACK_REGION_SIZE) / LARGE_PAGE;
 const _: () = assert!(
     STACK_WINDOW == DIRECT_MAP_WINDOW + DIRECT_MAP_WINDOW_SIZE
@@ -78,8 +78,9 @@ const _: () = assert!(
     "the stack window lies between the direct-map window and the MMIO window"
 );
 
-/// The stack region's base for `random`, 64 bits of hardware entropy (ADR-0004 Amendment 2,
-/// A4): 2 MiB-aligned, with the whole region in the stack window, and never the fixed base.
+/// The stack region's base for `random`, the 64 random bits the loader hands over for it
+/// (ADR-0004 Amendment 2, A4 and A5.1): 2 MiB-aligned, with the whole region in the stack
+/// window, and never the fixed base.
 /// Not printed after boot (A6).
 pub const fn stack_region_base(random: u64) -> u64 {
     STACK_WINDOW + (1 + random % STACK_PLACEMENTS) * LARGE_PAGE

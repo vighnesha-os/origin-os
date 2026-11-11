@@ -650,6 +650,12 @@ fn start_one(
     // SAFETY: an all-zero `CpuTables` is valid (integers only); `init_ap` writes it before
     // the processor uses it.
     let tables = Box::into_raw(unsafe { Box::<CpuTables>::new_zeroed().assume_init() });
+    // Its random-number generator's stack and seed area (ADR-0016): made here, by the
+    // processor that starts it, so that it finds both when it starts its generator
+    // (`random::start_this_processor`), which allocates nothing.
+    if !crate::random::prepare(index) {
+        return Err("no memory for its random-number generator");
+    }
     let stack_top = stack.top();
     let interrupt_tops = interrupt_stacks.each_ref().map(GuardedStack::top);
     // Kept for ever: the AP runs on the first (its idle context) and takes its #DF, NMI, #MC
@@ -858,6 +864,9 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     if !start.handshake.answer(id) {
         cpu::halt();
     }
+    // This processor's random-number generator (ADR-0016 R5): its instructions' start-up tests
+    // and a first seed from the root, before anything can run here that asks for a value.
+    crate::random::start_this_processor();
     // M3: this processor's scheduler.
     (start.main)(&lapic)
 }

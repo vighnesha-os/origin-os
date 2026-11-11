@@ -10,11 +10,13 @@
 //! boot (`early`), so mapping a stack only fills in entries. The slots are `origin_sync::slots`;
 //! this module maps and unmaps them.
 //!
-//! The region's base is random (ADR-0004 Amendment 2): drawn once, from RDSEED or else RDRAND,
-//! when the kernel builds its page tables ([`draw_region`]), 2 MiB-aligned within PML4 slots
-//! 384–447. With neither instruction it is the fixed base, `layout::STACK_REGION`, and the boot
-//! says so. After boot the kernel prints neither the base nor an address in the region (A6):
-//! [`Region`]'s `Debug` leaves the base out.
+//! The region's base is random (ADR-0004 Amendment 2): placed once, when the kernel builds its
+//! page tables ([`draw_region`]), 2 MiB-aligned within PML4 slots 384–447, from the random value
+//! the loader's generator handed over for it (A5.1, decision item 166). This module runs neither
+//! RDSEED nor RDRAND: the kernel's generator is the only code that does (ADR-0016), and it cannot
+//! start this early. When the loader handed over no value the base is the fixed one,
+//! `layout::STACK_REGION`, and the boot says so. After boot the kernel prints neither the base
+//! nor an address in the region (A6): [`Region`]'s `Debug` leaves the base out.
 //!
 //! # Giving a stack back
 //!
@@ -31,7 +33,7 @@
 //! which is the safe failure for a safe caller that drops one too early.
 
 use alloc::alloc::{Layout, alloc, dealloc};
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use origin_paging::PAGE;
 use origin_paging::layout::{self, STACK_REGION, STACK_REGION_SIZE};
@@ -63,27 +65,18 @@ const _: () = assert!(
 /// The region's slots.
 static REGION: Slots<SLOTS, IDLE> = Slots::new();
 
-/// An instruction that gives the processor's entropy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Entropy {
-    /// `RDSEED`.
-    Rdseed,
-    /// `RDRAND`.
-    Rdrand,
-}
-
 /// Where the kernel stacks' region is (ADR-0004 Amendment 2).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Region {
     /// The region's base: 2 MiB-aligned, with the whole region in PML4 slots 384–447. Never
     /// printed after boot (A6).
     pub base: u64,
-    /// What drew the base, or `None`: the processor has neither instruction, and the region is
-    /// at its fixed base.
-    pub drawn: Option<Entropy>,
+    /// Whether the loader's random value placed the base (A5.1). `false`: the loader handed
+    /// over none, and the region is at its fixed base.
+    pub drawn: bool,
 }
 
-/// Shows what drew the base, never the base (A6).
+/// Shows whether the base was drawn, never the base (A6).
 impl core::fmt::Debug for Region {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Region")
@@ -97,39 +90,22 @@ impl core::fmt::Debug for Region {
 /// and check that boots place the region apart (ADR-0004 Amendment 2, A6.4), while the kernel
 /// prints nothing of it.
 static STACK_REGION_BASE: AtomicU64 = AtomicU64::new(0);
-/// What drew it: 0 nothing, 1 RDSEED, 2 RDRAND. Written before the base is published.
-static STACK_REGION_DRAWN: AtomicU8 = AtomicU8::new(0);
+/// Whether the loader's value placed it. Written before the base is published.
+static STACK_REGION_DRAWN: AtomicBool = AtomicBool::new(false);
 
-/// RDSEED attempts before RDRAND, and RDRAND attempts before the fixed base: the loader's, for
-/// the image's slide (ADR-0004 H3).
-const RDSEED_TRIES: u32 = 64;
-const RDRAND_TRIES: u32 = 16;
-
-/// Draws the region's base (ADR-0004 Amendment 2, A4 and A5): from RDSEED, else RDRAND, or the
-/// fixed base with neither. For `early`, which makes the region's tables there and then
-/// records it ([`place`]).
+/// Draws the region's base (ADR-0004 Amendment 2, A4, A5.1 and A5.2): from the random value the
+/// loader handed over for it, which this takes, once (`random::take_stack_value`), or the fixed
+/// base when the loader handed over none. No instruction is run here. For `early`, which makes
+/// the region's tables there and then records it ([`place`]).
 pub(crate) fn draw_region() -> Region {
-    let features = crate::features::Features::decode(&cpu::gather_cpuid());
-    let draw = |available: bool, tries: u32, instruction: fn() -> Option<u64>| {
-        if available {
-            (0..tries).find_map(|_| instruction())
-        } else {
-            None
-        }
-    };
-    let drawn = draw(features.rdseed, RDSEED_TRIES, cpu::rdseed)
-        .map(|random| (random, Entropy::Rdseed))
-        .or_else(|| {
-            draw(features.rdrand, RDRAND_TRIES, cpu::rdrand).map(|random| (random, Entropy::Rdrand))
-        });
-    match drawn {
-        Some((random, entropy)) => Region {
+    match crate::random::take_stack_value() {
+        Some(random) => Region {
             base: layout::stack_region_base(random),
-            drawn: Some(entropy),
+            drawn: true,
         },
         None => Region {
             base: STACK_REGION,
-            drawn: None,
+            drawn: false,
         },
     }
 }
@@ -140,13 +116,8 @@ pub(crate) fn place(region: Region) -> bool {
     if STACK_REGION_BASE.load(Ordering::Relaxed) != 0 {
         return false;
     }
-    let drawn = match region.drawn {
-        None => 0,
-        Some(Entropy::Rdseed) => 1,
-        Some(Entropy::Rdrand) => 2,
-    };
-    STACK_REGION_DRAWN.store(drawn, Ordering::Relaxed);
-    // Release: whoever reads the base reads what drew it too.
+    STACK_REGION_DRAWN.store(region.drawn, Ordering::Relaxed);
+    // Release: whoever reads the base reads whether it was drawn too.
     STACK_REGION_BASE
         .compare_exchange(0, region.base, Ordering::Release, Ordering::Relaxed)
         .is_ok()
@@ -158,15 +129,11 @@ pub fn region() -> Region {
     match STACK_REGION_BASE.load(Ordering::Acquire) {
         0 => Region {
             base: STACK_REGION,
-            drawn: None,
+            drawn: false,
         },
         base => Region {
             base,
-            drawn: match STACK_REGION_DRAWN.load(Ordering::Relaxed) {
-                1 => Some(Entropy::Rdseed),
-                2 => Some(Entropy::Rdrand),
-                _ => None,
-            },
+            drawn: STACK_REGION_DRAWN.load(Ordering::Relaxed),
         },
     }
 }

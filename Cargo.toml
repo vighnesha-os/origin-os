@@ -29,6 +29,7 @@ members = [
     "runtime/version",
     "sdk/directory",
     "security/crypto",
+    "security/random",
     "services/directory",
 ]
 # Host-buildable crates only. The UEFI loader's and the Framekernel's binaries cannot be
@@ -49,6 +50,7 @@ default-members = [
     "runtime/onbf/verify",
     "runtime/version",
     "security/crypto",
+    "security/random",
 ]
 
 [workspace.package]
@@ -64,6 +66,7 @@ license = "MIT OR Apache-2.0"
 origin-version = { path = "runtime/version" }
 origin-boot-info = { path = "boot/info" }
 origin-crypto = { path = "security/crypto" }
+origin-random = { path = "security/random" }
 onbf-format = { path = "runtime/onbf/format" }
 onbf-merkle = { path = "runtime/onbf/merkle" }
 onbf-verify = { path = "runtime/onbf/verify" }

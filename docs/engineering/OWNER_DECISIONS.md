@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–160, and 2026-11-11 for items 161 to 165, 167, 168 and 189. Items up to 70: 2026-11-09, after the pre-merge review. Items 166 and 188 are on another branch (`claude/18b-kernel-random`). Items 169–187 are given out for S3-6's shapes, which are put to you and not answered. None of these is recorded in this sheet yet. |
-| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 142–144, 155–160 and 162–164: as their sections say. Items 165 and 168: your own text for CLAUDE.md §1, in its second and third versions, read against the whole of revision 7.5 and the ADRs each change names; the check and the list of changes are `ROLES_CHECK_2026-11-11.md`. Item 167: items 70 and 113 and CLAUDE.md §78 and §80, by the session that keeps the second step-3 batch. Item 189: proposal 11 of `ROLES_CHECK_2026-11-11.md`. |
+| As of | 2026-11-10 for items 71–160, and 2026-11-11 for items 161 to 168, 188 and 189. Items up to 70: 2026-11-09, after the pre-merge review. Items 169–187 are given out for S3-6's shapes, which are put to you and not answered. They are not recorded in this sheet yet. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 142–144, 155–160, 162–164, 166 and 188: as their sections say. Items 165 and 168: your own text for CLAUDE.md §1, in its second and third versions, read against the whole of revision 7.5 and the ADRs each change names; the check and the list of changes are `ROLES_CHECK_2026-11-11.md`. Item 167: items 70 and 113 and CLAUDE.md §78 and §80, by the session that keeps the second step-3 batch. Item 189: proposal 11 of `ROLES_CHECK_2026-11-11.md`. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–160 (item 97 delegated to Claude). 2026-11-11: items 161 to 165, 167, 168 and 189 (item 168 delegated to Claude). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–160 (item 97 delegated to Claude). 2026-11-11: items 161 to 168, 188 and 189 (item 168 delegated to Claude). |
 | Still open | Items 169–187, the shapes of S3-6 (events, ports and `clock_read`): put to you on 2026-11-11 with a recommendation each, and not answered. Nothing that rests on them is merged into this batch, and they reach this sheet with your answer. Item 168's changes to your text are Claude's, and you have not read them. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -413,7 +413,7 @@ Task H2-stacks built ADR-0004 Amendment 1's A2 on its own branch and left two th
 | 143, answered | Update ADR-0004 to say what H2-stacks built, when it lands: A2 is built; the region is 2048 slots of 128 KiB (256 MiB), each stack at the top of its slot with at least 64 KiB below it never mapped; the boot processor's interrupt stacks stay in the kernel image and the boot stack is the loader's? | **Accept** |
 | 144, answered | Give the kernel stack region a random base: drawn by the kernel when it builds its tables, 2 MiB-aligned within PML4 slots 384–447 (about 24 bits), from RDSEED, else RDRAND, and with neither the fixed base, reported; never printed after boot; built as a framework task of its own after H2-stacks lands? | **Accept** |
 
-## The kernel's random-number generator (ADR-0016): Accepted 2026-11-10, the mechanism built, nothing in the kernel
+## The kernel's random-number generator (ADR-0016): Accepted 2026-11-10; built by tasks 18a and 18b, under QEMU only
 
 Decision item 113 accepted one generator in outline. [ADR-0016](../adr/ADR-0016-kernel-random-numbers.md) filled the outline in and ended with seven questions, each with a recommended answer checked against CLAUDE.md 7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C. The seventh, a download, is item 145 above. You answered **"Accept all"** to the other six on 2026-11-10, in the session that wrote the ADR. The coordinating session put the same six to you the same day, in shorter words, and records the same answer (its commit `44de977`).
 
@@ -426,7 +426,7 @@ Three of them change something you had already accepted. The ADR said so before 
 | # | Question | Answer | Where it is recorded, and its state |
 |---|---|---|---|
 | 146, answered | The design (R1 to R9, R11 to R13): one HMAC_DRBG over SHA-512; a root generator and one for each processor, in the shape of SP 800-90C's tree of generators with two named differences; health tests on the instructions' outputs; no generator and no randomness without a healthy seed; overwriting in three layers; a new crate for the policy? | **Accept** | ADR-0016. The mechanism is built and tested on the host. Everything else is task 18b |
-| 147, answered | Boot info 0.6 (§84): one appended field, `boot_seed`, the physical address of 64 secret bytes inside the boot-info region or 0, which the kernel overwrites once it has taken them? | **Accept** | ADR-0016 R10; ADR-0002 B4. Not built: `origin-version.toml` stays at 0.5 until 18b |
+| 147, answered | Boot info 0.6 (§84): one appended field, `boot_seed`, the physical address of 64 secret bytes inside the boot-info region or 0, which the kernel overwrites once it has taken them? | **Accept** | ADR-0016 R10; ADR-0002 B4. Built by task 18b (2026-11-11). Item 166 below makes the secret area 72 bytes |
 | 148, answered | What may seed, and what happens when the sources fail? RDRAND with no RDSEED: the generator runs, the boot says so, and requests for prediction resistance are refused. The firmware's seed with neither instruction: no generator. Every instruction failing after boot: the root stops and the processors' generators go on with the seeds they have. | **Accept, as stated.** The stricter alternative to the third part, stopping all randomness, was offered and not chosen | ADR-0016 R3, R6, R8; ADR-0004 H3's note. Not built |
 | 149, answered | What "health tests on the raw source" (CLAUDE.md §59) can mean: tests on the instructions' outputs, because the noise behind them cannot be reached; gross failure only; no SP 800-90B conformance claimed? | **Accept** | ADR-0016 R4. Not built. Draft 7.4's §59 says so since `44de977` on `docs/design-review-2026-11-10` |
 | 150, answered | Keep `unsafe` out of `origin-crypto`: best-effort overwriting there, and the guarantee in the framework, by volatile writes over the state and an overwrite of the stack after every request? | **Accept** | ADR-0016 R9. The best-effort part is built; the framework's part is 18b |
@@ -435,6 +435,38 @@ Three of them change something you had already accepted. The ADR said so before 
 **Yours to do:** nothing new. The wording of §17 and §59 is in draft 7.4, which you read with its pull request (item 106).
 
 The numbers start at 146 because 142 to 144 are in use on `land/s3-part2` and 145 is the download above. The header of this sheet was brought up to date on 2026-11-11, when the branches that hold items 124 to 154 had met in the review batch.
+
+### Where the kernel stack region's base gets its randomness (item 166): Accepted 2026-11-11
+
+Building the generator found that the next batch draws the base of the kernel stacks' region in early boot, when the kernel builds its page tables: before the heap and the clock, and so before the kernel's generator can exist. That draw could not simply ask the generator. The coordinating session put three recommendations to you on 2026-11-11 and you answered **"Accept all"**; it relayed your words. This is the second of them. The third, how task 18b lands (item 167, through pull request 16), is recorded by that batch's lander.
+
+It changes two things you accepted on 2026-11-10, and the recommendation said so: ADR-0004 Amendment 2's "the kernel chooses this slide, and boot info does not change", and the 64-byte size of boot info 0.6's secret area (item 147). Boot info 0.6 has not landed, so there is no second version bump.
+
+| # | Question | Answer | Where it is recorded, and its state |
+|---|---|---|---|
+| 166, answered | Where does the stack region's base get its randomness? Recommended: the loader's generator makes one more 8-byte request and puts it directly after its 64-byte seed; the kernel reads it when it builds its page tables and overwrites it with the seed. The kernel still places the region; only the random value comes from the loader. With no loader generator the region stays at its fixed base | **Accept** | ADR-0016 Amendment 1; ADR-0002 B4. On the generator's branch: the loader's third request, the 72-byte area and its checks, `origin_frame::random::take_stack_value`, and a boot proof that it is taken once and overwritten. The stack region is on the next batch, whose lander makes `draw_region` the caller and notes ADR-0004 Amendment 2 (A4, A5) |
+
+**Offered and not chosen:**
+
+- derive the value from the seed with a key-derivation function: no boot-info change, but the seed gets a second use and the directive would need a new standard;
+- start the kernel's generator before the heap and the clock: that moves most of its machinery into early boot;
+- place the region after the generator starts: the generator's own stacks live in that region.
+
+**Yours to do:** nothing.
+
+### What a dry RDSEED costs a processor with no healthy RDRAND (item 188): Accepted 2026-11-11
+
+An independent read of the generator's policy crate found that one row of ADR-0016's threat model said too little. T5 is a program in ring 3 that runs RDSEED in a loop and keeps it dry. The row said reseeds are then "delayed and fall back to RDRAND". Where RDRAND is not healthy on a processor there is nothing to fall back to, and that processor's reseed waits for as long as RDSEED is kept dry. That is how R6 was accepted and how it is built; only the row was short. The session that built the generator put it to you on 2026-11-11 with a recommendation, and you answered **"Yes, amend T5"**.
+
+The number is 188 because 168 is in use on `docs/directive-7.5` and 169 to 187 were given out that morning for the events-and-ports shapes.
+
+| # | Question | Answer | Where it is recorded, and its state |
+|---|---|---|---|
+| 188, answered | Amend T5's row in ADR-0016 to say that where RDRAND is not healthy on a processor, its reseed waits for as long as RDSEED is kept dry, and that T7's bound of 60 seconds or 2^20 requests does not hold for that processor meanwhile? Recommended: yes, and build nothing | **Yes, amend T5** | ADR-0016 Amendment 2, and T5's row. Nothing is built and nothing changes in R6 |
+
+**Offered and not chosen:** send such a processor to the root once its reseed has been delayed for some periods. That changes R6, and on a machine whose processors are alike it is a reseed in name only: the root's own reseed needs the same instruction.
+
+**Yours to do:** nothing. The limit is stated, not closed. How long a program can keep RDSEED dry on a real processor is unmeasured.
 
 ## What building ADR-0017's first half found (items 152 to 154): Accepted 2026-11-10
 

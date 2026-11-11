@@ -13,6 +13,7 @@ mod image;
 mod interfaces;
 mod lex;
 mod loom;
+mod mnemonics;
 mod reproducible;
 mod screen;
 mod serial;
@@ -42,13 +43,17 @@ commands:
               off must refuse an unsigned image, a wrong key, a tampered statement, a bad
               signature and tampered content, each with its own message
   boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
-              one after another, then boot-x2apic, boot-bridge, boot-legacy-free and
-              boot-console
+              one after another, then boot-x2apic, boot-bridge, boot-legacy-free,
+              boot-random and boot-console
   boot-bridge boot-test with the NIC behind a PCIe root port (both IOMMUs): bus mastering is
               cleared on the bridge too and opened again above the device its driver attached
   boot-legacy-free  the kernel boot on a machine with no 8254 and no 8042: the timers
               calibrate against the ACPI PM timer, and the proofs that need those devices
               say they cannot run
+  boot-random the kernel boot on two processors that lack what the random-number generator is
+              seeded from (ADR-0016): one with RDRAND and no RDSEED, which boots and says
+              so; one with neither, which has no generator, launches nothing and still
+              reaches its verdict
   boot-x2apic boot-test on a sparse topology: the boot processor at APIC ID 0 and processors
               at APIC IDs 256 and 412, above what 8-bit APIC IDs reach (the MADT lists
               150 possible processors); twice, on a CPU model with CPUID leaf 1Fh and on
@@ -63,8 +68,9 @@ commands:
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
-  unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction and on the
-              `preserves_flags` option of assembly blocks (part of check; quick)
+  unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction, on the
+              `preserves_flags` option of assembly blocks, and on RDRAND and RDSEED, which
+              only the kernel's generator and the loader's may run (part of check; quick)
   cfg-lint    only the CLAUDE.md §11 lint: no Origin code outside developer-tools/ asks
               whether its target is Linux or Unix (part of check; quick)
   document-gate only the gate on documents and archives: none is tracked, or left in this
@@ -120,6 +126,8 @@ const LOADER_BIN: &str = "origin-boot";
 const VERSION_PACKAGE: &str = "origin-version";
 const ONBF_FORMAT_PACKAGE: &str = "onbf-format";
 const CRYPTO_PACKAGE: &str = "origin-crypto";
+/// The random-number generator's policy (ADR-0016 R2): in the loader and the Framekernel.
+const RANDOM_PACKAGE: &str = "origin-random";
 const MERKLE_PACKAGE: &str = "onbf-merkle";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// `no_std` libraries embedded in the boot loader and the Framekernel, and the generated crates of
@@ -139,6 +147,7 @@ const FREESTANDING_LIBS: &[&str] = &[
     ONBF_FORMAT_PACKAGE,
     MERKLE_PACKAGE,
     CRYPTO_PACKAGE,
+    RANDOM_PACKAGE,
     "origin-sync",
     "onbf-verify",
     "origin-paging",
@@ -241,6 +250,15 @@ fn qemu_machine_options(base: &str) -> String {
 fn qemu_machine_lacks(device: &str) -> bool {
     let off = format!("{device}=off");
     env::var("ORIGIN_QEMU_MACHINE").is_ok_and(|extra| extra.split(',').any(|o| o == off))
+}
+
+/// Whether `ORIGIN_QEMU_CPU` takes `feature` away from the processor (`-feature` or
+/// `feature=off`).
+fn qemu_cpu_lacks(feature: &str) -> bool {
+    let (minus, off) = (format!("-{feature}"), format!("{feature}=off"));
+    qemu_cpu_model()
+        .split(',')
+        .any(|option| option == minus || option == off)
 }
 
 /// The QEMU CPU model: `ORIGIN_QEMU_CPU` (for example `max,-avx2` to boot a CPU below the
@@ -643,7 +661,82 @@ fn boot_scenario() -> Scenario {
     if qemu_machine_lacks("i8042") {
         no_i8042_markers(&mut scenario);
     }
+    match (qemu_cpu_lacks("rdseed"), qemu_cpu_lacks("rdrand")) {
+        (true, false) => rdrand_only_markers(&mut scenario),
+        (true, true) => no_generator_markers(&mut scenario),
+        _ => {}
+    }
     scenario
+}
+
+/// The markers of a boot on a processor with RDRAND and no RDSEED (`-cpu max,-rdseed`): the
+/// machine AMD's second workaround for AMD-SB-7055 produces. It boots; the root is counted on
+/// RDRAND and says its strength is no more than the processor's own generator's, and a
+/// request with prediction resistance is refused (ADR-0016 R3, R6, R8).
+fn rdrand_only_markers(scenario: &mut Scenario) {
+    swap_marker(
+        scenario,
+        "origin-boot: random: known-answer test passed; ",
+        "origin-boot: random: known-answer test passed; RDSEED absent, RDRAND healthy".into(),
+    );
+    swap_marker(
+        scenario,
+        "origin-kernel: random: root: known-answer test passed; ",
+        "origin-kernel: random: root: known-answer test passed; RDSEED absent, RDRAND healthy on the boot processor; seeded from RDRAND's 1024 start-up draws, with 4 more of its draws as the nonce; no healthy RDSEED, so its strength is no more than the processor's own generator's".into(),
+    );
+    swap_marker(
+        scenario,
+        "origin-kernel: random: processor 0: ",
+        "origin-kernel: random: processor 0: RDSEED absent (0 draws passed), RDRAND healthy (2052 draws passed)".into(),
+    );
+    swap_marker(
+        scenario,
+        "origin-kernel: random: 16 of 16 values answered, all distinct true; 300 bytes in pieces true; with prediction resistance: ",
+        "origin-kernel: random: 16 of 16 values answered, all distinct true; 300 bytes in pieces true; with prediction resistance: refused, as it must be with no healthy RDSEED here".into(),
+    );
+}
+
+/// The lines of a boot on a processor with neither instruction (`-cpu max,-rdseed,-rdrand`),
+/// in place of the whole list: there is no generator, so the kernel and its stacks' region are
+/// placed at fixed addresses, every request is refused, no process is launched and no mapping
+/// placed at a random address, the network asks for no lease, and the boot still reaches its
+/// verdict, which names the generator (ADR-0016 R8).
+fn no_generator_markers(scenario: &mut Scenario) {
+    scenario.markers = vec![
+        "origin-boot: UEFI 2.".into(),
+        "origin-boot: random: known-answer test passed; RDSEED absent, RDRAND absent; no generator: the kernel is placed at a fixed address and is handed no seed".into(),
+        "(no generator: fixed placement)".into(),
+        "origin-boot: random: no seed for the kernel; the loader's generator is uninstantiated".into(),
+        "origin-boot: exiting boot services; entering the Framekernel".into(),
+        // No value from the loader, so the kernel stacks' region stays at its fixed base
+        // (ADR-0004 Amendment 2, A5.1 and H3), and the kernel says so both times.
+        STACK_FIXED_LINE.into(),
+        "origin-kernel: random: the loader's value for the kernel stacks' region: none: the loader handed over no secret area".into(),
+        "origin-kernel: random: no generator: known-answer test passed; on the boot processor RDSEED is absent and RDRAND is absent. Nothing will be launched and nothing placed at a random address (ADR-0016 R8)".into(),
+        "origin-kernel: random: processor 0: RDSEED absent (0 draws passed), RDRAND absent (0 draws passed); its generator NOT seeded".into(),
+        "origin-kernel: random: no generator, so no request is answered; consistent false: random failed".into(),
+        "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, service-directory and memory-object proofs did not run".into(),
+        "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: true; the loader handed over no random value: true, and the region is at its fixed base: true".into(),
+        // The network asks for no lease: a transaction ID must not be guessable.
+        "; DHCP lease 0.0.0.0 (".into(),
+        "; no random value for a transaction ID or port; consistent false: virtio-net failed".into(),
+        "origin-kernel: boot verdict: degraded: ".into(),
+        "; 3 did not run; failed: ".into(),
+        "random-number generator (no randomness)".into(),
+        HALT_LINE.into(),
+    ];
+    // What this machine is expected to say is not a failure here.
+    scenario.failures.retain(|failure| {
+        ![
+            "origin-kernel: random: no generator",
+            ": random failed",
+            "origin-boot: random: no seed for the kernel",
+            // The network driver asks for no lease without a random transaction ID.
+            ": virtio-net failed",
+        ]
+        .contains(failure)
+    });
+    scenario.check = None;
 }
 
 /// Replaces the required marker `old` with `new`, or records that it was not found, which
@@ -1152,13 +1245,21 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-boot: TEST trust store: this loader trusts a development key and must never ship".into(),
             "origin-boot: kernel signature verified: origin-kernel, Ed25519 and ML-DSA-87 both good, key ID ".into(),
             "origin-boot: kernel verified: ".into(),
+            // The loader's own random-number generator (ADR-0016 R10): the self-test passed
+            // and an instruction passed its start-up test.
+            "origin-boot: random: known-answer test passed; ".into(),
+            "; the loader's generator is seeded".into(),
             "origin-boot: kernel placed at ".into(),
             // The firmware's framebuffer, for the kernel's console (ADR-0010).
             format!(
                 "origin-boot: framebuffer: {QEMU_DISPLAY} at 0x"
             ),
+            // Two slides, each from its own request.
             "origin-boot: KASLR: kernel at 0xffffffff".into(),
+            "(two requests to the loader's generator)".into(),
             "origin-boot: page tables built: ".into(),
+            // The kernel's seed is handed over and the loader's generator is gone.
+            "origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten".into(),
             "origin-boot: exiting boot services; entering the Framekernel".into(),
             // Attached before anything else is printed, so everything below is also on the
             // screen; `check_screen` holds the kernel to that.
@@ -1242,6 +1343,15 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "interrupt remapping on (256 entries, 32-bit x2APIC destinations, compatibility format blocked); translation on (GSTS 0x".into(),
             "every device's DMA faults until its driver attaches it; 0 stale fault(s) cleared".into(),
             "origin-kernel: IOMMU: translating ".into(),
+            // The random-number generator's root and the boot processor's own generator
+            // (ADR-0016 R5, R13), before another processor starts: the self-test passed and
+            // an instruction passed its start-up test.
+            // The loader's value for the kernel stacks' region (decision item 166): taken once,
+            // by the code that places that region while the kernel builds its page tables
+            // (`stack::draw_region`), so a take at this point is refused.
+            "origin-kernel: random: the loader's value for the kernel stacks' region: taken once before this point, and a take here was refused".into(),
+            "origin-kernel: random: root: known-answer test passed; ".into(),
+            "; the loader's seed mixed in and overwritten where it lay; the boot processor's generator seeded".into(),
             // M3: every processor QEMU emulates (`-smp`, see `machine`) comes online. The
             // MADT lists every possible processor; each enabled one gets a CPU index.
             format!(
@@ -1296,9 +1406,14 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // off-diagonal >= 10.
             "origin-kernel: slit: ".into(),
             "; consistent true".into(),
-            // Hardware entropy from RDSEED/RDRAND: a batch of draws, all distinct and non-zero.
-            "origin-kernel: entropy: ".into(),
-            "; consistent true".into(),
+            // The random-number generator (ADR-0016): every processor has one, requests are
+            // answered with values that differ, and its stack holds only zeros after a request.
+            "origin-kernel: random: processor 0: ".into(),
+            "; its generator seeded".into(),
+            "origin-kernel: random: 16 of 16 values answered, all distinct true; 300 bytes in pieces true; with prediction resistance: ".into(),
+            "origin-kernel: random: cost: a 64-byte request ".into(),
+            "; only zeros on it after a request: true".into(),
+            "origin-kernel: random: every processor has a generator true; consistent true".into(),
             // The guard is in the kernel stacks' region, whose addresses the boot never prints
             // (ADR-0004 Amendment 2, A6.3).
             "origin-kernel: page protection: the first thread's stack guard page faulted (#PF error 0x0)".into(),
@@ -1622,6 +1737,11 @@ fn boot_failures() -> Vec<&'static str> {
         "origin-boot: panic:",
         "origin-kernel: panic:",
         "origin-boot: kernel rejected",
+        // The loader's generator: a failed self-test, no generator, or a stack that ran over.
+        "origin-boot: random: known-answer test FAILED",
+        "origin-boot: random: no seed for the kernel",
+        "ran over its stack",
+        "kernel stacks' region: WRONG",
         "origin-kernel: invalid boot info",
         "origin-kernel: invalid image",
         // ADR-0013: a proof whose failure stops the boot said so.
@@ -1656,7 +1776,9 @@ fn boot_failures() -> Vec<&'static str> {
         ": CPU baseline failed",
         ": numa failed",
         ": slit failed",
-        ": entropy failed",
+        ": random failed",
+        "origin-kernel: random: no generator",
+        "with prediction resistance: WRONG",
         ": initramfs failed",
         ": virtio-net failed",
         "supervisor isolation from user pages incomplete",
@@ -1744,6 +1866,10 @@ fn stack_window_lines(serial: &str) -> Vec<&str> {
 /// placed the region, so its base can be read (A6.4).
 const STACK_PROOF_LINE: &str = "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned";
 
+/// The kernel's line, as it builds its tables, for a region left at its fixed base: the loader
+/// handed over no random value for it (ADR-0004 Amendment 2, A5.1 and H3).
+const STACK_FIXED_LINE: &str = "origin-kernel: kernel stacks: the loader handed over no random value: the region is at its fixed base";
+
 /// Where each full kernel boot records the base it placed the kernel stacks' region at, read
 /// through QEMU's monitor (ADR-0004 Amendment 2, A6.4). `boot-matrix` empties it and then checks
 /// that its boots placed the region apart. The kernel prints nothing of a base; this file is the
@@ -1800,11 +1926,16 @@ fn elf_symbol(elf: &[u8], part: &str) -> Option<u64> {
 /// framework's `STACK_REGION_BASE`: the kernel's physical base, from its boot line, plus the
 /// symbol's RVA in the kernel ELF. `rx` brings QEMU's output. Only a base a draw can give is
 /// accepted: 2 MiB-aligned, the whole region in its window, and not the fixed base.
+///
+/// The one exception is a boot whose kernel said, in [`STACK_FIXED_LINE`], that the loader
+/// handed over no random value: its word must be the fixed base and nothing else, and the
+/// answer is `None`, since a fixed base is not one to compare across boots. Whether a machine
+/// may say that line is its marker list's to decide, not this function's.
 fn read_stack_base(
     monitor: &mut ChildStdin,
     rx: &mpsc::Receiver<Vec<u8>>,
     serial: &str,
-) -> Result<u64> {
+) -> Result<Option<u64>> {
     use framekernel::paging::layout::{STACK_REGION, is_stack_region_base};
     let path = target_dir()
         .join(KERNEL_TARGET)
@@ -1840,10 +1971,33 @@ fn read_stack_base(
         };
         let base = u64::from_str_radix(&digits[..end], 16)
             .map_err(|e| format!("the monitor's answer is not a number: {e}"))?;
-        if !is_stack_region_base(base) || base == STACK_REGION {
-            return Err("the word read is not a base a draw can give".into());
-        }
-        return Ok(base);
+        return stack_base_read(
+            serial.contains(STACK_FIXED_LINE),
+            base,
+            STACK_REGION,
+            is_stack_region_base(base),
+        );
+    }
+}
+
+/// What the word read as the kernel stacks' region's base means: `said_fixed` is whether the
+/// kernel said the region is at its fixed base, `fixed` is that base, and `placeable` is whether
+/// `base` is 2 MiB-aligned with the whole region in its window. A drawn base is `Some`; the fixed
+/// base of a kernel that said so is `None`; anything else is an error.
+fn stack_base_read(
+    said_fixed: bool,
+    base: u64,
+    fixed: u64,
+    placeable: bool,
+) -> Result<Option<u64>> {
+    match (said_fixed, base == fixed) {
+        (true, true) => Ok(None),
+        (true, false) => Err(
+            "the kernel said the region is at its fixed base, and the word read is not that base"
+                .into(),
+        ),
+        (false, false) if placeable => Ok(Some(base)),
+        (false, _) => Err("the word read is not a base a draw can give".into()),
     }
 }
 
@@ -2045,9 +2199,11 @@ fn stack_markers(machine: &Machine) -> Vec<String> {
     // The processor that caches the freed stack: the first after the boot processor, if any.
     let reader = machine.named(cpus.min(2) - 1);
     vec![
-        // ADR-0004 Amendment 2: every machine here has RDSEED or RDRAND, so its region's base is
-        // drawn. The line names neither the base nor the instruction's value (A6).
-        "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: true; drawn from the processor's entropy, so not its fixed base: true".into(),
+        // ADR-0004 Amendment 2: every machine here has RDSEED or RDRAND, so the loader hands
+        // over a random value and the region's base is drawn from it (A5.1). The line names
+        // neither the base nor the value (A6). The machine with neither instruction has its
+        // own list (`no_generator_markers`).
+        "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: true; drawn from the loader's random value, taken once: true, so not its fixed base: true".into(),
         format!(
             "origin-kernel: kernel stacks: stacks of 4, 16 and 64 KiB each in a slot of its own in the region, every page read/write, not executable and global: true; the page below each, the bottom of its slot and the bottom of the next faulted: 9 of 9; the application processors' interrupt stacks, as their TSSs name them, in the region with the page below each faulting: {interrupt_stacks} of {interrupt_stacks}"
         ),
@@ -2348,6 +2504,7 @@ fn main() -> ExitCode {
         ["boot-console"] => in_turn("boot-console", boot_console),
         ["boot-bridge"] => in_turn("boot-bridge", boot_bridge),
         ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
+        ["boot-random"] => in_turn("boot-random", boot_random),
         ["run"] => in_turn("run", run),
         ["loom"] => in_turn("loom", loom::run),
         ["reproducible-gate"] => in_turn("reproducible-gate", reproducible::gate),
@@ -2419,6 +2576,7 @@ fn boot_matrix() -> Result {
     boot_x2apic()?;
     boot_bridge()?;
     boot_legacy_free()?;
+    boot_random()?;
     boot_console()?;
     // ADR-0004 Amendment 2, A6.4: the boots placed the kernel stacks' region apart.
     let recorded = fs::read_to_string(&bases).map_err(|e| format!("{}: {e}", bases.display()))?;
@@ -2427,7 +2585,7 @@ fn boot_matrix() -> Result {
         "xtask: boot-matrix: the kernel stacks' region was at {boots} distinct bases in {boots} kernel boots, read through QEMU's monitor; none is printed"
     );
     println!(
-        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, and the console machines)"
+        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, the two machines without the random-number instructions, and the console machines)"
     );
     Ok(())
 }
@@ -2720,6 +2878,32 @@ fn boot_legacy_free() -> Result {
         ));
     }
     println!("xtask: boot-legacy-free passed (no 8254, no 8042)");
+    Ok(())
+}
+
+/// Runs the kernel boot on two processors that lack the instructions the random-number
+/// generator is seeded from (ADR-0016 R3, R8): one with RDRAND and no RDSEED, which boots and
+/// says what its generator's strength rests on; and one with neither, which has no generator,
+/// launches nothing, and still reaches its verdict.
+fn boot_random() -> Result {
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    for (model, what) in [
+        ("max,-rdseed", "RDRAND and no RDSEED"),
+        ("max,-rdseed,-rdrand", "neither RDSEED nor RDRAND"),
+    ] {
+        println!("xtask: boot-random: a processor with {what} (-cpu {model})");
+        let status = boot_test_child(&exe)
+            .env("ORIGIN_QEMU_CPU", model)
+            .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
+            .status()
+            .map_err(|e| format!("cannot run boot-test: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "boot-test on a processor with {what} failed ({status})"
+            ));
+        }
+    }
+    println!("xtask: boot-random passed (RDRAND alone; neither instruction)");
     Ok(())
 }
 
@@ -4514,14 +4698,15 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
         }
     }
     // Where this boot placed the kernel stacks' region, read through the monitor, for
-    // `boot-matrix` to compare across boots (ADR-0004 Amendment 2, A6.4).
+    // `boot-matrix` to compare across boots (ADR-0004 Amendment 2, A6.4). A fixed base, on the
+    // machine whose loader had no random value to hand over, is checked and not recorded.
     if verdict.is_ok()
         && scenario.capture == Capture::Com1AndScreen
         && text.contains(STACK_PROOF_LINE)
         && let Some(monitor) = stdin.as_mut()
     {
         verdict = read_stack_base(monitor, &rx, &text)
-            .and_then(|base| record_stack_base(scenario.label, base))
+            .and_then(|base| base.map_or(Ok(()), |base| record_stack_base(scenario.label, base)))
             .map_err(|e| format!("the kernel stacks' region's base: {e}"));
     }
     drop(stdin);
@@ -5106,6 +5291,26 @@ origin-kernel: a long run 0xffffc00000000000123 is no address\n";
         );
         assert_eq!(stack_bases_apart(""), Ok(0));
         assert!(stack_bases_apart(alike).is_err());
+    }
+
+    #[test]
+    fn a_fixed_stack_base_is_accepted_only_from_a_kernel_that_said_so() {
+        use framekernel::paging::layout::{STACK_REGION, is_stack_region_base, stack_region_base};
+        let drawn = stack_region_base(0x1234_5678_9abc_def0);
+        assert_ne!(drawn, STACK_REGION);
+        let read = |said_fixed, base| {
+            stack_base_read(said_fixed, base, STACK_REGION, is_stack_region_base(base))
+        };
+        // A drawn base is recorded; the fixed base of a kernel that drew is refused.
+        assert_eq!(read(false, drawn), Ok(Some(drawn)));
+        assert!(read(false, STACK_REGION).is_err());
+        // A base no draw can give: not 2 MiB-aligned, or outside the window.
+        assert!(read(false, drawn + 0x1000).is_err());
+        assert!(read(false, 0).is_err());
+        // A kernel that said its region is at the fixed base: that base, not recorded, and no
+        // other.
+        assert_eq!(read(true, STACK_REGION), Ok(None));
+        assert!(read(true, drawn).is_err());
     }
 
     fn proof(cpus: u64) -> String {

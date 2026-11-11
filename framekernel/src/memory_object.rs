@@ -237,11 +237,12 @@ fn put(
         // Never over a mapping, or any other page of the space (C7).
         Place::At(base) => take(base)?.then_some(base).ok_or(Error::InvalidArgs),
         Place::Anywhere => {
-            // An ended process, then the mapping limit, before the placement and its entropy
-            // (D5's order).
+            // An ended process, then the mapping limit, before the placement and its random
+            // draws (D5's order). The draws are the kernel's generator's (ADR-0016): with none,
+            // or with randomness withheld, a kernel-chosen place is `not_supported`.
             without_interrupts(|| target.mappings.lock().room())?;
             // Eight draws that all land on something mapped are `limit` (the note on D5).
-            mapping::place_at_random(asked.pages, crate::entropy::hardware_u64, take)
+            mapping::place_at_random(asked.pages, || origin_frame::random::next_u64().ok(), take)
         }
     }
 }

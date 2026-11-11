@@ -112,6 +112,7 @@ mod tests {
             kernel_virtual_base: 0xFFFF_FFFF_8000_0000,
             flags: 1,
             framebuffer: origin_boot_info::Framebuffer::NONE,
+            boot_seed: 0,
         }
     }
 
