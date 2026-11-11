@@ -3385,7 +3385,7 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
   - *Without the clamp,* the walk took whatever address the program gave. For a kernel address, it read this space's top-level entry for that address, a copy of the kernel's (`set_upper_half`). It went on to search this space's list of tables only where that entry is present, and stopped there, since the kernel's lower tables are not in the list. Where it stops can tell which 512 GiB slots of the kernel half are in use, and so part of the stack region's slide (ADR-0004 Amendment 2, A4: one of slots 384–447).
   - This is a reading of the code, not an experiment: nothing here can see a wrongly guessed path.
 - **Evidence:**
-  - *Host tests:* the `nospec` test above, among `origin-frame`'s 420. No host test can reach the four places: `userspace.rs` is compiled only for the kernel (`#[cfg(target_os = "none")]` in `lib.rs`), so the boot is what runs them.
+  - *Host tests:* the `nospec` test above, among the 222 of `origin-frame`'s library (420 is the kernel's count). No host test can reach the four places: `userspace.rs` is compiled only for the kernel (`#[cfg(target_os = "none")]` in `lib.rs`), so the boot is what runs them.
   - *The commit on its own* (`0fbcd9f`, run on its tree just before it was committed):
     - rustfmt;
     - clippy for the host and the kernel target, and for UEFI on `origin-sync` and `origin-paging`;
@@ -3409,7 +3409,7 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
 - **In the batch:** merged into `land/s3-part2` on 2026-11-11 by a merge commit (`a4540ad`), so the three commits above keep their hashes (`0fbcd9f`, `2efc74b`, `8b4d755`).
   - The coordinating session read the whole change first: two files of the framework (`userspace.rs`, and one value added to `nospec.rs`'s host test) and three records. Outside `docs/` the merged tree is `8b4d755`'s tree, byte for byte.
   - On `a4540ad`'s tree, with nothing uncommitted: `cargo xtask check` passed (1370 host tests in 43 suites, none failed, 10 ignored; the no-panic and dependency checks; the unsafe gate's 324 sites in its 22 listed files; the image, assembly, document, interface and reproducible-build gates; 42 Loom models and 68 negative controls in 98 runs). `cargo xtask boot-test` passed 11 of 11, the kernel boot ending "degraded: 60 of 61 proofs passed; failed: speculation controls" (item 154). The boots ran under QEMU (TCG) on the M1 Max; no physical x86-64 processor ran any of this.
-  - In that run the framework's library has 222 host tests, the `nospec` test among them, and the kernel's has 420. The host-test line above gives 420 for `origin-frame`; its author is asked to correct it.
+  - In that run the framework's library has 222 host tests, the `nospec` test among them, and the kernel's has 420.
   - The four negative controls were not repeated when landing; they stand as their author reports them.
   - Not in the batch when this was written: `THREAT_MODEL_SYSCALLS.md`'s Z9 list does not show the walk, and its row for the mapping calls still says the framework has no clamp of its own. Both corrections are asked of the session that keeps that file.
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-11. Original code; no third-party source was read or copied (§3).
