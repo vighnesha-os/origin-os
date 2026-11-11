@@ -18,14 +18,15 @@
 //! character literals, whatever it heads: a block, an `unsafe fn`, an `unsafe impl`, an
 //! `unsafe extern` or an attribute such as `#[unsafe(no_mangle)]`.
 //!
-//! The gate ends with the one on what assembly blocks promise the compiler about the flags
-//! (`asmflags`, CLAUDE.md §13).
+//! The gate ends with two on the assembly inside those sites: what a block promises the
+//! compiler about the flags (`asmflags`, CLAUDE.md §13), and where the processor's two
+//! random-number instructions may be run (`mnemonics`, CLAUDE.md §59; ADR-0016 R2).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use crate::{Result, asmflags, cargo, collect_files, lex, repo_root};
+use crate::{Result, asmflags, cargo, collect_files, lex, mnemonics, repo_root};
 
 /// Under this directory is the privileged framework, the one place `unsafe` may appear: the
 /// crate `origin-frame`, and its lock package, `origin-sync`, kept as a package of its own
@@ -247,8 +248,10 @@ pub(crate) fn gate() -> Result {
         ABOVE_UNSAFE_FILES.len(),
         scanned.files
     );
-    // What the assembly inside those sites promises the compiler about the flags.
-    asmflags::gate()
+    // What the assembly inside those sites promises the compiler about the flags, and where
+    // RDRAND and RDSEED may be run.
+    asmflags::gate()?;
+    mnemonics::gate()
 }
 
 /// What one file of the framework holds.

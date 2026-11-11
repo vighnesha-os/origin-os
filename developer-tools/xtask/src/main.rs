@@ -13,6 +13,7 @@ mod image;
 mod interfaces;
 mod lex;
 mod loom;
+mod mnemonics;
 mod reproducible;
 mod screen;
 mod serial;
@@ -63,8 +64,9 @@ commands:
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
-  unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction and on the
-              `preserves_flags` option of assembly blocks (part of check; quick)
+  unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction, on the
+              `preserves_flags` option of assembly blocks, and on RDRAND and RDSEED, which
+              only the kernel's generator and the loader's may run (part of check; quick)
   cfg-lint    only the CLAUDE.md §11 lint: no Origin code outside developer-tools/ asks
               whether its target is Linux or Unix (part of check; quick)
   document-gate only the gate on documents and archives: none is tracked, or left in this
