@@ -33,7 +33,7 @@ The framework's half of step 3's memory work, with no system call yet (S3-5b add
 
 **Decided:** `docs/adr/ADR-0017-speculation-processor-hardening.md` and `docs/engineering/THREAT_MODEL_SYSTEM.md`, both accepted by the owner (decision items 124 to 141), from a ledger of Intel's and AMD's own documents read that day. Amendment 1 (item 152): the toolchain's prebuilt libraries are outside the image rules, by name.
 
-**Built (task 19b), on branch `claude/intelligent-dhawan-a7f6d4`, not merged:**
+**Built (task 19b) on branch `claude/intelligent-dhawan-a7f6d4`, and merged into the review batch (`land/review-tasks`, pull request 15) on 2026-11-10:**
 
 - Every index, count and address a program chooses goes through one framework primitive, `origin_frame::nospec`, before the kernel looks anything up or copies anything with it: a conditional move, or LFENCE, by the processor's maker and family. The list is in `THREAT_MODEL_SYSCALLS.md`.
 - Each processor reads what it reports as it starts, sets the controls it enumerates (enhanced IBRS with `BHI_DIS_S` and `RRSBA_DIS_S`, or automatic IBRS with STIBP), reads them back and records the result. The boot prints what is on and what the processor lacks, and never refuses on it.
@@ -41,7 +41,7 @@ The framework's half of step 3's memory work, with no system call yet (S3-5b add
 - The trap entry zeroes the general-purpose registers once it has saved them.
 - The kernel is built with no jump tables and an INT3 after every return, and `cargo xtask check` reads the built image to hold both, and the entry's register clearing.
 
-**What is shown, and it is little:** host tests of the decision against AMD's published register values for two family 1Ah models and against Intel values built from the SDM's bit positions; boot proofs under QEMU 11.1.3's software processor. **That processor has none of these controls**, so every boot there prints `on: nothing` and ends `degraded: 58 of 59 proofs passed; failed: speculation controls` (kept so by the owner, decision item 154), and **no control has ever been written on a processor that has it.** CI's boots under KVM will be the first, when the branch lands. No test can show what a processor does on a wrongly guessed path. No processor in the declared scope has been run (§74).
+**What is shown, and it is little:** host tests of the decision against AMD's published register values for two family 1Ah models and against Intel values built from the SDM's bit positions; boot proofs under QEMU 11.1.3's software processor. **That processor has none of these controls**, so every boot there prints `on: nothing` and ends `degraded: 58 of 59 proofs passed; failed: speculation controls` (kept so by the owner, decision item 154), and **no control has ever been written on a processor that has it.** CI's boots under KVM did not change that. On 2026-11-11 the review batch's CI ran its real-CPU boots at `55db1f1` on an AMD EPYC 7763 (family 25) and an Intel Xeon Platinum 8573C (family 6, model 207), each as a guest under KVM with `-cpu max`. The guests offered none of the controls: every boot printed `on: nothing; ... not offered: enhanced or automatic IBRS, IBPB, branch isolation between sibling threads` and `this processor has no IBPB to measure`. The fence form was the one in use in one of those boots, the x2APIC scenario, which presents an Intel vendor name with family 25, and it passed. No test can show what a processor does on a wrongly guessed path. No processor in the declared scope has been run (§74).
 
 **Not built:** FRED, LASS, shadow stacks, the nested-NMI guard (row E12 of the system-call threat model stays Open) and the per-thread `SPEC_CTRL` value: task 19c. Direct calls between the kernel's crates: TASKS item 33 (decision item 153).
 
@@ -179,7 +179,7 @@ The owner asked for a very careful review of CLAUDE.md and the design documents.
 **Not built, and needed before ADR-0011 N14 step 4 puts a real program in ring 3:**
 
 - Randomness comes straight from the processor's instructions, with no generator and no health gate (TASKS item 18).
-- Speculative execution (TASKS item 19): the system threat model and ADR-0017 are written and accepted, and the half that step 4 waits for is built on an unmerged branch (see "Speculation and processor hardening" above). Its controls have not run on a processor that has them.
+- Speculative execution (TASKS item 19): the system threat model and ADR-0017 are written and accepted, and the half that step 4 waits for is built and is in the review batch (see "Speculation and processor hardening" above). Its controls have not run on a processor that has them.
 
 The rest is TASKS items 20 to 30. One of them is an ABI limit: a 32-bit handle still gives a process about 4.29 billion handle creations in its life (item 24).
 

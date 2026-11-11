@@ -175,7 +175,7 @@ ADR-0011 N9 and S9, as C11 and C12 decide: `origin.directory` 0.1, served by a p
 Before any program that is not a boot proof runs in ring 3 (N14 step 4):
 1. **E8**, the per-call pin (Amendment 2, B2).
 2. **O2**, quotas on threads, processes and memory (P11), with the calls that create them.
-3. **I2**: a speculative-execution review against the declared processors. The review is `docs/research/2026-11-10-speculation-processor-hardening.md`, and ADR-0017, accepted on 2026-11-10, decides from it. Its Z2, Z3, Z5, Z9 and Z10 are built (task 19b), under QEMU's software processor only. **I2 stays Partly until a boot on a processor that has the controls shows each one read back as written** (CI's KVM boots, when the branch lands).
+3. **I2**: a speculative-execution review against the declared processors. The review is `docs/research/2026-11-10-speculation-processor-hardening.md`, and ADR-0017, accepted on 2026-11-10, decides from it. Its Z2, Z3, Z5, Z9 and Z10 are built (task 19b), under QEMU's software processor only. **I2 stays Partly until a boot on a processor that has the controls shows each one read back as written.** CI's KVM boots cannot be that boot: on 2026-11-11 their guests, on an AMD EPYC 7763 and an Intel Xeon Platinum 8573C, offered none of the controls.
 4. **D11**, the directory's back side, decided before the first directory that is a program runs.
 
 Before any claim about real hardware: **E12**, the nested NMI.

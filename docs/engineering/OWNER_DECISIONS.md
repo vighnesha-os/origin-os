@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–141. Items up to 70: 2026-11-09, after the pre-merge review. |
-| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). |
+| As of | 2026-11-10 for items 71–141 and 145–154, and 2026-11-11 for item 161. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144 and 155–160 are on another branch (`land/s3-part2`) and are not in this sheet yet. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 (item 97 delegated to Claude). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: item 161. |
 | Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -335,7 +335,7 @@ Finding 19's smaller points were not put as decisions. They stay in the review a
 
 The work these create is in `TASKS.md`, items 17 to 30.
 
-**Two later answers changed this revision's wording, on the same day.** You accepted the six questions of ADR-0016, the kernel's random-number generator, as items 146 to 151. They are recorded with that ADR, which is on the generator's branch until it lands. Two of them are in draft 7.4:
+**Two later answers changed this revision's wording, on the same day.** You accepted the six questions of ADR-0016, the kernel's random-number generator, as items 146 to 151. They are recorded with that ADR, in their own section below. Two of them are in draft 7.4:
 
 - item 149: §59 says the health tests are on what each source returns, catch gross failure only, and claim no SP 800-90B conformance;
 - item 151: §17 names SP 800-90A Rev. 1, SP 800-90B (January 2018), SP 800-90C (September 2025) and FIPS 198-1.
@@ -417,7 +417,7 @@ Three of them change something you had already accepted. The ADR said so before 
 
 **Yours to do:** nothing new. The wording of §17 and §59 is in draft 7.4, which you read with its pull request (item 106).
 
-The numbers start at 146 because 142 to 144 are in use on `land/s3-part2` and 145 is the download above. The header of this sheet still counts items to 123: it is brought up to date when the branches that hold items 124 to 151 meet.
+The numbers start at 146 because 142 to 144 are in use on `land/s3-part2` and 145 is the download above. The header of this sheet was brought up to date on 2026-11-11, when the branches that hold items 124 to 154 had met in the review batch.
 
 ## What building ADR-0017's first half found (items 152 to 154): Accepted 2026-11-10
 
@@ -428,3 +428,13 @@ TASKS item 19b built Z1, Z2, Z3, Z5, Z9 and Z10 of ADR-0017, and its gate on the
 | 152, answered | The toolchain's prebuilt `core`, `alloc` and `compiler_builtins` are outside ADR-0017 Z10's "an INT3 after every RET" and "no jump table": stable Rust cannot rebuild them, and in the kernel of that day they hold 113 returns, 33 without an INT3, and 2 jump tables. Accept the gap by name, with the count printed on every run and looked at again at each toolchain upgrade, as ADR-0017 Amendment 1? A pinned nightly compiler under §12 was offered and not chosen. | **Accept** |
 | 153, answered | More than half the kernel's calls go through the global offset table, because the compiler emits a relocation the linker cannot turn into a direct call. Make it a task of its own, not a condition of ADR-0011 N14 step 4: find a fix on stable Rust (link-time optimization is the candidate, untried), measure before and after, then have the image gate hold the count? | **Accept.** TASKS item 33; not started |
 | 154, answered | Under QEMU's software processor every boot now ends `degraded: 58 of 59 proofs passed; failed: speculation controls`, because that processor offers none of the controls and the "speculation controls" row fails on a processor that lacks one (item 131). Keep it as written? A row that passes when the kernel set everything the machine offers, and only prints what is lacking, was offered and not chosen. | **Keep as written.** Answered twice the same way: in the session that built 19b, with the boot output beside it, and as one of three recommendations accepted in the coordinating session. No code changes: the verdict already behaves this way |
+
+## The review batch may be offered at 76 commits (item 161): Accepted 2026-11-11
+
+Item 70 offers a code pull request for review once it carries 100 commits of real work. Pull request 15, the review batch, holds four finished tasks (TASKS items 17, 18a, 19 and 31) and one fix to a boot proof, in 76 commits that are not merges. On 2026-11-11 you asked that the open pull requests be ready to merge when they are ready, and were asked whether this one may be marked ready as it is.
+
+| # | Question | Answer |
+|---|---|---|
+| 161, answered | Mark pull request 15 ready at 76 commits, once pull requests 13 and 14 are in? Waiting for task 18b, the generator in the kernel, to bring it past 100 was offered and not chosen. | **Yes, at 76** |
+
+This is for pull request 15 only. Item 70 stands for every later code pull request, and no commit was added to raise the count (CLAUDE.md §7). Merging it still takes your word, after pull requests 13 and 14, each with a merge commit.
