@@ -412,8 +412,8 @@ fn at_root<T>(
 
 /// Looks whether the root is due and, if it is, reseeds it from eight draws of processor `on`
 /// (R6): the root keeps its own schedule, 2^20 requests or 60 seconds, as long as some
-/// processor with a healthy instruction answers requests. A processor looks when it has
-/// reseeded itself, and again when a period has passed since the root's last seed as it saw it.
+/// processor with a healthy instruction answers requests. A processor looks when a period has
+/// passed since the root's last seed as it last saw it, whenever it itself was last reseeded.
 ///
 /// The request may make `left` more draws (S2). If the draws cannot be had within that, or
 /// the lock is taken and `wait` is not set, the processor leaves the root alone for
@@ -540,7 +540,7 @@ fn maintain(platform: &mut dyn Platform, on: u32, first: Maint) -> Result<(), Er
                 outcome,
                 ..
             } => (which, purpose, outcome),
-            // The root is looked at next, by the step after this one.
+            // The next step looks at the root, if its period has passed too.
             Maint::Reseeded => continue,
             Maint::TellRoot => {
                 let told = in_root_step(platform, |ctx, root| {

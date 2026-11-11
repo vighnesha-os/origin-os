@@ -303,6 +303,45 @@ fn the_root_is_told_once_however_the_thread_moves() {
 }
 
 #[test]
+fn a_thread_that_moves_does_not_get_another_processors_reseed_from_the_root() {
+    // Processor 1 has no instruction: when it is due, the root reseeds it. The thread that
+    // asks is on processor 0 by the time the root is reached, and processor 0 needs nothing
+    // from the root: it is left as it is.
+    let mut world = World::new(2);
+    world.cpus[1].rdseed.reported = false;
+    world.cpus[1].rdrand.reported = false;
+    world.boot();
+    world.now += RESEED_NANOS;
+    world.on = 1;
+    let first = world.steps + 1;
+    world.mover = Some(Box::new(move |step, on| if step == first { 0 } else { on }));
+    next_u64(&mut world).unwrap();
+    assert_eq!(world.on, 0);
+    assert_eq!(world.cpus[0].node.counts().reseeds_root, 0);
+    assert_eq!(world.root.counts().reseeded, 0);
+    assert!(
+        world.cpus[1].node.due(world.now),
+        "processor 1 is served next time"
+    );
+    assert!(
+        world.cpus[0].node.due(world.now),
+        "and processor 0 by its own instruction"
+    );
+    // Next time, without the move.
+    world.mover = None;
+    world.on = 1;
+    next_u64(&mut world).unwrap();
+    assert_eq!(world.cpus[1].node.counts().reseeds_root, 1);
+    assert_eq!(world.root.counts().reseeded, 1);
+    assert!(!world.cpus[1].node.due(world.now));
+    assert_eq!(
+        world.cpus[1].node.from_root, [0; 80],
+        "what the root handed over is gone"
+    );
+    assert_eq!(world.cpus[1].node.from_root_len, 0);
+}
+
+#[test]
 fn a_request_that_moved_does_not_make_another_processor_wait_for_the_root() {
     // Processor 1 has no instruction. Processor 0 reseeds itself, finds the root's lock
     // taken when it looks, and leaves the root alone for a second.

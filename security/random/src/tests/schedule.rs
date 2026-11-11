@@ -991,3 +991,20 @@ fn a_processor_with_no_healthy_instruction_does_not_look_at_the_root() {
     assert!(world.root.due(world.now));
     assert_eq!(world.root_asks, asks);
 }
+
+#[test]
+fn a_processor_that_has_not_seen_the_root_looks_at_its_next_request() {
+    let mut world = World::new(1);
+    world.boot();
+    assert!(world.cpus[0].node.root_seen.is_some(), "its start looked");
+    let asks = world.root_asks;
+    assert_eq!(request(&mut world), (0, 0));
+    assert_eq!(world.root_asks, asks);
+    // As if its start had not reached the root.
+    world.cpus[0].node.root_seen = None;
+    assert_eq!(request(&mut world), (0, 0));
+    assert_eq!(world.root_asks, asks + 1, "one look; the root is not due");
+    assert_eq!(world.cpus[0].node.root_seen, Some(world.root.seeded_at()));
+    assert_eq!(request(&mut world), (0, 0));
+    assert_eq!(world.root_asks, asks + 1);
+}

@@ -145,8 +145,8 @@ pub enum Maint {
     NeedRoot,
     /// An instruction's health has changed since the root was last told: tell it.
     TellRoot,
-    /// Nothing is due here, and this processor reseeded itself without having looked whether
-    /// the root is due as well: look now.
+    /// Nothing is due here, and a reseed period has passed since the root's last seed as this
+    /// processor last saw it: look whether the root is due.
     LookAtRoot,
     /// A reseed is due and cannot be made now: the instruction it needs is resting.
     Delayed,
@@ -339,12 +339,11 @@ pub struct Node {
     /// When the root last could not be asked for a reseed, or reached for its own, if it is
     /// being left alone.
     root_rest_since: Option<u64>,
-    /// This processor has reseeded itself and has not yet looked whether the root is due (R6).
-    root_look: bool,
-    /// When the root was last seeded, as this processor found it at its last look. The
-    /// processor looks again when a reseed period has passed since then, so the root's
-    /// schedule does not hang on when this processor reseeds itself.
-    root_seen: Option<u64>,
+    /// When the root was last seeded, as this processor last saw it: at the look it made when
+    /// it started, at a later look, or when it reseeded the root itself. The processor looks
+    /// again when a reseed period has passed since then (R6), so the root's schedule does not
+    /// hang on when this processor reseeds itself. `None` if it has not seen the root yet.
+    pub(crate) root_seen: Option<u64>,
     counts: Counts,
 }
 
@@ -372,7 +371,6 @@ impl Node {
             region1_of: None,
             seeded_at: 0,
             root_rest_since: None,
-            root_look: false,
             root_seen: None,
             counts: Counts {
                 reseeds_rdseed: 0,
@@ -911,15 +909,14 @@ impl Node {
     }
 
     /// Whether this processor should look whether the root is due, and may now. It should
-    /// when it has reseeded itself since it last looked, and when a reseed period has passed
-    /// since the root's last seed as it last saw it. It may when it has an instruction to
-    /// reseed the root from and the root is not being left alone.
+    /// when a reseed period has passed since the root's last seed as it last saw it, or it has
+    /// not seen the root at all. It may when it has an instruction to reseed the root from
+    /// and the root is not being left alone.
     pub const fn wants_root_look(&self, now: u64) -> bool {
-        let should = self.root_look
-            || match self.root_seen {
-                Some(seeded) => passed(now, seeded, RESEED_NANOS),
-                None => false,
-            };
+        let should = match self.root_seen {
+            Some(seeded) => passed(now, seeded, RESEED_NANOS),
+            None => true,
+        };
         should
             && (self.rdseed.health.is_healthy() || self.rdrand.health.is_healthy())
             && self.root_rested(now)
@@ -928,7 +925,6 @@ impl Node {
     /// Records a look at the root: it was last seeded at `seeded`, which is now if this
     /// processor has just reseeded it.
     pub const fn saw_root(&mut self, seeded: u64) {
-        self.root_look = false;
         self.root_seen = Some(seeded);
     }
 
@@ -975,8 +971,6 @@ impl Node {
         self.clear_store();
         if reseeded {
             self.seeded_at = now;
-            // The root keeps the same schedule: this processor looks at it next.
-            self.root_look = true;
             match from {
                 Instruction::Rdseed => {
                     self.counts.reseeds_rdseed = self.counts.reseeds_rdseed.saturating_add(1);
