@@ -1269,43 +1269,6 @@ pub fn cpuid_subleaf(leaf: u32, sub: u32) -> [u32; 4] {
     [eax, ebx, ecx, edx]
 }
 
-/// One `RDRAND` attempt: the 64-bit value on success (carry set), or `None` on a transient
-/// failure a retry may satisfy. The caller must have confirmed `Features::rdrand`.
-pub fn rdrand() -> Option<u64> {
-    let (value, ok): (u64, u8);
-    // SAFETY: RDRAND writes only its destination register and the carry flag, reads no
-    // memory, and is defined on every long-mode processor that reports it in CPUID (which
-    // the caller checks). It is not `pure`: each call returns fresh bits.
-    unsafe {
-        asm!(
-            "rdrand {v}",
-            "setc {ok}",
-            v = out(reg) value,
-            ok = out(reg_byte) ok,
-            options(nomem, nostack),
-        );
-    }
-    if ok == 1 { Some(value) } else { None }
-}
-
-/// One `RDSEED` attempt: a full-entropy 64-bit value on success, or `None`. `RDSEED` draws
-/// directly from the entropy source and fails more often than `RDRAND` under load, so it
-/// needs the same bounded retry. The caller must have confirmed `Features::rdseed`.
-pub fn rdseed() -> Option<u64> {
-    let (value, ok): (u64, u8);
-    // SAFETY: as `rdrand`; RDSEED has the same register/flag-only effect and CPUID gate.
-    unsafe {
-        asm!(
-            "rdseed {v}",
-            "setc {ok}",
-            v = out(reg) value,
-            ok = out(reg_byte) ok,
-            options(nomem, nostack),
-        );
-    }
-    if ok == 1 { Some(value) } else { None }
-}
-
 /// Whether the processor supports the execute-disable bit (CPUID 8000_0001h EDX bit 20).
 pub fn nx_supported() -> bool {
     cpuid(0x8000_0000)[0] >= 0x8000_0001 && cpuid(0x8000_0001)[3] & (1 << 20) != 0

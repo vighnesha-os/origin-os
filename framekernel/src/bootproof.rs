@@ -89,7 +89,7 @@ proofs! {
     Topology "CPU topology" => Report;
     Numa "NUMA affinities" => Report;
     NumaDistances "NUMA distances" => Report;
-    Entropy "hardware entropy" => Report;
+    Random "random-number generator" => Withdraw("no randomness");
     // Threads, and what runs in ring 3.
     Preemption "preemption" => Refuse;
     Fairness "scheduler fairness" => Report;
@@ -257,11 +257,12 @@ mod tests {
         Proof::Ibpb,
     ];
 
-    /// Every proof whose failure withholds a capability (ADR-0013 R2).
-    const WITHDRAWING: [Proof; 6] = [
+    /// Every proof whose failure withholds a capability (ADR-0013 R2, Amendment 1).
+    const WITHDRAWING: [Proof; 7] = [
         Proof::BusMasterQuiesce,
         Proof::Iommu,
         Proof::Processors,
+        Proof::Random,
         Proof::Pcie,
         Proof::BusMastersQuiet,
         Proof::Nvme,
@@ -321,6 +322,29 @@ mod tests {
         assert_eq!(
             Proof::Processors.consequence(),
             Consequence::Withdraw("fewer processors")
+        );
+        // ADR-0013 Amendment 1 and ADR-0016 R8: with no generator, randomness is withheld.
+        assert_eq!(
+            Proof::Random.consequence(),
+            Consequence::Withdraw("no randomness")
+        );
+        assert_eq!(Proof::Random.name(), "random-number generator");
+    }
+
+    #[test]
+    fn a_machine_with_no_generator_reaches_a_verdict_that_names_it() {
+        // ADR-0016 R8: the boot goes on, the two proofs that launch a process do not run, and
+        // the verdict names the generator.
+        let mut tally = Tally::new();
+        for &proof in Proof::ALL {
+            if !matches!(proof, Proof::Launch | Proof::Directory) {
+                tally.record(proof, proof != Proof::Random);
+            }
+        }
+        assert!(!tally.must_stop());
+        assert_eq!(
+            verdict(tally),
+            "origin-kernel: boot verdict: degraded: 56 of 57 proofs passed; 2 did not run; failed: random-number generator (no randomness)\n"
         );
     }
 

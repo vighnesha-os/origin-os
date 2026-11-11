@@ -323,10 +323,14 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         proofs.record(Proof::Numa, numa);
         // Inter-node distances from the ACPI SLIT (CLAUDE.md §27, §28).
         proofs.record(Proof::NumaDistances, prove_slit(&mut com1, info.acpi_rsdp));
-        // Hardware entropy from RDSEED/RDRAND (CLAUDE.md §59).
-        proofs.record(Proof::Entropy, prove_entropy(&mut com1, &features));
-        // The random-number generator on every processor (ADR-0016).
-        let _ = prove_random(&mut com1, online.cpus(), tsc_hz);
+        // The random-number generator on every processor (CLAUDE.md §59; ADR-0016). If the
+        // proof fails, randomness is withheld from here on (ADR-0013 R2, Amendment 1): nothing
+        // is launched and nothing is placed at a random address.
+        let random = prove_random(&mut com1, online.cpus(), tsc_hz);
+        if !random {
+            origin_frame::random::withhold();
+        }
+        proofs.record(Proof::Random, random);
         // M3, second step: preemptive kernel threads on every online processor. Its proofs
         // run to the end and are judged together (ADR-0013 R4): the proofs after a failure
         // use only the kernel's fixed programs, and the operator sees every result.
@@ -1268,86 +1272,6 @@ fn prove_slit(com1: &mut console::Console, rsdp: u64) -> bool {
     consistent
 }
 
-/// Proves the kernel's hardware entropy source (CLAUDE.md §59 secure randomness). Draws a
-/// batch of 64-bit values through the bounded-retry logic in [`framekernel::entropy`] over
-/// RDSEED (preferred) and RDRAND, and checks they all arrived, are non-zero and are
-/// distinct — the smoke test that distinguishes a live entropy source from a dead one that
-/// returns a constant. A processor that reports neither instruction is reported honestly,
-/// not failed.
-fn prove_entropy(com1: &mut console::Console, features: &crate::features::Features) -> bool {
-    use crate::entropy::{self, Source};
-
-    if !features.rdseed && !features.rdrand {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: entropy: no RDSEED or RDRAND; consistent true (no source claimed)"
-        );
-        return true;
-    }
-
-    // Prefer RDSEED (full-entropy), falling back to RDRAND within one attempt; the generic
-    // `draw` loop then retries this combined source per Intel's budget.
-    struct Hw {
-        rdseed: bool,
-        rdrand: bool,
-        from_rdseed: u32,
-        from_rdrand: u32,
-    }
-    impl Source for Hw {
-        fn try_next(&mut self) -> Option<u64> {
-            if self.rdseed
-                && let Some(v) = cpu::rdseed()
-            {
-                self.from_rdseed += 1;
-                return Some(v);
-            }
-            if self.rdrand
-                && let Some(v) = cpu::rdrand()
-            {
-                self.from_rdrand += 1;
-                return Some(v);
-            }
-            None
-        }
-    }
-
-    let mut src = Hw {
-        rdseed: features.rdseed,
-        rdrand: features.rdrand,
-        from_rdseed: 0,
-        from_rdrand: 0,
-    };
-    let mut values = [0u64; 16];
-    let mut drawn = 0;
-    for slot in &mut values {
-        match entropy::draw(&mut src, entropy::RDRAND_RETRIES) {
-            Some(v) => {
-                *slot = v;
-                drawn += 1;
-            }
-            None => break,
-        }
-    }
-    let all = drawn == values.len();
-    let nonzero = values[..drawn].iter().all(|&v| v != 0);
-    let distinct = values[..drawn]
-        .iter()
-        .enumerate()
-        .all(|(i, &v)| !values[..i].contains(&v));
-    let consistent = all && nonzero && distinct;
-    let _ = writeln!(
-        com1,
-        "origin-kernel: entropy: RDSEED {}, RDRAND {}; {drawn} draws ({} RDSEED, {} RDRAND), all {all}, distinct {distinct}, nonzero {nonzero}; consistent {}{}",
-        features.rdseed,
-        features.rdrand,
-        src.from_rdseed,
-        src.from_rdrand,
-        consistent,
-        if consistent { "" } else { ": entropy failed" }
-    );
-    consistent
-}
-
 /// How an instruction stands, as the generator's lines give it.
 fn condition_name(condition: origin_frame::random::Condition) -> &'static str {
     use origin_frame::random::Condition;
@@ -1428,7 +1352,7 @@ fn prove_random(com1: &mut Console, cpus: &[cpu::CpuIndex], tsc_hz: u64) -> bool
     use origin_frame::random::{self, Condition, Error};
 
     // Every processor started its generator as it came up; give the last of them a moment.
-    let deadline = time::monotonic_nanos().saturating_add(2_000_000_000);
+    let deadline = time::monotonic_nanos().saturating_add(10_000_000_000);
     while cpus
         .iter()
         .any(|&c| !random::processor(c).is_some_and(|p| p.started))

@@ -123,6 +123,7 @@ Apart from the SMEP proof's stale translation above (Intel, fixed on the CI bran
 | Bus-master quiesce (`pcie::quiesce`, `pcie::check_quiet`) | A device may still be mastering the bus (T4) | Every driver (`DeviceDma`) |
 | IOMMU bring-up (`iommu::init`) | Units not running, or their tables unreadable. No DMAR or IVRS at all passes (ADR-0007, sheet item 9) | Every driver |
 | Application processors (`smp::start`) | One or more did not start | Those processors, and the reclaim of loader memory (`online.complete`) |
+| Random-number generator (`prove_random`; Amendment 1 and ADR-0016 R8, in place of "hardware entropy") | There is no generator: no instruction passed its start-up test on the boot processor, or the known-answer test failed. Or a processor has none, a request was refused or two values were the same, or the generator's stack held something after a request | Randomness (`random::withhold`): every request is refused, so nothing is launched, nothing is placed at a random address and the network asks for no lease. The process-start and service-directory proofs then do not run |
 | PCIe enumeration (`pcie::init`) | The bus could not be listed | Every driver |
 | NVMe (`storage::init`) | The controller did not come up. On a disk that is not the boot test's, only the read-only proofs run | Storage |
 
@@ -136,7 +137,6 @@ Apart from the SMEP proof's stale translation above (Intel, fixed on the CI bran
 | Clock sources (`time::init`) | The RTC, HPET or PM timer disagrees with the TSC, or the wall clock is unreadable. Nothing uses HPET or the PM timer, and the monotonic clock is published either way | Yes: firmware values, PIT gating |
 | I/O APIC routing (`irq::prove`) | The PIT's IRQ0 did not arrive through the I/O APIC, with the 8254 counting. A machine whose 8254 does not count reports that it cannot prove this and passes (F3) | Only with the 8254 counting and something else wrong |
 | CPU topology, NUMA affinities, NUMA distances | Firmware and CPUID disagree. The scheduler uses none of it yet | Yes: firmware tables |
-| Hardware entropy (`prove_entropy`) | RDSEED/RDRAND dead or stuck | Yes. It has been consumed since S3-3, and it becomes Withdraw with the kernel's generator (Amendment 1) |
 | Scheduler fairness | Two workers' shares of running time differ by over 2×. Time since F6: the measure that failed was loop counts | **Seen** on the old measure: 2.1–2.5× on a Xeon 8370C (shared cores) |
 | Scheduler weights | Shares off under load | **Seen** failing under load (1 boot in 30, all cores loaded) |
 | Thread lifecycle, refused spawns, thread reaping | Accounting or a leak; a yield or sleep out of bounds | Yes: timing bounds. A leak is a bug, not a safety failure |
@@ -277,7 +277,7 @@ The Refuse list costs a stricter boot on real machines than the proofs had befor
 
 ## Amendment 1 (Accepted, 2026-11-10): the entropy proof becomes Withdraw with the kernel's generator
 
-**Status: Accepted by the owner on 2026-11-10, as recommended ("Accept all", decision sheet item 113; CLAUDE.md §18). Not built.** The inventory's class for this proof, `framekernel::bootproof` and the host test that pins them still say Report. All three change in one commit, with the generator. The evidence is finding 8 of `docs/engineering/DESIGN_REVIEW_2026-11-10.md`.
+**Status: Accepted by the owner on 2026-11-10, as recommended ("Accept all", decision sheet item 113; CLAUDE.md §18). Built on 2026-11-11 (task 18b), under QEMU only.** The inventory's row, `framekernel::bootproof`, the host test that pins them and the boot test's markers changed in one commit, with the generator's proof: the row is now "random-number generator", a Withdraw row, and "hardware entropy" and `prove_entropy` are gone. The evidence is finding 8 of `docs/engineering/DESIGN_REVIEW_2026-11-10.md`.
 
 **Why.** R3 moves a proof "when something comes to depend on what it proves", and gives entropy as its example of a result nothing consumes. That stopped being true with task S3-3:
 

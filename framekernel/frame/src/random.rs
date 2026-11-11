@@ -152,6 +152,8 @@ static SLOTS: [Slot; MAX_CPUS] = [const { Slot::new() }; MAX_CPUS];
 static ROOT: SpinLock<Root> = SpinLock::new(Root::new());
 /// There is a root: requests can be answered.
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
+/// The boot's proof of the generator failed: every request is refused from then on.
+static WITHHELD: AtomicBool = AtomicBool::new(false);
 /// The boot processor's start has run.
 static BOOT_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -518,9 +520,17 @@ pub(crate) fn start_this_processor() {
     finish_start(slot);
 }
 
-/// Whether there is a generator to ask (R8). With none, every request is refused.
+/// Whether there is a generator to ask (R8). With none, or once it has been withheld, every
+/// request is refused.
 pub fn available() -> bool {
-    AVAILABLE.load(Ordering::Acquire)
+    AVAILABLE.load(Ordering::Acquire) && !WITHHELD.load(Ordering::Acquire)
+}
+
+/// Withholds randomness for the rest of this boot: every later request is refused as if there
+/// were no generator. For the boot flow, when its proof of the generator fails (ADR-0013 R2:
+/// what a failed proof withdraws is withheld where it would be used).
+pub fn withhold() {
+    WITHHELD.store(true, Ordering::Release);
 }
 
 /// Fills `out` with random bytes from the generator of the processor the caller is on.

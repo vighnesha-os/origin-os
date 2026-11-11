@@ -1244,6 +1244,11 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "interrupt remapping on (256 entries, 32-bit x2APIC destinations, compatibility format blocked); translation on (GSTS 0x".into(),
             "every device's DMA faults until its driver attaches it; 0 stale fault(s) cleared".into(),
             "origin-kernel: IOMMU: translating ".into(),
+            // The random-number generator's root and the boot processor's own generator
+            // (ADR-0016 R5, R13), before another processor starts: the self-test passed and
+            // an instruction passed its start-up test.
+            "origin-kernel: random: root: known-answer test passed; ".into(),
+            "; the boot processor's generator seeded".into(),
             // M3: every processor QEMU emulates (`-smp`, see `machine`) comes online. The
             // MADT lists every possible processor; each enabled one gets a CPU index.
             format!(
@@ -1298,9 +1303,14 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // off-diagonal >= 10.
             "origin-kernel: slit: ".into(),
             "; consistent true".into(),
-            // Hardware entropy from RDSEED/RDRAND: a batch of draws, all distinct and non-zero.
-            "origin-kernel: entropy: ".into(),
-            "; consistent true".into(),
+            // The random-number generator (ADR-0016): every processor has one, requests are
+            // answered with values that differ, and its stack holds only zeros after a request.
+            "origin-kernel: random: processor 0: ".into(),
+            "; its generator seeded".into(),
+            "origin-kernel: random: 16 of 16 values answered, all distinct true; 300 bytes in pieces true; with prediction resistance: ".into(),
+            "origin-kernel: random: cost: a 64-byte request ".into(),
+            "; only zeros on it after a request: true".into(),
+            "origin-kernel: random: every processor has a generator true; consistent true".into(),
             "origin-kernel: page protection: stack guard page at ".into(),
             // M3: two non-yielding threads per processor, all preempted and all running.
             "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted ".into(),
@@ -1654,7 +1664,9 @@ fn boot_failures() -> Vec<&'static str> {
         ": CPU baseline failed",
         ": numa failed",
         ": slit failed",
-        ": entropy failed",
+        ": random failed",
+        "origin-kernel: random: no generator",
+        "with prediction resistance: WRONG",
         ": initramfs failed",
         ": virtio-net failed",
         "supervisor isolation from user pages incomplete",
