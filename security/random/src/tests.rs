@@ -5,6 +5,7 @@
 //! policy must handle. A test can move the calling thread to another processor between steps.
 
 mod health;
+mod model;
 mod reference;
 mod requests;
 mod schedule;
