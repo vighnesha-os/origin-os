@@ -3250,6 +3250,24 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
 - **Two defects found by the gates, fixed in the commits that introduced them** (the branch is local, so its history was rebuilt rather than patched on top):
   - `cargo xtask check`'s clippy of `origin-sync` built for Loom wanted a `Default` for `Slots`, whose impl had been left out of Loom builds by a `cfg`. The `cfg` is gone, as `Shootdown`'s and `Confirmation`'s have none (`b9ddcbd`). It changes no build but Loom's.
   - `boot-matrix` failed once, on the AMD IOMMU machine with 4 processors: the proof printed `its slot and frames free: false` while every read on the other processor faulted and its final counts showed nothing lost or left retired. The proof had checked that the freed stack's frames were still free, but a released frame is anyone's at once. It now checks the slot, which `Slots::reclaim` frees only after the frames are released, an order the Loom model covers (`87905fd`).
+- **A third defect, brought in by the second's fix and found by CI's real-processor jobs on 2026-11-11; fixed in `4dc5c15` on `claude/stacks-proof-own-slot`:**
+  - **The defect.** Since `87905fd` the proof's wait, and its clause "its slot free again", asked `stack::slot_is_free(top)`, with `top` the stack's `GuardedStack::top()`. That is the first address past the stack, the base of the next slot, so both asked about the next slot.
+  - **How it failed.** With three processors or more, an idle processor can take the proof's slot to reclaim it in its idle loop (`sched::reap`), while the boot processor's own `reclaim` finds nothing more to do. The next slot was free, so the wait ended at once, and the reader on CPU 1 read the old pages before that reclaim had taken them away.
+  - **Where.** CI's two real-processor jobs on `land/s3-part2` failed this way in three runs and seven boots: the Intel and AMD IOMMU machines with 4 processors, the x2APIC machine with 3, and the host's own processor with 4. They never failed with 1 or 2 processors, and passed in one earlier run by timing. QEMU's software processor on the development Mac never showed it.
+  - **The reading is the coordinating session's,** from the logs, checked here against the code. Nothing has measured the race.
+  - **The fix.** `stack::slot_is_free` takes a `StackSlot`, which only `GuardedStack::slot` makes, so it cannot be given a top. `stack::slot_holding(addr)` names the slot an address is in. The proof waits on `made.slot()`, and its line also requires `slot_holding(top - 1)` to be that slot. A wait on any other slot therefore fails the proof on every boot, under QEMU too. xtask expects the new line: "...; its slot, the one its last byte was in: true, free again: true".
+  - **Controls,** each a change to a scratch worktree at `4dc5c15`, never committed, run on 2026-11-11 between 10:31 and 10:33 UTC, the boots on 2 processors:
+    - *The old call,* `slot_is_free(top)`, no longer compiles (`E0308`, mismatched types).
+    - *`GuardedStack::slot` names the next slot:* the boot fails at "...: 4 of 4 reads there faulted and 0 saw the old pages; its slot, the one its last byte was in: false, free again: true: kernel stacks failed".
+    - *The proof waits on `slot_holding(top)`, the original reading in the new interface:* the same line, the same failure.
+    - Both boots failed on the software processor, where the race never shows: the identity clause catches a wrong slot whatever the timing.
+  - **Gates on `4dc5c15`,** with a clean tree, from 10:23 UTC:
+    - clippy for the kernel target passed.
+    - `cargo xtask check` passed: 1,370 host tests in 43 suites, none failed, 10 ignored; the unsafe gate's 324 sites in its 22 listed files; Loom, all 42 models passed and all 68 controls were caught (98 runs).
+    - `cargo xtask boot-test` passed 11 of 11. The kernel boot's line was true in both clauses, and the boot ended "degraded: 60 of 61 proofs passed; failed: speculation controls" (item 154).
+  - **Not shown:**
+    - that this was the whole cause of CI's failures, which only CI's real-processor jobs over several runs can show;
+    - the race itself, which QEMU's software processor does not reproduce.
 - **Review:** none yet. No human has reviewed this code.
 - **Licensing:** MIT OR Apache-2.0.
 
