@@ -10,7 +10,7 @@
 use origin_crypto::HmacDrbgSha512;
 
 use crate::health::STARTUP_DRAWS;
-use crate::node::{Instruction, Node, PIECE, RESEED_NANOS, RESEED_REQUESTS};
+use crate::node::{Instruction, Node, PIECE, RESEED_NANOS, RESEED_REQUESTS, passed};
 use crate::seed::{self, NONCE_DRAWS};
 use crate::wipe::wipe;
 
@@ -125,7 +125,7 @@ impl Root {
     pub const fn due(&self, now: u64) -> bool {
         self.drbg.is_instantiated()
             && (self.drbg.requests_since_seed() >= RESEED_REQUESTS
-                || now.saturating_sub(self.seeded_at) >= RESEED_NANOS)
+                || passed(now, self.seeded_at, RESEED_NANOS))
     }
 
     /// Brings the root's count of healthy instructions up to date with `node`.
@@ -157,11 +157,12 @@ impl Root {
         tsc: u64,
         extra: bool,
     ) -> bool {
+        // Draws of an instruction that has failed since they were collected are not used.
+        node.settle_regions(area);
         let both = node.region1 == STARTUP_DRAWS;
         let instantiated = self.instantiate_inner(node, area, tsc, extra);
         wipe(area);
-        node.region0 = 0;
-        node.region1 = 0;
+        node.forget_regions();
         if instantiated {
             self.seeded_at = now;
             self.both = both;
@@ -261,11 +262,15 @@ impl Root {
         }
     }
 
-    /// Reseeds `node`'s generator from 64 bytes of the root's output: for a processor none of
-    /// whose instructions is healthy (R6).
+    /// Reseeds `node`'s generator from 64 bytes of the root's output: for a processor that is
+    /// due a reseed and none of whose instructions is healthy (R6). Any other processor is
+    /// left as it is: a thread that asked for one processor may be on another by now.
     pub fn reseed_processor(&mut self, node: &mut Node, now: u64, tsc: u64) -> Answer {
         if let Err(answer) = self.ready() {
             return answer;
+        }
+        if !node.wants_root(now) {
+            return Answer::NotGathered;
         }
         let Some(entropy) = node.from_root.get_mut(..64) else {
             return Answer::NotNow;
@@ -285,15 +290,24 @@ impl Root {
     }
 
     /// One piece with prediction resistance (R6; SP 800-90A §9.3.1): the root is reseeded from
-    /// `node`'s store, which must hold eight RDSEED draws, and then generates.
-    pub fn fresh_piece(&mut self, node: &mut Node, out: &mut [u8], now: u64, tsc: u64) -> Answer {
+    /// `node`'s store and then generates. The store must hold eight RDSEED draws gathered by
+    /// the request that asks: `epoch` is the number [`Node::begin_fresh`] gave it, and a store
+    /// that another request has begun in since, or that was filled before, gives nothing.
+    pub fn fresh_piece(
+        &mut self,
+        node: &mut Node,
+        out: &mut [u8],
+        now: u64,
+        tsc: u64,
+        epoch: u32,
+    ) -> Answer {
         if let Err(answer) = self.ready() {
             return answer;
         }
         if out.len() > PIECE {
             return Answer::NotNow;
         }
-        if !node.store_is_fresh() {
+        if node.fresh_epoch() != epoch || !node.store_is_fresh() {
             return Answer::NotGathered;
         }
         let extra = node.stamp(tsc);

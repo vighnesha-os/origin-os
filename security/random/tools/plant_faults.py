@@ -14,6 +14,10 @@ Host-only engineering tool; nothing here ships. It edits the working tree while 
 run nothing else in the checkout meanwhile.
 
 Usage: python3 -I security/random/tools/plant_faults.py <repository root> [part of a fault's name]
+       python3 -I security/random/tools/plant_faults.py <repository root> --strings
+
+With `--strings` nothing is edited or run: it only says which entries' strings no longer occur
+once.
 """
 
 import re
@@ -52,27 +56,27 @@ FAULTS = [
  ("node: a reseed is due after 61 seconds", [(N, "pub const RESEED_NANOS: u64 = 60_000_000_000;", "pub const RESEED_NANOS: u64 = 61_000_000_000;")]),
  ("node: a reseed is due one request late", [(N, "pub const RESEED_REQUESTS: u64 = 1 << 20;", "pub const RESEED_REQUESTS: u64 = (1 << 20) + 1;")]),
  ("node: an instruction rests two seconds", [(N, "pub const REST_NANOS: u64 = 1_000_000_000;", "pub const REST_NANOS: u64 = 2_000_000_000;")]),
- ("node: the clock never makes a reseed due", [(N, "                || now.saturating_sub(self.seeded_at) >= RESEED_NANOS)\n    }\n\n    /// Whether a start-up test", "                || false)\n    }\n\n    /// Whether a start-up test")]),
- ("node: the count never makes a reseed due", [(N, "            && (self.drbg.requests_since_seed() >= RESEED_REQUESTS\n                || now.saturating_sub(self.seeded_at) >= RESEED_NANOS)\n    }\n\n    /// Whether a start-up test", "            && (now.saturating_sub(self.seeded_at) >= RESEED_NANOS)\n    }\n\n    /// Whether a start-up test")]),
+ ('node: the clock never makes a reseed due', [(N, '                || passed(now, self.seeded_at, RESEED_NANOS))\n    }\n\n    /// Whether a start-up test', '                || false)\n    }\n\n    /// Whether a start-up test')]),
+ ('node: the count never makes a reseed due', [(N, '            && (self.drbg.requests_since_seed() >= RESEED_REQUESTS\n                || passed(now, self.seeded_at, RESEED_NANOS))\n    }\n\n    /// Whether a start-up test', '            && (passed(now, self.seeded_at, RESEED_NANOS))\n    }\n\n    /// Whether a start-up test')]),
  ("node: a failed instruction keeps its draws in the store", [(N, "    fn failed(&mut self, which: Instruction, now: u64) {\n        self.drop_draws(which);", "    fn failed(&mut self, which: Instruction, now: u64) {")]),
- ("node: a failed instruction may be tested again at once", [(N, "        self.line_mut(which).retest_after = now.saturating_add(RESEED_NANOS);", "        self.line_mut(which).retest_after = now;")]),
- ("node: 'not now' does not rest the instruction", [(N, "        self.line_mut(which).rest_until = now.saturating_add(REST_NANOS);\n        match which {", "        match which {")]),
+ ('node: a failed instruction may be tested again at once', [(N, '        self.drop_draws(which);\n        self.line_mut(which).failed_at = Some(now);', '        self.drop_draws(which);\n        self.line_mut(which).failed_at = None;')]),
+ ("node: 'not now' does not rest the instruction", [(N, '        self.line_mut(which).rest_since = Some(now);\n        self.count_not_now(which);', '        self.count_not_now(which);')]),
  ("node: a draw of stuck values is only 'not now'", [(N, "        if saw_set_aside {\n            if matches!", "        if false {\n            if matches!")]),
  ("node: a reseed asks RDRAND first", [(N, "        let which = if rdseed && (self.have == 0 || self.from == Instruction::Rdseed) {\n            Instruction::Rdseed\n        } else if rdrand {", "        let which = if rdrand {\n            Instruction::Rdrand\n        } else if rdseed && (self.have == 0 || self.from == Instruction::Rdseed) {\n            Instruction::Rdseed\n        } else if false {")]),
- ("node: a resting RDSEED is tried all the same", [(N, "let rdseed = self.rdseed.health.is_healthy() && now >= self.rdseed.rest_until;", "let rdseed = self.rdseed.health.is_healthy();")]),
+ ('node: a resting RDSEED is tried all the same', [(N, 'let rdseed = allow.rdseed && self.rdseed.health.is_healthy() && !self.rdseed.resting(now);', 'let rdseed = allow.rdseed && self.rdseed.health.is_healthy();')]),
  ("node: RDSEED draws are dropped when RDRAND takes over", [(N, "                    copy(to, from);\n                    self.aside_have = self.have;", "                    copy(to, from);")]),
  ("node: a reseed's additional input has no time-stamp counter", [(N, "            copy(to, &tsc.to_le_bytes());\n        }\n        if let Some(to) = self.aside.get_mut(8..16)", "            copy(to, &0u64.to_le_bytes());\n        }\n        if let Some(to) = self.aside.get_mut(8..16)")]),
  ("node: a reseed's additional input has no index", [(N, "copy(to, &u64::from(self.index).to_le_bytes());", "copy(to, &0u64.to_le_bytes());")]),
- ("node: a reseed does not start the clock again", [(N, "        if reseeded {\n            self.seeded_at = now;\n            match from {", "        if reseeded {\n            match from {")]),
+ ('node: a reseed does not start the clock again', [(N, '        if reseeded {\n            self.seeded_at = now;\n            // The root keeps the same schedule', '        if reseeded {\n            // The root keeps the same schedule')]),
  ("node: a reseed from RDRAND is never counted as dry", [(N, "                    if self.rdseed.health.is_healthy() {\n                        self.counts.reseeds_dry", "                    if false {\n                        self.counts.reseeds_dry")]),
  ("node: the store is not emptied after a reseed", [(N, "        let from = self.from;\n        self.clear_store();", "        let from = self.from;")]),
  ("node: a test begins again though no reseed is due", [(N, "            if !testing\n                && due\n                && matches!", "            if !testing\n                && matches!")]),
- ("node: a test begins again within the period", [(N, "                && matches!(line.health.condition(), Condition::Unhealthy)\n                && now >= line.retest_after\n            {", "                && matches!(line.health.condition(), Condition::Unhealthy)\n            {")]),
- ("node: a request does not wait for a running test", [(N, "&& (self.due(now) || self.retesting() || self.owes_root())", "&& (self.due(now) || self.owes_root())")]),
+ ('node: a test begins again within the period', [(N, '                && matches!(line.health.condition(), Condition::Unhealthy)\n                && line.may_retest(now)\n            {', '                && matches!(line.health.condition(), Condition::Unhealthy)\n            {')]),
+ ('node: a request does not wait for a running test', [(N, '&& (self.due(now) || self.retesting() || self.owes_root() || self.wants_root_look(now))', '&& (self.due(now) || self.owes_root() || self.wants_root_look(now))')]),
  ("node: the root is never told of a change", [(N, "        if self.owes_root() {\n            return Maint::TellRoot;\n        }\n", "")]),
  ("node: a processor's own draws are left out of its first seed", [(N, "let end = seed::HEAD.saturating_add(regions.saturating_mul(seed::REGION));", "let end = seed::HEAD;")]),
  ("node: the root's nonce bytes are used as the entropy input", [(N, "            (Some(entropy), Some(nonce), Some(personalization)) => self\n                .drbg\n                .instantiate(entropy, nonce, personalization)\n                .is_ok(),\n            _ => false,\n        }\n    }\n\n    /// The standard's uninstantiate", "            (Some(entropy), Some(nonce), Some(personalization)) => self\n                .drbg\n                .instantiate(nonce, entropy, personalization)\n                .is_ok(),\n            _ => false,\n        }\n    }\n\n    /// The standard's uninstantiate")]),
- ("node: the seed area is left as it was after a processor starts", [(N, "        self.from_root_len = 0;\n        wipe(area);\n        self.region0 = 0;", "        self.from_root_len = 0;\n        self.region0 = 0;")]),
+ ('node: the seed area is left as it was after a processor starts', [(N, '        self.from_root_len = 0;\n        wipe(area);\n        self.forget_regions();', '        self.from_root_len = 0;\n        self.forget_regions();')]),
  ("node: what the root handed over is left in place", [(N, "        let instantiated = self.instantiate_inner(area, tsc);\n        wipe(&mut self.from_root);", "        let instantiated = self.instantiate_inner(area, tsc);")]),
  ("node: a failed collection leaves the region as it was", [(N, "        if let Some(bytes) = seed::region(area, region) {\n            wipe(bytes);\n        }", "")]),
  ("node: draws are stored high byte first", [(N, "        copy(slot, &value.to_le_bytes());\n        self.set_collected(region, have.saturating_add(1));", "        copy(slot, &value.to_be_bytes());\n        self.set_collected(region, have.saturating_add(1));")]),
@@ -100,6 +104,53 @@ FAULTS = [
  ("drive: a start-up test that is not ready stays running", [(D, "                        if !failed && testing {\n                            ctx.node.abandon_test(which);\n                        }\n", "")]),
  ("drive: no pause between tries", [(D, "                    return Ok(Collected::Without);\n                }\n                platform.pause();", "                    return Ok(Collected::Without);\n                }")]),
  ("drive: the count of tries is not started again for a new draw", [(D, "            Try::Stored | Try::Completed | Try::Failed | Try::Unwanted => {\n                self.of = None;\n                None\n            }", "            Try::Stored | Try::Completed | Try::Failed | Try::Unwanted => None,")]),
+ # The review of 2026-11-11: one fault for each fix.
+ # 1. A request with prediction resistance is never answered from earlier draws.
+ ('fresh: a request keeps what the store held when it began', [(N, '    pub fn begin_fresh(&mut self) -> u32 {\n        self.clear_store();', '    pub fn begin_fresh(&mut self) -> u32 {')]),
+ ('fresh: a request that was not answered leaves its draws', [(N, '        if self.fresh_epoch == epoch {\n            self.clear_store();\n        }', '        if false && self.fresh_epoch == epoch {\n            self.clear_store();\n        }')]),
+ ('fresh: the driver does not end a request that was not answered', [(D, '                ctx.node.end_fresh(epoch);', '                let _ = epoch;')]),
+ ('fresh: the root takes a store whatever request filled it', [(R, '        if node.fresh_epoch() != epoch || !node.store_is_fresh() {', '        if !node.store_is_fresh() {')]),
+ ('fresh: a request goes on in a store another has begun in', [(N, '            Some(epoch) if epoch == self.fresh_epoch => epoch,', '            Some(epoch) => epoch,')]),
+ ('fresh: a request that moved goes on by its number alone', [(D, 'let here = begun.and_then(|(cpu, epoch)| (cpu == ctx.index).then_some(epoch));', 'let here = begun.map(|(_, epoch)| epoch);')]),
+ ("fresh: a processor's own reseed takes over draws left for another purpose", [(N, '        if self.store_lent {\n            // Draws left from a gathering for the root', '        if false && self.store_lent {\n            // Draws left from a gathering for the root')]),
+ # 2. The root keeps the processors' schedule.
+ ('root schedule: a processor that reseeds itself does not look at the root', [(D, '                    look_at_root(platform)?;\n', '')]),
+ ('root schedule: a processor that could not reach the root does not look again', [(N, '            self.root_look = true;\n', '')]),
+ ('root schedule: the look is made again at once, without a rest', [(N, '            && (self.rdseed.health.is_healthy() || self.rdrand.health.is_healthy())\n            && self.root_rested(now)\n    }', '            && (self.rdseed.health.is_healthy() || self.rdrand.health.is_healthy())\n    }')]),
+ ('root schedule: draws that did not reach the root are kept', [(D, '        // Draws that did not reach the root are not kept for later.\n        ctx.node.drop_root_draws();\n        if !reseeded {', '        if !reseeded {')]),
+ ("root schedule: a request waits for the root's lock on the root's account", [(D, '    let due = try_root_step(platform, |ctx, root| {\n        root.account(ctx.node);\n        let due = root.due(ctx.now) && !root.stopped();\n        if !due {\n            ctx.node.looked_at_root();\n        }\n        due\n    });', '    let due = in_root_step(platform, |ctx, root| {\n        root.account(ctx.node);\n        let due = root.due(ctx.now) && !root.stopped();\n        if !due {\n            ctx.node.looked_at_root();\n        }\n        due\n    })\n    .ok();')]),
+ ('root schedule: the root is reseeded though it is not due', [(D, '        let due = root.due(ctx.now) && !root.stopped();\n        if !due {\n            ctx.node.looked_at_root();', '        let due = !root.stopped();\n        if !due {\n            ctx.node.looked_at_root();')]),
+ ("root schedule: the root's gathering takes a processor's own draws", [(N, '            if self.have != 0 || self.aside_have != 0 {\n                // This generator is gathering for its own reseed', '            if false {\n                // This generator is gathering for its own reseed')]),
+ ("root schedule: the root's gathering may make nine draws", [(D, '        if drawn >= RESEED_DRAWS {\n            return in_step(platform, |ctx| ctx.node.store_full());', '        if drawn > RESEED_DRAWS {\n            return in_step(platform, |ctx| ctx.node.store_full());')]),
+ ('root schedule: a request with nine draws behind it still reseeds the root', [(D, '                    if draws <= REQUEST_DRAWS.saturating_sub(RESEED_DRAWS) =>', '                    if draws <= REQUEST_DRAWS =>')]),
+ ('root schedule: a processor that starts does not reseed a root that is due', [(D, '        root.account(ctx.node);\n        root.due(ctx.now) && !root.stopped()\n    })?;\n    if due {', '        root.account(ctx.node);\n        root.due(ctx.now) && !root.stopped()\n    })?;\n    if false && due {')]),
+ # 3. A start waits out a 'not now'.
+ ("start: an instruction is given up at its first 'not now'", [(D, 'const START_PATIENCE: u32 = 8;', 'const START_PATIENCE: u32 = 0;')]),
+ ("start: a ninth 'not now' is waited out", [(D, 'const START_PATIENCE: u32 = 8;', 'const START_PATIENCE: u32 = 9;')]),
+ ("start: a 'not now' that is waited out is not counted", [(N, '    pub fn waited_at_start(&mut self, which: Instruction) {\n        self.count_not_now(which);', '    pub fn waited_at_start(&mut self, which: Instruction) {\n        let _ = which;')]),
+ ("start: stuck values are waited out like a 'not now'", [(D, '                    if !set_aside && patience != 0 {', '                    if patience != 0 {')]),
+ # 4. Start-up draws of an instruction that has failed since are not in a first seed.
+ ("regions: a failed instruction's draws go into a processor's first seed", [(N, '        self.settle_regions(area);\n        let Some(head) = seed::write_processor_head', '        let Some(head) = seed::write_processor_head')]),
+ ("regions: a failed instruction's draws go into a root's first seed", [(R, '        node.settle_regions(area);\n        let both', '        let both')]),
+ ("regions: the second instruction's draws are not moved into the first's place", [(N, '        if self.region0 == 0 && self.region1 == STARTUP_DRAWS {', '        if false && self.region0 == 0 && self.region1 == STARTUP_DRAWS {')]),
+ ('regions: a region does not say whose draws it holds', [(N, '        self.set_collected(region, have.saturating_add(1));\n        self.set_region_of(region, Some(which));', '        self.set_collected(region, have.saturating_add(1));')]),
+ ('regions: region 1 keeps its draws after they moved down', [(N, '                self.region0_of = self.region1_of;\n            }\n            self.empty_region(area, 1);', '                self.region0_of = self.region1_of;\n            }')]),
+ # 5. Waits are measured from when they began.
+ ('clock: a clock that steps back prolongs a wait', [(N, '    now < since || now.wrapping_sub(since) >= period', '    now.saturating_sub(since) >= period')]),
+ ("clock: the root's clock never makes it due", [(R, '                || passed(now, self.seeded_at, RESEED_NANOS))', '                || false)')]),
+ # 6. A thread that moves.
+ ('moving: a processor that needs nothing is reseeded from the root', [(R, '        if !node.wants_root(now) {\n            return Answer::NotGathered;\n        }\n', '')]),
+ ("moving: a draw's tries start again on another processor", [(D, '                    self.of = Some((on, which));\n                    self.set_aside = false;\n                }\n            }\n            // A new draw: the count starts again.', '                    self.of = Some((on, which));\n                    self.used = 0;\n                    self.set_aside = false;\n                }\n            }\n            // A new draw: the count starts again.')]),
+ ('moving: a stuck value seen on one processor is held against another', [(D, '                    self.of = Some((on, which));\n                    self.set_aside = false;\n                }\n            }\n            // A new draw: the count starts again.', '                    self.of = Some((on, which));\n                }\n            }\n            // A new draw: the count starts again.')]),
+ ('moving: a request tries an instruction again after giving it up', [(D, '            // The request does not try this instruction again, wherever it is by then.\n            allow.stop(which);', '')]),
+ ('moving: a root that had nothing to do rests the processor', [(D, '                    if !matches!(answer, Answer::Done | Answer::NotGathered) {', '                    if !matches!(answer, Answer::Done) {')]),
+ # 7. Nothing stays behind.
+ ('left behind: with no root the extra bytes stay in the area', [(D, '        if !instantiated {\n            wipe(ctx.area);\n        }', '')]),
+ ('left behind: uninstantiate leaves the store', [(N, '        self.drbg.uninstantiate();\n        self.clear_store();', '        self.drbg.uninstantiate();')]),
+ ('left behind: a failed RDSEED leaves the draws set aside', [(N, '        if which == Instruction::Rdseed {\n            wipe(&mut self.aside);\n            self.aside_have = 0;\n        }', '')]),
+ ('left behind: what the root handed over for a reseed stays', [(N, '            _ => false,\n        };\n        wipe(&mut self.from_root);\n        self.from_root_len = 0;\n        if reseeded {', '            _ => false,\n        };\n        if reseeded {')]),
+ # Not observable by a test on a host, and listed to say so: a local variable's bytes.
+ ('left behind: next_u64 leaves its copy of the value (not observable)', [(D, '    wipe(&mut bytes);\n    filled.map(|()| value)', '    filled.map(|()| value)')]),
  # The self-test.
  ("selftest: the answer is not compared", [(T, "    difference == 0 && !drbg.is_instantiated()", "    !drbg.is_instantiated()")]),
  ("selftest: only the first step is run", [(T, "    for step in vector.steps {\n        let done", "    for step in vector.steps.iter().take(1) {\n        let done")]),
@@ -107,7 +158,7 @@ FAULTS = [
  # Not observable, and listed to say so: the root is told of a change of health by the
  # maintenance of the request that saw it, so telling it again before a fresh request changes
  # nothing a test can see.
- ("drive: the root is not told again before a fresh request (not observable)", [(D, "                let answer = in_root_step(platform, |ctx, root| {\n                    root.account(ctx.node);\n                    root.fresh_piece(ctx.node, out, ctx.now, ctx.tsc)", "                let answer = in_root_step(platform, |ctx, root| {\n                    root.fresh_piece(ctx.node, out, ctx.now, ctx.tsc)")]),
+ ('drive: the root is not told again before a fresh request (not observable)', [(D, '                    root.account(ctx.node);\n                    root.fresh_piece(ctx.node, out, ctx.now, ctx.tsc, epoch)', '                    root.fresh_piece(ctx.node, out, ctx.now, ctx.tsc, epoch)')]),
 ]
 
 
@@ -123,6 +174,14 @@ def run():
 
 FILES = (H, N, R, D, S, T)
 originals = {f: (SRC / f).read_text() for f in FILES}
+if ONLY == "--strings":
+    stale = 0
+    for n, (name, edits) in enumerate(FAULTS, 1):
+        for f, old, _ in edits:
+            if originals[f].count(old) != 1:
+                stale += 1
+                print(f"fault {n} ({name}): its string occurs {originals[f].count(old)} times in {f}")
+    sys.exit(f"{stale} of {len(FAULTS)} entries are out of date" if stale else 0)
 try:
     code, failed, _ = run()
     if code != 0:

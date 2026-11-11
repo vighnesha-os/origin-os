@@ -93,13 +93,16 @@ fn three_processors_a_reseed_the_root_and_prediction_resistance() {
     // Sixty seconds on, every generator is due a reseed.
     world.now += RESEED_NANOS;
     assert_eq!(request(&mut world, 0), expected("a.cpu0.reseeded"));
-    assert_eq!(world.given(0, Instruction::Rdseed), 2056, "eight draws");
+    // Eight draws for its own reseed, and eight for the root, which was due as well (R6).
+    assert_eq!(world.given(0, Instruction::Rdseed), 2064);
     assert_eq!(
         world.given(0, Instruction::Rdrand),
         2048,
         "RDRAND is not touched"
     );
     assert_eq!(world.cpus[0].node.counts().reseeds_rdseed, 1);
+    assert_eq!(world.root.counts().reseeds, 1);
+    assert!(!world.root.due(world.now));
 
     // Processor 2 has nothing of its own: the root reseeds it.
     assert_eq!(request(&mut world, 2), expected("a.cpu2.reseeded"));
@@ -113,7 +116,7 @@ fn three_processors_a_reseed_the_root_and_prediction_resistance() {
     assert_eq!(out.to_vec(), expected("a.fresh"));
     assert_eq!(world.given(1, Instruction::Rdseed), 1032);
     assert_eq!(world.root.counts().fresh, 1);
-    assert_eq!(world.root.counts().reseeds, 1);
+    assert_eq!(world.root.counts().reseeds, 2);
 }
 
 #[test]

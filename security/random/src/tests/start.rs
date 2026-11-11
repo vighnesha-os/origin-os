@@ -179,7 +179,7 @@ fn a_failed_draw_empties_what_was_collected() {
 }
 
 #[test]
-fn not_ready_for_99_tries_is_a_draw_and_for_100_is_not_now() {
+fn not_ready_for_99_tries_is_a_draw_and_a_start_waits_out_a_not_now() {
     // 99 tries not ready, then a value: the draw is made.
     let mut world = World::new(1);
     world
@@ -207,8 +207,8 @@ fn not_ready_for_99_tries_is_a_draw_and_for_100_is_not_now() {
     assert_eq!(root.rdseed, Condition::Healthy);
     assert_eq!(world.tries(0, Instruction::Rdseed), 1024 + 120);
 
-    // 100 tries not ready: "not now". At a start that leaves the instruction out, with no
-    // fault, and the root is counted on RDRAND.
+    // 100 tries not ready is "not now", which is not a failure, and a start has nothing else
+    // to do: the draw is made again, and the instruction is healthy.
     let mut world = World::new(1);
     world
         .line(0, Instruction::Rdseed)
@@ -219,31 +219,334 @@ fn not_ready_for_99_tries_is_a_draw_and_for_100_is_not_now() {
         });
     let root = start_root(&mut world, false);
     assert!(root.instantiated);
-    assert_eq!(root.rdseed, Condition::Unhealthy);
-    assert_eq!(world.cpus[0].node.faults(Instruction::Rdseed), 0);
-    assert_eq!(world.cpus[0].node.last_fault(Instruction::Rdseed), None);
-    assert_eq!(world.tries(0, Instruction::Rdseed), 600);
+    assert_eq!(root.rdseed, Condition::Healthy);
+    assert_eq!(world.tries(0, Instruction::Rdseed), 1024 + 100);
     assert_eq!(world.cpus[0].node.counts().not_now_rdseed, 1);
-    assert_eq!(world.root.counted(), Some(Instruction::Rdrand));
+    assert_eq!(world.root.counted(), Some(Instruction::Rdseed));
+    // The instruction does not rest for it: the boot processor's own draws follow at once.
+    assert_eq!(start_processor(&mut world).own_regions, 2);
 
-    // RDRAND's budget is ten.
-    let mut world = World::reporting(1, false, true);
+    // Eight times "not now" are waited out; the ninth gives the instruction up for now, with
+    // no fault, and the root is counted on RDRAND.
+    for (count, healthy) in [(800, true), (900, false)] {
+        let mut world = World::new(1);
+        world
+            .line(0, Instruction::Rdseed)
+            .rules
+            .push(Rule::NotReady { from: 500, count });
+        let root = start_root(&mut world, false);
+        assert!(root.instantiated, "{count}");
+        assert_eq!(root.rdseed == Condition::Healthy, healthy, "{count}");
+        assert_eq!(world.cpus[0].node.faults(Instruction::Rdseed), 0);
+        assert_eq!(world.cpus[0].node.last_fault(Instruction::Rdseed), None);
+        if healthy {
+            assert_eq!(world.tries(0, Instruction::Rdseed), 1024 + 800);
+            assert_eq!(world.cpus[0].node.counts().not_now_rdseed, 8);
+        } else {
+            assert_eq!(world.tries(0, Instruction::Rdseed), 500 + 900);
+            assert_eq!(world.cpus[0].node.counts().not_now_rdseed, 9);
+            assert_eq!(world.root.counted(), Some(Instruction::Rdrand));
+        }
+    }
+
+    // RDRAND's budget is ten, and its "not now" is waited out the same way.
+    for (count, started, tries) in [(9, true, 1028 + 9), (10, true, 1028 + 10), (90, false, 95)] {
+        let mut world = World::reporting(1, false, true);
+        world
+            .line(0, Instruction::Rdrand)
+            .rules
+            .push(Rule::NotReady { from: 5, count });
+        let root = start_root(&mut world, false);
+        assert_eq!(root.instantiated, started, "{count} tries not ready");
+        assert_eq!(world.tries(0, Instruction::Rdrand), tries, "{count}");
+    }
+}
+
+#[test]
+fn a_not_now_among_the_roots_nonce_draws_does_not_cost_the_generator() {
+    // One instruction, so the nonce is four further draws, made straight after its 1,024:
+    // when it is most likely to be dry. One "not now" there is waited out.
+    let mut world = World::reporting(1, true, false);
     world
-        .line(0, Instruction::Rdrand)
+        .line(0, Instruction::Rdseed)
         .rules
-        .push(Rule::NotReady { from: 5, count: 9 });
-    assert!(start_root(&mut world, false).instantiated);
-    let mut world = World::reporting(1, false, true);
-    world
-        .line(0, Instruction::Rdrand)
-        .rules
-        .push(Rule::NotReady { from: 5, count: 10 });
+        .push(Rule::NotReady {
+            from: 1025,
+            count: 100,
+        });
     let root = start_root(&mut world, false);
+    assert!(root.instantiated);
+    assert_eq!(world.given(0, Instruction::Rdseed), 1028);
+    assert_eq!(world.tries(0, Instruction::Rdseed), 1028 + 100);
+    // Dry for nine draws' worth: no root, and nothing of the start stays in the area.
+    let mut world = World::reporting(1, true, false);
+    world
+        .line(0, Instruction::Rdseed)
+        .rules
+        .push(Rule::NotReady {
+            from: 1025,
+            count: 900,
+        });
+    let root = start_root(&mut world, false);
+    assert!(!root.instantiated);
+    assert!(all_zero(&world.cpus[0].area));
+}
+
+#[test]
+fn with_no_root_the_extra_bytes_do_not_stay_in_the_area() {
+    let mut world = World::reporting(1, false, false);
+    seed::extra_slot(&mut world.cpus[0].area)
+        .unwrap()
+        .fill(0x77);
+    let root = start_root(&mut world, true);
+    assert!(!root.instantiated);
     assert!(
-        !root.instantiated,
-        "the only instruction was not ready: no root"
+        all_zero(&world.cpus[0].area),
+        "the caller's 64 bytes are overwritten"
     );
-    assert_eq!(world.tries(0, Instruction::Rdrand), 15);
+    // The same with a failed self-test.
+    let mut world = World::new(1);
+    seed::extra_slot(&mut world.cpus[0].area)
+        .unwrap()
+        .fill(0x77);
+    let root = crate::drive::start_root_after(&mut world, true, false);
+    assert!(!root.instantiated);
+    assert!(all_zero(&world.cpus[0].area));
+}
+
+#[test]
+fn start_up_draws_of_an_instruction_that_has_since_failed_are_not_in_the_seed() {
+    use origin_crypto::HmacDrbgSha512;
+    // Both instructions pass their start-up tests; then RDSEED repeats a value while the
+    // processor gathers for the root, which is due. Its 1,024 draws are "in hand" and go
+    // (R4 item 8): the first seed holds RDRAND's alone.
+    let mut world = World::new(2);
+    assert!(start_root(&mut world, false).instantiated);
+    assert!(start_processor(&mut world).generator);
+    world.now += crate::RESEED_NANOS;
+    world.on = 1;
+    // Processor 1's RDSEED: 1,024 good draws, then one value twice.
+    world.line(1, Instruction::Rdseed).rules.push(Rule::Value {
+        from: 1024,
+        count: 2,
+        value: 0x0123_4567_89AB_CDEF,
+    });
+    let started = start_processor(&mut world);
+    assert!(started.generator);
+    assert_eq!(started.rdseed, Condition::Unhealthy);
+    assert_eq!(started.rdrand, Condition::Healthy);
+    assert_eq!(
+        started.own_regions, 2,
+        "what was collected, before the failure"
+    );
+    // The failure cost the root its reseed (a reseed's eight draws were made, and one was
+    // dropped): no draw is kept, and the next processor to reseed itself reseeds the root.
+    assert_eq!(world.root.counts().reseeds, 0);
+    assert_eq!(world.cpus[1].node.have, 0);
+    assert!(all_zero(&world.cpus[1].node.entropy));
+    assert!(all_zero(&world.cpus[1].area));
+    // What processor 1 must have been seeded from, put together here: 80 bytes of the root's
+    // output, and a personalization string of the label, the index, the time-stamp counter
+    // and RDRAND's 1,024 start-up draws, in the place RDSEED's would have had.
+    let draws = |cpu: u32, which, count: u64| -> Vec<u8> {
+        (0..count)
+            .flat_map(|n| {
+                super::world::splitmix(super::world::seed_of(cpu, which), n).to_le_bytes()
+            })
+            .collect()
+    };
+    let tsc = super::world::TSC.to_le_bytes();
+    let mut root = HmacDrbgSha512::new();
+    let mut label = b"Origin OS random root, 1".to_vec();
+    label.extend_from_slice(&tsc);
+    root.instantiate(
+        &draws(0, Instruction::Rdseed, 1024),
+        &draws(0, Instruction::Rdrand, 1024),
+        &label,
+    )
+    .unwrap();
+    let mut handed = [0u8; 80];
+    root.generate(&mut handed, &[]).unwrap(); // processor 0's
+    root.generate(&mut handed, &[]).unwrap();
+    let personalization = |regions: &[Vec<u8>]| {
+        let mut bytes = b"Origin OS random processor, 1".to_vec();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&tsc);
+        for region in regions {
+            bytes.extend_from_slice(region);
+        }
+        bytes
+    };
+    let first_output = |personalization: &[u8]| {
+        let mut expected = HmacDrbgSha512::new();
+        expected
+            .instantiate(&handed[..64], &handed[64..], personalization)
+            .unwrap();
+        let mut want = [0u8; 64];
+        expected.generate(&mut want, &[]).unwrap();
+        want
+    };
+    let rdseed = draws(1, Instruction::Rdseed, 1024);
+    let rdrand = draws(1, Instruction::Rdrand, 1024);
+    let mut got = [0u8; 64];
+    fill(&mut world, &mut got).unwrap();
+    assert_eq!(
+        got,
+        first_output(&personalization(core::slice::from_ref(&rdrand)))
+    );
+    // Not this: the seed with the failed instruction's draws in it.
+    assert_ne!(got, first_output(&personalization(&[rdseed, rdrand])));
+}
+
+#[test]
+fn a_region_whose_instruction_has_failed_is_emptied_before_a_first_seed() {
+    use crate::seed::{AREA_LEN, HEAD, REGION};
+    // A processor with both regions full, as its start leaves them.
+    let collected = || {
+        let mut world = World::new(1);
+        assert!(start_root(&mut world, false).instantiated);
+        let cpu = &mut world.cpus[0];
+        for (region, byte) in [(0u8, 0xA5u8), (1, 0x5A)] {
+            crate::seed::region(&mut cpu.area, region)
+                .unwrap()
+                .fill(byte);
+        }
+        cpu.node.region0 = crate::STARTUP_DRAWS;
+        cpu.node.region1 = crate::STARTUP_DRAWS;
+        world
+    };
+    let region = |area: &[u8], n: usize| area[HEAD + n * REGION..HEAD + (n + 1) * REGION].to_vec();
+    let fail = |world: &mut World, which| {
+        // A value twice running fails the repetition count test.
+        let cpu = &mut world.cpus[0];
+        let now = 0;
+        let line = match which {
+            Instruction::Rdseed => &mut cpu.rdseed,
+            Instruction::Rdrand => &mut cpu.rdrand,
+        };
+        let at = line.tries;
+        line.rules.push(Rule::Value {
+            from: at,
+            count: 2,
+            value: 0x1357_9BDF_0246_8ACE,
+        });
+        let mut source = super::world::lines(&mut cpu.rdseed, &mut cpu.rdrand);
+        let only = crate::Allow {
+            rdseed: which == Instruction::Rdseed,
+            rdrand: which == Instruction::Rdrand,
+            ..crate::Allow::ALL
+        };
+        let _ = cpu.node.gather_for_root(&mut source, now, only);
+        let _ = cpu.node.gather_for_root(&mut source, now, only);
+        assert!(!cpu.node.is_healthy(which));
+    };
+    // The regions are RDSEED's and RDRAND's.
+    let mut world = collected();
+    world.cpus[0]
+        .node
+        .set_regions_for_tests(Some(Instruction::Rdseed), Some(Instruction::Rdrand));
+    // Nothing has failed: nothing changes.
+    let before = world.cpus[0].area.clone();
+    let cpu = &mut world.cpus[0];
+    cpu.node.settle_regions(&mut cpu.area);
+    assert_eq!(cpu.area, before);
+    assert_eq!((cpu.node.region0, cpu.node.region1), (1024, 1024));
+
+    // Region 0's instruction has failed: region 1's draws take its place, byte for byte, and
+    // region 1 is empty.
+    fail(&mut world, Instruction::Rdseed);
+    let cpu = &mut world.cpus[0];
+    cpu.node.settle_regions(&mut cpu.area);
+    assert_eq!((cpu.node.region0, cpu.node.region1), (1024, 0));
+    assert_eq!(region(&cpu.area, 0), vec![0x5A; REGION]);
+    assert!(all_zero(&region(&cpu.area, 1)));
+    assert_eq!(cpu.area.len(), AREA_LEN);
+    // A root is not started from that: it has no nonce.
+    let mut root = crate::Root::new();
+    assert!(!root.instantiate(&mut cpu.node, &mut cpu.area, 0, 0, false));
+    assert!(all_zero(&cpu.area));
+
+    // Region 1's instruction has failed: it is emptied and region 0 stays.
+    let mut world = collected();
+    world.cpus[0]
+        .node
+        .set_regions_for_tests(Some(Instruction::Rdseed), Some(Instruction::Rdrand));
+    fail(&mut world, Instruction::Rdrand);
+    let cpu = &mut world.cpus[0];
+    cpu.node.settle_regions(&mut cpu.area);
+    assert_eq!((cpu.node.region0, cpu.node.region1), (1024, 0));
+    assert_eq!(region(&cpu.area, 0), vec![0xA5; REGION]);
+    assert!(all_zero(&region(&cpu.area, 1)));
+
+    // Both have failed: nothing is left.
+    fail(&mut world, Instruction::Rdseed);
+    let cpu = &mut world.cpus[0];
+    cpu.node.settle_regions(&mut cpu.area);
+    assert_eq!((cpu.node.region0, cpu.node.region1), (0, 0));
+    assert!(all_zero(&cpu.area[HEAD..]));
+
+    // A root does the same before it takes its first seed. With either instruction failed
+    // since its draws were collected, the other's alone are not an entropy input and a
+    // nonce: there is no root, and nothing stays in the area.
+    for failed in Instruction::BOTH {
+        let mut world = collected();
+        world.cpus[0]
+            .node
+            .set_regions_for_tests(Some(Instruction::Rdseed), Some(Instruction::Rdrand));
+        fail(&mut world, failed);
+        let cpu = &mut world.cpus[0];
+        let mut root = crate::Root::new();
+        assert!(!root.instantiate(&mut cpu.node, &mut cpu.area, 0, 0, false));
+        assert!(!root.is_instantiated());
+        assert!(all_zero(&cpu.area));
+    }
+}
+
+#[test]
+fn uninstantiating_a_processor_clears_its_store() {
+    let mut world = World::reporting(1, true, false);
+    world.boot();
+    // Three draws of a reseed are in the store when RDSEED goes dry.
+    let tried = world.tries(0, Instruction::Rdseed);
+    world
+        .line(0, Instruction::Rdseed)
+        .rules
+        .push(Rule::NotReady {
+            from: tried + 3,
+            count: 100,
+        });
+    world.now += crate::RESEED_NANOS;
+    next_u64(&mut world).unwrap();
+    assert_eq!(world.cpus[0].node.have, 3);
+    assert!(!all_zero(&world.cpus[0].node.entropy));
+    world.cpus[0].node.uninstantiate();
+    assert_eq!(world.cpus[0].node.have, 0);
+    assert!(all_zero(&world.cpus[0].node.entropy));
+    assert!(all_zero(&world.cpus[0].node.aside));
+    assert!(!world.cpus[0].node.has_generator());
+    assert_eq!(next_u64(&mut world), Err(Error::NoGenerator));
+}
+
+#[test]
+fn a_failed_rdseed_takes_the_draws_set_aside_with_it() {
+    let mut world = World::new(1);
+    world.boot();
+    let node = &mut world.cpus[0].node;
+    // RDRAND has taken a reseed over, with three RDSEED draws set aside.
+    node.from = Instruction::Rdrand;
+    node.have = 2;
+    node.entropy = [0x11; 64];
+    node.aside = [0x22; 80];
+    node.aside_have = 3;
+    // RDRAND failing drops its own draws and leaves RDSEED's.
+    node.drop_draws(Instruction::Rdrand);
+    assert_eq!((node.have, node.aside_have), (0, 3));
+    assert!(all_zero(&node.entropy));
+    assert!(!all_zero(&node.aside));
+    // RDSEED failing drops what was set aside.
+    node.drop_draws(Instruction::Rdseed);
+    assert_eq!(node.aside_have, 0);
+    assert!(all_zero(&node.aside));
 }
 
 #[test]
@@ -451,10 +754,11 @@ fn the_root_gives_nothing_fresh_from_rdrand_draws() {
     node.from = Instruction::Rdrand;
     node.entropy = [0x42; 64];
     let mut out = [0xEE; 16];
+    let epoch = world.cpus[0].node.fresh_epoch();
     assert_eq!(
         world
             .root
-            .fresh_piece(&mut world.cpus[0].node, &mut out, 0, 0),
+            .fresh_piece(&mut world.cpus[0].node, &mut out, 0, 0, epoch),
         Answer::NotGathered
     );
     assert_eq!(out, [0xEE; 16], "nothing was written");

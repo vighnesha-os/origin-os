@@ -97,14 +97,17 @@ def scenario_a():
     yield "a.cpu0", cpu0.generate(64, b"")
     yield "a.cpu1", cpu1.generate(64, b"")
     yield "a.cpu2", cpu2.generate(64, b"")
-    # Sixty seconds on: processor 0 reseeds from eight draws of its RDSEED.
+    # Sixty seconds on: processor 0 reseeds from eight draws of its RDSEED. The root is due
+    # as well (R6: the same schedule), and the processor that has just reseeded itself
+    # reseeds it from eight more.
     cpu0.reseed(s0.draws(8), stamp(0))
+    root.reseed(s0.draws(8), stamp(0))
     yield "a.cpu0.reseeded", cpu0.generate(64, b"")
     # Processor 2 has no instruction: it reseeds from 64 bytes of the root's output.
     cpu2.reseed(root.generate(64, b""), stamp(2))
     yield "a.cpu2.reseeded", cpu2.generate(64, b"")
     # Prediction resistance on processor 1: the root is reseeded from eight RDSEED draws of
-    # that processor, then generates.
+    # that processor, all made inside the request, then generates.
     root.reseed(s1.draws(8), stamp(1))
     yield "a.fresh", root.generate(64, b"")
 

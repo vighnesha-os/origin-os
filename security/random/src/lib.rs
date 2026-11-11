@@ -60,8 +60,8 @@ pub use drive::{
 };
 pub use health::{Condition, Fault, Health, Offer, STARTUP_DRAWS, WINDOW};
 pub use node::{
-    Allow, Counts, Instruction, Maint, Node, PIECE, Piece, Purpose, RESEED_DRAWS, RESEED_NANOS,
-    RESEED_REQUESTS, REST_NANOS, Source, Try,
+    Allow, Counts, Fresh, Instruction, Maint, Node, PIECE, Piece, Purpose, RESEED_DRAWS,
+    RESEED_NANOS, RESEED_REQUESTS, REST_NANOS, Source, Try,
 };
 pub use root::{Answer, Root, RootCounts};
 pub use selftest::run as self_test;

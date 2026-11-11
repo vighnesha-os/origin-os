@@ -92,6 +92,11 @@ struct Lines<'a> {
     rdrand: &'a mut Line,
 }
 
+/// A processor's two instructions as a [`Source`], for a test that drives a step by hand.
+pub(crate) fn lines<'a>(rdseed: &'a mut Line, rdrand: &'a mut Line) -> impl Source + 'a {
+    Lines { rdseed, rdrand }
+}
+
 impl Source for Lines<'_> {
     fn reports(&self, which: Instruction) -> bool {
         match which {
@@ -124,6 +129,10 @@ pub(crate) struct World {
     pub(crate) pauses: u64,
     /// How many more times the root's lock is found taken.
     pub(crate) root_busy: u32,
+    /// Times the root's lock has been asked for.
+    pub(crate) root_asks: u64,
+    /// The asks (counted from 1) at which the lock is found taken.
+    pub(crate) root_taken_at: Vec<u64>,
     /// Whether a step is "already running" on the caller's processor.
     pub(crate) node_busy: bool,
     /// Where the caller is after step `n` (counted from 1), if it moves.
@@ -166,6 +175,8 @@ impl World {
             root_steps: 0,
             pauses: 0,
             root_busy: 0,
+            root_asks: 0,
+            root_taken_at: Vec::new(),
             node_busy: false,
             mover: None,
         }
@@ -242,6 +253,10 @@ impl Platform for World {
     fn root_step(&mut self, step: &mut dyn FnMut(&mut Ctx<'_>, &mut Root)) -> Result<(), Busy> {
         if self.node_busy {
             return Err(Busy::Node);
+        }
+        self.root_asks += 1;
+        if self.root_taken_at.contains(&self.root_asks) {
+            return Err(Busy::Root);
         }
         if self.root_busy != 0 {
             self.root_busy -= 1;
