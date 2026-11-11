@@ -2626,7 +2626,7 @@ An addition to the entry above, from the same session on the same branch. The ow
 
 - **Module:** `boot/info/src/lib.rs` (`BOOT_SECRET_LEN`, `BOOT_STACK_VALUE_LEN`; `boot_seed()` checks 72 bytes); `boot/uefi/src/main.rs` (the third request); `framekernel/frame/src/random.rs` (`take_stack_value`, `stack_value`, the 72-byte overwrite; `finish_start` takes its lock); `framekernel/src/kernel.rs` (`prove_stack_value`); the boot test's markers.
 - **Specifications:** none new. The value is 64 bits of the loader's HMAC_DRBG output, read through the direct map.
-- **Test evidence:** the host test of where the area may lie, with the boundaries moved to 72 bytes and two cases where the seed would fit and the value would not; the boots and gates the task's result names for this commit. A boot says the value was "taken here, once, and a second take was refused", and the proof fails if a take succeeds after the generator's start.
+- **Test evidence:** the host test of where the area may lie, with the boundaries moved to 72 bytes and two cases where the seed would fit and the value would not; and the gates: `cargo xtask check` passed on `396e9e2` (2026-11-11, 11:41 to 11:46, a clean tree before and after), whose code is `8fbd8e9`, and `cargo xtask boot-matrix` passed on it (11:46 to 12:14): `boot-test`'s 11 scenarios under both IOMMUs with 1, 2 and 4 processors, the sparse, bridge and legacy-free machines, both `boot-random` machines and the 9 console scenarios. A boot says the value was "taken here, once, and a second take was refused", and the proof fails if a take succeeds after the generator's start.
 - **Not done:** nothing uses the value on this branch. `stack::draw_region` on the next batch becomes its caller.
 
 ## `developer-tools/xtask/` (`xtask`)

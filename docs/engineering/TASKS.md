@@ -387,4 +387,6 @@ Written 2026-11-11, before any of it was built. It is the second half of item 18
 - the kernel overwrites and reads back all 72 bytes, and a boot proof takes the value once, is refused a second time, and is refused again after the start;
 - `finish_start` takes its lock outright, where it tried it and went on silently if it failed (a review point from the coordinating session; nothing contended for the lock).
 
+**Gates on this addition:** `cargo xtask check` passed on `396e9e2` (2026-11-11, 11:41 to 11:46, a clean tree before and after), whose code is `8fbd8e9`, and `cargo xtask boot-matrix` passed on it (11:46 to 12:14): `boot-test`'s 11 scenarios under both IOMMUs with 1, 2 and 4 processors, the sparse, bridge and legacy-free machines, both `boot-random` machines and the 9 console scenarios. Every boot is QEMU's software processor.
+
 The stack region is not on this branch, so nothing here uses the value: the boot takes it to prove the hand-over and drops it. On the next batch `stack::draw_region` becomes its caller, and the boot's line then reads "taken once before this point". **18b lands through pull request 16** (decision item 167, recorded by that batch's lander).
