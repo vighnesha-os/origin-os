@@ -2955,6 +2955,7 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
     - 32. `memory_protect` compares the access with what the mapping allows before it asks for the mapping: the third verdict is `false`; the first and second stay `true`.
   - *What no boot shows:* either order in ring 3. No ring-3 program of the proof fills a space's page tables, and none races a protect against another call: the proof holds the record itself, through the calls the system calls make. The start record's pages under such a run rest on the reading in the entry before this one.
   - *`unsafe`:* none added. The gate's count is unchanged.
+  - *In the batch:* fast-forwarded into `land/s3-part2` on 2026-11-11 (`4990564`, the four commits on `1665b58`), after the coordinating session read the whole change: the proof, xtask's expected line and records, with no kernel or framework code. Run again by that session on `4990564`'s tree, clean before and after: `cargo xtask check` passes (1367 host tests, 0 failed, 10 ignored; the gates; all 42 Loom models and all 68 negative controls) and `cargo xtask boot-test` passes 11 of 11. The kernel boot's log holds the line with its three verdicts `true`, among the memory proof's thirteen, and ends "degraded: 60 of 61 proofs passed; failed: speculation controls" (item 154). Controls 30 to 32 were not repeated when landing; they stand as their author reports them. QEMU (TCG) with OVMF on an M1 Max.
 - **Licensing:** MIT OR Apache-2.0.
 
 ## Pre-merge review fixes (2026-11-09)
