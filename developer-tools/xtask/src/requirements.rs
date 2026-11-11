@@ -1704,13 +1704,14 @@ fn problems(sources: &Sources<'_>, tree: &dyn Tree) -> (Vec<String>, Figure) {
     let unnamed: Vec<String> = answered
         .iter()
         .filter(|item| !named.contains(item) && !nothing.contains(item) && !owed.contains(item))
-        .map(|item| {
-            format!(
-                "decision item {item} is answered, and no row names it: name it in the last cell of the row it decided, or list it in the README's table of items without rows"
-            )
-        })
+        .map(u32::to_string)
         .collect();
-    listed(&mut problems, unnamed);
+    if !unnamed.is_empty() {
+        problems.push(format!(
+            "answered decision items that no row names and the README does not list: {}. Name each in the last cell of the row it decided, or list it in the README's table of items without rows",
+            unnamed.join(", ")
+        ));
+    }
 
     // Scope changes: their items are answered, their rows exist, and they name every removed row.
     let touches = |change: &Change, id: &str| {
@@ -2816,7 +2817,7 @@ The owner accepted both:
             "| Taken out of scope. | - |",
         );
         case.refused("row S3-05: a removed row names the decision item that took it out of scope");
-        case.refused("decision item 2 is answered, and no row names it");
+        case.refused("answered decision items that no row names and the README does not list: 2.");
         // With no scope change that names it.
         let mut unrecorded = Case::sound();
         unrecorded.readme = once(
@@ -2941,7 +2942,9 @@ The owner accepted both:
                 "| person:Ada | - | 1 |",
                 "| person:Ada | - | - |",
             )
-            .refused_once("decision item 1 is answered, and no row names it");
+            .refused_once(
+                "answered decision items that no row names and the README does not list: 1.",
+            );
         // A row names an item the sheet does not hold as answered.
         Case::sound()
             .edit("adr-0001.md", "| - | 1 |", "| - | 1, 4 |")
@@ -2970,7 +2973,7 @@ The owner accepted both:
             (
                 "| 3 | none | A process rule. |\n",
                 "",
-                "decision item 3 is answered, and no row names it",
+                "answered decision items that no row names and the README does not list: 3.",
             ),
         ] {
             let mut case = Case::sound();
@@ -2983,6 +2986,47 @@ The owner accepted both:
         let (found, figure) = owed.judged();
         assert_eq!(found, Vec::<String>::new());
         assert_eq!((figure.items_nothing, figure.items_owed), (0, 1));
+    }
+
+    #[test]
+    fn unnamed_items_are_one_problem() {
+        let mut case = Case::sound()
+            .edit("adr-0001.md", "| - | 1 |", "| - | - |")
+            .edit(
+                "directive-02-build.md",
+                "| person:Ada | - | 1 |",
+                "| person:Ada | - | - |",
+            );
+        case.readme = once(README_TEXT, "| 3 | none | A process rule. |\n", "");
+        case.refused_once(
+            "answered decision items that no row names and the README does not list: 1, 3.",
+        );
+    }
+
+    /// The matrix in this checkout: what `cargo xtask check` runs, as a test of its own.
+    #[test]
+    fn the_matrix_in_this_tree_passes() {
+        let read = read().expect("the matrix and its sources");
+        let sources = Sources {
+            directive: &read.directive,
+            adrs: &read.adrs,
+            sheet: &read.sheet,
+            readme: &read.readme,
+            files: &read.files,
+        };
+        let (found, figure) = problems(&sources, &Disk(repo_root()));
+        assert_eq!(found, Vec::<String>::new());
+        assert_eq!(figure.rows, figure.statements + figure.decisions);
+        assert!(
+            figure.statements > 1000 && figure.decisions > 200,
+            "{figure:?}"
+        );
+        // Nothing has run on a physical machine, and no person has reviewed anything: when
+        // either changes, this line changes with the record that shows it.
+        assert_eq!(
+            (figure.ran[Env::Hardware as usize], figure.by_person),
+            (0, 0)
+        );
     }
 
     #[test]

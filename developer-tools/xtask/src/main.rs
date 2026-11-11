@@ -74,7 +74,8 @@ commands:
               (part of check; quick)
   requirements-gate only the gate on the requirements matrix under docs/requirements/: a row
               for every statement of CLAUDE.md and every decision of an accepted ADR, each
-              true to the tree; prints the coverage figure (CLAUDE.md §1; quick)
+              true to the tree; prints the coverage figure (part of check; CLAUDE.md §1;
+              quick)
   regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
   image-gate [kernel ELF]
               only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
@@ -2772,6 +2773,7 @@ fn check() -> Result {
     dependency_check()?;
     linux_cfg_lint()?;
     documents::gate()?;
+    requirements::gate()?;
     unsafety::gate()?;
     interfaces::gate()?;
     manifest_version_lint()?;
