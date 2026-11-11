@@ -1,6 +1,6 @@
 # The requirements matrix
 
-CLAUDE.md §1 makes 100% coverage of approved requirements the completion target, "measured against a versioned requirements matrix". This directory is that matrix. The owner decided its shape on 2026-11-12 (decision items 191 to 196, and items 221 and 222 for two things that building it added), and `cargo xtask requirements-gate`, which is part of `cargo xtask check`, holds it to the rules on this page.
+CLAUDE.md §1 makes 100% coverage of approved requirements the completion target, "measured against a versioned requirements matrix". This directory is that matrix. The owner decided its shape on 2026-11-12 (decision items 191 to 196, and items 221 to 223 for three things that building it added), and `cargo xtask requirements-gate`, which is part of `cargo xtask check`, holds it to the rules on this page.
 
 | | |
 |---|---|
@@ -25,7 +25,7 @@ A lead-in is a paragraph that ends with a colon. It is joined in front of each i
 
 **A decision of an ADR** is a heading `### X1. Title` or `## Decision N: title`, a paragraph `**X1. Title.**` under "Decisions", a row `| X1 | … |` of a table with a `#` column and a "Decision" column, a numbered item under "Approved defaults", or an amendment that holds none of these. Only an ADR whose status is Accepted is read.
 
-A row quotes what it stands for. A statement is quoted whole, so a change to it anywhere is seen. A decision is quoted by its title: its heading, its question, its leading bold phrase or its first sentence. The gate fails when a statement or a decision has no row, and when a row quotes what its source no longer says.
+A row quotes what it stands for. A statement is quoted whole, so a change to it anywhere is seen. A decision is quoted by its title (item 223): its heading, its question, its leading bold phrase or its first sentence. The gate fails when a statement or a decision has no row, and when a row quotes what its source no longer says.
 
 The specifications, the threat models and ADR-0013's list of boot proofs are cited by rows and are not split into rows. Neither are the decision sheet's items: rows name them (see "Decision items").
 
@@ -186,7 +186,7 @@ It does not check:
 - whether an owner, a scope, a kind, acceptance criteria or a state is the right judgement. The figure moves with the kind and the state, and there it rests on review that has not happened: the lists above make such a change a second, visible edit, and no more;
 - whether a row's criterion is its own: most are shared (see "Acceptance criteria");
 - whether evidence passes, where it ran, beyond a hardware record's form, and who reviewed a row;
-- whether the body of an ADR's decision changed under an unchanged title.
+- whether the body of an ADR's decision changed under an unchanged title. The owner accepted this limit as decision item 223: whoever changes an ADR's decision brings its row up to date by hand.
 
 ## Changing the matrix
 
