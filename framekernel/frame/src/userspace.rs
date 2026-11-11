@@ -928,6 +928,10 @@ impl UserSpace {
         access: Access,
     ) -> Result<(), ChangeError> {
         let end = user_range_end(base, frames.len() as u64)?;
+        // The address may be a program's, whoever the caller is: it stays in the user half on
+        // a path where the processor guessed the check wrong, too (ADR-0017 Z9). After the
+        // check it is unchanged. The run's tables are walked and filled by it.
+        let base = crate::nospec::user_address(base);
         if frames.is_empty() {
             return Ok(());
         }
@@ -975,6 +979,9 @@ impl UserSpace {
     ///   unmapped all the same; the frames taken out after the stall are leaked.
     pub fn unmap(&self, virt: u64, pages: u64) -> Result<Change, ChangeError> {
         let end = user_range_end(virt, pages)?;
+        // As in `map_shared_run`, whatever the caller (Z9): here it is compared with the
+        // space's records rather than walked, and kept in the user half all the same.
+        let virt = crate::nospec::user_address(virt);
         let _turn = self.edit();
         self.unmap_range(virt, end)
     }
@@ -1020,6 +1027,8 @@ impl UserSpace {
     ///   its new permissions all the same; the old ones stay counted until a later flush.
     pub fn protect(&self, virt: u64, pages: u64, access: Access) -> Result<Change, ChangeError> {
         let end = user_range_end(virt, pages)?;
+        // As in `unmap` (Z9).
+        let virt = crate::nospec::user_address(virt);
         let _turn = self.edit();
         let mut reprotecting = Reprotecting {
             space: self,
@@ -1168,7 +1177,14 @@ impl UserSpace {
             return Err(Error::Fault);
         }
         let range = UserRange::new(addr, len)?;
-        usercopy::check_mapped(&range, access, |page| self.translate(page))?;
+        // The walk of this space's tables goes by a program's address, so each page it visits
+        // stays in the user half on a path where the processor guessed `UserRange::new`'s check
+        // wrong (ADR-0017 Z9). After the check every page is unchanged. With the mask, such a
+        // path walks address 0: this space's own lower-half entries, which the program's own
+        // accesses walk anyway.
+        usercopy::check_mapped(&range, access, |page| {
+            self.translate(crate::nospec::user_address(page))
+        })?;
         Ok(range)
     }
 }
