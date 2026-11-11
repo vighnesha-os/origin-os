@@ -253,7 +253,10 @@ fn collect(
             (ctx.index, outcome)
         })?;
         match outcome {
-            Try::Stored | Try::Completed => {}
+            // The draw arrived: the next one has all its tries.
+            Try::Stored | Try::Completed => {
+                tries.note(on, which, outcome);
+            }
             // Nothing more is wanted: the region is full, or the instruction is not one that
             // may be drawn from.
             Try::Unwanted => {
@@ -616,7 +619,10 @@ fn fresh_piece(platform: &mut dyn Platform, out: &mut [u8]) -> Result<(), Error>
             return Err(Error::NotNow);
         };
         match outcome {
-            Try::Stored | Try::Completed => {}
+            // The draw arrived: the next one has all its tries.
+            Try::Stored | Try::Completed => {
+                tries.note(on, Instruction::Rdseed, outcome);
+            }
             Try::Failed => return Err(Error::NotNow),
             // The store holds the eight draws.
             Try::Unwanted => {

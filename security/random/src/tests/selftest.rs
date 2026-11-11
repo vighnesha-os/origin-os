@@ -1,7 +1,7 @@
 //! The known-answer self-test: its constants are NIST's, and a wrong one fails it.
 
 use crate::kat::VECTORS;
-use crate::selftest::{Step, Vector, passes};
+use crate::selftest::{Step, Vector, all_pass, passes};
 
 const NIST: &str = include_str!("../../../crypto/tests/vectors/acvp/hmac-drbg-sha2-512.txt");
 
@@ -141,4 +141,21 @@ fn a_wrong_constant_fails_the_self_test() {
         steps: VECTORS[0].steps,
     };
     assert!(!passes(&short));
+}
+
+#[test]
+fn every_vector_is_run() {
+    let whole = |vector: &Vector| Vector {
+        tc: vector.tc,
+        entropy: vector.entropy,
+        nonce: vector.nonce,
+        personalization: vector.personalization,
+        steps: vector.steps,
+        answer: vector.answer,
+    };
+    assert!(all_pass(&[whole(&VECTORS[0]), whole(&VECTORS[1])]));
+    // A wrong answer in either place fails the whole test.
+    assert!(!all_pass(&[corrupted(&VECTORS[0], 3), whole(&VECTORS[1])]));
+    assert!(!all_pass(&[whole(&VECTORS[0]), corrupted(&VECTORS[1], 3)]));
+    assert!(all_pass(&[]));
 }

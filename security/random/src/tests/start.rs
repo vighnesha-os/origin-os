@@ -195,6 +195,18 @@ fn not_ready_for_99_tries_is_a_draw_and_for_100_is_not_now() {
     assert_eq!(world.pauses, 99);
     assert_eq!(world.cpus[0].node.counts().not_now_rdseed, 0);
 
+    // Two draws that each wait sixty tries: each has its own hundred.
+    let mut world = World::new(1);
+    for from in [300, 700] {
+        world
+            .line(0, Instruction::Rdseed)
+            .rules
+            .push(Rule::NotReady { from, count: 60 });
+    }
+    let root = start_root(&mut world, false);
+    assert_eq!(root.rdseed, Condition::Healthy);
+    assert_eq!(world.tries(0, Instruction::Rdseed), 1024 + 120);
+
     // 100 tries not ready: "not now". At a start that leaves the instruction out, with no
     // fault, and the root is counted on RDRAND.
     let mut world = World::new(1);

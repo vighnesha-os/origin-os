@@ -47,7 +47,12 @@ const ANSWER_LEN: usize = 512;
 /// Runs the self-test. `true` only if every vector gives NIST's answer and every refusal is
 /// made.
 pub fn run() -> bool {
-    VECTORS.iter().all(passes) && refuses()
+    all_pass(&VECTORS) && refuses()
+}
+
+/// Whether the generator gives the answer of every one of `vectors`.
+pub(crate) fn all_pass(vectors: &[Vector]) -> bool {
+    vectors.iter().all(passes)
 }
 
 /// Whether the generator gives `vector`'s answer.

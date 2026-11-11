@@ -3,7 +3,8 @@
 
 use super::world::{Rule, World};
 use crate::{
-    Condition, Error, Instruction, RESEED_NANOS, RESEED_REQUESTS, REST_NANOS, fill_fresh, next_u64,
+    Allow, Condition, Error, Instruction, Maint, PIECE, RESEED_DRAWS, RESEED_NANOS,
+    RESEED_REQUESTS, REST_NANOS, fill_fresh, next_u64,
 };
 
 use Instruction::{Rdrand, Rdseed};
@@ -403,4 +404,71 @@ fn fresh_requests_reseed_the_root_every_piece() {
     let tried = world.tries(0, Rdseed);
     fill_fresh(&mut world, &mut out).unwrap();
     assert_eq!(world.tries(0, Rdseed) - tried, 6);
+}
+
+#[test]
+fn the_figures_are_the_adrs() {
+    // ADR-0016 R4, R6 and R7, and TASKS 18b S3: a change to any of these is a change to them.
+    assert_eq!(Rdseed.tries(), 100);
+    assert_eq!(Rdrand.tries(), 10);
+    assert_eq!(RESEED_DRAWS, 8);
+    assert_eq!(RESEED_REQUESTS, 1 << 20);
+    assert_eq!(RESEED_NANOS, 60_000_000_000);
+    assert_eq!(REST_NANOS, 1_000_000_000);
+    assert_eq!(PIECE, 128);
+    assert_eq!((Rdseed.name(), Rdrand.name()), ("RDSEED", "RDRAND"));
+}
+
+#[test]
+fn a_test_does_not_begin_again_unless_a_reseed_is_due() {
+    let mut world = World::new(1);
+    world.line(0, Rdseed).rules.push(Rule::Bit {
+        from: 0,
+        bit: 9,
+        set: true,
+    });
+    world.boot();
+    assert_eq!(world.cpus[0].node.condition(Rdseed), Condition::Unhealthy);
+    // A minute after the failure the test may begin again, but only when a reseed is due.
+    // This generator was reseeded a moment ago (set by hand), so maintenance does nothing.
+    world.now += RESEED_NANOS;
+    world.cpus[0].node.seeded_at = world.now;
+    assert!(!world.cpus[0].node.due(world.now));
+    let tried = world.tries(0, Rdseed);
+    let now = world.now;
+    let cpu = &mut world.cpus[0];
+    struct Never;
+    impl crate::Source for Never {
+        fn reports(&self, _: Instruction) -> bool {
+            true
+        }
+        fn try_once(&mut self, _: Instruction) -> Option<u64> {
+            panic!("no instruction is to be tried")
+        }
+    }
+    assert_eq!(
+        cpu.node.maintain(&mut Never, now, 0, Allow::ALL),
+        Maint::Idle
+    );
+    assert_eq!(cpu.node.condition(Rdseed), Condition::Unhealthy);
+    assert_eq!(world.tries(0, Rdseed), tried);
+    assert_eq!(world.cpus[0].node.counts().retests, 0);
+}
+
+#[test]
+fn every_draw_of_a_fresh_request_has_its_own_tries() {
+    let mut world = World::new(1);
+    world.boot();
+    let tried = world.tries(0, Rdseed);
+    // The second and the fourth of the eight draws wait sixty tries each.
+    for from in [tried + 1, tried + 63] {
+        world
+            .line(0, Rdseed)
+            .rules
+            .push(Rule::NotReady { from, count: 60 });
+    }
+    let mut out = [0u8; 16];
+    fill_fresh(&mut world, &mut out).unwrap();
+    assert_eq!(world.tries(0, Rdseed) - tried, 8 + 120);
+    assert_eq!(world.cpus[0].node.counts().not_now_rdseed, 0);
 }

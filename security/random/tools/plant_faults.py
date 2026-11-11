@@ -13,7 +13,7 @@ happens, and the tests are run once more at the end on the restored tree.
 Host-only engineering tool; nothing here ships. It edits the working tree while it runs, so
 run nothing else in the checkout meanwhile.
 
-Usage: python3 -I security/random/tools/plant_faults.py <repository root>
+Usage: python3 -I security/random/tools/plant_faults.py <repository root> [part of a fault's name]
 """
 
 import re
@@ -21,9 +21,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-if len(sys.argv) != 2:
+if len(sys.argv) not in (2, 3):
     sys.exit(__doc__)
 ROOT = Path(sys.argv[1])
+# An optional second argument runs only the faults whose name holds it.
+ONLY = sys.argv[2] if len(sys.argv) == 3 else ""
 SRC = ROOT / "security/random/src"
 H, N, R, D, S, T = "health.rs", "node.rs", "root.rs", "drive.rs", "seed.rs", "selftest.rs"
 
@@ -98,11 +100,14 @@ FAULTS = [
  ("drive: a start-up test that is not ready stays running", [(D, "                        if !failed && testing {\n                            ctx.node.abandon_test(which);\n                        }\n", "")]),
  ("drive: no pause between tries", [(D, "                    return Ok(Collected::Without);\n                }\n                platform.pause();", "                    return Ok(Collected::Without);\n                }")]),
  ("drive: the count of tries is not started again for a new draw", [(D, "            Try::Stored | Try::Completed | Try::Failed | Try::Unwanted => {\n                self.of = None;\n                None\n            }", "            Try::Stored | Try::Completed | Try::Failed | Try::Unwanted => None,")]),
- ("drive: a full store is asked for fresh output without the root being told", [(D, "                let answer = in_root_step(platform, |ctx, root| {\n                    root.account(ctx.node);\n                    root.fresh_piece(ctx.node, out, ctx.now, ctx.tsc)", "                let answer = in_root_step(platform, |ctx, root| {\n                    root.fresh_piece(ctx.node, out, ctx.now, ctx.tsc)")]),
  # The self-test.
  ("selftest: the answer is not compared", [(T, "    difference == 0 && !drbg.is_instantiated()", "    !drbg.is_instantiated()")]),
  ("selftest: only the first step is run", [(T, "    for step in vector.steps {\n        let done", "    for step in vector.steps.iter().take(1) {\n        let done")]),
- ("selftest: only the first vector is run", [(T, "    VECTORS.iter().all(passes) && refuses()", "    VECTORS.iter().take(1).all(passes) && refuses()")]),
+ ("selftest: only the first vector is run", [(T, "    vectors.iter().all(passes)", "    vectors.iter().take(1).all(passes)")]),
+ # Not observable, and listed to say so: the root is told of a change of health by the
+ # maintenance of the request that saw it, so telling it again before a fresh request changes
+ # nothing a test can see.
+ ("drive: the root is not told again before a fresh request (not observable)", [(D, "                let answer = in_root_step(platform, |ctx, root| {\n                    root.account(ctx.node);\n                    root.fresh_piece(ctx.node, out, ctx.now, ctx.tsc)", "                let answer = in_root_step(platform, |ctx, root| {\n                    root.fresh_piece(ctx.node, out, ctx.now, ctx.tsc)")]),
 ]
 
 
@@ -126,6 +131,8 @@ try:
     caught = 0
     missed = []
     for n, (name, edits) in enumerate(FAULTS, 1):
+        if ONLY not in name:
+            continue
         try:
             for f, old, new in edits:
                 text = (SRC / f).read_text()
