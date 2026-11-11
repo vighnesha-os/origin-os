@@ -52,7 +52,7 @@ Each is a recommendation. The words in quotation marks are proposed additions to
 
 ### 1. A role for original source, provenance and licensing
 
-The directive gives this a priority (P4), a whole part (§3–§7), an agent (§77, 25), a step of every task (§83, 17) and three final rules (2, 3, 27). Decision items 91–97, 121 and 122 add the rules for reading Linux and other open-source code. In the roles it is four words of role 2: "and original-source policy". Roles 25, 27, 31 and 47 hold provenance and licences for builds, specifications, artifacts and firmware, and none holds them for the source.
+The directive gives this a priority (P4), a whole part (§3–§7), an agent (§77, 25), a step of every task (§83, 17) and three final rules (2, 3, 27). Decision items 91–97, 121 and 122 add the rules for reading Linux and other open-source code. In the roles it is one phrase of role 2: "and original-source policy". Roles 25, 27, 31 and 47 hold provenance and licences for builds, specifications, artifacts and firmware, and none holds them for the source.
 
 > 51. Original-Source, Provenance, and Licensing Lead. Own the original-source policy, source provenance records, the rules for reading reference code, licence compatibility, third-party notices, runtime-dependency exceptions, and contribution sign-off. Keep the reading of reference code apart from the writing of Origin code, record every source consulted, and check similarity before publication.
 
@@ -64,7 +64,7 @@ P5 names NPUs. §37 is a section, §77 has an agent for it (14), §49 lists Comp
 
 ### 3. Role 19: the SDK-only rule's enforcement
 
-Role 19 owns coverage: every device standard and management operation has an SDK interface backed by a real service. It does not hold the other half of §48: that no first-party client has another way in. That half is P3, final rules 10 and 11, ADR-0011 and its Amendment 1 (decision item 108).
+Role 19 owns coverage: every device standard and management operation has an SDK interface backed by a real service. It does not hold the other half of §48: that no first-party client has another way in. That half is final rule 11, ADR-0011 and its Amendment 1 (decision item 108).
 
 > Add to role 19: Enforce the SDK-only rule for every first-party client: no hidden shell commands, no launching of another program to do a client's work, and no parsing of another program's text output.
 
@@ -147,7 +147,7 @@ The reading proposed, with no change to the text: each role defines them for the
 
 ### 11. §77: point to §1
 
-§77 still lists 26 agents. The second closing paragraph already separates the two ideas: roles are responsibilities, and tasks are assigned by source ownership, independence, resources and integration needs. With proposals 1 and 7 in, every agent of §77 has a role, and the list only repeats §1 in fewer words, with a different count.
+§77 still lists 26 agents. The second closing paragraph already separates the two ideas: roles are responsibilities, and tasks are assigned by source ownership, independence, resources and integration needs. With proposals 1, 2 and 7 in, every agent of §77 has a role, and the list only repeats §1 in fewer words, with a different count.
 
 > Replace §77's list with: The specialist roles and their responsibilities are in §1. Agents are given bounded tasks from them, as §1 and §78 say.
 
