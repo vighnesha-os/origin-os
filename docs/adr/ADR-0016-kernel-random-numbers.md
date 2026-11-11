@@ -225,6 +225,8 @@ The contract of task 18b in `docs/engineering/TASKS.md` has the detail, as S1 to
 
 **Left to other tasks:** the firmware's protocol (above); two draws on `land/s3-part2` (read at `e9eae13` on 2026-11-11). `framekernel/src/memory_object.rs` places a mapping through `entropy::hardware_u64`, which becomes `origin_frame::random::next_u64`. `framekernel/frame/src/stack.rs` draws the stack region's base through `cpu::rdseed` and `cpu::rdrand`, and that is not a change of one call: `early.rs` draws it where the kernel's tables are made, before the heap and the clock, so before the kernel's generator exists. The owner decided how on 2026-11-11 (decision item 166; ADR-0016 Amendment 1): the loader's generator makes a third 8-byte request and hands the value over directly after its seed, and `draw_region` takes it through `origin_frame::random::take_stack_value`, which this branch provides and proves. `framekernel/src/stacks.rs` does not draw: its proof reads which instruction the framework drew from, and changes with it; neither compiles against this tree as it stands; reseeding on resume and on a restored snapshot (R6, T10); an interface for programs (R11); everything on hardware. *(2026-11-11: the two draws are converted in that batch's merge of this task, `c2245ef`. The firmware's protocol is still not built.)*
 
+**Note, 2026-11-11.** Both draws named above were changed by task 18b, which is in the second step-3 batch (`land/s3-part2`, merge `c2245ef`): a mapping's place comes from `origin_frame::random::next_u64` and the stack region's base from `take_stack_value`. The firmware's protocol (18c) is still left.
+
 ## Evidence
 
 Only R1's mechanism is built, so only it has evidence. The detail is in `SOURCE_PROVENANCE.md`.
