@@ -74,6 +74,7 @@
 //! - [`pci`]: the MCFG, ECAM addressing, configuration headers, enumeration and BAR
 //!   sizing over an abstract configuration space;
 //! - [`ps2`]: PS/2 set-1 scancode decoding and the US keyboard layout;
+//! - [`quota`]: count quotas a process's creator sets (ADR-0005 P11);
 //! - [`raster`]: a 2D software rasterizer (fills, blits, alpha blend) for the UI;
 //! - [`runqueue`]: the per-CPU round-robin run queue (scheduler policy);
 //! - [`semver`]: semantic-version parsing and precedence (package dependency resolution);
@@ -134,6 +135,7 @@ pub use origin_frame::{
 };
 pub use origin_paging as paging;
 pub mod ps2;
+pub mod quota;
 pub mod raster;
 pub mod report;
 pub mod ring;

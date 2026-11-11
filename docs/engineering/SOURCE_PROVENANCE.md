@@ -3803,3 +3803,31 @@ A fourth addition to the entry above, from another session and on a branch of it
   - *The landing tree at `3138dd9`, with a clean tree before and after:* `cargo xtask check` passes (1,312 host tests, 0 failed, 10 ignored; the gates; Loom), and `cargo xtask boot-test` passes, 11 of 11, with 2 processors and again with 1, where the thread shares the unmapping processor: `200 pages ... on this processor: ... Ok(Change { pages: 200, shootdowns: 2, interrupts: 0 })`. `boot-matrix` was not run on the development machine.
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-10, on the owner's word ("Fix it here"). Original code; Rust `core` and `alloc` only.
 - **Licensing:** MIT OR Apache-2.0.
+
+## The channel quota's count, tested on the host, and a charge that takes its sum only under the quota (2026-11-11)
+
+- **What:** `framekernel/src/quota.rs` (new) and `framekernel/src/process.rs`, whose `Account` now counts its channels with it. Two commits: `a856e0d`, the move, and `4dbbb59`, the fix.
+  - **The move:** `process.rs` is built only for the kernel's target, so nothing in it can have a host test. A process's count of channels against its quota is now `quota::Count` (`charge`, `refund`, `held`), in a module the host builds too, as `mapping.rs` holds the memory quotas' arithmetic for `process.rs`. `Account::charge_channel` and `refund_channel` stay and call it, so `ipc.rs` is unchanged. `lib.rs` gains the module's line and its line in the module list.
+  - **The fault:** the charge was `(n < max).then_some(n + 1)`, and `then_some` evaluates its argument before the comparison is looked at. A refund of something never charged wraps the count to the top of its range, and the next charge then overflows the sum. A build that checks overflow panics there. One that does not wraps the sum, drops it and answers `limit`. The boot images are built with the release profile and the workspace sets no `overflow-checks`, so the kernel as booted already refused; a kernel built with the dev profile would have panicked, as the host test did.
+  - **Now:** the sum is taken only once the count is under its quota (`if n < self.max { Some(n + 1) } else { None }`), so the answer is `limit` in every build. A refund too many fails closed, and `refund`'s documentation says so.
+- **How it was found:** the count quotas of task S3-6, which are not in this batch, were first written in the same form, and their refund test panicked. No refund too many is known in the kernel.
+- **Specifications:** none. `bool::then_some` and `AtomicUsize::try_update` are as the standard library documents them for Rust 1.99.1.
+- **Architecture decisions:** ADR-0005 P11 (a process's creator sets its quotas). No decision changes.
+- **Open-source references consulted (§3, §6):** none.
+- **`unsafe`:** none. `quota.rs` starts with `#![forbid(unsafe_code)]`.
+- **Limits, stated plainly:**
+  - Nothing a program can observe changes: the kernel as booted gives the same answers before and after.
+  - The new test fails without the fix only in a build that checks overflow. That is the profile the gates test with. With `--release` the old form passes it, by the wrapped sum.
+  - The other two charges in `process.rs`, `charge_queued` and `charge_committed`, use `checked_add` and were not at fault. They stay in `process.rs`, with no host test of their own.
+  - The thread test runs on the host's threads and is not a Loom model. The step it tests is one `try_update`.
+  - A refund too many is not detected or reported. It only fails closed.
+  - No human has reviewed this.
+- **Test evidence (2026-11-11; Rust 1.99.1; the boots under QEMU TCG + OVMF on the M1 Max):** every run held the machine's turn, with a clean tree before and after.
+  - *Each of the two commits, 12:39 to 12:40 UTC:* `cargo fmt --all -- --check` is clean. `cargo clippy` with `-D warnings` is clean for the kernel on the host (`--lib --tests`), for the kernel on `x86_64-unknown-none` and for xtask (`--all-targets`). `cargo test --package framekernel --lib`: 425 passed at `a856e0d` and 426 at `4dbbb59`, none failed. `cargo test --package xtask`: 145 passed, 1 ignored.
+  - *Control for the fix, the tip's tests on the charge as it was:* `a_refund_too_many_refuses_every_later_charge ... FAILED`, `attempt to add with overflow` at the sum; the other five passed. The file was put back and compared byte for byte.
+  - *Control for the thread test, the charge as a load, a yield and a store:* `charges_from_several_threads_never_pass_the_quota ... FAILED`: the count after every charge was refunded was not 0. Put back the same way.
+  - *`cargo xtask check` at `4dbbb59`, 12:40 to 12:47 UTC:* passed. Its host tests' result lines sum to 1,376 passed, 0 failed, 10 ignored; the gates passed; Loom ran its 42 models and caught its 68 negative controls. None of the Loom models is of this count.
+  - *`cargo xtask boot-test` at `4dbbb59`, 12:47 to 12:49 UTC:* passed, 11 of 11 scenarios. The kernel's own proof of the channel quota printed `ipc: quotas: a fifth channel -> LIMIT, a thirteenth handle -> LIMIT, one more after a close -> OK, still working -> OK`, as before. The verdict is the usual one under QEMU: degraded, 60 of 61 proofs, speculation controls failed (item 154).
+  - *Not run:* a boot at `a856e0d`, the boot matrix, anything on a real processor.
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-11, asked for by the session landing the step-3 batch. Original code; Rust `core` only.
+- **Licensing:** MIT OR Apache-2.0.
