@@ -268,3 +268,15 @@ The framework session building ADR-0004 Amendment 2 (item 144) found four cases 
 | 158, answered | Crash reports: print offsets in every mode (`stack region +0x…`, `image +0x…`, a backtrace as image offsets, no base), the image part included, which brings it under H3's rule? | **Accept** |
 | 159, answered | The boot log: print neither the stack region's base nor an address in it, during boot either? | **Accept** |
 | 160, answered | Showing that boots differ with nothing printed: required, a host test of the draw, a true-or-false boot line, a forced no-entropy boot and controls; in addition a read through QEMU's monitor across the matrix, dropped and recorded as not done if it is unreliable on CI? | **Accept** |
+
+## S3-5b: three cases D5 does not place (Accepted 2026-11-11)
+
+The review of S3-5b's fixes left three cases that D5 (item 105) does not place (`REVIEW_S3-5B_2026-11-10.md`, step 2). What a status means is the owner's (CLAUDE.md §84). The coordinating session put them to the owner with one recommendation for each, to keep what is built, and the owner answered **"Accept all"** on 2026-11-11. They are the second note on D5 in ADR-0005 Amendment 5. All three are what the kernel does since `f56263a`.
+
+They were put to the owner as items 161 to 163. Item 161 was already in use on the unmerged review batch (`land/review-tasks`, pull request 15: marking that pull request ready at 76 commits), so they are recorded here as 162 to 164. The questions and the answers are unchanged.
+
+| # | Question | Answer |
+|---|---|---|
+| 162, answered | `memory_map` at a fixed place that runs over a page already mapped, in an address space that is also at its bound of page tables: keep `invalid_args` (the place is taken), since the space looks at its records before it makes tables, and not `limit`? | **Accept** |
+| 163, answered | `memory_protect` on a mapping another call is changing: keep `should_wait` ahead of the comparison of the access asked with what the mapping allows, since that comparison is not settled while the mapping changes? | **Accept** |
+| 164, answered | Keep counting as "being changed" (item 155) a mapping whose own `memory_map` has not yet written its address to its caller, so that `memory_unmap` or `memory_protect` on it returns `should_wait`? | **Accept** |

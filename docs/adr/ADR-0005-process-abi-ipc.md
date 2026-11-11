@@ -160,3 +160,11 @@ The implementation records each decision's consequences in `docs/engineering/SOU
 - `memory_map` with a random placement returns **`limit`** when eight draws in a row land on something mapped. It is a bound of the process's own address space; `no_memory` stays for frames and the kernel heap (the note on D4). This is what the kernel does today.
 
 Each call already declares its status, so `user-abi` stays 0.5. **Both built 2026-11-11:** the first with a boot proof line under QEMU, the second pinned by a host test.
+
+**Second note on D5 (Accepted by the owner on 2026-11-11, "Accept all"; decision sheet items 162 to 164).** The review of the fixes found three more cases D5 does not place (`docs/engineering/REVIEW_S3-5B_2026-11-10.md`, step 2). The owner decided to keep what the kernel does:
+
+- `memory_map` at a fixed place that runs over a page already mapped returns **`invalid_args`**, also when the address space is at its bound of page tables. The space looks at its records before it makes tables, so it finds the taken place first. `limit` (the note on D4) is for a run whose place is free.
+- `memory_protect` on a mapping another call is changing returns **`should_wait`** before the access asked is compared with what the mapping allows. That comparison is not settled while the mapping changes. A retry gets the true answer, `access_denied` included.
+- A mapping whose own `memory_map` has not yet written its address to its caller counts as being changed (the first note): `memory_unmap` or `memory_protect` on it returns **`should_wait`**. Until the address is written the kernel may still take the mapping back, so it is its maker's alone.
+
+No status is added and no call declares a new one, so `user-abi` stays 0.5. **Built** (on the batch since `f56263a`). The third has a host test and a boot proof line under QEMU. The first and the second follow from the order of the code (`memory_object::put` reserves the record before it enters pages; `memory_object::protect` takes the mapping before it compares the access) and have no test of their own yet.
