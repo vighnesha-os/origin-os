@@ -517,6 +517,9 @@ fn copy_request(
         return Err(Error::InvalidArgs);
     }
     let len = usize::try_from(size).map_err(|_| Error::InvalidArgs)?;
+    // The size is a program's, and sizes a copy into this buffer: `nospec` keeps it within the
+    // buffer on a wrongly guessed path too (ADR-0017 Z9).
+    let len = nospec::length(len, bytes.len()).ok_or(Error::InvalidArgs)?;
     copy_in(p, bytes.get_mut(..len).ok_or(Error::InvalidArgs)?, addr)?;
     Ok(size)
 }
