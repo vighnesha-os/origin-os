@@ -30,6 +30,8 @@ Each address space has the same PML4 entries 256–511, pointing at kernel table
 ### H3. KASLR
 The loader chooses the slides: the kernel image at 2 MiB granularity within its 2 GiB window, the direct map at 1 GiB granularity. Entropy: RDSEED, else RDRAND, else `EFI_RNG_PROTOCOL`; with none, boot proceeds without a slide and says so. The kernel never prints its base after boot except to the serial debug console in developer mode.
 
+*(Recorded 2026-11-10, from the design review's findings 8 and 14; decision sheet items 113 and 119. Two clauses of H3 are not what the code does. The loader has no `EFI_RNG_PROTOCOL` fallback, and it prints both slides in every build (`boot/uefi/src/main.rs`); the pre-merge review listed both as low. The firmware's generator becomes one seed of the kernel's generator (item 113). Addresses leave release logs before the Diagnostics interface serves the kernel log (item 119). Until both are built, H3 states the intent, not the build.)*
+
 ### H4. The loader builds the first page tables
 The loader already holds the verified segment table. It builds tables mapping the kernel at its slid virtual base, the direct map and the boot info, loads CR3 just before the jump, and passes the table root in boot info **0.3** (all boot-info addresses become virtual). The kernel's entry runs at its virtual address from the first instruction and later rebuilds its tables with its own allocator.
 *Alternative:* the kernel relocates itself from identity mapping (keeps the loader simpler, but the kernel's first instructions then run at a different address from the rest).

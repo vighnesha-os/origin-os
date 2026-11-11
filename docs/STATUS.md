@@ -136,6 +136,30 @@ With the early console and the wait-queue and timer fixes merged (`31c3d39`), `c
 | Signature block, certificate chain, trust store | encodings decided (S1–S4); parser (`onbf-format`), entry verification and the KRN policy (`onbf-verify`, proven against reference-signed vectors and `onbf-sign`'s signatures) and the loader's compiled-in store done, with a test key only; OKC chains specified (errata O2–O5) and waiting for the SYS profile's signed time; trust anchor decided (B7) |
 | Signing (host) | `onbf-pack sign` and `keygen`, with Ed25519 and ML-DSA-87 signing written in Rust (`onbf-sign`, host only: the loader and kernel cannot reach it). Keygen and signing match the independent Python references and OpenSSL byte for byte; every image is self-verified with the loader's code. Side-channel assessment recorded; zeroization is best effort, accepted by the owner for development keys; agent-reviewed, not independently audited. A test key is derived from public text; no release key exists |
 
+## The design review (2026-11-10): accepted, recorded, almost nothing built
+
+The owner asked for a very careful review of CLAUDE.md and the design documents. `docs/engineering/DESIGN_REVIEW_2026-11-10.md` has 19 findings, each checked against the code at `land/s3-part2` (`02d9ba8`) and `docs/editions-device-sdk` (`a95d05b`). The owner accepted its 18 decisions the same day. They are:
+
+- decision sheet items 106–123;
+- CLAUDE.md revision 7.4;
+- ADR-0005 Amendment 6, ADR-0011 Amendment 1, ADR-0013 Amendment 1 and ADR-0014 Amendment 1;
+- notes in ADR-0004, ADR-0012 and ADR-0015.
+
+**Done:**
+
+- The editions branch (revision 7.3, ADR-0014, ADR-0015, items 71–97) is committed, pushed and merged with the landing line.
+- The commit that held Intel's VT-d PDF is on no branch, and it was never pushed. `.gitignore` now keeps `specifications/` and PDFs out.
+
+**Not built, and needed before ADR-0011 N14 step 4 puts a real program in ring 3:**
+
+- Twelve `asm!` blocks declare `preserves_flags`, and five of them write the flags (TASKS item 17).
+- Randomness comes straight from the processor's instructions, with no generator and no health gate (TASKS item 18).
+- There is no system threat model, and no decision on speculative execution (TASKS item 19).
+
+The rest is TASKS items 20 to 30. One of them is an ABI limit: a 32-bit handle still gives a process about 4.29 billion handle creations in its life (item 24).
+
+No human has reviewed the review. Nothing was built, tested or booted for it.
+
 ## Waiting on the owner
 
 ADR-0002 with B7, ADR-0003, G1 and the errata readings were decided on 2026-11-07, under the owner's instruction to finalise with the recommended options. The owner accepted ADR-0004 and ADR-0005, and on 2026-11-08 ADR-0005's Amendment 1 (what the first system-call slice needed and P1–P12 did not say), with the recommended options.
@@ -147,6 +171,16 @@ The owner accepted **ADR-0007** (DMA isolation and interrupt remapping, Intel VT
 Errata **V1–V6 and O2–O5** were decided by the owner on 2026-11-08, along with Rust host signing: `docs/spec/ONBF-errata.md`. Certificate chains are specified but wait for the SYS profile's signed time (O3). **O1** was decided the same day: a statement's `id` is printable ASCII.
 
 For the host signer the owner accepted best-effort zeroization of development keys (2026-11-08); release keys belong in an HSM.
+
+On 2026-11-10 the owner accepted decision items 71–96 and delegated item 97 to Claude (CLAUDE.md revision 7.3). Nothing in them is built.
+
+- **ADR-0014:** Origin Server, an edition of the same release with the full native desktop.
+- **ADR-0015:** every device standard through the SDK.
+- **ADR-0002 Amendment 1:** Origin-owned Secure Boot keys by default.
+- **ADR-0009 Amendment 1:** Intel 2026+ and AMD 2026+ with Zen 5 or newer. The kernel will name the core generation at boot and never refuse.
+- **References:** Linux and other open-source code are read for gaps, or for a named reason where vendor documents already cover a topic (item 97). Never copied, and always at today's version (CLAUDE.md §3).
+
+Still the owner's from those: a trademark search for the name (item 77) and turning on GitHub's private vulnerability reporting (item 79).
 
 Both AMD manuals the kernel's AMD code was written from (48882 Rev 3.11, 24594 Rev 3.39) were read from a mirror and are confirmed byte-identical to AMD's own copies (2026-11-08). Still the owner's, because they are not design: merging PR #1 into `main`; and buying the physical x86 test machines. **ADR-0009** declares what "introduced in 2026 or later" covers and chooses the first two (Claude decided, at the owner's request); nothing has been bought, and nothing is qualified on hardware until those machines have run (CLAUDE.md §74, §76). Details: `docs/engineering/TASKS.md`.
 

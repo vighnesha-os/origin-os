@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Required by | CLAUDE.md §79 (persistent engineering memory) |
-| Updated | 2026-11-09 |
+| Updated | 2026-11-10 |
 | Rule | Status words mean what they say. "Done" means built, tested and committed; QEMU is not hardware (CLAUDE.md §74). |
 
 ## Done (branch `m0/toolchain-verification`)
@@ -86,12 +86,67 @@
 9. **CPU-feature CPUID tests** (key registry bits 0–5) and XCR0 checks; **M1 follow-ups** (A/B deployment, boot-attempt recording).
 
 10. **The pre-merge review's open list:** the Framekernel's trusted base, speculation controls, CET, TCP's acceptance checks, the open IOMMU threats, NVMe reset, scheduling and allocator scaling (`docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md`, "Not fixed").
+
 11. **IOMMU after the Rev 3.11 check (2026-11-09; AMD-Vi ledger §7, "Found, not changed"):** clear Enable No Snoop in each attached function where a VT-d unit lacks snoop control; IVMD semantics and placement, with question 4's identity maps; whether the IVRS parser stops one IVHD's walk instead of refusing the table; a precedence for several entries naming one DeviceID; decoding a type 10h block's feature field. On the first AMD machine: record which address form an interrupt fault carries, and that the SMI filter the firmware set is still on after boot.
+12. **The public repository's files (decision item 79, CLAUDE.md §6):** `CONTRIBUTING.md` with DCO sign-off and an original-source declaration (§3), `SECURITY.md` for private vulnerability reports (§60), `CODEOWNERS` for the kernel and SDK interfaces (§78). Also: the README's status line still says "There is no kernel yet".
+13. **Research before M10 (ADR-0015 D5, D6), each recorded in `docs/research/`:**
+    - Intel's Thunderbolt licence terms, read before the specification;
+    - the Bluetooth SIG's membership, qualification and patent licence, and how they treat an open-source host stack;
+    - whether any Wi-Fi or Bluetooth chip maker publishes documentation Origin may use;
+    - radio regulatory duties (country setting, 5 GHz radar avoidance, 6 GHz);
+    - re-checking IEEE 802.11 and Bluetooth Core revisions (§16, §17);
+    - re-checking Linux and Ubuntu coverage at Linux 7.4 final and when each driver starts. The snapshot of 2026-11-10 is `docs/research/2026-11-10-linux-ubuntu-device-coverage.md`; its section 6 lists the open points.
+14. **Radio cryptography (§59, ADR-0015 D6), when Wi-Fi or Bluetooth work starts:** P-256, AES-CCM and AES-GCM, AES-CMAC and HMAC-based key derivation, each with known-answer and differential tests like the existing verifiers.
+15. **Origin Server (ADR-0014), after M9:** OIDL interfaces for remote administration, service management, hardware health and remote desktop (S7); the remote desktop ADR (S4); the release manifest's edition field (§84); an ADR-0009 amendment for 2026-generation server targets (S3).
+16. **The CPU identification table (ADR-0009 Amendment 1, items 88–89):**
+    - one table from vendor, family and model to core generation, built from Intel's and AMD's own publications (the numbers the rule uses are confirmed in `docs/research/2026-11-10-cpu-identification.md`; Diamond Rapids is not), and the home for errata keyed by family, model and stepping;
+    - the kernel's one-line scope report at boot, with no refusal;
+    - two QEMU boots that set `family=` and `model=`, one in scope and one outside it.
+
+    At M9, the owner decides whether the installer warns or refuses (item 90).
+
+**From the design review of 2026-11-10 (decision items 106–123), in order.** The findings and their evidence are in `docs/engineering/DESIGN_REVIEW_2026-11-10.md`. Each task writes its §78 contract before it starts (item 122).
+
+17. **The assembly blocks' options, and four gates (items 107, 110, 111, 123), now:**
+    - remove `preserves_flags` from the five blocks in `framekernel/frame/src/cpu.rs` that use `or` or `and`;
+    - for the seven that only move to or from a control register (six in `cpu.rs`, one in `boot/uefi/src/main.rs`), read Intel's and AMD's entries for that move (§16), and remove the option unless both say the status flags are unchanged;
+    - four gates in `cargo xtask check`: an `asm!` block that declares the option holds only instructions known not to write flags; only listed files hold `unsafe`, and every other kernel file forbids it; no PDF or similar document is tracked outside an allowlist; §11's lint also refuses `cfg(unix)`, `target_family` and `target_env`.
+18. **The kernel's random-number generator (item 113), before S3-5b lands:**
+    - an ADR first: the SP 800-90A and 800-90B revisions pinned (§16), seeding from RDSEED, RDRAND and a firmware seed the loader passes, reseeding, state for each processor, health tests, a threat model;
+    - then HMAC_DRBG over `origin-crypto`'s SHA-512, with NIST's vectors, as a framework service;
+    - every consumer draws from it: `launch.rs`, `virtionet.rs`, the loader's KASLR draw and S3-5b's mappings;
+    - "hardware entropy" becomes Withdraw in `bootproof.rs`, its host test and ADR-0013's inventory, in one commit (ADR-0013 Amendment 1).
+19. **The system threat model, and the ADR on speculation and processor hardening (item 112), before ADR-0011 N14 step 4:**
+    - `docs/engineering/THREAT_MODEL_SYSTEM.md`: the attackers, what each edition defends, which component covers each, and each component model's exclusions covered or accepted by name;
+    - the ADR, from Intel's and AMD's documents read under §16: `IA32_ARCH_CAPABILITIES`, enhanced and automatic IBRS, IBPB, the SMT policy, supervisor shadow stacks, FRED and LASS where CPUID reports them, and the compiler's options;
+    - an index-masking primitive in the framework, for the handle table and the call table;
+    - a row for a nested NMI in the system-call threat model.
+20. **The clock experiment (item 114):** `prove_consistent` with `LFENCE; RDTSC`, on the CI runners that showed the step, from a trial branch. The result goes in the TSC ledger. If it supports one, a fast-path amendment to ADR-0012 is put to the owner.
+21. **The four statements (item 120):**
+    - `origin-version.toml`'s comment says what the loader does today;
+    - the kernel manifest's `cet.shstk` is false until the kernel has shadow stacks;
+    - `xtask` passes the canonical flags to `onbf-pack`, so `flags_digest` records them;
+    - the AP trampoline's frame is not writable through the direct map while it is executable, and `smp.rs`'s comment says what holds.
+22. **Build settings and CI (item 123):** `overflow-checks = true` for the kernel and the loader, with the cost measured; the loader refuses a processor below x86-64-v3, and then the kernel is built with `+popcnt,+lzcnt,+bmi1,+bmi2,+movbe`; CI runs `developer-tools/toolchain/verify.sh`, builds with `--locked` and checks the compiler's commit.
+23. **What lives in the kernel (item 111):** the ADR (a user-mode service by default; a stated reason for kernel placement; the no-panic rule for every in-kernel path that reads outside data). Then the modules that are not the kernel's move out of `framekernel` to the crates §81 names. Twelve are named by nothing today: `base64`, `json`, `glob`, `editbuffer`, `semver`, `deflate`, `dns`, `route`, `hashmap`, `utf16`, `originfs`, `klog`.
+24. **64-bit handles (item 109; ADR-0005 Amendment 6, E1), after S3-5b and S3-6 land:** the kernel's table, `origin-abi`, `origin.kernel.oidl`, `docs/spec/OIDL.md` §10, every generated crate and the hostile corpus, in one `user-abi` minor.
+25. **The records (item 122):** a provenance table with one row for each crate and §6's ten fields, read by a gate; a task-contract template with §78's fields; `docs/ROADMAP.md` with exit tests for each milestone, and M0 to M2 marked against it.
+26. **Provisional performance budgets (item 115):** `docs/engineering/PERFORMANCE_BUDGETS.md`, each figure marked as a hypothesis, with the costs the CI boots print recorded as trends.
+27. **ADRs that §18 requires (item 118):** locking and synchronization (lock classes in a fixed order, checked by types or by a debug-build checker; rules for interrupt context); the rest of the cryptographic profile (storage encryption, password hashing, transport; the generator is task 18's); trade-offs and migration consequences for ADR-0002, 0003, 0004 and 0005.
+28. **ADR-0002 Amendment 2 (item 119), with the SYS profile:** measured boot, the release manifest and the rollback floor, firmware runtime calls. Addresses leave release logs before the Diagnostics interface exists.
+29. **The SDK-only mechanism (item 108; ADR-0011 Amendment 1), with the Loader Service's interface at M6:** the launch capability, the manifest gate, the directory, a base image with no interpreter, the run-time test.
+30. **The review's smaller points (finding 19), which were not put as decisions:** the stale lines in `README.md`, `STATUS.md` and the ADR headings; SAFETY text for the naked functions and the `global_asm!` blocks; `place.rs`'s skipped segment; a zero check for a named reserved field in OIDL; a register of specifications in use for §17.
 
 ## Waiting on the owner
 
-Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
+Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
 
 | # | Decision | Blocks |
 |---|---|---|
 | — | The owner cannot buy machines for now. The steps that need the owner (sign-ups and small rentals) are in `docs/research/2026-11-09-testing-without-buying-hardware.md`; ADR-0009's choices (#2, then #5 once its serial option is confirmed, H5) stand for when that changes | The first physical boot (§74) |
+| 77 | A trademark search for the product name (vivo has shipped "OriginOS" worldwide since 2025-10-15) | The first public release (§76) |
+| 79 | Turn on GitHub's private vulnerability reporting (Settings → Security) | `SECURITY.md` being useful (§60) |
+| 78 | An organisation that can hold an EV certificate and pass Microsoft's annual audit | The Microsoft-signed first stage (ADR-0002 Amendment 1) |
+| 106 | Read revision 7.4's wording, and say whether the records pull request may merge | CLAUDE.md 7.4, ADR-0014, ADR-0015 and items 71–123 reaching `main` |
+| 122 | Confirm ADR-0009's text, which was delegated and not reviewed, and ADR-0007's two additions marked "for the owner's review" | Their acceptance being the owner's own (§18) |
+| 121 | Name the person who signs off the first driver written from reference reading, when one exists | Publishing that driver (CLAUDE.md §3) |

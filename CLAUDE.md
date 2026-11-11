@@ -1,18 +1,19 @@
 # ORIGIN OS — DEFINITIVE PRODUCTION ENGINEERING DIRECTIVE
-## Version 7.2 — Original-Source, Rust 1.99.1, Research-Verified Operating System
+## Version 7.4 — Original-Source, Rust 1.99.1, Research-Verified Operating System
 
-**Product:** Origin OS  
+**Product:** Origin OS, in two editions of one release: Origin Desktop and Origin Server  
 **Kernel:** Framekernel  
 **Research baseline:** November 7, 2026  
-**Revision:** 7.2, 2026-11-09. Amends §48 and §70 to match ADR-0011, the native SDK (decision sheet item 39). Revision 7.1 (2026-11-07) added the ONBF decisions (`docs/adr/ADR-0001-onbf.md`) and toolchain and standards corrections (`docs/research/2026-11-07-onbf.md` §5). v7.1 is kept at `docs/engineering/CLAUDE-v7.1.md` and v7.0 at `docs/engineering/CLAUDE-v7.0.md`.  
+**Revision:** 7.4, 2026-11-10. Adds the decisions of the design review (`docs/engineering/DESIGN_REVIEW_2026-11-10.md`, decision sheet items 106–123): how the SDK-only rule is enforced and what the server's GUI rule means (§48), security rules for the GUI (§52), a system threat model (§58), one kernel random-number generator (§59), three more rules for reference code (§3), build rules for the kernel (§13, §14), provisional performance budgets (§53), and how the records themselves land (§6, §79, §82). It also carries two answers on the kernel's random-number generator, accepted the same day with ADR-0016 (items 149 and 151): the standards it is pinned to (§17) and what its health tests are (§59). Revision 7.3 (2026-11-10) added the Server edition (`docs/adr/ADR-0014-server-edition.md`), every device standard through the SDK (`docs/adr/ADR-0015-device-standards-sdk.md`), Origin-owned Secure Boot keys as the default (ADR-0002 Amendment 1), rules for the public repository, a stricter hardware scope with the core generation named at boot (ADR-0009 Amendment 1), and Linux and other open-source code as a reference only, kept apart from the code, recorded and read at today's version (§3, §6) (decision sheet items 71–97). Revision 7.2 (2026-11-09) amended §48 and §70 to match ADR-0011, the native SDK (item 39). Revision 7.1 (2026-11-07) added the ONBF decisions (`docs/adr/ADR-0001-onbf.md`) and toolchain and standards corrections (`docs/research/2026-11-07-onbf.md` §5). v7.3 is kept at `docs/engineering/CLAUDE-v7.3.md`, v7.2 at `docs/engineering/CLAUDE-v7.2.md`, v7.1 at `docs/engineering/CLAUDE-v7.1.md` and v7.0 at `docs/engineering/CLAUDE-v7.0.md`.  
 **Mandatory compiler:** Rust 1.99.1 stable  
 **Rust edition:** 2024  
 **Processor architecture:** x86-64 exclusively: 64-bit long mode only. No 32-bit or x32 code, and no Windows `.exe` or `.msi` compatibility.  
-**Target hardware:** Intel and AMD platforms introduced in 2026 or later  
+**Target hardware:** Intel platforms introduced in 2026 or later, and AMD platforms introduced in 2026 or later with Zen 5 or newer cores. Older machines are bench equipment only: no support or qualification claim rests on them (ADR-0009, Amendment 1)  
 **Primary development host:** Apple M1 Max with 64 GB RAM  
 **Engineering platform:** Claude Code, specialist agents, Git, QEMU/OVMF, automated CI and physical x86-64 validation  
 **Development policy:** Original, independently authored Origin OS implementation  
-**Production objective:** A complete, secure, exceptionally responsive, high-performance, multicore, multithreaded, preemptively multitasking, GUI-first, SDK-native, maintainable desktop operating system.
+**Licence and repository:** MIT OR Apache-2.0, developed in a public GitHub repository  
+**Production objective:** A complete, secure, exceptionally responsive, high-performance, multicore, multithreaded, preemptively multitasking, GUI-first, SDK-native, maintainable operating system, in a Desktop and a Server edition that share one kernel, one SDK and the full native desktop (ADR-0014).
 
 ### Native Origin OS formats
 
@@ -154,6 +155,42 @@ Do not claim code is original merely because it has been renamed, translated int
 
 Derive the implementation from legitimate specifications, independently developed architecture contracts and verified requirements.
 
+Linux source may be read only as a reference, to understand what the vendor's documents or the official specifications and standards leave out. Never copy it, translate it or reproduce its structure (owner's rule, decision item 91).
+
+Where those documents already cover a topic, reading Linux is Claude's decision (item 97, delegated by the owner). Read it only for a named reason:
+
+- device quirks, errata workarounds or firmware behaviour the documents do not describe;
+- a specification ambiguity, where interoperability depends on how deployed systems read it;
+- research into what Linux supports;
+- debugging a difference between Origin and Linux on the same hardware.
+
+Never read it just to see how Linux structured something the documents already explain. Origin's design differs, so that adds copying risk and nothing else.
+
+Keep that reading apart from the code (item 92). The session that reads Linux writes what it learned into Origin's own specification or research ledger, in Origin's words, citing file, commit and licence. A separate session then writes the code from that and the vendor documents, without the Linux source. Claude, which writes Origin's code, was trained on Linux's code, so this split is what keeps the code from drifting toward Linux's.
+
+Three rules make the split hold (decision item 121):
+
+- The reading session writes down facts: register layouts, required sequences, timings, firmware messages. It writes them in Origin's own structure and names. It carries over no code, no identifiers, and not the reference's arrangement into files and functions.
+- Prefer a reference whose licence is compatible with Origin's: BSD, ISC, MIT, or a vendor driver that is dual-licensed. Record its notice.
+- Before the first driver written this way is published, run §6's similarity check against the files consulted, and have a person sign it off.
+
+The same terms apply to other open-source projects (item 94):
+
+- **Ubuntu:** its kernel patches, packaged firmware and user-space stacks.
+- **Others:** the BSDs, Haiku, Redox, Fuchsia, illumos, EDK2, coreboot, SeaBIOS, QEMU's device models, SPDK, `libspdm`, Zephyr and NimBLE.
+
+ReactOS is excluded. Leaked or proprietary code is never opened.
+
+The order of sources, with no spending (item 95):
+
+1. free official specifications and vendor documents;
+2. open-source code the vendor wrote itself;
+3. other open-source systems.
+
+A feature with no free legitimate source is reported "not supported".
+
+Always read today's version (item 96): the newest release on the day of reading, recorded with its tag or commit and the date, never Claude's memory of older code. Specification revisions are re-checked the same day (§16).
+
 Use normal software-engineering knowledge, documented algorithms and hardware interfaces, but author project source independently.
 
 ## 4. Permitted external infrastructure
@@ -219,12 +256,21 @@ For each original implementation module, record:
 - Licensing status.
 - Test evidence.
 - Known external firmware/data dependencies.
+- Open-source references consulted under §3 (Linux or any project item 94 allows): each file, its project, tag or commit, licence, the date read, the reason for reading it, and the gap it filled (decision items 93, 96, 97).
+
+Keep these fields in a table with one row per crate, which a gate in `cargo xtask check` reads. The narrative entries are its evidence (decision item 122).
 
 Preserve traceability to Git commits.
 
 Use automated provenance and license checks where practical.
 
 Never claim that automated similarity scanning can mathematically prove independent authorship.
+
+The repository is public, so outside contributions need the same traceability. Keep in it:
+
+- `CONTRIBUTING.md`: Developer Certificate of Origin sign-off, and a declaration that each contribution is original under §3.
+- `SECURITY.md`: how to report a vulnerability privately (§60).
+- `CODEOWNERS`: owners for the kernel and SDK interfaces (§78).
 
 ## 7. No artificial LOC targets
 
@@ -373,6 +419,11 @@ Use Rust lints such as `unsafe_op_in_unsafe_fn` and appropriate Clippy checks.
 
 Avoid globally suppressing useful diagnostics.
 
+Two rules for the kernel's privileged code, each checked by a gate:
+
+- An `asm!` block declares `preserves_flags` only if every instruction in it leaves the status flags unchanged (decision item 110).
+- Only the files the gate lists may hold `unsafe`. Every other file of the kernel forbids it (decision item 111).
+
 ## 14. Compiler and linker security
 
 Review:
@@ -396,6 +447,8 @@ Do not globally enable aggressive CPU features that are unavailable on some supp
 The CPU baseline is `x86-64-v3`. Higher features (AVX-512/AVX10, APX) need runtime detection or a per-image declaration (ONBF §6.1.3).
 
 On stable Rust 1.99.1, `-Z cf-protection` (IBT/ENDBR64) and `-Z stack-protector` are unavailable; re-verify per §9. Enforce CET shadow stacks (they need no code generation), guard pages, W^X, full RELRO and frame pointers (`-C force-frame-pointers=yes`). Enable IBT once a stable flag exists.
+
+Build the kernel and the loader with integer overflow checks on in release builds. Build the kernel with x86-64-v3's integer instructions (POPCNT, LZCNT, BMI1, BMI2, MOVBE) once the loader refuses a processor below the baseline before it enters the kernel. The kernel stays without SIMD (decision item 123).
 
 ## 15. Future Rust upgrades
 
@@ -461,12 +514,17 @@ Initial reference baseline:
 - System V x86-64 psABI (pin the revision after verification).
 - FIPS 180-4, FIPS 202, FIPS 204 (with the NIST errata), FIPS 205 and NIST SP 800-208.
 - RFC 8032 (Ed25519), RFC 8949 (CBOR) and RFC 8878 (Zstandard).
+- IEEE 802.11-2024 with the 802.11be amendment (Wi-Fi 7). Re-verify when Wi-Fi work starts.
+- Bluetooth Core 6.2 or later. Re-verify when Bluetooth work starts.
+- NIST SP 800-90A Rev. 1 (June 2015), SP 800-90B (January 2018) and SP 800-90C (September 2025), and FIPS 198-1 (July 2008), for the kernel's random-number generator (§59; ADR-0016, decision item 151).
 
 Target actual PCIe Gen 5/6 hardware initially.
 
 A published PCIe 7.x standard does not establish physical hardware support.
 
 Respect standards licensing, patent obligations and certification restrictions.
+
+Keep specifications whose terms forbid redistribution out of the repository. The repository is public.
 
 ## 18. Architecture Decision Records
 
@@ -488,6 +546,7 @@ Use ADRs for:
 - Recovery design.
 - Original-source exceptions.
 - Hardware qualification policy.
+- Speculation and processor hardening.
 
 Each ADR must include alternatives, evidence, trade-offs and migration consequences.
 
@@ -515,6 +574,8 @@ Required:
 - Recovery boot support.
 
 The UEFI loader, kernel image and `.ose` user executable are distinct binary concepts.
+
+Secure Boot trust: by default, users and OEMs enroll Origin's keys. A first stage signed by Microsoft follows once an organisation exists that can hold that signature (ADR-0002 B7, Amendment 1).
 
 ## 20. Boot manager
 
@@ -608,10 +669,17 @@ Implement:
 - NUMA topology.
 - Hybrid-core capabilities.
 - CPU online/offline lifecycle.
-- Relevant security mitigations.
+- Speculative-execution controls and processor hardening, decided in an ADR before any program that is not a boot proof runs in ring 3 (decision item 112).
 - FPU/SIMD state management.
 
 Use hardware capability discovery, not processor marketing names.
+
+The kernel names the core generation from CPUID's vendor, family and model, using one table built from Intel's and AMD's documents. That table also holds errata. The kernel reports at boot whether the machine is in the declared scope (ADR-0009 Amendment 1):
+
+- AMD family 1Ah or higher is Zen 5 or newer.
+- Intel family 18 or higher, or a listed 2026 family-6 model, is a 2026 generation.
+
+It never refuses to boot on that basis, and instructions are still chosen from feature bits.
 
 ## 25. Kernel threading
 
@@ -756,6 +824,16 @@ Implement:
 
 Drivers must use a documented Origin Driver ABI.
 
+Programs reach every device technology through typed SDK interfaces in three layers (ADR-0015):
+
+- the device class;
+- everything the published standard defines;
+- vendor extras, only where the vendor documents them.
+
+Each device reports truthfully which features it supports. An unsupported feature returns "not supported", never a pretended success.
+
+Dangerous operations need rights of their own: firmware update, format, sanitize, device approval and radio transmit settings. Raw device access is a diagnostics right for administrators only. Radio host stacks and the USB4 connection manager run unprivileged.
+
 ## 32. PCIe and IOMMU
 
 Support:
@@ -839,6 +917,8 @@ Implement:
 
 Record USB-IF and Thunderbolt licensing/certification requirements.
 
+Thunderbolt 4/5 is part of the USB4 interface, not a separate SDK. Read Intel's Thunderbolt licence before its specification. Use the Thunderbolt name only after Intel certification (ADR-0015 D5).
+
 ## 36. GPU
 
 Implement a native graphics-driver architecture for selected Intel, AMD and NVIDIA devices.
@@ -858,6 +938,8 @@ Required capabilities include:
 - GPU reset and recovery.
 
 Begin with a validated display fallback and one supported GPU target.
+
+Support DisplayPort first. HDMI 2.1's high-rate (FRL) modes wait until their licensing allows an open implementation (ADR-0015 D7).
 
 Do not claim full acceleration without a functional native driver.
 
@@ -1030,6 +1112,8 @@ Plan a controlled route toward Rust standard-library platform support.
 
 Do not claim Rust `std` support before implementing the required OS services.
 
+Software written for other systems: Rust `std` comes first. A POSIX library over the SDK would need its own ADR at M6 (ADR-0014 S6). Linux APIs stay banned (§11).
+
 ## 45. `.oapp`
 
 Define:
@@ -1106,11 +1190,29 @@ Client → hidden shell command → CLI program → operating-system operation.
 
 No first-party component starts another program to do its work or parses another program's text output.
 
+A mechanism enforces this, not review alone (ADR-0011 Amendment 1, decision item 108):
+
+- Starting a program is a capability. Only the session launcher, the shell, the terminal and developer tools may declare it, and a release gate checks every first-party manifest.
+- A program that does not hold it is never handed the launch interface.
+- The base image holds no command interpreter. The shell and the terminal are an optional developer package.
+- No system library reads the environment. A child's environment is empty unless its launcher sets it, and first-party services take their configuration through typed interfaces, never through arguments.
+- No interface takes text that its receiver executes or hands to a program.
+
 Programs reach the Framekernel only through the SDK, by way of `origin.core`. The Framekernel does not call the SDK.
 
 The terminal may exist as an optional development tool. It is an ordinary SDK client and is not the graphical desktop's control plane.
 
 The only exceptions are ADR-0011 N12's closed list: code that implements the SDK's guarantees or runs where no SDK can exist yet.
+
+Origin Server is administered the same way. Every administrative operation is available in the native GUI, and none needs a terminal (ADR-0014 S4 and Amendment 1, decision item 117):
+
+- on its own console;
+- from the native management app on another Origin machine, over an authenticated, encrypted connection;
+- in a remote desktop session, which must exist before the Server edition ships.
+
+Neither edition needs a terminal or a web page to administer.
+
+Installing without an operator and configuring many machines are done through the SDK as well: Origin Setup applies a signed, declarative provisioning document. No script runs (ONBF-R3).
 
 ## 49. Origin SDK
 
@@ -1141,6 +1243,12 @@ Implement typed SDKs for:
 - Localization.
 - Compute.
 - Diagnostics.
+- Remote administration.
+- Service management.
+- Hardware health.
+- Remote desktop.
+
+The last four serve Origin Server first (ADR-0014 S7). Device technologies follow §31's three layers (ADR-0015).
 
 Support stable versioned APIs and a C-compatible ABI.
 
@@ -1215,6 +1323,13 @@ Implement:
 
 The compositor must not be blocked by ordinary application work.
 
+The compositor is a security boundary between programs (decision item 116):
+
+- A client sees only its own surfaces and its own input.
+- Synthetic input, global shortcuts, screen capture, reading another client's surfaces, and clipboard access without a user action are capabilities.
+- Credential and elevation prompts are drawn and read by the compositor, on a path no client can draw over or inject into, behind a secure attention key.
+- A remote session is marked as one.
+
 ## 53. Smoothness qualification
 
 Measure:
@@ -1231,6 +1346,8 @@ Measure:
 - Background update interference.
 
 Establish benchmark thresholds on declared supported hardware.
+
+Until that hardware exists, keep provisional budgets in `docs/engineering/PERFORMANCE_BUDGETS.md`, marked as hypotheses, and record the figures CI measures as trends. They claim nothing (decision item 115).
 
 Do not claim superior performance to Windows without a reproducible comparison.
 
@@ -1261,6 +1378,13 @@ Implement:
 - VPN extension interfaces.
 
 Implement standards-based interoperability testing.
+
+A Wi-Fi or Bluetooth driver needs a legitimate source for its chip's programming interface (ADR-0015 D6):
+
+- vendor documentation that lets Origin publish source written from it; or
+- §3's process for gaps: Linux read only as a reference, what it explains written into Origin's own specification first, and the code written from that in a separate session (decision items 91–93).
+
+Never translate another operating system's driver. Host stacks may be built from the public specifications first. Before either radio ships, check Bluetooth SIG qualification and licensing and the radio regulations.
 
 ## 55. Audio
 
@@ -1345,6 +1469,8 @@ Implement:
 
 Threat-model every privileged interface.
 
+Keep a system threat model, `docs/engineering/THREAT_MODEL_SYSTEM.md`: the attackers, what each edition defends against, and which component covers each. What one component's threat model puts out of scope, the system model either covers elsewhere or accepts by name (decision item 112).
+
 ## 59. Cryptographic implementation
 
 Use established published cryptographic algorithms.
@@ -1368,6 +1494,10 @@ Never invent a new cryptographic algorithm to avoid an external dependency.
 For package, driver and boot trust, Origin OS needs signature verification only; signing runs in release infrastructure and host tools.
 
 The signature suite is Ed25519 + ML-DSA-65. Root, kernel and release keys use Ed25519 + ML-DSA-87. Both signatures must verify (ADR-0001).
+
+The kernel has one random-number generator: an established deterministic generator (NIST SP 800-90A's HMAC_DRBG over SHA-512), seeded from more than one source and reseeded, with health tests on what each source returns. Those tests catch gross failure only, and Origin claims no SP 800-90B conformance (ADR-0016, decision item 149). Nothing else draws from the processor's instructions directly (decision item 113).
+
+The cryptographic profile covers more than signatures. Storage encryption, password hashing, transport and the generator are each decided in the profile's ADR, from a published standard, before they are built (decision item 118).
 
 ## 60. Software supply-chain security
 
@@ -1675,8 +1805,9 @@ Test defined configurations covering:
 - Audio devices.
 - Sleep/resume.
 - Power interruptions.
+- Origin Server: a KVM guest first, then physical servers on 2026-generation platforms, through the server's BMC console (ADR-0014 S3).
 
-Do not claim physical hardware support from QEMU alone.
+Do not claim physical hardware support from QEMU alone. A virtual machine is a declared scope of its own, not hardware qualification.
 
 ## 75. Reproducibility
 
@@ -1713,6 +1844,9 @@ Require:
 - SDK compatibility checks.
 - Documentation.
 - Maintenance policy.
+- Before the first public release: a trademark search for the product name.
+
+Each edition is qualified for its own declared scope.
 
 No test count alone establishes production readiness.
 
@@ -1791,6 +1925,8 @@ Maintain:
 - Hardware compatibility database.
 - Build evidence.
 - Session handoffs.
+
+A change to `CLAUDE.md`, an ADR or the decision sheet lands on `main` through a pull request of its own as soon as the owner accepts it. It does not wait for a batch of code (decision item 106).
 
 Do not rely on one AI context window to remember the project.
 
@@ -1981,9 +2117,15 @@ Implement secure unified releases, atomic upgrades, recovery and rollback.
 
 Complete release security review, performance testing, reliability tests, physical hardware qualification, documentation and maintenance planning.
 
+**Origin Server** follows the same milestones (ADR-0014 S2):
+
+- Its GUI comes with M8.
+- Server-only work starts after M9: remote administration, remote desktop, service management and hardware health.
+- USB4, Thunderbolt, Wi-Fi and Bluetooth come at M10, on physical hardware (ADR-0015 D9).
+
 Milestones may overlap where architecture contracts permit safe parallel development.
 
-Do not mark a milestone complete without its exit tests.
+Do not mark a milestone complete without its exit tests. Each milestone's exit tests are listed in `docs/ROADMAP.md` before it is marked done (decision item 122).
 
 ---
 
@@ -2076,7 +2218,7 @@ Never fabricate test results or implementation status.
 9. Scheduling must be scalable and hardware-aware.
 10. Origin SDK must provide real native APIs.
 11. Origin UI must not depend on hidden CLI calls.
-12. Origin Desktop must provide genuine native interaction.
+12. Origin Desktop must provide genuine native interaction, in both editions.
 13. `.ose`, `.osl`, `.osi`, `.oapp` and `.od` must be implemented as actual validated ONBF formats.
 14. Hardware functionality must not be fabricated.
 15. Filesystem integrity and recovery are mandatory.
