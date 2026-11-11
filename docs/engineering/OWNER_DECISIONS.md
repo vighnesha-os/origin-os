@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–141 and 145–154, and 2026-11-11 for item 161. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144 and 155–160 are on another branch (`land/s3-part2`) and are not in this sheet yet. |
-| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. |
+| As of | 2026-11-10 for items 71–141 and 145–154, and 2026-11-11 for items 161 and 165. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144 and 155–164 are on another branch (`land/s3-part2`) and are not in this sheet yet. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Item 165: your own text for CLAUDE.md §1, read against the rest of the directive; what it leaves as it was is in its section. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: item 161. |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: items 161 and 165. |
 | Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -438,3 +438,19 @@ Item 70 offers a code pull request for review once it carries 100 commits of rea
 | 161, answered | Mark pull request 15 ready at 76 commits, once pull requests 13 and 14 are in? Waiting for task 18b, the generator in the kernel, to bring it past 100 was offered and not chosen. | **Yes, at 76** |
 
 This is for pull request 15 only. Item 70 stands for every later code pull request, and no commit was added to raise the count (CLAUDE.md §7). Merging it still takes your word, after pull requests 13 and 14, each with a merge commit.
+
+## The roles in CLAUDE.md §1 (item 165): your text, 2026-11-11
+
+On 2026-11-11 you gave new text for the start of CLAUDE.md §1, "Your mission", with the words "update CLAUDE.md with following at line: 35". It names three lead roles, sets 100% coverage of approved requirements as the completion target, and lists 28 specialist roles with their responsibilities.
+
+| # | What | Where |
+|---|---|---|
+| 165, your text | The sentence that opened §1 ("You are the Principal Operating System Architect, ... and Multi-Agent Engineering Coordinator for Origin OS.") is replaced by your text | CLAUDE.md 7.5, §1. Revision 7.4 is kept at `docs/engineering/CLAUDE-v7.4.md` |
+
+How it was put in:
+
+- **Your words are in as you gave them,** checked against the pasted text line by line. Two blank lines were added, so that your three opening paragraphs stay three paragraphs in Markdown.
+- **Line 35 is where the old sentence stands in revision 7.1,** which the main checkout still held that day. In revision 7.4 it was line 36. Your text replaces that sentence; the nine roles it named are all among your 28.
+- **Nothing else in the directive changes.** The rest of §1 follows your text as before.
+
+One thing left as it was, for you to say: §77 still lists 26 engineering agents. They overlap your 28 roles and do not match them one for one.
