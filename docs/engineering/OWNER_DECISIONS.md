@@ -612,3 +612,36 @@ A randomized model of the generator's policy was built as a host test after 18b'
 - It adds a host test file, nine negative controls in `plant_faults.py` and its records. It changes no code of the generator.
 - No person has read the model.
 - Merging pull request 16 still takes your word.
+
+## S3-6: what events, ports and `clock_read` leave open (items 169 to 187): Accepted 2026-11-11
+
+ADR-0005 C9 (ports), C10 (events) and C13 (`clock_read`) were accepted on 2026-11-09. Task S3-6's research ledger, `docs/research/2026-11-11-events-ports.md`, found 19 points those three leave open. Each fixes what a program sees at the system-call boundary, which is the owner's (CLAUDE.md §84). The coordinating session checked every shape, put them to the owner as items 169 to 187 with one recommendation each and four marked "Look" (169, 178, 179, 187), and the owner answered **"Accept all"** on 2026-11-11. They are ADR-0005 Amendment 7, F1 to F19, in the same order; the full text of each, and what was rejected, is there and in the ledger.
+
+| # | Question | Answer |
+|---|---|---|
+| 169, answered | Is `port_packet` a fixed 32-byte record of C9's six fields with no `size` field, as an exception to ADR-0005 P4 for this record? (**Look**) | **Accept** |
+| 170, answered | Does `object_wait_async(port, object, key, signals)` need `write` on the port and `wait` on the object, take no options argument, and fail in D5's order? | **Accept** |
+| 171, answered | Does `port_wait(port, deadline) -> packet` need `read`, use `wait_one`'s deadline, answer `timed_out` and `canceled` as `wait_one` does, and consume a packet when it is taken even if the copy then faults? | **Accept** |
+| 172, answered | Does `port_cancel(port, object, key)` need only `write` on the port, remove every matching binding and queued packet silently, and answer `not_found` when nothing matched? | **Accept** |
+| 173, answered | Is `object_signal` events-only and `signaled`-only in v1, one atomic `(old & !clear) | set`, with `wrong_type` for a non-event? | **Accept** |
+| 174, answered | Are the default rights named `event_rights` and `port_rights`, with C6's rights? | **Accept** |
+| 175, answered | Three new per-process count quotas, `events`, `ports` and `bindings`, with a binding charged to the process that bound it? | **Accept** |
+| 176, answered | Does `wait_one` work on an event and answer `access_denied` on a port, with no signals on ports in v1? | **Accept** |
+| 177, answered | May the same port, object and key be bound twice, giving two bindings and two packets? | **Accept** |
+| 178, answered | Does `clock_read() -> nanos` read the monotonic clock only, take no argument, and have the one status `fault`? (**Look**: the task contract had said "no errors") | **Accept** |
+| 179, answered | When a binder exits while another process holds the port, do its packets stay queued and stay charged to its account until read, cancelled or the port closes? (**Look**: the task contract had asked for no charge left at once) | **Accept** |
+| 180, answered | Is a binding's storage refunded when its packet is read, when it is explicitly cancelled and when the port closes, and not on an implicit cancel? | **Accept** |
+| 181, answered | Is the mask left unchecked against the object's type, as with `wait_one`? | **Accept** |
+| 182, answered | Is `trigger` the mask asked, and `observed` all of the object's signals when the packet was queued? | **Accept** |
+| 183, answered | Do packets leave in the order queued, with no bound per port beyond the binders' quotas? | **Accept** |
+| 184, answered | Does an implicit cancel follow the handle the binding was made through, not the object? | **Accept** |
+| 185, answered | Do `event_create()` and `port_create()` take no argument and answer `fault`, `limit` or `no_memory`? | **Accept** |
+| 186, answered | Can any object `wait_one` can wait on be bound: channel ends, processes, threads and events? | **Accept** |
+| 187, answered | Does S3-6 leave out packets a program queues itself and edge-triggered or repeating bindings, and leave the `Timer` object owed under P3 as TASKS item 36? (**Look**) | **Accept** |
+
+- **Two of them correct the coordinating session's own task contract** (TASKS, contract S3-6): item 178 ("no errors" was a mistake: a call with a result has `fault`) and item 179 (an exited binder's charge can outlast it on a shared port).
+- **Item 169 is an exception to an accepted sentence**, ADR-0005 P4's rule that every structure crossing the boundary begins with a size, for `port_packet` only.
+- **Item 187 leaves P3's `Timer` object owed**, not dropped. TASKS item 36 tracks it.
+- **Recorded with them, and no decision:** the call numbers (9, 10, 15 to 19), the change to two reserved calls' error sets, and `origin.kernel` and `user-abi` going from 0.5 to 0.6.
+- **Nothing of this is built into the batch on the day of the answer.** No behaviour of the seven calls has run. Two pieces were built ahead under §84 and are not merged: the framework's protocol core (`claude/s3-6a-port-core`) and the count quotas of item 175 (`claude/s3-6-events-ports` at `b40d569`). Each lands only after the coordinating session has read it and run the gates on the merge.
+- Merging pull request 16 still takes your word.
