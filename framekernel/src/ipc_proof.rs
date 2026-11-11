@@ -809,11 +809,13 @@ fn hostile_groups(kernel: u64, foreign: u64) -> Vec<Group> {
                     &[],
                     Error::NotSupported.raw()
                 ),
+                // Events exist since task S3-6, and this process was given no quota for one
+                // (ADR-0005 D4, Amendment 7 F7).
                 step(
-                    "an object type not here yet",
+                    "an event with no quota for one",
                     sys::EVENT_CREATE,
                     &[Imm(slot_addr(9))],
-                    Error::NotSupported.raw()
+                    Error::Limit.raw()
                 ),
             ],
         },

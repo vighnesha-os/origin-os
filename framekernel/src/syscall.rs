@@ -32,6 +32,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use origin_abi::{Error, Handle};
 use origin_frame::nospec;
 use origin_frame::once::SetOnce;
+use origin_frame::sync::ports::{Kind, Packet};
 use origin_frame::trap::SyscallOutcome;
 use origin_syscalls::oidl_rt as rt;
 use origin_syscalls::origin_kernel::kernel::server;
@@ -39,10 +40,11 @@ use origin_syscalls::origin_kernel::types as oidl;
 
 use crate::channel::Identity;
 use crate::console::Console;
+use crate::event::{self, Event};
 use crate::mapping::Request;
 use crate::memory_object::{self, MemoryObject};
-use crate::process::{Ending, UserContext};
-use crate::{cpu, ipc, sched};
+use crate::process::{Account, Ending, UserContext};
+use crate::{cpu, ipc, port, sched, time};
 use origin_frame::objref::ObjectRef;
 
 /// The most handles in one message, as a length.
@@ -51,6 +53,8 @@ const MAX_HANDLES: usize = oidl::MAX_MESSAGE_HANDLES as usize;
 const HANDLE_BYTES: usize = <rt::Handle as rt::Fixed>::SIZE;
 /// Bytes of one received handle's record in user memory (ADR-0005 B3).
 const RECORD_BYTES: usize = <oidl::ReceivedHandle as rt::Fixed>::SIZE;
+/// Bytes of one port packet in user memory (ADR-0005 Amendment 7, F1).
+const PACKET_BYTES: usize = <oidl::PortPacket as rt::Fixed>::SIZE;
 
 /// Runs one system call from ring 3: the number, its six arguments, and the address after
 /// the `syscall` instruction. Interrupts are off on entry and on return.
@@ -255,6 +259,79 @@ impl server::Calls for UserContext {
                 memory_object::protect(&self.process, &target, address, length, access.bits())
             })
             .map_err(declared(server::MemoryProtectError::InvalidArgs))
+    }
+
+    fn event_create(&self, event: rt::UserRef<rt::Handle>) -> Result<(), server::EventCreateError> {
+        let make = |account: &ObjectRef<Account>| Event::create(account).map(ipc::Object::Event);
+        create_one(self, event, make, oidl::EVENT_RIGHTS.bits())
+            .map_err(declared(server::EventCreateError::NoMemory))
+    }
+
+    fn object_signal(
+        &self,
+        object: rt::HandleArg,
+        clear: oidl::Signals,
+        set: oidl::Signals,
+    ) -> Result<(), server::ObjectSignalError> {
+        event::event_of(&self.process.handles, object.value(), need(object))
+            .and_then(|event| event.signal(clear.bits(), set.bits()))
+            .map_err(declared(server::ObjectSignalError::InvalidArgs))
+    }
+
+    fn port_create(&self, port: rt::UserRef<rt::Handle>) -> Result<(), server::PortCreateError> {
+        let make = |account: &ObjectRef<Account>| port::create(account).map(ipc::Object::Port);
+        create_one(self, port, make, oidl::PORT_RIGHTS.bits())
+            .map_err(declared(server::PortCreateError::NoMemory))
+    }
+
+    fn object_wait_async(
+        &self,
+        port: rt::HandleArg,
+        object: rt::HandleArg,
+        key: u64,
+        signals: oidl::Signals,
+    ) -> Result<(), server::ObjectWaitAsyncError> {
+        let process = &self.process;
+        port::bind(
+            &process.handles,
+            &process.account,
+            process.id(),
+            (port.value(), need(port)),
+            (object.value(), need(object)),
+            key,
+            signals.bits(),
+        )
+        .map_err(declared(server::ObjectWaitAsyncError::InvalidArgs))
+    }
+
+    fn port_wait(
+        &self,
+        port: rt::HandleArg,
+        deadline: u64,
+        packet: rt::UserRef<oidl::PortPacket>,
+    ) -> Result<(), server::PortWaitError> {
+        port_wait(self, port, deadline, packet).map_err(declared(server::PortWaitError::BadHandle))
+    }
+
+    fn port_cancel(
+        &self,
+        port: rt::HandleArg,
+        object: rt::HandleArg,
+        key: u64,
+    ) -> Result<(), server::PortCancelError> {
+        port::cancel(
+            &self.process.handles,
+            (port.value(), need(port)),
+            (object.value(), need(object)),
+            key,
+        )
+        .map_err(declared(server::PortCancelError::BadHandle))
+    }
+
+    fn clock_read(&self, nanos: rt::UserRef<u64>) -> Result<(), server::ClockReadError> {
+        // The clock never steps back (ADR-0012), so neither does what a program reads (F10).
+        copy_out(self, nanos.addr(), &time::monotonic_nanos().to_le_bytes())
+            .map_err(declared(server::ClockReadError::Fault))
     }
 }
 
@@ -585,6 +662,60 @@ fn memory_map(
     // written only by a call that succeeds (OIDL `@also_on`).
     let tell = |at: u64| copy_out(p, address.addr(), &at.to_le_bytes());
     memory_object::map(&p.process, &target, &object, held, &request, &tell).map(|_| ())
+}
+
+/// A call that makes one object and returns a handle to it with `rights` (ADR-0005 Amendment 7,
+/// F17): the out pointer is checked before anything is made, and a handle the caller cannot be
+/// told of is closed again, which gives the object and its charge back.
+fn create_one(
+    p: &UserContext,
+    out: rt::UserRef<rt::Handle>,
+    make: impl FnOnce(&ObjectRef<Account>) -> Result<ipc::Object, Error>,
+    rights: u32,
+) -> Result<(), Error> {
+    checked(p, out.addr(), HANDLE_BYTES as u64, UserAccess::Write)?;
+    let object = make(&p.process.account)?;
+    let handle = p.process.grant(object, rights)?;
+    copy_out(p, out.addr(), &handle.to_le_bytes()).inspect_err(|_| {
+        let _ = ipc::handle_close(&p.process, handle, Need::NOTHING);
+    })
+}
+
+/// `port_wait` (F3): the out pointer is checked before the wait and written only with a packet.
+/// A packet is taken when it is read, so a write that faults then loses it, as `channel_read`
+/// loses a message it has taken.
+fn port_wait(
+    p: &UserContext,
+    port: rt::HandleArg,
+    deadline: u64,
+    packet: rt::UserRef<oidl::PortPacket>,
+) -> Result<(), Error> {
+    checked(p, packet.addr(), PACKET_BYTES as u64, UserAccess::Write)?;
+    let taken = port::wait(
+        &p.process.handles,
+        &p.process.waiting,
+        port.value(),
+        need(port),
+        deadline,
+    )?;
+    copy_out_packet(p, packet.addr(), &taken)
+}
+
+/// Writes `packet` to the caller's memory at `addr` as the definition lays out a `port_packet`
+/// (F1): each field little-endian at its offset, `reserved` and `data` zero. The packet holds no
+/// reference and no address (C9).
+fn copy_out_packet(p: &UserContext, addr: u64, packet: &Packet) -> Result<(), Error> {
+    let kind = match packet.kind {
+        Kind::Signal => oidl::PacketKind::Signal,
+        Kind::Canceled => oidl::PacketKind::Canceled,
+    };
+    let mut bytes = [0; PACKET_BYTES];
+    rt::put_field(&mut bytes, oidl::PortPacket::KEY_AT, packet.key)
+        .and_then(|()| rt::put_field(&mut bytes, oidl::PortPacket::KIND_AT, kind.raw()))
+        .and_then(|()| rt::put_field(&mut bytes, oidl::PortPacket::TRIGGER_AT, packet.trigger))
+        .and_then(|()| rt::put_field(&mut bytes, oidl::PortPacket::OBSERVED_AT, packet.observed))
+        .map_err(|_| Error::Fault)?;
+    copy_out(p, addr, &bytes)
 }
 
 /// `wait_one`. The decoder has refused an empty mask and undefined signals.

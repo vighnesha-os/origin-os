@@ -64,16 +64,8 @@ pub(crate) enum Object {
     /// A memory object (C7).
     Memory(ObjectRef<MemoryObject>),
     /// An event (C10).
-    #[expect(
-        dead_code,
-        reason = "the system calls of task S3-6 use it: the interface step, the next commit"
-    )]
     Event(ObjectRef<Event>),
     /// A port (C9).
-    #[expect(
-        dead_code,
-        reason = "the system calls of task S3-6 use it: the interface step, the next commit"
-    )]
     Port(PortHandle),
 }
 

@@ -181,6 +181,11 @@ pub mod rights {
     /// The rights of a new memory object (amendment C6): never `EXECUTE`, since an anonymous
     /// object is never executable; `WAIT`, `SIGNAL` and `MANAGE` do not apply.
     pub const MEMORY_OBJECT: u32 = READ | WRITE | MAP | DUPLICATE | TRANSFER;
+    /// The rights of a new event (amendments C6 and F6).
+    pub const EVENT: u32 = WAIT | SIGNAL | DUPLICATE | TRANSFER;
+    /// The rights of a new port (amendments C6 and F6): no `WAIT`, since a port raises no
+    /// signals (F8).
+    pub const PORT: u32 = READ | WRITE | DUPLICATE | TRANSFER;
 }
 
 /// Object signals (P9).
@@ -241,7 +246,7 @@ pub mod syscall {
     pub const CHANNEL_READ: u64 = 7;
     /// `wait_one(handle, signals, deadline, out_observed)`.
     pub const WAIT_ONE: u64 = 8;
-    /// `event_create(out_handle)`.
+    /// `event_create(out_event)` (amendment F17).
     pub const EVENT_CREATE: u64 = 9;
     /// `object_signal(handle, clear, set)`: user signals ([`super::signals::SIGNALED`]).
     pub const OBJECT_SIGNAL: u64 = 10;
@@ -254,6 +259,16 @@ pub mod syscall {
     /// `memory_protect(process, address, length, access)`: one whole mapping, its access only
     /// reduced ([`super::map_access`]).
     pub const MEMORY_PROTECT: u64 = 14;
+    /// `port_create(out_port)` (amendment F17).
+    pub const PORT_CREATE: u64 = 15;
+    /// `object_wait_async(port, object, key, signals)` (amendment F2).
+    pub const OBJECT_WAIT_ASYNC: u64 = 16;
+    /// `port_wait(port, deadline, out_packet)`: a [`super::port_packet`] (amendment F3).
+    pub const PORT_WAIT: u64 = 17;
+    /// `port_cancel(port, object, key)` (amendment F4).
+    pub const PORT_CANCEL: u64 = 18;
+    /// `clock_read(out_nanos)`: the monotonic clock (amendment F10).
+    pub const CLOCK_READ: u64 = 19;
 }
 
 /// Bytes in a page: memory objects, mappings, offsets and fixed addresses are whole pages of
@@ -390,6 +405,42 @@ pub mod received_handle {
     pub const OBJECT_TYPE_AT: usize = 4;
     /// Byte offset of `rights`.
     pub const RIGHTS_AT: usize = 8;
+}
+
+/// What `port_wait` writes (C9; amendment F1): one packet, 32 bytes, every field
+/// little-endian, with no padding and no `size` (an exception to P4 for this record only).
+///
+/// ```text
+/// 0  u64 key        what the binder gave, unchanged
+/// 8  u32 kind       a packet_kind: SIGNAL or CANCELED, never 0
+/// 12 u32 trigger    the mask the binding asked
+/// 16 u32 observed   the object's signals when the packet was queued
+/// 20 u32            zero
+/// 24 u64 data       zero in this version
+/// ```
+pub mod port_packet {
+    /// Bytes of one packet.
+    pub const SIZE: usize = 32;
+    /// Byte offset of `key`.
+    pub const KEY_AT: usize = 0;
+    /// Byte offset of `kind`.
+    pub const KIND_AT: usize = 8;
+    /// Byte offset of `trigger`.
+    pub const TRIGGER_AT: usize = 12;
+    /// Byte offset of `observed`.
+    pub const OBSERVED_AT: usize = 16;
+    /// Byte offset of `reserved`.
+    pub const RESERVED_AT: usize = 20;
+    /// Byte offset of `data`.
+    pub const DATA_AT: usize = 24;
+}
+
+/// What made a packet (amendment F1).
+pub mod packet_kind {
+    /// The object's signals met the binding's mask.
+    pub const SIGNAL: u32 = 1;
+    /// The binding was cancelled implicitly (F11, F16).
+    pub const CANCELED: u32 = 2;
 }
 
 /// The start record, version 1 (P6, amendment C4): what a process begins with. The kernel
@@ -833,6 +884,15 @@ mod tests {
             syscall::WAIT_ONE,
             syscall::EVENT_CREATE,
             syscall::OBJECT_SIGNAL,
+            syscall::MEMORY_OBJECT_CREATE,
+            syscall::MEMORY_MAP,
+            syscall::MEMORY_UNMAP,
+            syscall::MEMORY_PROTECT,
+            syscall::PORT_CREATE,
+            syscall::OBJECT_WAIT_ASYNC,
+            syscall::PORT_WAIT,
+            syscall::PORT_CANCEL,
+            syscall::CLOCK_READ,
         ];
         let mut sorted = n.to_vec();
         sorted.sort_unstable();

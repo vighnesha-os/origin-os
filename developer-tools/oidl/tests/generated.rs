@@ -858,11 +858,12 @@ fn the_corpus_passes_and_every_planted_fault_fails_it() {
             "if raw & !Self::ALL.0 == 0 {",
             "if true {",
         ),
+        // origin.kernel has no reserved call since 0.6 (ADR-0005 Amendment 7): the fixture's.
         (
             "a reserved call succeeds",
-            "rust/origin_kernel/kernel/server.rs",
-            "number::EVENT_CREATE => Error::NotSupported.raw(),",
-            "number::EVENT_CREATE => 0,",
+            "rust/origin_fixture_calls/calls/server.rs",
+            "number::UNIMPLEMENTED => super::super::super::origin_kernel::Error::NotSupported.raw(),",
+            "number::UNIMPLEMENTED => 0,",
         ),
     ];
     let results: Mutex<Vec<(String, Result<String, String>)>> = Mutex::new(Vec::new());
@@ -1214,7 +1215,7 @@ fn the_definition_has_exactly_the_hand_written_abi_s_statuses_rights_signals_and
         .iter()
         .map(|m| (m.name.as_str(), m.ordinal))
         .collect();
-    assert_eq!(numbers.len(), 15);
+    assert_eq!(numbers.len(), 20);
     assert_eq!(u64::from(numbers["thread_exit"]), syscall::THREAD_EXIT);
     assert_eq!(u64::from(numbers["debug_report"]), syscall::DEBUG_REPORT);
     assert_eq!(u64::from(numbers["debug_write"]), syscall::DEBUG_WRITE);
@@ -1242,6 +1243,14 @@ fn the_definition_has_exactly_the_hand_written_abi_s_statuses_rights_signals_and
         u64::from(numbers["memory_protect"]),
         syscall::MEMORY_PROTECT
     );
+    assert_eq!(u64::from(numbers["port_create"]), syscall::PORT_CREATE);
+    assert_eq!(
+        u64::from(numbers["object_wait_async"]),
+        syscall::OBJECT_WAIT_ASYNC
+    );
+    assert_eq!(u64::from(numbers["port_wait"]), syscall::PORT_WAIT);
+    assert_eq!(u64::from(numbers["port_cancel"]), syscall::PORT_CANCEL);
+    assert_eq!(u64::from(numbers["clock_read"]), syscall::CLOCK_READ);
     let object_type = comp.object_type.as_ref().expect("object_type");
     assert_eq!(
         object_type

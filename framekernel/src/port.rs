@@ -22,10 +22,6 @@
 //! is a leaf. So nothing calls into the protocol while it holds a handle table or a channel's
 //! lock, and a port's last handle is never dropped under one.
 #![forbid(unsafe_code)]
-#![expect(
-    dead_code,
-    reason = "the system calls of task S3-6 use it: the interface step, the next commit"
-)]
 
 use core::ops::Deref;
 use core::sync::atomic::{AtomicU32, Ordering};

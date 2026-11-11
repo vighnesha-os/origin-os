@@ -11,21 +11,33 @@
 //! - There is no pulse: a signal raised and cleared again by the time a waiter looks may be
 //!   missed by that waiter, as C10 says.
 #![forbid(unsafe_code)]
-#![expect(
-    dead_code,
-    reason = "the system calls of task S3-6 use it: the interface step, the next commit"
-)]
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use origin_abi::{Error, signals};
+use origin_abi::{Error, Handle, signals};
 use origin_frame::objref::ObjectRef;
+use origin_frame::sync::SpinLock;
 use origin_frame::sync::ports::Source;
 
-use crate::ipc::note_cross_cpu_wakes;
+use crate::cpu::without_interrupts;
+use crate::handles::{HandleTable, Need};
+use crate::ipc::{Object, note_cross_cpu_wakes};
 use crate::port::Ports;
 use crate::process::Account;
 use crate::wait::{KernelThreads, WaitQueue};
+
+/// The event `handle` names in `table`, if the handle meets `need`: [`Error::WrongType`] for any
+/// other object, after the handle's own checks (F5's order).
+pub(crate) fn event_of(
+    table: &SpinLock<HandleTable<Object>>,
+    handle: Handle,
+    need: Need,
+) -> Result<ObjectRef<Event>, Error> {
+    without_interrupts(|| match table.lock().get(handle, need)? {
+        (Object::Event(event), _) => Ok(event.clone()),
+        _ => Err(Error::WrongType),
+    })
+}
 
 /// One event.
 pub(crate) struct Event {

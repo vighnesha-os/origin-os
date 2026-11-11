@@ -14,7 +14,7 @@
 use super::super::oidl_rt as rt;
 
 /// This library's version: `(major, minor)` (§9).
-pub const VERSION: (u16, u16) = (0, 5);
+pub const VERSION: (u16, u16) = (0, 6);
 
 /// The rights of a new channel end: everything that applies to a channel (ADR-0005 P2, P8,
 /// amendment A1).
@@ -30,6 +30,13 @@ pub const THREAD_RIGHTS: Rights = match Rights::from_bits(0x170) { Some(value) =
 /// The rights of a new memory object (ADR-0005 C6): never execute, since an anonymous object
 /// is never executable.
 pub const MEMORY_OBJECT_RIGHTS: Rights = match Rights::from_bits(0x37) { Some(value) => value, None => Rights::NONE };
+
+/// The rights of a new event (ADR-0005 C6; Amendment 7, F6).
+pub const EVENT_RIGHTS: Rights = match Rights::from_bits(0xf0) { Some(value) => value, None => Rights::NONE };
+
+/// The rights of a new port (ADR-0005 C6; Amendment 7, F6). No wait: a port raises no signals
+/// in this version, so wait_one on it is access_denied and it cannot be bound to a port (F8).
+pub const PORT_RIGHTS: Rights = match Rights::from_bits(0x33) { Some(value) => value, None => Rights::NONE };
 
 /// Bytes in a page: every memory object, mapping, offset and fixed address is counted in
 /// whole pages of this size (ADR-0005 P7, D2).
@@ -89,7 +96,8 @@ pub enum Error {
     /// The caller's buffer is too small; the sizes it needs were written to the out pointer.
     BufferTooSmall = -13,
     /// Nothing by that name or key is here: a service directory holds no provider of the
-    /// interface and major asked for (ADR-0005 C11).
+    /// interface and major asked for (ADR-0005 C11), or a port holds no binding or packet for
+    /// the object and key port_cancel names (ADR-0005 Amendment 7, F4).
     NotFound = -14,
 }
 
@@ -273,6 +281,66 @@ impl StartRole {
 impl rt::Fixed for StartRole {
     const SIZE: usize = 4;
     const FILLER: Self = Self::Bootstrap;
+    fn read(bytes: &[u8], minor: u16) -> Result<Self, rt::WireError> {
+        let raw = <u32 as rt::Fixed>::read(bytes, minor)?;
+        let value = Self::from_raw(raw).ok_or(rt::WireError::Enum)?;
+        if minor < value.since_minor() {
+            return Err(rt::WireError::Enum);
+        }
+        Ok(value)
+    }
+    fn write(self, out: &mut [u8]) -> Result<(), rt::WireError> {
+        rt::Fixed::write(self.raw(), out)
+    }
+}
+
+/// What made a port packet (ADR-0005 C9; Amendment 7, F1). 0 is never a kind, so a zeroed
+/// buffer is not a packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+#[non_exhaustive]
+pub enum PacketKind {
+    /// The object's signals met the binding's mask.
+    Signal = 1,
+    /// The binding was cancelled implicitly: the handle it was made through was closed or
+    /// moved, or the binder's process ended (F11, F16).
+    Canceled = 2,
+}
+
+impl PacketKind {
+    /// Every member, in declaration order.
+    pub const ALL: [Self; 2] = [Self::Signal, Self::Canceled];
+
+    /// The value on the wire or in a register.
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+
+    /// The member with this value, if there is one.
+    pub fn from_raw(raw: u32) -> Option<Self> {
+        Self::ALL.iter().copied().find(|e| e.raw() == raw)
+    }
+
+    /// This value's name in the C ABI.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Signal => "SIGNAL",
+            Self::Canceled => "CANCELED",
+        }
+    }
+
+    /// The first minor it is valid at.
+    const fn since_minor(self) -> u16 {
+        match self {
+            Self::Signal => 6,
+            Self::Canceled => 6,
+        }
+    }
+}
+
+impl rt::Fixed for PacketKind {
+    const SIZE: usize = 4;
+    const FILLER: Self = Self::Signal;
     fn read(bytes: &[u8], minor: u16) -> Result<Self, rt::WireError> {
         let raw = <u32 as rt::Fixed>::read(bytes, minor)?;
         let value = Self::from_raw(raw).ok_or(rt::WireError::Enum)?;
@@ -1000,6 +1068,79 @@ impl MapRequest {
         if u64::from(limit) >= 40 && let Some(value) = self.address {
             rt::put_field(out, 32, value)?;
         }
+        Ok(())
+    }
+}
+
+/// One packet, as port_wait writes it (ADR-0005 C9; Amendment 7, F1, F14): 32 bytes, no padding
+/// and no size field, an exception to P4's rule for this record only. A different layout is a
+/// new call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortPacket {
+    /// What the binder gave object_wait_async, unchanged.
+    pub key: u64,
+    /// What made the packet. A new kind is a new minor of origin.kernel: a client decodes this
+    /// field strictly and refuses a kind its minor does not know.
+    pub kind: PacketKind,
+    /// The mask the binding asked.
+    pub trigger: Signals,
+    /// All of the object's signals when the packet was queued; for a canceled packet, when the
+    /// binding was cancelled. A packet stays queued if a signal falls afterwards.
+    pub observed: Signals,
+    /// Zero.
+    pub reserved: u32,
+    /// Zero in this version.
+    pub data: u64,
+}
+
+impl PortPacket {
+    /// Byte offset of `key`.
+    pub const KEY_AT: usize = 0;
+    /// Byte offset of `kind`.
+    pub const KIND_AT: usize = 8;
+    /// Byte offset of `trigger`.
+    pub const TRIGGER_AT: usize = 12;
+    /// Byte offset of `observed`.
+    pub const OBSERVED_AT: usize = 16;
+    /// Byte offset of `reserved`.
+    pub const RESERVED_AT: usize = 20;
+    /// Byte offset of `data`.
+    pub const DATA_AT: usize = 24;
+}
+
+impl rt::Fixed for PortPacket {
+    const SIZE: usize = 32;
+    const FILLER: Self = Self {
+        key: <u64 as rt::Fixed>::FILLER,
+        kind: <PacketKind as rt::Fixed>::FILLER,
+        trigger: <Signals as rt::Fixed>::FILLER,
+        observed: <Signals as rt::Fixed>::FILLER,
+        reserved: <u32 as rt::Fixed>::FILLER,
+        data: <u64 as rt::Fixed>::FILLER,
+    };
+    fn read(oidl_bytes: &[u8], oidl_minor: u16) -> Result<Self, rt::WireError> {
+        if oidl_bytes.len() != Self::SIZE {
+            return Err(rt::WireError::Size);
+        }
+        let key: u64 = rt::field(oidl_bytes, 0, oidl_minor)?;
+        let kind: PacketKind = rt::field(oidl_bytes, 8, oidl_minor)?;
+        let trigger: Signals = rt::field(oidl_bytes, 12, oidl_minor)?;
+        let observed: Signals = rt::field(oidl_bytes, 16, oidl_minor)?;
+        let reserved: u32 = rt::field(oidl_bytes, 20, oidl_minor)?;
+        let data: u64 = rt::field(oidl_bytes, 24, oidl_minor)?;
+        Ok(Self { key, kind, trigger, observed, reserved, data })
+    }
+    fn write(self, out: &mut [u8]) -> Result<(), rt::WireError> {
+        if out.len() != Self::SIZE {
+            return Err(rt::WireError::Size);
+        }
+        out.fill(0);
+        rt::put_field(out, 0, self.key)?;
+        rt::put_field(out, 8, self.kind)?;
+        rt::put_field(out, 12, self.trigger)?;
+        rt::put_field(out, 16, self.observed)?;
+        rt::put_field(out, 20, self.reserved)?;
+        rt::put_field(out, 24, self.data)?;
         Ok(())
     }
 }
