@@ -479,7 +479,7 @@ The stack region is not on this branch, so nothing here uses the value: the boot
 
 ### S3-6. Events, ports and `clock_read`
 
-Sent by the coordinating session to the interface session on 2026-11-11, after the owner said "Start S3-6"; written here on 2026-11-11, when the owner accepted its 19 shapes (decision items 169 to 187; ADR-0005 Amendment 7). Stage 1, the research ledger and the shapes, is done (`docs/research/2026-11-11-events-ports.md`). **Stage 2, the build, is done on `claude/s3-6-events-ports` (2026-11-11), not yet read or merged by the coordinating session:** the interface at 0.6, the kernel's side of the seven calls, two boot results with eleven negative controls (ADR-0013, EP1 to EP11), threat rows K1 to K15, and the provenance entry. It ran under QEMU on the development Mac only.
+Sent by the coordinating session to the interface session on 2026-11-11, after the owner said "Start S3-6"; written here on 2026-11-11, when the owner accepted its 19 shapes (decision items 169 to 187; ADR-0005 Amendment 7). Stage 1, the research ledger and the shapes, is done (`docs/research/2026-11-11-events-ports.md`). **Stage 2, the build, is done (2026-11-11), and in the batch since merge `15baed9`, after the coordinating session read it against Amendment 7 and ran the check, the boot test and the boot matrix on the merge (`SOURCE_PROVENANCE.md`):** the interface at 0.6, the kernel's side of the seven calls, two boot results with eleven negative controls (ADR-0013, EP1 to EP11), threat rows K1 to K15, and the provenance entry. It ran under QEMU on the development Mac only.
 
 | Field | |
 |---|---|
