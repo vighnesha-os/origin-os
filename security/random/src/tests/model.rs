@@ -14,11 +14,12 @@
 //!
 //! - *Weather* ([`Weather`]). Once the machine has started, an instruction may be not ready,
 //!   go dry for up to 399 tries, give zero or all ones with success reported, or give its last
-//!   value again.
+//!   value again. In one weather RDSEED runs out after a few values.
 //! - *One thread of control* ([`Chaos`]). After a step another request may run from beginning
 //!   to end, up to three deep: an interrupt, or another thread on that processor. The thread
-//!   may be on another processor afterwards. The root's lock may be found taken. The clock
-//!   moves at every step and now and then steps back.
+//!   may be on another processor afterwards, by chance, or because the store it stood at was
+//!   full. The root's lock may be found taken. The clock moves at every step and now and then
+//!   steps back.
 //! - *Several threads* ([`Thread`]). Each thread makes its requests in turns of one step, and
 //!   the machine's random numbers say whose turn is next: the steps of requests that are in
 //!   flight together interleave one by one, which nesting cannot do.
@@ -54,10 +55,10 @@
 //! - With instructions that always deliver, no lock taken and no move: after a plain request
 //!   on a processor with a healthy instruction, the root's seed is younger than a reseed
 //!   period and 5 ms.
-//! - In dry weather, at length: at least one reseed of the root is made from RDRAND, with the
-//!   RDSEED draws gathered before as additional input (S3).
+//! - Where RDSEED runs out in the middle of gatherings: reseeds of the root are made from
+//!   RDRAND, with the RDSEED draws gathered before as additional input (S3).
 //! - Every configuration makes seeds, and does what it is there for: requests nest, threads
-//!   move. A run in which nothing happens keeps every rule.
+//!   move, instructions fail. A run in which nothing happens keeps every rule.
 //!
 //! **What it does not show.**
 //!
@@ -77,8 +78,8 @@
 //!   shares nothing between processors except through the platform.
 //!
 //! **Running it.** Every configuration is two tests. The short one runs with the crate's
-//! others. The one whose name ends in `at_length` is marked `#[ignore]`: it is the run that
-//! was made on 2026-11-11, seed for seed.
+//! others. The one whose name ends in `at_length` is marked `#[ignore]`: for the
+//! configurations of 2026-11-11 it is the run that was made then, seed for seed.
 //!
 //! ```text
 //! cargo test --package origin-random                        the short runs
@@ -90,8 +91,8 @@
 //! violation was seen, and the violations' texts. The same seed makes the same run, and a
 //! short run is the beginning of the run at length.
 //!
-//! **Negative controls.** `tools/plant_faults.py` puts defects back one at a time; a test
-//! here fails for many of them.
+//! **Negative controls.** `tools/plant_faults.py` puts defects back one at a time. For the
+//! entries it marks as this model's it fails unless a test of this file notices each.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
@@ -336,6 +337,9 @@ struct Weather {
     stuck: u64,
     /// In a hundred thousand: it gives the value it gave last.
     repeat: u64,
+    /// RDSEED gives at most this many values in a row, and then nothing for 100 to 199 tries:
+    /// it runs out, as a rule in the middle of a gathering. 0 for no such limit.
+    runs_out: u64,
 }
 
 /// Something of everything, now and then.
@@ -344,19 +348,33 @@ const ROUGH: Weather = Weather {
     not_ready: 20,
     stuck: 30,
     repeat: 6,
+    runs_out: 0,
 };
 /// The same, with RDSEED dry fifteen times as often.
 const DRY: Weather = Weather { dry: 30, ..ROUGH };
+/// The same, with ten times the stuck values and the repeats: instructions fail their tests
+/// every few hundred requests.
+const STORMY: Weather = Weather {
+    stuck: 300,
+    repeat: 60,
+    ..ROUGH
+};
 /// Not ready now and then, and nothing else.
 const FAIR: Weather = Weather {
     dry: 0,
     not_ready: 2,
     stuck: 0,
     repeat: 0,
+    runs_out: 0,
 };
 /// Instructions that never fail.
 const CLEAR: Weather = Weather {
     not_ready: 0,
+    ..FAIR
+};
+/// RDSEED that runs out after twelve values at most, and is not ready now and then.
+const SPENT: Weather = Weather {
+    runs_out: 12,
     ..FAIR
 };
 
@@ -367,6 +385,8 @@ struct Line {
     last: u64,
     /// Tries for which it stays dry.
     dry: u64,
+    /// Values it still gives before it runs out, in weather that has it run out.
+    left: u64,
 }
 
 /// One processor's instructions, for the length of one step.
@@ -426,6 +446,18 @@ impl Source for Lines<'_> {
         log.given += 1;
         let value = splitmix(VALUES, log.given);
         line.last = value;
+        if which == Rdseed
+            && let Some(weather) = self.weather
+            && weather.runs_out != 0
+        {
+            if line.left == 0 {
+                line.left = 1 + self.rng.below(weather.runs_out);
+            }
+            line.left -= 1;
+            if line.left == 0 {
+                line.dry = 100 + self.rng.below(100);
+            }
+        }
         log.drawn.insert(
             value,
             Drawn {
@@ -520,6 +552,10 @@ struct Chaos {
     root_busy: u64,
     /// In a hundred thousand, after a step: the clock steps back by up to three seconds.
     clock_back: u64,
+    /// In a thousand, after a step: the thread is on a processor chosen anew, if the store of
+    /// the processor it is on is full. A full store is a seed about to be made. This leaves
+    /// one behind, or brings a request to another processor with its gathering done.
+    leaves_full: u64,
 }
 
 impl Chaos {
@@ -532,6 +568,7 @@ impl Chaos {
             moves,
             root_busy: 30,
             clock_back: 20,
+            leaves_full: 0,
         }
     }
 }
@@ -568,6 +605,7 @@ impl Machine {
             reported,
             last: 0,
             dry: 0,
+            left: 0,
         };
         Self {
             seed,
@@ -840,6 +878,13 @@ impl Machine {
             self.log.tally.moves += 1;
             self.on = self.rng.index(self.nodes.len());
         }
+        if chaos.leaves_full != 0
+            && self.nodes[self.on].store_full()
+            && self.rng.chance(chaos.leaves_full)
+        {
+            self.log.tally.moves += 1;
+            self.on = self.rng.index(self.nodes.len());
+        }
     }
 
     /// One request on this thread of control, from beginning to end.
@@ -980,8 +1025,7 @@ fn reports(rng: &mut Rng, cpus: usize, sides: u64) -> Vec<(bool, bool)> {
 
 /// How far the clock has moved when the next request is made. One request in `waits` comes a
 /// second or two after the one before it, one in `waits` 20 to 70 seconds after, and the
-/// others sooner than `mostly` nanoseconds. The fewer the waits, the oftener a reseed falls
-/// due.
+/// others sooner than `mostly` nanoseconds.
 fn interval(rng: &mut Rng, waits: u64, mostly: u64) -> u64 {
     match rng.below(waits) {
         0 => 1_000_000_000 + rng.below(1_000_000_000),
@@ -995,14 +1039,20 @@ fn interval(rng: &mut Rng, waits: u64, mostly: u64) -> u64 {
 struct Single {
     weather: Weather,
     chaos: Chaos,
+    /// One request in this many comes 20 to 70 seconds after the one before it, and one in
+    /// this many a second or two after; the others within 50 ms. The fewer, the oftener a
+    /// reseed falls due.
+    waits: u64,
 }
 
 impl Single {
-    /// Requests that nest and threads that move this often.
+    /// Requests that nest and threads that move this often, with a long wait before one
+    /// request in twenty.
     const fn of(weather: Weather, nest: u64, moves: u64) -> Self {
         Self {
             weather,
             chaos: Chaos::of(nest, moves),
+            waits: 20,
         }
     }
 }
@@ -1020,7 +1070,7 @@ fn run(seed: u64, requests: u32, config: Single) -> Machine {
     machine.chaos = Some(config.chaos);
     for _ in 0..requests {
         machine.on = machine.rng.index(reports.len());
-        machine.now += interval(&mut machine.rng, 20, 50_000_000);
+        machine.now += interval(&mut machine.rng, config.waits, 50_000_000);
         machine.request(false);
     }
     machine
@@ -1070,10 +1120,14 @@ struct Thread<'a> {
     on: usize,
     /// The request it is making.
     frame: Option<Frame>,
+    /// How often its requests come after a long wait ([`Threads::waits`]).
+    waits: u64,
     /// Whether that request came with interrupts off.
     quick: bool,
     /// In a thousand, after a step: the thread is on a processor chosen anew.
     moves: u64,
+    /// The same, if the store of the processor it is on is full ([`Chaos::leaves_full`]).
+    leaves_full: u64,
     /// In a thousand, at a step under the root's lock: the lock is found taken.
     root_busy: u64,
 }
@@ -1117,6 +1171,13 @@ impl Thread<'_> {
             machine.log.tally.moves += 1;
             self.on = machine.rng.index(machine.nodes.len());
         }
+        if self.leaves_full != 0
+            && machine.nodes[self.on].store_full()
+            && machine.rng.chance(self.leaves_full)
+        {
+            machine.log.tally.moves += 1;
+            self.on = machine.rng.index(machine.nodes.len());
+        }
         done
     }
 
@@ -1127,7 +1188,7 @@ impl Thread<'_> {
             let (kind, len) = shape(&mut machine.rng, 350, 300);
             thread.quick = machine.rng.chance(200);
             thread.on = machine.rng.index(machine.nodes.len());
-            machine.now += interval(&mut machine.rng, 40, 5_000_000);
+            machine.now += interval(&mut machine.rng, thread.waits, 5_000_000);
             thread.frame = Some(machine.log.open(kind));
             (kind, len)
         });
@@ -1209,6 +1270,11 @@ struct Threads {
     requests: u32,
     /// In a thousand, after a step: the thread is on a processor chosen anew.
     moves: u64,
+    /// The same, if the store of the processor it is on is full ([`Chaos::leaves_full`]).
+    leaves_full: u64,
+    /// One request in this many comes 20 to 70 seconds after the one before it, and one in
+    /// this many a second or two after; the others within 5 ms.
+    waits: u64,
     weather: Weather,
 }
 
@@ -1236,8 +1302,10 @@ fn run_threads(seed: u64, config: Threads) -> Machine {
                     turns,
                     on: 0,
                     frame: None,
+                    waits: config.waits,
                     quick: false,
                     moves: config.moves,
+                    leaves_full: config.leaves_full,
                     root_busy: 20,
                 };
                 for _ in 0..config.requests {
@@ -1320,7 +1388,7 @@ fn threaded(name: &str, first: u64, machines: u64, config: Threads) -> Tally {
     check(name, &machines)
 }
 
-// ---- One thread of control. ----
+// ---- One thread of control. The first seven are the configurations of 2026-11-11. ----
 
 fn one_after_another(machines: u64, requests: u32) {
     let config = Single::of(ROUGH, 0, 0);
@@ -1413,8 +1481,8 @@ fn the_rules_are_kept_in_dry_weather() {
     in_dry_weather((6, 2000));
 }
 
-/// At this length the weather makes the root's reseed fall back to RDRAND, three times on the
-/// code of 2026-11-11.
+/// At this length the weather alone makes the root's reseed fall back to RDRAND, three times
+/// on the code of 2026-11-11. The short runs have [`rdseed_runs_out`] for that.
 #[test]
 #[ignore = "at length: run with -- --ignored"]
 fn the_rules_are_kept_in_dry_weather_at_length() {
@@ -1499,7 +1567,94 @@ fn the_root_keeps_its_schedule_in_calm_weather_at_length() {
     calm(40, 6000);
 }
 
-// ---- Several threads. ----
+// ---- One thread of control, in configurations that make a rare thing the rule. ----
+
+/// Instructions that fail their tests often, and a reseed due at every fifth request: what
+/// an instruction gave is thrown away, its start-up test is run again over later requests,
+/// and a processor that has lost both asks the root.
+fn failing_often(machines: u64, requests: u32) {
+    let config = Single {
+        waits: 5,
+        ..Single::of(STORMY, 40, 60)
+    };
+    let name = "instructions that fail often";
+    let tally = single(name, 1400, machines, requests, config);
+    assert!(tally.failures > 0, "no instruction failed");
+}
+
+#[test]
+fn instructions_that_fail_often_leave_nothing_in_a_seed() {
+    failing_often(8, 1000);
+}
+
+#[test]
+#[ignore = "at length: run with -- --ignored"]
+fn instructions_that_fail_often_leave_nothing_in_a_seed_at_length() {
+    failing_often(16, 4000);
+}
+
+/// RDSEED that runs out in the middle of a gathering, and a reseed due at every fifth
+/// request: the root's reseed then falls back to RDRAND as a matter of course, with the
+/// RDSEED draws it had as additional input (S3). Little else happens between the steps: a
+/// draw that uses all its hundred tries has to be left to finish.
+fn rdseed_runs_out(machines: u64, requests: u32) {
+    let config = Single {
+        waits: 5,
+        ..Single::of(SPENT, 5, 5)
+    };
+    let tally = single("RDSEED that runs out", 1100, machines, requests, config);
+    assert!(
+        tally.root_fallbacks > 0,
+        "no reseed of the root fell back to RDRAND"
+    );
+}
+
+#[test]
+fn the_roots_reseed_falls_back_to_rdrand_when_rdseed_runs_out() {
+    rdseed_runs_out(8, 1000);
+}
+
+#[test]
+#[ignore = "at length: run with -- --ignored"]
+fn the_roots_reseed_falls_back_to_rdrand_when_rdseed_runs_out_at_length() {
+    rdseed_runs_out(16, 4000);
+}
+
+/// A thread that is often somewhere else after a step that leaves a store full, and a reseed
+/// due at every fifth request: stores are left behind full, and requests arrive on another
+/// processor with their gathering done.
+fn leaving_full_stores(name: &str, weather: Weather, first: u64, machines: u64, requests: u32) {
+    let config = Single {
+        chaos: Chaos {
+            leaves_full: 300,
+            ..Chaos::of(10, 20)
+        },
+        waits: 5,
+        weather,
+    };
+    let tally = single(name, first, machines, requests, config);
+    assert!(tally.moves > 0, "no thread moved");
+}
+
+fn left_behind_full(machines: u64, requests: u32) {
+    let name = "a thread that leaves full stores behind";
+    leaving_full_stores(name, FAIR, 1200, machines, requests);
+    let name = "a thread that leaves full stores behind, rough weather";
+    leaving_full_stores(name, ROUGH, 1250, machines, requests);
+}
+
+#[test]
+fn a_store_left_behind_full_is_nobody_elses_seed() {
+    left_behind_full(8, 1000);
+}
+
+#[test]
+#[ignore = "at length: run with -- --ignored"]
+fn a_store_left_behind_full_is_nobody_elses_seed_at_length() {
+    left_behind_full(16, 4000);
+}
+
+// ---- Several threads. All but the one that leaves full stores are of 2026-11-11. ----
 
 /// Threads on `cpus` processors in rough weather that stay where they are while a request
 /// runs.
@@ -1509,6 +1664,8 @@ fn threads_that_stay(name: &str, first: u64, threads: usize, cpus: usize, size: 
         cpus,
         requests: size.1,
         moves: 0,
+        leaves_full: 0,
+        waits: 40,
         weather: ROUGH,
     };
     threaded(name, first, size.0, config);
@@ -1552,6 +1709,8 @@ fn threads_that_move(name: &str, weather: Weather, first: u64, size: (u64, u32))
         cpus: 3,
         requests: size.1,
         moves: 80,
+        leaves_full: 0,
+        waits: 40,
         weather,
     };
     let tally = threaded(name, first, size.0, config);
@@ -1606,6 +1765,34 @@ fn threads_that_move_keep_the_rules_in_dry_weather_at_length() {
     moving_in_dry_weather((10, 1500));
 }
 
+/// Four threads that are often somewhere else after a step that leaves a store full, with a
+/// reseed due at every fifth request.
+fn threads_that_leave_full_stores(size: (u64, u32)) {
+    let config = Threads {
+        threads: 4,
+        cpus: 3,
+        requests: size.1,
+        moves: 20,
+        leaves_full: 300,
+        waits: 5,
+        weather: FAIR,
+    };
+    let name = "four threads that leave full stores behind on three processors";
+    let tally = threaded(name, 1300, size.0, config);
+    assert!(tally.moves > 0, "no thread moved");
+}
+
+#[test]
+fn threads_that_leave_full_stores_behind_keep_the_rules() {
+    threads_that_leave_full_stores((4, 500));
+}
+
+#[test]
+#[ignore = "at length: run with -- --ignored"]
+fn threads_that_leave_full_stores_behind_keep_the_rules_at_length() {
+    threads_that_leave_full_stores((10, 1500));
+}
+
 /// Threads on one processor whose instructions never fail. One thread alone is always
 /// answered. Two or three overwrite each other's gatherings for prediction resistance, and
 /// most such requests are refused after thousands of draws: ADR-0016 records that, with its
@@ -1616,6 +1803,8 @@ fn in_clear_weather(threads: usize, size: (u64, u32)) -> Tally {
         cpus: 1,
         requests: size.1,
         moves: 0,
+        leaves_full: 0,
+        waits: 40,
         weather: CLEAR,
     };
     let name = format!("{threads} thread(s) on one processor, instructions that never fail");
@@ -1647,6 +1836,8 @@ fn the_same_seed_makes_the_same_run() {
         cpus: 3,
         requests: 150,
         moves: 80,
+        leaves_full: 300,
+        waits: 5,
         weather: ROUGH,
     };
     let runs = [run_threads(77, config), run_threads(77, config)];
