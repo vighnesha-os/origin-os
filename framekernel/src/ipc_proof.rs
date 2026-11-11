@@ -101,8 +101,10 @@ enum Arg {
 use Arg::{Handle as Hd, Imm};
 
 mod directory;
+mod events_ports;
 mod memory_objects;
 pub(crate) use directory::prove_directory;
+pub(crate) use events_ports::{prove_events_ports, prove_user_clock};
 pub(crate) use memory_objects::prove_memory;
 
 /// What a step must do.
