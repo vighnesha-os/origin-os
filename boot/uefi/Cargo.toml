@@ -32,6 +32,7 @@ origin-version.workspace = true
 origin-boot-info.workspace = true
 onbf-format.workspace = true
 origin-crypto.workspace = true
+origin-random.workspace = true
 onbf-merkle.workspace = true
 onbf-verify.workspace = true
 origin-paging = { path = "../../framekernel/paging" }

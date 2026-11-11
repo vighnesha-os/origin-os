@@ -22,7 +22,8 @@ use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use origin_boot_info::{
-    BootInfo, FLAG_KASLR, Framebuffer, KernelSegment, MAX_KERNEL_SEGMENTS, MemoryRegion,
+    BOOT_SECRET_LEN, BOOT_SEED_LEN, BootInfo, FLAG_KASLR, Framebuffer, KernelSegment,
+    MAX_KERNEL_SEGMENTS, MemoryRegion,
 };
 use origin_boot_uefi::console::ConOut;
 use origin_boot_uefi::protocols::{
@@ -38,6 +39,8 @@ use origin_boot_uefi::uefi::{
 use origin_boot_uefi::{framebuffer, kernel, memmap, place, trust};
 use origin_paging::layout::{self, Placement};
 use origin_paging::{Access, Attributes, Table, TablePool};
+
+mod random;
 
 /// The console the panic handler writes to. Set once the system table is validated, and
 /// cleared just before `ExitBootServices` (ADR-0002 B5).
@@ -204,11 +207,43 @@ fn boot(
             span_bytes,
         )
     };
-    // ADR-0004 H3: the kernel's virtual slot is chosen now, because the relocations depend
-    // on it; the direct-map slot waits for the memory map.
-    let entropy = entropy();
-    let random = entropy.map_or(0, |(r, _)| r);
-    let (_, kernel_virtual) = layout::place(random, 0, span).ok_or(Status::LOAD_ERROR)?;
+    // ADR-0016 R10: the loader's own random-number generator, started before the kernel's
+    // place is chosen: a known-answer test, a start-up test of each instruction the processor
+    // reports, and a first seed from their draws.
+    let storage = allocate(&bs, memory_type::LOADER_DATA, random::PAGES).map_err(|s| {
+        fail(
+            out,
+            s,
+            format_args!("cannot allocate the random-number generator's storage"),
+        )
+    })?;
+    let rdseed = cpuid(0)[0] >= 7 && cpuid(7)[1] & (1 << 18) != 0;
+    let rdrand = cpuid(1)[2] & (1 << 30) != 0;
+    // SAFETY: `allocate` returned `random::PAGES` zeroed, identity-mapped pages at `storage`
+    // that only this generator uses, until it is finished below.
+    let (mut generator, started) = unsafe { random::Generator::start(storage, rdseed, rdrand) };
+    let _ = writeln!(
+        out,
+        "origin-boot: random: known-answer test {}; RDSEED {}, RDRAND {}; {}; the firmware's generator is not asked in this build",
+        if started.self_test {
+            "passed"
+        } else {
+            "FAILED"
+        },
+        random::condition_name(started.rdseed),
+        random::condition_name(started.rdrand),
+        if started.seeded {
+            "the loader's generator is seeded"
+        } else {
+            "no generator: the kernel is placed at a fixed address and is handed no seed"
+        }
+    );
+    // ADR-0004 H3, as ADR-0016 R10 amends it: two slides, two requests. The kernel's virtual
+    // slot is chosen now, because the relocations depend on it; the direct-map slot waits for
+    // the memory map.
+    let kernel_slide = generator.next_u64();
+    let (_, kernel_virtual) =
+        layout::place(kernel_slide.unwrap_or(0), 0, span).ok_or(Status::LOAD_ERROR)?;
     let relocations = place::place(&v.image, dest, kernel_virtual).map_err(|e| {
         fail(
             out,
@@ -258,7 +293,12 @@ fn boot(
         .map_err(|s| fail(out, s, format_args!("cannot size the memory map: {s:?}")))?;
     let capacity = probe_size / descriptor_size.max(1) + MAP_SLACK;
     let segments_bytes = MAX_KERNEL_SEGMENTS as usize * size_of::<KernelSegment>();
-    let info_bytes = size_of::<BootInfo>() + segments_bytes + capacity * size_of::<MemoryRegion>();
+    // After the region array, the secret area the kernel is handed (boot info 0.6): the seed
+    // for its generator, then the value its stacks' region is placed from.
+    let info_bytes = size_of::<BootInfo>()
+        + segments_bytes
+        + capacity * size_of::<MemoryRegion>()
+        + BOOT_SECRET_LEN as usize;
     let info_pages = info_bytes.div_ceil(PAGE);
     let info_addr = allocate(&bs, memory_type::OS_BOOT_INFO, info_pages)
         .map_err(|s| fail(out, s, format_args!("cannot allocate the boot info")))?;
@@ -350,7 +390,8 @@ fn boot(
             format_args!("cannot allocate the page-table pool ({pool_pages} pages)"),
         )
     })?;
-    let (root, direct_map_base, table_count) = {
+    let seed_addr = regions_addr + (capacity * size_of::<MemoryRegion>()) as u64;
+    let (root, direct_map_base, table_count, kaslr) = {
         let (_, n) = read_memory_map(get_map, map, regions).map_err(|e| e.report(out))?;
         let n = memmap::carve(
             regions,
@@ -373,8 +414,10 @@ fn boot(
             .map(|r| r.base + r.pages * PAGE as u64)
             .max()
             .unwrap_or(0);
-        let (direct, _) =
-            layout::place(random, max_physical, span).ok_or(Status::OUT_OF_RESOURCES)?;
+        let direct_slide = generator.next_u64();
+        let kaslr = kernel_slide.is_some() && direct_slide.is_some();
+        let (direct, _) = layout::place(direct_slide.unwrap_or(0), max_physical, span)
+            .ok_or(Status::OUT_OF_RESOURCES)?;
         let framebuffer_map = layout::framebuffer_mapping(&framebuffer).filter(|m| {
             let in_ram = origin_boot_info::overlaps_ram(regions, m.phys, m.bytes);
             if in_ram {
@@ -449,7 +492,11 @@ fn boot(
         let _ = writeln!(
             out,
             "origin-boot: KASLR: kernel at {kernel_virtual:#x}, direct map at {direct:#x} ({})",
-            entropy.map_or("no entropy source: fixed placement", |(_, src)| src)
+            if kaslr {
+                "two requests to the loader's generator"
+            } else {
+                "no generator: fixed placement"
+            }
         );
         let _ = writeln!(
             out,
@@ -457,9 +504,46 @@ fn boot(
             pool.used(),
             stats.direct_bytes >> 20
         );
-        (space.root(), direct, pool.used())
+        (space.root(), direct, pool.used(), kaslr)
     };
     let _ = table_count;
+    // ADR-0016 R10 step 4 and Amendment 1 (decision item 166): last before `ExitBootServices`,
+    // the secret area goes into the boot-info region: 64 bytes for the kernel's generator and,
+    // as a request of its own, the 8 bytes its stacks' region is placed from. Then the loader's
+    // generator is uninstantiated and overwritten with its stack.
+    // SAFETY: `allocate` zeroed `info_pages` pages at `info_addr`; these 72 bytes lie after the
+    // region array's `capacity` entries and inside those pages (`info_bytes`), and nothing else
+    // refers to them.
+    let secret = unsafe {
+        core::slice::from_raw_parts_mut(
+            ptr::with_exposed_provenance_mut::<u8>(seed_addr as usize),
+            BOOT_SECRET_LEN as usize,
+        )
+    };
+    let (seed, stack_value) = secret.split_at_mut(BOOT_SEED_LEN as usize);
+    // Both or neither: a kernel that is told of an area finds all of it.
+    let handed = generator.fill(seed) && generator.fill(stack_value);
+    if !handed {
+        seed.fill(0);
+        stack_value.fill(0);
+    }
+    let boot_seed = if handed { seed_addr } else { 0 };
+    if !generator.finish() {
+        return Err(fail(
+            out,
+            Status::LOAD_ERROR,
+            format_args!("the random-number generator ran over its stack: nothing it gave is used"),
+        ));
+    }
+    let _ = writeln!(
+        out,
+        "origin-boot: random: {}; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten",
+        if boot_seed == 0 {
+            "no seed for the kernel"
+        } else {
+            "64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info"
+        }
+    );
     let _ = writeln!(
         out,
         "origin-boot: exiting boot services; entering the Framekernel"
@@ -496,8 +580,9 @@ fn boot(
                 page_table_root: root,
                 direct_map_base,
                 kernel_virtual_base: kernel_virtual,
-                flags: if entropy.is_some() { FLAG_KASLR } else { 0 },
+                flags: if kaslr { FLAG_KASLR } else { 0 },
                 framebuffer,
+                boot_seed,
             };
             // SAFETY: `info_addr` is the start of this loader's zeroed, 4 KiB-aligned boot-info
             // allocation, large enough for a `BootInfo`.
@@ -953,38 +1038,6 @@ fn cpuid(leaf: u32) -> [u32; 4] {
 /// Whether the processor supports the execute-disable bit.
 fn nx_supported() -> bool {
     cpuid(0x8000_0000)[0] >= 0x8000_0001 && cpuid(0x8000_0001)[3] & (1 << 20) != 0
-}
-
-/// 64 random bits for KASLR (ADR-0004 H3): RDSEED, else RDRAND, else `None` (the kernel is
-/// then placed at the windows' starts and the boot info says so).
-fn entropy() -> Option<(u64, &'static str)> {
-    let rdseed = cpuid(0)[0] >= 7 && cpuid(7)[1] & (1 << 18) != 0;
-    let rdrand = cpuid(1)[2] & (1 << 30) != 0;
-    for _ in 0..64 {
-        if rdseed {
-            let (value, ok): (u64, u8);
-            // SAFETY: RDSEED is supported (checked); it writes only its operand and CF.
-            unsafe {
-                core::arch::asm!("rdseed {v}", "setc {ok}", v = out(reg) value, ok = out(reg_byte) ok, options(nomem, nostack))
-            };
-            if ok == 1 {
-                return Some((value, "RDSEED"));
-            }
-        }
-    }
-    for _ in 0..16 {
-        if rdrand {
-            let (value, ok): (u64, u8);
-            // SAFETY: RDRAND is supported (checked); it writes only its operand and CF.
-            unsafe {
-                core::arch::asm!("rdrand {v}", "setc {ok}", v = out(reg) value, ok = out(reg_byte) ok, options(nomem, nostack))
-            };
-            if ok == 1 {
-                return Some((value, "RDRAND"));
-            }
-        }
-    }
-    None
 }
 
 #[panic_handler]

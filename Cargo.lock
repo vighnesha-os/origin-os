@@ -90,6 +90,7 @@ dependencies = [
  "origin-boot-info",
  "origin-crypto",
  "origin-paging",
+ "origin-random",
  "origin-version",
 ]
 
@@ -115,6 +116,7 @@ dependencies = [
  "origin-abi",
  "origin-boot-info",
  "origin-paging",
+ "origin-random",
  "origin-sync",
 ]
 
@@ -123,6 +125,13 @@ name = "origin-paging"
 version = "0.0.0"
 dependencies = [
  "origin-boot-info",
+]
+
+[[package]]
+name = "origin-random"
+version = "0.0.0"
+dependencies = [
+ "origin-crypto",
 ]
 
 [[package]]

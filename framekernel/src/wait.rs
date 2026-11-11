@@ -36,7 +36,7 @@ use crate::sched::{self, ThreadRef};
 const WAITERS: usize = 16;
 
 /// The kernel's scheduler and clock, as a wait queue sees them.
-struct KernelThreads;
+pub(crate) struct KernelThreads;
 
 impl wait::Scheduler for KernelThreads {
     type Thread = ThreadRef;

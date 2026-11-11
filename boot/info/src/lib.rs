@@ -321,6 +321,58 @@ pub struct BootInfo {
     pub flags: u64,
     /// The firmware's linear framebuffer (0.4); [`Framebuffer::NONE`] if there is none.
     pub framebuffer: Framebuffer,
+    /// Physical address of the loader's secret area, [`BOOT_SECRET_LEN`] bytes from its
+    /// random-number generator inside the region that holds this structure, or 0 if the loader
+    /// has none to give (0.6; ADR-0016 R10 and its Amendment 1, decision item 166). The area
+    /// is two things, one after the other:
+    ///
+    /// - [`BOOT_SEED_LEN`] bytes that the kernel mixes into its generator's first seed;
+    /// - [`BOOT_STACK_VALUE_LEN`] bytes, a little-endian `u64`, from which the kernel places
+    ///   its stacks' region when it builds its page tables, before its generator exists.
+    ///
+    /// The kernel takes each once and overwrites the whole area where it lies. Neither side
+    /// prints any of it: this field is the area's address and nothing of its contents.
+    pub boot_seed: u64,
+}
+
+/// The seed for the kernel's generator: the first bytes of the area [`BootInfo::boot_seed`]
+/// names.
+pub const BOOT_SEED_LEN: u64 = 64;
+/// The random value for the kernel stack region's base, directly after the seed (decision
+/// item 166).
+pub const BOOT_STACK_VALUE_LEN: u64 = 8;
+/// The whole secret area [`BootInfo::boot_seed`] names: the seed, then the stack value.
+pub const BOOT_SECRET_LEN: u64 = BOOT_SEED_LEN + BOOT_STACK_VALUE_LEN;
+
+/// Where the loader's secret area is, if `info` names one the kernel may take:
+/// [`BOOT_SECRET_LEN`] bytes that lie inside one region of kind [`RegionKind::BootInfo`] and
+/// clear of the header at physical address `info_addr`, of the region array and of the kernel
+/// segment array. Anything else is no area: the kernel reads and overwrites those bytes, so it
+/// must know they are the loader's to give and nothing else's.
+pub fn boot_seed(info: &BootInfo, info_addr: u64, regions: &[MemoryRegion]) -> Option<u64> {
+    let seed = info.boot_seed;
+    let end = seed.checked_add(BOOT_SECRET_LEN)?;
+    if seed == 0 {
+        return None;
+    }
+    let inside = regions.iter().any(|r| {
+        let region_end = r.base.saturating_add(r.pages.saturating_mul(4096));
+        RegionKind::from_raw(r.kind) == Some(RegionKind::BootInfo)
+            && r.base <= seed
+            && end <= region_end
+    });
+    let clear_of = |base: u64, bytes: u64| end <= base || base.saturating_add(bytes) <= seed;
+    let header = core::mem::size_of::<BootInfo>() as u64;
+    let region = core::mem::size_of::<MemoryRegion>() as u64;
+    let segment = core::mem::size_of::<KernelSegment>() as u64;
+    (inside
+        && clear_of(info_addr, header)
+        && clear_of(info.regions, info.region_count.saturating_mul(region))
+        && clear_of(
+            info.kernel_segments,
+            info.kernel_segment_count.saturating_mul(segment),
+        ))
+    .then_some(seed)
 }
 
 // The ABI layout; a change here is a boot-info major version change.
@@ -350,7 +402,8 @@ const _: () = {
     assert!(offset_of!(BootInfo, direct_map_base) == 104);
     assert!(offset_of!(BootInfo, kernel_virtual_base) == 112);
     assert!(offset_of!(BootInfo, flags) == 120);
-    assert!(size_of::<BootInfo>() == 176);
+    assert!(offset_of!(BootInfo, boot_seed) == 176);
+    assert!(size_of::<BootInfo>() == 184);
     assert!(size_of::<KernelSegment>() == 24);
 };
 
@@ -461,6 +514,7 @@ mod tests {
             kernel_virtual_base: 0xFFFF_FFFF_8000_0000,
             flags: FLAG_KASLR,
             framebuffer: Framebuffer::NONE,
+            boot_seed: 0,
         }
     }
 
@@ -571,7 +625,90 @@ mod tests {
 
     #[test]
     fn version_comes_from_origin_version_toml() {
-        assert_eq!(VERSION, (0, 5));
+        assert_eq!(VERSION, (0, 6));
+    }
+
+    #[test]
+    fn a_boot_seed_is_taken_only_from_inside_the_boot_info_region() {
+        // The header at 0x8000, 184 bytes; three regions at 0x8100; one segment at 0x8200; the
+        // boot-info region is the two pages from 0x8000.
+        let region = |base, pages, kind: RegionKind| MemoryRegion {
+            base,
+            pages,
+            kind: kind as u32,
+            reserved: 0,
+        };
+        let regions = [
+            region(0x1000, 7, RegionKind::Usable),
+            region(0x8000, 2, RegionKind::BootInfo),
+            region(0xA000, 16, RegionKind::KernelStack),
+        ];
+        let mut info = sample();
+        info.regions = 0x8100;
+        info.region_count = 3;
+        info.kernel_segments = 0x8200;
+        info.kernel_segment_count = 1;
+        let at = |seed: u64| {
+            let mut info = info;
+            info.boot_seed = seed;
+            boot_seed(&info, 0x8000, &regions)
+        };
+        // The area is the 64-byte seed and the 8-byte stack value: 72 bytes.
+        assert_eq!(
+            (BOOT_SEED_LEN, BOOT_STACK_VALUE_LEN, BOOT_SECRET_LEN),
+            (64, 8, 72)
+        );
+        assert_eq!(at(0), None, "the loader gave none");
+        assert_eq!(at(0x9000), Some(0x9000));
+        assert_eq!(at(0x9FB8), Some(0x9FB8), "the last 72 bytes of the region");
+        assert_eq!(at(0x9FB9), None, "one byte past the region's end");
+        assert_eq!(
+            at(0x9FC0),
+            None,
+            "the seed would fit, and the stack value after it would not"
+        );
+        assert_eq!(at(0x7FFF), None, "begins before the region");
+        assert_eq!(at(0x2000), None, "in usable memory");
+        assert_eq!(at(0xA000), None, "in the kernel's stack");
+        assert_eq!(at(u64::MAX - 10), None, "wraps");
+        assert_eq!(
+            at(u64::MAX - 71),
+            None,
+            "its end is the last address: no region holds it"
+        );
+        // Clear of the header, the region array and the segment array.
+        assert_eq!(at(0x8000), None, "on the header");
+        assert_eq!(at(0x80B7), None, "the header's last byte");
+        assert_eq!(
+            at(0x80B8),
+            Some(0x80B8),
+            "right after the header, up to the region array"
+        );
+        assert_eq!(
+            at(0x80B9),
+            None,
+            "its last byte is the region array's first"
+        );
+        assert_eq!(at(0x8100 + 71), None, "the region array's last byte");
+        assert_eq!(at(0x8100 + 72), Some(0x8148));
+        assert_eq!(at(0x8200 - 72), Some(0x81B8), "up to the segment array");
+        assert_eq!(
+            at(0x8200 - 71),
+            None,
+            "its last byte is the segment array's first"
+        );
+        assert_eq!(
+            at(0x8200 - 64),
+            None,
+            "the seed ends where the segment array begins, and the stack value is on it"
+        );
+        assert_eq!(at(0x8200 + 23), None, "the segment array's last byte");
+        assert_eq!(at(0x8200 + 24), Some(0x8218));
+        // A region of another kind at the same place gives nothing.
+        let mut others = regions;
+        others[1].kind = RegionKind::LoaderReclaimable as u32;
+        info.boot_seed = 0x9000;
+        assert_eq!(boot_seed(&info, 0x8000, &others), None);
     }
 
     #[test]

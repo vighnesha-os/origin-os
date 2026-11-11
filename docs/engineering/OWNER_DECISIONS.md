@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–141 and 145–154, 2026-11-11 for items 161, 165, 168 and 189, and 2026-11-12 for items 191–220. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144, 155–160, 162–164, 166, 167, 169–188 and 190 are in the second step-3 batch (`land/s3-part2`, pull request 16) and reach this sheet with it. |
-| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 165 and 168: your own text for CLAUDE.md §1, in its second and third versions, read against the whole of revision 7.5 and the ADRs each change names; the check and the list of changes are `ROLES_CHECK_2026-11-11.md`. Item 189: that check's proposal 11. Items 191–196: CLAUDE.md 7.6's §1, by TASKS item 35's session, with one rule added to item 191 by the coordinating session. Items 197–220: CLAUDE.md 7.6, the accepted ADRs and `docs/spec/OIDL.md`, by the session that wrote step 4's ledger, and again by the coordinating session against ADR-0005 A6, ADR-0011 N8 and the system threat model. |
+| As of | 2026-11-10 for items 71–160, 2026-11-11 for items 161 to 190, and 2026-11-12 for items 191 to 220. Items up to 70: 2026-11-09, after the pre-merge review. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 142–144, 155–160, 162–164, 166 and 188: as their sections say. Items 165 and 168: your own text for CLAUDE.md §1, in its second and third versions, read against the whole of revision 7.5 and the ADRs each change names; the check and the list of changes are `ROLES_CHECK_2026-11-11.md`. Item 167: items 70 and 113 and CLAUDE.md §78 and §80, by the session that keeps the second step-3 batch. Item 189: proposal 11 of `ROLES_CHECK_2026-11-11.md`. Items 169–187 and 190: as their sections say. Items 191–196: CLAUDE.md 7.6's §1, by TASKS item 35's session, with one rule added to item 191 by the coordinating session. Items 197–220: CLAUDE.md 7.6, the accepted ADRs and `docs/spec/OIDL.md`, by the session that wrote step 4's ledger, and again by the coordinating session against ADR-0005 A6, ADR-0011 N8 and the system threat model. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: items 161, 165, 168 and 189 (item 168 delegated to Claude). 2026-11-12: items 191–220. |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–160 (item 97 delegated to Claude). 2026-11-11: items 161 to 190 (item 168 delegated to Claude). 2026-11-12: items 191 to 220. |
 | Still open | No numbered item. Item 168's changes to your text are Claude's, and you have not read them. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -168,7 +168,7 @@ CI caught one processor's TSC stepping back by 16 ticks on an EPYC 9V45 under KV
 
 ## ADR-0011 N14 step 3: caller identity, the start record, the directory, memory objects and ports (Accepted 2026-11-09)
 
-Step 3 adds system calls and structures, so these are ABI and format decisions (CLAUDE.md §84). The owner accepted all thirteen with the recommended answer on 2026-11-09 ("Accept all 13"). They are ADR-0005 Amendment 4, C1–C13; the scoping is `docs/research/2026-11-09-n14-step3-scope.md`. C1–C3 are built (task S3-2, 2026-11-10: a message's writer and handle records), C4–C6 (task S3-3, 2026-11-10: the start record and its launch path), and C11 and C12 (task S3-4, 2026-11-10: `not_found` and the service directory, `origin.directory` 0.1); the rest are not.
+Step 3 adds system calls and structures, so these are ABI and format decisions (CLAUDE.md §84). The owner accepted all thirteen with the recommended answer on 2026-11-09 ("Accept all 13"). They are ADR-0005 Amendment 4, C1–C13; the scoping is `docs/research/2026-11-09-n14-step3-scope.md`. C1–C3 are built (task S3-2, 2026-11-10: a message's writer and handle records), C4–C6 (task S3-3, 2026-11-10: the start record and its launch path), C11 and C12 (task S3-4, 2026-11-10: `not_found` and the service directory, `origin.directory` 0.1), and C7 and C8, with C6's rights for a memory object (task S3-5b, 2026-11-10: memory objects, `origin.kernel` 0.5, as items 101–105 decide); C9, C10 and C13 are not.
 
 | # | Question | Answer |
 |---|---|---|
@@ -204,7 +204,7 @@ Work reaches `main` through pull requests, and merging each one takes the owner'
 
 What this means in practice:
 
-- Tasks collect on one landing branch per batch, as a draft pull request. CI runs on every push to it, so each task is tested, including the real-CPU boots, as it arrives. The first batch is ADR-0011 N14 step 3, pull request 13.
+- Tasks collect on one landing branch per batch, as a draft pull request. CI runs on every push to it, so each task is tested, including the real-CPU boots, as it arrives. The first batch is the first part of ADR-0011 N14 step 3, pull request 13: merged on the owner's word on 2026-11-11, at 110 commits (`c11e6f4`). The second batch, the rest of step 3, is the landing branch `land/s3-part2`.
 - Commits are small and self-contained: each one builds and passes its tests.
 - Merge commits from `main` don't count toward the 100, and nothing is padded to reach it (CLAUDE.md §7).
 - Merging still takes the owner's word.
@@ -284,7 +284,7 @@ The independent review of S3-5a found that ADR-0004 H2's table puts the kernel h
 
 ## S3-5b: memory objects' interface (Accepted 2026-11-10)
 
-Task S3-5b (memory objects) needs five interface decisions that C6–C8 (items 61–63) leave open. They are ABI decisions, so they are the owner's (CLAUDE.md §84). The session building S3-5b proposed them, with the options it rejected, and the coordinating session checked them against CLAUDE.md, ADR-0004 and ADR-0005 before asking. The owner answered **"Accept all"** on 2026-11-10. They are ADR-0005 Amendment 5, D1–D5. Items 71–97 are in use on the unmerged `docs/editions-device-sdk` branch.
+Task S3-5b (memory objects) needs five interface decisions that C6–C8 (items 61–63) leave open. They are ABI decisions, so they are the owner's (CLAUDE.md §84). The session building S3-5b proposed them, with the options it rejected, and the coordinating session checked them against CLAUDE.md, ADR-0004 and ADR-0005 before asking. The owner answered **"Accept all"** on 2026-11-10. They are ADR-0005 Amendment 5, D1–D5, all built by task S3-5b on 2026-11-10 (`origin.kernel` 0.5, `user-abi` 0.5). Items 71–97 are in use on the unmerged `docs/editions-device-sdk` branch.
 
 | # | Question | Answer |
 |---|---|---|
@@ -396,7 +396,24 @@ Nothing is built. The work is TASKS item 19b, which writes its contract first (i
 
 **Coming back to you:** item 134, with the storage-encryption ADR; and the trust classes that would let item 125 cost less, with measurements.
 
-## The kernel's random-number generator (ADR-0016): Accepted 2026-11-10, the mechanism built, nothing in the kernel
+## S3-5b: the status when a map runs out (Accepted 2026-11-10)
+
+The review of S3-5b found that `memory_map` returns `limit` for three causes that D4 (item 104) does not tell apart (`REVIEW_S3-5B_2026-11-10.md`, finding C). What a status means is an ABI decision, so it is the owner's (CLAUDE.md §84). The session that built S3-5b put it to the owner in its own session, with three recommendations about the order of work, and the owner answered **"Accept all"** there on 2026-11-10. That session relayed the answer; the coordinating session read that session's record of it, then numbered and recorded the decision here. It is a note on D4 in ADR-0005 Amendment 5. Not built yet. Items 106–123 are in use on the unmerged `docs/design-review-2026-11-10` branch, and items 124–141 on the unmerged `claude/intelligent-dhawan-a7f6d4` branch (ADR-0017).
+
+| # | Question | Answer |
+|---|---|---|
+| 142, answered | When a map runs out: `limit` when the address space's 32 page-table frames are used up, and `no_memory` when the machine has no free frame or the kernel heap cannot grow? `memory_map` already declares both, so `user-abi` stays 0.5. | **Accept** |
+
+## H2-stacks: ADR-0004's wording, and a slide for the stack region (Accepted 2026-11-10)
+
+Task H2-stacks built ADR-0004 Amendment 1's A2 on its own branch and left two things to the owner: the ADR's wording for what it built, and whether the stack region is slid. The coordinating session put both to the owner with a recommendation each, and the owner answered **"Accept all"** on 2026-11-10. Item 143 changes no decision; its five edits are applied when H2-stacks lands on the step-3 batch. Item 144 is ADR-0004 Amendment 2 (A4–A6). Not built yet.
+
+| # | Question | Answer |
+|---|---|---|
+| 143, answered | Update ADR-0004 to say what H2-stacks built, when it lands: A2 is built; the region is 2048 slots of 128 KiB (256 MiB), each stack at the top of its slot with at least 64 KiB below it never mapped; the boot processor's interrupt stacks stay in the kernel image and the boot stack is the loader's? | **Accept** |
+| 144, answered | Give the kernel stack region a random base: drawn by the kernel when it builds its tables, 2 MiB-aligned within PML4 slots 384–447 (about 24 bits), from RDSEED, else RDRAND, and with neither the fixed base, reported; never printed after boot; built as a framework task of its own after H2-stacks lands? | **Accept** |
+
+## The kernel's random-number generator (ADR-0016): Accepted 2026-11-10; built by tasks 18a and 18b, under QEMU only
 
 Decision item 113 accepted one generator in outline. [ADR-0016](../adr/ADR-0016-kernel-random-numbers.md) filled the outline in and ended with seven questions, each with a recommended answer checked against CLAUDE.md 7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C. The seventh, a download, is item 145 above. You answered **"Accept all"** to the other six on 2026-11-10, in the session that wrote the ADR. The coordinating session put the same six to you the same day, in shorter words, and records the same answer (its commit `44de977`).
 
@@ -409,7 +426,7 @@ Three of them change something you had already accepted. The ADR said so before 
 | # | Question | Answer | Where it is recorded, and its state |
 |---|---|---|---|
 | 146, answered | The design (R1 to R9, R11 to R13): one HMAC_DRBG over SHA-512; a root generator and one for each processor, in the shape of SP 800-90C's tree of generators with two named differences; health tests on the instructions' outputs; no generator and no randomness without a healthy seed; overwriting in three layers; a new crate for the policy? | **Accept** | ADR-0016. The mechanism is built and tested on the host. Everything else is task 18b |
-| 147, answered | Boot info 0.6 (§84): one appended field, `boot_seed`, the physical address of 64 secret bytes inside the boot-info region or 0, which the kernel overwrites once it has taken them? | **Accept** | ADR-0016 R10; ADR-0002 B4. Not built: `origin-version.toml` stays at 0.5 until 18b |
+| 147, answered | Boot info 0.6 (§84): one appended field, `boot_seed`, the physical address of 64 secret bytes inside the boot-info region or 0, which the kernel overwrites once it has taken them? | **Accept** | ADR-0016 R10; ADR-0002 B4. Built by task 18b (2026-11-11). Item 166 below makes the secret area 72 bytes |
 | 148, answered | What may seed, and what happens when the sources fail? RDRAND with no RDSEED: the generator runs, the boot says so, and requests for prediction resistance are refused. The firmware's seed with neither instruction: no generator. Every instruction failing after boot: the root stops and the processors' generators go on with the seeds they have. | **Accept, as stated.** The stricter alternative to the third part, stopping all randomness, was offered and not chosen | ADR-0016 R3, R6, R8; ADR-0004 H3's note. Not built |
 | 149, answered | What "health tests on the raw source" (CLAUDE.md §59) can mean: tests on the instructions' outputs, because the noise behind them cannot be reached; gross failure only; no SP 800-90B conformance claimed? | **Accept** | ADR-0016 R4. Not built. Draft 7.4's §59 says so since `44de977` on `docs/design-review-2026-11-10` |
 | 150, answered | Keep `unsafe` out of `origin-crypto`: best-effort overwriting there, and the guarantee in the framework, by volatile writes over the state and an overwrite of the stack after every request? | **Accept** | ADR-0016 R9. The best-effort part is built; the framework's part is 18b |
@@ -418,6 +435,38 @@ Three of them change something you had already accepted. The ADR said so before 
 **Yours to do:** nothing new. The wording of §17 and §59 is in draft 7.4, which you read with its pull request (item 106).
 
 The numbers start at 146 because 142 to 144 are in use on `land/s3-part2` and 145 is the download above. The header of this sheet was brought up to date on 2026-11-11, when the branches that hold items 124 to 154 had met in the review batch.
+
+### Where the kernel stack region's base gets its randomness (item 166): Accepted 2026-11-11
+
+Building the generator found that the next batch draws the base of the kernel stacks' region in early boot, when the kernel builds its page tables: before the heap and the clock, and so before the kernel's generator can exist. That draw could not simply ask the generator. The coordinating session put three recommendations to you on 2026-11-11 and you answered **"Accept all"**; it relayed your words. This is the second of them. The third, how task 18b lands (item 167, through pull request 16), is recorded by that batch's lander.
+
+It changes two things you accepted on 2026-11-10, and the recommendation said so: ADR-0004 Amendment 2's "the kernel chooses this slide, and boot info does not change", and the 64-byte size of boot info 0.6's secret area (item 147). Boot info 0.6 has not landed, so there is no second version bump.
+
+| # | Question | Answer | Where it is recorded, and its state |
+|---|---|---|---|
+| 166, answered | Where does the stack region's base get its randomness? Recommended: the loader's generator makes one more 8-byte request and puts it directly after its 64-byte seed; the kernel reads it when it builds its page tables and overwrites it with the seed. The kernel still places the region; only the random value comes from the loader. With no loader generator the region stays at its fixed base | **Accept** | ADR-0016 Amendment 1; ADR-0002 B4. On the generator's branch: the loader's third request, the 72-byte area and its checks, `origin_frame::random::take_stack_value`, and a boot proof that it is taken once and overwritten. The stack region is on the next batch, whose lander makes `draw_region` the caller and notes ADR-0004 Amendment 2 (A4, A5) **Done on 2026-11-11:** the batch's merge of 18b (`c2245ef`) makes `draw_region` the caller, and ADR-0004 Amendment 2 has its note. |
+
+**Offered and not chosen:**
+
+- derive the value from the seed with a key-derivation function: no boot-info change, but the seed gets a second use and the directive would need a new standard;
+- start the kernel's generator before the heap and the clock: that moves most of its machinery into early boot;
+- place the region after the generator starts: the generator's own stacks live in that region.
+
+**Yours to do:** nothing.
+
+### What a dry RDSEED costs a processor with no healthy RDRAND (item 188): Accepted 2026-11-11
+
+An independent read of the generator's policy crate found that one row of ADR-0016's threat model said too little. T5 is a program in ring 3 that runs RDSEED in a loop and keeps it dry. The row said reseeds are then "delayed and fall back to RDRAND". Where RDRAND is not healthy on a processor there is nothing to fall back to, and that processor's reseed waits for as long as RDSEED is kept dry. That is how R6 was accepted and how it is built; only the row was short. The session that built the generator put it to you on 2026-11-11 with a recommendation, and you answered **"Yes, amend T5"**.
+
+The number is 188 because 168 is in use on `docs/directive-7.5` and 169 to 187 were given out that morning for the events-and-ports shapes.
+
+| # | Question | Answer | Where it is recorded, and its state |
+|---|---|---|---|
+| 188, answered | Amend T5's row in ADR-0016 to say that where RDRAND is not healthy on a processor, its reseed waits for as long as RDSEED is kept dry, and that T7's bound of 60 seconds or 2^20 requests does not hold for that processor meanwhile? Recommended: yes, and build nothing | **Yes, amend T5** | ADR-0016 Amendment 2, and T5's row. Nothing is built and nothing changes in R6 |
+
+**Offered and not chosen:** send such a processor to the root once its reseed has been delayed for some periods. That changes R6, and on a machine whose processors are alike it is a reseed in name only: the root's own reseed needs the same instruction.
+
+**Yours to do:** nothing. The limit is stated, not closed. How long a program can keep RDSEED dry on a real processor is unmeasured.
 
 ## What building ADR-0017's first half found (items 152 to 154): Accepted 2026-11-10
 
@@ -429,6 +478,26 @@ TASKS item 19b built Z1, Z2, Z3, Z5, Z9 and Z10 of ADR-0017, and its gate on the
 | 153, answered | More than half the kernel's calls go through the global offset table, because the compiler emits a relocation the linker cannot turn into a direct call. Make it a task of its own, not a condition of ADR-0011 N14 step 4: find a fix on stable Rust (link-time optimization is the candidate, untried), measure before and after, then have the image gate hold the count? | **Accept.** TASKS item 33; not started |
 | 154, answered | Under QEMU's software processor every boot now ends `degraded: 58 of 59 proofs passed; failed: speculation controls`, because that processor offers none of the controls and the "speculation controls" row fails on a processor that lacks one (item 131). Keep it as written? A row that passes when the kernel set everything the machine offers, and only prints what is lacking, was offered and not chosen. | **Keep as written.** Answered twice the same way: in the session that built 19b, with the boot output beside it, and as one of three recommendations accepted in the coordinating session. No code changes: the verdict already behaves this way |
 
+## S3-5b: two statuses D5 does not name (Accepted 2026-11-10)
+
+The review of S3-5b's low observations left two cases whose status D5 (item 105) does not name (`REVIEW_S3-5B_2026-11-10.md`). What a status means is the owner's (CLAUDE.md §84). The coordinating session put both to the owner with a recommendation each, and the owner answered **"Accept all"** on 2026-11-10. They are a note on D5 in ADR-0005 Amendment 5. Item 155 is not built yet; item 156 is what the kernel does. Items 145–154 are in use on unmerged branches (ADR-0016, ADR-0017, the design review).
+
+| # | Question | Answer |
+|---|---|---|
+| 155, answered | `memory_unmap` or `memory_protect` on a mapping another thread is changing: return `should_wait`, since nothing changed and a retry gives the true answer, instead of today's `invalid_args`? | **Accept** |
+| 156, answered | A random placement whose eight draws all collide: keep `limit` and write it into D5, with `no_memory` staying for frames and the kernel heap? | **Accept** |
+
+## The stack region's slide: what A6 leaves open (Accepted 2026-11-10)
+
+The framework session building ADR-0004 Amendment 2 (item 144) found four cases its no-printing rule, A6, does not settle, and two more boot lines that fall under them (`sched.rs`'s stack-guard line, under 159; `kernel.rs`'s NMI stack line, under 158). The coordinating session put them to the owner with a recommendation each, and the owner answered **"Accept all"** on 2026-11-10. They are notes A6.1–A6.4 in ADR-0004 Amendment 2. Not built yet.
+
+| # | Question | Answer |
+|---|---|---|
+| 157, answered | A6 allows printing in developer mode and the kernel has none: add none now, so A6 means never until one exists for its own reasons? | **Accept** |
+| 158, answered | Crash reports: print offsets in every mode (`stack region +0x…`, `image +0x…`, a backtrace as image offsets, no base), the image part included, which brings it under H3's rule? | **Accept** |
+| 159, answered | The boot log: print neither the stack region's base nor an address in it, during boot either? | **Accept** |
+| 160, answered | Showing that boots differ with nothing printed: required, a host test of the draw, a true-or-false boot line, a forced no-entropy boot and controls; in addition a read through QEMU's monitor across the matrix, dropped and recorded as not done if it is unreliable on CI? | **Accept** |
+
 ## The review batch may be offered at 76 commits (item 161): Accepted 2026-11-11
 
 Item 70 offers a code pull request for review once it carries 100 commits of real work. Pull request 15, the review batch, holds four finished tasks (TASKS items 17, 18a, 19 and 31) and one fix to a boot proof, in 76 commits that are not merges. On 2026-11-11 you asked that the open pull requests be ready to merge when they are ready, and were asked whether this one may be marked ready as it is.
@@ -438,6 +507,18 @@ Item 70 offers a code pull request for review once it carries 100 commits of rea
 | 161, answered | Mark pull request 15 ready at 76 commits, once pull requests 13 and 14 are in? Waiting for task 18b, the generator in the kernel, to bring it past 100 was offered and not chosen. | **Yes, at 76** |
 
 This is for pull request 15 only. Item 70 stands for every later code pull request, and no commit was added to raise the count (CLAUDE.md §7). Merging it still takes your word, after pull requests 13 and 14, each with a merge commit.
+
+## S3-5b: three cases D5 does not place (Accepted 2026-11-11)
+
+The review of S3-5b's fixes left three cases that D5 (item 105) does not place (`REVIEW_S3-5B_2026-11-10.md`, step 2). What a status means is the owner's (CLAUDE.md §84). The coordinating session put them to the owner with one recommendation for each, to keep what is built, and the owner answered **"Accept all"** on 2026-11-11. They are the second note on D5 in ADR-0005 Amendment 5. All three are what the kernel does since `f56263a`.
+
+They were put to the owner as items 161 to 163. Item 161 was already in use on the unmerged review batch (`land/review-tasks`, pull request 15: marking that pull request ready at 76 commits), so they are recorded here as 162 to 164. The questions and the answers are unchanged.
+
+| # | Question | Answer |
+|---|---|---|
+| 162, answered | `memory_map` at a fixed place that runs over a page already mapped, in an address space that is also at its bound of page tables: keep `invalid_args` (the place is taken), since the space looks at its records before it makes tables, and not `limit`? | **Accept** |
+| 163, answered | `memory_protect` on a mapping another call is changing: keep `should_wait` ahead of the comparison of the access asked with what the mapping allows, since that comparison is not settled while the mapping changes? | **Accept** |
+| 164, answered | Keep counting as "being changed" (item 155) a mapping whose own `memory_map` has not yet written its address to its caller, so that `memory_unmap` or `memory_protect` on it returns `should_wait`? | **Accept** |
 
 ## The roles in CLAUDE.md §1 (items 165 and 168): your text, and what you left to Claude, 2026-11-11
 
@@ -490,6 +571,21 @@ How the text was put in:
 - **Nothing else in the directive changes.** The rest of §1 follows your text as before.
 - **The first and second versions are kept only in this branch's history,** at commits `fc92eca` and `453fded`.
 
+## Task 18b lands through the second step-3 batch (item 167): Accepted 2026-11-11
+
+Item 113 asks for the kernel's random-number generator before S3-5b lands. S3-5b is in the second step-3 batch (pull request 16), and that batch still draws straight from RDSEED and RDRAND in two places: the random place of a mapping (`memory_object.rs`) and the base of the kernel stacks' region (the framework's `stack.rs`). Task 18b, the generator in the kernel and the loader, was built on a branch of its own from `main` (`claude/18b-kernel-random`).
+
+On 2026-11-11 the architecture-review session put three recommendations to the owner, and the owner answered **"Accept all"**. Two of them concern this batch; the third was about pull request 17. The session that keeps this batch read the questions and the answer in that session's record before writing this.
+
+| # | Question | Answer |
+|---|---|---|
+| 167, answered | How 18b lands: through the next batch, pull request 16, and not a pull request of its own? That batch cannot be offered until the generator is in it (item 113), and the two direct draws it adds are converted there. Before it is offered, the architecture-review session finishes reading the parts of 18b it has not read. | **Accept** |
+
+- **Item 166** was accepted with it: the stack region's base takes its random value from the loader's generator, 8 bytes directly after the 64-byte seed in boot info 0.6's secret area. The session that builds 18b records it on `claude/18b-kernel-random`, and it reaches this sheet when that branch is merged here. What it changes in ADR-0004 Amendment 2 is the note on A4 and A5 there.
+- **Item 165** is the owner's own text for CLAUDE.md §1 (revision 7.5). It came to `main` with pull request 17, and its record is the section above.
+- **Done on 2026-11-11:** 18b (`a11202a`) is merged into this batch at `c2245ef`, and the merge moves both draws to the generator. Checked under QEMU only; no person has read it.
+- Merging pull request 16 still takes your word, and item 70's 100 commits stand.
+
 ## §77 points to §1 (item 189): Accepted 2026-11-11, revision 7.6
 
 | # | Question | Answer |
@@ -504,6 +600,52 @@ What it changes, in CLAUDE.md 7.6:
 
 Why: §1 has listed 67 specialist roles since revision 7.5, and §77's 26 agents overlapped them with another count. Every one of the 26 has a role in §1: the NPU is role 56, source provenance is role 67, and context management is role 28 with the requirement to keep durable engineering records.
 
+## The randomized model lands with 18b (item 190): Accepted 2026-11-11
+
+A randomized model of the generator's policy was built as a host test after 18b's final commit (TASKS item 37 (c)), and the architecture-review session put one question to the owner. The owner answered that session on 2026-11-11: "Yes, with 18b". The landing session did not hear the answer; it read it in that session's transcript.
+
+| # | Question | Answer |
+|---|---|---|
+| 190, answered | Does the randomized model of the generator's policy (TASKS item 37 (c), `claude/18b-random-model` at `dabe70b`, nine commits on 18b's final commit) land with 18b in pull request 16, or later on its own? | **With 18b: "Yes, with 18b"** |
+
+- **Done on 2026-11-11:** merged into the second step-3 batch at `fe457f2`, right after 18b's merge (`c2245ef`).
+- It adds a host test file, nine negative controls in `plant_faults.py` and its records. It changes no code of the generator.
+- No person has read the model.
+- Merging pull request 16 still takes your word.
+
+## S3-6: what events, ports and `clock_read` leave open (items 169 to 187): Accepted 2026-11-11
+
+ADR-0005 C9 (ports), C10 (events) and C13 (`clock_read`) were accepted on 2026-11-09. Task S3-6's research ledger, `docs/research/2026-11-11-events-ports.md`, found 19 points those three leave open. Each fixes what a program sees at the system-call boundary, which is the owner's (CLAUDE.md §84). The coordinating session checked every shape, put them to the owner as items 169 to 187 with one recommendation each and four marked "Look" (169, 178, 179, 187), and the owner answered **"Accept all"** on 2026-11-11. They are ADR-0005 Amendment 7, F1 to F19, in the same order; the full text of each, and what was rejected, is there and in the ledger.
+
+| # | Question | Answer |
+|---|---|---|
+| 169, answered | Is `port_packet` a fixed 32-byte record of C9's six fields with no `size` field, as an exception to ADR-0005 P4 for this record? (**Look**) | **Accept** |
+| 170, answered | Does `object_wait_async(port, object, key, signals)` need `write` on the port and `wait` on the object, take no options argument, and fail in D5's order? | **Accept** |
+| 171, answered | Does `port_wait(port, deadline) -> packet` need `read`, use `wait_one`'s deadline, answer `timed_out` and `canceled` as `wait_one` does, and consume a packet when it is taken even if the copy then faults? | **Accept** |
+| 172, answered | Does `port_cancel(port, object, key)` need only `write` on the port, remove every matching binding and queued packet silently, and answer `not_found` when nothing matched? | **Accept** |
+| 173, answered | Is `object_signal` events-only and `signaled`-only in v1, one atomic `(old & !clear) | set`, with `wrong_type` for a non-event? | **Accept** |
+| 174, answered | Are the default rights named `event_rights` and `port_rights`, with C6's rights? | **Accept** |
+| 175, answered | Three new per-process count quotas, `events`, `ports` and `bindings`, with a binding charged to the process that bound it? | **Accept** |
+| 176, answered | Does `wait_one` work on an event and answer `access_denied` on a port, with no signals on ports in v1? | **Accept** |
+| 177, answered | May the same port, object and key be bound twice, giving two bindings and two packets? | **Accept** |
+| 178, answered | Does `clock_read() -> nanos` read the monotonic clock only, take no argument, and have the one status `fault`? (**Look**: the task contract had said "no errors") | **Accept** |
+| 179, answered | When a binder exits while another process holds the port, do its packets stay queued and stay charged to its account until read, cancelled or the port closes? (**Look**: the task contract had asked for no charge left at once) | **Accept** |
+| 180, answered | Is a binding's storage refunded when its packet is read, when it is explicitly cancelled and when the port closes, and not on an implicit cancel? | **Accept** |
+| 181, answered | Is the mask left unchecked against the object's type, as with `wait_one`? | **Accept** |
+| 182, answered | Is `trigger` the mask asked, and `observed` all of the object's signals when the packet was queued? | **Accept** |
+| 183, answered | Do packets leave in the order queued, with no bound per port beyond the binders' quotas? | **Accept** |
+| 184, answered | Does an implicit cancel follow the handle the binding was made through, not the object? | **Accept** |
+| 185, answered | Do `event_create()` and `port_create()` take no argument and answer `fault`, `limit` or `no_memory`? | **Accept** |
+| 186, answered | Can any object `wait_one` can wait on be bound: channel ends, processes, threads and events? | **Accept** |
+| 187, answered | Does S3-6 leave out packets a program queues itself and edge-triggered or repeating bindings, and leave the `Timer` object owed under P3 as TASKS item 36? (**Look**) | **Accept** |
+
+- **Two of them correct the coordinating session's own task contract** (TASKS, contract S3-6): item 178 ("no errors" was a mistake: a call with a result has `fault`) and item 179 (an exited binder's charge can outlast it on a shared port).
+- **Item 169 is an exception to an accepted sentence**, ADR-0005 P4's rule that every structure crossing the boundary begins with a size, for `port_packet` only.
+- **Item 187 leaves P3's `Timer` object owed**, not dropped. TASKS item 36 tracks it.
+- **Recorded with them, and no decision:** the call numbers (9, 10, 15 to 19), the change to two reserved calls' error sets, and `origin.kernel` and `user-abi` going from 0.5 to 0.6.
+- **Nothing of this is built into the batch on the day of the answer.** No behaviour of the seven calls has run. Two pieces were built ahead under §84 and are not merged: the framework's protocol core (`claude/s3-6a-port-core`) and the count quotas of item 175 (`claude/s3-6-events-ports` at `b40d569`). Each lands only after the coordinating session has read it and run the gates on the merge.
+- **Built since, in this batch:** the protocol core at merge `9889fcc`, a fix to the channel quotas at `d8e9d49`, and the seven calls with their quotas at `15baed9` (task S3-6 stage 2). The coordinating session read each against Amendment 7 and ran the check, the boot test and the boot matrix on the merge, under QEMU only. No person has read them.
+- Merging pull request 16 still takes your word.
 ## The requirements matrix's shape (items 191 to 196): Accepted 2026-11-12
 
 CLAUDE.md §1 makes 100% coverage of approved requirements the completion target, measured against a versioned requirements matrix (revision 7.5, item 165). TASKS item 35 builds it. Its session found six questions of shape that the directive leaves open, and the coordinating session put them to you on 2026-11-11 with one recommendation each, adding one rule to item 191. You answered **"Accept all 30"** on 2026-11-12, which covers these six and items 197 to 220 below.

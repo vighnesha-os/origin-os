@@ -46,7 +46,8 @@ enum status: i64 {
     /// The caller's buffer is too small; the sizes it needs were written to the out pointer.
     buffer_too_small = -13;
     /// Nothing by that name or key is here: a service directory holds no provider of the
-    /// interface and major asked for (ADR-0005 C11).
+    /// interface and major asked for (ADR-0005 C11), or a port holds no binding or packet for
+    /// the object and key port_cancel names (ADR-0005 Amendment 7, F4).
     @since(0.4) not_found = -14;
 }
 
@@ -84,6 +85,25 @@ const process_rights: rights = read | write | manage | wait | duplicate | transf
 /// The rights of a thread's handle to itself (ADR-0005 C6).
 @since(0.3)
 const thread_rights: rights = wait | manage | duplicate | transfer;
+
+/// The rights of a new memory object (ADR-0005 C6): never execute, since an anonymous object
+/// is never executable.
+@since(0.5)
+const memory_object_rights: rights = read | write | map | duplicate | transfer;
+
+/// The rights of a new event (ADR-0005 C6; Amendment 7, F6).
+@since(0.6)
+const event_rights: rights = wait | signal | duplicate | transfer;
+
+/// The rights of a new port (ADR-0005 C6; Amendment 7, F6). No wait: a port raises no signals
+/// in this version, so wait_one on it is access_denied and it cannot be bound to a port (F8).
+@since(0.6)
+const port_rights: rights = read | write | duplicate | transfer;
+
+/// Bytes in a page: every memory object, mapping, offset and fixed address is counted in
+/// whole pages of this size (ADR-0005 P7, D2).
+@since(0.5)
+const page_size: u64 = 4096;
 
 /// Object signals (ADR-0005 P9).
 bits signals: u32 {
@@ -225,6 +245,83 @@ struct start_entry {
     role: start_role;
 }
 
+/// What a mapping allows (ADR-0005 P7, C7, D2). Every mapping can be read; write and execute
+/// are never given together.
+@since(0.5)
+bits map_access: u32 {
+    /// Read. Every mapping has it.
+    read = 0;
+    /// Write.
+    write = 1;
+    /// Execute: refused until the Code Integrity Table exists (ONBF §8.2), and an anonymous
+    /// object never has the right.
+    execute = 2;
+}
+
+/// How a mapping is placed (ADR-0005 P7, C7, D2).
+@since(0.5)
+bits map_flags: u32 {
+    /// At the request's address, whose pages must all be free: a mapping is never replaced.
+    /// Without it the kernel places the mapping at a random free address.
+    fixed = 0;
+}
+
+/// What memory_object_create makes (ADR-0005 C7). A sized struct, so that a later minor can
+/// add an option without a new call (P4, D1).
+@since(0.5)
+sized struct object_request {
+    /// Bytes of the object: a non-zero multiple of page_size. They are committed at creation,
+    /// zeroed, and charged to the caller.
+    length: u64;
+}
+
+/// What memory_map maps and how (ADR-0005 P7, C7, C8, D2).
+@since(0.5)
+sized struct map_request {
+    /// What the mapping allows: read, and at most one of write and execute.
+    access: map_access;
+    /// How it is placed.
+    flags: map_flags;
+    /// Where it starts in the object, in bytes: a multiple of page_size.
+    offset: u64;
+    /// How many bytes it maps: a non-zero multiple of page_size, inside the object.
+    length: u64;
+    /// With fixed, where it is placed: a multiple of page_size, in the user half. Otherwise 0.
+    address: u64;
+}
+
+/// What made a port packet (ADR-0005 C9; Amendment 7, F1). 0 is never a kind, so a zeroed
+/// buffer is not a packet.
+@since(0.6)
+enum packet_kind: u32 {
+    /// The object's signals met the binding's mask.
+    signal = 1;
+    /// The binding was cancelled implicitly: the handle it was made through was closed or
+    /// moved, or the binder's process ended (F11, F16).
+    canceled = 2;
+}
+
+/// One packet, as port_wait writes it (ADR-0005 C9; Amendment 7, F1, F14): 32 bytes, no padding
+/// and no size field, an exception to P4's rule for this record only. A different layout is a
+/// new call.
+@since(0.6)
+struct port_packet {
+    /// What the binder gave object_wait_async, unchanged.
+    key: u64;
+    /// What made the packet. A new kind is a new minor of origin.kernel: a client decodes this
+    /// field strictly and refuses a kind its minor does not know.
+    kind: packet_kind;
+    /// The mask the binding asked.
+    trigger: signals;
+    /// All of the object's signals when the packet was queued; for a canceled packet, when the
+    /// binding was cancelled. A packet stays queued if a signal falls afterwards.
+    observed: signals;
+    /// Zero.
+    reserved: u32;
+    /// Zero in this version.
+    data: u64;
+}
+
 /// Calls made by a thread on its process's behalf (ADR-0005 P4). Every number here is private
 /// to the release; the C entry points below are the stable interface.
 interface kernel {
@@ -308,21 +405,157 @@ interface kernel {
         @also_on(timed_out, canceled) observed: signals,
     ) errors(bad_handle, invalid_args, fault, access_denied, timed_out, canceled) requires none;
 
-    /// Reserved: creates an event. Events do not exist yet (ADR-0005 P3).
-    @reserved
+    /// Creates an event with no signal raised, charged to the caller's quota of events, and
+    /// returns a handle to it with event_rights (ADR-0005 C10; Amendment 7, F7, F17). limit:
+    /// past the caller's quota of events, or its handle table is full.
     method event_create = 9 () -> (
         /// The new event.
         event: handle<event>,
-    ) errors(not_supported) requires none;
+    ) errors(fault, limit, no_memory) requires none;
 
-    /// Reserved: changes an object's user signals. Events do not exist yet (ADR-0005 P9).
-    @reserved
+    /// Changes an event's user signal: clears clear, then sets set, as one step, so a signal in
+    /// both ends set; there is no pulse (ADR-0005 C10; Amendment 7, F5). Two empty masks change
+    /// nothing. wrong_type: not an event. invalid_args: a signal other than signaled in either
+    /// mask.
     method object_signal = 10 (
-        /// The object.
+        /// The object: an event.
         object: handle<any, signal>,
         /// Signals to clear.
         clear: signals,
         /// Signals to set.
         set: signals,
-    ) errors(not_supported) requires none;
+    ) errors(bad_handle, invalid_args, access_denied, wrong_type) requires none;
+
+    /// Makes a memory object of zeroed frames, committed in full and charged to the caller's
+    /// account, and returns a handle to it with memory_object_rights (ADR-0005 C6, C7, D1).
+    /// limit: past the caller's memory quota (D4), or its handle table is full.
+    @since(0.5)
+    method memory_object_create = 11 (
+        /// What to make.
+        request: object_request,
+    ) -> (
+        /// The new object.
+        object: handle<memory_object>,
+    ) errors(invalid_args, fault, limit, no_memory) requires none;
+
+    /// Maps part of a memory object into a process and returns where (ADR-0005 P7, C7, C8, D2,
+    /// D5).
+    /// The mapping holds the object: closing a handle never unmaps. access_denied: the
+    /// object's handle lacks read, or write for a writable mapping, or execute was asked.
+    /// invalid_args: a malformed request, or a fixed address any page of which is mapped.
+    /// limit: past the process's mappings, or its page tables are full, or eight places
+    /// drawn at random in a row were all taken. not_supported: the kernel's random-number
+    /// generator gave no number to place it at random (ADR-0016).
+    @since(0.5)
+    method memory_map = 12 (
+        /// The process whose address space changes: write is needed, the caller's own
+        /// included (ADR-0005 C6).
+        process: handle<process, write>,
+        /// The object.
+        object: handle<memory_object, map>,
+        /// What to map and how.
+        request: map_request,
+    ) -> (
+        /// Where the mapping starts.
+        address: u64,
+    ) errors(bad_handle, wrong_type, access_denied, invalid_args, fault, limit, no_memory, not_supported) requires none;
+
+    /// Removes one whole mapping (ADR-0005 P7, C7, D3). When it returns, no processor reaches its
+    /// pages through this process. invalid_args: address and length are not exactly one
+    /// mapping. should_wait: the process's budget of shootdowns cannot pay for it now, or
+    /// another call is making or changing the mapping at this moment; either way nothing
+    /// changed. timed_out: a processor did not answer the shootdown; the mapping is gone, and
+    /// its frames are kept from reuse for good. no_memory: only after such a stall, when the
+    /// kernel heap cannot replace the bookkeeping it leaked (D5).
+    @since(0.5)
+    method memory_unmap = 13 (
+        /// The process whose address space changes.
+        process: handle<process, write>,
+        /// Where the mapping starts.
+        address: u64,
+        /// Its whole length, in bytes.
+        length: u64,
+    ) errors(bad_handle, wrong_type, access_denied, invalid_args, no_memory, should_wait, timed_out) requires none;
+
+    /// Reduces what one whole mapping allows (ADR-0005 P7, C7, D3). When it returns, no processor
+    /// uses the old access. access_denied: the new access is not within the old one.
+    /// invalid_args, should_wait and timed_out as for memory_unmap.
+    @since(0.5)
+    method memory_protect = 14 (
+        /// The process whose address space changes.
+        process: handle<process, write>,
+        /// Where the mapping starts.
+        address: u64,
+        /// Its whole length, in bytes.
+        length: u64,
+        /// What it allows from now on: read, and at most what it allowed before.
+        @nonzero access: map_access,
+    ) errors(bad_handle, wrong_type, access_denied, invalid_args, should_wait, timed_out) requires none;
+
+    /// Creates a port, charged to the caller's quota of ports, and returns a handle to it with
+    /// port_rights (ADR-0005 C9; Amendment 7, F7, F17). limit: past the caller's quota of ports,
+    /// or its handle table is full.
+    @since(0.6)
+    method port_create = 15 () -> (
+        /// The new port.
+        port: handle<port>,
+    ) errors(fault, limit, no_memory) requires none;
+
+    /// Binds signals of an object to a port: once one of them is raised, one signal packet with
+    /// key is queued in the port (ADR-0005 C9; Amendment 7, F2, F9, F13, F18). A signal already
+    /// raised queues it before the call returns. The binding is charged to the caller's quota of
+    /// bindings until its packet has left the port. Closing or moving the handle it is made
+    /// through, or the caller's end, cancels it and queues a canceled packet instead (F11, F16).
+    /// bad_handle: also an object that raises no signals, or either handle closed during the
+    /// call, after which nothing stays bound. limit: past the caller's quota of bindings.
+    @since(0.6)
+    method object_wait_async = 16 (
+        /// The port the packet goes to.
+        port: handle<port, write>,
+        /// The object whose signals are watched: a channel end, a process, a thread or an event.
+        object: handle<any, wait>,
+        /// Given back unchanged in the packet; compared by port_cancel, never interpreted.
+        key: u64,
+        /// The signals that fire the binding: any one of them.
+        @nonzero signals: signals,
+    ) errors(bad_handle, wrong_type, invalid_args, access_denied, limit, no_memory) requires none;
+
+    /// Takes the oldest packet queued in a port, waiting until the deadline (ADR-0005 C9;
+    /// Amendment 7, F3, F15). timed_out: nothing was queued by then. canceled: the handle waited
+    /// through was closed or moved during the wait, even if a duplicate keeps the port open; such
+    /// a wait takes no packet. A packet is taken when it is read: if writing it faults, the
+    /// answer is fault and the packet is gone.
+    @since(0.6)
+    method port_wait = 17 (
+        /// The port.
+        port: handle<port, read>,
+        /// A monotonic deadline in nanoseconds; 0 polls, deadline_infinite never expires.
+        deadline: u64,
+    ) -> (
+        /// The packet.
+        packet: port_packet,
+    ) errors(bad_handle, wrong_type, access_denied, fault, timed_out, canceled) requires none;
+
+    /// Removes every binding armed for a port on an object with a key, and every packet from
+    /// such a binding queued in the port, of either kind, silently (ADR-0005 C9; Amendment 7,
+    /// F4). It needs no right on the object: whoever holds the port's write controls its
+    /// bindings. not_found: nothing matched.
+    @since(0.6)
+    method port_cancel = 18 (
+        /// The port.
+        port: handle<port, write>,
+        /// The object the bindings watch.
+        object: handle<any>,
+        /// The key they were made with.
+        key: u64,
+    ) errors(bad_handle, wrong_type, access_denied, not_found) requires none;
+
+    /// Reads the monotonic clock: nanoseconds since the kernel started, never less than a value
+    /// it gave before on any processor (ADR-0005 C13; Amendment 7, F10; ADR-0012). What it does
+    /// across a suspend is not decided.
+    @since(0.6)
+    method clock_read = 19 () -> (
+        /// Nanoseconds.
+        nanos: u64,
+    ) errors(fault) requires none;
 }

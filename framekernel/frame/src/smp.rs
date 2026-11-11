@@ -16,12 +16,13 @@
 //!    and its argument) lives in the separate read/write page [`TRAMPOLINE_DATA`]. The GDT
 //!    descriptors are pre-marked accessed, so loading them never writes. So W^X holds even
 //!    while an AP starts.
-//! 3. For each AP, in turn: a heap stack and heap `CpuTables`, then INIT, 10 ms, start-up
-//!    IPI, 200 µs, a second start-up IPI if it is not up yet, and up to 200 ms for its
-//!    handshake. The AP runs the trampoline (real → protected → long mode with the
-//!    kernel's own page tables), then [`ap_entry`]: its own GDT and TSS, the shared IDT,
-//!    the CPU-local area of its index (only if that index's APIC ID is its own), SMEP and
-//!    SMAP, its local APIC in x2APIC mode, and the handshake with its APIC ID.
+//! 3. For each AP, in turn: a stack and four interrupt stacks in the stack region
+//!    (`crate::stack`), the page below each interrupt stack proven to fault, and heap
+//!    `CpuTables`; then INIT, 10 ms, start-up IPI, 200 µs, a second start-up IPI if it is not
+//!    up yet, and up to 200 ms for its handshake. The AP runs the trampoline (real → protected
+//!    → long mode with the kernel's own page tables), then [`ap_entry`]: its own GDT and TSS,
+//!    the shared IDT, the CPU-local area of its index (only if that index's APIC ID is its
+//!    own), SMEP and SMAP, its local APIC in x2APIC mode, and the handshake with its APIC ID.
 //! 4. The data page is then rewritten for the next AP. An AP that missed its handshake may
 //!    only be slow, so before that it must be made unable both to join late and to read
 //!    the page again (ADR-0008 C7):
@@ -168,8 +169,10 @@ struct ApStart {
     /// Settled once, by the AP's answer or refusal or by the boot processor's deadline,
     /// whichever comes first.
     handshake: Handshake,
-    /// The AP's own GDT, TSS and interrupt stacks.
+    /// The AP's own GDT and TSS.
     tables: *mut CpuTables,
+    /// The tops of its interrupt stacks, in the stack region: #DF, NMI, #MC, #DB.
+    interrupt_stacks: [u64; 4],
     /// The CPU index the AP takes; discovery assigned it the AP's APIC ID.
     index: CpuIndex,
     /// Where the AP goes once it is online: the layers above's scheduler.
@@ -272,7 +275,10 @@ pub fn start(com1: &mut dyn Write, ap_main: fn(&X2Apic) -> !) -> Online {
     cpu::record_cpu_state();
     // The boot processor's interrupt stacks are in the kernel's image; nothing could guard
     // them before the kernel's own tables were live.
-    let bsp_guards = guard_interrupt_stacks(cpu::bsp_tables())
+    // SAFETY: the boot processor's interrupt stacks lie above their guard pages and have not
+    // been used down that far, and nothing else touches a guard page.
+    let bsp_guards = unsafe { cpu::protect_interrupt_stacks() }
+        .and_then(|guards| probe_guards(&guards))
         .map(|proven| INTERRUPT_STACK_GUARDS.store(proven, Ordering::Relaxed));
     let map = match discover(info.acpi_rsdp, bsp) {
         Ok(map) => map,
@@ -434,15 +440,10 @@ pub fn topology_of(index: CpuIndex) -> Option<CpuTopology> {
 /// Guard pages proven unmapped, for the boot report.
 static INTERRUPT_STACK_GUARDS: AtomicU64 = AtomicU64::new(0);
 
-/// Unmaps the guard page below each interrupt stack in `tables` (an AP has yet to start; on the
-/// boot processor each guard page lies below anything those stacks have used so far), proves
-/// that each one faults, and returns how many did.
-fn guard_interrupt_stacks(tables: *const CpuTables) -> Result<u64, &'static str> {
-    // SAFETY: `tables` is an AP's own tables, before the AP starts, or the boot processor's,
-    // whose interrupt stacks lie above the guard pages (`cpu::protect_interrupt_stacks`).
-    let guards = unsafe { cpu::protect_interrupt_stacks(tables) }?;
+/// Proves that a read of each guard page in `guards` faults, and returns how many did.
+fn probe_guards(guards: &[u64]) -> Result<u64, &'static str> {
     let mut proven = 0;
-    for guard in guards {
+    for &guard in guards {
         match cpu::probe_read(guard) {
             cpu::Probe::Faulted { error: 0, address } if address == guard => {
                 proven += 1;
@@ -451,6 +452,25 @@ fn guard_interrupt_stacks(tables: *const CpuTables) -> Result<u64, &'static str>
         }
     }
     Ok(proven)
+}
+
+/// An application processor's four interrupt stacks (#DF, NMI, #MC, #DB), in the stack region
+/// (ADR-0004 Amendment 1, A2): the unmapped space below each is its guard, so none is cut out
+/// of the direct map. Proves that the page below each faults.
+fn interrupt_stacks() -> Result<([GuardedStack; 4], u64), &'static str> {
+    let made = [(); 4].map(|()| GuardedStack::new(cpu::IST_STACK_SIZE));
+    let [
+        Some(double_fault),
+        Some(nmi),
+        Some(machine_check),
+        Some(debug),
+    ] = made
+    else {
+        return Err("no memory for the interrupt stacks");
+    };
+    let stacks = [double_fault, nmi, machine_check, debug];
+    let proven = probe_guards(&stacks.each_ref().map(GuardedStack::guard_addr))?;
+    Ok((stacks, proven))
 }
 
 /// RSDP → XSDT → MADT → the processors it lists → their CPU indexes, the boot processor
@@ -625,17 +645,27 @@ fn start_one(
     tsc_hz: u64,
     main: fn(&X2Apic) -> !,
 ) -> Result<u64, &'static str> {
+    let (interrupt_stacks, guards) = interrupt_stacks()?;
+    let stack = GuardedStack::new(AP_STACK_BYTES).ok_or("no memory for the AP stack")?;
     // SAFETY: an all-zero `CpuTables` is valid (integers only); `init_ap` writes it before
     // the processor uses it.
     let tables = Box::into_raw(unsafe { Box::<CpuTables>::new_zeroed().assume_init() });
-    let guards = guard_interrupt_stacks(tables)?;
-    let stack = GuardedStack::new(AP_STACK_BYTES).ok_or("no memory for the AP stack")?;
+    // Its random-number generator's stack and seed area (ADR-0016): made here, by the
+    // processor that starts it, so that it finds both when it starts its generator
+    // (`random::start_this_processor`), which allocates nothing.
+    if !crate::random::prepare(index) {
+        return Err("no memory for its random-number generator");
+    }
     let stack_top = stack.top();
-    // Kept for ever: the AP runs on it (its idle context).
+    let interrupt_tops = interrupt_stacks.each_ref().map(GuardedStack::top);
+    // Kept for ever: the AP runs on the first (its idle context) and takes its #DF, NMI, #MC
+    // and #DB on the others.
     core::mem::forget(stack);
+    core::mem::forget(interrupt_stacks);
     let start: &'static ApStart = Box::leak(Box::new(ApStart {
         handshake: Handshake::new(),
         tables,
+        interrupt_stacks: interrupt_tops,
         index,
         main,
         lacks: AtomicU64::new(0),
@@ -782,8 +812,10 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     let start = unsafe { &*start };
     // SAFETY: once per AP (each gets its own `start`), CPL 0, interrupts disabled (the
     // trampoline ran `cli`), after `cpu::init` on the boot processor; the tables are this
-    // AP's alone, and so is `start.index` (the boot processor gives each index once).
-    unsafe { cpu::init_ap(start.tables, start.index) };
+    // AP's alone, and so is `start.index` (the boot processor gives each index once). The
+    // interrupt stacks are four stacks of `IST_STACK_SIZE` bytes in the stack region that the
+    // boot processor made for this AP alone and keeps for ever (`start_one`).
+    unsafe { cpu::init_ap(start.tables, start.index, start.interrupt_stacks) };
     // SAFETY: CPL 0; the kernel has no user mappings. Every processor enforces SMEP and SMAP.
     let (smep, smap) = unsafe { cpu::enable_smep_smap() };
     // SAFETY: CPL 0; the kernel's tables mark only the kernel half global.
@@ -832,6 +864,9 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     if !start.handshake.answer(id) {
         cpu::halt();
     }
+    // This processor's random-number generator (ADR-0016 R5): its instructions' start-up tests
+    // and a first seed from the root, before anything can run here that asks for a value.
+    crate::random::start_this_processor();
     // M3: this processor's scheduler.
     (start.main)(&lapic)
 }
