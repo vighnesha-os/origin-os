@@ -120,6 +120,8 @@ const LOADER_BIN: &str = "origin-boot";
 const VERSION_PACKAGE: &str = "origin-version";
 const ONBF_FORMAT_PACKAGE: &str = "onbf-format";
 const CRYPTO_PACKAGE: &str = "origin-crypto";
+/// The random-number generator's policy (ADR-0016 R2): in the loader and the Framekernel.
+const RANDOM_PACKAGE: &str = "origin-random";
 const MERKLE_PACKAGE: &str = "onbf-merkle";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// `no_std` libraries embedded in the boot loader and the Framekernel, and the generated crates of
@@ -139,6 +141,7 @@ const FREESTANDING_LIBS: &[&str] = &[
     ONBF_FORMAT_PACKAGE,
     MERKLE_PACKAGE,
     CRYPTO_PACKAGE,
+    RANDOM_PACKAGE,
     "origin-sync",
     "onbf-verify",
     "origin-paging",

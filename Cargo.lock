@@ -126,6 +126,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-random"
+version = "0.0.0"
+dependencies = [
+ "origin-crypto",
+]
+
+[[package]]
 name = "origin-sync"
 version = "0.0.0"
 
