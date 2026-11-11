@@ -271,6 +271,13 @@
     - then have the image gate (`developer-tools/xtask/src/image.rs`) hold the count of calls through the table, so it cannot grow back unnoticed.
 
     It writes its own contract (§78) before any change. The toolchain's prebuilt `core` and `alloc` keep their own calls, as they keep their returns (ADR-0017 Amendment 1).
+35. **The requirements matrix (CLAUDE.md 7.5 §1; decision items 165 and 168). Not started.** (Item 34 is on another branch.) §1 sets 100% coverage of approved requirements as the completion target and measures it against a versioned requirements matrix, which role 45 owns. No such matrix exists, so coverage cannot be stated today. The task:
+    - one row for each approved requirement of CLAUDE.md, the accepted ADRs and the decision sheet, with its scope, owning role, implementation, acceptance criteria, verification evidence, state and remaining limitations;
+    - kept where a gate can read it, beside item 25's provenance table and `docs/ROADMAP.md`, and repeating neither;
+    - a gate in `cargo xtask check` that fails when a row marked done names evidence that is not in the repository, and prints the coverage figure;
+    - approved scope changes recorded in the matrix with the decision item that made them.
+
+    It writes its own contract (§78) first. The contract says how a requirement is split into rows and where the matrix lives; both are put to the owner before the matrix is filled.
 
 ## Waiting on the owner
 
