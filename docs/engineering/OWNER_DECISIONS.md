@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–141 and 145–154, and 2026-11-11 for items 161, 165, 168 and 189. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144, 155–164, 166, 167 and 188 are on other branches (`land/s3-part2`, `claude/18b-kernel-random`), and 169–187 are given out for S3-6's shapes; none of them is in this sheet yet. |
-| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 165 and 168: your own text for CLAUDE.md §1, in its second and third versions, read against the whole of revision 7.5 and the ADRs each change names; the check and the list of changes are `ROLES_CHECK_2026-11-11.md`. Item 189: that check's proposal 11. |
+| As of | 2026-11-10 for items 71–141 and 145–154, 2026-11-11 for items 161, 165, 168 and 189, and 2026-11-12 for items 191–220. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144, 155–160, 162–164, 166, 167, 169–188 and 190 are in the second step-3 batch (`land/s3-part2`, pull request 16) and reach this sheet with it. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 165 and 168: your own text for CLAUDE.md §1, in its second and third versions, read against the whole of revision 7.5 and the ADRs each change names; the check and the list of changes are `ROLES_CHECK_2026-11-11.md`. Item 189: that check's proposal 11. Items 191–196: CLAUDE.md 7.6's §1, by TASKS item 35's session, with one rule added to item 191 by the coordinating session. Items 197–220: CLAUDE.md 7.6, the accepted ADRs and `docs/spec/OIDL.md`, by the session that wrote step 4's ledger, and again by the coordinating session against ADR-0005 A6, ADR-0011 N8 and the system threat model. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: items 161, 165, 168 and 189 (item 168 delegated to Claude). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: items 161, 165, 168 and 189 (item 168 delegated to Claude). 2026-11-12: items 191–220. |
 | Still open | No numbered item. Item 168's changes to your text are Claude's, and you have not read them. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -503,3 +503,72 @@ What it changes, in CLAUDE.md 7.6:
 - **Nothing else changes.** Revision 7.5 is kept at `docs/engineering/CLAUDE-v7.5.md`.
 
 Why: §1 has listed 67 specialist roles since revision 7.5, and §77's 26 agents overlapped them with another count. Every one of the 26 has a role in §1: the NPU is role 56, source provenance is role 67, and context management is role 28 with the requirement to keep durable engineering records.
+
+## The requirements matrix's shape (items 191 to 196): Accepted 2026-11-12
+
+CLAUDE.md §1 makes 100% coverage of approved requirements the completion target, measured against a versioned requirements matrix (revision 7.5, item 165). TASKS item 35 builds it. Its session found six questions of shape that the directive leaves open, and the coordinating session put them to you on 2026-11-11 with one recommendation each, adding one rule to item 191. You answered **"Accept all 30"** on 2026-11-12, which covers these six and items 197 to 220 below.
+
+| # | Question | Answer |
+|---|---|---|
+| 191, answered | What one row is: one row per statement of CLAUDE.md 7.6 (1,382) and per decision of an accepted ADR (221), 1,603 rows when counted on `main` at `405495c`. Decision-sheet items are cited by rows and are not rows. A statement that asks for nothing keeps a row marked as information, and is not counted. With the coordinating session's addition: every answered decision item is named by at least one row or listed as asking for nothing (a process rule such as item 70 or 190), and the gate checks it. | **Accept** |
+| 192, answered | Where and in what form: Markdown tables under `docs/requirements/`, one file per PART of the directive and one per ADR, and a README with the rules, the directive's revision and the scope changes. The tables are the only copy. | **Accept** |
+| 193, answered | `built` and `done`: `built` is implemented with evidence but short of the row's scope (QEMU only where the scope is hardware); `done` is acceptance criteria passing within the declared scope. Each row names where its evidence ran (host tests, emulation, hardware-assisted virtualization, physical devices), and the gate refuses `done` below the row's scope. The figure counts `done` only, with `built` beside it. | **Accept** |
+| 194, answered | Evidence: references the gate finds in the tree (a file, a test by file and name, a boot proof by name, a `cargo xtask` command). A `built` or `done` row names at least one. Each row says who reviewed it (nobody, an AI reviewer, a named person), and the gate prints how many a person reviewed. | **Accept** |
+| 195, answered | Acceptance criteria: a `not-started` row may lack them, and cannot leave that state without them, written by its task's §78 contract. | **Accept** |
+| 196, answered | Scope changes: a table in the README, one line per approved change (item, date, what changed, rows touched). A removed row stays, marked `removed` with its item, and is not counted. The table starts with the changes already approved, among them the Server edition (items 71–76) and the hardware scope (item 88). | **Accept** |
+
+- **What item 193 means today:** no kernel, loader or driver row can be `done`. Their evidence is QEMU's and CI's virtual machines, and their scope is hardware.
+- **Item 191's addition is the coordinating session's.** Some answers are recorded only as a note, such as item 163 in ADR-0005's "Second note on D5", and a count of ADR rows alone would miss them.
+- **Nothing is built.** TASKS item 35's session builds the matrix from `main`. Its gate will refuse the second step-3 batch's tree until rows exist for the batch's ADR decisions, and the coordinating session plans that order.
+
+## N14 step 4: `origin.core` and the Diagnostics domain (items 197 to 220): Accepted 2026-11-12
+
+ADR-0011 N14's step 4 is "`origin.core`, then one end-to-end service domain: Diagnostics first, because it is the smallest. Measure it (N8)." Its research ledger, `docs/research/2026-11-11-n14-step4-scope.md`, found 24 points that the accepted texts leave open. The coordinating session checked each against CLAUDE.md 7.6, ADR-0005 A6, ADR-0011 N8 and the system threat model, numbered them 197 to 220 (the ledger's candidate n is item 196 + n), and put them to you on 2026-11-11, six marked "Look". You answered **"Accept all 30"** on 2026-11-12.
+
+| # | Question | Answer |
+|---|---|---|
+| 197, answered | Do step 4's programs reach ring 3 inside the kernel's image, laid out at build time and parsed by nothing at run time, until the Loader Service exists? (**Look**) | **Accept** |
+| 198, answered | Is `origin.core` one stateless image per release, mapped read-execute into every process at a random place before its first thread, once, and never unmapped or changed? | **Accept** |
+| 199, answered | Does the launch path bind each program's imports from `origin.core` from a table made at build time, read-only before the first thread? | **Accept** |
+| 200, answered | Does `origin.core` hold only the generated stubs in step 4, with P8's helper deferred until a kernel fast path is designed with N8's figures? (**Look**) | **Accept** |
+| 201, answered | Does `origin.core` export exactly OIDL's generated entry points, versioned by `user-abi`, with the psABI revision pinned before the first export? | **Accept** |
+| 202, answered | Are the stubs naked functions, with a gate holding one `syscall` per number in `origin.core` and none in any other image the kernel carries? | **Accept** |
+| 203, answered | Does the kernel know each call's offset from the build and record `origin.core`'s base when it maps it (Zircon's method), rather than take a table from a loader (OpenBSD's)? | **Accept** |
+| 204, answered | Does a call from anywhere but its own stub stop the thread as a fault does, rather than answer `access_denied` as A6 does? (**Look**) | **Accept** |
+| 205, answered | Do the kernel's own proof processes keep A6's range, while every other process is pinned per call? | **Accept** |
+| 206, answered | Does O2 close for step 4 by absence, with the thread and process calls built in step 5 with their quotas? (**Look**) | **Accept** |
+| 207, answered | Is the ledger's candidate 11 (one create-and-start call, a `threads` count, a reserve of run-queue slots for the kernel) where step 5 starts? | **Accept**, decided again with step 5 |
+| 208, answered | Is the ledger's candidate 12 (creation and start behind a named capability; a change rate above 10^9 refused) where the Loader Service starts? | **Accept**, decided again with the Loader Service |
+| 209, answered | Is the kernel-wide bound the worst-case figure of a process's limits, paid out of its creator's own, with the kernel's root sized at boot less a reserve? | **Accept** |
+| 210, answered | No implicit default quotas: each kind given deliberately, step 4's limits explicit, and the Loader Service's defaults decided with its manifest? | **Accept** |
+| 211, answered | Does a launcher fill a directory through a `setup` interface on its BOOTSTRAP, with `add`, `limit` for a full table and a new appended status for a key already held? | **Accept** |
+| 212, answered | Does a provider receive connections as a one-way `accept(interface_id, major, server)` on a `provider` interface? | **Accept** |
+| 213, answered | Does step 4 go ahead with I2 "Partly", with I2's closure moved to "before any claim about real hardware, and before any program that is not first-party runs in ring 3"? (**Look**) | **Accept**. Nothing is rented |
+| 214, answered | Does ring 3's clock stay at full resolution, with K15 closed as accepted under AC5? | **Accept** |
+| 215, answered | Is the `Timer` object left out of step 4, still owed under P3? | **Accept** |
+| 216, answered | Does `origin.diagnostics` 0.1 serve the boot report (the verdict and each processor's facts, behind a capability), with the kernel log in a later minor? | **Accept** |
+| 217, answered | Does the Diagnostics service read the report through one kernel call, gated by a kernel capability only it holds? | **Accept** |
+| 218, answered | Does N8's measurement cover the round trip on one processor and on two, with p50 to p99.9, beside the ping-pong, a null call and `clock_read`, against a hypothesis written first? | **Accept** |
+| 219, answered | Is N8's figure on declared hardware owed before any performance claim and before release qualification, with step 5 not waiting for it? (**Look**) | **Accept** |
+| 220, answered | No call to drop a message: does a service close a connection whose next message it cannot take? | **Accept** |
+
+Where they are written:
+
+- **ADR-0011 Amendment 2, L1 to L12:** items 197–203, 205, 213, 216, 218 and 219. ONBF §8.3 gains a note for item 197, and the system threat model's "What must exist" and AC6 change with items 206 and 213.
+- **ADR-0005 Amendment 8, G1 to G12:** items 204, 206–212, 214, 215, 217 and 220. It follows Amendment 7, which is only in the second step-3 batch, so it is written there and reaches `main` with that batch. So do the system-call threat model's rows E8, O2, D11, K5 and K15 and its list "What must be closed", whose K rows are only there.
+
+What the six marked "Look" change in accepted text:
+
+- **Item 197:** ONBF §8.3 gives mapping to the Loader Service; until it exists, the kernel carries step 4's first-party programs. CLAUDE.md §11's sentence that `onbf-pack` "converts the linker output to `.ose`" is your text and is not changed; under item 197 that conversion waits for M6. Whether §11 should say so is yours to ask for.
+- **Item 200:** ADR-0005 P8's helper in `origin.core` waits for a fast path designed with N8's figures.
+- **Item 204:** for every process pinned per call, a call from outside its stub stops the thread, where A6 answered `access_denied`.
+- **Item 206:** O2 closes for step 4 by absence, where the system-call model said it closes "with the calls that create them".
+- **Item 213:** I2 stays "Partly". Renting a machine to read ADR-0017's controls back on silicon would be external spending, which is yours, and nothing is rented.
+- **Item 219:** N8's "before a second one is built" becomes "before any performance claim and before release qualification".
+
+Also:
+
+- **Items 207 and 208 are drafts.** Their exact shapes are put to you again when step 5 and the Loader Service begin.
+- **Owed before code:** the System V x86-64 psABI revision, pinned before the first export of `origin.core` (item 201, CLAUDE.md §17).
+- **Recorded, and no decision:** S4-0, ADR-0005 E1's 64-bit handles (item 109), lands before `origin.core` and takes `user-abi` to 0.7; `origin.directory` goes to 0.2 in S4-4 and `origin.diagnostics` starts at 0.1 in S4-5.
+- **Nothing is built.** Step 4 starts with S4-0 once the second step-3 batch is on `main`. When built, it runs under QEMU and as KVM guests in CI, and nothing will have run on a declared machine.
