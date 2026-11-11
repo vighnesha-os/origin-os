@@ -3482,12 +3482,12 @@ A fourth addition to the entry above, from another session and on a branch of it
     - `tell`;
     - `Counts::pages`;
     - xtask's scan, ELF reader, monitor answer and cross-boot comparison.
-  - **Boot controls**, each caught on its first run (ADR-0013 C30–C34):
-    - C30: a draw that always gives the fixed base;
-    - C31: a drawn base recorded as undrawn;
-    - C32: the guard's address printed again, caught by the scan;
-    - C33: `rip` printed as an address;
-    - C34: one base for every boot, caught by `boot-matrix` after its second run.
+  - **Boot controls**, each caught on its first run (ADR-0013 C44–C48; numbered C30–C34 until 2026-11-11):
+    - C44: a draw that always gives the fixed base;
+    - C45: a drawn base recorded as undrawn;
+    - C46: the guard's address printed again, caught by the scan;
+    - C47: `rip` printed as an address;
+    - C48: one base for every boot, caught by `boot-matrix` after its second run.
   - **Host-test controls:**
     - H1: a draw that can give the fixed base;
     - H2: placements past the window's end, caught by the window check;

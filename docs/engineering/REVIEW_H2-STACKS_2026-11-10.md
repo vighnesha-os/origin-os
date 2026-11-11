@@ -48,7 +48,7 @@ Landed on the step-3 batch's local branch as `759d319`. ADR-0004's wording now s
 
 **Read as changes:** `layout.rs`, `stack.rs`, `early.rs`, `told.rs`, `phys.rs`, `vm.rs`, `slots.rs`, and the kernel's `console.rs`, `kernel.rs`, `sched.rs` and `stacks.rs`; xtask's scan of the serial log. **Not read:** xtask's read through QEMU's monitor (`9f882e8`) and the records commit; the gates cover the first only where it runs.
 
-**Run by the reviewer on the merged tree `685e34c`:** `cargo xtask check` passed (all 42 Loom models, all 68 controls caught); `cargo xtask boot-test` passed 11 of 11 scenarios, with the kernel boot saying its region's base was drawn from RDSEED and is not the fixed one (QEMU's software CPU). **Reported by the author, not repeated:** `cargo xtask boot-matrix` (18 boots, 58 of 58 each, 11 distinct bases read through the monitor, none printed), controls C30–C34 and H1–H3, and the forced boot without entropy.
+**Run by the reviewer on the merged tree `685e34c`:** `cargo xtask check` passed (all 42 Loom models, all 68 controls caught); `cargo xtask boot-test` passed 11 of 11 scenarios, with the kernel boot saying its region's base was drawn from RDSEED and is not the fixed one (QEMU's software CPU). **Reported by the author, not repeated:** `cargo xtask boot-matrix` (18 boots, 58 of 58 each, 11 distinct bases read through the monitor, none printed), controls C30–C34 (renumbered C44–C48 in ADR-0013 on 2026-11-11) and H1–H3, and the forced boot without entropy.
 
 **Checked and found sound.**
 - The draw: `1 + random % placements` steps of 2 MiB from the window's start, so every base is aligned, keeps the whole region in PML4 slots 384–447, and is never the fixed base; the extremes are tested.
