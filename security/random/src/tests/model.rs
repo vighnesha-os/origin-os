@@ -94,7 +94,7 @@
 //! **Negative controls.** `tools/plant_faults.py` puts defects into the policy one at a time
 //! and says which rules the model then reports broken. For the entries it marks as this
 //! model's it fails unless a test of this file notices each. The rules that no defect of one
-//! edit reaches are shown something false by hand, in the last two tests here.
+//! edit reaches are shown something false by hand, in the last three tests here.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
@@ -1865,7 +1865,7 @@ fn the_same_seed_makes_the_same_run() {
     assert_eq!(once, again);
 }
 
-// ---- The rules themselves, on a store and on answers made up by hand. ----
+// ---- The rules themselves, on stores, answers and reseeds made up by hand. ----
 //
 // `tools/plant_faults.py` shows that most rules can be broken: it puts defects into the policy
 // and the model reports them. No defect of one edit reaches the rules below, so here the model
@@ -2012,4 +2012,130 @@ fn the_rules_notice_an_answer_that_is_none() {
         said(Kind::Fresh, 0, &left, refused),
         ["fresh: a refused request left bytes"]
     );
+}
+
+/// What the model says of a reseed made up by hand. The store holds eight RDSEED draws that
+/// the log has as made one after another by the request that is running, under the number
+/// the store is lent under: what a reseed of `seed`'s kind should find. `request` is the
+/// kind of the request that is running, if one is. `change` makes one thing false before the
+/// store is held against the rules.
+fn says_of_a_made_up_reseed(
+    seed: Seed,
+    request: Option<Kind>,
+    change: impl FnOnce(&mut Snapshot, &mut Machine),
+) -> Vec<String> {
+    let mut machine = Machine::new(0, &[(true, true)]);
+    machine.log.time = 100;
+    let running = request.map(|kind| {
+        let frame = machine.log.open(kind);
+        let id = frame.id;
+        machine.log.frames.push(frame);
+        id
+    });
+    let lent = (seed != Seed::Own).then_some(7);
+    let mut store = Snapshot {
+        draws: [0; 2 * KEEPS],
+        counted: SEED_DRAWS,
+        aside: 0,
+        blank: false,
+        from: Rdseed,
+        lent,
+        own_reseeds: 0,
+        failures: [0; 2],
+        not_now: [0; 2],
+    };
+    for (n, draw) in store.draws.iter_mut().take(SEED_DRAWS).enumerate() {
+        *draw = splitmix(0x4D41_4445, n as u64);
+        machine.log.time += 1;
+        let drawn = Drawn {
+            time: machine.log.time,
+            cpu: 0,
+            which: Rdseed,
+            request: running,
+            lent,
+        };
+        machine.log.drawn.insert(*draw, drawn);
+    }
+    change(&mut store, &mut machine);
+    machine.consume(0, &store, seed);
+    machine.log.violations
+}
+
+#[test]
+fn the_rules_notice_a_reseed_that_is_not_what_it_should_be() {
+    for (seed, request) in [
+        (Seed::Own, None),
+        (Seed::Own, Some(Kind::Plain)),
+        (Seed::Root, None),
+        (Seed::Root, Some(Kind::Plain)),
+        (Seed::Fresh, Some(Kind::Fresh)),
+    ] {
+        assert_eq!(
+            says_of_a_made_up_reseed(seed, request, |_, _| ()),
+            Vec::<String>::new(),
+            "{seed:?} in {request:?}"
+        );
+    }
+    type Change = fn(&mut Snapshot, &mut Machine);
+    // The request began after its draws were made.
+    let began_late: Change = |_, machine| machine.log.frames[0].began = machine.log.time;
+    let cases: [(&str, Seed, Option<Kind>, Change); 7] = [
+        (
+            "own: the store held 7 draws",
+            Seed::Own,
+            None,
+            |store, _| {
+                store.counted = 7;
+            },
+        ),
+        (
+            "root: a draw made under a lending is used from a store that is lent under another \
+             number",
+            Seed::Root,
+            Some(Kind::Plain),
+            |store, _| store.lent = Some(8),
+        ),
+        (
+            "root: a draw made before the request that reseeds the root began",
+            Seed::Root,
+            Some(Kind::Plain),
+            began_late,
+        ),
+        (
+            "fresh: a draw made at ",
+            Seed::Fresh,
+            Some(Kind::Fresh),
+            began_late,
+        ),
+        (
+            "fresh: an RDRAND draw",
+            Seed::Fresh,
+            Some(Kind::Fresh),
+            |store, machine| {
+                store.from = Rdrand;
+                for drawn in machine.log.drawn.values_mut() {
+                    drawn.which = Rdrand;
+                }
+            },
+        ),
+        (
+            "fresh: a piece inside a plain request",
+            Seed::Fresh,
+            Some(Kind::Plain),
+            |_, _| (),
+        ),
+        (
+            "fresh: a piece outside any request",
+            Seed::Fresh,
+            None,
+            |_, _| (),
+        ),
+    ];
+    for (rule, seed, request, change) in cases {
+        let said = says_of_a_made_up_reseed(seed, request, change);
+        assert!(
+            !said.is_empty() && said.iter().all(|line| line.starts_with(rule)),
+            "{rule}: the model said {said:?}"
+        );
+    }
 }
