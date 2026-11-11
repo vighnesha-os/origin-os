@@ -437,6 +437,20 @@ It changes two things you accepted on 2026-11-10, and the recommendation said so
 
 **Yours to do:** nothing.
 
+### What a dry RDSEED costs a processor with no healthy RDRAND (item 188): Accepted 2026-11-11
+
+An independent read of the generator's policy crate found that one row of ADR-0016's threat model said too little. T5 is a program in ring 3 that runs RDSEED in a loop and keeps it dry. The row said reseeds are then "delayed and fall back to RDRAND". Where RDRAND is not healthy on a processor there is nothing to fall back to, and that processor's reseed waits for as long as RDSEED is kept dry. That is how R6 was accepted and how it is built; only the row was short. The session that built the generator put it to you on 2026-11-11 with a recommendation, and you answered **"Yes, amend T5"**.
+
+The number is 188 because 168 is in use on `docs/directive-7.5` and 169 to 187 were given out that morning for the events-and-ports shapes.
+
+| # | Question | Answer | Where it is recorded, and its state |
+|---|---|---|---|
+| 188, answered | Amend T5's row in ADR-0016 to say that where RDRAND is not healthy on a processor, its reseed waits for as long as RDSEED is kept dry, and that T7's bound of 60 seconds or 2^20 requests does not hold for that processor meanwhile? Recommended: yes, and build nothing | **Yes, amend T5** | ADR-0016 Amendment 2, and T5's row. Nothing is built and nothing changes in R6 |
+
+**Offered and not chosen:** send such a processor to the root once its reseed has been delayed for some periods. That changes R6, and on a machine whose processors are alike it is a reseed in name only: the root's own reseed needs the same instruction.
+
+**Yours to do:** nothing. The limit is stated, not closed. How long a program can keep RDSEED dry on a real processor is unmeasured.
+
 ## What building ADR-0017's first half found (items 152 to 154): Accepted 2026-11-10
 
 TASKS item 19b built Z1, Z2, Z3, Z5, Z9 and Z10 of ADR-0017, and its gate on the kernel's image found two things the ADR had not foreseen. Both were put to you in the coordinating session, with six of ADR-0016's (items 146 to 151, recorded by the session that wrote that ADR). You answered **"Accept all"** to one question covering the eight. The coordinating session relayed the answer, and the words each was put in, to the session that built 19b, which records the two here. Items 142 to 151 are on other branches.
