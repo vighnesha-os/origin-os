@@ -261,6 +261,9 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
                 time::monotonic_nanos() / 1_000_000
             );
         }
+        // The random-number generator (ADR-0016): the root and the boot processor's own
+        // generator, before another processor starts.
+        report_random_start(&mut com1, origin_frame::random::start_boot());
         let online = smp::start(&mut com1, sched::run_ap);
         proofs.record(Proof::Processors, online.complete());
         // What each processor put in its own control registers, which ring 3 relies on.
@@ -322,6 +325,8 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         proofs.record(Proof::NumaDistances, prove_slit(&mut com1, info.acpi_rsdp));
         // Hardware entropy from RDSEED/RDRAND (CLAUDE.md §59).
         proofs.record(Proof::Entropy, prove_entropy(&mut com1, &features));
+        // The random-number generator on every processor (ADR-0016).
+        let _ = prove_random(&mut com1, online.cpus(), tsc_hz);
         // M3, second step: preemptive kernel threads on every online processor. Its proofs
         // run to the end and are judged together (ADR-0013 R4): the proofs after a failure
         // use only the kernel's fixed programs, and the operator sees every result.
@@ -1339,6 +1344,219 @@ fn prove_entropy(com1: &mut console::Console, features: &crate::features::Featur
         src.from_rdrand,
         consistent,
         if consistent { "" } else { ": entropy failed" }
+    );
+    consistent
+}
+
+/// How an instruction stands, as the generator's lines give it.
+fn condition_name(condition: origin_frame::random::Condition) -> &'static str {
+    use origin_frame::random::Condition;
+    match condition {
+        Condition::Absent => "absent",
+        Condition::Untested => "not tested",
+        Condition::Testing => "being tested",
+        Condition::Healthy => "healthy",
+        Condition::Unhealthy => "unhealthy",
+    }
+}
+
+/// Says how the generator's start went on the boot processor (ADR-0016 R13). Counts and
+/// yes-or-no only: no draw, seed, state or output is ever printed (CLAUDE.md §61).
+fn report_random_start(com1: &mut Console, start: Option<origin_frame::random::BootStart>) {
+    use origin_frame::random::Instruction;
+    let Some(start) = start else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: random: the generator was not started: no memory for it, or not the boot processor's first call"
+        );
+        return;
+    };
+    let test = if start.self_test { "passed" } else { "FAILED" };
+    let (rdseed, rdrand) = (condition_name(start.rdseed), condition_name(start.rdrand));
+    let Some(counted) = start.counted.filter(|_| start.root) else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: random: no generator: known-answer test {test}; on the boot processor RDSEED is {rdseed} and RDRAND is {rdrand}. Nothing will be launched and nothing placed at a random address (ADR-0016 R8)"
+        );
+        return;
+    };
+    let (name, other) = match counted {
+        Instruction::Rdseed => ("RDSEED", "RDRAND"),
+        Instruction::Rdrand => ("RDRAND", "RDSEED"),
+    };
+    let _ = write!(
+        com1,
+        "origin-kernel: random: root: known-answer test {test}; RDSEED {rdseed}, RDRAND {rdrand} on the boot processor; seeded from {name}'s 1024 start-up draws, "
+    );
+    let _ = if start.both {
+        write!(com1, "with {other}'s 1024 as the nonce")
+    } else {
+        write!(com1, "with 4 more of its draws as the nonce")
+    };
+    if counted == Instruction::Rdrand {
+        let _ = write!(
+            com1,
+            "; no healthy RDSEED, so its strength is no more than the processor's own generator's"
+        );
+    }
+    let _ = writeln!(
+        com1,
+        "; loader seed {}; the boot processor's generator {}",
+        if start.loader_seed {
+            "mixed in"
+        } else {
+            "none"
+        },
+        if start.generator {
+            "seeded"
+        } else {
+            "NOT seeded"
+        }
+    );
+}
+
+/// Time-stamp counter ticks as nanoseconds.
+fn ticks_to_nanos(ticks: u64, tsc_hz: u64) -> u64 {
+    (u128::from(ticks) * 1_000_000_000 / u128::from(tsc_hz.max(1))) as u64
+}
+
+/// Proves the random-number generator (ADR-0016; CLAUDE.md §59): every processor has one,
+/// requests are answered with values that differ, the generator's stack holds only zeros after
+/// a request (R9 Z3), and what a request costs and how long a step kept interrupts off
+/// (R12; rules 21 and 22). With no generator it says so and fails: randomness is withheld.
+fn prove_random(com1: &mut Console, cpus: &[cpu::CpuIndex], tsc_hz: u64) -> bool {
+    use origin_frame::random::{self, Condition, Error};
+
+    // Every processor started its generator as it came up; give the last of them a moment.
+    let deadline = time::monotonic_nanos().saturating_add(2_000_000_000);
+    while cpus
+        .iter()
+        .any(|&c| !random::processor(c).is_some_and(|p| p.started))
+        && time::monotonic_nanos() < deadline
+    {
+        core::hint::spin_loop();
+    }
+    let mut every = !cpus.is_empty();
+    let (mut longest_start, mut longest, mut steps) = (0u64, 0u64, 0u64);
+    for &c in cpus {
+        let Some(p) = random::processor(c).filter(|p| p.started) else {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: random: processor {} has not finished starting its generator",
+                c.get()
+            );
+            every = false;
+            continue;
+        };
+        let _ = writeln!(
+            com1,
+            "origin-kernel: random: processor {}: RDSEED {} ({} draws passed), RDRAND {} ({} draws passed); its generator {}",
+            c.get(),
+            condition_name(p.rdseed),
+            p.accepted_rdseed,
+            condition_name(p.rdrand),
+            p.accepted_rdrand,
+            if p.generator { "seeded" } else { "NOT seeded" }
+        );
+        every &= p.generator;
+        longest_start = longest_start.max(p.longest_start);
+        longest = longest.max(p.longest);
+        steps += p.steps;
+    }
+    if !random::available() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: random: no generator, so no request is answered; consistent false: random failed"
+        );
+        return false;
+    }
+
+    // Requests are answered, and no two values are the same.
+    let mut values = [0u64; 16];
+    let mut answered = 0;
+    for slot in &mut values {
+        if let Ok(value) = random::next_u64() {
+            *slot = value;
+            answered += 1;
+        }
+    }
+    let distinct = values
+        .iter()
+        .enumerate()
+        .all(|(i, v)| !values[..i].contains(v));
+    let mut long = [0u8; 300];
+    let long_ok = random::fill(&mut long).is_ok() && long[..8] != [0; 8] && long[292..] != [0; 8];
+    // Prediction resistance needs a healthy RDSEED on this processor, and is refused without.
+    let here = random::processor(cpu::this_cpu());
+    let rdseed = here.is_some_and(|p| p.rdseed == Condition::Healthy);
+    let mut fresh = [0u8; 32];
+    let fresh_result = random::fill_fresh(&mut fresh);
+    let fresh_ok = if rdseed {
+        fresh_result.is_ok() && fresh != [0; 32]
+    } else {
+        fresh_result == Err(Error::NotNow) && fresh == [0; 32]
+    };
+    let _ = writeln!(
+        com1,
+        "origin-kernel: random: {answered} of 16 values answered, all distinct {distinct}; 300 bytes in pieces {long_ok}; with prediction resistance: {}",
+        match (rdseed, fresh_ok) {
+            (true, true) => "answered",
+            (false, true) => "refused, as it must be with no healthy RDSEED here",
+            (_, false) => "WRONG",
+        }
+    );
+
+    // What a request costs, and the longest a step kept interrupts off.
+    let mut costs = [0u64; 64];
+    let mut out = [0u8; 64];
+    for cost in &mut costs {
+        let began = cpu::rdtsc();
+        let _ = random::fill(&mut out);
+        *cost = cpu::rdtsc().wrapping_sub(began);
+    }
+    costs.sort_unstable();
+    let after = cpus
+        .iter()
+        .filter_map(|&c| random::processor(c))
+        .map(|p| p.longest)
+        .max()
+        .unwrap_or(longest);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: random: cost: a 64-byte request {} ns (median of 64, least {} ns); the longest step with interrupts off: {} us while a processor started, {} us since; {} steps so far",
+        ticks_to_nanos(costs[32], tsc_hz),
+        ticks_to_nanos(costs[0], tsc_hz),
+        ticks_to_nanos(longest_start, tsc_hz) / 1000,
+        ticks_to_nanos(after, tsc_hz) / 1000,
+        steps
+    );
+
+    // The generator's own stack: how deep a request goes, and that nothing is left on it.
+    let stack = random::prove_stack();
+    let stack_ok = match stack {
+        Some(proof) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: random: the generator's stack: a request used {} of {} bytes; only zeros on it after a request: {}",
+                proof.used, proof.size, proof.clean
+            );
+            proof.clean && proof.used != 0 && proof.used < proof.size
+        }
+        None => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: random: the generator's stack could not be looked at"
+            );
+            false
+        }
+    };
+
+    let consistent =
+        every && answered == values.len() && distinct && long_ok && fresh_ok && stack_ok;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: random: every processor has a generator {every}; consistent {consistent}{}",
+        if consistent { "" } else { ": random failed" }
     );
     consistent
 }

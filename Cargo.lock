@@ -115,6 +115,7 @@ dependencies = [
  "origin-abi",
  "origin-boot-info",
  "origin-paging",
+ "origin-random",
  "origin-sync",
 ]
 

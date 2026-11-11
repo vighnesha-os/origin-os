@@ -630,6 +630,12 @@ fn start_one(
     let tables = Box::into_raw(unsafe { Box::<CpuTables>::new_zeroed().assume_init() });
     let guards = guard_interrupt_stacks(tables)?;
     let stack = GuardedStack::new(AP_STACK_BYTES).ok_or("no memory for the AP stack")?;
+    // Its random-number generator's stack and seed area (ADR-0016): made here, because a
+    // guard page changes the kernel's page tables, which this processor does while the other
+    // is not yet sent shootdowns.
+    if !crate::random::prepare(index) {
+        return Err("no memory for its random-number generator");
+    }
     let stack_top = stack.top();
     // Kept for ever: the AP runs on it (its idle context).
     core::mem::forget(stack);
@@ -832,6 +838,9 @@ extern "sysv64" fn ap_entry(start: *const ApStart) -> ! {
     if !start.handshake.answer(id) {
         cpu::halt();
     }
+    // This processor's random-number generator (ADR-0016 R5): its instructions' start-up tests
+    // and a first seed from the root, before anything can run here that asks for a value.
+    crate::random::start_this_processor();
     // M3: this processor's scheduler.
     (start.main)(&lapic)
 }

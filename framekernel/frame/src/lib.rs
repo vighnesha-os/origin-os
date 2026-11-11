@@ -78,6 +78,8 @@ pub mod port;
 #[cfg(target_os = "none")]
 pub mod proof_programs;
 #[cfg(target_os = "none")]
+pub mod random;
+#[cfg(target_os = "none")]
 pub mod smp;
 #[cfg(target_os = "none")]
 pub mod stack;

@@ -40,6 +40,9 @@ const KERNEL_LEAVES: &[&str] = &[
     "runtime/abi",
     "runtime/version",
     "sdk/directory",
+    // The random-number generator's mechanism and policy (ADR-0016 R2): both forbid `unsafe`.
+    "security/crypto",
+    "security/random",
 ];
 /// The kernel library's crate root, whose `forbid(unsafe_code)` covers every module above the
 /// framework.
@@ -104,6 +107,10 @@ const UNSAFE_FILES: &[(&str, &str)] = &[
         "the ring-3 proof programs: assembly carried as data, and the linker's symbols around it",
     ),
     (
+        "framekernel/frame/src/random.rs",
+        "the random-number generator: RDSEED and RDRAND, its own stack for each step, volatile overwrites",
+    ),
+    (
         "framekernel/frame/src/smp.rs",
         "application-processor start-up: the real-mode trampoline, its data page, the AP entry",
     ),
@@ -155,6 +162,8 @@ const LAYERS: &[(&str, &[&str])] = &[
     ("origin-boot-info", &["origin-version"]),
     ("origin-abi", &["origin-version"]),
     ("origin-sync", &[]),
+    ("origin-crypto", &[]),
+    ("origin-random", &["origin-crypto"]),
     ("origin-syscalls", &[]),
     // The service directory's generated client and stub, which a boot proof uses.
     ("origin-directory", &[]),
@@ -164,7 +173,9 @@ const LAYERS: &[(&str, &[&str])] = &[
         &[
             "origin-abi",
             "origin-boot-info",
+            "origin-crypto",
             "origin-paging",
+            "origin-random",
             "origin-sync",
             "origin-version",
         ],
@@ -174,9 +185,11 @@ const LAYERS: &[(&str, &[&str])] = &[
         &[
             "origin-abi",
             "origin-boot-info",
+            "origin-crypto",
             "origin-frame",
             "origin-paging",
             "origin-directory",
+            "origin-random",
             "origin-sync",
             "origin-syscalls",
             "origin-version",
