@@ -2645,6 +2645,21 @@ A second addition to the entry above, from the same session on the same branch. 
   - **Reproduce:** as the entry above; `python3 -I security/random/tools/plant_faults.py . --strings` says which of the tool's entries the code has outgrown.
 - **Not done:** T5's row in ADR-0016 does not say that a processor with no healthy RDRAND waits for as long as RDSEED is kept dry: put to the owner, nothing built. Anything on hardware: how often RDSEED gives nothing decides whether a start's eight rounds of patience and the proof's three requests are enough.
 
+*(T5's row was amended the same day: decision item 188, ADR-0016 Amendment 2.)*
+
+### The second review's findings (2026-11-11)
+
+A third addition to the entry above, from the same session on the same branch. The coordinating session had the first review's fixes read at `a6ab315` by another session that wrote none of them. It confirmed all eight, each by planting the old behaviour, and reported seven more findings with probes of its own. `TASKS.md` (task 18b) has the table. The reviewer's probes were read as data; no test of theirs was copied, and the tests here are this session's own.
+
+- **Module:** `security/random/src/{node,root,drive}.rs`, the tests under `src/tests/` (`world.rs` gains a clock that can move at every step), and `tools/plant_faults.py`. Commits `7012285` and `d739b93`. Nothing in the kernel or the loader changed: both use the driver's functions, whose signatures are as they were.
+- **What changed in the design:** a draw's tries are counted in the processor's own state and its last try ends the draw in the same step; a request's upkeep is bound to the processor it began on; the store is lent under a number that names the request and the processor; a processor looks at the root when the root's own period has passed since it last saw it. The driver's count of tries, the flag for a look, and the checks of the processor around a request with prediction resistance are gone.
+- **Review:** the findings are another session's. These fixes have been read by nobody else. **No human has reviewed any of it.**
+- **Test evidence:**
+  - **The policy, on the host:** 79 tests (72 before this round). The reference still agrees byte for byte, unchanged.
+  - **Planted faults:** 116 (107 before). The first run on this round's fixes caught 112 and showed that one test had been deleted by mistake while its neighbours were rewritten; it was put back as it was. On the final code: **115 fail a test, and one is listed as not observable** (`next_u64`'s local copy).
+  - **Gates:** `cargo xtask check` passed on `d739b93` (2026-11-11, 15:20 to 15:26; the commit after it changes Markdown only): every crate's clippy and tests, the no-panic check with `origin-random` in it (9 external symbols, all allowed), the image gate (1,259 returns, an INT3 after each), the `unsafe`, assembly and random-instruction gates, the loader built three ways and the kernel twice with the same bytes, and Loom. `cargo xtask boot-matrix` passed on the same code (15:26 to 15:53): `boot-test`'s 11 scenarios under Intel VT-d and AMD-Vi with 1, 2 and 4 processors, the sparse, bridge and legacy-free machines, both `boot-random` machines and the 9 console scenarios. The planted faults were run on an exported copy of `d739b93` beside the check. Every boot is QEMU's software processor.
+- **Not done:** requests with prediction resistance that overwrite each other are recorded with their bound and not changed (ADR-0016, "cannot show"). A check of the linked images for the two instructions' encodings. Anything on hardware.
+
 ## `developer-tools/xtask/` (`xtask`)
 
 - **What:** host-side build orchestration, with four commands:
