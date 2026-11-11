@@ -110,14 +110,23 @@ At `f654d71`, with and without the remap:
 
 Each path is 37 bytes shorter on this machine (the kernel's eight make its 296), so what follows it in the read-only data moves, and every instruction that addresses that data holds another displacement. With addresses and displacements masked, the disassembly (`llvm-objdump -d`) is the same text in both, for both images.
 
-## 8. Found, not changed
+## 8. What `xtask` itself showed
+
+In one turn on the machine, at `dfa8281`:
+
+- The gate passes, and prints these digests: the loader with no feature `6e85a3f3…019c0`, with `test-trust-store` `f034ed8c…436af`, with `developer-mode` `b0b43f7e…71a1f`, and the kernel ELF `eef10ba4…0d76`. The second and the last are §3's remapped builds, made there with plain `cargo`.
+- **A second copy of the toolchain.** Its whole directory, 1.0 GB, was copied to another path. The copy's `rustc` reports that path as its directory. With the copy's `cargo` and `rustc` in use, the gate passes and prints the same four digests.
+- **With the remap taken out of `xtask`,** the gate fails at the first image and names the toolchain's directory, the offset and the whole location found there. Run with the second copy, it names the copy's path. The two builds of that image were the same bytes each time: before this task the gate passed in that state.
+- `cargo xtask check`, `boot-test` and `boot-matrix` pass (the provenance entry has the counts). The loader and the kernel that booted have the gate's digests.
+
+## 9. Found, not changed
 
 - **An image built by plain `cargo build` still holds the path.** Only `xtask` adds the remap. The gate, the boots and CI all build through `xtask`.
 - **Other configuration files can still add flags.** Cargo reads `.cargo/config.toml` from every directory above the checkout, and from Cargo's home. A `target.<triple>.rustflags` there is joined to the repository's. `xtask` does not look for one.
 - **The gate does not look for the bare home directory.** It looks for the toolchain's directory, Cargo's home and the checkout, each as named and with links followed. A home directory can be as short as `/root`, which an image's own text could hold.
 - **A path under eight bytes is not looked for,** and the gate says which. `/src` is in every image, inside the source locations of Origin's own code.
 
-## 9. Not verified
+## 10. Not verified
 
 - **Another machine.** Everything here is one Mac. The second copy of the toolchain is the same files at another path, run by the same account on the same host.
 - **A Linux build host.** CI builds there. Whether the compiler and the linker write the same bytes on Linux as on macOS, with the path out of the way, is not known. The gate prints each image's SHA-256, so the first CI run after this lands can be compared with the digests in the provenance entry.
