@@ -246,6 +246,13 @@ fn not_ready_for_99_tries_is_a_draw_and_a_start_waits_out_a_not_now() {
             assert_eq!(world.tries(0, Instruction::Rdseed), 500 + 900);
             assert_eq!(world.cpus[0].node.counts().not_now_rdseed, 9);
             assert_eq!(world.root.counted(), Some(Instruction::Rdrand));
+            // The test is given up, not left running: the instruction is unhealthy until a
+            // new test passes, and none begins before a reseed is due.
+            assert_eq!(root.rdseed, Condition::Unhealthy);
+            assert!(start_processor(&mut world).generator);
+            let tried = world.tries(0, Instruction::Rdseed);
+            next_u64(&mut world).unwrap();
+            assert_eq!(world.tries(0, Instruction::Rdseed), tried);
         }
     }
 

@@ -771,3 +771,41 @@ fn a_clock_that_steps_back_ends_a_wait() {
     assert!(!world.cpus[0].node.due(world.now));
     assert!(!world.root.due(world.now));
 }
+
+#[test]
+fn the_roots_gathering_leaves_a_processors_own_draws_alone() {
+    use crate::{Allow, Maint};
+    // RDSEED alone. Its reseed is delayed with three draws in the store.
+    let mut world = World::reporting(1, true, false);
+    world.boot();
+    world.now += RESEED_NANOS;
+    let tried = world.tries(0, Rdseed);
+    world.line(0, Rdseed).rules.push(Rule::NotReady {
+        from: tried + 3,
+        count: 100,
+    });
+    assert_eq!(request(&mut world), (103, 0));
+    assert_eq!(world.cpus[0].node.have, 3);
+    let own = world.cpus[0].node.entropy;
+    // A gathering for the root finds them and does nothing: they are neither lent to the
+    // root nor overwritten for it, and they are not the root's to drop.
+    world.now += REST_NANOS;
+    let now = world.now;
+    let cpu = &mut world.cpus[0];
+    let tried = cpu.rdseed.tries;
+    {
+        let mut source = super::world::lines(&mut cpu.rdseed, &mut cpu.rdrand);
+        assert_eq!(
+            cpu.node.gather_for_root(&mut source, now, Allow::ALL),
+            Maint::Delayed
+        );
+    }
+    cpu.node.drop_root_draws();
+    assert_eq!(cpu.rdseed.tries, tried);
+    assert_eq!(cpu.node.have, 3);
+    assert_eq!(cpu.node.entropy, own);
+    // The processor's own reseed uses them, with five more; then the root gets its eight.
+    assert_eq!(request(&mut world), (5 + 8, 0));
+    assert_eq!(world.cpus[0].node.counts().reseeds_rdseed, 1);
+    assert_eq!(world.root.counts().reseeds, 1);
+}

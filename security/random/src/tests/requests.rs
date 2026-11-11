@@ -226,6 +226,39 @@ fn a_thread_that_moves_does_not_get_another_processors_reseed_from_the_root() {
 }
 
 #[test]
+fn a_request_that_moved_does_not_make_another_processor_wait_for_the_root() {
+    // Processor 1 has no instruction. Processor 0 reseeds itself, finds the root's lock
+    // taken when it looks, and leaves the root alone for a second.
+    let mut world = World::new(2);
+    world.cpus[1].rdseed.reported = false;
+    world.cpus[1].rdrand.reported = false;
+    world.boot();
+    world.now += RESEED_NANOS;
+    world.root_busy = 1;
+    next_u64(&mut world).unwrap();
+    assert_eq!(world.root.counts().reseeds, 0);
+    // Just before the second is over, a request that began on processor 1 reaches the root
+    // from processor 0. The root has nothing to do for processor 0, and that is not a
+    // refusal: processor 0's second does not begin again.
+    world.now += crate::REST_NANOS - 1;
+    world.on = 1;
+    let first = world.steps + 1;
+    world.mover = Some(Box::new(move |step, on| if step == first { 0 } else { on }));
+    next_u64(&mut world).unwrap();
+    assert_eq!(world.on, 0);
+    world.mover = None;
+    world.now += 1;
+    let before = world.tries(0, Instruction::Rdseed);
+    next_u64(&mut world).unwrap();
+    assert_eq!(
+        world.tries(0, Instruction::Rdseed) - before,
+        8,
+        "the look it owed"
+    );
+    assert_eq!(world.root.counts().reseeds, 1);
+}
+
+#[test]
 fn moving_between_processors_does_not_buy_more_tries() {
     // RDSEED alone, and dry everywhere. A thread that is on the other processor after every
     // step still gets one draw's tries, not one draw's tries on each.
