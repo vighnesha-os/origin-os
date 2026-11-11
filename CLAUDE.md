@@ -1,10 +1,10 @@
 # ORIGIN OS — DEFINITIVE PRODUCTION ENGINEERING DIRECTIVE
-## Version 7.5 — Original-Source, Rust 1.99.1, Research-Verified Operating System
+## Version 7.6 — Original-Source, Rust 1.99.1, Research-Verified Operating System
 
 **Product:** Origin OS, in two editions of one release: Origin Desktop and Origin Server  
 **Kernel:** Framekernel  
 **Research baseline:** November 7, 2026  
-**Revision:** 7.5, 2026-11-11. Replaces the first sentence of §1 with the owner's text for the roles: the lead roles, 100% coverage of approved requirements as the completion target, measured against a versioned requirements matrix, 67 specialist roles with their responsibilities, and 25 engineering requirements that apply to every role. It is the owner's third text of that day, improved by Claude where the owner said "You decide"; the decision sheet lists every change (items 165 and 168). Revision 7.4 (2026-11-10) added the decisions of the design review (`docs/engineering/DESIGN_REVIEW_2026-11-10.md`, decision sheet items 106–123): how the SDK-only rule is enforced and what the server's GUI rule means (§48), security rules for the GUI (§52), a system threat model (§58), one kernel random-number generator (§59), three more rules for reference code (§3), build rules for the kernel (§13, §14), provisional performance budgets (§53), and how the records themselves land (§6, §79, §82). It also carried two answers on the kernel's random-number generator, accepted the same day with ADR-0016 (items 149 and 151): the standards it is pinned to (§17) and what its health tests are (§59). Revision 7.3 (2026-11-10) added the Server edition (`docs/adr/ADR-0014-server-edition.md`), every device standard through the SDK (`docs/adr/ADR-0015-device-standards-sdk.md`), Origin-owned Secure Boot keys as the default (ADR-0002 Amendment 1), rules for the public repository, a stricter hardware scope with the core generation named at boot (ADR-0009 Amendment 1), and Linux and other open-source code as a reference only, kept apart from the code, recorded and read at today's version (§3, §6) (decision sheet items 71–97). Revision 7.2 (2026-11-09) amended §48 and §70 to match ADR-0011, the native SDK (item 39). Revision 7.1 (2026-11-07) added the ONBF decisions (`docs/adr/ADR-0001-onbf.md`) and toolchain and standards corrections (`docs/research/2026-11-07-onbf.md` §5). v7.4 is kept at `docs/engineering/CLAUDE-v7.4.md`, v7.3 at `docs/engineering/CLAUDE-v7.3.md`, v7.2 at `docs/engineering/CLAUDE-v7.2.md`, v7.1 at `docs/engineering/CLAUDE-v7.1.md` and v7.0 at `docs/engineering/CLAUDE-v7.0.md`.  
+**Revision:** 7.6, 2026-11-11. §77 no longer lists 26 engineering agents of its own: it points to the roles of §1 (decision sheet item 189). Revision 7.5 (2026-11-11) replaced the first sentence of §1 with the owner's text for the roles: the lead roles, 100% coverage of approved requirements as the completion target, measured against a versioned requirements matrix, 67 specialist roles with their responsibilities, and 25 engineering requirements that apply to every role. It is the owner's third text of that day, improved by Claude where the owner said "You decide"; the decision sheet lists every change (items 165 and 168). Revision 7.4 (2026-11-10) added the decisions of the design review (`docs/engineering/DESIGN_REVIEW_2026-11-10.md`, decision sheet items 106–123): how the SDK-only rule is enforced and what the server's GUI rule means (§48), security rules for the GUI (§52), a system threat model (§58), one kernel random-number generator (§59), three more rules for reference code (§3), build rules for the kernel (§13, §14), provisional performance budgets (§53), and how the records themselves land (§6, §79, §82). It also carried two answers on the kernel's random-number generator, accepted the same day with ADR-0016 (items 149 and 151): the standards it is pinned to (§17) and what its health tests are (§59). Revision 7.3 (2026-11-10) added the Server edition (`docs/adr/ADR-0014-server-edition.md`), every device standard through the SDK (`docs/adr/ADR-0015-device-standards-sdk.md`), Origin-owned Secure Boot keys as the default (ADR-0002 Amendment 1), rules for the public repository, a stricter hardware scope with the core generation named at boot (ADR-0009 Amendment 1), and Linux and other open-source code as a reference only, kept apart from the code, recorded and read at today's version (§3, §6) (decision sheet items 71–97). Revision 7.2 (2026-11-09) amended §48 and §70 to match ADR-0011, the native SDK (item 39). Revision 7.1 (2026-11-07) added the ONBF decisions (`docs/adr/ADR-0001-onbf.md`) and toolchain and standards corrections (`docs/research/2026-11-07-onbf.md` §5). v7.5 is kept at `docs/engineering/CLAUDE-v7.5.md`, v7.4 at `docs/engineering/CLAUDE-v7.4.md`, v7.3 at `docs/engineering/CLAUDE-v7.3.md`, v7.2 at `docs/engineering/CLAUDE-v7.2.md`, v7.1 at `docs/engineering/CLAUDE-v7.1.md` and v7.0 at `docs/engineering/CLAUDE-v7.0.md`.  
 **Mandatory compiler:** Rust 1.99.1 stable  
 **Rust edition:** 2024  
 **Processor architecture:** x86-64 exclusively: 64-bit long mode only. No 32-bit or x32 code, and no Windows `.exe` or `.msi` compatibility.  
@@ -1964,34 +1964,7 @@ No test count alone establishes production readiness.
 
 ## 77. Engineering agents
 
-Create specialized responsibilities for:
-
-1. Research verification.
-2. Architecture.
-3. Rust toolchain.
-4. UEFI/boot.
-5. Framekernel.
-6. SMP/scheduler.
-7. Memory.
-8. IPC/processes.
-9. PCIe/IOMMU.
-10. NVMe/storage.
-11. USB/USB4.
-12. Networking.
-13. Graphics.
-14. NPU.
-15. Native ABI/runtime.
-16. Packages.
-17. Native SDK.
-18. UI/compositor.
-19. Desktop.
-20. Security.
-21. Performance.
-22. Updates/recovery.
-23. Testing/formal methods.
-24. Build/release.
-25. Source provenance.
-26. Context management.
+The specialist roles and their responsibilities are in §1. Agents are given bounded tasks from them, as §1 and §78 say.
 
 Do not execute every agent simultaneously without task independence.
 
