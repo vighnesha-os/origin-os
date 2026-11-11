@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–141 and 145–154, and 2026-11-11 for item 161. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144 and 155–160 are on another branch (`land/s3-part2`) and are not in this sheet yet. |
-| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. |
+| As of | 2026-11-10 for items 71–160, and 2026-11-11 for items 161 to 164 and 167. Items up to 70: 2026-11-09, after the pre-merge review. Items 165 and 166 are on other branches (`docs/directive-7.5`, pull request 17; `claude/18b-kernel-random`) and are not in this sheet yet. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 142–144, 155–160 and 162–164: as their sections say. Item 167: items 70 and 113 and CLAUDE.md §78 and §80, by the session that keeps the second step-3 batch. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: item 161. |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–160 (item 97 delegated to Claude). 2026-11-11: items 161 to 164 and 167. |
 | Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -487,3 +487,18 @@ They were put to the owner as items 161 to 163. Item 161 was already in use on t
 | 162, answered | `memory_map` at a fixed place that runs over a page already mapped, in an address space that is also at its bound of page tables: keep `invalid_args` (the place is taken), since the space looks at its records before it makes tables, and not `limit`? | **Accept** |
 | 163, answered | `memory_protect` on a mapping another call is changing: keep `should_wait` ahead of the comparison of the access asked with what the mapping allows, since that comparison is not settled while the mapping changes? | **Accept** |
 | 164, answered | Keep counting as "being changed" (item 155) a mapping whose own `memory_map` has not yet written its address to its caller, so that `memory_unmap` or `memory_protect` on it returns `should_wait`? | **Accept** |
+
+## Task 18b lands through the second step-3 batch (item 167): Accepted 2026-11-11
+
+Item 113 asks for the kernel's random-number generator before S3-5b lands. S3-5b is in the second step-3 batch (pull request 16), and that batch still draws straight from RDSEED and RDRAND in two places: the random place of a mapping (`memory_object.rs`) and the base of the kernel stacks' region (the framework's `stack.rs`). Task 18b, the generator in the kernel and the loader, was built on a branch of its own from `main` (`claude/18b-kernel-random`).
+
+On 2026-11-11 the architecture-review session put three recommendations to the owner, and the owner answered **"Accept all"**. Two of them concern this batch; the third was about pull request 17. The session that keeps this batch read the questions and the answer in that session's record before writing this.
+
+| # | Question | Answer |
+|---|---|---|
+| 167, answered | How 18b lands: through the next batch, pull request 16, and not a pull request of its own? That batch cannot be offered until the generator is in it (item 113), and the two direct draws it adds are converted there. Before it is offered, the architecture-review session finishes reading the parts of 18b it has not read. | **Accept** |
+
+- **Item 166** was accepted with it: the stack region's base takes its random value from the loader's generator, 8 bytes directly after the 64-byte seed in boot info 0.6's secret area. The session that builds 18b records it on `claude/18b-kernel-random`, and it reaches this sheet when that branch is merged here. What it changes in ADR-0004 Amendment 2 is the note on A4 and A5 there.
+- **Item 165** is the owner's own text for CLAUDE.md §1 (revision 7.5). It is on `docs/directive-7.5`, pull request 17.
+- **Not done yet:** 18b's branch is not merged into this batch, and both draws are as they were.
+- Merging pull request 16 still takes your word, and item 70's 100 commits stand.
