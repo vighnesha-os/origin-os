@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–160, and 2026-11-11 for items 161 to 168, 188 and 189. Items up to 70: 2026-11-09, after the pre-merge review. Items 169–187 are given out for S3-6's shapes, which are put to you and not answered. They are not recorded in this sheet yet. |
+| As of | 2026-11-10 for items 71–160, and 2026-11-11 for items 161 to 168 and 188 to 190. Items up to 70: 2026-11-09, after the pre-merge review. Items 169–187 are given out for S3-6's shapes, which are put to you and not answered. They are not recorded in this sheet yet. |
 | Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 142–144, 155–160, 162–164, 166 and 188: as their sections say. Items 165 and 168: your own text for CLAUDE.md §1, in its second and third versions, read against the whole of revision 7.5 and the ADRs each change names; the check and the list of changes are `ROLES_CHECK_2026-11-11.md`. Item 167: items 70 and 113 and CLAUDE.md §78 and §80, by the session that keeps the second step-3 batch. Item 189: proposal 11 of `ROLES_CHECK_2026-11-11.md`. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–160 (item 97 delegated to Claude). 2026-11-11: items 161 to 168, 188 and 189 (item 168 delegated to Claude). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–160 (item 97 delegated to Claude). 2026-11-11: items 161 to 168 and 188 to 190 (item 168 delegated to Claude). |
 | Still open | Items 169–187, the shapes of S3-6 (events, ports and `clock_read`): put to you on 2026-11-11 with a recommendation each, and not answered. Nothing that rests on them is merged into this batch, and they reach this sheet with your answer. Item 168's changes to your text are Claude's, and you have not read them. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -444,7 +444,7 @@ It changes two things you accepted on 2026-11-10, and the recommendation said so
 
 | # | Question | Answer | Where it is recorded, and its state |
 |---|---|---|---|
-| 166, answered | Where does the stack region's base get its randomness? Recommended: the loader's generator makes one more 8-byte request and puts it directly after its 64-byte seed; the kernel reads it when it builds its page tables and overwrites it with the seed. The kernel still places the region; only the random value comes from the loader. With no loader generator the region stays at its fixed base | **Accept** | ADR-0016 Amendment 1; ADR-0002 B4. On the generator's branch: the loader's third request, the 72-byte area and its checks, `origin_frame::random::take_stack_value`, and a boot proof that it is taken once and overwritten. The stack region is on the next batch, whose lander makes `draw_region` the caller and notes ADR-0004 Amendment 2 (A4, A5) |
+| 166, answered | Where does the stack region's base get its randomness? Recommended: the loader's generator makes one more 8-byte request and puts it directly after its 64-byte seed; the kernel reads it when it builds its page tables and overwrites it with the seed. The kernel still places the region; only the random value comes from the loader. With no loader generator the region stays at its fixed base | **Accept** | ADR-0016 Amendment 1; ADR-0002 B4. On the generator's branch: the loader's third request, the 72-byte area and its checks, `origin_frame::random::take_stack_value`, and a boot proof that it is taken once and overwritten. The stack region is on the next batch, whose lander makes `draw_region` the caller and notes ADR-0004 Amendment 2 (A4, A5) **Done on 2026-11-11:** the batch's merge of 18b (`c2245ef`) makes `draw_region` the caller, and ADR-0004 Amendment 2 has its note. |
 
 **Offered and not chosen:**
 
@@ -583,7 +583,7 @@ On 2026-11-11 the architecture-review session put three recommendations to the o
 
 - **Item 166** was accepted with it: the stack region's base takes its random value from the loader's generator, 8 bytes directly after the 64-byte seed in boot info 0.6's secret area. The session that builds 18b records it on `claude/18b-kernel-random`, and it reaches this sheet when that branch is merged here. What it changes in ADR-0004 Amendment 2 is the note on A4 and A5 there.
 - **Item 165** is the owner's own text for CLAUDE.md §1 (revision 7.5). It came to `main` with pull request 17, and its record is the section above.
-- **Not done yet:** 18b's branch is not merged into this batch, and both draws are as they were.
+- **Done on 2026-11-11:** 18b (`a11202a`) is merged into this batch at `c2245ef`, and the merge moves both draws to the generator. Checked under QEMU only; no person has read it.
 - Merging pull request 16 still takes your word, and item 70's 100 commits stand.
 
 ## §77 points to §1 (item 189): Accepted 2026-11-11, revision 7.6
@@ -599,3 +599,16 @@ What it changes, in CLAUDE.md 7.6:
 - **Nothing else changes.** Revision 7.5 is kept at `docs/engineering/CLAUDE-v7.5.md`.
 
 Why: §1 has listed 67 specialist roles since revision 7.5, and §77's 26 agents overlapped them with another count. Every one of the 26 has a role in §1: the NPU is role 56, source provenance is role 67, and context management is role 28 with the requirement to keep durable engineering records.
+
+## The randomized model lands with 18b (item 190): Accepted 2026-11-11
+
+A randomized model of the generator's policy was built as a host test after 18b's final commit (TASKS item 37 (c)), and the architecture-review session put one question to the owner. The owner answered that session on 2026-11-11: "Yes, with 18b". The landing session did not hear the answer; it read it in that session's transcript.
+
+| # | Question | Answer |
+|---|---|---|
+| 190, answered | Does the randomized model of the generator's policy (TASKS item 37 (c), `claude/18b-random-model` at `dabe70b`, nine commits on 18b's final commit) land with 18b in pull request 16, or later on its own? | **With 18b: "Yes, with 18b"** |
+
+- **Done on 2026-11-11:** merged into the second step-3 batch at `fe457f2`, right after 18b's merge (`c2245ef`).
+- It adds a host test file, nine negative controls in `plant_faults.py` and its records. It changes no code of the generator.
+- No person has read the model.
+- Merging pull request 16 still takes your word.
