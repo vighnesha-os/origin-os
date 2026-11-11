@@ -190,11 +190,23 @@ fn slot_of(addr: u64) -> Option<usize> {
     Some(((addr - base) / SLOT) as usize)
 }
 
-/// Whether the slot holding `addr` is free: nothing is mapped there, and no processor holds a
-/// translation of what was. For a proof that a freed stack's reclaim has completed, whichever
-/// processor did it.
-pub fn slot_is_free(addr: u64) -> bool {
-    slot_of(addr).is_some_and(|slot| without_interrupts(|| REGION.state(slot)) == Some(State::Free))
+/// One stack's slot, as [`GuardedStack::slot`] names it: kept after the stack is gone, to ask
+/// about the slot later. It is not an address. A stack's [`GuardedStack::top`] is the base of the
+/// next slot, so a question asked by address about "the slot of the top" asks about another
+/// stack's slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StackSlot(usize);
+
+/// Whether `slot` is free: nothing is mapped there, and no processor holds a translation of what
+/// was. For a proof that a freed stack's reclaim has completed, whichever processor did it.
+pub fn slot_is_free(slot: StackSlot) -> bool {
+    without_interrupts(|| REGION.state(slot.0)) == Some(State::Free)
+}
+
+/// The slot holding `addr`, if `addr` is in the stack region. A stack's last byte, its
+/// [`GuardedStack::top`] less one, is in its slot; its top is in the next one.
+pub fn slot_holding(addr: u64) -> Option<StackSlot> {
+    slot_of(addr).map(StackSlot)
 }
 
 /// The top of the slot holding `addr`, if `addr` is in the stack region: past it lies the next
@@ -256,9 +268,15 @@ impl GuardedStack {
         self.bytes
     }
 
-    /// The first address past the stack, 16-byte aligned: the top of its slot.
+    /// The first address past the stack, 16-byte aligned: the top of its slot, which is the base
+    /// of the next slot.
     pub fn top(&self) -> u64 {
         slot_base(self.slot) + SLOT
+    }
+
+    /// Its slot, to ask [`slot_is_free`] about once the stack is gone.
+    pub const fn slot(&self) -> StackSlot {
+        StackSlot(self.slot)
     }
 
     /// Writes a new thread's first frame on this stack, starting at `start` with every other

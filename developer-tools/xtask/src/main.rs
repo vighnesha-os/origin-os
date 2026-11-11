@@ -2053,7 +2053,7 @@ fn stack_markers(machine: &Machine) -> Vec<String> {
         ),
         "origin-kernel: kernel stacks: the direct map has every 2 MiB page it was built with: true (".into(),
         format!(
-            "origin-kernel: kernel stacks: a stack's 4 pages read on {reader}, then the stack freed and reclaimed: 4 of 4 reads there faulted and 0 saw the old pages; its slot free again: true"
+            "origin-kernel: kernel stacks: a stack's 4 pages read on {reader}, then the stack freed and reclaimed: 4 of 4 reads there faulted and 0 saw the old pages; its slot, the one its last byte was in: true, free again: true"
         ),
         "origin-kernel: kernel stacks: 64 stacks of 16384 bytes made and freed: all made true; making one took ".into(),
         " (QEMU, no budget)".into(),
