@@ -1451,24 +1451,47 @@ fn prove_random(com1: &mut Console, cpus: &[cpu::CpuIndex], tsc_hz: u64) -> bool
     let mut long = [0u8; 300];
     let long_ok = random::fill(&mut long).is_ok() && long[..8] != [0; 8] && long[292..] != [0; 8];
     // Prediction resistance needs a healthy RDSEED on this processor, and is refused without.
+    // With one, "not now" is still a right answer: RDSEED may give nothing for a while, most
+    // of all straight after every processor drew its 1,024, and that is not a failure (R4
+    // item 1). The request is made again after the instruction's rest, a bounded number of
+    // times, and only a wrong answer fails the proof: an answer of zeros, bytes left in a
+    // refused buffer, or an answer where no healthy RDSEED stands behind it.
+    const FRESH_ASKS: u32 = 3;
+    // The rest after a "not now" is one second (TASKS 18b S3).
+    const FRESH_WAIT_NANOS: u64 = 1_100_000_000;
     let here = random::processor(cpu::this_cpu());
     let rdseed = here.is_some_and(|p| p.rdseed == Condition::Healthy);
     let mut fresh = [0u8; 32];
-    let fresh_result = random::fill_fresh(&mut fresh);
-    let fresh_ok = if rdseed {
-        fresh_result.is_ok() && fresh != [0; 32]
-    } else {
-        fresh_result == Err(Error::NotNow) && fresh == [0; 32]
-    };
-    let _ = writeln!(
-        com1,
-        "origin-kernel: random: {answered} of 16 values answered, all distinct {distinct}; 300 bytes in pieces {long_ok}; with prediction resistance: {}",
-        match (rdseed, fresh_ok) {
-            (true, true) => "answered",
-            (false, true) => "refused, as it must be with no healthy RDSEED here",
-            (_, false) => "WRONG",
+    let mut fresh_result = random::fill_fresh(&mut fresh);
+    let mut asked = 1u32;
+    while rdseed && fresh_result == Err(Error::NotNow) && fresh == [0; 32] && asked < FRESH_ASKS {
+        let until = time::monotonic_nanos().saturating_add(FRESH_WAIT_NANOS);
+        while time::monotonic_nanos() < until {
+            core::hint::spin_loop();
         }
+        fresh_result = random::fill_fresh(&mut fresh);
+        asked += 1;
+    }
+    let refused = fresh_result == Err(Error::NotNow) && fresh == [0; 32];
+    let answered_fresh = fresh_result.is_ok() && fresh != [0; 32];
+    let fresh_ok = if rdseed {
+        answered_fresh || refused
+    } else {
+        refused
+    };
+    let _ = write!(
+        com1,
+        "origin-kernel: random: {answered} of 16 values answered, all distinct {distinct}; 300 bytes in pieces {long_ok}; with prediction resistance: "
     );
+    let _ = match (rdseed, fresh_ok, answered_fresh) {
+        (true, true, true) => writeln!(com1, "answered"),
+        (true, true, false) => writeln!(
+            com1,
+            "not now, {asked} times a second apart: RDSEED is healthy and gave nothing, which is not a failure"
+        ),
+        (false, true, _) => writeln!(com1, "refused, as it must be with no healthy RDSEED here"),
+        (_, false, _) => writeln!(com1, "WRONG"),
+    };
 
     // What a request costs, and the longest a step kept interrupts off.
     let mut costs = [0u64; 64];
