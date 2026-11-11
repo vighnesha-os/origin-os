@@ -33,13 +33,19 @@ impl Count {
     pub fn charge(&self) -> Result<(), Error> {
         self.held
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.max).then_some(n + 1)
+                // The sum is taken only under the quota, so it cannot overflow. `then_some`
+                // would add first: on a count wrapped to the top of its range, a build that
+                // checks overflow would panic where the charge must be refused.
+                if n < self.max { Some(n + 1) } else { None }
             })
             .map(|_| ())
             .map_err(|_| Error::Limit)
     }
 
     /// One that was charged here is gone.
+    ///
+    /// A refund of something never charged is a kernel bug. It fails closed: the count wraps
+    /// to the top of its range, so every later charge is refused.
     pub fn refund(&self) {
         self.held.fetch_sub(1, Ordering::AcqRel);
     }
@@ -101,6 +107,17 @@ mod tests {
         let count = Count::new(usize::MAX);
         assert_eq!(count.charge(), Ok(()));
         assert_eq!(count.held(), 1);
+    }
+
+    #[test]
+    fn a_refund_too_many_refuses_every_later_charge() {
+        let count = Count::new(4);
+        count.refund();
+        assert_eq!(count.charge(), Err(Error::Limit));
+        // Even under the largest quota there is.
+        let widest = Count::new(usize::MAX);
+        widest.refund();
+        assert_eq!(widest.charge(), Err(Error::Limit));
     }
 
     /// Several threads charge and refund one count at once. None of them may ever see more
