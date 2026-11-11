@@ -17,6 +17,7 @@ mod reproducible;
 mod screen;
 mod serial;
 mod targetcfg;
+mod toolchain;
 mod turns;
 mod unsafety;
 
@@ -58,8 +59,9 @@ commands:
               UART at all (with a framebuffer the only way to see the boot)
   run         boot under QEMU with the serial console on this terminal (Ctrl-A X quits)
   reproducible-gate only the gate on reproducible builds: the loader, each way it is built,
-              and the kernel are built twice from nothing in two target directories, and the
-              two files of each must be the same bytes (part of check; CLAUDE.md §75)
+              and the kernel are built twice from nothing in two target directories; the
+              two files of each must be the same bytes, and hold no path of this machine
+              (part of check; CLAUDE.md §75)
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
@@ -112,7 +114,13 @@ environment:
                                       an x86-64 host with /dev/kvm); the devices and firmware
                                       stay QEMU's
   ORIGIN_QEMU_DEBUG                   if set, QEMU logs interrupts and resets to
-                                      target/xtask/qemu-debug.log";
+                                      target/xtask/qemu-debug.log
+  RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS, CARGO_TARGET_X86_64_UNKNOWN_NONE_RUSTFLAGS,
+  CARGO_TARGET_X86_64_UNKNOWN_UEFI_RUSTFLAGS
+                                      refused if set, even empty: they replace or add to the
+                                      compiler flags of .cargo/config.toml, so an image would
+                                      not be the one the repository describes. Only
+                                      `exclusive` runs with them, and what it runs may not";
 
 const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 const LOADER_PACKAGE: &str = "origin-boot-uefi";
@@ -2076,6 +2084,15 @@ fn parse_console_line(rest: &str) -> Option<(u64, usize)> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    // Nothing is built with compiler flags from the environment (`toolchain`). `exclusive`
+    // builds nothing itself, and what it runs makes this check for itself.
+    if let Some(command) = args.first()
+        && command != "exclusive"
+        && let Err(e) = toolchain::refuse_environment_flags()
+    {
+        eprintln!("xtask: error: {e}");
+        return ExitCode::FAILURE;
+    }
     let result = match args
         .iter()
         .map(String::as_str)
@@ -3076,20 +3093,23 @@ fn build_kernel_object(package: &str, out_dir: &Path) -> Result<PathBuf> {
             KERNEL_TARGET,
         ]))?;
         let emit = format!("--emit=obj={}", obj.display());
-        run_step(cargo().args([
-            "rustc",
-            "--quiet",
-            "--package",
-            package,
-            "--lib",
-            "--release",
-            "--target",
-            KERNEL_TARGET,
-            "--",
-            &emit,
-            "-C",
-            "codegen-units=1",
-        ]))?;
+        // The same flags as the kernel's own build, so that Cargo does not compile the
+        // libraries they share again each time one follows the other.
+        run_step(
+            cargo()
+                .args([
+                    "rustc",
+                    "--quiet",
+                    "--package",
+                    package,
+                    "--lib",
+                    "--release",
+                    "--target",
+                    KERNEL_TARGET,
+                ])
+                .args(toolchain::image_config()?)
+                .args(["--", &emit, "-C", "codegen-units=1"]),
+        )?;
         if !obj.is_file() {
             return Err(format!(
                 "no-panic check: rustc did not write {}",
@@ -3325,22 +3345,11 @@ fn dependency_check() -> Result {
 
 /// A tool from the pinned toolchain's `llvm-tools` component.
 fn llvm_tool(name: &str) -> Result<PathBuf> {
-    let rustc = |args: &[&str]| -> Result<String> {
-        let out = Command::new("rustc")
-            .args(args)
-            .current_dir(repo_root())
-            .output()
-            .map_err(|e| format!("cannot run rustc: {e}"))?;
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    };
-    let sysroot = rustc(&["--print", "sysroot"])?.trim().to_string();
-    let host = rustc(&["-vV"])?
-        .lines()
-        .find_map(|l| l.strip_prefix("host: ").map(str::to_string))
-        .ok_or("cannot read the host triple from `rustc -vV`")?;
-    let path = Path::new(&sysroot)
+    let toolchain = toolchain::toolchain()?;
+    let path = toolchain
+        .sysroot
         .join("lib/rustlib")
-        .join(host)
+        .join(&toolchain.host)
         .join("bin")
         .join(name);
     if path.is_file() {
@@ -3519,6 +3528,7 @@ fn build_loader_in(feature: Option<&str>, target: Option<&Path>) -> Result<PathB
     if let Some(target) = target {
         build.arg("--target-dir").arg(target);
     }
+    build.args(toolchain::image_config()?);
     run_step(&mut build)?;
     let efi = target
         .map_or_else(target_dir, Path::to_path_buf)
@@ -3557,6 +3567,7 @@ fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
     if let Some(target) = target {
         build.arg("--target-dir").arg(target);
     }
+    build.args(toolchain::image_config()?);
     run_step(&mut build)?;
     let elf = target
         .map_or_else(target_dir, Path::to_path_buf)

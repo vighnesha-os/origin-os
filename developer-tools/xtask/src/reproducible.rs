@@ -5,9 +5,14 @@
 //! build in the first ended. The two files of each image must be the same bytes.
 //!
 //! That shows an image does not depend on when it was built, on what Cargo had built before
-//! it, or on where its target directory is. It does not show that another machine gives the
-//! same bytes: both builds have one toolchain, installed in one place, on one host
-//! (`docs/research/2026-11-10-loader-reproducible-build.md` says what is known to differ).
+//! it, or on where its target directory is. Each image is then searched for the paths of the
+//! machine that built it: the toolchain's directory, Cargo's home and the checkout
+//! ([`toolchain::host_paths`]). None may be there.
+//!
+//! Neither check shows that another machine gives the same bytes: both builds have one
+//! toolchain on one host. `docs/research/2026-11-11-toolchain-path-in-images.md` says what
+//! was tried with a second copy of the toolchain, and
+//! `docs/research/2026-11-10-loader-reproducible-build.md` what made the loader differ.
 //!
 //! The loader was not reproducible until its link arguments made it so (`.cargo/config.toml`):
 //! the linker wrote the time of the link into the PE header, and an identifier that changed
@@ -20,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use crate::{Loader, Result, build_kernel_in, build_loader_in, read_file, target_dir};
+use crate::{Loader, Result, build_kernel_in, build_loader_in, read_file, target_dir, toolchain};
 
 /// An image the gate builds twice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,8 +86,19 @@ impl Image {
     }
 }
 
-/// Builds every image twice and fails at the first whose two files differ.
+/// How much of an image's text a report shows where a host path was found.
+const REPORTED_TEXT: usize = 200;
+
+/// Builds every image twice and fails at the first whose two files differ, or that holds a
+/// path of this machine.
 pub(crate) fn gate() -> Result {
+    let (host_paths, set_aside) = toolchain::host_paths()?;
+    for path in &set_aside {
+        println!(
+            "xtask: reproducible-build gate: not looked for in the images: {}, `{}` (not UTF-8, or too short to tell from an image's own text)",
+            path.what, path.path
+        );
+    }
     let work = target_dir().join("xtask").join("reproducible");
     let [first_dir, second_dir] = DIRECTORIES.map(|name| work.join(name));
     // From nothing: in each directory Cargo compiles and links everything again.
@@ -116,8 +132,17 @@ pub(crate) fn gate() -> Result {
                 kept.join("\n"),
             ));
         }
+        if let Some((path, at)) = toolchain::host_path_in(first, &host_paths) {
+            return Err(format!(
+                "{} holds a path of the machine that built it (CLAUDE.md §75, §60): {}, `{}`, at offset {at:#x}\n  the text there: `{}`\n  `xtask` remaps the toolchain's source directory in every image build (`toolchain::image_config`). A path that still reaches an image needs a remap of its own, or must not be compiled in",
+                image.name(),
+                path.what,
+                path.path,
+                text_at(first, at),
+            ));
+        }
         println!(
-            "xtask: reproducible-build gate: {}: {} bytes, the same from two builds (SHA-256 {})",
+            "xtask: reproducible-build gate: {}: {} bytes, the same from two builds and free of this machine's paths (SHA-256 {})",
             image.name(),
             first.len(),
             hex(&origin_crypto::Sha256::digest(first), "")
@@ -176,7 +201,7 @@ fn difference(first: &[u8], second: &[u8]) -> Option<String> {
         && stamp.clone().any(differs)
     {
         report.push(format!(
-            "  bytes {:#x} to {:#x} are the PE header's time stamp, which `/TIMESTAMP:0` sets to zero (`.cargo/config.toml`). If it differs, the loader's link arguments did not reach the linker: RUSTFLAGS in the environment replaces the list they are in",
+            "  bytes {:#x} to {:#x} are the PE header's time stamp, which `/TIMESTAMP:0` sets to zero (`.cargo/config.toml`). If it differs, the loader's link arguments did not reach the linker",
             stamp.start,
             stamp.end - 1
         ));
@@ -201,6 +226,19 @@ fn differing_runs(first: &[u8], second: &[u8]) -> Vec<Range<usize>> {
         }
     }
     runs
+}
+
+/// The printable text of `image` from `at`, up to [`REPORTED_TEXT`] bytes: the whole of a
+/// path that starts there.
+fn text_at(image: &[u8], at: usize) -> String {
+    image
+        .get(at..)
+        .unwrap_or_default()
+        .iter()
+        .take(REPORTED_TEXT)
+        .take_while(|byte| byte.is_ascii_graphic() || **byte == b' ')
+        .map(|&byte| char::from(byte))
+        .collect()
 }
 
 /// Where a PE image's header keeps its time stamp: the four bytes that start eight after the
@@ -361,7 +399,7 @@ mod tests {
             report.contains("bytes 0x80 to 0x83 are the PE header's time stamp"),
             "{report}"
         );
-        assert!(report.contains("RUSTFLAGS"), "{report}");
+        assert!(report.contains("did not reach the linker"), "{report}");
     }
 
     #[test]
@@ -393,6 +431,18 @@ mod tests {
         assert_eq!(pe_time_stamp(&far), None);
         assert_eq!(pe_time_stamp(&image[..0x82]), None);
         assert_eq!(pe_time_stamp(&image[..0x84]), Some(0x80..0x84));
+    }
+
+    #[test]
+    fn the_text_at_an_offset_stops_at_the_first_byte_that_is_not_text() {
+        let mut image = vec![0u8; 64];
+        image[10..30].copy_from_slice(b"/Users/x/a file.rs\0Z");
+        assert_eq!(text_at(&image, 10), "/Users/x/a file.rs");
+        assert_eq!(text_at(&image, 0), "");
+        assert_eq!(text_at(&image, 64), "");
+        assert_eq!(text_at(&image, 1000), "");
+        let long = vec![b'a'; 3 * REPORTED_TEXT];
+        assert_eq!(text_at(&long, 5).len(), REPORTED_TEXT);
     }
 
     #[test]
