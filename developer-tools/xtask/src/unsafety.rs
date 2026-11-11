@@ -18,14 +18,15 @@
 //! character literals, whatever it heads: a block, an `unsafe fn`, an `unsafe impl`, an
 //! `unsafe extern` or an attribute such as `#[unsafe(no_mangle)]`.
 //!
-//! The gate ends with the one on what assembly blocks promise the compiler about the flags
-//! (`asmflags`, CLAUDE.md §13).
+//! The gate ends with two on the assembly inside those sites: what a block promises the
+//! compiler about the flags (`asmflags`, CLAUDE.md §13), and where the processor's two
+//! random-number instructions may be run (`mnemonics`, CLAUDE.md §59; ADR-0016 R2).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use crate::{Result, asmflags, cargo, collect_files, lex, repo_root};
+use crate::{Result, asmflags, cargo, collect_files, lex, mnemonics, repo_root};
 
 /// Under this directory is the privileged framework, the one place `unsafe` may appear: the
 /// crate `origin-frame`, and its lock package, `origin-sync`, kept as a package of its own
@@ -40,6 +41,9 @@ const KERNEL_LEAVES: &[&str] = &[
     "runtime/abi",
     "runtime/version",
     "sdk/directory",
+    // The random-number generator's mechanism and policy (ADR-0016 R2): both forbid `unsafe`.
+    "security/crypto",
+    "security/random",
 ];
 /// The kernel library's crate root, whose `forbid(unsafe_code)` covers every module above the
 /// framework.
@@ -104,6 +108,10 @@ const UNSAFE_FILES: &[(&str, &str)] = &[
         "the ring-3 proof programs: assembly carried as data, and the linker's symbols around it",
     ),
     (
+        "framekernel/frame/src/random.rs",
+        "the random-number generator: RDSEED and RDRAND, its own stack for each step, volatile overwrites",
+    ),
+    (
         "framekernel/frame/src/smp.rs",
         "application-processor start-up: the real-mode trampoline, its data page, the AP entry",
     ),
@@ -155,6 +163,8 @@ const LAYERS: &[(&str, &[&str])] = &[
     ("origin-boot-info", &["origin-version"]),
     ("origin-abi", &["origin-version"]),
     ("origin-sync", &[]),
+    ("origin-crypto", &[]),
+    ("origin-random", &["origin-crypto"]),
     ("origin-syscalls", &[]),
     // The service directory's generated client and stub, which a boot proof uses.
     ("origin-directory", &[]),
@@ -164,7 +174,9 @@ const LAYERS: &[(&str, &[&str])] = &[
         &[
             "origin-abi",
             "origin-boot-info",
+            "origin-crypto",
             "origin-paging",
+            "origin-random",
             "origin-sync",
             "origin-version",
         ],
@@ -174,9 +186,11 @@ const LAYERS: &[(&str, &[&str])] = &[
         &[
             "origin-abi",
             "origin-boot-info",
+            "origin-crypto",
             "origin-frame",
             "origin-paging",
             "origin-directory",
+            "origin-random",
             "origin-sync",
             "origin-syscalls",
             "origin-version",
@@ -234,8 +248,10 @@ pub(crate) fn gate() -> Result {
         ABOVE_UNSAFE_FILES.len(),
         scanned.files
     );
-    // What the assembly inside those sites promises the compiler about the flags.
-    asmflags::gate()
+    // What the assembly inside those sites promises the compiler about the flags, and where
+    // RDRAND and RDSEED may be run.
+    asmflags::gate()?;
+    mnemonics::gate()
 }
 
 /// What one file of the framework holds.

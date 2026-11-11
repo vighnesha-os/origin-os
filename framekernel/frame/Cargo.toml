@@ -10,6 +10,7 @@ publish.workspace = true
 origin-boot-info = { path = "../../boot/info" }
 origin-paging = { path = "../paging" }
 origin-abi = { path = "../../runtime/abi" }
+origin-random.workspace = true
 origin-sync = { path = "sync" }
 
 [lints]

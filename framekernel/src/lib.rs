@@ -40,7 +40,6 @@
 //! - [`dmar`]: the ACPI DMAR table (Intel VT-d units, device scopes, reserved memory);
 //! - [`dns`]: DNS message parsing with bounded name decompression;
 //! - [`editbuffer`]: a gap buffer for editable text (caret, insert/delete);
-//! - [`entropy`]: bounded-retry hardware entropy draw/fill over an abstract source;
 //! - [`fbconsole`]: the text console on the firmware's framebuffer (geometry, glyph placement
 //!   and the byte rules, drawn through an abstract pixel sink);
 //! - [`features`]: CPUID feature decoding and the x86-64-v3 baseline;
@@ -113,7 +112,6 @@ pub mod deflate;
 pub mod dhcp;
 pub mod dns;
 pub mod editbuffer;
-pub mod entropy;
 pub mod fbconsole;
 pub mod font;
 pub mod glob;

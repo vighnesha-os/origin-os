@@ -69,19 +69,19 @@ pub(crate) struct Launched {
     pub(crate) size: usize,
 }
 
-/// A random page at which `pages` pages fit in the record region, from hardware entropy.
-/// `None` when the processor gives no entropy: a start record never goes at a predictable
-/// address.
+/// A random page at which `pages` pages fit in the record region, from the kernel's
+/// random-number generator (ADR-0016). `None` when there is no generator: a start record never
+/// goes at a predictable address.
 fn random_place(pages: u64) -> Option<u64> {
     let slots = ((RECORD_HIGH - RECORD_LOW) / PAGE).checked_sub(pages)? + 1;
-    let random = crate::entropy::hardware_u64()?;
+    let random = origin_frame::random::next_u64().ok()?;
     Some(RECORD_LOW + (random % slots) * PAGE)
 }
 
 /// Maps the pages of `child`'s start record, for what `given` holds, read-only and not
 /// executable, at a random address no other mapping of the child touches (C4). The record is
-/// written by [`start`]. `LIMIT` past 64 handles or 64 KiB, `NOT_SUPPORTED` without hardware
-/// entropy, `NO_MEMORY` without frames.
+/// written by [`start`]. `LIMIT` past 64 handles or 64 KiB, `NOT_SUPPORTED` without a
+/// random-number generator, `NO_MEMORY` without frames.
 pub(crate) fn place(child: &mut Process, given: &Given<'_>) -> Result<Placed, Error> {
     let size = start::size_of(given.handles(), given.args, given.env).map_err(|_| Error::Limit)?;
     let pages = size.div_ceil(PAGE as usize) as u64;

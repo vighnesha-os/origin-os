@@ -19,7 +19,9 @@
 //! The entry contract, which `_start` relies on: the Origin boot loader calls it after
 //! `ExitBootServices`, with the physical address of a [`BootInfo`] in `rdi` (System V; null, or
 //! readable, with region and segment arrays, if the header is valid, that are readable and are
-//! never written afterwards: the loader leaves that memory to the kernel for good), interrupts
+//! never written afterwards: the loader leaves that memory to the kernel for good; the one
+//! thing the kernel writes there is zeros over the loader's 64-byte seed, which lies clear of
+//! the header and both arrays), interrupts
 //! disabled, the processor at CPL 0, the loader's page tables active (a direct map of RAM at
 //! `direct_map_base`, and the kernel image at `kernel_virtual_base`), `rsp` 16-byte aligned before
 //! the `call`, on the stack `BootInfo` describes, the direction flag clear, and the image's
@@ -67,6 +69,8 @@ pub struct BootData {
     regions: &'static [MemoryRegion],
     segments: &'static [KernelSegment],
     summary: MemorySummary,
+    /// The physical address of the loader's seed, if the header names one the kernel may take.
+    boot_seed: Option<u64>,
 }
 
 impl BootData {
@@ -88,6 +92,13 @@ impl BootData {
     /// What the memory map adds up to.
     pub const fn summary(&self) -> MemorySummary {
         self.summary
+    }
+
+    /// The physical address of the loader's 64-byte seed (boot info 0.6; ADR-0016 R10), if the
+    /// header names one that lies inside the boot-info region and clear of the header and the
+    /// two arrays. Whether the loader named one at all is `info().boot_seed != 0`.
+    pub(crate) const fn boot_seed(&self) -> Option<u64> {
+        self.boot_seed
     }
 }
 
@@ -156,12 +167,19 @@ impl Entry {
         // integer fields.
         let segments = unsafe { slice::from_raw_parts(first, segment_array.len) };
         boot::check_kernel_segments(segments, &info)?;
+        // The loader's seed is taken only from where it may lie; anything else is no seed.
+        let boot_seed = origin_boot_info::boot_seed(
+            &info,
+            phys::to_phys(self.boot_info.addr() as u64),
+            regions,
+        );
         // `Entry` is made once, so this is the first and only `set`.
         let _ = BOOT_DATA.set(BootData {
             info,
             regions,
             segments,
             summary,
+            boot_seed,
         });
         let data = BOOT_DATA.get().ok_or(InvalidBootInfo::Null)?;
         Ok(Early {
@@ -374,7 +392,8 @@ impl Early {
             stack_guard: info.stack_base.wrapping_sub(PAGE),
         };
         // The kernel stacks' region slides (ADR-0004 Amendment 2): its base is drawn now, when
-        // the kernel builds its tables.
+        // the kernel builds its tables, from the loader's value for it (A5.1), which this
+        // takes: the boot info is read already, and the loader's direct map holds the area.
         let region = crate::stack::draw_region();
         let built = layout::build(&mut tables, &at, self.data.regions, self.data.segments)
             // ADR-0004 H2: every slot of the kernel half gets its table now, while nothing can
@@ -388,22 +407,19 @@ impl Early {
             });
         match built {
             Ok((space, stats)) => {
-                // Placed only with its tables made. The boot says what drew the base (A5),
-                // never the base (A6).
+                // Placed only with its tables made. The boot says whether the loader's value
+                // placed the base (A5.1, A5.2), never the value (A5.3) or the base (A6).
                 crate::stack::place(region);
-                let _ = match region.drawn {
-                    Some(entropy) => writeln!(
+                let _ = if region.drawn {
+                    writeln!(
                         com1,
-                        "origin-kernel: kernel stacks: the region's base is drawn from {}",
-                        match entropy {
-                            crate::stack::Entropy::Rdseed => "RDSEED",
-                            crate::stack::Entropy::Rdrand => "RDRAND",
-                        }
-                    ),
-                    None => writeln!(
+                        "origin-kernel: kernel stacks: the region's base is drawn from the loader's random value"
+                    )
+                } else {
+                    writeln!(
                         com1,
-                        "origin-kernel: kernel stacks: no entropy from RDSEED or RDRAND: the region is at its fixed base"
-                    ),
+                        "origin-kernel: kernel stacks: the loader handed over no random value: the region is at its fixed base"
+                    )
                 };
                 Some(KernelTables {
                     space,

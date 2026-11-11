@@ -73,31 +73,40 @@ fn guarded(stack: &GuardedStack) -> (bool, u32) {
 }
 
 /// The region's slide (ADR-0004 Amendment 2): its base is one the slide can give,
-/// 2 MiB-aligned with the whole region in PML4 slots 384–447. On a processor with RDSEED or
-/// RDRAND it was drawn, and so is not the fixed base, which a draw never gives; on one with
-/// neither, it is the fixed base. Nothing it prints names the base or an address in the region
-/// (A6).
+/// 2 MiB-aligned with the whole region in PML4 slots 384–447. When the loader handed over a
+/// random value for it (A5.1, decision item 166) the base was drawn from that value, taken
+/// once, and so is not the fixed base, which a draw never gives; when the loader handed over
+/// none, it is the fixed base. Nothing it prints names the value, the base or an address in the
+/// region (A5.3, A6).
 fn placed_at_random(com1: &mut Console) -> bool {
+    use origin_frame::random::{self, StackValue};
     let region = stack::region();
-    let features = crate::features::Features::decode(&cpu::gather_cpuid());
     let in_window = layout::is_stack_region_base(region.base);
     let fixed = region.base == layout::STACK_REGION;
+    // What became of the loader's value: taken exactly when the base was drawn from it, and
+    // not there at all when the base is the fixed one. A value left unclaimed beside a fixed
+    // base, or a drawn base with no value taken, is wrong.
+    let value = random::stack_value();
     let right = in_window
-        && match region.drawn {
-            Some(_) => !fixed,
-            None => !features.rdseed && !features.rdrand && fixed,
+        && if region.drawn {
+            !fixed && value == StackValue::Taken
+        } else {
+            fixed && value == StackValue::None
         };
     let verdict = if right { "" } else { ": kernel stacks failed" };
-    let _ = match region.drawn {
-        Some(entropy) => writeln!(
+    let _ = if region.drawn {
+        writeln!(
             com1,
-            "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: {in_window}; drawn from the processor's entropy, so not its fixed base: {} ({entropy:?}){verdict}",
+            "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: {in_window}; drawn from the loader's random value, taken once: {}, so not its fixed base: {}{verdict}",
+            value == StackValue::Taken,
             !fixed
-        ),
-        None => writeln!(
+        )
+    } else {
+        writeln!(
             com1,
-            "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: {in_window}; no entropy from RDSEED or RDRAND, and the region is at its fixed base: {fixed}{verdict}"
-        ),
+            "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: {in_window}; the loader handed over no random value: {}, and the region is at its fixed base: {fixed}{verdict}",
+            value == StackValue::None
+        )
     };
     right
 }
@@ -294,15 +303,20 @@ fn reclaimed_out_of_reach(
     }
     let cached = other.is_none() || STAGE.load(Ordering::Acquire) >= 1;
     // Freed, then retired with everything kept for reuse, then reclaimed: a shootdown each.
-    // Another processor may reclaim it first, in its idle loop: this waits for whoever does.
-    let top = made.top();
+    // Another processor may reclaim it first, in its idle loop: this waits for whoever does, on
+    // the stack's own slot. Its top is the base of the next slot, which may be free whatever
+    // happens to this one: a wait on that slot ended at once while another processor was still
+    // reclaiming the stack, and the reader read through translations it still held. So the slot
+    // waited on must be the one the stack's last byte is in, on every boot.
+    let slot = made.slot();
+    let own = stack::slot_holding(made.top() - 1) == Some(slot);
     drop(made);
     stack::trim();
     stack::reclaim();
     // The slot is free only once its frames have been released (`Slots::reclaim`); the frames
     // themselves may be someone else's again by now, so they are not looked at.
-    crate::sched::yield_until(|| stack::slot_is_free(top), tsc_hz, 5);
-    let free = stack::slot_is_free(top);
+    crate::sched::yield_until(|| stack::slot_is_free(slot), tsc_hz, 5);
+    let free = stack::slot_is_free(slot);
     let (faulted, stale, reader) = match other {
         Some(cpu) => {
             STAGE.store(2, Ordering::Release);
@@ -326,10 +340,10 @@ fn reclaimed_out_of_reach(
         }
     };
     let pages = CACHED_PAGES as u64;
-    let ok = cached && free && faulted == pages && stale == 0;
+    let ok = cached && own && free && faulted == pages && stale == 0;
     let _ = writeln!(
         com1,
-        "origin-kernel: kernel stacks: a stack's {pages} pages read on {reader}, then the stack freed and reclaimed: {faulted} of {pages} reads there faulted and {stale} saw the old pages; its slot free again: {free}{}",
+        "origin-kernel: kernel stacks: a stack's {pages} pages read on {reader}, then the stack freed and reclaimed: {faulted} of {pages} reads there faulted and {stale} saw the old pages; its slot, the one its last byte was in: {own}, free again: {free}{}",
         if ok { "" } else { ": kernel stacks failed" }
     );
     ok

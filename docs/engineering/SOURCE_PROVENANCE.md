@@ -2595,6 +2595,132 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
   - The standard's known-answer self-test at start-up (SP 800-90A §11.3): 18b, with NIST's vectors as its answers.
   - A check of the compiled branches; a measurement on x86-64; a measured stack depth; Kani and coverage-guided fuzzing; an independent review (§59).
 
+## `security/random/` (`origin-random`), and the random-number generator in the kernel and the loader (ADR-0016; task 18b; 2026-11-11)
+
+The fields are §6's ten, in order.
+
+- **Module:** `security/random/` (`origin-random`): `health.rs`, `node.rs`, `root.rs`, `drive.rs`, `seed.rs`, `selftest.rs`, `kat.rs` (generated), `wipe.rs`, the tests under `src/tests/`, and the tools `tools/gen_selftest.py`, `tools/seed_reference.py`, `tools/plant_faults.py`. `framekernel/frame/src/random.rs` (`origin_frame::random`). `boot/uefi/src/random.rs` and the loader's `main.rs`. `boot/info/src/lib.rs` (`boot_seed`, boot info 0.6). `developer-tools/xtask/src/mnemonics.rs` and the `boot-random` scenarios. Changes in `framekernel/src/`: `kernel.rs` (the start, the proof), `launch.rs`, `virtionet.rs`, `sched.rs`, `bootproof.rs`; `entropy.rs` removed.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-11, on `claude/18b-kernel-random`, cut from `main` at `f654d71`. Commits `c8e1267` (the contract), `7628797` and `b77b42b` (the policy crate), `ddcfe57` (the framework's service), `86bb955` (the consumers and the row), `a33ad5a` (boot info 0.6 and the loader), `837dae2` (the gate), `fe51290` (the two boots), `54e6173` and `da4c148` (records and a lint).
+- **Specifications:** NIST SP 800-90A Rev. 1 §9, §10.1.2 and §11.3; SP 800-90B §4.3 and §4.4; SP 800-90C §7 and Appendix A.3.4; Intel's DRNG guide; AMD-SB-7055. All as `docs/research/2026-11-10-kernel-random-numbers.md` records them, read on 2026-11-10. Nothing further was read for this task. UEFI 2.11 was not read (its site refuses automated access): the loader's new code calls no firmware service beyond the page allocation it already used.
+- **Architecture decision:** `docs/adr/ADR-0016-kernel-random-numbers.md`, accepted by the owner on 2026-11-10 (decision items 145 to 151); its section "What was built" says how each decision was built. The contract of task 18b in `TASKS.md` settles what the ADR left open, as S1 to S7. ADR-0013 Amendment 1 (the row), ADR-0002 B4 (boot info 0.6), ADR-0004 H3 as amended.
+- **Dependencies:** `origin-crypto` and `core`; `alloc` in the framework for the seed area while a processor starts. No third-party crate. Python 3's standard library for the three tools, which do not ship.
+- **Toolchain:** Rust 1.99.1. Clippy-clean on the host and for both freestanding targets. `origin-random` forbids `unsafe`; its release object for `x86_64-unknown-none` references `origin-crypto`'s generator, `memcpy`, `memset` and `Formatter::write_str`, and nothing else.
+- **Review:** **no human has reviewed it.** The coordinating session's review note on reseeding was answered in the contract before any code. The policy crate was then read at `cef9342` by a session that did not write it; what it found and what was done is in the addition below, "The independent review's findings". The kernel's wiring and the gate have not been read by another session yet.
+- **Licensing:** MIT OR Apache-2.0. `kat.rs` holds two of NIST's ACVP vectors, from the file committed under owner decision 145, with NIST's notice beside that file.
+- **Test evidence (2026-11-11; QEMU 11.1.3 with OVMF, software processor, for every boot):**
+  - **The policy, on the host:** 55 tests. Each health test on hand-made sequences; the cutoffs from SP 800-90B's formulas, which give the standard's own table (410, 311, 177, 62 and 13); seeds byte for byte against `tools/seed_reference.py`, written from the ADR's tables on the Python HMAC_DRBG that NIST's vectors confirmed: nine outputs, all equal at the first run; the schedule, the back-off, the 16-draw bound, a thread that moves between steps, every refusal; the self-test's constants equal to NIST's file, and a wrong one failing it.
+  - **Planted faults** (`tools/plant_faults.py`; the tree is restored and re-tested afterwards): 69 planted one at a time. 62 failed a test at first; the seven that did not led to six new tests and to one real fault in the code (a draw's tries counted across draws), since fixed. **68 of 68 are caught**; the 69th is listed as not observable.
+  - **The gate:** eight tests; on the tree the instructions are run 4 times, in the 2 files listed.
+  - **`cargo xtask check`:** passed at `da4c148` (2026-11-11, 10:26 to 10:34, a clean tree before and after): every crate's clippy and tests, the no-panic check with `origin-random` in it (9 external symbols, all allowed), the image gate (1,238 returns, an INT3 after each), the `unsafe`, assembly and random-instruction gates, the loader built three ways and the kernel twice with the same bytes, and Loom.
+  - **Boots:** `cargo xtask boot-matrix` passed at `da4c148` (2026-11-11, 10:35 to 11:03): the 11 scenarios of `boot-test` under Intel VT-d and AMD-Vi with 1, 2 and 4 processors, the sparse machine twice, the bridge machine twice, the legacy-free machine, the two `boot-random` machines and the 9 console scenarios.
+  - **Controls:** C37 to C42 in ADR-0013, each one edit to an exported copy of `fe51290`.
+  - **What a boot measures:** a request uses 3,024 of the 8,192 bytes of the generator's stack, and only zeros are on it afterwards. A 64-byte request about 22 µs; the longest step with interrupts off about 0.8 ms while a processor started and 0.2 ms since. **An emulator's figures: they claim nothing.**
+  - **Reproduce:** `cargo test --package origin-random`; `python3 -I security/random/tools/gen_selftest.py --check`; `python3 -I security/random/tools/seed_reference.py --check`; `python3 -I security/random/tools/plant_faults.py .`; `cargo xtask unsafe-gate`; `cargo xtask boot-random`; `cargo xtask check`.
+- **External data and firmware:** none new. No file was downloaded.
+- **Open-source references consulted (§3; decision items 92, 93, 96):** none in this task. This session read EDK II's declaration of the firmware's random-number protocol on 2026-11-10 (the ledger's §12), so it did not write the loader's call to that protocol: that is left to a session that has not (TASKS, 18c).
+- **Not done:** the firmware's protocol; the consumers on `land/s3-part2`; a processor going offline; reseeding on resume and after a snapshot; an interface for programs; a check of the compiled branches; Kani or Loom models of the step and the root's lock; anything on hardware. *(2026-11-11: the consumers on `land/s3-part2` are converted in that batch's merge of this task, `c2245ef`; the entry on the conversion has it.)*
+
+### The stack region's value, handed over beside the seed (decision item 166; 2026-11-11)
+
+An addition to the entry above, from the same session on the same branch. The owner decided on 2026-11-11 that the loader's generator makes a third 8-byte request for the kernel stacks' region and hands it over directly after its seed (ADR-0016 Amendment 1).
+
+- **Module:** `boot/info/src/lib.rs` (`BOOT_SECRET_LEN`, `BOOT_STACK_VALUE_LEN`; `boot_seed()` checks 72 bytes); `boot/uefi/src/main.rs` (the third request); `framekernel/frame/src/random.rs` (`take_stack_value`, `stack_value`, the 72-byte overwrite; `finish_start` takes its lock); `framekernel/src/kernel.rs` (`prove_stack_value`); the boot test's markers.
+- **Specifications:** none new. The value is 64 bits of the loader's HMAC_DRBG output, read through the direct map.
+- **Test evidence:** the host test of where the area may lie, with the boundaries moved to 72 bytes and two cases where the seed would fit and the value would not; and the gates: `cargo xtask check` passed on `396e9e2` (2026-11-11, 11:41 to 11:46, a clean tree before and after), whose code is `8fbd8e9`, and `cargo xtask boot-matrix` passed on it (11:46 to 12:14): `boot-test`'s 11 scenarios under both IOMMUs with 1, 2 and 4 processors, the sparse, bridge and legacy-free machines, both `boot-random` machines and the 9 console scenarios. A boot says the value was "taken here, once, and a second take was refused", and the proof fails if a take succeeds after the generator's start.
+- **Not done:** nothing uses the value on this branch. `stack::draw_region` on the next batch becomes its caller. *(2026-11-11: it is the caller since the batch's merge of this task, `c2245ef`.)*
+
+### The independent review's findings (2026-11-11)
+
+A second addition to the entry above, from the same session on the same branch. The coordinating session had `origin-random` read at `cef9342` by a session that did not write it. It reported eight findings, of which the coordinating session checked three against the code. `TASKS.md` (task 18b) has the table: each finding, how it was judged, what is built and the test that fails without it.
+
+- **Module:** `security/random/src/{node,root,drive,lib}.rs` and the tests under `src/tests/`; `security/random/tools/seed_reference.py` and its output; `security/random/tools/plant_faults.py`; `framekernel/src/kernel.rs` (the generator's proof). Commits `1a2ad4d`, `34184b1` (the policy and its tests) and `53ee743` (the proof).
+- **Specifications:** none new. SP 800-90A §9.3.1 for the order of a request with prediction resistance, and ADR-0016 R4 item 1 and item 8 and R6, as the ledger records them.
+- **Review:** the findings are another session's; the fixes are this session's and have been read by nobody else. **No human has reviewed any of it.**
+- **Test evidence:**
+  - **The policy, on the host:** 72 tests (55 before). The new ones are named in `TASKS.md` beside the finding each belongs to.
+  - **The reference:** `tools/seed_reference.py` now has the root reseeded by the first processor that reseeds itself; two of its nine outputs changed with that, and the crate gives all nine.
+  - **Planted faults:** 107 (69 before), one for each fix among them. The first full run on the fixes caught 102 and left three that a test could see; three tests were added for them. On the final code: **105 fail a test, and two are listed as not observable** (`next_u64`'s local copy; the root told of a change twice).
+  - **Control C43** (ADR-0013): RDSEED made dry from the first request with prediction resistance on, in an exported copy, booted once with the proof as it is and once with the proof as it was at `edd8387`. The first ends as an unedited boot; the second ends with randomness withheld.
+  - **Gates:** `cargo xtask check` passed on `fb88326` (2026-11-11, 12:54 to 12:59, a clean tree when it began; the code is `53ee743`, and the commits after it change Markdown only): every crate's clippy and tests, the no-panic check with `origin-random` in it (9 external symbols, all allowed), the image gate (1,270 returns, an INT3 after each), the `unsafe`, assembly and random-instruction gates, the loader built three ways and the kernel twice with the same bytes, and Loom. `cargo xtask boot-matrix` passed on the same code (13:00 to 13:29): `boot-test`'s 11 scenarios under Intel VT-d and AMD-Vi with 1, 2 and 4 processors, the sparse, bridge and legacy-free machines, both `boot-random` machines and the 9 console scenarios. The planted faults were run on an exported copy of `fb88326` beside the check. Every boot is QEMU's software processor.
+  - **Reproduce:** as the entry above; `python3 -I security/random/tools/plant_faults.py . --strings` says which of the tool's entries the code has outgrown.
+- **Not done:** T5's row in ADR-0016 does not say that a processor with no healthy RDRAND waits for as long as RDSEED is kept dry: put to the owner, nothing built. Anything on hardware: how often RDSEED gives nothing decides whether a start's eight rounds of patience and the proof's three requests are enough.
+
+*(T5's row was amended the same day: decision item 188, ADR-0016 Amendment 2.)*
+
+### The second review's findings (2026-11-11)
+
+A third addition to the entry above, from the same session on the same branch. The coordinating session had the first review's fixes read at `a6ab315` by another session that wrote none of them. It confirmed all eight, each by planting the old behaviour, and reported seven more findings with probes of its own. `TASKS.md` (task 18b) has the table. The reviewer's probes were read as data; no test of theirs was copied, and the tests here are this session's own.
+
+- **Module:** `security/random/src/{node,root,drive}.rs`, the tests under `src/tests/` (`world.rs` gains a clock that can move at every step), and `tools/plant_faults.py`. Commits `7012285` and `d739b93`. Nothing in the kernel or the loader changed: both use the driver's functions, whose signatures are as they were.
+- **What changed in the design:** a draw's tries are counted in the processor's own state and its last try ends the draw in the same step; a request's upkeep is bound to the processor it began on; the store is lent under a number that names the request and the processor; a processor looks at the root when the root's own period has passed since it last saw it. The driver's count of tries, the flag for a look, and the checks of the processor around a request with prediction resistance are gone.
+- **Review:** the findings are another session's. These fixes have been read by nobody else. **No human has reviewed any of it.**
+- **Test evidence:**
+  - **The policy, on the host:** 79 tests (72 before this round). The reference still agrees byte for byte, unchanged.
+  - **Planted faults:** 116 (107 before). The first run on this round's fixes caught 112 and showed that one test had been deleted by mistake while its neighbours were rewritten; it was put back as it was. On the final code: **115 fail a test, and one is listed as not observable** (`next_u64`'s local copy).
+  - **Gates:** `cargo xtask check` passed on `d739b93` (2026-11-11, 15:20 to 15:26; the commit after it changes Markdown only): every crate's clippy and tests, the no-panic check with `origin-random` in it (9 external symbols, all allowed), the image gate (1,259 returns, an INT3 after each), the `unsafe`, assembly and random-instruction gates, the loader built three ways and the kernel twice with the same bytes, and Loom. `cargo xtask boot-matrix` passed on the same code (15:26 to 15:53): `boot-test`'s 11 scenarios under Intel VT-d and AMD-Vi with 1, 2 and 4 processors, the sparse, bridge and legacy-free machines, both `boot-random` machines and the 9 console scenarios. The planted faults were run on an exported copy of `d739b93` beside the check. Every boot is QEMU's software processor.
+- **Not done:** requests with prediction resistance that overwrite each other are recorded with their bound and not changed (ADR-0016, "cannot show"). A check of the linked images for the two instructions' encodings. Anything on hardware.
+
+### The randomized model of the policy (TASKS item 37 (c); 2026-11-11)
+
+A fourth addition to the entry above, from another session and on a branch of its own: `claude/18b-random-model`, cut from `a11202a`, the final commit of `claude/18b-kernel-random`. It adds a host test and extends a host tool. Nothing that ships changed: `drive.rs`, `node.rs`, `root.rs`, `health.rs` and the rest of the crate outside `src/tests/` are as at `a11202a`.
+
+- **Module:** `security/random/src/tests/model.rs` (new; one `mod` line in `src/tests.rs`) and `security/random/tools/plant_faults.py`. Commits, in order: `09550f8` (the model as it ran on 2026-11-11, adapted), `9fa8cd5` (three knobs and four configurations), `4605072` (the tool: the six negative controls and the three counts), `a4a7984` (rules tried by hand), `d3242b7` (the tool says which rules a fault breaks), `02b267b` (the store's size is not named), `de45c2f` (the rest of the rules by hand), `f9df059` (three more rules, with a control each).
+- **Authors and origin:** three Claude sessions working on Origin, all on 2026-11-11. It is Origin's own work, and nothing outside the repository was read for it.
+  - **The machine** is the second reviewer's: the session that read the first review's fixes at `a6ab315` wrote it as a probe.
+  - **The coordinating session** added checks to it with a script: the lending a draw was made under, the request that made it, a plain request's tries on one processor, a failure or a "not now" counted only by a step that tried the instruction, and four tests for the second review's fixes. It ran the result on `a11202a`, found no violation, and put six of the review's defects back, each of which a check noticed.
+  - **This session** (Claude Code, local, M1 Max) brought both into the repository, changed what is listed below, and added to it. It wrote none of the policy and none of its fixes.
+  - **The scratch files** it worked from were in the coordinating session's scratch folder and are not in the repository. By name, with the first 16 hexadecimal digits of each SHA-256: `fuzz.rs`, the machine with the checks added, 1,165 lines (`cf0021fe5cddca25`); `patch-fuzz.py`, the script that added them (`cf39c5969145c68f`); `plants.py` and `plants.log`, the six defects and what noticed them (`b1647a2a025bc7fe`, `cfb1afaf1cc2d4d1`); `fuzz-run.log`, the run on `a11202a` (`9c04861566a1b3e3`).
+  - The addition above says of the session that built the generator: "The reviewer's probes were read as data; no test of theirs was copied". That stays true of the scripted tests. This is the reviewer's machine itself.
+- **What the model is:** a `Platform` over up to four scripted processors, like `world`'s, in which things happen around a step. Requests run nested between the steps of other requests. Threads take their steps in turns, one by one. A thread is on another processor after a step. Instructions are not ready, go dry, give zero or all ones, or repeat a value. The root's lock is found taken. The clock jumps and now and then steps back. All of it comes from a fixed seed.
+- **What it checks:** every value an instruction gives is logged with its logical time, its processor, its instruction, how many values that instruction had given since it last failed, the request that was running and the number the store was lent under when that step ended. A step that made a reseed shows in the counters, and the store as it was before that step is held against the rules. The head of `model.rs` lists them. In short:
+  - any seed: eight draws that the store was keeping, none in two seeds, none from before its instruction's last failure or from before the start-up test after it, all of that processor, and the store empty afterwards;
+  - a processor's own reseed: nothing gathered under a lending;
+  - the root's reseed: every draw under the store's lending number, made by the request that reseeds, after it began;
+  - a piece with prediction resistance: the same, from RDSEED only;
+  - a plain request: at most 16 draws, tries on one processor only, and always answered;
+  - a failure or a "not now": counted only by a step that tried that instruction;
+  - a reseed from the root's output: only of a processor that was due and had no healthy instruction;
+  - an answer: no 16 bytes left as they were, its first eight bytes no earlier answer's; a refused buffer all zeros;
+  - in calm weather: after a request, the processor's own seed and the root's never older than 60 s and 5 ms;
+  - where RDSEED runs out: the root's reseed made from RDRAND, with the RDSEED draws set aside.
+- **What changed on the way into the repository** (`09550f8`, `02b267b`):
+  - **The runs are the same.** For the seven configurations on one thread of control, every figure of the run at length equals the scratch machine's on `a11202a`: requests answered and refused, reseeds of each kind, failures, nested requests, moves. So does the configuration with one thread.
+  - **Threads are deterministic.** In the scratch machine a thread that had finished took itself out of the turns whenever it got the lock, so two runs of one seed differed. Here it leaves in a turn of its own. A test runs one seed twice and compares the answers. Each thread has its own signal, and a thread that panics gives its turn away, so a failure does not hang the others: tried once, with a panic planted in a thread's turn.
+  - **The log is bounded.** It kept every value before: ten million in the longest configuration. Now it keeps a draw for as long as a store holds it. A value that is in a seed and not in the log is reported as such.
+  - **Rules that were counted, or not there, are checked:** at most 16 draws in a plain request; a plain request always answered; the store empty after every reseed, not only the root's; a draw set aside is RDSEED's; no 16 bytes of an answer left unwritten or zero.
+  - **The store's size is not named.** The scratch machine compared a store with arrays of 64 and 80 bytes, so a store of another size would have stopped the build. The rules' figures are the model's own and not the crate's constants: eight draws, sixteen draws and sixty seconds as they were, and 1,024 draws for the start-up test.
+  - **Every configuration is two tests:** a short one, and the run at length marked `#[ignore]`.
+- **What this session added to the model, and why:**
+  - **Three knobs** (`9fa8cd5`). Two of the six defects were noticed by a thin margin. The root's reseed fell back to RDRAND with RDSEED draws set aside 3 times in 64,000 requests of dry weather: a draw that goes dry takes a hundred steps and was almost never left to finish. The lending defect was seen on 11 machines of 60, after about two thousand requests: it takes two moves, each at one particular step. So there is a weather in which RDSEED runs out after twelve values at most; a thread that is on another processor, three times in ten, after a step that leaves its store full; and a clock under which every fifth request comes after a long wait. A fourth weather has ten times the stuck values and repeats. Four configurations use them. Where a knob is off it draws no random number, so the 13 configurations of 2026-11-11 run as before.
+  - **Three rules** (`f9df059`). The fault list showed three faults that no test of the model failed for and that are within what the model is for: the clock never making a processor's reseed due, a processor that needs nothing being reseeded from the root, and a failure leaving an instruction healthy. The rules are the calm weather's for the processor's own seed, the one on reseeds from the root's output, and the one on the start-up test after a failure.
+  - **Rules tried by hand** (`a4a7984`, `de45c2f`). Three tests show the model something false directly: a store whose log is changed, answers that are none, and a reseed that is not what it should be. They are for the rules that no fault of one edit reaches.
+- **What it cannot show:**
+  - **It runs the policy crate on a scripted platform, on the build host.** The Framekernel's wiring (interrupts off, the generator's stack and its overwrite, the root's lock), the loader's generator and a real processor's RDSEED and RDRAND are not in it. Nothing here is evidence about hardware.
+  - **A step is indivisible in it,** as the platform's contract has it. A request made inside a running step is not made, nor anything that could interrupt a step.
+  - **The machine starts in calm weather.** A start with instructions that fail or go dry, a machine with no generator, a processor that goes offline, `next_u64` and the loader's `fill_from_root` are not in it. The scripted tests have the first two.
+  - **It is randomized, not exhaustive.** The seeds are fixed, so every run makes the same orders. A run that finds nothing says nothing about the orders it did not make.
+  - **It follows draws into seeds.** It does not judge the output beyond an answer coming twice. Of what stays in memory it sees a store after a reseed and a refused buffer.
+  - **Its threads take turns.** No two steps run at once, so it finds no data race. The policy shares nothing between processors except through the platform.
+  - **What it does not hold, though it could:** how many tries a draw gets and how long an instruction rests; that a request leaves none of its lent draws where it ends; that a stopped root answers nothing; the 2^20 requests that make a reseed due. The scripted tests have each. A test of the model fails for 40 of the 120 planted faults; the other 80 are for the scripted tests.
+  - **Measured once** (the toolchain's `llvm-cov`, on `4605072`): the model's short tests alone run 1,383 of the 1,697 lines of the crate's seven source files, 81.5%. What they do not run is what this list says, with `Debug` and the accessors.
+- **Specifications:** none new. The rules are ADR-0016's R4 item 8, R6 and R7 and T5's row, and task 18b's S2 and S3, as the entry above records them.
+- **Dependencies:** none added. The model uses `std` inside the tests (`HashMap`, `HashSet`, `Mutex`, `Condvar`, scoped threads). The tool uses Python 3's standard library and does not ship.
+- **Toolchain:** Rust 1.99.1. Clippy-clean with the tests (`--all-targets`, `-D warnings`) and rustfmt-clean.
+- **Review:** no other session has read this version, and **no human has reviewed any of it.**
+- **Licensing:** MIT OR Apache-2.0, as the crate.
+- **Test evidence (2026-11-11; host only, an M1 Max, debug build):**
+  - **`cargo test --package origin-random`:** 100 tests in 3.7 to 3.8 s (79 in 2.7 s before), 21 of them the model's, and 17 more marked `#[ignore]`. The model's short runs make 204,706 requests on 106 machines and hold the 349,207 draws of 43,391 seeds against the rules.
+  - **No violation on `a11202a`:** in the short runs, in the runs at length, and in sweeps of 148 other settings of the knobs made while the four configurations were chosen (8 or 12 machines of 1,000 or 1,500 requests each, with the model as it then was).
+  - **The runs at length:** 17 tests in 56 s with the test harness's own threads: 1,476,624 requests on 262 machines, and the 2,318,698 draws of 287,920 seeds. The 13 configurations of 2026-11-11 are among them: the seven on one thread of control, and the one with a single thread, give the scratch machine's figures exactly, and the others figures close to its, which changed from run to run. Here two runs give the same figures.
+  - **Negative controls, by planted fault:** `plant_faults.py` names nine faults as the model's (`MODEL`) and fails unless a test of the model fails for each. All nine do.
+    - **The six of 2026-11-11**, with what the model reports and how many of its tests fail: the upkeep going on where the thread arrives (a plain request's tries on two processors; 11 tests). The root reseeding itself from a store whatever its number (a draw that another request made, under no lending, before the request began; 4). A look that notes its own time and not when the root was seeded (the root's seed older than a period in calm weather; 1, **and no other test of the crate fails for it**). A gathering for the root that goes on from what a lent store holds (a draw that another request made; 14). The root's gathering capped at eight draws in all (no reseed of the root fell back to RDRAND; 1). A give-up recorded by a later step (an instruction failed or rested in a step that did not try it; 15).
+    - **Three for the rules added here:** the clock never making a reseed due (2 tests), a processor that needs nothing reseeded from the root (11), a failure leaving the instruction as it was (11).
+  - **The whole fault list:** 120 planted on an exported copy of `f9df059`: the 116 of before and the four of the six above that were not in the list. **118 fail a test, 1 does not compile and 1 is not caught**, the one listed as not observable. The one that does not compile is a reseed of seven draws: `schedule.rs` and `start.rs` write arrays of 64 and 80 bytes into a store. It was so at `a11202a`, where the tool's "115 of 116 caught" counted it with the faults that fail a test: 114 did. The tool now says the three counts apart. A test of the model fails for 40 of the 118, and they break 17 of its rules; the tool's last lines say which rule for how many faults. The other 78 fail scripted tests only: they are in what the model does not hold or see.
+  - **Negative controls, by hand:** three tests hand the model a store, answers and a reseed made up by hand, with one thing made false: 21 false things, each reported under its own rule and no other, and what is as it should be reported as nothing. They are the only controls of ten rules. With the faults, every rule the model can report has been seen to be reported, except the one that says the model itself lost a request.
+  - **Gates:** `cargo xtask check` passed on `f9df059` (2026-11-11, 18:18 to 18:25, 75 s of it waiting for the machine's turn; a clean tree before and after; the commit after it changes Markdown only): every crate's clippy and tests, `origin-random`'s 100 among them, the no-panic check with `origin-random` in it (9 external symbols, all allowed), the image gate (1,259 returns, an INT3 after each), the document, `unsafe`, assembly and random-instruction gates, the loader built three ways and the kernel twice with the same bytes, and Loom. It had passed on `02b267b` before the last two commits (17:54 to 18:01). The fault list was run on an exported copy of `f9df059` in the machine's turn after the check (18:25 to 18:35). **No boot was run:** no code of the kernel or the loader changed.
+  - **Reproduce:** `cargo test --package origin-random`; `cargo test --package origin-random -- --ignored`; `python3 -I security/random/tools/plant_faults.py . --model`; `python3 -I security/random/tools/plant_faults.py .`. With `--nocapture` a model test prints what its configuration did.
+- **Not done:** the same model against the kernel's wiring; a start in bad weather; a request inside a running step; the rules listed above as not held; a coverage measurement of branches. `docs/STATUS.md` and the table row of task 18b still give the counts as they were at `d739b93` (79 tests, 116 faults).
+
 ## `developer-tools/xtask/` (`xtask`)
 
 - **What:** host-side build orchestration, with four commands:
@@ -3250,6 +3376,24 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
 - **Two defects found by the gates, fixed in the commits that introduced them** (the branch is local, so its history was rebuilt rather than patched on top):
   - `cargo xtask check`'s clippy of `origin-sync` built for Loom wanted a `Default` for `Slots`, whose impl had been left out of Loom builds by a `cfg`. The `cfg` is gone, as `Shootdown`'s and `Confirmation`'s have none (`b9ddcbd`). It changes no build but Loom's.
   - `boot-matrix` failed once, on the AMD IOMMU machine with 4 processors: the proof printed `its slot and frames free: false` while every read on the other processor faulted and its final counts showed nothing lost or left retired. The proof had checked that the freed stack's frames were still free, but a released frame is anyone's at once. It now checks the slot, which `Slots::reclaim` frees only after the frames are released, an order the Loom model covers (`87905fd`).
+- **A third defect, brought in by the second's fix and found by CI's real-processor jobs on 2026-11-11; fixed in `4dc5c15` on `claude/stacks-proof-own-slot`:**
+  - **The defect.** Since `87905fd` the proof's wait, and its clause "its slot free again", asked `stack::slot_is_free(top)`, with `top` the stack's `GuardedStack::top()`. That is the first address past the stack, the base of the next slot, so both asked about the next slot.
+  - **How it failed.** With three processors or more, an idle processor can take the proof's slot to reclaim it in its idle loop (`sched::reap`), while the boot processor's own `reclaim` finds nothing more to do. The next slot was free, so the wait ended at once, and the reader on CPU 1 read the old pages before that reclaim had taken them away.
+  - **Where.** CI's two real-processor jobs on `land/s3-part2` failed this way in three runs and seven boots: the Intel and AMD IOMMU machines with 4 processors, the x2APIC machine with 3, and the host's own processor with 4. They never failed with 1 or 2 processors, and passed in one earlier run by timing. QEMU's software processor on the development Mac never showed it.
+  - **The reading is the coordinating session's,** from the logs, checked here against the code. Nothing has measured the race.
+  - **The fix.** `stack::slot_is_free` takes a `StackSlot`, which only `GuardedStack::slot` makes, so it cannot be given a top. `stack::slot_holding(addr)` names the slot an address is in. The proof waits on `made.slot()`, and its line also requires `slot_holding(top - 1)` to be that slot. A wait on any other slot therefore fails the proof on every boot, under QEMU too. xtask expects the new line: "...; its slot, the one its last byte was in: true, free again: true".
+  - **Controls,** each a change to a scratch worktree at `4dc5c15`, never committed, run on 2026-11-11 between 10:31 and 10:33 UTC, the boots on 2 processors:
+    - *The old call,* `slot_is_free(top)`, no longer compiles (`E0308`, mismatched types).
+    - *`GuardedStack::slot` names the next slot:* the boot fails at "...: 4 of 4 reads there faulted and 0 saw the old pages; its slot, the one its last byte was in: false, free again: true: kernel stacks failed".
+    - *The proof waits on `slot_holding(top)`, the original reading in the new interface:* the same line, the same failure.
+    - Both boots failed on the software processor, where the race never shows: the identity clause catches a wrong slot whatever the timing.
+  - **Gates on `4dc5c15`,** with a clean tree, from 10:23 UTC:
+    - clippy for the kernel target passed.
+    - `cargo xtask check` passed: 1,370 host tests in 43 suites, none failed, 10 ignored; the unsafe gate's 324 sites in its 22 listed files; Loom, all 42 models passed and all 68 controls were caught (98 runs).
+    - `cargo xtask boot-test` passed 11 of 11. The kernel boot's line was true in both clauses, and the boot ended "degraded: 60 of 61 proofs passed; failed: speculation controls" (item 154).
+  - **Not shown:**
+    - that this was the whole cause of CI's failures, which only CI's real-processor jobs over several runs can show;
+    - the race itself, which QEMU's software processor does not reproduce.
 - **Review:** none yet. No human has reviewed this code.
 - **Licensing:** MIT OR Apache-2.0.
 
@@ -3300,9 +3444,9 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
     - `stack_region_base(random)`: 2 MiB-aligned, the whole region in the window, about 2^24 placements, never the fixed base `STACK_REGION`, which is kept for a boot without entropy;
     - `is_stack_region_base`;
     - `STACK_REGION_TABLES` of 130, because a slid region may cross a 1 GiB boundary.
-  - `72e56a7` **The base drawn at boot (A4, A5).** `early::build_kernel_tables` draws the base through `stack::draw_region`: RDSEED with 64 tries, else RDRAND with 16, as the loader does for H3; with neither, the fixed base. It makes the region's tables there, and only then places it (`stack::place`).
+  - `72e56a7` **The base drawn at boot (A4, A5).** `early::build_kernel_tables` draws the base through `stack::draw_region`: RDSEED with 64 tries, else RDRAND with 16, as the loader does for H3; with neither, the fixed base. It makes the region's tables there, and only then places it (`stack::place`). *(2026-11-11: since task 18b's merge, `c2245ef`, `draw_region` runs neither instruction: it takes the loader's value (decision item 166), and with none the base is the fixed one. The entry on the conversion has it.)*
     - Every slot address, `vm`'s region check and the backtrace's slot top follow the drawn base.
-    - The boot says what drew it, never the base.
+    - The boot says what drew it, never the base. *(Since `c2245ef` it says whether the loader's value drew it.)*
     - The kernel stacks proof gains a first line that checks the base and prints only true or false.
   - `e52be7e` **The guard probe's line (A6.3).** It names no address, and the early marker list matches.
   - `420c1fd`, `ad8c869` **Offsets in crash reports (A6.2).**
@@ -3338,12 +3482,12 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
     - `tell`;
     - `Counts::pages`;
     - xtask's scan, ELF reader, monitor answer and cross-boot comparison.
-  - **Boot controls**, each caught on its first run (ADR-0013 C30–C34):
-    - C30: a draw that always gives the fixed base;
-    - C31: a drawn base recorded as undrawn;
-    - C32: the guard's address printed again, caught by the scan;
-    - C33: `rip` printed as an address;
-    - C34: one base for every boot, caught by `boot-matrix` after its second run.
+  - **Boot controls**, each caught on its first run (ADR-0013 C44–C48; numbered C30–C34 until 2026-11-11):
+    - C44: a draw that always gives the fixed base;
+    - C45: a drawn base recorded as undrawn;
+    - C46: the guard's address printed again, caught by the scan;
+    - C47: `rip` printed as an address;
+    - C48: one base for every boot, caught by `boot-matrix` after its second run.
   - **Host-test controls:**
     - H1: a draw that can give the fixed base;
     - H2: placements past the window's end, caught by the window check;
@@ -3353,6 +3497,7 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
     - the kernel says `kernel stacks: no entropy from RDSEED or RDRAND: the region is at its fixed base`, with no address;
     - the boot is then refused by the start-record proof, whose records need entropy for their random addresses (ADR-0005 C4), so the stacks proof never runs;
     - the log names no stack-window address.
+    - *(2026-11-11: this is the run of 2026-11-10, against the kernel's own draw. Since `c2245ef` this machine is one of `boot-random`'s two: its boot runs to a verdict, with the stacks proof run and the region at its fixed base.)*
   - **Gates at the code tip `9f882e8`:**
     - `cargo xtask check` passed on a byte-identical tree, before the last history rebuild only moved the same changes into the commits that introduced them: 1,243 test results, 0 failed, 8 ignored, the 42 Loom models' run among them; the no-panic check (`origin-paging` references 2 external symbols, both allowed); the unsafe gate (311 sites, 152 kernel source files); Loom, all 42 models passed and all 68 controls were caught (98 runs).
     - `cargo xtask boot-test` passed, 11 of 11 scenarios. Its kernel boot ended `58 of 58`, with the breakpoint's and the NMI's lines as image offsets and the slide's lines naming no base. `cargo xtask boot-matrix` passed on its first attempt: all 18 full boots `58 of 58`. In the 11 whose console shares QEMU's stdio with the monitor, xtask read the region's base after the boot and found 11 distinct bases, none printed.
@@ -3362,9 +3507,36 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
     - Before the first commit of A6.4, the monitor read timed out. QEMU 11.1 prints `xp`'s address with 8 digits below 4 GiB, where 16 were expected. The answer is now matched by the address's value, and a unit test pins QEMU's form.
 - **Not proven:**
   - physical hardware;
-  - a boot without entropy that runs past `process start`;
+  - a boot without entropy that runs past `process start`; *(2026-11-11: since `c2245ef` such a boot launches nothing and ends with a verdict, under QEMU.)*
   - that QEMU's monitor answers the same way in CI's QEMU, which the matrix there will show.
 - **Review:** none yet. No human has reviewed this code.
+
+## The batch's two direct draws moved to the kernel's generator, in task 18b's merge (decision items 166 and 167; 2026-11-11)
+
+- **What:** the merge of task 18b into the second step-3 batch, commit `c2245ef`, also changes code. 18b removes `cpu::rdrand`, `cpu::rdseed` and `entropy.rs`, so the merged tree does not compile until the batch's two draws change. 13 files are changed by hand against the plain merge, 187 lines added and 176 removed; five of them are the merge's conflicts.
+  - **The stack region's base** (`framekernel/frame/src/stack.rs`, `early.rs`): `draw_region` takes the loader's value through `origin_frame::random::take_stack_value`, once. With a value the base is `layout::stack_region_base` of it; with none the region is at its fixed base. The region records which. The boot says which and prints neither the value nor the base.
+  - **The stacks proof** (`framekernel/src/stacks.rs`, `kernel.rs`): it passes only if the region's record agrees with the generator's: a drawn region off its fixed base with the value recorded as taken, or an undrawn one at its fixed base with no value handed over. The generator's proof fails a second take that still succeeds.
+  - **A mapping's place** (`framekernel/src/memory_object.rs`): `mapping::place_at_random` draws from `origin_frame::random::next_u64`. A draw that fails gives `not_supported`.
+  - **Withheld randomness** (`framekernel/src/sched.rs`, `bootproof.rs`): with no generator the process-start, service-directory and memory-object proofs do not run, the boot says so, and the verdict names the generator. The stacks proof always runs.
+  - **Processors' stacks** (`framekernel/frame/src/smp.rs`): the batch's stacks in the region stand in place of the guarded stacks 18b's side still had from `main`, and 18b's per-processor preparation of the generator is kept.
+  - **xtask** (`developer-tools/xtask/src/main.rs`): the boot markers follow the new lines, and a fixed base is accepted only from a kernel that said its region was fixed.
+  - Comments only in `framekernel/frame/src/random.rs` and `framekernel/paging/src/layout.rs`.
+- **Author:** the landing session of pull request 16 (Claude Code on the development Mac, Apple M1 Max), 2026-11-11.
+- **Specifications and decisions:** ADR-0004 Amendment 2's note on A4 and A5 (decision item 166); ADR-0016 Amendment 1 and R8; ADR-0013 Amendment 1; CLAUDE.md §59 (decision item 113); decision item 167. Nothing was read beyond the repository: no specification, vendor document or open-source code.
+- **Dependencies:** none added.
+- **Toolchain:** Rust 1.99.1; QEMU with OVMF for the boots.
+- **`unsafe`:** the conversion adds none. The gate counts 337 sites in 23 files on the merged tree.
+- **Evidence**, all on the merged tree `8780d11a71a2`, before the merge was committed, on the development Mac:
+  - `cargo xtask build` and `cargo xtask check` passed. The host tests run on their own gave 917 passed, 0 failed, 1 ignored in 12 suites; inside `check`, 1,455 passed, 0 failed, 10 ignored. Loom ran 42 models and 68 controls. The random-instruction gate finds the instructions in 2 files.
+  - `cargo xtask boot-random`: the machine with RDRAND alone said the base was drawn and ended "degraded: 60 of 61 proofs passed; failed: speculation controls"; the machine with neither instruction said the region was at its fixed base and that randomness was withheld, and ended "degraded: 56 of 58 proofs passed; 3 did not run; failed: speculation controls, random-number generator (no randomness)".
+  - `cargo xtask boot-matrix` passed: 20 kernel boots judged, 19 with a drawn base and 1 with the fixed one; 12 distinct bases in the 12 boots whose base was read through QEMU's monitor, none printed. Verdicts: "degraded: 60 of 61 proofs passed; failed: speculation controls" in 19 boots; "degraded: 56 of 58 proofs passed; 3 did not run; failed: speculation controls, random-number generator (no randomness)" in 1 boot; 102 judged boots with no kernel verdict of their own.
+  - *Host tests added:* `a_machine_with_no_generator_reaches_a_verdict_that_names_it` (`bootproof.rs`) and `a_fixed_stack_base_is_accepted_only_from_a_kernel_that_said_so` (xtask).
+- **Not shown:**
+  - anything on an x86-64 processor: every boot ran under QEMU's software processor, and CI's KVM boots run only once the batch is pushed;
+  - the controls of A4 and A5 (ADR-0013 C44 and C45) against this code: they were run against the kernel's own draw;
+  - a map at a place the kernel chooses on a machine with no generator: the memory-object proof does not run there (TASKS item 37 (d)).
+- **Review:** none. No person has read the merge or the conversion.
+- **Licence:** MIT OR Apache-2.0. No external firmware or data.
 
 ## ADR-0017 Z9 inside the framework's address spaces: a user pointer's walk and a mapping call's address (2026-11-11)
 
@@ -3385,7 +3557,7 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
   - *Without the clamp,* the walk took whatever address the program gave. For a kernel address, it read this space's top-level entry for that address, a copy of the kernel's (`set_upper_half`). It went on to search this space's list of tables only where that entry is present, and stopped there, since the kernel's lower tables are not in the list. Where it stops can tell which 512 GiB slots of the kernel half are in use, and so part of the stack region's slide (ADR-0004 Amendment 2, A4: one of slots 384–447).
   - This is a reading of the code, not an experiment: nothing here can see a wrongly guessed path.
 - **Evidence:**
-  - *Host tests:* the `nospec` test above, among `origin-frame`'s 420. No host test can reach the four places: `userspace.rs` is compiled only for the kernel (`#[cfg(target_os = "none")]` in `lib.rs`), so the boot is what runs them.
+  - *Host tests:* the `nospec` test above, among the 222 of `origin-frame`'s library (420 is the kernel's count). No host test can reach the four places: `userspace.rs` is compiled only for the kernel (`#[cfg(target_os = "none")]` in `lib.rs`), so the boot is what runs them.
   - *The commit on its own* (`0fbcd9f`, run on its tree just before it was committed):
     - rustfmt;
     - clippy for the host and the kernel target, and for UEFI on `origin-sync` and `origin-paging`;
@@ -3409,9 +3581,11 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
 - **In the batch:** merged into `land/s3-part2` on 2026-11-11 by a merge commit (`a4540ad`), so the three commits above keep their hashes (`0fbcd9f`, `2efc74b`, `8b4d755`).
   - The coordinating session read the whole change first: two files of the framework (`userspace.rs`, and one value added to `nospec.rs`'s host test) and three records. Outside `docs/` the merged tree is `8b4d755`'s tree, byte for byte.
   - On `a4540ad`'s tree, with nothing uncommitted: `cargo xtask check` passed (1370 host tests in 43 suites, none failed, 10 ignored; the no-panic and dependency checks; the unsafe gate's 324 sites in its 22 listed files; the image, assembly, document, interface and reproducible-build gates; 42 Loom models and 68 negative controls in 98 runs). `cargo xtask boot-test` passed 11 of 11, the kernel boot ending "degraded: 60 of 61 proofs passed; failed: speculation controls" (item 154). The boots ran under QEMU (TCG) on the M1 Max; no physical x86-64 processor ran any of this.
-  - In that run the framework's library has 222 host tests, the `nospec` test among them, and the kernel's has 420. The host-test line above gives 420 for `origin-frame`; its author is asked to correct it.
+  - In that run the framework's library has 222 host tests, the `nospec` test among them, and the kernel's has 420.
   - The four negative controls were not repeated when landing; they stand as their author reports them.
-  - Not in the batch when this was written: `THREAT_MODEL_SYSCALLS.md`'s Z9 list does not show the walk, and its row for the mapping calls still says the framework has no clamp of its own. Both corrections are asked of the session that keeps that file.
+  - Left when the clamps landed, and in the batch since: `THREAT_MODEL_SYSCALLS.md`'s Z9 list did not show the walk, and its row for the mapping calls still said the framework had no clamp of its own. The session that keeps that file corrected both the same day (`ccbb086`, merged here at `3ea8393`). The coordinating session checked each statement of the two rows against `userspace.rs`, `mapping.rs` and `syscall.rs` at `dc50296` before merging.
+  - The host-test line above first gave 420 for `origin-frame`, which is the kernel crate's count. Its author corrected it to the library's 222 (`daa387d`, merged here at `f1b5b0f`).
+  - Both corrections change documents only, so no build or test was repeated for them; the document gate passed on the commit that adds these lines.
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-11. Original code; no third-party source was read or copied (§3).
 - **Specifications:** ADR-0017 Z9, and the vendors' statements as `nospec.rs` cites them; not re-read.
 - **Dependencies:** none new.

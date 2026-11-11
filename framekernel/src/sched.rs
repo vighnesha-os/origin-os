@@ -1165,18 +1165,33 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         Proof::Identity,
         crate::ipc_proof::prove_identity(com1, cpus, bsp, tsc_hz),
     );
-    proofs.record(
-        Proof::Launch,
-        crate::ipc_proof::prove_launch(com1, cpus, bsp, tsc_hz),
-    );
-    proofs.record(
-        Proof::Directory,
-        crate::ipc_proof::prove_directory(com1, cpus, bsp, tsc_hz),
-    );
-    proofs.record(
-        Proof::Memory,
-        crate::ipc_proof::prove_memory(com1, cpus, bsp, tsc_hz),
-    );
+    // The first two launch processes, and a start record goes at a random address (ADR-0005
+    // C4); the third maps memory objects at addresses the kernel chooses at random (ADR-0005
+    // D5). With no random-number generator, or with one whose proof failed, randomness is
+    // withheld: nothing is launched and no such place can be chosen, so none of the three can
+    // run. They are left out of the tally, which the verdict counts as "did not run"
+    // (ADR-0016 R8; ADR-0013 R2 and R6).
+    if origin_frame::random::available() {
+        proofs.record(
+            Proof::Launch,
+            crate::ipc_proof::prove_launch(com1, cpus, bsp, tsc_hz),
+        );
+        proofs.record(
+            Proof::Directory,
+            crate::ipc_proof::prove_directory(com1, cpus, bsp, tsc_hz),
+        );
+        proofs.record(
+            Proof::Memory,
+            crate::ipc_proof::prove_memory(com1, cpus, bsp, tsc_hz),
+        );
+    } else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, service-directory and memory-object proofs did not run"
+        );
+    }
+    // The kernel stacks' region needs no generator: its base is the loader's value or the
+    // fixed one, and the proof says which.
     proofs.record(Proof::Stacks, crate::stacks::prove(com1, cpus, bsp, tsc_hz));
     // Every thread has exited: once each processor has reaped its own, the heap is back
     // exactly where it was before the first spawn, and so are the stacks held.
