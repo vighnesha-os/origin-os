@@ -10,8 +10,10 @@ neither.
 The entries named in MODEL are the negative controls of the randomized model
 (`src/tests/model.rs`): defects that need requests to interleave, a thread to move or an
 instruction to go dry, which the model is there to notice. For each of them a test of the model
-has to fail, whatever else does, and the script says what the model reported. It ends with a
-failure if one of them goes unnoticed by the model.
+has to fail, whatever else does, and the script ends with a failure if one of them goes unnoticed
+by the model. For every fault that a test of the model fails for, it says which rules the model
+reported broken, and at the end how many faults broke each rule: a rule that is not in that list
+has no fault here that shows it can be broken.
 
 Every edit is an exact string that must occur once. When the code changes so that one no longer
 does, the script stops and names it: bring the entry up to date. The files are restored whatever
@@ -246,6 +248,7 @@ try:
     print("baseline: passes", flush=True)
     planted = failing = uncompiled = by_model = only_model = controls = 0
     missed = []
+    rules = {}
     for n, (name, edits) in enumerate(FAULTS, 1):
         if ONLY == "--model":
             if name not in MODEL:
@@ -279,12 +282,14 @@ try:
             verdict = (f"caught by {len(failed)} test(s), {len(models)} of them the model's: "
                        + ", ".join(shown) + (" ..." if len(failed) > len(shown) else ""))
         print(f"{n:3}. {name}: {verdict}", flush=True)
+        if models:
+            for line in said:
+                rules[line] = rules.get(line, 0) + 1
+                print(f"       the model says: {line}", flush=True)
         if name in MODEL:
             controls += 1
             if models:
                 print(f"       the model's tests: {', '.join(models)}", flush=True)
-                for line in said:
-                    print(f"       the model says: {line}", flush=True)
             else:
                 unnoticed.append(name)
                 print("       NOT NOTICED BY THE MODEL", flush=True)
@@ -298,6 +303,9 @@ try:
           "of the model", flush=True)
     for name in unnoticed:
         print(f"not noticed by the model: {name}", flush=True)
+    print("what the model said, and for how many faults:", flush=True)
+    for line, count in sorted(rules.items(), key=lambda rule: (-rule[1], rule[0])):
+        print(f"{count:5}  {line}", flush=True)
 finally:
     for f, text in originals.items():
         (SRC / f).write_text(text)
