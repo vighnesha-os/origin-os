@@ -24,7 +24,7 @@
 | A buggy or compromised `origin.core` | Issue any call with any arguments from the pinned code range | `origin.core` does not exist yet (step 4). Until it does, the creator names each process's range (A6) |
 | Code outside `origin.core` | Run `syscall` from its own pages | Refused by the range pin (A6). The per-call pin (B2) is not built |
 
-**Out of scope:** a kernel already compromised another way, physical attacks, malicious firmware or microcode, and DMA (`THREAT_MODEL_IOMMU.md`). Speculative execution is listed as open (I2) but not modelled in detail.
+**Out of scope:** a kernel already compromised another way, physical attacks, malicious firmware or microcode, and DMA (`THREAT_MODEL_IOMMU.md`). Speculative execution is listed as open (I2) but not modelled in detail. What each exclusion means for the product, where it is covered and what is accepted by name, is in `THREAT_MODEL_SYSTEM.md` (EX1 to EX12). Speculation is decided in `docs/adr/ADR-0017-speculation-processor-hardening.md`, which the owner accepted on 2026-11-10. Its Z1, Z2, Z3, Z5, Z9 and Z10 are built (TASKS item 19b); row I2 and the list under it say what that covers and what it does not.
 
 ## Threats
 
@@ -45,6 +45,7 @@ Status: **Proven** (a boot proof whose negative control is recorded in `SOURCE_P
 | E9 | A program uses the developer calls to hold the serial line with interrupts off | `debug_report` and `debug_write` need the `kernel.debug` capability, given only to proof processes; others get `not_supported`. A line is at most 128 bytes | **Boot** (`nodebug`) |
 | E10 | A program reads the descriptor tables' addresses to find the KASLR slide | UMIP is on, so `sidt` and `sgdt` fault in ring 3 | **Boot** (`sidt`) |
 | E11 | The CET shadow stack is not enabled, although P6 asks for it at entry | None | **Open**, a recorded deviation |
+| E12 | **A nested NMI.** After an NMI is delivered, further NMIs are blocked until the next IRET executes, whoever executes it. If the NMI handler takes an exception of its own, that exception's return unblocks them while the handler is still on its stack. The next NMI enters through IST2, which loads the same top of stack every time, and overwrites the frame and the saved registers the first handler has yet to restore. The interrupted context is lost | None in the entry path: `exception_common` and `exception_saved` treat vector 2 like any other, with no mark that the handler is running and no second place for its frame. What keeps the window shut today is how little the handler does. For vector 2, `dispatch` records a count and the frame's address and returns: it reads no CPU-local data and no user memory, takes no lock and prints nothing. No breakpoint is armed (DR7 is cleared on every processor), and its code and its stack are always mapped. Two ways in remain. The kernel's own: a machine check during those instructions that `machine_check` judges recoverable returns with IRETQ. And one below the kernel: an SMI on an AMD processor, where the manual read does not say that NMIs blocked before the SMI stay blocked after it (Intel's says they do) | **Open.** Ring 3 cannot reach it: no call raises an NMI or a machine check, and the kernel's only NMI source is its own boot proof. The "NMI stack" proof behind E3 takes one NMI on IST2 and never two. FRED closes it where the processor has FRED; the path kept for processors without it needs a guard (ADR-0017 Z6 and Z12, accepted on 2026-11-10 and not built) |
 
 ### Arguments and user memory
 
@@ -97,8 +98,23 @@ Status: **Proven** (a boot proof whose negative control is recorded in `SOURCE_P
 | # | Threat | Defence | Status |
 |---|---|---|---|
 | I1 | Uninitialized kernel memory is copied out | Results are built in zeroed buffers, and the generated encoders zero padding (OIDL §5.2) | **Host** |
-| I2 | Speculative execution: a call number or handle index used out of bounds speculatively, poisoned indirect branches, or a Meltdown-type read of the kernel half, which is mapped in every address space | None: no index masking, no indirect-branch mitigation, no page-table isolation, and `IA32_ARCH_CAPABILITIES` is not read | **Open** |
+| I2 | Speculative execution: a handle index, a count or an address used out of bounds on a wrongly guessed path; indirect branches steered from ring 3 or from a sibling thread; one process's branch history used against the next; a Meltdown-type read of the kernel half, which is mapped in every address space | ADR-0017, as built by task 19b. **Lookups:** every index, count and address in the list below goes through `origin_frame::nospec`, as a conditional move or as LFENCE, by the processor's maker and family. **Indirect branches:** each processor sets enhanced IBRS with `BHI_DIS_S` and `RRSBA_DIS_S`, or automatic IBRS with STIBP, where it reports them, and the boot says what it lacks. **Between processes:** an IBPB when a processor takes up a different process. **On entry:** the general-purpose registers are zeroed once saved. **In the image:** no jump table and an INT3 after every return, in the code the build compiles. **The kernel half:** no page-table isolation; the declared processors do not have the Meltdown behaviour (ADR-0017 Z11) | **Partly.** Host-tested and boot-tested under QEMU's software processor, which has none of these controls: **no control has been written on a processor that has it**, and nothing can test what a processor does on a wrongly guessed path. Not covered: the toolchain's prebuilt `core`, `alloc` and `compiler_builtins` (33 returns without an INT3 and 2 jump tables in today's image), which the owner accepted by name (ADR-0017 Amendment 1, item 152); FRED, LASS, shadow stacks and the nested-NMI guard (19c) |
 | I3 | Process IDs are sequential, so a program learns roughly how many processes were created between two of its observations | Accepted by ADR-0005 C1, since an ID grants nothing | **Open** (accepted) |
+
+### What a program chooses that the kernel then indexes or copies with (ADR-0017 Z9)
+
+Z9's rule: a lookup whose index, count or address comes from ring 3 goes through `origin_frame::nospec`. No lint can tell where a value came from, so this list is the record, and **each new system call adds its own to it.**
+
+| What the program chooses | Where the kernel uses it | Through |
+|---|---|---|
+| A handle's slot | `HandleTable::get` and `remove` (`framekernel/src/handles.rs`): every call that takes a handle, and every handle a `channel_write` carries | `nospec::index` |
+| The address of anything copied in or out | `UserSpace::copy_in` and `copy_out` (`framekernel/frame/src/userspace.rs`), after the range check: the only two places the kernel copies to or from a program | `nospec::user_address` |
+| The length of `debug_write`'s text | The copy into a buffer on the kernel's stack (`syscall.rs`, `debug_write`) | `nospec::length` |
+| The number of handles a `channel_write` carries | The copy into `raw` and the list read from `values`, both on the kernel's stack (`syscall.rs`, `channel_write`) | `nospec::length` |
+| The `size` a reader writes in its `read_sizes` record | The piece of the encoded record copied out (`syscall.rs`, `channel_read`) | `nospec::length` |
+| The call number | The generated dispatcher's `match`: comparisons, with no table (the image gate holds that). A wrong guess among them runs another call's decoder on this call's arguments, and that decoder's lookups are in this list | Not an index |
+
+Looked at and left alone, because the value is the kernel's own by the time it is used: the lengths `copy_out_handles` and `copy_out_records` take (set when the message was written, within the limit checked then); the size of `channel_write`'s payload, which sizes the buffer it is copied into; rights, signals and deadlines, which index nothing.
 
 ### A message's writer and handle records (S3-2)
 
@@ -159,14 +175,17 @@ ADR-0011 N9 and S9, as C11 and C12 decide: `origin.directory` 0.1, served by a p
 Before any program that is not a boot proof runs in ring 3 (N14 step 4):
 1. **E8**, the per-call pin (Amendment 2, B2).
 2. **O2**, quotas on threads, processes and memory (P11), with the calls that create them.
-3. **I2**: a speculative-execution review against the declared processors.
+3. **I2**: a speculative-execution review against the declared processors. The review is `docs/research/2026-11-10-speculation-processor-hardening.md`, and ADR-0017, accepted on 2026-11-10, decides from it. Its Z2, Z3, Z5, Z9 and Z10 are built (task 19b), under QEMU's software processor only. **I2 stays Partly until a boot on a processor that has the controls shows each one read back as written.** CI's KVM boots cannot be that boot: on 2026-11-11 their guests, on an AMD EPYC 7763 and an Intel Xeon Platinum 8573C, offered none of the controls.
 4. **D11**, the directory's back side, decided before the first directory that is a program runs.
+
+Before any claim about real hardware: **E12**, the nested NMI.
 
 Before release: **E11** (CET) and **V2**.
 
 ## References
 
 - Intel 64 and IA-32 Architectures Software Developer's Manual, Vol. 2B (`SYSCALL`, `SYSENTER`, `IRET`) and Vol. 3A (privilege levels and gates, SMEP, SMAP, UMIP).
+- For E12, read on 2026-11-10: Intel SDM Volume 3, order 325384-093, September 2026, §7.7.2 (NMI blocking), §7.14.5 (the interrupt stack table) and §34.8 (NMIs and SMM); AMD64 APM Volume 2, publication 24593, Rev. 3.46, October 2026, §8.2.3, §8.9.4 and §10.3.3. The ledger is `docs/research/2026-11-10-speculation-processor-hardening.md`, §3.10.
 - CERT/CC, Vulnerability Note VU#649219, the SYSRET return to a non-canonical address (2012): <https://www.kb.cert.org/vuls/id/649219>
 - Kocher et al., *Spectre Attacks: Exploiting Speculative Execution*, IEEE S&P 2019; Lipp et al., *Meltdown: Reading Kernel Memory from User Space*, USENIX Security 2018.
 - `docs/research/2026-11-10-caller-identity.md`, for the writer's identity S3-2 adds.

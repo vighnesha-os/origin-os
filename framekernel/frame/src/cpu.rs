@@ -10,6 +10,15 @@
 //! It also switches to the kernel's own page tables ([`load_page_tables`]) and provides
 //! *probes*: single deliberate accesses that report a page fault instead of taking it, which
 //! prove on the real processor that the page protections hold.
+//!
+//! # The flags, and `preserves_flags`
+//!
+//! An `asm!` block declares `preserves_flags` only if every instruction in it is on the list
+//! that `cargo xtask check` keeps (`developer-tools/xtask/src/asmflags.rs`): the instructions
+//! that both Intel's and AMD's manuals say change no status flag (CLAUDE.md §13). A move to or
+//! from a control or debug register is not on it: AMD says it affects no flag, and Intel says it
+//! leaves all six status flags undefined (`docs/research/2026-11-10-asm-flags.md`). Without the
+//! option the compiler assumes the block may change the flags, which is always true.
 
 use core::arch::{asm, naked_asm};
 use core::ptr;
@@ -290,6 +299,8 @@ unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex) {
             "lea {tmp}, [rip + 2f]",
             "push {tmp}",
             "retfq",
+            // Never reached: the far return goes to `2:` (ADR-0017 Z10).
+            "int3",
             "2:",
             "mov ds, {data:x}",
             "mov es, {data:x}",
@@ -312,6 +323,7 @@ unsafe fn load_tables(tables: *mut CpuTables, index: CpuIndex) {
     // GS was just reloaded (base 0): point it at this processor's CPU-local area.
     init_cpu_local(tss_field.addr() as u64, index);
     init_cpu_state();
+    init_speculation();
 }
 
 /// Processors the kernel indexes: every per-CPU array, the CPU-local areas included, has
@@ -512,8 +524,9 @@ fn init_cpu_state() {
             options(nostack),
         );
     }
-    // SAFETY: CPL 0; DR7's reset value disarms every breakpoint, and nothing here uses one.
-    unsafe { asm!("mov dr7, {}", in(reg) DR7_CLEAR, options(nostack, preserves_flags)) };
+    // SAFETY: CPL 0; DR7's reset value disarms every breakpoint, and nothing here uses one. The
+    // flags are not preserved: Intel leaves them undefined after a move to a debug register.
+    unsafe { asm!("mov dr7, {}", in(reg) DR7_CLEAR, options(nostack)) };
     if has_sysenter() {
         // SAFETY: CPL 0; SEP says the MSR exists, and a zero selector only makes SYSENTER
         // raise #GP (Intel SDM Vol. 2B, SYSENTER).
@@ -524,24 +537,25 @@ fn init_cpu_state() {
 /// CR4.
 fn read_cr4() -> u64 {
     let value: u64;
-    // SAFETY: reading CR4 at CPL 0 has no side effect.
-    unsafe { asm!("mov {}, cr4", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: reading CR4 at CPL 0 has no side effect but the one on the flags (see the module
+    // documentation), which this block does not claim to preserve.
+    unsafe { asm!("mov {}, cr4", out(reg) value, options(nomem, nostack)) };
     value
 }
 
 /// CR0.
 fn read_cr0() -> u64 {
     let value: u64;
-    // SAFETY: reading CR0 at CPL 0 has no side effect.
-    unsafe { asm!("mov {}, cr0", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: as `read_cr4`.
+    unsafe { asm!("mov {}, cr0", out(reg) value, options(nomem, nostack)) };
     value
 }
 
 /// DR7.
 fn read_dr7() -> u64 {
     let value: u64;
-    // SAFETY: reading DR7 at CPL 0 has no side effect.
-    unsafe { asm!("mov {}, dr7", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: as `read_cr4`; Intel says the same of the debug registers.
+    unsafe { asm!("mov {}, dr7", out(reg) value, options(nomem, nostack)) };
     value
 }
 
@@ -875,7 +889,8 @@ pub fn idle_disabling() {
 /// Touches only those registers: kernel code is soft-float, so nothing else uses them.
 pub fn xmm_load(values: [u64; 4]) {
     // SAFETY: SSE is enabled on this processor (`enable_simd`); these instructions only load
-    // the named XMM registers from general registers.
+    // the named XMM registers from general registers. No `preserves_flags`: `movq` is an SSE
+    // instruction, and none is on the list of the module documentation.
     unsafe {
         asm!(
             "movq xmm0, {0}",
@@ -884,7 +899,7 @@ pub fn xmm_load(values: [u64; 4]) {
             "movq xmm15, {3}",
             in(reg) values[0], in(reg) values[1], in(reg) values[2], in(reg) values[3],
             out("xmm0") _, out("xmm3") _, out("xmm7") _, out("xmm15") _,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
 }
@@ -892,7 +907,8 @@ pub fn xmm_load(values: [u64; 4]) {
 /// Reads XMM0, XMM3, XMM7 and XMM15 (the SIMD state the boot proof checks).
 pub fn xmm_read() -> [u64; 4] {
     let (a, b, c, d): (u64, u64, u64, u64);
-    // SAFETY: reads the named XMM registers; no memory, no stack.
+    // SAFETY: reads the named XMM registers; no memory, no stack. No `preserves_flags`, as in
+    // `xmm_load`.
     unsafe {
         asm!(
             "movq {0}, xmm0",
@@ -900,7 +916,7 @@ pub fn xmm_read() -> [u64; 4] {
             "movq {2}, xmm7",
             "movq {3}, xmm15",
             out(reg) a, out(reg) b, out(reg) c, out(reg) d,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
     [a, b, c, d]
@@ -1208,8 +1224,8 @@ pub fn interrupts_enabled() -> bool {
 /// CR2: the linear address of the last page fault.
 fn read_cr2() -> u64 {
     let value: u64;
-    // SAFETY: reading CR2 at CPL 0 has no side effects.
-    unsafe { asm!("mov {}, cr2", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: as `read_cr4`.
+    unsafe { asm!("mov {}, cr2", out(reg) value, options(nomem, nostack)) };
     value
 }
 
@@ -1334,6 +1350,167 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
     }
 }
 
+/// `value` if it is below `limit`, and 0 if it is not, chosen by a conditional move that
+/// depends on the comparison and on no prediction: the Mask form of [`crate::nospec`]
+/// (ADR-0017 Z9). It is written in assembly because a compiler may turn the same thing
+/// written in Rust back into a branch.
+#[inline]
+#[must_use]
+pub fn below_or_zero(value: u64, limit: u64) -> u64 {
+    let mut kept = value;
+    // SAFETY: a comparison and a conditional move between registers. Nothing reads or writes
+    // memory or the stack. The flags change, so the block does not say it preserves them.
+    unsafe {
+        asm!(
+            "cmp {kept}, {limit}",
+            "cmovae {kept}, {zero}",
+            kept = inout(reg) kept,
+            limit = in(reg) limit,
+            zero = in(reg) 0u64,
+            options(pure, nomem, nostack),
+        );
+    }
+    kept
+}
+
+/// `value`, once every instruction before this one has completed: LFENCE, the Fence form of
+/// [`crate::nospec`] (ADR-0017 Z9). The value passes through the block, so nothing that
+/// uses the result can be placed before the LFENCE.
+#[inline]
+#[must_use]
+pub fn after_fence(value: u64) -> u64 {
+    let mut kept = value;
+    // SAFETY: LFENCE reads and writes no register, no memory and no flag. RAX is named only
+    // to carry the value through the block.
+    unsafe { asm!("lfence", inout("rax") kept, options(nomem, nostack)) };
+    kept
+}
+
+/// `IA32_SPEC_CTRL`: the speculation controls a processor keeps set.
+const SPEC_CTRL: u32 = 0x48;
+/// `IA32_PRED_CMD`: a write of bit 0 is one IBPB.
+const PRED_CMD: u32 = 0x49;
+/// `IA32_ARCH_CAPABILITIES`.
+const ARCH_CAPABILITIES: u32 = 0x10A;
+/// AMD's MSR C001_1029, whose bit 1 makes LFENCE dispatch-serializing.
+const DE_CFG: u32 = 0xC001_1029;
+const DE_CFG_LFENCE: u64 = 1 << 1;
+/// EFER.AIBRSE: AMD's automatic IBRS.
+const EFER_AIBRSE: u64 = 1 << 21;
+
+/// What this processor reports about speculation (ADR-0017 Z1): the CPUID leaves
+/// `speculation` decodes, each read only if the processor has it, and
+/// `IA32_ARCH_CAPABILITIES` where CPUID says it exists.
+#[must_use]
+pub fn read_speculation() -> crate::speculation::Reported {
+    let leaf0 = cpuid(0);
+    let leaf1 = cpuid(1);
+    let highest_extended = cpuid(0x8000_0000)[0];
+    let mut leaf7 = [[0; 4]; 3];
+    if leaf0[0] >= 7 {
+        leaf7[0] = cpuid_subleaf(7, 0);
+        // Subleaf 0's EAX is the last subleaf the processor has.
+        for subleaf in 1..=2 {
+            if leaf7[0][0] >= subleaf {
+                leaf7[subleaf as usize] = cpuid_subleaf(7, subleaf);
+            }
+        }
+    }
+    let extended = |leaf: u32| {
+        if highest_extended >= leaf {
+            cpuid(leaf)
+        } else {
+            [0; 4]
+        }
+    };
+    let arch_capabilities = if leaf7[0][3] & (1 << 29) != 0 {
+        // SAFETY: CPL 0; CPUID.07H.00H:EDX[29] says this processor has the register, and
+        // reading it has no side effect.
+        unsafe { rdmsr(ARCH_CAPABILITIES) }
+    } else {
+        0
+    };
+    crate::speculation::Reported {
+        leaf0,
+        leaf1: [leaf1[0], leaf1[2]],
+        leaf7,
+        ext8_ebx: extended(0x8000_0008)[1],
+        ext21: extended(0x8000_0021),
+        arch_capabilities,
+    }
+}
+
+/// Sets this processor's speculation controls and records what it found (ADR-0017 Z1, Z2,
+/// Z5, Z9). Every processor runs this on itself as it starts, from [`load_tables`], before it
+/// runs anything else. A processor's reset clears these registers, so a resume from sleep
+/// will have to come back through here.
+///
+/// Each register is written only where `Plan::decide` found the bit that says the
+/// processor has it, and is read back: a processor whose registers do not hold what was
+/// written says so in its record.
+fn init_speculation() {
+    use crate::speculation::{self, Lfence, Plan};
+    let plan = Plan::decide(&read_speculation());
+    let mut held = true;
+    if let Some(value) = plan.spec_ctrl {
+        // SAFETY: CPL 0; the plan names a value only where CPUID enumerates the register,
+        // and sets only bits CPUID enumerates. The bits restrict the processor's branch
+        // predictors and change nothing about memory.
+        unsafe { wrmsr(SPEC_CTRL, value) };
+        // SAFETY: as above; reading it has no side effect.
+        held &= unsafe { rdmsr(SPEC_CTRL) } == value;
+    }
+    if plan.automatic_ibrs {
+        // SAFETY: CPL 0; EFER exists on every x86-64 processor, and CPUID Fn8000_0021_EAX[8]
+        // says this one has AIBRSE, which only restricts the predictors in ring 0.
+        let efer = unsafe { rdmsr(EFER) };
+        // SAFETY: as above; every other bit is written back as it was read.
+        unsafe { wrmsr(EFER, efer | EFER_AIBRSE) };
+        // SAFETY: as above.
+        held &= unsafe { rdmsr(EFER) } & EFER_AIBRSE != 0;
+    }
+    if plan.lfence == Lfence::KernelSets {
+        // SAFETY: CPL 0; the plan asks for this only on an AMD family that AMD's mitigation
+        // G-2 says has the register, and never under a hypervisor. Bit 1 makes LFENCE wait
+        // for the instructions before it; every other bit is written back as it was read.
+        let value = unsafe { rdmsr(DE_CFG) };
+        // SAFETY: as above.
+        unsafe { wrmsr(DE_CFG, value | DE_CFG_LFENCE) };
+        // SAFETY: as above.
+        held &= unsafe { rdmsr(DE_CFG) } & DE_CFG_LFENCE != 0;
+    }
+    let cpu = this_cpu().get();
+    if cpu == CpuIndex::BOOT.get() {
+        // The maker and family are the machine's: the boot processor chooses for all.
+        crate::nospec::set_form(plan.form);
+    }
+    speculation::record(cpu, plan, held);
+}
+
+/// Tells this processor that the thread it is about to resume runs `process` in ring 3, and
+/// issues an IBPB if that is not the process it ran there last (ADR-0017 Z3). Only at the
+/// scheduler's switch point, which has interrupts off, so nothing else on this processor
+/// runs between the note and the barrier.
+pub fn entering_process(process: u64, _switch: &Switch) {
+    if crate::speculation::enters(this_cpu().get(), process) {
+        // SAFETY: CPL 0; `enters` says yes only where this processor recorded that it has
+        // the IBPB command, so the register exists. Bit 0 is the command, and it changes
+        // nothing but what the branch predictors hold.
+        unsafe { wrmsr(PRED_CMD, 1) };
+    }
+}
+
+/// Issues one IBPB on this processor if it has the command, and says whether it did. For
+/// the boot's measurement of what one costs; the scheduler's own are [`entering_process`]'s.
+pub fn issue_ibpb() -> bool {
+    let offered = crate::speculation::recorded(this_cpu().get()).is_some_and(|(plan, _)| plan.ibpb);
+    if offered {
+        // SAFETY: as in `entering_process`.
+        unsafe { wrmsr(PRED_CMD, 1) };
+    }
+    offered
+}
+
 /// Runs `f` with interrupts disabled on this processor, restoring the previous state.
 ///
 /// Every lock that a thread can hold while preemptible is taken inside this: otherwise a
@@ -1355,8 +1532,8 @@ pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
 /// CR3: the physical address of the live PML4 (and, with PCIDs off, nothing else).
 pub fn read_cr3() -> u64 {
     let value: u64;
-    // SAFETY: reading CR3 at CPL 0 has no side effect.
-    unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: as `read_cr4`.
+    unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack)) };
     value
 }
 
@@ -1381,8 +1558,9 @@ pub unsafe fn write_cr3(root: u64) {
 ///
 /// As for [`write_cr3`].
 pub(crate) unsafe fn load_cr3(root: u64) {
-    // SAFETY: the caller's contract.
-    unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+    // SAFETY: the caller's contract. The flags are not preserved: Intel leaves them undefined
+    // after a move to a control register.
+    unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack)) };
 }
 
 /// The furthest a backtrace reads above the starting frame pointer, and the largest single
@@ -1430,9 +1608,10 @@ pub fn ordered_tsc(use_rdtscp: bool) -> u64 {
             asm!("rdtscp", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack, preserves_flags));
         }
     } else {
-        // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory.
+        // SAFETY: LFENCE and RDTSC exist on every x86-64 processor and read no memory. No
+        // `preserves_flags`: Intel's entry for LFENCE does not say what it does to the flags.
         unsafe {
-            asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags));
+            asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
         }
     }
     (u64::from(high) << 32) | u64::from(low)
@@ -1483,7 +1662,7 @@ pub unsafe fn load_page_tables(root: u64) {
     // SAFETY: the caller's contract. EFER is read and written back with only NXE added
     // (NX is supported, so the bit is defined). WP only restricts supervisor writes to
     // pages already marked read-only. Loading CR3 switches to tables the caller vouches
-    // for and flushes every non-global TLB entry.
+    // for and flushes every non-global TLB entry. The flags are not preserved: `or` writes them.
     unsafe {
         asm!(
             "mov ecx, {efer}",
@@ -1502,7 +1681,7 @@ pub unsafe fn load_page_tables(root: u64) {
             out("eax") _,
             out("ecx") _,
             out("edx") _,
-            options(nostack, preserves_flags),
+            options(nostack),
         );
     }
 }
@@ -1661,7 +1840,7 @@ pub fn disable_interrupts() {
 /// so a fault has RIP = `user_copy` and resumes at `probe_recover`.
 #[unsafe(naked)]
 unsafe extern "sysv64" fn user_copy(_dst: u64, _src: u64, _unused: u64, _len: u64) -> u64 {
-    naked_asm!("rep movsb", "mov rax, -1", "ret");
+    naked_asm!("rep movsb", "mov rax, -1", "ret", "int3");
 }
 
 /// The bytes of `mov rax, -1; ret`, for a probe target that must not be executable.
@@ -1735,7 +1914,7 @@ pub unsafe fn enable_global_pages() -> bool {
         return false;
     }
     // SAFETY: the caller's contract. Each write changes only CR4.PGE, which affects only
-    // which translations the TLB keeps.
+    // which translations the TLB keeps. The flags are not preserved: `and` and `or` write them.
     unsafe {
         asm!(
             "mov {tmp}, cr4",
@@ -1746,7 +1925,7 @@ pub unsafe fn enable_global_pages() -> bool {
             clear = in(reg) !CR4_PGE,
             pge = in(reg) CR4_PGE,
             tmp = out(reg) _,
-            options(nostack, preserves_flags),
+            options(nostack),
         );
     }
     true
@@ -1788,13 +1967,14 @@ pub fn flush_tlb_non_global() {
     without_interrupts(|| {
         // SAFETY: CPL 0. CR3 is reloaded with the value it holds, so nothing about what is
         // mapped changes, only what the TLB holds. Interrupts are off, so no handler sees the
-        // processor between the two instructions.
+        // processor between the two instructions. The flags are not preserved: Intel leaves
+        // them undefined after a move to or from a control register.
         unsafe {
             asm!(
                 "mov {tmp}, cr3",
                 "mov cr3, {tmp}",
                 tmp = out(reg) _,
-                options(nostack, preserves_flags),
+                options(nostack),
             );
         }
     });
@@ -1894,7 +2074,8 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
     // CR0: clear EM and TS, set MP, so SSE instructions run and do not fault to an
     // emulator or a (nonexistent) lazy-FPU handler; set NE, so an x87 error raises #MF
     // (INIT leaves it clear on an AP).
-    // SAFETY: the caller's contract; these CR0 bits only configure FPU/SSE behaviour.
+    // SAFETY: the caller's contract; these CR0 bits only configure FPU/SSE behaviour. The flags
+    // are not preserved: `and` and `or` write them.
     unsafe {
         asm!(
             "mov {t}, cr0",
@@ -1904,7 +2085,7 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
             clear = in(reg) !(CR0_EM | CR0_TS),
             set = in(reg) CR0_MP | CR0_NE,
             t = out(reg) _,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
     // CR4: OSFXSR and OSXMMEXCPT for SSE; OSXSAVE when the CPU has XSAVE.
@@ -1912,7 +2093,8 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
     if features.xsave {
         cr4_bits |= CR4_OSXSAVE;
     }
-    // SAFETY: the caller's contract; these CR4 bits enable FXSAVE/SSE and XSAVE.
+    // SAFETY: the caller's contract; these CR4 bits enable FXSAVE/SSE and XSAVE. The flags are
+    // not preserved: `or` writes them.
     unsafe {
         asm!(
             "mov {t}, cr4",
@@ -1920,7 +2102,7 @@ pub unsafe fn enable_simd(id: &crate::features::Cpuid) -> u64 {
             "mov cr4, {t}",
             bits = in(reg) cr4_bits,
             t = out(reg) _,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
     let mut xcr0 = 0;
@@ -1983,14 +2165,16 @@ pub unsafe fn fpu_init_area(area: u64) {
 pub unsafe fn fpu_save(area: u64) {
     if USE_XSAVE.load(core::sync::atomic::Ordering::Relaxed) {
         // XSAVE with the full mask (EDX:EAX = all ones): save every enabled component.
-        // SAFETY: the caller's contract; the area is large enough (CPUID's maximum).
+        // SAFETY: the caller's contract; the area is large enough (CPUID's maximum). No
+        // `preserves_flags` on any of the four blocks that save or restore this state: the
+        // option also covers the x87 status word and MXCSR, which is the state they handle.
         unsafe {
-            asm!("xsave [{a}]", a = in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, preserves_flags));
+            asm!("xsave [{a}]", a = in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
         }
     } else {
         // SAFETY: as above; FXSAVE needs 512 bytes, 16-byte aligned.
         unsafe {
-            asm!("fxsave [{a}]", a = in(reg) area, options(nostack, preserves_flags));
+            asm!("fxsave [{a}]", a = in(reg) area, options(nostack));
         }
     }
 }
@@ -2002,14 +2186,15 @@ pub unsafe fn fpu_save(area: u64) {
 /// As for [`fpu_save`]; `area` must hold state written by [`fpu_save`] or [`fpu_init_area`].
 pub unsafe fn fpu_restore(area: u64) {
     if USE_XSAVE.load(core::sync::atomic::Ordering::Relaxed) {
-        // SAFETY: the caller's contract; the area holds a valid XSAVE image.
+        // SAFETY: the caller's contract; the area holds a valid XSAVE image. The restore
+        // replaces the x87 status word and MXCSR, so it cannot claim to preserve the flags.
         unsafe {
-            asm!("xrstor [{a}]", a = in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, preserves_flags));
+            asm!("xrstor [{a}]", a = in(reg) area, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack));
         }
     } else {
         // SAFETY: as above.
         unsafe {
-            asm!("fxrstor [{a}]", a = in(reg) area, options(nostack, preserves_flags));
+            asm!("fxrstor [{a}]", a = in(reg) area, options(nostack));
         }
     }
 }
@@ -2037,7 +2222,8 @@ pub unsafe fn enable_smep_smap() -> (bool, bool) {
         | if smap { CR4_SMAP } else { 0 }
         | if umip { CR4_UMIP } else { 0 };
     // SAFETY: the caller's contract; setting supported CR4 bits only adds restrictions on
-    // supervisor accesses to user pages and on user-mode descriptor reads.
+    // supervisor accesses to user pages and on user-mode descriptor reads. The flags are not
+    // preserved: `or` writes them.
     unsafe {
         asm!(
             "mov {tmp}, cr4",
@@ -2045,7 +2231,7 @@ pub unsafe fn enable_smep_smap() -> (bool, bool) {
             "mov cr4, {tmp}",
             bits = in(reg) bits,
             tmp = out(reg) _,
-            options(nomem, nostack, preserves_flags),
+            options(nomem, nostack),
         );
     }
     (smep, smap)
@@ -2054,13 +2240,13 @@ pub unsafe fn enable_smep_smap() -> (bool, bool) {
 /// `movzx eax, byte ptr [rdi]` is the first instruction, so a fault has RIP = `read_byte`.
 #[unsafe(naked)]
 unsafe extern "sysv64" fn read_byte(_addr: u64) -> u64 {
-    naked_asm!("movzx eax, byte ptr [rdi]", "mov rax, -1", "ret");
+    naked_asm!("movzx eax, byte ptr [rdi]", "mov rax, -1", "ret", "int3");
 }
 
 /// `mov byte ptr [rdi], sil` is the first instruction, so a fault has RIP = `write_byte`.
 #[unsafe(naked)]
 unsafe extern "sysv64" fn write_byte(_addr: u64, _value: u8) -> u64 {
-    naked_asm!("mov byte ptr [rdi], sil", "mov rax, -1", "ret");
+    naked_asm!("mov byte ptr [rdi], sil", "mov rax, -1", "ret", "int3");
 }
 
 /// Jumps to `addr` with the caller's return address on the stack.
@@ -2073,7 +2259,7 @@ unsafe extern "sysv64" fn jump(_addr: u64) -> u64 {
 /// holds the error code, so `ret` returns the code to that caller.
 #[unsafe(naked)]
 extern "sysv64" fn probe_recover() {
-    naked_asm!("ret");
+    naked_asm!("ret", "int3");
 }
 
 /// The common entry of every vector: swaps the kernel's GS base in if the processor came
@@ -2112,11 +2298,24 @@ extern "sysv64" fn exception_common() {
 /// RFLAGS.AC is cleared if SMAP is on, whatever the interrupted code left in it: otherwise
 /// a program could set AC and turn SMAP off for the kernel code an interrupt runs (an
 /// interrupted user copy keeps its AC in the saved frame, and gets it back from IRETQ).
+///
+/// Once saved, every general-purpose register but RSP is zeroed before `dispatch` runs, so a
+/// wrongly guessed path in the kernel has no value a program chose to work with (ADR-0017 Z2;
+/// AMD's mitigation G-1). The system call's arguments are read from the frame.
 #[unsafe(naked)]
 extern "sysv64" fn exception_saved() {
     naked_asm!(
         "push rax", "push rbx", "push rcx", "push rdx", "push rsi", "push rdi", "push rbp",
         "push r8", "push r9", "push r10", "push r11", "push r12", "push r13", "push r14", "push r15",
+        // ADR-0017 Z2: nothing the interrupted code chose stays in a register. `dispatch`
+        // reads the frame. RBP is cleared by a conditional move, not a branch a processor
+        // could guess, and only for an entry from ring 3 (the saved CS, 144 bytes up): from
+        // ring 0 it is the frame-pointer chain a backtrace follows.
+        "xor eax, eax", "xor ebx, ebx", "xor ecx, ecx", "xor edx, edx", "xor esi, esi",
+        "xor r8d, r8d", "xor r9d, r9d", "xor r10d, r10d", "xor r11d, r11d",
+        "xor r12d, r12d", "xor r13d, r13d", "xor r14d, r14d", "xor r15d, r15d",
+        "test byte ptr [rsp + 144], 3",
+        "cmovnz rbp, rax",
         "mov rdi, rsp",
         "cld",
         "cmp byte ptr [rip + {smap}], 0",
@@ -2134,6 +2333,7 @@ extern "sysv64" fn exception_saved() {
         "swapgs",
         "4:",
         "iretq",
+        "int3",
         smap = sym SMAP_ON,
         dispatch = sym dispatch,
     );

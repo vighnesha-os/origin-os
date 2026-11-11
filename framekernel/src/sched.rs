@@ -104,7 +104,11 @@ fn follow_thread(id: usize, slot: usize, switch: &Switch) {
         None => cpu::clear_kernel_stack(),
     }
     match t.user.get(slot).and_then(Option::as_ref) {
-        Some(user) => user.space.activate(switch),
+        Some(user) => {
+            // ADR-0017 Z3: a barrier, if this processor last ran another process in ring 3.
+            cpu::entering_process(user.process.id(), switch);
+            user.space.activate(switch);
+        }
         None => crate::vm::activate_kernel_space(switch),
     }
 }

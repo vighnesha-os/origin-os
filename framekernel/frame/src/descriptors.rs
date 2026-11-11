@@ -3,6 +3,7 @@
 //!
 //! Pure arithmetic, unit-tested on the host. The binary loads the tables (`lgdt`, `ltr`,
 //! `lidt`).
+#![forbid(unsafe_code)]
 
 /// GDT selector of the kernel code segment.
 pub const KERNEL_CODE: u16 = 0x08;

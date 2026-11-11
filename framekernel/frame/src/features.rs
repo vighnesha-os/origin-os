@@ -5,6 +5,7 @@
 //!
 //! References: Intel SDM Vol. 2A, CPUID (leaf 1, leaf 7 sub-leaf 0, leaf 0Dh sub-leaves 0
 //! and 1); AMD64 APM Vol. 3; the x86-64 microarchitecture levels (the psABI supplement).
+#![forbid(unsafe_code)]
 
 /// The CPUID leaves this module decodes, as the kernel read them.
 #[derive(Clone, Copy, Debug, Default)]

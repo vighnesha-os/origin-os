@@ -2,8 +2,37 @@
 xtask = "run --quiet --package xtask --"
 
 # CLAUDE.md §14: frame pointers on every Origin-owned freestanding image.
+#
+# CLAUDE.md §75: the loader's image is the same bytes from one build to the next
+# (docs/research/2026-11-10-loader-reproducible-build.md). For this target rustc 1.99.1 runs
+# rust-lld's COFF driver with `/DEBUG`, whatever `-C strip` says, and two links of the same
+# objects then differ in the PE header's time stamp (the time of the link) and in the CodeView
+# record's identifier (a hash of the PDB, which holds the path of a directory rustc creates
+# under a random name for each link). The two arguments come after rustc's own, and of two
+# `/DEBUG` options the linker obeys the last:
+# - `/DEBUG:NONE`: no PDB, no CodeView record, and so no debug directory in the image;
+# - `/TIMESTAMP:0`: the header's time stamp is zero.
+# Either one alone leaves two builds different. The image then holds nothing but what
+# UEFI 2.11 §2.1.1 says firmware uses: the header, the sections and the relocations.
+# `/Brepro` in place of `/TIMESTAMP:0` also gives the same bytes twice, and leaves a debug
+# directory with one entry (type 16) that a firmware's loader may read. `cargo xtask check`
+# builds the loader twice and fails if the images differ. RUSTFLAGS in the environment
+# replaces this whole list.
 [target.x86_64-unknown-uefi]
-rustflags = ["-C", "force-frame-pointers=yes"]
+rustflags = [
+    "-C", "force-frame-pointers=yes",
+    "-C", "link-arg=/DEBUG:NONE",
+    "-C", "link-arg=/TIMESTAMP:0",
+]
 
+# The kernel's two further options are ADR-0017 Z10's. `cargo xtask check` reads the built
+# image to hold both (developer-tools/xtask/src/image.rs), because the second is a feature
+# the stable compiler passes to the code generator with a warning, not one it supports.
 [target.x86_64-unknown-none]
-rustflags = ["-C", "force-frame-pointers=yes"]
+rustflags = [
+    "-C", "force-frame-pointers=yes",
+    # No `match` compiles to an indirect jump through a table.
+    "-C", "jump-tables=no",
+    # An INT3 follows every RET, so a processor that runs past one stops there.
+    "-C", "target-feature=+harden-sls-ret",
+]

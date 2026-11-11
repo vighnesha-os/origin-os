@@ -7,6 +7,15 @@
 | Reproduce | Heavy runs wait for their turn on the machine; `cargo xtask exclusive -- <command>` takes one for anything else. `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs under QEMU 11.1.3 + OVMF: on its software CPU (TCG) and, in CI, on real AMD EPYC and Intel Xeon processors through KVM, with the devices and firmware still QEMU's. Nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
 
+## The kernel's random-number generator: the mechanism, and an accepted design (TASKS 18a; 2026-11-10)
+
+The first half of TASKS item 18 (decision item 113), on `claude/objective-gould-4ac8c1`. **Nothing here is in the kernel yet.** The kernel and the loader still draw from RDSEED and RDRAND directly, and the "hardware entropy" proof is still Report.
+
+- **Built and tested on the host:** HMAC-SHA-512 (FIPS 198-1, RFC 2104) and NIST's HMAC_DRBG over SHA-512 (SP 800-90A Rev. 1 §10.1.2) in `origin-crypto`, with no `unsafe`, no allocation and no panic path. The generator makes no entropy and has no default seed. It passes RFC 4231's seven HMAC test cases, six generator outputs published in RFC 6979, **NIST's own 30 ACVP vectors for HMAC_DRBG over SHA-512** (reseeding, additional input and prediction resistance), and a differential corpus from an independent Python implementation, which an installed OpenSSL's generator reproduces. 51 of 53 planted faults fail a test; the other two cannot be observed from safe code.
+- **Accepted by the owner on 2026-11-10, and not built:** `docs/adr/ADR-0016-kernel-random-numbers.md` (decision sheet items 145 to 151). A root generator and one for each processor, in the shape of SP 800-90C's tree of generators; seeds from RDSEED, RDRAND and 64 bytes the loader hands over in boot info 0.6; health tests on the instructions' outputs; no generator and no randomness without a healthy seed; overwriting in three layers. It changes ADR-0002 B4 (boot info 0.6) and ADR-0004 H3 (the loader's slides, and the firmware's generator never alone); both carry a note. The work is TASKS item 18's second half, 18b.
+- **Read:** SP 800-90A Rev. 1, SP 800-90B and SP 800-90C, in the parts that bear on this, and FIPS 198-1; the code was compared with the standard's text afterwards and agrees. The research is `docs/research/2026-11-10-kernel-random-numbers.md`.
+- **Not verified:** nothing has run in a kernel, under QEMU or on hardware, and everything in the ADR beyond the mechanism is unbuilt. Overwriting of secrets is best effort inside `origin-crypto`. No human has reviewed any of it. The evidence is in `docs/engineering/SOURCE_PROVENANCE.md`, "HMAC-SHA-512 and HMAC_DRBG".
+
 ## Address spaces that change while they run (ADR-0011 N14 step 3, task S3-5a; 2026-11-10)
 
 The framework's half of step 3's memory work, with no system call yet (S3-5b adds `memory_map`, `memory_unmap` and `memory_protect` on top of it):
@@ -19,6 +28,22 @@ The framework's half of step 3's memory work, with no system call yet (S3-5b add
 **What is proven, under QEMU 11.1 TCG:** boot proofs, each a Refuse row in ADR-0013: the kernel half, with a control in every boot (a space lacking the slot faults); a page unmapped under a reading thread on another processor is free when the unmap returns and is reused with a secret the thread never reads (and a reader that still maps it does read it, in every boot); permissions withdrawn and added under running threads; a page mapped under one; 5 and 200 pages at once; a frame in two spaces; 64 map-and-unmap rounds that interrupt only the processor in the space. Six edits to the framework each fail the boot (ADR-0013, C18 to C23). The shootdown protocol and the deferred free are the code the Loom models run, with committed negative controls. **What is not:** physical hardware; a human review of the new safe APIs; any limit on a hostile loop (S3-5b); the spurious fault a permission upgrade prevents, which QEMU cannot show. Threat model: `docs/engineering/THREAT_MODEL_ADDRESS_SPACES.md`.
 
 **Its independent review (one AI reviewer, 2026-11-10)** found seven issues; findings 1–5 and 7 and the housekeeping are fixed on `claude/s3-5a-review-fixes`. A space's record and the CR3 write now change together with interrupts off; only the scheduler activates a space, and proofs visit one instead; a stalled shootdown is remembered until a flush completes; the kernel-half proof's probe page is no longer global, the defect CI's run on a real processor exposed, and CI's next run passed on one (`81cb61c`, an AMD EPYC 7763 under KVM); W^X holds across every mapping of a shared frame; and the Loom controls fail with their property's own message. Finding 6, an unbounded wait, is documented and unchanged. The owner settled ADR-0004 H2's table as Amendment 1 (decision sheet items 98–100): the heap stays in the direct map, the stacks move to their own region with guard pages that take no memory (not built yet), and slot 480 holds only the probe page. Each fix by finding: the threat model and `SOURCE_PROVENANCE.md`.
+
+## Speculation and processor hardening (ADR-0017; TASKS item 19; 2026-11-10)
+
+**Decided:** `docs/adr/ADR-0017-speculation-processor-hardening.md` and `docs/engineering/THREAT_MODEL_SYSTEM.md`, both accepted by the owner (decision items 124 to 141), from a ledger of Intel's and AMD's own documents read that day. Amendment 1 (item 152): the toolchain's prebuilt libraries are outside the image rules, by name.
+
+**Built (task 19b) on branch `claude/intelligent-dhawan-a7f6d4`, and merged into the review batch (`land/review-tasks`, pull request 15) on 2026-11-10:**
+
+- Every index, count and address a program chooses goes through one framework primitive, `origin_frame::nospec`, before the kernel looks anything up or copies anything with it: a conditional move, or LFENCE, by the processor's maker and family. The list is in `THREAT_MODEL_SYSCALLS.md`.
+- Each processor reads what it reports as it starts, sets the controls it enumerates (enhanced IBRS with `BHI_DIS_S` and `RRSBA_DIS_S`, or automatic IBRS with STIBP), reads them back and records the result. The boot prints what is on and what the processor lacks, and never refuses on it.
+- An IBPB when a processor takes up a different process.
+- The trap entry zeroes the general-purpose registers once it has saved them.
+- The kernel is built with no jump tables and an INT3 after every return, and `cargo xtask check` reads the built image to hold both, and the entry's register clearing.
+
+**What is shown, and it is little:** host tests of the decision against AMD's published register values for two family 1Ah models and against Intel values built from the SDM's bit positions; boot proofs under QEMU 11.1.3's software processor. **That processor has none of these controls**, so every boot there prints `on: nothing` and ends `degraded: 58 of 59 proofs passed; failed: speculation controls` (kept so by the owner, decision item 154), and **no control has ever been written on a processor that has it.** CI's boots under KVM did not change that. On 2026-11-11 the review batch's CI ran its real-CPU boots at `55db1f1` on an AMD EPYC 7763 (family 25) and an Intel Xeon Platinum 8573C (family 6, model 207), each as a guest under KVM with `-cpu max`. The guests offered none of the controls: every boot printed `on: nothing; ... not offered: enhanced or automatic IBRS, IBPB, branch isolation between sibling threads` and `this processor has no IBPB to measure`. The fence form was the one in use in one of those boots, the x2APIC scenario, which presents an Intel vendor name with family 25, and it passed. No test can show what a processor does on a wrongly guessed path. No processor in the declared scope has been run (§74).
+
+**Not built:** FRED, LASS, shadow stacks, the nested-NMI guard (row E12 of the system-call threat model stays Open) and the per-thread `SPEC_CTRL` value: task 19c. Direct calls between the kernel's crates: TASKS item 33 (decision item 153).
 
 ## The Framekernel framework crate (ADR-0011 N6, N14 step 1; 2026-11-09)
 
@@ -149,12 +174,12 @@ The owner asked for a very careful review of CLAUDE.md and the design documents.
 
 - The editions branch (revision 7.3, ADR-0014, ADR-0015, items 71–97) is committed, pushed and merged with the landing line.
 - The commit that held Intel's VT-d PDF is on no branch, and it was never pushed. `.gitignore` now keeps `specifications/` and PDFs out.
+- **TASKS item 17 (2026-11-10, branch `claude/funny-torvalds-9a28a0`):** no assembly block of the kernel or the loader declares `preserves_flags` unless every instruction in it is one that both Intel's and AMD's manuals say changes no status flag. The review named 12 blocks; 22 lost the option, and no instruction changed. Four gates in `cargo xtask check` now hold the rules: that one; only 22 listed files of the framework hold `unsafe`, and every other file there forbids it; no document or archive is tracked or left in a branch's history; and the §11 lint also refuses `cfg(unix)`, `target_family` and `target_env`. QEMU only, and no human has reviewed it.
 
 **Not built, and needed before ADR-0011 N14 step 4 puts a real program in ring 3:**
 
-- Twelve `asm!` blocks declare `preserves_flags`, and five of them write the flags (TASKS item 17).
 - Randomness comes straight from the processor's instructions, with no generator and no health gate (TASKS item 18).
-- There is no system threat model, and no decision on speculative execution (TASKS item 19).
+- Speculative execution (TASKS item 19): the system threat model and ADR-0017 are written and accepted, and the half that step 4 waits for is built and is in the review batch (see "Speculation and processor hardening" above). Its controls have not run on a processor that has them.
 
 The rest is TASKS items 20 to 30. One of them is an ABI limit: a 32-bit handle still gives a process about 4.29 billion handle creations in its life (item 24).
 

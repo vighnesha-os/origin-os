@@ -149,8 +149,10 @@ fn flush(virt: u64, len: u64) {
     let mut line = virt & !63;
     while line < virt + len {
         // SAFETY: `line` lies in a live, mapped kernel page (the caller's contract), and
-        // CLFLUSH only writes the line back and drops it from the caches.
-        unsafe { asm!("clflush [{}]", in(reg) line, options(nostack, preserves_flags)) };
+        // CLFLUSH only writes the line back and drops it from the caches. No `preserves_flags`:
+        // Intel's entry for CLFLUSH does not say what it does to the flags
+        // (docs/research/2026-11-10-asm-flags.md).
+        unsafe { asm!("clflush [{}]", in(reg) line, options(nostack)) };
         line += 64;
     }
     // MFENCE orders the flushes before every later store (the register write that lets

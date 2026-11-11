@@ -921,9 +921,11 @@ unsafe extern "sysv64" fn enter_kernel(entry: u64, boot_info: u64, stack_top: u6
 /// The value of CR4.
 fn read_cr4() -> u64 {
     let cr4: u64;
-    // SAFETY: the loader runs at CPL 0, where reading CR4 is allowed and has no effect.
+    // SAFETY: the loader runs at CPL 0, where reading CR4 is allowed. Its one effect is on the
+    // flags, which Intel leaves undefined after a move from a control register
+    // (docs/research/2026-11-10-asm-flags.md), so the block does not claim to preserve them.
     unsafe {
-        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
     }
     cr4
 }

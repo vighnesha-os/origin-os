@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–123. Items up to 70: 2026-11-09, after the pre-merge review. |
-| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. |
+| As of | 2026-11-10 for items 71–141 and 145–154, and 2026-11-11 for item 161. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144 and 155–160 are on another branch (`land/s3-part2`) and are not in this sheet yet. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–123 (item 97 delegated to Claude). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: item 161. |
 | Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -67,6 +67,7 @@ IOMMU overhead has never been measured (rule 21). QEMU's numbers would mean litt
 |---|---|---|---|
 | 18, answered | Intel VT-d Rev 5.20 PDF (D51397-019, intel.com, 12.8 MB)? | **Approved; downloaded 2026-11-08**, outside the repository | §16 wants this text before implementation. Every encoding has now been checked against it: seven corrections, none affecting a boot proof. |
 | 19, answered | NIST ACVP vectors (ML-DSA, SHA-2/3), the FIPS 204 errata sheet, Wycheproof (Ed25519)? | **Approved; fetched 2026-11-08**, after each file's name, source and size were confirmed with the owner | §59 requires known-answer tests and independent validation. Host-only test data. The applicable vectors are committed under `security/crypto/tests/vectors/` with the upstream notices; sources and hashes are in `SOURCE_PROVENANCE.md`. |
+| 145, answered | Six files from NIST for the kernel's random-number generator (TASKS 18a, ADR-0016)? To read: SP 800-90A Rev. 1 (2,417,007 bytes), SP 800-90B (1,043,696) and its errata sheet (107,606), SP 800-90C (10,056,754) and FIPS 198-1 (129,454), from nvlpubs.nist.gov and csrc.nist.gov. To convert and commit: the ACVP vectors for HMAC_DRBG, `hmacDRBG-1.0/internalProjection.json` (1,160,048 bytes), from github.com/usnistgov/ACVP-Server at commit `975de31`, the release item 19's vectors are pinned to. | **Approved 2026-11-10: "Approve all six"**, after each file's name, source and size had been put to you; your words reached the generator's session through the coordinating session. The vector file was fetched after that and checked against the hash GitHub lists; its SHA2-512 vectors are committed under `security/crypto/tests/vectors/acvp/` with NIST's notice. The five documents had already been read in memory, with no file written, before your answer reached the session; they are not in the repository. Two copies of SP 800-90A that the fetch tool had saved unasked were deleted unopened | §16 wants the standards' text before a design is accepted, and §59 known-answer tests. Host-only test data. Sizes, hashes and the pages read are in `docs/research/2026-11-10-kernel-random-numbers.md`; the vectors' provenance is in `SOURCE_PROVENANCE.md`, "HMAC-SHA-512 and HMAC_DRBG". The number 145 leaves 142 to 144 to the branches that use them |
 | 20, answered | The `loom` crate as a host-only dev-dependency? | **Approved; added 2026-11-08** after its version, licence, transitive crates and sizes were stated and accepted (`SOURCE_PROVENANCE.md`, "Loom models") | §73 names Loom, and it never reaches the shipping runtime (§5): `cargo xtask check` now fails if a third-party crate enters a shipping crate's dependencies or `Cargo.lock` changes without approval. |
 
 ## Only you can do these
@@ -334,7 +335,7 @@ Finding 19's smaller points were not put as decisions. They stay in the review a
 
 The work these create is in `TASKS.md`, items 17 to 30.
 
-**Two later answers changed this revision's wording, on the same day.** You accepted the six questions of ADR-0016, the kernel's random-number generator, as items 146 to 151. They are recorded with that ADR, which is on the generator's branch until it lands. Two of them are in draft 7.4:
+**Two later answers changed this revision's wording, on the same day.** You accepted the six questions of ADR-0016, the kernel's random-number generator, as items 146 to 151. They are recorded with that ADR, in their own section below. Two of them are in draft 7.4:
 
 - item 149: §59 says the health tests are on what each source returns, catch gross failure only, and claim no SP 800-90B conformance;
 - item 151: §17 names SP 800-90A Rev. 1, SP 800-90B (January 2018), SP 800-90C (September 2025) and FIPS 198-1.
@@ -344,3 +345,96 @@ The work these create is in `TASKS.md`, items 17 to 30.
 - Read revision 7.4's wording and say whether the records pull request may merge (item 106). CLAUDE.md is your text, and merging takes your word.
 - Confirm ADR-0009's text, which you delegated and have not reviewed, and ADR-0007's two additions marked "for the owner's review" (item 122).
 - Name the person who signs off the first driver written from reference reading, when one exists (item 121).
+
+## Speculation and processor hardening (ADR-0017), and what the system threat model accepts (items 124–141): Accepted 2026-11-10, nothing built
+
+Item 112 asked for a system threat model and an ADR on speculation and processor hardening, both before ADR-0011 N14 step 4. TASKS item 19a wrote them on 2026-11-10:
+
+- `docs/engineering/THREAT_MODEL_SYSTEM.md`;
+- `docs/adr/ADR-0017-speculation-processor-hardening.md`;
+- the ledger they rest on, `docs/research/2026-11-10-speculation-processor-hardening.md`, from Intel's and AMD's own documents read that day.
+
+No processor in scope was run, and no cost is measured. Each recommendation was checked against CLAUDE.md 7.4 and the accepted ADRs before it was put. You answered **"Accept all"** in that session, to one question that covered both lists below.
+
+Three of the answers reach past ADR-0017. The ADR said so before you answered:
+
+- item 127 has ADR-0003 K8 and ADR-0005 P4 amended when the FRED entry path is built;
+- item 131 adds a Report row to ADR-0013's table when the proof exists;
+- item 129 uses a compiler feature that is not nightly and not supported either, which CLAUDE.md §12 does not foresee.
+
+**ADR-0017's nine questions.**
+
+| # | Question | Answer |
+|---|---|---|
+| 124, answered | Z1 to Z12 as the policy, built as TASKS item 19b with its own contract? | **Accept** |
+| 125, answered | An IBPB at every change of process, until trust classes exist and the cost is measured (Z3)? IBPB only between different principals was offered and not chosen. | **Accept** |
+| 126, answered | SMT on, with branch isolation between sibling threads, and the remaining timing channels accepted by name (Z5; item 137)? SMT off by default on Origin Server was offered and not chosen. | **Accept** |
+| 127, answered | FRED wherever every processor reports it, with the IDT path kept for the rest, AMD's Zen 5 among them (Z6); ADR-0003 K8 and ADR-0005 P4 amended to say so when it is built? | **Accept** |
+| 128, answered | On AMD, FRED waits for AMD's own text or for proofs on a machine that has it (Z6)? | **Accept** |
+| 129, answered | An INT3 after every RET, through a target feature the stable compiler accepts with a warning, with a gate that reads the kernel's image (Z10)? Hardening only the hand-written assembly was offered and not chosen. | **Accept** |
+| 130, answered | Supervisor shadow stacks under FRED first, and on the IDT path only on evidence (Z8)? | **Accept** |
+| 131, answered | A processor that lacks a control boots and the boot says so, as a Report row in ADR-0013's table (Z1); whether the production installer refuses such a machine is decided with item 90 at M9? | **Accept** |
+| 132, answered | Index masking on AMD and on Intel family 6, LFENCE on Intel family 18 and above and on anything unknown (Z9)? LFENCE on every Intel processor was offered and not chosen. | **Accept** |
+
+**The system threat model's nine acceptances.** Each says what the product does not promise.
+
+| # | What is accepted | Answer |
+|---|---|---|
+| 133, answered | AC1: the platform firmware, system management mode and the processor's microcode are trusted; so is the hypervisor under an Origin guest, and a server's baseboard controller | **Accept** |
+| 134, answered | AC2: while a machine is locked or asleep its secrets are in memory, and someone who can read memory with equipment gets them | **Accept for now.** Decided again in the storage-encryption ADR |
+| 135, answered | AC3: tampering with tools: implants, debug ports, bus probes, chips rewritten off the board, and anything measured at the machine | **Accept** |
+| 136, answered | AC4: a program that induces faults in memory hardware | **Accept.** Revisited when the list of declared machines exists |
+| 137, answered | AC5: timing and contention channels between programs, the two threads of one core included | **Accept for programs in general.** First-party code that handles secrets must be constant-time, and that is not waived |
+| 138, answered | AC6: on a processor that lacks the controls ADR-0017 needs, programs are not protected from each other's speculation | **Accept, for bench machines only** |
+| 139, answered | AC7: an administrator of an Origin Server can read whatever the system can read | **Accept,** with attribution and an audit record as the defence |
+| 140, answered | AC8: whoever operates the host of an Origin Server guest, or the building a server stands in, can read and change everything | **Accept** |
+| 141, answered | AC9: a compromised update server can withhold updates until the signed metadata it serves has expired | **Accept** |
+
+Nothing is built. The work is TASKS item 19b, which writes its contract first (item 122). ADR-0011 N14 step 4 still waits for Z2, Z3, Z5, Z9 and Z10.
+
+**Left for the next revision of CLAUDE.md, which is your text:** §14 and §24 do not yet name ADR-0017.
+
+**Coming back to you:** item 134, with the storage-encryption ADR; and the trust classes that would let item 125 cost less, with measurements.
+
+## The kernel's random-number generator (ADR-0016): Accepted 2026-11-10, the mechanism built, nothing in the kernel
+
+Decision item 113 accepted one generator in outline. [ADR-0016](../adr/ADR-0016-kernel-random-numbers.md) filled the outline in and ended with seven questions, each with a recommended answer checked against CLAUDE.md 7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C. The seventh, a download, is item 145 above. You answered **"Accept all"** to the other six on 2026-11-10, in the session that wrote the ADR. The coordinating session put the same six to you the same day, in shorter words, and records the same answer (its commit `44de977`).
+
+Three of them change something you had already accepted. The ADR said so before you answered:
+
+- item 147 changes ADR-0002 B4: boot info goes to 0.6;
+- items 147 and 148 change ADR-0004 H3: the loader's slides come from a generator of its own, as two requests, and the firmware's generator is never a source by itself;
+- item 146 carries out ADR-0013 Amendment 1, which you accepted with item 113: one row of its table moves when the generator lands.
+
+| # | Question | Answer | Where it is recorded, and its state |
+|---|---|---|---|
+| 146, answered | The design (R1 to R9, R11 to R13): one HMAC_DRBG over SHA-512; a root generator and one for each processor, in the shape of SP 800-90C's tree of generators with two named differences; health tests on the instructions' outputs; no generator and no randomness without a healthy seed; overwriting in three layers; a new crate for the policy? | **Accept** | ADR-0016. The mechanism is built and tested on the host. Everything else is task 18b |
+| 147, answered | Boot info 0.6 (§84): one appended field, `boot_seed`, the physical address of 64 secret bytes inside the boot-info region or 0, which the kernel overwrites once it has taken them? | **Accept** | ADR-0016 R10; ADR-0002 B4. Not built: `origin-version.toml` stays at 0.5 until 18b |
+| 148, answered | What may seed, and what happens when the sources fail? RDRAND with no RDSEED: the generator runs, the boot says so, and requests for prediction resistance are refused. The firmware's seed with neither instruction: no generator. Every instruction failing after boot: the root stops and the processors' generators go on with the seeds they have. | **Accept, as stated.** The stricter alternative to the third part, stopping all randomness, was offered and not chosen | ADR-0016 R3, R6, R8; ADR-0004 H3's note. Not built |
+| 149, answered | What "health tests on the raw source" (CLAUDE.md §59) can mean: tests on the instructions' outputs, because the noise behind them cannot be reached; gross failure only; no SP 800-90B conformance claimed? | **Accept** | ADR-0016 R4. Not built. Draft 7.4's §59 says so since `44de977` on `docs/design-review-2026-11-10` |
+| 150, answered | Keep `unsafe` out of `origin-crypto`: best-effort overwriting there, and the guarantee in the framework, by volatile writes over the state and an overwrite of the stack after every request? | **Accept** | ADR-0016 R9. The best-effort part is built; the framework's part is 18b |
+| 151, answered | CLAUDE.md §17: pin SP 800-90A to Rev. 1 (June 2015) and SP 800-90B to January 2018, and add SP 800-90C (September 2025) and FIPS 198-1 (July 2008)? | **Accept** | ADR-0016 R1. CLAUDE.md is not changed on this branch. Draft 7.4 on `docs/design-review-2026-11-10` names them in §17 since `44de977`; it reaches `main` on your word (item 106) |
+
+**Yours to do:** nothing new. The wording of §17 and §59 is in draft 7.4, which you read with its pull request (item 106).
+
+The numbers start at 146 because 142 to 144 are in use on `land/s3-part2` and 145 is the download above. The header of this sheet was brought up to date on 2026-11-11, when the branches that hold items 124 to 154 had met in the review batch.
+
+## What building ADR-0017's first half found (items 152 to 154): Accepted 2026-11-10
+
+TASKS item 19b built Z1, Z2, Z3, Z5, Z9 and Z10 of ADR-0017, and its gate on the kernel's image found two things the ADR had not foreseen. Both were put to you in the coordinating session, with six of ADR-0016's (items 146 to 151, recorded by the session that wrote that ADR). You answered **"Accept all"** to one question covering the eight. The coordinating session relayed the answer, and the words each was put in, to the session that built 19b, which records the two here. Items 142 to 151 are on other branches.
+
+| # | Question | Answer |
+|---|---|---|
+| 152, answered | The toolchain's prebuilt `core`, `alloc` and `compiler_builtins` are outside ADR-0017 Z10's "an INT3 after every RET" and "no jump table": stable Rust cannot rebuild them, and in the kernel of that day they hold 113 returns, 33 without an INT3, and 2 jump tables. Accept the gap by name, with the count printed on every run and looked at again at each toolchain upgrade, as ADR-0017 Amendment 1? A pinned nightly compiler under §12 was offered and not chosen. | **Accept** |
+| 153, answered | More than half the kernel's calls go through the global offset table, because the compiler emits a relocation the linker cannot turn into a direct call. Make it a task of its own, not a condition of ADR-0011 N14 step 4: find a fix on stable Rust (link-time optimization is the candidate, untried), measure before and after, then have the image gate hold the count? | **Accept.** TASKS item 33; not started |
+| 154, answered | Under QEMU's software processor every boot now ends `degraded: 58 of 59 proofs passed; failed: speculation controls`, because that processor offers none of the controls and the "speculation controls" row fails on a processor that lacks one (item 131). Keep it as written? A row that passes when the kernel set everything the machine offers, and only prints what is lacking, was offered and not chosen. | **Keep as written.** Answered twice the same way: in the session that built 19b, with the boot output beside it, and as one of three recommendations accepted in the coordinating session. No code changes: the verdict already behaves this way |
+
+## The review batch may be offered at 76 commits (item 161): Accepted 2026-11-11
+
+Item 70 offers a code pull request for review once it carries 100 commits of real work. Pull request 15, the review batch, holds four finished tasks (TASKS items 17, 18a, 19 and 31) and one fix to a boot proof, in 76 commits that are not merges. On 2026-11-11 you asked that the open pull requests be ready to merge when they are ready, and were asked whether this one may be marked ready as it is.
+
+| # | Question | Answer |
+|---|---|---|
+| 161, answered | Mark pull request 15 ready at 76 commits, once pull requests 13 and 14 are in? Waiting for task 18b, the generator in the kernel, to bring it past 100 was offered and not chosen. | **Yes, at 76** |
+
+This is for pull request 15 only. Item 70 stands for every later code pull request, and no commit was added to raise the count (CLAUDE.md §7). Merging it still takes your word, after pull requests 13 and 14, each with a merge commit.

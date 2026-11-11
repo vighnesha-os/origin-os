@@ -266,6 +266,12 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // What each processor put in its own control registers, which ring 3 relies on.
         let held = cpu::cpu_states_holding(online.cpus()) == online.cpus().len();
         record_or_stop(&mut com1, &mut proofs, Proof::CpuState, held);
+        // ADR-0017: what each processor reported and set as it started, and the two forms
+        // of the lookup every index and address from ring 3 goes through.
+        let controls = prove_speculation(&mut com1, online.cpus());
+        proofs.record(Proof::SpeculationControls, controls);
+        let clamps = prove_nospec(&mut com1);
+        record_or_stop(&mut com1, &mut proofs, Proof::Nospec, clamps);
         // M2 completion: once every enabled processor has left firmware code, the loader's
         // and the firmware's boot-time memory belongs to the kernel.
         let reclaimed = early.reclaim_loader_memory(&online);
@@ -320,6 +326,8 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // run to the end and are judged together (ADR-0013 R4): the proofs after a failure
         // use only the kernel's fixed programs, and the operator sees every result.
         sched::prove(&mut com1, online.cpus(), tsc_hz, &mut proofs);
+        // ADR-0017 Z3, after the proofs above have run several processes in ring 3.
+        proofs.record(Proof::Ibpb, prove_ibpb(&mut com1, online.cpus()));
         stop_if_refused(&mut com1, proofs);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
         if let Some(q) = quiesced.as_mut()
@@ -397,6 +405,192 @@ fn stop_if_refused(com1: &mut Console, proofs: Tally) {
         let _ = proofs.write_refusal(com1);
         halt();
     }
+}
+
+/// ADR-0017 Z1: prints what the processors reported and set as they started, and says
+/// whether each one's registers read back as written and whether any lacks something the ADR
+/// needs. A machine that lacks a control still boots (decision item 131): this is a report.
+fn prove_speculation(com1: &mut Console, cpus: &[cpu::CpuIndex]) -> bool {
+    use origin_frame::speculation;
+    let mut alike = true;
+    let mut first = None;
+    let mut sound = !cpus.is_empty();
+    for c in cpus {
+        let Some((plan, held)) = speculation::recorded(c.get()) else {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: speculation: processor {} left no record of its controls",
+                c.get()
+            );
+            sound = false;
+            continue;
+        };
+        if !held {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: speculation: processor {}: a control register did not read back as written",
+                c.get()
+            );
+        }
+        sound &= held && plan.complete();
+        alike &= *first.get_or_insert(plan) == plan;
+    }
+    match first {
+        Some(plan) if alike && cpus.len() == 1 => {
+            let _ = writeln!(com1, "origin-kernel: speculation: 1 processor: {plan}");
+        }
+        Some(plan) if alike => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: speculation: {} processors alike: {plan}",
+                cpus.len()
+            );
+        }
+        _ => {
+            for c in cpus {
+                if let Some((plan, _)) = speculation::recorded(c.get()) {
+                    let _ = writeln!(
+                        com1,
+                        "origin-kernel: speculation: processor {}: {plan}",
+                        c.get()
+                    );
+                }
+            }
+        }
+    }
+    sound
+}
+
+/// ADR-0017 Z9: runs both forms of the lookup, as the instructions the kernel uses, over the
+/// ends of the range, and prints what each costs.
+///
+/// It shows what the sequences compute. What a processor does on a wrongly guessed path it
+/// cannot show: that rests on Intel's and AMD's documents.
+fn prove_nospec(com1: &mut Console) -> bool {
+    use origin_frame::nospec::{self, Form};
+    use origin_frame::usercopy::{USER_END, USER_START};
+    const FORMS: [Form; 2] = [Form::Mask, Form::Fence];
+    const LENGTHS: [usize; 6] = [0, 1, 2, 255, 0xFFFF, usize::MAX];
+    const INDICES: [usize; 9] = [
+        0,
+        1,
+        2,
+        254,
+        255,
+        0xFFFE,
+        0xFFFF,
+        usize::MAX - 1,
+        usize::MAX,
+    ];
+    let mut sound = true;
+    for form in FORMS {
+        for len in LENGTHS {
+            for index in INDICES {
+                let got = nospec::index_in(form, index, len);
+                sound &= got == (index < len).then_some(index);
+            }
+        }
+        // A count may reach its limit, and an index may not.
+        for max in [0, 1, 64, usize::MAX - 1, usize::MAX] {
+            for len in [0, 1, 64, 65, usize::MAX - 1, usize::MAX] {
+                sound &= nospec::length_in(form, len, max) == (len <= max).then_some(len);
+            }
+        }
+        for address in [USER_START, USER_END - 1] {
+            sound &= nospec::user_address_in(form, address) == address;
+        }
+    }
+    // The mask puts 0 in place of anything at or above the limit, and of nothing below it.
+    for limit in [0, 1, 0x100, USER_END, u64::MAX] {
+        for value in [0, 1, 0xFF, 0x100, USER_END - 1, USER_END, 1 << 63, u64::MAX] {
+            let want = if value < limit { value } else { 0 };
+            sound &= cpu::below_or_zero(value, limit) == want;
+            sound &= cpu::after_fence(value) == value;
+        }
+    }
+    for outside in [USER_END, 0xFFFF_8000_0000_0000, u64::MAX] {
+        sound &= nospec::user_address_in(Form::Mask, outside) == 0;
+    }
+    // The form in use is the one the boot processor's maker and family call for.
+    let reported = cpu::read_speculation();
+    let chosen = nospec::choose(reported.maker(), reported.family());
+    sound &= nospec::form() == chosen;
+
+    const ROUNDS: u64 = 1 << 16;
+    let cost = |form: Form| {
+        let mut sum = 0usize;
+        let start = time::monotonic_nanos();
+        for round in 0..ROUNDS {
+            let index = core::hint::black_box(round as usize & 0xFF);
+            sum = sum.wrapping_add(nospec::index_in(form, index, 256).unwrap_or(0));
+        }
+        let taken = time::monotonic_nanos().saturating_sub(start);
+        core::hint::black_box(sum);
+        // Tenths of a nanosecond for one lookup, the loop around it included.
+        taken.saturating_mul(10) / ROUNDS
+    };
+    let (masked, fenced) = (cost(Form::Mask), cost(Form::Fence));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: nospec: both forms keep an index and an address in range: {}; in use: {} ({:?}, family {}); a lookup costs {}.{} ns masked and {}.{} ns fenced, its loop included",
+        if sound { "yes" } else { "NO" },
+        match nospec::form() {
+            Form::Mask => "mask",
+            Form::Fence => "fence",
+        },
+        reported.maker(),
+        reported.family(),
+        masked / 10,
+        masked % 10,
+        fenced / 10,
+        fenced % 10,
+    );
+    if !sound {
+        let _ = writeln!(com1, "origin-kernel: nospec failed");
+    }
+    sound
+}
+
+/// ADR-0017 Z3: on every processor, one IBPB for each change of the process it runs in
+/// ring 3 where the processor has the command, and none where it has not; and the scheduler
+/// did note the processes the proofs before this one ran. Prints what one IBPB costs.
+fn prove_ibpb(com1: &mut Console, cpus: &[cpu::CpuIndex]) -> bool {
+    use origin_frame::speculation;
+    let mut sound = true;
+    let (mut changes, mut barriers, mut resumes) = (0u64, 0u64, 0u64);
+    for c in cpus {
+        let count = speculation::count(c.get());
+        let offered = speculation::recorded(c.get()).is_some_and(|(plan, _)| plan.ibpb);
+        sound &= count.barriers == if offered { count.changes } else { 0 };
+        changes += u64::from(count.changes);
+        barriers += u64::from(count.barriers);
+        resumes += count.resumes;
+    }
+    // The proofs before this one ran more than one process in ring 3: each was a change on
+    // the processor that took it up.
+    sound &= changes >= 2;
+    let _ = write!(
+        com1,
+        "origin-kernel: ibpb: {changes} changes of process on {} processor{}, {barriers} barriers, {resumes} resumes without one",
+        cpus.len(),
+        if cpus.len() == 1 { "" } else { "s" }
+    );
+    const SAMPLES: u64 = 16;
+    let start = time::monotonic_nanos();
+    let mut issued = 0;
+    for _ in 0..SAMPLES {
+        issued += u64::from(cpu::issue_ibpb());
+    }
+    let taken = time::monotonic_nanos().saturating_sub(start);
+    let _ = if issued == SAMPLES {
+        writeln!(com1, "; one IBPB costs {} ns", taken / SAMPLES)
+    } else {
+        writeln!(com1, "; this processor has no IBPB to measure")
+    };
+    if !sound {
+        let _ = writeln!(com1, "origin-kernel: ibpb failed");
+    }
+    sound
 }
 
 /// Builds a read-only `/sys`-style tree in the VFS from facts several subsystems

@@ -1,25 +1,31 @@
-//! `cargo xtask check`'s gate on `unsafe` in the kernel (ADR-0011 N6 and N13): only the
-//! framework crate may use it, and every other kernel crate builds on the framework, never
-//! the reverse.
+//! `cargo xtask check`'s gate on `unsafe` in the kernel (ADR-0011 N6 and N13; CLAUDE.md §13,
+//! decision item 111): only the files listed here may use it, all of them in the framework
+//! crate, and every other kernel crate builds on the framework, never the reverse.
 //!
 //! - The kernel is the crates under [`KERNEL_ROOT`] and the leaf crates it links
 //!   ([`KERNEL_LEAVES`]). Anywhere in them but under [`FRAMEWORK`], a file with an `unsafe`
 //!   token (or a `global_asm!`, which needs no `unsafe` keyword) fails the gate.
-//! - The kernel's library crate root carries `#![forbid(unsafe_code)]`, which the compiler then
-//!   enforces for every module above the framework. (The kernel image's link root holds `_start`,
-//!   so it lives under [`FRAMEWORK`].)
+//! - Under [`FRAMEWORK`], only the files on [`UNSAFE_FILES`] may hold one. Every other file
+//!   there starts with `#![forbid(unsafe_code)]`, so the compiler refuses an `unsafe` added to it,
+//!   and the gate refuses the attribute being taken away. A new file is one or the other.
+//! - Each kernel crate outside the framework carries the same attribute at its library root, which
+//!   the compiler then enforces for every module of the crate. (The kernel image's link root
+//!   holds `_start`, so it lives under [`FRAMEWORK`].)
 //! - Dependencies run one way, per [`LAYERS`]: the framework depends only on the leaf crates
 //!   named there, and no crate below it depends on the framework or on what is above it.
 //!
 //! A "site" here is one `unsafe` token (or `global_asm!`) outside comments, strings and
 //! character literals, whatever it heads: a block, an `unsafe fn`, an `unsafe impl`, an
 //! `unsafe extern` or an attribute such as `#[unsafe(no_mangle)]`.
+//!
+//! The gate ends with the one on what assembly blocks promise the compiler about the flags
+//! (`asmflags`, CLAUDE.md §13).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use crate::{Result, cargo, collect_files, repo_root};
+use crate::{Result, asmflags, cargo, collect_files, lex, repo_root};
 
 /// Under this directory is the privileged framework, the one place `unsafe` may appear: the
 /// crate `origin-frame`, and its lock package, `origin-sync`, kept as a package of its own
@@ -38,6 +44,107 @@ const KERNEL_LEAVES: &[&str] = &[
 /// The kernel library's crate root, whose `forbid(unsafe_code)` covers every module above the
 /// framework.
 const KERNEL_LIB_ROOT: &str = "framekernel/src/lib.rs";
+
+/// The files that may hold `unsafe`, and what each needs it for: the kernel's trusted base, file
+/// by file (ADR-0011 N6, N12). All are under [`FRAMEWORK`].
+///
+/// A file comes onto this list with a reason a reviewer accepts, and leaves it when its last
+/// `unsafe` goes: the gate fails on a listed file that holds none.
+const UNSAFE_FILES: &[(&str, &str)] = &[
+    (
+        "framekernel/frame/entry/main.rs",
+        "the kernel image's link root: `_start`, the symbol the boot loader jumps to",
+    ),
+    (
+        "framekernel/frame/src/cpu.rs",
+        "the processor: descriptor tables, control registers, MSRs, trap entry, FPU state, probes",
+    ),
+    (
+        "framekernel/frame/src/dma.rs",
+        "pages a device reads and writes: allocation, and volatile access to memory a device shares",
+    ),
+    (
+        "framekernel/frame/src/early.rs",
+        "early boot: the loader's boot information, read through the pointer it hands over",
+    ),
+    (
+        "framekernel/frame/src/iommu.rs",
+        "Intel VT-d: remapping structures the hardware reads, and their cache-line flushes",
+    ),
+    (
+        "framekernel/frame/src/iommu/amd.rs",
+        "AMD-Vi: remapping structures the hardware reads",
+    ),
+    (
+        "framekernel/frame/src/irq.rs",
+        "device interrupt handlers kept in atomics: one function pointer made from its stored bits",
+    ),
+    (
+        "framekernel/frame/src/memory.rs",
+        "the kernel's `GlobalAlloc`, and heap addresses turned into pointers",
+    ),
+    (
+        "framekernel/frame/src/mmio.rs",
+        "device registers: volatile access to mapped device memory",
+    ),
+    (
+        "framekernel/frame/src/objref.rs",
+        "a reference-counted object with a fallible constructor: raw allocation, `Send` and `Sync`",
+    ),
+    (
+        "framekernel/frame/src/once.rs",
+        "a value set once and read without a lock: `UnsafeCell`, `Sync`",
+    ),
+    (
+        "framekernel/frame/src/port.rs",
+        "x86 port I/O: `in` and `out`",
+    ),
+    (
+        "framekernel/frame/src/proof_programs.rs",
+        "the ring-3 proof programs: assembly carried as data, and the linker's symbols around it",
+    ),
+    (
+        "framekernel/frame/src/smp.rs",
+        "application-processor start-up: the real-mode trampoline, its data page, the AP entry",
+    ),
+    (
+        "framekernel/frame/src/stack.rs",
+        "kernel stacks and FPU areas: raw allocation, guard pages, first frames",
+    ),
+    (
+        "framekernel/frame/src/timer.rs",
+        "the local APIC and the timers: MSRs, ports, interrupt-controller registers",
+    ),
+    (
+        "framekernel/frame/src/tlb.rs",
+        "TLB shootdown on the machine: IPIs, global pages",
+    ),
+    (
+        "framekernel/frame/src/userspace.rs",
+        "user address spaces: page-table frames reached through the direct map, user copies",
+    ),
+    (
+        "framekernel/frame/src/vm.rs",
+        "the kernel's own address space: installing and changing live page tables",
+    ),
+    (
+        "framekernel/frame/sync/src/lib.rs",
+        "the locks: `UnsafeCell`, `Send` and `Sync` for the guards",
+    ),
+    (
+        "framekernel/frame/sync/src/models.rs",
+        "the Loom models (tests only): a frame written through Loom's cell",
+    ),
+    (
+        "framekernel/frame/tests/objref_out_of_memory.rs",
+        "a host test's own global allocator, which refuses on demand",
+    ),
+];
+
+/// Files under [`FRAMEWORK`] that hold no `unsafe` and still cannot carry the attribute: it would
+/// reach the listed modules declared beneath them, and the crate would not compile. The compiler
+/// cannot hold these to the rule, so the gate counts their sites itself.
+const ABOVE_UNSAFE_FILES: &[&str] = &["framekernel/frame/src/lib.rs"];
 
 /// What each kernel crate may depend on, directly or not (normal edges, packages in this
 /// workspace). Every package under `framekernel/` must be listed: a crate of unknown place
@@ -83,24 +190,32 @@ const ABOVE_THE_FRAMEWORK: &[&str] = &["framekernel"];
 /// `origin_frame::sync`.
 const FRAMEWORK_PACKAGE: &str = "origin-frame";
 const LOCK_PACKAGE: &str = "origin-sync";
-/// What the kernel library's crate root must carry.
+/// What every kernel file off [`UNSAFE_FILES`] carries, itself or through its crate's root.
 const FORBID: &str = "#![forbid(unsafe_code)]";
 
 /// The gate: see the module documentation.
 pub(crate) fn gate() -> Result {
     let root = repo_root();
-    let (outside, framework_sites, scanned) = scan(&root)?;
-    let problems = site_problems(&outside, framework_sites);
+    let scanned = scan(&root)?;
+    let problems = site_problems(&scanned.outside, scanned.framework_sites);
     if !problems.is_empty() {
         return Err(format!(
             "`unsafe` outside the framework (ADR-0011 N6, N13):\n  {}",
             problems.join("\n  ")
         ));
     }
-    let text = read(&root.join(KERNEL_LIB_ROOT))?;
-    if !text.contains(FORBID) {
+    let problems = framework_problems(&scanned.framework);
+    if !problems.is_empty() {
         return Err(format!(
-            "{KERNEL_LIB_ROOT} no longer carries `{FORBID}` (ADR-0011 N6)"
+            "`unsafe` in the framework is for the files the gate lists, and every other file there forbids it (CLAUDE.md §13, decision item 111; the list is UNSAFE_FILES in developer-tools/xtask/src/unsafety.rs):\n  {}",
+            problems.join("\n  ")
+        ));
+    }
+    let problems = root_problems(&root)?;
+    if !problems.is_empty() {
+        return Err(format!(
+            "a kernel crate outside the framework must forbid `unsafe` at its root (ADR-0011 N6):\n  {}",
+            problems.join("\n  ")
         ));
     }
     let problems = dependency_problems(&root)?;
@@ -110,15 +225,43 @@ pub(crate) fn gate() -> Result {
             problems.join("\n  ")
         ));
     }
+    let forbidding = scanned.framework.values().filter(|f| f.forbids).count();
     println!(
-        "xtask: unsafe gate: no `unsafe` outside the framework ({framework_sites} sites in it, {scanned} kernel source files scanned)"
+        "xtask: unsafe gate: no `unsafe` outside the framework; in it, {} sites in the {} files listed, and none in its other {}, of which {forbidding} start with `{FORBID}` and {} cannot, being above listed modules ({} kernel source files scanned)",
+        scanned.framework_sites,
+        UNSAFE_FILES.len(),
+        scanned.framework.len().saturating_sub(UNSAFE_FILES.len()),
+        ABOVE_UNSAFE_FILES.len(),
+        scanned.files
     );
-    Ok(())
+    // What the assembly inside those sites promises the compiler about the flags.
+    asmflags::gate()
 }
 
-/// Every kernel source file's `unsafe` count: those outside the framework by repository
-/// path, the framework's total, and how many files were read.
-fn scan(root: &Path) -> Result<(BTreeMap<String, usize>, usize, usize)> {
+/// What one file of the framework holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameworkFile {
+    /// Its `unsafe` sites.
+    sites: usize,
+    /// Whether it starts with the attribute.
+    forbids: bool,
+}
+
+/// What [`scan`] read.
+#[derive(Debug)]
+struct Scanned {
+    /// Files outside the framework that hold `unsafe`, by repository path, with their sites.
+    outside: BTreeMap<String, usize>,
+    /// Every file of the framework, by repository path.
+    framework: BTreeMap<String, FrameworkFile>,
+    /// The framework's sites in all.
+    framework_sites: usize,
+    /// How many files were read.
+    files: usize,
+}
+
+/// Reads every kernel source file.
+fn scan(root: &Path) -> Result<Scanned> {
     let mut files = Vec::new();
     let framework = root.join(FRAMEWORK);
     for dir in std::iter::once(KERNEL_ROOT).chain(KERNEL_LEAVES.iter().copied()) {
@@ -135,164 +278,152 @@ fn scan(root: &Path) -> Result<(BTreeMap<String, usize>, usize, usize)> {
             "unsafe gate: no Rust files under {KERNEL_ROOT}: nothing was checked"
         ));
     }
-    let mut outside = BTreeMap::new();
-    let mut framework_sites = 0;
+    let mut scanned = Scanned {
+        outside: BTreeMap::new(),
+        framework: BTreeMap::new(),
+        framework_sites: 0,
+        files: files.len(),
+    };
     for file in &files {
         let text = fs::read_to_string(file)
             .map_err(|e| format!("unsafe gate: {}: {e}", file.display()))?;
-        let count = count_sites(&text);
+        let sites = count_sites(&text);
+        let relative = file
+            .strip_prefix(root)
+            .map_err(|e| format!("unsafe gate: {}: {e}", file.display()))?
+            .to_string_lossy()
+            .into_owned();
         if file.starts_with(&framework) {
-            framework_sites += count;
-        } else if count > 0 {
-            let relative = file
-                .strip_prefix(root)
-                .map_err(|e| format!("unsafe gate: {}: {e}", file.display()))?;
-            outside.insert(relative.to_string_lossy().into_owned(), count);
+            scanned.framework_sites += sites;
+            let forbids = carries_forbid(&text);
+            scanned
+                .framework
+                .insert(relative, FrameworkFile { sites, forbids });
+        } else if sites > 0 {
+            scanned.outside.insert(relative, sites);
         }
     }
-    Ok((outside, framework_sites, files.len()))
+    Ok(scanned)
+}
+
+/// Whether `source` starts with `#![forbid(unsafe_code)]`: among the inner attributes that open
+/// the file, before any item. The text in a comment or a string is not the attribute, and neither
+/// is one inside a module or a function further down, which covers only that.
+fn carries_forbid(source: &str) -> bool {
+    let tokens = lex::tokens(source);
+    let mut i = 0;
+    while tokens.get(i).is_some_and(|t| t.is_punct('#'))
+        && tokens.get(i + 1).is_some_and(|t| t.is_punct('!'))
+        && tokens.get(i + 2).is_some_and(|t| t.is_punct('['))
+    {
+        let Some(close) = lex::closing(&tokens, i + 2) else {
+            return false;
+        };
+        if let Some([forbid, open, lint, shut]) = tokens.get(i + 3..close)
+            && forbid.is_ident("forbid")
+            && open.is_punct('(')
+            && lint.is_ident("unsafe_code")
+            && shut.is_punct(')')
+        {
+            return true;
+        }
+        i = close + 1;
+    }
+    false
+}
+
+/// What is wrong among the framework's files: `unsafe` in a file off the list, a file off the
+/// list that does not forbid it, or a list that names a file with none.
+fn framework_problems(files: &BTreeMap<String, FrameworkFile>) -> Vec<String> {
+    let mut problems = Vec::new();
+    for &(listed, _) in UNSAFE_FILES {
+        match files.get(listed) {
+            None => problems.push(format!(
+                "{listed} is on the list and does not exist: take it off"
+            )),
+            Some(file) if file.sites == 0 => problems.push(format!(
+                "{listed} is on the list and holds no `unsafe`: take it off, and start it with `{FORBID}`"
+            )),
+            Some(_) => {}
+        }
+    }
+    for &above in ABOVE_UNSAFE_FILES {
+        if !files.contains_key(above) {
+            problems.push(format!(
+                "{above} is named as a file above the listed ones and does not exist"
+            ));
+        }
+    }
+    for (path, file) in files {
+        if UNSAFE_FILES.iter().any(|&(listed, _)| listed == path) {
+            continue;
+        }
+        if file.sites > 0 {
+            problems.push(format!(
+                "{path}: {} `unsafe` sites in a file that is not on the list",
+                file.sites
+            ));
+        }
+        if !file.forbids && !ABOVE_UNSAFE_FILES.contains(&path.as_str()) {
+            problems.push(format!(
+                "{path} does not start with `{FORBID}`, and is not on the list"
+            ));
+        }
+    }
+    problems
+}
+
+/// The library root of each kernel crate outside the framework, which must carry the attribute:
+/// `src/lib.rs` beside each manifest.
+fn root_problems(root: &Path) -> Result<Vec<String>> {
+    let framework = root.join(FRAMEWORK);
+    let mut manifests = Vec::new();
+    for dir in std::iter::once(KERNEL_ROOT).chain(KERNEL_LEAVES.iter().copied()) {
+        collect_files(
+            &root.join(dir),
+            &|_| false,
+            &|name| name == "Cargo.toml",
+            &mut manifests,
+        )
+        .map_err(|e| format!("unsafe gate: {dir}: {e}"))?;
+    }
+    let mut problems = Vec::new();
+    let mut checked = 0;
+    for manifest in manifests.iter().filter(|m| !m.starts_with(&framework)) {
+        let lib = manifest.with_file_name("src").join("lib.rs");
+        let shown = lib.strip_prefix(root).unwrap_or(&lib).display().to_string();
+        match fs::read_to_string(&lib) {
+            Ok(text) if carries_forbid(&text) => checked += 1,
+            Ok(_) => problems.push(format!("{shown} does not start with `{FORBID}`")),
+            Err(e) => problems.push(format!(
+                "{shown}: {e} (the gate looks for a kernel crate's library root there)"
+            )),
+        }
+    }
+    if checked == 0 && problems.is_empty() {
+        problems.push(format!(
+            "no kernel crate found outside {FRAMEWORK}: the gate's roots are wrong"
+        ));
+    }
+    if !root.join(KERNEL_LIB_ROOT).is_file() {
+        problems.push(format!("{KERNEL_LIB_ROOT} does not exist"));
+    }
+    Ok(problems)
 }
 
 /// Counts `unsafe` tokens and `global_asm!` invocations in `source`, outside comments, strings
 /// and character literals. Raw identifiers (`r#unsafe`) are not the keyword and do not count.
 pub(crate) fn count_sites(source: &str) -> usize {
-    let bytes = source.as_bytes();
-    let mut i = 0;
-    let mut count = 0;
-    while let Some(&byte) = bytes.get(i) {
-        match byte {
-            b'/' if bytes.get(i + 1) == Some(&b'/') => i = line_end(bytes, i),
-            b'/' if bytes.get(i + 1) == Some(&b'*') => i = block_comment_end(bytes, i + 2),
-            b'"' => i = string_end(bytes, i + 1),
-            b'\'' => i = char_or_lifetime_end(bytes, i),
-            b'_' | b'a'..=b'z' | b'A'..=b'Z' => {
-                let (word, end) = identifier(bytes, i);
-                match word {
-                    "r" | "br" | "cr" if raw_string_start(bytes, end).is_some() => {
-                        i = raw_string_end(bytes, end).unwrap_or(bytes.len());
-                    }
-                    "b" | "c" if bytes.get(end) == Some(&b'"') => {
-                        i = string_end(bytes, end + 1);
-                    }
-                    "b" if bytes.get(end) == Some(&b'\'') => {
-                        i = char_or_lifetime_end(bytes, end);
-                    }
-                    "r" if bytes.get(end) == Some(&b'#') => {
-                        // A raw identifier: `r#unsafe` names an ordinary identifier.
-                        let (_, after) = identifier(bytes, end + 1);
-                        i = after;
-                    }
-                    _ => {
-                        if word == "unsafe"
-                            || (word == "global_asm" && bytes.get(end) == Some(&b'!'))
-                        {
-                            count += 1;
-                        }
-                        i = end;
-                    }
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    count
-}
-
-fn is_identifier_byte(byte: u8) -> bool {
-    byte == b'_' || byte.is_ascii_alphanumeric()
-}
-
-/// The identifier starting at `start` and the index just after it.
-fn identifier(bytes: &[u8], start: usize) -> (&str, usize) {
-    let mut end = start;
-    while bytes.get(end).copied().is_some_and(is_identifier_byte) {
-        end += 1;
-    }
-    // Only ASCII bytes were accepted, so this cannot fail.
-    (core::str::from_utf8(&bytes[start..end]).unwrap_or(""), end)
-}
-
-fn line_end(bytes: &[u8], mut i: usize) -> usize {
-    while bytes.get(i).is_some_and(|&b| b != b'\n') {
-        i += 1;
-    }
-    i
-}
-
-/// The index after the nested block comment whose body starts at `i` (after `/*`).
-fn block_comment_end(bytes: &[u8], mut i: usize) -> usize {
-    let mut depth = 1;
-    while depth > 0 && i < bytes.len() {
-        if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
-            depth += 1;
-            i += 2;
-        } else if bytes.get(i) == Some(&b'*') && bytes.get(i + 1) == Some(&b'/') {
-            depth -= 1;
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    i
-}
-
-/// The index after the string whose body starts at `i` (after its opening quote).
-fn string_end(bytes: &[u8], mut i: usize) -> usize {
-    while let Some(&byte) = bytes.get(i) {
-        match byte {
-            b'\\' => i += 2,
-            b'"' => return i + 1,
-            _ => i += 1,
-        }
-    }
-    i
-}
-
-/// The hash count if `at` starts a raw string's delimiter (`#*"`).
-fn raw_string_start(bytes: &[u8], at: usize) -> Option<usize> {
-    let mut hashes = 0;
-    while bytes.get(at + hashes) == Some(&b'#') {
-        hashes += 1;
-    }
-    (bytes.get(at + hashes) == Some(&b'"')).then_some(hashes)
-}
-
-/// The index after the raw string whose delimiter starts at `at`.
-fn raw_string_end(bytes: &[u8], at: usize) -> Option<usize> {
-    let hashes = raw_string_start(bytes, at)?;
-    let mut i = at + hashes + 1;
-    while i < bytes.len() {
-        if bytes.get(i) == Some(&b'"') && (0..hashes).all(|k| bytes.get(i + 1 + k) == Some(&b'#')) {
-            return Some(i + 1 + hashes);
-        }
-        i += 1;
-    }
-    Some(bytes.len())
-}
-
-/// The index after a character literal, or after the `'` if this is a lifetime. A character
-/// literal is either escaped (`'\…'`) or has a closing quote within a code point (`'x'`,
-/// up to four bytes of UTF-8 between the quotes).
-fn char_or_lifetime_end(bytes: &[u8], at: usize) -> usize {
-    let start = at + 1;
-    match bytes.get(start) {
-        Some(b'\\') => {
-            let mut i = start + 2;
-            // Skip to the closing quote: an escape may be longer than one byte.
-            while let Some(&byte) = bytes.get(i) {
-                if byte == b'\'' {
-                    return i + 1;
-                }
-                i += 1;
-            }
-            i
-        }
-        Some(_) => match (1..=4).find(|n| bytes.get(start + n) == Some(&b'\'')) {
-            Some(n) => start + n + 1,
-            None => start,
-        },
-        None => start,
-    }
+    let tokens = lex::tokens(source);
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|&(i, token)| {
+            token.is_ident("unsafe")
+                || (token.is_ident("global_asm")
+                    && tokens.get(i + 1).is_some_and(|next| next.is_punct('!')))
+        })
+        .count()
 }
 
 /// What is wrong with the `unsafe` the scan found: any of it outside the framework, or none
@@ -486,22 +617,198 @@ mod tests {
         assert!(empty[0].contains("gate's roots are wrong"), "{empty:?}");
     }
 
+    fn framework(entries: &[(&str, usize, bool)]) -> BTreeMap<String, FrameworkFile> {
+        // Every listed file, each holding one site, and the root above them, then `entries`.
+        let mut files: BTreeMap<String, FrameworkFile> = UNSAFE_FILES
+            .iter()
+            .map(|&(path, _)| {
+                let file = FrameworkFile {
+                    sites: 1,
+                    forbids: false,
+                };
+                (path.to_string(), file)
+            })
+            .collect();
+        for &above in ABOVE_UNSAFE_FILES {
+            let file = FrameworkFile {
+                sites: 0,
+                forbids: false,
+            };
+            files.insert(above.to_string(), file);
+        }
+        for &(path, sites, forbids) in entries {
+            files.insert(path.to_string(), FrameworkFile { sites, forbids });
+        }
+        files
+    }
+
+    #[test]
+    fn the_attribute_counts_only_where_it_opens_the_file() {
+        for source in [
+            "#![forbid(unsafe_code)]\nfn f() {}",
+            "//! Documentation first.\n\n#![forbid(unsafe_code)]\n\nuse core::fmt;",
+            "/* a comment */ #![no_std]\n#![allow(dead_code)]\n#! [ forbid ( unsafe_code ) ]\nfn f() {}",
+        ] {
+            assert!(carries_forbid(source), "{source}");
+        }
+        for source in [
+            "",
+            "fn f() {}",
+            // In a comment, in documentation, in a string.
+            "// #![forbid(unsafe_code)]\nfn f() {}",
+            "//! `#![forbid(unsafe_code)]` is what the modules above carry.\nfn f() {}",
+            "const TEXT: &str = \"#![forbid(unsafe_code)]\";",
+            // After an item: an inner attribute of something smaller than the file.
+            "mod inner {\n    #![forbid(unsafe_code)]\n}\nfn f() { unsafe {} }",
+            "fn f() {\n    #![forbid(unsafe_code)]\n}",
+            // Weaker lints, another lint, a condition, an outer attribute.
+            "#![deny(unsafe_code)]",
+            "#![warn(unsafe_code)]",
+            "#![forbid(unsafe_op_in_unsafe_fn)]",
+            "#![forbid(unsafe_code, dead_code)]",
+            "#![cfg_attr(not(test), forbid(unsafe_code))]",
+            "#[forbid(unsafe_code)]\nfn f() {}",
+            "#![forbid(unsafe_code)",
+        ] {
+            assert!(!carries_forbid(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn the_listed_files_and_forbidding_ones_pass() {
+        let files = framework(&[
+            ("framekernel/frame/src/apic.rs", 0, true),
+            ("framekernel/frame/sync/src/wait.rs", 0, true),
+        ]);
+        assert_eq!(framework_problems(&files), [""; 0]);
+    }
+
+    #[test]
+    fn unsafe_in_a_file_off_the_list_is_caught() {
+        // With the attribute the compiler refuses it first; the gate does not depend on that.
+        for forbids in [true, false] {
+            let files = framework(&[("framekernel/frame/src/apic.rs", 2, forbids)]);
+            let found = framework_problems(&files);
+            assert!(
+                found
+                    .iter()
+                    .any(|p| p
+                        .contains("apic.rs: 2 `unsafe` sites in a file that is not on the list")),
+                "{found:?}"
+            );
+        }
+        // The crate root holds none, and nothing but this count says so.
+        let files = framework(&[("framekernel/frame/src/lib.rs", 1, false)]);
+        let found = framework_problems(&files);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("src/lib.rs: 1 `unsafe` sites"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_off_the_list_without_the_attribute_is_caught() {
+        // A new file, or one whose attribute was deleted.
+        let files = framework(&[("framekernel/frame/src/new_driver.rs", 0, false)]);
+        let found = framework_problems(&files);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("new_driver.rs does not start with `#![forbid(unsafe_code)]`"),
+            "{found:?}"
+        );
+        // The root above the listed files is the one file excused, and only from that.
+        assert_eq!(framework_problems(&framework(&[])), [""; 0]);
+    }
+
+    #[test]
+    fn a_listed_file_with_no_unsafe_or_that_is_gone_is_caught() {
+        let files = framework(&[("framekernel/frame/src/port.rs", 0, false)]);
+        let found = framework_problems(&files);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("port.rs is on the list and holds no `unsafe`"),
+            "{found:?}"
+        );
+        let mut files = framework(&[]);
+        files.remove("framekernel/frame/src/port.rs");
+        files.remove("framekernel/frame/src/lib.rs");
+        let found = framework_problems(&files);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].contains("port.rs is on the list and does not exist"));
+        assert!(found[1].contains("lib.rs is named as a file above the listed ones"));
+    }
+
+    #[test]
+    fn the_list_is_sorted_under_the_framework_and_has_no_duplicates() {
+        assert!(
+            UNSAFE_FILES.windows(2).all(|w| w[0].0 < w[1].0),
+            "the list is not in order"
+        );
+        for &(path, reason) in UNSAFE_FILES {
+            assert!(path.starts_with(&format!("{FRAMEWORK}/")), "{path}");
+            assert!(!reason.is_empty(), "{path} has no reason");
+            assert!(
+                !ABOVE_UNSAFE_FILES.contains(&path),
+                "{path} is on both lists"
+            );
+        }
+    }
+
     /// The real tree, so the gate's roots are known to find the real files.
     #[test]
     fn the_gate_sees_the_real_tree() {
         let root = repo_root();
-        let (_, framework_sites, scanned) = scan(&root).expect("the scan");
-        assert!(framework_sites > 0, "the framework has no unsafe");
-        assert!(scanned > 50, "only {scanned} files scanned");
+        let scanned = scan(&root).expect("the scan");
+        assert!(scanned.framework_sites > 0, "the framework has no unsafe");
+        assert!(scanned.files > 50, "only {} files scanned", scanned.files);
         // Nothing is left outside the framework, and the library's root says so.
-        let (outside, _, _) = scan(&root).expect("the scan");
-        assert!(outside.is_empty(), "{outside:?}");
-        assert!(
-            read(&root.join(KERNEL_LIB_ROOT))
-                .expect("the root")
-                .contains(FORBID)
-        );
+        assert!(scanned.outside.is_empty(), "{:?}", scanned.outside);
+        assert!(carries_forbid(
+            &read(&root.join(KERNEL_LIB_ROOT)).expect("the root")
+        ));
+        // Inside it, the list is exact, and every other file forbids `unsafe`.
+        assert_eq!(framework_problems(&scanned.framework), [""; 0]);
+        assert!(scanned.framework.len() > UNSAFE_FILES.len() + 20);
+        assert_eq!(root_problems(&root).expect("the roots"), [""; 0]);
         let names = kernel_packages(&root).expect("the packages");
         assert!(names.contains("origin-frame") && names.contains("framekernel"));
+    }
+
+    /// Violations planted in the text of real files: the attribute deleted from one that carries
+    /// it, and an `unsafe` block added to it.
+    #[test]
+    fn a_real_file_changed_for_the_worse_is_caught() {
+        let root = repo_root();
+        let path = "framekernel/frame/src/apic.rs";
+        let real = read(&root.join(path)).expect("the file");
+        assert!(carries_forbid(&real) && count_sites(&real) == 0);
+        let mut scanned = scan(&root).expect("the scan");
+
+        let without = real.replace("#![forbid(unsafe_code)]\n", "");
+        assert_ne!(without, real);
+        let file = FrameworkFile {
+            sites: count_sites(&without),
+            forbids: carries_forbid(&without),
+        };
+        scanned.framework.insert(path.to_string(), file);
+        let found = framework_problems(&scanned.framework);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("apic.rs does not start with"),
+            "{found:?}"
+        );
+
+        let with_unsafe = format!(
+            "{real}\nfn planted() {{ unsafe {{ core::hint::unreachable_unchecked() }} }}\n"
+        );
+        let file = FrameworkFile {
+            sites: count_sites(&with_unsafe),
+            forbids: carries_forbid(&with_unsafe),
+        };
+        scanned.framework.insert(path.to_string(), file);
+        let found = framework_problems(&scanned.framework);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("apic.rs: 1 `unsafe` sites"), "{found:?}");
     }
 }
