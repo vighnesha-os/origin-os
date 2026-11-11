@@ -4,20 +4,29 @@
 A check of the tests, not of the code (CLAUDE.md §72): each entry of FAULTS is a small wrong
 edit, a test left out, a number changed, a step skipped. The script makes the edit, runs the
 crate's tests, puts the file back, and reports which tests failed. A fault is caught when a test
-fails or the crate no longer compiles.
+fails or the crate no longer compiles, and the end says how many did each and how many did
+neither.
+
+The entries named in MODEL are the negative controls of the randomized model
+(`src/tests/model.rs`): defects that need requests to interleave, a thread to move or an
+instruction to go dry, which the model is there to notice. For each of them a test of the model
+has to fail, whatever else does, and the script says what the model reported. It ends with a
+failure if one of them goes unnoticed by the model.
 
 Every edit is an exact string that must occur once. When the code changes so that one no longer
 does, the script stops and names it: bring the entry up to date. The files are restored whatever
 happens, and the tests are run once more at the end on the restored tree.
 
 Host-only engineering tool; nothing here ships. It edits the working tree while it runs, so
-run nothing else in the checkout meanwhile.
+run nothing else in the checkout meanwhile. The tests it runs are the ones `cargo test` runs: the
+model's short runs, not its runs at length.
 
 Usage: python3 -I security/random/tools/plant_faults.py <repository root> [part of a fault's name]
+       python3 -I security/random/tools/plant_faults.py <repository root> --model
        python3 -I security/random/tools/plant_faults.py <repository root> --strings
 
-With `--strings` nothing is edited or run: it only says which entries' strings no longer occur
-once.
+With `--model` only the model's negative controls are planted. With `--strings` nothing is edited
+or run: it only says which entries' strings no longer occur once.
 """
 
 import re
@@ -162,11 +171,40 @@ FAULTS = [
  ('lend: a gathering goes on in a store that is no longer its own', [(N, '        if !self.lent_to(number) {\n            return Maint::Delayed;\n        }\n', '')]),
  ('lend: a full store counts as lent to anyone', [(N, '        self.lent_to(number) && self.store_full()', '        self.store_full()')]),
  ('root: a refusal is not recorded on the processor refused', [(R, '        if answer != Answer::Done {\n            node.root_refused(now);\n        }\n', '')]),
+ # The randomized model's negative controls that are not entries above (see MODEL): four of the
+ # six defects it was held to notice on 2026-11-11. Each puts back something the second review
+ # found, in a form the faults above do not have.
+ ("model: a look notes its own time, not when the root was seeded", [(D, '            ctx.node.saw_root(root.seeded_at());', '            ctx.node.saw_root(ctx.now);')]),
+ ('model: a gathering for the root goes on from what a lent store holds', [(N, '        Some(self.begin_lend())\n    }', '        if let Some(number) = self.lent {\n            return Some(number);\n        }\n        Some(self.begin_lend())\n    }')]),
+ ("model: the root's gathering is capped at eight draws in all", [(D, '        if drawn >= left {\n            break;\n        }', '        if drawn >= left.min(RESEED_DRAWS) {\n            break;\n        }')]),
+ ('model: a give-up is recorded by a later step', [
+     (N, '    /// Rests `which` for [`REST_NANOS`]: for a start that has waited out as many "not now"', '    /// Planted.\n    pub fn planted_give_up(&mut self, which: Instruction) {\n        self.count_not_now(which);\n    }\n\n    /// Rests `which` for [`REST_NANOS`]: for a start that has waited out as many "not now"'),
+     (D, '            Try::Failed | Try::Unwanted | Try::NotNow => {\n                if purpose == Purpose::Retest {\n                    stop_retest(&mut allow);\n                }\n            }', '            Try::Failed | Try::Unwanted | Try::NotNow => {\n                if purpose == Purpose::Retest {\n                    stop_retest(&mut allow);\n                }\n                if outcome == Try::NotNow {\n                    in_step(platform, |ctx| ctx.node.planted_give_up(which))?;\n                }\n            }')]),
  # The self-test.
  ("selftest: the answer is not compared", [(T, "    difference == 0 && !drbg.is_instantiated()", "    !drbg.is_instantiated()")]),
  ("selftest: only the first step is run", [(T, "    for step in vector.steps {\n        let done", "    for step in vector.steps.iter().take(1) {\n        let done")]),
  ("selftest: only the first vector is run", [(T, "    vectors.iter().all(passes)", "    vectors.iter().take(1).all(passes)")]),
 ]
+
+
+# The model's negative controls: a test of `src/tests/model.rs` has to fail for each. The first
+# two are faults for the reviews' fixes, which the scripted tests catch as well; the others are
+# the model's own entries.
+MODEL = (
+    "moving: the upkeep goes on where the thread arrives",
+    "lend: the root reseeds itself from a store whatever its number",
+    "model: a look notes its own time, not when the root was seeded",
+    "model: a gathering for the root goes on from what a lent store holds",
+    "model: the root's gathering is capped at eight draws in all",
+    "model: a give-up is recorded by a later step",
+)
+# What the names of the model's tests hold.
+MODEL_TESTS = "tests::model::"
+
+names = [name for name, _ in FAULTS]
+for name in MODEL:
+    if names.count(name) != 1:
+        sys.exit(f"MODEL names {name!r}, which is {names.count(name)} entries of FAULTS")
 
 
 def run():
@@ -176,7 +214,17 @@ def run():
     failed = set(re.findall(r"^test (\S+) \.\.\. FAILED", out, re.M))
     failed |= set(re.findall(r"^---- (\S+) stdout ----", out, re.M))
     compile_error = "error[" in out or "error: could not compile" in out
-    return r.returncode, sorted(failed), compile_error
+    return r.returncode, sorted(failed), compile_error, model_says(out)
+
+
+def model_says(out):
+    """What the model's failing tests reported, with the numbers taken out: the rules that were
+    broken, and what a test asserted besides."""
+    said = set(re.findall(r"^ +seed \d+, first at request \d+: (.*)$", out, re.M))
+    for line in re.findall(r"panicked at [^\n]*tests/model\.rs[^\n]*\n([^\n]*)", out):
+        if "the rules were broken" not in line:
+            said.add(line.strip())
+    return sorted(set(re.sub(r"\d+", "N", line) for line in said))
 
 
 FILES = (H, N, R, D, S, T)
@@ -189,42 +237,72 @@ if ONLY == "--strings":
                 stale += 1
                 print(f"fault {n} ({name}): its string occurs {originals[f].count(old)} times in {f}")
     sys.exit(f"{stale} of {len(FAULTS)} entries are out of date" if stale else 0)
+unnoticed = []
+restored = False
 try:
-    code, failed, _ = run()
+    code, failed, _, _ = run()
     if code != 0:
         sys.exit(f"the unmodified tree does not pass: {failed}")
     print("baseline: passes", flush=True)
-    caught = 0
+    planted = failing = uncompiled = by_model = only_model = controls = 0
     missed = []
     for n, (name, edits) in enumerate(FAULTS, 1):
-        if ONLY not in name:
+        if ONLY == "--model":
+            if name not in MODEL:
+                continue
+        elif ONLY not in name:
             continue
+        planted += 1
         try:
             for f, old, new in edits:
                 text = (SRC / f).read_text()
                 if text.count(old) != 1:
                     sys.exit(f"fault {n} ({name}): {old!r} occurs {text.count(old)} times in {f}")
                 (SRC / f).write_text(text.replace(old, new))
-            code, failed, compile_error = run()
+            code, failed, compile_error, said = run()
         finally:
             for f, text in originals.items():
                 (SRC / f).write_text(text)
+        models = [t.split(MODEL_TESTS, 1)[-1] for t in failed if MODEL_TESTS in t]
+        others = [t.split("::", 1)[-1] for t in failed if MODEL_TESTS not in t]
         if code == 0:
             verdict = "NOT CAUGHT"
             missed.append(name)
         elif compile_error and not failed:
             verdict = "caught: does not compile"
-            caught += 1
+            uncompiled += 1
         else:
-            names = [t.split("::", 1)[-1] for t in failed]
-            verdict = f"caught by {len(names)} test(s): " + ", ".join(names[:3]) + (" ..." if len(names) > 3 else "")
-            caught += 1
-        print(f"{n:2}. {name}: {verdict}", flush=True)
-    print(f"{caught} of {len(FAULTS)} caught", flush=True)
+            failing += 1
+            by_model += bool(models)
+            only_model += bool(models) and not others
+            shown = others[:3] if others else ["model::" + t for t in models[:3]]
+            verdict = (f"caught by {len(failed)} test(s), {len(models)} of them the model's: "
+                       + ", ".join(shown) + (" ..." if len(failed) > len(shown) else ""))
+        print(f"{n:3}. {name}: {verdict}", flush=True)
+        if name in MODEL:
+            controls += 1
+            if models:
+                print(f"       the model's tests: {', '.join(models)}", flush=True)
+                for line in said:
+                    print(f"       the model says: {line}", flush=True)
+            else:
+                unnoticed.append(name)
+                print("       NOT NOTICED BY THE MODEL", flush=True)
+    print(f"{planted} planted: {failing} fail a test, {uncompiled} do not compile, "
+          f"{len(missed)} not caught", flush=True)
     for name in missed:
         print(f"not caught: {name}", flush=True)
+    print(f"the model's tests fail for {by_model} of the {failing}, and for {only_model} of those "
+          "no other test does", flush=True)
+    print(f"the model's negative controls: {controls - len(unnoticed)} of {controls} fail a test "
+          "of the model", flush=True)
+    for name in unnoticed:
+        print(f"not noticed by the model: {name}", flush=True)
 finally:
     for f, text in originals.items():
         (SRC / f).write_text(text)
-    code, failed, _ = run()
-    print("restored tree: " + ("passes" if code == 0 else f"FAILS: {failed}"), flush=True)
+    code, failed, _, _ = run()
+    restored = code == 0
+    print("restored tree: " + ("passes" if restored else f"FAILS: {failed}"), flush=True)
+if unnoticed or not restored:
+    sys.exit(1)
