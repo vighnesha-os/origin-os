@@ -28,6 +28,12 @@
 //!   protect of a mapping whose map has not returned yet, and of one a change holds, are told
 //!   to wait (`should_wait`); they change nothing and spend nothing, so a budget of one unit
 //!   still pays for the mapping's one unmap.
+//! - **Two orders D5 does not place** (ADR-0005 Amendment 5, the second note on D5; the
+//!   owner's items 162 and 163): through the kernel's own calls. In a space at its bound of
+//!   page tables, a fixed run that needs one more table and lies over a mapped page, a
+//!   mapping's or the program's own, is `invalid_args` and not `limit`. A protect that asks
+//!   for more than a mapping allows is told to wait while another call holds the mapping,
+//!   and is denied (`access_denied`) once it is free.
 //! - **Costs:** map, protect and unmap through the kernel's own calls, as QEMU figures; and the
 //!   unmap of a shared object's page from a space a thread is reading it in, on another
 //!   processor where there is one, after which the thread faults there and the object stays
@@ -724,6 +730,11 @@ struct Runs {
     /// A run that needs a page table past the space's bound is refused with `limit`, and leaves
     /// no page and no record.
     tables: bool,
+    /// At that bound, a fixed run that needs one more table and lies over a mapping's page is
+    /// `invalid_args`, and leaves no record (the owner's item 162).
+    bound_mapping: bool,
+    /// So is one over a page of the program's own, which stays as it was.
+    bound_own: bool,
 }
 
 /// Fixed maps through the kernel's own calls, which then look at the pages and records left.
@@ -782,13 +793,18 @@ fn runs() -> Option<Runs> {
         })
         && !process.is_mapped(FIXED_L + 2 * PAGE);
 
-    // Mappings two mebibytes apart, until the space's bound on page tables refuses one.
-    let wide = Process::new(
-        limits(1, APART as usize + 1, PLENTY),
+    // Mappings two mebibytes apart, until the space's bound on page tables refuses one. The
+    // process has a page of its own first, below them, where a table's reach begins: the page
+    // under it is in a table the space does not have.
+    let mut wide = Process::new(
+        limits(3, APART as usize + 1, PLENTY),
         (CODE, CODE + PAGE),
         0,
     )?;
+    let own_at = FIXED_S - 4 * LARGE_PAGE;
+    let wide_own = wide.map_page(own_at, Access::ReadWrite).ok()?.phys();
     let one = object(&wide, 1)?;
+    let pair = object(&wide, 2)?;
     let at = |k: u64| FIXED_S + k * LARGE_PAGE;
     let refusal = (0..APART).find_map(|k| map(&wide, &one, 0, 1, at(k)).err().map(|e| (k, e)));
     let tables = refusal.is_some_and(|(k, e)| {
@@ -802,7 +818,37 @@ fn runs() -> Option<Runs> {
             // mapping, in a table the space has, is mapped.
             && map(&wide, &one, 0, 1, at(0) + PAGE) == Ok(at(0) + PAGE)
     });
-    Some(Runs { own, later, tables })
+
+    // At that bound, a fixed run of two pages that needs one more table and lies over a
+    // mapped page: refused for the page (`invalid_args`), not for the table (`limit`).
+    let (bound_mapping, bound_own) = refusal.map_or((false, false), |(k, _)| {
+        // Over a mapping's page. The last page of the last table the space got, and the page
+        // after it, the one the space was refused a table for. While nothing is mapped there
+        // the run is refused for the table; once its first page is a mapping's, for that.
+        let last = at(k) - PAGE;
+        let over_mapping = map(&wide, &pair, 0, 2, last) == Err(Error::Limit)
+            && map(&wide, &one, 0, 1, last) == Ok(last)
+            && map(&wide, &pair, 0, 2, last) == Err(Error::InvalidArgs)
+            && !wide.is_mapped(at(k))
+            // No record was left over the second page: alone, it is refused for its table.
+            && map(&wide, &one, 0, 1, at(k)) == Err(Error::Limit);
+        // Over the page of the process's own: the run starts on the page under it.
+        let under = own_at - PAGE;
+        let over_own = map(&wide, &pair, 0, 2, under) == Err(Error::InvalidArgs)
+            && !wide.is_mapped(under)
+            && wide.frame_of(own_at).map(UserFrame::phys) == Some(wide_own)
+            // The run did need a table, and left no record: its first page alone is refused
+            // for the table.
+            && map(&wide, &one, 0, 1, under) == Err(Error::Limit);
+        (over_mapping, over_own)
+    });
+    Some(Runs {
+        own,
+        later,
+        tables,
+        bound_mapping,
+        bound_own,
+    })
 }
 
 // ------------------------------------------------------------------ a mapping in other hands
@@ -817,6 +863,10 @@ struct Busy {
     /// The refusals changed nothing and spent nothing: the page stayed on its frame and the
     /// record as it was, and a budget of one unit still paid for the mapping's one unmap.
     untouched: bool,
+    /// A protect that asks for more than a mapping allows was told to wait while the mapping
+    /// was being made and while a change held it, and was denied once it was free (the
+    /// owner's item 163).
+    asks_more: bool,
 }
 
 /// An unmap and a protect of a mapping another call holds (ADR-0005, the note on D5; the
@@ -825,6 +875,12 @@ struct Busy {
 /// a change as `unmap` and `protect` take it. The process's budget pays for one unit, which is
 /// what unmapping its one page costs in a space no processor holds: had a refusal spent
 /// anything, the unmap at the end would have to wait.
+///
+/// Then the order of `memory_protect`'s two refusals (the owner's item 163), on a second
+/// mapping, read-only, with a protect that asks for read and write: more than the mapping
+/// allows. While the mapping is in another call's hands the answer is `should_wait`, as for
+/// any change; the access is compared only once the mapping is free, and is then denied.
+/// Neither answer reaches the budget, which the unmap before them has emptied.
 fn busy() -> Option<Busy> {
     let request = Request {
         access: READ_WRITE,
@@ -837,7 +893,7 @@ fn busy() -> Option<Busy> {
         burst: 1,
         per_second: 1,
     };
-    let process = Process::new(limits(1, 1, once), (CODE, CODE + PAGE), 0)?;
+    let process = Process::new(limits(1, 2, once), (CODE, CODE + PAGE), 0)?;
     let object = ObjectRef::try_new(MemoryObject::create(&process.account, PAGE).ok()?).ok()?;
     let record = || cpu::without_interrupts(|| process.mappings.lock().get(FIXED_Y));
     let frame = || process.frame_of(FIXED_Y).map(UserFrame::phys);
@@ -877,10 +933,47 @@ fn busy() -> Option<Busy> {
         && memory_object::unmap(&process, &process, FIXED_Y, PAGE) == Ok(())
         && record().is_none()
         && !process.is_mapped(FIXED_Y);
+
+    // A second mapping, read-only, and a protect of it that asks for more than it allows.
+    let second = FIXED_Y + LARGE_PAGE;
+    let read_only = Request {
+        access: READ,
+        flags: FIXED,
+        offset: 0,
+        length: PAGE,
+        address: second,
+    };
+    let more = || memory_object::protect(&process, &process, second, PAGE, READ_WRITE);
+    let as_made = || {
+        cpu::without_interrupts(|| process.mappings.lock().get(second))
+            == Some((1, Allow::Read, false))
+    };
+    // Being made: told to wait.
+    let waited = Cell::new(false);
+    let second_report = |_at: u64| -> Result<(), Error> {
+        waited.set(more() == Err(Error::ShouldWait));
+        Ok(())
+    };
+    let second_mapped = memory_object::map(
+        &process,
+        &process,
+        &object,
+        rights::MEMORY_OBJECT,
+        &read_only,
+        &second_report,
+    ) == Ok(second);
+    let made = second_mapped && waited.get() && as_made();
+    // Held by a change: told to wait.
+    let held = cpu::without_interrupts(|| process.mappings.lock().begin(second, 1));
+    let waits = held == Ok(Allow::Read) && more() == Err(Error::ShouldWait);
+    cpu::without_interrupts(|| process.mappings.lock().end(second, Allow::Read));
+    // Free: the access is compared, and denied; the mapping is as it was made.
+    let asks_more = made && waits && more() == Err(Error::AccessDenied) && as_made();
     Some(Busy {
         making,
         changing,
         untouched,
+        asks_more,
     })
 }
 
@@ -1148,6 +1241,14 @@ fn parts(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> b
         verdict(making && changing && untouched)
     );
 
+    let (bound_mapping, bound_own, asks_more) =
+        (runs.bound_mapping, runs.bound_own, busy.asks_more);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: memory: in a space at its bound of page tables, a fixed run that needs one more table and lies over a mapping's page is invalid_args: {bound_mapping}; so is one over a page of the program's own: {bound_own}; a protect that asks for more than a mapping allows is told to wait while another call holds the mapping, and is denied once it is free: {asks_more}{}",
+        verdict(bound_mapping && bound_own && asks_more)
+    );
+
     let scripts = a.statuses()
         && b.statuses()
         && q.statuses()
@@ -1225,6 +1326,9 @@ fn parts(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> b
         && making
         && changing
         && untouched
+        && bound_mapping
+        && bound_own
+        && asks_more
 }
 
 /// The memory-object proof (ADR-0005 P7, P11, C6–C8), with a leak check of its own. Called from

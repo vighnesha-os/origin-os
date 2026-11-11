@@ -2180,6 +2180,7 @@ fn memory_markers() -> Vec<String> {
         "origin-kernel: memory: a map whose address cannot be written to its caller leaves no page and no record, though the caller's budget pays for nothing: true; what taking it back cost is charged, and the caller's next unmap must wait: true".into(),
         "origin-kernel: memory: a fixed run over a page of the program's own is refused whole, and the page stays: true; a mapping of an object's later pages maps those pages' frames: true; a run past the space's page tables is refused with limit and leaves no page and no record: true".into(),
         "origin-kernel: memory: an unmap and a protect of a mapping whose map has not returned yet are told to wait (should_wait): true; so are those of a mapping another change holds: true; the refusals changed nothing and spent nothing: true".into(),
+        "origin-kernel: memory: in a space at its bound of page tables, a fixed run that needs one more table and lies over a mapping's page is invalid_args: true; so is one over a page of the program's own: true; a protect that asks for more than a mapping allows is told to wait while another call holds the mapping, and is denied once it is free: true".into(),
         "origin-kernel: memory: every other call of the proof's programs returned what its script says, and each program ended as it should: true".into(),
         "origin-kernel: memory: map, protect and unmap of 16 pages took ".into(),
         " us (QEMU; the kernel's own calls, in a space no processor holds)".into(),
