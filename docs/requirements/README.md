@@ -50,7 +50,7 @@ The specifications, the threat models and ADR-0013's list of boot proofs are cit
 | Implementation | Paths from the repository's root, separated by `, `. Each must exist. |
 | Acceptance | What must pass for the row to be done. A row that is not started may have none (item 195). |
 | Evidence | References the gate can find in the tree, separated by `, ` (item 194). See "Evidence". |
-| Env | Where the row's evidence ran, the strongest of: `host` (tests and tools on the development host), `emu` (QEMU's software processor), `virt` (a guest on a real processor under KVM, with QEMU's devices and firmware), `hw` (a physical machine). |
+| Env | Where the row's evidence ran: the strongest environment that all of it has run in, of `host` (tests and tools on the development host), `emu` (QEMU's software processor), `virt` (a guest on a real processor under KVM, with QEMU's devices and firmware), `hw` (a physical machine). |
 | Review | Who reviewed the implementation: `none`, `agent` (an AI reviewer, recorded in the tree) or `person:<name>`. |
 | Limitations | What is missing, or what the evidence does not show. |
 | Decided by | The decision items that approved or changed the row. For a decision of an ADR these may be the items that accepted its whole ADR. `-` where the text is older than the decision sheet or no item touched it. |
@@ -83,8 +83,8 @@ No kernel, loader or driver row can be `done` today: their scope is hardware, an
 - `virt` rests on CI's jobs that run `cargo xtask boot-matrix` under KVM (`.github/workflows/ci.yml`). Their results are in CI and in `docs/STATUS.md`, not in the tree's files.
 - Under KVM the boot tests forgive four things that QEMU cannot show there, or that assume a software processor's timing: the last two steps of the VT-d pin proof, a small step of the TSC, a virtio-net ring that did not fill, and uneven fair shares (`kvm_forgives` in `developer-tools/xtask/src/main.rs`). QEMU's software processor proves those. A row whose proofs run in both says `virt`.
 - A row whose evidence ran on hardware names its record under `docs/hardware/`. None exists yet.
-- `agent` in the Review column means one of two records covers the row's implementation: `docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md` or `docs/engineering/REVIEW_S3-5A_2026-11-10.md`. Both are AI reviewers' work. The first read the code as it stood on 2026-11-09 and lists the files no reviewer opened: rows built from those files, and rows for work that came later with no review of its own, say `none`. Code the first review read and that has changed since, the move of the privileged code into the framework crate among the changes, has had no second reading.
-- Work that is only in the second step-3 batch (pull request 16) is not in this tree. A row for it says so in its limitations, in words that start "In the batch", and its state here is what this tree shows.
+- `agent` in the Review column means a record of a review covers the row's implementation: `docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md`, `REVIEW_S3-5A_2026-11-10.md`, `REVIEW_S3-5B_2026-11-10.md` and `REVIEW_H2-STACKS_2026-11-10.md` in the same directory, or the two reviews of task 18b that `docs/engineering/TASKS.md` records. All are AI reviewers' work. The first read the code as it stood on 2026-11-09 and lists the files no reviewer opened: rows built from those files, and rows for work that came later with no review of its own, say `none`. Code the first review read and that has changed since, the move of the privileged code into the framework crate among the changes, has had no second reading.
+- The second step-3 batch's work (memory objects, the kernel stacks' region and its slide, the kernel's random-number generator, events, ports and `clock_read`) is recorded in `docs/STATUS.md` under QEMU's software processor only. Its rows say `emu`, and so does a row that names one of its proofs beside older ones.
 
 ## Decision items
 
@@ -96,7 +96,7 @@ Every answered item of `docs/engineering/OWNER_DECISIONS.md` is named in the "De
 | 22 | none | A permission to push one branch and open one pull request. |
 | 23 | none | A comparison of two AMD manuals with AMD's own copies, done once. |
 | 70, 161 | none | How pull requests are offered: at 100 commits, and pull request 15 at 76. A rule of process that no statement of the directive or decision of an ADR carries. |
-| 204, 207–212, 214, 215, 217, 220 | owed | Written in ADR-0005 Amendment 8, which is in the second step-3 batch (pull request 16). Their rows come when that amendment reaches this tree. |
+| 167, 190 | none | How task 18b and the randomized model of its policy land: through pull request 16. Rules of process. |
 
 ## Scope changes
 
