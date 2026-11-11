@@ -271,7 +271,7 @@
     - then have the image gate (`developer-tools/xtask/src/image.rs`) hold the count of calls through the table, so it cannot grow back unnoticed.
 
     It writes its own contract (§78) before any change. The toolchain's prebuilt `core` and `alloc` keep their own calls, as they keep their returns (ADR-0017 Amendment 1).
-35. **The requirements matrix (CLAUDE.md 7.5 §1; decision items 165 and 168). Not started.** (Item 34 is on another branch.) §1 sets 100% coverage of approved requirements as the completion target and measures it against a versioned requirements matrix, which role 45 owns. No such matrix exists, so coverage cannot be stated today. The task:
+35. **The requirements matrix (CLAUDE.md 7.5 §1; decision items 165, 168 and 191 to 196). Built on 2026-11-12 on `claude/dazzling-jackson-9eca1b`, and not landed: see "Result" below.** (Item 34 is on another branch.) §1 sets 100% coverage of approved requirements as the completion target and measures it against a versioned requirements matrix, which role 45 owns. No such matrix exists, so coverage cannot be stated today. The task:
     - one row for each approved requirement of CLAUDE.md, the accepted ADRs and the decision sheet, with its scope, owning role, implementation, acceptance criteria, verification evidence, state and remaining limitations;
     - kept where a gate can read it, beside item 25's provenance table and `docs/ROADMAP.md`, and repeating neither;
     - a gate in `cargo xtask check` that fails when a row marked done names evidence that is not in the repository, and prints the coverage figure;
@@ -304,7 +304,7 @@
     | answered item of the decision sheet | 155 on `main` | Rows of `OWNER_DECISIONS.md` that start with a number: 1–141, 145–154, 161, 165, 168 and 189. The numbers in between, and 190, are on branches that have not landed |
     | section and final rule of CLAUDE.md | 125 | 85 sections and 40 final rules |
 
-    **The shape, put to the owner on 2026-11-11. Not answered yet, so nothing below is decided and no row is written.** Each question has one recommendation.
+    **The shape, put to the owner on 2026-11-11 and accepted on 2026-11-12:** "Accept all 30", which is decision items 191 to 196 for these six and items 197 to 220 for step 4. The coordinating session added one rule to item 191 before it was put: every answered decision item is named by at least one row, or listed as asking for nothing, and the gate checks it. Each question had one recommendation, and each recommendation is what was accepted.
 
     1. **What one row is.** Recommended: one row for each statement of CLAUDE.md and one for each decision of an accepted ADR: 1,603 rows today. A row quotes its statement, so the gate can check that every statement has exactly one row and that no row outlives its statement. Decision-sheet items are not rows: most accept an ADR whose decisions are already rows, and some are downloads and merges. Each row names the item that approved or changed it instead. A statement that asks for nothing (a permission, a definition, a milestone's description) keeps its row, marked as information and not counted. Specifications, threat models and ADR-0013's list of boot proofs are cited by rows and not split into rows. One row for each section (125) was rejected: almost every section would read "partly done" for years, and the figure would say nothing.
     2. **Where it lives, and in what form.** Recommended: Markdown tables under `docs/requirements/`, one file for each PART of the directive and one for each ADR, with a `README.md` that holds the rules, the directive's revision and the scope changes. The tables are the only copy: GitHub shows them as they are, and the gate reads them with first-party code. Rejected: one file (about 1,600 long lines, too large to show or to read); a data file with a generated page (two copies, and the generated one conflicts at every merge).
@@ -314,6 +314,37 @@
     6. **Scope changes.** Recommended: a table in the matrix's `README.md` with one line for each approved change: the decision item, the date, what was added, narrowed or removed, and the rows it touched. A row taken out of scope stays in the matrix, marked `removed` with its item, and is not counted. The gate checks that each item named is in the decision sheet. It starts with the changes already approved, the Server edition (items 71 to 76) and the stricter hardware scope (item 88) among them.
 
     Left out of the first version, and said so in its report: which requirement depends on which; a milestone for each row (the roadmap's exit tests are item 25's); the date each piece of evidence last passed; rows for the 24 decisions that are only on the draft batch at `15baed9` (ADR-0004 Amendment 2, ADR-0005 Amendment 7, ADR-0016 Amendments 1 and 2), which get their rows when the batch and this branch meet: until then the gate would fail there, by design.
+
+    **Result (2026-11-12).** Built to the six answers on `claude/dazzling-jackson-9eca1b`: `main` at `405495c`, with the decision record `docs/decisions-191-220` (`88fa0c3`) merged in so the answers were in the sheet before the first row. Not pushed, and no pull request: the session that keeps the landing batch is told the commit.
+
+    - **The matrix:** `docs/requirements/`, 39 tables and a `README.md` with the rules. 1,615 rows: one for each of CLAUDE.md 7.6's 1,382 statements, and one for each of the 233 decisions of the 17 accepted ADRs on this branch (the 221 counted on `main`, and ADR-0011 Amendment 2's twelve).
+    - **The gate:** `developer-tools/xtask/src/requirements.rs`, run by `cargo xtask check` and alone by `cargo xtask requirements-gate`. It reads files only and takes about 0.3 s, against the contract's two seconds. 32 host tests, each planting a fault in a small sound matrix. Each kind of fault was also planted once in the real tree and undone: 19 of 19 refused, each with its own message.
+    - **The figure at this commit:** 35 of the 1,563 counted rows are done, 2.2%. 261 are built, 187 partial, 62 not verified and 1,018 not started. 51 rows ask for nothing, and one is removed (ADR-0009 H2, which A2 replaced under decision item 89).
+    - **What "done" is today:** every done row has the host as its scope, or QEMU for the two rows about boot testing itself. A gate, a file or a CI job shows each: the compiler's pin, the dependency gate, the gates on `unsafe`, on assembly options and on documents, generated versions, known-answer tests, and kernel boot testing. No kernel, loader or driver row is done: their scope is hardware.
+    - **Where evidence ran:** on the host for 177 rows, and in KVM guests in CI for 306. Under emulation alone for none, and on a physical machine for none.
+    - **Review:** an AI reviewer's record covers 263 of the 545 rows past not-started. No person has reviewed any row, or the matrix.
+    - **Decision items:** of the 185 answered on this branch, rows name 168. Six are listed as asking for nothing (18, 22, 23, 70, 145, 161). Eleven are listed as owed rows (204, 207 to 212, 214, 215, 217, 220): their text is ADR-0005 Amendment 8, which is only in the second step-3 batch.
+    - **Two states beyond the answers:** `partial` and `not-verified`. Both come from this task's brief ("a requirement with no evidence in the tree is 'not started' or 'not verified'"), and neither counts as coverage.
+    - **How the first rows were written:** a script laid them out from the gate's own reading of the sources, with each judgement written down as a rule: owner, scope, kind, state, criteria, evidence, limitations. The tables are the only copy now and are changed by hand. The script is not in the repository. Every one of those judgements is Claude's, and no person has checked them.
+
+    - **`cargo xtask check`** passed at `7f9e710`, the last commit that changes code: 1,344 tests with no failure, every gate with the requirements gate among them, and Loom. The commits after it change documents only, and the gate and `xtask`'s 172 tests pass on the final tree. Nothing here needed a boot, and none was run.
+
+    **Hardest to split into rows:**
+
+    - **§1's roles.** Each is one statement with five to eight duties, and one row has one state. A role's row is done when every row it owns is done. Duties that no other statement carries have no row of their own: role 54's machine checks and ECC, role 42's data lifecycle, role 43's migrations, role 44's backups, role 47's firmware inventory, role 53's quotas.
+    - **Paragraphs that hold several requirements.** §11's paragraph on userspace has five, one of them built (the lint). §14's on hardening has five mechanisms, three built. §59's on the generator has four. Each is one row, so each is `partial`.
+    - **Lists under a lead-in.** "Implement: Recovery." is a row in three sections and means something different in each. §3's 32 "Origin-owned implementations of" and §17's 22 baselines make one policy into many rows.
+    - **Decisions without titles.** ADR-0005's Amendments 2 to 5 are table rows with no title, so each is quoted by its first sentence. A decision is quoted by its title only, so a change to its body under the same title is not seen.
+    - **Decisions another decision replaced.** A removed row needs a decision item. ADR-0003 K2 was replaced by ADR-0004 before items were numbered, so its row is marked as asking for nothing, with the reason.
+    - **Statements that say what another says.** The final rules, the header's table of formats and the milestones repeat sections. Each is a row, so the same gap is counted more than once.
+
+    **Not covered, or not verified:**
+
+    - **The second step-3 batch.** Its ADR decisions have no rows (ADR-0004 Amendment 2, ADR-0005 Amendments 7 and 8, ADR-0016 Amendments 1 and 2), and the gate refuses that tree until they are added. Rows for work that is only there say "In the batch", and their state is what this tree shows.
+    - **Rows that are not started.** A row is not started where `docs/STATUS.md`, the boot proofs and the tree's layout show nothing for it. The tree was not searched for each of the 1,018.
+    - **Acceptance criteria.** Only the 545 rows past not-started have them. They are Claude's wording, written with the row: most of that work is older than task contracts (decision item 122).
+    - **What the gate does not check:** whether evidence passes, where it ran, who reviewed a row, and whether an owner, scope, kind or state is the right judgement.
+    - **Left out of this version:** which row depends on which, a milestone for each row, and the date each piece of evidence last passed. The specifications, the threat models and ADR-0013's list of boot proofs are cited by rows and not split.
 
 ## Waiting on the owner
 
