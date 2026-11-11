@@ -26,17 +26,19 @@
 //!
 //! **The log.** Apart from the zeros, all-ones and repeats that the weather has it give,
 //! every value an instruction gives is new. It is logged with its logical time (the tries
-//! made so far), its processor, its instruction, the request that was running, and the number
-//! the processor's store was lent under when that step ended. The log keeps a draw for as
-//! long as a store holds it, so it stays small however long the run is.
+//! made so far), its processor, its instruction, how many values that instruction had given
+//! since it last failed, the request that was running, and the number the processor's store
+//! was lent under when that step ended. The log keeps a draw for as long as a store holds it,
+//! so it stays small however long the run is.
 //!
 //! **The rules.** A step that made a reseed shows in the counters. The processor's store *as
 //! it was before that step* is what the reseed consumed, and it is held against these:
 //!
 //! - Any seed: eight draws; each one a draw the store was keeping; none in two seeds; none
-//!   from before the last failure of its instruction; all of the processor the step ran on;
-//!   the eight that are counted, of the instruction the store names; any set aside, RDSEED's.
-//!   The store is empty afterwards: no draw, and no byte of one.
+//!   from before the last failure of its instruction, and none from before that instruction
+//!   had given 1,024 values since, which is a start-up test; all of the processor the step
+//!   ran on; the eight that are counted, of the instruction the store names; any set aside,
+//!   RDSEED's. The store is empty afterwards: no draw, and no byte of one.
 //! - A processor's own reseed: the store is not lent, and every draw was made in a step that
 //!   left it not lent.
 //! - The root's reseed: the store is lent, and every draw was made under that same number, by
@@ -47,14 +49,15 @@
 //! And these, at other moments:
 //!
 //! - After every step: an instruction's failure or "not now" is counted only by a step that
-//!   tried that instruction.
+//!   tried that instruction. A processor is reseeded from the root's output only if a reseed
+//!   was due there and neither of its instructions was healthy.
 //! - At every try: a plain request tries instructions on one processor only.
 //! - When a request ends: a plain request was answered, and made at most 16 draws (S2). An
 //!   answer holds no 16 bytes that are still as the caller left them, or zero, and its first
 //!   eight bytes are no earlier answer's. A refused request's buffer is all zeros.
 //! - With instructions that always deliver, no lock taken and no move: after a plain request
-//!   on a processor with a healthy instruction, the root's seed is younger than a reseed
-//!   period and 5 ms.
+//!   the processor's own seed is younger than a reseed period and 5 ms, and so is the root's
+//!   if that processor has a healthy instruction.
 //! - Where RDSEED runs out in the middle of gatherings: reseeds of the root are made from
 //!   RDRAND, with the RDSEED draws gathered before as additional input (S3).
 //! - Every configuration makes seeds, and does what it is there for: requests nest, threads
@@ -117,6 +120,8 @@ const SEED_DRAWS: usize = 8;
 const REQUEST_DRAWS: u32 = 16;
 /// A reseed period, in nanoseconds (R6).
 const PERIOD: u64 = 60_000_000_000;
+/// The draws of a start-up test (R4).
+const STARTUP: u64 = 1024;
 /// What a request's buffer holds before the request is made.
 const UNWRITTEN: u8 = 0xEE;
 /// The most violations a machine keeps.
@@ -227,6 +232,8 @@ struct Drawn {
     request: Option<u64>,
     /// What the processor's store was lent under when the step that made the draw ended.
     lent: Option<u64>,
+    /// The values its instruction had given since it last failed, this one counted.
+    nth: u64,
 }
 
 /// What a machine did, in counts.
@@ -256,6 +263,8 @@ struct Tally {
     draws_checked: u64,
     /// Of those, the draws of the root's scheduled reseeds.
     root_draws_checked: u64,
+    /// Reseeds of a processor's generator from the root's output.
+    from_root: u64,
 }
 
 impl Tally {
@@ -274,6 +283,7 @@ impl Tally {
         self.most_plain_draws = self.most_plain_draws.max(other.most_plain_draws);
         self.draws_checked += other.draws_checked;
         self.root_draws_checked += other.root_draws_checked;
+        self.from_root += other.from_root;
     }
 }
 
@@ -389,6 +399,8 @@ struct Line {
     dry: u64,
     /// Values it still gives before it runs out, in weather that has it run out.
     left: u64,
+    /// Values it has given since the model last saw it fail a test, or since it started.
+    since_failure: u64,
 }
 
 /// One processor's instructions, for the length of one step.
@@ -448,6 +460,7 @@ impl Source for Lines<'_> {
         log.given += 1;
         let value = splitmix(VALUES, log.given);
         line.last = value;
+        line.since_failure += 1;
         if which == Rdseed
             && let Some(weather) = self.weather
             && weather.runs_out != 0
@@ -468,6 +481,7 @@ impl Source for Lines<'_> {
                 which,
                 request: log.frames.last().map(|frame| frame.id),
                 lent: None,
+                nth: line.since_failure,
             },
         );
         log.step_values.push(value);
@@ -502,12 +516,18 @@ struct Snapshot {
     /// The number the store is lent under.
     lent: Option<u64>,
     own_reseeds: u32,
+    /// Reseeds of the processor's generator from the root's output.
+    from_root: u32,
+    /// Whether the processor has to ask the root for its reseed: one is due and it has no
+    /// healthy instruction (R6).
+    needs_root: bool,
     failures: [u32; 2],
     not_now: [u32; 2],
 }
 
 impl Snapshot {
-    fn of(node: &Node) -> Self {
+    /// The processor as it is at `now`.
+    fn of(node: &Node, now: u64) -> Self {
         let counts = node.counts();
         // The draws a reseed counts, and the ones set aside: those lie after the 16 bytes
         // that a reseed stamps.
@@ -528,6 +548,8 @@ impl Snapshot {
             from: node.from,
             lent: node.lent,
             own_reseeds: counts.reseeds_rdseed + counts.reseeds_rdrand,
+            from_root: counts.reseeds_root,
+            needs_root: node.due(now) && !node.is_healthy(Rdseed) && !node.is_healthy(Rdrand),
             failures: [node.faults(Rdseed), node.faults(Rdrand)],
             not_now: [counts.not_now_rdseed, counts.not_now_rdrand],
         }
@@ -615,6 +637,7 @@ impl Machine {
             last: 0,
             dry: 0,
             left: 0,
+            since_failure: 0,
         };
         Self {
             seed,
@@ -767,6 +790,12 @@ impl Machine {
                     "{what}: a draw of an instruction that failed since"
                 ));
             }
+            if drawn.nth <= STARTUP {
+                log.violation(format!(
+                    "{what}: a draw of an instruction that had passed no start-up test since \
+                     it failed"
+                ));
+            }
             if drawn.cpu != on {
                 log.violation(format!(
                     "{what}: a draw of processor {} used on {on}",
@@ -807,7 +836,7 @@ impl Machine {
     /// What follows every step. `before` is processor `on` as the step found it, and
     /// `root_before` the root's counts if the step ran under its lock.
     fn step_ended(&mut self, on: usize, before: &Snapshot, root_before: Option<RootCounts>) {
-        let after = Snapshot::of(&self.nodes[on]);
+        let after = Snapshot::of(&self.nodes[on], self.now);
         let log = &mut self.log;
         // A draw of this step that the store holds now learns what the store is lent under.
         // One that it does not hold was not kept.
@@ -830,6 +859,17 @@ impl Machine {
             if failed {
                 log.tally.failures += 1;
                 log.failed_at[on][n] = log.time;
+                self.lines[on][n].since_failure = 0;
+            }
+        }
+        if after.from_root > before.from_root {
+            log.tally.from_root += 1;
+            if !before.needs_root {
+                log.violation(
+                    "a processor that was not due, or could reseed itself, was reseeded from \
+                     the root"
+                        .to_string(),
+                );
             }
         }
         // The counters say whether the step made a reseed, and of what.
@@ -966,7 +1006,7 @@ impl Machine {
 impl Platform for Machine {
     fn step(&mut self, step: &mut dyn FnMut(&mut Ctx<'_>)) -> Result<(), Busy> {
         let on = self.on;
-        let before = Snapshot::of(&self.nodes[on]);
+        let before = Snapshot::of(&self.nodes[on], self.now);
         self.run_step(|ctx, _| step(ctx));
         self.step_ended(on, &before, None);
         Ok(())
@@ -982,7 +1022,7 @@ impl Platform for Machine {
             return Err(Busy::Root);
         }
         let on = self.on;
-        let before = Snapshot::of(&self.nodes[on]);
+        let before = Snapshot::of(&self.nodes[on], self.now);
         let root_before = self.root.counts();
         self.run_step(|ctx, root| step(ctx, root));
         self.step_ended(on, &before, Some(root_before));
@@ -1353,7 +1393,7 @@ fn check(name: &str, machines: &[Machine]) -> Tally {
          RDRAND with RDSEED draws set aside), {} pieces with prediction resistance. {} failures \
          of an instruction, {} nested requests, {} moves. At most {} draws in a plain request. \
          {given} values given, {} of them in seeds and held against the rules, {} of those the \
-         root's.",
+         root's. {} reseeds of a processor from the root.",
         machines.len(),
         total.plain_answered,
         total.plain_refused,
@@ -1369,6 +1409,7 @@ fn check(name: &str, machines: &[Machine]) -> Tally {
         total.most_plain_draws,
         total.draws_checked,
         total.root_draws_checked,
+        total.from_root,
     );
     assert!(
         violations.is_empty(),
@@ -1518,8 +1559,9 @@ fn requests_crowded_into_each_other_keep_the_rules_at_length() {
     crowded((16, 4000));
 }
 
-/// With instructions that always deliver, no lock taken and no move, the root's seed is never
-/// older than a reseed period after a request on a processor that could reseed it.
+/// With instructions that always deliver, no lock taken and no move, a request leaves no seed
+/// older than a reseed period: not its processor's, and not the root's if that processor
+/// could reseed it.
 fn calm(machines: u64, requests: u32) {
     let mut worst = 0;
     let mut seen = 0u64;
@@ -1538,6 +1580,13 @@ fn calm(machines: u64, requests: u32) {
             let result = fill(&mut machine, &mut out);
             if let Some(frame) = machine.log.frames.pop() {
                 machine.judge(&frame, &out, result);
+            }
+            let own = machine.now.saturating_sub(machine.nodes[on].seeded_at);
+            if own >= PERIOD + 5_000_000 {
+                machine.log.violation(format!(
+                    "calm: the generator of processor {on} was seeded {own} ns ago after a \
+                     request there"
+                ));
             }
             if machine.nodes[on].is_healthy(Rdseed) || machine.nodes[on].is_healthy(Rdrand) {
                 let age = machine.now.saturating_sub(machine.root.seeded_at());
@@ -1891,6 +1940,7 @@ fn reseed_from_a_made_up_store(tamper: impl FnOnce(&mut Machine, [u64; 8])) -> V
             which: Rdseed,
             request: None,
             lent: None,
+            nth: 2 * STARTUP,
         };
         machine.log.drawn.insert(value, drawn);
     }
@@ -1921,7 +1971,11 @@ fn the_rules_notice_a_store_that_is_not_what_the_log_says() {
         "a store that is what the log says"
     );
     type Tamper = fn(&mut Machine, [u64; 8]);
-    let cases: [(&str, Tamper); 7] = [
+    let cases: [(&str, Tamper); 8] = [
+        (
+            "own: a draw of an instruction that had passed no start-up test since it failed",
+            |machine, values| relog(machine, values[6], |drawn| drawn.nth = STARTUP),
+        ),
         (
             "own: a value in the seed is no draw that the store was keeping",
             |machine, values| {
@@ -2041,6 +2095,8 @@ fn says_of_a_made_up_reseed(
         from: Rdseed,
         lent,
         own_reseeds: 0,
+        from_root: 0,
+        needs_root: false,
         failures: [0; 2],
         not_now: [0; 2],
     };
@@ -2053,6 +2109,7 @@ fn says_of_a_made_up_reseed(
             which: Rdseed,
             request: running,
             lent,
+            nth: 2 * STARTUP,
         };
         machine.log.drawn.insert(*draw, drawn);
     }

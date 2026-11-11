@@ -189,16 +189,23 @@ FAULTS = [
 ]
 
 
-# The model's negative controls: a test of `src/tests/model.rs` has to fail for each. The first
-# two are faults for the reviews' fixes, which the scripted tests catch as well; the others are
-# the model's own entries.
+# The model's negative controls: a test of `src/tests/model.rs` has to fail for each.
 MODEL = (
+    # The six defects the model was held to notice on 2026-11-11. The first two are faults for
+    # the reviews' fixes, which the scripted tests catch as well; the others are the model's
+    # own entries.
     "moving: the upkeep goes on where the thread arrives",
     "lend: the root reseeds itself from a store whatever its number",
     "model: a look notes its own time, not when the root was seeded",
     "model: a gathering for the root goes on from what a lent store holds",
     "model: the root's gathering is capped at eight draws in all",
     "model: a give-up is recorded by a later step",
+    # One for each rule the model was given in the repository: a processor keeps its own
+    # schedule, the root reseeds only a processor that has to ask it, and nothing is used of
+    # an instruction between a failure and a whole start-up test.
+    "node: the clock never makes a reseed due",
+    "moving: a processor that needs nothing is reseeded from the root",
+    "health: a failure leaves the instruction as it was",
 )
 # What the names of the model's tests hold.
 MODEL_TESTS = "tests::model::"
