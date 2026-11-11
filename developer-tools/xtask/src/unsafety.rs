@@ -144,6 +144,10 @@ const UNSAFE_FILES: &[(&str, &str)] = &[
         "the Loom models (tests only): a frame written through Loom's cell",
     ),
     (
+        "framekernel/frame/sync/tests/ports_allocation.rs",
+        "a host test's own global allocator, which counts and refuses on demand",
+    ),
+    (
         "framekernel/frame/tests/objref_out_of_memory.rs",
         "a host test's own global allocator, which refuses on demand",
     ),
