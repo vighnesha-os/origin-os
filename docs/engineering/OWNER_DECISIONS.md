@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–141 and 145–154, and 2026-11-11 for items 161, 165 and 168. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144, 155–164, 166 and 167 are on another branch (`land/s3-part2`) and are not in this sheet yet. |
-| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 165 and 168: your own text for CLAUDE.md §1, in its second and third versions, read against the whole of revision 7.5 and the ADRs each change names; the check and the list of changes are `ROLES_CHECK_2026-11-11.md`. |
+| As of | 2026-11-10 for items 71–141 and 145–154, and 2026-11-11 for items 161, 165, 168 and 189. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144, 155–164, 166, 167 and 188 are on other branches (`land/s3-part2`, `claude/18b-kernel-random`), and 169–187 are given out for S3-6's shapes; none of them is in this sheet yet. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 165 and 168: your own text for CLAUDE.md §1, in its second and third versions, read against the whole of revision 7.5 and the ADRs each change names; the check and the list of changes are `ROLES_CHECK_2026-11-11.md`. Item 189: that check's proposal 11. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: items 161, 165 and 168 (item 168 delegated to Claude). |
-| Still open | No numbered item. One proposal on the roles of §1 is still yours to answer: whether §77's list of 26 agents should point to §1 (`ROLES_CHECK_2026-11-11.md`, proposal 11). Item 168's changes to your text are Claude's, and you have not read them. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: items 161, 165, 168 and 189 (item 168 delegated to Claude). |
+| Still open | No numbered item. Item 168's changes to your text are Claude's, and you have not read them. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -459,7 +459,7 @@ What your third text keeps and adds:
 - **The completion target** is still 100% coverage of approved requirements. It is now measured against a versioned requirements matrix. That matrix does not exist yet: TASKS item 35.
 - **Roles 1 to 50 keep their numbers.** All but two are reworded. Roles 51 to 64 are new: a Chief Systems Architect, system integration, resource governance, platform reliability, and ten roles for driver families, with the GPU and the NPU among them.
 - **Requirements for every role** replace the two closing paragraphs.
-- **It answers most of the check of the second text.** What became of each of the twelve proposals is in the check's last section. One is still yours: §77 lists 26 engineering agents and is as it was.
+- **It answers most of the check of the second text.** What became of each of the twelve proposals is in the check's last section. The last one, §77's list of 26 engineering agents, you answered later the same day (item 189).
 
 What item 168 changed, by the areas you named:
 
@@ -489,3 +489,17 @@ How the text was put in:
 - **Line 35 is where the old sentence stands in revision 7.1,** which the main checkout still held that day. In revision 7.4 it was line 36. Your text replaces that sentence; the nine roles it named are all among your roles.
 - **Nothing else in the directive changes.** The rest of §1 follows your text as before.
 - **The first and second versions are kept only in this branch's history,** at commits `fc92eca` and `453fded`.
+
+## §77 points to §1 (item 189): Accepted 2026-11-11, revision 7.6
+
+| # | Question | Answer |
+|---|---|---|
+| 189, answered | Replace §77's list of 26 agents with a pointer to §1? This was proposal 11 of the roles check (`ROLES_CHECK_2026-11-11.md`). | **Yes: "Yes, point to §1"** |
+
+What it changes, in CLAUDE.md 7.6:
+
+- **§77 now reads:** "The specialist roles and their responsibilities are in §1. Agents are given bounded tasks from them, as §1 and §78 say."
+- **Its last line stays:** "Do not execute every agent simultaneously without task independence."
+- **Nothing else changes.** Revision 7.5 is kept at `docs/engineering/CLAUDE-v7.5.md`.
+
+Why: §1 has listed 67 specialist roles since revision 7.5, and §77's 26 agents overlapped them with another count. Every one of the 26 has a role in §1: the NPU is role 56, source provenance is role 67, and context management is role 28 with the requirement to keep durable engineering records.
