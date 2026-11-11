@@ -47,6 +47,8 @@ use crate::handles::HandleTable;
 use crate::mapping::{Budget, Mappings, Rate};
 use crate::memory_object::MemoryObject;
 use crate::paging::{Access, MapError, Translation};
+use crate::quota::ObjectCounts;
+pub(crate) use crate::quota::ObjectLimits;
 use crate::runqueue::QueueError;
 use origin_abi::{Error, Handle, signals};
 use origin_frame::objref::ObjectRef;
@@ -75,6 +77,9 @@ pub(crate) struct Account {
     /// made, refunded when its last handle and mapping are gone.
     committed: AtomicUsize,
     max_committed: usize,
+    /// The events and ports this process created that still exist, and the bindings it made
+    /// whose packet has not left its port.
+    objects: ObjectCounts,
 }
 
 impl Account {
@@ -135,6 +140,15 @@ impl Account {
     pub(crate) fn committed(&self) -> usize {
         self.committed.load(Ordering::Acquire)
     }
+
+    /// Its counts of events, ports and bindings, each against its own quota.
+    #[expect(
+        dead_code,
+        reason = "the event and port calls of task S3-6 charge these, and none is built yet"
+    )]
+    pub(crate) fn objects(&self) -> &ObjectCounts {
+        &self.objects
+    }
 }
 
 /// What a process may commit and map, and how fast it may change its mappings (P11, C7;
@@ -163,7 +177,8 @@ impl MemoryLimits {
 }
 
 /// A process's quotas: at most `handles` entries in its table, `channels` live channels,
-/// `message_bytes` of kernel heap in messages it has queued, and its memory.
+/// `message_bytes` of kernel heap in messages it has queued, its memory, and its events, ports
+/// and bindings.
 #[derive(Clone, Copy)]
 pub(crate) struct Limits {
     pub(crate) handles: usize,
@@ -175,6 +190,8 @@ pub(crate) struct Limits {
     pub(crate) debug_calls: bool,
     /// Its memory objects and mappings.
     pub(crate) memory: MemoryLimits,
+    /// Its events, ports and bindings. [`ObjectLimits::NONE`] allows none.
+    pub(crate) objects: ObjectLimits,
 }
 
 /// What ended the process's last thread, for the boot proofs.
@@ -341,6 +358,7 @@ impl Process {
                 max_queued_bytes: limits.message_bytes,
                 committed: AtomicUsize::new(0),
                 max_committed: limits.memory.committed,
+                objects: ObjectCounts::new(limits.objects),
             })
             .ok()?,
             mappings: SpinLock::new(Mappings::new(limits.memory.mappings)),

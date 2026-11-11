@@ -20,7 +20,7 @@ use origin_abi::{Error, status_name};
 
 use crate::console::Console;
 use crate::cpu::CpuIndex;
-use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, MemoryLimits, Process};
+use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, MemoryLimits, ObjectLimits, Process};
 use crate::sched;
 use crate::vm;
 use origin_frame::objref::ObjectRef;
@@ -38,6 +38,7 @@ const LIMITS: Limits = Limits {
     message_bytes: 1 << 20,
     debug_calls: true,
     memory: MemoryLimits::NONE,
+    objects: ObjectLimits::NONE,
 };
 
 /// A kernel object for the reader to touch.

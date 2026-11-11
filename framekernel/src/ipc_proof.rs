@@ -46,7 +46,7 @@ use crate::cpu::{self, CpuIndex};
 use crate::handles::Need;
 use crate::ipc::{self, Object};
 use crate::launch::{self, Given};
-use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, MemoryLimits, Process};
+use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, MemoryLimits, ObjectLimits, Process};
 use crate::{memory, sched, syscall, time};
 
 /// Where every proof process's code begins.
@@ -455,6 +455,7 @@ const LIMITS: Limits = Limits {
     message_bytes: 1 << 20,
     debug_calls: true,
     memory: MemoryLimits::NONE,
+    objects: ObjectLimits::NONE,
 };
 
 /// Waits for `process`'s last thread to end.
@@ -1526,6 +1527,7 @@ fn quotas(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         message_bytes: 1 << 20,
         debug_calls: true,
         memory: MemoryLimits::NONE,
+        objects: ObjectLimits::NONE,
     };
     let limit = Error::Limit.raw();
     let steps = alloc::vec![
@@ -1583,6 +1585,7 @@ fn byte_quota(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64)
         message_bytes: 64,
         debug_calls: true,
         memory: MemoryLimits::NONE,
+        objects: ObjectLimits::NONE,
     };
     let (Some(mut writer), Some(mut peer)) = (
         Image::new(limits, proof_programs::script()),
