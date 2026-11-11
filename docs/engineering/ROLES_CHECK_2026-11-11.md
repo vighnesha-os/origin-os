@@ -7,7 +7,7 @@
 | Against | CLAUDE.md 7.5 from its header to the final rules, read in full for this check; the lines of ADR-0014 and ADR-0015 on the subjects below; the 26 agents of §77; the owner's first text for §1 (28 roles, commit `fc92eca` on this branch) |
 | How | One AI reader went through the directive section by section and named the role that owns each. A search of the owner's text for each subject then confirmed whether any role names it. "Named by no role" means the words are in no role; where a wider phrase in a role can be read to cover the subject, the finding says so |
 | Not done | Nothing was built or tested: this is a check of text. No ADR other than 0014 and 0015 was read again for it. **No human has reviewed this** |
-| Outcome | The text is in CLAUDE.md as the owner gave it (decision sheet item 165). The twelve proposals below are put to the owner and are not answered. None of them is in CLAUDE.md |
+| Outcome | The owner answered with a third text the same day. It took in much of this check and left the rest to Claude: "improve if you can ... You decide" (decision sheet item 168). The last section says what became of each proposal and lists every change Claude made. Everything from "Result" to "What was checked and found right" is the check as the owner read it, and describes the second text |
 
 ## Result
 
@@ -167,3 +167,96 @@ The proposal is a task of its own: one row for each approved requirement of CLAU
 - Role 39's "common kernel, SDK, desktop, and release identity", role 50's "native management GUI" and "BMC-console diagnostics", and role 41's KVM guests agree with ADR-0014 and ADR-0009.
 - Role 19's "every approved device standard ... has the required SDK coverage" agrees with ADR-0015, and role 30's mitigations "on supported configurations" with ADR-0017.
 - The second closing paragraph agrees with §77's last line and with §78.
+
+## After the check: the owner's third text, and what Claude changed in it (decision item 168)
+
+Later on 2026-11-11 the owner sent a third text for §1, with these words: "Consider following, and improve if you can. Consider extreme security, performance, Native SDK, Native Desktop, Native GUI or UI, CPU, GPU, NPU consider these also. You can do extremely very good, You decide."
+
+The third text has seven opening paragraphs, 64 specialist roles and 22 engineering requirements that apply to every role. Roles 1 to 50 keep their numbers and subjects; all but two are reworded. Roles 51 to 64 are new: a Chief Systems Architect, system integration, resource governance, platform reliability, and ten roles for driver families, the GPU and the NPU among them.
+
+CLAUDE.md 7.5 holds that text with the 47 changes listed below. They are Claude's, made under the owner's delegation, and the owner can change any of them.
+
+### What became of the twelve proposals
+
+| # | Proposal | In the owner's third text | Changed by Claude (item 168) |
+|---|---|---|---|
+| 1 | A role for original source, provenance and licensing | A requirement, "Preserve original implementation and provenance", and a sentence in role 2. No role | Role 67 |
+| 2 | A role for the NPU and the Compute API | Role 56, and role 55 for the GPU | The NPU added to role 53's resource policies |
+| 3 | The SDK-only rule's enforcement | Not taken | Opening paragraph 5, role 19 and a requirement |
+| 4 | The GUI as a security boundary; international text; themes | Not taken | Roles 65 and 66; role 20 |
+| 5 | Video, cameras, printers, scanners | Roles 62 and 63; pens and game controllers in role 61; media capabilities in roles 13 and 55 | Nothing |
+| 6 | Hardware errors and health; remote administration and remote desktop | Role 54 for hardware faults | Remote administration and remote desktop in role 50 |
+| 7 | Twelve smaller additions | Vulnerability response (role 26); session hand-offs (a requirement); side-channel assessment (role 17); ACPI coordination (role 64) | The boot manager (7); ACPI runtime evaluation (8); the firewall, TLS and VPN (12); constant time and zeroization (17); the runtime library and `std` (18); sessions and elevation (21); continuous integration (25); Secure Boot, the TPM and measured boot (30); milestone exit tests (45); search and notifications (49) |
+| 8 | Five wordings restored | The accountability sentence rewritten from hardware to recovery; "qualification records" (25); the four kinds of evidence (a requirement) | "memory accounting" (6); "clock synchronization" (15) |
+| 9 | One sentence for subjects with two owners | Role 31 validates and no longer owns; role 39 coordinates; a requirement routes system, OS, kernel and SDK decisions | Routes for security and performance; the Architect and Lead sentence; roles 16 and 23 take the chief titles the opening names |
+| 10 | How "Every role must define ..." is read | The paragraph is gone; requirements replace it | Nothing |
+| 11 | §77 points to §1 | Not answered | Nothing. §77 is as it was |
+| 12 | A task for the requirement inventory and coverage matrix | The matrix is now the measure of the completion target (opening paragraph 3, a requirement, role 45) | TASKS item 35 |
+
+### The 47 changes
+
+"Why" names the area the owner asked to be considered, and the rule the change rests on.
+
+| # | Where | Change | Why |
+|---|---|---|---|
+| 1 | opening 1 and 3, role 1 | The typographic apostrophe, three times, becomes the plain one | the plain apostrophe is what the rest of the directive uses |
+| 2 | opening 2 | "system services, native SDKs, applications," becomes "system services, the native SDK, the native desktop and GUI, applications," | one SDK, not several (the header: one kernel, one SDK); the native desktop and GUI named |
+| 3 | opening 5 | "original-source policy, architecture decisions," becomes "original-source policy, SDK-only rule, architecture decisions," | the SDK-only rule stands beside the other approved baselines (§48) |
+| 4 | opening 6 | Now: "Begin every engineering session by establishing the actual source revision, repository state, implemented behavior, recorded decisions, task ownership, and current verification evidence before selecting the next task. Continue development through working, reviewable, tested milestones." It was: "Begin every engineering session by inspecting the existing implementation, repository state, recorded decisions, task ownership, and verification evidence. Continue development through working, reviewable, tested milestones." | the first requirement said the same thing; the two are one sentence now, with every element of both |
+| 5 | opening 7 | "64 specialist roles" becomes "67 specialist roles" | three roles added |
+| 6 | role 3 | Added at the end: "Keep the privileged framework small, with `unsafe` code and assembly confined to the files the gate lists." | security: the Framekernel's defining boundary (§13, decision items 110 and 111) |
+| 7 | role 4 | Added at the end: "Apply the selected speculation controls and processor protections on every processor, at startup and after resume, and verify that they are in effect." | CPU, security: controls are per processor and a reset clears them (ADR-0017 Z1) |
+| 8 | role 6 | "kernel heaps, accounting, and allocation failure" becomes "kernel heaps, memory accounting, and allocation failure" | says which accounting |
+| 9 | role 7 | "boot handoff, and recovery entry." becomes "boot handoff, the boot manager with deployment selection and known-good fallback, and recovery entry." | the boot manager had no owner (§20) |
+| 10 | role 8 | Added at the end: "Own ACPI runtime evaluation, and validate the tables and methods the firmware supplies." | battery, thermal, lid and embedded-controller support (§67, role 64) run firmware-supplied ACPI code; nothing named its owner |
+| 11 | role 9 | Added at the end: "Run third-party drivers only in user mode, confined by the IOMMU, and keep kernel-mode drivers first-party." | security: the accepted driver rule (§47, ADR-0001) |
+| 12 | role 12 | "sockets, routing, configuration, DNS, DHCP," becomes "sockets, routing, the firewall, TLS integration, VPN interfaces, configuration, DNS, DHCP," | security: the firewall, TLS and VPN interfaces had no owner (§54, §58) |
+| 13 | role 15 | "wall time, timers, synchronization, and defined behavior" becomes "wall time, timers, clock synchronization, and defined behavior" | elsewhere in the text the bare word means locks |
+| 14 | role 16 | "16. Security and Isolation Architect. Maintain system threat models" becomes "16. Chief Security Architect. Hold security authority across both editions and every subsystem. Maintain system threat models" | the opening names a Chief Security Architect and no role had the title; role 3 was retitled the same way |
+| 15 | role 16 | "memory protection, DMA isolation," becomes "memory protection, exploit mitigations, DMA isolation," | security: W^X, ASLR, shadow stacks and guard pages (§14, §58) |
+| 16 | role 16 | Added at the end: "Accept no change that weakens a security invariant in exchange for performance or convenience." | security: priority P0 and final rule 16, as an authority |
+| 17 | role 17 | "side-channel assessment, and independent review" becomes "side-channel and constant-time assessment, secret zeroization, and independent review" | security: §59's list |
+| 18 | role 18 | Added at the end: "Own the Origin runtime library and the route to Rust `std`. Keep system-call numbers private to each release, with the system libraries' C ABI as the stable binary interface, and verify each native image before parsing it." | SDK, security: the runtime library had no owner (§44); the stable interface (§42); verify before parse (ONBF-R1) |
+| 19 | role 19 | "documentation, and API evolution. Define capability discovery," becomes "documentation, and API evolution. Define each interface once in the Origin interface language, generate its bindings from that definition, and keep the C ABI stable and versioned. Define capability discovery," | SDK: one source of truth for every interface (ADR-0011) |
+| 20 | role 19 | Added at the end: "Enforce the SDK-only rule for every first-party client." | SDK: coverage had an owner, the ban on any other way in had none (§48) |
+| 21 | role 20 | "Own window management, desktop interaction, native controls, input responsiveness," becomes "Own Origin UI: window management, desktop interaction, native controls, layout, event dispatch, themes, animation, clipboard, drag and drop, input responsiveness," | GUI: the rest of §50's toolkit |
+| 22 | role 20 | Added at the end: "Build every first-party graphical interface with Origin UI, with no web view, browser engine, or foreign toolkit." | GUI: native means no HTML, Electron or browser process (§50) |
+| 23 | role 21 | "first-run setup, authentication, permissions," becomes "first-run setup, authentication, login sessions, session locking, user switching, administrative authorization, permissions," | security: §57's session and elevation rules had no owner |
+| 24 | role 22 | Added at the end: "Keep installation declarative: no install-time code runs." | security: ONBF-R3 (§46) |
+| 25 | role 23 | "23. Performance and Reliability Architect. Establish workload-specific targets" becomes "23. Chief Performance Architect. Hold performance authority across both editions and every subsystem. Establish workload-specific targets" | the opening names a Chief Performance Architect and no role had the title |
+| 26 | role 23 | "and test sustained operation." becomes "and test sustained operation and recovery from faults." | reliability stays in the role now that it has left the title (the second text's words) |
+| 27 | role 25 | "Own reproducible builds, dependency inventories," becomes "Own reproducible builds, continuous integration and its gates, dependency inventories," | the gates enforce most of the directive's rules and had no owner |
+| 28 | role 30 | "Own the boot trust chain, firmware validation," becomes "Own the boot trust chain, Secure Boot, TPM use, measured boot, firmware validation," | security: §19 and §58 name all three |
+| 29 | role 45 | "acceptance criteria, dependencies, evidence freshness," becomes "acceptance criteria, milestone exit tests, dependencies, evidence freshness," | §82: no milestone is done without its exit tests |
+| 30 | role 49 | "Integrate the shell," becomes "Integrate the desktop shell," | desktop: the bare word also means the command shell, which the base image does not hold (§48) |
+| 31 | role 49 | "sessions, settings, native applications," becomes "sessions, settings, search, notifications, native applications," | desktop: §49 lists both and no role named them |
+| 32 | role 49 | Added at the end: "Make every setting and management task available in the native GUI." | desktop: the GUI is always enough (§48) |
+| 33 | role 50 | "the native management GUI, and remote and BMC-console diagnostics." becomes "a native management GUI that covers every administrative operation, authenticated and encrypted remote administration, remote desktop sessions, and remote and BMC-console diagnostics." | server, security: §48's three ways to administer a server; remote desktop must exist before the edition ships (ADR-0014 S4) |
+| 34 | role 51 | "or shared architectural constraints." becomes "or shared architectural constraints to the owner." | says to whom |
+| 35 | role 53 | "network, GPU, and background-work" becomes "network, GPU, NPU, and background-work" | NPU: §37 schedules work across CPU, GPU and NPU |
+| 36 | role 55 | Added at the end: "Keep a validated fallback display path, and claim acceleration only for a working native driver." | GPU: §36's two closing rules |
+| 37 | role 65 | A new role; its text is in CLAUDE.md §1 | GUI, security: §52 had no owner, and its security rules (decision item 116) were in no role |
+| 38 | role 66 | A new role; its text is in CLAUDE.md §1 | GUI: §51's text engine had three words in role 20; fonts are parsed from files programs supply |
+| 39 | role 67 | A new role; its text is in CLAUDE.md §1 | priority P4 and Part II had a requirement and no owner (§3 to §6, decision items 91 to 97 and 121) |
+| 40 | requirement 1 | Removed: "Inspect and continue existing work. Establish the actual source revision, repository state, implemented behavior, relevant decisions, and current evidence before selecting the next task." | merged into opening paragraph 6 |
+| 41 | requirement: ownership and authority | "kernel contracts through the Chief Kernel Architect, and SDK contracts through the Native SDK Architect." becomes "kernel contracts through the Chief Kernel Architect, SDK contracts through the Native SDK Architect, security decisions through the Chief Security Architect, and performance budgets through the Chief Performance Architect. Where an Architect and a Lead cover one subject, the Architect decides its design and the Lead verifies it independently." | security and performance had no route; several subjects have an Architect and a Lead |
+| 42 | requirement: independent review | Added at the end: "State who reviewed each item, and say so when no person has." | so far every review has been by another AI session; the records say so and the rule should |
+| 43 | requirement: graphics and accelerators | "Test both output correctness and resource isolation." becomes "Test both output correctness and resource isolation, including that no client can read memory another client left behind." | GPU, NPU, security: the isolation failure these devices are known for |
+| 44 | requirements | A new requirement: "Reserve the owner's decisions." Its text is in CLAUDE.md §1 | the roles hold strong authority and none of them is the owner (§5, §80, §84; how work lands, decision item 70) |
+| 45 | requirements | A new requirement: "Enforce the SDK-only rule." Its text is in CLAUDE.md §1 | SDK, GUI: the rule the owner asked for first, in the requirements every role reads (§48, ADR-0011) |
+| 46 | requirements | A new requirement: "Discover and report capabilities truthfully." Its text is in CLAUDE.md §1 | CPU, GPU, NPU: §24's discovery rule and ADR-0015's truthful reporting, for every kind of hardware |
+| 47 | requirements | A new requirement: "Deny by default." Its text is in CLAUDE.md §1 | security: the accepted capability model (ADR-0005 P1) and failing closed, as one rule for every role |
+
+### What was left as it was
+
+- **The numbers of roles 1 to 64.** The new roles are 65 to 67, so no number moves. The Chief Systems Architect stays role 51, though the requirements route system-wide decisions through it first.
+- **§77.** It still lists 26 engineering agents (proposal 11).
+- **"SATA/AHCI" in role 57.** The directive names NVMe and USB storage and no SATA controller. The word "approved" in that role keeps AHCI out until a decision adds it.
+- **The three statements of the requirements matrix:** the target in opening paragraph 3, the rule in the requirements, the owner in role 45.
+
+### How the changes were made and checked
+
+- **Made by a script from the owner's words.** The text was taken from the owner's message. Each change is one entry that must apply exactly once, or the build stops. So the table above is the whole difference in words.
+- **Form.** Role titles and requirement headings are bold, the list marker is "-", and the apostrophe is the plain one. No word changes for these.
+- **Each addition rests on a rule that was read on the day,** in CLAUDE.md 7.5 or in ADR-0001 (D2), the ONBF specification (R1, R3), ADR-0005 (P1), ADR-0011 (the interface language, `origin.core`, N12), ADR-0014 (S4, S7), ADR-0015 (D2), ADR-0017 (Z1) and decision item 70. The one exception is ACPI runtime evaluation, which no section or ADR names: role 8 now owns it, and how it is built is still to be decided.
+- **Not done.** No person has reviewed these changes, and the owner had not read them when this was written. Nothing was built or tested: this is text.
