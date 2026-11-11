@@ -1,6 +1,12 @@
 //! Kernel objects and channels (ADR-0005 P1, P2, P3, P8, P9): the objects handles name, the
 //! moves between handle tables and queues, and blocking until a signal on any of them.
 //!
+//! Every object that raises signals is also a source a port's bindings are armed on (C9;
+//! `port`, task S3-6). Whatever changes its signals delivers to them afterwards, as it wakes its
+//! waiters. A handle that leaves its table, closed or moved, wakes the threads waiting through it
+//! and cancels the bindings made through it ([`Gone`], ADR-0005 Amendment 7 F3 and F16); a
+//! process that ends cancels every binding it made before its handles close ([`close_table`]).
+//!
 //! The queues and limits are the library's `framekernel::channel`; this module adds the
 //! locks, the handle moves, the waiting and the lifetime:
 //! - A [`ChannelEnd`] is one reference to one end: a handle in a table or a handle in a
@@ -21,13 +27,14 @@
 //!   a sender over its `Limits::message_bytes` gets `LIMIT` and the peer is unaffected.
 //!
 //! Lock order: a handle table, then [`TRANSFERS`], then a channel's state, then its charge
-//! list, then an end's holder link. A wait queue's lock is taken before whatever a wait's
-//! condition reads (a table, a channel's state); a waker holds none of these locks while it
-//! wakes.
+//! list, then an end's holder link. A wait queue's lock, and a source's (the ports' protocol),
+//! is taken before whatever a wait's condition or a bind reads (a table, a channel's state); a
+//! waker holds none of these locks while it wakes or delivers.
 #![forbid(unsafe_code)]
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::channel::{Channel, Identity, Message, QUEUE_BYTES, QUEUE_DEPTH, ReadError, other};
@@ -36,13 +43,16 @@ use crate::heap::{MAX_BLOCK, MIN_BLOCK, PAGE};
 use origin_abi::{Error, Handle, ObjectType};
 use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
+use origin_frame::sync::ports::Source;
 
 use crate::cpu::without_interrupts;
+use crate::event::Event;
 use crate::memory_object::MemoryObject;
+use crate::port::{Owner, PortHandle, PortRef, Ports};
 use crate::process::{Account, Process, ThreadObject};
-use crate::wait::WaitQueue;
+use crate::wait::{KernelThreads, WaitQueue};
 
-/// What a handle names (ADR-0005 P3; channels, processes and threads so far).
+/// What a handle names (ADR-0005 P3; every type but the timer so far).
 #[derive(Clone)]
 pub(crate) enum Object {
     /// One end of a channel.
@@ -53,6 +63,18 @@ pub(crate) enum Object {
     Thread(ObjectRef<ThreadObject>),
     /// A memory object (C7).
     Memory(ObjectRef<MemoryObject>),
+    /// An event (C10).
+    #[expect(
+        dead_code,
+        reason = "the system calls of task S3-6 use it: the interface step, the next commit"
+    )]
+    Event(ObjectRef<Event>),
+    /// A port (C9).
+    #[expect(
+        dead_code,
+        reason = "the system calls of task S3-6 use it: the interface step, the next commit"
+    )]
+    Port(PortHandle),
 }
 
 impl Typed for Object {
@@ -62,61 +84,148 @@ impl Typed for Object {
             Self::Process(_) => ObjectType::Process,
             Self::Thread(_) => ObjectType::Thread,
             Self::Memory(_) => ObjectType::MemoryObject,
+            Self::Event(_) => ObjectType::Event,
+            Self::Port(_) => ObjectType::Port,
         }) as u32
     }
 }
 
-/// What a wait, or the wake-up of one, needs of an object: counted references that keep its
-/// signals and its waiters alive, and are not one more handle to it (an end's reference count
-/// is what closes it).
-enum Waitable {
+/// What a wait, a binding, or the wake-up of either needs of an object that raises signals:
+/// counted references that keep its signals, its waiters and its bindings alive, and are not one
+/// more handle to it (an end's reference count is what closes it). It is also a port's way back
+/// to an object a binding of the port's is armed on (`port`, C9).
+#[derive(Clone)]
+pub(crate) enum Waitable {
     /// A channel and which of its two sides.
     Channel(ObjectRef<KernelChannel>, usize),
     /// A process.
     Process(ObjectRef<Process>),
     /// A thread.
     Thread(ObjectRef<ThreadObject>),
-    /// An object with no signals and no waiters: a memory object. No handle to one has `wait`.
-    Silent,
+    /// An event.
+    Event(ObjectRef<Event>),
 }
 
 impl Waitable {
-    fn of(object: &Object) -> Self {
+    /// The object's signals, its waiters and its bindings; `None` for an object that raises no
+    /// signals, a memory object or a port. No handle to either has `wait` (C6, F8).
+    pub(crate) fn of(object: &Object) -> Option<Self> {
         match object {
-            Object::Channel(end) => Self::Channel(end.channel.clone(), end.side),
-            Object::Process(process) => Self::Process(process.clone()),
-            Object::Thread(thread) => Self::Thread(thread.clone()),
-            Object::Memory(_) => Self::Silent,
+            Object::Channel(end) => Some(Self::Channel(end.channel.clone(), end.side)),
+            Object::Process(process) => Some(Self::Process(process.clone())),
+            Object::Thread(thread) => Some(Self::Thread(thread.clone())),
+            Object::Event(event) => Some(Self::Event(event.clone())),
+            Object::Memory(_) | Object::Port(_) => None,
         }
     }
 
     /// The signals the object has raised.
-    fn signals(&self) -> u32 {
+    pub(crate) fn signals(&self) -> u32 {
         match self {
             Self::Channel(channel, side) => {
                 without_interrupts(|| channel.state.lock().signals(*side))
             }
             Self::Process(process) => process.termination().signals(),
             Self::Thread(thread) => thread.termination().signals(),
-            Self::Silent => 0,
+            Self::Event(event) => event.signals(),
         }
     }
 
     /// The threads waiting on it.
-    fn waiters(&self) -> Option<&WaitQueue> {
+    fn waiters(&self) -> &WaitQueue {
         match self {
-            Self::Channel(channel, side) => channel.waiters.get(*side),
-            Self::Process(process) => Some(process.termination().waiters()),
-            Self::Thread(thread) => Some(thread.termination().waiters()),
-            Self::Silent => None,
+            Self::Channel(channel, side) => of_side(&channel.waiters, *side),
+            Self::Process(process) => process.termination().waiters(),
+            Self::Thread(thread) => thread.termination().waiters(),
+            Self::Event(event) => event.waiters(),
         }
     }
 
     /// Wakes everything waiting on it.
     fn wake(&self) {
-        if let Some(waiters) = self.waiters() {
-            note_cross_cpu_wakes(waiters.wake_all());
+        note_cross_cpu_wakes(self.waiters().wake_all());
+    }
+}
+
+impl Deref for Waitable {
+    type Target = Source<Ports>;
+
+    /// The bindings armed on the object.
+    fn deref(&self) -> &Source<Ports> {
+        match self {
+            Self::Channel(channel, side) => of_side(&channel.sources, *side),
+            Self::Process(process) => process.termination().source(),
+            Self::Thread(thread) => thread.termination().source(),
+            Self::Event(event) => event.source(),
         }
+    }
+}
+
+/// The one of a channel's pair that belongs to `side`: the first for side 0, the second for any
+/// other. A side is always 0 or 1 (`channel`'s `other`).
+const fn of_side<T>(pair: &[T; 2], side: usize) -> &T {
+    let [first, second] = pair;
+    if side == 0 { first } else { second }
+}
+
+/// What follows a handle out of its table once it has gone, closed or moved by a write (P9;
+/// ADR-0005 Amendment 7, F3 and F16). Threads waiting through it, in `wait_one` or `port_wait`,
+/// wake to see it gone. Every binding made through it is cancelled implicitly, and becomes a
+/// `canceled` packet in its port; bindings made through another handle to the object stay.
+struct Gone {
+    /// The object's signals and bindings, if it raises signals.
+    target: Option<Waitable>,
+    /// The port, if the handle was a port's.
+    port: Option<PortRef>,
+    /// The bindings made through the handle.
+    owner: Owner,
+}
+
+impl Gone {
+    /// What must follow `object`'s handle, made by `owner`, once it is out of its table.
+    fn of(object: &Object, owner: Owner) -> Self {
+        let port = match object {
+            Object::Port(port) => Some(port.memory()),
+            _ => None,
+        };
+        Self {
+            target: Waitable::of(object),
+            port,
+            owner,
+        }
+    }
+
+    /// Wakes the waiters and cancels the bindings, with no lock held.
+    fn finish(self) {
+        if let Some(port) = &self.port {
+            port.wake(&KernelThreads);
+        }
+        if let Some(target) = &self.target {
+            target.wake();
+            target.cancel_owners(
+                &KernelThreads,
+                |owner| *owner == self.owner,
+                || target.signals(),
+            );
+        }
+    }
+}
+
+/// Empties a process's table when the process has ended, or its launch was abandoned (P11;
+/// ADR-0005 Amendment 7, F11). Each object's bindings that the process made are cancelled
+/// implicitly first, and stay as `canceled` packets charged to it until they are read or
+/// cancelled or their port closes; then the handle closes, and a port's last handle takes its
+/// bindings and packets with it. Called with no lock held, once no thread of the process runs.
+pub(crate) fn close_table(table: HandleTable<Object>, process: u64) {
+    for object in table.into_objects() {
+        if let Some(target) = Waitable::of(&object) {
+            target.cancel_owners(
+                &KernelThreads,
+                |owner| owner.process == process,
+                || target.signals(),
+            );
+        }
+        drop(object);
     }
 }
 
@@ -207,6 +316,8 @@ pub(crate) struct KernelChannel {
     open: [AtomicU32; 2],
     /// Threads in `wait_one` on each end.
     waiters: [WaitQueue; 2],
+    /// The bindings armed on each end (C9).
+    sources: [Source<Ports>; 2],
     /// Who was charged for each message queued toward each side, in queue order, kept in
     /// step with the queues: locked only under `state`.
     charges: SpinLock<[VecDeque<Charge>; 2]>,
@@ -257,11 +368,14 @@ pub(crate) fn note_cross_cpu_wakes(woken: usize) {
     CROSS_CPU_WAKES.fetch_add(woken as u64, Ordering::Relaxed);
 }
 
-/// Wakes everything waiting on `side`.
-fn wake(channel: &KernelChannel, side: usize) {
-    if let Some(waiters) = channel.waiters.get(side) {
-        note_cross_cpu_wakes(waiters.wake_all());
-    }
+/// `side`'s signals may have changed: everything waiting on it wakes to look again, and every
+/// binding armed on it whose mask they now meet fires. Called after the change, with no lock
+/// held.
+fn signals_changed(channel: &KernelChannel, side: usize) {
+    note_cross_cpu_wakes(of_side(&channel.waiters, side).wake_all());
+    of_side(&channel.sources, side).deliver(&KernelThreads, || {
+        without_interrupts(|| channel.state.lock().signals(side))
+    });
 }
 
 /// `side` lost its last reference: it closes. Its waiters and the peer's are woken, and
@@ -287,8 +401,8 @@ fn close_side(channel: &ObjectRef<KernelChannel>, side: usize) {
         without_interrupts(|| *slot.lock() = undelivered);
         list_closed(channel);
     }
-    wake(channel, 0);
-    wake(channel, 1);
+    signals_changed(channel, 0);
+    signals_changed(channel, 1);
 }
 
 /// Puts `channel` on the list [`reap_closed`] drains, unless it is there already.
@@ -343,6 +457,7 @@ pub(crate) fn create_channel(
         state: SpinLock::new(state),
         open: [AtomicU32::new(1), AtomicU32::new(1)],
         waiters: [WaitQueue::new(), WaitQueue::new()],
+        sources: [Source::new(), Source::new()],
         charges: SpinLock::new(charges),
         undelivered: [
             SpinLock::new(VecDeque::new()),
@@ -374,7 +489,7 @@ fn channel_of(
     let (object, _) = table.get(handle, need)?;
     match object {
         Object::Channel(end) => Ok((end.channel.clone(), end.side)),
-        Object::Process(_) | Object::Thread(_) | Object::Memory(_) => Err(Error::WrongType),
+        _ => Err(Error::WrongType),
     }
 }
 
@@ -422,9 +537,9 @@ pub(crate) fn channel_write(
     transfer: &[Handle],
     transfer_need: Need,
 ) -> Result<(), Error> {
-    // Threads blocked on a handle this message takes away must wake and see it gone (P9),
-    // and that happens after the locks are released.
-    let mut moved_away: Vec<Waitable> = Vec::new();
+    // Threads blocked on a handle this message takes away must wake and see it gone (P9), and
+    // the bindings made through it are cancelled (F16): after the locks are released.
+    let mut moved_away: Vec<Gone> = Vec::new();
     moved_away
         .try_reserve_exact(transfer.len())
         .map_err(|_| Error::NoMemory)?;
@@ -462,13 +577,18 @@ pub(crate) fn channel_write(
         };
         let moved = table.take_all(transfer, transfer_need)?;
         // The reader's queue holds them now, recorded before anyone can see the message.
-        for (object, _) in &moved {
+        // `take_all` keeps the list's order.
+        for (&value, (object, _)) in transfer.iter().zip(&moved) {
             if let Object::Channel(end) = object
                 && let Some(holder) = end.channel.holder.get(end.side)
             {
                 *holder.lock() = Some((channel.clone(), reader));
             }
-            moved_away.push(Waitable::of(object));
+            let owner = Owner {
+                process: sender.process,
+                handle: value,
+            };
+            moved_away.push(Gone::of(object, owner));
         }
         let message = Message {
             bytes,
@@ -493,14 +613,15 @@ pub(crate) fn channel_write(
         Ok::<_, Error>((channel, reader, refused))
     });
     let (channel, reader, refused) = wake_side?;
+    // The handles have left the table either way: moved, or closed with a refused message.
+    for gone in moved_away {
+        gone.finish();
+    }
     if let Some((error, message)) = refused {
         drop(message);
         return Err(error);
     }
-    wake(&channel, reader);
-    for target in &moved_away {
-        target.wake();
-    }
+    signals_changed(&channel, reader);
     Ok(())
 }
 
@@ -615,21 +736,22 @@ pub(crate) fn channel_read(
     let (woken, result, charge) = read;
     drop(charge);
     if let Some((channel, writer)) = &woken {
-        wake(channel, *writer);
+        signals_changed(channel, *writer);
     }
     Ok(result)
 }
 
-/// Closes `handle`, so a thread waiting on it completes with `CANCELED`.
-pub(crate) fn handle_close(
-    table: &SpinLock<HandleTable<Object>>,
-    handle: Handle,
-    need: Need,
-) -> Result<(), Error> {
-    let (object, _) = without_interrupts(|| table.lock().remove(handle, need))?;
+/// Closes `process`'s `handle`, so a thread waiting through it completes with `CANCELED` and
+/// the bindings made through it are cancelled (F16).
+pub(crate) fn handle_close(process: &Process, handle: Handle, need: Need) -> Result<(), Error> {
+    let (object, _) = without_interrupts(|| process.handles.lock().remove(handle, need))?;
     // The handle is gone from the table: a waiter on it sees that when it is woken here. If
     // this was an end's last reference, the drop below closes the end and wakes its peer.
-    Waitable::of(&object).wake();
+    let owner = Owner {
+        process: process.id(),
+        handle,
+    };
+    Gone::of(&object, owner).finish();
     drop(object);
     Ok(())
 }
@@ -672,7 +794,9 @@ pub(crate) fn wait_one(
             .get(handle, need)
             .map(|(object, _)| Waitable::of(object))
     })?;
-    let waiters = target.waiters().ok_or(Error::BadHandle)?;
+    // An object that raises no signals.
+    let target = target.ok_or(Error::BadHandle)?;
+    let waiters = target.waiters();
     waiting.fetch_add(1, Ordering::Release);
     let still_open = || without_interrupts(|| table.lock().get(handle, Need::NOTHING).is_ok());
     let result =

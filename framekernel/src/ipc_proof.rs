@@ -2943,7 +2943,7 @@ fn refused_launches(creator: &Process) -> (bool, bool) {
             0,
         )
         .is_ok_and(|w| w.status.is_ok());
-        let _ = ipc::handle_close(&creator.handles, held, Need::NOTHING);
+        let _ = ipc::handle_close(creator, held, Need::NOTHING);
         Some((outcome, closed))
     };
     let large = alloc::vec![7u8; start::MAX_SIZE];

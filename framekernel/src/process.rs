@@ -53,12 +53,14 @@ use crate::runqueue::QueueError;
 use origin_abi::{Error, Handle, signals};
 use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
+use origin_frame::sync::ports::Source;
 use origin_frame::userspace::{UserFrame, UserSpace};
 
 use crate::cpu::{CpuIndex, without_interrupts};
 use crate::ipc::{self, Object};
+use crate::port::Ports;
 use crate::sched;
-use crate::wait::WaitQueue;
+use crate::wait::{KernelThreads, WaitQueue};
 
 /// Values a process's report log keeps, for the boot proofs.
 const REPORTS: usize = 128;
@@ -136,11 +138,7 @@ impl Account {
         self.committed.load(Ordering::Acquire)
     }
 
-    /// Its counts of events, ports and bindings, each against its own quota.
-    #[expect(
-        dead_code,
-        reason = "the event and port calls of task S3-6 charge these, and none is built yet"
-    )]
+    /// Its counts of events, ports and bindings, each against its own quota (F7).
     pub(crate) fn objects(&self) -> &ObjectCounts {
         &self.objects
     }
@@ -209,10 +207,12 @@ struct ReportLog {
     count: usize,
 }
 
-/// The signal an object raises when it has ended, and who waits for it (P9, P11).
+/// The signal an object raises when it has ended, who waits for it, and the bindings armed on
+/// it (P9, P11, C9).
 pub(crate) struct Termination {
     raised: AtomicBool,
     waiters: WaitQueue,
+    source: Source<Ports>,
 }
 
 impl Termination {
@@ -220,6 +220,7 @@ impl Termination {
         Self {
             raised: AtomicBool::new(false),
             waiters: WaitQueue::new(),
+            source: Source::new(),
         }
     }
 
@@ -237,15 +238,22 @@ impl Termination {
         &self.waiters
     }
 
+    /// The bindings armed on the object.
+    pub(crate) const fn source(&self) -> &Source<Ports> {
+        &self.source
+    }
+
     /// Whether the object has ended.
     pub(crate) fn raised(&self) -> bool {
         self.raised.load(Ordering::Acquire)
     }
 
-    /// Raises the signal: the state first, then the wake-ups, as every waker does (`wait`).
+    /// Raises the signal: the state first, then the wake-ups and the deliveries, as every waker
+    /// does (`wait`, and the ports' protocol).
     fn raise(&self) {
         self.raised.store(true, Ordering::Release);
         ipc::note_cross_cpu_wakes(self.waiters.wake_all());
+        self.source.deliver(&KernelThreads, || self.signals());
     }
 }
 
@@ -625,7 +633,8 @@ impl Process {
         let table = without_interrupts(|| {
             core::mem::replace(&mut *self.handles.lock(), HandleTable::new(0))
         });
-        drop(table);
+        // The bindings it made are cancelled before its handles close (F11).
+        ipc::close_table(table, self.id);
         ipc::reap_closed();
         // Its mappings' objects go with it, and no more can be made (P11): before it counts as
         // ended, so whoever sees the ending sees their charges back.
@@ -646,7 +655,8 @@ impl Process {
         let table = without_interrupts(|| {
             core::mem::replace(&mut *self.handles.lock(), HandleTable::new(0))
         });
-        drop(table);
+        // The bindings it made are cancelled before its handles close (F11).
+        ipc::close_table(table, self.id);
         ipc::reap_closed();
     }
 

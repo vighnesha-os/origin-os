@@ -159,7 +159,7 @@ impl server::Calls for UserContext {
     }
 
     fn handle_close(&self, handle: rt::HandleArg) -> Result<(), server::HandleCloseError> {
-        ipc::handle_close(&self.process.handles, handle.value(), need(handle))
+        ipc::handle_close(&self.process, handle.value(), need(handle))
             .map_err(declared(server::HandleCloseError::BadHandle))
     }
 
@@ -357,7 +357,7 @@ fn handle_duplicate(
     let table = &p.process.handles;
     let new = ipc::handle_duplicate(table, handle.value(), need(handle), rights.bits())?;
     copy_out(p, new_handle.addr(), &new.to_le_bytes()).inspect_err(|_| {
-        let _ = ipc::handle_close(table, new, Need::NOTHING);
+        let _ = ipc::handle_close(&p.process, new, Need::NOTHING);
     })
 }
 
@@ -371,13 +371,13 @@ fn channel_create(p: &UserContext, ends: rt::UserRef<[rt::Handle; 2]>) -> Result
     let b = match process.grant(ipc::Object::Channel(second), rights) {
         Ok(b) => b,
         Err(e) => {
-            let _ = ipc::handle_close(&process.handles, a, Need::NOTHING);
+            let _ = ipc::handle_close(process, a, Need::NOTHING);
             return Err(e);
         }
     };
     copy_out_handles(p, ends.addr(), &[a, b]).inspect_err(|_| {
-        let _ = ipc::handle_close(&process.handles, a, Need::NOTHING);
-        let _ = ipc::handle_close(&process.handles, b, Need::NOTHING);
+        let _ = ipc::handle_close(process, a, Need::NOTHING);
+        let _ = ipc::handle_close(process, b, Need::NOTHING);
     })
 }
 
@@ -496,7 +496,7 @@ fn channel_read(
             // call could fail here. Then the handles the program cannot see are closed.
             delivered.inspect_err(|_| {
                 for received in &installed {
-                    let _ = ipc::handle_close(table, received.handle, Need::NOTHING);
+                    let _ = ipc::handle_close(&p.process, received.handle, Need::NOTHING);
                 }
             })
         }
@@ -543,12 +543,11 @@ fn memory_object_create(
     let length = asked.length.ok_or(Error::InvalidArgs)?;
     let made = MemoryObject::create(&p.process.account, length)?;
     let made = ObjectRef::try_new(made).map_err(|_| Error::NoMemory)?;
-    let table = &p.process.handles;
     let handle = p
         .process
         .grant(ipc::Object::Memory(made), oidl::MEMORY_OBJECT_RIGHTS.bits())?;
     copy_out(p, object.addr(), &handle.to_le_bytes()).inspect_err(|_| {
-        let _ = ipc::handle_close(table, handle, Need::NOTHING);
+        let _ = ipc::handle_close(&p.process, handle, Need::NOTHING);
     })
 }
 
