@@ -288,6 +288,13 @@
     - **A starved run without loading the machine** for other sessions: stop and continue the QEMU process (SIGSTOP, SIGCONT) at a known duty cycle while the proof runs. Such a run should show merged periods, a rate that holds, and where the delivery bound can sit.
     - **Negative controls:** a wrong divisor; an APIC rate off by more than the bound, in each direction; the timer's interrupt masked; one-shot mode in place of periodic. Each must fail under TCG and under KVM.
     - **ADR-0013.** Its row for the APIC timer says a correct kernel fails this proof only when no calibration source works (since F3). The kept logs show it failing with one that works, under a starved emulator. R1(a) already gives the remedy: a better proof, not a looser rule. A change to that row, or to what the proof refuses, is the owner's (R7: the table is the policy).
+35. **The requirements matrix (CLAUDE.md 7.5 §1; decision items 165 and 168). Not started.** §1 sets 100% coverage of approved requirements as the completion target and measures it against a versioned requirements matrix, which role 45 owns. No such matrix exists, so coverage cannot be stated today. The task:
+    - one row for each approved requirement of CLAUDE.md, the accepted ADRs and the decision sheet, with its scope, owning role, implementation, acceptance criteria, verification evidence, state and remaining limitations;
+    - kept where a gate can read it, beside item 25's provenance table and `docs/ROADMAP.md`, and repeating neither;
+    - a gate in `cargo xtask check` that fails when a row marked done names evidence that is not in the repository, and prints the coverage figure;
+    - approved scope changes recorded in the matrix with the decision item that made them.
+
+    It writes its own contract (§78) first. The contract says how a requirement is split into rows and where the matrix lives; both are put to the owner before the matrix is filled.
 
 ## Waiting on the owner
 

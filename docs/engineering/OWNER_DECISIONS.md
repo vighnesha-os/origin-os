@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–160, and 2026-11-11 for items 161 to 164 and 167. Items up to 70: 2026-11-09, after the pre-merge review. Items 165 and 166 are on other branches (`docs/directive-7.5`, pull request 17; `claude/18b-kernel-random`) and are not in this sheet yet. |
-| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 142–144, 155–160 and 162–164: as their sections say. Item 167: items 70 and 113 and CLAUDE.md §78 and §80, by the session that keeps the second step-3 batch. |
+| As of | 2026-11-10 for items 71–160, and 2026-11-11 for items 161 to 165, 167 and 168. Items up to 70: 2026-11-09, after the pre-merge review. Items 166 and 188 are on another branch (`claude/18b-kernel-random`) and item 189 is on a third (`docs/directive-7.6`, pull request 18). Items 169–187 are given out for S3-6's shapes, which are put to you and not answered. None of these is recorded in this sheet yet. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 142–144, 155–160 and 162–164: as their sections say. Items 165 and 168: your own text for CLAUDE.md §1, in its second and third versions, read against the whole of revision 7.5 and the ADRs each change names; the check and the list of changes are `ROLES_CHECK_2026-11-11.md`. Item 167: items 70 and 113 and CLAUDE.md §78 and §80, by the session that keeps the second step-3 batch. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–160 (item 97 delegated to Claude). 2026-11-11: items 161 to 164 and 167. |
-| Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–160 (item 97 delegated to Claude). 2026-11-11: items 161 to 165, 167 and 168 (item 168 delegated to Claude). |
+| Still open | Items 169–187, the shapes of S3-6 (events, ports and `clock_read`): put to you on 2026-11-11 with a recommendation each, and not answered. Nothing that rests on them is merged into this batch, and they reach this sheet with your answer. The proposal that §77's list of 26 agents should point to §1 (`ROLES_CHECK_2026-11-11.md`, proposal 11) is recorded as answered on `docs/directive-7.6` (item 189, pull request 18); until that is merged here, the section on the roles below still calls it yours. Item 168's changes to your text are Claude's, and you have not read them. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -488,6 +488,57 @@ They were put to the owner as items 161 to 163. Item 161 was already in use on t
 | 163, answered | `memory_protect` on a mapping another call is changing: keep `should_wait` ahead of the comparison of the access asked with what the mapping allows, since that comparison is not settled while the mapping changes? | **Accept** |
 | 164, answered | Keep counting as "being changed" (item 155) a mapping whose own `memory_map` has not yet written its address to its caller, so that `memory_unmap` or `memory_protect` on it returns `should_wait`? | **Accept** |
 
+## The roles in CLAUDE.md §1 (items 165 and 168): your text, and what you left to Claude, 2026-11-11
+
+On 2026-11-11 you gave text for the start of CLAUDE.md §1, "Your mission", three times:
+
+- first with the words "update CLAUDE.md with following at line: 35": three lead roles and 28 specialist roles;
+- then with the words "Update CLAUDE.md at line: 35 with following, check carefully, if anything missing": six lead roles, 50 specialist roles and two closing paragraphs;
+- then, after the check of the second, with the words "Consider following, and improve if you can. Consider extreme security, performance, Native SDK, Native Desktop, Native GUI or UI, CPU, GPU, NPU consider these also. You can do extremely very good, You decide.": seven opening paragraphs, 64 specialist roles and 22 engineering requirements that apply to every role.
+
+Each replaced the one before it, and none had reached `main`. Revision 7.5 holds the third, with the changes of item 168.
+
+| # | What | Where |
+|---|---|---|
+| 165, your text | The sentence that opened §1 ("You are the Principal Operating System Architect, ... and Multi-Agent Engineering Coordinator for Origin OS.") is replaced by your text, in its third version | CLAUDE.md 7.5, §1. Revision 7.4 is kept at `docs/engineering/CLAUDE-v7.4.md` |
+| 168, delegated to Claude ("improve if you can ... You decide") | Your third text is improved where it could be: 47 changes, among them three new roles and four new requirements. **You have not read them. You can change any of them** | CLAUDE.md 7.5, §1. Every change, with the words before and after and the reason: `docs/engineering/ROLES_CHECK_2026-11-11.md`, its last section |
+
+What your third text keeps and adds:
+
+- **The completion target** is still 100% coverage of approved requirements. It is now measured against a versioned requirements matrix. That matrix does not exist yet: TASKS item 35.
+- **Roles 1 to 50 keep their numbers.** All but two are reworded. Roles 51 to 64 are new: a Chief Systems Architect, system integration, resource governance, platform reliability, and ten roles for driver families, with the GPU and the NPU among them.
+- **Requirements for every role** replace the two closing paragraphs.
+- **It answers most of the check of the second text.** What became of each of the twelve proposals is in the check's last section. One is still yours: §77 lists 26 engineering agents and is as it was.
+
+What item 168 changed, by the areas you named:
+
+- **Security.**
+  - A role for the compositor as a security boundary between programs (65).
+  - Role 16 is the Chief Security Architect, and accepts no change that weakens a security invariant for performance or convenience.
+  - Two requirements: deny by default, and the owner's decisions stay the owner's.
+  - Named in the roles that own them: speculation controls on every processor (4); `unsafe` confined to the listed files (3); third-party drivers in user mode only (9); the firewall, TLS and VPN (12); constant time and zeroization (17); verify before parse (18); sessions and elevation (21); no install-time code (22); Secure Boot, the TPM and measured boot (30).
+- **Performance.** Role 23 is the Chief Performance Architect, and performance budgets are routed through it. The NPU joins role 53's resource policies.
+- **Native SDK.** A requirement states the SDK-only rule in full, and role 19 enforces it. Role 19 defines each interface once in the interface language, with a stable C ABI. Role 18 owns the runtime library and the route to Rust `std`.
+- **Native desktop and GUI.**
+  - Role 20 owns the rest of the UI toolkit and allows no web view, browser engine or foreign toolkit.
+  - A role for the text engine, fonts and input methods (66).
+  - "The desktop shell", search and notifications in role 49.
+  - A management GUI that covers every administrative operation, remote administration and remote desktop in role 50.
+- **CPU, GPU, NPU.**
+  - A requirement to discover capabilities and report them truthfully.
+  - A fallback display path, and no claim of acceleration without a working driver (55).
+  - No client can read memory another client left behind.
+- **Left without an owner by the directive's own sections.** The boot manager (7); ACPI runtime evaluation (8); continuous integration and its gates (25); milestone exit tests (45); original source, provenance and licensing (67).
+- **One merge.** Your first requirement and your sixth opening paragraph said the same thing. They are one sentence now, with every element of both.
+- **Form.** Role titles and requirement headings are bold, and the apostrophe is the plain one.
+
+How the text was put in:
+
+- **Your third text was taken from your message** and compared with the second, role by role. The changes were then applied by a script, each exactly once, so the list of 47 is the whole difference in words.
+- **Line 35 is where the old sentence stands in revision 7.1,** which the main checkout still held that day. In revision 7.4 it was line 36. Your text replaces that sentence; the nine roles it named are all among your roles.
+- **Nothing else in the directive changes.** The rest of §1 follows your text as before.
+- **The first and second versions are kept only in this branch's history,** at commits `fc92eca` and `453fded`.
+
 ## Task 18b lands through the second step-3 batch (item 167): Accepted 2026-11-11
 
 Item 113 asks for the kernel's random-number generator before S3-5b lands. S3-5b is in the second step-3 batch (pull request 16), and that batch still draws straight from RDSEED and RDRAND in two places: the random place of a mapping (`memory_object.rs`) and the base of the kernel stacks' region (the framework's `stack.rs`). Task 18b, the generator in the kernel and the loader, was built on a branch of its own from `main` (`claude/18b-kernel-random`).
@@ -499,6 +550,6 @@ On 2026-11-11 the architecture-review session put three recommendations to the o
 | 167, answered | How 18b lands: through the next batch, pull request 16, and not a pull request of its own? That batch cannot be offered until the generator is in it (item 113), and the two direct draws it adds are converted there. Before it is offered, the architecture-review session finishes reading the parts of 18b it has not read. | **Accept** |
 
 - **Item 166** was accepted with it: the stack region's base takes its random value from the loader's generator, 8 bytes directly after the 64-byte seed in boot info 0.6's secret area. The session that builds 18b records it on `claude/18b-kernel-random`, and it reaches this sheet when that branch is merged here. What it changes in ADR-0004 Amendment 2 is the note on A4 and A5 there.
-- **Item 165** is the owner's own text for CLAUDE.md §1 (revision 7.5). It is on `docs/directive-7.5`, pull request 17.
+- **Item 165** is the owner's own text for CLAUDE.md §1 (revision 7.5). It came to `main` with pull request 17, and its record is the section above.
 - **Not done yet:** 18b's branch is not merged into this batch, and both draws are as they were.
 - Merging pull request 16 still takes your word, and item 70's 100 commits stand.
