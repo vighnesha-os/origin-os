@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (below): Accepted** by the owner on 2026-11-08, with the recommended option of each item. **Amendment 2 (below): Accepted** by the owner on 2026-11-09, through ADR-0011. **Amendment 3 (below): Accepted** by the owner on 2026-11-09, through `docs/spec/OIDL.md`'s question Q8. **Amendment 4 (below): Accepted** by the owner on 2026-11-09. **Amendment 5 (below): Accepted** by the owner on 2026-11-10. |
+| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (below): Accepted** by the owner on 2026-11-08, with the recommended option of each item. **Amendment 2 (below): Accepted** by the owner on 2026-11-09, through ADR-0011. **Amendment 3 (below): Accepted** by the owner on 2026-11-09, through `docs/spec/OIDL.md`'s question Q8. **Amendment 4 (below): Accepted** by the owner on 2026-11-09. **Amendment 5 (below): Accepted** by the owner on 2026-11-10. **Amendment 6 (below): Accepted** by the owner on 2026-11-10; not built. |
 | Scope | Kernel objects and handles, the system-call convention, status codes, process and thread start, memory mapping, IPC, waiting, faults, termination, ABI versioning |
 | Builds on | ONBF §6.1 (EXE/LIB images, syscall-origin pinning, TLS in FS), §8.2 (sealed objects, the Code Integrity Table, mapping rules), §8.3 (the user-mode Loader Service and the start record); ADR-0001 D2 (user-mode drivers); ADR-0004 (address-space layout) |
 | Requires | CLAUDE.md §29 (processes and isolation), §30 (IPC and capabilities), §42 (executable ABI), §44 (runtime), §49 (SDK) |
@@ -168,3 +168,29 @@ Each call already declares its status, so `user-abi` stays 0.5. **Both built 202
 - A mapping whose own `memory_map` has not yet written its address to its caller counts as being changed (the first note): `memory_unmap` or `memory_protect` on it returns **`should_wait`**. Until the address is written the kernel may still take the mapping back, so it is its maker's alone.
 
 No status is added and no call declares a new one, so `user-abi` stays 0.5. **Built** (on the batch since `f56263a`). The third has a host test and a boot proof line under QEMU. The first and the second follow from the order of the code (`memory_object::put` reserves the record before it enters pages; `memory_object::protect` takes the mapping before it compares the access) and have no test of their own yet.
+
+## Amendment 6 (Accepted, 2026-11-10): 64-bit handles, and what a start record's strings are
+
+**Status: Accepted by the owner on 2026-11-10, with the recommended answer ("Accept all", decision sheet items 108 and 109; CLAUDE.md §84). Neither item is built.** The evidence is findings 3 and 4 of `docs/engineering/DESIGN_REVIEW_2026-11-10.md`. E1 changes P1. Where an item below differs from P1, P6, B3 or C4, the item governs.
+
+| # | Decision | Refines |
+|---|---|---|
+| E1 | **A handle is a 64-bit value.** It is still opaque to programs (ADR-0011 N9) and still never 0, and a stale handle still never names a reused slot. How the kernel divides the bits between a slot and its generation is not part of the ABI. The division must leave a process no practical limit on how many handles it creates in its life: 24 bits of slot and 40 of generation, for example, give about 16 million live handles and about a trillion uses of each slot. `received_handle` becomes `{u64 handle; u32 object_type; u32 rights}`, 16 bytes. `start_entry` becomes `{u64 handle; u32 object_type; u32 rights; u32 role}`, 24 bytes with its padding. A handle argument fills its register, so the decoder's check that the upper 32 bits are zero goes (`docs/spec/OIDL.md` §10). A channel message's slots are positions, not handle values, and do not change (§7.4). The change lands in one `user-abi` minor, while the ABI is at major 0, after S3-5b and S3-6, which change the same calls. | P1; B3; C4 |
+| E2 | **A start record's arguments and environment are bytes for the program alone.** No system library reads the environment: the loader, `origin.core` and the SDK libraries take nothing from it. A child's environment is empty unless its launcher sets it, so nothing is inherited. First-party services take their configuration through typed interfaces, never through arguments (ADR-0011 Amendment 1, M5). C4's layout does not change. | P6; C4 |
+
+**Why E1.** A handle today is 16 bits of slot and 16 of generation (`framekernel/src/handles.rs`). A slot is retired when its generations run out, which is how P1's promise is kept. So a process holds at most 65,535 handles at once, and creates at most 65,535 × 65,535, about 4.29 billion, in its life. After that every call that makes or receives a handle returns `limit`, for good. At 1,000 handles a second that is 50 days. Every service call moves handles (`origin.directory`'s `connect` passes one for each connection), and Origin Server expects months without a restart.
+
+**Why E2.** Environment strings that libraries read are how other systems grew attacks through `LD_PRELOAD` and `PATH`, and arguments are how one program comes to drive another with text. P6 and C4 say what the strings look like, and nothing says who may read them.
+
+**Alternatives to E1.**
+
+| Alternative | For | Against |
+|---|---|---|
+| Keep 32 bits and retire slots, as today | No change | The lifetime above, and at most 65,535 live handles in one process |
+| Keep 32 bits and let generations wrap | No ABI change | A stale handle can then name a later object: P1's promise becomes "very unlikely" |
+| Keep 32 bits, with more slot bits and fewer generation bits | More live handles | Each slot wears out sooner. The product stays 2^32 |
+| 64 bits | No practical lifetime, and room for far more live handles | 4 more bytes in `received_handle` and 8 in `start_entry`; every generated binding changes once |
+
+**Trade-offs.** Each handle record grows, and one change touches the kernel's table, `origin-abi`, the OIDL definition and every generated crate together. In return the limit goes for good, at the only time when changing it breaks nothing outside the tree.
+
+**Migration consequences.** `user-abi` is at major 0, so no program outside the tree depends on a handle's width (P12). After the first release with third-party programs the width could change only with a new major. E2 changes no layout and no built behaviour: no system library exists yet to read an environment.

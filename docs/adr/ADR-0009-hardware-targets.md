@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** on 2026-11-08 by delegation. The owner told Claude to decide what "introduced in 2026 or later" covers and to choose the machines ("You do"). Claude decided. The owner has not reviewed this text and can change it. It is not an ABI or format decision (§84). |
+| Status | **Accepted** on 2026-11-08 by delegation. The owner told Claude to decide what "introduced in 2026 or later" covers and to choose the machines ("You do"). Claude decided. The owner has not reviewed this text and can change it. It is not an ABI or format decision (§84). **Amendment 1, accepted by the owner on 2026-11-10 (decision sheet items 88–90), tightens H1 for AMD and replaces H2: the kernel now names the core generation, and still never refuses to boot.** |
 | Requires | CLAUDE.md header ("Target hardware"), §17, §18 (hardware qualification policy), §24, §27, §67, §74, §76, rules 14, 30 and 40 |
 | Evidence | `docs/hardware/SHORTLIST.md`, which has the sources and says what was and was not checked. Research only: **nothing here has been bought, booted or tested.** |
 | Related | ADR-0007 (sheet items 8, 9, 12 and 25 tie its policy to the declared scope), ADR-0008 (64 per-CPU slots, sheet item 14) |
@@ -24,6 +24,8 @@ The shortlist found four machines that fit if "platform" means a generation and 
 | A new model added to an older generation, on that generation's platform | No, even if the model launched in 2026 | Core Ultra 200S Plus (March 2026, on a platform from October 2024); Ryzen 7 9850X3D (January 2026, Ryzen 9000) |
 
 The header says platforms, not CPUs. A refresh has to count because the header requires AMD as well as Intel, and no Zen 6 client part has launched.
+
+*(H1 and H2 are changed by Amendment 1, at the end.)*
 
 **H2. The date scopes claims, not code.** The kernel keeps deciding from CPUID and ACPI (§24) and contains no launch-date check. A machine outside the scope may be used on the bench, but no support or qualification claim can rest on it (§76, rule 40).
 
@@ -97,3 +99,76 @@ Evidence now comes from these, in order, and the plan and its sources are in `do
 3. **Volunteers' own machines,** with a safe USB image: client firmware, sleep and USB, and the only route to 2026 laptops.
 
 A rented or borrowed machine outside H1's scope is bench equipment (H2). No support claim can rest on it. CLAUDE.md §74, §76 and rules 30 and 40 are unchanged: a release still needs the declared machines.
+
+## Amendment 1, 2026-11-10: a stricter scope, and the kernel names the core generation
+
+*Accepted by the owner on 2026-11-10, as recommended ("Accept all", decision sheet items 88–90; CLAUDE.md §18). Nothing here is built.*
+
+The owner asked for a strict rule: "we are building for 2026+ hardware and in AMD Zen5 and Zen5+ / For Intel also 2026+ hardware". Since a CPU reports no year, the owner then asked whether the kernel could check for Panther Lake, Nova Lake, Zen 5, Zen 6 and so on instead.
+
+### A1. The scope (item 88; replaces H1's rule, keeps its table)
+
+- **Intel:** a platform counts if its generation first launched in 2026 or later. This is unchanged.
+- **AMD:** a platform counts if its generation first launched in 2026 or later **and** its CPU cores are Zen 5 or newer (Zen 5, Zen 5c, Zen 6 and later). "Zen 5+" is read as "Zen 5 and newer"; AMD sells nothing by that name.
+
+Zen 5 itself launched in 2024: Ryzen 9000, Ryzen AI 300 and EPYC 9005 are Zen 5 but outside the scope. The new AMD condition keeps out any 2026 generation built on older cores.
+
+| As of 2026-11-10 | In scope | Outside the scope |
+|---|---|---|
+| Intel | Panther Lake (January 2026); Xeon 6+ Clearwater Forest (introduced March 2026); Wildcat Lake and Nova Lake when they ship | Lunar Lake, Arrow Lake (and its 2026 refresh), Granite Rapids, older |
+| AMD | Ryzen AI 400 "Gorgon Point" (Zen 5 refresh, January 2026); EPYC "Venice" (Zen 6, introduced July 2026); Zen 6 Ryzen when it ships | Ryzen 9000, Ryzen AI 300, EPYC 9005; anything on Zen 4 or older |
+
+Everything else is bench equipment: it may be used for testing, but no support or qualification claim rests on it (§76, rules 30 and 40).
+
+### A2. The kernel names the core generation and reports the scope (item 89; replaces H2)
+
+CPUID reports a vendor, a family and a model, which identify the core generation. These are hardware identifiers, not marketing names (§24).
+
+| Answer | Rule |
+|---|---|
+| AMD, Zen 5 or newer | Vendor `AuthenticAMD` and family 1Ah or higher. Every earlier AMD core is below it: Zen to Zen 4 in families 17h and 19h, per AMD's own documents, and the cores before Zen in 0Fh to 16h. Family 1Ah begins with Zen 5 (EPYC 9005) and continues into models first documented from December 2025. So no model list is needed |
+| Intel, a 2026 generation | Vendor `GenuineIntel` and family 18 (12h) or higher (Nova Lake is 18); or family 6 with model CCh or E5h (Panther Lake cores), D5h (Wildcat Lake) or DDh (Clearwater Forest) |
+| Anything else | Outside the scope, including other vendors and every older family or model |
+
+- **Where the numbers come from.** They come from one CPU identification table built from Intel's and AMD's own publications. The numbers above were confirmed on 2026-11-10 against Intel's microcode release notes and perfmon map, and against AMD's uProf guide and processor references (`docs/research/2026-11-10-cpu-identification.md`). The same table holds the errata workarounds keyed by family, model and stepping (P0). New 2026+ family-6 models are added to it as Intel publishes them.
+- **At boot.** The kernel prints one line saying whether the machine is in scope or a bench machine, and why.
+- **It never refuses to boot.** Every machine Origin can be tested on today is outside the scope: GitHub's runners, QEMU on the Mac, and every rentable server found on 2026-11-09. A refusal would stop all testing.
+- **Features still come from feature bits.** Instructions are chosen from CPUID feature bits (§14, §24). The generation decides only the scope line.
+- **Both answers are tested.** QEMU can be told to report any family and model, so CI can boot an in-scope and an out-of-scope identity.
+- **What cannot be checked.** The check gives the core generation, not the launch year. Gorgon Point refreshes 2024's Strix and Krackan Point on the same socket, probably with the same model numbers (unconfirmed). So "AMD from 2026" stays a rule about claims: a 2024 Zen 5 machine reads as Zen 5 or newer, and that is not a support claim.
+- **It is not a security control.** A virtual machine reports its host's CPU, or whatever QEMU is told to report.
+
+### A3. The installer, decided at M9 (item 90)
+
+At M9, the owner decides whether the production installer warns on or refuses machines outside the scope, using A2's check. Developer builds are exempt, like ADR-0002 B8's developer mode. The trade-off to weigh then: a cloud virtual machine on an older host fails the check, which matters for the Server edition's first platform (ADR-0014 S3).
+
+### Alternatives
+
+| Alternative | Why not |
+|---|---|
+| Check the launch year | CPUID reports none |
+| A model list for AMD | Unneeded: family 1Ah or higher is Zen 5 or newer |
+| A feature floor instead of the generation | One floor cannot fit both vendors: what is new in Intel's 2026 cores (FRED, for example) is missing from Zen 5 |
+| Refuse to boot outside the scope | Stops every test available today |
+| No check (H2 as written) | The owner asked for a strict rule, and the scope could not be reported |
+| Count AMD Zen 5 from any year | Would make rentable EPYC 9005 and Ryzen 9000 machines qualifying hardware, but breaks "2026+"; offered and not chosen |
+
+### Evidence
+
+Checked 2026-11-10:
+
+- **Family and model numbers, from Intel's and AMD's own publications:** `docs/research/2026-11-10-cpu-identification.md`.
+  - Intel confirms every Intel number above. Diamond Rapids, which Linux lists as family 19, is not confirmed by Intel, and the rule does not depend on it.
+  - AMD confirms family 1Ah for EPYC 9005 and for the models documented in 2026, and family 17h and 19h for the older EPYC generations.
+  - Before this, the numbers were first read from two Linux source files. That ledger's section 4 records it, and they are no longer the evidence.
+- **Gorgon Point is Zen 5, family 1Ah:** [Wikipedia](https://en.wikipedia.org/wiki/Zen_5). Its model number is still unconfirmed.
+- **Gorgon Point is a refresh:** [Igor'sLAB](https://www.igorslab.de/amd-ryzen-ai-400-alias-gorgon-point-viel-neue-etiketten-aber-nach-bisherigem-stand-eher-ein-refresh-von-strix-und-krackan/), [Tom's Hardware](https://www.tomshardware.com/pc-components/cpus/amds-ryzen-ai-400-series-includes-the-first-copilot-desktop-cpu-team-red-refreshes-zen-5-apus-and-strix-halo).
+- **Launches:** Zen 6 EPYC in July 2026 ([Club386](https://www.club386.com/amd-confirms-zen-6-launch-date/)); Intel's 2026–2028 roadmap ([Tom's Hardware](https://www.tomshardware.com/tech-industry/semiconductors/intel-chip-roadmap-2026-2028)).
+
+Each row the table adds later needs the same kind of vendor source, recorded beside it.
+
+### Trade-offs and migration
+
+- **What it costs.** One table to maintain, and every new Intel family-6 model must be added to it. AMD needs nothing more for future generations.
+- **What it gains.** The scope becomes visible on every boot, and the table errata need anyway gets a second use.
+- **Migration.** CLAUDE.md's header and §24 say this (revision 7.3). Nothing built changes. New task: the table, the scope line and the two QEMU identities.

@@ -3,6 +3,7 @@
 | | |
 |---|---|
 | Date | 2026-11-08 |
+| Updated | 2026-11-10: gem5 added (§7); two §6 items rechecked |
 | For | CLAUDE.md §74 and the header's hardware target (Intel and AMD platforms from 2026 on) |
 | Outcome | No tool was adopted and no design changed. §5 is a recommendation; the spending and licence questions are the owner's. |
 | Method | CLAUDE.md §16: vendor pages first, dates recorded, local experiments recorded |
@@ -61,6 +62,7 @@ Host: Apple M1 Max (`arm64`), QEMU 11.1.3, repository at commit `540fc2c`.
 | Intel SDE 10.13.1 | Instruction emulator for user programs | No: it runs applications under Pin, which handles user space (R6, R8) | x86 only (R6) | Instructions only: Nova Lake and Diamond Rapids (R7) |
 | AMD SimNow | Full-system simulator | No public build for current chips was found | The newest public build found is 64-bit Linux, judging by its file name (R10) | No public Zen model found (R9 to R12) |
 | QEMU 11.1.3 (installed) | Full-system emulator | Yes, in daily use | Runs on the M1 Max, TCG only (E1) | Model names only; the newest features are refused (E2) |
+| gem5 26.0 (added 2026-11-10, §7) | Full-system and syscall-emulation simulator | Not Origin: no UEFI path, and its CPU is below x86-64-v3 (R20 to R23) | Its developers use Apple Silicon (R19); not tried here | None: generic CPU models (R24) |
 
 - **Neither Intel tool lists Apple Silicon as a host.** Running either on the M1 Max would be unsupported, and it was not attempted.
 - **AMD.** AMD appears to keep SimNow for its own validation work (R11). Any access for Zen would have to be arranged with AMD directly; no public programme was found.
@@ -86,13 +88,64 @@ How Origin OS will be released decides which of clauses 2.1 and 2.2 applies. Und
 | Adopt SDE as a host-only tool once AVX-512, AVX10 or APX code paths exist. | §14 requires runtime detection or per-image declaration of those features, and SDE can exercise such code. It runs Linux and Windows programs, so it would test host builds, not `.ose` files. None exist to test yet (E3). | §4, §5, §11, §14 |
 | Do not adopt Simics now. | Its board is old, it cannot model AMD, device coverage is unconfirmed, and the licence question comes first. If it is adopted later, no Simics model source may enter Origin. | §3, §4, §6, §74 |
 | Do not use simulator timings to support performance claims. | Simics' public platform is a functional model (R1), and QEMU's timing is not hardware timing. | §53, rules 21 and 22 |
+| Do not adopt gem5 (added 2026-11-10; details in §7.3). | Origin cannot boot on it, and its timings are not hardware timings. | §14, §19, §53, §74, rule 30 |
 
 ## 6. Still to verify
 
-- The current public Simics version. R1 dates from 2023, while later builds exist.
+- The current public Simics version. R1 dates from 2023, while later builds exist. Rechecked 2026-11-10: only secondary sources were found, giving Simics 7 from March 2025 and the end of life of commercial Simics 6 in July 2026 (R28). The public release's version is still unconfirmed.
 - Whether the public Simics packages include NVMe or VT-d models.
-- Whether `x86QSP3` exposes AVX2. Origin refuses a CPU below x86-64-v3 at boot.
+- Whether `x86QSP3` exposes AVX2. Origin refuses a CPU below x86-64-v3 at boot. Rechecked 2026-11-10 without a result (R29).
 - SDE's full list of CPU options, from `sde -help` on an x86 host. No Panther Lake entry was found in R7.
 - Whether AMD offers SimNow for Zen under agreement.
 - Whether Intel's developer cloud still exists and whether it allows booting a custom operating system.
 - Which bare-metal hosts offer 2026-or-later CPUs with UEFI and Secure Boot control.
+
+## 7. Addendum, 2026-11-10: gem5
+
+The owner asked whether gem5 had been checked alongside Simics. A note on `origin/main`, `docs/research/2026-11-09-testing-without-buying-hardware.md`, covered it in one sentence. This addendum checks that sentence against gem5's source. R20 to R25 are raw files at a pinned commit, fetched through the GitHub API and read directly rather than through the fetch tool. Nothing was built or installed. Sources marked ‡ were seen only as search-result text.
+
+### 7.1 Sources
+
+| ID | Source | What it establishes |
+|---|---|---|
+| R18 | GitHub releases and branches of `gem5/gem5` (API, 2026-11-10) | v26.0.0.0 was published on 2026-10-21, after v25.1.0.1 on 2026-04-21. `stable` is the default branch. R20 to R25 were read at its head, `9d368896ce119c17e1289dcbb18f33624724b843` (2026-11-04). |
+| R19 | `RELEASE-NOTES.md` on `stable` (first 100,000 of 149,684 characters read through the fetch tool) | Releases 24.0 to 26.0 never mention AVX, VEX, AVX-512, APX, UEFI, EDK2, NVMe or IOMMU. 24.0 says Apple Silicon machines were used regularly during development, and 26.0 mentions daily macOS builds. |
+| R20 | `src/arch/x86/decoder.cc`, `src/arch/x86/isa/decoder/*.isa` and the `src/arch/x86/isa/insts/` tree | The decoder parses two- and three-byte VEX prefixes and passes the opcode to the legacy two-byte and three-byte tables. Instructions are defined only for the general-purpose, x87, MMX (`simd64`), SSE (`simd128`) and system groups. No AVX instruction is defined. |
+| R21 | `src/arch/x86/X86ISA.py` and `src/arch/x86/cpuid.cc` | CPUID values are configuration parameters, listed as EAX, EBX, EDX, ECX. The defaults are vendor `HygonGenuine`, name "Fake gem5 x86_64 CPU", leaf 1 EAX `0x00020F51` (family 0Fh), leaf 1 ECX `0x00000209` (SSE3, MONITOR and SSSE3 only), and leaf 7 EBX `0x01800001` (FSGSBASE, CLFLUSHOPT and CLWB only). |
+| R22 | `src/arch/x86/fs_workload.cc`, `src/arch/x86/linux/fs_workload.cc` and `src/arch/x86/X86FsWorkload.py` | gem5 writes its own GDT, identity-maps the first 4 GiB with 2 MiB pages, turns on long mode and starts an ELF kernel as if a boot loader had already run. It generates SMBIOS, Intel MP and ACPI tables itself, and the Linux variant also writes the E820 map and Linux boot parameters. |
+| R23 | `src/arch/x86/bare_metal/workload.cc`, `src/dev/x86/X86QemuFwCfg.py` and GitHub code search of the default branch | `X86BareMetalWorkload` starts CPU 0 from the INIT state and halts the others, and a QEMU `fw_cfg` device exists. Code search finds no configuration that uses either one, and no mention of SeaBIOS, OVMF or EDK2. |
+| R24 | The `src/dev/` and `src/cpu/` trees | The x86 devices are CMOS, an i8042 keyboard controller, an 82094AA I/O APIC, 8237 DMA, an 8254 timer, an 8259 interrupt controller, a PC speaker, a south bridge, an IDE controller and QEMU `fw_cfg`. There is no NVMe, AHCI, xHCI or USB model, and the only IOMMU model is Arm's SMMUv3. The CPU models are simple (atomic and timing), Minor, O3 and KVM; none is named after a real processor. |
+| R25 | GitHub licence API for `gem5/gem5` | BSD-3-Clause. |
+| R26 | ‡ doi.org/10.1109/ACCESS.2024.3359296 (IEEE Access, vol. 12, 2024; the DOAJ page returned HTTP 403) | "Gem5-AVX" by S. Lee, Y. Kim, D. Nam and J. Kim adds AVX, AVX2 and subsets of AVX-512 to gem5, validated against Haswell and Skylake hardware and SDE. It is not in upstream gem5. |
+| R27 | ‡ github.com/seanzw/gem5-avx | A separate, unofficial fork with partial AVX2 and AVX-512 support. Not confirmed to be R26's code. |
+| R28 | ‡ windriver.com: Simics 7 product overview (2025-04) and "Intel Simics 6 Transitioning to Legacy State" | Simics 7 since March 2025. Commercial Simics 6 reaches end of life in July 2026. |
+| R29 | intel.github.io/tsffs/simics/targetguide-qsp-x86/introduction.html | The QSP-x86 guide's introduction names no processor model or feature. `index.single-page.html` in the same directory returned HTTP 404. |
+
+### 7.2 Checks against Origin
+
+- **E4. What Origin's kernel needs at entry.** Repository at commit `5b6ab78`. The kernel halts with "CPU baseline failed" on a CPU below x86-64-v3 (`framekernel/src/main.rs`, lines 188 to 201). It starts from the `BootInfo` structure that Origin's UEFI loader builds, which carries the UEFI system table and the loader's page tables (`boot/info/src/lib.rs`, line 133).
+
+| Origin needs | gem5 26.0's x86 model | Effect |
+|---|---|---|
+| UEFI boot (§19) | None provided. gem5 sets up long mode and its own tables, then jumps into an ELF kernel (R22). A reset-state workload and a QEMU `fw_cfg` device exist, but nothing uses them (R23). | Origin would need an entry path used only on gem5. That path would never ship. |
+| x86-64-v3 (§14) | The default CPU lacks CX16, SSE4.1, SSE4.2, POPCNT, MOVBE, XSAVE, AVX, AVX2, BMI1, BMI2, FMA and F16C (R21), so it is below even x86-64-v2. Editing CPUID does not help, because no AVX instruction is defined (R20). | Origin halts at boot (E4). Userspace built for x86-64-v3 (§11) could not run. |
+| NVMe, IOMMU and USB (§32 to §34) | None on x86 (R24). | The storage, DMA-protection and USB paths cannot be tested. |
+| Intel and AMD platforms from 2026 on (header) | Generic CPU models only (R24). CPUID reports family 0Fh (R21). | The same limit as QEMU. |
+| The M1 Max as host | Its developers use Apple Silicon (R19). The KVM CPU runs guest code on the host processor, so on the M1 Max x86 would run only in software models. | Not tried here. |
+| Licence | BSD-3-Clause (R25). | Acceptable for a host-only tool (§4). |
+
+The 2026-11-09 note says gem5 has "no AVX decode". More precisely, the decoder parses VEX prefixes, but no AVX instruction is defined (R20). The note's conclusion stands. Out-of-tree work adds AVX (R26, R27), but neither is described as adding firmware or devices.
+
+### 7.3 Recommendation, checked against CLAUDE.md
+
+| Recommendation | Reason | CLAUDE.md |
+|---|---|---|
+| Do not adopt gem5 for testing Origin. | gem5 provides no UEFI path (R22, R23). Its CPU is below x86-64-v3 and cannot be raised (R20, R21), so Origin halts (E4). It has no NVMe, IOMMU or USB (R24). Booting Origin would need a gem5-only entry path that never ships. | Header, §14, §19, §74, rule 30 |
+| Do not use gem5 timings to support performance claims. | Its CPU models are generic (R24), not the 2026 Intel and AMD cores that Origin targets. | §53, rules 21 and 22 |
+| Reconsider gem5 only for a specific cache, coherence or pipeline question, and only as a host-only tool. | Its BSD-3-Clause licence (R25) suits host-only use. No gem5 source may enter Origin. | §3, §4, §6, §16, §66 |
+
+### 7.4 Still to verify
+
+- Whether OVMF or another UEFI build runs on gem5's bare-metal workload. It is untested, and Origin would still lack x86-64-v3 there.
+- Whether R26's source is public, and whether it supports full-system mode.
+- Whether gem5 26.0 builds on the M1 Max.

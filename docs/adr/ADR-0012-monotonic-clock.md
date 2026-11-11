@@ -145,3 +145,16 @@ The floor is kernel-only memory. No user code reads or writes it. The clock's va
 1. Accept the contract (C1) and an unconditional floor (C2), at the cost shown in C8? Recommended: yes. Nothing else makes the promise on every machine, and no caller is hot today. **Yes (2026-11-09).**
 2. Accept that a machine without an invariant TSC keeps order but not rate (C3), rather than failing or moving to a platform timer? Recommended: yes. Supported hardware has the bit; a machine without it is outside the supported set, and it is how the kernel is tested. **Yes (2026-11-09).**
 3. Accept leaving IA32_TSC_ADJUST unused until a physical machine shows a constant offset (C5)? Recommended: yes. It is not needed for the contract, and code for it could not have run anywhere yet. **Yes (2026-11-09).**
+
+## Recorded 2026-11-10: an experiment before C2 is looked at again
+
+*The owner accepted this on 2026-11-10 ("Accept all", decision sheet item 114). It changes no decision above: C1 and C2 stand.*
+
+The design review (`docs/engineering/DESIGN_REVIEW_2026-11-10.md`, finding 9) made two observations.
+
+- **The step that led to this ADR may come from how it was measured.** It was 16 ticks in 261,083 handoffs, in 1 boot of 13, on a nested virtual machine. An unfenced RDTSC can produce that with counters that agree exactly: the reader's RDTSC may execute before the load that hands it the other processor's value has completed. The ledger records that RDTSC is unordered and that LFENCE orders it (rows I1 and I7). No run with a fenced read is recorded.
+- **The floor's cost falls on every reader.** C8 measured it, and user mode will read the clock through a system call (ADR-0005 C13) while ADR-0011 N8 promises a shared page.
+
+**The experiment.** Run `prove_consistent` with `LFENCE; RDTSC` on the same CI runners, for as many boots as showed the step before.
+
+**What follows from it.** If the steps go, a fast path is put to the owner as an amendment, with measurements: a fenced per-processor read while the counters are trusted, with the floor as the state the kernel falls back to when a check fails. That would change C2, which was accepted as unconditional, so it is the owner's decision then. Whatever the result, that amendment also proposes a bound on how far one reading may raise the floor (C7's wild value).

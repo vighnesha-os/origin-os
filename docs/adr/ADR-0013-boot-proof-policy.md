@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-09, as proposed, with the recommended answer to each of the five questions below (decision sheet item 55). The owner's answer was "Accept both" to one question covering ADR-0012 and this ADR, relayed by the session that asked it. It decides what a machine does when the kernel's own checks fail (CLAUDE.md §18), and is not an ABI or format decision (§84). Everything below is built and boot-tested under QEMU, except what Migration says is left for later; the follow-ups F1 to F6 this inventory found are fixed. Nothing here has shipped, and nothing has run on physical hardware (§74). |
+| Status | **Accepted** by the owner on 2026-11-09, as proposed, with the recommended answer to each of the five questions below (decision sheet item 55). The owner's answer was "Accept both" to one question covering ADR-0012 and this ADR, relayed by the session that asked it. It decides what a machine does when the kernel's own checks fail (CLAUDE.md §18), and is not an ABI or format decision (§84). Everything below is built and boot-tested under QEMU, except what Migration says is left for later; the follow-ups F1 to F6 this inventory found are fixed. Nothing here has shipped, and nothing has run on physical hardware (§74). **Amendment 1 (below): Accepted** by the owner on 2026-11-10 (item 113); not built. |
 | Requires | CLAUDE.md P0, P8, §13 (explicit panic handling), §18, §19 (early diagnostics), §20 (boot-failure detection), §24–§26, §28–§31, §58, §59, §65, §68, §69 (safe mode, boot recovery), §74, rules 14, 16, 30, 34, 35, 40 |
 | Code | `framekernel/src/bootproof.rs` (the policy table and the tally), `framekernel/src/kernel.rs` (`kernel_main`), `framekernel/src/{sched,wait,time,irq,i8042,storage,pcie,console,stacks}.rs`, `framekernel/frame/src/{timer,early,port,acpi,apic}.rs`, `developer-tools/xtask/src/main.rs` |
 | Evidence | `docs/research/2026-11-09-boot-proof-failures.md`; `docs/engineering/SOURCE_PROVENANCE.md`, "What a failed boot proof means" |
@@ -136,7 +136,7 @@ Apart from the SMEP proof's stale translation above (Intel, fixed on the CI bran
 | Clock sources (`time::init`) | The RTC, HPET or PM timer disagrees with the TSC, or the wall clock is unreadable. Nothing uses HPET or the PM timer, and the monotonic clock is published either way | Yes: firmware values, PIT gating |
 | I/O APIC routing (`irq::prove`) | The PIT's IRQ0 did not arrive through the I/O APIC, with the 8254 counting. A machine whose 8254 does not count reports that it cannot prove this and passes (F3) | Only with the 8254 counting and something else wrong |
 | CPU topology, NUMA affinities, NUMA distances | Firmware and CPUID disagree. The scheduler uses none of it yet | Yes: firmware tables |
-| Hardware entropy (`prove_entropy`) | RDSEED/RDRAND dead or stuck | Yes. Nothing consumes it yet (R3) |
+| Hardware entropy (`prove_entropy`) | RDSEED/RDRAND dead or stuck | Yes. It has been consumed since S3-3, and it becomes Withdraw with the kernel's generator (Amendment 1) |
 | Scheduler fairness | Two workers' shares of running time differ by over 2×. Time since F6: the measure that failed was loop counts | **Seen** on the old measure: 2.1–2.5× on a Xeon 8370C (shared cores) |
 | Scheduler weights | Shares off under load | **Seen** failing under load (1 boot in 30, all cores loaded) |
 | Thread lifecycle, refused spawns, thread reaping | Accounting or a leak; a yield or sleep out of bounds | Yes: timing bounds. A leak is a bug, not a safety failure |
@@ -279,3 +279,29 @@ The Refuse list costs a stricter boot on real machines than the proofs had befor
 3. Accept that a refusal halts rather than resets until a boot manager records boot attempts (R5)? **Recommended: yes.** **Yes (2026-11-09).**
 4. No "continue past a refusal" switch for first physical boots? **Recommended: yes, no switch.** A one-line local edit does it for a bring-up session, and a switch can be left on. **Yes (2026-11-09).**
 5. Which proofs should a production boot still run? They were written for development and cost several seconds of deliberate waiting on every boot (the 2 s weights proof alone, the 1 to 3.2 s RTC second). **Recommended: decide before M9** and keep them all until then; the table above is the list to prune. **Yes: decide before M9 (2026-11-09).**
+
+## Amendment 1 (Accepted, 2026-11-10): the entropy proof becomes Withdraw with the kernel's generator
+
+**Status: Accepted by the owner on 2026-11-10, as recommended ("Accept all", decision sheet item 113; CLAUDE.md §18). Not built.** The inventory's class for this proof, `framekernel::bootproof` and the host test that pins them still say Report. All three change in one commit, with the generator. The evidence is finding 8 of `docs/engineering/DESIGN_REVIEW_2026-11-10.md`.
+
+**Why.** R3 moves a proof "when something comes to depend on what it proves", and gives entropy as its example of a result nothing consumes. That stopped being true with task S3-3:
+
+- a start record's address is drawn from RDSEED or RDRAND (`framekernel/src/launch.rs`);
+- so are the DHCP and TFTP identifiers (`framekernel/src/virtionet.rs`);
+- task S3-5b draws one value for each mapping.
+
+Each consumer refuses when a draw fails. None of them sees what the proof checks: a source that is stuck but still reports success.
+
+**The decision.** When the kernel's random-number generator lands (CLAUDE.md §59), "hardware entropy" becomes a Withdraw row. What is withheld is randomness. With no healthy seed, nothing is launched and nothing is placed at a random address. The generator's ADR decides the health tests that replace today's proof.
+
+**Alternatives.**
+
+| Alternative | For | Against |
+|---|---|---|
+| Leave it Report | No change | A stuck source gives predictable addresses and identifiers, and nothing acts on the proof that saw it |
+| Refuse: stop the boot | Simplest gate | It fails R1(b): a correct kernel can meet a slow source, or fail a statistical health test by chance. Withdraw withholds exactly what depends on the result, and the boot still reaches its verdict |
+| Withdraw now, before the generator | Sooner | Each consumer would need the tally passed to it, only to be rewritten when the generator becomes the one consumer |
+
+**Trade-offs.** A machine whose source fails its health tests starts no program until it has a seed. That is the point (P0).
+
+**Migration consequences.** `framekernel::bootproof`'s table, its host test and this inventory change together. No ABI or format changes.

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-09, as recommended: questions 1–6 below, decision sheet items 33–38 (CLAUDE.md §18, §84). Question 7 is still the owner's. N6, and N13's gates on `unsafe` and on dependency direction, are built (2026-11-09: the framework crate `framekernel/frame/`, with no `unsafe` left outside it; `docs/engineering/SOURCE_PROVENANCE.md`), which is step 1 of N14; N1–N5, N7–N12, the rest of N13 and the rest of N14 are not built. The owner set the direction the same day: "100% native SDK (if possible)", with the console, the terminal and the kernel included, and "every module as SDK" |
+| Status | **Accepted** by the owner on 2026-11-09, as recommended: questions 1–6 below, decision sheet items 33–38 (CLAUDE.md §18, §84). Question 7 was answered the same day (item 39). **Amendment 1 (below): Accepted** by the owner on 2026-11-10 (item 108); not built. N6, and N13's gates on `unsafe` and on dependency direction, are built (2026-11-09: the framework crate `framekernel/frame/`, with no `unsafe` left outside it; `docs/engineering/SOURCE_PROVENANCE.md`), which is step 1 of N14; N1–N5, N7–N12, the rest of N13 and the rest of N14 are not built. The owner set the direction the same day: "100% native SDK (if possible)", with the console, the terminal and the kernel included, and "every module as SDK" |
 | Requires | CLAUDE.md P1, P2, P3, P8; §3, §5, §7, §13, §22, §30, §42, §44, §45, §47–§50, §53, §58, §62, §63, §66, §70, §72; final rules 5, 10, 11, 12, 20, 21, 36 |
 | Evidence | `docs/research/2026-11-09-native-sdk.md`; `docs/engineering/PRE_MERGE_REVIEW_2026-11-09.md` |
 | Builds on | ADR-0001 (framekernel argument R1, user-mode drivers D2, default 10); ADR-0003 K1; ADR-0005 (P1, P4, P6, P8, P12, A6); ONBF §6.1 |
@@ -179,3 +179,37 @@ The OIDL grammar, the Driver ABI, the graphics path, any POSIX layer, how `std` 
 5. Kernel-stamped caller identity on every channel message, as an amendment to ADR-0005 (N9)? **Yes (2026-11-09).**
 6. Each system-call number accepted only from its own address in `origin.core` (N5)? **Yes (2026-11-09).**
 7. If accepted, will you amend CLAUDE.md §48 and §70 to say this? They are your text, so Claude has not changed them. **Yes (2026-11-09; decision sheet item 39): Claude drafts the wording and the owner approves it before it goes in. The owner approved it the same day: CLAUDE.md revision 7.2.**
+
+## Amendment 1 (Accepted, 2026-11-10): N1's rule gets a mechanism
+
+**Status: Accepted by the owner on 2026-11-10, as recommended ("Accept all", decision sheet item 108; CLAUDE.md §18). Nothing in it is built.** The evidence is finding 3 of `docs/engineering/DESIGN_REVIEW_2026-11-10.md`. N1, N2 and N13 stand. This adds to N13, and says where N1 holds at run time.
+
+**Why.** N13 lists a gate: "first-party system code starts a first-party tool as a process". It is a check of source text. It is not built, and it could not see what a program does when it runs: a helper crate or a general "run" method would pass it. Nothing breaks N1 today, because no shipping crate starts a process and no interface creates one. The mechanism has to exist before the Loader Service's interface does.
+
+| # | Decision |
+|---|---|
+| M1 | **Starting a program is a named capability** on the Loader Service's interface, declared with OIDL's `requires` (`docs/spec/OIDL.md` §6). Its name is decided with that interface (§84). |
+| M2 | **A release gate reads every first-party manifest** (ONBF §6.2, `capabilities`). Only the session launcher, the shell, the terminal and developer tools may declare the capability. The desktop, Settings, the installer, Origin Setup and every service never do. |
+| M3 | **A program without the capability is never handed the launch interface.** Its launcher builds its directory from what it declared (N9), so the rule holds at run time and not only in review. |
+| M4 | **The base image holds no command interpreter.** The shell and the terminal are an optional developer package (§48). |
+| M5 | **The environment carries nothing by default,** and no system library reads it. First-party services take their configuration through typed interfaces, never through arguments (ADR-0005 Amendment 6, E2). |
+| M6 | **A GUI test reads the kernel's record of process creation,** and fails if a first-party GUI component created a process (§72). |
+| M7 | **No interface takes text that its receiver executes or hands to a program.** This is a review rule for every OIDL definition. |
+
+**Alternatives.**
+
+| Alternative | For | Against |
+|---|---|---|
+| N13's source gate alone | Nothing new to build | It reads source, not behaviour |
+| No launch interface for first-party code at all | Nothing to misuse | The session launcher, the shell and the terminal must start programs (N2) |
+| M6 alone, as an audit | Simple | It finds a violation after it has been written, and only on the paths a test walks |
+
+**Trade-offs.** One more capability and one more gate to keep. A first-party component that truly needs to start a program has to be added to M2's list, in review, where the reason is seen.
+
+**Migration consequences.** None now: no EXE or APP manifest exists yet, and ONBF's key registry assigns capability keys when those profiles are implemented. After a release, taking the capability away from a component that shipped with it is a compatibility change (rule 39).
+
+**Threat model (§58), one more row.**
+
+| # | Threat | Defence |
+|---|---|---|
+| S10 | A first-party component is made to run a command: text that reaches a service is passed to a program, or a helper is started with arguments an attacker shaped | The component holds no way to start a program (M1–M3), nothing reads an inherited environment (M5), and no interface takes text to execute (M7) |

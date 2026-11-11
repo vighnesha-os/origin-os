@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| As of | 2026-11-09, on `main`, after the pre-merge review. Everything that was on a side branch is merged. |
-| Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
+| As of | 2026-11-10 for items 71–123. Items up to 70: 2026-11-09, after the pre-merge review. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. |
-| Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–123 (item 97 delegated to Claude). |
+| Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -208,7 +208,68 @@ What this means in practice:
 - Merge commits from `main` don't count toward the 100, and nothing is padded to reach it (CLAUDE.md §7).
 - Merging still takes the owner's word.
 
-**Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.
+**Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists and an organisation can hold the signature (Amendment 1, item 78); USB-IF and Thunderbolt licensing (§35), when that work starts.
+
+## Editions, device standards and the public repository (ADR-0014, ADR-0015, ADR-0002 Amendment 1): Accepted 2026-11-10, nothing built
+
+On 2026-11-10 you said you are building a Desktop and a Server OS. You want:
+
+- both with the native GUI, "not terminal";
+- the server running the full native desktop;
+- the kernel, NVMe, USB4, Thunderbolt 4/5, Wi-Fi 6/7 and Bluetooth "with all features as Native SDK".
+
+Claude recommended these seventeen items, each checked against CLAUDE.md v7.2. Items 1–5 were revised twice as your direction became clearer. You answered **"Accept all"** in the same session. They are recorded in CLAUDE.md revision 7.3.
+
+| # | Question | Answer |
+|---|---|---|
+| 71, answered | Server is an edition of the same release and installs the full desktop by default; editions differ only in defaults (ADR-0014 S1)? | **Accept** |
+| 72, answered | Desktop through M9 first; server-only work after M9 (S2)? | **Accept** |
+| 73, answered | The first server platform is a KVM guest with its GUI on the VM's display; physical servers later on 2026 platforms (S3)? | **Accept** |
+| 74, answered | Administration only through the native GUI (console, management app, remote desktop); remote desktop built before the server ships; no terminal needed; no web administration page (S4)? | **Accept** |
+| 75, answered | Server sessions cheap and closed: login screen only when idle, unprivileged, nothing in the UI listening on a network (S5)? | **Accept** |
+| 76, answered | Software written for other systems decided later: Rust `std` first, a POSIX library only through its own ADR at M6 (S6)? | **Accept** |
+| 77, answered | A trademark search for the product name before the first public release (CLAUDE.md §76)? vivo has shipped "OriginOS" worldwide since 2025-10-15. | **Accept.** The search is yours to arrange |
+| 78, answered | Secure Boot defaults to Origin-owned keys; the Microsoft-signed first stage waits for an organisation (ADR-0002 Amendment 1)? This reverses B7's default order of 2026-11-07, which Claude had not pointed out when recommending it. | **Accept** |
+| 79, answered | Add `CONTRIBUTING.md` (DCO sign-off, an original-source declaration), `SECURITY.md` and `CODEOWNERS` (CLAUDE.md §6)? | **Accept.** Turning on GitHub's private vulnerability reporting is a repository setting, so it is yours |
+| 80, answered | DisplayPort first; read the Thunderbolt licence before its specification; keep restricted documents out of Git (ADR-0015 D7)? | **Accept** |
+| 81, answered | Add remote administration, service management, hardware health and remote desktop to §49 (ADR-0014 S7)? | **Accept** |
+| 82, answered | Three typed layers per device technology (class, the whole standard, documented vendor extras), with each device reporting its features truthfully (ADR-0015 D1, D2)? | **Accept** |
+| 83, answered | Separate rights for dangerous operations; raw access for administrator diagnostics only; unprivileged radio stacks; fuzzed parsers (D3, D4)? | **Accept** |
+| 84, answered | Thunderbolt 4/5 inside the USB4 interface; the name only after certification (D5)? | **Accept** |
+| 85, answered | Wi-Fi and Bluetooth drivers wait for vendor documentation or an approved clean-room ADR; host stacks first; licensing and regulation checked before shipping (D6)? | **Accept** |
+| 86, answered | Add IEEE 802.11-2024 with 802.11be, and Bluetooth Core 6.2 or later, to §17 (D8)? | **Accept** |
+| 87, answered | NVMe and xHCI first; USB4, Thunderbolt, Wi-Fi and Bluetooth at M10 on physical hardware (D9)? | **Accept** |
+
+**Yours to do:** the trademark search (item 77), and turning on private vulnerability reporting under the repository's Settings → Security (item 79).
+
+## A strict hardware scope (ADR-0009 Amendment 1): Accepted 2026-11-10, nothing built
+
+You asked for a strict rule: "we are building for 2026+ hardware and in AMD Zen5 and Zen5+ / For Intel also 2026+ hardware". Then, since a CPU reports no year, you asked whether Panther Lake, Nova Lake, Zen 5, Zen 6 and so on could be checked instead. Claude checked the CPUID family and model numbers and recommended these. You answered **"Accept all"**.
+
+| # | Question | Answer |
+|---|---|---|
+| 88, answered | The scope: Intel platforms launched in 2026 or later; AMD platforms launched in 2026 or later with Zen 5 or newer cores; everything else is bench equipment only (A1)? Zen 5 itself launched in 2024. Counting Zen 5 from any year was offered and not chosen. | **Accept** |
+| 89, answered | The kernel names the core generation from CPUID (AMD family 1Ah or higher; Intel family 18 or higher, or family 6 model CCh, D5h, DDh or E5h), from one table built from Intel's and AMD's documents, and reports the scope at boot without ever refusing to boot (A2)? | **Accept** |
+| 90, answered | At M9, decide whether the production installer warns on or refuses machines outside the scope, with developer builds exempt (A3)? | **Accept**, to be decided at M9 |
+
+## Linux and other open-source code as a reference only (CLAUDE.md §3, §6, §16): decided by the owner 2026-11-10
+
+Claude had proposed five items allowing Linux drivers to be studied for how they handle hardware. You narrowed that in your own words: "in any case if need to refer Linux code that should be completely as reference, Don't copy just to understand if anything missing from Vendor or official specifications or standards". That replaces Claude's proposal.
+
+| # | Question | Answer |
+|---|---|---|
+| 91, answered | When may Linux source be read? | **Only as a reference, to understand what the vendor's documents or the official specifications and standards leave out. Never copied** (your rule, 2026-11-10) |
+| 92, answered | So that code is never written with Linux source open: the reading step writes the missing facts into Origin's specification or research ledger in Origin's own words, citing file, commit and licence; the code is then written from that, in a separate session, without the Linux source? | **Yes, as recommended** ("keep 92 as before you said", 2026-11-10). Claude writes Origin's code and was trained on Linux's code, so this split is what keeps "don't copy" true. It is also the clean-room process ADR-0015 D6 asked for |
+| 93, answered | Record per driver which Linux files were consulted, their licence, and which gap each one filled (§6)? | **Yes** ("accept 93", 2026-11-10) |
+
+You then asked whether public sources, Linux and other open-source operating systems, Ubuntu included, could cover these drivers without spending, as of today rather than from Claude's training data. You answered **"Accept all"** to these.
+
+| # | Question | Answer |
+|---|---|---|
+| 94, answered | Extend items 91–93 to other open-source projects on the same terms (gaps only, never copied, Origin's own specification first, licence recorded)? <br>• **Ubuntu:** its kernel patches, packaged firmware and user-space stacks such as wpa_supplicant, BlueZ and fwupd. <br>• **Others:** the BSDs, Haiku, Redox, Fuchsia, illumos, EDK2, coreboot, SeaBIOS, QEMU's device models, SPDK, `libspdm`, Zephyr and NimBLE. <br>• **Excluded:** ReactOS (§3 names it, and it reimplements Windows). Leaked or proprietary code is never opened. | **Accept** |
+| 95, answered | The source order, with no spending: free official specifications and vendor documents first; then open-source code the vendor wrote itself (EDK2, SPDK, `libspdm`, Intel's Linux drivers); then other open-source systems? The paid PCIe specification stays unread, and a feature with no free legitimate source is reported "not supported" (ADR-0015 D2). | **Accept** |
+| 96, answered | Always today's version: read each reference from the newest release on the day (on 2026-11-10 that was Linux 7.4-rc2 or 7.3.3, and Ubuntu 26.10 or 26.04.1 LTS); record its tag or commit and the date; re-check specification revisions the same day; never rely on Claude's memory of older code? | **Accept** |
+| 97, answered | Where vendor documents already cover a topic, may Linux (or another allowed project) still be read? | **Delegated to Claude**: "If vendor fie already covers, then your choice why do you want to read, take decision appropriately" (2026-11-10). <br>**Claude's decision:** only for a named reason, recorded with the reference (§6): <br>• device quirks, errata workarounds or firmware behaviour the documents do not describe; <br>• a specification ambiguity, where interoperability depends on how deployed systems read it; <br>• research into what Linux supports; <br>• debugging a difference between Origin and Linux on the same hardware. <br>Never just to see how Linux structured something the documents already explain: Origin's design differs, so that adds copying risk and nothing else. Items 92, 93 and 96 still apply. In CLAUDE.md §3 |
 
 ## ADR-0004 H2: the heap, the stacks and the probe page (Accepted 2026-11-10)
 
@@ -231,6 +292,58 @@ Task S3-5b (memory objects) needs five interface decisions that C6–C8 (items 6
 | 103, answered | D3: `memory_unmap` and `memory_protect` name the process, the mapping's start and its length; in v1 exactly one whole mapping; protect only reduces access? | **Accept** |
 | 104, answered | D4: quotas set by the creator: committed bytes, mappings, and a rate for unmap and protect; `limit` past a quota, `no_memory` without frames, `should_wait` past the rate with nothing changed? | **Accept** |
 | 105, answered | D5: the rest: `write` on the process handle for every call, the caller's own included; existing statuses only, in a fixed order; ADR-0004 H1's addresses and the start records' random region; a mapping holds its object; two new constants; `user-abi` 0.5 in one step? | **Accept** |
+
+Items 71–97 and 98–105 were written on two branches that had not met. They are in one sheet since the records branch merged them on 2026-11-10 (item 106).
+
+## The design review of 2026-11-10 (items 106–123): Accepted 2026-11-10, recorded, almost nothing built
+
+On 2026-11-10 you asked for a very careful review of CLAUDE.md and the design documents: "Extreme highest security, performance, design, native SDK no calling of shell commands from GUI or UI. Check very carefully each and everything."
+
+The review is `docs/engineering/DESIGN_REVIEW_2026-11-10.md`. It read the documents at `land/s3-part2` (`02d9ba8`) and `docs/editions-device-sdk` (`a95d05b`), checked each of its 19 findings against the code, and put 18 decisions to you. Each had a recommended answer, checked against CLAUDE.md 7.3 and every accepted ADR. You answered **"Accept all"** in the same session.
+
+Five of them change something you had already accepted. The review said so before you answered:
+
+- item 106 changes item 70;
+- item 109 changes ADR-0005 P1;
+- item 113 changes one row of ADR-0013's table;
+- item 114's second step would change ADR-0012 C2, and only if the experiment supports it;
+- item 117 rewords item 74.
+
+| # | Question | Answer | Where it is recorded, and its state |
+|---|---|---|---|
+| 106, answered | Commit and push the editions branch, and land directive, ADR and decision-sheet changes on `main` in pull requests of their own, outside item 70's 100-commit rule (finding 1)? | **Accept** | CLAUDE.md §79. **Done so far:** the editions branch is committed and pushed, and merged with the landing line on the records branch. Reaching `main` waits for your word on that pull request |
+| 107, answered | Drop the commit that holds Intel's VT-d PDF, keep the gem5 ledger, and add an ignore rule and a gate (finding 2)? | **Accept** | `.gitignore`. **Done except the gate:** the commit is on no branch and was never pushed, the ledger is on the records branch, and the PDF is a local file again |
+| 108, answered | Make "no first-party component runs a command" structural: starting a program is a capability; a release gate over first-party manifests; no command interpreter in the base image; an empty environment by default; a run-time test; no interface that takes text to execute (finding 3)? | **Accept** | CLAUDE.md §48; ADR-0011 Amendment 1; ADR-0005 Amendment 6, E2. Not built. The capability's name is decided with the Loader Service's interface (§84) |
+| 109, answered | 64-bit handles, while `user-abi` is at major 0 (finding 4)? | **Accept** | ADR-0005 Amendment 6, E1. Not built |
+| 110, answered | Remove `preserves_flags` from the twelve assembly blocks and add a gate (finding 5)? | **Accept** | CLAUDE.md §13. Not built |
+| 111, answered | An ADR on what lives in the kernel; move the modules that are not the kernel's; fix which files may hold `unsafe` (finding 6)? | **Accept** | CLAUDE.md §13. The ADR is to be written |
+| 112, answered | A system threat model, and an ADR on speculation and processor hardening, both before ADR-0011 N14 step 4 (finding 7)? | **Accept** | CLAUDE.md §18, §24, §58. Both are to be written |
+| 113, answered | A kernel random-number generator (HMAC_DRBG over SHA-512) before S3-5b lands, with the entropy proof moved to Withdraw (finding 8)? | **Accept** | CLAUDE.md §17, §59; ADR-0013 Amendment 1; ADR-0004 H3's note. Not built: the row moves with the generator |
+| 114, answered | Run the fenced-read experiment on the clock now, and decide the fast path from its result (finding 9)? | **Accept** | ADR-0012's note. C1 and C2 stand until the result is in and you decide |
+| 115, answered | Provisional performance budgets, recorded from CI as trends (finding 10)? | **Accept** | CLAUDE.md §53. The file is to be written |
+| 116, answered | Security rules for the GUI (finding 11)? | **Accept** | CLAUDE.md §52 |
+| 117, answered | Reword "GUI only" as "the GUI is always enough, and nothing needs a terminal", with declarative provisioning and a process for each remote session (finding 12)? | **Accept** | CLAUDE.md §48; ADR-0014 Amendment 1 |
+| 118, answered | ADRs for locking and for the rest of the cryptographic profile; the trade-offs and migration sections missing from ADR-0002 to ADR-0005 (finding 13)? | **Accept** | CLAUDE.md §59. To be written |
+| 119, answered | ADR-0002 Amendment 2: measured boot, the rollback floor, firmware runtime calls (finding 14)? | **Accept** | ADR-0004 H3's note. To be written, with the SYS profile |
+| 120, answered | Make the four statements the build makes true, or reword them (finding 15)? | **Accept** | Not built |
+| 121, answered | Three more rules for reference code, with a person's sign-off on the first driver written that way (finding 16)? | **Accept** | CLAUDE.md §3; ADR-0015 D6 |
+| 122, answered | A checked provenance table, task contracts from S3-5b on, and exit tests for each milestone (finding 17)? | **Accept** | CLAUDE.md §6, §82. Not built |
+| 123, answered | Overflow checks in the kernel and loader; x86-64-v3's integer features once the loader checks the baseline; `verify.sh` and `--locked` in CI; a wider §11 lint (finding 18)? | **Accept** | CLAUDE.md §14. Not built |
+
+Finding 19's smaller points were not put as decisions. They stay in the review as tidying.
+
+The work these create is in `TASKS.md`, items 17 to 30.
+
+**Two later answers changed this revision's wording, on the same day.** You accepted the six questions of ADR-0016, the kernel's random-number generator, as items 146 to 151. They are recorded with that ADR, which is on the generator's branch until it lands. Two of them are in draft 7.4:
+
+- item 149: §59 says the health tests are on what each source returns, catch gross failure only, and claim no SP 800-90B conformance;
+- item 151: §17 names SP 800-90A Rev. 1, SP 800-90B (January 2018), SP 800-90C (September 2025) and FIPS 198-1.
+
+**Yours to do:**
+
+- Read revision 7.4's wording and say whether the records pull request may merge (item 106). CLAUDE.md is your text, and merging takes your word.
+- Confirm ADR-0009's text, which you delegated and have not reviewed, and ADR-0007's two additions marked "for the owner's review" (item 122).
+- Name the person who signs off the first driver written from reference reading, when one exists (item 121).
 
 ## S3-5b: the status when a map runs out (Accepted 2026-11-10)
 
