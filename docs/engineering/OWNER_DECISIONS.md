@@ -3,10 +3,10 @@
 | | |
 |---|---|
 | As of | 2026-11-10 for items 71–141 and 145–154, and 2026-11-11 for items 161 and 165. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144 and 155–164 are on another branch (`land/s3-part2`) and are not in this sheet yet. |
-| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Item 165: your own text for CLAUDE.md §1, read against the rest of the directive; what it leaves as it was is in its section. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Item 165: your own text for CLAUDE.md §1, in its second version, read against the whole of revision 7.5; the check is `ROLES_CHECK_2026-11-11.md`. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
 | Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: items 161 and 165. |
-| Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
+| Still open | No numbered item. Twelve proposals on the roles of §1 are put to you in `ROLES_CHECK_2026-11-11.md` (see item 165's section). Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -441,16 +441,41 @@ This is for pull request 15 only. Item 70 stands for every later code pull reque
 
 ## The roles in CLAUDE.md §1 (item 165): your text, 2026-11-11
 
-On 2026-11-11 you gave new text for the start of CLAUDE.md §1, "Your mission", with the words "update CLAUDE.md with following at line: 35". It names three lead roles, sets 100% coverage of approved requirements as the completion target, and lists 28 specialist roles with their responsibilities.
+On 2026-11-11 you gave new text for the start of CLAUDE.md §1, "Your mission", twice:
+
+- first with the words "update CLAUDE.md with following at line: 35": three lead roles and 28 specialist roles;
+- then, later that day, with the words "Update CLAUDE.md at line: 35 with following, check carefully, if anything missing": six lead roles, 50 specialist roles and two closing paragraphs.
+
+The second replaced the first before the first had reached `main`, and it is what revision 7.5 holds. Like the first, it sets 100% coverage of approved requirements as the completion target. Its two closing paragraphs say what every role must define (security invariants, performance budgets, resource limits, failure behavior and acceptance evidence), and that the roles set responsibilities while tasks are assigned by source ownership, task independence, available resources and integration needs.
 
 | # | What | Where |
 |---|---|---|
-| 165, your text | The sentence that opened §1 ("You are the Principal Operating System Architect, ... and Multi-Agent Engineering Coordinator for Origin OS.") is replaced by your text | CLAUDE.md 7.5, §1. Revision 7.4 is kept at `docs/engineering/CLAUDE-v7.4.md` |
+| 165, your text | The sentence that opened §1 ("You are the Principal Operating System Architect, ... and Multi-Agent Engineering Coordinator for Origin OS.") is replaced by your text, in its second version | CLAUDE.md 7.5, §1. Revision 7.4 is kept at `docs/engineering/CLAUDE-v7.4.md` |
 
 How it was put in:
 
-- **Your words are in as you gave them,** checked against the pasted text line by line. Two blank lines were added, so that your three opening paragraphs stay three paragraphs in Markdown.
-- **Line 35 is where the old sentence stands in revision 7.1,** which the main checkout still held that day. In revision 7.4 it was line 36. Your text replaces that sentence; the nine roles it named are all among your 28.
+- **Your words are in as you gave them,** checked against your message line by line: 55 lines, the same in both. Three blank lines were added, so that your three opening paragraphs and your two closing paragraphs stay separate in Markdown.
+- **Line 35 is where the old sentence stands in revision 7.1,** which the main checkout still held that day. In revision 7.4 it was line 36. Your text replaces that sentence; the nine roles it named are all among your 50.
 - **Nothing else in the directive changes.** The rest of §1 follows your text as before.
+- **The first version is kept only in this branch's history,** at commit `fc92eca`.
 
-One thing left as it was, for you to say: §77 still lists 26 engineering agents. They overlap your 28 roles and do not match them one for one.
+What the second version changes from the first:
+
+- **22 more roles, 29 to 50:** four for security, four for performance, and one each for developer tooling, IPC and system services, the two editions together, external I/O, virtual and cloud validation, privacy, configuration, backup, requirements, conformance, the firmware lifecycle, documentation and support, Origin Desktop and Origin Server.
+- **Role 19 is the Native SDK Architect alone.** Developer experience moved to role 37.
+- **A number of sentences are shorter.**
+
+**The check you asked for** is `docs/engineering/ROLES_CHECK_2026-11-11.md`. It found no role that contradicts the directive or an accepted ADR. It makes twelve proposals. They are yours to answer, they get item numbers when you do, and none of them is in CLAUDE.md:
+
+1. a role for original source, provenance and licensing;
+2. a role for the NPU and the Compute API;
+3. the SDK-only rule's enforcement, in role 19;
+4. the GUI as a security boundary, international text and visual design, in role 20;
+5. video, cameras, printers and scanners, in roles 13 and 14;
+6. hardware errors and health in role 8, and remote administration and remote desktop in role 50;
+7. twelve smaller additions;
+8. five wordings of the first text restored;
+9. one sentence for subjects with two owners;
+10. how "Every role must define ..." is read;
+11. §77 pointing to §1 instead of listing 26 agents;
+12. a task for the requirement inventory and the coverage matrix that role 45 owns.
