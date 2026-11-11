@@ -83,7 +83,11 @@ pub enum Try {
     NotReady,
     /// The instruction returned zero or all ones, which is not a value.
     SetAside,
-    /// A test failed: the instruction is unhealthy and what it had given is thrown away.
+    /// This try was the last the draw had, and none of them gave a stuck value: the draw is
+    /// "not now" (R4 item 1), and the instruction rests on this processor.
+    NotNow,
+    /// A test failed, or the draw used all its tries and some of them gave zero or all ones:
+    /// the instruction is unhealthy and what it had given is thrown away.
     Failed,
     /// Nothing wanted the try, so the instruction was not run.
     Unwanted,
@@ -172,12 +176,6 @@ pub struct Allow {
     /// Draws for a reseed that is due. A store that is already full is used whatever this
     /// says.
     pub gather: bool,
-    /// RDSEED may be tried at all. A request that has used a whole draw's tries on it without
-    /// a value does not try it again, on whichever processor it is by then: moving between
-    /// processors buys no further tries.
-    pub rdseed: bool,
-    /// The same for RDRAND.
-    pub rdrand: bool,
 }
 
 impl Allow {
@@ -186,22 +184,12 @@ impl Allow {
         retest_rdseed: true,
         retest_rdrand: true,
         gather: true,
-        rdseed: true,
-        rdrand: true,
     };
 
     const fn retest(self, which: Instruction) -> bool {
         match which {
-            Instruction::Rdseed => self.retest_rdseed && self.rdseed,
-            Instruction::Rdrand => self.retest_rdrand && self.rdrand,
-        }
-    }
-
-    /// No further try of `which` in this request.
-    pub const fn stop(&mut self, which: Instruction) {
-        match which {
-            Instruction::Rdseed => self.rdseed = false,
-            Instruction::Rdrand => self.rdrand = false,
+            Instruction::Rdseed => self.retest_rdseed,
+            Instruction::Rdrand => self.retest_rdrand,
         }
     }
 }
@@ -258,10 +246,11 @@ impl core::fmt::Debug for Counts {
 }
 
 /// Whether `period` has passed since `since`. A clock that reads earlier than `since` has
-/// stepped back: what was being waited for is then held to have passed, so that a wait never
-/// outlasts its period because of the clock.
+/// stepped back: the difference then wraps to a number larger than any period, so what was
+/// being waited for is held to have passed, and a wait never outlasts its period because of
+/// the clock.
 pub(crate) const fn passed(now: u64, since: u64, period: u64) -> bool {
-    now < since || now.wrapping_sub(since) >= period
+    now.wrapping_sub(since) >= period
 }
 
 /// One instruction's tests and its schedule.
@@ -273,6 +262,12 @@ struct Line {
     failed_at: Option<u64>,
     /// What the root has been told about its health.
     told_healthy: bool,
+    /// Tries of the draw in hand, on this processor, that gave no value. A draw's tries are
+    /// counted here and nowhere else, so what follows the last of them falls on the processor
+    /// that made them, wherever the thread that asked is by then.
+    dry: u32,
+    /// Whether any of those tries gave zero or all ones.
+    stuck: bool,
 }
 
 impl Line {
@@ -282,6 +277,8 @@ impl Line {
             rest_since: None,
             failed_at: None,
             told_healthy: false,
+            dry: 0,
+            stuck: false,
         }
     }
 
@@ -321,11 +318,13 @@ pub struct Node {
     pub(crate) aside: [u8; ASIDE_LEN],
     /// RDSEED draws set aside in it.
     pub(crate) aside_have: u8,
-    /// The number of the request with prediction resistance that last began here.
-    fresh_epoch: u32,
-    /// The draws in the store were gathered for the root or for a request with prediction
-    /// resistance, not for this generator's own reseed, which must not take them over.
-    store_lent: bool,
+    /// The request the store is lent to, if it is: one that gathers for the root, with or
+    /// without prediction resistance. Only the request that holds this number uses the draws,
+    /// and this generator's own reseed never takes them over. The number holds the
+    /// processor's index, so no other processor ever gives the same one.
+    pub(crate) lent: Option<u64>,
+    /// How often the store has been lent.
+    lends: u32,
     /// What the root handed over.
     pub(crate) from_root: [u8; FROM_ROOT_LEN],
     /// How much of it is there.
@@ -342,6 +341,10 @@ pub struct Node {
     root_rest_since: Option<u64>,
     /// This processor has reseeded itself and has not yet looked whether the root is due (R6).
     root_look: bool,
+    /// When the root was last seeded, as this processor found it at its last look. The
+    /// processor looks again when a reseed period has passed since then, so the root's
+    /// schedule does not hang on when this processor reseeds itself.
+    root_seen: Option<u64>,
     counts: Counts,
 }
 
@@ -359,8 +362,8 @@ impl Node {
             from: Instruction::Rdseed,
             aside: [0; ASIDE_LEN],
             aside_have: 0,
-            fresh_epoch: 0,
-            store_lent: false,
+            lent: None,
+            lends: 0,
             from_root: [0; FROM_ROOT_LEN],
             from_root_len: 0,
             region0: 0,
@@ -370,6 +373,7 @@ impl Node {
             seeded_at: 0,
             root_rest_since: None,
             root_look: false,
+            root_seen: None,
             counts: Counts {
                 reseeds_rdseed: 0,
                 reseeds_rdrand: 0,
@@ -565,26 +569,38 @@ impl Node {
 
     /// One try of `which`, through its tests. `Ok` holds the value and whether it completed a
     /// start-up test.
+    ///
+    /// A try that gives no value is counted here, on this processor. The last try a draw has
+    /// (100 for RDSEED, 10 for RDRAND, one for a caller that came with interrupts off) ends
+    /// the draw in the same step: as a failure if any of its tries gave zero or all ones (R4
+    /// item 2; a mixture of "not ready" and stuck values is held to be one too, since a
+    /// working instruction gives such a value about once in 2^63 tries), and otherwise as
+    /// "not now", after which the instruction rests for [`REST_NANOS`] if `rest` says so (S3).
     fn draw(
         &mut self,
         source: &mut dyn Source,
         which: Instruction,
         now: u64,
+        quick: bool,
+        rest: bool,
     ) -> Result<(u64, bool), Try> {
         let before = self.line(which).health.condition();
         if !matches!(before, Condition::Testing | Condition::Healthy) {
             return Err(Try::Unwanted);
         }
         let Some(value) = source.try_once(which) else {
-            return Err(Try::NotReady);
+            return Err(self.no_value(which, false, now, quick, rest));
         };
         match self.line_mut(which).health.offer(value) {
             Offer::Accepted => {
+                let line = self.line_mut(which);
+                line.dry = 0;
+                line.stuck = false;
                 let completed =
                     matches!(before, Condition::Testing) && self.line(which).health.is_healthy();
                 Ok((value, completed))
             }
-            Offer::SetAside => Err(Try::SetAside),
+            Offer::SetAside => Err(self.no_value(which, true, now, quick, rest)),
             Offer::Failed(_) => {
                 self.failed(which, now);
                 Err(Try::Failed)
@@ -592,11 +608,46 @@ impl Node {
         }
     }
 
+    /// Counts a try of `which` that gave no value, and ends the draw if it was its last.
+    fn no_value(
+        &mut self,
+        which: Instruction,
+        stuck: bool,
+        now: u64,
+        quick: bool,
+        rest: bool,
+    ) -> Try {
+        let budget = if quick { 1 } else { which.tries() };
+        let line = self.line_mut(which);
+        line.dry = line.dry.saturating_add(1);
+        line.stuck |= stuck;
+        if line.dry < budget {
+            return if stuck { Try::SetAside } else { Try::NotReady };
+        }
+        let saw_stuck = line.stuck;
+        line.dry = 0;
+        line.stuck = false;
+        if saw_stuck {
+            if matches!(self.line_mut(which).health.stuck(), Offer::Failed(_)) {
+                self.failed(which, now);
+            }
+            return Try::Failed;
+        }
+        if rest {
+            self.line_mut(which).rest_since = Some(now);
+        }
+        self.count_not_now(which);
+        Try::NotNow
+    }
+
     /// What follows any failure of `which`: its draws go, and it is not tested again for one
     /// reseed period.
     fn failed(&mut self, which: Instruction, now: u64) {
         self.drop_draws(which);
-        self.line_mut(which).failed_at = Some(now);
+        let line = self.line_mut(which);
+        line.failed_at = Some(now);
+        line.dry = 0;
+        line.stuck = false;
     }
 
     /// Begins a start-up test of `which`, if the processor reports it and none has passed.
@@ -624,7 +675,8 @@ impl Node {
         if have >= want || area.len() < seed::AREA_LEN {
             return Try::Unwanted;
         }
-        let (value, completed) = match self.draw(source, which, now) {
+        // A start has nothing else to do and makes a "not now" draw again, so nothing rests.
+        let (value, completed) = match self.draw(source, which, now, false, false) {
             Ok(drawn) => drawn,
             Err(outcome) => {
                 if outcome == Try::Failed {
@@ -655,24 +707,6 @@ impl Node {
         self.set_region_of(region, None);
     }
 
-    /// Records that a draw of `which` used all its tries without a value.
-    ///
-    /// If any try gave zero or all ones, the instruction is stuck: that is a failure (R4 item
-    /// 2; a mixture of "not ready" and stuck values is held to be one too, since a working
-    /// instruction gives such a value about once in 2^63 tries). Otherwise it was "not now":
-    /// the instruction rests for [`REST_NANOS`] (S3). Returns whether it was a failure.
-    pub fn gave_up(&mut self, which: Instruction, saw_set_aside: bool, now: u64) -> bool {
-        if saw_set_aside {
-            if matches!(self.line_mut(which).health.stuck(), Offer::Failed(_)) {
-                self.failed(which, now);
-            }
-            return true;
-        }
-        self.line_mut(which).rest_since = Some(now);
-        self.count_not_now(which);
-        false
-    }
-
     /// Counts a draw of `which` that ended "not now".
     fn count_not_now(&mut self, which: Instruction) {
         match which {
@@ -685,10 +719,10 @@ impl Node {
         }
     }
 
-    /// Records that a draw of `which` ended "not now" while the processor starts, and that the
-    /// start will make the draw again: nothing rests (TASKS 18b, the review of 2026-11-11).
-    pub fn waited_at_start(&mut self, which: Instruction) {
-        self.count_not_now(which);
+    /// Rests `which` for [`REST_NANOS`]: for a start that has waited out as many "not now"
+    /// draws as it will.
+    pub fn rest(&mut self, which: Instruction, now: u64) {
+        self.line_mut(which).rest_since = Some(now);
     }
 
     /// Gives up a start-up test that could not be finished while the processor starts: the
@@ -701,7 +735,13 @@ impl Node {
 
     /// One try of `which` for the store. Draws of the other instruction that are in the way
     /// are moved aside (RDSEED's, which then go into the reseed as additional input) or dropped.
-    fn gather_try(&mut self, source: &mut dyn Source, which: Instruction, now: u64) -> Try {
+    fn gather_try(
+        &mut self,
+        source: &mut dyn Source,
+        which: Instruction,
+        now: u64,
+        quick: bool,
+    ) -> Try {
         if self.have >= RESEED_DRAWS && self.from == which {
             return Try::Unwanted;
         }
@@ -718,7 +758,7 @@ impl Node {
             self.have = 0;
         }
         self.from = which;
-        let (value, completed) = match self.draw(source, which, now) {
+        let (value, completed) = match self.draw(source, which, now, quick, true) {
             Ok(drawn) => drawn,
             Err(outcome) => return outcome,
         };
@@ -741,10 +781,10 @@ impl Node {
         &mut self,
         source: &mut dyn Source,
         now: u64,
-        allow: Allow,
+        quick: bool,
     ) -> Option<(Instruction, Try)> {
-        let rdseed = allow.rdseed && self.rdseed.health.is_healthy() && !self.rdseed.resting(now);
-        let rdrand = allow.rdrand && self.rdrand.health.is_healthy() && !self.rdrand.resting(now);
+        let rdseed = self.rdseed.health.is_healthy() && !self.rdseed.resting(now);
+        let rdrand = self.rdrand.health.is_healthy() && !self.rdrand.resting(now);
         let which = if rdseed && (self.have == 0 || self.from == Instruction::Rdseed) {
             Instruction::Rdseed
         } else if rdrand {
@@ -752,7 +792,7 @@ impl Node {
         } else {
             return None;
         };
-        Some((which, self.gather_try(source, which, now)))
+        Some((which, self.gather_try(source, which, now, quick)))
     }
 
     /// Whether the store holds a whole reseed's draws.
@@ -760,22 +800,64 @@ impl Node {
         self.have >= RESEED_DRAWS
     }
 
-    /// One try towards a full store, whether or not a reseed is due here: for the root's own
-    /// reseed (R6). [`Maint::Delayed`] if it cannot be made now: no instruction can be tried,
-    /// or the store holds draws of this generator's own reseed.
-    pub fn gather_for_root(&mut self, source: &mut dyn Source, now: u64, allow: Allow) -> Maint {
-        if !self.store_lent {
-            if self.have != 0 || self.aside_have != 0 {
-                // This generator is gathering for its own reseed, which comes first: its draws
-                // are neither handed to the root nor thrown away for it.
-                return Maint::Delayed;
-            }
-            self.store_lent = true;
+    /// Lends the store to a request that gathers for the root: whatever it holds is
+    /// overwritten, and it gets a number that no other request and no other processor has.
+    fn begin_lend(&mut self) -> u64 {
+        self.clear_store();
+        self.lends = self.lends.wrapping_add(1);
+        let number = (u64::from(self.index) << 32) | u64::from(self.lends);
+        self.lent = Some(number);
+        number
+    }
+
+    /// Whether the store is lent to the request that holds `number`.
+    pub(crate) fn lent_to(&self, number: u64) -> bool {
+        self.lent == Some(number)
+    }
+
+    /// Whether the store is lent to that request and holds a whole reseed's draws.
+    pub fn lent_full(&self, number: u64) -> bool {
+        self.lent_to(number) && self.store_full()
+    }
+
+    /// Ends a lending: the store is overwritten, unless it has been cleared or lent again
+    /// since, in which case it is no longer that request's and is left alone.
+    pub fn end_lend(&mut self, number: u64) {
+        if self.lent_to(number) {
+            self.clear_store();
+        }
+    }
+
+    /// Begins a gathering for the root's own reseed (R6), whether or not a reseed is due
+    /// here, and returns the number the store is lent under. Draws another request left in a
+    /// lent store are overwritten: a gathering never goes on from them. `None` if the store
+    /// holds draws of this generator's own reseed, which comes first: they are neither handed
+    /// to the root nor thrown away for it.
+    pub fn begin_root_gather(&mut self) -> Option<u64> {
+        if self.lent.is_none() && (self.have != 0 || self.aside_have != 0) {
+            return None;
+        }
+        Some(self.begin_lend())
+    }
+
+    /// One try towards a full store for the root, by the request that began the gathering
+    /// under `number`. [`Maint::Idle`] when the store is full; [`Maint::Delayed`] if no
+    /// instruction can be tried now, or the store is no longer lent to that request: it has
+    /// been lent again, or the thread is on another processor.
+    pub fn gather_for_root(
+        &mut self,
+        source: &mut dyn Source,
+        now: u64,
+        number: u64,
+        quick: bool,
+    ) -> Maint {
+        if !self.lent_to(number) {
+            return Maint::Delayed;
         }
         if self.store_full() {
             return Maint::Idle;
         }
-        match self.gather_next(source, now, allow) {
+        match self.gather_next(source, now, quick) {
             Some((which, outcome)) => Maint::Tried {
                 on: self.index,
                 which,
@@ -786,50 +868,33 @@ impl Node {
         }
     }
 
-    /// Begins a request with prediction resistance on this processor: whatever the store holds
-    /// is overwritten, so that every draw the request uses is made after it began, and the
-    /// store gets a new number, which the request shows at each later step.
-    pub fn begin_fresh(&mut self) -> u32 {
-        self.clear_store();
-        self.store_lent = true;
-        self.fresh_epoch = self.fresh_epoch.wrapping_add(1);
-        self.fresh_epoch
-    }
-
-    /// Ends a request with prediction resistance that was not answered: what it gathered is
-    /// overwritten, unless another request has begun here since.
-    pub fn end_fresh(&mut self, epoch: u32) {
-        if self.fresh_epoch == epoch {
-            self.clear_store();
-        }
-    }
-
     /// One try of RDSEED towards the eight draws of a request with prediction resistance
-    /// (R6). `mine` is the number [`Self::begin_fresh`] gave this request on this processor, if
-    /// it has begun here.
+    /// (R6). `mine` is the number the request holds, if it has begun.
     ///
     /// Returns the number the request holds now, and what happened. A request that has not
-    /// begun here, or whose store another request has since taken over, begins (again) in this
-    /// step: nothing gathered before that is ever used.
+    /// begun here, or whose store has been lent again or cleared since, begins (again) in this
+    /// step: whatever the store holds is overwritten, so every draw the request uses is made
+    /// after it began, on the processor that answers it.
     pub fn fresh_try(
         &mut self,
         source: &mut dyn Source,
         now: u64,
-        mine: Option<u32>,
-    ) -> (u32, Fresh) {
+        mine: Option<u64>,
+        quick: bool,
+    ) -> (u64, Fresh) {
         if !self.rdseed.health.is_healthy() || self.rdseed.resting(now) {
-            return (self.fresh_epoch, Fresh::Unavailable);
+            return (mine.unwrap_or(0), Fresh::Unavailable);
         }
-        let epoch = match mine {
-            Some(epoch) if epoch == self.fresh_epoch => epoch,
-            _ => self.begin_fresh(),
+        let number = match mine {
+            Some(number) if self.lent_to(number) => number,
+            _ => self.begin_lend(),
         };
         if self.store_is_fresh() {
-            return (epoch, Fresh::Ready);
+            return (number, Fresh::Ready);
         }
         (
-            epoch,
-            Fresh::Tried(self.gather_try(source, Instruction::Rdseed, now)),
+            number,
+            Fresh::Tried(self.gather_try(source, Instruction::Rdseed, now, quick)),
         )
     }
 
@@ -839,29 +904,32 @@ impl Node {
         self.store_full() && matches!(self.from, Instruction::Rdseed)
     }
 
-    /// The number of the request with prediction resistance that last began here.
-    pub(crate) const fn fresh_epoch(&self) -> u32 {
-        self.fresh_epoch
-    }
-
     /// Whether this processor has to ask the root for its reseed: one is due and it has no
     /// healthy instruction of its own (R6).
     pub(crate) const fn wants_root(&self, now: u64) -> bool {
         self.due(now) && !self.rdseed.health.is_healthy() && !self.rdrand.health.is_healthy()
     }
 
-    /// Whether this processor still has to look whether the root is due, and may now: it has
-    /// reseeded itself since it last looked, it has an instruction to reseed the root from,
-    /// and the root is not being left alone.
+    /// Whether this processor should look whether the root is due, and may now. It should
+    /// when it has reseeded itself since it last looked, and when a reseed period has passed
+    /// since the root's last seed as it last saw it. It may when it has an instruction to
+    /// reseed the root from and the root is not being left alone.
     pub const fn wants_root_look(&self, now: u64) -> bool {
-        self.root_look
+        let should = self.root_look
+            || match self.root_seen {
+                Some(seeded) => passed(now, seeded, RESEED_NANOS),
+                None => false,
+            };
+        should
             && (self.rdseed.health.is_healthy() || self.rdrand.health.is_healthy())
             && self.root_rested(now)
     }
 
-    /// Records that the root was looked at and is not due, or has just been reseeded.
-    pub const fn looked_at_root(&mut self) {
+    /// Records a look at the root: it was last seeded at `seeded`, which is now if this
+    /// processor has just reseeded it.
+    pub const fn saw_root(&mut self, seeded: u64) {
         self.root_look = false;
+        self.root_seen = Some(seeded);
     }
 
     /// Whether the root may be asked again after it could not be (S3's second).
@@ -884,20 +952,13 @@ impl Node {
         16usize.saturating_add(usize::from(self.aside_have).saturating_mul(8))
     }
 
-    /// Overwrites draws that were gathered for the root and did not reach it.
-    pub fn drop_root_draws(&mut self) {
-        if self.store_lent {
-            self.clear_store();
-        }
-    }
-
     /// Empties the store.
     pub(crate) fn clear_store(&mut self) {
         wipe(&mut self.entropy);
         wipe(&mut self.aside);
         self.have = 0;
         self.aside_have = 0;
-        self.store_lent = false;
+        self.lent = None;
     }
 
     /// Reseeds the generator from a full store (R6).
@@ -965,7 +1026,14 @@ impl Node {
     ///
     /// A start-up test of an unhealthy instruction begins when a reseed falls due, at most once
     /// in a reseed period, and goes on over later requests until it passes or fails (S2).
-    pub fn maintain(&mut self, source: &mut dyn Source, now: u64, tsc: u64, allow: Allow) -> Maint {
+    pub fn maintain(
+        &mut self,
+        source: &mut dyn Source,
+        now: u64,
+        tsc: u64,
+        allow: Allow,
+        quick: bool,
+    ) -> Maint {
         if !self.drbg.is_instantiated() {
             return Maint::Idle;
         }
@@ -989,7 +1057,7 @@ impl Node {
                 testing = true;
             }
             if testing && !self.line(which).resting(now) {
-                let outcome = match self.draw(source, which, now) {
+                let outcome = match self.draw(source, which, now, quick, true) {
                     Ok((_, true)) => Try::Completed,
                     Ok((_, false)) => Try::Stored,
                     Err(outcome) => outcome,
@@ -1009,10 +1077,10 @@ impl Node {
                 Maint::Idle
             };
         }
-        if self.store_lent {
-            // Draws left from a gathering for the root, or for a request with prediction
-            // resistance, that did not finish here: this generator's reseed does not take
-            // them over.
+        if self.lent.is_some() {
+            // Draws of a gathering for the root, or of a request with prediction resistance:
+            // this generator's reseed does not take them over. Whoever gathered them begins
+            // again, if it is still there.
             self.clear_store();
         }
         if self.store_full() {
@@ -1025,7 +1093,7 @@ impl Node {
         if !allow.gather {
             return Maint::Idle;
         }
-        if let Some((which, outcome)) = self.gather_next(source, now, allow) {
+        if let Some((which, outcome)) = self.gather_next(source, now, quick) {
             return Maint::Tried {
                 on: self.index,
                 which,
@@ -1059,6 +1127,7 @@ impl Node {
         now: u64,
         tsc: u64,
         maintain: Option<Allow>,
+        quick: bool,
     ) -> Piece {
         if !self.drbg.is_instantiated() {
             return Piece::NoGenerator;
@@ -1069,7 +1138,7 @@ impl Node {
         if let Some(allow) = maintain
             && (self.due(now) || self.retesting() || self.owes_root() || self.wants_root_look(now))
         {
-            return Piece::Due(self.maintain(source, now, tsc, allow));
+            return Piece::Due(self.maintain(source, now, tsc, allow, quick));
         }
         match self.drbg.generate(out, &[]) {
             Ok(()) => Piece::Done,
@@ -1145,6 +1214,16 @@ impl Node {
         for n in 0..u64::from(passed) {
             let value = crate::tests::world::splitmix(0x7E57, n);
             assert_eq!(line.health.offer(value), Offer::Accepted);
+        }
+    }
+
+    /// For the tests: `which` gives one value twice and fails its repetition count test.
+    #[cfg(test)]
+    pub(crate) fn fail_for_tests(&mut self, which: Instruction, now: u64) {
+        for _ in 0..2 {
+            if let Offer::Failed(_) = self.line_mut(which).health.offer(0x1357_9BDF_0246_8ACE) {
+                self.failed(which, now);
+            }
         }
     }
 

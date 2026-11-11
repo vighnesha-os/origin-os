@@ -223,8 +223,11 @@ fn not_ready_for_99_tries_is_a_draw_and_a_start_waits_out_a_not_now() {
     assert_eq!(world.tries(0, Instruction::Rdseed), 1024 + 100);
     assert_eq!(world.cpus[0].node.counts().not_now_rdseed, 1);
     assert_eq!(world.root.counted(), Some(Instruction::Rdseed));
-    // The instruction does not rest for it: the boot processor's own draws follow at once.
+    // The instruction does not rest for it: the boot processor's own draws follow at once,
+    // and so does an answer with prediction resistance, which a resting RDSEED would refuse.
     assert_eq!(start_processor(&mut world).own_regions, 2);
+    let mut fresh = [0u8; 16];
+    assert_eq!(crate::fill_fresh(&mut world, &mut fresh), Ok(()));
 
     // Eight times "not now" are waited out; the ninth gives the instruction up for now, with
     // no fault, and the root is counted on RDRAND.
@@ -346,22 +349,24 @@ fn start_up_draws_of_an_instruction_that_has_since_failed_are_not_in_the_seed() 
         started.own_regions, 2,
         "what was collected, before the failure"
     );
-    // The failure cost the root its reseed (a reseed's eight draws were made, and one was
-    // dropped): no draw is kept, and the next processor to reseed itself reseeds the root.
-    assert_eq!(world.root.counts().reseeds, 0);
+    // The one RDSEED draw in the store went with the failure, and the root was reseeded from
+    // eight RDRAND draws in the same gathering (R6); nothing stays in the store or the area.
+    assert_eq!(world.root.counts().reseeds, 1);
+    assert_eq!(world.given(1, Instruction::Rdrand), 1024 + 8);
     assert_eq!(world.cpus[1].node.have, 0);
     assert!(all_zero(&world.cpus[1].node.entropy));
     assert!(all_zero(&world.cpus[1].area));
     // What processor 1 must have been seeded from, put together here: 80 bytes of the root's
     // output, and a personalization string of the label, the index, the time-stamp counter
     // and RDRAND's 1,024 start-up draws, in the place RDSEED's would have had.
-    let draws = |cpu: u32, which, count: u64| -> Vec<u8> {
-        (0..count)
+    let draws_from = |cpu: u32, which, from: u64, count: u64| -> Vec<u8> {
+        (from..from + count)
             .flat_map(|n| {
                 super::world::splitmix(super::world::seed_of(cpu, which), n).to_le_bytes()
             })
             .collect()
     };
+    let draws = |cpu: u32, which, count: u64| draws_from(cpu, which, 0, count);
     let tsc = super::world::TSC.to_le_bytes();
     let mut root = HmacDrbgSha512::new();
     let mut label = b"Origin OS random root, 1".to_vec();
@@ -374,6 +379,12 @@ fn start_up_draws_of_an_instruction_that_has_since_failed_are_not_in_the_seed() 
     .unwrap();
     let mut handed = [0u8; 80];
     root.generate(&mut handed, &[]).unwrap(); // processor 0's
+    // The root's reseed: eight RDRAND draws of processor 1, with the time-stamp counter and
+    // the processor's index as additional input.
+    let mut stamp = tsc.to_vec();
+    stamp.extend_from_slice(&1u64.to_le_bytes());
+    root.reseed(&draws_from(1, Instruction::Rdrand, 1024, 8), &stamp)
+        .unwrap();
     root.generate(&mut handed, &[]).unwrap();
     let personalization = |regions: &[Vec<u8>]| {
         let mut bytes = b"Origin OS random processor, 1".to_vec();
@@ -426,25 +437,7 @@ fn a_region_whose_instruction_has_failed_is_emptied_before_a_first_seed() {
     let fail = |world: &mut World, which| {
         // A value twice running fails the repetition count test.
         let cpu = &mut world.cpus[0];
-        let now = 0;
-        let line = match which {
-            Instruction::Rdseed => &mut cpu.rdseed,
-            Instruction::Rdrand => &mut cpu.rdrand,
-        };
-        let at = line.tries;
-        line.rules.push(Rule::Value {
-            from: at,
-            count: 2,
-            value: 0x1357_9BDF_0246_8ACE,
-        });
-        let mut source = super::world::lines(&mut cpu.rdseed, &mut cpu.rdrand);
-        let only = crate::Allow {
-            rdseed: which == Instruction::Rdseed,
-            rdrand: which == Instruction::Rdrand,
-            ..crate::Allow::ALL
-        };
-        let _ = cpu.node.gather_for_root(&mut source, now, only);
-        let _ = cpu.node.gather_for_root(&mut source, now, only);
+        cpu.node.fail_for_tests(which, 0);
         assert!(!cpu.node.is_healthy(which));
     };
     // The regions are RDSEED's and RDRAND's.
@@ -709,6 +702,7 @@ fn a_failed_instructions_draws_leave_the_store() {
             now,
             0,
             Allow::ALL,
+            false,
         )
     };
     for n in 1..=5 {
@@ -760,12 +754,12 @@ fn the_root_gives_nothing_fresh_from_rdrand_draws() {
     node.have = 8;
     node.from = Instruction::Rdrand;
     node.entropy = [0x42; 64];
+    node.lent = Some(7);
     let mut out = [0xEE; 16];
-    let epoch = world.cpus[0].node.fresh_epoch();
     assert_eq!(
         world
             .root
-            .fresh_piece(&mut world.cpus[0].node, &mut out, 0, 0, epoch),
+            .fresh_piece(&mut world.cpus[0].node, &mut out, 0, 0, 7),
         Answer::NotGathered
     );
     assert_eq!(out, [0xEE; 16], "nothing was written");

@@ -470,9 +470,11 @@ fn a_test_does_not_begin_again_unless_a_reseed_is_due() {
             panic!("no instruction is to be tried")
         }
     }
+    // Nothing is due here. The root's period has passed since this processor last saw it, so
+    // the upkeep's one piece is a look at the root; no instruction is tried and no test begins.
     assert_eq!(
-        cpu.node.maintain(&mut Never, now, 0, Allow::ALL),
-        Maint::Idle
+        cpu.node.maintain(&mut Never, now, 0, Allow::ALL, false),
+        Maint::LookAtRoot
     );
     assert_eq!(cpu.node.condition(Rdseed), Condition::Unhealthy);
     assert_eq!(world.tries(0, Rdseed), tried);
@@ -549,16 +551,16 @@ fn fresh_entropy_is_never_older_than_the_request() {
         }
     }
     let mut source = Good(&mut cpu.rdseed);
-    let (first, did) = cpu.node.fresh_try(&mut source, now, None);
+    let (first, did) = cpu.node.fresh_try(&mut source, now, None, false);
     assert_eq!(did, Fresh::Tried(Try::Stored));
     for _ in 0..7 {
         assert_eq!(
-            cpu.node.fresh_try(&mut source, now, Some(first)),
+            cpu.node.fresh_try(&mut source, now, Some(first), false),
             (first, Fresh::Tried(Try::Stored))
         );
     }
     assert_eq!(
-        cpu.node.fresh_try(&mut source, now, Some(first)),
+        cpu.node.fresh_try(&mut source, now, Some(first), false),
         (first, Fresh::Ready)
     );
     let mut out = [0xEE; 16];
@@ -571,12 +573,12 @@ fn fresh_entropy_is_never_older_than_the_request() {
     );
     assert_eq!(out, [0xEE; 16]);
     // A second request begins here: the store is emptied and gets a new number.
-    let (second, did) = cpu.node.fresh_try(&mut source, now, None);
+    let (second, did) = cpu.node.fresh_try(&mut source, now, None, false);
     assert_ne!(second, first);
     assert_eq!(did, Fresh::Tried(Try::Stored));
     assert_eq!(cpu.node.have, 1, "the first request's eight draws are gone");
     // The first request finds its store taken over, and begins again in its turn.
-    let (third, did) = cpu.node.fresh_try(&mut source, now, Some(first));
+    let (third, did) = cpu.node.fresh_try(&mut source, now, Some(first), false);
     assert!(third != first && third != second);
     assert_eq!(did, Fresh::Tried(Try::Stored));
     assert_eq!(cpu.node.have, 1);
@@ -587,9 +589,9 @@ fn fresh_entropy_is_never_older_than_the_request() {
         Answer::NotGathered
     );
     // A request that ends unanswered overwrites what it gathered, and only that.
-    cpu.node.end_fresh(second);
+    cpu.node.end_lend(second);
     assert_eq!(cpu.node.have, 1, "another request's store is left alone");
-    cpu.node.end_fresh(third);
+    cpu.node.end_lend(third);
     assert_eq!(cpu.node.have, 0);
 }
 
@@ -774,7 +776,6 @@ fn a_clock_that_steps_back_ends_a_wait() {
 
 #[test]
 fn the_roots_gathering_leaves_a_processors_own_draws_alone() {
-    use crate::{Allow, Maint};
     // RDSEED alone. Its reseed is delayed with three draws in the store.
     let mut world = World::reporting(1, true, false);
     world.boot();
@@ -790,22 +791,203 @@ fn the_roots_gathering_leaves_a_processors_own_draws_alone() {
     // A gathering for the root finds them and does nothing: they are neither lent to the
     // root nor overwritten for it, and they are not the root's to drop.
     world.now += REST_NANOS;
-    let now = world.now;
     let cpu = &mut world.cpus[0];
-    let tried = cpu.rdseed.tries;
-    {
-        let mut source = super::world::lines(&mut cpu.rdseed, &mut cpu.rdrand);
-        assert_eq!(
-            cpu.node.gather_for_root(&mut source, now, Allow::ALL),
-            Maint::Delayed
-        );
-    }
-    cpu.node.drop_root_draws();
-    assert_eq!(cpu.rdseed.tries, tried);
+    assert_eq!(cpu.node.begin_root_gather(), None);
+    assert_eq!(cpu.node.lent, None);
     assert_eq!(cpu.node.have, 3);
     assert_eq!(cpu.node.entropy, own);
     // The processor's own reseed uses them, with five more; then the root gets its eight.
     assert_eq!(request(&mut world), (5 + 8, 0));
     assert_eq!(world.cpus[0].node.counts().reseeds_rdseed, 1);
     assert_eq!(world.root.counts().reseeds, 1);
+}
+
+#[test]
+fn the_root_does_not_wait_for_the_processors_next_reseed() {
+    // One busy processor, and a clock that moves on by a microsecond at every step.
+    let mut world = World::new(1);
+    world.tick = 1_000;
+    world.boot();
+    // First period: a request at the moment the processor is due reseeds it and then the
+    // root, so the root's seed is some steps younger than the processor's.
+    world.now = world.cpus[0].node.seeded_at + RESEED_NANOS;
+    next_u64(&mut world).unwrap();
+    assert_eq!(world.root.counts().reseeds, 1);
+    assert!(world.root.seeded_at() > world.cpus[0].node.seeded_at);
+    // Second period: a request at the moment the processor is due again. It reseeds itself
+    // and looks at the root, which is not due yet, by those few steps.
+    world.now = world.cpus[0].node.seeded_at + RESEED_NANOS;
+    next_u64(&mut world).unwrap();
+    assert_eq!(world.cpus[0].node.counts().reseeds_rdseed, 2);
+    assert_eq!(world.root.counts().reseeds, 1, "not due yet");
+    // The processor noted when the root was seeded, and looks again when the root's period
+    // has passed: the next request, 100 ms on, reseeds it. (It used to look only after its
+    // own next reseed, a minute later.)
+    world.now += 100_000_000;
+    assert!(world.root.due(world.now));
+    assert!(!world.cpus[0].node.due(world.now));
+    next_u64(&mut world).unwrap();
+    assert_eq!(world.root.counts().reseeds, 2);
+    // No request in the following two minutes leaves a due root alone.
+    for _ in 0..1200 {
+        world.now += 100_000_000;
+        next_u64(&mut world).unwrap();
+        assert!(!world.root.due(world.now));
+    }
+    assert_eq!(world.root.counts().reseeds, 4);
+}
+
+#[test]
+fn the_roots_reseed_falls_back_to_rdrand_when_rdseed_goes_dry() {
+    let mut world = World::new(1);
+    world.boot();
+    world.now += RESEED_NANOS;
+    // RDSEED gives the processor's eight draws and three of the root's, then nothing for a
+    // draw's tries; and a second later three more, then nothing again.
+    let tried = world.tries(0, Rdseed);
+    for from in [tried + 11, tried + 11 + 100 + 3] {
+        world
+            .line(0, Rdseed)
+            .rules
+            .push(Rule::NotReady { from, count: 100 });
+    }
+    // The first look has eight of the request's sixteen draws left: three of RDSEED and five
+    // of RDRAND do not fill the store, and none of them is kept.
+    assert_eq!(request(&mut world), (8 + 3 + 100, 5));
+    assert_eq!(world.root.counts().reseeds, 0);
+    assert_eq!(world.cpus[0].node.have, 0);
+    assert_eq!(world.cpus[0].node.aside_have, 0);
+    assert_eq!(world.cpus[0].node.lent, None);
+    // A second later the processor looks again with all sixteen: three RDSEED draws, RDSEED
+    // dry again, and the root's reseed is made at once from eight RDRAND draws.
+    world.now += REST_NANOS;
+    assert_eq!(request(&mut world), (3 + 100, 8));
+    assert_eq!(world.root.counts().reseeds, 1);
+    assert!(!world.root.due(world.now));
+    assert_eq!(world.cpus[0].node.have, 0);
+    assert_eq!(world.cpus[0].node.aside_have, 0);
+}
+
+#[test]
+fn draws_left_on_a_processor_the_thread_moved_away_from_are_never_gone_on_from() {
+    let mut world = World::new(2);
+    world.boot();
+    world.now += RESEED_NANOS;
+    // Processor 0 reseeds itself and gathers for the root. After five of the root's draws the
+    // thread is on processor 1, where it does nothing more for the root.
+    let before = (world.tries(0, Rdseed), world.tries(1, Rdseed));
+    let last = world.steps + 17;
+    world.mover = Some(Box::new(move |step, on| if step >= last { 1 } else { on }));
+    next_u64(&mut world).unwrap();
+    world.mover = None;
+    assert_eq!(world.tries(0, Rdseed) - before.0, 8 + 5);
+    assert_eq!(world.tries(1, Rdseed), before.1);
+    assert_eq!(world.root.counts().reseeds, 0);
+    // The five lie on processor 0, lent under a number nobody holds any more.
+    assert_eq!(world.cpus[0].node.have, 5);
+    let left = world.cpus[0].node.lent;
+    assert!(left.is_some());
+    // Half a minute later processor 0 looks at the root again. Its gathering does not go on
+    // from the five: it begins by overwriting them and makes all eight draws anew.
+    world.now += RESEED_NANOS / 2;
+    world.on = 0;
+    assert_eq!(request(&mut world), (8, 0));
+    assert_eq!(world.root.counts().reseeds, 1);
+    assert_eq!(world.cpus[0].node.have, 0);
+    assert_eq!(world.cpus[0].node.lent, None);
+
+    // The same move, seen from processor 1: nothing was recorded against it. Its own request
+    // straight afterwards reseeds it and then the root, with no second's wait.
+    let mut world = World::new(2);
+    world.boot();
+    world.now += RESEED_NANOS;
+    let last = world.steps + 17;
+    world.mover = Some(Box::new(move |step, on| if step >= last { 1 } else { on }));
+    next_u64(&mut world).unwrap();
+    world.mover = None;
+    assert_eq!(world.on, 1);
+    assert_eq!(request(&mut world), (16, 0));
+    assert_eq!(world.root.counts().reseeds, 1);
+
+    // A thread that is on processor 1 straight after the look begins no gathering there: the
+    // look was processor 0's, which still owes it.
+    let mut world = World::new(2);
+    world.boot();
+    world.now += RESEED_NANOS;
+    let before = world.tries(1, Rdseed);
+    let last = world.steps + 11;
+    world.mover = Some(Box::new(move |step, on| if step >= last { 1 } else { on }));
+    next_u64(&mut world).unwrap();
+    world.mover = None;
+    assert_eq!(world.tries(1, Rdseed), before);
+    assert_eq!(world.cpus[1].node.lent, None);
+    assert_eq!(world.root.counts().reseeds, 0);
+    world.on = 0;
+    assert_eq!(request(&mut world), (8, 0));
+    assert_eq!(world.root.counts().reseeds, 1);
+}
+
+#[test]
+fn a_lending_number_names_its_processor() {
+    use crate::Answer;
+    let mut world = World::new(2);
+    world.boot();
+    let now = world.now + RESEED_NANOS;
+    // The first lending on each processor: the numbers differ.
+    let zero = world.cpus[0].node.begin_root_gather().unwrap();
+    let one = world.cpus[1].node.begin_root_gather().unwrap();
+    assert_ne!(zero, one);
+    assert!(world.cpus[0].node.lent_to(zero));
+    assert!(!world.cpus[1].node.lent_to(zero));
+    // Processor 1's store is full of RDSEED draws. A request that holds processor 0's number
+    // is given nothing from it, with or without prediction resistance, and does not end its
+    // lending either.
+    let node = &mut world.cpus[1].node;
+    node.have = 8;
+    node.from = Rdseed;
+    node.entropy = [0x33; 64];
+    let mut out = [0xEE; 16];
+    assert_eq!(
+        world.root.fresh_piece(node, &mut out, now, 0, zero),
+        Answer::NotGathered
+    );
+    assert_eq!(
+        world.root.reseed_from(node, now, 0, zero),
+        Answer::NotGathered
+    );
+    node.end_lend(zero);
+    assert_eq!(node.have, 8);
+    assert_eq!(out, [0xEE; 16]);
+    // Under its own number the store is the request's.
+    assert_eq!(world.root.reseed_from(node, now, 0, one), Answer::Done);
+    assert_eq!(node.have, 0);
+    assert!(node.entropy.iter().all(|&b| b == 0));
+}
+
+#[test]
+fn a_processor_with_no_healthy_instruction_does_not_look_at_the_root() {
+    // Processor 0 has RDSEED alone. It reseeds itself and finds the root's lock taken when it
+    // looks, so it still owes the look.
+    let mut world = World::new(2);
+    world.cpus[0].rdrand.reported = false;
+    world.boot();
+    world.now += RESEED_NANOS;
+    world.root_busy = 1;
+    assert_eq!(request(&mut world), (8, 0));
+    assert!(world.root.due(world.now));
+    // Then its instruction fails. The root is told by the next request.
+    let now = world.now;
+    world.cpus[0].node.fail_for_tests(Rdseed, now);
+    world.now += REST_NANOS;
+    next_u64(&mut world).unwrap();
+    assert_eq!(world.root.sources(), 2, "processor 1's two");
+    // After that the processor does not go near the root, however long the root stays due:
+    // it has nothing to reseed it from.
+    let asks = world.root_asks;
+    for _ in 0..5 {
+        world.now += REST_NANOS;
+        next_u64(&mut world).unwrap();
+    }
+    assert!(world.root.due(world.now));
+    assert_eq!(world.root_asks, asks);
 }

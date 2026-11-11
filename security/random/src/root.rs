@@ -121,6 +121,12 @@ impl Root {
         self.drbg.is_instantiated() && self.sources == 0
     }
 
+    /// When the root was last seeded. Not a secret: a processor keeps it to know when to look
+    /// at the root again.
+    pub const fn seeded_at(&self) -> u64 {
+        self.seeded_at
+    }
+
     /// Whether the root is due a reseed (R6).
     pub const fn due(&self, now: u64) -> bool {
         self.drbg.is_instantiated()
@@ -219,12 +225,14 @@ impl Root {
         }
     }
 
-    /// Reseeds the root from `node`'s full store (R6).
-    pub fn reseed_from(&mut self, node: &mut Node, now: u64, tsc: u64) -> Answer {
+    /// Reseeds the root from `node`'s full store (R6). The store must be lent to the request
+    /// that asks, under `number`: a store another request filled, or one that lay on a
+    /// processor the request has left, gives nothing.
+    pub fn reseed_from(&mut self, node: &mut Node, now: u64, tsc: u64, number: u64) -> Answer {
         if let Err(answer) = self.ready() {
             return answer;
         }
-        if !node.store_full() {
+        if !node.lent_full(number) {
             return Answer::NotGathered;
         }
         let extra = node.stamp(tsc);
@@ -236,6 +244,7 @@ impl Root {
         if reseeded {
             self.seeded_at = now;
             self.counts.reseeds = self.counts.reseeds.saturating_add(1);
+            node.saw_root(now);
             Answer::Done
         } else {
             Answer::NotNow
@@ -265,12 +274,24 @@ impl Root {
     /// Reseeds `node`'s generator from 64 bytes of the root's output: for a processor that is
     /// due a reseed and none of whose instructions is healthy (R6). Any other processor is
     /// left as it is: a thread that asked for one processor may be on another by now.
+    ///
+    /// If the root has nothing to give, `node` leaves it alone for a while
+    /// ([`Node::root_refused`]): that is recorded here, in the same step, so that it falls on
+    /// the processor that was refused.
     pub fn reseed_processor(&mut self, node: &mut Node, now: u64, tsc: u64) -> Answer {
-        if let Err(answer) = self.ready() {
-            return answer;
-        }
         if !node.wants_root(now) {
             return Answer::NotGathered;
+        }
+        let answer = self.reseed_wanting(node, now, tsc);
+        if answer != Answer::Done {
+            node.root_refused(now);
+        }
+        answer
+    }
+
+    fn reseed_wanting(&mut self, node: &mut Node, now: u64, tsc: u64) -> Answer {
+        if let Err(answer) = self.ready() {
+            return answer;
         }
         let Some(entropy) = node.from_root.get_mut(..64) else {
             return Answer::NotNow;
@@ -290,16 +311,16 @@ impl Root {
     }
 
     /// One piece with prediction resistance (R6; SP 800-90A §9.3.1): the root is reseeded from
-    /// `node`'s store and then generates. The store must hold eight RDSEED draws gathered by
-    /// the request that asks: `epoch` is the number [`Node::begin_fresh`] gave it, and a store
-    /// that another request has begun in since, or that was filled before, gives nothing.
+    /// `node`'s store and then generates. The store must hold eight RDSEED draws and be lent
+    /// to the request that asks, under `number`: a store that has been lent again since, or
+    /// that lies on a processor the request has left, gives nothing.
     pub fn fresh_piece(
         &mut self,
         node: &mut Node,
         out: &mut [u8],
         now: u64,
         tsc: u64,
-        epoch: u32,
+        number: u64,
     ) -> Answer {
         if let Err(answer) = self.ready() {
             return answer;
@@ -307,7 +328,7 @@ impl Root {
         if out.len() > PIECE {
             return Answer::NotNow;
         }
-        if node.fresh_epoch() != epoch || !node.store_is_fresh() {
+        if !node.lent_to(number) || !node.store_is_fresh() {
             return Answer::NotGathered;
         }
         let extra = node.stamp(tsc);
@@ -323,6 +344,7 @@ impl Root {
             self.seeded_at = now;
             self.counts.reseeds = self.counts.reseeds.saturating_add(1);
             self.counts.fresh = self.counts.fresh.saturating_add(1);
+            node.saw_root(now);
             Answer::Done
         } else {
             wipe(out);

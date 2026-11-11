@@ -92,11 +92,6 @@ struct Lines<'a> {
     rdrand: &'a mut Line,
 }
 
-/// A processor's two instructions as a [`Source`], for a test that drives a step by hand.
-pub(crate) fn lines<'a>(rdseed: &'a mut Line, rdrand: &'a mut Line) -> impl Source + 'a {
-    Lines { rdseed, rdrand }
-}
-
 impl Source for Lines<'_> {
     fn reports(&self, which: Instruction) -> bool {
         match which {
@@ -120,6 +115,9 @@ pub(crate) struct World {
     /// The processor the caller is on.
     pub(crate) on: usize,
     pub(crate) now: u64,
+    /// Nanoseconds the clock moves on at every step. 0 unless a test sets it: the clock then
+    /// stands still while a request runs.
+    pub(crate) tick: u64,
     pub(crate) tsc: u64,
     pub(crate) quick: bool,
     /// Steps run, of both kinds.
@@ -169,6 +167,7 @@ impl World {
             root: Root::new(),
             on: 0,
             now: 1_000_000,
+            tick: 0,
             tsc: TSC,
             quick: false,
             steps: 0,
@@ -221,6 +220,7 @@ impl World {
 
     fn after_step(&mut self) {
         self.steps += 1;
+        self.now += self.tick;
         if let Some(mover) = self.mover.as_mut() {
             self.on = mover(self.steps, self.on);
         }

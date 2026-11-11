@@ -6,9 +6,19 @@
 //! functions here decide which step comes next and how often an instruction is tried. They
 //! see only what a step reports: counts and outcomes, never a draw, a seed or a state.
 //!
-//! A thread may move to another processor between two steps. Each step works on the
-//! processor it runs on, so a request's steps may be spread over several processors'
-//! generators, which is harmless (R7).
+//! A thread may move to another processor between two steps, and the rules for that are few:
+//!
+//! - **A draw's tries are counted by the processor that makes them** (`node`), and what
+//!   follows the last of them, a rest or a failure, happens in that same step. Nothing here
+//!   records an outcome in a later step, which might run somewhere else.
+//! - **A request's upkeep belongs to the processor it began on.** Every later step of it says
+//!   which processor that was, and does nothing on any other: the upkeep ends there, and the
+//!   processor that was left carries on at its own next request.
+//! - **Draws gathered for the root carry a number** that names the request and the processor.
+//!   Only that request uses them. What a request leaves on a processor it moved away from is
+//!   never gone on from: whatever uses that store next begins by overwriting it.
+//! - **The answer itself may come from any processor's generator** (R7), so a request that
+//!   has moved is still answered.
 
 use crate::health::{Condition, STARTUP_DRAWS};
 use crate::node::{
@@ -173,73 +183,13 @@ fn in_root_step<T>(
     }
 }
 
-/// The tries of the draw that is being made.
-struct Tries {
-    /// One try for each draw (S6).
-    quick: bool,
-    /// The processor and instruction of the draw in hand, if one is.
-    of: Option<(u32, Instruction)>,
-    used: u32,
-    set_aside: bool,
-}
-
-impl Tries {
-    const fn new(quick: bool) -> Self {
-        Self {
-            quick,
-            of: None,
-            used: 0,
-            set_aside: false,
-        }
-    }
-
-    /// Notes one try's outcome. `Some` when the draw has used all its tries without a value:
-    /// it holds whether any try gave zero or all ones.
-    fn note(&mut self, on: u32, which: Instruction, outcome: Try) -> Option<bool> {
-        match self.of {
-            Some((before, same)) if same == which => {
-                if before != on {
-                    // The thread moved in the middle of a draw. The tries it has used still
-                    // count, so that moving cannot buy more of them. What another processor's
-                    // instruction returned says nothing about this one's.
-                    self.of = Some((on, which));
-                    self.set_aside = false;
-                }
-            }
-            // A new draw: the count starts again.
-            _ => {
-                self.of = Some((on, which));
-                self.used = 0;
-                self.set_aside = false;
-            }
-        }
-        match outcome {
-            Try::Stored | Try::Completed | Try::Failed | Try::Unwanted => {
-                self.of = None;
-                None
-            }
-            Try::NotReady | Try::SetAside => {
-                self.used = self.used.saturating_add(1);
-                self.set_aside |= outcome == Try::SetAside;
-                let budget = if self.quick { 1 } else { which.tries() };
-                if self.used >= budget {
-                    self.of = None;
-                    Some(self.set_aside)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-}
-
 /// How a collection into the seed area ended.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Collected {
     /// The region holds the draws wanted.
     Done,
-    /// The instruction failed a test, or was not ready for a whole draw's tries. The region
-    /// is empty.
+    /// The instruction failed a test, or was not ready for longer than a start waits. The
+    /// region is empty.
     Without,
 }
 
@@ -255,26 +205,21 @@ fn collect(
     if testing {
         in_step(platform, |ctx| ctx.node.begin_test(which))?;
     }
-    let mut tries = Tries::new(false);
     let mut patience = START_PATIENCE;
     // Every draw may use all its tries, the start's patience adds its own, and one step more
     // ends it.
     let steps = u32::from(want)
         .saturating_add(START_PATIENCE)
+        .saturating_add(1)
         .saturating_mul(which.tries())
         .saturating_add(64);
     for _ in 0..steps {
-        let (on, outcome) = in_step(platform, |ctx| {
-            let outcome = ctx
-                .node
-                .collect_try(ctx.source, which, ctx.area, region, want, ctx.now);
-            (ctx.index, outcome)
+        let outcome = in_step(platform, |ctx| {
+            ctx.node
+                .collect_try(ctx.source, which, ctx.area, region, want, ctx.now)
         })?;
         match outcome {
-            // The draw arrived: the next one has all its tries.
-            Try::Stored | Try::Completed => {
-                tries.note(on, which, outcome);
-            }
+            Try::Stored | Try::Completed => {}
             // Nothing more is wanted: the region is full, or the instruction is not one that
             // may be drawn from.
             Try::Unwanted => {
@@ -285,27 +230,24 @@ fn collect(
                     Collected::Without
                 });
             }
+            // The step that failed it emptied the region.
             Try::Failed => return Ok(Collected::Without),
-            Try::NotReady | Try::SetAside => {
-                if let Some(set_aside) = tries.note(on, which, outcome) {
-                    if !set_aside && patience != 0 {
-                        // "Not now" is not a failure (R4 item 1), and a start can wait: the
-                        // draw is made again.
-                        patience = patience.saturating_sub(1);
-                        in_step(platform, |ctx| ctx.node.waited_at_start(which))?;
-                        platform.pause();
-                        continue;
-                    }
-                    in_step(platform, |ctx| {
-                        let failed = ctx.node.gave_up(which, set_aside, ctx.now);
-                        if !failed && testing {
-                            ctx.node.abandon_test(which);
-                        }
-                        ctx.node.empty_region(ctx.area, region);
-                    })?;
-                    return Ok(Collected::Without);
-                }
+            Try::NotReady | Try::SetAside => platform.pause(),
+            // "Not now" is not a failure (R4 item 1), and a start can wait: the draw is made
+            // again, up to `START_PATIENCE` times.
+            Try::NotNow if patience != 0 => {
+                patience = patience.saturating_sub(1);
                 platform.pause();
+            }
+            Try::NotNow => {
+                in_step(platform, |ctx| {
+                    ctx.node.rest(which, ctx.now);
+                    if testing {
+                        ctx.node.abandon_test(which);
+                    }
+                    ctx.node.empty_region(ctx.area, region);
+                })?;
+                return Ok(Collected::Without);
             }
         }
     }
@@ -421,8 +363,9 @@ pub fn start_processor(platform: &mut dyn Platform) -> ProcessorStart {
 }
 
 fn seed_processor(platform: &mut dyn Platform) -> Result<(u8, bool), Error> {
-    in_step(platform, |ctx| {
+    let on = in_step(platform, |ctx| {
         ctx.node.start(ctx.source, ctx.index);
+        ctx.index
     })?;
     let mut regions = 0u8;
     for which in Instruction::BOTH {
@@ -436,24 +379,9 @@ fn seed_processor(platform: &mut dyn Platform) -> Result<(u8, bool), Error> {
         }
     }
     // The root is told how this processor's instructions stand, and is reseeded first if it
-    // is due and this processor can do it (R6).
-    let due = in_root_step(platform, |ctx, root| {
-        root.account(ctx.node);
-        root.due(ctx.now) && !root.stopped()
-    })?;
-    if due {
-        let reseeded = fill_store(platform).unwrap_or(false)
-            && in_root_step(platform, |ctx, root| {
-                root.reseed_from(ctx.node, ctx.now, ctx.tsc)
-            }) == Ok(Answer::Done);
-        // Draws that did not reach the root are not kept for later.
-        in_step(platform, |ctx| {
-            ctx.node.drop_root_draws();
-            if reseeded {
-                ctx.node.looked_at_root();
-            }
-        })?;
-    }
+    // is due and this processor can do it (R6). A start waits for the root's lock.
+    in_root_step(platform, |ctx, root| root.account(ctx.node))?;
+    look_at_root(platform, on, REQUEST_DRAWS, true)?;
     let answer = in_root_step(platform, |ctx, root| root.seed_processor(ctx.node))?;
     if answer != Answer::Done {
         return Ok((0, false));
@@ -464,99 +392,187 @@ fn seed_processor(platform: &mut dyn Platform) -> Result<(u8, bool), Error> {
     Ok((regions, generator))
 }
 
-/// Gathers a reseed's draws into this processor's store. `false` if they cannot be had now.
-fn fill_store(platform: &mut dyn Platform) -> Result<bool, Error> {
-    let mut tries = Tries::new(platform.quick());
-    let mut allow = Allow::ALL;
-    // At most a reseed's draws are made here, wherever the thread goes meanwhile (S2).
-    let mut drawn = 0u8;
-    for _ in 0..MAINTAIN_STEPS {
-        if drawn >= RESEED_DRAWS {
-            return in_step(platform, |ctx| ctx.node.store_full());
-        }
-        match in_step(platform, |ctx| {
-            ctx.node.gather_for_root(ctx.source, ctx.now, allow)
-        })? {
-            Maint::Idle => return Ok(true),
-            Maint::Tried {
-                on, which, outcome, ..
-            } => {
-                if matches!(outcome, Try::Stored | Try::Completed) {
-                    drawn = drawn.saturating_add(1);
-                }
-                if let Some(set_aside) = tries.note(on, which, outcome) {
-                    in_step(platform, |ctx| {
-                        ctx.node.gave_up(which, set_aside, ctx.now);
-                    })?;
-                    allow.stop(which);
-                } else if matches!(outcome, Try::NotReady | Try::SetAside) {
-                    platform.pause();
-                }
-            }
-            Maint::Delayed
-            | Maint::Reseeded
-            | Maint::NeedRoot
-            | Maint::TellRoot
-            | Maint::LookAtRoot => {
-                return Ok(false);
-            }
-        }
+/// Runs `step` as one step under the root's lock. With `wait` it waits for the lock as
+/// [`in_root_step`] does; without, it gives up at once if the lock is taken, so that the
+/// root's own reseed never makes a request wait for a lock another processor holds.
+fn at_root<T>(
+    platform: &mut dyn Platform,
+    wait: bool,
+    mut step: impl FnMut(&mut Ctx<'_>, &mut Root) -> T,
+) -> Option<T> {
+    if wait {
+        return in_root_step(platform, step).ok();
     }
-    Ok(false)
+    let mut result = None;
+    platform
+        .root_step(&mut |ctx, root| result = Some(step(ctx, root)))
+        .ok()?;
+    result
 }
 
-/// What is due before a request on this processor: draws towards a start-up test that is
-/// being run again, and a reseed (S1 to S3). Bounded: at most [`REQUEST_DRAWS`] draws.
+/// Looks whether the root is due and, if it is, reseeds it from eight draws of processor `on`
+/// (R6): the root keeps its own schedule, 2^20 requests or 60 seconds, as long as some
+/// processor with a healthy instruction answers requests. A processor looks when it has
+/// reseeded itself, and again when a period has passed since the root's last seed as it saw it.
 ///
-/// `first` is what the step that found the processor due did already.
-fn maintain(platform: &mut dyn Platform, first: Maint) -> Result<(), Error> {
+/// The request may make `left` more draws (S2). If the draws cannot be had within that, or
+/// the lock is taken and `wait` is not set, the processor leaves the root alone for
+/// [`crate::REST_NANOS`] and looks again at a later request. Draws that do not reach the root
+/// are overwritten before this returns, if the thread is still on that processor; if it has
+/// moved they stay there, lent under a number nobody holds any more, until that store is next
+/// used, which begins by overwriting it.
+fn look_at_root(platform: &mut dyn Platform, on: u32, left: u8, wait: bool) -> Result<(), Error> {
+    // The look itself may run on any processor: what it tells that processor is true of the
+    // root. The gathering that follows begins only on `on`.
+    let due = at_root(platform, wait, |ctx, root| {
+        let due = root.due(ctx.now) && !root.stopped();
+        if !due {
+            ctx.node.saw_root(root.seeded_at());
+        }
+        due
+    });
+    if due == Some(false) {
+        return Ok(());
+    }
+    let mut number = None;
+    let mut reseeded = false;
+    if due == Some(true) {
+        let (began, full) = gather_for_root(platform, on, left)?;
+        number = began;
+        if let Some(number) = began
+            && full
+        {
+            reseeded = at_root(platform, wait, |ctx, root| {
+                root.reseed_from(ctx.node, ctx.now, ctx.tsc, number)
+            }) == Some(Answer::Done);
+        }
+    }
+    in_step(platform, |ctx| {
+        if let Some(number) = number {
+            ctx.node.end_lend(number);
+        }
+        if !reseeded && ctx.index == on {
+            ctx.node.root_refused(ctx.now);
+        }
+    })
+}
+
+/// Gathers a reseed's draws for the root into the store of processor `on`, making at most
+/// `left` draws (S2). Returns the number the store was lent under, if the gathering began,
+/// and whether the store is full. Its caller ends the lending under that number whatever
+/// happened, which overwrites draws that did not reach the root.
+fn gather_for_root(
+    platform: &mut dyn Platform,
+    on: u32,
+    left: u8,
+) -> Result<(Option<u64>, bool), Error> {
+    let quick = platform.quick();
+    let began = in_step(platform, |ctx| {
+        if ctx.index == on {
+            ctx.node.begin_root_gather()
+        } else {
+            None
+        }
+    })?;
+    let Some(number) = began else {
+        return Ok((None, false));
+    };
+    let mut drawn = 0u8;
+    for _ in 0..MAINTAIN_STEPS {
+        if drawn >= left {
+            break;
+        }
+        let did = in_step(platform, |ctx| {
+            ctx.node.gather_for_root(ctx.source, ctx.now, number, quick)
+        })?;
+        match did {
+            Maint::Idle => return Ok((began, true)),
+            Maint::Tried { outcome, .. } => match outcome {
+                Try::Stored | Try::Completed => drawn = drawn.saturating_add(1),
+                Try::NotReady | Try::SetAside => platform.pause(),
+                // The instruction rests or has failed: the next try is the other's, if it
+                // can be tried.
+                Try::NotNow | Try::Failed | Try::Unwanted => {}
+            },
+            // No instruction can be tried now, or the store is no longer this request's: it
+            // was lent again, or the thread has moved.
+            _ => return Ok((began, false)),
+        }
+    }
+    // The last draw the request may make can be the one that fills the store.
+    let full = in_step(platform, |ctx| ctx.node.lent_full(number))?;
+    Ok((began, full))
+}
+
+/// What is due before a request on processor `on`: draws towards a start-up test that is
+/// being run again, a reseed, and a look at the root (S1 to S3). Bounded: at most
+/// [`REQUEST_DRAWS`] draws.
+///
+/// `first` is what the step that found the processor due did already. Every later step does
+/// nothing unless the thread is still on `on`, and the upkeep ends at the first that finds it
+/// elsewhere.
+fn maintain(platform: &mut dyn Platform, on: u32, first: Maint) -> Result<(), Error> {
+    let quick = platform.quick();
     let mut allow = Allow::ALL;
-    let mut tries = Tries::new(platform.quick());
     let mut draws = 0u8;
     let (mut retested_rdseed, mut retested_rdrand) = (0u8, 0u8);
     let mut first = Some(first);
     for _ in 0..MAINTAIN_STEPS {
         let did = match first.take() {
             Some(did) => did,
-            None => in_step(platform, |ctx| {
-                ctx.node.maintain(ctx.source, ctx.now, ctx.tsc, allow)
-            })?,
+            None => {
+                let did = in_step(platform, |ctx| {
+                    (ctx.index == on).then(|| {
+                        ctx.node
+                            .maintain(ctx.source, ctx.now, ctx.tsc, allow, quick)
+                    })
+                })?;
+                let Some(did) = did else {
+                    return Ok(());
+                };
+                did
+            }
         };
-        let Maint::Tried {
-            on,
-            which,
-            purpose,
-            outcome,
-        } = did
-        else {
-            match did {
-                Maint::NeedRoot => {
-                    let answer = in_root_step(platform, |ctx, root| {
+        let (which, purpose, outcome) = match did {
+            Maint::Tried {
+                which,
+                purpose,
+                outcome,
+                ..
+            } => (which, purpose, outcome),
+            // The root is looked at next, by the step after this one.
+            Maint::Reseeded => continue,
+            Maint::TellRoot => {
+                let told = in_root_step(platform, |ctx, root| {
+                    let here = ctx.index == on;
+                    if here {
                         root.account(ctx.node);
-                        root.reseed_processor(ctx.node, ctx.now, ctx.tsc)
-                    })?;
-                    // The root has nothing to give now: it is left alone for a while. (If the
-                    // thread has moved to a processor that needs nothing, nothing was done.)
-                    if !matches!(answer, Answer::Done | Answer::NotGathered) {
-                        in_step(platform, |ctx| ctx.node.root_refused(ctx.now))?;
                     }
-                }
-                // R6: the root is reseeded on the same schedule. A processor that has
-                // reseeded itself looks at the root and, if it is due, reseeds it too, as
-                // long as the request's draws allow it. Otherwise it looks at its next
-                // request.
-                Maint::Reseeded | Maint::LookAtRoot
-                    if draws <= REQUEST_DRAWS.saturating_sub(RESEED_DRAWS) =>
-                {
-                    look_at_root(platform)?;
-                }
-                Maint::TellRoot => {
-                    in_root_step(platform, |ctx, root| root.account(ctx.node))?;
+                    here
+                })?;
+                if told {
                     continue;
                 }
-                _ => {}
+                return Ok(());
             }
-            return Ok(());
+            Maint::NeedRoot => {
+                // The root reseeds a processor only if that processor needs it, and a refusal
+                // is recorded on the processor refused: wherever the thread is, this is safe.
+                in_root_step(platform, |ctx, root| {
+                    root.reseed_processor(ctx.node, ctx.now, ctx.tsc)
+                })?;
+                return Ok(());
+            }
+            Maint::LookAtRoot => {
+                // R6: the root is reseeded on the same schedule, as long as the request's
+                // draws allow it. Otherwise the processor looks at its next request.
+                let left = REQUEST_DRAWS.saturating_sub(draws);
+                if left >= RESEED_DRAWS {
+                    look_at_root(platform, on, left, false)?;
+                }
+                return Ok(());
+            }
+            Maint::Idle | Maint::Delayed => return Ok(()),
         };
         let stop_retest = |allow: &mut Allow| match which {
             Instruction::Rdseed => allow.retest_rdseed = false,
@@ -582,94 +598,40 @@ fn maintain(platform: &mut dyn Platform, first: Maint) -> Result<(), Error> {
                         retest_rdseed: false,
                         retest_rdrand: false,
                         gather: false,
-                        ..allow
                     };
                 }
             }
-            Try::Failed | Try::Unwanted => {
+            Try::Failed | Try::Unwanted | Try::NotNow => {
                 if purpose == Purpose::Retest {
                     stop_retest(&mut allow);
                 }
             }
-            Try::NotReady | Try::SetAside => {}
-        }
-        if let Some(set_aside) = tries.note(on, which, outcome) {
-            in_step(platform, |ctx| {
-                ctx.node.gave_up(which, set_aside, ctx.now);
-            })?;
-            // The request does not try this instruction again, wherever it is by then.
-            allow.stop(which);
-        } else if matches!(outcome, Try::NotReady | Try::SetAside) {
-            platform.pause();
+            Try::NotReady | Try::SetAside => platform.pause(),
         }
     }
     Ok(())
 }
 
-/// Runs `step` as one step under the root's lock if the lock is free, and does not wait for
-/// it: the root's own reseed never makes a request wait for a lock another processor holds.
-fn try_root_step<T>(
-    platform: &mut dyn Platform,
-    mut step: impl FnMut(&mut Ctx<'_>, &mut Root) -> T,
-) -> Option<T> {
-    let mut result = None;
-    platform
-        .root_step(&mut |ctx, root| result = Some(step(ctx, root)))
-        .ok()?;
-    result
-}
-
-/// Looks whether the root is due and, if it is, reseeds it from eight draws of this processor
-/// (R6): the root keeps the processors' schedule, 2^20 requests or 60 seconds, as long as some
-/// processor with a healthy instruction reseeds itself.
-///
-/// It never waits for the root's lock. If the lock is taken, or the draws cannot be had now,
-/// the processor leaves the root alone for [`crate::REST_NANOS`] and looks again at a later
-/// request; the draws it made are not kept.
-fn look_at_root(platform: &mut dyn Platform) -> Result<(), Error> {
-    let due = try_root_step(platform, |ctx, root| {
-        root.account(ctx.node);
-        let due = root.due(ctx.now) && !root.stopped();
-        if !due {
-            ctx.node.looked_at_root();
-        }
-        due
-    });
-    if due == Some(false) {
-        return Ok(());
-    }
-    let reseeded = due == Some(true)
-        && fill_store(platform).unwrap_or(false)
-        && try_root_step(platform, |ctx, root| {
-            let answer = root.reseed_from(ctx.node, ctx.now, ctx.tsc);
-            if answer == Answer::Done {
-                ctx.node.looked_at_root();
-            }
-            answer
-        }) == Some(Answer::Done);
-    in_step(platform, |ctx| {
-        // Draws that did not reach the root are not kept for later.
-        ctx.node.drop_root_draws();
-        if !reseeded {
-            ctx.node.root_refused(ctx.now);
-        }
-    })
-}
-
-/// One piece of a request, with the maintenance that is due before it.
+/// One piece of a request, with the upkeep that is due before it.
 fn piece(platform: &mut dyn Platform, out: &mut [u8], maintained: &mut bool) -> Result<(), Error> {
+    let quick = platform.quick();
     for _ in 0..2 {
         let allow = if *maintained { None } else { Some(Allow::ALL) };
-        match in_step(platform, |ctx| {
-            ctx.node.piece(out, ctx.source, ctx.now, ctx.tsc, allow)
-        })? {
+        let (on, piece) = in_step(platform, |ctx| {
+            (
+                ctx.index,
+                ctx.node
+                    .piece(out, ctx.source, ctx.now, ctx.tsc, allow, quick),
+            )
+        })?;
+        match piece {
             Piece::Done => return Ok(()),
             Piece::NoGenerator => return Err(Error::NoGenerator),
             Piece::NotNow => return Err(Error::NotNow),
             Piece::Due(first) => {
                 // A reseed that cannot be made now is delayed, and the request is answered
-                // from the state there is (T5).
-                let _ = maintain(platform, first);
+                // from the state there is (T5), on whichever processor the thread is by then.
+                let _ = maintain(platform, on, first);
                 *maintained = true;
             }
         }
@@ -720,23 +682,18 @@ pub fn next_u64(platform: &mut dyn Platform) -> Result<u64, Error> {
 /// on, then the root reseeded from them and asked (R6; SP 800-90A §9.3.1).
 ///
 /// Every one of the eight draws is made after the request began. The store is overwritten when
-/// the request begins on a processor, and again if the request ends without an answer on the
-/// processor it last gathered on, so a draw that was in memory before the request is never
-/// the root's fresh entropy. What a request left on a processor it moved away from stays
-/// until that store is next used, and whatever uses it next begins by overwriting it or, for
-/// the root's ordinary reseed, uses it up.
+/// the request begins on a processor and lent to it under a number; only the holder of that
+/// number is answered from it, and a request that ends without an answer overwrites what it
+/// gathered where it still is. So a draw that was in memory before the request is never the
+/// root's fresh entropy. What a request left on a processor it moved away from stays there,
+/// under a number nobody holds, until that store is next used, which begins by overwriting it.
 fn fresh_piece(platform: &mut dyn Platform, out: &mut [u8]) -> Result<(), Error> {
-    // The processor this request is gathering on, and the number its store was given.
-    let mut mine: Option<(u32, u32)> = None;
+    let mut mine = None;
     let answered = fresh_gather(platform, out, &mut mine);
     if answered.is_err()
-        && let Some((cpu, epoch)) = mine
+        && let Some(number) = mine
     {
-        let _ = in_step(platform, |ctx| {
-            if ctx.index == cpu {
-                ctx.node.end_fresh(epoch);
-            }
-        });
+        let _ = in_step(platform, |ctx| ctx.node.end_lend(number));
     }
     answered
 }
@@ -744,19 +701,19 @@ fn fresh_piece(platform: &mut dyn Platform, out: &mut [u8]) -> Result<(), Error>
 fn fresh_gather(
     platform: &mut dyn Platform,
     out: &mut [u8],
-    mine: &mut Option<(u32, u32)>,
+    mine: &mut Option<u64>,
 ) -> Result<(), Error> {
-    let mut tries = Tries::new(platform.quick());
+    let quick = platform.quick();
     for _ in 0..FRESH_STEPS {
-        let begun = *mine;
-        let (on, generator, epoch, did) = in_step(platform, |ctx| {
+        let held = *mine;
+        let (generator, number, did) = in_step(platform, |ctx| {
             if !ctx.node.has_generator() {
-                return (ctx.index, false, 0, Fresh::Unavailable);
+                return (false, 0, Fresh::Unavailable);
             }
-            // A request that has moved to another processor begins there afresh.
-            let here = begun.and_then(|(cpu, epoch)| (cpu == ctx.index).then_some(epoch));
-            let (epoch, did) = ctx.node.fresh_try(ctx.source, ctx.now, here);
-            (ctx.index, true, epoch, did)
+            // A request that has moved holds a number this processor never gave: it begins
+            // afresh here.
+            let (number, did) = ctx.node.fresh_try(ctx.source, ctx.now, held, quick);
+            (true, number, did)
         })?;
         if !generator {
             return Err(Error::NoGenerator);
@@ -765,14 +722,11 @@ fn fresh_gather(
             // RDSEED is not healthy here, or is resting: no fresh entropy now.
             Fresh::Unavailable => return Err(Error::NotNow),
             Fresh::Ready => {
-                *mine = Some((on, epoch));
+                *mine = Some(number);
+                // If the thread has moved since its last draw, the store there is not lent
+                // under this number, and the request gathers where it is now.
                 let answer = in_root_step(platform, |ctx, root| {
-                    if ctx.index != on {
-                        // The thread moved after its last draw: gather where it is now.
-                        return Answer::NotGathered;
-                    }
-                    root.account(ctx.node);
-                    root.fresh_piece(ctx.node, out, ctx.now, ctx.tsc, epoch)
+                    root.fresh_piece(ctx.node, out, ctx.now, ctx.tsc, number)
                 })?;
                 match answer {
                     Answer::Done => return Ok(()),
@@ -782,25 +736,15 @@ fn fresh_gather(
                 }
             }
             Fresh::Tried(outcome) => {
-                *mine = Some((on, epoch));
+                *mine = Some(number);
                 outcome
             }
         };
         match outcome {
-            // The draw arrived: the next one has all its tries.
-            Try::Stored | Try::Completed | Try::Unwanted => {
-                tries.note(on, Instruction::Rdseed, outcome);
-            }
-            Try::Failed => return Err(Error::NotNow),
-            Try::NotReady | Try::SetAside => {
-                if let Some(set_aside) = tries.note(on, Instruction::Rdseed, outcome) {
-                    in_step(platform, |ctx| {
-                        ctx.node.gave_up(Instruction::Rdseed, set_aside, ctx.now);
-                    })?;
-                    return Err(Error::NotNow);
-                }
-                platform.pause();
-            }
+            Try::Stored | Try::Completed | Try::Unwanted => {}
+            Try::NotReady | Try::SetAside => platform.pause(),
+            // RDSEED rests or has failed: no fresh entropy now.
+            Try::NotNow | Try::Failed => return Err(Error::NotNow),
         }
     }
     Err(Error::NotNow)
