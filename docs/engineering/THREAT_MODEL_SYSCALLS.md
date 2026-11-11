@@ -112,9 +112,14 @@ Z9's rule: a lookup whose index, count or address comes from ring 3 goes through
 | The length of `debug_write`'s text | The copy into a buffer on the kernel's stack (`syscall.rs`, `debug_write`) | `nospec::length` |
 | The number of handles a `channel_write` carries | The copy into `raw` and the list read from `values`, both on the kernel's stack (`syscall.rs`, `channel_write`) | `nospec::length` |
 | The `size` a reader writes in its `read_sizes` record | The piece of the encoded record copied out (`syscall.rs`, `channel_read`) | `nospec::length` |
+| The `size` of the request record `memory_object_create` and `memory_map` read | The copy into a buffer on the kernel's stack (`syscall.rs`, `copy_request`) | `nospec::length` |
+| A `memory_map` request's offset and length | The object's frames the mapping takes (`memory_object.rs`, `MemoryObject::run`), and by the same count a random place and a take-back. Clamped where the range is checked (`mapping.rs`, `check`), the only place a request becomes pages | `nospec::length`, twice |
+| A `memory_map` request's fixed address, and the address and length of `memory_unmap` and `memory_protect` | The page-table entries the address space walks (`UserSpace::map_shared_run`, `unmap` and `protect`, which have no clamp of their own after their range check). Clamped in the kernel before the call (`mapping.rs`, `user_run`): by `check` for a fixed address, and by `memory_object.rs`'s `unmap` and `protect` before they ask the records for the mapping | `nospec::user_address` and `nospec::length` |
 | The call number | The generated dispatcher's `match`: comparisons, with no table (the image gate holds that). A wrong guess among them runs another call's decoder on this call's arguments, and that decoder's lookups are in this list | Not an index |
 
 Looked at and left alone, because the value is the kernel's own by the time it is used: the lengths `copy_out_handles` and `copy_out_records` take (set when the message was written, within the limit checked then); the size of `channel_write`'s payload, which sizes the buffer it is copied into; rights, signals and deadlines, which index nothing.
+
+Looked at and left alone in the four memory calls (2026-11-11), because nothing is indexed by them: a mapping's record is found by comparing each record's address and pages with the ones asked for, in a list the kernel made; access and flag bits are compared; `memory_object_create`'s length sizes the kernel's own new object and is charged to the account's quota first; a random place is the kernel's arithmetic on the clamped count; a change's price is arithmetic; and the generated decoders read fixed offsets of a full-size buffer, where `size` only says by comparison which fields are present.
 
 ### A message's writer and handle records (S3-2)
 
