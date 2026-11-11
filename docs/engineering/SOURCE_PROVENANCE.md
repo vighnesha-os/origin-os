@@ -3397,6 +3397,10 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
     - **Z2, `map_shared_run`:** a fixed map is made from address 0 instead, over the program's own mappings, so `prepare_run` refuses it. The hostile calls' line "ipc: memory maps" shows "mapped -> INVALID_ARGS" where a passing boot shows "mapped -> OK", and ends ": ipc failed".
     - **Z3, `unmap`:** the unmap takes every mapping from address 0 to the run's end, the program's own among them, and the program reports nothing after it. The line "ipc: memory unmap and protect" shows "unmap -> nothing, unmap again -> nothing" where a passing boot shows "unmap -> OK, unmap again -> INVALID_ARGS", and ends ": ipc failed".
     - **Z4, `protect`:** the protect changes every mapping from address 0 to the run's end, and the program reports nothing from it on. The same line shows "nothing" for the protect to read-only and the three steps after it, where a passing boot shows "OK", "ACCESS_DENIED", "OK" and "INVALID_ARGS", and ends ": ipc failed".
+  - *Gates on `2efc74b`,* the records commit, with a clean tree, on 2026-11-11 from 05:53 UTC:
+    - `cargo xtask check` passed. 1,370 host tests, none failed, 10 ignored: the batch's own count, since this change adds a value to a test and no test. The unsafe gate counted 324 sites in its 22 listed files, none of them added here. The no-panic, image, interface, document and reproducible-build gates passed. Loom: all 42 models passed and all 68 controls were caught (98 runs).
+    - `cargo xtask boot-test` passed 11 of 11 scenarios. Its kernel boot ended "degraded: 60 of 61 proofs passed; failed: speculation controls" (item 154), with the mask in use.
+    - The commit after `2efc74b` only adds these lines.
 - **Not shown:**
   - what a processor does on a wrongly guessed path, which nothing here can test (threat row I2). That each clamp keeps the walk in this space's own tables rests on the reading above;
   - anything on an x86-64 processor. Every run was QEMU 11.1.3's TCG on the development Mac (Apple M1 Max), with the mask in use, so no boot of this change used the fence. CI's KVM boots run once the batch is pushed.
