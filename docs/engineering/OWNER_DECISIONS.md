@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–141 and 145–154, 2026-11-11 for items 161, 165, 168 and 189, and 2026-11-12 for items 191–222. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144, 155–160, 162–164, 166, 167, 169–188 and 190 are in the second step-3 batch (`land/s3-part2`, pull request 16) and reach this sheet with it. |
+| As of | 2026-11-10 for items 71–141 and 145–154, 2026-11-11 for items 161, 165, 168 and 189, and 2026-11-12 for items 191–223. Items up to 70: 2026-11-09, after the pre-merge review. Items 142–144, 155–160, 162–164, 166, 167, 169–188 and 190 are in the second step-3 batch (`land/s3-part2`, pull request 16) and reach this sheet with it. |
 | Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 165 and 168: your own text for CLAUDE.md §1, in its second and third versions, read against the whole of revision 7.5 and the ADRs each change names; the check and the list of changes are `ROLES_CHECK_2026-11-11.md`. Item 189: that check's proposal 11. Items 191–196: CLAUDE.md 7.6's §1, by TASKS item 35's session, with one rule added to item 191 by the coordinating session. Items 197–220: CLAUDE.md 7.6, the accepted ADRs and `docs/spec/OIDL.md`, by the session that wrote step 4's ledger, and again by the coordinating session against ADR-0005 A6, ADR-0011 N8 and the system threat model. Items 221–223: items 191–196 and the matrix as built, by the coordinating session, which ran its gate. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: items 161, 165, 168 and 189 (item 168 delegated to Claude). 2026-11-12: items 191–222. |
-| Still open | Item 223, the matrix's quoting of a decision by its title: put to you on 2026-11-12, and not answered in the coordinating session (see its section). Item 168's changes to your text are Claude's, and you have not read them. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–141 and 145–154 (item 97 delegated to Claude). 2026-11-11: items 161, 165, 168 and 189 (item 168 delegated to Claude). 2026-11-12: items 191–223. |
+| Still open | No numbered item. Item 168's changes to your text are Claude's, and you have not read them. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -573,15 +573,15 @@ Also:
 - **Recorded, and no decision:** S4-0, ADR-0005 E1's 64-bit handles (item 109), lands before `origin.core` and takes `user-abi` to 0.7; `origin.directory` goes to 0.2 in S4-4 and `origin.diagnostics` starts at 0.1 in S4-5.
 - **Nothing is built.** Step 4 starts with S4-0 once the second step-3 batch is on `main`. When built, it runs under QEMU and as KVM guests in CI, and nothing will have run on a declared machine.
 
-## The requirements matrix: two more states and the owed list (items 221 and 222): Accepted 2026-11-12
+## The requirements matrix: two more states, the owed list and quoting by title (items 221 to 223): Accepted 2026-11-12
 
-Building the matrix (TASKS item 35) took three things that items 191 to 196 do not say. The coordinating session numbered them 221 to 223 and put the first two to you on 2026-11-12, recommending both; the matrix session put all three to you in its own session. You answered **"Accept both"** in the coordinating session the same day.
+Building the matrix (TASKS item 35) took three things that items 191 to 196 do not say. The coordinating session numbered them 221 to 223 and put the first two to you on 2026-11-12, recommending both; the matrix session put all three to you in its own session. You answered **"Accept both"** in the coordinating session the same day, and then **"Accept 223"** when the coordinating session put the third to you.
 
 | # | Question | Answer |
 |---|---|---|
 | 221, answered | Two more states for a row: `partial`, where part of it is implemented with evidence and its limitations say what is missing, and `not-verified`, where something is in the tree and the gate can find no evidence for it. Neither counts as coverage; both are printed beside the figure, with `built`. | **Accept** |
 | 222, answered | A second kind of entry in the README's list of answered items without rows: `owed`, for an item whose deciding text is not in the tree yet. Today that is items 204, 207–212, 214, 215, 217 and 220, whose text is ADR-0005 Amendment 8, in pull request 16. Rows replace the entry when the text lands. | **Accept** |
-| 223 | A decision of an ADR is quoted by its title only, so the gate does not see a change to its body under the same title. | Not answered in the coordinating session |
+| 223, answered | A decision of an ADR is quoted by its title only, so the gate does not see a change to its body under the same title. | **Accept** |
 
-- **Item 223 accepts a limit of the gate,** which the matrix's README already lists under what the gate does not check. The matrix session reports that you answered "Accept all" to it in that session; the coordinating session records only answers given to it, and asks you again.
+- **Item 223 accepts a limit of the gate,** which the matrix's README already lists under what the gate does not check. A reworded decision under an unchanged title has to be caught by whoever changes the ADR, who updates the decision's rows by hand.
 - **Built:** the matrix and its gate, on `claude/dazzling-jackson-9eca1b`, not yet landed. Both states and the `owed` list are in it already; its README and TASKS item 35 will name these items.
