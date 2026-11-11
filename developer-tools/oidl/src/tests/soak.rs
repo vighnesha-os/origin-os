@@ -11,7 +11,8 @@ use crate::{codegen, corpus, fingerprint, wire};
 const KERNEL: &str = include_str!("../../../../sdk/interfaces/origin.kernel.oidl");
 const ECHO: &str = include_str!("../../tests/fixtures/echo.oidl");
 const CALLS: &str = include_str!("../../tests/fixtures/calls.oidl");
-const VERSIONS: &str = "[compatibility]\nuser-abi = \"0.1\"\n";
+/// The real versions file, which the kernel's definition names its version from (§9).
+const VERSIONS: &str = include_str!("../../../../origin-version.toml");
 
 fn render(tokens: &[lex::Spanned]) -> String {
     let mut out = String::new();

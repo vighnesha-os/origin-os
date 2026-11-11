@@ -26,30 +26,33 @@
 
 #![forbid(unsafe_code)]
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
 
 use crate::paging::{Access, PAGE};
 use origin_abi::limits::{DEADLINE_INFINITE, MAX_MESSAGE_BYTES};
-use origin_abi::{Error, OK, read_sizes, rights, signals, status_name, syscall as sys};
+use origin_abi::{
+    Error, OK, ObjectType, read_sizes, received_handle, rights, signals, start, status_name,
+    syscall as sys,
+};
 
-use origin_frame::proof_programs::{self, DATA, STACK};
-use origin_frame::userspace::UserFrame;
+use origin_frame::objref::ObjectRef;
+use origin_frame::proof_programs::{self, DATA, ENTRY_RDI, SCRIPT, STACK};
+use origin_frame::userspace::{self, UserFrame};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex};
+use crate::handles::Need;
 use crate::ipc::{self, Object};
-use crate::process::{Ending, Limits, Process};
-use crate::{memory, sched, time};
+use crate::launch::{self, Given};
+use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, Process};
+use crate::{memory, sched, syscall, time};
 
 /// Where every proof process's code begins.
 const CODE: u64 = 0x40_0000;
 /// Pages of scratch memory.
 const DATA_PAGES: u64 = 4;
-/// The script, on read-only pages.
-const SCRIPT: u64 = 0x54_0000;
 /// Pages of script (64 calls per page).
 const SCRIPT_PAGES: u64 = 4;
 /// A second read-write region for the 64 KiB message test.
@@ -71,13 +74,15 @@ const MSG: u64 = DATA + 0x100;
 const RBUF: u64 = DATA + 0x140;
 /// `wait_one`'s output.
 const OBS: u64 = DATA + 0x240;
-/// `channel_read`'s sizes structure (`size` set to the known 12 before the process starts).
+/// `channel_read`'s sizes structure, given its first version's size, 12, before the process
+/// starts: every read through it gets the counts and nothing past them (C2).
 const SIZES: u64 = DATA + 0x248;
 /// A sizes structure too small for the kernel to use.
 const BAD_SIZES: u64 = DATA + 0x260;
 /// A handle list to send.
 const LIST: u64 = DATA + 0x300;
-/// Handles received.
+/// Handles received: a `received_handle` record each (ADR-0005 B3), so the first handle's
+/// value is the `u32` here.
 const RECV: u64 = DATA + 0x400;
 
 /// A test message.
@@ -94,6 +99,9 @@ enum Arg {
     Handle(u64),
 }
 use Arg::{Handle as Hd, Imm};
+
+mod directory;
+pub(crate) use directory::prove_directory;
 
 /// What a step must do.
 #[derive(Clone, Copy)]
@@ -256,9 +264,25 @@ impl Image {
 
     /// As [`Image::new`], but system calls are accepted only from `origin`.
     fn with_origin(limits: Limits, code: &[u8], origin: (u64, u64)) -> Option<Self> {
+        Self::build(limits, code, origin, BOOT_PROOF_PRINCIPAL)
+    }
+
+    /// As [`Image::new`], acting for `principal` (ADR-0005 C1).
+    fn acting_for(limits: Limits, code: &[u8], principal: u64) -> Option<Self> {
+        let code_pages = code.len().div_ceil(PAGE as usize).max(1) as u64;
+        Self::build(limits, code, (CODE, CODE + code_pages * PAGE), principal)
+    }
+
+    fn build(limits: Limits, code: &[u8], origin: (u64, u64), principal: u64) -> Option<Self> {
+        Self::from_process(Process::new(limits, origin, principal)?, code)
+    }
+
+    /// An image for `process`, made by its caller (a launched child, say): `program` at
+    /// [`CODE`], its data pages, and one stack page.
+    fn from_process(process: Process, code: &[u8]) -> Option<Self> {
         let code_pages = code.len().div_ceil(PAGE as usize).max(1) as u64;
         let mut image = Self {
-            process: Process::new(limits, origin)?,
+            process,
             pages: Vec::new(),
         };
         image.map(CODE, code_pages, Access::ReadExecute)?;
@@ -303,7 +327,7 @@ impl Image {
     /// The scratch memory every scripted process starts with.
     fn scratch(&self) -> Option<()> {
         self.write(MSG, TEXT)?;
-        self.write(SIZES, &read_sizes::SIZE.to_le_bytes())?;
+        self.write(SIZES, &read_sizes::BASE_SIZE.to_le_bytes())?;
         self.write(BAD_SIZES, &8u32.to_le_bytes())
     }
 
@@ -338,8 +362,9 @@ impl Image {
         self.write(at, &encoded)
     }
 
-    fn finish(self) -> Arc<Process> {
-        Arc::new(self.process)
+    /// The process, now shared; `None` without the memory to share it.
+    fn finish(self) -> Option<ObjectRef<Process>> {
+        ObjectRef::try_new(self.process).ok()
     }
 }
 
@@ -489,10 +514,10 @@ fn ping_pong(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) 
 }
 
 /// The process of `image`, its round count written (handles are written after the grants).
-fn build_pinger(image: Image, rounds: u64) -> Option<Arc<Process>> {
+fn build_pinger(image: Image, rounds: u64) -> Option<ObjectRef<Process>> {
     image.write_u64(DATA + 8, rounds)?;
-    image.write(SIZES, &read_sizes::SIZE.to_le_bytes())?;
-    Some(image.finish())
+    image.write(SIZES, &read_sizes::BASE_SIZE.to_le_bytes())?;
+    image.finish()
 }
 
 /// Writes `value` to the `u64` at `offset` of the process's data page, before it starts.
@@ -607,6 +632,13 @@ fn hostile_groups(kernel: u64, foreign: u64) -> Vec<Group> {
                     "sizes in the kernel",
                     sys::CHANNEL_READ,
                     &[b, Imm(RBUF), Imm(16), Imm(0), Imm(0), Imm(kernel)],
+                    fault,
+                ),
+                // Room for one handle is a whole record, 12 bytes, not a 4-byte value (B3).
+                step(
+                    "a handle record across the end of mapped",
+                    sys::CHANNEL_READ,
+                    &[b, Imm(RBUF), Imm(16), Imm(data_end - 4), Imm(1), Imm(SIZES)],
                     fault,
                 ),
                 step(
@@ -766,6 +798,17 @@ fn hostile_groups(kernel: u64, foreign: u64) -> Vec<Group> {
                 write("the sender's handle is gone", h(18), MSG, 4, bad),
                 read_handles("received", h(17), OK),
                 value_at("with one handle", SIZES + read_sizes::HANDLES_AT as u64, 1),
+                // Its record says what it names and what it may do (B3).
+                value_at(
+                    "its record names a channel",
+                    RECV + received_handle::OBJECT_TYPE_AT as u64,
+                    ObjectType::Channel as u64
+                ),
+                value_at(
+                    "with the rights it was sent with",
+                    RECV + received_handle::RIGHTS_AT as u64,
+                    u64::from(full)
+                ),
                 write("the moved handle writes", Hd(RECV), MSG, 4, OK),
                 read("and the other end reads", h(19), RBUF, 16, OK),
                 dup("it kept its rights", Hd(RECV), full, 20, OK),
@@ -831,7 +874,7 @@ fn full_queue_steps(timed_out: i64, wait_status: i64) -> Vec<Step> {
 fn hostile(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     // Another process with a live handle whose value is not live in the hostile process:
     // slot 40, which the hostile process's table never reaches.
-    let Some(other) = Process::new(LIMITS, (CODE, CODE + PAGE)) else {
+    let Some(other) = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL) else {
         return false;
     };
     let Ok((end, peer)) = ipc::create_channel(&other.account) else {
@@ -859,7 +902,9 @@ fn hostile(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     if image.scratch().is_none() || image.script(&steps).is_none() {
         return false;
     }
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -933,7 +978,9 @@ fn exit_closes(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64
         {
             return false;
         }
-        let (waiter, ender) = (waiter.finish(), ender.finish());
+        let (Some(waiter), Some(ender)) = (waiter.finish(), ender.finish()) else {
+            return false;
+        };
         let wakes_before = ipc::cross_cpu_wakes();
         if Process::start_thread(&waiter, far, CODE, STACK + PAGE, SCRIPT).is_err() {
             return false;
@@ -1008,7 +1055,9 @@ fn cancel(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> 
     if image.write_script(second_script, &second).is_none() {
         return false;
     }
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -1077,7 +1126,9 @@ fn quotas(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     if image.scratch().is_none() || image.script(&group[0].steps).is_none() {
         return false;
     }
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -1153,7 +1204,9 @@ fn byte_quota(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64)
     {
         return false;
     }
-    let (writer, peer) = (writer.finish(), peer.finish());
+    let (Some(writer), Some(peer)) = (writer.finish(), peer.finish()) else {
+        return false;
+    };
     if Process::start_thread(&writer, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -1226,7 +1279,9 @@ fn transfer_depth(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     if image.scratch().is_none() || image.script(&group[0].steps).is_none() {
         return false;
     }
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -1269,7 +1324,13 @@ fn big_message(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
             return false;
         }
     }
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
+    // Its memory goes with its last thread: this keeps it to be read afterwards.
+    let Some(memory) = process.memory() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -1282,7 +1343,7 @@ fn big_message(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let mut intact = ended;
     if ended {
         for k in 0..(MAX_MESSAGE_BYTES as u64 / 8) {
-            intact &= process.read_u64(BIG_IN + 8 * k) == Some(pattern(k));
+            intact &= memory.read_u64(BIG_IN + 8 * k) == Some(pattern(k));
         }
     }
     let right = ended && groups_ok && intact && process.ending() == Some(Ending::Exited(0));
@@ -1304,7 +1365,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let Some(image) = Image::new(LIMITS, code) else {
         return false;
     };
-    let regs = image.finish();
+    let Some(regs) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&regs, bsp, CODE, STACK + PAGE, 0).is_err() {
         return false;
     }
@@ -1328,7 +1391,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     if image.scratch().is_none() || image.script(&script).is_none() {
         return false;
     }
-    let pinned = image.finish();
+    let Some(pinned) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&pinned, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
         return false;
     }
@@ -1354,7 +1419,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let Some(image) = Image::new(LIMITS, gs) else {
         return false;
     };
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
         return false;
     }
@@ -1373,7 +1440,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let Some(image) = Image::new(LIMITS, ac) else {
         return false;
     };
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     let leaks_before = cpu::ac_leaks();
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
         return false;
@@ -1400,7 +1469,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let Some(image) = Image::new(limits, nodebug) else {
         return false;
     };
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
         return false;
     }
@@ -1420,7 +1491,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let Some(image) = Image::new(LIMITS, sidt) else {
         return false;
     };
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
         return false;
     }
@@ -1447,7 +1520,9 @@ fn abi_and_entry(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let Some(image) = Image::new(LIMITS, step) else {
         return false;
     };
-    let process = image.finish();
+    let Some(process) = image.finish() else {
+        return false;
+    };
     if Process::start_thread(&process, bsp, CODE, STACK + PAGE, 0).is_err() {
         return false;
     }
@@ -1492,6 +1567,1028 @@ fn copy_fault_recovered(com1: &mut Console) -> bool {
     right
 }
 
+// ------------------------------------------------------------------ process and thread objects
+
+/// Where a second thread's script starts, on the script pages.
+const SECOND_SCRIPT: u64 = SCRIPT + SCRIPT_PAGES * PAGE / 2;
+
+/// Writes handle slot `k` of a process that has already started, before the thread that reads
+/// that slot does.
+fn write_slot(process: &Process, k: u64, value: u32) -> bool {
+    process
+        .frame_of(DATA)
+        .is_some_and(|f| process.write_frame(f, 4 * k as usize, &value.to_le_bytes()))
+}
+
+/// Handles name objects of a type, and each call asks for a type: a process or a thread is not a
+/// channel, whatever rights it has. A live process or thread raises nothing; a handle to one
+/// can be waited on, duplicated, carried in a message and closed like any other.
+fn object_types(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let (Some(mut target), Some(mut prober)) = (
+        Image::new(LIMITS, proof_programs::script()),
+        Image::new(LIMITS, proof_programs::script()),
+    ) else {
+        return false;
+    };
+    let Ok((target_end, prober_end)) = ipc::create_channel(&target.process.account) else {
+        return false;
+    };
+    let (Ok(held_t), Ok(_)) = (
+        target
+            .process
+            .grant(Object::Channel(target_end), rights::CHANNEL),
+        prober
+            .process
+            .grant(Object::Channel(prober_end), rights::CHANNEL),
+    ) else {
+        return false;
+    };
+    // The target stays alive for as long as the prober holds the other end.
+    let target_steps = alloc::vec![wait(
+        "",
+        Imm(u64::from(held_t)),
+        signals::PEER_CLOSED,
+        DEADLINE_INFINITE,
+        OK
+    )];
+    if target.scratch().is_none() || target.script(&target_steps).is_none() {
+        return false;
+    }
+    let Some(target) = target.finish() else {
+        return false;
+    };
+    let Ok(thread) = Process::start_thread(&target, bsp, CODE, STACK + PAGE, SCRIPT) else {
+        return false;
+    };
+    let granted = (
+        prober
+            .process
+            .grant(Object::Process(target.clone()), rights::PROCESS),
+        prober
+            .process
+            .grant(Object::Process(target.clone()), rights::READ),
+        prober.process.grant(Object::Thread(thread), rights::THREAD),
+    );
+    let (Ok(process_handle), Ok(read_only), Ok(thread_handle)) = granted else {
+        return false;
+    };
+    let (p, weak, t) = (
+        Imm(u64::from(process_handle)),
+        Imm(u64::from(read_only)),
+        Imm(u64::from(thread_handle)),
+    );
+    let wrong = Error::WrongType.raw();
+    let denied = Error::AccessDenied.raw();
+    let timed_out = Error::TimedOut.raw();
+    let ended = signals::TERMINATED;
+    let group = [Group {
+        title: "object types",
+        steps: alloc::vec![
+            create(20),
+            write("a process is no channel", p, MSG, 8, wrong),
+            read("a thread is no channel", t, RBUF, 16, wrong),
+            write("the type comes before the rights", weak, MSG, 8, wrong),
+            wait("a live process", p, ended, 0, timed_out),
+            value_at("raises nothing", OBS, 0),
+            wait("a live thread", t, ended, 0, timed_out),
+            value_at("raises nothing either", OBS, 0),
+            wait("waiting needs WAIT", weak, ended, 0, denied),
+            dup("", p, rights::WAIT | rights::TRANSFER, 8, OK),
+            wait("a duplicate waits", h(8), ended, 0, timed_out),
+            dup("and cannot duplicate", h(8), rights::WAIT, 9, denied),
+            copy32(slot_addr(8), LIST),
+            send("a process handle travels", h(20), 1, OK),
+            wait(
+                "the sender's is gone",
+                h(8),
+                ended,
+                0,
+                Error::BadHandle.raw()
+            ),
+            read_handles("", h(21), OK),
+            wait("the received one waits", Hd(RECV), ended, 0, timed_out),
+            close("", Hd(RECV), OK),
+            close("a thread handle closes", t, OK),
+        ],
+    }];
+    if prober.scratch().is_none() || prober.script(&group[0].steps).is_none() {
+        return false;
+    }
+    let Some(prober) = prober.finish() else {
+        return false;
+    };
+    if Process::start_thread(&prober, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
+        return false;
+    }
+    let done = await_end(&prober, tsc_hz, 10) && await_end(&target, tsc_hz, 10);
+    let groups_ok = check_groups(com1, &group, &prober.reports());
+    done && groups_ok
+        && prober.ending() == Some(Ending::Exited(0))
+        && target.ending() == Some(Ending::Exited(0))
+}
+
+/// A thread of one process blocked on a handle to another, on another processor, wakes when that
+/// process ends, by exiting or by faulting, and sees `TERMINATED`; it stays raised.
+fn process_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let mut ok = true;
+    for (label, exit_step) in [("exits", None), ("faults", Some(fault()))] {
+        let (Some(mut waiter), Some(mut ender)) = (
+            Image::new(LIMITS, proof_programs::script()),
+            Image::new(LIMITS, proof_programs::script()),
+        ) else {
+            return false;
+        };
+        let ender_steps: Vec<Step> = exit_step.into_iter().collect();
+        if ender.scratch().is_none() || ender.script(&ender_steps).is_none() {
+            return false;
+        }
+        let Some(ender) = ender.finish() else {
+            return false;
+        };
+        let Ok(held) = waiter
+            .process
+            .grant(Object::Process(ender.clone()), rights::PROCESS)
+        else {
+            return false;
+        };
+        let held = Imm(u64::from(held));
+        let ended = signals::TERMINATED;
+        let waiter_steps = alloc::vec![
+            wait("woken", held, ended, DEADLINE_INFINITE, OK),
+            value_at("observed", OBS, u64::from(ended)),
+            wait("and it stays raised", held, ended, 0, OK),
+        ];
+        if waiter.scratch().is_none() || waiter.script(&waiter_steps).is_none() {
+            return false;
+        }
+        let Some(waiter) = waiter.finish() else {
+            return false;
+        };
+        let wakes_before = ipc::cross_cpu_wakes();
+        if Process::start_thread(&waiter, far, CODE, STACK + PAGE, SCRIPT).is_err() {
+            return false;
+        }
+        sched::yield_until(|| waiter.waiting.load(Ordering::Acquire) > 0, tsc_hz, 5);
+        if Process::start_thread(&ender, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
+            return false;
+        }
+        let done = await_end(&ender, tsc_hz, 10) && await_end(&waiter, tsc_hz, 10);
+        let groups = [Group {
+            title: "the waiter on a process that",
+            steps: waiter_steps,
+        }];
+        let right_reports = check_groups(com1, &groups, &waiter.reports());
+        let wakes = ipc::cross_cpu_wakes().wrapping_sub(wakes_before);
+        let ender_ok = matches!(
+            (exit_step.is_some(), ender.ending()),
+            (false, Some(Ending::Exited(0))) | (true, Some(Ending::Faulted { vector: 6, .. }))
+        );
+        let right = done && right_reports && ender_ok && (far == bsp || wakes > 0);
+        ok &= right;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: ipc: when a process {label}: TERMINATED reached the thread waiting on it on {}, blocked {} times; {} wake-ups crossed processors{}",
+            far.named(),
+            waiter.blocked(),
+            wakes,
+            if right { "" } else { ": ipc failed" }
+        );
+    }
+    ok
+}
+
+/// A thread waits for another thread of its own process: `TERMINATED` on a thread is raised when
+/// that thread ends, with the process and the waiter still running.
+fn thread_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let Some(mut image) = Image::new(LIMITS, proof_programs::script()) else {
+        return false;
+    };
+    if image.map(STACK_1, 1, Access::ReadWrite).is_none() {
+        return false;
+    }
+    let Ok((a, b)) = ipc::create_channel(&image.process.account) else {
+        return false;
+    };
+    let (Ok(ha), Ok(hb)) = (
+        image.process.grant(Object::Channel(a), rights::CHANNEL),
+        image.process.grant(Object::Channel(b), rights::CHANNEL),
+    ) else {
+        return false;
+    };
+    // Slot 3 holds the handle to the other thread: it exists only once that thread has started.
+    let other = h(3);
+    let ended = signals::TERMINATED;
+    let joined_thread = alloc::vec![wait(
+        "",
+        Imm(u64::from(hb)),
+        signals::READABLE,
+        DEADLINE_INFINITE,
+        OK
+    )];
+    let joiner = alloc::vec![
+        wait(
+            "a thread still running",
+            other,
+            ended,
+            0,
+            Error::TimedOut.raw()
+        ),
+        write("", Imm(u64::from(ha)), MSG, 8, OK),
+        wait("joined", other, ended, DEADLINE_INFINITE, OK),
+        value_at("observed", OBS, u64::from(ended)),
+        wait("and it stays raised", other, ended, 0, OK),
+    ];
+    if image.scratch().is_none()
+        || image.script(&joiner).is_none()
+        || image.write_script(SECOND_SCRIPT, &joined_thread).is_none()
+    {
+        return false;
+    }
+    let Some(process) = image.finish() else {
+        return false;
+    };
+    let Ok(thread) = Process::start_thread(&process, far, CODE, STACK_1 + PAGE, SECOND_SCRIPT)
+    else {
+        return false;
+    };
+    let Ok(value) = process.grant(Object::Thread(thread), rights::THREAD) else {
+        return false;
+    };
+    if !write_slot(&process, 3, value)
+        || Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err()
+    {
+        return false;
+    }
+    let done = await_end(&process, tsc_hz, 10);
+    // Both threads report to the one log. The other thread's only status, OK, is always somewhere
+    // among the first OKs: it cannot come later, because the joiner's wait ends after it.
+    let mut steps = joiner;
+    steps.insert(2, step("", sys::WAIT_ONE, &[], OK));
+    let group = [Group {
+        title: "a thread waiting for another thread",
+        steps,
+    }];
+    let groups_ok = check_groups(com1, &group, &process.reports());
+    done && groups_ok && process.ending() == Some(Ending::Exited(0))
+}
+
+/// The address space of a process goes when the last of its threads has been reaped, and only
+/// then, however many references to the process remain; `TERMINATED` is raised after it.
+fn memory_goes_with_the_last_thread(
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    bsp: CpuIndex,
+    tsc_hz: u64,
+) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let Some(mut image) = Image::new(LIMITS, proof_programs::script()) else {
+        return false;
+    };
+    if image.map(STACK_1, 1, Access::ReadWrite).is_none() {
+        return false;
+    }
+    let Ok((end, kept)) = ipc::create_channel(&image.process.account) else {
+        return false;
+    };
+    let Ok(held) = image.process.grant(Object::Channel(end), rights::CHANNEL) else {
+        return false;
+    };
+    // The first thread stays until the kernel drops the far end; the second exits at once.
+    let stays = alloc::vec![wait(
+        "",
+        Imm(u64::from(held)),
+        signals::PEER_CLOSED,
+        DEADLINE_INFINITE,
+        OK
+    )];
+    if image.scratch().is_none()
+        || image.script(&stays).is_none()
+        || image.write_script(SECOND_SCRIPT, &[]).is_none()
+    {
+        return false;
+    }
+    let Some(process) = image.finish() else {
+        return false;
+    };
+    let before = userspace::spaces_freed();
+    if Process::start_thread(&process, far, CODE, STACK + PAGE, SCRIPT).is_err() {
+        return false;
+    }
+    sched::yield_until(|| process.waiting.load(Ordering::Acquire) > 0, tsc_hz, 5);
+    let Ok(second) = Process::start_thread(&process, bsp, CODE, STACK_1 + PAGE, SECOND_SCRIPT)
+    else {
+        return false;
+    };
+    // The second thread ends and is reaped here while the first still runs in the space.
+    sched::yield_until(|| second.termination().raised(), tsc_hz, 5);
+    let second_ended = second.termination().raised();
+    sched::reap();
+    let while_running = userspace::spaces_freed().wrapping_sub(before);
+    let raised_early = process.termination().raised();
+    drop(kept);
+    sched::yield_until(|| process.termination().raised(), tsc_hz, 10);
+    let raised = process.termination().raised();
+    let at_terminated = userspace::spaces_freed().wrapping_sub(before);
+    let reports = process.reports();
+    let right = second_ended
+        && while_running == 0
+        && !raised_early
+        && raised
+        && at_terminated == 1
+        && reports == [OK as u64]
+        && process.memory().is_none()
+        && process.ending() == Some(Ending::Exited(0));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: a process's memory goes when its last thread is reaped, with the process object still held: {while_running} spaces freed while a thread ran, {at_terminated} when TERMINATED was raised{}",
+        if right { "" } else { ": ipc failed" }
+    );
+    right
+}
+
+/// Process IDs are never 0, which is the kernel, and never used twice (ADR-0005 C1).
+fn process_ids(com1: &mut Console) -> bool {
+    const PROCESSES: usize = 16;
+    let mut previous = 0;
+    let mut ascending = true;
+    for _ in 0..PROCESSES {
+        let Some(process) = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL) else {
+            return false;
+        };
+        ascending &= process.id() > previous;
+        previous = process.id();
+        drop(process);
+    }
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: process IDs: {PROCESSES} processes created and dropped in turn, each ID above the last and none of them 0: {ascending}{}",
+        if ascending { "" } else { ": ipc failed" }
+    );
+    ascending
+}
+
+/// A thread blocked on a handle to a process completes with `CANCELED` when another thread of
+/// its process closes that handle, or sends it away (ADR-0005 A2): cancellation does not
+/// depend on the object being a channel.
+fn cancel_on_any_object(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let mut ok = true;
+    for (how, sends) in [("closes", false), ("sends away", true)] {
+        // Never started, so nothing else can end the wait.
+        let Some(never_runs) = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)
+        else {
+            return false;
+        };
+        let Ok(never_runs) = ObjectRef::try_new(never_runs) else {
+            return false;
+        };
+        let Some(mut image) = Image::new(LIMITS, proof_programs::script()) else {
+            return false;
+        };
+        if image.map(STACK_1, 1, Access::ReadWrite).is_none() {
+            return false;
+        }
+        let Ok((a, b)) = ipc::create_channel(&image.process.account) else {
+            return false;
+        };
+        let (Ok(held), Ok(carrier), Ok(_)) = (
+            image
+                .process
+                .grant(Object::Process(never_runs.clone()), rights::PROCESS),
+            image.process.grant(Object::Channel(a), rights::CHANNEL),
+            image.process.grant(Object::Channel(b), rights::CHANNEL),
+        ) else {
+            return false;
+        };
+        let waited = Imm(u64::from(held));
+        let first = alloc::vec![wait(
+            "",
+            waited,
+            signals::TERMINATED,
+            DEADLINE_INFINITE,
+            Error::Canceled.raw()
+        )];
+        let second = if sends {
+            if image.write(LIST, &held.to_le_bytes()).is_none() {
+                return false;
+            }
+            alloc::vec![send("", Imm(u64::from(carrier)), 1, OK)]
+        } else {
+            alloc::vec![close("", waited, OK)]
+        };
+        if image.scratch().is_none()
+            || image.script(&first).is_none()
+            || image.write_script(SECOND_SCRIPT, &second).is_none()
+        {
+            return false;
+        }
+        let Some(process) = image.finish() else {
+            return false;
+        };
+        if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
+            return false;
+        }
+        sched::yield_until(|| process.waiting.load(Ordering::Acquire) > 0, tsc_hz, 5);
+        let in_wait = process.waiting.load(Ordering::Acquire) > 0;
+        if Process::start_thread(&process, far, CODE, STACK_1 + PAGE, SECOND_SCRIPT).is_err() {
+            return false;
+        }
+        let done = await_end(&process, tsc_hz, 10);
+        let canceled = process.reports().contains(&(Error::Canceled.raw() as u64));
+        let right = done && in_wait && canceled && process.ending() == Some(Ending::Exited(0));
+        ok &= right;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: ipc: a thread in wait_one on a process handle another thread {how} completes with {}{}",
+            if canceled {
+                "CANCELED"
+            } else {
+                "something else"
+            },
+            if right { "" } else { ": ipc failed" }
+        );
+    }
+    ok
+}
+
+/// Runs the proofs of process and thread objects, with a leak check of their own: every one of
+/// them is dropped by the end, and the memory is back to the frame. Called from the boot flow
+/// with every scheduler running, after [`prove`], which leaves nothing behind.
+pub(crate) fn prove_objects(
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    bsp: CpuIndex,
+    tsc_hz: u64,
+) -> bool {
+    let before = memory::stats();
+    let mut ok = true;
+    // First, while no other address space is being freed: it counts them.
+    ok &= memory_goes_with_the_last_thread(com1, cpus, bsp, tsc_hz);
+    ok &= object_types(com1, bsp, tsc_hz);
+    ok &= process_terminated(com1, cpus, bsp, tsc_hz);
+    ok &= thread_terminated(com1, cpus, bsp, tsc_hz);
+    ok &= cancel_on_any_object(com1, cpus, bsp, tsc_hz);
+    ok &= process_ids(com1);
+    let same = || {
+        memory::stats().map(|(h, f)| (h.bytes_in_use, f))
+            == before.map(|(h, f)| (h.bytes_in_use, f))
+    };
+    ipc::reap_closed();
+    sched::yield_until(same, tsc_hz, 2);
+    let back = same();
+    let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: every process and thread object and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){}",
+        if back { "" } else { ": ipc failed" }
+    );
+    ok && back
+}
+
+// ------------------------------------------------------------------ a message's writer
+
+/// The reader's `read_sizes` structures in the identity proof, each the current 32 bytes: for
+/// a read too small for its message, then one per message read.
+const IDENT_SMALL: u64 = DATA + 0x500;
+const IDENT_FIRST: u64 = DATA + 0x520;
+const IDENT_SECOND: u64 = DATA + 0x540;
+/// One given the first version's 12 bytes (C2), and what fills it past them.
+const IDENT_OLD: u64 = DATA + 0x560;
+/// What fills each structure before the reads, so that a field the kernel did not write
+/// shows.
+const UNWRITTEN: u32 = 0xC5C5_C5C5;
+/// The principals of the identity proof's two writers and its reader: both halves of each
+/// non-zero, so a field that arrives with only 32 of its 64 bits shows (C1).
+const PRINCIPAL_A: u64 = 0xA11C_E000_0000_0001;
+const PRINCIPAL_B: u64 = 0x0000_0002_B0B0_0002;
+const PRINCIPAL_READER: u64 = 0x5EAD_E500_0000_0003;
+/// The lengths of the three messages, each different.
+const FIRST_LEN: u64 = 6;
+const SECOND_LEN: u64 = 8;
+const THIRD_LEN: u64 = 7;
+
+/// The `u64` a script reported as two `report32` halves, low first, starting at `at`.
+fn reported_u64(reports: &[u64], at: usize) -> Option<u64> {
+    let low = *reports.get(at)?;
+    let high = *reports.get(at + 1)?;
+    Some((low & 0xFFFF_FFFF) | (high << 32))
+}
+
+/// Reports the identity fields of the `read_sizes` at `sizes`: four `report32` steps.
+fn report_identity(sizes: u64) -> [Step; 4] {
+    [
+        value_at("", sizes + read_sizes::SENDER_PROCESS_AT as u64, 0),
+        value_at("", sizes + read_sizes::SENDER_PROCESS_AT as u64 + 4, 0),
+        value_at("", sizes + read_sizes::SENDER_PRINCIPAL_AT as u64, 0),
+        value_at("", sizes + read_sizes::SENDER_PRINCIPAL_AT as u64 + 4, 0),
+    ]
+}
+
+/// Every message carries its writer's identity, stamped when it is written, and a read
+/// reports it through the caller's `read_sizes` as far as its `size` reaches (ADR-0005 B1,
+/// C1, C2). Writer A writes the first message on its end of a channel, then sends that end to
+/// writer B, which writes the second and third. The reader, told by B that it is done, reads
+/// them: first with a buffer too small, then each in turn, the last with the first version's
+/// 12-byte `read_sizes`. Each process acts for its own principal.
+fn writer_identity(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let script = proof_programs::script();
+    let (Some(mut a), Some(mut b), Some(mut reader)) = (
+        Image::acting_for(LIMITS, script, PRINCIPAL_A),
+        Image::acting_for(LIMITS, script, PRINCIPAL_B),
+        Image::acting_for(LIMITS, script, PRINCIPAL_READER),
+    ) else {
+        return false;
+    };
+    // X carries the messages, Y carries X's writing end from A to B, Z tells the reader.
+    let (Ok((x0, x1)), Ok((y0, y1)), Ok((z0, z1))) = (
+        ipc::create_channel(&a.process.account),
+        ipc::create_channel(&a.process.account),
+        ipc::create_channel(&b.process.account),
+    ) else {
+        return false;
+    };
+    let full = rights::CHANNEL;
+    let (Ok(ax), Ok(ay), Ok(by), Ok(bz), Ok(rx), Ok(rz)) = (
+        a.process.grant(Object::Channel(x0), full),
+        a.process.grant(Object::Channel(y0), full),
+        b.process.grant(Object::Channel(y1), full),
+        b.process.grant(Object::Channel(z0), full),
+        reader.process.grant(Object::Channel(x1), full),
+        reader.process.grant(Object::Channel(z1), full),
+    ) else {
+        return false;
+    };
+    // A's end of X goes in its list to send.
+    let moved = ax.to_le_bytes();
+    let (ax, ay, by, bz, rx, rz) = (
+        Imm(u64::from(ax)),
+        Imm(u64::from(ay)),
+        Imm(u64::from(by)),
+        Imm(u64::from(bz)),
+        Imm(u64::from(rx)),
+        Imm(u64::from(rz)),
+    );
+    let a_steps = alloc::vec![
+        write("", ax, MSG, FIRST_LEN, OK),
+        // The end the first message was written on goes to B.
+        step(
+            "",
+            sys::CHANNEL_WRITE,
+            &[ay, Imm(MSG), Imm(4), Imm(LIST), Imm(1)],
+            OK
+        ),
+    ];
+    let b_steps = alloc::vec![
+        wait("", by, signals::READABLE, DEADLINE_INFINITE, OK),
+        read_handles("", by, OK),
+        write("", Hd(RECV), MSG, SECOND_LEN, OK),
+        write("", Hd(RECV), MSG, THIRD_LEN, OK),
+        write("", bz, MSG, 4, OK),
+    ];
+    let read_into = |sizes: u64, room: u64, want: i64| {
+        step(
+            "",
+            sys::CHANNEL_READ,
+            &[rx, Imm(RBUF), Imm(room), Imm(0), Imm(0), Imm(sizes)],
+            want,
+        )
+    };
+    let mut reader_steps = alloc::vec![
+        wait("", rz, signals::READABLE, DEADLINE_INFINITE, OK),
+        read_into(IDENT_SMALL, 2, Error::BufferTooSmall.raw()),
+    ];
+    reader_steps.extend(report_identity(IDENT_SMALL));
+    reader_steps.push(read_into(IDENT_FIRST, 16, OK));
+    reader_steps.extend(report_identity(IDENT_FIRST));
+    reader_steps.push(read_into(IDENT_SECOND, 16, OK));
+    reader_steps.extend(report_identity(IDENT_SECOND));
+    reader_steps.push(read_into(IDENT_OLD, 16, OK));
+    reader_steps.push(value_at("", IDENT_OLD + read_sizes::BYTES_AT as u64, 0));
+    for past in [12, 16, 20, 24, 28] {
+        reader_steps.push(value_at("", IDENT_OLD + past, 0));
+    }
+    // Each structure starts filled with UNWRITTEN, then its `size`.
+    let unwritten = UNWRITTEN.to_le_bytes();
+    let filled: [u8; read_sizes::SIZE as usize] =
+        core::array::from_fn(|i| unwritten.get(i % 4).copied().unwrap_or(0));
+    let structure = |at: u64, size: u32| {
+        reader.write(at, &filled).is_some() && reader.write(at, &size.to_le_bytes()).is_some()
+    };
+    let structures = structure(IDENT_SMALL, read_sizes::SIZE)
+        && structure(IDENT_FIRST, read_sizes::SIZE)
+        && structure(IDENT_SECOND, read_sizes::SIZE)
+        && structure(IDENT_OLD, read_sizes::BASE_SIZE);
+    let ready = structures
+        && a.scratch().is_some()
+        && a.write(LIST, &moved).is_some()
+        && a.script(&a_steps).is_some()
+        && b.scratch().is_some()
+        && b.script(&b_steps).is_some()
+        && reader.scratch().is_some()
+        && reader.script(&reader_steps).is_some();
+    if !ready {
+        return false;
+    }
+    let (Some(a), Some(b), Some(reader)) = (a.finish(), b.finish(), reader.finish()) else {
+        return false;
+    };
+    let started = Process::start_thread(&reader, far, CODE, STACK + PAGE, SCRIPT).is_ok()
+        && Process::start_thread(&b, far, CODE, STACK + PAGE, SCRIPT).is_ok()
+        && Process::start_thread(&a, bsp, CODE, STACK + PAGE, SCRIPT).is_ok();
+    let ended = started
+        && await_end(&a, tsc_hz, 10)
+        && await_end(&b, tsc_hz, 10)
+        && await_end(&reader, tsc_hz, 10);
+    let all_ok = |p: &Process, steps: &[Step]| {
+        let reports = p.reports();
+        p.ending() == Some(Ending::Exited(0))
+            && reports.len()
+                == steps
+                    .iter()
+                    .filter(|s| !matches!(s.want, Want::Nothing))
+                    .count()
+            && steps
+                .iter()
+                .filter(|s| !matches!(s.want, Want::Nothing))
+                .zip(&reports)
+                .all(|(s, &got)| match s.want {
+                    Want::Status(w) => got == w as u64,
+                    _ => true,
+                })
+    };
+    let writers_ok = ended && all_ok(&a, &a_steps) && all_ok(&b, &b_steps);
+    let reports = reader.reports();
+    let identity_at = |at: usize| reported_u64(&reports, at).zip(reported_u64(&reports, at + 2));
+    let (a_is, b_is) = (Some((a.id(), PRINCIPAL_A)), Some((b.id(), PRINCIPAL_B)));
+    // Report positions: each status, then each `report32`, in script order.
+    let statuses_ok = all_ok(&reader, &reader_steps);
+    let too_small = identity_at(2);
+    let first_seen = identity_at(7);
+    let second_seen = identity_at(12);
+    let counted = reports.get(17).copied();
+    let untouched = reports
+        .get(18..23)
+        .is_some_and(|past| past.iter().all(|&w| w == u64::from(UNWRITTEN)));
+    let not_reader = [too_small, first_seen, second_seen].iter().all(|seen| {
+        seen.is_some_and(|(process, principal)| {
+            process != reader.id() && principal != PRINCIPAL_READER
+        })
+    });
+    let names_a = first_seen == a_is;
+    let names_b = second_seen == b_is;
+    let too_small_names_a = too_small == a_is;
+    let identity_right =
+        ended && writers_ok && statuses_ok && names_a && names_b && too_small_names_a && not_reader;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: a message's writer: the message written before its end moved to another process names its writer, process and principal: {names_a}; the one written after names the new writer: {names_b}; a read too small for it names the writer too: {too_small_names_a}; none names the reader: {not_reader}{}",
+        if identity_right { "" } else { ": ipc failed" }
+    );
+    if !identity_right {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: ipc: a message's writer: A is ({:#x}, {PRINCIPAL_A:#x}), B is ({:#x}, {PRINCIPAL_B:#x}); seen {too_small:x?}, {first_seen:x?}, {second_seen:x?}; ended {ended}, writers {writers_ok}, statuses {statuses_ok}",
+            a.id(),
+            b.id()
+        );
+    }
+    let old_right = ended && statuses_ok && counted == Some(THIRD_LEN) && untouched;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: a reader that gives read_sizes' first size, 12: its read -> {}, its counts -> {} bytes, and nothing written past them: {untouched}{}",
+        reports
+            .get(16)
+            .map_or("nothing", |&s| status_name(s as i64)),
+        counted.unwrap_or(0),
+        if old_right { "" } else { ": ipc failed" }
+    );
+    identity_right && old_right
+}
+
+/// Runs the proof of a message's writer (ADR-0005 B1, C1, C2), with a leak check of its own.
+/// Called from the boot flow with every scheduler running, after [`prove_objects`].
+pub(crate) fn prove_identity(
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    bsp: CpuIndex,
+    tsc_hz: u64,
+) -> bool {
+    let before = memory::stats();
+    let ok = writer_identity(com1, cpus, bsp, tsc_hz);
+    let same = || {
+        memory::stats().map(|(h, f)| (h.bytes_in_use, f))
+            == before.map(|(h, f)| (h.bytes_in_use, f))
+    };
+    ipc::reap_closed();
+    sched::yield_until(same, tsc_hz, 2);
+    let back = same();
+    let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: the identity proof's processes and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){}",
+        if back { "" } else { ": ipc failed" }
+    );
+    ok && back
+}
+
+// ------------------------------------------------------------------ process start
+
+/// The launch proof's creator's principal: both halves non-zero, so a child that took only part
+/// of it, or any other, shows (C1).
+const PRINCIPAL_CREATOR: u64 = 0xC4EA_7012_0000_0007;
+/// The arguments and environment every launched child gets.
+const LAUNCH_ARGS: [&[u8]; 2] = [b"origin", b"start record"];
+const LAUNCH_ENV: [&[u8]; 1] = [b"ROLE=child"];
+/// The start-record entries in the order the launch path writes them, with what each must be:
+/// role, object type and rights (C5, C6).
+const START_ENTRIES: [(u32, u32, u32); 4] = [
+    (
+        start::role::SELF_PROCESS,
+        ObjectType::Process as u32,
+        rights::PROCESS,
+    ),
+    (
+        start::role::SELF_THREAD,
+        ObjectType::Thread as u32,
+        rights::THREAD,
+    ),
+    (
+        start::role::BOOTSTRAP,
+        ObjectType::Channel as u32,
+        rights::CHANNEL,
+    ),
+    (
+        start::role::DIRECTORY,
+        ObjectType::Channel as u32,
+        rights::CHANNEL,
+    ),
+];
+
+/// The address of entry `i`'s handle in a start record at `record`.
+const fn entry_handle(record: u64, i: u64) -> u64 {
+    record + start::HEADER as u64 + i * start::ENTRY as u64 + start::ENTRY_HANDLE_AT as u64
+}
+
+/// What one launched child showed.
+struct Launch {
+    /// Its start record's address.
+    record: u64,
+    /// RDI held it, and the record it read in ring 3 is the one the launch wrote: its size,
+    /// version, entries (C5, C6), arguments and environment.
+    record_right: bool,
+    /// Its handles did what their rights allow.
+    handles_work: bool,
+    /// Its message on BOOTSTRAP named it and its creator's principal.
+    names_creator: bool,
+    /// Its write to its own record faulted at the record's address.
+    faulted_there: bool,
+    /// What the launch path took: placing the record, then granting, writing and starting.
+    micros: u64,
+}
+
+/// Launches one child from `creator` through the launch path, with a BOOTSTRAP end whose peer
+/// the creator holds and a DIRECTORY end, and checks what it saw and did. `None` if the
+/// launch itself could not run.
+fn launch_one(creator: &Process, cpu: CpuIndex, tsc_hz: u64) -> Option<Launch> {
+    let code = proof_programs::launched();
+    let code_pages = code.len().div_ceil(PAGE as usize).max(1) as u64;
+    let child = Process::child_of(creator, LIMITS, (CODE, CODE + code_pages * PAGE))?;
+    let mut image = Image::from_process(child, code)?;
+    let (Ok((boot_child, boot_creator)), Ok((dir_child, dir_other))) = (
+        ipc::create_channel(&creator.account),
+        ipc::create_channel(&creator.account),
+    ) else {
+        return None;
+    };
+    let held = creator
+        .grant(Object::Channel(boot_creator), rights::CHANNEL)
+        .ok()?;
+    let given = Given {
+        bootstrap: Some(boot_child),
+        directory: Some(dir_child),
+        args: &LAUNCH_ARGS,
+        env: &LAUNCH_ENV,
+    };
+    let placing = cpu::rdtsc();
+    let placed = launch::place(&mut image.process, &given).ok()?;
+    let placing = cpu::rdtsc().wrapping_sub(placing);
+    let record = placed.record;
+    let words = placed.size as u64 / 4;
+    // The child reports the RDI it started with and its whole record, word by word; uses each
+    // handle; then writes its record, which must fault.
+    let mut steps = alloc::vec![value_at("", ENTRY_RDI, 0), value_at("", ENTRY_RDI + 4, 0),];
+    for w in 0..words {
+        steps.push(value_at("", record + 4 * w, 0));
+    }
+    steps.extend([
+        write("", Hd(entry_handle(record, 2)), MSG, 4, OK),
+        dup("", Hd(entry_handle(record, 0)), rights::WAIT, 0, OK),
+        wait(
+            "",
+            Hd(entry_handle(record, 1)),
+            signals::TERMINATED,
+            0,
+            Error::TimedOut.raw(),
+        ),
+        wait("", Hd(entry_handle(record, 3)), signals::WRITABLE, 0, OK),
+        copy32(DATA, record),
+    ]);
+    if image.scratch().is_none() || image.script(&steps).is_none() {
+        return None;
+    }
+    let starting = cpu::rdtsc();
+    let launched = launch::start(image.process, placed, given, cpu, CODE, STACK + PAGE).ok()?;
+    let starting = cpu::rdtsc().wrapping_sub(starting);
+    let micros = placing.saturating_add(starting) / (tsc_hz / 1_000_000).max(1);
+    let ended = await_end(&launched.process, tsc_hz, 10);
+    drop(dir_other);
+    let reports = launched.process.reports();
+    // RDI, then the record as the child read it.
+    let rdi = reported_u64(&reports, 0);
+    let mut bytes = Vec::new();
+    for word in reports.get(2..2 + words as usize).unwrap_or(&[]) {
+        bytes.extend_from_slice(&(*word as u32).to_le_bytes());
+    }
+    let decoded = start::decode(&bytes).ok();
+    let record_right = rdi == Some(record)
+        && bytes.len() == launched.size
+        && decoded.is_some_and(|r| {
+            let entries: Vec<start::Entry> = r.entries().collect();
+            r.abi == origin_abi::ABI_VERSION
+                && r.abi_min_minor == origin_abi::ABI_VERSION.1
+                && entries.len() == START_ENTRIES.len()
+                && entries
+                    .iter()
+                    .zip(START_ENTRIES)
+                    .all(|(e, (role, ty, rights))| {
+                        e.role == role && e.object_type == ty && e.rights == rights && e.handle != 0
+                    })
+                && r.args.iter().eq(LAUNCH_ARGS)
+                && r.env.iter().eq(LAUNCH_ENV)
+        });
+    let statuses = reports.get(2 + words as usize..).unwrap_or(&[]);
+    let handles_work = statuses
+        == [
+            OK as u64,
+            OK as u64,
+            Error::TimedOut.raw() as u64,
+            OK as u64,
+        ];
+    let names_creator = match ipc::channel_read(&creator.handles, held, Need::NOTHING, 64, 0) {
+        Ok(ipc::Read::Message { sender, .. }) => {
+            sender.process == launched.process.id() && sender.principal == PRINCIPAL_CREATOR
+        }
+        _ => false,
+    };
+    let faulted_there = ended
+        && matches!(
+            launched.process.ending(),
+            Some(Ending::Faulted { vector: 14, address, .. }) if address == record
+        );
+    Some(Launch {
+        record,
+        record_right,
+        handles_work,
+        names_creator,
+        faulted_there,
+        micros,
+    })
+}
+
+/// A launch whose start record would pass 64 KiB is refused before anything is mapped, and a
+/// launch that fails after its child holds something gives it all back: here, a child whose
+/// table holds one handle, so the second start handle is refused. Each passes the BOOTSTRAP
+/// end of a channel whose other end the creator holds, which must close.
+fn refused_launches(creator: &Process) -> (bool, bool) {
+    let code = proof_programs::launched();
+    let code_pages = code.len().div_ceil(PAGE as usize).max(1) as u64;
+    let origin = (CODE, CODE + code_pages * PAGE);
+    let attempt = |limits: Limits, args: &[&[u8]]| -> Option<(Result<(), Error>, bool)> {
+        let child = Process::child_of(creator, limits, origin)?;
+        let mut image = Image::from_process(child, code)?;
+        let (child_end, creator_end) = ipc::create_channel(&creator.account).ok()?;
+        let held = creator
+            .grant(Object::Channel(creator_end), rights::CHANNEL)
+            .ok()?;
+        let given = Given {
+            bootstrap: Some(child_end),
+            directory: None,
+            args,
+            env: &[],
+        };
+        let outcome = match launch::place(&mut image.process, &given) {
+            // Refused before the child held anything: what it was to be given goes back now.
+            Err(e) => {
+                drop(given);
+                Err(e)
+            }
+            Ok(placed) => launch::start(
+                image.process,
+                placed,
+                given,
+                CpuIndex::BOOT,
+                CODE,
+                STACK + PAGE,
+            )
+            .map(|_| ()),
+        };
+        // The end the child would have had is closed either way.
+        let closed = ipc::wait_one(
+            &creator.handles,
+            &creator.waiting,
+            held,
+            Need::NOTHING,
+            signals::PEER_CLOSED,
+            0,
+        )
+        .is_ok_and(|w| w.status.is_ok());
+        let _ = ipc::handle_close(&creator.handles, held, Need::NOTHING);
+        Some((outcome, closed))
+    };
+    let large = alloc::vec![7u8; start::MAX_SIZE];
+    let too_large = attempt(LIMITS, &[&large])
+        .is_some_and(|(outcome, closed)| outcome == Err(Error::Limit) && closed);
+    let one_handle = Limits {
+        handles: 1,
+        ..LIMITS
+    };
+    let gave_back = attempt(one_handle, &[])
+        .is_some_and(|(outcome, closed)| outcome == Err(Error::Limit) && closed);
+    (too_large, gave_back)
+}
+
+/// The process start proof (ADR-0005 P6, C1, C4–C6): two children launched from one creator
+/// through the launch path, and two launches that must be refused, with a leak check of its
+/// own. Called from the boot flow with every scheduler running, after [`prove_identity`].
+pub(crate) fn prove_launch(
+    com1: &mut Console,
+    cpus: &[CpuIndex],
+    bsp: CpuIndex,
+    tsc_hz: u64,
+) -> bool {
+    let before = memory::stats();
+    let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
+    let ok = {
+        let Some(creator) = Process::new(LIMITS, (CODE, CODE + PAGE), PRINCIPAL_CREATOR) else {
+            return false;
+        };
+        let first = launch_one(&creator, far, tsc_hz);
+        let second = launch_one(&creator, bsp, tsc_hz);
+        let (too_large, gave_back) = refused_launches(&creator);
+        let each = |check: fn(&Launch) -> bool| {
+            first.as_ref().is_some_and(check) && second.as_ref().is_some_and(check)
+        };
+        let record_right = each(|l| l.record_right);
+        let handles_work = each(|l| l.handles_work);
+        let names_creator = each(|l| l.names_creator);
+        let faulted_there = each(|l| l.faulted_there);
+        let apart = match (&first, &second) {
+            (Some(a), Some(b)) => a.record != b.record,
+            _ => false,
+        };
+        let launched_right = record_right && handles_work && names_creator && faulted_there;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: start: two children launched from their creator found their start records in RDI, read-only at random addresses: each record, read back in ring 3, has its size, version, 4 entries with C6's rights, 2 arguments and 1 environment string: {record_right}; each start handle works: {handles_work}; each child's message names it and its creator's principal: {names_creator}; writing its record faulted there: {faulted_there}{}",
+            if launched_right { "" } else { ": start failed" }
+        );
+        let refused_right = apart && too_large && gave_back;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: start: the two records are at different addresses: {apart}; a record over 64 KiB is refused: {too_large}; a launch refused after its child held a handle gives everything back: {gave_back}{}",
+            if refused_right { "" } else { ": start failed" }
+        );
+        let took = |launch: &Option<Launch>| launch.as_ref().map_or(0, |l| l.micros);
+        let _ = writeln!(
+            com1,
+            "origin-kernel: start: the launch path took {} us and {} us (placing the record, then granting, writing and starting)",
+            took(&first),
+            took(&second)
+        );
+        launched_right && refused_right
+    };
+    let same = || {
+        memory::stats().map(|(h, f)| (h.bytes_in_use, f))
+            == before.map(|(h, f)| (h.bytes_in_use, f))
+    };
+    ipc::reap_closed();
+    sched::yield_until(same, tsc_hz, 2);
+    let back = same();
+    let (heap_now, frames_now) = memory::stats().map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    let (heap_before, frames_before) = before.map_or((0, 0), |(h, f)| (h.bytes_in_use, f));
+    let _ = writeln!(
+        com1,
+        "origin-kernel: start: every launched process and all they held are gone: heap {heap_now} bytes (was {heap_before}), {frames_now} free frames (was {frames_before}){}",
+        if back { "" } else { ": start failed" }
+    );
+    ok && back
+}
+
 /// Runs every proof and checks nothing leaked. Called from the boot flow with every
 /// scheduler running.
 pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> bool {
@@ -1531,5 +2628,18 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
             ": ipc failed"
         }
     );
-    ok && back && unready == 0
+    // Every call above returned a status its definition declares: a bug here is invisible from
+    // ring 3, where a fallback status stands in for it.
+    let (undeclared, first) = syscall::undeclared_statuses();
+    let declared = undeclared == 0;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: a status its call does not declare reached the system-call boundary {undeclared} times{}{}",
+        match first {
+            Some((call, status)) => alloc::format!(" (the first: {} from {call})", status.name()),
+            None => alloc::string::String::new(),
+        },
+        if declared { "" } else { ": ipc failed" }
+    );
+    ok && back && unready == 0 && declared
 }

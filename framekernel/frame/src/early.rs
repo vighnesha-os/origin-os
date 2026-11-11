@@ -278,6 +278,7 @@ impl Early {
         // kernel can map too.
         let Some(table_frames) = layout::table_frames(regions, regions.len() as u64, kernel_span)
             .and_then(|needed| needed.checked_add(TABLE_POOL_RESERVE))
+            .and_then(|needed| needed.checked_add(layout::KERNEL_HALF_SLOTS))
             .map(|frames| frames.max(TABLE_POOL_MIN_FRAMES))
         else {
             let _ = writeln!(
@@ -370,7 +371,14 @@ impl Early {
             kernel_physical_base: info.kernel_base,
             stack_guard: info.stack_base.wrapping_sub(PAGE),
         };
-        match layout::build(&mut tables, &at, self.data.regions, self.data.segments) {
+        let built = layout::build(&mut tables, &at, self.data.regions, self.data.segments)
+            // ADR-0004 H2: every slot of the kernel half gets its table now, while nothing can
+            // have copied the half yet. The pool was sized for this (`init_memory`).
+            .and_then(|(mut space, stats)| {
+                space.reserve_upper_half(&mut tables)?;
+                Ok((space, stats))
+            });
+        match built {
             Ok((space, stats)) => Some(KernelTables {
                 space,
                 tables,

@@ -8,6 +8,8 @@ use crate::wire::{HandleInfo, Reason, check_message};
 const KERNEL: &str = include_str!("../../../../sdk/interfaces/origin.kernel.oidl");
 const ECHO: &str = include_str!("../../tests/fixtures/echo.oidl");
 const CALLS: &str = include_str!("../../tests/fixtures/calls.oidl");
+/// The real versions file, which the kernel's definition names its version from (§9).
+const VERSIONS: &str = include_str!("../../../../origin-version.toml");
 
 fn compilation() -> Compilation {
     let inputs = [("k", KERNEL), ("e", ECHO), ("c", CALLS)]
@@ -17,7 +19,7 @@ fn compilation() -> Compilation {
             text: text.as_bytes().to_vec(),
         })
         .collect::<Vec<_>>();
-    compile(&inputs, Some("[compatibility]\nuser-abi = \"0.1\"\n")).expect("valid")
+    compile(&inputs, Some(VERSIONS)).expect("valid")
 }
 
 fn method<'c>(comp: &'c Compilation, name: &str) -> &'c Method {
@@ -221,7 +223,7 @@ fn the_corpus_is_bounded_on_a_huge_message() {
             text: definition.as_bytes().to_vec(),
         },
     ];
-    let comp = compile(&inputs, Some("[compatibility]\nuser-abi = \"0.1\"\n")).expect("valid");
+    let comp = compile(&inputs, Some(VERSIONS)).expect("valid");
     let library = comp
         .libraries
         .iter()

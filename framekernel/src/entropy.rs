@@ -46,6 +46,35 @@ pub fn fill<S: Source + ?Sized>(source: &mut S, retries: u32, out: &mut [u8]) ->
     true
 }
 
+/// 64 bits of this processor's hardware entropy: RDSEED, else RDRAND, each attempt with
+/// [`draw`]'s bounded retries. `None` when the processor gives none, which a caller must treat
+/// as "no entropy", never as a value: it stops rather than use something predictable. For an
+/// identifier an off-path sender must not guess (a DHCP transaction ID, a TFTP port) and for
+/// where a process's start record goes (ADR-0005 C4).
+#[cfg(target_os = "none")]
+pub(crate) fn hardware_u64() -> Option<u64> {
+    use crate::features::Features;
+
+    struct Hardware(Features);
+    impl Source for Hardware {
+        fn try_next(&mut self) -> Option<u64> {
+            if self.0.rdseed
+                && let Some(v) = crate::cpu::rdseed()
+            {
+                return Some(v);
+            }
+            if self.0.rdrand {
+                crate::cpu::rdrand()
+            } else {
+                None
+            }
+        }
+    }
+
+    let features = Features::decode(&crate::cpu::gather_cpuid());
+    draw(&mut Hardware(features), RDRAND_RETRIES)
+}
+
 #[cfg(test)]
 mod tests {
     extern crate alloc;

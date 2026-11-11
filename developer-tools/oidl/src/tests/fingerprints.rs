@@ -171,6 +171,56 @@ fn a_later_field_of_a_sized_struct_leaves_earlier_minors_alone() {
     assert_ne!(base[2], added[2]);
 }
 
+/// A library whose method takes and returns its sized struct `t`.
+fn sized_comp_used(fields: &str) -> crate::model::Compilation {
+    let text = format!(
+        "/// lib\nlibrary test.sized;\ntransport syscall;\nversion 1.3;\n/// s\nenum status: i64 {{ ok = 0; invalid_args = -1; fault = -6; }}\n/// t\nsized struct t {{ {fields} }}\n/// i\ninterface i {{\n/// m\nmethod m = 1 (p: t) -> (r: t) errors(invalid_args, fault) requires none;\n}}\n"
+    );
+    compile(
+        &[Input {
+            file: "c".to_string(),
+            text: text.into_bytes(),
+        }],
+        None,
+    )
+    .expect("valid")
+}
+
+#[test]
+fn a_later_field_of_a_sized_struct_a_method_uses_leaves_earlier_minors_alone() {
+    // The method names the struct, and that reference must not carry a size from a later
+    // minor: growing a sized struct is an addition (§9), which changes no earlier minor (§13).
+    let print = |fields: &str| {
+        let comp = sized_comp_used(fields);
+        fingerprints(&comp.libraries[0])
+            .into_iter()
+            .map(|p| p.stable)
+            .collect::<Vec<_>>()
+    };
+    let base = print("a: u16;");
+    let added = print("a: u16; @since(1.2) b: u64;");
+    assert_eq!(base[..2], added[..2], "minors 0 and 1 are unchanged");
+    assert_ne!(base[2], added[2], "minor 2 has the new field");
+    assert_ne!(base[3], added[3]);
+    // Each minor names the struct with its size at that minor.
+    let comp = sized_comp_used("a: u16; @since(1.2) b: u64;");
+    let library = &comp.libraries[0];
+    let t = library.structs.iter().find(|s| s.name == "t").expect("t");
+    for minor in 0..=3 {
+        let text = fingerprint::describe(library, minor, false);
+        let named = format!("struct(t,{})", t.size_at(minor));
+        assert!(
+            text.contains(&format!(" in p {named} ")),
+            "minor {minor}: {text}"
+        );
+        assert!(
+            text.contains(&format!(" out r {named} ")),
+            "minor {minor}: {text}"
+        );
+    }
+    assert_ne!(t.size_at(1), t.size_at(2), "the struct did grow");
+}
+
 #[test]
 fn a_used_librarys_layout_is_part_of_this_librarys_fingerprint() {
     let build = |fields: &str, member_line: &str| {

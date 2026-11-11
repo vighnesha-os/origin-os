@@ -175,10 +175,21 @@ pub fn zero_fill(out: &mut [u8], at: usize, len: usize) -> Result<(), WireError>
 /// never reads user memory, so the kernel calls this after its copy.
 pub fn check_string(bytes: &[u8]) -> Result<&str, WireError> {
     let text = core::str::from_utf8(bytes).map_err(|_| WireError::Utf8)?;
-    if bytes.contains(&0) {
+    if has_nul(bytes) {
         return Err(WireError::Nul);
     }
     Ok(text)
+}
+
+/// Whether `bytes` holds a `NUL`. A loop because `contains` would call `core::slice::memchr`,
+/// which is outside what the kernel's no-panic object check allows (ONBF §12).
+fn has_nul(bytes: &[u8]) -> bool {
+    for byte in bytes {
+        if *byte == 0 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Reads and validates the `T` at `at`.
@@ -190,6 +201,53 @@ pub fn field<T: Fixed>(bytes: &[u8], at: usize, minor: u16) -> Result<T, WireErr
 pub fn put_field<T: Fixed>(out: &mut [u8], at: usize, value: T) -> Result<(), WireError> {
     let end = at.checked_add(T::SIZE).ok_or(WireError::Size)?;
     value.write(out.get_mut(at..end).ok_or(WireError::Size)?)
+}
+
+/// Encodes `items` one after another at the start of `out`, each field by field: how a
+/// system-call vector of structs crosses (§10). Returns the bytes written; `Count` if they do
+/// not fit.
+pub fn encode_elements<'o, T: Fixed>(
+    items: &[T],
+    out: &'o mut [u8],
+) -> Result<&'o [u8], WireError> {
+    let len = items.len().checked_mul(T::SIZE).ok_or(WireError::Count)?;
+    let filled = out.get_mut(..len).ok_or(WireError::Count)?;
+    for (index, item) in items.iter().enumerate() {
+        put_field(filled, index.saturating_mul(T::SIZE), *item)?;
+    }
+    Ok(filled)
+}
+
+/// The start of `raw` that holds `capacity` whole elements, or as many as fit: the buffer a
+/// system-call result of structs is written into (§10).
+pub fn element_room<T: Fixed>(raw: &mut [u8], capacity: usize) -> &mut [u8] {
+    let whole = raw
+        .len()
+        .checked_div(T::SIZE)
+        .unwrap_or(0)
+        .min(capacity)
+        .saturating_mul(T::SIZE);
+    let (room, _) = raw.split_at_mut_checked(whole).unwrap_or_default();
+    room
+}
+
+/// Decodes the first `count` elements of `raw` into `out`, each checked at `minor` (§10).
+/// `Count` if `out` or `raw` holds fewer.
+pub fn decode_elements<T: Fixed>(
+    raw: &[u8],
+    out: &mut [T],
+    count: usize,
+    minor: u16,
+) -> Result<(), WireError> {
+    let len = count.checked_mul(T::SIZE).ok_or(WireError::Count)?;
+    if len > raw.len() {
+        return Err(WireError::Count);
+    }
+    let slots = out.get_mut(..count).ok_or(WireError::Count)?;
+    for (index, slot) in slots.iter_mut().enumerate() {
+        *slot = field::<T>(raw, index.saturating_mul(T::SIZE), minor)?;
+    }
+    Ok(())
 }
 
 macro_rules! fixed_int {
@@ -543,7 +601,7 @@ impl<'a> Reader<'a> {
         let len = usize::try_from(count).map_err(|_| WireError::Count)?;
         let bytes = slice_at(self.body, self.at, len)?;
         let text = core::str::from_utf8(bytes).map_err(|_| WireError::Utf8)?;
-        if bytes.contains(&0) {
+        if has_nul(bytes) {
             return Err(WireError::Nul);
         }
         self.skip(len)?;
@@ -626,7 +684,7 @@ impl<'a> Writer<'a> {
     /// Writes the next string, refusing a NUL (§3).
     pub fn string(&mut self, text: &str) -> Result<(), WireError> {
         let bytes = text.as_bytes();
-        if bytes.contains(&0) {
+        if has_nul(bytes) {
             return Err(WireError::Nul);
         }
         let end = self.at.checked_add(bytes.len()).ok_or(WireError::Size)?;

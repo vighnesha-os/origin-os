@@ -15,6 +15,11 @@ use origin_paging::PAGE;
 pub const DATA: u64 = 0x50_0000;
 /// The stack of a proof process's thread 0: one page, with no neighbour mapped below it.
 pub const STACK: u64 = 0x60_0000;
+/// Where a scripted process's script is (read-only to it).
+pub const SCRIPT: u64 = 0x54_0000;
+/// Where a launched program keeps the RDI its first thread started with: its start record's
+/// address (ADR-0005 P6).
+pub const ENTRY_RDI: u64 = DATA + 0x600;
 
 global_asm!(
     r#"
@@ -26,6 +31,13 @@ global_asm!(
     // After a real call its status is reported, in order.
     .globl ipc_script_start
     .globl ipc_script_end
+    .globl ipc_launched_start
+
+    // A launched process starts here: RDI holds its start record's address (ADR-0005 P6). It
+    // keeps that at ENTRY_RDI and runs the script at SCRIPT, falling into the interpreter.
+ipc_launched_start:
+    mov qword ptr [{ENTRY_RDI}], rdi
+    mov edi, {SCRIPT}
 ipc_script_start:
     mov rbx, rdi
 .Lscript_next:
@@ -404,6 +416,8 @@ ipc_step_end:
     .popsection
 "#,
     DATA = const DATA,
+    ENTRY_RDI = const ENTRY_RDI,
+    SCRIPT = const SCRIPT,
     DEBUG_REPORT = const sys::DEBUG_REPORT,
     THREAD_EXIT = const sys::THREAD_EXIT,
     DEBUG_WRITE = const sys::DEBUG_WRITE,
@@ -420,6 +434,7 @@ ipc_step_end:
 // SAFETY: these symbols are defined by the `global_asm!` above, in the kernel's read-only
 // image; only their addresses are used.
 unsafe extern "C" {
+    static ipc_launched_start: u8;
     static ipc_script_start: u8;
     static ipc_script_end: u8;
     static ipc_ping_start: u8;
@@ -450,6 +465,12 @@ fn between(start: *const u8, end: *const u8) -> &'static [u8] {
 /// The script interpreter: RDI names a table of calls, each reported in order.
 pub fn script() -> &'static [u8] {
     between(&raw const ipc_script_start, &raw const ipc_script_end)
+}
+
+/// A launched program: keeps the start record's address it finds in RDI at [`ENTRY_RDI`], then
+/// interprets the script at [`SCRIPT`].
+pub fn launched() -> &'static [u8] {
+    between(&raw const ipc_launched_start, &raw const ipc_script_end)
 }
 
 /// Writes each round number on a channel, then reads and checks the reply.

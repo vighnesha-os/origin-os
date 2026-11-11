@@ -16,7 +16,6 @@
 //! reschedule IPI goes to the APIC ID recorded for the target's index.
 #![forbid(unsafe_code)]
 
-use alloc::sync::Arc;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -25,10 +24,12 @@ use crate::runqueue::{QueueError, RunQueue, per_mille, share_near_weight};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, MAX_CPUS, rdtsc};
-use crate::process::Process;
+use crate::process::UserContext;
 use crate::timer::{self, X2Apic};
+use origin_frame::objref::ObjectRef;
 use origin_frame::stack::{FpuArea, GuardedStack, ThreadStart};
 use origin_frame::sync::SpinLock;
+use origin_frame::trap::Switch;
 
 /// Each kernel thread's stack.
 const THREAD_STACK: usize = 16 * 1024;
@@ -48,8 +49,8 @@ use crate::cpu::without_interrupts;
 
 /// The timer interrupted the context whose frame is at `interrupted`; returns the frame to
 /// resume. Processors without an active queue keep running what they were running.
-pub(crate) fn on_tick(interrupted: u64) -> u64 {
-    with_queue(interrupted, |q| Some(q.tick(interrupted)))
+pub(crate) fn on_tick(interrupted: u64, switch: &Switch) -> u64 {
+    with_queue(interrupted, switch, |q| Some(q.tick(interrupted)))
 }
 
 /// Makes sure CPU `cpu`'s boot/idle context (slot 0) has an FPU area, so the first switch
@@ -85,7 +86,7 @@ fn switch_fpu(id: usize, old: usize, new: usize) {
 /// an interrupt from user mode always lands on the running thread's own stack (the boot or
 /// idle flow, with no stack of its own, never runs in user mode), and the page tables are its
 /// process's (the kernel's for a kernel thread).
-fn follow_thread(id: usize, slot: usize) {
+fn follow_thread(id: usize, slot: usize, switch: &Switch) {
     let Some(threads) = THREADS.get(id) else {
         return;
     };
@@ -102,9 +103,9 @@ fn follow_thread(id: usize, slot: usize) {
         // any more, and an exited thread's stack can be freed.
         None => cpu::clear_kernel_stack(),
     }
-    match t.process.get(slot).and_then(Option::as_ref) {
-        Some(process) => process.space().activate(),
-        None => crate::vm::activate_kernel_space(),
+    match t.user.get(slot).and_then(Option::as_ref) {
+        Some(user) => user.space.activate(switch),
+        None => crate::vm::activate_kernel_space(switch),
     }
 }
 
@@ -112,11 +113,12 @@ fn follow_thread(id: usize, slot: usize) {
 static FIRST_GUARD: AtomicU64 = AtomicU64::new(0);
 
 /// A thread that has exited, awaiting [`reap`]: its stack, FPU area and, for a user
-/// thread, the reference that keeps its process alive until this processor has left it.
+/// thread, the references that keep its process and address space until this processor has left
+/// them.
 struct Zombie {
     stack: GuardedStack,
     fpu: Option<FpuArea>,
-    process: Option<Arc<Process>>,
+    user: Option<ObjectRef<UserContext>>,
 }
 
 /// Per CPU: each slot's stack, and the stacks of threads that exited and await
@@ -127,8 +129,8 @@ struct Threads {
     zombies: [Option<Zombie>; crate::runqueue::CAPACITY],
     /// Each slot's FPU/SIMD save area; slot 0 is the boot or idle context.
     fpu: [Option<FpuArea>; crate::runqueue::CAPACITY],
-    /// The process each slot's thread belongs to (`None`: a kernel thread).
-    process: [Option<Arc<Process>>; crate::runqueue::CAPACITY],
+    /// What each slot's thread runs in (`None`: a kernel thread).
+    user: [Option<ObjectRef<UserContext>>; crate::runqueue::CAPACITY],
 }
 
 static THREADS: [SpinLock<Threads>; MAX_CPUS] = [const {
@@ -136,7 +138,7 @@ static THREADS: [SpinLock<Threads>; MAX_CPUS] = [const {
         stacks: [const { None }; crate::runqueue::CAPACITY],
         zombies: [const { None }; crate::runqueue::CAPACITY],
         fpu: [const { None }; crate::runqueue::CAPACITY],
-        process: [const { None }; crate::runqueue::CAPACITY],
+        user: [const { None }; crate::runqueue::CAPACITY],
     })
 }; MAX_CPUS];
 
@@ -169,28 +171,32 @@ pub(crate) fn reap() -> usize {
     let mut freed = 0;
     loop {
         let next = without_interrupts(|| threads.lock().zombies.iter_mut().find_map(Option::take));
-        let Some(Zombie {
-            stack,
-            fpu,
-            process,
-        }) = next
-        else {
+        let Some(Zombie { stack, fpu, user }) = next else {
             return freed;
         };
         if let Some(z) = ZOMBIES.get(this_cpu()) {
             z.fetch_sub(1, Ordering::AcqRel);
         }
         drop(fpu);
-        // Possibly the process's last reference, which frees its address space: this
-        // processor left it when the thread exited, and no processor still runs in it.
-        drop(process);
         drop(stack);
+        if let Some(user) = user {
+            let process = user.process.clone();
+            // Possibly the last reference to the address space, which frees it: this processor
+            // left it when the thread exited, and no processor still runs in it.
+            drop(user);
+            // After the memory, so that whoever sees `TERMINATED` knows it has gone (P11).
+            process.thread_reaped();
+        }
         freed += 1;
     }
 }
 
 /// The running thread's queue request, made with interrupts disabled (the gate cleared IF).
-fn with_queue(interrupted: u64, f: impl FnOnce(&mut RunQueue) -> Option<u64>) -> u64 {
+fn with_queue(
+    interrupted: u64,
+    switch: &Switch,
+    f: impl FnOnce(&mut RunQueue) -> Option<u64>,
+) -> u64 {
     let id = this_cpu();
     match (ACTIVE.get(id), QUEUES.get(id)) {
         (Some(active), Some(queue)) if active.load(Ordering::Acquire) => {
@@ -201,7 +207,7 @@ fn with_queue(interrupted: u64, f: impl FnOnce(&mut RunQueue) -> Option<u64>) ->
             if new != old {
                 switch_fpu(id, old, new);
             }
-            follow_thread(id, new);
+            follow_thread(id, new, switch);
             next
         }
         _ => interrupted,
@@ -209,20 +215,20 @@ fn with_queue(interrupted: u64, f: impl FnOnce(&mut RunQueue) -> Option<u64>) ->
 }
 
 /// `YIELD_VECTOR`: the running context gives up the processor.
-pub(crate) fn on_yield(interrupted: u64) -> u64 {
-    with_queue(interrupted, |q| Some(q.yield_now(interrupted)))
+pub(crate) fn on_yield(interrupted: u64, switch: &Switch) -> u64 {
+    with_queue(interrupted, switch, |q| Some(q.yield_now(interrupted)))
 }
 
 /// `SLEEP_VECTOR`: the running thread sleeps for `ticks` timer ticks.
-pub(crate) fn on_sleep(interrupted: u64, ticks: u64) -> u64 {
-    with_queue(interrupted, |q| q.sleep(interrupted, ticks).ok())
+pub(crate) fn on_sleep(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
+    with_queue(interrupted, switch, |q| q.sleep(interrupted, ticks).ok())
 }
 
 /// `BLOCK_VECTOR`: the running thread blocks until [`wake`] (or goes on, if a wake-up is
 /// already pending).
 /// RDI holds the most ticks to wait (0: no limit).
-pub(crate) fn on_block(interrupted: u64, ticks: u64) -> u64 {
-    with_queue(interrupted, |q| {
+pub(crate) fn on_block(interrupted: u64, ticks: u64, switch: &Switch) -> u64 {
+    with_queue(interrupted, switch, |q| {
         q.block_for(interrupted, (ticks != 0).then_some(ticks)).ok()
     })
 }
@@ -231,8 +237,10 @@ pub(crate) fn on_block(interrupted: u64, ticks: u64) -> u64 {
 /// processor made a thread here ready). The interrupted context is charged nothing: this
 /// switches only if a thread that was woken should run now
 /// ([`RunQueue::preempt_for_wake`]), and otherwise resumes what the interrupt interrupted.
-pub(crate) fn on_reschedule(interrupted: u64) -> u64 {
-    with_queue(interrupted, |q| Some(q.preempt_for_wake(interrupted)))
+pub(crate) fn on_reschedule(interrupted: u64, switch: &Switch) -> u64 {
+    with_queue(interrupted, switch, |q| {
+        Some(q.preempt_for_wake(interrupted))
+    })
 }
 
 /// A kernel thread: its processor (CPU index), run-queue slot, and the slot's generation,
@@ -298,31 +306,27 @@ pub(crate) fn wake(thread: ThreadRef) -> bool {
 
 /// `EXIT_VECTOR`: the running thread ends. Its stack becomes a zombie, freed later by
 /// [`reap`] on this processor.
-pub(crate) fn on_exit(interrupted: u64) -> u64 {
+pub(crate) fn on_exit(interrupted: u64, switch: &Switch) -> u64 {
     let id = this_cpu();
-    with_queue(interrupted, |q| {
+    with_queue(interrupted, switch, |q| {
         let slot = q.current();
         let next = q.exit(interrupted).ok()?;
         if let Some(threads) = THREADS.get(id) {
             let mut t = threads.lock();
             let stack = t.stacks.get_mut(slot).and_then(Option::take);
             let fpu = t.fpu.get_mut(slot).and_then(Option::take);
-            let process = t.process.get_mut(slot).and_then(Option::take);
+            let user = t.user.get_mut(slot).and_then(Option::take);
             match (t.zombies.iter_mut().find(|z| z.is_none()), stack) {
                 (Some(free), Some(stack)) => {
-                    *free = Some(Zombie {
-                        stack,
-                        fpu,
-                        process,
-                    });
+                    *free = Some(Zombie { stack, fpu, user });
                     if let Some(z) = ZOMBIES.get(id) {
                         z.fetch_add(1, Ordering::AcqRel);
                     }
                 }
-                // No record of it can be kept. The process reference is leaked deliberately:
-                // this processor is still in the process's address space, and dropping the
-                // last reference here would free the tables it is running on.
-                _ => core::mem::forget(process),
+                // No record of it can be kept. Its references are leaked deliberately: this
+                // processor is still in the process's address space, and dropping the last
+                // reference here would free the tables it is running on.
+                _ => core::mem::forget(user),
             }
         }
         Some(next)
@@ -344,13 +348,13 @@ pub(crate) fn exit() -> ! {
     cpu::thread_exit()
 }
 
-/// The process of the running thread, or `None` for a kernel thread.
-pub(crate) fn current_process() -> Option<Arc<Process>> {
+/// What the running thread runs in, or `None` for a kernel thread.
+pub(crate) fn current_user() -> Option<ObjectRef<UserContext>> {
     let id = this_cpu();
     let (queue, threads) = (QUEUES.get(id)?, THREADS.get(id)?);
     without_interrupts(|| {
         let slot = queue.lock().current();
-        threads.lock().process.get(slot).cloned().flatten()
+        threads.lock().user.get(slot).cloned().flatten()
     })
 }
 
@@ -381,12 +385,12 @@ pub(crate) fn spawn(
     )
 }
 
-/// Creates a user thread of `process` on processor `cpu`: it enters ring 3 at `rip` with the
+/// Creates a user thread in `user` on processor `cpu`: it enters ring 3 at `rip` with the
 /// stack pointer `rsp` and `rdi` in RDI, every other register zero, the first time it is
 /// scheduled (there is no kernel half to the thread until it enters the kernel).
 pub(crate) fn spawn_user(
     cpu: CpuIndex,
-    process: Arc<Process>,
+    user: ObjectRef<UserContext>,
     rip: u64,
     rsp: u64,
     rdi: u64,
@@ -395,7 +399,7 @@ pub(crate) fn spawn_user(
         cpu,
         ThreadStart::User { rip, rsp, rdi },
         crate::runqueue::DEFAULT_WEIGHT,
-        Some(process),
+        Some(user),
     )
 }
 
@@ -414,9 +418,9 @@ fn spawn_with(
     cpu: CpuIndex,
     start: ThreadStart,
     weight: u32,
-    process: Option<Arc<Process>>,
+    user: Option<ObjectRef<UserContext>>,
 ) -> Result<usize, QueueError> {
-    spawn_with_fpu(cpu, start, weight, process, FpuArea::new)
+    spawn_with_fpu(cpu, start, weight, user, FpuArea::new)
 }
 
 /// [`spawn_with`], with `fpu_area` the source of the thread's FPU area (the boot proof gives
@@ -426,7 +430,7 @@ fn spawn_with_fpu(
     cpu: CpuIndex,
     start: ThreadStart,
     weight: u32,
-    process: Option<Arc<Process>>,
+    user: Option<ObjectRef<UserContext>>,
     fpu_area: impl FnOnce() -> Option<FpuArea>,
 ) -> Result<usize, QueueError> {
     let queue = QUEUES.get(cpu.get()).ok_or(QueueError::Full)?;
@@ -455,8 +459,8 @@ fn spawn_with_fpu(
             if let Some(f) = t.fpu.get_mut(slot) {
                 *f = Some(fpu_area);
             }
-            if let Some(p) = t.process.get_mut(slot) {
-                *p = process;
+            if let Some(u) = t.user.get_mut(slot) {
+                *u = user;
             }
         }
         Ok(slot)
@@ -1110,6 +1114,27 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     proofs.record(Proof::Tlb, crate::tlb::prove(com1, cpus, bsp, tsc_hz));
     crate::wait::prove(com1, cpus, bsp, tsc_hz, proofs);
     proofs.record(Proof::Ipc, crate::ipc_proof::prove(com1, cpus, bsp, tsc_hz));
+    proofs.record(
+        Proof::Objects,
+        crate::ipc_proof::prove_objects(com1, cpus, bsp, tsc_hz),
+    );
+    proofs.record(Proof::KernelHalf, crate::aspace::prove_kernel_half(com1));
+    proofs.record(
+        Proof::AddressSpaces,
+        crate::aspace::prove(com1, cpus, bsp, tsc_hz),
+    );
+    proofs.record(
+        Proof::Identity,
+        crate::ipc_proof::prove_identity(com1, cpus, bsp, tsc_hz),
+    );
+    proofs.record(
+        Proof::Launch,
+        crate::ipc_proof::prove_launch(com1, cpus, bsp, tsc_hz),
+    );
+    proofs.record(
+        Proof::Directory,
+        crate::ipc_proof::prove_directory(com1, cpus, bsp, tsc_hz),
+    );
     // Every thread has exited: once each processor has reaped its own, the heap is back
     // exactly where it was before the first spawn.
     let back = || crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before;

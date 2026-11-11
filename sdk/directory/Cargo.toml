@@ -1,0 +1,16 @@
+[package]
+name = "origin-directory"
+description = "The service directory's interface, origin.directory (ADR-0005 C12): its types, server and client, generated from sdk/interfaces/origin.directory.oidl"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Everything under `src/` is written by `cargo xtask regenerate` (`oidl generate --library
+# origin.directory`) and compared with a fresh generation by `cargo xtask check`: nothing there is
+# edited by hand. It holds the runtime, origin.directory's types, server and client, and
+# origin.kernel's types; a channel client needs no shim, so the crate's root forbids `unsafe`
+# (docs/spec/OIDL.md §11).
+
+[lints]
+workspace = true

@@ -1,10 +1,11 @@
 // The Framekernel's system calls as OIDL (docs/spec/OIDL.md): the first consumer of the
-// generator, ADR-0011 N14 step 2.
+// generator, ADR-0011 N14 steps 2 and 3.
 //
-// The owner accepted the format on 2026-11-09, but **nothing is generated from this file
-// into the tree yet, and the kernel does not use it**: adopting it is a later step (ADR-0011
-// N14), and the kernel may be restructured first (N6). The comparison with runtime/abi and
-// framekernel/src/syscall.rs is in docs/engineering/OIDL_KERNEL_COMPARISON.md.
+// The kernel's call table, argument decoding and statuses are generated from this file, into
+// framekernel/syscalls (`cargo xtask regenerate`). `cargo xtask check` fails if that code is not
+// what this file generates, or if this file's ABI is not the one origin.kernel.lock records.
+// Nothing else is generated from it yet: origin.core and its C entry points come with step 4. The
+// comparison with the hand-written ABI is in docs/engineering/OIDL_KERNEL_COMPARISON.md.
 
 /// The Framekernel's system calls: what the kernel offers a process (ADR-0005).
 /// Everything here reaches a program only through origin.core (ADR-0011 N5); the numbers are
@@ -44,6 +45,9 @@ enum status: i64 {
     limit = -12;
     /// The caller's buffer is too small; the sizes it needs were written to the out pointer.
     buffer_too_small = -13;
+    /// Nothing by that name or key is here: a service directory holds no provider of the
+    /// interface and major asked for (ADR-0005 C11).
+    @since(0.4) not_found = -14;
 }
 
 /// Handle rights (ADR-0005 P2). A right can be removed, never added.
@@ -71,6 +75,15 @@ bits rights: u32 {
 /// The rights of a new channel end: everything that applies to a channel (ADR-0005 P2, P8,
 /// amendment A1).
 const channel_rights: rights = read | write | duplicate | transfer | wait;
+
+/// The rights of a process's handle to itself (ADR-0005 C6). Changing another process's
+/// address space needs write; manage is for termination and thread control.
+@since(0.3)
+const process_rights: rights = read | write | manage | wait | duplicate | transfer;
+
+/// The rights of a thread's handle to itself (ADR-0005 C6).
+@since(0.3)
+const thread_rights: rights = wait | manage | duplicate | transfer;
 
 /// Object signals (ADR-0005 P9).
 bits signals: u32 {
@@ -120,12 +133,96 @@ const debug_write_max: u32 = 128;
 /// with this permission or without it; a process without it is refused.
 capability kernel.debug;
 
-/// What channel_read reports (ADR-0005 P4, amendment A4).
+/// What channel_read reports (ADR-0005 P4, amendment A4): the next message's sizes and, from
+/// minor 2, who wrote it (B1, C1, C2). A caller whose size predates a field gets nothing in its
+/// place, and no error.
 sized struct read_sizes {
     /// The message's byte count.
     bytes: u32;
     /// The message's handle count.
     handles: u32;
+    /// The writer's process ID, stamped by the kernel when the message was written: unique for
+    /// the boot and never reused. It names the process and grants nothing.
+    @since(0.2) sender_process: u64;
+    /// The writer's principal, stamped with it: opaque, set when the writer's process was
+    /// created.
+    @since(0.2) sender_principal: u64;
+}
+
+/// A handle channel_read moved into the caller's table: its value there, what it names and the
+/// rights it has, so a receiver can check both before using it (ADR-0005 B3, C3).
+@since(0.2)
+struct received_handle {
+    /// Its value in the caller's table.
+    handle: u32;
+    /// The type of the object it names.
+    object_type: object_type;
+    /// Its rights in the caller's table.
+    rights: rights;
+}
+
+/// Most handles a start record carries (ADR-0005 C4).
+@since(0.3)
+const start_max_handles: u32 = 64;
+
+/// Most bytes a start record takes, all of it (ADR-0005 C4).
+@since(0.3)
+const start_max_bytes: u32 = 65536;
+
+/// What a handle in a start record is for (ADR-0005 C5). 4 was SERVICE: it is retired and never
+/// reused, because a process finds services through its directory (ADR-0011 N9).
+@since(0.3)
+enum start_role: u32 {
+    /// The channel to whoever started the process.
+    bootstrap = 1;
+    /// The process itself.
+    self_process = 2;
+    /// Its first thread.
+    self_thread = 3;
+    /// The channel to the service directory.
+    directory = 5;
+}
+
+/// The start record's header (ADR-0005 P6, C4). The kernel writes the record before a process's
+/// first thread runs, read-only, at a random address that RDI holds at entry. The handle entries
+/// follow, then the arguments and the environment, each string a u32 length and its bytes padded
+/// to 8 with zeros. Exact size, zero padding, at most start_max_handles entries and
+/// start_max_bytes in all. origin-abi's codec reads and writes it.
+@since(0.3)
+struct start_header {
+    /// Bytes of the whole record, exactly.
+    size: u32;
+    /// The kernel's userspace ABI.
+    abi_major: u16;
+    /// Its minor.
+    abi_minor: u16;
+    /// The oldest minor of abi_major the kernel serves.
+    abi_min_minor: u16;
+    /// Zero.
+    reserved: u16;
+    /// Handle entries after the header.
+    handle_count: u32;
+    /// Argument strings.
+    arg_count: u32;
+    /// Bytes of the arguments, prefixes and padding included.
+    arg_bytes: u32;
+    /// Environment strings.
+    env_count: u32;
+    /// Bytes of the environment, prefixes and padding included.
+    env_bytes: u32;
+}
+
+/// One handle a start record names (ADR-0005 C4).
+@since(0.3)
+struct start_entry {
+    /// Its value in the process's table.
+    handle: u32;
+    /// The type of the object it names.
+    object_type: object_type;
+    /// Its rights.
+    rights: rights;
+    /// What it is for.
+    role: start_role;
 }
 
 /// Calls made by a thread on its process's behalf (ADR-0005 P4). Every number here is private
@@ -190,9 +287,10 @@ interface kernel {
     ) -> (
         /// Filled with the message's bytes.
         @count(sizes.bytes) bytes: vector<u8, max_message_bytes>,
-        /// Filled with the handles moved to the caller's table.
-        @count(sizes.handles) handles: vector<handle<any>, max_message_handles>,
-        /// The message's sizes; set size before the call.
+        /// Filled with a record of each handle moved to the caller's table (ADR-0005 B3).
+        @count(sizes.handles) handles: vector<received_handle, max_message_handles>,
+        /// The message's sizes and writer; set size before the call. Written on
+        /// buffer_too_small too, so a reader can decide from both whether to make room.
         @also_on(buffer_too_small) sizes: read_sizes,
     ) errors(bad_handle, wrong_type, access_denied, fault, invalid_args, should_wait, peer_closed, buffer_too_small, limit, no_memory) requires none;
 

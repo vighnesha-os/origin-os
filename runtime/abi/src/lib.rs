@@ -70,11 +70,14 @@ pub enum Error {
     Limit = -12,
     /// The caller's buffer is too small; the sizes it needs were written to the out pointer.
     BufferTooSmall = -13,
+    /// Nothing by that name or key is here: a service directory holds no provider of the
+    /// interface and major asked for (amendment C11).
+    NotFound = -14,
 }
 
 impl Error {
     /// Every error, in value order.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::InvalidArgs,
         Self::BadHandle,
         Self::WrongType,
@@ -88,6 +91,7 @@ impl Error {
         Self::NotSupported,
         Self::Limit,
         Self::BufferTooSmall,
+        Self::NotFound,
     ];
 
     /// The raw status value.
@@ -116,6 +120,7 @@ impl Error {
             Self::NotSupported => "NOT_SUPPORTED",
             Self::Limit => "LIMIT",
             Self::BufferTooSmall => "BUFFER_TOO_SMALL",
+            Self::NotFound => "NOT_FOUND",
         }
     }
 }
@@ -167,6 +172,12 @@ pub mod rights {
     /// The rights of a new channel end: everything that applies to a channel (P2, P8,
     /// amendment A1). `MAP`, `EXECUTE`, `SIGNAL` and `MANAGE` do not apply.
     pub const CHANNEL: u32 = READ | WRITE | DUPLICATE | TRANSFER | WAIT;
+    /// The rights of a process's handle to itself (amendment C6). Changing another process's
+    /// address space needs `WRITE`; `MANAGE` is for termination and thread control. `MAP`,
+    /// `EXECUTE` and `SIGNAL` do not apply.
+    pub const PROCESS: u32 = READ | WRITE | MANAGE | WAIT | DUPLICATE | TRANSFER;
+    /// The rights of a thread's handle to itself (amendment C6).
+    pub const THREAD: u32 = WAIT | MANAGE | DUPLICATE | TRANSFER;
 }
 
 /// Object signals (P9).
@@ -222,7 +233,8 @@ pub mod syscall {
     pub const CHANNEL_CREATE: u64 = 5;
     /// `channel_write(handle, bytes, length, handles, count)`.
     pub const CHANNEL_WRITE: u64 = 6;
-    /// `channel_read(handle, bytes, capacity, handles, capacity, out_sizes)`.
+    /// `channel_read(handle, bytes, capacity, records, capacity, out_sizes)`: each handle
+    /// received is a [`super::received_handle`] record (B3).
     pub const CHANNEL_READ: u64 = 7;
     /// `wait_one(handle, signals, deadline, out_observed)`.
     pub const WAIT_ONE: u64 = 8;
@@ -246,65 +258,158 @@ pub mod limits {
 /// `u32 size`, which the caller sets, so a later minor version can append fields.
 ///
 /// ```text
-/// 0  u32 size      set by the caller: bytes of the structure it knows
-/// 4  u32 bytes     the message's byte count
-/// 8  u32 handles   the message's handle count
+/// 0  u32 size              set by the caller: bytes of the structure it knows
+/// 4  u32 bytes             the message's byte count
+/// 8  u32 handles           the message's handle count
+/// 12 u32                   zero (from minor 2)
+/// 16 u64 sender_process    from minor 2: the writer's process ID (B1, C1)
+/// 24 u64 sender_principal  from minor 2: the writer's principal
 /// ```
 ///
-/// The kernel refuses a `size` below [`read_sizes::SIZE`], and never reads or writes past the
-/// fields it knows. Both counts are also written when the buffers are too small
-/// ([`Error::BufferTooSmall`]).
+/// The kernel refuses a `size` below [`read_sizes::BASE_SIZE`], and writes only what fits in
+/// the caller's `size`: a caller that gives 12 gets the counts, nothing past them, and no
+/// error (C2). The counts and the writer are also written when the buffers are too small
+/// ([`Error::BufferTooSmall`]). The writer is stamped by the kernel when the message is
+/// written, from the writing process; nothing the writer passes reaches it.
 pub mod read_sizes {
-    /// Bytes of this version of the structure.
-    pub const SIZE: u32 = 12;
+    /// Bytes of this version of the structure, with the writer's identity.
+    pub const SIZE: u32 = 32;
+    /// Bytes of the first version: the counts alone.
+    pub const BASE_SIZE: u32 = 12;
     /// Byte offset of `size`.
     pub const SIZE_AT: usize = 0;
     /// Byte offset of `bytes`.
     pub const BYTES_AT: usize = 4;
     /// Byte offset of `handles`.
     pub const HANDLES_AT: usize = 8;
+    /// Byte offset of `sender_process`.
+    pub const SENDER_PROCESS_AT: usize = 16;
+    /// Byte offset of `sender_principal`.
+    pub const SENDER_PRINCIPAL_AT: usize = 24;
 }
 
-/// The start record (P6): what a process begins with, at the address RDI holds.
+/// What `channel_read` writes for each handle it moves into the caller's table (B3): the
+/// handle, the type of the object it names and its rights there, so a receiver can check both
+/// before it uses the handle. Each record is 12 bytes, every field a little-endian `u32`, and
+/// the capacity passed is in records.
 ///
 /// ```text
-/// 0  u32 size            total bytes of the record
-/// 4  u16 abi_major       the kernel's userspace ABI
-/// 6  u16 abi_minor
-/// 8  u32 handle_count
-/// 12 u32 reserved        zero
-/// 16 handle_count × { u32 handle, u32 role }
+/// 0  u32 handle        its value in the caller's table
+/// 4  u32 object_type   an [`ObjectType`]
+/// 8  u32 rights        [`rights`]
 /// ```
+pub mod received_handle {
+    /// Bytes of one record.
+    pub const SIZE: usize = 12;
+    /// Byte offset of `handle`.
+    pub const HANDLE_AT: usize = 0;
+    /// Byte offset of `object_type`.
+    pub const OBJECT_TYPE_AT: usize = 4;
+    /// Byte offset of `rights`.
+    pub const RIGHTS_AT: usize = 8;
+}
+
+/// The start record, version 1 (P6, amendment C4): what a process begins with. The kernel
+/// writes it before the first thread runs, on pages the process may read but not write or
+/// execute, at a random address, and the first thread finds that address in RDI.
+///
+/// ```text
+/// 0    u32 size            bytes of the whole record, exactly
+/// 4    u16 abi_major       the kernel's userspace ABI
+/// 6    u16 abi_minor
+/// 8    u16 abi_min_minor   the oldest minor of abi_major the kernel serves
+/// 10   u16 reserved        zero
+/// 12   u32 handle_count    at most 64
+/// 16   u32 arg_count
+/// 20   u32 arg_bytes       bytes of the arguments, prefixes and padding included
+/// 24   u32 env_count
+/// 28   u32 env_bytes       bytes of the environment, the same way
+/// 32   handle_count × { u32 handle; u32 object_type; u32 rights; u32 role }
+///      the arguments, then the environment: each a u32 length, its bytes, then zeros to 8
+/// ```
+///
+/// The whole record is at most 64 KiB, and every padding byte is zero.
 pub mod start {
     use crate::{ABI_VERSION, Handle};
 
-    /// Size of the fixed header.
-    pub const HEADER: usize = 16;
-    /// Size of one handle entry.
-    pub const ENTRY: usize = 8;
+    /// Bytes of the header.
+    pub const HEADER: usize = 32;
+    /// Bytes of one handle entry.
+    pub const ENTRY: usize = 16;
     /// Most handles a start record carries.
-    pub const MAX_HANDLES: usize = 32;
+    pub const MAX_HANDLES: usize = 64;
+    /// Most bytes a start record takes, all of it.
+    pub const MAX_SIZE: usize = 64 * 1024;
+    /// The oldest minor of [`ABI_VERSION`]'s major the kernel serves. At major 0 it serves
+    /// only its own.
+    pub const ABI_MIN_MINOR: u16 = ABI_VERSION.1;
 
-    /// What a start-record handle is for.
+    /// Byte offset of `size`.
+    pub const SIZE_AT: usize = 0;
+    /// Byte offset of `abi_major`.
+    pub const ABI_MAJOR_AT: usize = 4;
+    /// Byte offset of `abi_minor`.
+    pub const ABI_MINOR_AT: usize = 6;
+    /// Byte offset of `abi_min_minor`.
+    pub const ABI_MIN_MINOR_AT: usize = 8;
+    /// Byte offset of `reserved`.
+    pub const RESERVED_AT: usize = 10;
+    /// Byte offset of `handle_count`.
+    pub const HANDLE_COUNT_AT: usize = 12;
+    /// Byte offset of `arg_count`.
+    pub const ARG_COUNT_AT: usize = 16;
+    /// Byte offset of `arg_bytes`.
+    pub const ARG_BYTES_AT: usize = 20;
+    /// Byte offset of `env_count`.
+    pub const ENV_COUNT_AT: usize = 24;
+    /// Byte offset of `env_bytes`.
+    pub const ENV_BYTES_AT: usize = 28;
+    /// Byte offset of an entry's `handle`, from the entry's start.
+    pub const ENTRY_HANDLE_AT: usize = 0;
+    /// Byte offset of an entry's `object_type`.
+    pub const ENTRY_OBJECT_TYPE_AT: usize = 4;
+    /// Byte offset of an entry's `rights`.
+    pub const ENTRY_RIGHTS_AT: usize = 8;
+    /// Byte offset of an entry's `role`.
+    pub const ENTRY_ROLE_AT: usize = 12;
+
+    /// What a start-record handle is for (amendment C5).
     pub mod role {
         /// The channel to whoever started the process.
         pub const BOOTSTRAP: u32 = 1;
         /// The process itself.
         pub const SELF_PROCESS: u32 = 2;
-        /// The first thread.
+        /// Its first thread.
         pub const SELF_THREAD: u32 = 3;
-        /// A service the creator granted.
-        pub const SERVICE: u32 = 4;
+        // 4 was SERVICE: retired, and never reused, because a process finds services through
+        // its directory (ADR-0011 N9).
+        /// The channel to the service directory.
+        pub const DIRECTORY: u32 = 5;
+    }
+
+    /// One handle the record names.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Entry {
+        /// Its value in the process's table.
+        pub handle: Handle,
+        /// The type of the object it names (an [`ObjectType`](crate::ObjectType)).
+        pub object_type: u32,
+        /// Its rights.
+        pub rights: u32,
+        /// What it is for: a [`role`].
+        pub role: u32,
     }
 
     /// Why a start record could not be encoded or decoded.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum StartError {
-        /// The buffer is too small.
+        /// The buffer is too small, or the record runs past it.
         Short,
         /// More than [`MAX_HANDLES`] handles.
         TooManyHandles,
-        /// `size` disagrees with the handle count, or `reserved` is not zero.
+        /// More than [`MAX_SIZE`] bytes.
+        TooLarge,
+        /// A size or count disagrees with the rest, or a reserved or padding byte is not zero.
         Malformed,
     }
 
@@ -316,11 +421,6 @@ pub mod start {
         Ok(())
     }
 
-    /// Byte offset of entry `i`, counted from `base`.
-    fn entry_at(base: usize, i: usize) -> Option<usize> {
-        ENTRY.checked_mul(i)?.checked_add(base)
-    }
-
     fn get<const N: usize>(b: &[u8], at: usize) -> Result<[u8; N], StartError> {
         let end = at.checked_add(N).ok_or(StartError::Short)?;
         let mut v = [0u8; N];
@@ -328,78 +428,230 @@ pub mod start {
         Ok(v)
     }
 
-    /// Writes a start record for `handles` (`(handle, role)`) into `out`; returns its size.
-    pub fn encode(handles: &[(Handle, u32)], out: &mut [u8]) -> Result<usize, StartError> {
-        if handles.len() > MAX_HANDLES {
+    fn u32_at(b: &[u8], at: usize) -> Result<u32, StartError> {
+        get(b, at).map(u32::from_le_bytes)
+    }
+
+    fn u16_at(b: &[u8], at: usize) -> Result<u16, StartError> {
+        get(b, at).map(u16::from_le_bytes)
+    }
+
+    /// Bytes one string takes: its length, its bytes, and zeros to the next multiple of 8.
+    fn string_bytes(len: usize) -> Option<usize> {
+        len.checked_add(4)?.checked_add(7).map(|n| n & !7)
+    }
+
+    /// Bytes a list of strings takes.
+    fn strings_bytes(strings: &[&[u8]]) -> Option<usize> {
+        strings
+            .iter()
+            .try_fold(0usize, |total, s| total.checked_add(string_bytes(s.len())?))
+    }
+
+    /// The size of the record for `handles` entries, `args` and `env`, within the limits.
+    pub fn size_of(handles: usize, args: &[&[u8]], env: &[&[u8]]) -> Result<usize, StartError> {
+        if handles > MAX_HANDLES {
             return Err(StartError::TooManyHandles);
         }
-        let size = entry_at(HEADER, handles.len()).ok_or(StartError::Short)?;
-        let size32 = u32::try_from(size).map_err(|_| StartError::Short)?;
-        let count = u32::try_from(handles.len()).map_err(|_| StartError::TooManyHandles)?;
-        put(out, 0, &size32.to_le_bytes())?;
-        put(out, 4, &ABI_VERSION.0.to_le_bytes())?;
-        put(out, 6, &ABI_VERSION.1.to_le_bytes())?;
-        put(out, 8, &count.to_le_bytes())?;
-        put(out, 12, &0u32.to_le_bytes())?;
-        for (i, (handle, role)) in handles.iter().enumerate() {
-            let at = entry_at(HEADER, i).ok_or(StartError::Short)?;
-            put(out, at, &handle.to_le_bytes())?;
-            put(
-                out,
-                at.checked_add(4).ok_or(StartError::Short)?,
-                &role.to_le_bytes(),
-            )?;
+        let size = ENTRY
+            .checked_mul(handles)
+            .and_then(|n| n.checked_add(HEADER))
+            .and_then(|n| n.checked_add(strings_bytes(args)?))
+            .and_then(|n| n.checked_add(strings_bytes(env)?))
+            .ok_or(StartError::TooLarge)?;
+        if size > MAX_SIZE {
+            return Err(StartError::TooLarge);
         }
         Ok(size)
     }
 
-    /// A decoded start record.
+    fn u32_of(n: usize) -> Result<u32, StartError> {
+        u32::try_from(n).map_err(|_| StartError::TooLarge)
+    }
+
+    /// Writes `strings` at `at`; returns the offset after them.
+    fn put_strings(out: &mut [u8], at: usize, strings: &[&[u8]]) -> Result<usize, StartError> {
+        let mut at = at;
+        for s in strings {
+            put(out, at, &u32_of(s.len())?.to_le_bytes())?;
+            put(out, at.checked_add(4).ok_or(StartError::Short)?, s)?;
+            at = at
+                .checked_add(string_bytes(s.len()).ok_or(StartError::TooLarge)?)
+                .ok_or(StartError::Short)?;
+        }
+        Ok(at)
+    }
+
+    /// Writes the start record for `entries`, `args` and `env` at the start of `out`, padding
+    /// included, and returns its size. Every byte of the record is written, so nothing else
+    /// that was in `out` remains in it.
+    pub fn encode(
+        entries: &[Entry],
+        args: &[&[u8]],
+        env: &[&[u8]],
+        out: &mut [u8],
+    ) -> Result<usize, StartError> {
+        let size = size_of(entries.len(), args, env)?;
+        let record = out.get_mut(..size).ok_or(StartError::Short)?;
+        record.fill(0);
+        let arg_bytes = strings_bytes(args).ok_or(StartError::TooLarge)?;
+        let env_bytes = strings_bytes(env).ok_or(StartError::TooLarge)?;
+        put(record, SIZE_AT, &u32_of(size)?.to_le_bytes())?;
+        put(record, ABI_MAJOR_AT, &ABI_VERSION.0.to_le_bytes())?;
+        put(record, ABI_MINOR_AT, &ABI_VERSION.1.to_le_bytes())?;
+        put(record, ABI_MIN_MINOR_AT, &ABI_MIN_MINOR.to_le_bytes())?;
+        put(
+            record,
+            HANDLE_COUNT_AT,
+            &u32_of(entries.len())?.to_le_bytes(),
+        )?;
+        put(record, ARG_COUNT_AT, &u32_of(args.len())?.to_le_bytes())?;
+        put(record, ARG_BYTES_AT, &u32_of(arg_bytes)?.to_le_bytes())?;
+        put(record, ENV_COUNT_AT, &u32_of(env.len())?.to_le_bytes())?;
+        put(record, ENV_BYTES_AT, &u32_of(env_bytes)?.to_le_bytes())?;
+        let mut at = HEADER;
+        for entry in entries {
+            for (offset, value) in [
+                (ENTRY_HANDLE_AT, entry.handle),
+                (ENTRY_OBJECT_TYPE_AT, entry.object_type),
+                (ENTRY_RIGHTS_AT, entry.rights),
+                (ENTRY_ROLE_AT, entry.role),
+            ] {
+                let field = at.checked_add(offset).ok_or(StartError::Short)?;
+                put(record, field, &value.to_le_bytes())?;
+            }
+            at = at.checked_add(ENTRY).ok_or(StartError::Short)?;
+        }
+        let at = put_strings(record, at, args)?;
+        let end = put_strings(record, at, env)?;
+        if end != size {
+            return Err(StartError::Malformed);
+        }
+        Ok(size)
+    }
+
+    /// A list of strings, checked: each a length, its bytes and zero padding to 8, filling
+    /// exactly the area they were given.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Strings<'a> {
+        area: &'a [u8],
+        count: usize,
+    }
+
+    impl<'a> Strings<'a> {
+        fn check(area: &'a [u8], count: usize) -> Result<Self, StartError> {
+            let mut at = 0usize;
+            for _ in 0..count {
+                let len = u32_at(area, at).map_err(|_| StartError::Malformed)? as usize;
+                let start = at.checked_add(4).ok_or(StartError::Malformed)?;
+                let next = at
+                    .checked_add(string_bytes(len).ok_or(StartError::Malformed)?)
+                    .ok_or(StartError::Malformed)?;
+                let end = start.checked_add(len).ok_or(StartError::Malformed)?;
+                let padding = area.get(end..next).ok_or(StartError::Malformed)?;
+                if padding.iter().any(|&b| b != 0) {
+                    return Err(StartError::Malformed);
+                }
+                at = next;
+            }
+            if at != area.len() {
+                return Err(StartError::Malformed);
+            }
+            Ok(Self { area, count })
+        }
+
+        /// How many there are.
+        pub const fn count(&self) -> usize {
+            self.count
+        }
+
+        /// Each string, in order.
+        pub fn iter(&self) -> impl Iterator<Item = &'a [u8]> + 'a {
+            let area = self.area;
+            let mut at = 0usize;
+            (0..self.count).map_while(move |_| {
+                let len = u32_at(area, at).ok()? as usize;
+                let start = at.checked_add(4)?;
+                let bytes = area.get(start..start.checked_add(len)?)?;
+                at = at.checked_add(string_bytes(len)?)?;
+                Some(bytes)
+            })
+        }
+    }
+
+    /// A decoded and checked start record.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct StartRecord<'a> {
         /// The kernel's userspace ABI version.
         pub abi: (u16, u16),
+        /// The oldest minor of `abi`'s major the kernel serves.
+        pub abi_min_minor: u16,
         entries: &'a [u8],
         count: usize,
+        /// The arguments.
+        pub args: Strings<'a>,
+        /// The environment.
+        pub env: Strings<'a>,
     }
 
     impl StartRecord<'_> {
-        /// The `(handle, role)` entries.
-        pub fn handles(&self) -> impl Iterator<Item = (Handle, u32)> + '_ {
-            (0..self.count).filter_map(|i| {
-                let at = entry_at(0, i)?;
-                Some((
-                    u32::from_le_bytes(get(self.entries, at).ok()?),
-                    u32::from_le_bytes(get(self.entries, at.checked_add(4)?).ok()?),
-                ))
+        /// Each handle entry, in order.
+        pub fn entries(&self) -> impl Iterator<Item = Entry> + '_ {
+            (0..self.count).map_while(|i| {
+                let at = ENTRY.checked_mul(i)?;
+                let field = |offset: usize| u32_at(self.entries, at.checked_add(offset)?).ok();
+                Some(Entry {
+                    handle: field(ENTRY_HANDLE_AT)?,
+                    object_type: field(ENTRY_OBJECT_TYPE_AT)?,
+                    rights: field(ENTRY_RIGHTS_AT)?,
+                    role: field(ENTRY_ROLE_AT)?,
+                })
             })
         }
 
-        /// The first handle with `role`, if any.
-        pub fn find(&self, role: u32) -> Option<Handle> {
-            self.handles().find(|&(_, r)| r == role).map(|(h, _)| h)
+        /// The first entry with `role`, if any.
+        pub fn find(&self, role: u32) -> Option<Entry> {
+            self.entries().find(|e| e.role == role)
         }
     }
 
-    /// Decodes and checks a start record.
+    /// Decodes and checks the start record at the start of `b`: its size is exact, its counts
+    /// agree with its areas, and every reserved and padding byte is zero.
     pub fn decode(b: &[u8]) -> Result<StartRecord<'_>, StartError> {
-        let size = u32::from_le_bytes(get(b, 0)?) as usize;
-        let abi = (
-            u16::from_le_bytes(get(b, 4)?),
-            u16::from_le_bytes(get(b, 6)?),
-        );
-        let count = u32::from_le_bytes(get(b, 8)?) as usize;
-        let reserved = u32::from_le_bytes(get(b, 12)?);
+        let size = u32_at(b, SIZE_AT)? as usize;
+        if size > MAX_SIZE {
+            return Err(StartError::TooLarge);
+        }
+        let record = b.get(..size).ok_or(StartError::Short)?;
+        if size < HEADER || u16_at(record, RESERVED_AT)? != 0 {
+            return Err(StartError::Malformed);
+        }
+        let count = u32_at(record, HANDLE_COUNT_AT)? as usize;
         if count > MAX_HANDLES {
             return Err(StartError::TooManyHandles);
         }
-        if reserved != 0 || Some(size) != entry_at(HEADER, count) {
+        let arg_bytes = u32_at(record, ARG_BYTES_AT)? as usize;
+        let env_bytes = u32_at(record, ENV_BYTES_AT)? as usize;
+        let args_at = ENTRY
+            .checked_mul(count)
+            .and_then(|n| n.checked_add(HEADER))
+            .ok_or(StartError::Malformed)?;
+        let env_at = args_at
+            .checked_add(arg_bytes)
+            .ok_or(StartError::Malformed)?;
+        if env_at.checked_add(env_bytes) != Some(size) {
             return Err(StartError::Malformed);
         }
-        let entries = b.get(HEADER..size).ok_or(StartError::Short)?;
+        let entries = record.get(HEADER..args_at).ok_or(StartError::Malformed)?;
+        let args = record.get(args_at..env_at).ok_or(StartError::Malformed)?;
+        let env = record.get(env_at..size).ok_or(StartError::Malformed)?;
         Ok(StartRecord {
-            abi,
+            abi: (u16_at(record, ABI_MAJOR_AT)?, u16_at(record, ABI_MINOR_AT)?),
+            abi_min_minor: u16_at(record, ABI_MIN_MINOR_AT)?,
             entries,
             count,
+            args: Strings::check(args, u32_at(record, ARG_COUNT_AT)? as usize)?,
+            env: Strings::check(env, u32_at(record, ENV_COUNT_AT)? as usize)?,
         })
     }
 }
@@ -411,7 +663,7 @@ mod tests {
     #[test]
     fn status_values_are_stable_and_distinct() {
         // Pinned: these values are the C ABI (P5); changing one breaks every program.
-        let expected: [(Error, i64); 13] = [
+        let expected: [(Error, i64); 14] = [
             (Error::InvalidArgs, -1),
             (Error::BadHandle, -2),
             (Error::WrongType, -3),
@@ -425,20 +677,22 @@ mod tests {
             (Error::NotSupported, -11),
             (Error::Limit, -12),
             (Error::BufferTooSmall, -13),
+            (Error::NotFound, -14),
         ];
         for (e, v) in expected {
             assert_eq!(e.raw(), v);
             assert_eq!(Error::from_raw(v), Some(e));
         }
         assert_eq!(Error::from_raw(OK), None);
-        assert_eq!(Error::from_raw(-14), None);
+        assert_eq!(Error::from_raw(-15), None);
         assert_eq!(Error::ALL.len(), expected.len());
     }
 
     #[test]
     fn every_status_has_a_distinct_name() {
         assert_eq!(status_name(OK), "OK");
-        assert_eq!(status_name(-14), "UNKNOWN");
+        assert_eq!(status_name(-14), "NOT_FOUND");
+        assert_eq!(status_name(-15), "UNKNOWN");
         assert_eq!(status_name(1), "UNKNOWN");
         let mut names: Vec<&str> = Error::ALL.iter().map(|e| e.name()).collect();
         for e in Error::ALL {
@@ -518,46 +772,181 @@ mod tests {
         assert_eq!(read_sizes::SIZE_AT, 0);
         assert_eq!(read_sizes::BYTES_AT, 4);
         assert_eq!(read_sizes::HANDLES_AT, 8);
-        assert_eq!(read_sizes::SIZE, 12);
+        assert_eq!(read_sizes::BASE_SIZE, 12);
+        // The writer's identity follows, each `u64` aligned (B1, C2).
+        assert_eq!(read_sizes::SENDER_PROCESS_AT, 16);
+        assert_eq!(read_sizes::SENDER_PRINCIPAL_AT, 24);
+        assert_eq!(read_sizes::SIZE, 32);
+        // Three `u32`s, in order, with no padding (B3).
+        assert_eq!(received_handle::HANDLE_AT, 0);
+        assert_eq!(received_handle::OBJECT_TYPE_AT, 4);
+        assert_eq!(received_handle::RIGHTS_AT, 8);
+        assert_eq!(received_handle::SIZE, 12);
+    }
+
+    /// A channel end in a start record, with `role`.
+    fn channel_entry(handle: u32, role: u32) -> start::Entry {
+        start::Entry {
+            handle,
+            object_type: ObjectType::Channel as u32,
+            rights: rights::CHANNEL,
+            role,
+        }
     }
 
     #[test]
-    fn start_records_round_trip_and_are_checked() {
-        let handles = [
-            (0x0001_0001, start::role::BOOTSTRAP),
-            (0x0001_0002, start::role::SERVICE),
+    fn the_rights_of_a_process_and_a_thread_are_c6s() {
+        assert_eq!(
+            rights::PROCESS,
+            rights::READ
+                | rights::WRITE
+                | rights::MANAGE
+                | rights::WAIT
+                | rights::DUPLICATE
+                | rights::TRANSFER
+        );
+        assert_eq!(
+            rights::THREAD,
+            rights::WAIT | rights::MANAGE | rights::DUPLICATE | rights::TRANSFER
+        );
+        assert_eq!(rights::PROCESS & !rights::ALL, 0);
+        assert_eq!(rights::THREAD & !rights::ALL, 0);
+    }
+
+    #[test]
+    fn start_records_round_trip_with_their_handles_arguments_and_environment() {
+        let entries = [
+            start::Entry {
+                handle: 0x0001_0001,
+                object_type: ObjectType::Process as u32,
+                rights: rights::PROCESS,
+                role: start::role::SELF_PROCESS,
+            },
+            start::Entry {
+                handle: 0x0001_0002,
+                object_type: ObjectType::Thread as u32,
+                rights: rights::THREAD,
+                role: start::role::SELF_THREAD,
+            },
+            channel_entry(0x0001_0003, start::role::BOOTSTRAP),
+            channel_entry(0x0001_0004, start::role::DIRECTORY),
         ];
-        let mut buf = [0u8; 64];
-        let size = start::encode(&handles, &mut buf).unwrap();
-        assert_eq!(size, 32);
+        let args: [&[u8]; 3] = [b"origin", b"", b"seven b"];
+        let env: [&[u8]; 1] = [b"LANG=te"];
+        let mut buf = [0xAAu8; 512];
+        let size = start::encode(&entries, &args, &env, &mut buf).unwrap();
+        // The header, four entries, then 4 + 6 bytes padded to 16, 4 to 8, 4 + 7 to 16, and
+        // the environment's 4 + 7 to 16.
+        assert_eq!(size, 32 + 4 * 16 + 16 + 8 + 16 + 16);
+        assert_eq!(start::size_of(entries.len(), &args, &env), Ok(size));
         let r = start::decode(&buf[..size]).unwrap();
         assert_eq!(r.abi, ABI_VERSION);
-        assert_eq!(r.handles().collect::<Vec<_>>(), handles);
-        assert_eq!(r.find(start::role::BOOTSTRAP), Some(0x0001_0001));
-        assert_eq!(r.find(start::role::SELF_THREAD), None);
-        // The first handle is at byte 16, where a program reads it.
-        assert_eq!(&buf[16..20], &0x0001_0001u32.to_le_bytes());
-        // Malformed records are refused.
-        let mut bad = buf;
-        bad[12] = 1;
+        assert_eq!(r.abi_min_minor, ABI_VERSION.1);
+        assert_eq!(r.entries().collect::<Vec<_>>(), entries);
+        assert_eq!(r.find(start::role::DIRECTORY), Some(entries[3]));
+        assert_eq!(r.find(4), None, "4 was SERVICE, and is retired");
+        assert_eq!(r.args.count(), 3);
+        assert_eq!(r.args.iter().collect::<Vec<_>>(), args);
+        assert_eq!(r.env.iter().collect::<Vec<_>>(), env);
+        // Where a program finds them.
+        assert_eq!(&buf[..4], &(size as u32).to_le_bytes());
+        assert_eq!(&buf[32..36], &0x0001_0001u32.to_le_bytes());
         assert_eq!(
-            start::decode(&bad[..size]),
-            Err(start::StartError::Malformed)
+            &buf[32 + 12..32 + 16],
+            &start::role::SELF_PROCESS.to_le_bytes()
         );
-        let mut bad = buf;
-        bad[0] = 31;
+        // Every reserved and padding byte is zero, whatever the buffer held, and nothing past
+        // the record is written.
+        assert_eq!(&buf[start::RESERVED_AT..start::RESERVED_AT + 2], &[0, 0]);
+        let first_arg = start::HEADER + 4 * start::ENTRY;
+        assert_eq!(&buf[first_arg + 4..first_arg + 10], b"origin");
+        assert_eq!(&buf[first_arg + 10..first_arg + 16], &[0; 6]);
+        assert_eq!(buf[size], 0xAA);
+    }
+
+    #[test]
+    fn start_records_hold_their_limits() {
+        let one = [channel_entry(1, start::role::BOOTSTRAP)];
+        let mut buf = vec![0u8; start::MAX_SIZE + 64];
+        let too_many = [channel_entry(1, start::role::BOOTSTRAP); start::MAX_HANDLES + 1];
         assert_eq!(
-            start::decode(&bad[..size]),
-            Err(start::StartError::Malformed)
+            start::encode(&too_many, &[], &[], &mut buf),
+            Err(start::StartError::TooManyHandles)
         );
-        assert_eq!(start::decode(&buf[..20]), Err(start::StartError::Short));
-        let many = [(1u32, 1u32); start::MAX_HANDLES + 1];
+        let full = [channel_entry(1, start::role::BOOTSTRAP); start::MAX_HANDLES];
+        assert!(start::encode(&full, &[], &[], &mut buf).is_ok());
+        // Exactly 64 KiB is allowed, and one string byte more is not.
+        let room = start::MAX_SIZE - start::HEADER - start::ENTRY - 4;
+        let largest = vec![7u8; room];
         assert_eq!(
-            start::encode(&many, &mut [0u8; 512]),
+            start::encode(&one, &[&largest], &[], &mut buf),
+            Ok(start::MAX_SIZE)
+        );
+        assert!(start::decode(&buf).is_ok());
+        let over = vec![7u8; room + 1];
+        assert_eq!(
+            start::encode(&one, &[&over], &[], &mut buf),
+            Err(start::StartError::TooLarge)
+        );
+        assert_eq!(
+            start::encode(&one, &[b"x"], &[], &mut [0u8; 40]),
+            Err(start::StartError::Short)
+        );
+    }
+
+    #[test]
+    fn malformed_start_records_are_refused() {
+        let entries = [channel_entry(0x0001_0003, start::role::BOOTSTRAP)];
+        let mut good = [0u8; 128];
+        let size = start::encode(&entries, &[b"abc"], &[], &mut good).unwrap();
+        let first_arg = start::HEADER + start::ENTRY;
+        let refused = |edit: &dyn Fn(&mut [u8; 128])| {
+            let mut bad = good;
+            edit(&mut bad);
+            start::decode(&bad).map(|_| ())
+        };
+        let malformed = Err(start::StartError::Malformed);
+        assert_eq!(start::decode(&good[..size]).map(|_| ()), Ok(()));
+        assert_eq!(
+            refused(&|b| b[..4].copy_from_slice(&((size + 8) as u32).to_le_bytes())),
+            malformed,
+            "a size the areas do not fill"
+        );
+        assert_eq!(
+            refused(&|b| b[..4].copy_from_slice(&8u32.to_le_bytes())),
+            malformed,
+            "a size under the header's"
+        );
+        assert_eq!(
+            refused(&|b| b[start::RESERVED_AT] = 1),
+            malformed,
+            "reserved"
+        );
+        assert_eq!(
+            refused(&|b| b[first_arg + 7] = 1),
+            malformed,
+            "a padding byte"
+        );
+        assert_eq!(
+            refused(&|b| b[first_arg..first_arg + 4].copy_from_slice(&100u32.to_le_bytes())),
+            malformed,
+            "a string past its area"
+        );
+        assert_eq!(
+            refused(&|b| b[start::ARG_COUNT_AT] = 2),
+            malformed,
+            "a count the area does not hold"
+        );
+        assert_eq!(
+            refused(&|b| b[start::HANDLE_COUNT_AT] = 65),
             Err(start::StartError::TooManyHandles)
         );
         assert_eq!(
-            start::encode(&handles, &mut [0u8; 20]),
+            refused(&|b| b[..4].copy_from_slice(&(64 * 1024 + 8u32).to_le_bytes())),
+            Err(start::StartError::TooLarge)
+        );
+        assert_eq!(
+            start::decode(&good[..size - 1]).map(|_| ()),
             Err(start::StartError::Short)
         );
     }

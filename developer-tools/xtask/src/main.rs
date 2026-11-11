@@ -7,9 +7,11 @@
 #![forbid(unsafe_code)]
 
 mod disk;
+mod interfaces;
 mod loom;
 mod screen;
 mod serial;
+mod turns;
 mod unsafety;
 
 use std::borrow::Cow;
@@ -54,8 +56,19 @@ commands:
               check (CLAUDE.md §73)
   unsafe-gate only the gate on `unsafe` and on the kernel's dependency direction (part of
               check; quick)
+  interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
+              (part of check; quick)
+  regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
+  exclusive -- <command> [args...]
+              runs any command in a turn on the machine, as check, the boots, run and loom
+              take theirs: one at a time across every checkout of this repository on this
+              machine. A waiter says once, and about once a minute, which run it waits for.
+              For scripts that call cargo directly (per-commit verification, say)
 
 environment:
+  ORIGIN_XTASK_LOCK_HELD              set by a run that holds the turn, for its own child
+                                      processes: a child that finds the turn held by that
+                                      process runs inside it instead of waiting for it
   ORIGIN_LOOM_DEEP                    if set, the Loom models search to their deeper bounds
                                       (a long run; the default search is part of check)
   ORIGIN_OVMF_CODE, ORIGIN_OVMF_VARS  firmware code image and NVRAM template
@@ -92,7 +105,8 @@ const ONBF_FORMAT_PACKAGE: &str = "onbf-format";
 const CRYPTO_PACKAGE: &str = "origin-crypto";
 const MERKLE_PACKAGE: &str = "onbf-merkle";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
-/// `no_std` libraries embedded in the boot loader and the Framekernel. Each must be
+/// `no_std` libraries embedded in the boot loader and the Framekernel, and the generated crates of
+/// the SDK's interfaces, which the Framekernel's boot proofs use and programs will. Each must be
 /// clippy-clean on every target and free of panic paths (ONBF §12).
 const BOOT_INFO_PACKAGE: &str = "origin-boot-info";
 const KERNEL_PACKAGE: &str = "framekernel";
@@ -112,7 +126,11 @@ const FREESTANDING_LIBS: &[&str] = &[
     "onbf-verify",
     "origin-paging",
     "origin-abi",
+    "origin-syscalls",
+    "origin-directory",
 ];
+/// The services' `no_std` logic, which programs will run in ring 3 and the host tests until then.
+const SERVICE_LIBS: &[&str] = &["origin-directory-service"];
 const QEMU: &str = "qemu-system-x86_64";
 /// Where the emulated RTC starts (UTC), so the boot test can check the wall clock the
 /// kernel reads from it: BCD decoding, the FADT century register and the calendar.
@@ -1323,6 +1341,11 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         ])
         // M4's first slice (ADR-0005 P1–P5, P8, P9): system calls between ring-3 processes.
         .chain(ipc_markers(machine.named(0), target.clone()))
+        .chain(object_markers(&target))
+        .chain(address_space_markers(cpus))
+        .chain(identity_markers())
+        .chain(launch_markers())
+        .chain(directory_markers())
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             // M5 groundwork: q35's functions listed with their BARs sized and restored.
@@ -1606,8 +1629,11 @@ fn boot_failures() -> Vec<&'static str> {
         IOAPIC_FAILED,
         ": PM timer failed",
         ": ipc failed",
+        ": start failed",
+        ": directory failed",
         ": console failed",
         ": TLB failed",
+        ": address spaces failed",
         ": wait queues failed",
         ": PCIe failed",
         // No BAR on the test machines is refused, and the exhaustive quiesce sees every
@@ -1736,6 +1762,45 @@ fn refusal_scenario(
 
 /// What the kernel's first system-call slice must report, in order: a line per group of
 /// hostile calls, each naming the status its call returned.
+/// N14 step 3, S3-5a: address spaces (ADR-0004 H2), each boot proof's own lines.
+fn address_space_markers(cpus: u32) -> Vec<String> {
+    let (far, one) = if cpus > 1 {
+        ("another processor", 1)
+    } else {
+        ("this processor", 0)
+    };
+    let cost = format!("Ok(Change {{ pages: 1, shootdowns: 1, interrupts: {one} }})");
+    vec![
+        "origin-kernel: address spaces: the kernel half is the same tables in every space: true; a kernel mapping made at 0xfffff00000000000, in a top-level slot of its own, after a space was created is visible from that space: true; from a space lacking the slot, the same read faults: true; the probe page is not global: true".into(),
+        format!(
+            "origin-kernel: address spaces: a page unmapped under a running thread on {far}: frame free when the unmap returned: true; reused with a secret: true; the thread faulted at 0x500000 (#PF error 0x4): true; it read the secret: false; {cost}"
+        ),
+        "origin-kernel: address spaces: control: a thread whose page is still mapped reads the same secret: true".into(),
+        format!(
+            "origin-kernel: address spaces: a page made read-only under a running writer on {far}: the writer faulted at 0x500000 (#PF error 0x7): true; {cost}"
+        ),
+        format!(
+            "origin-kernel: address spaces: a page made writable under a running reader on {far}: it wrote without a fault: true; {cost}"
+        ),
+        "origin-kernel: address spaces: a page mapped under a running thread: it read 0x1234 and exited".into(),
+        format!(
+            "origin-kernel: address spaces: 5 pages unmapped at once under a running thread on {far}: it faulted at its page among them: true; Ok(Change {{ pages: 5, shootdowns: 1, interrupts: {one} }})"
+        ),
+        format!(
+            "origin-kernel: address spaces: 200 pages unmapped at once under a running thread on {far}: it faulted at its page among them: true; Ok(Change {{ pages: 200, shootdowns: 2, interrupts: {} }})",
+            2 * one
+        ),
+        "origin-kernel: address spaces: a frame shared by two spaces: unmapped from the first, its thread faulted: true, the other went on: true, the frame still in use: true; unmapped from the second, its thread faulted: true, the frame free when the unmap returned: true".into(),
+        "origin-kernel: address spaces: W^X across a shared frame's mappings: executable in another space while writable in one, refused: true; at another address in the same space, refused: true; read-only beside it: true; executable once nothing writes it: true; writable again while executable elsewhere, refused: true; from executable to writable in one step, refused: true".into(),
+        format!(
+            "origin-kernel: address spaces: 64 maps and unmaps of a page under a thread on {far}: {} interrupts, 0 on processors not in the space; ",
+            64 * one
+        ),
+        " us each (QEMU, no budget)".into(),
+        "origin-kernel: address spaces: every process and frame of these proofs is gone: ".into(),
+    ]
+}
+
 fn ipc_markers(boot: String, far: String) -> Vec<String> {
     let mut markers = vec![
         format!(
@@ -1747,12 +1812,12 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
         "origin-kernel: ipc: bad handles: handle 0 -> BAD_HANDLE, never issued -> BAD_HANDLE, bits above 32 -> BAD_HANDLE, wait on a bad handle -> BAD_HANDLE, closed -> BAD_HANDLE, stale, slot reused -> BAD_HANDLE, another process's -> BAD_HANDLE, wait on another process's -> BAD_HANDLE".to_string(),
         "origin-kernel: ipc: too few rights: write without WRITE -> ACCESS_DENIED, read without READ -> ACCESS_DENIED, wait without WAIT -> ACCESS_DENIED, duplicate without DUPLICATE -> ACCESS_DENIED, send without TRANSFER -> ACCESS_DENIED".into(),
         "origin-kernel: ipc: rights only shrink: adding WRITE -> INVALID_ARGS, an undefined right -> INVALID_ARGS, dropping DUPLICATE -> OK, the copy cannot write -> ACCESS_DENIED, the copy can read -> SHOULD_WAIT".into(),
-        "origin-kernel: ipc: bad pointers: write from the kernel -> FAULT, from unmapped -> FAULT, across the end of mapped -> FAULT, from address 0 -> FAULT, wrapping past the top -> FAULT, from the top page -> FAULT, read into the kernel -> FAULT, into unmapped -> FAULT, into code -> FAULT, into read-only memory -> FAULT, sizes in the kernel -> FAULT, create out to the kernel -> FAULT, create out to read-only -> FAULT, duplicate out to the kernel -> FAULT, duplicate out to read-only -> FAULT, wait out to read-only -> FAULT, wait out to the kernel -> FAULT, handle list in the kernel -> FAULT, zero length names no memory -> OK, the empty message arrived -> 0x0".into(),
+        "origin-kernel: ipc: bad pointers: write from the kernel -> FAULT, from unmapped -> FAULT, across the end of mapped -> FAULT, from address 0 -> FAULT, wrapping past the top -> FAULT, from the top page -> FAULT, read into the kernel -> FAULT, into unmapped -> FAULT, into code -> FAULT, into read-only memory -> FAULT, sizes in the kernel -> FAULT, a handle record across the end of mapped -> FAULT, create out to the kernel -> FAULT, create out to read-only -> FAULT, duplicate out to the kernel -> FAULT, duplicate out to read-only -> FAULT, wait out to read-only -> FAULT, wait out to the kernel -> FAULT, handle list in the kernel -> FAULT, zero length names no memory -> OK, the empty message arrived -> 0x0".into(),
         "origin-kernel: ipc: sizes and numbers: one byte too many -> INVALID_ARGS, one handle too many -> INVALID_ARGS, no signals -> INVALID_ARGS, an undefined signal -> INVALID_ARGS, a sizes structure too small -> INVALID_ARGS, an unknown call number -> NOT_SUPPORTED, an object type not here yet -> NOT_SUPPORTED".into(),
         "origin-kernel: ipc: queues: empty -> SHOULD_WAIT, nothing by deadline 0 -> TIMED_OUT, written -> OK, readable -> OK, observed -> 0x3, 4-byte buffer -> BUFFER_TOO_SMALL, it needs -> 0x10, still there -> OK, received -> 0x10".into(),
         "origin-kernel: ipc: a full queue: the write after the last -> SHOULD_WAIT, not writable -> TIMED_OUT, writable again after a read -> OK".into(),
         "origin-kernel: ipc: a closed peer: sees PEER_CLOSED -> OK, observed -> 0x5, write -> PEER_CLOSED, the message sent before the close -> OK, read past the close -> PEER_CLOSED, READABLE will never rise -> TIMED_OUT".into(),
-        "origin-kernel: ipc: handle transfer: send -> OK, the sender's handle is gone -> BAD_HANDLE, received -> OK, with one handle -> 0x1, the moved handle writes -> OK, and the other end reads -> OK, it kept its rights -> OK".into(),
+        "origin-kernel: ipc: handle transfer: send -> OK, the sender's handle is gone -> BAD_HANDLE, received -> OK, with one handle -> 0x1, its record names a channel -> 0x4, with the rights it was sent with -> 0x73, the moved handle writes -> OK, and the other end reads -> OK, it kept its rights -> OK".into(),
         "origin-kernel: ipc: transfers that would break the graph: an end through its own channel -> INVALID_ARGS, the peer end through its own channel -> INVALID_ARGS, the same handle twice -> INVALID_ARGS, an end with another handle -> INVALID_ARGS, that end, alone again -> OK, into the first channel -> OK, a cycle through two queues -> INVALID_ARGS, a stale handle in the list -> BAD_HANDLE".into(),
         "origin-kernel: ipc: every hostile call returned its status and the process exited by itself (".into(),
         "; user-copy faults recovered: 0".into(),
@@ -1783,8 +1848,58 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
         "origin-kernel: ipc: a fault inside a user copy comes back as a failed copy, not a dead kernel: 1 fault recovered".into(),
         "origin-kernel: ipc: every process's memory, handles, channels and queued messages are gone: heap ".into(),
         "; threads run before their state existed: 0".into(),
+        "origin-kernel: ipc: a status its call does not declare reached the system-call boundary 0 times".into(),
     ]);
     markers
+}
+
+/// The proofs of process and thread objects (ADR-0005 P3, P9, P11; `ipc_proof::prove_objects`).
+fn object_markers(far: &str) -> Vec<String> {
+    let mut markers = vec![
+        "origin-kernel: ipc: a process's memory goes when its last thread is reaped, with the process object still held: 0 spaces freed while a thread ran, 1 when TERMINATED was raised".to_string(),
+        "origin-kernel: ipc: object types: a process is no channel -> WRONG_TYPE, a thread is no channel -> WRONG_TYPE, the type comes before the rights -> WRONG_TYPE, a live process -> TIMED_OUT, raises nothing -> 0x0, a live thread -> TIMED_OUT, raises nothing either -> 0x0, waiting needs WAIT -> ACCESS_DENIED, a duplicate waits -> TIMED_OUT, and cannot duplicate -> ACCESS_DENIED, a process handle travels -> OK, the sender's is gone -> BAD_HANDLE, the received one waits -> TIMED_OUT, a thread handle closes -> OK".into(),
+    ];
+    for how in ["exits", "faults"] {
+        markers.extend([
+            "origin-kernel: ipc: the waiter on a process that: woken -> OK, observed -> 0x10, and it stays raised -> OK".to_string(),
+            format!("origin-kernel: ipc: when a process {how}: TERMINATED reached the thread waiting on it on {far}, blocked "),
+        ]);
+    }
+    markers.extend([
+        "origin-kernel: ipc: a thread waiting for another thread: a thread still running -> TIMED_OUT, joined -> OK, observed -> 0x10, and it stays raised -> OK".to_string(),
+        "origin-kernel: ipc: a thread in wait_one on a process handle another thread closes completes with CANCELED".into(),
+        "origin-kernel: ipc: a thread in wait_one on a process handle another thread sends away completes with CANCELED".into(),
+        "origin-kernel: ipc: process IDs: 16 processes created and dropped in turn, each ID above the last and none of them 0: true".into(),
+        "origin-kernel: ipc: every process and thread object and all they held are gone: heap ".into(),
+    ]);
+    markers
+}
+
+/// The proof of a message's writer (ADR-0005 B1, C1, C2; `ipc_proof::prove_identity`).
+fn identity_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: ipc: a message's writer: the message written before its end moved to another process names its writer, process and principal: true; the one written after names the new writer: true; a read too small for it names the writer too: true; none names the reader: true".into(),
+        "origin-kernel: ipc: a reader that gives read_sizes' first size, 12: its read -> OK, its counts -> 7 bytes, and nothing written past them: true".into(),
+        "origin-kernel: ipc: the identity proof's processes and all they held are gone: heap ".into(),
+    ]
+}
+
+/// The process start proof (ADR-0005 P6, C1, C4-C6; `ipc_proof::prove_launch`).
+fn launch_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: start: two children launched from their creator found their start records in RDI, read-only at random addresses: each record, read back in ring 3, has its size, version, 4 entries with C6's rights, 2 arguments and 1 environment string: true; each start handle works: true; each child's message names it and its creator's principal: true; writing its record faulted there: true".into(),
+        "origin-kernel: start: the two records are at different addresses: true; a record over 64 KiB is refused: true; a launch refused after its child held a handle gives everything back: true".into(),
+        "origin-kernel: start: every launched process and all they held are gone: heap ".into(),
+    ]
+}
+
+/// The service directory proof (ADR-0005 C11, C12; ADR-0011 N9; `ipc_proof::prove_directory`).
+fn directory_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: directory: a launcher started a directory, a service and a client; the client's connect, and the request it wrote on its own end before any reply, reached the service through the directory: true; the service read that request stamped with the client's process and principal, not the directory's: true; the client read the service's reply stamped with the service's process: true".into(),
+        "origin-kernel: directory: the client's replies, read in ring 3 and decoded by the generated client: ok for the interface and major the directory holds: true; not_found (-14) for a major it does not hold: true; that connection's end reports peer_closed: true; the service answered ok for the end passed to it: true".into(),
+        "origin-kernel: directory: the directory, the service, the client and all they held are gone: heap ".into(),
+    ]
 }
 
 /// The tampered path: one byte of a SEGMENT changed on disk. The loader must refuse it, and
@@ -1924,21 +2039,35 @@ fn main() -> ExitCode {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["check"] => check(),
+        ["check"] => in_turn("check", check),
         ["unsafe-gate"] => unsafety::gate(),
-        ["build"] => build_loader(Loader::Developer).and_then(|loader| {
-            let kernel = pack_kernel(&build_kernel()?)?;
-            println!("{}\n{}", loader.display(), kernel.display());
-            Ok(())
+        ["interface-gate"] => interfaces::gate(),
+        ["regenerate"] => interfaces::regenerate(),
+        ["build"] => in_turn("build", || {
+            build_loader(Loader::Developer).and_then(|loader| {
+                let kernel = pack_kernel(&build_kernel()?)?;
+                println!("{}\n{}", loader.display(), kernel.display());
+                Ok(())
+            })
         }),
-        ["boot-test"] => boot_test(),
-        ["boot-matrix"] => boot_matrix(),
-        ["boot-x2apic"] => boot_x2apic(),
-        ["boot-console"] => boot_console(),
-        ["boot-bridge"] => boot_bridge(),
-        ["boot-legacy-free"] => boot_legacy_free(),
-        ["run"] => run(),
-        ["loom"] => loom::run(),
+        ["boot-test"] => in_turn("boot-test", boot_test),
+        ["boot-matrix"] => in_turn("boot-matrix", boot_matrix),
+        ["boot-x2apic"] => in_turn("boot-x2apic", boot_x2apic),
+        ["boot-console"] => in_turn("boot-console", boot_console),
+        ["boot-bridge"] => in_turn("boot-bridge", boot_bridge),
+        ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
+        ["run"] => in_turn("run", run),
+        ["loom"] => in_turn("loom", loom::run),
+        ["exclusive", "--", command @ ..] => {
+            let command: Vec<String> = command.iter().map(|s| (*s).to_string()).collect();
+            return match turns::exclusive(&command) {
+                Ok(code) => ExitCode::from(code),
+                Err(e) => {
+                    eprintln!("xtask: error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -1953,6 +2082,21 @@ fn main() -> ExitCode {
     }
 }
 
+/// Runs `run` in this process's turn on the machine: heavy runs go one at a time across every
+/// checkout of the repository (`turns`).
+fn in_turn(command: &str, run: impl FnOnce() -> Result) -> Result {
+    let _turn = turns::take(command)?;
+    run()
+}
+
+/// `xtask boot-test`, as a child process inside this run's turn on the machine.
+fn boot_test_child(exe: &Path) -> Command {
+    let mut command = Command::new(exe);
+    command.arg("boot-test");
+    turns::pass(&mut command);
+    command
+}
+
 /// Runs `boot-test` in a child process for each IOMMU and processor count, so each gets its
 /// own `ORIGIN_QEMU_IOMMU` and `ORIGIN_QEMU_SMP` (the environment of this process is never
 /// changed), and then [`boot_x2apic`] (the owner's decision on ADR-0008, question 3).
@@ -1961,8 +2105,7 @@ fn boot_matrix() -> Result {
     for iommu in ["intel", "amd"] {
         for cpus in [1, 2, 4] {
             println!("xtask: boot-matrix: {iommu} IOMMU, {cpus} processor(s)");
-            let status = Command::new(&exe)
-                .arg("boot-test")
+            let status = boot_test_child(&exe)
                 .env("ORIGIN_QEMU_IOMMU", iommu)
                 .env("ORIGIN_QEMU_SMP", cpus.to_string())
                 .status()
@@ -2261,8 +2404,7 @@ fn boot_console() -> Result {
 fn boot_legacy_free() -> Result {
     let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
     println!("xtask: boot-legacy-free: no 8254 and no 8042");
-    let status = Command::new(&exe)
-        .arg("boot-test")
+    let status = boot_test_child(&exe)
         .env("ORIGIN_QEMU_MACHINE", "pit=off,i8042=off")
         .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
         .status()
@@ -2285,8 +2427,7 @@ fn boot_bridge() -> Result {
     let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
     for iommu in ["intel", "amd"] {
         println!("xtask: boot-bridge: the {iommu} IOMMU, the NIC behind a PCIe root port");
-        let status = Command::new(&exe)
-            .arg("boot-test")
+        let status = boot_test_child(&exe)
             .env("ORIGIN_QEMU_IOMMU", iommu)
             .env("ORIGIN_QEMU_BRIDGE", "on")
             .status()
@@ -2316,8 +2457,7 @@ fn boot_x2apic() -> Result {
         println!(
             "xtask: boot-x2apic: processors at APIC IDs 0, 256 and 412 of 150 possible, -cpu {model} ({leaf})"
         );
-        let status = Command::new(&exe)
-            .arg("boot-test")
+        let status = boot_test_child(&exe)
             .env("ORIGIN_QEMU_TOPOLOGY", "x2apic")
             .env("ORIGIN_QEMU_CPU", model)
             .status()
@@ -2488,6 +2628,32 @@ fn check() -> Result {
         }
         run_step(cargo().args(["test", "--package", package]))?;
     }
+    // The services' logic: `no_std`, tested on the host until programs run it in ring 3 (ADR-0011
+    // N14 step 4). Clippy on the host (with tests) and, as a `no_std` build, for the kernel's
+    // target, then their tests.
+    for &package in SERVICE_LIBS {
+        run_step(cargo().args([
+            "clippy",
+            "--package",
+            package,
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
+        run_step(cargo().args([
+            "clippy",
+            "--package",
+            package,
+            "--lib",
+            "--target",
+            KERNEL_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
+        run_step(cargo().args(["test", "--package", package]))?;
+    }
     // The framework: its logic on the host (with tests), and for the kernel's own target.
     run_step(cargo().args([
         "clippy",
@@ -2553,6 +2719,7 @@ fn check() -> Result {
     dependency_check()?;
     linux_cfg_lint()?;
     unsafety::gate()?;
+    interfaces::gate()?;
     manifest_version_lint()?;
     signing_stays_off_the_os_lint()?;
     signing_has_no_secret_branches()?;

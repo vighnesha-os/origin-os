@@ -85,6 +85,7 @@ codes! {
     TooLarge = "a size exceeds the 64 KiB limit",
     SinceNotIncreasing = "declaration order must not decrease in version",
     BadSince = "a version in @since is not valid here",
+    NewerReference = "from major 1, an item names an item of its library from a later minor",
     BadHandleType = "unknown object type or right in a handle type",
     // Interfaces and methods.
     DuplicateOrdinal = "two methods have the same ordinal",

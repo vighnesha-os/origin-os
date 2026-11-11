@@ -13,6 +13,7 @@ use oidl::model::{Compilation, ConstKind};
 use oidl::{Input, codegen, compile, corpus, fingerprint};
 
 const KERNEL: &str = include_str!("../../../sdk/interfaces/origin.kernel.oidl");
+const DIRECTORY: &str = include_str!("../../../sdk/interfaces/origin.directory.oidl");
 const ECHO: &str = include_str!("fixtures/echo.oidl");
 const CALLS: &str = include_str!("fixtures/calls.oidl");
 const VERSIONS: &str = include_str!("../../../origin-version.toml");
@@ -20,6 +21,7 @@ const VERSIONS: &str = include_str!("../../../origin-version.toml");
 fn inputs() -> Vec<Input> {
     [
         ("origin.kernel.oidl", KERNEL),
+        ("origin.directory.oidl", DIRECTORY),
         ("echo.oidl", ECHO),
         ("calls.oidl", CALLS),
     ]
@@ -263,6 +265,211 @@ fn unsafe_appears_only_in_the_named_shims() {
     assert!(checked > 10, "{checked} files");
 }
 
+/// The server side alone (§11), for the crate the kernel links: the same code as the full output,
+/// less the client and the two shims, and it builds with no `unsafe` under a forbidding root.
+#[test]
+fn the_server_side_is_the_same_code_without_the_client_or_the_shims() {
+    let comp = compilation();
+    let everything = all_files(&comp);
+    let server = codegen::generate_server(&comp);
+    let interfaces: usize = comp.libraries.iter().map(|l| l.interfaces.len()).sum();
+    assert_eq!(server.len(), 2 + 2 * comp.libraries.len() + 2 * interfaces);
+    for file in &server {
+        let name = file.path.rsplit('/').next().expect("a name");
+        assert!(
+            !["client.rs", "abi.rs", "core_stubs.rs"].contains(&name),
+            "{}",
+            file.path
+        );
+        let code: String = file
+            .text
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//") && !trimmed.starts_with("#![")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("unsafe"), "{}: unsafe", file.path);
+        // Only what lists the modules differs from the full output.
+        let is_interface_mod = name == "mod.rs" && file.path.matches('/').count() == 2;
+        if file.path != "lib.rs" && !is_interface_mod {
+            assert_eq!(
+                everything.get(&format!("rust/{}", file.path)),
+                Some(&file.text),
+                "{}",
+                file.path
+            );
+        }
+    }
+    let root = server
+        .iter()
+        .find(|file| file.path == "lib.rs")
+        .expect("a crate root");
+    assert!(
+        root.text.contains("#![forbid(unsafe_code)]"),
+        "{}",
+        root.text
+    );
+
+    // It builds alone, every library of both transports, for the kernel's target.
+    let dir = scratch("server-side");
+    let files: BTreeMap<String, String> = server
+        .into_iter()
+        .map(|file| (file.path, file.text))
+        .collect();
+    write_tree(&dir, &files);
+    let mut cmd = Command::new(rustc());
+    cmd.args([
+        "--edition",
+        "2024",
+        "--crate-type",
+        "rlib",
+        "--crate-name",
+        "oidl_server",
+        "--target",
+        "x86_64-unknown-none",
+        "-D",
+        "warnings",
+        "-o",
+    ])
+    .arg(dir.join("server.rlib"))
+    .arg(dir.join("lib.rs"))
+    .current_dir(&dir);
+    run_ok(cmd, "the server side alone");
+}
+
+/// One channel library's crate (§11), for its services and their clients: its types, servers and
+/// clients exactly as the full output writes them; of the libraries it uses, directly or not, only
+/// their types; no shim and no `unsafe`; and it builds alone, for the kernel's target too.
+#[test]
+fn a_library_crate_is_its_server_and_client_and_the_types_it_uses() {
+    const ECHO_LIBRARY: &str = "origin.fixture.echo";
+    let comp = compilation();
+    let everything = all_files(&comp);
+    let files = codegen::generate_library(&comp, ECHO_LIBRARY).expect("a channel library");
+    let echo = comp
+        .libraries
+        .iter()
+        .find(|library| library.name == ECHO_LIBRARY)
+        .expect("the fixture");
+    // The fixture uses both other libraries, so each is in the crate, by its types alone.
+    assert_eq!(echo.uses.len(), 2, "{:?}", echo.uses);
+    assert_eq!(
+        files.len(),
+        2 + 2 * (echo.uses.len() + 1) + 3 * echo.interfaces.len()
+    );
+    for file in &files {
+        let name = file.path.rsplit('/').next().expect("a name");
+        assert!(
+            !["abi.rs", "core_stubs.rs"].contains(&name),
+            "{}",
+            file.path
+        );
+        let code: String = file
+            .text
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//") && !trimmed.starts_with("#![")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("unsafe"), "{}: unsafe", file.path);
+        let full = everything.get(&format!("rust/{}", file.path));
+        if file.path.starts_with("origin_fixture_echo/") || file.path == "oidl_rt.rs" {
+            assert_eq!(full, Some(&file.text), "{}", file.path);
+        } else if file.path != "lib.rs" {
+            // A used library: its types as the full output writes them, and no interface.
+            assert!(
+                name == "types.rs" || name == "mod.rs",
+                "{}: only types",
+                file.path
+            );
+            if name == "types.rs" {
+                assert_eq!(full, Some(&file.text), "{}", file.path);
+            } else {
+                assert!(
+                    file.text.contains("pub mod types;")
+                        && file.text.matches("pub mod ").count() == 1,
+                    "{}: {}",
+                    file.path,
+                    file.text
+                );
+            }
+        }
+    }
+    let clients = files
+        .iter()
+        .filter(|file| file.path.ends_with("/client.rs"))
+        .count();
+    assert_eq!(clients, echo.interfaces.len());
+    let root = files
+        .iter()
+        .find(|file| file.path == "lib.rs")
+        .expect("a crate root");
+    assert!(
+        root.text.contains("#![forbid(unsafe_code)]"),
+        "{}",
+        root.text
+    );
+
+    // A syscall library's client is the shims, and an unknown library is no library.
+    let refused = codegen::generate_library(&comp, "origin.kernel").expect_err("syscall");
+    assert!(refused.contains("syscall"), "{refused}");
+    assert!(codegen::generate_library(&comp, "origin.no.such").is_err());
+
+    // A library given but not used is left out: here one that uses only origin.kernel.
+    let mut with_other = inputs();
+    with_other.push(Input {
+        file: "other.oidl".to_string(),
+        text: b"/// o\nlibrary origin.fixture.other;\ntransport channel;\nversion 0.1;\nuse origin.kernel;\n/// i\ninterface other {\n    /// m\n    method ping = 1 () errors() requires none;\n}\n".to_vec(),
+    });
+    let wider = compile(&with_other, Some(VERSIONS)).expect("valid");
+    let other = codegen::generate_library(&wider, "origin.fixture.other").expect("channel");
+    let other_paths: Vec<&str> = other.iter().map(|file| file.path.as_str()).collect();
+    assert_eq!(
+        other_paths,
+        [
+            "lib.rs",
+            "oidl_rt.rs",
+            "origin_fixture_other/mod.rs",
+            "origin_fixture_other/other/client.rs",
+            "origin_fixture_other/other/mod.rs",
+            "origin_fixture_other/other/server.rs",
+            "origin_fixture_other/types.rs",
+            "origin_kernel/mod.rs",
+            "origin_kernel/types.rs",
+        ]
+    );
+
+    // It builds alone, for the kernel's target.
+    let dir = scratch("library-crate");
+    let tree: BTreeMap<String, String> = files
+        .into_iter()
+        .map(|file| (file.path, file.text))
+        .collect();
+    write_tree(&dir, &tree);
+    let mut cmd = Command::new(rustc());
+    cmd.args([
+        "--edition",
+        "2024",
+        "--crate-type",
+        "rlib",
+        "--crate-name",
+        "oidl_library",
+        "--target",
+        "x86_64-unknown-none",
+        "-D",
+        "warnings",
+        "-o",
+    ])
+    .arg(dir.join("library.rlib"))
+    .arg(dir.join("lib.rs"))
+    .current_dir(&dir);
+    run_ok(cmd, "a library crate alone");
+}
+
 /// The C standards the headers are compiled under: from the first with `_Static_assert` to the
 /// newest published (`docs/spec/OIDL.md` §17).
 const C_STANDARDS: &[&str] = &["c11", "c17", "c23"];
@@ -346,10 +553,15 @@ fn the_c_headers_compile_under_every_standard_from_the_oldest_to_the_newest() {
     }
     // The compilers check the layout assertions; pin one, so a removed assertion is noticed.
     let kernel = &tree.files["c/origin/kernel.h"];
-    assert!(kernel.contains("ORIGIN_OIDL_ASSERT(sizeof(origin_kernel_read_sizes_t) == 12"));
+    assert!(kernel.contains("ORIGIN_OIDL_ASSERT(sizeof(origin_kernel_read_sizes_t) == 32"));
+    assert!(kernel.contains(
+        "ORIGIN_OIDL_ASSERT(offsetof(origin_kernel_read_sizes_t, sender_principal) == 24"
+    ));
     assert!(
         kernel.contains("ORIGIN_OIDL_ASSERT(offsetof(origin_kernel_read_sizes_t, handles) == 8")
     );
+    // channel_read's handles are records, which C passes as the generated struct (ADR-0005 B3).
+    assert!(kernel.contains("origin_kernel_received_handle_t *handles, uint64_t handles_capacity"));
     // Booleans cross the C ABI as bytes (CLAUDE.md §10).
     let echo = &tree.files["c/origin/fixture/calls.h"];
     assert!(echo.contains("uint8_t e"), "{echo}");
@@ -529,7 +741,7 @@ fn the_corpus_passes_and_every_planted_fault_fails_it() {
         (
             "strings may hold NUL",
             "rust/oidl_rt.rs",
-            "let text = core::str::from_utf8(bytes).map_err(|_| WireError::Utf8)?;\n        if bytes.contains(&0) {",
+            "let text = core::str::from_utf8(bytes).map_err(|_| WireError::Utf8)?;\n        if has_nul(bytes) {",
             "let text = core::str::from_utf8(bytes).map_err(|_| WireError::Utf8)?;\n        if false {",
         ),
         (
@@ -838,7 +1050,9 @@ fn map_of(output: &str) -> BTreeMap<String, String> {
 
 #[test]
 fn the_generated_values_equal_the_hand_written_abi() {
-    use origin_abi::{Error, OK, ObjectType, limits, read_sizes, rights, signals, syscall};
+    use origin_abi::{
+        Error, OK, ObjectType, limits, read_sizes, received_handle, rights, signals, syscall,
+    };
     let tree = tree();
     let out = run_program(
         &tree.dir,
@@ -933,6 +1147,34 @@ fn the_generated_values_equal_the_hand_written_abi() {
     assert_eq!(
         map["read_sizes HANDLES_AT"],
         read_sizes::HANDLES_AT.to_string()
+    );
+    assert_eq!(
+        map["read_sizes BASE_SIZE"],
+        read_sizes::BASE_SIZE.to_string()
+    );
+    assert_eq!(
+        map["read_sizes SENDER_PROCESS_AT"],
+        read_sizes::SENDER_PROCESS_AT.to_string()
+    );
+    assert_eq!(
+        map["read_sizes SENDER_PRINCIPAL_AT"],
+        read_sizes::SENDER_PRINCIPAL_AT.to_string()
+    );
+    assert_eq!(
+        map["received_handle SIZE"],
+        received_handle::SIZE.to_string()
+    );
+    assert_eq!(
+        map["received_handle HANDLE_AT"],
+        received_handle::HANDLE_AT.to_string()
+    );
+    assert_eq!(
+        map["received_handle OBJECT_TYPE_AT"],
+        received_handle::OBJECT_TYPE_AT.to_string()
+    );
+    assert_eq!(
+        map["received_handle RIGHTS_AT"],
+        received_handle::RIGHTS_AT.to_string()
     );
     assert_eq!(
         map["handle INVALID"],
@@ -1125,6 +1367,33 @@ fn the_command_line_checks_generates_and_guards_the_lock() {
     assert!(out_dir.join("c/origin/kernel.h").is_file());
     assert!(out_dir.join("abi/origin.kernel.fingerprint").is_file());
     assert!(out_dir.join("corpus/origin.kernel.corpus").is_file());
+
+    // The server side alone: a crate at the top of the directory, and nothing else.
+    let server_dir = cli.dir.join("server");
+    let server_out = server_dir.display().to_string();
+    let mut args = vec![
+        "generate",
+        "--server-only",
+        "--versions",
+        &versions,
+        "--out",
+        &server_out,
+    ];
+    args.extend(files.iter().map(String::as_str));
+    let (ok, text) = cli.run(&args);
+    assert!(ok, "{text}");
+    assert!(server_dir.join("lib.rs").is_file());
+    assert!(server_dir.join("origin_kernel/kernel/server.rs").is_file());
+    for absent in [
+        "rust",
+        "c",
+        "abi",
+        "corpus",
+        "doc",
+        "origin_kernel/kernel/abi.rs",
+    ] {
+        assert!(!server_dir.join(absent).exists(), "{absent}");
+    }
 
     // A missing lock is an error until it is created with --update.
     let lock = cli.dir.join("oidl.lock").display().to_string();

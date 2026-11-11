@@ -23,8 +23,12 @@ bench = false
 [dependencies]
 origin-abi = { path = "../runtime/abi" }
 origin-boot-info.workspace = true
+# The service directory's generated client and stub: the directory boot proof makes its ring-3
+# programs' messages with them (ipc_proof/directory.rs).
+origin-directory = { path = "../sdk/directory" }
 origin-frame = { path = "frame" }
 origin-paging = { path = "paging" }
+origin-syscalls = { path = "syscalls" }
 origin-version.workspace = true
 
 [lints]

@@ -5,8 +5,8 @@
 | As of | 2026-11-09, on `main`, after the pre-merge review. Everything that was on a side branch is merged. |
 | Checked against | CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. |
 | Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 32–38 and 40–69. |
-| Still open | Items 30, 31 and 39 below. Buying machines is off for now (ADR-0009's update of 2026-11-09). |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. |
+| Still open | No item. Buying machines is off for now (ADR-0009's update of 2026-11-09). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
 
@@ -112,8 +112,8 @@ ADR-0009 H6 asked for a console that does not depend on a 16550 at `0x3F8`. The 
 
 | # | Question | Recommendation | Why |
 |---|---|---|---|
-| 30 | ADR-0007 question 10: clear bus mastering on every function at enumeration (I12), bridges included, and leave an AMD IOMMU's own function alone until hardware shows what it needs? | **Accept** | §32 and §58. It is built and boot-proven, and it merged on your word. It may stop firmware-owned controllers (USB legacy, a firmware framebuffer) until drivers or exceptions exist, which hardware must settle (§74). |
-| 31 | The Loom download went beyond what you approved: 26 crate files and 3.36 MiB, against the 24 and 3.09 MiB you were told, and `memchr` and `aho-corasick` were said not to be fetched | **Accept** | §5. All are host-only and no shipping crate reaches them, and since the review they sit outside the kernel's workspace. The record should match what happened. |
+| 30, answered | ADR-0007 question 10: clear bus mastering on every function at enumeration (I12), bridges included, and leave an AMD IOMMU's own function alone until hardware shows what it needs? | **Accepted by the owner, 2026-11-09** | §32 and §58. It is built and boot-proven, and it merged on your word. It may stop firmware-owned controllers (USB legacy, a firmware framebuffer) until drivers or exceptions exist, which hardware must settle (§74). |
+| 31, answered | The Loom download went beyond what you approved: 26 crate files and 3.36 MiB, against the 24 and 3.09 MiB you were told, and `memchr` and `aho-corasick` were said not to be fetched | **Accepted by the owner, 2026-11-09** | §5. All are host-only and no shipping crate reaches them, and since the review they sit outside the kernel's workspace. The record should match what happened. |
 | 32, answered | Add CI: a GitHub workflow running `cargo xtask check` and the boot tests on every pull request? | **Yes: the owner's decision, 2026-11-09** | §8 and §82 put CI in M0, and until then every gate depended on one Mac. §80 forbids silent external costs, so it needed the owner's word. It uses only GitHub's standard runners, free for this public repository. Built in `.github/workflows/ci.yml`, with the boots on a real processor through KVM as well as on QEMU's software CPU. A trial branch first booted the kernel on a real AMD EPYC on those runners (`docs/research/2026-11-09-testing-without-buying-hardware.md`) and showed costs QEMU's software CPU had hidden. |
 
 ## The native SDK (ADR-0011): Accepted 2026-11-09, nothing built
@@ -128,7 +128,7 @@ Every recommendation below was checked against the whole of CLAUDE.md. The secti
 | 36, answered | A small original interface language (N7)? | **Yes** | One source of truth for Rust, C, IPC, the kernel's calls and documentation (§42, §49). Adopting one would put third-party generated code in the runtime (§3, §5). |
 | 37, answered | Kernel-stamped caller identity on every channel message (N9, an ADR-0005 amendment)? | **Yes** | §30 and §48 require authenticated IPC, and a capability says what may be done, not who asked. |
 | 38, answered | Each system-call number accepted only from its own address in `origin.core` (N5)? | **Yes** | Enforces §42's private door. It is hardening, not authorization (§58). |
-| 39 | If accepted, will you amend CLAUDE.md §48 and §70 to say this? | Your text, your call | Claude has not changed the directive. |
+| 39, answered | If accepted, will you amend CLAUDE.md §48 and §70 to say this? | **Yes, with Claude drafting the wording and the owner approving it before it goes in (2026-11-09)** | The owner approved the wording the same day; it is CLAUDE.md revision 7.2, and 7.1 is kept at `docs/engineering/CLAUDE-v7.1.md`. |
 
 ## The interface language (OIDL): accepted 2026-11-09, as recommended
 
@@ -167,7 +167,7 @@ CI caught one processor's TSC stepping back by 16 ticks on an EPYC 9V45 under KV
 
 ## ADR-0011 N14 step 3: caller identity, the start record, the directory, memory objects and ports (Accepted 2026-11-09)
 
-Step 3 adds system calls and structures, so these are ABI and format decisions (CLAUDE.md §84). The owner accepted all thirteen with the recommended answer on 2026-11-09 ("Accept all 13"). They are ADR-0005 Amendment 4, C1–C13; the scoping is `docs/research/2026-11-09-n14-step3-scope.md`. Not built.
+Step 3 adds system calls and structures, so these are ABI and format decisions (CLAUDE.md §84). The owner accepted all thirteen with the recommended answer on 2026-11-09 ("Accept all 13"). They are ADR-0005 Amendment 4, C1–C13; the scoping is `docs/research/2026-11-09-n14-step3-scope.md`. C1–C3 are built (task S3-2, 2026-11-10: a message's writer and handle records), C4–C6 (task S3-3, 2026-11-10: the start record and its launch path), and C11 and C12 (task S3-4, 2026-11-10: `not_found` and the service directory, `origin.directory` 0.1); the rest are not.
 
 | # | Question | Answer |
 |---|---|---|
@@ -193,4 +193,29 @@ UEFI added two memory attributes after 2.7 that a 2026+ kernel must respect, and
 |---|---|---|
 | 69, answered | After the landing, make the loader honour `EFI_MEMORY_SP` (UEFI 2.8) and `EFI_MEMORY_HOT_PLUGGABLE` (UEFI 2.11): conventional memory carrying either becomes its own region kind, `SpecificPurpose` or `HotPluggable`, which the kernel neither allocates from nor direct-maps (boot info 0.5)? | **Yes, after the landing (2026-11-09)** |
 
+## How work lands (2026-11-09)
+
+Work reaches `main` through pull requests, and merging each one takes the owner's word. Until this decision each task opened its own pull request, so the owner was asked to merge pull requests of 1 to 14 commits.
+
+| # | Question | Answer |
+|---|---|---|
+| 70, answered | Offer a pull request for review only once it carries at least 100 commits? | **Yes: "create PRs with minimum 100 commits" (2026-11-09)** |
+
+What this means in practice:
+
+- Tasks collect on one landing branch per batch, as a draft pull request. CI runs on every push to it, so each task is tested, including the real-CPU boots, as it arrives. The first batch is ADR-0011 N14 step 3, pull request 13.
+- Commits are small and self-contained: each one builds and passes its tests.
+- Merge commits from `main` don't count toward the 100, and nothing is padded to reach it (CLAUDE.md §7).
+- Merging still takes the owner's word.
+
 **Later:** the Microsoft signature for the first-stage loader (ADR-0002 B7), once that stage exists; USB-IF and Thunderbolt licensing (§35), when that work starts.
+
+## ADR-0004 H2: the heap, the stacks and the probe page (Accepted 2026-11-10)
+
+The independent review of S3-5a found that ADR-0004 H2's table puts the kernel heap and stacks at `0xFFFF_C000_0000_0000`, while the code keeps both in the direct map. Changing an accepted ADR is the owner's decision. The owner answered **"Accept all"** on 2026-11-10. These are ADR-0004 Amendment 1, A1–A3. They are numbered from 98 because items 71–97 are in use on the `docs/editions-device-sdk` branch, which has not been merged yet.
+
+| # | Question | Answer |
+|---|---|---|
+| 98, answered | A1: amend H2 so the kernel heap stays in the direct map, as the code has it (no mapping work or shootdown when it is freed, and the large pages kept)? | **Accept** |
+| 99, answered | A2: keep H2 for the stacks, and move them to `0xFFFF_C000_0000_0000` with guard pages in virtual space, as a task of their own that the framework session starts now? | **Accept** |
+| 100, answered | A3: record PML4 slot 480 (`0xFFFF_F000_0000_0000`), the kernel-half proof's probe page, in H2's table? | **Accept** |

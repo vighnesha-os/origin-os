@@ -160,6 +160,8 @@ pub mod virtqueue;
 // The kernel proper, for its own target only: the boot flow and the services, on the
 // framework's typed interfaces.
 #[cfg(target_os = "none")]
+mod aspace;
+#[cfg(target_os = "none")]
 mod block;
 #[cfg(target_os = "none")]
 mod console;
@@ -175,6 +177,8 @@ mod ipc_proof;
 mod irq;
 #[cfg(target_os = "none")]
 mod kernel;
+#[cfg(target_os = "none")]
+mod launch;
 #[cfg(target_os = "none")]
 mod pcie;
 #[cfg(target_os = "none")]

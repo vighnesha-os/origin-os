@@ -1,5 +1,5 @@
-//! Kernel channels (ADR-0005 P1, P2, P8, P9): the objects handles name, the moves between
-//! handle tables and queues, and blocking until a signal.
+//! Kernel objects and channels (ADR-0005 P1, P2, P3, P8, P9): the objects handles name, the
+//! moves between handle tables and queues, and blocking until a signal on any of them.
 //!
 //! The queues and limits are the library's `framekernel::channel`; this module adds the
 //! locks, the handle moves, the waiting and the lifetime:
@@ -27,26 +27,88 @@
 #![forbid(unsafe_code)]
 
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use crate::channel::{Channel, Message, QUEUE_BYTES, QUEUE_DEPTH, ReadError, other};
-use crate::handles::HandleTable;
+use crate::channel::{Channel, Identity, Message, QUEUE_BYTES, QUEUE_DEPTH, ReadError, other};
+use crate::handles::{HandleTable, Need, Typed};
 use crate::heap::{MAX_BLOCK, MIN_BLOCK, PAGE};
-use origin_abi::{Error, Handle, rights};
+use origin_abi::{Error, Handle, ObjectType};
 use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
 
 use crate::cpu::without_interrupts;
-use crate::process::Account;
+use crate::process::{Account, Process, ThreadObject};
 use crate::wait::WaitQueue;
 
-/// What a handle names (ADR-0005 P3; only channels exist so far).
+/// What a handle names (ADR-0005 P3; channels, processes and threads so far).
 #[derive(Clone)]
 pub(crate) enum Object {
     /// One end of a channel.
     Channel(ChannelEnd),
+    /// A process.
+    Process(ObjectRef<Process>),
+    /// A thread.
+    Thread(ObjectRef<ThreadObject>),
+}
+
+impl Typed for Object {
+    fn object_type(&self) -> u32 {
+        (match self {
+            Self::Channel(_) => ObjectType::Channel,
+            Self::Process(_) => ObjectType::Process,
+            Self::Thread(_) => ObjectType::Thread,
+        }) as u32
+    }
+}
+
+/// What a wait, or the wake-up of one, needs of an object: counted references that keep its
+/// signals and its waiters alive, and are not one more handle to it (an end's reference count
+/// is what closes it).
+enum Waitable {
+    /// A channel and which of its two sides.
+    Channel(ObjectRef<KernelChannel>, usize),
+    /// A process.
+    Process(ObjectRef<Process>),
+    /// A thread.
+    Thread(ObjectRef<ThreadObject>),
+}
+
+impl Waitable {
+    fn of(object: &Object) -> Self {
+        match object {
+            Object::Channel(end) => Self::Channel(end.channel.clone(), end.side),
+            Object::Process(process) => Self::Process(process.clone()),
+            Object::Thread(thread) => Self::Thread(thread.clone()),
+        }
+    }
+
+    /// The signals the object has raised.
+    fn signals(&self) -> u32 {
+        match self {
+            Self::Channel(channel, side) => {
+                without_interrupts(|| channel.state.lock().signals(*side))
+            }
+            Self::Process(process) => process.termination().signals(),
+            Self::Thread(thread) => thread.termination().signals(),
+        }
+    }
+
+    /// The threads waiting on it.
+    fn waiters(&self) -> Option<&WaitQueue> {
+        match self {
+            Self::Channel(channel, side) => channel.waiters.get(*side),
+            Self::Process(process) => Some(process.termination().waiters()),
+            Self::Thread(thread) => Some(thread.termination().waiters()),
+        }
+    }
+
+    /// Wakes everything waiting on it.
+    fn wake(&self) {
+        if let Some(waiters) = self.waiters() {
+            note_cross_cpu_wakes(waiters.wake_all());
+        }
+    }
 }
 
 /// A handle in a message: its object and its rights, preserved in transit (P2).
@@ -71,7 +133,7 @@ fn heap_block(bytes: usize) -> usize {
 /// What a queued message cost its sender. Its drop is the refund, when the message leaves the
 /// queue: read, or left behind when the end it was queued for closed.
 struct Charge {
-    account: Arc<Account>,
+    account: ObjectRef<Account>,
     bytes: usize,
 }
 
@@ -148,7 +210,7 @@ pub(crate) struct KernelChannel {
     /// Whether this channel is on that list.
     listed: AtomicBool,
     /// Its creator's account, charged once for this channel's lifetime.
-    account: Arc<Account>,
+    account: ObjectRef<Account>,
 }
 
 impl Drop for KernelChannel {
@@ -176,16 +238,20 @@ static CLOSED_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Wake-ups of threads blocked on another processor, for the boot proof.
 static CROSS_CPU_WAKES: AtomicU64 = AtomicU64::new(0);
 
-/// How many blocked threads a channel operation woke on another processor (by IPI).
+/// How many blocked threads an operation woke on another processor (by IPI).
 pub(crate) fn cross_cpu_wakes() -> u64 {
     CROSS_CPU_WAKES.load(Ordering::Relaxed)
+}
+
+/// Counts `woken` wake-ups that crossed processors, for the boot proof.
+pub(crate) fn note_cross_cpu_wakes(woken: usize) {
+    CROSS_CPU_WAKES.fetch_add(woken as u64, Ordering::Relaxed);
 }
 
 /// Wakes everything waiting on `side`.
 fn wake(channel: &KernelChannel, side: usize) {
     if let Some(waiters) = channel.waiters.get(side) {
-        let crossed = waiters.wake_all();
-        CROSS_CPU_WAKES.fetch_add(crossed as u64, Ordering::Relaxed);
+        note_cross_cpu_wakes(waiters.wake_all());
     }
 }
 
@@ -255,7 +321,9 @@ pub(crate) fn reap_closed() {
 }
 
 /// Creates a channel charged to `account`: its two ends, or why not.
-pub(crate) fn create_channel(account: &Arc<Account>) -> Result<(ChannelEnd, ChannelEnd), Error> {
+pub(crate) fn create_channel(
+    account: &ObjectRef<Account>,
+) -> Result<(ChannelEnd, ChannelEnd), Error> {
     account.charge_channel()?;
     let refund = || account.refund_channel();
     let state = Channel::try_new(QUEUE_DEPTH, QUEUE_BYTES).inspect_err(|_| refund())?;
@@ -286,15 +354,19 @@ pub(crate) fn create_channel(account: &Arc<Account>) -> Result<(ChannelEnd, Chan
     Ok((first, second))
 }
 
-/// Which object `handle` names, if it is a channel and has `need`.
+/// The channel and side `handle` names, if it meets `need` and names a channel. Every call
+/// that reaches here asks for a channel, so a handle to anything else already failed the lookup;
+/// this answer is for a definition that stopped asking.
 fn channel_of(
     table: &HandleTable<Object>,
     handle: Handle,
-    need: u32,
+    need: Need,
 ) -> Result<(ObjectRef<KernelChannel>, usize), Error> {
     let (object, _) = table.get(handle, need)?;
-    let Object::Channel(end) = object;
-    Ok((end.channel.clone(), end.side))
+    match object {
+        Object::Channel(end) => Ok((end.channel.clone(), end.side)),
+        Object::Process(_) | Object::Thread(_) => Err(Error::WrongType),
+    }
 }
 
 /// Whether `target` is the end `(channel, side)` or holds it, through up to
@@ -324,32 +396,44 @@ fn inside(
 }
 
 /// `channel_write`: queues `bytes` and moves the handles in `transfer` out of `table`, or
-/// does nothing and says why.
+/// does nothing and says why. `need` is what the end must meet, and `transfer_need` what each
+/// listed handle must. The message carries `sender`, the writing process's identity, which
+/// the caller takes from that process and never from what the writer passed (ADR-0005 B1).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one fact the write needs"
+)]
 pub(crate) fn channel_write(
     table: &SpinLock<HandleTable<Object>>,
-    account: &Arc<Account>,
+    account: &ObjectRef<Account>,
+    sender: Identity,
     handle: Handle,
+    need: Need,
     bytes: Vec<u8>,
     transfer: &[Handle],
+    transfer_need: Need,
 ) -> Result<(), Error> {
     // Threads blocked on a handle this message takes away must wake and see it gone (P9),
     // and that happens after the locks are released.
-    let mut moved_ends: Vec<EndId> = Vec::new();
-    moved_ends
+    let mut moved_away: Vec<Waitable> = Vec::new();
+    moved_away
         .try_reserve_exact(transfer.len())
         .map_err(|_| Error::NoMemory)?;
     let wake_side = without_interrupts(|| {
         let mut table = table.lock();
-        let (channel, side) = channel_of(&table, handle, rights::WRITE)?;
+        let (channel, side) = channel_of(&table, handle, need)?;
         let reader = other(side);
-        table.check_all(transfer, rights::TRANSFER)?;
+        table.check_all(transfer, transfer_need)?;
         // An end may be sent only if that keeps every end reachable (amendment A3). Every
-        // listed handle was just checked to exist.
+        // listed handle was just checked to exist. Only an end can be held in a queue and so
+        // be part of a cycle of queues: other objects are just carried.
         let moves_an_end = !transfer.is_empty();
         let _order = moves_an_end.then(|| TRANSFERS.lock());
         for &value in transfer {
-            let (object, _) = table.get(value, 0)?;
-            let Object::Channel(end) = object;
+            let (object, _) = table.get(value, Need::NOTHING)?;
+            let Object::Channel(end) = object else {
+                continue;
+            };
             let references = end.channel.open.get(end.side);
             if ObjectRef::same(&end.channel, &channel)
                 || references.is_none_or(|n| n.load(Ordering::Relaxed) != 1)
@@ -367,18 +451,20 @@ pub(crate) fn channel_write(
             account: account.clone(),
             bytes: cost,
         };
-        let moved = table.take_all(transfer, rights::TRANSFER)?;
+        let moved = table.take_all(transfer, transfer_need)?;
         // The reader's queue holds them now, recorded before anyone can see the message.
         for (object, _) in &moved {
-            let Object::Channel(end) = object;
-            if let Some(holder) = end.channel.holder.get(end.side) {
+            if let Object::Channel(end) = object
+                && let Some(holder) = end.channel.holder.get(end.side)
+            {
                 *holder.lock() = Some((channel.clone(), reader));
             }
-            moved_ends.push((end.channel.clone(), end.side));
+            moved_away.push(Waitable::of(object));
         }
         let message = Message {
             bytes,
             handles: moved,
+            sender,
         };
         // Beside the message, in step with the queue; its storage was taken at creation.
         if let Some(list) = channel.charges.lock().get_mut(reader) {
@@ -403,45 +489,69 @@ pub(crate) fn channel_write(
         return Err(error);
     }
     wake(&channel, reader);
-    for (end, side) in &moved_ends {
-        wake(end, *side);
+    for target in &moved_away {
+        target.wake();
     }
     Ok(())
 }
 
+/// A handle `channel_read` put in the reader's table, with what the table holds for it: the
+/// record the reader receives (ADR-0005 B3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Received {
+    /// Its value in the reader's table.
+    pub(crate) handle: Handle,
+    /// The type of the object it names.
+    pub(crate) object_type: u32,
+    /// Its rights there: the ones it had in the message.
+    pub(crate) rights: u32,
+}
+
 /// What a `channel_read` found.
 pub(crate) enum Read {
-    /// A message, now out of the queue, with the values of its handles in the reader's table.
+    /// A message, now out of the queue, with its handles in the reader's table.
     Message {
         /// The payload.
         bytes: Vec<u8>,
-        /// The handles' new values.
-        handles: Vec<Handle>,
+        /// The handles, as the reader's table now holds them.
+        handles: Vec<Received>,
+        /// Who wrote it (B1).
+        sender: Identity,
     },
-    /// The next message does not fit; it stays queued. Its sizes.
+    /// The next message does not fit; it stays queued. Its sizes and its writer.
     TooSmall {
         /// Bytes of the message.
         bytes: usize,
         /// Handles with it.
         handles: usize,
+        /// Who wrote it.
+        sender: Identity,
     },
 }
 
-/// `channel_read`: the next message, its handles moved into `table`.
+/// `channel_read`: the next message, its handles moved into `table`. `need` is what the end
+/// must meet.
 pub(crate) fn channel_read(
     table: &SpinLock<HandleTable<Object>>,
     handle: Handle,
+    need: Need,
     byte_capacity: usize,
     handle_capacity: usize,
 ) -> Result<Read, Error> {
     let read = without_interrupts(|| {
         let mut table = table.lock();
-        let (channel, side) = channel_of(&table, handle, rights::READ)?;
+        let (channel, side) = channel_of(&table, handle, need)?;
         let mut state = channel.state.lock();
-        let (bytes, handles) = state.peek(side)?;
+        let next = state.peek(side)?;
+        let (bytes, handles, sender) = (next.bytes.len(), next.handles.len(), next.sender);
         if bytes > byte_capacity || handles > handle_capacity {
             drop(state);
-            return Ok((None, Read::TooSmall { bytes, handles }, None));
+            let too_small = Read::TooSmall {
+                bytes,
+                handles,
+                sender,
+            };
+            return Ok((None, too_small, None));
         }
         // Room for its handles first: if the table is full, or memory is out, the message
         // stays queued.
@@ -465,12 +575,18 @@ pub(crate) fn channel_read(
         drop(state);
         let mut incoming = message.handles.into_iter();
         for (object, entry_rights) in incoming.by_ref() {
-            let Object::Channel(end) = &object;
-            if let Some(holder) = end.channel.holder.get(end.side) {
+            if let Object::Channel(end) = &object
+                && let Some(holder) = end.channel.holder.get(end.side)
+            {
                 *holder.lock() = None;
             }
+            let object_type = object.object_type();
             match table.insert(object, entry_rights) {
-                Ok(h) => values.push(h),
+                Ok(handle) => values.push(Received {
+                    handle,
+                    object_type,
+                    rights: entry_rights,
+                }),
                 // `reserve` above makes this unreachable. Were it reached, nothing may
                 // close here, under the table lock: the objects are leaked instead.
                 Err((e, object)) => {
@@ -483,6 +599,7 @@ pub(crate) fn channel_read(
         let read = Read::Message {
             bytes: message.bytes,
             handles: values,
+            sender: message.sender,
         };
         Ok::<_, Error>((Some((channel, other(side))), read, charge))
     })?;
@@ -498,26 +615,25 @@ pub(crate) fn channel_read(
 pub(crate) fn handle_close(
     table: &SpinLock<HandleTable<Object>>,
     handle: Handle,
+    need: Need,
 ) -> Result<(), Error> {
-    let (object, _) = without_interrupts(|| table.lock().remove(handle, 0))?;
+    let (object, _) = without_interrupts(|| table.lock().remove(handle, need))?;
     // The handle is gone from the table: a waiter on it sees that when it is woken here. If
-    // this was the end's last reference, the drop below closes the end and wakes its peer.
-    let Object::Channel(end) = &object;
-    wake(&end.channel, end.side);
+    // this was an end's last reference, the drop below closes the end and wakes its peer.
+    Waitable::of(&object).wake();
     drop(object);
     Ok(())
 }
 
-/// `duplicate`: a new handle with `new_rights`, which may only remove rights (P2).
+/// `duplicate`: a new handle with `new_rights`, which may only remove rights (P2). The decoder
+/// has refused a right the definition does not declare.
 pub(crate) fn handle_duplicate(
     table: &SpinLock<HandleTable<Object>>,
     handle: Handle,
+    need: Need,
     new_rights: u32,
 ) -> Result<Handle, Error> {
-    if new_rights & !rights::ALL != 0 {
-        return Err(Error::InvalidArgs);
-    }
-    without_interrupts(|| table.lock().duplicate(handle, new_rights))
+    without_interrupts(|| table.lock().duplicate(handle, need, new_rights))
 }
 
 /// What ended a `wait_one`.
@@ -530,23 +646,30 @@ pub(crate) struct Waited {
     pub(crate) blocked: u64,
 }
 
-/// `wait_one`: blocks until a signal in `mask` is raised on `handle`'s object, the monotonic
-/// clock reaches `deadline`, or `handle` is closed (P9).
+/// `wait_one`: blocks until a signal in `mask` is raised on `handle`'s object, of any type, the
+/// monotonic clock reaches `deadline`, or `handle` is closed (P9). `need` is what the handle
+/// must meet.
 pub(crate) fn wait_one(
     table: &SpinLock<HandleTable<Object>>,
     waiting: &AtomicU32,
     handle: Handle,
+    need: Need,
     mask: u32,
     deadline: u64,
 ) -> Result<Waited, Error> {
-    let (channel, side) = without_interrupts(|| channel_of(&table.lock(), handle, rights::WAIT))?;
-    let waiters = channel.waiters.get(side).ok_or(Error::BadHandle)?;
+    let target = without_interrupts(|| {
+        table
+            .lock()
+            .get(handle, need)
+            .map(|(object, _)| Waitable::of(object))
+    })?;
+    let waiters = target.waiters().ok_or(Error::BadHandle)?;
     waiting.fetch_add(1, Ordering::Release);
-    let signals = || without_interrupts(|| channel.state.lock().signals(side));
-    let still_open = || without_interrupts(|| table.lock().get(handle, 0).is_ok());
-    let result = waiters.wait_until_deadline(|| signals() & mask != 0 || !still_open(), deadline);
+    let still_open = || without_interrupts(|| table.lock().get(handle, Need::NOTHING).is_ok());
+    let result =
+        waiters.wait_until_deadline(|| target.signals() & mask != 0 || !still_open(), deadline);
     waiting.fetch_sub(1, Ordering::AcqRel);
-    let observed = signals();
+    let observed = target.signals();
     let status = if !still_open() {
         Err(Error::Canceled)
     } else if result.is_err() {
@@ -555,7 +678,7 @@ pub(crate) fn wait_one(
         Ok(())
     };
     let blocked = result.unwrap_or(0);
-    drop(channel);
+    drop(target);
     Ok(Waited {
         status,
         observed,

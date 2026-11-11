@@ -21,12 +21,15 @@ members = [
     "framekernel/frame",
     "framekernel/frame/sync",
     "framekernel/paging",
+    "framekernel/syscalls",
     "runtime/abi",
     "runtime/onbf/format",
     "runtime/onbf/merkle",
     "runtime/onbf/verify",
     "runtime/version",
+    "sdk/directory",
     "security/crypto",
+    "services/directory",
 ]
 # Host-buildable crates only. The UEFI loader's and the Framekernel's binaries cannot be
 # built for the host.
@@ -39,6 +42,7 @@ default-members = [
     "framekernel/frame",
     "framekernel/frame/sync",
     "framekernel/paging",
+    "framekernel/syscalls",
     "runtime/abi",
     "runtime/onbf/format",
     "runtime/onbf/merkle",

@@ -4,11 +4,12 @@
 |---|---|
 | Document | `docs/spec/OIDL.md` |
 | Version | 1 |
-| Status | **Accepted by the owner on 2026-11-09**: questions Q1–Q12 answered with the recommended option of each (CLAUDE.md §84). The grammar, the fixed-layout wire format and the handshake are decided. The generator exists, and its output is not yet in the tree: **the kernel does not use it**, and adopting it is a later step (ADR-0011 N14) |
+| Status | **Accepted by the owner on 2026-11-09**: questions Q1–Q12 answered with the recommended option of each (CLAUDE.md §84). The grammar, the fixed-layout wire format and the handshake are decided. The generator exists, and its output is in the tree: the kernel's system calls (`framekernel/syscalls`, since task S3-0) and the service directory's interface (`sdk/directory`, task S3-4) |
 | Requires | ADR-0011 N3, N4, N5, N7, N8, N9, N10, N13; ADR-0005 P1, P2, P4, P5, P8, P12, amendments A1–A6, B1, B2, B3; ONBF-R7, ONBF-R8; CLAUDE.md §3, §5, §10, §13, §30, §42, §45, §49, §62, §63, §84 |
-| Implementation | `developer-tools/oidl` (host only). First consumer: `sdk/interfaces/origin.kernel.oidl` |
+| Implementation | `developer-tools/oidl` (host only). Consumers: `sdk/interfaces/origin.kernel.oidl` and `sdk/interfaces/origin.directory.oidl` |
 | Evidence | `docs/research/2026-11-09-native-sdk.md`, `docs/research/2026-11-09-oidl-wire-format.md`, and the comparison with the hand-written ABI, `docs/engineering/OIDL_KERNEL_COMPARISON.md` |
 | Compatibility | Every byte layout here is revision 1 of the format, accepted by the owner on 2026-11-09. A change to any of them needs the owner's acceptance again (CLAUDE.md §84) |
+| Revisions | 2026-11-10: plain structs of integers, enums and bits as `syscall` vector and array elements (§3.1, §10), ADR-0005 C3, accepted by the owner on 2026-11-09 (decision sheet item 58). Existing definitions and the `channel` wire format are unchanged. 2026-11-10: the fingerprint names a library's own `sized struct` with its size at the minor described (§13), as §9 requires; the owner asked for the fix. 2026-11-10: from major 1, an item may not name one of its library's items from a later minor (§9). 2026-11-10: `--library`, one channel library's bindings as a crate of their own (§11) and a lock per library (§13), for the service directory; §7.4 records that `channel_read` reports handle records. Tools only: no format changes |
 
 The keywords MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
@@ -55,7 +56,7 @@ Every limit is checked before the work it guards. The struct-nesting limit is wh
 
 **Comments.** `//` to the end of the line is ignored. A line comment that begins with exactly three slashes is a **doc comment**: it belongs to the next declaration, and it may appear only before something that can carry documentation. Doc text is trimmed, and it MUST NOT contain `*/` or `/*`, because it is copied into C block comments, or a code fence (three backticks or three tildes), because it is copied into Rust doc comments and `rustdoc --test` would run a fenced block as code. Trimming keeps an indented line from becoming an indented code block for the same reason. Four or more slashes make an ordinary comment.
 
-**Identifiers** are `[a-z][a-z0-9_]*`: lower-case only, no leading or trailing `_`, and no `__`, so that generated names are mechanical. The tool refuses a name that is a keyword of Rust, of C through C23, or of C++ through C++26, that begins with `oidl_`, or that would collide with another name once it is converted to `PascalCase` or `SHOUTY_CASE` (`foo_1` and `foo1` collide). A few names are reserved for what the generator emits: the `PascalCase` forms `Error`, `Handle`, `Result` and the like, the type words (`u8` … `i64`, `bool`, `handle`, `optional`, `array`, `vector`, `string`) for items, `types` for an interface, and `holds`, `connect` and `transport` for a method.
+**Identifiers** are `[a-z][a-z0-9_]*`: lower-case only, no leading or trailing `_`, and no `__`, so that generated names are mechanical. The tool refuses a name that is a keyword of Rust, of C through C23, or of C++ through C++26, that begins with `oidl_`, or that would collide with another name once it is converted to `PascalCase` or `SHOUTY_CASE` (`foo_1` and `foo1` collide). A few names are reserved for what the generator emits: the `PascalCase` forms `Error`, `Handle`, `Result` and the like, the type words (`u8` … `i64`, `bool`, `handle`, `optional`, `array`, `vector`, `string`) for items, `types` for an interface, and `holds` and `transport` for a method. (A generated client's hello is `new`, already a C++ keyword. Until 2026-11-10 it was `connect`, which took that name from every interface, and C12's directory needs it.)
 
 **Numbers** are decimal or `0x` hexadecimal, up to 64 bits, with `_` allowed between digits. A decimal number has no leading zero. A number is negated with a leading `-` only where a value is expected.
 
@@ -148,7 +149,7 @@ There is no floating-point type, union or nullable pointer in this revision. A l
 
 Nesting is never variable-length, so no decoder recurses over message data, and no generated structure holds a pointer.
 
-In a `syscall` library the elements of a `vector` or `array` are integers or handles only, because those cross as their in-memory form. A struct element would need the compiler's layout (§42); an interface that wants one passes a pointer to a struct instead.
+In a `syscall` library the elements of a `vector` or `array` are integers, handles, or plain structs whose fields are integers, enums and bits (ADR-0005 C3). Integers and handles cross as their in-memory form. A struct element crosses as its fields, each at its §5.3 offset with zero padding, and never in a compiler's layout (§42): the Rust client encodes and decodes each element field by field, the kernel's server reads each one as a fixed-size value, and in C each element is the generated struct, whose layout the header's assertions pin to the same bytes. A `bool`, a nested struct, an array or a handle inside the element is refused. A vector of structs is at most 64 KiB at its bound, because the client encodes it into a buffer of that size.
 
 ---
 
@@ -307,7 +308,7 @@ Handles are out of band: the kernel moves them with the message, in the message'
 
 Handles are consumed in field order, starting from 0. So every present slot is exactly determined: the `k`th present slot MUST equal `k`. When the message has been read, the number of handles consumed MUST equal the length of the list. There is no way to name a handle twice, to skip one, or to leave one out.
 
-The transport supplies, for each handle in the list, its value, its object type and its rights. A slot's handle MUST match the `object_type` and every right its declared type names (§6). `channel_read` does not report the last two today; the owner has decided how it will (Q8, ADR-0005 B3). Until that slice lands, the generated server stub can only be run against a transport that supplies them, and this rule cannot be enforced on a real channel.
+The transport supplies, for each handle in the list, its value, its object type and its rights. A slot's handle MUST match the `object_type` and every right its declared type names (§6). `channel_read` reports all three as a `received_handle` record per handle, from `origin.kernel` 0.2 (Q8, ADR-0005 B3, built 2026-11-10), each made from what the reader's table holds, so this rule holds on a real channel.
 
 ### 7.5 Order of validation
 
@@ -415,6 +416,8 @@ Within a major version only additions are allowed (ADR-0011 N10):
 
 `@since(M.m)` names the current major, with `1 ≤ m ≤` the current minor. An item without it dates from `M.0`. Bumping the major therefore forces every `@since` to be removed.
 
+From major 1, an item may not name an item of its own library that a later minor added: a parameter or result its type (or the element type inside it), a field its type, a constant its bits type or the members it combines, a method its capability or its statuses. No version of the definition has both, so the reference could not be kept compatibly, and the tool refuses it (`NewerReference`). At major 0 it is allowed, and the fingerprint gate reports the minors it changes instead: `origin.kernel`'s `channel_read`, from minor 0, names `received_handle`, from minor 2 (ADR-0005 B3). Decided 2026-11-10 with the fingerprint fix (§13); items of another library are versioned by that library, so they are outside this rule.
+
 Major `0` promises nothing, like ADR-0005 P12's `user-abi` today: a change at major 0 is reported and not refused.
 
 A later-version parameter of a `channel` method is `Option<T>` in Rust: `None` when the negotiated minor predates it. An enum or bits member newer than the negotiated minor is refused.
@@ -436,6 +439,8 @@ Parameters take registers first, in declaration order, then results, in declarat
 | `bool`, integer, enum, bits | one register | one out pointer |
 | struct, `array` | one pointer | one out pointer |
 | `vector`, `string` | pointer, then count | pointer, then capacity (`@count` is required) |
+
+A vector's count and a result's capacity are in elements. A struct element is its bytes as §3.1 lays them out, so the kernel's length in bytes is the count times the struct's §5.3 size.
 
 A method that needs more than six registers is refused by the generator; ADR-0005 P4 says such a call takes a pointer to a structure.
 
@@ -487,6 +492,10 @@ Generated Rust is `no_std`, allocates nothing and passes the project's no-panic 
 
 Channel-transport C entry points are **not generated in this revision**: they would sit on `origin.core`'s call helper (ADR-0005 P8), which does not exist. The header carries their types and message sizes.
 
+`oidl generate --server-only` writes one crate at the top of the output directory, and nothing else: `lib.rs`, `oidl_rt.rs`, `<lib>/types.rs` and each interface's `server.rs`. There is no client, C, documentation or corpus, and so no shim: the crate's root is `#![forbid(unsafe_code)]`. The files it shares with the full output are identical to it. Its modules are marked `#[rustfmt::skip]`, because what the tool wrote is what a repository commits and compares. The Framekernel's crate is made this way (`framekernel/syscalls`, ADR-0011 N14).
+
+`oidl generate --library NAME` writes one crate for the `channel` library `NAME`, for its services and their clients, again at the top of the output directory and nothing else: `lib.rs`, `oidl_rt.rs`, `NAME`'s `types.rs`, and each of its interfaces' `server.rs` and `client.rs`; of the libraries it uses, directly or not, only their `types.rs`, each under a `mod.rs` that declares nothing else. A channel client needs no shim, so this crate has no `unsafe` either, and its root is `#![forbid(unsafe_code)]`. Every file but `lib.rs` and the used libraries' `mod.rs` is identical to the full output's. The tool refuses a `NAME` that is not among the inputs, and a `syscall` library, whose client is the shims. The service directory's crate is made this way (`sdk/directory`, from `origin.directory`).
+
 ---
 
 ## 12. The generator is a parser of untrusted input
@@ -505,11 +514,12 @@ For each library and each minor `m` from 0 to its current minor, the tool render
 - The description starts with its own format version, `oidl-fingerprint 1`, followed by `library <name>`, `major <M>` and `transport <t>`. A library's minor is not in it, so the digest of minor `m` does not change when a later minor is added.
 - The rest is one line per fact, in this order, each rendered in `src/fingerprint.rs`: constants; enumerations with their members; bits with their members; structures with their fields and offsets; capabilities; then every method, by interface and ordinal, with its parameters, results, sorted error names and requirement. A test pins one digest (`the_fingerprint_is_pinned`).
 - Items carry their `since`, and an item with `since` above `M.m` does not appear at minor `m`, so a `const`, `struct` or the like added in a later minor changes no earlier minor's fingerprint. An item added later without `@since` does change them: it is part of the earlier minors, as far as the definition says.
+- A parameter or result that is a `sized struct` of the library names it with its size at minor `m`, so a field the struct gains later, an addition §9 allows, changes no earlier minor's fingerprint either. (Until 2026-11-10 the reference carried the newest size, and growing `read_sizes` changed `origin.kernel`'s 0.0 and 0.1: a warning at major 0, a refusal at any other.) A `sized struct` from another library, which nothing uses yet, is still expanded at its newest layout; whether its later fields are that library's own business, as an enum's later members are, is not decided.
 - A type from another library is expanded in the description (the layout of a struct, the base members of an enum or bits): a used library's change of layout would otherwise alter this library's messages unseen.
 
-A lock file records `<library> <M.m> sha256:<hex>`, one line per minor. `oidl fingerprint --lock FILE` fails if, for the current major, a recorded minor's fingerprint has changed or a recorded minor has gone; if a recorded major is higher than the library's (the version went backwards); if the lock names a library that is not among the inputs; if a line is malformed; or if the file is missing and `--update` was not given. A minor that is not recorded yet is reported. At major 0 a changed or removed minor is a warning (§9). `--update` records new minors and refuses to run while there are errors.
+A lock file records `<library> <M.m> sha256:<hex>`, one line per minor. `oidl fingerprint --library NAME` prints, checks and records `NAME` alone, the other inputs being there only so that it compiles, so each library can have a lock of its own. `oidl fingerprint --lock FILE` fails if, for the current major, a recorded minor's fingerprint has changed or a recorded minor has gone; if a recorded major is higher than the library's (the version went backwards); if the lock names a library that is not among the inputs; if a line is malformed; or if the file is missing and `--update` was not given. A minor that is not recorded yet is reported. At major 0 a changed or removed minor is a warning (§9). `--update` records new minors and refuses to run while there are errors.
 
-Each minor's fingerprint is frozen once it is recorded, which is what makes additions compatible and everything else detectable (ADR-0011 N13).
+Each minor's fingerprint is frozen once it is recorded, which is what makes additions compatible and everything else detectable (ADR-0011 N13). `cargo xtask check` is stricter than the tool: it fails if re-recording a repository's lock would change it, even at major 0, so that a change to an ABI is always recorded in the commit that makes it (`developer-tools/xtask/src/interfaces.rs`).
 
 ---
 
@@ -585,7 +595,7 @@ An implementation of this specification MUST: pass the malformed-definition suit
 - Events: a server-initiated message.
 - Floating-point types, unions, nested variable-length data.
 - C entry points for the `channel` transport (§11).
-- The fields of ADR-0005 B1's stamped identity, how a message delivers it and where a stub puts it. The generated server takes an opaque `Caller` until that slice exists.
+- Where a `channel` stub puts ADR-0005 B1's stamped identity. Its fields (C1) and how a read delivers them, through `origin.kernel`'s `read_sizes` (C2), are decided and built (task S3-2, 2026-11-10); the generated server takes an opaque `Caller` until the first ring-3 service (ADR-0011 N14 step 4).
 - Per-number pinning, which needs the number-to-address table the linker produces, and generation of the kernel's `syscall` table from this definition: the kernel's switch to generated code, which ADR-0011 N14 orders after this.
 - The Driver SDK (ADR-0001 D2): its own ADR.
 

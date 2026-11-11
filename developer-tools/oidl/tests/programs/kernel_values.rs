@@ -12,7 +12,9 @@ fn main() {
         println!("status {} {}", e.name(), e.raw());
     }
     println!("status_name {}", k::status_name(k::OK));
-    println!("status_name {}", k::status_name(-14));
+    // One below the lowest status: no status has it.
+    let unknown = k::Error::ALL.iter().map(|e| e.raw()).min().unwrap_or(0) - 1;
+    println!("status_name {}", k::status_name(unknown));
     println!("status_name {}", k::status_name(k::Error::Limit.raw()));
 
     let rights = [
@@ -68,6 +70,13 @@ fn main() {
     println!("read_sizes SIZE_AT {}", k::ReadSizes::SIZE_AT);
     println!("read_sizes BYTES_AT {}", k::ReadSizes::BYTES_AT);
     println!("read_sizes HANDLES_AT {}", k::ReadSizes::HANDLES_AT);
+    println!("read_sizes BASE_SIZE {}", k::ReadSizes::BASE_SIZE);
+    println!("read_sizes SENDER_PROCESS_AT {}", k::ReadSizes::SENDER_PROCESS_AT);
+    println!("read_sizes SENDER_PRINCIPAL_AT {}", k::ReadSizes::SENDER_PRINCIPAL_AT);
+    println!("received_handle SIZE {}", <k::ReceivedHandle as rt::Fixed>::SIZE);
+    println!("received_handle HANDLE_AT {}", k::ReceivedHandle::HANDLE_AT);
+    println!("received_handle OBJECT_TYPE_AT {}", k::ReceivedHandle::OBJECT_TYPE_AT);
+    println!("received_handle RIGHTS_AT {}", k::ReceivedHandle::RIGHTS_AT);
     println!("handle INVALID {}", rt::Handle::INVALID.to_abi());
     for raw in 0..=255u8 {
         if let Some(value) = rt::decode_bool(raw) {

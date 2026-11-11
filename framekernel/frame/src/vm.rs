@@ -6,11 +6,11 @@
 //! released, so no processor keeps the old translation; changes that only add access need
 //! none. Kernel-half mappings are global; the identity pages of the AP trampoline are not.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use origin_paging::{
     Access, AddressSpace, Attributes, LARGE_PAGE, LeafCensus, MapError, PAGE, TablePool,
-    Translation,
+    Translation, kernel_half_is_complete, same_kernel_half,
 };
 
 /// The MMIO window (ADR-0004 H2): device registers, mapped uncached on demand. It starts
@@ -25,7 +25,9 @@ use origin_boot_info::{MemoryRegion, RegionKind, overlaps_ram};
 use origin_sync::SpinLock;
 
 use crate::addr::PhysAddr;
+use crate::memory::OwnedFrame;
 use crate::mmio::MmioRegion;
+use crate::once::SetOnce;
 
 /// Physical ranges of device registers that have been handed out, at most one owner each. A
 /// claim outside `map_mmio` is the framework's own (the IOMMU's registers, ECAM): no driver
@@ -82,12 +84,26 @@ pub fn kernel_root() -> u64 {
     KERNEL_ROOT.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// The kernel half (PML4 entries 256–511) every process address space shares.
-pub fn kernel_half() -> Option<[u64; 256]> {
+/// The kernel half as it was when the kernel's tables went live (`install`). No later mapping
+/// changes these entries (`reserve_upper_half`): every address space's copy stays right.
+static KERNEL_HALF: SetOnce<[u64; 256]> = SetOnce::new();
+
+/// The kernel half (PML4 entries 256–511) every process address space shares: each points at a
+/// table allocated once at boot (ADR-0004 H2). `None` before `install`, and if the half was
+/// not complete when it ran.
+pub fn kernel_half() -> Option<&'static [u64; 256]> {
+    KERNEL_HALF.get()
+}
+
+/// Whether the kernel's own tables still have the entries [`kernel_half`] gave everyone.
+pub fn kernel_half_unchanged() -> bool {
+    let Some(fixed) = kernel_half() else {
+        return false;
+    };
     crate::cpu::without_interrupts(|| {
         let guard = KERNEL_SPACE.lock();
-        let k = guard.as_ref()?;
-        k.space.upper_half(&k.tables)
+        let live = guard.as_ref().and_then(|k| k.space.upper_half(&k.tables));
+        live.is_some_and(|live| same_kernel_half(&live, fixed))
     })
 }
 
@@ -104,6 +120,12 @@ pub unsafe fn install(
     memory_map: &'static [MemoryRegion],
 ) {
     KERNEL_ROOT.store(space.root(), core::sync::atomic::Ordering::Release);
+    if let Some(half) = space.upper_half(&tables)
+        && kernel_half_is_complete(&half)
+    {
+        // Only this call sets it, and `early` makes it once.
+        let _ = KERNEL_HALF.set(half);
+    }
     crate::cpu::without_interrupts(|| {
         *KERNEL_SPACE.lock() = Some(KernelSpace {
             space,
@@ -219,6 +241,96 @@ fn unmap_guards(pages: &[u64]) -> Result<(), MapError> {
         }
         Ok(())
     })
+}
+
+/// Where a [`KernelProbe`] maps its page: PML4 entry 480, just above the MMIO window, which
+/// nothing else uses. Exactly the case ADR-0004 H2 is about: a kernel mapping in a top-level
+/// slot no earlier mapping has touched.
+pub(crate) const PROBE_PAGE: u64 = MMIO_END;
+/// [`PROBE_PAGE`]'s index among PML4 entries 256–511.
+pub(crate) const PROBE_SLOT: usize = 480 - 256;
+
+/// Whether a [`KernelProbe`] exists (one at a time: there is one probe page).
+static PROBE_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// A kernel page in a top-level slot of its own, for the proof that a mapping made after an
+/// address space was created is visible from that space. Unmapped (on every processor) and
+/// freed when dropped.
+///
+/// Unlike the rest of the kernel half it is **not global**: the proof reads it through one space
+/// and then through another, and a global translation cached by the first read would survive
+/// the CR3 load and answer the second without a walk of that space's tables (review finding 4,
+/// seen on an AMD EPYC under KVM; QEMU's software CPU flushes everything on a CR3 load).
+#[derive(Debug)]
+pub struct KernelProbe {
+    frame: Option<OwnedFrame>,
+}
+
+impl KernelProbe {
+    /// Maps a fresh frame at the probe page, read-only, never executable and not global.
+    /// `None` if one exists already, or if the frame or the tables cannot be had.
+    pub fn new() -> Option<Self> {
+        if PROBE_TAKEN.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let mapped = crate::memory::allocate_frame().and_then(|frame| {
+            let done = crate::cpu::without_interrupts(|| {
+                let mut guard = KERNEL_SPACE.lock();
+                let k = guard.as_mut()?;
+                k.space
+                    .map(
+                        &mut k.tables,
+                        PROBE_PAGE,
+                        frame.phys().raw(),
+                        Attributes::kernel(Access::Read),
+                    )
+                    .ok()
+            });
+            if done.is_some() {
+                Some(frame)
+            } else {
+                let _ = crate::memory::free_frame(frame);
+                None
+            }
+        });
+        if mapped.is_none() {
+            PROBE_TAKEN.store(false, Ordering::Release);
+        }
+        mapped.map(|frame| Self { frame: Some(frame) })
+    }
+
+    /// The address of the mapped page.
+    #[must_use]
+    pub const fn addr(&self) -> u64 {
+        PROBE_PAGE
+    }
+
+    /// Reads the probe page through a space like every space before ADR-0004 H2: built as
+    /// [`UserSpace::new`] builds one, but with the probe page's top-level slot empty, as when a
+    /// kernel mapping was made in a slot of its own after the space was created. The in-boot
+    /// control of the kernel-half proof, which expects a fault. The space is made and dropped
+    /// inside this call, so no space that lacks part of the kernel half ever reaches a caller
+    /// (review housekeeping). `None` without memory for it.
+    ///
+    /// [`UserSpace::new`]: crate::userspace::UserSpace::new
+    #[must_use]
+    pub fn read_without_its_slot(&self) -> Option<crate::cpu::Probe> {
+        let lacking = crate::userspace::UserSpace::without_probe_slot()?;
+        Some(lacking.probe_read(self.addr()))
+    }
+}
+
+impl Drop for KernelProbe {
+    fn drop(&mut self) {
+        // SAFETY: `PROBE_PAGE` is this probe's own page: nothing but `probe_read` was given
+        // its address, and that recovers from a fault, so nothing relies on it being mapped.
+        let unmapped = unsafe { unmap(PROBE_PAGE) }.is_ok();
+        if unmapped && let Some(frame) = self.frame.take() {
+            // `unmap` has returned, so no processor still reaches the frame.
+            let _ = crate::memory::free_frame(frame);
+        }
+        PROBE_TAKEN.store(false, Ordering::Release);
+    }
 }
 
 /// Why [`map_mmio`] refused.
@@ -386,12 +498,12 @@ pub(crate) fn in_device_window(addr: u64) -> bool {
 }
 
 /// Switches this processor to the kernel's own address space, if it isn't on it yet: the space
-/// of every kernel thread. Safe: the kernel's tables are complete (`install` keeps them for
-/// ever), and this replaces whatever the processor was using, which the switching code
-/// (the scheduler) has given up.
-pub fn activate_kernel_space() {
+/// of every kernel thread. Only at the scheduler's switch point (`trap::Switch`, review finding
+/// 2). Safe: the kernel's tables are complete (`install` keeps them for ever), and this replaces
+/// whatever the processor was using, which the switching code (the scheduler) has given up.
+pub fn activate_kernel_space(_switch: &crate::trap::Switch) {
     let root = kernel_root();
-    if root != 0 && crate::cpu::read_cr3() != root {
+    if root != 0 {
         // SAFETY: `root` is the kernel's complete PML4, which maps everything kernel code
         // touches next; it lives for ever.
         unsafe { crate::cpu::write_cr3(root) };

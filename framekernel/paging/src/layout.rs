@@ -44,6 +44,9 @@ pub const KERNEL_ALIGN: u64 = LARGE_PAGE;
 pub const FRAMEBUFFER_WINDOW: u64 = 0xFFFF_E000_0000_0000;
 /// Size of the framebuffer window. Device registers are mapped above it.
 pub const FRAMEBUFFER_WINDOW_SIZE: u64 = 2 << 30;
+/// Tables the kernel half's top level can take (ADR-0004 H2): one for each of PML4 entries
+/// 256–511. [`AddressSpace::reserve_upper_half`] makes the ones [`build`] did not.
+pub const KERNEL_HALF_SLOTS: u64 = (crate::ENTRIES / 2) as u64;
 /// Bits of the address a page directory covers (1 GiB).
 const GIB_SHIFT: u32 = 30;
 /// Bits of the address a PDPT covers (512 GiB).

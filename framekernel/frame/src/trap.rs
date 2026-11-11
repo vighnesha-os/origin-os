@@ -6,7 +6,31 @@
 //! *frame* here is the address of a thread's saved register frame on its kernel stack: the trap
 //! entry passes the interrupted one, and the scheduler hook answers which to resume.
 
+use core::marker::PhantomData;
+
 use crate::once::SetOnce;
+
+/// The scheduler's switch point: the moment, inside the trap entry with interrupts off, when
+/// it chooses what this processor runs next. Only the trap entry makes one, for the scheduling
+/// hooks, and only for the length of the call (it is not `Send`, and the hooks get a borrow).
+///
+/// What is loaded with it stays: the address space for the thread about to resume
+/// (`UserSpace::activate`). Anywhere else, a space loaded on a processor would be undone the
+/// next time the scheduler resumed the thread, or would carry a system call back to ring 3 on
+/// another process's tables (review finding 2); so nothing but the scheduler can do it, and the
+/// proofs use a visit that puts back what was there (`UserSpace::probe_read`).
+#[derive(Debug)]
+pub struct Switch {
+    _here: PhantomData<*const ()>,
+}
+
+impl Switch {
+    /// For the trap entry only (which exists on the kernel's target only).
+    #[cfg(target_os = "none")]
+    pub(crate) const fn new() -> Self {
+        Self { _here: PhantomData }
+    }
+}
 
 /// What a system call's upcall asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,17 +73,17 @@ impl core::fmt::Debug for ExceptionReport<'_> {
 #[derive(Clone, Copy, Debug)]
 pub struct Hooks {
     /// The timer interrupted the context at this frame; answers the frame to resume.
-    pub tick: fn(u64) -> u64,
+    pub tick: fn(u64, &Switch) -> u64,
     /// A device interrupt woke someone, or another processor rescheduled this one.
-    pub reschedule: fn(u64) -> u64,
+    pub reschedule: fn(u64, &Switch) -> u64,
     /// The running context gives up the processor.
-    pub yield_now: fn(u64) -> u64,
+    pub yield_now: fn(u64, &Switch) -> u64,
     /// The running context sleeps for this many timer ticks.
-    pub sleep: fn(u64, u64) -> u64,
+    pub sleep: fn(u64, u64, &Switch) -> u64,
     /// The running context blocks (for this many ticks at most; 0 is no limit).
-    pub block: fn(u64, u64) -> u64,
+    pub block: fn(u64, u64, &Switch) -> u64,
     /// The running context ends.
-    pub exit: fn(u64) -> u64,
+    pub exit: fn(u64, &Switch) -> u64,
     /// A system call: the number, the six arguments, and its return address.
     pub syscall: fn(u64, [u64; 6], u64) -> SyscallOutcome,
     /// A ring-3 exception ended the running thread: vector, error code, faulting address (0

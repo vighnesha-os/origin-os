@@ -26,6 +26,28 @@ fn status_enum(comp: &Compilation) -> Option<&Enum> {
     comp.status.as_deref()
 }
 
+/// Which part of the output to write.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// Everything, under `rust/`.
+    Everything,
+    /// The server side alone, at the top of the output directory.
+    Server,
+    /// One channel library's server and client, at the top of the output directory, with only
+    /// the types of the libraries it uses.
+    Library,
+}
+
+impl Side {
+    /// The directory the crate is written under, with its slash.
+    const fn top(self) -> &'static str {
+        match self {
+            Self::Everything => "rust/",
+            Self::Server | Self::Library => "",
+        }
+    }
+}
+
 struct Gen<'a> {
     comp: &'a Compilation,
     lib: &'a Library,
@@ -555,10 +577,11 @@ fn gen_sized_struct(g: &Gen<'_>, t: &mut Text, s: &Struct, lib_version: Version)
         let size = layout::fixed_layout(&field.ty).0;
         let end = u64::from(field.offset).saturating_add(size);
         if is_later(field.since) {
-            t.open(format!("if u64::from(limit) >= {end} {{"));
-            t.open(format!("if let Some(value) = self.{} {{", field.name));
+            t.open(format!(
+                "if u64::from(limit) >= {end} && let Some(value) = self.{} {{",
+                field.name
+            ));
             t.line(format!("rt::put_field(out, {}, value)?;", field.offset));
-            t.shut("}");
             t.shut("}");
         } else {
             t.open(format!("if u64::from(limit) >= {end} {{"));
@@ -1168,6 +1191,16 @@ fn abi_element(ty: &Type) -> String {
     }
 }
 
+/// The size of a struct element of a `syscall` vector or array, which crosses as bytes encoded
+/// field by field (§10, ADR-0005 C3); `None` for an integer or a handle, which crosses as its
+/// in-memory form.
+fn record_size(elem: &Type) -> Option<u64> {
+    match elem {
+        Type::Struct(s) => Some(u64::from(s.size)),
+        _ => None,
+    }
+}
+
 /// One abi-level parameter: `(name, Rust type, conversion to u64 for the stub)`.
 fn abi_params(g: &Gen<'_>, method: &Method) -> Vec<(String, String, &'static str)> {
     let mut out = Vec::new();
@@ -1261,18 +1294,32 @@ fn gen_sys_abi(g: &Gen<'_>, interface: &Interface) -> String {
                 }
                 Type::Array(elem, count) => {
                     let e = abi_element(elem);
-                    args.push(format!("{n}: &[{e}; {count}]"));
+                    match record_size(elem) {
+                        Some(size) => {
+                            let bytes = u64::from(*count).saturating_mul(size);
+                            args.push(format!("{n}: &[u8; {bytes}]"));
+                        }
+                        None => args.push(format!("{n}: &[{e}; {count}]")),
+                    }
                     call.push(format!("{n}.as_ptr()"));
                 }
                 Type::Vector(elem, _) => {
                     let e = abi_element(elem);
-                    let t = match elem.as_ref() {
-                        Type::Handle(_) => "rt::Handle".to_string(),
-                        _ => e.clone(),
-                    };
-                    args.push(format!("{n}: &[{t}]"));
-                    call.push(format!("{n}.as_ptr().cast::<{e}>()"));
-                    call.push(format!("{n}.len() as u64"));
+                    if let Some(size) = record_size(elem) {
+                        // Encoded records: the count is in elements, never more than the
+                        // bytes passed hold.
+                        args.push(format!("{n}: &[u8]"));
+                        call.push(format!("{n}.as_ptr()"));
+                        call.push(format!("{n}.len().checked_div({size}).unwrap_or(0) as u64"));
+                    } else {
+                        let t = match elem.as_ref() {
+                            Type::Handle(_) => "rt::Handle".to_string(),
+                            _ => e.clone(),
+                        };
+                        args.push(format!("{n}: &[{t}]"));
+                        call.push(format!("{n}.as_ptr().cast::<{e}>()"));
+                        call.push(format!("{n}.len() as u64"));
+                    }
                 }
                 Type::String(_) => {
                     args.push(format!("{n}: &str"));
@@ -1294,22 +1341,36 @@ fn gen_sys_abi(g: &Gen<'_>, interface: &Interface) -> String {
                 }
                 Type::Array(elem, count) => {
                     let e = abi_element(elem);
-                    let t = match elem.as_ref() {
-                        Type::Handle(_) => "rt::Handle".to_string(),
-                        _ => e.clone(),
-                    };
-                    args.push(format!("{n}: &mut [{t}; {count}]"));
-                    call.push(format!("{n}.as_mut_ptr().cast::<{e}>()"));
+                    if let Some(size) = record_size(elem) {
+                        let bytes = u64::from(*count).saturating_mul(size);
+                        args.push(format!("{n}: &mut [u8; {bytes}]"));
+                        call.push(format!("{n}.as_mut_ptr()"));
+                    } else {
+                        let t = match elem.as_ref() {
+                            Type::Handle(_) => "rt::Handle".to_string(),
+                            _ => e.clone(),
+                        };
+                        args.push(format!("{n}: &mut [{t}; {count}]"));
+                        call.push(format!("{n}.as_mut_ptr().cast::<{e}>()"));
+                    }
                 }
                 Type::Vector(elem, _) => {
                     let e = abi_element(elem);
-                    let t = match elem.as_ref() {
-                        Type::Handle(_) => "rt::Handle".to_string(),
-                        _ => e.clone(),
-                    };
-                    args.push(format!("{n}: &mut [{t}]"));
-                    call.push(format!("{n}.as_mut_ptr().cast::<{e}>()"));
-                    call.push(format!("{n}.len() as u64"));
+                    if let Some(size) = record_size(elem) {
+                        // Room for encoded records: the capacity is in elements, never more
+                        // than the bytes passed hold.
+                        args.push(format!("{n}: &mut [u8]"));
+                        call.push(format!("{n}.as_mut_ptr()"));
+                        call.push(format!("{n}.len().checked_div({size}).unwrap_or(0) as u64"));
+                    } else {
+                        let t = match elem.as_ref() {
+                            Type::Handle(_) => "rt::Handle".to_string(),
+                            _ => e.clone(),
+                        };
+                        args.push(format!("{n}: &mut [{t}]"));
+                        call.push(format!("{n}.as_mut_ptr().cast::<{e}>()"));
+                        call.push(format!("{n}.len() as u64"));
+                    }
                 }
                 Type::String(_) => {
                     args.push(format!("{n}: &mut [u8]"));
@@ -1492,6 +1553,31 @@ fn gen_sys_client_method(g: &Gen<'_>, t: &mut Text, method: &Method) {
             }
         }
     }
+    // Encode vectors and arrays of structs, element by element (C3).
+    for param in &method.params {
+        let name = &param.name;
+        match &param.ty {
+            Type::Vector(elem, bound) => {
+                if let Some(size) = record_size(elem) {
+                    let bytes = u64::from(*bound).saturating_mul(size);
+                    t.line(format!("let mut oidl_buf_{name} = [0u8; {bytes}];"));
+                    t.line(format!(
+                        "let oidl_wire_{name} = rt::encode_elements({name}, &mut oidl_buf_{name}).map_err(rt::CallError::Protocol)?;"
+                    ));
+                }
+            }
+            Type::Array(elem, count) => {
+                if let Some(size) = record_size(elem) {
+                    let bytes = u64::from(*count).saturating_mul(size);
+                    t.line(format!("let mut oidl_buf_{name} = [0u8; {bytes}];"));
+                    t.line(format!(
+                        "rt::Fixed::write(*{name}, &mut oidl_buf_{name}).map_err(rt::CallError::Protocol)?;"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
     // Result storage.
     for result in &returned {
         match &result.ty {
@@ -1514,14 +1600,29 @@ fn gen_sys_client_method(g: &Gen<'_>, t: &mut Text, method: &Method) {
                     result.name
                 ));
             }
-            Type::Array(elem, count) => match elem.as_ref() {
-                Type::Handle(_) => t.line(format!(
+            Type::Array(elem, count) => match (elem.as_ref(), record_size(elem)) {
+                (Type::Handle(_), _) => t.line(format!(
                     "let mut oidl_{} = [rt::Handle::INVALID; {count}];",
                     result.name
                 )),
+                (_, Some(size)) => {
+                    let bytes = u64::from(*count).saturating_mul(size);
+                    t.line(format!("let mut oidl_{} = [0u8; {bytes}];", result.name));
+                }
                 _ => t.line(format!("let mut oidl_{} = [0; {count}];", result.name)),
             },
-            Type::Vector(..) | Type::String(_) => {}
+            Type::Vector(elem, bound) => {
+                // Structs arrive encoded, into room here, and are decoded into the caller's
+                // slice after the call.
+                if let Some(size) = record_size(elem) {
+                    let bytes = u64::from(*bound).saturating_mul(size);
+                    t.line(format!(
+                        "let mut oidl_raw_{} = [0u8; {bytes}];",
+                        result.name
+                    ));
+                }
+            }
+            Type::String(_) => {}
             Type::Bool => t.line(format!("let mut oidl_{}: u8 = 0;", result.name)),
             Type::Int(_) | Type::Enum(_) | Type::Bits(_) => {
                 t.line(format!(
@@ -1538,6 +1639,11 @@ fn gen_sys_client_method(g: &Gen<'_>, t: &mut Text, method: &Method) {
     }
     for result in &returned {
         call.push(match &result.ty {
+            Type::Vector(elem, _) if record_size(elem).is_some() => format!(
+                "rt::element_room::<{}>(&mut oidl_raw_{name}, {name}.len())",
+                g.fixed(3, elem),
+                name = result.name
+            ),
             Type::Vector(..) | Type::String(_) => format!("&mut *{}", result.name),
             _ => format!("&mut oidl_{}", result.name),
         });
@@ -1595,6 +1701,21 @@ fn gen_sys_client_method(g: &Gen<'_>, t: &mut Text, method: &Method) {
             ));
         }
     }
+    // Then structs that arrived encoded go into the caller's slice, each one checked.
+    for result in &returned {
+        if let Type::Vector(elem, bound) = &result.ty
+            && record_size(elem).is_some()
+        {
+            let name = &result.name;
+            t.line(format!(
+                "let oidl_{name}_count = {}.min({name}.len()).min({bound});",
+                result_count(result)
+            ));
+            t.line(format!(
+                "rt::decode_elements(&oidl_raw_{name}, {name}, oidl_{name}_count, u16::MAX).map_err(rt::CallError::Protocol)?;"
+            ));
+        }
+    }
     match returned.as_slice() {
         [] => t.line("Ok(())"),
         [single] if !matches!(single.ty, Type::Vector(..) | Type::String(_)) => {
@@ -1614,8 +1735,20 @@ fn gen_sys_client_method(g: &Gen<'_>, t: &mut Text, method: &Method) {
     t.blank();
 }
 
+/// The count a `vector` or `string` result reports through its `@count` field.
+fn result_count(r: &Param) -> String {
+    match &r.count {
+        Some((result, field)) => {
+            format!("usize::try_from(oidl_{result}_decoded.{field}).unwrap_or(usize::MAX)")
+        }
+        None => "0".to_string(),
+    }
+}
+
 fn sys_client_value(p: &Param) -> String {
     match &p.ty {
+        Type::Vector(elem, _) if record_size(elem).is_some() => format!("oidl_wire_{}", p.name),
+        Type::Array(elem, _) if record_size(elem).is_some() => format!("&oidl_buf_{}", p.name),
         Type::Handle(h) => {
             if h.optional {
                 format!("{}.map_or(0, |h| h.to_abi())", p.name)
@@ -1676,6 +1809,10 @@ fn sys_client_result_value(g: &Gen<'_>, r: &Param, checked: bool) -> String {
                 format!("<{path} as rt::Fixed>::read(&{local}.0, u16::MAX)")
             }
         }
+        Type::Array(elem, count) if record_size(elem).is_some() => finish(format!(
+            "<[{}; {count}] as rt::Fixed>::read(&{local}, u16::MAX)",
+            g.fixed(3, elem)
+        )),
         Type::Array(..) => {
             if checked {
                 local
@@ -1683,14 +1820,9 @@ fn sys_client_result_value(g: &Gen<'_>, r: &Param, checked: bool) -> String {
                 format!("Ok::<_, rt::WireError>({local})")
             }
         }
+        Type::Vector(elem, _) if record_size(elem).is_some() => format!("oidl_{}_count", r.name),
         Type::Vector(..) | Type::String(_) => {
-            let count = match &r.count {
-                Some((result, field)) => {
-                    format!("usize::try_from(oidl_{result}_decoded.{field}).unwrap_or(usize::MAX)")
-                }
-                None => "0".to_string(),
-            };
-            format!("{count}.min({name}.len())", name = r.name)
+            format!("{}.min({name}.len())", result_count(r), name = r.name)
         }
         Type::Bool => finish(format!(
             "rt::decode_bool({local}).ok_or(rt::WireError::Bool)"
@@ -2515,8 +2647,10 @@ fn gen_channel_client(g: &Gen<'_>, interface: &Interface) -> String {
     t.shut("}");
     t.blank();
     t.open(format!("impl<T: rt::Transport> {name}<T> {{"));
-    t.line("/// Runs the hello (§7.7).");
-    t.open("pub fn connect(mut transport: T, scratch: &mut rt::Scratch<'_>) -> Result<Self, rt::CallError<core::convert::Infallible>> {");
+    // `new`, a C++ keyword and so never a method's name (§2): any other name would take one from
+    // the interfaces.
+    t.line("/// Runs the hello (§7.7), and on success is the connection.");
+    t.open("pub fn new(mut transport: T, scratch: &mut rt::Scratch<'_>) -> Result<Self, rt::CallError<core::convert::Infallible>> {");
     t.line("let oidl_hello = rt::Hello { interface_id: INTERFACE_ID, major: VERSION.0, minor: VERSION.1 };");
     t.line("let oidl_total = rt::write_hello(scratch.bytes, rt::KIND_REQUEST, 1, oidl_hello).map_err(rt::CallError::Protocol)?;");
     t.line("let (oidl_n, oidl_h) = transport.call(scratch.bytes, oidl_total, &[], scratch.received).map_err(rt::CallError::Transport)?;");
@@ -2675,9 +2809,10 @@ fn gen_channel_client_method(g: &Gen<'_>, t: &mut Text, method: &Method) {
 
 // --- Files ---------------------------------------------------------------------------------
 
-fn gen_library(comp: &Compilation, lib: &Library, files: &mut Vec<Generated>) {
+fn gen_library(comp: &Compilation, lib: &Library, side: Side, files: &mut Vec<Generated>) {
     let m = module(&lib.name);
     let g = Gen { comp, lib };
+    let top = side.top();
     let mut root = Text::default();
     root.line(format!(
         "//! `{}`, generated from its definition.",
@@ -2690,51 +2825,54 @@ fn gen_library(comp: &Compilation, lib: &Library, files: &mut Vec<Generated>) {
         root.line(format!("pub mod {};", interface.name));
     }
     files.push(Generated {
-        path: format!("rust/{m}/mod.rs"),
+        path: format!("{top}{m}/mod.rs"),
         text: format!("{HEADER}{}", root.finish()),
     });
     files.push(Generated {
-        path: format!("rust/{m}/types.rs"),
+        path: format!("{top}{m}/types.rs"),
         text: format!("{HEADER}{}", gen_types(&g)),
     });
     for interface in &lib.interfaces {
-        let dir = format!("rust/{m}/{}", interface.name);
+        let dir = format!("{top}{m}/{}", interface.name);
         let mut module_text = Text::default();
         module_text.line(format!("//! The `{}` interface.", interface.name));
         module_text.blank();
         module_text.line("pub mod server;");
-        module_text.line("pub mod client;");
-        match lib.transport {
-            Transport::Syscall => {
-                module_text.line("mod abi;");
-                module_text.line("#[cfg(target_arch = \"x86_64\")]");
-                module_text.line("pub mod core_stubs;");
-                files.push(Generated {
-                    path: format!("{dir}/server.rs"),
-                    text: format!("{HEADER}{}", gen_sys_server(&g, interface)),
-                });
-                files.push(Generated {
-                    path: format!("{dir}/client.rs"),
-                    text: format!("{HEADER}{}", gen_sys_client(&g, interface)),
-                });
-                files.push(Generated {
-                    path: format!("{dir}/abi.rs"),
-                    text: format!("{HEADER}{}", gen_sys_abi(&g, interface)),
-                });
-                files.push(Generated {
-                    path: format!("{dir}/core_stubs.rs"),
-                    text: format!("{HEADER}{}", gen_sys_core_stubs(&g, interface)),
-                });
-            }
-            Transport::Channel => {
-                files.push(Generated {
-                    path: format!("{dir}/server.rs"),
-                    text: format!("{HEADER}{}", gen_channel_server(&g, interface)),
-                });
-                files.push(Generated {
-                    path: format!("{dir}/client.rs"),
-                    text: format!("{HEADER}{}", gen_channel_client(&g, interface)),
-                });
+        let server = match lib.transport {
+            Transport::Syscall => gen_sys_server(&g, interface),
+            Transport::Channel => gen_channel_server(&g, interface),
+        };
+        files.push(Generated {
+            path: format!("{dir}/server.rs"),
+            text: format!("{HEADER}{server}"),
+        });
+        // A library crate is made only for a channel library, whose client needs no shim.
+        if side != Side::Server {
+            module_text.line("pub mod client;");
+            match lib.transport {
+                Transport::Syscall => {
+                    module_text.line("mod abi;");
+                    module_text.line("#[cfg(target_arch = \"x86_64\")]");
+                    module_text.line("pub mod core_stubs;");
+                    files.push(Generated {
+                        path: format!("{dir}/client.rs"),
+                        text: format!("{HEADER}{}", gen_sys_client(&g, interface)),
+                    });
+                    files.push(Generated {
+                        path: format!("{dir}/abi.rs"),
+                        text: format!("{HEADER}{}", gen_sys_abi(&g, interface)),
+                    });
+                    files.push(Generated {
+                        path: format!("{dir}/core_stubs.rs"),
+                        text: format!("{HEADER}{}", gen_sys_core_stubs(&g, interface)),
+                    });
+                }
+                Transport::Channel => {
+                    files.push(Generated {
+                        path: format!("{dir}/client.rs"),
+                        text: format!("{HEADER}{}", gen_channel_client(&g, interface)),
+                    });
+                }
             }
         }
         files.push(Generated {
@@ -2940,30 +3078,119 @@ fn corpus_path(ty: &str, module_name: &str) -> String {
 
 /// Every Rust file.
 pub fn generate(comp: &Compilation) -> Vec<Generated> {
+    let all: Vec<&Library> = comp.libraries.iter().collect();
+    let mut files = gen_crate(comp, Side::Everything, &all, None);
+    files.push(Generated {
+        path: "rust/bin/corpus_check.rs".to_string(),
+        text: format!("{HEADER}{}", gen_corpus_check(comp)),
+    });
+    files
+}
+
+/// The server side alone (`docs/spec/OIDL.md` §11), as a crate of its own: the runtime, the types
+/// and the server modules, with no client, no C entry points and so no `unsafe` at all. The
+/// compiler holds it to that: its root is `forbid(unsafe_code)`.
+pub fn generate_server(comp: &Compilation) -> Vec<Generated> {
+    let all: Vec<&Library> = comp.libraries.iter().collect();
+    gen_crate(comp, Side::Server, &all, None)
+}
+
+/// One `channel` library's bindings (`docs/spec/OIDL.md` §11), as a crate of its own: the
+/// runtime, the library's types, and each of its interfaces' server and client; of the libraries
+/// it uses, directly or not, only their types. A channel client needs no shim, so there is no
+/// `unsafe` at all, and the root is `forbid(unsafe_code)`. Refused for a library that is not
+/// among the definitions, and for a `syscall` library, whose client is the shims.
+pub fn generate_library(comp: &Compilation, name: &str) -> Result<Vec<Generated>, String> {
+    let Some(selected) = comp.libraries.iter().find(|lib| lib.name == name) else {
+        return Err(format!("{name} is not among the definitions given"));
+    };
+    if selected.transport != Transport::Channel {
+        return Err(format!(
+            "{name} is a syscall library: its client is the C-ABI shims, which only the full output writes"
+        ));
+    }
+    // What it uses, directly or not. `libraries` lists each after every library it uses, so one
+    // pass from the end finds them all.
+    let mut wanted = vec![name];
+    for lib in comp.libraries.iter().rev() {
+        if wanted.contains(&lib.name.as_str()) {
+            for used in &lib.uses {
+                if !wanted.contains(&used.as_str()) {
+                    wanted.push(used.as_str());
+                }
+            }
+        }
+    }
+    let included: Vec<&Library> = comp
+        .libraries
+        .iter()
+        .filter(|lib| wanted.contains(&lib.name.as_str()))
+        .collect();
+    Ok(gen_crate(comp, Side::Library, &included, Some(name)))
+}
+
+/// A crate of `libraries`: in full where `selected` is `None` or names it, otherwise only its
+/// types.
+fn gen_crate(
+    comp: &Compilation,
+    side: Side,
+    libraries: &[&Library],
+    selected: Option<&str>,
+) -> Vec<Generated> {
+    let top = side.top();
     let mut files = vec![Generated {
-        path: "rust/oidl_rt.rs".to_string(),
+        path: format!("{top}oidl_rt.rs"),
         text: format!("{HEADER}{}", include_str!("oidl_rt.rs.in")),
     }];
     let mut root = Text::default();
     root.line("//! Generated from the OIDL definitions. `docs/spec/OIDL.md`.");
     root.line("//!");
     root.line("#![no_std]");
-    root.line("#![deny(unsafe_op_in_unsafe_fn)]");
+    root.line(match side {
+        Side::Everything => "#![deny(unsafe_op_in_unsafe_fn)]",
+        Side::Server | Side::Library => "#![forbid(unsafe_code)]",
+    });
     root.blank();
+    // What the tool wrote is what is committed and compared, so rustfmt leaves it alone.
+    root.line("#[rustfmt::skip]");
     root.line("pub mod oidl_rt;");
-    for lib in &comp.libraries {
+    for lib in libraries {
+        root.line("#[rustfmt::skip]");
         root.line(format!("pub mod {};", module(&lib.name)));
     }
     files.push(Generated {
-        path: "rust/lib.rs".to_string(),
+        path: format!("{top}lib.rs"),
         text: format!("{HEADER}{}", root.finish()),
     });
-    for lib in &comp.libraries {
-        gen_library(comp, lib, &mut files);
+    for lib in libraries {
+        if selected.is_none_or(|name| name == lib.name) {
+            gen_library(comp, lib, side, &mut files);
+        } else {
+            gen_types_only(comp, lib, side, &mut files);
+        }
     }
-    files.push(Generated {
-        path: "rust/bin/corpus_check.rs".to_string(),
-        text: format!("{HEADER}{}", gen_corpus_check(comp)),
-    });
     files
+}
+
+/// A used library in a library crate: its types, and none of its interfaces.
+fn gen_types_only(comp: &Compilation, lib: &Library, side: Side, files: &mut Vec<Generated>) {
+    let m = module(&lib.name);
+    let g = Gen { comp, lib };
+    let top = side.top();
+    let mut root = Text::default();
+    root.line(format!(
+        "//! `{}`'s types, generated from its definition. Its interfaces are not part of this crate.",
+        lib.name
+    ));
+    root.blank();
+    root.line("pub mod types;");
+    root.line("pub use types::*;");
+    files.push(Generated {
+        path: format!("{top}{m}/mod.rs"),
+        text: format!("{HEADER}{}", root.finish()),
+    });
+    files.push(Generated {
+        path: format!("{top}{m}/types.rs"),
+        text: format!("{HEADER}{}", gen_types(&g)),
+    });
 }

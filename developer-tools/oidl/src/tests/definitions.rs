@@ -232,6 +232,7 @@ fn cases() -> Vec<(Code, Case)> {
         (NameCollision, Case::Sources(sys("/// e\nenum e: u8 { a_1 = 1; a1 = 2; }"))),
         (NameCollision, Case::Sources(sys("/// i\ninterface types {\n/// m\nmethod m = 1 () errors() requires none;\n}"))),
         (NameCollision, Case::Sources(sys(&one("method holds = 1 () errors() requires none;")))),
+        (NameCollision, Case::Sources(sys(&one("method transport = 1 () errors() requires none;")))),
         (DuplicateRole, Case::Sources(sys("/// s\nenum status: i64 { ok = 0; }"))),
         (DuplicateRole, Case::Sources(sys("/// r\nbits rights: u32 { a = 0; }"))),
         (DuplicateRole, Case::Sources(sys("/// o\nenum object_type: u32 { a = 1; }"))),
@@ -291,7 +292,12 @@ fn cases() -> Vec<(Code, Case)> {
         (BadPosition, Case::Sources(chan(&one("method m = 1 (a: vector<optional<handle<any>>, 2>) errors() requires none;")))),
         (BadPosition, Case::Sources(sys(&one("method m = 1 (a: vector<bool, 2>) errors(invalid_args, fault) requires none;")))),
         (BadPosition, Case::Sources(sys(&one("method m = 1 (a: array<bool, 2>) errors(fault) requires none;")))),
-        (BadPosition, Case::Sources(sys("/// t\nstruct t { x: u8; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (a: vector<t, 2>) errors(invalid_args, fault) requires none;\n}"))),
+        // A system-call vector or array element may be a plain struct of integers, enums and
+        // bits only (ADR-0005 C3): a bool, a nested struct or an array in it is refused.
+        (BadPosition, Case::Sources(sys("/// t\nstruct t { x: bool; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (a: vector<t, 2>) errors(invalid_args, fault) requires none;\n}"))),
+        (BadPosition, Case::Sources(sys("/// u\nstruct u { y: u8; }\n/// t\nstruct t { x: u; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (a: vector<t, 2>) errors(invalid_args, fault) requires none;\n}"))),
+        (BadPosition, Case::Sources(sys("/// t\nstruct t { x: array<u8, 2>; }\n/// i\ninterface i {\n/// m\nmethod m = 1 () -> (a: array<t, 2>) errors(fault) requires none;\n}"))),
+        (BadPosition, Case::Sources(sys("/// t\nstruct t { x: bool; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (a: array<t, 2>) errors(fault) requires none;\n}"))),
         (BadPosition, Case::Sources(chan(&one("method m = 1 (e: kernel.status) errors() requires none;")))),
         // A handle array crosses with no way to state its rights (§3.1).
         (BadPosition, Case::Sources(sys(&one("method m = 1 (a: array<handle<channel, read>, 2>) errors(fault, bad_handle, access_denied, wrong_type) requires none;")))),
@@ -305,8 +311,20 @@ fn cases() -> Vec<(Code, Case)> {
         (BoundOutOfRange, Case::Sources(sys(&one("method m = 1 (a: vector<u8, 4294967296>) errors(invalid_args, fault) requires none;")))),
         (BoundOutOfRange, Case::Sources(sys("/// c\nconst c: i32 = 3;\n/// s\nstruct s { a: array<u8, c>; }"))),
         (TooLarge, Case::Sources(sys("/// s\nstruct s { a: array<u32, 20000>; }"))),
+        // A system-call vector of structs is encoded into a buffer of its bound: 64 KiB at most.
+        (TooLarge, Case::Sources(sys("/// t\nstruct t { x: u32; y: u32; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (a: vector<t, 8193>) errors(invalid_args, fault) requires none;\n}"))),
         (TooLarge, Case::Sources(sys("/// s\nstruct t { x: array<u64, 8192>; }\n/// t\nstruct s { a: array<t, 2>; }"))),
         (SinceNotIncreasing, Case::Sources(sys("/// s\nsized struct s { @since(1.2) a: u32; @since(1.1) b: u32; }"))),
+        // From major 1 nothing names an item of its library from a later minor (§9): a
+        // parameter, an array element, a field, a constant's bits and members, a capability and
+        // a status.
+        (NewerReference, Case::Sources(sys("/// e\n@since(1.2) enum e: u8 { a = 1; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (x: e) errors(invalid_args) requires none;\n}"))),
+        (NewerReference, Case::Sources(sys("/// t\n@since(1.1) struct t { x: u8; }\n/// i\ninterface i {\n/// m\nmethod m = 1 () -> (a: array<t, 2>) errors(fault) requires none;\n}"))),
+        (NewerReference, Case::Sources(sys("/// e\n@since(1.2) enum e: u8 { a = 1; }\n/// t\nstruct t { x: e; }"))),
+        (NewerReference, Case::Sources(sys("/// b\n@since(1.2) bits b: u8 { a = 0; }\n/// c\nconst c: b = a;"))),
+        (NewerReference, Case::Sources(sys("/// b\nbits b: u8 { a = 0; @since(1.2) z = 1; }\n/// c\nconst c: b = a | z;"))),
+        (NewerReference, Case::Sources(sys("/// k\n@since(1.2) capability t.k;\n/// i\ninterface i {\n/// m\nmethod m = 1 () errors(access_denied) requires t.k;\n}"))),
+        (NewerReference, s("/// d\nlibrary a.b; transport syscall; version 1.2;\n/// s\nenum status: i64 { ok = 0; @since(1.2) late = -20; }\n/// i\ninterface i {\n/// m\nmethod m = 1 () errors(late) requires none;\n}\n")),
         (SinceNotIncreasing, Case::Sources(chan(&one("method m = 1 (@since(1.2) a: u32, @since(1.1) b: u32) errors() requires none;")))),
         (SinceNotIncreasing, Case::Sources(chan(&one("method m = 1 () -> (@since(1.2) a: u32, @since(1.1) b: u32) errors() requires none;")))),
         (BadSince, Case::Sources(sys("/// e\nenum e: u8 { @since(2.0) a = 1; }"))),
@@ -427,6 +445,18 @@ fn an_item_may_be_added_in_a_later_minor() {
 }
 
 #[test]
+fn a_reference_to_a_newer_item_is_a_recorded_break_at_major_0_and_fine_within_one_minor() {
+    // At major 0 nothing is promised (§9): the fingerprint gate reports the change instead.
+    let major_0 = "/// d\nlibrary a.b; transport syscall; version 0.2;\n/// s\nenum status: i64 { ok = 0; invalid_args = -1; }\n/// e\n@since(0.2) enum e: u8 { a = 1; }\n/// i\ninterface i {\n/// m\nmethod m = 1 (x: e) errors(invalid_args) requires none;\n}\n";
+    assert_eq!(run(&s(major_0)), Ok(()));
+    // From major 1, an item added in the same minor as what it names is fine.
+    let same_minor = sys(
+        "/// e\n@since(1.2) enum e: u8 { a = 1; }\n/// t\n@since(1.2) struct t { x: e; }\n/// i\ninterface i {\n/// m\n@since(1.2) method m = 1 (x: e) errors(invalid_args) requires none;\n}",
+    );
+    assert_eq!(compile_all(&same_minor, None), Ok(()));
+}
+
+#[test]
 fn doc_text_is_trimmed_so_it_cannot_become_an_indented_code_block() {
     let input = Input {
         file: "d".to_string(),
@@ -453,14 +483,18 @@ fn a_diagnostic_says_where_the_problem_is() {
 }
 
 const KERNEL: &str = include_str!("../../../../sdk/interfaces/origin.kernel.oidl");
+const DIRECTORY: &str = include_str!("../../../../sdk/interfaces/origin.directory.oidl");
 const ECHO: &str = include_str!("../../tests/fixtures/echo.oidl");
 const CALLS: &str = include_str!("../../tests/fixtures/calls.oidl");
 
-const VERSIONS: &str = "[compatibility]\nuser-abi = \"0.1\"\n";
+/// The versions file the kernel's definition names its version from (§9): the real one, the
+/// one place each number is written (§62).
+const VERSIONS: &str = include_str!("../../../../origin-version.toml");
 
 fn good_inputs() -> Vec<Input> {
     [
         ("origin.kernel.oidl", KERNEL),
+        ("origin.directory.oidl", DIRECTORY),
         ("echo.oidl", ECHO),
         ("calls.oidl", CALLS),
     ]
@@ -475,7 +509,7 @@ fn good_inputs() -> Vec<Input> {
 #[test]
 fn the_shipped_definitions_compile() {
     let comp = compile(&good_inputs(), Some(VERSIONS)).expect("valid");
-    assert_eq!(comp.libraries.len(), 3);
+    assert_eq!(comp.libraries.len(), 4);
     assert!(comp.status.is_some());
     assert!(comp.rights.is_some());
     assert!(comp.object_type.is_some());
@@ -545,7 +579,11 @@ fn a_method_may_name_a_later_version_and_a_version_key_is_read() {
         .iter()
         .find(|l| l.name == "origin.kernel")
         .expect("kernel");
-    assert_eq!((kernel.version.major, kernel.version.minor), (0, 1));
+    assert_eq!(
+        (kernel.version.major, kernel.version.minor),
+        origin_abi::ABI_VERSION,
+        "read from origin-version.toml"
+    );
     assert_eq!(kernel.version_key.as_deref(), Some("user-abi"));
     let echo = comp
         .libraries
