@@ -304,7 +304,7 @@
     - **(a)** A processor's start still records a give-up in a later step (`collect`). That is true to the rule only because a start cannot move.
     - **(b)** A processor's own draws wait in its store when a gathering is interrupted. Someone who reads memory meanwhile (ADR-0016's T7) knows them, and against that reader the next reseed is worth only its newer draws.
     - **(c)** The randomized model of the generator's policy as a host test. **Built:** `security/random/src/tests/model.rs` and nine negative controls in `security/random/tools/plant_faults.py`, on `claude/18b-random-model` at `dabe70b`, merged into the second step-3 batch at `fe457f2` (decision item 190). No person has read it.
-    - **(d)** From the landing (`c2245ef`): run the memory-object proof on a machine with no generator and show `not_supported` for a map at a place the kernel chooses. Today that proof does not run there, and only a host test of `mapping::place_at_random` shows the status.
+    - **(d)** From the landing (`c2245ef`): run the memory-object proof on a machine with no generator and show `not_supported` for a map at a place the kernel chooses. Today that proof does not run there, and only a host test of `mapping::place_at_random` shows the status. *An observation from the interface session (2026-11-11), not a remedy:* on such a machine no process can be launched, since a start record's place is drawn too (threat row P3), so the proof cannot be a ring-3 program there. A remedy would have to call the map path from the kernel, with the kernel choosing the place, in a process that is never started.
 
 ## Waiting on the owner
 
