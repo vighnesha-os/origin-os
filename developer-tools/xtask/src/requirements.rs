@@ -23,13 +23,20 @@
 //!   names no decision item or that no scope change names (item 196);
 //! - an answered decision item that no row names and the README does not list, and a row or a
 //!   scope change that names an item the decision sheet does not hold as answered;
+//! - a row that says its evidence ran on hardware and names no record the gate can read
+//!   ([`RECORD_KEYS`]);
+//! - a heading, a code block or a table's header of the directive that is not as its PART's
+//!   recorded digest ([`unquoted`]): with the rows' quotes, every line of the directive is held;
+//! - a row that is `done` or `info` without its ID in the README's lists, so the figure cannot
+//!   move by one cell alone;
 //! - a matrix checked against another revision of the directive than the one in the tree;
 //! - a run that read no row: nothing was checked.
 //!
 //! **What it does not see:** whether a row's owner, scope, kind, acceptance criteria or state is
 //! the right judgement; whether evidence that exists passes, which is `cargo xtask check` and the
 //! boots; where evidence ran, beyond asking a hardware record of a row that says hardware; who
-//! reviewed a row; and a decision of an ADR whose body changes under an unchanged title.
+//! reviewed a row; whether a row's acceptance criterion is its own, which it prints a count of;
+//! and a decision of an ADR whose body changes under an unchanged title.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -50,8 +57,11 @@ const SHEET: &str = "docs/engineering/OWNER_DECISIONS.md";
 const PROOFS: &str = "framekernel/src/bootproof.rs";
 /// Where a `cargo xtask` command is looked for: `xtask:<command>`.
 const COMMANDS: &str = "developer-tools/xtask/src/main.rs";
-/// Where the record of a run on a physical machine is kept (CLAUDE.md §74, §79).
-const HARDWARE_RECORDS: &str = "docs/hardware/";
+/// Where the record of a run on a physical machine is kept (CLAUDE.md §74, §79). Other files
+/// under `docs/hardware/`, the shortlist of machines to buy among them, are no such record.
+const HARDWARE_RECORDS: &str = "docs/hardware/records/";
+/// What a hardware record says, each as a row of a table in it.
+const RECORD_KEYS: [&str; 5] = ["Machine", "Firmware", "Source revision", "Date", "Result"];
 
 /// The header of every table of the matrix.
 const COLUMNS: [&str; 13] = [
@@ -73,6 +83,11 @@ const COLUMNS: [&str; 13] = [
 const CHANGES: [&str; 4] = ["Item", "Date", "What changed", "Rows"];
 /// The header of the README's table of answered decision items that no row names (item 191).
 const UNROWED: [&str; 3] = ["Item", "Rows", "Why"];
+/// The header of the README's table of what the rows do not quote: each PART's headings, code
+/// blocks and table headers, as one digest.
+const UNQUOTED: [&str; 2] = ["Part", "Headings and code blocks"];
+/// The header of the README's lists of the rows that move the figure: `done` and `info`.
+const LISTS: [&str; 2] = ["List", "Rows"];
 /// The first cell of the README's row that says which revision of the directive the matrix
 /// was checked against.
 const REVISION_KEY: &str = "Directive revision";
@@ -249,6 +264,70 @@ struct Directive {
     roles: BTreeSet<u8>,
     /// Lines the statement rule does not define. Each fails the gate.
     problems: Vec<String>,
+    /// For each PART, the SHA-256 of the lines no row quotes: see [`unquoted`].
+    unquoted: BTreeMap<u8, String>,
+}
+
+/// Bytes as lower-case hexadecimal.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
+/// What no row of the matrix quotes, as one digest for each PART of the directive (0 for the
+/// header, one past the last PART for the final rules): its headings, its rules, its fenced code
+/// with the fences, and its tables' header and rule rows. With the statements, that is every
+/// line of the directive that is not blank.
+fn unquoted(text: &str) -> BTreeMap<u8, String> {
+    let mut lines: BTreeMap<u8, Vec<&str>> = BTreeMap::new();
+    let mut part = 0u8;
+    let mut fenced = false;
+    let mut in_table = false;
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        let fence = raw.starts_with("```");
+        if fence {
+            fenced = !fenced;
+        }
+        let kept = if fence || fenced {
+            in_table = false;
+            true
+        } else if line.starts_with('#') || line == "---" {
+            in_table = false;
+            if line.starts_with("# PART ") || line.starts_with("# FINAL MANDATORY") {
+                part += 1;
+            }
+            true
+        } else if line.starts_with('|') {
+            let rule = cells(line).is_some_and(|cells| {
+                cells
+                    .iter()
+                    .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':')))
+            });
+            let header = !in_table;
+            in_table = true;
+            header || rule
+        } else {
+            in_table = false;
+            false
+        };
+        if kept {
+            lines.entry(part).or_default().push(line);
+        } else {
+            lines.entry(part).or_default();
+        }
+    }
+    lines
+        .into_iter()
+        .map(|(part, lines)| {
+            (
+                part,
+                hex(&origin_crypto::Sha256::digest(lines.join("\n").as_bytes())),
+            )
+        })
+        .collect()
 }
 
 /// A piece of the directive, before lead-ins are joined.
@@ -299,7 +378,10 @@ fn is_label(text: &str) -> bool {
 /// joined in front of the paragraph after it, unless that is a label too. A lead-in with a code
 /// block after it is a statement by itself.
 fn directive(text: &str) -> Directive {
-    let mut out = Directive::default();
+    let mut out = Directive {
+        unquoted: unquoted(text),
+        ..Directive::default()
+    };
     let mut blocks: Vec<(Section, u8, usize, Block)> = Vec::new();
     let mut section = Section::Header;
     let mut part = 0u8;
@@ -793,6 +875,11 @@ struct Readme {
     revision: Option<String>,
     changes: Vec<Change>,
     unrowed: Vec<Unrowed>,
+    /// For each PART of the directive, the digest the README records of what no row quotes.
+    unquoted: Option<BTreeMap<u8, String>>,
+    /// The IDs the README lists as `done`, and as `info`.
+    done: Option<BTreeSet<String>>,
+    information: Option<BTreeSet<String>>,
     problems: Vec<String>,
 }
 
@@ -842,6 +929,43 @@ fn readme(text: &str) -> Readme {
                     )),
                 }
             }
+        } else if is_header(&table.header, &UNQUOTED) {
+            let recorded = out.unquoted.get_or_insert_with(BTreeMap::new);
+            for (line, cells) in &table.rows {
+                let part = cells.first().and_then(|part| part.parse::<u8>().ok());
+                match (part, cells.get(1)) {
+                    (Some(part), Some(digest)) if cells.len() == 2 => {
+                        if recorded.insert(part, digest.clone()).is_some() {
+                            out.problems
+                                .push(format!("README.md:{line}: PART {part:02} is recorded twice"));
+                        }
+                    }
+                    _ => out.problems.push(format!(
+                        "README.md:{line}: a row of what the rows do not quote is a PART's number and a digest"
+                    )),
+                }
+            }
+        } else if is_header(&table.header, &LISTS) {
+            for (line, cells) in &table.rows {
+                let list = match cells.first().map(String::as_str) {
+                    Some("done") if cells.len() == 2 => out.done.get_or_insert_with(BTreeSet::new),
+                    Some("info") if cells.len() == 2 => {
+                        out.information.get_or_insert_with(BTreeSet::new)
+                    }
+                    _ => {
+                        out.problems.push(format!(
+                            "README.md:{line}: a list of rows is `done` or `info`, and then the rows' IDs"
+                        ));
+                        continue;
+                    }
+                };
+                for id in entries(&cells[1]) {
+                    if !list.insert(id.to_string()) {
+                        out.problems
+                            .push(format!("README.md:{line}: the list names {id} twice"));
+                    }
+                }
+            }
         } else {
             for (_, cells) in &table.rows {
                 if cells.len() == 2 && cells[0] == REVISION_KEY {
@@ -849,6 +973,18 @@ fn readme(text: &str) -> Readme {
                 }
             }
         }
+    }
+    if out.unquoted.is_none() {
+        out.problems.push(
+            "README.md has no table of what the rows do not quote (`| Part | Headings and code blocks |`)"
+                .into(),
+        );
+    }
+    if out.done.is_none() || out.information.is_none() {
+        out.problems.push(
+            "README.md has no lists of the rows that are `done` and that are `info` (`| List | Rows |`)"
+                .into(),
+        );
     }
     if !has_changes {
         out.problems.push(
@@ -970,6 +1106,8 @@ struct Row {
     state: Option<State>,
     implementation: Vec<String>,
     acceptance: bool,
+    /// The acceptance criteria as written.
+    criteria: String,
     evidence: Vec<Evidence>,
     env: Option<Env>,
     review: Review,
@@ -1166,6 +1304,7 @@ fn row(file: &str, line: usize, cells: &[String]) -> std::result::Result<Row, St
         state,
         implementation,
         acceptance: acceptance != "-" && !acceptance.is_empty(),
+        criteria: acceptance.clone(),
         evidence: found,
         env,
         review,
@@ -1268,6 +1407,27 @@ struct Figure {
     items_named: usize,
     items_nothing: usize,
     items_owed: usize,
+    /// How many different acceptance criteria the rows past `not-started` have between them,
+    /// and how many rows the commonest one serves.
+    criteria_texts: usize,
+    criteria_commonest: usize,
+}
+
+/// What a hardware record does not say: the keys of [`RECORD_KEYS`] for which its tables have
+/// no row with something beside the key.
+fn unsaid(record: &str) -> Vec<&'static str> {
+    let tables = tables(record);
+    RECORD_KEYS
+        .into_iter()
+        .filter(|key| {
+            !tables
+                .iter()
+                .flat_map(|table| &table.rows)
+                .any(|(_, cells)| {
+                    cells.len() == 2 && cells[0] == *key && !cells[1].is_empty() && cells[1] != "-"
+                })
+        })
+        .collect()
 }
 
 /// Adds problems of one kind, listing the first [`LISTED`] and counting the rest.
@@ -1532,19 +1692,44 @@ fn problems(sources: &Sources<'_>, tree: &dyn Tree) -> (Vec<String>, Figure) {
         }
         if let Some(env) = row.env {
             figure.ran[env as usize] += 1;
-            let has_record = row
-                .evidence
-                .iter()
-                .any(|e| matches!(e, Evidence::File(path) if path.starts_with(HARDWARE_RECORDS)));
-            need(
-                env != Env::Hardware || has_record,
-                &format!(
-                    "its evidence ran on hardware, and it names no record under {HARDWARE_RECORDS} (`file:{HARDWARE_RECORDS}…`)"
-                ),
-            );
+            if env == Env::Hardware {
+                let records: Vec<&String> = row
+                    .evidence
+                    .iter()
+                    .filter_map(|e| match e {
+                        Evidence::File(path) if path.starts_with(HARDWARE_RECORDS) => Some(path),
+                        _ => None,
+                    })
+                    .collect();
+                need(
+                    !records.is_empty(),
+                    &format!(
+                        "its evidence ran on hardware, and it names no record under {HARDWARE_RECORDS} (`file:{HARDWARE_RECORDS}…`)"
+                    ),
+                );
+                for path in records {
+                    let missing = tree.text(path).map_or_else(Vec::new, |text| unsaid(&text));
+                    need(
+                        missing.is_empty(),
+                        &format!(
+                            "its hardware record `{path}` does not say: {}. A record is a table with a row for each of {}",
+                            missing.join(", "),
+                            RECORD_KEYS.join(", ")
+                        ),
+                    );
+                }
+            }
         }
     }
     figure.counted = figure.rows - figure.information - figure.removed;
+    let mut criteria: BTreeMap<&str, usize> = BTreeMap::new();
+    for row in &rows {
+        if row.acceptance && !matches!(row.state, None | Some(State::NotStarted | State::Removed)) {
+            *criteria.entry(row.criteria.as_str()).or_default() += 1;
+        }
+    }
+    figure.criteria_texts = criteria.len();
+    figure.criteria_commonest = criteria.values().copied().max().unwrap_or(0);
 
     // The rows against their sources: every statement and decision has one row, in the file of
     // its source and in its order, and no row quotes what its source does not say.
@@ -1713,6 +1898,61 @@ fn problems(sources: &Sources<'_>, tree: &dyn Tree) -> (Vec<String>, Figure) {
         ));
     }
 
+    // What no row quotes: each PART's headings, code blocks and table headers are as the README
+    // recorded them, so a change to one is seen and read against that PART's rows.
+    if let Some(recorded) = &readme.unquoted {
+        for (part, now) in &directive.unquoted {
+            match recorded.get(part) {
+                Some(then) if then == now => {}
+                then => problems.push(format!(
+                    "{DIRECTIVE}: the headings, code blocks or table headers of PART {part:02} are not as {MATRIX}/README.md records them (they give SHA-256 {now}, and the README has {}). Read the change against the rows of directive-{part:02}-<name>.md, then record the new digest",
+                    then.map_or("none", String::as_str)
+                )),
+            }
+        }
+        for part in recorded
+            .keys()
+            .filter(|part| !directive.unquoted.contains_key(part))
+        {
+            problems.push(format!(
+                "{MATRIX}/README.md records a digest for PART {part:02}, which {DIRECTIVE} does not have"
+            ));
+        }
+    }
+
+    // The rows that move the figure, `done` and `info`, are the ones the README lists, so a row
+    // joins or leaves either by two edits.
+    for (what, listed_ids, is) in [
+        (
+            "done",
+            &readme.done,
+            (|row: &Row| row.state == Some(State::Done)) as fn(&Row) -> bool,
+        ),
+        ("info", &readme.information, |row: &Row| {
+            row.kind == Kind::Info
+        }),
+    ] {
+        let Some(listed_ids) = listed_ids else {
+            continue;
+        };
+        for row in rows
+            .iter()
+            .filter(|row| is(row) && !listed_ids.contains(&row.id))
+        {
+            problems.push(format!(
+                "{MATRIX}/{}:{}: row {} is `{what}`, and the README's list of `{what}` rows does not name it: a row joins that list by an edit of its own",
+                row.file, row.line, row.id
+            ));
+        }
+        for id in listed_ids {
+            if !ids.get(id.as_str()).is_some_and(|row| is(row)) {
+                problems.push(format!(
+                    "{MATRIX}/README.md lists {id} as `{what}`, and the matrix has no such row that is"
+                ));
+            }
+        }
+    }
+
     // Scope changes: their items are answered, their rows exist, and they name every removed row.
     let touches = |change: &Change, id: &str| {
         change.rows.iter().any(|row| match row.strip_suffix('*') {
@@ -1802,10 +2042,17 @@ fn report(figure: &Figure) -> String {
         figure.by_agent,
         figure.by_nobody
     );
-    let _ = write!(
+    let _ = writeln!(
         out,
         "xtask: requirements decisions: of {} answered decision items, rows name {}, {} are listed as asking for nothing and {} as owed rows",
         figure.items_answered, figure.items_named, figure.items_nothing, figure.items_owed
+    );
+    let _ = write!(
+        out,
+        "xtask: requirements criteria: the {} rows past not-started have {} different acceptance criteria between them, and the commonest serves {} rows: a row has a criterion of its own once its task's contract writes one",
+        figure.by_person + figure.by_agent + figure.by_nobody,
+        figure.criteria_texts,
+        figure.criteria_commonest
     );
     out
 }
@@ -1987,6 +2234,12 @@ Its text.
 | Item | Rows | Why |
 |---|---|---|
 | 3 | none | A process rule. |
+
+| List | Rows |
+|---|---|
+| done | S3-03 |
+| info | H-01, H-02, S1-01 |
+| info | P2-01, F-02 |
 ";
 
     const HEAD: &str = "\
@@ -2061,6 +2314,18 @@ Its text.
         readme: String,
         files: Vec<(String, String)>,
         tree: BTreeMap<String, String>,
+        /// The directive the README's digests were recorded from: the case's own, unless a
+        /// test sets an older one. `Some("")` leaves the table out.
+        recorded_from: Option<String>,
+    }
+
+    /// The README's table of what the rows do not quote, as recorded from `directive`.
+    fn digests(directive: &str) -> String {
+        let mut table = String::from("\n| Part | Headings and code blocks |\n|---|---|\n");
+        for (part, digest) in unquoted(directive) {
+            table.push_str(&format!("| {part:02} | {digest} |\n"));
+        }
+        table
     }
 
     impl Case {
@@ -2089,15 +2354,22 @@ Its text.
                     .iter()
                     .map(|(path, text)| ((*path).to_string(), (*text).to_string()))
                     .collect(),
+                recorded_from: None,
             }
         }
 
         fn judged(&self) -> (Vec<String>, Figure) {
+            let recorded = match self.recorded_from.as_deref() {
+                Some("") => String::new(),
+                Some(older) => digests(older),
+                None => digests(&self.directive),
+            };
+            let readme = format!("{}{recorded}", self.readme);
             let sources = Sources {
                 directive: &self.directive,
                 adrs: &self.adrs,
                 sheet: &self.sheet,
-                readme: &self.readme,
+                readme: &readme,
                 files: &self.files,
             };
             problems(&sources, &self.tree)
@@ -2174,9 +2446,15 @@ Its text.
                 items_named: 2,
                 items_nothing: 1,
                 items_owed: 0,
+                criteria_texts: 4,
+                criteria_commonest: 1,
             }
         );
         let report = report(&figure);
+        assert!(
+            report.contains("the 4 rows past not-started have 4 different acceptance criteria between them, and the commonest serves 1 rows"),
+            "{report}"
+        );
         assert!(
             report.contains("1 of 12 counted rows are done (8.3%)"),
             "{report}"
@@ -2579,9 +2857,7 @@ The owner accepted both:
     fn an_id_used_twice_is_refused() {
         Case::sound()
             .edit("directive-03-final.md", "| F-02 |", "| F-01 |")
-            .refused_once(
-                "directive-03-final.md:6: the ID F-01 is also at directive-03-final.md:5",
-            );
+            .refused("directive-03-final.md:6: the ID F-01 is also at directive-03-final.md:5");
     }
 
     #[test]
@@ -2726,23 +3002,47 @@ The owner accepted both:
 
     #[test]
     fn evidence_at_or_above_the_scope_can_be_done() {
-        let mut on_hardware = Case::sound()
-            .edit(
-                "directive-02-build.md",
-                "| build | both/hw | 2 | built |",
-                "| build | both/hw | 2 | done |",
-            )
-            .edit(
-                "directive-02-build.md",
-                "xtask:boot-test | emu |",
-                "xtask:boot-test, file:docs/hardware/first-machine.md | hw |",
-            );
-        on_hardware.refused_once("the file `docs/hardware/first-machine.md`");
-        on_hardware.tree.insert(
-            "docs/hardware/first-machine.md".to_string(),
-            "A record.\n".to_string(),
+        const RECORD: &str = "docs/hardware/records/first-machine.md";
+        let record = "# The first machine\n\n| | |\n|---|---|\n| Machine | A board |\n| Firmware | 1.2 |\n| Source revision | 00dc7aa |\n| Date | 2027-01-01 |\n| Result | `boot-matrix` passed |\n";
+        let on_hardware = |evidence: &str| {
+            let mut case = Case::sound()
+                .edit(
+                    "directive-02-build.md",
+                    "| build | both/hw | 2 | built |",
+                    "| build | both/hw | 2 | done |",
+                )
+                .edit(
+                    "directive-02-build.md",
+                    "xtask:boot-test | emu |",
+                    &format!("xtask:boot-test, {evidence} | hw |"),
+                );
+            case.readme = once(README_TEXT, "| done | S3-03 |", "| done | S3-03, S3-01 |");
+            case
+        };
+        // The record is named and is not in the tree.
+        let mut case = on_hardware(&format!("file:{RECORD}"));
+        case.refused_once(&format!("the file `{RECORD}`"));
+        // It is there, and says what a record says.
+        case.tree.insert(RECORD.to_string(), record.to_string());
+        assert_eq!(case.judged().0, Vec::<String>::new());
+        // It leaves two things out, one of them by a dash.
+        case.tree.insert(
+            RECORD.to_string(),
+            record
+                .replace("| Firmware | 1.2 |\n", "")
+                .replace("| 2027-01-01 |", "| - |"),
         );
-        assert_eq!(on_hardware.judged().0, Vec::<String>::new());
+        case.refused_once(&format!(
+            "row S3-01: its hardware record `{RECORD}` does not say: Firmware, Date. A record is a table with a row for each of Machine, Firmware, Source revision, Date, Result"
+        ));
+        // Another file under docs/hardware/ is no record: the list of machines to buy is there.
+        let mut shortlist = on_hardware("file:docs/hardware/SHORTLIST.md");
+        shortlist
+            .tree
+            .insert("docs/hardware/SHORTLIST.md".to_string(), record.to_string());
+        shortlist.refused_once(
+            "row S3-01: its evidence ran on hardware, and it names no record under docs/hardware/records/",
+        );
         // Emulation is enough for a row whose scope is the host.
         let above = Case::sound().edit(
             "directive-02-build.md",
@@ -2750,6 +3050,152 @@ The owner accepted both:
             "| file:rust-toolchain.toml | emu |",
         );
         assert_eq!(above.judged().0, Vec::<String>::new());
+    }
+
+    #[test]
+    fn headings_and_code_blocks_are_held_by_a_digest() {
+        // What a row quotes does not move a digest: the rows hold that.
+        let reworded = once(DIRECTIVE_TEXT, "- A kernel entry.", "- A kernel exit.");
+        let renumbered = once(
+            DIRECTIVE_TEXT,
+            "| `.ose` | Origin System Executable |",
+            "| `.ose` | Executable |",
+        );
+        assert_eq!(unquoted(&reworded), unquoted(DIRECTIVE_TEXT));
+        assert_eq!(unquoted(&renumbered), unquoted(DIRECTIVE_TEXT));
+        assert_eq!(
+            unquoted(DIRECTIVE_TEXT)
+                .keys()
+                .copied()
+                .collect::<Vec<u8>>(),
+            [0, 1, 2, 3]
+        );
+        // What no row quotes does, in its own PART.
+        for (from, to, part) in [
+            ("channel = \"1.99.1\"", "channel = \"1.99.2\"", 2),
+            ("```toml", "```text", 2),
+            ("## 3. Boot", "## 3. Booting", 2),
+            ("# PART II — BUILD", "# PART II — BUILDING", 2),
+            ("| Extension | Purpose |", "| Extension | Use |", 0),
+            ("## 2. Priorities", "## 2. The priorities", 1),
+            (
+                "# FINAL MANDATORY ENGINEERING RULES",
+                "# FINAL MANDATORY ENGINEERING RULES, AGAIN",
+                3,
+            ),
+        ] {
+            let mut case = Case::sound();
+            case.recorded_from = Some(DIRECTIVE_TEXT.to_string());
+            case.directive = once(DIRECTIVE_TEXT, from, to);
+            case.refused_once(&format!(
+                "CLAUDE.md: the headings, code blocks or table headers of PART {part:02} are not as docs/requirements/README.md records them"
+            ));
+        }
+        // A PART the README has no digest for, and one the directive does not have.
+        let mut gained = Case::sound();
+        gained.recorded_from = Some(DIRECTIVE_TEXT.to_string());
+        gained.directive = once(
+            DIRECTIVE_TEXT,
+            "# FINAL MANDATORY",
+            "# PART III — MORE\n\n# FINAL MANDATORY",
+        );
+        gained.refused(
+            "PART 04 are not as docs/requirements/README.md records them (they give SHA-256",
+        );
+        gained.refused("and the README has none)");
+        let mut lost = Case::sound();
+        lost.recorded_from = Some(once(
+            DIRECTIVE_TEXT,
+            "# FINAL MANDATORY",
+            "# PART III — MORE\n\n# FINAL MANDATORY",
+        ));
+        lost.refused("README.md records a digest for PART 04, which CLAUDE.md does not have");
+        let mut unrecorded = Case::sound();
+        unrecorded.recorded_from = Some(String::new());
+        unrecorded.refused_once("README.md has no table of what the rows do not quote");
+        let mut twice = Case::sound();
+        twice.readme.push_str("\n| Part | Headings and code blocks |\n|---|---|\n| 09 | abc |\n| 09 | abc |\n| nine | abc |\n");
+        twice.refused("README.md:24: PART 09 is recorded twice");
+        twice.refused(
+            "README.md:25: a row of what the rows do not quote is a PART's number and a digest",
+        );
+    }
+
+    #[test]
+    fn the_rows_that_move_the_figure_are_listed() {
+        for (from, to, needle) in [
+            // A row that is done, or asks for nothing, and is not on its list.
+            (
+                "| done | S3-03 |\n",
+                "| done | - |\n",
+                "directive-02-build.md:8: row S3-03 is `done`, and the README's list of `done` rows does not name it",
+            ),
+            (
+                "| info | P2-01, F-02 |",
+                "| info | P2-01 |",
+                "directive-03-final.md:6: row F-02 is `info`, and the README's list of `info` rows does not name it",
+            ),
+            // A row on a list that is not what the list says, or is no row.
+            (
+                "| done | S3-03 |",
+                "| done | S3-03, S3-01 |",
+                "README.md lists S3-01 as `done`, and the matrix has no such row that is",
+            ),
+            (
+                "| info | P2-01, F-02 |",
+                "| info | P2-01, F-02, F-01 |",
+                "README.md lists F-01 as `info`, and the matrix has no such row that is",
+            ),
+            (
+                "| info | P2-01, F-02 |",
+                "| info | P2-01, F-02, F-09 |",
+                "README.md lists F-09 as `info`, and the matrix has no such row that is",
+            ),
+            (
+                "| info | P2-01, F-02 |",
+                "| info | P2-01, F-02, H-01 |",
+                "README.md:19: the list names H-01 twice",
+            ),
+            (
+                "| done | S3-03 |",
+                "| built | S3-01 |",
+                "README.md:17: a list of rows is `done` or `info`, and then the rows' IDs",
+            ),
+        ] {
+            let mut case = Case::sound();
+            case.readme = once(README_TEXT, from, to);
+            case.refused(needle);
+        }
+        // A row cannot leave the count, or become done, by its own cells alone.
+        Case::sound()
+            .edit(
+                "directive-00-header.md",
+                "| build | both/hw | 2 | not-started |",
+                "| info | - | 2 | - |",
+            )
+            .refused_once(
+                "row H-03 is `info`, and the README's list of `info` rows does not name it",
+            );
+        Case::sound()
+            .edit(
+                "directive-01-authority.md",
+                "| S1-02 | 1. **First Architect.** Own the first things. | build | eng/host | 1 | not-started | - | - | - | - | none |",
+                "| S1-02 | 1. **First Architect.** Own the first things. | build | eng/host | 1 | done | docs/x.md | It is there. | file:docs/x.md | host | none |",
+            )
+            .refused_once("row S1-02 is `done`, and the README's list of `done` rows does not name it");
+    }
+
+    #[test]
+    fn the_commonest_criterion_is_counted() {
+        let (found, figure) = Case::sound()
+            .edit(
+                "directive-02-build.md",
+                "| The entry's proof passes. |",
+                "| A gate holds it. |",
+            )
+            .judged();
+        assert_eq!(found, Vec::<String>::new());
+        assert_eq!((figure.criteria_texts, figure.criteria_commonest), (3, 2));
     }
 
     #[test]
@@ -3056,6 +3502,7 @@ The owner accepted both:
         bare.readme = "| | |\n|---|---|\n| Directive revision | 9.1 |\n".to_string();
         bare.refused("README.md has no table of scope changes");
         bare.refused("README.md has no table of decision items without rows");
+        bare.refused("README.md has no lists of the rows that are `done` and that are `info`");
     }
 
     #[test]
