@@ -91,8 +91,10 @@
 //! violation was seen, and the violations' texts. The same seed makes the same run, and a
 //! short run is the beginning of the run at length.
 //!
-//! **Negative controls.** `tools/plant_faults.py` puts defects back one at a time. For the
-//! entries it marks as this model's it fails unless a test of this file notices each.
+//! **Negative controls.** `tools/plant_faults.py` puts defects into the policy one at a time
+//! and says which rules the model then reports broken. For the entries it marks as this
+//! model's it fails unless a test of this file notices each. The rules that no defect of one
+//! edit reaches are shown something false by hand, in the last two tests here.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
@@ -1854,4 +1856,153 @@ fn the_same_seed_makes_the_same_run() {
     });
     assert!(once.0.fresh_pieces > 0 && once.0.moves > 0);
     assert_eq!(once, again);
+}
+
+// ---- The rules themselves, on a store and on answers made up by hand. ----
+//
+// `tools/plant_faults.py` shows that most rules can be broken: it puts defects into the policy
+// and the model reports them. No defect of one edit reaches the rules below, so here the model
+// is shown something false directly.
+
+/// A quiet machine in which processor 0 is given a full store by hand, logged as eight RDSEED
+/// draws of its own. `tamper` changes the store or what the log says of it. Then the processor
+/// is due, and one plain request makes it reseed from that store. Returns what the model said.
+fn reseed_from_a_made_up_store(tamper: impl FnOnce(&mut Machine, [u64; 8])) -> Vec<String> {
+    let mut machine = Machine::started(5, &[(true, true), (true, true)]);
+    let values: [u64; 8] = std::array::from_fn(|n| splitmix(0x4D41_4445, n as u64));
+    let time = machine.log.time;
+    let node = &mut machine.nodes[0];
+    for (slot, value) in node.entropy.as_chunks_mut::<8>().0.iter_mut().zip(values) {
+        *slot = value.to_le_bytes();
+    }
+    node.have = 8;
+    node.from = Rdseed;
+    for value in values {
+        let drawn = Drawn {
+            time,
+            cpu: 0,
+            which: Rdseed,
+            request: None,
+            lent: None,
+        };
+        machine.log.drawn.insert(value, drawn);
+    }
+    tamper(&mut machine, values);
+    machine.now += PERIOD;
+    machine.on = 0;
+    let frame = machine.log.open(Kind::Plain);
+    machine.log.frames.push(frame);
+    let mut out = [UNWRITTEN; 8];
+    let result = fill(&mut machine, &mut out);
+    if let Some(frame) = machine.log.frames.pop() {
+        machine.judge(&frame, &out, result);
+    }
+    assert_eq!(machine.log.tally.own_reseeds, 1, "the store was not used");
+    machine.log.violations
+}
+
+/// Changes what the log says of one draw.
+fn relog(machine: &mut Machine, value: u64, change: impl FnOnce(&mut Drawn)) {
+    change(machine.log.drawn.get_mut(&value).expect("a logged draw"));
+}
+
+#[test]
+fn the_rules_notice_a_store_that_is_not_what_the_log_says() {
+    assert_eq!(
+        reseed_from_a_made_up_store(|_, _| ()),
+        Vec::<String>::new(),
+        "a store that is what the log says"
+    );
+    type Tamper = fn(&mut Machine, [u64; 8]);
+    let cases: [(&str, Tamper); 7] = [
+        (
+            "own: a value in the seed is no draw that the store was keeping",
+            |machine, values| {
+                machine.log.drawn.remove(&values[3]);
+            },
+        ),
+        (
+            "a draw went into two seeds: root, then own",
+            |machine, values| {
+                machine.log.used.insert(values[0], Seed::Root);
+            },
+        ),
+        (
+            "own: a draw made under a lending is used from a store that is not lent",
+            |machine, values| relog(machine, values[7], |drawn| drawn.lent = Some(1)),
+        ),
+        (
+            "own: a draw of an instruction that failed since",
+            |machine, _| machine.log.failed_at[0][slot(Rdseed)] = machine.log.time,
+        ),
+        ("own: a draw of processor 1 used on 0", |machine, values| {
+            relog(machine, values[1], |drawn| drawn.cpu = 1)
+        }),
+        (
+            "own: the store's instruction is not the draw's",
+            |machine, values| relog(machine, values[2], |drawn| drawn.which = Rdrand),
+        ),
+        ("own: an RDRAND draw was set aside", |machine, values| {
+            // A ninth draw, set aside, that the log has as RDRAND's.
+            let aside = values[0] ^ 1;
+            let mut drawn = machine.log.drawn[&values[0]];
+            drawn.which = Rdrand;
+            machine.log.drawn.insert(aside, drawn);
+            let node = &mut machine.nodes[0];
+            node.aside[16..24].copy_from_slice(&aside.to_le_bytes());
+            node.aside_have = 1;
+        }),
+    ];
+    for (rule, tamper) in cases {
+        let said = reseed_from_a_made_up_store(tamper);
+        assert!(
+            !said.is_empty() && said.iter().all(|line| line == rule),
+            "{rule}: the model said {said:?}"
+        );
+    }
+}
+
+#[test]
+fn the_rules_notice_an_answer_that_is_none() {
+    // Nothing here needs a generator: the answers are made up.
+    let mut machine = Machine::new(0, &[(true, true)]);
+    let mut said = |kind, draws, out: &[u8], result| {
+        let mut frame = machine.log.open(kind);
+        frame.draws = draws;
+        machine.judge(&frame, out, result);
+        std::mem::take(&mut machine.log.violations)
+    };
+    let none = Vec::<String>::new();
+    let answer: Vec<u8> = (1..=40).collect();
+    assert_eq!(said(Kind::Plain, 16, &answer, Ok(())), none);
+    assert_eq!(said(Kind::Fresh, 99, &answer[8..], Ok(())), none);
+    assert_eq!(
+        said(Kind::Fresh, 0, &answer, Ok(())),
+        ["fresh: an output came twice"]
+    );
+    assert_eq!(
+        said(Kind::Plain, 17, &answer[16..], Ok(())),
+        ["plain: a request made 17 draws"]
+    );
+    for left in [UNWRITTEN, 0] {
+        let mut holed = answer.clone();
+        holed[0] = left;
+        holed[16..32].fill(left);
+        assert_eq!(
+            said(Kind::Plain, 0, &holed, Ok(())),
+            ["plain: an answer of 40 bytes with 16 that are no answer"]
+        );
+    }
+    let refused = Err(Error::NotNow);
+    assert_eq!(said(Kind::Fresh, 0, &[0; 24], refused), none);
+    assert_eq!(
+        said(Kind::Plain, 0, &[0; 24], refused),
+        ["plain: a request was refused"]
+    );
+    let mut left = [0; 24];
+    left[23] = 1;
+    assert_eq!(
+        said(Kind::Fresh, 0, &left, refused),
+        ["fresh: a refused request left bytes"]
+    );
 }
