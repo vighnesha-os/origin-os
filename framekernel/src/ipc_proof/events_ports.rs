@@ -532,6 +532,7 @@ fn run_rules(
     com1: &mut Console,
     bsp: CpuIndex,
     tsc_hz: u64,
+    name: &str,
     build: fn(&mut Written) -> Vec<usize>,
 ) -> Ran {
     let failed = Ran {
@@ -562,14 +563,14 @@ fn run_rules(
     if let Some((i, number, got, want)) = first_wrong(&steps, &reports) {
         let _ = writeln!(
             com1,
-            "origin-kernel: events: step {i} (call {number:#x}) returned {got}, not {want}{}",
+            "origin-kernel: events: the {name} rules process: step {i} (call {number:#x}) returned {got}, not {want}{}",
             verdict(false)
         );
     }
     if let Some((key, seen)) = first_wrong_packet(&packets, &reports) {
         let _ = writeln!(
             com1,
-            "origin-kernel: events: the packet with key {key} was reported as {seen:x?}{}",
+            "origin-kernel: events: the {name} rules process: the packet with key {key} was reported as {seen:x?}{}",
             verdict(false)
         );
     }
@@ -582,9 +583,9 @@ fn run_rules(
 
 /// Every rule one process can show by itself, in three processes.
 fn rules(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
-    let first = run_rules(com1, bsp, tsc_hz, events_and_delivery);
-    let second = run_rules(com1, bsp, tsc_hz, cancels);
-    let third = run_rules(com1, bsp, tsc_hz, refusals);
+    let first = run_rules(com1, bsp, tsc_hz, "first", events_and_delivery);
+    let second = run_rules(com1, bsp, tsc_hz, "second", cancels);
+    let third = run_rules(com1, bsp, tsc_hz, "third", refusals);
     let at = |ran: &Ran, i: usize| ran.groups.get(i).copied().unwrap_or(false);
     let (events, deliver) = (at(&first, 0), at(&first, 1));
     let (explicit, implicit) = (at(&second, 0), at(&second, 1));
