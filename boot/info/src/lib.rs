@@ -662,7 +662,6 @@ mod tests {
         // A region of another kind at the same place gives nothing.
         let mut others = regions;
         others[1].kind = RegionKind::LoaderReclaimable as u32;
-        let mut info = info;
         info.boot_seed = 0x9000;
         assert_eq!(boot_seed(&info, 0x8000, &others), None);
     }
