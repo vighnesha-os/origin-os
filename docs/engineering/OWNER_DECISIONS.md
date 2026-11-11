@@ -396,7 +396,7 @@ Nothing is built. The work is TASKS item 19b, which writes its contract first (i
 
 **Coming back to you:** item 134, with the storage-encryption ADR; and the trust classes that would let item 125 cost less, with measurements.
 
-## The kernel's random-number generator (ADR-0016): Accepted 2026-11-10, the mechanism built, nothing in the kernel
+## The kernel's random-number generator (ADR-0016): Accepted 2026-11-10; built by tasks 18a and 18b, under QEMU only
 
 Decision item 113 accepted one generator in outline. [ADR-0016](../adr/ADR-0016-kernel-random-numbers.md) filled the outline in and ended with seven questions, each with a recommended answer checked against CLAUDE.md 7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C. The seventh, a download, is item 145 above. You answered **"Accept all"** to the other six on 2026-11-10, in the session that wrote the ADR. The coordinating session put the same six to you the same day, in shorter words, and records the same answer (its commit `44de977`).
 
@@ -409,7 +409,7 @@ Three of them change something you had already accepted. The ADR said so before 
 | # | Question | Answer | Where it is recorded, and its state |
 |---|---|---|---|
 | 146, answered | The design (R1 to R9, R11 to R13): one HMAC_DRBG over SHA-512; a root generator and one for each processor, in the shape of SP 800-90C's tree of generators with two named differences; health tests on the instructions' outputs; no generator and no randomness without a healthy seed; overwriting in three layers; a new crate for the policy? | **Accept** | ADR-0016. The mechanism is built and tested on the host. Everything else is task 18b |
-| 147, answered | Boot info 0.6 (§84): one appended field, `boot_seed`, the physical address of 64 secret bytes inside the boot-info region or 0, which the kernel overwrites once it has taken them? | **Accept** | ADR-0016 R10; ADR-0002 B4. Not built: `origin-version.toml` stays at 0.5 until 18b |
+| 147, answered | Boot info 0.6 (§84): one appended field, `boot_seed`, the physical address of 64 secret bytes inside the boot-info region or 0, which the kernel overwrites once it has taken them? | **Accept** | ADR-0016 R10; ADR-0002 B4. Built by task 18b (2026-11-11). Item 166 below makes the secret area 72 bytes |
 | 148, answered | What may seed, and what happens when the sources fail? RDRAND with no RDSEED: the generator runs, the boot says so, and requests for prediction resistance are refused. The firmware's seed with neither instruction: no generator. Every instruction failing after boot: the root stops and the processors' generators go on with the seeds they have. | **Accept, as stated.** The stricter alternative to the third part, stopping all randomness, was offered and not chosen | ADR-0016 R3, R6, R8; ADR-0004 H3's note. Not built |
 | 149, answered | What "health tests on the raw source" (CLAUDE.md §59) can mean: tests on the instructions' outputs, because the noise behind them cannot be reached; gross failure only; no SP 800-90B conformance claimed? | **Accept** | ADR-0016 R4. Not built. Draft 7.4's §59 says so since `44de977` on `docs/design-review-2026-11-10` |
 | 150, answered | Keep `unsafe` out of `origin-crypto`: best-effort overwriting there, and the guarantee in the framework, by volatile writes over the state and an overwrite of the stack after every request? | **Accept** | ADR-0016 R9. The best-effort part is built; the framework's part is 18b |
@@ -418,6 +418,24 @@ Three of them change something you had already accepted. The ADR said so before 
 **Yours to do:** nothing new. The wording of §17 and §59 is in draft 7.4, which you read with its pull request (item 106).
 
 The numbers start at 146 because 142 to 144 are in use on `land/s3-part2` and 145 is the download above. The header of this sheet was brought up to date on 2026-11-11, when the branches that hold items 124 to 154 had met in the review batch.
+
+### Where the kernel stack region's base gets its randomness (item 166): Accepted 2026-11-11
+
+Building the generator found that the next batch draws the base of the kernel stacks' region in early boot, when the kernel builds its page tables: before the heap and the clock, and so before the kernel's generator can exist. That draw could not simply ask the generator. The coordinating session put three recommendations to you on 2026-11-11 and you answered **"Accept all"**; it relayed your words. This is the second of them. The third, how task 18b lands (item 167, through pull request 16), is recorded by that batch's lander.
+
+It changes two things you accepted on 2026-11-10, and the recommendation said so: ADR-0004 Amendment 2's "the kernel chooses this slide, and boot info does not change", and the 64-byte size of boot info 0.6's secret area (item 147). Boot info 0.6 has not landed, so there is no second version bump.
+
+| # | Question | Answer | Where it is recorded, and its state |
+|---|---|---|---|
+| 166, answered | Where does the stack region's base get its randomness? Recommended: the loader's generator makes one more 8-byte request and puts it directly after its 64-byte seed; the kernel reads it when it builds its page tables and overwrites it with the seed. The kernel still places the region; only the random value comes from the loader. With no loader generator the region stays at its fixed base | **Accept** | ADR-0016 Amendment 1; ADR-0002 B4. On the generator's branch: the loader's third request, the 72-byte area and its checks, `origin_frame::random::take_stack_value`, and a boot proof that it is taken once and overwritten. The stack region is on the next batch, whose lander makes `draw_region` the caller and notes ADR-0004 Amendment 2 (A4, A5) |
+
+**Offered and not chosen:**
+
+- derive the value from the seed with a key-derivation function: no boot-info change, but the seed gets a second use and the directive would need a new standard;
+- start the kernel's generator before the heap and the clock: that moves most of its machinery into early boot;
+- place the region after the generator starts: the generator's own stacks live in that region.
+
+**Yours to do:** nothing.
 
 ## What building ADR-0017's first half found (items 152 to 154): Accepted 2026-11-10
 

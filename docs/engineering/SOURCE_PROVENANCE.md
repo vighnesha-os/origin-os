@@ -2620,6 +2620,15 @@ The fields are §6's ten, in order.
 - **Open-source references consulted (§3; decision items 92, 93, 96):** none in this task. This session read EDK II's declaration of the firmware's random-number protocol on 2026-11-10 (the ledger's §12), so it did not write the loader's call to that protocol: that is left to a session that has not (TASKS, 18c).
 - **Not done:** the firmware's protocol; the consumers on `land/s3-part2`; a processor going offline; reseeding on resume and after a snapshot; an interface for programs; a check of the compiled branches; Kani or Loom models of the step and the root's lock; anything on hardware.
 
+### The stack region's value, handed over beside the seed (decision item 166; 2026-11-11)
+
+An addition to the entry above, from the same session on the same branch. The owner decided on 2026-11-11 that the loader's generator makes a third 8-byte request for the kernel stacks' region and hands it over directly after its seed (ADR-0016 Amendment 1).
+
+- **Module:** `boot/info/src/lib.rs` (`BOOT_SECRET_LEN`, `BOOT_STACK_VALUE_LEN`; `boot_seed()` checks 72 bytes); `boot/uefi/src/main.rs` (the third request); `framekernel/frame/src/random.rs` (`take_stack_value`, `stack_value`, the 72-byte overwrite; `finish_start` takes its lock); `framekernel/src/kernel.rs` (`prove_stack_value`); the boot test's markers.
+- **Specifications:** none new. The value is 64 bits of the loader's HMAC_DRBG output, read through the direct map.
+- **Test evidence:** the host test of where the area may lie, with the boundaries moved to 72 bytes and two cases where the seed would fit and the value would not; the boots and gates the task's result names for this commit. A boot says the value was "taken here, once, and a second take was refused", and the proof fails if a take succeeds after the generator's start.
+- **Not done:** nothing uses the value on this branch. `stack::draw_region` on the next batch becomes its caller.
+
 ## `developer-tools/xtask/` (`xtask`)
 
 - **What:** host-side build orchestration, with four commands:
