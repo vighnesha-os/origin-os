@@ -250,7 +250,7 @@ CLAUDE.md 7.5 holds that text with the 47 changes listed below. They are Claude'
 ### What was left as it was
 
 - **The numbers of roles 1 to 64.** The new roles are 65 to 67, so no number moves. The Chief Systems Architect stays role 51, though the requirements route system-wide decisions through it first.
-- **§77.** It still lists 26 engineering agents (proposal 11).
+- **§77.** It still lists 26 engineering agents (proposal 11). The owner accepted proposal 11 later the same day: decision item 189, CLAUDE.md 7.6.
 - **"SATA/AHCI" in role 57.** The directive names NVMe and USB storage and no SATA controller. The word "approved" in that role keeps AHCI out until a decision adds it.
 - **The three statements of the requirements matrix:** the target in opening paragraph 3, the rule in the requirements, the owner in role 45.
 
