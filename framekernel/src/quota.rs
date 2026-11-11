@@ -6,12 +6,13 @@
 //!   never pass the quota between them: the check and the increment are one atomic step.
 //! - **A quota of 0 allows nothing.** A creator gives each kind to a process deliberately, so a
 //!   process whose creator said nothing gets nothing ([`ObjectLimits::NONE`]).
+//! - **Channels:** a channel is charged to the process that created it, once, until the channel
+//!   is destroyed.
 //! - **Events, ports and bindings** are counted apart, each against its own quota
-//!   ([`ObjectCounts`]). An event or a port is charged to the process that created it until the
-//!   object is destroyed. A binding is charged to the process that bound it, from the bind until
-//!   its one packet has left the port. These three are the shape proposed for task S3-6
-//!   (`docs/research/2026-11-11-events-ports.md`, shape 7): nothing charges them until that
-//!   shape is accepted.
+//!   ([`ObjectCounts`]; ADR-0005 Amendment 7, F7). An event or a port is charged to the process
+//!   that created it until the object is destroyed. A binding is charged to the process that
+//!   bound it, from the bind until its one packet has left the port. Task S3-6's calls charge
+//!   them; until they are built nothing does.
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -38,9 +39,9 @@ impl Count {
     pub fn charge(&self) -> Result<(), Error> {
         self.held
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                // The sum is taken only under the quota, so it cannot overflow: `then_some`
-                // would add first, and a count wrapped to the top of its range would panic
-                // where it must be refused.
+                // The sum is taken only under the quota, so it cannot overflow. `then_some`
+                // would add first: on a count wrapped to the top of its range, a build that
+                // checks overflow would panic where the charge must be refused.
                 if n < self.max { Some(n + 1) } else { None }
             })
             .map(|_| ())

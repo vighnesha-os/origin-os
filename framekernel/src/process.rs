@@ -47,8 +47,8 @@ use crate::handles::HandleTable;
 use crate::mapping::{Budget, Mappings, Rate};
 use crate::memory_object::MemoryObject;
 use crate::paging::{Access, MapError, Translation};
-use crate::quota::ObjectCounts;
 pub(crate) use crate::quota::ObjectLimits;
+use crate::quota::{Count, ObjectCounts};
 use crate::runqueue::QueueError;
 use origin_abi::{Error, Handle, signals};
 use origin_frame::objref::ObjectRef;
@@ -68,8 +68,8 @@ const REPORTS: usize = 128;
 /// channels in the kernel's queues. Queued messages are charged too, to the process that
 /// sent them, by the memory they hold.
 pub(crate) struct Account {
-    channels: AtomicUsize,
-    max_channels: usize,
+    /// Channels this process created that still exist.
+    channels: Count,
     /// Bytes of kernel heap held by messages this process has queued and nobody has read.
     queued_bytes: AtomicUsize,
     max_queued_bytes: usize,
@@ -85,17 +85,12 @@ pub(crate) struct Account {
 impl Account {
     /// One more channel, or [`Error::Limit`].
     pub(crate) fn charge_channel(&self) -> Result<(), Error> {
-        self.channels
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.max_channels).then_some(n + 1)
-            })
-            .map(|_| ())
-            .map_err(|_| Error::Limit)
+        self.channels.charge()
     }
 
     /// A channel charged to this account is gone.
     pub(crate) fn refund_channel(&self) {
-        self.channels.fetch_sub(1, Ordering::AcqRel);
+        self.channels.refund();
     }
 
     /// `bytes` more of queued-message memory, or [`Error::Limit`].
@@ -352,8 +347,7 @@ impl Process {
             space: SpinLock::new(Some(ObjectRef::try_new(UserSpace::new()?).ok()?)),
             handles: SpinLock::new(HandleTable::new(limits.handles)),
             account: ObjectRef::try_new(Account {
-                channels: AtomicUsize::new(0),
-                max_channels: limits.channels,
+                channels: Count::new(limits.channels),
                 queued_bytes: AtomicUsize::new(0),
                 max_queued_bytes: limits.message_bytes,
                 committed: AtomicUsize::new(0),
