@@ -1132,8 +1132,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         crate::ipc_proof::prove_identity(com1, cpus, bsp, tsc_hz),
     );
     // Both launch processes, and a start record goes at a random address (ADR-0005 C4). With
-    // no random-number generator nothing is launched, so neither proof can run: they are left
-    // out of the tally, which the verdict counts as "did not run" (ADR-0016 R8; ADR-0013 R6).
+    // no random-number generator, or with one whose proof failed, randomness is withheld and
+    // nothing is launched, so neither proof can run: they are left out of the tally, which the
+    // verdict counts as "did not run" (ADR-0016 R8; ADR-0013 R2 and R6).
     if origin_frame::random::available() {
         proofs.record(
             Proof::Launch,
@@ -1146,7 +1147,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     } else {
         let _ = writeln!(
             com1,
-            "origin-kernel: start: there is no random-number generator, so no process is launched: the process-start and service-directory proofs did not run"
+            "origin-kernel: start: randomness is withheld, so no process is launched: the process-start and service-directory proofs did not run"
         );
     }
     // Every thread has exited: once each processor has reaped its own, the heap is back

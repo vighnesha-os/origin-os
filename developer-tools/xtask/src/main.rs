@@ -710,7 +710,7 @@ fn no_generator_markers(scenario: &mut Scenario) {
         "origin-kernel: random: no generator: known-answer test passed; on the boot processor RDSEED is absent and RDRAND is absent. Nothing will be launched and nothing placed at a random address (ADR-0016 R8)".into(),
         "origin-kernel: random: processor 0: RDSEED absent (0 draws passed), RDRAND absent (0 draws passed); its generator NOT seeded".into(),
         "origin-kernel: random: no generator, so no request is answered; consistent false: random failed".into(),
-        "origin-kernel: start: there is no random-number generator, so no process is launched: the process-start and service-directory proofs did not run".into(),
+        "origin-kernel: start: randomness is withheld, so no process is launched: the process-start and service-directory proofs did not run".into(),
         // The network asks for no lease: a transaction ID must not be guessable.
         "; DHCP lease 0.0.0.0 (".into(),
         "; no random value for a transaction ID or port; consistent false: virtio-net failed".into(),

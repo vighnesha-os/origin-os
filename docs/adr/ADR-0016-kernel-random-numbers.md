@@ -2,15 +2,15 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-10, as proposed, with the recommended answer to each of the seven questions below: "Accept all" to questions 1 to 6, in the session that wrote this ADR (decision sheet items 146 to 151), and "Approve all six" to the downloads of question 7, earlier the same day (item 145). **Built:** HMAC-SHA-512 and the HMAC_DRBG mechanism in `origin-crypto`, tested on the host and linked into nothing that boots. **Not built:** everything this ADR decides for the kernel, the loader and boot info, which is TASKS item 18's second half, 18b. Nothing here has run in a kernel, under QEMU or on hardware. **No human has reviewed it.** |
+| Status | **Accepted** by the owner on 2026-11-10, as proposed, with the recommended answer to each of the seven questions below: "Accept all" to questions 1 to 6, in the session that wrote this ADR (decision sheet items 146 to 151), and "Approve all six" to the downloads of question 7, earlier the same day (item 145). **Built** (tasks 18a and 18b, 2026-11-10 and 2026-11-11): the mechanism in `origin-crypto`; the policy in `origin-random`; the kernel's service with a generator on every processor; the loader's own generator, its two slides and boot info 0.6; the consumers on `main`; the Withdraw row; the gate on the two instructions. **Not built:** the loader's call to the firmware's random-number protocol (R10 step 1), the consumers that are not yet on `main`, and what the section "What was built" lists. **It has run under QEMU only**, on its software processor: nothing here has run on a real processor, and no figure it prints claims anything. **No human has reviewed it.** |
 | Decides | Decision item 113 and finding 8 of `docs/engineering/DESIGN_REVIEW_2026-11-10.md`; TASKS item 18. It carries out ADR-0013 Amendment 1 and the note of 2026-11-10 in ADR-0004 H3 |
 | Changes accepted decisions | Three, each named where it happens and each recorded in the ADR it changes: ADR-0002 B4 (boot info 0.6, R10; item 147); ADR-0004 H3 (the firmware's generator is an addition and never a source of its own; two slides, two draws; R3, R10; items 147 and 148); ADR-0013's inventory (one row, which Amendment 1 already accepted; R8) |
 | Requires | CLAUDE.md P0, P1, §3, §4, §13, §14, §16 to §19, §24, §58, §59, §61, §72, §84; rules 14, 16, 17, 21, 35 |
-| Code | Built: `security/crypto/src/hmac.rs`, `hmac_drbg.rs`, `wipe.rs`. Decided and not built: `security/random/` (a new crate), `framekernel/frame/src/random.rs`, `boot/uefi`, `boot/info` |
+| Code | `security/crypto/src/hmac.rs`, `hmac_drbg.rs`, `wipe.rs`; `security/random/` (`origin-random`); `framekernel/frame/src/random.rs`; `boot/uefi/src/random.rs` and `main.rs`; `boot/info`; `developer-tools/xtask/src/mnemonics.rs` |
 | Evidence | `docs/research/2026-11-10-kernel-random-numbers.md` (the ledger, cited below by its row numbers A, B and C); `docs/engineering/SOURCE_PROVENANCE.md`, "HMAC-SHA-512 and HMAC_DRBG" |
 | Related | ADR-0001 D3, ADR-0002 B4, ADR-0004 H3, ADR-0008, ADR-0009 Amendment 1, ADR-0011 N6, ADR-0012, ADR-0013 Amendment 1 |
 
-**What stands behind this.** SP 800-90A Rev. 1, SP 800-90B and SP 800-90C were read in the parts that bear on it (ledger §2). The built mechanism was compared with the standard's text step by step, and it gives NIST's own answers on NIST's test vectors for it. Nothing stands behind the rest: R3 to R13 are design, and unbuilt.
+**What stands behind this.** SP 800-90A Rev. 1, SP 800-90B and SP 800-90C were read in the parts that bear on it (ledger §2). The built mechanism was compared with the standard's text step by step, and it gives NIST's own answers on NIST's test vectors for it. R3 to R13 are built since task 18b: their policy is tested on the build host against an independent reference and planted faults, and the whole has booted under QEMU. "What was built", near the end, says how each point was built and what was left.
 
 ## Context
 
@@ -203,6 +203,26 @@ Measured on the build host (an M1 Max, portable code, a loaded machine; indicati
 
 One line when the root is instantiated and one for each processor: which instructions passed, how many draws, whether the loader gave a seed, and the cost. Counts and yes-or-no only: no draw, seed, state or output is ever printed (§61).
 
+## What was built (tasks 18a and 18b), and how
+
+The contract of task 18b in `docs/engineering/TASKS.md` has the detail, as S1 to S7. Each point below is something the decisions above left open or that building changed in the telling. **None changes a decision.**
+
+| Decision | As built |
+|---|---|
+| R2: where the code lives | As decided. The gate (`developer-tools/xtask/src/mnemonics.rs`) also holds the instructions to their 64-bit forms (R3) and refuses the compiler's intrinsics for them |
+| R4: the health tests | As decided, in `origin-random`. A draw whose tries were a mixture of "not ready" and stuck values (zero or all ones) is held to be a failure, which R4 does not say: a working instruction gives such a value about once in 2^63 tries. The tests remember two draws (the one before, and a window's first), in the processor's static storage |
+| R5: seeding | As decided, byte for byte: a host test compares nine outputs with a Python reference written from R5's table. A second start of a root or of a processor's generator changes nothing |
+| R6: reseeding | As decided, in steps (S1). A reseed's eight draws are gathered before the request's first piece, each try in a step of its own. When RDSEED was "not now" for one draw, it rests for one second and the reseed is made at once from RDRAND, with the RDSEED draws already gathered as additional input (S3). A request makes at most 16 draws (S2). A request that finds a processor due always does one piece of its maintenance in the same step, so a thread that moves between processors cannot starve one |
+| R7: state for each processor | As decided: static, one slot for each processor index, aligned so that no two share a cache line. A slot is larger than the 576 bytes R7 gives for the state alone, because the tests' values and the store are beside it. No processor goes offline today, so nothing uninstantiates a generator while the kernel runs |
+| R8: no healthy seed | As decided, and one step further: when the boot's proof of the generator fails for any reason, `random::withhold()` refuses every later request, so the Withdraw row withholds what it says (ADR-0013 R2). "Runs no program" (Migration) is built as "launches no process": the kernel's fixed ring-3 proof programs ask for no random value and still run |
+| R9: overwriting | Z1 and Z2 as decided. Z3 is the whole of a stack that belongs to the generator, one for each processor, 8 KiB with a guard page, in place of "a fixed depth" of the caller's stack (S5): every step runs on it with interrupts off, it is overwritten before they come back on, and the scratch registers are cleared. The boot proof paints that stack, measures how deep a request goes (3,024 bytes in the first build) and checks that only zeros are on it after a request |
+| R10: the loader | Steps 2 to 5 as decided, with the same step: interrupts off, a stack of the generator's own, registers cleared. **Step 1's call to the firmware's random-number protocol is not built**: the session that built this had read EDK II's declaration of the protocol (ledger §12), and decision item 92 has that code written by a session that has not. The loader says so in its line. Boot info 0.6 as decided; the kernel also requires the 64 bytes to lie clear of the boot-info header and its two arrays |
+| R11: what the kernel sees | `origin_frame::random::{fill, next_u64, fill_fresh}` and one error type with the two cases. A request that arrives in the middle of a step on the same processor is refused with "not now" |
+| R12: cost | Printed at every boot: a 64-byte request, and the longest step with interrupts off, while a processor started and since. Under QEMU's software processor these were about 22 µs, 0.8 ms and 0.2 ms: an emulator's figures, which claim nothing. The budgets stay hypotheses |
+| R13: what a boot says | One line for the root, one for each processor, three for the proof. Counts and yes-or-no only |
+
+**Left to other tasks:** the firmware's protocol (above); the three places on `land/s3-part2` that still draw from the processor (`memory_object.rs`, `stacks.rs`, `frame/src/stack.rs`), which no longer compile against this tree until they ask `origin_frame::random`; reseeding on resume and on a restored snapshot (R6, T10); an interface for programs (R11); everything on hardware.
+
 ## Evidence
 
 Only R1's mechanism is built, so only it has evidence. The detail is in `SOURCE_PROVENANCE.md`.
@@ -217,7 +237,9 @@ Only R1's mechanism is built, so only it has evidence. The detail is in `SOURCE_
 | No panic path, no `unsafe` | The kernel-target release object references `memcpy`, `memset` and one formatter function; the crate forbids `unsafe` |
 | Overwriting (R9 Z2) | The same object holds the overwrite calls. One build, not a promise |
 | Cost (R12) | Measured on the build host, not on the target |
-| R3 to R13 | **None.** Nothing is built, and nothing has run in a kernel |
+| R3 to R8, the policy | `origin-random`: 55 host tests. Each health test on hand-made sequences, and the cutoffs against SP 800-90B's formulas, which give the standard's own table; seeds byte for byte against an independent Python reference; the schedule, the back-off and the 16-draw bound with a scripted source and clock; a thread that moves between steps. 68 of 68 planted faults fail a test (a 69th is listed as not observable); planting them found one real fault, since fixed: a draw's failed tries were counted across draws |
+| R2's gate | Eight tests of its own; on the tree, the instructions are run 4 times in the 2 files listed |
+| R9 to R13, the machine | Boots under QEMU 11.1.3 with OVMF, software processor: the standard boot, a processor with RDRAND only, a processor with neither instruction, and the controls of ADR-0013 from C37. **Nothing on hardware** |
 
 ## Alternatives
 
@@ -289,11 +311,8 @@ Only R1's mechanism is built, so only it has evidence. The detail is in `SOURCE_
 - **Conformance or validation** of any kind (R1). The sources are not validated, and two rules of the standard's tree are departed from (R7).
 - **Anything about hardware.** Not one line of this has run on a processor. The start-up tests' cost, RDSEED's behaviour when sixty-four processors ask at once, and the cost of a request on x86-64 are all unmeasured.
 - **That the overwrites survive the compiler** beyond what one build shows (R9 Z2).
-- **Where a reseed's draws run, and what backs off when RDSEED is dry.** Recorded on 2026-11-10 after acceptance, from the coordinating session's review, and checked against the text above. It changes nothing that was accepted.
-  - R6 puts a reseed before a request and R7 runs a request with interrupts off. Nothing here says whether the reseed's draws run with them off as well, or whether the root's draws are made while its lock is held.
-  - R4 allows 100 tries for one RDSEED draw and R6 takes 8 draws, so one reseed can make 800 tries. A start-up test tried again at a reseed (R4, item 8) is 1,024 draws: up to 102,400 tries.
-  - While a program in ring 3 keeps RDSEED dry (T5), nothing here says how soon a reseed that got "not now" is tried again, or after how many tries it takes RDRAND instead. T5 names that fall-back; R6 gives it only for an instruction that is not healthy.
-  - 18b's contract settles these, bounds the longest time interrupts stay off, and has the boot print the measured worst case (TASKS item 18). An answer that changes R4, R6 or R7 as accepted comes back to the owner as an amendment first.
+- **What a non-maskable interrupt leaves.** An NMI or a machine check that arrives in the middle of a step saves the interrupted registers on its own stack, which is not overwritten. Neither handler asks for a random value (R7). T11 does not say this; task 18b's contract names it (S7), and it is not closed.
+- **Where a reseed's draws run, and what backs off when RDSEED is dry.** The coordinating session's review found these open after acceptance (2026-11-10). Task 18b's contract settled them as S1 to S7 without changing R4, R6 or R7, and they are built: "What was built", below.
 - **More of the mechanism than its vectors reach.** NIST's 30 vectors for SHA-512 all use one shape of input (ledger §9). Other lengths, and a request of no bytes, are checked against the author's reference, OpenSSL's generator and the standard's text.
 
 ## Questions for the owner
