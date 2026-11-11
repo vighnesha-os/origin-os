@@ -3366,6 +3366,53 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
   - that QEMU's monitor answers the same way in CI's QEMU, which the matrix there will show.
 - **Review:** none yet. No human has reviewed this code.
 
+## ADR-0017 Z9 inside the framework's address spaces: a user pointer's walk and a mapping call's address (2026-11-11)
+
+- **What:** on `claude/z9-frame-clamps`, cut from `land/s3-part2` at `0dceabf`. The review of Z9 for the four memory calls (its entry under "Memory objects" above) left two places in `framekernel/frame/src/userspace.rs` to the framework. In each, an address from ring 3 is used after a range check with no `nospec` after the check. `0fbcd9f` clamps both:
+  - **The walk behind every user pointer's check.** `UserSpace::checked`, which `check_user`, `copy_in` and `copy_out` use, checks the range (`UserRange::new`: comparisons and branches). It then walks this space's tables a page at a time by the program's address (`usercopy::check_mapped`, then `translate`). Each page now goes through `nospec::user_address` before it is walked, in the closure handed to `check_mapped`. The clamp is not inside `translate`: `user_address` is defined only after a range check, and `translate`'s other callers pass the kernel's own addresses (the launch path's start record, the proofs' constants). The clamps before the copy instruction in `copy_in` and `copy_out` stay. The framework's other walks by an address (`translate` when called directly, `read_u64`, `frame_of`) are called only with the kernel's own addresses, so these four places are all of them.
+  - **The address of a mapping call.** `map_shared_run`, `unmap` and `protect` take their address through `nospec::user_address` right after `user_range_end` accepts it, whatever the caller.
+    - `map_shared_run` prepares and fills the tables by it (`prepare_user`, `map_user`): for it the address is an index from ring 3.
+    - `unmap` and `protect` only compare it with the space's sorted records (`State::position`, a binary search), and walk the tables by each record's own address. For them the clamp guards a comparison. It is there so that the rule holds at the framework's boundary for every caller, at one conditional move or LFENCE a call.
+    - The kernel's own clamp in `mapping::user_run` stays as it is.
+  - **The host test** `nospec::tests::a_user_address_passes_and_any_other_is_zero_under_the_mask` gains `USER_END - PAGE`: the last page a check lets through, so the last page the four clamps see. Both forms give it back unchanged.
+- **Why no status, signature or interface changes:** each clamp stands after a check that accepts only addresses below `USER_END` (`UserRange::new`, `user_range_end`). `user_address` gives back every address below `USER_END` unchanged, in both forms. So each address used is the one checked, and every result, status and order of refusals is as it was.
+- **What a wrongly guessed walk reads, settled by reading** (`AddressSpace::leaf` in `origin-paging`, `Tables::table` in `userspace.rs`):
+  - *With the clamp, under the mask* (CMP and CMOVAE, `cpu::below_or_zero`), a page at or past `USER_END` becomes 0. The walk of address 0 reads this space's top-level entry 0. Where each is present, it reads entry 0 of the next three tables, each found in this space's own list of tables. Those are this space's own lower-half tables.
+    - A check of `USER_START` (0x1000), the lowest page a program may name, reads the same entries at the top three levels, and the next entry of the same page table, in the same 64-byte line.
+    - A program can have that check made at will, and its own accesses walk the same tables.
+    - So the wrongly guessed walk shows a program nothing it cannot be shown anyway.
+  - *With the clamp, under the fence,* the walk waits until the check is resolved.
+  - *Without the clamp,* the walk took whatever address the program gave. For a kernel address, it read this space's top-level entry for that address, a copy of the kernel's (`set_upper_half`). It went on to search this space's list of tables only where that entry is present, and stopped there, since the kernel's lower tables are not in the list. Where it stops can tell which 512 GiB slots of the kernel half are in use, and so part of the stack region's slide (ADR-0004 Amendment 2, A4: one of slots 384–447).
+  - This is a reading of the code, not an experiment: nothing here can see a wrongly guessed path.
+- **Evidence:**
+  - *Host tests:* the `nospec` test above, among `origin-frame`'s 420. No host test can reach the four places: `userspace.rs` is compiled only for the kernel (`#[cfg(target_os = "none")]` in `lib.rs`), so the boot is what runs them.
+  - *The commit on its own* (`0fbcd9f`, run on its tree just before it was committed):
+    - rustfmt;
+    - clippy for the host and the kernel target, and for UEFI on `origin-sync` and `origin-paging`;
+    - the kernel's release build;
+    - the host tests of `origin-sync`, `origin-paging`, `origin-frame`, the kernel and `xtask`;
+    - a kernel boot on 2 processors. It ended "degraded: 60 of 61 proofs passed; failed: speculation controls", as every boot under QEMU does (item 154), and its `nospec` line says the mask is in use.
+  - *Negative controls,* each a change to a scratch worktree at `0fbcd9f`, never committed. Each replaces one place's clamp with a block that returns 0 whatever it is given, and runs the kernel boot once on 2 processors.
+    - Run on 2026-11-11 between 05:39 and 05:43 UTC. Each was caught on its first run, at the first line that failed, where `boot-test` stops the boot. The tree unchanged is the commit's own run above.
+    - **Z1, the walk in `checked`:** every check walks address 0, which is never mapped, so a copy from a valid buffer faults. The boot stops at the user-isolation proof's line "copy from user: valid buffer -> FAULT, kernel address -> FAULT, unmapped user address -> FAULT; kernel carries on: user isolation failed".
+    - **Z2, `map_shared_run`:** a fixed map is made from address 0 instead, over the program's own mappings, so `prepare_run` refuses it. The hostile calls' line "ipc: memory maps" shows "mapped -> INVALID_ARGS" where a passing boot shows "mapped -> OK", and ends ": ipc failed".
+    - **Z3, `unmap`:** the unmap takes every mapping from address 0 to the run's end, the program's own among them, and the program reports nothing after it. The line "ipc: memory unmap and protect" shows "unmap -> nothing, unmap again -> nothing" where a passing boot shows "unmap -> OK, unmap again -> INVALID_ARGS", and ends ": ipc failed".
+    - **Z4, `protect`:** the protect changes every mapping from address 0 to the run's end, and the program reports nothing from it on. The same line shows "nothing" for the protect to read-only and the three steps after it, where a passing boot shows "OK", "ACCESS_DENIED", "OK" and "INVALID_ARGS", and ends ": ipc failed".
+  - *Gates on `2efc74b`,* the records commit, with a clean tree, on 2026-11-11 from 05:53 UTC:
+    - `cargo xtask check` passed. 1,370 host tests, none failed, 10 ignored: the batch's own count, since this change adds a value to a test and no test. The unsafe gate counted 324 sites in its 22 listed files, none of them added here. The no-panic, image, interface, document and reproducible-build gates passed. Loom: all 42 models passed and all 68 controls were caught (98 runs).
+    - `cargo xtask boot-test` passed 11 of 11 scenarios. Its kernel boot ended "degraded: 60 of 61 proofs passed; failed: speculation controls" (item 154), with the mask in use.
+    - The commit after `2efc74b` only adds these lines.
+- **Not shown:**
+  - what a processor does on a wrongly guessed path, which nothing here can test (threat row I2). That each clamp keeps the walk in this space's own tables rests on the reading above;
+  - anything on an x86-64 processor. Every run was QEMU 11.1.3's TCG on the development Mac (Apple M1 Max), with the mask in use, so no boot of this change used the fence. CI's KVM boots run once the batch is pushed.
+- **`unsafe`:** none added. The gate's count is unchanged.
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-11. Original code; no third-party source was read or copied (§3).
+- **Specifications:** ADR-0017 Z9, and the vendors' statements as `nospec.rs` cites them; not re-read.
+- **Dependencies:** none new.
+- **Toolchain:** Rust 1.99.1 (stable, edition 2024), QEMU 11.1.3 (TCG) + OVMF.
+- **Review:** none yet. No human has reviewed this code.
+- **Licensing:** MIT OR Apache-2.0.
+
 ## The assembly blocks' options, and four gates (TASKS item 17; decision items 107, 110, 111, 123; 2026-11-10)
 
 - **What:** the design review's findings 2, 5, 6 (its last point) and 18 (its fifth), on branch `claude/funny-torvalds-9a28a0`. The contract is in `TASKS.md`, under item 17.
