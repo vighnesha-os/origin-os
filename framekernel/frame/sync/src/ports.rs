@@ -72,6 +72,8 @@
 //! - Make every call outside its own locks. Storage, references and payloads come back to the
 //!   caller, and dropping a reference may run the destructor of the object it names.
 //! - Make a reservation for the port the binding goes to, after resolving the port's handle.
+//! - Call [`Port::wake`] when it closes or moves a port handle a thread may be waiting through
+//!   (ADR-0005 Amendment 7, F3).
 //!
 //! # Cost
 //!
@@ -764,7 +766,7 @@ impl<K: Kernel> Port<K> {
     }
 
     /// Wakes every thread waiting in [`Port::take`], each to look again at what it waits for.
-    /// Whoever closes a handle a thread may be waiting through calls it, as for any wait.
+    /// Whoever closes or moves a handle a thread may be waiting through calls it, as for any wait.
     pub fn wake(&self, scheduler: &K::Scheduler) {
         for thread in self.waiters.take_all(scheduler).into_iter().flatten() {
             scheduler.wake(thread);

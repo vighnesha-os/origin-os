@@ -3421,7 +3421,7 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
 
 ## The ports' protocol in the framework: bind, raise, cancel and close (ADR-0005 C9, P9; task S3-6a; 2026-11-11)
 
-- **What:** on `claude/s3-6a-port-core`, cut from `land/s3-part2` at `dc50296`. The request is the section "What the kernel needs from the framework" of the S3-6 ledger (`docs/research/2026-11-11-events-ports.md` at `6c69ada`, lines 63 to 135, on the unmerged `claude/s3-6-events-ports`). The contract, and how this answers it, are in the coordinating session's task S3-6a. Nothing in the kernel crate changes: the kernel instantiates this in stage 2 of S3-6, as it instantiates `WaitQueue`.
+- **What:** on `claude/s3-6a-port-core`, cut from `land/s3-part2` at `dc50296`. The request is the section "What the kernel needs from the framework" of the S3-6 ledger (`docs/research/2026-11-11-events-ports.md` at `6c69ada`, lines 63 to 135, on the unmerged `claude/s3-6-events-ports`; *2026-11-11: in the batch since `c0ca2cc`*). The contract, and how this answers it, are in the coordinating session's task S3-6a. Nothing in the kernel crate changes: the kernel instantiates this in stage 2 of S3-6, as it instantiates `WaitQueue`.
   - **`framekernel/frame/sync/src/ports.rs`** (new, `#![forbid(unsafe_code)]`): `Source`, `Port`, `Reservation`, `Storage`, `Removed`, `Packet`, and `Kernel`, the trait for what the kernel supplies (its scheduler, the payload, the owner, and counted references to a port and to what holds a source). Generic over the scheduler, so the host tests and the Loom models run the code the kernel runs.
   - **What a binding is made of:**
     - The *storage*: one allocation carrying the payload, what the binding asked for, and the packet it becomes. The source keeps it while the binding is armed, with a counted reference to the port. The port keeps it once it is queued.
@@ -3494,7 +3494,12 @@ Task 18a (TASKS item 18's first half; decision item 113; finding 8 of the design
   - the kernel's part (handles, quotas, exit, the boot proof): stage 2;
   - any timing: no measurement was asked for at this stage.
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-11. Original code; no third-party source was read or copied (§3). The design follows the ledger's request. No other system's source was read.
-- **Specifications:** ADR-0005 C9, P9, A2; the ledger's shapes 9, 11, 12, 15 and 16 (decision items 177, 179, 180, 183, 184, proposed, not accepted).
+- **Specifications:** ADR-0005 C9, P9, A2; the ledger's shapes 9, 11, 12, 15 and 16 (decision items 177, 179, 180, 183, 184, proposed, not accepted). *(2026-11-11: the owner accepted them that day. They are ADR-0005 Amendment 7's F9, F11, F12, F15 and F16.)*
+  - *Checked against Amendment 7 as written, at `8f8f6e8` (2026-11-11):* those five, and F2 to F4, F7, F13 and F14, where the protocol carries out part of them. Nothing differs.
+  - *One kernel duty is wider than the sketch said:* F3 counts a moved handle as well as a closed one, so `Port::wake` is called for both. Its doc says so now.
+  - *One cost the amendment does not name:*
+    - A port's index is memory no quota counts: about 24 bytes a slot, at its peak, kept until the port closes.
+    - Its peak is the bindings armed for it, or reserved, at once, which the binders' quotas bound (F7, F15).
 - **Dependencies:** none new. `alloc` is the compiler's.
 - **Toolchain:** Rust 1.99.1 (stable, edition 2024); Loom 0.7.2 for the models, as locked.
 - **Review:** none yet. No human has reviewed this code.
