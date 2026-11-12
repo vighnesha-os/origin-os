@@ -31,6 +31,6 @@ boot-info = "0.6"
 # Origin userspace ABI: the C ABI of origin.core and the SDK libraries, which every .ose
 # image names in its manifest (docs/adr/ADR-0005-process-abi-ipc.md P12). Major 0 marks it
 # as not yet stable: it may change until the first release that ships third-party programs.
-user-abi = "0.6"
+user-abi = "0.7"
 # Further identifiers (driver ABI, manifest and data schemas) are added when the interface
 # they version first exists.

@@ -137,7 +137,7 @@ impl rt::Transport for Recording {
         &mut self,
         buffer: &mut [u8],
         request: usize,
-        handles: &[u32],
+        handles: &[u64],
         _received: &mut [RecvHandle],
     ) -> Result<(usize, usize), i64> {
         let refused = Error::InvalidArgs.raw();
@@ -152,7 +152,7 @@ impl rt::Transport for Recording {
             })
             .collect();
         let mut reply = [0u8; ROOM as usize];
-        let mut reply_handles = [0u32; 4];
+        let mut reply_handles = [0u64; 4];
         let rt::Dispatched::Reply {
             bytes, handles: 0, ..
         } = stub::dispatch(
@@ -176,7 +176,7 @@ impl rt::Transport for Recording {
         Ok((bytes, 0))
     }
 
-    fn send(&mut self, _buffer: &[u8], _handles: &[u32]) -> Result<(), i64> {
+    fn send(&mut self, _buffer: &[u8], _handles: &[u64]) -> Result<(), i64> {
         Err(Error::NotSupported.raw())
     }
 
@@ -194,7 +194,7 @@ impl rt::Transport for Replay<'_> {
         &mut self,
         buffer: &mut [u8],
         _request: usize,
-        _handles: &[u32],
+        _handles: &[u64],
         _received: &mut [RecvHandle],
     ) -> Result<(usize, usize), i64> {
         let answer = self.answers.get(self.next).ok_or(Error::PeerClosed.raw())?;
@@ -206,7 +206,7 @@ impl rt::Transport for Replay<'_> {
         Ok((answer.len(), 0))
     }
 
-    fn send(&mut self, _buffer: &[u8], _handles: &[u32]) -> Result<(), i64> {
+    fn send(&mut self, _buffer: &[u8], _handles: &[u64]) -> Result<(), i64> {
         Err(Error::NotSupported.raw())
     }
 
@@ -229,7 +229,7 @@ type Answer = Result<ConnectResponse, CallError<ConnectError>>;
 /// major 1. `None` if the hello fails.
 fn run_client<T: rt::Transport>(transport: T) -> Option<(DirectoryClient<T>, Answer, Answer)> {
     let mut bytes = [0u8; ROOM as usize];
-    let mut handles = [0u32; 4];
+    let mut handles = [0u64; 4];
     let unused = RecvHandle {
         value: Handle::INVALID,
         object: 0,

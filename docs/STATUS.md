@@ -7,6 +7,12 @@
 | Reproduce | Heavy runs wait for their turn on the machine; `cargo xtask exclusive -- <command>` takes one for anything else. `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs under QEMU 11.1.3 + OVMF: on its software CPU (TCG) and, in CI, on real AMD EPYC and Intel Xeon processors through KVM, with the devices and firmware still QEMU's. Nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
 
+## 64-bit handles (ADR-0005 Amendment 6, E1; task S4-0 of ADR-0011 N14 step 4, TASKS item 38; 2026-11-12)
+
+On `claude/s4-0-handles`, from `main` at `04ec842`, **not merged**. A handle is a 64-bit value wherever a program meets one: a register, an out pointer, the handle lists `channel_write` and `channel_create` take and fill, `received_handle` (16 bytes) and a start record's entry (24 bytes, four of them zero padding). `user-abi` and `origin.kernel` go from 0.6 to 0.7; the lock's minors 0.0 to 0.6 are re-recorded, as major 0 allows. The decoder no longer refuses a handle register for its upper 32 bits (`docs/spec/OIDL.md` §10, revised); the kernel's table judges every value. The table puts the slot in the top 24 bits and the generation in the low 40, which is the kernel's and not the ABI's: a process can hold about 16 million handles and use each slot about a trillion times before it is retired, where 32 bits gave 65,535 and 65,535. A value cut to 32 bits names no slot, so a path that kept half a handle fails at once.
+
+**What is shown, under QEMU's software processor on the development Mac only:** host tests of the table, of both records field by field against the generated layout, and of the generated code with handle values above 32 bits; a planted decoder that keeps 32 bits fails the generator's system-call checks. `cargo xtask boot-test` (11 of 11) and `cargo xtask boot-matrix` (122 scenarios) pass with the interpreter loading 64-bit handles, and the hostile process's `bad handles` line shows a live handle's low 32 bits alone, and its slot at a generation never issued, refused with `bad_handle`. Two controls (ADR-0013, H64-1 and H64-2) fail the boot. The ping-pong round trip shows no change that three interleaved boots can resolve. Not run under KVM or on a real processor; no human has reviewed it. Details: `docs/engineering/SOURCE_PROVENANCE.md`, "Task S4-0".
+
 ## ADR-0017 Z9 inside the framework's address spaces (2026-11-11)
 
 Two places in the framework's `UserSpace` looked something up by a program's address after a range check, with nothing to keep the address in range on a path where the processor guessed the check wrong. The review of Z9 for the memory calls left them open (the Z9 section below). Both now go through `origin_frame::nospec`:
@@ -239,7 +245,7 @@ The owner asked for a very careful review of CLAUDE.md and the design documents.
 - Randomness comes straight from the processor's instructions, with no generator and no health gate (TASKS item 18).
 - Speculative execution (TASKS item 19): the system threat model and ADR-0017 are written and accepted, and the half that step 4 waits for is built and is in the review batch (see "Speculation and processor hardening" above). Its controls have not run on a processor that has them.
 
-The rest is TASKS items 20 to 30. One of them is an ABI limit: a 32-bit handle still gives a process about 4.29 billion handle creations in its life (item 24).
+The rest is TASKS items 20 to 30. One of them was an ABI limit: a 32-bit handle gave a process about 4.29 billion handle creations in its life (item 24). Task S4-0 removes it on its branch, `claude/s4-0-handles`, not yet merged (see "64-bit handles" above).
 
 No human has reviewed the review. Nothing was built, tested or booted for it.
 

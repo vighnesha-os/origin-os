@@ -63,8 +63,8 @@ Status: **Proven** (a boot proof whose negative control is recorded in `SOURCE_P
 
 | # | Threat | Defence | Status |
 |---|---|---|---|
-| H1 | A forged handle: a value never issued, or one that is live in another process | Each process has its own table; anything else is `bad_handle` | **Boot** ("bad handles") |
-| H2 | A stale handle names a slot that has been reused | A 16-bit generation per slot. A slot whose generations are used up is retired, never reused | **Host** |
+| H1 | A forged handle: a value never issued, or one that is live in another process | Each process has its own table; anything else is `bad_handle`. Since task S4-0 a handle fills 64 bits and every register value goes to the table (ADR-0005 E1): the slot lies in the top 24 bits, so a value cut to 32 bits names nothing, and a slot at a generation never issued is refused | **Boot** ("bad handles": "its low 32 bits alone" and "its slot at a generation never issued"; S4-0 controls H64-1 and H64-2 in ADR-0013) |
+| H2 | A stale handle names a slot that has been reused | A 40-bit generation per slot, since task S4-0 (ADR-0005 E1; a 16-bit one before). A slot whose generations are used up is retired, never reused; that takes about a trillion uses of one slot, so no process meets it in its life | **Host** (`handles.rs`: one slot past 2^16 uses, and one retired at its last generation); **Boot** ("bad handles": "stale, slot reused"; control H64-2) |
 | H3 | A call runs with too few rights | The definition states the rights each handle needs, and the table enforces them on every lookup | **Proven** (S3-1 controls 1 and 2) |
 | H4 | A handle of another type is used | The type is checked before the rights | **Proven** (S3-1 control 3) |
 | H5 | A right is gained by duplicating or moving a handle | `handle_duplicate` only removes rights; a moved handle keeps the rights it had | **Boot** ("rights only shrink") |
@@ -107,7 +107,7 @@ Z9's rule: a lookup whose index, count or address comes from ring 3 goes through
 
 | What the program chooses | Where the kernel uses it | Through |
 |---|---|---|
-| A handle's slot | `HandleTable::get` and `remove` (`framekernel/src/handles.rs`): every call that takes a handle, and every handle a `channel_write` carries | `nospec::index` |
+| A handle's slot | `HandleTable::get` and `remove` (`framekernel/src/handles.rs`): every call that takes a handle, and every handle a `channel_write` carries. Since task S4-0 the whole 64-bit register reaches the table (ADR-0005 E1), and the slot is its top 24 bits | `nospec::index` |
 | The address of anything copied in or out | `UserSpace::copy_in` and `copy_out` (`framekernel/frame/src/userspace.rs`), after the range check: the only two places the kernel copies to or from a program | `nospec::user_address` |
 | The address and length of any memory the kernel checks before it reads or writes it: every pointer a call takes | The walk of the space's page tables by the program's address (`UserSpace::checked` in `framekernel/frame/src/userspace.rs`, under `check_user`, `copy_in` and `copy_out`), a page at a time, after `UserRange::new`'s range check. Each page the walk visits passes the clamp, in the closure handed to `usercopy::check_mapped`; the length is not clamped by itself, since it only says how many pages are visited. So the walk before a copy is clamped as the copy is (the row above), and so is the check of a pointer `syscall.rs` validates before it consumes anything (`checked`, `check_user`'s only caller). Under the mask, a wrongly guessed path walks address 0: the space's own lower-half entries, which the program's own accesses walk anyway | `nospec::user_address`, once for each page |
 | The length of `debug_write`'s text | The copy into a buffer on the kernel's stack (`syscall.rs`, `debug_write`) | `nospec::length` |
