@@ -4,14 +4,27 @@
 A host tool (CLAUDE.md §4; ADR-0011 N12): it runs on the development Mac, never in CI and never
 on Origin. The plan it follows is `docs/research/2026-11-12-first-bare-metal-boot.md`.
 
-Money is guarded four ways, because a forgotten server bills every hour:
+Money is guarded these ways, because a forgotten server bills every hour:
 
-- Nothing is bought without `--yes`. Without it, a command says what it would buy and stops.
-- A spend cap (`--cap-usd`, default 10) covers every rental in the local ledger, each counted at
-  its worst case: whole hours, from deployment to deletion or to its deadline.
+- Nothing is bought without `--yes`, and `--yes` follows the owner's yes in chat, with the item
+  and the total, for each purchase; it never stands in for it. Without it, a command says what it
+  would buy and stops.
+- A spend cap (`--cap-usd`, default 10, decision item 225) covers every rental in the local
+  ledger, each counted at its worst case: whole hours, from deployment to confirmed deletion, or
+  to the later of its deadline and now, plus a margin for deletion's own delay.
+- The request that creates a server is never retried. If it fails or its reply cannot be read,
+  every bench server is listed for a few minutes, recorded and deleted.
 - Every rental has a deadline (`--max-minutes`, at most 120). A separate watchdog process, kept
-  awake with `caffeinate`, deletes the server at the deadline whatever happens to this one.
+  awake with `caffeinate`, deletes the server at the deadline whatever happens to this one, and
+  keeps trying until the deletion is confirmed.
 - The rental deletes its server on every way out: success, error and Ctrl-C.
+- A deletion counts only when the API confirms it. Until then the ledger and `status` show the
+  server as not deleted.
+
+What it cannot guard: the watchdog runs on this Mac. Latitude's API has no way to set a deletion
+time (the dashboard's scheduled deletion takes one; the API's "schedule deletion" removes a
+server "at the end of the billing cycle"). So keep the Mac plugged in, its lid open and online
+until `status` shows the server deleted.
 
 The API token is read from `~/.config/origin-bench/latitude.token`, which must be mode 0600. It
 is sent only to https://api.latitude.sh and never printed. Raw dumps from the machine (ACPI
@@ -27,6 +40,8 @@ Commands:
 """
 
 import argparse
+import contextlib
+import fcntl
 import json
 import math
 import os
@@ -53,6 +68,13 @@ PLANS = {"m4-metal-small": "EPYC 4244P, Zen 4", "f4-metal-large": "EPYC 9275F, Z
 OS_SLUG = "ubuntu_24_04_x64_lts"
 OS_USER = "ubuntu"
 HARD_MAX_MINUTES = 120
+# How late a deletion may land after its deadline: the watchdog's last sleep, and the polling in
+# `delete_server`. The cap counts it.
+MARGIN_MINUTES = 10
+# The states in which a server no longer runs for the tenant. Anything else is not deleted.
+CONFIRMED = ("gone", "deleted", "deleting", "disk_erasing")
+# Methods that are safe to repeat. A repeated POST could create a second server.
+IDEMPOTENT = ("GET", "DELETE")
 
 
 def die(message):
@@ -90,8 +112,12 @@ def token():
     return value
 
 
-def api(method, path, body=None, ok=(200, 201, 204), retries=3):
-    """One request; returns the decoded JSON, or None for an empty body."""
+def api(method, path, body=None, ok=(200, 201, 204)):
+    """One request; returns the decoded JSON, or None for an empty body.
+
+    Only GET and DELETE are retried. Any other method is sent once, because a request that timed
+    out may still have been carried out."""
+    retries = 3 if method in IDEMPOTENT else 1
     data = json.dumps(body).encode() if body is not None else None
     for attempt in range(retries):
         request = urllib.request.Request(API + path, data=data, method=method)
@@ -195,25 +221,50 @@ def ledger():
     return {"rentals": []}
 
 
-def save_ledger(book):
+@contextlib.contextmanager
+def ledger_for_update():
+    """The ledger under an exclusive lock, written back when the block ends without an error.
+    The rental and its watchdog both write it."""
     private_dir(STATE)
-    tmp = LEDGER.with_suffix(".tmp")
-    tmp.write_text(json.dumps(book, indent=2))
-    tmp.replace(LEDGER)
+    with open(STATE / "ledger.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        book = ledger()
+        yield book
+        tmp = LEDGER.with_name(f"ledger.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(book, indent=2))
+        tmp.replace(LEDGER)
 
 
 def worst_case(rental):
-    end = rental.get("deleted_at") or rental["deadline"]
+    """Whole hours from deployment to confirmed deletion; for a server not confirmed deleted, to
+    the later of its deadline and now, plus the margin deletion itself may take."""
+    if rental.get("deleted_at"):
+        end = rental["deleted_at"]
+    else:
+        end = max(rental["deadline"], now()) + MARGIN_MINUTES * 60
     hours = max(1, math.ceil((end - rental["deployed_at"]) / 3600))
     return hours * rental["usd_per_hour"]
 
 
+def add_rental(rental):
+    with ledger_for_update() as book:
+        if not any(r["server_id"] == rental["server_id"] for r in book["rentals"]):
+            book["rentals"].append(rental)
+
+
 def update_rental(server_id, **fields):
-    book = ledger()
-    for r in book["rentals"]:
-        if r["server_id"] == server_id:
-            r.update(fields)
-    save_ledger(book)
+    with ledger_for_update() as book:
+        for r in book["rentals"]:
+            if r["server_id"] == server_id:
+                r.update(fields)
+
+
+def confirm_deleted(server_id, result, by):
+    """Records the deletion only if the API confirmed it. Returns whether it did."""
+    if result in CONFIRMED:
+        update_rental(server_id, deleted_at=now(), deleted_by=by)
+        return True
+    return False
 
 
 # SSH.
@@ -380,8 +431,40 @@ def cmd_status(args):
 
 def cmd_delete(args):
     result = delete_server(args.server_id)
-    update_rental(args.server_id, deleted_at=now())
     print(f"{args.server_id}: {result}")
+    if not confirm_deleted(args.server_id, result, "delete"):
+        die(f"{args.server_id}: deletion not confirmed; it may still bill. Run delete again")
+
+
+def reap(servers, by):
+    """Deletes each server, recording it in the ledger first if it is not there. Returns the
+    IDs whose deletion the API did not confirm."""
+    unconfirmed = []
+    for s in servers:
+        a = s["attributes"]
+        add_rental({"server_id": s["id"], "plan": (a.get("plan") or {}).get("slug", "?"),
+                    "site": ((a.get("region") or {}).get("site") or {}).get("slug", "?"),
+                    "usd_per_hour": offers_price_or_cap(a), "deployed_at": now(),
+                    "deadline": now(), "hostname": a.get("hostname"), "found_by": by})
+        try:
+            result = delete_server(s["id"])
+        except Exception as e:
+            result = f"failed ({e})"
+        print(f"{s['id']} {a.get('hostname')}: {result}")
+        if not confirm_deleted(s["id"], result, by):
+            unconfirmed.append(s["id"])
+    return unconfirmed
+
+
+def offers_price_or_cap(attributes):
+    """A price for a server the ledger did not know: the plan's, if one of ours, else $5/h, so
+    the cap errs high."""
+    slug = (attributes.get("plan") or {}).get("slug")
+    if slug in PLANS:
+        found = offers(slug)
+        if found:
+            return max(o[0] for o in found)
+    return 5.0
 
 
 def cmd_reap(args):
@@ -392,13 +475,14 @@ def cmd_reap(args):
     if not args.yes:
         print(f"{len(servers)} bench servers; run again with --yes to delete them")
         return
-    for s in servers:
-        print(f"{s['id']}: {delete_server(s['id'])}")
-        update_rental(s["id"], deleted_at=now())
+    unconfirmed = reap(servers, "reap")
+    if unconfirmed:
+        die(f"deletion not confirmed for {', '.join(unconfirmed)}; they may still bill. Run reap again")
 
 
 def cmd_watchdog(args):
-    """Runs detached. Deletes the server at the deadline unless it is gone already."""
+    """Runs detached. Deletes the server at the deadline unless it is gone already, and keeps
+    trying until the API confirms the deletion."""
     while now() < args.deadline:
         try:
             api("GET", f"/servers/{args.server_id}")
@@ -406,18 +490,19 @@ def cmd_watchdog(args):
             if e.code == 404:
                 print(f"{stamp()} {args.server_id} gone before the deadline", flush=True)
                 return
+            print(f"{stamp()} watchdog: {e}", flush=True)
         except Exception as e:  # keep watching through a network fault
             print(f"{stamp()} watchdog: {e}", flush=True)
         time.sleep(min(60, max(1, args.deadline - now())))
-    for attempt in range(20):
+    while True:
         try:
-            print(f"{stamp()} deadline: deleting {args.server_id}: {delete_server(args.server_id)}",
-                  flush=True)
-            update_rental(args.server_id, deleted_at=now(), deleted_by="watchdog")
-            return
+            result = delete_server(args.server_id)
         except Exception as e:
-            print(f"{stamp()} watchdog delete failed ({e}); retrying", flush=True)
-            time.sleep(30)
+            result = f"failed ({e})"
+        print(f"{stamp()} deadline: deleting {args.server_id}: {result}", flush=True)
+        if confirm_deleted(args.server_id, result, "watchdog"):
+            return
+        time.sleep(60)
 
 
 def start_watchdog(server_id, deadline, rental_dir):
@@ -442,9 +527,8 @@ def cmd_rental_a(args):
     if not found:
         die(f"{args.plan} is not in stock{' at ' + args.site if args.site else ''}")
     hour, site, instant = found[0]
-    book = ledger()
-    spent = sum(worst_case(r) for r in book["rentals"])
-    this = math.ceil(args.max_minutes / 60) * hour
+    spent = sum(worst_case(r) for r in ledger()["rentals"])
+    this = math.ceil((args.max_minutes + MARGIN_MINUTES) / 60) * hour
     print(f"would rent {args.plan} ({PLANS[args.plan]}) at {site}, ${hour:.2f}/h, hourly billing, "
           f"{'instant deploy' if instant else 'standard deploy'}; deleted within {args.max_minutes} "
           f"minutes; worst case ${this:.2f}; ledger so far ${spent:.2f}; cap ${args.cap_usd:.2f}")
@@ -453,26 +537,47 @@ def cmd_rental_a(args):
     if not args.yes:
         print("nothing bought: run again with --yes to rent")
         return
+    print("keep this Mac plugged in, its lid open and online until `status` shows the server "
+          "deleted: the watchdog runs here, and the API cannot set a deletion time")
     key_id = ensure_key(project)
     hostname = HOST_PREFIX + "a-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     body = {"data": {"type": "servers", "attributes": {
         "project": project, "plan": args.plan, "site": site, "operating_system": OS_SLUG,
         "hostname": hostname, "ssh_keys": [key_id], "billing": "hourly"}}}
-    created = api("POST", "/servers", body)
-    server_id = created["data"]["id"]
+    try:
+        server_id = api("POST", "/servers", body)["data"]["id"]
+    except BaseException as e:
+        # The server may exist even though the reply failed or could not be read.
+        print(f"{stamp()} the create request failed or its reply is unreadable ({e!r}); looking "
+              f"for bench servers for 3 minutes and deleting any found", file=sys.stderr)
+        unconfirmed, seen = [], set()
+        for _ in range(10):
+            try:
+                found_now = [s for s in bench_servers(project) if s["id"] not in seen]
+            except Exception as list_error:
+                print(f"{stamp()} listing failed: {list_error}", file=sys.stderr)
+                found_now = []
+            seen.update(s["id"] for s in found_now)
+            unconfirmed += reap(found_now, "failed-create")
+            time.sleep(20)
+        for server in unconfirmed:
+            start_watchdog(server, now(), private_dir(STATE / f"failed-create-{server}"))
+        die(f"no rental: {len(seen)} server(s) found and deleted"
+            + (f"; {', '.join(unconfirmed)} not confirmed, watchdogs started" if unconfirmed else ""))
     deployed = now()
     deadline = deployed + args.max_minutes * 60
-    rental_dir = private_dir(STATE / f"{hostname}-{server_id}")
-    book["rentals"].append({"server_id": server_id, "plan": args.plan, "site": site,
-                            "usd_per_hour": hour, "deployed_at": deployed, "deadline": deadline,
-                            "hostname": hostname, "dir": str(rental_dir)})
-    save_ledger(book)
-    watchdog = start_watchdog(server_id, deadline, rental_dir)
-    update_rental(server_id, watchdog_pid=watchdog)
-    print(f"{stamp()} deployed {server_id} ({hostname}); the watchdog (pid {watchdog}) deletes it at "
-          f"{stamp(deadline)}")
+    rental_dir = STATE / f"{hostname}-{server_id}"
+    watchdog = None
     sol = None
     try:
+        private_dir(rental_dir)
+        add_rental({"server_id": server_id, "plan": args.plan, "site": site, "usd_per_hour": hour,
+                    "deployed_at": deployed, "deadline": deadline, "hostname": hostname,
+                    "dir": str(rental_dir)})
+        watchdog = start_watchdog(server_id, deadline, rental_dir)
+        update_rental(server_id, watchdog_pid=watchdog)
+        print(f"{stamp()} deployed {server_id} ({hostname}); the watchdog (pid {watchdog}) deletes "
+              f"it at {stamp(deadline)}")
         ip = None
         while now() < deadline - 300:
             a = api("GET", f"/servers/{server_id}")["data"]["attributes"]
@@ -521,15 +626,17 @@ def cmd_rental_a(args):
         except Exception as e:
             result = f"failed ({e})"
         print(f"{stamp()} deleting {server_id}: {result}")
-        if result in ("gone", "deleted", "deleting", "disk_erasing"):
-            update_rental(server_id, deleted_at=now(), deleted_by="rental")
-            try:
-                os.killpg(watchdog, 15)
-            except (ProcessLookupError, PermissionError):
-                pass
+        if confirm_deleted(server_id, result, "rental"):
+            if watchdog:
+                try:
+                    os.killpg(watchdog, 15)
+                except (ProcessLookupError, PermissionError):
+                    pass
         else:
-            print(f"{stamp()} deletion not confirmed: the watchdog stays on, and `status` shows the "
-                  f"server; run `delete {server_id}` again", file=sys.stderr)
+            if not watchdog:
+                watchdog = start_watchdog(server_id, now(), private_dir(rental_dir))
+            print(f"{stamp()} deletion not confirmed: the watchdog (pid {watchdog}) keeps trying, "
+                  f"and `status` shows the server; or run `delete {server_id}`", file=sys.stderr)
         print(f"files: {rental_dir}")
 
 
