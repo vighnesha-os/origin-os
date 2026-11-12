@@ -34,6 +34,9 @@ are the board maker's data and carry serial numbers and addresses.
 Commands:
   preflight                  read-only: projects, prices and stock per site, servers, keys
   rental-a [--yes]           rental A: deploy Ubuntu, read the machine, delete it
+  rental-b --image-dir D --source-revision C --identity-maps-commit M [--yes]
+                             rental B: put Origin's loader where the firmware's first boot
+                             entry points, boot it, capture each boot's verdict, delete it
   status                     the bench servers that exist now, and the ledger
   delete SERVER_ID           delete one server
   reap [--yes]               delete every server whose hostname starts with origin-bench-
@@ -45,11 +48,13 @@ import fcntl
 import json
 import math
 import os
+import re
 import socket
 import stat
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -534,11 +539,32 @@ def start_watchdog(server_id, deadline, rental_dir):
     return process.pid
 
 
-def cmd_rental_a(args):
+
+
+# A rental, from purchase to confirmed deletion. Both rentals go through `rent`.
+
+
+class Rental:
+    """What a rental's work needs: the server, its address, its directory and its console."""
+
+    def __init__(self, server_id, ip, rental_dir, deadline, key_id, console):
+        self.server_id, self.ip, self.dir = server_id, ip, rental_dir
+        self.deadline, self.key_id, self.console = deadline, key_id, console
+
+    def ssh(self, command, **kwargs):
+        return subprocess.run(ssh_base(self.dir) + [f"{OS_USER}@{self.ip}", command], **kwargs)
+
+
+def rent(args, kind, work, check=None):
+    """Checks, buys, runs `work(rental)`, and deletes the server on every way out.
+
+    `check()` runs before anything is bought and may refuse the rental."""
     if args.plan not in PLANS:
         die(f"{args.plan} is not one of {', '.join(PLANS)}")
     if not 10 <= args.max_minutes <= HARD_MAX_MINUTES:
         die(f"--max-minutes must be between 10 and {HARD_MAX_MINUTES}")
+    if check:
+        check()
     project = project_id(args.project)
     running = bench_servers(project)
     if running:
@@ -560,7 +586,7 @@ def cmd_rental_a(args):
     print("keep this Mac plugged in, its lid open and online until `status` shows the server "
           "deleted: the watchdog runs here, and the API cannot set a deletion time")
     key_id = ensure_key(project)
-    hostname = HOST_PREFIX + "a-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    hostname = HOST_PREFIX + kind + "-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     body = {"data": {"type": "servers", "attributes": {
         "project": project, "plan": args.plan, "site": site, "operating_system": OS_SLUG,
         "hostname": hostname, "ssh_keys": [key_id], "billing": "hourly"}}}
@@ -588,7 +614,7 @@ def cmd_rental_a(args):
     deadline = deployed + args.max_minutes * 60
     rental_dir = STATE / f"{hostname}-{server_id}"
     watchdog = None
-    sol = None
+    console = None
     try:
         private_dir(rental_dir)
         add_rental({"server_id": server_id, "plan": args.plan, "site": site, "usd_per_hour": hour,
@@ -612,35 +638,13 @@ def cmd_rental_a(args):
         print(f"{stamp()} on, at {ip}")
         wait_for_ssh(rental_dir, ip, deadline - 300)
         print(f"{stamp()} SSH answers")
-        sol, sol_log = start_sol(server_id, key_id, rental_dir, deadline)
-        dump = rental_dir / "dump.tar.gz"
-        with open(dump, "wb") as f:
-            subprocess.run(ssh_base(rental_dir) + [f"{OS_USER}@{ip}", "sudo -n bash -s"],
-                           input=COLLECT.encode(), stdout=f, check=True, timeout=600)
-        with tarfile.open(dump) as t:
-            t.extractall(rental_dir / "dump", filter="data")
-        print(f"{stamp()} read the machine")
-        if sol:
-            subprocess.run(ssh_base(rental_dir) + [f"{OS_USER}@{ip}",
-                           "for p in 0 1 2 3; do echo ORIGIN-BENCH-MARK-ttyS$p | "
-                           "sudo -n timeout 5 tee /dev/ttyS$p >/dev/null 2>&1; done"], timeout=60)
-            time.sleep(10)
-            marks = [p for p in range(4) if f"ORIGIN-BENCH-MARK-ttyS{p}" in sol_log.read_text(errors="replace")]
-            (rental_dir / "sol-port.txt").write_text(f"markers seen on the serial console: {marks}\n")
-            print(f"{stamp()} serial-over-LAN carries ttyS{marks}")
-            if not args.no_reboot and now() < deadline - 900:
-                subprocess.run(ssh_base(rental_dir) + [f"{OS_USER}@{ip}", "sudo -n systemctl reboot"],
-                               timeout=60)
-                print(f"{stamp()} rebooting, to capture the firmware's own output")
-                limit = min(now() + 480, deadline - 300)
-                while now() < limit and "login:" not in sol_log.read_text(errors="replace")[-4000:]:
-                    time.sleep(15)
-        print(decode(rental_dir))
+        console = Console.open(server_id, key_id, rental_dir, deadline)
+        work(Rental(server_id, ip, rental_dir, deadline, key_id, console))
     except BaseException as e:
         print(f"{stamp()} stopped: {e!r}", file=sys.stderr)
     finally:
-        if sol:
-            stop_sol(sol)
+        if console:
+            console.stop()
         try:
             result = delete_server(server_id)
         except Exception as e:
@@ -660,14 +664,136 @@ def cmd_rental_a(args):
         print(f"files: {rental_dir}")
 
 
-def start_sol(server_id, key_id, rental_dir, deadline):
+def read_machine(rental):
+    """Runs COLLECT on the machine and unpacks it under the rental's `dump`."""
+    dump = rental.dir / "dump.tar.gz"
+    with open(dump, "wb") as f:
+        subprocess.run(ssh_base(rental.dir) + [f"{OS_USER}@{rental.ip}", "sudo -n bash -s"],
+                       input=COLLECT.encode(), stdout=f, check=True, timeout=600)
+    with tarfile.open(dump) as t:
+        t.extractall(rental.dir / "dump", filter="data")
+    print(f"{stamp()} read the machine")
+
+
+# Rental A: read the machine, find the console's port, watch a reboot.
+
+
+def cmd_rental_a(args):
+    def work(rental):
+        read_machine(rental)
+        console = rental.console
+        if console:
+            rental.ssh("for p in 0 1 2 3; do echo ORIGIN-BENCH-MARK-ttyS$p | "
+                       "sudo -n timeout 5 tee /dev/ttyS$p >/dev/null 2>&1; done", timeout=60)
+            time.sleep(10)
+            marks = [p for p in range(4) if f"ORIGIN-BENCH-MARK-ttyS{p}" in console.text()]
+            (rental.dir / "sol-port.txt").write_text(f"markers seen on the serial console: {marks}\n")
+            print(f"{stamp()} serial-over-LAN carries ttyS{marks}")
+            if not args.no_reboot and now() < rental.deadline - 900:
+                start = console.size()
+                rental.ssh("sudo -n systemctl reboot", timeout=60)
+                print(f"{stamp()} rebooting, to capture the firmware's own output")
+                limit = min(now() + 480, rental.deadline - 300)
+                while now() < limit and "login:" not in console.text(start):
+                    time.sleep(15)
+        print(decode(rental.dir))
+
+    rent(args, "a", work)
+
+
+# The serial console, kept open across resets.
+
+
+class Console:
+    """The out-of-band serial console, captured to `sol.log` and opened again whenever it drops.
+
+    The BMC closes the session at every reset of the machine (rental A, 2026-11-12). A thread
+    reconnects at once, so that the firmware's and Origin's output after a reset is kept.
+    `sol.log` holds only what the console carried; ssh's own messages and the reconnections go to
+    `sol-events.log`."""
+
+    def __init__(self, command, rental_dir, reopen=None):
+        self.command, self.reopen = command, reopen
+        self.path = rental_dir / "sol.log"
+        self.events = open(rental_dir / "sol-events.log", "a")
+        self.log = open(self.path, "ab")
+        self.process = None
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    @classmethod
+    def open(cls, server_id, key_id, rental_dir, deadline):
+        conn = out_of_band(server_id, key_id, deadline)
+        if not conn:
+            return None
+
+        def reopen():
+            fresh = out_of_band(server_id, key_id, now() + 900)
+            return sol_command(fresh, rental_dir) if fresh else None
+
+        console = cls(sol_command(conn, rental_dir), rental_dir, reopen)
+        time.sleep(10)
+        print(f"{stamp()} capturing the serial console")
+        return console
+
+    def note(self, text):
+        self.events.write(f"{stamp()} {text}\n")
+        self.events.flush()
+
+    def run(self):
+        quick_failures = 0
+        while not self.stopping.is_set():
+            started = now()
+            self.process = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=self.log,
+                                            stderr=self.events)
+            self.note(f"console session opened at byte {self.size()}")
+            while self.process.poll() is None and not self.stopping.is_set():
+                time.sleep(0.5)
+            if self.stopping.is_set():
+                break
+            self.note(f"console session ended (exit {self.process.returncode}) at byte {self.size()}")
+            quick_failures = quick_failures + 1 if now() - started < 5 else 0
+            if quick_failures >= 5 and self.reopen:
+                self.note("five quick failures: asking the API for the out-of-band connection again")
+                command = self.reopen()
+                if command:
+                    self.command = command
+                quick_failures = 0
+            time.sleep(1 if quick_failures == 0 else 2)
+
+    def flush(self):
+        if not self.log.closed:
+            self.log.flush()
+
+    def size(self):
+        self.flush()
+        return self.path.stat().st_size
+
+    def text(self, start=0):
+        """What the console carried from byte `start`, without terminal control sequences."""
+        self.flush()
+        with open(self.path, "rb") as f:
+            f.seek(start)
+            return clean(f.read().decode("utf-8", errors="replace"))
+
+    def stop(self):
+        self.stopping.set()
+        if self.process:
+            stop_sol(self.process)
+        self.thread.join(timeout=15)
+        self.log.close()
+        self.events.close()
+
+
+def out_of_band(server_id, key_id, deadline):
+    """Creates the out-of-band connection and waits up to five minutes for it."""
     try:
         body = {"data": {"type": "out_of_band", "attributes": {"ssh_key_id": key_id}}}
         api("POST", f"/servers/{server_id}/out_of_band_connection", body)
     except ApiError as e:
         print(f"{stamp()} no out-of-band connection: {e}")
-        return None, None
-    conn = None
+        return None
     # Five minutes at most: the console is worth having, not worth the rental's hour.
     limit = min(now() + 300, deadline - 600)
     while now() < limit:
@@ -675,27 +801,27 @@ def start_sol(server_id, key_id, rental_dir, deadline):
         listed = listed if isinstance(listed, list) else [listed]
         conn = next((c["attributes"] for c in listed if c["attributes"].get("status") == "connected"), None)
         if conn:
-            break
+            return conn
         time.sleep(15)
-    if not conn:
-        print(f"{stamp()} out-of-band never connected")
-        return None, None
-    log_path = rental_dir / "sol.log"
-    log = open(log_path, "ab")
-    command = ["ssh", "-tt", "-i", str(KEY), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
-               "-o", "StrictHostKeyChecking=accept-new",
-               "-o", f"UserKnownHostsFile={rental_dir / 'known_hosts'}",
-               "-o", "ServerAliveInterval=15", "-p", str(conn.get("port", 2222)),
-               f"{conn['username']}@{conn['access_ip']}"]
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
-    time.sleep(10)
-    print(f"{stamp()} capturing the serial console")
-    return process, log_path
+    print(f"{stamp()} out-of-band never connected")
+    return None
+
+
+def sol_command(conn, rental_dir):
+    return ["ssh", "-tt", "-i", str(KEY), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR",
+            "-o", f"UserKnownHostsFile={rental_dir / 'known_hosts'}",
+            "-o", "ServerAliveInterval=15", "-p", str(conn.get("port", 2222)),
+            f"{conn['username']}@{conn['access_ip']}"]
+
+
+def clean(text):
+    """Drops terminal control sequences and carriage returns, which serial consoles are full of."""
+    return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][0-9A-Za-z]|\x1b[=>78]|\r", "", text)
 
 
 def stop_sol(process):
-    """Ends the console session. The BMC may have closed it already: it does on every reset of
-    the machine (rental A, 2026-11-12: "SOL session closed by BMC")."""
+    """Ends one console session. The BMC may have closed it already."""
     try:
         if process.poll() is None:
             process.stdin.write(b"\r~.")
@@ -708,6 +834,208 @@ def stop_sol(process):
             process.stdin.close()
         except OSError:
             pass
+
+
+# Rental B: Origin's first boot on a physical machine.
+
+LOADER_LINE = "origin-boot:"
+VERDICT_LINE = "origin-kernel: boot verdict:"
+REFUSED_LINE = "origin-kernel: boot refused"
+REPO = Path(__file__).resolve().parents[2]
+# A firmware boot entry's file, as the tool will accept it: on the ESP, under \EFI, a .efi name.
+ENTRY_FILE = re.compile(r"^\\EFI\\[A-Za-z0-9_.\-]+(\\[A-Za-z0-9_.\-]+)*\.efi$", re.IGNORECASE)
+
+
+def is_ancestor(older, newer):
+    """Whether commit `older` is in the history of `newer`, in this repository."""
+    for ref in (older, newer):
+        if subprocess.run(["git", "-C", str(REPO), "cat-file", "-e", f"{ref}^{{commit}}"],
+                          capture_output=True).returncode != 0:
+            die(f"{ref} is not a commit in {REPO}")
+    return subprocess.run(["git", "-C", str(REPO), "merge-base", "--is-ancestor", older, newer],
+                          capture_output=True).returncode == 0
+
+
+def boot_entry(efibootmgr, esp_partuuid):
+    """The firmware's first boot entry, if it starts a file on the ESP the system has mounted.
+
+    Returns (entry, path) with the path in the firmware's form (`\\EFI\\...`). Writing Origin's
+    loader over that file makes the firmware start Origin with no UEFI variable written."""
+    order = re.search(r"^BootOrder:\s*([0-9A-Fa-f]{4})", efibootmgr, re.MULTILINE)
+    if not order:
+        raise ValueError("efibootmgr shows no BootOrder")
+    first = order.group(1).upper()
+    line = next((l for l in efibootmgr.splitlines() if l.upper().startswith(f"BOOT{first}")), None)
+    if line is None:
+        raise ValueError(f"no line for Boot{first}")
+    if esp_partuuid.lower() not in line.lower():
+        raise ValueError(f"Boot{first} does not name the mounted ESP ({esp_partuuid}): {line[:120]}")
+    path = re.search(r"(?:File\()?(\\EFI\\[^)\t ]+?\.efi)\)?(?:\s|$)", line, re.IGNORECASE)
+    if not path or not ENTRY_FILE.match(path.group(1)):
+        raise ValueError(f"Boot{first} names no file under \\EFI: {line[:120]}")
+    return f"Boot{first}", path.group(1)
+
+
+def scope_verdict(lscpu):
+    """ADR-0009 A2's rule, by hand, until the kernel prints it (P9 of the plan)."""
+    fields = {}
+    for line in lscpu.splitlines():
+        key, _, value = line.partition(":")
+        fields[key.strip()] = value.strip()
+    vendor, family = fields.get("Vendor ID", "?"), int(fields.get("CPU family", "0") or 0)
+    model = int(fields.get("Model", "0") or 0)
+    if vendor == "AuthenticAMD":
+        if family >= 0x1A:
+            return (f"AMD family {family:#x}: Zen 5 or newer by CPUID, which cannot tell the launch "
+                    "year (ADR-0009 A2); a 2024–2025 part is bench equipment")
+        return f"AMD family {family:#x}: older than Zen 5; bench equipment (ADR-0009 A1)"
+    if vendor == "GenuineIntel":
+        if family >= 18 or (family == 6 and model in (0xCC, 0xE5, 0xD5, 0xDD)):
+            return f"Intel family {family}, model {model:#x}: a 2026 generation by ADR-0009 A2"
+        return f"Intel family {family}, model {model:#x}: outside the scope; bench equipment"
+    return f"{vendor}: outside the scope; bench equipment"
+
+
+def boot_result(text):
+    """What one boot showed on the console: the loader's first line, the kernel's verdict, or how
+    far it got."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    loader = next((l for l in lines if LOADER_LINE in l), None)
+    verdict = next((l for l in lines if VERDICT_LINE in l or REFUSED_LINE in l), None)
+    origin = [l for l in lines if "origin-kernel:" in l or LOADER_LINE in l]
+    if verdict:
+        return {"ended": True, "summary": verdict[verdict.find("origin-kernel:"):], "loader": bool(loader)}
+    if any("login:" in l for l in lines):
+        return {"ended": True, "summary": "a system other than Origin started (a login prompt)",
+                "loader": bool(loader)}
+    last = origin[-1] if origin else (lines[-1] if lines else "nothing on the console")
+    return {"ended": False, "summary": f"no verdict; last line: {last[:200]}", "loader": bool(loader)}
+
+
+def redact(text, server_id, ips):
+    for ip in ips:
+        text = text.replace(ip, "<ip>")
+    text = re.sub(r"\b\d{1,3}(\.\d{1,3}){3}\b", "<ip>", text)
+    return text.replace(server_id, "<server>")
+
+
+def cmd_rental_b(args):
+    loader = Path(args.image_dir) / "BOOTX64.EFI"
+    kernel = Path(args.image_dir) / "KERNEL.ONBF"
+
+    def check():
+        for f in (loader, kernel):
+            if not f.is_file():
+                die(f"{f} is missing: build with `cargo xtask build` and copy the loader as BOOTX64.EFI")
+        # Item 229: Origin boots on real hardware only once identity maps have landed.
+        if not is_ancestor(args.identity_maps_commit, args.source_revision):
+            die(f"{args.identity_maps_commit} (identity maps) is not in the history of "
+                f"{args.source_revision}: item 229 forbids this boot")
+        print(f"image: {args.source_revision}; loader SHA-256 {sha256(loader)}; "
+              f"kernel SHA-256 {sha256(kernel)}; identity maps {args.identity_maps_commit} included")
+
+    def work(rental):
+        read_machine(rental)
+        dump = rental.dir / "dump"
+        boot_mode = (dump / "boot-mode.txt").read_text().strip()
+        secure = (dump / "secure-boot.txt").read_text().split()
+        if not boot_mode.startswith("uefi 64") or not secure or secure[-1] != "0":
+            raise RuntimeError(f"needs UEFI 64-bit with Secure Boot off; found {boot_mode}, {secure}")
+        esp = json.loads(rental.ssh("findmnt -J -o SOURCE,TARGET,FSTYPE /boot/efi", capture_output=True,
+                                    text=True, check=True, timeout=60).stdout)["filesystems"][0]
+        if esp["fstype"] != "vfat":
+            raise RuntimeError(f"/boot/efi is {esp['fstype']}, not vfat")
+        partuuid = rental.ssh(f"sudo -n blkid -s PARTUUID -o value {esp['source']}", capture_output=True,
+                              text=True, check=True, timeout=60).stdout.strip()
+        entry, path = boot_entry((dump / "efibootmgr.txt").read_text(), partuuid)
+        target = "/boot/efi" + path.replace("\\", "/")
+        print(f"{stamp()} the firmware's first entry, {entry}, starts {path} on the mounted ESP")
+        rental.ssh("rm -rf /tmp/origin && mkdir -m 700 /tmp/origin", check=True, timeout=60)
+        subprocess.run(["scp", "-q"] + ssh_base(rental.dir)[1:] + [str(loader), str(kernel),
+                       f"{OS_USER}@{rental.ip}:/tmp/origin/"], check=True, timeout=300)
+        install = (f"set -eu; test -f '{target}'; "
+                   f"install -D -m 0644 /tmp/origin/KERNEL.ONBF /boot/efi/EFI/ORIGIN/KERNEL.ONBF; "
+                   f"cp /tmp/origin/BOOTX64.EFI '{target}'; sync; "
+                   f"sha256sum '{target}' /boot/efi/EFI/ORIGIN/KERNEL.ONBF")
+        sums = rental.ssh(f"sudo -n bash -c \"{install}\"", capture_output=True, text=True, check=True,
+                          timeout=120).stdout.split()
+        if sums[0] != sha256(loader) or sums[2] != sha256(kernel):
+            raise RuntimeError("the files on the ESP do not match the image")
+        (rental.dir / "installed.txt").write_text(f"{entry} {path}\n{' '.join(sums)}\n")
+        print(f"{stamp()} Origin's loader is {path}, and its kernel \\EFI\\ORIGIN\\KERNEL.ONBF; "
+              "no UEFI variable was written")
+        console = rental.console
+        if not console:
+            raise RuntimeError("no serial console: a boot would show nothing")
+        results = []
+        for boot in range(1, args.boots + 1):
+            start = console.size()
+            if boot == 1:
+                rental.ssh("sudo -n systemctl reboot", timeout=60)
+            else:
+                api("POST", f"/servers/{rental.server_id}/actions",
+                    {"data": {"type": "actions", "attributes": {"action": "reboot"}}})
+            print(f"{stamp()} boot {boot} of {args.boots}: restarting")
+            limit = min(now() + args.boot_minutes * 60, rental.deadline - 300)
+            result = boot_result(console.text(start))
+            while not result["ended"] and now() < limit:
+                time.sleep(10)
+                result = boot_result(console.text(start))
+            result.update(boot=boot, start=start, end=console.size())
+            results.append(result)
+            print(f"{stamp()} boot {boot}: {result['summary']}")
+            (rental.dir / "boots.json").write_text(json.dumps(results, indent=2))
+            if not result["loader"] or "login prompt" in result["summary"] or now() > rental.deadline - 600:
+                break
+        write_record(args, rental, results)
+
+    rent(args, "b", work, check)
+
+
+def sha256(path):
+    import hashlib
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write_record(args, rental, results):
+    """A draft of the hardware record (the requirements gate's form) and a redacted console log,
+    both in the rental's directory. A person reads them before either goes into the repository."""
+    dump = rental.dir / "dump"
+    read = lambda name: (dump / name).read_text(errors="replace") if (dump / name).exists() else ""
+    dmi = dict(l.split(": ", 1) for l in read("dmi.txt").splitlines() if ": " in l)
+    lscpu = read("lscpu.txt")
+    cpu = dict((k.strip(), v.strip()) for k, _, v in (l.partition(":") for l in lscpu.splitlines()))
+    console_text = rental.console.text() if rental.console else ""
+    log = redact(console_text, rental.server_id, [rental.ip])
+    (rental.dir / "console-redacted.log").write_text(log)
+    origin = [l.strip() for l in log.splitlines() if "origin-kernel:" in l]
+    pick = lambda word: next((l for l in origin if word in l.lower()), "not printed")
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    rows = [
+        ("Machine", f"Latitude.sh `{args.plan}`: {cpu.get('Model name', '?')}, CPUID family "
+                    f"{cpu.get('CPU family', '?')}, model {cpu.get('Model', '?')}, stepping "
+                    f"{cpu.get('Stepping', '?')}; board {dmi.get('board_vendor', '?')} "
+                    f"{dmi.get('board_name', '?')}; {cpu.get('CPU(s)', '?')} logical processors"),
+        ("Firmware", f"{dmi.get('bios_vendor', '?')} {dmi.get('bios_version', '?')} "
+                     f"({dmi.get('bios_date', '?')}); {read('boot-mode.txt').strip()}; Secure Boot off"),
+        ("Source revision", f"`{args.source_revision}`; developer-mode loader; `BOOTX64.EFI` SHA-256 "
+                            f"{sha256(Path(args.image_dir) / 'BOOTX64.EFI')}; `KERNEL.ONBF` SHA-256 "
+                            f"{sha256(Path(args.image_dir) / 'KERNEL.ONBF')}"),
+        ("Date", date),
+        ("Result", "; ".join(f"boot {r['boot']}: {r['summary']}" for r in results) or "no boot ran"),
+        ("Scope", scope_verdict(lscpu) + ". It qualifies nothing and supports no hardware claim "
+                  "(CLAUDE.md §74, §76, rules 30 and 40; item 233)"),
+        ("Environment", "A physical machine with no hypervisor; the provider's firmware and BMC"),
+        ("Speculation controls", pick("speculation")),
+        ("IOMMU", pick("iommu")),
+        ("Log", f"`console-redacted.log`, SHA-256 {sha256(rental.dir / 'console-redacted.log')}"),
+        ("Not kept here", "ACPI tables, `lspci -vvv`, `dmidecode`: held privately (item 232); "
+                          "SHA-256 of the tables in `dump/acpi.sha256`"),
+    ]
+    table = "\n".join(f"| {k} | {v.replace('|', '/')} |" for k, v in rows)
+    (rental.dir / "record-draft.md").write_text(
+        f"# Bench boot: Latitude.sh {args.plan}, {date}\n\n| | |\n|---|---|\n{table}\n")
+    print(f"{stamp()} record draft: {rental.dir / 'record-draft.md'}")
 
 
 def main():
@@ -723,13 +1051,24 @@ def main():
     p = sub.add_parser("reap")
     p.add_argument("--yes", action="store_true")
     p.set_defaults(run=cmd_reap)
-    p = sub.add_parser("rental-a")
-    p.add_argument("--plan", default="m4-metal-small")
-    p.add_argument("--site", help="site slug (default: the cheapest in stock)")
-    p.add_argument("--max-minutes", type=int, default=50)
-    p.add_argument("--no-reboot", action="store_true", help="skip the reboot that captures the firmware")
-    p.add_argument("--yes", action="store_true", help="actually rent")
-    p.set_defaults(run=cmd_rental_a)
+    for name, run in (("rental-a", cmd_rental_a), ("rental-b", cmd_rental_b)):
+        p = sub.add_parser(name)
+        p.add_argument("--plan", default="m4-metal-small")
+        p.add_argument("--site", help="site slug (default: the cheapest in stock)")
+        p.add_argument("--max-minutes", type=int, default=50)
+        p.add_argument("--yes", action="store_true", help="actually rent")
+        p.set_defaults(run=run)
+        if name == "rental-a":
+            p.add_argument("--no-reboot", action="store_true",
+                           help="skip the reboot that captures the firmware")
+        else:
+            p.add_argument("--image-dir", required=True,
+                           help="holds BOOTX64.EFI (the developer-mode loader) and KERNEL.ONBF")
+            p.add_argument("--source-revision", required=True, help="the commit the image was built from")
+            p.add_argument("--identity-maps-commit", required=True,
+                           help="the commit that landed identity maps (item 229)")
+            p.add_argument("--boots", type=int, default=3, choices=range(1, 6))
+            p.add_argument("--boot-minutes", type=int, default=8, help="how long one boot may take")
     p = sub.add_parser("watchdog")
     p.add_argument("--server-id", required=True)
     p.add_argument("--deadline", type=float, required=True)

@@ -133,6 +133,118 @@ class Guards(unittest.TestCase):
         self.assertIn("deleted_at", rental)
         watchdog.assert_not_called()
 
+    # Rental B.
+
+    OLD_STYLE = ("BootCurrent: 0004\nTimeout: 1 seconds\nBootOrder: 0002,0003,0004,0001\n"
+                 "Boot0001* UEFI: Built-in EFI Shell\tVenMedia(c0ffee00-0000-4000-8000-000000000002)\n"
+                 "Boot0002* Ubuntu\tHD(1,GPT,c0ffee00-0000-4000-8000-000000000001,0x800,0x100000)"
+                 "/File(\\EFI\\ubuntu\\shimx64.efi)\n"
+                 "Boot0003* UEFI PXE IPv4\tPciRoot(0x0)/Pci(0x1,0x1)/MAC(000000000000,1)\n")
+    NEW_STYLE = ("BootOrder: 0002,0001\n"
+                 "Boot0002* ubuntu\tHD(1,GPT,C0FFEE00-0000-4000-8000-000000000001,0x800,0x100000)"
+                 "/\\EFI\\ubuntu\\shimx64.efi\n")
+    PARTUUID = "c0ffee00-0000-4000-8000-000000000001"
+
+    def test_boot_entry_reads_both_efibootmgr_forms(self):
+        for text in (self.OLD_STYLE, self.NEW_STYLE):
+            self.assertEqual(self.lat.boot_entry(text, self.PARTUUID), ("Boot0002", "\\EFI\\ubuntu\\shimx64.efi"))
+
+    def test_boot_entry_refuses_another_partition_or_no_file(self):
+        with self.assertRaises(ValueError):
+            self.lat.boot_entry(self.OLD_STYLE, "11111111-2222-3333-4444-555555555555")
+        pxe_first = self.OLD_STYLE.replace("BootOrder: 0002", "BootOrder: 0003")
+        with self.assertRaises(ValueError):
+            self.lat.boot_entry(pxe_first, self.PARTUUID)
+        with self.assertRaises(ValueError):
+            self.lat.boot_entry("Timeout: 1 seconds\n", self.PARTUUID)
+        sneaky = self.OLD_STYLE.replace("\\EFI\\ubuntu\\shimx64.efi", "\\EFI\\..\\x';rm.efi")
+        with self.assertRaises(ValueError):
+            self.lat.boot_entry(sneaky, self.PARTUUID)
+
+    def test_boot_result(self):
+        verdict = "\x1b[0morigin-boot: read \\EFI\\ORIGIN\\KERNEL.ONBF (1 MiB)\r\n" \
+                  "origin-kernel: boot verdict: degraded: 58 of 59 proofs passed\r\n"
+        r = self.lat.boot_result(self.lat.clean(verdict))
+        self.assertTrue(r["ended"] and r["loader"])
+        self.assertEqual(r["summary"], "origin-kernel: boot verdict: degraded: 58 of 59 proofs passed")
+        r = self.lat.boot_result("origin-boot: x\norigin-kernel: boot refused: heap failed\n")
+        self.assertTrue(r["ended"])
+        r = self.lat.boot_result("Ubuntu 24.04 LTS host ttyS1\nhost login: ")
+        self.assertTrue(r["ended"] and not r["loader"])
+        r = self.lat.boot_result("Pre-memory NB Initialization\n")
+        self.assertFalse(r["ended"])
+        self.assertIn("Pre-memory", r["summary"])
+
+    def test_scope_verdict(self):
+        zen4 = "Vendor ID: AuthenticAMD\nCPU family: 25\nModel: 97\n"
+        zen5 = "Vendor ID: AuthenticAMD\nCPU family: 26\nModel: 2\n"
+        ptl = "Vendor ID: GenuineIntel\nCPU family: 6\nModel: 204\n"
+        self.assertIn("older than Zen 5", self.lat.scope_verdict(zen4))
+        self.assertIn("cannot tell the launch year", self.lat.scope_verdict(zen5))
+        self.assertIn("a 2026 generation", self.lat.scope_verdict(ptl))
+
+    def test_identity_maps_must_be_in_the_image(self):
+        self.assertTrue(self.lat.is_ancestor("7113b48", "11bb986"))
+        self.assertFalse(self.lat.is_ancestor("11bb986", "7113b48"))
+        image = self.home / "image"
+        image.mkdir()
+        (image / "BOOTX64.EFI").write_bytes(b"loader")
+        (image / "KERNEL.ONBF").write_bytes(b"kernel")
+        args = mock.Mock(plan="m4-metal-small", max_minutes=50, image_dir=str(image),
+                         source_revision="7113b48", identity_maps_commit="11bb986", yes=False)
+        with mock.patch.object(self.lat, "project_id") as project:
+            with self.assertRaises(SystemExit):
+                self.lat.cmd_rental_b(args)
+            project.assert_not_called()  # refused before any request
+
+    def test_redact_and_clean(self):
+        text = "Connection to 192.0.2.10 closed\nserver sv_test0000000000 at 198.51.100.20\n"
+        out = self.lat.redact(text, "sv_test0000000000", ["198.51.100.20"])
+        self.assertNotIn("192.0.2", out)
+        self.assertNotIn("sv_te", out)
+        self.assertEqual(self.lat.clean("\x1b[1;31mred\x1b[0m\r\n\x1b[?25l"), "red\n")
+
+    def test_console_reopens_after_each_drop(self):
+        d = self.home / "rental"
+        d.mkdir()
+        console = self.lat.Console(["/bin/sh", "-c", "echo session; sleep 0.3"], d)
+        try:
+            deadline = self.lat.now() + 15
+            while console.text().count("session") < 3 and self.lat.now() < deadline:
+                self.lat.time.sleep(0.2)
+        finally:
+            console.stop()
+        self.assertGreaterEqual(console.text().count("session"), 3)
+        events = (d / "sol-events.log").read_text()
+        self.assertGreaterEqual(events.count("console session opened"), 3)
+        self.assertIn("console session ended", events)
+
+    def test_record_draft_has_the_gates_five_rows(self):
+        d = self.home / "rental"
+        (d / "dump").mkdir(parents=True)
+        (d / "dump" / "dmi.txt").write_text("bios_vendor: AMI\nbios_version: 2.5a\nbios_date: 12/08/2025\n"
+                                            "board_vendor: Supermicro\nboard_name: H13SRE-F\n")
+        (d / "dump" / "lscpu.txt").write_text("Vendor ID: AuthenticAMD\nModel name: AMD EPYC 4244P\n"
+                                              "CPU family: 25\nModel: 97\nStepping: 2\nCPU(s): 12\n")
+        (d / "dump" / "boot-mode.txt").write_text("uefi 64\n")
+        image = self.home / "image"
+        image.mkdir()
+        (image / "BOOTX64.EFI").write_bytes(b"loader")
+        (image / "KERNEL.ONBF").write_bytes(b"kernel")
+        console = mock.Mock()
+        console.text.return_value = ("from 192.0.2.3: origin-kernel: speculation: automatic IBRS on\n"
+                                     "origin-kernel: boot verdict: 59 of 59 proofs passed\n")
+        rental = self.lat.Rental("sv_x", "192.0.2.3", d, 0, "key", console)
+        args = mock.Mock(plan="m4-metal-small", source_revision="abc1234", image_dir=str(image))
+        results = [{"boot": 1, "summary": "origin-kernel: boot verdict: 59 of 59 proofs passed"}]
+        self.lat.write_record(args, rental, results)
+        record = (d / "record-draft.md").read_text()
+        for key in ("Machine", "Firmware", "Source revision", "Date", "Result"):
+            self.assertIn(f"| {key} | ", record)
+        self.assertIn("older than Zen 5", record)
+        self.assertIn("automatic IBRS on", record)
+        self.assertNotIn("192.0.2.3", (d / "console-redacted.log").read_text())
+
     def test_two_writers_lose_nothing(self):
         self.lat.add_rental({"server_id": "sv", "usd_per_hour": 0.41, "deployed_at": 1.0, "deadline": 2.0})
         context = multiprocessing.get_context("spawn")
