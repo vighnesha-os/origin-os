@@ -675,7 +675,7 @@ At `c34fdab`, before item 44, four of ten were the same (§13.2). Each digest he
 
 ### 16.4 What would close the gap between this and a check
 
-Not built; put to the coordinating session with the result.
+Not built when this was written; put to the coordinating session with the result. It decided the rows' states on this evidence (three are `built`, none `done`), made the second of these TASKS item 45, and put the first to the owner as decision item 275.
 
 - A comparison that runs: CI's `check` job on both of its runner images, and a job that compares the two artifacts. That is two machines on every run, both Linux; it is a new thing CI must pass.
 - A tool for the comparison made here by hand: a command that takes a directory of kept files and compares it with the gate's own.
