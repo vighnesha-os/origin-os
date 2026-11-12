@@ -59,6 +59,11 @@ const PROGRAMS: &[Program] = &[Program {
     name: "first_program",
 }];
 
+/// The package of each program the kernel carries.
+pub(crate) fn carried_packages() -> impl Iterator<Item = &'static str> {
+    PROGRAMS.iter().map(|program| program.package)
+}
+
 /// `target`, or Cargo's own target directory.
 fn base_dir(target: Option<&Path>) -> PathBuf {
     target.map_or_else(target_dir, Path::to_path_buf)
