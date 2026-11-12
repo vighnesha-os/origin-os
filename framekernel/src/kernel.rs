@@ -261,6 +261,12 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
                 time::monotonic_nanos() / 1_000_000
             );
         }
+        // The random-number generator (ADR-0016): the root and the boot processor's own
+        // generator, before another processor starts.
+        // Boot info 0.6 (decision item 166): the loader's value for the kernel stacks' region
+        // can be taken once, and only before the generator's start overwrites it with the seed.
+        let stack_value = prove_stack_value(&mut com1, info.boot_seed != 0);
+        report_random_start(&mut com1, origin_frame::random::start_boot());
         let online = smp::start(&mut com1, sched::run_ap);
         proofs.record(Proof::Processors, online.complete());
         // What each processor put in its own control registers, which ring 3 relies on.
@@ -320,8 +326,14 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         proofs.record(Proof::Numa, numa);
         // Inter-node distances from the ACPI SLIT (CLAUDE.md §27, §28).
         proofs.record(Proof::NumaDistances, prove_slit(&mut com1, info.acpi_rsdp));
-        // Hardware entropy from RDSEED/RDRAND (CLAUDE.md §59).
-        proofs.record(Proof::Entropy, prove_entropy(&mut com1, &features));
+        // The random-number generator on every processor (CLAUDE.md §59; ADR-0016). If the
+        // proof fails, randomness is withheld from here on (ADR-0013 R2, Amendment 1): nothing
+        // is launched and nothing is placed at a random address.
+        let random = prove_random(&mut com1, online.cpus(), tsc_hz) && stack_value;
+        if !random {
+            origin_frame::random::withhold();
+        }
+        proofs.record(Proof::Random, random);
         // M3, second step: preemptive kernel threads on every online processor. Its proofs
         // run to the end and are judged together (ADR-0013 R4): the proofs after a failure
         // use only the kernel's fixed programs, and the operator sees every result.
@@ -1263,82 +1275,285 @@ fn prove_slit(com1: &mut console::Console, rsdp: u64) -> bool {
     consistent
 }
 
-/// Proves the kernel's hardware entropy source (CLAUDE.md §59 secure randomness). Draws a
-/// batch of 64-bit values through the bounded-retry logic in [`framekernel::entropy`] over
-/// RDSEED (preferred) and RDRAND, and checks they all arrived, are non-zero and are
-/// distinct — the smoke test that distinguishes a live entropy source from a dead one that
-/// returns a constant. A processor that reports neither instruction is reported honestly,
-/// not failed.
-fn prove_entropy(com1: &mut console::Console, features: &crate::features::Features) -> bool {
-    use crate::entropy::{self, Source};
-
-    if !features.rdseed && !features.rdrand {
-        let _ = writeln!(
-            com1,
-            "origin-kernel: entropy: no RDSEED or RDRAND; consistent true (no source claimed)"
-        );
-        return true;
+/// How an instruction stands, as the generator's lines give it.
+fn condition_name(condition: origin_frame::random::Condition) -> &'static str {
+    use origin_frame::random::Condition;
+    match condition {
+        Condition::Absent => "absent",
+        Condition::Untested => "not tested",
+        Condition::Testing => "being tested",
+        Condition::Healthy => "healthy",
+        Condition::Unhealthy => "unhealthy",
     }
+}
 
-    // Prefer RDSEED (full-entropy), falling back to RDRAND within one attempt; the generic
-    // `draw` loop then retries this combined source per Intel's budget.
-    struct Hw {
-        rdseed: bool,
-        rdrand: bool,
-        from_rdseed: u32,
-        from_rdrand: u32,
-    }
-    impl Source for Hw {
-        fn try_next(&mut self) -> Option<u64> {
-            if self.rdseed
-                && let Some(v) = cpu::rdseed()
-            {
-                self.from_rdseed += 1;
-                return Some(v);
-            }
-            if self.rdrand
-                && let Some(v) = cpu::rdrand()
-            {
-                self.from_rdrand += 1;
-                return Some(v);
-            }
-            None
+/// The loader's value for the kernel stacks' region (boot info 0.6; ADR-0016 R10 Amendment 1,
+/// decision item 166): it is there when the loader handed over a secret area, it can be taken
+/// once, and a second take is refused. The value is never printed.
+///
+/// The code that places the region takes it while the kernel builds its tables
+/// (`origin_frame::stack`, ADR-0004 Amendment 2, A5.1), long before this runs. So a take here
+/// must be refused: one that succeeds means the region was placed without the value, and
+/// fails this.
+fn prove_stack_value(com1: &mut Console, handed: bool) -> bool {
+    use origin_frame::random::{self, StackValue};
+    let first = random::take_stack_value().is_some();
+    let second = random::take_stack_value().is_some();
+    let (what, in_order) = match (handed, first, second, random::stack_value()) {
+        (true, true, _, _) => (
+            "WRONG: it was still there, so the kernel stacks' region was placed without it",
+            false,
+        ),
+        (true, false, false, StackValue::Taken) => (
+            "taken once before this point, and a take here was refused",
+            true,
+        ),
+        (false, false, false, StackValue::None) => {
+            ("none: the loader handed over no secret area", true)
         }
-    }
-
-    let mut src = Hw {
-        rdseed: features.rdseed,
-        rdrand: features.rdrand,
-        from_rdseed: 0,
-        from_rdrand: 0,
+        (true, false, false, StackValue::None) => (
+            "none: the secret area the loader named does not lie where one may",
+            true,
+        ),
+        _ => ("WRONG: it was not taken exactly once", false),
     };
-    let mut values = [0u64; 16];
-    let mut drawn = 0;
-    for slot in &mut values {
-        match entropy::draw(&mut src, entropy::RDRAND_RETRIES) {
-            Some(v) => {
-                *slot = v;
-                drawn += 1;
-            }
-            None => break,
-        }
-    }
-    let all = drawn == values.len();
-    let nonzero = values[..drawn].iter().all(|&v| v != 0);
-    let distinct = values[..drawn]
-        .iter()
-        .enumerate()
-        .all(|(i, &v)| !values[..i].contains(&v));
-    let consistent = all && nonzero && distinct;
     let _ = writeln!(
         com1,
-        "origin-kernel: entropy: RDSEED {}, RDRAND {}; {drawn} draws ({} RDSEED, {} RDRAND), all {all}, distinct {distinct}, nonzero {nonzero}; consistent {}{}",
-        features.rdseed,
-        features.rdrand,
-        src.from_rdseed,
-        src.from_rdrand,
-        consistent,
-        if consistent { "" } else { ": entropy failed" }
+        "origin-kernel: random: the loader's value for the kernel stacks' region: {what}"
+    );
+    in_order
+}
+
+/// Says how the generator's start went on the boot processor (ADR-0016 R13). Counts and
+/// yes-or-no only: no draw, seed, state or output is ever printed (CLAUDE.md §61).
+fn report_random_start(com1: &mut Console, start: Option<origin_frame::random::BootStart>) {
+    use origin_frame::random::{Instruction, LoaderSeed};
+    let Some(start) = start else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: random: the generator was not started: no memory for it, or not the boot processor's first call"
+        );
+        return;
+    };
+    let test = if start.self_test { "passed" } else { "FAILED" };
+    let (rdseed, rdrand) = (condition_name(start.rdseed), condition_name(start.rdrand));
+    let Some(counted) = start.counted.filter(|_| start.root) else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: random: no generator: known-answer test {test}; on the boot processor RDSEED is {rdseed} and RDRAND is {rdrand}. Nothing will be launched and nothing placed at a random address (ADR-0016 R8)"
+        );
+        return;
+    };
+    let (name, other) = match counted {
+        Instruction::Rdseed => ("RDSEED", "RDRAND"),
+        Instruction::Rdrand => ("RDRAND", "RDSEED"),
+    };
+    let _ = write!(
+        com1,
+        "origin-kernel: random: root: known-answer test {test}; RDSEED {rdseed}, RDRAND {rdrand} on the boot processor; seeded from {name}'s 1024 start-up draws, "
+    );
+    let _ = if start.both {
+        write!(com1, "with {other}'s 1024 as the nonce")
+    } else {
+        write!(com1, "with 4 more of its draws as the nonce")
+    };
+    if counted == Instruction::Rdrand {
+        let _ = write!(
+            com1,
+            "; no healthy RDSEED, so its strength is no more than the processor's own generator's"
+        );
+    }
+    let _ = writeln!(
+        com1,
+        "; the loader's seed {}; the boot processor's generator {}",
+        match start.loader_seed {
+            LoaderSeed::None => "none",
+            LoaderSeed::Refused => "refused: not inside the boot-info region",
+            LoaderSeed::Mixed { overwritten: true } => "mixed in and overwritten where it lay",
+            LoaderSeed::Mixed { overwritten: false } => "mixed in and NOT overwritten",
+        },
+        if start.generator {
+            "seeded"
+        } else {
+            "NOT seeded"
+        }
+    );
+}
+
+/// Time-stamp counter ticks as nanoseconds.
+fn ticks_to_nanos(ticks: u64, tsc_hz: u64) -> u64 {
+    (u128::from(ticks) * 1_000_000_000 / u128::from(tsc_hz.max(1))) as u64
+}
+
+/// Proves the random-number generator (ADR-0016; CLAUDE.md §59): every processor has one,
+/// requests are answered with values that differ, the generator's stack holds only zeros after
+/// a request (R9 Z3), and what a request costs and how long a step kept interrupts off
+/// (R12; rules 21 and 22). With no generator it says so and fails: randomness is withheld.
+fn prove_random(com1: &mut Console, cpus: &[cpu::CpuIndex], tsc_hz: u64) -> bool {
+    use origin_frame::random::{self, Condition, Error};
+
+    // Every processor started its generator as it came up; give the last of them a moment.
+    let deadline = time::monotonic_nanos().saturating_add(10_000_000_000);
+    while cpus
+        .iter()
+        .any(|&c| !random::processor(c).is_some_and(|p| p.started))
+        && time::monotonic_nanos() < deadline
+    {
+        core::hint::spin_loop();
+    }
+    let mut every = !cpus.is_empty();
+    let (mut longest_start, mut longest, mut steps) = (0u64, 0u64, 0u64);
+    for &c in cpus {
+        let Some(p) = random::processor(c).filter(|p| p.started) else {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: random: processor {} has not finished starting its generator",
+                c.get()
+            );
+            every = false;
+            continue;
+        };
+        let _ = writeln!(
+            com1,
+            "origin-kernel: random: processor {}: RDSEED {} ({} draws passed), RDRAND {} ({} draws passed); its generator {}",
+            c.get(),
+            condition_name(p.rdseed),
+            p.accepted_rdseed,
+            condition_name(p.rdrand),
+            p.accepted_rdrand,
+            if p.generator { "seeded" } else { "NOT seeded" }
+        );
+        every &= p.generator;
+        longest_start = longest_start.max(p.longest_start);
+        longest = longest.max(p.longest);
+        steps += p.steps;
+    }
+    if !random::available() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: random: no generator, so no request is answered; consistent false: random failed"
+        );
+        return false;
+    }
+
+    // Requests are answered, and no two values are the same.
+    let mut values = [0u64; 16];
+    let mut answered = 0;
+    for slot in &mut values {
+        if let Ok(value) = random::next_u64() {
+            *slot = value;
+            answered += 1;
+        }
+    }
+    let distinct = values
+        .iter()
+        .enumerate()
+        .all(|(i, v)| !values[..i].contains(v));
+    let mut long = [0u8; 300];
+    let long_ok = random::fill(&mut long).is_ok() && long[..8] != [0; 8] && long[292..] != [0; 8];
+    // Prediction resistance needs a healthy RDSEED on this processor, and is refused without.
+    // With one, "not now" is still a right answer: RDSEED may give nothing for a while, most
+    // of all straight after every processor drew its 1,024, and that is not a failure (R4
+    // item 1). The request is made again after the instruction's rest, a bounded number of
+    // times, and only a wrong answer fails the proof: an answer of zeros, bytes left in a
+    // refused buffer, or an answer where no healthy RDSEED stands behind it.
+    const FRESH_ASKS: u32 = 3;
+    // The rest after a "not now" is one second (TASKS 18b S3).
+    const FRESH_WAIT_NANOS: u64 = 1_100_000_000;
+    let here = random::processor(cpu::this_cpu());
+    let rdseed = here.is_some_and(|p| p.rdseed == Condition::Healthy);
+    let mut fresh = [0u8; 32];
+    let mut fresh_result = random::fill_fresh(&mut fresh);
+    let mut asked = 1u32;
+    while rdseed && fresh_result == Err(Error::NotNow) && fresh == [0; 32] && asked < FRESH_ASKS {
+        let until = time::monotonic_nanos().saturating_add(FRESH_WAIT_NANOS);
+        while time::monotonic_nanos() < until {
+            core::hint::spin_loop();
+        }
+        fresh_result = random::fill_fresh(&mut fresh);
+        asked += 1;
+    }
+    let refused = fresh_result == Err(Error::NotNow) && fresh == [0; 32];
+    let answered_fresh = fresh_result.is_ok() && fresh != [0; 32];
+    let fresh_ok = if rdseed {
+        answered_fresh || refused
+    } else {
+        refused
+    };
+    let _ = write!(
+        com1,
+        "origin-kernel: random: {answered} of 16 values answered, all distinct {distinct}; 300 bytes in pieces {long_ok}; with prediction resistance: "
+    );
+    let _ = match (rdseed, fresh_ok, answered_fresh) {
+        (true, true, true) => writeln!(com1, "answered"),
+        (true, true, false) => writeln!(
+            com1,
+            "not now, {asked} times a second apart: RDSEED is healthy and gave nothing, which is not a failure"
+        ),
+        (false, true, _) => writeln!(com1, "refused, as it must be with no healthy RDSEED here"),
+        (_, false, _) => writeln!(com1, "WRONG"),
+    };
+
+    // What a request costs, and the longest a step kept interrupts off.
+    let mut costs = [0u64; 64];
+    let mut out = [0u8; 64];
+    for cost in &mut costs {
+        let began = cpu::rdtsc();
+        let _ = random::fill(&mut out);
+        *cost = cpu::rdtsc().wrapping_sub(began);
+    }
+    costs.sort_unstable();
+    let after = cpus
+        .iter()
+        .filter_map(|&c| random::processor(c))
+        .map(|p| p.longest)
+        .max()
+        .unwrap_or(longest);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: random: cost: a 64-byte request {} ns (median of 64, least {} ns); the longest step with interrupts off: {} us while a processor started, {} us since; {} steps so far",
+        ticks_to_nanos(costs[32], tsc_hz),
+        ticks_to_nanos(costs[0], tsc_hz),
+        ticks_to_nanos(longest_start, tsc_hz) / 1000,
+        ticks_to_nanos(after, tsc_hz) / 1000,
+        steps
+    );
+
+    // The generator's own stack: how deep a request goes, and that nothing is left on it.
+    let stack = random::prove_stack();
+    let stack_ok = match stack {
+        Some(proof) => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: random: the generator's stack: a request used {} of {} bytes; only zeros on it after a request: {}",
+                proof.used, proof.size, proof.clean
+            );
+            proof.clean && proof.used != 0 && proof.used < proof.size
+        }
+        None => {
+            let _ = writeln!(
+                com1,
+                "origin-kernel: random: the generator's stack could not be looked at"
+            );
+            false
+        }
+    };
+
+    // The loader's secret area, if it gave one, is gone from where it lay (R9, R10), and the
+    // value in it for the kernel stacks' region can no longer be taken.
+    let seed_gone = random::loader_seed() != random::LoaderSeed::Mixed { overwritten: false }
+        && random::take_stack_value().is_none();
+    let consistent = every
+        && answered == values.len()
+        && distinct
+        && long_ok
+        && fresh_ok
+        && stack_ok
+        && seed_gone;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: random: every processor has a generator {every}; consistent {consistent}{}",
+        if consistent { "" } else { ": random failed" }
     );
     consistent
 }
@@ -1481,9 +1696,14 @@ fn prove_nmi_ist(com1: &mut Console, tsc_hz: u64) -> NmiProof {
     }
     let (low, high) = cpu::bsp_nmi_stack();
     let on_own_stack = (low..high).contains(&frame);
+    // The boot processor's interrupt stacks are in the kernel image, so these are image
+    // offsets: no base is printed (ADR-0004 Amendment 2, A6.2).
     let _ = writeln!(
         com1,
-        "origin-kernel: NMI taken on its own stack (IST2): frame at {frame:#x}, stack {low:#x}..{high:#x}{}",
+        "origin-kernel: NMI taken on its own stack (IST2): frame at {}, stack {}..{}{}",
+        crate::phys::told(frame),
+        crate::phys::told(low),
+        crate::phys::told(high),
         if on_own_stack {
             ""
         } else {
@@ -1505,10 +1725,16 @@ fn panic(info: &PanicInfo) -> ! {
         let _ = report::write_panic(&mut out, info);
         let mut frames = [0u64; 16];
         let n = cpu::capture_backtrace(&mut frames);
-        let base = crate::phys::kernel_virtual_base();
-        let _ = write!(out, "origin-kernel: backtrace (kernel base {base:#x}):");
-        for addr in frames.iter().take(n) {
-            let _ = write!(out, " {addr:#x}");
+        // As image offsets, which are what a symbol table needs; the base is never printed, in
+        // any mode (ADR-0004 Amendment 2, A6.2).
+        let _ = write!(out, "origin-kernel: backtrace:");
+        for (i, &addr) in frames.iter().take(n).enumerate() {
+            let _ = write!(
+                out,
+                "{} {}",
+                if i == 0 { "" } else { "," },
+                crate::phys::told(addr)
+            );
         }
         let _ = writeln!(out);
     }

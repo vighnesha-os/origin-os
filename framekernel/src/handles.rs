@@ -157,6 +157,15 @@ impl<T> HandleTable<T> {
         self.live += 1;
         Ok(join(index, slot.generation))
     }
+
+    /// Every object the table holds, once for each handle, and the table gone: for a process
+    /// that has ended, whose bindings are cancelled object by object before its handles close
+    /// (ADR-0005 Amendment 7, F11). Allocates nothing.
+    pub fn into_objects(self) -> impl Iterator<Item = T> {
+        self.slots
+            .into_iter()
+            .filter_map(|slot| slot.entry.map(|(object, _)| object))
+    }
 }
 
 impl<T: Typed> HandleTable<T> {
@@ -403,6 +412,22 @@ mod tests {
         }
         assert_eq!(t.len(), 0);
         assert!(t.insert(1, READ).is_ok(), "the table keeps working");
+    }
+
+    #[test]
+    fn an_emptied_table_gives_each_handle_s_object_once() {
+        let mut t = HandleTable::new(8);
+        let closed = t.insert(1u32, READ).unwrap();
+        let kept = t.insert(2, READ | DUPLICATE).unwrap();
+        t.insert(3, READ).unwrap();
+        t.remove(closed, Need::NOTHING).unwrap();
+        // The duplicate takes the freed slot, which then holds it and not the closed object.
+        dup(&mut t, kept, READ).unwrap();
+        t.insert(4, READ).unwrap();
+        let mut objects: Vec<u32> = t.into_objects().collect();
+        objects.sort_unstable();
+        assert_eq!(objects, vec![2, 2, 3, 4], "a duplicate is one more handle");
+        assert_eq!(HandleTable::<u32>::new(4).into_objects().count(), 0);
     }
 
     #[test]

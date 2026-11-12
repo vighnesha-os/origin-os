@@ -999,8 +999,9 @@ mod waiting {
     pub(super) const DHCP: u64 = 2;
     pub(super) const ECHO: u64 = 3;
     pub(super) const TFTP: u64 = 4;
-    /// Not a wait: no hardware entropy for a transaction ID or port.
-    pub(super) const NO_ENTROPY: u64 = 5;
+    /// Not a wait: no random value for a transaction ID or port (the kernel has no generator,
+    /// ADR-0016 R8).
+    pub(super) const NO_RANDOM: u64 = 5;
     /// Not a wait: the DHCP server refused every restart.
     pub(super) const DHCP_REFUSED: u64 = 6;
 }
@@ -1050,10 +1051,8 @@ fn timeout_note(step: u64) -> alloc::string::String {
             );
         }
         waiting::ECHO => alloc::format!("the reply to echo request {detail}"),
-        waiting::NO_ENTROPY => {
-            return alloc::string::String::from(
-                "; no hardware entropy for a transaction ID or port",
-            );
+        waiting::NO_RANDOM => {
+            return alloc::string::String::from("; no random value for a transaction ID or port");
         }
         waiting::DHCP_REFUSED => {
             return alloc::format!(
@@ -1148,8 +1147,8 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
     let Some(n) = tftp::read_request(TFTP_FILE, &mut request) else {
         return;
     };
-    let Some(random) = crate::entropy::hardware_u64() else {
-        timed_out(waiting::NO_ENTROPY, 0);
+    let Ok(random) = origin_frame::random::next_u64() else {
+        timed_out(waiting::NO_RANDOM, 0);
         return;
     };
     let client_port = tftp::client_port(random);
@@ -1248,11 +1247,11 @@ fn fetch_tftp(rx: &mut RxRing, our_mac: Mac, server_mac: Mac, ours: Ipv4) {
 fn dhcp_lease(rx: &mut RxRing, our_mac: Mac) -> Option<Ipv4> {
     use crate::dhcp::{self, Action};
 
-    /// A new transaction ID, or `None` (recorded) with no entropy to draw one from.
+    /// A new transaction ID, or `None` (recorded) with no generator to ask for one.
     fn new_xid() -> Option<u32> {
-        let random = crate::entropy::hardware_u64();
+        let random = origin_frame::random::next_u64().ok();
         if random.is_none() {
-            timed_out(waiting::NO_ENTROPY, 0);
+            timed_out(waiting::NO_RANDOM, 0);
         }
         random.map(|r| r as u32)
     }
@@ -1634,7 +1633,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[crate::cpu::CpuIndex], tsc_hz: u
         timeout_note(waiting::ARP),
         timeout_note(waiting::DHCP),
         timeout_note(waiting::DHCP_REFUSED),
-        timeout_note(waiting::NO_ENTROPY)
+        timeout_note(waiting::NO_RANDOM)
     );
     let ip = (lease as u32).to_be_bytes();
     let _ = writeln!(

@@ -178,17 +178,6 @@ pub(crate) fn shootdown_space(root: u64, request: Request) -> Result<Completed, 
     SHOOTDOWN.shoot(&Hardware, request, Scope::Space(root))
 }
 
-/// The deferred free of a user mapping: `value` is what the caller took out of `root`'s page
-/// tables, and `release` gets it back once no processor can reach it (`Shootdown::retire`).
-pub(crate) fn retire_in_space<T>(
-    root: u64,
-    request: Request,
-    value: T,
-    release: impl FnOnce(T),
-) -> Result<Completed, Stalled> {
-    SHOOTDOWN.retire(&Hardware, value, request, Scope::Space(root), release)
-}
-
 /// How many processors have the address space `root` loaded now.
 pub(crate) fn processors_holding(root: u64) -> u32 {
     SHOOTDOWN.processors_holding(root)
@@ -224,4 +213,21 @@ pub fn shootdown(addr: u64) -> u64 {
 /// As for [`shootdown`].
 pub fn shootdown_all() -> u64 {
     finished(SHOOTDOWN.shoot(&Hardware, Request::Everything, Scope::Kernel))
+}
+
+/// Drops the translations of the `pages` pages from `base` on every online processor, after the
+/// caller took them out of the kernel's tables; more than `MAX_LISTED_PAGES` pages flush every
+/// translation. A stall is returned rather than stopping the kernel: the stack region's caller
+/// (`stack`, through `origin_sync::slots`) then never reuses the pages or what they held.
+pub(crate) fn shootdown_kernel_pages(base: u64, pages: u64) -> Result<Completed, Stalled> {
+    let request = if (1..=origin_sync::shootdown::MAX_LISTED_PAGES).contains(&pages) {
+        Request::Pages { base, pages }
+    } else {
+        Request::Everything
+    };
+    let outcome = SHOOTDOWN.shoot(&Hardware, request, Scope::Kernel);
+    if let Ok(done) = outcome {
+        LAST_CYCLES.store(done.ticks, Ordering::Relaxed);
+    }
+    outcome
 }

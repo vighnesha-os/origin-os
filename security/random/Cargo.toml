@@ -1,0 +1,13 @@
+[package]
+name = "origin-random"
+description = "Origin OS random-number policy: health tests on the processor's instructions, and the seeding and reseeding of the kernel's HMAC_DRBG (ADR-0016)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+origin-crypto.workspace = true
+
+[lints]
+workspace = true

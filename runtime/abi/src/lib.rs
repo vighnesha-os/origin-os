@@ -178,6 +178,14 @@ pub mod rights {
     pub const PROCESS: u32 = READ | WRITE | MANAGE | WAIT | DUPLICATE | TRANSFER;
     /// The rights of a thread's handle to itself (amendment C6).
     pub const THREAD: u32 = WAIT | MANAGE | DUPLICATE | TRANSFER;
+    /// The rights of a new memory object (amendment C6): never `EXECUTE`, since an anonymous
+    /// object is never executable; `WAIT`, `SIGNAL` and `MANAGE` do not apply.
+    pub const MEMORY_OBJECT: u32 = READ | WRITE | MAP | DUPLICATE | TRANSFER;
+    /// The rights of a new event (amendments C6 and F6).
+    pub const EVENT: u32 = WAIT | SIGNAL | DUPLICATE | TRANSFER;
+    /// The rights of a new port (amendments C6 and F6): no `WAIT`, since a port raises no
+    /// signals (F8).
+    pub const PORT: u32 = READ | WRITE | DUPLICATE | TRANSFER;
 }
 
 /// Object signals (P9).
@@ -238,10 +246,100 @@ pub mod syscall {
     pub const CHANNEL_READ: u64 = 7;
     /// `wait_one(handle, signals, deadline, out_observed)`.
     pub const WAIT_ONE: u64 = 8;
-    /// `event_create(out_handle)`.
+    /// `event_create(out_event)` (amendment F17).
     pub const EVENT_CREATE: u64 = 9;
     /// `object_signal(handle, clear, set)`: user signals ([`super::signals::SIGNALED`]).
     pub const OBJECT_SIGNAL: u64 = 10;
+    /// `memory_object_create(request, out_object)`: a [`super::object_request`].
+    pub const MEMORY_OBJECT_CREATE: u64 = 11;
+    /// `memory_map(process, object, request, out_address)`: a [`super::map_request`].
+    pub const MEMORY_MAP: u64 = 12;
+    /// `memory_unmap(process, address, length)`: one whole mapping.
+    pub const MEMORY_UNMAP: u64 = 13;
+    /// `memory_protect(process, address, length, access)`: one whole mapping, its access only
+    /// reduced ([`super::map_access`]).
+    pub const MEMORY_PROTECT: u64 = 14;
+    /// `port_create(out_port)` (amendment F17).
+    pub const PORT_CREATE: u64 = 15;
+    /// `object_wait_async(port, object, key, signals)` (amendment F2).
+    pub const OBJECT_WAIT_ASYNC: u64 = 16;
+    /// `port_wait(port, deadline, out_packet)`: a [`super::port_packet`] (amendment F3).
+    pub const PORT_WAIT: u64 = 17;
+    /// `port_cancel(port, object, key)` (amendment F4).
+    pub const PORT_CANCEL: u64 = 18;
+    /// `clock_read(out_nanos)`: the monotonic clock (amendment F10).
+    pub const CLOCK_READ: u64 = 19;
+}
+
+/// Bytes in a page: memory objects, mappings, offsets and fixed addresses are whole pages of
+/// this size (P7).
+pub const PAGE_SIZE: u64 = 4096;
+
+/// What a mapping allows (P7, amendments C7 and D2): `READ` always, and at most one of `WRITE` and
+/// `EXECUTE`; nothing is executable until the Code Integrity Table exists.
+pub mod map_access {
+    /// Read.
+    pub const READ: u32 = 1 << 0;
+    /// Write.
+    pub const WRITE: u32 = 1 << 1;
+    /// Execute (refused in this version).
+    pub const EXECUTE: u32 = 1 << 2;
+    /// Every bit defined in this version.
+    pub const ALL: u32 = READ | WRITE | EXECUTE;
+}
+
+/// How a mapping is placed (P7, amendments C7 and D2).
+pub mod map_flags {
+    /// At the request's address, whose pages must all be free: a mapping is never replaced.
+    pub const FIXED: u32 = 1 << 0;
+    /// Every bit defined in this version.
+    pub const ALL: u32 = FIXED;
+}
+
+/// The structure `memory_object_create` reads (amendments C7 and D1), which begins with its own
+/// `u32 size`, set by the caller to a version it knows (P4).
+///
+/// ```text
+/// 0  u32 size     16
+/// 4  u32          zero
+/// 8  u64 length   bytes of the object: a non-zero multiple of PAGE_SIZE
+/// ```
+pub mod object_request {
+    /// Bytes of this version of the structure.
+    pub const SIZE: u32 = 16;
+    /// Byte offset of `size`.
+    pub const SIZE_AT: usize = 0;
+    /// Byte offset of `length`.
+    pub const LENGTH_AT: usize = 8;
+}
+
+/// The structure `memory_map` reads (amendments C7, C8 and D2), which begins with its own
+/// `u32 size` (P4).
+///
+/// ```text
+/// 0  u32 size      40
+/// 4  u32 access    map_access bits
+/// 8  u32 flags     map_flags bits
+/// 12 u32           zero
+/// 16 u64 offset    where the mapping starts in the object: a multiple of PAGE_SIZE
+/// 24 u64 length    bytes mapped: a non-zero multiple of PAGE_SIZE
+/// 32 u64 address   with FIXED, where it goes; otherwise zero
+/// ```
+pub mod map_request {
+    /// Bytes of this version of the structure.
+    pub const SIZE: u32 = 40;
+    /// Byte offset of `size`.
+    pub const SIZE_AT: usize = 0;
+    /// Byte offset of `access`.
+    pub const ACCESS_AT: usize = 4;
+    /// Byte offset of `flags`.
+    pub const FLAGS_AT: usize = 8;
+    /// Byte offset of `offset`.
+    pub const OFFSET_AT: usize = 16;
+    /// Byte offset of `length`.
+    pub const LENGTH_AT: usize = 24;
+    /// Byte offset of `address`.
+    pub const ADDRESS_AT: usize = 32;
 }
 
 /// Limits (P8, P9).
@@ -307,6 +405,42 @@ pub mod received_handle {
     pub const OBJECT_TYPE_AT: usize = 4;
     /// Byte offset of `rights`.
     pub const RIGHTS_AT: usize = 8;
+}
+
+/// What `port_wait` writes (C9; amendment F1): one packet, 32 bytes, every field
+/// little-endian, with no padding and no `size` (an exception to P4 for this record only).
+///
+/// ```text
+/// 0  u64 key        what the binder gave, unchanged
+/// 8  u32 kind       a packet_kind: SIGNAL or CANCELED, never 0
+/// 12 u32 trigger    the mask the binding asked
+/// 16 u32 observed   the object's signals when the packet was queued
+/// 20 u32            zero
+/// 24 u64 data       zero in this version
+/// ```
+pub mod port_packet {
+    /// Bytes of one packet.
+    pub const SIZE: usize = 32;
+    /// Byte offset of `key`.
+    pub const KEY_AT: usize = 0;
+    /// Byte offset of `kind`.
+    pub const KIND_AT: usize = 8;
+    /// Byte offset of `trigger`.
+    pub const TRIGGER_AT: usize = 12;
+    /// Byte offset of `observed`.
+    pub const OBSERVED_AT: usize = 16;
+    /// Byte offset of `reserved`.
+    pub const RESERVED_AT: usize = 20;
+    /// Byte offset of `data`.
+    pub const DATA_AT: usize = 24;
+}
+
+/// What made a packet (amendment F1).
+pub mod packet_kind {
+    /// The object's signals met the binding's mask.
+    pub const SIGNAL: u32 = 1;
+    /// The binding was cancelled implicitly (F11, F16).
+    pub const CANCELED: u32 = 2;
 }
 
 /// The start record, version 1 (P6, amendment C4): what a process begins with. The kernel
@@ -750,6 +884,15 @@ mod tests {
             syscall::WAIT_ONE,
             syscall::EVENT_CREATE,
             syscall::OBJECT_SIGNAL,
+            syscall::MEMORY_OBJECT_CREATE,
+            syscall::MEMORY_MAP,
+            syscall::MEMORY_UNMAP,
+            syscall::MEMORY_PROTECT,
+            syscall::PORT_CREATE,
+            syscall::OBJECT_WAIT_ASYNC,
+            syscall::PORT_WAIT,
+            syscall::PORT_CANCEL,
+            syscall::CLOCK_READ,
         ];
         let mut sorted = n.to_vec();
         sorted.sort_unstable();
@@ -811,6 +954,33 @@ mod tests {
         );
         assert_eq!(rights::PROCESS & !rights::ALL, 0);
         assert_eq!(rights::THREAD & !rights::ALL, 0);
+    }
+
+    #[test]
+    fn a_memory_object_has_c6s_rights_and_never_execute() {
+        assert_eq!(
+            rights::MEMORY_OBJECT,
+            rights::READ | rights::WRITE | rights::MAP | rights::DUPLICATE | rights::TRANSFER
+        );
+        assert_eq!(rights::MEMORY_OBJECT & rights::EXECUTE, 0);
+        assert_eq!(rights::MEMORY_OBJECT & !rights::ALL, 0);
+    }
+
+    #[test]
+    fn the_memory_requests_are_laid_out_field_by_field() {
+        // Each field at its alignment after the implicit size, with no hole but the one named.
+        assert_eq!(object_request::SIZE_AT, 0);
+        assert_eq!(object_request::LENGTH_AT, 8);
+        assert_eq!(object_request::SIZE as usize, object_request::LENGTH_AT + 8);
+        assert_eq!(map_request::ACCESS_AT, 4);
+        assert_eq!(map_request::FLAGS_AT, 8);
+        assert_eq!(map_request::OFFSET_AT, 16);
+        assert_eq!(map_request::LENGTH_AT, 24);
+        assert_eq!(map_request::ADDRESS_AT, 32);
+        assert_eq!(map_request::SIZE as usize, map_request::ADDRESS_AT + 8);
+        assert_eq!(map_access::ALL, 0b111);
+        assert_eq!(map_flags::ALL, 0b1);
+        assert!(PAGE_SIZE.is_power_of_two());
     }
 
     #[test]
