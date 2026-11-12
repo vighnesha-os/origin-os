@@ -746,6 +746,26 @@ impl<'a> Ivrs<'a> {
         })
     }
 
+    /// The memory ranges that apply to a device of `segment` whose own DeviceID is `id` and
+    /// whose requests carry `requester` (its alias, or `id` itself), on the IOMMU whose
+    /// registers are at `unit_base` (research ledger 2026-11-12, R5). An IVMD for every
+    /// peripheral (20h) applies to the devices of the IOMMU described just before it (48882
+    /// §5.2.2). One for a DeviceID (21h) or a range (22h) applies by its own segment and
+    /// DeviceID, whichever IOMMU translates the device, and whether it names the device's own
+    /// DeviceID or the one its requests carry.
+    pub fn memory_for(
+        &self,
+        unit_base: u64,
+        segment: u16,
+        id: u16,
+        requester: u16,
+    ) -> impl Iterator<Item = MemoryRange> + 'a {
+        self.memory().filter(move |m| match m.kind {
+            kind::IVMD_ALL => m.unit_base == unit_base && m.unit_segment == segment,
+            _ => m.covers(segment, id) || m.covers(segment, requester),
+        })
+    }
+
     /// The IOMMUs have an Extended Feature Register.
     pub fn efr_supported(&self) -> bool {
         self.info & info::EFR_SUPPORTED != 0
@@ -1284,6 +1304,56 @@ mod tests {
         )
     }
 
+    /// Two IOMMUs in one segment, with IVMDs placed after the second (R5): a 21h naming a
+    /// device of the first still applies to it; the second's "all" range does not.
+    #[test]
+    fn a_device_range_applies_wherever_it_sits() {
+        let a = ivhd(
+            kind::IVHD,
+            0,
+            device_id(0, 0, 2),
+            0x40,
+            0xFEB8_0000,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &[e4(entry::SELECT, device_id(0, 3, 0), 0)],
+        );
+        let b = ivhd(
+            kind::IVHD,
+            0,
+            device_id(0x80, 0, 2),
+            0x40,
+            0xFEC0_0000,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &[e4(entry::SELECT, device_id(0x80, 1, 0), 0)],
+        );
+        let nvme = device_id(0, 3, 0);
+        let mine = ivmd(kind::IVMD_DEVICE, 0b0111, nvme, 0, 0, 0x7D00_0000, 0x1000);
+        let all_b = ivmd(kind::IVMD_ALL, 0b0011, 0, 0, 0, 0x7E00_0000, 0x1000);
+        let t = table(1, info::EFR_SUPPORTED, &[a, b, mine, all_b]);
+        let r = parse(&t).unwrap();
+        let (unit, c) = r.unit_for(0, nvme).unwrap();
+        assert_eq!(unit.base, 0xFEB8_0000);
+        let starts: Vec<u64> = r
+            .memory_for(unit.base, 0, nvme, c.requester)
+            .map(|m| m.start)
+            .collect();
+        assert_eq!(starts, alloc::vec![0x7D00_0000]);
+        let other = device_id(0x80, 1, 0);
+        let starts: Vec<u64> = r
+            .memory_for(0xFEC0_0000, 0, other, other)
+            .map(|m| m.start)
+            .collect();
+        assert_eq!(starts, alloc::vec![0x7E00_0000]);
+    }
+
     #[test]
     fn every_block_and_entry_type() {
         let t = platform();
@@ -1417,6 +1487,33 @@ mod tests {
         assert_eq!(m[2].unit_base, 0xFEC0_4000);
         assert!(m[2].covers(1, device_id(1, 0, 1)) && !m[2].covers(1, device_id(1, 0, 2)));
         assert!(!m[2].covers(0, device_id(1, 0, 0)));
+        // Which ranges apply to a device (R5): the "all" range of the IOMMU before it, and
+        // the ranges naming it or its alias, wherever they sit.
+        let starts = |unit, segment, id, requester| {
+            r.memory_for(unit, segment, id, requester)
+                .map(|m| m.start)
+                .collect::<Vec<_>>()
+        };
+        let usb = device_id(0, 0x13, 0);
+        assert_eq!(
+            starts(0xFEB8_0000, 0, usb, usb),
+            alloc::vec![0x7A00_0000, 0x7B00_0000]
+        );
+        let other = device_id(0, 0x13, 1);
+        assert_eq!(
+            starts(0xFEB8_0000, 0, other, other),
+            alloc::vec![0x7A00_0000]
+        );
+        // On IOMMU B the "all" range of A does not apply; the 22h range does, and an alias
+        // that the range names brings a device into it.
+        let gpu = device_id(1, 0, 1);
+        assert_eq!(starts(0xFEC0_4000, 1, gpu, gpu), alloc::vec![0x7C00_0000]);
+        let behind = device_id(1, 0, 4);
+        assert_eq!(starts(0xFEC0_4000, 1, behind, behind), alloc::vec![]);
+        assert_eq!(
+            starts(0xFEC0_4000, 1, behind, gpu),
+            alloc::vec![0x7C00_0000]
+        );
         assert_eq!(bdf(device_id(0x12, 0x1F, 7)), (0x12, 0x1F, 7));
     }
 

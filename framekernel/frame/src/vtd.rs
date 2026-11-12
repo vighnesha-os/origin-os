@@ -898,6 +898,32 @@ impl IovaWindow {
         Some(at)
     }
 
+    /// As [`IovaWindow::alloc`], but the pages handed out never touch any of `holes`
+    /// (`(base, end)`, end exclusive): a domain's identity-mapped reserved ranges, which VT-d
+    /// §3.16 keeps apart from the addresses the OS gives the device. The window moves past a
+    /// hole it meets; a hole's pages are never handed out.
+    pub fn alloc_skipping(&mut self, pages: u64, holes: &[(u64, u64)]) -> Option<u64> {
+        let bytes = pages.checked_mul(PAGE)?;
+        if pages == 0 {
+            return None;
+        }
+        loop {
+            let at = self.next;
+            let end = at.checked_add(bytes)?;
+            if end > self.end {
+                return None;
+            }
+            match holes.iter().find(|&&(b, e)| b < end && at < e) {
+                // Past the hole, rounded up to a page; strictly forward, so this ends.
+                Some(&(_, e)) => self.next = e.checked_add(PAGE - 1)? & !(PAGE - 1),
+                None => {
+                    self.next = end;
+                    return Some(at);
+                }
+            }
+        }
+    }
+
     /// Whether `iova` was handed out by this window.
     pub fn issued(&self, iova: u64, base: u64) -> bool {
         (base..self.next).contains(&iova)
@@ -1579,5 +1605,56 @@ mod tests {
         assert_eq!(w.alloc(1), Some(IOVA_BASE + 3 * PAGE));
         assert_eq!(w.alloc(1), None);
         assert_eq!(IovaWindow::new(0, u64::MAX).alloc(u64::MAX), None);
+    }
+
+    #[test]
+    fn the_window_skips_identity_mapped_pages() {
+        let holes = [
+            (IOVA_BASE + PAGE, IOVA_BASE + 3 * PAGE),
+            (IOVA_BASE + 4 * PAGE, IOVA_BASE + 5 * PAGE),
+        ];
+        let mut w = IovaWindow::new(IOVA_BASE, IOVA_BASE + 8 * PAGE);
+        assert_eq!(w.alloc_skipping(1, &holes), Some(IOVA_BASE));
+        // Two pages would touch the first hole: the window moves past it.
+        assert_eq!(w.alloc_skipping(1, &holes), Some(IOVA_BASE + 3 * PAGE));
+        assert_eq!(w.alloc_skipping(2, &holes), Some(IOVA_BASE + 5 * PAGE));
+        assert_eq!(w.alloc_skipping(1, &holes), Some(IOVA_BASE + 7 * PAGE));
+        assert_eq!(w.alloc_skipping(1, &holes), None);
+        // A hole that ends mid-page, and one covering the whole window.
+        let mut w = IovaWindow::new(IOVA_BASE, IOVA_END);
+        assert_eq!(
+            w.alloc_skipping(1, &[(IOVA_BASE, IOVA_BASE + 10)]),
+            Some(IOVA_BASE + PAGE)
+        );
+        let mut w = IovaWindow::new(IOVA_BASE, IOVA_END);
+        assert_eq!(w.alloc_skipping(1, &[(0, u64::MAX)]), None);
+        assert_eq!(w.alloc_skipping(0, &[]), None);
+    }
+
+    /// Whatever the holes, no page handed out touches one, and pages are never handed out
+    /// twice.
+    #[test]
+    fn no_page_handed_out_touches_a_hole() {
+        let mut rng = crate::testing::Rng::new(0x1D_E7);
+        for _ in 0..500 {
+            let holes: Vec<(u64, u64)> = (0..rng.below(4))
+                .map(|_| {
+                    let b = IOVA_BASE + rng.below(64) as u64 * PAGE;
+                    (b, b + (1 + rng.below(8) as u64) * PAGE)
+                })
+                .collect();
+            let mut w = IovaWindow::new(IOVA_BASE, IOVA_BASE + 64 * PAGE);
+            let mut last = 0;
+            loop {
+                let pages = 1 + rng.below(3) as u64;
+                let Some(at) = w.alloc_skipping(pages, &holes) else {
+                    break;
+                };
+                let end = at + pages * PAGE;
+                assert!(at >= last && end <= IOVA_BASE + 64 * PAGE);
+                assert!(holes.iter().all(|&(b, e)| end <= b || e <= at));
+                last = end;
+            }
+        }
     }
 }
