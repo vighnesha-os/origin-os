@@ -147,12 +147,15 @@ environment:
                                       stay QEMU's
   ORIGIN_QEMU_DEBUG                   if set, QEMU logs interrupts and resets to
                                       target/xtask/qemu-debug.log
-  RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS, CARGO_TARGET_X86_64_UNKNOWN_NONE_RUSTFLAGS,
-  CARGO_TARGET_X86_64_UNKNOWN_UEFI_RUSTFLAGS
+  RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS, CARGO_TARGET_<TRIPLE>_RUSTFLAGS for the kernel's, the
+  loader's and the ring-3 programs' triples; RUSTC, RUSTC_WRAPPER, RUSTC_WORKSPACE_WRAPPER
+  and their CARGO_BUILD_ forms; CARGO_TARGET_<TRIPLE>_LINKER for the kernel's and the
+  loader's triples
                                       refused if set, even empty: they replace or add to the
-                                      compiler flags of .cargo/config.toml, so an image would
-                                      not be the one the repository describes. Only
-                                      `exclusive` runs with them, and what it runs may not";
+                                      repository's compiler flags, or put another compiler or
+                                      linker in the pinned one's place, so an image would not
+                                      be the one the repository describes. Only `exclusive`
+                                      runs with them, and what it runs may not";
 
 const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 const LOADER_PACKAGE: &str = "origin-boot-uefi";
@@ -3383,16 +3386,19 @@ fn check() -> Result {
     // The ring-3 crates on their own target (task S4-1), then the kernel, which carries the
     // programs they build.
     ring3::clippy()?;
-    run_step(ring3::with_programs(cargo().args([
-        "clippy",
-        "--package",
-        KERNEL_PACKAGE,
-        "--target",
-        KERNEL_TARGET,
-        "--",
-        "-D",
-        "warnings",
-    ]))?)?;
+    run_step(ring3::with_programs(
+        cargo().args([
+            "clippy",
+            "--package",
+            KERNEL_PACKAGE,
+            "--target",
+            KERNEL_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ]),
+        None,
+    )?)?;
     run_step(cargo().args(["test", "--package", KERNEL_PACKAGE, "--lib"]))?;
     // The loader in developer mode too (the boot test's variant).
     for loader in [Loader::Developer, Loader::Verifying] {
@@ -4206,8 +4212,8 @@ fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
         build.arg("--target-dir").arg(target);
     }
     build.args(toolchain::image_config()?);
-    // The programs it carries in its image (task S4-1).
-    run_step(ring3::with_programs(&mut build)?)?;
+    // The programs it carries in its image (task S4-1), built into the same directory.
+    run_step(ring3::with_programs(&mut build, target)?)?;
     let elf = target
         .map_or_else(target_dir, Path::to_path_buf)
         .join(KERNEL_TARGET)

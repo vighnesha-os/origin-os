@@ -8,6 +8,12 @@
 //!   `.cargo/userspace.toml` with `--config`; nothing else reads that file.
 //! - [`programs`] builds each carried program, has `onbf-pack carried` describe it, and returns
 //!   the directory every kernel build names in [`CARRIED_ENV`].
+//! - [`carried_files`] lists what one build wrote for each carried program, for the
+//!   reproducible-build gate to read (TASKS item 32).
+//!
+//! Each of these takes the target directory to build into, or `None` for Cargo's own: the gate
+//! builds the programs from nothing in two directories of its own, and each directory's kernel
+//! carries that directory's programs.
 //! - [`clippy`] runs clippy over the ring-3 crates on their own target.
 //!
 //! Generated files are rewritten only when their bytes change, so a build that changed nothing
@@ -53,9 +59,14 @@ const PROGRAMS: &[Program] = &[Program {
     name: "first_program",
 }];
 
+/// `target`, or Cargo's own target directory.
+fn base_dir(target: Option<&Path>) -> PathBuf {
+    target.map_or_else(target_dir, Path::to_path_buf)
+}
+
 /// `ring3` under the target directory.
-fn ring3_dir() -> PathBuf {
-    target_dir().join("xtask").join("ring3")
+fn ring3_dir(target: Option<&Path>) -> PathBuf {
+    base_dir(target).join("xtask").join("ring3")
 }
 
 /// Writes `bytes` to `path` unless it already holds exactly them.
@@ -83,8 +94,8 @@ fn files_under(dir: &Path) -> Result<Vec<PathBuf>> {
 /// Generates `origin.kernel`'s code into a scratch directory, copies each file that changed
 /// into place, and writes the `modules.rs` that `runtime/kernel-stubs` includes. Returns the
 /// directory `ORIGIN_KERNEL_STUBS` names.
-pub(crate) fn generate_stubs() -> Result<PathBuf> {
-    let staging = ring3_dir().join("oidl-staging");
+pub(crate) fn generate_stubs(target: Option<&Path>) -> Result<PathBuf> {
+    let staging = ring3_dir(target).join("oidl-staging");
     if staging.exists() {
         fs::remove_dir_all(&staging).map_err(|e| format!("{}: {e}", staging.display()))?;
     }
@@ -102,7 +113,7 @@ pub(crate) fn generate_stubs() -> Result<PathBuf> {
     .args(["--versions", "origin-version.toml", KERNEL_DEFINITION]);
     run_step(&mut oidl)?;
     let generated = staging.join("rust");
-    let stubs = ring3_dir().join("oidl");
+    let stubs = ring3_dir(target).join("oidl");
     let wanted = files_under(&generated)?;
     if wanted.is_empty() {
         return Err(format!(
@@ -155,32 +166,32 @@ pub(crate) fn generate_stubs() -> Result<PathBuf> {
 /// `cargo <subcommand>` for the ring-3 crates: the userspace triple, its configuration file, the
 /// remap that keeps the toolchain's path out of what it builds (`toolchain`, TASKS item 32),
 /// and the generated stubs' directory.
-fn userspace(subcommand: &str, stubs: &Path) -> Result<Command> {
+fn userspace(subcommand: &str, stubs: &Path, target: Option<&Path>) -> Result<Command> {
     let mut command = cargo();
     command
         .arg(subcommand)
         .args(["--target", USERSPACE_TARGET, "--config", USERSPACE_CONFIG])
         .args(crate::toolchain::userspace_config()?)
         .env(STUBS_ENV, stubs);
+    if let Some(target) = target {
+        command.arg("--target-dir").arg(target);
+    }
     Ok(command)
 }
 
 /// Builds every carried program for ring 3 and describes each for the kernel. Returns the
 /// directory the kernel's builds name in [`CARRIED_ENV`].
-pub(crate) fn programs() -> Result<PathBuf> {
-    let stubs = generate_stubs()?;
-    let mut build = userspace("build", &stubs)?;
+pub(crate) fn programs(target: Option<&Path>) -> Result<PathBuf> {
+    let stubs = generate_stubs(target)?;
+    let mut build = userspace("build", &stubs, target)?;
     build.arg("--release");
     for program in PROGRAMS {
         build.args(["--package", program.package]);
     }
     run_step(&mut build)?;
-    let out = ring3_dir().join("carried");
+    let out = ring3_dir(target).join("carried");
     for program in PROGRAMS {
-        let elf = target_dir()
-            .join(USERSPACE_TARGET)
-            .join("release")
-            .join(program.package);
+        let elf = linked(target, program);
         if !elf.is_file() {
             return Err(format!(
                 "cargo reported success but {} does not exist",
@@ -209,18 +220,167 @@ pub(crate) fn programs() -> Result<PathBuf> {
 
 /// Gives `command`, a build or clippy of the kernel for its own target, the carried programs:
 /// builds and describes them first.
-pub(crate) fn with_programs(command: &mut Command) -> Result<&mut Command> {
-    let carried = programs()?;
+pub(crate) fn with_programs<'a>(
+    command: &'a mut Command,
+    target: Option<&Path>,
+) -> Result<&'a mut Command> {
+    let carried = programs(target)?;
     Ok(command.env(CARRIED_ENV, carried))
+}
+
+/// Where the linker writes `program`.
+fn linked(target: Option<&Path>, program: &Program) -> PathBuf {
+    base_dir(target)
+        .join(USERSPACE_TARGET)
+        .join("release")
+        .join(program.package)
+}
+
+/// What a file of a carried program is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CarriedKind {
+    /// The linker's output, which `onbf-pack carried` reads.
+    Linked,
+    /// A segment's bytes as `onbf-pack carried` wrote them: the kernel includes the file, so
+    /// its image holds these bytes as they are.
+    Segment,
+    /// The description `onbf-pack carried` wrote, which the kernel compiles as source.
+    Description,
+}
+
+/// A file of a carried program, as one build wrote it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CarriedFile {
+    /// The program's name in the kernel.
+    pub(crate) program: &'static str,
+    pub(crate) kind: CarriedKind,
+    /// The file's own name.
+    pub(crate) file: String,
+    pub(crate) path: PathBuf,
+}
+
+/// Every file of every carried program built into `target`: the linker's output, then what
+/// `onbf-pack carried` wrote for it, by name. [`programs`] must have run for `target`. A
+/// program with no segment file is an error: there would be nothing of it to read.
+pub(crate) fn carried_files(target: Option<&Path>) -> Result<Vec<CarriedFile>> {
+    let carried = ring3_dir(target).join("carried");
+    let mut files = Vec::new();
+    for program in PROGRAMS {
+        let path = linked(target, program);
+        files.push(CarriedFile {
+            program: program.name,
+            kind: CarriedKind::Linked,
+            file: program.package.to_string(),
+            path,
+        });
+        let described = described_files(&carried, program.name)?;
+        if !described
+            .iter()
+            .any(|(_, kind)| *kind == CarriedKind::Segment)
+        {
+            return Err(format!(
+                "{} holds no segment of `{}`: nothing of the program to read",
+                carried.display(),
+                program.name
+            ));
+        }
+        for (file, kind) in described {
+            files.push(CarriedFile {
+                program: program.name,
+                kind,
+                path: carried.join(&file),
+                file,
+            });
+        }
+    }
+    Ok(files)
+}
+
+/// The files in `carried` that `onbf-pack carried` wrote for the program `name`, which are
+/// the ones named `<name>.<something>`, in the order of their names. A `.bin` is a segment.
+fn described_files(carried: &Path, name: &str) -> Result<Vec<(String, CarriedKind)>> {
+    let prefix = format!("{name}.");
+    let mut found = Vec::new();
+    let entries = fs::read_dir(carried).map_err(|e| format!("{}: {e}", carried.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", carried.display()))?;
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if file.starts_with(&prefix) {
+            let kind = if file.ends_with(".bin") {
+                CarriedKind::Segment
+            } else {
+                CarriedKind::Description
+            };
+            found.push((file, kind));
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(found)
 }
 
 /// Clippy over every ring-3 crate on the userspace triple, warnings denied.
 pub(crate) fn clippy() -> Result {
-    let stubs = generate_stubs()?;
+    let stubs = generate_stubs(None)?;
     for package in CRATES {
-        let mut clippy = userspace("clippy", &stubs)?;
+        let mut clippy = userspace("clippy", &stubs, None)?;
         clippy.args(["--package", package, "--", "-D", "warnings"]);
         run_step(&mut clippy)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_programs_files_are_the_ones_named_for_it_and_a_bin_is_a_segment() {
+        let dir = target_dir()
+            .join("xtask")
+            .join("ring3-tests")
+            .join("described");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a scratch directory");
+        for name in [
+            "first_program.rs",
+            "first_program.10.bin",
+            "first_program.0.bin",
+            "first_program_two.0.bin",
+            "other.0.bin",
+            "first_program",
+        ] {
+            fs::write(dir.join(name), b"x").expect("a scratch file");
+        }
+        assert_eq!(
+            described_files(&dir, "first_program"),
+            Ok(vec![
+                ("first_program.0.bin".to_string(), CarriedKind::Segment),
+                ("first_program.10.bin".to_string(), CarriedKind::Segment),
+                ("first_program.rs".to_string(), CarriedKind::Description),
+            ])
+        );
+        assert_eq!(described_files(&dir, "absent"), Ok(Vec::new()));
+        // A directory that is not there is an error, not an empty list.
+        assert!(described_files(&dir.join("missing"), "first_program").is_err());
+        fs::remove_dir_all(&dir).expect("the scratch directory goes");
+    }
+
+    #[test]
+    fn a_target_directory_holds_its_own_stubs_programs_and_linker_output() {
+        let target = Path::new("/somewhere/else");
+        assert_eq!(
+            ring3_dir(Some(target)),
+            Path::new("/somewhere/else/xtask/ring3")
+        );
+        assert_eq!(ring3_dir(None), target_dir().join("xtask").join("ring3"));
+        for program in PROGRAMS {
+            assert_eq!(
+                linked(Some(target), program),
+                target
+                    .join(USERSPACE_TARGET)
+                    .join("release")
+                    .join(program.package)
+            );
+        }
+    }
 }

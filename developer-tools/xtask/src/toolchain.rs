@@ -10,11 +10,12 @@
 //!   libraries the flag that writes `/rustc/<commit>` there instead, which is what the compiler
 //!   itself writes when it has no local copy of that source. [`userspace_config`] gives the
 //!   ring-3 builds the same: the kernel's image holds the bytes of the programs it carries.
-//! - **Compiler flags in the environment.** `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS`, even
-//!   empty, replace every flag `.cargo/config.toml` sets: the frame pointers, the kernel's
-//!   hardening options, the loader's link arguments. The per-target variables add flags the
-//!   repository does not hold. [`refuse_environment_flags`] stops `xtask` before it builds
-//!   anything.
+//! - **Flags, compilers and linkers in the environment.** `RUSTFLAGS` and
+//!   `CARGO_ENCODED_RUSTFLAGS`, even empty, replace every flag the repository's files set: the
+//!   frame pointers, the kernel's hardening options, the loader's link arguments, the ring-3
+//!   programs' whole list. The per-target variables add flags the repository does not hold.
+//!   Others put a program in the pinned compiler's place, or a linker in an image's.
+//!   [`refuse_environment_flags`] stops `xtask` before it builds anything.
 //!
 //! An image built by plain `cargo build` gets neither: it holds the toolchain's path.
 
@@ -43,18 +44,30 @@ pub(crate) struct Toolchain {
 /// another.
 const PINNED_COMMIT: &str = "developer-tools/toolchain/rustc-commit-hash";
 
-/// Environment variables `xtask` does not run with, and what each would do. Seen with Cargo
-/// 1.99.1 (`cargo build -v`): the first two replace every `target.<triple>.rustflags` entry
-/// even when they are empty, and a per-target variable is added to them.
-/// `CARGO_BUILD_RUSTFLAGS` is not here: it reaches no build that has flags for its target.
+/// Environment variables `xtask` does not run with, and what each would do. Each was seen to
+/// reach an image's build with Cargo 1.99.1 (`cargo build -v`, and a program that records its
+/// own use; `docs/research/2026-11-11-toolchain-path-in-images.md` §6 and §12):
+///
+/// - the first two replace every `target.<triple>.rustflags` entry, even when they are empty;
+/// - a per-target flags variable is added in front of them, so a flag the repository's files
+///   do not set gets through;
+/// - a compiler or wrapper variable makes Cargo run that program for every compilation, where
+///   [`toolchain`] asks the `rustc` on the path for its commit;
+/// - a per-target linker variable replaces the kernel's linker and the loader's.
+///
+/// Not here, each for its reason. `CARGO_BUILD_RUSTFLAGS` reaches no build that has flags for
+/// its target, and every image has. `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER` does not
+/// reach a ring-3 build, whose flags name the linker themselves, and on a Linux host it is
+/// the host's own. A configuration file above the checkout or in Cargo's home can do most of
+/// this too, and is not looked for: see the ledger's §12.
 const REFUSED: &[(&str, &str)] = &[
     (
         "CARGO_ENCODED_RUSTFLAGS",
-        "replaces every compiler flag `.cargo/config.toml` sets, even when it is empty",
+        "replaces every compiler flag the repository sets, even when it is empty",
     ),
     (
         "RUSTFLAGS",
-        "replaces every compiler flag `.cargo/config.toml` sets, even when it is empty",
+        "replaces every compiler flag the repository sets, even when it is empty",
     ),
     (
         "CARGO_TARGET_X86_64_UNKNOWN_NONE_RUSTFLAGS",
@@ -63,6 +76,42 @@ const REFUSED: &[(&str, &str)] = &[
     (
         "CARGO_TARGET_X86_64_UNKNOWN_UEFI_RUSTFLAGS",
         "adds compiler flags to the loader that the repository does not hold",
+    ),
+    (
+        "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+        "adds compiler flags to the programs built for ring 3 that the repository does not hold",
+    ),
+    (
+        "RUSTC",
+        "puts another program in the pinned compiler's place",
+    ),
+    (
+        "CARGO_BUILD_RUSTC",
+        "puts another program in the pinned compiler's place",
+    ),
+    (
+        "RUSTC_WRAPPER",
+        "runs every compilation through a program the repository does not hold",
+    ),
+    (
+        "RUSTC_WORKSPACE_WRAPPER",
+        "runs every compilation through a program the repository does not hold",
+    ),
+    (
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "runs every compilation through a program the repository does not hold",
+    ),
+    (
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "runs every compilation through a program the repository does not hold",
+    ),
+    (
+        "CARGO_TARGET_X86_64_UNKNOWN_NONE_LINKER",
+        "puts another linker in the place of the kernel's",
+    ),
+    (
+        "CARGO_TARGET_X86_64_UNKNOWN_UEFI_LINKER",
+        "puts another linker in the place of the loader's",
     ),
 ];
 
@@ -195,7 +244,13 @@ pub(crate) fn userspace_config() -> Result<Vec<String>> {
 fn config_for(targets: &[&str]) -> Result<Vec<String>> {
     let toolchain = toolchain()?;
     let flags = remap_flags(&source_directories(&toolchain.sysroot), &toolchain.commit)?;
-    Ok(targets
+    Ok(entries_for(targets, &flags))
+}
+
+/// `--config target.<triple>.rustflags=<flags>` for each of `targets`, `flags` being a TOML
+/// array.
+fn entries_for(targets: &[&str], flags: &str) -> Vec<String> {
+    targets
         .iter()
         .flat_map(|target| {
             [
@@ -203,7 +258,7 @@ fn config_for(targets: &[&str]) -> Result<Vec<String>> {
                 format!("target.{target}.rustflags={flags}"),
             ]
         })
-        .collect())
+        .collect()
 }
 
 /// The toolchain's source directory as the compiler names it, and with every symbolic link
@@ -436,23 +491,76 @@ mod tests {
         assert!(error.contains(PINNED_COMMIT), "{error}");
     }
 
+    /// The configuration keys a list of `--config` arguments sets.
+    fn keys(config: &[String]) -> Vec<&str> {
+        config
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "--config");
+                pair[1].split('=').next().expect("a key")
+            })
+            .collect()
+    }
+
     #[test]
     fn the_ring_3_builds_get_the_remap_for_their_own_triple_alone() {
         let config = userspace_config().expect("the pinned toolchain is installed");
-        assert_eq!(config.len(), 2);
-        assert_eq!(config[0], "--config");
+        assert_eq!(keys(&config), ["target.x86_64-unknown-linux-gnu.rustflags"]);
         assert!(
             config[1]
                 .starts_with("target.x86_64-unknown-linux-gnu.rustflags=[\"--remap-path-prefix="),
             "{}",
             config[1]
         );
-        // The freestanding builds do not name the userspace triple, which is CI's host.
+        // The freestanding builds set no key of the userspace triple, which is CI's host.
         let images = image_config().expect("the pinned toolchain is installed");
-        assert!(
-            images.iter().all(|entry| !entry.contains(USERSPACE_TARGET)),
-            "{images:?}"
+        assert_eq!(
+            keys(&images),
+            [
+                "target.x86_64-unknown-uefi.rustflags",
+                "target.x86_64-unknown-none.rustflags"
+            ]
         );
+    }
+
+    #[test]
+    fn a_toolchain_directory_named_for_the_userspace_triple_changes_no_key() {
+        // On CI the toolchain's directory holds the host's triple, which is the userspace
+        // triple. The first form of the test above looked for that triple anywhere in an
+        // entry, found it in the directory's name, and failed CI's check job on the batch
+        // (run 43230979284, at 9e4f79f): it had only ever run on the development Mac.
+        let commit = "58cf8f9c35b355199727627d07ae34a4e2846d67";
+        let flags = remap_flags(
+            &[PathBuf::from(
+                "/home/runner/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/lib/rustlib/src/rust",
+            )],
+            commit,
+        )
+        .expect("the directory is UTF-8");
+        assert!(flags.contains(USERSPACE_TARGET));
+        let images = entries_for(&[UEFI_TARGET, KERNEL_TARGET], &flags);
+        assert_eq!(
+            keys(&images),
+            [
+                "target.x86_64-unknown-uefi.rustflags",
+                "target.x86_64-unknown-none.rustflags"
+            ]
+        );
+        let ring3 = entries_for(&[USERSPACE_TARGET], &flags);
+        assert_eq!(keys(&ring3), ["target.x86_64-unknown-linux-gnu.rustflags"]);
+        // And the same on a machine whose toolchain is named for another host.
+        let mac = remap_flags(
+            &[PathBuf::from(
+                "/Users/someone/.rustup/toolchains/1.99.1-aarch64-apple-darwin/lib/rustlib/src/rust",
+            )],
+            commit,
+        )
+        .expect("the directory is UTF-8");
+        assert_eq!(
+            keys(&entries_for(&[UEFI_TARGET, KERNEL_TARGET], &mac)),
+            keys(&images)
+        );
+        assert!(entries_for(&[], &flags).is_empty());
     }
 
     #[test]
@@ -535,23 +643,40 @@ mod tests {
             Some("RUSTFLAGS")
         );
         assert_eq!(refused(|_| false), None);
+        // Let through, each for the reason beside the list: the last is the host's own linker
+        // on a Linux machine, and reaches no ring-3 build.
         for other in [
             "CARGO_BUILD_RUSTFLAGS",
             "PATH",
             "CARGO",
-            "RUSTC",
+            "CARGO_HOME",
             "CARGO_TARGET_DIR",
+            "RUSTUP_TOOLCHAIN",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
         ] {
             assert_eq!(refused(|asked| asked == other), None, "{other}");
         }
-        // The names are the ones Cargo reads for the two image targets.
-        for target in [UEFI_TARGET, KERNEL_TARGET] {
-            let name = format!(
-                "CARGO_TARGET_{}_RUSTFLAGS",
+        // The names are the ones Cargo derives from the triples: flags for all three targets
+        // an image is built for, linkers for the two whose flags do not name their own.
+        let variable = |target: &str, key: &str| {
+            format!(
+                "CARGO_TARGET_{}_{key}",
                 target.to_uppercase().replace('-', "_")
-            );
+            )
+        };
+        let is_refused = |name: &str| REFUSED.iter().any(|(refused, _)| *refused == name);
+        for target in [UEFI_TARGET, KERNEL_TARGET, USERSPACE_TARGET] {
+            let name = variable(target, "RUSTFLAGS");
+            assert!(is_refused(&name), "{name}");
+        }
+        for target in [UEFI_TARGET, KERNEL_TARGET] {
+            let name = variable(target, "LINKER");
+            assert!(is_refused(&name), "{name}");
+        }
+        // No name is listed twice.
+        for (i, (name, _)) in REFUSED.iter().enumerate() {
             assert!(
-                REFUSED.iter().any(|(refused, _)| *refused == name),
+                REFUSED[i + 1..].iter().all(|(other, _)| other != name),
                 "{name}"
             );
         }
