@@ -47,7 +47,7 @@ class Guards(unittest.TestCase):
     def test_post_is_sent_once_and_get_is_retried(self):
         calls = []
 
-        def fail(request, timeout):
+        def fail(request, timeout, context=None):
             calls.append(request.get_method())
             raise urllib.error.URLError("timed out")
 

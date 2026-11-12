@@ -126,7 +126,7 @@ def api(method, path, body=None, ok=(200, 201, 204)):
         if data is not None:
             request.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=60, context=tls_context()) as response:
                 raw = response.read()
                 if response.status not in ok:
                     die(f"{method} {path}: HTTP {response.status}")
@@ -151,6 +151,22 @@ def api(method, path, body=None, ok=(200, 201, 204)):
     return None
 
 
+def tls_context():
+    """A verifying TLS context. python.org's macOS builds ship with no CA certificates, so when
+    Python's own store is empty this falls back to the system's bundle. Verification stays on."""
+    import ssl
+
+    context = ssl.create_default_context()
+    if context.cert_store_stats()["x509_ca"] == 0:
+        for bundle in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
+            if Path(bundle).exists():
+                context.load_verify_locations(cafile=bundle)
+                break
+    if context.cert_store_stats()["x509_ca"] == 0:
+        die("no CA certificates to verify api.latitude.sh with")
+    return context
+
+
 class ApiError(Exception):
     def __init__(self, code, message):
         super().__init__(message)
@@ -171,7 +187,11 @@ def project_id(wanted):
 
 
 def offers(plan):
-    """Every site where `plan` is in stock, cheapest first: (usd_per_hour, site, instant)."""
+    """Every site where `plan` is in stock, cheapest first: (usd_per_hour, site, instant).
+
+    `hour` is the hourly-billing price. The public pricing page's "/hr" figure is the monthly
+    price over 730 hours, half of it (checked 2026-11-12: $0.81 against $0.41 for
+    m4-metal-small). `instant` says whether the region deploys `OS_SLUG` instantly."""
     found = []
     for p in api("GET", f"/plans?filter[slug]={plan}")["data"]:
         if p["attributes"]["slug"] != plan:
@@ -181,9 +201,9 @@ def offers(plan):
             hour = usd.get("hour")
             if hour is None:
                 continue
-            instant = set(region.get("deploys_instantly") or [])
+            instant = OS_SLUG in (region.get("deploys_instantly") or [])
             for site in (region.get("locations") or {}).get("in_stock") or []:
-                found.append((float(hour), site, site in instant))
+                found.append((float(hour), site, instant))
     return sorted(found, key=lambda o: (o[0], not o[2], o[1]))
 
 
