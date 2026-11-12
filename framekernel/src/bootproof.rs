@@ -137,14 +137,14 @@ proofs! {
     ConsoleSections "console screen sections" => Report;
 }
 
-// A proof's bit in the tally's two words.
-const _: () = assert!(Proof::ALL.len() <= u64::BITS as usize);
+// A proof's bit in the tally's two words: 128 proofs at most.
+const _: () = assert!(Proof::ALL.len() <= u128::BITS as usize);
 
 /// Which proofs have run and which of them failed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Tally {
-    ran: u64,
-    failed: u64,
+    ran: u128,
+    failed: u128,
 }
 
 impl Tally {
@@ -156,7 +156,7 @@ impl Tally {
 
     /// Records that `proof` ran, and whether it passed. A failure stays recorded.
     pub fn record(&mut self, proof: Proof, passed: bool) {
-        let bit = 1u64 << (proof as u32);
+        let bit = 1u128 << (proof as u32);
         self.ran |= bit;
         if !passed {
             self.failed |= bit;
@@ -168,7 +168,7 @@ impl Tally {
         Proof::ALL
             .iter()
             .copied()
-            .filter(move |&p| self.failed & (1u64 << (p as u32)) != 0)
+            .filter(move |&p| self.failed & (1u128 << (p as u32)) != 0)
     }
 
     /// The failed proofs whose failure stops the boot, in boot order.
