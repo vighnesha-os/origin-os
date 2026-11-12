@@ -680,3 +680,36 @@ Not built when this was written; put to the coordinating session with the result
 - A comparison that runs: CI's `check` job on both of its runner images, and a job that compares the two artifacts. That is two machines on every run, both Linux; it is a new thing CI must pass.
 - A tool for the comparison made here by hand: a command that takes a directory of kept files and compares it with the gate's own.
 - Words in the rows' criterion for a signed artifact, which cannot be "the same bytes".
+
+## 17. Item 45 (2026-11-12): the comparison is a command
+
+§13 and §16 compared the Mac's files with CI's by hand, with a script in a scratch directory. The coordinating session made the second point of §16.4 TASKS item 45. Its contract is "45" under "Task contracts" in `TASKS.md`.
+
+### 17.1 What it does
+
+`cargo xtask reproducible-compare <directory>` compares a directory of the files the gate keeps with this checkout's own (`target/xtask/reproducible/files`). The directory is CI's artifact unpacked, or another checkout's `files/`: two directories, `first` and `second`, one for each of the gate's builds.
+
+- For each build both sides must hold the same names, and each file must be the same bytes. It prints every file's size and digest.
+- A file that differs is named with the first offset at which it does, the byte on each side there, both lengths, and how many places differ in the part both hold.
+- A name on one side only is a failure, on either side. So is a build's directory that is not there. Two sides with no file at all are not agreement.
+- It builds nothing and writes nothing, and it is not part of `cargo xtask check`.
+
+**The directory is read as untrusted data.** It is another machine's output. Only plain files directly inside its two build directories are read. A symbolic link there, a directory, or anything else is reported and never followed or opened, and a link in place of a build's directory is not entered. Of each file no more is read than this checkout's own file is long, and one byte, so a file of any size costs no more memory than the gate's own. Nothing in it is run.
+
+### 17.2 The comparisons of §16 and §13, made with it
+
+- **Against CI's artifact of run 43275652672** (`8ae9e9b`, the merged head): all 22 files, eleven from each build, are the same bytes. That is §16.2's result, now from the command. It was run before `check` and after it, `check` having built and kept the files again in between.
+- **Against CI's artifact of run 43248605239** (`c34fdab`, before item 44), as a control: it fails. Ten files are the same and twelve things are not, six for each build: `kernel-image` is missing from that artifact; and five files differ, each named with its first offset: the program as linked (0x6018, inside `.comment`), its description (0xc7, the digest it quotes), the kernel (0x28, the section table's offset; 1,680,400 bytes here and 1,680,384 there), the loader with no feature and the loader with `test-trust-store` (0x1b0 each).
+- The contract expected six files to differ in that control. Five do. Six is the count for the Mac's files of that artifact's own tree (§13.2); this checkout's files are of the later tree, and two of them happen to be the bytes CI's older tree gave: the `developer-mode` loader (§14.3) and the program's segment 0 (§14.5).
+- A directory that does not exist fails, naming both missing build directories.
+
+### 17.3 The gate
+
+`cargo xtask check` passes on `e78c65c`, the commit with the command: 1,694 host tests, 0 failed, 27 ignored; Loom, all 53 models and all 78 controls; 6 min 25 s after a wait of 5 min 2 s for another session's turn. No boot was run: nothing that is built changed. `xtask`'s own tests: 267 pass and 1 is ignored.
+
+### 17.4 What it still lacks
+
+- **Nothing runs it.** A person or an agent fetches an artifact and types the command. A comparison that runs in CI is decision item 275, with the owner.
+- **It does not know which commit either side was built from.** The kept files carry no name for it; whoever runs the command says which two builds they compared.
+- **It compares with what this checkout's gate last kept.** If the tree has changed since, the gate has to be run first.
+- It has compared development commits. There has been no release candidate.

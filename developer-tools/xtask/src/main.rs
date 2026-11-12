@@ -77,6 +77,11 @@ commands:
               and the kernel are built twice from nothing in two target directories; the
               two files of each must be the same bytes, and hold no path of this machine
               (part of check; CLAUDE.md §75)
+  reproducible-compare <directory>
+              compares a directory of the files that gate keeps, CI's artifact unpacked or
+              another checkout's target/xtask/reproducible/files, with this checkout's own,
+              file by file; the directory is read as untrusted data. Builds nothing; run
+              reproducible-gate first
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
@@ -2597,6 +2602,7 @@ fn main() -> ExitCode {
         ["version-gate"] => image_inputs::version_gate(),
         ["image-graph-gate"] => image_inputs::graph_gate(),
         ["linker-text-gate", files @ ..] => image_inputs::linker_text_gate(files),
+        ["reproducible-compare", directory] => reproducible::compare(Path::new(directory)),
         ["image-gate"] => in_turn("image-gate", image::build_and_gate),
         ["image-gate", elf] => image::gate(Path::new(elf)),
         ["build"] => in_turn("build", || {
