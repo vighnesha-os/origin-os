@@ -15,10 +15,9 @@
 //! slot, so that the launch path's only work on a slot is to add the base. The same ELF always
 //! gives the same files, byte for byte (§6.1.2's determinism test; CLAUDE.md §75): the
 //! conversion adds nothing from the environment, a clock or a path. What the compiler put in
-//! the program's bytes is carried as it is, and today that includes the path of the toolchain's
-//! `core` source under the building account's home directory, in a panic location's file name:
-//! so the same source gives different bytes on two machines until TASKS item 32's remapping
-//! reaches the ring-3 build (S4-1's review, finding F5).
+//! the program's bytes is carried as it is: a panic location's file name held the path of the
+//! toolchain's `core` source under the building account's home directory until TASKS item 32's
+//! remapping reached the ring-3 build (S4-1's review, finding F5).
 //!
 //! [`stale`] keeps the output directory safe: the files it removes are only this tool's own,
 //! from an earlier description of the same program (finding F9).
