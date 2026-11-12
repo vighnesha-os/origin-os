@@ -20,6 +20,12 @@
 //! the run, so a file whose digest differs from another machine's can be compared with it
 //! byte by byte.
 //!
+//! The linker writes a line about itself into every ELF, and its builds for two kinds of host
+//! word it differently. `.cargo/config.toml` fixes that line, and this gate reads `.comment`
+//! of the kernel's ELF and of each carried program's linker output and fails if the line
+//! there is not the fixed one ([`image_inputs::check_linker_text`]). No file of the ten may
+//! hold the linker's own line.
+//!
 //! None of this shows that another machine gives the same bytes: both builds have one
 //! toolchain on one host. `docs/research/2026-11-11-toolchain-path-in-images.md` says what
 //! was tried with a second copy of the toolchain and what CI printed, and
@@ -37,7 +43,10 @@ use std::thread;
 use std::time::Duration;
 
 use crate::ring3::{self, CarriedKind};
-use crate::{Loader, Result, build_kernel_in, build_loader_in, read_file, target_dir, toolchain};
+use crate::{
+    Loader, Result, build_kernel_in, build_loader_in, image_inputs, read_file, target_dir,
+    toolchain,
+};
 
 /// What the gate builds twice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +81,9 @@ struct Built {
     /// Whether the kernel's image must hold these bytes as they are: a carried program's
     /// segment.
     in_kernel: bool,
+    /// Whether a linker wrote this file as an ELF: the kernel, and a carried program before
+    /// `onbf-pack` takes it apart. Its `.comment` is then read.
+    elf: bool,
 }
 
 /// The two target directories, under `target/xtask/reproducible/`. The names differ in length
@@ -100,14 +112,16 @@ impl Image {
     /// Builds the image into `target` and reads every file it is made of. The loader's builds
     /// all write one path in a directory, so nothing is left to be read later.
     fn build(self, target: &Path) -> Result<Vec<Built>> {
-        let one = |name: String, file_name: String, path: PathBuf| -> Result<Vec<Built>> {
-            Ok(vec![Built {
-                name,
-                file_name,
-                bytes: read_file(&path)?,
-                in_kernel: false,
-            }])
-        };
+        let one =
+            |name: String, file_name: String, path: PathBuf, elf: bool| -> Result<Vec<Built>> {
+                Ok(vec![Built {
+                    name,
+                    file_name,
+                    bytes: read_file(&path)?,
+                    in_kernel: false,
+                    elf,
+                }])
+            };
         match self {
             Self::Loader(loader) => {
                 let path = build_loader_in(loader.map(Loader::feature), Some(target))?;
@@ -116,11 +130,13 @@ impl Image {
                         "the loader as a release builds it (no feature)".into(),
                         "loader".into(),
                         path,
+                        false,
                     ),
                     Some(loader) => one(
                         format!("the loader with `{}`", loader.feature()),
                         format!("loader-{}", loader.feature()),
                         path,
+                        false,
                     ),
                 }
             }
@@ -139,6 +155,7 @@ impl Image {
                         file_name: format!("carried-{}-{}", file.program, file.file),
                         bytes: read_file(&file.path)?,
                         in_kernel: file.kind == CarriedKind::Segment,
+                        elf: file.kind == CarriedKind::Linked,
                     });
                 }
                 Ok(built)
@@ -147,6 +164,7 @@ impl Image {
                 "the kernel ELF".into(),
                 "kernel".into(),
                 build_kernel_in(Some(target))?,
+                true,
             ),
         }
     }
@@ -166,6 +184,9 @@ pub(crate) fn gate() -> Result {
             path.what, path.path
         );
     }
+    // Read before anything is built: an entry that is missing, or not forced, is a fault of
+    // the configuration and needs no build to show it.
+    let linker_text = image_inputs::linker_text()?;
     let work = target_dir().join("xtask").join("reproducible");
     let [first_dir, second_dir] = DIRECTORIES.map(|name| work.join(name));
     // From nothing: in each directory Cargo compiles and links everything again.
@@ -199,6 +220,7 @@ pub(crate) fn gate() -> Result {
         }
         for (first, second) in first.iter().zip(&second) {
             check_pair(first, second, &kept, &host_paths)?;
+            check_linker_line(first, &linker_text)?;
         }
         if image == Image::Kernel {
             let segments: Vec<&Built> = first_builds
@@ -228,6 +250,27 @@ pub(crate) fn gate() -> Result {
         first_builds.iter().map(Vec::len).sum::<usize>(),
         kept.display()
     );
+    Ok(())
+}
+
+/// Fails if `built` holds the linker's own line about itself, or, for an ELF, if its
+/// `.comment` does not hold the fixed line. The two builds are the same bytes by now, so one
+/// is read.
+fn check_linker_line(built: &Built, linker_text: &str) -> Result {
+    if built.elf {
+        image_inputs::check_linker_text(&built.name, &built.bytes, linker_text)?;
+        println!(
+            "xtask: reproducible-build gate: {}: `.comment` holds the fixed line for the linker and not the linker's own",
+            built.name
+        );
+    }
+    if let Some(at) = image_inputs::linkers_own_line_in(&built.bytes) {
+        return Err(format!(
+            "{} holds the linker's own line about itself at offset {at:#x} (CLAUDE.md §75): `{}`. It is other text on another kind of host (`docs/research/2026-11-11-toolchain-path-in-images.md` §13)",
+            built.name,
+            text_at(&built.bytes, at)
+        ));
+    }
     Ok(())
 }
 
@@ -614,6 +657,7 @@ mod tests {
             file_name: name.replace(' ', "-"),
             bytes: bytes.to_vec(),
             in_kernel,
+            elf: false,
         }
     }
 

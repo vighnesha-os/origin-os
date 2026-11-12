@@ -76,3 +76,21 @@ rustflags = [
     # PT_GNU_STACK, if emitted, is not executable.
     "-C", "link-arg=-znoexecstack",
 ]
+
+# The linker writes a line about itself into `.comment` of every ELF it links: the kernel's and
+# each carried program's. Left to itself it writes its version and the repository its own
+# build was configured with, and the pinned toolchain's rust-lld for Linux and the one for
+# macOS give that repository differently. `.comment` is not loaded, but it moves the section
+# table, whose offset is in the ELF header, and the first loaded segment holds the header: so
+# an image built on one kind of host differed from one built on the other, in bytes that boot
+# (docs/research/2026-11-11-toolchain-path-in-images.md §13). lld writes `LLD_VERSION` in
+# place of its own line when that variable is set. Its source calls the variable an aid for
+# testing, so `cargo xtask check` reads `.comment` in every ELF it builds and fails if the line
+# there is not this one: a later linker that stopped honouring the variable fails that gate.
+#
+# The text names no version, so a toolchain upgrade does not make it false; the compiler
+# writes its own version beside it. `force` makes this entry win over a value in the
+# environment (tried with Cargo 1.99.1), and a file above the checkout cannot replace it.
+# This is the one place the text is written: xtask reads it from here.
+[env]
+LLD_VERSION = { value = "Linker: rust-lld of the toolchain that rust-toolchain.toml pins (text from .cargo/config.toml)", force = true }

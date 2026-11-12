@@ -114,6 +114,10 @@ commands:
   image-graph-gate only the gate on what the images are built from: no package under the
               loader, the kernel or a carried program has a build script or is a
               procedural macro (part of check; quick)
+  linker-text-gate <ELF>...
+              only the check the reproducible-build gate makes of each ELF it builds, on
+              files named here: `.comment` holds the line .cargo/config.toml fixes for the
+              linker, and not the linker's own, which differs between kinds of host
   image-gate [kernel ELF]
               only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
               and no jump table, in the code this build compiled. Builds the kernel first, or
@@ -2592,6 +2596,7 @@ fn main() -> ExitCode {
         ["version"] => image_inputs::write_version_file(),
         ["version-gate"] => image_inputs::version_gate(),
         ["image-graph-gate"] => image_inputs::graph_gate(),
+        ["linker-text-gate", files @ ..] => image_inputs::linker_text_gate(files),
         ["image-gate"] => in_turn("image-gate", image::build_and_gate),
         ["image-gate", elf] => image::gate(Path::new(elf)),
         ["build"] => in_turn("build", || {
