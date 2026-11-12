@@ -300,6 +300,89 @@ impl TestElf {
     }
 }
 
+/// One symbol of a dynamic symbol table made by [`symbol_tables`].
+#[derive(Clone, Debug)]
+pub(crate) struct Sym {
+    pub(crate) name: &'static str,
+    /// `st_info`: `0x12` is a global function, `0x10` a global symbol of no type.
+    pub(crate) info: u8,
+    pub(crate) other: u8,
+    /// `st_shndx`: 0 for a symbol the image does not define.
+    pub(crate) shndx: u16,
+    pub(crate) value: u64,
+    pub(crate) size: u64,
+}
+
+impl Sym {
+    /// A global function the image defines.
+    pub(crate) fn function(name: &'static str, value: u64, size: u64) -> Self {
+        Self {
+            name,
+            info: 0x12,
+            other: 0,
+            shndx: 7,
+            value,
+            size,
+        }
+    }
+
+    /// A global symbol the image leaves undefined, as `rust-lld` writes an import.
+    pub(crate) fn undefined(name: &'static str) -> Self {
+        Self {
+            name,
+            info: 0x10,
+            other: 0,
+            shndx: 0,
+            value: 0,
+            size: 0,
+        }
+    }
+}
+
+/// The bytes of a read-only segment at `vaddr` that holds a `DT_HASH` table (one bucket, and a
+/// chain count of the symbols with the null one), the symbol table and the string table, with
+/// the dynamic tags that name them, and where each of `strings` starts in the string table.
+/// The string table begins with an empty string, then `strings`, then each symbol's name.
+pub(crate) fn symbol_tables(
+    vaddr: u64,
+    symbols: &[Sym],
+    strings: &[&str],
+) -> (Vec<u8>, Vec<(u64, u64)>, Vec<u64>) {
+    let mut table = vec![0u8];
+    let mut put = |text: &str| {
+        let at = table.len() as u32;
+        table.extend_from_slice(text.as_bytes());
+        table.push(0);
+        at
+    };
+    let extra: Vec<u64> = strings.iter().map(|s| u64::from(put(s))).collect();
+    let names: Vec<u32> = symbols.iter().map(|s| put(s.name)).collect();
+    let mut bytes = Vec::new();
+    for word in [1u32, symbols.len() as u32 + 1, 0, 0] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    let symtab = vaddr + bytes.len() as u64;
+    bytes.extend_from_slice(&[0; 24]);
+    for (symbol, name) in symbols.iter().zip(&names) {
+        bytes.extend_from_slice(&name.to_le_bytes());
+        bytes.push(symbol.info);
+        bytes.push(symbol.other);
+        bytes.extend_from_slice(&symbol.shndx.to_le_bytes());
+        bytes.extend_from_slice(&symbol.value.to_le_bytes());
+        bytes.extend_from_slice(&symbol.size.to_le_bytes());
+    }
+    let strtab = vaddr + bytes.len() as u64;
+    bytes.extend_from_slice(&table);
+    let tags = vec![
+        (6, symtab),
+        (11, 24),
+        (5, strtab),
+        (10, table.len() as u64),
+        (4, vaddr),
+    ];
+    (bytes, tags, extra)
+}
+
 pub(crate) fn put16(b: &mut [u8], at: usize, v: u16) {
     b[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }

@@ -11,11 +11,12 @@ use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 
 use onbf_pack::sign::{self, HostKey, KeyPaths, SignOptions, Signer};
-use onbf_pack::{KrnOptions, Toolchain, carried, krn};
+use onbf_pack::{KrnOptions, Toolchain, carried, corelib, krn};
 
 const USAGE: &str = "\
 usage: onbf-pack krn --input <kernel.elf> --output <kernel.onbf> [options]
        onbf-pack carried --input <program.elf> --name <name> --variable <VAR> --out <dir>
+       onbf-pack corelib --input <origin.core> --exports <list> --variable <VAR> --out <dir>
        onbf-pack sign --input <kernel.onbf> --output <signed.onbf> --key <file>
                       --signing-time <seconds>
        onbf-pack keygen --key <file> --public-ed25519 <file> --public-mldsa <file>
@@ -38,6 +39,13 @@ carried lays out a program the kernel carries in its image (ADR-0011 L1; ONBF §
 which the Rust file includes from the directory the environment variable <VAR> names when the
 kernel is compiled. A file whose bytes are already there is left untouched, and an older
 `<name>.*` file the description no longer has is removed.
+
+corelib lays out `origin.core`, the library of system-call stubs the kernel carries and maps
+into every process that is pinned per call (ADR-0011 L2 to L7): `origin_core.rs`, a static the
+kernel compiles in, and `origin_core.0.bin`, its code. <list> is the generator's list of its
+exports (`oidl generate` writes it as core/<library>.exports). The image is refused unless it
+is the listed stubs and nothing else, with one `syscall` in each, no writable data and nothing
+to relocate.
 
 sign signs an unsigned KRN image in the role origin-kernel (ONBF §7.1-§7.2), with a key from
 `keygen`, and checks the result with the boot loader's code.
@@ -109,6 +117,7 @@ const KRN_OPTIONS: &[&str] = &[
     "--llvm-version",
 ];
 const CARRIED_OPTIONS: &[&str] = &["--input", "--name", "--variable", "--out"];
+const CORELIB_OPTIONS: &[&str] = &["--input", "--exports", "--variable", "--out"];
 const SIGN_OPTIONS: &[&str] = &["--input", "--output", "--key", "--signing-time"];
 const KEYGEN_OPTIONS: &[&str] = &[
     "--key",
@@ -222,13 +231,14 @@ fn run(args: &[OsString]) -> Result<Option<String>, Failure> {
     let mut rest = args.iter();
     let command = match rest.next().and_then(|a| a.to_str()) {
         Some("-h" | "--help") => return Ok(None),
-        Some(command @ ("krn" | "carried" | "sign" | "keygen")) => command,
+        Some(command @ ("krn" | "carried" | "corelib" | "sign" | "keygen")) => command,
         Some(other) => return Err(usage(format!("unknown command `{other}`"))),
         None => return Err(usage("no command given".into())),
     };
     let known = match command {
         "krn" => KRN_OPTIONS,
         "carried" => CARRIED_OPTIONS,
+        "corelib" => CORELIB_OPTIONS,
         "sign" => SIGN_OPTIONS,
         _ => KEYGEN_OPTIONS,
     };
@@ -238,6 +248,7 @@ fn run(args: &[OsString]) -> Result<Option<String>, Failure> {
     match command {
         "krn" => pack_krn(options),
         "carried" => describe_carried(options),
+        "corelib" => describe_corelib(options),
         "sign" => sign_krn(options),
         _ => keygen(options),
     }
@@ -295,13 +306,32 @@ fn describe_carried(mut options: Options) -> Result<String, Failure> {
     let elf = read_input(&input)?;
     let carried = carried::describe(&elf).map_err(conversion)?;
     let files = carried.rust(&name, &variable).map_err(conversion)?;
-    fs::create_dir_all(&out)
+    let written = write_description(&out, &name, &carried::generated_line(&name), &files)?;
+    Ok(format!(
+        "onbf-pack: described {name} in {}: {} segments, {} relocations, {} files ({written} written)",
+        out.display(),
+        carried.segments.len(),
+        carried.relocations.len(),
+        files.len()
+    ))
+}
+
+/// Writes `files`, a description of `name`, into `out`, and removes what an earlier
+/// description of it left that this one no longer has. What may go is decided before anything
+/// is written: only files this tool wrote for `name`, in a directory whose `<name>.rs` begins
+/// with `first_line` (`carried::stale`; S4-1's review, finding F9). A file whose bytes are
+/// already there is left untouched. Returns how many files were written.
+fn write_description(
+    out: &Path,
+    name: &str,
+    first_line: &str,
+    files: &[carried::File],
+) -> Result<usize, Failure> {
+    fs::create_dir_all(out)
         .map_err(|e| conversion(format!("cannot create {}: {e}", out.display())))?;
-    // What may go, decided before anything is written: only files this tool wrote for `name`
-    // (`carried::stale`; S4-1's review, finding F9).
     let mut present = Vec::new();
-    let entries = fs::read_dir(&out)
-        .map_err(|e| conversion(format!("cannot read {}: {e}", out.display())))?;
+    let entries =
+        fs::read_dir(out).map_err(|e| conversion(format!("cannot read {}: {e}", out.display())))?;
     for entry in entries {
         let entry = entry.map_err(|e| conversion(format!("{}: {e}", out.display())))?;
         // A name that is not UTF-8 is not one this tool writes.
@@ -310,10 +340,10 @@ fn describe_carried(mut options: Options) -> Result<String, Failure> {
         }
     }
     let description = fs::read(out.join(format!("{name}.rs"))).ok();
-    let stale = carried::stale(&name, &files, &present, description.as_deref())
+    let stale = carried::stale(name, first_line, files, &present, description.as_deref())
         .map_err(|e| conversion(format!("{}: {e}", out.display())))?;
     let mut written = 0;
-    for (file, bytes) in &files {
+    for (file, bytes) in files {
         let path = out.join(file);
         if fs::read(&path).is_ok_and(|old| old == *bytes) {
             continue;
@@ -325,11 +355,31 @@ fn describe_carried(mut options: Options) -> Result<String, Failure> {
         fs::remove_file(out.join(file))
             .map_err(|e| conversion(format!("cannot remove {file}: {e}")))?;
     }
+    Ok(written)
+}
+
+fn describe_corelib(mut options: Options) -> Result<String, Failure> {
+    let input = PathBuf::from(options.require("--input")?);
+    let exports = PathBuf::from(options.require("--exports")?);
+    let out = PathBuf::from(options.require("--out")?);
+    let variable = options
+        .text("--variable")?
+        .ok_or_else(|| Failure::Usage("--variable is required".into()))?;
+    let list = String::from_utf8(read_input(&exports)?)
+        .map_err(|_| conversion(format!("{} is not UTF-8", exports.display())))?;
+    let listing = corelib::Listing::parse(&list)
+        .map_err(|e| conversion(format!("{}: {e}", exports.display())))?;
+    let elf = read_input(&input)?;
+    let core = corelib::describe(&elf, &listing).map_err(conversion)?;
+    let files = core.rust(&variable).map_err(conversion)?;
+    let written = write_description(&out, corelib::NAME, &corelib::generated_line(), &files)?;
     Ok(format!(
-        "onbf-pack: described {name} in {}: {} segments, {} relocations, {} files ({written} written)",
+        "onbf-pack: described {} in {}: {} bytes of code in {} pages, {} exports, one `syscall` each, {} files ({written} written)",
+        corelib::LIBRARY,
         out.display(),
-        carried.segments.len(),
-        carried.relocations.len(),
+        core.code.len(),
+        core.span / 4096,
+        core.exports.len(),
         files.len()
     ))
 }
