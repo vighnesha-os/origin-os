@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** on 2026-11-08 by delegation. The owner told Claude to decide what "introduced in 2026 or later" covers and to choose the machines ("You do"). Claude decided. The owner has not reviewed this text and can change it. It is not an ABI or format decision (§84). **Amendment 1, accepted by the owner on 2026-11-10 (decision sheet items 88–90), tightens H1 for AMD and replaces H2: the kernel now names the core generation, and still never refuses to boot.** |
+| Status | **Accepted** on 2026-11-08 by delegation. The owner told Claude to decide what "introduced in 2026 or later" covers and to choose the machines ("You do"). Claude decided. The owner has not reviewed this text and can change it. It is not an ABI or format decision (§84). **Amendment 1, accepted by the owner on 2026-11-10 (decision sheet items 88–90), tightens H1 for AMD and replaces H2: the kernel now names the core generation, and still never refuses to boot.** Two launch facts in A1's table were corrected on 2026-11-12 (items 257 and 258); the scope did not change. |
 | Requires | CLAUDE.md header ("Target hardware"), §17, §18 (hardware qualification policy), §24, §27, §67, §74, §76, rules 14, 30 and 40 |
 | Evidence | `docs/hardware/SHORTLIST.md`, which has the sources and says what was and was not checked. Research only: **nothing here has been bought, booted or tested.** |
 | Related | ADR-0007 (sheet items 8, 9, 12 and 25 tie its policy to the declared scope), ADR-0008 (64 per-CPU slots, sheet item 14) |
@@ -115,10 +115,17 @@ Zen 5 itself launched in 2024: Ryzen 9000, Ryzen AI 300 and EPYC 9005 are Zen 5 
 
 | As of 2026-11-10 | In scope | Outside the scope |
 |---|---|---|
-| Intel | Panther Lake (January 2026); Xeon 6+ Clearwater Forest (introduced March 2026); Wildcat Lake and Nova Lake when they ship | Lunar Lake, Arrow Lake (and its 2026 refresh), Granite Rapids, older |
+| Intel | Panther Lake (January 2026); Xeon 6+ Clearwater Forest (Q2 2026, by Intel's product pages); Wildcat Lake (April 2026); Nova Lake when it ships | Lunar Lake, Arrow Lake (and its 2026 refresh), Granite Rapids, older |
 | AMD | Ryzen AI 400 "Gorgon Point" (Zen 5 refresh, January 2026); EPYC "Venice" (Zen 6, introduced July 2026); Zen 6 Ryzen when it ships | Ryzen 9000, Ryzen AI 300, EPYC 9005; anything on Zen 4 or older |
 
 Everything else is bench equipment: it may be used for testing, but no support or qualification claim rests on it (§76, rules 30 and 40).
+
+*Corrected on 2026-11-12, accepted by the owner ("Accept all 7", decision sheet items 257 and 258).* Two of the table's launch facts were read again against Intel's own pages, for TASKS item 16 (its ledger `docs/research/2026-11-12-cpu-identification-table.md`, section 3, commit `6791317` on `claude/t16-cpu-ident-621a3b`, which lands with the third batch):
+
+- **Clearwater Forest (item 257).** The table said "introduced March 2026". Intel's ark gives a launch date of Q2'26 for all four Xeon 6900E+ processors, and Intel's product brief is dated 2026-06-01.
+- **Wildcat Lake (item 258).** The table had it in the scope "when they ship". Intel launched it on 2026-04-16, as Core Series 3; its ark gives Q2'26. Nova Lake has not shipped.
+
+Both are 2026 generations either way, and A2's rule never depended on a launch date, so nothing in the scope or the check changes.
 
 ### A2. The kernel names the core generation and reports the scope (item 89; replaces H2)
 
