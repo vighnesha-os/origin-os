@@ -34,13 +34,13 @@ Until 2026-11-12, `docs/STATUS.md` marked M0 "done", M1 "done (developer mode)" 
 | M0-6 | `Cargo.lock` holds only the workspace's packages, and the one host-only exception (Loom) is approved and pinned | S5-01, S5-10 |
 | M0-7 | The records are kept: the requirements matrix and the provenance table, each read by a gate in `cargo xtask check`; a §78 contract for each task, following `docs/engineering/TASK_CONTRACT_TEMPLATE.md` and checked in review; the ADRs, the research ledgers and the decision sheet | S6-01 to S6-13, S78-01 to S78-11, S79-06 to S79-09, S84-08 |
 
-**Marked against the tests, 2026-11-12: built, not done.** M0-2 and M0-3 fail until TASKS item 22 lands.
+**Marked against the tests, 2026-11-12: built, not done.** M0-3 is not shown until CI has run the workflow as TASKS item 22a changed it, and that needs a push. M0-1 and M0-2 pass on the development host since 22a.
 
 | Test | On the tree | Evidence |
 |---|---|---|
-| M0-1 | Not shown: `verify.sh` was last recorded on 2026-11-07, from a tree with five uncommitted paths | `docs/toolchain/VERIFICATION.md`; design review finding 18 |
-| M0-2 | Fails: the tests are run by hand, and are not part of `cargo xtask check` or of CI | rows S10-01 to S10-04, "Limitations" |
-| M0-3 | Fails: CI installs the pinned toolchain, and runs neither `verify.sh` nor `--locked` | `.github/workflows/ci.yml`; TASKS item 22 |
+| M0-1 | Passes on the development host: `verify.sh` recorded on 2026-11-12 at `b17dc8d`, from a tree with nothing uncommitted (PASS 20, FAIL 0). `rust-toolchain.toml` has §8's settings; one comment says "CLAUDE.md §11" where §8's block says "§11" | `docs/toolchain/VERIFICATION.md`; `SOURCE_PROVENANCE.md`, "TASKS item 22a" |
+| M0-2 | Passes on the development host: `verify.sh` runs all three, the `wcslen` test in the loader's own library and link, and a planted fault fails each. CI's workflow runs it; no run exists yet | `docs/toolchain/VERIFICATION.md`; `SOURCE_PROVENANCE.md`, "TASKS item 22a" |
+| M0-3 | Built, not shown: the workflow runs `verify.sh`, gives every cargo command `--locked`, and every job fails unless the compiler reports the pinned commit. No run of it exists | `.github/workflows/ci.yml`, `.github/ci/install-rust.sh`; TASKS item 22a |
 | M0-4 | Passes | `cargo xtask check`, run on every merge into the batch |
 | M0-5 | Passes | `cargo xtask check` (the §62 lint) |
 | M0-6 | Passes | `cargo xtask check` (`dependency_check`) |
