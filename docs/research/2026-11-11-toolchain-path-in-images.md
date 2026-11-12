@@ -130,3 +130,55 @@ In one turn on the machine, at `dfa8281`:
 
 - **Another machine.** Everything here is one Mac. The second copy of the toolchain is the same files at another path, run by the same account on the same host.
 - **A Linux build host.** CI builds there. Whether the compiler and the linker write the same bytes on Linux as on macOS, with the path out of the way, is not known. The gate prints each image's SHA-256, so the first CI run after this lands can be compared with the digests in the provenance entry.
+
+## 11. Brought up to the batch (2026-11-12): the ring-3 build and the pinned commit
+
+The batch (`land/s4` at `e51e098`) gained two things after this ledger was written: a kernel that carries a program built for ring 3 (task S4-1), and one file for the pinned compiler's commit (TASKS 22a). Each touches §5.
+
+**A third way in.** The kernel includes the bytes of the program it carries (`include_bytes!` of what `onbf-pack carried` describes). That program is built for the userspace triple with the flags of `.cargo/userspace.toml`, which had no remap, and it held one location: `<sysroot>/lib/rustlib/src/rust/library/core/src/slice/index.rs`. The independent review of S4-1 found it (`docs/engineering/REVIEW_S4-1_2026-11-12.md`, F5). So with the batch merged, the gate of §8 fails on the kernel's image, as it should.
+
+Shown with plain `cargo` on the merged tree, building `first-program` (29,784 bytes) as `xtask` does:
+
+| Build | Paths of this machine | What it holds in their place |
+|---|---|---|
+| as the batch built it | 1, under the toolchain's directory | — |
+| with `--config target.x86_64-unknown-linux-gnu.rustflags=["--remap-path-prefix=…"]` after `--config .cargo/userspace.toml` | none | `/rustc/<commit>/library/core/src/slice/index.rs` |
+
+Cargo joins the second `--config` to the first's list, as R2 says of lists.
+
+**What the tree has now.** `ring3::userspace()`, which every ring-3 build and clippy run goes through, passes `toolchain::userspace_config()`: the remap for the userspace triple alone. The freestanding builds do not name that triple, because on CI it is the host's own: R2 says a target's flags reach the host's build scripts when no `--target` is given.
+
+**The commit comes from one file.** The remap's target is `/rustc/<commit>`. `xtask` now reads the commit from `developer-tools/toolchain/rustc-commit-hash`, the way CI's install step reads it (a `#` starts a comment, white space does not count, 40 lower-case hexadecimal digits must be left), and stops if the compiler in use reports another. The check matters to the images and not only to the record: the library code the toolchain ships compiled already holds `/rustc/<its own commit>`, so with another compiler an image would hold two.
+
+**The refusal already covers the ring-3 build** (the review's F10). `xtask` checks the environment when it starts, before any command but `exclusive`, so `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` cannot replace the list in `.cargo/userspace.toml` either. Not refused yet: `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`, which would add flags to the ring-3 build and, on CI, to the host's.
+
+**What `xtask` showed on the merged tree,** in one turn on the machine, at ``119d78d``:
+
+- The gate passes in 40 s and prints: the loader with no feature, 196,096 bytes, `b02de0363fb0643bcc0f936ec40df7f88cb1a7eb19a193f1ef6b9b4adb1a8ccd`; with `test-trust-store`, 199,168 bytes, `b3a2e18497bbe03fb9dbaa9db20b2962c4815e5e0dbfdd9e88d2012cb60c74d7`; with `developer-mode`, 199,168 bytes, `6dfe435c44f1356fe1b99ee1b5de286439fdefe9d29ace0bce7287fde82b6baa`; the kernel ELF, 1,676,104 bytes, `e3c95ed22ae6ecd49edb0d7fb87fc6a06a093bc9a10a8db489b316fda1c025f3`.
+- With a second copy of the toolchain's whole directory at another path, and that copy's `cargo` and `rustc` in use, it prints the same four.
+- **With the remap taken out of the freestanding builds** (one line of `toolchain.rs`), it fails at the first image: the loader holds the toolchain's directory at offset 0x2c79d, in `…/library/core/src/slice/mod.rs`.
+- **With the remap taken out of the ring-3 build alone,** the three loaders pass and the kernel fails: it holds the toolchain's directory at offset 0x142c4, in `…/library/core/src/slice/index.rs`, the location the carried program brings. So the search of the kernel's image covers the bytes of what it carries.
+- Each of `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` and the two freestanding per-target variables stops `xtask` with exit 1; with `CARGO_BUILD_RUSTFLAGS` it runs.
+- `cargo xtask check`, `boot-test` and `boot-matrix` pass (the provenance entry has the counts). The kernel that booted has the gate's digest.
+
+With and without the freestanding remap, on the merged tree (plain `cargo`, the carried program remapped in both):
+
+| | Loader (`test-trust-store`) | Kernel ELF |
+|---|---|---|
+| File size | 199,168 bytes, both | 1,676,104 bytes, both |
+| Code section | `.text`, `0x2A13F` bytes, both | `.text`, `0x104F94` bytes, both |
+| Instructions | 39,429, both, the same count of each | 245,061, both, the same count of each |
+| Read-only data | `.rdata` 32 bytes shorter | `.rodata` 296 bytes shorter |
+| Bytes that differ | 9,429 | 99,789 |
+
+As in §7, the disassembly is the same text in both once addresses and displacements are masked. The remapped builds here have the digests the gate printed.
+
+**What a CI run must show.** CI's `cargo xtask check` job prints the gate's four lines, each with an image's size and SHA-256. For the same commit:
+
+- the four digests are the ones the development Mac prints: then the images do not depend on the host's system, its processor, the account or any path, for the first time on two machines;
+- if one differs, the gate itself still passed on CI (two builds there agree and hold no path of that machine), so the difference is something a machine's own two builds share. The next step is to get both files and compare them as §7 does: CI would need to keep the image as an artifact of the run;
+- the toolchain job has passed, so the compiler is the pinned one on both sides.
+
+The digests change with every change to the kernel's or the loader's source, so the comparison is of one commit: the Mac's figures for the batch's tip are the ones the keeper's own `check` prints there, not the ones in this ledger.
+
+**Still open after this:** a check of each carried program's own bytes before the kernel includes them, and the refusal of the userspace triple's variable. Both wait for S4-1's review fixes, which edit the same files.
