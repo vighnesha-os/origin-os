@@ -4230,13 +4230,16 @@ fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
         build.arg("--target-dir").arg(target);
     }
     build.args(toolchain::image_config()?);
-    // The programs it carries in its image (task S4-1), built into the same directory.
-    run_step(ring3::with_programs(&mut build, target)?)?;
     let elf = target
         .map_or_else(target_dir, Path::to_path_buf)
         .join(KERNEL_TARGET)
         .join("release")
         .join(KERNEL_PACKAGE);
+    // The programs it carries in its image (task S4-1), built into the same directory.
+    let build = ring3::with_programs(&mut build, target)?;
+    // A kernel linked before `.cargo/config.toml` fixed the linker's line is linked again:
+    // Cargo does not do that by itself (TASKS item 44).
+    image_inputs::build_with_the_fixed_line(std::slice::from_ref(&elf), || run_step(build))?;
     if elf.is_file() {
         Ok(elf)
     } else {

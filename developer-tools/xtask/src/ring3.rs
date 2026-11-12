@@ -193,7 +193,10 @@ pub(crate) fn programs(target: Option<&Path>) -> Result<PathBuf> {
     for program in PROGRAMS {
         build.args(["--package", program.package]);
     }
-    run_step(&mut build)?;
+    // Each is an ELF the kernel takes a segment of with its header in it, so each must have
+    // been linked with the linker's fixed line: one from before it is linked again.
+    let linked_files: Vec<PathBuf> = PROGRAMS.iter().map(|p| linked(target, p)).collect();
+    crate::image_inputs::build_with_the_fixed_line(&linked_files, || run_step(&mut build))?;
     let out = ring3_dir(target).join("carried");
     for program in PROGRAMS {
         let elf = linked(target, program);

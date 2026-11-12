@@ -389,6 +389,105 @@ pub(crate) fn check_linker_text(name: &str, elf: &[u8], text: &str) -> Result {
     }
 }
 
+/// Builds, then makes sure each of `outputs`, the ELF files the build links, was linked with
+/// the fixed line; one that was not is removed and the build run once more.
+///
+/// Cargo does not link a file again when `[env]` changes: nothing it tracks for that file
+/// changed. So a target directory that held a kernel or a program from before the entry, or
+/// from before its text last changed, keeps that file, with the linker's own line or the old
+/// one in it. A kernel built on top would carry a program's header from before, and would
+/// not be the kernel the reproducible-build gate builds from nothing. Removing the file makes
+/// Cargo link it again. Returns the files it had to link again.
+pub(crate) fn build_with_the_fixed_line(
+    outputs: &[PathBuf],
+    mut build: impl FnMut() -> Result,
+) -> Result<Vec<PathBuf>> {
+    let text = linker_text()?;
+    relink_stale(
+        outputs,
+        &text,
+        &mut build,
+        &|path| fs::read(path).map_err(|e| format!("{}: {e}", path.display())),
+        &remove_linked,
+    )
+}
+
+/// The names Cargo keeps one linked file under, given the names in its `deps` directory: the
+/// file's own name with `-` as `_`, then `-` and sixteen hexadecimal digits, and no extension.
+fn deps_names<'a>(file_name: &str, deps: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let prefix = format!("{}-", file_name.replace('-', "_"));
+    deps.filter(|name| {
+        name.strip_prefix(&prefix).is_some_and(|hash| {
+            hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    })
+    .collect()
+}
+
+/// Removes a linked file so that Cargo links it again. Cargo keeps what the linker wrote
+/// under `deps/` beside it, and the file itself is a second name for that: with only the
+/// second name gone, Cargo gives the old file its name back and links nothing.
+fn remove_linked(path: &Path) -> Result {
+    let gone = |path: &Path| fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()));
+    gone(path)?;
+    let (Some(directory), Some(file_name)) = (
+        path.parent(),
+        path.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return Ok(());
+    };
+    let deps = directory.join("deps");
+    let Ok(entries) = fs::read_dir(&deps) else {
+        return Ok(());
+    };
+    let names: Vec<String> = entries
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .collect();
+    for name in deps_names(file_name, names.iter().map(String::as_str)) {
+        gone(&deps.join(name))?;
+    }
+    Ok(())
+}
+
+/// [`build_with_the_fixed_line`] over the three things it does to a file, so that a test can
+/// stand in for them.
+fn relink_stale(
+    outputs: &[PathBuf],
+    text: &str,
+    build: &mut dyn FnMut() -> Result,
+    read: &dyn Fn(&Path) -> Result<Vec<u8>>,
+    remove: &dyn Fn(&Path) -> Result,
+) -> Result<Vec<PathBuf>> {
+    build()?;
+    let stale = |path: &PathBuf| -> Result<Option<String>> {
+        linker_text_problem(&read(path)?, text).map_err(|e| format!("{}: {e}", path.display()))
+    };
+    let mut again = Vec::new();
+    for path in outputs {
+        if stale(path)?.is_some() {
+            remove(path)?;
+            again.push(path.clone());
+        }
+    }
+    if again.is_empty() {
+        return Ok(again);
+    }
+    build()?;
+    for path in &again {
+        if let Some(problem) = stale(path)? {
+            return Err(format!(
+                "{} {problem}. It was removed and linked again, and still does (CLAUDE.md §75)",
+                path.display()
+            ));
+        }
+        println!(
+            "xtask: note: {} had been linked before {CARGO_CONFIG} fixed the linker's line, or with another text; Cargo does not link it again for that, so it was removed and linked again",
+            path.display()
+        );
+    }
+    Ok(again)
+}
+
 /// Where in `file` the linker's own line about itself starts, if anywhere. No file an image
 /// is made of may hold it, an ELF or not.
 pub(crate) fn linkers_own_line_in(file: &[u8]) -> Option<usize> {
@@ -681,6 +780,100 @@ mod tests {
             .expect("refused");
         assert!(problem.contains("has no `.comment` section"), "{problem}");
         assert!(linkers_own_line_in(&good).is_none());
+    }
+
+    #[test]
+    fn a_file_linked_before_the_fixed_line_is_removed_and_linked_again_once() {
+        use std::cell::{Cell, RefCell};
+        use std::collections::BTreeMap;
+        let rustc = b"rustc version 1\0".as_slice();
+        let fresh = elf_with_comment(&[rustc, FIXED.as_bytes(), b"\0"].concat());
+        let old = elf_with_comment(&[b"Linker: LLD 23.1.1 (somewhere abc)\0", rustc].concat());
+        let kernel = PathBuf::from("/t/kernel");
+        let program = PathBuf::from("/t/program");
+        // A directory, and a build that links whatever is missing and leaves the rest alone,
+        // as Cargo does. `honoured` is whether the linker writes the fixed line.
+        let run = |start: &[(&PathBuf, &Vec<u8>)], honoured: bool| {
+            let files: RefCell<BTreeMap<PathBuf, Vec<u8>>> = RefCell::new(
+                start
+                    .iter()
+                    .map(|(path, bytes)| ((*path).clone(), (*bytes).clone()))
+                    .collect(),
+            );
+            let builds = Cell::new(0);
+            let outputs = [kernel.clone(), program.clone()];
+            let result = relink_stale(
+                &outputs,
+                FIXED,
+                &mut || {
+                    builds.set(builds.get() + 1);
+                    for path in &outputs {
+                        files
+                            .borrow_mut()
+                            .entry(path.clone())
+                            .or_insert_with(|| if honoured { fresh.clone() } else { old.clone() });
+                    }
+                    Ok(())
+                },
+                &|path| {
+                    files
+                        .borrow()
+                        .get(path)
+                        .cloned()
+                        .ok_or_else(|| "missing".to_string())
+                },
+                &|path| {
+                    files
+                        .borrow_mut()
+                        .remove(path)
+                        .map(|_| ())
+                        .ok_or_else(|| "missing".to_string())
+                },
+            );
+            (result, builds.get(), files.into_inner())
+        };
+        // Nothing there: one build, nothing linked again.
+        let (result, builds, _) = run(&[], true);
+        assert_eq!((result, builds), (Ok(Vec::new()), 1));
+        // Both from before the entry: both removed, one more build, both right afterwards.
+        let (result, builds, files) = run(&[(&kernel, &old), (&program, &old)], true);
+        assert_eq!(result, Ok(vec![kernel.clone(), program.clone()]));
+        assert_eq!(builds, 2);
+        assert!(files.values().all(|bytes| bytes == &fresh));
+        // The program alone from before, the case that booted a kernel one byte off the
+        // gate's: it alone is linked again.
+        let (result, builds, _) = run(&[(&kernel, &fresh), (&program, &old)], true);
+        assert_eq!((result, builds), (Ok(vec![program.clone()]), 2));
+        // What is removed with a linked file: Cargo's own copies of it, under any of the
+        // hashes it has had, and nothing else that starts the same way.
+        assert_eq!(
+            deps_names(
+                "first-program",
+                [
+                    "first_program-4b2f9914be5d4c98",
+                    "first_program-4b2f9914be5d4c98.d",
+                    "first_program-9ee3ce843fa0cf90",
+                    "first_program_two-9ee3ce843fa0cf90",
+                    "libfirst_program-9ee3ce843fa0cf90.rlib",
+                    "first_program-short",
+                    "first-program-4b2f9914be5d4c98",
+                ]
+                .into_iter()
+            ),
+            [
+                "first_program-4b2f9914be5d4c98",
+                "first_program-9ee3ce843fa0cf90"
+            ]
+        );
+        // A linker that does not write the fixed line: an error after one more build, never a
+        // third.
+        let (result, builds, _) = run(&[(&kernel, &old)], false);
+        let error = result.expect_err("still the linker's own line");
+        assert!(
+            error.contains("removed and linked again, and still does"),
+            "{error}"
+        );
+        assert_eq!(builds, 2);
     }
 
     #[test]
