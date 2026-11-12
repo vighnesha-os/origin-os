@@ -189,7 +189,7 @@ const RING3_UNSAFE_FILES: &[(&str, &str)] = &[
     ),
     (
         "tests/kernel/first-program/src/faults.rs",
-        "the proof's deliberate faults: a write to its own code and a jump into its own data",
+        "the proof's deliberate faults: a write to its own code, a jump into its own data and a write to its relocated read-only data",
     ),
 ];
 

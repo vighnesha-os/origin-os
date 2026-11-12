@@ -9,6 +9,12 @@
 //! - `memcpy`, `memmove`, `memset`, `memcmp` and `bcmp`, which the compiler calls and which no
 //!   C library supplies here (§11).
 //!
+//! The runtime ends a thread with three codes of its own: [`PANIC_EXIT`] (`u64::MAX`),
+//! [`BAD_RECORD_EXIT`] (`u64::MAX - 1`) and [`UNWIND_EXIT`] (`u64::MAX - 2`). They share the space
+//! of the codes a program's `main` returns: a program that returns one of them cannot be told
+//! from the runtime's ending by its code alone (S4-1's review, finding F11). The kernel's proof
+//! program never does; whether the ABI reserves them is for `origin.core` (task S4-2).
+//!
 //! No allocator, no thread-local storage and nothing that reads the environment (ADR-0005 E2).
 //! `unsafe` is only in `entry.rs` and `mem.rs`, the two files `cargo xtask check`'s gate lists for
 //! this crate; the rest denies it.
