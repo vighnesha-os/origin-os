@@ -3916,6 +3916,7 @@ A fourth addition to the entry above, from another session and on a branch of it
   - *`cargo xtask check` on the commit that adds this entry:* run after it was written; the task's hand-over report says what it found.
   - *Not run:* anything under KVM or on a real processor. The generated C header, with `origin_handle_t` a `uint64_t`, was compiled by the generator's own test with this Mac's `cc` (Apple clang), as C11, C17 and C23 and as C++11, C++17, C++20 and C++23; no program called through it.
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-12, the interface session, on the coordinating session's contract. Original code; Rust `core` and `alloc` only.
+- **In the batch:** merged into the third batch, `land/s4`, at `5871257` on 2026-11-12. The branch's last commit is `42bbb6c` (a clippy fix in a host test after `f491602`); `cargo xtask check` passed on it in the task's session (1,564 passed, 0 failed). On the merge, the coordinating session read `framekernel/src/handles.rs`'s change in full and ran `cargo xtask check` (1,564 host tests passed, 0 failed, 27 ignored; Loom 53 models, 78 controls; the requirements gate), `cargo xtask boot-test` (11 of 11 scenarios) and `cargo xtask boot-matrix` (passed: 19 boots "degraded, 62 of 63", 1 "degraded, 58 of 60" without randomness; the stack region at 12 distinct bases in 12 boots), all under QEMU on the development Mac. Not run: anything under KVM, until CI runs on the batch.
 - **Review:** none. No person and no second agent has read it.
 - **Licensing:** MIT OR Apache-2.0.
 
@@ -3938,3 +3939,4 @@ A fourth addition to the entry above, from another session and on a branch of it
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-12, the interface session, on the coordinating session's request. Original code.
 - **Review:** none.
 - **Licensing:** MIT OR Apache-2.0.
+- **In the batch:** merged into `land/s4` at `3b06a80` on 2026-11-12, with the record of item 237. The coordinating session read the change to `developer-tools/oidl/src/fingerprint.rs`; the check on the merge is in the landing record's commit.
