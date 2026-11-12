@@ -30,6 +30,8 @@
 //! - [`blockcache`]: the block cache's LRU index and write-back bookkeeping;
 //! - [`cache`]: the CPU cache hierarchy from CPUID leaf 04h;
 //! - [`channel`]: one channel's queues, limits and signals (ADR-0005 P8);
+//! - [`core_image`]: `origin.core` as the build laid it out, and the check the kernel's build
+//!   runs on it (task S4-2);
 //! - [`clock`]: monotonic-clock arithmetic (ticks to nanoseconds and back) and the CPUID
 //!   TSC rate;
 //! - [`cpumap`]: dense CPU indexes for the processors the MADT enables (per-CPU arrays are
@@ -110,6 +112,7 @@ pub mod blockcache;
 pub mod bootproof;
 pub mod cache;
 pub mod channel;
+pub mod core_image;
 pub mod deflate;
 pub mod dhcp;
 pub mod dns;

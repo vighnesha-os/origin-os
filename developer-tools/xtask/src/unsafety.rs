@@ -159,9 +159,11 @@ const UNSAFE_FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// The crates that run in ring 3 (CLAUDE.md §11; task S4-1): the runtime and the bodies of its
-/// `mem*` functions, today's generated stubs, and the kernel's Rust proof programs.
+/// The crates that run in ring 3 (CLAUDE.md §11; tasks S4-1 and S4-2): `origin.core`, the
+/// runtime and the bodies of its `mem*` functions, the generated client, and the kernel's Rust
+/// proof programs.
 const RING3_CRATES: &[&str] = &[
+    "runtime/core",
     "runtime/kernel-stubs",
     "runtime/rt",
     "runtime/rt-mem",
@@ -194,7 +196,9 @@ const RING3_UNSAFE_FILES: &[(&str, &str)] = &[
 ];
 
 /// The ring-3 crate roots, each of which denies `unsafe`; only the modules of listed files allow
-/// it. (`runtime/kernel-stubs` cannot: it includes the generated shims.)
+/// it. (`runtime/core` and `runtime/kernel-stubs` cannot: each includes generated shims, the
+/// stubs and the client's imports, which are not committed and so are not read here. Their own
+/// committed files hold no `unsafe`, which this gate checks like any other file's.)
 const RING3_ROOTS: &[&str] = &[
     "runtime/rt/src/lib.rs",
     "tests/kernel/first-program/src/main.rs",

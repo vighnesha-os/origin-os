@@ -1,0 +1,25 @@
+[package]
+name = "origin-core"
+description = "origin.core: the generated system-call stubs and nothing else, linked as the one image every process that is pinned per call maps (task S4-2; ADR-0011 Amendment 2, L2 to L6)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Nothing generated is committed here. `cargo xtask` runs `oidl generate` on
+# `sdk/interfaces/origin.kernel.oidl` into the target directory at each ring-3 build, and
+# `src/lib.rs` includes the stubs' file from there, so the stubs are always the definition's.
+#
+# A `cdylib`, linked by `rust-lld` as a shared object named `origin.core`, only so that a program
+# can be linked against it and have the linker name its imports. No loader reads it: `onbf-pack
+# corelib` takes its code and its exports' places and describes them for the kernel, which carries
+# them in its own image (L1, L2). Built only for the userspace triple, with
+# `.cargo/userspace.toml`; never a default member, and no crate depends on it.
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true

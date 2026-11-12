@@ -104,6 +104,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-core"
+version = "0.0.0"
+
+[[package]]
 name = "origin-crypto"
 version = "0.0.0"
 
