@@ -9,7 +9,7 @@
 | Implementation | `developer-tools/oidl` (host only). Consumers: `sdk/interfaces/origin.kernel.oidl` and `sdk/interfaces/origin.directory.oidl` |
 | Evidence | `docs/research/2026-11-09-native-sdk.md`, `docs/research/2026-11-09-oidl-wire-format.md`, and the comparison with the hand-written ABI, `docs/engineering/OIDL_KERNEL_COMPARISON.md` |
 | Compatibility | Every byte layout here is revision 1 of the format, accepted by the owner on 2026-11-09. A change to any of them needs the owner's acceptance again (CLAUDE.md §84) |
-| Revisions | 2026-11-10: plain structs of integers, enums and bits as `syscall` vector and array elements (§3.1, §10), ADR-0005 C3, accepted by the owner on 2026-11-09 (decision sheet item 58). Existing definitions and the `channel` wire format are unchanged. 2026-11-10: the fingerprint names a library's own `sized struct` with its size at the minor described (§13), as §9 requires; the owner asked for the fix. 2026-11-10: from major 1, an item may not name one of its library's items from a later minor (§9). 2026-11-10: `--library`, one channel library's bindings as a crate of their own (§11) and a lock per library (§13), for the service directory; §7.4 records that `channel_read` reports handle records. Tools only: no format changes |
+| Revisions | 2026-11-10: plain structs of integers, enums and bits as `syscall` vector and array elements (§3.1, §10), ADR-0005 C3, accepted by the owner on 2026-11-09 (decision sheet item 58). Existing definitions and the `channel` wire format are unchanged. 2026-11-10: the fingerprint names a library's own `sized struct` with its size at the minor described (§13), as §9 requires; the owner asked for the fix. 2026-11-10: from major 1, an item may not name one of its library's items from a later minor (§9). 2026-11-10: `--library`, one channel library's bindings as a crate of their own (§11) and a lock per library (§13), for the service directory; §7.4 records that `channel_read` reports handle records. Tools only: no format changes. 2026-11-12: a handle is a 64-bit value at the `syscall` transport, and the decoder no longer refuses a handle register whose upper 32 bits are not zero (§10): ADR-0005 Amendment 6, E1, accepted by the owner on 2026-11-10 (decision sheet item 109), built by task S4-0. The `channel` wire format is unchanged: a slot is a position in the message's handle list, not a handle value (§7.4) |
 
 The keywords MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
@@ -434,7 +434,7 @@ Parameters take registers first, in declaration order, then results, in declarat
 
 | Type | As a parameter | As a result |
 |---|---|---|
-| `handle` | one register | one out pointer (`u32`) |
+| `handle` | one register | one out pointer (`u64`) |
 | `optional<handle>` | one register; `0` is absent | one out pointer |
 | `bool`, integer, enum, bits | one register | one out pointer |
 | struct, `array` | one pointer | one out pointer |
@@ -442,13 +442,15 @@ Parameters take registers first, in declaration order, then results, in declarat
 
 A vector's count and a result's capacity are in elements. A struct element is its bytes as §3.1 lays them out, so the kernel's length in bytes is the count times the struct's §5.3 size.
 
+**A handle is a 64-bit value** (ADR-0005 Amendment 6, E1). It fills its register as a parameter, and in memory it is a little-endian `u64`: a handle result's out pointer, each element of an `array<handle>` result and of a `vector<handle>` parameter, and a handle field of a structure the kernel writes, such as `received_handle` and `start_entry`, are 8 bytes. In C it is `origin_handle_t`, a `uint64_t`. It stays opaque (ADR-0011 N9): how the kernel divides its bits is not part of the ABI, and no program may compute one handle from another. A slot of the `channel` wire format (§7.4) is a position, not a handle, and stays 4 bytes.
+
 A method that needs more than six registers is refused by the generator; ADR-0005 P4 says such a call takes a pointer to a structure.
 
 **Register decoding** happens after the `@reserved` check (which answers `not_supported`) and the capability check (§6), in declaration order, the first failure winning:
 
 | Type | Check | Refused with |
 |---|---|---|
-| `handle`, `optional<handle>` | The upper 32 bits are zero | `bad_handle` |
+| `handle`, `optional<handle>` | None: every value goes to the kernel's table, which answers `bad_handle` for one that names nothing (ADR-0005 E1; until `origin.kernel` 0.7 the upper 32 bits had to be zero) | — |
 | `u8`, `u16`, `u32` | The value fits | `invalid_args` |
 | `i8`, `i16`, `i32` | The value is correctly sign-extended | `invalid_args` |
 | `bool` | `0` or `1` (§10 of CLAUDE.md) | `invalid_args` |
@@ -464,7 +466,7 @@ Pointers are not dereferenced by the decoder. It produces typed descriptors of u
 
 Unused argument registers are ignored: a C stub leaves them undefined.
 
-Every method MUST declare the statuses its own decoding can produce: `bad_handle` with a handle parameter, `invalid_args` with a parameter narrower than 64 bits, a `bool`, an enum, a `bits` or a bounded count, `fault` with any pointer, `access_denied` with a handle that has rights, and `wrong_type` with a handle of a specific object type. A `@reserved` method is exempt, since it decodes nothing. The tool refuses a definition that leaves one out.
+Every method MUST declare the statuses its own decoding can produce: `bad_handle` with a handle parameter (since E1 its decoding refuses no handle, but the table it is looked up in does, so the rule stands), `invalid_args` with a parameter narrower than 64 bits, a `bool`, an enum, a `bits` or a bounded count, `fault` with any pointer, `access_denied` with a handle that has rights, and `wrong_type` with a handle of a specific object type. A `@reserved` method is exempt, since it decodes nothing. The tool refuses a definition that leaves one out.
 
 The generated C entry point is the stable interface: `<library with _>_<method>`, returning the status as `int64_t` (`_Noreturn void` for `never`). `origin.core` issues the `syscall` instruction inside each entry point, with **one `syscall` instruction per number**, as ADR-0005 B2 requires.
 
