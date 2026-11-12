@@ -33,6 +33,11 @@
 //! step with a key, and its ML-DSA signature is hedged with fresh randomness by design, so no
 //! two signings of one image are the same bytes (`developer-tools/onbf-pack/src/sign.rs`).
 //!
+//! [`compare`], `cargo xtask reproducible-compare <directory>`, compares another such
+//! directory with this checkout's, file by file: CI's kept artifact, unpacked, or another
+//! checkout's `files/`. That directory is another machine's output and is read as untrusted
+//! data.
+//!
 //! None of this shows that another machine gives the same bytes: both builds have one
 //! toolchain on one host. `docs/research/2026-11-11-toolchain-path-in-images.md` says what
 //! was tried with a second copy of the toolchain and what CI printed, and
@@ -43,7 +48,9 @@
 //! with every link beside it. A time stamp that differs is named in the report, because that
 //! is what comes back if those arguments stop reaching the linker.
 
+use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -298,6 +305,171 @@ fn check_linker_line(built: &Built, linker_text: &str) -> Result {
         ));
     }
     Ok(())
+}
+
+/// What a comparison of two directories of kept files found.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Comparison {
+    /// One line for each file that is the same bytes on both sides.
+    same: Vec<String>,
+    /// One entry for each thing that is not: a file that differs, a name on one side only,
+    /// an entry that is not a plain file, a directory that is not there.
+    problems: Vec<String>,
+}
+
+/// The names of the plain files directly in `dir`, and a problem for every other entry there:
+/// a symbolic link, a directory, anything else. Such an entry is never followed or opened.
+fn plain_files(dir: &Path, problems: &mut Vec<String>) -> Result<BTreeSet<String>> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let path = entry.path();
+        // Of the entry itself: a link's target is not asked about.
+        let kind = fs::symlink_metadata(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .file_type();
+        let what = if kind.is_file() {
+            match entry.file_name().into_string() {
+                Ok(name) => {
+                    names.insert(name);
+                    continue;
+                }
+                Err(_) => "has a name that is not UTF-8",
+            }
+        } else if kind.is_symlink() {
+            "is a symbolic link, which is not followed"
+        } else if kind.is_dir() {
+            "is a directory, which is not entered"
+        } else {
+            "is not a plain file"
+        };
+        problems.push(format!("{} {what}", path.display()));
+    }
+    Ok(names)
+}
+
+/// At most `limit` bytes of the plain file at `path`, and its whole length. The file is
+/// checked again to be a plain file, not a link, just before it is opened.
+fn read_at_most(path: &Path, limit: usize) -> Result<(Vec<u8>, u64)> {
+    let failed = |e: std::io::Error| format!("{}: {e}", path.display());
+    let metadata = fs::symlink_metadata(path).map_err(failed)?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("{} is not a plain file", path.display()));
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(failed)?
+        .take(u64::try_from(limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .map_err(failed)?;
+    Ok((bytes, metadata.len()))
+}
+
+/// Compares `theirs`, a directory of kept files from somewhere else, with `ours`, this
+/// checkout's. For each of the gate's two builds both must hold the same names, and each file
+/// must be the same bytes. `theirs` is untrusted: only plain files directly in its two build
+/// directories are read, and of each no more than our own file's length and one byte.
+fn compare_kept(ours: &Path, theirs: &Path) -> Result<Comparison> {
+    let mut found = Comparison::default();
+    for build in BUILDS {
+        let (our_dir, their_dir) = (ours.join(build), theirs.join(build));
+        let mut not_ours = Vec::new();
+        let our_names = plain_files(&our_dir, &mut not_ours).map_err(|e| {
+            format!("this checkout has no kept files to compare with ({e}): run `cargo xtask reproducible-gate` first")
+        })?;
+        if let Some(odd) = not_ours.first() {
+            return Err(format!("this checkout's own kept files: {odd}"));
+        }
+        if !fs::symlink_metadata(&their_dir).is_ok_and(|m| m.file_type().is_dir()) {
+            found.problems.push(format!(
+                "{} is not a directory: the {build} build's files are missing",
+                their_dir.display()
+            ));
+            continue;
+        }
+        let their_names = plain_files(&their_dir, &mut found.problems)?;
+        for name in our_names.difference(&their_names) {
+            found.problems.push(format!(
+                "{build}/{name} is missing from {}",
+                theirs.display()
+            ));
+        }
+        for name in their_names.difference(&our_names) {
+            found.problems.push(format!(
+                "{build}/{name} is in {} and is not one of this checkout's files",
+                theirs.display()
+            ));
+        }
+        for name in our_names.intersection(&their_names) {
+            let our_bytes = read_file(&our_dir.join(name))?;
+            let (their_bytes, their_length) =
+                read_at_most(&their_dir.join(name), our_bytes.len().saturating_add(1))?;
+            let same_length = u64::try_from(our_bytes.len()).is_ok_and(|ours| ours == their_length);
+            if same_length && our_bytes == their_bytes {
+                found.same.push(format!(
+                    "{build}/{name}: {} bytes, the same (SHA-256 {})",
+                    our_bytes.len(),
+                    hex(&origin_crypto::Sha256::digest(&our_bytes), "")
+                ));
+                continue;
+            }
+            // The first offset at which they differ: within what both hold, or where the
+            // shorter one ends.
+            let shared = our_bytes.len().min(their_bytes.len());
+            let first = (0..shared)
+                .find(|&at| our_bytes[at] != their_bytes[at])
+                .unwrap_or(shared);
+            let places = differing_runs(&our_bytes[..shared], &their_bytes[..shared]).len();
+            let byte = |bytes: &[u8]| {
+                bytes
+                    .get(first)
+                    .map_or_else(|| "its end".to_string(), |byte| format!("{byte:#04x}"))
+            };
+            found.problems.push(format!(
+                "{build}/{name} differs: first at offset {first:#x} (here {}, there {}); {} bytes here and {their_length} there; {places} place(s) differ in the part both hold",
+                byte(&our_bytes),
+                byte(&their_bytes),
+                our_bytes.len()
+            ));
+        }
+    }
+    if found.same.is_empty() && found.problems.is_empty() {
+        found.problems.push(format!(
+            "neither {} nor {} holds a file: nothing was compared",
+            ours.display(),
+            theirs.display()
+        ));
+    }
+    Ok(found)
+}
+
+/// `cargo xtask reproducible-compare <directory>`: `directory` against the files this
+/// checkout's gate last kept. It builds nothing and writes nothing, and does not know which
+/// commit either side was built from: that is for whoever runs it to say.
+pub(crate) fn compare(theirs: &Path) -> Result {
+    let ours = target_dir().join("xtask").join("reproducible").join(KEPT);
+    let found = compare_kept(&ours, theirs)?;
+    for line in &found.same {
+        println!("xtask: reproducible-compare: {line}");
+    }
+    let total = found.same.len() + found.problems.len();
+    if found.problems.is_empty() {
+        println!(
+            "xtask: reproducible-compare: all {total} files, from both builds, are the same bytes in {} and in {}",
+            ours.display(),
+            theirs.display()
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "{} of {total} things compared between {} (this checkout's) and {} are not the same (CLAUDE.md §75):\n  {}",
+            found.problems.len(),
+            ours.display(),
+            theirs.display(),
+            found.problems.join("\n  ")
+        ))
+    }
 }
 
 /// Leaves a copy of each of `built`, the files of one image from the build named `build`,
@@ -694,6 +866,187 @@ mod tests {
         assert!(files.iter().all(|file| !file.in_kernel));
         // The converted image has the name the boots' own image has.
         assert_eq!(KERNEL_IMAGE, "KERNEL.ONBF");
+    }
+
+    /// Two directories of kept files under a scratch directory of their own: `ours` and
+    /// `theirs`, each with both builds holding `files`.
+    fn kept_pair(case: &str, files: &[(&str, &[u8])]) -> (PathBuf, PathBuf) {
+        let work = target_dir()
+            .join("xtask")
+            .join("reproducible-compare-tests")
+            .join(case);
+        let _ = fs::remove_dir_all(&work);
+        let (ours, theirs) = (work.join("ours"), work.join("theirs"));
+        for side in [&ours, &theirs] {
+            for build in BUILDS {
+                let dir = side.join(build);
+                fs::create_dir_all(&dir).expect("a scratch directory");
+                for (name, bytes) in files {
+                    fs::write(dir.join(name), bytes).expect("a scratch file");
+                }
+            }
+        }
+        (ours, theirs)
+    }
+
+    const KERNEL: &[u8] = b"the kernel's bytes, sixteen and more";
+
+    #[test]
+    fn two_directories_that_agree_compare_the_same_file_by_file() {
+        let (ours, theirs) = kept_pair("agree", &[("kernel", KERNEL), ("loader", b"MZ loader")]);
+        let found = compare_kept(&ours, &theirs).expect("readable");
+        assert!(found.problems.is_empty(), "{:?}", found.problems);
+        assert_eq!(found.same.len(), 4);
+        assert!(found.same[0].starts_with("first/kernel: 36 bytes, the same (SHA-256 "));
+        assert!(found.same[3].starts_with("second/loader: 9 bytes, the same"));
+    }
+
+    #[test]
+    fn a_difference_is_named_with_its_first_offset() {
+        let (ours, theirs) = kept_pair("differ", &[("kernel", KERNEL), ("loader", b"MZ loader")]);
+        // One byte of their second build's kernel, and their first build's loader cut short
+        // and, apart, made longer than ours.
+        let mut planted = KERNEL.to_vec();
+        planted[5] ^= 0x01;
+        planted[20] ^= 0x01;
+        fs::write(theirs.join("second/kernel"), &planted).expect("planted");
+        fs::write(theirs.join("first/loader"), b"MZ lo").expect("planted");
+        let found = compare_kept(&ours, &theirs).expect("readable");
+        assert_eq!(found.same.len(), 2);
+        assert_eq!(found.problems.len(), 2, "{:?}", found.problems);
+        assert!(
+            found.problems[0].starts_with(
+                "first/loader differs: first at offset 0x5 (here 0x61, there its end); 9 bytes here and 5 there"
+            ),
+            "{}",
+            found.problems[0]
+        );
+        assert!(
+            found.problems[1].starts_with(
+                "second/kernel differs: first at offset 0x5 (here 0x65, there 0x64); 36 bytes here and 36 there; 2 place(s) differ"
+            ),
+            "{}",
+            found.problems[1]
+        );
+        // Ours a prefix of theirs: it differs where ours ends, and no more of theirs is read
+        // than ours is long, and one byte.
+        let mut longer = b"MZ loader".to_vec();
+        longer.extend(std::iter::repeat_n(0x55, 1 << 20));
+        fs::write(theirs.join("first/loader"), &longer).expect("planted");
+        let found = compare_kept(&ours, &theirs).expect("readable");
+        assert!(
+            found.problems[0].starts_with(
+                "first/loader differs: first at offset 0x9 (here its end, there 0x55); 9 bytes here and 1048585 there"
+            ),
+            "{}",
+            found.problems[0]
+        );
+        let (read, length) = read_at_most(&theirs.join("first/loader"), 10).expect("readable");
+        assert_eq!((read.len(), length), (10, 1_048_585));
+    }
+
+    #[test]
+    fn a_file_on_one_side_only_is_a_failure_and_never_a_skip() {
+        let (ours, theirs) = kept_pair("names", &[("kernel", KERNEL), ("loader", b"MZ loader")]);
+        fs::remove_file(theirs.join("first/kernel")).expect("removed");
+        fs::write(theirs.join("second/kernel-image"), b"extra").expect("planted");
+        let found = compare_kept(&ours, &theirs).expect("readable");
+        assert_eq!(found.same.len(), 3);
+        assert_eq!(found.problems.len(), 2, "{:?}", found.problems);
+        assert!(found.problems[0].starts_with("first/kernel is missing from "));
+        assert!(
+            found.problems[1].starts_with("second/kernel-image is in ")
+                && found.problems[1].ends_with("is not one of this checkout's files"),
+            "{}",
+            found.problems[1]
+        );
+        // A whole build's directory gone from theirs.
+        fs::remove_dir_all(theirs.join("second")).expect("removed");
+        let found = compare_kept(&ours, &theirs).expect("readable");
+        assert!(
+            found
+                .problems
+                .iter()
+                .any(|p| p.ends_with("is not a directory: the second build's files are missing")),
+            "{:?}",
+            found.problems
+        );
+        // Nothing of ours to compare with is an error that says what to run.
+        fs::remove_dir_all(ours.join("first")).expect("removed");
+        let error = compare_kept(&ours, &theirs).expect_err("nothing of ours");
+        assert!(
+            error.contains("run `cargo xtask reproducible-gate` first"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn nothing_on_either_side_is_not_agreement() {
+        let (ours, theirs) = kept_pair("empty", &[]);
+        let found = compare_kept(&ours, &theirs).expect("readable");
+        assert!(found.same.is_empty());
+        assert_eq!(found.problems.len(), 1);
+        assert!(found.problems[0].ends_with("holds a file: nothing was compared"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_or_a_directory_in_the_other_side_is_refused_and_not_followed() {
+        let (ours, theirs) = kept_pair("untrusted", &[("kernel", KERNEL)]);
+        // Their kernel is a link to a file outside their directory that holds our kernel's
+        // very bytes: followed, it would compare the same.
+        let outside = theirs
+            .parent()
+            .expect("the case's directory")
+            .join("outside");
+        fs::write(&outside, KERNEL).expect("planted");
+        fs::remove_file(theirs.join("first/kernel")).expect("removed");
+        std::os::unix::fs::symlink(&outside, theirs.join("first/kernel")).expect("a link");
+        // And a directory where a file's name could be, with a file of ours inside it.
+        fs::create_dir(theirs.join("second/more")).expect("a directory");
+        fs::write(theirs.join("second/more/kernel"), KERNEL).expect("planted");
+        let found = compare_kept(&ours, &theirs).expect("readable");
+        assert_eq!(found.same.len(), 1, "{:?}", found.same);
+        assert!(found.same[0].starts_with("second/kernel: "));
+        assert!(
+            found
+                .problems
+                .iter()
+                .any(|p| p.ends_with("first/kernel is a symbolic link, which is not followed")),
+            "{:?}",
+            found.problems
+        );
+        assert!(
+            found
+                .problems
+                .iter()
+                .any(|p| p.starts_with("first/kernel is missing from ")),
+            "{:?}",
+            found.problems
+        );
+        assert!(
+            found
+                .problems
+                .iter()
+                .any(|p| p.ends_with("second/more is a directory, which is not entered")),
+            "{:?}",
+            found.problems
+        );
+        // A link is not read even when asked for by name.
+        let error = read_at_most(&theirs.join("first/kernel"), 64).expect_err("a link");
+        assert!(error.ends_with("is not a plain file"), "{error}");
+        // A link in place of a build's whole directory is not entered either.
+        fs::remove_dir_all(theirs.join("second")).expect("removed");
+        std::os::unix::fs::symlink(ours.join("second"), theirs.join("second")).expect("a link");
+        let found = compare_kept(&ours, &theirs).expect("readable");
+        assert!(
+            found
+                .problems
+                .iter()
+                .any(|p| p.ends_with("is not a directory: the second build's files are missing")),
+            "{:?}",
+            found.problems
+        );
     }
 
     /// A file a build wrote, for the checks that take one.
