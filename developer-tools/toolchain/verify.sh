@@ -12,9 +12,10 @@
 # Exit status: 0 if no check failed, 1 if any failed, 2 on usage errors.
 # Written for the bash 3.2 that ships with macOS; also runs on Linux bash.
 #
-# A compiler upgrade (CLAUDE.md §15) changes four places together, and this script fails until
-# they agree: `channel` in rust-toolchain.toml, `rust-version` in Cargo.toml, EXPECTED below,
-# and the commit in developer-tools/toolchain/rustc-commit-hash.
+# A compiler upgrade (CLAUDE.md §15) changes four places together: `channel` in
+# rust-toolchain.toml, `rust-version` in Cargo.toml, EXPECTED below, and the commit in
+# developer-tools/toolchain/rustc-commit-hash. This script fails until all four agree: it compares
+# the first three as text, and the fourth with what the compiler reports.
 
 set -u
 
@@ -138,6 +139,21 @@ if [ "$MODE" = "install" ]; then
   else
     record FAIL "rustup installed $EXPECTED with components [$COMPONENTS] and targets [$TARGETS]" "$out"
   fi
+fi
+
+# The version is written in three places; an upgrade that changes one must change all three.
+out="$WORK/pin.txt"
+CHANNEL=$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$REPO/rust-toolchain.toml" 2>/dev/null)
+MSRV=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' "$REPO/Cargo.toml" 2>/dev/null)
+{
+  echo "rust-toolchain.toml, channel:    ${CHANNEL:-not found}"
+  echo "Cargo.toml, rust-version:        ${MSRV:-not found}"
+  echo "verify.sh, EXPECTED:             $EXPECTED"
+} > "$out"
+if [ "$CHANNEL" = "$EXPECTED" ] && [ "$MSRV" = "$EXPECTED" ]; then
+  record PASS "The pin is written the same in rust-toolchain.toml, Cargo.toml and this script ($EXPECTED)" "$out"
+else
+  record FAIL "The pin is written the same in rust-toolchain.toml, Cargo.toml and this script" "$out"
 fi
 
 out="$WORK/active.txt"
