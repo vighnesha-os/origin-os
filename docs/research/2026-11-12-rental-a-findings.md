@@ -60,7 +60,11 @@ Whether Origin's "speculation controls" proof passes here is known only once Ori
 3. **No reserved-memory maps are asked for.** With no IVMD block, ADR-0007 A9's refusal would refuse no device on this machine. The identity-map deadline (items 8, 12 and 229) stands as decided. This only says that this machine would not exercise the unity-map code.
 4. **The screen should survive the IOMMU.** The boot display is the BMC's, which shows the picture from the BMC's own memory. Reasoning: the framebuffer console (ADR-0010) does not depend on a reserved-memory region here, unlike T14's integrated-graphics case.
 5. **UEFI and Secure Boot need no change.** Rental B needs no firmware setting changed (item 231).
-6. **Boot selection.** The firmware has a built-in EFI shell entry and a short timeout (1 second). Picking the second disk once, from the firmware's menu over the console, is still the plan (item 231). Whether the menu shows that disk is for rental B to see.
+6. **Boot selection.** The firmware's first boot entry starts `\EFI\ubuntu\shimx64.efi` on the first disk's EFI system partition, which the installed system mounts at `/boot/efi`. Its timeout is 1 second, and it also has a built-in EFI shell entry.
+   - Item 231 says to pick the disk once from the firmware's menu over the console. Driving that menu blind, over a console the BMC drops at every reset, is the step most likely to fail.
+   - **Accepted by the owner on 2026-11-12, "Yes, replace the file", in the bare-metal session; confirmed in the coordinating session as decision item 236:** copy Origin's loader over the file the first entry starts, and its kernel to `\EFI\ORIGIN\KERNEL.ONBF` on the same partition. The firmware then starts Origin with no UEFI variable written and no firmware setting changed, which keeps the rest of item 231.
+   - The provider's system on that disk no longer starts; the server is deleted and its disks erased afterwards. Latitude's rescue mode starts from the network, so it stays available to recover.
+   - `latitude.py rental-b` does this, and checks first that the entry names the partition that is mounted.
 
 ## What this rental cannot show
 
