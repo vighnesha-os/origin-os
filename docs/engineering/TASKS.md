@@ -696,6 +696,7 @@ Three things were tried first, in a scratch copy of `0550226` that has no git an
 - **Two files the contract did not name.** `.github/ci/checkout-unchanged.sh` is new: the "checkout as committed" step is in two jobs, the new one and `check`, so it is a script and not a line of the workflow. And `.github/workflows/processor-sweep.yml` gives its two cargo commands `--locked`: the contract named `ci.yml` alone, and the second workflow had not been read when it was written. **Changing that file starts the workflow's short sweep on the pull request that carries the change,** by the workflow's own design; it is a commit of its own, so the keeper of `land/s4` can leave it out.
 - **Controls.** (a) was also run with a commit file that is not a hash and with none. (e)'s first plant, a `transmute`, failed the check on `x86_64-unknown-uefi` only, because rustc 1.99.1 still masks the byte on the two System V targets; the body Rust 1.99.0 produced, written in assembly, fails all three. (f)'s first attempt planted nothing and passed; it was planted again with an asserted replacement.
 - **`VERIFICATION.md` was recorded three times,** each time from a clean tree, so that the record comes from the script the tree holds.
+- **`land/s4` moved while the task was built, and was merged in at `61aae61`:** `main` with ADR-0018, and TASKS item 26's budgets file. Documents only, with no conflict. The contract says ADR-0018 is not in this tree; since the merge it is. The cost ledger in `docs/engineering/PERFORMANCE_BUDGETS.md` is owed no row by this task: it lists what the design pays on each operation or pays unmeasured on a path, and nothing here is on any path.
 
 **What was run on each commit** (the contract: the full check on the last one, and this list for the others):
 
@@ -712,7 +713,8 @@ Three things were tried first, in a scratch copy of `0550226` that has no git an
 | `b17dc8d` | The sweep's `--locked` | Both workflows parsed as YAML |
 | `ca9193a` | The record | `verify.sh`'s own output, at `b17dc8d` |
 | `8d32bc9` | A comment in the workflow: the Loom models' lock file named | The workflow parsed as YAML |
-| the records' commit, which is the last | These records and the matrix rows | The requirements, provenance and document gates; then `cargo --locked xtask check` in full, reported with the commit |
+| `f055962` | These records and the matrix rows | The requirements, provenance and document gates |
+| `d42acdd`, and the commit after it, which is the last | The merge of `land/s4` at `61aae61` (documents only), and the lines here that say so | The requirements, provenance and document gates; then `cargo --locked xtask check` in full on the last commit, reported with it |
 
 **Owed, and by whom:**
 
