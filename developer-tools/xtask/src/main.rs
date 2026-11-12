@@ -16,6 +16,7 @@ mod loom;
 mod mnemonics;
 mod reproducible;
 mod requirements;
+mod ring3;
 mod screen;
 mod serial;
 mod targetcfg;
@@ -3206,7 +3207,10 @@ fn check() -> Result {
         "-D",
         "warnings",
     ]))?;
-    run_step(cargo().args([
+    // The ring-3 crates on their own target (task S4-1), then the kernel, which carries the
+    // programs they build.
+    ring3::clippy()?;
+    run_step(ring3::with_programs(cargo().args([
         "clippy",
         "--package",
         KERNEL_PACKAGE,
@@ -3215,7 +3219,7 @@ fn check() -> Result {
         "--",
         "-D",
         "warnings",
-    ]))?;
+    ]))?)?;
     run_step(cargo().args(["test", "--package", KERNEL_PACKAGE, "--lib"]))?;
     // The loader in developer mode too (the boot test's variant).
     for loader in [Loader::Developer, Loader::Verifying] {
@@ -3894,9 +3898,12 @@ fn linux_cfg_lint() -> Result {
         &mut manifests,
     )
     .map_err(|e| format!("cfg lint: {e}"))?;
-    let cargo_config = root.join(".cargo").join("config.toml");
-    if cargo_config.is_file() {
-        manifests.push(cargo_config);
+    // `config.toml`, and the userspace flags xtask passes to the ring-3 builds (task S4-1).
+    for name in ["config.toml", "userspace.toml"] {
+        let cargo_config = root.join(".cargo").join(name);
+        if cargo_config.is_file() {
+            manifests.push(cargo_config);
+        }
     }
     if sources.is_empty() || manifests.is_empty() {
         return Err(format!(
@@ -4029,7 +4036,8 @@ fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
     if let Some(target) = target {
         build.arg("--target-dir").arg(target);
     }
-    run_step(&mut build)?;
+    // The programs it carries in its image (task S4-1).
+    run_step(ring3::with_programs(&mut build)?)?;
     let elf = target
         .map_or_else(target_dir, Path::to_path_buf)
         .join(KERNEL_TARGET)
