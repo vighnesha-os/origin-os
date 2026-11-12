@@ -15,6 +15,11 @@
 //! programs, and the gate fails unless the kernel's image holds the bytes of every segment it
 //! read: what was checked is then what the kernel carries.
 //!
+//! A copy of every file the gate read, from each of the two builds, is left under
+//! `target/xtask/reproducible/files/` ([`KEPT`]). CI's `check` job keeps that directory with
+//! the run, so a file whose digest differs from another machine's can be compared with it
+//! byte by byte.
+//!
 //! None of this shows that another machine gives the same bytes: both builds have one
 //! toolchain on one host. `docs/research/2026-11-11-toolchain-path-in-images.md` says what
 //! was tried with a second copy of the toolchain and what CI printed, and
@@ -72,6 +77,14 @@ struct Built {
 /// The two target directories, under `target/xtask/reproducible/`. The names differ in length
 /// too: a path that reached an image would then move everything after it as well.
 const DIRECTORIES: [&str; 2] = ["a", "another-target-directory"];
+
+/// Where a copy of every file the gate read is left, under `target/xtask/reproducible/`: one
+/// directory for each build, named in [`BUILDS`]. The loader's three builds write one path in
+/// a target directory, so only a copy keeps all three. `.github/workflows/ci.yml` names this
+/// directory.
+const KEPT: &str = "files";
+/// The two builds, in the order of [`DIRECTORIES`].
+const BUILDS: [&str; 2] = ["first", "second"];
 
 /// How long after the first directory's last build the second directory's first one starts.
 /// A PE time stamp counts seconds, so two links within one second would agree by chance.
@@ -156,18 +169,24 @@ pub(crate) fn gate() -> Result {
     let work = target_dir().join("xtask").join("reproducible");
     let [first_dir, second_dir] = DIRECTORIES.map(|name| work.join(name));
     // From nothing: in each directory Cargo compiles and links everything again.
-    for dir in [&first_dir, &second_dir] {
+    // The kept copies go too: none may be left from an earlier tree.
+    let kept = work.join(KEPT);
+    for dir in [&first_dir, &second_dir, &kept] {
         if dir.exists() {
             fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
     }
     let mut first_builds = Vec::new();
     for &image in IMAGES {
-        first_builds.push(image.build(&first_dir)?);
+        let built = image.build(&first_dir)?;
+        keep(&kept, BUILDS[0], &built)?;
+        first_builds.push(built);
     }
     thread::sleep(APART);
     for (&image, first) in IMAGES.iter().zip(&first_builds) {
         let second = image.build(&second_dir)?;
+        // Before the comparison: a file that differs is then there from both builds.
+        keep(&kept, BUILDS[1], &second)?;
         let names = |built: &[Built]| -> Vec<String> {
             built.iter().map(|file| file.file_name.clone()).collect()
         };
@@ -179,7 +198,7 @@ pub(crate) fn gate() -> Result {
             ));
         }
         for (first, second) in first.iter().zip(&second) {
-            check_pair(first, second, &work, &host_paths)?;
+            check_pair(first, second, &kept, &host_paths)?;
         }
         if image == Image::Kernel {
             let segments: Vec<&Built> = first_builds
@@ -204,6 +223,23 @@ pub(crate) fn gate() -> Result {
             }
         }
     }
+    println!(
+        "xtask: reproducible-build gate: a copy of each of the {} files it read, from each build, is in {}",
+        first_builds.iter().map(Vec::len).sum::<usize>(),
+        kept.display()
+    );
+    Ok(())
+}
+
+/// Leaves a copy of each of `built`, the files of one image from the build named `build`,
+/// in `kept`.
+fn keep(kept: &Path, build: &str, built: &[Built]) -> Result {
+    let dir = kept.join(build);
+    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for file in built {
+        let path = dir.join(&file.file_name);
+        fs::write(&path, &file.bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -212,23 +248,22 @@ pub(crate) fn gate() -> Result {
 fn check_pair(
     first: &Built,
     second: &Built,
-    work: &Path,
+    kept: &Path,
     host_paths: &[toolchain::HostPath],
 ) -> Result {
     if let Some(report) = difference(&first.bytes, &second.bytes) {
-        // Both are kept for whoever investigates: the next build in a directory may write
-        // over this one.
-        let kept = [(first, "first"), (second, "second")].map(|(built, which)| {
-            let path = work.join(format!("{}.{which}", built.file_name));
-            match fs::write(&path, &built.bytes) {
-                Ok(()) => format!("  the {which} build's file is kept as {}", path.display()),
-                Err(e) => format!("  the {which} build's file could not be kept: {e}"),
-            }
+        // Where [`keep`] left both, for whoever investigates: the next build in a target
+        // directory may write over its file.
+        let copies = [(first, BUILDS[0]), (second, BUILDS[1])].map(|(built, build)| {
+            format!(
+                "  the {build} build's file is kept as {}",
+                kept.join(build).join(&built.file_name).display()
+            )
         });
         return Err(format!(
             "{} is not reproducible (CLAUDE.md §75): two builds of the same source give different files\n{report}\n{}",
             first.name,
-            kept.join("\n"),
+            copies.join("\n"),
         ));
     }
     if let Some((path, at)) = toolchain::host_path_in(&first.bytes, host_paths) {
@@ -625,18 +660,23 @@ mod tests {
         }];
         let clean = built("the carried program `p` in `p.0.bin`", &[7u8; 64], true);
         assert_eq!(check_pair(&clean, &clean, &work, &paths), Ok(()));
-        // The second build differs in one byte.
+        // The second build differs in one byte. As in the gate, each build's file is kept
+        // before the two are compared.
         let mut other = built("the carried program `p` in `p.0.bin`", &[7u8; 64], true);
         other.bytes[9] = 8;
+        keep(&work, BUILDS[0], std::slice::from_ref(&clean)).expect("the first is kept");
+        keep(&work, BUILDS[1], std::slice::from_ref(&other)).expect("the second is kept");
         let error = check_pair(&clean, &other, &work, &paths).expect_err("a planted difference");
         assert!(
             error.starts_with("the carried program `p` in `p.0.bin` is not reproducible"),
             "{error}"
         );
         assert!(error.contains("0x000009, 1 byte(s): 07 | 08"), "{error}");
-        for which in ["first", "second"] {
-            let kept = work.join(format!("{}.{which}", clean.file_name));
-            assert!(kept.is_file(), "{}", kept.display());
+        // The report names the two copies, and each holds its own build's bytes.
+        for (build, bytes) in [(BUILDS[0], &clean.bytes), (BUILDS[1], &other.bytes)] {
+            let copy = work.join(build).join(&clean.file_name);
+            assert!(error.contains(&copy.display().to_string()), "{error}");
+            assert_eq!(&fs::read(&copy).expect("the copy is there"), bytes);
         }
         // Both builds agree, and hold the toolchain's path.
         let mut bytes = vec![0u8; 256];
@@ -653,6 +693,36 @@ mod tests {
         assert!(error.contains("at offset 0x28"), "{error}");
         assert!(error.contains("core/src/slice/index.rs`"), "{error}");
         fs::remove_dir_all(&work).expect("the scratch directory goes");
+    }
+
+    #[test]
+    fn every_file_of_a_build_is_kept_under_its_own_name() {
+        let kept = target_dir().join("xtask").join("reproducible-tests-kept");
+        let _ = fs::remove_dir_all(&kept);
+        // The loader's three builds write one path; their copies are three files.
+        let files = [
+            Built {
+                file_name: "loader".into(),
+                ..built("the loader", b"one", false)
+            },
+            Built {
+                file_name: "loader-test-trust-store".into(),
+                ..built("the loader with a feature", b"two", false)
+            },
+        ];
+        keep(&kept, BUILDS[0], &files).expect("kept");
+        keep(&kept, BUILDS[1], &files[..1]).expect("kept");
+        assert_eq!(fs::read(kept.join("first/loader")).expect("there"), b"one");
+        assert_eq!(
+            fs::read(kept.join("first/loader-test-trust-store")).expect("there"),
+            b"two"
+        );
+        assert_eq!(fs::read(kept.join("second/loader")).expect("there"), b"one");
+        assert!(!kept.join("second/loader-test-trust-store").exists());
+        // The workflow names the directory by this path.
+        assert_eq!(KEPT, "files");
+        assert_ne!(BUILDS[0], BUILDS[1]);
+        fs::remove_dir_all(&kept).expect("the scratch directory goes");
     }
 
     #[test]

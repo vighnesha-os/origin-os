@@ -320,7 +320,17 @@ All of it on `9648878`, the last commit that changes code, in one turn on the ma
 - The kernel that booted has the gate's digest and holds no path under `/Users` or `/private`. Each of the four segment files occurs in it exactly once (at 0x13b4b, 0x14bb3, 0x1736d and 0x175ed).
 - `xtask`'s own tests: 248 pass and 1 is ignored. On a copy of `9e4f79f` with `9648878` alone applied, 244 pass.
 
-### 12.8 Not verified
+### 12.8 CI keeps the files the gate read (added the same day)
+
+The coordinating session asked for this before step 2 lands, so that the first CI run to pass `check` already keeps CI's kernel file, which §12.5 could not get.
+
+- **The gate leaves a copy of every file it read,** from each of its two builds, in `target/xtask/reproducible/files/first/` and `…/second/`: `loader`, `loader-test-trust-store`, `loader-developer-mode`, `carried-first_program-…` (six) and `kernel`. The copies are needed because the loader's three builds write one path in a target directory. The directory is emptied when the gate starts, and each build's file is copied before the two are compared, so a file that differs is there from both builds. About 2.3 MB for each build.
+- **CI's `check` job uploads that directory** as the artifact `reproducible-gate-files`, with the action and the pinned commit the workflow already uses, kept for 14 days. The step runs when `check` fails too. If `check` failed before the gate there is nothing to upload, which is a warning; and the step is marked so that it cannot decide whether the job passes. What CI gates on is unchanged.
+- The ten digests are already in the job's log: the gate prints one line for each file.
+
+Not seen yet: the step has not run on CI. Its first run is the one on a head that holds it.
+
+### 12.9 Not verified
 
 - **No image of a tree that holds item 32 has been compared across two machines.** §12.5 is of the tree before it, with the Mac given CI's path. The direct comparison needs a CI run whose `check` job reaches the gate; the Mac's ten digests for the batch's images are in §12.7.
 - **Why CI's kernel differs from the Mac's with CI's path and host line** (§12.5). Only its size and digest are known.

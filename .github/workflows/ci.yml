@@ -74,6 +74,20 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: bash .github/ci/install-rust.sh
       - run: cargo --locked xtask check
+      # A copy of every file the reproducible-build gate read, from each of its two builds:
+      # the three loaders, each carried program's files and the kernel (TASKS item 32). A
+      # digest that differs from another machine's can then be looked into byte by byte. Kept
+      # when `check` fails too. If `check` failed before the gate there is nothing to keep,
+      # which warns; and this step never decides whether the job passes.
+      - name: Keep the files the reproducible-build gate read
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reproducible-gate-files
+          path: target/xtask/reproducible/files
+          if-no-files-found: warn
+          retention-days: 14
       # What `--locked` cannot say: that nothing the job ran afterwards rewrote Cargo.lock, or
       # any other tracked file. This job runs every build the others do.
       - name: The job left the checkout as committed
