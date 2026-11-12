@@ -694,12 +694,20 @@ def start_sol(server_id, key_id, rental_dir, deadline):
 
 
 def stop_sol(process):
+    """Ends the console session. The BMC may have closed it already: it does on every reset of
+    the machine (rental A, 2026-11-12: "SOL session closed by BMC")."""
     try:
-        process.stdin.write(b"\r~.")
-        process.stdin.flush()
-        process.wait(timeout=10)
-    except Exception:
+        if process.poll() is None:
+            process.stdin.write(b"\r~.")
+            process.stdin.flush()
+            process.wait(timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
         process.kill()
+    finally:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
 
 
 def main():
