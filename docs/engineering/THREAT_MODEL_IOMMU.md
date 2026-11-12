@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Required by | CLAUDE.md §58 ("Threat-model every privileged interface"), §32, §47 |
-| Covers | `framekernel/src/iommu.rs`, `iommu/amd.rs`, `dma.rs`, `pcie.rs`, `pci.rs`, `vtd.rs`, `amdvi.rs`, `dmar.rs`, `ivrs.rs`; ADR-0007 |
+| Covers | `framekernel/src/iommu.rs`, `iommu/amd.rs`, `dma.rs`, `pcie.rs`, `pci.rs`, `vtd.rs`, `amdvi.rs`, `dmar.rs`, `ivrs.rs`, `reserved.rs`; ADR-0007 |
 | Written | 2026-11-08, **after** the implementation. §58 and §83 step 12 expect this during design. |
 | Evidence | QEMU only. "Proven" below means a boot proof with a negative control under QEMU 11.1. Nothing has run on hardware (§74). Every VT-d encoding has been checked against Rev 5.20 (research ledger, last section). |
 
@@ -46,7 +46,7 @@ Status: **Proven** (boot proof and control, QEMU), **By design** (no proof), **O
 | T11 | A device overwrites a page it only needed to read | None: every mapping is read/write (I4) | **Open** |
 | T12 | A device reaches kernel data that shares a page with its buffer (compare Markuze et al., ASPLOS 2016) | `DeviceDma::page` allocates whole pages. But `iommu::map` is crate-visible, so kernel code could misuse it | By design |
 | T13 | A device changes shared memory after the driver checked it | Drivers validate what a device supplies, and hostile-ring tests exercise it. Virtio rings are read with volatile accesses and received frames are copied once before parsing. Most kernel-side refusals are host-tested only | Partly |
-| T14 | Firmware requires a device to reach reserved memory (RMRR, IVMD) | The device is refused at attach (fails closed). Costs availability. One consequence to expect on real machines: an integrated GPU scans out the firmware framebuffer through this path, so the framebuffer console (ADR-0010) goes dark when translation comes up, until identity maps exist | By design |
+| T14 | Firmware requires a device to reach reserved memory (RMRR, IVMD) | Since TASKS item 40 (2026-11-12): when a driver attaches the device, its domain identity-maps every range the firmware names for it, with the firmware's permissions, before the device's entry turns present. An IVMD's read-only range stays read-only. An exclusion range is identity-mapped, read and write, and never let through the exclusion registers. The IOVA window keeps clear of these pages, and they are never unmapped. A range is mapped only if T26's checks pass; otherwise the devices it names are still refused at attach (fails closed). A device with no driver still gets no entry (I2), and its bus mastering is cleared at enumeration (I12). So a firmware-owned device still stops when translation comes up: USB legacy emulation under SMM, or an integrated GPU scanning out the firmware framebuffer (ADR-0010's console goes dark there). Research ledger `docs/research/2026-11-12-reserved-memory-identity-maps.md`; R1–R5 put to the coordinating session | **Proven** for attached devices (QEMU, both IOMMUs, with ranges a test-only firmware step plants; boot proofs and controls, `SOURCE_PROVENANCE.md`, "Identity maps for firmware-reserved memory"). **Open** for firmware-owned devices without a driver: R1's option (b) together with I12's exceptions, at hardware qualification |
 | T15 | IOVAs run out: 1 GiB per device, and they are not reused | None. No driver maps per request yet | **Open** |
 
 ### Interrupts
@@ -68,6 +68,7 @@ Status: **Proven** (boot proof and control, QEMU), **By design** (no proof), **O
 | T23 | **An attack goes unnoticed.** Faults are blocked and recorded, but `take_faults` is only called by the boot proofs, so a runtime fault is never read or logged (§69) | None | **Open** |
 | T24 | A stuck unit stalls the kernel | Each invalidation waits at most 100 ms with interrupts off, then fails. A failed unmap never hands the page back, so it cannot be reused. An NVMe poll no longer holds the driver lock with interrupts off | Partly |
 | T25 | A device reports BAR values that aim the kernel's own register writes at RAM, at ECAM or at an IOMMU's registers | A memory BAR is used only if non-zero, naturally aligned, at most 1 GiB and clear of RAM, of the platform's reserved ranges and of other BARs; `map_mmio` refuses RAM. A BAR moved after sizing is not noticed | **Proven** (host controls and one boot control) |
+| T26 | **Firmware names "reserved" memory a device should not reach**: RAM the kernel allocates or reclaims, the IOMMU's own registers or another platform register range, the interrupt range, or more than the domain can address. An identity map would then hand a device that memory | `reserved::check`, once at bring-up, for every range. Every page must lie in memory the memory map calls Reserved, RuntimeCode or RuntimeData (VT-d §8.4 asks firmware for exactly that). The range must lie outside the interrupt range and, under AMD-Vi, outside the special range of 48882 Table 3. It must be clear of the IOMMUs', the APICs', the HPET's and every ECAM window's registers, inside the domain's address width, and at most 4 GiB long. A range that fails is reported by name and never mapped. Its devices are refused at attach. A device's ranges that ask for one page to be both mapped and never mapped refuse the device too. A device that shares an AMD-Vi alias with one attached first must find all of its ranges already mapped there. Memory a device may write is never handed out as a Rust reference (`vm::firmware_bytes` refuses it; the proof reads it with volatile reads) | **Proven** (host tests at every boundary; at boot, a range in RAM and one in the interrupt range refused by name; a control that skips the memory-map check fails the boot) |
 
 ### T4 in detail: what remains
 
@@ -81,7 +82,7 @@ Status: **Proven** (boot proof and control, QEMU), **By design** (no proof), **O
 
 1. **T4** (the windows above), **T5 and T6.** Today confinement can be absent exactly when firmware or bring-up misbehaves, and is always absent before translation turns on.
 2. **T8 and T9.** The per-device isolation claim is unproven on any machine with a PCIe switch.
-3. **T14.** RMRR identity maps, or USB and integrated graphics will not work.
+3. **T14.** Identity maps exist for attached devices (TASKS item 40, 2026-11-12), so a USB or integrated-graphics driver can attach a device that needs one. Still open: firmware-owned devices with no driver, which I12 stops at enumeration. Their exceptions are a hardware-qualification decision (R1 (b)).
 4. **T23.** Blocked attacks should at least be logged.
 
 Before external devices are supported: T8, T9, and §32's external-device authorization (sheet item 9). Before third-party drivers: a capability-checked DMA interface, under its own ADR and threat model.

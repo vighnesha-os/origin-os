@@ -280,6 +280,18 @@ Each boot failed (`cargo xtask boot-test` exit 1), and each by the proof the edi
 
 Both boots failed (`cargo xtask boot-test` exit 1), each by the line it was aimed at. The generator's own control, a decoder that keeps 32 bits caught by the system-call API checks on the host, is `a_handle_cut_to_32_bits_fails_the_syscall_checks` in `developer-tools/oidl/tests/generated.rs`. Logs: the interface session's scratchpad, not kept in the repository.
 
+**Controls of the identity maps for firmware-reserved memory (ADR-0007 questions 4 and 8; TASKS item 40; 2026-11-12, QEMU 11.1.3 TCG, 2 processors):** temporary edits on `claude/rmrr-ivmd-maps` at `9a9c62f`, each booted once in the `kernel boot` scenario of the reserved-memory machine (`ORIGIN_QEMU_RESERVED=on`, `ORIGIN_BOOT_TEST_ONLY="kernel boot"`), under the IOMMU named, then put back with `git checkout` and the tree checked clean:
+
+| # | Edit | Result |
+|---|---|---|
+| RM-1 | The identity maps are not made, in either driver (`iommu.rs`, `iommu/amd.rs`) | VT-d and AMD-Vi alike: `reserved memory proof: page … maps to itself: false; the controller's write … landed there: false; its read … carried what the page holds: false; …; consistent false: IOMMU failed` |
+| RM-2 | VT-d maps each reserved page one page off (`iommu.rs`) | `… maps to itself: false; … landed there: false; … carried what the page holds: false; …: IOMMU failed` |
+| RM-3 | `reserved::check` skips the memory-map rule | The range in loader-data pages is reported identity-mapped; `first missing marker "; for 00:1f.6): refused (the memory map does not call 0x"` |
+| RM-4 | An IVMD's read-only range is mapped read and write (`reserved::from_ivmd`), AMD-Vi | Bring-up reports the read-only IVMD as `read and write`; `first missing marker ", flags 0b0011; for DeviceID 0x0010 (00:02.0) in segment 0): identity-mapped, read only, "`. The kernel's own proof passes here, because it takes the access it expects from the same decoding the edit changed; only xtask's markers and its whole-log check, which ask for one read-only page and know the flags planted, catch it |
+| RM-5 | The application plants nothing: the XSDT keeps QEMU's DMAR (`tests/emulator/reserved-memory/src/main.rs`) | `first missing marker "origin-kernel: IOMMU: reserved memory 0x"`: with QEMU's own table the kernel has nothing to map, and the proof shows nothing |
+
+Each boot failed (`cargo xtask boot-test` exit 1), each by the line it was aimed at. Logs: the session's scratchpad, not kept in the repository.
+
 **The legacy-free machine (`boot-legacy-free`, in `boot-matrix`):** `-machine pit=off,i8042=off` boots the whole kernel. Before F3 it read the absent port 61h as 0xFF and reported `calibrated against the PIT: 0 kHz`, and failed. After, it calibrates against the ACPI PM timer (agreeing with one RTC second to 0.006 %), reports that it cannot prove the two PIT-based I/O APIC proofs, that the FADT says it has no 8042, and `boot verdict: 50 of 50 proofs passed`.
 
 **Real processors:** research ledger §3 (CI through KVM).

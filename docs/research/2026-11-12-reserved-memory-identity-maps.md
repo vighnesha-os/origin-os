@@ -47,7 +47,7 @@ What the specification leaves to software: when the maps are made, what to do wi
 
 ## 5. Questions put to the coordinating session (2026-11-12)
 
-The ADR leaves these open. Each was sent with a recommendation (notes folder, `2026-11-12-reserved-memory-maps-proposals.md`); the answers go in ADR-0007 and the decision sheet.
+The ADR leaves these open. Each was sent with a recommendation (notes folder, `2026-11-12-reserved-memory-maps-proposals.md`). The coordinating session numbered them decision items 247 to 251 (R n is item 246 + n) and put them to the owner on 2026-11-12; not answered when this was written. The answers go in ADR-0007 and the decision sheet.
 
 | | Question | Recommended |
 |---|---|---|
