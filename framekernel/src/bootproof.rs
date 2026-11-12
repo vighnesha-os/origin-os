@@ -110,6 +110,7 @@ proofs! {
     AddressSpaces "live address spaces" => Refuse;
     Identity "a message's writer" => Refuse;
     Launch "process start" => Refuse;
+    RustProgram "a Rust program in ring 3" => Refuse;
     Directory "the service directory" => Refuse;
     Memory "memory objects" => Refuse;
     EventsPorts "events and ports" => Refuse;
@@ -237,7 +238,7 @@ mod tests {
 
     /// Every proof whose failure stops the boot (ADR-0013 R1). Changing this list changes
     /// what a real machine does: change the ADR with it.
-    const REFUSING: [Proof; 24] = [
+    const REFUSING: [Proof; 25] = [
         Proof::PageTables,
         Proof::FrameAllocator,
         Proof::Heap,
@@ -257,6 +258,7 @@ mod tests {
         Proof::AddressSpaces,
         Proof::Identity,
         Proof::Launch,
+        Proof::RustProgram,
         Proof::Directory,
         Proof::Memory,
         Proof::EventsPorts,
@@ -297,7 +299,7 @@ mod tests {
 
     #[test]
     fn the_table_has_one_row_per_proof_in_order() {
-        assert_eq!(Proof::ALL.len(), 63);
+        assert_eq!(Proof::ALL.len(), 64);
         for (i, &proof) in Proof::ALL.iter().enumerate() {
             assert_eq!(proof as usize, i, "{proof:?} is out of order");
             assert!(!proof.name().is_empty(), "{proof:?} has no name");
@@ -340,19 +342,22 @@ mod tests {
 
     #[test]
     fn a_machine_with_no_generator_reaches_a_verdict_that_names_it() {
-        // ADR-0016 R8: the boot goes on, the two proofs that launch a process and the one that
-        // maps memory objects at addresses chosen at random do not run, and the verdict names
-        // the generator.
+        // ADR-0016 R8: the boot goes on, the three proofs that launch a process and the one
+        // that maps memory objects at addresses chosen at random do not run, and the verdict
+        // names the generator.
         let mut tally = Tally::new();
         for &proof in Proof::ALL {
-            if !matches!(proof, Proof::Launch | Proof::Directory | Proof::Memory) {
+            if !matches!(
+                proof,
+                Proof::Launch | Proof::RustProgram | Proof::Directory | Proof::Memory
+            ) {
                 tally.record(proof, proof != Proof::Random);
             }
         }
         assert!(!tally.must_stop());
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 59 of 60 proofs passed; 3 did not run; failed: random-number generator (no randomness)\n"
+            "origin-kernel: boot verdict: degraded: 59 of 60 proofs passed; 4 did not run; failed: random-number generator (no randomness)\n"
         );
     }
 
@@ -403,7 +408,7 @@ mod tests {
     fn the_verdict_of_a_clean_boot_is_exact() {
         assert_eq!(
             verdict(passed_all()),
-            "origin-kernel: boot verdict: 63 of 63 proofs passed\n"
+            "origin-kernel: boot verdict: 64 of 64 proofs passed\n"
         );
     }
 
@@ -415,7 +420,7 @@ mod tests {
         tally.record(Proof::Nvme, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 60 of 63 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
+            "origin-kernel: boot verdict: degraded: 61 of 64 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
         );
     }
 
@@ -426,7 +431,7 @@ mod tests {
         tally.record(Proof::PageTables, true);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 61 did not run\n"
+            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 62 did not run\n"
         );
     }
 
@@ -437,7 +442,7 @@ mod tests {
         tally.record(Proof::Raster, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 62 of 63 proofs passed; failed: rasterizer\n"
+            "origin-kernel: boot verdict: degraded: 63 of 64 proofs passed; failed: rasterizer\n"
         );
     }
 
