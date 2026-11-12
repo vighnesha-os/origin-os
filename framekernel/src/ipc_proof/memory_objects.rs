@@ -350,18 +350,16 @@ fn sharing(cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> Option<(Run<AMarks>
     let mut a = Program::new(limits(2, 1, PLENTY))?;
     let mut b = Program::new(limits(0, 4, PLENTY))?;
     let (a_end, b_end) = ipc::create_channel(&a.image.process.account).ok()?;
-    let to_b = Imm(u64::from(
-        a.image
-            .process
-            .grant(Object::Channel(a_end), rights::CHANNEL)
-            .ok()?,
-    ));
-    let from_a = Imm(u64::from(
-        b.image
-            .process
-            .grant(Object::Channel(b_end), rights::CHANNEL)
-            .ok()?,
-    ));
+    let to_b = Imm(a
+        .image
+        .process
+        .grant(Object::Channel(a_end), rights::CHANNEL)
+        .ok()?);
+    let from_a = Imm(b
+        .image
+        .process
+        .grant(Object::Channel(b_end), rights::CHANNEL)
+        .ok()?);
     let s = &mut a.script;
     s.call(create_object(OBJECT_2, 1, OK));
     let a_map = s.reported();
@@ -523,18 +521,16 @@ fn into_another(bsp: CpuIndex, tsc_hz: u64) -> Option<(Run<CMarks>, Run<usize>)>
     let mut t = Program::new(limits(0, 1, PLENTY))?;
     let mut c = Program::new(limits(1, 1, PLENTY))?;
     let (c_end, t_end) = ipc::create_channel(&c.image.process.account).ok()?;
-    let to_t = Imm(u64::from(
-        c.image
-            .process
-            .grant(Object::Channel(c_end), rights::CHANNEL)
-            .ok()?,
-    ));
-    let from_c = Imm(u64::from(
-        t.image
-            .process
-            .grant(Object::Channel(t_end), rights::CHANNEL)
-            .ok()?,
-    ));
+    let to_t = Imm(c
+        .image
+        .process
+        .grant(Object::Channel(c_end), rights::CHANNEL)
+        .ok()?);
+    let from_c = Imm(t
+        .image
+        .process
+        .grant(Object::Channel(t_end), rights::CHANNEL)
+        .ok()?);
     let s = &mut t.script;
     s.call(readable(from_c));
     s.call(read("", from_c, RBUF, 16, OK));
@@ -560,7 +556,7 @@ fn into_another(bsp: CpuIndex, tsc_hz: u64) -> Option<(Run<CMarks>, Run<usize>)>
             rights::PROCESS & !rights::WRITE,
         )
         .ok()?;
-    let (strong, weak) = (Imm(u64::from(strong)), Imm(u64::from(weak)));
+    let (strong, weak) = (Imm(strong), Imm(weak));
     let denied = Error::AccessDenied.raw();
     let s = &mut c.script;
     s.call(create_object(OBJECT_1, 1, OK));
@@ -598,12 +594,11 @@ fn hostile_loop(bsp: CpuIndex, tsc_hz: u64) -> Option<Run<HMarks>> {
     let mut hp = Program::new(limits(1, 1, HOSTILE))?;
     let holder = Process::new(LIMITS, (CODE, CODE + PAGE), 0)?;
     let (h_end, holder_end) = ipc::create_channel(&holder.account).ok()?;
-    let from_kernel = Imm(u64::from(
-        hp.image
-            .process
-            .grant(Object::Channel(h_end), rights::CHANNEL)
-            .ok()?,
-    ));
+    let from_kernel = Imm(hp
+        .image
+        .process
+        .grant(Object::Channel(h_end), rights::CHANNEL)
+        .ok()?);
     let go = holder
         .grant(Object::Channel(holder_end), rights::CHANNEL)
         .ok()?;

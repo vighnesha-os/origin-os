@@ -33,8 +33,8 @@ use core::sync::atomic::Ordering;
 use crate::paging::{Access, PAGE};
 use origin_abi::limits::{DEADLINE_INFINITE, MAX_MESSAGE_BYTES};
 use origin_abi::{
-    Error, OK, ObjectType, read_sizes, received_handle, rights, signals, start, status_name,
-    syscall as sys,
+    Error, Handle, OK, ObjectType, read_sizes, received_handle, rights, signals, start,
+    status_name, syscall as sys,
 };
 
 use origin_frame::objref::ObjectRef;
@@ -43,7 +43,7 @@ use origin_frame::userspace::{self, UserFrame};
 
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex};
-use crate::handles::Need;
+use crate::handles::{GENERATION_BITS, Need};
 use crate::ipc::{self, Object};
 use crate::launch::{self, Given};
 use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, MemoryLimits, ObjectLimits, Process};
@@ -64,10 +64,17 @@ const BIG_PAGES: u64 = 16;
 /// The stack of thread 1: one page, with no neighbour mapped below it (thread 0's is `STACK`).
 const STACK_1: u64 = 0x60_2000;
 
-/// In the scratch memory: each process's handles, one `u32` per slot.
+/// In the scratch memory: each process's handles, one `u64` per slot (ADR-0005 Amendment 6,
+/// E1), for [`SLOTS`] slots, in an area of their own at [`SLOT_AREA`]. (Until task S4-0 the
+/// slots were `u32`s at `DATA`; the ping-pong programs still take their handle and round count
+/// at `DATA` and their buffers at the offsets below, which are therefore unchanged.)
 const fn slot_addr(i: u64) -> u64 {
-    DATA + 4 * i
+    SLOT_AREA + 8 * i
 }
+/// Where the handle slots are.
+const SLOT_AREA: u64 = DATA + 0x3000;
+/// How many handle slots there are.
+const SLOTS: u64 = 64;
 /// The bytes every test message carries.
 const MSG: u64 = DATA + 0x100;
 /// Where messages are read to.
@@ -79,11 +86,21 @@ const OBS: u64 = DATA + 0x240;
 const SIZES: u64 = DATA + 0x248;
 /// A sizes structure too small for the kernel to use.
 const BAD_SIZES: u64 = DATA + 0x260;
-/// A handle list to send.
+/// A handle list to send: a `u64` per handle, room for sixteen.
 const LIST: u64 = DATA + 0x300;
 /// Handles received: a `received_handle` record each (ADR-0005 B3), so the first handle's
-/// value is the `u32` here.
+/// value is the `u64` here.
 const RECV: u64 = DATA + 0x400;
+
+// The slots lie inside the scratch memory, in one page, above everything else the proofs place
+// there (the hostile memory proof's area ends at `DATA + 0x2900`); and the list ends before the
+// records.
+const _: () = assert!(
+    SLOT_AREA >= DATA + 0x2900
+        && slot_addr(SLOTS) <= DATA + DATA_PAGES * PAGE
+        && SLOT_AREA / PAGE == (slot_addr(SLOTS) - 1) / PAGE
+        && LIST + 16 * 8 <= RECV
+);
 
 /// A test message.
 const TEXT: &[u8; 16] = b"origin ipc proof";
@@ -95,7 +112,7 @@ const TEXT: &[u8; 16] = b"origin ipc proof";
 enum Arg {
     /// This value.
     Imm(u64),
-    /// The `u32` at this address, loaded by the interpreter when the call runs.
+    /// The handle, a `u64`, at this address, loaded by the interpreter when the call runs.
     Handle(u64),
 }
 use Arg::{Handle as Hd, Imm};
@@ -229,9 +246,21 @@ const fn copy32(from: u64, to: u64) -> Step {
     }
 }
 
+/// Copies the handle at `from` to `to`, all 64 bits of it (ADR-0005 Amendment 6, E1), in
+/// ring 3, reporting nothing.
+const fn copy_handle(from: u64, to: u64) -> Step {
+    Step {
+        name: "",
+        number: PSEUDO_MOV64,
+        args: [Imm(from), Imm(to), Imm(0), Imm(0), Imm(0), Imm(0)],
+        want: Want::Nothing,
+    }
+}
+
 const PSEUDO_MOV32: u64 = -2i64 as u64;
 const PSEUDO_REPORT32: u64 = -3i64 as u64;
 const PSEUDO_FAULT: u64 = -4i64 as u64;
+const PSEUDO_MOV64: u64 = -5i64 as u64;
 
 /// Executes `ud2`: a #UD ends the thread.
 const fn fault() -> Step {
@@ -554,7 +583,7 @@ fn ping_pong(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) 
         return false;
     };
     // The kernel told each process its handle through its data page.
-    let told = write_param(&ping, 0, u64::from(ha)) && write_param(&pong, 0, u64::from(hb));
+    let told = write_param(&ping, 0, ha) && write_param(&pong, 0, hb);
     let wakes_before = ipc::cross_cpu_wakes();
     let start = cpu::rdtsc();
     if !told
@@ -613,7 +642,7 @@ fn write_param(process: &Process, offset: usize, value: u64) -> bool {
 
 /// The hostile script. `kernel` is an address of kernel data; `foreign` a handle value that
 /// is live in another process's table, and not in this one's.
-fn hostile_groups(kernel: u64, foreign: u64) -> Vec<Group> {
+fn hostile_groups(kernel: u64, foreign: Handle) -> Vec<Group> {
     const UNMAPPED: u64 = 0x0000_2000_0000_0000;
     const TOP_PAGE: u64 = 0x0000_7FFF_FFFF_F000;
     let fault = Error::Fault.raw();
@@ -666,7 +695,7 @@ fn hostile_groups(kernel: u64, foreign: u64) -> Vec<Group> {
                 read("read without READ", h(7), RBUF, 16, denied),
                 wait("wait without WAIT", h(7), signals::READABLE, 0, denied),
                 dup("duplicate without DUPLICATE", h(8), rights::READ, 9, denied),
-                copy32(slot_addr(6), LIST),
+                copy_handle(slot_addr(6), LIST),
                 send("send without TRANSFER", a, 1, denied),
             ],
         },
@@ -879,7 +908,7 @@ fn hostile_groups(kernel: u64, foreign: u64) -> Vec<Group> {
             steps: alloc::vec![
                 create(16),
                 create(18),
-                copy32(slot_addr(18), LIST),
+                copy_handle(slot_addr(18), LIST),
                 send("send", h(16), 1, OK),
                 write("the sender's handle is gone", h(18), MSG, 4, bad),
                 read_handles("received", h(17), OK),
@@ -904,26 +933,26 @@ fn hostile_groups(kernel: u64, foreign: u64) -> Vec<Group> {
         Group {
             title: "transfers that would break the graph",
             steps: alloc::vec![
-                copy32(slot_addr(16), LIST),
+                copy_handle(slot_addr(16), LIST),
                 send("an end through its own channel", h(16), 1, invalid),
-                copy32(slot_addr(17), LIST),
+                copy_handle(slot_addr(17), LIST),
                 send("the peer end through its own channel", h(16), 1, invalid),
                 create(22),
                 create(24),
-                copy32(slot_addr(19), LIST),
-                copy32(slot_addr(19), LIST + 4),
+                copy_handle(slot_addr(19), LIST),
+                copy_handle(slot_addr(19), LIST + 8),
                 send("the same handle twice", h(16), 2, invalid),
                 dup("", h(19), full, 21, OK),
-                copy32(slot_addr(19), LIST),
+                copy_handle(slot_addr(19), LIST),
                 send("an end with another handle", h(16), 1, invalid),
                 close("", h(21), OK),
                 send("that end, alone again", h(16), 1, OK),
                 read_handles("", h(17), OK),
-                copy32(slot_addr(24), LIST),
+                copy_handle(slot_addr(24), LIST),
                 send("into the first channel", h(23), 1, OK),
-                copy32(slot_addr(22), LIST),
+                copy_handle(slot_addr(22), LIST),
                 send("a cycle through two queues", h(25), 1, invalid),
-                copy32(slot_addr(0), LIST),
+                copy_handle(slot_addr(0), LIST),
                 send("a stale handle in the list", h(16), 1, bad),
             ],
         },
@@ -1258,14 +1287,14 @@ fn hostile(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     drop(end);
 
     let kernel = core::ptr::from_ref(&ROUNDS_MARKER).addr() as u64;
-    let groups = hostile_groups(kernel, u64::from(foreign));
+    let Some(mut image) = Image::new(LIMITS, proof_programs::script()) else {
+        return false;
+    };
+    let groups = hostile_groups(kernel, foreign);
     let steps: Vec<Step> = groups
         .iter()
         .flat_map(|g| g.steps.iter().copied())
         .collect();
-    let Some(mut image) = Image::new(LIMITS, proof_programs::script()) else {
-        return false;
-    };
     if image.scratch().is_none() || image.script(&steps).is_none() {
         return false;
     }
@@ -1281,7 +1310,7 @@ fn hostile(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let exit_ok = process.ending() == Some(Ending::Exited(0));
     // The process lived through all of it and ended by its own exit; the other process's
     // handle was never reachable from it.
-    let right = ended && groups_ok && exit_ok && foreign & 0xFFFF == 41;
+    let right = ended && groups_ok && exit_ok && foreign >> GENERATION_BITS == 41;
     let _ = writeln!(
         com1,
         "origin-kernel: ipc: every hostile call returned its status and the process exited by itself ({} calls); user-copy faults recovered: {}{}",
@@ -1389,7 +1418,7 @@ fn exit_closes(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64
         ) else {
             return false;
         };
-        let held = Imm(u64::from(hb));
+        let held = Imm(hb);
         let waiter_steps = alloc::vec![
             wait(
                 "woken",
@@ -1475,7 +1504,7 @@ fn cancel(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> 
     ) else {
         return false;
     };
-    let waited = Imm(u64::from(ha));
+    let waited = Imm(ha);
     let first = alloc::vec![wait(
         "the waiter",
         waited,
@@ -1608,7 +1637,7 @@ fn byte_quota(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64)
     ) else {
         return false;
     };
-    let (held_w, held_p) = (Imm(u64::from(ha)), Imm(u64::from(hb)));
+    let (held_w, held_p) = (Imm(ha), Imm(hb));
     let writer_steps = alloc::vec![
         write("the first", held_w, MSG, 17, OK),
         write("the second", held_w, MSG, 17, OK),
@@ -1699,15 +1728,15 @@ fn transfer_depth(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     }
     // Links 1 to `depth`: the peer end of channel i goes into channel i + 1.
     for channel in 0..depth {
-        steps.push(copy32(slot_addr(2 * channel + 1), LIST));
+        steps.push(copy_handle(slot_addr(2 * channel + 1), LIST));
         steps.push(send("", h(2 * channel + 2), 1, OK));
     }
-    steps.push(copy32(slot_addr(2 * extra), LIST));
+    steps.push(copy_handle(slot_addr(2 * extra), LIST));
     steps.push(send("nested to the limit", h(0), 1, OK));
     // One more link, and a transfer that would have to walk it is refused.
-    steps.push(copy32(slot_addr(2 * depth + 1), LIST));
+    steps.push(copy_handle(slot_addr(2 * depth + 1), LIST));
     steps.push(send("", h(2 * depth + 2), 1, OK));
-    steps.push(copy32(slot_addr(2 * extra + 1), LIST));
+    steps.push(copy_handle(slot_addr(2 * extra + 1), LIST));
     steps.push(send("a link deeper", h(0), 1, Error::Limit.raw()));
     let group = [Group {
         title: "transfers into nested ends",
@@ -2014,10 +2043,11 @@ const SECOND_SCRIPT: u64 = SCRIPT + SCRIPT_PAGES * PAGE / 2;
 
 /// Writes handle slot `k` of a process that has already started, before the thread that reads
 /// that slot does.
-fn write_slot(process: &Process, k: u64, value: u32) -> bool {
+fn write_slot(process: &Process, k: u64, value: Handle) -> bool {
+    let at = slot_addr(k);
     process
-        .frame_of(DATA)
-        .is_some_and(|f| process.write_frame(f, 4 * k as usize, &value.to_le_bytes()))
+        .frame_of(at - at % PAGE)
+        .is_some_and(|f| process.write_frame(f, (at % PAGE) as usize, &value.to_le_bytes()))
 }
 
 /// Handles name objects of a type, and each call asks for a type: a process or a thread is not a
@@ -2046,7 +2076,7 @@ fn object_types(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     // The target stays alive for as long as the prober holds the other end.
     let target_steps = alloc::vec![wait(
         "",
-        Imm(u64::from(held_t)),
+        Imm(held_t),
         signals::PEER_CLOSED,
         DEADLINE_INFINITE,
         OK
@@ -2072,11 +2102,7 @@ fn object_types(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let (Ok(process_handle), Ok(read_only), Ok(thread_handle)) = granted else {
         return false;
     };
-    let (p, weak, t) = (
-        Imm(u64::from(process_handle)),
-        Imm(u64::from(read_only)),
-        Imm(u64::from(thread_handle)),
-    );
+    let (p, weak, t) = (Imm(process_handle), Imm(read_only), Imm(thread_handle));
     let wrong = Error::WrongType.raw();
     let denied = Error::AccessDenied.raw();
     let timed_out = Error::TimedOut.raw();
@@ -2096,7 +2122,7 @@ fn object_types(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
             dup("", p, rights::WAIT | rights::TRANSFER, 8, OK),
             wait("a duplicate waits", h(8), ended, 0, timed_out),
             dup("and cannot duplicate", h(8), rights::WAIT, 9, denied),
-            copy32(slot_addr(8), LIST),
+            copy_handle(slot_addr(8), LIST),
             send("a process handle travels", h(20), 1, OK),
             wait(
                 "the sender's is gone",
@@ -2152,7 +2178,7 @@ fn process_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_
         else {
             return false;
         };
-        let held = Imm(u64::from(held));
+        let held = Imm(held);
         let ended = signals::TERMINATED;
         let waiter_steps = alloc::vec![
             wait("woken", held, ended, DEADLINE_INFINITE, OK),
@@ -2220,13 +2246,7 @@ fn thread_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_h
     // Slot 3 holds the handle to the other thread: it exists only once that thread has started.
     let other = h(3);
     let ended = signals::TERMINATED;
-    let joined_thread = alloc::vec![wait(
-        "",
-        Imm(u64::from(hb)),
-        signals::READABLE,
-        DEADLINE_INFINITE,
-        OK
-    )];
+    let joined_thread = alloc::vec![wait("", Imm(hb), signals::READABLE, DEADLINE_INFINITE, OK)];
     let joiner = alloc::vec![
         wait(
             "a thread still running",
@@ -2235,7 +2255,7 @@ fn thread_terminated(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_h
             0,
             Error::TimedOut.raw()
         ),
-        write("", Imm(u64::from(ha)), MSG, 8, OK),
+        write("", Imm(ha), MSG, 8, OK),
         wait("joined", other, ended, DEADLINE_INFINITE, OK),
         value_at("observed", OBS, u64::from(ended)),
         wait("and it stays raised", other, ended, 0, OK),
@@ -2298,7 +2318,7 @@ fn memory_goes_with_the_last_thread(
     // The first thread stays until the kernel drops the far end; the second exits at once.
     let stays = alloc::vec![wait(
         "",
-        Imm(u64::from(held)),
+        Imm(held),
         signals::PEER_CLOSED,
         DEADLINE_INFINITE,
         OK
@@ -2402,7 +2422,7 @@ fn cancel_on_any_object(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, ts
         ) else {
             return false;
         };
-        let waited = Imm(u64::from(held));
+        let waited = Imm(held);
         let first = alloc::vec![wait(
             "",
             waited,
@@ -2414,7 +2434,7 @@ fn cancel_on_any_object(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, ts
             if image.write(LIST, &held.to_le_bytes()).is_none() {
                 return false;
             }
-            alloc::vec![send("", Imm(u64::from(carrier)), 1, OK)]
+            alloc::vec![send("", Imm(carrier), 1, OK)]
         } else {
             alloc::vec![close("", waited, OK)]
         };
@@ -2564,14 +2584,7 @@ fn writer_identity(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz:
     };
     // A's end of X goes in its list to send.
     let moved = ax.to_le_bytes();
-    let (ax, ay, by, bz, rx, rz) = (
-        Imm(u64::from(ax)),
-        Imm(u64::from(ay)),
-        Imm(u64::from(by)),
-        Imm(u64::from(bz)),
-        Imm(u64::from(rx)),
-        Imm(u64::from(rz)),
-    );
+    let (ax, ay, by, bz, rx, rz) = (Imm(ax), Imm(ay), Imm(by), Imm(bz), Imm(rx), Imm(rz));
     let a_steps = alloc::vec![
         write("", ax, MSG, FIRST_LEN, OK),
         // The end the first message was written on goes to B.

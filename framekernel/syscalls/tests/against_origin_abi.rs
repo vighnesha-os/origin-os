@@ -143,6 +143,53 @@ fn the_start_record_is_the_same() {
         assert_eq!(ours, theirs);
     }
     assert_eq!(generated::START_MAX_HANDLES as usize, start::MAX_HANDLES);
+    // ADR-0005 Amendment 6, E1 (task S4-0): an entry is 24 bytes, a 64-bit handle first and four
+    // bytes of padding last.
+    assert_eq!(
+        (start::ENTRY, Entry::HANDLE_AT, Entry::ROLE_AT),
+        (24, 0, 16)
+    );
+    // An entry as origin-abi's codec writes it is the entry the generated decoder reads, all 64
+    // bits of its handle included; the generated decoder refuses a padding byte that is not zero,
+    // as origin-abi's does.
+    let entry = start::Entry {
+        handle: 0xFEDC_BA98_7654_3210,
+        object_type: origin_abi::ObjectType::Channel as u32,
+        rights: origin_abi::rights::CHANNEL,
+        role: role::BOOTSTRAP,
+    };
+    let mut record = [0u8; 128];
+    let size = start::encode(&[entry], &[], &[], &mut record).expect("encode");
+    assert_eq!(size, start::HEADER + start::ENTRY);
+    let bytes = &record[start::HEADER..size];
+    let read = <Entry as rt::Fixed>::read(bytes, u16::MAX).expect("generated decode");
+    assert_eq!(read.handle, entry.handle);
+    assert_eq!(read.object_type.raw(), entry.object_type);
+    assert_eq!(read.rights.bits(), entry.rights);
+    assert_eq!(read.role.raw(), entry.role);
+    let mut written = [0xAAu8; 24];
+    <Entry as rt::Fixed>::write(read, &mut written).expect("generated encode");
+    assert_eq!(
+        &written[..],
+        bytes,
+        "the generated encoder writes the same bytes"
+    );
+    for byte in 20..24 {
+        let mut padded = [0u8; 24];
+        padded.copy_from_slice(bytes);
+        padded[byte] = 1;
+        assert_eq!(
+            <Entry as rt::Fixed>::read(&padded, u16::MAX).map(|_| ()),
+            Err(rt::WireError::Padding),
+            "byte {byte}"
+        );
+        let mut whole = record;
+        whole[start::HEADER + byte] = 1;
+        assert!(
+            start::decode(&whole[..size]).is_err(),
+            "origin-abi, byte {byte}"
+        );
+    }
     assert_eq!(generated::START_MAX_BYTES as usize, start::MAX_SIZE);
     // The roles (C5), with 4 retired, and the rights of a process and a thread (C6).
     assert_eq!(generated::StartRole::Bootstrap.raw(), role::BOOTSTRAP);
@@ -198,7 +245,26 @@ fn the_limits_layouts_and_version_are_the_same() {
         generated::ReadSizes::SENDER_PRINCIPAL_AT,
         origin_abi::read_sizes::SENDER_PRINCIPAL_AT
     );
-    // The record `channel_read` writes for each handle (ADR-0005 B3).
+    // The record `channel_read` writes for each handle (ADR-0005 B3): 16 bytes since E1, the
+    // handle a `u64` first (task S4-0).
+    assert_eq!(origin_abi::received_handle::SIZE, 16);
+    assert_eq!(generated::ReceivedHandle::OBJECT_TYPE_AT, 8);
+    let record = generated::ReceivedHandle {
+        handle: 0x0123_4567_89AB_CDEF,
+        object_type: generated::ObjectType::Port,
+        rights: generated::PORT_RIGHTS,
+    };
+    let mut bytes = [0u8; 16];
+    <generated::ReceivedHandle as rt::Fixed>::write(record, &mut bytes).expect("encode");
+    let at = origin_abi::received_handle::HANDLE_AT;
+    assert_eq!(
+        u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes")),
+        0x0123_4567_89AB_CDEF
+    );
+    assert_eq!(
+        <generated::ReceivedHandle as rt::Fixed>::read(&bytes, u16::MAX).expect("decode"),
+        record
+    );
     assert_eq!(
         <generated::ReceivedHandle as rt::Fixed>::SIZE,
         origin_abi::received_handle::SIZE
