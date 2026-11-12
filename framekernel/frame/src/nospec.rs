@@ -301,7 +301,15 @@ mod tests {
 
     #[test]
     fn a_user_address_passes_and_any_other_is_zero_under_the_mask() {
-        for address in [USER_START, 0x40_0000, USER_END - 1] {
+        // `USER_END - PAGE` is the largest page a check lets through: the last a walk of a
+        // program's tables visits (`UserSpace::checked`) and the last a mapping call starts at
+        // (`map_shared_run`, `unmap`, `protect`). Those four clamps change nothing there.
+        for address in [
+            USER_START,
+            0x40_0000,
+            USER_END - origin_paging::PAGE,
+            USER_END - 1,
+        ] {
             for form in FORMS {
                 assert_eq!(user_address_in(form, address), address, "{form:?}");
             }

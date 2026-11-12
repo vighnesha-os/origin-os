@@ -1,0 +1,80 @@
+# Requirements matrix: PART XVI, Testing and formal verification
+
+One row for each statement of CLAUDE.md in §72 to §76. The columns and their rules are in [README.md](README.md), and `cargo xtask requirements-gate` holds this file to them and to the directive.
+
+| ID | Requirement | Kind | Scope | Owner | State | Implementation | Acceptance | Evidence | Env | Review | Limitations | Decided by |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| S72-01 | Use: Unit testing. | build | eng/host | 24 | built | developer-tools/xtask/src/main.rs | Every crate has unit tests, and `cargo xtask check` and CI run them on each crate's own target. | xtask:check | host | none | Run by `cargo xtask check` and by CI. Nothing measures what the tests cover. | - |
+| S72-02 | Use: Integration testing. | build | eng/emu | 24 | built | developer-tools/xtask/src/main.rs, framekernel/src/bootproof.rs | The parts that exist are tested together through their real entry points in every CI run. | xtask:boot-matrix | virt | none | Boot tests run the loader, the kernel, its drivers and programs in ring 3 together. No test crosses a service boundary outside the kernel yet. | - |
+| S72-03 | Use: Property-based testing. | build | eng/host | 24 | partial | framekernel/frame/src/testing.rs, runtime/onbf/format/src/tests_soak_image.rs | Every parser of firmware, device or file data has a test that feeds it damaged input and finds no panic, no read out of bounds and no broken invariant. | xtask:check, file:runtime/onbf/format/src/tests_soak_image.rs | host | agent | Seeded mutation soaks and model tests check invariants over generated inputs. No property-testing framework with shrinking. | - |
+| S72-04 | Use: Model-based testing. | build | eng/host | 24 | built | framekernel/src/editbuffer.rs, framekernel/src/ring.rs | Each data structure with a simple model is tested against it over long generated runs. | file:framekernel/src/editbuffer.rs, file:framekernel/src/ring.rs | host | none | The gap buffer, the ring buffer and the bit allocator are tested against models. Nothing says which structures must be. | - |
+| S72-05 | Use: Fuzzing. | build | eng/host | 24 | partial | framekernel/frame/src/testing.rs, runtime/onbf/format/src/tests_soak_image.rs | Every parser of firmware, device or file data has a test that feeds it damaged input and finds no panic, no read out of bounds and no broken invariant. | xtask:check, file:runtime/onbf/format/src/tests_soak_image.rs | host | agent | Seeded mutation soaks of every parser. No coverage-guided fuzzer. | - |
+| S72-06 | Use: Concurrency testing. | build | eng/host | 24 | built | framekernel/frame/sync, developer-tools/xtask/src/loom.rs | Each synchronization primitive the kernel uses is model-checked under Loom, with negative controls that fail. | xtask:loom | host | agent | Covers the spin lock, the reader-writer lock, the wait queue, the run queue and the shootdown protocol, within each model's bounds. A later primitive needs its own models. | - |
+| S72-07 | Use: Fault injection. | build | eng/emu | 24 | partial | developer-tools/xtask/src/loom.rs, framekernel/src/bootproof.rs | Device, memory and timing faults are injected while the system runs, and each has a test of what happens. | xtask:loom, xtask:boot-test | virt | none | Negative controls plant faults in scratch copies of the source, and each fails its proof. No fault is injected into a running device or into memory. | - |
+| S72-08 | Use: Kernel boot testing. | build | eng/emu | 24 | done | developer-tools/xtask/src/main.rs, framekernel/src/bootproof.rs, .github/workflows/ci.yml | Every change boots under QEMU in CI, on its software processor and under KVM, and each boot proof's markers are checked. | xtask:boot-test, xtask:boot-matrix, file:.github/workflows/ci.yml | virt | none | - | - |
+| S72-09 | Use: Hardware testing. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S72-10 | Use: Performance testing. | build | eng/host | 24 | not-started | - | - | - | - | none | - | - |
+| S72-11 | Use: Security testing. | build | eng/emu | 24 | partial | framekernel/src/ipc_proof.rs, framekernel/frame/src/proof_programs.rs | Every protection in a threat model has a test that the forbidden thing is refused. | proof:IPC and handles, proof:ring-3 isolation | virt | agent | A hostile program's bad system calls and forbidden accesses are refused on every boot. The tests are not mapped to the threat models' rows. | - |
+| S72-12 | Use: Upgrade testing. | build | eng/host | 24 | not-started | - | - | - | - | none | - | - |
+| S72-13 | Use: Recovery testing. | build | eng/host | 24 | not-started | - | - | - | - | none | - | - |
+| S72-14 | Use: GUI testing. | build | eng/host | 24 | not-started | - | - | - | - | none | - | - |
+| S72-15 | Use: Accessibility testing. | build | eng/host | 24 | not-started | - | - | - | - | none | - | - |
+| S72-16 | Use: Long-duration reliability testing. | build | eng/host | 24 | not-started | - | - | - | - | none | - | - |
+| S73-01 | Use Loom for suitable concurrency models. | build | eng/host | 24 | built | framekernel/frame/sync, developer-tools/xtask/src/loom.rs | Each synchronization primitive the kernel uses is model-checked under Loom, with negative controls that fail. | xtask:loom | host | agent | Covers the spin lock, the reader-writer lock, the wait queue, the run queue and the shootdown protocol, within each model's bounds. A later primitive needs its own models. | 20, 31 |
+| S73-02 | Use Kani for suitable bounded correctness properties. | build | eng/host | 24 | not-started | - | - | - | - | none | - | - |
+| S73-03 | Evaluate Verus for selected high-assurance modules. | build | eng/host | 24 | not-started | - | - | - | - | none | - | - |
+| S73-04 | Priority areas: Memory allocator invariants. | build | eng/host | 24 | not-started | - | - | - | - | none | - | - |
+| S73-05 | Priority areas: Object lifetime. | build | eng/host | 24 | built | framekernel/frame/sync, developer-tools/xtask/src/loom.rs | Each synchronization primitive the kernel uses is model-checked under Loom, with negative controls that fail. | xtask:loom | host | agent | Covers the spin lock, the reader-writer lock, the wait queue, the run queue and the shootdown protocol, within each model's bounds. A later primitive needs its own models. | - |
+| S73-06 | Priority areas: Synchronization. | build | eng/host | 24 | built | framekernel/frame/sync, developer-tools/xtask/src/loom.rs | Each synchronization primitive the kernel uses is model-checked under Loom, with negative controls that fail. | xtask:loom | host | agent | Covers the spin lock, the reader-writer lock, the wait queue, the run queue and the shootdown protocol, within each model's bounds. A later primitive needs its own models. | - |
+| S73-07 | Priority areas: Capability validation. | build | eng/host | 24 | not-started | - | - | - | - | none | - | - |
+| S73-08 | Priority areas: Binary parsers. | build | eng/host | 24 | not-started | - | - | - | - | none | - | - |
+| S73-09 | Priority areas: Update state machines. | build | eng/host | 24 | not-started | - | - | - | - | none | - | - |
+| S73-10 | Priority areas: Filesystem metadata. | build | eng/host | 24 | not-started | - | - | - | - | none | - | - |
+| S73-11 | Priority areas: DMA mapping ownership. | build | eng/host | 24 | not-started | - | - | - | - | none | - | - |
+| S73-12 | State precisely what was proved and what remains unverified. | rule | eng/host | 24 | built | docs/engineering/SOURCE_PROVENANCE.md, framekernel/frame/sync/src/models.rs | Each formal result states its property, its bounds and what it leaves unproved, beside the result. | xtask:loom, file:docs/engineering/SOURCE_PROVENANCE.md | host | none | The Loom models print their bounds, and the provenance file says what is and is not proved. There is no other formal result to state. | - |
+| S74-01 | Test defined configurations covering: Multiple Intel CPU models. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-02 | Test defined configurations covering: Multiple AMD CPU models. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-03 | Test defined configurations covering: Different logical processor counts. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-04 | Test defined configurations covering: SMT enabled/disabled. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-05 | Test defined configurations covering: Hybrid scheduling. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-06 | Test defined configurations covering: NUMA configurations. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-07 | Test defined configurations covering: Different RAM capacities. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-08 | Test defined configurations covering: Multiple NVMe controllers. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-09 | Test defined configurations covering: PCIe Gen 5/6 platforms. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-10 | Test defined configurations covering: USB controllers. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-11 | Test defined configurations covering: USB4/Thunderbolt docks. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-12 | Test defined configurations covering: Supported graphics devices. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-13 | Test defined configurations covering: Network devices. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-14 | Test defined configurations covering: Audio devices. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-15 | Test defined configurations covering: Sleep/resume. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-16 | Test defined configurations covering: Power interruptions. | build | eng/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S74-17 | Test defined configurations covering: Origin Server: a KVM guest first, then physical servers on 2026-generation platforms, through the server's BMC console (ADR-0014 S3). | build | server/virt | 50 | not-started | - | - | - | - | none | - | 73 |
+| S74-18 | Do not claim physical hardware support from QEMU alone. A virtual machine is a declared scope of its own, not hardware qualification. | rule | eng/host | 24 | built | docs/requirements, developer-tools/xtask/src/requirements.rs | Every claim of completion is a row of the matrix whose evidence the gate finds, in the environment its scope asks for. | xtask:requirements-gate | host | none | Holds for the matrix's states. Reports written outside the matrix are not checked. | - |
+| S75-01 | For every release candidate: Build in a controlled environment. | build | eng/host | 25 | not-started | - | - | - | - | none | - | - |
+| S75-02 | For every release candidate: Record toolchain hashes and versions. | build | eng/host | 25 | not-started | - | - | - | - | none | - | - |
+| S75-03 | For every release candidate: Record source revision. | build | eng/host | 25 | not-started | - | - | - | - | none | - | - |
+| S75-04 | For every release candidate: Record configuration. | build | eng/host | 25 | not-started | - | - | - | - | none | - | - |
+| S75-05 | For every release candidate: Normalize nondeterministic build inputs. | build | eng/host | 25 | partial | developer-tools/xtask/src/reproducible.rs, .cargo/config.toml | Each shipped artifact, built twice from nothing on two machines, is the same bytes. | xtask:reproducible-gate | host | none | The loader, each way it is built, and the kernel are built twice on one machine in two directories and compared. The toolchain's path is still in the images, so two machines differ (TASKS item 32). | - |
+| S75-06 | For every release candidate: Rebuild independently. | build | eng/host | 25 | partial | developer-tools/xtask/src/reproducible.rs, .cargo/config.toml | Each shipped artifact, built twice from nothing on two machines, is the same bytes. | xtask:reproducible-gate | host | none | The loader, each way it is built, and the kernel are built twice on one machine in two directories and compared. The toolchain's path is still in the images, so two machines differ (TASKS item 32). | - |
+| S75-07 | For every release candidate: Compare artifacts. | build | eng/host | 25 | partial | developer-tools/xtask/src/reproducible.rs, .cargo/config.toml | Each shipped artifact, built twice from nothing on two machines, is the same bytes. | xtask:reproducible-gate | host | none | The loader, each way it is built, and the kernel are built twice on one machine in two directories and compared. The toolchain's path is still in the images, so two machines differ (TASKS item 32). | - |
+| S75-08 | For every release candidate: Investigate differences. | build | eng/host | 25 | not-started | - | - | - | - | none | - | - |
+| S75-09 | For every release candidate: Preserve provenance evidence. | build | eng/host | 25 | not-started | - | - | - | - | none | - | - |
+| S76-01 | A release may be called production-qualified only for its declared supported scope. | rule | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-02 | Require: Installation tests. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-03 | Require: Boot tests. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-04 | Require: Security reviews. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-05 | Require: Filesystem tests. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-06 | Require: Concurrency tests. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-07 | Require: Driver tests. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-08 | Require: GUI tests. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-09 | Require: Performance tests. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-10 | Require: Upgrade tests. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-11 | Require: Rollback tests. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-12 | Require: Recovery tests. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-13 | Require: Actual supported-hardware testing. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-14 | Require: SDK compatibility checks. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-15 | Require: Documentation. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-16 | Require: Maintenance policy. | build | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-17 | Require: Before the first public release: a trademark search for the product name. | build | both/hw | 48 | not-started | - | - | - | - | none | - | 77 |
+| S76-18 | Each edition is qualified for its own declared scope. | rule | both/hw | 24 | not-started | - | - | - | - | none | - | - |
+| S76-19 | No test count alone establishes production readiness. | rule | both/hw | 24 | not-started | - | - | - | - | none | - | - |

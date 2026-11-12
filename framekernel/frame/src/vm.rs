@@ -1,15 +1,18 @@
 //! The kernel's address space once it is live, behind a lock, so pages can be mapped or
-//! remapped later: firmware tables the kernel reads (ACPI), guard pages and the AP
-//! start-up trampoline.
+//! remapped later: firmware tables the kernel reads (ACPI), the kernel stacks in their region
+//! (`stack`, ADR-0004 Amendment 1, A2), the guard pages of the boot processor's interrupt
+//! stacks and the AP start-up trampoline.
 //!
 //! Every change that removes access is followed by a TLB shootdown (`tlb`) once the lock is
 //! released, so no processor keeps the old translation; changes that only add access need
 //! none. Kernel-half mappings are global; the identity pages of the AP trampoline are not.
+//! Nothing here splits a page of the direct map after boot.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use origin_paging::layout::{DIRECT_MAP_WINDOW, DIRECT_MAP_WINDOW_SIZE, STACK_REGION_SIZE};
 use origin_paging::{
-    Access, AddressSpace, Attributes, LARGE_PAGE, LeafCensus, MapError, PAGE, TablePool,
+    Access, AddressSpace, Attributes, LARGE_PAGE, LeafCensus, LeafSizes, MapError, PAGE, TablePool,
     Translation, kernel_half_is_complete, same_kernel_half,
 };
 
@@ -95,6 +98,32 @@ pub fn kernel_half() -> Option<&'static [u64; 256]> {
     KERNEL_HALF.get()
 }
 
+/// The direct map's leaves by size when the kernel's tables went live (`install`).
+static DIRECT_MAP_AT_BOOT: SetOnce<LeafSizes> = SetOnce::new();
+
+/// The leaves in the direct-map window of these tables, by size.
+fn direct_map_sizes(space: &AddressSpace, tables: &TablePool<'_>) -> LeafSizes {
+    space.leaf_sizes(
+        tables,
+        DIRECT_MAP_WINDOW,
+        DIRECT_MAP_WINDOW + DIRECT_MAP_WINDOW_SIZE,
+    )
+}
+
+/// The direct map's leaves by size, now and when the kernel's tables went live: the direct
+/// map's page sizes (ADR-0004 Amendment 1, A2). Firmware tables mapped since (`firmware_bytes`)
+/// add 4 KiB leaves of their own; only a split takes a 2 MiB leaf away. `None` before
+/// `install`. Walks every table of the window, with interrupts off: for proofs.
+pub fn direct_map_leaves() -> Option<(LeafSizes, LeafSizes)> {
+    let boot = *DIRECT_MAP_AT_BOOT.get()?;
+    let now = crate::cpu::without_interrupts(|| {
+        let guard = KERNEL_SPACE.lock();
+        let k = guard.as_ref()?;
+        Some(direct_map_sizes(&k.space, &k.tables))
+    })?;
+    Some((now, boot))
+}
+
 /// Whether the kernel's own tables still have the entries [`kernel_half`] gave everyone.
 pub fn kernel_half_unchanged() -> bool {
     let Some(fixed) = kernel_half() else {
@@ -126,6 +155,8 @@ pub unsafe fn install(
         // Only this call sets it, and `early` makes it once.
         let _ = KERNEL_HALF.set(half);
     }
+    // As above: set once, before anything can split a page.
+    let _ = DIRECT_MAP_AT_BOOT.set(direct_map_sizes(&space, &tables));
     crate::cpu::without_interrupts(|| {
         *KERNEL_SPACE.lock() = Some(KernelSpace {
             space,
@@ -213,25 +244,18 @@ pub unsafe fn unmap(virt: u64) -> Result<u64, MapError> {
     Ok(phys)
 }
 
-/// Turns the direct-map page `page` into a guard page: unmapped, so any access faults,
-/// on every processor once this returns. A 2 MiB leaf covering it is split first (one
-/// INVLPG in the page drops the old 2 MiB translation too).
-pub(crate) fn make_guard(page: u64) -> Result<(), MapError> {
-    unmap_guards(&[page])?;
-    crate::tlb::shootdown(page);
-    Ok(())
-}
-
-/// As [`make_guard`] for several pages, with one full TLB flush on every processor instead
-/// of one shootdown per page.
+/// Turns pages of the kernel's image into guard pages: unmapped, so any access faults, on every
+/// processor once this returns, with one full TLB flush. A 2 MiB leaf covering one is split
+/// first. Only the boot processor's interrupt stacks have guards in the image (`cpu`), since
+/// they exist before anything else; every other guard is the unmapped space below a stack in
+/// the stack region (`stack`). A page outside the image window is refused, with nothing
+/// changed: nothing splits a page of the direct map after boot (ADR-0004 Amendment 1, A2).
 pub(crate) fn make_guards(pages: &[u64]) -> Result<(), MapError> {
-    unmap_guards(pages)?;
-    crate::tlb::shootdown_all();
-    Ok(())
-}
-
-/// Splits and unmaps each page under the lock; the caller shoots down.
-fn unmap_guards(pages: &[u64]) -> Result<(), MapError> {
+    // The image window is the top of the address space: it ends where the addresses do.
+    use origin_paging::layout::KERNEL_WINDOW;
+    if let Some(&outside) = pages.iter().find(|&&page| page < KERNEL_WINDOW) {
+        return Err(MapError::NotMapped(outside));
+    }
     crate::cpu::without_interrupts(|| {
         let mut guard = KERNEL_SPACE.lock();
         let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
@@ -239,8 +263,82 @@ fn unmap_guards(pages: &[u64]) -> Result<(), MapError> {
             k.space.split_large(&mut k.tables, page)?;
             k.space.unmap(&mut k.tables, page)?;
         }
-        Ok(())
+        Ok::<(), MapError>(())
+    })?;
+    crate::tlb::shootdown_all();
+    Ok(())
+}
+
+/// Whether the `pages` pages from `virt` lie in the kernel stacks' region, wherever it was
+/// placed (`stack::region`).
+fn in_stack_region(virt: u64, pages: usize) -> bool {
+    let base = crate::stack::region().base;
+    let end = (pages as u64)
+        .checked_mul(PAGE)
+        .and_then(|bytes| virt.checked_add(bytes));
+    virt.is_multiple_of(PAGE)
+        && virt >= base
+        && end.is_some_and(|end| end <= base + STACK_REGION_SIZE)
+}
+
+/// Maps `frames` at consecutive pages from `virt` in the kernel stacks' region (`stack`):
+/// read/write, never executable, and global like the rest of the kernel half. Each frame it maps
+/// is taken out of `frames`: the tables hold it now. Returns how many it mapped, which is all of
+/// them unless the tables refused one; the region's tables are made at boot, so only a page
+/// that is mapped already can be. Outside the region nothing is mapped.
+///
+/// No shootdown: a page that was not present is in no TLB, since no processor caches a
+/// translation from an entry whose P flag is 0 (Intel SDM Vol. 3A §4.10.4.3).
+pub(crate) fn map_stack_pages(virt: u64, frames: &mut [Option<OwnedFrame>]) -> usize {
+    if !in_stack_region(virt, frames.len()) {
+        return 0;
+    }
+    crate::cpu::without_interrupts(|| {
+        let mut guard = KERNEL_SPACE.lock();
+        let Some(k) = guard.as_mut() else {
+            return 0;
+        };
+        let mut mapped = 0;
+        for (page, slot) in (0u64..).zip(frames.iter_mut()) {
+            let Some(frame) = slot.as_ref() else {
+                break;
+            };
+            let at = virt + page * PAGE;
+            let rw = Attributes::kernel_global(Access::ReadWrite);
+            if k.space
+                .map(&mut k.tables, at, frame.phys().raw(), rw)
+                .is_err()
+            {
+                break;
+            }
+            *slot = None;
+            mapped += 1;
+        }
+        mapped
     })
+}
+
+/// Takes the stack-region pages from `virt` out of the kernel's tables, one for each entry of
+/// `out`, and puts there the frames they held (`None` where nothing was mapped). Their
+/// translations may still be cached: the caller shoots down before the addresses or the frames
+/// are used again (`origin_sync::slots::Slots::reclaim`). Outside the region nothing changes.
+pub(crate) fn unmap_stack_pages(virt: u64, out: &mut [Option<OwnedFrame>]) {
+    if !in_stack_region(virt, out.len()) {
+        return;
+    }
+    crate::cpu::without_interrupts(|| {
+        let mut guard = KERNEL_SPACE.lock();
+        let Some(k) = guard.as_mut() else {
+            return;
+        };
+        for (page, slot) in (0u64..).zip(out.iter_mut()) {
+            *slot = k
+                .space
+                .unmap(&mut k.tables, virt + page * PAGE)
+                .ok()
+                .map(|phys| OwnedFrame::from_mapping(PhysAddr::new(phys)));
+        }
+    });
 }
 
 /// Where a [`KernelProbe`] maps its page: PML4 entry 480, just above the MMIO window, which
@@ -525,20 +623,6 @@ pub fn leaf_census() -> Option<LeafCensus> {
         let guard = KERNEL_SPACE.lock();
         let k = guard.as_ref()?;
         Some(k.space.leaf_census(&k.tables))
-    })
-}
-
-/// Maps a guard page back (read/write, never executable) before its memory is freed.
-pub(crate) fn unguard(page: u64) -> Result<(), MapError> {
-    crate::cpu::without_interrupts(|| {
-        let mut guard = KERNEL_SPACE.lock();
-        let k = guard.as_mut().ok_or(MapError::OutOfMemory)?;
-        k.space.map(
-            &mut k.tables,
-            page,
-            crate::phys::to_phys(page),
-            Attributes::kernel_global(Access::ReadWrite),
-        )
     })
 }
 
