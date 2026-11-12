@@ -230,6 +230,26 @@
 24. **64-bit handles (item 109; ADR-0005 Amendment 6, E1), after S3-5b and S3-6 land:** the kernel's table, `origin-abi`, `origin.kernel.oidl`, `docs/spec/OIDL.md` §10, every generated crate and the hostile corpus, in one `user-abi` minor.
 25. **The records (item 122):** a provenance table with one row for each crate and §6's ten fields, read by a gate; a task-contract template with §78's fields; `docs/ROADMAP.md` with exit tests for each milestone, and M0 to M2 marked against it.
 26. **Provisional performance budgets (item 115):** `docs/engineering/PERFORMANCE_BUDGETS.md`, each figure marked as a hypothesis, with the costs the CI boots print recorded as trends.
+
+    **Written (2026-11-12), on `claude/item-26-performance-budgets`, not landed.** The contract (CLAUDE.md §78):
+
+    | Field | |
+    |---|---|
+    | Task ID | 26, on branch `claude/item-26-performance-budgets`, cut from the record of ADR-0018 (`docs/decisions-238-246`). The architecture-review session, on the owner's "Continue" of 2026-11-12 |
+    | Objective | The file decision item 115 accepted, in the shape ADR-0018 V5 and V6 give it: a table of budgets, each a hypothesis with its model; the cost ledger's table; and the figures the last CI run on `main` printed, as trends. Documents only |
+    | Source ownership | New, owned by this task: `docs/engineering/PERFORMANCE_BUDGETS.md` and `docs/engineering/PERFORMANCE_TRENDS_2026-11-12.md`. Edited: this item of this file; in the requirements matrix, the rows S53-12, A18-V5 and A18-V6 |
+    | Architecture contract | Read and not changed: decision item 115; ADR-0018; ADR-0011 N8, L11 and L12; ADR-0012 C8; ADR-0016 R12; ADR-0017 Z3 and Z9; ADR-0005; ADR-0003's tick; ONBF's cold-launch figure. A budget that an accepted record already states is taken in its words (ADR-0016 R12). The typed round trip's budget is left for step 4's task S4-6 (ADR-0011 L11) |
+    | Relevant specifications | None beyond the project's own records. No vendor document is read and none enters the tree |
+    | Required dependencies | The log of CI run 43131676181 on `main` at `04ec842`, read through `gh`. Nothing in the tree |
+    | Security invariants | No protection is changed, switched off or measured without (ADR-0018 V7 is another task's). No log is copied into the tree: only the numbers the kernel printed |
+    | Performance constraints | This task sets them, as hypotheses. No threshold, and no CI job fails on a figure (item 115; ADR-0018 V6) |
+    | Required tests | None that execute: no code changes. `cargo xtask check`, for the requirements gate on the three rows. Each trend in the budgets file is checked against the values in the dated record |
+    | Actual deliverables | The two documents, this contract, and the three rows' new states |
+    | Acceptance conditions | (1) The budgets file holds a hypothesis and a model, or a stated reason for having none, for every cost line the kernel prints at boot and for finding 10's paths. (2) Every trend names its environment, the revision and the run, and its raw values are in the tree. (3) The ledger's table is there with ADR-0018 V5's columns. (4) The file claims nothing, and says so. (5) `cargo xtask check` passes |
+
+    **What it found.** One CI run, 62 boots: 20 on QEMU's software processor and 21 each as KVM guests on an EPYC 7763 and an EPYC 9V45. A context switch prints 260 ns on the Zen 5 guest. The random request prints 7.0 µs on the older guest, over ADR-0016 R12's "under 5 µs", on a processor outside the declared scope. The paths that wake a processor are far over their budgets under KVM, where a halted virtual processor is woken through the host. A console section kept interrupts off for as long as 5.3 ms in a guest, where each access to the UART leaves the guest. No boot printed what an IBPB costs. None of it is a figure for a declared machine.
+
+    **Not done, and whose it is.** The ledger has no row: its first fill and ADR-0018 V8's gate are a task the coordinating session numbers. Nothing collects the figures at each run: the script that read the logs is not in the tree. No tail latency, and nothing on a physical machine. No person has reviewed the budgets.
 27. **ADRs that §18 requires (item 118):** locking and synchronization (lock classes in a fixed order, checked by types or by a debug-build checker; rules for interrupt context); the rest of the cryptographic profile (storage encryption, password hashing, transport; the generator is task 18's); trade-offs and migration consequences for ADR-0002, 0003, 0004 and 0005.
 28. **ADR-0002 Amendment 2 (item 119), with the SYS profile:** measured boot, the release manifest and the rollback floor, firmware runtime calls. Addresses leave release logs before the Diagnostics interface exists.
 29. **The SDK-only mechanism (item 108; ADR-0011 Amendment 1), with the Loader Service's interface at M6:** the launch capability, the manifest gate, the directory, a base image with no interpreter, the run-time test.
