@@ -641,8 +641,9 @@ fn write_param(process: &Process, offset: usize, value: u64) -> bool {
 }
 
 /// The hostile script. `kernel` is an address of kernel data; `foreign` a handle value that
-/// is live in another process's table, and not in this one's.
-fn hostile_groups(kernel: u64, foreign: Handle) -> Vec<Group> {
+/// is live in another process's table, and not in this one's; `live` a channel end of this
+/// process, whose peer the kernel holds, so it is writable.
+fn hostile_groups(kernel: u64, foreign: Handle, live: Handle) -> Vec<Group> {
     const UNMAPPED: u64 = 0x0000_2000_0000_0000;
     const TOP_PAGE: u64 = 0x0000_7FFF_FFFF_F000;
     let fault = Error::Fault.raw();
@@ -660,6 +661,25 @@ fn hostile_groups(kernel: u64, foreign: Handle) -> Vec<Group> {
             title: "bad handles",
             steps: alloc::vec![
                 close("handle 0", Imm(0), bad),
+                // E1 (task S4-0): a handle fills 64 bits, and the kernel's table places a
+                // slot above bit 32, so the low half of a live handle names nothing; nor does
+                // its slot at a generation never issued.
+                wait("a live handle", Imm(live), signals::WRITABLE, 0, OK),
+                wait(
+                    "its low 32 bits alone",
+                    Imm(live & 0xFFFF_FFFF),
+                    signals::WRITABLE,
+                    0,
+                    bad
+                ),
+                wait(
+                    "its slot at a generation never issued",
+                    Imm(live ^ (1 << (GENERATION_BITS - 1))),
+                    signals::WRITABLE,
+                    0,
+                    bad
+                ),
+                close("", Imm(live), OK),
                 write("never issued", Imm(0x7FFF_0042), MSG, 8, bad),
                 read("bits above 32", Imm(0x1_0001_0001), RBUF, 16, bad),
                 wait(
@@ -1290,7 +1310,14 @@ fn hostile(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let Some(mut image) = Image::new(LIMITS, proof_programs::script()) else {
         return false;
     };
-    let groups = hostile_groups(kernel, foreign);
+    // A live end of the hostile process's own, for E1's steps; its peer stays here.
+    let Ok((own, own_peer)) = ipc::create_channel(&image.process.account) else {
+        return false;
+    };
+    let Ok(live) = image.process.grant(Object::Channel(own), rights::CHANNEL) else {
+        return false;
+    };
+    let groups = hostile_groups(kernel, foreign, live);
     let steps: Vec<Step> = groups
         .iter()
         .flat_map(|g| g.steps.iter().copied())
@@ -1310,6 +1337,7 @@ fn hostile(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let exit_ok = process.ending() == Some(Ending::Exited(0));
     // The process lived through all of it and ended by its own exit; the other process's
     // handle was never reachable from it.
+    drop(own_peer);
     let right = ended && groups_ok && exit_ok && foreign >> GENERATION_BITS == 41;
     let _ = writeln!(
         com1,
