@@ -5,11 +5,11 @@
 | Document | `docs/spec/OIDL.md` |
 | Version | 1 |
 | Status | **Accepted by the owner on 2026-11-09**: questions Q1–Q12 answered with the recommended option of each (CLAUDE.md §84). The grammar, the fixed-layout wire format and the handshake are decided. The generator exists, and its output is in the tree: the kernel's system calls (`framekernel/syscalls`, since task S3-0) and the service directory's interface (`sdk/directory`, task S3-4) |
-| Requires | ADR-0011 N3, N4, N5, N7, N8, N9, N10, N13; ADR-0005 P1, P2, P4, P5, P8, P12, amendments A1–A6, B1, B2, B3; ONBF-R7, ONBF-R8; CLAUDE.md §3, §5, §10, §13, §30, §42, §45, §49, §62, §63, §84 |
+| Requires | ADR-0011 N3, N4, N5, N7, N8, N9, N10, N13, and Amendments 2 and 3 (L2 to L8, L13); ADR-0005 P1, P2, P4, P5, P8, P12, amendments A1–A6, B1, B2, B3, and Amendment 8 (G1); ONBF-R7, ONBF-R8; CLAUDE.md §3, §5, §10, §13, §30, §42, §45, §49, §62, §63, §84 |
 | Implementation | `developer-tools/oidl` (host only). Consumers: `sdk/interfaces/origin.kernel.oidl` and `sdk/interfaces/origin.directory.oidl` |
 | Evidence | `docs/research/2026-11-09-native-sdk.md`, `docs/research/2026-11-09-oidl-wire-format.md`, and the comparison with the hand-written ABI, `docs/engineering/OIDL_KERNEL_COMPARISON.md` |
 | Compatibility | Every byte layout here is revision 1 of the format, accepted by the owner on 2026-11-09. A change to any of them needs the owner's acceptance again (CLAUDE.md §84) |
-| Revisions | 2026-11-10: plain structs of integers, enums and bits as `syscall` vector and array elements (§3.1, §10), ADR-0005 C3, accepted by the owner on 2026-11-09 (decision sheet item 58). Existing definitions and the `channel` wire format are unchanged. 2026-11-10: the fingerprint names a library's own `sized struct` with its size at the minor described (§13), as §9 requires; the owner asked for the fix. 2026-11-10: from major 1, an item may not name one of its library's items from a later minor (§9). 2026-11-10: `--library`, one channel library's bindings as a crate of their own (§11) and a lock per library (§13), for the service directory; §7.4 records that `channel_read` reports handle records. Tools only: no format changes. 2026-11-12: a handle is a 64-bit value at the `syscall` transport, and the decoder no longer refuses a handle register whose upper 32 bits are not zero (§10): ADR-0005 Amendment 6, E1, accepted by the owner on 2026-11-10 (decision sheet item 109), built by task S4-0. The `channel` wire format is unchanged: a slot is a position in the message's handle list, not a handle value (§7.4). 2026-11-12: the canonical description is format `oidl-fingerprint 2`, which records a handle's width (§13): decision item 237, accepted by the owner on 2026-11-12, built by TASKS item 39; every lock recorded again. No byte layout changes |
+| Revisions | 2026-11-10: plain structs of integers, enums and bits as `syscall` vector and array elements (§3.1, §10), ADR-0005 C3, accepted by the owner on 2026-11-09 (decision sheet item 58). Existing definitions and the `channel` wire format are unchanged. 2026-11-10: the fingerprint names a library's own `sized struct` with its size at the minor described (§13), as §9 requires; the owner asked for the fix. 2026-11-10: from major 1, an item may not name one of its library's items from a later minor (§9). 2026-11-10: `--library`, one channel library's bindings as a crate of their own (§11) and a lock per library (§13), for the service directory; §7.4 records that `channel_read` reports handle records. Tools only: no format changes. 2026-11-12: a handle is a 64-bit value at the `syscall` transport, and the decoder no longer refuses a handle register whose upper 32 bits are not zero (§10): ADR-0005 Amendment 6, E1, accepted by the owner on 2026-11-10 (decision sheet item 109), built by task S4-0. The `channel` wire format is unchanged: a slot is a position in the message's handle list, not a handle value (§7.4). 2026-11-12: the canonical description is format `oidl-fingerprint 2`, which records a handle's width (§13): decision item 237, accepted by the owner on 2026-11-12, built by TASKS item 39; every lock recorded again. No byte layout changes 2026-11-13: `origin.core`'s entry points are naked functions in a tree of their own, `core/`, with the list of what they export; each extends its narrow parameters (§10; ADR-0011 Amendment 3, L13); the per-call pin and what the generator writes for it (§10, §11; ADR-0005 B2; task S4-2). No wire format, call number or C signature changes. |
 
 The keywords MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
@@ -466,9 +466,26 @@ Pointers are not dereferenced by the decoder. It produces typed descriptors of u
 
 Unused argument registers are ignored: a C stub leaves them undefined.
 
+**The entry point extends its narrow parameters** (ADR-0011 Amendment 3, L13). The C calling convention leaves the bits of a register above a narrow argument undefined (the x86-64 psABI, CLAUDE.md §17), and the decoder above refuses a register that is not correctly extended. So each entry point of `origin.core`, before its `syscall`, extends every one of its own register parameters that is narrower than 64 bits:
+
+| Parameter | Extension |
+|---|---|
+| `u8`, `u16`, `u32`, `bool`, bits | zero |
+| `i8`, `i16`, `i32` | sign |
+| enum | as its underlying integer: zero if that is unsigned, sign if it is signed |
+| `handle`, `u64`, `i64`, a pointer, a count | none: it fills its register |
+
+A caller of the C entry point therefore gets `invalid_args` only for a value its declared type can hold and the method refuses, never for what its compiler left above it. The decoder is unchanged: the kernel does not trust the stub, and a call that does not come through a stub (a proof process's, below) is decoded as before.
+
 Every method MUST declare the statuses its own decoding can produce: `bad_handle` with a handle parameter (since E1 its decoding refuses no handle, but the table it is looked up in does, so the rule stands), `invalid_args` with a parameter narrower than 64 bits, a `bool`, an enum, a `bits` or a bounded count, `fault` with any pointer, `access_denied` with a handle that has rights, and `wrong_type` with a handle of a specific object type. A `@reserved` method is exempt, since it decodes nothing. The tool refuses a definition that leaves one out.
 
 The generated C entry point is the stable interface: `<library with _>_<method>`, returning the status as `int64_t` (`_Noreturn void` for `never`). `origin.core` issues the `syscall` instruction inside each entry point, with **one `syscall` instruction per number**, as ADR-0005 B2 requires.
+
+**An entry point is exactly this**, in order, and nothing else (ADR-0011 Amendment 2, L4 and L6): the extensions above, each parameter's in register order, with the move of the fourth argument from RCX to R10 at its place (P4; the `syscall` instruction overwrites RCX); the load of the method's own number into EAX; `syscall`; and `ret`, or `ud2` for a method that never returns. It is generated as a naked function, so that the compiler adds no instruction to it and makes no second copy of it. It reads and writes no memory and uses no stack of its own.
+
+**The per-call pin** (ADR-0005 B2; ADR-0011 L6 and L7). For a process that reaches the kernel through `origin.core`, the kernel accepts call number *n* only if the `syscall` instruction that made the call is the one in the entry point of *n*: the return address less two, less the base of that process's `origin.core`, equals the offset of that instruction in the image. The generator writes the comparison (`pinned`, §11), one arm for each method and none for any other number, with no table that a value from ring 3 indexes (ADR-0017 Z9). The offsets come from the image as linked, not from the generator: the build reads them from `origin.core` and hands them to the kernel as `Pins`. A call that fails the comparison gets no status: the kernel stops the thread, and the thread's ending records the number and the address (ADR-0005 Amendment 8, G1). Since a number no method has is at no entry point, such a process can never be answered `not_supported` for an unknown number.
+
+The kernel's own proof processes do not map `origin.core`. They keep ADR-0005 A6's rule, one range of addresses a process, with `access_denied` for a call from outside it (ADR-0011 L8).
 
 ---
 
@@ -480,19 +497,22 @@ The generated C entry point is the stable interface: `<library with _>_<method>`
 |---|---|---|
 | `rust/lib.rs`, `rust/oidl_rt.rs` | The crate root and the runtime (`Reader`, `Writer`, `Fixed`, `CallError`) | None |
 | `rust/<lib>/types.rs` | Constants, enums, bits and structures, with validated encoders and decoders | None |
-| `rust/<lib>/<interface>/server.rs` | Syscall: the call table, per-method errors, `Calls` and `dispatch`. Channel: request and response codecs, per-method errors, the server trait and dispatcher | None |
+| `rust/<lib>/<interface>/server.rs` | Syscall: the call table, per-method errors, `Calls` and `dispatch`; and for the per-call pin (§10) `Pins`, one offset a method, `pinned`, and `RELEASE_FINGERPRINT`, the release fingerprint of the definition (§13). Channel: request and response codecs, per-method errors, the server trait and dispatcher | None |
 | `rust/<lib>/<interface>/client.rs` | The safe client | None |
-| `rust/<lib>/<interface>/abi.rs` | Syscall: C-ABI imports and their thin wrappers | **The named shim** |
-| `rust/<lib>/<interface>/core_stubs.rs` | Syscall: `origin.core`'s entry points; `x86_64` only | **The named shim** |
+| `rust/<lib>/<interface>/abi.rs` | Syscall: C-ABI imports and their thin wrappers. It declares the entry points and holds none | **The named shim** |
+| `core/lib.rs`, `core/<lib>/<interface>.rs` | Syscall: the source of `origin.core`, a crate of its own: one naked function for each method (§10) and nothing else; `x86_64` only | **The named shim** |
+| `core/<lib>.exports` | Syscall: what `origin.core` exports. A first line `# oidl-core-exports 1 <library>`, then `release sha256:<hex>`, the release fingerprint (§13), then one line a method, in number order: `<number> <C symbol> <method> <major>.<minor>`, the version of the library the method arrived in (ADR-0011 L5) | — |
 | `c/<lib path>.h` | The C header: `typedef`s, constants, structures with named padding and `_Static_assert`s, and for `syscall` the entry points | — |
 | `doc/<lib>.md` | Reference documentation | — |
 | `abi/<lib>.fingerprint` | The fingerprint (§13) | — |
 | `corpus/<lib>.corpus` | The hostile corpus (§14) | — |
 | `rust/bin/corpus_check.rs` | A program that runs the corpus against the generated code | — |
 
-Generated Rust is `no_std`, allocates nothing and passes the project's no-panic lints (`clippy::panic`, `unwrap_used`, `expect_used`, `indexing_slicing`, `arithmetic_side_effects`, `cast_possible_truncation`) in every non-test build. It contains no `unsafe` outside the two named shims (ADR-0011 S7). No Rust layout crosses a boundary: every structure is encoded and decoded field by field (ONBF-R7, CLAUDE.md §42), and a `bool` crossing the C ABI is `uint8_t`.
+Generated Rust is `no_std`, allocates nothing and passes the project's no-panic lints (`clippy::panic`, `unwrap_used`, `expect_used`, `indexing_slicing`, `arithmetic_side_effects`, `cast_possible_truncation`) in every non-test build. It contains no `unsafe` outside the two named shims (ADR-0011 S7). The `rust/` tree, which a program is built from, holds no entry point and no `syscall` instruction: those are in `core/` alone, and a program reaches them by import (ADR-0011 L3, L6). No Rust layout crosses a boundary: every structure is encoded and decoded field by field (ONBF-R7, CLAUDE.md §42), and a `bool` crossing the C ABI is `uint8_t`.
 
 Channel-transport C entry points are **not generated in this revision**: they would sit on `origin.core`'s call helper (ADR-0005 P8), which does not exist. The header carries their types and message sizes.
+
+**`origin.core` is built from `core/` and checked as linked.** The build links the `core/` crate into one image whose exports are the entry points (ADR-0011 L2, L4, L5). What the generator wrote is not what is trusted: the build's own tools read the linked image and refuse one that holds anything but the entry points, an entry point that is not §10's form for its own method, the two bytes of `syscall` anywhere but once in each entry point, or a list of exports that is not the definition's (`onbf-pack corelib`; `cargo xtask core-gate`, which works each entry point's form out from the definition again, apart from the generator's writer). The same build refuses a program the kernel carries that holds a `syscall` instruction, the kernel's proof programs excepted by name and exact count (L8). The kernel is compiled only with an `origin.core` whose release fingerprint is its own dispatcher's.
 
 `oidl generate --server-only` writes one crate at the top of the output directory, and nothing else: `lib.rs`, `oidl_rt.rs`, `<lib>/types.rs` and each interface's `server.rs`. There is no client, C, documentation or corpus, and so no shim: the crate's root is `#![forbid(unsafe_code)]`. The files it shares with the full output are identical to it. Its modules are marked `#[rustfmt::skip]`, because what the tool wrote is what a repository commits and compares. The Framekernel's crate is made this way (`framekernel/syscalls`, ADR-0011 N14).
 
@@ -599,7 +619,8 @@ An implementation of this specification MUST: pass the malformed-definition suit
 - Floating-point types, unions, nested variable-length data.
 - C entry points for the `channel` transport (§11).
 - Where a `channel` stub puts ADR-0005 B1's stamped identity. Its fields (C1) and how a read delivers them, through `origin.kernel`'s `read_sizes` (C2), are decided and built (task S3-2, 2026-11-10); the generated server takes an opaque `Caller` until the first ring-3 service (ADR-0011 N14 step 4).
-- Per-number pinning, which needs the number-to-address table the linker produces, and generation of the kernel's `syscall` table from this definition: the kernel's switch to generated code, which ADR-0011 N14 orders after this.
+- `origin.core` as a signed ONBF image that the Loader Service maps, and its export table as ONBF §6 lays one out (ADR-0011 L5; milestone M6). Until then the kernel carries it in its own image and binds a program's imports itself, and the list of exports is `core/<lib>.exports` (§11). Per-number pinning and the kernel's generated `syscall` table, which this list once named, are decided and built (§10; tasks S3-0 and S4-2).
+- Entry points for a second `syscall` library in `origin.core`. The generator writes them for every one it is given; the build and the kernel take `origin.kernel`'s alone.
 - The Driver SDK (ADR-0001 D2): its own ADR.
 
 ---
