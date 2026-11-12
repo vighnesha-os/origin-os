@@ -152,22 +152,24 @@ pub(crate) fn generate_stubs() -> Result<PathBuf> {
     Ok(stubs)
 }
 
-/// `cargo <subcommand>` for the ring-3 crates: the userspace triple, its configuration file, and
-/// the generated stubs' directory.
-fn userspace(subcommand: &str, stubs: &Path) -> Command {
+/// `cargo <subcommand>` for the ring-3 crates: the userspace triple, its configuration file, the
+/// remap that keeps the toolchain's path out of what it builds (`toolchain`, TASKS item 32),
+/// and the generated stubs' directory.
+fn userspace(subcommand: &str, stubs: &Path) -> Result<Command> {
     let mut command = cargo();
     command
         .arg(subcommand)
         .args(["--target", USERSPACE_TARGET, "--config", USERSPACE_CONFIG])
+        .args(crate::toolchain::userspace_config()?)
         .env(STUBS_ENV, stubs);
-    command
+    Ok(command)
 }
 
 /// Builds every carried program for ring 3 and describes each for the kernel. Returns the
 /// directory the kernel's builds name in [`CARRIED_ENV`].
 pub(crate) fn programs() -> Result<PathBuf> {
     let stubs = generate_stubs()?;
-    let mut build = userspace("build", &stubs);
+    let mut build = userspace("build", &stubs)?;
     build.arg("--release");
     for program in PROGRAMS {
         build.args(["--package", program.package]);
@@ -216,7 +218,7 @@ pub(crate) fn with_programs(command: &mut Command) -> Result<&mut Command> {
 pub(crate) fn clippy() -> Result {
     let stubs = generate_stubs()?;
     for package in CRATES {
-        let mut clippy = userspace("clippy", &stubs);
+        let mut clippy = userspace("clippy", &stubs)?;
         clippy.args(["--package", package, "--", "-D", "warnings"]);
         run_step(&mut clippy)?;
     }
