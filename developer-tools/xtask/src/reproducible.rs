@@ -5,13 +5,19 @@
 //! build in the first ended. The two files of each image must be the same bytes.
 //!
 //! That shows an image does not depend on when it was built, on what Cargo had built before
-//! it, or on where its target directory is. Each image is then searched for the paths of the
+//! it, or on where its target directory is. Each file is then searched for the paths of the
 //! machine that built it: the toolchain's directory, Cargo's home and the checkout
 //! ([`toolchain::host_paths`]). None may be there.
 //!
-//! Neither check shows that another machine gives the same bytes: both builds have one
+//! The programs the kernel carries are images of their own here. Each is built in both
+//! directories, and its linker output and every file `onbf-pack carried` writes for it are
+//! compared and searched like any other. Each directory's kernel carries that directory's
+//! programs, and the gate fails unless the kernel's image holds the bytes of every segment it
+//! read: what was checked is then what the kernel carries.
+//!
+//! None of this shows that another machine gives the same bytes: both builds have one
 //! toolchain on one host. `docs/research/2026-11-11-toolchain-path-in-images.md` says what
-//! was tried with a second copy of the toolchain, and
+//! was tried with a second copy of the toolchain and what CI printed, and
 //! `docs/research/2026-11-10-loader-reproducible-build.md` what made the loader differ.
 //!
 //! The loader was not reproducible until its link arguments made it so (`.cargo/config.toml`):
@@ -25,24 +31,43 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
+use crate::ring3::{self, CarriedKind};
 use crate::{Loader, Result, build_kernel_in, build_loader_in, read_file, target_dir, toolchain};
 
-/// An image the gate builds twice.
+/// What the gate builds twice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Image {
     /// The loader with one of the boots' features, or with none: what a release builds.
     Loader(Option<Loader>),
+    /// Every program the kernel carries: each one's linker output, and each file
+    /// `onbf-pack carried` writes for it.
+    Programs,
     /// The Framekernel ELF, which `onbf-pack` turns into the KRN image.
     Kernel,
 }
 
-/// The loader each way it is built, and the kernel.
+/// The loader each way it is built, the programs the kernel carries, and the kernel. The
+/// programs come before the kernel: a fault in a program is then reported at the program.
 const IMAGES: &[Image] = &[
     Image::Loader(None),
     Image::Loader(Some(Loader::Verifying)),
     Image::Loader(Some(Loader::Developer)),
+    Image::Programs,
     Image::Kernel,
 ];
+
+/// One file a build wrote, read as soon as it was built.
+#[derive(Debug)]
+struct Built {
+    /// What the file is, for messages.
+    name: String,
+    /// A file name for the copies kept when the two builds differ.
+    file_name: String,
+    bytes: Vec<u8>,
+    /// Whether the kernel's image must hold these bytes as they are: a carried program's
+    /// segment.
+    in_kernel: bool,
+}
 
 /// The two target directories, under `target/xtask/reproducible/`. The names differ in length
 /// too: a path that reached an image would then move everything after it as well.
@@ -59,29 +84,57 @@ const REPORTED_RUNS: usize = 8;
 const REPORTED_BYTES: usize = 16;
 
 impl Image {
-    /// What the image is, for messages.
-    fn name(self) -> String {
+    /// Builds the image into `target` and reads every file it is made of. The loader's builds
+    /// all write one path in a directory, so nothing is left to be read later.
+    fn build(self, target: &Path) -> Result<Vec<Built>> {
+        let one = |name: String, file_name: String, path: PathBuf| -> Result<Vec<Built>> {
+            Ok(vec![Built {
+                name,
+                file_name,
+                bytes: read_file(&path)?,
+                in_kernel: false,
+            }])
+        };
         match self {
-            Self::Loader(None) => "the loader as a release builds it (no feature)".into(),
-            Self::Loader(Some(loader)) => format!("the loader with `{}`", loader.feature()),
-            Self::Kernel => "the kernel ELF".into(),
-        }
-    }
-
-    /// A file name for the copies kept when the two builds differ.
-    fn file_name(self) -> String {
-        match self {
-            Self::Loader(None) => "loader".into(),
-            Self::Loader(Some(loader)) => format!("loader-{}", loader.feature()),
-            Self::Kernel => "kernel".into(),
-        }
-    }
-
-    /// Builds the image into `target` and returns the file's path.
-    fn build(self, target: &Path) -> Result<PathBuf> {
-        match self {
-            Self::Loader(loader) => build_loader_in(loader.map(Loader::feature), Some(target)),
-            Self::Kernel => build_kernel_in(Some(target)),
+            Self::Loader(loader) => {
+                let path = build_loader_in(loader.map(Loader::feature), Some(target))?;
+                match loader {
+                    None => one(
+                        "the loader as a release builds it (no feature)".into(),
+                        "loader".into(),
+                        path,
+                    ),
+                    Some(loader) => one(
+                        format!("the loader with `{}`", loader.feature()),
+                        format!("loader-{}", loader.feature()),
+                        path,
+                    ),
+                }
+            }
+            Self::Programs => {
+                ring3::programs(Some(target))?;
+                let mut built = Vec::new();
+                for file in ring3::carried_files(Some(target))? {
+                    let what = match file.kind {
+                        CarriedKind::Linked => "as the linker wrote it".to_string(),
+                        CarriedKind::Segment | CarriedKind::Description => {
+                            format!("in `{}`", file.file)
+                        }
+                    };
+                    built.push(Built {
+                        name: format!("the carried program `{}` {what}", file.program),
+                        file_name: format!("carried-{}-{}", file.program, file.file),
+                        bytes: read_file(&file.path)?,
+                        in_kernel: file.kind == CarriedKind::Segment,
+                    });
+                }
+                Ok(built)
+            }
+            Self::Kernel => one(
+                "the kernel ELF".into(),
+                "kernel".into(),
+                build_kernel_in(Some(target))?,
+            ),
         }
     }
 }
@@ -89,8 +142,9 @@ impl Image {
 /// How much of an image's text a report shows where a host path was found.
 const REPORTED_TEXT: usize = 200;
 
-/// Builds every image twice and fails at the first whose two files differ, or that holds a
-/// path of this machine.
+/// Builds every image twice and fails at the first file whose two builds differ, or that
+/// holds a path of this machine, or at a kernel that does not hold what the gate read of the
+/// programs it carries.
 pub(crate) fn gate() -> Result {
     let (host_paths, set_aside) = toolchain::host_paths()?;
     for path in &set_aside {
@@ -107,48 +161,101 @@ pub(crate) fn gate() -> Result {
             fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
     }
-    // The loader's builds all write one path in a directory, so each image is read as soon as
-    // it is built.
-    let mut first = Vec::new();
+    let mut first_builds = Vec::new();
     for &image in IMAGES {
-        first.push(read_file(&image.build(&first_dir)?)?);
+        first_builds.push(image.build(&first_dir)?);
     }
     thread::sleep(APART);
-    for (&image, first) in IMAGES.iter().zip(&first) {
-        let second = read_file(&image.build(&second_dir)?)?;
-        if let Some(report) = difference(first, &second) {
-            // Both are kept for whoever investigates: the loader's next build in a directory
-            // writes over this one.
-            let kept = [(first, "first"), (&second, "second")].map(|(bytes, which)| {
-                let path = work.join(format!("{}.{which}", image.file_name()));
-                match fs::write(&path, bytes) {
-                    Ok(()) => format!("  the {which} build's file is kept as {}", path.display()),
-                    Err(e) => format!("  the {which} build's file could not be kept: {e}"),
+    for (&image, first) in IMAGES.iter().zip(&first_builds) {
+        let second = image.build(&second_dir)?;
+        let names = |built: &[Built]| -> Vec<String> {
+            built.iter().map(|file| file.file_name.clone()).collect()
+        };
+        if names(first) != names(&second) {
+            return Err(format!(
+                "the two builds did not write the same files (CLAUDE.md §75): the first wrote {:?} and the second {:?}",
+                names(first),
+                names(&second)
+            ));
+        }
+        for (first, second) in first.iter().zip(&second) {
+            check_pair(first, second, &work, &host_paths)?;
+        }
+        if image == Image::Kernel {
+            let segments: Vec<&Built> = first_builds
+                .iter()
+                .flatten()
+                .filter(|file| file.in_kernel)
+                .collect();
+            for kernel in first {
+                if let Some(missing) = segment_not_in(&kernel.bytes, &segments) {
+                    return Err(format!(
+                        "{} does not hold the bytes of {} ({} bytes) (CLAUDE.md §75): the gate read a file of a carried program that is not what the kernel carries. If the kernel now holds its programs another way, `ring3::carried_files` and this check must follow it",
+                        kernel.name,
+                        missing.name,
+                        missing.bytes.len()
+                    ));
                 }
-            });
-            return Err(format!(
-                "{} is not reproducible (CLAUDE.md §75): two builds of the same source give different files\n{report}\n{}",
-                image.name(),
-                kept.join("\n"),
-            ));
+                println!(
+                    "xtask: reproducible-build gate: {} holds the bytes of each of the {} carried segments the gate read",
+                    kernel.name,
+                    segments.len()
+                );
+            }
         }
-        if let Some((path, at)) = toolchain::host_path_in(first, &host_paths) {
-            return Err(format!(
-                "{} holds a path of the machine that built it (CLAUDE.md §75, §60): {}, `{}`, at offset {at:#x}\n  the text there: `{}`\n  `xtask` remaps the toolchain's source directory in every image build (`toolchain::image_config`). A path that still reaches an image needs a remap of its own, or must not be compiled in",
-                image.name(),
-                path.what,
-                path.path,
-                text_at(first, at),
-            ));
-        }
-        println!(
-            "xtask: reproducible-build gate: {}: {} bytes, the same from two builds and free of this machine's paths (SHA-256 {})",
-            image.name(),
-            first.len(),
-            hex(&origin_crypto::Sha256::digest(first), "")
-        );
     }
     Ok(())
+}
+
+/// Fails if the two builds of one file differ, or if it holds a path of this machine; else
+/// prints its size and SHA-256.
+fn check_pair(
+    first: &Built,
+    second: &Built,
+    work: &Path,
+    host_paths: &[toolchain::HostPath],
+) -> Result {
+    if let Some(report) = difference(&first.bytes, &second.bytes) {
+        // Both are kept for whoever investigates: the next build in a directory may write
+        // over this one.
+        let kept = [(first, "first"), (second, "second")].map(|(built, which)| {
+            let path = work.join(format!("{}.{which}", built.file_name));
+            match fs::write(&path, &built.bytes) {
+                Ok(()) => format!("  the {which} build's file is kept as {}", path.display()),
+                Err(e) => format!("  the {which} build's file could not be kept: {e}"),
+            }
+        });
+        return Err(format!(
+            "{} is not reproducible (CLAUDE.md §75): two builds of the same source give different files\n{report}\n{}",
+            first.name,
+            kept.join("\n"),
+        ));
+    }
+    if let Some((path, at)) = toolchain::host_path_in(&first.bytes, host_paths) {
+        return Err(format!(
+            "{} holds a path of the machine that built it (CLAUDE.md §75, §60): {}, `{}`, at offset {at:#x}\n  the text there: `{}`\n  `xtask` remaps the toolchain's source directory in every image build (`toolchain::image_config`, `toolchain::userspace_config`). A path that still reaches an image needs a remap of its own, or must not be compiled in",
+            first.name,
+            path.what,
+            path.path,
+            text_at(&first.bytes, at),
+        ));
+    }
+    println!(
+        "xtask: reproducible-build gate: {}: {} bytes, the same from two builds and free of this machine's paths (SHA-256 {})",
+        first.name,
+        first.bytes.len(),
+        hex(&origin_crypto::Sha256::digest(&first.bytes), "")
+    );
+    Ok(())
+}
+
+/// The first of `segments` whose bytes `kernel` does not hold. An empty segment is held by
+/// any image.
+fn segment_not_in<'a>(kernel: &[u8], segments: &[&'a Built]) -> Option<&'a Built> {
+    segments.iter().copied().find(|segment| {
+        let bytes = segment.bytes.as_slice();
+        !bytes.is_empty() && !kernel.windows(bytes.len()).any(|window| window == bytes)
+    })
 }
 
 /// What differs between two builds of an image, as a report, or `None` if they are the same
@@ -446,22 +553,106 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_builds_every_loader_the_boots_use_and_the_kernel() {
+    fn the_gate_builds_every_loader_the_boots_use_the_programs_and_the_kernel() {
         for image in [
             Image::Loader(None),
             Image::Loader(Some(Loader::Verifying)),
             Image::Loader(Some(Loader::Developer)),
+            Image::Programs,
             Image::Kernel,
         ] {
             assert!(IMAGES.contains(&image), "{image:?}");
         }
-        // No two images share a name or a kept file.
-        for (i, a) in IMAGES.iter().enumerate() {
-            for b in &IMAGES[i + 1..] {
-                assert_ne!(a.name(), b.name());
-                assert_ne!(a.file_name(), b.file_name());
-            }
+        // The programs are built and read before the kernel that carries them, and no image
+        // is listed twice.
+        let at = |image: Image| IMAGES.iter().position(|listed| *listed == image);
+        assert!(at(Image::Programs) < at(Image::Kernel));
+        for (i, image) in IMAGES.iter().enumerate() {
+            assert!(!IMAGES[i + 1..].contains(image), "{image:?}");
         }
+    }
+
+    /// A file a build wrote, for the checks that take one.
+    fn built(name: &str, bytes: &[u8], in_kernel: bool) -> Built {
+        Built {
+            name: name.to_string(),
+            file_name: name.replace(' ', "-"),
+            bytes: bytes.to_vec(),
+            in_kernel,
+        }
+    }
+
+    #[test]
+    fn a_segment_the_kernel_does_not_hold_is_found() {
+        let mut kernel = vec![0x90u8; 4096];
+        kernel[100..108].copy_from_slice(b"SEGMENT0");
+        kernel[4088..4096].copy_from_slice(b"SEGMENT1");
+        let held = [
+            built("segment 0", b"SEGMENT0", true),
+            built("segment 1, at the image's end", b"SEGMENT1", true),
+            built("an empty segment", b"", true),
+        ];
+        let all: Vec<&Built> = held.iter().collect();
+        assert!(segment_not_in(&kernel, &all).is_none());
+        // One byte of a segment changed in the kernel: it no longer holds that segment.
+        kernel[104] ^= 0x01;
+        let missing = segment_not_in(&kernel, &all).expect("a planted difference");
+        assert_eq!(missing.name, "segment 0");
+        kernel[104] ^= 0x01;
+        // A segment longer than the kernel, and one the kernel holds only the start of.
+        let longer = built("longer than the image", &vec![0x90u8; 5000], true);
+        assert_eq!(
+            segment_not_in(&kernel, &[&longer]).map(|s| s.name.as_str()),
+            Some("longer than the image")
+        );
+        let cut = built("cut short", b"SEGMENT1 and more", true);
+        assert_eq!(
+            segment_not_in(&kernel, &[&held[1], &cut]).map(|s| s.name.as_str()),
+            Some("cut short")
+        );
+        assert!(segment_not_in(&[], &[&held[2]]).is_none());
+        assert!(segment_not_in(&[], &[&held[0]]).is_some());
+    }
+
+    #[test]
+    fn a_file_that_differs_or_holds_a_host_path_fails_and_says_which() {
+        let work = target_dir().join("xtask").join("reproducible-tests");
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work).expect("a scratch directory");
+        let paths = vec![toolchain::HostPath {
+            what: "the toolchain's directory",
+            path: "/Users/someone/.rustup/toolchains/pinned".into(),
+        }];
+        let clean = built("the carried program `p` in `p.0.bin`", &[7u8; 64], true);
+        assert_eq!(check_pair(&clean, &clean, &work, &paths), Ok(()));
+        // The second build differs in one byte.
+        let mut other = built("the carried program `p` in `p.0.bin`", &[7u8; 64], true);
+        other.bytes[9] = 8;
+        let error = check_pair(&clean, &other, &work, &paths).expect_err("a planted difference");
+        assert!(
+            error.starts_with("the carried program `p` in `p.0.bin` is not reproducible"),
+            "{error}"
+        );
+        assert!(error.contains("0x000009, 1 byte(s): 07 | 08"), "{error}");
+        for which in ["first", "second"] {
+            let kept = work.join(format!("{}.{which}", clean.file_name));
+            assert!(kept.is_file(), "{}", kept.display());
+        }
+        // Both builds agree, and hold the toolchain's path.
+        let mut bytes = vec![0u8; 256];
+        let location = b"/Users/someone/.rustup/toolchains/pinned/lib/rustlib/src/rust/library/core/src/slice/index.rs";
+        bytes[40..40 + location.len()].copy_from_slice(location);
+        let leaking = built("the carried program `p` in `p.1.bin`", &bytes, true);
+        let error = check_pair(&leaking, &leaking, &work, &paths).expect_err("a planted path");
+        assert!(
+            error.starts_with(
+                "the carried program `p` in `p.1.bin` holds a path of the machine that built it"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("at offset 0x28"), "{error}");
+        assert!(error.contains("core/src/slice/index.rs`"), "{error}");
+        fs::remove_dir_all(&work).expect("the scratch directory goes");
     }
 
     #[test]

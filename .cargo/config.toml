@@ -7,7 +7,10 @@ xtask = "run --quiet --package xtask --"
 # is another path on every machine (developer-tools/xtask/src/toolchain.rs, CLAUDE.md §75).
 # An image built by plain `cargo build` holds that path, and so is not the image another
 # machine builds. xtask also refuses to run with RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS or a
-# per-target RUSTFLAGS variable set: the first two replace every list below, even when empty.
+# per-target RUSTFLAGS variable set (the first two replace every list below, even when empty),
+# or with a variable that names another compiler, a compiler wrapper, or a linker for the
+# kernel or the loader. A configuration file above the checkout, or in Cargo's home, is joined
+# to this one by Cargo, and xtask does not look for one.
 
 # CLAUDE.md §14: frame pointers on every Origin-owned freestanding image.
 #
