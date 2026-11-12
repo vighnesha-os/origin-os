@@ -27,6 +27,7 @@ So another account, or another machine, gives strings of another length and cann
 | R3 | Cargo's own source, one file: `src/compiler/build_runner/compilation_files.rs` in `github.com/rust-lang/cargo` at commit `5f94df4789f005f9a352888e8355ffc645b7ed0e`, which is the commit `cargo -vV` reports for 1.99.1. MIT OR Apache-2.0 | Read on 2026-11-12, for §12.6: how a crate's `-C metadata` value is made, which R2 does not say. A build tool's source (CLAUDE.md §4), read after step 2's code was committed; nothing of it is in Origin's code |
 | R4 | The linker's own source, two files: `lld/ELF/SyntheticSections.cpp` and `lld/Common/Version.cpp` in `github.com/rust-lang/llvm-project` at commit `1b9c0d5ff9bbe7634aead059efe6b11a7eeba145`, the commit the pinned `rust-lld` names in what it writes. Apache-2.0 WITH LLVM-exception | Read on 2026-11-12, for §13.3: how the linker makes the string it writes into `.comment`. A build tool's source (CLAUDE.md §4); nothing of it is in Origin's code |
 | C2 | CI's run 43248605239 at `c34fdab`: its `check` job's log, and the artifact `reproducible-gate-files` it kept | Read and fetched on 2026-11-12, for §13 |
+| C3 | CI's run 43275652672 at `8ae9e9b`: its `check` job's log (job 131383211984), and the artifact `reproducible-gate-files` it kept | Read and fetched on 2026-11-12, for §16 |
 | C1 | CI's logs for this repository: run 43201395354 at `f5ab54f` (its `check` and toolchain jobs) and run 43230979284 at `9e4f79f` (its `check` job) | Read on 2026-11-12, for §12.4 and §12.5 |
 | T1 | The toolchain itself: `rustc 1.99.1 (58cf8f9c3 2026-10-13)`, commit `58cf8f9c35b355199727627d07ae34a4e2846d67`, and `cargo 1.99.1 (5f94df478 2026-08-27)`, on `aarch64-apple-darwin` | What `cargo build -v` passes to rustc, and what the images then hold (`strings`, `cmp`, `llvm-objdump`), each observed on 2026-11-11 |
 
@@ -520,7 +521,7 @@ Before item 44 the same change gave other bytes for the two feature loaders, the
 
   No code or data changes: the line is 16 bytes shorter after alignment, and what differs is `.comment`, the offset in each ELF header, and the one byte of the program's header that the kernel carries.
 - **With the compiler reporting CI's host,** all ten files are the same bytes as without (plain `cargo`, two jobs).
-- **An existing target directory.** Cargo does not link a file again when `[env]` changes: nothing it tracks for that file changed. Tried: a program and a kernel built without the entry, then built again with it, are not linked again, and keep the linker's own line. `3761692`'s own run showed what follows. The ordinary target directory still held `first-program` as linked before the entry; the kernel built there carried its old header; and `boot-test` booted a kernel one byte off the gate's (`50ccb41e…` where the gate printed `897a6d0f…`). The gate builds from nothing and was right. `68ed2b1` makes every `xtask` build of a carried program or of the kernel read `.comment` of what it linked: a file without the fixed line is removed, with Cargo's own copy of it under `deps/`, and linked once more, and if it is still wrong that is an error. On that directory `cargo xtask build` then linked `first-program` again and said so, and the kernel there was the gate's, byte for byte; a second build linked nothing again.
+- **An existing target directory.** Cargo does not link a file again when `[env]` changes: nothing it tracks for that file changed. Tried: a program and a kernel built without the entry, then built again with it, are not linked again, and keep the linker's own line. `3761692`'s own run showed what follows. The ordinary target directory still held `first-program` as linked before the entry; the kernel built there carried its old header; and `boot-test` booted a kernel one byte off the gate's (`50ccb41e…` where the gate printed `897a6d0f…`). The gate builds from nothing and was right. `68ed2b1` makes every `xtask` build of a carried program or of the kernel read `.comment` of what it linked: a file without the fixed line is removed, with Cargo's own copy of it under `deps/`, and linked once more, and if it is still wrong that is an error. On that directory `cargo xtask build` then linked `first-program` again and said so, and the kernel there was the gate's, byte for byte; a second build linked nothing again. **What this path has been exercised by:** a host test, and that one run on that one stale directory, in this session's checkout. Nowhere else. The keeper's first build on the merge printed no such note: the merge itself changed what the kernel and `first-program` are built from, so Cargo linked both again anyway and there was no stale file for `xtask` to find.
 
 ### 14.6 The controls and the gates
 
@@ -563,7 +564,7 @@ Said plainly, for release work.
 
 With CI's values for the three, the Mac built all ten of CI's files at `c34fdab` bit for bit (§13.4). So for those ten files, on these two hosts, there was no fourth. **That is the evidence there is; it is not a proof that no other host would show one.**
 
-Expected, and not seen: for a tree with item 44, CI prints the Mac's ten digests, the ones in §14.3 for the loaders and §14.5 for the rest.
+Expected when this was written, and seen since (§16): for a tree with item 44, CI prints the Mac's ten digests, the ones in §14.3 for the loaders and §14.5 for the rest.
 
 What was not looked for:
 
@@ -583,8 +584,7 @@ Three things here rest on how the pinned tools behave. CLAUDE.md §15 asks for a
 
 ### 14.9 Not verified
 
-- **No file of a tree with item 44 has been built on CI.** The comparison needs the batch pushed with it.
-- That a linker really running on Linux honours the entry as the Mac's does. Both are the same source revision.
+- When this was written, no file of a tree with item 44 had been built on CI, and it was not known that a linker really running on Linux honours the entry. Both are seen since: §16.
 - No human has reviewed any of this, and nothing ran on physical hardware.
 
 ## 15. Item 44, step 2 (2026-11-12): the image that boots, in the gate
@@ -621,6 +621,62 @@ No boot matrix for this step: no image changed, and the keeper runs all three on
 
 ### 15.4 Not verified
 
-- **CI's digest for the converted image.** `onbf-pack` is a host tool, built for each host. That a Linux build of it converts the same ELF to the same bytes is expected and has not been seen. (§13.3 converted CI's ELF on the Mac, not the other way round.)
+- **CI's digest for the converted image,** when this was written. `onbf-pack` is a host tool, built for each host; that its Linux build converts the same ELF to the same bytes was expected and not seen. It is seen since: §16.
 - A carried program's own converted form: the kernel carries its segments as the gate already reads them, and they are compared as files.
 - A signed release image: no release signing exists yet to compare around.
+
+## 16. The comparison with CI on a tree that holds item 44: `8ae9e9b` (2026-11-12)
+
+The batch was pushed once more, at `8ae9e9b`, whose tree is `c6c2c68`'s: items 32 and 44 and item 44's step 2. CI ran on it (run 43275652672, its `cargo xtask check` job 131383211984).
+
+### 16.1 What CI's job showed by itself
+
+- `cargo xtask check` passed: 1,690 host tests, 0 failed, 27 ignored (the Mac runs 1,689; §13.1 says which one it cannot); Loom, all 53 models and all 78 controls.
+- **The new gates passed on a Linux host:** `version-gate`; `image-graph-gate`, over the same 19 packages under 3 images; and the reproducible-build gate, each of its eleven files the same from CI's two builds and free of that machine's paths.
+- **The Linux linker honours the fixed line.** The gate printed, for the program's linker output and for the kernel, that `.comment` holds the fixed line and not the linker's own. §14.9 had this as not verified.
+- The step that keeps the gate's files ran: 3,008,614 bytes as uploaded, the eleven files from each build, 7.4 MB unpacked.
+- The job's machine was an Intel Xeon Platinum 8573C with 4 processors, on the `ubuntu-24.04` image: the third processor model in three runs (§13.1, §13.6).
+
+### 16.2 The eleven files, the Mac's against CI's
+
+The Mac's are the gate's at `3fe5aef`, the last commit that changes code. The keeper's own eleven for `8ae9e9b`, built in another checkout on the same Mac, are the same eleven.
+
+| File | Bytes | SHA-256, on the Mac and on CI |
+|---|---|---|
+| loader, no feature | 196,096 | `b3ee60b9173235fdc38d708a2c95e14e3c065abdc8d89b28231c693a787dd6d2` |
+| loader, `test-trust-store` | 199,168 | `a9f7ddf8536b6cef49e81af38bc3dd70b2788e9baedd6d26cde2c85013830905` |
+| loader, `developer-mode` | 199,168 | `ee2a063f093fbbf4135f2b29155165d901d4c5b7bb29c20e915d36024e7e3eaf` |
+| `first_program` as the linker wrote it | 29,768 | `8a6658ab4662300661306886431348de8a1346c084bd61acda1901b30052b627` |
+| `first_program.0.bin` | 4,200 | `9e35a5739dc0e0133499a77bd12430720f0788a30c50e7f39e27b4b3c68dbf16` |
+| `first_program.1.bin` | 10,170 | `01f7addb33cac76c6aa8bf93d7607b2ab3ed30eb8455b684846fdf920fbad38c` |
+| `first_program.2.bin` | 640 | `592ee8a478796bb0cc4274c7cb9336f57a6fa4f5c834b24389944e553bccdb14` |
+| `first_program.3.bin` | 24 | `3341bcae4c97d7ba73e0728c783373725905eab0417cf220037920f0960679cb` |
+| `first_program.rs` | 1,748 | `364739ab7e1b18462e7fffeefe1a0e33282e1d795a19cd271fdef08487991bc5` |
+| kernel ELF | 1,680,400 | `897a6d0fc43a2cae92342f69da35a8b3d34bda30df3f60637bbf66c9858b178a` |
+| kernel image that boots | 1,545,848 | `239f308b539b85e2b28d14ee066ca9652cc8c021600f2f7490421bba9a6f5c92` |
+
+**All eleven are the same bytes on the two machines.** They were compared as files, each of the Mac's against the one in CI's artifact, and not by digest alone; CI's log prints the same eleven digests; and in the artifact each file of CI's second build is the same bytes as its first's.
+
+At `c34fdab`, before item 44, four of ten were the same (§13.2). Each digest here is the one predicted before CI ran: §14.3 and §14.5 for the first ten, §15.1 for the eleventh.
+
+### 16.3 What that shows, and what it does not
+
+**Shown:** for one commit, the eleven files the reproducible-build gate builds, built twice from nothing on an Apple-processor Mac and twice from nothing on a GitHub-hosted x86-64 Linux machine, are the same bytes in all four builds. Among them is the image that boots. The three things a build took from its host (§13.4) are ended on a real Linux host as well as under the Mac's stand-ins for one: the remap, the absence of host units, and the linker's fixed line each held there.
+
+**Not shown,** and what the requirement rows still ask:
+
+- **Every shipped artifact.** These eleven are what the tree builds today. The formats that will ship more, packages, drivers, applications, an installer's image, a release manifest, do not exist yet, and a new artifact is in the gate only when someone adds it there.
+- **A release candidate.** There has been none. This is one development commit.
+- **An independent rebuild.** CI built the pushed commit from nothing on another machine, with another account and another kind of host. It was started by the same push and uses the same workflow, toolchain download and repository as every other run; nobody outside the project rebuilt anything, and no step of a release says who rebuilds and where.
+- **A comparison that runs.** The gate on each machine runs on every `check`. The comparison across the two was made by hand, once, from CI's log and its kept files. Nothing compares the two machines' digests on the next commit.
+- **Other hosts.** One Mac with an Apple processor and GitHub's x86-64 Linux runners on one image. §14.7 lists what was not looked for.
+- **A signed image.** What a release ships is signed, and a signed image is never the same bytes twice (§15.2). The criterion's "the same bytes" can hold for what a signature covers and not for the signature.
+- **The relink path** (§14.5) has been exercised by a host test and one run on one stale directory in one checkout.
+
+### 16.4 What would close the gap between this and a check
+
+Not built when this was written; put to the coordinating session with the result. It decided the rows' states on this evidence (three are `built`, none `done`), made the second of these TASKS item 45, and put the first to the owner as decision item 275.
+
+- A comparison that runs: CI's `check` job on both of its runner images, and a job that compares the two artifacts. That is two machines on every run, both Linux; it is a new thing CI must pass.
+- A tool for the comparison made here by hand: a command that takes a directory of kept files and compares it with the gate's own.
+- Words in the rows' criterion for a signed artifact, which cannot be "the same bytes".
