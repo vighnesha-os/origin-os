@@ -130,7 +130,7 @@ Two cells move the figure by themselves. A row marked `info` leaves the count, a
 | done | H-05 |
 | done | S1-03, S5-01, S5-10, S6-01, S6-02, S6-03, S6-04, S6-05, S6-06, S6-07, S6-08, S6-09, S6-10, S6-11, S6-13, S8-01, S8-02, S8-04, S8-06, S8-08, S9-11, S10-06, S11-01, S11-02, S12-01, S13-01, S13-12, S13-14, S13-15, S17-03, S17-26, S18-16, S18-17, S59-03, S59-13, S62-01, S62-16, S62-17, S72-08, S79-04, S82-19, S84-07, S84-11, S84-12 |
 | done | F-01 |
-| done | A15-D8 |
+| done | A15-D8, A18-V2 |
 | info | H-01, H-02, H-03, H-04, H-09, H-10 |
 | info | S1-01, S1-02, S1-07, S1-75, S1-102, S4-01, S4-02, S4-03, S4-04, S4-05, S4-06, S4-07, S4-08, S4-09, S4-10, S4-11, S4-12, S4-13, S4-14, S4-15, S5-02, S7-01, S12-03, S14-12, S17-24, S49-30, S63-07, S70-17, S71-12, S77-01, S79-01, S80-02, S82-18 |
 | info | P9-01 |
@@ -148,6 +148,7 @@ Every answered item of `docs/engineering/OWNER_DECISIONS.md` is named in the "De
 | 23 | none | A comparison of two AMD manuals with AMD's own copies, done once. |
 | 70, 161 | none | How pull requests are offered: at 100 commits, and pull request 15 at 76. A rule of process that no statement of the directive or decision of an ADR carries. |
 | 167, 190 | none | How task 18b and the randomized model of its policy land: through pull request 16. Rules of process. |
+| 224–228, 231–236 | none | How rented bench machines are used: the provider, the budget cap, who signs up and holds the credentials, the order of the rentals, how Origin boots there (items 231 and 236), what is kept and where, what a bench record may claim, no self-hosted runner, and rentals through Latitude's API (`docs/research/2026-11-12-first-bare-metal-boot.md`). Rules of process for bench equipment, which ADR-0009 A1 keeps outside the declared scope. |
 
 ## Scope changes
 
