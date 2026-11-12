@@ -9,6 +9,7 @@
 | Starts from | `docs/research/2026-11-09-testing-without-buying-hardware.md`, which priced the first candidates on 2026-11-09 |
 | Prices | Excluding tax. Rupees at the ECB rate of 2026-11-11, read on 2026-11-12: $1 = ₹93.69, €1 = ₹104.25 ([Frankfurter, USD](https://api.frankfurter.dev/v1/latest?base=USD&symbols=INR,EUR), [EUR](https://api.frankfurter.dev/v1/latest?base=EUR&symbols=INR)) |
 | Owner's decisions | Section 6, unnumbered: the coordinating session numbers them |
+| Decided | On 2026-11-12 the owner accepted all eleven with the recommended answer ("Accept all 11"), as decision items 224–234, in section 6's order. This ledger is kept as it was put. |
 
 **How to read it.** **Page** means a provider's or vendor's own page, read on 2026-11-12 at the address given. **Repo** means a file at `land/s3-part2` (`e6456dc`) unless another revision is named. **Reasoning** means no source says it. Hetzner's and the other providers' pages were read for this ledger by research subagents of this session, which quoted each page; Latitude.sh's, AMD's and GitHub's pages were read directly. Nobody signed up with any provider.
 
