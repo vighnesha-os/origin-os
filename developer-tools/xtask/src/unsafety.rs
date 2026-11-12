@@ -169,6 +169,7 @@ const RING3_CRATES: &[&str] = &[
     "runtime/rt",
     "runtime/rt-mem",
     "tests/kernel/first-program",
+    "tests/kernel/pin-program",
 ];
 
 /// The ring-3 files that may hold `unsafe`, and what each needs it for. A file comes onto this list
@@ -194,6 +195,14 @@ const RING3_UNSAFE_FILES: &[(&str, &str)] = &[
         "tests/kernel/first-program/src/faults.rs",
         "the proof's deliberate faults: a write to its own code, a jump into its own data and a write to its relocated read-only data",
     ),
+    (
+        "tests/kernel/pin-program/src/calls.rs",
+        "each entry point of `origin.core` declared with six whole registers, so that the pin proof's scripts can pass a stub any register values, hostile ones among them",
+    ),
+    (
+        "tests/kernel/pin-program/src/raw.rs",
+        "the pin proof's script and scratch memory at the kernel's fixed addresses; its entry, which reads RFLAGS first; and the two calls the pin must stop: its one `syscall` of its own, and a jump into a stub",
+    ),
 ];
 
 /// The ring-3 crate roots, each of which denies `unsafe`; only the modules of listed files allow
@@ -203,6 +212,7 @@ const RING3_UNSAFE_FILES: &[(&str, &str)] = &[
 const RING3_ROOTS: &[&str] = &[
     "runtime/rt/src/lib.rs",
     "tests/kernel/first-program/src/main.rs",
+    "tests/kernel/pin-program/src/main.rs",
 ];
 /// What each of [`RING3_ROOTS`] carries.
 const DENY: &str = "#![deny(unsafe_code)]";

@@ -776,13 +776,13 @@ fn no_generator_markers(scenario: &mut Scenario) {
         "origin-kernel: random: no generator: known-answer test passed; on the boot processor RDSEED is absent and RDRAND is absent. Nothing will be launched and nothing placed at a random address (ADR-0016 R8)".into(),
         "origin-kernel: random: processor 0: RDSEED absent (0 draws passed), RDRAND absent (0 draws passed); its generator NOT seeded".into(),
         "origin-kernel: random: no generator, so no request is answered; consistent false: random failed".into(),
-        "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, Rust-program, service-directory and memory-object proofs did not run".into(),
+        "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, Rust-program, origin.core, entry-flags, service-directory and memory-object proofs did not run".into(),
         "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: true; the loader handed over no random value: true, and the region is at its fixed base: true".into(),
         // The network asks for no lease: a transaction ID must not be guessable.
         "; DHCP lease 0.0.0.0 (".into(),
         "; no random value for a transaction ID or port; consistent false: virtio-net failed".into(),
         "origin-kernel: boot verdict: degraded: ".into(),
-        "; 4 did not run; failed: ".into(),
+        "; 6 did not run; failed: ".into(),
         "random-number generator (no randomness)".into(),
         HALT_LINE.into(),
     ];
@@ -1561,6 +1561,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(identity_markers())
         .chain(launch_markers())
         .chain(rust_program_markers())
+        .chain(core_pin_markers())
         .chain(directory_markers())
         .chain(memory_markers())
         .chain(events_ports_markers())
@@ -1865,6 +1866,7 @@ fn boot_failures() -> Vec<&'static str> {
         ": start failed",
         ": rust program failed",
         ": origin.core failed",
+        ": entry flags failed",
         ": directory failed",
         ": memory failed",
         ": events and ports failed",
@@ -2398,6 +2400,30 @@ fn rust_program_markers() -> Vec<String> {
         "origin-kernel: rust program: two launches differ in base and stack: true; a write to its code faulted there: true; a jump into its data faulted there as a fetch: true; a write to its relocated read-only data faulted there: true; a panic ended it with the runtime's exit code: true; a launch refused before anything was made took nothing: true; a launch refused part-way through mapping, at the bound on its page tables, gave back every frame, table and heap byte it took: true".into(),
         "origin-kernel: rust program: loading and starting it took ".into(),
         "origin-kernel: rust program: every launched process and all they held are gone: heap ".into(),
+    ]
+}
+
+/// `origin.core` and the per-call pin, and the flags at a thread's entry (task S4-2; ADR-0005 B2,
+/// G1, H1; ADR-0011 L2, L3, L6 to L8, L13; `ipc_proof::prove_core_pin` and `prove_entry_flags`):
+/// the kernel writes `origin.core` into its frames once, and the second program it carries, a
+/// script interpreter in Rust, makes every call through it and is stopped where it must be.
+fn core_pin_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: core: a Rust program made every one of origin.kernel's 20 calls through origin.core: 20 calls of its script, each reported through debug_report, each with the status it must give, then thread_exit: true".into(),
+        "origin-kernel: core: the hostile scripts of \"IPC and handles\", made through the stubs, gave call for call the statuses they give directly, and each process exited by itself: ".into(),
+        " IPC calls (the one call number no method has is left out: no stub can ask it): true; 49 memory calls: true".into(),
+        "origin-kernel: core: one call through origin.core, as it is pinned: ".into(),
+        "origin-kernel: core: the per-call pin: a syscall in the program's own code stopped the thread, its ending naming call 1 and that address: true; a jump to debug_report's syscall with channel_create's number stopped it, naming call 5 and the stub's address: true; a number no stub has, 9999, stopped it there too: true".into(),
+        "origin-kernel: core: the kernel's proof processes keep their range: a call from outside it was refused with a status and the process went on to its own fault: true; a call number no method has answered NOT_SUPPORTED: true".into(),
+        "origin-kernel: core: origin.core in a process: a write to its page faulted there: true; memory_unmap and memory_protect of its range and a fixed memory_map over it each answered INVALID_ARGS, and calls through it went on: true; its 1 pages were still mapped read-execute on the same frames afterwards: true; two processes hold it on one set of frames, executable in ".into(),
+        " spaces and writable in none: true, at different bases: true".into(),
+        "origin-kernel: core: the binding: before its thread starts, each of pin_program's ".into(),
+        " import slots holds the address of its export in its own origin.core, on a page it cannot write: true; and each of first_program's ".into(),
+        "origin-kernel: core: narrow parameters: through its stub, a call whose 32-bit parameter has bits set above it, in the second, third and fourth registers, is the same call with them clear, 4 calls: true; the same registers in a direct call by a proof process are each INVALID_ARGS: true".into(),
+        "origin-kernel: core: every process it launched and all they held are gone: heap ".into(),
+        "; origin.core's own frames stay, mapped by no process: true".into(),
+        "origin-kernel: entry flags: a program's first instruction pushed RFLAGS, ".into(),
+        ", and found 0x202 and 0x202: the direction flag and the six status flags clear and interrupts on: true".into(),
     ]
 }
 

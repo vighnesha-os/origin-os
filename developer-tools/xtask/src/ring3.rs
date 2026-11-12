@@ -81,12 +81,20 @@ struct Program {
     entry: Option<&'static str>,
 }
 
-/// Every program the kernel carries.
-const PROGRAMS: &[Program] = &[Program {
-    package: "first-program",
-    name: "first_program",
-    entry: None,
-}];
+/// Every program the kernel carries. The second starts at an entry of its own, which reads
+/// RFLAGS before the runtime's runs (ADR-0005 Amendment 9, H1).
+const PROGRAMS: &[Program] = &[
+    Program {
+        package: "first-program",
+        name: "first_program",
+        entry: None,
+    },
+    Program {
+        package: "pin-program",
+        name: "pin_program",
+        entry: Some("origin_pin_entry"),
+    },
+];
 
 /// The package of each ring-3 image the kernel carries: `origin.core`, then each program.
 pub(crate) fn carried_packages() -> impl Iterator<Item = &'static str> {

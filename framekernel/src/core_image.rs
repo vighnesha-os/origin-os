@@ -179,13 +179,14 @@ pub(crate) fn image() -> &'static CoreImage {
 }
 
 #[cfg(target_os = "none")]
-pub(crate) use shared::{install, map_into};
+pub(crate) use shared::{frame, install, map_into, mappings};
 
 /// The one set of frames, and the only code that touches them.
 #[cfg(target_os = "none")]
 mod shared {
     use alloc::vec::Vec;
 
+    use origin_frame::addr::PhysAddr;
     use origin_frame::once::SetOnce;
     use origin_frame::userspace::{ChangeError, SharedFrame, UserSpace};
     use origin_paging::{Access, MapError};
@@ -260,6 +261,20 @@ mod shared {
     pub(crate) fn map_into(space: &UserSpace, base: u64) -> Result<(), ChangeError> {
         let frames = FRAMES.get().ok_or(MapError::OutOfMemory)?;
         space.map_shared_run(base, frames, Access::ReadExecute)
+    }
+
+    /// The physical address of page `page` of `origin.core`, for the boot proof that two
+    /// processes map the same frames.
+    #[must_use]
+    pub(crate) fn frame(page: usize) -> Option<PhysAddr> {
+        FRAMES.get()?.get(page).map(SharedFrame::phys)
+    }
+
+    /// How many mappings make `origin.core`'s first frame writable, and how many executable, in
+    /// every space: the first is always 0 (the framework refuses one beside the other).
+    #[must_use]
+    pub(crate) fn mappings() -> Option<(u32, u32)> {
+        FRAMES.get()?.first().map(SharedFrame::mappings)
     }
 }
 

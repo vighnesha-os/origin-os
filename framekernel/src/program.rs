@@ -329,6 +329,8 @@ include!(concat!(
     ),
     "/first_program.rs"
 ));
+#[cfg(target_os = "none")]
+include!(concat!(env!("ORIGIN_CARRIED_PROGRAMS"), "/pin_program.rs"));
 
 /// What the first program is given (ADR-0005 G6), each kind deliberately: its three start
 /// handles, room for the one message it writes, and the developer calls, since it reports to its

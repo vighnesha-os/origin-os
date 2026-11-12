@@ -269,6 +269,8 @@ pub(crate) struct ProgramLimits {
 pub(crate) struct LoadedProgram {
     /// The child, which nothing else holds yet.
     pub(crate) process: Process,
+    /// Where `origin.core` starts in the child: the base its calls are pinned to.
+    pub(crate) core: u64,
     /// Where the program starts: each offset in its description is from here.
     pub(crate) base: u64,
     /// Its entry point's address.
@@ -326,6 +328,7 @@ pub(crate) fn load_program(
     let (stack, stack_top) = place_stack(&mut child, run.stack_pages)?;
     Ok(LoadedProgram {
         process: child,
+        core,
         base,
         entry: base + program.entry,
         stack,

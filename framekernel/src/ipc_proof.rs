@@ -117,9 +117,11 @@ enum Arg {
 }
 use Arg::{Handle as Hd, Imm};
 
+mod core_pin;
 mod directory;
 mod events_ports;
 mod memory_objects;
+pub(crate) use core_pin::{prove_core_pin, prove_entry_flags};
 pub(crate) use directory::prove_directory;
 pub(crate) use events_ports::{prove_events_ports, prove_user_clock};
 pub(crate) use memory_objects::prove_memory;
@@ -546,6 +548,101 @@ fn check_groups(com1: &mut Console, groups: &[Group], reports: &[u64]) -> bool {
         );
     }
     ok
+}
+
+/// The first step among `groups` whose report is not what it must be: its group's title, its
+/// name (empty for a setup step) and what it reported. `None` when every step is right and
+/// `reports` holds exactly one value for each step that reports. [`check_groups`] without the
+/// printing, for a proof that runs another proof's script a second way.
+fn first_wrong(
+    groups: &[Group],
+    reports: &[u64],
+) -> Option<(&'static str, &'static str, Option<u64>)> {
+    let mut at = 0;
+    for group in groups {
+        for s in &group.steps {
+            if matches!(s.want, Want::Nothing) {
+                continue;
+            }
+            let got = reports.get(at).copied();
+            at += 1;
+            let right = match s.want {
+                Want::Status(w) => got == Some(w as u64),
+                Want::Value(w) => got == Some(w),
+                Want::Nothing => true,
+            };
+            if !right {
+                return Some((group.title, s.name, got));
+            }
+        }
+    }
+    (at != reports.len()).then_some(("", "more reports than steps", reports.get(at).copied()))
+}
+
+/// How a scripted process makes its calls.
+#[derive(Clone, Copy)]
+enum Via<'a> {
+    /// The assembly interpreter, by its own `syscall` instructions, under the range its creator
+    /// names (ADR-0005 A6): one of the kernel's proof processes.
+    Direct,
+    /// The Rust interpreter the kernel carries, through `origin.core`'s stubs, pinned per call
+    /// (ADR-0005 B2; task S4-2), launched by this creator.
+    Core(&'a Process),
+}
+
+/// A scripted process, made and not yet started: its memory can still be written, and handles
+/// granted into its table.
+struct Scripted {
+    image: Image,
+    /// Where the launch path put the carried program, for a process made [`Via::Core`].
+    pinned: Option<core_pin::Placed>,
+}
+
+impl Scripted {
+    /// A process under `limits` that will run a script: the assembly interpreter at [`CODE`],
+    /// or the carried Rust interpreter, as `via` says. A process made through `origin.core`
+    /// gets two handles more than `limits` gives, for the process and thread handles its start
+    /// record holds, so that a script finds the same room in its table either way.
+    fn new(limits: Limits, via: Via<'_>) -> Option<Self> {
+        match via {
+            Via::Direct => Some(Self {
+                image: Image::new(limits, proof_programs::script())?,
+                pinned: None,
+            }),
+            Via::Core(creator) => core_pin::scripted(creator, limits),
+        }
+    }
+
+    /// Starts it on `cpu`, to run the script written at [`SCRIPT`]. With `own_slot`, a handle
+    /// to its own process, with C6's rights for one, is in that slot when the script runs.
+    fn start(self, cpu: CpuIndex, own_slot: Option<u64>) -> Option<ObjectRef<Process>> {
+        match self.pinned {
+            Some(placed) => core_pin::start(self.image, placed, cpu, own_slot.map(slot_addr)),
+            None => {
+                let process = self.image.finish()?;
+                if let Some(slot) = own_slot {
+                    // Its own handle; the table closes it when the process ends.
+                    let own = process.grant(Object::Process(process.clone()), rights::PROCESS);
+                    if !own.is_ok_and(|own| write_slot(&process, slot, own)) {
+                        process.abandon();
+                        return None;
+                    }
+                }
+                Process::start_thread(&process, cpu, CODE, STACK + PAGE, SCRIPT).ok()?;
+                Some(process)
+            }
+        }
+    }
+}
+
+/// Whether `origin.core` has a stub for `step`'s call: a pseudo-step is the interpreter's own,
+/// and a number no method has can be asked of the kernel only by a `syscall` that is no
+/// stub's.
+fn has_stub(step: &Step) -> bool {
+    (step.number as i64) < 0
+        || origin_syscalls::origin_kernel::kernel::server::CALLS
+            .iter()
+            .any(|call| call.number == step.number)
 }
 
 // ------------------------------------------------------------------ the proofs
@@ -1287,67 +1384,86 @@ fn full_queue_steps(timed_out: i64, wait_status: i64) -> Vec<Step> {
 
 /// A process makes every bad call, each checked against the status it must return; the
 /// kernel is undisturbed if the rest of the boot runs.
-fn hostile(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
+/// One run of a hostile script: its groups as run, what the process reported, whether it ended
+/// in time, and whether it ended by its own exit with 0.
+struct HostileRun {
+    groups: Vec<Group>,
+    reports: Vec<u64>,
+    ended: bool,
+    exited: bool,
+}
+
+/// Runs the hostile script in a process made as `via` says, and returns what it did with the
+/// other process's handle value. Made through `origin.core`, the script is less the one step
+/// that asks for a call number no method has: there is no stub to ask through.
+fn hostile_run(via: Via<'_>, bsp: CpuIndex, tsc_hz: u64) -> Option<(HostileRun, Handle)> {
     // Another process with a live handle whose value is not live in the hostile process:
     // slot 40, which the hostile process's table never reaches.
-    let Some(other) = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL) else {
-        return false;
-    };
-    let Ok((end, peer)) = ipc::create_channel(&other.account) else {
-        return false;
-    };
+    let other = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)?;
+    let (end, peer) = ipc::create_channel(&other.account).ok()?;
     drop(peer);
     let mut foreign = 0;
     for _ in 0..=40 {
-        match other.grant(Object::Channel(end.clone()), rights::CHANNEL) {
-            Ok(value) => foreign = value,
-            Err(_) => return false,
-        }
+        foreign = other
+            .grant(Object::Channel(end.clone()), rights::CHANNEL)
+            .ok()?;
     }
     drop(end);
 
     let kernel = core::ptr::from_ref(&ROUNDS_MARKER).addr() as u64;
-    let Some(mut image) = Image::new(LIMITS, proof_programs::script()) else {
-        return false;
-    };
+    let mut scripted = Scripted::new(LIMITS, via)?;
     // A live end of the hostile process's own, for E1's steps; its peer stays here.
-    let Ok((own, own_peer)) = ipc::create_channel(&image.process.account) else {
-        return false;
-    };
-    let Ok(live) = image.process.grant(Object::Channel(own), rights::CHANNEL) else {
-        return false;
-    };
-    let groups = hostile_groups(kernel, foreign, live);
+    let (own, own_peer) = ipc::create_channel(&scripted.image.process.account).ok()?;
+    let live = scripted
+        .image
+        .process
+        .grant(Object::Channel(own), rights::CHANNEL)
+        .ok()?;
+    let mut groups = hostile_groups(kernel, foreign, live);
+    if matches!(via, Via::Core(_)) {
+        for group in &mut groups {
+            group.steps.retain(has_stub);
+        }
+    }
     let steps: Vec<Step> = groups
         .iter()
         .flat_map(|g| g.steps.iter().copied())
         .collect();
-    if image.scratch().is_none() || image.script(&steps).is_none() {
-        return false;
-    }
-    let Some(process) = image.finish() else {
-        return false;
-    };
-    if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
-        return false;
-    }
+    scripted.image.scratch()?;
+    scripted.image.script(&steps)?;
+    let process = scripted.start(bsp, None)?;
     let ended = await_end(&process, tsc_hz, 10);
     let reports = process.reports();
-    let groups_ok = check_groups(com1, &groups, &reports);
-    let exit_ok = process.ending() == Some(Ending::Exited(0));
+    let exited = process.ending() == Some(Ending::Exited(0));
     // The process lived through all of it and ended by its own exit; the other process's
     // handle was never reachable from it.
     drop(own_peer);
-    let right = ended && groups_ok && exit_ok && foreign >> GENERATION_BITS == 41;
+    // It never ran: only its handle table mattered. It is dropped with its handles.
+    drop(other);
+    Some((
+        HostileRun {
+            groups,
+            reports,
+            ended,
+            exited,
+        },
+        foreign,
+    ))
+}
+
+fn hostile(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let Some((run, foreign)) = hostile_run(Via::Direct, bsp, tsc_hz) else {
+        return false;
+    };
+    let groups_ok = check_groups(com1, &run.groups, &run.reports);
+    let right = run.ended && groups_ok && run.exited && foreign >> GENERATION_BITS == 41;
     let _ = writeln!(
         com1,
         "origin-kernel: ipc: every hostile call returned its status and the process exited by itself ({} calls); user-copy faults recovered: {}{}",
-        reports.len(),
+        run.reports.len(),
         cpu::user_copy_faults(),
         if right { "" } else { ": ipc failed" }
     );
-    // It never ran: only its handle table mattered. It is dropped with its handles.
-    drop(other);
     right
 }
 
@@ -1355,6 +1471,23 @@ fn hostile(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
 /// corpus fills a process's report log: it may commit two pages and hold two mappings, and
 /// names its own process handle, in slot [`HOSTILE_SELF`], for every call.
 fn hostile_memory(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
+    let Some(run) = hostile_memory_run(Via::Direct, bsp, tsc_hz) else {
+        return false;
+    };
+    let groups_ok = check_groups(com1, &run.groups, &run.reports);
+    let (ended, reports) = (run.ended, &run.reports);
+    let right = ended && groups_ok && run.exited;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: ipc: every hostile memory call returned its status and the process exited by itself ({} calls){}",
+        reports.len(),
+        if right { "" } else { ": ipc failed" }
+    );
+    right
+}
+
+/// Runs the memory calls' hostile corpus in a process made as `via` says.
+fn hostile_memory_run(via: Via<'_>, bsp: CpuIndex, tsc_hz: u64) -> Option<HostileRun> {
     let kernel = core::ptr::from_ref(&ROUNDS_MARKER).addr() as u64;
     let groups = alloc::vec![
         Group {
@@ -1385,39 +1518,23 @@ fn hostile_memory(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         },
         ..LIMITS
     };
-    let Some(mut image) = Image::new(limits, proof_programs::script()) else {
-        return false;
-    };
-    if image.scratch().is_none() || image.script(&steps).is_none() {
-        return false;
-    }
+    let mut scripted = Scripted::new(limits, via)?;
+    scripted.image.scratch()?;
+    scripted.image.script(&steps)?;
     for (k, request) in hostile_requests().iter().enumerate() {
-        if image.write(hostile_request(k as u64), request).is_none() {
-            return false;
-        }
+        scripted.image.write(hostile_request(k as u64), request)?;
     }
-    let Some(process) = image.finish() else {
-        return false;
-    };
-    // Its own handle; the table closes it when the process ends.
-    let own = process.grant(Object::Process(process.clone()), rights::PROCESS);
-    if !own.is_ok_and(|own| write_slot(&process, HOSTILE_SELF, own)) {
-        return false;
-    }
-    if Process::start_thread(&process, bsp, CODE, STACK + PAGE, SCRIPT).is_err() {
-        return false;
-    }
+    // Its own handle, in the slot the script names.
+    let process = scripted.start(bsp, Some(HOSTILE_SELF))?;
     let ended = await_end(&process, tsc_hz, 10);
     let reports = process.reports();
-    let groups_ok = check_groups(com1, &groups, &reports);
-    let right = ended && groups_ok && process.ending() == Some(Ending::Exited(0));
-    let _ = writeln!(
-        com1,
-        "origin-kernel: ipc: every hostile memory call returned its status and the process exited by itself ({} calls){}",
-        reports.len(),
-        if right { "" } else { ": ipc failed" }
-    );
-    right
+    let exited = process.ending() == Some(Ending::Exited(0));
+    Some(HostileRun {
+        groups,
+        reports,
+        ended,
+        exited,
+    })
 }
 
 /// What the "kernel pointer" argument points at.

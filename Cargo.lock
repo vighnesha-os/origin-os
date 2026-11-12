@@ -180,6 +180,15 @@ name = "origin-version"
 version = "0.0.0"
 
 [[package]]
+name = "pin-program"
+version = "0.0.0"
+dependencies = [
+ "origin-abi",
+ "origin-kernel-client",
+ "origin-rt",
+]
+
+[[package]]
 name = "xtask"
 version = "0.0.0"
 dependencies = [
