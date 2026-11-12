@@ -245,3 +245,27 @@ The OIDL grammar, the Driver ABI, the graphics path, any POSIX layer, how `std` 
 **Migration consequences.** None for programs outside the tree: `user-abi` is at major 0 (ADR-0005 P12). When the Loader Service exists, L1's carried programs become EXE images it maps, and how L7's base is recorded then is decided with the Loader Service.
 
 **What stays unknown.** The ledger's section 6: whether a naked function can ever be duplicated by the compiler (L6's gate holds the rule either way); whether `origin.core` links with nothing to relocate; the form of the kernel-private description; the round trip's cost; the psABI revision. When built, step 4 runs under QEMU and as KVM guests in CI. Nothing will have run on a declared machine.
+
+## Amendment 3 (Accepted, 2026-11-13): `origin.core`'s C entry points under the pinned psABI
+
+**Status: Accepted by the owner on 2026-11-13, each item with the recommended answer ("Accept all 5", decision sheet items 273 and 274; CLAUDE.md §84). Nothing in it is built.** Amendment 2's L5 asked for the psABI revision to be pinned before task S4-2 publishes the first export. Pinning it (decision item 271; CLAUDE.md 7.7 §17; `docs/research/2026-11-12-psabi-revision.md`) showed one thing the accepted texts did not cover, L13. L14 answers a question the independent review of task S4-1 left for S4-2 (finding F11).
+
+| # | Item | Decision | Refines |
+|---|---|---|---|
+| L13 | 273 | **Each generated stub extends every parameter narrower than 64 bits to its whole register before the call.** Zero for an unsigned integer, a `bool`, an enum and a bits type; the sign for a signed integer. The pinned psABI leaves the bits of an argument register beyond the parameter's type unspecified, and says the side that consumes the value extends it (the ledger's row R5). The kernel's register decoding judges the whole register (OIDL §10: "the value fits", "correctly sign-extended", "`0` or `1`"), and a naked stub (L6) passes the caller's register on as it is. So the stub, which is where the C call is consumed, extends; and the kernel's check stays as it is, so a call that does not come through a stub is still refused when its register does not fit. No C signature, wire format or call number changes. OIDL §10 gains the rule when S4-2 builds the stubs, as Amendment 2 says of the stubs' form. | L5, L6; OIDL §10; CLAUDE.md §10 |
+| L14 | 274 | **`origin.core` reserves no exit codes at major 0.** `thread_exit`'s code is the program's, the whole `u64`. The three codes `origin-rt` ends a thread with (a panic, a start record that does not decode, an unwind) are that runtime's own documented convention: they share the program's space, and nothing may depend on them. How a process's end is reported, an exit apart from a panic and from a fault, is decided with P10's crash record and the process-creation calls (ADR-0005 G4), before `user-abi` reaches major 1. | L5; ADR-0005 P10 and P12 |
+
+**Options that were put.** For L13: (a) as decided; (b) every register parameter a 64-bit type in the C signature, which puts the widening on every caller and makes the header say less than the interface; (c) the kernel ignores the upper bits, which weakens its check for every caller that is not a stub (the kernel's proof processes, L8). For L14: (a) as decided; (b) reserve a range of codes for the runtime and the system now, which fixes a detail of the ABI before the reporting of a process's end is designed.
+
+**Recorded, and no decision.**
+- **L6's gate.** The gate reads each stub for the load of its own number before its one `syscall`. The extensions sit before that load, and the gate has to allow exactly them: an extension of a parameter register of that method, and nothing else. That is S4-2's to build, with a control.
+- **Results.** A status comes back in the whole of RAX as `int64_t`, and every other result through a pointer of its own size, so nothing on the way back needs extending.
+- **The fourth argument.** A C caller passes it in RCX and the kernel takes it in R10 (ADR-0005 P4). That move is part of a stub already, and is not this decision.
+
+**Performance cost (ADR-0018 V3).** L13: one register-to-register instruction for each parameter narrower than 64 bits, in each call. Unmeasured and owed: S4-2's exit tests already ask for the cost of one call before the pin and after it, and the figure is reported with them, under QEMU and as KVM guests in CI, as a trend (CLAUDE.md §53). L14: none, by construction.
+
+**Trade-offs.** L13 spends an instruction on a caller whose compiler had already extended the value, which is most callers; in return a correct call is never refused for what a compiler left beside its argument. L14 leaves a parent unable to tell a panic from a program's own exit code for now.
+
+**Migration consequences.** None for programs outside the tree: `user-abi` is at major 0 (ADR-0005 P12). The generated stubs change form with S4-2 in any case (L6).
+
+**What stays unknown.** What Rust 1.99.1 and a C compiler each leave in the upper bits in practice was not measured, and L13 does not depend on it. When built, this runs under QEMU and as KVM guests in CI only.
