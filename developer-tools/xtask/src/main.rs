@@ -9,11 +9,13 @@
 mod asmflags;
 mod disk;
 mod documents;
+mod expected_warning;
 mod image;
 mod interfaces;
 mod lex;
 mod loom;
 mod mnemonics;
+mod provenance;
 mod reproducible;
 mod requirements;
 mod ring3;
@@ -26,7 +28,7 @@ mod unsafety;
 use std::borrow::Cow;
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, ExitCode, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -83,7 +85,11 @@ commands:
               for every statement of CLAUDE.md and every decision of an accepted ADR, each
               true to the tree; prints the coverage figure (part of check; CLAUDE.md §1;
               quick)
-  regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
+  provenance-gate only the gate on the provenance table in
+              docs/engineering/SOURCE_PROVENANCE.md: one row for each crate, each of §6's
+              fields filled, its dependencies named and its licence stated (part of check;
+              CLAUDE.md §6; quick)
+  regenerate rewrites the kernel's generated system-call crate from sdk/interfaces
   image-gate [kernel ELF]
               only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
               and no jump table, in the code this build compiled. Builds the kernel first, or
@@ -2532,6 +2538,7 @@ fn main() -> ExitCode {
         ["cfg-lint"] => linux_cfg_lint(),
         ["interface-gate"] => interfaces::gate(),
         ["requirements-gate"] => requirements::gate(),
+        ["provenance-gate"] => provenance::gate(),
         ["regenerate"] => interfaces::regenerate(),
         ["image-gate"] => in_turn("image-gate", image::build_and_gate),
         ["image-gate", elf] => image::gate(Path::new(elf)),
@@ -3029,7 +3036,9 @@ fn cargo() -> Command {
     c
 }
 
-/// Runs `cmd` with inherited stdio and fails unless it exits successfully.
+/// Runs `cmd` and fails unless it exits successfully. Its standard output is inherited. Its
+/// error output passes through line by line, except the one compiler warning `cargo xtask`
+/// expects, which is collapsed to a single note (`expected_warning.rs`, ADR-0017 Z10).
 fn run_step(cmd: &mut Command) -> Result {
     let shown = std::iter::once(cmd.get_program())
         .chain(cmd.get_args())
@@ -3037,9 +3046,44 @@ fn run_step(cmd: &mut Command) -> Result {
         .collect::<Vec<_>>()
         .join(" ");
     println!("xtask: $ {shown}");
-    let status = cmd
-        .status()
+    // Piped, cargo would drop its colours; keep them where a person is watching.
+    if env::var_os("CARGO_TERM_COLOR").is_none() && std::io::stderr().is_terminal() {
+        cmd.env("CARGO_TERM_COLOR", "always");
+    }
+    let mut child = cmd
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("cannot run `{shown}`: {e}"))?;
+    let mut filter = expected_warning::Filter::default();
+    if let Some(stderr) = child.stderr.take() {
+        let mut reader = BufReader::new(stderr);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            let read = reader
+                .read_until(b'\n', &mut bytes)
+                .map_err(|e| format!("reading the output of `{shown}`: {e}"))?;
+            if read == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let line = text.strip_suffix('\n').unwrap_or(&text);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            for out in filter.line(line) {
+                eprintln!("{out}");
+            }
+        }
+    }
+    let (rest, dropped) = filter.finish();
+    for out in rest {
+        eprintln!("{out}");
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("cannot run `{shown}`: {e}"))?;
+    if dropped != expected_warning::Dropped::default() {
+        println!("{}", expected_warning::note(&dropped));
+    }
     if status.success() {
         Ok(())
     } else {
@@ -3256,6 +3300,7 @@ fn check() -> Result {
     linux_cfg_lint()?;
     documents::gate()?;
     requirements::gate()?;
+    provenance::gate()?;
     unsafety::gate()?;
     interfaces::gate()?;
     manifest_version_lint()?;
