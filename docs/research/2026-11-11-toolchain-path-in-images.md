@@ -24,6 +24,8 @@ So another account, or another machine, gives strings of another length and cann
 |---|---|---|
 | R1 | The rustc book as published for Rust 1.99.1: "Command-line Arguments" (`--remap-path-prefix`, `--remap-path-scope`) and the chapter "Remap source paths": `doc.rust-lang.org/1.99.1/rustc/command-line-arguments.html` and `…/rustc/remap-source-paths.html` | Read on 2026-11-11 |
 | R2 | The Cargo book as published for 1.99.1, "Configuration": `doc.rust-lang.org/1.99.1/cargo/reference/config.html`, for `build.rustflags`, how values from several sources are joined, `--config`, and the names of environment variables | Read on 2026-11-11 |
+| R3 | Cargo's own source, one file: `src/compiler/build_runner/compilation_files.rs` in `github.com/rust-lang/cargo` at commit `5f94df4789f005f9a352888e8355ffc645b7ed0e`, which is the commit `cargo -vV` reports for 1.99.1. MIT OR Apache-2.0 | Read on 2026-11-12, for §12.6: how a crate's `-C metadata` value is made, which R2 does not say. A build tool's source (CLAUDE.md §4), read after step 2's code was committed; nothing of it is in Origin's code |
+| C1 | CI's logs for this repository: run 43201395354 at `f5ab54f` (its `check` and toolchain jobs) and run 43230979284 at `9e4f79f` (its `check` job) | Read on 2026-11-12, for §12.4 and §12.5 |
 | T1 | The toolchain itself: `rustc 1.99.1 (58cf8f9c3 2026-10-13)`, commit `58cf8f9c35b355199727627d07ae34a4e2846d67`, and `cargo 1.99.1 (5f94df478 2026-08-27)`, on `aarch64-apple-darwin` | What `cargo build -v` passes to rustc, and what the images then hold (`strings`, `cmp`, `llvm-objdump`), each observed on 2026-11-11 |
 
 What R1 says, in this ledger's words:
@@ -182,3 +184,147 @@ As in §7, the disassembly is the same text in both once addresses and displacem
 The digests change with every change to the kernel's or the loader's source, so the comparison is of one commit: the Mac's figures for the batch's tip are the ones the keeper's own `check` prints there, not the ones in this ledger.
 
 **Still open after this:** a check of each carried program's own bytes before the kernel includes them, and the refusal of the userspace triple's variable. Both wait for S4-1's review fixes, which edit the same files.
+
+## 12. Step 2 (2026-11-12): each carried program's own bytes, the other ways in, and CI
+
+The coordinating session asked for this once S4-1's review answers were in the batch (`land/s4` at `9e4f79f`). Its contract is under "Task contracts" in `TASKS.md`.
+
+### 12.1 What step 1 said too much about
+
+§11 and step 1's matrix rows say the kernel "with the program it carries" is built twice and compared. The kernel was built twice. The program was built once: `ring3::programs()` built it in Cargo's own target directory, and both of the gate's kernels included that one build. So a carried program that differed from one build to the next would not have been seen. Nothing was found wrong with the program; the record said more than was shown.
+
+### 12.2 What the gate does now
+
+The gate has two target directories. In each it now builds, from nothing: the three loaders, each carried program, and then the kernel, which includes the program built in that same directory. For each program it reads six files from each directory: the file the linker wrote, the four segment files `onbf-pack carried` writes, and the description (`first_program.rs`). With the three loaders and the kernel that is ten files. Each pair must be the same bytes, and neither may hold the toolchain's directory, Cargo's home or the checkout.
+
+After the kernel's pair, the gate looks for each segment file's bytes in the kernel's image and fails unless every one is there. So what it searched is what the kernel carries. In the real kernel each of the four occurs exactly once.
+
+The two directories must hold the same file names, or the gate fails: a program that gained or lost a segment between two builds is a difference too.
+
+### 12.3 Every way in that was tried
+
+Each row was tried with Cargo 1.99.1 on the development Mac, with plain `cargo build -v` or with a small program put in the compiler's place that records each time it is run. "Reaches" means the build's `rustc` command changed.
+
+| Way in | The ring-3 build | The loader and the kernel | `xtask` |
+|---|---|---|---|
+| `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` | replaces every flag of `.cargo/userspace.toml` | replaces every flag (§6) | refuses (step 1) |
+| `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS` | reaches it; its flags go in front of the file's | not their triple | **refuses now** |
+| `CARGO_TARGET_X86_64_UNKNOWN_NONE_RUSTFLAGS`, `…_UEFI_RUSTFLAGS` | not its triple | reaches them (§6) | refuses (step 1) |
+| `CARGO_BUILD_RUSTFLAGS` | does not reach it | does not reach them (§6) | lets through |
+| `RUSTC`, `CARGO_BUILD_RUSTC` | run in the compiler's place: 11 times in one build | the same: 15 times in one build of the loader | **refuses now** |
+| `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER`, `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER` | each is run around the compiler | the same | **refuses now** |
+| `CARGO_TARGET_X86_64_UNKNOWN_NONE_LINKER`, `…_UEFI_LINKER` | not its triple | replaces the linker | **refuses now** |
+| `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER` | does not reach it: the file's `-C linker=rust-lld` is used | not their triple | lets through |
+| A configuration file above the checkout, or in Cargo's home, with `[target.x86_64-unknown-linux-gnu] rustflags`, `[target.'cfg(target_os = "linux")'] rustflags` or `[target.'cfg(all())'] rustflags` | reaches it; joined to the file's | the same, by their own triples or `cfg` | **does not look: a limit, below** |
+| The same file with `[build] rustflags` | does not reach it | does not reach them | — |
+
+Three notes on the table.
+
+- **Why a compiler or wrapper variable is refused and not only reported.** `xtask` asks the `rustc` on the path for its directory and commit, and checks the commit against the pin. A variable that makes Cargo run another program for every compilation goes around that check: the commit would be the pinned one and the compiler would not.
+- **Why the userspace triple's linker variable is let through.** It does not reach the ring-3 build, whose flags name the linker themselves. And on a Linux host it is the host's own setting, which a developer may need for host tools.
+- **`xtask` itself is started by `cargo run`.** What Cargo and rustup add to its environment was listed with a three-line program: `CARGO`, `CARGO_HOME`, `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`, the `CARGO_PKG_…` variables, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `RUSTUP_TOOLCHAIN_SOURCE` and `RUST_RECURSION_COUNT`. None is refused, and nothing in the repository or in CI's workflow sets one that is.
+
+**The limit: a configuration file outside the repository.** Cargo reads `.cargo/config.toml` in every directory above the one it runs in, and in its home, and joins their lists to the repository's. Such a file can add flags to any image. `xtask` does not look for one, for three reasons:
+
+- Cargo 1.99.1 has no stable command that prints the configuration in effect (`cargo config get` is unstable), so `xtask` would have to find and read the files as Cargo does, and would be wrong wherever it read them differently;
+- this project's worktrees sit under the main checkout, so every worktree build already reads the main checkout's `.cargo/config.toml`. A rule against any file above the checkout would refuse the project's own layout;
+- the gate cannot see such a file either, since both of its builds share it. What catches it is a comparison with a build made elsewhere: the digests would differ.
+
+So the limit stands, and it is one more reason the comparison across machines matters. Ending it would mean `xtask` passing each image's complete flag list itself, so that nothing outside could add to it. That is a change to how every image is built, and is not proposed here.
+
+### 12.4 What CI has shown, and what it has not
+
+**No CI run has reached the gate on a tree that holds item 32.** The batch's pull request ran CI at `9e4f79f` (run 43230979284). Its `cargo xtask check` job failed in `xtask`'s own host tests, 242 passed and 1 failed: a test step 1 added, `the_ring_3_builds_get_the_remap_for_their_own_triple_alone`, asserted that no entry of the freestanding builds' configuration contains the userspace triple. On CI the toolchain's directory is named `1.99.1-x86_64-unknown-linux-gnu`, and the entry holds that directory. The test had only ever run on the Mac, whose toolchain is named for `aarch64-apple-darwin`. The keys were right on both; the test was wrong. It now compares keys, and a second test builds the entries from a directory named as CI's is (`9648878`).
+
+`xtask`'s tests are the first tests `check` runs, after the format check and seven clippy runs. So for that tree CI ran nothing after them: not the other crates' host tests on an x86-64 host, not Loom, not this gate.
+
+**The last digests CI printed are of `f5ab54f`** (run 43201395354), a tree that holds S4-1 and not item 32. Its gate was item 31's:
+
+| Image | Size on CI | CI's SHA-256 |
+|---|---|---|
+| loader, no feature | 196,096 | `cbe34acdc6fcbe070f2aa012265ecd553ffbb6e4436d6c28dfd6daed8cd5ea6a` |
+| loader, `test-trust-store` | 199,168 | `2fbd37a2142e15e48c0a8eb97b3ec95f9d2eea30bd57f4cee53c3f838d555b29` |
+| loader, `developer-mode` | 199,168 | `d58cdc00943884584fa2fd12bee1a828f1ca466f48eb0dd0242669883444190b` |
+| kernel ELF | 1,676,072 | `6808e6eca1e96a8939faf1a1cc23d2bc68eb242602eace201b6914c14c6b51ea` |
+
+Those images hold the path of CI's toolchain, as the Mac's held the Mac's before item 32, so the two machines' digests for that commit could not be equal. They can still be used.
+
+### 12.5 The Mac's builds of that commit, compared with CI's
+
+This is the comparison across two machines that can be made today. It is of `f5ab54f`, the tree before item 32, with the Mac's build given the two things known to differ. Nothing was pushed for it.
+
+**The first: the path.** In a copy of `f5ab54f`, each target's flag list in `.cargo/config.toml` and `.cargo/userspace.toml` got one more flag, which remaps the Mac's toolchain source directory to the path CI's has (`/home/runner/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/lib/rustlib/src/rust`). That commit's own `cargo xtask reproducible-gate` was then run in the copy, in the machine's turn.
+
+**The second: the host the compiler reports.** §12.6 says why it matters. A stand-in was put in the compiler's place with `RUSTC`. It passes every command to the pinned `rustc` unchanged, and changes one thing: in the output of `rustc -vV`, the line `host: aarch64-apple-darwin` reads `host: x86_64-unknown-linux-gnu`. CI's toolchain job prints the same seven lines with that host. These builds were made with plain `cargo` at two jobs, with the commands `xtask` runs; with `rustc` as it is, the same commands give the digests of the copy's gate, for all four images.
+
+| Image of `f5ab54f` | The Mac, with CI's path | The Mac, with CI's path and CI's host line | CI |
+|---|---|---|---|
+| loader, no feature | `cbe34acd…5ea6a` | `cbe34acd…5ea6a` | `cbe34acd…5ea6a` |
+| loader, `test-trust-store` | `d42c6ec7…8685` | `2fbd37a2…5b29` | `2fbd37a2…5b29` |
+| loader, `developer-mode` | `dc329a24…1bf3` | `d58cdc00…190b` | `d58cdc00…190b` |
+| kernel ELF | `e247d280…11ac`, 1,676,104 bytes | `2f7ece6c…86e1`, 1,676,088 bytes | `6808e6ec…51ea`, 1,676,072 bytes |
+
+What that shows:
+
+- **The three loaders: the Mac writes CI's bytes, bit for bit,** once those two things are CI's. So for these three images, two things are all that a build takes from its host. Item 32 removed the first. The second is still there.
+- **The loader with no feature does not follow the host line:** its bytes are CI's with the path alone.
+- **The kernel is not explained.** The host line changes its bytes and moves its size 16 bytes toward CI's, and CI's is 16 bytes smaller again and another digest. Something else about the build on CI reaches the kernel. It was not found. Finding it needs CI's own file, to compare section by section, or a Linux machine to build on; neither was available.
+- The carried program: its four segments are the same bytes with either host line. The file the linker wrote is not: it differs outside those segments. CI printed nothing for it at `f5ab54f`, so it was compared with nothing of CI's.
+
+**What follows for a tree that holds item 32.** The path is no longer an input, so no stand-in for it is needed. The host line still is. So when CI's `check` reaches the gate on the batch, its digests are expected to differ from the Mac's for the two feature loaders and the kernel, and may agree for the loader with no feature. That is a prediction and has not been seen.
+
+The full digests of the middle columns, for whoever repeats this: `d42c6ec7a84cf78bec15d60943ac4d569a197929c495399a758f813c76578685`, `dc329a24944a5eb4893942f1992a83d61ce78cbd59eb2d48836b2a64fe481bf3` and `e247d2800a26a94c02d3fc5e5be1b4ac28fb7ee2a29d071941a275374e4a11ac` with the path; `2f7ece6cb60b3f2276ecb136cbf6b6b6b61b94c63b392d7562fb1ff05f2086e1` for the kernel with the path and the host line. CI's are in §12.4.
+
+For the batch's own tree the three loaders were built the same two ways, with the remap `xtask` passes (plain `cargo`, two jobs; with `rustc` as it is they have the gate's digests):
+
+| Loader at `9648878` | The Mac: the gate's digest | The Mac with CI's host line: what CI should print |
+|---|---|---|
+| no feature | `b02de0363fb0643bcc0f936ec40df7f88cb1a7eb19a193f1ef6b9b4adb1a8ccd` | the same |
+| `test-trust-store` | `b3a2e18497bbe03fb9dbaa9db20b2962c4815e5e0dbfdd9e88d2012cb60c74d7` | `77a858ada76471428a90b92b4a774392fcfa530d94a23512bda9c41b5677b8c1` |
+| `developer-mode` | `6dfe435c44f1356fe1b99ee1b5de286439fdefe9d29ace0bce7287fde82b6baa` | `ee2a063f093fbbf4135f2b29155165d901d4c5b7bb29c20e915d36024e7e3eaf` |
+
+If CI prints the right-hand column, the host line is the whole of the difference for the loaders on that tree too. No figure can be given for the kernel.
+
+### 12.6 How the host gets in: Cargo's metadata, through a build script
+
+Cargo gives every crate a `-C metadata` value. The compiler mixes it into each symbol's name and into the names of the pieces it compiles a crate in.
+
+Cargo's source says how the value is made (`src/compiler/build_runner/compilation_files.rs` at Cargo's commit `5f94df4789f005f9a352888e8355ffc645b7ed0e`, the one `cargo -vV` reports for 1.99.1; MIT OR Apache-2.0; read on 2026-11-12 because the Cargo book does not say):
+
+- it never includes the compiler flags, so the remap does not change it;
+- it includes the lines of `rustc -vV`, but the `host:` line only for a unit built for the host, such as a build script;
+- it includes the values of the units a unit depends on. So a crate that depends on a build script's run takes the host in through it.
+
+Two crates in the images have a build script: `origin-version` (it writes the release's constants from `origin-version.toml`) and `framekernel` (it prints the kernel's link arguments). Seen with `cargo build -v` and the stand-in of §12.5:
+
+- **Loader:** 8 of its 11 compilations get another `-C metadata` value with CI's host line: the build script, `origin_version`, and six more (`onbf_format`, `onbf_verify`, `origin_boot_info`, `origin_paging`, the loader's library and its binary). `origin_crypto`, `origin_random` and `onbf_merkle` keep theirs.
+- **Kernel:** its symbol names carry each crate's value. Of the ten Origin crates named there, five get another with CI's host line (`framekernel`, `origin_abi`, `origin_boot_info`, `origin_frame`, `origin_paging`) and five keep theirs. With it, `.text` is the same size and other bytes, `.rodata` is 8 bytes shorter, and the string table is 15 bytes shorter: `origin_abi`'s value is one character shorter in each of the 14 names that hold it, and one piece's name is a character shorter.
+- The remap changes no unit's value: every one is the same with and without it.
+
+This agrees with item 31's ledger, where a build script given to the loader's own crate reordered its code.
+
+**What would end it:** an image none of whose units depends on a unit built for the host. Then Cargo's value for each of them takes in nothing of the host. That means the two build scripts out of the images' dependency graphs: the constants and the link arguments supplied another way. It is not built here: it changes two crates this task does not own and every image's bytes, and it is put to the coordinating session as a proposal.
+
+### 12.7 What `xtask` showed
+
+All of it on `9648878`, the last commit that changes code, in one turn on the machine (14:06 to 14:56 UTC), except where a line says otherwise.
+
+- **Before any of this step's code,** at `9e4f79f`, the gate passed in 37 s and printed four digests: the loader with no feature, 196,096 bytes, `b02de0363fb0643bcc0f936ec40df7f88cb1a7eb19a193f1ef6b9b4adb1a8ccd`; with `test-trust-store`, 199,168 bytes, `b3a2e18497bbe03fb9dbaa9db20b2962c4815e5e0dbfdd9e88d2012cb60c74d7`; with `developer-mode`, 199,168 bytes, `6dfe435c44f1356fe1b99ee1b5de286439fdefe9d29ace0bce7287fde82b6baa`; the kernel ELF, 1,680,416 bytes, `92b4debb5d71c70fbaf0e1eb7338dbd329f7e9860123c0027cce31c224e105dd`.
+- **After,** the gate passes in 38 s (35 s on `22abf35`, which differs from `9648878` in one test) and prints ten files. The four above have the same digests: this step changed no image. The six new ones, all of `first_program`: as the linker wrote it, 29,784 bytes, `251e985c43ea78e3f6bf50c11d131c463c6157579a0dee3b13ded353bcb060c2`; `first_program.0.bin`, 4,200 bytes, `02fe296a23249a7ba579189834e0ead60b468d3e0966dec7c4c42abb3e51d841`; `.1.bin`, 10,170 bytes, `01f7addb33cac76c6aa8bf93d7607b2ab3ed30eb8455b684846fdf920fbad38c`; `.2.bin`, 640 bytes, `592ee8a478796bb0cc4274c7cb9336f57a6fa4f5c834b24389944e553bccdb14`; `.3.bin`, 24 bytes, `3341bcae4c97d7ba73e0728c783373725905eab0417cf220037920f0960679cb`; `first_program.rs`, 1,748 bytes, `276f45954297d6f94c6e42516ed26e338ebc4f773143896324a76da72ff71721`. Then: "the kernel ELF holds the bytes of each of the 4 carried segments the gate read".
+- **With a second copy of the toolchain at another path,** and that copy's `cargo` and `rustc` in use, it prints the same ten.
+- **With the remap taken out of the ring-3 build alone** (one line of `toolchain.rs`, put back with `git checkout` of that file), the gate fails after 25 s. The three loaders pass. It stops at "the carried program `first_program` as the linker wrote it holds a path of the machine that built it", the toolchain's directory at offset 0x891, in `…/library/core/src/slice/index.rs`. It prints nothing for the kernel: in step 1 this same control failed only once the kernel had been built.
+- **Each refused variable stops `xtask` before it builds.** Fourteen settings, covering all thirteen variables (the userspace triple's flags variable both empty and not): each exits 1 within a second and names the variable, and the gate's directories were as they had been. With `CARGO_BUILD_RUSTFLAGS` or the userspace triple's linker variable set, `xtask` runs.
+- `cargo xtask check` passes in 6 min 40 s, the gate included: 1,673 host tests, 0 failed, 27 ignored; Loom, all 53 models passed and all 78 negative controls were caught; the requirements, provenance, roadmap, progress, document, image, `unsafe`, assembly and interface gates each printed their line.
+- `cargo xtask boot-test` passes on its first attempt, 11 of 11 scenarios in 129 s; its kernel boot ends `boot verdict: degraded: 63 of 64 proofs passed; failed: speculation controls`.
+- `cargo xtask boot-matrix` passes on its first attempt, with no scenario repeated: 124 of 124 in 39 min 6 s. 21 of its full boots end with that verdict, which is the batch's under QEMU's software processor (decision item 154); the machine with neither random-number instruction ends `degraded: 58 of 60 proofs passed; 4 did not run; failed: speculation controls, random-number generator (no randomness)`, which is what `boot-random` asks of it.
+- The kernel that booted has the gate's digest and holds no path under `/Users` or `/private`. Each of the four segment files occurs in it exactly once (at 0x13b4b, 0x14bb3, 0x1736d and 0x175ed).
+- `xtask`'s own tests: 248 pass and 1 is ignored. On a copy of `9e4f79f` with `9648878` alone applied, 244 pass.
+
+### 12.8 Not verified
+
+- **No image of a tree that holds item 32 has been compared across two machines.** §12.5 is of the tree before it, with the Mac given CI's path. The direct comparison needs a CI run whose `check` job reaches the gate; the Mac's ten digests for the batch's images are in §12.7.
+- **Why CI's kernel differs from the Mac's with CI's path and host line** (§12.5). Only its size and digest are known.
+- Whether taking the build scripts out (§12.6) makes the feature loaders the same on both kinds of host. It follows from Cargo's source and from §12.5; it was not built and tried.
+- The stand-in changes what Cargo is told about the host and nothing about the compiler. A compiler that really runs on Linux was not available: what one does is known only from CI's logs.
+- The refusals were tried one variable at a time. Combinations were not.
+- The configuration-file routes were tried with a file one directory above a copy of the checkout and with one in a stand-in for Cargo's home. A file that Cargo finds some other way was not looked for.
