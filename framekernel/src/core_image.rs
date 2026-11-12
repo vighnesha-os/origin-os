@@ -179,7 +179,7 @@ pub(crate) fn image() -> &'static CoreImage {
 }
 
 #[cfg(target_os = "none")]
-pub(crate) use shared::{InstallError, install, installed};
+pub(crate) use shared::install;
 
 /// The one set of frames, and the only code that touches them.
 #[cfg(target_os = "none")]
@@ -240,13 +240,10 @@ mod shared {
             }
             frames.push(frame);
         }
-        FRAMES.set(frames).map(|()| pages).map_err(|_| InstallError::Twice)
-    }
-
-    /// How many frames hold `origin.core`, once it is installed.
-    #[must_use]
-    pub(crate) fn installed() -> Option<usize> {
-        FRAMES.get().map(Vec::len)
+        FRAMES
+            .set(frames)
+            .map(|()| pages)
+            .map_err(|_| InstallError::Twice)
     }
 }
 

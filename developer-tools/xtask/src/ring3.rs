@@ -256,17 +256,14 @@ pub(crate) fn core_linked(target: Option<&Path>) -> PathBuf {
 /// (ADR-0011 Amendment 2, L2 to L7): `onbf-pack corelib` refuses an image that is anything but
 /// the generated stubs, each with one `syscall`, with no writable data and nothing to relocate.
 ///
-/// Its name is given to the linker for this one image, after the flags every ring-3 build
-/// has: `cargo rustc` passes what follows `--` to the compiler of this package alone. So is its
-/// entry, which is none: every ring-3 build names `_start`, a library has no such symbol, and
-/// the linker takes the last entry it is given, here the address 0 that a library's header
-/// holds anyway.
+/// Its name is given to the linker for this one image: `cargo rustc` passes what follows `--`
+/// to the compiler of this package alone. It has no entry, and `.cargo/userspace.toml` names
+/// none.
 fn origin_core(generated: &Generated, target: Option<&Path>) -> Result {
     let mut build = userspace("rustc", generated, target)?;
     build
         .args(["--release", "--package", CORE_PACKAGE, "--", "-C"])
-        .arg(format!("link-arg=--soname={CORE_SONAME}"))
-        .args(["-C", "link-arg=--entry=0"]);
+        .arg(format!("link-arg=--soname={CORE_SONAME}"));
     let linked = core_linked(target);
     // An ELF the kernel takes its code from: it must have been linked with the linker's fixed
     // line, as each program must (TASKS item 44).
