@@ -15,6 +15,7 @@ mod interfaces;
 mod lex;
 mod loom;
 mod mnemonics;
+mod provenance;
 mod reproducible;
 mod requirements;
 mod screen;
@@ -83,7 +84,11 @@ commands:
               for every statement of CLAUDE.md and every decision of an accepted ADR, each
               true to the tree; prints the coverage figure (part of check; CLAUDE.md §1;
               quick)
-  regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
+  provenance-gate only the gate on the provenance table in
+              docs/engineering/SOURCE_PROVENANCE.md: one row for each crate, each of §6's
+              fields filled, its dependencies named and its licence stated (part of check;
+              CLAUDE.md §6; quick)
+  regenerate rewrites the kernel's generated system-call crate from sdk/interfaces
   image-gate [kernel ELF]
               only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
               and no jump table, in the code this build compiled. Builds the kernel first, or
@@ -2519,6 +2524,7 @@ fn main() -> ExitCode {
         ["cfg-lint"] => linux_cfg_lint(),
         ["interface-gate"] => interfaces::gate(),
         ["requirements-gate"] => requirements::gate(),
+        ["provenance-gate"] => provenance::gate(),
         ["regenerate"] => interfaces::regenerate(),
         ["image-gate"] => in_turn("image-gate", image::build_and_gate),
         ["image-gate", elf] => image::gate(Path::new(elf)),
@@ -3277,6 +3283,7 @@ fn check() -> Result {
     linux_cfg_lint()?;
     documents::gate()?;
     requirements::gate()?;
+    provenance::gate()?;
     unsafety::gate()?;
     interfaces::gate()?;
     manifest_version_lint()?;
