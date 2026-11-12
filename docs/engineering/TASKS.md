@@ -631,9 +631,10 @@ Sent by the coordinating session on 2026-11-12; written here on 2026-11-12, befo
 
 | Condition | How it stands |
 |---|---|
-| Host tests | 231 of `origin-frame`'s pass, 11 of them the table's, including every maker, family and model against A2's rule and Z9's, each written again from its text. Ten planted faults each fail named tests (`SOURCE_PROVENANCE.md`) |
+| Host tests | 232 of `origin-frame`'s pass, 11 of them the table's (10 at `c2764fe`; the eleventh came with the coordinating session's review), including every maker, family and model against A2's rule and Z9's, each written again from its text. Ten planted faults each fail named tests (`SOURCE_PROVENANCE.md`) |
 | Both identity boots | Passed under QEMU's software processor: a Panther Lake in the scope and rental A's EPYC 4244P outside it, each with its whole line and its verdict |
 | Negative controls | CI-1 to CI-3 (ADR-0013) each failed the boot on its line, and were put back byte for byte |
 | Records | Ledger `docs/research/2026-11-12-cpu-identification-table.md`; dated as-built notes under ADR-0009 A2 and ADR-0017 Z9; ADR-0013's evidence; the provenance entry; STATUS; rows S24-18, S24-19, S24-20 and A09-A2 at `built`, with criteria of their own |
 | Corrections to accepted text | Two launch dates in ADR-0009 A1 went to the coordinating session and were accepted as items 257 and 258; that session writes them on `main`. This branch leaves A1 as it is |
-| What it does not show | No processor of a generation in the scope has printed the line. The errata home holds none. A 2024 Zen 5 reads as in the scope, as A2 accepts |
+| What it does not show | No processor of a generation in the scope has printed the line. The errata home holds none. A 2024 Zen 5 passes A2's check by its cores, as A2 accepts; its line says in the same clause that the scope holds only for a generation from 2026 or later, which CPUID cannot tell |
+| Review | The coordinating session read `cpuident.rs` outside its tests, the ADR-0009 diff and the matrix rows at `c2764fe`, and asked for two changes, made in the next commit: the line for AMD family 1Ah or higher states the scope with its condition in one clause; one stray blank line in ADR-0009 is gone. The next commit's boots were not run here: the keeper of `land/s4` runs all three gates on the merge |

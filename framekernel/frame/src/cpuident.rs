@@ -193,7 +193,10 @@ impl Document {
 /// Whether a generation is in the declared scope (ADR-0009 A1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
-    /// In the declared scope, as far as CPUID can tell (A2).
+    /// A2's check says yes: in the declared scope as far as CPUID can tell. For AMD that is a
+    /// statement about the cores alone. CPUID gives no year, and A1 names 2024's Zen 5
+    /// generations as outside the scope, so the line never says "in the declared scope" of
+    /// an AMD processor without that condition in the same clause ([`Reason::AmdZen5`]).
     Declared,
     /// Outside it: a bench machine. It may be used for testing, and no support or
     /// qualification claim rests on it (§76, rules 30 and 40).
@@ -232,17 +235,31 @@ impl Reason {
         }
     }
 
-    const fn text(self) -> &'static str {
+    /// The verdict the line prints: the scope, why, and the decision it rests on. The scope
+    /// and its condition are one clause.
+    const fn verdict(self) -> &'static str {
         match self {
-            Self::IntelListedModel => "a 2026 Intel generation, listed by its family-6 model",
-            Self::IntelFamily18 => "Intel family 18 (12h) or higher is a 2026 generation",
-            Self::IntelOlderModel => "an Intel family-6 model that is not a listed 2026 generation",
-            Self::IntelOlderFamily => "an Intel family below 18 (12h) that is not family 6",
-            Self::AmdZen5 => {
-                "AMD family 1Ah or higher is Zen 5 or newer; CPUID gives no year, so a Zen 5 generation from 2024 reads the same"
+            Self::IntelListedModel => {
+                "in the declared scope: a 2026 Intel generation, listed by its family-6 model (ADR-0009 A2)"
             }
-            Self::AmdBeforeZen5 => "AMD family below 1Ah, where Zen 5 begins",
-            Self::OtherMaker => "neither Intel nor AMD",
+            Self::IntelFamily18 => {
+                "in the declared scope: Intel family 18 (12h) or higher is a 2026 generation (ADR-0009 A2)"
+            }
+            Self::IntelOlderModel => {
+                "outside the declared scope, a bench machine: an Intel family-6 model that is not a listed 2026 generation (ADR-0009 A2)"
+            }
+            Self::IntelOlderFamily => {
+                "outside the declared scope, a bench machine: an Intel family below 18 (12h) that is not family 6 (ADR-0009 A2)"
+            }
+            Self::AmdZen5 => {
+                "in the declared scope by its cores, and only if its generation is from 2026 or later, which CPUID cannot tell: AMD family 1Ah or higher is Zen 5 or newer (ADR-0009 A1, A2)"
+            }
+            Self::AmdBeforeZen5 => {
+                "outside the declared scope, a bench machine: AMD family below 1Ah, where Zen 5 begins (ADR-0009 A2)"
+            }
+            Self::OtherMaker => {
+                "outside the declared scope, a bench machine: neither Intel nor AMD (ADR-0009 A2)"
+            }
         }
     }
 }
@@ -696,12 +713,13 @@ impl fmt::Display for Identity {
                 )?;
             }
         }
-        write!(f, " (leaf 1 EAX {:08X}h): {}; ", s.eax, self.row.generation)?;
-        f.write_str(match self.scope() {
-            Scope::Declared => "in the declared scope: ",
-            Scope::Bench => "outside the declared scope, a bench machine: ",
-        })?;
-        write!(f, "{} (ADR-0009 A2)", self.row.reason.text())?;
+        write!(
+            f,
+            " (leaf 1 EAX {:08X}h): {}; {}",
+            s.eax,
+            self.row.generation,
+            self.row.reason.verdict()
+        )?;
         if s.hosted {
             f.write_str("; reported under a hypervisor, which can report any identity")?;
         }
@@ -1033,6 +1051,29 @@ mod tests {
     }
 
     #[test]
+    fn an_amd_line_never_claims_the_scope_without_its_condition() {
+        // A1 names 2024's Zen 5 generations (EPYC 9005, Ryzen 9000) as outside the scope, and
+        // CPUID gives no year: every AMD line that says "in the declared scope" says in the
+        // same clause that it holds only for a generation from 2026 or later.
+        for family in 0..=MAX_FAMILY {
+            for model in [0x00, 0x02, 0x11, 0x44, 0x50, 0xC0, 0xFF] {
+                let line = identify(amd(family, model, 0)).to_string();
+                let Some(at) = line.find("in the declared scope") else {
+                    continue;
+                };
+                let clause = &line[at..line[at..].find(';').map_or(line.len(), |end| at + end)];
+                assert!(
+                    clause.starts_with("in the declared scope by its cores, and only if its generation is from 2026 or later, which CPUID cannot tell"),
+                    "{line}"
+                );
+                assert!(!line.contains("in the declared scope:"), "{line}");
+            }
+        }
+        // The check keeps its two answers, for the installer's question at M9 (item 90).
+        assert_eq!(identify(amd(0x1A, 0x02, 1)).scope(), Scope::Declared);
+    }
+
+    #[test]
     fn the_line_says_what_was_reported_what_it_is_and_why() {
         let ptl = identify(Signature::new(INTEL, 0x000C_06C2, 1 << 31));
         assert_eq!(
@@ -1052,8 +1093,9 @@ mod tests {
         assert_eq!(
             turin.to_string(),
             "AuthenticAMD family 1Ah (26) model 02h stepping 1 (leaf 1 EAX 00B00F21h): Zen 5 or newer; \
-             in the declared scope: AMD family 1Ah or higher is Zen 5 or newer; CPUID gives no year, \
-             so a Zen 5 generation from 2024 reads the same (ADR-0009 A2); no erratum listed for it"
+             in the declared scope by its cores, and only if its generation is from 2026 or later, \
+             which CPUID cannot tell: AMD family 1Ah or higher is Zen 5 or newer (ADR-0009 A1, A2); \
+             no erratum listed for it"
         );
         let nova = identify(Signature::new(INTEL, 0x0030_0F10, 0));
         assert!(nova.to_string().starts_with(
