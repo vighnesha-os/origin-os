@@ -184,6 +184,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "framekernel",
+ "oidl",
  "onbf-format",
  "onbf-merkle",
  "origin-boot-info",

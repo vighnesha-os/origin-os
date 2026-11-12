@@ -16,6 +16,9 @@ onbf-merkle.workspace = true
 # compares QEMU's picture against them) and the boot-info layout it reads.
 framekernel = { path = "../../framekernel" }
 origin-boot-info.workspace = true
+# For the gate on `origin.core` (task S4-2): the definition's front end, so that what each stub
+# must be is worked out here from the definition and not taken from the generator's output.
+oidl = { path = "../oidl" }
 
 [lints]
 workspace = true

@@ -1,0 +1,555 @@
+//! The `origin.core` gate against listings, tables and code made by hand: what a good image
+//! looks like, and each way it can be wrong.
+
+use std::fmt::Write as _;
+
+use super::*;
+
+/// The real definition and versions: the gate's expectations come from them.
+fn stubs() -> Vec<Stub> {
+    let root = repo_root();
+    let read = |file: &str| String::from_utf8(read_file(&root.join(file)).unwrap()).unwrap();
+    expected_stubs(&read(DEFINITION), &read(VERSIONS)).unwrap()
+}
+
+/// One instruction's length in bytes, for laying a listing out: enough to keep addresses
+/// apart, and right for the instructions the stubs use.
+fn length(instruction: &str) -> u64 {
+    match instruction {
+        "syscall" | "ud2" => 2,
+        "ret" | "int3" => 1,
+        i if i.starts_with("mov eax, ") => 5,
+        i if i.starts_with("movzx r") || i.starts_with("movsx") => 4,
+        i if i.starts_with("movzx ") => 3,
+        i if i.starts_with("mov r10") || i.starts_with("mov r8d") || i.starts_with("mov r9d") => 3,
+        _ => 2,
+    }
+}
+
+/// An image made of `stubs`, each padded with `int3` to four bytes, from `0x1000`: its listing
+/// as the disassembler prints one, the kernel's table for it, and its code.
+struct Image {
+    functions: Vec<(String, Vec<String>)>,
+    /// Stubs by symbol, for the table: the method's name and its version.
+    methods: Vec<(String, String, (u16, u16))>,
+}
+
+impl Image {
+    fn of(stubs: &[Stub]) -> Self {
+        Self {
+            functions: stubs
+                .iter()
+                .map(|s| (s.symbol.clone(), s.instructions.clone()))
+                .collect(),
+            methods: stubs
+                .iter()
+                .map(|s| (s.symbol.clone(), s.method.clone(), s.since))
+                .collect(),
+        }
+    }
+
+    /// `(listing, description, code)`.
+    fn files(&self) -> (String, String, Vec<u8>) {
+        let mut listing = String::from(
+            "\nliborigin_core.so:\tfile format elf64-x86-64\n\nDisassembly of section .text:\n",
+        );
+        let mut exports = String::new();
+        let mut pins = String::new();
+        let mut code = Vec::new();
+        let mut address = 0x1000u64;
+        // The table names each stub once: its first function, and that function's first
+        // `syscall`, as a description made from a real image would.
+        let mut tabled: Vec<&str> = Vec::new();
+        for (name, instructions) in &self.functions {
+            let start = address;
+            let first = !tabled.contains(&name.as_str());
+            tabled.push(name);
+            let mut pinned = false;
+            let _ = write!(listing, "\n{address:016x} <{name}>:\n");
+            let mut body: Vec<String> = instructions.clone();
+            let size: u64 = body.iter().map(|i| length(i)).sum();
+            for _ in 0..(4 - size % 4) % 4 {
+                body.push("int3".to_string());
+            }
+            for instruction in &body {
+                let spelled = instruction.replacen(' ', "\t", 1);
+                let _ = writeln!(listing, "    {address:x}:      \t{spelled}");
+                let at = address - 0x1000;
+                match instruction.as_str() {
+                    "syscall" => {
+                        code.extend_from_slice(&SYSCALL);
+                        if let Some((_, method, _)) =
+                            self.methods.iter().find(|(symbol, ..)| symbol == name)
+                            && first
+                            && !pinned
+                        {
+                            let _ = writeln!(pins, "        {method}: {at:#x},");
+                            pinned = true;
+                        }
+                    }
+                    "int3" => code.push(0xCC),
+                    other => code.extend(std::iter::repeat_n(0x90, length(other) as usize)),
+                }
+                address += length(instruction);
+            }
+            if let Some((_, _, since)) = self.methods.iter().find(|(symbol, ..)| symbol == name)
+                && first
+            {
+                let _ = writeln!(
+                    exports,
+                    "        CoreExport {{ name: \"{name}\", offset: {:#x}, since: ({}, {}) }},",
+                    start - 0x1000,
+                    since.0,
+                    since.1
+                );
+            }
+        }
+        let description = format!(
+            "// @generated\npub(crate) static ORIGIN_CORE: CoreImage = CoreImage {{\n    span: 0x1000,\n    exports: &[\n{exports}    ],\n    pins: Pins {{\n{pins}    }},\n    release: [\n        0x00,\n    ],\n}};\n"
+        );
+        (listing, description, code)
+    }
+
+    fn problems(&self, stubs: &[Stub]) -> Vec<String> {
+        let (listing, description, code) = self.files();
+        problems(
+            stubs,
+            &read_listing(&listing).unwrap(),
+            &read_table(&description).unwrap(),
+            &code,
+        )
+    }
+
+    fn function(&mut self, symbol: &str) -> &mut Vec<String> {
+        &mut self
+            .functions
+            .iter_mut()
+            .find(|(name, _)| name == symbol)
+            .unwrap()
+            .1
+    }
+}
+
+#[track_caller]
+fn refused(image: &Image, stubs: &[Stub], what: &str) {
+    let found = image.problems(stubs);
+    assert!(
+        found.iter().any(|problem| problem.contains(what)),
+        "no problem with `{what}` among: {found:#?}"
+    );
+}
+
+#[test]
+fn what_each_stub_must_be_follows_from_its_parameters() {
+    let stubs = stubs();
+    let of = |method: &str| {
+        stubs
+            .iter()
+            .find(|s| s.method == method)
+            .unwrap_or_else(|| panic!("no method {method}"))
+            .instructions
+            .clone()
+    };
+    // No parameter narrower than 64 bits, and fewer than four registers: nothing before the load.
+    assert_eq!(of("handle_close"), ["mov eax, 0x3", "syscall", "ret"]);
+    // Never returns.
+    assert_eq!(of("thread_exit"), ["mov eax, 0x0", "syscall", "ud2"]);
+    // `rights`, 32 bits of flags, in the second register.
+    assert_eq!(
+        of("handle_duplicate"),
+        ["mov esi, esi", "mov eax, 0x4", "syscall", "ret"]
+    );
+    // `signals` in the second register, and a result's pointer in the fourth.
+    assert_eq!(
+        of("wait_one"),
+        [
+            "mov esi, esi",
+            "mov r10, rcx",
+            "mov eax, 0x8",
+            "syscall",
+            "ret"
+        ]
+    );
+    // `clear` and `set`, both 32 bits, in the second and third.
+    assert_eq!(
+        of("object_signal"),
+        [
+            "mov esi, esi",
+            "mov edx, edx",
+            "mov eax, 0xa",
+            "syscall",
+            "ret"
+        ]
+    );
+    // A narrow value in the fourth register is extended on its way to R10.
+    assert_eq!(
+        of("memory_protect"),
+        ["mov r10d, ecx", "mov eax, 0xe", "syscall", "ret"]
+    );
+    assert_eq!(
+        of("object_wait_async"),
+        ["mov r10d, ecx", "mov eax, 0x10", "syscall", "ret"]
+    );
+    // Six registers, none narrow: only the fourth moves.
+    assert_eq!(
+        of("channel_read"),
+        ["mov r10, rcx", "mov eax, 0x7", "syscall", "ret"]
+    );
+    // Every stub has its own number, loaded just before its one `syscall`.
+    for stub in &stubs {
+        let at = stub.instructions.len() - 3;
+        assert_eq!(
+            stub.instructions[at],
+            format!("mov eax, {:#x}", stub.number)
+        );
+        assert_eq!(stub.instructions[at + 1], "syscall");
+        assert_eq!(stub.symbol, format!("origin_kernel_{}", stub.method));
+    }
+    assert_eq!(stubs.len(), 20);
+    assert!(
+        stubs
+            .iter()
+            .any(|s| s.method == "memory_map" && s.since == (0, 5))
+    );
+}
+
+#[test]
+fn every_narrow_width_and_sign_has_its_own_instruction_in_each_register() {
+    // The definition has no signed or 8- or 16-bit parameter today, so the rule is held here
+    // against a table written out by hand, as the generator's own test holds its writer.
+    let table: [[&str; 6]; 6] = [
+        [
+            "movzx edi, dil",
+            "movzx esi, sil",
+            "movzx edx, dl",
+            "movzx r10d, cl",
+            "movzx r8d, r8b",
+            "movzx r9d, r9b",
+        ],
+        [
+            "movzx edi, di",
+            "movzx esi, si",
+            "movzx edx, dx",
+            "movzx r10d, cx",
+            "movzx r8d, r8w",
+            "movzx r9d, r9w",
+        ],
+        [
+            "mov edi, edi",
+            "mov esi, esi",
+            "mov edx, edx",
+            "mov r10d, ecx",
+            "mov r8d, r8d",
+            "mov r9d, r9d",
+        ],
+        [
+            "movsx rdi, dil",
+            "movsx rsi, sil",
+            "movsx rdx, dl",
+            "movsx r10, cl",
+            "movsx r8, r8b",
+            "movsx r9, r9b",
+        ],
+        [
+            "movsx rdi, di",
+            "movsx rsi, si",
+            "movsx rdx, dx",
+            "movsx r10, cx",
+            "movsx r8, r8w",
+            "movsx r9, r9w",
+        ],
+        [
+            "movsxd rdi, edi",
+            "movsxd rsi, esi",
+            "movsxd rdx, edx",
+            "movsxd r10, ecx",
+            "movsxd r8, r8d",
+            "movsxd r9, r9d",
+        ],
+    ];
+    let definition = |ty: &str| {
+        format!(
+            "/// Fixture.\nlibrary origin.kernel;\ntransport syscall;\nversion 1.0;\n\
+             /// Statuses.\nenum status: i64 {{\n    /// Fine.\n    ok = 0;\n    /// Not fine.\n    invalid_args = -1;\n}}\n\
+             /// Calls.\ninterface kernel {{\n    /// Six.\n    method six = 3 (\n        /// A.\n        a: {ty},\n        /// B.\n        b: {ty},\n        /// C.\n        c: {ty},\n        /// D.\n        d: {ty},\n        /// E.\n        e: {ty},\n        /// F.\n        f: {ty},\n    ) errors(invalid_args) requires none;\n}}\n"
+        )
+    };
+    for (ty, row) in ["u8", "u16", "u32", "i8", "i16", "i32"].iter().zip(table) {
+        let stubs = expected_stubs(&definition(ty), "").unwrap_or_else(|e| panic!("{ty}: {e}"));
+        let mut wanted: Vec<&str> = row.to_vec();
+        wanted.extend(["mov eax, 0x3", "syscall", "ret"]);
+        assert_eq!(stubs[0].instructions, wanted, "six parameters of {ty}");
+    }
+    // A boolean is a byte, and a value that fills its register needs nothing but the move.
+    let stubs = expected_stubs(&definition("bool"), "").unwrap();
+    assert_eq!(stubs[0].instructions[..6], table[0]);
+    let stubs = expected_stubs(&definition("u64"), "").unwrap();
+    assert_eq!(
+        stubs[0].instructions,
+        ["mov r10, rcx", "mov eax, 0x3", "syscall", "ret"]
+    );
+}
+
+#[test]
+fn an_image_of_the_definitions_stubs_passes() {
+    let stubs = stubs();
+    assert_eq!(Image::of(&stubs).problems(&stubs), Vec::<String>::new());
+    // In any order of functions: the kernel's table says where each is.
+    let mut reversed = Image::of(&stubs);
+    reversed.functions.reverse();
+    assert_eq!(reversed.problems(&stubs), Vec::<String>::new());
+}
+
+#[test]
+fn a_second_syscall_for_one_number_is_refused() {
+    let stubs = stubs();
+    let mut image = Image::of(&stubs);
+    image
+        .function("origin_kernel_handle_close")
+        .insert(2, "syscall".to_string());
+    refused(
+        &image,
+        &stubs,
+        "`origin_kernel_handle_close` is not its stub",
+    );
+    refused(&image, &stubs, "21 `syscall` instructions for 20 methods");
+}
+
+#[test]
+fn a_stub_whose_number_is_not_its_own_is_refused() {
+    let stubs = stubs();
+    let mut image = Image::of(&stubs);
+    // `handle_close` loading `channel_write`'s number: the E8 attack, linked in.
+    image.function("origin_kernel_handle_close")[0] = "mov eax, 0x6".to_string();
+    refused(
+        &image,
+        &stubs,
+        "`origin_kernel_handle_close` is not its stub",
+    );
+    // The number moved into RAX from a register a caller sets.
+    let mut image = Image::of(&stubs);
+    image.function("origin_kernel_handle_close")[0] = "mov eax, esi".to_string();
+    refused(
+        &image,
+        &stubs,
+        "`origin_kernel_handle_close` is not its stub",
+    );
+}
+
+#[test]
+fn anything_before_the_syscall_but_the_stubs_own_extensions_is_refused() {
+    let stubs = stubs();
+    // An instruction that is no extension and no move of the fourth argument.
+    let mut image = Image::of(&stubs);
+    image
+        .function("origin_kernel_handle_close")
+        .insert(0, "add rdi, 0x8".to_string());
+    refused(
+        &image,
+        &stubs,
+        "`origin_kernel_handle_close` is not its stub",
+    );
+    // An extension of a register the method does not take narrow.
+    let mut image = Image::of(&stubs);
+    image
+        .function("origin_kernel_handle_close")
+        .insert(0, "mov edi, edi".to_string());
+    refused(
+        &image,
+        &stubs,
+        "`origin_kernel_handle_close` is not its stub",
+    );
+    // An extension that is missing (L13): `rights` passed on as the caller left its register.
+    let mut image = Image::of(&stubs);
+    image.function("origin_kernel_handle_duplicate").remove(0);
+    refused(
+        &image,
+        &stubs,
+        "`origin_kernel_handle_duplicate` is not its stub",
+    );
+    // The wrong one: the sign where the value is unsigned.
+    let mut image = Image::of(&stubs);
+    image.function("origin_kernel_handle_duplicate")[0] = "movsxd rsi, esi".to_string();
+    refused(
+        &image,
+        &stubs,
+        "`origin_kernel_handle_duplicate` is not its stub",
+    );
+    // The fourth argument left in RCX, which `syscall` overwrites.
+    let mut image = Image::of(&stubs);
+    image.function("origin_kernel_channel_read").remove(0);
+    refused(
+        &image,
+        &stubs,
+        "`origin_kernel_channel_read` is not its stub",
+    );
+    // Something after the return that is not padding.
+    let mut image = Image::of(&stubs);
+    image
+        .function("origin_kernel_handle_close")
+        .push("jmp rax".to_string());
+    refused(
+        &image,
+        &stubs,
+        "`origin_kernel_handle_close` is not its stub",
+    );
+}
+
+#[test]
+fn a_syscall_at_an_offset_the_kernels_table_does_not_hold_is_refused() {
+    let stubs = stubs();
+    let image = Image::of(&stubs);
+    let (listing, description, code) = image.files();
+    let functions = read_listing(&listing).unwrap();
+    let good = read_table(&description).unwrap();
+    assert!(problems(&stubs, &functions, &good, &code).is_empty());
+    // One pin off by a byte, and one that is another call's.
+    let mut table = good.clone();
+    *table.pins.get_mut("channel_write").unwrap() += 1;
+    let found = problems(&stubs, &functions, &table, &code);
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("the kernel accepts call 6 (`channel_write`)")),
+        "{found:#?}"
+    );
+    let mut table = good.clone();
+    let other = table.pins["channel_read"];
+    *table.pins.get_mut("channel_write").unwrap() = other;
+    let found = problems(&stubs, &functions, &table, &code);
+    assert!(
+        found.iter().any(|p| p.contains("(`channel_write`)")),
+        "{found:#?}"
+    );
+    assert!(
+        found.iter().any(|p| p.contains("must be the same places")),
+        "{found:#?}"
+    );
+    // A pin left out, and an export put elsewhere.
+    let mut table = good.clone();
+    table.pins.remove("clock_read");
+    let found = problems(&stubs, &functions, &table, &code);
+    assert!(
+        found.iter().any(|p| p.contains("from offset none")),
+        "{found:#?}"
+    );
+    let mut table = good.clone();
+    table.exports.get_mut("origin_kernel_clock_read").unwrap().0 += 4;
+    let found = problems(&stubs, &functions, &table, &code);
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("which is not where it was linked")),
+        "{found:#?}"
+    );
+    // A version that is not the method's.
+    let mut table = good.clone();
+    table.exports.get_mut("origin_kernel_memory_map").unwrap().1 = (0, 0);
+    let found = problems(&stubs, &functions, &table, &code);
+    assert!(
+        found.iter().any(|p| p.contains("arrived in 0.0")),
+        "{found:#?}"
+    );
+    // A pin and an export of no method.
+    let mut table = good;
+    table.pins.insert("helper".to_string(), 0);
+    table
+        .exports
+        .insert("origin_kernel_helper".to_string(), (0, (0, 0)));
+    let found = problems(&stubs, &functions, &table, &code);
+    assert!(
+        found.iter().any(|p| p.contains("pins `helper`")),
+        "{found:#?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("exports `origin_kernel_helper`")),
+        "{found:#?}"
+    );
+}
+
+#[test]
+fn a_function_that_is_no_stub_and_a_stub_that_is_missing_are_refused() {
+    let stubs = stubs();
+    let mut more = Image::of(&stubs);
+    more.functions
+        .push(("origin_core_helper".to_string(), vec!["ret".to_string()]));
+    refused(&more, &stubs, "the image holds `origin_core_helper`");
+    let mut fewer = Image::of(&stubs);
+    fewer
+        .functions
+        .retain(|(name, _)| name != "origin_kernel_port_wait");
+    refused(
+        &fewer,
+        &stubs,
+        "does not hold exactly one `origin_kernel_port_wait`",
+    );
+    let mut twice = Image::of(&stubs);
+    let again = twice.functions[3].clone();
+    twice.functions.push(again);
+    refused(&twice, &stubs, "does not hold exactly one");
+}
+
+#[test]
+fn the_two_bytes_of_syscall_anywhere_else_in_the_carried_code_are_refused() {
+    let stubs = stubs();
+    let (listing, description, mut code) = Image::of(&stubs).files();
+    let functions = read_listing(&listing).unwrap();
+    let table = read_table(&description).unwrap();
+    // Inside another instruction's bytes, where the disassembler shows no `syscall`.
+    code[1..3].copy_from_slice(&SYSCALL);
+    let found = problems(&stubs, &functions, &table, &code);
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert!(found[0].contains("must be the same places"), "{found:#?}");
+    // And one that is missing from the bytes.
+    let (_, _, mut code) = Image::of(&stubs).files();
+    let at = table.pins["wait_one"] as usize;
+    code[at] = 0x90;
+    let found = problems(&stubs, &functions, &table, &code);
+    assert!(found[0].contains("must be the same places"), "{found:#?}");
+}
+
+#[test]
+fn bytes_the_disassembler_could_not_decode_are_refused() {
+    let stubs = stubs();
+    let mut image = Image::of(&stubs);
+    image
+        .function("origin_kernel_handle_close")
+        .push("(bad)".to_string());
+    refused(&image, &stubs, "could not decode");
+}
+
+#[test]
+fn a_listing_or_a_table_that_does_not_read_is_an_error() {
+    assert!(read_listing("0000000000001000 <f>:\n    1000:\tret\n  what is this\n").is_err());
+    // An instruction before any function.
+    assert!(read_listing("    1000:\tret\n").is_err());
+    let functions = read_listing(
+        "\nx.so:\tfile format elf64-x86-64\n\nDisassembly of section .text:\n\n0000000000001000 <f>:\n    1000:      \tmov\teax, 0x5\n    1005:      \tsyscall\n",
+    )
+    .unwrap();
+    assert_eq!(
+        functions,
+        [Function {
+            name: "f".to_string(),
+            address: 0x1000,
+            instructions: vec![
+                (0x1000, "mov eax, 0x5".to_string()),
+                (0x1005, "syscall".to_string())
+            ],
+        }]
+    );
+    assert!(read_table("nothing here").is_err());
+    assert!(read_table("    pins: Pins {\n        a: 5,\n    },\n").is_err());
+    assert!(
+        read_table("        CoreExport { name: \"a\", offset: 0x0 },\n    pins: Pins {\n        a: 0x5,\n    },\n")
+            .is_err()
+    );
+    let table = read_table(
+        "        CoreExport { name: \"origin_kernel_a\", offset: 0x10, since: (0, 5) },\n    pins: Pins {\n        a: 0x15,\n    },\n    release: [\n        0x00, 0x11,\n    ],\n",
+    )
+    .unwrap();
+    assert_eq!(table.exports["origin_kernel_a"], (0x10, (0, 5)));
+    assert_eq!(table.pins["a"], 0x15);
+}
