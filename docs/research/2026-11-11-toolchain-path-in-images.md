@@ -407,13 +407,13 @@ So on this tree a build took exactly three things from its host:
 |---|---|---|
 | Where the toolchain is installed | the standard library's source paths, in panic locations | removed by item 32 (§5, §11) |
 | The host the compiler reports | Cargo's `-C metadata` values, through a build script | removed by item 44 (§14); not yet compared with CI |
-| The linker's name for itself | `.comment` of each ELF, and through `e_shoff` one loaded byte of each | **still there** |
+| The linker's name for itself | `.comment` of each ELF, and through `e_shoff` one loaded byte of each | still there when this was written; ended since by item 44 (§14.5), and not yet compared with CI |
 
 Nothing else was found: no difference in generated code, in data, or in symbol names between the Mac's compiler and linker and CI's, for these ten files.
 
 ### 13.5 What could end the third
 
-Not built; put to the coordinating session.
+Not built when this was written; put to the coordinating session, which made it part of item 44. §14.5 is what was built.
 
 - Cargo's `[env]` configuration can set `LLD_VERSION` for every link. Tried on the Mac with `--config env.LLD_VERSION=…`: the program's `.comment` then holds the given text and the compiler's version, and nothing of the linker's own. One entry in `.cargo/config.toml` would do it for `xtask` and for plain `cargo` alike.
 - What it rests on: a variable the linker's source calls a testing aid. A gate that reads `.comment` in each ELF it builds would fail on any machine if a later linker stopped honouring it.
@@ -425,3 +425,164 @@ Not built; put to the coordinating session.
 - With the three inputs set as CI's, the Mac gives CI's bytes; that the reverse holds, CI giving the Mac's, was not tried.
 - One CI machine. The `check` job runs on one runner image, so whether another image's toolchain writes the same bytes is not known from this run. At `f5ab54f` the job ran on another processor (an EPYC 9V45) and its loaders fit the same account.
 - Whether `LLD_VERSION` behaves the same in the linker's COFF driver was not looked at; the loaders have no `.comment`.
+
+## 14. Item 44 (2026-11-12): no unit of an image is built for the host
+
+§12.6 found one way the build host gets into an image: Cargo's `-C metadata` value for a unit built for the host takes in the host the compiler reports, and each unit takes in the values of the units it depends on. Two crates under the images had a build script. This section is what was done about it. The contract is "44" under "Task contracts" in `TASKS.md`. §13, written while this was being built, found one more way, and §14.5 ends that too.
+
+### 14.1 What was changed
+
+- **The release's constants** were written at build time by `runtime/version/build.rs`. They are now a file in the tree, `runtime/version/src/generated.rs`, which the crate includes. `cargo xtask version` writes it from `origin-version.toml`, with the same parser and the same text the script used, now in `runtime/version/manifest.rs`. Its first line says what wrote it. It is a function of `origin-version.toml` alone.
+- **A gate, `version-gate`,** in `cargo xtask check`: the committed file must be exactly what the generator writes from `origin-version.toml`. When it is not, the gate names the first line that differs and the command that rewrites the file.
+- **The kernel's link arguments** were printed by `framekernel/build.rs` for the kernel's binary. The same nine, in the same order, are now in `.cargo/config.toml` under the kernel's target, where the loader's two have been since item 31. The kernel is the one binary built for that target.
+- **Both build scripts are removed.**
+- **The linker's line about itself is fixed** (§14.5), added after §13 found it: one entry in `.cargo/config.toml`, and a check in the reproducible-build gate.
+- **A gate, `image-graph-gate`,** in `cargo xtask check`: no package that the loader, the kernel or a carried program is built from may have a build script or be a procedural macro. Which packages have such a target is read from Cargo's own account (`cargo metadata`), and what each image is built from, from its dependency tree with every feature on (`cargo tree`, normal and build dependencies).
+
+### 14.2 Nothing was lost: the transitional commit
+
+Removing a build script changes Cargo's values, and with them the order of an image's code (item 31's ledger, §6). So the bytes cannot be compared across the removal. They can be compared across a step that keeps the scripts.
+
+`62d045a` moves the constants and the link arguments and leaves both build scripts in place, empty. While a script exists, Cargo gives every crate the value it had. At that commit the reproducible-build gate passes, and **each of the ten files it keeps is the same bytes as the one kept at `41c03c2`**: the three loaders, the carried program's six files, and the kernel. So every constant has the value it had, and every link argument reaches the linker as it did.
+
+The generated file itself is the script's output with another first line: `cargo xtask version`, run on a file made that way, reported it already right.
+
+### 14.3 What the removal changed in the images
+
+`da2b82e` removes the scripts. Each image was compared with the one built before it. Sizes did not change.
+
+| File | Before (`41c03c2`) | After (`da2b82e`) |
+|---|---|---|
+| loader, no feature, 196,096 bytes | `b02de0363fb0643bcc0f936ec40df7f88cb1a7eb19a193f1ef6b9b4adb1a8ccd` | `b3ee60b9173235fdc38d708a2c95e14e3c065abdc8d89b28231c693a787dd6d2` |
+| loader, `test-trust-store`, 199,168 bytes | `b3a2e18497bbe03fb9dbaa9db20b2962c4815e5e0dbfdd9e88d2012cb60c74d7` | `a9f7ddf8536b6cef49e81af38bc3dd70b2788e9baedd6d26cde2c85013830905` |
+| loader, `developer-mode`, 199,168 bytes | `6dfe435c44f1356fe1b99ee1b5de286439fdefe9d29ace0bce7287fde82b6baa` | `ee2a063f093fbbf4135f2b29155165d901d4c5b7bb29c20e915d36024e7e3eaf` |
+| `first_program` as the linker wrote it, 29,784 bytes | `251e985c43ea78e3f6bf50c11d131c463c6157579a0dee3b13ded353bcb060c2` | `bd2f3f3c4f627b762ca576f4773e7082f476fe8420d0014d498410786c800f30` |
+| its four segment files | unchanged | the same bytes |
+| its description, 1,748 bytes | `276f45954297d6f94c6e42516ed26e338ebc4f773143896324a76da72ff71721` | `cf54ca01bc92e1f19738983e3873b6f14b01fa530cf23f4257fd2691d1be4f22` |
+| kernel ELF, 1,680,416 bytes | `92b4debb5d71c70fbaf0e1eb7338dbd329f7e9860123c0027cce31c224e105dd` | `1f3d05341758da0174c7997ec7ad24708dd05e082b68addd70d6a632cdfc8537` |
+
+**The kernel** (the toolchain's `llvm-readobj`, `llvm-nm` and `llvm-objdump`):
+
+- its 20 section headers are the same, field for field: name, type, flags, address, offset, size and alignment;
+- its 9 program headers are the same, field for field. So the layout, the segment permissions, RELRO and the entry are as they were;
+- 1,644 symbols, with the same names once the hashes are taken out by demangling, the same kinds and the same sizes. Every data symbol is at the address it had. 132 functions are at another address;
+- 245,551 instructions, 192 kinds, the same count of each;
+- each of its 1,332 functions has the same instructions, in the same order, once what depends on placement is masked: a direct branch's target and a displacement from `%rip`;
+- 90,080 of its bytes differ: 40,580 in `.text` (the displacements and targets), 49,282 in the symbol and string tables (the names), 146 in `.rodata` and 72 in the relocations.
+
+So it is the same code with 132 functions in another order. **Performance cost, in ADR-0018 V3's first form: none, by construction**: no instruction was added, removed or changed, and no code generation flag changed.
+
+**The loaders:** the same five sections with the same sizes, and the same count of each instruction (39,415, 39,428 and 39,427). In two of them `.rdata`'s used length differs by 8 bytes within the same size on disk.
+
+**The carried program:** its four segments are the same bytes, so the kernel carries what it carried. The file the linker wrote has the same sections, program headers, symbols at the same addresses and instructions; the names in its symbol table changed. Its description differs in one comment line, which quotes that file's digest.
+
+One thing seen and not looked into: the new `developer-mode` loader is, byte for byte, the file §12.5 got from the old tree with CI's host line.
+
+### 14.4 With the compiler reporting CI's host
+
+The stand-in of §12.5 again: plain `cargo` at two jobs, with the `--config` entries `xtask` passes, and a `rustc` that differs only in the `host:` line of `rustc -vV`. At `da2b82e`:
+
+- with `rustc` as it is, all ten files are the gate's bytes, which checks the method;
+- **with CI's host line, all ten files are the gate's bytes too.**
+
+Before item 44 the same change gave other bytes for the two feature loaders, the kernel and the program's linker output (§12.5, §12.6). So what Cargo is told about the host no longer reaches any of the ten files.
+
+**That is a prediction, not a comparison with CI.** The stand-in changes what Cargo is told and nothing about the compiler or the linker, which on CI are other programs built for another machine. §13 shows what that can hide, and what it hid: the linker's name for itself.
+
+### 14.5 The linker's line about itself, fixed
+
+§13 found the third thing a build took from its host while this task was being built, and the coordinating session put ending it into this task, so that the images' bytes change in one merge.
+
+- **The entry.** `.cargo/config.toml` has `[env] LLD_VERSION = { value = "Linker: rust-lld of the toolchain that rust-toolchain.toml pins (text from .cargo/config.toml)", force = true }`. The linker writes that in place of its own line (R4). The text names the linker as the pinned toolchain's and holds no version, so a toolchain upgrade does not make it false; the compiler's own line beside it, `rustc version 1.99.1 (58cf8f9c3 2026-10-13)`, carries the version and is the same on both hosts.
+- **One place.** It is Cargo's own configuration, so plain `cargo` and `xtask` get the same line, and `xtask` passes nothing for it. `xtask`'s own `--config` entries, for the remap and for the ring-3 flags, are joined to the file and do not replace it: the gate reads the line in the kernel's ELF and in the program's, which are built with those entries.
+- **Which wins,** tried with Cargo 1.99.1 on the carried program:
+
+  | Setting | The line in `.comment` |
+  |---|---|
+  | nothing set | the linker's own |
+  | an entry in the file, not forced | the entry's |
+  | the same, and `LLD_VERSION` set outside | **the outside value** |
+  | a forced entry in the file, and `LLD_VERSION` set outside, or set and empty | the entry's |
+  | a forced entry, and a forced entry in a file above the checkout | the checkout's entry |
+  | a forced entry, and `--config env.LLD_VERSION="…"` on the command line | Cargo refuses to merge the two, and builds nothing |
+
+  So the entry is forced, and `xtask` does not need to refuse the variable: a value in the environment cannot take the entry's place. The gate fails if the entry is not forced.
+- **The loaders** are PE images. The linker's COFF driver writes no such line: none of the three holds `LLD`, `Linker:` or the compiler's version, and each is the same bytes with the entry as without.
+- **The check.** For each ELF the reproducible-build gate builds, the kernel's and each carried program's linker output, `.comment` must hold the fixed line, and may hold besides it only the compiler's line. The linker's own line, or any other, fails it. And none of the ten files may hold the linker's own line anywhere. The fixed line is read from `.cargo/config.toml`, and an entry that is missing or not forced fails the gate before anything is built.
+- **What it did to the images** (`3761692`): the three loaders and the program's segments 1, 2 and 3 are the same bytes as before the entry. The rest changed once more:
+
+  | File | Before the entry (`a81af90`) | With it |
+  |---|---|---|
+  | `first_program` as the linker wrote it | `bd2f3f3c…`, 29,784 bytes | `8a6658ab4662300661306886431348de8a1346c084bd61acda1901b30052b627`, 29,768 bytes |
+  | `first_program.0.bin` | `02fe296a…` | `9e35a5739dc0e0133499a77bd12430720f0788a30c50e7f39e27b4b3c68dbf16`: one byte, the section table's offset |
+  | `first_program.rs` | `cf54ca01…` | `364739ab7e1b18462e7fffeefe1a0e33282e1d795a19cd271fdef08487991bc5`: the line that quotes the linker output's digest |
+  | kernel ELF | `1f3d0534…`, 1,680,416 bytes | `897a6d0fc43a2cae92342f69da35a8b3d34bda30df3f60637bbf66c9858b178a`, 1,680,400 bytes |
+
+  No code or data changes: the line is 16 bytes shorter after alignment, and what differs is `.comment`, the offset in each ELF header, and the one byte of the program's header that the kernel carries.
+- **With the compiler reporting CI's host,** all ten files are the same bytes as without (plain `cargo`, two jobs).
+- **An existing target directory.** Cargo does not link a file again when `[env]` changes: nothing it tracks for that file changed. Tried: a program and a kernel built without the entry, then built again with it, are not linked again, and keep the linker's own line. `3761692`'s own run showed what follows. The ordinary target directory still held `first-program` as linked before the entry; the kernel built there carried its old header; and `boot-test` booted a kernel one byte off the gate's (`50ccb41e…` where the gate printed `897a6d0f…`). The gate builds from nothing and was right. `68ed2b1` makes every `xtask` build of a carried program or of the kernel read `.comment` of what it linked: a file without the fixed line is removed, with Cargo's own copy of it under `deps/`, and linked once more, and if it is still wrong that is an error. On that directory `cargo xtask build` then linked `first-program` again and said so, and the kernel there was the gate's, byte for byte; a second build linked nothing again.
+
+### 14.6 The controls and the gates
+
+**On `a81af90`,** the last commit before the linker's line, in one turn on the machine (15:37 to 16:27 UTC):
+
+- **`framekernel/build.rs` put back** (an empty script, removed again afterwards): `image-graph-gate` fails, "the kernel is built from `framekernel`, which has a build script (framekernel/build.rs)".
+- **A build script given to the loader's own package:** it fails, "the loader is built from `origin-boot-uefi`, which has a build script (boot/uefi/build.rs)".
+- With the two original scripts still in place, before `da2b82e`, it named both, for the loader, the kernel and the carried program: `origin-version`'s under all three and `framekernel`'s under the kernel.
+- **A value changed in `origin-version.toml` and the file not rewritten** (`boot-info` 0.6 to 0.7, put back with `git checkout`): `version-gate` fails, names `cargo xtask version`, and shows line 24 as generated and as committed.
+- `cargo xtask check` passes in 7 min 12 s, both new gates and the reproducible-build gate included: 1,683 host tests, 0 failed, 27 ignored; Loom, all 53 models and all 78 controls. The gate's ten digests are those of §14.3.
+- `cargo xtask boot-test` passes on its first attempt, 11 of 11 scenarios in 129 s; its kernel boot ends `boot verdict: degraded: 63 of 64 proofs passed; failed: speculation controls`.
+- `cargo xtask boot-matrix` passes on its first attempt, with no scenario repeated: 124 of 124 in 40 min 31 s. 21 of its full boots end with that verdict (decision item 154), and the machine with neither random-number instruction ends `degraded: 58 of 60 proofs passed; 4 did not run; failed: speculation controls, random-number generator (no randomness)`, which is what `boot-random` asks of it.
+
+At `da2b82e` `check` had failed, in clippy over `origin-version`'s tests: the generator's function, moved out of the build script, was used by `xtask` and by nothing in the crate's own test build. `a81af90` gives the crate the test it lacked: the file it includes is, to the byte, what the generator writes. No image changed between the two commits.
+
+**On `3761692`,** the commit with the linker's line, in one turn (16:28 to 16:37 UTC): the two controls below, the gate, `check` (1,687 host tests, 0 failed, 27 ignored) and `boot-test` (11 of 11) passed. Its `boot-test` is not evidence for the gate's kernel: it booted the kernel one byte off, as §14.5 says.
+
+**On `68ed2b1`,** the last commit that changes code, in one turn (16:41 to 16:50 UTC):
+
+- **The entry taken out of `.cargo/config.toml`** (put back with `git checkout`): the reproducible-build gate fails at once, "`.cargo/config.toml` has no `LLD_VERSION = { value = "...", force = true }` under `[env]`", and builds nothing.
+- **The entry there and not forced:** it fails at once, naming `force = true`, and builds nothing.
+- **The check run by hand** (`cargo xtask linker-text-gate`) on files built before the entry: the Mac's kernel at `a81af90` is refused, naming the line the Mac's linker writes; CI's kernel and CI's `first_program` from run 43248605239 are refused, naming the line CI's linker writes. A loader, which is not an ELF, is an error and not a pass.
+- The reproducible-build gate passes in 34 s, with the ten digests of §14.3 (the loaders) and §14.5, and prints for the program's linker output and for the kernel that `.comment` holds the fixed line and not the linker's own.
+- `cargo xtask check` passes in 6 min 11 s: 1,688 host tests, 0 failed, 27 ignored; Loom, all 53 models and all 78 controls.
+- `cargo xtask boot-test` passes on its first attempt, 11 of 11 scenarios in 127 s; its kernel boot ends `boot verdict: degraded: 63 of 64 proofs passed; failed: speculation controls`.
+- After the boots, the kernel and the program in the ordinary target directory are the gate's, byte for byte.
+- `xtask`'s own tests: 261 pass and 1 is ignored.
+
+The boot matrix was not run after `a81af90`: the coordinating session set `check` and `boot-test` for the later commits, and the keeper runs all three on the merge. Between `a81af90` and `68ed2b1` the kernel differs in `.comment`, one header byte and one byte of read-only data.
+
+### 14.7 The three things a build took from its host, and what was not looked for
+
+Said plainly, for release work.
+
+| What | Ended by | How it is kept so |
+|---|---|---|
+| Where the toolchain is installed | item 32: `xtask`'s remap to `/rustc/<commit>` | the gate searches every file for the toolchain's directory, Cargo's home and the checkout |
+| The host the compiler reports | item 44: no unit of an image is built for the host | `image-graph-gate` |
+| The linker's name for itself | item 44: the fixed line | the gate reads `.comment` in every ELF it builds |
+
+With CI's values for the three, the Mac built all ten of CI's files at `c34fdab` bit for bit (§13.4). So for those ten files, on these two hosts, there was no fourth. **That is the evidence there is; it is not a proof that no other host would show one.**
+
+Expected, and not seen: for a tree with item 44, CI prints the Mac's ten digests, the ones in §14.3 for the loaders and §14.5 for the rest.
+
+What was not looked for:
+
+- **Another kind of host than these two.** One Mac with an Apple processor, and CI's Linux machines with x86-64 processors of two models. No Windows host, no Linux host with another processor family, no other release of macOS or of the runner's image.
+- **Another build of the same toolchain version.** Both hosts have rustup's own builds of 1.99.1. A distribution's own build of the same version, or a linker of another version under the same compiler, could differ in ways these did not; the gate's check of `.comment` would catch another linker line and nothing else about it.
+- **The other runner image.** Only the `check` job, on `ubuntu-24.04`, prints digests.
+- **The image that boots.** It is `onbf-pack`'s conversion of the kernel's ELF, and the gate compares the ELF. On the Mac two conversions of one ELF are the same bytes. The next piece of this task puts the converted image in the gate.
+- **A configuration file outside the repository** that adds compiler flags (§12.3). Its `[env]` entries cannot replace the fixed line.
+
+### 14.8 For a toolchain upgrade
+
+Three things here rest on how the pinned tools behave. CLAUDE.md §15 asks for a compiler upgrade to be checked before it is taken; these are three of the checks, and what catches each.
+
+- **`LLD_VERSION`.** The linker's source calls it an aid for testing. If a later linker does not read it, the linker's own line is back in `.comment`, and the reproducible-build gate fails on every machine, naming the line. So does every `xtask` build of the kernel or of a carried program.
+- **Cargo's `-C metadata`.** If a later Cargo takes the host into the value of a unit that is not built for the host, the images follow the host again and no gate on one machine sees it: only the comparison of the Mac's digests with CI's does. That comparison has to be made again after an upgrade.
+- **The standard library's source paths.** The remap's target, `/rustc/<commit>`, is checked against the pinned commit, and the gate searches for the path.
+
+### 14.9 Not verified
+
+- **No file of a tree with item 44 has been built on CI.** The comparison needs the batch pushed with it.
+- That a linker really running on Linux honours the entry as the Mac's does. Both are the same source revision.
+- No human has reviewed any of this, and nothing ran on physical hardware.
