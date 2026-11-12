@@ -12,6 +12,15 @@
 //! [`check`] holds a description to what the kernel relies on, and it runs when the kernel is
 //! compiled: a kernel whose `origin.core` was generated from another definition than its own
 //! dispatcher, or whose description names a `syscall` where the code has none, does not build.
+//!
+//! # One set of frames (L2)
+//!
+//! At boot, before any process exists, [`install`] takes one frame for each page of the image,
+//! writes the code into them, and keeps them here. That is the only time they are written: this
+//! module keeps the frames to itself and hands out no way to reach them but the mapping of them,
+//! read-execute, into a process's space. The framework counts each frame's executable mappings
+//! and refuses a writable mapping of a frame that is executable anywhere
+//! (`origin_frame::aliases`), so no process can come to write them either.
 #![forbid(unsafe_code)]
 
 use origin_syscalls::origin_kernel::kernel::server::{Pins, RELEASE_FINGERPRINT};
@@ -161,6 +170,85 @@ const _: () = assert!(
     check(&ORIGIN_CORE).is_ok(),
     "the description of origin.core this kernel carries does not pass core_image::check"
 );
+
+/// `origin.core`, as this kernel carries it.
+#[cfg(target_os = "none")]
+#[must_use]
+pub(crate) fn image() -> &'static CoreImage {
+    &ORIGIN_CORE
+}
+
+#[cfg(target_os = "none")]
+pub(crate) use shared::{InstallError, install, installed};
+
+/// The one set of frames, and the only code that touches them.
+#[cfg(target_os = "none")]
+mod shared {
+    use alloc::vec::Vec;
+
+    use origin_frame::once::SetOnce;
+    use origin_frame::userspace::SharedFrame;
+
+    use super::{ORIGIN_CORE, PAGE};
+
+    /// `origin.core`'s frames, one a page, in order: made by [`install`], and never written
+    /// after it returns.
+    static FRAMES: SetOnce<Vec<SharedFrame>> = SetOnce::new();
+
+    /// Why `origin.core` could not be put into its frames.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum InstallError {
+        /// No frame, or no kernel memory for their record.
+        NoMemory,
+        /// It is already installed: the frames are written once.
+        Twice,
+    }
+
+    /// Takes one frame for each page of `origin.core` and writes its code into them: once, at
+    /// boot, before any process exists and so before any mapping of them does. Returns how
+    /// many frames it took.
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::NoMemory`], with every frame it took given back; [`InstallError::Twice`]
+    /// on a second call, which changes nothing.
+    pub(crate) fn install() -> Result<usize, InstallError> {
+        if FRAMES.get().is_some() {
+            return Err(InstallError::Twice);
+        }
+        let pages = (ORIGIN_CORE.span / PAGE) as usize;
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(pages)
+            .map_err(|_| InstallError::NoMemory)?;
+        // A fresh frame is zero, as the span past the code must be.
+        for chunk in 0..pages {
+            let frame = SharedFrame::new().ok_or(InstallError::NoMemory)?;
+            let page = ORIGIN_CORE
+                .code
+                .chunks(PAGE as usize)
+                .nth(chunk)
+                .unwrap_or(&[]);
+            for (word, bytes) in page.chunks(8).enumerate() {
+                let mut value = [0u8; 8];
+                if let Some(low) = value.get_mut(..bytes.len()) {
+                    low.copy_from_slice(bytes);
+                }
+                if !frame.write_u64(word * 8, u64::from_le_bytes(value)) {
+                    return Err(InstallError::NoMemory);
+                }
+            }
+            frames.push(frame);
+        }
+        FRAMES.set(frames).map(|()| pages).map_err(|_| InstallError::Twice)
+    }
+
+    /// How many frames hold `origin.core`, once it is installed.
+    #[must_use]
+    pub(crate) fn installed() -> Option<usize> {
+        FRAMES.get().map(Vec::len)
+    }
+}
 
 #[cfg(test)]
 mod tests;
