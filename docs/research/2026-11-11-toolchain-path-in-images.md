@@ -328,6 +328,8 @@ The coordinating session asked for this before step 2 lands, so that the first C
 - **CI's `check` job uploads that directory** as the artifact `reproducible-gate-files`, with the action and the pinned commit the workflow already uses, kept for 14 days. The step runs when `check` fails too. If `check` failed before the gate there is nothing to upload, which is a warning; and the step is marked so that it cannot decide whether the job passes. What CI gates on is unchanged.
 - The ten digests are already in the job's log: the gate prints one line for each file.
 
+On the Mac, at `0230c4c`: `cargo xtask check` passes in 6 min 13 s (1,674 host tests, 0 failed, 27 ignored; Loom 53 models, 78 controls). The gate prints the same ten digests as in §12.7 and leaves ten files for each build, 2.3 MB each, the second build's the same bytes as the first's; the kept kernel and loaders have the digests it printed. No boot was run for this commit: no image changed.
+
 Not seen yet: the step has not run on CI. Its first run is the one on a head that holds it.
 
 ### 12.9 Not verified
