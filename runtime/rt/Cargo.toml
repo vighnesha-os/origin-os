@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 origin-abi = { path = "../abi" }
 origin-kernel-stubs = { path = "../kernel-stubs" }
+origin-rt-mem = { path = "../rt-mem" }
 
 [lints]
 workspace = true

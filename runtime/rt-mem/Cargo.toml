@@ -1,0 +1,13 @@
+[package]
+name = "origin-rt-mem"
+description = "The bodies of the ring-3 runtime's memcpy, memmove, memset, memcmp and bcmp, apart from the runtime so the host can test them (task S4-1; S4-1's review, finding F6)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# A default member: its tests run on the host (`cargo xtask check`). `runtime/rt` builds it for
+# the userspace triple, where the same functions are the `mem*` the compiler calls.
+
+[lints]
+workspace = true

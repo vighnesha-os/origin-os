@@ -153,7 +153,12 @@ version = "0.0.0"
 dependencies = [
  "origin-abi",
  "origin-kernel-stubs",
+ "origin-rt-mem",
 ]
+
+[[package]]
+name = "origin-rt-mem"
+version = "0.0.0"
 
 [[package]]
 name = "origin-sync"

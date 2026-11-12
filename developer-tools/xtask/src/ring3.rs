@@ -31,7 +31,15 @@ pub(crate) const CARRIED_ENV: &str = "ORIGIN_CARRIED_PROGRAMS";
 const KERNEL_DEFINITION: &str = "sdk/interfaces/origin.kernel.oidl";
 
 /// Every ring-3 crate, for clippy.
-pub(crate) const CRATES: &[&str] = &["origin-kernel-stubs", "origin-rt", "first-program"];
+pub(crate) const CRATES: &[&str] = &[
+    "origin-kernel-stubs",
+    "origin-rt",
+    "origin-rt-mem",
+    "first-program",
+];
+/// The bodies of the runtime's `mem*` functions: a ring-3 crate the host tests too (S4-1's
+/// review, finding F6).
+pub(crate) const MEM_PACKAGE: &str = "origin-rt-mem";
 
 /// A program the kernel carries: its package and binary, and its name in the kernel.
 struct Program {

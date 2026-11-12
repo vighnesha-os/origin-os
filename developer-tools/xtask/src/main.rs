@@ -3351,6 +3351,18 @@ fn check() -> Result {
         "-D",
         "warnings",
     ]))?;
+    // The bodies of the ring-3 runtime's `mem*` functions on the host, with their tests against
+    // `core` (S4-1's review, finding F6). `ring3::clippy` lints them for the userspace triple.
+    run_step(cargo().args([
+        "clippy",
+        "--package",
+        ring3::MEM_PACKAGE,
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run_step(cargo().args(["test", "--package", ring3::MEM_PACKAGE]))?;
     // The ring-3 crates on their own target (task S4-1), then the kernel, which carries the
     // programs they build.
     ring3::clippy()?;
