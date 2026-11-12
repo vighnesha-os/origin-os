@@ -21,15 +21,20 @@
 //!   belonging to none;
 //! - a row placed in two milestones, or in a milestone and in the list of rows in none. A row may
 //!   appear in several tables of one milestone;
-//! - and, failing closed: no matrix row read, no milestone section, no placement read.
+//! - and, failing closed: a matrix the requirements gate's reader cannot read, no matrix row
+//!   read, no milestone section, no placement read.
 //!
 //! **What it does not see:** whether a placement is right, whether a test's words match its rows,
 //! and anything outside the "Rows" columns. Rows of kind `rule` need no place (item 256, rule 3).
+//!
+//! It reads the matrix through the requirements gate's reader ([`requirements::matrix_rows`]), and
+//! the progress page (TASKS item 43) reads the roadmap through [`check`] and [`states`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
 use crate::provenance::cells;
+use crate::requirements::{self, Kind, Row, State};
 use crate::{Result, repo_root};
 
 /// The page this gate reads.
@@ -43,61 +48,11 @@ const ROWS: &str = "Rows";
 /// What the list of rows in none is called in messages.
 const NONE: &str = "\"Rows in no milestone\"";
 
-/// A row of the matrix, as far as this gate needs it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Row {
-    id: String,
-    /// The matrix file it is in.
-    file: String,
-    kind: String,
-    state: String,
-}
-
 impl Row {
     /// Whether item 264 asks for a place for it: a `build` row that is counted.
     fn needs_a_place(&self) -> bool {
-        self.kind == "build" && self.state != "removed"
+        self.kind == Kind::Build && self.state != Some(State::Removed)
     }
-}
-
-/// The rows of the matrix's files, each file's rows in their order. `files` is `(name, text)`.
-fn matrix(files: &[(String, String)]) -> Vec<Row> {
-    let mut rows = Vec::new();
-    for (name, text) in files {
-        let mut columns: Option<(usize, usize, usize)> = None;
-        let mut fenced = false;
-        for line in text.lines() {
-            if line.trim_start().starts_with("```") {
-                fenced = !fenced;
-                continue;
-            }
-            let Some(cells) = (!fenced).then(|| cells(line)).flatten() else {
-                columns = None;
-                continue;
-            };
-            let Some((id, kind, state)) = columns else {
-                let at = |want: &str| cells.iter().position(|c| c == want);
-                columns = match (at("ID"), at("Kind"), at("State")) {
-                    (Some(0), Some(kind), Some(state)) => Some((0, kind, state)),
-                    _ => None,
-                };
-                continue;
-            };
-            let rule = cells
-                .iter()
-                .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':')));
-            if rule || cells.len() <= kind.max(state) {
-                continue;
-            }
-            rows.push(Row {
-                id: cells[id].clone(),
-                file: name.clone(),
-                kind: cells[kind].clone(),
-                state: cells[state].clone(),
-            });
-        }
-    }
-    rows
 }
 
 /// Whether `text` has the shape of a row ID: a capital letter, digits, a dash, and letters or
@@ -189,18 +144,24 @@ impl Section {
     }
 }
 
-/// What the gate found: its problems, and its counts for the report.
+/// What the gate found: its problems, its counts for the report, and where each row is placed.
 #[derive(Debug, Default)]
-struct Found {
-    problems: Vec<String>,
+pub(crate) struct Found {
+    pub(crate) problems: Vec<String>,
     milestones: usize,
     placed: usize,
     in_none: usize,
     needing: usize,
+    /// Each milestone's name and title, as its heading `## M<n>. Title` gives them, in the
+    /// roadmap's order.
+    pub(crate) headings: Vec<(String, String)>,
+    /// For each row placed, by its index in the rows given to [`check`], the sections it is
+    /// placed in: milestones by name, or [`NONE`].
+    pub(crate) placed_in: BTreeMap<usize, BTreeSet<String>>,
 }
 
 /// Reads `roadmap` against `rows` and returns what is wrong with it.
-fn check(roadmap: &str, rows: &[Row]) -> Found {
+pub(crate) fn check(roadmap: &str, rows: &[Row]) -> Found {
     let mut found = Found::default();
     if rows.is_empty() {
         found
@@ -232,6 +193,8 @@ fn check(roadmap: &str, rows: &[Row]) -> Found {
             current = section(line);
             if let Section::Milestone(name) = &current {
                 milestones.insert(name.clone());
+                let title = line.split_once(". ").map_or("", |(_, title)| title.trim());
+                found.headings.push((name.clone(), title.to_string()));
             }
             column = None;
             continue;
@@ -338,47 +301,118 @@ fn check(roadmap: &str, rows: &[Row]) -> Found {
             if !placed.contains_key(&i) {
                 found.problems.push(format!(
                     "{} ({}, `build`, {}) is in no milestone and not in {NONE}",
-                    row.id, row.file, row.state
+                    row.id,
+                    row.file,
+                    row.state.map_or("-", State::named)
                 ));
             }
         }
     }
+    found.placed_in = placed;
     found
 }
 
-/// The matrix's files, `(name, text)`, sorted by name, without its README.
-fn matrix_files() -> Result<Vec<(String, String)>> {
-    let path = repo_root().join(MATRIX);
-    let mut names = Vec::new();
-    for entry in fs::read_dir(&path).map_err(|e| format!("{}: {e}", path.display()))? {
-        let name = entry
-            .map_err(|e| format!("{}: {e}", path.display()))?
-            .file_name()
-            .to_string_lossy()
-            .into_owned();
-        if name.ends_with(".md") && name != "README.md" {
-            names.push(name);
+/// The words a milestone's state may start with, longest first so that `not started` is not
+/// read as something shorter.
+const STATE_WORDS: [&str; 4] = ["not started", "partial", "built", "done"];
+
+/// What opens a sentence that gives a milestone's state: `**State, <date>: <word>` and
+/// `**Marked against the tests, <date>: <word>`.
+const STATE_OPENINGS: [&str; 2] = ["**State, ", "**Marked against the tests, "];
+
+/// Each milestone's state word, by name, as its section of `roadmap` gives it, and what is wrong:
+/// a milestone with no such sentence, with two, or with a word not in [`STATE_WORDS`].
+pub(crate) fn states(roadmap: &str) -> (BTreeMap<String, String>, Vec<String>) {
+    let mut found: BTreeMap<String, Vec<(usize, Option<&str>)>> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    let mut fenced = false;
+    for (index, line) in roadmap.lines().enumerate() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        if line.starts_with("## ") {
+            current = match section(line) {
+                Section::Milestone(name) => {
+                    found.entry(name.clone()).or_default();
+                    Some(name)
+                }
+                _ => None,
+            };
+            continue;
+        }
+        let Some(name) = &current else {
+            continue;
+        };
+        for opening in STATE_OPENINGS {
+            for (at, _) in line.match_indices(opening) {
+                let after = &line[at + opening.len()..];
+                let word = after.split_once(": ").and_then(|(_, rest)| {
+                    STATE_WORDS.into_iter().find(|word| rest.starts_with(word))
+                });
+                found
+                    .entry(name.clone())
+                    .or_default()
+                    .push((index + 1, word));
+            }
         }
     }
-    names.sort();
-    names
-        .into_iter()
-        .map(|name| {
-            let file = path.join(&name);
-            fs::read_to_string(&file)
-                .map(|text| (name, text))
-                .map_err(|e| format!("{}: {e}", file.display()))
-        })
-        .collect()
+    let mut states = BTreeMap::new();
+    let mut problems = Vec::new();
+    for (name, sentences) in found {
+        match sentences.as_slice() {
+            [(_, Some(word))] => {
+                states.insert(name, (*word).to_string());
+            }
+            [(line, None)] => problems.push(format!(
+                "{ROADMAP}:{line}: {name}'s state is not one of {}",
+                STATE_WORDS.join(", ")
+            )),
+            [] => problems.push(format!(
+                "{ROADMAP}: {name} gives no state: a sentence starting `{}<date>: <word>`",
+                STATE_OPENINGS[0]
+            )),
+            more => {
+                let lines: Vec<String> = more.iter().map(|(line, _)| line.to_string()).collect();
+                problems.push(format!(
+                    "{ROADMAP}: {name} gives its state {} times, on lines {}: a milestone has one",
+                    more.len(),
+                    lines.join(", ")
+                ));
+            }
+        }
+    }
+    (states, problems)
+}
+
+/// The roadmap as the checkout holds it.
+pub(crate) fn read() -> Result<String> {
+    let path = repo_root().join(ROADMAP);
+    fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The matrix's rows, read by the requirements gate's reader; a matrix it cannot read is an error.
+pub(crate) fn matrix() -> Result<Vec<Row>> {
+    let mut problems = Vec::new();
+    let rows = requirements::matrix_rows(&requirements::read()?.files, &mut problems);
+    if problems.is_empty() {
+        Ok(rows)
+    } else {
+        Err(format!(
+            "the matrix under {MATRIX}/ cannot be read (`cargo xtask requirements-gate` says more):\n  {}",
+            problems.join("\n  ")
+        ))
+    }
 }
 
 /// The gate: every counted `build` row of the matrix is placed in one milestone of the roadmap,
 /// or listed as belonging to none, and every row the roadmap names exists.
 pub(crate) fn gate() -> Result {
-    let rows = matrix(&matrix_files()?);
-    let path = repo_root().join(ROADMAP);
-    let roadmap = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let found = check(&roadmap, &rows);
+    let rows = matrix()?;
+    let found = check(&read()?, &rows);
     if !found.problems.is_empty() {
         return Err(format!(
             "{ROADMAP} does not place every counted build row of the matrix once (CLAUDE.md §82, decision item 264; its rules are in developer-tools/xtask/src/roadmap.rs):\n  {}",
@@ -400,22 +434,29 @@ pub(crate) fn gate() -> Result {
 mod tests {
     use super::*;
 
-    const HEADER: &str =
-        "| ID | Requirement | Kind | Scope | Owner | State |\n|---|---|---|---|---|---|\n";
+    const HEADER: &str = "| ID | Requirement | Kind | Scope | Owner | State | Implementation | Acceptance | Evidence | Env | Review | Limitations | Decided by |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
 
-    /// Two small matrix files: `a.md` with S1-01 to S1-05, `b.md` with A17-Z1 and A17-Z2.
+    /// The cells after a row's state that this gate does not read.
+    const REST: &str = "- | - | - | - | none | - | - |";
+
+    /// Two small matrix files: `directive-01-a.md` with S1-01 to S1-05, `adr-0017.md` with
+    /// A17-Z1 and A17-Z2.
     fn files() -> Vec<(String, String)> {
         let a = format!(
-            "# PART\n\n{HEADER}| S1-01 | one | build | both/hw | 3 | built |\n| S1-02 | two | build | both/hw | 3 | not-started |\n| S1-03 | three | rule | eng/host | 28 | not-started |\n| S1-04 | four | info | - | 1 | - |\n| S1-05 | five | build | both/hw | 3 | removed |\n"
+            "# PART\n\n{HEADER}| S1-01 | one | build | both/hw | 3 | built | {REST}\n| S1-02 | two | build | both/hw | 3 | not-started | {REST}\n| S1-03 | three | rule | eng/host | 28 | not-started | {REST}\n| S1-04 | four | info | - | 1 | - | {REST}\n| S1-05 | five | build | both/hw | 3 | removed | {REST}\n"
         );
         let b = format!(
-            "{HEADER}| A17-Z1 | a | build | both/hw | 16 | partial |\n| A17-Z2 | b | build | both/hw | 16 | partial |\n"
+            "{HEADER}| A17-Z1 | a | build | both/hw | 16 | partial | {REST}\n| A17-Z2 | b | build | both/hw | 16 | partial | {REST}\n"
         );
-        vec![("a.md".into(), a), ("b.md".into(), b)]
+        vec![("directive-01-a.md".into(), a), ("adr-0017.md".into(), b)]
     }
 
+    /// The fixture's rows, read by the requirements gate's reader.
     fn rows() -> Vec<Row> {
-        matrix(&files())
+        let mut problems = Vec::new();
+        let rows = requirements::matrix_rows(&files(), &mut problems);
+        assert_eq!(problems, Vec::<String>::new());
+        rows
     }
 
     /// A roadmap whose milestones place what `m0` and `m1` say, with `none` in no milestone.

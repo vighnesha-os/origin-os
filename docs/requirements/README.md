@@ -195,6 +195,7 @@ It does not check:
 - **An ADR is accepted or amended.** Add a row for each new decision to its `adr-NNNN.md`, or add the file.
 - **The owner answers a decision item.** Name it in the row it decided, or list it above.
 - **Work lands.** Change the row's state with the cells that state needs, and give the row the criterion its task's contract writes for it (CLAUDE.md §78). A row that becomes `done` is added to the list of done rows above.
+- **A row's state changes, or the roadmap places a row or gives a milestone's state.** Run `cargo xtask progress` and commit `docs/PROGRESS.md` with the change: `cargo xtask check` refuses a page that is not the one the tree generates.
 - **A heading or a code block of the directive changes.** Read the change against that PART's rows, then record the digest the gate prints.
 - **Something runs on a machine.** Write its record under `docs/hardware/records/`, with the machine, its firmware, the source revision, the date and the result, and name it in the rows it is evidence for.
 - **A state never goes up on memory.** It follows what the tree shows: `docs/STATUS.md`, the boot proofs, the tests and the gates.
