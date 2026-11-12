@@ -936,6 +936,24 @@ Assigned by the coordinating session on 2026-11-12, as the first of the three pr
 - **The matrix.** S62-16 stays `done`, with the generated file and its gate in place of the script. S60-03, S60-11, S75-05, S75-06, S75-07 and F-28 stay `partial`: no file of a tree with this task has been built on CI.
 - **Next on this branch, as its own commits** (item 44, step 2): the image that boots, `onbf-pack`'s conversion of the kernel's ELF, in the reproducible-build gate.
 
+### 44, step 2. The reproducible-build gate compares the image that boots
+
+Asked for by the coordinating session on 2026-11-12, after this session reported that the gate compares the kernel's ELF and that what boots is `onbf-pack`'s conversion of it. Written before any of it was built. Its own commits, after item 44's final hash `a2a2700`; it does not hold item 44.
+
+| Field | |
+|---|---|
+| Task ID | TASKS item 44, step 2, on branch `claude/item-32-toolchain-path`, after `a2a2700`. |
+| Objective | The reproducible-build gate converts the kernel's ELF from each of its two builds with `onbf-pack krn`, as `cargo xtask build` and the boots do, and treats the converted image as it treats every other file: the two must be the same bytes, neither may hold a path of the machine or the linker's own line, its digest is printed, and a copy of each is kept, so CI's artifact holds it. The comparison with CI then covers what boots. **Not in this task:** any change to `onbf-pack`, to the image's format, or to how anything is signed; a signed image in the gate. |
+| Source ownership | This task alone edits `developer-tools/xtask/src/reproducible.rs`, and in `main.rs` the one function that runs the conversion, to give it an output path. It edits its own records. Nothing under `developer-tools/onbf-pack/`. |
+| Architecture contract | CLAUDE.md 7.6 §75, §60, §59 (signing runs in host tools; Origin OS verifies); ONBF §6.1.2, §6.5 and ONBF-R9 (the image is a function of its inputs; the claimed signing time is an input). Not an ABI or format decision (§84). |
+| Relevant specifications | None outside the repository. `onbf-pack`'s own account of what is and is not deterministic (`developer-tools/onbf-pack/src/sign.rs`), read on 2026-11-12. |
+| Required dependencies | `a2a2700`. No new crate or tool (§5). No owner answer is awaited. |
+| Security invariants | (1) The converted image the gate reads is made by the same command, with the same arguments, as the one the boots start. (2) The gate fails if the two builds' images differ, naming both kept copies. (3) Nothing about signing changes: the gate signs nothing and reads no key. (4) No image's bytes change. |
+| Performance constraints | None set. Reported: the gate's time before and after. Performance cost: none, by construction: no image changes. |
+| Required tests | Host tests: the gate's list of what it builds holds the converted image after the kernel; the check that the kernel carries its programs' segments still reads the ELF. On the real tree: the gate, with the image's digest; that digest against the image the boots used; a control in which the conversion is made to depend on where it is written (a one-line edit of `xtask`, put back with `git checkout`), which the gate must fail at the converted image. Two signings of one image, compared, to say what the signature is a limit on. `cargo xtask check` and `cargo xtask boot-test` on the last commit that changes code. |
+| Actual deliverables | The gate's eleventh file with its tests and control; the record of what signing does to an image and why it is not in the gate; the Mac's digest for the image, for the comparison with CI. Nothing is pushed by this session. |
+| Acceptance conditions | The gate, `check` and `boot-test` pass on the last commit with code changes, on the development Mac under QEMU's software processor. The control fails at the converted image. The image the boots used has the digest the gate prints. Rows S60-03, S60-11, S75-05, S75-06, S75-07 and F-28 name the image among what is compared and stay `partial` until CI has built it. The coordinating session checks the result. |
+
 ### S4-1. Rust in ring 3, with no ABI change (TASKS item 41)
 
 Sent by the coordinating session on 2026-11-12. Written here on 2026-11-12, before any code. It is task S4-1 of ADR-0011 N14 step 4 (`docs/research/2026-11-11-n14-step4-scope.md`, section 4, whose exit tests were written before this), and it builds decision item 197 (ADR-0011 Amendment 2, L1; the note to ONBF §8.3).
