@@ -160,6 +160,21 @@ ADR-0005 P6, as C4–C6 decide, and C1's inheritance of the principal. The ledge
 | P9 | Arguments or environment take unbounded kernel or user memory | At most 64 handles and 64 KiB per record, checked before anything is mapped | **Boot**, **Host**: a launch over 64 KiB is refused before anything is mapped; host tests of both limits to the byte |
 | P10 | DIRECTORY is a channel to whatever the creator chose | Intended: a creator decides what its child can reach (P1 of ADR-0005: no ambient authority). The service directory comes with S3-4 | **By design** |
 
+### Programs the kernel carries (S4-1)
+
+ADR-0011 Amendment 2, L1 and L8: until the Loader Service exists, step 4's first-party programs reach ring 3 inside the KRN image, laid out at build time by `onbf-pack carried` and launched by `launch::load_program` and `launch::start_program`. The first is a boot proof, `tests/kernel/first-program`. Written with the contract (TASKS item 41), then given the status the boot proof "a Rust program in ring 3" and its controls (ADR-0013, R3-1 to R3-3) earned.
+
+| # | Threat | Defence | Status |
+|---|---|---|---|
+| R1 | A carried program's code is writable, or its data executable, at any moment | The conversion refuses a writable and executable segment (ONBF §6.1.2). The launch path maps each page once, with its final permissions, and writes it through its frame before the first thread exists | **Proven** (control R3-1, at build): a write to its code and a jump into its data each fault there; **Host**: the conversion's refusals |
+| R2 | A relocated pointer is overwritten by the program, so its control flow follows data it chose (RELRO) | RELRO pages are mapped read-only from the start; their relocations are written through the frame | **Boot**: a write to a relocated pointer faults there |
+| R3 | A relocation is left out or applied twice, so a pointer names the wrong place | Every slot gets the base added once, in the page that holds it, before the thread starts | **Proven** (control R3-2): every slot is read back through the child's own tables |
+| R4 | The program sits where an attacker can predict it | Its base and its stack are random pages of `[0x1000_0000, 0x1000_0000_0000)`, almost 2^32 places each, drawn from `origin_frame::random`; with no generator nothing is launched (ADR-0016 R8). Below the start records' region, which is drawn apart | **Proven** (control R3-3): two launches differ in base and in stack |
+| R5 | A malformed description makes the launch path write outside the program's pages, overflow, or panic | Descriptions come from the same build as the kernel, and the KRN signature covers them. `program::check` refuses a misplaced segment, a second code segment, an entry outside the code, or a relocation slot that is out of order, misaligned or outside a writable or RELRO segment's bytes, before anything is mapped; every access is bounds-checked and a slot whose value plus the base overflows is refused | **Host** |
+| R6 | The program makes system calls from somewhere other than its code | Its range (A6, row E7) is exactly its one read-execute segment at its base; data and stack are never executable. Per-call pinning is S4-2's (row E8) | **By design**, with E7's proof |
+| R7 | A launch refused after its image is mapped keeps its frames | The child, and every frame it was given, is dropped with the error | **Boot**: the proof's leak check, with a launch refused after mapping |
+| R8 | The runtime reads its start record past what the kernel mapped | `origin-rt` reads the header, then at most the size it states, which the kernel maps (C4), and refuses one over 64 KiB | **Boot** |
+
 ### The service directory (S3-4)
 
 ADR-0011 N9 and S9, as C11 and C12 decide: `origin.directory` 0.1, served by a process over the channel a program's start record names DIRECTORY. The directory is not in the kernel, but it is the only way a program finds services, so it is modelled here with the boundary it extends. The ledger is `docs/research/2026-11-10-service-directory.md`. Written before the code (§58, §83), then given the status the boot proof "the service directory", its controls (recorded for S3-4 in `SOURCE_PROVENANCE.md`) and the host tests of `services/directory` earned.

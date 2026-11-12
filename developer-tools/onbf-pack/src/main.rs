@@ -11,10 +11,11 @@ use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 
 use onbf_pack::sign::{self, HostKey, KeyPaths, SignOptions, Signer};
-use onbf_pack::{KrnOptions, Toolchain, krn};
+use onbf_pack::{KrnOptions, Toolchain, carried, krn};
 
 const USAGE: &str = "\
 usage: onbf-pack krn --input <kernel.elf> --output <kernel.onbf> [options]
+       onbf-pack carried --input <program.elf> --name <name> --variable <VAR> --out <dir>
        onbf-pack sign --input <kernel.onbf> --output <signed.onbf> --key <file>
                       --signing-time <seconds>
        onbf-pack keygen --key <file> --public-ed25519 <file> --public-mldsa <file>
@@ -31,6 +32,12 @@ krn options:
   --rustc-version V    rustc release        } each defaults to the matching line of
   --rustc-commit H     rustc commit hash    } `rustc -vV`, run in the current directory
   --llvm-version V     LLVM version         }
+
+carried lays out a program the kernel carries in its image (ADR-0011 L1; ONBF §8.3's note):
+`<name>.rs`, a static the kernel compiles in, and `<name>.<i>.bin` for each segment with bytes,
+which the Rust file includes from the directory the environment variable <VAR> names when the
+kernel is compiled. A file whose bytes are already there is left untouched, and an older
+`<name>.*` file the description no longer has is removed.
 
 sign signs an unsigned KRN image in the role origin-kernel (ONBF §7.1-§7.2), with a key from
 `keygen`, and checks the result with the boot loader's code.
@@ -101,6 +108,7 @@ const KRN_OPTIONS: &[&str] = &[
     "--rustc-commit",
     "--llvm-version",
 ];
+const CARRIED_OPTIONS: &[&str] = &["--input", "--name", "--variable", "--out"];
 const SIGN_OPTIONS: &[&str] = &["--input", "--output", "--key", "--signing-time"];
 const KEYGEN_OPTIONS: &[&str] = &[
     "--key",
@@ -214,12 +222,13 @@ fn run(args: &[OsString]) -> Result<Option<String>, Failure> {
     let mut rest = args.iter();
     let command = match rest.next().and_then(|a| a.to_str()) {
         Some("-h" | "--help") => return Ok(None),
-        Some(command @ ("krn" | "sign" | "keygen")) => command,
+        Some(command @ ("krn" | "carried" | "sign" | "keygen")) => command,
         Some(other) => return Err(usage(format!("unknown command `{other}`"))),
         None => return Err(usage("no command given".into())),
     };
     let known = match command {
         "krn" => KRN_OPTIONS,
+        "carried" => CARRIED_OPTIONS,
         "sign" => SIGN_OPTIONS,
         _ => KEYGEN_OPTIONS,
     };
@@ -228,6 +237,7 @@ fn run(args: &[OsString]) -> Result<Option<String>, Failure> {
     };
     match command {
         "krn" => pack_krn(options),
+        "carried" => describe_carried(options),
         "sign" => sign_krn(options),
         _ => keygen(options),
     }
@@ -270,6 +280,50 @@ fn pack_krn(mut options: Options) -> Result<String, Failure> {
         packed.segments,
         packed.relocations,
         packed.bytes.len()
+    ))
+}
+
+fn describe_carried(mut options: Options) -> Result<String, Failure> {
+    let input = PathBuf::from(options.require("--input")?);
+    let out = PathBuf::from(options.require("--out")?);
+    let name = options
+        .text("--name")?
+        .ok_or_else(|| Failure::Usage("--name is required".into()))?;
+    let variable = options
+        .text("--variable")?
+        .ok_or_else(|| Failure::Usage("--variable is required".into()))?;
+    let elf = read_input(&input)?;
+    let carried = carried::describe(&elf).map_err(conversion)?;
+    let files = carried.rust(&name, &variable).map_err(conversion)?;
+    fs::create_dir_all(&out)
+        .map_err(|e| conversion(format!("cannot create {}: {e}", out.display())))?;
+    let mut written = 0;
+    for (file, bytes) in &files {
+        let path = out.join(file);
+        if fs::read(&path).is_ok_and(|old| old == *bytes) {
+            continue;
+        }
+        write_output(&path, bytes)?;
+        written += 1;
+    }
+    let prefix = format!("{name}.");
+    let entries = fs::read_dir(&out)
+        .map_err(|e| conversion(format!("cannot read {}: {e}", out.display())))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| conversion(format!("{}: {e}", out.display())))?;
+        let file = entry.file_name();
+        let file = file.to_string_lossy();
+        if file.starts_with(&prefix) && !files.iter().any(|(f, _)| *f == file) {
+            fs::remove_file(entry.path())
+                .map_err(|e| conversion(format!("cannot remove {file}: {e}")))?;
+        }
+    }
+    Ok(format!(
+        "onbf-pack: described {name} in {}: {} segments, {} relocations, {} files ({written} written)",
+        out.display(),
+        carried.segments.len(),
+        carried.relocations.len(),
+        files.len()
     ))
 }
 

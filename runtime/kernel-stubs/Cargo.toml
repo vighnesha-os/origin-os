@@ -1,0 +1,17 @@
+[package]
+name = "origin-kernel-stubs"
+description = "Today's generated origin.kernel stubs and client, for the kernel's Rust proof programs in ring 3 until origin.core exists (task S4-1; ADR-0011 L8)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Nothing generated is committed here. `cargo xtask` runs `oidl generate` (its full mode) on
+# `sdk/interfaces/origin.kernel.oidl` into the target directory at each ring-3 build, and
+# `src/lib.rs` includes that tree: the generator's runtime, origin.kernel's types, its client,
+# `abi.rs` and `core_stubs.rs`, the shims that hold a `syscall` each. So no committed crate holds
+# a shim (xtask's interface test), and the stubs are always the definition's. Built only for the
+# userspace triple, with `.cargo/userspace.toml`; never a default member.
+
+[lints]
+workspace = true

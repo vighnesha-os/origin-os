@@ -19,6 +19,7 @@ mod progress;
 mod provenance;
 mod reproducible;
 mod requirements;
+mod ring3;
 mod roadmap;
 mod screen;
 mod serial;
@@ -741,13 +742,13 @@ fn no_generator_markers(scenario: &mut Scenario) {
         "origin-kernel: random: no generator: known-answer test passed; on the boot processor RDSEED is absent and RDRAND is absent. Nothing will be launched and nothing placed at a random address (ADR-0016 R8)".into(),
         "origin-kernel: random: processor 0: RDSEED absent (0 draws passed), RDRAND absent (0 draws passed); its generator NOT seeded".into(),
         "origin-kernel: random: no generator, so no request is answered; consistent false: random failed".into(),
-        "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, service-directory and memory-object proofs did not run".into(),
+        "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, Rust-program, service-directory and memory-object proofs did not run".into(),
         "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: true; the loader handed over no random value: true, and the region is at its fixed base: true".into(),
         // The network asks for no lease: a transaction ID must not be guessable.
         "; DHCP lease 0.0.0.0 (".into(),
         "; no random value for a transaction ID or port; consistent false: virtio-net failed".into(),
         "origin-kernel: boot verdict: degraded: ".into(),
-        "; 3 did not run; failed: ".into(),
+        "; 4 did not run; failed: ".into(),
         "random-number generator (no randomness)".into(),
         HALT_LINE.into(),
     ];
@@ -1521,6 +1522,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(address_space_markers(cpus))
         .chain(identity_markers())
         .chain(launch_markers())
+        .chain(rust_program_markers())
         .chain(directory_markers())
         .chain(memory_markers())
         .chain(events_ports_markers())
@@ -1823,6 +1825,7 @@ fn boot_failures() -> Vec<&'static str> {
         ": PM timer failed",
         ": ipc failed",
         ": start failed",
+        ": rust program failed",
         ": directory failed",
         ": memory failed",
         ": events and ports failed",
@@ -2345,6 +2348,17 @@ fn launch_markers() -> Vec<String> {
         "origin-kernel: start: two children launched from their creator found their start records in RDI, read-only at random addresses: each record, read back in ring 3, has its size, version, 4 entries with C6's rights, 2 arguments and 1 environment string: true; each start handle works: true; each child's message names it and its creator's principal: true; writing its record faulted there: true".into(),
         "origin-kernel: start: the two records are at different addresses: true; a record over 64 KiB is refused: true; a launch refused after its child held a handle gives everything back: true".into(),
         "origin-kernel: start: every launched process and all they held are gone: heap ".into(),
+    ]
+}
+
+/// The first Rust program in ring 3 (task S4-1; ADR-0011 L1, L8; `program_proof::prove`): the
+/// kernel carries it in its image, and launches it six times at random bases.
+fn rust_program_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: rust program: first_program ran in ring 3 from the kernel's image at random bases, 6 times: each found its start record in RDI and read its header and 3 entries as written: true; ran at its base plus its entry: true; every relocated slot held its value plus the base: true; read its data through relocated pointers: true; the runtime's mem functions copy, move, fill and compare: true; wrote on BOOTSTRAP, named as the writer: true; ended with its exit code: true".into(),
+        "origin-kernel: rust program: two launches differ in base and stack: true; a write to its code faulted there: true; a jump into its data faulted there as a fetch: true; a write to its relocated read-only data faulted there: true; a panic ended it with the runtime's exit code: true; a launch refused after its image was mapped: true".into(),
+        "origin-kernel: rust program: loading and starting it took ".into(),
+        "origin-kernel: rust program: every launched process and all they held are gone: heap ".into(),
     ]
 }
 
@@ -3337,7 +3351,10 @@ fn check() -> Result {
         "-D",
         "warnings",
     ]))?;
-    run_step(cargo().args([
+    // The ring-3 crates on their own target (task S4-1), then the kernel, which carries the
+    // programs they build.
+    ring3::clippy()?;
+    run_step(ring3::with_programs(cargo().args([
         "clippy",
         "--package",
         KERNEL_PACKAGE,
@@ -3346,7 +3363,7 @@ fn check() -> Result {
         "--",
         "-D",
         "warnings",
-    ]))?;
+    ]))?)?;
     run_step(cargo().args(["test", "--package", KERNEL_PACKAGE, "--lib"]))?;
     // The loader in developer mode too (the boot test's variant).
     for loader in [Loader::Developer, Loader::Verifying] {
@@ -4028,9 +4045,12 @@ fn linux_cfg_lint() -> Result {
         &mut manifests,
     )
     .map_err(|e| format!("cfg lint: {e}"))?;
-    let cargo_config = root.join(".cargo").join("config.toml");
-    if cargo_config.is_file() {
-        manifests.push(cargo_config);
+    // `config.toml`, and the userspace flags xtask passes to the ring-3 builds (task S4-1).
+    for name in ["config.toml", "userspace.toml"] {
+        let cargo_config = root.join(".cargo").join(name);
+        if cargo_config.is_file() {
+            manifests.push(cargo_config);
+        }
     }
     if sources.is_empty() || manifests.is_empty() {
         return Err(format!(
@@ -4163,7 +4183,8 @@ fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
     if let Some(target) = target {
         build.arg("--target-dir").arg(target);
     }
-    run_step(&mut build)?;
+    // The programs it carries in its image (task S4-1).
+    run_step(ring3::with_programs(&mut build)?)?;
     let elf = target
         .map_or_else(target_dir, Path::to_path_buf)
         .join(KERNEL_TARGET)

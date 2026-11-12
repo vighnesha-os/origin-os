@@ -2,10 +2,13 @@
 //! owner decision D1). Host only; it is not part of the shipping OS.
 //!
 //! This version writes one profile, KRN (§6.5): [`krn::pack`] turns the Framekernel's
-//! ELF64 x86-64 PIE into an unsigned (developer-mode) KRN image.
+//! ELF64 x86-64 PIE into an unsigned (developer-mode) KRN image. It also describes the programs
+//! the kernel carries in that image ([`carried`], ADR-0011 L1), which is no ONBF profile.
 //!
 //! - [`elf`] reads the input against the conversion contract and rejects everything
 //!   outside it (§6.1.2 hard errors, ONBF-R11).
+//! - [`carried`] lays a ring-3 program out for the kernel's launch path, as Rust the kernel
+//!   compiles in (task S4-1; the note to ONBF §8.3).
 //! - [`relr`] encodes and decodes RELR relocations (§6.1).
 //! - [`ocbor`] writes canonical OCBOR-1 (§5).
 //! - [`krn`] builds the sections, lays out the container (errata C1–C4, C7, C10, C12,
@@ -30,6 +33,7 @@
     )
 )]
 
+pub mod carried;
 mod container;
 pub mod elf;
 pub mod krn;
