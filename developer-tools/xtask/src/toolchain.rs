@@ -244,7 +244,13 @@ pub(crate) fn userspace_config() -> Result<Vec<String>> {
 fn config_for(targets: &[&str]) -> Result<Vec<String>> {
     let toolchain = toolchain()?;
     let flags = remap_flags(&source_directories(&toolchain.sysroot), &toolchain.commit)?;
-    Ok(targets
+    Ok(entries_for(targets, &flags))
+}
+
+/// `--config target.<triple>.rustflags=<flags>` for each of `targets`, `flags` being a TOML
+/// array.
+fn entries_for(targets: &[&str], flags: &str) -> Vec<String> {
+    targets
         .iter()
         .flat_map(|target| {
             [
@@ -252,7 +258,7 @@ fn config_for(targets: &[&str]) -> Result<Vec<String>> {
                 format!("target.{target}.rustflags={flags}"),
             ]
         })
-        .collect())
+        .collect()
 }
 
 /// The toolchain's source directory as the compiler names it, and with every symbolic link
@@ -485,23 +491,76 @@ mod tests {
         assert!(error.contains(PINNED_COMMIT), "{error}");
     }
 
+    /// The configuration keys a list of `--config` arguments sets.
+    fn keys(config: &[String]) -> Vec<&str> {
+        config
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "--config");
+                pair[1].split('=').next().expect("a key")
+            })
+            .collect()
+    }
+
     #[test]
     fn the_ring_3_builds_get_the_remap_for_their_own_triple_alone() {
         let config = userspace_config().expect("the pinned toolchain is installed");
-        assert_eq!(config.len(), 2);
-        assert_eq!(config[0], "--config");
+        assert_eq!(keys(&config), ["target.x86_64-unknown-linux-gnu.rustflags"]);
         assert!(
             config[1]
                 .starts_with("target.x86_64-unknown-linux-gnu.rustflags=[\"--remap-path-prefix="),
             "{}",
             config[1]
         );
-        // The freestanding builds do not name the userspace triple, which is CI's host.
+        // The freestanding builds set no key of the userspace triple, which is CI's host.
         let images = image_config().expect("the pinned toolchain is installed");
-        assert!(
-            images.iter().all(|entry| !entry.contains(USERSPACE_TARGET)),
-            "{images:?}"
+        assert_eq!(
+            keys(&images),
+            [
+                "target.x86_64-unknown-uefi.rustflags",
+                "target.x86_64-unknown-none.rustflags"
+            ]
         );
+    }
+
+    #[test]
+    fn a_toolchain_directory_named_for_the_userspace_triple_changes_no_key() {
+        // On CI the toolchain's directory holds the host's triple, which is the userspace
+        // triple. The first form of the test above looked for that triple anywhere in an
+        // entry, found it in the directory's name, and failed CI's check job on the batch
+        // (run 43230979284, at 9e4f79f): it had only ever run on the development Mac.
+        let commit = "58cf8f9c35b355199727627d07ae34a4e2846d67";
+        let flags = remap_flags(
+            &[PathBuf::from(
+                "/home/runner/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/lib/rustlib/src/rust",
+            )],
+            commit,
+        )
+        .expect("the directory is UTF-8");
+        assert!(flags.contains(USERSPACE_TARGET));
+        let images = entries_for(&[UEFI_TARGET, KERNEL_TARGET], &flags);
+        assert_eq!(
+            keys(&images),
+            [
+                "target.x86_64-unknown-uefi.rustflags",
+                "target.x86_64-unknown-none.rustflags"
+            ]
+        );
+        let ring3 = entries_for(&[USERSPACE_TARGET], &flags);
+        assert_eq!(keys(&ring3), ["target.x86_64-unknown-linux-gnu.rustflags"]);
+        // And the same on a machine whose toolchain is named for another host.
+        let mac = remap_flags(
+            &[PathBuf::from(
+                "/Users/someone/.rustup/toolchains/1.99.1-aarch64-apple-darwin/lib/rustlib/src/rust",
+            )],
+            commit,
+        )
+        .expect("the directory is UTF-8");
+        assert_eq!(
+            keys(&entries_for(&[UEFI_TARGET, KERNEL_TARGET], &mac)),
+            keys(&images)
+        );
+        assert!(entries_for(&[], &flags).is_empty());
     }
 
     #[test]
