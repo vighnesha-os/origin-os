@@ -25,7 +25,7 @@ rustflags = [
     "-C", "linker=rust-lld",
     "-C", "linker-flavor=ld.lld",
     # The shape `onbf-pack carried` accepts (ONBF §6.1.2), the same as the kernel's
-    # (`framekernel/build.rs`). These come after rustc's own arguments, and in lld the last of
+    # (`.cargo/config.toml`). These come after rustc's own arguments, and in lld the last of
     # two opposing `-z` options wins.
     "-C", "link-arg=--entry=_start",
     # No PT_INTERP: nothing loads these images but the kernel's launch path.

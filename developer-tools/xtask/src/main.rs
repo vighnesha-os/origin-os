@@ -11,6 +11,7 @@ mod disk;
 mod documents;
 mod expected_warning;
 mod image;
+mod image_inputs;
 mod interfaces;
 mod lex;
 mod loom;
@@ -106,6 +107,17 @@ commands:
   progress-gate only the gate on docs/PROGRESS.md: the committed page is the one the
               tree generates, byte for byte (part of check; quick)
   regenerate rewrites the kernel's generated system-call crate from sdk/interfaces
+  version     writes runtime/version/src/generated.rs, the release's constants, from
+              origin-version.toml (CLAUDE.md §62)
+  version-gate only the gate on that file: it is what origin-version.toml generates (part of
+              check; quick)
+  image-graph-gate only the gate on what the images are built from: no package under the
+              loader, the kernel or a carried program has a build script or is a
+              procedural macro (part of check; quick)
+  linker-text-gate <ELF>...
+              only the check the reproducible-build gate makes of each ELF it builds, on
+              files named here: `.comment` holds the line .cargo/config.toml fixes for the
+              linker, and not the linker's own, which differs between kinds of host
   image-gate [kernel ELF]
               only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
               and no jump table, in the code this build compiled. Builds the kernel first, or
@@ -2581,6 +2593,10 @@ fn main() -> ExitCode {
         ["progress"] => progress::write(),
         ["progress-gate"] => progress::gate(),
         ["regenerate"] => interfaces::regenerate(),
+        ["version"] => image_inputs::write_version_file(),
+        ["version-gate"] => image_inputs::version_gate(),
+        ["image-graph-gate"] => image_inputs::graph_gate(),
+        ["linker-text-gate", files @ ..] => image_inputs::linker_text_gate(files),
         ["image-gate"] => in_turn("image-gate", image::build_and_gate),
         ["image-gate", elf] => image::gate(Path::new(elf)),
         ["build"] => in_turn("build", || {
@@ -3427,6 +3443,8 @@ fn check() -> Result {
     progress::gate()?;
     unsafety::gate()?;
     interfaces::gate()?;
+    image_inputs::version_gate()?;
+    image_inputs::graph_gate()?;
     manifest_version_lint()?;
     signing_stays_off_the_os_lint()?;
     signing_has_no_secret_branches()?;
@@ -4212,13 +4230,16 @@ fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
         build.arg("--target-dir").arg(target);
     }
     build.args(toolchain::image_config()?);
-    // The programs it carries in its image (task S4-1), built into the same directory.
-    run_step(ring3::with_programs(&mut build, target)?)?;
     let elf = target
         .map_or_else(target_dir, Path::to_path_buf)
         .join(KERNEL_TARGET)
         .join("release")
         .join(KERNEL_PACKAGE);
+    // The programs it carries in its image (task S4-1), built into the same directory.
+    let build = ring3::with_programs(&mut build, target)?;
+    // A kernel linked before `.cargo/config.toml` fixed the linker's line is linked again:
+    // Cargo does not do that by itself (TASKS item 44).
+    image_inputs::build_with_the_fixed_line(std::slice::from_ref(&elf), || run_step(build))?;
     if elf.is_file() {
         Ok(elf)
     } else {

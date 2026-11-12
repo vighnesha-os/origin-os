@@ -59,6 +59,11 @@ const PROGRAMS: &[Program] = &[Program {
     name: "first_program",
 }];
 
+/// The package of each program the kernel carries.
+pub(crate) fn carried_packages() -> impl Iterator<Item = &'static str> {
+    PROGRAMS.iter().map(|program| program.package)
+}
+
 /// `target`, or Cargo's own target directory.
 fn base_dir(target: Option<&Path>) -> PathBuf {
     target.map_or_else(target_dir, Path::to_path_buf)
@@ -188,7 +193,10 @@ pub(crate) fn programs(target: Option<&Path>) -> Result<PathBuf> {
     for program in PROGRAMS {
         build.args(["--package", program.package]);
     }
-    run_step(&mut build)?;
+    // Each is an ELF the kernel takes a segment of with its header in it, so each must have
+    // been linked with the linker's fixed line: one from before it is linked again.
+    let linked_files: Vec<PathBuf> = PROGRAMS.iter().map(|p| linked(target, p)).collect();
+    crate::image_inputs::build_with_the_fixed_line(&linked_files, || run_step(&mut build))?;
     let out = ring3_dir(target).join("carried");
     for program in PROGRAMS {
         let elf = linked(target, program);
