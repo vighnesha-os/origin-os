@@ -148,6 +148,7 @@ Every answered item of `docs/engineering/OWNER_DECISIONS.md` is named in the "De
 | 23 | none | A comparison of two AMD manuals with AMD's own copies, done once. |
 | 70, 161 | none | How pull requests are offered: at 100 commits, and pull request 15 at 76. A rule of process that no statement of the directive or decision of an ADR carries. |
 | 167, 190 | none | How task 18b and the randomized model of its policy land: through pull request 16. Rules of process. |
+| 224–228, 231–236 | none | How rented bench machines are used: the provider, the budget cap, who signs up and holds the credentials, the order of the rentals, how Origin boots there (items 231 and 236), what is kept and where, what a bench record may claim, no self-hosted runner, and rentals through Latitude's API (`docs/research/2026-11-12-first-bare-metal-boot.md`). Rules of process for bench equipment, which ADR-0009 A1 keeps outside the declared scope. |
 
 ## Scope changes
 

@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| As of | 2026-11-10 for items 71–160, 2026-11-11 for items 161 to 190, and 2026-11-12 for items 191 to 223 and 238 to 246. Items up to 70: 2026-11-09, after the pre-merge review. |
-| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 142–144, 155–160, 162–164, 166 and 188: as their sections say. Items 165 and 168: your own text for CLAUDE.md §1, in its second and third versions, read against the whole of revision 7.5 and the ADRs each change names; the check and the list of changes are `ROLES_CHECK_2026-11-11.md`. Item 167: items 70 and 113 and CLAUDE.md §78 and §80, by the session that keeps the second step-3 batch. Item 189: proposal 11 of `ROLES_CHECK_2026-11-11.md`. Items 169–187 and 190: as their sections say. Items 191–196: CLAUDE.md 7.6's §1, by TASKS item 35's session, with one rule added to item 191 by the coordinating session. Items 197–220: CLAUDE.md 7.6, the accepted ADRs and `docs/spec/OIDL.md`, by the session that wrote step 4's ledger, and again by the coordinating session against ADR-0005 A6, ADR-0011 N8 and the system threat model. Items 221–223: items 191–196 and the matrix as built, by the coordinating session, which ran its gate. Items 238–246: CLAUDE.md 7.6 and ADR-0001 to ADR-0017 as they stand on `main` at `04ec842`, by the architecture-review session, which wrote them. |
-| Evidence | Everything below is proven under QEMU only. Nothing has run on physical hardware (CLAUDE.md §74). |
-| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–160 (item 97 delegated to Claude). 2026-11-11: items 161 to 190 (item 168 delegated to Claude). 2026-11-12: items 191 to 223 and 238 to 246. |
+| As of | 2026-11-10 for items 71–160, 2026-11-11 for items 161 to 190, and 2026-11-12 for items 191 to 236 and 238 to 246. Items up to 70: 2026-11-09, after the pre-merge review. Item 237 is in the third batch (pull request 21) and reaches this sheet with it. |
+| Checked against | Items 1–70: CLAUDE.md v7.1, item by item. That check changed the first version of this sheet. Items 71–97: v7.2, and the 7.3 revision they produced. Items 98–105: as their sections say. Items 106–123: v7.3 and every accepted ADR, in the design review that put them, and the 7.4 revision they produced. Items 124–141: v7.4 and ADR-0001 to ADR-0015 as they stand on the records branch, by the task that put them (TASKS item 19a). Items 145–151: v7.4, the accepted ADRs and NIST's SP 800-90A, 90B and 90C, by the task that put them (TASKS item 18a). Items 152–154: ADR-0017 and ADR-0013, by the task that built ADR-0017's first half (TASKS item 19b) and the session that keeps the review batch. Item 161: items 70 and 106. Items 142–144, 155–160, 162–164, 166 and 188: as their sections say. Items 165 and 168: your own text for CLAUDE.md §1, in its second and third versions, read against the whole of revision 7.5 and the ADRs each change names; the check and the list of changes are `ROLES_CHECK_2026-11-11.md`. Item 167: items 70 and 113 and CLAUDE.md §78 and §80, by the session that keeps the second step-3 batch. Item 189: proposal 11 of `ROLES_CHECK_2026-11-11.md`. Items 169–187 and 190: as their sections say. Items 191–196: CLAUDE.md 7.6's §1, by TASKS item 35's session, with one rule added to item 191 by the coordinating session. Items 197–220: CLAUDE.md 7.6, the accepted ADRs and `docs/spec/OIDL.md`, by the session that wrote step 4's ledger, and again by the coordinating session against ADR-0005 A6, ADR-0011 N8 and the system threat model. Items 221–223: items 191–196 and the matrix as built, by the coordinating session, which ran its gate. Items 224–234: the bare-metal plan's sources, as its ledger records them, and four of its statements about the code, checked by the coordinating session. Item 235: the rental tool at `70e596d`, read in full by the coordinating session, whose own run of its offline tests passed. Item 236: rental A's findings (`docs/research/2026-11-12-rental-a-findings.md`, point 6). Items 238–246: CLAUDE.md 7.6 and ADR-0001 to ADR-0017 as they stand on `main` at `04ec842`, by the architecture-review session, which wrote them. |
+| Evidence | Everything below is proven under QEMU only. No Origin code has run on physical hardware (CLAUDE.md §74): rental A (items 224–235) read a rented server with the provider's own Linux. |
+| Answered | 2026-11-08: items 1–29. 2026-11-09: items 30–70. 2026-11-10: items 71–160 (item 97 delegated to Claude). 2026-11-11: items 161 to 190 (item 168 delegated to Claude). 2026-11-12: items 191 to 236 and 238 to 246. |
 | Still open | No numbered item. Item 168's changes to your text are Claude's, and you have not read them. Buying machines is off for now (ADR-0009's update of 2026-11-09). Items 77 and 79 leave you two things to do, and items 106, 121 and 122 three more (see their sections). |
 
 The recommendations are Claude's. The decisions are yours (CLAUDE.md §18, §84).
@@ -727,6 +727,58 @@ Building the matrix (TASKS item 35) took three things that items 191 to 196 do n
 
 - **Item 223 accepts a limit of the gate,** which the matrix's README already lists under what the gate does not check. A reworded decision under an unchanged title has to be caught by whoever changes the ADR, who updates the decision's rows by hand.
 - **Built:** the matrix and its gate, on `claude/dazzling-jackson-9eca1b`, not yet landed. Both states and the `owed` list are in it already; its README and TASKS item 35 will name these items.
+
+## The first boot on a rented bare-metal machine (items 224 to 236): Accepted 2026-11-12
+
+You asked whether bare metal is possible for testing, and answered "Yes, plan it" on 2026-11-12. A session of its own wrote the plan, `docs/research/2026-11-12-first-bare-metal-boot.md`. The coordinating session checked four of its statements against the code at `e6456dc` (identity maps for firmware-reserved memory are not built; the kernel prints no scope line; the boot proofs write only to the boot test's own disk; at most 64 processors are started), numbered its eleven decisions 224 to 234 in its order, and put them to you with three marked "Look". You answered **"Accept all 11"** the same day.
+
+| # | Question | Answer |
+|---|---|---|
+| 224, answered | Provider: Latitude.sh, billed hourly: an `m4.metal.small` (EPYC 4244P, Zen 4, $0.41 an hour) for rentals A and B, and optionally one `f4.metal.large` (EPYC 9275F, Zen 5, $2.62 an hour) for rental C? | **Accept** |
+| 225, answered | A budget cap of $10 (₹937) of machine time for all rentals together, with a stop to ask you before going past it; the $5 card hold outside it? | **Accept** |
+| 226, answered | You sign up personally, and verify with a government ID through Stripe Identity if you are content to share it, otherwise with $100 of credit? (**Look**) | **Accept** |
+| 227, answered | You do every dashboard action and hold every credential; Claude prepares the checklist and the image, reads the logs, and runs commands in rescue Linux only with an SSH key you add for that rental? | **Accept** |
+| 228, answered | Rental A once you have signed up; rental B after identity maps land and pull request 16 merges; rental C only if B's serial console worked? | **Accept** |
+| 229, answered | Does the deadline "identity maps must land before real hardware" (items 8 and 12) apply to rented servers too? (**Look**) | **Accept** |
+| 230, answered | Accept by name T4's two windows, T5, T6, T8, T9 and T23, for bench boots on rented servers only? (**Look**) | **Accept** |
+| 231, answered | Boot with the developer-mode loader and Secure Boot off, with no keys enrolled and no firmware variable written, and any firmware setting changed put back before deletion? | **Accept** |
+| 232, answered | Commit the record and Origin's serial log with addresses and server IDs removed, and keep raw firmware tables and hardware dumps private, with their SHA-256 in the record? | **Accept** |
+| 233, answered | Does the record claim bench evidence only, so that I2 stays Partly, E12 stays Open and no requirements row becomes done on it? | **Accept** |
+| 234, answered | No self-hosted GitHub runner for now, since the repository is public? | **Accept** |
+
+- **Nothing is rented and nothing is spent yet.** Signing up, the card and the identity check are yours (items 226 and 227). Rental A, on the provider's rescue Linux only, can start once you have signed up (item 228).
+- **Rental B, Origin's first boot on a physical machine, waits** for identity maps for firmware-reserved memory (item 229 keeps items 8 and 12) and for pull request 16's merge.
+- **Item 230 accepts six threats by name, for bench boots on rented servers only.** It is written into `THREAT_MODEL_IOMMU.md`'s list "before real hardware" and beside ADR-0009 H6. It does not reach a volunteer's machine, a release or any claim, and T14 is not accepted: identity maps close it.
+- **Item 233:** a rented machine is bench equipment outside ADR-0009 A1's scope, so its record qualifies nothing.
+- **Corrected after your answer: the prices.** Item 224 quoted the pricing page, whose "/hr" figure is the monthly price over 730 hours. Latitude's API, read by the bare-metal session with your key on 2026-11-12, gives hourly billing at $0.81 an hour for `m4.metal.small` in the US, Canada, Germany and the Netherlands, and $6.04 an hour for `f4.metal.large`, in stock only in Singapore and Tokyo. Rentals A and B fit item 225's $10 cap, at about $0.81 (at most $1.62) and $2.43. Rental C does not: its worst case passes the cap, so it runs only if you raise the cap or choose another machine. Items 224 and 225 stand as answered, and nothing was bought on the old figures.
+- **Found, not changed:** ADR-0009 Amendment 1's table says Clearwater Forest was introduced in March 2026, and Intel's specification page for the Xeon 6990E+ gives a launch date of Q2'26. It is in the scope either way.
+
+### Rentals through Latitude's API (item 235, changing item 227): Accepted 2026-11-12
+
+After signing up with Latitude.sh, you told the bare-metal session to "try their API and make it automate from your side, money is also matter". That changes item 227, which had you doing every dashboard action. The session wrote a rental tool, `developer-tools/bench/latitude.py`. The coordinating session read it and found two faults that could cost money: a retried create could make a second server, and an unconfirmed deletion was recorded as done. Both were fixed (`70e596d`), with seven offline tests. The coordinating session put the change to you as item 235, and you answered **"Accept 235"**.
+
+| # | Question | Answer |
+|---|---|---|
+| 235, answered | Change item 227: Claude runs the rentals through Latitude's API with `developer-tools/bench/latitude.py` once its money faults are fixed, and you sign up, create the API key and save it to the token file yourself, approve each rental's cost in chat before it is bought, and revoke the key when the rentals are done? | **Accept** |
+
+- **Item 227 otherwise stands.** You hold every credential, and no Claude session creates the key, reads it off a page, or writes or prints it. The tool reads the token file only to send the key to `api.latitude.sh`.
+- **Every purchase still needs your yes in chat, with the item and the total.** The tool's `--yes` follows that answer and never stands in for it. Item 225's $10 cap is enforced by the tool's own ledger.
+- **What the tool cannot guard:** Latitude's API cannot set a deletion time, so the watchdog that deletes a server at its deadline runs on the Mac. Keep the Mac plugged in, lid open and online until `status` shows the server deleted.
+- **Rental A done on 2026-11-12, $0.81 of the $10 cap.** You approved its cost in the bare-metal session ("Yes, rent it"). One `m4.metal.small` in Amsterdam ran for 9 minutes 11 seconds, was billed one hour, and its deletion was confirmed by the API. No Origin code ran. What the machine showed is in `docs/research/2026-11-12-rental-a-findings.md`. The serial console is COM2, and the firmware has no IVMD block. The raw dumps stay private (item 232).
+- **Not in the repository yet.** Before rental A the tool had not been run against Latitude's API. It is on `claude/first-bare-metal-boot` (`11bb986` and `70e596d`), and it lands with a later batch, since it is code.
+
+### How rental B starts Origin (item 236, changing item 231): Accepted 2026-11-12
+
+Rental A showed that the rented server's management controller drops the serial console at every reset. Item 231's way of starting Origin, picking the disk once from the firmware's boot menu over that console, would have to be done blind. The bare-metal session proposed another way and put it to you in its own session, where you answered "Yes, replace the file". The coordinating session numbered it item 236 and put it to you, and you answered **"Accept 236"**.
+
+| # | Question | Answer |
+|---|---|---|
+| 236, answered | Change item 231's boot method for rental B: put Origin's developer-mode loader over the file the firmware's first boot entry starts (on the rented board, `\EFI\ubuntu\shimx64.efi` on the first disk's EFI system partition), with the kernel at `\EFI\ORIGIN\KERNEL.ONBF` on the same partition, instead of picking the disk from the boot menu? | **Accept** |
+
+- **The rest of item 231 stands:** no UEFI variable is written, no firmware setting is changed, and Secure Boot stays off.
+- **Its cost:** the provider's system on that disk no longer starts. The server is deleted and its disks erased after each rental, and the provider's rescue mode, which starts from the network, can still recover it.
+- **Rental B still waits** for identity maps (item 229), which its tool enforces. The tool (`b56a99b` on `claude/first-bare-metal-boot`) has not run, and the coordinating session reads it in full before it does.
+
 
 ## Performance cost policy (ADR-0018, items 238 to 246): Accepted 2026-11-12, nothing built
 
