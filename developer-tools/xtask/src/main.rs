@@ -9,6 +9,7 @@
 mod asmflags;
 mod disk;
 mod documents;
+mod expected_warning;
 mod image;
 mod interfaces;
 mod lex;
@@ -25,7 +26,7 @@ mod unsafety;
 use std::borrow::Cow;
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, ExitCode, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -3015,7 +3016,9 @@ fn cargo() -> Command {
     c
 }
 
-/// Runs `cmd` with inherited stdio and fails unless it exits successfully.
+/// Runs `cmd` and fails unless it exits successfully. Its standard output is inherited. Its
+/// error output passes through line by line, except the one compiler warning `cargo xtask`
+/// expects, which is collapsed to a single note (`expected_warning.rs`, ADR-0017 Z10).
 fn run_step(cmd: &mut Command) -> Result {
     let shown = std::iter::once(cmd.get_program())
         .chain(cmd.get_args())
@@ -3023,9 +3026,44 @@ fn run_step(cmd: &mut Command) -> Result {
         .collect::<Vec<_>>()
         .join(" ");
     println!("xtask: $ {shown}");
-    let status = cmd
-        .status()
+    // Piped, cargo would drop its colours; keep them where a person is watching.
+    if env::var_os("CARGO_TERM_COLOR").is_none() && std::io::stderr().is_terminal() {
+        cmd.env("CARGO_TERM_COLOR", "always");
+    }
+    let mut child = cmd
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("cannot run `{shown}`: {e}"))?;
+    let mut filter = expected_warning::Filter::default();
+    if let Some(stderr) = child.stderr.take() {
+        let mut reader = BufReader::new(stderr);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            let read = reader
+                .read_until(b'\n', &mut bytes)
+                .map_err(|e| format!("reading the output of `{shown}`: {e}"))?;
+            if read == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let line = text.strip_suffix('\n').unwrap_or(&text);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            for out in filter.line(line) {
+                eprintln!("{out}");
+            }
+        }
+    }
+    let (rest, dropped) = filter.finish();
+    for out in rest {
+        eprintln!("{out}");
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("cannot run `{shown}`: {e}"))?;
+    if dropped != expected_warning::Dropped::default() {
+        println!("{}", expected_warning::note(&dropped));
+    }
     if status.success() {
         Ok(())
     } else {

@@ -3940,3 +3940,13 @@ A fourth addition to the entry above, from another session and on a branch of it
 - **Review:** none.
 - **Licensing:** MIT OR Apache-2.0.
 - **In the batch:** merged into `land/s4` at `3b06a80` on 2026-11-12, with the record of item 237. The coordinating session read the change to `developer-tools/oidl/src/fingerprint.rs`; the check on the merge is in the landing record's commit.
+
+## `cargo xtask`: the expected `harden-sls-ret` warning collapsed to one line (2026-11-12)
+
+- **What:** `run_step` reads a command's error output line by line. `developer-tools/xtask/src/expected_warning.rs` drops exactly the compiler's five-line warning that `-C target-feature=+harden-sls-ret` (ADR-0017 Z10) is unknown and unstable, and each crate's "generated 1 warning" summary while that is the build's only warning, and prints one note in their place. Every other line passes through in order; once any other warning appears, no summary is dropped for the rest of that command.
+- **Why:** the owner's choice on 2026-11-12, "Collapse to one line", over leaving twelve copies in every build's output. Stable Rust 1.99.1 has no supported option for the feature and no lint governs the warning (`-A` cannot silence it); removing the option would remove the protection. The image gate (`image.rs`) still holds the protection.
+- **Tests:** six host tests: CI's own output (run 43118681550), another warning passing through, a near-miss passing through in order, other counts, colour codes, and the note's words. In real output on the development Mac, the boot test's kernel build printed one note, "(warnings: 1, crate summaries: 12)", and no copy of the warning.
+- **Gates:** `cargo xtask check` passed (1,572 host tests passed, 0 failed, 27 ignored); `cargo xtask boot-test` passed (11 of 11).
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-12, the session that keeps the third batch. Original code, std only.
+- **Review:** none.
+- **Licensing:** MIT OR Apache-2.0.
