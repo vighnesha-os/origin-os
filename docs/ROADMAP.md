@@ -3,14 +3,14 @@
 | | |
 |---|---|
 | Required by | CLAUDE.md §82: "Do not mark a milestone complete without its exit tests. Each milestone's exit tests are listed in `docs/ROADMAP.md` before it is marked done (decision item 122)." |
-| State | **Every exit test here is proposed.** None is accepted. Exit tests define scope, so they are the owner's. On 2026-11-12 the coordinating session put M0 to M2's tests and the rule for later milestones to the owner as decision items 252 to 256: 252 for M0, 253 for M1, 254 for M2, 255 for what QEMU and guests under KVM can show, 256 for the rule. They are marked "proposed" until the answer is relayed. The tests of M3 to M13 are written by the proposed rule and are not yet put to the owner. |
-| Milestones done | **None.** No milestone is marked done here until the owner has answered on its exit tests and every test passes in its declared scope. |
+| State | **M0, M1 and M2's exit tests and the rule for later milestones are accepted.** The owner accepted them on 2026-11-12 as decision items 252 to 256 ("Accept all 7", which covered items 252 to 258): 252 for M0, 253 for M1, 254 for M2, 255 for what QEMU and guests under KVM can show, 256 for the rule. The decision sheet records them through the coordinating session's records pull request to `main`. **The tests of M3 to M13 are proposed**, written by item 256's rule, and are not accepted. |
+| Milestones done | **None.** A milestone is done when every one of its accepted exit tests passes in its declared scope (items 255 and 256). M0, M1 and M2 are built. |
 | Written | 2026-11-12, by TASKS item 25, at `land/s4` `5ea97ef`. |
 | Rows | The IDs are rows of the requirements matrix (`docs/requirements/`). What a row's state means is in its `README.md`. A row's state is the matrix's; this page does not repeat it, so it cannot go stale here. |
 
-Until 2026-11-12, `docs/STATUS.md` marked M0 "done", M1 "done (developer mode)" and M2 "done (baseline)", before any exit test existed. §82 forbids that, so the coordinating session had those three marks changed to "built; exit tests proposed in `docs/ROADMAP.md`". By the tests proposed below, none of the three would pass today (see each milestone's "Marked against the tests").
+Until 2026-11-12, `docs/STATUS.md` marked M0 "done", M1 "done (developer mode)" and M2 "done (baseline)", before any exit test existed. §82 forbids that, so at the coordinating session's request those three marks now say "built", with a pointer to the tests here. By the accepted tests, none of the three passes today (see each milestone's "Marked against the tests").
 
-## The rule for writing exit tests (proposed: decision items 255 and 256)
+## The rule for writing exit tests (accepted: decision items 255 and 256)
 
 1. A milestone's exit tests are written here before its first task's contract (`docs/engineering/TASK_CONTRACT_TEMPLATE.md`), or now for milestones already started (M3, M4, M5, M6 and M10), and are put to the owner as one decision item before the milestone is marked done. M6 counts as started because TASKS item 41 (task S4-1, on its own branch) builds the native Rust user runtime.
 2. Each test says what passes, through the entry point a supported caller uses (CLAUDE.md §1: "Test through actual entry points"), names its negative controls, and names the matrix rows it completes. A row's acceptance criterion becomes the test's text (`docs/requirements/README.md`, "Acceptance criteria").
@@ -20,7 +20,7 @@ Until 2026-11-12, `docs/STATUS.md` marked M0 "done", M1 "done (developer mode)" 
 
 ## M0. Toolchain and engineering foundation
 
-**Proposed: decision item 252.**
+**Accepted: decision item 252.**
 
 §82: "Pin Rust 1.99.1, validate cross-compilation, establish repository, tests, research governance, source provenance and CI." Scope: the project's own tools, on the development host (`eng/host`). Matrix row S82-01.
 
@@ -34,7 +34,7 @@ Until 2026-11-12, `docs/STATUS.md` marked M0 "done", M1 "done (developer mode)" 
 | M0-6 | `Cargo.lock` holds only the workspace's packages, and the one host-only exception (Loom) is approved and pinned | S5-01, S5-10 |
 | M0-7 | The records are kept: the requirements matrix and the provenance table, each read by a gate in `cargo xtask check`; a §78 contract for each task, following `docs/engineering/TASK_CONTRACT_TEMPLATE.md` and checked in review; the ADRs, the research ledgers and the decision sheet | S6-01 to S6-13, S78-01 to S78-11, S79-06 to S79-09, S84-08 |
 
-**Marked against the tests, 2026-11-12: not done.**
+**Marked against the tests, 2026-11-12: built, not done.** M0-2 and M0-3 fail until TASKS item 22 lands.
 
 | Test | On the tree | Evidence |
 |---|---|---|
@@ -44,11 +44,11 @@ Until 2026-11-12, `docs/STATUS.md` marked M0 "done", M1 "done (developer mode)" 
 | M0-4 | Passes | `cargo xtask check`, run on every merge into the batch |
 | M0-5 | Passes | `cargo xtask check` (the §62 lint) |
 | M0-6 | Passes | `cargo xtask check` (`dependency_check`) |
-| M0-7 | Passes on this branch: both gates are in `cargo xtask check`, and the template exists. Three pieces of work done since item 122 have no contract table (S3-5b, H2-stacks, TASKS item 39; the template's comparison) | `developer-tools/xtask/src/requirements.rs`, `developer-tools/xtask/src/provenance.rs`, `docs/engineering/TASK_CONTRACT_TEMPLATE.md` |
+| M0-7 | Passes: both gates are in `cargo xtask check` (the provenance gate since TASKS item 25), and the template exists. Three pieces of work done since item 122 have no contract table (S3-5b, H2-stacks, TASKS item 39; the template's comparison), which review, not a gate, is to catch | `developer-tools/xtask/src/requirements.rs`, `developer-tools/xtask/src/provenance.rs`, `docs/engineering/TASK_CONTRACT_TEMPLATE.md` |
 
 ## M1. Bootable Framekernel
 
-**Proposed: decision item 253.**
+**Accepted: decision item 253.**
 
 §82: "Implement UEFI boot, kernel loading, memory handoff and diagnostics." Scope: both editions, on hardware (`both/hw`). Matrix row S82-02.
 
@@ -62,11 +62,11 @@ Until 2026-11-12, `docs/STATUS.md` marked M0 "done", M1 "done (developer mode)" 
 
 Given to a later milestone by rule 3: Secure Boot integration and its first stage (S19-12, S19-15) and recovery boot (S19-13), to M12. S19-14 is a rule that binds now.
 
-**Marked against the tests, 2026-11-12: not done.** M1-1 to M1-4 pass under QEMU's software processor and as guests under KVM in CI (`cargo xtask boot-test`, `boot-matrix`; `docs/STATUS.md`), signed with a test key only. M1-5 fails: no Origin code has run on a physical machine. The one rented machine so far ran Ubuntu, was a Zen 4 bench machine outside the declared scope, and qualifies nothing (`main`, `docs/research/2026-11-12-rental-a-findings.md`).
+**Marked against the tests, 2026-11-12: built, not done.** M1-1 to M1-4 pass under QEMU's software processor and as guests under KVM in CI (`cargo xtask boot-test`, `boot-matrix`; `docs/STATUS.md`), signed with a test key only. M1-5 fails: no Origin code has run on a physical machine. The one rented machine so far ran Ubuntu, was a Zen 4 bench machine outside the declared scope, and qualifies nothing (`main`, `docs/research/2026-11-12-rental-a-findings.md`).
 
 ## M2. CPU and memory
 
-**Proposed: decision item 254.**
+**Accepted: decision item 254.**
 
 §82: "Implement CPU initialization, exceptions, interrupts, physical/virtual memory." Scope: both editions, on hardware. Matrix row S82-03.
 
@@ -81,11 +81,11 @@ Given to a later milestone by rule 3: Secure Boot integration and its first stag
 
 Given elsewhere by rule 3: SMP, topology and TLB shootdowns (S24-06 to S24-14, S28-17, S28-18) to M3; user address spaces (S28-05, S28-06) and speculation controls (S24-15, which ADR-0017 needs before ring 3 runs anything but a boot proof) to M4.
 
-**Marked against the tests, 2026-11-12: not done.** M2-1, M2-3 and M2-5 pass under QEMU and as guests under KVM (`docs/STATUS.md`, "By milestone"; boot proofs `kernel page tables`, `frame allocator`, `per-processor control state`), with S28-07 partial. M2-2 fails: not built (TASKS item 16). M2-4 is partial: no live level-triggered pin (TASKS item 2). M2-6 fails: no physical machine.
+**Marked against the tests, 2026-11-12: built, not done.** M2-1, M2-3 and M2-5 pass under QEMU and as guests under KVM (`docs/STATUS.md`, "By milestone"; boot proofs `kernel page tables`, `frame allocator`, `per-processor control state`), with S28-07 partial. M2-2 fails: not built (TASKS item 16). M2-4 is partial: no live level-triggered pin (TASKS item 2). M2-6 fails: no physical machine.
 
 ## M3. SMP and scheduler
 
-**Proposed, by the rule of item 256. Not yet put to the owner.**
+**Proposed, by the rule of item 256.**
 
 §82: "Implement multiple processors, native threads, preemption, synchronization and scheduling." Scope: both editions, on hardware. Matrix row S82-04.
 
@@ -100,7 +100,7 @@ Given elsewhere by rule 3: SMP, topology and TLB shootdowns (S24-06 to S24-14, S
 
 ## M4. Processes and IPC
 
-**Proposed, by the rule of item 256. Not yet put to the owner.**
+**Proposed, by the rule of item 256.**
 
 §82: "Implement isolated user processes, system calls, capabilities and IPC." Scope: both editions, on hardware. Matrix row S82-05.
 
@@ -116,7 +116,7 @@ Given elsewhere by rule 3: SMP, topology and TLB shootdowns (S24-06 to S24-14, S
 
 ## M5. Storage
 
-**Proposed, by the rule of item 256. Not yet put to the owner.**
+**Proposed, by the rule of item 256.**
 
 §82: "Implement PCIe, DMA/IOMMU, NVMe, block storage and filesystem foundations." Scope: both editions, on hardware. Matrix row S82-06.
 
@@ -133,7 +133,7 @@ Given elsewhere by rule 3: hot-plug and external-device authorization (S31-12, S
 
 ## M6. Native runtime
 
-**Proposed, by the rule of item 256. Not yet put to the owner.**
+**Proposed, by the rule of item 256.**
 
 §82: "Implement Origin executable ABI, `.ose` loader and native Rust user runtime." Scope: both editions, on hardware. Matrix row S82-07.
 
@@ -148,7 +148,7 @@ Given elsewhere by rule 3: hot-plug and external-device authorization (S31-12, S
 
 ## M7. Native packaging
 
-**Proposed, by the rule of item 256. Not yet put to the owner.**
+**Proposed, by the rule of item 256.**
 
 §82: "Implement `.osi`, `.oapp`, `.od`, signing, installation and rollback." Scope: both editions, on hardware. Matrix row S82-08.
 
@@ -164,7 +164,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 
 ## M8. Native graphics
 
-**Proposed, by the rule of item 256. Not yet put to the owner.**
+**Proposed, by the rule of item 256.**
 
 §82: "Implement Origin UI, software renderer, compositor and first graphical applications." Scope: both editions, on hardware. Matrix row S82-09.
 
@@ -179,7 +179,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 
 ## M9. Installable operating system
 
-**Proposed, by the rule of item 256. Not yet put to the owner.**
+**Proposed, by the rule of item 256.**
 
 §82: "Create actual installation media, partitioning, installation GUI, first-run setup and native system management." Scope: both editions, on hardware. Matrix row S82-10.
 
@@ -195,7 +195,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 
 ## M10. Connectivity and laptop support
 
-**Proposed, by the rule of item 256. Not yet put to the owner.**
+**Proposed, by the rule of item 256.**
 
 §82: "Implement appropriate USB, USB4, Thunderbolt, networking, audio, power and peripheral support." Scope: both editions, on hardware. Matrix row S82-11. USB4, Thunderbolt, Wi-Fi and Bluetooth are shown on physical hardware only (ADR-0015 D9; S82-17).
 
@@ -211,7 +211,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 
 ## M11. Graphics acceleration and compute
 
-**Proposed, by the rule of item 256. Not yet put to the owner.**
+**Proposed, by the rule of item 256.**
 
 §82: "Implement supported native GPU/NPU capabilities, hardware graphics and compute interfaces." Scope: both editions, on hardware. Matrix row S82-12.
 
@@ -223,7 +223,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 
 ## M12. System updates and recovery
 
-**Proposed, by the rule of item 256. Not yet put to the owner.**
+**Proposed, by the rule of item 256.**
 
 §82: "Implement secure unified releases, atomic upgrades, recovery and rollback." Scope: both editions, on hardware. Matrix row S82-13.
 
@@ -238,7 +238,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 
 ## M13. Production qualification
 
-**Proposed, by the rule of item 256. Not yet put to the owner.**
+**Proposed, by the rule of item 256.**
 
 §82: "Complete release security review, performance testing, reliability tests, physical hardware qualification, documentation and maintenance planning." Scope: each edition, on its declared hardware. Matrix row S82-14.
 
@@ -253,7 +253,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 
 ## The Server edition
 
-Proposed placement, from ADR-0014 S2 and ADR-0015 D9. The rows are the matrix's.
+Placed by point 5 of item 256's rule, from ADR-0014 S2 and ADR-0015 D9. The rows are the matrix's.
 
 | Where | What | Rows |
 |---|---|---|
