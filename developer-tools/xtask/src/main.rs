@@ -9,11 +9,18 @@
 mod asmflags;
 mod disk;
 mod documents;
+mod expected_warning;
 mod image;
 mod interfaces;
 mod lex;
 mod loom;
+mod mnemonics;
+mod progress;
+mod provenance;
 mod reproducible;
+mod requirements;
+mod ring3;
+mod roadmap;
 mod screen;
 mod serial;
 mod targetcfg;
@@ -24,7 +31,7 @@ mod unsafety;
 use std::borrow::Cow;
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, ExitCode, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -43,13 +50,20 @@ commands:
               off must refuse an unsigned image, a wrong key, a tampered statement, a bad
               signature and tampered content, each with its own message
   boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
-              one after another, then boot-x2apic, boot-bridge, boot-legacy-free and
-              boot-console
+              one after another, then boot-x2apic, boot-bridge, boot-legacy-free,
+              boot-random, boot-identity and boot-console
   boot-bridge boot-test with the NIC behind a PCIe root port (both IOMMUs): bus mastering is
               cleared on the bridge too and opened again above the device its driver attached
   boot-legacy-free  the kernel boot on a machine with no 8254 and no 8042: the timers
               calibrate against the ACPI PM timer, and the proofs that need those devices
               say they cannot run
+  boot-random the kernel boot on two processors that lack what the random-number generator is
+              seeded from (ADR-0016): one with RDRAND and no RDSEED, which boots and says
+              so; one with neither, which has no generator, launches nothing and still
+              reaches its verdict
+  boot-identity the kernel boot on two processors QEMU is told to report (ADR-0009 A2): a
+              Panther Lake, in the declared scope, and rental A's Zen 4 EPYC, outside it;
+              each must print its own CPU identity line and still reach its verdict
   boot-x2apic boot-test on a sparse topology: the boot processor at APIC ID 0 and processors
               at APIC IDs 256 and 412, above what 8-bit APIC IDs reach (the MADT lists
               150 possible processors); twice, on a CPU model with CPUID leaf 1Fh and on
@@ -65,15 +79,33 @@ commands:
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
-  unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction and on the
-              `preserves_flags` option of assembly blocks (part of check; quick)
+  unsafe-gate only the gate on `unsafe`, on the kernel's dependency direction, on the
+              `preserves_flags` option of assembly blocks, and on RDRAND and RDSEED, which
+              only the kernel's generator and the loader's may run (part of check; quick)
   cfg-lint    only the CLAUDE.md §11 lint: no Origin code outside developer-tools/ asks
               whether its target is Linux or Unix (part of check; quick)
   document-gate only the gate on documents and archives: none is tracked, or left in this
               branch's history, outside a short allowlist (part of check; quick)
   interface-gate only the gates on the generated interface code: fresh, and its ABI recorded
               (part of check; quick)
-  regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
+  requirements-gate only the gate on the requirements matrix under docs/requirements/: a row
+              for every statement of CLAUDE.md and every decision of an accepted ADR, each
+              true to the tree; prints the coverage figure (part of check; CLAUDE.md §1;
+              quick)
+  provenance-gate only the gate on the provenance table in
+              docs/engineering/SOURCE_PROVENANCE.md: one row for each crate, each of §6's
+              fields filled, its dependencies named and its licence stated (part of check;
+              CLAUDE.md §6; quick)
+  roadmap-gate only the gate on docs/ROADMAP.md: every counted build row of the
+              requirements matrix placed in one milestone or listed as in none, and
+              every row it names in the matrix (part of check; CLAUDE.md §82; quick)
+  progress    writes docs/PROGRESS.md from the requirements matrix, CLAUDE.md's and the
+              ADRs' headings and docs/ROADMAP.md: counts of rows by state, overall, by
+              milestone, by feature group, by ADR and for the standing rules. Run it when
+              a row's state changes (TASKS item 43; quick)
+  progress-gate only the gate on docs/PROGRESS.md: the committed page is the one the
+              tree generates, byte for byte (part of check; quick)
+  regenerate rewrites the kernel's generated system-call crate from sdk/interfaces
   image-gate [kernel ELF]
               only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
               and no jump table, in the code this build compiled. Builds the kernel first, or
@@ -128,6 +160,8 @@ const LOADER_BIN: &str = "origin-boot";
 const VERSION_PACKAGE: &str = "origin-version";
 const ONBF_FORMAT_PACKAGE: &str = "onbf-format";
 const CRYPTO_PACKAGE: &str = "origin-crypto";
+/// The random-number generator's policy (ADR-0016 R2): in the loader and the Framekernel.
+const RANDOM_PACKAGE: &str = "origin-random";
 const MERKLE_PACKAGE: &str = "onbf-merkle";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 /// `no_std` libraries embedded in the boot loader and the Framekernel, and the generated crates of
@@ -147,6 +181,7 @@ const FREESTANDING_LIBS: &[&str] = &[
     ONBF_FORMAT_PACKAGE,
     MERKLE_PACKAGE,
     CRYPTO_PACKAGE,
+    RANDOM_PACKAGE,
     "origin-sync",
     "onbf-verify",
     "origin-paging",
@@ -249,6 +284,15 @@ fn qemu_machine_options(base: &str) -> String {
 fn qemu_machine_lacks(device: &str) -> bool {
     let off = format!("{device}=off");
     env::var("ORIGIN_QEMU_MACHINE").is_ok_and(|extra| extra.split(',').any(|o| o == off))
+}
+
+/// Whether `ORIGIN_QEMU_CPU` takes `feature` away from the processor (`-feature` or
+/// `feature=off`).
+fn qemu_cpu_lacks(feature: &str) -> bool {
+    let (minus, off) = (format!("-{feature}"), format!("{feature}=off"));
+    qemu_cpu_model()
+        .split(',')
+        .any(|option| option == minus || option == off)
 }
 
 /// The QEMU CPU model: `ORIGIN_QEMU_CPU` (for example `max,-avx2` to boot a CPU below the
@@ -651,7 +695,83 @@ fn boot_scenario() -> Scenario {
     if qemu_machine_lacks("i8042") {
         no_i8042_markers(&mut scenario);
     }
+    match (qemu_cpu_lacks("rdseed"), qemu_cpu_lacks("rdrand")) {
+        (true, false) => rdrand_only_markers(&mut scenario),
+        (true, true) => no_generator_markers(&mut scenario),
+        _ => {}
+    }
+    cpu_identity_marker(&mut scenario);
     scenario
+}
+
+/// The markers of a boot on a processor with RDRAND and no RDSEED (`-cpu max,-rdseed`): the
+/// machine AMD's second workaround for AMD-SB-7055 produces. It boots; the root is counted on
+/// RDRAND and says its strength is no more than the processor's own generator's, and a
+/// request with prediction resistance is refused (ADR-0016 R3, R6, R8).
+fn rdrand_only_markers(scenario: &mut Scenario) {
+    swap_marker(
+        scenario,
+        "origin-boot: random: known-answer test passed; ",
+        "origin-boot: random: known-answer test passed; RDSEED absent, RDRAND healthy".into(),
+    );
+    swap_marker(
+        scenario,
+        "origin-kernel: random: root: known-answer test passed; ",
+        "origin-kernel: random: root: known-answer test passed; RDSEED absent, RDRAND healthy on the boot processor; seeded from RDRAND's 1024 start-up draws, with 4 more of its draws as the nonce; no healthy RDSEED, so its strength is no more than the processor's own generator's".into(),
+    );
+    swap_marker(
+        scenario,
+        "origin-kernel: random: processor 0: ",
+        "origin-kernel: random: processor 0: RDSEED absent (0 draws passed), RDRAND healthy (2052 draws passed)".into(),
+    );
+    swap_marker(
+        scenario,
+        "origin-kernel: random: 16 of 16 values answered, all distinct true; 300 bytes in pieces true; with prediction resistance: ",
+        "origin-kernel: random: 16 of 16 values answered, all distinct true; 300 bytes in pieces true; with prediction resistance: refused, as it must be with no healthy RDSEED here".into(),
+    );
+}
+
+/// The lines of a boot on a processor with neither instruction (`-cpu max,-rdseed,-rdrand`),
+/// in place of the whole list: there is no generator, so the kernel and its stacks' region are
+/// placed at fixed addresses, every request is refused, no process is launched and no mapping
+/// placed at a random address, the network asks for no lease, and the boot still reaches its
+/// verdict, which names the generator (ADR-0016 R8).
+fn no_generator_markers(scenario: &mut Scenario) {
+    scenario.markers = vec![
+        "origin-boot: UEFI 2.".into(),
+        "origin-boot: random: known-answer test passed; RDSEED absent, RDRAND absent; no generator: the kernel is placed at a fixed address and is handed no seed".into(),
+        "(no generator: fixed placement)".into(),
+        "origin-boot: random: no seed for the kernel; the loader's generator is uninstantiated".into(),
+        "origin-boot: exiting boot services; entering the Framekernel".into(),
+        // No value from the loader, so the kernel stacks' region stays at its fixed base
+        // (ADR-0004 Amendment 2, A5.1 and H3), and the kernel says so both times.
+        STACK_FIXED_LINE.into(),
+        "origin-kernel: random: the loader's value for the kernel stacks' region: none: the loader handed over no secret area".into(),
+        "origin-kernel: random: no generator: known-answer test passed; on the boot processor RDSEED is absent and RDRAND is absent. Nothing will be launched and nothing placed at a random address (ADR-0016 R8)".into(),
+        "origin-kernel: random: processor 0: RDSEED absent (0 draws passed), RDRAND absent (0 draws passed); its generator NOT seeded".into(),
+        "origin-kernel: random: no generator, so no request is answered; consistent false: random failed".into(),
+        "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, Rust-program, service-directory and memory-object proofs did not run".into(),
+        "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: true; the loader handed over no random value: true, and the region is at its fixed base: true".into(),
+        // The network asks for no lease: a transaction ID must not be guessable.
+        "; DHCP lease 0.0.0.0 (".into(),
+        "; no random value for a transaction ID or port; consistent false: virtio-net failed".into(),
+        "origin-kernel: boot verdict: degraded: ".into(),
+        "; 4 did not run; failed: ".into(),
+        "random-number generator (no randomness)".into(),
+        HALT_LINE.into(),
+    ];
+    // What this machine is expected to say is not a failure here.
+    scenario.failures.retain(|failure| {
+        ![
+            "origin-kernel: random: no generator",
+            ": random failed",
+            "origin-boot: random: no seed for the kernel",
+            // The network driver asks for no lease without a random transaction ID.
+            ": virtio-net failed",
+        ]
+        .contains(failure)
+    });
+    scenario.check = None;
 }
 
 /// Replaces the required marker `old` with `new`, or records that it was not found, which
@@ -1160,13 +1280,21 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-boot: TEST trust store: this loader trusts a development key and must never ship".into(),
             "origin-boot: kernel signature verified: origin-kernel, Ed25519 and ML-DSA-87 both good, key ID ".into(),
             "origin-boot: kernel verified: ".into(),
+            // The loader's own random-number generator (ADR-0016 R10): the self-test passed
+            // and an instruction passed its start-up test.
+            "origin-boot: random: known-answer test passed; ".into(),
+            "; the loader's generator is seeded".into(),
             "origin-boot: kernel placed at ".into(),
             // The firmware's framebuffer, for the kernel's console (ADR-0010).
             format!(
                 "origin-boot: framebuffer: {QEMU_DISPLAY} at 0x"
             ),
+            // Two slides, each from its own request.
             "origin-boot: KASLR: kernel at 0xffffffff".into(),
+            "(two requests to the loader's generator)".into(),
             "origin-boot: page tables built: ".into(),
+            // The kernel's seed is handed over and the loader's generator is gone.
+            "origin-boot: random: 64 bytes for the kernel's generator and 8 for its stacks' region are in the boot info; the loader's generator is uninstantiated, and its state, seed area and stack are overwritten".into(),
             "origin-boot: exiting boot services; entering the Framekernel".into(),
             // Attached before anything else is printed, so everything below is also on the
             // screen; `check_screen` holds the kernel to that.
@@ -1185,11 +1313,15 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: kernel segment 2: R at ".into(),
             "origin-kernel: kernel segment 3: RW at ".into(),
             "origin-kernel: GDT, TSS and IDT loaded (32 exception vectors)".into(),
-            "origin-kernel: exception 3 (#BP breakpoint) at rip ".into(),
+            // An image offset, never the image's base (ADR-0004 Amendment 2, A6.2).
+            "origin-kernel: exception 3 (#BP breakpoint) at rip image +0x".into(),
             "origin-kernel: breakpoint handled; resuming".into(),
             // CPU features: QEMU's `max` CPU has every x86-64-v3 feature, so the kernel must
             // find the baseline met (CLAUDE.md §14); below it, the kernel refuses to boot.
             "origin-kernel: CPU: x86-64 level 3 (baseline v3 true)".into(),
+            // ADR-0009 A2: the core generation and the declared scope; what it says depends
+            // on the processor, so only its start is fixed (`boot-identity` fixes all of it).
+            "origin-kernel: CPU identity: ".into(),
             // A frame-pointer backtrace of a known call chain (CLAUDE.md §69).
             "origin-kernel: backtrace: 4 frames from a known call chain, all in the kernel image true".into(),
             "origin-kernel: frame allocator: ".into(),
@@ -1223,7 +1355,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: APIC timer: 50 interrupts at 100 Hz in ".into(),
             // The wait for Transactions Pending, once the TSC is calibrated: none is pending.
             "origin-kernel: PCIe: bus mastering: 1 of 7 functions have a PCI Express capability; Transactions Pending clear on 1 of them after waiting ".into(),
-            "origin-kernel: NMI taken on its own stack (IST2): frame at ".into(),
+            "origin-kernel: NMI taken on its own stack (IST2): frame at image +0x".into(),
             // The clocks (CLAUDE.md §68): the TSC rate proven against one RTC second, and
             // the wall clock read from the RTC, which `qemu_command` starts at RTC_BASE.
             "origin-kernel: clock: TSC at ".into(),
@@ -1249,6 +1381,15 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "interrupt remapping on (256 entries, 32-bit x2APIC destinations, compatibility format blocked); translation on (GSTS 0x".into(),
             "every device's DMA faults until its driver attaches it; 0 stale fault(s) cleared".into(),
             "origin-kernel: IOMMU: translating ".into(),
+            // The random-number generator's root and the boot processor's own generator
+            // (ADR-0016 R5, R13), before another processor starts: the self-test passed and
+            // an instruction passed its start-up test.
+            // The loader's value for the kernel stacks' region (decision item 166): taken once,
+            // by the code that places that region while the kernel builds its page tables
+            // (`stack::draw_region`), so a take at this point is refused.
+            "origin-kernel: random: the loader's value for the kernel stacks' region: taken once before this point, and a take here was refused".into(),
+            "origin-kernel: random: root: known-answer test passed; ".into(),
+            "; the loader's seed mixed in and overwritten where it lay; the boot processor's generator seeded".into(),
             // M3: every processor QEMU emulates (`-smp`, see `machine`) comes online. The
             // MADT lists every possible processor; each enabled one gets a CPU index.
             format!(
@@ -1303,10 +1444,17 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // off-diagonal >= 10.
             "origin-kernel: slit: ".into(),
             "; consistent true".into(),
-            // Hardware entropy from RDSEED/RDRAND: a batch of draws, all distinct and non-zero.
-            "origin-kernel: entropy: ".into(),
-            "; consistent true".into(),
-            "origin-kernel: page protection: stack guard page at ".into(),
+            // The random-number generator (ADR-0016): every processor has one, requests are
+            // answered with values that differ, and its stack holds only zeros after a request.
+            "origin-kernel: random: processor 0: ".into(),
+            "; its generator seeded".into(),
+            "origin-kernel: random: 16 of 16 values answered, all distinct true; 300 bytes in pieces true; with prediction resistance: ".into(),
+            "origin-kernel: random: cost: a 64-byte request ".into(),
+            "; only zeros on it after a request: true".into(),
+            "origin-kernel: random: every processor has a generator true; consistent true".into(),
+            // The guard is in the kernel stacks' region, whose addresses the boot never prints
+            // (ADR-0004 Amendment 2, A6.3).
+            "origin-kernel: page protection: the first thread's stack guard page faulted (#PF error 0x0)".into(),
             // M3: two non-yielding threads per processor, all preempted and all running.
             "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted ".into(),
             format!(
@@ -1382,7 +1530,11 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(address_space_markers(cpus))
         .chain(identity_markers())
         .chain(launch_markers())
+        .chain(rust_program_markers())
         .chain(directory_markers())
+        .chain(memory_markers())
+        .chain(events_ports_markers())
+        .chain(stack_markers(machine))
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
             // ADR-0017 Z3: the scheduler noted each change of process, with one barrier for
@@ -1625,6 +1777,11 @@ fn boot_failures() -> Vec<&'static str> {
         "origin-boot: panic:",
         "origin-kernel: panic:",
         "origin-boot: kernel rejected",
+        // The loader's generator: a failed self-test, no generator, or a stack that ran over.
+        "origin-boot: random: known-answer test FAILED",
+        "origin-boot: random: no seed for the kernel",
+        "ran over its stack",
+        "kernel stacks' region: WRONG",
         "origin-kernel: invalid boot info",
         "origin-kernel: invalid image",
         // ADR-0013: a proof whose failure stops the boot said so.
@@ -1659,7 +1816,9 @@ fn boot_failures() -> Vec<&'static str> {
         ": CPU baseline failed",
         ": numa failed",
         ": slit failed",
-        ": entropy failed",
+        ": random failed",
+        "origin-kernel: random: no generator",
+        "with prediction resistance: WRONG",
         ": initramfs failed",
         ": virtio-net failed",
         "supervisor isolation from user pages incomplete",
@@ -1674,7 +1833,11 @@ fn boot_failures() -> Vec<&'static str> {
         ": PM timer failed",
         ": ipc failed",
         ": start failed",
+        ": rust program failed",
         ": directory failed",
+        ": memory failed",
+        ": events and ports failed",
+        ": user clock failed",
         ": console failed",
         ": TLB failed",
         ": address spaces failed",
@@ -1721,6 +1884,225 @@ const EVEN_SHARES_LINE: &str = "origin-kernel: preemptive multitasking: ";
 const IOAPIC_FAILED: &str = ": I/O APIC failed";
 /// How every clock proof ends a line that failed.
 const CLOCK_FAILED: &str = ": clock failed";
+
+/// The lines of `serial` that name an address in the window the kernel stacks' region slides
+/// in, PML4 slots 384–447: a boot log must have none, during boot or after (ADR-0004 Amendment 2,
+/// A6.3), or it gives the region's base away.
+fn stack_window_lines(serial: &str) -> Vec<&str> {
+    use framekernel::paging::layout::{STACK_WINDOW, STACK_WINDOW_SIZE};
+    serial
+        .lines()
+        .filter(|line| {
+            line.match_indices("0x").any(|(at, _)| {
+                let digits = line.get(at + 2..).unwrap_or("");
+                let end = digits
+                    .find(|c: char| !c.is_ascii_hexdigit())
+                    .unwrap_or(digits.len());
+                u64::from_str_radix(&digits[..end], 16)
+                    .is_ok_and(|v| v >= STACK_WINDOW && v - STACK_WINDOW < STACK_WINDOW_SIZE)
+            })
+        })
+        .collect()
+}
+
+/// The start of the kernel stacks proof's line about the region's base: a boot that printed it
+/// placed the region, so its base can be read (A6.4).
+const STACK_PROOF_LINE: &str = "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned";
+
+/// The kernel's line, as it builds its tables, for a region left at its fixed base: the loader
+/// handed over no random value for it (ADR-0004 Amendment 2, A5.1 and H3).
+const STACK_FIXED_LINE: &str = "origin-kernel: kernel stacks: the loader handed over no random value: the region is at its fixed base";
+
+/// Where each full kernel boot records the base it placed the kernel stacks' region at, read
+/// through QEMU's monitor (ADR-0004 Amendment 2, A6.4). `boot-matrix` empties it and then checks
+/// that its boots placed the region apart. The kernel prints nothing of a base; this file is the
+/// host's, and nothing prints it.
+fn stack_bases_file() -> PathBuf {
+    target_dir().join("xtask").join("stack-region-bases")
+}
+
+/// The kernel's physical base, from its boot line `loaded at … (physical 0x…)`.
+fn kernel_physical_base(serial: &str) -> Option<u64> {
+    let line = serial
+        .lines()
+        .find(|l| l.starts_with("origin-kernel: loaded at "))?;
+    let from = line.find("(physical 0x")? + "(physical 0x".len();
+    let digits = line.get(from..)?;
+    let end = digits.find(|c: char| !c.is_ascii_hexdigit())?;
+    u64::from_str_radix(digits.get(..end)?, 16).ok()
+}
+
+/// The value of the first symbol whose name contains `part` in the ELF64 image `elf`. Only the
+/// section headers, the symbol tables and their string tables are read; any other shape gives
+/// `None`. The kernel is linked at 0, so a symbol's value is its RVA (`onbf-pack`).
+fn elf_symbol(elf: &[u8], part: &str) -> Option<u64> {
+    let bytes = |at: u64, n: usize| elf.get(usize::try_from(at).ok()?..)?.get(..n);
+    let u16_at = |at: u64| bytes(at, 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let u32_at = |at: u64| bytes(at, 4)?.try_into().ok().map(u32::from_le_bytes);
+    let u64_at = |at: u64| bytes(at, 8)?.try_into().ok().map(u64::from_le_bytes);
+    if elf.get(..5)? != b"\x7fELF\x02" {
+        return None;
+    }
+    let (table, entry, count) = (u64_at(0x28)?, u64::from(u16_at(0x3A)?), u16_at(0x3C)?);
+    let section = |i: u64| table.checked_add(i.checked_mul(entry)?);
+    (0..u64::from(count)).find_map(|i| {
+        let header = section(i)?;
+        if u32_at(header + 4)? != 2 {
+            return None;
+        }
+        let (symbols, size) = (u64_at(header + 24)?, u64_at(header + 32)?);
+        let strings = u64_at(section(u64::from(u32_at(header + 40)?))? + 24)?;
+        (0..size / 24).find_map(|k| {
+            let symbol = symbols.checked_add(k * 24)?;
+            let name = elf.get(usize::try_from(strings + u64::from(u32_at(symbol)?)).ok()?..)?;
+            let name = name.get(..name.iter().position(|&b| b == 0)?)?;
+            std::str::from_utf8(name)
+                .ok()?
+                .contains(part)
+                .then(|| u64_at(symbol + 8))?
+        })
+    })
+}
+
+/// Reads the base this boot placed the kernel stacks' region at, out of the halted kernel's
+/// memory through QEMU's monitor, which the scenario has switched to (A6.4). The word is the
+/// framework's `STACK_REGION_BASE`: the kernel's physical base, from its boot line, plus the
+/// symbol's RVA in the kernel ELF. `rx` brings QEMU's output. Only a base a draw can give is
+/// accepted: 2 MiB-aligned, the whole region in its window, and not the fixed base.
+///
+/// The one exception is a boot whose kernel said, in [`STACK_FIXED_LINE`], that the loader
+/// handed over no random value: its word must be the fixed base and nothing else, and the
+/// answer is `None`, since a fixed base is not one to compare across boots. Whether a machine
+/// may say that line is its marker list's to decide, not this function's.
+fn read_stack_base(
+    monitor: &mut ChildStdin,
+    rx: &mpsc::Receiver<Vec<u8>>,
+    serial: &str,
+) -> Result<Option<u64>> {
+    use framekernel::paging::layout::{STACK_REGION, is_stack_region_base};
+    let path = target_dir()
+        .join(KERNEL_TARGET)
+        .join("release")
+        .join(KERNEL_PACKAGE);
+    let elf = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let rva = elf_symbol(&elf, "STACK_REGION_BASE")
+        .ok_or("the kernel ELF has no STACK_REGION_BASE symbol")?;
+    let physical =
+        kernel_physical_base(serial).ok_or("the kernel's boot line gives no physical base")?;
+    let addr = physical
+        .checked_add(rva)
+        .ok_or("the word's physical address overflows")?;
+    monitor
+        .write_all(format!("xp /1gx {addr:#x}\n").as_bytes())
+        .and_then(|()| monitor.flush())
+        .map_err(|e| format!("cannot write to the monitor: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out = Vec::new();
+    loop {
+        let chunk = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| format!("the monitor did not answer xp at {addr:#x}"))?;
+        out.extend_from_slice(&chunk);
+        let text = String::from_utf8_lossy(&out);
+        // Split at newlines only: a whole answer line keeps the carriage return QEMU ends it with.
+        let Some(digits) = text.split('\n').find_map(|line| xp_answer(line, addr)) else {
+            continue;
+        };
+        // Only a whole number: the line goes on past its last digit.
+        let Some(end) = digits.find(|c: char| !c.is_ascii_hexdigit()) else {
+            continue;
+        };
+        let base = u64::from_str_radix(&digits[..end], 16)
+            .map_err(|e| format!("the monitor's answer is not a number: {e}"))?;
+        return stack_base_read(
+            serial.contains(STACK_FIXED_LINE),
+            base,
+            STACK_REGION,
+            is_stack_region_base(base),
+        );
+    }
+}
+
+/// What the word read as the kernel stacks' region's base means: `said_fixed` is whether the
+/// kernel said the region is at its fixed base, `fixed` is that base, and `placeable` is whether
+/// `base` is 2 MiB-aligned with the whole region in its window. A drawn base is `Some`; the fixed
+/// base of a kernel that said so is `None`; anything else is an error.
+fn stack_base_read(
+    said_fixed: bool,
+    base: u64,
+    fixed: u64,
+    placeable: bool,
+) -> Result<Option<u64>> {
+    match (said_fixed, base == fixed) {
+        (true, true) => Ok(None),
+        (true, false) => Err(
+            "the kernel said the region is at its fixed base, and the word read is not that base"
+                .into(),
+        ),
+        (false, false) if placeable => Ok(Some(base)),
+        (false, _) => Err("the word read is not a base a draw can give".into()),
+    }
+}
+
+/// The digits of the word `xp` printed for `addr`, from its answer line `<addr>: 0x<word>`. QEMU
+/// pads the address to a width of its own choosing (8 digits below 4 GiB with QEMU 11.1), and its
+/// line editor leaves escape codes before it, so the address is matched by value: the last run of
+/// hexadecimal digits before the colon.
+fn xp_answer(line: &str, addr: u64) -> Option<&str> {
+    let (left, right) = line.split_once(": 0x")?;
+    let digits = left.rsplit(|c: char| !c.is_ascii_hexdigit()).next()?;
+    (u64::from_str_radix(digits, 16).ok()? == addr).then_some(right)
+}
+
+/// Appends this boot's base to the file `boot-matrix` compares (A6.4).
+fn record_stack_base(label: &str, base: u64) -> Result {
+    let path = stack_bases_file();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| writeln!(file, "{label}\t{base:#x}"))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// How many boots `recorded` (the lines of [`stack_bases_file`]) holds, if each placed the kernel
+/// stacks' region at a base no other did (A6.4).
+fn stack_bases_apart(recorded: &str) -> Result<usize> {
+    let bases: Vec<&str> = recorded
+        .lines()
+        .filter_map(|line| line.split('\t').nth(1))
+        .collect();
+    let distinct: std::collections::HashSet<&str> = bases.iter().copied().collect();
+    if distinct.len() != bases.len() {
+        return Err(format!(
+            "the kernel stacks' region was at {} distinct bases in {} boots: boots placed it alike",
+            distinct.len(),
+            bases.len()
+        ));
+    }
+    Ok(bases.len())
+}
+
+/// As [`stack_bases_apart`], and there are at least two boots to compare: the end of
+/// `boot-matrix`.
+fn distinct_stack_bases(recorded: &str) -> Result<usize> {
+    let boots = stack_bases_apart(recorded)?;
+    if boots < 2 {
+        return Err(format!(
+            "{boots} boot(s) recorded where they placed the kernel stacks' region: nothing to compare"
+        ));
+    }
+    Ok(boots)
+}
+
+/// Fails `boot-matrix` as soon as two of its boots so far placed the kernel stacks' region alike.
+fn check_stack_bases_so_far(path: &Path) -> Result {
+    let recorded = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    stack_bases_apart(&recorded).map(drop)
+}
 
 /// The screen after a whole boot: exactly what the serial log says it must show (the
 /// console writes one line at a time to both).
@@ -1843,12 +2225,40 @@ fn address_space_markers(cpus: u32) -> Vec<String> {
         ),
         "origin-kernel: address spaces: a frame shared by two spaces: unmapped from the first, its thread faulted: true, the other went on: true, the frame still in use: true; unmapped from the second, its thread faulted: true, the frame free when the unmap returned: true".into(),
         "origin-kernel: address spaces: W^X across a shared frame's mappings: executable in another space while writable in one, refused: true; at another address in the same space, refused: true; read-only beside it: true; executable once nothing writes it: true; writable again while executable elsewhere, refused: true; from executable to writable in one step, refused: true".into(),
+        "origin-kernel: address spaces: a run of shared frames is mapped whole or not at all: over a page already mapped, refused with none of it mapped: true; with a frame executable in another space, refused with none of it mapped and no count taken: true; into 2 MiB that needs a page table once the space has made all it may, refused as a limit with none of it mapped: true; mapped whole: true".into(),
         format!(
             "origin-kernel: address spaces: 64 maps and unmaps of a page under a thread on {far}: {} interrupts, 0 on processors not in the space; ",
             64 * one
         ),
         " us each (QEMU, no budget)".into(),
         "origin-kernel: address spaces: every process and frame of these proofs is gone: ".into(),
+    ]
+}
+
+/// ADR-0004 Amendment 1, A2: the kernel stacks' region, each of its boot proof's lines.
+fn stack_markers(machine: &Machine) -> Vec<String> {
+    let cpus = machine.cpus();
+    let interrupt_stacks = 4 * (cpus - 1);
+    // The processor that caches the freed stack: the first after the boot processor, if any.
+    let reader = machine.named(cpus.min(2) - 1);
+    vec![
+        // ADR-0004 Amendment 2: every machine here has RDSEED or RDRAND, so the loader hands
+        // over a random value and the region's base is drawn from it (A5.1). The line names
+        // neither the base nor the value (A6). The machine with neither instruction has its
+        // own list (`no_generator_markers`).
+        "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: true; drawn from the loader's random value, taken once: true, so not its fixed base: true".into(),
+        format!(
+            "origin-kernel: kernel stacks: stacks of 4, 16 and 64 KiB each in a slot of its own in the region, every page read/write, not executable and global: true; the page below each, the bottom of its slot and the bottom of the next faulted: 9 of 9; the application processors' interrupt stacks, as their TSSs name them, in the region with the page below each faulting: {interrupt_stacks} of {interrupt_stacks}"
+        ),
+        "origin-kernel: kernel stacks: the direct map has every 2 MiB page it was built with: true (".into(),
+        format!(
+            "origin-kernel: kernel stacks: a stack's 4 pages read on {reader}, then the stack freed and reclaimed: 4 of 4 reads there faulted and 0 saw the old pages; its slot, the one its last byte was in: true, free again: true"
+        ),
+        "origin-kernel: kernel stacks: 64 stacks of 16384 bytes made and freed: all made true; making one took ".into(),
+        " (QEMU, no budget)".into(),
+        "origin-kernel: kernel stacks: every stack the proof made is given back: Counts { live: ".into(),
+        ", idle: 0, retired: 0, lost: 0, pages: ".into(),
+        " }, as before: true".into(),
     ]
 }
 
@@ -1860,11 +2270,11 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
         "origin-kernel: ipc: ping-pong round trip: ".into(),
     ];
     markers.extend([
-        "origin-kernel: ipc: bad handles: handle 0 -> BAD_HANDLE, never issued -> BAD_HANDLE, bits above 32 -> BAD_HANDLE, wait on a bad handle -> BAD_HANDLE, closed -> BAD_HANDLE, stale, slot reused -> BAD_HANDLE, another process's -> BAD_HANDLE, wait on another process's -> BAD_HANDLE".to_string(),
+        "origin-kernel: ipc: bad handles: handle 0 -> BAD_HANDLE, a live handle -> OK, its low 32 bits alone -> BAD_HANDLE, its slot at a generation never issued -> BAD_HANDLE, never issued -> BAD_HANDLE, bits above 32 -> BAD_HANDLE, wait on a bad handle -> BAD_HANDLE, closed -> BAD_HANDLE, stale, slot reused -> BAD_HANDLE, another process's -> BAD_HANDLE, wait on another process's -> BAD_HANDLE".to_string(),
         "origin-kernel: ipc: too few rights: write without WRITE -> ACCESS_DENIED, read without READ -> ACCESS_DENIED, wait without WAIT -> ACCESS_DENIED, duplicate without DUPLICATE -> ACCESS_DENIED, send without TRANSFER -> ACCESS_DENIED".into(),
         "origin-kernel: ipc: rights only shrink: adding WRITE -> INVALID_ARGS, an undefined right -> INVALID_ARGS, dropping DUPLICATE -> OK, the copy cannot write -> ACCESS_DENIED, the copy can read -> SHOULD_WAIT".into(),
         "origin-kernel: ipc: bad pointers: write from the kernel -> FAULT, from unmapped -> FAULT, across the end of mapped -> FAULT, from address 0 -> FAULT, wrapping past the top -> FAULT, from the top page -> FAULT, read into the kernel -> FAULT, into unmapped -> FAULT, into code -> FAULT, into read-only memory -> FAULT, sizes in the kernel -> FAULT, a handle record across the end of mapped -> FAULT, create out to the kernel -> FAULT, create out to read-only -> FAULT, duplicate out to the kernel -> FAULT, duplicate out to read-only -> FAULT, wait out to read-only -> FAULT, wait out to the kernel -> FAULT, handle list in the kernel -> FAULT, zero length names no memory -> OK, the empty message arrived -> 0x0".into(),
-        "origin-kernel: ipc: sizes and numbers: one byte too many -> INVALID_ARGS, one handle too many -> INVALID_ARGS, no signals -> INVALID_ARGS, an undefined signal -> INVALID_ARGS, a sizes structure too small -> INVALID_ARGS, an unknown call number -> NOT_SUPPORTED, an object type not here yet -> NOT_SUPPORTED".into(),
+        "origin-kernel: ipc: sizes and numbers: one byte too many -> INVALID_ARGS, one handle too many -> INVALID_ARGS, no signals -> INVALID_ARGS, an undefined signal -> INVALID_ARGS, a sizes structure too small -> INVALID_ARGS, an unknown call number -> NOT_SUPPORTED, an event with no quota for one -> LIMIT".into(),
         "origin-kernel: ipc: queues: empty -> SHOULD_WAIT, nothing by deadline 0 -> TIMED_OUT, written -> OK, readable -> OK, observed -> 0x3, 4-byte buffer -> BUFFER_TOO_SMALL, it needs -> 0x10, still there -> OK, received -> 0x10".into(),
         "origin-kernel: ipc: a full queue: the write after the last -> SHOULD_WAIT, not writable -> TIMED_OUT, writable again after a read -> OK".into(),
         "origin-kernel: ipc: a closed peer: sees PEER_CLOSED -> OK, observed -> 0x5, write -> PEER_CLOSED, the message sent before the close -> OK, read past the close -> PEER_CLOSED, READABLE will never rise -> TIMED_OUT".into(),
@@ -1872,6 +2282,11 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
         "origin-kernel: ipc: transfers that would break the graph: an end through its own channel -> INVALID_ARGS, the peer end through its own channel -> INVALID_ARGS, the same handle twice -> INVALID_ARGS, an end with another handle -> INVALID_ARGS, that end, alone again -> OK, into the first channel -> OK, a cycle through two queues -> INVALID_ARGS, a stale handle in the list -> BAD_HANDLE".into(),
         "origin-kernel: ipc: every hostile call returned its status and the process exited by itself (".into(),
         "; user-copy faults recovered: 0".into(),
+        // N14 step 3, S3-5b: the memory calls' corpus, in a process of its own.
+        "origin-kernel: ipc: memory objects: a request in the kernel -> FAULT, a request of the wrong size -> INVALID_ARGS, no bytes -> INVALID_ARGS, not whole pages -> INVALID_ARGS, past the quota -> LIMIT, its handle into the kernel -> FAULT, one page -> OK, wait on it -> ACCESS_DENIED, give it EXECUTE -> INVALID_ARGS".into(),
+        "origin-kernel: ipc: memory maps: a bad process handle -> BAD_HANDLE, a channel for the process -> WRONG_TYPE, a process handle without WRITE -> ACCESS_DENIED, a channel for the object -> WRONG_TYPE, an object handle without MAP -> ACCESS_DENIED, a request in the kernel -> FAULT, the address into the kernel -> FAULT, a request of the wrong size -> INVALID_ARGS, an undefined access -> INVALID_ARGS, an undefined flag -> INVALID_ARGS, write without read -> INVALID_ARGS, write and execute -> INVALID_ARGS, execute -> ACCESS_DENIED, write without WRITE -> ACCESS_DENIED, a misaligned offset -> INVALID_ARGS, no length -> INVALID_ARGS, past the object -> INVALID_ARGS, in the kernel half -> INVALID_ARGS, at address 0 -> INVALID_ARGS, at the top page -> INVALID_ARGS, an address without FIXED -> INVALID_ARGS, mapped -> OK, over it -> INVALID_ARGS".into(),
+        "origin-kernel: ipc: memory unmap and protect: unmap without WRITE -> ACCESS_DENIED, unmap where nothing is -> INVALID_ARGS, unmap none of it -> INVALID_ARGS, unmap more than it -> INVALID_ARGS, unmap not whole pages -> INVALID_ARGS, protect to nothing -> INVALID_ARGS, protect with an undefined bit -> INVALID_ARGS, protect to execute -> ACCESS_DENIED, protect where nothing is -> INVALID_ARGS, protect to read-only -> OK, protect back to writable -> ACCESS_DENIED, unmap -> OK, unmap again -> INVALID_ARGS".into(),
+        "origin-kernel: ipc: every hostile memory call returned its status and the process exited by itself (49 calls)".into(),
     ]);
     for how in ["exits", "faults"] {
         markers.extend([
@@ -1944,12 +2359,65 @@ fn launch_markers() -> Vec<String> {
     ]
 }
 
+/// The first Rust program in ring 3 (task S4-1; ADR-0011 L1, L8; `program_proof::prove`): the
+/// kernel carries it in its image, and launches it six times at random bases.
+fn rust_program_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: rust program: first_program ran in ring 3 from the kernel's image at random bases, 6 times: each found its start record in RDI and read its header and 3 entries as written: true; ran at its base plus its entry: true; every relocated slot held its value plus the base: true; read its data through relocated pointers: true; the runtime's mem functions copy, move, fill and compare: true; wrote on BOOTSTRAP, named as the writer: true; ended with its exit code: true".into(),
+        "origin-kernel: rust program: two launches differ in base and stack: true; a write to its code faulted there: true; a jump into its data faulted there as a fetch: true; a write to its relocated read-only data faulted there: true; a panic ended it with the runtime's exit code: true; a launch refused after its image was mapped: true".into(),
+        "origin-kernel: rust program: loading and starting it took ".into(),
+        "origin-kernel: rust program: every launched process and all they held are gone: heap ".into(),
+    ]
+}
+
 /// The service directory proof (ADR-0005 C11, C12; ADR-0011 N9; `ipc_proof::prove_directory`).
 fn directory_markers() -> Vec<String> {
     vec![
         "origin-kernel: directory: a launcher started a directory, a service and a client; the client's connect, and the request it wrote on its own end before any reply, reached the service through the directory: true; the service read that request stamped with the client's process and principal, not the directory's: true; the client read the service's reply stamped with the service's process: true".into(),
         "origin-kernel: directory: the client's replies, read in ring 3 and decoded by the generated client: ok for the interface and major the directory holds: true; not_found (-14) for a major it does not hold: true; that connection's end reports peer_closed: true; the service answered ok for the end passed to it: true".into(),
         "origin-kernel: directory: the directory, the service, the client and all they held are gone: heap ".into(),
+    ]
+}
+
+/// The events-and-ports proof and the clock as ring 3 reads it (ADR-0005 C9, C10, C13,
+/// Amendment 7; `ipc_proof::prove_events_ports`, `ipc_proof::prove_user_clock`).
+fn events_ports_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: events: an event starts with nothing raised; object_signal raises and clears SIGNALED, a signal in both masks ends set, and wait_one sees each state: true; a mask with another signal, a handle without signal and a bad pointer are refused: true".into(),
+        "origin-kernel: ports: a binding on an event and on a channel end becomes one packet when its signal is raised, at once if it already is, twice if made twice, in the order queued: true; each packet is what was bound and seen: true".into(),
+        "origin-kernel: ports: port_cancel removes an armed binding and a queued packet silently, then not_found: true; closing the handle a binding was made through queues one canceled packet, another duplicate's close cancels nothing, a move cancels, and a queued signal packet stays with nothing after it: true".into(),
+        "origin-kernel: ports: hostile binds, waits and cancels are refused in D5's order, and a port cannot be waited on: true; events, ports and bindings stop at their quotas, and closing a port gives back its bindings' charges: true; every other call returned what it must, and the three processes ended: true".into(),
+        "origin-kernel: ports: a process given no quota can make no event and no port: true".into(),
+        "origin-kernel: ports: a thread in port_wait through a handle another thread closes ends canceled, while a duplicate keeps the port open and empty: true".into(),
+        "origin-kernel: ports: a binder that exits while another process holds the port leaves its 2 bindings as canceled packets, still charged to it (2 after its exit, 0 once the holder read them): true".into(),
+        "origin-kernel: ports: 30 round trips between ".into(),
+        " us each (QEMU, through the script interpreter, no budget): true".into(),
+        "origin-kernel: ports: a bind, a signal that delivers it, a take and a clear took ".into(),
+        " ns together (QEMU, the kernel's own calls, 1000 times, no budget): true".into(),
+        "origin-kernel: ports: every process, event, port, binding and packet of the proof is gone: heap ".into(),
+        "origin-kernel: clock: 30 reads from ring 3 never went back: true; each lies between the kernel's readings before and after: true; a wait to a deadline on the same clock ended after it: true; a bad out pointer is fault: true; one read every ".into(),
+        " ns (QEMU, through the script interpreter)".into(),
+    ]
+}
+
+/// The memory-object proof (ADR-0005 P7, P11, C6-C8; `ipc_proof::prove_memory`).
+fn memory_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: memory: two processes share an object by passing its handle, and each reads what the other wrote: true; protect to read-only refuses an increase and makes a write fault at the mapping: true; unmap makes a read fault there: true".into(),
+        "origin-kernel: memory: a fixed address over a mapping is refused, and the mapping keeps what was written to it: true; execute is refused: true; a handle without write maps nothing writable, and one without read maps nothing: true; two random placements are apart, page-aligned and in their region: true; closing the handle leaves the mapping working: true".into(),
+        "origin-kernel: memory: the quota refuses an object past its bound and takes one again once an object is closed; a closed object still mapped keeps its charge; a third mapping past the limit of two is refused: true; once the process has ended its account owes nothing: true".into(),
+        "origin-kernel: memory: mapping into another process needs write on its handle, and with it the two share the frame: true; unmapping there needs it too, and the other's next read faults: true".into(),
+        "origin-kernel: memory: a hostile unmap loop is refused with should_wait once its budget is spent, changing nothing: true; it is served again once the budget refills: true".into(),
+        "origin-kernel: memory: a map whose address cannot be written to its caller leaves no page and no record, though the caller's budget pays for nothing: true; what taking it back cost is charged, and the caller's next unmap must wait: true".into(),
+        "origin-kernel: memory: a fixed run over a page of the program's own is refused whole, and the page stays: true; a mapping of an object's later pages maps those pages' frames: true; a run past the space's page tables is refused with limit and leaves no page and no record: true".into(),
+        "origin-kernel: memory: an unmap and a protect of a mapping whose map has not returned yet are told to wait (should_wait): true; so are those of a mapping another change holds: true; the refusals changed nothing and spent nothing: true".into(),
+        "origin-kernel: memory: in a space at its bound of page tables, a fixed run that needs one more table and lies over a mapping's page is invalid_args: true; so is one over a page of the program's own: true; a protect that asks for more than a mapping allows is told to wait while another call holds the mapping, and is denied once it is free: true".into(),
+        "origin-kernel: memory: every other call of the proof's programs returned what its script says, and each program ended as it should: true".into(),
+        "origin-kernel: memory: map, protect and unmap of 16 pages took ".into(),
+        " us (QEMU; the kernel's own calls, in a space no processor holds)".into(),
+        "origin-kernel: memory: unmapping a page of a shared object from a space a thread is reading it in took ".into(),
+        " us (QEMU, no budget); the thread then faulted at the page: true; the object stays mapped in its creator's space: true".into(),
+        "origin-kernel: memory: every process, object and mapping of the proof is gone: heap ".into(),
     ]
 }
 
@@ -2104,6 +2572,11 @@ fn main() -> ExitCode {
         ["document-gate"] => documents::gate(),
         ["cfg-lint"] => linux_cfg_lint(),
         ["interface-gate"] => interfaces::gate(),
+        ["requirements-gate"] => requirements::gate(),
+        ["provenance-gate"] => provenance::gate(),
+        ["roadmap-gate"] => roadmap::gate(),
+        ["progress"] => progress::write(),
+        ["progress-gate"] => progress::gate(),
         ["regenerate"] => interfaces::regenerate(),
         ["image-gate"] => in_turn("image-gate", image::build_and_gate),
         ["image-gate", elf] => image::gate(Path::new(elf)),
@@ -2120,6 +2593,8 @@ fn main() -> ExitCode {
         ["boot-console"] => in_turn("boot-console", boot_console),
         ["boot-bridge"] => in_turn("boot-bridge", boot_bridge),
         ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
+        ["boot-random"] => in_turn("boot-random", boot_random),
+        ["boot-identity"] => in_turn("boot-identity", boot_identity),
         ["run"] => in_turn("run", run),
         ["loom"] => in_turn("loom", loom::run),
         ["reproducible-gate"] => in_turn("reproducible-gate", reproducible::gate),
@@ -2167,6 +2642,11 @@ fn boot_test_child(exe: &Path) -> Command {
 /// changed), and then [`boot_x2apic`] (the owner's decision on ADR-0008, question 3).
 fn boot_matrix() -> Result {
     let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    let bases = stack_bases_file();
+    if let Some(dir) = bases.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    fs::write(&bases, "").map_err(|e| format!("{}: {e}", bases.display()))?;
     for iommu in ["intel", "amd"] {
         for cpus in [1, 2, 4] {
             println!("xtask: boot-matrix: {iommu} IOMMU, {cpus} processor(s)");
@@ -2180,14 +2660,23 @@ fn boot_matrix() -> Result {
                     "boot-test with the {iommu} IOMMU and {cpus} processor(s) failed ({status})"
                 ));
             }
+            check_stack_bases_so_far(&bases)?;
         }
     }
     boot_x2apic()?;
     boot_bridge()?;
     boot_legacy_free()?;
+    boot_random()?;
+    boot_identity()?;
     boot_console()?;
+    // ADR-0004 Amendment 2, A6.4: the boots placed the kernel stacks' region apart.
+    let recorded = fs::read_to_string(&bases).map_err(|e| format!("{}: {e}", bases.display()))?;
+    let boots = distinct_stack_bases(&recorded)?;
     println!(
-        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, and the console machines)"
+        "xtask: boot-matrix: the kernel stacks' region was at {boots} distinct bases in {boots} kernel boots, read through QEMU's monitor; none is printed"
+    );
+    println!(
+        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, the two machines without the random-number instructions, the two CPU identities, and the console machines)"
     );
     Ok(())
 }
@@ -2483,6 +2972,96 @@ fn boot_legacy_free() -> Result {
     Ok(())
 }
 
+/// Runs the kernel boot on two processors that lack the instructions the random-number
+/// generator is seeded from (ADR-0016 R3, R8): one with RDRAND and no RDSEED, which boots and
+/// says what its generator's strength rests on; and one with neither, which has no generator,
+/// launches nothing, and still reaches its verdict.
+fn boot_random() -> Result {
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    for (model, what) in [
+        ("max,-rdseed", "RDRAND and no RDSEED"),
+        ("max,-rdseed,-rdrand", "neither RDSEED nor RDRAND"),
+    ] {
+        println!("xtask: boot-random: a processor with {what} (-cpu {model})");
+        let status = boot_test_child(&exe)
+            .env("ORIGIN_QEMU_CPU", model)
+            .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
+            .status()
+            .map_err(|e| format!("cannot run boot-test: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "boot-test on a processor with {what} failed ({status})"
+            ));
+        }
+    }
+    println!("xtask: boot-random passed (RDRAND alone; neither instruction)");
+    Ok(())
+}
+
+/// The processors `boot-identity` has QEMU report (ADR-0009 A2; TASKS item 16): the `-cpu`
+/// value, what it is, and the whole line the kernel must print for it. The lines are written
+/// here from the vendors' documents (`docs/research/2026-11-12-cpu-identification-table.md`),
+/// not taken from the kernel's table, so the boot checks the table.
+const CPU_IDENTITIES: [(&str, &str, &str); 2] = [
+    (
+        // Intel's microcode notes: PTL-H, 06-CC-02.
+        "max,vendor=GenuineIntel,family=6,model=204,stepping=2",
+        "a Panther Lake, in the declared scope",
+        "origin-kernel: CPU identity: GenuineIntel family 06h (6) model CCh stepping 2 (leaf 1 EAX 000C06C2h): Panther Lake; in the declared scope: a 2026 Intel generation, listed by its family-6 model (ADR-0009 A2); reported under a hypervisor, which can report any identity; no erratum listed for it",
+    ),
+    (
+        // Rental A's AMD EPYC 4244P (docs/research/2026-11-12-rental-a-findings.md): Zen 4.
+        "max,vendor=AuthenticAMD,family=25,model=97,stepping=2",
+        "rental A's EPYC 4244P, outside it",
+        "origin-kernel: CPU identity: AuthenticAMD family 19h (25) model 61h stepping 2 (leaf 1 EAX 00A60F12h): older than Zen 5; outside the declared scope, a bench machine: AMD family below 1Ah, where Zen 5 begins (ADR-0009 A2); reported under a hypervisor, which can report any identity; no erratum listed for it",
+    ),
+];
+
+/// Where `ORIGIN_QEMU_CPU` is one of [`CPU_IDENTITIES`], the boot must print that identity's
+/// whole line in place of the line's start. The rest of the boot is held to every other
+/// marker, its verdict and the halt line among them: the kernel never refuses a machine for
+/// its identity (A2).
+fn cpu_identity_marker(scenario: &mut Scenario) {
+    let model = qemu_cpu_model();
+    if let Some((_, _, line)) = CPU_IDENTITIES.iter().find(|(cpu, _, _)| *cpu == model) {
+        swap_marker(
+            scenario,
+            "origin-kernel: CPU identity: ",
+            (*line).to_string(),
+        );
+    }
+}
+
+/// Runs the kernel boot on the two processors of [`CPU_IDENTITIES`], each set with QEMU's
+/// `family=` and `model=` (ADR-0009 A2: "QEMU can be told to report any family and model, so CI
+/// can boot an in-scope and an out-of-scope identity"). Under KVM a guest's vendor is not
+/// changed: those boots run on QEMU's software processor only, and the KVM jobs' own boots
+/// print the real processor's line.
+fn boot_identity() -> Result {
+    if Accel::from_env()? == Accel::Kvm {
+        println!(
+            "xtask: boot-identity: not run under KVM, where the guest's vendor stays the host's; QEMU's software processor runs it"
+        );
+        return Ok(());
+    }
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    for (model, what, _) in CPU_IDENTITIES {
+        println!("xtask: boot-identity: {what} (-cpu {model})");
+        let status = boot_test_child(&exe)
+            .env("ORIGIN_QEMU_CPU", model)
+            .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
+            .status()
+            .map_err(|e| format!("cannot run boot-test: {e}"))?;
+        if !status.success() {
+            return Err(format!("boot-test as {what} failed ({status})"));
+        }
+    }
+    println!(
+        "xtask: boot-identity passed (a Panther Lake in the declared scope; a Zen 4 EPYC outside it)"
+    );
+    Ok(())
+}
+
 /// Runs `boot-test` in a child process with the NIC behind a PCIe root port
 /// (`ORIGIN_QEMU_BRIDGE=on`), under each IOMMU: bus mastering must be cleared on the bridge at
 /// the quiesce and opened again above the device its driver attached (ADR-0007 I12). QEMU
@@ -2561,7 +3140,9 @@ fn cargo() -> Command {
     c
 }
 
-/// Runs `cmd` with inherited stdio and fails unless it exits successfully.
+/// Runs `cmd` and fails unless it exits successfully. Its standard output is inherited. Its
+/// error output passes through line by line, except the one compiler warning `cargo xtask`
+/// expects, which is collapsed to a single note (`expected_warning.rs`, ADR-0017 Z10).
 fn run_step(cmd: &mut Command) -> Result {
     let shown = std::iter::once(cmd.get_program())
         .chain(cmd.get_args())
@@ -2569,9 +3150,44 @@ fn run_step(cmd: &mut Command) -> Result {
         .collect::<Vec<_>>()
         .join(" ");
     println!("xtask: $ {shown}");
-    let status = cmd
-        .status()
+    // Piped, cargo would drop its colours; keep them where a person is watching.
+    if env::var_os("CARGO_TERM_COLOR").is_none() && std::io::stderr().is_terminal() {
+        cmd.env("CARGO_TERM_COLOR", "always");
+    }
+    let mut child = cmd
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("cannot run `{shown}`: {e}"))?;
+    let mut filter = expected_warning::Filter::default();
+    if let Some(stderr) = child.stderr.take() {
+        let mut reader = BufReader::new(stderr);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            let read = reader
+                .read_until(b'\n', &mut bytes)
+                .map_err(|e| format!("reading the output of `{shown}`: {e}"))?;
+            if read == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let line = text.strip_suffix('\n').unwrap_or(&text);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            for out in filter.line(line) {
+                eprintln!("{out}");
+            }
+        }
+    }
+    let (rest, dropped) = filter.finish();
+    for out in rest {
+        eprintln!("{out}");
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("cannot run `{shown}`: {e}"))?;
+    if dropped != expected_warning::Dropped::default() {
+        println!("{}", expected_warning::note(&dropped));
+    }
     if status.success() {
         Ok(())
     } else {
@@ -2752,7 +3368,10 @@ fn check() -> Result {
         "-D",
         "warnings",
     ]))?;
-    run_step(cargo().args([
+    // The ring-3 crates on their own target (task S4-1), then the kernel, which carries the
+    // programs they build.
+    ring3::clippy()?;
+    run_step(ring3::with_programs(cargo().args([
         "clippy",
         "--package",
         KERNEL_PACKAGE,
@@ -2761,7 +3380,7 @@ fn check() -> Result {
         "--",
         "-D",
         "warnings",
-    ]))?;
+    ]))?)?;
     run_step(cargo().args(["test", "--package", KERNEL_PACKAGE, "--lib"]))?;
     // The loader in developer mode too (the boot test's variant).
     for loader in [Loader::Developer, Loader::Verifying] {
@@ -2784,6 +3403,10 @@ fn check() -> Result {
     dependency_check()?;
     linux_cfg_lint()?;
     documents::gate()?;
+    requirements::gate()?;
+    provenance::gate()?;
+    roadmap::gate()?;
+    progress::gate()?;
     unsafety::gate()?;
     interfaces::gate()?;
     manifest_version_lint()?;
@@ -3431,9 +4054,12 @@ fn linux_cfg_lint() -> Result {
         &mut manifests,
     )
     .map_err(|e| format!("cfg lint: {e}"))?;
-    let cargo_config = root.join(".cargo").join("config.toml");
-    if cargo_config.is_file() {
-        manifests.push(cargo_config);
+    // `config.toml`, and the userspace flags xtask passes to the ring-3 builds (task S4-1).
+    for name in ["config.toml", "userspace.toml"] {
+        let cargo_config = root.join(".cargo").join(name);
+        if cargo_config.is_file() {
+            manifests.push(cargo_config);
+        }
     }
     if sources.is_empty() || manifests.is_empty() {
         return Err(format!(
@@ -3568,7 +4194,8 @@ fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
         build.arg("--target-dir").arg(target);
     }
     build.args(toolchain::image_config()?);
-    run_step(&mut build)?;
+    // The programs it carries in its image (task S4-1).
+    run_step(ring3::with_programs(&mut build)?)?;
     let elf = target
         .map_or_else(target_dir, Path::to_path_buf)
         .join(KERNEL_TARGET)
@@ -4267,6 +4894,18 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
             None => verdict = Err("QEMU stdin was not captured".into()),
         }
     }
+    // Where this boot placed the kernel stacks' region, read through the monitor, for
+    // `boot-matrix` to compare across boots (ADR-0004 Amendment 2, A6.4). A fixed base, on the
+    // machine whose loader had no random value to hand over, is checked and not recorded.
+    if verdict.is_ok()
+        && scenario.capture == Capture::Com1AndScreen
+        && text.contains(STACK_PROOF_LINE)
+        && let Some(monitor) = stdin.as_mut()
+    {
+        verdict = read_stack_base(monitor, &rx, &text)
+            .and_then(|base| base.map_or(Ok(()), |base| record_stack_base(scenario.label, base)))
+            .map_err(|e| format!("the kernel stacks' region's base: {e}"));
+    }
     drop(stdin);
 
     // QEMU keeps running after the scenario ends (the kernel halts; a rejecting loader hands
@@ -4294,6 +4933,13 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
         com1,
     };
     let verdict = verdict
+        .and_then(|()| match stack_window_lines(&done.serial).first() {
+            Some(line) => Err(format!(
+                "the serial log names an address in the kernel stacks' window, which no boot may \
+                 print (ADR-0004 Amendment 2, A6.3): {line:?}"
+            )),
+            None => Ok(()),
+        })
         .and_then(|()| scenario.check.map_or(Ok(()), |check| check(&done)))
         .and_then(
             |()| match scenario.stderr.iter().find(|m| !qemu_stderr.contains(**m)) {
@@ -4711,6 +5357,158 @@ mod gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0004 Amendment 2, A6.3: a boot log names no address in the stack window, PML4 slots
+    /// 384–447, in any case and anywhere in a line; its edges and the windows beside it are fine.
+    #[test]
+    fn a_boot_log_naming_a_stack_window_address_is_caught() {
+        let log = "\
+origin-kernel: loaded at 0xffffffff80600000 (physical 0x7e50000), span 0x13000 bytes\n\
+origin-kernel: direct map at 0xffff800000000000 and 0xffffbfffffffffff\n\
+origin-kernel: page protection: stack guard page at 0xffffc00000001000 faulted\n\
+origin-kernel: framebuffer at 0xffffe00000000000\n\
+origin-kernel: the last page 0xFFFFDFFFFFFFF000, in capitals\n\
+origin-kernel: two numbers, 0x1000 then 0xffffd8a4c0000000, in a line\n\
+origin-kernel: a long run 0xffffc00000000000123 is no address\n";
+        assert_eq!(
+            stack_window_lines(log),
+            [
+                "origin-kernel: page protection: stack guard page at 0xffffc00000001000 faulted",
+                "origin-kernel: the last page 0xFFFFDFFFFFFFF000, in capitals",
+                "origin-kernel: two numbers, 0x1000 then 0xffffd8a4c0000000, in a line",
+            ]
+        );
+        assert!(stack_window_lines("origin-kernel: 0x").is_empty());
+    }
+
+    #[test]
+    fn the_kernels_physical_base_is_read_from_its_boot_line() {
+        let line = "origin-kernel: loaded at 0xffffffff80600000 (physical 0x7e50000), span 0x13000 bytes; direct map at 0xffff800000000000 (KASLR)\n";
+        assert_eq!(kernel_physical_base(line), Some(0x7e5_0000));
+        assert_eq!(
+            kernel_physical_base("origin-kernel: loaded at somewhere\n"),
+            None
+        );
+    }
+
+    /// A hand-made ELF64: a null section, a symbol table and its string table.
+    fn elf_with(symbols: &[(&str, u64)]) -> Vec<u8> {
+        let mut strings = vec![0u8];
+        let mut table = vec![0u8; 24];
+        for (name, value) in symbols {
+            let at = u32::try_from(strings.len()).unwrap();
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            let mut symbol = [0u8; 24];
+            symbol[..4].copy_from_slice(&at.to_le_bytes());
+            symbol[8..16].copy_from_slice(&value.to_le_bytes());
+            table.extend_from_slice(&symbol);
+        }
+        let symbols_at = 64u64;
+        let strings_at = symbols_at + table.len() as u64;
+        let sections_at = strings_at + strings.len() as u64;
+        let mut elf = vec![0u8; 64];
+        elf[..5].copy_from_slice(b"\x7fELF\x02");
+        elf[0x28..0x30].copy_from_slice(&sections_at.to_le_bytes());
+        elf[0x3A..0x3C].copy_from_slice(&64u16.to_le_bytes());
+        elf[0x3C..0x3E].copy_from_slice(&3u16.to_le_bytes());
+        elf.extend_from_slice(&table);
+        elf.extend_from_slice(&strings);
+        let section = |kind: u32, offset: u64, size: u64, link: u32| {
+            let mut header = [0u8; 64];
+            header[4..8].copy_from_slice(&kind.to_le_bytes());
+            header[24..32].copy_from_slice(&offset.to_le_bytes());
+            header[32..40].copy_from_slice(&size.to_le_bytes());
+            header[40..44].copy_from_slice(&link.to_le_bytes());
+            header
+        };
+        elf.extend_from_slice(&[0u8; 64]);
+        elf.extend_from_slice(&section(2, symbols_at, table.len() as u64, 2));
+        elf.extend_from_slice(&section(3, strings_at, strings.len() as u64, 0));
+        elf
+    }
+
+    #[test]
+    fn a_kernel_symbol_is_found_by_part_of_its_name() {
+        let elf = elf_with(&[
+            ("_ZN4core3fmt5write17h0123E", 0x1000),
+            (
+                "_ZN12origin_frame5stack17STACK_REGION_BASE17h4567E",
+                0x13_6008,
+            ),
+        ]);
+        assert_eq!(elf_symbol(&elf, "STACK_REGION_BASE"), Some(0x13_6008));
+        assert_eq!(elf_symbol(&elf, "NOT_THERE"), None);
+        assert_eq!(
+            elf_symbol(&elf[..100], "STACK_REGION_BASE"),
+            None,
+            "cut short"
+        );
+        assert_eq!(elf_symbol(b"not an ELF", "STACK_REGION_BASE"), None);
+    }
+
+    /// What QEMU 11.1's monitor sends back for `xp /1gx`: its line editor's redraw of the
+    /// command, then the answer, its address padded to 8 digits.
+    #[test]
+    fn the_monitors_answer_is_matched_by_its_address() {
+        let answer =
+            "\u{1b}[Dxp /1gx 0x1dcffd30\u{1b}[K\r\n1dcffd30: 0xffffd8a4c0000000\r\n(qemu) ";
+        let line = answer
+            .split('\n')
+            .find_map(|line| xp_answer(line, 0x1dcf_fd30));
+        assert_eq!(line, Some("ffffd8a4c0000000\r"));
+        assert_eq!(
+            xp_answer("000000001dcffd30: 0x10\r", 0x1dcf_fd30),
+            Some("10\r")
+        );
+        assert_eq!(
+            xp_answer("1dcffd38: 0x10\r", 0x1dcf_fd30),
+            None,
+            "another word"
+        );
+        assert_eq!(
+            xp_answer("xp /1gx 0x1dcffd30", 0x1dcf_fd30),
+            None,
+            "the command"
+        );
+    }
+
+    #[test]
+    fn boots_must_place_the_stack_region_apart() {
+        let three = "kernel boot\t0xffffc00000200000\nkernel boot\t0xffffd00000400000\nx2APIC\t0xffffd8a4c0000000\n";
+        assert_eq!(distinct_stack_bases(three), Ok(3));
+        let alike = "kernel boot\t0xffffc00000200000\nkernel boot\t0xffffc00000200000\n";
+        assert!(distinct_stack_bases(alike).is_err());
+        assert!(distinct_stack_bases("kernel boot\t0xffffc00000200000\n").is_err());
+        assert!(distinct_stack_bases("").is_err());
+        // So far, during the matrix: one boot, or none, is no failure; two alike are.
+        assert_eq!(
+            stack_bases_apart("kernel boot\t0xffffc00000200000\n"),
+            Ok(1)
+        );
+        assert_eq!(stack_bases_apart(""), Ok(0));
+        assert!(stack_bases_apart(alike).is_err());
+    }
+
+    #[test]
+    fn a_fixed_stack_base_is_accepted_only_from_a_kernel_that_said_so() {
+        use framekernel::paging::layout::{STACK_REGION, is_stack_region_base, stack_region_base};
+        let drawn = stack_region_base(0x1234_5678_9abc_def0);
+        assert_ne!(drawn, STACK_REGION);
+        let read = |said_fixed, base| {
+            stack_base_read(said_fixed, base, STACK_REGION, is_stack_region_base(base))
+        };
+        // A drawn base is recorded; the fixed base of a kernel that drew is refused.
+        assert_eq!(read(false, drawn), Ok(Some(drawn)));
+        assert!(read(false, STACK_REGION).is_err());
+        // A base no draw can give: not 2 MiB-aligned, or outside the window.
+        assert!(read(false, drawn + 0x1000).is_err());
+        assert!(read(false, 0).is_err());
+        // A kernel that said its region is at the fixed base: that base, not recorded, and no
+        // other.
+        assert_eq!(read(true, STACK_REGION), Ok(None));
+        assert!(read(true, drawn).is_err());
+    }
 
     fn proof(cpus: u64) -> String {
         let mut text = String::from("origin-kernel: SMP: up\n");

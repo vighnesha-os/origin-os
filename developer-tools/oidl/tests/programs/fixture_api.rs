@@ -122,10 +122,10 @@ impl s::EchoServer for Service {
 struct Loopback {
     service: Service,
     connection: rt::Connection,
-    discarded: Vec<u32>,
+    discarded: Vec<u64>,
 }
 
-fn received(handles: &[u32]) -> Vec<rt::RecvHandle> {
+fn received(handles: &[u64]) -> Vec<rt::RecvHandle> {
     handles
         .iter()
         .map(|h| rt::RecvHandle {
@@ -141,12 +141,12 @@ impl rt::Transport for Loopback {
         &mut self,
         buffer: &mut [u8],
         request: usize,
-        handles: &[u32],
+        handles: &[u64],
         out: &mut [rt::RecvHandle],
     ) -> Result<(usize, usize), i64> {
         let incoming = received(handles);
         let mut reply = vec![0u8; 65536];
-        let mut reply_handles = vec![0u32; 64];
+        let mut reply_handles = vec![0u64; 64];
         match s::dispatch(
             &mut self.service,
             &(),
@@ -170,10 +170,10 @@ impl rt::Transport for Loopback {
         }
     }
 
-    fn send(&mut self, buffer: &[u8], handles: &[u32]) -> Result<(), i64> {
+    fn send(&mut self, buffer: &[u8], handles: &[u64]) -> Result<(), i64> {
         let incoming = received(handles);
         let mut reply = vec![0u8; 256];
-        let mut reply_handles = vec![0u32; 8];
+        let mut reply_handles = vec![0u64; 8];
         match s::dispatch(
             &mut self.service,
             &(),
@@ -201,7 +201,7 @@ fn loopback(admin: bool) -> Loopback {
     }
 }
 
-fn scratch<'a>(bytes: &'a mut [u8], handles: &'a mut [u32], received: &'a mut [rt::RecvHandle]) -> rt::Scratch<'a> {
+fn scratch<'a>(bytes: &'a mut [u8], handles: &'a mut [u64], received: &'a mut [rt::RecvHandle]) -> rt::Scratch<'a> {
     rt::Scratch { bytes, handles, received }
 }
 
@@ -212,14 +212,14 @@ fn nothing() -> rt::RecvHandle {
 macro_rules! buffers {
     ($b:ident, $h:ident, $r:ident) => {
         let mut $b = vec![0u8; 65536];
-        let mut $h = vec![0u32; 64];
+        let mut $h = vec![0u64; 64];
         let mut $r = vec![nothing(); 64];
     };
 }
 
 fn known_answer() {
     let mut out = [0u8; 64];
-    let mut handles = [0u32; 4];
+    let mut handles = [0u64; 4];
     let mut sink = rt::HandleSink::new(&mut handles);
     let args = s::PutRequestArgs {
         flag: true,
@@ -349,7 +349,7 @@ fn an_older_client_uses_the_older_layout() {
     .unwrap();
     let mut transport = loopback(true);
     let mut reply = [0u8; 64];
-    let mut none = [0u32; 1];
+    let mut none = [0u64; 1];
     let disposition = s::dispatch(
         &mut transport.service,
         &(),
@@ -403,7 +403,7 @@ fn an_older_client_uses_the_older_layout() {
 
     // Encoding a later field without a value fails rather than sending a wrong message.
     let mut out = [0u8; 256];
-    let mut slots = [0u32; 8];
+    let mut slots = [0u64; 8];
     let mut sink = rt::HandleSink::new(&mut slots);
     let bad = s::VectorsRequestArgs {
         points: &points,
@@ -471,7 +471,7 @@ fn dispatch_once(
     handles: &[rt::RecvHandle],
     reply: &mut [u8],
 ) -> rt::Dispatched {
-    let mut none = [0u32; 8];
+    let mut none = [0u64; 8];
     s::dispatch(
         &mut transport.service,
         &(),
@@ -550,7 +550,7 @@ fn the_server_refuses_before_any_service_runs() {
         let points = [e::Point { x: 1, y: 10 }, e::Point { x: 2, y: 20 }];
         let handles = [rt::Handle::from_abi(6), rt::Handle::from_abi(7)];
         let mut body = [0u8; 256];
-        let mut slots = [0u32; 8];
+        let mut slots = [0u64; 8];
         let mut sink = rt::HandleSink::new(&mut slots);
         let n = s::VectorsRequestArgs {
             points: &points,
@@ -685,7 +685,7 @@ fn a_client_validates_what_it_receives() {
     struct Fake {
         connected: bool,
         reply: Vec<u8>,
-        reply_handles: Vec<u32>,
+        reply_handles: Vec<u64>,
         discarded: Rc<Cell<usize>>,
         hello: Option<Vec<u8>>,
         hello_handles: usize,
@@ -695,7 +695,7 @@ fn a_client_validates_what_it_receives() {
             &mut self,
             buffer: &mut [u8],
             _request: usize,
-            _handles: &[u32],
+            _handles: &[u64],
             out: &mut [rt::RecvHandle],
         ) -> Result<(usize, usize), i64> {
             if !self.connected {
@@ -703,7 +703,7 @@ fn a_client_validates_what_it_receives() {
                 if let Some(hello) = &self.hello {
                     buffer[..hello.len()].copy_from_slice(hello);
                     for (slot, h) in out.iter_mut().zip(0..self.hello_handles) {
-                        *slot = received(&[100 + h as u32])[0];
+                        *slot = received(&[100 + h as u64])[0];
                     }
                     return Ok((hello.len(), self.hello_handles));
                 }
@@ -722,7 +722,7 @@ fn a_client_validates_what_it_receives() {
             }
             Ok((self.reply.len(), self.reply_handles.len()))
         }
-        fn send(&mut self, _buffer: &[u8], _handles: &[u32]) -> Result<(), i64> {
+        fn send(&mut self, _buffer: &[u8], _handles: &[u64]) -> Result<(), i64> {
             Ok(())
         }
         fn discard(&mut self, handles: &[rt::RecvHandle]) {
@@ -736,7 +736,7 @@ fn a_client_validates_what_it_receives() {
         message[16..].copy_from_slice(body);
         message
     }
-    let fake = |reply: Vec<u8>, reply_handles: Vec<u32>, discarded: &Rc<Cell<usize>>| Fake {
+    let fake = |reply: Vec<u8>, reply_handles: Vec<u64>, discarded: &Rc<Cell<usize>>| Fake {
         connected: false,
         reply,
         reply_handles,
@@ -783,7 +783,7 @@ fn a_client_validates_what_it_receives() {
     );
 
     // A reply with handles it should not carry: refused, and the handles are discarded.
-    let discards = |message: Vec<u8>, handles: Vec<u32>| {
+    let discards = |message: Vec<u8>, handles: Vec<u64>| {
         buffers!(b, h, r);
         let mut s0 = scratch(&mut b, &mut h, &mut r);
         let count = Rc::new(Cell::new(0));
@@ -809,7 +809,7 @@ fn a_client_validates_what_it_receives() {
     // The hello reply is checked like any other.
     fn connect_with(hello: Vec<u8>, handles: usize) -> (Result<u16, rt::CallError<core::convert::Infallible>>, usize) {
         let mut b = vec![0u8; 65536];
-        let mut h = vec![0u32; 64];
+        let mut h = vec![0u64; 64];
         let mut r = vec![nothing(); 64];
         let mut s0 = scratch(&mut b, &mut h, &mut r);
         let count = Rc::new(Cell::new(0));

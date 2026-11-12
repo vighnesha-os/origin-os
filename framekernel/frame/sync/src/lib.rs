@@ -29,13 +29,18 @@
     )
 )]
 
+// The ports' storage (`ports.rs`): one allocation per node, made fallibly before any lock.
+extern crate alloc;
+
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::Ordering;
 
 pub mod floor;
+pub mod ports;
 pub mod refcount;
 pub mod shootdown;
+pub mod slots;
 pub mod wait;
 
 #[cfg(all(test, loom))]

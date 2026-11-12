@@ -99,6 +99,15 @@ fn the_call_numbers_are_the_same() {
         (number::WAIT_ONE, abi::WAIT_ONE),
         (number::EVENT_CREATE, abi::EVENT_CREATE),
         (number::OBJECT_SIGNAL, abi::OBJECT_SIGNAL),
+        (number::MEMORY_OBJECT_CREATE, abi::MEMORY_OBJECT_CREATE),
+        (number::MEMORY_MAP, abi::MEMORY_MAP),
+        (number::MEMORY_UNMAP, abi::MEMORY_UNMAP),
+        (number::MEMORY_PROTECT, abi::MEMORY_PROTECT),
+        (number::PORT_CREATE, abi::PORT_CREATE),
+        (number::OBJECT_WAIT_ASYNC, abi::OBJECT_WAIT_ASYNC),
+        (number::PORT_WAIT, abi::PORT_WAIT),
+        (number::PORT_CANCEL, abi::PORT_CANCEL),
+        (number::CLOCK_READ, abi::CLOCK_READ),
     ];
     assert_eq!(server::CALLS.len(), pairs.len());
     for (ours, theirs) in pairs {
@@ -134,6 +143,53 @@ fn the_start_record_is_the_same() {
         assert_eq!(ours, theirs);
     }
     assert_eq!(generated::START_MAX_HANDLES as usize, start::MAX_HANDLES);
+    // ADR-0005 Amendment 6, E1 (task S4-0): an entry is 24 bytes, a 64-bit handle first and four
+    // bytes of padding last.
+    assert_eq!(
+        (start::ENTRY, Entry::HANDLE_AT, Entry::ROLE_AT),
+        (24, 0, 16)
+    );
+    // An entry as origin-abi's codec writes it is the entry the generated decoder reads, all 64
+    // bits of its handle included; the generated decoder refuses a padding byte that is not zero,
+    // as origin-abi's does.
+    let entry = start::Entry {
+        handle: 0xFEDC_BA98_7654_3210,
+        object_type: origin_abi::ObjectType::Channel as u32,
+        rights: origin_abi::rights::CHANNEL,
+        role: role::BOOTSTRAP,
+    };
+    let mut record = [0u8; 128];
+    let size = start::encode(&[entry], &[], &[], &mut record).expect("encode");
+    assert_eq!(size, start::HEADER + start::ENTRY);
+    let bytes = &record[start::HEADER..size];
+    let read = <Entry as rt::Fixed>::read(bytes, u16::MAX).expect("generated decode");
+    assert_eq!(read.handle, entry.handle);
+    assert_eq!(read.object_type.raw(), entry.object_type);
+    assert_eq!(read.rights.bits(), entry.rights);
+    assert_eq!(read.role.raw(), entry.role);
+    let mut written = [0xAAu8; 24];
+    <Entry as rt::Fixed>::write(read, &mut written).expect("generated encode");
+    assert_eq!(
+        &written[..],
+        bytes,
+        "the generated encoder writes the same bytes"
+    );
+    for byte in 20..24 {
+        let mut padded = [0u8; 24];
+        padded.copy_from_slice(bytes);
+        padded[byte] = 1;
+        assert_eq!(
+            <Entry as rt::Fixed>::read(&padded, u16::MAX).map(|_| ()),
+            Err(rt::WireError::Padding),
+            "byte {byte}"
+        );
+        let mut whole = record;
+        whole[start::HEADER + byte] = 1;
+        assert!(
+            start::decode(&whole[..size]).is_err(),
+            "origin-abi, byte {byte}"
+        );
+    }
     assert_eq!(generated::START_MAX_BYTES as usize, start::MAX_SIZE);
     // The roles (C5), with 4 retired, and the rights of a process and a thread (C6).
     assert_eq!(generated::StartRole::Bootstrap.raw(), role::BOOTSTRAP);
@@ -189,7 +245,26 @@ fn the_limits_layouts_and_version_are_the_same() {
         generated::ReadSizes::SENDER_PRINCIPAL_AT,
         origin_abi::read_sizes::SENDER_PRINCIPAL_AT
     );
-    // The record `channel_read` writes for each handle (ADR-0005 B3).
+    // The record `channel_read` writes for each handle (ADR-0005 B3): 16 bytes since E1, the
+    // handle a `u64` first (task S4-0).
+    assert_eq!(origin_abi::received_handle::SIZE, 16);
+    assert_eq!(generated::ReceivedHandle::OBJECT_TYPE_AT, 8);
+    let record = generated::ReceivedHandle {
+        handle: 0x0123_4567_89AB_CDEF,
+        object_type: generated::ObjectType::Port,
+        rights: generated::PORT_RIGHTS,
+    };
+    let mut bytes = [0u8; 16];
+    <generated::ReceivedHandle as rt::Fixed>::write(record, &mut bytes).expect("encode");
+    let at = origin_abi::received_handle::HANDLE_AT;
+    assert_eq!(
+        u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes")),
+        0x0123_4567_89AB_CDEF
+    );
+    assert_eq!(
+        <generated::ReceivedHandle as rt::Fixed>::read(&bytes, u16::MAX).expect("decode"),
+        record
+    );
     assert_eq!(
         <generated::ReceivedHandle as rt::Fixed>::SIZE,
         origin_abi::received_handle::SIZE
@@ -215,6 +290,72 @@ fn the_limits_layouts_and_version_are_the_same() {
             "byte {raw:#x}"
         );
     }
+}
+
+/// Events and ports (ADR-0005 C9, C10, Amendment 7 F1 and F6): their rights and the packet.
+#[test]
+fn events_and_ports_are_the_same() {
+    use origin_abi::{packet_kind, port_packet};
+    assert_eq!(generated::EVENT_RIGHTS.bits(), origin_abi::rights::EVENT);
+    assert_eq!(generated::PORT_RIGHTS.bits(), origin_abi::rights::PORT);
+    assert_eq!(
+        <generated::PortPacket as rt::Fixed>::SIZE,
+        port_packet::SIZE
+    );
+    let fields = [
+        (generated::PortPacket::KEY_AT, port_packet::KEY_AT),
+        (generated::PortPacket::KIND_AT, port_packet::KIND_AT),
+        (generated::PortPacket::TRIGGER_AT, port_packet::TRIGGER_AT),
+        (generated::PortPacket::OBSERVED_AT, port_packet::OBSERVED_AT),
+        (generated::PortPacket::RESERVED_AT, port_packet::RESERVED_AT),
+        (generated::PortPacket::DATA_AT, port_packet::DATA_AT),
+    ];
+    for (ours, theirs) in fields {
+        assert_eq!(ours, theirs);
+    }
+    assert_eq!(generated::PacketKind::Signal.raw(), packet_kind::SIGNAL);
+    assert_eq!(generated::PacketKind::Canceled.raw(), packet_kind::CANCELED);
+    assert_eq!(
+        generated::PacketKind::from_raw(0),
+        None,
+        "0 is never a kind"
+    );
+}
+
+/// Memory objects (ADR-0005 C6-C8): their rights, bits, page size and request layouts.
+#[test]
+fn memory_objects_are_the_same() {
+    use origin_abi::{map_access, map_flags, map_request, object_request};
+    assert_eq!(
+        generated::MEMORY_OBJECT_RIGHTS.bits(),
+        origin_abi::rights::MEMORY_OBJECT
+    );
+    assert_eq!(generated::PAGE_SIZE, origin_abi::PAGE_SIZE);
+    assert_eq!(generated::MapAccess::READ.bits(), map_access::READ);
+    assert_eq!(generated::MapAccess::WRITE.bits(), map_access::WRITE);
+    assert_eq!(generated::MapAccess::EXECUTE.bits(), map_access::EXECUTE);
+    assert_eq!(generated::MapAccess::ALL.bits(), map_access::ALL);
+    assert_eq!(generated::MapFlags::FIXED.bits(), map_flags::FIXED);
+    assert_eq!(generated::MapFlags::ALL.bits(), map_flags::ALL);
+    assert_eq!(generated::ObjectRequest::SIZE, object_request::SIZE);
+    assert_eq!(
+        generated::ObjectRequest::LENGTH_AT,
+        object_request::LENGTH_AT
+    );
+    assert_eq!(generated::MapRequest::SIZE, map_request::SIZE);
+    assert_eq!(generated::MapRequest::ACCESS_AT, map_request::ACCESS_AT);
+    assert_eq!(generated::MapRequest::FLAGS_AT, map_request::FLAGS_AT);
+    assert_eq!(generated::MapRequest::OFFSET_AT, map_request::OFFSET_AT);
+    assert_eq!(generated::MapRequest::LENGTH_AT, map_request::LENGTH_AT);
+    assert_eq!(generated::MapRequest::ADDRESS_AT, map_request::ADDRESS_AT);
+    // Only the sizes of versions the kernel knows are taken (OIDL §5.3).
+    assert!(generated::MapRequest::accepts_param_size(map_request::SIZE));
+    assert!(!generated::MapRequest::accepts_param_size(
+        map_request::SIZE - 1
+    ));
+    assert!(!generated::MapRequest::accepts_param_size(
+        map_request::SIZE + 8
+    ));
 }
 
 /// An implementation of the interface that only records that it ran.
@@ -286,6 +427,115 @@ impl Calls for Recorder {
     ) -> Result<(), server::WaitOneError> {
         self.ran.set(true);
         Ok(())
+    }
+    fn memory_object_create(
+        &self,
+        _: rt::UserRef<generated::ObjectRequest>,
+        _: rt::UserRef<rt::Handle>,
+    ) -> Result<(), server::MemoryObjectCreateError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn memory_map(
+        &self,
+        _: rt::HandleArg,
+        _: rt::HandleArg,
+        _: rt::UserRef<generated::MapRequest>,
+        _: rt::UserRef<u64>,
+    ) -> Result<(), server::MemoryMapError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn memory_unmap(
+        &self,
+        _: rt::HandleArg,
+        _: u64,
+        _: u64,
+    ) -> Result<(), server::MemoryUnmapError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn memory_protect(
+        &self,
+        _: rt::HandleArg,
+        _: u64,
+        _: u64,
+        _: generated::MapAccess,
+    ) -> Result<(), server::MemoryProtectError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn event_create(&self, _: rt::UserRef<rt::Handle>) -> Result<(), server::EventCreateError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn object_signal(
+        &self,
+        _: rt::HandleArg,
+        _: generated::Signals,
+        _: generated::Signals,
+    ) -> Result<(), server::ObjectSignalError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn port_create(&self, _: rt::UserRef<rt::Handle>) -> Result<(), server::PortCreateError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn object_wait_async(
+        &self,
+        _: rt::HandleArg,
+        _: rt::HandleArg,
+        _: u64,
+        _: generated::Signals,
+    ) -> Result<(), server::ObjectWaitAsyncError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn port_wait(
+        &self,
+        _: rt::HandleArg,
+        _: u64,
+        _: rt::UserRef<generated::PortPacket>,
+    ) -> Result<(), server::PortWaitError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn port_cancel(
+        &self,
+        _: rt::HandleArg,
+        _: rt::HandleArg,
+        _: u64,
+    ) -> Result<(), server::PortCancelError> {
+        self.ran.set(true);
+        Ok(())
+    }
+    fn clock_read(&self, _: rt::UserRef<u64>) -> Result<(), server::ClockReadError> {
+        self.ran.set(true);
+        Ok(())
+    }
+}
+
+/// `memory_protect`'s access is `@nonzero` and its bits are checked: zero, or a bit the
+/// definition does not declare, is refused before the implementation runs.
+#[test]
+fn a_protect_with_no_access_or_an_undefined_bit_never_runs() {
+    for access in [0, 1 << 3] {
+        let recorder = Recorder::default();
+        let outcome = server::dispatch(
+            &recorder,
+            number::MEMORY_PROTECT,
+            [1, 0x1000, 0x1000, access, 0, 0],
+        );
+        assert_eq!(
+            outcome,
+            server::Outcome::Status(generated::Error::InvalidArgs.raw()),
+            "{access:#x}"
+        );
+        assert!(
+            !recorder.ran.get(),
+            "the implementation ran for {access:#x}"
+        );
     }
 }
 

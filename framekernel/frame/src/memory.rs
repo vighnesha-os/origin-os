@@ -121,6 +121,13 @@ impl OwnedFrame {
     pub(crate) fn virt(&self) -> usize {
         crate::phys::to_virt(self.phys.raw()) as usize
     }
+
+    /// The frame a kernel mapping held, back from the page tables that held it: only for
+    /// `vm::unmap_stack_pages`, which has just taken the mapping, the frame's one owner, out of
+    /// the tables. Nothing else may make an `OwnedFrame` from an address.
+    pub(crate) const fn from_mapping(phys: PhysAddr) -> Self {
+        Self { phys }
+    }
 }
 
 /// One free 4 KiB frame, or `None`.
@@ -128,6 +135,21 @@ pub fn allocate_frame() -> Option<OwnedFrame> {
     without_interrupts(|| MEMORY.lock().as_mut()?.frames.allocate()).map(|addr| OwnedFrame {
         phys: PhysAddr::new(addr),
     })
+}
+
+/// Zeroes a frame nothing else holds.
+pub(crate) fn zero_frame(frame: &OwnedFrame) {
+    let p = ptr::with_exposed_provenance_mut::<u8>(frame.virt());
+    // SAFETY: an `OwnedFrame` has one owner, the caller, which has mapped it nowhere yet; the
+    // direct map makes it writable at `p`, and it spans `FRAME` bytes.
+    unsafe { p.write_bytes(0, FRAME as usize) };
+}
+
+/// A fresh zeroed frame, or `None`.
+pub(crate) fn zeroed_frame() -> Option<OwnedFrame> {
+    let frame = allocate_frame()?;
+    zero_frame(&frame);
+    Some(frame)
 }
 
 /// The frame at `phys`, if it is free: for a boot proof that needs to see one particular frame

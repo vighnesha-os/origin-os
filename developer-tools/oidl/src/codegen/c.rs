@@ -194,8 +194,11 @@ fn gen_library(lib: &Library) -> String {
     t.blank();
     t.line("#ifndef ORIGIN_OIDL_HANDLE_T");
     t.line("#define ORIGIN_OIDL_HANDLE_T");
-    t.line("/** A handle: a 32-bit name for a kernel object. 0 is never valid. */");
-    t.line("typedef uint32_t origin_handle_t;");
+    t.line("/** A handle: a 64-bit name for a kernel object (ADR-0005 E1). 0 is never valid. */");
+    t.line(format!(
+        "typedef uint{}_t origin_handle_t;",
+        layout::HANDLE_BITS
+    ));
     t.line("#define ORIGIN_INVALID_HANDLE ((origin_handle_t)0)");
     t.line("#endif");
     t.blank();

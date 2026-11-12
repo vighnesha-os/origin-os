@@ -12,8 +12,8 @@ use origin_frame::vm::{self, KernelProbe};
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex, Probe};
 use crate::memory;
-use crate::paging::{Access, PAGE};
-use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, Process};
+use crate::paging::{Access, LARGE_PAGE, MapError, PAGE};
+use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, MemoryLimits, ObjectLimits, Process};
 use crate::sched;
 
 /// Where each proof program's code runs.
@@ -53,6 +53,8 @@ const LIMITS: Limits = Limits {
     channels: 4,
     message_bytes: 1 << 20,
     debug_calls: true,
+    memory: MemoryLimits::NONE,
+    objects: ObjectLimits::NONE,
 };
 
 /// `mov edi, value; mov eax, DEBUG_REPORT; syscall`.
@@ -574,6 +576,79 @@ fn shared_frames_keep_w_xor_x(com1: &mut Console) -> bool {
     right
 }
 
+/// Where the page-table proof maps a page every 2 MiB, each needing a page table of its own.
+const TABLES: u64 = 0x4000_0000;
+
+/// A run of shared frames is mapped whole or not at all (S3-5b's review, findings B and C).
+/// Each refusal comes before any entry of the run is written, so it leaves none of the run
+/// mapped and no frame counted, and needs no shootdown: over a page already mapped, with a
+/// frame executable in another space, and when the run needs a page table and the space has
+/// made as many as one space may, which is a limit and not a want of memory.
+fn a_run_is_mapped_whole_or_not_at_all(com1: &mut Console) -> bool {
+    let (Some(space), Some(elsewhere)) = (UserSpace::new(), UserSpace::new()) else {
+        return false;
+    };
+    let frames: Vec<SharedFrame> = (0..3).map_while(|_| SharedFrame::new()).collect();
+    let [first, second, last] = frames.as_slice() else {
+        return false;
+    };
+    let uncounted = || frames.iter().all(|f| f.mappings() == (0, 0));
+    let unmapped =
+        |base: u64, pages: u64| (0..pages).all(|k| space.translate(base + k * PAGE).is_none());
+    // The run's last page is mapped already.
+    let in_the_way = space.map_page(WIDE + 2 * PAGE, Access::Read).is_ok();
+    let over = in_the_way
+        && space.map_shared_run(WIDE, &frames, Access::ReadWrite)
+            == Err(ChangeError::Map(MapError::AlreadyMapped(WIDE + 2 * PAGE)))
+        && unmapped(WIDE, 2)
+        && uncounted();
+    // Its last frame is executable in another space: writable here would make it both.
+    let executable = elsewhere
+        .map_shared(DATA, last, Access::ReadExecute)
+        .is_ok();
+    let both = executable
+        && space.map_shared_run(LATER, &frames, Access::ReadWrite)
+            == Err(ChangeError::WriteAndExecute)
+        && unmapped(LATER, 3)
+        && first.mappings() == (0, 0)
+        && second.mappings() == (0, 0)
+        && last.mappings() == (0, 1);
+    let both = both && elsewhere.unmap(DATA, 1).is_ok() && uncounted();
+    // The space's page tables used up: from `TABLES`, each 2 MiB needs one of its own. Then a
+    // run of two pages, its first in the last 2 MiB with a table and its second in the next.
+    let made = (0..64u64)
+        .take_while(|&k| {
+            space
+                .map_page(TABLES + k * LARGE_PAGE, Access::Read)
+                .is_ok()
+        })
+        .count() as u64;
+    let across = TABLES + made * LARGE_PAGE - PAGE;
+    let limit = made > 0
+        && space.map_shared_run(across, &[first.clone(), second.clone()], Access::ReadWrite)
+            == Err(ChangeError::Limit)
+        && unmapped(across, 2)
+        && uncounted();
+    // And a run that can be mapped is, whole.
+    let base = WIDE + 3 * PAGE;
+    let whole = space
+        .map_shared_run(base, &frames, Access::ReadWrite)
+        .is_ok()
+        && frames
+            .iter()
+            .zip(0..)
+            .all(|(f, k)| space.frame_of(base + k * PAGE).map(UserFrame::phys) == Some(f.phys()))
+        && frames.iter().all(|f| f.mappings() == (1, 0));
+    let whole = whole && space.unmap(base, 3).is_ok() && uncounted();
+    let right = over && both && limit && whole;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: address spaces: a run of shared frames is mapped whole or not at all: over a page already mapped, refused with none of it mapped: {over}; with a frame executable in another space, refused with none of it mapped and no count taken: {both}; into 2 MiB that needs a page table once the space has made all it may, refused as a limit with none of it mapped: {limit}; mapped whole: {whole}{}",
+        verdict(right)
+    );
+    right
+}
+
 /// A program maps and unmaps a page in a loop while a thread of its own runs on another
 /// processor (done by the kernel here: no system call exists yet). Each unmap interrupts only
 /// the processor that has the space loaded; the others take nothing. Reports what it costs
@@ -731,6 +806,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
     ok &= unmap_many(com1, 200, far, bsp, tsc_hz);
     ok &= shared_between_spaces(com1, far, third, tsc_hz);
     ok &= shared_frames_keep_w_xor_x(com1);
+    ok &= a_run_is_mapped_whole_or_not_at_all(com1);
     ok &= the_loop_interrupts_only_the_space(com1, cpus, bsp, far, tsc_hz);
     // Each processor reaps what its own threads left, on its own time.
     let same = || memory::stats().map(|(h, f)| (h.bytes_in_use, f)) == before;

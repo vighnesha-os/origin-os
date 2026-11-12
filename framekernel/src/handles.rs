@@ -1,16 +1,21 @@
-//! Per-process handle tables (ADR-0005 P1–P2).
+//! Per-process handle tables (ADR-0005 P1–P2, Amendment 6 E1).
 //!
-//! A handle is a 32-bit value: the slot index plus one in the low 16 bits and the slot's
-//! generation in the high 16 bits, so a handle is never 0 and a stale handle (its slot
-//! freed and reused) never names the new object. Each entry holds an object and its rights;
-//! every lookup states what it needs ([`Need`]), and a duplicate can only remove rights. What
-//! a system call needs comes from its definition (`docs/spec/OIDL.md` §6), through the
-//! generated decoder: there is no second list of rights here.
+//! A handle is a 64-bit value (E1): the slot index plus one in the top [`SLOT_BITS`] bits and
+//! the slot's generation in the low [`GENERATION_BITS`], so a handle is never 0 and a stale
+//! handle (its slot freed and reused) never names the new object. How the bits are divided is
+//! the kernel's, not the ABI's. The slot is placed above bit 32 on purpose: a value cut to 32
+//! bits anywhere names no slot and is `bad_handle`, so a path that still keeps 32 bits of a
+//! handle fails at once instead of naming the wrong object. Each entry holds an object and its
+//! rights; every lookup states what it needs ([`Need`]), and a duplicate can only remove
+//! rights. What a system call needs comes from its definition (`docs/spec/OIDL.md` §6), through
+//! the generated decoder: there is no second list of rights here.
 //!
 //! A slot whose generations are used up is retired rather than reused, so "a stale handle
-//! never names a reused slot" holds however long a process runs. The table allocates only
-//! with `try_reserve`: a hostile process that fills it gets [`Error::Limit`] or
-//! [`Error::NoMemory`], never an allocation failure that stops the kernel.
+//! never names a reused slot" holds however long a process runs. With 40 bits that takes about
+//! a trillion uses of one slot, and a table has about 16 million slots, so no process meets the
+//! limit in its life (E1). The table allocates only with `try_reserve`: a hostile process that
+//! fills it gets [`Error::Limit`] or [`Error::NoMemory`], never an allocation failure that stops
+//! the kernel.
 //!
 //! Generic over the object type, safe, tested on the host.
 
@@ -19,8 +24,14 @@ use alloc::vec::Vec;
 use origin_abi::{Error, Handle};
 use origin_frame::nospec;
 
-/// Most entries any table can have (the index field's range).
-pub const MAX_HANDLES: usize = 0xFFFF;
+/// Bits of a handle that hold its slot's index plus one: the top of the value.
+pub const SLOT_BITS: u32 = 24;
+/// Bits of a handle that hold its slot's generation: the rest, below the slot.
+pub const GENERATION_BITS: u32 = 64 - SLOT_BITS;
+/// The last generation a slot can have; a slot that reaches it is retired when it is freed.
+const LAST_GENERATION: u64 = (1 << GENERATION_BITS) - 1;
+/// Most entries any table can have (the slot field's range, less the 0 that means none).
+pub const MAX_HANDLES: usize = (1 << SLOT_BITS) - 1;
 
 /// What a lookup requires of a handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,14 +62,14 @@ pub trait Typed {
 }
 
 struct Slot<T> {
-    generation: u16,
+    generation: u64,
     entry: Option<(T, u32)>,
 }
 
 /// One process's handles.
 pub struct HandleTable<T> {
     slots: Vec<Slot<T>>,
-    free: Vec<u16>,
+    free: Vec<u32>,
     limit: usize,
     live: usize,
 }
@@ -72,13 +83,16 @@ impl<T> core::fmt::Debug for HandleTable<T> {
     }
 }
 
-fn split(handle: Handle) -> Option<(usize, u16)> {
-    let index = (handle & 0xFFFF).checked_sub(1)?;
-    Some((index as usize, (handle >> 16) as u16))
+/// The slot index and generation a handle names; `None` for a handle with no slot.
+fn split(handle: Handle) -> Option<(usize, u64)> {
+    let index = (handle >> GENERATION_BITS).checked_sub(1)?;
+    Some((usize::try_from(index).ok()?, handle & LAST_GENERATION))
 }
 
-fn join(index: usize, generation: u16) -> Handle {
-    (u32::from(generation) << 16) | (index as u32 + 1)
+/// The handle of `index` at `generation`. `index` is below [`MAX_HANDLES`] and `generation`
+/// at most [`LAST_GENERATION`], as the table keeps them.
+fn join(index: usize, generation: u64) -> Handle {
+    ((index as u64 + 1) << GENERATION_BITS) | (generation & LAST_GENERATION)
 }
 
 impl<T> HandleTable<T> {
@@ -135,7 +149,7 @@ impl<T> HandleTable<T> {
             return Err((Error::Limit, object));
         }
         let index = match self.free.pop() {
-            Some(i) => usize::from(i),
+            Some(i) => i as usize,
             None => {
                 if self.slots.len() >= MAX_HANDLES {
                     return Err((Error::Limit, object));
@@ -156,6 +170,15 @@ impl<T> HandleTable<T> {
         slot.entry = Some((object, rights));
         self.live += 1;
         Ok(join(index, slot.generation))
+    }
+
+    /// Every object the table holds, once for each handle, and the table gone: for a process
+    /// that has ended, whose bindings are cancelled object by object before its handles close
+    /// (ADR-0005 Amendment 7, F11). Allocates nothing.
+    pub fn into_objects(self) -> impl Iterator<Item = T> {
+        self.slots
+            .into_iter()
+            .filter_map(|slot| slot.entry.map(|(object, _)| object))
     }
 }
 
@@ -192,10 +215,10 @@ impl<T: Typed> HandleTable<T> {
         let entry = slot.entry.take().ok_or(Error::BadHandle)?;
         // A slot whose generations are used up is retired: reusing it would let a stale
         // handle name a later object, which P1 rules out.
-        if let Some(next) = slot.generation.checked_add(1) {
-            slot.generation = next;
+        if slot.generation < LAST_GENERATION {
+            slot.generation += 1;
             // Never grows: `insert` made room for every slot.
-            self.free.push(index as u16);
+            self.free.push(index as u32);
         }
         self.live -= 1;
         Ok(entry)
@@ -302,10 +325,63 @@ mod tests {
         assert_eq!(t.len(), 2);
         assert_eq!(t.get(0, Need::NOTHING), Err(Error::BadHandle));
         assert_eq!(
-            t.get(0xFFFF_0001, Need::NOTHING),
+            t.get(a + 1, Need::NOTHING),
             Err(Error::BadHandle),
             "wrong generation"
         );
+        assert_eq!(
+            t.get(a ^ (1 << 30), Need::NOTHING),
+            Err(Error::BadHandle),
+            "another bit of the generation"
+        );
+    }
+
+    /// E1: a handle fills 64 bits, and its slot lies above bit 32, so a value cut to its low
+    /// 32 bits names nothing, whatever the slot and generation.
+    #[test]
+    fn a_handle_s_low_32_bits_alone_name_nothing() {
+        let mut t = HandleTable::new(MAX_HANDLES);
+        let mut handles = Vec::new();
+        for i in 0..300u32 {
+            handles.push(t.insert(i, READ).unwrap());
+        }
+        for &h in &handles {
+            assert!(h > u64::from(u32::MAX), "{h:#x} fits in 32 bits");
+            assert_eq!(t.get(h & 0xFFFF_FFFF, Need::NOTHING), Err(Error::BadHandle));
+            assert_eq!(t.get(h >> 32, Need::NOTHING), Err(Error::BadHandle));
+        }
+        // The same holds for a slot reused many times: the generation never reaches the slot.
+        let h = handles[7];
+        t.remove(h, Need::NOTHING).unwrap();
+        let again = t.insert(7, READ).unwrap();
+        assert_eq!(
+            again >> GENERATION_BITS,
+            h >> GENERATION_BITS,
+            "the slot is reused"
+        );
+        assert_eq!(
+            t.get(again & 0xFFFF_FFFF, Need::NOTHING),
+            Err(Error::BadHandle)
+        );
+    }
+
+    /// The division E1 leaves to the kernel: about 16 million live handles, a trillion uses
+    /// of each slot, and the two fields together fill the value.
+    #[test]
+    fn the_fields_fill_the_value_and_meet_e1() {
+        assert_eq!(SLOT_BITS + GENERATION_BITS, 64);
+        assert_eq!(MAX_HANDLES, 0xFF_FFFF);
+        assert_eq!(LAST_GENERATION, 0xFF_FFFF_FFFF);
+        const { assert!(MAX_HANDLES >= 16_000_000 && LAST_GENERATION >= 1_000_000_000_000) };
+        // The first and last slot, at the first and last generation, round-trip.
+        for (index, generation) in [(0, 1), (0, LAST_GENERATION), (MAX_HANDLES - 1, 1)] {
+            let h = join(index, generation);
+            assert_ne!(h, 0);
+            assert_eq!(split(h), Some((index, generation)));
+        }
+        assert_eq!(join(MAX_HANDLES - 1, LAST_GENERATION), u64::MAX);
+        assert_eq!(split(0), None);
+        assert_eq!(split(LAST_GENERATION), None, "no slot");
     }
 
     #[test]
@@ -383,26 +459,84 @@ mod tests {
         let old = t.insert(1, READ).unwrap();
         t.remove(old, Need::NOTHING).unwrap();
         let new = t.insert(2, READ).unwrap();
-        assert_eq!(old & 0xFFFF, new & 0xFFFF, "the slot is reused");
+        assert_eq!(
+            old >> GENERATION_BITS,
+            new >> GENERATION_BITS,
+            "the slot is reused"
+        );
         assert_ne!(old, new, "with a new generation");
         assert_eq!(t.get(old, Need::NOTHING), Err(Error::BadHandle));
         assert_eq!(t.remove(old, Need::NOTHING), Err(Error::BadHandle));
         assert_eq!(t.get(new, Need::NOTHING), Ok((&2, READ)));
     }
 
+    /// Past 2^16 generations, where 32-bit handles retired a slot (E1's reason), the slot is
+    /// still in use, and no value repeats.
     #[test]
-    fn a_slot_is_retired_before_its_generation_can_repeat() {
+    fn a_slot_outlives_the_old_limit_of_2_16_generations() {
         let mut t = HandleTable::new(4);
         let mut seen = std::collections::HashSet::new();
-        // Every generation of the one slot, and a few more: none may repeat a value.
-        for i in 0..0x1_0010u32 {
+        let first = t.insert(0, READ).unwrap();
+        t.remove(first, Need::NOTHING).unwrap();
+        for i in 1..0x1_0010u32 {
             let h = t.insert(i, READ).unwrap();
+            assert_eq!(
+                h >> GENERATION_BITS,
+                first >> GENERATION_BITS,
+                "use {i} took another slot: the first was retired"
+            );
             assert!(seen.insert(h), "handle {h:#x} issued twice");
             assert_eq!(t.remove(h, Need::NOTHING), Ok((i, READ)));
             assert_eq!(t.get(h, Need::NOTHING), Err(Error::BadHandle));
+            assert_eq!(t.get(first, Need::NOTHING), Err(Error::BadHandle));
         }
         assert_eq!(t.len(), 0);
-        assert!(t.insert(1, READ).is_ok(), "the table keeps working");
+        assert_eq!(t.slots.len(), 1, "one slot served every use");
+    }
+
+    /// A slot whose generations are used up is retired, never reused, so no value can come
+    /// back (H2). Driving one slot through 2^40 generations takes too long for a test, so the
+    /// slot is set at its last generation and driven past it.
+    #[test]
+    fn a_slot_is_retired_when_its_generations_are_used_up() {
+        let mut t = HandleTable::new(4);
+        let h = t.insert(1u32, READ).unwrap();
+        t.remove(h, Need::NOTHING).unwrap();
+        t.slots[0].generation = LAST_GENERATION - 1;
+        let before_last = t.insert(2, READ).unwrap();
+        assert_eq!(split(before_last), Some((0, LAST_GENERATION - 1)));
+        t.remove(before_last, Need::NOTHING).unwrap();
+        let last = t.insert(3, READ).unwrap();
+        assert_eq!(
+            split(last),
+            Some((0, LAST_GENERATION)),
+            "the slot's last use"
+        );
+        t.remove(last, Need::NOTHING).unwrap();
+        // The slot is retired: the next handle takes a new one, and neither old value works.
+        let next = t.insert(4, READ).unwrap();
+        assert_eq!(split(next), Some((1, 1)));
+        for stale in [h, before_last, last] {
+            assert_eq!(t.get(stale, Need::NOTHING), Err(Error::BadHandle));
+        }
+        assert_eq!(t.free.len(), 0, "a retired slot is never on the free list");
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn an_emptied_table_gives_each_handle_s_object_once() {
+        let mut t = HandleTable::new(8);
+        let closed = t.insert(1u32, READ).unwrap();
+        let kept = t.insert(2, READ | DUPLICATE).unwrap();
+        t.insert(3, READ).unwrap();
+        t.remove(closed, Need::NOTHING).unwrap();
+        // The duplicate takes the freed slot, which then holds it and not the closed object.
+        dup(&mut t, kept, READ).unwrap();
+        t.insert(4, READ).unwrap();
+        let mut objects: Vec<u32> = t.into_objects().collect();
+        objects.sort_unstable();
+        assert_eq!(objects, vec![2, 2, 3, 4], "a duplicate is one more handle");
+        assert_eq!(HandleTable::<u32>::new(4).into_objects().count(), 0);
     }
 
     #[test]
@@ -443,7 +577,7 @@ mod tests {
         );
         assert_eq!(t.take_all(&[a, b, a], r(TRANSFER)), Err(Error::InvalidArgs));
         assert_eq!(
-            t.take_all(&[a, 0x7777_0009], r(TRANSFER)),
+            t.take_all(&[a, 0x7777_0009_0000_0001], r(TRANSFER)),
             Err(Error::BadHandle)
         );
         assert_eq!(t.check_all(&[a, a], r(TRANSFER)), Err(Error::InvalidArgs));

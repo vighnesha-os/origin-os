@@ -38,6 +38,24 @@ pub mod number {
     pub const EVENT_CREATE: u64 = 9;
     /// `object_signal`.
     pub const OBJECT_SIGNAL: u64 = 10;
+    /// `memory_object_create`.
+    pub const MEMORY_OBJECT_CREATE: u64 = 11;
+    /// `memory_map`.
+    pub const MEMORY_MAP: u64 = 12;
+    /// `memory_unmap`.
+    pub const MEMORY_UNMAP: u64 = 13;
+    /// `memory_protect`.
+    pub const MEMORY_PROTECT: u64 = 14;
+    /// `port_create`.
+    pub const PORT_CREATE: u64 = 15;
+    /// `object_wait_async`.
+    pub const OBJECT_WAIT_ASYNC: u64 = 16;
+    /// `port_wait`.
+    pub const PORT_WAIT: u64 = 17;
+    /// `port_cancel`.
+    pub const PORT_CANCEL: u64 = 18;
+    /// `clock_read`.
+    pub const CLOCK_READ: u64 = 19;
 }
 
 /// One entry of the call table.
@@ -54,7 +72,7 @@ pub struct CallInfo {
 }
 
 /// Every call, in number order.
-pub const CALLS: [CallInfo; 11] = [
+pub const CALLS: [CallInfo; 20] = [
     CallInfo { number: 0, name: "thread_exit", registers: 1, reserved: false },
     CallInfo { number: 1, name: "debug_report", registers: 1, reserved: false },
     CallInfo { number: 2, name: "debug_write", registers: 2, reserved: false },
@@ -64,8 +82,17 @@ pub const CALLS: [CallInfo; 11] = [
     CallInfo { number: 6, name: "channel_write", registers: 5, reserved: false },
     CallInfo { number: 7, name: "channel_read", registers: 6, reserved: false },
     CallInfo { number: 8, name: "wait_one", registers: 4, reserved: false },
-    CallInfo { number: 9, name: "event_create", registers: 1, reserved: true },
-    CallInfo { number: 10, name: "object_signal", registers: 3, reserved: true },
+    CallInfo { number: 9, name: "event_create", registers: 1, reserved: false },
+    CallInfo { number: 10, name: "object_signal", registers: 3, reserved: false },
+    CallInfo { number: 11, name: "memory_object_create", registers: 2, reserved: false },
+    CallInfo { number: 12, name: "memory_map", registers: 4, reserved: false },
+    CallInfo { number: 13, name: "memory_unmap", registers: 3, reserved: false },
+    CallInfo { number: 14, name: "memory_protect", registers: 4, reserved: false },
+    CallInfo { number: 15, name: "port_create", registers: 1, reserved: false },
+    CallInfo { number: 16, name: "object_wait_async", registers: 4, reserved: false },
+    CallInfo { number: 17, name: "port_wait", registers: 3, reserved: false },
+    CallInfo { number: 18, name: "port_cancel", registers: 3, reserved: false },
+    CallInfo { number: 19, name: "clock_read", registers: 1, reserved: false },
 ];
 
 /// What `debug_report` can fail with.
@@ -428,15 +455,21 @@ impl rt::MethodError for WaitOneError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EventCreateError {
-    /// `NOT_SUPPORTED`.
-    NotSupported,
+    /// `FAULT`.
+    Fault,
+    /// `LIMIT`.
+    Limit,
+    /// `NO_MEMORY`.
+    NoMemory,
 }
 
 impl EventCreateError {
     /// The status this error is reported as.
     pub const fn error(self) -> Error {
         match self {
-            Self::NotSupported => Error::NotSupported,
+            Self::Fault => Error::Fault,
+            Self::Limit => Error::Limit,
+            Self::NoMemory => Error::NoMemory,
         }
     }
 }
@@ -444,7 +477,9 @@ impl EventCreateError {
 impl rt::MethodError for EventCreateError {
     fn from_status(status: i64) -> Option<Self> {
         match Error::from_raw(status)? {
-            Error::NotSupported => Some(Self::NotSupported),
+            Error::Fault => Some(Self::Fault),
+            Error::Limit => Some(Self::Limit),
+            Error::NoMemory => Some(Self::NoMemory),
             _ => None,
         }
     }
@@ -457,15 +492,24 @@ impl rt::MethodError for EventCreateError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ObjectSignalError {
-    /// `NOT_SUPPORTED`.
-    NotSupported,
+    /// `BAD_HANDLE`.
+    BadHandle,
+    /// `INVALID_ARGS`.
+    InvalidArgs,
+    /// `ACCESS_DENIED`.
+    AccessDenied,
+    /// `WRONG_TYPE`.
+    WrongType,
 }
 
 impl ObjectSignalError {
     /// The status this error is reported as.
     pub const fn error(self) -> Error {
         match self {
-            Self::NotSupported => Error::NotSupported,
+            Self::BadHandle => Error::BadHandle,
+            Self::InvalidArgs => Error::InvalidArgs,
+            Self::AccessDenied => Error::AccessDenied,
+            Self::WrongType => Error::WrongType,
         }
     }
 }
@@ -473,7 +517,415 @@ impl ObjectSignalError {
 impl rt::MethodError for ObjectSignalError {
     fn from_status(status: i64) -> Option<Self> {
         match Error::from_raw(status)? {
+            Error::BadHandle => Some(Self::BadHandle),
+            Error::InvalidArgs => Some(Self::InvalidArgs),
+            Error::AccessDenied => Some(Self::AccessDenied),
+            Error::WrongType => Some(Self::WrongType),
+            _ => None,
+        }
+    }
+    fn status(self) -> i64 {
+        self.error().raw()
+    }
+}
+
+/// What `memory_object_create` can fail with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemoryObjectCreateError {
+    /// `INVALID_ARGS`.
+    InvalidArgs,
+    /// `FAULT`.
+    Fault,
+    /// `LIMIT`.
+    Limit,
+    /// `NO_MEMORY`.
+    NoMemory,
+}
+
+impl MemoryObjectCreateError {
+    /// The status this error is reported as.
+    pub const fn error(self) -> Error {
+        match self {
+            Self::InvalidArgs => Error::InvalidArgs,
+            Self::Fault => Error::Fault,
+            Self::Limit => Error::Limit,
+            Self::NoMemory => Error::NoMemory,
+        }
+    }
+}
+
+impl rt::MethodError for MemoryObjectCreateError {
+    fn from_status(status: i64) -> Option<Self> {
+        match Error::from_raw(status)? {
+            Error::InvalidArgs => Some(Self::InvalidArgs),
+            Error::Fault => Some(Self::Fault),
+            Error::Limit => Some(Self::Limit),
+            Error::NoMemory => Some(Self::NoMemory),
+            _ => None,
+        }
+    }
+    fn status(self) -> i64 {
+        self.error().raw()
+    }
+}
+
+/// What `memory_map` can fail with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemoryMapError {
+    /// `BAD_HANDLE`.
+    BadHandle,
+    /// `WRONG_TYPE`.
+    WrongType,
+    /// `ACCESS_DENIED`.
+    AccessDenied,
+    /// `INVALID_ARGS`.
+    InvalidArgs,
+    /// `FAULT`.
+    Fault,
+    /// `LIMIT`.
+    Limit,
+    /// `NO_MEMORY`.
+    NoMemory,
+    /// `NOT_SUPPORTED`.
+    NotSupported,
+}
+
+impl MemoryMapError {
+    /// The status this error is reported as.
+    pub const fn error(self) -> Error {
+        match self {
+            Self::BadHandle => Error::BadHandle,
+            Self::WrongType => Error::WrongType,
+            Self::AccessDenied => Error::AccessDenied,
+            Self::InvalidArgs => Error::InvalidArgs,
+            Self::Fault => Error::Fault,
+            Self::Limit => Error::Limit,
+            Self::NoMemory => Error::NoMemory,
+            Self::NotSupported => Error::NotSupported,
+        }
+    }
+}
+
+impl rt::MethodError for MemoryMapError {
+    fn from_status(status: i64) -> Option<Self> {
+        match Error::from_raw(status)? {
+            Error::BadHandle => Some(Self::BadHandle),
+            Error::WrongType => Some(Self::WrongType),
+            Error::AccessDenied => Some(Self::AccessDenied),
+            Error::InvalidArgs => Some(Self::InvalidArgs),
+            Error::Fault => Some(Self::Fault),
+            Error::Limit => Some(Self::Limit),
+            Error::NoMemory => Some(Self::NoMemory),
             Error::NotSupported => Some(Self::NotSupported),
+            _ => None,
+        }
+    }
+    fn status(self) -> i64 {
+        self.error().raw()
+    }
+}
+
+/// What `memory_unmap` can fail with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemoryUnmapError {
+    /// `BAD_HANDLE`.
+    BadHandle,
+    /// `WRONG_TYPE`.
+    WrongType,
+    /// `ACCESS_DENIED`.
+    AccessDenied,
+    /// `INVALID_ARGS`.
+    InvalidArgs,
+    /// `NO_MEMORY`.
+    NoMemory,
+    /// `SHOULD_WAIT`.
+    ShouldWait,
+    /// `TIMED_OUT`.
+    TimedOut,
+}
+
+impl MemoryUnmapError {
+    /// The status this error is reported as.
+    pub const fn error(self) -> Error {
+        match self {
+            Self::BadHandle => Error::BadHandle,
+            Self::WrongType => Error::WrongType,
+            Self::AccessDenied => Error::AccessDenied,
+            Self::InvalidArgs => Error::InvalidArgs,
+            Self::NoMemory => Error::NoMemory,
+            Self::ShouldWait => Error::ShouldWait,
+            Self::TimedOut => Error::TimedOut,
+        }
+    }
+}
+
+impl rt::MethodError for MemoryUnmapError {
+    fn from_status(status: i64) -> Option<Self> {
+        match Error::from_raw(status)? {
+            Error::BadHandle => Some(Self::BadHandle),
+            Error::WrongType => Some(Self::WrongType),
+            Error::AccessDenied => Some(Self::AccessDenied),
+            Error::InvalidArgs => Some(Self::InvalidArgs),
+            Error::NoMemory => Some(Self::NoMemory),
+            Error::ShouldWait => Some(Self::ShouldWait),
+            Error::TimedOut => Some(Self::TimedOut),
+            _ => None,
+        }
+    }
+    fn status(self) -> i64 {
+        self.error().raw()
+    }
+}
+
+/// What `memory_protect` can fail with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemoryProtectError {
+    /// `BAD_HANDLE`.
+    BadHandle,
+    /// `WRONG_TYPE`.
+    WrongType,
+    /// `ACCESS_DENIED`.
+    AccessDenied,
+    /// `INVALID_ARGS`.
+    InvalidArgs,
+    /// `SHOULD_WAIT`.
+    ShouldWait,
+    /// `TIMED_OUT`.
+    TimedOut,
+}
+
+impl MemoryProtectError {
+    /// The status this error is reported as.
+    pub const fn error(self) -> Error {
+        match self {
+            Self::BadHandle => Error::BadHandle,
+            Self::WrongType => Error::WrongType,
+            Self::AccessDenied => Error::AccessDenied,
+            Self::InvalidArgs => Error::InvalidArgs,
+            Self::ShouldWait => Error::ShouldWait,
+            Self::TimedOut => Error::TimedOut,
+        }
+    }
+}
+
+impl rt::MethodError for MemoryProtectError {
+    fn from_status(status: i64) -> Option<Self> {
+        match Error::from_raw(status)? {
+            Error::BadHandle => Some(Self::BadHandle),
+            Error::WrongType => Some(Self::WrongType),
+            Error::AccessDenied => Some(Self::AccessDenied),
+            Error::InvalidArgs => Some(Self::InvalidArgs),
+            Error::ShouldWait => Some(Self::ShouldWait),
+            Error::TimedOut => Some(Self::TimedOut),
+            _ => None,
+        }
+    }
+    fn status(self) -> i64 {
+        self.error().raw()
+    }
+}
+
+/// What `port_create` can fail with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PortCreateError {
+    /// `FAULT`.
+    Fault,
+    /// `LIMIT`.
+    Limit,
+    /// `NO_MEMORY`.
+    NoMemory,
+}
+
+impl PortCreateError {
+    /// The status this error is reported as.
+    pub const fn error(self) -> Error {
+        match self {
+            Self::Fault => Error::Fault,
+            Self::Limit => Error::Limit,
+            Self::NoMemory => Error::NoMemory,
+        }
+    }
+}
+
+impl rt::MethodError for PortCreateError {
+    fn from_status(status: i64) -> Option<Self> {
+        match Error::from_raw(status)? {
+            Error::Fault => Some(Self::Fault),
+            Error::Limit => Some(Self::Limit),
+            Error::NoMemory => Some(Self::NoMemory),
+            _ => None,
+        }
+    }
+    fn status(self) -> i64 {
+        self.error().raw()
+    }
+}
+
+/// What `object_wait_async` can fail with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ObjectWaitAsyncError {
+    /// `BAD_HANDLE`.
+    BadHandle,
+    /// `WRONG_TYPE`.
+    WrongType,
+    /// `INVALID_ARGS`.
+    InvalidArgs,
+    /// `ACCESS_DENIED`.
+    AccessDenied,
+    /// `LIMIT`.
+    Limit,
+    /// `NO_MEMORY`.
+    NoMemory,
+}
+
+impl ObjectWaitAsyncError {
+    /// The status this error is reported as.
+    pub const fn error(self) -> Error {
+        match self {
+            Self::BadHandle => Error::BadHandle,
+            Self::WrongType => Error::WrongType,
+            Self::InvalidArgs => Error::InvalidArgs,
+            Self::AccessDenied => Error::AccessDenied,
+            Self::Limit => Error::Limit,
+            Self::NoMemory => Error::NoMemory,
+        }
+    }
+}
+
+impl rt::MethodError for ObjectWaitAsyncError {
+    fn from_status(status: i64) -> Option<Self> {
+        match Error::from_raw(status)? {
+            Error::BadHandle => Some(Self::BadHandle),
+            Error::WrongType => Some(Self::WrongType),
+            Error::InvalidArgs => Some(Self::InvalidArgs),
+            Error::AccessDenied => Some(Self::AccessDenied),
+            Error::Limit => Some(Self::Limit),
+            Error::NoMemory => Some(Self::NoMemory),
+            _ => None,
+        }
+    }
+    fn status(self) -> i64 {
+        self.error().raw()
+    }
+}
+
+/// What `port_wait` can fail with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PortWaitError {
+    /// `BAD_HANDLE`.
+    BadHandle,
+    /// `WRONG_TYPE`.
+    WrongType,
+    /// `ACCESS_DENIED`.
+    AccessDenied,
+    /// `FAULT`.
+    Fault,
+    /// `TIMED_OUT`.
+    TimedOut,
+    /// `CANCELED`.
+    Canceled,
+}
+
+impl PortWaitError {
+    /// The status this error is reported as.
+    pub const fn error(self) -> Error {
+        match self {
+            Self::BadHandle => Error::BadHandle,
+            Self::WrongType => Error::WrongType,
+            Self::AccessDenied => Error::AccessDenied,
+            Self::Fault => Error::Fault,
+            Self::TimedOut => Error::TimedOut,
+            Self::Canceled => Error::Canceled,
+        }
+    }
+}
+
+impl rt::MethodError for PortWaitError {
+    fn from_status(status: i64) -> Option<Self> {
+        match Error::from_raw(status)? {
+            Error::BadHandle => Some(Self::BadHandle),
+            Error::WrongType => Some(Self::WrongType),
+            Error::AccessDenied => Some(Self::AccessDenied),
+            Error::Fault => Some(Self::Fault),
+            Error::TimedOut => Some(Self::TimedOut),
+            Error::Canceled => Some(Self::Canceled),
+            _ => None,
+        }
+    }
+    fn status(self) -> i64 {
+        self.error().raw()
+    }
+}
+
+/// What `port_cancel` can fail with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PortCancelError {
+    /// `BAD_HANDLE`.
+    BadHandle,
+    /// `WRONG_TYPE`.
+    WrongType,
+    /// `ACCESS_DENIED`.
+    AccessDenied,
+    /// `NOT_FOUND`.
+    NotFound,
+}
+
+impl PortCancelError {
+    /// The status this error is reported as.
+    pub const fn error(self) -> Error {
+        match self {
+            Self::BadHandle => Error::BadHandle,
+            Self::WrongType => Error::WrongType,
+            Self::AccessDenied => Error::AccessDenied,
+            Self::NotFound => Error::NotFound,
+        }
+    }
+}
+
+impl rt::MethodError for PortCancelError {
+    fn from_status(status: i64) -> Option<Self> {
+        match Error::from_raw(status)? {
+            Error::BadHandle => Some(Self::BadHandle),
+            Error::WrongType => Some(Self::WrongType),
+            Error::AccessDenied => Some(Self::AccessDenied),
+            Error::NotFound => Some(Self::NotFound),
+            _ => None,
+        }
+    }
+    fn status(self) -> i64 {
+        self.error().raw()
+    }
+}
+
+/// What `clock_read` can fail with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClockReadError {
+    /// `FAULT`.
+    Fault,
+}
+
+impl ClockReadError {
+    /// The status this error is reported as.
+    pub const fn error(self) -> Error {
+        match self {
+            Self::Fault => Error::Fault,
+        }
+    }
+}
+
+impl rt::MethodError for ClockReadError {
+    fn from_status(status: i64) -> Option<Self> {
+        match Error::from_raw(status)? {
+            Error::Fault => Some(Self::Fault),
             _ => None,
         }
     }
@@ -515,6 +967,67 @@ pub trait Calls {
     /// Blocks until a signal is raised on the object, the deadline passes, or the handle is
     /// closed (ADR-0005 P9).
     fn wait_one(&self, handle: rt::HandleArg, signals: Signals, deadline: u64, observed: rt::UserRef<Signals>) -> Result<(), WaitOneError>;
+    /// Creates an event with no signal raised, charged to the caller's quota of events, and
+    /// returns a handle to it with event_rights (ADR-0005 C10; Amendment 7, F7, F17). limit:
+    /// past the caller's quota of events, or its handle table is full.
+    fn event_create(&self, event: rt::UserRef<rt::Handle>) -> Result<(), EventCreateError>;
+    /// Changes an event's user signal: clears clear, then sets set, as one step, so a signal in
+    /// both ends set; there is no pulse (ADR-0005 C10; Amendment 7, F5). Two empty masks change
+    /// nothing. wrong_type: not an event. invalid_args: a signal other than signaled in either
+    /// mask.
+    fn object_signal(&self, object: rt::HandleArg, clear: Signals, set: Signals) -> Result<(), ObjectSignalError>;
+    /// Makes a memory object of zeroed frames, committed in full and charged to the caller's
+    /// account, and returns a handle to it with memory_object_rights (ADR-0005 C6, C7, D1).
+    /// limit: past the caller's memory quota (D4), or its handle table is full.
+    fn memory_object_create(&self, request: rt::UserRef<ObjectRequest>, object: rt::UserRef<rt::Handle>) -> Result<(), MemoryObjectCreateError>;
+    /// Maps part of a memory object into a process and returns where (ADR-0005 P7, C7, C8, D2,
+    /// D5).
+    /// The mapping holds the object: closing a handle never unmaps. access_denied: the
+    /// object's handle lacks read, or write for a writable mapping, or execute was asked.
+    /// invalid_args: a malformed request, or a fixed address any page of which is mapped.
+    /// limit: past the process's mappings, or its page tables are full, or eight places
+    /// drawn at random in a row were all taken. not_supported: the kernel's random-number
+    /// generator gave no number to place it at random (ADR-0016).
+    fn memory_map(&self, process: rt::HandleArg, object: rt::HandleArg, request: rt::UserRef<MapRequest>, address: rt::UserRef<u64>) -> Result<(), MemoryMapError>;
+    /// Removes one whole mapping (ADR-0005 P7, C7, D3). When it returns, no processor reaches its
+    /// pages through this process. invalid_args: address and length are not exactly one
+    /// mapping. should_wait: the process's budget of shootdowns cannot pay for it now, or
+    /// another call is making or changing the mapping at this moment; either way nothing
+    /// changed. timed_out: a processor did not answer the shootdown; the mapping is gone, and
+    /// its frames are kept from reuse for good. no_memory: only after such a stall, when the
+    /// kernel heap cannot replace the bookkeeping it leaked (D5).
+    fn memory_unmap(&self, process: rt::HandleArg, address: u64, length: u64) -> Result<(), MemoryUnmapError>;
+    /// Reduces what one whole mapping allows (ADR-0005 P7, C7, D3). When it returns, no processor
+    /// uses the old access. access_denied: the new access is not within the old one.
+    /// invalid_args, should_wait and timed_out as for memory_unmap.
+    fn memory_protect(&self, process: rt::HandleArg, address: u64, length: u64, access: MapAccess) -> Result<(), MemoryProtectError>;
+    /// Creates a port, charged to the caller's quota of ports, and returns a handle to it with
+    /// port_rights (ADR-0005 C9; Amendment 7, F7, F17). limit: past the caller's quota of ports,
+    /// or its handle table is full.
+    fn port_create(&self, port: rt::UserRef<rt::Handle>) -> Result<(), PortCreateError>;
+    /// Binds signals of an object to a port: once one of them is raised, one signal packet with
+    /// key is queued in the port (ADR-0005 C9; Amendment 7, F2, F9, F13, F18). A signal already
+    /// raised queues it before the call returns. The binding is charged to the caller's quota of
+    /// bindings until its packet has left the port. Closing or moving the handle it is made
+    /// through, or the caller's end, cancels it and queues a canceled packet instead (F11, F16).
+    /// bad_handle: also an object that raises no signals, or either handle closed during the
+    /// call, after which nothing stays bound. limit: past the caller's quota of bindings.
+    fn object_wait_async(&self, port: rt::HandleArg, object: rt::HandleArg, key: u64, signals: Signals) -> Result<(), ObjectWaitAsyncError>;
+    /// Takes the oldest packet queued in a port, waiting until the deadline (ADR-0005 C9;
+    /// Amendment 7, F3, F15). timed_out: nothing was queued by then. canceled: the handle waited
+    /// through was closed or moved during the wait, even if a duplicate keeps the port open; such
+    /// a wait takes no packet. A packet is taken when it is read: if writing it faults, the
+    /// answer is fault and the packet is gone.
+    fn port_wait(&self, port: rt::HandleArg, deadline: u64, packet: rt::UserRef<PortPacket>) -> Result<(), PortWaitError>;
+    /// Removes every binding armed for a port on an object with a key, and every packet from
+    /// such a binding queued in the port, of either kind, silently (ADR-0005 C9; Amendment 7,
+    /// F4). It needs no right on the object: whoever holds the port's write controls its
+    /// bindings. not_found: nothing matched.
+    fn port_cancel(&self, port: rt::HandleArg, object: rt::HandleArg, key: u64) -> Result<(), PortCancelError>;
+    /// Reads the monotonic clock: nanoseconds since the kernel started, never less than a value
+    /// it gave before on any processor (ADR-0005 C13; Amendment 7, F10; ADR-0012). What it does
+    /// across a suspend is not decided.
+    fn clock_read(&self, nanos: rt::UserRef<u64>) -> Result<(), ClockReadError>;
 }
 
 /// Decodes and runs one system call: the number and its six arguments.
@@ -533,8 +1046,17 @@ pub fn dispatch<C: Calls + ?Sized>(oidl_calls: &C, oidl_number: u64, oidl_args: 
         number::CHANNEL_WRITE => match call_channel_write(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
         number::CHANNEL_READ => match call_channel_read(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
         number::WAIT_ONE => match call_wait_one(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
-        number::EVENT_CREATE => Error::NotSupported.raw(),
-        number::OBJECT_SIGNAL => Error::NotSupported.raw(),
+        number::EVENT_CREATE => match call_event_create(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
+        number::OBJECT_SIGNAL => match call_object_signal(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
+        number::MEMORY_OBJECT_CREATE => match call_memory_object_create(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
+        number::MEMORY_MAP => match call_memory_map(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
+        number::MEMORY_UNMAP => match call_memory_unmap(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
+        number::MEMORY_PROTECT => match call_memory_protect(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
+        number::PORT_CREATE => match call_port_create(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
+        number::OBJECT_WAIT_ASYNC => match call_object_wait_async(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
+        number::PORT_WAIT => match call_port_wait(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
+        number::PORT_CANCEL => match call_port_cancel(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
+        number::CLOCK_READ => match call_clock_read(oidl_calls, oidl_args) { Ok(()) => 0, Err(oidl_e) => oidl_e.error().raw() },
         _ => Error::NotSupported.raw(),
     };
     Outcome::Status(oidl_status)
@@ -560,13 +1082,13 @@ fn call_debug_write<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> R
 
 fn call_handle_close<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), HandleCloseError> {
     let [oidl_a0, _, _, _, _, _] = oidl_args;
-    let handle = rt::HandleArg::from_reg(oidl_a0, 0x0, 0).ok_or(HandleCloseError::BadHandle)?;
+    let handle = rt::HandleArg::from_reg(oidl_a0, 0x0, 0);
     oidl_calls.handle_close(handle)
 }
 
 fn call_handle_duplicate<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), HandleDuplicateError> {
     let [oidl_a0, oidl_a1, oidl_a2, _, _, _] = oidl_args;
-    let handle = rt::HandleArg::from_reg(oidl_a0, 0x10, 0).ok_or(HandleDuplicateError::BadHandle)?;
+    let handle = rt::HandleArg::from_reg(oidl_a0, 0x10, 0);
     let rights = u32::try_from(oidl_a1).ok().and_then(Rights::from_bits).ok_or(HandleDuplicateError::InvalidArgs)?;
     let new_handle = rt::UserRef::new(oidl_a2);
     oidl_calls.handle_duplicate(handle, rights, new_handle)
@@ -580,7 +1102,7 @@ fn call_channel_create<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -
 
 fn call_channel_write<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), ChannelWriteError> {
     let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, oidl_a4, _] = oidl_args;
-    let end = rt::HandleArg::from_reg(oidl_a0, 0x2, 4).ok_or(ChannelWriteError::BadHandle)?;
+    let end = rt::HandleArg::from_reg(oidl_a0, 0x2, 4);
     let bytes = rt::UserSlice::<u8>::new(oidl_a1, oidl_a2, 65536).ok_or(ChannelWriteError::InvalidArgs)?;
     let handles = rt::UserSlice::<rt::Handle>::new(oidl_a3, oidl_a4, 64).map(|slice| rt::HandleSlice { slice, need_rights: 0x20, need_object: 0 }).ok_or(ChannelWriteError::InvalidArgs)?;
     oidl_calls.channel_write(end, bytes, handles)
@@ -588,7 +1110,7 @@ fn call_channel_write<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) ->
 
 fn call_channel_read<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), ChannelReadError> {
     let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, oidl_a4, oidl_a5] = oidl_args;
-    let end = rt::HandleArg::from_reg(oidl_a0, 0x1, 4).ok_or(ChannelReadError::BadHandle)?;
+    let end = rt::HandleArg::from_reg(oidl_a0, 0x1, 4);
     let bytes = rt::UserBuffer::<u8>::new(oidl_a1, oidl_a2, 65536);
     let handles = rt::UserBuffer::<ReceivedHandle>::new(oidl_a3, oidl_a4, 64);
     let sizes = rt::UserRef::new(oidl_a5);
@@ -597,7 +1119,7 @@ fn call_channel_read<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> 
 
 fn call_wait_one<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), WaitOneError> {
     let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, _, _] = oidl_args;
-    let handle = rt::HandleArg::from_reg(oidl_a0, 0x40, 0).ok_or(WaitOneError::BadHandle)?;
+    let handle = rt::HandleArg::from_reg(oidl_a0, 0x40, 0);
     let signals = u32::try_from(oidl_a1).ok().and_then(Signals::from_bits).ok_or(WaitOneError::InvalidArgs)?;
     if signals.bits() == 0 {
         return Err(WaitOneError::InvalidArgs);
@@ -605,5 +1127,95 @@ fn call_wait_one<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Resu
     let deadline: u64 = oidl_a2;
     let observed = rt::UserRef::new(oidl_a3);
     oidl_calls.wait_one(handle, signals, deadline, observed)
+}
+
+fn call_event_create<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), EventCreateError> {
+    let [oidl_a0, _, _, _, _, _] = oidl_args;
+    let event = rt::UserRef::new(oidl_a0);
+    oidl_calls.event_create(event)
+}
+
+fn call_object_signal<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), ObjectSignalError> {
+    let [oidl_a0, oidl_a1, oidl_a2, _, _, _] = oidl_args;
+    let object = rt::HandleArg::from_reg(oidl_a0, 0x80, 0);
+    let clear = u32::try_from(oidl_a1).ok().and_then(Signals::from_bits).ok_or(ObjectSignalError::InvalidArgs)?;
+    let set = u32::try_from(oidl_a2).ok().and_then(Signals::from_bits).ok_or(ObjectSignalError::InvalidArgs)?;
+    oidl_calls.object_signal(object, clear, set)
+}
+
+fn call_memory_object_create<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), MemoryObjectCreateError> {
+    let [oidl_a0, oidl_a1, _, _, _, _] = oidl_args;
+    let request = rt::UserRef::<ObjectRequest>::new(oidl_a0);
+    let object = rt::UserRef::new(oidl_a1);
+    oidl_calls.memory_object_create(request, object)
+}
+
+fn call_memory_map<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), MemoryMapError> {
+    let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, _, _] = oidl_args;
+    let process = rt::HandleArg::from_reg(oidl_a0, 0x2, 1);
+    let object = rt::HandleArg::from_reg(oidl_a1, 0x4, 3);
+    let request = rt::UserRef::<MapRequest>::new(oidl_a2);
+    let address = rt::UserRef::new(oidl_a3);
+    oidl_calls.memory_map(process, object, request, address)
+}
+
+fn call_memory_unmap<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), MemoryUnmapError> {
+    let [oidl_a0, oidl_a1, oidl_a2, _, _, _] = oidl_args;
+    let process = rt::HandleArg::from_reg(oidl_a0, 0x2, 1);
+    let address: u64 = oidl_a1;
+    let length: u64 = oidl_a2;
+    oidl_calls.memory_unmap(process, address, length)
+}
+
+fn call_memory_protect<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), MemoryProtectError> {
+    let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, _, _] = oidl_args;
+    let process = rt::HandleArg::from_reg(oidl_a0, 0x2, 1);
+    let address: u64 = oidl_a1;
+    let length: u64 = oidl_a2;
+    let access = u32::try_from(oidl_a3).ok().and_then(MapAccess::from_bits).ok_or(MemoryProtectError::InvalidArgs)?;
+    if access.bits() == 0 {
+        return Err(MemoryProtectError::InvalidArgs);
+    }
+    oidl_calls.memory_protect(process, address, length, access)
+}
+
+fn call_port_create<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), PortCreateError> {
+    let [oidl_a0, _, _, _, _, _] = oidl_args;
+    let port = rt::UserRef::new(oidl_a0);
+    oidl_calls.port_create(port)
+}
+
+fn call_object_wait_async<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), ObjectWaitAsyncError> {
+    let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, _, _] = oidl_args;
+    let port = rt::HandleArg::from_reg(oidl_a0, 0x2, 6);
+    let object = rt::HandleArg::from_reg(oidl_a1, 0x40, 0);
+    let key: u64 = oidl_a2;
+    let signals = u32::try_from(oidl_a3).ok().and_then(Signals::from_bits).ok_or(ObjectWaitAsyncError::InvalidArgs)?;
+    if signals.bits() == 0 {
+        return Err(ObjectWaitAsyncError::InvalidArgs);
+    }
+    oidl_calls.object_wait_async(port, object, key, signals)
+}
+
+fn call_port_wait<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), PortWaitError> {
+    let [oidl_a0, oidl_a1, oidl_a2, _, _, _] = oidl_args;
+    let port = rt::HandleArg::from_reg(oidl_a0, 0x1, 6);
+    let deadline: u64 = oidl_a1;
+    let packet = rt::UserRef::new(oidl_a2);
+    oidl_calls.port_wait(port, deadline, packet)
+}
+
+fn call_port_cancel<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), PortCancelError> {
+    let [oidl_a0, oidl_a1, oidl_a2, _, _, _] = oidl_args;
+    let port = rt::HandleArg::from_reg(oidl_a0, 0x2, 6);
+    let object = rt::HandleArg::from_reg(oidl_a1, 0x0, 0);
+    let key: u64 = oidl_a2;
+    oidl_calls.port_cancel(port, object, key)
+}
+
+fn call_clock_read<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), ClockReadError> {
+    let [oidl_a0, _, _, _, _, _] = oidl_args;
+    let nanos = rt::UserRef::new(oidl_a0);
+    oidl_calls.clock_read(nanos)
 }
 

@@ -159,10 +159,26 @@ pub(crate) fn unready_switches() -> u64 {
 /// that it has none.
 static ZOMBIES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
+/// Exited threads that await [`reap`] on any processor: for a proof that needs every stack
+/// given back before it counts them (`stacks`).
+pub(crate) fn zombies() -> u64 {
+    ZOMBIES.iter().map(|z| z.load(Ordering::Acquire)).sum()
+}
+
 /// Frees the stacks of threads that exited on **this** processor. Only this processor may
 /// do it, and only from thread context: by then its exit handler, which ran on the dead
 /// stack, has certainly switched away. Returns how many stacks were freed.
+///
+/// Then it gives back what retired stacks hold (`stack::reclaim`): here, with no lock held, as
+/// the shootdown that must come first waits for every processor (ADR-0004 Amendment 1, A2).
 pub(crate) fn reap() -> usize {
+    let freed = reap_zombies();
+    origin_frame::stack::reclaim();
+    freed
+}
+
+/// [`reap`]'s own processor's exited threads.
+fn reap_zombies() -> usize {
     let Some(threads) = THREADS.get(this_cpu()) else {
         return 0;
     };
@@ -990,6 +1006,8 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         init_cpu_fpu(id);
     }
     let heap_before = crate::memory::stats().map(|(h, _)| h.bytes_in_use);
+    // The stacks the processors hold for good: their own and their interrupt stacks.
+    let stacks_before = origin_frame::stack::counts().live;
     RUNNING_STEP.store(
         (tsc_hz / 1_000_000).max(1) * RUNNING_STEP_MICROS,
         Ordering::Relaxed,
@@ -1021,20 +1039,36 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     }
     crate::tlb::mark_online();
     timer::start_periodic(&lapic);
-    // The first thread's guard page must be unmapped.
+    // The first thread's guard page must be unmapped. It is in the kernel stacks' region, so
+    // these lines name neither it nor anything else there (ADR-0004 Amendment 2, A6.3).
     let guard = FIRST_GUARD.load(Ordering::Relaxed);
     match cpu::probe_read(guard) {
         cpu::Probe::Faulted { error: 0, address } if address == guard => {
             let _ = writeln!(
                 com1,
-                "origin-kernel: page protection: stack guard page at {guard:#x} faulted (#PF error 0x0)"
+                "origin-kernel: page protection: the first thread's stack guard page faulted (#PF error 0x0)"
             );
         }
         other => {
-            let _ = writeln!(
-                com1,
-                "origin-kernel: page protection violated: stack guard page at {guard:#x}: {other:?}"
-            );
+            let _ = match other {
+                cpu::Probe::Faulted { error, address } => writeln!(
+                    com1,
+                    "origin-kernel: page protection violated: the first thread's stack guard page faulted with #PF error {error:#x}{}",
+                    if address == guard {
+                        ""
+                    } else {
+                        ", at another address"
+                    }
+                ),
+                cpu::Probe::Completed => writeln!(
+                    com1,
+                    "origin-kernel: page protection violated: the first thread's stack guard page was read"
+                ),
+                cpu::Probe::Refused => writeln!(
+                    com1,
+                    "origin-kernel: page protection violated: the first thread's stack guard page is in a device window"
+                ),
+            };
             proofs.record(Proof::Preemption, false);
             return;
         }
@@ -1131,26 +1165,65 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         Proof::Identity,
         crate::ipc_proof::prove_identity(com1, cpus, bsp, tsc_hz),
     );
+    // The first three launch processes, and a start record goes at a random address (ADR-0005
+    // C4), as does a carried program (task S4-1); the fourth maps memory objects at addresses
+    // the kernel chooses at random (ADR-0005 D5). With no random-number generator, or with one
+    // whose proof failed, randomness is withheld: nothing is launched and no such place can be
+    // chosen, so none of the four can run. They are left out of the tally, which the verdict
+    // counts as "did not run" (ADR-0016 R8; ADR-0013 R2 and R6).
+    if origin_frame::random::available() {
+        proofs.record(
+            Proof::Launch,
+            crate::ipc_proof::prove_launch(com1, cpus, bsp, tsc_hz),
+        );
+        proofs.record(
+            Proof::RustProgram,
+            crate::program_proof::prove(com1, cpus, bsp, tsc_hz),
+        );
+        proofs.record(
+            Proof::Directory,
+            crate::ipc_proof::prove_directory(com1, cpus, bsp, tsc_hz),
+        );
+        proofs.record(
+            Proof::Memory,
+            crate::ipc_proof::prove_memory(com1, cpus, bsp, tsc_hz),
+        );
+    } else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, Rust-program, service-directory and memory-object proofs did not run"
+        );
+    }
+    // Events and ports, and the clock as ring 3 reads it (task S3-6), need no generator: their
+    // processes are built by the kernel at fixed addresses, and nothing is placed at random.
     proofs.record(
-        Proof::Launch,
-        crate::ipc_proof::prove_launch(com1, cpus, bsp, tsc_hz),
+        Proof::EventsPorts,
+        crate::ipc_proof::prove_events_ports(com1, cpus, bsp, tsc_hz),
     );
     proofs.record(
-        Proof::Directory,
-        crate::ipc_proof::prove_directory(com1, cpus, bsp, tsc_hz),
+        Proof::UserClock,
+        crate::ipc_proof::prove_user_clock(com1, bsp, tsc_hz),
     );
+    // The kernel stacks' region needs no generator: its base is the loader's value or the
+    // fixed one, and the proof says which.
+    proofs.record(Proof::Stacks, crate::stacks::prove(com1, cpus, bsp, tsc_hz));
     // Every thread has exited: once each processor has reaped its own, the heap is back
-    // exactly where it was before the first spawn.
-    let back = || crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before;
+    // exactly where it was before the first spawn, and so are the stacks held.
+    let stacks = || origin_frame::stack::counts().live;
+    let back = || {
+        crate::memory::stats().map(|(h, _)| h.bytes_in_use) == heap_before
+            && stacks() == stacks_before
+    };
     yield_until(back, tsc_hz, 2);
     let reaped = back();
     let now = crate::memory::stats().map_or(0, |(h, _)| h.bytes_in_use);
     proofs.record(Proof::ThreadsReaped, reaped);
     let _ = writeln!(
         com1,
-        "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap {} KiB, {} KiB before the first spawn{}",
+        "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap {} KiB, {} KiB before the first spawn; {} stacks held, {stacks_before} before the first spawn{}",
         now >> 10,
         heap_before.unwrap_or(0) >> 10,
+        stacks(),
         if reaped { "" } else { ": scheduler failed" }
     );
 }

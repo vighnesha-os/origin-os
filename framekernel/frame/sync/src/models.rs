@@ -1,4 +1,5 @@
-//! Loom models of [`SpinLock`], [`RwLock`] and the kernel's wait-queue protocol (CLAUDE.md §73).
+//! Loom models of [`SpinLock`], [`RwLock`], the kernel's wait-queue protocol and the other
+//! protocols of this crate (CLAUDE.md §73).
 //!
 //! Built only by `cargo xtask loom`, with `--cfg loom`, for this crate's tests, in a scratch
 //! workspace that alone has Loom as a dependency (`developer-tools/xtask/src/loom.rs`). That tool
@@ -18,6 +19,13 @@
 //! too. What stands in for the machine there is `TlbCpu`: a boolean for what its TLB holds, a
 //! relaxed load for a page walk, `Notify` for the interrupt, and a clock that ticks once each
 //! time it is read, so that an initiator gives up after `PATIENCE` polls.
+//!
+//! The ports' protocol (`ports.rs`, task S3-6a, which the kernel will instantiate for its events
+//! and ports) is real too, over the same scheduler as the wait queue's models. What stands in for
+//! the kernel there is `Raiser`: an object's signals in an atomic, the handle a binding was made
+//! through as a flag that `still_open` reads, and the order every raiser keeps (the state first,
+//! then the delivery). A binding's account is an atomic count, charged before each reservation
+//! and refunded as each storage comes back.
 //!
 //! Copies, written by hand here, standing in for kernel code; nothing compares them with it:
 //!
@@ -83,6 +91,40 @@
 //!   when the page left the tables happens before the frame is released (Loom's cell reports any
 //!   pair that is not ordered), and an unmap that shoots down releases exactly once, also for a
 //!   frame mapped in two spaces and unmapped from each by a different processor (`RefCount`).
+//! - The slots of a region (`slots.rs`, which `origin_frame::stack` instantiates for the kernel
+//!   stacks): a slot given back and reclaimed is taken again only once its shootdown has
+//!   completed, so its next holder finds no processor still holding the old translation, and
+//!   what it held is released only after every access through such a translation.
+//! - A change to a space made in rounds (`Confirmation::change`, which `origin_frame::userspace`
+//!   runs for an unmap and a protect), with an initiator that gives up after `IMPATIENCE` polls,
+//!   so that its shootdowns do stall in some executions. However they go, the change ends with
+//!   every page it names out of the tables, whether a round's shootdown stalls (S3-5b's review,
+//!   finding A, case b) or the flush that should make an earlier stall good does (case a). The
+//!   frame is released only if a completed shootdown covered it after its round, its own or a
+//!   flush of the whole space, as the model's own record of the shootdowns says, and then once,
+//!   after every access through the old translation. A change that succeeds leaves the space
+//!   confirmed; one that returns a stall leaves it unconfirmed.
+//! - Ports, each with one binding raced against one other operation:
+//!   - A signal raised against a bind queues exactly one packet, whichever comes first.
+//!   - When an explicit cancel returns, no packet from its binding is queued, none arrives later,
+//!     and the cancel holds the binding's storage.
+//!   - A raise against the close of the binding's handle makes exactly one packet, `signal` or
+//!     `canceled`, and when the implicit cancel returns the binding is armed no more.
+//!   - When a port's close returns, nothing is queued in it and nothing is armed for it. The
+//!     close holds the storage of a binding armed before it, whether a raise fired it first or
+//!     not. A bind raced against the close is refused, or the close takes what it bound, whether
+//!     the bind would queue its packet at once or arm (two models).
+//!   - Two raisers make one packet, also when the first holds the source's lock having read the
+//!     signals before the second raised its own.
+//!   - A bind against the close of its own handle is refused, or is followed by a `canceled`
+//!     packet: never a binding armed whose handle is gone.
+//!   - A thread waiting for a packet gets one delivered from another processor, and a close ends
+//!     a wait `canceled`: a lost wake-up leaves the waiter blocked, which Loom reports as a
+//!     deadlock.
+//!   - Two reservations racing for a port's last free slot both bind: each keeps room in the
+//!     port's index, so no bind finds it full.
+//!   - In every one, each binding's storage comes back exactly once: an account charged at each
+//!     reservation ends at zero, and never goes below it.
 //!
 //! # What is not proved
 //!
@@ -116,12 +158,21 @@
 //!   after `PATIENCE` polls and the model fails with `NO_ANSWER`, which is how a bug that stops
 //!   an answer shows (the control `shootdown_waiting_initiator_does_not_serve`). No correct
 //!   execution gets there (`PATIENCE` says why). The leak that follows a `Stalled` is tested on
-//!   the host only.
+//!   the host only, except in a change made in rounds, whose models give up after `IMPATIENCE`
+//!   polls on purpose. Those have two rounds and one processor in the space; more rounds, a
+//!   round refused, and `prepare` are tested on the host (`shootdown.rs`).
+//! - The slots of a region beyond a reclaim and a take: a slot kept with its mapping for reuse,
+//!   `abandon`, `leak`, `trim`, and a reclaim whose shootdown stalls are tested on the host only
+//!   (`slots.rs`), and so is more than one slot.
 //! - `RwLock` writer starvation, which its documentation accepts; a timed waiter that finds the
 //!   queue full (the other way to reach `Step::Poll`, the same loop as the boot flow's); and what
 //!   callers must uphold themselves: the state changes before `wake_one`, and one condition per
 //!   queue (`waker_wakes_before_setting_the_flag` shows the first matters). A wait with a deadline
 //!   that does arrive is not shown to keep its wake-up: the timer ends it either way.
+//! - Ports beyond one binding raced against one operation: a source bound to two ports, a close
+//!   racing an explicit cancel, more than two raisers or binders, a taker that times out, a
+//!   port's index growing more than once in a model, and the kernel's own part (its handles,
+//!   quotas, exit). Those are host tests (`ports.rs`), or the kernel's, in stage 2 of S3-6.
 //!
 //! # What the models add
 //!
@@ -153,9 +204,11 @@ use loom::sync::{Arc, Notify};
 use loom::thread::{self, JoinHandle};
 
 use crate::floor::MonotonicFloor;
+use crate::ports::{self, Kind, Packet, Port, Reservation, Source, Storage, TakeError};
 use crate::refcount::RefCount;
 use crate::runqueue::RunQueue;
-use crate::shootdown::{Request, Scope, Shootdown, TlbHardware};
+use crate::shootdown::{Confirmation, Request, Rounds, Scope, Shootdown, Stalled, TlbHardware};
+use crate::slots::Slots;
 use crate::wait::{Scheduler, TimedOut, WaitQueue};
 use crate::{RwLock, SpinLock};
 
@@ -2084,4 +2137,816 @@ fn world_switch(me: &IrqCpu, to: u64) {
     me.0.world.shootdown.switch_space(me, to, || {
         me.0.world.cr3[me.0.id].store(to, Relaxed);
     });
+}
+
+// ---------------------------------------------------------------- the slots of a region
+
+/// A one-slot region whose page is [`THE_PAGE`], given back and reclaimed by one processor while
+/// another holds the page's translation and touches the frame, and a third tries to take the
+/// slot: `origin_frame::stack`'s reclaim, with `vm`'s unmap and `tlb`'s shootdown stood in for
+/// by the world's. What the slot held is released only after every access through the old
+/// translation, and the taker gets the slot only once no processor holds that translation.
+#[test]
+fn slots_reclaimed_slot_is_taken_only_after_its_shootdown() {
+    check(
+        "slots_reclaimed_slot_is_taken_only_after_its_shootdown",
+        preempted(2, SPINS),
+        preempted(3, SPINS),
+        || {
+            let world = TlbWorld::new();
+            let (near, holder, taker) =
+                (tlb_cpu(&world, 0), tlb_cpu(&world, 1), tlb_cpu(&world, 2));
+            for cpu in [&near, &holder, &taker] {
+                world.shootdown.mark_online(cpu);
+            }
+            world.tlb[1].store(true, Relaxed);
+            let slots = Arc::new(Slots::<1, 0>::new());
+            let taken = slots.take(1).expect("the slot is free");
+            // Nothing is kept for reuse (`IDLE` is 0): the slot is retired.
+            slots.give_back(taken.slot, true);
+            let frame = Arc::new(ModelFrame::new(0));
+            let holding = {
+                let (me, frame) = (holder.clone(), Arc::clone(&frame));
+                (
+                    1,
+                    thread::spawn(move || {
+                        me.touch(&frame);
+                        me.take_interrupt_then_touch(&frame);
+                        me.serve();
+                    }),
+                )
+            };
+            let taking = {
+                let (me, slots) = (taker.clone(), Arc::clone(&slots));
+                (
+                    2,
+                    thread::spawn(move || {
+                        if slots.take(1).is_some() {
+                            // Free again: no processor may still reach what was mapped there.
+                            assert!(!me.world.tlb[1].load(Relaxed), "{STALE}");
+                        }
+                        me.serve();
+                    }),
+                )
+            };
+            let outcome = slots.reclaim(
+                |_, _| {
+                    world.pte.store(0, Relaxed);
+                    Arc::clone(&frame)
+                },
+                |_, _| {
+                    world
+                        .shootdown
+                        .shoot(&near, Request::page(THE_PAGE), Scope::Kernel)
+                },
+                |frame| reuse(&frame),
+            );
+            assert!(matches!(outcome, Some(Ok(_))), "{NO_ANSWER}");
+            world.finish(vec![holding, taking]);
+        },
+    );
+}
+
+// ---------------------------------------------------------------- a change that stalls
+
+/// How many readings of its clock the initiator of a stalling change waits for its answers
+/// before it gives up: fewer than the spin bound lets it poll, so that executions in which a
+/// shootdown stalls are explored. [`PATIENCE`] keeps every other model from stalling.
+const IMPATIENCE: u64 = 2;
+
+/// A [`TlbCpu`] that gives up on a shootdown after [`IMPATIENCE`] polls.
+struct ImpatientCpu(TlbCpu);
+
+impl TlbHardware for ImpatientCpu {
+    fn this_cpu(&self) -> usize {
+        self.0.this_cpu()
+    }
+
+    fn invalidate(&self, request: Request) {
+        self.0.invalidate(request);
+    }
+
+    fn send_ipi(&self, cpu: usize) {
+        self.0.send_ipi(cpu);
+    }
+
+    fn without_interrupts<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.0.without_interrupts(f)
+    }
+
+    fn now(&self) -> u64 {
+        self.0.now()
+    }
+
+    fn patience(&self) -> u64 {
+        IMPATIENCE
+    }
+
+    fn current_root(&self) -> u64 {
+        self.0.current_root()
+    }
+}
+
+/// The page after [`THE_PAGE`]: what the second round of a stalling change takes.
+const NEXT_PAGE: u64 = THE_PAGE + crate::shootdown::PAGE;
+/// What a model says when a change returned with a page of it as it was.
+const UNFINISHED: &str = "a change that stalled left a page as it was";
+/// What a model says when a change gave back a frame that no completed shootdown covered.
+const GIVEN_BACK: &str = "a change gave back what a stalled shootdown left reachable";
+/// What a model says when a change that returned a stall left its space confirmed.
+const FORGOTTEN: &str = "a change that stalled left its space confirmed";
+
+/// A space's unmap of [`THE_PAGE`] and [`NEXT_PAGE`], one round each, as `UserSpace::unmap`
+/// makes it: each round takes its page's entry out of the tables, and the frame of
+/// [`THE_PAGE`] is kept until a completed shootdown or flush covers it, then released, or lost.
+struct TwoPages<'a> {
+    world: Arc<TlbWorld>,
+    frame: Arc<ModelFrame>,
+    /// [`NEXT_PAGE`]'s entry ([`THE_PAGE`]'s is the world's).
+    next_mapped: bool,
+    rounds: u32,
+    /// Whether the first round has taken [`THE_PAGE`] out of the tables: what the model's own
+    /// record of the shootdowns reads, apart from the code under test.
+    first_made: &'a core::cell::Cell<bool>,
+    kept: bool,
+    released: u32,
+}
+
+impl TwoPages<'_> {
+    fn give_back(&mut self) {
+        if core::mem::take(&mut self.kept) {
+            reuse(&self.frame);
+            self.released += 1;
+        }
+    }
+}
+
+impl Rounds for TwoPages<'_> {
+    type Error = Stalled;
+
+    fn prepare(&mut self) -> Result<(), Stalled> {
+        Ok(())
+    }
+
+    fn round(&mut self) -> Result<Option<Request>, Stalled> {
+        self.rounds += 1;
+        Ok(match self.rounds {
+            1 => {
+                self.world.pte.store(0, Relaxed);
+                self.first_made.set(true);
+                self.kept = true;
+                Some(Request::page(THE_PAGE))
+            }
+            2 => {
+                self.next_mapped = false;
+                Some(Request::page(NEXT_PAGE))
+            }
+            _ => None,
+        })
+    }
+
+    fn shot(&mut self) {
+        self.give_back();
+    }
+
+    fn flushed(&mut self) {
+        self.give_back();
+    }
+
+    fn lost(&mut self) {
+        self.kept = false;
+    }
+}
+
+/// Unmaps [`THE_PAGE`] and [`NEXT_PAGE`] with an impatient initiator, while a processor in the
+/// space holds [`THE_PAGE`]'s translation and touches its frame before and after the interrupt.
+/// `unconfirmed`: an earlier change's shootdown stalled, so the change starts with a flush.
+///
+/// However the shootdowns go, the change ends with both pages out of the tables, and the frame
+/// is released only if a completed shootdown covered it after its round: its own, or a flush of
+/// the whole space. Then it is released once, after every access through the old translation
+/// (Loom's cell). If the change succeeds, the space is confirmed. If it returns a stall, the
+/// space stays unconfirmed, and the frame was released only if its own round's shootdown
+/// completed before a later one stalled.
+fn stalling_change(unconfirmed: bool) {
+    let world = TlbWorld::new();
+    let (near, user) = (ImpatientCpu(tlb_cpu(&world, 0)), tlb_cpu(&world, 1));
+    world.shootdown.mark_online(&near);
+    world.shootdown.mark_online(&user);
+    user.switch_to(THE_SPACE, || ());
+    world.tlb[1].store(true, Relaxed);
+    let frame = Arc::new(ModelFrame::new(0));
+    let running = {
+        let (me, frame) = (user.clone(), Arc::clone(&frame));
+        (
+            1,
+            thread::spawn(move || {
+                me.touch(&frame);
+                // Each interrupt is served, and the user code it interrupted touches the page
+                // again. Every wake checks for the end first: when every shootdown stalled
+                // before this thread ran, their interrupts and the end's are one wake.
+                loop {
+                    me.world.kick[1].wait();
+                    if me.world.stop.load(Relaxed) {
+                        return;
+                    }
+                    me.world.shootdown.service(&me);
+                    me.touch(&frame);
+                }
+            }),
+        )
+    };
+    let confirmation = Confirmation::new();
+    if unconfirmed {
+        let _ = confirmation.record(Err(Stalled { cpu: 1 }));
+    }
+    let first_made = core::cell::Cell::new(false);
+    let mut change = TwoPages {
+        world: Arc::clone(&world),
+        frame: Arc::clone(&frame),
+        next_mapped: true,
+        rounds: 0,
+        first_made: &first_made,
+        kept: false,
+        released: 0,
+    };
+    // The model's own record: whether a shootdown that names the frame's page completed after
+    // its round took the page out of the tables.
+    let mut covered = false;
+    let outcome = confirmation.change(&mut change, |request| {
+        let done = world
+            .shootdown
+            .shoot(&near, request, Scope::Space(THE_SPACE));
+        covered |= first_made.get()
+            && done.is_ok()
+            && (request == Request::page(THE_PAGE) || request == Request::NonGlobal);
+        done
+    });
+    assert!(
+        world.pte.load(Relaxed) == 0 && !change.next_mapped,
+        "{UNFINISHED}"
+    );
+    if covered {
+        assert_eq!(change.released, 1, "the frame was not freed once");
+    } else {
+        assert_eq!(change.released, 0, "{GIVEN_BACK}");
+    }
+    if outcome.is_ok() {
+        assert!(covered, "a change succeeded with its frame not covered");
+        assert!(!user.holds(), "{STALE}");
+        assert!(
+            !confirmation.is_unconfirmed(),
+            "a confirmed change left a mark"
+        );
+    } else {
+        assert!(confirmation.is_unconfirmed(), "{FORGOTTEN}");
+    }
+    world.finish(vec![running]);
+}
+
+/// S3-5b's review, finding A, case b: the first round's shootdown may stall. The second round
+/// is still made, and the frame waits for the flush at the end.
+#[test]
+fn a_change_whose_round_stalls_is_still_made_and_frees_only_what_a_flush_covered() {
+    check(
+        "a_change_whose_round_stalls_is_still_made_and_frees_only_what_a_flush_covered",
+        preempted(2, SPINS),
+        preempted(3, SPINS),
+        || stalling_change(false),
+    );
+}
+
+/// Finding A, case a: the space is unconfirmed when the change starts, and the flush that
+/// should make that good may stall too. The change is still made, and the flush at its end
+/// decides what happens to the frame.
+#[test]
+fn a_change_whose_first_flush_stalls_is_still_made() {
+    check(
+        "a_change_whose_first_flush_stalls_is_still_made",
+        preempted(2, SPINS),
+        preempted(3, SPINS),
+        || stalling_change(true),
+    );
+}
+
+// ---------------------------------------------------------------- ports (S3-6a)
+
+/// What the port models' kernel supplies: the scheduler above, an account each binding is
+/// charged to, and Loom's `Arc` as the counted references.
+struct Ports;
+
+impl ports::Kernel for Ports {
+    type Scheduler = OnCpu;
+    type Payload = Arc<AtomicU64>;
+    type Owner = u32;
+    type PortRef = Arc<Port<Ports>>;
+    type SourceRef = Arc<Source<Ports>>;
+}
+
+/// The handle every model's binding is made through.
+const BINDER: u32 = 7;
+/// The key every model's binding gives: it must come back unchanged.
+const KEY: u64 = u64::MAX - 1;
+/// The signal the models' bindings ask for, and one they do not.
+const ASKED: u32 = 1 << 3;
+const OTHER: u32 = 1 << 2;
+
+/// What a port model reports when it finds a fault (the controls in `cargo xtask loom` look
+/// for these).
+const LOST: &str = "a signal was lost, or one binding made two packets";
+const STILL_ARMED: &str = "a binding stayed armed after its handle closed";
+const CLOSED_QUEUED: &str = "a packet was queued in a closed port";
+const CLOSED_ARMED: &str = "a binding stayed armed on a closed port";
+
+/// One object that raises signals, as the kernel's do: its state, whether the handle the
+/// binding is made through is still in the binder's table, and its source.
+struct Raiser {
+    source: Arc<Source<Ports>>,
+    signals: AtomicU32,
+    open: AtomicBool,
+}
+
+impl Raiser {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            source: Arc::new(Source::new()),
+            signals: AtomicU32::new(0),
+            open: AtomicBool::new(true),
+        })
+    }
+
+    fn signals(&self) -> u32 {
+        self.signals.load(Relaxed)
+    }
+
+    /// The state first, then the delivery, holding no lock: as every raiser in the kernel.
+    fn raise(&self, me: &OnCpu, bit: u32) {
+        self.signals.fetch_or(bit, Relaxed);
+        self.source.deliver(me, || self.signals());
+    }
+
+    /// The handle the binding was made through closes: out of the table first, then the
+    /// implicit cancel, as `handle_close` will do.
+    fn close_handle(&self, me: &OnCpu) {
+        self.open.store(false, Relaxed);
+        self.source
+            .cancel_owners(me, |owner| *owner == BINDER, || self.signals());
+    }
+
+    /// The charge, the reservation, then the bind. A refused bind is refunded here; returns
+    /// whether it bound.
+    fn bind(&self, me: &OnCpu, port: &Arc<Port<Ports>>, account: &Arc<AtomicU64>) -> bool {
+        account.fetch_add(1, Relaxed);
+        let storage = Reservation::<Ports>::try_new(me, port, Arc::clone(account)).unwrap();
+        let request = ports::Request {
+            owner: BINDER,
+            key: KEY,
+            mask: ASKED,
+        };
+        match Source::<Ports>::bind(
+            &self.source,
+            me,
+            storage,
+            request,
+            || self.open.load(Relaxed),
+            || self.signals(),
+        ) {
+            Ok(_) => true,
+            Err((_, storage)) => {
+                let account = storage.into_payload();
+                account.fetch_sub(1, Relaxed);
+                false
+            }
+        }
+    }
+}
+
+/// A binding's storage, given back to its account: once.
+fn refund(storage: Storage<Ports>) {
+    let account = storage.into_payload();
+    assert!(
+        account.fetch_sub(1, Relaxed) > 0,
+        "a binding's storage came back twice"
+    );
+}
+
+/// Every packet queued, polled by a flow that cannot block, each one's storage refunded.
+fn drain(port: &Port<Ports>, me: &OnCpu) -> Vec<Packet> {
+    let mut packets = Vec::new();
+    while let Ok((packet, storage)) = port.take(me, 0, || true) {
+        refund(storage);
+        packets.push(packet);
+    }
+    packets
+}
+
+/// The end of a port model: the port closed, what it held refunded, and every account at zero.
+fn close_and_settle(port: &Arc<Port<Ports>>, me: &OnCpu, account: &AtomicU64) {
+    for storage in port.close(me) {
+        refund(storage);
+    }
+    assert_eq!(
+        account.load(Relaxed),
+        0,
+        "a binding's storage never came back"
+    );
+}
+
+/// What every port model starts from: two processors, a port, an account, an object.
+fn ports_world() -> (Kernel, Arc<Port<Ports>>, Arc<AtomicU64>, Arc<Raiser>) {
+    (
+        Kernel::with_cpus(2),
+        Arc::new(Port::new()),
+        Arc::new(AtomicU64::new(0)),
+        Raiser::new(),
+    )
+}
+
+/// A signal raised before, during or after a bind queues exactly one packet: the bind reads the
+/// signals under the source's lock, which every delivery takes after the state changed.
+#[test]
+fn ports_bind_against_raise() {
+    check(
+        "ports_bind_against_raise",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let (world, port, account, object) = ports_world();
+            let binder = world.spawn(0, {
+                let (port, account, object) =
+                    (Arc::clone(&port), Arc::clone(&account), Arc::clone(&object));
+                move |me| {
+                    assert!(
+                        object.bind(&me, &port, &account),
+                        "a bind with its handle and its port open was refused"
+                    );
+                }
+            });
+            let raiser = world.spawn(1, {
+                let object = Arc::clone(&object);
+                move |me| object.raise(&me, ASKED)
+            });
+            binder.join().unwrap();
+            raiser.join().unwrap();
+            let me = world.boot_flow_on(0);
+            let packets = drain(&port, &me);
+            assert_eq!(packets.len(), 1, "{LOST}");
+            assert_eq!(
+                packets.first().copied(),
+                Some(Packet {
+                    key: KEY,
+                    kind: Kind::Signal,
+                    trigger: ASKED,
+                    observed: ASKED,
+                })
+            );
+            assert_eq!(object.source.armed(&me), 0, "a fired binding stayed armed");
+            close_and_settle(&port, &me, &account);
+        },
+    );
+}
+
+/// When an explicit cancel returns, no packet from its binding is queued and none arrives, and
+/// the binding's storage has come back once, whether the raise came first or not.
+#[test]
+fn ports_raise_against_an_explicit_cancel() {
+    check(
+        "ports_raise_against_an_explicit_cancel",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let (world, port, account, object) = ports_world();
+            let boot = world.boot_flow_on(0);
+            assert!(object.bind(&boot, &port, &account));
+            let raiser = world.spawn(0, {
+                let object = Arc::clone(&object);
+                move |me| object.raise(&me, ASKED)
+            });
+            let canceller = world.spawn(1, {
+                let (port, object) = (Arc::clone(&port), Arc::clone(&object));
+                move |me| {
+                    let removed = object.source.cancel(&me, &port, KEY);
+                    assert_eq!(
+                        removed.len(),
+                        1,
+                        "an explicit cancel did not take its binding back once"
+                    );
+                    for storage in removed {
+                        refund(storage);
+                    }
+                    assert_eq!(port.queued(&me), 0, "a packet from a cancelled binding");
+                }
+            });
+            raiser.join().unwrap();
+            canceller.join().unwrap();
+            assert!(
+                drain(&port, &boot).is_empty(),
+                "a packet from a cancelled binding arrived"
+            );
+            close_and_settle(&port, &boot, &account);
+        },
+    );
+}
+
+/// A raise against the close of the handle a binding was made through: exactly one packet,
+/// `signal` or `canceled`, and once the cancel has returned the binding is armed no more.
+#[test]
+fn ports_raise_against_an_implicit_cancel() {
+    check(
+        "ports_raise_against_an_implicit_cancel",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let (world, port, account, object) = ports_world();
+            let boot = world.boot_flow_on(0);
+            assert!(object.bind(&boot, &port, &account));
+            let raiser = world.spawn(0, {
+                let object = Arc::clone(&object);
+                move |me| object.raise(&me, ASKED)
+            });
+            let closer = world.spawn(1, {
+                let object = Arc::clone(&object);
+                move |me| {
+                    object.close_handle(&me);
+                    assert_eq!(object.source.armed(&me), 0, "{STILL_ARMED}");
+                }
+            });
+            raiser.join().unwrap();
+            closer.join().unwrap();
+            let packets = drain(&port, &boot);
+            assert_eq!(packets.len(), 1, "{LOST}");
+            assert!(packets.iter().all(|p| p.key == KEY && p.trigger == ASKED));
+            close_and_settle(&port, &boot, &account);
+        },
+    );
+}
+
+/// A port's close against a raise: once the close has returned, nothing is queued in the port
+/// and nothing is armed for it, and the close holds the binding's storage, whether the raise
+/// queued a packet first or not.
+#[test]
+fn ports_close_against_raise() {
+    check(
+        "ports_close_against_raise",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let (world, port, account, object) = ports_world();
+            let boot = world.boot_flow_on(0);
+            assert!(object.bind(&boot, &port, &account));
+            let raiser = world.spawn(0, {
+                let object = Arc::clone(&object);
+                move |me| object.raise(&me, ASKED)
+            });
+            let closer = world.spawn(1, {
+                let (port, object) = (Arc::clone(&port), Arc::clone(&object));
+                move |me| {
+                    let removed = port.close(&me);
+                    assert_eq!(
+                        removed.len(),
+                        1,
+                        "a close did not take back its binding's storage"
+                    );
+                    for storage in removed {
+                        refund(storage);
+                    }
+                    assert_eq!(port.queued(&me), 0, "{CLOSED_QUEUED}");
+                    assert_eq!(object.source.armed(&me), 0, "{CLOSED_ARMED}");
+                }
+            });
+            raiser.join().unwrap();
+            closer.join().unwrap();
+            assert_eq!(port.queued(&boot), 0, "{CLOSED_QUEUED}");
+            close_and_settle(&port, &boot, &account);
+        },
+    );
+}
+
+/// Two raisers, one raising a signal the binding does not ask for: one packet, whichever
+/// delivery holds the source's lock when the other comes.
+#[test]
+fn ports_two_raisers() {
+    check(
+        "ports_two_raisers",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let (world, port, account, object) = ports_world();
+            let boot = world.boot_flow_on(0);
+            assert!(object.bind(&boot, &port, &account));
+            let raisers = [(0, OTHER), (1, ASKED)].map(|(cpu, bit)| {
+                let object = Arc::clone(&object);
+                world.spawn(cpu, move |me| object.raise(&me, bit))
+            });
+            for raiser in raisers {
+                raiser.join().unwrap();
+            }
+            let packets = drain(&port, &boot);
+            assert_eq!(packets.len(), 1, "{LOST}");
+            assert!(
+                packets
+                    .iter()
+                    .all(|p| p.kind == Kind::Signal && p.observed & ASKED != 0)
+            );
+            close_and_settle(&port, &boot, &account);
+        },
+    );
+}
+
+/// A bind against the close of the handle it is made through: either the bind is refused and
+/// nothing is bound, or it is bound and a `canceled` packet follows. Never a binding armed whose
+/// handle is gone.
+#[test]
+fn ports_bind_against_a_close_of_the_bound_handle() {
+    check(
+        "ports_bind_against_a_close_of_the_bound_handle",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let (world, port, account, object) = ports_world();
+            let binder = world.spawn(0, {
+                let (port, account, object) =
+                    (Arc::clone(&port), Arc::clone(&account), Arc::clone(&object));
+                move |me| object.bind(&me, &port, &account)
+            });
+            let closer = world.spawn(1, {
+                let object = Arc::clone(&object);
+                move |me| object.close_handle(&me)
+            });
+            let bound = binder.join().unwrap();
+            closer.join().unwrap();
+            let boot = world.boot_flow_on(0);
+            assert_eq!(object.source.armed(&boot), 0, "{STILL_ARMED}");
+            let packets = drain(&port, &boot);
+            if bound {
+                assert_eq!(
+                    packets.iter().map(|p| p.kind).collect::<Vec<_>>(),
+                    [Kind::Canceled],
+                    "a binding whose handle closed sent no canceled packet"
+                );
+            } else {
+                assert!(packets.is_empty(), "a refused bind queued a packet");
+            }
+            close_and_settle(&port, &boot, &account);
+        },
+    );
+}
+
+/// A port's close against a bind: the bind is refused, or the close takes what it bound.
+/// Nothing stays queued in a closed port or armed for it, and the storage comes back once.
+fn close_against_bind(raised: bool) {
+    let (world, port, account, object) = ports_world();
+    if raised {
+        object.signals.store(ASKED, Relaxed);
+    }
+    let binder = world.spawn(0, {
+        let (port, account, object) =
+            (Arc::clone(&port), Arc::clone(&account), Arc::clone(&object));
+        move |me| object.bind(&me, &port, &account)
+    });
+    let closer = world.spawn(1, {
+        let port = Arc::clone(&port);
+        move |me| {
+            for storage in port.close(&me) {
+                refund(storage);
+            }
+        }
+    });
+    binder.join().unwrap();
+    closer.join().unwrap();
+    let boot = world.boot_flow_on(0);
+    assert_eq!(port.queued(&boot), 0, "{CLOSED_QUEUED}");
+    assert_eq!(object.source.armed(&boot), 0, "{CLOSED_ARMED}");
+    assert_eq!(
+        account.load(Relaxed),
+        0,
+        "a binding's storage never came back"
+    );
+}
+
+/// A bind whose signal is already raised, so that it queues its packet at once, against the
+/// port's close.
+#[test]
+fn ports_close_against_a_bind_that_queues() {
+    check(
+        "ports_close_against_a_bind_that_queues",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || close_against_bind(true),
+    );
+}
+
+/// A bind that arms, against the port's close.
+#[test]
+fn ports_close_against_a_bind_that_arms() {
+    check(
+        "ports_close_against_a_bind_that_arms",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || close_against_bind(false),
+    );
+}
+
+/// A thread waiting in `take` against a delivery: the waiter gets the packet. A lost wake-up
+/// leaves it blocked for ever, which Loom reports as a deadlock.
+#[test]
+fn ports_taker_against_a_delivery() {
+    check(
+        "ports_taker_against_a_delivery",
+        preempted(4, SPINS),
+        preempted(6, SPINS),
+        || {
+            let (world, port, account, object) = ports_world();
+            let boot = world.boot_flow_on(0);
+            assert!(object.bind(&boot, &port, &account));
+            let taker = world.spawn(0, {
+                let port = Arc::clone(&port);
+                move |me| {
+                    let Ok((packet, storage)) = port.take(&me, UNREACHABLE, || true) else {
+                        panic!("a wait for a packet that came gave up");
+                    };
+                    refund(storage);
+                    assert_eq!(packet.kind, Kind::Signal);
+                }
+            });
+            let raiser = world.spawn(1, {
+                let object = Arc::clone(&object);
+                move |me| object.raise(&me, ASKED)
+            });
+            taker.join().unwrap();
+            raiser.join().unwrap();
+            close_and_settle(&port, &boot, &account);
+        },
+    );
+}
+
+/// A port's close against a thread waiting on it, through the handle that closes: the waiter
+/// returns `Canceled`.
+#[test]
+fn ports_close_against_a_waiter() {
+    check(
+        "ports_close_against_a_waiter",
+        preempted(4, SPINS),
+        preempted(6, SPINS),
+        || {
+            let (world, port, _, _) = ports_world();
+            let open = Arc::new(AtomicBool::new(true));
+            let taker = world.spawn(0, {
+                let (port, open) = (Arc::clone(&port), Arc::clone(&open));
+                move |me| {
+                    let ended = port.take(&me, UNREACHABLE, || open.load(Relaxed));
+                    assert_eq!(
+                        ended.err(),
+                        Some(TakeError::Canceled),
+                        "a wait through a port's closed handle did not end canceled"
+                    );
+                }
+            });
+            let closer = world.spawn(1, {
+                let port = Arc::clone(&port);
+                move |me| {
+                    open.store(false, Relaxed);
+                    assert!(port.close(&me).is_empty());
+                }
+            });
+            taker.join().unwrap();
+            closer.join().unwrap();
+        },
+    );
+}
+
+/// Two reservations race for a port's last free slot (this representation's own protocol):
+/// each keeps room for its binding, so both bind, and neither bind allocates.
+#[test]
+fn ports_two_reservations_race_for_the_last_slot() {
+    check(
+        "ports_two_reservations_race_for_the_last_slot",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let (world, port, account, object) = ports_world();
+            let boot = world.boot_flow_on(0);
+            // Three of the index's first four slots used: one left.
+            for _ in 0..3 {
+                assert!(object.bind(&boot, &port, &account));
+            }
+            let binders = [0, 1].map(|cpu| {
+                let (port, account) = (Arc::clone(&port), Arc::clone(&account));
+                let object = Raiser::new();
+                world.spawn(cpu, move |me| {
+                    assert!(
+                        object.bind(&me, &port, &account),
+                        "a bind found no room: a reservation did not keep its own"
+                    );
+                    object
+                })
+            });
+            let others: Vec<Arc<Raiser>> = binders.into_iter().map(|b| b.join().unwrap()).collect();
+            for object in others.iter().chain([&object]) {
+                object.raise(&boot, ASKED);
+            }
+            assert_eq!(drain(&port, &boot).len(), 5, "{LOST}");
+            close_and_settle(&port, &boot, &account);
+        },
+    );
 }

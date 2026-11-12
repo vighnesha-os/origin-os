@@ -40,6 +40,8 @@ rustflags = [
     "-C", "force-frame-pointers=yes",
     # No `match` compiles to an indirect jump through a table.
     "-C", "jump-tables=no",
-    # An INT3 follows every RET, so a processor that runs past one stops there.
+    # An INT3 follows every RET, so a processor that runs past one stops there. The compiler
+    # warns once per crate that this feature is unknown and unstable; `cargo xtask` collapses that
+    # warning to one line (developer-tools/xtask/src/expected_warning.rs).
     "-C", "target-feature=+harden-sls-ret",
 ]

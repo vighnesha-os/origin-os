@@ -27,8 +27,10 @@ global_asm!(
 
     // The interpreter: RDI points at a script, a table of 64-byte steps, each
     // number, flags, a0, a1, a2, a3, a4, a5. Bit i of `flags` set means argument i is
-    // the address of a u32 to load (so a handle a call wrote can be used by a later call).
-    // After a real call its status is reported, in order.
+    // the address of a handle to load, all 64 bits of it (ADR-0005 Amendment 6, E1), so a
+    // handle a call wrote can be used by a later call. After a real call its status is
+    // reported, in order. The pseudo-steps: -1 ends the script, -2 copies a u32, -3 reports
+    // a u32, -4 faults, -5 copies a u64 (a handle).
     .globl ipc_script_start
     .globl ipc_script_end
     .globl ipc_launched_start
@@ -48,32 +50,32 @@ ipc_script_start:
     mov rdi, qword ptr [rbx + 16]
     test r15b, 1
     jz .Larg1
-    mov edi, dword ptr [rdi]
+    mov rdi, qword ptr [rdi]
 .Larg1:
     mov rsi, qword ptr [rbx + 24]
     test r15b, 2
     jz .Larg2
-    mov esi, dword ptr [rsi]
+    mov rsi, qword ptr [rsi]
 .Larg2:
     mov rdx, qword ptr [rbx + 32]
     test r15b, 4
     jz .Larg3
-    mov edx, dword ptr [rdx]
+    mov rdx, qword ptr [rdx]
 .Larg3:
     mov r10, qword ptr [rbx + 40]
     test r15b, 8
     jz .Larg4
-    mov r10d, dword ptr [r10]
+    mov r10, qword ptr [r10]
 .Larg4:
     mov r8, qword ptr [rbx + 48]
     test r15b, 16
     jz .Larg5
-    mov r8d, dword ptr [r8]
+    mov r8, qword ptr [r8]
 .Larg5:
     mov r9, qword ptr [rbx + 56]
     test r15b, 32
     jz .Lscript_call
-    mov r9d, dword ptr [r9]
+    mov r9, qword ptr [r9]
 .Lscript_call:
     syscall
     mov rdi, rax
@@ -89,6 +91,8 @@ ipc_script_start:
     je .Lscript_report32
     cmp rax, -4
     je .Lscript_fault
+    cmp rax, -5
+    je .Lscript_mov64
     // -1: the end of the script.
     xor edi, edi
 .Lscript_exit:
@@ -100,6 +104,12 @@ ipc_script_start:
     mov edi, dword ptr [rdi]
     mov rsi, qword ptr [rbx + 24]
     mov dword ptr [rsi], edi
+    jmp .Lscript_step
+.Lscript_mov64:
+    mov rdi, qword ptr [rbx + 16]
+    mov rdi, qword ptr [rdi]
+    mov rsi, qword ptr [rbx + 24]
+    mov qword ptr [rsi], rdi
     jmp .Lscript_step
 .Lscript_report32:
     mov rdi, qword ptr [rbx + 16]

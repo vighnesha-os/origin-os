@@ -3,6 +3,10 @@
 //! makes on its arguments alone. The transcription below (`hand_written`) stops where the kernel
 //! first touches user memory or a handle table, because the generated decoder stops there too.
 //! Compiled with optimizations and run by tests/generated.rs.
+//!
+//! One rule has changed since that commit, by decision: a handle fills its register (ADR-0005
+//! Amendment 6, E1; task S4-0), so `handle_arg` refuses nothing any more. Everything else is the
+//! transcription as it was.
 
 use oidl_generated::oidl_rt as rt;
 use oidl_generated::origin_kernel as k;
@@ -16,6 +20,7 @@ const MAX_MESSAGE_BYTES: u64 = 65_536;
 const MAX_MESSAGE_HANDLES: u64 = 64;
 const RIGHTS_ALL: u32 = 0x1FF;
 const SIGNALS_ALL: u32 = 0x1F;
+const MAP_ACCESS_ALL: u32 = 0x7;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
@@ -23,9 +28,11 @@ enum Verdict {
     Exit,
 }
 
-/// `handle_arg` in `syscall.rs`.
-fn handle_arg(raw: u64) -> Result<u32, i64> {
-    u32::try_from(raw).map_err(|_| BAD_HANDLE)
+/// `handle_arg` in `syscall.rs`, with E1 applied: until S4-0 a register above 32 bits was
+/// `bad_handle` here; now every value goes to the table, which is past what this compares.
+#[allow(clippy::unnecessary_wraps)]
+fn handle_arg(raw: u64) -> Result<u64, i64> {
+    Ok(raw)
 }
 
 /// `dispatch` in `framekernel/src/syscall.rs`, for the parts decided by registers alone.
@@ -77,10 +84,60 @@ fn hand_written(call: u64, a: [u64; 6], debug_calls: bool) -> Verdict {
             }
             Ok(())
         })(),
-        // event_create and object_signal have numbers but no match arm: the catch-all.
+        // The memory calls (S3-5b) came after 9ca0438, with the definition; their register checks
+        // are OIDL §10's. memory_object_create: only pointers.
+        11 => Ok(()),
+        // memory_map: two handles, then pointers.
+        12 => handle_arg(a0).and_then(|_| handle_arg(a1)).map(|_| ()),
+        // memory_unmap: the handle, then two u64s.
+        13 => handle_arg(a0).map(|_| ()),
+        // memory_protect: the handle, two u64s, then access: it must fit, declare no unknown bit
+        // and not be zero.
+        14 => (|| {
+            handle_arg(a0)?;
+            let access = u32::try_from(a3).map_err(|_| INVALID_ARGS)?;
+            if access == 0 || access & !MAP_ACCESS_ALL != 0 {
+                return Err(INVALID_ARGS);
+            }
+            Ok(())
+        })(),
+        // The event and port calls (S3-6, ADR-0005 Amendment 7) came with the definition too;
+        // their register checks are OIDL §10's. event_create: only a pointer.
+        9 => Ok(()),
+        // object_signal: the handle, then each mask must fit and declare no unknown bit; either
+        // may be zero.
+        10 => (|| {
+            handle_arg(a0)?;
+            for mask in [a1, a2] {
+                let mask = u32::try_from(mask).map_err(|_| INVALID_ARGS)?;
+                if mask & !SIGNALS_ALL != 0 {
+                    return Err(INVALID_ARGS);
+                }
+            }
+            Ok(())
+        })(),
+        // port_create: only a pointer.
+        15 => Ok(()),
+        // object_wait_async: two handles, the key, then the mask: it must fit, be non-zero and
+        // declare no unknown bit.
+        16 => (|| {
+            handle_arg(a0)?;
+            handle_arg(a1)?;
+            let mask = u32::try_from(a3).map_err(|_| INVALID_ARGS)?;
+            if mask == 0 || mask & !SIGNALS_ALL != 0 {
+                return Err(INVALID_ARGS);
+            }
+            Ok(())
+        })(),
+        // port_wait: the handle, the deadline, then a pointer.
+        17 => handle_arg(a0).map(|_| ()),
+        // port_cancel: two handles and the key.
+        18 => handle_arg(a0).and_then(|_| handle_arg(a1)).map(|_| ()),
+        // clock_read: only a pointer.
+        19 => Ok(()),
+        // Every other number: the catch-all.
         _ => Err(NOT_SUPPORTED),
     };
-    let _ = a3;
     Verdict::Status(match result {
         Ok(()) => 0,
         Err(status) => status,
@@ -149,6 +206,81 @@ impl s::Calls for Reached {
     ) -> Result<(), s::WaitOneError> {
         Ok(())
     }
+    fn memory_object_create(
+        &self,
+        _request: rt::UserRef<k::ObjectRequest>,
+        _object: rt::UserRef<rt::Handle>,
+    ) -> Result<(), s::MemoryObjectCreateError> {
+        Ok(())
+    }
+    fn memory_map(
+        &self,
+        _process: rt::HandleArg,
+        _object: rt::HandleArg,
+        _request: rt::UserRef<k::MapRequest>,
+        _address: rt::UserRef<u64>,
+    ) -> Result<(), s::MemoryMapError> {
+        Ok(())
+    }
+    fn memory_unmap(
+        &self,
+        _process: rt::HandleArg,
+        _address: u64,
+        _length: u64,
+    ) -> Result<(), s::MemoryUnmapError> {
+        Ok(())
+    }
+    fn memory_protect(
+        &self,
+        _process: rt::HandleArg,
+        _address: u64,
+        _length: u64,
+        _access: k::MapAccess,
+    ) -> Result<(), s::MemoryProtectError> {
+        Ok(())
+    }
+    fn event_create(&self, _event: rt::UserRef<rt::Handle>) -> Result<(), s::EventCreateError> {
+        Ok(())
+    }
+    fn object_signal(
+        &self,
+        _object: rt::HandleArg,
+        _clear: k::Signals,
+        _set: k::Signals,
+    ) -> Result<(), s::ObjectSignalError> {
+        Ok(())
+    }
+    fn port_create(&self, _port: rt::UserRef<rt::Handle>) -> Result<(), s::PortCreateError> {
+        Ok(())
+    }
+    fn object_wait_async(
+        &self,
+        _port: rt::HandleArg,
+        _object: rt::HandleArg,
+        _key: u64,
+        _signals: k::Signals,
+    ) -> Result<(), s::ObjectWaitAsyncError> {
+        Ok(())
+    }
+    fn port_wait(
+        &self,
+        _port: rt::HandleArg,
+        _deadline: u64,
+        _packet: rt::UserRef<k::PortPacket>,
+    ) -> Result<(), s::PortWaitError> {
+        Ok(())
+    }
+    fn port_cancel(
+        &self,
+        _port: rt::HandleArg,
+        _object: rt::HandleArg,
+        _key: u64,
+    ) -> Result<(), s::PortCancelError> {
+        Ok(())
+    }
+    fn clock_read(&self, _nanos: rt::UserRef<u64>) -> Result<(), s::ClockReadError> {
+        Ok(())
+    }
 }
 
 fn generated(call: u64, a: [u64; 6], debug_calls: bool) -> Verdict {
@@ -213,7 +345,7 @@ fn main() {
     let mut mismatches = 0usize;
     let mut cases = 0u64;
     // Every call number the kernel knows and several it does not.
-    for call in (0..=16u64).chain([65_535, 1 << 32, u64::MAX]) {
+    for call in (0..=21u64).chain([65_535, 1 << 32, u64::MAX]) {
         for debug_calls in [false, true] {
             // Every edge in the first three registers, with the rest at the extremes.
             for &a0 in &EDGES {

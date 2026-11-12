@@ -48,7 +48,7 @@ Intel comes first because its console path is documented and the VT-d work is th
 **H6. Before the first boot.**
 
 - Read Intel's no-fix errata for this CPU, on VT-d (PTL003, PTL023) and xHCI (PTL002, 006, 007, 009). The research reported them, and nobody has re-read them.
-- Close or explicitly accept what the IOMMU threat model lists before real hardware: T4, T5, T6, T8, T9, T14 (RMRR and IVMD identity maps, the deadline in items 8 and 12) and T23.
+- Close or explicitly accept what the IOMMU threat model lists before real hardware: T4, T5, T6, T8, T9, T14 (RMRR and IVMD identity maps, the deadline in items 8 and 12) and T23. *(2026-11-12, items 229 and 230: for bench boots on rented servers only, T4's two windows, T5, T6, T8, T9 and T23 are accepted by name, and T14's deadline holds there too; `docs/research/2026-11-12-first-bare-metal-boot.md`.)*
 - Give the kernel a console that does not depend on a 16550 at `0x3F8`, such as a UEFI GOP framebuffer or the address in the ACPI SPCR table. The only console today is at that fixed port, and neither ASRock nor Lenovo documents the address. Without it, a failed boot shows nothing. *(2026-11-08: built against ADR-0010, which the owner accepted; proven under QEMU only.)*
 
 **H7. Later machines, for §74.**
@@ -137,6 +137,16 @@ CPUID reports a vendor, a family and a model, which identify the core generation
 - **Both answers are tested.** QEMU can be told to report any family and model, so CI can boot an in-scope and an out-of-scope identity.
 - **What cannot be checked.** The check gives the core generation, not the launch year. Gorgon Point refreshes 2024's Strix and Krackan Point on the same socket, probably with the same model numbers (unconfirmed). So "AMD from 2026" stays a rule about claims: a 2024 Zen 5 machine reads as Zen 5 or newer, and that is not a support claim.
 - **It is not a security control.** A virtual machine reports its host's CPU, or whatever QEMU is told to report.
+
+*As built, 2026-11-12 (TASKS item 16; this note changes no decision).*
+
+- **The table** is `origin_frame::cpuident` (`framekernel/frame/src/cpuident.rs`). Each row names the Intel or AMD documents it rests on, read on 2026-11-12 (`docs/research/2026-11-12-cpu-identification-table.md`). It decodes the model by each vendor's own rule: Intel counts the extended model under base family 06H or 0FH, AMD only under 0FH.
+- **What it names.** Intel's family-6 rows name the generations of the SDM's Table 2-1, the four 2026 models of the rule among them. Model E5H is named only as Panther Lake's cores, since Intel names no product for it. AMD's rows are by family alone, as the rule is: "Zen 5 or newer" from 1AH, "older than Zen 5" below it.
+- **Diamond Rapids is now confirmed by Intel.** Its Instruction Set Extensions and Future Features Programming Reference, 319433-062 (June 2026), Table 1-1, lists it as DisplayFamily_DisplayModel 13_01H, and Nova Lake as 12_01H and 12_03H. The evidence below, which found no Intel source on 2026-11-10, is out of date on that point only, and no decision changes: the rule never depended on it, since family 18 or higher is in the scope whatever the model. The table names Diamond Rapids from that document.
+- **ADR-0017 Z9's form** is a column of it. `nospec::choose` moved into it, with the same answer for every maker and family.
+- **Errata.** The home holds none: nothing the kernel runs works around a documented erratum.
+- **At boot.** The line follows the CPU features line, for example `origin-kernel: CPU identity: AuthenticAMD family 19h (25) model 61h stepping 2 (leaf 1 EAX 00A60F12h): older than Zen 5; outside the declared scope, a bench machine: AMD family below 1Ah, where Zen 5 begins (ADR-0009 A2); …`. It says when a hypervisor runs the processor. For AMD from family 1AH it never says "in the declared scope" without the condition beside it: `Zen 5 or newer; in the declared scope by its cores, and only if its generation is from 2026 or later, which CPUID cannot tell: …`, since A1 names 2024's Zen 5 generations as outside the scope and CPUID gives no year. The check itself keeps its two answers, which the installer's question at M9 (item 90) will use.
+- **Tests.** Host tests check every maker, family and model against this rule and Z9's, each written again from its text, and against the signatures the vendors publish. `cargo xtask boot-identity`, part of `boot-matrix`, boots QEMU told to report a Panther Lake (in the scope) and rental A's EPYC 4244P (outside it), each held to its whole line and to its verdict. Under QEMU only: no processor of either generation has printed the line.
 
 ### A3. The installer, decided at M9 (item 90)
 

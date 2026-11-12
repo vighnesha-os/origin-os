@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "first-program"
+version = "0.0.0"
+dependencies = [
+ "origin-abi",
+ "origin-kernel-stubs",
+ "origin-rt",
+]
+
+[[package]]
 name = "framekernel"
 version = "0.0.0"
 dependencies = [
@@ -90,6 +99,7 @@ dependencies = [
  "origin-boot-info",
  "origin-crypto",
  "origin-paging",
+ "origin-random",
  "origin-version",
 ]
 
@@ -115,14 +125,34 @@ dependencies = [
  "origin-abi",
  "origin-boot-info",
  "origin-paging",
+ "origin-random",
  "origin-sync",
 ]
+
+[[package]]
+name = "origin-kernel-stubs"
+version = "0.0.0"
 
 [[package]]
 name = "origin-paging"
 version = "0.0.0"
 dependencies = [
  "origin-boot-info",
+]
+
+[[package]]
+name = "origin-random"
+version = "0.0.0"
+dependencies = [
+ "origin-crypto",
+]
+
+[[package]]
+name = "origin-rt"
+version = "0.0.0"
+dependencies = [
+ "origin-abi",
+ "origin-kernel-stubs",
 ]
 
 [[package]]

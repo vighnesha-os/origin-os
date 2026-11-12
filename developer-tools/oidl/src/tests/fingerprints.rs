@@ -431,11 +431,12 @@ fn a_very_high_minor_does_not_render_the_description_65536_times() {
 #[test]
 fn the_fingerprint_is_pinned() {
     // Changing the description's format is a compatibility event of its own (§13); pinning one
-    // digest makes that a visible change here.
+    // digest makes that a visible change here. Format 2, which records a handle's width
+    // (decision item 237), moved it from 74a42979…505d, format 1's.
     let comp = comp_at("1.0", METHOD);
     assert_eq!(
         fingerprint::hex(&fingerprints(&comp.libraries[0])[0].stable),
-        "74a42979729aad7a3f762562208f10f2977808a393c991c81da36e559a61505d"
+        "b7bb3cbe175f3059d7e018f5d97ef1cdd80cf47b08f57072a97db745a8e0ebc2"
     );
 }
 
@@ -447,4 +448,89 @@ fn interface_ids_differ_by_name_and_are_stable() {
     assert_ne!(a, b);
     assert_ne!(a, c);
     assert_eq!(a, fingerprint::interface_id("origin.fixture.echo", "echo"));
+}
+
+/// The shipped definitions, compiled against the real versions file.
+fn shipped() -> crate::model::Compilation {
+    let inputs = [
+        (
+            "origin.kernel.oidl",
+            include_str!("../../../../sdk/interfaces/origin.kernel.oidl"),
+        ),
+        (
+            "origin.directory.oidl",
+            include_str!("../../../../sdk/interfaces/origin.directory.oidl"),
+        ),
+    ]
+    .iter()
+    .map(|(file, text)| Input {
+        file: file.to_string(),
+        text: text.as_bytes().to_vec(),
+    })
+    .collect::<Vec<_>>();
+    compile(
+        &inputs,
+        Some(include_str!("../../../../origin-version.toml")),
+    )
+    .expect("valid")
+}
+
+/// Decision item 237: every library's description says, at every minor, how wide a handle is,
+/// and the width it says is the one the generator emits, in Rust and in C.
+#[test]
+fn the_description_records_the_handle_width_the_generator_emits() {
+    use crate::layout::HANDLE_BITS;
+    let comp = shipped();
+    for library in &comp.libraries {
+        for minor in 0..=library.version.minor {
+            for numbers in [false, true] {
+                let text = fingerprint::describe(library, minor, numbers);
+                let header: Vec<&str> = text.lines().take(5).collect();
+                assert_eq!(header[0], "oidl-fingerprint 2");
+                assert!(header[3].starts_with("transport "), "{text}");
+                assert_eq!(header[4], format!("handle {HANDLE_BITS}"), "{text}");
+            }
+        }
+    }
+    // The runtime the generator writes holds a handle in exactly that width.
+    let runtime = include_str!("../codegen/oidl_rt.rs.in");
+    assert!(runtime.contains(&format!("pub struct Handle(u{HANDLE_BITS});")));
+    assert!(runtime.contains(&format!(
+        "impl Fixed for Handle {{\n    const SIZE: usize = {};",
+        HANDLE_BITS / 8
+    )));
+    assert!(runtime.contains(&format!(
+        "pub const fn from_abi(raw: u{HANDLE_BITS}) -> Self"
+    )));
+    // And the C header names it so.
+    let files = crate::codegen::generate(&comp);
+    let header = files
+        .iter()
+        .find(|f| f.path == "c/origin/kernel.h")
+        .expect("the kernel's header");
+    assert!(
+        header
+            .text
+            .contains(&format!("typedef uint{HANDLE_BITS}_t origin_handle_t;"))
+    );
+}
+
+/// The negative control of decision item 237: a handle of another width, planted where the
+/// description is made, changes every minor's stable and release digest of every library, so a
+/// change of a handle's width can never leave a lock as it was. (Before format 2 it left them all
+/// as they were: S4-0's 32 to 64 bits showed only through two structures.)
+#[test]
+fn a_planted_handle_width_changes_every_digest() {
+    let comp = shipped();
+    for library in &comp.libraries {
+        let real = fingerprints(library);
+        let planted = fingerprint::fingerprints_with(library, 32);
+        assert_eq!(real.len(), planted.len());
+        assert!(!real.is_empty());
+        for (a, b) in real.iter().zip(&planted) {
+            assert_eq!(a.version, b.version);
+            assert_ne!(a.stable, b.stable, "{} {}", library.name, a.version);
+            assert_ne!(a.release, b.release, "{} {}", library.name, a.version);
+        }
+    }
 }

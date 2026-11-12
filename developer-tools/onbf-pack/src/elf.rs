@@ -1,4 +1,5 @@
-//! ELF64 input, read against the KRN conversion contract (ONBF §6.1.2, ONBF-R11).
+//! ELF64 input, read against the conversion contract (ONBF §6.1.2, ONBF-R11): for the KRN
+//! image (`krn`), and for the programs the kernel carries in it (`carried`, ADR-0011 L1).
 //!
 //! Sources: the System V ABI generic part (ELF gABI: `e_ident`, the ELF header, program
 //! headers, the dynamic section, `Elf64_Rela`, and the `SHT_RELR` encoding) and the x86-64
@@ -16,6 +17,9 @@
 //! ignored. Anything else is a hard error. `PT_GNU_RELRO` must be whole pages at the start of
 //! an R+W `PT_LOAD`: `rust-lld` also ends that `PT_LOAD` there, and if a linker does not, the
 //! rest is split off, so the two never share a page (ONBF §6.1).
+//!
+//! The dynamic symbol table is read only to refuse an undefined symbol (§6.1.2), its length
+//! taken from `DT_HASH`; no relocation may name a symbol, so nothing else in it is used.
 
 use core::fmt;
 
@@ -129,6 +133,14 @@ pub mod dt {
 }
 
 const DYN_SIZE: usize = 16;
+/// `Elf64_Sym`'s size, the only accepted `DT_SYMENT`.
+const SYM_SIZE: u64 = 24;
+/// The same, for slicing.
+const SYM_BYTES: usize = 24;
+/// Where `st_shndx` is in an `Elf64_Sym`.
+const SYM_SHNDX_AT: usize = 6;
+/// `st_shndx` of a symbol the image does not define (gABI `SHN_UNDEF`).
+const SHN_UNDEF: u16 = 0;
 const RELA_SIZE: u64 = 24;
 const RELA_BYTES: usize = 24;
 const RELR_SIZE: u64 = 8;
@@ -369,6 +381,16 @@ pub enum ElfError {
     },
     /// The `DT_RELR` table does not decode.
     Relr(RelrError),
+    /// The dynamic symbol table cannot be read: `DT_SYMTAB` without `DT_HASH`, which gives its
+    /// length, a `DT_SYMENT` other than 24, or a table outside the file-backed bytes of one
+    /// `PT_LOAD`.
+    SymbolTable(&'static str),
+    /// A dynamic symbol the image does not define (ONBF §6.1.2: "an undefined symbol not
+    /// exported by a declared Origin library"; no library is declared yet).
+    UndefinedSymbol {
+        /// Its index in the dynamic symbol table.
+        index: u64,
+    },
 }
 
 impl fmt::Display for ElfError {
@@ -474,6 +496,11 @@ impl fmt::Display for ElfError {
                 "conflicting relocations at {slot:#x} (different addends, or both DT_RELA and DT_RELR)"
             ),
             E::Relr(e) => write!(f, "DT_RELR: {e}"),
+            E::SymbolTable(why) => write!(f, "dynamic symbol table: {why}"),
+            E::UndefinedSymbol { index } => write!(
+                f,
+                "dynamic symbol {index} is undefined, and no Origin library is declared to export it (ONBF §6.1.2)"
+            ),
         }
     }
 }
@@ -847,6 +874,7 @@ fn read_dynamic(
         ));
     }
     let mut tags = RelocationTags::default();
+    let mut symbols = SymbolTags::default();
     let mut terminated = false;
     for raw in table.as_chunks::<DYN_SIZE>().0 {
         let d = Fields {
@@ -876,18 +904,11 @@ fn read_dynamic(
             | dt::RELR
             | dt::RELRSZ
             | dt::RELRENT => tags.set(tag, value)?,
-            // Symbol and hash tables are only metadata here: no relocation may name a
-            // symbol, so nothing reads them. DT_FLAGS, DT_FLAGS_1 and DT_DEBUG carry no
-            // information a KRN image needs.
-            dt::HASH
-            | dt::GNU_HASH
-            | dt::SYMTAB
-            | dt::STRTAB
-            | dt::STRSZ
-            | dt::SYMENT
-            | dt::FLAGS
-            | dt::FLAGS_1
-            | dt::DEBUG => {}
+            // The symbol table is read only to refuse an undefined symbol, and DT_HASH only
+            // for the table's length: no relocation may name a symbol. The string table, the
+            // GNU hash table, DT_FLAGS, DT_FLAGS_1 and DT_DEBUG carry nothing an image needs.
+            dt::SYMTAB | dt::SYMENT | dt::HASH => symbols.set(tag, value)?,
+            dt::GNU_HASH | dt::STRTAB | dt::STRSZ | dt::FLAGS | dt::FLAGS_1 | dt::DEBUG => {}
             other => return Err(ElfError::UnknownDynamicTag(other)),
         }
     }
@@ -895,9 +916,70 @@ fn read_dynamic(
         return Err(ElfError::DynamicTable("no DT_NULL terminator"));
     }
 
+    check_symbols(file, &symbols, segments)?;
     let rela = read_rela(file, &tags, segments)?;
     let relr = read_relr(file, &tags, segments)?;
     merge(rela, relr)
+}
+
+/// The symbol-related dynamic tags, each at most once.
+#[derive(Default)]
+struct SymbolTags {
+    symtab: Option<u64>,
+    syment: Option<u64>,
+    hash: Option<u64>,
+}
+
+impl SymbolTags {
+    fn set(&mut self, tag: u64, value: u64) -> Result<(), ElfError> {
+        let field = match tag {
+            dt::SYMTAB => &mut self.symtab,
+            dt::SYMENT => &mut self.syment,
+            _ => &mut self.hash,
+        };
+        if field.replace(value).is_some() {
+            return Err(ElfError::DuplicateDynamicTag(tag));
+        }
+        Ok(())
+    }
+}
+
+/// Refuses a dynamic symbol table that holds an undefined symbol (ONBF §6.1.2). Its length is
+/// `nchain`, the second word of `DT_HASH` (gABI: "the number of symbol table entries"); entry 0
+/// is the reserved null symbol, which is undefined by definition.
+fn check_symbols(file: &[u8], tags: &SymbolTags, segments: &[LoadSegment]) -> Result<(), ElfError> {
+    let Some(symtab) = tags.symtab else {
+        return Ok(());
+    };
+    if tags.syment != Some(SYM_SIZE) {
+        return Err(ElfError::SymbolTable("DT_SYMENT is not 24"));
+    }
+    let hash = tags.hash.ok_or(ElfError::SymbolTable(
+        "DT_SYMTAB without DT_HASH, which gives its length",
+    ))?;
+    let words = table_bytes(file, segments, hash, 8, "DT_HASH")
+        .map_err(|_| ElfError::SymbolTable("DT_HASH is outside the file-backed bytes"))?;
+    let count = Fields {
+        bytes: words,
+        what: "DT_HASH",
+    }
+    .u32(4)?;
+    let size = u64::from(count)
+        .checked_mul(SYM_SIZE)
+        .ok_or(ElfError::SymbolTable("too many symbols"))?;
+    let table = table_bytes(file, segments, symtab, size, "DT_SYMTAB")
+        .map_err(|_| ElfError::SymbolTable("DT_SYMTAB is outside the file-backed bytes"))?;
+    for (index, raw) in (0u64..).zip(table.as_chunks::<SYM_BYTES>().0).skip(1) {
+        let shndx = Fields {
+            bytes: raw,
+            what: "DT_SYMTAB",
+        }
+        .u16(SYM_SHNDX_AT)?;
+        if shndx == SHN_UNDEF {
+            return Err(ElfError::UndefinedSymbol { index });
+        }
+    }
+    Ok(())
 }
 
 /// The bytes of a relocation table at RVA `rva`, which must lie inside the file-backed

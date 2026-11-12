@@ -33,9 +33,10 @@
 //! Every object here is allocated fallibly ([`ObjectRef::try_new`]): a process or thread that
 //! cannot be created is an error for its creator, never a stopped kernel.
 //!
-//! The first slice has no process-creation or memory system calls: the kernel builds each
-//! process and maps its pages before any of its threads runs. A space can change while its
-//! threads run (`origin_frame::userspace`), but only the boot proofs change one so far.
+//! Only the kernel creates processes and maps their code, data and stacks, before any of their
+//! threads runs. After that a space changes through the memory calls (`memory_object`): a
+//! process's whole mappings of memory objects are recorded here, and the memory it commits is
+//! charged to its account (P11, C7).
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
@@ -43,17 +44,23 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use crate::channel::Identity;
 use crate::handles::HandleTable;
+use crate::mapping::{Budget, Mappings, Rate};
+use crate::memory_object::MemoryObject;
 use crate::paging::{Access, MapError, Translation};
+pub(crate) use crate::quota::ObjectLimits;
+use crate::quota::{Count, ObjectCounts};
 use crate::runqueue::QueueError;
 use origin_abi::{Error, Handle, signals};
 use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
+use origin_frame::sync::ports::Source;
 use origin_frame::userspace::{UserFrame, UserSpace};
 
 use crate::cpu::{CpuIndex, without_interrupts};
 use crate::ipc::{self, Object};
+use crate::port::Ports;
 use crate::sched;
-use crate::wait::WaitQueue;
+use crate::wait::{KernelThreads, WaitQueue};
 
 /// Values a process's report log keeps, for the boot proofs.
 const REPORTS: usize = 128;
@@ -63,27 +70,29 @@ const REPORTS: usize = 128;
 /// channels in the kernel's queues. Queued messages are charged too, to the process that
 /// sent them, by the memory they hold.
 pub(crate) struct Account {
-    channels: AtomicUsize,
-    max_channels: usize,
+    /// Channels this process created that still exist.
+    channels: Count,
     /// Bytes of kernel heap held by messages this process has queued and nobody has read.
     queued_bytes: AtomicUsize,
     max_queued_bytes: usize,
+    /// Bytes of memory objects this process created that still exist (C7): charged when one is
+    /// made, refunded when its last handle and mapping are gone.
+    committed: AtomicUsize,
+    max_committed: usize,
+    /// The events and ports this process created that still exist, and the bindings it made
+    /// whose packet has not left its port.
+    objects: ObjectCounts,
 }
 
 impl Account {
     /// One more channel, or [`Error::Limit`].
     pub(crate) fn charge_channel(&self) -> Result<(), Error> {
-        self.channels
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.max_channels).then_some(n + 1)
-            })
-            .map(|_| ())
-            .map_err(|_| Error::Limit)
+        self.channels.charge()
     }
 
     /// A channel charged to this account is gone.
     pub(crate) fn refund_channel(&self) {
-        self.channels.fetch_sub(1, Ordering::AcqRel);
+        self.channels.refund();
     }
 
     /// `bytes` more of queued-message memory, or [`Error::Limit`].
@@ -107,10 +116,62 @@ impl Account {
     pub(crate) fn queued_bytes(&self) -> usize {
         self.queued_bytes.load(Ordering::Acquire)
     }
+
+    /// `bytes` more of committed memory, or [`Error::Limit`] past the quota (C7).
+    pub(crate) fn charge_committed(&self, bytes: usize) -> Result<(), Error> {
+        self.committed
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                n.checked_add(bytes)
+                    .filter(|&total| total <= self.max_committed)
+            })
+            .map(|_| ())
+            .map_err(|_| Error::Limit)
+    }
+
+    /// A memory object charged to this account is gone, and its `bytes` with it.
+    pub(crate) fn refund_committed(&self, bytes: usize) {
+        self.committed.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    /// Bytes of committed memory charged to this account now.
+    pub(crate) fn committed(&self) -> usize {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    /// Its counts of events, ports and bindings, each against its own quota (F7).
+    pub(crate) fn objects(&self) -> &ObjectCounts {
+        &self.objects
+    }
 }
 
-/// A process's quotas: at most `handles` entries in its table, `channels` live channels and
-/// `message_bytes` of kernel heap in messages it has queued.
+/// What a process may commit and map, and how fast it may change its mappings (P11, C7;
+/// `THREAT_MODEL_ADDRESS_SPACES.md` T15, T16). [`MemoryLimits::NONE`] allows nothing: a creator
+/// gives memory to a process deliberately.
+#[derive(Clone, Copy)]
+pub(crate) struct MemoryLimits {
+    /// Bytes of memory objects it may have committed at once.
+    pub(crate) committed: usize,
+    /// Whole mappings its address space may hold.
+    pub(crate) mappings: usize,
+    /// Its budget of shootdowns and interrupts for unmap and protect.
+    pub(crate) changes: Rate,
+}
+
+impl MemoryLimits {
+    /// No memory objects, no mappings and no changes.
+    pub(crate) const NONE: Self = Self {
+        committed: 0,
+        mappings: 0,
+        changes: Rate {
+            burst: 0,
+            per_second: 1,
+        },
+    };
+}
+
+/// A process's quotas: at most `handles` entries in its table, `channels` live channels,
+/// `message_bytes` of kernel heap in messages it has queued, its memory, and its events, ports
+/// and bindings.
 #[derive(Clone, Copy)]
 pub(crate) struct Limits {
     pub(crate) handles: usize,
@@ -120,6 +181,10 @@ pub(crate) struct Limits {
     /// builds: an ordinary process that calls them gets `NOT_SUPPORTED`, so it cannot hold
     /// the serial line (at 115200 baud, a line for many milliseconds) with interrupts off.
     pub(crate) debug_calls: bool,
+    /// Its memory objects and mappings.
+    pub(crate) memory: MemoryLimits,
+    /// Its events, ports and bindings. [`ObjectLimits::NONE`] allows none.
+    pub(crate) objects: ObjectLimits,
 }
 
 /// What ended the process's last thread, for the boot proofs.
@@ -142,10 +207,12 @@ struct ReportLog {
     count: usize,
 }
 
-/// The signal an object raises when it has ended, and who waits for it (P9, P11).
+/// The signal an object raises when it has ended, who waits for it, and the bindings armed on
+/// it (P9, P11, C9).
 pub(crate) struct Termination {
     raised: AtomicBool,
     waiters: WaitQueue,
+    source: Source<Ports>,
 }
 
 impl Termination {
@@ -153,6 +220,7 @@ impl Termination {
         Self {
             raised: AtomicBool::new(false),
             waiters: WaitQueue::new(),
+            source: Source::new(),
         }
     }
 
@@ -170,15 +238,22 @@ impl Termination {
         &self.waiters
     }
 
+    /// The bindings armed on the object.
+    pub(crate) const fn source(&self) -> &Source<Ports> {
+        &self.source
+    }
+
     /// Whether the object has ended.
     pub(crate) fn raised(&self) -> bool {
         self.raised.load(Ordering::Acquire)
     }
 
-    /// Raises the signal: the state first, then the wake-ups, as every waker does (`wait`).
+    /// Raises the signal: the state first, then the wake-ups and the deliveries, as every waker
+    /// does (`wait`, and the ports' protocol).
     fn raise(&self) {
         self.raised.store(true, Ordering::Release);
         ipc::note_cross_cpu_wakes(self.waiters.wake_all());
+        self.source.deliver(&KernelThreads, || self.signals());
     }
 }
 
@@ -246,6 +321,10 @@ pub(crate) struct Process {
     pub(crate) handles: SpinLock<HandleTable<Object>>,
     /// What it may hold (P11).
     pub(crate) account: ObjectRef<Account>,
+    /// Its whole mappings of memory objects (C7), each holding its object.
+    pub(crate) mappings: SpinLock<Mappings<ObjectRef<MemoryObject>>>,
+    /// Its budget for the unmaps and protects it asks for, in any process (T15, T16).
+    pub(crate) changes: SpinLock<Budget>,
     /// The only code range that may issue system calls (P4, ONBF §6.1): `[start, end)`.
     syscall_origin: (u64, u64),
     /// May it use the developer-only calls?
@@ -276,12 +355,16 @@ impl Process {
             space: SpinLock::new(Some(ObjectRef::try_new(UserSpace::new()?).ok()?)),
             handles: SpinLock::new(HandleTable::new(limits.handles)),
             account: ObjectRef::try_new(Account {
-                channels: AtomicUsize::new(0),
-                max_channels: limits.channels,
+                channels: Count::new(limits.channels),
                 queued_bytes: AtomicUsize::new(0),
                 max_queued_bytes: limits.message_bytes,
+                committed: AtomicUsize::new(0),
+                max_committed: limits.memory.committed,
+                objects: ObjectCounts::new(limits.objects),
             })
             .ok()?,
+            mappings: SpinLock::new(Mappings::new(limits.memory.mappings)),
+            changes: SpinLock::new(Budget::new(limits.memory.changes)),
             syscall_origin,
             debug_calls: limits.debug_calls,
             lifecycle: SpinLock::new(Lifecycle {
@@ -550,8 +633,13 @@ impl Process {
         let table = without_interrupts(|| {
             core::mem::replace(&mut *self.handles.lock(), HandleTable::new(0))
         });
-        drop(table);
+        // The bindings it made are cancelled before its handles close (F11).
+        ipc::close_table(table, self.id);
         ipc::reap_closed();
+        // Its mappings' objects go with it, and no more can be made (P11): before it counts as
+        // ended, so whoever sees the ending sees their charges back.
+        let objects = without_interrupts(|| self.mappings.lock().close());
+        drop(objects);
         // "Ended" means its handles are closed and its peers can see that. (Ends that were only
         // reachable through an undelivered message another processor is reaping this instant
         // close a moment later: they are delayed, never lost.)
@@ -567,7 +655,8 @@ impl Process {
         let table = without_interrupts(|| {
             core::mem::replace(&mut *self.handles.lock(), HandleTable::new(0))
         });
-        drop(table);
+        // The bindings it made are cancelled before its handles close (F11).
+        ipc::close_table(table, self.id);
         ipc::reap_closed();
     }
 

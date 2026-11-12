@@ -21,7 +21,6 @@
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use origin_abi::limits::DEADLINE_INFINITE;
 use origin_abi::{
     Error, OK, ObjectType, read_sizes, received_handle, rights, signals, syscall as sys,
 };
@@ -36,8 +35,8 @@ use origin_frame::proof_programs::{self, DATA, STACK};
 
 use super::Arg::{Handle as Hd, Imm};
 use super::{
-    Arg, CODE, Image, LIMITS, SIZES, Step, Want, await_end, close, create, entry_handle, h, read,
-    report_identity, reported_u64, slot_addr, step, value_at, wait, write,
+    Arg, CODE, Image, LIMITS, SIZES, Script, Step, Want, await_end, close, create, entry_handle, h,
+    read, readable, report_identity, reported_u64, slot_addr, step, value_at, wait, write,
 };
 use crate::console::Console;
 use crate::cpu::{self, CpuIndex};
@@ -138,7 +137,7 @@ impl rt::Transport for Recording {
         &mut self,
         buffer: &mut [u8],
         request: usize,
-        handles: &[u32],
+        handles: &[u64],
         _received: &mut [RecvHandle],
     ) -> Result<(usize, usize), i64> {
         let refused = Error::InvalidArgs.raw();
@@ -153,7 +152,7 @@ impl rt::Transport for Recording {
             })
             .collect();
         let mut reply = [0u8; ROOM as usize];
-        let mut reply_handles = [0u32; 4];
+        let mut reply_handles = [0u64; 4];
         let rt::Dispatched::Reply {
             bytes, handles: 0, ..
         } = stub::dispatch(
@@ -177,7 +176,7 @@ impl rt::Transport for Recording {
         Ok((bytes, 0))
     }
 
-    fn send(&mut self, _buffer: &[u8], _handles: &[u32]) -> Result<(), i64> {
+    fn send(&mut self, _buffer: &[u8], _handles: &[u64]) -> Result<(), i64> {
         Err(Error::NotSupported.raw())
     }
 
@@ -195,7 +194,7 @@ impl rt::Transport for Replay<'_> {
         &mut self,
         buffer: &mut [u8],
         _request: usize,
-        _handles: &[u32],
+        _handles: &[u64],
         _received: &mut [RecvHandle],
     ) -> Result<(usize, usize), i64> {
         let answer = self.answers.get(self.next).ok_or(Error::PeerClosed.raw())?;
@@ -207,7 +206,7 @@ impl rt::Transport for Replay<'_> {
         Ok((answer.len(), 0))
     }
 
-    fn send(&mut self, _buffer: &[u8], _handles: &[u32]) -> Result<(), i64> {
+    fn send(&mut self, _buffer: &[u8], _handles: &[u64]) -> Result<(), i64> {
         Err(Error::NotSupported.raw())
     }
 
@@ -230,7 +229,7 @@ type Answer = Result<ConnectResponse, CallError<ConnectError>>;
 /// major 1. `None` if the hello fails.
 fn run_client<T: rt::Transport>(transport: T) -> Option<(DirectoryClient<T>, Answer, Answer)> {
     let mut bytes = [0u8; ROOM as usize];
-    let mut handles = [0u32; 4];
+    let mut handles = [0u64; 4];
     let unused = RecvHandle {
         value: Handle::INVALID,
         object: 0,
@@ -277,46 +276,13 @@ fn messages() -> Option<Messages> {
     })
 }
 
-/// A script, and where each value it reports lands among its reports: every call reports its
-/// status, and every `report32` its value, in order.
-#[derive(Default)]
-struct Script {
-    steps: Vec<Step>,
-}
-
 impl Script {
-    fn call(&mut self, step: Step) {
-        self.steps.push(step);
-    }
-
-    /// How many reports the steps so far make.
-    fn reported(&self) -> usize {
-        self.steps
-            .iter()
-            .filter(|s| !matches!(s.want, Want::Nothing))
-            .count()
-    }
-
-    /// Reports the `len` bytes at `at`, a word at a time; returns where they start.
-    fn report_bytes(&mut self, at: u64, len: usize) -> usize {
-        let start = self.reported();
-        for word in 0..len.div_ceil(4) as u64 {
-            self.steps.push(value_at("", at + 4 * word, 0));
-        }
-        start
-    }
-
     /// Reports the writer the read into [`SIZES_ID`] saw; returns where it starts.
     fn report_writer(&mut self) -> usize {
         let start = self.reported();
         self.steps.extend(report_identity(SIZES_ID));
         start
     }
-}
-
-/// A blocking wait for a message on `x`.
-fn readable(x: Arg) -> Step {
-    wait("", x, signals::READABLE, DEADLINE_INFINITE, OK)
 }
 
 /// Reads the next message on `x` into `bytes`, its handles' records into `into`.

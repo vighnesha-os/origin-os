@@ -32,8 +32,9 @@ pub const ABI_VERSION: (u16, u16) = (
     origin_version::USER_ABI_MINOR,
 );
 
-/// A handle: a 32-bit name for a kernel object in one process's handle table (P1).
-pub type Handle = u32;
+/// A handle: a 64-bit name for a kernel object in one process's handle table (P1, Amendment 6
+/// E1). It is opaque: how the kernel divides its bits is not part of the ABI.
+pub type Handle = u64;
 /// Never a valid handle.
 pub const INVALID_HANDLE: Handle = 0;
 
@@ -178,6 +179,14 @@ pub mod rights {
     pub const PROCESS: u32 = READ | WRITE | MANAGE | WAIT | DUPLICATE | TRANSFER;
     /// The rights of a thread's handle to itself (amendment C6).
     pub const THREAD: u32 = WAIT | MANAGE | DUPLICATE | TRANSFER;
+    /// The rights of a new memory object (amendment C6): never `EXECUTE`, since an anonymous
+    /// object is never executable; `WAIT`, `SIGNAL` and `MANAGE` do not apply.
+    pub const MEMORY_OBJECT: u32 = READ | WRITE | MAP | DUPLICATE | TRANSFER;
+    /// The rights of a new event (amendments C6 and F6).
+    pub const EVENT: u32 = WAIT | SIGNAL | DUPLICATE | TRANSFER;
+    /// The rights of a new port (amendments C6 and F6): no `WAIT`, since a port raises no
+    /// signals (F8).
+    pub const PORT: u32 = READ | WRITE | DUPLICATE | TRANSFER;
 }
 
 /// Object signals (P9).
@@ -238,10 +247,100 @@ pub mod syscall {
     pub const CHANNEL_READ: u64 = 7;
     /// `wait_one(handle, signals, deadline, out_observed)`.
     pub const WAIT_ONE: u64 = 8;
-    /// `event_create(out_handle)`.
+    /// `event_create(out_event)` (amendment F17).
     pub const EVENT_CREATE: u64 = 9;
     /// `object_signal(handle, clear, set)`: user signals ([`super::signals::SIGNALED`]).
     pub const OBJECT_SIGNAL: u64 = 10;
+    /// `memory_object_create(request, out_object)`: a [`super::object_request`].
+    pub const MEMORY_OBJECT_CREATE: u64 = 11;
+    /// `memory_map(process, object, request, out_address)`: a [`super::map_request`].
+    pub const MEMORY_MAP: u64 = 12;
+    /// `memory_unmap(process, address, length)`: one whole mapping.
+    pub const MEMORY_UNMAP: u64 = 13;
+    /// `memory_protect(process, address, length, access)`: one whole mapping, its access only
+    /// reduced ([`super::map_access`]).
+    pub const MEMORY_PROTECT: u64 = 14;
+    /// `port_create(out_port)` (amendment F17).
+    pub const PORT_CREATE: u64 = 15;
+    /// `object_wait_async(port, object, key, signals)` (amendment F2).
+    pub const OBJECT_WAIT_ASYNC: u64 = 16;
+    /// `port_wait(port, deadline, out_packet)`: a [`super::port_packet`] (amendment F3).
+    pub const PORT_WAIT: u64 = 17;
+    /// `port_cancel(port, object, key)` (amendment F4).
+    pub const PORT_CANCEL: u64 = 18;
+    /// `clock_read(out_nanos)`: the monotonic clock (amendment F10).
+    pub const CLOCK_READ: u64 = 19;
+}
+
+/// Bytes in a page: memory objects, mappings, offsets and fixed addresses are whole pages of
+/// this size (P7).
+pub const PAGE_SIZE: u64 = 4096;
+
+/// What a mapping allows (P7, amendments C7 and D2): `READ` always, and at most one of `WRITE` and
+/// `EXECUTE`; nothing is executable until the Code Integrity Table exists.
+pub mod map_access {
+    /// Read.
+    pub const READ: u32 = 1 << 0;
+    /// Write.
+    pub const WRITE: u32 = 1 << 1;
+    /// Execute (refused in this version).
+    pub const EXECUTE: u32 = 1 << 2;
+    /// Every bit defined in this version.
+    pub const ALL: u32 = READ | WRITE | EXECUTE;
+}
+
+/// How a mapping is placed (P7, amendments C7 and D2).
+pub mod map_flags {
+    /// At the request's address, whose pages must all be free: a mapping is never replaced.
+    pub const FIXED: u32 = 1 << 0;
+    /// Every bit defined in this version.
+    pub const ALL: u32 = FIXED;
+}
+
+/// The structure `memory_object_create` reads (amendments C7 and D1), which begins with its own
+/// `u32 size`, set by the caller to a version it knows (P4).
+///
+/// ```text
+/// 0  u32 size     16
+/// 4  u32          zero
+/// 8  u64 length   bytes of the object: a non-zero multiple of PAGE_SIZE
+/// ```
+pub mod object_request {
+    /// Bytes of this version of the structure.
+    pub const SIZE: u32 = 16;
+    /// Byte offset of `size`.
+    pub const SIZE_AT: usize = 0;
+    /// Byte offset of `length`.
+    pub const LENGTH_AT: usize = 8;
+}
+
+/// The structure `memory_map` reads (amendments C7, C8 and D2), which begins with its own
+/// `u32 size` (P4).
+///
+/// ```text
+/// 0  u32 size      40
+/// 4  u32 access    map_access bits
+/// 8  u32 flags     map_flags bits
+/// 12 u32           zero
+/// 16 u64 offset    where the mapping starts in the object: a multiple of PAGE_SIZE
+/// 24 u64 length    bytes mapped: a non-zero multiple of PAGE_SIZE
+/// 32 u64 address   with FIXED, where it goes; otherwise zero
+/// ```
+pub mod map_request {
+    /// Bytes of this version of the structure.
+    pub const SIZE: u32 = 40;
+    /// Byte offset of `size`.
+    pub const SIZE_AT: usize = 0;
+    /// Byte offset of `access`.
+    pub const ACCESS_AT: usize = 4;
+    /// Byte offset of `flags`.
+    pub const FLAGS_AT: usize = 8;
+    /// Byte offset of `offset`.
+    pub const OFFSET_AT: usize = 16;
+    /// Byte offset of `length`.
+    pub const LENGTH_AT: usize = 24;
+    /// Byte offset of `address`.
+    pub const ADDRESS_AT: usize = 32;
 }
 
 /// Limits (P8, P9).
@@ -290,23 +389,59 @@ pub mod read_sizes {
 
 /// What `channel_read` writes for each handle it moves into the caller's table (B3): the
 /// handle, the type of the object it names and its rights there, so a receiver can check both
-/// before it uses the handle. Each record is 12 bytes, every field a little-endian `u32`, and
-/// the capacity passed is in records.
+/// before it uses the handle. Each record is 16 bytes, every field little-endian, with no
+/// padding (Amendment 6, E1), and the capacity passed is in records.
 ///
 /// ```text
-/// 0  u32 handle        its value in the caller's table
-/// 4  u32 object_type   an [`ObjectType`]
-/// 8  u32 rights        [`rights`]
+/// 0  u64 handle        its value in the caller's table
+/// 8  u32 object_type   an [`ObjectType`]
+/// 12 u32 rights        [`rights`]
 /// ```
 pub mod received_handle {
     /// Bytes of one record.
-    pub const SIZE: usize = 12;
+    pub const SIZE: usize = 16;
     /// Byte offset of `handle`.
     pub const HANDLE_AT: usize = 0;
     /// Byte offset of `object_type`.
-    pub const OBJECT_TYPE_AT: usize = 4;
+    pub const OBJECT_TYPE_AT: usize = 8;
     /// Byte offset of `rights`.
-    pub const RIGHTS_AT: usize = 8;
+    pub const RIGHTS_AT: usize = 12;
+}
+
+/// What `port_wait` writes (C9; amendment F1): one packet, 32 bytes, every field
+/// little-endian, with no padding and no `size` (an exception to P4 for this record only).
+///
+/// ```text
+/// 0  u64 key        what the binder gave, unchanged
+/// 8  u32 kind       a packet_kind: SIGNAL or CANCELED, never 0
+/// 12 u32 trigger    the mask the binding asked
+/// 16 u32 observed   the object's signals when the packet was queued
+/// 20 u32            zero
+/// 24 u64 data       zero in this version
+/// ```
+pub mod port_packet {
+    /// Bytes of one packet.
+    pub const SIZE: usize = 32;
+    /// Byte offset of `key`.
+    pub const KEY_AT: usize = 0;
+    /// Byte offset of `kind`.
+    pub const KIND_AT: usize = 8;
+    /// Byte offset of `trigger`.
+    pub const TRIGGER_AT: usize = 12;
+    /// Byte offset of `observed`.
+    pub const OBSERVED_AT: usize = 16;
+    /// Byte offset of `reserved`.
+    pub const RESERVED_AT: usize = 20;
+    /// Byte offset of `data`.
+    pub const DATA_AT: usize = 24;
+}
+
+/// What made a packet (amendment F1).
+pub mod packet_kind {
+    /// The object's signals met the binding's mask.
+    pub const SIGNAL: u32 = 1;
+    /// The binding was cancelled implicitly (F11, F16).
+    pub const CANCELED: u32 = 2;
 }
 
 /// The start record, version 1 (P6, amendment C4): what a process begins with. The kernel
@@ -324,18 +459,19 @@ pub mod received_handle {
 /// 20   u32 arg_bytes       bytes of the arguments, prefixes and padding included
 /// 24   u32 env_count
 /// 28   u32 env_bytes       bytes of the environment, the same way
-/// 32   handle_count × { u32 handle; u32 object_type; u32 rights; u32 role }
+/// 32   handle_count × { u64 handle; u32 object_type; u32 rights; u32 role; u32 zero }
 ///      the arguments, then the environment: each a u32 length, its bytes, then zeros to 8
 /// ```
 ///
-/// The whole record is at most 64 KiB, and every padding byte is zero.
+/// An entry is 24 bytes, its last four padding (Amendment 6, E1). The whole record is at most
+/// 64 KiB, and every padding byte is zero.
 pub mod start {
     use crate::{ABI_VERSION, Handle};
 
     /// Bytes of the header.
     pub const HEADER: usize = 32;
-    /// Bytes of one handle entry.
-    pub const ENTRY: usize = 16;
+    /// Bytes of one handle entry, its padding included.
+    pub const ENTRY: usize = 24;
     /// Most handles a start record carries.
     pub const MAX_HANDLES: usize = 64;
     /// Most bytes a start record takes, all of it.
@@ -367,11 +503,13 @@ pub mod start {
     /// Byte offset of an entry's `handle`, from the entry's start.
     pub const ENTRY_HANDLE_AT: usize = 0;
     /// Byte offset of an entry's `object_type`.
-    pub const ENTRY_OBJECT_TYPE_AT: usize = 4;
+    pub const ENTRY_OBJECT_TYPE_AT: usize = 8;
     /// Byte offset of an entry's `rights`.
-    pub const ENTRY_RIGHTS_AT: usize = 8;
+    pub const ENTRY_RIGHTS_AT: usize = 12;
     /// Byte offset of an entry's `role`.
-    pub const ENTRY_ROLE_AT: usize = 12;
+    pub const ENTRY_ROLE_AT: usize = 16;
+    /// Byte offset of an entry's padding, four bytes that are zero.
+    pub const ENTRY_PADDING_AT: usize = 20;
 
     /// What a start-record handle is for (amendment C5).
     pub mod role {
@@ -430,6 +568,10 @@ pub mod start {
 
     fn u32_at(b: &[u8], at: usize) -> Result<u32, StartError> {
         get(b, at).map(u32::from_le_bytes)
+    }
+
+    fn u64_at(b: &[u8], at: usize) -> Result<u64, StartError> {
+        get(b, at).map(u64::from_le_bytes)
     }
 
     fn u16_at(b: &[u8], at: usize) -> Result<u16, StartError> {
@@ -511,8 +653,10 @@ pub mod start {
         put(record, ENV_BYTES_AT, &u32_of(env_bytes)?.to_le_bytes())?;
         let mut at = HEADER;
         for entry in entries {
+            let handle = at.checked_add(ENTRY_HANDLE_AT).ok_or(StartError::Short)?;
+            put(record, handle, &entry.handle.to_le_bytes())?;
+            // The padding stays as `fill` left it: zero.
             for (offset, value) in [
-                (ENTRY_HANDLE_AT, entry.handle),
                 (ENTRY_OBJECT_TYPE_AT, entry.object_type),
                 (ENTRY_RIGHTS_AT, entry.rights),
                 (ENTRY_ROLE_AT, entry.role),
@@ -601,7 +745,7 @@ pub mod start {
                 let at = ENTRY.checked_mul(i)?;
                 let field = |offset: usize| u32_at(self.entries, at.checked_add(offset)?).ok();
                 Some(Entry {
-                    handle: field(ENTRY_HANDLE_AT)?,
+                    handle: u64_at(self.entries, at.checked_add(ENTRY_HANDLE_AT)?).ok()?,
                     object_type: field(ENTRY_OBJECT_TYPE_AT)?,
                     rights: field(ENTRY_RIGHTS_AT)?,
                     role: field(ENTRY_ROLE_AT)?,
@@ -643,6 +787,15 @@ pub mod start {
             return Err(StartError::Malformed);
         }
         let entries = record.get(HEADER..args_at).ok_or(StartError::Malformed)?;
+        for i in 0..count {
+            let padding = ENTRY
+                .checked_mul(i)
+                .and_then(|at| at.checked_add(ENTRY_PADDING_AT))
+                .ok_or(StartError::Malformed)?;
+            if u32_at(entries, padding).map_err(|_| StartError::Malformed)? != 0 {
+                return Err(StartError::Malformed);
+            }
+        }
         let args = record.get(args_at..env_at).ok_or(StartError::Malformed)?;
         let env = record.get(env_at..size).ok_or(StartError::Malformed)?;
         Ok(StartRecord {
@@ -750,6 +903,15 @@ mod tests {
             syscall::WAIT_ONE,
             syscall::EVENT_CREATE,
             syscall::OBJECT_SIGNAL,
+            syscall::MEMORY_OBJECT_CREATE,
+            syscall::MEMORY_MAP,
+            syscall::MEMORY_UNMAP,
+            syscall::MEMORY_PROTECT,
+            syscall::PORT_CREATE,
+            syscall::OBJECT_WAIT_ASYNC,
+            syscall::PORT_WAIT,
+            syscall::PORT_CANCEL,
+            syscall::CLOCK_READ,
         ];
         let mut sorted = n.to_vec();
         sorted.sort_unstable();
@@ -777,15 +939,23 @@ mod tests {
         assert_eq!(read_sizes::SENDER_PROCESS_AT, 16);
         assert_eq!(read_sizes::SENDER_PRINCIPAL_AT, 24);
         assert_eq!(read_sizes::SIZE, 32);
-        // Three `u32`s, in order, with no padding (B3).
+        // A `u64` handle, then two `u32`s, in order, with no padding (B3; Amendment 6, E1).
         assert_eq!(received_handle::HANDLE_AT, 0);
-        assert_eq!(received_handle::OBJECT_TYPE_AT, 4);
-        assert_eq!(received_handle::RIGHTS_AT, 8);
-        assert_eq!(received_handle::SIZE, 12);
+        assert_eq!(received_handle::OBJECT_TYPE_AT, 8);
+        assert_eq!(received_handle::RIGHTS_AT, 12);
+        assert_eq!(received_handle::SIZE, 16);
+        // A start entry: a `u64` handle, three `u32`s, and four bytes of padding to 8 (E1).
+        assert_eq!(start::ENTRY_HANDLE_AT, 0);
+        assert_eq!(start::ENTRY_OBJECT_TYPE_AT, 8);
+        assert_eq!(start::ENTRY_RIGHTS_AT, 12);
+        assert_eq!(start::ENTRY_ROLE_AT, 16);
+        assert_eq!(start::ENTRY_PADDING_AT, 20);
+        assert_eq!(start::ENTRY, 24);
+        assert_eq!(start::HEADER % 8, 0, "every entry's handle is aligned");
     }
 
     /// A channel end in a start record, with `role`.
-    fn channel_entry(handle: u32, role: u32) -> start::Entry {
+    fn channel_entry(handle: Handle, role: u32) -> start::Entry {
         start::Entry {
             handle,
             object_type: ObjectType::Channel as u32,
@@ -814,22 +984,49 @@ mod tests {
     }
 
     #[test]
+    fn a_memory_object_has_c6s_rights_and_never_execute() {
+        assert_eq!(
+            rights::MEMORY_OBJECT,
+            rights::READ | rights::WRITE | rights::MAP | rights::DUPLICATE | rights::TRANSFER
+        );
+        assert_eq!(rights::MEMORY_OBJECT & rights::EXECUTE, 0);
+        assert_eq!(rights::MEMORY_OBJECT & !rights::ALL, 0);
+    }
+
+    #[test]
+    fn the_memory_requests_are_laid_out_field_by_field() {
+        // Each field at its alignment after the implicit size, with no hole but the one named.
+        assert_eq!(object_request::SIZE_AT, 0);
+        assert_eq!(object_request::LENGTH_AT, 8);
+        assert_eq!(object_request::SIZE as usize, object_request::LENGTH_AT + 8);
+        assert_eq!(map_request::ACCESS_AT, 4);
+        assert_eq!(map_request::FLAGS_AT, 8);
+        assert_eq!(map_request::OFFSET_AT, 16);
+        assert_eq!(map_request::LENGTH_AT, 24);
+        assert_eq!(map_request::ADDRESS_AT, 32);
+        assert_eq!(map_request::SIZE as usize, map_request::ADDRESS_AT + 8);
+        assert_eq!(map_access::ALL, 0b111);
+        assert_eq!(map_flags::ALL, 0b1);
+        assert!(PAGE_SIZE.is_power_of_two());
+    }
+
+    #[test]
     fn start_records_round_trip_with_their_handles_arguments_and_environment() {
         let entries = [
             start::Entry {
-                handle: 0x0001_0001,
+                handle: 0x0000_0100_0000_0001,
                 object_type: ObjectType::Process as u32,
                 rights: rights::PROCESS,
                 role: start::role::SELF_PROCESS,
             },
             start::Entry {
-                handle: 0x0001_0002,
+                handle: 0x0000_0200_0000_0001,
                 object_type: ObjectType::Thread as u32,
                 rights: rights::THREAD,
                 role: start::role::SELF_THREAD,
             },
-            channel_entry(0x0001_0003, start::role::BOOTSTRAP),
-            channel_entry(0x0001_0004, start::role::DIRECTORY),
+            channel_entry(0xFFFF_FF00_0000_0003, start::role::BOOTSTRAP),
+            channel_entry(0x0000_0400_0000_0004, start::role::DIRECTORY),
         ];
         let args: [&[u8]; 3] = [b"origin", b"", b"seven b"];
         let env: [&[u8]; 1] = [b"LANG=te"];
@@ -837,7 +1034,7 @@ mod tests {
         let size = start::encode(&entries, &args, &env, &mut buf).unwrap();
         // The header, four entries, then 4 + 6 bytes padded to 16, 4 to 8, 4 + 7 to 16, and
         // the environment's 4 + 7 to 16.
-        assert_eq!(size, 32 + 4 * 16 + 16 + 8 + 16 + 16);
+        assert_eq!(size, 32 + 4 * 24 + 16 + 8 + 16 + 16);
         assert_eq!(start::size_of(entries.len(), &args, &env), Ok(size));
         let r = start::decode(&buf[..size]).unwrap();
         assert_eq!(r.abi, ABI_VERSION);
@@ -850,14 +1047,24 @@ mod tests {
         assert_eq!(r.env.iter().collect::<Vec<_>>(), env);
         // Where a program finds them.
         assert_eq!(&buf[..4], &(size as u32).to_le_bytes());
-        assert_eq!(&buf[32..36], &0x0001_0001u32.to_le_bytes());
+        assert_eq!(&buf[32..40], &0x0000_0100_0000_0001u64.to_le_bytes());
         assert_eq!(
-            &buf[32 + 12..32 + 16],
+            &buf[32 + 16..32 + 20],
             &start::role::SELF_PROCESS.to_le_bytes()
+        );
+        // The whole 64 bits of a handle arrive, the top half included.
+        let third = 32 + 2 * start::ENTRY;
+        assert_eq!(
+            &buf[third..third + 8],
+            &0xFFFF_FF00_0000_0003u64.to_le_bytes()
         );
         // Every reserved and padding byte is zero, whatever the buffer held, and nothing past
         // the record is written.
         assert_eq!(&buf[start::RESERVED_AT..start::RESERVED_AT + 2], &[0, 0]);
+        for i in 0..entries.len() {
+            let padding = 32 + i * start::ENTRY + start::ENTRY_PADDING_AT;
+            assert_eq!(&buf[padding..padding + 4], &[0; 4], "entry {i}'s padding");
+        }
         let first_arg = start::HEADER + 4 * start::ENTRY;
         assert_eq!(&buf[first_arg + 4..first_arg + 10], b"origin");
         assert_eq!(&buf[first_arg + 10..first_arg + 16], &[0; 6]);
@@ -896,7 +1103,7 @@ mod tests {
 
     #[test]
     fn malformed_start_records_are_refused() {
-        let entries = [channel_entry(0x0001_0003, start::role::BOOTSTRAP)];
+        let entries = [channel_entry(0x0000_0300_0000_0001, start::role::BOOTSTRAP)];
         let mut good = [0u8; 128];
         let size = start::encode(&entries, &[b"abc"], &[], &mut good).unwrap();
         let first_arg = start::HEADER + start::ENTRY;
@@ -927,6 +1134,13 @@ mod tests {
             malformed,
             "a padding byte"
         );
+        for byte in 0..4 {
+            assert_eq!(
+                refused(&|b| b[start::HEADER + start::ENTRY_PADDING_AT + byte] = 0x80),
+                malformed,
+                "byte {byte} of an entry's padding"
+            );
+        }
         assert_eq!(
             refused(&|b| b[first_arg..first_arg + 4].copy_from_slice(&100u32.to_le_bytes())),
             malformed,

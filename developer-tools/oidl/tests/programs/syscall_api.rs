@@ -18,7 +18,7 @@ struct Log {
     calls: Vec<String>,
     /// What the next channel_read should do: the message's bytes, and a record of each handle
     /// (its value, object type and rights).
-    next_read: Option<(Vec<u8>, Vec<(u32, u32, u32)>)>,
+    next_read: Option<(Vec<u8>, Vec<(u64, u32, u32)>)>,
     /// The writer the next channel_read reports: (process, principal).
     sender: (u64, u64),
     /// What the next wait_one should report: (status, observed).
@@ -29,6 +29,10 @@ struct Log {
     records_in: Option<(u64, Vec<u8>, Vec<u8>)>,
     /// What the next `records_out` writes: the records' bytes, `n` and the array's bytes.
     next_records: Option<(Vec<u8>, u32, Vec<u8>)>,
+    /// What the next port_wait writes: a packet's 32 bytes.
+    next_packet: Option<[u8; 32]>,
+    /// What the next clock_read writes.
+    clock: u64,
 }
 
 static MOCK: Mutex<Option<Log>> = Mutex::new(None);
@@ -63,14 +67,14 @@ pub unsafe extern "C" fn origin_kernel_debug_write(text: *const u8, count: u64) 
     })
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn origin_kernel_handle_close(handle: u32) -> i64 {
+pub extern "C" fn origin_kernel_handle_close(handle: u64) -> i64 {
     with(|m| {
         m.calls.push(format!("handle_close {handle}"));
         m.status
     })
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn origin_kernel_handle_duplicate(handle: u32, rights: u32, out: *mut u32) -> i64 {
+pub unsafe extern "C" fn origin_kernel_handle_duplicate(handle: u64, rights: u32, out: *mut u64) -> i64 {
     with(|m| {
         m.calls.push(format!("handle_duplicate {handle} {rights}"));
         if m.status == 0 {
@@ -80,13 +84,14 @@ pub unsafe extern "C" fn origin_kernel_handle_duplicate(handle: u32, rights: u32
     })
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn origin_kernel_channel_create(out: *mut u32) -> i64 {
+pub unsafe extern "C" fn origin_kernel_channel_create(out: *mut u64) -> i64 {
     with(|m| {
         m.calls.push("channel_create".to_string());
         if m.status == 0 {
+            // Values above 32 bits, so a client that kept half of one would be seen (E1).
             unsafe {
-                out.write(77);
-                out.add(1).write(78);
+                out.write(0xFFFF_FF00_0000_004D);
+                out.add(1).write(0x0000_0100_0000_004E);
             }
         }
         m.status
@@ -94,10 +99,10 @@ pub unsafe extern "C" fn origin_kernel_channel_create(out: *mut u32) -> i64 {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn origin_kernel_channel_write(
-    end: u32,
+    end: u64,
     bytes: *const u8,
     bytes_count: u64,
-    handles: *const u32,
+    handles: *const u64,
     handles_count: u64,
 ) -> i64 {
     let payload = unsafe { core::slice::from_raw_parts(bytes, bytes_count as usize) }.to_vec();
@@ -109,7 +114,7 @@ pub unsafe extern "C" fn origin_kernel_channel_write(
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn origin_kernel_channel_read(
-    end: u32,
+    end: u64,
     bytes: *mut u8,
     bytes_capacity: u64,
     handles: *mut u8,
@@ -137,12 +142,13 @@ pub unsafe extern "C" fn origin_kernel_channel_read(
         }
         unsafe {
             core::ptr::copy_nonoverlapping(message.as_ptr(), bytes, message.len());
-            // A record per handle: three little-endian u32s (ADR-0005 B3).
+            // A record per handle: a little-endian u64 and two u32s, 16 bytes (ADR-0005 B3,
+            // Amendment 6 E1).
             for (index, (value, object, rights)) in list.iter().enumerate() {
-                let record = handles.add(index * 12);
-                (record as *mut u32).write_unaligned(*value);
-                (record.add(4) as *mut u32).write_unaligned(*object);
-                (record.add(8) as *mut u32).write_unaligned(*rights);
+                let record = handles.add(index * 16);
+                (record as *mut u64).write_unaligned(*value);
+                (record.add(8) as *mut u32).write_unaligned(*object);
+                (record.add(12) as *mut u32).write_unaligned(*rights);
             }
         }
         0
@@ -150,7 +156,7 @@ pub unsafe extern "C" fn origin_kernel_channel_read(
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn origin_kernel_wait_one(
-    handle: u32,
+    handle: u64,
     signals: u32,
     deadline: u64,
     observed: *mut u32,
@@ -163,12 +169,37 @@ pub unsafe extern "C" fn origin_kernel_wait_one(
     })
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn origin_kernel_event_create(_out: *mut u32) -> i64 {
-    k::Error::NotSupported.raw()
+pub unsafe extern "C" fn origin_kernel_event_create(out: *mut u64) -> i64 {
+    with(|m| {
+        m.calls.push("event_create".to_string());
+        unsafe { out.write(21) };
+        m.status
+    })
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn origin_kernel_object_signal(_o: u32, _clear: u32, _set: u32) -> i64 {
-    k::Error::NotSupported.raw()
+pub extern "C" fn origin_kernel_object_signal(object: u64, clear: u32, set: u32) -> i64 {
+    with(|m| {
+        m.calls.push(format!("object_signal {object} {clear} {set}"));
+        m.status
+    })
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn origin_kernel_port_wait(port: u64, deadline: u64, packet: *mut u8) -> i64 {
+    with(|m| {
+        m.calls.push(format!("port_wait {port} {deadline}"));
+        if let Some(bytes) = m.next_packet {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), packet, bytes.len()) };
+        }
+        m.status
+    })
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn origin_kernel_clock_read(nanos: *mut u64) -> i64 {
+    with(|m| {
+        m.calls.push("clock_read".to_string());
+        unsafe { nanos.write(m.clock) };
+        m.status
+    })
 }
 
 // The fixture's entry points. Only the records calls run here; the others exist for the link.
@@ -186,7 +217,7 @@ pub extern "C" fn origin_fixture_calls_buffers(
     _text_count: u64,
     _data: *const u32,
     _data_count: u64,
-    _opt: u32,
+    _opt: u64,
     _p: *const u8,
 ) -> i64 {
     unreachable!()
@@ -205,7 +236,7 @@ pub extern "C" fn origin_fixture_calls_gated() -> i64 {
     unreachable!()
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn origin_fixture_calls_rights(_h: u32) -> i64 {
+pub extern "C" fn origin_fixture_calls_rights(_h: u64) -> i64 {
     unreachable!()
 }
 #[unsafe(no_mangle)]
@@ -221,8 +252,8 @@ pub extern "C" fn origin_fixture_calls_results(
     _r_bool: *mut u8,
     _r_kind: *mut i32,
     _r_mode: *mut u16,
-    _r_handle: *mut u32,
-    _r_opt: *mut u32,
+    _r_handle: *mut u64,
+    _r_opt: *mut u64,
     _r_num: *mut u64,
 ) -> i64 {
     unreachable!()
@@ -267,7 +298,7 @@ pub unsafe extern "C" fn origin_fixture_calls_records_out(
     })
 }
 
-fn handle(raw: u32) -> rt::Handle {
+fn handle(raw: u64) -> rt::Handle {
     rt::Handle::from_abi(raw)
 }
 
@@ -283,7 +314,12 @@ fn client_paths() {
     assert_eq!(kc::handle_close(handle(5)), Ok(()));
     let rights = k::Rights::READ.union(k::Rights::WRITE);
     assert_eq!(kc::handle_duplicate(handle(5), rights), Ok(handle(1005)));
-    assert_eq!(kc::channel_create(), Ok([handle(77), handle(78)]));
+    assert_eq!(
+        kc::channel_create(),
+        Ok([handle(0xFFFF_FF00_0000_004D), handle(0x0000_0100_0000_004E)])
+    );
+    // A handle fills its register: all 64 bits reach the kernel (E1).
+    assert_eq!(kc::handle_close(handle(0xFFFF_FFFF_0000_0005)), Ok(()));
     assert_eq!(kc::channel_write(handle(3), b"abc", &[handle(4), handle(5)]), Ok(()));
 
     // channel_read: success fills the buffers and reports the counts through @count, and each
@@ -292,7 +328,9 @@ fn client_paths() {
     let rights_of_a_channel = k::CHANNEL_RIGHTS.bits();
     // The writer's identity comes with the sizes, all 64 bits of each (ADR-0005 B1, C2).
     with(|m| m.sender = (0x0000_0001_0000_0029, 0xA11C_E000_0000_0001));
-    with(|m| m.next_read = Some((b"xyz".to_vec(), vec![(9, channel, rights_of_a_channel)])));
+    with(|m| {
+        m.next_read = Some((b"xyz".to_vec(), vec![(0xABCD_0000_0000_0009, channel, rights_of_a_channel)]))
+    });
     let filler = <k::ReceivedHandle as rt::Fixed>::FILLER;
     let mut bytes = [0u8; 8];
     let mut handles = [filler; 2];
@@ -311,7 +349,11 @@ fn client_paths() {
     assert_eq!(&bytes[..3], b"xyz");
     assert_eq!(
         handles[0],
-        k::ReceivedHandle { handle: 9, object_type: k::ObjectType::Channel, rights: k::CHANNEL_RIGHTS }
+        k::ReceivedHandle {
+            handle: 0xABCD_0000_0000_0009,
+            object_type: k::ObjectType::Channel,
+            rights: k::CHANNEL_RIGHTS
+        }
     );
     // A record the definition cannot hold is a protocol error, not a handle.
     with(|m| m.next_read = Some((b"x".to_vec(), vec![(9, 99, rights_of_a_channel)])));
@@ -380,12 +422,64 @@ fn client_paths() {
         rt::CallError::Method(kc::WaitOneFailure { error: ks::WaitOneError::Canceled, observed: None }),
         "an undecodable @also_on value is reported as absent"
     );
-    assert_eq!(kc::event_create(), Err(rt::CallError::Method(ks::EventCreateError::NotSupported)));
+    // event_create, object_signal (ADR-0005 Amendment 7, F5, F17): a handle back; a status.
+    with(|m| m.status = 0);
+    assert_eq!(kc::event_create(), Ok(handle(21)));
+    assert_eq!(kc::object_signal(handle(21), k::Signals::NONE, k::Signals::SIGNALED), Ok(()));
+    with(|m| m.status = k::Error::WrongType.raw());
+    assert_eq!(
+        kc::object_signal(handle(3), k::Signals::NONE, k::Signals::SIGNALED),
+        Err(rt::CallError::Method(ks::ObjectSignalError::WrongType))
+    );
+    // port_wait's packet is a plain 32-byte record the kernel writes (F1), decoded field by field.
+    with(|m| m.status = 0);
+    let mut packet = [0u8; 32];
+    packet[0..8].copy_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes());
+    packet[8..12].copy_from_slice(&2u32.to_le_bytes());
+    packet[12..16].copy_from_slice(&k::Signals::SIGNALED.bits().to_le_bytes());
+    packet[16..20].copy_from_slice(&k::Signals::TERMINATED.bits().to_le_bytes());
+    with(|m| m.next_packet = Some(packet));
+    assert_eq!(
+        kc::port_wait(handle(22), 99),
+        Ok(k::PortPacket {
+            key: 0x0123_4567_89AB_CDEF,
+            kind: k::PacketKind::Canceled,
+            trigger: k::Signals::SIGNALED,
+            observed: k::Signals::TERMINATED,
+            reserved: 0,
+            data: 0,
+        })
+    );
+    // A kind this minor does not know, or 0, is a protocol error at the client, not a value: a
+    // new kind is a new minor of origin.kernel.
+    for kind in [0u32, 3] {
+        packet[8..12].copy_from_slice(&kind.to_le_bytes());
+        with(|m| m.next_packet = Some(packet));
+        assert_eq!(
+            kc::port_wait(handle(22), 0),
+            Err(rt::CallError::Protocol(rt::WireError::Enum)),
+            "kind {kind}"
+        );
+    }
+    with(|m| m.status = k::Error::Canceled.raw());
+    assert_eq!(
+        kc::port_wait(handle(22), 0),
+        Err(rt::CallError::Method(ks::PortWaitError::Canceled))
+    );
+    // clock_read: the nanoseconds the kernel wrote (F10).
+    with(|m| {
+        m.status = 0;
+        m.clock = 1_234_567_890;
+    });
+    assert_eq!(kc::clock_read(), Ok(1_234_567_890));
     let log = with(|m| m.calls.clone());
+    assert!(log.contains(&"object_signal 21 0 8".to_string()), "{log:?}");
+    assert!(log.contains(&"port_wait 22 99".to_string()), "{log:?}");
     assert!(log.contains(&"handle_duplicate 5 3".to_string()), "{log:?}");
     assert!(log.contains(&"channel_write 3 [97, 98, 99] [4, 5]".to_string()), "{log:?}");
     assert!(log.contains(&"channel_read 3 8 2".to_string()), "{log:?}");
     assert!(log.contains(&"wait_one 3 1 123".to_string()), "{log:?}");
+    assert!(log.contains(&"handle_close 18446744069414584325".to_string()), "{log:?}");
 }
 
 // --- The kernel-side decoders: what `dispatch` hands the kernel ---------------------------------
@@ -585,10 +679,13 @@ fn decoded_values() {
     assert_eq!(run(3, [0x1000, 33, 0x2000, 8, 0, 0x3000]), k::Error::InvalidArgs.raw(), "over the string bound");
     assert_eq!(run(3, [0x1000, 32, 0x2000, 9, 0, 0x3000]), k::Error::InvalidArgs.raw(), "over the vector bound");
     assert_eq!(run(3, [0x1000, 32, 0x2000, 8, 7, 0x3000]), 0, "a handle; zero is absent");
-    assert_eq!(run(3, [0x1000, 32, 0x2000, 8, 1 << 32, 0x3000]), k::Error::BadHandle.raw(), "over 32 bits");
+    // A handle fills its register (ADR-0005 Amendment 6, E1): no value is refused by decoding.
+    assert_eq!(run(3, [0x1000, 32, 0x2000, 8, 1 << 32, 0x3000]), 0, "above 32 bits");
+    assert_eq!(run(3, [0x1000, 32, 0x2000, 8, u64::MAX, 0x3000]), 0, "every bit");
     // A result buffer's capacity is clamped, never refused.
     assert_eq!(run(4, [0x1000, 0x2000, 0x3000, 100, 0, 0]), 0);
     assert_eq!(run(6, [5, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(run(6, [0xFFFF_FFFF_0000_0005, 0, 0, 0, 0, 0]), 0, "a handle's top half");
     // Vectors and arrays of structs: lengths in bytes are the wire size of each record.
     assert_eq!(run(10, [0x1000, 4, 0x2000, 0, 0, 0]), 0);
     assert_eq!(run(10, [0x1000, 5, 0x2000, 0, 0, 0]), k::Error::InvalidArgs.raw(), "over the vector bound");
@@ -604,6 +701,15 @@ fn decoded_values() {
     assert!(log.contains(&"buffers 1000 32 2000 8 32 Some((7, 0, 0)) 3000".to_string()), "{log:?}");
     assert!(log.contains(&"struct_io 1000 2000 3000 16 16".to_string()), "the capacity 100 is clamped to the bound 16: {log:?}");
     assert!(log.contains(&"rights 5 3 4".to_string()), "need read|write and a channel: {log:?}");
+    // The whole register reaches the kernel's table, never a part of it (E1).
+    let whole = [
+        "rights 18446744069414584325 3 4",
+        "buffers 1000 32 2000 8 32 Some((4294967296, 0, 0)) 3000",
+        "buffers 1000 32 2000 8 32 Some((18446744073709551615, 0, 0)) 3000",
+    ];
+    for line in whole {
+        assert!(log.contains(&line.to_string()), "a handle's top half was lost: {line}: {log:?}");
+    }
 
     // A @reserved number answers not_supported without any implementation.
     assert_eq!(run(8, [0; 6]), k::Error::NotSupported.raw());

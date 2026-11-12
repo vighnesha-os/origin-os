@@ -89,7 +89,7 @@ proofs! {
     Topology "CPU topology" => Report;
     Numa "NUMA affinities" => Report;
     NumaDistances "NUMA distances" => Report;
-    Entropy "hardware entropy" => Report;
+    Random "random-number generator" => Withdraw("no randomness");
     // Threads, and what runs in ring 3.
     Preemption "preemption" => Refuse;
     Fairness "scheduler fairness" => Report;
@@ -110,7 +110,12 @@ proofs! {
     AddressSpaces "live address spaces" => Refuse;
     Identity "a message's writer" => Refuse;
     Launch "process start" => Refuse;
+    RustProgram "a Rust program in ring 3" => Refuse;
     Directory "the service directory" => Refuse;
+    Memory "memory objects" => Refuse;
+    EventsPorts "events and ports" => Refuse;
+    UserClock "the clock as ring 3 reads it" => Report;
+    Stacks "kernel stacks" => Refuse;
     ThreadsReaped "thread reaping" => Report;
     Ibpb "IBPB at each change of process" => Refuse;
     // Devices.
@@ -133,14 +138,14 @@ proofs! {
     ConsoleSections "console screen sections" => Report;
 }
 
-// A proof's bit in the tally's two words.
-const _: () = assert!(Proof::ALL.len() <= u64::BITS as usize);
+// A proof's bit in the tally's two words: 128 proofs at most.
+const _: () = assert!(Proof::ALL.len() <= u128::BITS as usize);
 
 /// Which proofs have run and which of them failed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Tally {
-    ran: u64,
-    failed: u64,
+    ran: u128,
+    failed: u128,
 }
 
 impl Tally {
@@ -152,7 +157,7 @@ impl Tally {
 
     /// Records that `proof` ran, and whether it passed. A failure stays recorded.
     pub fn record(&mut self, proof: Proof, passed: bool) {
-        let bit = 1u64 << (proof as u32);
+        let bit = 1u128 << (proof as u32);
         self.ran |= bit;
         if !passed {
             self.failed |= bit;
@@ -164,7 +169,7 @@ impl Tally {
         Proof::ALL
             .iter()
             .copied()
-            .filter(move |&p| self.failed & (1u64 << (p as u32)) != 0)
+            .filter(move |&p| self.failed & (1u128 << (p as u32)) != 0)
     }
 
     /// The failed proofs whose failure stops the boot, in boot order.
@@ -233,7 +238,7 @@ mod tests {
 
     /// Every proof whose failure stops the boot (ADR-0013 R1). Changing this list changes
     /// what a real machine does: change the ADR with it.
-    const REFUSING: [Proof; 21] = [
+    const REFUSING: [Proof; 25] = [
         Proof::PageTables,
         Proof::FrameAllocator,
         Proof::Heap,
@@ -253,15 +258,20 @@ mod tests {
         Proof::AddressSpaces,
         Proof::Identity,
         Proof::Launch,
+        Proof::RustProgram,
         Proof::Directory,
+        Proof::Memory,
+        Proof::EventsPorts,
+        Proof::Stacks,
         Proof::Ibpb,
     ];
 
-    /// Every proof whose failure withholds a capability (ADR-0013 R2).
-    const WITHDRAWING: [Proof; 6] = [
+    /// Every proof whose failure withholds a capability (ADR-0013 R2, Amendment 1).
+    const WITHDRAWING: [Proof; 7] = [
         Proof::BusMasterQuiesce,
         Proof::Iommu,
         Proof::Processors,
+        Proof::Random,
         Proof::Pcie,
         Proof::BusMastersQuiet,
         Proof::Nvme,
@@ -289,7 +299,7 @@ mod tests {
 
     #[test]
     fn the_table_has_one_row_per_proof_in_order() {
-        assert_eq!(Proof::ALL.len(), 59);
+        assert_eq!(Proof::ALL.len(), 64);
         for (i, &proof) in Proof::ALL.iter().enumerate() {
             assert_eq!(proof as usize, i, "{proof:?} is out of order");
             assert!(!proof.name().is_empty(), "{proof:?} has no name");
@@ -321,6 +331,33 @@ mod tests {
         assert_eq!(
             Proof::Processors.consequence(),
             Consequence::Withdraw("fewer processors")
+        );
+        // ADR-0013 Amendment 1 and ADR-0016 R8: with no generator, randomness is withheld.
+        assert_eq!(
+            Proof::Random.consequence(),
+            Consequence::Withdraw("no randomness")
+        );
+        assert_eq!(Proof::Random.name(), "random-number generator");
+    }
+
+    #[test]
+    fn a_machine_with_no_generator_reaches_a_verdict_that_names_it() {
+        // ADR-0016 R8: the boot goes on, the three proofs that launch a process and the one
+        // that maps memory objects at addresses chosen at random do not run, and the verdict
+        // names the generator.
+        let mut tally = Tally::new();
+        for &proof in Proof::ALL {
+            if !matches!(
+                proof,
+                Proof::Launch | Proof::RustProgram | Proof::Directory | Proof::Memory
+            ) {
+                tally.record(proof, proof != Proof::Random);
+            }
+        }
+        assert!(!tally.must_stop());
+        assert_eq!(
+            verdict(tally),
+            "origin-kernel: boot verdict: degraded: 59 of 60 proofs passed; 4 did not run; failed: random-number generator (no randomness)\n"
         );
     }
 
@@ -371,7 +408,7 @@ mod tests {
     fn the_verdict_of_a_clean_boot_is_exact() {
         assert_eq!(
             verdict(passed_all()),
-            "origin-kernel: boot verdict: 59 of 59 proofs passed\n"
+            "origin-kernel: boot verdict: 64 of 64 proofs passed\n"
         );
     }
 
@@ -383,7 +420,7 @@ mod tests {
         tally.record(Proof::Nvme, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 56 of 59 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
+            "origin-kernel: boot verdict: degraded: 61 of 64 proofs passed; failed: IOMMU bring-up (no device drivers), NVMe (no storage), i8042\n"
         );
     }
 
@@ -394,7 +431,7 @@ mod tests {
         tally.record(Proof::PageTables, true);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 57 did not run\n"
+            "origin-kernel: boot verdict: degraded: 2 of 2 proofs passed; 62 did not run\n"
         );
     }
 
@@ -405,7 +442,7 @@ mod tests {
         tally.record(Proof::Raster, false);
         assert_eq!(
             verdict(tally),
-            "origin-kernel: boot verdict: degraded: 58 of 59 proofs passed; failed: rasterizer\n"
+            "origin-kernel: boot verdict: degraded: 63 of 64 proofs passed; failed: rasterizer\n"
         );
     }
 

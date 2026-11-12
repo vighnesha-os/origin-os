@@ -4,6 +4,19 @@
 # GitHub's standard runners are free for this public repository, and this workflow uses nothing
 # else (§80). It has no secrets and only reads the repository.
 #
+# Every job builds with exactly the pinned compiler: install-rust.sh fails unless rustc reports
+# the version rust-toolchain.toml names and the commit developer-tools/toolchain/rustc-commit-hash
+# holds (§8).
+#
+# Every cargo command here carries `--locked`, so a job stops before it builds anything if
+# Cargo.lock is out of step with the manifests. Without the flag cargo rewrites the file and
+# carries on. That first command resolves the whole workspace, so the cargo commands xtask starts
+# afterwards resolve the same workspace against the same file and have nothing to change; they
+# do not repeat the flag. xtask's Loom models are the one other resolution: a scratch workspace
+# built from a lock of its own (developer-tools/xtask/src/loom.lock), which xtask holds with
+# `--locked` itself (loom.rs). The root Cargo.lock holds the workspace's packages alone
+# (`cargo xtask check`).
+#
 # Neither kind of boot below qualifies anything (§74, rule 30): the devices and the firmware are
 # QEMU's, and the processors are whatever GitHub's fleet holds, not the declared hardware.
 name: ci
@@ -26,6 +39,30 @@ env:
   ORIGIN_BOOT_TEST_TIMEOUT: 600
 
 jobs:
+  # CLAUDE.md §9 and §10: the toolchain's own checks and the three regression tests, on the
+  # compiler this run installed. §10's wcslen test builds the loader itself. The report goes to
+  # the run's summary page and not into the checkout, which the last step holds unchanged.
+  toolchain:
+    name: toolchain verification (verify.sh)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: bash .github/ci/install-rust.sh
+      - name: Verify the toolchain
+        run: bash developer-tools/toolchain/verify.sh --report "$RUNNER_TEMP/VERIFICATION.md"
+      - name: The report
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f "$RUNNER_TEMP/VERIFICATION.md" ]; then
+            cat "$RUNNER_TEMP/VERIFICATION.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: The job left the checkout as committed
+        run: bash .github/ci/checkout-unchanged.sh
+
   check:
     name: cargo xtask check
     runs-on: ubuntu-24.04
@@ -36,7 +73,11 @@ jobs:
           persist-credentials: false
       - name: Install the pinned Rust toolchain
         run: bash .github/ci/install-rust.sh
-      - run: cargo xtask check
+      - run: cargo --locked xtask check
+      # What `--locked` cannot say: that nothing the job ran afterwards rewrote Cargo.lock, or
+      # any other tracked file. This job runs every build the others do.
+      - name: The job left the checkout as committed
+        run: bash .github/ci/checkout-unchanged.sh
 
   # The control: every proof, on QEMU's software CPU, as on the development Mac.
   boot-software-cpu:
@@ -51,7 +92,7 @@ jobs:
         run: bash .github/ci/install-rust.sh
       - name: Build QEMU
         run: bash .github/ci/install-qemu.sh
-      - run: cargo xtask boot-matrix
+      - run: cargo --locked xtask boot-matrix
 
   # The same boots on a real processor through KVM. Two runner images, because that is the only
   # say a job has in which processor it gets. xtask holds every proof to its markers, except the
@@ -87,14 +128,14 @@ jobs:
         run: bash .github/ci/install-qemu.sh
       - name: Let this job use KVM
         run: bash .github/ci/enable-kvm.sh
-      - run: cargo xtask boot-matrix
+      - run: cargo --locked xtask boot-matrix
       - name: The processor as it is, nothing masked
         if: ${{ !cancelled() }}
         env:
           ORIGIN_QEMU_CPU: host
           ORIGIN_QEMU_SMP: 4
           ORIGIN_BOOT_TEST_ONLY: kernel boot
-        run: cargo xtask boot-test
+        run: cargo --locked xtask boot-test
 
   # Which vendors and models this run's real-CPU boots ran on, in one table on the run's summary
   # page, with a notice on the pull request. A record only: it never fails the run.

@@ -33,6 +33,21 @@ pub fn kernel_virtual_base() -> u64 {
     KERNEL_VIRTUAL.load(Ordering::Relaxed)
 }
 
+/// How a crash report prints `addr` (ADR-0004 Amendment 2, A6.2): as its offset from the base
+/// of the sliding window it is in (the image, the kernel stacks' region, the direct map), or as
+/// itself when it is in none; never a base, in any mode. Reads only atomics, so an exception
+/// handler may call it whatever lock the interrupted code holds.
+pub fn told(addr: u64) -> crate::told::Shown {
+    crate::told::Shown(origin_paging::layout::tell(
+        addr,
+        &origin_paging::layout::Bases {
+            image: kernel_virtual_base(),
+            direct_map: DIRECT.load(Ordering::Relaxed),
+            stack_region: crate::stack::region().base,
+        },
+    ))
+}
+
 /// The physical address behind a direct-map or kernel-image address.
 pub fn to_phys(virt: u64) -> u64 {
     let kernel = KERNEL_VIRTUAL.load(Ordering::Relaxed);

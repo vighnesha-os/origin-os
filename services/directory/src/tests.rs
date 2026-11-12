@@ -21,23 +21,23 @@ use super::*;
 const SERVICE: u64 = 0x5E21_11CE_0000_0001;
 const OTHER: u64 = 0x5E21_11CE_0000_0002;
 /// The provider's channel, as the directory holds it.
-const PROVIDER: u32 = 0x40;
+const PROVIDER: u64 = 0xFFFF_FF00_0000_0040;
 /// A client's server ends, with a channel's rights (from `END` up); one without `transfer`; and
 /// an event.
-const END: u32 = 0x100;
-const WEAK_END: u32 = 0x201;
-const EVENT: u32 = 0x202;
+const END: u64 = 0x0000_0100_0000_0100;
+const WEAK_END: u64 = 0x0000_0200_0000_0201;
+const EVENT: u64 = 0x0000_0300_0000_0202;
 
 /// What the directory did with a handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Did {
     Passed {
-        provider: u32,
+        provider: u64,
         interface_id: u64,
         major: u16,
-        server: u32,
+        server: u64,
     },
-    Closed(u32),
+    Closed(u64),
 }
 
 /// The directory's handles: every pass and close is recorded, and a provider refuses as told
@@ -45,7 +45,7 @@ enum Did {
 #[derive(Debug, Default)]
 struct Model {
     log: Vec<Did>,
-    refusing: Cell<Option<(u32, Refused)>>,
+    refusing: Cell<Option<(u64, Refused)>>,
 }
 
 impl Providers for Model {
@@ -76,7 +76,7 @@ impl Providers for Model {
 }
 
 /// What the kernel reports for a handle the directory receives (ADR-0005 B3).
-fn received(value: u32) -> RecvHandle {
+fn received(value: u64) -> RecvHandle {
     let channel = ObjectType::Channel.raw();
     let (object, rights) = match value {
         WEAK_END => (channel, CHANNEL_RIGHTS.bits() & !Rights::TRANSFER.bits()),
@@ -97,7 +97,7 @@ struct Loopback<'d> {
     directory: &'d mut Directory<Model, 2>,
     connection: rt::Connection,
     /// The handles of messages the stub refused, which its caller closes (OIDL §7.8).
-    closed_by_stub: Vec<u32>,
+    closed_by_stub: Vec<u64>,
 }
 
 impl rt::Transport for Loopback<'_> {
@@ -105,13 +105,13 @@ impl rt::Transport for Loopback<'_> {
         &mut self,
         buffer: &mut [u8],
         request: usize,
-        handles: &[u32],
+        handles: &[u64],
         _received: &mut [RecvHandle],
     ) -> Result<(usize, usize), i64> {
         let message = buffer[..request].to_vec();
         let list: Vec<RecvHandle> = handles.iter().map(|&value| received(value)).collect();
         let mut reply = [0u8; 64];
-        let mut reply_handles = [0u32; 4];
+        let mut reply_handles = [0u64; 4];
         let outcome = dispatch(
             self.directory,
             &Caller::default(),
@@ -142,7 +142,7 @@ impl rt::Transport for Loopback<'_> {
         }
     }
 
-    fn send(&mut self, _buffer: &[u8], _handles: &[u32]) -> Result<(), i64> {
+    fn send(&mut self, _buffer: &[u8], _handles: &[u64]) -> Result<(), i64> {
         Err(Error::NotSupported.raw())
     }
 
@@ -152,7 +152,7 @@ impl rt::Transport for Loopback<'_> {
 /// Buffers for one call.
 struct Buffers {
     bytes: [u8; 64],
-    handles: [u32; 4],
+    handles: [u64; 4],
     received: [RecvHandle; 4],
 }
 
@@ -201,7 +201,7 @@ fn connect(
     client: &mut DirectoryClient<Loopback<'_>>,
     interface_id: u64,
     major: u16,
-    server: u32,
+    server: u64,
 ) -> Result<ConnectResponse, CallError<ConnectError>> {
     let mut buffers = Buffers::new();
     client.connect(
@@ -327,7 +327,7 @@ fn deliver(
     handles: &[RecvHandle],
 ) -> (rt::Dispatched, Vec<u8>) {
     let mut reply = [0u8; 64];
-    let mut reply_handles = [0u32; 4];
+    let mut reply_handles = [0u64; 4];
     let outcome = dispatch(
         directory,
         &Caller::default(),
@@ -401,7 +401,7 @@ fn a_connect_before_the_hello_closes_the_connection_and_its_end_is_not_taken() {
     let mut directory = directory();
     let mut connection = rt::Connection::new();
     let mut message = [0u8; 32];
-    let mut sent = [0u32; 1];
+    let mut sent = [0u64; 1];
     let (head, tail) = message.split_at_mut(rt::HEADER_SIZE);
     let mut sink = rt::HandleSink::new(&mut sent);
     let size = ConnectRequestArgs {
@@ -456,7 +456,7 @@ fn a_connect_never_changes_what_the_directory_holds() {
         .into_iter()
         .enumerate()
     {
-        let _ = connect(&mut client, interface_id, major, END + k as u32);
+        let _ = connect(&mut client, interface_id, major, END + k as u64);
     }
     drop(client);
     assert_eq!(directory.len(), 1);
@@ -466,7 +466,7 @@ fn a_connect_never_changes_what_the_directory_holds() {
     );
     assert_eq!(directory.provider(OTHER, 1), None);
     // Every end it was given was passed on or closed, once.
-    let ends: Vec<u32> = directory
+    let ends: Vec<u64> = directory
         .providers()
         .log
         .iter()

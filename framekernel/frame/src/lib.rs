@@ -34,6 +34,7 @@ pub mod apstart;
 pub mod bitmap;
 pub mod boot;
 pub mod clock;
+pub mod cpuident;
 pub mod cpumap;
 pub mod descriptors;
 pub mod dmar;
@@ -49,6 +50,8 @@ pub mod objref;
 pub mod once;
 pub mod pci;
 pub mod speculation;
+pub mod tablebound;
+pub mod told;
 pub mod topology;
 pub mod trap;
 pub mod unwind;
@@ -77,6 +80,8 @@ pub mod phys;
 pub mod port;
 #[cfg(target_os = "none")]
 pub mod proof_programs;
+#[cfg(target_os = "none")]
+pub mod random;
 #[cfg(target_os = "none")]
 pub mod smp;
 #[cfg(target_os = "none")]

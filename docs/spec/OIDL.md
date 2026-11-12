@@ -9,7 +9,7 @@
 | Implementation | `developer-tools/oidl` (host only). Consumers: `sdk/interfaces/origin.kernel.oidl` and `sdk/interfaces/origin.directory.oidl` |
 | Evidence | `docs/research/2026-11-09-native-sdk.md`, `docs/research/2026-11-09-oidl-wire-format.md`, and the comparison with the hand-written ABI, `docs/engineering/OIDL_KERNEL_COMPARISON.md` |
 | Compatibility | Every byte layout here is revision 1 of the format, accepted by the owner on 2026-11-09. A change to any of them needs the owner's acceptance again (CLAUDE.md §84) |
-| Revisions | 2026-11-10: plain structs of integers, enums and bits as `syscall` vector and array elements (§3.1, §10), ADR-0005 C3, accepted by the owner on 2026-11-09 (decision sheet item 58). Existing definitions and the `channel` wire format are unchanged. 2026-11-10: the fingerprint names a library's own `sized struct` with its size at the minor described (§13), as §9 requires; the owner asked for the fix. 2026-11-10: from major 1, an item may not name one of its library's items from a later minor (§9). 2026-11-10: `--library`, one channel library's bindings as a crate of their own (§11) and a lock per library (§13), for the service directory; §7.4 records that `channel_read` reports handle records. Tools only: no format changes |
+| Revisions | 2026-11-10: plain structs of integers, enums and bits as `syscall` vector and array elements (§3.1, §10), ADR-0005 C3, accepted by the owner on 2026-11-09 (decision sheet item 58). Existing definitions and the `channel` wire format are unchanged. 2026-11-10: the fingerprint names a library's own `sized struct` with its size at the minor described (§13), as §9 requires; the owner asked for the fix. 2026-11-10: from major 1, an item may not name one of its library's items from a later minor (§9). 2026-11-10: `--library`, one channel library's bindings as a crate of their own (§11) and a lock per library (§13), for the service directory; §7.4 records that `channel_read` reports handle records. Tools only: no format changes. 2026-11-12: a handle is a 64-bit value at the `syscall` transport, and the decoder no longer refuses a handle register whose upper 32 bits are not zero (§10): ADR-0005 Amendment 6, E1, accepted by the owner on 2026-11-10 (decision sheet item 109), built by task S4-0. The `channel` wire format is unchanged: a slot is a position in the message's handle list, not a handle value (§7.4). 2026-11-12: the canonical description is format `oidl-fingerprint 2`, which records a handle's width (§13): decision item 237, accepted by the owner on 2026-11-12, built by TASKS item 39; every lock recorded again. No byte layout changes |
 
 The keywords MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
@@ -434,7 +434,7 @@ Parameters take registers first, in declaration order, then results, in declarat
 
 | Type | As a parameter | As a result |
 |---|---|---|
-| `handle` | one register | one out pointer (`u32`) |
+| `handle` | one register | one out pointer (`u64`) |
 | `optional<handle>` | one register; `0` is absent | one out pointer |
 | `bool`, integer, enum, bits | one register | one out pointer |
 | struct, `array` | one pointer | one out pointer |
@@ -442,13 +442,15 @@ Parameters take registers first, in declaration order, then results, in declarat
 
 A vector's count and a result's capacity are in elements. A struct element is its bytes as §3.1 lays them out, so the kernel's length in bytes is the count times the struct's §5.3 size.
 
+**A handle is a 64-bit value** (ADR-0005 Amendment 6, E1). It fills its register as a parameter, and in memory it is a little-endian `u64`: a handle result's out pointer, each element of an `array<handle>` result and of a `vector<handle>` parameter, and a handle field of a structure the kernel writes, such as `received_handle` and `start_entry`, are 8 bytes. In C it is `origin_handle_t`, a `uint64_t`. It stays opaque (ADR-0011 N9): how the kernel divides its bits is not part of the ABI, and no program may compute one handle from another. A slot of the `channel` wire format (§7.4) is a position, not a handle, and stays 4 bytes.
+
 A method that needs more than six registers is refused by the generator; ADR-0005 P4 says such a call takes a pointer to a structure.
 
 **Register decoding** happens after the `@reserved` check (which answers `not_supported`) and the capability check (§6), in declaration order, the first failure winning:
 
 | Type | Check | Refused with |
 |---|---|---|
-| `handle`, `optional<handle>` | The upper 32 bits are zero | `bad_handle` |
+| `handle`, `optional<handle>` | None: every value goes to the kernel's table, which answers `bad_handle` for one that names nothing (ADR-0005 E1; until `origin.kernel` 0.7 the upper 32 bits had to be zero) | — |
 | `u8`, `u16`, `u32` | The value fits | `invalid_args` |
 | `i8`, `i16`, `i32` | The value is correctly sign-extended | `invalid_args` |
 | `bool` | `0` or `1` (§10 of CLAUDE.md) | `invalid_args` |
@@ -464,7 +466,7 @@ Pointers are not dereferenced by the decoder. It produces typed descriptors of u
 
 Unused argument registers are ignored: a C stub leaves them undefined.
 
-Every method MUST declare the statuses its own decoding can produce: `bad_handle` with a handle parameter, `invalid_args` with a parameter narrower than 64 bits, a `bool`, an enum, a `bits` or a bounded count, `fault` with any pointer, `access_denied` with a handle that has rights, and `wrong_type` with a handle of a specific object type. A `@reserved` method is exempt, since it decodes nothing. The tool refuses a definition that leaves one out.
+Every method MUST declare the statuses its own decoding can produce: `bad_handle` with a handle parameter (since E1 its decoding refuses no handle, but the table it is looked up in does, so the rule stands), `invalid_args` with a parameter narrower than 64 bits, a `bool`, an enum, a `bits` or a bounded count, `fault` with any pointer, `access_denied` with a handle that has rights, and `wrong_type` with a handle of a specific object type. A `@reserved` method is exempt, since it decodes nothing. The tool refuses a definition that leaves one out.
 
 The generated C entry point is the stable interface: `<library with _>_<method>`, returning the status as `int64_t` (`_Noreturn void` for `never`). `origin.core` issues the `syscall` instruction inside each entry point, with **one `syscall` instruction per number**, as ADR-0005 B2 requires.
 
@@ -511,7 +513,8 @@ For each library and each minor `m` from 0 to its current minor, the tool render
 - Comments and documentation never appear in it.
 - Declaration order does not matter except where it is ABI: fields and parameters keep their order, everything else is sorted by name, ordinal or value.
 - `syscall` numbers are excluded from the **stable** fingerprint (§42). A second fingerprint, the **release** fingerprint, includes them, so a build can check that the kernel and `origin.core` were generated from the same definition.
-- The description starts with its own format version, `oidl-fingerprint 1`, followed by `library <name>`, `major <M>` and `transport <t>`. A library's minor is not in it, so the digest of minor `m` does not change when a later minor is added.
+- The description starts with its own format version, `oidl-fingerprint 2`, followed by `library <name>`, `major <M>`, `transport <t>` and `handle <bits>`. A library's minor is not in it, so the digest of minor `m` does not change when a later minor is added.
+- `handle <bits>` is the width of a handle's value: 64 bits, since ADR-0005 E1 (§10). No definition declares it. This specification sets it, the generator emits handles of that width from the same constant (`layout::HANDLE_BITS`), and every library's description records it at every minor. So a change of a handle's width changes every digest of every library, and no lock can stay as it was through one; a test plants another width and shows that it does (`a_planted_handle_width_changes_every_digest`). Decided by the owner on 2026-11-12 (decision item 237), built by TASKS item 39. Format 1 had no `handle` line: S4-0's change from 32 to 64 bits reached `origin.kernel`'s lock only through `received_handle` and `start_entry`, and nothing would have shown it in a library without them. Every lock was recorded again in format 2 while every library was at major 0, where a changed digest is reported and not refused (§9). Since the width is the specification's and not a library's, every minor's description carries today's width: a minor recorded before a width changed is described again with the new one, as any change at major 0 is.
 - The rest is one line per fact, in this order, each rendered in `src/fingerprint.rs`: constants; enumerations with their members; bits with their members; structures with their fields and offsets; capabilities; then every method, by interface and ordinal, with its parameters, results, sorted error names and requirement. A test pins one digest (`the_fingerprint_is_pinned`).
 - Items carry their `since`, and an item with `since` above `M.m` does not appear at minor `m`, so a `const`, `struct` or the like added in a later minor changes no earlier minor's fingerprint. An item added later without `@since` does change them: it is part of the earlier minors, as far as the definition says.
 - A parameter or result that is a `sized struct` of the library names it with its size at minor `m`, so a field the struct gains later, an addition §9 allows, changes no earlier minor's fingerprint either. (Until 2026-11-10 the reference carried the newest size, and growing `read_sizes` changed `origin.kernel`'s 0.0 and 0.1: a warning at major 0, a refusal at any other.) A `sized struct` from another library, which nothing uses yet, is still expanded at its newest layout; whether its later fields are that library's own business, as an enum's later members are, is not decided.

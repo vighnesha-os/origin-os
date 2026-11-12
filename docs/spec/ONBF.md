@@ -488,6 +488,8 @@ The shell asks the Loader Service (through the SDK) to launch an app. The Loader
 
 Startup cost is mapping only: no extraction, no decompression and no copying, because installed images are uncompressed and 4 KiB aligned.
 
+**Until the Loader Service exists** (decision item 197, 2026-11-12; ADR-0011 Amendment 2, L1): the first-party programs of ADR-0011 N14 step 4 are carried inside the KRN image, which its signature covers, and described by a table the build writes into the kernel. The kernel's launch path places each at a random base, applies its relative relocations, binds its imports from `origin.core` and makes them read-only, then starts it. No ONBF image is parsed at run time. The steps above become the Loader Service's when it exists (M6).
+
 ### 8.4 Driver hosting (Device Service, user mode)
 
 1. A device appears.

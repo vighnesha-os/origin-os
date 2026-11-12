@@ -40,7 +40,6 @@
 //! - [`dmar`]: the ACPI DMAR table (Intel VT-d units, device scopes, reserved memory);
 //! - [`dns`]: DNS message parsing with bounded name decompression;
 //! - [`editbuffer`]: a gap buffer for editable text (caret, insert/delete);
-//! - [`entropy`]: bounded-retry hardware entropy draw/fill over an abstract source;
 //! - [`fbconsole`]: the text console on the firmware's framebuffer (geometry, glyph placement
 //!   and the byte rules, drawn through an abstract pixel sink);
 //! - [`features`]: CPUID feature decoding and the x86-64-v3 baseline;
@@ -70,11 +69,14 @@
 //! - [`topology`]: CPU topology (thread/core/module/tile/die/package, and core types) from
 //!   CPUID leaves 1Fh, 0Bh and 80000026h;
 //! - [`nvme`]: NVMe controller registers, queue entries and indexes, Identify data;
+//! - [`program`]: the programs the kernel carries in its image, as the build laid them out, and
+//!   the launch path's arithmetic on them (task S4-1);
 //! - [`paging`]: 4-level page tables with structural W^X (the `origin-paging` crate,
 //!   shared with the loader);
 //! - [`pci`]: the MCFG, ECAM addressing, configuration headers, enumeration and BAR
 //!   sizing over an abstract configuration space;
 //! - [`ps2`]: PS/2 set-1 scancode decoding and the US keyboard layout;
+//! - [`quota`]: count quotas a process's creator sets (ADR-0005 P11);
 //! - [`raster`]: a 2D software rasterizer (fills, blits, alpha blend) for the UI;
 //! - [`runqueue`]: the per-CPU round-robin run queue (scheduler policy);
 //! - [`semver`]: semantic-version parsing and precedence (package dependency resolution);
@@ -112,7 +114,6 @@ pub mod deflate;
 pub mod dhcp;
 pub mod dns;
 pub mod editbuffer;
-pub mod entropy;
 pub mod fbconsole;
 pub mod font;
 pub mod glob;
@@ -125,16 +126,19 @@ pub mod ioapic;
 pub mod json;
 pub mod klog;
 pub mod linequeue;
+pub mod mapping;
 pub mod net;
 pub mod numa;
 pub mod nvme;
 pub mod originfs;
+pub mod program;
 pub use origin_frame::{
     acpi, amdvi, apic, apstart, bitmap, boot, clock, cpumap, descriptors, dmar, features, frames,
     heap, ivrs, pci, topology, unwind, usercopy, vtd,
 };
 pub use origin_paging as paging;
 pub mod ps2;
+pub mod quota;
 pub mod raster;
 pub mod report;
 pub mod ring;
@@ -168,6 +172,8 @@ mod console;
 #[cfg(target_os = "none")]
 mod dma;
 #[cfg(target_os = "none")]
+mod event;
+#[cfg(target_os = "none")]
 mod i8042;
 #[cfg(target_os = "none")]
 mod ipc;
@@ -180,11 +186,19 @@ mod kernel;
 #[cfg(target_os = "none")]
 mod launch;
 #[cfg(target_os = "none")]
+mod memory_object;
+#[cfg(target_os = "none")]
 mod pcie;
+#[cfg(target_os = "none")]
+mod port;
 #[cfg(target_os = "none")]
 mod process;
 #[cfg(target_os = "none")]
+mod program_proof;
+#[cfg(target_os = "none")]
 mod sched;
+#[cfg(target_os = "none")]
+mod stacks;
 #[cfg(target_os = "none")]
 mod storage;
 #[cfg(target_os = "none")]

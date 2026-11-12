@@ -18,14 +18,21 @@
 //! character literals, whatever it heads: a block, an `unsafe fn`, an `unsafe impl`, an
 //! `unsafe extern` or an attribute such as `#[unsafe(no_mangle)]`.
 //!
-//! The gate ends with the one on what assembly blocks promise the compiler about the flags
-//! (`asmflags`, CLAUDE.md §13).
+//! Ring 3 has a list of its own ([`RING3_UNSAFE_FILES`], task S4-1): in the ring-3 crates
+//! ([`RING3_CRATES`]) only the listed files may hold `unsafe`, each for a reason, and the crate
+//! roots that can deny it do ([`RING3_ROOTS`]). `runtime/kernel-stubs` commits no generated
+//! code: the shims it includes (`abi.rs` and `core_stubs.rs`, OIDL §11's named shims) are the
+//! generator's output under the target directory, written at each build.
+//!
+//! The gate ends with two on the assembly inside those sites: what a block promises the
+//! compiler about the flags (`asmflags`, CLAUDE.md §13), and where the processor's two
+//! random-number instructions may be run (`mnemonics`, CLAUDE.md §59; ADR-0016 R2).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use crate::{Result, asmflags, cargo, collect_files, lex, repo_root};
+use crate::{Result, asmflags, cargo, collect_files, lex, mnemonics, repo_root};
 
 /// Under this directory is the privileged framework, the one place `unsafe` may appear: the
 /// crate `origin-frame`, and its lock package, `origin-sync`, kept as a package of its own
@@ -40,6 +47,9 @@ const KERNEL_LEAVES: &[&str] = &[
     "runtime/abi",
     "runtime/version",
     "sdk/directory",
+    // The random-number generator's mechanism and policy (ADR-0016 R2): both forbid `unsafe`.
+    "security/crypto",
+    "security/random",
 ];
 /// The kernel library's crate root, whose `forbid(unsafe_code)` covers every module above the
 /// framework.
@@ -104,6 +114,10 @@ const UNSAFE_FILES: &[(&str, &str)] = &[
         "the ring-3 proof programs: assembly carried as data, and the linker's symbols around it",
     ),
     (
+        "framekernel/frame/src/random.rs",
+        "the random-number generator: RDSEED and RDRAND, its own stack for each step, volatile overwrites",
+    ),
+    (
         "framekernel/frame/src/smp.rs",
         "application-processor start-up: the real-mode trampoline, its data page, the AP entry",
     ),
@@ -136,10 +150,48 @@ const UNSAFE_FILES: &[(&str, &str)] = &[
         "the Loom models (tests only): a frame written through Loom's cell",
     ),
     (
+        "framekernel/frame/sync/tests/ports_allocation.rs",
+        "a host test's own global allocator, which counts and refuses on demand",
+    ),
+    (
         "framekernel/frame/tests/objref_out_of_memory.rs",
         "a host test's own global allocator, which refuses on demand",
     ),
 ];
+
+/// The crates that run in ring 3 (CLAUDE.md §11; task S4-1): the runtime, today's generated
+/// stubs, and the kernel's Rust proof programs.
+const RING3_CRATES: &[&str] = &[
+    "runtime/kernel-stubs",
+    "runtime/rt",
+    "tests/kernel/first-program",
+];
+
+/// The ring-3 files that may hold `unsafe`, and what each needs it for. A file comes onto this list
+/// with a reason a reviewer accepts, and leaves it when its last `unsafe` goes.
+const RING3_UNSAFE_FILES: &[(&str, &str)] = &[
+    (
+        "runtime/rt/src/entry.rs",
+        "the runtime's entry: `_start`, the start record read where RDI points, and the program's `main` by its one name",
+    ),
+    (
+        "runtime/rt/src/mem.rs",
+        "`memcpy`, `memmove`, `memset`, `memcmp` and `bcmp`, which the compiler calls and no C library supplies",
+    ),
+    (
+        "tests/kernel/first-program/src/faults.rs",
+        "the proof's deliberate faults: a write to its own code and a jump into its own data",
+    ),
+];
+
+/// The ring-3 crate roots, each of which denies `unsafe`; only the modules of listed files allow
+/// it. (`runtime/kernel-stubs` cannot: it includes the generated shims.)
+const RING3_ROOTS: &[&str] = &[
+    "runtime/rt/src/lib.rs",
+    "tests/kernel/first-program/src/main.rs",
+];
+/// What each of [`RING3_ROOTS`] carries.
+const DENY: &str = "#![deny(unsafe_code)]";
 
 /// Files under [`FRAMEWORK`] that hold no `unsafe` and still cannot carry the attribute: it would
 /// reach the listed modules declared beneath them, and the crate would not compile. The compiler
@@ -155,6 +207,8 @@ const LAYERS: &[(&str, &[&str])] = &[
     ("origin-boot-info", &["origin-version"]),
     ("origin-abi", &["origin-version"]),
     ("origin-sync", &[]),
+    ("origin-crypto", &[]),
+    ("origin-random", &["origin-crypto"]),
     ("origin-syscalls", &[]),
     // The service directory's generated client and stub, which a boot proof uses.
     ("origin-directory", &[]),
@@ -164,7 +218,9 @@ const LAYERS: &[(&str, &[&str])] = &[
         &[
             "origin-abi",
             "origin-boot-info",
+            "origin-crypto",
             "origin-paging",
+            "origin-random",
             "origin-sync",
             "origin-version",
         ],
@@ -174,9 +230,11 @@ const LAYERS: &[(&str, &[&str])] = &[
         &[
             "origin-abi",
             "origin-boot-info",
+            "origin-crypto",
             "origin-frame",
             "origin-paging",
             "origin-directory",
+            "origin-random",
             "origin-sync",
             "origin-syscalls",
             "origin-version",
@@ -225,6 +283,22 @@ pub(crate) fn gate() -> Result {
             problems.join("\n  ")
         ));
     }
+    let ring3 = read_ring3(&root)?;
+    let problems = ring3_problems(&ring3);
+    if !problems.is_empty() {
+        return Err(format!(
+            "`unsafe` in ring 3 is for the files the gate lists (RING3_UNSAFE_FILES in developer-tools/xtask/src/unsafety.rs; task S4-1):\n  {}",
+            problems.join("\n  ")
+        ));
+    }
+    let ring3_sites: usize = ring3.values().map(|text| count_sites(text)).sum();
+    println!(
+        "xtask: unsafe gate: in ring 3, {ring3_sites} sites in the {} files listed and none in the other {} files of {} crates, whose {} roots deny it",
+        RING3_UNSAFE_FILES.len(),
+        ring3.len().saturating_sub(RING3_UNSAFE_FILES.len()),
+        RING3_CRATES.len(),
+        RING3_ROOTS.len()
+    );
     let forbidding = scanned.framework.values().filter(|f| f.forbids).count();
     println!(
         "xtask: unsafe gate: no `unsafe` outside the framework; in it, {} sites in the {} files listed, and none in its other {}, of which {forbidding} start with `{FORBID}` and {} cannot, being above listed modules ({} kernel source files scanned)",
@@ -234,8 +308,10 @@ pub(crate) fn gate() -> Result {
         ABOVE_UNSAFE_FILES.len(),
         scanned.files
     );
-    // What the assembly inside those sites promises the compiler about the flags.
-    asmflags::gate()
+    // What the assembly inside those sites promises the compiler about the flags, and where
+    // RDRAND and RDSEED may be run.
+    asmflags::gate()?;
+    mnemonics::gate()
 }
 
 /// What one file of the framework holds.
@@ -444,6 +520,68 @@ fn site_problems(outside: &BTreeMap<String, usize>, framework_sites: usize) -> V
     problems
 }
 
+/// Every Rust file of the ring-3 crates, by repository path, with its text.
+fn read_ring3(root: &Path) -> Result<BTreeMap<String, String>> {
+    let mut paths = Vec::new();
+    for dir in RING3_CRATES {
+        collect_files(
+            &root.join(dir),
+            &|_| false,
+            &|name| name.ends_with(".rs"),
+            &mut paths,
+        )
+        .map_err(|e| format!("unsafe gate: {dir}: {e}"))?;
+    }
+    let mut files = BTreeMap::new();
+    for path in paths {
+        let shown = path
+            .strip_prefix(root)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        files.insert(shown, read(&path)?);
+    }
+    Ok(files)
+}
+
+/// What is wrong with `files`, the ring-3 crates' Rust files: `unsafe` in a file off the list, a
+/// listed file with none or gone, or a root that does not deny it.
+fn ring3_problems(files: &BTreeMap<String, String>) -> Vec<String> {
+    let mut problems = Vec::new();
+    if files.is_empty() {
+        problems.push("no ring-3 Rust files found: the gate's roots are wrong".to_string());
+    }
+    for (path, text) in files {
+        let sites = count_sites(text);
+        let listed = RING3_UNSAFE_FILES.iter().any(|(p, _)| p == path);
+        if sites != 0 && !listed {
+            problems.push(format!(
+                "{path}: {sites} `unsafe` sites, and it is not on the list"
+            ));
+        }
+    }
+    for (path, _) in RING3_UNSAFE_FILES {
+        match files.get(*path) {
+            None => problems.push(format!("{path}: listed, and not found")),
+            Some(text) if count_sites(text) == 0 => {
+                problems.push(format!(
+                    "{path}: listed, and holds no `unsafe`: take it off"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for path in RING3_ROOTS {
+        let denies = files
+            .get(*path)
+            .is_some_and(|text| text.lines().any(|line| line.trim() == DENY));
+        if !denies {
+            problems.push(format!("{path}: a ring-3 crate root without `{DENY}`"));
+        }
+    }
+    problems
+}
+
 fn read(path: &Path) -> Result<String> {
     fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -555,6 +693,56 @@ fn tree_lines(package: &str, depth: Option<&str>) -> Result<BTreeSet<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ring3_unsafe_is_only_in_the_listed_files() {
+        let clean = || -> BTreeMap<String, String> {
+            let mut files = BTreeMap::new();
+            for (path, _) in RING3_UNSAFE_FILES {
+                files.insert((*path).to_string(), "unsafe { x() }".to_string());
+            }
+            for path in RING3_ROOTS {
+                files.insert((*path).to_string(), format!("//! a root\n{DENY}\n"));
+            }
+            files.insert(
+                "runtime/rt/src/panic.rs".to_string(),
+                "fn panic() {} // unsafe in a comment".to_string(),
+            );
+            files
+        };
+        assert_eq!(ring3_problems(&clean()), Vec::<String>::new());
+        // An `unsafe` planted in a file off the list.
+        let mut planted = clean();
+        planted.insert(
+            "runtime/rt/src/panic.rs".to_string(),
+            "fn panic() { unsafe { y() } }".to_string(),
+        );
+        assert_eq!(
+            ring3_problems(&planted),
+            ["runtime/rt/src/panic.rs: 1 `unsafe` sites, and it is not on the list"]
+        );
+        // A root that no longer denies it.
+        let mut open = clean();
+        open.insert(RING3_ROOTS[1].to_string(), "//! a root\n".to_string());
+        assert_eq!(ring3_problems(&open).len(), 1);
+        // A listed file with none, and one gone.
+        let mut emptied = clean();
+        emptied.insert(RING3_UNSAFE_FILES[0].0.to_string(), "fn a() {}".to_string());
+        emptied.remove(RING3_UNSAFE_FILES[1].0);
+        assert_eq!(ring3_problems(&emptied).len(), 2);
+    }
+
+    #[test]
+    fn the_ring3_gate_sees_the_real_tree() {
+        let files = read_ring3(&repo_root()).expect("the ring-3 crates");
+        assert_eq!(ring3_problems(&files), Vec::<String>::new());
+        assert!(files.contains_key("runtime/rt/src/entry.rs"));
+        assert!(
+            files
+                .keys()
+                .all(|path| RING3_CRATES.iter().any(|c| path.starts_with(c)))
+        );
+    }
 
     #[test]
     fn counts_the_keyword_and_global_asm_in_code() {
