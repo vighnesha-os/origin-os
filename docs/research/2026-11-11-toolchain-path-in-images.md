@@ -570,7 +570,7 @@ What was not looked for:
 - **Another kind of host than these two.** One Mac with an Apple processor, and CI's Linux machines with x86-64 processors of two models. No Windows host, no Linux host with another processor family, no other release of macOS or of the runner's image.
 - **Another build of the same toolchain version.** Both hosts have rustup's own builds of 1.99.1. A distribution's own build of the same version, or a linker of another version under the same compiler, could differ in ways these did not; the gate's check of `.comment` would catch another linker line and nothing else about it.
 - **The other runner image.** Only the `check` job, on `ubuntu-24.04`, prints digests.
-- **The image that boots.** It is `onbf-pack`'s conversion of the kernel's ELF, and the gate compares the ELF. On the Mac two conversions of one ELF are the same bytes. The next piece of this task puts the converted image in the gate.
+- **The image that boots.** It is `onbf-pack`'s conversion of the kernel's ELF, and the gate compared the ELF. §15 puts the converted image in the gate; CI's conversion has not been seen.
 - **A configuration file outside the repository** that adds compiler flags (§12.3). Its `[env]` entries cannot replace the fixed line.
 
 ### 14.8 For a toolchain upgrade
@@ -586,3 +586,41 @@ Three things here rest on how the pinned tools behave. CLAUDE.md §15 asks for a
 - **No file of a tree with item 44 has been built on CI.** The comparison needs the batch pushed with it.
 - That a linker really running on Linux honours the entry as the Mac's does. Both are the same source revision.
 - No human has reviewed any of this, and nothing ran on physical hardware.
+
+## 15. Item 44, step 2 (2026-11-12): the image that boots, in the gate
+
+§14.7 listed one thing no gate covered: the loader starts the image `onbf-pack krn` converts the kernel's ELF to, and the gate compared the ELF. The coordinating session asked for it as this task's next piece. Its contract is "44, step 2" under "Task contracts" in `TASKS.md`.
+
+### 15.1 What the gate does now
+
+Each of the gate's two builds converts its own kernel ELF, with the command `cargo xtask build` and the boots use, into its own directory. The converted image is an eleventh file, treated as the other ten are: the two builds' must be the same bytes; neither may hold a path of the machine or the linker's own line; its digest is printed; and a copy of each is kept under `files/`, as `kernel-image`, so CI's artifact holds it. The check that the kernel carries its programs' segments still reads the ELF.
+
+On the Mac, at `3fe5aef`: 1,545,848 bytes, `239f308b539b85e2b28d14ee066ca9652cc8c021600f2f7490421bba9a6f5c92`. After a boot test, the image the boots used (`target/xtask/KERNEL.ONBF`) is that file, byte for byte. The other ten digests are unchanged.
+
+### 15.2 Signing, and why no signed image is in the gate
+
+The converted image is unsigned. Signing is a separate step with a key: the boot tests do it with test keys, and a release does it in release infrastructure (CLAUDE.md §59).
+
+A signed image is never the same twice, by design. `onbf-pack`'s own account (`developer-tools/onbf-pack/src/sign.rs`): the ML-DSA signature is hedged with fresh randomness (FIPS 204 §3.4); the container, the content digest and the statement stay deterministic; the claimed signing time is an input and never the host's clock.
+
+Measured, to say exactly what the signature is a limit on: the gate's image was signed twice with the test key and the boot tests' fixed signing time. The two signed images are the same size and differ in 4,603 bytes, all of them within one span of 4,627 bytes, which is the length of an ML-DSA-87 signature. Everything outside that span is the same bytes: the image, the statement with its content digest, and the Ed25519 signature.
+
+So what a signature covers, the statement and through its digest the image, is compared by the gate as the unsigned image. The signature bytes themselves cannot be compared, on one machine or two. Nothing about signing was changed.
+
+### 15.3 The control and the gates
+
+On `3fe5aef`, the last commit that changes code, in one turn on the machine (16:56 to 17:06 UTC):
+
+- **The gate's reading of the converted image made to follow its directory** (a three-line edit of `reproducible.rs` that adds the directory's path to what was read, put back with `git checkout`): the gate fails, "the kernel image that boots (its ELF as `onbf-pack krn` converts it) is not reproducible", after the ten other files, the kernel's ELF among them, had passed.
+- The gate passes in 35 s (34 s before this step) and prints eleven digests.
+- `cargo xtask check` passes in 6 min 15 s: 1,689 host tests, 0 failed, 27 ignored; Loom, all 53 models and all 78 controls.
+- `cargo xtask boot-test` passes on its first attempt, 11 of 11 scenarios in 134 s, its kernel boot ending `boot verdict: degraded: 63 of 64 proofs passed; failed: speculation controls`.
+- After the boots, the converted image, the kernel's ELF and the program in the ordinary target directory are the gate's, byte for byte.
+
+No boot matrix for this step: no image changed, and the keeper runs all three on the merge.
+
+### 15.4 Not verified
+
+- **CI's digest for the converted image.** `onbf-pack` is a host tool, built for each host. That a Linux build of it converts the same ELF to the same bytes is expected and has not been seen. (§13.3 converted CI's ELF on the Mac, not the other way round.)
+- A carried program's own converted form: the kernel carries its segments as the gate already reads them, and they are compared as files.
+- A signed release image: no release signing exists yet to compare around.
