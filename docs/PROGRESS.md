@@ -30,13 +30,13 @@ The counted rows `docs/ROADMAP.md` places in each milestone: its exit tests and 
 
 | Milestone | State in the roadmap | Rows | Done | Built | In progress | Not started | % done | % done or built |
 |---|---|--:|--:|--:|--:|--:|--:|--:|
-| M0. Toolchain and engineering foundation | built | 116 | 36 | 44 | 14 | 22 | 31.0% | 69.0% |
-| M1. Bootable Framekernel | built | 39 | 1 | 35 | 2 | 1 | 2.6% | 92.3% |
+| M0. Toolchain and engineering foundation | built | 107 | 36 | 36 | 13 | 22 | 33.6% | 67.3% |
+| M1. Bootable Framekernel | built | 47 | 1 | 43 | 2 | 1 | 2.1% | 93.6% |
 | M2. CPU and memory | built | 44 | 0 | 32 | 9 | 3 | 0.0% | 72.7% |
 | M3. SMP and scheduler | partial | 77 | 0 | 38 | 8 | 31 | 0.0% | 49.4% |
 | M4. Processes and IPC | partial | 133 | 1 | 94 | 23 | 15 | 0.8% | 71.4% |
 | M5. Storage | partial | 104 | 0 | 39 | 18 | 47 | 0.0% | 37.5% |
-| M6. Native runtime | not started | 118 | 0 | 2 | 32 | 84 | 0.0% | 1.7% |
+| M6. Native runtime | not started | 119 | 0 | 2 | 33 | 84 | 0.0% | 1.7% |
 | M7. Native packaging | not started | 75 | 2 | 3 | 11 | 59 | 2.7% | 6.7% |
 | M8. Native graphics | not started | 85 | 0 | 0 | 2 | 83 | 0.0% | 0.0% |
 | M9. Installable operating system | not started | 83 | 0 | 0 | 1 | 82 | 0.0% | 0.0% |

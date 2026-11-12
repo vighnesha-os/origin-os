@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Required by | CLAUDE.md §82: "Do not mark a milestone complete without its exit tests. Each milestone's exit tests are listed in `docs/ROADMAP.md` before it is marked done (decision item 122)." |
-| State | **M0, M1 and M2's exit tests and the rule for later milestones are accepted.** The owner accepted them on 2026-11-12 as decision items 252 to 256 ("Accept all 7", which covered items 252 to 258): 252 for M0, 253 for M1, 254 for M2, 255 for what QEMU and guests under KVM can show, 256 for the rule. **M3, M4, M5, M6 and M10's tests are accepted too,** as decision items 259 to 263 ("Accept all 5", 2026-11-12). **Items 264 to 268 corrected the roadmap** ("Accept all 5", 2026-11-12): every counted `build` row is placed (264), two machines for M4 and M5 (265), Secure Boot at M9 (266), `ONBF.md` §13 in M6 and M7 (267), the test trust store for M1 (268). The decision sheet records them all through the coordinating session's records pull request to `main`. **The tests of M7, M8, M9, M11, M12 and M13 are proposed,** written by item 256's rule, and are not accepted, except where an item above says otherwise. **The rows each milestone adds beyond its tests are proposed,** under "Further rows placed here", until the owner answers on them. |
+| State | **M0, M1 and M2's exit tests and the rule for later milestones are accepted.** The owner accepted them on 2026-11-12 as decision items 252 to 256 ("Accept all 7", which covered items 252 to 258): 252 for M0, 253 for M1, 254 for M2, 255 for what QEMU and guests under KVM can show, 256 for the rule. **M3, M4, M5, M6 and M10's tests are accepted too,** as decision items 259 to 263 ("Accept all 5", 2026-11-12). **Items 264 to 268 corrected the roadmap** ("Accept all 5", 2026-11-12): every counted `build` row is placed (264), two machines for M4 and M5 (265), Secure Boot at M9 (266), `ONBF.md` §13 in M6 and M7 (267), the test trust store for M1 (268). **Item 269 accepted the further rows of M0 to M6 and M10** ("Accept both", 2026-11-12): the rows each of those milestones adds beyond its tests, under "Further rows placed here", with ADR-0013's rows moved from M0 to M1 and ADR-0011 N13 from M0 to M6. The decision sheet records them all through the coordinating session's records pull request to `main`. **The tests of M7, M8, M9, M11, M12 and M13 are proposed,** written by item 256's rule, and are not accepted, except where an item above says otherwise. **The rows those six milestones add beyond their tests are proposed** with them, until the owner answers on them. |
 | Milestones done | **None.** A milestone is done when every one of its accepted exit tests passes in its declared scope (items 255 and 256). M0, M1 and M2 are built. |
 | Machines | **No machine in the declared scope can be rented** (ADR-0011 L9). ADR-0009 Amendment 1 A1 puts the EPYC 9005 generation outside the scope, and buying is off (ADR-0009's update of 2026-11-09). Until a machine in scope exists, through a volunteer or a purchase, no milestone from M1 on can be done. |
 | Written | 2026-11-12, by TASKS item 25 at `land/s4` `5ea97ef`; corrected by TASKS item 42 from findings F0 to F11 of `docs/engineering/DESIGN_READ_2026-11-12.md`. |
@@ -52,7 +52,7 @@ These are accepted rules, not new decisions (finding F10). Each hardware test be
 | M0-6 | `Cargo.lock` holds only the workspace's packages, and the one host-only exception (Loom) is approved and pinned | S5-01, S5-10 |
 | M0-7 | The records are kept: the requirements matrix and the provenance table, each read by a gate in `cargo xtask check`; a §78 contract for each task, following `docs/engineering/TASK_CONTRACT_TEMPLATE.md` and checked in review; the ADRs, the research ledgers and the decision sheet | S6-01 to S6-13, S78-01 to S78-11, S79-06 to S79-09, S84-08 |
 
-**Further rows placed here: proposed (item 264).** They are in no accepted test; each would join M0's scope if the owner accepts it.
+**Further rows placed here: accepted (item 269).** They are in no exit test; the owner accepted them as part of M0's scope.
 
 | Rows | Subject |
 |---|---|
@@ -61,8 +61,6 @@ These are accepted rules, not new decisions (finding F10). Each hardware test be
 | S6-15, S6-17 to S6-19 | Automated provenance and licence checks; `CONTRIBUTING.md`, `SECURITY.md` and `CODEOWNERS` (TASKS item 12) |
 | S13-10, S14-01 to S14-11, S14-16 | The compiler and linker reviews, overflow checks and the integer features (TASKS item 22) |
 | S18-15, S18-16 | ADRs for original-source exceptions and for hardware qualification |
-| A11-N13 | The SDK's rules enforced by gates |
-| A13-R1 to A13-Am1 | What a failed boot proof means (ADR-0013): the test policy every boot runs under |
 | S72-01, S72-02, S72-04, S72-06, S72-08 | Unit, integration, model-based, concurrency and kernel boot testing |
 | S79-02 to S79-05, S79-13 | `CLAUDE.md`, `origin-version.toml`, `rust-toolchain.toml`, the specifications and the session handoffs kept |
 | S84-01, S84-04, S84-12 | The repository inspected, QEMU and OVMF verified, boot tests run and captured |
@@ -98,7 +96,7 @@ Origin's own kernel key belongs to the signing ceremony (§60, TASKS item 6) bef
 
 M1-5 needs the prerequisites in "Before a first boot on a machine in scope".
 
-**Further rows placed here: proposed (item 264).**
+**Further rows placed here: accepted (item 269).**
 
 | Rows | Subject |
 |---|---|
@@ -110,6 +108,7 @@ M1-5 needs the prerequisites in "Before a first boot on a machine in scope".
 | A10-E1 to A10-Am2 | The early console (ADR-0010 and its amendments) |
 | A16-R10, A16-Am1 | The loader's generator, its seed for the kernel, and the stack region's value |
 | S13-01, S13-03, S13-08, S13-09 | `no_std`, explicit panic handling, defined stack and calling conventions, checked parsing of what the firmware hands over |
+| A13-R1 to A13-Am1 | What a failed boot proof means (ADR-0013): the test policy every boot runs under, on each declared machine (moved from M0 by item 269) |
 
 **Marked against the tests, 2026-11-12: built, not done.** M1-1 to M1-4 pass under QEMU's software processor and as guests under KVM in CI (`cargo xtask boot-test`, `boot-matrix`; `docs/STATUS.md`), signed with a test key only. M1-5 fails: no Origin code has run on a physical machine. The one rented machine so far ran Ubuntu, was a Zen 4 bench machine outside the declared scope, and qualifies nothing (`main`, `docs/research/2026-11-12-rental-a-findings.md`).
 
@@ -132,7 +131,7 @@ Given elsewhere by rule 3: SMP, topology and TLB shootdowns (S24-06 to S24-14, S
 
 M2-6's negative controls are shown under QEMU: ADR-0013's controls are temporary edits booted there. The proofs themselves pass on the machine (finding F5). M2-6 needs the prerequisites in "Before a first boot on a machine in scope".
 
-**Further rows placed here: proposed (item 264).**
+**Further rows placed here: accepted (item 269).**
 
 | Rows | Subject |
 |---|---|
@@ -169,7 +168,7 @@ M2-6's negative controls are shown under QEMU: ADR-0013's controls are temporary
 
 M3-6 needs the prerequisites in "Before a first boot on a machine in scope".
 
-**Further rows placed here: proposed (item 264).**
+**Further rows placed here: accepted (item 269).**
 
 | Rows | Subject |
 |---|---|
@@ -202,7 +201,7 @@ M3-6 needs the prerequisites in "Before a first boot on a machine in scope".
 
 M4-1 rests on ADR-0005 G3 and G4, drafts to be decided again with step 5 and with the Loader Service (ADR-0005 Amendment 8). So M4 cannot close before that part of M6's work (finding F2). M4-7 needs the prerequisites in "Before a first boot on a machine in scope".
 
-**Further rows placed here: proposed (item 264).**
+**Further rows placed here: accepted (item 269).**
 
 | Rows | Subject |
 |---|---|
@@ -233,7 +232,7 @@ M4-1 rests on ADR-0005 G3 and G4, drafts to be decided again with step 5 and wit
 
 Given elsewhere by rule 3: hot-plug and external-device authorization (S31-12, S32-12, S32-13) to M10; the rest of §40 (access control, sparse, large and mapped files, quotas, locking, snapshots, encryption, repair, migrations) to M9. M5-6 needs the prerequisites in "Before a first boot on a machine in scope".
 
-**Further rows placed here: proposed (item 264).**
+**Further rows placed here: accepted (item 269).**
 
 | Rows | Subject |
 |---|---|
@@ -263,7 +262,7 @@ Given elsewhere by rule 3: hot-plug and external-device authorization (S31-12, S
 
 Given elsewhere by item 262: networking in the runtime (S44-08) to M10, with the network stack, because a sockets API cannot be tested through an actual entry point before a network service exists. M6-6 needs the prerequisites in "Before a first boot on a machine in scope".
 
-**Further rows placed here: proposed (item 264).**
+**Further rows placed here: accepted (item 269).**
 
 | Rows | Subject |
 |---|---|
@@ -284,6 +283,7 @@ Given elsewhere by item 262: networking in the runtime (S44-08) to M10, with the
 | S71-01 to S71-03, S71-05, S71-06, S71-09, S71-10 | SDK bindings, templates, documentation, threading and async examples, debugging and testing |
 | S73-08 | Binary parsers as proof targets |
 | S84-13 | Host-testable native-format parsers |
+| A11-N13 | The SDK's rules enforced by gates, one of which reads first-party manifests (moved from M0 by item 269) |
 
 ## M7. Native packaging
 
@@ -392,7 +392,7 @@ The installer needs a USB keyboard on a real machine, and USB and HID are placed
 
 `THREAT_MODEL_SYSTEM.md`: before anything but a boot proof uses the network, where the stack runs is decided (TASKS item 23), with a model of a hostile peer. M10-7 needs the prerequisites in "Before a first boot on a machine in scope".
 
-**Further rows placed here: proposed (item 264).**
+**Further rows placed here: accepted (item 269).**
 
 | Rows | Subject |
 |---|---|
