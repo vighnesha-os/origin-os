@@ -3918,3 +3918,23 @@ A fourth addition to the entry above, from another session and on a branch of it
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-12, the interface session, on the coordinating session's contract. Original code; Rust `core` and `alloc` only.
 - **Review:** none. No person and no second agent has read it.
 - **Licensing:** MIT OR Apache-2.0.
+
+## TASKS item 39: the fingerprint records a handle's width, `oidl-fingerprint 2` (decision item 237; 2026-11-12)
+
+- **What:** on `claude/item-39-fingerprint-width`, from `records/item-237` at `e306ab7`, which sits on the third batch's merge of S4-0 (`5871257`). OIDL §13's canonical description did not record how wide a handle is, so `origin.kernel` 0.7's digest came out equal to 0.6's after S4-0. The owner accepted recording it (item 237). Commits:
+  - `85fa8a9` the generator: `layout::HANDLE_BITS` (64), from which the description's new line `handle <bits>` comes, after `transport`, and from which the generator emits a handle's Rust ABI type and C's `origin_handle_t`. A test holds the runtime template's `Handle` to the same width. `FORMAT` is `oidl-fingerprint 2`, and the pinned digest moves with it. Both locks recorded again.
+  - `3978849` the specification and the records: OIDL §13's text in place of its dated note, and a revisions entry; TASKS item 39; the matrix row A11-N13; this entry. Then `records/item-237` at `8977f4f` merged in, with TASKS item 39's corrected criteria.
+- **Specifications:** none outside the repository. `docs/spec/OIDL.md` §9, §10, §13; ADR-0005 E1; ADR-0011 N13; decision item 237.
+- **Open-source references consulted (§3, §6):** none.
+- **`unsafe`:** none.
+- **Decisions this task did not take:** whether `origin.kernel` 0.7's digest should differ from 0.6's. The first wording of TASKS item 39 asked for it, and item 237 as decided cannot give it: the width is the specification's, not a library's, so every minor's description carries today's 64 bits, and 0.6 and 0.7 still share `d270a7a5…`. Making them differ would need a definition to say when its width changed, which is a question of grammar. This session put that to the coordinating session on 2026-11-12, recommending that the criterion be dropped. That session agreed: it corrected TASKS item 39's criteria on `records/item-237` at `8977f4f`, merged here, and put no grammar change to the owner.
+- **Limits:** the width is one number for both transports. A `channel` slot is a position, 4 bytes, and its width is in the layout already; the `handle` line describes the values a transport delivers. Nothing describes a width per minor.
+- **Test evidence (2026-11-12; Rust 1.99.1; the M1 Max):**
+  - `oidl`'s unit tests, 51 passed: `the_description_records_the_handle_width_the_generator_emits` (every minor of both shipped libraries, stable and release, says `handle 64` after `transport`; the runtime template's `Handle` is a `u64` of 8 bytes; the kernel's C header says `uint64_t`), and the negative control `a_planted_handle_width_changes_every_digest` (a 32-bit width changes every minor's stable and release digest of both libraries). Its `generated` suite, 19 passed.
+  - A planted change, once: `HANDLE_BITS` set to 32 in `layout.rs`, then `cargo xtask interface-gate`, which failed: "the ABI of origin.kernel is not the one sdk/interfaces/origin.kernel.lock records". Put back byte for byte.
+  - The locks recorded again: every digest of `origin.kernel` (0.0 to 0.7) and of `origin.directory` (0.0, 0.1) differs from its format-1 value; `origin.kernel` 0.6 and 0.7 are equal, as above.
+  - `cargo xtask check` on the commit that adds this entry: run after it was written; the hand-over report says what it found.
+  - Nothing booted: no kernel or loader code changed.
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-12, the interface session, on the coordinating session's request. Original code.
+- **Review:** none.
+- **Licensing:** MIT OR Apache-2.0.
