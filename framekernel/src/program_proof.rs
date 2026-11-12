@@ -8,7 +8,9 @@
 //!
 //! - twice with `run`, on two processors: each runs in ring 3 at a random base, and the two
 //!   bases differ, and their stacks; each finds its start record in RDI and reports its header
-//!   and entries as the kernel wrote them; it runs at its base plus its entry; every relocated
+//!   and entries as the kernel wrote them; it runs at its base plus its entry; its tables map
+//!   each page of its span as its description says and its stack writable and never executable,
+//!   with an unmapped page on either side, walked before its thread starts; every relocated
 //!   slot in its pages holds its addend plus the base, read back from its memory before its
 //!   thread starts; it reads its data only through relocated pointers and gets what the compiler
 //!   worked out; the runtime's `mem*` functions copy, move, fill and compare; it writes a message
@@ -21,10 +23,16 @@
 //!   at that address, the error code saying a write to a present user page;
 //! - `panic`: it ends with the runtime's exit code for a panic.
 //!
-//! Before them, a launch is refused after the program's image is mapped (a stack of no pages).
-//! Every process, and everything it and that refused child held, is gone afterwards: the heap and the free frames are
-//! back where they were. The values the program reports, and their order, are its contract with
-//! this file, which keeps its own copy of each of the program's constants.
+//! The walk of the tables, and the read-back of the slots, are done for all six launches.
+//!
+//! Before them, two launches are refused, and each takes nothing: the heap and the free frames,
+//! page tables among them, are where they were before it (S4-1's review, finding F2). One is
+//! refused before anything is made (a stack of no pages); the other part-way through mapping,
+//! at the bound on a space's page tables, after its image and part of its stack are mapped (a
+//! stack of [`PART_WAY_STACK`] pages). Every process, and everything it held, is gone
+//! afterwards: the heap and the free frames are back where they were. The values the program
+//! reports, and their order, are its contract with this file, which keeps its own copy of each
+//! of the program's constants.
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
@@ -37,8 +45,8 @@ use crate::console::Console;
 use crate::cpu::{self, CpuIndex};
 use crate::handles::Need;
 use crate::ipc::{self, Object};
-use crate::launch::{self, Given, ProgramLimits};
-use crate::paging::PAGE;
+use crate::launch::{self, Given, LoadedProgram, ProgramLimits};
+use crate::paging::{PAGE, Translation};
 use crate::process::{BOOT_PROOF_PRINCIPAL, Ending, Limits, MemoryLimits, ObjectLimits, Process};
 use crate::program::{self, Carried, FIRST_PROGRAM, FIRST_PROGRAM_RUN, SegmentAccess};
 use crate::{memory, sched};
@@ -63,6 +71,13 @@ const PANIC_EXIT: u64 = u64::MAX;
 /// Where its reports start for each mode, after the record's: RDI, the entry, the ABI, the
 /// entry count, two values for each of its three entries, the argument count.
 const MODE_REPORTS: usize = 4 + 2 * 3 + 1;
+
+/// A stack this long cannot be mapped: each page table maps 512 pages (2 MiB), so its pages need
+/// at least 32 tables of their own, and a space may have 32 in all, its top-level table among
+/// them (`MAX_TABLES` in `origin_frame::userspace`). A launch with it is refused part-way through
+/// mapping: the image first, then the stack's pages until a table is refused. Well under
+/// [`program::MAX_STACK_PAGES`], so it gets that far.
+const PART_WAY_STACK: u64 = 32 * 512;
 
 /// The page fault's vector, and its error code's bits (Intel SDM Vol. 3A, §4.7; AMD64 APM Vol. 2,
 /// §8.4.2): present, write, user, and instruction fetch.
@@ -91,6 +106,8 @@ struct Run {
     /// Its record found in RDI, and read back as written; and its entry where it should be.
     record_right: bool,
     entry_right: bool,
+    /// Its tables mapped each page as its description says, before the thread started.
+    tables_right: bool,
     /// Every relocated slot held its addend plus the base before the thread started.
     slots_right: bool,
     /// What it reported after the record's values.
@@ -119,6 +136,56 @@ fn expected_entries() -> [(u64, u64); 3] {
     ]
 }
 
+/// Whether `translation`, a page's, is what `access` asks: present to ring 3, a 4 KiB page,
+/// writable for a writable segment alone and executable for the code alone; or absent, where
+/// `access` is `None`.
+fn mapped_as(translation: Option<Translation>, access: Option<SegmentAccess>) -> bool {
+    match (translation, access) {
+        (None, None) => true,
+        (Some(t), Some(access)) => {
+            t.user
+                && t.size == PAGE
+                && t.writable == (access == SegmentAccess::ReadWrite)
+                && t.executable == (access == SegmentAccess::ReadExecute)
+        }
+        _ => false,
+    }
+}
+
+/// Walks `loaded`'s tables before its first thread exists (S4-1's review, finding F1): each
+/// page of the span as its description says ([`program::page_access`]); each page of the stack
+/// writable and never executable; and the page below the stack and the page above it unmapped.
+fn tables_match(loaded: &LoadedProgram) -> bool {
+    let child = &loaded.process;
+    let image = (0..FIRST_PROGRAM.span / PAGE).all(|k| {
+        mapped_as(
+            child.translate(loaded.base + k * PAGE),
+            program::page_access(&FIRST_PROGRAM, k * PAGE),
+        )
+    });
+    let stack = (loaded.stack..loaded.stack_top)
+        .step_by(PAGE as usize)
+        .all(|at| mapped_as(child.translate(at), Some(SegmentAccess::ReadWrite)));
+    let neighbours = child.translate(loaded.stack - PAGE).is_none()
+        && child.translate(loaded.stack_top).is_none();
+    image && stack && neighbours && loaded.stack < loaded.stack_top
+}
+
+/// Whether a launch of [`FIRST_PROGRAM`] with a stack of `stack_pages` pages is refused with
+/// `error`, and the heap and the free frames, page tables among them, are then where they were
+/// before it (S4-1's review, finding F2).
+fn refused_whole(creator: &Process, stack_pages: u64, error: Error, tsc_hz: u64) -> bool {
+    let counts = || memory::stats().map(|(h, f)| (h.bytes_in_use, f));
+    let before = counts();
+    let run = ProgramLimits {
+        stack_pages,
+        ..FIRST_PROGRAM_RUN
+    };
+    let refused = launch::load_program(creator, &FIRST_PROGRAM, &run).err() == Some(error);
+    sched::yield_until(|| counts() == before, tsc_hz, 2);
+    refused && before.is_some() && counts() == before
+}
+
 /// Launches [`FIRST_PROGRAM`] from `creator` on `cpu` with the argument `mode`, waits for it to
 /// end, and returns what it showed. `None` if the launch itself was refused.
 fn launch(creator: &Process, mode: &[u8], cpu: CpuIndex, tsc_hz: u64) -> Option<Run> {
@@ -136,7 +203,8 @@ fn launch(creator: &Process, mode: &[u8], cpu: CpuIndex, tsc_hz: u64) -> Option<
     let loaded = launch::load_program(creator, &FIRST_PROGRAM, &FIRST_PROGRAM_RUN).ok()?;
     let loading = cpu::rdtsc().wrapping_sub(began);
     let (base, stack, entry) = (loaded.base, loaded.stack, loaded.entry);
-    // Read back through the child's own tables before anything of it runs.
+    // Walk the child's own tables, and read back through them, before anything of it runs.
+    let tables_right = tables_match(&loaded);
     let slots_right = loaded.process.memory().is_some_and(|space| {
         FIRST_PROGRAM.relocations.iter().all(|&slot| {
             space.read_u64(base + slot) == program::relocated(&FIRST_PROGRAM, slot, base)
@@ -151,7 +219,7 @@ fn launch(creator: &Process, mode: &[u8], cpu: CpuIndex, tsc_hz: u64) -> Option<
     let record = reports.get(..MODE_REPORTS).unwrap_or(&[]);
     let abi = u64::from(origin_abi::ABI_VERSION.0) << 32
         | u64::from(origin_abi::ABI_VERSION.1) << 16
-        | u64::from(origin_abi::ABI_VERSION.1);
+        | u64::from(origin_abi::start::ABI_MIN_MINOR);
     let mut wanted = Vec::new();
     wanted.extend([launched.record, entry, abi, 3]);
     for (a, b) in expected_entries() {
@@ -173,6 +241,7 @@ fn launch(creator: &Process, mode: &[u8], cpu: CpuIndex, tsc_hz: u64) -> Option<
         stack,
         record_right,
         entry_right,
+        tables_right,
         slots_right,
         after: reports.get(MODE_REPORTS..).unwrap_or(&[]).to_vec(),
         ending: launched.process.ending(),
@@ -221,13 +290,10 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
         let Some(creator) = Process::new(CREATOR, (0, 0), BOOT_PROOF_PRINCIPAL) else {
             return false;
         };
-        // Refused after its image is mapped: the child, and every frame it was given, go.
-        let no_stack = ProgramLimits {
-            stack_pages: 0,
-            ..FIRST_PROGRAM_RUN
-        };
-        let refused = launch::load_program(&creator, &FIRST_PROGRAM, &no_stack).err()
-            == Some(Error::InvalidArgs);
+        // Refused before anything is made, and refused part-way through mapping: each takes
+        // nothing.
+        let early = refused_whole(&creator, 0, Error::InvalidArgs, tsc_hz);
+        let late = refused_whole(&creator, PART_WAY_STACK, Error::Limit, tsc_hz);
         let first = launch(&creator, b"run", far, tsc_hz);
         let second = launch(&creator, b"run", bsp, tsc_hz);
         let write_code = launch(&creator, b"write-code", bsp, tsc_hz);
@@ -248,6 +314,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
 
         let record = each(|r| r.record_right);
         let entry = each(|r| r.entry_right);
+        let tables = each(|r| r.tables_right);
         let slots = each(|r| r.slots_right);
         let relocated = both(|r| r.after.first() == Some(&1) && r.after.get(1) == Some(&STEPS));
         let mem = both(|r| r.after.get(2) == Some(&MEM_CHECKS));
@@ -258,10 +325,10 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
                     .is_some_and(|(bytes, named)| bytes.as_slice() == GREETING && *named)
         });
         let exited = both(|r| r.ending == Some(Ending::Exited(RAN)) && r.after.len() == 4);
-        let ran_right = record && entry && slots && relocated && mem && wrote && exited;
+        let ran_right = record && entry && tables && slots && relocated && mem && wrote && exited;
         let _ = writeln!(
             com1,
-            "origin-kernel: rust program: {} ran in ring 3 from the kernel's image at random bases, 6 times: each found its start record in RDI and read its header and 3 entries as written: {record}; ran at its base plus its entry: {entry}; every relocated slot held its value plus the base: {slots}; read its data through relocated pointers: {relocated}; the runtime's mem functions copy, move, fill and compare: {mem}; wrote on BOOTSTRAP, named as the writer: {wrote}; ended with its exit code: {exited}{}",
+            "origin-kernel: rust program: {} ran in ring 3 from the kernel's image at random bases, 6 times: each found its start record in RDI and read its header and 3 entries as written: {record}; ran at its base plus its entry: {entry}; its tables mapped each page of its span as described, and its stack writable and never executable between two unmapped pages: {tables}; every relocated slot held its value plus the base: {slots}; read its data through relocated pointers: {relocated}; the runtime's mem functions copy, move, fill and compare: {mem}; wrote on BOOTSTRAP, named as the writer: {wrote}; ended with its exit code: {exited}{}",
             FIRST_PROGRAM.name,
             if ran_right {
                 ""
@@ -302,10 +369,10 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz
             r.after.as_slice() == [ABOUT_TO_PANIC] && r.ending == Some(Ending::Exited(PANIC_EXIT))
         });
         let refused_right =
-            apart && code_faulted && data_faulted && relro_faulted && panic_ended && refused;
+            apart && code_faulted && data_faulted && relro_faulted && panic_ended && early && late;
         let _ = writeln!(
             com1,
-            "origin-kernel: rust program: two launches differ in base and stack: {apart}; a write to its code faulted there: {code_faulted}; a jump into its data faulted there as a fetch: {data_faulted}; a write to its relocated read-only data faulted there: {relro_faulted}; a panic ended it with the runtime's exit code: {panic_ended}; a launch refused after its image was mapped: {refused}{}",
+            "origin-kernel: rust program: two launches differ in base and stack: {apart}; a write to its code faulted there: {code_faulted}; a jump into its data faulted there as a fetch: {data_faulted}; a write to its relocated read-only data faulted there: {relro_faulted}; a panic ended it with the runtime's exit code: {panic_ended}; a launch refused before anything was made took nothing: {early}; a launch refused part-way through mapping, at the bound on its page tables, gave back every frame, table and heap byte it took: {late}{}",
             if refused_right {
                 ""
             } else {

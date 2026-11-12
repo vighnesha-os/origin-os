@@ -26,12 +26,12 @@ use alloc::vec::Vec;
 use origin_abi::start::{self, Entry, role};
 use origin_abi::{Error, Handle, rights};
 use origin_frame::objref::ObjectRef;
-use origin_frame::userspace::UserFrame;
+use origin_frame::userspace::{ChangeError, UserFrame};
 
 use crate::cpu::{CpuIndex, without_interrupts};
 use crate::handles::{Need, Typed};
 use crate::ipc::{ChannelEnd, Object};
-use crate::paging::{Access, PAGE};
+use crate::paging::{Access, MapError, PAGE};
 use crate::process::{Limits, Process, ThreadObject};
 use crate::program::{self, Carried, SegmentAccess};
 
@@ -88,10 +88,22 @@ fn random_place(pages: u64) -> Option<u64> {
     Some(RECORD_LOW + (random % slots) * PAGE)
 }
 
+/// What a launch reports when it cannot map a page, with the reason kept (ADR-0005 D4; S4-1's
+/// review, finding F4): `LIMIT` when the child has as many page tables as one space may have,
+/// `NO_MEMORY` for a want of memory, and `INVALID_ARGS` for an address the launch path never
+/// asks for (outside the user half, or already mapped).
+fn map_refused(e: ChangeError) -> Error {
+    match e {
+        ChangeError::Limit => Error::Limit,
+        ChangeError::Map(MapError::OutOfMemory) => Error::NoMemory,
+        _ => Error::InvalidArgs,
+    }
+}
+
 /// Maps the pages of `child`'s start record, for what `given` holds, read-only and not
 /// executable, at a random address no other mapping of the child touches (C4). The record is
-/// written by [`start`]. `LIMIT` past 64 handles or 64 KiB, `NOT_SUPPORTED` without a
-/// random-number generator, `NO_MEMORY` without frames.
+/// written by [`start`]. `LIMIT` past 64 handles or 64 KiB, or when the child's page tables are
+/// at their bound, `NOT_SUPPORTED` without a random-number generator, `NO_MEMORY` without frames.
 pub(crate) fn place(child: &mut Process, given: &Given<'_>) -> Result<Placed, Error> {
     let size = start::size_of(given.handles(), given.args, given.env).map_err(|_| Error::Limit)?;
     let pages = size.div_ceil(PAGE as usize) as u64;
@@ -107,7 +119,7 @@ pub(crate) fn place(child: &mut Process, given: &Given<'_>) -> Result<Placed, Er
         for k in 0..pages {
             let frame = child
                 .map_page(record + k * PAGE, Access::Read)
-                .map_err(|_| Error::NoMemory)?;
+                .map_err(map_refused)?;
             frames.push(frame);
         }
         return Ok(Placed {
@@ -244,7 +256,8 @@ fn started(
 pub(crate) struct ProgramLimits {
     /// Its quotas: each kind given deliberately, and the least it needs.
     pub(crate) limits: Limits,
-    /// Pages of its first thread's stack.
+    /// Pages of its first thread's stack: at least one, and at most
+    /// [`program::MAX_STACK_PAGES`].
     pub(crate) stack_pages: u64,
 }
 
@@ -280,27 +293,36 @@ fn random() -> Result<u64, Error> {
 /// from its read-execute segment alone (ADR-0005 A6), and maps the program at a random base and
 /// a stack at another random place. Every page is mapped once, with its final permissions, and
 /// written through its frame: read-execute for code, read-only for read-only data and for RELRO
-/// once its relocations are in, read-write and never executable for data. `INVALID_ARGS` for a
-/// description that breaks [`program::check`]'s rules, `NOT_SUPPORTED` without a random-number
-/// generator, `NO_MEMORY` without frames, `LIMIT` if no free place is found. On an error the
-/// child, and every frame it was given, is dropped.
+/// once its relocations are in, read-write and never executable for data.
+///
+/// `INVALID_ARGS`, before anything is made, for a description that breaks [`program::check`]'s
+/// rules or a stack of no pages or of more than [`program::MAX_STACK_PAGES`]; `NOT_SUPPORTED`
+/// without a random-number generator; `NO_MEMORY` without frames; `LIMIT` if no free place is
+/// found, or when the image and stack need more page tables than one space may have. That last
+/// is found part-way through mapping, not estimated first: a program or stack spread over more
+/// than about 40 MiB is refused after much of it is mapped (S4-1's review, finding F4, kept as a
+/// limit; the boot proof shows such a refusal gives everything back). On every error the child,
+/// and every frame and table it was given, is dropped.
 pub(crate) fn load_program(
     creator: &Process,
     program: &Carried,
     run: &ProgramLimits,
 ) -> Result<LoadedProgram, Error> {
     program::check(program).map_err(|_| Error::InvalidArgs)?;
+    if run.stack_pages == 0 || run.stack_pages > program::MAX_STACK_PAGES {
+        return Err(Error::InvalidArgs);
+    }
     let base = program::random_base(program.span / PAGE, random()?).ok_or(Error::Limit)?;
     let code = program::code_range(program, base).ok_or(Error::InvalidArgs)?;
     let mut child = Process::child_of(creator, run.limits, code).ok_or(Error::NoMemory)?;
     map_image(&mut child, program, base)?;
-    let stack = place_stack(&mut child, run.stack_pages)?;
+    let (stack, stack_top) = place_stack(&mut child, run.stack_pages)?;
     Ok(LoadedProgram {
         process: child,
         base,
         entry: base + program.entry,
         stack,
-        stack_top: stack + run.stack_pages * PAGE,
+        stack_top,
     })
 }
 
@@ -321,7 +343,7 @@ fn map_image(child: &mut Process, program: &Carried, base: u64) -> Result<(), Er
                 .map_err(|_| Error::InvalidArgs)?;
             let frame = child
                 .map_page(base + segment.rva + k * PAGE, access)
-                .map_err(|_| Error::NoMemory)?;
+                .map_err(map_refused)?;
             // A fresh frame is zero: only a page with bytes is written.
             if page.iter().any(|&b| b != 0) && !child.write_frame(frame, 0, &page) {
                 return Err(Error::NoMemory);
@@ -333,23 +355,23 @@ fn map_image(child: &mut Process, program: &Carried, base: u64) -> Result<(), Er
 
 /// Maps `pages` pages of stack, read-write and never executable, at a random place in the
 /// programs' region with an unmapped page below and above it that nothing else of `child` uses.
-/// Returns its lowest page.
-fn place_stack(child: &mut Process, pages: u64) -> Result<u64, Error> {
-    if pages == 0 {
-        return Err(Error::InvalidArgs);
-    }
+/// Returns its lowest page and one past its highest: the first thread's RSP.
+fn place_stack(child: &mut Process, pages: u64) -> Result<(u64, u64), Error> {
+    let guarded = pages.checked_add(2).ok_or(Error::InvalidArgs)?;
+    let bytes = pages.checked_mul(PAGE).ok_or(Error::InvalidArgs)?;
     for _ in 0..PLACEMENT_TRIES {
-        let guarded = program::random_base(pages + 2, random()?).ok_or(Error::Limit)?;
-        if (0..pages + 2).any(|k| child.is_mapped(guarded + k * PAGE)) {
+        // `random_base` keeps all `guarded` pages below `PROGRAM_HIGH`, so nothing here overflows.
+        let place = program::random_base(guarded, random()?).ok_or(Error::Limit)?;
+        if (0..guarded).any(|k| child.is_mapped(place + k * PAGE)) {
             continue;
         }
-        let low = guarded + PAGE;
+        let low = place + PAGE;
         for k in 0..pages {
             child
                 .map_page(low + k * PAGE, Access::ReadWrite)
-                .map_err(|_| Error::NoMemory)?;
+                .map_err(map_refused)?;
         }
-        return Ok(low);
+        return Ok((low, low + bytes));
     }
     Err(Error::Limit)
 }

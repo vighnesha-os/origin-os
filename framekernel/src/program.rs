@@ -27,6 +27,10 @@ pub const PROGRAM_LOW: u64 = 0x0000_0000_1000_0000;
 pub const PROGRAM_HIGH: u64 = 0x0000_1000_0000_0000;
 /// The largest span a program may have (ONBF §6.1: at most 2 GiB, for the small code model).
 pub const MAX_SPAN: u64 = 1 << 31;
+/// The most pages a carried program's first stack may have: as many as its span may (2 GiB), so
+/// that the stack with its two unmapped neighbours always fits the programs' region and its top
+/// never overflows (S4-1's review, finding F3).
+pub const MAX_STACK_PAGES: u64 = MAX_SPAN / PAGE;
 
 /// How the launch path maps a segment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +149,19 @@ pub fn code_range(carried: &Carried, base: u64) -> Option<(u64, u64)> {
         .find(|s| s.access == SegmentAccess::ReadExecute)?;
     let start = base.checked_add(s.rva)?;
     Some((start, start.checked_add(s.size)?))
+}
+
+/// How the page at offset `offset` from the base of `carried` must be mapped: the access of the
+/// segment that holds it, or `None` for a page of the span no segment holds, which stays
+/// unmapped. What the boot proof compares the child's tables with, page by page, before its
+/// first thread starts (S4-1's review, finding F1).
+#[must_use]
+pub fn page_access(carried: &Carried, offset: u64) -> Option<SegmentAccess> {
+    carried
+        .segments
+        .iter()
+        .find(|s| offset.checked_sub(s.rva).is_some_and(|at| at < s.size))
+        .map(|s| s.access)
 }
 
 /// The page-aligned place in `[PROGRAM_LOW, PROGRAM_HIGH)` at which `pages` pages start, from a

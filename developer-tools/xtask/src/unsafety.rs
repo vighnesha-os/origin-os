@@ -159,11 +159,12 @@ const UNSAFE_FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// The crates that run in ring 3 (CLAUDE.md §11; task S4-1): the runtime, today's generated
-/// stubs, and the kernel's Rust proof programs.
+/// The crates that run in ring 3 (CLAUDE.md §11; task S4-1): the runtime and the bodies of its
+/// `mem*` functions, today's generated stubs, and the kernel's Rust proof programs.
 const RING3_CRATES: &[&str] = &[
     "runtime/kernel-stubs",
     "runtime/rt",
+    "runtime/rt-mem",
     "tests/kernel/first-program",
 ];
 
@@ -179,8 +180,16 @@ const RING3_UNSAFE_FILES: &[(&str, &str)] = &[
         "`memcpy`, `memmove`, `memset`, `memcmp` and `bcmp`, which the compiler calls and no C library supplies",
     ),
     (
+        "runtime/rt-mem/src/lib.rs",
+        "the bodies of those five functions: `rep movsb`, `rep stosb` and the byte reads of a comparison, on raw pointers",
+    ),
+    (
+        "runtime/rt-mem/src/tests.rs",
+        "the host tests of those bodies, which are unsafe to call, against `core::ptr::copy`, and the direction flag read after a copy down",
+    ),
+    (
         "tests/kernel/first-program/src/faults.rs",
-        "the proof's deliberate faults: a write to its own code and a jump into its own data",
+        "the proof's deliberate faults: a write to its own code, a jump into its own data and a write to its relocated read-only data",
     ),
 ];
 

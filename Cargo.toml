@@ -28,6 +28,7 @@ members = [
     "runtime/onbf/merkle",
     "runtime/onbf/verify",
     "runtime/rt",
+    "runtime/rt-mem",
     "runtime/version",
     "sdk/directory",
     "security/crypto",
@@ -38,7 +39,8 @@ members = [
 # Host-buildable crates only. The UEFI loader's and the Framekernel's binaries cannot be
 # built for the host, and the ring-3 crates (`runtime/rt`, `runtime/kernel-stubs` and
 # `tests/kernel/first-program`) are built only for the userspace triple, by `cargo xtask` with
-# `.cargo/userspace.toml` (CLAUDE.md §11; task S4-1).
+# `.cargo/userspace.toml` (CLAUDE.md §11; task S4-1). `runtime/rt-mem`, the bodies of the
+# runtime's `mem*` functions, is built for both, so the host can test it.
 default-members = [
     "boot/info",
     "developer-tools/oidl",
@@ -53,6 +55,7 @@ default-members = [
     "runtime/onbf/format",
     "runtime/onbf/merkle",
     "runtime/onbf/verify",
+    "runtime/rt-mem",
     "runtime/version",
     "security/crypto",
     "security/random",

@@ -28,14 +28,18 @@ unsafe extern "Rust" {
 }
 
 /// Where the kernel starts the first thread: RDI holds the start record's address, RSP the top
-/// of its stack, and every other register is zero (P6). The psABI says RSP is 16-byte aligned
-/// here; the stack is aligned again rather than trusted, RBP is cleared so a backtrace ends
-/// here, and [`run`] is called with RDI untouched, as its first argument. `run` never returns;
-/// `ud2` stops the thread if it ever did.
+/// of its stack, and every other register is zero (P6). The direction flag is cleared first:
+/// the kernel starts a thread with it clear (RFLAGS `0x202`), but P6 does not say so, and the
+/// psABI's promise that it is clear at every call, which the `mem*` functions keep and rely on,
+/// starts here (S4-1's review, finding F7). The psABI says RSP is 16-byte aligned here; the
+/// stack is aligned again rather than trusted, RBP is cleared so a backtrace ends here, and
+/// [`run`] is called with RDI untouched, as its first argument. `run` never returns; `ud2`
+/// stops the thread if it ever did.
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
     naked_asm!(
+        "cld",
         "xor ebp, ebp",
         "and rsp, -16",
         "call {run}",

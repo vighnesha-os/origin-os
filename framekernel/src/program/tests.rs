@@ -220,3 +220,30 @@ fn every_base_is_a_page_in_the_region_with_room_for_the_program() {
     );
     assert_eq!(random_base(u64::MAX, 0), None);
 }
+
+#[test]
+fn each_page_of_the_span_has_its_segments_access_or_none() {
+    // `GOOD` has no segment at its first page: that page stays unmapped.
+    assert_eq!(page_access(&GOOD, 0), None);
+    assert_eq!(page_access(&GOOD, 0xFFF), None);
+    assert_eq!(page_access(&GOOD, 0x1000), Some(SegmentAccess::ReadExecute));
+    assert_eq!(page_access(&GOOD, 0x1FFF), Some(SegmentAccess::ReadExecute));
+    assert_eq!(page_access(&GOOD, 0x2000), Some(SegmentAccess::Read));
+    assert_eq!(
+        page_access(&GOOD, 0x3000),
+        Some(SegmentAccess::ReadAfterRelocation)
+    );
+    // Both pages of the writable segment, the second all bss.
+    assert_eq!(page_access(&GOOD, 0x4000), Some(SegmentAccess::ReadWrite));
+    assert_eq!(page_access(&GOOD, 0x5000), Some(SegmentAccess::ReadWrite));
+    // Past the span.
+    assert_eq!(page_access(&GOOD, GOOD.span), None);
+    assert_eq!(page_access(&GOOD, u64::MAX), None);
+}
+
+#[test]
+fn the_largest_stack_and_its_two_neighbours_fit_the_region() {
+    assert_eq!(MAX_STACK_PAGES * PAGE, MAX_SPAN);
+    let place = random_base(MAX_STACK_PAGES + 2, u64::MAX).unwrap();
+    assert!(place + (MAX_STACK_PAGES + 2) * PAGE <= PROGRAM_HIGH);
+}
