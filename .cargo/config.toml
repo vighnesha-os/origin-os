@@ -1,6 +1,14 @@
 [alias]
 xtask = "run --quiet --package xtask --"
 
+# Build the kernel and the loader with `cargo xtask`, not with `cargo build`. Beside the flags
+# below, xtask gives every image build a `--remap-path-prefix` for the directory this machine's
+# toolchain keeps the standard library's source in, which cannot be written here because it
+# is another path on every machine (developer-tools/xtask/src/toolchain.rs, CLAUDE.md §75).
+# An image built by plain `cargo build` holds that path, and so is not the image another
+# machine builds. xtask also refuses to run with RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS or a
+# per-target RUSTFLAGS variable set: the first two replace every list below, even when empty.
+
 # CLAUDE.md §14: frame pointers on every Origin-owned freestanding image.
 #
 # CLAUDE.md §75: the loader's image is the same bytes from one build to the next
@@ -16,8 +24,7 @@ xtask = "run --quiet --package xtask --"
 # UEFI 2.11 §2.1.1 says firmware uses: the header, the sections and the relocations.
 # `/Brepro` in place of `/TIMESTAMP:0` also gives the same bytes twice, and leaves a debug
 # directory with one entry (type 16) that a firmware's loader may read. `cargo xtask check`
-# builds the loader twice and fails if the images differ. RUSTFLAGS in the environment
-# replaces this whole list.
+# builds the loader twice and fails if the images differ.
 [target.x86_64-unknown-uefi]
 rustflags = [
     "-C", "force-frame-pointers=yes",
