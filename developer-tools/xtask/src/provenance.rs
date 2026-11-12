@@ -205,7 +205,7 @@ fn workspace_licence(root_manifest: &str) -> Option<&str> {
 
 /// The cells of one table line, trimmed, with `\|` read as `|`. `None` if the line does not
 /// start and end with a `|`.
-fn cells(line: &str) -> Option<Vec<String>> {
+pub(crate) fn cells(line: &str) -> Option<Vec<String>> {
     let rest = line.trim().strip_prefix('|')?;
     let mut cells = Vec::new();
     let mut cell = String::new();
