@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Required by | CLAUDE.md §82: "Do not mark a milestone complete without its exit tests. Each milestone's exit tests are listed in `docs/ROADMAP.md` before it is marked done (decision item 122)." |
-| State | **M0, M1 and M2's exit tests and the rule for later milestones are accepted.** The owner accepted them on 2026-11-12 as decision items 252 to 256 ("Accept all 7", which covered items 252 to 258): 252 for M0, 253 for M1, 254 for M2, 255 for what QEMU and guests under KVM can show, 256 for the rule. The decision sheet records them through the coordinating session's records pull request to `main`. **The tests of M3 to M13 are proposed**, written by item 256's rule, and are not accepted. M3, M4, M5, M6 and M10's are with the owner as decision items 259 to 263. |
+| State | **M0, M1 and M2's exit tests and the rule for later milestones are accepted.** The owner accepted them on 2026-11-12 as decision items 252 to 256 ("Accept all 7", which covered items 252 to 258): 252 for M0, 253 for M1, 254 for M2, 255 for what QEMU and guests under KVM can show, 256 for the rule. The decision sheet records them through the coordinating session's records pull request to `main`. **M3, M4, M5, M6 and M10's tests are accepted too,** as decision items 259 to 263 ("Accept all 5", 2026-11-12). **The tests of M7, M8, M9, M11, M12 and M13 are proposed,** written by item 256's rule, and are not accepted. |
 | Milestones done | **None.** A milestone is done when every one of its accepted exit tests passes in its declared scope (items 255 and 256). M0, M1 and M2 are built. |
 | Written | 2026-11-12, by TASKS item 25, at `land/s4` `5ea97ef`. |
 | Rows | The IDs are rows of the requirements matrix (`docs/requirements/`). What a row's state means is in its `README.md`. A row's state is the matrix's; this page does not repeat it, so it cannot go stale here. |
@@ -85,7 +85,7 @@ Given elsewhere by rule 3: SMP, topology and TLB shootdowns (S24-06 to S24-14, S
 
 ## M3. SMP and scheduler
 
-**Proposed, by the rule of item 256, and with the owner as decision item 259.**
+**Accepted: decision item 259.** **State, 2026-11-12: partial.** In short: processors, threads, preemption, wait queues and fair shares are built; there are no scheduling classes, no load balancing and no topology-aware placement, and nothing has run on a physical machine (matrix row S82-04).
 
 §82: "Implement multiple processors, native threads, preemption, synchronization and scheduling." Scope: both editions, on hardware. Matrix row S82-04.
 
@@ -100,7 +100,7 @@ Given elsewhere by rule 3: SMP, topology and TLB shootdowns (S24-06 to S24-14, S
 
 ## M4. Processes and IPC
 
-**Proposed, by the rule of item 256, and with the owner as decision item 260.**
+**Accepted: decision item 260.** **State, 2026-11-12: partial.** In short: isolated processes, system calls, handles, channels, the start record, the directory, memory objects, events and ports are built under QEMU; no call creates a process or a thread, there is no Loader Service, and ADR-0017's controls are partly built (rows S24-15 and S82-05).
 
 §82: "Implement isolated user processes, system calls, capabilities and IPC." Scope: both editions, on hardware. Matrix row S82-05.
 
@@ -116,7 +116,7 @@ Given elsewhere by rule 3: SMP, topology and TLB shootdowns (S24-06 to S24-14, S
 
 ## M5. Storage
 
-**Proposed, by the rule of item 256, and with the owner as decision item 261.**
+**Accepted: decision item 261.** **State, 2026-11-12: partial.** In short: PCIe, both IOMMUs, NVMe and a block cache are built; no filesystem is mounted, and nothing has run on a physical machine (matrix row S82-06).
 
 §82: "Implement PCIe, DMA/IOMMU, NVMe, block storage and filesystem foundations." Scope: both editions, on hardware. Matrix row S82-06.
 
@@ -133,7 +133,7 @@ Given elsewhere by rule 3: hot-plug and external-device authorization (S31-12, S
 
 ## M6. Native runtime
 
-**Proposed, by the rule of item 256, and with the owner as decision item 262.**
+**Accepted: decision item 262.** **State, 2026-11-12: not started on this tree.** In short: TASKS item 41 (task S4-1) builds the native Rust user runtime on its own branch; nothing of M6 is on this tree yet (matrix row S82-07).
 
 §82: "Implement Origin executable ABI, `.ose` loader and native Rust user runtime." Scope: both editions, on hardware. Matrix row S82-07.
 
@@ -141,14 +141,16 @@ Given elsewhere by rule 3: hot-plug and external-device authorization (S31-12, S
 |---|---|---|
 | M6-1 | The userspace ABI is written and versioned: calling convention, stack, registers, TLS, start-up, allocation, dynamic linking, shared libraries, unwinding, notifications, version negotiation, 64-bit only | S42-01 to S42-04, S42-07 to S42-16 |
 | M6-2 | The `.ose` loader verifies and loads an ONBF executable, refuses malformed and hostile images, and is fuzzed | S43-01 to S43-14 |
-| M6-3 | The Origin runtime: start-up, allocation, threads, TLS, synchronization, files, time, standard I/O, async I/O, panics and shutdown | S44-01 to S44-17 |
+| M6-3 | The Origin runtime: start-up, allocation, threads, TLS, synchronization, files, time, standard I/O, async I/O, panics and shutdown | S44-01 to S44-07, S44-09 to S44-17 |
 | M6-4 | Userspace is built for its own target and never for Linux's APIs | S11-03 to S11-07 |
 | M6-5 | Starting a program is a capability, with the manifest gate, no interpreter in the base image and an empty environment by default (ADR-0011 Amendment 1) | S48-05 to S48-10 |
 | M6-6 | M6-1 to M6-5 on a physical machine in scope, with a record | the rows above |
 
+Given elsewhere by item 262: networking in the runtime (S44-08) to M10, with the network stack, because a sockets API cannot be tested through an actual entry point before a network service exists.
+
 ## M7. Native packaging
 
-**Proposed, by the rule of item 256.**
+**Proposed, by the rule of item 256.** **State, 2026-11-12: not started; groundwork only, below.**
 
 §82: "Implement `.osi`, `.oapp`, `.od`, signing, installation and rollback." Scope: both editions, on hardware. Matrix row S82-08.
 
@@ -164,7 +166,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 
 ## M8. Native graphics
 
-**Proposed, by the rule of item 256.**
+**Proposed, by the rule of item 256.** **State, 2026-11-12: not started; groundwork only: a software rasterizer, an in-memory file tree and text codecs (matrix row S82-09).**
 
 §82: "Implement Origin UI, software renderer, compositor and first graphical applications." Scope: both editions, on hardware. Matrix row S82-09.
 
@@ -179,7 +181,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 
 ## M9. Installable operating system
 
-**Proposed, by the rule of item 256.**
+**Proposed, by the rule of item 256.** **State, 2026-11-12: not started.**
 
 §82: "Create actual installation media, partitioning, installation GUI, first-run setup and native system management." Scope: both editions, on hardware. Matrix row S82-10.
 
@@ -195,7 +197,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 
 ## M10. Connectivity and laptop support
 
-**Proposed, by the rule of item 256, and with the owner as decision item 263.**
+**Accepted: decision item 263.** **State, 2026-11-12: partial.** In short: packet, TCP, DHCP and DNS code proven in memory, a virtio-net driver and PS/2 decoding; no USB, audio, power or radio (matrix row S82-11).
 
 §82: "Implement appropriate USB, USB4, Thunderbolt, networking, audio, power and peripheral support." Scope: both editions, on hardware. Matrix row S82-11. USB4, Thunderbolt, Wi-Fi and Bluetooth are shown on physical hardware only (ADR-0015 D9; S82-17).
 
@@ -203,7 +205,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 |---|---|---|
 | M10-1 | USB through xHCI: hubs, enumeration, every transfer type, HID, mass storage, audio, networking and video, with descriptors fuzzed | S34-01 to S34-16 |
 | M10-2 | USB4 and Thunderbolt: the connection manager, tunnels, bandwidth, docks, hot-plug and DMA protection, with external-device authorization | S35-01 to S35-14, S31-12, S32-12, S32-13 |
-| M10-3 | Networking: Ethernet, IPv4 and IPv6, TCP, UDP, DHCP, DNS, routing, the firewall, sockets, TLS, Wi-Fi and Bluetooth | S54-01 to S54-21 |
+| M10-3 | Networking: Ethernet, IPv4 and IPv6, TCP, UDP, DHCP, DNS, routing, the firewall, sockets, TLS, Wi-Fi and Bluetooth; and networking in the Origin runtime, through the network service | S54-01 to S54-21, S44-08 |
 | M10-4 | Audio and peripherals | S55-01 to S55-12, S56-01 to S56-13 |
 | M10-5 | Power, suspend and resume, with the clocks across sleep | S67-01 to S67-13, S68-08, S31-11 |
 | M10-6 | Every device standard through the SDK's three layers, each feature reported truthfully, dangerous operations behind rights of their own | S31-17 to S31-21, rows A15-* |
@@ -211,7 +213,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 
 ## M11. Graphics acceleration and compute
 
-**Proposed, by the rule of item 256.**
+**Proposed, by the rule of item 256.** **State, 2026-11-12: not started.**
 
 §82: "Implement supported native GPU/NPU capabilities, hardware graphics and compute interfaces." Scope: both editions, on hardware. Matrix row S82-12.
 
@@ -223,7 +225,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 
 ## M12. System updates and recovery
 
-**Proposed, by the rule of item 256.**
+**Proposed, by the rule of item 256.** **State, 2026-11-12: not started.**
 
 §82: "Implement secure unified releases, atomic upgrades, recovery and rollback." Scope: both editions, on hardware. Matrix row S82-13.
 
@@ -238,7 +240,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 
 ## M13. Production qualification
 
-**Proposed, by the rule of item 256.**
+**Proposed, by the rule of item 256.** **State, 2026-11-12: not started.**
 
 §82: "Complete release security review, performance testing, reliability tests, physical hardware qualification, documentation and maintenance planning." Scope: each edition, on its declared hardware. Matrix row S82-14.
 
