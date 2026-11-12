@@ -12,9 +12,10 @@
 # Cargo.lock is out of step with the manifests. Without the flag cargo rewrites the file and
 # carries on. That first command resolves the whole workspace, so the cargo commands xtask starts
 # afterwards resolve the same workspace against the same file and have nothing to change; they
-# do not repeat the flag. xtask's Loom models have a lock of their own, in a scratch workspace,
-# and pass `--locked` themselves (developer-tools/xtask/src/loom.rs). The root Cargo.lock is the
-# only lock file tracked, and holds the workspace's packages alone (`cargo xtask check`).
+# do not repeat the flag. xtask's Loom models are the one other resolution: a scratch workspace
+# built from a lock of its own (developer-tools/xtask/src/loom.lock), which xtask holds with
+# `--locked` itself (loom.rs). The root Cargo.lock holds the workspace's packages alone
+# (`cargo xtask check`).
 #
 # Neither kind of boot below qualifies anything (§74, rule 30): the devices and the firmware are
 # QEMU's, and the processors are whatever GitHub's fleet holds, not the declared hardware.
