@@ -16,6 +16,9 @@ onbf-merkle.workspace = true
 # compares QEMU's picture against them) and the boot-info layout it reads.
 framekernel = { path = "../../framekernel" }
 origin-boot-info.workspace = true
+# TEST ONLY: the configuration format of the application that plants firmware-reserved memory
+# in QEMU's ACPI tables (`ORIGIN_QEMU_RESERVED`, TASKS item 40).
+origin-test-reserved-memory = { path = "../../tests/emulator/reserved-memory" }
 
 [lints]
 workspace = true
