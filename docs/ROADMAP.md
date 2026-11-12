@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Required by | CLAUDE.md §82: "Do not mark a milestone complete without its exit tests. Each milestone's exit tests are listed in `docs/ROADMAP.md` before it is marked done (decision item 122)." |
-| State | **M0, M1 and M2's exit tests and the rule for later milestones are accepted.** The owner accepted them on 2026-11-12 as decision items 252 to 256 ("Accept all 7", which covered items 252 to 258): 252 for M0, 253 for M1, 254 for M2, 255 for what QEMU and guests under KVM can show, 256 for the rule. The decision sheet records them through the coordinating session's records pull request to `main`. **The tests of M3 to M13 are proposed**, written by item 256's rule, and are not accepted. |
+| State | **M0, M1 and M2's exit tests and the rule for later milestones are accepted.** The owner accepted them on 2026-11-12 as decision items 252 to 256 ("Accept all 7", which covered items 252 to 258): 252 for M0, 253 for M1, 254 for M2, 255 for what QEMU and guests under KVM can show, 256 for the rule. The decision sheet records them through the coordinating session's records pull request to `main`. **The tests of M3 to M13 are proposed**, written by item 256's rule, and are not accepted. M3, M4, M5, M6 and M10's are with the owner as decision items 259 to 263. |
 | Milestones done | **None.** A milestone is done when every one of its accepted exit tests passes in its declared scope (items 255 and 256). M0, M1 and M2 are built. |
 | Written | 2026-11-12, by TASKS item 25, at `land/s4` `5ea97ef`. |
 | Rows | The IDs are rows of the requirements matrix (`docs/requirements/`). What a row's state means is in its `README.md`. A row's state is the matrix's; this page does not repeat it, so it cannot go stale here. |
@@ -85,7 +85,7 @@ Given elsewhere by rule 3: SMP, topology and TLB shootdowns (S24-06 to S24-14, S
 
 ## M3. SMP and scheduler
 
-**Proposed, by the rule of item 256.**
+**Proposed, by the rule of item 256, and with the owner as decision item 259.**
 
 §82: "Implement multiple processors, native threads, preemption, synchronization and scheduling." Scope: both editions, on hardware. Matrix row S82-04.
 
@@ -100,7 +100,7 @@ Given elsewhere by rule 3: SMP, topology and TLB shootdowns (S24-06 to S24-14, S
 
 ## M4. Processes and IPC
 
-**Proposed, by the rule of item 256.**
+**Proposed, by the rule of item 256, and with the owner as decision item 260.**
 
 §82: "Implement isolated user processes, system calls, capabilities and IPC." Scope: both editions, on hardware. Matrix row S82-05.
 
@@ -116,7 +116,7 @@ Given elsewhere by rule 3: SMP, topology and TLB shootdowns (S24-06 to S24-14, S
 
 ## M5. Storage
 
-**Proposed, by the rule of item 256.**
+**Proposed, by the rule of item 256, and with the owner as decision item 261.**
 
 §82: "Implement PCIe, DMA/IOMMU, NVMe, block storage and filesystem foundations." Scope: both editions, on hardware. Matrix row S82-06.
 
@@ -133,7 +133,7 @@ Given elsewhere by rule 3: hot-plug and external-device authorization (S31-12, S
 
 ## M6. Native runtime
 
-**Proposed, by the rule of item 256.**
+**Proposed, by the rule of item 256, and with the owner as decision item 262.**
 
 §82: "Implement Origin executable ABI, `.ose` loader and native Rust user runtime." Scope: both editions, on hardware. Matrix row S82-07.
 
@@ -195,7 +195,7 @@ Not started. The tree holds groundwork only: the ONBF container parser knows eac
 
 ## M10. Connectivity and laptop support
 
-**Proposed, by the rule of item 256.**
+**Proposed, by the rule of item 256, and with the owner as decision item 263.**
 
 §82: "Implement appropriate USB, USB4, Thunderbolt, networking, audio, power and peripheral support." Scope: both editions, on hardware. Matrix row S82-11. USB4, Thunderbolt, Wi-Fi and Bluetooth are shown on physical hardware only (ADR-0015 D9; S82-17).
 
