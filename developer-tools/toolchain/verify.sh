@@ -352,7 +352,7 @@ else
         | grep -v '^$' | grep -v 'file format' > "$WORK/wcslen_dis.txt"
       cat "$WORK/wcslen_dis.txt" >> "$out"
       if ! grep -Eq 'IMAGE_REL_AMD64_REL32[[:space:]]+wcslen$' "$WORK/wcslen_dis.txt"; then
-        why="LLVM left char16_len a loop: its code names no wcslen"
+        why="the code of char16_len names no wcslen: LLVM no longer makes the loop that call, or the function is no longer that loop"
       fi
     fi
   fi
@@ -390,7 +390,7 @@ if loader_cargo --bin origin-boot > "$out" 2>&1; then
 else
   # The linker's own lines, without the argument list rustc prints around them.
   grep -E 'error|undefined symbol|referenced by' "$out" | cut -c1-400 | head -20 > "$WORK/wcslen_link_short.txt"
-  record FAIL "§10 wcslen: the loader does not link (#163614 if the symbol is wcslen)" "$WORK/wcslen_link_short.txt"
+  record FAIL "§10 wcslen: the loader did not build and link (#163614 if the linker names wcslen)" "$WORK/wcslen_link_short.txt"
 fi
 
 # ---------------------------------------------------------------- FFI bool (§10, #163911)
