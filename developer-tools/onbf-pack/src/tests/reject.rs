@@ -327,23 +327,85 @@ fn static_constructors_are_rejected() {
     }
 }
 
-#[test]
-fn metadata_tags_are_ignored() {
-    // What rust-lld writes for a static PIE: flags, debug, and the symbol and hash tables.
-    let bytes = with(|e| {
+/// An R segment at 0x5000 holding a `DT_HASH` table at 0x5000 (one bucket, `nchain`
+/// symbols) and `symbols` 24-byte symbols at 0x5010, the first the null symbol; each symbol
+/// after it has `st_shndx` from `defined`. Returns the image with its dynamic tags as rust-lld
+/// writes them for a static PIE: flags, debug, and the symbol, string and hash tables.
+fn with_symbols(nchain: u32, defined: &[u16], edit: impl FnOnce(&mut TestElf)) -> Vec<u8> {
+    let mut table = Vec::new();
+    table.extend_from_slice(&1u32.to_le_bytes());
+    table.extend_from_slice(&nchain.to_le_bytes());
+    table.extend_from_slice(&[0; 8]);
+    table.extend_from_slice(&[0; 24]);
+    for &shndx in defined {
+        let mut symbol = [0u8; 24];
+        symbol[4] = 0x12; // STB_GLOBAL, STT_FUNC
+        symbol[6..8].copy_from_slice(&shndx.to_le_bytes());
+        table.extend_from_slice(&symbol);
+    }
+    with(|e| {
+        e.loads.push(super::elf_writer::Load::new(R, 0x5000, table));
         e.dynamic = vec![
             (30, 0x8),
             (0x6FFF_FFFB, 0x0800_0001),
             (21, 0),
-            (6, 0x2000),
+            (6, 0x5010),
             (11, 24),
             (5, 0x2000),
             (10, 1),
             (0x6FFF_FEF5, 0x2000),
-            (4, 0x2000),
+            (4, 0x5000),
         ];
-    });
-    assert!(pack(&bytes, &options()).is_ok());
+        edit(e);
+    })
+}
+
+#[test]
+fn metadata_tags_are_ignored() {
+    // The null symbol alone, and then with two defined symbols (section indexes 7 and
+    // SHN_ABS): nothing in the symbol table is used beyond the undefined-symbol check.
+    assert!(pack(&with_symbols(1, &[], |_| {}), &options()).is_ok());
+    assert!(pack(&with_symbols(3, &[7, 0xFFF1], |_| {}), &options()).is_ok());
+}
+
+#[test]
+fn an_undefined_symbol_is_rejected() {
+    // ONBF §6.1.2: no Origin library is declared, so every symbol must be defined.
+    rejects(
+        &with_symbols(3, &[7, 0], |_| {}),
+        ElfError::UndefinedSymbol { index: 2 },
+    );
+    rejects(
+        &with_symbols(2, &[0], |_| {}),
+        ElfError::UndefinedSymbol { index: 1 },
+    );
+}
+
+#[test]
+fn an_unreadable_symbol_table_is_rejected() {
+    rejects(
+        &with_symbols(1, &[], |e| e.dynamic.retain(|&(tag, _)| tag != 4)),
+        ElfError::SymbolTable("DT_SYMTAB without DT_HASH, which gives its length"),
+    );
+    rejects(
+        &with_symbols(1, &[], |e| {
+            for tag in &mut e.dynamic {
+                if tag.0 == 11 {
+                    tag.1 = 16;
+                }
+            }
+        }),
+        ElfError::SymbolTable("DT_SYMENT is not 24"),
+    );
+    // `nchain` past the end of the segment's bytes.
+    rejects(
+        &with_symbols(9, &[7], |_| {}),
+        ElfError::SymbolTable("DT_SYMTAB is outside the file-backed bytes"),
+    );
+    rejects(
+        &with_symbols(1, &[], |e| e.dynamic.push((6, 0x5010))),
+        ElfError::DuplicateDynamicTag(6),
+    );
 }
 
 #[test]
