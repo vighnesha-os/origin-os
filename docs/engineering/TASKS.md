@@ -77,7 +77,7 @@
 
 | Task | Notes |
 |---|---|
-| S4-0 (item 38) | 64-bit handles, on `claude/s4-0-handles`; the contract is under "Task contracts" |
+| S4-0 (item 38) | 64-bit handles: built on `claude/s4-0-handles`, waiting to be read and landed in the third batch; the contract is under "Task contracts" |
 
 **Found during S3-2 (2026-11-10):**
 - **Reading without room:** a reader cannot drop a message it does not want without making room for it (Zircon has a discard option). Neither B1 nor B3 needs it; a service domain may.
@@ -394,7 +394,7 @@
     - **(c)** The randomized model of the generator's policy as a host test. **Built:** `security/random/src/tests/model.rs` and nine negative controls in `security/random/tools/plant_faults.py`, on `claude/18b-random-model` at `dabe70b`, merged into the second step-3 batch at `fe457f2` (decision item 190). No person has read it.
     - **(d)** From the landing (`c2245ef`): run the memory-object proof on a machine with no generator and show `not_supported` for a map at a place the kernel chooses. Today that proof does not run there, and only a host test of `mapping::place_at_random` shows the status. *An observation from the interface session (2026-11-11), not a remedy:* on such a machine no process can be launched, since a start record's place is drawn too (threat row P3), so the proof cannot be a ring-3 program there. A remedy would have to call the map path from the kernel, with the kernel choosing the place, in a process that is never started.
 
-38. **Task S4-0 of ADR-0011 N14 step 4: 64-bit handles (item 24; decision item 109; ADR-0005 Amendment 6, E1).** In progress on `claude/s4-0-handles`. Its contract is under "Task contracts".
+38. **Task S4-0 of ADR-0011 N14 step 4: 64-bit handles (item 24; decision item 109; ADR-0005 Amendment 6, E1). Built on `claude/s4-0-handles` on 2026-11-12, not merged:** `user-abi` and `origin.kernel` 0.7, the kernel's table, `origin-abi`, the generator and every generated crate, the proofs, OIDL §10. The boot test and the boot matrix pass under QEMU; two controls fail the boot (ADR-0013, H64-1 and H64-2). It waits for the coordinating session to read it and land it in the third batch, and then for CI. Its contract is under "Task contracts"; what was run is in `SOURCE_PROVENANCE.md`, "Task S4-0".
 
 ## Waiting on the owner
 

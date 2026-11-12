@@ -271,6 +271,15 @@ The order "free a stack's frames and slot only after its shootdown" is also Loom
 
 Each boot failed (`cargo xtask boot-test` exit 1), and each by the proof the edit was aimed at. Logs: the interface session's scratchpad, not kept in the repository.
 
+**Controls of the 64-bit handles (ADR-0005 Amendment 6, E1; task S4-0; 2026-11-12, QEMU 11.1.3 TCG, Intel VT-d, 2 processors):** temporary edits on `claude/s4-0-handles` at `380e27c`, each booted once in the `kernel boot` scenario alone (`ORIGIN_BOOT_TEST_ONLY="kernel boot"`), then put back and compared byte for byte; the tree was clean before and after. They add no proof and change no row's consequence: the steps they aim at are lines of "IPC and handles". They are numbered apart from C0 to C48 and EP1 to EP11.
+
+| # | Edit | Result |
+|---|---|---|
+| H64-1 | The generated decoder keeps only a handle register's low 32 bits (`HandleArg::from_reg` in `framekernel/syscalls/src/oidl_rt.rs`) | `ipc: ping-pong: … the processes blocked in wait_one 0 and 0 times, and 0 wake-ups crossed processors: ipc failed`: the first ring-3 proof's handles name nothing once cut, since the kernel's table places a slot above bit 32 |
+| H64-2 | A handle lookup ignores the generation (`HandleTable::get` in `framekernel/src/handles.rs`) | `ipc: bad handles: … its slot at a generation never issued -> OK, … stale, slot reused -> OK, …: ipc failed` |
+
+Both boots failed (`cargo xtask boot-test` exit 1), each by the line it was aimed at. The generator's own control, a decoder that keeps 32 bits caught by the system-call API checks on the host, is `a_handle_cut_to_32_bits_fails_the_syscall_checks` in `developer-tools/oidl/tests/generated.rs`. Logs: the interface session's scratchpad, not kept in the repository.
+
 **The legacy-free machine (`boot-legacy-free`, in `boot-matrix`):** `-machine pit=off,i8042=off` boots the whole kernel. Before F3 it read the absent port 61h as 0xFF and reported `calibrated against the PIT: 0 kHz`, and failed. After, it calibrates against the ACPI PM timer (agreeing with one RTC second to 0.006 %), reports that it cannot prove the two PIT-based I/O APIC proofs, that the FADT says it has no 8042, and `boot verdict: 50 of 50 proofs passed`.
 
 **Real processors:** research ledger §3 (CI through KVM).
