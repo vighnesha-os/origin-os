@@ -26,6 +26,13 @@
 //! there is not the fixed one ([`image_inputs::check_linker_text`]). No file of the ten may
 //! hold the linker's own line.
 //!
+//! The loader starts neither the kernel's ELF nor a carried program's: it starts the image
+//! `onbf-pack krn` converts the kernel's ELF to. So each build's ELF is converted, by the
+//! command `cargo xtask build` and the boots use, and the converted image is compared, searched
+//! and kept like every other file. A signed image is not among them: signing is a separate
+//! step with a key, and its ML-DSA signature is hedged with fresh randomness by design, so no
+//! two signings of one image are the same bytes (`developer-tools/onbf-pack/src/sign.rs`).
+//!
 //! None of this shows that another machine gives the same bytes: both builds have one
 //! toolchain on one host. `docs/research/2026-11-11-toolchain-path-in-images.md` says what
 //! was tried with a second copy of the toolchain and what CI printed, and
@@ -44,8 +51,8 @@ use std::time::Duration;
 
 use crate::ring3::{self, CarriedKind};
 use crate::{
-    Loader, Result, build_kernel_in, build_loader_in, image_inputs, read_file, target_dir,
-    toolchain,
+    KERNEL_IMAGE, Loader, Result, build_kernel_in, build_loader_in, image_inputs, pack_kernel_to,
+    read_file, target_dir, toolchain,
 };
 
 /// What the gate builds twice.
@@ -56,7 +63,7 @@ enum Image {
     /// Every program the kernel carries: each one's linker output, and each file
     /// `onbf-pack carried` writes for it.
     Programs,
-    /// The Framekernel ELF, which `onbf-pack` turns into the KRN image.
+    /// The Framekernel ELF, and the KRN image `onbf-pack` turns it into, which is what boots.
     Kernel,
 }
 
@@ -112,16 +119,15 @@ impl Image {
     /// Builds the image into `target` and reads every file it is made of. The loader's builds
     /// all write one path in a directory, so nothing is left to be read later.
     fn build(self, target: &Path) -> Result<Vec<Built>> {
-        let one =
-            |name: String, file_name: String, path: PathBuf, elf: bool| -> Result<Vec<Built>> {
-                Ok(vec![Built {
-                    name,
-                    file_name,
-                    bytes: read_file(&path)?,
-                    in_kernel: false,
-                    elf,
-                }])
-            };
+        let one = |name: String, file_name: String, path: PathBuf| -> Result<Vec<Built>> {
+            Ok(vec![Built {
+                name,
+                file_name,
+                bytes: read_file(&path)?,
+                in_kernel: false,
+                elf: false,
+            }])
+        };
         match self {
             Self::Loader(loader) => {
                 let path = build_loader_in(loader.map(Loader::feature), Some(target))?;
@@ -130,13 +136,11 @@ impl Image {
                         "the loader as a release builds it (no feature)".into(),
                         "loader".into(),
                         path,
-                        false,
                     ),
                     Some(loader) => one(
                         format!("the loader with `{}`", loader.feature()),
                         format!("loader-{}", loader.feature()),
                         path,
-                        false,
                     ),
                 }
             }
@@ -160,14 +164,35 @@ impl Image {
                 }
                 Ok(built)
             }
-            Self::Kernel => one(
-                "the kernel ELF".into(),
-                "kernel".into(),
-                build_kernel_in(Some(target))?,
-                true,
-            ),
+            Self::Kernel => {
+                let elf = build_kernel_in(Some(target))?;
+                // Into this build's own directory, so that the two builds' images are two
+                // files, each converted from its own ELF.
+                let image = pack_kernel_to(&elf, &target.join("xtask").join(KERNEL_IMAGE))?;
+                Ok(kernel_files(read_file(&elf)?, read_file(&image)?))
+            }
         }
     }
+}
+
+/// The two files of the kernel: what the linker wrote, and what boots.
+fn kernel_files(elf: Vec<u8>, image: Vec<u8>) -> Vec<Built> {
+    vec![
+        Built {
+            name: "the kernel ELF".into(),
+            file_name: "kernel".into(),
+            bytes: elf,
+            in_kernel: false,
+            elf: true,
+        },
+        Built {
+            name: "the kernel image that boots (its ELF as `onbf-pack krn` converts it)".into(),
+            file_name: "kernel-image".into(),
+            bytes: image,
+            in_kernel: false,
+            elf: false,
+        },
+    ]
 }
 
 /// How much of an image's text a report shows where a host path was found.
@@ -228,7 +253,8 @@ pub(crate) fn gate() -> Result {
                 .flatten()
                 .filter(|file| file.in_kernel)
                 .collect();
-            for kernel in first {
+            // The ELF: the converted image may store a segment in another form.
+            for kernel in first.iter().filter(|file| file.elf) {
                 if let Some(missing) = segment_not_in(&kernel.bytes, &segments) {
                     return Err(format!(
                         "{} does not hold the bytes of {} ({} bytes) (CLAUDE.md §75): the gate read a file of a carried program that is not what the kernel carries. If the kernel now holds its programs another way, `ring3::carried_files` and this check must follow it",
@@ -648,6 +674,26 @@ mod tests {
         for (i, image) in IMAGES.iter().enumerate() {
             assert!(!IMAGES[i + 1..].contains(image), "{image:?}");
         }
+    }
+
+    #[test]
+    fn the_kernel_is_two_files_and_the_segments_are_looked_for_in_the_elf() {
+        let files = kernel_files(b"elf".to_vec(), b"image".to_vec());
+        let names: Vec<&str> = files.iter().map(|file| file.file_name.as_str()).collect();
+        assert_eq!(names, ["kernel", "kernel-image"]);
+        // The ELF's `.comment` is read; the converted image is not an ELF.
+        let elfs: Vec<&str> = files
+            .iter()
+            .filter(|file| file.elf)
+            .map(|file| file.file_name.as_str())
+            .collect();
+        assert_eq!(elfs, ["kernel"]);
+        assert_eq!(files[0].bytes, b"elf");
+        assert_eq!(files[1].bytes, b"image");
+        assert!(files[1].name.starts_with("the kernel image that boots"));
+        assert!(files.iter().all(|file| !file.in_kernel));
+        // The converted image has the name the boots' own image has.
+        assert_eq!(KERNEL_IMAGE, "KERNEL.ONBF");
     }
 
     /// A file a build wrote, for the checks that take one.

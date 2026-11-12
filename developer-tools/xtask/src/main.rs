@@ -4253,7 +4253,15 @@ fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
 /// Converts the kernel ELF into the KRN image with `onbf-pack`, which verifies its output
 /// before writing it.
 fn pack_kernel(elf: &Path) -> Result<PathBuf> {
-    let out = target_dir().join("xtask").join("KERNEL.ONBF");
+    pack_kernel_to(elf, &target_dir().join("xtask").join(KERNEL_IMAGE))
+}
+
+/// The file name of the converted kernel, under a target directory's `xtask/`.
+const KERNEL_IMAGE: &str = "KERNEL.ONBF";
+
+/// [`pack_kernel`] into `out`: the one command that makes the image the loader starts, for
+/// the boots and for the reproducible-build gate alike.
+fn pack_kernel_to(elf: &Path, out: &Path) -> Result<PathBuf> {
     if let Some(dir) = out.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -4273,7 +4281,7 @@ fn pack_kernel(elf: &Path) -> Result<PathBuf> {
         "--output",
         output,
     ]))?;
-    Ok(out)
+    Ok(out.to_path_buf())
 }
 
 /// A copy of `krn` with one byte flipped in the middle of the first SEGMENT's content.
