@@ -615,7 +615,7 @@ def cmd_rental_a(args):
         sol, sol_log = start_sol(server_id, key_id, rental_dir, deadline)
         dump = rental_dir / "dump.tar.gz"
         with open(dump, "wb") as f:
-            subprocess.run(ssh_base(rental_dir) + [f"{OS_USER}@{ip}", "sudo bash -s"],
+            subprocess.run(ssh_base(rental_dir) + [f"{OS_USER}@{ip}", "sudo -n bash -s"],
                            input=COLLECT.encode(), stdout=f, check=True, timeout=600)
         with tarfile.open(dump) as t:
             t.extractall(rental_dir / "dump", filter="data")
@@ -623,13 +623,13 @@ def cmd_rental_a(args):
         if sol:
             subprocess.run(ssh_base(rental_dir) + [f"{OS_USER}@{ip}",
                            "for p in 0 1 2 3; do echo ORIGIN-BENCH-MARK-ttyS$p | "
-                           "sudo timeout 5 tee /dev/ttyS$p >/dev/null 2>&1; done"], timeout=60)
+                           "sudo -n timeout 5 tee /dev/ttyS$p >/dev/null 2>&1; done"], timeout=60)
             time.sleep(10)
             marks = [p for p in range(4) if f"ORIGIN-BENCH-MARK-ttyS{p}" in sol_log.read_text(errors="replace")]
             (rental_dir / "sol-port.txt").write_text(f"markers seen on the serial console: {marks}\n")
             print(f"{stamp()} serial-over-LAN carries ttyS{marks}")
             if not args.no_reboot and now() < deadline - 900:
-                subprocess.run(ssh_base(rental_dir) + [f"{OS_USER}@{ip}", "sudo systemctl reboot"],
+                subprocess.run(ssh_base(rental_dir) + [f"{OS_USER}@{ip}", "sudo -n systemctl reboot"],
                                timeout=60)
                 print(f"{stamp()} rebooting, to capture the firmware's own output")
                 limit = min(now() + 480, deadline - 300)
@@ -668,7 +668,9 @@ def start_sol(server_id, key_id, rental_dir, deadline):
         print(f"{stamp()} no out-of-band connection: {e}")
         return None, None
     conn = None
-    while now() < deadline - 600:
+    # Five minutes at most: the console is worth having, not worth the rental's hour.
+    limit = min(now() + 300, deadline - 600)
+    while now() < limit:
         listed = api("GET", f"/servers/{server_id}/out_of_band_connection")["data"]
         listed = listed if isinstance(listed, list) else [listed]
         conn = next((c["attributes"] for c in listed if c["attributes"].get("status") == "connected"), None)
@@ -680,7 +682,7 @@ def start_sol(server_id, key_id, rental_dir, deadline):
         return None, None
     log_path = rental_dir / "sol.log"
     log = open(log_path, "ab")
-    command = ["ssh", "-tt", "-i", str(KEY), "-o", "IdentitiesOnly=yes",
+    command = ["ssh", "-tt", "-i", str(KEY), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                "-o", "StrictHostKeyChecking=accept-new",
                "-o", f"UserKnownHostsFile={rental_dir / 'known_hosts'}",
                "-o", "ServerAliveInterval=15", "-p", str(conn.get("port", 2222)),
