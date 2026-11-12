@@ -3971,3 +3971,45 @@ A fourth addition to the entry above, from another session and on a branch of it
 - **Review:** none.
 - **Licensing:** MIT OR Apache-2.0.
 - **In the batch:** merged into `land/s4` at `3b06a80` on 2026-11-12, with the record of item 237. The coordinating session read the change to `developer-tools/oidl/src/fingerprint.rs`; the check on the merge is in the landing record's commit.
+
+## TASKS item 25: the provenance table and its gate, the task-contract template, the roadmap's exit tests (CLAUDE.md §6, §78, §82; decision items 122 and 252 to 256; 2026-11-12)
+
+- **What:**
+  - **The provenance table,** a section of its own at the top of this file: one row for each of the tree's 20 crates, with a column for each of §6's eleven fields. CLAUDE.md 7.6 lists eleven, not the ten TASKS item 25 named: revision 7.3 added the open-source references consulted. The narrative entries were not changed.
+  - **Its gate,** `developer-tools/xtask/src/provenance.rs`: `cargo xtask provenance-gate`, and one line in `cargo xtask check`. It finds every `Cargo.toml` with a `[package]` table, whether or not the workspace lists it. It fails on a crate with no row, a crate with two rows, a row that names no crate, an empty field, a manifest dependency the row does not name, and a manifest licence the row does not state. It also fails closed: a missing or doubled section, a second table, a wrong header, a row of the wrong width, an unreadable manifest, a package with no name or licence it can read, no crate and no row.
+  - **The template,** `docs/engineering/TASK_CONTRACT_TEMPLATE.md`, with §78's eleven fields, compared with the ten contracts in `TASKS.md`.
+  - **The roadmap,** `docs/ROADMAP.md`. M0 to M2's exit tests and the rule for later milestones were accepted by the owner as items 252 to 256. M3 to M13's tests are proposed; M3 to M6 and M10's are with the owner as items 259 to 263. M0, M1 and M2 are built, not done. `docs/STATUS.md`'s three milestone cells were corrected to say so, at the coordinating session's request (§82).
+  - **The matrix rows** for §6, §78 and §82.
+- **Author / date:** Claude Code (local, M1 Max), 2026-11-12, on `claude/t25-records-roadmap-50bfb3`, cut from `land/s4` at `5ea97ef`. Four read-only subagents drew each crate's facts from the narrative entries, with line citations. The table was written from their reports, and their load-bearing citations were checked against the file before use.
+- **Specifications:** none outside the repository. The gate reads Cargo manifests' `[package]`, dependency tables and `license`, as The Cargo Book shipped with Rust 1.99.1 defines them.
+- **Architecture decisions:** CLAUDE.md §6, §78 and §82; decision item 122; items 252 to 256 for the roadmap. No ABI or format decision, so no ADR (§84).
+- **Dependencies:** `std` only, inside `xtask`. No new crate.
+- **Toolchain:** Rust 1.99.1, as the workspace pins it.
+- **Review:** none. No person and no second agent has read the gate, the table or the roadmap.
+- **Licensing:** MIT OR Apache-2.0, as the workspace.
+- **Test evidence:**
+  - 13 unit tests of the gate, among them one that passes on the real tree. All 202 of `xtask`'s tests passed, with 1 ignored; `cargo fmt --check` and clippy on `xtask` passed.
+  - Five controls planted in the real tree. Each was one edit, followed by one run of `cargo xtask provenance-gate`, and each was refused (exit 1). Afterwards both files were restored from copies, and their SHA-256 matched the copies taken before the edits:
+
+    | Control | The edit | The gate's refusal |
+    |---|---|---|
+    | 1 | `origin-version`'s row deleted | "the crate `origin-version` (`runtime/version`) has no row" |
+    | 2 | `onbf-merkle`'s "Code review" cell emptied | "the field \"Code review\" is empty" |
+    | 3 | `origin-directory-service` renamed `origin-directory-services` in its row | "the row names no crate of the tree", and the crate "has no row" |
+    | 4 | a dev-dependency on `origin-crypto` added to `services/directory/Cargo.toml` | "`origin-directory-service` depends on `origin-crypto` ..., and the field \"Source dependencies\" does not name it" |
+    | 5 | `origin-version`'s licence written as "MIT" | "`origin-version` is licensed `MIT OR Apache-2.0` by its Cargo.toml, and the field \"Licensing status\" does not say so" |
+
+  - The requirements gate passed with the rows changed: 47 of 1,598 counted rows done, from 35.
+  - Every row ID the roadmap cites (1,012, ranges expanded) was checked by script against the matrix's IDs, and all were found. No gate reads the roadmap.
+- **External firmware/data:** none.
+- **Open-source references consulted (§3, §6):** none.
+- **Found, not changed.** The subagents' reading turned up narrative entries that disagree with the tree or with each other. They are left as written, because the narrative entries are the table's evidence and this task does not rewrite them. The table says what is true now:
+  - Five entries say "project licence not chosen yet": four of the kernel's, and the Loom entry. The crypto test-vector entry says the licence is "still not chosen". The file's header says the owner chose it on 2026-11-08.
+  - The loader's entry lists `core` and `origin-version` as its dependencies; its manifest has eight first-party crates.
+  - `origin-sync`'s heading names `framekernel/sync/`; the crate is at `framekernel/frame/sync/`. One entry calls Loom a dev-dependency, which the scratch workspace has since replaced, and another calls the crate `core` only, though it uses `alloc`.
+  - The framework entry's list of layers names `origin-version` and not `origin-random`; the manifest has the reverse.
+  - Some entries still call ADR-0002, ADR-0012 and ADR-0013 Proposed, though each was accepted.
+  - The stack slide's entry says it has had no review; `REVIEW_H2-STACKS_2026-11-10.md` has an addendum of 2026-11-11 that read it.
+  - `origin-paging` and `origin-abi` still have no entry of their own.
+  - Most readings of other projects' source recorded before items 93 and 96 give no licence and no commit. `origin-boot-uefi`'s test keys have no entry of their own.
+  - Doc comments in `developer-tools/oidl/src/lib.rs` and `runtime/onbf/format/src/lib.rs` describe states that have since changed.
