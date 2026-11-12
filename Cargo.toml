@@ -24,7 +24,7 @@ members = [
     "framekernel/syscalls",
     "runtime/abi",
     "runtime/core",
-    "runtime/kernel-stubs",
+    "runtime/kernel-client",
     "runtime/onbf/format",
     "runtime/onbf/merkle",
     "runtime/onbf/verify",
@@ -39,7 +39,7 @@ members = [
 ]
 # Host-buildable crates only. The UEFI loader's and the Framekernel's binaries cannot be
 # built for the host, and the ring-3 crates (`runtime/core`, `runtime/rt`,
-# `runtime/kernel-stubs` and `tests/kernel/first-program`) are built only for the userspace
+# `runtime/kernel-client` and `tests/kernel/first-program`) are built only for the userspace
 # triple, by `cargo xtask` with `.cargo/userspace.toml` (CLAUDE.md §11; tasks S4-1 and S4-2).
 # `runtime/rt-mem`, the bodies of the runtime's `mem*` functions, is built for both, so the host
 # can test it.

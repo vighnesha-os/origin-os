@@ -2,7 +2,7 @@
 //! (task S4-1, TASKS item 41, and task S4-2, TASKS item 47; ADR-0011 Amendment 2, L1 to L6).
 //!
 //! - [`generate`] writes the code for `origin.kernel` (`oidl generate`, full mode) under the
-//!   target directory: the client and its imports for `runtime/kernel-stubs` to include, and
+//!   target directory: the client and its imports for `runtime/kernel-client` to include, and
 //!   the stubs, with the list of what they export, for `runtime/core`. Nothing generated is
 //!   committed, so no committed crate holds a shim.
 //! - Every ring-3 build names `--target x86_64-unknown-linux-gnu` and passes
@@ -10,8 +10,10 @@
 //! - [`origin_core`] links `runtime/core` as the shared object `origin.core` and has
 //!   `onbf-pack corelib` describe it for the kernel, which refuses an image that is anything
 //!   but the listed stubs.
-//! - [`programs`] does that, then builds each carried program, has `onbf-pack carried` describe
-//!   it, and returns the directory every kernel build names in [`CARRIED_ENV`].
+//! - [`programs`] does that, then links each carried program against `origin.core`, so that
+//!   the program holds no stub and the linker names each of its imports; has `onbf-pack
+//!   carried` describe it, imports and all; and returns the directory every kernel build names
+//!   in [`CARRIED_ENV`].
 //! - [`carried_files`] lists what one build wrote for `origin.core` and for each carried
 //!   program, for the reproducible-build gate to read (TASKS item 32).
 //!
@@ -33,8 +35,8 @@ use crate::{OIDL_PACKAGE, PACK_PACKAGE, Result, cargo, read_file, run_step, targ
 pub(crate) const USERSPACE_TARGET: &str = "x86_64-unknown-linux-gnu";
 /// The userspace flags, passed with `--config` to the ring-3 builds alone.
 pub(crate) const USERSPACE_CONFIG: &str = ".cargo/userspace.toml";
-/// The variable `runtime/kernel-stubs` reads for the generated client's directory.
-const STUBS_ENV: &str = "ORIGIN_KERNEL_STUBS";
+/// The variable `runtime/kernel-client` reads for the generated client's directory.
+const CLIENT_ENV: &str = "ORIGIN_KERNEL_CLIENT";
 /// The variable `runtime/core` reads for the generated stubs' directory.
 const CORE_STUBS_ENV: &str = "ORIGIN_CORE_STUBS";
 /// `origin.core`'s package, the name its linker output has, its `DT_SONAME`, and the name its
@@ -46,6 +48,13 @@ pub(crate) const CORE_NAME: &str = "origin_core";
 /// The stubs' file and the list of what they export, under the generated stubs' directory.
 const CORE_STUBS_FILE: &str = "origin_kernel/kernel.rs";
 const CORE_EXPORTS: &str = "origin_kernel.exports";
+/// Where a program's link finds `origin.core`, as the linker is told: a path from the
+/// repository's root, where Cargo runs the compiler of a workspace's package. The same text in
+/// every build, in every target directory and on every machine: Cargo hashes a package's
+/// compiler arguments into what it builds, so a path of one build's own would make that
+/// build's programs its own too (CLAUDE.md §75). [`origin_core`] puts a copy of the library
+/// there before any program is linked.
+const CORE_LINK: &str = "target/xtask/core-link/liborigin_core.so";
 /// The variable the kernel's `program.rs` reads for the carried programs' descriptions.
 pub(crate) const CARRIED_ENV: &str = "ORIGIN_CARRIED_PROGRAMS";
 /// The definition the stubs are generated from.
@@ -54,25 +63,29 @@ const KERNEL_DEFINITION: &str = "sdk/interfaces/origin.kernel.oidl";
 /// Every ring-3 crate, for clippy.
 pub(crate) const CRATES: &[&str] = &[
     CORE_PACKAGE,
-    "origin-kernel-stubs",
+    "origin-kernel-client",
     "origin-rt",
     "origin-rt-mem",
     "first-program",
+    "pin-program",
 ];
 /// The bodies of the runtime's `mem*` functions: a ring-3 crate the host tests too (S4-1's
 /// review, finding F6).
 pub(crate) const MEM_PACKAGE: &str = "origin-rt-mem";
 
-/// A program the kernel carries: its package and binary, and its name in the kernel.
+/// A program the kernel carries: its package and binary, its name in the kernel, and its entry
+/// if that is not the runtime's `_start`.
 struct Program {
     package: &'static str,
     name: &'static str,
+    entry: Option<&'static str>,
 }
 
 /// Every program the kernel carries.
 const PROGRAMS: &[Program] = &[Program {
     package: "first-program",
     name: "first_program",
+    entry: None,
 }];
 
 /// The package of each ring-3 image the kernel carries: `origin.core`, then each program.
@@ -115,7 +128,7 @@ fn files_under(dir: &Path) -> Result<Vec<PathBuf>> {
 /// Where one build's generated code for `origin.kernel` is.
 pub(crate) struct Generated {
     /// The client's tree: `oidl_rt`, the library's types, its client and its imports, with the
-    /// `modules.rs` that `runtime/kernel-stubs` includes. What [`STUBS_ENV`] names.
+    /// `modules.rs` that `runtime/kernel-client` includes. What [`CLIENT_ENV`] names.
     pub(crate) client: PathBuf,
     /// The stubs' tree: one file of naked functions for each interface, and the list of what
     /// they export. What [`CORE_STUBS_ENV`] names.
@@ -157,7 +170,7 @@ fn mirror(from: &Path, to: &Path, keep: &[&str]) -> Result {
 }
 
 /// Generates `origin.kernel`'s code into a scratch directory, copies each file that changed
-/// into place, and writes the `modules.rs` that `runtime/kernel-stubs` includes. Returns where
+/// into place, and writes the `modules.rs` that `runtime/kernel-client` includes. Returns where
 /// the client's tree and the stubs' tree are.
 pub(crate) fn generate(target: Option<&Path>) -> Result<Generated> {
     let staging = ring3_dir(target).join("oidl-staging");
@@ -205,18 +218,15 @@ pub(crate) fn generate(target: Option<&Path>) -> Result<Generated> {
     // Clippy finds one thing in the generated client, which only the generator can change: an
     // `Ok(x?)` (`needless_question_mark`). It is allowed on that module alone.
     //
-    // Until the launch path binds a program's imports from `origin.core` (the second half of
-    // task S4-2), a carried program still links the stubs into itself and runs under ADR-0005
-    // A6: `core_stubs` is the stubs' file, the same one `runtime/core` includes.
+    // The client's tree and nothing of the stubs': a program holds no `syscall`, and reaches
+    // the kernel through the imports the launch path binds to `origin.core` (ADR-0011 L3).
     let modules = format!(
         "// Written by `cargo xtask` (developer-tools/xtask/src/ring3.rs). Do not edit.\n\
          #[rustfmt::skip]\n#[path = \"{}\"]\npub mod oidl_rt;\n\
          #[rustfmt::skip]\n#[allow(clippy::needless_question_mark)]\n\
-         #[path = \"{}\"]\npub mod origin_kernel;\n\
-         #[rustfmt::skip]\n#[path = \"{}\"]\npub mod core_stubs;\n",
+         #[path = \"{}\"]\npub mod origin_kernel;\n",
         quoted(generated.client.join("oidl_rt.rs"))?,
         quoted(generated.client.join("origin_kernel/mod.rs"))?,
-        quoted(generated.stubs())?,
     );
     write_if_changed(&generated.client.join("modules.rs"), modules.as_bytes())?;
     Ok(generated)
@@ -231,7 +241,7 @@ fn userspace(subcommand: &str, generated: &Generated, target: Option<&Path>) -> 
         .arg(subcommand)
         .args(["--target", USERSPACE_TARGET, "--config", USERSPACE_CONFIG])
         .args(crate::toolchain::userspace_config()?)
-        .env(STUBS_ENV, &generated.client)
+        .env(CLIENT_ENV, &generated.client)
         .env(CORE_STUBS_ENV, &generated.core);
     if let Some(target) = target {
         command.arg("--target-dir").arg(target);
@@ -240,7 +250,7 @@ fn userspace(subcommand: &str, generated: &Generated, target: Option<&Path>) -> 
 }
 
 /// Where the descriptions of one build go: what the kernel's builds name in [`CARRIED_ENV`].
-fn carried_dir(target: Option<&Path>) -> PathBuf {
+pub(crate) fn carried_dir(target: Option<&Path>) -> PathBuf {
     ring3_dir(target).join("carried")
 }
 
@@ -293,7 +303,9 @@ fn origin_core(generated: &Generated, target: Option<&Path>) -> Result {
         .arg(generated.exports())
         .arg("--out")
         .arg(carried_dir(target));
-    run_step(&mut describe)
+    run_step(&mut describe)?;
+    // Where each program's link looks for it: see [`CORE_LINK`].
+    write_if_changed(&crate::repo_root().join(CORE_LINK), &read_file(&linked)?)
 }
 
 /// Builds `origin.core` and every carried program for ring 3 and describes each for the kernel.
@@ -301,15 +313,26 @@ fn origin_core(generated: &Generated, target: Option<&Path>) -> Result {
 pub(crate) fn programs(target: Option<&Path>) -> Result<PathBuf> {
     let generated = generate(target)?;
     origin_core(&generated, target)?;
-    let mut build = userspace("build", &generated, target)?;
-    build.arg("--release");
+    // Each program is linked against `origin.core`: the library is one more input of its link,
+    // given to the compiler of that package alone (`cargo rustc` passes what follows `--` to
+    // it), with the program's own entry where it has one.
+    let mut builds = Vec::new();
     for program in PROGRAMS {
-        build.args(["--package", program.package]);
+        let mut build = userspace("rustc", &generated, target)?;
+        build
+            .args(["--release", "--package", program.package, "--", "-C"])
+            .arg(format!("link-arg={CORE_LINK}"));
+        if let Some(entry) = program.entry {
+            build.arg("-C").arg(format!("link-arg=--entry={entry}"));
+        }
+        builds.push(build);
     }
     // Each is an ELF the kernel takes a segment of with its header in it, so each must have
     // been linked with the linker's fixed line: one from before it is linked again.
     let linked_files: Vec<PathBuf> = PROGRAMS.iter().map(|p| linked(target, p)).collect();
-    crate::image_inputs::build_with_the_fixed_line(&linked_files, || run_step(&mut build))?;
+    crate::image_inputs::build_with_the_fixed_line(&linked_files, || {
+        builds.iter_mut().try_for_each(run_step)
+    })?;
     let out = carried_dir(target);
     for program in PROGRAMS {
         let elf = linked(target, program);
@@ -332,6 +355,8 @@ pub(crate) fn programs(target: Option<&Path>) -> Result<PathBuf> {
             .args(["carried", "--name", program.name, "--variable", CARRIED_ENV])
             .arg("--input")
             .arg(&elf)
+            .arg("--core-exports")
+            .arg(generated.exports())
             .arg("--out")
             .arg(&out);
         run_step(&mut describe)?;

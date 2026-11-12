@@ -20,9 +20,10 @@
 //!
 //! Ring 3 has a list of its own ([`RING3_UNSAFE_FILES`], task S4-1): in the ring-3 crates
 //! ([`RING3_CRATES`]) only the listed files may hold `unsafe`, each for a reason, and the crate
-//! roots that can deny it do ([`RING3_ROOTS`]). `runtime/kernel-stubs` commits no generated
-//! code: the shims it includes (`abi.rs` and `core_stubs.rs`, OIDL §11's named shims) are the
-//! generator's output under the target directory, written at each build.
+//! roots that can deny it do ([`RING3_ROOTS`]). `runtime/kernel-client` and `runtime/core`
+//! commit no generated code: the shims they include (the client's imports in `abi.rs`, and
+//! `origin.core`'s stubs, OIDL §11's two named shims) are the generator's output under the
+//! target directory, written at each build.
 //!
 //! The gate ends with two on the assembly inside those sites: what a block promises the
 //! compiler about the flags (`asmflags`, CLAUDE.md §13), and where the processor's two
@@ -164,7 +165,7 @@ const UNSAFE_FILES: &[(&str, &str)] = &[
 /// proof programs.
 const RING3_CRATES: &[&str] = &[
     "runtime/core",
-    "runtime/kernel-stubs",
+    "runtime/kernel-client",
     "runtime/rt",
     "runtime/rt-mem",
     "tests/kernel/first-program",
@@ -196,7 +197,7 @@ const RING3_UNSAFE_FILES: &[(&str, &str)] = &[
 ];
 
 /// The ring-3 crate roots, each of which denies `unsafe`; only the modules of listed files allow
-/// it. (`runtime/core` and `runtime/kernel-stubs` cannot: each includes generated shims, the
+/// it. (`runtime/core` and `runtime/kernel-client` cannot: each includes generated shims, the
 /// stubs and the client's imports, which are not committed and so are not read here. Their own
 /// committed files hold no `unsafe`, which this gate checks like any other file's.)
 const RING3_ROOTS: &[&str] = &[

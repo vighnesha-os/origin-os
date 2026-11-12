@@ -7,7 +7,7 @@ name = "first-program"
 version = "0.0.0"
 dependencies = [
  "origin-abi",
- "origin-kernel-stubs",
+ "origin-kernel-client",
  "origin-rt",
 ]
 
@@ -134,7 +134,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "origin-kernel-stubs"
+name = "origin-kernel-client"
 version = "0.0.0"
 
 [[package]]
@@ -156,7 +156,7 @@ name = "origin-rt"
 version = "0.0.0"
 dependencies = [
  "origin-abi",
- "origin-kernel-stubs",
+ "origin-kernel-client",
  "origin-rt-mem",
 ]
 

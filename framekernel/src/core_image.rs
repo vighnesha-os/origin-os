@@ -179,7 +179,7 @@ pub(crate) fn image() -> &'static CoreImage {
 }
 
 #[cfg(target_os = "none")]
-pub(crate) use shared::install;
+pub(crate) use shared::{install, map_into};
 
 /// The one set of frames, and the only code that touches them.
 #[cfg(target_os = "none")]
@@ -187,7 +187,8 @@ mod shared {
     use alloc::vec::Vec;
 
     use origin_frame::once::SetOnce;
-    use origin_frame::userspace::SharedFrame;
+    use origin_frame::userspace::{ChangeError, SharedFrame, UserSpace};
+    use origin_paging::{Access, MapError};
 
     use super::{ORIGIN_CORE, PAGE};
 
@@ -244,6 +245,21 @@ mod shared {
             .set(frames)
             .map(|()| pages)
             .map_err(|_| InstallError::Twice)
+    }
+
+    /// Maps `origin.core` into `space` at `base`: every page, or none, each read-execute, each
+    /// the same frame in every space. The framework counts each frame's executable mappings and
+    /// refuses a writable mapping of it anywhere while one exists.
+    ///
+    /// # Errors
+    ///
+    /// The framework's, as `UserSpace::map_shared_run` gives them: a place that is not free
+    /// pages of the user half, the bound on a space's page tables, or no memory; and
+    /// [`MapError::OutOfMemory`] if `origin.core` was never installed. Nothing is mapped on any
+    /// of them.
+    pub(crate) fn map_into(space: &UserSpace, base: u64) -> Result<(), ChangeError> {
+        let frames = FRAMES.get().ok_or(MapError::OutOfMemory)?;
+        space.map_shared_run(base, frames, Access::ReadExecute)
     }
 }
 

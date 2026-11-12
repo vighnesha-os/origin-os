@@ -302,3 +302,124 @@ fn a_name_that_cannot_be_read_is_refused() {
         Err(ElfError::DuplicateDynamicTag(5))
     );
 }
+
+// ------------------------------------------------------------------ the description
+
+use crate::carried::{CarriedError, describe, describe_importing};
+use crate::corelib::Listing;
+
+/// The generator's list for a library that exports [`EXPORTS`], in number order, which is not
+/// name order.
+fn listing() -> Listing {
+    Listing::parse(
+        "# oidl-core-exports 1 origin.kernel\n\
+         release sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+         0 origin_kernel_c c 0.0\n1 origin_kernel_a a 0.0\n2 origin_kernel_b b 0.5\n",
+    )
+    .expect("the list reads")
+}
+
+#[test]
+fn a_programs_imports_are_laid_out_as_slots_and_exports_by_name_order() {
+    let carried = describe_importing(&program(|_, _| {}), &listing()).expect("it converts");
+    let imports: Vec<(u64, usize, &str)> = carried
+        .imports
+        .iter()
+        .map(|i| (i.slot, i.export, i.symbol.as_str()))
+        .collect();
+    // `a` is export 0 and `b` export 1, whatever their call numbers.
+    assert_eq!(
+        imports,
+        [
+            (0x3010, 1, "origin_kernel_b"),
+            (0x3018, 0, "origin_kernel_a")
+        ]
+    );
+    assert_eq!(carried.relocations, [0x3000]);
+    assert_eq!(carried.core.map(|release| release[1]), Some(0x11));
+    // The description holds zero in each import slot: its value is the launch path's to write.
+    let relro = carried
+        .segments
+        .iter()
+        .find(|s| s.rva == 0x3000)
+        .expect("the RELRO segment");
+    assert_eq!(relro.access, crate::carried::Access::ReadAfterRelocation);
+    assert_eq!(relro.bytes[0x10..0x20], [0; 16]);
+    // The relative relocation's addend is in place beside them.
+    assert_eq!(relro.bytes[..8], 0x2008u64.to_le_bytes());
+    let files = carried.rust("importer", "ORIGIN_CARRIED").unwrap();
+    let text = String::from_utf8(files[0].1.clone()).unwrap();
+    for line in [
+        "    imports: &[",
+        "        Import { slot: 0x3010, export: 1 }, // origin_kernel_b",
+        "        Import { slot: 0x3018, export: 0 }, // origin_kernel_a",
+        "    core: Some([",
+        "        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,",
+    ] {
+        assert!(
+            text.contains(&format!("{line}\n")),
+            "no line `{line}` in:\n{text}"
+        );
+    }
+    assert_eq!(
+        files,
+        describe_importing(&program(|_, _| {}), &listing())
+            .unwrap()
+            .rust("importer", "ORIGIN_CARRIED")
+            .unwrap(),
+        "the same twice"
+    );
+}
+
+#[test]
+fn a_slot_left_in_the_import_by_the_linker_is_zero_in_the_description() {
+    // A linker may leave anything in a slot it expects a loader to fill.
+    let bytes = program(|_, elf| elf.loads[2].data[0x18..0x20].copy_from_slice(&[0xAA; 8]));
+    let carried = describe_importing(&bytes, &listing()).unwrap();
+    let relro = carried.segments.iter().find(|s| s.rva == 0x3000).unwrap();
+    assert_eq!(relro.bytes[0x18..0x20], [0; 8]);
+}
+
+#[test]
+fn an_import_slot_outside_relro_is_refused() {
+    // The same program with no `PT_GNU_RELRO`: its slots are in plain writable data, which the
+    // program could write over.
+    let writable = program(|_, elf| elf.extra.retain(|header| header.p_type != 0x6474_E552));
+    assert_eq!(
+        describe_importing(&writable, &listing()),
+        Err(CarriedError::ImportSlot(0x3010))
+    );
+}
+
+#[test]
+fn a_program_that_imports_is_refused_when_no_library_is_named() {
+    assert_eq!(
+        describe(&program(|_, _| {})),
+        Err(CarriedError::Elf(ElfError::Needed))
+    );
+    // And a program that imports nothing says so in its description.
+    let plain = describe(&TestElf::kernel().bytes()).unwrap();
+    assert!(plain.imports.is_empty() && plain.core.is_none());
+    let text =
+        String::from_utf8(plain.rust("plain", "ORIGIN_CARRIED").unwrap()[0].1.clone()).unwrap();
+    assert!(
+        text.contains("    imports: &[\n    ],\n    core: None,\n};\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_import_of_a_symbol_the_list_does_not_name_is_refused_by_the_reader() {
+    // The list is where the reader's exports come from, so a symbol it lacks never becomes an
+    // import: the reader refuses the undefined symbol first.
+    let short = Listing::parse(
+        "# oidl-core-exports 1 origin.kernel\n\
+         release sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+         0 origin_kernel_a a 0.0\n",
+    )
+    .unwrap();
+    assert_eq!(
+        describe_importing(&program(|_, _| {}), &short),
+        Err(CarriedError::Elf(ElfError::UndefinedSymbol { index: 1 }))
+    );
+}

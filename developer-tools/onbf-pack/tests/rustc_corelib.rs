@@ -308,6 +308,34 @@ fn a_program_linked_against_it_imports_each_call_through_a_relro_slot() {
             );
         }
     }
+    // Laid out for the kernel: each import is a slot and an export by its place in name order,
+    // the slot holds zero, and the description carries the list's fingerprint.
+    let carried = onbf_pack::carried::describe_importing(&elf, &list).expect("it converts");
+    let mut laid: Vec<(usize, &str)> = carried
+        .imports
+        .iter()
+        .map(|i| (i.export, i.symbol.as_str()))
+        .collect();
+    laid.sort_unstable();
+    assert_eq!(
+        laid,
+        [(0, "origin_kernel_first"), (1, "origin_kernel_last")]
+    );
+    assert_eq!(carried.core, Some(list.release));
+    for import in &carried.imports {
+        let segment = carried
+            .segments
+            .iter()
+            .find(|s| import.slot >= s.rva && import.slot < s.rva + s.size)
+            .unwrap();
+        assert_eq!(
+            segment.access,
+            onbf_pack::carried::Access::ReadAfterRelocation
+        );
+        let at = (import.slot - segment.rva) as usize;
+        assert_eq!(segment.bytes[at..at + 8], [0; 8]);
+        assert!(!carried.relocations.contains(&import.slot));
+    }
     // Read as a static image, as before this task, it is refused for its library.
     assert_eq!(
         onbf_pack::elf::parse(&elf),

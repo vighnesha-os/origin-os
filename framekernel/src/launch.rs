@@ -11,14 +11,17 @@
 //! A launch that fails after the child holds anything closes the child's table: the child's
 //! handle to itself would otherwise keep a process that never ran alive for ever.
 //!
-//! A program the kernel carries in its image (ADR-0011 Amendment 2, L1; task S4-1) is launched
-//! in two steps around those two. [`load_program`] makes the child with its system calls pinned
-//! to the program's one read-execute segment (ADR-0005 A6), places the program at a random base,
-//! maps each page with its final permissions and writes it, relocations applied, through its
-//! frame, then maps a stack at another random place with an unmapped page on either side.
-//! Nothing is ever writable and executable, and RELRO pages are read-only to the program from
-//! the start. [`start_program`] then places the start record and starts the first thread at the
-//! entry, as [`place`] and [`start`] do for any child.
+//! A program the kernel carries in its image (ADR-0011 Amendment 2, L1 to L3 and L7; tasks S4-1
+//! and S4-2) is launched in two steps around those two. [`load_program`] makes the child pinned
+//! per call (ADR-0005 B2): it maps `origin.core` into it at a random place, read-execute, on the
+//! one set of frames every process shares, which records that place as where the child's calls
+//! must come from. It then places the program at another random base, maps each page with its
+//! final permissions and writes it through its frame, relocations applied and each import slot
+//! holding the address of its export in the child's `origin.core`; and maps a stack at a third
+//! random place with an unmapped page on either side. Nothing is ever writable and executable,
+//! and RELRO pages, the import slots among them, are read-only to the program from the start.
+//! [`start_program`] then places the start record and starts the first thread at the entry, as
+//! [`place`] and [`start`] do for any child.
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
@@ -28,12 +31,13 @@ use origin_abi::{Error, Handle, rights};
 use origin_frame::objref::ObjectRef;
 use origin_frame::userspace::{ChangeError, UserFrame};
 
+use crate::core_image;
 use crate::cpu::{CpuIndex, without_interrupts};
 use crate::handles::{Need, Typed};
 use crate::ipc::{ChannelEnd, Object};
 use crate::paging::{Access, MapError, PAGE};
 use crate::process::{Limits, Process, ThreadObject};
-use crate::program::{self, Carried, SegmentAccess};
+use crate::program::{self, Carried, CoreAt, SegmentAccess};
 
 /// Start records go at a random page in `[RECORD_LOW, RECORD_HIGH)`: the upper part of the user
 /// half (ADR-0004 H1), clear of the low addresses programs are placed at.
@@ -289,33 +293,36 @@ fn random() -> Result<u64, Error> {
     origin_frame::random::next_u64().map_err(|_| Error::NotSupported)
 }
 
-/// Makes `creator`'s child for `program`, under `run`'s limits, with its system calls accepted
-/// from its read-execute segment alone (ADR-0005 A6), and maps the program at a random base and
-/// a stack at another random place. Every page is mapped once, with its final permissions, and
-/// written through its frame: read-execute for code, read-only for read-only data and for RELRO
-/// once its relocations are in, read-write and never executable for data.
+/// Makes `creator`'s child for `program`, under `run`'s limits, pinned per call (ADR-0005 B2),
+/// and maps `origin.core`, the program and a stack into it, each at a random place of its own.
+/// `origin.core` is mapped read-execute on the frames every process shares, and its place is
+/// recorded as where the child's calls must come from (ADR-0011 L2, L7). Every page of the
+/// program is mapped once, with its final permissions, and written through its frame:
+/// read-execute for code, read-only for read-only data and for RELRO once its relocations and
+/// its imports are in (L3), read-write and never executable for data.
 ///
 /// `INVALID_ARGS`, before anything is made, for a description that breaks [`program::check`]'s
 /// rules or a stack of no pages or of more than [`program::MAX_STACK_PAGES`]; `NOT_SUPPORTED`
-/// without a random-number generator; `NO_MEMORY` without frames; `LIMIT` if no free place is
-/// found, or when the image and stack need more page tables than one space may have. That last
-/// is found part-way through mapping, not estimated first: a program or stack spread over more
-/// than about 40 MiB is refused after much of it is mapped (S4-1's review, finding F4, kept as a
-/// limit; the boot proof shows such a refusal gives everything back). On every error the child,
-/// and every frame and table it was given, is dropped.
+/// without a random-number generator; `NO_MEMORY` without frames, or if `origin.core` was never
+/// written into its frames; `LIMIT` if no free place is found, or when the image and stack need
+/// more page tables than one space may have. That last is found part-way through mapping, not
+/// estimated first: a program or stack spread over more than about 40 MiB is refused after much
+/// of it is mapped (S4-1's review, finding F4, kept as a limit; the boot proof shows such a
+/// refusal gives everything back). On every error the child, and every frame and table it was
+/// given, is dropped, and its mappings of `origin.core`'s frames with it.
 pub(crate) fn load_program(
     creator: &Process,
     program: &Carried,
     run: &ProgramLimits,
 ) -> Result<LoadedProgram, Error> {
-    program::check(program).map_err(|_| Error::InvalidArgs)?;
+    let image = core_image::image();
+    program::check(program, image).map_err(|_| Error::InvalidArgs)?;
     if run.stack_pages == 0 || run.stack_pages > program::MAX_STACK_PAGES {
         return Err(Error::InvalidArgs);
     }
-    let base = program::random_base(program.span / PAGE, random()?).ok_or(Error::Limit)?;
-    let code = program::code_range(program, base).ok_or(Error::InvalidArgs)?;
-    let mut child = Process::child_of(creator, run.limits, code).ok_or(Error::NoMemory)?;
-    map_image(&mut child, program, base)?;
+    let mut child = Process::pinned_child_of(creator, run.limits).ok_or(Error::NoMemory)?;
+    let core = place_core(&mut child, image.span / PAGE)?;
+    let base = place_image(&mut child, program, CoreAt { base: core, image })?;
     let (stack, stack_top) = place_stack(&mut child, run.stack_pages)?;
     Ok(LoadedProgram {
         process: child,
@@ -326,8 +333,46 @@ pub(crate) fn load_program(
     })
 }
 
-/// Maps every page of `program` at `base` into `child`, relocations applied.
-fn map_image(child: &mut Process, program: &Carried, base: u64) -> Result<(), Error> {
+/// Maps `origin.core`, `pages` pages of it, into `child` at a random place in the programs'
+/// region, which nothing else of the child uses yet, and returns that place: the base the
+/// child's calls are pinned to from now on.
+fn place_core(child: &mut Process, pages: u64) -> Result<u64, Error> {
+    for _ in 0..PLACEMENT_TRIES {
+        let place = program::random_base(pages, random()?).ok_or(Error::Limit)?;
+        if (0..pages).any(|k| child.is_mapped(place + k * PAGE)) {
+            continue;
+        }
+        child.map_core(place)?;
+        return Ok(place);
+    }
+    Err(Error::Limit)
+}
+
+/// Maps `program` into `child` at a random base whose whole span is free, its imports bound to
+/// `core`, and returns the base.
+fn place_image(child: &mut Process, program: &Carried, core: CoreAt<'_>) -> Result<u64, Error> {
+    let pages = program.span / PAGE;
+    for _ in 0..PLACEMENT_TRIES {
+        let base = program::random_base(pages, random()?).ok_or(Error::Limit)?;
+        // Clear of `origin.core`, the one thing mapped so far: a page of the span that no
+        // segment holds must stay unmapped too.
+        if (0..pages).any(|k| child.is_mapped(base + k * PAGE)) {
+            continue;
+        }
+        map_image(child, program, base, core)?;
+        return Ok(base);
+    }
+    Err(Error::Limit)
+}
+
+/// Maps every page of `program` at `base` into `child`, relocations applied and imports bound
+/// to `core`.
+fn map_image(
+    child: &mut Process,
+    program: &Carried,
+    base: u64,
+    core: CoreAt<'_>,
+) -> Result<(), Error> {
     let mut page = Vec::new();
     page.try_reserve_exact(PAGE as usize)
         .map_err(|_| Error::NoMemory)?;
@@ -339,7 +384,7 @@ fn map_image(child: &mut Process, program: &Carried, base: u64) -> Result<(), Er
             SegmentAccess::ReadWrite => Access::ReadWrite,
         };
         for k in 0..segment.size / PAGE {
-            program::fill_page(program, index, k, base, &mut page)
+            program::fill_page(program, index, k, base, core, &mut page)
                 .map_err(|_| Error::InvalidArgs)?;
             let frame = child
                 .map_page(base + segment.rva + k * PAGE, access)

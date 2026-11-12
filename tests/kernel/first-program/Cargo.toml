@@ -17,7 +17,7 @@ bench = false
 
 [dependencies]
 origin-abi = { path = "../../../runtime/abi" }
-origin-kernel-stubs = { path = "../../../runtime/kernel-stubs" }
+origin-kernel-client = { path = "../../../runtime/kernel-client" }
 origin-rt = { path = "../../../runtime/rt" }
 
 [lints]

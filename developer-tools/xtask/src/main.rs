@@ -1478,6 +1478,10 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             "origin-kernel: random: cost: a 64-byte request ".into(),
             "; only zeros on it after a request: true".into(),
             "origin-kernel: random: every processor has a generator true; consistent true".into(),
+            // `origin.core` into its one set of frames, before any process exists (task S4-2;
+            // ADR-0011 L2).
+            "origin-kernel: origin.core: ".into(),
+            " bytes of code, the stubs of 20 calls and nothing else, written once into 1 frames that every process pinned per call maps read-execute; the free frames fell by 1".into(),
             // The guard is in the kernel stacks' region, whose addresses the boot never prints
             // (ADR-0004 Amendment 2, A6.3).
             "origin-kernel: page protection: the first thread's stack guard page faulted (#PF error 0x0)".into(),
@@ -1860,6 +1864,7 @@ fn boot_failures() -> Vec<&'static str> {
         ": ipc failed",
         ": start failed",
         ": rust program failed",
+        ": origin.core failed",
         ": directory failed",
         ": memory failed",
         ": events and ports failed",

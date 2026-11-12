@@ -199,6 +199,38 @@ pub(crate) enum Ending {
         error: u64,
         address: u64,
     },
+    /// A system call the per-call pin refused (ADR-0005 B2 and Amendment 8, G1): the thread
+    /// was stopped as a fault stops one, and no status went back. The record is the number
+    /// that was in RAX and the address of the `syscall` instruction that was run. It becomes
+    /// the event on the process's exception channel once such channels exist (P10).
+    Refused {
+        /// The call number asked for.
+        number: u64,
+        /// Where the `syscall` instruction was.
+        address: u64,
+    },
+}
+
+/// Where a process's system calls may come from. Fixed when the process is made, and never
+/// changed (ADR-0011 Amendment 2, L8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallOrigin {
+    /// One of the kernel's own proof processes: any `syscall` instruction inside
+    /// `[start, end)`, the range its creator named (ADR-0005 A6). A call from outside it is
+    /// `access_denied`.
+    Range {
+        /// The range's first address.
+        start: u64,
+        /// One past its last.
+        end: u64,
+    },
+    /// Pinned per call (ADR-0005 B2): each call number only from its own `syscall`
+    /// instruction in `origin.core`. `base` is where `origin.core` is in this process, recorded
+    /// when it was mapped there (L7); `None` until then, and until then no call is accepted.
+    Core {
+        /// `origin.core`'s base in this process.
+        base: Option<u64>,
+    },
 }
 
 /// The values a process reported through `DEBUG_REPORT`, oldest first.
@@ -325,8 +357,9 @@ pub(crate) struct Process {
     pub(crate) mappings: SpinLock<Mappings<ObjectRef<MemoryObject>>>,
     /// Its budget for the unmaps and protects it asks for, in any process (T15, T16).
     pub(crate) changes: SpinLock<Budget>,
-    /// The only code range that may issue system calls (P4, ONBF §6.1): `[start, end)`.
-    syscall_origin: (u64, u64),
+    /// Where its system calls may come from (P4, B2, ONBF §6.1). A plain field: written before
+    /// the process is shared, never after.
+    origin: CallOrigin,
     /// May it use the developer-only calls?
     debug_calls: bool,
     /// Its threads.
@@ -344,11 +377,18 @@ pub(crate) struct Process {
 }
 
 impl Process {
-    /// A new process with an empty lower half and the kernel's half, under `limits`, whose
-    /// code may issue system calls only from `[syscall_origin.0, syscall_origin.1)`, acting
-    /// for `principal` (C1). Only kernel code creates processes yet, so the creator names the
+    /// A new proof process with an empty lower half and the kernel's half, under `limits`,
+    /// whose code may issue system calls only from `[syscall_origin.0, syscall_origin.1)`
+    /// (ADR-0005 A6, which the kernel's own proof processes keep: ADR-0011 L8), acting for
+    /// `principal` (C1). Only kernel code creates processes yet, so the creator names the
     /// principal; a launch path will pass its own by default.
     pub(crate) fn new(limits: Limits, syscall_origin: (u64, u64), principal: u64) -> Option<Self> {
+        let (start, end) = syscall_origin;
+        Self::with_origin(limits, CallOrigin::Range { start, end }, principal)
+    }
+
+    /// A new process whose system calls come from `origin`.
+    fn with_origin(limits: Limits, origin: CallOrigin, principal: u64) -> Option<Self> {
         Some(Self {
             id: NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed),
             principal,
@@ -365,7 +405,7 @@ impl Process {
             .ok()?,
             mappings: SpinLock::new(Mappings::new(limits.memory.mappings)),
             changes: SpinLock::new(Budget::new(limits.memory.changes)),
-            syscall_origin,
+            origin,
             debug_calls: limits.debug_calls,
             lifecycle: SpinLock::new(Lifecycle {
                 running: 0,
@@ -384,15 +424,24 @@ impl Process {
         })
     }
 
-    /// A new process that `creator` starts: it acts for the creator's principal, and there is no
-    /// way to give it another (ADR-0005 C1; no capability for one exists). The launch path's way
-    /// in; only kernel code that creates a process with no creator names a principal.
+    /// A new proof process that `creator` starts: it acts for the creator's principal, and
+    /// there is no way to give it another (ADR-0005 C1; no capability for one exists). Its
+    /// system calls come from the range its creator names (A6).
     pub(crate) fn child_of(
         creator: &Self,
         limits: Limits,
         syscall_origin: (u64, u64),
     ) -> Option<Self> {
         Self::new(limits, syscall_origin, creator.principal)
+    }
+
+    /// A new process that `creator` starts, pinned per call (ADR-0005 B2; ADR-0011 L8): the
+    /// launch path's way in for every program that is not a proof process. It acts for the
+    /// creator's principal, as [`child_of`](Self::child_of) says. Until `origin.core` is mapped
+    /// into it ([`map_core`](Self::map_core)) none of its calls would be accepted, and it has
+    /// no thread to make one.
+    pub(crate) fn pinned_child_of(creator: &Self, limits: Limits) -> Option<Self> {
+        Self::with_origin(limits, CallOrigin::Core { base: None }, creator.principal)
     }
 
     /// This process's ID.
@@ -459,10 +508,44 @@ impl Process {
         self.translate(virt).is_some()
     }
 
-    /// Whether the system call whose return address is `rip` came from the code allowed to
-    /// make one (P4): the `syscall` instruction, two bytes long, lies inside the range.
+    /// Maps `origin.core` into this process at `base`, read-execute, on the one set of frames
+    /// every process shares, and records `base` as where its calls must come from (ADR-0011
+    /// Amendment 2, L2 and L7). Once: only a process made by
+    /// [`pinned_child_of`](Self::pinned_child_of) that has no `origin.core` yet, and only
+    /// before the process is shared, while its creator holds it alone.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGS` for a proof process, for a second mapping, and for a place that is not
+    /// free pages of the user half; `NO_MEMORY` if `origin.core` is not installed or the tables
+    /// cannot be made; `LIMIT` at the bound on a space's page tables. Nothing is mapped and no
+    /// base is recorded on any of them.
+    pub(crate) fn map_core(&mut self, base: u64) -> Result<(), Error> {
+        if self.origin != (CallOrigin::Core { base: None }) {
+            return Err(Error::InvalidArgs);
+        }
+        let space = self.memory().ok_or(Error::InvalidArgs)?;
+        crate::core_image::map_into(&space, base).map_err(|e| match e {
+            ChangeError::Limit => Error::Limit,
+            ChangeError::Map(MapError::OutOfMemory) => Error::NoMemory,
+            _ => Error::InvalidArgs,
+        })?;
+        self.origin = CallOrigin::Core { base: Some(base) };
+        Ok(())
+    }
+
+    /// Where this process's system calls may come from.
+    pub(crate) const fn call_origin(&self) -> CallOrigin {
+        self.origin
+    }
+
+    /// For a proof process: whether the system call whose return address is `rip` came from
+    /// the range its creator named (A6): the `syscall` instruction, two bytes long, lies inside
+    /// it. `false` for a process pinned per call, which this does not judge.
     pub(crate) fn may_call_from(&self, rip: u64) -> bool {
-        let (start, end) = self.syscall_origin;
+        let CallOrigin::Range { start, end } = self.origin else {
+            return false;
+        };
         rip.checked_sub(2)
             .is_some_and(|at| at >= start && rip <= end)
     }

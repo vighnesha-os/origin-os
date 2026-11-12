@@ -4,7 +4,7 @@
 use core::arch::naked_asm;
 
 use origin_abi::start::{self, StartRecord};
-use origin_kernel_stubs::origin_kernel::kernel::client;
+use origin_kernel_client::origin_kernel::kernel::client;
 
 /// The exit code of a program whose start record did not decode. The kernel writes every record
 /// itself, so a correct kernel never gives one.

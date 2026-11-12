@@ -267,6 +267,11 @@ pub(crate) fn prove(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
                 want_fault.is_none() && code == 0,
                 alloc::format!("exited with {:?}", Some(code)),
             ),
+            // None of these is pinned per call, so none can be stopped by the pin.
+            Some(Ending::Refused { number, address }) => (
+                false,
+                alloc::format!("stopped at call {number} from {address:#x}"),
+            ),
             None => (false, alloc::string::String::from("did not end")),
         };
         let right = right && got_report == Some(want_report);

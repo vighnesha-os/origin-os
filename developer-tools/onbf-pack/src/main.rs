@@ -16,6 +16,7 @@ use onbf_pack::{KrnOptions, Toolchain, carried, corelib, krn};
 const USAGE: &str = "\
 usage: onbf-pack krn --input <kernel.elf> --output <kernel.onbf> [options]
        onbf-pack carried --input <program.elf> --name <name> --variable <VAR> --out <dir>
+                         [--core-exports <list>]
        onbf-pack corelib --input <origin.core> --exports <list> --variable <VAR> --out <dir>
        onbf-pack sign --input <kernel.onbf> --output <signed.onbf> --key <file>
                       --signing-time <seconds>
@@ -39,6 +40,10 @@ carried lays out a program the kernel carries in its image (ADR-0011 L1; ONBF §
 which the Rust file includes from the directory the environment variable <VAR> names when the
 kernel is compiled. A file whose bytes are already there is left untouched, and an older
 `<name>.*` file the description no longer has is removed.
+  --core-exports LIST  the program is linked against `origin.core`, whose exports LIST names
+                       (the generator's core/<library>.exports): each of its imports becomes
+                       a slot the kernel's launch path binds (ADR-0011 L3). Without it the
+                       program may import nothing.
 
 corelib lays out `origin.core`, the library of system-call stubs the kernel carries and maps
 into every process that is pinned per call (ADR-0011 L2 to L7): `origin_core.rs`, a static the
@@ -116,7 +121,7 @@ const KRN_OPTIONS: &[&str] = &[
     "--rustc-commit",
     "--llvm-version",
 ];
-const CARRIED_OPTIONS: &[&str] = &["--input", "--name", "--variable", "--out"];
+const CARRIED_OPTIONS: &[&str] = &["--input", "--name", "--variable", "--out", "--core-exports"];
 const CORELIB_OPTIONS: &[&str] = &["--input", "--exports", "--variable", "--out"];
 const SIGN_OPTIONS: &[&str] = &["--input", "--output", "--key", "--signing-time"];
 const KEYGEN_OPTIONS: &[&str] = &[
@@ -303,15 +308,27 @@ fn describe_carried(mut options: Options) -> Result<String, Failure> {
     let variable = options
         .text("--variable")?
         .ok_or_else(|| Failure::Usage("--variable is required".into()))?;
+    let exports = options.take("--core-exports").map(PathBuf::from);
     let elf = read_input(&input)?;
-    let carried = carried::describe(&elf).map_err(conversion)?;
+    let carried = match &exports {
+        None => carried::describe(&elf),
+        Some(exports) => {
+            let list = String::from_utf8(read_input(exports)?)
+                .map_err(|_| conversion(format!("{} is not UTF-8", exports.display())))?;
+            let listing = corelib::Listing::parse(&list)
+                .map_err(|e| conversion(format!("{}: {e}", exports.display())))?;
+            carried::describe_importing(&elf, &listing)
+        }
+    }
+    .map_err(conversion)?;
     let files = carried.rust(&name, &variable).map_err(conversion)?;
     let written = write_description(&out, &name, &carried::generated_line(&name), &files)?;
     Ok(format!(
-        "onbf-pack: described {name} in {}: {} segments, {} relocations, {} files ({written} written)",
+        "onbf-pack: described {name} in {}: {} segments, {} relocations, {} imports, {} files ({written} written)",
         out.display(),
         carried.segments.len(),
         carried.relocations.len(),
+        carried.imports.len(),
         files.len()
     ))
 }

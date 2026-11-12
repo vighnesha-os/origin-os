@@ -5,9 +5,20 @@
 //!
 //! [`describe`] reads `rust-lld`'s output with the same reader as the KRN conversion
 //! ([`crate::elf::parse`]), which refuses each of ONBF §6.1.2's hard errors, and adds the
-//! program's own rule: exactly one read-execute segment, the range ADR-0005 A6 pins its system
-//! calls to. Every relocation is base-relative; `R_X86_64_GLOB_DAT` and `R_X86_64_JUMP_SLOT`
-//! are refused too, since nothing is bound until `origin.core` exists (task S4-2, L3).
+//! program's own rule: exactly one read-execute segment. Every relocation is base-relative, and
+//! the program imports nothing.
+//!
+//! [`describe_importing`] reads a program linked against `origin.core` (task S4-2; ADR-0011
+//! Amendment 2, L3): its one `DT_NEEDED` names that library, each symbol it leaves undefined is
+//! one of the library's exports, and each `R_X86_64_GLOB_DAT` relocation against one becomes an
+//! import: a slot, and which export goes there. The launch path binds every import before the
+//! program's first thread exists, on a page that is read-only to the program from the start,
+//! so an import slot must lie in a read-only-after-relocation segment; one anywhere else is
+//! refused here. The description names an export by its place among the library's exports in
+//! name order, which is the order `onbf-pack corelib` writes them in, and carries the release
+//! fingerprint of the list it was bound against, so the kernel can refuse a program bound to
+//! another `origin.core` than the one it carries. The program's own bytes hold no call number
+//! and no offset of `origin.core`.
 //!
 //! [`Carried::rust`] writes the kernel-private description: one Rust file holding a static of
 //! the kernel's `program::Carried` type, and one file of bytes for each segment that has any.
@@ -26,7 +37,8 @@ use core::fmt;
 
 use origin_crypto::Sha256;
 
-use crate::elf::{self, ElfError, Permissions};
+use crate::corelib::{self, Listing};
+use crate::elf::{self, ElfError, Linking, Permissions};
 use crate::sign::hex;
 
 /// How the kernel maps a segment.
@@ -69,6 +81,18 @@ pub struct Segment {
     pub bytes: Vec<u8>,
 }
 
+/// One import of a program: a slot the launch path writes an export's address into.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CarriedImport {
+    /// The slot's offset from the base: 8-byte aligned, in the file-backed bytes of a
+    /// read-only-after-relocation segment, and no relocation slot.
+    pub slot: u64,
+    /// Which export of `origin.core` goes there: its place among the exports in name order.
+    pub export: usize,
+    /// The export's name, for the description's comments.
+    pub symbol: String,
+}
+
 /// A program, laid out for the kernel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Carried {
@@ -82,6 +106,11 @@ pub struct Carried {
     /// base to the 8 bytes there. Each lies in the file-backed bytes of a writable or RELRO
     /// segment and is 8-byte aligned.
     pub relocations: Vec<u64>,
+    /// Each import, strictly ascending by slot. Empty for a program that imports nothing.
+    pub imports: Vec<CarriedImport>,
+    /// The release fingerprint of the `origin.core` the imports were bound against (the
+    /// generator's list of its exports). `None` for a program read with no library.
+    pub core: Option<[u8; 32]>,
     /// SHA-256 of the linker output it was made from, for the record.
     pub source_digest: [u8; 32],
 }
@@ -93,6 +122,9 @@ pub enum CarriedError {
     Elf(ElfError),
     /// The program does not have exactly one read-execute segment; the value is how many.
     CodeSegments(usize),
+    /// An import slot is not in a read-only-after-relocation segment: the program could write
+    /// over the address it calls through (ONBF §6.1: full RELRO). The value is the slot.
+    ImportSlot(u64),
     /// A segment's bytes or a relocation slot fell outside what the reader validated (a bug in
     /// this module, or in the reader).
     Inconsistent(&'static str),
@@ -111,7 +143,11 @@ impl fmt::Display for CarriedError {
             Self::Elf(e) => write!(f, "ELF input: {e}"),
             Self::CodeSegments(n) => write!(
                 f,
-                "the program has {n} read-execute segments; the launch path pins its system calls to exactly one (ADR-0005 A6)"
+                "the program has {n} read-execute segments; a carried program has exactly one"
+            ),
+            Self::ImportSlot(slot) => write!(
+                f,
+                "the import slot at {slot:#x} is not in a read-only-after-relocation segment; link with -z relro -z now (ONBF §6.1)"
             ),
             Self::Inconsistent(what) => write!(f, "inconsistent description: {what}"),
             Self::Name(name) => write!(
@@ -138,9 +174,33 @@ impl From<ElfError> for CarriedError {
     }
 }
 
-/// Reads `file`, a program's `rust-lld` output, and lays it out for the kernel.
+/// Reads `file`, the `rust-lld` output of a program that imports nothing, and lays it out for
+/// the kernel.
 pub fn describe(file: &[u8]) -> Result<Carried, CarriedError> {
-    let parsed = elf::parse(file)?;
+    layout(file, elf::parse(file)?, None)
+}
+
+/// Reads `file`, the `rust-lld` output of a program linked against `origin.core`, whose exports
+/// `listing` names, and lays it out for the kernel with its imports.
+pub fn describe_importing(file: &[u8], listing: &Listing) -> Result<Carried, CarriedError> {
+    let exports = listing.symbols();
+    let parsed = elf::parse_linked(
+        file,
+        Linking::Importing {
+            library: corelib::LIBRARY,
+            exports: &exports,
+        },
+    )?;
+    layout(file, parsed, Some(listing))
+}
+
+/// Lays `parsed`, the reading of `file`, out for the kernel; its imports are named by their
+/// place in `listing`.
+fn layout(
+    file: &[u8],
+    parsed: elf::Elf,
+    listing: Option<&Listing>,
+) -> Result<Carried, CarriedError> {
     let code = parsed
         .segments
         .iter()
@@ -183,11 +243,40 @@ pub fn describe(file: &[u8]) -> Result<Carried, CarriedError> {
         .last()
         .and_then(|s| s.rva.checked_add(s.size))
         .ok_or(CarriedError::Inconsistent("the span"))?;
+    let mut imports = Vec::with_capacity(parsed.imports.len());
+    for import in &parsed.imports {
+        // The reader held the slot to a writable segment's file-backed bytes; the launch path
+        // needs more: a page the program can never write.
+        let relro = segments.iter().any(|s| {
+            s.access == Access::ReadAfterRelocation
+                && import
+                    .slot
+                    .checked_sub(s.rva)
+                    .and_then(|at| at.checked_add(8))
+                    .is_some_and(|end| end <= s.bytes.len() as u64)
+        });
+        if !relro {
+            return Err(CarriedError::ImportSlot(import.slot));
+        }
+        let export = listing
+            .and_then(|listing| listing.export_index(&import.symbol))
+            .ok_or(CarriedError::Inconsistent("an import of no listed export"))?;
+        // Whatever the linker left in the slot, the description holds zero there: its value
+        // is the launch path's to write.
+        place_addend(&mut segments, import.slot, 0)?;
+        imports.push(CarriedImport {
+            slot: import.slot,
+            export,
+            symbol: import.symbol.clone(),
+        });
+    }
     Ok(Carried {
         entry: parsed.entry,
         span,
         segments,
         relocations,
+        imports,
+        core: listing.map(|listing| listing.release),
         source_digest: Sha256::digest(file),
     })
 }
@@ -302,8 +391,8 @@ fn is_name(name: &str, first: fn(u8) -> bool, rest: fn(u8) -> bool) -> bool {
 impl Carried {
     /// The kernel-private description of this program: `{name}.rs`, then one `{name}.{i}.bin`
     /// for each segment `i` with bytes. The Rust file defines `pub(crate) static {NAME}:
-    /// Carried`, with the kernel's `Carried`, `Segment` and `SegmentAccess` in scope where it
-    /// is included, and finds the byte files in the directory the environment variable
+    /// Carried`, with the kernel's `Carried`, `Segment`, `SegmentAccess` and `Import` in scope
+    /// where it is included, and finds the byte files in the directory the environment variable
     /// `variable` names when the kernel is compiled.
     pub fn rust(&self, name: &str, variable: &str) -> Result<Vec<File>, CarriedError> {
         if !is_name(
@@ -363,7 +452,26 @@ impl Carried {
             let offsets: Vec<String> = line.iter().map(|r| format!("{r:#x},")).collect();
             text.push_str(&format!("        {}\n", offsets.join(" ")));
         }
-        text.push_str("    ],\n};\n");
+        text.push_str("    ],\n    imports: &[\n");
+        for import in &self.imports {
+            text.push_str(&format!(
+                "        Import {{ slot: {:#x}, export: {} }}, // {}\n",
+                import.slot, import.export, import.symbol
+            ));
+        }
+        text.push_str("    ],\n");
+        match &self.core {
+            None => text.push_str("    core: None,\n"),
+            Some(release) => {
+                text.push_str("    core: Some([\n");
+                for row in release.chunks(8) {
+                    let bytes: Vec<String> = row.iter().map(|b| format!("{b:#04x},")).collect();
+                    text.push_str(&format!("        {}\n", bytes.join(" ")));
+                }
+                text.push_str("    ]),\n");
+            }
+        }
+        text.push_str("};\n");
         files.insert(0, (format!("{name}.rs"), text.into_bytes()));
         Ok(files)
     }
