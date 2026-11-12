@@ -17,6 +17,7 @@ mod mnemonics;
 mod provenance;
 mod reproducible;
 mod requirements;
+mod roadmap;
 mod screen;
 mod serial;
 mod targetcfg;
@@ -87,6 +88,9 @@ commands:
               docs/engineering/SOURCE_PROVENANCE.md: one row for each crate, each of §6's
               fields filled, its dependencies named and its licence stated (part of check;
               CLAUDE.md §6; quick)
+  roadmap-gate only the gate on docs/ROADMAP.md: every counted build row of the
+              requirements matrix placed in one milestone or listed as in none, and
+              every row it names in the matrix (part of check; CLAUDE.md §82; quick)
   regenerate rewrites the kernel's generated system-call crate from sdk/interfaces
   image-gate [kernel ELF]
               only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
@@ -2524,6 +2528,7 @@ fn main() -> ExitCode {
         ["interface-gate"] => interfaces::gate(),
         ["requirements-gate"] => requirements::gate(),
         ["provenance-gate"] => provenance::gate(),
+        ["roadmap-gate"] => roadmap::gate(),
         ["regenerate"] => interfaces::regenerate(),
         ["image-gate"] => in_turn("image-gate", image::build_and_gate),
         ["image-gate", elf] => image::gate(Path::new(elf)),
@@ -3246,6 +3251,7 @@ fn check() -> Result {
     documents::gate()?;
     requirements::gate()?;
     provenance::gate()?;
+    roadmap::gate()?;
     unsafety::gate()?;
     interfaces::gate()?;
     manifest_version_lint()?;
