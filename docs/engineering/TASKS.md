@@ -396,6 +396,8 @@
 
 38. **Task S4-0 of ADR-0011 N14 step 4: 64-bit handles (item 24; decision item 109; ADR-0005 Amendment 6, E1). Built on `claude/s4-0-handles` on 2026-11-12, not merged:** `user-abi` and `origin.kernel` 0.7, the kernel's table, `origin-abi`, the generator and every generated crate, the proofs, OIDL §10. The boot test and the boot matrix pass under QEMU; two controls fail the boot (ADR-0013, H64-1 and H64-2). It waits for the coordinating session to read it and land it in the third batch, and then for CI. Its contract is under "Task contracts"; what was run is in `SOURCE_PROVENANCE.md`, "Task S4-0".
 
+39. **The fingerprint records a handle's width (decision item 237, 2026-11-12). Not started.** OIDL §13's canonical description gains the width of a handle, as format `oidl-fingerprint 2`, and every library's lock is recorded again once, while every library is at major 0. Its pieces: the generator's description (`developer-tools/oidl/src/fingerprint.rs`) and its pinned digest; OIDL §13's text, in place of its dated note; every `sdk/interfaces/*.lock`. Done when `cargo xtask check` passes, a planted change of a handle's width changes the fingerprint (a negative control), and `origin.kernel` 0.7's fingerprint differs from 0.6's.
+
 ## Waiting on the owner
 
 Every design decision was finalised on 2026-11-07, under the owner's instruction to finalise the design with the recommended options: ADR-0002 (with B7: a Microsoft-signed first stage by default, Origin-owned machines supported; since Amendment 1 of 2026-11-10, Origin-owned keys are the default), ADR-0003, errata G1 (the SYM `DWARF` kind) and the readings R1–R5, P1–P7, E1, M1 and L1. What remains is not design:
