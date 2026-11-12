@@ -1,8 +1,13 @@
-//! UEFI smoke test and `wcslen` regression test (CLAUDE.md §9, §10; rust-lang/rust#163614).
+//! UEFI smoke test (CLAUDE.md §9): the compiler alone, without Cargo, links an EFI application.
 //!
-//! `developer-tools/toolchain/verify.sh` builds this for `x86_64-unknown-uefi` at opt-level 3.
-//! Rust 1.99.0 failed to link release UEFI builds with "undefined symbol: wcslen" after
-//! LLVM's loop-idiom pass rewrote a NUL-terminated 16-bit length loop into a `wcslen` call.
+//! `developer-tools/toolchain/verify.sh` builds this for `x86_64-unknown-uefi` at opt-level 3
+//! and reads the image's PE header.
+//!
+//! It still holds a NUL-terminated 16-bit length loop, which LLVM's loop-idiom pass rewrites
+//! into a `wcslen` call, and which Rust 1.99.0 failed to link ("undefined symbol: wcslen",
+//! rust-lang/rust#163614). §10's test for that regression is no longer here: it is
+//! `char16_len` in the loader's library (`boot/uefi/src/uefi.rs`), linked into the loader
+//! itself, as §10 asks.
 #![no_std]
 #![no_main]
 
