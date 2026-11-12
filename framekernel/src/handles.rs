@@ -372,8 +372,7 @@ mod tests {
         assert_eq!(SLOT_BITS + GENERATION_BITS, 64);
         assert_eq!(MAX_HANDLES, 0xFF_FFFF);
         assert_eq!(LAST_GENERATION, 0xFF_FFFF_FFFF);
-        assert!(MAX_HANDLES >= 16_000_000);
-        assert!(LAST_GENERATION >= 1_000_000_000_000);
+        const { assert!(MAX_HANDLES >= 16_000_000 && LAST_GENERATION >= 1_000_000_000_000) };
         // The first and last slot, at the first and last generation, round-trip.
         for (index, generation) in [(0, 1), (0, LAST_GENERATION), (MAX_HANDLES - 1, 1)] {
             let h = join(index, generation);
