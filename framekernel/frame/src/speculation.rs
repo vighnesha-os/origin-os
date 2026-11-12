@@ -7,7 +7,8 @@
 //!   Fn8000_0008, Fn8000_0021, and `IA32_ARCH_CAPABILITIES` where it exists.
 //! - [`Plan::decide`] turns that into what the kernel sets on that processor. Every setting
 //!   follows a bit the processor reports, never its name, with one exception the ADR makes:
-//!   the form of [`crate::nospec`], which no bit reports.
+//!   the form of [`crate::nospec`], which no bit reports. That comes from the CPU
+//!   identification table ([`crate::cpuident`], ADR-0009 A2), which ADR-0017 makes its home.
 //! - Each processor's plan, and whether its registers read back as planned, is kept per
 //!   processor ([`record`], [`recorded`]): the cores of one machine may differ.
 //! - [`Ledger`] counts changes of process on a processor, for the IBPB of Z3.
@@ -25,8 +26,9 @@
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::cpuident::{self, Maker, Signature};
 use crate::limits::MAX_CPUS;
-use crate::nospec::{self, Form, Maker};
+use crate::nospec::Form;
 
 /// `IA32_SPEC_CTRL` bit 0: with enhanced IBRS, set once and left.
 pub const IBRS: u64 = 1 << 0;
@@ -69,35 +71,19 @@ impl Reported {
     /// The maker, from the name in leaf 0.
     #[must_use]
     pub fn maker(&self) -> Maker {
-        // The twelve letters, in the order the registers hold them: EBX, EDX, ECX.
-        fn name(text: &[u8; 12]) -> [u32; 3] {
-            let word = |at: usize| {
-                u32::from_le_bytes([text[at], text[at + 1], text[at + 2], text[at + 3]])
-            };
-            [word(0), word(4), word(8)]
-        }
-        let reported = [self.leaf0[1], self.leaf0[3], self.leaf0[2]];
-        let is = |maker: [u32; 3]| {
-            reported[0] == maker[0] && reported[1] == maker[1] && reported[2] == maker[2]
-        };
-        if is(name(b"GenuineIntel")) {
-            Maker::Intel
-        } else if is(name(b"AuthenticAMD")) {
-            Maker::Amd
-        } else {
-            Maker::Other
-        }
+        Maker::of(self.leaf0)
     }
 
     /// The family: the base family, plus the extended family where the base is 0FH.
     #[must_use]
     pub const fn family(&self) -> u32 {
-        let base = (self.leaf1[0] >> 8) & 0xF;
-        if base == 0xF {
-            base + ((self.leaf1[0] >> 20) & 0xFF)
-        } else {
-            base
-        }
+        cpuident::family_of(self.leaf1[0])
+    }
+
+    /// The maker, family, model and stepping, as the CPU identification table reads them.
+    #[must_use]
+    pub fn signature(&self) -> Signature {
+        Signature::new(self.leaf0, self.leaf1[0], self.leaf1[1])
     }
 
     /// CPUID.01H:ECX[31]: a hypervisor runs this processor.
@@ -182,7 +168,7 @@ pub struct Plan {
     pub ibpb: bool,
     /// LFENCE on this processor (Z9).
     pub lfence: Lfence,
-    /// The form of `nospec` for this maker and family (Z9).
+    /// The form of `nospec` for this processor (Z9), from the CPU identification table.
     pub form: Form,
     lacks: u64,
 }
@@ -274,7 +260,7 @@ impl Plan {
             automatic_ibrs: automatic,
             ibpb,
             lfence,
-            form: nospec::choose(maker, family),
+            form: cpuident::identify(reported.signature()).form(),
             lacks,
         }
     }

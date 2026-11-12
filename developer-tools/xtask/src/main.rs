@@ -47,7 +47,7 @@ commands:
               signature and tampered content, each with its own message
   boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
               one after another, then boot-x2apic, boot-bridge, boot-legacy-free,
-              boot-random and boot-console
+              boot-random, boot-identity and boot-console
   boot-bridge boot-test with the NIC behind a PCIe root port (both IOMMUs): bus mastering is
               cleared on the bridge too and opened again above the device its driver attached
   boot-legacy-free  the kernel boot on a machine with no 8254 and no 8042: the timers
@@ -57,6 +57,9 @@ commands:
               seeded from (ADR-0016): one with RDRAND and no RDSEED, which boots and says
               so; one with neither, which has no generator, launches nothing and still
               reaches its verdict
+  boot-identity the kernel boot on two processors QEMU is told to report (ADR-0009 A2): a
+              Panther Lake, in the declared scope, and rental A's Zen 4 EPYC, outside it;
+              each must print its own CPU identity line and still reach its verdict
   boot-x2apic boot-test on a sparse topology: the boot processor at APIC ID 0 and processors
               at APIC IDs 256 and 412, above what 8-bit APIC IDs reach (the MADT lists
               150 possible processors); twice, on a CPU model with CPUID leaf 1Fh and on
@@ -677,6 +680,7 @@ fn boot_scenario() -> Scenario {
         (true, true) => no_generator_markers(&mut scenario),
         _ => {}
     }
+    cpu_identity_marker(&mut scenario);
     scenario
 }
 
@@ -1295,6 +1299,9 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // CPU features: QEMU's `max` CPU has every x86-64-v3 feature, so the kernel must
             // find the baseline met (CLAUDE.md §14); below it, the kernel refuses to boot.
             "origin-kernel: CPU: x86-64 level 3 (baseline v3 true)".into(),
+            // ADR-0009 A2: the core generation and the declared scope; what it says depends
+            // on the processor, so only its start is fixed (`boot-identity` fixes all of it).
+            "origin-kernel: CPU identity: ".into(),
             // A frame-pointer backtrace of a known call chain (CLAUDE.md §69).
             "origin-kernel: backtrace: 4 frames from a known call chain, all in the kernel image true".into(),
             "origin-kernel: frame allocator: ".into(),
@@ -2542,6 +2549,7 @@ fn main() -> ExitCode {
         ["boot-bridge"] => in_turn("boot-bridge", boot_bridge),
         ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
         ["boot-random"] => in_turn("boot-random", boot_random),
+        ["boot-identity"] => in_turn("boot-identity", boot_identity),
         ["run"] => in_turn("run", run),
         ["loom"] => in_turn("loom", loom::run),
         ["reproducible-gate"] => in_turn("reproducible-gate", reproducible::gate),
@@ -2614,6 +2622,7 @@ fn boot_matrix() -> Result {
     boot_bridge()?;
     boot_legacy_free()?;
     boot_random()?;
+    boot_identity()?;
     boot_console()?;
     // ADR-0004 Amendment 2, A6.4: the boots placed the kernel stacks' region apart.
     let recorded = fs::read_to_string(&bases).map_err(|e| format!("{}: {e}", bases.display()))?;
@@ -2622,7 +2631,7 @@ fn boot_matrix() -> Result {
         "xtask: boot-matrix: the kernel stacks' region was at {boots} distinct bases in {boots} kernel boots, read through QEMU's monitor; none is printed"
     );
     println!(
-        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, the two machines without the random-number instructions, and the console machines)"
+        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, the two machines without the random-number instructions, the two CPU identities, and the console machines)"
     );
     Ok(())
 }
@@ -2941,6 +2950,70 @@ fn boot_random() -> Result {
         }
     }
     println!("xtask: boot-random passed (RDRAND alone; neither instruction)");
+    Ok(())
+}
+
+/// The processors `boot-identity` has QEMU report (ADR-0009 A2; TASKS item 16): the `-cpu`
+/// value, what it is, and the whole line the kernel must print for it. The lines are written
+/// here from the vendors' documents (`docs/research/2026-11-12-cpu-identification-table.md`),
+/// not taken from the kernel's table, so the boot checks the table.
+const CPU_IDENTITIES: [(&str, &str, &str); 2] = [
+    (
+        // Intel's microcode notes: PTL-H, 06-CC-02.
+        "max,vendor=GenuineIntel,family=6,model=204,stepping=2",
+        "a Panther Lake, in the declared scope",
+        "origin-kernel: CPU identity: GenuineIntel family 06h (6) model CCh stepping 2 (leaf 1 EAX 000C06C2h): Panther Lake; in the declared scope: a 2026 Intel generation, listed by its family-6 model (ADR-0009 A2); reported under a hypervisor, which can report any identity; no erratum listed for it",
+    ),
+    (
+        // Rental A's AMD EPYC 4244P (docs/research/2026-11-12-rental-a-findings.md): Zen 4.
+        "max,vendor=AuthenticAMD,family=25,model=97,stepping=2",
+        "rental A's EPYC 4244P, outside it",
+        "origin-kernel: CPU identity: AuthenticAMD family 19h (25) model 61h stepping 2 (leaf 1 EAX 00A60F12h): older than Zen 5; outside the declared scope, a bench machine: AMD family below 1Ah, where Zen 5 begins (ADR-0009 A2); reported under a hypervisor, which can report any identity; no erratum listed for it",
+    ),
+];
+
+/// Where `ORIGIN_QEMU_CPU` is one of [`CPU_IDENTITIES`], the boot must print that identity's
+/// whole line in place of the line's start. The rest of the boot is held to every other
+/// marker, its verdict and the halt line among them: the kernel never refuses a machine for
+/// its identity (A2).
+fn cpu_identity_marker(scenario: &mut Scenario) {
+    let model = qemu_cpu_model();
+    if let Some((_, _, line)) = CPU_IDENTITIES.iter().find(|(cpu, _, _)| *cpu == model) {
+        swap_marker(
+            scenario,
+            "origin-kernel: CPU identity: ",
+            (*line).to_string(),
+        );
+    }
+}
+
+/// Runs the kernel boot on the two processors of [`CPU_IDENTITIES`], each set with QEMU's
+/// `family=` and `model=` (ADR-0009 A2: "QEMU can be told to report any family and model, so CI
+/// can boot an in-scope and an out-of-scope identity"). Under KVM a guest's vendor is not
+/// changed: those boots run on QEMU's software processor only, and the KVM jobs' own boots
+/// print the real processor's line.
+fn boot_identity() -> Result {
+    if Accel::from_env()? == Accel::Kvm {
+        println!(
+            "xtask: boot-identity: not run under KVM, where the guest's vendor stays the host's; QEMU's software processor runs it"
+        );
+        return Ok(());
+    }
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    for (model, what, _) in CPU_IDENTITIES {
+        println!("xtask: boot-identity: {what} (-cpu {model})");
+        let status = boot_test_child(&exe)
+            .env("ORIGIN_QEMU_CPU", model)
+            .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
+            .status()
+            .map_err(|e| format!("cannot run boot-test: {e}"))?;
+        if !status.success() {
+            return Err(format!("boot-test as {what} failed ({status})"));
+        }
+    }
+    println!(
+        "xtask: boot-identity passed (a Panther Lake in the declared scope; a Zen 4 EPYC outside it)"
+    );
     Ok(())
 }
 
