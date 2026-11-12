@@ -151,6 +151,19 @@ pub fn code_range(carried: &Carried, base: u64) -> Option<(u64, u64)> {
     Some((start, start.checked_add(s.size)?))
 }
 
+/// How the page at offset `offset` from the base of `carried` must be mapped: the access of the
+/// segment that holds it, or `None` for a page of the span no segment holds, which stays
+/// unmapped. What the boot proof compares the child's tables with, page by page, before its
+/// first thread starts (S4-1's review, finding F1).
+#[must_use]
+pub fn page_access(carried: &Carried, offset: u64) -> Option<SegmentAccess> {
+    carried
+        .segments
+        .iter()
+        .find(|s| offset.checked_sub(s.rva).is_some_and(|at| at < s.size))
+        .map(|s| s.access)
+}
+
 /// The page-aligned place in `[PROGRAM_LOW, PROGRAM_HIGH)` at which `pages` pages start, from a
 /// random value `random`: every page that fits is a possible answer. `None` if they do not fit.
 #[must_use]
