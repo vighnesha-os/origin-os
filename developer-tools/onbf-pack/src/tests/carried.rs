@@ -3,7 +3,7 @@
 //! files.
 
 use super::elf_writer::{Load, Phdr, R, RELATIVE, RW, RX, TestElf, text};
-use crate::carried::{Access, CarriedError, describe};
+use crate::carried::{Access, CarriedError, describe, stale};
 use crate::elf::{ElfError, Permissions, SlotProblem};
 
 /// The baseline program: text at 0x1000 (the entry), read-only data at 0x2000, writable data at
@@ -231,4 +231,93 @@ fn names_are_checked() {
         );
     }
     assert!(carried.rust("first_program_2", "ORIGIN_CARRIED_2").is_ok());
+}
+
+/// What `stale` is given for a directory: its file names, and its description's bytes.
+fn directory(files: &[&str]) -> Vec<String> {
+    files.iter().map(|f| (*f).to_string()).collect()
+}
+
+#[test]
+fn only_this_tools_own_stale_files_are_removed() {
+    let carried = describe(&program().bytes()).unwrap();
+    let files = carried.rust("first", "ORIGIN_CARRIED").unwrap();
+    let ours = files[0].1.clone();
+    assert_eq!(files[0].0, "first.rs");
+    // An empty directory, and one with nothing of this program's: nothing to remove.
+    assert_eq!(stale("first", &files, &[], None), Ok(vec![]));
+    let others = directory(&["second.rs", "second.0.bin", "notes.txt"]);
+    assert_eq!(stale("first", &files, &others, None), Ok(vec![]));
+    // Its own earlier description, with more segments: the extra files go, nothing else does,
+    // whatever its name looks like.
+    let present = directory(&[
+        "first.rs",
+        "first.0.bin",
+        "first.1.bin",
+        "first.7.bin",
+        "first.12.bin",
+        "first.txt",
+        "first.rs.bak",
+        "first.x.bin",
+        "first..bin",
+        "first.0.bin.old",
+        "firsts.9.bin",
+        "second.3.bin",
+    ]);
+    let mut gone = stale("first", &files, &present, Some(&ours)).unwrap();
+    gone.sort();
+    let kept: Vec<&String> = files.iter().map(|(name, _)| name).collect();
+    assert!(gone.iter().all(|f| !kept.contains(&f)));
+    assert!(
+        gone.contains(&"first.7.bin".to_string()) && gone.contains(&"first.12.bin".to_string())
+    );
+    assert!(
+        gone.iter().all(|f| f.starts_with("first.")
+            && f.ends_with(".bin")
+            && f != "first.x.bin"
+            && f != "first..bin"),
+        "{gone:?}"
+    );
+}
+
+#[test]
+fn a_directory_this_tool_did_not_write_to_is_refused() {
+    let carried = describe(&program().bytes()).unwrap();
+    let files = carried.rust("first", "ORIGIN_CARRIED").unwrap();
+    let ours = files[0].1.clone();
+    // A hand-written `first.rs`: the wrong `--out`.
+    assert_eq!(
+        stale(
+            "first",
+            &files,
+            &directory(&["first.rs", "lib.rs"]),
+            Some(b"fn main() {}\n")
+        ),
+        Err(CarriedError::Foreign("first.rs".into()))
+    );
+    // Bytes files and no description, or one that cannot be read.
+    assert_eq!(
+        stale("first", &files, &directory(&["first.0.bin"]), None),
+        Err(CarriedError::Foreign("first.0.bin".into()))
+    );
+    assert_eq!(
+        stale("first", &files, &directory(&["first.rs"]), None),
+        Err(CarriedError::Foreign("first.rs".into()))
+    );
+    // Another program's description under this one's name.
+    let other = carried.rust("second", "ORIGIN_CARRIED").unwrap();
+    assert_eq!(
+        stale(
+            "first",
+            &files,
+            &directory(&["first.rs"]),
+            Some(&other[0].1)
+        ),
+        Err(CarriedError::Foreign("first.rs".into()))
+    );
+    // Its own: accepted.
+    assert_eq!(
+        stale("first", &files, &directory(&["first.rs"]), Some(&ours)),
+        Ok(vec![])
+    );
 }

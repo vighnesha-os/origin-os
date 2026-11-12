@@ -297,6 +297,21 @@ fn describe_carried(mut options: Options) -> Result<String, Failure> {
     let files = carried.rust(&name, &variable).map_err(conversion)?;
     fs::create_dir_all(&out)
         .map_err(|e| conversion(format!("cannot create {}: {e}", out.display())))?;
+    // What may go, decided before anything is written: only files this tool wrote for `name`
+    // (`carried::stale`; S4-1's review, finding F9).
+    let mut present = Vec::new();
+    let entries = fs::read_dir(&out)
+        .map_err(|e| conversion(format!("cannot read {}: {e}", out.display())))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| conversion(format!("{}: {e}", out.display())))?;
+        // A name that is not UTF-8 is not one this tool writes.
+        if let Ok(file) = entry.file_name().into_string() {
+            present.push(file);
+        }
+    }
+    let description = fs::read(out.join(format!("{name}.rs"))).ok();
+    let stale = carried::stale(&name, &files, &present, description.as_deref())
+        .map_err(|e| conversion(format!("{}: {e}", out.display())))?;
     let mut written = 0;
     for (file, bytes) in &files {
         let path = out.join(file);
@@ -306,17 +321,9 @@ fn describe_carried(mut options: Options) -> Result<String, Failure> {
         write_output(&path, bytes)?;
         written += 1;
     }
-    let prefix = format!("{name}.");
-    let entries = fs::read_dir(&out)
-        .map_err(|e| conversion(format!("cannot read {}: {e}", out.display())))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| conversion(format!("{}: {e}", out.display())))?;
-        let file = entry.file_name();
-        let file = file.to_string_lossy();
-        if file.starts_with(&prefix) && !files.iter().any(|(f, _)| *f == file) {
-            fs::remove_file(entry.path())
-                .map_err(|e| conversion(format!("cannot remove {file}: {e}")))?;
-        }
+    for file in &stale {
+        fs::remove_file(out.join(file))
+            .map_err(|e| conversion(format!("cannot remove {file}: {e}")))?;
     }
     Ok(format!(
         "onbf-pack: described {name} in {}: {} segments, {} relocations, {} files ({written} written)",

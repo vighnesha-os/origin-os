@@ -947,6 +947,12 @@ impl SymbolTags {
 /// Refuses a dynamic symbol table that holds an undefined symbol (ONBF §6.1.2). Its length is
 /// `nchain`, the second word of `DT_HASH` (gABI: "the number of symbol table entries"); entry 0
 /// is the reserved null symbol, which is undefined by definition.
+///
+/// A limit (S4-1's review, finding F9): the length is the file's own word, so a file can
+/// understate it and an undefined symbol past it is not seen. Nothing could use one: every
+/// relocation the conversions accept is `R_X86_64_RELATIVE`, which names no symbol, and nothing
+/// binds a symbol until `origin.core` exists (task S4-2), so an unseen undefined symbol has no
+/// effect on the image.
 fn check_symbols(file: &[u8], tags: &SymbolTags, segments: &[LoadSegment]) -> Result<(), ElfError> {
     let Some(symtab) = tags.symtab else {
         return Ok(());
