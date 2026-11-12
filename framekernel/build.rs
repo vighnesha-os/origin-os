@@ -1,45 +1,9 @@
-//! Link arguments that give the Framekernel ELF the shape `onbf-pack` converts to KRN
-//! (ONBF §6.1.2, §6.5).
+//! Left in place for one commit, and empty (TASKS item 44).
 //!
-//! For `x86_64-unknown-none`, rustc 1.99.1 runs rust-lld with `-pie --eh-frame-hdr
-//! -z noexecstack --gc-sections -z relro -z now -O1 --strip-debug` (observed with
-//! `--print link-args`): a PIE, but without `--no-dynamic-linker` or `-z text`. The
-//! arguments below come after rustc's own, so they decide the output whatever rustc's
-//! defaults become (in lld the last of two opposing `-z` options wins). They are scoped to
-//! this crate's binary and emitted only for the kernel target; the library is also built for
-//! the host, for its unit tests, where these options mean nothing.
+//! The link arguments this script used to print are now in `.cargo/config.toml`, under the
+//! kernel's target. While a build script exists Cargo gives this crate the `-C metadata`
+//! value it gave it before, so a kernel built from this commit must be the same bytes as one
+//! built from the commit before it. That is the evidence that every argument still reaches
+//! the linker, in the same order. The next commit removes this file.
 
-/// The target the kernel binary is built for.
-const KERNEL_TARGET: &str = "x86_64-unknown-none";
-
-/// What each argument guarantees in the output ELF.
-const LINK_ARGS: &[&str] = &[
-    // The entry point is `_start` (lld's default, stated so it cannot drift).
-    "--entry=_start",
-    // No PT_INTERP: nothing loads this image but the Origin boot loader.
-    "--no-dynamic-linker",
-    // No text relocations: every relocation target is in a writable segment.
-    "-ztext",
-    // Every PT_LOAD starts on its own 4 KiB page, in the file and in memory, so no page
-    // holds two segments with different permissions (ONBF §6.1).
-    "-zseparate-loadable-segments",
-    "-zmax-page-size=4096",
-    "-zcommon-page-size=4096",
-    // Full RELRO (CLAUDE.md §14, ADR-0001 default 9): rust-lld ends one PT_LOAD at the end of
-    // PT_GNU_RELRO, `onbf-pack` flags it RELRO, and the boot loader applies its relocations
-    // and hands it to the kernel read-only.
-    "-zrelro",
-    "-znow",
-    // PT_GNU_STACK, if emitted, is not executable.
-    "-znoexecstack",
-];
-
-fn main() {
-    println!("cargo::rerun-if-changed=build.rs");
-    if std::env::var("TARGET").as_deref() != Ok(KERNEL_TARGET) {
-        return;
-    }
-    for arg in LINK_ARGS {
-        println!("cargo::rustc-link-arg-bins={arg}");
-    }
-}
+fn main() {}

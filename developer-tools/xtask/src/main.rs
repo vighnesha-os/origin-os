@@ -11,6 +11,7 @@ mod disk;
 mod documents;
 mod expected_warning;
 mod image;
+mod image_inputs;
 mod interfaces;
 mod lex;
 mod loom;
@@ -106,6 +107,10 @@ commands:
   progress-gate only the gate on docs/PROGRESS.md: the committed page is the one the
               tree generates, byte for byte (part of check; quick)
   regenerate rewrites the kernel's generated system-call crate from sdk/interfaces
+  version     writes runtime/version/src/generated.rs, the release's constants, from
+              origin-version.toml (CLAUDE.md §62)
+  version-gate only the gate on that file: it is what origin-version.toml generates (part of
+              check; quick)
   image-gate [kernel ELF]
               only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
               and no jump table, in the code this build compiled. Builds the kernel first, or
@@ -2581,6 +2586,8 @@ fn main() -> ExitCode {
         ["progress"] => progress::write(),
         ["progress-gate"] => progress::gate(),
         ["regenerate"] => interfaces::regenerate(),
+        ["version"] => image_inputs::write_version_file(),
+        ["version-gate"] => image_inputs::version_gate(),
         ["image-gate"] => in_turn("image-gate", image::build_and_gate),
         ["image-gate", elf] => image::gate(Path::new(elf)),
         ["build"] => in_turn("build", || {
@@ -3427,6 +3434,7 @@ fn check() -> Result {
     progress::gate()?;
     unsafety::gate()?;
     interfaces::gate()?;
+    image_inputs::version_gate()?;
     manifest_version_lint()?;
     signing_stays_off_the_os_lint()?;
     signing_has_no_secret_branches()?;
