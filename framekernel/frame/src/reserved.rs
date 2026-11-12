@@ -307,6 +307,25 @@ pub fn merge(ranges: &[Reserved]) -> Result<Vec<(Span, Access)>, Conflict> {
     Ok(out)
 }
 
+/// Whether `have` (from [`merge`]) maps every page of `need` (from [`merge`]) with at least
+/// the access `need` asks: a domain made for one device that another device shares (an
+/// AMD-Vi alias) serves the second only if it already holds all of the second's ranges.
+pub fn includes(have: &[(Span, Access)], need: &[(Span, Access)]) -> bool {
+    need.iter().all(|&(s, a)| {
+        let mut at = s.base;
+        while at < s.end {
+            let Some(&(t, b)) = have.iter().find(|(t, _)| t.contains(at)) else {
+                return false;
+            };
+            if (a.read && !b.read) || (a.write && !b.write) {
+                return false;
+            }
+            at = t.end;
+        }
+        true
+    })
+}
+
 /// The never-map spans among `ranges`.
 pub fn never_mapped(ranges: &[Reserved]) -> Vec<Span> {
     ranges
@@ -637,6 +656,22 @@ mod tests {
                 end: 0x4000
             }]
         );
+    }
+
+    #[test]
+    fn includes_asks_for_every_page_and_its_access() {
+        let s = |base, end| Span { base, end };
+        let have = [
+            (s(0x1000, 0x3000), Access::READ_WRITE),
+            (s(0x3000, 0x4000), Access::READ),
+        ];
+        assert!(includes(&have, &[]));
+        assert!(includes(&have, &[(s(0x1000, 0x4000), Access::READ)]));
+        assert!(includes(&have, &[(s(0x2000, 0x3000), Access::WRITE)]));
+        assert!(!includes(&have, &[(s(0x2000, 0x4000), Access::WRITE)]));
+        assert!(!includes(&have, &[(s(0x0, 0x2000), Access::READ)]));
+        assert!(!includes(&have, &[(s(0x3000, 0x5000), Access::READ)]));
+        assert!(!includes(&[], &[(s(0x1000, 0x2000), Access::READ)]));
     }
 
     /// Every span `merge` returns is page aligned, disjoint, sorted, never empty, and covers

@@ -17,7 +17,11 @@
 //!    faults until its driver attaches it (ADR-0007 D2).
 //!
 //! A driver then attaches its device ([`attach`]): the device gets a domain of its own — a
-//! domain ID, second-level tables and an IOVA window — and a context entry. Each DMA page the
+//! domain ID, second-level tables and an IOVA window — and a context entry. If the firmware
+//! names memory the device must reach (a VT-d RMRR, an AMD-Vi IVMD), the domain identity-maps
+//! it, with the firmware's permissions, before the entry turns present, and the window keeps
+//! clear of it ([`crate::reserved`]; ADR-0007 questions 4 and 8). A range bring-up does not
+//! trust is never mapped, and the devices it names stay refused. Each DMA page the
 //! driver allocates is mapped there ([`map`]) at an IOVA from [1 GiB, 2 GiB), never at its
 //! physical address. Unmapping ([`unmap`]) invalidates the IOTLB — page-selective, draining
 //! reads and writes where the unit can — and waits for it before returning. MSI-X messages
@@ -43,6 +47,7 @@
 use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::vec::Vec;
 use core::arch::asm;
+use origin_boot_info::MemoryRegion;
 use core::fmt::Write;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering, fence};
@@ -55,6 +60,7 @@ use crate::dmar::{self, BridgeBuses, Dmar, IoApicScopeError, Requester};
 use crate::mmio::MmioRegion;
 use crate::once::SetOnce;
 use crate::pci::{self, Address};
+use crate::reserved::{self, Platform, Refusal, Reserved, Span, Use};
 use crate::sync::SpinLock;
 use crate::vtd::{
     self, Access, Capability, ContextEntry, Descriptor, Drain, ExtCapability, FaultRecord,
@@ -217,7 +223,7 @@ struct Unit {
 }
 
 /// One device's domain.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct DomainState {
     unit: usize,
     id: u16,
@@ -230,6 +236,9 @@ struct DomainState {
     mapped_ever: u64,
     /// Table pages (the top one included).
     tables: u64,
+    /// The firmware-reserved spans identity-mapped for the device, never unmapped, which the
+    /// window keeps clear of.
+    identity: Vec<(Span, Access)>,
 }
 
 /// A device's DMA domain, as drivers hold it.
@@ -240,6 +249,8 @@ struct Iommu {
     dmar: Dmar<'static>,
     units: Vec<Unit>,
     domains: Vec<DomainState>,
+    /// Every RMRR, as bring-up judged it.
+    reserved: Vec<ReservedRange>,
     /// Every unit translates.
     translating: bool,
     /// Every unit remaps interrupts.
@@ -251,6 +262,139 @@ static IOMMU: SpinLock<Option<Iommu>> = SpinLock::new(None);
 static STARTED: AtomicBool = AtomicBool::new(false);
 /// What [`init`] established about the platform's IOMMUs.
 static STATUS: SpinLock<pci::IommuStatus> = SpinLock::new(pci::IommuStatus::NotRun);
+
+/// Where a firmware-reserved range comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// A VT-d reserved memory region (DMAR type 1).
+    Rmrr,
+    /// An AMD-Vi memory definition of this type (20h, 21h or 22h) with these flags.
+    Ivmd { kind: u8, flags: u8 },
+}
+
+/// Why bring-up does not identity-map a firmware-reserved range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeRefusal {
+    /// The range breaks one of [`reserved::check`]'s rules.
+    Range(Refusal),
+    /// The platform's register ranges could not be listed, so nothing can be checked against
+    /// them.
+    NoRegisterList,
+}
+
+impl core::fmt::Display for RangeRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Range(r) => r.fmt(f),
+            Self::NoRegisterList => f.write_str("the platform's register ranges are not known"),
+        }
+    }
+}
+
+/// A firmware-reserved range and what bring-up made of it (ADR-0007 questions 4 and 8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReservedRange {
+    /// The structure's offset in its table.
+    pub offset: usize,
+    pub source: Source,
+    /// What it asks for; `None` for an empty IVMD, or one that wraps once rounded.
+    pub range: Option<Reserved>,
+    /// `Ok`: identity-mapped for each named device its driver attaches (or, never-map, kept
+    /// out of their domains). `Err`: not mapped, and the devices it names are refused.
+    pub verdict: Result<(), RangeRefusal>,
+}
+
+/// Judges one range against the platform (`registers` `None`: they could not be listed).
+fn judge(
+    offset: usize,
+    source: Source,
+    range: Result<Option<Reserved>, Refusal>,
+    width: u8,
+    memory_map: &[MemoryRegion],
+    registers: Option<&[(u64, u64)]>,
+    amd: bool,
+) -> ReservedRange {
+    let (range, verdict) = match range {
+        Err(why) => (None, Err(RangeRefusal::Range(why))),
+        Ok(None) => (None, Ok(())),
+        Ok(Some(r)) => {
+            let verdict = match registers {
+                None if r.use_ != Use::NeverMap => Err(RangeRefusal::NoRegisterList),
+                registers => reserved::check(
+                    &r,
+                    width,
+                    &Platform {
+                        memory_map,
+                        registers: registers.unwrap_or(&[]),
+                        amd,
+                    },
+                )
+                .map_err(RangeRefusal::Range),
+            };
+            (Some(r), verdict)
+        }
+    };
+    ReservedRange {
+        offset,
+        source,
+        range,
+        verdict,
+    }
+}
+
+/// Tells the memory manager which firmware memory devices may now write (every accepted
+/// identity range with write access), so no reference to it is ever handed out.
+fn note_writable(ranges: &[ReservedRange]) {
+    for r in ranges.iter().filter(|r| r.verdict.is_ok()) {
+        if let Some(Reserved {
+            span,
+            use_: Use::Identity(Access { write: true, .. }),
+        }) = r.range
+        {
+            crate::vm::device_writable(span.base, span.end);
+        }
+    }
+}
+
+/// The boot report's line for `r`, which names `devices`.
+fn report_range(com1: &mut dyn Write, r: &ReservedRange, devices: &str) {
+    let what = match r.source {
+        Source::Rmrr => alloc::format!("RMRR at offset {:#x}", r.offset),
+        Source::Ivmd { kind, flags } => alloc::format!(
+            "IVMD type {kind:#x} at offset {:#x}, flags {flags:#06b}",
+            r.offset
+        ),
+    };
+    let span = match r.range {
+        Some(Reserved { span, .. }) => alloc::format!("{:#x}-{:#x}", span.base, span.end - 1),
+        None => alloc::string::String::from("(empty)"),
+    };
+    let outcome = match (r.verdict, r.range.map(|x| x.use_)) {
+        (Err(why), _) => alloc::format!("refused ({why}), so the devices it names cannot be attached"),
+        (Ok(()), None) => alloc::string::String::from("maps nothing"),
+        (Ok(()), Some(Use::NeverMap)) => {
+            alloc::string::String::from("never mapped for the devices it names")
+        }
+        (Ok(()), Some(Use::Identity(a))) => alloc::format!(
+            "identity-mapped, {}, in the domain of each device it names that a driver attaches",
+            access_words(a)
+        ),
+    };
+    let _ = writeln!(
+        com1,
+        "origin-kernel: IOMMU: reserved memory {span} ({what}; {devices}): {outcome}"
+    );
+}
+
+/// "read and write", "read only" or "write only".
+pub fn access_words(a: Access) -> &'static str {
+    match (a.read, a.write) {
+        (true, true) => "read and write",
+        (true, false) => "read only",
+        (false, true) => "write only",
+        (false, false) => "no access",
+    }
+}
 
 /// What `firmware::acpi_table` says when the XSDT does not list a table: the one failure that
 /// means the table is really absent, not unreadable.
@@ -598,13 +742,24 @@ fn enable(unit: &mut Unit, remap: bool) -> Result<(), &'static str> {
 /// a platform with neither table is reported and left untranslated (the owner's decision,
 /// sheet item 9: internal devices may still bind). A table that exists but cannot be read is a
 /// failure, not an absence.
-pub fn init(com1: &mut dyn Write, rsdp: u64, config: ConfigRead) -> bool {
+///
+/// `memory_map` is the loader's, and `registers` every platform register range (the IOMMUs',
+/// the APICs', the HPET's, every ECAM window), or `None` if they could not be listed: a
+/// firmware-reserved range is identity-mapped only if it lies in reserved or runtime memory
+/// and clear of all of them ([`reserved::check`]).
+pub fn init(
+    com1: &mut dyn Write,
+    rsdp: u64,
+    config: ConfigRead,
+    memory_map: &'static [MemoryRegion],
+    registers: Option<&[(u64, u64)]>,
+) -> bool {
     // Once: the hardware is brought up by the first call, and a later one must not disturb it.
     if STARTED.swap(true, Ordering::AcqRel) {
         return false;
     }
     let _ = CONFIG_READ.set(config);
-    let status = bring_up_all(com1, rsdp);
+    let status = bring_up_all(com1, rsdp, memory_map, registers);
     crate::cpu::without_interrupts(|| *STATUS.lock() = status);
     status != pci::IommuStatus::Failed
 }
@@ -632,7 +787,12 @@ pub fn register_ranges(rsdp: u64) -> Result<Vec<(u64, u64)>, &'static str> {
 }
 
 /// The VT-d or AMD-Vi bring-up itself, and what it found.
-fn bring_up_all(com1: &mut dyn Write, rsdp: u64) -> pci::IommuStatus {
+fn bring_up_all(
+    com1: &mut dyn Write,
+    rsdp: u64,
+    memory_map: &'static [MemoryRegion],
+    registers: Option<&[(u64, u64)]>,
+) -> pci::IommuStatus {
     use pci::IommuStatus::{Absent, Failed, Translating};
     let failed = |com1: &mut dyn Write, why: &str| {
         let _ = writeln!(
@@ -648,7 +808,7 @@ fn bring_up_all(com1: &mut dyn Write, rsdp: u64) -> pci::IommuStatus {
         Ok(None) => {
             return match acpi_table_if_listed(rsdp, b"IVRS") {
                 Ok(Some(ivrs)) => {
-                    if amd::init(com1, ivrs) {
+                    if amd::init(com1, ivrs, memory_map, registers) {
                         Translating
                     } else {
                         Failed
@@ -694,18 +854,6 @@ fn bring_up_all(com1: &mut dyn Write, rsdp: u64) -> pci::IommuStatus {
             units.len()
         );
         return Failed;
-    }
-    for r in dmar.reserved_memory() {
-        // Identity-mapping a reserved region into its devices' domains is not implemented
-        // yet (ADR-0007): such a device is refused at `attach`, so its DMA stays blocked
-        // rather than reaching memory unchecked. QEMU's q35 reports none.
-        let _ = writeln!(
-            com1,
-            "origin-kernel: IOMMU: reserved memory {:#x}-{:#x} for {} device scope(s): not identity-mapped yet, so those devices cannot be attached",
-            r.base,
-            r.limit,
-            r.scopes().count()
-        );
     }
     let mut running = Vec::with_capacity(units.len());
     for (i, u) in units.iter().enumerate() {
@@ -802,11 +950,57 @@ fn bring_up_all(com1: &mut dyn Write, rsdp: u64) -> pci::IommuStatus {
         .iter()
         .all(|u| u.regs.read32(reg::GSTS) & gcmd::TE != 0);
     let remapping = running.iter().all(|u| u.irt.is_some());
+    // Every RMRR, judged once: a device it names gets it identity-mapped, read and write, when
+    // its driver attaches it (VT-d §3.16; ledger R1), if the range passes every check. The
+    // narrowest unit and the host address width bound it.
+    let width = running
+        .iter()
+        .map(|u| 12 + 9 * u.levels)
+        .chain(core::iter::once(
+            u8::try_from(dmar.host_address_width).unwrap_or(64),
+        ))
+        .min()
+        .unwrap_or(39);
+    let reserved: Vec<ReservedRange> = dmar
+        .reserved_memory()
+        .map(|m| {
+            judge(
+                m.offset,
+                Source::Rmrr,
+                Ok(reserved::from_rmrr(m.base, m.limit)),
+                width,
+                memory_map,
+                registers,
+                false,
+            )
+        })
+        .collect();
+    note_writable(&reserved);
+    for (r, m) in reserved.iter().zip(dmar.reserved_memory()) {
+        let mut devices = alloc::string::String::new();
+        for (i, sc) in m.scopes().enumerate() {
+            let named = sc
+                .resolve(m.segment, &mut Config)
+                .map(|r| alloc::format!("{:02x}:{:02x}.{}", r.bus, r.device, r.function));
+            let _ = write!(
+                devices,
+                "{}{} {}",
+                if i == 0 { "" } else { ", " },
+                match sc.kind {
+                    dmar::ScopeKind::Bridge => "below",
+                    _ => "for",
+                },
+                named.as_deref().unwrap_or("an unresolved path")
+            );
+        }
+        report_range(com1, r, &devices);
+    }
     crate::cpu::without_interrupts(|| {
         *IOMMU.lock() = Some(Iommu {
             dmar,
             units: running,
             domains: Vec::new(),
+            reserved,
             translating,
             remapping,
         });
@@ -863,13 +1057,28 @@ impl Iommu {
         if let Some(i) = self.domains.iter().position(|d| d.requester == r) {
             return Ok(Domain(i));
         }
-        if self
-            .dmar
-            .reserved_memory()
-            .any(|m| m.segment == r.segment && m.covers(r, &mut Config))
-        {
-            return Err("it needs reserved memory identity-mapped, which is not implemented");
+        // The reserved ranges the firmware names for it (ADR-0007 I11, question 4): all must
+        // have passed bring-up's checks, and they must not ask for a page to be both mapped
+        // and never mapped.
+        let mut ranges: Vec<Reserved> = Vec::new();
+        for m in self.dmar.reserved_memory() {
+            if m.segment != r.segment || !m.covers(r, &mut Config) {
+                continue;
+            }
+            let judged = self
+                .reserved
+                .iter()
+                .find(|j| j.offset == m.offset)
+                .ok_or("its reserved memory was not judged")?;
+            if judged.verdict.is_err() {
+                return Err(
+                    "the firmware names reserved memory for it that the kernel does not trust (see the IOMMU's boot report)",
+                );
+            }
+            ranges.extend(judged.range);
         }
+        let identity = reserved::merge(&ranges)
+            .map_err(|_| "its reserved ranges ask for a page to be both mapped and never mapped")?;
         let ui = self.unit_of(r)?;
         let unit = self.units.get_mut(ui).ok_or("no unit")?;
         let coherent = unit.ecap.coherent;
@@ -881,6 +1090,26 @@ impl Iommu {
         // context entry behind, and that domain ID must never go to another device.
         unit.next_domain += 1;
         let top = Page::new(coherent).ok_or("no memory for a page table")?;
+        // The identity maps first, so the device never sees its domain without them (ledger
+        // R1). Read and write separately, as the firmware gives them; SNP as for every leaf.
+        let mut tables = Tables { coherent, made: 0 };
+        for &(span, access) in &identity {
+            let mut page = span.base;
+            while page < span.end {
+                vtd::map(
+                    &mut tables,
+                    top.phys,
+                    unit.levels,
+                    page,
+                    page,
+                    access,
+                    unit.ecap.snoop_control,
+                )
+                .map_err(|_| "a reserved page could not be identity-mapped")?;
+                page += PAGE;
+            }
+        }
+        let made = tables.made;
         let bus = usize::from(r.bus);
         let context = match unit.contexts.get(bus).copied().flatten() {
             Some(c) => c,
@@ -939,7 +1168,8 @@ impl Iommu {
             window: IovaWindow::new(vtd::IOVA_BASE, vtd::IOVA_END),
             mapped: 0,
             mapped_ever: 0,
-            tables: 1,
+            tables: 1 + made,
+            identity,
         });
         Ok(Domain(self.domains.len() - 1))
     }
@@ -947,9 +1177,10 @@ impl Iommu {
     fn map(&mut self, d: Domain, phys: u64) -> Result<u64, &'static str> {
         let dom = self.domains.get_mut(d.0).ok_or("no such domain")?;
         let unit = self.units.get_mut(dom.unit).ok_or("no unit")?;
+        let holes = holes(&dom.identity);
         let iova = dom
             .window
-            .alloc(1)
+            .alloc_skipping(1, &holes)
             .ok_or("the domain's IOVA window is full")?;
         let mut tables = Tables {
             coherent: unit.ecap.coherent,
@@ -986,6 +1217,9 @@ impl Iommu {
 
     fn unmap(&mut self, d: Domain, iova: u64) -> Result<u64, &'static str> {
         let dom = self.domains.get_mut(d.0).ok_or("no such domain")?;
+        if dom.identity.iter().any(|(s, _)| s.contains(iova)) {
+            return Err("an identity-mapped reserved page is never unmapped");
+        }
         let unit = self.units.get_mut(dom.unit).ok_or("no unit")?;
         let mut tables = Tables {
             coherent: unit.ecap.coherent,
@@ -1430,10 +1664,53 @@ pub fn take_faults() -> (Vec<Fault>, bool) {
 #[derive(Clone, Copy, Debug)]
 pub struct DomainInfo {
     pub at: Address,
+    /// The domain, for [`translate`].
+    pub domain: Domain,
     pub id: u16,
     pub mapped: u64,
     pub mapped_ever: u64,
     pub tables: u64,
+    /// Firmware-reserved pages identity-mapped for the device.
+    pub identity_pages: u64,
+}
+
+/// How many pages `identity` maps.
+fn identity_pages(identity: &[(Span, Access)]) -> u64 {
+    identity.iter().map(|(s, _)| s.len() / PAGE).sum()
+}
+
+/// A domain's identity spans as the window's holes.
+fn holes(identity: &[(Span, Access)]) -> Vec<(u64, u64)> {
+    identity.iter().map(|(s, _)| (s.base, s.end)).collect()
+}
+
+/// Every firmware-reserved range (RMRR or IVMD) and what bring-up made of it.
+pub fn reserved_ranges() -> Vec<ReservedRange> {
+    if amd::active() {
+        return amd::reserved_ranges();
+    }
+    crate::cpu::without_interrupts(|| {
+        IOMMU
+            .lock()
+            .as_ref()
+            .map(|s| s.reserved.clone())
+            .unwrap_or_default()
+    })
+}
+
+/// The firmware-reserved spans identity-mapped in domain `d`, with their access.
+pub fn identity_spans(d: Domain) -> Vec<(Span, Access)> {
+    if amd::active() {
+        return amd::identity_spans(d);
+    }
+    crate::cpu::without_interrupts(|| {
+        IOMMU
+            .lock()
+            .as_ref()
+            .and_then(|s| s.domains.get(d.0))
+            .map(|dom| dom.identity.clone())
+            .unwrap_or_default()
+    })
 }
 
 /// Every attached device's domain, and the IRTEs in use on all units.
@@ -1449,7 +1726,9 @@ pub fn domains() -> (Vec<DomainInfo>, usize) {
         let list = s
             .domains
             .iter()
-            .map(|d| DomainInfo {
+            .enumerate()
+            .map(|(i, d)| DomainInfo {
+                domain: Domain(i),
                 at: Address {
                     bus: d.requester.bus,
                     device: d.requester.device,
@@ -1459,6 +1738,7 @@ pub fn domains() -> (Vec<DomainInfo>, usize) {
                 mapped: d.mapped,
                 mapped_ever: d.mapped_ever,
                 tables: d.tables,
+                identity_pages: identity_pages(&d.identity),
             })
             .collect();
         let irtes = s

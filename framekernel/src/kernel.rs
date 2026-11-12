@@ -250,9 +250,21 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // compatibility-format I/O APIC proof above, which interrupt remapping would block.
         // It runs whether or not the bus-master quiesce succeeded: confining a device that kept
         // mastering the bus is exactly what a failed quiesce leaves to it.
+        // Firmware-reserved ranges are identity-mapped only clear of every platform register
+        // range (ADR-0007 questions 4 and 8): listed here, or `None` if they cannot be, and
+        // then no range is trusted.
+        let registers = quiesced
+            .as_ref()
+            .and_then(|q| pcie::reserved_ranges(&mut com1, q, info.acpi_rsdp));
         proofs.record(
             Proof::Iommu,
-            iommu::init(&mut com1, info.acpi_rsdp, pcie::read_config32),
+            iommu::init(
+                &mut com1,
+                info.acpi_rsdp,
+                pcie::read_config32,
+                regions,
+                registers.as_deref(),
+            ),
         );
         if iommu::translating() {
             let _ = writeln!(
@@ -300,7 +312,13 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
             && !early.start_heap(&mut com1)
             && !early.prove_user_isolation(&mut com1)
             && early.enable_simd() == xcr0
-            && !iommu::init(&mut com1, info.acpi_rsdp, pcie::read_config32);
+            && !iommu::init(
+                &mut com1,
+                info.acpi_rsdp,
+                pcie::read_config32,
+                regions,
+                None,
+            );
         let _ = writeln!(
             com1,
             "origin-kernel: boot steps: out of turn refused {out_of_turn}; a second run refused {once}{}",

@@ -1768,8 +1768,17 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
     for d in &domains {
         let _ = write!(
             com1,
-            " {} domain {} ({} pages mapped, {} ever, {} table pages);",
-            d.at, d.id, d.mapped, d.mapped_ever, d.tables
+            " {} domain {} ({} pages mapped, {} ever, {} table pages{});",
+            d.at,
+            d.id,
+            d.mapped,
+            d.mapped_ever,
+            d.tables,
+            if d.identity_pages == 0 {
+                alloc::string::String::new()
+            } else {
+                alloc::format!(", {} reserved pages identity-mapped", d.identity_pages)
+            }
         );
     }
     let quiet = !attached_fault && !lost_before;
@@ -1782,5 +1791,156 @@ pub(crate) fn prove_iommu(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64) ->
         if lost_before { " (some lost)" } else { "" },
         if quiet { "" } else { ": IOMMU failed" }
     );
-    translated && blocked && remapped && blocked_irq && quiet
+    let reserved = prove_reserved(com1, domain, at);
+    translated && blocked && remapped && blocked_irq && quiet && reserved
+}
+
+/// The page of scratch blocks the reserved-memory proof writes: in the data partition, apart
+/// from every other proof's.
+const RESERVED_LBA: u64 = 24_576;
+
+/// A copy of the firmware memory page at `phys`, read with volatile reads (a device may write
+/// it), or `None` if the memory map does not call it the firmware's.
+fn firmware_page(phys: u64) -> Option<[u8; PAGE as usize]> {
+    let mut out = [0u8; PAGE as usize];
+    origin_frame::vm::read_firmware(PhysAddr::new(phys), &mut out).ok()?;
+    Some(out)
+}
+
+/// The DMA faults recorded since the last call that came from source ID `sid` and name
+/// `address` (or, where the IOMMU records none, address 0).
+fn faults_at(sid: u16, address: u64) -> Option<crate::iommu::Fault> {
+    let (faults, _) = crate::iommu::take_faults();
+    let address_ok = |a: u64| a == address || (a == 0 && !crate::iommu::fault_address_required());
+    faults
+        .into_iter()
+        .find(|f| f.source_id == sid && !f.interrupt && address_ok(f.address))
+}
+
+/// Pages of each identity span the reserved-memory proof drives DMA through.
+const RESERVED_PROOF_PAGES: u64 = 4;
+
+/// ADR-0007 questions 4 and 8 (TASKS item 40): firmware-reserved memory the NVMe controller's
+/// domain identity-maps is reached at its own physical address, with exactly the access the
+/// firmware gave, and by no device the firmware did not name. For each page of each identity
+/// span (the first [`RESERVED_PROOF_PAGES`] of a longer one): the domain's tables map it to
+/// itself; the controller's write into it (a read of the pattern blocks at LBA 2048) lands
+/// there, or, without write access, is blocked and recorded; its read of it (a write to the
+/// scratch blocks, read back through an ordinary DMA page) gives what the page holds, or,
+/// without read access, is blocked and recorded; every other domain maps the page to itself
+/// only if the firmware names it for that device too. With no identity span (QEMU's own
+/// tables have no RMRR or IVMD), it says so and proves nothing.
+fn prove_reserved(com1: &mut Console, domain: crate::iommu::Domain, at: pci::Address) -> bool {
+    let spans = crate::iommu::identity_spans(domain);
+    let ranges = crate::iommu::reserved_ranges();
+    let refused = ranges.iter().filter(|r| r.verdict.is_err()).count();
+    if spans.is_empty() {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: reserved memory: none is identity-mapped for the NVMe controller ({} range(s) named by the firmware, {refused} refused), so the proofs through it did not run",
+            ranges.len()
+        );
+        return true;
+    }
+    let sid = crate::iommu::source_id(at);
+    let (domains, _) = crate::iommu::domains();
+    let Some(plain) = dma_page() else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: reserved memory: no memory for a probe page: IOMMU failed"
+        );
+        return false;
+    };
+    let mut expected = [0u8; PAGE as usize];
+    for (k, block) in expected.chunks_mut(512).enumerate() {
+        pattern(PROBE_LBA + k as u64, block);
+    }
+    let _ = crate::iommu::take_faults();
+    let mut all = true;
+    let pages = spans.iter().flat_map(|&(span, access)| {
+        (0..(span.len() / PAGE).min(RESERVED_PROOF_PAGES))
+            .map(move |k| (span.base + k * PAGE, access))
+    });
+    for (page, access) in pages {
+        let walked = crate::iommu::translate(domain, origin_frame::addr::Iova::new(page));
+        let identity = walked == Some((page, access));
+        // The controller writes into the page: the pattern blocks read from the disk.
+        let before = firmware_page(page);
+        let wrote = transfer_status(false, PROBE_LBA, page, 8).ok();
+        let after = firmware_page(page);
+        let write_fault = faults_at(sid, page);
+        let write_ok = if access.write {
+            wrote.is_some_and(|s| s.ok()) && after == Some(expected) && write_fault.is_none()
+        } else {
+            before.is_some() && after == before && write_fault.is_some()
+        };
+        // The controller reads the page: written to the scratch blocks (zeroed first through
+        // an ordinary DMA page), then read back through that page.
+        plain.fill(&[0u8; PAGE as usize]);
+        let zeroed = transfer_status(true, RESERVED_LBA, plain.bus().raw(), 8)
+            .ok()
+            .is_some_and(|s| s.ok());
+        let sent = transfer_status(true, RESERVED_LBA, page, 8).ok();
+        let read_fault = faults_at(sid, page);
+        plain.fill(&[CANARY; PAGE as usize]);
+        let back = transfer_status(false, RESERVED_LBA, plain.bus().raw(), 8)
+            .ok()
+            .is_some_and(|s| s.ok());
+        let disk = plain.to_bytes();
+        let read_ok = zeroed
+            && back
+            && if access.read {
+                sent.is_some_and(|s| s.ok()) && Some(disk) == after && read_fault.is_none()
+            } else {
+                disk == [0u8; PAGE as usize] && read_fault.is_some()
+            };
+        // No other domain reaches the page unless the firmware names it for that device too.
+        let mut others = alloc::string::String::new();
+        let mut others_ok = true;
+        for d in domains.iter().filter(|d| d.at != at) {
+            let named = crate::iommu::identity_spans(d.domain)
+                .iter()
+                .any(|(s, _)| s.contains(page));
+            let there = crate::iommu::translate(d.domain, origin_frame::addr::Iova::new(page));
+            let fine = if named {
+                there.is_some_and(|(p, _)| p == page)
+            } else {
+                there.is_none()
+            };
+            others_ok &= fine;
+            let _ = write!(
+                others,
+                "{}{} {}",
+                if others.is_empty() { "" } else { ", " },
+                d.at,
+                if named {
+                    "maps it too, as the firmware names it"
+                } else if there.is_none() {
+                    "does not map it"
+                } else {
+                    "maps it, unnamed"
+                }
+            );
+        }
+        let ok = identity && write_ok && read_ok && others_ok;
+        all &= ok;
+        let _ = writeln!(
+            com1,
+            "origin-kernel: IOMMU: reserved memory proof: page {page:#x} ({}) in the NVMe controller's domain maps to itself: {identity}; the controller's write of LBA {PROBE_LBA} into it {}: {write_ok}; its read of it to LBA {RESERVED_LBA} {}: {read_ok}; other domains: {}; consistent {ok}{}",
+            crate::iommu::access_words(access),
+            if access.write {
+                "landed there"
+            } else {
+                "was blocked and recorded"
+            },
+            if access.read {
+                "carried what the page holds"
+            } else {
+                "was blocked and recorded"
+            },
+            if others.is_empty() { "none" } else { &others },
+            if ok { "" } else { ": IOMMU failed" }
+        );
+    }
+    all
 }

@@ -8,6 +8,7 @@
 //! none. Kernel-half mappings are global; the identity pages of the AP trampoline are not.
 //! Nothing here splits a page of the direct map after boot.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use origin_paging::layout::{DIRECT_MAP_WINDOW, DIRECT_MAP_WINDOW_SIZE, STACK_REGION_SIZE};
@@ -515,6 +516,76 @@ pub fn map_mmio(phys: PhysAddr, len: u64) -> Result<MmioRegion, MmioError> {
     Ok(unsafe { MmioRegion::from_mapped(virt as usize, len as usize, phys) })
 }
 
+/// Firmware memory a device may write by DMA: the reserved ranges the IOMMU identity-maps
+/// writable ([`device_writable`]). [`firmware_bytes`] never hands these out as a reference.
+static DEVICE_WRITABLE: SpinLock<Vec<(u64, u64)>> = SpinLock::new(Vec::new());
+
+/// Records that devices may write firmware memory `[base, end)` from now on (the IOMMU calls
+/// this before it can map such a range). Only [`read_firmware`] reads it afterwards.
+pub fn device_writable(base: u64, end: u64) {
+    crate::cpu::without_interrupts(|| DEVICE_WRITABLE.lock().push((base, end)));
+}
+
+/// Whether a device may write any of `[raw, end)`.
+fn device_may_write(raw: u64, end: u64) -> bool {
+    crate::cpu::without_interrupts(|| {
+        DEVICE_WRITABLE
+            .lock()
+            .iter()
+            .any(|&(b, e)| b < end && raw < e)
+    })
+}
+
+/// Whether `[raw, end)` is memory the firmware described as its own (reserved, ACPI, runtime
+/// or device memory): never RAM the kernel owns or will own.
+fn is_firmware_data(raw: u64, end: u64) -> bool {
+    let firmware = [
+        RegionKind::Reserved,
+        RegionKind::AcpiReclaimable,
+        RegionKind::AcpiNvs,
+        RegionKind::Mmio,
+        RegionKind::RuntimeCode,
+        RegionKind::RuntimeData,
+    ]
+    .map(|kind| kind as u32);
+    crate::cpu::without_interrupts(|| {
+        KERNEL_SPACE.lock().as_ref().is_some_and(|k| {
+            !k.memory_map.iter().any(|r| {
+                r.base < end
+                    && raw < r.base.saturating_add(r.pages.saturating_mul(PAGE))
+                    && !firmware.contains(&r.kind)
+            })
+        })
+    })
+}
+
+/// Copies firmware memory at physical `addr` into `out` with volatile reads, mapping it
+/// read-only first if the kernel does not map it: for memory a device may write by DMA at any
+/// time (a firmware-reserved range the IOMMU identity-maps, ADR-0007 question 4), which no
+/// Rust reference may cover. Refused, as [`firmware_bytes`], unless the memory map says the
+/// whole range is the firmware's own.
+pub fn read_firmware(addr: PhysAddr, out: &mut [u8]) -> Result<(), MapError> {
+    let raw = addr.raw();
+    let len = out.len() as u64;
+    if raw == 0 || len > isize::MAX as u64 {
+        return Err(MapError::Overflow);
+    }
+    let end = raw.checked_add(len).ok_or(MapError::Overflow)?;
+    if !is_firmware_data(raw, end) {
+        return Err(MapError::OutOfMemory);
+    }
+    let virt = map_firmware(raw, len)?;
+    for (i, byte) in out.iter_mut().enumerate() {
+        let p = core::ptr::with_exposed_provenance::<u8>(virt as usize + i);
+        // SAFETY: `[raw, raw + len)` is firmware memory (checked above), mapped readable at its
+        // direct-map address `virt` (just ensured) and not wrapping (checked), so `p` lies in a
+        // live mapping; `u8` has no alignment or validity requirement. Volatile and through a
+        // raw pointer, because a device may be writing it.
+        *byte = unsafe { p.read_volatile() };
+    }
+    Ok(())
+}
+
 /// A readable copy of what the firmware put at physical `[addr, addr + len)` (ACPI tables):
 /// `&'static` because firmware tables do not change after boot. Refused for anything but the
 /// firmware's own data: a range that overlaps memory the kernel owns or will own (`Usable`,
@@ -526,27 +597,8 @@ pub fn firmware_bytes(addr: PhysAddr, len: u64) -> Result<&'static [u8], MapErro
         return Err(MapError::Overflow);
     }
     let end = raw.checked_add(len).ok_or(MapError::Overflow)?;
-    // Only memory the firmware described as its own (reserved, ACPI, runtime or device
-    // memory): never RAM the kernel owns or will own.
-    let firmware = [
-        RegionKind::Reserved,
-        RegionKind::AcpiReclaimable,
-        RegionKind::AcpiNvs,
-        RegionKind::Mmio,
-        RegionKind::RuntimeCode,
-        RegionKind::RuntimeData,
-    ]
-    .map(|kind| kind as u32);
-    let is_firmware_data = crate::cpu::without_interrupts(|| {
-        KERNEL_SPACE.lock().as_ref().is_some_and(|k| {
-            !k.memory_map.iter().any(|r| {
-                r.base < end
-                    && raw < r.base.saturating_add(r.pages.saturating_mul(PAGE))
-                    && !firmware.contains(&r.kind)
-            })
-        })
-    });
-    if !is_firmware_data {
+    // Not memory a device may write: a reference to it could change under the reader.
+    if !is_firmware_data(raw, end) || device_may_write(raw, end) {
         return Err(MapError::OutOfMemory);
     }
     let virt = map_firmware(raw, len)?;
