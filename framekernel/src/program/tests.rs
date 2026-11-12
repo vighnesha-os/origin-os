@@ -220,3 +220,10 @@ fn every_base_is_a_page_in_the_region_with_room_for_the_program() {
     );
     assert_eq!(random_base(u64::MAX, 0), None);
 }
+
+#[test]
+fn the_largest_stack_and_its_two_neighbours_fit_the_region() {
+    assert_eq!(MAX_STACK_PAGES * PAGE, MAX_SPAN);
+    let place = random_base(MAX_STACK_PAGES + 2, u64::MAX).unwrap();
+    assert!(place + (MAX_STACK_PAGES + 2) * PAGE <= PROGRAM_HIGH);
+}

@@ -27,6 +27,10 @@ pub const PROGRAM_LOW: u64 = 0x0000_0000_1000_0000;
 pub const PROGRAM_HIGH: u64 = 0x0000_1000_0000_0000;
 /// The largest span a program may have (ONBF §6.1: at most 2 GiB, for the small code model).
 pub const MAX_SPAN: u64 = 1 << 31;
+/// The most pages a carried program's first stack may have: as many as its span may (2 GiB), so
+/// that the stack with its two unmapped neighbours always fits the programs' region and its top
+/// never overflows (S4-1's review, finding F3).
+pub const MAX_STACK_PAGES: u64 = MAX_SPAN / PAGE;
 
 /// How the launch path maps a segment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
