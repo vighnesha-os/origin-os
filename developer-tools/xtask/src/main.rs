@@ -124,11 +124,13 @@ commands:
               only the check the reproducible-build gate makes of each ELF it builds, on
               files named here: `.comment` holds the line .cargo/config.toml fixes for the
               linker, and not the linker's own, which differs between kinds of host
-  core-gate   only the gate on `origin.core` as it was linked: its functions are the stubs of
-              origin.kernel's methods and nothing else; each is the extension of its own
-              narrow parameters, the load of its own number and one `syscall`; and the
-              offsets the kernel accepts each call from are that image's (part of check;
-              ADR-0005 B2, ADR-0011 L6 and L13)
+  core-gate   only the gates on `origin.core` as it was linked and on the programs the kernel
+              carries: the image's functions are the stubs of origin.kernel's methods and
+              nothing else; each is the extension of its own narrow parameters, the load of
+              its own number and one `syscall`; the offsets the kernel accepts each call
+              from are that image's; and no carried program holds a `syscall` instruction,
+              but a proof program its stated one (part of check; ADR-0005 B2, ADR-0011 L6,
+              L8 and L13)
   image-gate [kernel ELF]
               only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
               and no jump table, in the code this build compiled. Builds the kernel first, or
@@ -3477,7 +3479,8 @@ fn check() -> Result {
         build_loader(loader)?;
     }
     image::gate(&build_kernel()?)?;
-    // `origin.core` as that build linked it, against the definition and the kernel's table.
+    // `origin.core` as that build linked it, against the definition and the kernel's table;
+    // and no `syscall` in a program the kernel carries.
     corestubs::gate()?;
     no_panic_check()?;
     dependency_check()?;

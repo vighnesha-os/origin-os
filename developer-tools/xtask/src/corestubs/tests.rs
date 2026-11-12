@@ -553,3 +553,205 @@ fn a_listing_or_a_table_that_does_not_read_is_an_error() {
     assert_eq!(table.exports["origin_kernel_a"], (0x10, (0, 5)));
     assert_eq!(table.pins["a"], 0x15);
 }
+
+// ------------------------------------------------------------------ the carried programs
+
+/// A program's code, as the disassembler lists it: `(function, instructions)`.
+fn program(functions: &[(&str, &[&str])]) -> Vec<Function> {
+    let mut address = 0x1000;
+    functions
+        .iter()
+        .map(|(name, instructions)| {
+            let start = address;
+            let instructions = instructions
+                .iter()
+                .map(|instruction| {
+                    address += 4;
+                    (address - 4, (*instruction).to_string())
+                })
+                .collect();
+            Function {
+                name: (*name).to_string(),
+                address: start,
+                instructions,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn a_program_with_no_syscall_passes_and_one_with_any_is_refused() {
+    let clean = program(&[
+        ("_start", &["xor ebp, ebp", "call 0x1010 <run>", "ud2"]),
+        ("run", &["call qword ptr [rip + 0x2f00]", "ret"]),
+    ]);
+    assert_eq!(
+        program_problems("first-program", &clean, None),
+        Vec::<String>::new()
+    );
+    // A stub compiled into it: today's `asm!` form, inlined, or the stubs' file linked in.
+    let inlined = program(&[
+        ("_start", &["xor ebp, ebp", "call 0x1010 <run>", "ud2"]),
+        ("run", &["mov eax, 0x3", "syscall", "ret"]),
+    ]);
+    let found = program_problems("first-program", &inlined, None);
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert!(
+        found[0].contains("holds 1 `syscall` instructions") && found[0].contains("in `run`"),
+        "{found:#?}"
+    );
+}
+
+#[test]
+fn a_proof_program_is_excepted_for_exactly_its_own_syscall() {
+    let allowed = Some((1, "own_syscall"));
+    let as_meant = program(&[
+        (
+            "_ZN11pin_program3raw11own_syscall17h0123456789abcdefE",
+            &["mov rax, rdi", "mov rdi, rsi", "syscall", "ret"],
+        ),
+        ("run", &["call qword ptr [rip + 0x2f00]", "ret"]),
+    ]);
+    assert_eq!(
+        program_problems("pin-program", &as_meant, allowed),
+        Vec::<String>::new()
+    );
+    // One more, anywhere: a stub inlined into the proof program is still caught.
+    let more = program(&[
+        (
+            "_ZN11pin_program3raw11own_syscall17h0123456789abcdefE",
+            &["mov rax, rdi", "syscall", "ret"],
+        ),
+        ("run", &["mov eax, 0x3", "syscall", "ret"]),
+    ]);
+    let found = program_problems("pin-program", &more, allowed);
+    assert!(
+        found[0].contains("holds 2 `syscall` instructions"),
+        "{found:#?}"
+    );
+    // The right number in the wrong function.
+    let elsewhere = program(&[("run", &["mov eax, 0x3", "syscall", "ret"])]);
+    assert_eq!(
+        program_problems("pin-program", &elsewhere, allowed).len(),
+        1
+    );
+    // None at all: the proof's forbidden call has gone, and the list must change with it.
+    let none = program(&[("run", &["ret"])]);
+    assert_eq!(program_problems("pin-program", &none, allowed).len(), 1);
+    // The same code in a program that is not excepted is refused.
+    assert_eq!(program_problems("first-program", &as_meant, None).len(), 1);
+}
+
+#[test]
+fn bytes_of_a_program_that_did_not_decode_fail_the_gate() {
+    let lost = program(&[("run", &["mov eax, 0x3", "(bad)", "ret"])]);
+    let found = program_problems("first-program", &lost, None);
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert!(found[0].contains("could not decode"), "{found:#?}");
+}
+
+#[test]
+fn the_code_a_description_names_is_its_read_execute_segments_files() {
+    let description = "pub(crate) static P: Carried = Carried {\n    segments: &[\n        Segment {\n            rva: 0x0,\n            size: 0x1000,\n            access: SegmentAccess::Read,\n            bytes: include_bytes!(concat!(env!(\"ORIGIN_CARRIED_PROGRAMS\"), \"/p.0.bin\")),\n        },\n        Segment {\n            rva: 0x1000,\n            size: 0x3000,\n            access: SegmentAccess::ReadExecute,\n            bytes: include_bytes!(concat!(env!(\"ORIGIN_CARRIED_PROGRAMS\"), \"/p.1.bin\")),\n        },\n        Segment {\n            rva: 0x4000,\n            size: 0x1000,\n            access: SegmentAccess::ReadWrite,\n            bytes: &[],\n        },\n    ],\n};\n";
+    assert_eq!(code_files(description), [(0x1000, "p.1.bin".to_string())]);
+    assert!(code_files("nothing").is_empty());
+}
+
+/// One function at 0x1000 whose instructions start at the given offsets.
+fn listed_at(instructions: &[(u64, &str)]) -> Vec<Function> {
+    vec![Function {
+        name: "run".to_string(),
+        address: 0x1000,
+        instructions: instructions
+            .iter()
+            .map(|(offset, text)| (0x1000 + offset, (*text).to_string()))
+            .collect(),
+    }]
+}
+
+#[test]
+fn each_pair_of_syscalls_bytes_is_placed_against_the_listing() {
+    // mov eax, 3 (5 bytes); syscall (2); ret (1).
+    let code = vec![(0x1000, vec![0xB8, 3, 0, 0, 0, 0x0F, 0x05, 0xC3])];
+    let listing = listed_at(&[(0, "mov eax, 0x3"), (5, "syscall"), (7, "ret")]);
+    assert_eq!(pair_problems("p", &listing, &code), (Vec::new(), 0));
+
+    // The pair as the immediate of a `mov`: inside a listed instruction, counted, not refused.
+    let code = vec![(0x1000, vec![0xB8, 0x0F, 0x05, 0, 0, 0xC3])];
+    let listing = listed_at(&[(0, "mov eax, 0x50f"), (5, "ret")]);
+    assert_eq!(pair_problems("p", &listing, &code), (Vec::new(), 1));
+
+    // The pair across two instructions: the last byte of one and the first of the next.
+    let code = vec![(0x1000, vec![0xB0, 0x0F, 0x05, 1, 0, 0, 0, 0xC3])];
+    let listing = listed_at(&[(0, "mov al, 0xf"), (2, "add eax, 0x1"), (7, "ret")]);
+    assert_eq!(pair_problems("p", &listing, &code), (Vec::new(), 1));
+}
+
+#[test]
+fn a_pair_the_listing_does_not_cover_fails_the_gate() {
+    // After the last listed instruction: nothing shows what those bytes are.
+    let code = vec![(0x1000, vec![0xC3, 0xCC, 0xCC, 0x0F, 0x05])];
+    let listing = listed_at(&[(0, "ret")]);
+    let (problems, inside) = pair_problems("p", &listing, &code);
+    assert_eq!(inside, 0);
+    assert!(
+        problems.len() == 1 && problems[0].contains("listed no instruction over"),
+        "{problems:#?}"
+    );
+    // Before the first.
+    let code = vec![(0x1000, vec![0x0F, 0x05, 0xC3])];
+    let listing = listed_at(&[(2, "ret")]);
+    assert_eq!(pair_problems("p", &listing, &code).0.len(), 1);
+    // Between two listed instructions too far apart for one instruction to reach.
+    let mut bytes = vec![0xC3];
+    bytes.extend([0xCC; 20]);
+    bytes.extend([0x0F, 0x05, 0xC3]);
+    let listing = listed_at(&[(0, "ret"), (23, "ret")]);
+    assert_eq!(pair_problems("p", &listing, &[(0x1000, bytes)]).0.len(), 1);
+    // In a second segment the listing says nothing of.
+    let code = vec![(0x1000, vec![0xC3]), (0x9000, vec![0x90, 0x0F, 0x05, 0xC3])];
+    let listing = listed_at(&[(0, "ret")]);
+    assert_eq!(pair_problems("p", &listing, &code).0.len(), 1);
+}
+
+#[test]
+fn a_listing_and_carried_code_that_are_not_one_program_fail_the_gate() {
+    // The listing has a `syscall` where the carried bytes have none.
+    let code = vec![(0x1000, vec![0xB8, 3, 0, 0, 0, 0x90, 0x90, 0xC3])];
+    let listing = listed_at(&[(0, "mov eax, 0x3"), (5, "syscall"), (7, "ret")]);
+    let (problems, _) = pair_problems("p", &listing, &code);
+    assert!(
+        problems.len() == 1 && problems[0].contains("no such bytes there"),
+        "{problems:#?}"
+    );
+    // The carried bytes have the pair where the listing has another instruction.
+    let code = vec![(0x1000, vec![0x0F, 0x05, 0xC3])];
+    let listing = listed_at(&[(0, "nop"), (2, "ret")]);
+    let (problems, _) = pair_problems("p", &listing, &code);
+    assert!(
+        problems.len() == 1 && problems[0].contains("has another instruction"),
+        "{problems:#?}"
+    );
+}
+
+#[test]
+fn every_excepted_proof_program_is_one_the_kernel_carries() {
+    let carried: Vec<&str> = ring3::program_images(None)
+        .iter()
+        .map(|(package, ..)| *package)
+        .collect();
+    for (package, count, holder) in PROOF_PROGRAMS {
+        assert!(
+            carried.contains(package),
+            "{package} is excepted and not carried"
+        );
+        assert!(*count > 0 && !holder.is_empty());
+    }
+    // And the first program is not excepted: it must hold none.
+    assert!(carried.contains(&"first-program"));
+    assert!(
+        !PROOF_PROGRAMS
+            .iter()
+            .any(|(package, ..)| *package == "first-program")
+    );
+}

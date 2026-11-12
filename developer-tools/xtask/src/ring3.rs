@@ -257,6 +257,15 @@ fn userspace(subcommand: &str, generated: &Generated, target: Option<&Path>) -> 
     Ok(command)
 }
 
+/// Each program the kernel carries: its package, its name in the kernel, and where the linker
+/// writes it. `origin.core` is not one of them.
+pub(crate) fn program_images(target: Option<&Path>) -> Vec<(&'static str, &'static str, PathBuf)> {
+    PROGRAMS
+        .iter()
+        .map(|program| (program.package, program.name, linked(target, program)))
+        .collect()
+}
+
 /// Where the descriptions of one build go: what the kernel's builds name in [`CARRIED_ENV`].
 pub(crate) fn carried_dir(target: Option<&Path>) -> PathBuf {
     ring3_dir(target).join("carried")

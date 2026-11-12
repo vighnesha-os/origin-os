@@ -1,5 +1,6 @@
-//! `cargo xtask check`'s gate on `origin.core` as it was linked (ADR-0005 B2; ADR-0011 Amendment
-//! 2, L4 to L7, and Amendment 3, L13; task S4-2).
+//! `cargo xtask check`'s gates on `origin.core` as it was linked, and on the programs the kernel
+//! carries (ADR-0005 B2; ADR-0011 N13 and Amendment 2, L4 to L8, and Amendment 3, L13; task
+//! S4-2).
 //!
 //! The kernel accepts each call number only from the address of that number's own `syscall`
 //! instruction in `origin.core`. That closes row E8 of the system-call threat model only if the
@@ -40,6 +41,36 @@
 //! (it is the same decoder the image gate trusts), or anything about a program that reaches
 //! the stubs. The kernel's own check of each call is what enforces; this gate is why that check
 //! means what it says.
+//!
+//! # The programs the kernel carries
+//!
+//! The second gate holds each carried program to the other half of L6: it holds no `syscall`
+//! instruction. A program reaches the kernel through `origin.core` alone, by the imports the
+//! launch path binds. The kernel's proof programs are excepted by name (L8), each with the
+//! exact number it holds on purpose and the function that holds them ([`PROOF_PROGRAMS`]): so
+//! a stub inlined into one of them is still one too many.
+//!
+//! This gate is hygiene for first-party code (ADR-0011 N13), not what keeps a program from the
+//! kernel. It reads a linear disassembly, so:
+//!
+//! - It fails if the disassembler could not decode some bytes of a program's code: a sweep
+//!   that has lost its place proves nothing.
+//! - The two bytes of `syscall` inside another instruction (an immediate, a displacement) are
+//!   no instruction of the program. They are counted and printed, not refused: a jump into the
+//!   middle of that instruction would run them, and that is exactly a `syscall` from an
+//!   address no stub has, which the kernel's per-call pin stops (the boot proof "origin.core
+//!   and the call pin" shows a `syscall` in a program's own code stopped). Refusing the byte
+//!   pair would fail a correct program by chance, more often as programs grow.
+//! - Every such pair in the code the kernel carries is placed against the listing
+//!   ([`pair_problems`]): at the address of a listed `syscall`, or between two listed
+//!   instructions that are close enough for one to hold it. A pair anywhere else is in bytes
+//!   the disassembler listed nothing over, and fails the gate. And each listed `syscall` must
+//!   be a pair of the carried code at its address: the listing is of the linker's file, the
+//!   bytes are what the kernel includes, and the two must be one program.
+//! - A limit: data placed among code can put a linear sweep out of step, so that bytes it
+//!   shows as other instructions are in truth a `syscall` reached another way. The compiler
+//!   puts no data in these programs' code, the gate cannot prove that, and it does not need to:
+//!   the pin stops such an instruction too.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -49,6 +80,13 @@ use std::process::Command;
 use oidl::model::{Int, Method, Transport, Type};
 
 use crate::{Result, llvm_tool, read_file, repo_root, ring3};
+
+/// The kernel's proof programs that hold a `syscall` instruction on purpose (ADR-0011 L8): the
+/// package, how many, and the function that holds them, by a part of its symbol's name.
+///
+/// `pin-program` holds one, in `own_syscall`: the boot proof "origin.core and the call pin"
+/// makes a call with it and must see the thread stopped.
+const PROOF_PROGRAMS: &[(&str, usize, &str)] = &[("pin-program", 1, "own_syscall")];
 
 /// The definition the stubs are generated from.
 const DEFINITION: &str = "sdk/interfaces/origin.kernel.oidl";
@@ -529,15 +567,231 @@ fn is_clearing(instruction: &str) -> bool {
         })
 }
 
-/// `cargo xtask core-gate`, and a step of `check`: builds `origin.core` as every build does and
-/// holds what was linked to the rules.
+/// What is wrong with the carried program `package`, whose code is `functions`: bytes the
+/// disassembler could not decode, or a count of `syscall` instructions other than `allowed`
+/// (how many, and in which function), which is none for a program that is no proof program.
+pub(crate) fn program_problems(
+    package: &str,
+    functions: &[Function],
+    allowed: Option<(usize, &str)>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut found: Vec<(&str, u64)> = Vec::new();
+    for function in functions {
+        for (address, instruction) in &function.instructions {
+            if instruction.contains("(bad)") || instruction.contains("<unknown>") {
+                problems.push(format!(
+                    "`{package}`: the disassembler could not decode the bytes at {address:#x} in `{}`: a sweep that has lost its place proves nothing",
+                    function.name
+                ));
+            }
+            if instruction == "syscall" {
+                found.push((&function.name, *address));
+            }
+        }
+    }
+    let places = || {
+        found
+            .iter()
+            .map(|(name, address)| format!("{address:#x} in `{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match allowed {
+        None if !found.is_empty() => problems.push(format!(
+            "the carried program `{package}` holds {} `syscall` instructions ({}): a program reaches the kernel through `origin.core` alone (ADR-0011 L6). Was a stub compiled into it?",
+            found.len(),
+            places()
+        )),
+        Some((count, holder))
+            if found.len() != count || found.iter().any(|(name, _)| !name.contains(holder)) =>
+        {
+            problems.push(format!(
+                "the proof program `{package}` holds {} `syscall` instructions ({}); it is excepted for exactly {count}, in `{holder}` (ADR-0011 L8)",
+                found.len(),
+                places()
+            ));
+        }
+        _ => {}
+    }
+    problems
+}
+
+/// The read-execute segments `description` names, each by its offset from the program's base
+/// and the file that holds its bytes: the code the kernel carries. Each segment of a
+/// description `onbf-pack carried` writes has an `rva:` line, an `access:` line, then a
+/// `bytes:` line that names its file or is `&[]`.
+fn code_files(description: &str) -> Vec<(u64, String)> {
+    let mut files = Vec::new();
+    let mut rva = None;
+    let mut executable = false;
+    for line in description.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("rva: 0x") {
+            rva = u64::from_str_radix(value.trim_end_matches(','), 16).ok();
+        } else if let Some(access) = line.strip_prefix("access: SegmentAccess::") {
+            executable = access.trim_end_matches(',') == "ReadExecute";
+        } else if executable
+            && let Some(rva) = rva
+            && let Some(file) = line
+                .strip_prefix("bytes: include_bytes!(")
+                .and_then(|rest| rest.rsplit_once("\"/"))
+                .and_then(|(_, file)| file.split_once('"'))
+                .map(|(file, _)| file)
+        {
+            files.push((rva, file.to_string()));
+        }
+    }
+    files
+}
+
+/// The longest an x86-64 instruction can be, in bytes (Intel SDM Volume 2, §2.3.11; AMD APM
+/// Volume 3, §1.1).
+const LONGEST_INSTRUCTION: u64 = 15;
+
+/// Places every pair of `syscall`'s two bytes in `code`, the read-execute segments the kernel
+/// carries (each with its address), against the listing of the same program, `functions`.
+/// Returns what is wrong, and how many pairs are no instruction of the program: inside one
+/// listed instruction, or across two.
+///
+/// - A pair at the address of a listed instruction must be a listed `syscall`, and each listed
+///   `syscall` must be such a pair: otherwise the listing and the carried bytes are not one
+///   program.
+/// - Any other pair must lie between two listed instructions no further apart than one
+///   instruction can be long: then the first of them, or the two together, hold it. A pair
+///   anywhere else is in bytes the disassembler listed nothing over.
+///
+/// The bound is the longest instruction, not the listed one's own length, which the listing
+/// does not give: so a pair in a gap of under 15 bytes between two sections' code would pass as
+/// inside the instruction before the gap. The linker fills such gaps itself.
+pub(crate) fn pair_problems(
+    package: &str,
+    functions: &[Function],
+    code: &[(u64, Vec<u8>)],
+) -> (Vec<String>, usize) {
+    let mut listed: Vec<(u64, bool)> = functions
+        .iter()
+        .flat_map(|function| &function.instructions)
+        .map(|(address, instruction)| (*address, instruction == "syscall"))
+        .collect();
+    listed.sort_unstable();
+    let pairs: Vec<u64> = code
+        .iter()
+        .flat_map(|(start, bytes)| {
+            bytes
+                .windows(2)
+                .zip(0u64..)
+                .filter(|(pair, _)| **pair == SYSCALL)
+                .map(move |(_, offset)| start + offset)
+        })
+        .collect();
+    let mut problems = Vec::new();
+    let mut inside = 0;
+    for &at in &pairs {
+        match listed.binary_search_by_key(&at, |&(address, _)| address) {
+            Ok(i) => {
+                if !listed.get(i).is_some_and(|&(_, syscall)| syscall) {
+                    problems.push(format!(
+                        "`{package}`: the code the kernel carries holds the two bytes of `syscall` at {at:#x}, where the listing has another instruction: the listing and the carried code are not one program"
+                    ));
+                }
+            }
+            Err(i) => {
+                let before = i.checked_sub(1).and_then(|i| listed.get(i));
+                match (before, listed.get(i)) {
+                    (Some(&(before, _)), Some(&(after, _)))
+                        if after - before <= LONGEST_INSTRUCTION =>
+                    {
+                        inside += 1;
+                    }
+                    _ => problems.push(format!(
+                        "`{package}`: the code the kernel carries holds the two bytes of `syscall` at {at:#x}, in bytes the disassembler listed no instruction over: nothing shows they are not run"
+                    )),
+                }
+            }
+        }
+    }
+    for &(address, _) in listed.iter().filter(|(_, syscall)| *syscall) {
+        if !pairs.contains(&address) {
+            problems.push(format!(
+                "`{package}`: the listing has a `syscall` at {address:#x}, and the code the kernel carries has no such bytes there: the listing and the carried code are not one program"
+            ));
+        }
+    }
+    (problems, inside)
+}
+
+/// The second gate, over the programs of one build.
+fn programs_gate(
+    programs: &[(&'static str, &'static str, std::path::PathBuf)],
+    carried: &Path,
+) -> Result {
+    if programs.is_empty() {
+        return Err("the kernel carries no program: the gate read nothing".to_string());
+    }
+    let mut problems = Vec::new();
+    let mut said = Vec::new();
+    for (package, name, linked) in programs {
+        let functions = read_listing(&disassemble(linked)?)?;
+        let instructions: usize = functions.iter().map(|f| f.instructions.len()).sum();
+        if instructions == 0 {
+            return Err(format!(
+                "{}: the disassembler listed no instruction of `{package}`: the gate read nothing",
+                linked.display()
+            ));
+        }
+        let allowed = PROOF_PROGRAMS
+            .iter()
+            .find(|(proof, ..)| proof == package)
+            .map(|&(_, count, holder)| (count, holder));
+        problems.extend(program_problems(package, &functions, allowed));
+        // The byte pair in the code the kernel carries, wherever it falls.
+        let description =
+            String::from_utf8_lossy(&read_file(&carried.join(format!("{name}.rs")))?).into_owned();
+        let mut code = Vec::new();
+        for (rva, file) in code_files(&description) {
+            code.push((rva, read_file(&carried.join(file))?));
+        }
+        if code.iter().all(|(_, bytes)| bytes.is_empty()) {
+            return Err(format!(
+                "the description of `{name}` names no read-execute segment's bytes: the gate read nothing"
+            ));
+        }
+        let (unplaced, inside) = pair_problems(package, &functions, &code);
+        problems.extend(unplaced);
+        said.push(match allowed {
+            None => format!(
+                "{package} holds none in {instructions} instructions ({inside} byte pairs inside other instructions)"
+            ),
+            Some((count, holder)) => format!(
+                "{package}, a proof program, holds the {count} it is excepted for, in `{holder}`, in {instructions} instructions ({inside} byte pairs inside other instructions)"
+            ),
+        });
+    }
+    if !problems.is_empty() {
+        return Err(format!(
+            "a program the kernel carries holds a `syscall` it may not ({} problems):\n  {}",
+            problems.len(),
+            problems.join("\n  ")
+        ));
+    }
+    println!(
+        "xtask: carried-program gate: no program the kernel carries holds a `syscall` instruction of its own but a proof program's stated one: {}. A pair of those bytes inside another instruction is no instruction of the program, and a jump into one is stopped by the per-call pin (ADR-0011 L6, L8)",
+        said.join("; ")
+    );
+    Ok(())
+}
+
+/// `cargo xtask core-gate`, and a step of `check`: builds `origin.core` and the carried
+/// programs as every build does and holds what was linked to the rules.
 pub(crate) fn gate() -> Result {
     let carried = ring3::programs(None)?;
     gate_files(
         &ring3::core_linked(None),
         &carried.join(format!("{}.rs", ring3::CORE_NAME)),
         &carried.join(format!("{}.0.bin", ring3::CORE_NAME)),
-    )
+    )?;
+    programs_gate(&ring3::program_images(None), &carried)
 }
 
 #[cfg(test)]
