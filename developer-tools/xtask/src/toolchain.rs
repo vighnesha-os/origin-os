@@ -6,9 +6,10 @@
 //! - **Where the toolchain is installed.** With the `rust-src` component present, the compiler
 //!   names the standard library's source by where it really is, so every panic location in
 //!   library code compiled into Origin's crates held a path under the builder's home
-//!   directory. [`image_config`] gives the three functions that build images the flag that
-//!   writes `/rustc/<commit>` there instead, which is what the compiler itself writes when it
-//!   has no local copy of that source.
+//!   directory. [`image_config`] gives the functions that build the loader, the kernel and its
+//!   libraries the flag that writes `/rustc/<commit>` there instead, which is what the compiler
+//!   itself writes when it has no local copy of that source. [`userspace_config`] gives the
+//!   ring-3 builds the same: the kernel's image holds the bytes of the programs it carries.
 //! - **Compiler flags in the environment.** `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS`, even
 //!   empty, replace every flag `.cargo/config.toml` sets: the frame pointers, the kernel's
 //!   hardening options, the loader's link arguments. The per-target variables add flags the
@@ -22,7 +23,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use crate::{KERNEL_TARGET, Result, UEFI_TARGET, repo_root};
+use crate::ring3::USERSPACE_TARGET;
+use crate::{KERNEL_TARGET, Result, UEFI_TARGET, read_file, repo_root};
 
 /// The pinned toolchain, as the compiler itself reports it.
 #[derive(Debug)]
@@ -31,9 +33,15 @@ pub(crate) struct Toolchain {
     pub(crate) sysroot: PathBuf,
     /// The triple of the machine the compiler runs on.
     pub(crate) host: String,
-    /// The commit the compiler was built from, 40 hexadecimal digits.
+    /// The commit the compiler was built from, 40 hexadecimal digits: the one the repository
+    /// pins in [`PINNED_COMMIT`], which the compiler in use must report too.
     pub(crate) commit: String,
 }
+
+/// The one place the pinned compiler's commit is written (TASKS item 22a). The toolchain
+/// check and CI's install step read it as well, and both fail on a compiler that reports
+/// another.
+const PINNED_COMMIT: &str = "developer-tools/toolchain/rustc-commit-hash";
 
 /// Environment variables `xtask` does not run with, and what each would do. Seen with Cargo
 /// 1.99.1 (`cargo build -v`): the first two replace every `target.<triple>.rustflags` entry
@@ -97,12 +105,52 @@ fn ask_rustc() -> Result<Toolchain> {
     if sysroot.is_empty() {
         return Err("`rustc --print sysroot` printed nothing".into());
     }
-    let (host, commit) = parse_version(&rustc(&["-vV"])?)?;
+    let (host, reported) = parse_version(&rustc(&["-vV"])?)?;
+    let pin = repo_root().join(PINNED_COMMIT);
+    let text =
+        String::from_utf8(read_file(&pin)?).map_err(|_| format!("{PINNED_COMMIT} is not UTF-8"))?;
+    let commit = same_commit(pinned_commit(&text)?, &reported)?;
     Ok(Toolchain {
         sysroot: PathBuf::from(sysroot),
         host,
         commit,
     })
+}
+
+/// The commit [`PINNED_COMMIT`] holds, read as CI's install step reads it: everything from a
+/// `#` to the end of its line is a comment, white space does not count, and what is left must
+/// be 40 lower-case hexadecimal digits.
+fn pinned_commit(text: &str) -> Result<String> {
+    let commit: String = text
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or_default())
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if commit.len() == 40
+        && commit
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        Ok(commit)
+    } else {
+        Err(format!(
+            "{PINNED_COMMIT} does not hold one commit of 40 hexadecimal digits"
+        ))
+    }
+}
+
+/// `pinned`, if the compiler in use reports it. The remap writes `/rustc/<pinned>`, and the
+/// library code the toolchain ships compiled already holds `/rustc/<reported>`: with another
+/// compiler an image would hold both, and would not be the image the repository describes.
+fn same_commit(pinned: String, reported: &str) -> Result<String> {
+    if pinned == reported {
+        Ok(pinned)
+    } else {
+        Err(format!(
+            "rustc reports commit {reported}; the pinned commit is {pinned} ({PINNED_COMMIT}). Build with the toolchain rust-toolchain.toml names"
+        ))
+    }
 }
 
 /// The host triple and the commit from what `rustc -vV` prints. A report without a full
@@ -128,14 +176,27 @@ fn parse_version(report: &str) -> Result<(String, String)> {
     Ok((host, commit))
 }
 
-/// `--config` arguments for a `cargo` command that builds an image or a library that goes
-/// into one. They add, for both freestanding targets, a remap of the toolchain's source
-/// directory to `/rustc/<commit>`. Cargo joins them to the flags `.cargo/config.toml` holds.
+/// `--config` arguments for a `cargo` command that builds the loader, the kernel, or a
+/// library that goes into one. They add, for both freestanding targets, a remap of the
+/// toolchain's source directory to `/rustc/<commit>`. Cargo joins them to the flags
+/// `.cargo/config.toml` holds.
 pub(crate) fn image_config() -> Result<Vec<String>> {
+    config_for(&[UEFI_TARGET, KERNEL_TARGET])
+}
+
+/// The same for a ring-3 build, whose target is the userspace triple. Given after
+/// `.cargo/userspace.toml`, it is joined to that file's flags. It is not part of
+/// [`image_config`]: on CI the userspace triple is the host's own.
+pub(crate) fn userspace_config() -> Result<Vec<String>> {
+    config_for(&[USERSPACE_TARGET])
+}
+
+/// `--config target.<triple>.rustflags=[the remap]` for each of `targets`.
+fn config_for(targets: &[&str]) -> Result<Vec<String>> {
     let toolchain = toolchain()?;
     let flags = remap_flags(&source_directories(&toolchain.sysroot), &toolchain.commit)?;
-    Ok([UEFI_TARGET, KERNEL_TARGET]
-        .into_iter()
+    Ok(targets
+        .iter()
         .flat_map(|target| {
             [
                 "--config".to_string(),
@@ -319,6 +380,79 @@ mod tests {
             let error = parse_version(&change).expect_err("an incomplete report");
             assert!(error.contains(said), "{error}");
         }
+    }
+
+    #[test]
+    fn the_pinned_commit_is_read_as_ci_reads_it() {
+        let commit = "58cf8f9c35b355199727627d07ae34a4e2846d67";
+        for text in [
+            format!("{commit}\n"),
+            format!("# The commit of the pinned compiler.\n# Two lines of comment.\n{commit}\n"),
+            format!("  {commit}  # the 1.99.1 release\n\n"),
+            format!("{}\n{}\n", &commit[..20], &commit[20..]),
+        ] {
+            assert_eq!(pinned_commit(&text).as_deref(), Ok(commit), "{text:?}");
+        }
+        for text in [
+            String::new(),
+            "# only a comment\n".to_string(),
+            format!("{}\n", &commit[..39]),
+            format!("{commit}0\n"),
+            format!("{commit}\n{commit}\n"),
+            format!("{}\n", commit.to_uppercase()),
+            format!("#{commit}\n"),
+            "unknown\n".to_string(),
+        ] {
+            let error = pinned_commit(&text).expect_err("not one commit");
+            assert!(
+                error.contains("does not hold one commit"),
+                "{text:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn this_repositorys_pin_is_the_compiler_in_use() {
+        let text = String::from_utf8(
+            read_file(&repo_root().join(PINNED_COMMIT)).expect("the pin is in the repository"),
+        )
+        .expect("the pin is text");
+        let pinned = pinned_commit(&text).expect("the pin holds one commit");
+        assert_eq!(
+            toolchain()
+                .expect("the pinned toolchain is installed")
+                .commit,
+            pinned
+        );
+    }
+
+    #[test]
+    fn a_compiler_that_is_not_the_pinned_one_is_refused() {
+        let pinned = "58cf8f9c35b355199727627d07ae34a4e2846d67".to_string();
+        assert_eq!(same_commit(pinned.clone(), &pinned), Ok(pinned.clone()));
+        let other = "0123456789abcdef0123456789abcdef01234567";
+        let error = same_commit(pinned.clone(), other).expect_err("another compiler");
+        assert!(error.contains(other) && error.contains(&pinned), "{error}");
+        assert!(error.contains(PINNED_COMMIT), "{error}");
+    }
+
+    #[test]
+    fn the_ring_3_builds_get_the_remap_for_their_own_triple_alone() {
+        let config = userspace_config().expect("the pinned toolchain is installed");
+        assert_eq!(config.len(), 2);
+        assert_eq!(config[0], "--config");
+        assert!(
+            config[1]
+                .starts_with("target.x86_64-unknown-linux-gnu.rustflags=[\"--remap-path-prefix="),
+            "{}",
+            config[1]
+        );
+        // The freestanding builds do not name the userspace triple, which is CI's host.
+        let images = image_config().expect("the pinned toolchain is installed");
+        assert!(
+            images.iter().all(|entry| !entry.contains(USERSPACE_TARGET)),
+            "{images:?}"
+        );
     }
 
     #[test]
