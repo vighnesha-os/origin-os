@@ -47,10 +47,10 @@
 use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::vec::Vec;
 use core::arch::asm;
-use origin_boot_info::MemoryRegion;
 use core::fmt::Write;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering, fence};
+use origin_boot_info::MemoryRegion;
 
 use crate::addr::{Iova, PhysAddr};
 use crate::amdvi;
@@ -370,7 +370,9 @@ fn report_range(com1: &mut dyn Write, r: &ReservedRange, devices: &str) {
         None => alloc::string::String::from("(empty)"),
     };
     let outcome = match (r.verdict, r.range.map(|x| x.use_)) {
-        (Err(why), _) => alloc::format!("refused ({why}), so the devices it names cannot be attached"),
+        (Err(why), _) => {
+            alloc::format!("refused ({why}), so the devices it names cannot be attached")
+        }
         (Ok(()), None) => alloc::string::String::from("maps nothing"),
         (Ok(()), Some(Use::NeverMap)) => {
             alloc::string::String::from("never mapped for the devices it names")

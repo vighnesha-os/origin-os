@@ -894,8 +894,9 @@ impl AmdVi {
         let (ui, c) = self.resolve(at)?;
         let requester = c.requester;
         let ranges = self.ranges_for(ui, at, requester)?;
-        let identity = reserved::merge(&ranges)
-            .map_err(|_| "its memory definitions ask for a page to be both mapped and never mapped")?;
+        let identity = reserved::merge(&ranges).map_err(
+            |_| "its memory definitions ask for a page to be both mapped and never mapped",
+        )?;
         let never = reserved::never_mapped(&ranges);
         if let Some(i) = self
             .domains
