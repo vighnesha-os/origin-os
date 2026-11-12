@@ -2411,6 +2411,8 @@ fn rust_program_markers() -> Vec<String> {
 /// script interpreter in Rust, makes every call through it and is stopped where it must be.
 fn core_pin_markers() -> Vec<String> {
     vec![
+        "origin-kernel: core: the binding: before its thread starts, each of pin_program's ".into(),
+        " import slots holds the address of its export in its own origin.core, on a page it cannot write: true; and each of first_program's ".into(),
         "origin-kernel: core: a Rust program made every one of origin.kernel's 20 calls through origin.core: 20 calls of its script, each reported through debug_report, each with the status it must give, then thread_exit: true".into(),
         "origin-kernel: core: the hostile scripts of \"IPC and handles\", made through the stubs, gave call for call the statuses they give directly, and each process exited by itself: ".into(),
         " IPC calls (the one call number no method has is left out: no stub can ask it): true; 49 memory calls: true".into(),
@@ -2419,8 +2421,6 @@ fn core_pin_markers() -> Vec<String> {
         "origin-kernel: core: the kernel's proof processes keep their range: a call from outside it was refused with a status and the process went on to its own fault: true; a call number no method has answered NOT_SUPPORTED: true".into(),
         "origin-kernel: core: origin.core in a process: a write to its page faulted there: true; memory_unmap and memory_protect of its range and a fixed memory_map over it each answered INVALID_ARGS, and calls through it went on: true; its 1 pages were still mapped read-execute on the same frames afterwards: true; two processes hold it on one set of frames, executable in ".into(),
         " spaces and writable in none: true, at different bases: true".into(),
-        "origin-kernel: core: the binding: before its thread starts, each of pin_program's ".into(),
-        " import slots holds the address of its export in its own origin.core, on a page it cannot write: true; and each of first_program's ".into(),
         "origin-kernel: core: narrow parameters: through its stub, a call whose 32-bit parameter has bits set above it, in the second, third and fourth registers, is the same call with them clear, 4 calls: true; the same registers in a direct call by a proof process are each INVALID_ARGS: true".into(),
         "origin-kernel: core: every process it launched and all they held are gone: heap ".into(),
         "; origin.core's own frames stay, mapped by no process: true".into(),

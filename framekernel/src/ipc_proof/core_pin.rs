@@ -9,6 +9,8 @@
 //!
 //! "origin.core and the call pin" shows, each clause printed and judged:
 //!
+//! - **the binding**: before a program's thread starts, every one of its import slots holds the
+//!   address of its export in that process's `origin.core`, on a page it cannot write;
 //! - **every call**: a script that makes each of `origin.kernel`'s calls through `origin.core`
 //!   gets the status each must give;
 //! - **the hostile calls**: the hostile scripts of "IPC and handles", the IPC one and the memory
@@ -21,8 +23,6 @@
 //!   `memory_protect` of its range and a fixed `memory_map` over it answer `invalid_args`, and
 //!   its pages are still mapped read-execute on the same frames afterwards; two processes hold
 //!   it at different bases on one set of frames, writable in no space;
-//! - **the binding**: before a program's thread starts, every one of its import slots holds the
-//!   address of its export in that process's `origin.core`, on a page it cannot write;
 //! - **narrow parameters** (L13): through a stub, a call whose 32-bit parameter has bits set
 //!   above it is taken as the same call with them clear, where the same registers in a direct
 //!   call are `invalid_args`;
@@ -427,6 +427,9 @@ pub(crate) fn prove_core_pin(
         let Some(creator) = Process::new(CREATOR, (0, 0), BOOT_PROOF_PRINCIPAL) else {
             return false;
         };
+        // The binding first: it is judged on processes that never run, and everything after
+        // it rests on it.
+        let binding_ok = prove_binding(com1, &creator);
         let calls_ok = prove_calls(com1, &creator, bsp, far, tsc_hz);
         // The figures come before the clauses a planted mistake in the pin fails, so that a
         // boot with the pin's check taken out still prints them (ADR-0018 V7's pair).
@@ -434,7 +437,7 @@ pub(crate) fn prove_core_pin(
         let pin_ok = prove_pin(com1, &creator, bsp, tsc_hz);
         let image_ok = prove_image(com1, &creator, bsp, tsc_hz);
         let narrow_ok = prove_narrow(com1, &creator, bsp, tsc_hz);
-        calls_ok && pin_ok && image_ok && narrow_ok
+        binding_ok && calls_ok && pin_ok && image_ok && narrow_ok
     };
     let same = || {
         memory::stats().map(|(h, f)| (h.bytes_in_use, f))
@@ -626,7 +629,37 @@ fn prove_pin(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64) 
     pinned && kept
 }
 
-/// The image: never writable, never unmapped or changed, one set of frames; and the binding.
+/// The binding (ADR-0011 L3): in two processes loaded with the pin program and one with the
+/// first program, none of them started, every import slot holds its export's address in that
+/// process's own `origin.core`, on a page the program cannot write.
+fn prove_binding(com1: &mut Console, creator: &Process) -> bool {
+    let (mut bound, mut first_bound) = (false, false);
+    if let (Some(a), Some(b)) = (
+        Scripted::new(LIMITS, Via::Core(creator)),
+        Scripted::new(LIMITS, Via::Core(creator)),
+    ) && let (Some(pa), Some(pb)) = (a.pinned.as_ref(), b.pinned.as_ref())
+    {
+        bound = imports_bound(&a.image.process, &PIN_PROGRAM, pa.base, pa.core)
+            && imports_bound(&b.image.process, &PIN_PROGRAM, pb.base, pb.core);
+    }
+    if let Ok(first) = launch::load_program(creator, &FIRST_PROGRAM, &FIRST_PROGRAM_RUN) {
+        first_bound = imports_bound(&first.process, &FIRST_PROGRAM, first.base, first.core)
+            && core_mapped(&first.process, first.core);
+    }
+    let binding = bound && first_bound;
+    let _ = writeln!(
+        com1,
+        "origin-kernel: core: the binding: before its thread starts, each of {}'s {} import slots holds the address of its export in its own origin.core, on a page it cannot write: {bound}; and each of {}'s {}: {first_bound}{}",
+        PIN_PROGRAM.name,
+        PIN_PROGRAM.imports.len(),
+        FIRST_PROGRAM.name,
+        FIRST_PROGRAM.imports.len(),
+        if binding { "" } else { FAILED }
+    );
+    binding
+}
+
+/// The image: never writable, never unmapped or changed, one set of frames.
 fn prove_image(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64) -> bool {
     let span = core_image::image().span;
     let invalid = Error::InvalidArgs.raw();
@@ -730,9 +763,8 @@ fn prove_image(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64
             && process.ending() == Some(Ending::Exited(0));
     }
 
-    // Two processes, loaded and never started: one set of frames at two bases, and each
-    // program's imports bound.
-    let (mut shared, mut apart, mut bound, mut first_bound) = (false, false, false, false);
+    // Two processes, loaded and never started: one set of frames at two bases.
+    let (mut shared, mut apart) = (false, false);
     let mut executors = 0;
     if let (Some(a), Some(b)) = (
         Scripted::new(LIMITS, Via::Core(creator)),
@@ -744,12 +776,6 @@ fn prove_image(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64
         let counts = core_image::mappings();
         executors = counts.map_or(0, |(_, executable)| executable);
         shared &= counts.is_some_and(|(writable, executable)| writable == 0 && executable >= 2);
-        bound = imports_bound(&a.image.process, &PIN_PROGRAM, pa.base, pa.core)
-            && imports_bound(&b.image.process, &PIN_PROGRAM, pb.base, pb.core);
-    }
-    if let Ok(first) = launch::load_program(creator, &FIRST_PROGRAM, &FIRST_PROGRAM_RUN) {
-        first_bound = imports_bound(&first.process, &FIRST_PROGRAM, first.base, first.core)
-            && core_mapped(&first.process, first.core);
     }
     let image_ok = write_faulted && refused && kept && shared && apart;
     let _ = writeln!(
@@ -758,17 +784,7 @@ fn prove_image(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64
         span / PAGE,
         if image_ok { "" } else { FAILED }
     );
-    let binding = bound && first_bound;
-    let _ = writeln!(
-        com1,
-        "origin-kernel: core: the binding: before its thread starts, each of {}'s {} import slots holds the address of its export in its own origin.core, on a page it cannot write: {bound}; and each of {}'s {}: {first_bound}{}",
-        PIN_PROGRAM.name,
-        PIN_PROGRAM.imports.len(),
-        FIRST_PROGRAM.name,
-        FIRST_PROGRAM.imports.len(),
-        if binding { "" } else { FAILED }
-    );
-    image_ok && binding
+    image_ok
 }
 
 /// The limits of a process that makes the narrow-parameter calls: a channel, an event, a port
