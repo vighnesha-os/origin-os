@@ -116,6 +116,8 @@
 
     At M9, the owner decides whether the installer warns or refuses (item 90).
 
+    **Built 2026-11-12 on `claude/t16-cpu-ident-621a3b`, not merged:** `origin_frame::cpuident`, the boot line, `boot-identity` in `boot-matrix`; the contract and its result are under "Task contracts".
+
 **From the design review of 2026-11-10 (decision items 106–123), in order.** The findings and their evidence are in `docs/engineering/DESIGN_REVIEW_2026-11-10.md`. Each task writes its §78 contract before it starts (item 122).
 
 17. **The assembly blocks' options, and four gates (items 107, 110, 111, 123), now — done 2026-11-10** (see Done, and the result below the contract):
@@ -624,3 +626,14 @@ Sent by the coordinating session on 2026-11-12; written here on 2026-11-12, befo
 | Required tests | Host, in `origin-frame`: the signature's decoding by each vendor's rule (the extended family only under base family 0Fh; the extended model under Intel's base family 6 or 0Fh and AMD's 0Fh), against signatures the vendors publish; every row's answer and each boundary (AMD 19h out, 1Ah and above in; Intel's listed family-6 models in and their neighbours out; Intel families 15 to 17 out, 18 and above in; another vendor out); the table's form (keys unique, every row sourced, no unconfirmed row in scope that the rule would leave out); Z9's form equal to the old rule's for every maker and every family up to 10Eh; the errata home's lookup over a test-only list, and the shipped list well formed; the line's exact text for each answer. Planted faults in the rule and the table, one at a time, each of which must fail a test. Boot: the two identities, each with its exact line, its verdict and the halt line, so a refusal fails the boot. Negative controls, each a temporary edit booted once and put back byte for byte: the AMD threshold moved down to 19h (the outside boot must fail); model CCh taken out of Intel's list (the inside boot must fail); the kernel halting after an outside line (the outside boot must fail). |
 | Actual deliverables | The table and errata home with their tests; the scope line; `nospec::choose` moved into the table; `cargo xtask boot-identity` in `boot-matrix`; the ledger; the records above. Small commits, each of which builds and passes its tests. Nothing pushed. |
 | Acceptance conditions | On the task's branch, on the final commit: `cargo xtask check` (the requirements gate included), `cargo xtask boot-test` and `cargo xtask boot-matrix` pass, every boot run as `cargo xtask exclusive -- <command>`; the host tests and both identity boots pass; each planted fault and each negative control fails as stated; requirements rows S24-18, S24-19, S24-20 and A09-A2 move to `built` with criteria of their own (not `done`: their scope is hardware, and the evidence is QEMU's); provenance, STATUS and TASKS are current; corrections to accepted text, Clearwater Forest's date among them, sent to the coordinating session with a recommendation. Then the branch, the commit and the results go to the coordinating session. Nothing here runs on physical hardware. |
+
+**Result of 16, 2026-11-12.** Against the contract's acceptance conditions, as far as this branch has gone (the final gates are in the hand-over report):
+
+| Condition | How it stands |
+|---|---|
+| Host tests | 231 of `origin-frame`'s pass, 11 of them the table's, including every maker, family and model against A2's rule and Z9's, each written again from its text. Ten planted faults each fail named tests (`SOURCE_PROVENANCE.md`) |
+| Both identity boots | Passed under QEMU's software processor: a Panther Lake in the scope and rental A's EPYC 4244P outside it, each with its whole line and its verdict |
+| Negative controls | CI-1 to CI-3 (ADR-0013) each failed the boot on its line, and were put back byte for byte |
+| Records | Ledger `docs/research/2026-11-12-cpu-identification-table.md`; dated as-built notes under ADR-0009 A2 and ADR-0017 Z9; ADR-0013's evidence; the provenance entry; STATUS; rows S24-18, S24-19, S24-20 and A09-A2 at `built`, with criteria of their own |
+| Corrections to accepted text | Two launch dates in ADR-0009 A1 went to the coordinating session and were accepted as items 257 and 258; that session writes them on `main`. This branch leaves A1 as it is |
+| What it does not show | No processor of a generation in the scope has printed the line. The errata home holds none. A 2024 Zen 5 reads as in the scope, as A2 accepts |

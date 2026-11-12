@@ -280,6 +280,16 @@ Each boot failed (`cargo xtask boot-test` exit 1), and each by the proof the edi
 
 Both boots failed (`cargo xtask boot-test` exit 1), each by the line it was aimed at. The generator's own control, a decoder that keeps 32 bits caught by the system-call API checks on the host, is `a_handle_cut_to_32_bits_fails_the_syscall_checks` in `developer-tools/oidl/tests/generated.rs`. Logs: the interface session's scratchpad, not kept in the repository.
 
+**The CPU identity line (ADR-0009 A2; task 16; 2026-11-12, QEMU 11.1.3 TCG, Intel VT-d, 2 processors):** not a proof. The line names the core generation and says whether the machine is in the declared scope; it is outside the verdict and stops nothing (R3, R8), and it adds no row to the table above. `boot-identity`, in `boot-matrix`, holds two processors QEMU is told to report to their whole lines: a Panther Lake (`-cpu max,vendor=GenuineIntel,family=6,model=204,stepping=2`), in the scope, and rental A's EPYC 4244P (`family=25,model=97,stepping=2`), outside it. Both passed, each ending `boot verdict: degraded: 62 of 63 proofs passed; failed: speculation controls`, the Report row QEMU always fails (item 154). Three controls, each a temporary edit booted once in the `kernel boot` scenario as one of the two processors, then put back and compared byte for byte, the tree clean before and after; numbered apart from C0 to C48, EP1 to EP11 and H64-1 and H64-2:
+
+| # | Edit | Result |
+|---|---|---|
+| CI-1 | AMD's threshold in the table moved down from 1AH to 19H (`cpuident.rs`), booted as the EPYC 4244P | The line read `AuthenticAMD family 19h (25) model 61h stepping 2 (leaf 1 EAX 00A60F12h): Zen 5 or newer; in the declared scope: …`, and the boot failed on the outside line's marker |
+| CI-2 | Model CCH taken out of Intel's list (`cpuident.rs`), booted as the Panther Lake | `GenuineIntel family 06h (6) model CCh stepping 2 (…): an earlier Intel family-6 generation; outside the declared scope, a bench machine: …`, and the boot failed on the inside line's marker |
+| CI-3 | The kernel halts after a line that says outside the scope (`kernel.rs`), booted as the EPYC 4244P | The line printed, then nothing: the boot failed on the next marker (the backtrace's) after its 120-second wait. A refusal for the scope cannot pass the boot test |
+
+Each failed (`cargo xtask boot-test` exit 1) on the line it was aimed at, at a host load of about 9. The table's own host tests and ten planted faults are in `SOURCE_PROVENANCE.md`, "TASKS item 16". Logs: this task's scratchpad, not kept in the repository.
+
 **The legacy-free machine (`boot-legacy-free`, in `boot-matrix`):** `-machine pit=off,i8042=off` boots the whole kernel. Before F3 it read the absent port 61h as 0xFF and reported `calibrated against the PIT: 0 kHz`, and failed. After, it calibrates against the ACPI PM timer (agreeing with one RTC second to 0.006 %), reports that it cannot prove the two PIT-based I/O APIC proofs, that the FADT says it has no 8042, and `boot verdict: 50 of 50 proofs passed`.
 
 **Real processors:** research ledger §3 (CI through KVM).

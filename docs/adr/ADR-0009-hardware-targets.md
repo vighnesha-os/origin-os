@@ -120,6 +120,7 @@ Zen 5 itself launched in 2024: Ryzen 9000, Ryzen AI 300 and EPYC 9005 are Zen 5 
 
 Everything else is bench equipment: it may be used for testing, but no support or qualification claim rests on it (§76, rules 30 and 40).
 
+
 ### A2. The kernel names the core generation and reports the scope (item 89; replaces H2)
 
 CPUID reports a vendor, a family and a model, which identify the core generation. These are hardware identifiers, not marketing names (§24).
@@ -137,6 +138,16 @@ CPUID reports a vendor, a family and a model, which identify the core generation
 - **Both answers are tested.** QEMU can be told to report any family and model, so CI can boot an in-scope and an out-of-scope identity.
 - **What cannot be checked.** The check gives the core generation, not the launch year. Gorgon Point refreshes 2024's Strix and Krackan Point on the same socket, probably with the same model numbers (unconfirmed). So "AMD from 2026" stays a rule about claims: a 2024 Zen 5 machine reads as Zen 5 or newer, and that is not a support claim.
 - **It is not a security control.** A virtual machine reports its host's CPU, or whatever QEMU is told to report.
+
+*As built, 2026-11-12 (TASKS item 16; this note changes no decision).*
+
+- **The table** is `origin_frame::cpuident` (`framekernel/frame/src/cpuident.rs`). Each row names the Intel or AMD documents it rests on, read on 2026-11-12 (`docs/research/2026-11-12-cpu-identification-table.md`). It decodes the model by each vendor's own rule: Intel counts the extended model under base family 06H or 0FH, AMD only under 0FH.
+- **What it names.** Intel's family-6 rows name the generations of the SDM's Table 2-1, the four 2026 models of the rule among them. Model E5H is named only as Panther Lake's cores, since Intel names no product for it. AMD's rows are by family alone, as the rule is: "Zen 5 or newer" from 1AH, "older than Zen 5" below it.
+- **Diamond Rapids is now confirmed by Intel.** Its Instruction Set Extensions and Future Features Programming Reference, 319433-062 (June 2026), Table 1-1, lists it as DisplayFamily_DisplayModel 13_01H, and Nova Lake as 12_01H and 12_03H. The evidence below, which found no Intel source on 2026-11-10, is out of date on that point only, and no decision changes: the rule never depended on it, since family 18 or higher is in the scope whatever the model. The table names Diamond Rapids from that document.
+- **ADR-0017 Z9's form** is a column of it. `nospec::choose` moved into it, with the same answer for every maker and family.
+- **Errata.** The home holds none: nothing the kernel runs works around a documented erratum.
+- **At boot.** The line follows the CPU features line, for example `origin-kernel: CPU identity: AuthenticAMD family 19h (25) model 61h stepping 2 (leaf 1 EAX 00A60F12h): older than Zen 5; outside the declared scope, a bench machine: AMD family below 1Ah, where Zen 5 begins (ADR-0009 A2); …`. It says when a hypervisor runs the processor. For AMD from family 1AH it says that CPUID gives no year, so a Zen 5 generation from 2024 reads the same.
+- **Tests.** Host tests check every maker, family and model against this rule and Z9's, each written again from its text, and against the signatures the vendors publish. `cargo xtask boot-identity`, part of `boot-matrix`, boots QEMU told to report a Panther Lake (in the scope) and rental A's EPYC 4244P (outside it), each held to its whole line and to its verdict. Under QEMU only: no processor of either generation has printed the line.
 
 ### A3. The installer, decided at M9 (item 90)
 

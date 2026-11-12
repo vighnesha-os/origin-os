@@ -71,8 +71,8 @@ The table decodes the model by the vendor's own rule. A processor of another ven
 
 **Launch dates, against ADR-0009 Amendment 1, A1:**
 
-- A1 dates Clearwater Forest to "March 2026". **Intel's ark gives Q2'26** for all four Xeon 6900E+ processors (I6), and Intel's product brief is dated 2026-06-01. Q2 is April to June, so "March" is contradicted. The scope does not change (2026 either way). Changing A1's text is the owner's: it is sent to the coordinating session as a proposal.
-- A1 lists Wildcat Lake as in the scope "when they ship". Intel launched it on 2026-04-16 (I7).
+- A1 dates Clearwater Forest to "March 2026". **Intel's ark gives Q2'26** for all four Xeon 6900E+ processors (I6), and Intel's product brief is dated 2026-06-01. Q2 is April to June, so "March" is contradicted. The scope does not change (2026 either way). Changing A1's text is the owner's. Sent to the coordinating session as a proposal, it was accepted the same day as decision item 257 ("Q2 2026, by Intel's product pages"); the coordinating session writes A1's text and the decision sheet in a records pull request to `main`, and this branch leaves A1 as it is.
+- A1 lists Wildcat Lake as in the scope "when they ship". Intel launched it on 2026-04-16 (I7). Accepted the same day as decision item 258 ("April 2026"; Nova Lake keeps "when it ships"), written the same way as item 257.
 - Panther Lake: A1's "January 2026" agrees with Intel's Q1'26 (I7).
 
 ## 4. AMD
