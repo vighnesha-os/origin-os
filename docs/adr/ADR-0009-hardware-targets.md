@@ -48,7 +48,7 @@ Intel comes first because its console path is documented and the VT-d work is th
 **H6. Before the first boot.**
 
 - Read Intel's no-fix errata for this CPU, on VT-d (PTL003, PTL023) and xHCI (PTL002, 006, 007, 009). The research reported them, and nobody has re-read them.
-- Close or explicitly accept what the IOMMU threat model lists before real hardware: T4, T5, T6, T8, T9, T14 (RMRR and IVMD identity maps, the deadline in items 8 and 12) and T23.
+- Close or explicitly accept what the IOMMU threat model lists before real hardware: T4, T5, T6, T8, T9, T14 (RMRR and IVMD identity maps, the deadline in items 8 and 12) and T23. *(2026-11-12, items 229 and 230: for bench boots on rented servers only, T4's two windows, T5, T6, T8, T9 and T23 are accepted by name, and T14's deadline holds there too; `docs/research/2026-11-12-first-bare-metal-boot.md`.)*
 - Give the kernel a console that does not depend on a 16550 at `0x3F8`, such as a UEFI GOP framebuffer or the address in the ACPI SPCR table. The only console today is at that fixed port, and neither ASRock nor Lenovo documents the address. Without it, a failed boot shows nothing. *(2026-11-08: built against ADR-0010, which the owner accepted; proven under QEMU only.)*
 
 **H7. Later machines, for §74.**
