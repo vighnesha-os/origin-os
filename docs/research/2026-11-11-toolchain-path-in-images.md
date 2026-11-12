@@ -25,6 +25,8 @@ So another account, or another machine, gives strings of another length and cann
 | R1 | The rustc book as published for Rust 1.99.1: "Command-line Arguments" (`--remap-path-prefix`, `--remap-path-scope`) and the chapter "Remap source paths": `doc.rust-lang.org/1.99.1/rustc/command-line-arguments.html` and `…/rustc/remap-source-paths.html` | Read on 2026-11-11 |
 | R2 | The Cargo book as published for 1.99.1, "Configuration": `doc.rust-lang.org/1.99.1/cargo/reference/config.html`, for `build.rustflags`, how values from several sources are joined, `--config`, and the names of environment variables | Read on 2026-11-11 |
 | R3 | Cargo's own source, one file: `src/compiler/build_runner/compilation_files.rs` in `github.com/rust-lang/cargo` at commit `5f94df4789f005f9a352888e8355ffc645b7ed0e`, which is the commit `cargo -vV` reports for 1.99.1. MIT OR Apache-2.0 | Read on 2026-11-12, for §12.6: how a crate's `-C metadata` value is made, which R2 does not say. A build tool's source (CLAUDE.md §4), read after step 2's code was committed; nothing of it is in Origin's code |
+| R4 | The linker's own source, two files: `lld/ELF/SyntheticSections.cpp` and `lld/Common/Version.cpp` in `github.com/rust-lang/llvm-project` at commit `1b9c0d5ff9bbe7634aead059efe6b11a7eeba145`, the commit the pinned `rust-lld` names in what it writes. Apache-2.0 WITH LLVM-exception | Read on 2026-11-12, for §13.3: how the linker makes the string it writes into `.comment`. A build tool's source (CLAUDE.md §4); nothing of it is in Origin's code |
+| C2 | CI's run 43248605239 at `c34fdab`: its `check` job's log, and the artifact `reproducible-gate-files` it kept | Read and fetched on 2026-11-12, for §13 |
 | C1 | CI's logs for this repository: run 43201395354 at `f5ab54f` (its `check` and toolchain jobs) and run 43230979284 at `9e4f79f` (its `check` job) | Read on 2026-11-12, for §12.4 and §12.5 |
 | T1 | The toolchain itself: `rustc 1.99.1 (58cf8f9c3 2026-10-13)`, commit `58cf8f9c35b355199727627d07ae34a4e2846d67`, and `cargo 1.99.1 (5f94df478 2026-08-27)`, on `aarch64-apple-darwin` | What `cargo build -v` passes to rustc, and what the images then hold (`strings`, `cmp`, `llvm-objdump`), each observed on 2026-11-11 |
 
@@ -340,3 +342,86 @@ Not seen yet: the step has not run on CI. Its first run is the one on a head tha
 - The stand-in changes what Cargo is told about the host and nothing about the compiler. A compiler that really runs on Linux was not available: what one does is known only from CI's logs.
 - The refusals were tried one variable at a time. Combinations were not.
 - The configuration-file routes were tried with a file one directory above a copy of the checkout and with one in a stand-in for Cargo's home. A file that Cargo finds some other way was not looked for.
+
+## 13. The first comparison with CI on a tree that holds item 32: `c34fdab` (2026-11-12)
+
+The batch was pushed at `c34fdab`, whose tree is `41c03c2`'s: item 32 with step 2 and the kept files (§12.8), and both build scripts still in place. CI ran on it (run 43248605239, on the batch's pull request).
+
+### 13.1 What ran on CI for the first time
+
+- `cargo xtask check` passed there: 1,675 host tests, 0 failed, 27 ignored (the Mac runs 1,674: `origin-rt-mem`'s test of the direction flag is compiled only for an x86-64 host, and passed there); Loom, all 53 models and all 78 controls. Nothing after `xtask`'s own tests had run on CI for a tree with item 32 before this (§12.4).
+- The reproducible-build gate passed on CI: each of the ten files was the same from CI's two builds, and free of that machine's paths. The check job's machine was an AMD EPYC 7763 with 4 processors, on the `ubuntu-24.04` image.
+- The step that keeps the gate's files ran. The artifact `reproducible-gate-files` is 1,839,090 bytes as uploaded and holds the ten files from each build, 4.5 MB unpacked. The kernel in it has the digest the log printed, and each file of the second build is the same bytes as the first's.
+
+### 13.2 The ten files, the Mac's against CI's
+
+The Mac's are the gate's at `41c03c2`, and the keeper's own ten for `c34fdab`, built in another checkout on the same Mac, are the same. "With CI's host line" is the Mac's build with the stand-in of §12.5, made before CI's result was read.
+
+| File | The Mac | The Mac with CI's host line | CI | The Mac's and CI's |
+|---|---|---|---|---|
+| loader, no feature | `b02de036…` | `b02de036…` | `b02de0363fb0643bcc0f936ec40df7f88cb1a7eb19a193f1ef6b9b4adb1a8ccd` | **the same** |
+| loader, `test-trust-store` | `b3a2e184…` | `77a858ad…` | `77a858ada76471428a90b92b4a774392fcfa530d94a23512bda9c41b5677b8c1` | differ |
+| loader, `developer-mode` | `6dfe435c…` | `ee2a063f…` | `ee2a063f093fbbf4135f2b29155165d901d4c5b7bb29c20e915d36024e7e3eaf` | differ |
+| `first_program` as the linker wrote it | `251e985c…`, 29,784 bytes | `daf14f35…`, 29,784 bytes | `5dedc72efb3b8b51bace0bbae197115fa74e0f8af7b386741a9f0d80853cd54b`, 29,768 bytes | differ |
+| `first_program.0.bin` | `02fe296a…` | `02fe296a…` | `9e35a5739dc0e0133499a77bd12430720f0788a30c50e7f39e27b4b3c68dbf16` | differ, in one byte |
+| `first_program.1.bin` | `01f7addb…` | `01f7addb…` | `01f7addb33cac76c6aa8bf93d7607b2ab3ed30eb8455b684846fdf920fbad38c` | **the same** |
+| `first_program.2.bin` | `592ee8a4…` | `592ee8a4…` | `592ee8a478796bb0cc4274c7cb9336f57a6fa4f5c834b24389944e553bccdb14` | **the same** |
+| `first_program.3.bin` | `3341bcae…` | `3341bcae…` | `3341bcae4c97d7ba73e0728c783373725905eab0417cf220037920f0960679cb` | **the same** |
+| `first_program.rs` | `276f4595…` | `ac996eb1…` | `1f825d08192d07695f9a8d1d57fd2643770c03f43105b268868215e325466047` | differ |
+| kernel ELF | `92b4debb…`, 1,680,416 bytes | `5168a904…`, 1,680,400 bytes | `90e7505387cd209a8d35529a6eea4bdaf07e69860eb32ebdbc1947009574b032`, 1,680,384 bytes | differ |
+
+**Four of the ten are the same bytes on the two machines, and six are not.**
+
+**The three loaders came out as §12.5 predicted**, digest for digest: CI's plain loader is the Mac's, and CI's two feature loaders are the ones the Mac writes with CI's host line. So for the loaders the host line was the whole difference on this tree too.
+
+The carried program and the kernel did not: with CI's host line the Mac's are still not CI's. That is the difference §12.5 could not explain at `f5ab54f`. With CI's own files it can be found.
+
+### 13.3 The third thing a build takes from its host: the linker's name for itself
+
+CI's `first_program` and the Mac's with CI's host line were compared section by section. Nineteen of the twenty sections are the same bytes, the code, the data and the symbol table among them. One differs, `.comment`:
+
+- the Mac's linker writes `Linker: LLD 23.1.1 (https://github.com/rust-lang/llvm-project.git 1b9c0d5f…)`;
+- CI's writes `Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5f…)`.
+
+That text is fixed when the linker itself is built (R4): its version, and the repository and revision its build was configured with. The pinned toolchain's `rust-lld` for macOS and the one for Linux were built from the same revision and name the repository differently. CI's string is 14 bytes shorter.
+
+`.comment` is not loaded. But it moves what is after it in the file, and that reaches loaded bytes in one place: the ELF header holds the offset of the section table (`e_shoff`), and the first loadable segment holds the ELF header. So:
+
+- `first_program` as linked: `.comment` differs, the file is 16 bytes shorter on CI, and one byte of its header differs (offset 0x28);
+- `first_program.0.bin`, the segment the kernel carries, differs in that one byte;
+- the kernel: its own `.comment` and one byte of its own header differ in the same way, and one byte of its read-only data differs, which is the program's header byte inside the segment it carries. Its other 18 sections are the same bytes as the Mac's with CI's host line;
+- `first_program.rs` quotes the linker output's digest in a comment, so it differs too;
+- the loaders are PE images, have no `.comment`, and are not touched by this.
+
+**It reaches what boots.** `onbf-pack` converts the kernel's ELF to the image the loader starts. Converted on the Mac, CI's kernel and the Mac's with CI's host line give two images of the same size that differ in 225 bytes: the two header bytes, and the digests the image holds over them.
+
+### 13.4 The three together are all of it
+
+The linker reads an environment variable, `LLD_VERSION`, in place of its own text (R4; the source says it is for testing). Step 2's tree was built on the Mac once more, with plain `cargo` at two jobs, with CI's host line and with `LLD_VERSION` set to CI's string.
+
+**All ten files are then CI's, bit for bit**: the three loaders, the program's six files, and the kernel.
+
+So on this tree a build took exactly three things from its host:
+
+| What | How it reaches an image | State |
+|---|---|---|
+| Where the toolchain is installed | the standard library's source paths, in panic locations | removed by item 32 (§5, §11) |
+| The host the compiler reports | Cargo's `-C metadata` values, through a build script | removed by item 44 (§14); not yet compared with CI |
+| The linker's name for itself | `.comment` of each ELF, and through `e_shoff` one loaded byte of each | **still there** |
+
+Nothing else was found: no difference in generated code, in data, or in symbol names between the Mac's compiler and linker and CI's, for these ten files.
+
+### 13.5 What could end the third
+
+Not built; put to the coordinating session.
+
+- Cargo's `[env]` configuration can set `LLD_VERSION` for every link. Tried on the Mac with `--config env.LLD_VERSION=…`: the program's `.comment` then holds the given text and the compiler's version, and nothing of the linker's own. One entry in `.cargo/config.toml` would do it for `xtask` and for plain `cargo` alike.
+- What it rests on: a variable the linker's source calls a testing aid. A gate that reads `.comment` in each ELF it builds would fail on any machine if a later linker stopped honouring it.
+- Other ways: remove `.comment` from the linker's output with a second tool; or have `onbf-pack` not carry the section table's fields of an ELF header. Each changes more than one entry does.
+
+### 13.6 Not verified
+
+- **No file of a tree with item 44 has been compared with CI's.** §14 has the Mac's side.
+- With the three inputs set as CI's, the Mac gives CI's bytes; that the reverse holds, CI giving the Mac's, was not tried.
+- One CI machine. The `check` job runs on one runner image, so whether another image's toolchain writes the same bytes is not known from this run. At `f5ab54f` the job ran on another processor (an EPYC 9V45) and its loaders fit the same account.
+- Whether `LLD_VERSION` behaves the same in the linker's COFF driver was not looked at; the loaders have no `.comment`.
