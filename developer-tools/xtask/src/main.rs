@@ -14,6 +14,7 @@ mod interfaces;
 mod lex;
 mod loom;
 mod mnemonics;
+mod progress;
 mod provenance;
 mod reproducible;
 mod requirements;
@@ -91,6 +92,12 @@ commands:
   roadmap-gate only the gate on docs/ROADMAP.md: every counted build row of the
               requirements matrix placed in one milestone or listed as in none, and
               every row it names in the matrix (part of check; CLAUDE.md §82; quick)
+  progress    writes docs/PROGRESS.md from the requirements matrix, CLAUDE.md's and the
+              ADRs' headings and docs/ROADMAP.md: counts of rows by state, overall, by
+              milestone, by feature group, by ADR and for the standing rules. Run it when
+              a row's state changes (TASKS item 43; quick)
+  progress-gate only the gate on docs/PROGRESS.md: the committed page is the one the
+              tree generates, byte for byte (part of check; quick)
   regenerate rewrites the kernel's generated system-call crate from sdk/interfaces
   image-gate [kernel ELF]
               only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
@@ -2529,6 +2536,8 @@ fn main() -> ExitCode {
         ["requirements-gate"] => requirements::gate(),
         ["provenance-gate"] => provenance::gate(),
         ["roadmap-gate"] => roadmap::gate(),
+        ["progress"] => progress::write(),
+        ["progress-gate"] => progress::gate(),
         ["regenerate"] => interfaces::regenerate(),
         ["image-gate"] => in_turn("image-gate", image::build_and_gate),
         ["image-gate", elf] => image::gate(Path::new(elf)),
@@ -3252,6 +3261,7 @@ fn check() -> Result {
     requirements::gate()?;
     provenance::gate()?;
     roadmap::gate()?;
+    progress::gate()?;
     unsafety::gate()?;
     interfaces::gate()?;
     manifest_version_lint()?;

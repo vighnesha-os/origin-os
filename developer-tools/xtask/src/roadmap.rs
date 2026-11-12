@@ -27,7 +27,8 @@
 //! **What it does not see:** whether a placement is right, whether a test's words match its rows,
 //! and anything outside the "Rows" columns. Rows of kind `rule` need no place (item 256, rule 3).
 //!
-//! It reads the matrix through the requirements gate's reader ([`requirements::matrix_rows`]).
+//! It reads the matrix through the requirements gate's reader ([`requirements::matrix_rows`]), and
+//! the progress page (TASKS item 43) reads the roadmap through [`check`] and [`states`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -143,18 +144,24 @@ impl Section {
     }
 }
 
-/// What the gate found: its problems, and its counts for the report.
+/// What the gate found: its problems, its counts for the report, and where each row is placed.
 #[derive(Debug, Default)]
-struct Found {
-    problems: Vec<String>,
+pub(crate) struct Found {
+    pub(crate) problems: Vec<String>,
     milestones: usize,
     placed: usize,
     in_none: usize,
     needing: usize,
+    /// Each milestone's name and title, as its heading `## M<n>. Title` gives them, in the
+    /// roadmap's order.
+    pub(crate) headings: Vec<(String, String)>,
+    /// For each row placed, by its index in the rows given to [`check`], the sections it is
+    /// placed in: milestones by name, or [`NONE`].
+    pub(crate) placed_in: BTreeMap<usize, BTreeSet<String>>,
 }
 
 /// Reads `roadmap` against `rows` and returns what is wrong with it.
-fn check(roadmap: &str, rows: &[Row]) -> Found {
+pub(crate) fn check(roadmap: &str, rows: &[Row]) -> Found {
     let mut found = Found::default();
     if rows.is_empty() {
         found
@@ -186,6 +193,8 @@ fn check(roadmap: &str, rows: &[Row]) -> Found {
             current = section(line);
             if let Section::Milestone(name) = &current {
                 milestones.insert(name.clone());
+                let title = line.split_once(". ").map_or("", |(_, title)| title.trim());
+                found.headings.push((name.clone(), title.to_string()));
             }
             column = None;
             continue;
@@ -299,17 +308,94 @@ fn check(roadmap: &str, rows: &[Row]) -> Found {
             }
         }
     }
+    found.placed_in = placed;
     found
 }
 
+/// The words a milestone's state may start with, longest first so that `not started` is not
+/// read as something shorter.
+const STATE_WORDS: [&str; 4] = ["not started", "partial", "built", "done"];
+
+/// What opens a sentence that gives a milestone's state: `**State, <date>: <word>` and
+/// `**Marked against the tests, <date>: <word>`.
+const STATE_OPENINGS: [&str; 2] = ["**State, ", "**Marked against the tests, "];
+
+/// Each milestone's state word, by name, as its section of `roadmap` gives it, and what is wrong:
+/// a milestone with no such sentence, with two, or with a word not in [`STATE_WORDS`].
+pub(crate) fn states(roadmap: &str) -> (BTreeMap<String, String>, Vec<String>) {
+    let mut found: BTreeMap<String, Vec<(usize, Option<&str>)>> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    let mut fenced = false;
+    for (index, line) in roadmap.lines().enumerate() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        if line.starts_with("## ") {
+            current = match section(line) {
+                Section::Milestone(name) => {
+                    found.entry(name.clone()).or_default();
+                    Some(name)
+                }
+                _ => None,
+            };
+            continue;
+        }
+        let Some(name) = &current else {
+            continue;
+        };
+        for opening in STATE_OPENINGS {
+            for (at, _) in line.match_indices(opening) {
+                let after = &line[at + opening.len()..];
+                let word = after.split_once(": ").and_then(|(_, rest)| {
+                    STATE_WORDS.into_iter().find(|word| rest.starts_with(word))
+                });
+                found
+                    .entry(name.clone())
+                    .or_default()
+                    .push((index + 1, word));
+            }
+        }
+    }
+    let mut states = BTreeMap::new();
+    let mut problems = Vec::new();
+    for (name, sentences) in found {
+        match sentences.as_slice() {
+            [(_, Some(word))] => {
+                states.insert(name, (*word).to_string());
+            }
+            [(line, None)] => problems.push(format!(
+                "{ROADMAP}:{line}: {name}'s state is not one of {}",
+                STATE_WORDS.join(", ")
+            )),
+            [] => problems.push(format!(
+                "{ROADMAP}: {name} gives no state: a sentence starting `{}<date>: <word>`",
+                STATE_OPENINGS[0]
+            )),
+            more => {
+                let lines: Vec<String> = more.iter().map(|(line, _)| line.to_string()).collect();
+                problems.push(format!(
+                    "{ROADMAP}: {name} gives its state {} times, on lines {}: a milestone has one",
+                    more.len(),
+                    lines.join(", ")
+                ));
+            }
+        }
+    }
+    (states, problems)
+}
+
 /// The roadmap as the checkout holds it.
-fn read() -> Result<String> {
+pub(crate) fn read() -> Result<String> {
     let path = repo_root().join(ROADMAP);
     fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The matrix's rows, read by the requirements gate's reader; a matrix it cannot read is an error.
-fn matrix() -> Result<Vec<Row>> {
+pub(crate) fn matrix() -> Result<Vec<Row>> {
     let mut problems = Vec::new();
     let rows = requirements::matrix_rows(&requirements::read()?.files, &mut problems);
     if problems.is_empty() {
