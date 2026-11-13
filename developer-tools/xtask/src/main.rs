@@ -843,8 +843,8 @@ fn boot_scenario() -> Scenario {
     if Accel::from_env() == Ok(Accel::Kvm) {
         kvm_markers(&mut scenario, qemu_iommu() != Iommu::Amd);
     } else if oversubscribed() {
-        // As under KVM: the processors share the host's cores, so the even-shares line may not
-        // come, and an uneven share within `KVM_FAIR_SHARE_FACTOR` is let pass.
+        // The processors share the host's cores, so the even-shares line may not come, and an
+        // uneven share whose workers both ran is let pass (`oversubscribed_fair_share`).
         scenario
             .markers
             .retain(|m| !m.starts_with(EVEN_SHARES_LINE));
@@ -1147,15 +1147,44 @@ fn is_unfilled_tx_ring(line: &str) -> bool {
     }
 }
 
-/// Whether this boot runs on QEMU's software processor with more guest processors than the host
-/// has threads (ADR-0008 Amendment 1, D7: the 65- and 288-processor machines on the development
-/// Mac's 10). Each guest processor is a host thread, so they share the host's cores as a KVM
-/// runner's virtual processors share physical ones, and the scheduler proof's two workers on
-/// one guest processor get unequal amounts done for the same reason. Such a boot is held to
-/// what [`is_uneven_fair_share`] lets pass under KVM, and to nothing looser.
+/// Whether this boot is oversubscribed: QEMU's software processor with more guest processors
+/// than the host has threads, the host's count read at run time (ADR-0008 Amendment 1, D7: the
+/// 65- and 67-processor machines on the development Mac's 10). Each guest processor is a host
+/// thread, so the scheduler proof's two workers on one guest processor get the shares the host
+/// gives QEMU's threads ([`oversubscribed_fair_share`]).
 fn oversubscribed() -> bool {
     let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    Accel::from_env() == Ok(Accel::Tcg) && machine().cpus() as usize > host
+    Accel::from_env().is_ok_and(|accel| oversubscribed_for(accel, machine().cpus(), host))
+}
+
+/// [`oversubscribed`] for an accelerator, a guest's processors and the host's threads.
+fn oversubscribed_for(accel: Accel, cpus: u32, host_threads: usize) -> bool {
+    accel == Accel::Tcg && cpus as usize > host_threads
+}
+
+/// The two workers' counts on a scheduler proof's line that an oversubscribed boot lets pass
+/// (the coordinating session's ruling of 2026-11-14, TASKS item 58; ADR-0013): the workers both
+/// ran, for enough rounds (at least 15 switches), whatever their shares. On such a boot the share
+/// measures how the host schedules QEMU's threads, not the kernel, so fairness is not shown
+/// there; preemption, which the two workers running and switching show, is still held.
+fn oversubscribed_fair_share(line: &str) -> Option<(u64, u64)> {
+    if !line.starts_with("origin-kernel: scheduler: CPU ")
+        || !line.ends_with(" context switches: scheduler failed")
+    {
+        return None;
+    }
+    let (_, counts) = line.split_once(" counted ")?;
+    let first = number_before(counts, " and ")?;
+    let second = number_before(counts, ", ")?;
+    let switches = number_before(counts, " context switches")?;
+    (first > 0 && second > 0 && switches >= 15).then_some((first, second))
+}
+
+/// Whether the checker lets `line` pass on a boot under `accel`: KVM's allowances, and on an
+/// oversubscribed boot an uneven fair share whose workers both ran.
+fn checker_forgives(line: &str, accel: Accel, oversubscribed: bool) -> bool {
+    (accel == Accel::Kvm && kvm_forgives(line))
+        || (oversubscribed && oversubscribed_fair_share(line).is_some())
 }
 
 /// How unequal two workers' counts [`is_uneven_fair_share`] lets pass: the larger under this
@@ -5353,19 +5382,16 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
             let complete = text
                 .get(..text.rfind('\n').map_or(0, |i| i + 1))
                 .unwrap_or("");
-            let judged = accel.judged(complete);
-            // The same allowance for a software processor's boot that has more processors
-            // than the host has threads (`oversubscribed`).
             let judged = if oversubscribed {
                 Cow::Owned(
-                    judged
+                    complete
                         .lines()
-                        .filter(|l| !is_uneven_fair_share(l))
+                        .filter(|l| !checker_forgives(l, accel, true))
                         .collect::<Vec<_>>()
                         .join("\n"),
                 )
             } else {
-                judged
+                accel.judged(complete)
             };
             if let Some(m) = scenario.failures.iter().find(|m| judged.contains(**m)) {
                 return Some(Err(format!("the serial output contains {m:?}")));
@@ -5412,6 +5438,23 @@ fn run_scenario(scenario: &Scenario, kernel: &[u8]) -> Result {
 
     // What the markers were found in, before any monitor output joins the stream.
     let text = serial::clean(&raw);
+    // Every fair share the checker let pass on an oversubscribed boot, said so.
+    if scenario.capture != Capture::Screen && oversubscribed() {
+        let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        for line in text.lines() {
+            if let Some((first, second)) = oversubscribed_fair_share(line) {
+                let cpu = line
+                    .strip_prefix("origin-kernel: scheduler: ")
+                    .and_then(|rest| rest.split_once(':'))
+                    .map_or("a processor", |(cpu, _)| cpu);
+                println!(
+                    "xtask: {}: forgave fairness on an oversubscribed machine ({} guest processors on {host} host threads): {cpu}: the workers counted {first} and {second}; both ran",
+                    scenario.label,
+                    machine().cpus()
+                );
+            }
+        }
+    }
     let mut screen = None;
     if verdict.is_ok() && scenario.capture == Capture::Com1AndScreen {
         match stdin.as_mut() {
@@ -5879,6 +5922,64 @@ mod gate_tests {
         assert_eq!(functions.len(), 1);
         assert_eq!(functions[0].0, "_foo");
         assert_eq!(functions[0].1.len(), 4, "everything up to .cfi_endproc");
+    }
+}
+
+#[cfg(test)]
+mod oversubscribed_tests {
+    use super::{Accel, checker_forgives, oversubscribed_fair_share, oversubscribed_for};
+
+    const UNEVEN: &str = "origin-kernel: scheduler: CPU 0: workers 0 and 1 counted 720000 and 7273000, 27 context switches: scheduler failed";
+
+    #[test]
+    fn only_the_software_processor_with_more_guest_processors_than_host_threads_is_oversubscribed()
+    {
+        assert!(oversubscribed_for(Accel::Tcg, 65, 10));
+        assert!(oversubscribed_for(Accel::Tcg, 11, 10));
+        assert!(!oversubscribed_for(Accel::Tcg, 10, 10));
+        assert!(!oversubscribed_for(Accel::Tcg, 4, 10));
+        assert!(
+            !oversubscribed_for(Accel::Kvm, 65, 4),
+            "KVM keeps its own allowance"
+        );
+    }
+
+    /// The coordinating session's ruling of 2026-11-14: an uneven share passes on an
+    /// oversubscribed software-processor boot when both workers ran and the rounds hold, and
+    /// nowhere else.
+    #[test]
+    fn an_uneven_share_passes_only_on_an_oversubscribed_boot_with_both_workers_running() {
+        assert_eq!(
+            oversubscribed_fair_share(UNEVEN),
+            Some((720_000, 7_273_000))
+        );
+        assert!(
+            checker_forgives(UNEVEN, Accel::Tcg, true),
+            "oversubscribed: passes"
+        );
+        assert!(
+            !checker_forgives(UNEVEN, Accel::Tcg, false),
+            "the same share on a 4-processor machine fails"
+        );
+        assert!(
+            !checker_forgives(UNEVEN, Accel::Kvm, false),
+            "KVM's factor of four still holds"
+        );
+        let idle = UNEVEN.replace("counted 720000 and", "counted 0 and");
+        assert!(
+            !checker_forgives(&idle, Accel::Tcg, true),
+            "a worker never ran: fails"
+        );
+        let few = UNEVEN.replace("27 context switches", "12 context switches");
+        assert!(
+            !checker_forgives(&few, Accel::Tcg, true),
+            "too few rounds: fails"
+        );
+        let other = "origin-kernel: scheduler: workers did not exit: scheduler failed";
+        assert!(
+            !checker_forgives(other, Accel::Tcg, true),
+            "no other scheduler line"
+        );
     }
 }
 
