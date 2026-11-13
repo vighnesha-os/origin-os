@@ -50,7 +50,7 @@ use crate::addr::PhysAddr;
 use crate::aliases::{Aliases, Mode};
 use crate::memory::{self, OwnedFrame};
 use crate::objref::ObjectRef;
-use crate::tablebound::{self, Refusal};
+use crate::tablebound::{self, Refusal, RunRefusal};
 use crate::usercopy::{self, UserAccess, UserRange};
 
 /// Page-table frames one space may own (enough for a few scattered megabytes), its PML4
@@ -423,21 +423,31 @@ impl State {
     /// and makes the room for their records and every page table they need, so that
     /// [`map_run`](Self::map_run) cannot fail for want of either. On a failure, what it made
     /// stays, unused: room in two vectors, and empty tables this space frees with the rest.
+    ///
+    /// A run whose records would pass [`MAX_USER_PAGES`] is refused as a limit before any room is
+    /// made for them (`tablebound::ready_records`): such a run could never be mapped, and room
+    /// made for it would stay in both tables, so that what a space holds would depend on the size
+    /// of an object another process made (task S4-3; ADR-0005 G5). A page already mapped is
+    /// still refused first, as before.
     fn prepare_run(&mut self, base: u64, end: u64, count: usize) -> Result<(), ChangeError> {
-        if let Some(mapped) = self
+        let overlap = self
             .mapped
             .get(self.position(base))
             .filter(|m| m.virt < end)
-        {
-            return Err(MapError::AlreadyMapped(mapped.virt).into());
-        }
-        let records = self
-            .mapped
-            .len()
-            .checked_add(count)
-            .ok_or(MapError::OutOfMemory)?;
-        if self.mapped.try_reserve(count).is_err() || self.spare.try_reserve(records).is_err() {
-            return Err(MapError::OutOfMemory.into());
+            .map(|m| m.virt);
+        match tablebound::ready_records(
+            overlap,
+            &mut self.mapped,
+            &mut self.spare,
+            count,
+            MAX_USER_PAGES,
+        ) {
+            Ok(()) => {}
+            Err(RunRefusal::AlreadyMapped(virt)) => {
+                return Err(MapError::AlreadyMapped(virt).into());
+            }
+            Err(RunRefusal::Limit) => return Err(ChangeError::Limit),
+            Err(RunRefusal::NoMemory) => return Err(MapError::OutOfMemory.into()),
         }
         self.tables.refused = None;
         match self
