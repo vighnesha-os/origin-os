@@ -977,5 +977,5 @@ Task S4-3 (TASKS item 55), building the kernel-wide bound you accepted as item 2
 
 - **The alternative put** was one kernel constant for every port (256 a port): simpler, but a default nobody chose, against item 210 (G6).
 - **What it changes that is built.** Nothing yet. S4-3 lands with threat row K7 open on this point, naming this item. TASKS item 57 builds it, before S4-4's directory, the first long-lived service whose clients come and go.
-- **Performance cost** (ADR-0018 V3): unmeasured and owed, as ADR-0005 Amendment 10 states it: one comparison at each bind, and a larger figure for each process given the kind. It names cost ledger row CL37, which is added when the ledger (TASKS item 54, in the batch) and this amendment are in one tree.
+- **Performance cost** (ADR-0018 V3): unmeasured and owed, as ADR-0005 Amendment 10 states it: one comparison at each bind, and a larger figure for each process given the kind. It names cost ledger row CL38, which is added when the ledger (TASKS item 54, in the batch) and this amendment are in one tree.
 - **Where it is written.** ADR-0005 Amendment 10 (row I1). The matrix's new row A05-I1 names the item. The roadmap places that row in M4 beside G5, which it refines, in no exit test; the coordinating session placed it under item 264's rule, and you may reopen that.

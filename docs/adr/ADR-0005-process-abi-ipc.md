@@ -341,7 +341,7 @@ method object_signal = 10 (object: handle<any, signal>, clear: signals, set: sig
 - The first long-lived service whose clients come and go is S4-4's directory, so I1 is built before S4-4 (TASKS item 57).
 - A bind refused by I1 changes nothing: no binding, no charge, no slot.
 
-**Performance cost (ADR-0018 V3).** Unmeasured, owed (cost ledger row CL37, added when the ledger and this amendment are in one tree): one comparison, at each bind, of the port's bindings armed at once against its creator's bound; and a larger figure for each process given `bindings_per_port`, which lowers how many processes the kernel's root admits. No other call changes.
+**Performance cost (ADR-0018 V3).** Unmeasured, owed (cost ledger row CL38, added when the ledger and this amendment are in one tree): one comparison, at each bind, of the port's bindings armed at once against its creator's bound; and a larger figure for each process given `bindings_per_port`, which lowers how many processes the kernel's root admits. No other call changes.
 
 **Trade-offs.** A creator must say how many clients may wait on each of its ports at once, and a client beyond that is refused rather than served. In return a process's holdings depend on its own limits and not on how many clients have ever come and gone.
 
