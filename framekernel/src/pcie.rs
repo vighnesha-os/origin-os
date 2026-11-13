@@ -144,9 +144,12 @@ fn with_space<T>(
 }
 
 /// Region kinds that are RAM (or hold firmware data the kernel reads), which an ECAM
-/// window must never overlap.
+/// window must never overlap. Firmware memory of another type is device space, as reserved
+/// memory is; unaccepted memory is RAM (boot info 0.7).
 fn is_ram(kind: u32) -> bool {
-    kind != RegionKind::Reserved as u32 && kind != RegionKind::Mmio as u32
+    kind != RegionKind::Reserved as u32
+        && kind != RegionKind::Mmio as u32
+        && kind != RegionKind::FirmwareOther as u32
 }
 
 /// A size for the report: `32 B`, `4 KiB`, `16 MiB`.

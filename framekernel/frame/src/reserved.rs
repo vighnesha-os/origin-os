@@ -211,7 +211,9 @@ pub struct Platform<'a> {
 
 /// Memory-map kinds an identity range may lie in: VT-d §8.4 requires the firmware to report
 /// every RMRR as reserved or EFI runtime memory. Nothing the kernel allocates, holds or
-/// reclaims is any of these.
+/// reclaims is any of these. Since boot info 0.7 `Reserved` is UEFI type 0 alone: unaccepted
+/// memory and firmware memory of any other type have kinds of their own, refused here
+/// (TASKS item 40's review, L2; decision item 293).
 pub fn reserved_kind(kind: u32) -> bool {
     matches!(
         RegionKind::from_raw(kind),
@@ -866,6 +868,27 @@ mod tests {
                 !s.is_empty() && s.base.is_multiple_of(PAGE) && s.end.is_multiple_of(PAGE)
             }));
         }
+    }
+
+    #[test]
+    fn unaccepted_memory_and_firmware_memory_of_other_types_are_refused() {
+        // Boot info 0.7 (decision item 293): UEFI type 15, and types 13, OEM, OS and unknown,
+        // have kinds of their own, which no RMRR or IVMD may name.
+        let mut m = map();
+        m.push(region(0x6000_0000, 0x10, RegionKind::Unaccepted));
+        m.push(region(0x6100_0000, 0x10, RegionKind::FirmwareOther));
+        let p = platform(&m, &[]);
+        assert_eq!(
+            check(&rw(0x6000_0000, 0x6000_1000), 48, &p),
+            Err(Refusal::NotReserved(0x6000_0000))
+        );
+        assert_eq!(
+            check(&rw(0x6100_0000, 0x6100_1000), 48, &p),
+            Err(Refusal::NotReserved(0x6100_0000))
+        );
+        assert!(!reserved_kind(RegionKind::Unaccepted as u32));
+        assert!(!reserved_kind(RegionKind::FirmwareOther as u32));
+        assert!(reserved_kind(RegionKind::Reserved as u32));
     }
 
     #[test]

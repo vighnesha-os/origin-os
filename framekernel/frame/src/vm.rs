@@ -538,10 +538,12 @@ pub fn lent_ranges() -> Vec<(u64, u64)> {
 }
 
 /// Whether `[raw, end)` is memory the firmware described as its own (reserved, ACPI, runtime
-/// or device memory): never RAM the kernel owns or will own.
+/// or device memory, or firmware memory of another type): never RAM the kernel owns or will
+/// own. Unaccepted memory is RAM, not firmware data (boot info 0.7).
 fn is_firmware_data(raw: u64, end: u64) -> bool {
     let firmware = [
         RegionKind::Reserved,
+        RegionKind::FirmwareOther,
         RegionKind::AcpiReclaimable,
         RegionKind::AcpiNvs,
         RegionKind::Mmio,
