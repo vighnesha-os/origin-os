@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (below): Accepted** by the owner on 2026-11-08, with the recommended option of each item. **Amendment 2 (below): Accepted** by the owner on 2026-11-09, through ADR-0011. **Amendment 3 (below): Accepted** by the owner on 2026-11-09, through `docs/spec/OIDL.md`'s question Q8. **Amendment 4 (below): Accepted** by the owner on 2026-11-09. **Amendment 5 (below): Accepted** by the owner on 2026-11-10. **Amendment 6 (below): Accepted** by the owner on 2026-11-10; its E1, 64-bit handles, built by task S4-0 in the third batch (`land/s4`, merged at `5871257`), under QEMU only. **Amendment 7 (below): Accepted** by the owner on 2026-11-11; built by task S3-6 in the second step-3 batch, under QEMU only. **Amendment 8 (below): Accepted** by the owner on 2026-11-12 (items 204, 206–212, 214, 215, 217 and 220): what ADR-0011 N14 step 4 needs; not built. **Amendment 9 (below): Accepted** by the owner on 2026-11-13 (item 272): the flags at a thread's entry. The kernel already starts a thread so; no boot proof reads the flags yet. |
+| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (below): Accepted** by the owner on 2026-11-08, with the recommended option of each item. **Amendment 2 (below): Accepted** by the owner on 2026-11-09, through ADR-0011. **Amendment 3 (below): Accepted** by the owner on 2026-11-09, through `docs/spec/OIDL.md`'s question Q8. **Amendment 4 (below): Accepted** by the owner on 2026-11-09. **Amendment 5 (below): Accepted** by the owner on 2026-11-10. **Amendment 6 (below): Accepted** by the owner on 2026-11-10; its E1, 64-bit handles, built by task S4-0 in the third batch (`land/s4`, merged at `5871257`), under QEMU only. **Amendment 7 (below): Accepted** by the owner on 2026-11-11; built by task S3-6 in the second step-3 batch, under QEMU only. **Amendment 8 (below): Accepted** by the owner on 2026-11-12 (items 204, 206–212, 214, 215, 217 and 220): what ADR-0011 N14 step 4 needs; not built. **Amendment 9 (below): Accepted** by the owner on 2026-11-13 (item 272): the flags at a thread's entry. The kernel already starts a thread so; no boot proof reads the flags yet. **Amendment 10 (below): Accepted** by the owner on 2026-11-13 (item 282): a port's creator pays for its index; not built. |
 | Scope | Kernel objects and handles, the system-call convention, status codes, process and thread start, memory mapping, IPC, waiting, faults, termination, ABI versioning |
 | Builds on | ONBF §6.1 (EXE/LIB images, syscall-origin pinning, TLS in FS), §8.2 (sealed objects, the Code Integrity Table, mapping rules), §8.3 (the user-mode Loader Service and the start record); ADR-0001 D2 (user-mode drivers); ADR-0004 (address-space layout) |
 | Requires | CLAUDE.md §29 (processes and isolation), §30 (IPC and capabilities), §42 (executable ABI), §44 (runtime), §49 (SDK) |
@@ -325,3 +325,26 @@ method object_signal = 10 (object: handle<any, signal>, clear: signals, set: sig
 **Migration consequences.** None: `user-abi` is at major 0 (P12), and the kernel's behaviour does not change.
 
 **What stays unknown.** Nothing has read the flags from ring 3 at entry. The psABI's other chapters were not read against this revision (the ledger's section 4).
+
+## Amendment 10 (Accepted, 2026-11-13): a port's creator pays for its index
+
+**Status: Accepted by the owner on 2026-11-13 with the recommended answer ("Accept 282", decision sheet item 282; CLAUDE.md §84). Not built.** Task S4-3 (TASKS item 55), building G5's kernel-wide bound, measured a port's index per binding as G5's last sentence asks. A binding's share is at most 8 slots, and that is counted in the binder's figure. What G5 did not foresee: the index never shrinks while the port is open, because each binding's record holds its slot number and a live slot cannot move. So when a binder's packets have been read and its account goes, its payment comes back, and the slots its bindings grew stay until the port closes, counted by nobody. On one port the leftover is at most that port's own peak of bindings armed at once. Across many long-lived ports the total is not bounded by any figure the kernel holds.
+
+| # | Item | Decision | Refines |
+|---|---|---|---|
+| I1 | 282 | **A port's creator pays for its index.** A process's limits gain one kind, `bindings_per_port`: the most bindings armed at once on any one port that process creates. The port's part of its creator's figure (G5) is the index at that bound, its growth and the heap's rounding included, so every slot is covered for as long as its port exists. An `object_wait_async` that would arm one binding more on that port than its creator's `bindings_per_port` allows is `limit`, F2's status, at F2's place in D5's order, after the binder's own `bindings` quota. The binder's `bindings` quota (F7) is unchanged. The kind is given deliberately and is zero when not given (G6): a port whose creator was given none accepts no binding. In step 4 each program's value is written beside its image, the least it needs, from its own high-water marks. | F2, F7; G5, G6 |
+
+**Options that were put.** (a) As decided: a kind in each process's limits. (b) One kernel constant for every port (256 bindings a port was proposed): simpler, but a default nobody chose for their program, against G6. (c) An index that shrinks once its high slots are free: no bound, since one live binding at the top keeps every slot below it. (d) Record the gap and decide later.
+
+**Recorded, and no decision.**
+- Threat row K7 stays open on this point until I1 is built.
+- The first long-lived service whose clients come and go is S4-4's directory, so I1 is built before S4-4 (TASKS item 57).
+- A bind refused by I1 changes nothing: no binding, no charge, no slot.
+
+**Performance cost (ADR-0018 V3).** Unmeasured, owed (cost ledger row CL37, added when the ledger and this amendment are in one tree): one comparison, at each bind, of the port's bindings armed at once against its creator's bound; and a larger figure for each process given `bindings_per_port`, which lowers how many processes the kernel's root admits. No other call changes.
+
+**Trade-offs.** A creator must say how many clients may wait on each of its ports at once, and a client beyond that is refused rather than served. In return a process's holdings depend on its own limits and not on how many clients have ever come and gone.
+
+**Migration consequences.** None for a program: `user-abi` is at major 0 (P12), and no call's shape changes. The kernel's `Limits` gains one field, given in each place that writes one (G6).
+
+**What stays unknown.** The right value for a real service. The index's cost per binding was measured on the host only, by S4-3's test.
