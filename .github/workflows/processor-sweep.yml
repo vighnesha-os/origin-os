@@ -81,9 +81,9 @@ jobs:
         if: steps.need.outputs.boot == 'true'
         run: |
           if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
-            cargo xtask boot-matrix
+            cargo --locked xtask boot-matrix
           fi
-          ORIGIN_QEMU_CPU=host ORIGIN_QEMU_SMP=4 ORIGIN_BOOT_TEST_ONLY='kernel boot' cargo xtask boot-test
+          ORIGIN_QEMU_CPU=host ORIGIN_QEMU_SMP=4 ORIGIN_BOOT_TEST_ONLY='kernel boot' cargo --locked xtask boot-test
       - name: Record the result
         if: ${{ !cancelled() && (steps.boots.outcome == 'success' || steps.boots.outcome == 'failure') }}
         env:

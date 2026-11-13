@@ -316,10 +316,10 @@ impl<T: Fixed, const N: usize> Fixed for [T; N] {
     }
 }
 
-/// A handle: an opaque name for a kernel object (ADR-0011 N9).
+/// A handle: an opaque 64-bit name for a kernel object (ADR-0011 N9; ADR-0005 Amendment 6, E1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct Handle(u32);
+pub struct Handle(u64);
 
 impl Handle {
     /// Never a valid handle.
@@ -327,13 +327,13 @@ impl Handle {
 
     /// The transport layer's way to make one. Not part of the SDK.
     #[doc(hidden)]
-    pub const fn from_abi(raw: u32) -> Self {
+    pub const fn from_abi(raw: u64) -> Self {
         Self(raw)
     }
 
     /// The transport layer's way to read one. Not part of the SDK.
     #[doc(hidden)]
-    pub const fn to_abi(self) -> u32 {
+    pub const fn to_abi(self) -> u64 {
         self.0
     }
 
@@ -344,10 +344,10 @@ impl Handle {
 }
 
 impl Fixed for Handle {
-    const SIZE: usize = 4;
+    const SIZE: usize = 8;
     const FILLER: Self = Self(0);
     fn read(bytes: &[u8], minor: u16) -> Result<Self, WireError> {
-        u32::read(bytes, minor).map(Self)
+        u64::read(bytes, minor).map(Self)
     }
     fn write(self, out: &mut [u8]) -> Result<(), WireError> {
         self.0.write(out)
@@ -432,13 +432,13 @@ impl<'h> HandleList<'h> {
 /// Collects the handles of a message being encoded, assigning each its slot.
 #[derive(Debug)]
 pub struct HandleSink<'a> {
-    out: &'a mut [u32],
+    out: &'a mut [u64],
     used: usize,
 }
 
 impl<'a> HandleSink<'a> {
     /// Handles will be written into `out`.
-    pub fn new(out: &'a mut [u32]) -> Self {
+    pub fn new(out: &'a mut [u64]) -> Self {
         Self { out, used: 0 }
     }
 
@@ -1046,12 +1046,12 @@ pub trait Transport {
         &mut self,
         buffer: &mut [u8],
         request: usize,
-        handles: &[u32],
+        handles: &[u64],
         received: &mut [RecvHandle],
     ) -> Result<(usize, usize), i64>;
 
     /// Sends a one-way message.
-    fn send(&mut self, buffer: &[u8], handles: &[u32]) -> Result<(), i64>;
+    fn send(&mut self, buffer: &[u8], handles: &[u64]) -> Result<(), i64>;
 
     /// Closes handles received with a reply that a client refused (§7.8).
     fn discard(&mut self, handles: &[RecvHandle]);
@@ -1063,7 +1063,7 @@ pub struct Scratch<'a> {
     /// Message bytes.
     pub bytes: &'a mut [u8],
     /// Handles to send.
-    pub handles: &'a mut [u32],
+    pub handles: &'a mut [u64],
     /// Handles received.
     pub received: &'a mut [RecvHandle],
 }
@@ -1219,23 +1219,24 @@ impl<T> UserRef<T> {
 /// about it (§6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HandleArg {
-    value: u32,
+    value: u64,
     need_rights: u32,
     need_object: u32,
 }
 
 impl HandleArg {
-    /// `None` if the register holds more than 32 bits.
-    pub fn from_reg(raw: u64, need_rights: u32, need_object: u32) -> Option<Self> {
-        Some(Self {
-            value: u32::try_from(raw).ok()?,
+    /// The register as it came: a handle fills its register, and every value is one the
+    /// kernel's table may be asked about (ADR-0005 Amendment 6, E1).
+    pub const fn from_reg(raw: u64, need_rights: u32, need_object: u32) -> Self {
+        Self {
+            value: raw,
             need_rights,
             need_object,
-        })
+        }
     }
 
     /// The handle's value.
-    pub const fn value(self) -> u32 {
+    pub const fn value(self) -> u64 {
         self.value
     }
 

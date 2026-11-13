@@ -171,7 +171,7 @@ pub trait DirectoryServer {
 }
 
 /// Validates and runs one message on a connection (§7.5, §7.8).
-pub fn dispatch<S: DirectoryServer>(server: &mut S, caller: &S::Caller, connection: &mut rt::Connection, message: &[u8], handles: &[rt::RecvHandle], reply: &mut [u8], reply_handles: &mut [u32]) -> rt::Dispatched {
+pub fn dispatch<S: DirectoryServer>(server: &mut S, caller: &S::Caller, connection: &mut rt::Connection, message: &[u8], handles: &[rt::RecvHandle], reply: &mut [u8], reply_handles: &mut [u64]) -> rt::Dispatched {
     let Ok(oidl_header) = rt::read_header(message) else {
         return rt::Dispatched::Close { taken: false };
     };
@@ -198,7 +198,7 @@ pub fn dispatch<S: DirectoryServer>(server: &mut S, caller: &S::Caller, connecti
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_connect<S: DirectoryServer>(server: &mut S, caller: &S::Caller, oidl_header: rt::Header, oidl_body: &[u8], handles: &[rt::RecvHandle], oidl_minor: u16, reply: &mut [u8], reply_handles: &mut [u32]) -> rt::Dispatched {
+fn handle_connect<S: DirectoryServer>(server: &mut S, caller: &S::Caller, oidl_header: rt::Header, oidl_body: &[u8], handles: &[rt::RecvHandle], oidl_minor: u16, reply: &mut [u8], reply_handles: &mut [u64]) -> rt::Dispatched {
     let _ = (&oidl_minor, &reply, &reply_handles, &oidl_header);
     let mut oidl_list = rt::HandleList::new(handles);
     let Ok(oidl_request) = ConnectRequest::decode(oidl_body, &mut oidl_list, oidl_minor) else {

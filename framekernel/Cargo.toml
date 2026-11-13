@@ -12,8 +12,9 @@ publish.workspace = true
 path = "src/lib.rs"
 
 # The kernel image: its link root, which holds `_start` and so sits in the framework's directory
-# (ADR-0011 N6). Build it only for x86_64-unknown-none; `build.rs` adds the link arguments that
-# give it the ELF shape `onbf-pack` accepts.
+# (ADR-0011 N6). Build it only for x86_64-unknown-none; `.cargo/config.toml` holds the link
+# arguments that give it the ELF shape `onbf-pack` accepts. This package has no build script,
+# and `cargo xtask check` fails if it gets one (TASKS item 44).
 [[bin]]
 name = "framekernel"
 path = "frame/entry/main.rs"

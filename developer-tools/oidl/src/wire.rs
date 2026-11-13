@@ -474,14 +474,10 @@ pub fn check_call(method: &Method, holds: bool, args: [u64; 6]) -> Result<(), St
     let invalid = || Err("invalid_args".to_string());
     for param in &method.params {
         match &param.ty {
-            Type::Handle(handle) => {
-                let raw = next(&mut index);
-                if handle.optional && raw == 0 {
-                    continue;
-                }
-                if raw > u64::from(u32::MAX) {
-                    return Err("bad_handle".to_string());
-                }
+            // A handle fills its register (ADR-0005 Amendment 6, E1): no value is refused here,
+            // and 0 for an optional one is absent. The kernel's table judges the rest.
+            Type::Handle(_) => {
+                let _handle = next(&mut index);
             }
             Type::Bool => {
                 if next(&mut index) > 1 {

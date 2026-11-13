@@ -1,0 +1,43 @@
+# The userspace build of CLAUDE.md §11 (task S4-1, TASKS item 41; ADR-0011 Amendment 2, L1).
+#
+# Cargo never reads this file by itself: `cargo xtask` passes it with `--config` to the builds of
+# the ring-3 crates, and to nothing else. Its flags cannot go in `config.toml`: CI's host is
+# `x86_64-unknown-linux-gnu`, the triple Origin's userspace uses as a code generator, so a
+# `[target.x86_64-unknown-linux-gnu]` section there would put `panic=abort` and `rust-lld` on
+# every host build and test. Every ring-3 build names `--target x86_64-unknown-linux-gnu`, so
+# these flags reach the ring-3 crates and never the build scripts compiled for the host.
+#
+# The triple is a code generator only (§11): the hard-float System V ABI, with no Linux API.
+# Origin supplies `_start` and the `mem*` functions (`runtime/rt`).
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    # ONBF §6.1.3: the baseline of every first-party image.
+    "-C", "target-cpu=x86-64-v3",
+    # ONBF §6.1.1: stable `no_std` cannot define an unwinding personality.
+    "-C", "panic=abort",
+    # CLAUDE.md §14 and ONBF §6.1.1: crash stacks without unwinding.
+    "-C", "force-frame-pointers=yes",
+    # A PIE (the triple's default, stated so it cannot drift): the launch path places the
+    # program at a random base and applies its relative relocations.
+    "-C", "relocation-model=pie",
+    # `rust-lld` directly, as an ELF linker: no C compiler driver, no C runtime objects and no
+    # C library (§11).
+    "-C", "linker=rust-lld",
+    "-C", "linker-flavor=ld.lld",
+    # The shape `onbf-pack carried` accepts (ONBF §6.1.2), the same as the kernel's
+    # (`.cargo/config.toml`). These come after rustc's own arguments, and in lld the last of
+    # two opposing `-z` options wins.
+    "-C", "link-arg=--entry=_start",
+    # No PT_INTERP: nothing loads these images but the kernel's launch path.
+    "-C", "link-arg=--no-dynamic-linker",
+    # No text relocations: every relocation target is in a writable segment.
+    "-C", "link-arg=-ztext",
+    # Every PT_LOAD starts on its own 4 KiB page, so no page holds two permissions (ONBF §6.1).
+    "-C", "link-arg=-zseparate-loadable-segments",
+    "-C", "link-arg=-zmax-page-size=4096",
+    "-C", "link-arg=-zcommon-page-size=4096",
+    # Full RELRO: the launch path maps the relocated part read-only from the start.
+    "-C", "link-arg=-zrelro",
+    "-C", "link-arg=-znow",
+    "-C", "link-arg=-znoexecstack",
+]

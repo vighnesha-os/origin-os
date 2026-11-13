@@ -232,6 +232,8 @@ The decisions above stand as accepted. This section records what building six of
 
 **What no test here shows.** What a processor does on a wrongly guessed path: no boot proof can, and QEMU's processor does not speculate. That any control takes effect: the development machine's emulator has none, so every write is unexercised until CI's boots under KVM. The costs: the figures the boot prints are an emulator's.
 
+*Z9's form, 2026-11-12 (TASKS item 16; this note changes no decision):* the CPU identification table now exists, as `origin_frame::cpuident`, and the form is its column, as "Migration consequences" foresaw. `nospec::choose` and `Maker` moved into it, and the plan and the clamp proof read the form from it. The answer is unchanged for every maker and every family: a host test compares the table with the rule of item 132, written again from its text, for every family up to 10EH. The row above still names `nospec::choose` as it stood when 19b was built.
+
 ### Amendment 1: the toolchain's prebuilt libraries are outside Z10 (decision item 152)
 
 **Status: Accepted by the owner on 2026-11-10, as recommended (decision sheet item 152; CLAUDE.md §18).** The owner's answer was "Accept all" to eight recommendations put in the coordinating session, which relayed it to the session that built 19b. Built: the gate already behaves this way.

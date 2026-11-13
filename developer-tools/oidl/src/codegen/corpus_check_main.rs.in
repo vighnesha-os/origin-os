@@ -52,10 +52,11 @@ fn run_line(library: &str, line: &str) -> Result<(), String> {
                 .filter(|h| !h.is_empty())
                 .map(|h| {
                     let mut items = h.split(':');
+                    let value =
+                        u64::from_str_radix(items.next().expect("field"), 16).expect("hex");
                     let mut next = || {
                         u32::from_str_radix(items.next().expect("field"), 16).expect("hex")
                     };
-                    let value = next();
                     let object = next();
                     let rights = next();
                     rt::RecvHandle {

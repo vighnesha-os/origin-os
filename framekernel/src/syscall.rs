@@ -357,7 +357,8 @@ fn read_u32(p: &UserContext, addr: u64) -> Result<u32, Error> {
     Ok(u32::from_le_bytes(bytes))
 }
 
-/// Writes the handles in `values` to the caller's memory at `addr`, as little-endian `u32`s.
+/// Writes the handles in `values` to the caller's memory at `addr`, as little-endian `u64`s
+/// (ADR-0005 Amendment 6, E1).
 fn copy_out_handles(p: &UserContext, addr: u64, values: &[Handle]) -> Result<(), Error> {
     let mut bytes = [0; HANDLE_BYTES * MAX_HANDLES];
     let dst = bytes
@@ -381,8 +382,9 @@ fn copy_out_records(p: &UserContext, addr: u64, received: &[ipc::Received]) -> R
         .ok_or(Error::InvalidArgs)?;
     let (records, _) = dst.as_chunks_mut::<RECORD_BYTES>();
     for (record, r) in records.iter_mut().zip(received) {
+        rt::put_field(record, oidl::ReceivedHandle::HANDLE_AT, r.handle)
+            .map_err(|_| Error::InvalidArgs)?;
         let fields = [
-            (oidl::ReceivedHandle::HANDLE_AT, r.handle),
             (oidl::ReceivedHandle::OBJECT_TYPE_AT, r.object_type),
             (oidl::ReceivedHandle::RIGHTS_AT, r.rights),
         ];
@@ -479,7 +481,7 @@ fn channel_write(
     let mut values = [0; MAX_HANDLES];
     let (chunks, _) = raw_used.as_chunks::<HANDLE_BYTES>();
     for (value, chunk) in values.iter_mut().zip(chunks) {
-        *value = u32::from_le_bytes(*chunk);
+        *value = Handle::from_le_bytes(*chunk);
     }
     let transfer = values.get(..count).ok_or(Error::InvalidArgs)?;
     // The writer's identity comes from its process, never from an argument (B1).

@@ -799,12 +799,6 @@ fn the_corpus_passes_and_every_planted_fault_fails_it() {
             "if false {",
         ),
         (
-            "a register handle may be wider than 32 bits",
-            "rust/oidl_rt.rs",
-            "value: u32::try_from(raw).ok()?,",
-            "value: raw as u32,",
-        ),
-        (
             "the capability gate is open",
             "rust/origin_kernel/kernel/server.rs",
             "if !oidl_calls.holds(Capability::KernelDebug) {",
@@ -937,12 +931,10 @@ fn the_fixture_api_round_trips_and_the_server_refuses_what_it_must() {
     assert!(out.contains("all checks passed"), "{out}");
 }
 
-#[test]
-fn the_syscall_outputs_decode_exactly_and_the_client_works_through_the_c_abi() {
-    let tree = tree();
-    // A copy of the tree without `core_stubs`: this program defines the C entry points itself, a
-    // mock kernel, and the real ones must not be linked in on an x86-64 host.
-    let mut files = tree.files.clone();
+/// A copy of the shared tree without `core_stubs`: `syscall_api.rs` defines the C entry points
+/// itself, a mock kernel, and the real ones must not be linked in on an x86-64 host.
+fn syscall_api_files() -> BTreeMap<String, String> {
+    let mut files = tree().files.clone();
     for (path, text) in &mut files {
         if path.ends_with("/mod.rs") {
             *text = text.replace(
@@ -951,6 +943,60 @@ fn the_syscall_outputs_decode_exactly_and_the_client_works_through_the_c_abi() {
             );
         }
     }
+    files
+}
+
+/// The negative control of `syscall_api.rs`'s checks that a handle reaches the kernel whole
+/// (ADR-0005 Amendment 6, E1; task S4-0): a decoder planted to keep only a handle register's low
+/// 32 bits must fail them. The corpus cannot see this, since nothing in it is refused.
+#[test]
+fn a_handle_cut_to_32_bits_fails_the_syscall_checks() {
+    let mut files = syscall_api_files();
+    let runtime = files.get_mut("rust/oidl_rt.rs").expect("the runtime");
+    let find = "            value: raw,\n            need_rights,\n";
+    assert!(runtime.contains(find), "the pattern to break is gone");
+    *runtime = runtime.replacen(
+        find,
+        "            value: raw & 0xFFFF_FFFF,\n            need_rights,\n",
+        1,
+    );
+    let dir = scratch("syscall-api-cut");
+    write_tree(&dir, &files);
+    let rlib = host_rlib(&dir, &["-A", "warnings"]);
+    let program = dir.join("syscall_api");
+    let mut cmd = Command::new(rustc());
+    cmd.args([
+        "--edition",
+        "2024",
+        "--crate-type",
+        "bin",
+        "--crate-name",
+        "syscall_api",
+    ])
+    .arg("--extern")
+    .arg(format!("oidl_generated={}", rlib.display()))
+    .arg("-o")
+    .arg(&program)
+    .arg(program_path("syscall_api.rs"))
+    .args(["-A", "warnings"])
+    .current_dir(&dir);
+    run_ok(cmd, "compile syscall_api with the planted cut");
+    let out = Command::new(&program).output().expect("run syscall_api");
+    assert!(
+        !out.status.success(),
+        "a handle cut to 32 bits passed every check: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("a handle's top half was lost"),
+        "failed elsewhere: {stderr}"
+    );
+}
+
+#[test]
+fn the_syscall_outputs_decode_exactly_and_the_client_works_through_the_c_abi() {
+    let files = syscall_api_files();
     let dir = scratch("syscall-api");
     write_tree(&dir, &files);
     let rlib = host_rlib(&dir, &["-A", "warnings"]);

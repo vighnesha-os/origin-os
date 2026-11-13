@@ -14,7 +14,7 @@
 use super::super::oidl_rt as rt;
 
 /// This library's version: `(major, minor)` (§9).
-pub const VERSION: (u16, u16) = (0, 6);
+pub const VERSION: (u16, u16) = (0, 7);
 
 /// The rights of a new channel end: everything that applies to a channel (ADR-0005 P2, P8,
 /// amendment A1).
@@ -714,11 +714,12 @@ impl ReadSizes {
 }
 
 /// A handle channel_read moved into the caller's table: its value there, what it names and the
-/// rights it has, so a receiver can check both before using it (ADR-0005 B3, C3).
+/// rights it has, so a receiver can check both before using it (ADR-0005 B3, C3). 16 bytes: the
+/// handle is 64 bits (ADR-0005 Amendment 6, E1, from 0.7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReceivedHandle {
     /// Its value in the caller's table.
-    pub handle: u32,
+    pub handle: u64,
     /// The type of the object it names.
     pub object_type: ObjectType,
     /// Its rights in the caller's table.
@@ -729,15 +730,15 @@ impl ReceivedHandle {
     /// Byte offset of `handle`.
     pub const HANDLE_AT: usize = 0;
     /// Byte offset of `object_type`.
-    pub const OBJECT_TYPE_AT: usize = 4;
+    pub const OBJECT_TYPE_AT: usize = 8;
     /// Byte offset of `rights`.
-    pub const RIGHTS_AT: usize = 8;
+    pub const RIGHTS_AT: usize = 12;
 }
 
 impl rt::Fixed for ReceivedHandle {
-    const SIZE: usize = 12;
+    const SIZE: usize = 16;
     const FILLER: Self = Self {
-        handle: <u32 as rt::Fixed>::FILLER,
+        handle: <u64 as rt::Fixed>::FILLER,
         object_type: <ObjectType as rt::Fixed>::FILLER,
         rights: <Rights as rt::Fixed>::FILLER,
     };
@@ -745,9 +746,9 @@ impl rt::Fixed for ReceivedHandle {
         if oidl_bytes.len() != Self::SIZE {
             return Err(rt::WireError::Size);
         }
-        let handle: u32 = rt::field(oidl_bytes, 0, oidl_minor)?;
-        let object_type: ObjectType = rt::field(oidl_bytes, 4, oidl_minor)?;
-        let rights: Rights = rt::field(oidl_bytes, 8, oidl_minor)?;
+        let handle: u64 = rt::field(oidl_bytes, 0, oidl_minor)?;
+        let object_type: ObjectType = rt::field(oidl_bytes, 8, oidl_minor)?;
+        let rights: Rights = rt::field(oidl_bytes, 12, oidl_minor)?;
         Ok(Self { handle, object_type, rights })
     }
     fn write(self, out: &mut [u8]) -> Result<(), rt::WireError> {
@@ -756,8 +757,8 @@ impl rt::Fixed for ReceivedHandle {
         }
         out.fill(0);
         rt::put_field(out, 0, self.handle)?;
-        rt::put_field(out, 4, self.object_type)?;
-        rt::put_field(out, 8, self.rights)?;
+        rt::put_field(out, 8, self.object_type)?;
+        rt::put_field(out, 12, self.rights)?;
         Ok(())
     }
 }
@@ -863,11 +864,12 @@ impl rt::Fixed for StartHeader {
     }
 }
 
-/// One handle a start record names (ADR-0005 C4).
+/// One handle a start record names (ADR-0005 C4). 24 bytes, the last four padding: the handle
+/// is 64 bits (ADR-0005 Amendment 6, E1, from 0.7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartEntry {
     /// Its value in the process's table.
-    pub handle: u32,
+    pub handle: u64,
     /// The type of the object it names.
     pub object_type: ObjectType,
     /// Its rights.
@@ -880,17 +882,17 @@ impl StartEntry {
     /// Byte offset of `handle`.
     pub const HANDLE_AT: usize = 0;
     /// Byte offset of `object_type`.
-    pub const OBJECT_TYPE_AT: usize = 4;
+    pub const OBJECT_TYPE_AT: usize = 8;
     /// Byte offset of `rights`.
-    pub const RIGHTS_AT: usize = 8;
+    pub const RIGHTS_AT: usize = 12;
     /// Byte offset of `role`.
-    pub const ROLE_AT: usize = 12;
+    pub const ROLE_AT: usize = 16;
 }
 
 impl rt::Fixed for StartEntry {
-    const SIZE: usize = 16;
+    const SIZE: usize = 24;
     const FILLER: Self = Self {
-        handle: <u32 as rt::Fixed>::FILLER,
+        handle: <u64 as rt::Fixed>::FILLER,
         object_type: <ObjectType as rt::Fixed>::FILLER,
         rights: <Rights as rt::Fixed>::FILLER,
         role: <StartRole as rt::Fixed>::FILLER,
@@ -899,10 +901,11 @@ impl rt::Fixed for StartEntry {
         if oidl_bytes.len() != Self::SIZE {
             return Err(rt::WireError::Size);
         }
-        let handle: u32 = rt::field(oidl_bytes, 0, oidl_minor)?;
-        let object_type: ObjectType = rt::field(oidl_bytes, 4, oidl_minor)?;
-        let rights: Rights = rt::field(oidl_bytes, 8, oidl_minor)?;
-        let role: StartRole = rt::field(oidl_bytes, 12, oidl_minor)?;
+        let handle: u64 = rt::field(oidl_bytes, 0, oidl_minor)?;
+        let object_type: ObjectType = rt::field(oidl_bytes, 8, oidl_minor)?;
+        let rights: Rights = rt::field(oidl_bytes, 12, oidl_minor)?;
+        let role: StartRole = rt::field(oidl_bytes, 16, oidl_minor)?;
+        rt::check_zero(oidl_bytes, 20, 4)?;
         Ok(Self { handle, object_type, rights, role })
     }
     fn write(self, out: &mut [u8]) -> Result<(), rt::WireError> {
@@ -911,9 +914,9 @@ impl rt::Fixed for StartEntry {
         }
         out.fill(0);
         rt::put_field(out, 0, self.handle)?;
-        rt::put_field(out, 4, self.object_type)?;
-        rt::put_field(out, 8, self.rights)?;
-        rt::put_field(out, 12, self.role)?;
+        rt::put_field(out, 8, self.object_type)?;
+        rt::put_field(out, 12, self.rights)?;
+        rt::put_field(out, 16, self.role)?;
         Ok(())
     }
 }

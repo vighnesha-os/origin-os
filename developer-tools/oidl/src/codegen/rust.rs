@@ -769,12 +769,12 @@ fn gen_sys_decode(g: &Gen<'_>, t: &mut Text, method: &Method) {
                 let (need_rights, need_object) = (h.rights_mask, h.object_value);
                 if h.optional {
                     t.line(format!(
-                        "let {name} = if {a} == 0 {{ None }} else {{ Some(rt::HandleArg::from_reg({a}, {need_rights:#x}, {need_object}).ok_or({error}::BadHandle)?) }};",
+                        "let {name} = if {a} == 0 {{ None }} else {{ Some(rt::HandleArg::from_reg({a}, {need_rights:#x}, {need_object})) }};",
                         name = param.name
                     ));
                 } else {
                     t.line(format!(
-                        "let {name} = rt::HandleArg::from_reg({a}, {need_rights:#x}, {need_object}).ok_or({error}::BadHandle)?;",
+                        "let {name} = rt::HandleArg::from_reg({a}, {need_rights:#x}, {need_object});",
                         name = param.name
                     ));
                 }
@@ -1178,14 +1178,14 @@ fn abi_scalar(g: &Gen<'_>, ty: &Type) -> String {
         Type::Int(int) => int.rust().to_string(),
         Type::Enum(e) => e.repr.rust().to_string(),
         Type::Bits(b) => b.repr.rust().to_string(),
-        Type::Handle(_) => "u32".to_string(),
+        Type::Handle(_) => format!("u{}", layout::HANDLE_BITS),
         other => g.fixed(3, other),
     }
 }
 
 fn abi_element(ty: &Type) -> String {
     match ty {
-        Type::Handle(_) => "u32".to_string(),
+        Type::Handle(_) => format!("u{}", layout::HANDLE_BITS),
         Type::Int(int) => int.rust().to_string(),
         _ => "u8".to_string(),
     }
@@ -2487,7 +2487,7 @@ fn gen_channel_server(g: &Gen<'_>, interface: &Interface) -> String {
     // Dispatch.
     t.line("/// Validates and runs one message on a connection (§7.5, §7.8).");
     t.open(format!(
-        "pub fn dispatch<S: {trait_name}>(server: &mut S, caller: &S::Caller, connection: &mut rt::Connection, message: &[u8], handles: &[rt::RecvHandle], reply: &mut [u8], reply_handles: &mut [u32]) -> rt::Dispatched {{"
+        "pub fn dispatch<S: {trait_name}>(server: &mut S, caller: &S::Caller, connection: &mut rt::Connection, message: &[u8], handles: &[rt::RecvHandle], reply: &mut [u8], reply_handles: &mut [u64]) -> rt::Dispatched {{"
     ));
     t.line("let Ok(oidl_header) = rt::read_header(message) else {");
     t.line("    return rt::Dispatched::Close { taken: false };");
@@ -2548,7 +2548,7 @@ fn gen_channel_handler(t: &mut Text, method: &Method, trait_name: &str, status: 
     let base_name = pascal(&method.name);
     t.line("#[allow(clippy::too_many_arguments)]");
     t.open(format!(
-        "fn handle_{}<S: {trait_name}>(server: &mut S, caller: &S::Caller, oidl_header: rt::Header, oidl_body: &[u8], handles: &[rt::RecvHandle], oidl_minor: u16, reply: &mut [u8], reply_handles: &mut [u32]) -> rt::Dispatched {{",
+        "fn handle_{}<S: {trait_name}>(server: &mut S, caller: &S::Caller, oidl_header: rt::Header, oidl_body: &[u8], handles: &[rt::RecvHandle], oidl_minor: u16, reply: &mut [u8], reply_handles: &mut [u64]) -> rt::Dispatched {{",
         method.name
     ));
     t.line("let _ = (&oidl_minor, &reply, &reply_handles, &oidl_header);");

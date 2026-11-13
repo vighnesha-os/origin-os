@@ -229,7 +229,7 @@ impl Program {
     /// Grants `object` with `rights` before the process starts: its handle, as an argument.
     fn grant(&self, object: Object, rights: u32) -> Option<Arg> {
         let handle = self.image.process.grant(object, rights).ok()?;
-        Some(Imm(u64::from(handle)))
+        Some(Imm(handle))
     }
 
     /// The process, its script written; its own handle goes in slot 0.
@@ -397,7 +397,7 @@ fn cancels(w: &mut Written) -> Vec<usize> {
     w.call(dup("", a, EVENT, 11, OK));
     w.call(bind(p, h(11), 11, SIG, OK));
     w.call(create(12));
-    w.call(super::copy32(slot_addr(11), LIST));
+    w.call(super::copy_handle(slot_addr(11), LIST));
     w.call(send("", h(12), 1, OK));
     w.packet(p, 11, packet_kind::CANCELED, SIG, 0);
     w.call(close("", h(12), OK));
@@ -663,7 +663,7 @@ fn canceled_wait(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u
     ) else {
         return set_up(com1);
     };
-    let (waited, kept) = (Imm(u64::from(waited)), Imm(u64::from(kept)));
+    let (waited, kept) = (Imm(waited), Imm(kept));
     let first = alloc::vec![take(waited, DEADLINE_INFINITE, PKT, Error::Canceled.raw())];
     let second = alloc::vec![
         close("", waited, OK),

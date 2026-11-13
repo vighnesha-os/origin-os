@@ -54,7 +54,7 @@ use origin_abi::{Error, Handle, signals};
 use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
 use origin_frame::sync::ports::Source;
-use origin_frame::userspace::{UserFrame, UserSpace};
+use origin_frame::userspace::{ChangeError, UserFrame, UserSpace};
 
 use crate::cpu::{CpuIndex, without_interrupts};
 use crate::ipc::{self, Object};
@@ -426,12 +426,13 @@ impl Process {
 
     /// Maps the user page `virt` to a fresh zeroed frame this process owns, and returns it.
     /// Only inside the user half (ADR-0004 H1). Before the process has threads, while its
-    /// creator holds the only reference to the address space.
-    pub(crate) fn map_page(&mut self, virt: u64, access: Access) -> Result<UserFrame, MapError> {
+    /// creator holds the only reference to the address space. [`ChangeError::Limit`] when the
+    /// page needs one more page table than the space may have (`UserSpace::map_page`).
+    pub(crate) fn map_page(&mut self, virt: u64, access: Access) -> Result<UserFrame, ChangeError> {
         without_interrupts(|| {
             let mut space = self.space.lock();
             let unique = space.as_mut().and_then(ObjectRef::get_mut);
-            unique.map_or(Err(MapError::OutOfMemory), |space| {
+            unique.map_or(Err(ChangeError::Map(MapError::OutOfMemory)), |space| {
                 space.map_page(virt, access)
             })
         })

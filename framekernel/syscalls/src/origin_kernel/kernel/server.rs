@@ -1082,13 +1082,13 @@ fn call_debug_write<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> R
 
 fn call_handle_close<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), HandleCloseError> {
     let [oidl_a0, _, _, _, _, _] = oidl_args;
-    let handle = rt::HandleArg::from_reg(oidl_a0, 0x0, 0).ok_or(HandleCloseError::BadHandle)?;
+    let handle = rt::HandleArg::from_reg(oidl_a0, 0x0, 0);
     oidl_calls.handle_close(handle)
 }
 
 fn call_handle_duplicate<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), HandleDuplicateError> {
     let [oidl_a0, oidl_a1, oidl_a2, _, _, _] = oidl_args;
-    let handle = rt::HandleArg::from_reg(oidl_a0, 0x10, 0).ok_or(HandleDuplicateError::BadHandle)?;
+    let handle = rt::HandleArg::from_reg(oidl_a0, 0x10, 0);
     let rights = u32::try_from(oidl_a1).ok().and_then(Rights::from_bits).ok_or(HandleDuplicateError::InvalidArgs)?;
     let new_handle = rt::UserRef::new(oidl_a2);
     oidl_calls.handle_duplicate(handle, rights, new_handle)
@@ -1102,7 +1102,7 @@ fn call_channel_create<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -
 
 fn call_channel_write<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), ChannelWriteError> {
     let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, oidl_a4, _] = oidl_args;
-    let end = rt::HandleArg::from_reg(oidl_a0, 0x2, 4).ok_or(ChannelWriteError::BadHandle)?;
+    let end = rt::HandleArg::from_reg(oidl_a0, 0x2, 4);
     let bytes = rt::UserSlice::<u8>::new(oidl_a1, oidl_a2, 65536).ok_or(ChannelWriteError::InvalidArgs)?;
     let handles = rt::UserSlice::<rt::Handle>::new(oidl_a3, oidl_a4, 64).map(|slice| rt::HandleSlice { slice, need_rights: 0x20, need_object: 0 }).ok_or(ChannelWriteError::InvalidArgs)?;
     oidl_calls.channel_write(end, bytes, handles)
@@ -1110,7 +1110,7 @@ fn call_channel_write<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) ->
 
 fn call_channel_read<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), ChannelReadError> {
     let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, oidl_a4, oidl_a5] = oidl_args;
-    let end = rt::HandleArg::from_reg(oidl_a0, 0x1, 4).ok_or(ChannelReadError::BadHandle)?;
+    let end = rt::HandleArg::from_reg(oidl_a0, 0x1, 4);
     let bytes = rt::UserBuffer::<u8>::new(oidl_a1, oidl_a2, 65536);
     let handles = rt::UserBuffer::<ReceivedHandle>::new(oidl_a3, oidl_a4, 64);
     let sizes = rt::UserRef::new(oidl_a5);
@@ -1119,7 +1119,7 @@ fn call_channel_read<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> 
 
 fn call_wait_one<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), WaitOneError> {
     let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, _, _] = oidl_args;
-    let handle = rt::HandleArg::from_reg(oidl_a0, 0x40, 0).ok_or(WaitOneError::BadHandle)?;
+    let handle = rt::HandleArg::from_reg(oidl_a0, 0x40, 0);
     let signals = u32::try_from(oidl_a1).ok().and_then(Signals::from_bits).ok_or(WaitOneError::InvalidArgs)?;
     if signals.bits() == 0 {
         return Err(WaitOneError::InvalidArgs);
@@ -1137,7 +1137,7 @@ fn call_event_create<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> 
 
 fn call_object_signal<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), ObjectSignalError> {
     let [oidl_a0, oidl_a1, oidl_a2, _, _, _] = oidl_args;
-    let object = rt::HandleArg::from_reg(oidl_a0, 0x80, 0).ok_or(ObjectSignalError::BadHandle)?;
+    let object = rt::HandleArg::from_reg(oidl_a0, 0x80, 0);
     let clear = u32::try_from(oidl_a1).ok().and_then(Signals::from_bits).ok_or(ObjectSignalError::InvalidArgs)?;
     let set = u32::try_from(oidl_a2).ok().and_then(Signals::from_bits).ok_or(ObjectSignalError::InvalidArgs)?;
     oidl_calls.object_signal(object, clear, set)
@@ -1152,8 +1152,8 @@ fn call_memory_object_create<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64;
 
 fn call_memory_map<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), MemoryMapError> {
     let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, _, _] = oidl_args;
-    let process = rt::HandleArg::from_reg(oidl_a0, 0x2, 1).ok_or(MemoryMapError::BadHandle)?;
-    let object = rt::HandleArg::from_reg(oidl_a1, 0x4, 3).ok_or(MemoryMapError::BadHandle)?;
+    let process = rt::HandleArg::from_reg(oidl_a0, 0x2, 1);
+    let object = rt::HandleArg::from_reg(oidl_a1, 0x4, 3);
     let request = rt::UserRef::<MapRequest>::new(oidl_a2);
     let address = rt::UserRef::new(oidl_a3);
     oidl_calls.memory_map(process, object, request, address)
@@ -1161,7 +1161,7 @@ fn call_memory_map<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Re
 
 fn call_memory_unmap<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), MemoryUnmapError> {
     let [oidl_a0, oidl_a1, oidl_a2, _, _, _] = oidl_args;
-    let process = rt::HandleArg::from_reg(oidl_a0, 0x2, 1).ok_or(MemoryUnmapError::BadHandle)?;
+    let process = rt::HandleArg::from_reg(oidl_a0, 0x2, 1);
     let address: u64 = oidl_a1;
     let length: u64 = oidl_a2;
     oidl_calls.memory_unmap(process, address, length)
@@ -1169,7 +1169,7 @@ fn call_memory_unmap<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> 
 
 fn call_memory_protect<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), MemoryProtectError> {
     let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, _, _] = oidl_args;
-    let process = rt::HandleArg::from_reg(oidl_a0, 0x2, 1).ok_or(MemoryProtectError::BadHandle)?;
+    let process = rt::HandleArg::from_reg(oidl_a0, 0x2, 1);
     let address: u64 = oidl_a1;
     let length: u64 = oidl_a2;
     let access = u32::try_from(oidl_a3).ok().and_then(MapAccess::from_bits).ok_or(MemoryProtectError::InvalidArgs)?;
@@ -1187,8 +1187,8 @@ fn call_port_create<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> R
 
 fn call_object_wait_async<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), ObjectWaitAsyncError> {
     let [oidl_a0, oidl_a1, oidl_a2, oidl_a3, _, _] = oidl_args;
-    let port = rt::HandleArg::from_reg(oidl_a0, 0x2, 6).ok_or(ObjectWaitAsyncError::BadHandle)?;
-    let object = rt::HandleArg::from_reg(oidl_a1, 0x40, 0).ok_or(ObjectWaitAsyncError::BadHandle)?;
+    let port = rt::HandleArg::from_reg(oidl_a0, 0x2, 6);
+    let object = rt::HandleArg::from_reg(oidl_a1, 0x40, 0);
     let key: u64 = oidl_a2;
     let signals = u32::try_from(oidl_a3).ok().and_then(Signals::from_bits).ok_or(ObjectWaitAsyncError::InvalidArgs)?;
     if signals.bits() == 0 {
@@ -1199,7 +1199,7 @@ fn call_object_wait_async<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]
 
 fn call_port_wait<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), PortWaitError> {
     let [oidl_a0, oidl_a1, oidl_a2, _, _, _] = oidl_args;
-    let port = rt::HandleArg::from_reg(oidl_a0, 0x1, 6).ok_or(PortWaitError::BadHandle)?;
+    let port = rt::HandleArg::from_reg(oidl_a0, 0x1, 6);
     let deadline: u64 = oidl_a1;
     let packet = rt::UserRef::new(oidl_a2);
     oidl_calls.port_wait(port, deadline, packet)
@@ -1207,8 +1207,8 @@ fn call_port_wait<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Res
 
 fn call_port_cancel<C: Calls + ?Sized>(oidl_calls: &C, oidl_args: [u64; 6]) -> Result<(), PortCancelError> {
     let [oidl_a0, oidl_a1, oidl_a2, _, _, _] = oidl_args;
-    let port = rt::HandleArg::from_reg(oidl_a0, 0x2, 6).ok_or(PortCancelError::BadHandle)?;
-    let object = rt::HandleArg::from_reg(oidl_a1, 0x0, 0).ok_or(PortCancelError::BadHandle)?;
+    let port = rt::HandleArg::from_reg(oidl_a0, 0x2, 6);
+    let object = rt::HandleArg::from_reg(oidl_a1, 0x0, 0);
     let key: u64 = oidl_a2;
     oidl_calls.port_cancel(port, object, key)
 }

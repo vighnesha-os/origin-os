@@ -128,7 +128,7 @@ Two cells move the figure by themselves. A row marked `info` leaves the count, a
 | List | Rows |
 |---|---|
 | done | H-05 |
-| done | S1-03, S5-01, S5-10, S6-01, S8-01, S8-02, S8-04, S8-06, S8-08, S9-11, S10-06, S11-01, S11-02, S12-01, S13-01, S13-12, S13-14, S13-15, S17-03, S17-26, S18-16, S18-17, S59-03, S59-13, S62-01, S62-16, S62-17, S72-08, S79-04, S84-07, S84-11, S84-12 |
+| done | S1-03, S5-01, S5-10, S6-01, S6-02, S6-03, S6-04, S6-05, S6-06, S6-07, S6-08, S6-09, S6-10, S6-11, S6-13, S8-01, S8-02, S8-04, S8-06, S8-08, S9-11, S10-04, S10-06, S11-01, S11-02, S12-01, S13-01, S13-12, S13-14, S13-15, S17-03, S17-26, S18-16, S18-17, S59-03, S59-13, S62-01, S62-16, S62-17, S72-08, S79-04, S82-19, S84-07, S84-11, S84-12 |
 | done | F-01 |
 | done | A15-D8, A18-V2 |
 | info | H-01, H-02, H-03, H-04, H-09, H-10 |
@@ -196,6 +196,7 @@ It does not check:
 - **An ADR is accepted or amended.** Add a row for each new decision to its `adr-NNNN.md`, or add the file.
 - **The owner answers a decision item.** Name it in the row it decided, or list it above.
 - **Work lands.** Change the row's state with the cells that state needs, and give the row the criterion its task's contract writes for it (CLAUDE.md §78). A row that becomes `done` is added to the list of done rows above.
+- **A row's state changes, or the roadmap places a row or gives a milestone's state.** Run `cargo xtask progress` and commit `docs/PROGRESS.md` with the change: `cargo xtask check` refuses a page that is not the one the tree generates.
 - **A heading or a code block of the directive changes.** Read the change against that PART's rows, then record the digest the gate prints.
 - **Something runs on a machine.** Write its record under `docs/hardware/records/`, with the machine, its firmware, the source revision, the date and the result, and name it in the rows it is evidence for.
 - **A state never goes up on memory.** It follows what the tree shows: `docs/STATUS.md`, the boot proofs, the tests and the gates.

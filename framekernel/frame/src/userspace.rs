@@ -868,14 +868,31 @@ impl UserSpace {
 
     /// Maps the user page `virt` to a fresh zeroed frame this space owns, with `access`. Only
     /// inside the user half.
-    pub fn map_page(&self, virt: u64, access: Access) -> Result<UserFrame, MapError> {
+    ///
+    /// # Errors
+    ///
+    /// [`ChangeError::Limit`] when the page needs one more page table than the space may have,
+    /// and [`ChangeError::Map`] for the rest: [`MapError::OutOfMemory`] is a want of memory, as
+    /// for [`map_shared_run`](Self::map_shared_run) (S3-5b's review, finding C; S4-1's review,
+    /// finding F4). Nothing is mapped on any of them.
+    pub fn map_page(&self, virt: u64, access: Access) -> Result<UserFrame, ChangeError> {
         if !usercopy::is_user_address(virt) || usercopy::USER_END - virt < PAGE {
-            return Err(MapError::NonCanonical(virt));
+            return Err(MapError::NonCanonical(virt).into());
         }
         let frame = memory::zeroed_frame().ok_or(MapError::OutOfMemory)?;
         let phys = frame.phys();
         let _turn = self.edit();
-        match self.with_state(|s| s.map(virt, Frame::Private(frame), access)) {
+        let mapped = self.with_state(|s| {
+            s.tables.refused = None;
+            s.map(virt, Frame::Private(frame), access)
+                .map_err(|(e, frame)| match e {
+                    MapError::OutOfMemory if s.tables.refused == Some(Refusal::Limit) => {
+                        (ChangeError::Limit, frame)
+                    }
+                    e => (ChangeError::Map(e), frame),
+                })
+        });
+        match mapped {
             Ok(()) => Ok(UserFrame { virt, phys }),
             Err((e, frame)) => {
                 frame.release();

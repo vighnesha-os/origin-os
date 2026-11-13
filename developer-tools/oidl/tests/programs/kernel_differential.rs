@@ -3,6 +3,10 @@
 //! makes on its arguments alone. The transcription below (`hand_written`) stops where the kernel
 //! first touches user memory or a handle table, because the generated decoder stops there too.
 //! Compiled with optimizations and run by tests/generated.rs.
+//!
+//! One rule has changed since that commit, by decision: a handle fills its register (ADR-0005
+//! Amendment 6, E1; task S4-0), so `handle_arg` refuses nothing any more. Everything else is the
+//! transcription as it was.
 
 use oidl_generated::oidl_rt as rt;
 use oidl_generated::origin_kernel as k;
@@ -24,9 +28,11 @@ enum Verdict {
     Exit,
 }
 
-/// `handle_arg` in `syscall.rs`.
-fn handle_arg(raw: u64) -> Result<u32, i64> {
-    u32::try_from(raw).map_err(|_| BAD_HANDLE)
+/// `handle_arg` in `syscall.rs`, with E1 applied: until S4-0 a register above 32 bits was
+/// `bad_handle` here; now every value goes to the table, which is past what this compares.
+#[allow(clippy::unnecessary_wraps)]
+fn handle_arg(raw: u64) -> Result<u64, i64> {
+    Ok(raw)
 }
 
 /// `dispatch` in `framekernel/src/syscall.rs`, for the parts decided by registers alone.

@@ -11,12 +11,13 @@ use std::collections::BTreeSet;
 
 use origin_crypto::Sha256;
 
+use crate::layout::HANDLE_BITS;
 use crate::model::{
     Bits, Compilation, ConstKind, Enum, Library, Method, Param, Struct, Transport, Type, Version,
 };
 
-/// The description's own format version.
-pub const FORMAT: &str = "oidl-fingerprint 1";
+/// The description's own format version. Format 2 adds the `handle` line (decision item 237).
+pub const FORMAT: &str = "oidl-fingerprint 2";
 
 /// The interface id of the hello (§7.7).
 pub fn interface_id(library: &str, interface: &str) -> u64 {
@@ -252,6 +253,17 @@ fn write_method(
 /// The canonical description of `library` at `minor`. With `numbers`, `syscall` numbers are
 /// included (§13); `channel` ordinals are always ABI and are always included.
 pub fn describe(library: &Library, minor: u16, numbers: bool) -> String {
+    describe_with(library, minor, numbers, HANDLE_BITS)
+}
+
+/// [`describe`], for a handle `handle_bits` wide: the generator's own width, or another one a
+/// test plants to show that the width reaches the digest.
+pub(crate) fn describe_with(
+    library: &Library,
+    minor: u16,
+    numbers: bool,
+    handle_bits: u32,
+) -> String {
     let channel = library.transport == Transport::Channel;
     let mut out = String::new();
     let _ = writeln!(out, "{FORMAT}");
@@ -262,6 +274,9 @@ pub fn describe(library: &Library, minor: u16, numbers: bool) -> String {
         "transport {}",
         if channel { "channel" } else { "syscall" }
     );
+    // A handle's width is not in any declaration: the specification sets it (§10), the generator
+    // emits it, and so it is a fact of every library at every minor (decision item 237).
+    let _ = writeln!(out, "handle {handle_bits}");
     let mut consts: Vec<String> = library
         .consts
         .iter()
@@ -378,6 +393,11 @@ fn changing_minors(library: &Library) -> BTreeSet<u16> {
 
 /// A library's fingerprints, one per minor up to its current one.
 pub fn fingerprints(library: &Library) -> Vec<MinorPrint> {
+    fingerprints_with(library, HANDLE_BITS)
+}
+
+/// [`fingerprints`], for a handle `handle_bits` wide (see [`describe_with`]).
+pub(crate) fn fingerprints_with(library: &Library, handle_bits: u32) -> Vec<MinorPrint> {
     let current = library.version;
     let changing = changing_minors(library);
     let mut stable = [0u8; 32];
@@ -385,8 +405,10 @@ pub fn fingerprints(library: &Library) -> Vec<MinorPrint> {
     (0..=current.minor)
         .map(|minor| {
             if changing.contains(&minor) {
-                stable = Sha256::digest(describe(library, minor, false).as_bytes());
-                release = Sha256::digest(describe(library, minor, true).as_bytes());
+                stable =
+                    Sha256::digest(describe_with(library, minor, false, handle_bits).as_bytes());
+                release =
+                    Sha256::digest(describe_with(library, minor, true, handle_bits).as_bytes());
             }
             MinorPrint {
                 version: Version {
