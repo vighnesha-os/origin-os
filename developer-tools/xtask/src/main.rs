@@ -799,7 +799,8 @@ fn no_generator_markers(scenario: &mut Scenario) {
     scenario.markers.extend([
         // The network asks for no lease: a transaction ID must not be guessable.
         "; DHCP lease 0.0.0.0 (".into(),
-        "; no random value for a transaction ID or port; consistent false: virtio-net failed".into(),
+        "; no random value for a transaction ID or port; consistent false: virtio-net failed"
+            .into(),
         "origin-kernel: boot verdict: degraded: ".into(),
         "; 6 did not run; failed: ".into(),
         "random-number generator (no randomness)".into(),

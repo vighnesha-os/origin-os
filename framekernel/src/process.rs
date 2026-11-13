@@ -57,10 +57,10 @@ use crate::handles::HandleTable;
 use crate::mapping::{Budget, Mappings};
 use crate::memory_object::MemoryObject;
 use crate::paging::{Access, MapError, Translation};
-pub(crate) use crate::quota::{Limits, MemoryLimits, ObjectLimits};
 use crate::quota::{
     Costs, Count, Element, ObjectCounts, Payment, Purse, eight_a_page, footprint, growing,
 };
+pub(crate) use crate::quota::{Limits, MemoryLimits, ObjectLimits};
 use crate::runqueue::QueueError;
 use origin_abi::{Error, Handle, signals};
 use origin_frame::objref::ObjectRef;
@@ -602,7 +602,11 @@ impl Process {
     /// The root pays its figure and `ahead` bytes besides, for the pages its launch will map
     /// (G5; the coordinating session's ruling (d)). `LIMIT` if it cannot, and then nothing is
     /// made; `NO_MEMORY` without the memory for its objects.
-    pub(crate) fn pinned_child_of(creator: &Self, limits: Limits, ahead: u64) -> Result<Self, Error> {
+    pub(crate) fn pinned_child_of(
+        creator: &Self,
+        limits: Limits,
+        ahead: u64,
+    ) -> Result<Self, Error> {
         Self::with_origin(
             limits,
             CallOrigin::Core { base: None },

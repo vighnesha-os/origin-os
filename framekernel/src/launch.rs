@@ -358,10 +358,9 @@ pub(crate) fn load_program(
 pub(crate) fn launch_ahead(program: &Carried, run: &ProgramLimits) -> Option<u64> {
     let costs = crate::process::costs()?;
     let core = core_image::image().span / PAGE;
-    let image = program
-        .segments
-        .iter()
-        .try_fold(0u64, |pages, segment| pages.checked_add(segment.size / PAGE))?;
+    let image = program.segments.iter().try_fold(0u64, |pages, segment| {
+        pages.checked_add(segment.size / PAGE)
+    })?;
     let record = (start::MAX_SIZE as u64).div_ceil(PAGE);
     let own = image.checked_add(run.stack_pages)?.checked_add(record)?;
     own.checked_mul(costs.page)?

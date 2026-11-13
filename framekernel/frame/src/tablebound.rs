@@ -105,7 +105,12 @@ mod tests {
     fn a_run_past_the_bound_is_refused_and_adds_no_room_to_either_table() {
         for mapped in [0, 1, 7, BOUND - 1, BOUND] {
             let (mut records, mut spare) = tables(mapped);
-            let before = (records.len(), records.capacity(), spare.len(), spare.capacity());
+            let before = (
+                records.len(),
+                records.capacity(),
+                spare.len(),
+                spare.capacity(),
+            );
             // A large shared object: a million pages into a space that can map 14,848.
             for count in [BOUND - mapped + 1, 1_000_000, usize::MAX - mapped] {
                 assert_eq!(
@@ -114,7 +119,12 @@ mod tests {
                     "{mapped} mapped, a run of {count}"
                 );
                 assert_eq!(
-                    (records.len(), records.capacity(), spare.len(), spare.capacity()),
+                    (
+                        records.len(),
+                        records.capacity(),
+                        spare.len(),
+                        spare.capacity()
+                    ),
                     before,
                     "no room added for a run of {count}"
                 );

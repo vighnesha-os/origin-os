@@ -652,11 +652,7 @@ fn handles_in(ty: &crate::model::Type, found: &mut Vec<crate::model::HandleType>
             }
         }
         Type::Array(inner, _) | Type::Vector(inner, _) => handles_in(inner, found),
-        Type::Bool
-        | Type::Int(_)
-        | Type::Enum(_)
-        | Type::Bits(_)
-        | Type::String(_) => {}
+        Type::Bool | Type::Int(_) | Type::Enum(_) | Type::Bits(_) | Type::String(_) => {}
     }
 }
 

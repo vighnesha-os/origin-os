@@ -813,9 +813,18 @@ mod tests {
                 let one = Element { size: 1, align: 1 };
                 let eight = Element { size: 8, align: 8 };
                 let forty = Element { size: 40, align: 8 };
-                let big = Element { size: 1032, align: 8 };
-                assert!(grown(0u8, most, step) <= growing(most, one).unwrap(), "{most} {step}");
-                assert!(grown(0u64, most, step) <= growing(most, eight).unwrap(), "{most} {step}");
+                let big = Element {
+                    size: 1032,
+                    align: 8,
+                };
+                assert!(
+                    grown(0u8, most, step) <= growing(most, one).unwrap(),
+                    "{most} {step}"
+                );
+                assert!(
+                    grown(0u64, most, step) <= growing(most, eight).unwrap(),
+                    "{most} {step}"
+                );
                 assert!(
                     grown([0u64; 5], most, step) <= growing(most, forty).unwrap(),
                     "{most} {step}"
@@ -847,7 +856,10 @@ mod tests {
     /// Costs with a distinct value in every field, so each kind's part can be told apart.
     const COSTS: Costs = Costs {
         process: 1_000_003,
-        handle_tables: [Element { size: 40, align: 8 }, Element { size: 4, align: 4 }],
+        handle_tables: [
+            Element { size: 40, align: 8 },
+            Element { size: 4, align: 4 },
+        ],
         channel: 3_584,
         memory_object: 64,
         memory_page: 80,
@@ -890,48 +902,97 @@ mod tests {
         let alone = |limits: Limits| limits.figure(&COSTS).unwrap() - COSTS.process;
         let [slots, free] = COSTS.handle_tables;
         assert_eq!(
-            alone(Limits { handles: 64, ..NOTHING }),
+            alone(Limits {
+                handles: 64,
+                ..NOTHING
+            }),
             growing(64, slots).unwrap() + growing(64, free).unwrap()
         );
-        assert_eq!(alone(Limits { channels: 32, ..NOTHING }), 32 * COSTS.channel);
-        assert_eq!(alone(Limits { message_bytes: 1 << 20, ..NOTHING }), 1 << 20);
+        assert_eq!(
+            alone(Limits {
+                channels: 32,
+                ..NOTHING
+            }),
+            32 * COSTS.channel
+        );
+        assert_eq!(
+            alone(Limits {
+                message_bytes: 1 << 20,
+                ..NOTHING
+            }),
+            1 << 20
+        );
         // Committed bytes: a frame for each page begun, an object for each page at most, and what
         // an object keeps for each page.
         let committed = |bytes: usize| Limits {
-            memory: MemoryLimits { committed: bytes, ..MemoryLimits::NONE },
+            memory: MemoryLimits {
+                committed: bytes,
+                ..MemoryLimits::NONE
+            },
             ..NOTHING
         };
-        assert_eq!(alone(committed(PAGE as usize)), PAGE + COSTS.memory_object + COSTS.memory_page);
+        assert_eq!(
+            alone(committed(PAGE as usize)),
+            PAGE + COSTS.memory_object + COSTS.memory_page
+        );
         assert_eq!(
             alone(committed(10 * PAGE as usize + 1)),
             11 * (PAGE + COSTS.memory_object + COSTS.memory_page)
         );
         // One mapping lets a process map up to what its space's tables allow, in two tables.
         let mappings = |n: usize| Limits {
-            memory: MemoryLimits { mappings: n, ..MemoryLimits::NONE },
+            memory: MemoryLimits {
+                mappings: n,
+                ..MemoryLimits::NONE
+            },
             ..NOTHING
         };
         let records = 2 * growing(COSTS.user_pages, COSTS.page_record).unwrap();
-        assert_eq!(alone(mappings(1)), growing(1, COSTS.mapping_table).unwrap() + records);
-        assert_eq!(alone(mappings(9)), growing(9, COSTS.mapping_table).unwrap() + records);
+        assert_eq!(
+            alone(mappings(1)),
+            growing(1, COSTS.mapping_table).unwrap() + records
+        );
+        assert_eq!(
+            alone(mappings(9)),
+            growing(9, COSTS.mapping_table).unwrap() + records
+        );
         // The change rate holds no memory.
         let rate = Limits {
             memory: MemoryLimits {
-                changes: Rate { burst: 1_000, per_second: 1_000_000 },
+                changes: Rate {
+                    burst: 1_000,
+                    per_second: 1_000_000,
+                },
                 ..MemoryLimits::NONE
             },
             ..NOTHING
         };
         assert_eq!(alone(rate), 0);
         let objects = |events, ports, bindings| Limits {
-            objects: ObjectLimits { events, ports, bindings },
+            objects: ObjectLimits {
+                events,
+                ports,
+                bindings,
+            },
             ..NOTHING
         };
         assert_eq!(alone(objects(3, 0, 0)), 3 * COSTS.event);
         assert_eq!(alone(objects(0, 2, 0)), 2 * COSTS.port);
         assert_eq!(alone(objects(0, 0, 5)), 5 * COSTS.binding);
-        assert_eq!(alone(Limits { threads: 4, ..NOTHING }), 4 * COSTS.thread);
-        assert_eq!(alone(Limits { debug_calls: true, ..NOTHING }), 0);
+        assert_eq!(
+            alone(Limits {
+                threads: 4,
+                ..NOTHING
+            }),
+            4 * COSTS.thread
+        );
+        assert_eq!(
+            alone(Limits {
+                debug_calls: true,
+                ..NOTHING
+            }),
+            0
+        );
 
         // Everything at once is the sum of the parts.
         let all = Limits {
@@ -942,9 +1003,16 @@ mod tests {
             memory: MemoryLimits {
                 committed: 16 * PAGE as usize,
                 mappings: 3,
-                changes: Rate { burst: 64, per_second: 1_000 },
+                changes: Rate {
+                    burst: 64,
+                    per_second: 1_000,
+                },
             },
-            objects: ObjectLimits { events: 3, ports: 2, bindings: 4 },
+            objects: ObjectLimits {
+                events: 3,
+                ports: 2,
+                bindings: 4,
+            },
             threads: 2,
         };
         let parts = all.parts(&COSTS).unwrap();
@@ -952,7 +1020,10 @@ mod tests {
             parts.total(),
             Some(
                 COSTS.process
-                    + alone(Limits { handles: 64, ..NOTHING })
+                    + alone(Limits {
+                        handles: 64,
+                        ..NOTHING
+                    })
                     + 32 * COSTS.channel
                     + (1 << 20)
                     + alone(committed(16 * PAGE as usize))
@@ -966,11 +1037,35 @@ mod tests {
 
     #[test]
     fn limits_whose_figure_overflows_have_none() {
-        assert_eq!(Limits { handles: usize::MAX, ..NOTHING }.figure(&COSTS), None);
-        assert_eq!(Limits { channels: usize::MAX, ..NOTHING }.figure(&COSTS), None);
-        assert_eq!(Limits { threads: usize::MAX, ..NOTHING }.figure(&COSTS), None);
+        assert_eq!(
+            Limits {
+                handles: usize::MAX,
+                ..NOTHING
+            }
+            .figure(&COSTS),
+            None
+        );
+        assert_eq!(
+            Limits {
+                channels: usize::MAX,
+                ..NOTHING
+            }
+            .figure(&COSTS),
+            None
+        );
+        assert_eq!(
+            Limits {
+                threads: usize::MAX,
+                ..NOTHING
+            }
+            .figure(&COSTS),
+            None
+        );
         let huge = |committed| Limits {
-            memory: MemoryLimits { committed, ..MemoryLimits::NONE },
+            memory: MemoryLimits {
+                committed,
+                ..MemoryLimits::NONE
+            },
             ..NOTHING
         };
         assert_eq!(huge(usize::MAX).figure(&COSTS), None);
@@ -982,10 +1077,20 @@ mod tests {
         };
         assert_eq!(wide.figure(&COSTS), None);
         // A cost so large that one of a kind overflows.
-        let dear = Costs { event: u64::MAX, ..COSTS };
+        let dear = Costs {
+            event: u64::MAX,
+            ..COSTS
+        };
         assert_eq!(
-            Limits { objects: ObjectLimits { events: 2, ports: 0, bindings: 0 }, ..NOTHING }
-                .figure(&dear),
+            Limits {
+                objects: ObjectLimits {
+                    events: 2,
+                    ports: 0,
+                    bindings: 0
+                },
+                ..NOTHING
+            }
+            .figure(&dear),
             None
         );
     }
@@ -1002,7 +1107,10 @@ mod tests {
         assert_eq!((root.size(), root.left()), (0, 0));
         assert!(root.size_once(4096));
         assert!(!root.size_once(1 << 30));
-        assert_eq!((root.size(), root.left(), root.lowest()), (4096, 4096, 4096));
+        assert_eq!(
+            (root.size(), root.left(), root.lowest()),
+            (4096, 4096, 4096)
+        );
     }
 
     #[test]
@@ -1106,7 +1214,10 @@ mod tests {
     #[test]
     fn a_ports_index_holds_at_most_eight_slots_a_binding() {
         for slot in (16..=1024).step_by(8) {
-            let element = Element { size: slot, align: 8 };
+            let element = Element {
+                size: slot,
+                align: 8,
+            };
             for bindings in 1..=20_000usize {
                 let held = growing(bindings, element).unwrap();
                 assert!(

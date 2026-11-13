@@ -35,9 +35,11 @@ use origin_abi::Error;
 
 use crate::console::Console;
 use crate::cpu::CpuIndex;
-use crate::launch::{self, Given};
 use crate::ipc;
-use crate::process::{self, BOOT_PROOF_PRINCIPAL, Limits, MemoryLimits, ObjectLimits, Process, ROOT};
+use crate::launch::{self, Given};
+use crate::process::{
+    self, BOOT_PROOF_PRINCIPAL, Limits, MemoryLimits, ObjectLimits, Process, ROOT,
+};
 use crate::program::{FIRST_PROGRAM, FIRST_PROGRAM_RUN};
 use crate::{memory, sched};
 use origin_frame::objref::ObjectRef;
@@ -215,8 +217,8 @@ fn refusal(com1: &mut Console, creator: &Process, launch: u64, process_cost: u64
     };
     let short = ROOT.left() == launch - 1;
     let before = snapshot();
-    let refused =
-        launch::load_program(creator, &FIRST_PROGRAM, &FIRST_PROGRAM_RUN).err() == Some(Error::Limit);
+    let refused = launch::load_program(creator, &FIRST_PROGRAM, &FIRST_PROGRAM_RUN).err()
+        == Some(Error::Limit);
     let nothing = before.is_some() && before == snapshot();
     let _ = writeln!(
         com1,
@@ -243,12 +245,13 @@ fn paid_to_the_byte(
 ) -> bool {
     let left = ROOT.left();
     let whole = left >= launch;
-    let took = Process::proof(FIRST_PROGRAM_RUN.limits, (0, 0), BOOT_PROOF_PRINCIPAL)
-        .is_some_and(|made| {
+    let took = Process::proof(FIRST_PROGRAM_RUN.limits, (0, 0), BOOT_PROOF_PRINCIPAL).is_some_and(
+        |made| {
             let paid = ROOT.left() == left - figure;
             drop(made);
             paid && ROOT.left() == left
-        });
+        },
+    );
     let mut pages = (0, 0);
     let ran = if origin_frame::random::available() {
         launch::load_program(creator, &FIRST_PROGRAM, &FIRST_PROGRAM_RUN)
