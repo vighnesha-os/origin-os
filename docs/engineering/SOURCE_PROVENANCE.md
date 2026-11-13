@@ -3590,15 +3590,17 @@ A fourth addition to the entry above, from another session and on a branch of it
   - *Rust 1.99.1, the six changes before the pin in the tree (`62710d9` and four uncommitted):* `cargo xtask check` passes, 1,694 host tests, 0 failed, 27 ignored; `verify.sh` 20 of 20; each of the eleven files of the reproducible-build gate keeps its digest, so none of the six changed an image.
   - *Rust 1.100.0, `5b65ce0`, nothing uncommitted, 04:32 to 05:23 UTC:* `cargo xtask check` passes in 433 s, 1,695 host tests, 0 failed, 27 ignored; Loom, all 53 models and all 78 controls; the image gate (1,501 returns, an INT3 after each; no jump table; the prebuilt libraries' 124, 33 and 2 as on 1.99.1); the reproducible-build gate, with eleven new digests. `verify.sh`, 21 of 21. `cargo xtask boot-test` passes, 11 of 11 scenarios, and the image that booted is the gate's. `cargo xtask boot-matrix` passes in 2,449 s.
   - *The stale-directory runs,* on 1.99.1 at `74c1e49` and on 1.100.0 in the run above: the program linked again when the linker's text changes, the kernel linked again when it alone is stale, each result the gate's bytes, the host's `release` directory untouched.
-  - *Planted faults in `verify.sh`'s checks,* each undone: the option out of the configuration, a bare return in the probe, the pin moved in three of its four places (two ways). Each fails by name.
+  - *Planted faults in `verify.sh`'s checks,* each undone: the option out of the configuration, commented out, or under the loader's table; a bare return in the probe. Each fails by name. *The pin's controls, two of its four places:* the commit's file left at 1.99.1's fails `verify.sh` and `install-rust.sh`, each naming both commits; `rust-version` left at 1.99.1 fails `verify.sh`, and `install-rust.sh`, which reads only the channel and the commit, does not.
+  - *CI.* Pull request 28 (draft), run 43374286164 on `9b72748`, every job passed: `check` (1,696 host tests, 0 failed), toolchain verification (21 of 21), the macOS job (rustup installed 1.100.0; all 22 files the same on a Linux and a macOS runner), and the boots under QEMU's software CPU and under KVM on two AMD EPYC 9V45 runners. The boot step on those runners took within about a minute of Rust 1.99.1's on runners with the same processor (research note §6.4).
+  - *The independent review* (one AI reviewer; `docs/engineering/REVIEW_T52_2026-11-13.md`): no high or medium finding. The answers are `1b185a7` (Cargo's own lints at deny), `9b0b13b` (the hardening check reads only the kernel's table), `5a73299` (a clean that leaves the stale file says so; an empty target directory refused), `bc67815` (`overwrite` on both uploads) and `eca7771` (`check` asks for the compiler's commit first), each shown by a planted fault (research note §6.5).
   - *After the records were merged* (CLAUDE.md 7.8), the booted tree and the final tree differ in documents alone, and `docs/toolchain/VERIFICATION.md` is `verify.sh`'s own report of 2026-11-13 at `b5ef84a`.
 - **Not proven, and limits:**
-  - **CI has not run any of it** when this was written: the Linux gates, the boots on a real CPU under KVM, the comparison across a Linux and a macOS host under 1.100.0, and rustup installing 1.100.0 on the macOS runner.
-  - No physical hardware: QEMU's software CPU on the development Mac.
+  - CI has run it once (run 43374286164). How often the macOS runner fails for its own reasons is not known.
+  - No physical hardware: QEMU's software CPU on the development Mac, and KVM guests on GitHub's runners.
   - The release was one day old. No point release existed.
-  - The relink step has not been run for a shared library; none is in this tree.
+  - The relink step has not been run for a shared library; none is in this tree. Each linked file with its own package, and that run, are TASKS item 50, after task S4-2.
   - The compiler will refuse the hardening option at a release nobody has named. The check says so at the upgrade that meets it, not before.
-  - No human has reviewed any of it.
+  - One AI review; no human has reviewed any of it.
 - **Licensing:** MIT OR Apache-2.0.
 
 ## Heavy xtask runs take turns across every checkout on one machine (2026-11-10)

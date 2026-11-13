@@ -128,7 +128,7 @@ Two cells move the figure by themselves. A row marked `info` leaves the count, a
 | List | Rows |
 |---|---|
 | done | H-05 |
-| done | S1-03, S5-01, S5-10, S6-01, S6-02, S6-03, S6-04, S6-05, S6-06, S6-07, S6-08, S6-09, S6-10, S6-11, S6-13, S8-01, S8-02, S8-04, S8-06, S8-08, S9-11, S10-04, S10-06, S11-01, S11-02, S12-01, S13-01, S13-12, S13-14, S13-15, S17-03, S17-26, S18-16, S18-17, S59-03, S59-13, S62-01, S62-16, S62-17, S72-08, S79-04, S82-19, S84-07, S84-11, S84-12 |
+| done | S1-03, S5-01, S5-10, S6-01, S6-02, S6-03, S6-04, S6-05, S6-06, S6-07, S6-08, S6-09, S6-10, S6-11, S6-13, S8-01, S8-02, S8-04, S8-06, S8-08, S9-11, S10-04, S10-06, S11-01, S11-02, S12-01, S13-01, S13-12, S13-14, S13-15, S17-03, S17-26, S18-16, S18-17, S59-03, S59-13, S60-03, S60-11, S62-01, S62-16, S62-17, S72-08, S79-04, S82-19, S84-07, S84-11, S84-12 |
 | done | F-01 |
 | done | A15-D8, A18-V2 |
 | info | H-01, H-02, H-03, H-04, H-09, H-10 |
@@ -148,7 +148,6 @@ Every answered item of `docs/engineering/OWNER_DECISIONS.md` is named in the "De
 | 23 | none | A comparison of two AMD manuals with AMD's own copies, done once. |
 | 70, 161 | none | How pull requests are offered: at 100 commits, and pull request 15 at 76. A rule of process that no statement of the directive or decision of an ADR carries. |
 | 167, 190 | none | How task 18b and the randomized model of its policy land: through pull request 16. Rules of process. |
-| 275 | owed | CI compares the images that two kinds of host build, on every run, and fails if they differ. Its job is TASKS item 46 and is not built. Rows S60-03, S75-06 and S75-07 take the item when it lands; until the third batch (pull request 21) is on `main` those rows are being changed there. |
 | 224–228, 231–236 | none | How rented bench machines are used: the provider, the budget cap, who signs up and holds the credentials, the order of the rentals, how Origin boots there (items 231 and 236), what is kept and where, what a bench record may claim, no self-hosted runner, and rentals through Latitude's API (`docs/research/2026-11-12-first-bare-metal-boot.md`). Rules of process for bench equipment, which ADR-0009 A1 keeps outside the declared scope. |
 
 ## Scope changes

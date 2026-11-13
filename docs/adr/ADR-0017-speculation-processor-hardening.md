@@ -262,7 +262,7 @@ The decisions above stand as accepted. This section records what building six of
 
 ### Amendment 2: the option behind Z10's INT3 after every RET is to become an error in the compiler, and stays while the compiler accepts it (decision items 280 and 281)
 
-**Status: Accepted by the owner on 2026-11-13, each item as recommended ("Accept both", decision sheet items 280 and 281; CLAUDE.md §18). Not built: the build's line about the warning is task 52's (TASKS item 52, the compiler upgrade), and nothing has been sent to the Rust project.**
+**Status: Accepted by the owner on 2026-11-13, each item as recommended ("Accept both", decision sheet items 280 and 281; CLAUDE.md §18). Built by TASKS item 52: the build's line about the warning (`developer-tools/xtask/src/expected_warning.rs`) and a check of its own in `developer-tools/toolchain/verify.sh`. Nothing has been sent to the Rust project: that is the owner's to post (item 281).**
 
 **What was found.** Z10 turns on an INT3 after every RET with `-C target-feature=+harden-sls-ret`, a target feature the stable compiler does not know as stable. When question 6 was answered (item 129, 2026-11-10) the compiler's warning said the feature was "unknown and unstable" and that its behaviour "can change in the future". Under Rust 1.100.0 the option is still accepted and still does its work, and the warning has two more lines: the option "was previously accepted by the compiler but is being phased out; it will become a hard error in a future release", and a pointer to issue 162235 of `rust-lang/rust`. Task 52's first build with the pin at 1.100.0 showed it (the development Mac, 2026-11-13). The release notes of 1.100.0 do not mention it.
 
@@ -282,7 +282,7 @@ The decisions above stand as accepted. This section records what building six of
 
 **Performance cost (ADR-0018 V3).** None, by construction: no instruction of the kernel changes.
 
-**What stays unknown.** When the error arrives, and whether the Rust project stabilizes the feature. That Rust 1.100.0 places every INT3 as 1.99.1 did rests on the image gate's reading of one build on the development Mac: on that tree the toolchain's prebuilt libraries held 124 returns, 33 of them without an INT3, and 2 jump tables under both compilers (Amendment 1's figures were for the kernel of 2026-11-10). When this was written no kernel built by 1.100.0 had been booted, and CI had not built with it.
+**What stays unknown.** When the error arrives, and whether the Rust project stabilizes the feature. That Rust 1.100.0 places every INT3 as 1.99.1 did rests on the image gate's reading of one build on the development Mac: on that tree the toolchain's prebuilt libraries held 124 returns, 33 of them without an INT3, and 2 jump tables under both compilers (Amendment 1's figures were for the kernel of 2026-11-10). When this was written no kernel built by 1.100.0 had been booted, and CI had not built with it. On 2026-11-13 CI's run 43374286164, on Rust 1.100.0, showed the same in its `check` job: 1,501 returns in the code the build compiled, an INT3 after each, and the prebuilt libraries' 124 returns, 33 without an INT3, and 2 jump tables; its toolchain job's check of the option passed with the compiler's announcement quoted; and its kernels booted under QEMU's software processor and, on two AMD EPYC 9V45 runners, under KVM.
 
 ## What this does not prove
 
