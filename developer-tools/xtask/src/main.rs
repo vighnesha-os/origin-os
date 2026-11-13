@@ -2514,6 +2514,7 @@ fn kernel_bound_markers(generator: bool) -> Vec<String> {
         "origin-kernel: kernel bound: a process given one thread starts it: true; while it waits a second start is refused: true; nothing is left of the refusal: true; the first ends when let go: true".into(),
         "origin-kernel: kernel bound: a memory object another process made, mapped in one whose last thread has ended and is not yet reaped, keeps its maker's ".into(),
         " bytes out while the space that maps it stands: true; they come back when the last reap frees that space, before TERMINATED: true".into(),
+        "origin-kernel: kernel bound: a port whose creator was given two bindings at once takes two from another process: true; a third is refused with LIMIT: true; nothing is left of it, the binder's charge and the port's armed count with the rest: true; once one fires it takes another: true; a port whose creator was given none refuses the first: true; the first creator paid beyond the second its port's index at two, to the byte: true".into(),
         "origin-kernel: kernel bound: after this proof the root is back at its size: true; the most of it the proofs before this one had paid out at once was ".into(),
     ]);
     markers
