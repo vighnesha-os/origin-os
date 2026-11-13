@@ -412,41 +412,43 @@ pub(crate) fn build_with_the_fixed_line(
     )
 }
 
-/// The names Cargo keeps one linked file under, given the names in its `deps` directory: the
-/// file's own name with `-` as `_`, then `-` and sixteen hexadecimal digits, and no extension.
-fn deps_names<'a>(file_name: &str, deps: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
-    let prefix = format!("{}-", file_name.replace('-', "_"));
-    deps.filter(|name| {
-        name.strip_prefix(&prefix).is_some_and(|hash| {
-            hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
-    })
-    .collect()
+/// The target directory and the target that `path` was built into: Cargo writes a linked file
+/// to `<target directory>/<target>/release/<file>`. `None` for a path of any other shape, and
+/// for a target that no ELF image is built for.
+fn built_into(path: &Path) -> Option<(&Path, &str)> {
+    let release = path.parent()?;
+    if release.file_name()? != "release" {
+        return None;
+    }
+    let target = release.parent()?;
+    let name = target.file_name()?.to_str()?;
+    [KERNEL_TARGET, ring3::USERSPACE_TARGET]
+        .contains(&name)
+        .then_some((target.parent()?, name))
 }
 
-/// Removes a linked file so that Cargo links it again. Cargo keeps what the linker wrote
-/// under `deps/` beside it, and the file itself is a second name for that: with only the
-/// second name gone, Cargo gives the old file its name back and links nothing.
+/// Makes Cargo link `path` again, by having it remove everything it built for that file's
+/// target in that target directory.
+///
+/// Removing the file alone does not do it: Cargo keeps what the linker wrote among its
+/// intermediate files and gives the old file its name back without linking. Where those files
+/// are and what they are called is no interface: Cargo 1.100.0 moved them, and a shared
+/// library's copy never had the hash in its name that a program's has. So nothing here names
+/// one, and `cargo clean` is Cargo's own way. It costs one build of that target's crates, on
+/// the rare run that finds a file from before the fixed line.
 fn remove_linked(path: &Path) -> Result {
-    let gone = |path: &Path| fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()));
-    gone(path)?;
-    let (Some(directory), Some(file_name)) = (
-        path.parent(),
-        path.file_name().and_then(|name| name.to_str()),
-    ) else {
-        return Ok(());
-    };
-    let deps = directory.join("deps");
-    let Ok(entries) = fs::read_dir(&deps) else {
-        return Ok(());
-    };
-    let names: Vec<String> = entries
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .collect();
-    for name in deps_names(file_name, names.iter().map(String::as_str)) {
-        gone(&deps.join(name))?;
-    }
-    Ok(())
+    let (directory, target) = built_into(path).ok_or_else(|| {
+        format!(
+            "{} is not `<target directory>/<target>/release/<file>`, so what to have Cargo build again is not known",
+            path.display()
+        )
+    })?;
+    crate::run_step(
+        crate::cargo()
+            .args(["clean", "--quiet", "--release", "--target", target])
+            .arg("--target-dir")
+            .arg(directory),
+    )
 }
 
 /// [`build_with_the_fixed_line`] over the three things it does to a file, so that a test can
@@ -844,27 +846,31 @@ mod tests {
         // gate's: it alone is linked again.
         let (result, builds, _) = run(&[(&kernel, &fresh), (&program, &old)], true);
         assert_eq!((result, builds), (Ok(vec![program.clone()]), 2));
-        // What is removed with a linked file: Cargo's own copies of it, under any of the
-        // hashes it has had, and nothing else that starts the same way.
+        // What Cargo is asked to build again for a stale file: everything of that file's
+        // target in that file's target directory. A path of another shape names neither.
         assert_eq!(
-            deps_names(
-                "first-program",
-                [
-                    "first_program-4b2f9914be5d4c98",
-                    "first_program-4b2f9914be5d4c98.d",
-                    "first_program-9ee3ce843fa0cf90",
-                    "first_program_two-9ee3ce843fa0cf90",
-                    "libfirst_program-9ee3ce843fa0cf90.rlib",
-                    "first_program-short",
-                    "first-program-4b2f9914be5d4c98",
-                ]
-                .into_iter()
-            ),
-            [
-                "first_program-4b2f9914be5d4c98",
-                "first_program-9ee3ce843fa0cf90"
-            ]
+            built_into(Path::new("/t/x86_64-unknown-none/release/framekernel")),
+            Some((Path::new("/t"), "x86_64-unknown-none"))
         );
+        assert_eq!(
+            built_into(Path::new(
+                "target/xtask/reproducible/a/x86_64-unknown-linux-gnu/release/liborigin_core.so"
+            )),
+            Some((
+                Path::new("target/xtask/reproducible/a"),
+                "x86_64-unknown-linux-gnu"
+            ))
+        );
+        for other in [
+            "/t/x86_64-unknown-none/debug/framekernel",
+            "/t/x86_64-unknown-uefi/release/origin-boot.efi",
+            "/t/release/framekernel",
+            "release/framekernel",
+            "framekernel",
+            "",
+        ] {
+            assert_eq!(built_into(Path::new(other)), None, "{other}");
+        }
         // A linker that does not write the fixed line: an error after one more build, never a
         // third.
         let (result, builds, _) = run(&[(&kernel, &old)], false);
