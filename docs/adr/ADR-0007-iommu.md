@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-08: questions 1–5 and 9 first, then questions 6, 7 and 8 (AMD-Vi) once AMD's manuals were confirmed byte-identical to the copies that were read. Question 10 (I12, bus mastering cleared at enumeration) on 2026-11-09. This is a kernel-internal security mechanism, not an ABI or format decision; the parts that will reach the Driver ABI (how a user-mode driver asks for DMA memory, §31) are decided later, against this. |
+| Status | **Accepted** by the owner on 2026-11-08: questions 1–5 and 9 first, then questions 6, 7 and 8 (AMD-Vi) once AMD's manuals were confirmed byte-identical to the copies that were read. Question 10 (I12, bus mastering cleared at enumeration) on 2026-11-09. This is a kernel-internal security mechanism, not an ABI or format decision; the parts that will reach the Driver ABI (how a user-mode driver asks for DMA memory, §31) are decided later, against this. **Amendment 1 (below): Accepted** by the owner on 2026-11-13 (items 247 to 251): identity maps for firmware-reserved memory, the shape questions 4 and 8 asked for before real hardware; built by TASKS item 40, not landed. |
 | Requires | CLAUDE.md §31 (DMA mapping, interrupt management, driver isolation), §32 (Intel VT-d, AMD IOMMU, interrupt remapping), §58 (DMA protection) |
 | Evidence | `docs/research/2026-11-08-vt-d-iommu.md` (VT-d Rev 5.20, D51397-019, 2026-05-14; what QEMU 11.1's `intel-iommu` emulates); `docs/research/2026-11-08-amd-vi-iommu.md` (AMD IOMMU specification 48882 Rev 3.11, April 2026; what QEMU 11.1's `amd-iommu` emulates and where it departs from the specification); the boot proofs and negative controls in `docs/engineering/SOURCE_PROVENANCE.md` ("Intel VT-d DMA and interrupt remapping"; "I/O APIC interrupts through VT-d interrupt remapping"; "AMD-Vi DMA and interrupt remapping"; "Bus mastering cleared at enumeration"); `docs/research/2026-11-08-bus-master-quiesce.md` for I12 |
 | Threat model | `docs/engineering/THREAT_MODEL_IOMMU.md` (CLAUDE.md §58) |
@@ -136,6 +136,28 @@ None on disk and none at any ABI: all of this is kernel-internal, and no persist
 - The IOVA window (I4) can move or grow, because drivers use only the addresses `map` returns.
 - RMRR and IVMD identity maps are additive.
 - When user-mode drivers arrive (§31, §47), their DMA interface needs its own ADR. It must be capability-checked and must not expose the window or the table formats; `dma::DeviceDma` stays beneath it.
+
+## Amendment 1 (Accepted, 2026-11-13): identity maps for firmware-reserved memory
+
+**Status: Accepted by the owner on 2026-11-13, each item with the recommended answer (decision sheet items 247 to 251; CLAUDE.md §84).** The owner gave the answer first in a fork of the coordinating session ("Okay, Gohead", to "Accept all 5") and confirmed it in the coordinating session ("Yes, accept all 5"). Questions 4 and 8 accepted refusing devices that firmware-reserved memory names (RMRRs under VT-d, IVMDs under AMD-Vi) only until identity maps exist, and set the deadline "identity maps must land before real hardware". This decides their shape. TASKS item 40 built it on `claude/rmrr-ivmd-maps` and it has not landed; its research ledger, `docs/research/2026-11-12-reserved-memory-identity-maps.md`, holds the reasoning and reaches `main` with that task. Rental A's server showed a real IVRS with no IVMD.
+
+| # | Item | Decision | Refines |
+|---|---|---|---|
+| R1 | 247 | **Identity maps are made when a driver attaches the device.** The device's own domain holds the identity maps for every firmware-reserved range that names it before the device's entry turns present. A device that no driver attaches gets none: I12 keeps its bus mastering off, so a map would gain nothing, and making maps at bring-up would change I2. | I11, A9; I2, I12 |
+| R2 | 248 | **The IOVA window skips identity-mapped pages.** Each domain's window, [1 GiB, 2 GiB), leaves out the pages identity-mapped in that domain. I4 now reads "IOVAs are not physical addresses, except within a firmware-reserved range identity-mapped by R1, where a device's bus address is the physical address the firmware gave it". | I4, A3 |
+| R3 | 249 | **What a firmware-reserved range must be before it is mapped.** Every page of it is Reserved, RuntimeCode or RuntimeData in the UEFI memory map; it lies outside the interrupt range (and, under AMD-Vi, outside the ranges the AMD IOMMU specification reserves); it is clear of the platform's register ranges; and it lies within the domain's address width. A range that fails any of these is not mapped and is reported, and the devices it names stay refused at attach, as I11 and A9 have them today. The boot goes on. | I11, A9 |
+| R4 | 250 | **What an IVMD's flags give.** Unity with IR and IW set as given: an identity map with exactly those permissions. IR or IW without Unity: an identity map as well. IR and IW both clear: `map` refuses a frame inside the range for the devices it covers. An ExclusionRange: an identity map, read and write, in each named device's domain; the IOMMU's exclusion registers are never programmed. | A9 |
+| R5 | 251 | **Which devices an IVMD covers.** Type 20h: every device of the IOMMU whose description comes before it. Types 21h and 22h: the devices named by their own segment and DeviceID, or by the alias the device's requests carry, on whichever IOMMU translates that device. | A1, A9 |
+
+**Options that were put.** Each item was put with one recommendation; the alternatives considered are in TASKS item 40's research ledger. The main ones: maps made at bring-up for every device (R1), which gains nothing while I12 keeps bus mastering off; a separate window for identity maps (R2); mapping a range the memory map does not mark as reserved (R3), which would let firmware tables open ordinary RAM to a device; programming AMD's exclusion registers (R4), which bypass translation for the range on every device of that IOMMU.
+
+**Performance cost (ADR-0018 V3).** Unmeasured, owed (cost ledger row CL39, added when the ledger and this amendment are in one tree): at a device's attach, one identity map for each page of each reserved range that names it; at each IOVA allocation in a domain that has identity maps, the skipped pages. A DMA through an identity map is translated as any other. Nothing changes for a device that no reserved range names.
+
+**Trade-offs.** A device that firmware names is reached at the addresses firmware chose, which I4 otherwise forbids, and a device learns those physical addresses. In return such devices work at all, which question 4 required before real hardware.
+
+**Migration consequences.** None for a program or a driver: nothing of the Driver ABI changes. ADR-0013 gains TASKS item 40's boot proof and controls when that task lands.
+
+**What stays unknown.** No machine in the declared scope has been seen with an RMRR or an IVMD. QEMU has neither, so TASKS item 40's boot test plants one in its tables (a test-only step). Rental A's server had an IVRS with no IVMD.
 
 ## Questions for the owner (1–9 answered 2026-11-08; 10 open)
 
