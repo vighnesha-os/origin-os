@@ -20,8 +20,9 @@
 
 /// The configuration file's first four bytes.
 pub const MAGIC: [u8; 4] = *b"ORRV";
-/// The configuration format's version.
-pub const VERSION: u16 = 1;
+/// The configuration format's version (2: [`Placement::ReservedOther`] and [`Placement::Table`],
+/// and a fill bound to each page's address).
+pub const VERSION: u16 = 2;
 /// Bytes of the header: magic, version, region count.
 pub const HEADER: usize = 8;
 /// Bytes of one region record.
@@ -48,6 +49,14 @@ pub enum Placement {
     /// Fresh pages of type `EfiReservedMemoryType`, filled with [`fill_byte`]: what a firmware
     /// that follows VT-d §8.4 reports.
     Reserved,
+    /// Fresh pages of type `EfiReservedMemoryType` that hold something other than the fill
+    /// (each page holds the fill of the page 1 MiB above it), as a real firmware's own memory
+    /// would: the kernel's proof must not write into them (TASKS item 40's review, M2).
+    ReservedOther,
+    /// The page that holds the application's copy of the table itself, which it puts in
+    /// `EfiReservedMemoryType` pages: a writable range there covers a table the kernel holds as
+    /// a reference, and the kernel must refuse it (TASKS item 40's review, M1).
+    Table,
     /// Fresh pages of type `EfiLoaderData`, which the kernel takes back as its own RAM: a
     /// range the kernel must refuse.
     LoaderData,
@@ -124,6 +133,8 @@ pub fn encode(regions: &[Region], out: &mut [u8]) -> Option<usize> {
             Placement::Reserved => (1, 0),
             Placement::LoaderData => (2, 0),
             Placement::Fixed(at) => (3, at),
+            Placement::ReservedOther => (4, 0),
+            Placement::Table => (5, 0),
         };
         rec[3] = placement;
         rec[4..6].copy_from_slice(&r.device.to_le_bytes());
@@ -157,6 +168,8 @@ pub fn decode(b: &[u8], out: &mut [Region; MAX_REGIONS]) -> Result<usize, Config
             1 => Placement::Reserved,
             2 => Placement::LoaderData,
             3 => Placement::Fixed(u64_at(rec, 16).ok_or(bad)?),
+            4 => Placement::ReservedOther,
+            5 => Placement::Table,
             _ => return Err(bad),
         };
         let pages = u32_at(rec, 8).ok_or(bad)?;
@@ -177,17 +190,23 @@ pub fn decode(b: &[u8], out: &mut [Region; MAX_REGIONS]) -> Result<usize, Config
     Ok(count)
 }
 
-/// The byte a reserved region holds at `offset` from its start, `index` being the region's
-/// place in the configuration: never zero, and different from page to page, so a copy that
-/// lands one page off is seen.
-pub fn fill_byte(index: usize, offset: u64) -> u8 {
-    let page = offset / PAGE;
-    let v = (index as u64)
-        .wrapping_mul(0x9E37)
-        .wrapping_add(page.wrapping_mul(0x51))
-        .wrapping_add(offset % PAGE)
-        % 255;
-    v as u8 + 1
+/// The first 16 bytes of every page the application fills.
+pub const FILL_MAGIC: [u8; 16] = *b"ORIGIN TEST FILL";
+
+/// The byte the application puts at `offset` (below [`PAGE`]) of the reserved page at physical
+/// address `page`: [`FILL_MAGIC`], then the page's own address, then bytes that are never zero
+/// and differ from page to page, so a copy that lands on another page is seen. The kernel
+/// recognises a page by it (`framekernel::testfill`, which `xtask`'s tests hold equal to this)
+/// and writes into no reserved page that lacks it (TASKS item 40's review, M2).
+pub fn fill_byte(page: u64, offset: u64) -> u8 {
+    match offset {
+        0..16 => FILL_MAGIC[offset as usize],
+        16..24 => page.to_le_bytes()[(offset - 16) as usize],
+        _ => {
+            let v = (page >> 12).wrapping_mul(0x9E37).wrapping_add(offset) % 255;
+            v as u8 + 1
+        }
+    }
 }
 
 /// An RMRR (VT-d §8.4) over `[base, base + len)` in `segment`, naming one PCI endpoint on bus
@@ -363,8 +382,15 @@ mod tests {
         bad[HEADER + 2 * RECORD + 8] = 0; // pages
         assert_eq!(decode(&bad[..len], &mut out), Err(ConfigError::Record(2)));
         let mut bad = buf;
-        bad[HEADER + 3] = 4; // placement
+        bad[HEADER + 3] = 6; // placement
         assert_eq!(decode(&bad[..len], &mut out), Err(ConfigError::Record(0)));
+        let mut other = buf;
+        other[HEADER + 3] = 4; // the reserved pages without the fill
+        assert_eq!(decode(&other[..len], &mut out), Ok(3));
+        assert_eq!(out[0].placement, Placement::ReservedOther);
+        other[HEADER + 3] = 5; // the table's own page
+        assert_eq!(decode(&other[..len], &mut out), Ok(3));
+        assert_eq!(out[0].placement, Placement::Table);
         assert_eq!(
             encode(&[regions()[0]; MAX_REGIONS + 1], &mut [0u8; 1024]),
             None
@@ -372,12 +398,15 @@ mod tests {
     }
 
     #[test]
-    fn the_fill_is_never_zero_and_differs_between_pages() {
-        for index in 0..4 {
-            for offset in (0..4 * PAGE).step_by(97) {
-                assert_ne!(fill_byte(index, offset), 0);
-            }
-            assert_ne!(fill_byte(index, 0), fill_byte(index, PAGE));
+    fn the_fill_is_bound_to_its_page_and_never_zero_after_its_header() {
+        for page in [0x1000, 0x1FB3_1000, 0xFF_FFFF_F000] {
+            let fill: [u8; PAGE as usize] = core::array::from_fn(|i| fill_byte(page, i as u64));
+            assert_eq!(&fill[..16], &FILL_MAGIC);
+            assert_eq!(fill[16..24], page.to_le_bytes());
+            assert!(fill[24..].iter().all(|&b| b != 0));
+            let next: [u8; PAGE as usize] =
+                core::array::from_fn(|i| fill_byte(page + 0x10_0000, i as u64));
+            assert_ne!(fill[24..], next[24..]);
         }
     }
 

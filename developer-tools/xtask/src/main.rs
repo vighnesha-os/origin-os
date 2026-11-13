@@ -454,12 +454,20 @@ fn reserved_regions(amd: bool) -> Vec<origin_test_reserved_memory::Region> {
             ivmd(0x20, 0b1000, Placement::Reserved, 0, 0),
             ivmd(0x22, 0b0000, Placement::Reserved, NVME, 3 << 3),
             ivmd(0x21, 0b0111, Placement::LoaderData, ABSENT_DEVICE, 0),
+            // A writable range whose page lacks the test fill: the proof must not write it (M2).
+            ivmd(0x21, 0b0111, Placement::ReservedOther, NVME, 0),
+            // A writable range over the IVRS copy itself, which the kernel holds (M1).
+            ivmd(0x21, 0b0111, Placement::Table, ABSENT_DEVICE, 0),
         ]
     } else {
         vec![
             rmrr(Placement::Reserved, NVME, 2),
             rmrr(Placement::LoaderData, ABSENT_DEVICE, 1),
             rmrr(Placement::Fixed(0xFEE0_0000), ABSENT_DEVICE, 1),
+            // A writable range whose page lacks the test fill: the proof must not write it (M2).
+            rmrr(Placement::ReservedOther, NVME, 1),
+            // A writable range over the DMAR copy itself, which the kernel holds (M1).
+            rmrr(Placement::Table, ABSENT_DEVICE, 1),
         ]
     }
 }
@@ -1162,6 +1170,10 @@ fn reserved_markers(scenario: &mut Scenario, amd: bool) {
             "(reserved pages) for DeviceID 0x0010",
             "origin-test-reserved: IVMD type 0x21 flags 0b0111 0x",
             "(loader-data pages) for DeviceID 0x00fe",
+            "origin-test-reserved: IVMD type 0x21 flags 0b0111 0x",
+            "(reserved pages without the test fill) for DeviceID 0x0010",
+            "origin-test-reserved: IVMD type 0x21 flags 0b0111 0x",
+            "(the table's own pages) for DeviceID 0x00fe",
             "origin-test-reserved: the XSDT now names IVRS at 0x",
             "origin-test-reserved: starting the loader",
         ]
@@ -1173,6 +1185,10 @@ fn reserved_markers(scenario: &mut Scenario, amd: bool) {
             "origin-test-reserved: RMRR 0x",
             "(loader-data pages) for 00:1f.6",
             "origin-test-reserved: RMRR 0xfee00000-0xfee00fff (a fixed address) for 00:1f.6",
+            "origin-test-reserved: RMRR 0x",
+            "(reserved pages without the test fill) for 00:02.0",
+            "origin-test-reserved: RMRR 0x",
+            "(the table's own pages) for 00:1f.6",
             "origin-test-reserved: the XSDT now names DMAR at 0x",
             "origin-test-reserved: starting the loader",
         ]
@@ -1183,9 +1199,11 @@ fn reserved_markers(scenario: &mut Scenario, amd: bool) {
     scenario.markers.splice(0..0, fixture);
     let mapped = "in the domain of each device it names that a driver attaches";
     let refused_ram = "): refused (the memory map does not call 0x";
+    let refused_lent =
+        "): refused (it is writable and overlaps the firmware table the kernel holds at 0x";
     let (after, kernel): (&str, Vec<String>) = if amd {
         (
-            "origin-kernel: IOMMU: IVRS revision 1, IVinfo 0x2801 (EFR support true, 40-bit physical and 0-bit virtual addresses, pre-boot DMA protection false); 1 IOMMU(s) in 2 IVHD(s), 5 memory definition(s)",
+            "origin-kernel: IOMMU: IVRS revision 1, IVinfo 0x2801 (EFR support true, 40-bit physical and 0-bit virtual addresses, pre-boot DMA protection false); 1 IOMMU(s) in 2 IVHD(s), 7 memory definition(s)",
             vec![
                 "origin-kernel: IOMMU: reserved memory 0x".into(),
                 ", flags 0b0111; for DeviceID 0x0010 (00:02.0) in segment 0): identity-mapped, read and write, ".into(),
@@ -1199,6 +1217,10 @@ fn reserved_markers(scenario: &mut Scenario, amd: bool) {
                 "origin-kernel: IOMMU: reserved memory 0x".into(),
                 format!(", flags 0b0111; for DeviceID 0x00fe (00:1f.6) in segment 0{refused_ram}"),
                 " reserved or EFI runtime memory), so the devices it names cannot be attached".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                ", flags 0b0111; for DeviceID 0x0010 (00:02.0) in segment 0): identity-mapped, read and write, ".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!(", flags 0b0111; for DeviceID 0x00fe (00:1f.6) in segment 0{refused_lent}"),
             ],
         )
     } else {
@@ -1212,6 +1234,10 @@ fn reserved_markers(scenario: &mut Scenario, amd: bool) {
                 " reserved or EFI runtime memory), so the devices it names cannot be attached".into(),
                 "origin-kernel: IOMMU: reserved memory 0xfee00000-0xfee00fff (RMRR at offset 0x".into(),
                 "; for 00:1f.6): refused (it overlaps the interrupt range), so the devices it names cannot be attached".into(),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!("; for 00:02.0): identity-mapped, read and write, {mapped}"),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                format!("; for 00:1f.6{refused_lent}"),
             ],
         )
     };
@@ -1273,36 +1299,70 @@ fn check_reserved_boot(done: &Completed) -> Result {
             ));
         }
     }
+    // The range over the table copy is refused for the copy the kernel holds, at its address
+    // (M1): the one the application put in the XSDT.
+    let copy = done
+        .serial
+        .lines()
+        .find_map(|l| l.strip_prefix("origin-test-reserved: the XSDT now names "))
+        .and_then(|l| l.split_whitespace().nth(2))
+        .ok_or("the application did not say where its table copy is")?;
+    let held = format!("overlaps the firmware table the kernel holds at {copy})");
+    if !done.serial.contains(&held) {
+        return Err(format!(
+            "the kernel did not refuse the range over the table copy at {copy} as a table it holds"
+        ));
+    }
     let proofs: Vec<&str> = done
         .serial
         .lines()
         .filter(|l| l.contains("origin-kernel: IOMMU: reserved memory proof: page 0x"))
         .collect();
-    let count = |access: &str, write: &str, others: &str| {
+    let count = |access: &str, write: &str, fill: &str, others: &str| {
         proofs
             .iter()
             .filter(|l| {
-                l.contains(&format!("({access}) in the NVMe controller's domain maps to itself: true; the controller's write of LBA 2048 into it {write}: true; its read of it to LBA 24576 carried what the page holds: true; other domains: {others}; consistent true"))
+                l.contains(&format!("({access}, as the firmware's bits give: true) in the NVMe controller's domain maps to itself: true; the controller's write of LBA 2048 into it {write}: true; its read of it to LBA 24576 carried what the page holds: true; {fill}; other domains: {others}; consistent true"))
             })
             .count()
     };
     let landed = "landed there";
-    let alone = "00:03.0 does not map it";
+    let filled = "the page held the test step's fill";
+    let alone = "00:03.0 does not map it at any address";
+    // The page without the test fill: written by nothing, and left as it was (M2).
+    let left = |count: &dyn Fn(&str, &str, &str, &str) -> usize| {
+        count(
+            "read and write",
+            "was not run, as the page does not hold the test step's fill",
+            "the page is unchanged: true",
+            alone,
+        )
+    };
     let (expected, found) = if amd {
         (
-            [1, 1, 1],
+            [1, 1, 1, 1],
             [
-                count("read and write", landed, alone),
-                count("read only", "was blocked and recorded", alone),
+                count("read and write", landed, filled, alone),
+                count("read only", "was blocked and recorded", filled, alone),
                 count(
                     "read and write",
                     landed,
+                    filled,
                     "00:03.0 maps it too, as the firmware names it",
                 ),
+                left(&count),
             ],
         )
     } else {
-        ([2, 0, 0], [count("read and write", landed, alone), 0, 0])
+        (
+            [2, 0, 0, 1],
+            [
+                count("read and write", landed, filled, alone),
+                0,
+                0,
+                left(&count),
+            ],
+        )
     };
     if found != expected || proofs.len() != expected.iter().sum::<usize>() {
         return Err(format!(
@@ -5773,6 +5833,29 @@ mod gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TASKS item 40's review, M2: the kernel writes into a planted reserved page only where it
+    /// finds the fill the TEST ONLY application puts there, so the two copies must agree.
+    #[test]
+    fn the_fixtures_fill_is_the_one_the_kernel_recognises() {
+        for page in [0x1000, 0x1FB3_1000, 0x7A00_0000, 0xFF_FFFF_F000] {
+            let planted: Vec<u8> = (0..framekernel::testfill::PAGE as u64)
+                .map(|o| origin_test_reserved_memory::fill_byte(page, o))
+                .collect();
+            assert!(
+                framekernel::testfill::holds_fill(page, &planted),
+                "{page:#x}"
+            );
+            // What the application puts in its pages without the fill is not the fill.
+            let other: Vec<u8> = (0..framekernel::testfill::PAGE as u64)
+                .map(|o| origin_test_reserved_memory::fill_byte(page + 0x10_0000, o))
+                .collect();
+            assert!(
+                !framekernel::testfill::holds_fill(page, &other),
+                "{page:#x}"
+            );
+        }
+    }
 
     /// ADR-0004 Amendment 2, A6.3: a boot log names no address in the stack window, PML4 slots
     /// 384–447, in any case and anywhere in a line; its edges and the windows beside it are fine.

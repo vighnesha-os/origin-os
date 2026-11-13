@@ -4,10 +4,13 @@
 //!
 //! 1. reads `\EFI\ORIGIN\RESERVED.CFG` (the regions, from `cargo xtask`) and
 //!    `\EFI\ORIGIN\LOADER.EFI` (the unchanged test loader) from its own volume;
-//! 2. allocates each region: reserved pages (filled with [`fill_byte`]), loader-data pages
-//!    (RAM the kernel will own, which it must refuse), or a fixed address;
+//! 2. allocates each region: reserved pages (filled with [`fill_byte`], or with another page's
+//!    fill), loader-data pages (RAM the kernel will own, which it must refuse), a fixed
+//!    address, or the pages of the table copy itself;
 //! 3. copies the firmware's DMAR or IVRS, with an RMRR or IVMD per region appended, into new
-//!    ACPI-reclaim pages, and points the XSDT's entry at the copy;
+//!    `EfiReservedMemoryType` pages (a firmware may keep its tables there; then a range over
+//!    the copy passes the memory-map rule, and only the kernel's refusal of writable ranges over
+//!    tables it holds stops it), and points the XSDT's entry at the copy;
 //! 4. prints each region on the console, so the boot test can hold the kernel's report against
 //!    it, and starts the loader with this volume as its device.
 //!
@@ -38,7 +41,6 @@ const ALLOCATE_MAX_ADDRESS: u32 = 1;
 /// `EfiReservedMemoryType`, `EfiLoaderData`, `EfiACPIReclaimMemory` (§7.2).
 const RESERVED_MEMORY: u32 = 0;
 const LOADER_DATA: u32 = 2;
-const ACPI_RECLAIM: u32 = 9;
 /// Regions are placed below 4 GiB, where firmware puts its legacy reservations.
 const BELOW_4G: u64 = 0xFFFF_F000;
 /// The largest file read (the loader is about 300 KiB).
@@ -231,27 +233,41 @@ fn plant(
     let old = unsafe { physical(addr, old_len) };
     let mut extra = [0u8; STRUCTURE * MAX_REGIONS];
     let mut used = 0;
-    for (i, r) in regions.iter().enumerate().filter(|(_, r)| r.table == table) {
+    // The copy's pages first, so a region can name them (Placement::Table).
+    let new_len = old_len + STRUCTURE * regions.iter().filter(|r| r.table == table).count();
+    let new = allocate(bs, RESERVED_MEMORY, new_len.div_ceil(PAGE as usize))?;
+    for r in regions.iter().filter(|r| r.table == table) {
         let pages = r.pages as usize;
         let base = match r.placement {
-            Placement::Reserved => {
+            Placement::Reserved | Placement::ReservedOther => {
                 let base = allocate(bs, RESERVED_MEMORY, pages)?;
+                // Each page's own fill, or, for the pages the kernel must leave alone, another
+                // page's.
+                let other = if r.placement == Placement::Reserved {
+                    0
+                } else {
+                    0x10_0000
+                };
                 // SAFETY: the pages just allocated, identity-mapped and owned by nothing else.
                 let mem = unsafe { physical_mut(base, pages * PAGE as usize) };
                 for (o, b) in mem.iter_mut().enumerate() {
-                    *b = fill_byte(i, o as u64);
+                    let o = o as u64;
+                    *b = fill_byte(base + o / PAGE * PAGE + other, o % PAGE);
                 }
                 base
             }
             Placement::LoaderData => allocate(bs, LOADER_DATA, pages)?,
             Placement::Fixed(at) => at,
+            Placement::Table => new,
         };
         extra[used..used + STRUCTURE].copy_from_slice(&structure(r, base));
         used += STRUCTURE;
         let what = match r.placement {
             Placement::Reserved => "reserved pages",
+            Placement::ReservedOther => "reserved pages without the test fill",
             Placement::LoaderData => "loader-data pages",
             Placement::Fixed(_) => "a fixed address",
+            Placement::Table => "the table's own pages",
         };
         let last = base + u64::from(r.pages) * PAGE - 1;
         let (bus, dev, fun) = (r.device >> 8, (r.device >> 3) & 0x1F, r.device & 7);
@@ -271,9 +287,10 @@ fn plant(
             }
         }
     }
-    let new_len = old_len + used;
-    let new = allocate(bs, ACPI_RECLAIM, new_len.div_ceil(PAGE as usize))?;
-    // SAFETY: the pages just allocated, at least `new_len` bytes, owned by nothing else.
+    if old_len + used != new_len {
+        return Err((Status::LOAD_ERROR, "the structures do not fill the copy"));
+    }
+    // SAFETY: the pages allocated above, at least `new_len` bytes, owned by nothing else.
     let dst = unsafe { physical_mut(new, new_len) };
     grow(old, &extra[..used], dst).ok_or((Status::LOAD_ERROR, "the copy does not fit"))?;
     xsdt_set(xsdt, index, new).ok_or((Status::LOAD_ERROR, "the XSDT cannot be changed"))?;
