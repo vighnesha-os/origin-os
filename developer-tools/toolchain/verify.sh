@@ -341,13 +341,13 @@ if [ ! -x "$NM" ] || [ ! -x "$LLVM_OBJDUMP" ]; then
 elif ! loader_cargo --lib > "$out" 2>&1; then
   why="the loader's library did not build"
 else
-  rlib=""; rlibs=0
-  for f in "$LOADER_TARGET"/x86_64-unknown-uefi/release/deps/liborigin_boot_uefi-*.rlib; do
-    if [ -f "$f" ]; then rlib="$f"; rlibs=$((rlibs + 1)); fi
-  done
+  # The archive under the name Cargo gives a library it was asked to build: beside the
+  # target's other outputs. Where Cargo keeps its own copy is no interface (Cargo 1.100.0
+  # moved it), and this directory is new in every run, so the file can only be this build's.
+  rlib="$LOADER_TARGET/x86_64-unknown-uefi/release/liborigin_boot_uefi.rlib"
   : > "$out"
-  if [ "$rlibs" -ne 1 ]; then
-    echo "expected one liborigin_boot_uefi-*.rlib, found $rlibs" >> "$out"
+  if [ ! -f "$rlib" ]; then
+    echo "expected $rlib, which is not there" >> "$out"
     why="the loader's library was not found as one archive"
   else
     "$NM" "$rlib" > "$WORK/wcslen_nm.txt" 2> /dev/null
