@@ -370,6 +370,32 @@ KB-11 to KB-14 are TASKS item 57's (ADR-0005 Amendment 10, I1) and ran on an exp
 
 Each of the six failed where it was aimed, and so did KB-7 to KB-10. `16b5683` differs from `8ca93c5` only by `rustfmt`. KB-1 and KB-2 are the two the step-4 ledger asks for; KB-3 to KB-6 are this task's own: the threads count, the coordinating session's ruling (d), the figure's thread part and the fix to S3-5b's `prepare_run`.
 
+**Controls of the identity maps for firmware-reserved memory (ADR-0007 questions 4 and 8; TASKS item 40; 2026-11-12, QEMU 11.1.3 TCG, 2 processors):** temporary edits on `claude/rmrr-ivmd-maps` at `9a9c62f`, each booted once in the `kernel boot` scenario of the reserved-memory machine (`ORIGIN_QEMU_RESERVED=on`, `ORIGIN_BOOT_TEST_ONLY="kernel boot"`), under the IOMMU named, then put back with `git checkout` and the tree checked clean:
+
+| # | Edit | Result |
+|---|---|---|
+| RM-1 | The identity maps are not made, in either driver (`iommu.rs`, `iommu/amd.rs`) | VT-d and AMD-Vi alike: `reserved memory proof: page … maps to itself: false; the controller's write … landed there: false; its read … carried what the page holds: false; …; consistent false: IOMMU failed` |
+| RM-2 | VT-d maps each reserved page one page off (`iommu.rs`) | `… maps to itself: false; … landed there: false; … carried what the page holds: false; …: IOMMU failed` |
+| RM-3 | `reserved::check` skips the memory-map rule | The range in loader-data pages is reported identity-mapped; `first missing marker "; for 00:1f.6): refused (the memory map does not call 0x"` |
+| RM-4 | An IVMD's read-only range is mapped read and write (`reserved::from_ivmd`), AMD-Vi | Bring-up reports the read-only IVMD as `read and write`; `first missing marker ", flags 0b0011; for DeviceID 0x0010 (00:02.0) in segment 0): identity-mapped, read only, "`. The kernel's own proof passes here, because it takes the access it expects from the same decoding the edit changed; only xtask's markers and its whole-log check, which ask for one read-only page and know the flags planted, catch it |
+| RM-5 | The application plants nothing: the XSDT keeps QEMU's DMAR (`tests/emulator/reserved-memory/src/main.rs`) | `first missing marker "origin-kernel: IOMMU: reserved memory 0x"`: with QEMU's own table the kernel has nothing to map, and the proof shows nothing |
+
+Each boot failed (`cargo xtask boot-test` exit 1), each by the line it was aimed at. Logs: the session's scratchpad, not kept in the repository.
+
+**The same controls again, and two more, after TASKS item 40's independent review (2026-11-13, Rust 1.100.0, QEMU 11.1.3 TCG, 2 processors):** temporary edits on `claude/rmrr-ivmd-maps` at `970bb94`, the fixes of `docs/engineering/REVIEW_T40_2026-11-13.md` in it. They ran in one turn of the machine, by a script that applied each edit, booted the `kernel boot` scenario of the reserved-memory machine once, put the file back with `git checkout` and checked it clean. The fixture now also plants a writable page without its fill for the NVMe controller, and a writable range over its own table copy for a device no driver attaches.
+
+| # | Edit | Result |
+|---|---|---|
+| RM-1 | The identity maps are not made, in either driver | VT-d and AMD-Vi alike: `… maps to itself: false; … its read of it to LBA 24576 carried what the page holds: false; …; consistent false: IOMMU failed`. The write leg is not run on the page without the fill, the first one proven, and that clause stays true |
+| RM-2 | VT-d maps each reserved page one page off | `… maps to itself: false; … carried what the page holds: false; …: IOMMU failed` |
+| RM-3 | `reserved::check` skips the memory-map rule | The range in loader-data pages is reported identity-mapped; first missing marker `"; for 00:1f.6): refused (the memory map does not call 0x"` |
+| RM-4 | An IVMD's read-only range decoded as read and write (`reserved::from_ivmd`), AMD-Vi | **Now caught by the kernel's own proof** (review I4): `page … (read and write, as the firmware's bits give: false) …; consistent false: IOMMU failed`. The controller's write landed, since the page was mapped writable |
+| RM-5 | The application plants nothing (the XSDT keeps QEMU's DMAR) | `reserved memory: none is identity-mapped for the NVMe controller (0 range(s) named by the firmware, 0 refused)`; first missing marker `"origin-kernel: IOMMU: reserved memory 0x"` |
+| RM-6 | The proof's write leg forced onto every page (`storage.rs`, review M2) | **Caught by the proof itself**: on the page without the fill, `the controller's write of LBA 2048 into it landed there: true; …; the page is unchanged: false; …: IOMMU failed` |
+| RM-7 | `vm::firmware_bytes` records nothing it lends (review M1) | The range over the DMAR copy is accepted (`identity-mapped, read and write`). That makes the copy device-writable, so `firmware_bytes` will not lend it again, and PCIe bring-up stops: `PCIe: the platform's reserved ranges cannot be listed (an XSDT entry could not be read): PCIe failed`. The other half of the record caught it before xtask's marker for the refusal could |
+
+Each boot failed (`cargo xtask boot-test` exit 1), and every file was restored. RM-4 and RM-6 now fail the kernel's own proof, which is what a real machine without xtask's markers has. Logs: the session's scratchpad, not kept in the repository.
+
 **The legacy-free machine (`boot-legacy-free`, in `boot-matrix`):** `-machine pit=off,i8042=off` boots the whole kernel. Before F3 it read the absent port 61h as 0xFF and reported `calibrated against the PIT: 0 kHz`, and failed. After, it calibrates against the ACPI PM timer (agreeing with one RTC second to 0.006 %), reports that it cannot prove the two PIT-based I/O APIC proofs, that the FADT says it has no 8042, and `boot verdict: 50 of 50 proofs passed`.
 
 **Real processors:** research ledger §3 (CI through KVM).

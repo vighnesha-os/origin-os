@@ -35,6 +35,7 @@ members = [
     "security/crypto",
     "security/random",
     "services/directory",
+    "tests/emulator/reserved-memory",
     "tests/kernel/first-program",
     "tests/kernel/pin-program",
 ]

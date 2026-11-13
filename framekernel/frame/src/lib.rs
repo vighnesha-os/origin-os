@@ -50,6 +50,7 @@ pub mod objref;
 pub mod once;
 pub mod pci;
 pub mod percpu;
+pub mod reserved;
 pub mod speculation;
 pub mod tablebound;
 pub mod told;

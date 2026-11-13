@@ -64,6 +64,8 @@
 //! - [`originfs`]: a read-only OriginFS on-disk parser and image builder (ADR-0006,
 //!   Proposed; host-tested, not mounted by the kernel pending owner approval, §84);
 //! - [`tcp`]: TCP segments and a minimal connection state machine;
+//! - [`testfill`]: the fill the TEST ONLY firmware step plants in reserved pages, which the
+//!   reserved-memory proof writes into only where it finds it;
 //! - [`text`]: a streaming, error-locating UTF-8 decoder for the text engine;
 //! - [`tftp`]: a TFTP reader (RFC 1350): read requests, acknowledgements and a download
 //!   state machine;
@@ -153,6 +155,7 @@ pub mod semver;
 pub mod serial;
 pub mod spcr;
 pub mod tcp;
+pub mod testfill;
 #[cfg(test)]
 #[path = "../frame/src/testing.rs"]
 mod testing;

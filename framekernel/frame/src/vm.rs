@@ -8,6 +8,7 @@
 //! none. Kernel-half mappings are global; the identity pages of the AP trampoline are not.
 //! Nothing here splits a page of the direct map after boot.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use origin_paging::layout::{self, DIRECT_MAP_WINDOW, DIRECT_MAP_WINDOW_SIZE};
@@ -31,6 +32,7 @@ use crate::addr::PhysAddr;
 use crate::memory::OwnedFrame;
 use crate::mmio::MmioRegion;
 use crate::once::SetOnce;
+use crate::reserved::Lending;
 
 /// Physical ranges of device registers that have been handed out, at most one owner each. A
 /// claim outside `map_mmio` is the framework's own (the IOMMU's registers, ECAM): no driver
@@ -554,6 +556,78 @@ pub fn map_mmio(phys: PhysAddr, len: u64) -> Result<MmioRegion, MmioError> {
     Ok(unsafe { MmioRegion::from_mapped(virt as usize, len as usize, phys) })
 }
 
+/// Firmware memory lent as references ([`firmware_bytes`]) and firmware memory a device may
+/// write by DMA (the reserved ranges the IOMMU identity-maps writable, [`device_writable`]),
+/// under one lock, so neither can be granted over the other (threat T26; TASKS item 40's
+/// review, M1).
+static LENDING: SpinLock<Lending> = SpinLock::new(Lending::new());
+
+/// Records that devices may write firmware memory `[base, end)` from now on (the IOMMU calls
+/// this before it can map such a range); only [`read_firmware`] reads it afterwards. Refused,
+/// and nothing recorded, if [`firmware_bytes`] has lent any of it, or if no more such ranges
+/// can be kept: the IOMMU must then refuse the range.
+pub fn device_writable(base: u64, end: u64) -> Result<(), crate::reserved::Refusal> {
+    crate::cpu::without_interrupts(|| LENDING.lock().allow_writes(base, end))
+}
+
+/// Every firmware range [`firmware_bytes`] has lent as a reference, `[base, end)`: the ACPI
+/// tables the kernel holds for its life. The IOMMU refuses a writable identity range over any.
+pub fn lent_ranges() -> Vec<(u64, u64)> {
+    crate::cpu::without_interrupts(|| LENDING.lock().lent().to_vec())
+}
+
+/// Whether `[raw, end)` is memory the firmware described as its own (reserved, ACPI, runtime
+/// or device memory, or firmware memory of another type): never RAM the kernel owns or will
+/// own. Unaccepted memory is RAM, not firmware data (boot info 0.7).
+fn is_firmware_data(raw: u64, end: u64) -> bool {
+    let firmware = [
+        RegionKind::Reserved,
+        RegionKind::FirmwareOther,
+        RegionKind::AcpiReclaimable,
+        RegionKind::AcpiNvs,
+        RegionKind::Mmio,
+        RegionKind::RuntimeCode,
+        RegionKind::RuntimeData,
+    ]
+    .map(|kind| kind as u32);
+    crate::cpu::without_interrupts(|| {
+        KERNEL_SPACE.lock().as_ref().is_some_and(|k| {
+            !k.memory_map.iter().any(|r| {
+                r.base < end
+                    && raw < r.base.saturating_add(r.pages.saturating_mul(PAGE))
+                    && !firmware.contains(&r.kind)
+            })
+        })
+    })
+}
+
+/// Copies firmware memory at physical `addr` into `out` with volatile reads, mapping it
+/// read-only first if the kernel does not map it: for memory a device may write by DMA at any
+/// time (a firmware-reserved range the IOMMU identity-maps, ADR-0007 question 4), which no
+/// Rust reference may cover. Refused, as [`firmware_bytes`], unless the memory map says the
+/// whole range is the firmware's own.
+pub fn read_firmware(addr: PhysAddr, out: &mut [u8]) -> Result<(), MapError> {
+    let raw = addr.raw();
+    let len = out.len() as u64;
+    if raw == 0 || len > isize::MAX as u64 {
+        return Err(MapError::Overflow);
+    }
+    let end = raw.checked_add(len).ok_or(MapError::Overflow)?;
+    if !is_firmware_data(raw, end) {
+        return Err(MapError::OutOfMemory);
+    }
+    let virt = map_firmware(raw, len)?;
+    for (i, byte) in out.iter_mut().enumerate() {
+        let p = core::ptr::with_exposed_provenance::<u8>(virt as usize + i);
+        // SAFETY: `[raw, raw + len)` is firmware memory (checked above), mapped readable at its
+        // direct-map address `virt` (just ensured) and not wrapping (checked), so `p` lies in a
+        // live mapping; `u8` has no alignment or validity requirement. Volatile and through a
+        // raw pointer, because a device may be writing it.
+        *byte = unsafe { p.read_volatile() };
+    }
+    Ok(())
+}
+
 /// A readable copy of what the firmware put at physical `[addr, addr + len)` (ACPI tables):
 /// `&'static` because firmware tables do not change after boot. Refused for anything but the
 /// firmware's own data: a range that overlaps memory the kernel owns or will own (`Usable`,
@@ -565,27 +639,11 @@ pub fn firmware_bytes(addr: PhysAddr, len: u64) -> Result<&'static [u8], MapErro
         return Err(MapError::Overflow);
     }
     let end = raw.checked_add(len).ok_or(MapError::Overflow)?;
-    // Only memory the firmware described as its own (reserved, ACPI, runtime or device
-    // memory): never RAM the kernel owns or will own.
-    let firmware = [
-        RegionKind::Reserved,
-        RegionKind::AcpiReclaimable,
-        RegionKind::AcpiNvs,
-        RegionKind::Mmio,
-        RegionKind::RuntimeCode,
-        RegionKind::RuntimeData,
-    ]
-    .map(|kind| kind as u32);
-    let is_firmware_data = crate::cpu::without_interrupts(|| {
-        KERNEL_SPACE.lock().as_ref().is_some_and(|k| {
-            !k.memory_map.iter().any(|r| {
-                r.base < end
-                    && raw < r.base.saturating_add(r.pages.saturating_mul(PAGE))
-                    && !firmware.contains(&r.kind)
-            })
-        })
-    });
-    if !is_firmware_data {
+    // Not memory a device may write: a reference to it could change under the reader. Lent
+    // from here on, so no device is ever allowed to write it.
+    if !is_firmware_data(raw, end)
+        || !crate::cpu::without_interrupts(|| LENDING.lock().lend(raw, end))
+    {
         return Err(MapError::OutOfMemory);
     }
     let virt = map_firmware(raw, len)?;
