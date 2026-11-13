@@ -250,6 +250,12 @@ Given elsewhere by rule 3: hot-plug and external-device authorization (S31-12, S
 | S58-06 | Driver isolation |
 | S73-10, S73-11 | Filesystem metadata and DMA mapping ownership as proof targets |
 
+**Five more rows placed here, beside the IOMMU rows they refine (items 247 to 251, 2026-11-13).** Placed by the coordinating session under item 264's rule; they are in no exit test and change none.
+
+| Rows | Subject |
+|---|---|
+| A07-R1 to A07-R5 | Identity maps for firmware-reserved memory (ADR-0007 Amendment 1) |
+
 ## M6. Native runtime
 
 **Accepted: decision item 262; `ONBF.md` §13 and §8.2 by item 267.** **State, 2026-11-12: not started on this tree.** In short: TASKS item 41 (task S4-1) builds the native Rust user runtime on its own branch; nothing of M6 is on this tree yet (matrix row S82-07).
