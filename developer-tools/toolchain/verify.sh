@@ -19,7 +19,7 @@
 
 set -u
 
-EXPECTED="1.99.1"
+EXPECTED="1.100.0"
 TARGETS="x86_64-unknown-none x86_64-unknown-uefi x86_64-unknown-linux-gnu"
 COMPONENTS="rustfmt clippy rust-src llvm-tools"
 
@@ -341,13 +341,13 @@ if [ ! -x "$NM" ] || [ ! -x "$LLVM_OBJDUMP" ]; then
 elif ! loader_cargo --lib > "$out" 2>&1; then
   why="the loader's library did not build"
 else
-  rlib=""; rlibs=0
-  for f in "$LOADER_TARGET"/x86_64-unknown-uefi/release/deps/liborigin_boot_uefi-*.rlib; do
-    if [ -f "$f" ]; then rlib="$f"; rlibs=$((rlibs + 1)); fi
-  done
+  # The archive under the name Cargo gives a library it was asked to build: beside the
+  # target's other outputs. Where Cargo keeps its own copy is no interface (Cargo 1.100.0
+  # moved it), and this directory is new in every run, so the file can only be this build's.
+  rlib="$LOADER_TARGET/x86_64-unknown-uefi/release/liborigin_boot_uefi.rlib"
   : > "$out"
-  if [ "$rlibs" -ne 1 ]; then
-    echo "expected one liborigin_boot_uefi-*.rlib, found $rlibs" >> "$out"
+  if [ ! -f "$rlib" ]; then
+    echo "expected $rlib, which is not there" >> "$out"
     why="the loader's library was not found as one archive"
   else
     "$NM" "$rlib" > "$WORK/wcslen_nm.txt" 2> /dev/null
@@ -478,6 +478,82 @@ if grep -Eq 'cf-protection|stack-protector' "$WORK/chelp.txt"; then
 else
   echo "Neither cf-protection nor stack-protector appears in 'rustc -C help'." > "$out"
   record PASS "IBT (cf-protection) and stack-protector are still unstable on ${RELEASE:-?}, as CLAUDE.md §14 records" "$out"
+fi
+
+# ---------------------------------------------------------------- the kernel's hardening option (ADR-0017 Z10, Amendment 2)
+# The kernel is built with `-C target-feature=+harden-sls-ret` (.cargo/config.toml): the code
+# generator puts an INT3 after every return. Stable Rust has no supported option for it. The
+# compiler passes the feature on with a warning, and since Rust 1.100.0 the warning announces
+# that the option will become a hard error (rust-lang/rust#162235). So every compiler upgrade
+# (CLAUDE.md §15) must show, by name, that the option is still accepted and still does its
+# work. A small function is compiled for the kernel's target with the option and without it:
+# the compiler's own words about the option are recorded; with the option each return must
+# have an INT3 after it; and without it none may, or the comparison shows nothing. The image
+# gate in `cargo xtask check` reads every return of the kernel itself.
+HARDEN="target-feature=+harden-sls-ret"
+out="$WORK/harden.txt"
+# returns_and_bare OBJECT: "<returns> <returns with no INT3 after them>"
+returns_and_bare() {
+  "$OBJDUMP" -d --no-show-raw-insn "$1" 2>/dev/null | awk '
+    /^[[:space:]]*[0-9a-f]+:[[:space:]]/ {
+      if (after && $2 != "int3") bare++
+      after = ($2 ~ /^ret[ql]?$/)
+      if (after) rets++
+      next
+    }
+    { if (after) { bare++; after = 0 } }
+    END { if (after) bare++; printf "%d %d\n", rets, bare }'
+}
+# Only a line of the kernel's own table counts, and only what comes before a `#` on it: the
+# option in a comment, or under another target's table, does not reach the kernel.
+kernel_flags() {
+  awk '
+    /^[[:space:]]*\[/ { mine = ($0 ~ /^[[:space:]]*\[target\.x86_64-unknown-none\][[:space:]]*(#.*)?$/); next }
+    mine { sub(/#.*/, ""); print }
+  ' .cargo/config.toml
+}
+if ! kernel_flags | grep -q "\"$HARDEN\""; then
+  {
+    echo "No line of the table [target.x86_64-unknown-none] in .cargo/config.toml gives \"$HARDEN\" outside a comment."
+    echo "The lines of .cargo/config.toml that name it:"
+    grep -n "$HARDEN" .cargo/config.toml || echo "(none)"
+  } > "$out"
+  record FAIL "The kernel's hardening option: .cargo/config.toml no longer gives it to the kernel's target (ADR-0017 Z10)" "$out"
+elif [ -z "$OBJDUMP" ]; then
+  echo "No disassembler found; install the llvm-tools component." > "$out"
+  record FAIL "The kernel's hardening option: no disassembler to read the probe with" "$out"
+elif ! rustc --edition 2024 --crate-type lib --target x86_64-unknown-none -C opt-level=3 \
+       --emit obj -o "$WORK/harden_without.o" "$TESTS/ffi_bool.rs" > "$WORK/harden_without.txt" 2>&1; then
+  record FAIL "The kernel's hardening option: the probe did not compile without it" "$WORK/harden_without.txt"
+elif ! rustc --edition 2024 --crate-type lib --target x86_64-unknown-none -C opt-level=3 \
+       -C "$HARDEN" --emit obj -o "$WORK/harden_with.o" "$TESTS/ffi_bool.rs" > "$WORK/harden_with.txt" 2>&1; then
+  {
+    echo "rustc ${RELEASE:-?} refused -C $HARDEN:"
+    cat "$WORK/harden_with.txt"
+  } > "$out"
+  record FAIL "The kernel's hardening option is REFUSED by rustc ${RELEASE:-?}: ADR-0017 Z10 has lost its means (rust-lang/rust#162235)" "$out"
+else
+  with=$(returns_and_bare "$WORK/harden_with.o")
+  without=$(returns_and_bare "$WORK/harden_without.o")
+  {
+    echo "rustc -C $HARDEN --target x86_64-unknown-none: accepted. What the compiler said:"
+    cat "$WORK/harden_with.txt"
+    echo "returns, and returns with no INT3 after them, with the option:    $with"
+    echo "returns, and returns with no INT3 after them, without the option: $without"
+    "$OBJDUMP" -d --no-show-raw-insn "$WORK/harden_with.o" 2>/dev/null | grep -v '^$' | grep -v 'file format'
+  } > "$out"
+  wr=${with% *}; wb=${with#* }; nr=${without% *}; nb=${without#* }
+  if [ "$wr" -lt 1 ] || [ "$nr" -lt 1 ]; then
+    record FAIL "The kernel's hardening option: the probe has no return to read" "$out"
+  elif [ "$wb" -ne 0 ]; then
+    record FAIL "The kernel's hardening option is accepted by rustc ${RELEASE:-?} but leaves $wb of $wr returns with no INT3 after them (ADR-0017 Z10)" "$out"
+  elif [ "$nb" -ne "$nr" ]; then
+    record FAIL "The kernel's hardening option: the probe cannot tell, since without the option $((nr - nb)) of $nr returns already have an INT3 after them" "$out"
+  elif grep -q 'hard error' "$WORK/harden_with.txt"; then
+    record PASS "The kernel's hardening option is accepted by rustc ${RELEASE:-?}, with this warning, which announces that it will become a hard error; an INT3 follows each return with it and none without (ADR-0017 Z10, Amendment 2)" "$out"
+  else
+    record PASS "The kernel's hardening option is accepted by rustc ${RELEASE:-?}, with this warning; an INT3 follows each return with it and none without (ADR-0017 Z10, Amendment 2)" "$out"
+  fi
 fi
 
 # ---------------------------------------------------------------- QEMU and firmware (needed from M1)

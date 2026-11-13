@@ -1,15 +1,20 @@
 //! The one compiler warning `cargo xtask` expects, collapsed to a single line.
 //!
 //! The kernel is built with `-C target-feature=+harden-sls-ret` (ADR-0017 Z10; `.cargo/config.toml`).
-//! Stable Rust 1.99.1 has no supported option for it: the compiler passes the feature to the code
-//! generator and warns, once for every crate it compiles for the kernel's target, that the feature
-//! is unknown and unstable. No lint governs that warning, so `-A` cannot silence it. The image
-//! gate (`image.rs`) is what holds the protection: it reads every return in the built kernel.
+//! Stable Rust 1.100.0 has no supported option for it: the compiler passes the feature to the
+//! code generator and warns, once for every crate it compiles for the kernel's target, that the
+//! feature is unknown and unstable. No lint governs that warning, so `-A` cannot silence it. The
+//! image gate (`image.rs`) is what holds the protection: it reads every return in the built kernel.
+//!
+//! Since Rust 1.100.0 the warning also says that the option "will become a hard error in a future
+//! release" (rust-lang/rust#162235, which names no release). Rust 1.99.1 printed five lines
+//! without that. The text below is 1.100.0's, and the line `xtask` prints in its place repeats
+//! the announcement on every build: collapsing the warning must not hide it.
 //!
 //! The owner chose, on 2026-11-12, to see that warning as one line instead of one per crate.
 //! [`Filter`] drops exactly this:
 //!
-//! - the warning's own five lines, only when all five match the text below;
+//! - the warning's own seven lines, only when all seven match the text below;
 //! - a crate's summary line, `warning: `name` (lib) generated 1 warning`, with or without
 //!   ` (1 duplicate)`, only while every warning of the build so far has been this one.
 //!
@@ -18,10 +23,12 @@
 //! matched with their colour codes removed and printed as they came.
 
 /// The warning's lines, without colour codes, as the compiler prints them.
-const BLOCK: [&str; 5] = [
+const BLOCK: [&str; 7] = [
     "warning: unknown and unstable feature specified for `-Ctarget-feature`: `harden-sls-ret`",
     "  |",
     "  = note: it is still passed through to the codegen backend, but use of this feature might be unsound and the behavior of this feature can change in the future",
+    "  = note: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!",
+    "  = note: for more information, see issue #162235 <https://github.com/rust-lang/rust/issues/162235>",
     "  = help: consider filing a feature request",
     "",
 ];
@@ -29,9 +36,11 @@ const BLOCK: [&str; 5] = [
 /// The line `cargo xtask` prints in place of what [`Filter`] dropped.
 pub(crate) fn note(dropped: &Dropped) -> String {
     format!(
-        "xtask: note: the compiler's warning that `-C target-feature=+harden-sls-ret` is unknown \
-         and unstable is expected (ADR-0017 Z10) and was collapsed (warnings: {}, crate \
-         summaries: {}); the image gate in `cargo xtask check` holds the protection",
+        "xtask: note: the compiler warns that `-C target-feature=+harden-sls-ret` is unknown and \
+         unstable, and announces that the option will become a hard error in a future release \
+         (rust-lang/rust#162235). The warning is expected (ADR-0017 Z10) and was collapsed \
+         (warnings: {}, crate summaries: {}); the image gate in `cargo xtask check` holds the \
+         protection",
         dropped.blocks, dropped.summaries
     )
 }
@@ -257,7 +266,10 @@ mod tests {
         let header = "\u{1b}[0m\u{1b}[1m\u{1b}[33mwarning\u{1b}[0m\u{1b}[0m\u{1b}[1m: unknown and unstable feature specified for `-Ctarget-feature`: `harden-sls-ret`\u{1b}[0m";
         let pipe = "\u{1b}[0m  \u{1b}[0m\u{1b}[0m\u{1b}[1m\u{1b}[38;5;12m|\u{1b}[0m";
         let summary = "\u{1b}[1m\u{1b}[33mwarning\u{1b}[0m\u{1b}[1m:\u{1b}[0m `origin-abi` (lib) generated 1 warning (1 duplicate)";
-        let (out, dropped) = run(&[header, pipe, BLOCK[2], BLOCK[3], BLOCK[4], summary]);
+        let mut input = vec![header, pipe];
+        input.extend(&BLOCK[2..]);
+        input.push(summary);
+        let (out, dropped) = run(&input);
         assert!(out.is_empty(), "{out:?}");
         assert_eq!(
             dropped,
@@ -278,5 +290,25 @@ mod tests {
             n.contains("harden-sls-ret") && n.contains("ADR-0017 Z10") && n.contains("image gate")
         );
         assert!(n.contains("warnings: 1") && n.contains("summaries: 12"));
+        // What the compiler announces is said on every build, not hidden by the collapse.
+        assert!(n.contains("hard error") && n.contains("rust-lang/rust#162235"));
+    }
+
+    /// The warning as Rust 1.99.1 printed it, without the two lines that announce the hard
+    /// error, is not the expected warning any more: every line of it passes through, and so
+    /// does the crate's summary. A compiler that prints it again is seen.
+    #[test]
+    fn the_five_lines_of_rust_1_99_are_not_collapsed() {
+        let old = [
+            BLOCK[0],
+            BLOCK[1],
+            BLOCK[2],
+            BLOCK[5],
+            BLOCK[6],
+            "warning: `framekernel` (lib) generated 1 warning",
+        ];
+        let (out, dropped) = run(&old);
+        assert_eq!(out, old);
+        assert_eq!(dropped, Dropped::default());
     }
 }

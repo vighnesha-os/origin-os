@@ -19,7 +19,7 @@ One row for each statement of CLAUDE.md in §16 to §18. The columns and their r
 | S16-13 | Do not mistake an experimental research result for production qualification. | rule | eng/host | 27 | not-started | - | - | - | - | none | - | - |
 | S17-01 | Initial reference baseline: UEFI 2.11. | rule | eng/host | 27 | not-started | - | - | - | - | none | - | - |
 | S17-02 | Initial reference baseline: ACPI 6.6. | rule | eng/host | 27 | not-started | - | - | - | - | none | - | - |
-| S17-03 | Initial reference baseline: Rust 1.99.1. | rule | eng/host | 2 | done | rust-toolchain.toml | `rust-toolchain.toml` names channel 1.99.1, so every `cargo` run in the repository and in CI uses that compiler. | file:rust-toolchain.toml, file:docs/toolchain/VERIFICATION.md | host | none | - | - |
+| S17-03 | Initial reference baseline: Rust 1.100.0. | rule | eng/host | 2 | done | rust-toolchain.toml | `rust-toolchain.toml` names channel 1.100.0, so every `cargo` run in the repository and in CI uses that compiler. | file:rust-toolchain.toml, file:docs/toolchain/VERIFICATION.md | host | none | - | 278 |
 | S17-04 | Initial reference baseline: Current Intel SDM. | rule | eng/host | 27 | not-started | - | - | - | - | none | - | - |
 | S17-05 | Initial reference baseline: Current AMD64 architecture documentation. | rule | eng/host | 27 | not-started | - | - | - | - | none | - | - |
 | S17-06 | Initial reference baseline: PCI Express 6.4 and 7.0: the latest confirmed on 2026-11-07. PCIe 8.0 is still a draft. Re-verify on pcisig.com. | rule | eng/host | 27 | not-started | - | - | - | - | none | - | - |

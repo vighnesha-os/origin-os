@@ -202,7 +202,7 @@ pub enum TakeError {
 }
 
 /// One value in an allocation of its own, made fallibly: `Box::try_new` is unstable on Rust
-/// 1.99.1. A one-element array is the shape a `Vec` converts to without allocating again.
+/// 1.100.0. A one-element array is the shape a `Vec` converts to without allocating again.
 struct Node<T>(Box<[T; 1]>);
 
 impl<T> Node<T> {

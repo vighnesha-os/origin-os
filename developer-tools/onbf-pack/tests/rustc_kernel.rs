@@ -117,6 +117,17 @@ fn pinned_rustc() -> PathBuf {
     Path::new(sysroot.trim()).join("bin").join("rustc")
 }
 
+/// The release `rust-toolchain.toml` pins, read from the file. The pin is written there and in
+/// the three places `verify.sh` holds to it (CLAUDE.md §8), and not a fifth time here.
+fn pinned_channel() -> String {
+    let file = manifest_dir().join("../../rust-toolchain.toml");
+    let text = fs::read_to_string(&file).expect("rust-toolchain.toml is readable");
+    text.lines()
+        .find_map(|line| line.strip_prefix("channel = \"")?.strip_suffix('"'))
+        .expect("rust-toolchain.toml names a channel")
+        .to_string()
+}
+
 fn toolchain_of(rustc: &Path) -> Toolchain {
     let out = Command::new(rustc).arg("-vV").output().unwrap();
     Toolchain::from_rustc_verbose_version(&String::from_utf8(out.stdout).unwrap()).unwrap()
@@ -301,8 +312,9 @@ fn pack_compile_and_check(link_flags: &[&str], name: &str) -> (Vec<u8>, usize) {
     let elf = compile(&dir, name, link_flags);
     let toolchain = toolchain_of(&pinned_rustc());
     assert_eq!(
-        toolchain.rustc, "1.99.1",
-        "the pinned compiler built the probe"
+        toolchain.rustc,
+        pinned_channel(),
+        "the compiler rust-toolchain.toml pins built the probe"
     );
     let packed = krn::pack(&elf, &options(toolchain.clone())).unwrap();
     // Determinism: a second run gives the same bytes.

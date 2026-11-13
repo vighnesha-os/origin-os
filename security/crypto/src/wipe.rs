@@ -6,7 +6,7 @@
 //! use in it, which the optimizer cannot drop as a dead store.
 //!
 //! **What it does not promise.** `black_box` is documented as best effort, and as giving no
-//! guarantee for cryptographic or security purposes (`core::hint`, Rust 1.99.1). A write the
+//! guarantee for cryptographic or security purposes (`core::hint`, Rust 1.100.0). A write the
 //! compiler may never remove is a volatile write, which is `unsafe`, and this crate forbids
 //! `unsafe`. The compiler may also keep copies of a secret in registers and in stack slots of
 //! its own, which no source-level overwrite reaches.

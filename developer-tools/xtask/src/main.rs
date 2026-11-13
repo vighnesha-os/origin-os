@@ -3158,7 +3158,7 @@ fn target_dir() -> PathBuf {
     env::var_os("CARGO_TARGET_DIR").map_or_else(|| repo_root().join("target"), PathBuf::from)
 }
 
-/// `cargo`, as the toolchain that runs this xtask (rust-toolchain.toml pins 1.99.1).
+/// `cargo`, as the toolchain that runs this xtask (the one rust-toolchain.toml pins).
 fn cargo() -> Command {
     let mut c = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     c.current_dir(repo_root());
@@ -3223,6 +3223,15 @@ fn run_step(cmd: &mut Command) -> Result {
 // ------------------------------------------------------------------ check
 
 fn check() -> Result {
+    // The compiler first, by the commit it reports, before any host gate runs. Cargo's
+    // `rust-version` is a floor: it refuses an older compiler and lets a newer one through, and
+    // until now the commit was first asked for at the first image build (TASKS item 52's
+    // review, finding 10).
+    let compiler = toolchain::toolchain()?;
+    println!(
+        "xtask: check: rustc reports the pinned commit {}",
+        compiler.commit
+    );
     let steps: &[&[&str]] = &[
         &["fmt", "--all", "--", "--check"],
         &[
@@ -3555,38 +3564,49 @@ fn check_signing_path(assembly: &str, arch: &str) -> Result<Vec<(&'static str, u
 /// a toolchain or code change that brought them back would show up here. ML-DSA has no such
 /// check: its rejection loops branch by design (`onbf-sign`'s side-channel assessment).
 fn signing_has_no_secret_branches() -> Result {
-    let deps = target_dir().join("release").join("deps");
-    run_step(cargo().args([
-        "rustc",
-        "--quiet",
-        "--release",
-        "--package",
-        SIGN_PACKAGE,
-        "--lib",
-        "--",
-        "--emit=asm",
-        "-C",
-        "codegen-units=1",
-        "-C",
-        "debuginfo=0",
-        "-C",
-        "symbol-mangling-version=v0",
-    ]))?;
-    let mut assembly: Vec<_> = fs::read_dir(&deps)
-        .map_err(|e| format!("{}: {e}", deps.display()))?
-        .filter_map(std::result::Result::ok)
-        .filter(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with("onbf_sign-") && name.ends_with(".s")
-        })
-        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-        .collect();
-    assembly.sort();
-    let (_, path) = assembly
-        .last()
-        .ok_or("the signing crate's assembly was not written")?;
-    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // The compiler is told where to write the assembly. Where Cargo keeps a crate's
+    // intermediate files is no interface, and Cargo 1.100.0 moved them.
+    let assembly = target_dir()
+        .join("xtask")
+        .join("signing")
+        .join("onbf_sign.s");
+    if let Some(dir) = assembly.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let mut emit = std::ffi::OsString::from("--emit=asm=");
+    emit.push(&assembly);
+    let build = || {
+        run_step(
+            cargo()
+                .args([
+                    "rustc",
+                    "--quiet",
+                    "--release",
+                    "--package",
+                    SIGN_PACKAGE,
+                    "--lib",
+                    "--",
+                ])
+                .arg(&emit)
+                .args([
+                    "-C",
+                    "codegen-units=1",
+                    "-C",
+                    "debuginfo=0",
+                    "-C",
+                    "symbol-mangling-version=v0",
+                ]),
+        )
+    };
+    build()?;
+    if !assembly.is_file() {
+        // An earlier run built the crate with these arguments, so Cargo did not run the
+        // compiler again, and the file that run wrote is gone. `cargo clean --package` is
+        // Cargo's own way to make a crate build again.
+        run_step(cargo().args(["clean", "--quiet", "--release", "--package", SIGN_PACKAGE]))?;
+        build()?;
+    }
+    let text = fs::read_to_string(&assembly).map_err(|e| format!("{}: {e}", assembly.display()))?;
     let arch = std::env::consts::ARCH;
     for (name, count) in check_signing_path(&text, arch)? {
         println!(

@@ -5,7 +5,7 @@ An original-source x86-64 operating system written in Rust. `CLAUDE.md` is the e
 
 ## Building
 
-Requirements: rustup (the pinned toolchain, Rust 1.99.1, is selected by `rust-toolchain.toml`), and QEMU with its EDK2 x86-64 firmware for boot tests (`brew install qemu` on macOS).
+Requirements: rustup (the pinned toolchain, Rust 1.100.0, is selected by `rust-toolchain.toml`), and QEMU with its EDK2 x86-64 firmware for boot tests (`brew install qemu` on macOS).
 
 ```bash
 bash developer-tools/toolchain/verify.sh --install   # first time: install and verify the toolchain
