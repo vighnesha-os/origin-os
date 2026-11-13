@@ -317,7 +317,11 @@ fn origin_core(generated: &Generated, target: Option<&Path>) -> Result {
     let linked = core_linked(target);
     // An ELF the kernel takes its code from: it must have been linked with the linker's fixed
     // line, as each program must (TASKS item 44).
-    crate::image_inputs::build_with_the_fixed_line(core::slice::from_ref(&linked), || {
+    let output = crate::image_inputs::Linked {
+        path: linked.clone(),
+        package: CORE_PACKAGE,
+    };
+    crate::image_inputs::build_with_the_fixed_line(core::slice::from_ref(&output), || {
         run_step(&mut build)
     })?;
     if !linked.is_file() {
@@ -369,7 +373,13 @@ pub(crate) fn programs(target: Option<&Path>) -> Result<PathBuf> {
     }
     // Each is an ELF the kernel takes a segment of with its header in it, so each must have
     // been linked with the linker's fixed line: one from before it is linked again.
-    let linked_files: Vec<PathBuf> = PROGRAMS.iter().map(|p| linked(target, p)).collect();
+    let linked_files: Vec<crate::image_inputs::Linked> = PROGRAMS
+        .iter()
+        .map(|p| crate::image_inputs::Linked {
+            path: linked(target, p),
+            package: p.package,
+        })
+        .collect();
     crate::image_inputs::build_with_the_fixed_line(&linked_files, || {
         builds.iter_mut().try_for_each(run_step)
     })?;

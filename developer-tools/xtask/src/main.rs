@@ -4325,7 +4325,11 @@ fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
     let build = ring3::with_programs(&mut build, target)?;
     // A kernel linked before `.cargo/config.toml` fixed the linker's line is linked again:
     // Cargo does not do that by itself (TASKS item 44).
-    image_inputs::build_with_the_fixed_line(std::slice::from_ref(&elf), || run_step(build))?;
+    let output = image_inputs::Linked {
+        path: elf.clone(),
+        package: KERNEL_PACKAGE,
+    };
+    image_inputs::build_with_the_fixed_line(std::slice::from_ref(&output), || run_step(build))?;
     if elf.is_file() {
         Ok(elf)
     } else {

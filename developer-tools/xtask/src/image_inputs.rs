@@ -141,11 +141,12 @@ fn images() -> Vec<(String, &'static str, &'static str)> {
         ("the kernel".to_string(), KERNEL_PACKAGE, KERNEL_TARGET),
     ];
     images.extend(ring3::carried_packages().map(|package| {
-        (
-            format!("the carried program `{package}`"),
-            package,
-            ring3::USERSPACE_TARGET,
-        )
+        let label = if package == ring3::CORE_PACKAGE {
+            format!("`origin.core`, the library the kernel carries (`{package}`)")
+        } else {
+            format!("the carried program `{package}`")
+        };
+        (label, package, ring3::USERSPACE_TARGET)
     }));
     images
 }
@@ -389,7 +390,18 @@ pub(crate) fn check_linker_text(name: &str, elf: &[u8], text: &str) -> Result {
     }
 }
 
-/// Builds, then makes sure each of `outputs`, the ELF files the build links, was linked with
+/// A file the linker writes for an image, and the package whose build links it. The caller
+/// knows which package that is; the relink step cleans that package and no other (TASKS
+/// item 50).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Linked {
+    /// Where the build writes the file: `<target directory>/<target>/release/<file>`.
+    pub(crate) path: PathBuf,
+    /// The package whose build links it.
+    pub(crate) package: &'static str,
+}
+
+/// Builds, then makes sure each of `outputs`, the ELF files the build links with the package that links each, was linked with
 /// the fixed line; one that was not is removed and the build run once more.
 ///
 /// Cargo does not link a file again when `[env]` changes: nothing it tracks for that file
@@ -399,7 +411,7 @@ pub(crate) fn check_linker_text(name: &str, elf: &[u8], text: &str) -> Result {
 /// not be the kernel the reproducible-build gate builds from nothing. Removing the file makes
 /// Cargo link it again. Returns the files it had to link again.
 pub(crate) fn build_with_the_fixed_line(
-    outputs: &[PathBuf],
+    outputs: &[Linked],
     mut build: impl FnMut() -> Result,
 ) -> Result<Vec<PathBuf>> {
     let text = linker_text()?;
@@ -425,16 +437,6 @@ fn built_into(path: &Path) -> Option<(&Path, &str)> {
     [KERNEL_TARGET, ring3::USERSPACE_TARGET]
         .contains(&name)
         .then_some((target.parent()?, name))
-}
-
-/// The packages whose linked files Cargo writes for `target`: the kernel for the kernel's
-/// target, and each ring-3 image the kernel carries for the userspace's.
-fn linked_packages(target: &str) -> Vec<&'static str> {
-    if target == KERNEL_TARGET {
-        vec![KERNEL_PACKAGE]
-    } else {
-        ring3::carried_packages().collect()
-    }
 }
 
 /// The arguments of a `cargo clean` of `packages`, as built for `target` into `directory`.
@@ -475,60 +477,60 @@ fn clean_arguments(
     Ok(arguments)
 }
 
-/// Makes Cargo link `path` again, by having it remove what it built of the packages that
-/// link a file for that file's target.
+/// Makes Cargo link `linked.path` again, by having it remove what it built of the package that
+/// links it, for that file's target and in that file's target directory.
 ///
 /// Removing the file alone does not do it: Cargo keeps what the linker wrote among its
 /// intermediate files and gives the old file its name back without linking. Where those files
 /// are and what they are called is no interface: Cargo 1.100.0 moved them, and a shared
 /// library's copy never had the hash in its name that a program's has. So nothing here names
-/// one, and `cargo clean --package` is Cargo's own way. It costs one more compilation of those
-/// packages, on the rare run that finds a file from before the fixed line.
-fn remove_linked(path: &Path) -> Result {
+/// one, and `cargo clean --package` is Cargo's own way. It costs one more compilation of that
+/// package, on the rare run that finds a file from before the fixed line.
+fn remove_linked(linked: &Linked) -> Result {
+    let path = &linked.path;
     let (directory, target) = built_into(path).ok_or_else(|| {
         format!(
             "{} is not `<target directory>/<target>/release/<file>` for a target an image is linked for, so what to have Cargo build again is not known",
             path.display()
         )
     })?;
-    let packages = linked_packages(target);
-    let arguments = clean_arguments(directory, target, &packages)?;
+    let arguments = clean_arguments(directory, target, &[linked.package])?;
     crate::run_step(crate::cargo().args(arguments))?;
     if path.exists() {
-        return Err(still_there(path, target, &packages));
+        return Err(still_there(path, target, linked.package));
     }
     Ok(())
 }
 
-/// What to say when `cargo clean` of `packages` left `path` where it was: none of them links
-/// that file. Said instead of the later "removed and linked again, and still does", which would
-/// be untrue of a file that was never removed (TASKS item 52's review, finding 4).
-fn still_there(path: &Path, target: &str, packages: &[&str]) -> String {
+/// What to say when `cargo clean` of `package` left `path` where it was: Cargo did not take
+/// it for a file of that package. Said instead of the later "removed and linked again, and
+/// still does", which would be untrue of a file that was never removed (TASKS item 52's
+/// review, finding 4).
+fn still_there(path: &Path, target: &str, package: &str) -> String {
     format!(
-        "{} is still there after `cargo clean` of {} for {target}: none of those packages links it, so it cannot be linked again this way. Name the package that links it among those `linked_packages` gives for {target} (TASKS item 50)",
-        path.display(),
-        packages.join(", ")
+        "{} is still there after `cargo clean` of {package} for {target}: Cargo did not take it for a file of that package, so it cannot be linked again this way. The caller names the package that links it (TASKS item 50)",
+        path.display()
     )
 }
 
 /// [`build_with_the_fixed_line`] over the three things it does to a file, so that a test can
 /// stand in for them.
 fn relink_stale(
-    outputs: &[PathBuf],
+    outputs: &[Linked],
     text: &str,
     build: &mut dyn FnMut() -> Result,
     read: &dyn Fn(&Path) -> Result<Vec<u8>>,
-    remove: &dyn Fn(&Path) -> Result,
+    remove: &dyn Fn(&Linked) -> Result,
 ) -> Result<Vec<PathBuf>> {
     build()?;
     let stale = |path: &PathBuf| -> Result<Option<String>> {
         linker_text_problem(&read(path)?, text).map_err(|e| format!("{}: {e}", path.display()))
     };
     let mut again = Vec::new();
-    for path in outputs {
-        if stale(path)?.is_some() {
-            remove(path)?;
-            again.push(path.clone());
+    for linked in outputs {
+        if stale(&linked.path)?.is_some() {
+            remove(linked)?;
+            again.push(linked.path.clone());
         }
     }
     if again.is_empty() {
@@ -853,6 +855,8 @@ mod tests {
         let old = elf_with_comment(&[b"Linker: LLD 23.1.1 (somewhere abc)\0", rustc].concat());
         let kernel = PathBuf::from("/t/kernel");
         let program = PathBuf::from("/t/program");
+        // Each output with the package that links it; the step must clean that one.
+        let removed: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
         // A directory, and a build that links whatever is missing and leaves the rest alone,
         // as Cargo does. `honoured` is whether the linker writes the fixed line.
         let run = |start: &[(&PathBuf, &Vec<u8>)], honoured: bool| {
@@ -863,16 +867,26 @@ mod tests {
                     .collect(),
             );
             let builds = Cell::new(0);
-            let outputs = [kernel.clone(), program.clone()];
+            removed.borrow_mut().clear();
+            let outputs = [
+                Linked {
+                    path: kernel.clone(),
+                    package: KERNEL_PACKAGE,
+                },
+                Linked {
+                    path: program.clone(),
+                    package: "first-program",
+                },
+            ];
             let result = relink_stale(
                 &outputs,
                 FIXED,
                 &mut || {
                     builds.set(builds.get() + 1);
-                    for path in &outputs {
+                    for linked in &outputs {
                         files
                             .borrow_mut()
-                            .entry(path.clone())
+                            .entry(linked.path.clone())
                             .or_insert_with(|| if honoured { fresh.clone() } else { old.clone() });
                     }
                     Ok(())
@@ -884,10 +898,11 @@ mod tests {
                         .cloned()
                         .ok_or_else(|| "missing".to_string())
                 },
-                &|path| {
+                &|linked| {
+                    removed.borrow_mut().push(linked.package);
                     files
                         .borrow_mut()
-                        .remove(path)
+                        .remove(&linked.path)
                         .map(|_| ())
                         .ok_or_else(|| "missing".to_string())
                 },
@@ -902,13 +917,16 @@ mod tests {
         assert_eq!(result, Ok(vec![kernel.clone(), program.clone()]));
         assert_eq!(builds, 2);
         assert!(files.values().all(|bytes| bytes == &fresh));
+        assert_eq!(*removed.borrow(), [KERNEL_PACKAGE, "first-program"]);
         // The program alone from before, the case that booted a kernel one byte off the
         // gate's: it alone is linked again.
         let (result, builds, _) = run(&[(&kernel, &fresh), (&program, &old)], true);
         assert_eq!((result, builds), (Ok(vec![program.clone()]), 2));
+        // Only the stale file's own package is cleaned.
+        assert_eq!(*removed.borrow(), ["first-program"]);
         // Where a stale file was built: its target directory and its target. Cargo is then
-        // asked to build again the packages that link a file for that target (below). A path
-        // of another shape, or of a target no ELF image is linked for, names neither.
+        // asked to build again the package that links it (below). A path of another shape, or
+        // of a target no ELF image is linked for, names neither.
         assert_eq!(
             built_into(Path::new("/t/x86_64-unknown-none/release/framekernel")),
             Some((Path::new("/t"), "x86_64-unknown-none"))
@@ -949,16 +967,15 @@ mod tests {
             refused.contains("no target directory is named"),
             "{refused}"
         );
-        // A file the clean did not remove is said to be still there, with the packages that
-        // were cleaned, not said to have been removed.
+        // A file the clean did not remove is said to be still there, with the package that was
+        // cleaned, not said to have been removed.
         let message = still_there(
             Path::new("/t/x86_64-unknown-linux-gnu/release/liborigin_core.so"),
             ring3::USERSPACE_TARGET,
-            &["first-program"],
+            ring3::CORE_PACKAGE,
         );
         assert!(
-            message
-                .contains("liborigin_core.so is still there after `cargo clean` of first-program"),
+            message.contains("liborigin_core.so is still there after `cargo clean` of origin-core"),
             "{message}"
         );
         let words = |target: &str, packages: &[&str]| -> Vec<String> {
@@ -968,8 +985,9 @@ mod tests {
                 .map(|word| word.to_string_lossy().into_owned())
                 .collect()
         };
+        // Each kind of linked file, with its own package: the kernel, `origin.core` and a program.
         assert_eq!(
-            words(KERNEL_TARGET, &linked_packages(KERNEL_TARGET)),
+            words(KERNEL_TARGET, &[KERNEL_PACKAGE]),
             [
                 "clean",
                 "--quiet",
@@ -982,17 +1000,12 @@ mod tests {
                 "framekernel"
             ]
         );
-        // For the userspace's target: every ring-3 image the kernel carries, each after its
-        // own `--package`.
-        let carried: Vec<&str> = ring3::carried_packages().collect();
-        assert!(carried.contains(&"first-program"));
-        assert_eq!(linked_packages(ring3::USERSPACE_TARGET), carried);
-        let userspace = words(ring3::USERSPACE_TARGET, &carried);
-        assert_eq!(userspace[4], "x86_64-unknown-linux-gnu");
-        assert_eq!(userspace.len(), 7 + 2 * carried.len());
-        for (pair, package) in userspace[7..].chunks(2).zip(&carried) {
-            assert_eq!(pair, ["--package", package]);
+        for package in ring3::carried_packages() {
+            let userspace = words(ring3::USERSPACE_TARGET, &[package]);
+            assert_eq!(userspace[4], "x86_64-unknown-linux-gnu");
+            assert_eq!(userspace[7..], ["--package", package]);
         }
+        assert!(ring3::carried_packages().any(|p| p == ring3::CORE_PACKAGE));
         // A linker that does not write the fixed line: an error after one more build, never a
         // third.
         let (result, builds, _) = run(&[(&kernel, &old)], false);
