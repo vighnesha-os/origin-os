@@ -601,7 +601,11 @@ pub(crate) fn program_problems(
                     function.name
                 ));
             }
-            if instruction == "syscall" {
+            // `syscall`, or a prefix before it in a word of its own (`data16 syscall`,
+            // `rep syscall`, `rex64 syscall`): each runs as a system call (the review of
+            // 2026-11-13, finding K9). The pinned `llvm-objdump` prints all three as a plain
+            // `syscall` at the prefix's address; another version may not.
+            if instruction.split_whitespace().last() == Some("syscall") {
                 found.push((&function.name, *address));
             }
         }

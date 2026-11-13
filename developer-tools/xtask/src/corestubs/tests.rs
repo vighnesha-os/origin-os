@@ -1020,3 +1020,127 @@ fn the_gate_expects_an_enumeration_extended_as_its_underlying_integer() {
         assert_eq!(of(&stub.method), stub.instructions, "{}", stub.method);
     }
 }
+
+// ------------------------------------------------------------------ prefixed `syscall` (K9)
+
+/// A program whose three functions each hold a `syscall` with a prefix byte before its two
+/// bytes: an operand-size prefix, a repeat prefix and a REX byte. Each runs as a system call.
+const PREFIXED: &str = r#"
+#![no_std]
+#![no_main]
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
+#[unsafe(naked)]
+extern "C" fn operand_size() {
+    core::arch::naked_asm!(".byte 0x66, 0x0f, 0x05", "ret")
+}
+
+#[unsafe(naked)]
+extern "C" fn repeat() {
+    core::arch::naked_asm!(".byte 0xf3, 0x0f, 0x05", "ret")
+}
+
+#[unsafe(naked)]
+extern "C" fn rex() {
+    core::arch::naked_asm!(".byte 0x48, 0x0f, 0x05", "ret")
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn _start() -> ! {
+    for f in [operand_size as extern "C" fn(), repeat, rex] {
+        core::hint::black_box(f)();
+    }
+    loop {}
+}
+"#;
+
+/// The carried-program gate, on a program the pinned compiler and linker made with three
+/// prefixed `syscall`s (the review of 2026-11-13, finding K9): each is counted as a `syscall`
+/// of the program and refused. The pinned `llvm-objdump` lists each as a plain `syscall` at the
+/// prefix's address, one byte before the pair; a spelling with the prefix's name is held by
+/// [`a_syscall_spelled_with_its_prefix_is_counted`].
+#[test]
+fn a_prefixed_syscall_in_a_really_linked_program_is_refused() {
+    let dir = crate::target_dir()
+        .join("xtask")
+        .join("corestubs-tests")
+        .join(format!("prefixed-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("prefixed.rs");
+    fs::write(&source, PREFIXED).unwrap();
+    let elf = dir.join("prefixed");
+    let toolchain = crate::toolchain::toolchain().expect("the pinned toolchain");
+    let mut rustc = Command::new(toolchain.sysroot.join("bin").join("rustc"));
+    rustc
+        .current_dir(&dir)
+        .args([
+            "--edition",
+            "2024",
+            "--crate-type",
+            "bin",
+            "--crate-name",
+            "prefixed",
+        ])
+        .args(["--target", "x86_64-unknown-linux-gnu", "-C", "opt-level=2"]);
+    for flag in userspace_flags() {
+        rustc.arg("-C").arg(flag);
+    }
+    let out = rustc
+        .arg("-o")
+        .arg(&elf)
+        .arg(&source)
+        .output()
+        .expect("rustc runs");
+    assert!(
+        out.status.success(),
+        "rustc failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listing = disassemble(&elf).unwrap();
+    let functions = read_listing(&listing).unwrap();
+    let spelled: Vec<String> = functions
+        .iter()
+        .filter(|f| {
+            ["operand_size", "repeat", "rex"]
+                .iter()
+                .any(|n| f.name.contains(n))
+        })
+        .filter_map(|f| f.instructions.first().map(|(_, i)| i.clone()))
+        .collect();
+    let problems = program_problems("prefixed", &functions, None);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(
+        spelled.len(),
+        3,
+        "the three functions as listed: {functions:#?}"
+    );
+    assert!(
+        problems.len() == 1 && problems[0].contains("holds 3 `syscall` instructions"),
+        "the pinned disassembler spells them {spelled:?}; the gate said {problems:#?}"
+    );
+}
+
+#[test]
+fn a_syscall_spelled_with_its_prefix_is_counted() {
+    for spelled in [
+        "data16 syscall",
+        "rep syscall",
+        "rex64 syscall",
+        "rex.W syscall",
+    ] {
+        let listing = program(&[("run", &["mov eax, 0x3", spelled, "ret"])]);
+        let found = program_problems("first-program", &listing, None);
+        assert!(
+            found.len() == 1 && found[0].contains("holds 1 `syscall` instructions"),
+            "{spelled}: {found:#?}"
+        );
+    }
+    // An instruction that only mentions the word elsewhere is not one.
+    let listing = program(&[("run", &["call 0x1000 <syscall_helper>", "ret"])]);
+    assert!(program_problems("first-program", &listing, None).is_empty());
+}
