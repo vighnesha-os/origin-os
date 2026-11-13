@@ -32,7 +32,7 @@ use origin_frame::sync::SpinLock;
 use origin_frame::trap::Switch;
 
 /// Each kernel thread's stack.
-const THREAD_STACK: usize = 16 * 1024;
+pub(crate) const THREAD_STACK: usize = 16 * 1024;
 
 static QUEUES: [SpinLock<RunQueue>; MAX_CPUS] =
     [const { SpinLock::new(RunQueue::new()) }; MAX_CPUS];

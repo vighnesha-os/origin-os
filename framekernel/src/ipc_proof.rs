@@ -489,6 +489,9 @@ const LIMITS: Limits = Limits {
     debug_calls: true,
     memory: MemoryLimits::NONE,
     objects: ObjectLimits::NONE,
+    // The most threads a process made with these runs at once: two, where a proof has one
+    // thread wait and another act in the same process (ADR-0005 G5, G6).
+    threads: 2,
 };
 
 /// Waits for `process`'s last thread to end.
@@ -1706,6 +1709,7 @@ fn quotas(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
         debug_calls: true,
         memory: MemoryLimits::NONE,
         objects: ObjectLimits::NONE,
+        threads: 1,
     };
     let limit = Error::Limit.raw();
     let steps = alloc::vec![
@@ -1764,6 +1768,7 @@ fn byte_quota(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64)
         debug_calls: true,
         memory: MemoryLimits::NONE,
         objects: ObjectLimits::NONE,
+        threads: 1,
     };
     let (Some(mut writer), Some(mut peer)) = (
         Image::new(limits, proof_programs::script()),

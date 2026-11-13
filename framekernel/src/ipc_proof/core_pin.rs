@@ -122,6 +122,8 @@ const CREATOR: Limits = Limits {
     debug_calls: false,
     memory: MemoryLimits::NONE,
     objects: ObjectLimits::NONE,
+    // It never runs (ADR-0005 G5, G6).
+    threads: 0,
 };
 
 /// Where the launch path put a pinned process's `origin.core`, program and stack.
@@ -163,6 +165,8 @@ pub(super) fn scripted(creator: &Process, limits: Limits) -> Option<Scripted> {
     let run = ProgramLimits {
         limits: Limits {
             handles: limits.handles + START_HANDLES,
+            // A program runs the one thread its launch starts (ADR-0005 G2, G6).
+            threads: 1,
             ..limits
         },
         stack_pages: STACK_PAGES,
@@ -1023,6 +1027,7 @@ pub(crate) fn prove_entry_flags(
             handles: START_HANDLES,
             channels: 0,
             message_bytes: 0,
+            threads: 1,
             ..LIMITS
         },
         stack_pages: STACK_PAGES,

@@ -292,6 +292,22 @@ pub struct Costs {
     pub binding: u64,
     /// Each thread: its kernel stack, its FPU area and its kernel objects.
     pub thread: u64,
+    /// Each page a launch maps into a process on a frame of its own (its image, its stack, its
+    /// start record): the frame, and the page's share of the space's two tables of page records.
+    /// Not in a figure: the creator pays it besides (the coordinating session's ruling (d)).
+    pub page: u64,
+    /// Each page a launch maps on a frame every process shares (`origin.core`): its share of the
+    /// space's two tables of page records.
+    pub shared_page: u64,
+}
+
+/// One page's share of a table of `element`s that grows a page at a time: the most the table
+/// holds while it grows, [`growing`], is never more than eight elements' bytes a page for
+/// elements of 16 bytes to 1 KiB (the host test of a port's index holds that bound up to 20,000
+/// elements, more than a space's pages).
+#[must_use]
+pub const fn eight_a_page(element: Element) -> Option<u64> {
+    (element.size as u64).checked_mul(8)
 }
 
 /// A set of limits' figure, kind by kind, in bytes (G5).
@@ -506,7 +522,7 @@ impl Purse {
         self.lowest.fetch_min(before - bytes, Ordering::AcqRel);
         Ok(Payment {
             purse: self,
-            bytes,
+            bytes: AtomicU64::new(bytes),
         })
     }
 
@@ -533,24 +549,50 @@ impl Default for Purse {
 }
 
 /// Bytes taken out of a [`Purse`]: given back, exactly, when this is dropped. Not `Clone` and
-/// not `Copy`, so it is given back once.
+/// not `Copy`, so it is given back once. It can take more from its purse ([`Payment::add`]) and
+/// give part back early ([`Payment::give_back`]); what it holds is always what its purse is
+/// short by on its account.
 #[derive(Debug)]
 #[must_use = "a payment dropped at once gives its bytes straight back"]
 pub struct Payment {
     purse: &'static Purse,
-    bytes: u64,
+    bytes: AtomicU64,
 }
 
 impl Payment {
-    /// The bytes it took.
-    pub const fn bytes(&self) -> u64 {
-        self.bytes
+    /// The bytes it holds now.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Acquire)
+    }
+
+    /// Takes `bytes` more out of the same purse, or [`Error::Limit`] if fewer are left there,
+    /// with nothing taken.
+    pub fn add(&self, bytes: u64) -> Result<(), Error> {
+        let more = self.purse.pay(bytes)?;
+        // The new payment's bytes move into this one, which gives them back when it is dropped.
+        let moved = more.bytes.swap(0, Ordering::AcqRel);
+        self.bytes.fetch_add(moved, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Gives back up to `bytes` of what it holds now, and returns how many it gave back.
+    pub fn give_back(&self, bytes: u64) -> u64 {
+        let given = match self
+            .bytes
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held - held.min(bytes))
+            }) {
+            Ok(held) | Err(held) => held.min(bytes),
+        };
+        self.purse.left.fetch_add(given, Ordering::AcqRel);
+        given
     }
 }
 
 impl Drop for Payment {
     fn drop(&mut self) {
-        self.purse.left.fetch_add(self.bytes, Ordering::AcqRel);
+        let held = self.bytes.swap(0, Ordering::AcqRel);
+        self.purse.left.fetch_add(held, Ordering::AcqRel);
     }
 }
 
@@ -816,6 +858,8 @@ mod tests {
         port: 768,
         binding: 448,
         thread: 17_920,
+        page: 4096 + 512,
+        shared_page: 512,
     };
 
     /// Limits that give nothing at all.
@@ -1069,6 +1113,71 @@ mod tests {
                     held <= 8 * (bindings * slot) as u64,
                     "{bindings} bindings of {slot}-byte slots: {held} bytes"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_payment_takes_more_and_gives_part_back_to_the_byte() {
+        let root = purse();
+        assert!(root.size_once(100_000));
+        let paid = root.pay(10_000).unwrap();
+        paid.add(4_096).unwrap();
+        assert_eq!((paid.bytes(), root.left()), (14_096, 85_904));
+        // More than is left is refused whole, and the payment is as it was.
+        assert_eq!(paid.add(85_905), Err(Error::Limit));
+        assert_eq!((paid.bytes(), root.left()), (14_096, 85_904));
+        // Part given back early.
+        assert_eq!(paid.give_back(96), 96);
+        assert_eq!((paid.bytes(), root.left()), (14_000, 86_000));
+        // Never more than it holds.
+        assert_eq!(paid.give_back(1 << 40), 14_000);
+        assert_eq!((paid.bytes(), root.left()), (0, 100_000));
+        paid.add(1).unwrap();
+        drop(paid);
+        assert_eq!(root.left(), 100_000);
+    }
+
+    /// The coordinating session's ruling (c): a process's payment is held by its account and
+    /// given back when the account goes, which is after every object charged to it, not when the
+    /// process object goes. Here as the kernel holds them: the process and a channel it created
+    /// each hold the account, and the channel outlives the process.
+    #[test]
+    fn the_refund_waits_for_an_object_charged_to_the_account_that_outlives_the_process() {
+        use std::sync::Arc;
+        struct Account {
+            _paid: Payment,
+        }
+        struct Process {
+            _account: Arc<Account>,
+        }
+        struct Channel {
+            _account: Arc<Account>,
+        }
+        let root = purse();
+        assert!(root.size_once(1 << 20));
+        let account = Arc::new(Account {
+            _paid: root.pay(300_000).unwrap(),
+        });
+        let channel = Channel {
+            _account: account.clone(),
+        };
+        let process = Process { _account: account };
+        assert_eq!(root.left(), (1 << 20) - 300_000);
+        drop(process);
+        // The process object is gone; the channel it made is not, and nor is the payment.
+        assert_eq!(root.left(), (1 << 20) - 300_000);
+        drop(channel);
+        assert_eq!(root.left(), 1 << 20);
+    }
+
+    #[test]
+    fn a_page_s_share_of_a_record_table_is_eight_elements() {
+        for size in (16..=1024).step_by(8) {
+            let element = Element { size, align: 8 };
+            let share = eight_a_page(element).unwrap();
+            for pages in 1..=(29 * 512 + 1) {
+                assert!(growing(pages, element).unwrap() <= pages as u64 * share);
             }
         }
     }

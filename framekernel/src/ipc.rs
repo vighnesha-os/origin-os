@@ -40,6 +40,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::channel::{Channel, Identity, Message, QUEUE_BYTES, QUEUE_DEPTH, ReadError, other};
 use crate::handles::{HandleTable, Need, Typed};
 use crate::heap::{MAX_BLOCK, MIN_BLOCK, PAGE};
+use crate::quota::footprint;
 use origin_abi::{Error, Handle, ObjectType};
 use origin_frame::objref::ObjectRef;
 use origin_frame::sync::SpinLock;
@@ -250,6 +251,25 @@ struct Charge {
 impl Drop for Charge {
     fn drop(&mut self) {
         self.account.refund_queued(self.bytes);
+    }
+}
+
+/// What one channel makes the kernel hold, as the heap rounds it, whatever is written to it
+/// (ADR-0005 G5): the channel itself, and for each of its two sides a queue of
+/// [`QUEUE_DEPTH`] messages (`Channel::try_new`) and a list of as many charges
+/// ([`charge_list`]), each taken whole at creation. The messages' bytes and handle lists are
+/// their sender's `message_bytes`. `None` if the arithmetic overflows.
+pub(crate) const fn channel_cost() -> Option<u64> {
+    let (channel, align) = ObjectRef::<KernelChannel>::ALLOCATION;
+    let queue = QUEUE_DEPTH * core::mem::size_of::<Message<Entry>>();
+    let charges = QUEUE_DEPTH * core::mem::size_of::<Charge>();
+    match (
+        footprint(channel, align),
+        footprint(queue, core::mem::align_of::<Message<Entry>>()),
+        footprint(charges, core::mem::align_of::<Charge>()),
+    ) {
+        (Some(channel), Some(queue), Some(charges)) => Some(channel + 2 * queue + 2 * charges),
+        _ => None,
     }
 }
 

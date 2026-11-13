@@ -385,6 +385,13 @@ pub struct Mappings<T> {
 }
 
 impl<T> Mappings<T> {
+    /// The size and alignment of one record of a whole mapping. The kernel-wide bound counts
+    /// the growing list of them at its limit (ADR-0005 G5).
+    pub const RECORD: (usize, usize) = (
+        core::mem::size_of::<Record<T>>(),
+        core::mem::align_of::<Record<T>>(),
+    );
+
     /// None yet, and room for `limit`.
     pub const fn new(limit: usize) -> Self {
         Self {
