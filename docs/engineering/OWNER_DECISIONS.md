@@ -935,7 +935,20 @@ On 2026-11-13 you wrote: "Updated Rust language to latest available version 1.10
 - **If the new compiler breaks something that is relied on,** one of §10's three regressions or a behaviour an accepted ADR rests on, it comes back to you with the evidence. Staying on 1.99.1 until a point release is then one of the answers.
 - **Why item 279.** A compiler change alters every image, so landing it alone keeps its evidence apart from other tasks' code, and it reaches `main` without waiting for a batch to fill. The pull request also carries TASKS item 46's CI job if that job's trial passes, so the runners themselves compare the two hosts' images under the new compiler.
 - **Performance cost** (ADR-0018 V3). Item 278: unknown until measured. A new code generator changes every image; TASKS item 52 records the figures CI already takes, before and after, as trends that claim nothing (CLAUDE.md §53). Item 279: none.
-- **Where they are written.** This sheet. The matrix's README lists item 278 as owed, since no row can carry it until CLAUDE.md 7.8 exists, and item 279 as asking for nothing a row could carry.
+- **Where they are written.** This sheet, and CLAUDE.md 7.8, which reaches `main` only together with the pin (TASKS item 52's pull request). The matrix names item 278 on rows H-04, H-05, S1-05, S8-01, S8-02, S12-01, S17-03 and F-01, and item 279 on H-04. *(Until revision 7.8 was written, the matrix's README listed item 278 as owed and item 279 as asking for nothing a row could carry.)*
+- **What revision 7.8 changes in CLAUDE.md, every place.** The version is replaced where the directive states the pin or a present fact, and 7.7 is kept at `docs/engineering/CLAUDE-v7.7.md`:
+  - the title ("Version 7.8 — Original-Source, Rust 1.100.0, ...") and the Revision line, which gains one sentence for 7.8 and the place where 7.7 is kept;
+  - "**Mandatory compiler:** Rust 1.100.0 stable";
+  - §1: "Follow the approved Rust 1.100.0 stable and Rust 2024 baseline";
+  - the heading of PART III, "MANDATORY RUST 1.100.0 TOOLCHAIN";
+  - §8: "Rust 1.100.0 is the mandatory production compiler." (it said "the mandatory initial production compiler"), "Require: Rust 1.100.0.", and `channel = "1.100.0"` in the example of `rust-toolchain.toml`;
+  - §12, three places: "Stable Rust 1.100.0 is mandatory for the standard release build.", "If a feature cannot be implemented using stable 1.100.0:", "8. Preserve stable Rust 1.100.0 as the main compiler baseline.";
+  - §14: "On stable Rust 1.100.0, `-Z cf-protection` (IBT/ENDBR64) and `-Z stack-protector` are unavailable", which the upgrade task checked again on 1.100.0 on 2026-11-13;
+  - §17's baseline: "Rust 1.100.0.";
+  - §82, M0: "Pin Rust 1.100.0, validate cross-compilation, ...";
+  - §84: "2. Check Rust 1.100.0 availability.";
+  - the first final rule: "1. Rust 1.100.0 stable is the mandatory compiler baseline." (it said "the initial mandatory compiler baseline").
+- **What 7.8 leaves as it was.** §10's heading and its first sentence still name Rust 1.99.1: they say which compiler fixed the three regressions the tests cover, which is a fact about that release, and the tests stay and are run under 1.100.0. §15 is unchanged: the named check of the kernel's hardening option is ADR-0017 Amendment 2's (item 280) and a heading of its own in `verify.sh`. No statement is added or removed, so the matrix keeps its rows and only their quotes change.
 
 ### The option behind the INT3 after every RET is to become an error in the compiler (items 280 and 281): Accepted 2026-11-13
 
