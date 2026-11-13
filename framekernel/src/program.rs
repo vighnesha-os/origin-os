@@ -76,6 +76,9 @@ pub struct Import {
     pub slot: u64,
     /// Which export of `origin.core`: its place in [`CoreImage::exports`].
     pub export: usize,
+    /// That export's name, as the linker's relocation named it: [`check`] refuses an import
+    /// whose place names another (the independent review of 2026-11-13, finding K6).
+    pub symbol: &'static str,
 }
 
 /// Where `origin.core` is in the process a program is built for: its base there, and its
@@ -123,8 +126,9 @@ pub enum LayoutError {
     /// bytes, or its value plus the base overflows.
     Relocation,
     /// An import slot is out of order, misaligned, not in a RELRO segment's bytes, or also a
-    /// relocation slot; it names an export `origin.core` does not have; or the program was
-    /// bound against another `origin.core` than the one the kernel carries.
+    /// relocation slot; it names an export `origin.core` does not have, or its place and its
+    /// name are two exports; or the program was bound against another `origin.core` than the
+    /// one the kernel carries.
     Import,
 }
 
@@ -133,8 +137,8 @@ pub enum LayoutError {
 /// read-execute segment, holding the entry; a span of whole pages up to [`MAX_SPAN`];
 /// relocation slots strictly ascending, 8-byte aligned, each inside the bytes of a writable or
 /// RELRO segment; and import slots strictly ascending, 8-byte aligned, each inside the bytes of
-/// a RELRO segment and no relocation slot, each naming an export of `core`, which is the
-/// `origin.core` the program was bound against.
+/// a RELRO segment and no relocation slot, each naming by place and by name the same export of
+/// `core`, which is the `origin.core` the program was bound against.
 pub fn check(carried: &Carried, core: &CoreImage) -> Result<(), LayoutError> {
     if carried.span == 0 || !carried.span.is_multiple_of(PAGE) || carried.span > MAX_SPAN {
         return Err(LayoutError::Span);
@@ -198,7 +202,10 @@ pub fn check(carried: &Carried, core: &CoreImage) -> Result<(), LayoutError> {
             || previous.is_some_and(|p| slot <= p)
             || !in_relro
             || carried.relocations.binary_search(&slot).is_ok()
-            || import.export >= core.exports.len()
+            || core
+                .exports
+                .get(import.export)
+                .is_none_or(|export| export.name != import.symbol)
         {
             return Err(LayoutError::Import);
         }

@@ -45,7 +45,7 @@
 //! filling of a code page it has mapped read-execute, is TASKS item 51.
 #![forbid(unsafe_code)]
 
-use origin_syscalls::origin_kernel::kernel::server::{Pins, RELEASE_FINGERPRINT};
+use origin_syscalls::origin_kernel::kernel::server::{CALLS, Pins, RELEASE_FINGERPRINT};
 
 /// Bytes in a page.
 pub const PAGE: u64 = 4096;
@@ -92,11 +92,74 @@ pub enum CoreError {
     Span,
     /// An export is outside the code, or the exports are not strictly ascending by name.
     Export,
-    /// A call's pin is not the place of a `syscall` instruction in the code, or two calls
-    /// share one.
+    /// A call's pin is not the place of a `syscall` instruction in the code, two calls share
+    /// one, or a pin does not lie in its own method's stub: from the export of that method's
+    /// name up to the next export.
     Pin,
     /// The stubs were generated from another definition than this kernel's dispatcher.
     Release,
+}
+
+/// What every export's name starts with: `origin.kernel`'s module name and an underscore, as the
+/// generator names each entry point (`docs/spec/OIDL.md` §10).
+const EXPORT_PREFIX: &[u8] = b"origin_kernel_";
+
+/// Whether `export` is the name of `method`'s entry point.
+const fn names_method(export: &str, method: &str) -> bool {
+    let (e, m) = (export.as_bytes(), method.as_bytes());
+    if e.len() != EXPORT_PREFIX.len() + m.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < e.len() {
+        let wanted = if i < EXPORT_PREFIX.len() {
+            EXPORT_PREFIX[i]
+        } else {
+            m[i - EXPORT_PREFIX.len()]
+        };
+        if e[i] != wanted {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Where the stub of call `number` is in `image`: from its export's offset up to the next
+/// export's, or the end of the code. `None` if the call has no export of its name.
+const fn stub_of(image: &CoreImage, number: u64) -> Option<(u64, u64)> {
+    let mut c = 0;
+    let mut method = None;
+    while c < CALLS.len() {
+        if CALLS[c].number == number {
+            method = Some(CALLS[c].name);
+        }
+        c += 1;
+    }
+    let Some(method) = method else {
+        return None;
+    };
+    let mut start = None;
+    let mut e = 0;
+    while e < image.exports.len() {
+        if names_method(image.exports[e].name, method) {
+            start = Some(image.exports[e].offset);
+        }
+        e += 1;
+    }
+    let Some(start) = start else {
+        return None;
+    };
+    let mut end = image.code.len() as u64;
+    let mut e = 0;
+    while e < image.exports.len() {
+        let offset = image.exports[e].offset;
+        if offset > start && offset < end {
+            end = offset;
+        }
+        e += 1;
+    }
+    Some((start, end))
 }
 
 /// Whether `a` sorts strictly before `b`, byte by byte.
@@ -114,8 +177,11 @@ const fn before(a: &str, b: &str) -> bool {
 
 /// Whether `image` keeps every rule the kernel relies on: a span of whole pages up to
 /// [`MAX_SPAN`] that holds all of the code; exports strictly ascending by name, each inside the
-/// code; every call's pin at a `syscall` instruction of the code, no two calls at one; and the
-/// release fingerprint of this kernel's own dispatcher.
+/// code; every call's pin at a `syscall` instruction of the code, inside its own method's stub
+/// (from the export `origin_kernel_<method>` up to the next export), no two calls at one; and
+/// the release fingerprint of this kernel's own dispatcher. The stub rule ties each pin to its
+/// own call by name, apart from the description's field names (the independent review of
+/// 2026-11-13, finding K6).
 ///
 /// A `const fn`, so that the kernel's build runs it on the description it compiles in.
 ///
@@ -154,6 +220,10 @@ pub const fn check(image: &CoreImage) -> Result<(), CoreError> {
         let at = at as usize;
         if code[at] != SYSCALL[0] || code[at + 1] != SYSCALL[1] {
             return Err(CoreError::Pin);
+        }
+        match stub_of(image, pins[i].0) {
+            Some((start, end)) if start <= pins[i].1 && pins[i].1 + 1 < end => {}
+            _ => return Err(CoreError::Pin),
         }
         let mut j = 0;
         while j < i {

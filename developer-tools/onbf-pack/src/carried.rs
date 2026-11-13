@@ -455,7 +455,7 @@ impl Carried {
         text.push_str("    ],\n    imports: &[\n");
         for import in &self.imports {
             text.push_str(&format!(
-                "        Import {{ slot: {:#x}, export: {} }}, // {}\n",
+                "        Import {{ slot: {:#x}, export: {}, symbol: \"{}\" }},\n",
                 import.slot, import.export, import.symbol
             ));
         }

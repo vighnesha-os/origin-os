@@ -374,8 +374,8 @@ fn a_programs_imports_are_laid_out_as_slots_and_exports_by_name_order() {
     let text = String::from_utf8(files[0].1.clone()).unwrap();
     for line in [
         "    imports: &[",
-        "        Import { slot: 0x3010, export: 1 }, // origin_kernel_b",
-        "        Import { slot: 0x3018, export: 0 }, // origin_kernel_a",
+        "        Import { slot: 0x3010, export: 1, symbol: \"origin_kernel_b\" },",
+        "        Import { slot: 0x3018, export: 0, symbol: \"origin_kernel_a\" },",
         "    core: Some([",
         "        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,",
     ] {

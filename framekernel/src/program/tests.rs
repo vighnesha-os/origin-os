@@ -127,6 +127,7 @@ const GOOD: Carried = Carried {
 static IMPORTS: [Import; 1] = [Import {
     slot: 0x3008,
     export: 1,
+    symbol: "origin_kernel_b",
 }];
 const BOUND: Carried = Carried {
     imports: &IMPORTS,
@@ -364,7 +365,12 @@ fn a_bound_description_passes_and_its_slot_takes_its_exports_address() {
 
 #[test]
 fn each_import_rule_is_held() {
-    let import = |slot, export| Import { slot, export };
+    let name = |export: usize| CORE_EXPORTS.get(export).map_or("none", |e| e.name);
+    let import = |slot, export| Import {
+        slot,
+        export,
+        symbol: name(export),
+    };
     // With no relocation in the way, every slot of the RELRO page's 24 bytes is free.
     for imports in [
         &[import(0x3010, 0), import(0x3008, 1)][..], // out of order
@@ -451,10 +457,39 @@ fn an_export_address_that_overflows_is_refused() {
         bound(
             &Import {
                 slot: 0x3008,
-                export: 3
+                export: 3,
+                symbol: "origin_kernel_d",
             },
             AT
         ),
         None
     );
+}
+
+#[test]
+fn an_import_whose_place_and_name_are_two_exports_is_refused() {
+    // The place says export 0, `origin_kernel_a`; the name says `origin_kernel_b`. If the
+    // build's two orders of exports ever came apart, every program would be bound to other
+    // stubs, and only this sees it (the review of 2026-11-13, finding K6).
+    let crossed = Carried {
+        imports: Vec::leak(vec![Import {
+            slot: 0x3008,
+            export: 0,
+            symbol: "origin_kernel_b",
+        }]),
+        ..BOUND
+    };
+    assert_eq!(check(&crossed, &CORE), Err(LayoutError::Import));
+    // A name that is no export's at all.
+    let unknown = Carried {
+        imports: Vec::leak(vec![Import {
+            slot: 0x3008,
+            export: 1,
+            symbol: "origin_kernel_helper",
+        }]),
+        ..BOUND
+    };
+    assert_eq!(check(&unknown, &CORE), Err(LayoutError::Import));
+    // The same import with its own name passes.
+    assert_eq!(check(&BOUND, &CORE), Ok(()));
 }

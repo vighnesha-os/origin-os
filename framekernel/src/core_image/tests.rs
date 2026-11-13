@@ -44,29 +44,25 @@ fn pins() -> Pins {
     }
 }
 
-const EXPORTS: &[CoreExport] = &[
-    CoreExport {
-        name: "origin_kernel_debug_report",
-        offset: 8,
-        since: (0, 0),
-    },
-    CoreExport {
-        name: "origin_kernel_memory_map",
-        offset: 96,
-        since: (0, 5),
-    },
-    CoreExport {
-        name: "origin_kernel_thread_exit",
-        offset: 0,
-        since: (0, 0),
-    },
-];
+/// Every call's export, `origin_kernel_<method>` at its stub's first byte, ascending by name.
+fn exports() -> &'static [CoreExport] {
+    let mut exports: Vec<CoreExport> = CALLS
+        .iter()
+        .map(|call| CoreExport {
+            name: format!("origin_kernel_{}", call.name).leak(),
+            offset: 8 * call.number,
+            since: (0, 0),
+        })
+        .collect();
+    exports.sort_by(|a, b| a.name.cmp(b.name));
+    exports.leak()
+}
 
 fn image() -> CoreImage {
     CoreImage {
         span: PAGE,
         code: code(),
-        exports: EXPORTS,
+        exports: exports(),
         pins: pins(),
         release: RELEASE_FINGERPRINT,
     }
@@ -120,7 +116,9 @@ fn the_span_is_whole_pages_that_hold_the_code() {
 #[test]
 fn the_exports_ascend_by_name_inside_the_code() {
     let with = |exports: &'static [CoreExport]| check(&CoreImage { exports, ..image() });
-    assert_eq!(with(&[]), Ok(()));
+    assert_eq!(with(exports()), Ok(()));
+    // With no export, no pin has a stub to lie in.
+    assert_eq!(with(&[]), Err(CoreError::Pin));
     let outside: &'static [CoreExport] = vec![CoreExport {
         name: "origin_kernel_x",
         offset: code().len() as u64,
@@ -128,9 +126,9 @@ fn the_exports_ascend_by_name_inside_the_code() {
     }]
     .leak();
     assert_eq!(with(outside), Err(CoreError::Export));
-    let reversed: &'static [CoreExport] = vec![EXPORTS[1], EXPORTS[0]].leak();
+    let reversed: &'static [CoreExport] = vec![exports()[1], exports()[0]].leak();
     assert_eq!(with(reversed), Err(CoreError::Export));
-    let twice: &'static [CoreExport] = vec![EXPORTS[0], EXPORTS[0]].leak();
+    let twice: &'static [CoreExport] = vec![exports()[0], exports()[0]].leak();
     assert_eq!(with(twice), Err(CoreError::Export));
     // A name that is another's beginning sorts first.
     assert!(before("origin_kernel_port", "origin_kernel_port_wait"));
@@ -235,4 +233,40 @@ fn a_whole_page_of_the_image_has_no_byte_after_its_code_but_padding() {
     // The two bytes of `syscall` are where the code has them and nowhere after it.
     let pairs = |bytes: &[u8]| bytes.windows(2).filter(|pair| *pair == SYSCALL).count();
     assert_eq!(pairs(&page), pairs(image.code));
+}
+
+#[test]
+fn every_pin_lies_in_its_own_methods_stub() {
+    let with = |edit: fn(&mut Pins)| {
+        let mut pins = pins();
+        edit(&mut pins);
+        check(&CoreImage { pins, ..image() })
+    };
+    // Two calls' pins swapped: each is a real `syscall`, no two share one, and each lies in
+    // the other's stub. Only the stub rule sees it (finding K6).
+    assert_eq!(
+        with(|p| core::mem::swap(&mut p.memory_map, &mut p.memory_unmap)),
+        Err(CoreError::Pin)
+    );
+    // A call whose export is missing has no stub for its pin.
+    let without: &'static [CoreExport] = exports()
+        .iter()
+        .copied()
+        .filter(|e| e.name != "origin_kernel_clock_read")
+        .collect::<Vec<_>>()
+        .leak();
+    assert_eq!(
+        check(&CoreImage {
+            exports: without,
+            ..image()
+        }),
+        Err(CoreError::Pin)
+    );
+    // The names match whole: a prefix of a method's name, or the name without the library's
+    // prefix, is no method's.
+    assert!(names_method("origin_kernel_port_wait", "port_wait"));
+    assert!(!names_method("origin_kernel_port", "port_wait"));
+    assert!(!names_method("origin_kernel_port_wait", "port"));
+    assert!(!names_method("port_wait", "port_wait"));
+    assert!(!names_method("origin_kerneL_port_wait", "port_wait"));
 }
