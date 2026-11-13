@@ -7,7 +7,7 @@ name = "first-program"
 version = "0.0.0"
 dependencies = [
  "origin-abi",
- "origin-kernel-stubs",
+ "origin-kernel-client",
  "origin-rt",
 ]
 
@@ -104,6 +104,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "origin-core"
+version = "0.0.0"
+
+[[package]]
 name = "origin-crypto"
 version = "0.0.0"
 
@@ -130,7 +134,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "origin-kernel-stubs"
+name = "origin-kernel-client"
 version = "0.0.0"
 
 [[package]]
@@ -152,7 +156,7 @@ name = "origin-rt"
 version = "0.0.0"
 dependencies = [
  "origin-abi",
- "origin-kernel-stubs",
+ "origin-kernel-client",
  "origin-rt-mem",
 ]
 
@@ -176,12 +180,23 @@ name = "origin-version"
 version = "0.0.0"
 
 [[package]]
+name = "pin-program"
+version = "0.0.0"
+dependencies = [
+ "origin-abi",
+ "origin-kernel-client",
+ "origin-rt",
+]
+
+[[package]]
 name = "xtask"
 version = "0.0.0"
 dependencies = [
  "framekernel",
+ "oidl",
  "onbf-format",
  "onbf-merkle",
+ "onbf-pack",
  "origin-boot-info",
  "origin-crypto",
  "origin-version",

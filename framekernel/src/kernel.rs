@@ -345,6 +345,9 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
             origin_frame::random::withhold();
         }
         proofs.record(Proof::Random, random);
+        // `origin.core` into its one set of frames, before any process exists (ADR-0011
+        // Amendment 2, L2; task S4-2).
+        install_origin_core(&mut com1);
         // M3, second step: preemptive kernel threads on every online processor. Its proofs
         // run to the end and are judged together (ADR-0013 R4): the proofs after a failure
         // use only the kernel's fixed programs, and the operator sees every result.
@@ -1615,6 +1618,37 @@ fn init_paging(com1: &mut Console, early: &mut Early) -> bool {
         console::withdraw_framebuffer(com1);
     }
     early.load_kernel_tables(com1, tables)
+}
+
+/// Writes `origin.core` into its frames, once, and says what it took: every process that is
+/// pinned per call maps these same frames, read-execute, and nothing writes them again. The
+/// install is judged by what it returns, which includes its own read-back of every word. The
+/// fall in free frames is printed as a figure and judges nothing: the frames' records are on
+/// the kernel heap, which may take a frame of its own, and the other processors are already
+/// running. If it cannot be done no process can be launched: the line fails the boot test, and
+/// the boot proofs that launch a program, and the last clause of "origin.core and the call
+/// pin", fail the boot itself.
+fn install_origin_core(com1: &mut Console) {
+    let image = crate::core_image::image();
+    let free = || memory::stats().map(|(_, frames)| frames);
+    let before = free();
+    let installed = crate::core_image::install();
+    let took = match (before, free()) {
+        (Some(before), Some(after)) => before.saturating_sub(after),
+        _ => 0,
+    };
+    let _ = match installed {
+        Ok(frames) => writeln!(
+            com1,
+            "origin-kernel: origin.core: {} bytes of code, the stubs of {} calls and nothing else, written once into {frames} frames and read back as written, the rest of each page the linker's int3; every process pinned per call maps them read-execute (free frames fell by {took}, a figure)",
+            image.code.len(),
+            image.exports.len(),
+        ),
+        Err(e) => writeln!(
+            com1,
+            "origin-kernel: origin.core could not be written into its frames ({e:?}): origin.core failed"
+        ),
+    };
 }
 
 /// Proves the heap with real `alloc` collections: a large vector (a frame run), thousands

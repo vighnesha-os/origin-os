@@ -75,9 +75,9 @@ fn spinner(value: u8, stack_top: u64) -> Vec<u8> {
 /// A process running `program` at [`CODE`] with one stack page, not started yet. System
 /// calls are accepted only from its code page.
 fn build(program: &[u8]) -> Option<Process> {
-    let mut p = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)?;
+    let mut p = Process::proof(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)?;
     let frame = p.map_page(CODE, Access::ReadExecute).ok()?;
-    if !p.write_frame(frame, 0, program) {
+    if !p.write_page(frame, 0, program) {
         return None;
     }
     p.map_page(STACK, Access::ReadWrite).ok()?;
@@ -266,6 +266,11 @@ pub(crate) fn prove(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> bool {
             Some(Ending::Exited(code)) => (
                 want_fault.is_none() && code == 0,
                 alloc::format!("exited with {:?}", Some(code)),
+            ),
+            // None of these is pinned per call, so none can be stopped by the pin.
+            Some(Ending::Refused { number, address }) => (
+                false,
+                alloc::format!("stopped at call {number} from {address:#x}"),
             ),
             None => (false, alloc::string::String::from("did not end")),
         };

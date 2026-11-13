@@ -31,6 +31,24 @@ pub const MAX_CHANNEL_ORDINAL: u64 = 0x7FFF_FFFF;
 /// Largest `syscall` number accepted in a definition.
 pub const MAX_SYSCALL_NUMBER: u64 = 0xFFFF;
 
+/// Whether loading `number` into EAX would put the two bytes of a `syscall` instruction,
+/// `0F 05`, into the stub: any two adjacent bytes of the number as the 32-bit immediate of
+/// `mov eax, imm32`, which is little-endian. Below [`MAX_SYSCALL_NUMBER`] that is 1295
+/// (`0x050F`) alone.
+///
+/// `origin.core` may hold those two bytes once in each stub, at its `syscall`, and nowhere
+/// else at any alignment (ADR-0005 B2; §10): the kernel accepts each call number only from
+/// the address of its own, and a second pair inside a stub would be a `syscall` a jump could
+/// reach with that stub's address. The build has always refused such a stub; the number is
+/// refused here, where the definition is read, so that the reason is given where it is made.
+#[must_use]
+pub fn number_holds_syscall(number: u32) -> bool {
+    number
+        .to_le_bytes()
+        .windows(2)
+        .any(|pair| pair == [0x0F, 0x05])
+}
+
 /// One input file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Input {
@@ -1198,6 +1216,16 @@ fn build_method(scope: &mut Scope<'_>, decl: &MethodDecl) -> Result<Method, Diag
         );
     }
     let ordinal = u32::try_from(decl.ordinal).or(fail(file, decl.pos, Code::BadOrdinal, ""))?;
+    if !channel && number_holds_syscall(ordinal) {
+        return fail(
+            file,
+            decl.name.pos,
+            Code::BadOrdinal,
+            format!(
+                "{ordinal}: loading it into EAX would put the two bytes of a syscall instruction (0F 05) into its stub a second time"
+            ),
+        );
+    }
     if decl.oneway && !channel {
         return fail(file, decl.name.pos, Code::OnewayNotAllowed, "only channel");
     }

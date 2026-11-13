@@ -1165,12 +1165,13 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         Proof::Identity,
         crate::ipc_proof::prove_identity(com1, cpus, bsp, tsc_hz),
     );
-    // The first three launch processes, and a start record goes at a random address (ADR-0005
-    // C4), as does a carried program (task S4-1); the fourth maps memory objects at addresses
-    // the kernel chooses at random (ADR-0005 D5). With no random-number generator, or with one
-    // whose proof failed, randomness is withheld: nothing is launched and no such place can be
-    // chosen, so none of the four can run. They are left out of the tally, which the verdict
-    // counts as "did not run" (ADR-0016 R8; ADR-0013 R2 and R6).
+    // The first five launch processes, and a start record goes at a random address (ADR-0005
+    // C4), as do a carried program and `origin.core` (tasks S4-1 and S4-2); the sixth maps
+    // memory objects at addresses the kernel chooses at random (ADR-0005 D5). With no
+    // random-number generator, or with one whose proof failed, randomness is withheld: nothing
+    // is launched and no such place can be chosen, so none of the six can run. They are left
+    // out of the tally, which the verdict counts as "did not run" (ADR-0016 R8; ADR-0013 R2
+    // and R6).
     if origin_frame::random::available() {
         proofs.record(
             Proof::Launch,
@@ -1179,6 +1180,14 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         proofs.record(
             Proof::RustProgram,
             crate::program_proof::prove(com1, cpus, bsp, tsc_hz),
+        );
+        proofs.record(
+            Proof::CorePin,
+            crate::ipc_proof::prove_core_pin(com1, cpus, bsp, tsc_hz),
+        );
+        proofs.record(
+            Proof::EntryFlags,
+            crate::ipc_proof::prove_entry_flags(com1, cpus, bsp, tsc_hz),
         );
         proofs.record(
             Proof::Directory,
@@ -1191,7 +1200,7 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
     } else {
         let _ = writeln!(
             com1,
-            "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, Rust-program, service-directory and memory-object proofs did not run"
+            "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, Rust-program, origin.core, entry-flags, service-directory and memory-object proofs did not run"
         );
     }
     // Events and ports, and the clock as ring 3 reads it (task S3-6), need no generator: their

@@ -10,7 +10,7 @@ publish.workspace = true
 # default member: its entry is x86-64 assembly and its panic handler would clash with `std`.
 [dependencies]
 origin-abi = { path = "../abi" }
-origin-kernel-stubs = { path = "../kernel-stubs" }
+origin-kernel-client = { path = "../kernel-client" }
 origin-rt-mem = { path = "../rt-mem" }
 
 [lints]

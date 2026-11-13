@@ -592,7 +592,7 @@ struct HMarks {
 /// module documentation).
 fn hostile_loop(bsp: CpuIndex, tsc_hz: u64) -> Option<Run<HMarks>> {
     let mut hp = Program::new(limits(1, 1, HOSTILE))?;
-    let holder = Process::new(LIMITS, (CODE, CODE + PAGE), 0)?;
+    let holder = Process::proof(LIMITS, (CODE, CODE + PAGE), 0)?;
     let (h_end, holder_end) = ipc::create_channel(&holder.account).ok()?;
     let from_kernel = Imm(hp
         .image
@@ -681,7 +681,7 @@ fn unreported() -> Option<Unreported> {
     // The process, its object, and whether its failed map left the place and its one mapping
     // free: no page is there, and the same map with a report that succeeds is served.
     let lost = |changes: Rate| {
-        let process = Process::new(limits(1, 1, changes), (CODE, CODE + PAGE), 0)?;
+        let process = Process::proof(limits(1, 1, changes), (CODE, CODE + PAGE), 0)?;
         let object = ObjectRef::try_new(MemoryObject::create(&process.account, PAGE).ok()?).ok()?;
         let map = |report: &dyn Fn(u64) -> Result<(), Error>| {
             memory_object::map(
@@ -764,7 +764,7 @@ fn runs() -> Option<Runs> {
 
     // A page of the process's own, as its creator maps its code, data and stack, where the
     // second page of a run would go.
-    let mut process = Process::new(limits(6, 3, PLENTY), (CODE, CODE + PAGE), 0)?;
+    let mut process = Process::proof(limits(6, 3, PLENTY), (CODE, CODE + PAGE), 0)?;
     let mine = process
         .map_page(FIXED_O + PAGE, Access::ReadWrite)
         .ok()?
@@ -791,7 +791,7 @@ fn runs() -> Option<Runs> {
     // Mappings two mebibytes apart, until the space's bound on page tables refuses one. The
     // process has a page of its own first, below them, where a table's reach begins: the page
     // under it is in a table the space does not have.
-    let mut wide = Process::new(
+    let mut wide = Process::proof(
         limits(3, APART as usize + 1, PLENTY),
         (CODE, CODE + PAGE),
         0,
@@ -888,7 +888,7 @@ fn busy() -> Option<Busy> {
         burst: 1,
         per_second: 1,
     };
-    let process = Process::new(limits(1, 2, once), (CODE, CODE + PAGE), 0)?;
+    let process = Process::proof(limits(1, 2, once), (CODE, CODE + PAGE), 0)?;
     let object = ObjectRef::try_new(MemoryObject::create(&process.account, PAGE).ok()?).ok()?;
     let record = || cpu::without_interrupts(|| process.mappings.lock().get(FIXED_Y));
     let frame = || process.frame_of(FIXED_Y).map(UserFrame::phys);
@@ -978,7 +978,7 @@ fn busy() -> Option<Busy> {
 /// processor holds: microseconds each.
 fn costs(tsc_hz: u64) -> Option<[u64; 3]> {
     const PAGES: u64 = 16;
-    let k = Process::new(limits(PAGES as usize, 1, PLENTY), (CODE, CODE + PAGE), 0)?;
+    let k = Process::proof(limits(PAGES as usize, 1, PLENTY), (CODE, CODE + PAGE), 0)?;
     let object = ObjectRef::try_new(MemoryObject::create(&k.account, PAGES * PAGE).ok()?).ok()?;
     let request = Request {
         access: READ_WRITE,
@@ -1031,7 +1031,7 @@ struct SharedUnmap {
 /// An object mapped in its creator's space and in a reader's, whose thread reads it in a loop
 /// on `cpu`: the kernel unmaps it from the reader's space while the thread runs.
 fn shared_unmap(cpu: CpuIndex, tsc_hz: u64) -> Option<SharedUnmap> {
-    let owner = Process::new(limits(1, 1, PLENTY), (CODE, CODE + PAGE), 0)?;
+    let owner = Process::proof(limits(1, 1, PLENTY), (CODE, CODE + PAGE), 0)?;
     let object = ObjectRef::try_new(MemoryObject::create(&owner.account, PAGE).ok()?).ok()?;
     let fixed = |address| Request {
         access: READ,
@@ -1078,7 +1078,7 @@ fn shared_unmap(cpu: CpuIndex, tsc_hz: u64) -> Option<SharedUnmap> {
         );
     if reader.ending().is_none() {
         // Still reading: the unmap did not reach it. Let it exit.
-        let _ = reader.write_frame(data, 8, &1u64.to_le_bytes());
+        let _ = reader.write_page(data, 8, &1u64.to_le_bytes());
         let _ = await_end(&reader, tsc_hz, 5);
     }
     let kept = owner

@@ -596,7 +596,7 @@ fn launch_child<T>(
 ) -> Option<Child<T>> {
     let code = proof_programs::launched();
     let code_pages = code.len().div_ceil(PAGE as usize).max(1) as u64;
-    let child = Process::child_of(launcher, LIMITS, (CODE, CODE + code_pages * PAGE))?;
+    let child = Process::proof_child_of(launcher, LIMITS, (CODE, CODE + code_pages * PAGE))?;
     let mut image = Image::from_process(child, code)?;
     let placed = launch::place(&mut image.process, &given).ok()?;
     let (script, marks) = build(placed.record, messages);
@@ -629,7 +629,7 @@ fn exchange(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -
         );
         return false;
     };
-    let Some(launcher) = Process::new(LIMITS, (CODE, CODE + PAGE), PRINCIPAL_LAUNCHER) else {
+    let Some(launcher) = Process::proof(LIMITS, (CODE, CODE + PAGE), PRINCIPAL_LAUNCHER) else {
         return false;
     };
     // The service's BOOTSTRAP, whose other end the directory gets as the provider's channel; the

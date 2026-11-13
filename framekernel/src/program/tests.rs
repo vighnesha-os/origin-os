@@ -2,6 +2,62 @@
 //! pages [`fill_page`] builds, and where [`random_base`] puts a program.
 
 use super::*;
+use crate::core_image::{CoreExport, PAGE as CORE_PAGE};
+use origin_syscalls::origin_kernel::kernel::server::{Pins, RELEASE_FINGERPRINT};
+
+/// An `origin.core` of three exports, for the binding's arithmetic alone: `check` and
+/// `fill_page` read its exports and its fingerprint, and nothing else of it.
+static CORE_EXPORTS: [CoreExport; 3] = [
+    CoreExport {
+        name: "origin_kernel_a",
+        offset: 0x10,
+        since: (0, 0),
+    },
+    CoreExport {
+        name: "origin_kernel_b",
+        offset: 0x1C,
+        since: (0, 0),
+    },
+    CoreExport {
+        name: "origin_kernel_c",
+        offset: 0,
+        since: (0, 5),
+    },
+];
+static CORE: CoreImage = CoreImage {
+    span: CORE_PAGE,
+    code: &[0xCC; 64],
+    exports: &CORE_EXPORTS,
+    pins: Pins {
+        thread_exit: 0,
+        debug_report: 0,
+        debug_write: 0,
+        handle_close: 0,
+        handle_duplicate: 0,
+        channel_create: 0,
+        channel_write: 0,
+        channel_read: 0,
+        wait_one: 0,
+        event_create: 0,
+        object_signal: 0,
+        memory_object_create: 0,
+        memory_map: 0,
+        memory_unmap: 0,
+        memory_protect: 0,
+        port_create: 0,
+        object_wait_async: 0,
+        port_wait: 0,
+        port_cancel: 0,
+        clock_read: 0,
+    },
+    release: RELEASE_FINGERPRINT,
+};
+/// Where the tests put `origin.core` in a process.
+const CORE_BASE: u64 = 0x0000_0456_7000_0000;
+const AT: CoreAt<'static> = CoreAt {
+    base: CORE_BASE,
+    image: &CORE,
+};
 
 /// Text at 0x1000 (the entry at 0x1010), read-only data at 0x2000, a RELRO page at 0x3000 with
 /// two slots, and writable data at 0x4000 with one slot and two pages, the second all bss.
@@ -62,6 +118,21 @@ const GOOD: Carried = Carried {
     span: 0x6000,
     segments: &SEGMENTS,
     relocations: &SLOTS,
+    imports: &[],
+    core: None,
+};
+
+/// `GOOD`, bound against [`CORE`]: its RELRO page's second word, between the two relocation
+/// slots, takes export `b`.
+static IMPORTS: [Import; 1] = [Import {
+    slot: 0x3008,
+    export: 1,
+    symbol: "origin_kernel_b",
+}];
+const BOUND: Carried = Carried {
+    imports: &IMPORTS,
+    core: Some(RELEASE_FINGERPRINT),
+    ..GOOD
 };
 
 /// `GOOD` with `segments` in place of its own.
@@ -78,7 +149,7 @@ fn segments(edit: impl FnOnce(&mut Vec<Segment>)) -> &'static [Segment] {
 
 #[test]
 fn a_good_description_passes() {
-    assert_eq!(check(&GOOD), Ok(()));
+    assert_eq!(check(&GOOD, &CORE), Ok(()));
     assert_eq!(
         code_range(&GOOD, 0x10_0000_0000),
         Some((0x10_0000_1000, 0x10_0000_2000))
@@ -98,18 +169,25 @@ fn each_segment_rule_is_held() {
     ];
     for (i, case) in cases.iter().enumerate() {
         let carried = with_segments(segments(case));
-        assert_eq!(check(&carried), Err(LayoutError::Segment), "case {i}");
+        assert_eq!(
+            check(&carried, &CORE),
+            Err(LayoutError::Segment),
+            "case {i}"
+        );
     }
 }
 
 #[test]
 fn exactly_one_code_segment_holds_the_entry() {
     let two = with_segments(segments(|s| s[1].access = SegmentAccess::ReadExecute));
-    assert_eq!(check(&two), Err(LayoutError::Code));
+    assert_eq!(check(&two, &CORE), Err(LayoutError::Code));
     let none = with_segments(segments(|s| s[0].access = SegmentAccess::Read));
-    assert_eq!(check(&none), Err(LayoutError::Code));
+    assert_eq!(check(&none, &CORE), Err(LayoutError::Code));
     for entry in [0x0FFF, 0x2000, 0x2010] {
-        assert_eq!(check(&Carried { entry, ..GOOD }), Err(LayoutError::Code));
+        assert_eq!(
+            check(&Carried { entry, ..GOOD }, &CORE),
+            Err(LayoutError::Code)
+        );
     }
 }
 
@@ -117,7 +195,7 @@ fn exactly_one_code_segment_holds_the_entry() {
 fn the_span_is_whole_pages_up_to_two_gib() {
     for span in [0, 0x6001, MAX_SPAN + PAGE] {
         assert_eq!(
-            check(&Carried { span, ..GOOD }),
+            check(&Carried { span, ..GOOD }, &CORE),
             Err(LayoutError::Span),
             "{span:#x}"
         );
@@ -140,7 +218,11 @@ fn each_relocation_rule_is_held() {
             relocations: Vec::leak(slots.to_vec()),
             ..GOOD
         };
-        assert_eq!(check(&carried), Err(LayoutError::Relocation), "{slots:x?}");
+        assert_eq!(
+            check(&carried, &CORE),
+            Err(LayoutError::Relocation),
+            "{slots:x?}"
+        );
     }
 }
 
@@ -148,22 +230,22 @@ fn each_relocation_rule_is_held() {
 fn a_page_holds_its_bytes_with_the_base_added_to_its_slots() {
     let base = 0x0000_0123_4000_0000;
     let mut page = [0xFFu8; PAGE as usize];
-    fill_page(&GOOD, 2, 0, base, &mut page).unwrap();
+    fill_page(&GOOD, 2, 0, base, AT, &mut page).unwrap();
     assert_eq!(page[0..8], (0x2000 + base).to_le_bytes());
     assert_eq!(page[8..16], [0; 8]);
     assert_eq!(page[16..24], (0x1010 + base).to_le_bytes());
     assert!(page[24..].iter().all(|&b| b == 0), "zero after the bytes");
 
     // The writable data's first page: its bytes, and the slot at its last word.
-    fill_page(&GOOD, 3, 0, base, &mut page).unwrap();
+    fill_page(&GOOD, 3, 0, base, AT, &mut page).unwrap();
     assert!(page[..4088].iter().all(|&b| b == 0x11));
     assert_eq!(page[4088..], (0x3008 + base).to_le_bytes());
     // Its second page is all bss, and no slot of the page before leaks into it.
-    fill_page(&GOOD, 3, 1, base, &mut page).unwrap();
+    fill_page(&GOOD, 3, 1, base, AT, &mut page).unwrap();
     assert!(page.iter().all(|&b| b == 0));
 
     // Text is copied as it is: no slot is in it.
-    fill_page(&GOOD, 0, 0, base, &mut page).unwrap();
+    fill_page(&GOOD, 0, 0, base, AT, &mut page).unwrap();
     assert_eq!(page[..32], TEXT);
     assert!(page[32..].iter().all(|&b| b == 0));
 
@@ -176,15 +258,15 @@ fn a_page_holds_its_bytes_with_the_base_added_to_its_slots() {
 fn a_page_outside_its_segment_or_a_wrong_buffer_is_refused() {
     let mut page = [0u8; PAGE as usize];
     assert_eq!(
-        fill_page(&GOOD, 4, 0, 0, &mut page),
+        fill_page(&GOOD, 4, 0, 0, AT, &mut page),
         Err(LayoutError::Segment)
     );
     assert_eq!(
-        fill_page(&GOOD, 0, 1, 0, &mut page),
+        fill_page(&GOOD, 0, 1, 0, AT, &mut page),
         Err(LayoutError::Segment)
     );
     assert_eq!(
-        fill_page(&GOOD, 0, 0, 0, &mut page[..100]),
+        fill_page(&GOOD, 0, 0, 0, AT, &mut page[..100]),
         Err(LayoutError::Segment)
     );
 }
@@ -193,7 +275,7 @@ fn a_page_outside_its_segment_or_a_wrong_buffer_is_refused() {
 fn a_base_that_overflows_a_slot_is_refused() {
     let mut page = [0u8; PAGE as usize];
     assert_eq!(
-        fill_page(&GOOD, 2, 0, u64::MAX - 0x1000, &mut page),
+        fill_page(&GOOD, 2, 0, u64::MAX - 0x1000, AT, &mut page),
         Err(LayoutError::Relocation)
     );
 }
@@ -246,4 +328,168 @@ fn the_largest_stack_and_its_two_neighbours_fit_the_region() {
     assert_eq!(MAX_STACK_PAGES * PAGE, MAX_SPAN);
     let place = random_base(MAX_STACK_PAGES + 2, u64::MAX).unwrap();
     assert!(place + (MAX_STACK_PAGES + 2) * PAGE <= PROGRAM_HIGH);
+}
+
+// ------------------------------------------------------------------ imports (ADR-0011 L3)
+
+#[test]
+fn a_bound_description_passes_and_its_slot_takes_its_exports_address() {
+    assert_eq!(check(&BOUND, &CORE), Ok(()));
+    let base = 0x0000_0123_4000_0000;
+    let mut page = [0xFFu8; PAGE as usize];
+    fill_page(&BOUND, 2, 0, base, AT, &mut page).unwrap();
+    // The relocation slots on each side of it are as they were, and the import's slot holds
+    // export `b`'s address in this process's `origin.core`: nothing of the program's base.
+    assert_eq!(page[0..8], (0x2000 + base).to_le_bytes());
+    assert_eq!(page[8..16], (CORE_BASE + 0x1C).to_le_bytes());
+    assert_eq!(page[16..24], (0x1010 + base).to_le_bytes());
+    assert!(page[24..].iter().all(|&b| b == 0));
+    assert_eq!(bound(&IMPORTS[0], AT), Some(CORE_BASE + 0x1C));
+
+    // Another process, another base of `origin.core`: the same slot, that process's address.
+    let elsewhere = CoreAt {
+        base: 0x0000_0777_0000_0000,
+        image: &CORE,
+    };
+    fill_page(&BOUND, 2, 0, base, elsewhere, &mut page).unwrap();
+    assert_eq!(page[8..16], (0x0000_0777_0000_001Cu64).to_le_bytes());
+
+    // No other page takes it: the writable data's pages are as they are without imports.
+    let (mut with, mut without) = ([0u8; PAGE as usize], [0u8; PAGE as usize]);
+    for (segment, page) in [(0, 0), (1, 0), (3, 0), (3, 1)] {
+        fill_page(&BOUND, segment, page, base, AT, &mut with).unwrap();
+        fill_page(&GOOD, segment, page, base, AT, &mut without).unwrap();
+        assert_eq!(with, without, "segment {segment}, page {page}");
+    }
+}
+
+#[test]
+fn each_import_rule_is_held() {
+    let name = |export: usize| CORE_EXPORTS.get(export).map_or("none", |e| e.name);
+    let import = |slot, export| Import {
+        slot,
+        export,
+        symbol: name(export),
+    };
+    // With no relocation in the way, every slot of the RELRO page's 24 bytes is free.
+    for imports in [
+        &[import(0x3010, 0), import(0x3008, 1)][..], // out of order
+        &[import(0x3008, 0), import(0x3008, 1)],     // one slot twice
+        &[import(0x3004, 0)],                        // misaligned
+        &[import(0x1000, 0)],                        // in the code
+        &[import(0x2000, 0)],                        // in read-only data: nothing writes there
+        &[import(0x4000, 0)], // in writable data: the program could change where it calls
+        &[import(0x3018, 0)], // past the RELRO page's bytes
+        &[import(0x7000, 0)], // outside every segment
+        &[import(0x3008, 3)], // an export `origin.core` does not have
+        &[import(0x3008, usize::MAX)],
+    ] {
+        let carried = Carried {
+            relocations: &[],
+            imports: Vec::leak(imports.to_vec()),
+            ..BOUND
+        };
+        assert_eq!(
+            check(&carried, &CORE),
+            Err(LayoutError::Import),
+            "{imports:x?}"
+        );
+    }
+    // A slot that is also a relocation slot: two writers of one word.
+    let both = Carried {
+        imports: Vec::leak(vec![import(0x3010, 0)]),
+        ..BOUND
+    };
+    assert_eq!(check(&both, &CORE), Err(LayoutError::Import));
+    // The same slots with no relocation there pass: the rule above is what refused it.
+    let free = Carried {
+        relocations: &[],
+        imports: Vec::leak(vec![
+            import(0x3000, 2),
+            import(0x3008, 1),
+            import(0x3010, 0),
+        ]),
+        ..BOUND
+    };
+    assert_eq!(check(&free, &CORE), Ok(()));
+}
+
+#[test]
+fn a_program_is_launched_only_beside_the_origin_core_it_was_bound_against() {
+    // Imports with no record of what they were bound against.
+    let unbound = Carried {
+        core: None,
+        ..BOUND
+    };
+    assert_eq!(check(&unbound, &CORE), Err(LayoutError::Import));
+    // Bound against another release's `origin.core`: an export's place means nothing here,
+    // whether or not it has an import.
+    let mut other = RELEASE_FINGERPRINT;
+    other[31] ^= 1;
+    let stale = Carried {
+        core: Some(other),
+        ..BOUND
+    };
+    assert_eq!(check(&stale, &CORE), Err(LayoutError::Import));
+    let stale_without = Carried {
+        core: Some(other),
+        ..GOOD
+    };
+    assert_eq!(check(&stale_without, &CORE), Err(LayoutError::Import));
+    // A program with no import and no such record is the kernel's own kind, and passes.
+    assert_eq!(check(&GOOD, &CORE), Ok(()));
+}
+
+#[test]
+fn an_export_address_that_overflows_is_refused() {
+    let top = CoreAt {
+        base: u64::MAX - 0x10,
+        image: &CORE,
+    };
+    assert_eq!(bound(&IMPORTS[0], top), None);
+    let mut page = [0u8; PAGE as usize];
+    assert_eq!(
+        fill_page(&BOUND, 2, 0, 0, top, &mut page),
+        Err(LayoutError::Import)
+    );
+    // And an import that names no export is no address at all.
+    assert_eq!(
+        bound(
+            &Import {
+                slot: 0x3008,
+                export: 3,
+                symbol: "origin_kernel_d",
+            },
+            AT
+        ),
+        None
+    );
+}
+
+#[test]
+fn an_import_whose_place_and_name_are_two_exports_is_refused() {
+    // The place says export 0, `origin_kernel_a`; the name says `origin_kernel_b`. If the
+    // build's two orders of exports ever came apart, every program would be bound to other
+    // stubs, and only this sees it (the review of 2026-11-13, finding K6).
+    let crossed = Carried {
+        imports: Vec::leak(vec![Import {
+            slot: 0x3008,
+            export: 0,
+            symbol: "origin_kernel_b",
+        }]),
+        ..BOUND
+    };
+    assert_eq!(check(&crossed, &CORE), Err(LayoutError::Import));
+    // A name that is no export's at all.
+    let unknown = Carried {
+        imports: Vec::leak(vec![Import {
+            slot: 0x3008,
+            export: 1,
+            symbol: "origin_kernel_helper",
+        }]),
+        ..BOUND
+    };
+    assert_eq!(check(&unknown, &CORE), Err(LayoutError::Import));
+    // The same import with its own name passes.
+    assert_eq!(check(&BOUND, &CORE), Ok(()));
 }
