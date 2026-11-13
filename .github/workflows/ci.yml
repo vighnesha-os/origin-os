@@ -89,6 +89,9 @@ jobs:
           path: target/xtask/reproducible/files
           if-no-files-found: warn
           retention-days: 14
+          # A re-run of the job replaces the files of the attempt before it (the review of TASKS
+          # item 52, finding 9).
+          overwrite: true
       # What `--locked` cannot say: that nothing the job ran afterwards rewrote Cargo.lock, or
       # any other tracked file. This job runs every build the others do.
       - name: The job left the checkout as committed
@@ -132,6 +135,9 @@ jobs:
           path: target/xtask/reproducible/files
           if-no-files-found: warn
           retention-days: 14
+          # A re-run of the job replaces the files of the attempt before it (the review of TASKS
+          # item 52, finding 9).
+          overwrite: true
       # Outside the checkout, which the last step holds unchanged. If the Linux job kept
       # nothing, this step fails, and so does the job.
       - name: Fetch the files the Linux job kept
