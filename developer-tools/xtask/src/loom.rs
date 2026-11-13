@@ -1205,6 +1205,21 @@ const CONTROLS: &[Control] = &[
             &["a bind found no room"],
         )],
     },
+    Control {
+        // The reservation does not look at the port's bound under the lock (ADR-0005 I1): two
+        // binds that both looked before either reserved pass a bound of one together.
+        name: "reserve_ignores_the_port_s_bound",
+        file: PORTS,
+        from: "                if state.index.used().saturating_add(reserved) >= self.bound {
+                    return Err(Unreserved::Full);
+                }
+",
+        to: "",
+        models: &[(
+            "ports_two_reservations_race_for_a_bound_of_one",
+            &["two reservations passed a bound of one"],
+        )],
+    },
 ];
 
 /// The scratch copy's workspace: just the crate under test. The tables `scratch_manifest` adds

@@ -86,14 +86,19 @@ pub struct ObjectLimits {
     pub ports: usize,
     /// Bindings it made whose packet has not left its port.
     pub bindings: usize,
+    /// The most bindings armed at once on any one port it creates, reservations in flight among
+    /// them (ADR-0005 Amendment 10, I1): each port it creates is bounded by it, and its figure
+    /// pays for each port's index at that bound. Zero: its ports accept no binding.
+    pub bindings_per_port: usize,
 }
 
 impl ObjectLimits {
-    /// No events, no ports and no bindings.
+    /// No events, no ports, no bindings, and no binding on any port.
     pub const NONE: Self = Self {
         events: 0,
         ports: 0,
         bindings: 0,
+        bindings_per_port: 0,
     };
 }
 
@@ -106,6 +111,8 @@ pub struct ObjectCounts {
     pub ports: Count,
     /// Bindings it made whose packet has not left its port.
     pub bindings: Count,
+    /// The bound of each port it creates (I1).
+    pub bindings_per_port: usize,
 }
 
 impl ObjectCounts {
@@ -115,7 +122,36 @@ impl ObjectCounts {
             events: Count::new(limits.events),
             ports: Count::new(limits.ports),
             bindings: Count::new(limits.bindings),
+            bindings_per_port: limits.bindings_per_port,
         }
+    }
+}
+
+/// The most slots a port's index holds at a bound of `bound` bindings armed and reserved, and
+/// the most its old block holds while it grows: the framework's rule
+/// (`origin_sync::ports::Port::index_at_bound`, held to the real index by its host test), copied
+/// here so that a figure can be made on the host; the kernel's build checks that the two agree.
+/// `first` is the index's first size (`Port::FIRST_INDEX_SLOTS`).
+#[must_use]
+pub const fn index_at_bound(bound: usize, first: usize) -> (usize, usize) {
+    if bound == 0 {
+        return (0, 0);
+    }
+    let most = bound.saturating_mul(2).saturating_sub(1);
+    (if most > first { most } else { first }, bound - 1)
+}
+
+/// What one port's index at its creator's bound makes the heap hold, its new block and its old
+/// one together, each rounded as the heap rounds it (ADR-0005 I1). `None` on overflow.
+#[must_use]
+pub const fn port_index(bound: usize, slot: Element, first: usize) -> Option<u64> {
+    let (most, old) = index_at_bound(bound, first);
+    let (Some(new), Some(old)) = (most.checked_mul(slot.size), old.checked_mul(slot.size)) else {
+        return None;
+    };
+    match (footprint(new, slot.align), footprint(old, slot.align)) {
+        (Some(new), Some(old)) => new.checked_add(old),
+        _ => None,
     }
 }
 
@@ -285,10 +321,15 @@ pub struct Costs {
     pub user_pages: usize,
     /// Each event.
     pub event: u64,
-    /// Each port.
+    /// Each port, besides its index.
     pub port: u64,
-    /// Each binding: its own allocations, and the slots of a port's index it can make the port
-    /// keep (row K7; G5 asks that it be measured before the figure is used).
+    /// One slot of a port's index, and the index's first size: each port's index is counted at
+    /// its creator's `bindings_per_port` ([`port_index`]; ADR-0005 I1).
+    pub index_slot: Element,
+    /// The index's first size (`Port::FIRST_INDEX_SLOTS`).
+    pub index_first: usize,
+    /// Each binding: its own two allocations. The slots of the port's index are the port's
+    /// creator's to pay (I1), not the binder's.
     pub binding: u64,
     /// Each thread: its kernel stack, its FPU area and its kernel objects.
     pub thread: u64,
@@ -308,8 +349,8 @@ pub struct Costs {
 
 /// One page's share of a table of `element`s that grows a page at a time: the most the table
 /// holds while it grows, [`growing`], is never more than eight elements' bytes a page for
-/// elements of 16 bytes to 1 KiB (the host test of a port's index holds that bound up to 20,000
-/// elements, more than a space's pages).
+/// elements of 16 bytes to 1 KiB, up to the most pages a space can map (the host test
+/// `a_page_s_share_of_a_record_table_is_eight_elements`).
 #[must_use]
 pub const fn eight_a_page(element: Element) -> Option<u64> {
     (element.size as u64).checked_mul(8)
@@ -375,7 +416,7 @@ pub struct Figure {
     pub mappings: u64,
     /// Its events.
     pub events: u64,
-    /// Its ports.
+    /// Its ports, each with its index at its `bindings_per_port` (I1).
     pub ports: u64,
     /// Its bindings.
     pub bindings: u64,
@@ -465,7 +506,17 @@ impl Limits {
             times(pages, costs.memory_page),
             mapping_records(self.memory.mappings, costs),
             times(self.objects.events, costs.event),
-            times(self.objects.ports, costs.port),
+            match port_index(
+                self.objects.bindings_per_port,
+                costs.index_slot,
+                costs.index_first,
+            ) {
+                Some(index) => match costs.port.checked_add(index) {
+                    Some(each) => times(self.objects.ports, each),
+                    None => None,
+                },
+                None => None,
+            },
             times(self.objects.bindings, costs.binding),
             match costs.thread.checked_add(costs.call) {
                 Some(each) => times(self.threads, each),
@@ -725,6 +776,7 @@ mod tests {
             events: 1,
             ports: 2,
             bindings: 3,
+            bindings_per_port: 3,
         });
         assert_eq!(fill(&counts.events), 1);
         assert_eq!(fill(&counts.ports), 2);
@@ -922,7 +974,9 @@ mod tests {
         user_pages: 29 * 512,
         event: 512,
         port: 768,
-        binding: 448,
+        index_slot: Element { size: 32, align: 8 },
+        index_first: 4,
+        binding: 192,
         thread: 17_920,
         call: 66_560,
         page: 4096 + 512,
@@ -1023,17 +1077,24 @@ mod tests {
             ..NOTHING
         };
         assert_eq!(alone(rate), 0);
-        let objects = |events, ports, bindings| Limits {
+        let objects = |events, ports, bindings, bindings_per_port| Limits {
             objects: ObjectLimits {
                 events,
                 ports,
                 bindings,
+                bindings_per_port,
             },
             ..NOTHING
         };
-        assert_eq!(alone(objects(3, 0, 0)), 3 * COSTS.event);
-        assert_eq!(alone(objects(0, 2, 0)), 2 * COSTS.port);
-        assert_eq!(alone(objects(0, 0, 5)), 5 * COSTS.binding);
+        let index = |bound| port_index(bound, COSTS.index_slot, COSTS.index_first).unwrap();
+        assert_eq!(alone(objects(3, 0, 0, 0)), 3 * COSTS.event);
+        // A port whose bound is zero has no index; one with a bound pays for its index at it.
+        assert_eq!(alone(objects(0, 2, 0, 0)), 2 * COSTS.port);
+        assert_eq!(alone(objects(0, 2, 0, 3)), 2 * (COSTS.port + index(3)));
+        // The bound costs nothing without a port to bound.
+        assert_eq!(alone(objects(0, 0, 0, 1_000)), 0);
+        // A binding pays its own two allocations, and no slot of the index.
+        assert_eq!(alone(objects(0, 0, 5, 0)), 5 * COSTS.binding);
         assert_eq!(
             alone(Limits {
                 threads: 4,
@@ -1067,6 +1128,7 @@ mod tests {
                 events: 3,
                 ports: 2,
                 bindings: 4,
+                bindings_per_port: 2,
             },
             threads: 2,
         };
@@ -1083,7 +1145,7 @@ mod tests {
                     + (1 << 20)
                     + alone(committed(16 * PAGE as usize))
                     + alone(mappings(3))
-                    + alone(objects(3, 2, 4))
+                    + alone(objects(3, 2, 4, 2))
                     + 2 * (COSTS.thread + COSTS.call)
             )
         );
@@ -1141,7 +1203,8 @@ mod tests {
                 objects: ObjectLimits {
                     events: 2,
                     ports: 0,
-                    bindings: 0
+                    bindings: 0,
+                    bindings_per_port: 0,
                 },
                 ..NOTHING
             }
@@ -1258,28 +1321,6 @@ mod tests {
         for pages in 1..=(1 << 20) {
             let list = footprint(8 * pages, 8).unwrap();
             assert!(list <= 16 * pages as u64, "{pages} pages: {list} bytes");
-        }
-    }
-
-    /// A port's index grows as a `Vec` does, from four slots (`Port::FIRST_INDEX_SLOTS`), with a
-    /// slot for each binding armed or reserved. `process::costs` counts eight slots' bytes for
-    /// each binding: whatever the count, the index's new and old blocks together, as the heap
-    /// rounds them, must never pass that, for any slot of 16 bytes to 1 KiB (the kernel's build
-    /// holds its slot to that range).
-    #[test]
-    fn a_ports_index_holds_at_most_eight_slots_a_binding() {
-        for slot in (16..=1024).step_by(8) {
-            let element = Element {
-                size: slot,
-                align: 8,
-            };
-            for bindings in 1..=20_000usize {
-                let held = growing(bindings, element).unwrap();
-                assert!(
-                    held <= 8 * (bindings * slot) as u64,
-                    "{bindings} bindings of {slot}-byte slots: {held} bytes"
-                );
-            }
         }
     }
 
@@ -1406,5 +1447,32 @@ mod tests {
         // Once ended, never, whatever is left.
         assert!(!may_start(true, 0, 1));
         assert!(!may_start(true, 0, usize::MAX));
+    }
+
+    /// ADR-0005 I1: a port's index at its creator's bound, as the framework's rule has it, rounded
+    /// as the heap rounds it, its new block and its old one together.
+    #[test]
+    fn a_port_s_index_is_counted_at_its_creator_s_bound() {
+        let slot = Element { size: 32, align: 8 };
+        assert_eq!(index_at_bound(0, 4), (0, 0));
+        assert_eq!(port_index(0, slot, 4), Some(0));
+        // At a bound of one or two the index never grows past its first four slots.
+        assert_eq!(index_at_bound(1, 4), (4, 0));
+        assert_eq!(index_at_bound(2, 4), (4, 1));
+        assert_eq!(port_index(1, slot, 4), Some(128));
+        assert_eq!(port_index(2, slot, 4), Some(128 + 32));
+        // Above that, twice the bound less one, and the old block under the bound.
+        assert_eq!(index_at_bound(3, 4), (5, 2));
+        assert_eq!(index_at_bound(100, 4), (199, 99));
+        assert_eq!(
+            port_index(100, slot, 4),
+            Some(footprint(199 * 32, 8).unwrap() + footprint(99 * 32, 8).unwrap())
+        );
+        // Never less than the bound's own slots, so every slot armed or reserved is counted.
+        for bound in 1..5_000 {
+            let (most, old) = index_at_bound(bound, 4);
+            assert!(most >= bound && old < bound);
+        }
+        assert_eq!(port_index(usize::MAX, slot, 4), None);
     }
 }

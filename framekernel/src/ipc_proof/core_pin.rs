@@ -296,6 +296,8 @@ fn every_call_limits() -> Limits {
             events: 1,
             ports: 1,
             bindings: 2,
+            // Its script arms both its bindings on its one port (ADR-0005 I1).
+            bindings_per_port: 2,
         },
         ..LIMITS
     }
@@ -900,6 +902,7 @@ fn narrow_limits() -> Limits {
             events: 1,
             ports: 1,
             bindings: 1,
+            bindings_per_port: 1,
         },
         ..LIMITS
     }

@@ -204,7 +204,7 @@ use loom::sync::{Arc, Notify};
 use loom::thread::{self, JoinHandle};
 
 use crate::floor::MonotonicFloor;
-use crate::ports::{self, Kind, Packet, Port, Reservation, Source, Storage, TakeError};
+use crate::ports::{self, Kind, Packet, Port, Reservation, Source, Storage, TakeError, Unreserved};
 use crate::refcount::RefCount;
 use crate::runqueue::RunQueue;
 use crate::shootdown::{Confirmation, Request, Rounds, Scope, Shootdown, Stalled, TlbHardware};
@@ -2947,6 +2947,55 @@ fn ports_two_reservations_race_for_the_last_slot() {
             }
             assert_eq!(drain(&port, &boot).len(), 5, "{LOST}");
             close_and_settle(&port, &boot, &account);
+        },
+    );
+}
+
+/// Two reservations race for a port bounded at one (ADR-0005 Amendment 10, I1; TASKS item 57):
+/// exactly one holds a place, the other is refused as `Full` with its charge given back, and
+/// once the place is given back the port takes one reservation again. The bound's check and the
+/// raise of `reserved` are one step under the port's lock, so the two cannot both pass it.
+#[test]
+fn ports_two_reservations_race_for_a_bound_of_one() {
+    check(
+        "ports_two_reservations_race_for_a_bound_of_one",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let world = Kernel::with_cpus(2);
+            let port = Arc::new(Port::<Ports>::bounded(1));
+            let account = Arc::new(AtomicU64::new(0));
+            let racers = [0, 1].map(|cpu| {
+                let (port, account) = (Arc::clone(&port), Arc::clone(&account));
+                world.spawn(cpu, move |me| {
+                    account.fetch_add(1, Relaxed);
+                    match Reservation::<Ports>::try_new(&me, &port, Arc::clone(&account)) {
+                        Ok(reservation) => Some(reservation),
+                        Err(refused) => {
+                            assert_eq!(refused, Unreserved::Full, "a reservation found no memory");
+                            account.fetch_sub(1, Relaxed);
+                            None
+                        }
+                    }
+                })
+            });
+            let held: Vec<Reservation<Ports>> = racers
+                .into_iter()
+                .filter_map(|racer| racer.join().unwrap())
+                .collect();
+            assert_eq!(held.len(), 1, "two reservations passed a bound of one");
+            for reservation in held {
+                reservation.into_payload().fetch_sub(1, Relaxed);
+            }
+            // The place given back, the port takes one again.
+            let me = world.boot_flow_on(0);
+            account.fetch_add(1, Relaxed);
+            let again = Reservation::<Ports>::try_new(&me, &port, Arc::clone(&account));
+            assert!(again.is_ok(), "a place given back was not free again");
+            if let Ok(reservation) = again {
+                reservation.into_payload().fetch_sub(1, Relaxed);
+            }
+            close_and_settle(&port, &me, &account);
         },
     );
 }

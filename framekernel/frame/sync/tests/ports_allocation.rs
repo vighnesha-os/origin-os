@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
-use origin_sync::ports::{Bound, Kernel, NoMemory, Port, Refused, Request, Reservation, Source};
+use origin_sync::ports::{Bound, Kernel, Port, Refused, Request, Reservation, Source, Unreserved};
 use origin_sync::wait::Scheduler;
 
 std::thread_local! {
@@ -103,7 +103,7 @@ fn a_reservation_without_memory_is_refused() {
     REFUSE.with(|refuse| refuse.set(true));
     let refused = Reservation::<Test>::try_new(&Host, &port, 7);
     REFUSE.with(|refuse| refuse.set(false));
-    assert_eq!(refused.err(), Some(NoMemory));
+    assert_eq!(refused.err(), Some(Unreserved::NoMemory));
     // The same call succeeds once there is memory, so the refusal was the allocator's.
     assert_eq!(
         Reservation::<Test>::try_new(&Host, &port, 7)

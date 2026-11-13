@@ -386,11 +386,11 @@ const fn element((size, align): (usize, usize)) -> Element {
 ///   least one page, so a process has at most one object for each page of its quota.
 /// - **Mappings:** the table of whole mappings, and the address space's two tables of page
 ///   records at the most pages a space can map (`quota::Limits::parts`).
-/// - **An event, a port:** the object.
-/// - **A binding:** its storage and its ticket, and the slots of a port's index it can make the
-///   port keep. A port's index grows as a `Vec` does, from four slots: while it grows it holds
-///   its new block and its old one, at most six slots' bytes a binding once rounded, and eight
-///   when it holds one. Counted as eight (row K7).
+/// - **An event, a port:** the object; and a port's index at its creator's `bindings_per_port`
+///   (I1), in the figure's port part.
+/// - **A binding:** its storage and its ticket. The slots of the port's index are paid by the
+///   port's creator (ADR-0005 Amendment 10, I1), at its `bindings_per_port`, in each port's part
+///   (`quota::port_index`, by the framework's rule for a bounded index).
 /// - **A thread:** its kernel stack, its FPU area at this processor's size (64-byte aligned,
 ///   `FpuArea`), its thread object and the context the scheduler holds for it; and, apart, the
 ///   most one system call can hold that no quota charges (`ipc::call_temporaries`), since a
@@ -423,10 +423,7 @@ pub(crate) fn costs() -> Option<Costs> {
     let frame_entry = core::mem::size_of::<SharedFrame>() as u64;
     let memory_page = block(SHARED_FRAME)?.checked_add(frame_entry.checked_mul(2)?)?;
     let [store, ticket] = Reservation::<Ports>::ALLOCATIONS;
-    let (slot, _) = Port::<Ports>::INDEX_SLOT;
-    let binding = block(store)?
-        .checked_add(block(ticket)?)?
-        .checked_add((slot as u64).checked_mul(8)?)?;
+    let binding = block(store)?.checked_add(block(ticket)?)?;
     // A page's share of the space's two tables of page records, each growing a page at a time.
     let records = eight_a_page(element(PAGE_RECORD))?.checked_mul(2)?;
     let fpu = crate::cpu::fpu_area_size().max(crate::features::FXSAVE_SIZE);
@@ -447,6 +444,8 @@ pub(crate) fn costs() -> Option<Costs> {
         user_pages: MAX_USER_PAGES + 1,
         event: block(ObjectRef::<crate::event::Event>::ALLOCATION)?,
         port: block(ObjectRef::<crate::port::KernelPort>::ALLOCATION)?,
+        index_slot: element(Port::<Ports>::INDEX_SLOT),
+        index_first: Port::<Ports>::FIRST_INDEX_SLOTS,
         binding,
         thread,
         call: ipc::call_temporaries()?,
@@ -456,13 +455,23 @@ pub(crate) fn costs() -> Option<Costs> {
 }
 
 // What `costs` assumes of this build, each held by a host test in `quota` for the values here:
-// a port's index grows from the same first capacity a `Vec` of its slots does, and its slot is
-// no smaller than the heap's smallest block, so eight slots' bytes cover a binding's share; and a
-// memory object's list of frames holds 8-byte entries, so twice its entries' bytes cover it.
+// a memory object's list of frames holds 8-byte entries, so twice its entries' bytes cover it;
+// and the figure's copy of a bounded port's index rule (`quota::index_at_bound`) is the
+// framework's (`Port::index_at_bound`, which its host test holds to the real index), for every
+// bound up to 4,096 and for the largest there is (ADR-0005 I1).
 const _: () = {
-    let (slot, _) = origin_frame::sync::ports::Port::<Ports>::INDEX_SLOT;
-    assert!(origin_frame::sync::ports::Port::<Ports>::FIRST_INDEX_SLOTS == 4);
-    assert!(slot >= 16 && slot <= 1024);
+    use origin_frame::sync::ports::Port as FramePort;
+    let first = FramePort::<Ports>::FIRST_INDEX_SLOTS;
+    let mut bound = 0;
+    while bound <= 4_096 {
+        let (most, old) = crate::quota::index_at_bound(bound, first);
+        let (frame_most, frame_old) = FramePort::<Ports>::index_at_bound(bound);
+        assert!(most == frame_most && old == frame_old);
+        bound += 1;
+    }
+    let (most, old) = crate::quota::index_at_bound(usize::MAX, first);
+    let (frame_most, frame_old) = FramePort::<Ports>::index_at_bound(usize::MAX);
+    assert!(most == frame_most && old == frame_old);
     assert!(core::mem::size_of::<origin_frame::userspace::SharedFrame>() == 8);
     // A page record is in the range that host test holds eight elements a page for.
     let (record, align) = origin_frame::userspace::PAGE_RECORD;
