@@ -285,6 +285,13 @@ Given elsewhere by item 262: networking in the runtime (S44-08) to M10, with the
 | S84-13 | Host-testable native-format parsers |
 | A11-N13 | The SDK's rules enforced by gates, one of which reads first-party manifests (moved from M0 by item 269) |
 
+**Two more rows placed here: proposed, not accepted.** Decision items 272 and 273 (2026-11-13) added them to the matrix after item 269 was answered. They stand beside the rows they extend: A05-H1 states what a thread finds at its entry, as A05-B2's neighbours do for a call, and A11-L13 is one more rule for the stubs of A11-L6. Task S4-2 (TASKS item 47) placed them when its branch first held both the roadmap and the two rows, so that `cargo xtask roadmap-gate` passes; the owner has not answered on the placement.
+
+| Rows | Subject |
+|---|---|
+| A05-H1 | At a thread's entry the direction flag and the six status flags are clear and interrupts are on (ADR-0005 Amendment 9) |
+| A11-L13 | Each generated stub extends every parameter narrower than 64 bits to its whole register (ADR-0011 Amendment 3) |
+
 ## M7. Native packaging
 
 **Proposed, by the rule of item 256; `ONBF.md` §13 by item 267.** **State, 2026-11-12: not started; groundwork only, below.**
