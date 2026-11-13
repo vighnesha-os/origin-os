@@ -18,9 +18,12 @@
 //!   a handle to the process: each thread holds a reference to the space through the scheduler
 //!   and gives it up when it is reaped, so by then no processor runs in it, and each that ran
 //!   one has loaded another CR3, which flushes its translations (no PCIDs yet).
+//! - The memory objects its mappings held go with its space, in the last reap, not when its last
+//!   thread ends: the space maps their frames until it goes, so their creators are repaid only
+//!   once nothing can reach them (the independent review of task S4-3, finding B2).
 //! - Only then is `TERMINATED` raised (P11's order: handles, memory, signal): whoever sees it
-//!   knows the process's handles have closed and that neither it nor any of its threads holds
-//!   the address space any more. A thread is counted before it takes its reference, so one being
+//!   knows the process's handles have closed, that neither it nor any of its threads holds
+//!   the address space any more, and that what its mappings held has been given back. A thread is counted before it takes its reference, so one being
 //!   started cannot keep the space past `TERMINATED`. A kernel helper that took a reference of
 //!   its own through [`Process::memory`] (`root`, `write_frame`, `frame_of`, `translate`, and the
 //!   boot proof that reads a process's memory after it has ended) keeps the space until it lets
@@ -37,6 +40,16 @@
 //! threads runs. After that a space changes through the memory calls (`memory_object`): a
 //! process's whole mappings of memory objects are recorded here, and the memory it commits is
 //! charged to its account (P11, C7).
+//!
+//! Every process is paid for before it is made (ADR-0005 G5; task S4-3). Its limits are worth a
+//! figure, the most kernel memory and frames they let it make the kernel hold ([`costs`] measures
+//! each kind in this build), and the kernel's root ([`ROOT`], sized once at boot by
+//! [`size_root`]) pays it before anything of the process exists. A process the root cannot pay
+//! for is refused with `LIMIT`, with nothing made. The payment is held by the process's account
+//! and given back when the account goes: after the process, its threads, its address space and
+//! every object charged to it are gone. Its threads are counted against its limits too: a
+//! thread started and not yet reaped holds a kernel stack and an FPU area, which the figure pays
+//! for one each.
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
@@ -44,11 +57,13 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use crate::channel::Identity;
 use crate::handles::HandleTable;
-use crate::mapping::{Budget, Mappings, Rate};
+use crate::mapping::{Budget, Mappings};
 use crate::memory_object::MemoryObject;
 use crate::paging::{Access, MapError, Translation};
-pub(crate) use crate::quota::ObjectLimits;
-use crate::quota::{Count, ObjectCounts};
+use crate::quota::{
+    Costs, Count, Element, ObjectCounts, Payment, Purse, eight_a_page, footprint, growing,
+};
+pub(crate) use crate::quota::{Limits, MemoryLimits, ObjectLimits};
 use crate::runqueue::QueueError;
 use origin_abi::{Error, Handle, signals};
 use origin_frame::objref::ObjectRef;
@@ -82,9 +97,58 @@ pub(crate) struct Account {
     /// The events and ports this process created that still exist, and the bindings it made
     /// whose packet has not left its port.
     objects: ObjectCounts,
+    /// What the root paid for this process (G5): its figure, and each page its launch mapped for
+    /// it (the coordinating session's ruling (d)). Given back when the account is dropped, which
+    /// is after the process and everything charged here are gone.
+    paid: Payment,
+    /// Its limits' figure, the first part of `paid`.
+    figure: u64,
+    /// Bytes paid ahead for pages its launch has not mapped yet (`launch::load_program`); what
+    /// is left once its start record is written goes back ([`Process::settle_launch`]).
+    ahead: AtomicU64,
+    /// Pages its launch mapped, each paid for.
+    launch_pages: AtomicU64,
 }
 
 impl Account {
+    /// Its limits' figure, as the root paid it (G5).
+    pub(crate) const fn figure(&self) -> u64 {
+        self.figure
+    }
+
+    /// What the root paid for the pages its launch mapped, and how many they are.
+    pub(crate) fn launch_paid(&self) -> (u64, u64) {
+        let bytes = self.paid.bytes() - self.figure - self.ahead.load(Ordering::Acquire);
+        (bytes, self.launch_pages.load(Ordering::Acquire))
+    }
+
+    /// Pays `bytes` for a page the launch maps: out of what was paid ahead if that covers it,
+    /// otherwise out of the root now. `true` if it came from what was paid ahead.
+    fn pay_page(&self, bytes: u64) -> Result<bool, Error> {
+        let ahead = self
+            .ahead
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(bytes)
+            })
+            .is_ok();
+        if !ahead {
+            self.paid.add(bytes)?;
+        }
+        self.launch_pages.fetch_add(1, Ordering::AcqRel);
+        Ok(ahead)
+    }
+
+    /// A page paid for with [`Account::pay_page`] was not mapped after all: `bytes` go back where
+    /// they came from.
+    fn unpay_page(&self, bytes: u64, ahead: bool) {
+        self.launch_pages.fetch_sub(1, Ordering::AcqRel);
+        if ahead {
+            self.ahead.fetch_add(bytes, Ordering::AcqRel);
+        } else {
+            self.paid.give_back(bytes);
+        }
+    }
+
     /// One more channel, or [`Error::Limit`].
     pub(crate) fn charge_channel(&self) -> Result<(), Error> {
         self.channels.charge()
@@ -142,49 +206,6 @@ impl Account {
     pub(crate) fn objects(&self) -> &ObjectCounts {
         &self.objects
     }
-}
-
-/// What a process may commit and map, and how fast it may change its mappings (P11, C7;
-/// `THREAT_MODEL_ADDRESS_SPACES.md` T15, T16). [`MemoryLimits::NONE`] allows nothing: a creator
-/// gives memory to a process deliberately.
-#[derive(Clone, Copy)]
-pub(crate) struct MemoryLimits {
-    /// Bytes of memory objects it may have committed at once.
-    pub(crate) committed: usize,
-    /// Whole mappings its address space may hold.
-    pub(crate) mappings: usize,
-    /// Its budget of shootdowns and interrupts for unmap and protect.
-    pub(crate) changes: Rate,
-}
-
-impl MemoryLimits {
-    /// No memory objects, no mappings and no changes.
-    pub(crate) const NONE: Self = Self {
-        committed: 0,
-        mappings: 0,
-        changes: Rate {
-            burst: 0,
-            per_second: 1,
-        },
-    };
-}
-
-/// A process's quotas: at most `handles` entries in its table, `channels` live channels,
-/// `message_bytes` of kernel heap in messages it has queued, its memory, and its events, ports
-/// and bindings.
-#[derive(Clone, Copy)]
-pub(crate) struct Limits {
-    pub(crate) handles: usize,
-    pub(crate) channels: usize,
-    pub(crate) message_bytes: usize,
-    /// May it use `DEBUG_REPORT` and `DEBUG_WRITE`? The ABI reserves them for developer
-    /// builds: an ordinary process that calls them gets `NOT_SUPPORTED`, so it cannot hold
-    /// the serial line (at 115200 baud, a line for many milliseconds) with interrupts off.
-    pub(crate) debug_calls: bool,
-    /// Its memory objects and mappings.
-    pub(crate) memory: MemoryLimits,
-    /// Its events, ports and bindings. [`ObjectLimits::NONE`] allows none.
-    pub(crate) objects: ObjectLimits,
 }
 
 /// What ended the process's last thread, for the boot proofs.
@@ -320,6 +341,134 @@ pub(crate) const BOOT_PROOF_PRINCIPAL: u64 = 0xB007_0000_0000_0000;
 /// The next process ID: 0 is the kernel, and an ID is never used twice (ADR-0005 C1).
 static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The ID the next process made will have: for the bound's proof that a refused launch drew none.
+pub(crate) fn next_id() -> u64 {
+    NEXT_PROCESS_ID.load(Ordering::Relaxed)
+}
+
+/// The kernel's root (ADR-0005 G5): what every process is paid out of while the kernel is the
+/// only creator (step 4). It holds nothing until [`size_root`] sizes it, so a process made
+/// before then is refused.
+pub(crate) static ROOT: Purse = Purse::new();
+
+/// Sizes [`ROOT`] once, from `free` bytes of free frames: what they hold, less the reserve the
+/// kernel keeps for its own use ([`crate::quota::reserve_for`]). Returns the root and the
+/// reserve, or `None` if the root was sized already, which leaves it as it was.
+pub(crate) fn size_root(free: u64) -> Option<(u64, u64)> {
+    let reserve = crate::quota::reserve_for(free);
+    let root = free.saturating_sub(reserve);
+    ROOT.size_once(root).then_some((root, reserve))
+}
+
+/// One allocation of a size and an alignment, as the heap rounds it.
+fn block((size, align): (usize, usize)) -> Option<u64> {
+    footprint(size, align)
+}
+
+/// One element of a growing table.
+const fn element((size, align): (usize, usize)) -> Element {
+    Element { size, align }
+}
+
+/// What each kind a process's limits name costs the kernel, as this build measures it (G5):
+/// each allocation the kernel makes for one of a kind, rounded as the heap rounds it, and each
+/// table that grows by its element. `None` if an allocation could not be made at all (which
+/// no type here has) or the arithmetic overflows.
+///
+/// - **A process:** the process, its account and its address space's object; its page tables
+///   at the bound one space may have (`MAX_TABLES`, the PML4 among them), and the list that
+///   holds them. A process holds them whatever its limits.
+/// - **Handles:** the handle table's two lists, at the `handles` quota (`HandleTable`).
+/// - **A channel:** `ipc::channel_cost`.
+/// - **Committed memory:** a frame for each page, and for each page the block `SharedFrame`
+///   makes and its entry in the object's list of frames. That list is one allocation of exactly
+///   the object's pages, which the heap rounds to at most twice its bytes; and an object has at
+///   least one page, so a process has at most one object for each page of its quota.
+/// - **Mappings:** the table of whole mappings, and the address space's two tables of page
+///   records at the most pages a space can map (`quota::Limits::parts`).
+/// - **An event, a port:** the object.
+/// - **A binding:** its storage and its ticket, and the slots of a port's index it can make the
+///   port keep. A port's index grows as a `Vec` does, from four slots: while it grows it holds
+///   its new block and its old one, at most six slots' bytes a binding once rounded, and eight
+///   when it holds one. Counted as eight (row K7).
+/// - **A thread:** its kernel stack, its FPU area at this processor's size (64-byte aligned,
+///   `FpuArea`), its thread object and the context the scheduler holds for it; and, apart, the
+///   most one system call can hold that no quota charges (`ipc::call_temporaries`), since a
+///   thread has one call in flight at most.
+/// - **A page a launch maps** (not in a figure; the creator pays it besides, the coordinating
+///   session's ruling (d)): its frame, if it is the process's own, and its share of the space's
+///   two tables of page records, eight records' bytes in each (`quota::eight_a_page`).
+pub(crate) fn costs() -> Option<Costs> {
+    use crate::memory::OwnedFrame;
+    use origin_frame::sync::ports::{Port, Reservation};
+    use origin_frame::userspace::{
+        MAX_TABLES, MAX_USER_PAGES, PAGE_RECORD, SHARED_FRAME, SharedFrame,
+    };
+
+    const PAGE: u64 = crate::paging::PAGE;
+    let tables = (MAX_TABLES as u64).checked_mul(PAGE)?;
+    let table_list = growing(
+        MAX_TABLES,
+        element((
+            core::mem::size_of::<OwnedFrame>(),
+            core::mem::align_of::<OwnedFrame>(),
+        )),
+    )?;
+    let process = block(ObjectRef::<Process>::ALLOCATION)?
+        .checked_add(block(ObjectRef::<Account>::ALLOCATION)?)?
+        .checked_add(block(ObjectRef::<UserSpace>::ALLOCATION)?)?
+        .checked_add(tables)?
+        .checked_add(table_list)?;
+    let [slots, free] = HandleTable::<Object>::ELEMENTS;
+    let frame_entry = core::mem::size_of::<SharedFrame>() as u64;
+    let memory_page = block(SHARED_FRAME)?.checked_add(frame_entry.checked_mul(2)?)?;
+    let [store, ticket] = Reservation::<Ports>::ALLOCATIONS;
+    let (slot, _) = Port::<Ports>::INDEX_SLOT;
+    let binding = block(store)?
+        .checked_add(block(ticket)?)?
+        .checked_add((slot as u64).checked_mul(8)?)?;
+    // A page's share of the space's two tables of page records, each growing a page at a time.
+    let records = eight_a_page(element(PAGE_RECORD))?.checked_mul(2)?;
+    let fpu = crate::cpu::fpu_area_size().max(crate::features::FXSAVE_SIZE);
+    let thread = (sched::THREAD_STACK as u64)
+        .checked_add(footprint(fpu, 64)?)?
+        .checked_add(block(ObjectRef::<ThreadObject>::ALLOCATION)?)?
+        .checked_add(block(ObjectRef::<UserContext>::ALLOCATION)?)?;
+    Some(Costs {
+        process,
+        handle_tables: [element(slots), element(free)],
+        channel: ipc::channel_cost()?,
+        memory_object: block(ObjectRef::<MemoryObject>::ALLOCATION)?,
+        memory_page,
+        mapping_table: element(Mappings::<ObjectRef<MemoryObject>>::RECORD),
+        page_record: element(PAGE_RECORD),
+        // One more than a space can map: a single page's map reserves room for one record before
+        // its tables refuse it (`UserSpace::map_page`), so a table can grow for that one.
+        user_pages: MAX_USER_PAGES + 1,
+        event: block(ObjectRef::<crate::event::Event>::ALLOCATION)?,
+        port: block(ObjectRef::<crate::port::KernelPort>::ALLOCATION)?,
+        binding,
+        thread,
+        call: ipc::call_temporaries()?,
+        page: PAGE.checked_add(records)?,
+        shared_page: records,
+    })
+}
+
+// What `costs` assumes of this build, each held by a host test in `quota` for the values here:
+// a port's index grows from the same first capacity a `Vec` of its slots does, and its slot is
+// no smaller than the heap's smallest block, so eight slots' bytes cover a binding's share; and a
+// memory object's list of frames holds 8-byte entries, so twice its entries' bytes cover it.
+const _: () = {
+    let (slot, _) = origin_frame::sync::ports::Port::<Ports>::INDEX_SLOT;
+    assert!(origin_frame::sync::ports::Port::<Ports>::FIRST_INDEX_SLOTS == 4);
+    assert!(slot >= 16 && slot <= 1024);
+    assert!(core::mem::size_of::<origin_frame::userspace::SharedFrame>() == 8);
+    // A page record is in the range that host test holds eight elements a page for.
+    let (record, align) = origin_frame::userspace::PAGE_RECORD;
+    assert!(record >= 16 && record <= 1024 && record % 8 == 0 && align <= 8);
+};
+
 /// One process.
 pub(crate) struct Process {
     /// Unique for the boot and never reused (ADR-0005 C1). Grants nothing.
@@ -335,6 +484,10 @@ pub(crate) struct Process {
     pub(crate) account: ObjectRef<Account>,
     /// Its whole mappings of memory objects (C7), each holding its object.
     pub(crate) mappings: SpinLock<Mappings<ObjectRef<MemoryObject>>>,
+    /// The objects its mappings held once its last thread has ended, kept until its address
+    /// space has gone (the last reap), when [`Process::release_unmapped`] drops them before
+    /// `TERMINATED` (the independent review of task S4-3, finding B2).
+    unmapped: SpinLock<Vec<ObjectRef<MemoryObject>>>,
     /// Its budget for the unmaps and protects it asks for, in any process (T15, T16).
     pub(crate) changes: SpinLock<Budget>,
     /// Where its system calls may come from (P4, B2, ONBF §6.1). A plain field: written before
@@ -342,6 +495,9 @@ pub(crate) struct Process {
     origin: CallOrigin,
     /// May it use the developer-only calls?
     debug_calls: bool,
+    /// The most threads it may have started and not yet reaped (G5): each holds a kernel stack
+    /// and an FPU area its figure paid for. A plain field: written before the process is shared.
+    threads: usize,
     /// Its threads.
     lifecycle: SpinLock<Lifecycle>,
     /// `TERMINATED`, raised once everything it held is gone (P11).
@@ -373,29 +529,53 @@ impl Process {
         principal: u64,
     ) -> Option<Self> {
         let (start, end) = syscall_origin;
-        Self::with_origin(limits, CallOrigin::Range { start, end }, principal)
+        Self::with_origin(limits, CallOrigin::Range { start, end }, principal, 0).ok()
     }
 
     /// A new process whose system calls come from `origin`.
-    fn with_origin(limits: Limits, origin: CallOrigin, principal: u64) -> Option<Self> {
-        Some(Self {
+    ///
+    /// Paid for first (G5): `LIMIT` if the root cannot pay what `limits` are worth and `ahead`
+    /// bytes besides, for the pages its launch will map (the coordinating session's ruling (d)),
+    /// or if that overflows; and then no ID is drawn and nothing is allocated. `NO_MEMORY`
+    /// without the memory for its objects, with the payment given back.
+    fn with_origin(
+        limits: Limits,
+        origin: CallOrigin,
+        principal: u64,
+        ahead: u64,
+    ) -> Result<Self, Error> {
+        let figure = costs()
+            .and_then(|costs| limits.figure(&costs))
+            .ok_or(Error::Limit)?;
+        let paid = ROOT.pay(figure.checked_add(ahead).ok_or(Error::Limit)?)?;
+        // On any failure below, `paid` is dropped where it then is, and the root is whole again.
+        let space = UserSpace::new().ok_or(Error::NoMemory)?;
+        let space = ObjectRef::try_new(space).map_err(|_| Error::NoMemory)?;
+        let account = ObjectRef::try_new(Account {
+            channels: Count::new(limits.channels),
+            queued_bytes: AtomicUsize::new(0),
+            max_queued_bytes: limits.message_bytes,
+            committed: AtomicUsize::new(0),
+            max_committed: limits.memory.committed,
+            objects: ObjectCounts::new(limits.objects),
+            paid,
+            figure,
+            ahead: AtomicU64::new(ahead),
+            launch_pages: AtomicU64::new(0),
+        })
+        .map_err(|_| Error::NoMemory)?;
+        Ok(Self {
             id: NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed),
             principal,
-            space: SpinLock::new(Some(ObjectRef::try_new(UserSpace::new()?).ok()?)),
+            space: SpinLock::new(Some(space)),
             handles: SpinLock::new(HandleTable::new(limits.handles)),
-            account: ObjectRef::try_new(Account {
-                channels: Count::new(limits.channels),
-                queued_bytes: AtomicUsize::new(0),
-                max_queued_bytes: limits.message_bytes,
-                committed: AtomicUsize::new(0),
-                max_committed: limits.memory.committed,
-                objects: ObjectCounts::new(limits.objects),
-            })
-            .ok()?,
+            account,
             mappings: SpinLock::new(Mappings::new(limits.memory.mappings)),
+            unmapped: SpinLock::new(Vec::new()),
             changes: SpinLock::new(Budget::new(limits.memory.changes)),
             origin,
             debug_calls: limits.debug_calls,
+            threads: limits.threads,
             lifecycle: SpinLock::new(Lifecycle {
                 running: 0,
                 unreaped: 0,
@@ -429,8 +609,28 @@ impl Process {
     /// creator's principal, as [`proof_child_of`](Self::proof_child_of) says for a proof process. Until `origin.core` is mapped
     /// into it ([`map_core`](Self::map_core)) none of its calls would be accepted, and it has
     /// no thread to make one.
-    pub(crate) fn pinned_child_of(creator: &Self, limits: Limits) -> Option<Self> {
-        Self::with_origin(limits, CallOrigin::Core { base: None }, creator.principal)
+    ///
+    /// The root pays its figure and `ahead` bytes besides, for the pages its launch will map
+    /// (G5; the coordinating session's ruling (d)). `LIMIT` if it cannot, and then nothing is
+    /// made; `NO_MEMORY` without the memory for its objects.
+    pub(crate) fn pinned_child_of(
+        creator: &Self,
+        limits: Limits,
+        ahead: u64,
+    ) -> Result<Self, Error> {
+        Self::with_origin(
+            limits,
+            CallOrigin::Core { base: None },
+            creator.principal,
+            ahead,
+        )
+    }
+
+    /// Gives back to the root what was paid ahead for pages its launch did not map: once its
+    /// start record is written, nothing more is mapped for it (`launch::start`).
+    pub(crate) fn settle_launch(&self) {
+        let left = self.account.ahead.swap(0, Ordering::AcqRel);
+        self.account.paid.give_back(left);
     }
 
     /// This process's ID.
@@ -465,15 +665,29 @@ impl Process {
     /// Maps the user page `virt` to a fresh zeroed frame this process owns, and returns it.
     /// Only inside the user half (ADR-0004 H1). Before the process has threads, while its
     /// creator holds the only reference to the address space. [`ChangeError::Limit`] when the
-    /// page needs one more page table than the space may have (`UserSpace::map_page`).
+    /// page needs one more page table than the space may have (`UserSpace::map_page`), and when
+    /// the root cannot pay for the page.
+    ///
+    /// The page is the creator's spending for its child, paid out of the root (G5; the
+    /// coordinating session's ruling (d)): out of what its launch paid ahead, or out of the root
+    /// now. A page that is not mapped after all is not paid for.
     pub(crate) fn map_page(&mut self, virt: u64, access: Access) -> Result<UserFrame, ChangeError> {
-        without_interrupts(|| {
+        let bytes = costs().ok_or(ChangeError::Limit)?.page;
+        let ahead = self
+            .account
+            .pay_page(bytes)
+            .map_err(|_| ChangeError::Limit)?;
+        let mapped = without_interrupts(|| {
             let mut space = self.space.lock();
             let unique = space.as_mut().and_then(ObjectRef::get_mut);
             unique.map_or(Err(ChangeError::Map(MapError::OutOfMemory)), |space| {
                 space.map_page(virt, access)
             })
-        })
+        });
+        if mapped.is_err() {
+            self.account.unpay_page(bytes, ahead);
+        }
+        mapped
     }
 
     /// Copies `bytes` to `offset` bytes into the frame `frame` (from [`Process::map_page`]).
@@ -520,14 +734,39 @@ impl Process {
     /// free pages of the user half; `NO_MEMORY` if `origin.core` is not installed or the tables
     /// cannot be made; `LIMIT` at the bound on a space's page tables. Nothing is mapped and no
     /// base is recorded on any of them.
+    ///
+    /// Its pages' records are paid for as [`map_page`](Self::map_page) pays for a page, at
+    /// [`Costs::shared_page`] each, since their frames are shared: `LIMIT` if the root cannot.
     pub(crate) fn map_core(&mut self, base: u64) -> Result<(), Error> {
         let mapped = self.origin.mapped_at(base).ok_or(Error::InvalidArgs)?;
         let space = self.memory().ok_or(Error::InvalidArgs)?;
-        crate::core_image::map_into(&space, base).map_err(|e| match e {
-            ChangeError::Limit => Error::Limit,
-            ChangeError::Map(MapError::OutOfMemory) => Error::NoMemory,
-            _ => Error::InvalidArgs,
-        })?;
+        let each = costs().ok_or(Error::Limit)?.shared_page;
+        let pages = crate::core_image::image().span / crate::paging::PAGE;
+        let mut paid = Vec::new();
+        paid.try_reserve_exact(pages as usize)
+            .map_err(|_| Error::NoMemory)?;
+        let give_back = |paid: &[bool]| {
+            for &ahead in paid {
+                self.account.unpay_page(each, ahead);
+            }
+        };
+        for _ in 0..pages {
+            match self.account.pay_page(each) {
+                Ok(ahead) => paid.push(ahead),
+                Err(e) => {
+                    give_back(&paid);
+                    return Err(e);
+                }
+            }
+        }
+        if let Err(e) = crate::core_image::map_into(&space, base) {
+            give_back(&paid);
+            return Err(match e {
+                ChangeError::Limit => Error::Limit,
+                ChangeError::Map(MapError::OutOfMemory) => Error::NoMemory,
+                _ => Error::InvalidArgs,
+            });
+        }
         self.origin = mapped;
         Ok(())
     }
@@ -615,9 +854,12 @@ impl Process {
         // finds itself counted. While it is counted the process cannot end, and its last reaping
         // cannot raise `TERMINATED`, so the reference to the address space taken below is always
         // given up first: by the reaper, or here before `start_failed`.
+        //
+        // A start past the process's `threads` is refused here too, before anything is taken
+        // (G5): its figure paid for that many kernel stacks and FPU areas, no more.
         without_interrupts(|| {
             let mut life = process.lifecycle.lock();
-            if life.ended {
+            if !crate::quota::may_start(life.ended, life.unreaped as usize, process.threads) {
                 return Err(QueueError::Full);
             }
             life.running += 1;
@@ -674,6 +916,7 @@ impl Process {
             self.close_out(ending);
         }
         if done {
+            self.release_unmapped();
             self.termination.raise();
         }
     }
@@ -707,10 +950,13 @@ impl Process {
         // The bindings it made are cancelled before its handles close (F11).
         ipc::close_table(table, self.id);
         ipc::reap_closed();
-        // Its mappings' objects go with it, and no more can be made (P11): before it counts as
-        // ended, so whoever sees the ending sees their charges back.
+        // No more mappings can be made (P11). Their objects are kept until the address space has
+        // gone, in the last reap: their frames stay mapped in it until then, so their creators
+        // are repaid only once nothing can reach those frames, and before `TERMINATED`, so that
+        // whoever sees it sees the charges back (the independent review of task S4-3, finding
+        // B2).
         let objects = without_interrupts(|| self.mappings.lock().close());
-        drop(objects);
+        without_interrupts(|| *self.unmapped.lock() = objects);
         // "Ended" means its handles are closed and its peers can see that. (Ends that were only
         // reachable through an undelivered message another processor is reaping this instant
         // close a moment later: they are delayed, never lost.)
@@ -740,7 +986,18 @@ impl Process {
             life.ended && life.unreaped == 0
         });
         if done {
+            self.release_unmapped();
             self.termination.raise();
         }
+    }
+
+    /// The last thread has been reaped, and with it the last reference to the address space a
+    /// thread held: the objects its mappings held go now, and their creators are repaid, before
+    /// `TERMINATED` is raised (P11's order: handles, memory, signal). A kernel helper that took
+    /// a reference of its own to the space ([`Process::memory`]) is the kernel's own use, as the
+    /// module notes say.
+    fn release_unmapped(&self) {
+        let objects = without_interrupts(|| core::mem::take(&mut *self.unmapped.lock()));
+        drop(objects);
     }
 }

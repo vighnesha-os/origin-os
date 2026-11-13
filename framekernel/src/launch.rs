@@ -12,6 +12,11 @@
 //! A launch that fails after the child holds anything closes the child's table: the child's
 //! handle to itself would otherwise keep a process that never ran alive for ever.
 //!
+//! The creator pays for its child out of its own before the child is made (ADR-0005 G5; task
+//! S4-3): in step 4 the creator is the kernel, and its own is the root. The payment is the
+//! figure of the child's limits and the pages the launch maps for it, its image, its stack and
+//! its start record; it comes back when the child's account goes.
+//!
 //! A program the kernel carries in its image (ADR-0011 Amendment 2, L1 to L3 and L7; tasks S4-1
 //! and S4-2) is launched in two steps around those two. [`load_program`] makes the child pinned
 //! per call (ADR-0005 B2): it maps `origin.core` into it at a random place, read-execute, on the
@@ -152,7 +157,10 @@ pub(crate) fn start(
 ) -> Result<Launched, Error> {
     let process = ObjectRef::try_new(child).map_err(|_| Error::NoMemory)?;
     let thread = ObjectRef::try_new(ThreadObject::new()).map_err(|_| Error::NoMemory)?;
+    // Once the record is written nothing more is mapped for the child: what was paid ahead for
+    // pages it did not use goes back to the root (G5; ruling (d)).
     match hand_over(&process, &thread, &placed, given)
+        .inspect(|()| process.settle_launch())
         .and_then(|()| started(&process, &thread, &placed, cpu, entry, stack_top))
     {
         Ok(()) => Ok(Launched {
@@ -304,8 +312,12 @@ fn random() -> Result<u64, Error> {
 /// read-execute for code, read-only for read-only data and for RELRO once its relocations and
 /// its imports are in (L3), read-write and never executable for data.
 ///
+/// The root pays for the child before it is made (ADR-0005 G5): its limits' figure, and the pages
+/// this launch maps for it ([`launch_ahead`]).
+///
 /// `INVALID_ARGS`, before anything is made, for a description that breaks [`program::check`]'s
-/// rules or a stack of no pages or of more than [`program::MAX_STACK_PAGES`]; `NOT_SUPPORTED`
+/// rules or a stack of no pages or of more than [`program::MAX_STACK_PAGES`]; `LIMIT`, with
+/// nothing made, if the root cannot pay for the child in full; `NOT_SUPPORTED`
 /// without a random-number generator; `NO_MEMORY` without frames, or if `origin.core` was never
 /// written into its frames; `LIMIT` if no free place is found, or when the image and stack need
 /// more page tables than one space may have. That last is found part-way through mapping, not
@@ -323,7 +335,8 @@ pub(crate) fn load_program(
     if run.stack_pages == 0 || run.stack_pages > program::MAX_STACK_PAGES {
         return Err(Error::InvalidArgs);
     }
-    let mut child = Process::pinned_child_of(creator, run.limits).ok_or(Error::NoMemory)?;
+    let ahead = launch_ahead(program, run).ok_or(Error::Limit)?;
+    let mut child = Process::pinned_child_of(creator, run.limits, ahead)?;
     let core = place_core(&mut child, image.span / PAGE)?;
     let base = place_image(&mut child, program, CoreAt { base: core, image })?;
     let (stack, stack_top) = place_stack(&mut child, run.stack_pages)?;
@@ -335,6 +348,30 @@ pub(crate) fn load_program(
         stack,
         stack_top,
     })
+}
+
+/// What the root pays ahead, besides the figure of `run`'s limits, for the pages a launch of
+/// `program` maps for its child (G5; the coordinating session's ruling (d)): `origin.core`'s
+/// pages at their share of the page records, and on frames of the child's own the program's
+/// pages, its stack and its start record at the largest a record can be. What the record does
+/// not use goes back once it is written ([`start`]). `None` on overflow.
+pub(crate) fn launch_ahead(program: &Carried, run: &ProgramLimits) -> Option<u64> {
+    let costs = crate::process::costs()?;
+    let core = core_image::image().span / PAGE;
+    let image = program.segments.iter().try_fold(0u64, |pages, segment| {
+        pages.checked_add(segment.size / PAGE)
+    })?;
+    let record = (start::MAX_SIZE as u64).div_ceil(PAGE);
+    let own = image.checked_add(run.stack_pages)?.checked_add(record)?;
+    own.checked_mul(costs.page)?
+        .checked_add(core.checked_mul(costs.shared_page)?)
+}
+
+/// What a launch of `program` under `run` takes out of the root before its child is made: the
+/// figure of its limits and [`launch_ahead`]. `None` on overflow.
+pub(crate) fn launch_payment(program: &Carried, run: &ProgramLimits) -> Option<u64> {
+    let figure = run.limits.figure(&crate::process::costs()?)?;
+    figure.checked_add(launch_ahead(program, run)?)
 }
 
 /// Maps `origin.core`, `pages` pages of it, into `child` at a random place in the programs'

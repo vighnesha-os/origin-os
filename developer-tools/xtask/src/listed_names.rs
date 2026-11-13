@@ -66,6 +66,10 @@ const PROOF_PROCESS_FILES: &[(&str, &str)] = &[
         "framekernel/src/program_proof.rs",
         "the creator of the first program's launches, which never runs",
     ),
+    (
+        "framekernel/src/ipc_proof/kernel_bound.rs",
+        "the kernel-wide bound's creator and holder, which never run, and a process made only to be paid for and dropped",
+    ),
 ];
 
 /// The kernel files that may name `write_frame`, the framework's raw write into a page, and why.

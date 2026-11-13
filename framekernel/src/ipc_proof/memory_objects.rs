@@ -1161,7 +1161,10 @@ fn parts(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, tsc_hz: u64) -> b
 
     // Every call of Q's is about its quota.
     let quota = q.statuses() && q.exited();
-    // Its objects went with its handles and mappings, and their charge with them.
+    // Its objects went with its handles and mappings, and their charge with them: by
+    // `TERMINATED`, since what its mappings held goes with its address space, at the last reap
+    // (task S4-3, the independent review's finding B2).
+    sched::yield_until(|| q.process.termination().raised(), tsc_hz, 5);
     let owes_nothing = q.process.account.committed() == 0;
     let _ = writeln!(
         com1,

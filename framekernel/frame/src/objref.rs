@@ -27,6 +27,13 @@ unsafe impl<T: Send + Sync> Send for ObjectRef<T> {}
 unsafe impl<T: Send + Sync> Sync for ObjectRef<T> {}
 
 impl<T> ObjectRef<T> {
+    /// The size and alignment of the one allocation [`ObjectRef::try_new`] makes for a `T`: the
+    /// object with its count. The kernel-wide bound counts each object by it (ADR-0005 G5).
+    pub const ALLOCATION: (usize, usize) = (
+        core::mem::size_of::<Counted<T>>(),
+        core::mem::align_of::<Counted<T>>(),
+    );
+
     /// A new object, or the value back if the kernel heap has no room.
     pub fn try_new(value: T) -> Result<Self, T> {
         let layout = Layout::new::<Counted<T>>();

@@ -348,6 +348,9 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         // `origin.core` into its one set of frames, before any process exists (ADR-0011
         // Amendment 2, L2; task S4-2).
         install_origin_core(&mut com1);
+        // The kernel's root, out of which every process is paid for (ADR-0005 G5; task S4-3):
+        // sized once, from the frames free now, before the first process exists.
+        size_root(&mut com1);
         // M3, second step: preemptive kernel threads on every online processor. Its proofs
         // run to the end and are judged together (ADR-0013 R4): the proofs after a failure
         // use only the kernel's fixed programs, and the operator sees every result.
@@ -1647,6 +1650,32 @@ fn install_origin_core(com1: &mut Console) {
         Err(e) => writeln!(
             com1,
             "origin-kernel: origin.core could not be written into its frames ({e:?}): origin.core failed"
+        ),
+    };
+}
+
+/// Sizes the kernel's root once, from the bytes the free frames hold now, less the kernel's
+/// reserve (ADR-0005 G5; `process::size_root`), prints both, and shows that a second sizing is
+/// refused and changes nothing. Until it is sized the root pays for nothing, so a process made
+/// before this is refused; the boot proofs' processes all come after it.
+fn size_root(com1: &mut Console) {
+    let free = memory::stats().map_or(0, |(_, frames)| frames.saturating_mul(memory::FRAME));
+    let _ = match crate::process::size_root(free) {
+        Some((root, reserve)) => {
+            let again = crate::process::size_root(free.saturating_mul(2)).is_none()
+                && crate::process::ROOT.size() == root
+                && crate::process::ROOT.left() == root;
+            writeln!(
+                com1,
+                "origin-kernel: kernel bound: the root holds {} KiB: {} KiB of free frames less a reserve of {} KiB kept for the kernel's own use; a second sizing is refused and changes nothing: {again}",
+                root >> 10,
+                free >> 10,
+                reserve >> 10,
+            )
+        }
+        None => writeln!(
+            com1,
+            "origin-kernel: kernel bound: the root was sized before the boot sized it: kernel bound failed"
         ),
     };
 }

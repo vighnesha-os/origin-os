@@ -55,6 +55,8 @@ const LIMITS: Limits = Limits {
     debug_calls: true,
     memory: MemoryLimits::NONE,
     objects: ObjectLimits::NONE,
+    // Each process here runs one thread (ADR-0005 G5, G6).
+    threads: 1,
 };
 
 /// `mov edi, value; mov eax, DEBUG_REPORT; syscall`.

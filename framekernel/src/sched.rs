@@ -32,7 +32,7 @@ use origin_frame::sync::SpinLock;
 use origin_frame::trap::Switch;
 
 /// Each kernel thread's stack.
-const THREAD_STACK: usize = 16 * 1024;
+pub(crate) const THREAD_STACK: usize = 16 * 1024;
 
 static QUEUES: [SpinLock<RunQueue>; MAX_CPUS] =
     [const { SpinLock::new(RunQueue::new()) }; MAX_CPUS];
@@ -1234,6 +1234,12 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         heap_before.unwrap_or(0) >> 10,
         stacks(),
         if reaped { "" } else { ": scheduler failed" }
+    );
+    // The kernel-wide bound (ADR-0005 G5; task S4-3), after every proof that makes a process, so
+    // that its root can be seen whole again.
+    proofs.record(
+        Proof::KernelBound,
+        crate::ipc_proof::prove_kernel_bound(com1, cpus, bsp, tsc_hz),
     );
 }
 
