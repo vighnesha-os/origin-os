@@ -948,6 +948,7 @@ On 2026-11-13 you wrote: "Updated Rust language to latest available version 1.10
   - §82, M0: "Pin Rust 1.100.0, validate cross-compilation, ...";
   - §84: "2. Check Rust 1.100.0 availability.";
   - the first final rule: "1. Rust 1.100.0 stable is the mandatory compiler baseline." (it said "the initial mandatory compiler baseline").
+- **Outside CLAUDE.md, one accepted specification states the pin.** The header of `docs/spec/ONBF.md` has a "Toolchain" line; it now names Rust 1.100.0 and says when it changed. No rule of the format changes. Three ADRs name Rust 1.99.1 in dated statements of what was checked, or not measured, on a past day (ADR-0017 Z10, ADR-0016, ADR-0011 Amendment 3); those stay, and ADR-0017 Amendment 2 carries what was seen under 1.100.0.
 - **What 7.8 leaves as it was.** §10's heading and its first sentence still name Rust 1.99.1: they say which compiler fixed the three regressions the tests cover, which is a fact about that release, and the tests stay and are run under 1.100.0. §15 is unchanged: the named check of the kernel's hardening option is ADR-0017 Amendment 2's (item 280) and a heading of its own in `verify.sh`. No statement is added or removed, so the matrix keeps its rows and only their quotes change.
 
 ### The option behind the INT3 after every RET is to become an error in the compiler (items 280 and 281): Accepted 2026-11-13
