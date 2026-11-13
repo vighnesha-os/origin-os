@@ -44,6 +44,16 @@ What the specification leaves to software: when the maps are made, what to do wi
 - `acpi_build` appends the tables given with `-acpitable` **after** every table it builds, the DMAR and IVRS included. `firmware::acpi_table` takes the first valid table of a signature. So a DMAR or IVRS given with `-acpitable` is never the one the kernel reads, and a plain QEMU command line cannot carry reserved regions to the kernel.
 - So the proof needs a firmware-stage step: a test-only UEFI application that runs before Origin's loader. It replaces QEMU's DMAR or IVRS with a copy that carries the regions (in pages the memory map then reports as reserved), and starts the unchanged loader. The OS then meets the table exactly where firmware puts it: the XSDT, in ACPI memory, with its ranges reserved in the memory map. The proposal to the coordinating session names the alternative (the same step as a test-only loader feature).
 - The 512 MiB QEMU machine has no RAM in [1 GiB, 2 GiB), so no region there can be both reserved and real memory: the IOVA window's skipping of identity-mapped pages is host-tested only.
+- **Observed, 2026-11-13** (at the coordinating session's request, so that no one checking later needs QEMU's source). A host-only script, kept outside the repository, booted QEMU 11.1.3 with the boot test's machine and Homebrew's `edk2-x86_64-code.fd`, and an empty ESP, so OVMF stops in its shell with its tables installed. It saved the guest's 512 MiB through QEMU's monitor (`pmemsave`), found the one valid RSDP (revision 2, both checksums), and walked the XSDT. The RSDP was at `0x1fb7e014`, where the kernel's own boot line finds it. What it showed:
+
+  | Machine | XSDT, in order | The IOMMU table |
+  |---|---|---|
+  | VT-d | FACP, APIC, HPET, SRAT, SLIT, MCFG, **DMAR**, WAET, BGRT | 128 bytes, one DRHD, **no RMRR** |
+  | VT-d with `-acpitable file=` a copy of that DMAR (OEM table ID changed) | the same, then the copy as entry 8, after WAET, then BGRT | QEMU's DMAR is entry 6, before the copy |
+  | AMD-Vi | FACP, APIC, HPET, SRAT, SLIT, MCFG, **IVRS**, WAET, BGRT | 192 bytes, IVHD types 10h and 11h, **no IVMD** |
+  | AMD-Vi with `-acpitable file=` a copy of that IVRS | the same, then the copy as entry 8 | QEMU's IVRS is entry 6, before the copy |
+
+  So a table given with `-acpitable` comes after QEMU's own, and the first valid table of a signature, the one `firmware::acpi_table` takes, is always QEMU's. These observations, not the reading of `hw/i386/acpi-build.c`, are now this section's source for both facts.
 
 ## 5. Questions put to the coordinating session (2026-11-12)
 

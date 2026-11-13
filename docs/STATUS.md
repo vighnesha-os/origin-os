@@ -173,6 +173,13 @@ AI reviewers read the tree by area and then re-read the fixes: no human has revi
   - The NIC's domain maps a page only if the firmware names it for the NIC too.
   - A range in RAM and one in the interrupt range are refused.
   - Under AMD-Vi, a read-only range takes the controller's read and blocks its write, with the fault recorded.
+- After its independent review (2026-11-13; `docs/engineering/REVIEW_T40_2026-11-13.md`):
+  - A writable range over a firmware table the kernel holds as a reference is refused. Shown at boot by a range over the table copy itself.
+  - The proof writes only into pages the test-only step filled, so on a real machine it never writes memory the firmware keeps; a page without the fill is shown untouched.
+  - Another domain must reach a page at no address at all; each page's access is checked against the firmware's own bits a second way.
+  - A device's ranges are bounded at 4 GiB in all; a BAR inside an identity range is refused.
+  - A never-map type-20h IVMD keeps its pages from every device on every IOMMU (decision item 291).
+  - Boot info 0.7 (decision item 293): only UEFI type 0 is `Reserved`; unaccepted memory and firmware memory of other types have kinds of their own, never accepted under an RMRR or IVMD. Host-tested; no QEMU firmware gives either type.
 - Not shown: devices with no driver (USB legacy emulation, an integrated GPU's scan-out), whose bus mastering I12 clears; a reserved range inside the IOVA window (none fits the 512 MiB machine; host-tested); anything on a physical machine. The five shapes the ADR left open (R1–R5) were accepted by the owner on 2026-11-13 as recommended, as decision items 247 to 251 (ADR-0007 Amendment 1), and the code follows them.
 
 Not yet: a mounted/writable filesystem; scalable mode; I/O APIC pins under AMD-Vi (an interrupt table for the I/O APIC's DeviceID; until then they stay masked there); a live level-triggered I/O APIC pin (PCI INTx) and the keyboard IRQ1 handler |
