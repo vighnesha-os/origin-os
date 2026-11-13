@@ -3223,6 +3223,15 @@ fn run_step(cmd: &mut Command) -> Result {
 // ------------------------------------------------------------------ check
 
 fn check() -> Result {
+    // The compiler first, by the commit it reports, before any host gate runs. Cargo's
+    // `rust-version` is a floor: it refuses an older compiler and lets a newer one through, and
+    // until now the commit was first asked for at the first image build (TASKS item 52's
+    // review, finding 10).
+    let compiler = toolchain::toolchain()?;
+    println!(
+        "xtask: check: rustc reports the pinned commit {}",
+        compiler.commit
+    );
     let steps: &[&[&str]] = &[
         &["fmt", "--all", "--", "--check"],
         &[
