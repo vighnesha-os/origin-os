@@ -458,6 +458,8 @@ fn reserved_regions(amd: bool) -> Vec<origin_test_reserved_memory::Region> {
             ivmd(0x21, 0b0111, Placement::ReservedOther, NVME, 0),
             // A writable range over the IVRS copy itself, which the kernel holds (M1).
             ivmd(0x21, 0b0111, Placement::Table, ABSENT_DEVICE, 0),
+            // Never mapped for any device of any IOMMU (ADR-0007 Amendment 2, R6).
+            ivmd(0x20, 0b0000, Placement::Reserved, 0, 0),
         ]
     } else {
         vec![
@@ -1174,6 +1176,8 @@ fn reserved_markers(scenario: &mut Scenario, amd: bool) {
             "(reserved pages without the test fill) for DeviceID 0x0010",
             "origin-test-reserved: IVMD type 0x21 flags 0b0111 0x",
             "(the table's own pages) for DeviceID 0x00fe",
+            "origin-test-reserved: IVMD type 0x20 flags 0b0000 0x",
+            "(reserved pages) for DeviceID 0x0000",
             "origin-test-reserved: the XSDT now names IVRS at 0x",
             "origin-test-reserved: starting the loader",
         ]
@@ -1203,7 +1207,7 @@ fn reserved_markers(scenario: &mut Scenario, amd: bool) {
         "): refused (it is writable and overlaps the firmware table the kernel holds at 0x";
     let (after, kernel): (&str, Vec<String>) = if amd {
         (
-            "origin-kernel: IOMMU: IVRS revision 1, IVinfo 0x2801 (EFR support true, 40-bit physical and 0-bit virtual addresses, pre-boot DMA protection false); 1 IOMMU(s) in 2 IVHD(s), 7 memory definition(s)",
+            "origin-kernel: IOMMU: IVRS revision 1, IVinfo 0x2801 (EFR support true, 40-bit physical and 0-bit virtual addresses, pre-boot DMA protection false); 1 IOMMU(s) in 2 IVHD(s), 8 memory definition(s)",
             vec![
                 "origin-kernel: IOMMU: reserved memory 0x".into(),
                 ", flags 0b0111; for DeviceID 0x0010 (00:02.0) in segment 0): identity-mapped, read and write, ".into(),
@@ -1221,6 +1225,9 @@ fn reserved_markers(scenario: &mut Scenario, amd: bool) {
                 ", flags 0b0111; for DeviceID 0x0010 (00:02.0) in segment 0): identity-mapped, read and write, ".into(),
                 "origin-kernel: IOMMU: reserved memory 0x".into(),
                 format!(", flags 0b0111; for DeviceID 0x00fe (00:1f.6) in segment 0{refused_lent}"),
+                "origin-kernel: IOMMU: reserved memory 0x".into(),
+                " (IVMD type 0x20 at offset 0x".into(),
+                ", flags 0b0000; every device in the system, on every IOMMU): never mapped for the devices it names".into(),
             ],
         )
     } else {

@@ -607,6 +607,12 @@ impl MemoryRange {
         self.flags & 8 != 0
     }
 
+    /// Whether the range must never be mapped (IR and IW clear, not an exclusion range, with
+    /// or without Unity: R4, and the review's I2).
+    pub fn never_mapped(&self) -> bool {
+        !self.read() && !self.write() && !self.exclusion()
+    }
+
     /// Whether the range applies to DeviceID `id` of `segment`.
     pub fn covers(&self, segment: u16, id: u16) -> bool {
         match self.kind {
@@ -748,11 +754,13 @@ impl<'a> Ivrs<'a> {
 
     /// The memory ranges that apply to a device of `segment` whose own DeviceID is `id` and
     /// whose requests carry `requester` (its alias, or `id` itself), on the IOMMU whose
-    /// registers are at `unit_base` (research ledger 2026-11-12, R5). An IVMD for every
-    /// peripheral (20h) applies to the devices of the IOMMU described just before it (48882
-    /// §5.2.2). One for a DeviceID (21h) or a range (22h) applies by its own segment and
-    /// DeviceID, whichever IOMMU translates the device, and whether it names the device's own
-    /// DeviceID or the one its requests carry.
+    /// registers are at `unit_base` (ADR-0007 Amendment 1, R5, and Amendment 2, R6). An IVMD
+    /// for every peripheral (20h) that gives an identity map applies to the devices of the
+    /// IOMMU described just before it (48882 §5.2.2); one that keeps its range out of every
+    /// device's address space (IR and IW clear, no exclusion) applies to every device in the
+    /// system, on every IOMMU (§5.2.2.2; decision item 291). One for a DeviceID (21h) or a range
+    /// (22h) applies by its own segment and DeviceID, whichever IOMMU translates the device, and
+    /// whether it names the device's own DeviceID or the one its requests carry.
     pub fn memory_for(
         &self,
         unit_base: u64,
@@ -761,7 +769,9 @@ impl<'a> Ivrs<'a> {
         requester: u16,
     ) -> impl Iterator<Item = MemoryRange> + 'a {
         self.memory().filter(move |m| match m.kind {
-            kind::IVMD_ALL => m.unit_base == unit_base && m.unit_segment == segment,
+            kind::IVMD_ALL => {
+                m.never_mapped() || (m.unit_base == unit_base && m.unit_segment == segment)
+            }
             _ => m.covers(segment, id) || m.covers(segment, requester),
         })
     }
@@ -1351,6 +1361,60 @@ mod tests {
             .map(|m| m.start)
             .collect();
         assert_eq!(starts, alloc::vec![0x7E00_0000]);
+    }
+
+    #[test]
+    fn a_never_map_range_for_every_peripheral_applies_on_every_iommu() {
+        let unit = |base, bus, dev| {
+            ivhd(
+                kind::IVHD,
+                0,
+                device_id(bus, 0, 2),
+                0x40,
+                base,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &[e4(entry::SELECT, device_id(bus, dev, 0), 0)],
+            )
+        };
+        let (a, b) = (unit(0xFEB8_0000, 0, 3), unit(0xFEC0_0000, 0x80, 1));
+        // After A: an identity 20h (R5: A's devices only) and a never-map 20h (R6: everyone's),
+        // with Unity set as well as without it.
+        let identity = ivmd(kind::IVMD_ALL, 0b0011, 0, 0, 0, 0x7E00_0000, 0x1000);
+        let never = ivmd(kind::IVMD_ALL, 0b0000, 0, 0, 0, 0x7F00_0000, 0x1000);
+        let never_unity = ivmd(kind::IVMD_ALL, 0b0001, 0, 0, 0, 0x7F10_0000, 0x1000);
+        // An exclusion range with IR = IW = 0 is an identity map (R4), so it keeps R5.
+        let exclusion = ivmd(kind::IVMD_ALL, 0b1000, 0, 0, 0, 0x7F20_0000, 0x1000);
+        let t = table(
+            1,
+            info::EFR_SUPPORTED,
+            &[a, identity, never, never_unity, exclusion, b],
+        );
+        let r = parse(&t).unwrap();
+        let on_a = device_id(0, 3, 0);
+        let starts: Vec<u64> = r
+            .memory_for(0xFEB8_0000, 0, on_a, on_a)
+            .map(|m| m.start)
+            .collect();
+        assert_eq!(
+            starts,
+            alloc::vec![0x7E00_0000, 0x7F00_0000, 0x7F10_0000, 0x7F20_0000]
+        );
+        let on_b = device_id(0x80, 1, 0);
+        let starts: Vec<u64> = r
+            .memory_for(0xFEC0_0000, 0, on_b, on_b)
+            .map(|m| m.start)
+            .collect();
+        assert_eq!(starts, alloc::vec![0x7F00_0000, 0x7F10_0000]);
+        // And on an IOMMU of another segment too: "every device, on every IOMMU".
+        let starts: Vec<u64> = r
+            .memory_for(0xFED0_0000, 1, on_b, on_b)
+            .map(|m| m.start)
+            .collect();
+        assert_eq!(starts, alloc::vec![0x7F00_0000, 0x7F10_0000]);
     }
 
     #[test]

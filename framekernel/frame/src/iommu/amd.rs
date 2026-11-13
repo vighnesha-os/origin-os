@@ -679,6 +679,11 @@ pub(super) fn init(
     super::note_writable(&mut reserved);
     for (r, m) in reserved.iter().zip(ivrs.memory()) {
         let devices = match m.kind {
+            // A never-map range for every peripheral keeps its pages from every device, on
+            // every IOMMU (ADR-0007 Amendment 2, R6).
+            ivrs::kind::IVMD_ALL if m.never_mapped() => {
+                alloc::string::String::from("every device in the system, on every IOMMU")
+            }
             ivrs::kind::IVMD_ALL => {
                 alloc::format!("every device of the IOMMU at {:#x}", m.unit_base)
             }
