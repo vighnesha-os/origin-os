@@ -2,6 +2,7 @@
 //! looks like, and each way it can be wrong.
 
 use std::fmt::Write as _;
+use std::path::PathBuf;
 
 use super::*;
 
@@ -754,4 +755,268 @@ fn every_excepted_proof_program_is_one_the_kernel_carries() {
             .iter()
             .any(|(package, ..)| *package == "first-program")
     );
+}
+
+// ------------------------------------------------------------------ a really linked image
+
+/// Where one really linked `origin.core` and its description are.
+struct Linked {
+    dir: PathBuf,
+    image: PathBuf,
+    description: PathBuf,
+    code: PathBuf,
+}
+
+impl Drop for Linked {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The `-C` flags of `.cargo/userspace.toml`, in order: every quoted string after a `"-C",`.
+fn userspace_flags() -> Vec<String> {
+    let text =
+        String::from_utf8(read_file(&repo_root().join(".cargo/userspace.toml")).unwrap()).unwrap();
+    let flags: Vec<String> = text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("\"-C\", \""))
+        .map(|rest| rest.trim_end_matches(['"', ',']).to_string())
+        .collect();
+    assert!(flags.iter().any(|f| f == "panic=abort"), "{flags:?}");
+    flags
+}
+
+/// Generates the stubs of the real definition, lets `plant` change the file of stubs, compiles
+/// and links `runtime/core` over them with the pinned compiler, its linker and the userspace
+/// flags, and describes the image as the build does (`onbf-pack corelib`). So the files the
+/// gate then reads are a compiler's and a linker's, not a listing laid out by hand.
+///
+/// `None` if the description refuses the image: then the build stops before the gate.
+fn really_linked(name: &str, plant: impl FnOnce(&str) -> String) -> Option<Linked> {
+    let root = repo_root();
+    let read = |path: &str| String::from_utf8(read_file(&root.join(path)).unwrap()).unwrap();
+    let inputs = [oidl::Input {
+        file: DEFINITION.to_string(),
+        text: read(DEFINITION).into_bytes(),
+    }];
+    let compilation = oidl::compile(&inputs, Some(&read(VERSIONS))).expect("it compiles");
+    let dir = crate::target_dir()
+        .join("xtask")
+        .join("corestubs-tests")
+        .join(format!("{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let stubs_file = "core/origin_kernel/kernel.rs";
+    let mut exports = None;
+    let mut plant = Some(plant);
+    for file in oidl::codegen::generate(&compilation) {
+        let Some(relative) = file.path.strip_prefix("core/") else {
+            continue;
+        };
+        let text = match plant.take_if(|_| file.path == stubs_file) {
+            Some(plant) => plant(&file.text),
+            None => file.text,
+        };
+        if relative.ends_with(".exports") {
+            exports = Some(text.clone());
+        }
+        let to = dir.join("stubs").join(relative);
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::write(&to, text).unwrap();
+    }
+    assert!(plant.is_none(), "the generator wrote no {stubs_file}");
+    let image = dir.join("liborigin_core.so");
+    let toolchain = crate::toolchain::toolchain().expect("the pinned toolchain");
+    let mut rustc = Command::new(toolchain.sysroot.join("bin").join("rustc"));
+    rustc
+        .current_dir(&dir)
+        .env("ORIGIN_CORE_STUBS", dir.join("stubs"))
+        .args(["--edition", "2024", "--crate-type", "cdylib"])
+        .args([
+            "--crate-name",
+            "origin_core",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+        ])
+        .args(["-C", "opt-level=3"]);
+    for flag in userspace_flags() {
+        rustc.arg("-C").arg(flag);
+    }
+    let out = rustc
+        .args(["-C", "link-arg=--soname=origin.core", "-o"])
+        .arg(&image)
+        .arg(root.join("runtime/core/src/lib.rs"))
+        .output()
+        .expect("rustc runs");
+    assert!(
+        out.status.success(),
+        "rustc failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listing = onbf_pack::corelib::Listing::parse(&exports.expect("a list of exports"))
+        .expect("the list reads");
+    let described = onbf_pack::corelib::describe(&fs::read(&image).unwrap(), &listing).ok()?;
+    let files = described
+        .rust("ORIGIN_CARRIED_PROGRAMS")
+        .expect("a description");
+    let carried = dir.join("carried");
+    fs::create_dir_all(&carried).unwrap();
+    for (file, bytes) in &files {
+        fs::write(carried.join(file), bytes).unwrap();
+    }
+    Some(Linked {
+        image,
+        description: carried.join(format!("{}.rs", ring3::CORE_NAME)),
+        code: carried.join(format!("{}.0.bin", ring3::CORE_NAME)),
+        dir,
+    })
+}
+
+/// The gate's verdict on a really linked image.
+fn gate_on(linked: &Linked) -> Result {
+    gate_files(&linked.image, &linked.description, &linked.code)
+}
+
+/// Replaces `old`, which must be there, with `new`, the first time it appears.
+#[track_caller]
+fn planted(stubs: &str, old: &str, new: &str) -> String {
+    assert!(stubs.contains(old), "the generated stubs have no `{old}`");
+    stubs.replacen(old, new, 1)
+}
+
+/// The gate, on files a compiler and a linker made (the review of 2026-11-13, finding F5): it
+/// passes the image as generated and refuses each planted fault that the description lets
+/// through. Until this test the gate had been seen to refuse only listings laid out by hand in
+/// the form its author expected of the disassembler; a new version of that tool is held to the
+/// same refusals here.
+#[test]
+fn the_gate_refuses_a_really_linked_image_with_a_planted_fault() {
+    // As generated: the gate passes it.
+    let good = really_linked("good", str::to_string).expect("the description takes it");
+    assert_eq!(gate_on(&good), Ok(()));
+
+    // `handle_close` (call 3) loads `channel_create`'s number.
+    let number = really_linked("number", |stubs| {
+        planted(stubs, "\"mov eax, 3\",", "\"mov eax, 5\",")
+    })
+    .expect("one `syscall` a stub still: the description takes it");
+    let refused = gate_on(&number).expect_err("another call's number");
+    assert!(
+        refused.contains("`origin_kernel_handle_close` is not its stub"),
+        "{refused}"
+    );
+
+    // `handle_duplicate` without the extension of its `rights`.
+    let extension = really_linked("extension", |stubs| planted(stubs, "\"mov esi, esi\",", ""))
+        .expect("the description does not read instructions");
+    let refused = gate_on(&extension).expect_err("a missing extension");
+    assert!(
+        refused.contains("`origin_kernel_handle_duplicate` is not its stub"),
+        "{refused}"
+    );
+
+    // A byte that is no instruction in 64-bit mode, inside `handle_close`.
+    let byte = really_linked("byte", |stubs| {
+        planted(
+            stubs,
+            "\"mov eax, 3\",",
+            "\".byte 0x06\",\n        \"mov eax, 3\",",
+        )
+    })
+    .expect("no second `syscall`: the description takes it");
+    let refused = gate_on(&byte).expect_err("a byte the disassembler cannot decode");
+    // The pinned disassembler prints `<unknown>` for it: both rules speak.
+    assert!(
+        refused.contains("origin_kernel_handle_close: the disassembler could not decode the bytes")
+            && refused.contains("linked:   <unknown>; mov eax, 0x3; syscall; ret"),
+        "{refused}"
+    );
+
+    // A second `syscall` in one stub never reaches the gate: the description refuses it.
+    assert!(
+        really_linked("second", |stubs| {
+            planted(
+                stubs,
+                "\"mov eax, 3\",",
+                "\"syscall\",\n        \"mov eax, 3\",",
+            )
+        })
+        .is_none()
+    );
+}
+
+// ------------------------------------------------------------------ enumerations (item 277)
+
+/// The gate's own rule for an enumeration, on the real definition with two enumerations and
+/// two calls added to it: one over a signed narrow integer with a member below zero, one over
+/// an unsigned one. Each is extended as its underlying integer (ADR-0011 Amendment 3, L13, as
+/// decision item 277 words it): the sign for the first, zero for the second. `origin.kernel`
+/// passes no enumeration by register, so without this the rule would be stated and not shown.
+#[test]
+fn the_gate_expects_an_enumeration_extended_as_its_underlying_integer() {
+    let root = repo_root();
+    let read = |path: &str| String::from_utf8(read_file(&root.join(path)).unwrap()).unwrap();
+    let definition = read(DEFINITION);
+    // The two enumerations go before the interface's own doc comment, and the two calls
+    // before its closing brace.
+    let lines: Vec<&str> = definition.lines().collect();
+    let interface = lines
+        .iter()
+        .position(|line| line.starts_with("interface kernel {"))
+        .expect("the interface");
+    let doc = (0..interface)
+        .rev()
+        .find(|&i| !lines[i].starts_with("///") && !lines[i].starts_with('@'))
+        .map_or(0, |i| i + 1);
+    let close = lines
+        .iter()
+        .rposition(|line| *line == "}")
+        .expect("its end");
+    let mut text = lines[..doc].join("\n");
+    text.push_str(
+        "\n/// A signed choice.\nenum test_sign: i8 {\n    /// Below zero.\n    minus = -1;\n    /// None.\n    none = 0;\n}\n\n\
+         /// An unsigned choice.\nenum test_plain: u16 {\n    /// One.\n    one = 1;\n}\n\n",
+    );
+    text.push_str(&lines[doc..close].join("\n"));
+    text.push_str(
+        "\n\n    /// A signed enumeration in the first and the fourth register.\n\
+         \x20   method test_signed = 900 (\n        /// One.\n        a: test_sign,\n        /// Two.\n        b: u64,\n\
+         \x20       /// Three.\n        c: u64,\n        /// Four.\n        d: test_sign,\n    ) errors(invalid_args) requires none;\n\n\
+         \x20   /// An unsigned enumeration in the second and the third register.\n\
+         \x20   method test_unsigned = 901 (\n        /// One.\n        a: u64,\n        /// Two.\n        b: test_plain,\n\
+         \x20       /// Three.\n        c: test_plain,\n    ) errors(invalid_args) requires none;\n}\n",
+    );
+    let stubs = expected_stubs(&text, &read(VERSIONS)).expect("the definition still compiles");
+    let of = |method: &str| {
+        stubs
+            .iter()
+            .find(|s| s.method == method)
+            .unwrap_or_else(|| panic!("no method {method}"))
+            .instructions
+            .clone()
+    };
+    assert_eq!(
+        of("test_signed"),
+        [
+            "movsx rdi, dil",
+            "movsx r10, cl",
+            "mov eax, 0x384",
+            "syscall",
+            "ret"
+        ]
+    );
+    assert_eq!(
+        of("test_unsigned"),
+        [
+            "movzx esi, si",
+            "movzx edx, dx",
+            "mov eax, 0x385",
+            "syscall",
+            "ret"
+        ]
+    );
+    // Every stub of the definition as it is stays what it was.
+    let unchanged = expected_stubs(&definition, &read(VERSIONS)).expect("it compiles");
+    for stub in &unchanged {
+        assert_eq!(of(&stub.method), stub.instructions, "{}", stub.method);
+    }
 }

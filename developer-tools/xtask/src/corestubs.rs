@@ -42,6 +42,22 @@
 //! the stubs. The kernel's own check of each call is what enforces; this gate is why that check
 //! means what it says.
 //!
+//! **It compares instructions as the disassembler spells them, not their bytes** (the
+//! independent review of 2026-11-13, finding F9). Two encodings of one instruction print
+//! alike: a redundant REX prefix before `mov esi, esi`, or opcode `8B` where the assembler
+//! writes `89`. To a processor they are the same instruction, so a stub that passes holds the
+//! instructions expected, whatever their encoding. A prefix before `syscall` would move its two
+//! bytes, and rules 4 and 6 hold those by offset. No two instructions of different effect that
+//! print alike are known. Comparing each stub's bytes with a table of its forms' encodings
+//! would close this, and is not written.
+//!
+//! The listing is the pinned toolchain's `llvm-objdump`, read as text, and another version of
+//! that tool may spell things another way. One test holds the gate to its refusals on an image
+//! the pinned compiler and linker really made, with a fault planted in its stubs
+//! (`the_gate_refuses_a_really_linked_image_with_a_planted_fault`, the same review's F5): it
+//! is what fails first if the tool's spelling changes. With this toolchain a byte that is no
+//! instruction is listed as `<unknown>`; the gate also takes `(bad)`.
+//!
 //! # The programs the kernel carries
 //!
 //! The second gate holds each carried program to the other half of L6: it holds no `syscall`

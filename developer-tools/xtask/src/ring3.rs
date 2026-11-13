@@ -155,6 +155,28 @@ impl Generated {
     }
 }
 
+/// Refuses a stubs' tree, given as its files, that is not one list of exports and one file of
+/// stubs beside the crate root: `origin.core` is built from one `syscall` interface of one
+/// library. The generator writes stubs for every interface it is given, but three things here
+/// take one: `runtime/core` includes one file of stubs by name, the kernel's `Pins` are one
+/// interface's, and the kernel compiles in one list of exports. With a second interface the
+/// build would fail later, at a place that does not say why (the review of 2026-11-13,
+/// finding F13; `docs/spec/OIDL.md` §18).
+fn one_interface(files: &[PathBuf]) -> Result {
+    let is = |file: &Path, extension: &str| file.extension().is_some_and(|e| e == extension);
+    let lists = files.iter().filter(|file| is(file, "exports")).count();
+    let stubs = files
+        .iter()
+        .filter(|file| is(file, "rs") && file.parent().is_some_and(|p| p != Path::new("")))
+        .count();
+    if lists == 1 && stubs == 1 {
+        return Ok(());
+    }
+    Err(format!(
+        "the definitions give `origin.core` {stubs} files of stubs and {lists} lists of exports; it is built from one `syscall` interface of one library. `runtime/core` includes one file of stubs, the kernel's `Pins` are one interface's, and the kernel takes one list of exports: a second interface needs each of those changed, not the definition alone (docs/spec/OIDL.md §18)"
+    ))
+}
+
 /// Copies every file under `from` into `to` that is not already there with the same bytes, and
 /// removes every file under `to` that `from` does not hold, but for those named in `keep`.
 fn mirror(from: &Path, to: &Path, keep: &[&str]) -> Result {
@@ -204,6 +226,7 @@ pub(crate) fn generate(target: Option<&Path>) -> Result<Generated> {
     };
     mirror(&staging.join("rust"), &generated.client, &["modules.rs"])?;
     mirror(&staging.join("core"), &generated.core, &[])?;
+    one_interface(&files_under(&generated.core)?)?;
     for needed in [generated.exports(), generated.stubs()] {
         if !needed.is_file() {
             return Err(format!(
@@ -531,6 +554,44 @@ mod tests {
         // A directory that is not there is an error, not an empty list.
         assert!(described_files(&dir.join("missing"), "first_program").is_err());
         fs::remove_dir_all(&dir).expect("the scratch directory goes");
+    }
+
+    #[test]
+    fn origin_core_is_built_from_one_interface_of_one_library() {
+        let files = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(PathBuf::from).collect() };
+        // What the generator writes for `origin.kernel` today.
+        assert_eq!(
+            one_interface(&files(&[
+                "lib.rs",
+                "origin_kernel.exports",
+                "origin_kernel/kernel.rs"
+            ])),
+            Ok(())
+        );
+        // A second interface of the library, and a second library.
+        for more in [
+            &[
+                "lib.rs",
+                "origin_kernel.exports",
+                "origin_kernel/kernel.rs",
+                "origin_kernel/debug.rs",
+            ][..],
+            &[
+                "lib.rs",
+                "origin_kernel.exports",
+                "origin_kernel/kernel.rs",
+                "origin_other.exports",
+                "origin_other/calls.rs",
+            ],
+            // And nothing at all.
+            &["lib.rs"],
+        ] {
+            let refused = one_interface(&files(more)).expect_err("more or less than one");
+            assert!(
+                refused.contains("one `syscall` interface of one library"),
+                "{refused}"
+            );
+        }
     }
 
     #[test]

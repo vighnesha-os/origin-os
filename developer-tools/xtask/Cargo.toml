@@ -20,5 +20,11 @@ origin-boot-info.workspace = true
 # must be is worked out here from the definition and not taken from the generator's output.
 oidl = { path = "../oidl" }
 
+# For one test of the gate on `origin.core` (task S4-2; the review of 2026-11-13, finding F5): a
+# really linked image with a planted fault is described as the build describes it, and the
+# gate must refuse it.
+[dev-dependencies]
+onbf-pack = { path = "../onbf-pack" }
+
 [lints]
 workspace = true

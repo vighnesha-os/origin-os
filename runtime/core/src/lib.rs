@@ -17,6 +17,26 @@
 //!
 //! This file holds no `unsafe` of its own. Each generated stub is `#[unsafe(naked)]`, with its
 //! reason beside it.
+//!
+//! # What a stub is not, recorded until each is decided
+//!
+//! From the independent review of 2026-11-13 (findings F11, F16, and its second question):
+//!
+//! - **No frame.** All Origin code is built with frame pointers (ONBF §6.1.1), and the flag is
+//!   kept for this crate too, but a naked function has no frame. A frame-pointer walk that
+//!   starts inside a stub therefore skips the stub's caller unless it takes the return address
+//!   at RSP first. That is for whatever writes ADR-0005 P10's crash record to do.
+//! - **No `ENDBR64`.** A stub is reached by an indirect call through an import slot. When
+//!   indirect-branch tracking is turned on for ring 3 (CLAUDE.md §14) each stub gains one, and
+//!   the generator, the gate's expected form and every offset the kernel holds change with it.
+//! - **No trap after its `ret`.** The stubs are aligned to 4 bytes: of the 19 that return, 12
+//!   are followed at once by the next stub's first instruction, 6 by the linker's `int3`, and
+//!   the last by the rest of the page, which the kernel fills with `int3`. ADR-0017's rule on
+//!   returns is written for the kernel and the framework and says nothing of ring 3 either way;
+//!   it is TASKS item 49, to be decided before a ring-3 program that takes hostile input runs.
+//!   By reading, a stub loads nothing from memory.
+//! - **One interface of one library.** The build refuses a second `syscall` interface, with
+//!   its reason (`ring3::one_interface`): this file includes one file of stubs by name.
 #![no_std]
 
 include!(concat!(

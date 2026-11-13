@@ -18,7 +18,7 @@
 //! character literals, whatever it heads: a block, an `unsafe fn`, an `unsafe impl`, an
 //! `unsafe extern` or an attribute such as `#[unsafe(no_mangle)]`.
 //!
-//! Ring 3 has a list of its own ([`RING3_UNSAFE_FILES`], task S4-1): in the ring-3 crates
+//! Ring 3 has a list of its own ([`RING3_UNSAFE_FILES`], tasks S4-1 and S4-2): in the ring-3 crates
 //! ([`RING3_CRATES`]) only the listed files may hold `unsafe`, each for a reason, and the crate
 //! roots that can deny it do ([`RING3_ROOTS`]). `runtime/kernel-client` and `runtime/core`
 //! commit no generated code: the shims they include (the client's imports in `abi.rs`, and
@@ -311,7 +311,7 @@ pub(crate) fn gate() -> Result {
     let problems = ring3_problems(&ring3);
     if !problems.is_empty() {
         return Err(format!(
-            "`unsafe` in ring 3 is for the files the gate lists (RING3_UNSAFE_FILES in developer-tools/xtask/src/unsafety.rs; task S4-1):\n  {}",
+            "`unsafe` in ring 3 is for the files the gate lists (RING3_UNSAFE_FILES in developer-tools/xtask/src/unsafety.rs; tasks S4-1 and S4-2):\n  {}",
             problems.join("\n  ")
         ));
     }

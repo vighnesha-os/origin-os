@@ -196,6 +196,7 @@ dependencies = [
  "oidl",
  "onbf-format",
  "onbf-merkle",
+ "onbf-pack",
  "origin-boot-info",
  "origin-crypto",
  "origin-version",
