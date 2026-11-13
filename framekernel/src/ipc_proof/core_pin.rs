@@ -17,12 +17,15 @@
 //!   calls' one, run again through the stubs, give call for call the statuses they give when
 //!   the assembly interpreter makes them directly;
 //! - **the pin**: a `syscall` instruction in the program's own code, a jump to one call's
-//!   `syscall` with another call's number in RAX, and a number no stub has, each stop the
-//!   thread, and its ending records the number and the address (G1);
+//!   `syscall` with another call's number in RAX, a number no stub has, and a call's own number
+//!   with bit 32 set, each stop the thread, and its ending records the number and the address
+//!   (G1): for the first, exactly the address the program reported for that instruction;
 //! - **the image**: a write to a page of `origin.core` faults there; `memory_unmap` and
-//!   `memory_protect` of its range and a fixed `memory_map` over it answer `invalid_args`, and
-//!   its pages are still mapped read-execute on the same frames afterwards; three processes
-//!   hold it, each at a base of its own, on one set of frames, writable in no space;
+//!   `memory_protect` of its range, a fixed `memory_map` over it and one of two pages from a
+//!   page below it answer `invalid_args`, and its pages are still mapped read-execute on the
+//!   same frames afterwards; three processes hold it, each at a base of its own, on one set of
+//!   frames, writable in no space; and the kernel's own `Process::write_frame` refuses a page
+//!   of it;
 //! - **narrow parameters** (L13): through a stub, a call whose 32-bit parameter has bits set
 //!   above it is taken as the same call with them clear, where the same registers in a direct
 //!   call are `invalid_args`;
@@ -87,6 +90,8 @@ const REQ_OBJECT: u64 = DATA + 0x800;
 const REQ_MAP: u64 = DATA + 0x840;
 const REQ_FIXED: u64 = DATA + 0x880;
 const MAPPED: u64 = DATA + 0x8C0;
+/// A fixed map of two pages that starts one page below `origin.core`'s base.
+const REQ_FIXED_BELOW: u64 = DATA + 0xA00;
 const PACKET: u64 = DATA + 0x900;
 const CLOCK: u64 = DATA + 0x980;
 
@@ -129,11 +134,31 @@ pub(super) struct Placed {
     stack_top: u64,
 }
 
+/// The pages the hostile memory script maps and unmaps at a fixed address, with a page of room
+/// on either side: `[HOSTILE_FIXED - PAGE, HOSTILE_FIXED + 3 * PAGE)`.
+const HOSTILE_PAGES: (u64, u64) = (super::HOSTILE_FIXED - PAGE, super::HOSTILE_FIXED + 3 * PAGE);
+
+/// Whether a launch placed `origin.core`, the program or the stack, with its two unmapped
+/// neighbours, on [`HOSTILE_PAGES`]. All three are random pages of the programs' region, where
+/// that fixed address lies too.
+fn on_hostile_pages(loaded: &LoadedProgram, program: &Carried) -> bool {
+    let (low, high) = HOSTILE_PAGES;
+    let overlaps = |start: u64, end: u64| start < high && low < end;
+    overlaps(loaded.core, loaded.core + core_image::image().span)
+        || overlaps(loaded.base, loaded.base + program.span)
+        || overlaps(loaded.stack - PAGE, loaded.stack_top + PAGE)
+}
+
 /// Makes a process for the Rust interpreter under `limits`, with two handles more for its
 /// start record's own (see `Scripted::new`): the pin program loaded and bound by the launch
 /// path, and the scratch memory every scripted process has at [`DATA`]. A page is mapped at
 /// [`CODE`] too, read-only: the scripts name that address as memory a call may not write into,
 /// which for the assembly interpreter is its own code.
+///
+/// A launch whose random places fell on the hostile memory script's fixed pages is loaded once
+/// more, and the first is dropped: that script expects those pages free, and a correct kernel
+/// would otherwise fail its run through the stubs about once in 10^8 boots (the independent
+/// review of 2026-11-13, finding K7). Two such falls in a row, about once in 10^17, still fail.
 pub(super) fn scripted(creator: &Process, limits: Limits) -> Option<Scripted> {
     let run = ProgramLimits {
         limits: Limits {
@@ -142,6 +167,10 @@ pub(super) fn scripted(creator: &Process, limits: Limits) -> Option<Scripted> {
         },
         stack_pages: STACK_PAGES,
     };
+    let mut loaded = launch::load_program(creator, &PIN_PROGRAM, &run).ok()?;
+    if on_hostile_pages(&loaded, &PIN_PROGRAM) {
+        loaded = launch::load_program(creator, &PIN_PROGRAM, &run).ok()?;
+    }
     let LoadedProgram {
         process,
         core,
@@ -149,7 +178,7 @@ pub(super) fn scripted(creator: &Process, limits: Limits) -> Option<Scripted> {
         entry,
         stack,
         stack_top,
-    } = launch::load_program(creator, &PIN_PROGRAM, &run).ok()?;
+    } = loaded;
     let mut image = Image {
         process,
         pages: Vec::new(),
@@ -425,7 +454,7 @@ pub(crate) fn prove_core_pin(
     let before = memory::stats();
     let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let ok = {
-        let Some(creator) = Process::new(CREATOR, (0, 0), BOOT_PROOF_PRINCIPAL) else {
+        let Some(creator) = Process::proof(CREATOR, (0, 0), BOOT_PROOF_PRINCIPAL) else {
             return false;
         };
         // The binding first: it is judged on processes that never run, and everything after
@@ -546,9 +575,21 @@ fn prove_pin(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64) 
             ),
         ])
     });
-    let own_stopped = stopped(own.as_ref(), sys::DEBUG_REPORT, |ran, address| {
-        program::code_range(&PIN_PROGRAM, ran.base)
-            .is_some_and(|(start, end)| (start..end).contains(&address))
+    // The program reports where its own `syscall` instruction is before it runs it, and the
+    // ending must record exactly that address (the review of 2026-11-13, finding K3), which is
+    // in the program's own code.
+    let own_stopped = own.as_ref().is_some_and(|ran| {
+        let [status, reported] = ran.reports[..] else {
+            return false;
+        };
+        status == bad as u64
+            && program::code_range(&PIN_PROGRAM, ran.base)
+                .is_some_and(|(start, end)| (start..end).contains(&reported))
+            && ran.ending
+                == Some(Ending::Refused {
+                    number: sys::DEBUG_REPORT,
+                    address: reported,
+                })
     });
 
     // A jump to `debug_report`'s `syscall` with `channel_create`'s number in RAX: the stub's
@@ -577,10 +618,14 @@ fn prove_pin(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64) 
     // A number no stub has, from a real stub's `syscall`.
     let unknown = jump(9999, 0);
     let unknown_stopped = stopped(unknown.as_ref(), 9999, at_stub);
-    let pinned = own_stopped && other_stopped && unknown_stopped;
+    // debug_report's own number with bit 32 set, at its own `syscall`: no stub's `mov eax` can
+    // make it, and the number is judged whole (finding K2).
+    let high = sys::DEBUG_REPORT | 1 << 32;
+    let high_stopped = stopped(jump(high, 0x5EED).as_ref(), high, at_stub);
+    let pinned = own_stopped && other_stopped && unknown_stopped && high_stopped;
     let _ = writeln!(
         com1,
-        "origin-kernel: core: the per-call pin: a syscall in the program's own code stopped the thread, its ending naming call {} and that address: {own_stopped}; a jump to debug_report's syscall with channel_create's number stopped it, naming call {} and the stub's address: {other_stopped}; a number no stub has, 9999, stopped it there too: {unknown_stopped}{}",
+        "origin-kernel: core: the per-call pin: a syscall in the program's own code stopped the thread, its ending naming call {} and the address the program reported for that instruction: {own_stopped}; a jump to debug_report's syscall with channel_create's number stopped it, naming call {} and the stub's address: {other_stopped}; a number no stub has, 9999, stopped it there too: {unknown_stopped}; and debug_report's own number with bit 32 set, {high:#x}, there too: {high_stopped}{}",
         sys::DEBUG_REPORT,
         sys::CHANNEL_CREATE,
         if pinned { "" } else { FAILED }
@@ -685,10 +730,12 @@ fn prove_image(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64
 
     // The memory calls on its range, then a wait the kernel ends once it has looked at the
     // process's tables: the pages must still be there, as they were.
+    // An object of two pages, so that the map that starts below the base asks nothing of the
+    // object it cannot give, and is refused for the image alone.
     let limits = Limits {
         handles: 8,
         memory: MemoryLimits {
-            committed: PAGE as usize,
+            committed: 2 * PAGE as usize,
             mappings: 1,
             changes: crate::mapping::Rate {
                 burst: 64,
@@ -742,12 +789,31 @@ fn prove_image(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64
                 &[h(SELF), h(4), Imm(REQ_FIXED), Imm(MAPPED)],
                 invalid
             ),
+            step(
+                "map two pages over it from one page below",
+                sys::MEMORY_MAP,
+                &[h(SELF), h(4), Imm(REQ_FIXED_BELOW), Imm(MAPPED)],
+                invalid
+            ),
             wait("", Imm(live), signals::PEER_CLOSED, DEADLINE_INFINITE, OK),
             step("still callable", sys::CLOCK_READ, &[Imm(CLOCK)], OK),
         ];
         let fixed = map_request(40, map_access::READ, map_flags::FIXED, 0, PAGE, core);
+        let below = map_request(
+            40,
+            map_access::READ,
+            map_flags::FIXED,
+            0,
+            2 * PAGE,
+            core - PAGE,
+        );
         if write_requests(&scripted.image).is_none()
+            || scripted
+                .image
+                .write(REQ_OBJECT, &object_request(16, 2 * PAGE))
+                .is_none()
             || scripted.image.write(REQ_FIXED, &fixed).is_none()
+            || scripted.image.write(REQ_FIXED_BELOW, &below).is_none()
             || scripted.image.scratch().is_none()
             || scripted.image.script(&steps).is_none()
         {
@@ -756,7 +822,7 @@ fn prove_image(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64
         let Some(process) = scripted.start(bsp, Some(SELF)) else {
             break 'kept;
         };
-        // Blocked in its wait, after the three calls: look at its tables as they now are.
+        // Blocked in its wait, after the four calls: look at its tables as they now are.
         sched::yield_until(
             || process.waiting.load(Ordering::Acquire) != 0 || process.ending().is_some(),
             tsc_hz,
@@ -770,14 +836,28 @@ fn prove_image(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64
     }
 
     // Three processes, loaded and never started, two with the pin program and one with the
-    // first: one set of frames, at a base of each process's own.
-    let (mut shared, mut apart) = (false, false);
+    // first: one set of frames, at a base of each process's own. A process whose random base
+    // equals one drawn before it is loaded once more before anything is judged (finding K7):
+    // a correct kernel then fails "each at a base of its own" only on two such draws in a row.
+    let (mut shared, mut apart, mut write_refused) = (false, false, false);
     let mut executors = 0;
-    if let (Some(a), Some(b)) = (
-        Scripted::new(LIMITS, Via::Core(creator)),
-        Scripted::new(LIMITS, Via::Core(creator)),
-    ) && let (Some(pa), Some(pb)) = (a.pinned.as_ref(), b.pinned.as_ref())
-        && let Ok(first) = launch::load_program(creator, &FIRST_PROGRAM, &FIRST_PROGRAM_RUN)
+    let core_of = |s: &Scripted| s.pinned.as_ref().map(|p| p.core);
+    let a = Scripted::new(LIMITS, Via::Core(creator));
+    let mut b = Scripted::new(LIMITS, Via::Core(creator));
+    if a.as_ref().and_then(core_of).is_some()
+        && a.as_ref().and_then(core_of) == b.as_ref().and_then(core_of)
+    {
+        b = Scripted::new(LIMITS, Via::Core(creator));
+    }
+    let load_first = || launch::load_program(creator, &FIRST_PROGRAM, &FIRST_PROGRAM_RUN).ok();
+    let mut first = load_first();
+    if first.as_ref().is_some_and(|f| {
+        Some(f.core) == a.as_ref().and_then(core_of) || Some(f.core) == b.as_ref().and_then(core_of)
+    }) {
+        first = load_first();
+    }
+    if let (Some(a), Some(b), Some(first)) = (a.as_ref(), b.as_ref(), first.as_ref())
+        && let (Some(pa), Some(pb)) = (a.pinned.as_ref(), b.pinned.as_ref())
     {
         shared = core_mapped(&a.image.process, pa.core)
             && core_mapped(&b.image.process, pb.core)
@@ -786,11 +866,21 @@ fn prove_image(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64
         let counts = core_image::mappings();
         executors = counts.map_or(0, |(_, executable)| executable);
         shared &= counts.is_some_and(|(writable, executable)| writable == 0 && executable >= 3);
+        // The kernel's own way of writing into a process's page, asked to write the byte that is
+        // already there, at `origin.core`'s first page in that process: it must refuse
+        // (finding K1). The same byte, so that a kernel that wrongly let it through still
+        // leaves the image as it was, and the clause alone fails.
+        let byte = core_image::image().code.first().copied().unwrap_or(0xCC);
+        write_refused = a
+            .image
+            .process
+            .frame_of(pa.core)
+            .is_some_and(|frame| !a.image.process.write_frame(frame, 0, &[byte]));
     }
-    let image_ok = write_faulted && refused && kept && shared && apart;
+    let image_ok = write_faulted && refused && kept && shared && apart && write_refused;
     let _ = writeln!(
         com1,
-        "origin-kernel: core: origin.core in a process: a write to its page faulted there: {write_faulted}; memory_unmap and memory_protect of its range and a fixed memory_map over it each answered INVALID_ARGS, and calls through it went on: {refused}; its {} pages were still mapped read-execute on the same frames afterwards: {kept}; three processes, two of the pin program and one of the first, hold it on one set of frames, executable in {executors} spaces and writable in none: {shared}, each at a base of its own: {apart}{}",
+        "origin-kernel: core: origin.core in a process: a write to its page faulted there: {write_faulted}; memory_unmap and memory_protect of its range, a fixed memory_map over it, and a fixed memory_map of two pages from one page below it each answered INVALID_ARGS, and calls through it went on: {refused}; its {} pages were still mapped read-execute on the same frames afterwards: {kept}; three processes, two of the pin program and one of the first, hold it on one set of frames, executable in {executors} spaces and writable in none: {shared}, each at a base of its own: {apart}; the kernel's own write path into a process's pages refused a page of it: {write_refused}{}",
         span / PAGE,
         if image_ok { "" } else { FAILED }
     );
@@ -924,7 +1014,7 @@ pub(crate) fn prove_entry_flags(
     tsc_hz: u64,
 ) -> bool {
     let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
-    let Some(creator) = Process::new(CREATOR, (0, 0), BOOT_PROOF_PRINCIPAL) else {
+    let Some(creator) = Process::proof(CREATOR, (0, 0), BOOT_PROOF_PRINCIPAL) else {
         return false;
     };
     let limits = ProgramLimits {

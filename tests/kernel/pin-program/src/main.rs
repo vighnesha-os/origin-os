@@ -31,7 +31,7 @@
 //! | -3 | report the `u32` at the first argument |
 //! | -4 | fault (`ud2`) |
 //! | -5 | copy the `u64` at the first argument to the second |
-//! | -6 | make call number (first argument) with one argument (second) by the `syscall` instruction in this program's own code |
+//! | -6 | report the address of the `syscall` instruction in this program's own code, then make call number (first argument) with one argument (second) by it |
 //! | -7 | jump to the address in the first argument with the second in RAX and the third in RDI |
 //! | -8 | make call number (second argument) the first argument's number of times, with the next three as its arguments, and report the nanoseconds that took |
 //!
@@ -102,6 +102,9 @@ fn interpret(mut at: u64) -> u64 {
             -4 => raw::fault(),
             -5 => raw::write_u64(argument(1), raw::read_u64(argument(0))),
             -6 => {
+                // Where the instruction is, first: the proof compares the thread's ending with
+                // it.
+                report(raw::own_syscall_address());
                 report(raw::own_syscall(argument(0), argument(1)) as u64);
                 return NOT_STOPPED;
             }

@@ -2418,15 +2418,17 @@ fn core_pin_markers() -> Vec<String> {
         "origin-kernel: core: the hostile scripts of \"IPC and handles\", made through the stubs, gave call for call the statuses they give directly, and each process exited by itself: ".into(),
         " IPC calls (the one call number no method has is left out: no stub can ask it): true; 49 memory calls: true".into(),
         "origin-kernel: core: one call through origin.core, as it is pinned: ".into(),
-        "origin-kernel: core: the per-call pin: a syscall in the program's own code stopped the thread, its ending naming call 1 and that address: true; a jump to debug_report's syscall with channel_create's number stopped it, naming call 5 and the stub's address: true; a number no stub has, 9999, stopped it there too: true".into(),
+        "origin-kernel: core: the per-call pin: a syscall in the program's own code stopped the thread, its ending naming call 1 and the address the program reported for that instruction: true; a jump to debug_report's syscall with channel_create's number stopped it, naming call 5 and the stub's address: true; a number no stub has, 9999, stopped it there too: true; and debug_report's own number with bit 32 set, 0x100000001, there too: true".into(),
         "origin-kernel: core: the kernel's proof processes keep their range: a call from outside it was refused with a status and the process went on to its own fault: true; a call number no method has answered NOT_SUPPORTED: true".into(),
-        "origin-kernel: core: origin.core in a process: a write to its page faulted there: true; memory_unmap and memory_protect of its range and a fixed memory_map over it each answered INVALID_ARGS, and calls through it went on: true; its 1 pages were still mapped read-execute on the same frames afterwards: true; three processes, two of the pin program and one of the first, hold it on one set of frames, executable in ".into(),
-        " spaces and writable in none: true, each at a base of its own: true".into(),
+        "origin-kernel: core: origin.core in a process: a write to its page faulted there: true; memory_unmap and memory_protect of its range, a fixed memory_map over it, and a fixed memory_map of two pages from one page below it each answered INVALID_ARGS, and calls through it went on: true; its 1 pages were still mapped read-execute on the same frames afterwards: true; three processes, two of the pin program and one of the first, hold it on one set of frames, executable in ".into(),
+        " spaces and writable in none: true, each at a base of its own: true; the kernel's own write path into a process's pages refused a page of it: true".into(),
         "origin-kernel: core: narrow parameters: through its stub, a call whose 32-bit parameter has bits set above it, in the second, third and fourth registers, is the same call with them clear, 4 calls: true; the same registers in a direct call by a proof process are each INVALID_ARGS: true".into(),
         "origin-kernel: core: every process it launched and all they held are gone: heap ".into(),
         "; origin.core's own frames stay, mapped by no process: true, and still hold the image word for word as it was written at boot: true".into(),
         "origin-kernel: entry flags: a program's first instruction pushed RFLAGS, ".into(),
-        ", and found 0x202 and 0x202: the direction flag and the six status flags clear and interrupts on: true".into(),
+        // Not the register's value: ADR-0005 H1 promises eight bits of it and no more, and the
+        // kernel's proof judges those (the review of 2026-11-13, finding K11).
+        ": the direction flag and the six status flags clear and interrupts on: true".into(),
     ]
 }
 

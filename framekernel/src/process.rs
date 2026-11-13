@@ -211,27 +211,7 @@ pub(crate) enum Ending {
     },
 }
 
-/// Where a process's system calls may come from. Fixed when the process is made, and never
-/// changed (ADR-0011 Amendment 2, L8).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CallOrigin {
-    /// One of the kernel's own proof processes: any `syscall` instruction inside
-    /// `[start, end)`, the range its creator named (ADR-0005 A6). A call from outside it is
-    /// `access_denied`.
-    Range {
-        /// The range's first address.
-        start: u64,
-        /// One past its last.
-        end: u64,
-    },
-    /// Pinned per call (ADR-0005 B2): each call number only from its own `syscall`
-    /// instruction in `origin.core`. `base` is where `origin.core` is in this process, recorded
-    /// when it was mapped there (L7); `None` until then, and until then no call is accepted.
-    Core {
-        /// `origin.core`'s base in this process.
-        base: Option<u64>,
-    },
-}
+pub(crate) use crate::pin::CallOrigin;
 
 /// The values a process reported through `DEBUG_REPORT`, oldest first.
 struct ReportLog {
@@ -377,12 +357,21 @@ pub(crate) struct Process {
 }
 
 impl Process {
-    /// A new proof process with an empty lower half and the kernel's half, under `limits`,
+    /// A new **proof** process with an empty lower half and the kernel's half, under `limits`,
     /// whose code may issue system calls only from `[syscall_origin.0, syscall_origin.1)`
     /// (ADR-0005 A6, which the kernel's own proof processes keep: ADR-0011 L8), acting for
     /// `principal` (C1). Only kernel code creates processes yet, so the creator names the
-    /// principal; a launch path will pass its own by default.
-    pub(crate) fn new(limits: Limits, syscall_origin: (u64, u64), principal: u64) -> Option<Self> {
+    /// principal.
+    ///
+    /// Only the boot proofs may make a process this way: every program is launched pinned per
+    /// call ([`pinned_child_of`](Self::pinned_child_of)). `cargo xtask check` holds that,
+    /// naming the files that may call this and [`proof_child_of`](Self::proof_child_of), each
+    /// with its reason (the independent review of 2026-11-13, finding K5).
+    pub(crate) fn proof(
+        limits: Limits,
+        syscall_origin: (u64, u64),
+        principal: u64,
+    ) -> Option<Self> {
         let (start, end) = syscall_origin;
         Self::with_origin(limits, CallOrigin::Range { start, end }, principal)
     }
@@ -427,17 +416,17 @@ impl Process {
     /// A new proof process that `creator` starts: it acts for the creator's principal, and
     /// there is no way to give it another (ADR-0005 C1; no capability for one exists). Its
     /// system calls come from the range its creator names (A6).
-    pub(crate) fn child_of(
+    pub(crate) fn proof_child_of(
         creator: &Self,
         limits: Limits,
         syscall_origin: (u64, u64),
     ) -> Option<Self> {
-        Self::new(limits, syscall_origin, creator.principal)
+        Self::proof(limits, syscall_origin, creator.principal)
     }
 
     /// A new process that `creator` starts, pinned per call (ADR-0005 B2; ADR-0011 L8): the
     /// launch path's way in for every program that is not a proof process. It acts for the
-    /// creator's principal, as [`child_of`](Self::child_of) says. Until `origin.core` is mapped
+    /// creator's principal, as [`proof_child_of`](Self::proof_child_of) says for a proof process. Until `origin.core` is mapped
     /// into it ([`map_core`](Self::map_core)) none of its calls would be accepted, and it has
     /// no thread to make one.
     pub(crate) fn pinned_child_of(creator: &Self, limits: Limits) -> Option<Self> {
@@ -488,7 +477,16 @@ impl Process {
     }
 
     /// Copies `bytes` to `offset` bytes into the frame `frame` (from [`Process::map_page`]).
+    ///
+    /// Never into a frame of `origin.core`: those are written once, at boot, by
+    /// `core_image::install` alone, and every pinned process maps the same ones. `false` then,
+    /// as for a frame this space does not map (the independent review of 2026-11-13, finding
+    /// K1). The framework's own `UserSpace::write_frame` does not refuse it; a rule there is
+    /// TASKS item 51.
     pub(crate) fn write_frame(&self, frame: UserFrame, offset: usize, bytes: &[u8]) -> bool {
+        if crate::core_image::is_core_frame(frame.phys()) {
+            return false;
+        }
         self.memory()
             .is_some_and(|space| space.write_frame(frame, offset, bytes))
     }
@@ -521,33 +519,20 @@ impl Process {
     /// cannot be made; `LIMIT` at the bound on a space's page tables. Nothing is mapped and no
     /// base is recorded on any of them.
     pub(crate) fn map_core(&mut self, base: u64) -> Result<(), Error> {
-        if self.origin != (CallOrigin::Core { base: None }) {
-            return Err(Error::InvalidArgs);
-        }
+        let mapped = self.origin.mapped_at(base).ok_or(Error::InvalidArgs)?;
         let space = self.memory().ok_or(Error::InvalidArgs)?;
         crate::core_image::map_into(&space, base).map_err(|e| match e {
             ChangeError::Limit => Error::Limit,
             ChangeError::Map(MapError::OutOfMemory) => Error::NoMemory,
             _ => Error::InvalidArgs,
         })?;
-        self.origin = CallOrigin::Core { base: Some(base) };
+        self.origin = mapped;
         Ok(())
     }
 
     /// Where this process's system calls may come from.
     pub(crate) const fn call_origin(&self) -> CallOrigin {
         self.origin
-    }
-
-    /// For a proof process: whether the system call whose return address is `rip` came from
-    /// the range its creator named (A6): the `syscall` instruction, two bytes long, lies inside
-    /// it. `false` for a process pinned per call, which this does not judge.
-    pub(crate) fn may_call_from(&self, rip: u64) -> bool {
-        let CallOrigin::Range { start, end } = self.origin else {
-            return false;
-        };
-        rip.checked_sub(2)
-            .is_some_and(|at| at >= start && rip <= end)
     }
 
     /// Whether this process may use the developer-only calls.

@@ -1,8 +1,9 @@
 //! The launch path (ADR-0005 P6, amendments C1 and C4–C6; ADR-0011 N14 step 3, task S3-3): the
 //! one way the kernel starts a process with a start record.
 //!
-//! A creator makes the child with [`Process::child_of`], so the child acts for the creator's
-//! principal and for no other; maps its image; has [`place`] put the start record's pages at a
+//! A creator makes the child with [`Process::proof_child_of`] (the boot proofs) or
+//! [`Process::pinned_child_of`] (a program), so the child acts for the creator's principal and
+//! for no other; maps its image; has [`place`] put the start record's pages at a
 //! random address, read-only; then [`start`] gives the child its own process and first thread
 //! and what the creator passes (BOOTSTRAP and DIRECTORY channel ends), writes the record from
 //! what the child's table then holds, and starts the first thread with RDI holding the

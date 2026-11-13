@@ -60,6 +60,17 @@ pub(crate) extern "C" fn own_syscall(number: u64, argument: u64) -> i64 {
     naked_asm!("mov rax, rdi", "mov rdi, rsi", "syscall", "ret")
 }
 
+/// The address of the `syscall` instruction in [`own_syscall`]: the first pair of its two bytes
+/// from the function's start, read from this program's own code, which is readable. The gate on
+/// carried programs holds that it is the one `syscall` this program has. `0` if none were found
+/// within the longest an instruction can be, twice over, which a correct build never gives.
+pub(crate) fn own_syscall_address() -> u64 {
+    let start = (own_syscall as *const ()).addr() as u64;
+    (start..start + 30)
+        .find(|&at| read_u32(at) & 0xFFFF == 0x050F)
+        .unwrap_or(0)
+}
+
 /// Jumps to `target` with `number` in RAX and `argument` in RDI. With `target` the `syscall`
 /// instruction of one call's stub and `number` another call's, this is the attack the per-call
 /// pin exists to stop (row E8 of the system-call threat model): the stub's own load of its

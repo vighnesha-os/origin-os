@@ -387,7 +387,7 @@ impl Image {
     }
 
     fn build(limits: Limits, code: &[u8], origin: (u64, u64), principal: u64) -> Option<Self> {
-        Self::from_process(Process::new(limits, origin, principal)?, code)
+        Self::from_process(Process::proof(limits, origin, principal)?, code)
     }
 
     /// An image for `process`, made by its caller (a launched child, say): `program` at
@@ -1399,7 +1399,7 @@ struct HostileRun {
 fn hostile_run(via: Via<'_>, bsp: CpuIndex, tsc_hz: u64) -> Option<(HostileRun, Handle)> {
     // Another process with a live handle whose value is not live in the hostile process:
     // slot 40, which the hostile process's table never reaches.
-    let other = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)?;
+    let other = Process::proof(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)?;
     let (end, peer) = ipc::create_channel(&other.account).ok()?;
     drop(peer);
     let mut foreign = 0;
@@ -2519,7 +2519,8 @@ fn process_ids(com1: &mut Console) -> bool {
     let mut previous = 0;
     let mut ascending = true;
     for _ in 0..PROCESSES {
-        let Some(process) = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL) else {
+        let Some(process) = Process::proof(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)
+        else {
             return false;
         };
         ascending &= process.id() > previous;
@@ -2542,7 +2543,7 @@ fn cancel_on_any_object(com1: &mut Console, cpus: &[CpuIndex], bsp: CpuIndex, ts
     let mut ok = true;
     for (how, sends) in [("closes", false), ("sends away", true)] {
         // Never started, so nothing else can end the wait.
-        let Some(never_runs) = Process::new(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)
+        let Some(never_runs) = Process::proof(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)
         else {
             return false;
         };
@@ -2955,7 +2956,7 @@ struct Launch {
 fn launch_one(creator: &Process, cpu: CpuIndex, tsc_hz: u64) -> Option<Launch> {
     let code = proof_programs::launched();
     let code_pages = code.len().div_ceil(PAGE as usize).max(1) as u64;
-    let child = Process::child_of(creator, LIMITS, (CODE, CODE + code_pages * PAGE))?;
+    let child = Process::proof_child_of(creator, LIMITS, (CODE, CODE + code_pages * PAGE))?;
     let mut image = Image::from_process(child, code)?;
     let (Ok((boot_child, boot_creator)), Ok((dir_child, dir_other))) = (
         ipc::create_channel(&creator.account),
@@ -3067,7 +3068,7 @@ fn refused_launches(creator: &Process) -> (bool, bool) {
     let code_pages = code.len().div_ceil(PAGE as usize).max(1) as u64;
     let origin = (CODE, CODE + code_pages * PAGE);
     let attempt = |limits: Limits, args: &[&[u8]]| -> Option<(Result<(), Error>, bool)> {
-        let child = Process::child_of(creator, limits, origin)?;
+        let child = Process::proof_child_of(creator, limits, origin)?;
         let mut image = Image::from_process(child, code)?;
         let (child_end, creator_end) = ipc::create_channel(&creator.account).ok()?;
         let held = creator
@@ -3132,7 +3133,7 @@ pub(crate) fn prove_launch(
     let before = memory::stats();
     let far = cpus.iter().copied().find(|&c| c != bsp).unwrap_or(bsp);
     let ok = {
-        let Some(creator) = Process::new(LIMITS, (CODE, CODE + PAGE), PRINCIPAL_CREATOR) else {
+        let Some(creator) = Process::proof(LIMITS, (CODE, CODE + PAGE), PRINCIPAL_CREATOR) else {
             return false;
         };
         let first = launch_one(&creator, far, tsc_hz);

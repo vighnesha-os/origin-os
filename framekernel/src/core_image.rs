@@ -29,10 +29,20 @@
 //! mapping of a frame that is executable anywhere (`origin_frame::aliases`), so no process can
 //! come to write them either.
 //!
-//! What the framework does not refuse is a write by the kernel itself through a `SharedFrame`
-//! it holds: each address space that maps the image holds one. That nothing does so is held
-//! by reading, and shown after the fact by [`intact`] at the end of the boot proof; a rule in
-//! the framework is TASKS item 51 (the same review, finding F7).
+//! What the framework does not refuse is a write by the kernel itself into these frames. There
+//! are two paths to one (the independent reviews of 2026-11-13, findings F7 and K1):
+//!
+//! - `SharedFrame::write_u64`, through a `SharedFrame` the kernel holds: each address space that
+//!   maps the image holds a clone, which no kernel code asks for;
+//! - `UserSpace::write_frame`, through the `UserFrame` that `UserSpace::frame_of` or
+//!   `Process::frame_of` gives for any page a space maps, the image's among them. The kernel's
+//!   own `Process::write_frame` refuses a frame of `origin.core` ([`is_core_frame`]), and the
+//!   boot proof shows that refusal; a caller that went to the framework's function directly
+//!   would not be refused.
+//!
+//! That nothing writes them is held by reading, and shown after the fact by [`intact`] at the end
+//! of the boot proof. A rule in the framework that covers both paths, and the launch path's own
+//! filling of a code page it has mapped read-execute, is TASKS item 51.
 #![forbid(unsafe_code)]
 
 use origin_syscalls::origin_kernel::kernel::server::{Pins, RELEASE_FINGERPRINT};
@@ -214,7 +224,7 @@ pub(crate) fn image() -> &'static CoreImage {
 }
 
 #[cfg(target_os = "none")]
-pub(crate) use shared::{frame, install, intact, map_into, mappings};
+pub(crate) use shared::{frame, install, intact, is_core_frame, map_into, mappings};
 
 /// The one set of frames, and the only code that touches them.
 #[cfg(target_os = "none")]
@@ -294,6 +304,15 @@ mod shared {
                     == Some(image_word(&ORIGIN_CORE, page * PAGE as usize + word * 8))
             })
         })
+    }
+
+    /// Whether `phys` is one of `origin.core`'s frames: the kernel's own write path into a
+    /// process's pages (`Process::write_frame`) refuses those.
+    #[must_use]
+    pub(crate) fn is_core_frame(phys: PhysAddr) -> bool {
+        FRAMES
+            .get()
+            .is_some_and(|frames| frames.iter().any(|frame| frame.phys() == phys))
     }
 
     /// Whether `origin.core`'s frames hold the image, word for word, as [`install`] wrote it:

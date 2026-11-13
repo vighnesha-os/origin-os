@@ -134,6 +134,7 @@ pub mod net;
 pub mod numa;
 pub mod nvme;
 pub mod originfs;
+pub mod pin;
 pub mod program;
 pub use origin_frame::{
     acpi, amdvi, apic, apstart, bitmap, boot, clock, cpumap, descriptors, dmar, features, frames,
