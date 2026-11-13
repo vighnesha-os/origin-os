@@ -149,6 +149,8 @@ Every answered item of `docs/engineering/OWNER_DECISIONS.md` is named in the "De
 | 70, 161 | none | How pull requests are offered: at 100 commits, and pull request 15 at 76. A rule of process that no statement of the directive or decision of an ADR carries. |
 | 167, 190 | none | How task 18b and the randomized model of its policy land: through pull request 16. Rules of process. |
 | 275 | owed | CI compares the images that two kinds of host build, on every run, and fails if they differ. Its job is TASKS item 46 and is not built. Rows S60-03, S75-06 and S75-07 take the item when it lands; until the third batch (pull request 21) is on `main` those rows are being changed there. |
+| 278 | owed | The compiler becomes Rust 1.100.0 stable, by the owner's instruction of 2026-11-13. CLAUDE.md still names 1.99.1. Revision 7.8 and the rows that quote the compiler's version (PART III and the directive's header, §17 and final rules) take the item when TASKS item 52, the upgrade by §15, lands with it; until then every build uses 1.99.1. |
+| 279 | none | How the compiler upgrade lands: a pull request of its own, outside item 70's 100 commits. A rule of process. |
 | 224–228, 231–236 | none | How rented bench machines are used: the provider, the budget cap, who signs up and holds the credentials, the order of the rentals, how Origin boots there (items 231 and 236), what is kept and where, what a bench record may claim, no self-hosted runner, and rentals through Latitude's API (`docs/research/2026-11-12-first-bare-metal-boot.md`). Rules of process for bench equipment, which ADR-0009 A1 keeps outside the declared scope. |
 
 ## Scope changes
