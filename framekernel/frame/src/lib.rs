@@ -34,6 +34,7 @@ pub mod apstart;
 pub mod bitmap;
 pub mod boot;
 pub mod clock;
+pub mod cpuident;
 pub mod cpumap;
 pub mod descriptors;
 pub mod dmar;

@@ -313,6 +313,48 @@ pub unsafe fn copy_char16_string(s: *const u16, buf: &mut [u16]) -> usize {
     n
 }
 
+/// The number of units before the terminating NUL of a `CHAR16` string.
+///
+/// This is CLAUDE.md §10's regression test for rust-lang/rust issue 163614, and nothing in the
+/// loader calls it. For `x86_64-unknown-uefi` LLVM turns this loop into a call to `wcslen`.
+/// Rust 1.99.0 shipped no `wcslen` for the target, so a release build that held such a loop
+/// did not link. The linker needs every symbol this function names before it drops the
+/// function as unused, so the loader links only where `wcslen` is there to be found.
+/// `developer-tools/toolchain/verify.sh` builds the loader and reads this library's object for
+/// that call.
+///
+/// It is not for a string that comes from firmware. The loop has no bound and reads until it
+/// finds a NUL: firmware's strings go through [`copy_char16_string`], which stops at the end
+/// of its buffer.
+///
+/// Two things keep the test a test:
+/// - `#[inline(never)]` keeps the function in this crate's object, where `verify.sh` looks.
+///   Without it the compiler may compile a small function only where it is called, and this
+///   one is called nowhere.
+/// - `wrapping_add` on the count. With overflow checks on, `n += 1` gives the loop a second
+///   way out and LLVM leaves it a loop (tried on 2026-11-12 with rustc 1.99.1). The count
+///   cannot wrap: the string lies in one allocation.
+///
+/// # Safety
+///
+/// `s` must be aligned for `u16` and point to a `CHAR16` string that is readable up to and
+/// including its terminating NUL, all of it in one allocation.
+#[inline(never)]
+pub unsafe fn char16_len(s: *const u16) -> usize {
+    let mut n = 0usize;
+    loop {
+        // SAFETY: units `0..n` held no NUL, so the caller guarantees that unit `n` is part of
+        // the string, in the same allocation as `s`.
+        let p = unsafe { s.add(n) };
+        // SAFETY: unit `n` is part of the string (above), so the caller guarantees it is
+        // readable, and `p` is aligned because `s` is.
+        if unsafe { *p } == 0 {
+            return n;
+        }
+        n = n.wrapping_add(1);
+    }
+}
+
 /// How [`exit_boot_services`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitOutcome<E> {
@@ -500,6 +542,35 @@ mod tests {
         // SAFETY: the string at `p` is NUL-terminated within `bytes`; unaligned is allowed.
         let n = unsafe { copy_char16_string(p, &mut buf) };
         assert_eq!(&buf[..n], &[u16::from(b'A'), u16::from(b'B')]);
+    }
+
+    #[test]
+    fn char16_len_counts_the_units_before_the_first_nul() {
+        // "Origin", then a second string after the first NUL that must not be counted.
+        let s: [u16; 10] = [0x4F, 0x72, 0x69, 0x67, 0x69, 0x6E, 0, 0x4F, 0x53, 0];
+        // SAFETY: `s` is an aligned array with a NUL at unit 6.
+        assert_eq!(unsafe { char16_len(s.as_ptr()) }, 6);
+        // SAFETY: the string that starts at unit 5 ends at the same NUL.
+        assert_eq!(unsafe { char16_len(s[5..].as_ptr()) }, 1);
+        // SAFETY: unit 6 is the NUL itself: an empty string.
+        assert_eq!(unsafe { char16_len(s[6..].as_ptr()) }, 0);
+        // SAFETY: the string that starts at unit 7 ends at the NUL at unit 9.
+        assert_eq!(unsafe { char16_len(s[7..].as_ptr()) }, 2);
+    }
+
+    #[test]
+    fn char16_len_agrees_with_the_bounded_copy() {
+        // Every length from 0 to 40, each with a unit after its NUL that neither may count.
+        for len in 0..=40usize {
+            let mut s = [0x41u16; 42];
+            s[len] = 0;
+            let mut buf = [0u16; 42];
+            // SAFETY: `s` has a NUL at unit `len`, inside its bounds.
+            let copied = unsafe { copy_char16_string(s.as_ptr(), &mut buf) };
+            // SAFETY: `s` is an aligned array with a NUL at unit `len`.
+            let counted = unsafe { char16_len(s.as_ptr()) };
+            assert_eq!((copied, counted), (len, len));
+        }
     }
 
     /// Runs [`exit_boot_services`] against scripted firmware answers, returning the outcome and

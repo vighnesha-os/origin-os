@@ -136,6 +136,17 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         cpu::fpu_area_size(),
         xcr0
     );
+    // ADR-0009 A2: the core generation, and whether the machine is in the declared scope or
+    // a bench machine, from the boot processor's CPUID. A report and nothing more: the boot
+    // never stops on it, no proof counts it, and instructions are still chosen from the
+    // feature bits above (CLAUDE.md §14, §24).
+    let leaf1 = cpu::cpuid(1);
+    let identity = origin_frame::cpuident::identify(origin_frame::cpuident::Signature::new(
+        cpu::cpuid(0),
+        leaf1[0],
+        leaf1[2],
+    ));
+    let _ = writeln!(com1, "origin-kernel: CPU identity: {identity}");
     // CLAUDE.md §14: Origin OS requires x86-64-v3. Below it — or if AVX state could not be
     // enabled (XCR0 must hold x87, SSE and AVX state) — refuse to go on, naming what is
     // missing, rather than fail later in a way that hides why.
@@ -541,9 +552,9 @@ fn prove_nospec(com1: &mut Console) -> bool {
     for outside in [USER_END, 0xFFFF_8000_0000_0000, u64::MAX] {
         sound &= nospec::user_address_in(Form::Mask, outside) == 0;
     }
-    // The form in use is the one the boot processor's maker and family call for.
+    // The form in use is the one the CPU identification table gives the boot processor.
     let reported = cpu::read_speculation();
-    let chosen = nospec::choose(reported.maker(), reported.family());
+    let chosen = origin_frame::cpuident::identify(reported.signature()).form();
     sound &= nospec::form() == chosen;
 
     const ROUNDS: u64 = 1 << 16;

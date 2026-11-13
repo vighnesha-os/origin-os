@@ -23,18 +23,25 @@ members = [
     "framekernel/paging",
     "framekernel/syscalls",
     "runtime/abi",
+    "runtime/kernel-stubs",
     "runtime/onbf/format",
     "runtime/onbf/merkle",
     "runtime/onbf/verify",
+    "runtime/rt",
+    "runtime/rt-mem",
     "runtime/version",
     "sdk/directory",
     "security/crypto",
     "security/random",
     "services/directory",
     "tests/emulator/reserved-memory",
+    "tests/kernel/first-program",
 ]
 # Host-buildable crates only. The UEFI loader's and the Framekernel's binaries cannot be
-# built for the host.
+# built for the host, and the ring-3 crates (`runtime/rt`, `runtime/kernel-stubs` and
+# `tests/kernel/first-program`) are built only for the userspace triple, by `cargo xtask` with
+# `.cargo/userspace.toml` (CLAUDE.md §11; task S4-1). `runtime/rt-mem`, the bodies of the
+# runtime's `mem*` functions, is built for both, so the host can test it.
 default-members = [
     "boot/info",
     "developer-tools/oidl",
@@ -49,6 +56,7 @@ default-members = [
     "runtime/onbf/format",
     "runtime/onbf/merkle",
     "runtime/onbf/verify",
+    "runtime/rt-mem",
     "runtime/version",
     "security/crypto",
     "security/random",
@@ -56,7 +64,7 @@ default-members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 publish = false
 # No `version` here or in any member, on purpose: the release identity lives only in
 # `origin-version.toml` and reaches code through the generated `origin-version` crate
@@ -86,6 +94,16 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 undocumented_unsafe_blocks = "deny"
 missing_safety_doc = "deny"
 multiple_unsafe_ops_per_block = "deny"
+
+[workspace.lints.cargo]
+# Cargo's own lints as errors (TASKS item 52; its review, finding 1). `-D warnings` reaches the
+# compiler and Clippy only, so a warning of Cargo's would otherwise fail no gate. The group
+# `default` holds every lint Cargo turns on by default: on Cargo 1.100.0 the seven that warn
+# (`unused_dependencies`, `unused_workspace_dependencies`, `unused_workspace_package_fields`,
+# `missing_lints_inheritance`, `unknown_lints`, `redundant_homepage`,
+# `blanket_hint_mostly_unused`) and the two that already deny. A lint a later Cargo adds to
+# the group is then an error at the upgrade that brings it (CLAUDE.md §15), not a line in a log.
+default = { level = "deny", priority = -1 }
 
 [profile.release]
 # One codegen unit: deterministic output (CLAUDE.md §75) and the same code shape that

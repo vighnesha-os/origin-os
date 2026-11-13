@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (below): Accepted** by the owner on 2026-11-08, with the recommended option of each item. **Amendment 2 (below): Accepted** by the owner on 2026-11-09, through ADR-0011. **Amendment 3 (below): Accepted** by the owner on 2026-11-09, through `docs/spec/OIDL.md`'s question Q8. **Amendment 4 (below): Accepted** by the owner on 2026-11-09. **Amendment 5 (below): Accepted** by the owner on 2026-11-10. **Amendment 6 (below): Accepted** by the owner on 2026-11-10; not built. **Amendment 7 (below): Accepted** by the owner on 2026-11-11; built by task S3-6 in the second step-3 batch, under QEMU only. **Amendment 8 (below): Accepted** by the owner on 2026-11-12 (items 204, 206–212, 214, 215, 217 and 220): what ADR-0011 N14 step 4 needs; not built. |
+| Status | **Accepted** by the owner on 2026-11-07: the four questions below answered with the recommended option each, then the whole ADR (P1–P12) accepted as proposed. Implementation in progress. **Amendment 1 (below): Accepted** by the owner on 2026-11-08, with the recommended option of each item. **Amendment 2 (below): Accepted** by the owner on 2026-11-09, through ADR-0011. **Amendment 3 (below): Accepted** by the owner on 2026-11-09, through `docs/spec/OIDL.md`'s question Q8. **Amendment 4 (below): Accepted** by the owner on 2026-11-09. **Amendment 5 (below): Accepted** by the owner on 2026-11-10. **Amendment 6 (below): Accepted** by the owner on 2026-11-10; its E1, 64-bit handles, built by task S4-0 in the third batch (`land/s4`, merged at `5871257`), under QEMU only. **Amendment 7 (below): Accepted** by the owner on 2026-11-11; built by task S3-6 in the second step-3 batch, under QEMU only. **Amendment 8 (below): Accepted** by the owner on 2026-11-12 (items 204, 206–212, 214, 215, 217 and 220): what ADR-0011 N14 step 4 needs; not built. **Amendment 9 (below): Accepted** by the owner on 2026-11-13 (item 272): the flags at a thread's entry. The kernel already starts a thread so; no boot proof reads the flags yet. |
 | Scope | Kernel objects and handles, the system-call convention, status codes, process and thread start, memory mapping, IPC, waiting, faults, termination, ABI versioning |
 | Builds on | ONBF §6.1 (EXE/LIB images, syscall-origin pinning, TLS in FS), §8.2 (sealed objects, the Code Integrity Table, mapping rules), §8.3 (the user-mode Loader Service and the start record); ADR-0001 D2 (user-mode drivers); ADR-0004 (address-space layout) |
 | Requires | CLAUDE.md §29 (processes and isolation), §30 (IPC and capabilities), §42 (executable ABI), §44 (runtime), §49 (SDK) |
@@ -302,3 +302,26 @@ method object_signal = 10 (object: handle<any, signal>, clear: signals, set: sig
 **Migration consequences.** `user-abi` is at major 0 (P12), so no program outside the tree depends on these shapes. G3 and G4 change nothing until their steps; their final shapes may differ, and are put to the owner then.
 
 **What stays unknown.** Each kind's largest kernel object, which G5's figure needs. Whether one directory process serves many programs' tables (step 5, with the session launcher). When built, this runs under QEMU and as KVM guests in CI only.
+
+## Amendment 9 (Accepted, 2026-11-13): the flags at a thread's entry
+
+**Status: Accepted by the owner on 2026-11-13 with the recommended answer ("Accept all 5", decision sheet item 272; CLAUDE.md §84). The kernel already starts a thread this way; nothing proves it at boot yet.** The evidence is `docs/research/2026-11-12-psabi-revision.md`, rows R1 and R2. The independent review of task S4-1 raised it (finding F7): the runtime's `_start` relied on the direction flag, and P6 did not state the flags.
+
+| # | Item | Decision | Refines |
+|---|---|---|---|
+| H1 | 272 | **At a thread's entry the direction flag and the six status flags are clear, and interrupts are on.** RFLAGS.DF, CF, PF, AF, ZF, SF and OF are 0, as the table for process initialization has them in the System V x86-64 psABI that CLAUDE.md §17 pins, and IF is 1. A program may rely on no other bit of RFLAGS. This holds for a process's first thread and for every thread started later. | P6 |
+
+**Options that were put.** (a) As decided. (b) State the whole register, `0x202`: it would promise bits that are the kernel's to choose, such as AC and ID, and any bit a later processor adds. (c) State nothing, and leave each runtime to clear the direction flag itself: a program not built on Origin's runtime would then have nothing to rely on.
+
+**Recorded, and no decision.**
+- The kernel starts every thread with RFLAGS `0x202` today (`NEW_RFLAGS` in the framework's `stack.rs`), which meets H1.
+- `origin-rt`'s `_start` clears the direction flag itself since S4-1's review. Whether it keeps doing so is its builder's choice: H1 makes it unnecessary and it costs one byte.
+- A boot proof that reads the flags at entry, before any instruction of the program changes them, with a control that starts a thread with the direction flag set, is owed with the next task that touches the launch path (S4-2). Until then the matrix row is "not verified".
+
+**Performance cost (ADR-0018 V3).** None, by construction: it states what the kernel already does.
+
+**Trade-offs.** A program gets less than the whole register. That is deliberate: what it gets is what the psABI's calling sequence needs.
+
+**Migration consequences.** None: `user-abi` is at major 0 (P12), and the kernel's behaviour does not change.
+
+**What stays unknown.** Nothing has read the flags from ring 3 at entry. The psABI's other chapters were not read against this revision (the ledger's section 4).

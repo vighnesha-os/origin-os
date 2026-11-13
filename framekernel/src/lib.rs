@@ -69,6 +69,8 @@
 //! - [`topology`]: CPU topology (thread/core/module/tile/die/package, and core types) from
 //!   CPUID leaves 1Fh, 0Bh and 80000026h;
 //! - [`nvme`]: NVMe controller registers, queue entries and indexes, Identify data;
+//! - [`program`]: the programs the kernel carries in its image, as the build laid them out, and
+//!   the launch path's arithmetic on them (task S4-1);
 //! - [`paging`]: 4-level page tables with structural W^X (the `origin-paging` crate,
 //!   shared with the loader);
 //! - [`pci`]: the MCFG, ECAM addressing, configuration headers, enumeration and BAR
@@ -129,6 +131,7 @@ pub mod net;
 pub mod numa;
 pub mod nvme;
 pub mod originfs;
+pub mod program;
 pub use origin_frame::{
     acpi, amdvi, apic, apstart, bitmap, boot, clock, cpumap, descriptors, dmar, features, frames,
     heap, ivrs, pci, topology, unwind, usercopy, vtd,
@@ -190,6 +193,8 @@ mod pcie;
 mod port;
 #[cfg(target_os = "none")]
 mod process;
+#[cfg(target_os = "none")]
+mod program_proof;
 #[cfg(target_os = "none")]
 mod sched;
 #[cfg(target_os = "none")]

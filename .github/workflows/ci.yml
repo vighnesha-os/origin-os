@@ -1,8 +1,22 @@
 # Continuous integration (CLAUDE.md §8 and §82; the owner's decision, item 32 of
-# docs/engineering/OWNER_DECISIONS.md): the project's gates on x86-64 Linux.
+# docs/engineering/OWNER_DECISIONS.md): the project's gates on x86-64 Linux, and one job on
+# macOS that builds the images there and compares them with the Linux job's (decision item 275).
 #
 # GitHub's standard runners are free for this public repository, and this workflow uses nothing
 # else (§80). It has no secrets and only reads the repository.
+#
+# Every job builds with exactly the pinned compiler: install-rust.sh fails unless rustc reports
+# the version rust-toolchain.toml names and the commit developer-tools/toolchain/rustc-commit-hash
+# holds (§8).
+#
+# Every cargo command here carries `--locked`, so a job stops before it builds anything if
+# Cargo.lock is out of step with the manifests. Without the flag cargo rewrites the file and
+# carries on. That first command resolves the whole workspace, so the cargo commands xtask starts
+# afterwards resolve the same workspace against the same file and have nothing to change; they
+# do not repeat the flag. xtask's Loom models are the one other resolution: a scratch workspace
+# built from a lock of its own (developer-tools/xtask/src/loom.lock), which xtask holds with
+# `--locked` itself (loom.rs). The root Cargo.lock holds the workspace's packages alone
+# (`cargo xtask check`).
 #
 # Neither kind of boot below qualifies anything (§74, rule 30): the devices and the firmware are
 # QEMU's, and the processors are whatever GitHub's fleet holds, not the declared hardware.
@@ -26,6 +40,30 @@ env:
   ORIGIN_BOOT_TEST_TIMEOUT: 600
 
 jobs:
+  # CLAUDE.md §9 and §10: the toolchain's own checks and the three regression tests, on the
+  # compiler this run installed. §10's wcslen test builds the loader itself. The report goes to
+  # the run's summary page and not into the checkout, which the last step holds unchanged.
+  toolchain:
+    name: toolchain verification (verify.sh)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: bash .github/ci/install-rust.sh
+      - name: Verify the toolchain
+        run: bash developer-tools/toolchain/verify.sh --report "$RUNNER_TEMP/VERIFICATION.md"
+      - name: The report
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f "$RUNNER_TEMP/VERIFICATION.md" ]; then
+            cat "$RUNNER_TEMP/VERIFICATION.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: The job left the checkout as committed
+        run: bash .github/ci/checkout-unchanged.sh
+
   check:
     name: cargo xtask check
     runs-on: ubuntu-24.04
@@ -36,7 +74,81 @@ jobs:
           persist-credentials: false
       - name: Install the pinned Rust toolchain
         run: bash .github/ci/install-rust.sh
-      - run: cargo xtask check
+      - run: cargo --locked xtask check
+      # A copy of every file the reproducible-build gate read, from each of its two builds:
+      # the three loaders, each carried program's files and the kernel (TASKS item 32). A
+      # digest that differs from another machine's can then be looked into byte by byte. Kept
+      # when `check` fails too. If `check` failed before the gate there is nothing to keep,
+      # which warns; and this step never decides whether the job passes.
+      - name: Keep the files the reproducible-build gate read
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reproducible-gate-files
+          path: target/xtask/reproducible/files
+          if-no-files-found: warn
+          retention-days: 14
+          # A re-run of the job replaces the files of the attempt before it (the review of TASKS
+          # item 52, finding 9).
+          overwrite: true
+      # What `--locked` cannot say: that nothing the job ran afterwards rewrote Cargo.lock, or
+      # any other tracked file. This job runs every build the others do.
+      - name: The job left the checkout as committed
+        run: bash .github/ci/checkout-unchanged.sh
+
+  # Decision item 275 (CLAUDE.md §75): the images are compared across two kinds of host on every
+  # run. The reproducible-build gate in `check` builds each image twice on one machine, which
+  # cannot see an input that every build on that machine shares: where the toolchain is, the
+  # host the compiler reports, the linker's name for itself. Each of those once made an image
+  # other bytes on a Mac than on Linux (docs/research/2026-11-11-toolchain-path-in-images.md).
+  # This job builds the same files on a macOS host and compares them, file by file, with the
+  # files the Linux job kept. A difference, a file on one side only, or no Linux artifact fails
+  # it.
+  #
+  # `macos-26` is one of GitHub's standard runners, free for a public repository (§80); the
+  # labels that end in -large or -xlarge are not. It is an Apple-processor machine, the kind of
+  # host the development Mac is: two kinds of host, not three. The images are unsigned, and
+  # the commit is whatever was pushed, not a release candidate.
+  #
+  # The comparison is a step of this job and not a job of its own: `reproducible-compare`
+  # compares a directory with the checkout's own kept files, and only a job that ran the gate
+  # has those.
+  images-on-macos:
+    name: the images on a macOS host, compared with the Linux host's
+    needs: check
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: bash .github/ci/install-rust.sh
+      - run: cargo --locked xtask reproducible-gate
+      - name: Keep the files the reproducible-build gate read
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reproducible-gate-files-macos
+          path: target/xtask/reproducible/files
+          if-no-files-found: warn
+          retention-days: 14
+          # A re-run of the job replaces the files of the attempt before it (the review of TASKS
+          # item 52, finding 9).
+          overwrite: true
+      # Outside the checkout, which the last step holds unchanged. If the Linux job kept
+      # nothing, this step fails, and so does the job.
+      - name: Fetch the files the Linux job kept
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: reproducible-gate-files
+          path: ${{ runner.temp }}/linux-files
+      - name: Compare this host's files with the Linux host's
+        run: cargo --locked xtask reproducible-compare "$RUNNER_TEMP/linux-files"
+      - name: The job left the checkout as committed
+        run: bash .github/ci/checkout-unchanged.sh
 
   # The control: every proof, on QEMU's software CPU, as on the development Mac.
   boot-software-cpu:
@@ -51,7 +163,7 @@ jobs:
         run: bash .github/ci/install-rust.sh
       - name: Build QEMU
         run: bash .github/ci/install-qemu.sh
-      - run: cargo xtask boot-matrix
+      - run: cargo --locked xtask boot-matrix
 
   # The same boots on a real processor through KVM. Two runner images, because that is the only
   # say a job has in which processor it gets. xtask holds every proof to its markers, except the
@@ -87,14 +199,14 @@ jobs:
         run: bash .github/ci/install-qemu.sh
       - name: Let this job use KVM
         run: bash .github/ci/enable-kvm.sh
-      - run: cargo xtask boot-matrix
+      - run: cargo --locked xtask boot-matrix
       - name: The processor as it is, nothing masked
         if: ${{ !cancelled() }}
         env:
           ORIGIN_QEMU_CPU: host
           ORIGIN_QEMU_SMP: 4
           ORIGIN_BOOT_TEST_ONLY: kernel boot
-        run: cargo xtask boot-test
+        run: cargo --locked xtask boot-test
 
   # Which vendors and models this run's real-CPU boots ran on, in one table on the run's summary
   # page, with a notice on the pull request. A record only: it never fails the run.

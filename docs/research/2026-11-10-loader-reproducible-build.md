@@ -141,7 +141,7 @@ So on one machine neither image depends on the time, on what was built before, o
 
 ## 9. Found, not changed
 
-**The images hold the path the toolchain is installed at.** This is the next thing that stands between these builds and §75's independent rebuild.
+**The images hold the path the toolchain is installed at.** This is the next thing that stands between these builds and §75's independent rebuild. (Taken out on 2026-11-11 by TASKS item 32, which also makes `xtask` refuse `RUSTFLAGS`: `2026-11-11-toolchain-path-in-images.md`.)
 
 - The loader holds one such path and the kernel eight, all of this form: `/Users/<account>/.rustup/toolchains/1.99.1-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/slice/mod.rs`. They are the source locations of panics in standard-library code that is compiled into Origin's crates.
 - The path holds the builder's account name and the build host's triple. CI installs the toolchain under another home directory, with `x86_64-unknown-linux-gnu` in the name. The strings differ in length there, so the images built on the Mac and in CI cannot be the same bytes. That is a prediction from the strings: no image built on another machine was compared.

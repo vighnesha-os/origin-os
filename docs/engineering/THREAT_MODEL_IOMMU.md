@@ -85,6 +85,8 @@ Status: **Proven** (boot proof and control, QEMU), **By design** (no proof), **O
 3. **T14.** Identity maps exist for attached devices (TASKS item 40, 2026-11-12), so a USB or integrated-graphics driver can attach a device that needs one. Still open: firmware-owned devices with no driver, which I12 stops at enumeration. Their exceptions are a hardware-qualification decision (R1 (b)).
 4. **T23.** Blocked attacks should at least be logged.
 
+**Accepted for bench boots on rented servers only** (decision item 230, 2026-11-12): T4's two windows, T5, T6, T8, T9 and T23, by name. Such a server holds no device of an attacker's and no data of value. The acceptance does not reach a volunteer's machine, a release, or any claim about hardware, and T14 is not accepted: identity maps close it, and the deadline of items 8 and 12 holds for rented servers too (item 229). The plan is `docs/research/2026-11-12-first-bare-metal-boot.md`.
+
 Before external devices are supported: T8, T9, and §32's external-device authorization (sheet item 9). Before third-party drivers: a capability-checked DMA interface, under its own ADR and threat model.
 
 ## References

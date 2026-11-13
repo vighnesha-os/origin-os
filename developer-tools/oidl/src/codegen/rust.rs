@@ -1178,14 +1178,14 @@ fn abi_scalar(g: &Gen<'_>, ty: &Type) -> String {
         Type::Int(int) => int.rust().to_string(),
         Type::Enum(e) => e.repr.rust().to_string(),
         Type::Bits(b) => b.repr.rust().to_string(),
-        Type::Handle(_) => "u64".to_string(),
+        Type::Handle(_) => format!("u{}", layout::HANDLE_BITS),
         other => g.fixed(3, other),
     }
 }
 
 fn abi_element(ty: &Type) -> String {
     match ty {
-        Type::Handle(_) => "u64".to_string(),
+        Type::Handle(_) => format!("u{}", layout::HANDLE_BITS),
         Type::Int(int) => int.rust().to_string(),
         _ => "u8".to_string(),
     }

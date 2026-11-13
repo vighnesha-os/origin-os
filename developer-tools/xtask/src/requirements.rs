@@ -266,6 +266,8 @@ struct Directive {
     problems: Vec<String>,
     /// For each PART, the SHA-256 of the lines no row quotes: see [`unquoted`].
     unquoted: BTreeMap<u8, String>,
+    /// Each numbered section's title, as its heading `## N. Title` gives it.
+    titles: BTreeMap<u8, String>,
 }
 
 /// Bytes as lower-case hexadecimal.
@@ -418,7 +420,11 @@ fn directive(text: &str) -> Directive {
                 let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
                 if digits > 0 && rest[digits..].starts_with(". ") {
                     match rest[..digits].parse() {
-                        Ok(number) => section = Section::Numbered(number),
+                        Ok(number) => {
+                            section = Section::Numbered(number);
+                            out.titles
+                                .insert(number, rest[digits + 2..].trim().to_string());
+                        }
                         Err(_) => out.problems.push(format!(
                             "line {line_number}: a section number too large to read"
                         )),
@@ -581,6 +587,8 @@ struct Decision {
 #[derive(Debug, PartialEq, Eq)]
 struct Adr {
     number: u16,
+    /// What its `# ADR-NNNN: Title` heading says after the colon.
+    title: String,
     /// Whether its status is Accepted: only then are its decisions requirements.
     accepted: bool,
     decisions: Vec<Decision>,
@@ -643,6 +651,7 @@ fn adr(text: &str) -> Option<Adr> {
     }
 
     let mut number = None;
+    let mut title = String::new();
     let mut accepted = false;
     let mut decisions: Vec<Decision> = Vec::new();
     let mut second = String::new();
@@ -707,6 +716,7 @@ fn adr(text: &str) -> Option<Adr> {
             {
                 let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
                 number = rest[..digits].parse().ok();
+                title = rest[digits..].trim_start_matches(':').trim().to_string();
             }
             if level == 2 {
                 second = heading.to_string();
@@ -814,6 +824,7 @@ fn adr(text: &str) -> Option<Adr> {
     decisions.sort_by_key(|d| d.line);
     Some(Adr {
         number: number?,
+        title,
         accepted,
         decisions,
     })
@@ -1008,7 +1019,7 @@ fn readme(text: &str) -> Readme {
 /// Where evidence ran, and what a row's scope asks for, weakest first (CLAUDE.md §1, "Qualify
 /// the declared environment").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Env {
+pub(crate) enum Env {
     /// Tests and tools on the development host.
     Host,
     /// QEMU's software processor.
@@ -1042,7 +1053,7 @@ impl Env {
 
 /// What a row asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     /// Something to build or deliver.
     Build,
     /// A standing rule on how the work is done.
@@ -1053,7 +1064,7 @@ enum Kind {
 
 /// How far a row has come.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum State {
+pub(crate) enum State {
     NotStarted,
     /// Something is in the tree, and no evidence for it is.
     NotVerified,
@@ -1065,6 +1076,20 @@ enum State {
     Done,
     /// Taken out of scope by a decision item. Not counted.
     Removed,
+}
+
+impl State {
+    /// The state as a row of the matrix writes it.
+    pub(crate) fn named(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not-started",
+            Self::NotVerified => "not-verified",
+            Self::Partial => "partial",
+            Self::Built => "built",
+            Self::Done => "done",
+            Self::Removed => "removed",
+        }
+    }
 }
 
 /// Who reviewed a row's implementation.
@@ -1092,24 +1117,26 @@ enum Evidence {
 
 /// One row of the matrix.
 #[derive(Debug)]
-struct Row {
-    file: String,
+pub(crate) struct Row {
+    /// The matrix file it is in, without the directory.
+    pub(crate) file: String,
     line: usize,
-    id: String,
+    pub(crate) id: String,
     requirement: String,
-    kind: Kind,
+    pub(crate) kind: Kind,
     /// The environment the row's scope asks its evidence to have run in.
     scope: Option<Env>,
     /// The number of the role that owns it.
     owner: u8,
     /// `None` only for a row that asks for nothing.
-    state: Option<State>,
+    pub(crate) state: Option<State>,
     implementation: Vec<String>,
     acceptance: bool,
     /// The acceptance criteria as written.
     criteria: String,
     evidence: Vec<Evidence>,
-    env: Option<Env>,
+    /// Where its evidence ran.
+    pub(crate) env: Option<Env>,
     review: Review,
     limitations: bool,
     decided: Vec<u32>,
@@ -1440,6 +1467,58 @@ fn listed(problems: &mut Vec<String>, mut found: Vec<String>) {
     }
 }
 
+/// The rows of the matrix's files, `(name, text)` without the README, each file's rows in their
+/// order. What cannot be read is added to `problems`, and its rows are left out. Every reader of
+/// the matrix reads it here: this gate, the roadmap's and the progress page.
+pub(crate) fn matrix_rows(files: &[(String, String)], problems: &mut Vec<String>) -> Vec<Row> {
+    let mut rows: Vec<Row> = Vec::new();
+    for (file, text) in files {
+        let at = format!("{MATRIX}/{file}");
+        if home(file).is_none() {
+            problems.push(format!(
+                "{at} is not a file of the matrix: `directive-NN-<name>.md`, `adr-NNNN.md` or `README.md`"
+            ));
+            continue;
+        }
+        let found = tables(text);
+        let [table] = found.as_slice() else {
+            problems.push(format!(
+                "{at} holds {} tables, and a file of the matrix holds one",
+                found.len()
+            ));
+            continue;
+        };
+        if !is_header(&table.header, &COLUMNS) {
+            problems.push(format!(
+                "{at}: the table's header is not `| {} |`",
+                COLUMNS.join(" | ")
+            ));
+            continue;
+        }
+        for (line, cells) in &table.rows {
+            match row(file, *line, cells) {
+                Ok(row) => rows.push(row),
+                Err(problem) => problems.push(format!("{at}:{line}: {problem}")),
+            }
+        }
+    }
+    rows
+}
+
+/// Each numbered section of the directive and its title, as its heading `## N. Title` gives it.
+pub(crate) fn section_titles(directive_text: &str) -> BTreeMap<u8, String> {
+    directive(directive_text).titles
+}
+
+/// Each ADR's number, its title, and whether it is accepted, from `(name, text)` pairs. An ADR
+/// with no `# ADR-NNNN` title is left out: the requirements gate refuses it.
+pub(crate) fn adr_titles(adrs: &[(String, String)]) -> BTreeMap<u16, (String, bool)> {
+    adrs.iter()
+        .filter_map(|(_, text)| adr(text))
+        .map(|adr| (adr.number, (adr.title, adr.accepted)))
+        .collect()
+}
+
 /// Everything wrong with the matrix, and its figure.
 fn problems(sources: &Sources<'_>, tree: &dyn Tree) -> (Vec<String>, Figure) {
     let mut problems = Vec::new();
@@ -1507,37 +1586,7 @@ fn problems(sources: &Sources<'_>, tree: &dyn Tree) -> (Vec<String>, Figure) {
     }
 
     // The rows.
-    let mut rows: Vec<Row> = Vec::new();
-    for (file, text) in sources.files {
-        let at = format!("{MATRIX}/{file}");
-        if home(file).is_none() {
-            problems.push(format!(
-                "{at} is not a file of the matrix: `directive-NN-<name>.md`, `adr-NNNN.md` or `README.md`"
-            ));
-            continue;
-        }
-        let found = tables(text);
-        let [table] = found.as_slice() else {
-            problems.push(format!(
-                "{at} holds {} tables, and a file of the matrix holds one",
-                found.len()
-            ));
-            continue;
-        };
-        if !is_header(&table.header, &COLUMNS) {
-            problems.push(format!(
-                "{at}: the table's header is not `| {} |`",
-                COLUMNS.join(" | ")
-            ));
-            continue;
-        }
-        for (line, cells) in &table.rows {
-            match row(file, *line, cells) {
-                Ok(row) => rows.push(row),
-                Err(problem) => problems.push(format!("{at}:{line}: {problem}")),
-            }
-        }
-    }
+    let rows = matrix_rows(sources.files, &mut problems);
     if rows.is_empty() {
         problems.push("no row was read: nothing was checked".to_string());
         return (problems, figure);
@@ -1999,7 +2048,7 @@ fn problems(sources: &Sources<'_>, tree: &dyn Tree) -> (Vec<String>, Figure) {
 }
 
 /// `part` of `whole`, as a percentage with one decimal.
-fn percent(part: usize, whole: usize) -> String {
+pub(crate) fn percent(part: usize, whole: usize) -> String {
     if whole == 0 {
         return "0.0%".to_string();
     }
@@ -2059,16 +2108,18 @@ fn report(figure: &Figure) -> String {
 
 /// The matrix and its sources as the checkout holds them.
 #[derive(Debug)]
-struct Read {
-    directive: String,
-    adrs: Vec<(String, String)>,
+pub(crate) struct Read {
+    pub(crate) directive: String,
+    /// Each ADR's file name and text.
+    pub(crate) adrs: Vec<(String, String)>,
     sheet: String,
     readme: String,
-    files: Vec<(String, String)>,
+    /// Each file of the matrix but its README: its name and text, sorted by name.
+    pub(crate) files: Vec<(String, String)>,
 }
 
 /// Reads the matrix and its sources from the checkout.
-fn read() -> Result<Read> {
+pub(crate) fn read() -> Result<Read> {
     let root = repo_root();
     let text =
         |path: PathBuf| fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()));
@@ -2098,6 +2149,30 @@ fn read() -> Result<Read> {
         readme: text(root.join(MATRIX).join("README.md"))?,
         files: markdown(MATRIX, &|name| name != "README.md")?,
     })
+}
+
+/// The figure of this checkout's matrix, for the progress page's test that its counts agree:
+/// counted rows, done, built, in progress (`partial` and `not-verified`), not started, and the
+/// rows whose evidence ran in each environment.
+#[cfg(test)]
+pub(crate) fn tree_counts() -> (usize, usize, usize, usize, usize, [usize; 4]) {
+    let read = read().expect("the matrix and its sources");
+    let sources = Sources {
+        directive: &read.directive,
+        adrs: &read.adrs,
+        sheet: &read.sheet,
+        readme: &read.readme,
+        files: &read.files,
+    };
+    let (_, figure) = problems(&sources, &Disk(repo_root()));
+    (
+        figure.counted,
+        figure.done,
+        figure.built,
+        figure.partial + figure.not_verified,
+        figure.not_started,
+        figure.ran,
+    )
 }
 
 /// The gate: the matrix is complete and true to the tree, and its figure is printed.

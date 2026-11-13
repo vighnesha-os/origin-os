@@ -4,7 +4,7 @@ CLAUDE.md §1 makes 100% coverage of approved requirements the completion target
 
 | | |
 |---|---|
-| Directive revision | 7.6 |
+| Directive revision | 7.8 |
 | Version | The matrix is versioned with the repository: a commit's matrix is checked against that commit's directive, ADRs and tree. |
 | The figure | Printed by `cargo xtask requirements-gate`, and not written here, so it cannot go stale. |
 | Evidence so far | Host tests, QEMU, and guests under KVM in CI. Nothing has run on a physical machine (CLAUDE.md §74). |
@@ -98,10 +98,10 @@ A row quotes a statement. The directive's headings, its code blocks (§8's `rust
 
 | Part | Headings and code blocks |
 |---|---|
-| 00 | d077d9bba4e5533a7ff065a1d6666f8fea0d9211a5136ee2c125631ef396f137 |
+| 00 | 4c0eb67ef376bf393296bbd8359ea95853b04b11a7ed4749b7494b0ff3d3c770 |
 | 01 | 9574396467ce88db554ffc3f9463d575fadd2d4a78e739c7e2f9c8ab2f8e252f |
 | 02 | 1da37825b5c4a35fe5f1408b44dc4a2e9e9f44412a1d2079addc78cfc43bb5cc |
-| 03 | 662b16e6e2a2a37901153898774fae959f32c3166c12716a7c1b528fc294b7a7 |
+| 03 | 8db217ade4bd8371cae157a19d571cc0d9083f72209dff868794cb40b6c59e4c |
 | 04 | 0c31aadbb4e67324b30a914452e8fb910f3ae2910c0c95da512ec18a0d316935 |
 | 05 | 21101169dacc3ce7ef8852f62b5d41f03bba5a1fc3599bda9762c299ded41c8c |
 | 06 | 0727dd4c05d1e5b9d06349d50ea10275424260949f1e0e5ede3f1f11c53db918 |
@@ -128,9 +128,9 @@ Two cells move the figure by themselves. A row marked `info` leaves the count, a
 | List | Rows |
 |---|---|
 | done | H-05 |
-| done | S1-03, S5-01, S5-10, S6-01, S8-01, S8-02, S8-04, S8-06, S8-08, S9-11, S10-06, S11-01, S11-02, S12-01, S13-01, S13-12, S13-14, S13-15, S17-03, S17-26, S18-16, S18-17, S59-03, S59-13, S62-01, S62-16, S62-17, S72-08, S79-04, S84-07, S84-11, S84-12 |
+| done | S1-03, S5-01, S5-10, S6-01, S6-02, S6-03, S6-04, S6-05, S6-06, S6-07, S6-08, S6-09, S6-10, S6-11, S6-13, S8-01, S8-02, S8-04, S8-06, S8-08, S9-11, S10-04, S10-06, S11-01, S11-02, S12-01, S13-01, S13-12, S13-14, S13-15, S17-03, S17-26, S18-16, S18-17, S59-03, S59-13, S60-03, S60-11, S62-01, S62-16, S62-17, S72-08, S79-04, S82-19, S84-07, S84-11, S84-12 |
 | done | F-01 |
-| done | A15-D8 |
+| done | A15-D8, A18-V2 |
 | info | H-01, H-02, H-03, H-04, H-09, H-10 |
 | info | S1-01, S1-02, S1-07, S1-75, S1-102, S4-01, S4-02, S4-03, S4-04, S4-05, S4-06, S4-07, S4-08, S4-09, S4-10, S4-11, S4-12, S4-13, S4-14, S4-15, S5-02, S7-01, S12-03, S14-12, S17-24, S49-30, S63-07, S70-17, S71-12, S77-01, S79-01, S80-02, S82-18 |
 | info | P9-01 |
@@ -148,6 +148,7 @@ Every answered item of `docs/engineering/OWNER_DECISIONS.md` is named in the "De
 | 23 | none | A comparison of two AMD manuals with AMD's own copies, done once. |
 | 70, 161 | none | How pull requests are offered: at 100 commits, and pull request 15 at 76. A rule of process that no statement of the directive or decision of an ADR carries. |
 | 167, 190 | none | How task 18b and the randomized model of its policy land: through pull request 16. Rules of process. |
+| 224–228, 231–236 | none | How rented bench machines are used: the provider, the budget cap, who signs up and holds the credentials, the order of the rentals, how Origin boots there (items 231 and 236), what is kept and where, what a bench record may claim, no self-hosted runner, and rentals through Latitude's API (`docs/research/2026-11-12-first-bare-metal-boot.md`). Rules of process for bench equipment, which ADR-0009 A1 keeps outside the declared scope. |
 
 ## Scope changes
 
@@ -194,6 +195,7 @@ It does not check:
 - **An ADR is accepted or amended.** Add a row for each new decision to its `adr-NNNN.md`, or add the file.
 - **The owner answers a decision item.** Name it in the row it decided, or list it above.
 - **Work lands.** Change the row's state with the cells that state needs, and give the row the criterion its task's contract writes for it (CLAUDE.md §78). A row that becomes `done` is added to the list of done rows above.
+- **A row's state changes, or the roadmap places a row or gives a milestone's state.** Run `cargo xtask progress` and commit `docs/PROGRESS.md` with the change: `cargo xtask check` refuses a page that is not the one the tree generates.
 - **A heading or a code block of the directive changes.** Read the change against that PART's rows, then record the digest the gate prints.
 - **Something runs on a machine.** Write its record under `docs/hardware/records/`, with the machine, its firmware, the source revision, the date and the result, and name it in the rows it is evidence for.
 - **A state never goes up on memory.** It follows what the tree shows: `docs/STATUS.md`, the boot proofs, the tests and the gates.

@@ -4,6 +4,14 @@
 
 use crate::model::{Method, Param, Struct, Type};
 
+/// A handle's width in bits wherever a handle's value crosses a boundary: a system-call
+/// register, an out pointer, an element of a handle vector or array, and each handle a transport
+/// delivers with a message (§10, §7.4; ADR-0005 Amendment 6, E1). A slot in a `channel` message
+/// is a position, not a handle, and is 4 bytes whatever this is. The generator emits handles of
+/// this width and the canonical description records it (§13, decision item 237), so neither can
+/// change without the other.
+pub const HANDLE_BITS: u32 = 64;
+
 /// Size of the message header (§7.1).
 pub const HEADER_SIZE: u64 = 16;
 /// Every message is aligned on this.

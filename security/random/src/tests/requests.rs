@@ -202,9 +202,9 @@ fn what_follows_a_draws_last_try_falls_on_the_processor_that_made_it() {
     next_u64(&mut world).unwrap();
     assert_eq!(world.tries(0, Instruction::Rdseed) - before.0, 40);
     assert_eq!(world.tries(1, Instruction::Rdseed), before.1);
-    for cpu in 0..2 {
-        assert_eq!(world.cpus[cpu].node.faults(Instruction::Rdseed), 0);
-        assert_eq!(world.cpus[cpu].node.counts().not_now_rdseed, 0);
+    for cpu in &world.cpus[..2] {
+        assert_eq!(cpu.node.faults(Instruction::Rdseed), 0);
+        assert_eq!(cpu.node.counts().not_now_rdseed, 0);
     }
     // The next request on processor 0 makes the sixty tries the draw has left, and the
     // instruction fails there.

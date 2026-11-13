@@ -1,11 +1,11 @@
 # ORIGIN OS — DEFINITIVE PRODUCTION ENGINEERING DIRECTIVE
-## Version 7.6 — Original-Source, Rust 1.99.1, Research-Verified Operating System
+## Version 7.8 — Original-Source, Rust 1.100.0, Research-Verified Operating System
 
 **Product:** Origin OS, in two editions of one release: Origin Desktop and Origin Server  
 **Kernel:** Framekernel  
 **Research baseline:** November 7, 2026  
-**Revision:** 7.6, 2026-11-11. §77 no longer lists 26 engineering agents of its own: it points to the roles of §1 (decision sheet item 189). Revision 7.5 (2026-11-11) replaced the first sentence of §1 with the owner's text for the roles: the lead roles, 100% coverage of approved requirements as the completion target, measured against a versioned requirements matrix, 67 specialist roles with their responsibilities, and 25 engineering requirements that apply to every role. It is the owner's third text of that day, improved by Claude where the owner said "You decide"; the decision sheet lists every change (items 165 and 168). Revision 7.4 (2026-11-10) added the decisions of the design review (`docs/engineering/DESIGN_REVIEW_2026-11-10.md`, decision sheet items 106–123): how the SDK-only rule is enforced and what the server's GUI rule means (§48), security rules for the GUI (§52), a system threat model (§58), one kernel random-number generator (§59), three more rules for reference code (§3), build rules for the kernel (§13, §14), provisional performance budgets (§53), and how the records themselves land (§6, §79, §82). It also carried two answers on the kernel's random-number generator, accepted the same day with ADR-0016 (items 149 and 151): the standards it is pinned to (§17) and what its health tests are (§59). Revision 7.3 (2026-11-10) added the Server edition (`docs/adr/ADR-0014-server-edition.md`), every device standard through the SDK (`docs/adr/ADR-0015-device-standards-sdk.md`), Origin-owned Secure Boot keys as the default (ADR-0002 Amendment 1), rules for the public repository, a stricter hardware scope with the core generation named at boot (ADR-0009 Amendment 1), and Linux and other open-source code as a reference only, kept apart from the code, recorded and read at today's version (§3, §6) (decision sheet items 71–97). Revision 7.2 (2026-11-09) amended §48 and §70 to match ADR-0011, the native SDK (item 39). Revision 7.1 (2026-11-07) added the ONBF decisions (`docs/adr/ADR-0001-onbf.md`) and toolchain and standards corrections (`docs/research/2026-11-07-onbf.md` §5). v7.5 is kept at `docs/engineering/CLAUDE-v7.5.md`, v7.4 at `docs/engineering/CLAUDE-v7.4.md`, v7.3 at `docs/engineering/CLAUDE-v7.3.md`, v7.2 at `docs/engineering/CLAUDE-v7.2.md`, v7.1 at `docs/engineering/CLAUDE-v7.1.md` and v7.0 at `docs/engineering/CLAUDE-v7.0.md`.  
-**Mandatory compiler:** Rust 1.99.1 stable  
+**Revision:** 7.8, 2026-11-13. The mandatory compiler is Rust 1.100.0 stable, in place of 1.99.1, by the owner's instruction and through §15 (decision sheet items 278 and 279). Revision 7.7 (2026-11-13) made §17 name the revision of the System V x86-64 psABI and what Origin takes from it (item 271). Revision 7.6 (2026-11-11) made §77 point to the roles of §1, in place of 26 engineering agents of its own (item 189). Revision 7.5 (2026-11-11) replaced the first sentence of §1 with the owner's text for the roles: the lead roles, 100% coverage of approved requirements as the completion target, measured against a versioned requirements matrix, 67 specialist roles with their responsibilities, and 25 engineering requirements that apply to every role. It is the owner's third text of that day, improved by Claude where the owner said "You decide"; the decision sheet lists every change (items 165 and 168). Revision 7.4 (2026-11-10) added the decisions of the design review (`docs/engineering/DESIGN_REVIEW_2026-11-10.md`, decision sheet items 106–123): how the SDK-only rule is enforced and what the server's GUI rule means (§48), security rules for the GUI (§52), a system threat model (§58), one kernel random-number generator (§59), three more rules for reference code (§3), build rules for the kernel (§13, §14), provisional performance budgets (§53), and how the records themselves land (§6, §79, §82). It also carried two answers on the kernel's random-number generator, accepted the same day with ADR-0016 (items 149 and 151): the standards it is pinned to (§17) and what its health tests are (§59). Revision 7.3 (2026-11-10) added the Server edition (`docs/adr/ADR-0014-server-edition.md`), every device standard through the SDK (`docs/adr/ADR-0015-device-standards-sdk.md`), Origin-owned Secure Boot keys as the default (ADR-0002 Amendment 1), rules for the public repository, a stricter hardware scope with the core generation named at boot (ADR-0009 Amendment 1), and Linux and other open-source code as a reference only, kept apart from the code, recorded and read at today's version (§3, §6) (decision sheet items 71–97). Revision 7.2 (2026-11-09) amended §48 and §70 to match ADR-0011, the native SDK (item 39). Revision 7.1 (2026-11-07) added the ONBF decisions (`docs/adr/ADR-0001-onbf.md`) and toolchain and standards corrections (`docs/research/2026-11-07-onbf.md` §5). v7.7 is kept at `docs/engineering/CLAUDE-v7.7.md`, v7.6 at `docs/engineering/CLAUDE-v7.6.md`, v7.5 at `docs/engineering/CLAUDE-v7.5.md`, v7.4 at `docs/engineering/CLAUDE-v7.4.md`, v7.3 at `docs/engineering/CLAUDE-v7.3.md`, v7.2 at `docs/engineering/CLAUDE-v7.2.md`, v7.1 at `docs/engineering/CLAUDE-v7.1.md` and v7.0 at `docs/engineering/CLAUDE-v7.0.md`.  
+**Mandatory compiler:** Rust 1.100.0 stable  
 **Rust edition:** 2024  
 **Processor architecture:** x86-64 exclusively: 64-bit long mode only. No 32-bit or x32 code, and no Windows `.exe` or `.msi` compatibility.  
 **Target hardware:** Intel platforms introduced in 2026 or later, and AMD platforms introduced in 2026 or later with Zen 5 or newer cores. Older machines are bench equipment only: no support or qualification claim rests on them (ADR-0009, Amendment 1)  
@@ -41,7 +41,7 @@ Treat 100% coverage of approved requirements as the completion target. Measure c
 
 Pursue the highest achievable accuracy, performance, security, responsiveness, and reliability through explicit contracts, independent review, reproducible tests, and recorded measurements. Keep correctness, security, and data integrity as mandatory acceptance requirements throughout optimization.
 
-Follow the approved Rust 1.99.1 stable and Rust 2024 baseline, original-source policy, SDK-only rule, architecture decisions, hardware scope, and release requirements. Process compiler changes through the approved upgrade and qualification procedure.
+Follow the approved Rust 1.100.0 stable and Rust 2024 baseline, original-source policy, SDK-only rule, architecture decisions, hardware scope, and release requirements. Process compiler changes through the approved upgrade and qualification procedure.
 
 Begin every engineering session by establishing the actual source revision, repository state, implemented behavior, recorded decisions, task ownership, and current verification evidence before selecting the next task. Continue development through working, reviewable, tested milestones.
 
@@ -392,15 +392,15 @@ Measure working capabilities and conformance instead.
 
 ---
 
-# PART III — MANDATORY RUST 1.99.1 TOOLCHAIN
+# PART III — MANDATORY RUST 1.100.0 TOOLCHAIN
 
 ## 8. Compiler version
 
-Rust 1.99.1 is the mandatory initial production compiler.
+Rust 1.100.0 is the mandatory production compiler.
 
 Require:
 
-- Rust 1.99.1.
+- Rust 1.100.0.
 - Rust edition 2024.
 - Cargo corresponding to the pinned toolchain.
 - Verified Rust installation.
@@ -411,7 +411,7 @@ Use `rust-toolchain.toml`:
 
 ```toml
 [toolchain]
-channel = "1.99.1"
+channel = "1.100.0"
 profile = "minimal"
 components = ["rustfmt", "clippy", "rust-src", "llvm-tools"]
 targets = [
@@ -488,13 +488,13 @@ Do not assume that a custom Origin target automatically provides `std`, threadin
 
 ## 12. Stable-only baseline and nightly exception policy
 
-Stable Rust 1.99.1 is mandatory for the standard release build.
+Stable Rust 1.100.0 is mandatory for the standard release build.
 
 Avoid unstable features unless technically required.
 
 Custom target specifications and rebuilding Rust standard-library components may need unstable toolchain facilities.
 
-If a feature cannot be implemented using stable 1.99.1:
+If a feature cannot be implemented using stable 1.100.0:
 
 1. Identify the exact limitation.
 2. Verify the Rust documentation.
@@ -503,7 +503,7 @@ If a feature cannot be implemented using stable 1.99.1:
 5. Pin the exact nightly commit.
 6. Isolate that build path.
 7. Require approval before it enters a release.
-8. Preserve stable Rust 1.99.1 as the main compiler baseline.
+8. Preserve stable Rust 1.100.0 as the main compiler baseline.
 
 Do not secretly build shipping artifacts with another compiler.
 
@@ -554,7 +554,7 @@ Do not globally enable aggressive CPU features that are unavailable on some supp
 
 The CPU baseline is `x86-64-v3`. Higher features (AVX-512/AVX10, APX) need runtime detection or a per-image declaration (ONBF §6.1.3).
 
-On stable Rust 1.99.1, `-Z cf-protection` (IBT/ENDBR64) and `-Z stack-protector` are unavailable; re-verify per §9. Enforce CET shadow stacks (they need no code generation), guard pages, W^X, full RELRO and frame pointers (`-C force-frame-pointers=yes`). Enable IBT once a stable flag exists.
+On stable Rust 1.100.0, `-Z cf-protection` (IBT/ENDBR64) and `-Z stack-protector` are unavailable; re-verify per §9. Enforce CET shadow stacks (they need no code generation), guard pages, W^X, full RELRO and frame pointers (`-C force-frame-pointers=yes`). Enable IBT once a stable flag exists.
 
 Build the kernel and the loader with integer overflow checks on in release builds. Build the kernel with x86-64-v3's integer instructions (POPCNT, LZCNT, BMI1, BMI2, MOVBE) once the loader refuses a processor below the baseline before it enters the kernel. The kernel stays without SIMD (decision item 123).
 
@@ -605,7 +605,7 @@ Initial reference baseline:
 
 - UEFI 2.11.
 - ACPI 6.6.
-- Rust 1.99.1.
+- Rust 1.100.0.
 - Current Intel SDM.
 - Current AMD64 architecture documentation.
 - PCI Express 6.4 and 7.0: the latest confirmed on 2026-11-07. PCIe 8.0 is still a draft. Re-verify on pcisig.com.
@@ -619,7 +619,7 @@ Initial reference baseline:
 - Unicode 18.0.
 - TPM 2.0 Library Specification Version 185, and the current TCG PC Client specifications.
 - TUF specification 1.0.37.
-- System V x86-64 psABI (pin the revision after verification).
+- System V x86-64 psABI, version 1.0, as the repository's `master` stood at commit `e1ce0983` of 2025-03-12 when read on 2026-11-12: its data representation and its function calling sequence, and not its process start-up stack, its auxiliary vector or its ILP32 chapter (decision item 271).
 - FIPS 180-4, FIPS 202, FIPS 204 (with the NIST errata), FIPS 205 and NIST SP 800-208.
 - RFC 8032 (Ed25519), RFC 8949 (CBOR) and RFC 8878 (Zstandard).
 - IEEE 802.11-2024 with the 802.11be amendment (Wi-Fi 7). Re-verify when Wi-Fi work starts.
@@ -2144,7 +2144,7 @@ Implement source files when their design contracts and development tasks are rea
 
 **M0 — Toolchain and engineering foundation**
 
-Pin Rust 1.99.1, validate cross-compilation, establish repository, tests, research governance, source provenance and CI.
+Pin Rust 1.100.0, validate cross-compilation, establish repository, tests, research governance, source provenance and CI.
 
 **M1 — Bootable Framekernel**
 
@@ -2242,7 +2242,7 @@ No implementation is complete merely because source code was generated.
 Immediately:
 
 1. Inspect actual repository state.
-2. Check Rust 1.99.1 availability.
+2. Check Rust 1.100.0 availability.
 3. Verify Cargo and cross-compilation targets.
 4. Verify QEMU/OVMF.
 5. Verify linker operation on Apple Silicon.
@@ -2288,7 +2288,7 @@ Never fabricate test results or implementation status.
 
 # FINAL MANDATORY ENGINEERING RULES
 
-1. Rust 1.99.1 stable is the initial mandatory compiler baseline.
+1. Rust 1.100.0 stable is the mandatory compiler baseline.
 2. Origin OS-owned source must be independently authored.
 3. No third-party OS runtime code may be imported silently.
 4. Framekernel must boot independently.

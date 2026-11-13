@@ -1,0 +1,17 @@
+[package]
+name = "origin-rt"
+description = "The Origin runtime for Rust programs in ring 3: the entry from the start record, the panic handler and the mem* functions (task S4-1; CLAUDE.md §11, §44)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Built only for the userspace triple, with `.cargo/userspace.toml` (`cargo xtask`); never a
+# default member: its entry is x86-64 assembly and its panic handler would clash with `std`.
+[dependencies]
+origin-abi = { path = "../abi" }
+origin-kernel-stubs = { path = "../kernel-stubs" }
+origin-rt-mem = { path = "../rt-mem" }
+
+[lints]
+workspace = true

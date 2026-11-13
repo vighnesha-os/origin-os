@@ -43,7 +43,7 @@ One row for each statement of CLAUDE.md in §42 to §47. The columns and their r
 | S44-05 | Support: TLS. | build | both/hw | 18 | not-started | - | - | - | - | none | - | - |
 | S44-06 | Support: Synchronization. | build | both/hw | 18 | not-started | - | - | - | - | none | - | - |
 | S44-07 | Support: Files. | build | both/hw | 18 | not-started | - | - | - | - | none | - | - |
-| S44-08 | Support: Networking. | build | both/hw | 18 | not-started | - | - | - | - | none | - | - |
+| S44-08 | Support: Networking. | build | both/hw | 18 | not-started | - | - | - | - | none | - | 262 |
 | S44-09 | Support: Time. | build | both/hw | 18 | not-started | - | - | - | - | none | - | - |
 | S44-10 | Support: Environment. | build | both/hw | 18 | not-started | - | - | - | - | none | - | - |
 | S44-11 | Support: Standard input/output. | build | both/hw | 18 | not-started | - | - | - | - | none | - | - |
