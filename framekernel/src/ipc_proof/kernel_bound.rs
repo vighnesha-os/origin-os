@@ -20,6 +20,8 @@
 //! - **the refund waits**: a channel charged to a process's account outlives the process
 //!   object, and the root has its payment back only when the channel goes (the coordinating
 //!   session's ruling (c));
+//! - **threads counted**: a process given no threads cannot start one, and the refusal takes
+//!   nothing (G5's "a kernel stack and an FPU area for each thread" is paid for by that count);
 //! - **back after**: when the proof's processes are gone the root holds its size again; and the
 //!   most of it the proofs before this one paid out at once is printed, a figure.
 //!
@@ -38,6 +40,7 @@ use crate::ipc;
 use crate::process::{self, BOOT_PROOF_PRINCIPAL, Limits, MemoryLimits, ObjectLimits, Process, ROOT};
 use crate::program::{FIRST_PROGRAM, FIRST_PROGRAM_RUN};
 use crate::{memory, sched};
+use origin_frame::objref::ObjectRef;
 
 /// The creator of the launches, which never runs.
 const CREATOR: Limits = Limits {
@@ -172,6 +175,7 @@ pub(crate) fn prove_kernel_bound(
         }
     };
     let waits = refund_waits(com1, tsc_hz);
+    let counted = threads_counted(com1, bsp);
 
     // Back after: the proof's own processes are gone.
     let after = back_whole(tsc_hz);
@@ -182,7 +186,7 @@ pub(crate) fn prove_kernel_bound(
         size >> 10,
         verdict(after)
     );
-    before && once && refused && made && waits && after
+    before && once && refused && made && waits && counted && after
 }
 
 /// The refusal: a holder takes all of the root but `launch - 1` bytes, and a launch that pays
@@ -333,4 +337,28 @@ fn refund_waits(com1: &mut Console, tsc_hz: u64) -> bool {
         verdict(held && back)
     );
     held && back
+}
+
+/// Threads counted: a start in a process whose limits give no threads is refused before it takes
+/// a kernel stack, an FPU area or anything else.
+fn threads_counted(com1: &mut Console, bsp: CpuIndex) -> bool {
+    let made = Process::proof(holder(0), (0, 0), BOOT_PROOF_PRINCIPAL)
+        .and_then(|process| ObjectRef::try_new(process).ok());
+    let Some(process) = made else {
+        let _ = writeln!(
+            com1,
+            "origin-kernel: kernel bound: the process given no threads could not be made: kernel bound failed"
+        );
+        return false;
+    };
+    let before = snapshot();
+    let refused = Process::start_thread(&process, bsp, 0x1000, 0x2000, 0).is_err();
+    let nothing = before.is_some() && before == snapshot();
+    drop(process);
+    let _ = writeln!(
+        com1,
+        "origin-kernel: kernel bound: a process given no threads cannot start one: {refused}; the refusal took nothing: {nothing}{}",
+        verdict(refused && nothing)
+    );
+    refused && nothing
 }

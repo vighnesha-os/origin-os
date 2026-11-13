@@ -2509,6 +2509,7 @@ fn kernel_bound_markers(generator: bool) -> Vec<String> {
     markers.extend([
         "origin-kernel: kernel bound: a process whose channel outlives it keeps its ".into(),
         " bytes out of the root after the process object is dropped: true; they come back when the channel goes: true".into(),
+        "origin-kernel: kernel bound: a process given no threads cannot start one: true; the refusal took nothing: true".into(),
         "origin-kernel: kernel bound: after this proof the root is back at its size: true; the most of it the proofs before this one had paid out at once was ".into(),
     ]);
     markers
