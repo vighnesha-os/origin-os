@@ -787,8 +787,16 @@ fn no_generator_markers(scenario: &mut Scenario) {
         "origin-kernel: random: no generator: known-answer test passed; on the boot processor RDSEED is absent and RDRAND is absent. Nothing will be launched and nothing placed at a random address (ADR-0016 R8)".into(),
         "origin-kernel: random: processor 0: RDSEED absent (0 draws passed), RDRAND absent (0 draws passed); its generator NOT seeded".into(),
         "origin-kernel: random: no generator, so no request is answered; consistent false: random failed".into(),
+        // The root is sized whatever the generator (ADR-0005 G5).
+        "origin-kernel: kernel bound: the root holds ".into(),
+        " KiB kept for the kernel's own use; a second sizing is refused and changes nothing: true".into(),
         "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, Rust-program, origin.core, entry-flags, service-directory and memory-object proofs did not run".into(),
         "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: true; the loader handed over no random value: true, and the region is at its fixed base: true".into(),
+    ];
+    // The bound's proof refuses a launch before any place is drawn, so it runs here too; only
+    // the run of the program to its end is left out (ADR-0005 G5).
+    scenario.markers.extend(kernel_bound_markers(false));
+    scenario.markers.extend([
         // The network asks for no lease: a transaction ID must not be guessable.
         "; DHCP lease 0.0.0.0 (".into(),
         "; no random value for a transaction ID or port; consistent false: virtio-net failed".into(),
@@ -796,7 +804,7 @@ fn no_generator_markers(scenario: &mut Scenario) {
         "; 6 did not run; failed: ".into(),
         "random-number generator (no randomness)".into(),
         HALT_LINE.into(),
-    ];
+    ]);
     // What this machine is expected to say is not a failure here.
     scenario.failures.retain(|failure| {
         ![
@@ -1493,6 +1501,10 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // ADR-0011 L2).
             "origin-kernel: origin.core: ".into(),
             " bytes of code, the stubs of 20 calls and nothing else, written once into 1 frames and read back as written, the rest of each page the linker's int3; every process pinned per call maps them read-execute (free frames fell by ".into(),
+            // The kernel's root, sized once before the first process (ADR-0005 G5; task S4-3).
+            "origin-kernel: kernel bound: the root holds ".into(),
+            " KiB of free frames less a reserve of ".into(),
+            " KiB kept for the kernel's own use; a second sizing is refused and changes nothing: true".into(),
             // The guard is in the kernel stacks' region, whose addresses the boot never prints
             // (ADR-0004 Amendment 2, A6.3).
             "origin-kernel: page protection: the first thread's stack guard page faulted (#PF error 0x0)".into(),
@@ -1579,6 +1591,9 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(stack_markers(machine))
         .chain([
             "origin-kernel: scheduler: exited threads' stacks reaped on their own CPUs: heap ".into(),
+        ])
+        .chain(kernel_bound_markers(true))
+        .chain([
             // ADR-0017 Z3: the scheduler noted each change of process, with one barrier for
             // each where the processor has IBPB and none where it has not.
             "origin-kernel: ibpb: ".into(),
@@ -1883,6 +1898,7 @@ fn boot_failures() -> Vec<&'static str> {
         ": memory failed",
         ": events and ports failed",
         ": user clock failed",
+        ": kernel bound failed",
         ": console failed",
         ": TLB failed",
         ": address spaces failed",
@@ -2469,6 +2485,33 @@ fn events_ports_markers() -> Vec<String> {
         "origin-kernel: clock: 30 reads from ring 3 never went back: true; each lies between the kernel's readings before and after: true; a wait to a deadline on the same clock ended after it: true; a bad out pointer is fault: true; one read every ".into(),
         " ns (QEMU, through the script interpreter)".into(),
     ]
+}
+
+/// The kernel-wide bound's proof (ADR-0005 G5; task S4-3; `ipc_proof::prove_kernel_bound`).
+/// `generator`: whether the boot has a random-number generator, which the run of the program
+/// to its end needs to place it.
+fn kernel_bound_markers(generator: bool) -> Vec<String> {
+    let mut markers: Vec<String> = vec![
+        "origin-kernel: kernel bound: costs as this build measures them, in bytes: a process ".into(),
+        "origin-kernel: kernel bound: after every earlier proof the root is back at its size, ".into(),
+        " KiB: true; it cannot be sized again: true".into(),
+        "origin-kernel: kernel bound: with all of the root but ".into(),
+        " bytes held by a process that never runs, one byte short of what a launch of the first program pays, ".into(),
+        " bytes: true; the launch is refused with LIMIT: true; nothing was made, the root, the heap in use, the free frames, the next process ID and the kernel stacks as they were: true".into(),
+        "origin-kernel: kernel bound: with the holder gone the root has room again: true; a process with the program's limits takes their figure, ".into(),
+        " bytes, to the byte and gives it back when dropped: true; the program launched and run to its end pays ".into(),
+    ];
+    markers.push(if generator {
+        " bytes until it is gone, then gives everything back: true".into()
+    } else {
+        " bytes until it is gone, then gives everything back: not run, no generator".into()
+    });
+    markers.extend([
+        "origin-kernel: kernel bound: a process whose channel outlives it keeps its ".into(),
+        " bytes out of the root after the process object is dropped: true; they come back when the channel goes: true".into(),
+        "origin-kernel: kernel bound: after this proof the root is back at its size: true; the most of it the proofs before this one had paid out at once was ".into(),
+    ]);
+    markers
 }
 
 /// The memory-object proof (ADR-0005 P7, P11, C6-C8; `ipc_proof::prove_memory`).

@@ -1235,6 +1235,12 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
         stacks(),
         if reaped { "" } else { ": scheduler failed" }
     );
+    // The kernel-wide bound (ADR-0005 G5; task S4-3), after every proof that makes a process, so
+    // that its root can be seen whole again.
+    proofs.record(
+        Proof::KernelBound,
+        crate::ipc_proof::prove_kernel_bound(com1, cpus, bsp, tsc_hz),
+    );
 }
 
 /// Stops the boot processor's scheduler and timer once the boot proofs are done, so the

@@ -120,10 +120,12 @@ use Arg::{Handle as Hd, Imm};
 mod core_pin;
 mod directory;
 mod events_ports;
+mod kernel_bound;
 mod memory_objects;
 pub(crate) use core_pin::{prove_core_pin, prove_entry_flags};
 pub(crate) use directory::prove_directory;
 pub(crate) use events_ports::{prove_events_ports, prove_user_clock};
+pub(crate) use kernel_bound::prove_kernel_bound;
 pub(crate) use memory_objects::prove_memory;
 
 /// What a step must do.
