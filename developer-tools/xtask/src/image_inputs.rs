@@ -427,28 +427,67 @@ fn built_into(path: &Path) -> Option<(&Path, &str)> {
         .then_some((target.parent()?, name))
 }
 
-/// Makes Cargo link `path` again, by having it remove everything it built for that file's
-/// target in that target directory.
+/// The packages whose linked files Cargo writes for `target`: the kernel for the kernel's
+/// target, and each ring-3 image the kernel carries for the userspace's.
+fn linked_packages(target: &str) -> Vec<&'static str> {
+    if target == KERNEL_TARGET {
+        vec![KERNEL_PACKAGE]
+    } else {
+        ring3::carried_packages().collect()
+    }
+}
+
+/// The arguments of a `cargo clean` of `packages`, as built for `target` into `directory`.
+/// An error if no package is named.
+///
+/// **The packages are what make it safe**, so no call can be made without one. Without
+/// `--package`, `cargo clean --release --target <target>` does not look at the target at all:
+/// it removes the host's own `release` directory, and without `--release` the whole target
+/// directory (measured with Cargo 1.99.1 and 1.100.0 on 2026-11-13, after a first form of
+/// this did exactly that and left the stale file where it was).
+fn clean_arguments(
+    directory: &Path,
+    target: &str,
+    packages: &[&str],
+) -> Result<Vec<std::ffi::OsString>> {
+    if packages.is_empty() {
+        return Err(format!(
+            "no package is named for a `cargo clean` of {target} in {}: without `--package`, Cargo would remove the host's own `release` directory and leave what was meant",
+            directory.display()
+        ));
+    }
+    let mut arguments: Vec<std::ffi::OsString> =
+        ["clean", "--quiet", "--release", "--target", target]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+    arguments.push("--target-dir".into());
+    arguments.push(directory.into());
+    for package in packages {
+        arguments.push("--package".into());
+        arguments.push(package.into());
+    }
+    Ok(arguments)
+}
+
+/// Makes Cargo link `path` again, by having it remove what it built of the packages that
+/// link a file for that file's target.
 ///
 /// Removing the file alone does not do it: Cargo keeps what the linker wrote among its
 /// intermediate files and gives the old file its name back without linking. Where those files
 /// are and what they are called is no interface: Cargo 1.100.0 moved them, and a shared
 /// library's copy never had the hash in its name that a program's has. So nothing here names
-/// one, and `cargo clean` is Cargo's own way. It costs one build of that target's crates, on
-/// the rare run that finds a file from before the fixed line.
+/// one, and `cargo clean --package` is Cargo's own way. It costs one more compilation of those
+/// packages, on the rare run that finds a file from before the fixed line.
 fn remove_linked(path: &Path) -> Result {
     let (directory, target) = built_into(path).ok_or_else(|| {
         format!(
-            "{} is not `<target directory>/<target>/release/<file>`, so what to have Cargo build again is not known",
+            "{} is not `<target directory>/<target>/release/<file>` for a target an image is linked for, so what to have Cargo build again is not known",
             path.display()
         )
     })?;
-    crate::run_step(
-        crate::cargo()
-            .args(["clean", "--quiet", "--release", "--target", target])
-            .arg("--target-dir")
-            .arg(directory),
-    )
+    let arguments = clean_arguments(directory, target, &linked_packages(target))?;
+    crate::run_step(crate::cargo().args(arguments))
 }
 
 /// [`build_with_the_fixed_line`] over the three things it does to a file, so that a test can
@@ -870,6 +909,44 @@ mod tests {
             "",
         ] {
             assert_eq!(built_into(Path::new(other)), None, "{other}");
+        }
+        // The clean names the packages that link a file for that target, always: without one,
+        // `cargo clean` removes the host's own directory and leaves the stale file. An empty
+        // list is refused, so no such command can be put together.
+        let refused = clean_arguments(Path::new("/t"), KERNEL_TARGET, &[])
+            .expect_err("a clean with no package");
+        assert!(refused.contains("no package is named"), "{refused}");
+        let words = |target: &str, packages: &[&str]| -> Vec<String> {
+            clean_arguments(Path::new("/t"), target, packages)
+                .expect("packages were named")
+                .iter()
+                .map(|word| word.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            words(KERNEL_TARGET, &linked_packages(KERNEL_TARGET)),
+            [
+                "clean",
+                "--quiet",
+                "--release",
+                "--target",
+                "x86_64-unknown-none",
+                "--target-dir",
+                "/t",
+                "--package",
+                "framekernel"
+            ]
+        );
+        // For the userspace's target: every ring-3 image the kernel carries, each after its
+        // own `--package`.
+        let carried: Vec<&str> = ring3::carried_packages().collect();
+        assert!(carried.contains(&"first-program"));
+        assert_eq!(linked_packages(ring3::USERSPACE_TARGET), carried);
+        let userspace = words(ring3::USERSPACE_TARGET, &carried);
+        assert_eq!(userspace[4], "x86_64-unknown-linux-gnu");
+        assert_eq!(userspace.len(), 7 + 2 * carried.len());
+        for (pair, package) in userspace[7..].chunks(2).zip(&carried) {
+            assert_eq!(pair, ["--package", package]);
         }
         // A linker that does not write the fixed line: an error after one more build, never a
         // third.
