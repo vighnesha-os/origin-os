@@ -572,6 +572,42 @@ pub fn translate(
     None
 }
 
+/// The first IOVA (lowest) whose leaf maps the 4 KiB physical page at `phys`, walking every
+/// present entry of the `levels`-deep host tables rooted at `root` that is one `map` makes (each
+/// directory entry naming the next level down); `None` if no leaf names it. For the proofs,
+/// which must show that a domain reaches a page at no IOVA at all (TASKS item 40's review, L5).
+pub fn find_physical(mem: &mut impl TableMemory, root: u64, levels: u8, phys: u64) -> Option<u64> {
+    fn walk<M: TableMemory>(
+        mem: &mut M,
+        table: u64,
+        level: u8,
+        base: u64,
+        phys: u64,
+    ) -> Option<u64> {
+        for i in 0..ENTRIES {
+            let e = mem.read(table, i);
+            if e & pte::PRESENT == 0
+                || (e & pte::NEXT_LEVEL) >> pte::NEXT_LEVEL_SHIFT != u64::from(level - 1)
+            {
+                continue;
+            }
+            let iova = base | (i as u64) << (12 + 9 * u32::from(level - 1));
+            if level == 1 {
+                if e & ADDRESS == phys & ADDRESS {
+                    return Some(iova);
+                }
+            } else if let Some(found) = walk(mem, e & ADDRESS, level - 1, iova, phys) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    if !(3..=5).contains(&levels) {
+        return None;
+    }
+    walk(mem, root, levels, 0, phys)
+}
+
 /// An interrupt remapping table entry for a remapped interrupt (§2.2.5): RemapEn set, fixed
 /// delivery, physical destination mode, no EOI request, page-fault events kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1208,6 +1244,36 @@ mod tests {
             self.pages.insert(t, [0; ENTRIES]);
             Some(t)
         }
+    }
+
+    #[test]
+    fn a_physical_page_is_found_at_whatever_iova_maps_it() {
+        let (mut m, root) = Model::new(32);
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), None);
+        let high = IOVA_BASE + 0x3456_7000;
+        map(&mut m, root, 4, high, 0x7_5000, Access::READ_WRITE).unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), Some(high));
+        map(&mut m, root, 4, 0x7_5000, 0x7_5000, Access::READ_WRITE).unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), Some(0x7_5000));
+        map(&mut m, root, 4, IOVA_BASE, 0x7_6000, Access::READ_WRITE).unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_4000), None);
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_6000), Some(IOVA_BASE));
+        unmap(&mut m, root, 4, 0x7_5000).unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), Some(high));
+        unmap(&mut m, root, 4, high).unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), None);
+        // An entry `map` does not make (a skipped level) is not followed, as `translate` would
+        // not follow it.
+        let (mut m, root) = Model::new(32);
+        map(&mut m, root, 4, IOVA_BASE, 0x8_8000, Access::READ_WRITE).unwrap();
+        let e = m.read(root, index(IOVA_BASE, 4));
+        m.write(
+            root,
+            index(IOVA_BASE, 4),
+            e & !pte::NEXT_LEVEL | 2 << pte::NEXT_LEVEL_SHIFT,
+        );
+        assert_eq!(find_physical(&mut m, root, 4, 0x8_8000), None);
+        assert_eq!(find_physical(&mut m, root, 2, 0x8_8000), None);
     }
 
     #[test]

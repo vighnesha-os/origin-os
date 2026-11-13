@@ -32,6 +32,7 @@ use crate::addr::PhysAddr;
 use crate::memory::OwnedFrame;
 use crate::mmio::MmioRegion;
 use crate::once::SetOnce;
+use crate::reserved::Lending;
 
 /// Physical ranges of device registers that have been handed out, at most one owner each. A
 /// claim outside `map_mmio` is the framework's own (the IOMMU's registers, ECAM): no driver
@@ -516,24 +517,24 @@ pub fn map_mmio(phys: PhysAddr, len: u64) -> Result<MmioRegion, MmioError> {
     Ok(unsafe { MmioRegion::from_mapped(virt as usize, len as usize, phys) })
 }
 
-/// Firmware memory a device may write by DMA: the reserved ranges the IOMMU identity-maps
-/// writable ([`device_writable`]). [`firmware_bytes`] never hands these out as a reference.
-static DEVICE_WRITABLE: SpinLock<Vec<(u64, u64)>> = SpinLock::new(Vec::new());
+/// Firmware memory lent as references ([`firmware_bytes`]) and firmware memory a device may
+/// write by DMA (the reserved ranges the IOMMU identity-maps writable, [`device_writable`]),
+/// under one lock, so neither can be granted over the other (threat T26; TASKS item 40's
+/// review, M1).
+static LENDING: SpinLock<Lending> = SpinLock::new(Lending::new());
 
 /// Records that devices may write firmware memory `[base, end)` from now on (the IOMMU calls
-/// this before it can map such a range). Only [`read_firmware`] reads it afterwards.
-pub fn device_writable(base: u64, end: u64) {
-    crate::cpu::without_interrupts(|| DEVICE_WRITABLE.lock().push((base, end)));
+/// this before it can map such a range); only [`read_firmware`] reads it afterwards. `false`,
+/// and nothing recorded, if [`firmware_bytes`] has lent any of it: the IOMMU must then refuse
+/// the range.
+pub fn device_writable(base: u64, end: u64) -> bool {
+    crate::cpu::without_interrupts(|| LENDING.lock().allow_writes(base, end))
 }
 
-/// Whether a device may write any of `[raw, end)`.
-fn device_may_write(raw: u64, end: u64) -> bool {
-    crate::cpu::without_interrupts(|| {
-        DEVICE_WRITABLE
-            .lock()
-            .iter()
-            .any(|&(b, e)| b < end && raw < e)
-    })
+/// Every firmware range [`firmware_bytes`] has lent as a reference, `[base, end)`: the ACPI
+/// tables the kernel holds for its life. The IOMMU refuses a writable identity range over any.
+pub fn lent_ranges() -> Vec<(u64, u64)> {
+    crate::cpu::without_interrupts(|| LENDING.lock().lent().to_vec())
 }
 
 /// Whether `[raw, end)` is memory the firmware described as its own (reserved, ACPI, runtime
@@ -597,8 +598,11 @@ pub fn firmware_bytes(addr: PhysAddr, len: u64) -> Result<&'static [u8], MapErro
         return Err(MapError::Overflow);
     }
     let end = raw.checked_add(len).ok_or(MapError::Overflow)?;
-    // Not memory a device may write: a reference to it could change under the reader.
-    if !is_firmware_data(raw, end) || device_may_write(raw, end) {
+    // Not memory a device may write: a reference to it could change under the reader. Lent
+    // from here on, so no device is ever allowed to write it.
+    if !is_firmware_data(raw, end)
+        || !crate::cpu::without_interrupts(|| LENDING.lock().lend(raw, end))
+    {
         return Err(MapError::OutOfMemory);
     }
     let virt = map_firmware(raw, len)?;

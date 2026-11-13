@@ -449,6 +449,43 @@ pub fn translate(
     None
 }
 
+/// The first IOVA (lowest) whose leaf maps the 4 KiB physical page at `phys`, walking every
+/// present entry of the `levels`-deep tables rooted at `root`; `None` if no leaf names it. A
+/// large page is skipped: `map` never makes one, and `translate` reaches none. For the proofs,
+/// which must show that a domain reaches a page at no IOVA at all, not only at one (TASKS item
+/// 40's review, L5).
+pub fn find_physical(mem: &mut impl TableMemory, root: u64, levels: u8, phys: u64) -> Option<u64> {
+    fn walk<M: TableMemory>(
+        mem: &mut M,
+        table: u64,
+        level: u8,
+        base: u64,
+        phys: u64,
+    ) -> Option<u64> {
+        for i in 0..ENTRIES {
+            let e = mem.read(table, i);
+            if !present(e) {
+                continue;
+            }
+            let iova = base | (i as u64) << (12 + 9 * u32::from(level - 1));
+            if level == 1 {
+                if e & ADDRESS == phys & ADDRESS {
+                    return Some(iova);
+                }
+            } else if e & (1 << 7) == 0
+                && let Some(found) = walk(mem, e & ADDRESS, level - 1, iova, phys)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    if !(3..=5).contains(&levels) {
+        return None;
+    }
+    walk(mem, root, levels, 0, phys)
+}
+
 /// How an IRTE checks who sent an interrupt (the SVT and SQ fields).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceCheck {
@@ -1057,6 +1094,50 @@ mod tests {
         assert_eq!(ContextEntry::decode([0xABC_D000, 2]), None, "not present");
         assert_eq!(ContextEntry::decode([0xABC_D009, 2]), None, "pass-through");
         assert_eq!(ContextEntry::decode([0xABC_D001, 7]), None, "AW 7");
+    }
+
+    #[test]
+    fn a_physical_page_is_found_at_whatever_iova_maps_it() {
+        let (mut m, root) = Memory::new(64);
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), None);
+        // Mapped at two IOVAs far apart: the lower is found.
+        let high = IOVA_BASE + 0x3456_7000;
+        map(&mut m, root, 4, high, 0x7_5000, Access::READ_WRITE, false).unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), Some(high));
+        map(
+            &mut m,
+            root,
+            4,
+            0x7_5000,
+            0x7_5000,
+            Access::READ_WRITE,
+            false,
+        )
+        .unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), Some(0x7_5000));
+        // A neighbouring page is not this one, and an unmapped page is found nowhere.
+        map(
+            &mut m,
+            root,
+            4,
+            IOVA_BASE,
+            0x7_6000,
+            Access::READ_WRITE,
+            false,
+        )
+        .unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_4000), None);
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_6000), Some(IOVA_BASE));
+        unmap(&mut m, root, 4, 0x7_5000).unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), Some(high));
+        unmap(&mut m, root, 4, high).unwrap();
+        assert_eq!(find_physical(&mut m, root, 4, 0x7_5000), None);
+        // Five levels reach IOVAs above 2^48, and the walk finds them there too.
+        let (mut m, root) = Memory::new(64);
+        let top = 1u64 << 52;
+        map(&mut m, root, 5, top, 0x9_9000, Access::READ_WRITE, false).unwrap();
+        assert_eq!(find_physical(&mut m, root, 5, 0x9_9000), Some(top));
+        assert_eq!(find_physical(&mut m, root, 2, 0x9_9000), None);
     }
 
     #[test]

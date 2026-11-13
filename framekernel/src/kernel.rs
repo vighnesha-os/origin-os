@@ -372,8 +372,19 @@ pub extern "sysv64" fn kernel_main(entry: Entry) -> ! {
         stop_if_refused(&mut com1, proofs);
         // M5 groundwork: PCI Express enumeration through the ACPI MCFG.
         if let Some(q) = quiesced.as_mut()
-            && let Some(reserved) = pcie::reserved_ranges(&mut com1, q, info.acpi_rsdp)
-            && pcie::init(&mut com1, q, online.cpus(), regions, &reserved)
+            && let Some(mut reserved) = pcie::reserved_ranges(&mut com1, q, info.acpi_rsdp)
+            && {
+                // No BAR where a device's DMA reaches untranslated: every accepted identity
+                // range is reserved too (TASKS item 40's review, L3).
+                let judged = iommu::reserved_ranges();
+                reserved.extend(origin_frame::reserved::identity_ranges(
+                    judged
+                        .iter()
+                        .filter(|r| r.verdict.is_ok())
+                        .filter_map(|r| r.range.as_ref()),
+                ));
+                pcie::init(&mut com1, q, online.cpus(), regions, &reserved)
+            }
         {
             proofs.record(Proof::Pcie, true);
             // Anything that turned bus mastering back on is stopped again before any driver

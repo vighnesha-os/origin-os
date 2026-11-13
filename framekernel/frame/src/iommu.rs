@@ -44,7 +44,7 @@
 //! a device a reference to memory safe code holds; [`init`] runs once. A wrong interrupt route
 //! is a logic error of its caller: it can only deliver a vector the IDT has a gate for.
 
-use alloc::alloc::{Layout, alloc_zeroed};
+use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::fmt::Write;
@@ -78,8 +78,9 @@ const TIMEOUT_NS: u64 = 100_000_000;
 /// Units the kernel drives.
 const MAX_UNITS: usize = 8;
 
-/// A zeroed 4 KiB kernel page, kept for ever (the remapping hardware may read it at any
-/// time): its direct-map address and its physical address.
+/// A zeroed 4 KiB kernel page, kept for ever once a structure the remapping hardware reads
+/// names it (it may then read it at any time): its direct-map address and its physical address.
+/// Only a page nothing names yet is ever given back ([`Page::give_back`]).
 #[derive(Clone, Copy, Debug)]
 struct Page {
     virt: u64,
@@ -91,8 +92,8 @@ impl Page {
     /// hardware reads zeros rather than whatever the memory held before.
     fn new(coherent: bool) -> Option<Self> {
         let layout = Layout::from_size_align(PAGE as usize, PAGE as usize).ok()?;
-        // SAFETY: `layout` has a non-zero size. The page is never freed: the remapping
-        // hardware may read it at any time.
+        // SAFETY: `layout` has a non-zero size. The page is freed only by `give_back`, before
+        // anything the remapping hardware reads names it.
         let p = unsafe { alloc_zeroed(layout) };
         if p.is_null() {
             return None;
@@ -105,6 +106,22 @@ impl Page {
             virt,
             phys: crate::phys::to_phys(virt),
         })
+    }
+
+    /// Frees the page. Only for a page made by [`Page::new`] that no structure the remapping
+    /// hardware can read has ever named (the table pages of an attach that failed before its
+    /// context entry or device table entry was written; TASKS item 40's review, L4), and never
+    /// used again.
+    fn give_back(self) {
+        let Ok(layout) = Layout::from_size_align(PAGE as usize, PAGE as usize) else {
+            return;
+        };
+        let p = ptr::with_exposed_provenance_mut::<u8>(self.virt as usize);
+        // SAFETY: by the contract above, `self.virt` is the pointer `alloc_zeroed` returned in
+        // `Page::new` for this same layout, the page has not been freed (a `Page` is given back
+        // once, by value), and no remapping structure names it, so neither the hardware nor this
+        // module reads it afterwards.
+        unsafe { dealloc(p, layout) };
     }
 
     fn read64(&self, offset: u64) -> u64 {
@@ -239,6 +256,8 @@ struct DomainState {
     /// The firmware-reserved spans identity-mapped for the device, never unmapped, which the
     /// window keeps clear of.
     identity: Vec<(Span, Access)>,
+    /// The judged ranges the identity spans come from, for the proofs.
+    sources: Vec<ReservedRange>,
 }
 
 /// A device's DMA domain, as drivers hold it.
@@ -304,16 +323,29 @@ pub struct ReservedRange {
     pub verdict: Result<(), RangeRefusal>,
 }
 
-/// Judges one range against the platform (`registers` `None`: they could not be listed).
+/// What a range is judged against: the loader's memory map, the platform's register ranges
+/// (`None`: they could not be listed) and the firmware tables the kernel holds as references.
+#[derive(Clone, Copy)]
+struct Against<'a> {
+    memory_map: &'a [MemoryRegion],
+    registers: Option<&'a [(u64, u64)]>,
+    lent: &'a [(u64, u64)],
+}
+
+/// Judges one range against the platform.
 fn judge(
     offset: usize,
     source: Source,
     range: Result<Option<Reserved>, Refusal>,
     width: u8,
-    memory_map: &[MemoryRegion],
-    registers: Option<&[(u64, u64)]>,
+    against: Against<'_>,
     amd: bool,
 ) -> ReservedRange {
+    let Against {
+        memory_map,
+        registers,
+        lent,
+    } = against;
     let (range, verdict) = match range {
         Err(why) => (None, Err(RangeRefusal::Range(why))),
         Ok(None) => (None, Ok(())),
@@ -327,6 +359,7 @@ fn judge(
                         memory_map,
                         registers: registers.unwrap_or(&[]),
                         amd,
+                        lent,
                     },
                 )
                 .map_err(RangeRefusal::Range),
@@ -343,15 +376,22 @@ fn judge(
 }
 
 /// Tells the memory manager which firmware memory devices may now write (every accepted
-/// identity range with write access), so no reference to it is ever handed out.
-fn note_writable(ranges: &[ReservedRange]) {
-    for r in ranges.iter().filter(|r| r.verdict.is_ok()) {
+/// identity range with write access), so no reference to it is ever handed out. A range a
+/// firmware table was lent over since it was judged is refused after all, as `check` refuses
+/// one lent before (threat T26).
+fn note_writable(ranges: &mut [ReservedRange]) {
+    for r in ranges.iter_mut().filter(|r| r.verdict.is_ok()) {
         if let Some(Reserved {
             span,
             use_: Use::Identity(Access { write: true, .. }),
         }) = r.range
+            && !crate::vm::device_writable(span.base, span.end)
         {
-            crate::vm::device_writable(span.base, span.end);
+            let at = crate::vm::lent_ranges()
+                .iter()
+                .find(|&&(b, e)| b < span.end && span.base < e)
+                .map_or(span.base, |&(b, _)| b);
+            r.verdict = Err(RangeRefusal::Range(Refusal::Lent(at)));
         }
     }
 }
@@ -475,10 +515,33 @@ fn poll(mut done: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// The second-level tables of one unit's domains, through the direct map.
+/// The second-level tables of one unit's domains, through the direct map, and the table
+/// pages one walk made.
 struct Tables {
     coherent: bool,
-    made: u64,
+    made: Vec<Page>,
+}
+
+impl Tables {
+    fn new(coherent: bool) -> Self {
+        Self {
+            coherent,
+            made: Vec::new(),
+        }
+    }
+
+    /// How many table pages the walk made.
+    fn count(&self) -> u64 {
+        self.made.len() as u64
+    }
+
+    /// Gives back every table page the walk made: only for tables no structure the hardware
+    /// reads names yet ([`Page::give_back`]).
+    fn give_back(self) {
+        for page in self.made {
+            page.give_back();
+        }
+    }
 }
 
 impl TableMemory for Tables {
@@ -510,7 +573,7 @@ impl TableMemory for Tables {
 
     fn new_table(&mut self) -> Option<u64> {
         let page = Page::new(self.coherent)?;
-        self.made += 1;
+        self.made.push(page);
         Some(page.phys)
     }
 }
@@ -963,21 +1026,28 @@ fn bring_up_all(
         ))
         .min()
         .unwrap_or(39);
-    let reserved: Vec<ReservedRange> = dmar
+    // The DMAR and every other table read so far are lent as references: a writable range over
+    // any of them is refused (threat T26).
+    let lent = crate::vm::lent_ranges();
+    let against = Against {
+        memory_map,
+        registers,
+        lent: &lent,
+    };
+    let mut reserved: Vec<ReservedRange> = dmar
         .reserved_memory()
         .map(|m| {
             judge(
                 m.offset,
                 Source::Rmrr,
-                Ok(reserved::from_rmrr(m.base, m.limit)),
+                reserved::rmrr_range(m.base, m.limit).map(Some),
                 width,
-                memory_map,
-                registers,
+                against,
                 false,
             )
         })
         .collect();
-    note_writable(&reserved);
+    note_writable(&mut reserved);
     for (r, m) in reserved.iter().zip(dmar.reserved_memory()) {
         let mut devices = alloc::string::String::new();
         for (i, sc) in m.scopes().enumerate() {
@@ -1063,6 +1133,7 @@ impl Iommu {
         // have passed bring-up's checks, and they must not ask for a page to be both mapped
         // and never mapped.
         let mut ranges: Vec<Reserved> = Vec::new();
+        let mut sources: Vec<ReservedRange> = Vec::new();
         for m in self.dmar.reserved_memory() {
             if m.segment != r.segment || !m.covers(r, &mut Config) {
                 continue;
@@ -1078,9 +1149,13 @@ impl Iommu {
                 );
             }
             ranges.extend(judged.range);
+            sources.push(*judged);
         }
         let identity = reserved::merge(&ranges)
             .map_err(|_| "its reserved ranges ask for a page to be both mapped and never mapped")?;
+        reserved::bounded(&identity).map_err(
+            |_| "its reserved ranges hold more pages than the kernel identity-maps for one device",
+        )?;
         let ui = self.unit_of(r)?;
         let unit = self.units.get_mut(ui).ok_or("no unit")?;
         let coherent = unit.ecap.coherent;
@@ -1088,17 +1163,21 @@ impl Iommu {
             return Err("its unit has no free domain ID");
         }
         let id = unit.next_domain as u16;
-        // Consumed before any entry names it: an attach that fails below may have left a
-        // context entry behind, and that domain ID must never go to another device.
-        unit.next_domain += 1;
         let top = Page::new(coherent).ok_or("no memory for a page table")?;
         // The identity maps first, so the device never sees its domain without them (ledger
         // R1). Read and write separately, as the firmware gives them; SNP as for every leaf.
-        let mut tables = Tables { coherent, made: 0 };
+        // Until the context entry is written nothing the hardware reads names these tables, so
+        // a failure gives every page back (review L4).
+        let mut tables = Tables::new(coherent);
+        let fail = |tables: Tables, why: &'static str| {
+            tables.give_back();
+            top.give_back();
+            Err(why)
+        };
         for &(span, access) in &identity {
             let mut page = span.base;
             while page < span.end {
-                vtd::map(
+                if vtd::map(
                     &mut tables,
                     top.phys,
                     unit.levels,
@@ -1107,17 +1186,25 @@ impl Iommu {
                     access,
                     unit.ecap.snoop_control,
                 )
-                .map_err(|_| "a reserved page could not be identity-mapped")?;
+                .is_err()
+                {
+                    return fail(tables, "a reserved page could not be identity-mapped");
+                }
                 page += PAGE;
             }
         }
-        let made = tables.made;
+        let made = tables.count();
         let bus = usize::from(r.bus);
         let context = match unit.contexts.get(bus).copied().flatten() {
             Some(c) => c,
             None => {
-                let c = Page::new(coherent).ok_or("no memory for a context table")?;
-                let [lo, hi] = vtd::root_entry(c.phys).ok_or("a context table is misplaced")?;
+                let Some(c) = Page::new(coherent) else {
+                    return fail(tables, "no memory for a context table");
+                };
+                let Some([lo, hi]) = vtd::root_entry(c.phys) else {
+                    c.give_back();
+                    return fail(tables, "a context table is misplaced");
+                };
                 let at = 16 * bus as u64;
                 unit.root.write64(at + 8, hi);
                 fence(Ordering::SeqCst);
@@ -1131,14 +1218,20 @@ impl Iommu {
                 c
             }
         };
-        let [lo, hi] = ContextEntry {
+        let Some([lo, hi]) = (ContextEntry {
             domain: id,
             page_table: top.phys,
             levels: unit.levels,
             fault_processing_disable: false,
-        }
-        .encode()
-        .ok_or("a context entry does not encode")?;
+        })
+        .encode() else {
+            return fail(tables, "a context entry does not encode");
+        };
+        // The pages are the domain's from here on: the context entry names them.
+        drop(tables);
+        // Consumed before the entry names it: an attach that fails below has left a context
+        // entry behind, and that domain ID must never go to another device.
+        unit.next_domain += 1;
         let devfn = u64::from(r.device & 0x1F) << 3 | u64::from(r.function & 7);
         // The high half first, so the entry turns present (low bit 0) only when complete.
         context.write64(16 * devfn + 8, hi);
@@ -1172,6 +1265,7 @@ impl Iommu {
             mapped_ever: 0,
             tables: 1 + made,
             identity,
+            sources,
         });
         Ok(Domain(self.domains.len() - 1))
     }
@@ -1184,10 +1278,7 @@ impl Iommu {
             .window
             .alloc_skipping(1, &holes)
             .ok_or("the domain's IOVA window is full")?;
-        let mut tables = Tables {
-            coherent: unit.ecap.coherent,
-            made: 0,
-        };
+        let mut tables = Tables::new(unit.ecap.coherent);
         // SNP where the unit offers snoop control: a device's No Snoop cannot then bypass
         // the caches every DMA buffer lives in (VT-d §3.10).
         vtd::map(
@@ -1200,7 +1291,7 @@ impl Iommu {
             unit.ecap.snoop_control,
         )
         .map_err(|_| "the page could not be mapped")?;
-        dom.tables += tables.made;
+        dom.tables += tables.count();
         dom.mapped += 1;
         dom.mapped_ever += 1;
         if unit.cap.caching_mode {
@@ -1219,14 +1310,11 @@ impl Iommu {
 
     fn unmap(&mut self, d: Domain, iova: u64) -> Result<u64, &'static str> {
         let dom = self.domains.get_mut(d.0).ok_or("no such domain")?;
-        if dom.identity.iter().any(|(s, _)| s.contains(iova)) {
+        if !reserved::may_unmap(&dom.identity, iova) {
             return Err("an identity-mapped reserved page is never unmapped");
         }
         let unit = self.units.get_mut(dom.unit).ok_or("no unit")?;
-        let mut tables = Tables {
-            coherent: unit.ecap.coherent,
-            made: 0,
-        };
+        let mut tables = Tables::new(unit.ecap.coherent);
         let phys = vtd::unmap(&mut tables, dom.top, unit.levels, iova)
             .map_err(|_| "the page was not mapped")?;
         dom.mapped -= 1;
@@ -1465,10 +1553,7 @@ pub fn translate(d: Domain, iova: Iova) -> Option<(u64, Access)> {
         let s = g.as_ref()?;
         let dom = s.domains.get(d.0)?;
         let unit = s.units.get(dom.unit)?;
-        let mut tables = Tables {
-            coherent: unit.ecap.coherent,
-            made: 0,
-        };
+        let mut tables = Tables::new(unit.ecap.coherent);
         vtd::translate(&mut tables, dom.top, unit.levels, iova)
     })
 }
@@ -1696,6 +1781,40 @@ pub fn reserved_ranges() -> Vec<ReservedRange> {
             .lock()
             .as_ref()
             .map(|s| s.reserved.clone())
+            .unwrap_or_default()
+    })
+}
+
+/// The first IOVA at which domain `d`'s tables reach physical page `phys`, if any, walking every
+/// entry: for the proofs, which must show that a domain reaches a page at no address at all,
+/// not only at one (TASKS item 40's review, L5).
+pub fn maps_physical(d: Domain, phys: u64) -> Option<u64> {
+    if amd::active() {
+        return amd::maps_physical(d, phys);
+    }
+    crate::cpu::without_interrupts(|| {
+        let g = IOMMU.lock();
+        let s = g.as_ref()?;
+        let dom = s.domains.get(d.0)?;
+        let unit = s.units.get(dom.unit)?;
+        let mut tables = Tables::new(unit.ecap.coherent);
+        vtd::find_physical(&mut tables, dom.top, unit.levels, phys)
+    })
+}
+
+/// The judged firmware-reserved ranges domain `d` was attached with (the ones that name its
+/// device), for the proofs: they can work out a page's access from the firmware's own bits a
+/// second way (TASKS item 40's review, I4).
+pub fn domain_ranges(d: Domain) -> Vec<ReservedRange> {
+    if amd::active() {
+        return amd::domain_ranges(d);
+    }
+    crate::cpu::without_interrupts(|| {
+        IOMMU
+            .lock()
+            .as_ref()
+            .and_then(|s| s.domains.get(d.0))
+            .map(|dom| dom.sources.clone())
             .unwrap_or_default()
     })
 }

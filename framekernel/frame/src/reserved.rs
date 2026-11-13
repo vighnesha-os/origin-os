@@ -5,7 +5,8 @@
 //! References: VT-d Rev 5.20 (D51397-019) §3.15, §3.16 and §8.4; AMD 48882 Rev 3.11
 //! §5.2.2.2 (Tables 111–113), MMIO 0020h and 0028h, and Table 3. Research ledger
 //! `docs/research/2026-11-12-reserved-memory-identity-maps.md`, whose questions R1–R5 this
-//! follows (their recommended options, until the owner answers).
+//! follows as the owner accepted them on 2026-11-13 (ADR-0007 Amendment 1, decision items 247
+//! to 251).
 //!
 //! A range becomes a [`Reserved`]: either an identity map (device address = physical
 //! address) with the permissions the firmware gives, or a range that must never be mapped
@@ -13,8 +14,10 @@
 //! can be trusted: it must lie wholly in memory the memory map calls reserved or EFI runtime
 //! (VT-d §8.4 asks the firmware for exactly that), outside the interrupt range and (AMD-Vi)
 //! the special address range, clear of every platform register range, inside the domain's
-//! address width and at most [`MAX_LENGTH`] long. [`merge`] turns one device's ranges into
-//! the disjoint spans its domain maps. Pure, no `unsafe`; host-tested.
+//! address width and at most [`MAX_LENGTH`] long, and, if devices may write it, clear of every
+//! firmware table the kernel holds as a reference ([`Lending`]). [`merge`] turns one device's
+//! ranges into the disjoint spans its domain maps, at most [`MAX_DEVICE_PAGES`] pages in all.
+//! Pure, no `unsafe`; host-tested.
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
@@ -27,6 +30,11 @@ use crate::vtd::{Access, PAGE};
 /// The longest identity range accepted: no legacy usage the specifications name needs more,
 /// and every 4 KiB costs a page-table entry in each named device's domain (ledger §5).
 pub const MAX_LENGTH: u64 = 4 << 30;
+
+/// The most pages one device's identity spans may hold together: as many as one accepted range
+/// may, so ranges that overlap or sit side by side cannot add up past the bound one range is
+/// refused for (TASKS item 40's review, L4).
+pub const MAX_DEVICE_PAGES: u64 = MAX_LENGTH / PAGE;
 
 /// The interrupt address range `FEEx_xxxxh`: nothing may be mapped there (VT-d §3.15; under
 /// AMD-Vi the MSI range, §2.2.5).
@@ -104,6 +112,9 @@ pub enum Refusal {
     Registers(u64),
     /// The page at this address is not reserved or EFI runtime memory in the memory map.
     NotReserved(u64),
+    /// It is writable and overlaps firmware memory the kernel holds as a reference (an ACPI
+    /// table `vm::firmware_bytes` lent), which starts at this address (threat T26).
+    Lent(u64),
 }
 
 impl core::fmt::Display for Refusal {
@@ -120,6 +131,10 @@ impl core::fmt::Display for Refusal {
                 f,
                 "the memory map does not call {at:#x} reserved or EFI runtime memory"
             ),
+            Self::Lent(at) => write!(
+                f,
+                "it is writable and overlaps the firmware table the kernel holds at {at:#x}"
+            ),
         }
     }
 }
@@ -134,10 +149,19 @@ pub fn from_rmrr(base: u64, limit: u64) -> Option<Reserved> {
     })
 }
 
+/// [`from_rmrr`], with a range it cannot use refused rather than taken for one that maps
+/// nothing: its devices then stay refused, as R3 asks of a range beyond the address width
+/// (a limit of `u64::MAX` ends past 64-bit addresses; review L1).
+pub fn rmrr_range(base: u64, limit: u64) -> Result<Reserved, Refusal> {
+    from_rmrr(base, limit).ok_or(Refusal::Width(64))
+}
+
 /// An IVMD's range, by its flags (48882 Table 113; ledger R4):
 /// - ExclusionRange: an identity map, read and write (the exclusion registers are never
 ///   used; the device sees the same addresses and access);
-/// - IR = IW = 0: never mapped;
+/// - IR = IW = 0: never mapped, whether Unity is set or not (Table 113 asks for Unity clear
+///   then; set, it is read as R4 reads "IR and IW both clear", not as a reason to refuse the
+///   whole table);
 /// - otherwise an identity map with exactly IR and IW, with Unity or without it (any
 ///   translation may then be used, and identity is the one firmware-driven DMA can know).
 ///
@@ -180,6 +204,9 @@ pub struct Platform<'a> {
     pub registers: &'a [(u64, u64)],
     /// AMD-Vi: [`AMD_SPECIAL_RANGE`] is refused too.
     pub amd: bool,
+    /// Every firmware range `[base, end)` the kernel holds as a reference
+    /// ([`Lending::lent`]): no device may be allowed to write any of it.
+    pub lent: &'a [(u64, u64)],
 }
 
 /// Memory-map kinds an identity range may lie in: VT-d §8.4 requires the firmware to report
@@ -238,6 +265,11 @@ pub fn check(r: &Reserved, width: u8, p: &Platform<'_>) -> Result<(), Refusal> {
             })
     }) {
         return Err(Refusal::Registers(base));
+    }
+    if let Use::Identity(Access { write: true, .. }) = r.use_
+        && let Some(&(base, _)) = p.lent.iter().find(|&&(b, e)| b < s.end && s.base < e)
+    {
+        return Err(Refusal::Lent(base));
     }
     match first_unreserved(s, p.memory_map) {
         Some(at) => Err(Refusal::NotReserved(at)),
@@ -335,6 +367,99 @@ pub fn never_mapped(ranges: &[Reserved]) -> Vec<Span> {
         .collect()
 }
 
+/// The accepted identity ranges among `ranges`, as `(base, length)` ranges the platform
+/// reserves: the BAR check refuses a device's registers wherever another device's DMA reaches
+/// untranslated (TASKS item 40's review, L3).
+pub fn identity_ranges<'a>(ranges: impl IntoIterator<Item = &'a Reserved>) -> Vec<(u64, u64)> {
+    ranges
+        .into_iter()
+        .filter(|r| matches!(r.use_, Use::Identity(_)))
+        .map(|r| (r.span.base, r.span.len()))
+        .collect()
+}
+
+/// How many pages `identity` (from [`merge`]) maps: `Ok` if no more than
+/// [`MAX_DEVICE_PAGES`], `Err` with the count otherwise (the device is then refused).
+pub fn bounded(identity: &[(Span, Access)]) -> Result<u64, u64> {
+    let total = identity
+        .iter()
+        .map(|(s, _)| s.len() / PAGE)
+        .fold(0u64, u64::saturating_add);
+    if total > MAX_DEVICE_PAGES {
+        Err(total)
+    } else {
+        Ok(total)
+    }
+}
+
+/// Whether the page at `iova` may be unmapped from a domain whose identity spans are
+/// `identity`: never one of them (ledger R2).
+pub fn may_unmap(identity: &[(Span, Access)], iova: u64) -> bool {
+    !identity.iter().any(|(s, _)| s.contains(iova))
+}
+
+/// Whether the page at physical `phys` may be mapped for a device whose never-map spans are
+/// `never` (an IVMD with IR = IW = 0, R4).
+pub fn may_map(never: &[Span], phys: u64) -> bool {
+    !never.iter().any(|s| s.contains(phys))
+}
+
+/// The firmware memory the kernel lends as `&'static` references (ACPI tables) and the
+/// firmware memory devices may write (identity ranges with write access), kept apart: a
+/// reference must never cover memory a device can change under it (threat T26). `vm` keeps
+/// one under a lock, so a lend and a grant cannot pass each other.
+#[derive(Debug, Default)]
+pub struct Lending {
+    lent: Vec<(u64, u64)>,
+    writable: Vec<(u64, u64)>,
+}
+
+/// Whether `[base, end)` overlaps a range of `list`.
+fn overlaps_any(list: &[(u64, u64)], base: u64, end: u64) -> bool {
+    list.iter().any(|&(b, e)| b < end && base < e)
+}
+
+impl Lending {
+    pub const fn new() -> Self {
+        Self {
+            lent: Vec::new(),
+            writable: Vec::new(),
+        }
+    }
+
+    /// Records `[base, end)` as lent, unless a device may write any of it: `false` then, and
+    /// nothing is recorded.
+    pub fn lend(&mut self, base: u64, end: u64) -> bool {
+        if overlaps_any(&self.writable, base, end) {
+            return false;
+        }
+        if !self.lent.iter().any(|&(b, e)| b <= base && end <= e) {
+            self.lent.push((base, end));
+        }
+        true
+    }
+
+    /// Records that devices may write `[base, end)`, unless any of it is lent: `false` then,
+    /// and nothing is recorded.
+    pub fn allow_writes(&mut self, base: u64, end: u64) -> bool {
+        if overlaps_any(&self.lent, base, end) {
+            return false;
+        }
+        self.writable.push((base, end));
+        true
+    }
+
+    /// Whether a device may write any of `[base, end)`.
+    pub fn device_may_write(&self, base: u64, end: u64) -> bool {
+        overlaps_any(&self.writable, base, end)
+    }
+
+    /// Every range lent so far.
+    pub fn lent(&self) -> &[(u64, u64)] {
+        &self.lent
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +495,7 @@ mod tests {
             memory_map: map,
             registers,
             amd: false,
+            lent: &[],
         }
     }
 
@@ -414,6 +540,23 @@ mod tests {
     }
 
     #[test]
+    fn an_rmrr_the_kernel_cannot_use_is_refused_not_taken_as_empty() {
+        // `dmar::parse` accepts this one (aligned, limit above base); its end does not fit.
+        assert_eq!(
+            rmrr_range(0xFFFF_FFFF_FFFF_F000, u64::MAX),
+            Err(Refusal::Width(64))
+        );
+        assert_eq!(rmrr_range(0x2000, 0x0FFF), Err(Refusal::Width(64)));
+        assert_eq!(
+            rmrr_range(0x7A00_0000, 0x7A00_0FFF).map(|r| r.span),
+            Ok(Span {
+                base: 0x7A00_0000,
+                end: 0x7A00_1000
+            })
+        );
+    }
+
+    #[test]
     fn ivmd_flags_choose_the_use() {
         let use_of = |flags| from_ivmd(&ivmd(kind::IVMD_DEVICE, flags, 0x1000, 0x1000)).unwrap();
         let id = |read, write| Some(Use::Identity(Access { read, write }));
@@ -423,8 +566,9 @@ mod tests {
         assert_eq!(use_of(0b0101).map(|r| r.use_), id(false, true));
         assert_eq!(use_of(0b0110).map(|r| r.use_), id(true, true));
         assert_eq!(use_of(0b0010).map(|r| r.use_), id(true, false));
-        // IR = IW = 0 and no exclusion: never mapped.
+        // IR = IW = 0 and no exclusion: never mapped, with Unity set as well (review I2).
         assert_eq!(use_of(0b0000).map(|r| r.use_), Some(Use::NeverMap));
+        assert_eq!(use_of(0b0001).map(|r| r.use_), Some(Use::NeverMap));
         // ExclusionRange: read and write, whatever IR, IW and Unity say.
         for flags in [0b1000, 0b1001, 0b1010, 0b1111] {
             assert_eq!(use_of(flags).map(|r| r.use_), id(true, true), "{flags:#b}");
@@ -722,5 +866,119 @@ mod tests {
                 !s.is_empty() && s.base.is_multiple_of(PAGE) && s.end.is_multiple_of(PAGE)
             }));
         }
+    }
+
+    #[test]
+    fn a_writable_range_over_a_lent_table_is_refused() {
+        let m = map();
+        // A 128-byte DMAR inside the reserved region at 0x7A00_0000, lent as a reference.
+        let lent = [(0x7A00_0040, 0x7A00_00C0)];
+        let p = Platform {
+            lent: &lent,
+            ..platform(&m, &[])
+        };
+        let over = rmrr_range(0x7A00_0000, 0x7A00_0FFF).unwrap();
+        assert_eq!(check(&over, 48, &p), Err(Refusal::Lent(0x7A00_0040)));
+        // Read only, or never mapped: a device cannot change the table.
+        let read_only = Reserved {
+            use_: Use::Identity(Access {
+                read: true,
+                write: false,
+            }),
+            ..over
+        };
+        assert_eq!(check(&read_only, 48, &p), Ok(()));
+        let never = Reserved {
+            use_: Use::NeverMap,
+            ..over
+        };
+        assert_eq!(check(&never, 48, &p), Ok(()));
+        // The next page holds no lent byte.
+        let next = rmrr_range(0x7A00_1000, 0x7A00_1FFF).unwrap();
+        assert_eq!(check(&next, 48, &p), Ok(()));
+        // A range that ends where the table starts, or starts where it ends, does not overlap.
+        let edge = [(0x7A00_1000, 0x7A00_1080)];
+        let p = Platform {
+            lent: &edge,
+            ..platform(&m, &[])
+        };
+        assert_eq!(check(&over, 48, &p), Ok(()));
+        assert_eq!(
+            check(&rmrr_range(0x7A00_1000, 0x7A00_1FFF).unwrap(), 48, &p),
+            Err(Refusal::Lent(0x7A00_1000))
+        );
+    }
+
+    #[test]
+    fn lent_memory_and_device_writable_memory_never_overlap() {
+        // A table lent first: a grant of writes over any of it is refused.
+        let mut l = Lending::new();
+        assert!(l.lend(0x7A00_0040, 0x7A00_00C0));
+        assert!(!l.allow_writes(0x7A00_0000, 0x7A00_1000));
+        assert!(!l.allow_writes(0x7A00_00BF, 0x7A00_00C0));
+        assert!(l.allow_writes(0x7A00_00C0, 0x7A00_1000));
+        assert!(l.allow_writes(0x7A00_0000, 0x7A00_0040));
+        assert!(l.device_may_write(0x7A00_0000, 0x7A00_0001));
+        assert!(!l.device_may_write(0x7A00_0040, 0x7A00_00C0));
+        // Writes granted first: a lend over any of it is refused, and recorded nowhere.
+        assert!(!l.lend(0x7A00_0F00, 0x7A00_1000));
+        assert!(!l.lend(0x7A00_0000, 0x7A00_0041));
+        assert_eq!(l.lent(), &[(0x7A00_0040, 0x7A00_00C0)]);
+        // Lending the same table again records it once.
+        assert!(l.lend(0x7A00_0040, 0x7A00_00C0));
+        assert!(l.lend(0x7A00_0050, 0x7A00_0060));
+        assert_eq!(l.lent(), &[(0x7A00_0040, 0x7A00_00C0)]);
+        assert!(l.lend(0x7A00_2000, 0x7A00_2010));
+        assert_eq!(l.lent().len(), 2);
+    }
+
+    #[test]
+    fn a_devices_identity_pages_are_bounded_in_all() {
+        let span = |base: u64, pages: u64| Span {
+            base,
+            end: base + pages * PAGE,
+        };
+        let at_bound = [
+            (span(0, MAX_DEVICE_PAGES / 2), Access::READ_WRITE),
+            (span(1 << 40, MAX_DEVICE_PAGES / 2), Access::READ_WRITE),
+        ];
+        assert_eq!(bounded(&at_bound), Ok(MAX_DEVICE_PAGES));
+        let past = [
+            (span(0, MAX_DEVICE_PAGES / 2), Access::READ_WRITE),
+            (span(1 << 40, MAX_DEVICE_PAGES / 2 + 1), Access::READ_WRITE),
+        ];
+        assert_eq!(bounded(&past), Err(MAX_DEVICE_PAGES + 1));
+        assert_eq!(bounded(&[]), Ok(0));
+        // Each range alone within MAX_LENGTH: merged, they still count once per page.
+        let ranges = [
+            rw(0x2000_0000, 0x2000_0000 + MAX_LENGTH),
+            rw(0x2000_0000, 0x2000_1000),
+        ];
+        assert_eq!(bounded(&merge(&ranges).unwrap()), Ok(MAX_DEVICE_PAGES));
+    }
+
+    #[test]
+    fn identity_pages_are_never_unmapped_and_never_map_pages_never_mapped() {
+        let identity = [(
+            Span {
+                base: 0x7A00_0000,
+                end: 0x7A00_2000,
+            },
+            Access::READ_WRITE,
+        )];
+        assert!(may_unmap(&identity, 0x79FF_F000));
+        assert!(!may_unmap(&identity, 0x7A00_0000));
+        assert!(!may_unmap(&identity, 0x7A00_1000));
+        assert!(may_unmap(&identity, 0x7A00_2000));
+        assert!(may_unmap(&[], 0x7A00_0000));
+        let never = [Span {
+            base: 0x20_0000,
+            end: 0x20_3000,
+        }];
+        assert!(may_map(&never, 0x1F_F000));
+        assert!(!may_map(&never, 0x20_0000));
+        assert!(!may_map(&never, 0x20_2000));
+        assert!(may_map(&never, 0x20_3000));
+        assert!(may_map(&[], 0x20_0000));
     }
 }

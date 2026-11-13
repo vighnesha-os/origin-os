@@ -975,7 +975,6 @@ fn check_entries(b: &[u8], from: usize, offset: usize, kind: u8) -> Result<bool,
 /// Checks the IVMD `b` of type `kind` at table offset `offset`.
 fn check_memory(b: &[u8], kind: u8, offset: usize) -> Result<(), IvrsError> {
     let bad = IvrsError::Memory(offset);
-    let flags = *b.get(1).ok_or(bad)?;
     let start = u64_at(b, 16).ok_or(bad)?;
     let length = u64_at(b, 24).ok_or(bad)?;
     if start.checked_add(length).is_none() {
@@ -984,10 +983,10 @@ fn check_memory(b: &[u8], kind: u8, offset: usize) -> Result<(), IvrsError> {
     if kind == kind::IVMD_RANGE && u16_at(b, 6).ok_or(bad)? < u16_at(b, 4).ok_or(bad)? {
         return Err(bad);
     }
-    // Unity without read or write access (outside an exclusion range) maps nothing.
-    if flags & 0b1111 == 0b0001 {
-        return Err(bad);
-    }
+    // Unity without read or write access (outside an exclusion range) is accepted: Table 113
+    // asks firmware for Unity clear there, and R4 reads "IR and IW both clear" as a range never
+    // mapped, whatever Unity says (`reserved::from_ivmd`; TASKS item 40's review, I2), rather
+    // than as a reason to withhold every driver.
     Ok(())
 }
 
@@ -1772,7 +1771,6 @@ mod tests {
         let bad_ranges = [
             ok(kind::IVMD_ALL, 0b110, 0, 0, u64::MAX - 0xFFF, 0x2000),
             ok(kind::IVMD_RANGE, 0b110, 0x20, 0x1F, 0x1000, 0x1000),
-            ok(kind::IVMD_DEVICE, 0b001, 0x20, 0, 0x1000, 0x1000),
         ];
         for m in bad_ranges {
             let t = table(1, 0, &[first.clone(), m.clone()]);
@@ -1785,6 +1783,18 @@ mod tests {
                 &[
                     first.clone(),
                     ok(kind::IVMD_DEVICE, 0b1001, 0x20, 0, 0x1000, 0x1000)
+                ]
+            ))
+            .is_ok()
+        );
+        // Unity with IR = IW = 0: accepted here, and never mapped (review I2).
+        assert!(
+            parse(&table(
+                1,
+                0,
+                &[
+                    first.clone(),
+                    ok(kind::IVMD_DEVICE, 0b0001, 0x20, 0, 0x1000, 0x1000)
                 ]
             ))
             .is_ok()
@@ -1912,10 +1922,20 @@ mod tests {
                     m.kind != kind::IVMD_RANGE || m.device_id <= m.last_device_id,
                     "case {case}"
                 );
-                assert!(
-                    !(m.unity() && !m.read() && !m.write() && !m.exclusion()),
-                    "case {case}"
-                );
+                // Unity with IR = IW = 0 is accepted (review I2): `reserved::from_ivmd`
+                // makes it a range never mapped.
+                if m.unity() && !m.read() && !m.write() && !m.exclusion() {
+                    assert!(
+                        !matches!(
+                            crate::reserved::from_ivmd(&m),
+                            Ok(Some(crate::reserved::Reserved {
+                                use_: crate::reserved::Use::Identity(_),
+                                ..
+                            }))
+                        ),
+                        "case {case}"
+                    );
+                }
             }
             for id in [0u16, 0x10, 0xA0, 0x0100, 0x0213, 0x0507, 0xFFFF] {
                 let _ = r.unit_for(0, id);
