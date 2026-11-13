@@ -524,10 +524,10 @@ pub fn map_mmio(phys: PhysAddr, len: u64) -> Result<MmioRegion, MmioError> {
 static LENDING: SpinLock<Lending> = SpinLock::new(Lending::new());
 
 /// Records that devices may write firmware memory `[base, end)` from now on (the IOMMU calls
-/// this before it can map such a range); only [`read_firmware`] reads it afterwards. `false`,
-/// and nothing recorded, if [`firmware_bytes`] has lent any of it: the IOMMU must then refuse
-/// the range.
-pub fn device_writable(base: u64, end: u64) -> bool {
+/// this before it can map such a range); only [`read_firmware`] reads it afterwards. Refused,
+/// and nothing recorded, if [`firmware_bytes`] has lent any of it, or if no more such ranges
+/// can be kept: the IOMMU must then refuse the range.
+pub fn device_writable(base: u64, end: u64) -> Result<(), crate::reserved::Refusal> {
     crate::cpu::without_interrupts(|| LENDING.lock().allow_writes(base, end))
 }
 

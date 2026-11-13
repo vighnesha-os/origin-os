@@ -115,6 +115,9 @@ pub enum Refusal {
     /// It is writable and overlaps firmware memory the kernel holds as a reference (an ACPI
     /// table `vm::firmware_bytes` lent), which starts at this address (threat T26).
     Lent(u64),
+    /// It is writable, and the kernel keeps no more device-writable ranges
+    /// ([`LENDING_SLOTS`]): it cannot keep references off it.
+    Untracked,
 }
 
 impl core::fmt::Display for Refusal {
@@ -134,6 +137,10 @@ impl core::fmt::Display for Refusal {
             Self::Lent(at) => write!(
                 f,
                 "it is writable and overlaps the firmware table the kernel holds at {at:#x}"
+            ),
+            Self::Untracked => write!(
+                f,
+                "it is writable and the kernel tracks no more than {LENDING_SLOTS} such ranges"
             ),
         }
     }
@@ -406,14 +413,27 @@ pub fn may_map(never: &[Span], phys: u64) -> bool {
     !never.iter().any(|s| s.contains(phys))
 }
 
+/// Ranges [`Lending`] keeps of each sort. Fixed, because the kernel lends firmware tables
+/// before it has a heap; a firmware with more is refused, not trusted (fail closed).
+pub const LENDING_SLOTS: usize = 128;
+
 /// The firmware memory the kernel lends as `&'static` references (ACPI tables) and the
 /// firmware memory devices may write (identity ranges with write access), kept apart: a
 /// reference must never cover memory a device can change under it (threat T26). `vm` keeps
-/// one under a lock, so a lend and a grant cannot pass each other.
-#[derive(Debug, Default)]
+/// one under a lock, so a lend and a grant cannot pass each other. It allocates nothing: the
+/// first tables are lent before the kernel's heap exists.
+#[derive(Debug)]
 pub struct Lending {
-    lent: Vec<(u64, u64)>,
-    writable: Vec<(u64, u64)>,
+    lent: [(u64, u64); LENDING_SLOTS],
+    lent_count: usize,
+    writable: [(u64, u64); LENDING_SLOTS],
+    writable_count: usize,
+}
+
+impl Default for Lending {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Whether `[base, end)` overlaps a range of `list`.
@@ -424,41 +444,70 @@ fn overlaps_any(list: &[(u64, u64)], base: u64, end: u64) -> bool {
 impl Lending {
     pub const fn new() -> Self {
         Self {
-            lent: Vec::new(),
-            writable: Vec::new(),
+            lent: [(0, 0); LENDING_SLOTS],
+            lent_count: 0,
+            writable: [(0, 0); LENDING_SLOTS],
+            writable_count: 0,
         }
     }
 
-    /// Records `[base, end)` as lent, unless a device may write any of it: `false` then, and
-    /// nothing is recorded.
+    /// Records `[base, end)` as lent, unless a device may write any of it or no slot is left:
+    /// `false` then, and nothing is recorded. A range that holds earlier ones takes their slots.
     pub fn lend(&mut self, base: u64, end: u64) -> bool {
-        if overlaps_any(&self.writable, base, end) {
+        if overlaps_any(self.writable(), base, end) {
             return false;
         }
-        if !self.lent.iter().any(|&(b, e)| b <= base && end <= e) {
-            self.lent.push((base, end));
+        if self.lent().iter().any(|&(b, e)| b <= base && end <= e) {
+            return true;
         }
-        true
+        // Drop the ranges this one holds (a table's header, lent before the whole table).
+        let mut kept = 0;
+        for i in 0..self.lent_count {
+            let (b, e) = self.lent[i];
+            if !(base <= b && e <= end) {
+                self.lent[kept] = (b, e);
+                kept += 1;
+            }
+        }
+        self.lent_count = kept;
+        match self.lent.get_mut(self.lent_count) {
+            Some(slot) => {
+                *slot = (base, end);
+                self.lent_count += 1;
+                true
+            }
+            None => false,
+        }
     }
 
-    /// Records that devices may write `[base, end)`, unless any of it is lent: `false` then,
-    /// and nothing is recorded.
-    pub fn allow_writes(&mut self, base: u64, end: u64) -> bool {
-        if overlaps_any(&self.lent, base, end) {
-            return false;
+    /// Records that devices may write `[base, end)`. Refused, and nothing recorded, if any of
+    /// it is lent ([`Refusal::Lent`], with the lent range's start) or no slot is left
+    /// ([`Refusal::Untracked`]).
+    pub fn allow_writes(&mut self, base: u64, end: u64) -> Result<(), Refusal> {
+        if let Some(&(b, _)) = self.lent().iter().find(|&&(b, e)| b < end && base < e) {
+            return Err(Refusal::Lent(b));
         }
-        self.writable.push((base, end));
-        true
+        let slot = self
+            .writable
+            .get_mut(self.writable_count)
+            .ok_or(Refusal::Untracked)?;
+        *slot = (base, end);
+        self.writable_count += 1;
+        Ok(())
     }
 
     /// Whether a device may write any of `[base, end)`.
     pub fn device_may_write(&self, base: u64, end: u64) -> bool {
-        overlaps_any(&self.writable, base, end)
+        overlaps_any(self.writable(), base, end)
     }
 
     /// Every range lent so far.
     pub fn lent(&self) -> &[(u64, u64)] {
-        &self.lent
+        self.lent.get(..self.lent_count).unwrap_or(&[])
+    }
+
+    fn writable(&self) -> &[(u64, u64)] {
+        self.writable.get(..self.writable_count).unwrap_or(&[])
     }
 }
 
@@ -937,22 +986,58 @@ mod tests {
         // A table lent first: a grant of writes over any of it is refused.
         let mut l = Lending::new();
         assert!(l.lend(0x7A00_0040, 0x7A00_00C0));
-        assert!(!l.allow_writes(0x7A00_0000, 0x7A00_1000));
-        assert!(!l.allow_writes(0x7A00_00BF, 0x7A00_00C0));
-        assert!(l.allow_writes(0x7A00_00C0, 0x7A00_1000));
-        assert!(l.allow_writes(0x7A00_0000, 0x7A00_0040));
+        assert_eq!(
+            l.allow_writes(0x7A00_0000, 0x7A00_1000),
+            Err(Refusal::Lent(0x7A00_0040))
+        );
+        assert_eq!(
+            l.allow_writes(0x7A00_00BF, 0x7A00_00C0),
+            Err(Refusal::Lent(0x7A00_0040))
+        );
+        assert_eq!(l.allow_writes(0x7A00_00C0, 0x7A00_1000), Ok(()));
+        assert_eq!(l.allow_writes(0x7A00_0000, 0x7A00_0040), Ok(()));
         assert!(l.device_may_write(0x7A00_0000, 0x7A00_0001));
         assert!(!l.device_may_write(0x7A00_0040, 0x7A00_00C0));
         // Writes granted first: a lend over any of it is refused, and recorded nowhere.
         assert!(!l.lend(0x7A00_0F00, 0x7A00_1000));
         assert!(!l.lend(0x7A00_0000, 0x7A00_0041));
         assert_eq!(l.lent(), &[(0x7A00_0040, 0x7A00_00C0)]);
-        // Lending the same table again records it once.
+        // Lending the same table again, or a part of it, records nothing new.
         assert!(l.lend(0x7A00_0040, 0x7A00_00C0));
         assert!(l.lend(0x7A00_0050, 0x7A00_0060));
         assert_eq!(l.lent(), &[(0x7A00_0040, 0x7A00_00C0)]);
         assert!(l.lend(0x7A00_2000, 0x7A00_2010));
         assert_eq!(l.lent().len(), 2);
+        // A table's header, then the whole table: the whole takes the header's slot.
+        assert!(l.lend(0x7A00_3000, 0x7A00_3024));
+        assert!(l.lend(0x7A00_3000, 0x7A00_3100));
+        assert_eq!(
+            l.lent(),
+            &[
+                (0x7A00_0040, 0x7A00_00C0),
+                (0x7A00_2000, 0x7A00_2010),
+                (0x7A00_3000, 0x7A00_3100)
+            ]
+        );
+    }
+
+    #[test]
+    fn lending_allocates_nothing_and_fails_closed_when_full() {
+        let mut l = Lending::new();
+        for i in 0..LENDING_SLOTS as u64 {
+            assert!(l.lend(i * 0x1000, i * 0x1000 + 0x24), "lend {i}");
+        }
+        // No slot left: a new table is refused, one already held is still lent.
+        assert!(!l.lend(0x1000_0000, 0x1000_0024));
+        assert!(l.lend(0x1000, 0x1010));
+        let mut w = Lending::new();
+        for i in 0..LENDING_SLOTS as u64 {
+            assert_eq!(w.allow_writes(i * 0x1000, i * 0x1000 + 0x1000), Ok(()));
+        }
+        assert_eq!(
+            w.allow_writes(0x1000_0000, 0x1000_1000),
+            Err(Refusal::Untracked)
+        );
     }
 
     #[test]

@@ -385,13 +385,9 @@ fn note_writable(ranges: &mut [ReservedRange]) {
             span,
             use_: Use::Identity(Access { write: true, .. }),
         }) = r.range
-            && !crate::vm::device_writable(span.base, span.end)
+            && let Err(why) = crate::vm::device_writable(span.base, span.end)
         {
-            let at = crate::vm::lent_ranges()
-                .iter()
-                .find(|&&(b, e)| b < span.end && span.base < e)
-                .map_or(span.base, |&(b, _)| b);
-            r.verdict = Err(RangeRefusal::Range(Refusal::Lent(at)));
+            r.verdict = Err(RangeRefusal::Range(why));
         }
     }
 }
