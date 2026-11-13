@@ -4651,3 +4651,39 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-13, on the coordinating session's contract and rulings. Original code; `std` in the host tests, `core` and `alloc` in the kernel.
 - **Review:** none yet. An independent review is arranged by the coordinating session. No person has reviewed this task.
 - **Licensing:** MIT OR Apache-2.0.
+
+### Task S4-3: the answers to its review (2026-11-13)
+
+- **The review:** one AI reviewer, read-only, started by the coordinating session, read `793299a..11028bc` from an export and wrote its findings before it opened the hand-over (`docs/engineering/REVIEW_S4-3_2026-11-13.md`): no High, two Medium (B1, B2), two Low (B3, B4), six informational. Its own inventory of the allocations matched the author's for every object a kind names; what it added is B1. The coordinating session ruled on its four questions; nothing went to the owner.
+- **Commits:** `da52a27` the kernel's answers (B1: a thread's part gains the largest call's temporaries, `quota::call_temporaries` and `ipc::call_temporaries`, 69,632 bytes on the development Mac; B2: a process's mappings' objects kept until its last reap and dropped before `TERMINATED`, `Process::release_unmapped`, with S3-5b's quota clause reading the account at `TERMINATED`; B4: `quota::may_start`; B5, B9); `5bad1b8` the proof's (B10: `settle` before each snapshot; B3: each page a launch maps paid for, counted apart; B4: a second thread refused; B2: a mapped object keeps its maker's payment out until the space goes; "nothing is left"); then records.
+- **What each system call can hold while it is preempted (B1, as the coordinating session asked; read from `syscall.rs`, `ipc.rs`, `handles.rs`, `port.rs`, `event.rs`, `memory_object.rs`, `mapping.rs`, `userspace.rs` and `ports.rs` at `5bad1b8`).** "Charged first" means its quota is charged before anything is allocated, so what it allocates is in a kind's cost. Buffers on the kernel stack are in the thread's 16 KiB stack. `ipc::reap_closed` and `sched::reap`, run at the end of every call, only free.
+
+  | # | Call | Heap held that no quota charges while it is held |
+  |---|---|---|
+  | 0 | `thread_exit` | none |
+  | 1 | `debug_report` | none: the report log is a field of the process |
+  | 2 | `debug_write` | none: its buffer is on the stack |
+  | 3 | `handle_close` | none: what follows the handle out (`Gone`) is on the stack |
+  | 4 | `handle_duplicate` | none: the table's growth is charged as `handles` |
+  | 5 | `channel_create` | none: charged first (`channels`), then its ends in the table (`handles`) |
+  | 6 | `channel_write` | **the message's bytes, up to 65,536, copied before the handles are checked, and the list of what follows each moved handle out (`Gone`, 64 of 40 bytes, a page once rounded), both made before `message_bytes` is charged: 69,632 bytes, the largest.** The handle list `take_all` makes comes after the charge and is the message's |
+  | 7 | `channel_read` | the message's bytes, up to 65,536, and the list of what its handles became (`Received`, 64 of 16 bytes, 1,024), from the refund of its charge until they are copied out: 66,560 bytes. The table's room for the handles is charged as `handles` |
+  | 8 | `wait_one` | none: a wait queue's entries are fixed |
+  | 9 | `event_create` | none: charged first (`events`) |
+  | 10 | `object_signal` | none: a delivery moves what a bind made (K1) |
+  | 11 | `memory_object_create` | none: charged first (`committed`), then its frames, its list and its block |
+  | 12 | `memory_map` | none: the mapping's record under `mappings`, the space's page records within its bound, its page tables within the process's 32 |
+  | 13 | `memory_unmap` | none: the spare record table already has room; a shootdown allocates nothing |
+  | 14 | `memory_protect` | none, as `memory_unmap` |
+  | 15 | `port_create` | none: charged first (`ports`) |
+  | 16 | `object_wait_async` | none beyond a binding's cost: charged first (`bindings`), then its two nodes and room in the port's index. Several threads growing one index at once each hold a new block until one wins (row O11) |
+  | 17 | `port_wait` | none: a packet is copied out from the stack |
+  | 18 | `port_cancel` | none: a cancel moves what binds made |
+  | 19 | `clock_read` | none |
+
+  `ipc::call_temporaries` counts the largest, `channel_write`'s, once for each thread.
+- **B6, recorded as the review asks:** since `7c7b099`, a run past the space's pages gets `limit` whatever memory is left, as item 142 says. Before, such a run could get `no_memory` when the heap could not hold room for its records or frames ran out before the 32nd table. No run that fits changes.
+- **B9:** the host test of the refund's timing is a model on `std::sync::Arc`: the kernel's `Account`, `Process` and channel cannot be built on the host. The boot proof's clauses "the refund waits" and "what a mapping held goes with the space" show the kernel's own.
+- **What changed in the figures:** a thread's part is 21,024 bytes and 69,632 for a call's temporaries; the first program's figure is 225,408 bytes and its launch pays 364,672 ahead.
+- **Negative controls KB-7 to KB-10** (ADR-0013), on an export of `5bad1b8`, each failing where aimed: a launch's pages mapped unpaid (the launch counted 1 page of 17); the threads count one short (a second start accepted); a mapping's objects dropped when the last thread ends (the maker repaid while the space stood); a call's temporaries left out of a thread's part (2 host tests). The file put back after each.
+- **Gates:** GATES
