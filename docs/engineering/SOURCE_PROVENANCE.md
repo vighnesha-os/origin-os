@@ -4743,6 +4743,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - `d919847` the §78 contract;
   - `3d2e0b8` the code: `origin_frame::percpu`, the 27 tables, `Shootdown` over `Records`, `Slots::grow`, the region's reserve and growth, `TablePool::extend`, the MADT revision gate, `CpuMap`, the NVMe queues, `cargo xtask percpu-gate`, and the new machines;
   - `1f13eb2`, `16cf7a3` and `1600931` the boots' fixes: the fairness proof's switch counts given back before the reaping proof; the markers' order; the IOMMU proof's routes; the checker judged per line; the 288-processor machine out of the gate;
+  - `f573761` the 67-processor sparse machine (decision item 294) and the console proof's budget scaled with the count;
   - `0f2ebde` and `ea90890` the cost ledger's CL40, CL38 and CL39, written to the coordinating session's text;
   - `8f164d1` the research ledger, with ACPI 6.6 read against 6.5;
   - the records: ADR-0008's "As built", budget B19's per-processor line, threat row T43, the matrix rows, STATUS, the progress page and this entry.
@@ -4769,4 +4770,5 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - Boots under QEMU's software processor on the development Mac:
     - `boot-test` with 2 processors passes, 11 of 11;
     - the kernel boot passes at 3 processors (Intel VT-d 126 s before the checker's fix; AMD-Vi 12.8 s after it), at 65 processors (Intel VT-d 70.4 s, AMD-Vi 70.1 s) and on the discovery machine (117 s);
-    - the 288-processor machine brought all 288 online once, and failed a timing proof on each of four boots (ADR-0008's "As built", D7).
+    - the 67-processor sparse machine's kernel boot (APIC IDs 256, 300 and 412): passed in 122 s; of two other runs, one failed on the console proof's fixed budget (fixed in `f573761`) and one on a fair share of 10× on CPU 0;
+    - the 288-processor run brought all 288 online once, and failed a timing proof on each of four boots (ADR-0008's "As built", D7); it is outside the gate (decision item 294).

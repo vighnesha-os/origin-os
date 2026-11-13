@@ -19,13 +19,14 @@ On `claude/any-cpu-count`, from the fourth batch (`land/s4-part2`) with S4-3 mer
 
 **What is shown, under QEMU's software processor on the development Mac only:**
 - the kernel boot at 1, 2, 3, 4 and 65 processors, under Intel VT-d and AMD-Vi: at 65, all online, 64 APs in about 2 s, and 62 with their own NVMe queue;
+- the 67-processor sparse machine, with APIC IDs 256, 300 and 412 above 255 (decision item 294);
 - the discovery machine: 2 enabled of the 4,096 the MADT lists;
-- one boot that brought 288 processors online.
+- one boot that brought 288 processors online: `cargo xtask boot-many`, outside the gate.
 
 **Not shown:** anything under KVM or on a real processor. CI has not built this. The new machines run in CI only once measured and accepted (D7).
 
 **Open:**
-- **The 288-processor machine is not in `boot-matrix`.** QEMU disturbs its timing on this host, and what replaces it is the coordinating session's call.
+- **The 288-processor run stays outside `boot-matrix`** (decision item 294): QEMU disturbs its timing on this host. The 67-processor sparse machine is the gate's large machine instead.
 - **The hot-plug task's gap:** a processor first seen through ACPI's namespace has no reserved index.
 - The boot checks now judge the serial log once per line; a 65-processor log had taken 48 minutes to judge.
 

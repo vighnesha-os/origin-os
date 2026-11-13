@@ -102,7 +102,7 @@ The facts below were first read from 6.5's sources. Each was then read in 6.6 (Â
   - The bounds are the 32-bit ID, memory (each table sized as far as the heap allows; an AP whose stacks cannot be had is never sent INIT), and the region (room for 262,144). The "CPU indexes" line reports them.
 - **D5:** `MAX_CPUS` is gone. `cargo xtask percpu-gate`, part of `check`, refuses it, refuses a static array sized by a processor count, and refuses a `PerCpu` static that its crate's `size_per_cpu` leaves out.
 - **D6:** NVMe asks for 2 + n pairs and takes what the controller allocates. Processors get queues while pairs and vectors last.
-- **D7:** `boot-matrix` gains 3 and 65 under each IOMMU, `boot-many` (288, sparse, TCG only) and `boot-listed` (2 of 4,096). They are held out of CI until measured and accepted.
+- **D7:** `boot-matrix` gains 3 and 65 under each IOMMU, `boot-sparse` (67 processors: 64 in package 0 and three at APIC IDs 256, 300 and 412, decision item 294) and `boot-listed` (2 of 4,096). They are held out of CI until measured and accepted. `boot-many` (288, two packages) is a measured run outside the gate: QEMU disturbs the guest's timing at 288 processors on this Mac (ADR-0008's "As built", D7).
 - **D8:** APs still start one at a time. The boot prints the total.
 
 ## 6. Gaps
