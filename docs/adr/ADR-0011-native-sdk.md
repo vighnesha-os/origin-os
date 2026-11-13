@@ -262,7 +262,7 @@ The OIDL grammar, the Driver ABI, the graphics path, any POSIX layer, how `std` 
 - **Results.** A status comes back in the whole of RAX as `int64_t`, and every other result through a pointer of its own size, so nothing on the way back needs extending.
 - **The fourth argument.** A C caller passes it in RCX and the kernel takes it in R10 (ADR-0005 P4). That move is part of a stub already, and is not this decision.
 
-**Performance cost (ADR-0018 V3).** L13: one register-to-register instruction for each parameter narrower than 64 bits, in each call. Unmeasured and owed: S4-2's exit tests already ask for the cost of one call before the pin and after it, and the figure is reported with them, under QEMU and as KVM guests in CI, as a trend (CLAUDE.md §53). L14: none, by construction.
+**Performance cost (ADR-0018 V3).** L13: one register-to-register instruction for each parameter narrower than 64 bits, in each call. Unmeasured and owed: S4-2's exit tests already ask for the cost of one call before the pin and after it, and the figure is reported with them, under QEMU and as KVM guests in CI, as a trend (CLAUDE.md §53) (cost ledger row CL17; the reference was added on 2026-11-13 for ADR-0018 V8 and changes no decision). L14: none, by construction.
 
 **Trade-offs.** L13 spends an instruction on a caller whose compiler had already extended the value, which is most callers; in return a correct call is never refused for what a compiler left beside its argument. L14 leaves a parent unable to tell a panic from a program's own exit code for now.
 

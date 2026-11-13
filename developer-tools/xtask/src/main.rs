@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod asmflags;
+mod costs;
 mod disk;
 mod documents;
 mod expected_warning;
@@ -111,6 +112,10 @@ commands:
               a row's state changes (TASKS item 43; quick)
   progress-gate only the gate on docs/PROGRESS.md: the committed page is the one the
               tree generates, byte for byte (part of check; quick)
+  cost-gate   only the gate on the cost ledger in docs/engineering/PERFORMANCE_BUDGETS.md:
+              each row's decision and figure, the list of ADR-0001 to ADR-0017, and a
+              Performance cost statement in every ADR or amendment accepted after
+              ADR-0018 (part of check; ADR-0018 V8; quick)
   regenerate rewrites the kernel's generated system-call crate from sdk/interfaces
   version     writes runtime/version/src/generated.rs, the release's constants, from
               origin-version.toml (CLAUDE.md §62)
@@ -2597,6 +2602,7 @@ fn main() -> ExitCode {
         ["roadmap-gate"] => roadmap::gate(),
         ["progress"] => progress::write(),
         ["progress-gate"] => progress::gate(),
+        ["cost-gate"] => costs::gate(),
         ["regenerate"] => interfaces::regenerate(),
         ["version"] => image_inputs::write_version_file(),
         ["version-gate"] => image_inputs::version_gate(),
@@ -3447,6 +3453,7 @@ fn check() -> Result {
     provenance::gate()?;
     roadmap::gate()?;
     progress::gate()?;
+    costs::gate()?;
     unsafety::gate()?;
     interfaces::gate()?;
     image_inputs::version_gate()?;
