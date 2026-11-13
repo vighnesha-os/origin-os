@@ -215,6 +215,12 @@ M4-1 rests on ADR-0005 G3 and G4, drafts to be decided again with step 5 and wit
 | S28-08, S28-09, S28-15 | Copy-on-write, demand paging, out-of-memory handling |
 | S73-03, S73-05, S73-07 | Verus evaluated; object lifetimes and capability validation as proof targets |
 
+**One more row placed here, beside G5, which it refines (item 282, 2026-11-13).** Placed by the coordinating session under item 264's rule; it is in no exit test and changes none.
+
+| Rows | Subject |
+|---|---|
+| A05-I1 | A port's creator pays for its index (ADR-0005 Amendment 10) |
+
 ## M5. Storage
 
 **Accepted: decision item 261; M5-6's two machines by item 265.** **State, 2026-11-12: partial.** In short: PCIe, both IOMMUs, NVMe and a block cache are built; no filesystem is mounted, and nothing has run on a physical machine (matrix row S82-06).
@@ -243,6 +249,12 @@ Given elsewhere by rule 3: hot-plug and external-device authorization (S31-12, S
 | S28-11, S28-12, S28-16 | Memory-mapped files, the page cache, reclamation |
 | S58-06 | Driver isolation |
 | S73-10, S73-11 | Filesystem metadata and DMA mapping ownership as proof targets |
+
+**Five more rows placed here, beside the IOMMU rows they refine (items 247 to 251, 2026-11-13).** Placed by the coordinating session under item 264's rule; they are in no exit test and change none.
+
+| Rows | Subject |
+|---|---|
+| A07-R1 to A07-R5 | Identity maps for firmware-reserved memory (ADR-0007 Amendment 1) |
 
 ## M6. Native runtime
 
