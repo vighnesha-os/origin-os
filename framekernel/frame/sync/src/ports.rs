@@ -2296,10 +2296,11 @@ mod tests {
     }
 
     /// The rule the kernel-wide bound counts a port's index by (`Port::index_at_bound`), driven
-    /// on the real index: for each bound, a long run of reservations, binds, fires and dropped
-    /// reservations in a seeded order never takes the index past the rule's most, it grows only
-    /// from a capacity under the bound (the old block the rule counts), and the bindings armed and
-    /// reserved never pass the bound.
+    /// on the real index: for each bound, a long run of reservations, binds, fires, explicit
+    /// cancels, implicit cancels (the binding's handle closed), dropped reservations and, for
+    /// about half the bounds, the port's close at a random step, in a seeded order, never takes
+    /// the index past the rule's most; it grows only from a capacity under the bound (the old
+    /// block the rule counts), and the bindings armed and reserved never pass the bound.
     #[test]
     fn a_bounded_port_s_index_stays_within_its_rule() {
         let mut seed: u64 = 0x5EED_0057;
@@ -2310,53 +2311,98 @@ mod tests {
             ((seed >> 33) as usize) % n
         };
         let bounds = (1..=40).chain([63, 64, 65, 100, 255, 256, 257, 500]);
+        let mut closes = 0;
         for bound in bounds {
             let account = Account::new();
             let port = Arc::new(Port::<Test>::bounded(bound));
             let (most, old_most) = Port::<Test>::index_at_bound(bound);
+            let steps = (bound * 12).max(400);
+            // Past the run for about half the bounds: their ports never close.
+            let close_at = next(steps * 2);
             let mut held: Vec<Reservation<Test>> = Vec::new();
-            let mut armed: Vec<Object> = Vec::new();
+            let mut armed: Vec<(Object, u64)> = Vec::new();
+            let mut closed = false;
             let mut id = 0;
-            for _ in 0..(bound * 12).max(400) {
+            for step in 0..steps {
                 let (before, _, _) = counts(&port);
-                match next(4) {
-                    // Reserve, sometimes several in a row.
+                if step == close_at {
+                    // The close takes the index and every binding armed, each one's storage
+                    // handed back; nothing is queued, since every packet is drained as it comes.
+                    assert_eq!(refund_all(port.close(&Host)).len(), armed.len());
+                    armed.clear();
+                    closed = true;
+                    closes += 1;
+                    assert_eq!(counts(&port).0, 0, "bound {bound}: the close left an index");
+                }
+                match next(6) {
+                    // Reserve, sometimes several in a row. A closed port makes no room, and is
+                    // never full.
                     0 | 1 => {
                         for _ in 0..=next(3) {
                             id += 1;
                             match try_reserve(&port, &account, id) {
                                 Ok(r) => held.push(r),
-                                Err(e) => assert_eq!(e, Unreserved::Full),
+                                Err(e) => {
+                                    assert!(!closed, "bound {bound}: a closed port was full");
+                                    assert_eq!(e, Unreserved::Full);
+                                }
                             }
                         }
                     }
-                    // Bind a reservation held.
+                    // Bind a reservation held: armed while the port is open, refused once closed.
                     2 => {
                         if let Some(r) = held.pop() {
                             let object = Object::new();
+                            let key = u64::from(id);
                             let bound_now = Source::bind(
                                 &object.source,
                                 &Host,
                                 r,
                                 Request {
                                     owner: ME,
-                                    key: u64::from(id),
+                                    key,
                                     mask: READABLE,
                                 },
                                 || true,
                                 || object.signals(),
                             );
-                            assert_eq!(bound_now.ok(), Some(Bound::Armed));
-                            armed.push(object);
+                            match bound_now {
+                                Ok(how) => {
+                                    assert!(!closed, "bound {bound}: a closed port took a binding");
+                                    assert_eq!(how, Bound::Armed);
+                                    armed.push((object, key));
+                                }
+                                Err((why, r)) => {
+                                    assert!(closed && matches!(why, Refused::PortClosed));
+                                    drop(r.into_payload());
+                                    account.charged.fetch_sub(1, Relaxed);
+                                }
+                            }
                         }
                     }
-                    // Fire a binding armed, or drop a reservation.
-                    _ => {
-                        if !armed.is_empty() && next(2) == 0 {
-                            let object = armed.swap_remove(next(armed.len()));
+                    // Fire a binding armed.
+                    3 => {
+                        if !armed.is_empty() {
+                            let (object, _) = armed.swap_remove(next(armed.len()));
                             assert_eq!(object.raise(READABLE), 1);
                             drain(&port);
-                        } else if !held.is_empty() {
+                        }
+                    }
+                    // Cancel a binding armed, explicitly or as its handle closes.
+                    4 => {
+                        if !armed.is_empty() {
+                            let (object, key) = armed.swap_remove(next(armed.len()));
+                            if next(2) == 0 {
+                                assert_eq!(refund_all(object.cancel(&port, key)).len(), 1);
+                            } else {
+                                assert_eq!(object.close_handle(ME), 1);
+                                drain(&port);
+                            }
+                        }
+                    }
+                    // Drop a reservation held.
+                    _ => {
+                        if !held.is_empty() {
                             let r = held.swap_remove(next(held.len()));
                             drop(r.into_payload());
                             account.charged.fetch_sub(1, Relaxed);
@@ -2372,7 +2418,7 @@ mod tests {
                     capacity <= most,
                     "bound {bound}: {capacity} slots, the rule says {most}"
                 );
-                if capacity != before {
+                if capacity > before {
                     assert!(
                         before <= old_most,
                         "bound {bound}: grew from {before} slots"
@@ -2383,12 +2429,13 @@ mod tests {
                 drop(r.into_payload());
                 account.charged.fetch_sub(1, Relaxed);
             }
-            for object in armed {
+            for (object, _) in armed {
                 object.raise(READABLE);
             }
             drain(&port);
             nothing_left(&port, &[], &account);
         }
+        assert!(closes > 0, "no port was closed");
     }
 
     /// Reservations from several threads at once never pass the bound between them: the check
