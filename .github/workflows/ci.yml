@@ -1,5 +1,6 @@
 # Continuous integration (CLAUDE.md §8 and §82; the owner's decision, item 32 of
-# docs/engineering/OWNER_DECISIONS.md): the project's gates on x86-64 Linux.
+# docs/engineering/OWNER_DECISIONS.md): the project's gates on x86-64 Linux, and one job on
+# macOS that builds the images there and compares them with the Linux job's (decision item 275).
 #
 # GitHub's standard runners are free for this public repository, and this workflow uses nothing
 # else (§80). It has no secrets and only reads the repository.
@@ -88,8 +89,64 @@ jobs:
           path: target/xtask/reproducible/files
           if-no-files-found: warn
           retention-days: 14
+          # A re-run of the job replaces the files of the attempt before it (the review of TASKS
+          # item 52, finding 9).
+          overwrite: true
       # What `--locked` cannot say: that nothing the job ran afterwards rewrote Cargo.lock, or
       # any other tracked file. This job runs every build the others do.
+      - name: The job left the checkout as committed
+        run: bash .github/ci/checkout-unchanged.sh
+
+  # Decision item 275 (CLAUDE.md §75): the images are compared across two kinds of host on every
+  # run. The reproducible-build gate in `check` builds each image twice on one machine, which
+  # cannot see an input that every build on that machine shares: where the toolchain is, the
+  # host the compiler reports, the linker's name for itself. Each of those once made an image
+  # other bytes on a Mac than on Linux (docs/research/2026-11-11-toolchain-path-in-images.md).
+  # This job builds the same files on a macOS host and compares them, file by file, with the
+  # files the Linux job kept. A difference, a file on one side only, or no Linux artifact fails
+  # it.
+  #
+  # `macos-26` is one of GitHub's standard runners, free for a public repository (§80); the
+  # labels that end in -large or -xlarge are not. It is an Apple-processor machine, the kind of
+  # host the development Mac is: two kinds of host, not three. The images are unsigned, and
+  # the commit is whatever was pushed, not a release candidate.
+  #
+  # The comparison is a step of this job and not a job of its own: `reproducible-compare`
+  # compares a directory with the checkout's own kept files, and only a job that ran the gate
+  # has those.
+  images-on-macos:
+    name: the images on a macOS host, compared with the Linux host's
+    needs: check
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: bash .github/ci/install-rust.sh
+      - run: cargo --locked xtask reproducible-gate
+      - name: Keep the files the reproducible-build gate read
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reproducible-gate-files-macos
+          path: target/xtask/reproducible/files
+          if-no-files-found: warn
+          retention-days: 14
+          # A re-run of the job replaces the files of the attempt before it (the review of TASKS
+          # item 52, finding 9).
+          overwrite: true
+      # Outside the checkout, which the last step holds unchanged. If the Linux job kept
+      # nothing, this step fails, and so does the job.
+      - name: Fetch the files the Linux job kept
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: reproducible-gate-files
+          path: ${{ runner.temp }}/linux-files
+      - name: Compare this host's files with the Linux host's
+        run: cargo --locked xtask reproducible-compare "$RUNNER_TEMP/linux-files"
       - name: The job left the checkout as committed
         run: bash .github/ci/checkout-unchanged.sh
 
