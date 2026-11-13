@@ -4720,7 +4720,7 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - The right value for a real service is not known (I1's "what stays unknown"); no program the kernel carries creates a port yet.
   - Nothing has run under KVM or on a real processor.
 - **Test evidence (2026-11-13; Rust 1.100.0; QEMU 11.1.3 TCG + OVMF on the M1 Max):**
-  - *Host:* `origin-sync`'s port tests, 31, four of them new (a bound of two, a bound of zero, the rule on the real index for bounds 1 to 500, eight threads against a bound of three); `quota`, 24, with a port's part of a figure and the rule's copy.
+  - *Host:* `origin-sync`'s port tests, 31, four of them new (a bound of two, a bound of zero, the rule on the real index for bounds 1 to 500 under a seeded order of reserves, binds, fires, explicit and implicit cancels, dropped reservations and, for about half the bounds, the port's close, eight threads against a bound of three); `quota`, 24, with a port's part of a figure and the rule's copy.
   - *Loom:* `cargo xtask loom`, 54 models and 79 controls caught, `ports_two_reservations_race_for_a_bound_of_one` and its control `reserve_ignores_the_port_s_bound` among them.
   - *Boot:* the kernel boot on `5629cbb` ended "degraded: 66 of 67 proofs passed; failed: speculation controls", with the new clause and every S3-6 and S4-2 proof passing.
   - *Negative controls:* KB-11 to KB-14 in ADR-0013, on an export of `5629cbb`, each failing where aimed.

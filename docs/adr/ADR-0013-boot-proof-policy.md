@@ -361,7 +361,7 @@ Each of the thirteen failed where it was aimed, CP-2 and CP-6(a) at an earlier p
 KB-7 to KB-10 answer the independent review of task S4-3 (findings B3, B4, B2 and B1) and ran on an export of `5bad1b8`, the same way, after its answers.
 
 | KB-11 | A port made with no bound (`Port::bounded` stores no bound) | `a port whose creator was given two bindings at once takes two from another process: true; a third is refused with LIMIT: false; nothing is left of it ...: false; once one fires it takes another: false; a port whose creator was given none refuses the first: false`, `kernel bound failed` |
-| KB-12 | The bound counting bindings armed and not reservations in flight (both of its checks) | Host: `ports::tests::a_bounded_port_refuses_one_more_than_its_bound_and_takes_nothing` and `a_bounded_port_s_index_stays_within_its_rule`, 2 of 31 failed |
+| KB-12 | The bound counting bindings armed and not reservations in flight (both of its checks) | Host: `ports::tests::a_bounded_port_refuses_one_more_than_its_bound_and_takes_nothing` and `a_bounded_port_s_index_stays_within_its_rule`, 2 of 31 failed (again on `5e5ead9`, with the second test's cancels and close) |
 | KB-13 | A port's index left out of its creator's figure (`Limits::parts`) | Host: `quota::tests::a_figure_is_its_kinds_added_kind_by_kind`, 1 of 24 failed |
 | KB-14 | A full port answered `no_memory` (`port::bind`) | `... a third is refused with LIMIT: false; ... a port whose creator was given none refuses the first: false`, `kernel bound failed` |
 
