@@ -4426,3 +4426,20 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - *`cargo xtask boot-test`:* passed 11 of 11 in 137 s. Kernel verdict "degraded: 63 of 64 proofs passed; failed: speculation controls" (item 154). Every clause of "a Rust program in ring 3" true, the table walk and both counted refusals among them. Heap 37,488 bytes and 128,153 free frames, the same before and after. The two launches took 492 µs and 1,501 µs.
   - *`cargo xtask boot-matrix`:* passed 124 scenarios with none failed in 2,422 s, across Intel VT-d and AMD-Vi with 1, 2 and 4 processors, the sparse, bridge and legacy-free machines, the two without the random-number instructions, the two CPU identities and the console machines. 21 kernel verdicts of "63 of 64; failed: speculation controls". One, with no generator, of "58 of 60; 4 did not run", the new proof among those not run. No clause of the proof false in any boot, and the leak line equal before and after in each. The kernel stacks' region was at 14 bases in 14 boots. First launches took 426 to 558 µs and second ones 1,020 to 2,204 µs across 21 boots (QEMU, no budget).
   - *Negative controls:* R3-4 to R3-8 in ADR-0013, on `00ad331`, each failing the kernel boot by the clause it was aimed at; and the host controls above.
+
+## TASKS item 54: the cost ledger's first fill, and ADR-0018 V8's gate (decision items 240, 242 and 245; 2026-11-13)
+
+- **What:**
+  - **The ledger** in `docs/engineering/PERFORMANCE_BUDGETS.md`: rows CL1 to CL36, read from the Trade-offs and Consequences of ADR-0001 to ADR-0017, every place one of them names a cost, and the four threat models, at `main` `4097413`; and a list of ADR-0001 to ADR-0017, each with its rows or "none" and the reason. The trends it quotes are CI run 43131676181's, as TASKS item 26 read them.
+  - **The gate:** `developer-tools/xtask/src/costs.rs`, `cargo xtask cost-gate`, one line in `check`. Its rules are in its module comment. It reads ADR decisions through the requirements gate's reader (`requirements::adr`, now `pub(crate)`) and tables through the provenance gate's cell reader.
+  - **One ADR reference:** ADR-0011 Amendment 3's cost statement names CL17, in the words the coordinating session ruled on 2026-11-13; it changes no decision.
+- **Author / date:** Claude Code (local, M1 Max), the architecture-review session, 2026-11-13, on the unpushed branch `claude/cost-ledger`, cut from `4097413`.
+- **Specifications:** none outside the repository. ADR-0018 V3, V5 and V8.
+- **Architecture decisions:** ADR-0018 (items 238 to 246). No ABI or format decision, so no ADR (§84).
+- **Dependencies:** `std` only, inside `xtask`. No new crate.
+- **Toolchain:** Rust 1.99.1, as the workspace pins it.
+- **Review:** the coordinating session reads it before it lands (an AI reviewer). No person has reviewed the ledger's rows or the gate. Every row is Claude's reading of the ADRs.
+- **Licensing:** MIT OR Apache-2.0, as the workspace.
+- **Performance:** none, by construction (ADR-0018 V3): documents, and one gate on the build host.
+- **Test evidence (2026-11-13; Rust 1.99.1; the M1 Max):** 24 unit tests of the gate in `costs.rs`, among them one on the real tree: each of V8's three refusals planted in fixtures, the list's rules, which amendments are held, a ledger ID in an older ADR's text, and the readers. The plants in the real tree and the full `check` are recorded in TASKS item 54's result.
+- **Open:** no figure in the ledger is from a declared machine, and no person has checked that the ledger is complete.
