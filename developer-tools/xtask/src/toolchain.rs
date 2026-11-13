@@ -46,7 +46,8 @@ const PINNED_COMMIT: &str = "developer-tools/toolchain/rustc-commit-hash";
 
 /// Environment variables `xtask` does not run with, and what each would do. Each was seen to
 /// reach an image's build with Cargo 1.99.1 (`cargo build -v`, and a program that records its
-/// own use; `docs/research/2026-11-11-toolchain-path-in-images.md` §6 and §12):
+/// own use; `docs/research/2026-11-11-toolchain-path-in-images.md` §6 and §12), and again with
+/// Cargo 1.100.0 in a scratch project (`docs/research/2026-11-13-rust-1.100.0.md` §6.3):
 ///
 /// - the first two replace every `target.<triple>.rustflags` entry, even when they are empty;
 /// - a per-target flags variable is added in front of them, so a flag the repository's files

@@ -29,6 +29,8 @@ So another account, or another machine, gives strings of another length and cann
 | C2 | CI's run 43248605239 at `c34fdab`: its `check` job's log, and the artifact `reproducible-gate-files` it kept | Read and fetched on 2026-11-12, for §13 |
 | C3 | CI's run 43275652672 at `8ae9e9b`: its `check` job's log (job 131383211984), and the artifact `reproducible-gate-files` it kept | Read and fetched on 2026-11-12, for §16 |
 | C1 | CI's logs for this repository: run 43201395354 at `f5ab54f` (its `check` and toolchain jobs) and run 43230979284 at `9e4f79f` (its `check` job) | Read on 2026-11-12, for §12.4 and §12.5 |
+| C4 | CI's run 43341445989 at `7001b44`, the trial's first: the jobs' steps and the log of its macOS job (131613843125), through GitHub's API | Read on 2026-11-13, for §18 |
+| C5 | CI's run 43355957632 at `6b83691`, the trial's control: the logs of its `check` job (131657950161) and of its macOS job (131661454789) | Read on 2026-11-13, for §18 |
 | T1 | The toolchain itself: `rustc 1.99.1 (58cf8f9c3 2026-10-13)`, commit `58cf8f9c35b355199727627d07ae34a4e2846d67`, and `cargo 1.99.1 (5f94df478 2026-08-27)`, on `aarch64-apple-darwin` | What `cargo build -v` passes to rustc, and what the images then hold (`strings`, `cmp`, `llvm-objdump`), each observed on 2026-11-11 |
 
 What R1 says, in this ledger's words:
@@ -713,3 +715,84 @@ Not built when this was written; put to the coordinating session with the result
 - **It does not know which commit either side was built from.** The kept files carry no name for it; whoever runs the command says which two builds they compared.
 - **It compares with what this checkout's gate last kept.** If the tree has changed since, the gate has to be run first.
 - It has compared development commits. There has been no release candidate.
+
+## 18. Item 46 (2026-11-13): the comparison runs in CI, and its trial
+
+§16.4 named what would turn the comparison by hand into a check, and §17 made its second point a command. The owner accepted decision item 275 on 2026-11-13: CI compares the images across two kinds of host on every run. The contract is "46" under "Task contracts" in `TASKS.md`.
+
+### 18.1 What was built
+
+- **A job, `images-on-macos`,** in `.github/workflows/ci.yml`. It needs the `check` job, runs on GitHub's standard macOS runner (`macos-26`), installs the pinned toolchain with the script every job uses, runs `cargo --locked xtask reproducible-gate`, keeps the gate's files as the artifact `reproducible-gate-files-macos`, fetches the Linux job's artifact `reproducible-gate-files` of the same run, and runs `cargo --locked xtask reproducible-compare` on it. A difference, a file on one side only, or a missing artifact fails the job.
+- **`.github/ci/install-rust.sh`** describes the machine by `uname -s`: `lscpu` and `nproc` on Linux as before, `sysctl` on macOS. Nothing above those lines changed.
+- Nothing that is built changed, so no image's bytes did.
+
+### 18.2 The trial
+
+The job had only run on the development Mac. It was tried on GitHub's runners in a draft pull request, number 26, opened and closed on 2026-11-13 and never merged.
+
+**Where the trial differs from the contract,** each by the coordinating session's word:
+
+- The pull request was against `main`, not `land/s4`: the third batch had merged (`c05797c`) before the trial began.
+- The control was a commit on a trial branch alone, `trial/item-46-macos`, and was not reverted: the branch was deleted instead, so the control never entered the task branch.
+
+**What was pushed.** `7001b44`: this branch at `6ef3023` with `main` at `c05797c` merged in. `main`'s tree was already this branch's at `ce279b8`, so the merge changed no file: `7001b44` and `6ef3023` have the same tree, `566ba614f739783a8a83ebd7000350c8f2df2538`. `cargo xtask check` had passed on `6ef3023` on the Mac (1,694 host tests, 0 failed, 27 ignored) and was not run again on the merge. One gate reads history, the document gate (`git log` over every commit reachable from `HEAD`); it was run by itself on `7001b44` and on the control's commit and passed on both. I had first told the coordinating session that no gate reads history. That was wrong, and I corrected it the same hour.
+
+**Run 1: the job as written** (run 43341445989, `7001b44`, 00:59:45 to 02:47:11 UTC).
+
+| Job | Number | Result |
+|---|---|---|
+| `cargo xtask check`, Linux | 131610489757 | Passed, 7 min 42 s |
+| The images on a macOS host | 131613843125 | Passed, 2 min 0 s: the toolchain 20 s, the gate 89 s, the comparison under 1 s |
+| Toolchain verification | 131610489699 | Passed |
+| Boots, QEMU's software CPU | 131610489743 | Passed, 72 min |
+| Boots, a real CPU, two runner images | 131610489462, 131610489829 | Passed, 107 min each |
+| Processors tested on | 131653252739 | Passed |
+
+The comparison's last line: "all 22 files, from both builds, are the same bytes". The eleven digests are the ones §16.2 has for the development Mac, the loader's `b3ee60b9…` and the kernel image's `239f308b…` among them. The runner: image `macos-26-arm64`, version 20261102.0473.1, runner 2.338.2, "Apple M1 (Virtual), 3 processors, Darwin 25.6.0". rustup installed 1.99.1 from the pin and the script's checks of version, commit and targets passed. `xtask` ran, so the runner's environment sets none of the variables `xtask` refuses.
+
+The real-CPU boots took 107 minutes where the third batch's run had taken about an hour. `main`'s own run of the same hour took as long. The keeper found the cause in the runners' processors, not in any tree; it is not this task's and is recorded with the performance trends.
+
+**Run 2: the control** (run 43355957632, `6b83691`, from 03:00:09 UTC). The control's commit makes the loader take in `RUNNER_OS`, which GitHub sets to the kind of host a job runs on (`option_env!`, read once so that the linker keeps it, never printed).
+
+| Job | Number | Result |
+|---|---|---|
+| `cargo xtask check`, Linux | 131657950161 | Passed. Loaders `7878329d…`, `5acaccb7…`, `6ae46ce9…` |
+| The images on a macOS host | 131661454789 | **Failed, at the comparison.** Its own gate passed first: loaders `5a1450d6…`, `4cfbeda2…`, `5ef0d7ba…`, each the same from two builds |
+
+The comparison's error: "6 of 22 things compared … are not the same". It named `loader`, `loader-developer-mode` and `loader-test-trust-store`, for each of the two builds, each with its first offset (0x2b08f, 0x2b128 and 0x2b0e7) and the byte on each side there (0x6d here, 0x4c there: "m" of "macOS", "L" of "Linux"). The other sixteen files were the same. No other step of the job failed, and the step after the comparison did not run.
+
+Both hosts' loader digests had been built on the development Mac beforehand, with `RUNNER_OS` set to each value: `7878329d…` for "Linux" and `5a1450d6…` for "macOS". Both came out. The run's three boot jobs were cancelled by hand once the macOS job had ended: nothing of the trial needed them. So the run as a whole ended cancelled.
+
+**The control's first form did nothing.** A `#[used]` static holding the value was dropped by the linker, and the loader was the same bytes with it as without. I had described that form to the coordinating session as the control before building it. Built and compared on the Mac, it showed nothing; read through `core::hint::black_box`, the value stays, and the two hosts' loaders differ. A control is shown to bite before it is called one.
+
+**The contract's four results:**
+
+| | Asked | Shown by |
+|---|---|---|
+| (a) | The job passes with all eleven files, from both builds, the same on the two hosts | Run 1, job 131613843125 |
+| (b) | How long it takes, and what the runner is | 2 min 0 s and 2 min 42 s, after a `check` of 7 min 42 s and 9 min 22 s; the runner above |
+| (c) | The macOS image sets none of the variables `xtask` refuses | `xtask` ran on it, in both runs |
+| (d) | A value of the build host compiled into the loader passes each host's own gate and fails the comparison, naming the loader | Run 2, jobs 131657950161 and 131661454789 |
+
+### 18.3 What the job is, and is not
+
+**It is:** on every run of CI, the gate's files built twice from nothing on a Linux host and twice on a macOS host, and all four builds compared, with the run failing on a difference. An input that differs between those two kinds of host now fails CI on the commit that brings it. Until now nothing would have noticed one.
+
+**It is not:**
+
+- **A third kind of host.** The macOS runner is an Apple-processor Mac, the same kind of host as the development machine. Two kinds are compared: x86-64 Linux and arm64 macOS, both GitHub's.
+- **A release candidate, or its independent rebuild.** Both jobs are started by one push, use one workflow and one toolchain download, and build development commits. Nobody outside the project rebuilds anything.
+- **A signed image.** The gate compares unsigned images, which are everything a signature covers (ONBF-R9). A signature's own bytes are outside it: ML-DSA signing is hedged with fresh randomness (FIPS 204 §3.4).
+- **Proof that the runner is reliable.** It passed once and failed once, both as intended. Two runs say nothing of how often a macOS runner fails for reasons of its own. If it proves unreliable, that goes to the coordinating session before the job is made required.
+- **The comparison under another compiler.** Both runs were on Rust 1.99.1. TASKS item 52 moves the pin to 1.100.0; its CI evidence is where the job first runs on the new toolchain, and where the macOS runner first installs it.
+
+### 18.4 What it costs
+
+Nothing while the system runs: no image changed. One more CI job on each push: about two and a half minutes on a standard macOS runner, which starts when `check` has passed. GitHub's documentation, read on 2026-11-13, has standard runners free for public repositories (the contract quotes it).
+
+### 18.5 Watch items, and not verified
+
+- **`origin.core`, when task S4-2 is in the tree.** Its description quotes the SHA-256 of the whole linker output, unloaded sections included (the finding F15 of S4-2's review). For `first-program`, a binary, that whole file was the same on the Mac and on CI's Linux host at `8ae9e9b` (§16.2). A shared library was not among the eleven files, so nothing is shown for it until S4-2's files are in a tree the job runs on.
+- **Whether the job and the command need a change for S4-2's three more kept files.** By reading they take whatever plain files both sides hold. No run has shown it.
+- **The development Mac under the control.** `RUNNER_OS` is not set there, so the Mac's loader would be a third set of bytes (`aa24890d…`, built for the record). The Mac's own gate passes for the reason each runner's does: both of its builds get the same value.
+- No person has reviewed the job.

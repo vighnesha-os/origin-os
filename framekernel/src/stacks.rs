@@ -5,7 +5,7 @@
 //!   page below it, the bottom of its slot and the bottom of the next slot fault, while each page
 //!   of the stack is read/write, never executable and global. Each application processor's
 //!   interrupt stacks, as its TSS names them, are in the region with the same space below. A
-//!   frame larger than a page is probed a page at a time (Rust 1.99.1's inline stack probes on
+//!   frame larger than a page is probed a page at a time (Rust 1.100.0's inline stack probes on
 //!   `x86_64-unknown-none`), so a stack's first access past its end is in that space.
 //! - **The direct map is whole:** it still has every 2 MiB leaf `layout::build` made.
 //! - **A freed stack is out of every processor's reach:** another processor caches the

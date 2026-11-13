@@ -13,7 +13,7 @@
 //!   Framekernel overwrites whole before it lets anything else run (R9 Z3; TASKS 18b S5).
 //!
 //! [`core::hint::black_box`] is used as `origin-crypto` uses it: it is documented as best
-//! effort and as no guarantee for security (`core::hint`, Rust 1.99.1), and it costs nothing
+//! effort and as no guarantee for security (`core::hint`, Rust 1.100.0), and it costs nothing
 //! to add.
 
 use core::hint::black_box;

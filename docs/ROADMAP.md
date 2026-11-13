@@ -40,7 +40,7 @@ These are accepted rules, not new decisions (finding F10). Each hardware test be
 
 **Accepted: decision item 252.**
 
-§82: "Pin Rust 1.99.1, validate cross-compilation, establish repository, tests, research governance, source provenance and CI." Scope: the project's own tools, on the development host (`eng/host`). Matrix row S82-01.
+§82: "Pin Rust 1.100.0, validate cross-compilation, establish repository, tests, research governance, source provenance and CI." Scope: the project's own tools, on the development host (`eng/host`). Matrix row S82-01.
 
 | Test | Passes when | Rows |
 |---|---|---|

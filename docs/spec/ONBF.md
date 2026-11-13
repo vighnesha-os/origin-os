@@ -8,7 +8,7 @@
 | Clarifications | `docs/spec/ONBF-errata.md`. C1–C14 and G2–G5 were decided by the owner on 2026-11-07 and are normative. They narrow §4 and define the §4.6 Merkle level numbering, for example: every unknown section kind is rejected (C13); manifests are never compressed (C12); segments are page-sized, sorted and disjoint (G4); REQUIRED is set on every section (G5); SYM's DWARF data has its own kind (G1). |
 | Manifest keys | `docs/spec/ONBF-manifest-keys.md`: one shared OCBOR-1 key registry for all profiles. Key 0 is `schema`, CPU features are a bitset, and the KRN keys are assigned (owner decisions K1–K4, 2026-11-07). |
 | Research baseline | 2026-11-07 |
-| Toolchain | Rust 1.99.1 stable, edition 2024 (CLAUDE.md §8) |
+| Toolchain | Rust 1.100.0 stable, edition 2024 (CLAUDE.md §8). It was Rust 1.99.1 until CLAUDE.md 7.8 (2026-11-13, decision item 278). No rule of the format depends on the compiler's version |
 | Implements | CLAUDE.md §19, §42–47, §58–60, §62–64, §70 |
 | Evidence | `docs/research/2026-11-07-onbf.md` (sources R1–R20, local experiments E1–E4) |
 

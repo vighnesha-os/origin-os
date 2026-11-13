@@ -15,7 +15,7 @@ xtask = "run --quiet --package xtask --"
 # CLAUDE.md §14: frame pointers on every Origin-owned freestanding image.
 #
 # CLAUDE.md §75: the loader's image is the same bytes from one build to the next
-# (docs/research/2026-11-10-loader-reproducible-build.md). For this target rustc 1.99.1 runs
+# (docs/research/2026-11-10-loader-reproducible-build.md). For this target rustc 1.100.0 runs
 # rust-lld's COFF driver with `/DEBUG`, whatever `-C strip` says, and two links of the same
 # objects then differ in the PE header's time stamp (the time of the link) and in the CodeView
 # record's identifier (a hash of the PDB, which holds the path of a directory rustc creates
@@ -49,7 +49,7 @@ rustflags = [
     "-C", "target-feature=+harden-sls-ret",
     # The link arguments that give the kernel's ELF the shape `onbf-pack` converts to KRN
     # (ONBF §6.1.2, §6.5). The kernel is the one binary built for this target. For it
-    # rustc 1.99.1 runs rust-lld with `-pie --eh-frame-hdr -z noexecstack --gc-sections
+    # rustc 1.100.0 runs rust-lld with `-pie --eh-frame-hdr -z noexecstack --gc-sections
     # -z relro -z now -O1 --strip-debug` (observed with `--print link-args`): a PIE, but
     # without `--no-dynamic-linker` or `-z text`. The arguments below come after rustc's own,
     # so they decide the output whatever rustc's defaults become (in lld the last of two
@@ -90,7 +90,7 @@ rustflags = [
 #
 # The text names no version, so a toolchain upgrade does not make it false; the compiler
 # writes its own version beside it. `force` makes this entry win over a value in the
-# environment (tried with Cargo 1.99.1), and a file above the checkout cannot replace it.
+# environment (tried with Cargo 1.100.0), and a file above the checkout cannot replace it.
 # This is the one place the text is written: xtask reads it from here.
 [env]
 LLD_VERSION = { value = "Linker: rust-lld of the toolchain that rust-toolchain.toml pins (text from .cargo/config.toml)", force = true }

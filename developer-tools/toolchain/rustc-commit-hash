@@ -3,4 +3,4 @@
 # that starts with # is a comment. Read by developer-tools/toolchain/verify.sh and by
 # .github/ci/install-rust.sh, which both fail when the compiler reports another commit.
 # A compiler upgrade (CLAUDE.md §15) changes this line with rust-toolchain.toml.
-58cf8f9c35b355199727627d07ae34a4e2846d67
+0ef1bc386059596dada8fb65b50425aab2ea637a
