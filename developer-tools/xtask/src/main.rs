@@ -4492,9 +4492,11 @@ fn build_loader(loader: Loader) -> Result<PathBuf> {
 }
 
 /// Builds the TEST ONLY application that plants firmware-reserved memory, and returns the path
-/// of its `.efi`.
+/// of its `.efi`. It takes the loader's flags: it builds the loader's library too, and with other
+/// flags each build would rebuild that library over the other's.
 fn build_reserved_fixture() -> Result<PathBuf> {
-    run_step(cargo().args([
+    let mut build = cargo();
+    build.args([
         "build",
         "--package",
         RESERVED_PACKAGE,
@@ -4503,7 +4505,9 @@ fn build_reserved_fixture() -> Result<PathBuf> {
         "--target",
         UEFI_TARGET,
         "--release",
-    ]))?;
+    ]);
+    build.args(toolchain::image_config()?);
+    run_step(&mut build)?;
     let efi = target_dir()
         .join(UEFI_TARGET)
         .join("release")
