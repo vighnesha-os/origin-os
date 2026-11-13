@@ -21,8 +21,8 @@
 //!   thread, and its ending records the number and the address (G1);
 //! - **the image**: a write to a page of `origin.core` faults there; `memory_unmap` and
 //!   `memory_protect` of its range and a fixed `memory_map` over it answer `invalid_args`, and
-//!   its pages are still mapped read-execute on the same frames afterwards; two processes hold
-//!   it at different bases on one set of frames, writable in no space;
+//!   its pages are still mapped read-execute on the same frames afterwards; three processes
+//!   hold it, each at a base of its own, on one set of frames, writable in no space;
 //! - **narrow parameters** (L13): through a stub, a call whose 32-bit parameter has bits set
 //!   above it is taken as the same call with them clear, where the same registers in a direct
 //!   call are `invalid_args`;
@@ -643,8 +643,7 @@ fn prove_binding(com1: &mut Console, creator: &Process) -> bool {
             && imports_bound(&b.image.process, &PIN_PROGRAM, pb.base, pb.core);
     }
     if let Ok(first) = launch::load_program(creator, &FIRST_PROGRAM, &FIRST_PROGRAM_RUN) {
-        first_bound = imports_bound(&first.process, &FIRST_PROGRAM, first.base, first.core)
-            && core_mapped(&first.process, first.core);
+        first_bound = imports_bound(&first.process, &FIRST_PROGRAM, first.base, first.core);
     }
     let binding = bound && first_bound;
     let _ = writeln!(
@@ -763,24 +762,28 @@ fn prove_image(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64
             && process.ending() == Some(Ending::Exited(0));
     }
 
-    // Two processes, loaded and never started: one set of frames at two bases.
+    // Three processes, loaded and never started, two with the pin program and one with the
+    // first: one set of frames, at a base of each process's own.
     let (mut shared, mut apart) = (false, false);
     let mut executors = 0;
     if let (Some(a), Some(b)) = (
         Scripted::new(LIMITS, Via::Core(creator)),
         Scripted::new(LIMITS, Via::Core(creator)),
     ) && let (Some(pa), Some(pb)) = (a.pinned.as_ref(), b.pinned.as_ref())
+        && let Ok(first) = launch::load_program(creator, &FIRST_PROGRAM, &FIRST_PROGRAM_RUN)
     {
-        shared = core_mapped(&a.image.process, pa.core) && core_mapped(&b.image.process, pb.core);
-        apart = pa.core != pb.core;
+        shared = core_mapped(&a.image.process, pa.core)
+            && core_mapped(&b.image.process, pb.core)
+            && core_mapped(&first.process, first.core);
+        apart = pa.core != pb.core && pa.core != first.core && pb.core != first.core;
         let counts = core_image::mappings();
         executors = counts.map_or(0, |(_, executable)| executable);
-        shared &= counts.is_some_and(|(writable, executable)| writable == 0 && executable >= 2);
+        shared &= counts.is_some_and(|(writable, executable)| writable == 0 && executable >= 3);
     }
     let image_ok = write_faulted && refused && kept && shared && apart;
     let _ = writeln!(
         com1,
-        "origin-kernel: core: origin.core in a process: a write to its page faulted there: {write_faulted}; memory_unmap and memory_protect of its range and a fixed memory_map over it each answered INVALID_ARGS, and calls through it went on: {refused}; its {} pages were still mapped read-execute on the same frames afterwards: {kept}; two processes hold it on one set of frames, executable in {executors} spaces and writable in none: {shared}, at different bases: {apart}{}",
+        "origin-kernel: core: origin.core in a process: a write to its page faulted there: {write_faulted}; memory_unmap and memory_protect of its range and a fixed memory_map over it each answered INVALID_ARGS, and calls through it went on: {refused}; its {} pages were still mapped read-execute on the same frames afterwards: {kept}; three processes, two of the pin program and one of the first, hold it on one set of frames, executable in {executors} spaces and writable in none: {shared}, each at a base of its own: {apart}{}",
         span / PAGE,
         if image_ok { "" } else { FAILED }
     );
