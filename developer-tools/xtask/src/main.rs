@@ -761,11 +761,18 @@ fn topology_markers(machine: &Machine, leaf_1f: bool) -> Vec<String> {
 fn boot_scenario() -> Scenario {
     let machine = machine();
     let mut scenario = boot_scenario_markers(&machine);
-    // Each AP's start-up line comes after the MADT line, in index order.
+    // Each AP's start-up line comes after the MADT line and the per-CPU line that follows it
+    // (ADR-0008 Amendment 1, D3), in index order.
     if let Some(at) = scenario
         .markers
         .iter()
-        .position(|m| m.starts_with("origin-kernel: ACPI MADT: "))
+        .position(|m| m.starts_with("; kernel stacks' region: room for "))
+        .or_else(|| {
+            scenario
+                .markers
+                .iter()
+                .position(|m| m.starts_with("origin-kernel: ACPI MADT: "))
+        })
     {
         for index in (1..machine.cpus()).rev() {
             scenario.markers.insert(
@@ -1522,9 +1529,6 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
                 "origin-kernel: ACPI MADT: {} processors, {cpus} enabled (largest APIC ID listed {})",
                 machine.listed, machine.highest
             ),
-            format!(
-                "origin-kernel: SMP: {cpus} of {cpus} enabled processors online; trampoline identity pages removed true"
-            ),
             // ADR-0008 Amendment 1, D3: every per-CPU table holds every index, sized at
             // discovery, the stacks' region has room, and nothing held a processor back.
             format!(
@@ -1533,6 +1537,9 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             format!(
                 "; kernel stacks' region: room for {} processors, at most 262144 in its reserved address space; x2APIC IDs are 32-bit, 0 with the broadcast ID refused; held back: none",
                 cpus.max(64)
+            ),
+            format!(
+                "origin-kernel: SMP: {cpus} of {cpus} enabled processors online; trampoline identity pages removed true"
             ),
             // D8: one at a time, and the total printed.
             format!(

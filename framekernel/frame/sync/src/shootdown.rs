@@ -432,22 +432,17 @@ impl Default for Record {
 
 /// The initiator's mark for one processor: whether the request in progress asked it. Only the
 /// processor holding the turn reads or writes a mark, and it clears every mark it set before it
-/// gives the turn up.
+/// gives the turn up. The turn is the lock that orders one holder's marks before the next's, so a
+/// mark is a plain atomic even under Loom: it is no point the models need to interleave, and the
+/// turn itself is modelled.
 #[derive(Debug)]
-pub struct Asked(prim::AtomicBool);
+pub struct Asked(core::sync::atomic::AtomicBool);
 
 impl Asked {
     /// Not asked.
-    #[cfg(not(all(test, loom)))]
     #[must_use]
     pub const fn new() -> Self {
-        Self(prim::AtomicBool::new(false))
-    }
-
-    /// Not asked. Loom's atomics cannot be built in a `const`.
-    #[cfg(all(test, loom))]
-    pub fn new() -> Self {
-        Self(prim::AtomicBool::new(false))
+        Self(core::sync::atomic::AtomicBool::new(false))
     }
 }
 

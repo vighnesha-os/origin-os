@@ -1156,6 +1156,9 @@ pub(crate) fn prove(com1: &mut Console, cpus: &[CpuIndex], tsc_hz: u64, proofs: 
             if passed { "" } else { ": scheduler failed" }
         );
     }
+    // Given back now: the reaping proof below finds the heap where it was before the first
+    // spawn.
+    drop(switches_at_stop);
     if ok && fair_everywhere {
         let _ = writeln!(
             com1,
