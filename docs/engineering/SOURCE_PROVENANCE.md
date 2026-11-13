@@ -4506,5 +4506,46 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
   - *The gates again under Rust 1.100.0 (2026-11-13), after merging `main` at `803755c` (CLAUDE.md 7.8) and the records of items 247 to 251, at `c0cd136`; each run as `cargo xtask exclusive -- cargo xtask <command>` on the M1 Max, QEMU 11.1.3 TCG:* `boot-reserved` passed (VT-d 109.4 s, AMD-Vi 112.8 s); `cargo xtask check` passed (50 suites, 1,720 tests passed, 0 failed, 27 ignored; Loom 53 models and 78 controls; every gate); `boot-test` passed, 11 of 11; `boot-matrix` passed, 126 scenarios, the kernel stacks' region at 16 distinct bases in 16 kernel boots, every verdict the usual one under QEMU (23 "degraded: 63 of 64 proofs passed; failed: speculation controls", and the machine without the random-number instructions). The merge changed none of the code controls RM-1 to RM-5 plant into, so they were not run again. `main` at `6368f02` was merged after these runs (`e98cf68`); it adds records only, nothing outside `docs/`, and the quick gates passed on it.
   - *Not run:* anything under KVM or on a real processor; a reserved range inside the IOVA window (the 512 MiB machine has no reserved memory there: host-tested only); `map`'s refusal of a frame in a never-map range (no DMA frame lands in one under QEMU: the rule's data is host-tested, the one-line check in `iommu/amd.rs` is not).
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-12, on the coordinating session's brief. Original code; Rust `core` and `alloc` (kernel, fixture) and `std` (xtask) only.
-- **Review:** none. No person and no second agent has read it.
+- **Review:** one independent AI review, 2026-11-13 (`docs/engineering/REVIEW_T40_2026-11-13.md`), answered in the entry below. No person has read it.
+- **Licensing:** MIT OR Apache-2.0.
+
+## TASKS item 40: the answers to its review, decision items 291 to 293, and boot info 0.7 (2026-11-13)
+
+- **What:** on `claude/rmrr-ivmd-maps`, after merging `main` at `6368f02` and the records of items 247 to 251 and 291 to 293 (`docs/decisions-291-293` at `22e44af`). The review (`docs/engineering/REVIEW_T40_2026-11-13.md`) found two Medium, seven Low and five Informational points; its Resolution answers each with its commit, under the coordinating session's rulings and the owner's answers ("Accept all 3").
+  - `fc5a2ae` and `970bb94`, the framework:
+    - `reserved.rs`: `Lending` (fixed slots, allocation-free) and the refusal of a writable range over a lent table (M1); `rmrr_range` (L1); `MAX_DEVICE_PAGES` and `bounded` (L4); `may_unmap` and `may_map` (L7); `identity_ranges` (L3).
+    - `vm.rs`: lent and device-writable memory under one lock (M1).
+    - `iommu.rs` and `iommu/amd.rs`: the bound, the give-back of a failed attach's pages (`Page::give_back`, a new `unsafe` site in a listed file), the domain's source ranges (I4), `maps_physical` (L5).
+    - `ivrs.rs`: Unity with IR = IW = 0 never mapped (I2).
+    - `vtd.rs` and `amdvi.rs`: `find_physical` (L5).
+    - `pci.rs` and `kernel.rs`: BARs held against identity ranges (L3).
+  - `741b442`, the proof and the fixture:
+    - `framekernel/src/testfill.rs` (new): the test fill, recognised by address.
+    - `storage.rs`: the write leg only on filled pages, with "the page is unchanged" (M2); other domains at any address (L5); the access from the firmware's bits (I4).
+    - The fixture's configuration format 2: an address-bound fill, `ReservedOther`, `Table`, and its table copy in reserved memory.
+    - xtask's markers and whole-log check, and an xtask test that holds the two fills equal.
+  - `c634f40`, item 291 (ADR-0007 Amendment 2, R6): a never-map type-20h IVMD applies to every device of every IOMMU (`Ivrs::memory_for`, `MemoryRange::never_mapped`).
+  - `fb0c0fd`, item 293 (ADR-0002 B4, boot info 0.7): `Unaccepted` and `FirmwareOther`, the loader's translation (`boot/uefi/src/memmap.rs`), `overlaps_ram`, `pcie::is_ram`, `vm::is_firmware_data`, and `origin-version.toml` at boot info 0.7.
+  - `aefe94d` and `7fcc594`, the records: T14, T26, rows A07-R1 to R6 and A02-B4, the ledger (the XSDT observation, the review's outcomes), ADR-0013's controls, STATUS, TASKS, this entry.
+- **Specifications:** as the first entry; AMD 48882 Rev 3.11 §5.2.2.2 for R6; UEFI 2.11 §7.2's memory types for boot info 0.7, as the loader's existing translation already read them.
+- **Open-source references consulted (§3, §6):** none in this part. QEMU's source was not read again: the XSDT facts were observed from a running QEMU instead (ledger §4).
+- **Decisions:** items 291, 292 and 293, accepted by the owner on 2026-11-13. Item 292 accepts the review's similarity check in place of §3's split for the fixture (see the entry above).
+- **The first boot of `fc5a2ae` failed:** a panic in the allocator, because the kernel lends ACPI tables before its heap exists, and `Lending` then used a `Vec`. `970bb94` made it allocation-free; nothing else in the fixes allocates before the heap.
+- **Test evidence (2026-11-13; Rust 1.100.0 `0ef1bc386`; QEMU 11.1.3 TCG and OVMF on the M1 Max):**
+  - *Host:* new tests in `reserved` (lent tables and both orders of lending, the slots and their exhaustion, `rmrr_range`, the bound, `may_unmap` and `may_map`, the new region kinds), `ivrs` (R6 over two IOMMUs and a third segment; Unity with IR = IW = 0 accepted; the mutation test's invariant), `vtd` and `amdvi` (`find_physical`), `pci` (a BAR inside an identity range), `framekernel::testfill`, `origin-boot-info` (the kinds' round trip and `overlaps_ram`), `origin-boot-uefi` (the kind of every UEFI type, OEM, OS and unknown types), and xtask (the two fills equal).
+  - *`boot-reserved` at `970bb94`:* VT-d passed in 131.7 s, AMD-Vi in 103.1 s. Under AMD-Vi:
+    - eight IVMDs reported;
+    - the one over the IVRS copy refused for the table the kernel holds at the copy's address, `0x1fb32000`;
+    - the never-map type-20h range named for every device on every IOMMU;
+    - four proof lines, each "as the firmware's bits give: true";
+    - the page without the fill "was not run" and is unchanged;
+    - the read-only page's write blocked and recorded.
+  - *Controls* RM-1 (both IOMMUs) to RM-7, at `970bb94`, each failed the boot (ADR-0013). RM-4 and RM-6 now fail the kernel's own proof. RM-7 failed PCIe's table read before xtask's marker could.
+  - *Gates at `7fcc594`, one turn of the machine, 22:17 to 23:11 UTC:*
+    - `cargo xtask check` passed: 50 suites, 1,734 tests passed, 0 failed, 27 ignored; Loom 53 models and 78 controls; every gate. The loader's release build is 196,096 bytes, SHA-256 `6f046852…5fd3436`: it changes with boot info 0.7, as expected.
+    - `boot-test` passed, 11 of 11.
+    - `boot-matrix` passed: 126 scenarios, the reserved-memory machines among them, the kernel stacks' region at 16 distinct bases in 16 kernel boots, and the usual verdicts (23 "degraded: 63 of 64, speculation controls", and the machine without the random-number instructions).
+  - *Not run:* anything under KVM or on a real processor. No QEMU firmware gives UEFI types 13, 15 or OEM and OS types, so boot info 0.7's new kinds are host-tested only. No attach fails part-way at boot, so `Page::give_back` is not exercised.
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-13, on the coordinating session's requests. Original code; `core` and `alloc` only in the kernel, the loader and the fixture.
+- **Review:** the review these fixes answer, by one AI reviewer. The fixes themselves have not been reviewed; the coordinating session reads M1, M2 and the 0.7 translation before landing. No person has reviewed any of it.
 - **Licensing:** MIT OR Apache-2.0.
