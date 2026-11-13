@@ -504,9 +504,21 @@ returns_and_bare() {
     { if (after) { bare++; after = 0 } }
     END { if (after) bare++; printf "%d %d\n", rets, bare }'
 }
-if ! grep -q "\"$HARDEN\"" .cargo/config.toml; then
-  echo ".cargo/config.toml does not give the kernel's target \"$HARDEN\"." > "$out"
-  record FAIL "The kernel's hardening option: .cargo/config.toml no longer names it (ADR-0017 Z10)" "$out"
+# Only a line of the kernel's own table counts, and only what comes before a `#` on it: the
+# option in a comment, or under another target's table, does not reach the kernel.
+kernel_flags() {
+  awk '
+    /^[[:space:]]*\[/ { mine = ($0 ~ /^[[:space:]]*\[target\.x86_64-unknown-none\][[:space:]]*(#.*)?$/); next }
+    mine { sub(/#.*/, ""); print }
+  ' .cargo/config.toml
+}
+if ! kernel_flags | grep -q "\"$HARDEN\""; then
+  {
+    echo "No line of the table [target.x86_64-unknown-none] in .cargo/config.toml gives \"$HARDEN\" outside a comment."
+    echo "The lines of .cargo/config.toml that name it:"
+    grep -n "$HARDEN" .cargo/config.toml || echo "(none)"
+  } > "$out"
+  record FAIL "The kernel's hardening option: .cargo/config.toml no longer gives it to the kernel's target (ADR-0017 Z10)" "$out"
 elif [ -z "$OBJDUMP" ]; then
   echo "No disassembler found; install the llvm-tools component." > "$out"
   record FAIL "The kernel's hardening option: no disassembler to read the probe with" "$out"
