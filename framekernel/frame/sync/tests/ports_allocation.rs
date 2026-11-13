@@ -99,7 +99,7 @@ const OTHER: u32 = 2;
 
 #[test]
 fn a_reservation_without_memory_is_refused() {
-    let port = Arc::new(Port::<Test>::new());
+    let port = Arc::new(Port::<Test>::bounded(1));
     REFUSE.with(|refuse| refuse.set(true));
     let refused = Reservation::<Test>::try_new(&Host, &port, 7);
     REFUSE.with(|refuse| refuse.set(false));
@@ -113,9 +113,23 @@ fn a_reservation_without_memory_is_refused() {
     );
 }
 
+/// A full port that is also short of memory is refused at its bound: `limit` before
+/// `no_memory`, D5's order, because the bound is looked at before the two nodes are allocated
+/// (ADR-0005 I1; the independent review of TASKS 57, finding T5).
+#[test]
+fn a_full_port_short_of_memory_is_refused_at_its_bound() {
+    let port = Arc::new(Port::<Test>::bounded(1));
+    let held = Reservation::<Test>::try_new(&Host, &port, 1).unwrap();
+    REFUSE.with(|refuse| refuse.set(true));
+    let refused = Reservation::<Test>::try_new(&Host, &port, 2);
+    REFUSE.with(|refuse| refuse.set(false));
+    assert_eq!(refused.err(), Some(Unreserved::Full));
+    assert_eq!(held.into_payload(), 1);
+}
+
 #[test]
 fn nothing_allocates_after_the_reservation() {
-    let port = Arc::new(Port::<Test>::new());
+    let port = Arc::new(Port::<Test>::bounded(8));
     let source = Arc::new(Source::<Test>::new());
     let signals = AtomicU32::new(0);
     let reserved: Vec<Reservation<Test>> = (0..8)

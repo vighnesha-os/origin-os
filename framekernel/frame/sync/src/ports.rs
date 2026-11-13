@@ -617,8 +617,11 @@ impl<K: Kernel> Reservation<K> {
     /// as its bound allows, found before anything is allocated, so that a full port is refused
     /// as a limit even when memory is short (ADR-0005 I1, D5's order); and again, under the
     /// port's lock, when the room is reserved. [`Unreserved::NoMemory`] if the heap has no room.
-    /// Either way it drops `payload` and changes nothing else. For a port that has closed it
-    /// makes no room: the bind will be refused.
+    /// Either way it drops `payload`, and the two nodes it made if it got that far. It changes
+    /// nothing else but this: under a race, the refusal can come after this reservation grew the
+    /// port's index, when others took the room it made, and the index stays grown, within
+    /// [`Port::index_at_bound`] (the independent review of TASKS 57, finding T8). For a port that
+    /// has closed it makes no room: the bind will be refused.
     pub fn try_new(
         scheduler: &K::Scheduler,
         port: &K::PortRef,
@@ -725,6 +728,52 @@ struct Queues<K: Kernel> {
     queue: Queue<Store<K>>,
     index: Index<K>,
     closed: bool,
+    /// A reservation is growing the index ([`Port::reserve`]): no other grows it until that one
+    /// has installed its block, freed the block that came back and cleared this.
+    growing: bool,
+}
+
+/// What this crate's tests and models count of one port's index: the slots of every block the
+/// port's growths and its index hold at a moment, and the most there have been at once
+/// (ADR-0005 I1; the independent review of TASKS 57, finding T1). `core`'s atomics even under
+/// Loom: it orders nothing, and a model reads it only after joining its threads.
+#[cfg(test)]
+struct Blocks {
+    slots: core::sync::atomic::AtomicUsize,
+    most: core::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl Blocks {
+    const fn new() -> Self {
+        Self {
+            slots: core::sync::atomic::AtomicUsize::new(0),
+            most: core::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// A block of `slots` slots was made.
+    fn made(&self, slots: usize) {
+        let now = self.slots.fetch_add(slots, Ordering::Relaxed) + slots;
+        self.most.fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// A block of `slots` slots was freed.
+    fn freed(&self, slots: usize) {
+        self.slots.fetch_sub(slots, Ordering::Relaxed);
+    }
+}
+
+/// What a reservation's look under the port's lock decided ([`Port::reserve`]).
+enum Look {
+    /// The port has closed: no room.
+    Closed,
+    /// Room kept.
+    Kept,
+    /// Another reservation is growing the index: wait for it, then look again.
+    Wait,
+    /// No room, and this reservation grows the index, to this many slots.
+    Grow(usize),
 }
 
 /// A port: packets queued in order, the threads waiting for one, and the index of the bindings
@@ -739,18 +788,15 @@ pub struct Port<K: Kernel> {
     /// fixed when it is made. Each holds a slot of the index, so the index stays within
     /// [`Port::index_at_bound`] of it.
     bound: usize,
+    /// Threads waiting for a packet, and reservations waiting for another's growth of the index.
     waiters: WaitQueue<Thread<K>, WAITERS>,
+    #[cfg(test)]
+    blocks: Blocks,
 }
 
 impl<K: Kernel> core::fmt::Debug for Port<K> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Port").finish_non_exhaustive()
-    }
-}
-
-impl<K: Kernel> Default for Port<K> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -770,12 +816,15 @@ impl<K: Kernel> Port<K> {
     /// stay within `bound`, and the most its old block held while it last grew (ADR-0005 I1):
     /// what the kernel-wide bound counts for a port's index (G5).
     ///
-    /// The index grows only when a reservation finds no room ([`Port::reserve`]), and then
-    /// to the larger of what it needs, twice its capacity and [`FIRST_SLOTS`]. A reservation is
-    /// made only while the bindings armed and reserved are under `bound`, and the index's room
-    /// is never less than the reservations, so the index grows only from a capacity under
-    /// `bound`, to at most twice that and one more: `2 * bound - 1`, or `FIRST_SLOTS` when that is
-    /// more. Its old block held under `bound` slots. With a bound of 0 it never grows.
+    /// The index grows only when a reservation finds no room ([`Port::reserve`]), one
+    /// reservation at a time, and then to the larger of what it needs, twice its capacity and
+    /// [`FIRST_SLOTS`]. A reservation is made only while the bindings armed and reserved are
+    /// under `bound`, and the index's room is never less than the reservations, so the index
+    /// grows only from a capacity under `bound`, to at most twice that and one more:
+    /// `2 * bound - 1`, or `FIRST_SLOTS` when that is more. Since no other growth runs meanwhile,
+    /// the block a growth replaces is the one its grower found, which held under `bound` slots;
+    /// and no third block exists while it runs (the independent review of TASKS 57, finding T1).
+    /// With a bound of 0 it never grows.
     #[must_use]
     pub const fn index_at_bound(bound: usize) -> (usize, usize) {
         if bound == 0 {
@@ -792,7 +841,9 @@ impl<K: Kernel> Port<K> {
 
     /// An open port with nothing queued and nothing armed, that accepts at most `bound` bindings
     /// armed and reservations in flight at once (ADR-0005 Amendment 10, I1): the bound its
-    /// creator was given. A bound of 0 accepts no binding.
+    /// creator was given. A bound of 0 accepts no binding. There is no other way to make a port:
+    /// every port has a bound, which a creator's figure can count (the independent review of
+    /// TASKS 57, finding T9).
     #[cfg(not(all(test, loom)))]
     pub const fn bounded(bound: usize) -> Self {
         Self {
@@ -800,10 +851,13 @@ impl<K: Kernel> Port<K> {
                 queue: Queue::new(),
                 index: Index::new(),
                 closed: false,
+                growing: false,
             }),
             reserved: prim::AtomicUsize::new(0),
             bound,
             waiters: WaitQueue::new(),
+            #[cfg(test)]
+            blocks: Blocks::new(),
         }
     }
 
@@ -815,24 +869,21 @@ impl<K: Kernel> Port<K> {
                 queue: Queue::new(),
                 index: Index::new(),
                 closed: false,
+                growing: false,
             }),
             reserved: prim::AtomicUsize::new(0),
             bound,
             waiters: WaitQueue::new(),
+            #[cfg(test)]
+            blocks: Blocks::new(),
         }
     }
 
-    /// An open port with no bound of its own, for this crate's tests and models. The kernel makes
-    /// every port with [`Port::bounded`].
-    #[cfg(not(all(test, loom)))]
-    pub const fn new() -> Self {
-        Self::bounded(usize::MAX)
-    }
-
-    /// As the other `new`, under Loom.
-    #[cfg(all(test, loom))]
-    pub fn new() -> Self {
-        Self::bounded(usize::MAX)
+    /// The most slots this port's index blocks have held at once, its growths' and its index's
+    /// together (ADR-0005 I1): for this crate's tests and models.
+    #[cfg(test)]
+    pub(crate) fn most_index_slots(&self) -> usize {
+        self.blocks.most.load(Ordering::Relaxed)
     }
 
     /// Whether the port, open, already has as many bindings armed and reservations in flight as
@@ -868,8 +919,10 @@ impl<K: Kernel> Port<K> {
         scheduler.without_interrupts(|| self.state.lock().closed)
     }
 
-    /// Wakes every thread waiting in [`Port::take`], each to look again at what it waits for.
-    /// Whoever closes or moves a handle a thread may be waiting through calls it, as for any wait.
+    /// Wakes every thread waiting in [`Port::take`], and every reservation waiting for another's
+    /// growth of the index, each to look again at what it waits for. Whoever closes or moves a
+    /// handle a thread may be waiting through calls it, as for any wait, and so does a growth
+    /// when it ends.
     pub fn wake(&self, scheduler: &K::Scheduler) {
         for thread in self.waiters.take_all(scheduler).into_iter().flatten() {
             scheduler.wake(thread);
@@ -882,12 +935,36 @@ impl<K: Kernel> Port<K> {
     /// [`Unreserved::Full`] if the bindings armed and the reservations in flight are already at
     /// the port's bound: checked under the lock that raises `reserved`, so reservations from
     /// several processors never pass it together (ADR-0005 I1).
+    ///
+    /// One reservation grows a port's index at a time (the independent review of TASKS 57,
+    /// finding T1). The first to find no room marks the index as growing, under the lock, and
+    /// only it allocates ([`Port::grow`]). Another that finds no room while the mark is set waits
+    /// on the port's queue of waiters until the grower has installed its block, freed the block
+    /// that came back and cleared the mark, then looks again. So the heap never holds more of the
+    /// port's index than the index and the one block being made for it, or that block and the
+    /// one it replaced: the two blocks the kernel-wide bound counts ([`Port::index_at_bound`]).
+    ///
+    /// The wait cannot last for ever, nor spin:
+    ///
+    /// - The grower holds no lock while it allocates, and nothing on its way to clearing the
+    ///   mark waits for anything: it allocates (or is refused), takes the port's lock to install
+    ///   the block, frees what came back, takes the lock again to clear the mark, then wakes the
+    ///   waiters. It clears the mark on every path: grown, refused by the heap, the port closed.
+    ///   A thread ends only by its own call or a fault in ring 3, never inside this one.
+    /// - It never holds the port's lock and the waiters' queue's lock together. A waiter takes
+    ///   the queue's lock and then the port's, to read the mark, as a wait for a packet does.
+    /// - A waiter blocks rather than spins, and the wait-queue protocol loses no wake-up (its
+    ///   Loom models; here `ports_two_reservations_race_to_grow_a_bound_of_two`). One that finds
+    ///   the queue full, or the boot flow, polls by yielding, as a wait for a packet does.
+    /// - Each growth at least doubles the index, and an index grows only while it holds fewer
+    ///   slots than the bound, so a port grows at most about log2 of its bound times in its life:
+    ///   one reservation waits at most that many times.
     fn reserve(&self, scheduler: &K::Scheduler) -> Result<bool, Unreserved> {
         loop {
-            let wanted = scheduler.without_interrupts(|| {
-                let state = self.state.lock();
+            let look = scheduler.without_interrupts(|| {
+                let mut state = self.state.lock();
                 if state.closed {
-                    return Ok(None);
+                    return Ok(Look::Closed);
                 }
                 let reserved = self.reserved.load(Ordering::Relaxed);
                 if state.index.used().saturating_add(reserved) >= self.bound {
@@ -895,19 +972,37 @@ impl<K: Kernel> Port<K> {
                 }
                 if state.index.room() > reserved {
                     self.reserved.fetch_add(1, Ordering::Relaxed);
-                    return Ok(Some(0));
+                    return Ok(Look::Kept);
                 }
-                Ok(Some(state.index.wanted(reserved)))
+                if state.growing {
+                    return Ok(Look::Wait);
+                }
+                state.growing = true;
+                Ok(Look::Grow(state.index.wanted(reserved)))
             })?;
-            let wanted = match wanted {
-                None => return Ok(false),
-                Some(0) => return Ok(true),
-                Some(wanted) => wanted,
-            };
-            let mut bigger = Vec::new();
-            if bigger.try_reserve_exact(wanted).is_err() {
-                return Err(Unreserved::NoMemory);
+            match look {
+                Look::Closed => return Ok(false),
+                Look::Kept => return Ok(true),
+                Look::Wait => {
+                    self.waiters
+                        .wait_until(scheduler, || !self.state.lock().growing);
+                }
+                Look::Grow(wanted) => self.grow(scheduler, wanted)?,
             }
+        }
+    }
+
+    /// The one growth of the index under way ([`Port::reserve`]): makes a block of `wanted` slots
+    /// with no lock held, installs it unless the port has closed meanwhile, frees the block that
+    /// comes back (the old index, or this one unused), and only then clears the mark and wakes
+    /// whoever waits. [`Unreserved::NoMemory`] if the heap has no room, with the mark cleared all
+    /// the same.
+    fn grow(&self, scheduler: &K::Scheduler, wanted: usize) -> Result<(), Unreserved> {
+        let mut bigger = Vec::new();
+        let made = bigger.try_reserve_exact(wanted).is_ok();
+        if made {
+            #[cfg(test)]
+            self.blocks.made(bigger.capacity());
             let unused = scheduler.without_interrupts(|| {
                 let mut state = self.state.lock();
                 if state.closed {
@@ -915,7 +1010,18 @@ impl<K: Kernel> Port<K> {
                 }
                 state.index.grow(bigger)
             });
+            #[cfg(test)]
+            let freed = unused.capacity();
             drop(unused);
+            #[cfg(test)]
+            self.blocks.freed(freed);
+        }
+        scheduler.without_interrupts(|| self.state.lock().growing = false);
+        self.wake(scheduler);
+        if made {
+            Ok(())
+        } else {
+            Err(Unreserved::NoMemory)
         }
     }
 
@@ -1002,6 +1108,8 @@ impl<K: Kernel> Port<K> {
             }
         }
         // The ways back are dropped here, outside every lock.
+        #[cfg(test)]
+        self.blocks.freed(slots.capacity());
         drop(slots);
         Removed { storage }
     }
@@ -1486,8 +1594,10 @@ mod tests {
     const WRITABLE: u32 = 1 << 1;
     const CLOSED: u32 = 1 << 2;
 
+    /// A port bounded so far above what any of these tests arms that its bound never decides
+    /// anything: the bound's own tests are under "a port's bound".
     fn port() -> Arc<Port<Test>> {
-        Arc::new(Port::new())
+        Arc::new(Port::bounded(usize::MAX))
     }
 
     /// One look at the port: a packet, or nothing.
@@ -2434,42 +2544,118 @@ mod tests {
             }
             drain(&port);
             nothing_left(&port, &[], &account);
+            // The index and the block a growth makes, or that block and the one it replaced:
+            // never more than the figure counts (T1).
+            assert!(
+                port.most_index_slots() <= most + old_most,
+                "bound {bound}: {} slots of index blocks at once, the figure counts {}",
+                port.most_index_slots(),
+                most + old_most
+            );
         }
         assert!(closes > 0, "no port was closed");
     }
 
-    /// Reservations from several threads at once never pass the bound between them: the check
-    /// and the raise of `reserved` are one step under the port's lock.
+    /// Reservations from several threads at once never pass the bound between them. In each
+    /// round eight threads each try once and hold what they get until all have tried, so exactly
+    /// as many as the bound hold a place, whatever the order; a bound that missed reservations in
+    /// flight would let all eight through, every round (KB-12). Real threads explore few orders:
+    /// this is a smoke test, and the race itself is the Loom model's
+    /// (`ports_two_reservations_race_for_a_bound_of_one`; the independent review of TASKS 57,
+    /// finding T2).
     #[test]
     fn reservations_from_several_threads_never_pass_the_bound() {
         const BOUND: usize = 3;
+        const THREADS: usize = 8;
+        const ROUNDS: u32 = 200;
         let account = Account::new();
         let port = Arc::new(Port::<Test>::bounded(BOUND));
-        let held = AtomicU32::new(0);
-        let refused = AtomicU32::new(0);
+        let (tried, dropped) = (
+            std::sync::Barrier::new(THREADS),
+            std::sync::Barrier::new(THREADS),
+        );
+        let made = AtomicU32::new(0);
+        // Rounds that did not make exactly `BOUND`: recorded, not asserted, so that no thread
+        // stops at a barrier the others wait at.
+        let wrong = Mutex::new(Vec::new());
         std::thread::scope(|scope| {
-            for t in 0..8u32 {
-                let (port, account, held, refused) = (&port, &account, &held, &refused);
+            for t in 0..THREADS {
+                let (port, account, tried, dropped, made, wrong) =
+                    (&port, &account, &tried, &dropped, &made, &wrong);
                 scope.spawn(move || {
-                    for k in 0..2_000 {
-                        match try_reserve(port, account, t * 10_000 + k) {
+                    for round in 0..ROUNDS {
+                        let id = round * 100 + u32::try_from(t).unwrap();
+                        let got = match try_reserve(port, account, id) {
                             Ok(r) => {
-                                let now = held.fetch_add(1, Relaxed) + 1;
-                                assert!(now as usize <= BOUND, "{now} reservations held at once");
-                                held.fetch_sub(1, Relaxed);
-                                drop(r.into_payload());
-                                account.charged.fetch_sub(1, Relaxed);
+                                made.fetch_add(1, Relaxed);
+                                Some(r)
                             }
                             Err(e) => {
                                 assert_eq!(e, Unreserved::Full);
-                                refused.fetch_add(1, Relaxed);
+                                None
+                            }
+                        };
+                        if tried.wait().is_leader() {
+                            let n = made.swap(0, Relaxed);
+                            if n as usize != BOUND {
+                                wrong.lock().unwrap().push((round, n));
                             }
                         }
+                        if let Some(r) = got {
+                            drop(r.into_payload());
+                            account.charged.fetch_sub(1, Relaxed);
+                        }
+                        dropped.wait();
                     }
                 });
             }
         });
+        let wrong = wrong.into_inner().unwrap();
+        assert!(
+            wrong.is_empty(),
+            "{} of {ROUNDS} rounds made other than {BOUND} reservations, the first (round, made) \
+             {:?}",
+            wrong.len(),
+            wrong.first()
+        );
+        let (most, old) = Port::<Test>::index_at_bound(BOUND);
+        assert!(port.most_index_slots() <= most + old);
         assert_eq!(counts(&port).2, 0);
+        nothing_left(&port, &[], &account);
+    }
+
+    /// A port full of bindings armed refuses a bind on an object whose signals already meet its
+    /// mask, though that bind would queue its packet at once and arm nothing. Its reservation
+    /// holds a place from before the signals are read: they are read under the source's lock, at
+    /// the bind, so that no raise between a look and the bind is missed (ADR-0005 I1, as row K7
+    /// reads it; the independent review of TASKS 57, finding T3).
+    #[test]
+    fn a_full_port_refuses_a_bind_that_would_queue_at_once() {
+        let account = Account::new();
+        let port = Arc::new(Port::<Test>::bounded(2));
+        let armed = [Object::new(), Object::new()];
+        for (key, object) in (1..).zip(&armed) {
+            assert_eq!(
+                object.bind(&port, &account, u32::try_from(key).unwrap(), key, READABLE),
+                Bound::Armed
+            );
+        }
+        let signalled = Object::new();
+        signalled.signals.store(READABLE, Relaxed);
+        assert_eq!(
+            try_reserve(&port, &account, 3).err(),
+            Some(Unreserved::Full)
+        );
+        assert_eq!(account.charged(), 2, "the refused charge came back");
+        // Once one fires, the same bind queues at once and takes no slot.
+        assert_eq!(armed[0].raise(READABLE), 1);
+        assert_eq!(
+            signalled.bind(&port, &account, 4, 4, READABLE),
+            Bound::Queued
+        );
+        assert_eq!(counts(&port).1, 1, "a bind that queued took a slot");
+        assert_eq!(armed[1].raise(READABLE), 1);
+        assert_eq!(drain(&port).len(), 3);
         nothing_left(&port, &[], &account);
     }
 }

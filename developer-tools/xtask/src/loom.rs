@@ -1220,6 +1220,39 @@ const CONTROLS: &[Control] = &[
             &["two reservations passed a bound of one"],
         )],
     },
+    Control {
+        // Two reservations that both find no room both grow the index (the independent review
+        // of TASKS 57, finding T1): the heap holds two new blocks at once, past the two the
+        // kernel-wide bound counts for the port.
+        name: "two_growers_at_once",
+        file: PORTS,
+        from: "                if state.growing {
+                    return Ok(Look::Wait);
+                }
+",
+        to: "",
+        models: &[
+            (
+                "ports_two_reservations_race_for_a_bound_of_one",
+                &["the index's blocks at once passed what the figure counts"],
+            ),
+            (
+                "ports_two_reservations_race_to_grow_a_bound_of_two",
+                &["the index's blocks at once passed what the figure counts"],
+            ),
+        ],
+    },
+    Control {
+        // A growth that ends without waking whoever waits for it: the waiter stays blocked.
+        name: "a_growth_wakes_no_one",
+        file: PORTS,
+        from: "        scheduler.without_interrupts(|| self.state.lock().growing = false);
+        self.wake(scheduler);
+",
+        to: "        scheduler.without_interrupts(|| self.state.lock().growing = false);
+",
+        models: &[("ports_two_reservations_race_to_grow_a_bound_of_two", DEADLOCK)],
+    },
 ];
 
 /// The scratch copy's workspace: just the crate under test. The tables `scratch_manifest` adds

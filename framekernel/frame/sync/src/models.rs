@@ -123,6 +123,13 @@
 //!     deadlock.
 //!   - Two reservations racing for a port's last free slot both bind: each keeps room in the
 //!     port's index, so no bind finds it full.
+//!   - A port's bound (ADR-0005 I1): two reservations racing for a bound of one, one holds a
+//!     place and the other is refused; two racing to grow the index of a port bounded at two,
+//!     one grows it while the other waits and is woken, and both hold a place. In both, the
+//!     heap never holds more of the index at once than the two blocks the kernel-wide bound
+//!     counts for it, since one reservation grows a port's index at a time. Every other port
+//!     model runs with its port bounded at the most it arms, so the bound's check is on its
+//!     paths too.
 //!   - In every one, each binding's storage comes back exactly once: an account charged at each
 //!     reservation ends at zero, and never goes below it.
 //!
@@ -171,8 +178,10 @@
 //!   that does arrive is not shown to keep its wake-up: the timer ends it either way.
 //! - Ports beyond one binding raced against one operation: a source bound to two ports, a close
 //!   racing an explicit cancel, more than two raisers or binders, a taker that times out, a
-//!   port's index growing more than once in a model, and the kernel's own part (its handles,
-//!   quotas, exit). Those are host tests (`ports.rs`), or the kernel's, in stage 2 of S3-6.
+//!   port's index growing more than once in a model, a third reservation waiting while a growth
+//!   frees the block it replaced (so the order in which a grower frees that block and then
+//!   clears its mark), and the kernel's own part (its handles, quotas, exit). Those are host
+//!   tests (`ports.rs`), reading, or the kernel's, in stage 2 of S3-6.
 //!
 //! # What the models add
 //!
@@ -2552,11 +2561,13 @@ fn close_and_settle(port: &Arc<Port<Ports>>, me: &OnCpu, account: &AtomicU64) {
     );
 }
 
-/// What every port model starts from: two processors, a port, an account, an object.
-fn ports_world() -> (Kernel, Arc<Port<Ports>>, Arc<AtomicU64>, Arc<Raiser>) {
+/// What every port model starts from: two processors, a port bounded at `bound`, the most
+/// bindings the model arms on it at once, so that the bound's check is on every path the model
+/// explores (the independent review of TASKS 57, finding T11), an account, an object.
+fn ports_world(bound: usize) -> (Kernel, Arc<Port<Ports>>, Arc<AtomicU64>, Arc<Raiser>) {
     (
         Kernel::with_cpus(2),
-        Arc::new(Port::new()),
+        Arc::new(Port::bounded(bound)),
         Arc::new(AtomicU64::new(0)),
         Raiser::new(),
     )
@@ -2571,7 +2582,7 @@ fn ports_bind_against_raise() {
         preempted(3, SPINS),
         preempted(4, SPINS),
         || {
-            let (world, port, account, object) = ports_world();
+            let (world, port, account, object) = ports_world(1);
             let binder = world.spawn(0, {
                 let (port, account, object) =
                     (Arc::clone(&port), Arc::clone(&account), Arc::clone(&object));
@@ -2615,7 +2626,7 @@ fn ports_raise_against_an_explicit_cancel() {
         preempted(3, SPINS),
         preempted(4, SPINS),
         || {
-            let (world, port, account, object) = ports_world();
+            let (world, port, account, object) = ports_world(1);
             let boot = world.boot_flow_on(0);
             assert!(object.bind(&boot, &port, &account));
             let raiser = world.spawn(0, {
@@ -2657,7 +2668,7 @@ fn ports_raise_against_an_implicit_cancel() {
         preempted(3, SPINS),
         preempted(4, SPINS),
         || {
-            let (world, port, account, object) = ports_world();
+            let (world, port, account, object) = ports_world(1);
             let boot = world.boot_flow_on(0);
             assert!(object.bind(&boot, &port, &account));
             let raiser = world.spawn(0, {
@@ -2691,7 +2702,7 @@ fn ports_close_against_raise() {
         preempted(3, SPINS),
         preempted(4, SPINS),
         || {
-            let (world, port, account, object) = ports_world();
+            let (world, port, account, object) = ports_world(1);
             let boot = world.boot_flow_on(0);
             assert!(object.bind(&boot, &port, &account));
             let raiser = world.spawn(0, {
@@ -2731,7 +2742,7 @@ fn ports_two_raisers() {
         preempted(3, SPINS),
         preempted(4, SPINS),
         || {
-            let (world, port, account, object) = ports_world();
+            let (world, port, account, object) = ports_world(1);
             let boot = world.boot_flow_on(0);
             assert!(object.bind(&boot, &port, &account));
             let raisers = [(0, OTHER), (1, ASKED)].map(|(cpu, bit)| {
@@ -2763,7 +2774,7 @@ fn ports_bind_against_a_close_of_the_bound_handle() {
         preempted(3, SPINS),
         preempted(4, SPINS),
         || {
-            let (world, port, account, object) = ports_world();
+            let (world, port, account, object) = ports_world(1);
             let binder = world.spawn(0, {
                 let (port, account, object) =
                     (Arc::clone(&port), Arc::clone(&account), Arc::clone(&object));
@@ -2795,7 +2806,7 @@ fn ports_bind_against_a_close_of_the_bound_handle() {
 /// A port's close against a bind: the bind is refused, or the close takes what it bound.
 /// Nothing stays queued in a closed port or armed for it, and the storage comes back once.
 fn close_against_bind(raised: bool) {
-    let (world, port, account, object) = ports_world();
+    let (world, port, account, object) = ports_world(1);
     if raised {
         object.signals.store(ASKED, Relaxed);
     }
@@ -2856,7 +2867,7 @@ fn ports_taker_against_a_delivery() {
         preempted(4, SPINS),
         preempted(6, SPINS),
         || {
-            let (world, port, account, object) = ports_world();
+            let (world, port, account, object) = ports_world(1);
             let boot = world.boot_flow_on(0);
             assert!(object.bind(&boot, &port, &account));
             let taker = world.spawn(0, {
@@ -2889,7 +2900,7 @@ fn ports_close_against_a_waiter() {
         preempted(4, SPINS),
         preempted(6, SPINS),
         || {
-            let (world, port, _, _) = ports_world();
+            let (world, port, _, _) = ports_world(1);
             let open = Arc::new(AtomicBool::new(true));
             let taker = world.spawn(0, {
                 let (port, open) = (Arc::clone(&port), Arc::clone(&open));
@@ -2924,7 +2935,7 @@ fn ports_two_reservations_race_for_the_last_slot() {
         preempted(3, SPINS),
         preempted(4, SPINS),
         || {
-            let (world, port, account, object) = ports_world();
+            let (world, port, account, object) = ports_world(5);
             let boot = world.boot_flow_on(0);
             // Three of the index's first four slots used: one left.
             for _ in 0..3 {
@@ -2951,10 +2962,24 @@ fn ports_two_reservations_race_for_the_last_slot() {
     );
 }
 
+/// What a port model reports when the heap held more of a port's index at once than the
+/// kernel-wide bound counts for it (the control `two_growers_at_once` looks for it).
+const GROWN_PAST: &str = "the index's blocks at once passed what the figure counts";
+
+/// The most slots a port's index blocks held at once, its growths' and its index's together,
+/// against the two blocks the figure counts at `bound` (ADR-0005 I1; the independent review of
+/// TASKS 57, finding T1).
+fn blocks_within_the_figure(port: &Port<Ports>, bound: usize) {
+    let (most, old) = Port::<Ports>::index_at_bound(bound);
+    assert!(port.most_index_slots() <= most + old, "{GROWN_PAST}");
+}
+
 /// Two reservations race for a port bounded at one (ADR-0005 Amendment 10, I1; TASKS item 57):
 /// exactly one holds a place, the other is refused as `Full` with its charge given back, and
 /// once the place is given back the port takes one reservation again. The bound's check and the
-/// raise of `reserved` are one step under the port's lock, so the two cannot both pass it.
+/// raise of `reserved` are one step under the port's lock, so the two cannot both pass it. Both
+/// find the index empty: one grows it, and the heap never holds more of it than the figure
+/// counts.
 #[test]
 fn ports_two_reservations_race_for_a_bound_of_one() {
     check(
@@ -2984,6 +3009,7 @@ fn ports_two_reservations_race_for_a_bound_of_one() {
                 .filter_map(|racer| racer.join().unwrap())
                 .collect();
             assert_eq!(held.len(), 1, "two reservations passed a bound of one");
+            blocks_within_the_figure(&port, 1);
             for reservation in held {
                 reservation.into_payload().fetch_sub(1, Relaxed);
             }
@@ -2995,6 +3021,45 @@ fn ports_two_reservations_race_for_a_bound_of_one() {
             if let Ok(reservation) = again {
                 reservation.into_payload().fetch_sub(1, Relaxed);
             }
+            close_and_settle(&port, &me, &account);
+        },
+    );
+}
+
+/// Two reservations race to grow the index of a port bounded at two (the independent review of
+/// TASKS 57, finding T1): one grows it while the other waits for that growth and then looks
+/// again, so both hold a place; the heap never holds more of the index than the figure counts;
+/// and the waiter is woken when the growth ends (a lost wake-up leaves it blocked, which Loom
+/// reports as a deadlock).
+#[test]
+fn ports_two_reservations_race_to_grow_a_bound_of_two() {
+    check(
+        "ports_two_reservations_race_to_grow_a_bound_of_two",
+        preempted(3, SPINS),
+        preempted(4, SPINS),
+        || {
+            let world = Kernel::with_cpus(2);
+            let port = Arc::new(Port::<Ports>::bounded(2));
+            let account = Arc::new(AtomicU64::new(0));
+            let racers = [0, 1].map(|cpu| {
+                let (port, account) = (Arc::clone(&port), Arc::clone(&account));
+                world.spawn(cpu, move |me| {
+                    account.fetch_add(1, Relaxed);
+                    let kept = Reservation::<Ports>::try_new(&me, &port, Arc::clone(&account));
+                    assert!(kept.is_ok(), "a reservation under the bound was refused");
+                    kept.ok()
+                })
+            });
+            let held: Vec<Reservation<Ports>> = racers
+                .into_iter()
+                .filter_map(|racer| racer.join().unwrap())
+                .collect();
+            assert_eq!(held.len(), 2);
+            blocks_within_the_figure(&port, 2);
+            for reservation in held {
+                reservation.into_payload().fetch_sub(1, Relaxed);
+            }
+            let me = world.boot_flow_on(0);
             close_and_settle(&port, &me, &account);
         },
     );
