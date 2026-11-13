@@ -59,11 +59,20 @@ The ADR leaves these open. Each was sent with a recommendation (notes folder, `2
 
 Not put as a question: a range longer than 4 GiB is refused, as no legacy usage the specification names needs one and each 4 KiB page costs a page-table entry per device (4 GiB is 1,048,576 entries, 2,048 table pages); the round-down of an IVMD's start and the round-up of its length to 4 KiB.
 
+**After the independent review of 2026-11-13** (notes folder, `t40-review.md`; answered in `docs/engineering/REVIEW_T40_2026-11-13.md`), with the coordinating session's rulings:
+
+- **A writable range over a table the kernel holds is refused** (M1). The kernel lends ACPI tables as `&'static` references (`vm::firmware_bytes`). A device allowed to write one could change it under the reference. VT-d §8.4 does not forbid firmware to keep its DMAR in reserved memory and name an RMRR over it, so R3's memory-map rule alone does not cover the case. This is threat T26's invariant, not a new decision.
+- **A device's ranges together are bounded as one range is**, at 4 GiB (1,048,576 pages), so ranges side by side cannot add up past the bound one range is refused for (L4).
+- **Overlapping ranges of one device get the union of their permissions** (I3, the coordinating session's ruling on the review's question 5): each range grants exactly its own access on its own pages, as R4 reads, so the union grants nothing no range granted.
+- **Unity with IR = IW = 0 is a never-map range** (I2, the review's question 4): R4's "IR and IW both clear" decides it, whatever Unity says. Refusing the whole IVRS for it, as the first version did, is stricter than what was accepted.
+- **A never-map type-20h IVMD and other IOMMUs** (L6): 48882 §5.2.2.2 says a 20h's flags apply "to all devices in a system". That changes R5, so it is with the owner as decision item 291. Until the answer, R5 stands as accepted.
+
 ## 6. Tests defined before completion (§16.12)
 
 - **Host:** RMRR and IVMD ranges to identity plans (every flag combination, rounding, the refusals of R3, each at its boundary); a domain's window skipping identity pages and never handing one out; `unmap` refusing an identity page; `map` refusing a frame in a never-map range; R5's placement over a two-IOMMU IVRS; the fixture's table rewrite (lengths, checksums, the appended structures parsed back by `dmar::parse` and `ivrs::parse`).
 - **Boot, under each IOMMU, with the fixture's tables:** the NVMe controller, named by a reserved range, writes a disk block into the range at its physical address and reads it back out; the NIC's domain holds no such page; a planted range that fails R3 is refused by name. Under AMD-Vi also: a read-only range takes the controller's read and blocks its write, with the fault recorded; a 20h range and an exclusion range are identity-mapped in every attached domain.
 - **Negative controls,** each a temporary edit booted once: the maps not made; the maps made one page off; R3's memory-map check skipped; (AMD) a read-only range mapped read and write.
+- **Added after the review (2026-11-13):** host tests of the refusal over a lent table, of lending and granting in both orders, of an RMRR whose end overflows, of a device's bound, of `unmap` and `map`'s refusals, of the walk that finds a physical page at any IOVA, of a BAR inside an identity range, and of the test fill. At boot, a writable range over the table copy itself (in reserved memory) is refused by name, and a writable reserved page without the test fill is never written. Two more controls: the proof's write leg forced onto that page, and `firmware_bytes` recording nothing it lends.
 
 ## 7. What this cannot show
 
