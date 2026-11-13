@@ -273,6 +273,36 @@ pub(crate) const fn channel_cost() -> Option<u64> {
     }
 }
 
+/// What one system call of this file's can make the kernel hold at once that no quota charges
+/// while it holds it, the largest of them (`quota::call_temporaries`; the independent review of
+/// task S4-3, finding B1):
+///
+/// - `channel_write`: the message's bytes, which `syscall::channel_write` copies into a buffer of
+///   exactly their count before the handles are checked, and the list of what follows each
+///   moved handle out of the table (`Gone`), both made before the sender's `message_bytes` is
+///   charged. Charging first would put `limit` before `bad_handle`, against D5's order.
+/// - `channel_read`: the message's bytes and the list of what its handles became in the reader's
+///   table (`Received`), held from the refund of the message's charge until the reader has
+///   copied them out.
+///
+/// Every other call charges its quota before it allocates, or allocates nothing. The handle
+/// list a message carries is charged with it.
+pub(crate) const fn call_temporaries() -> Option<u64> {
+    use crate::quota::{Element, call_temporaries};
+    use origin_abi::limits::{MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES};
+    let lists = [
+        Element {
+            size: core::mem::size_of::<Gone>(),
+            align: core::mem::align_of::<Gone>(),
+        },
+        Element {
+            size: core::mem::size_of::<Received>(),
+            align: core::mem::align_of::<Received>(),
+        },
+    ];
+    call_temporaries(MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES, &lists)
+}
+
 /// An empty list of charges with room for a whole queue, so writing never allocates.
 fn charge_list() -> Result<VecDeque<Charge>, Error> {
     let mut list = VecDeque::new();

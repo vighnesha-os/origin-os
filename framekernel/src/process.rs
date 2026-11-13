@@ -18,9 +18,12 @@
 //!   a handle to the process: each thread holds a reference to the space through the scheduler
 //!   and gives it up when it is reaped, so by then no processor runs in it, and each that ran
 //!   one has loaded another CR3, which flushes its translations (no PCIDs yet).
+//! - The memory objects its mappings held go with its space, in the last reap, not when its last
+//!   thread ends: the space maps their frames until it goes, so their creators are repaid only
+//!   once nothing can reach them (the independent review of task S4-3, finding B2).
 //! - Only then is `TERMINATED` raised (P11's order: handles, memory, signal): whoever sees it
-//!   knows the process's handles have closed and that neither it nor any of its threads holds
-//!   the address space any more. A thread is counted before it takes its reference, so one being
+//!   knows the process's handles have closed, that neither it nor any of its threads holds
+//!   the address space any more, and that what its mappings held has been given back. A thread is counted before it takes its reference, so one being
 //!   started cannot keep the space past `TERMINATED`. A kernel helper that took a reference of
 //!   its own through [`Process::memory`] (`root`, `write_frame`, `frame_of`, `translate`, and the
 //!   boot proof that reads a process's memory after it has ended) keeps the space until it lets
@@ -389,7 +392,9 @@ const fn element((size, align): (usize, usize)) -> Element {
 ///   its new block and its old one, at most six slots' bytes a binding once rounded, and eight
 ///   when it holds one. Counted as eight (row K7).
 /// - **A thread:** its kernel stack, its FPU area at this processor's size (64-byte aligned,
-///   `FpuArea`), its thread object and the context the scheduler holds for it.
+///   `FpuArea`), its thread object and the context the scheduler holds for it; and, apart, the
+///   most one system call can hold that no quota charges (`ipc::call_temporaries`), since a
+///   thread has one call in flight at most.
 /// - **A page a launch maps** (not in a figure; the creator pays it besides, the coordinating
 ///   session's ruling (d)): its frame, if it is the process's own, and its share of the space's
 ///   two tables of page records, eight records' bytes in each (`quota::eight_a_page`).
@@ -444,6 +449,7 @@ pub(crate) fn costs() -> Option<Costs> {
         port: block(ObjectRef::<crate::port::KernelPort>::ALLOCATION)?,
         binding,
         thread,
+        call: ipc::call_temporaries()?,
         page: PAGE.checked_add(records)?,
         shared_page: records,
     })
@@ -478,6 +484,10 @@ pub(crate) struct Process {
     pub(crate) account: ObjectRef<Account>,
     /// Its whole mappings of memory objects (C7), each holding its object.
     pub(crate) mappings: SpinLock<Mappings<ObjectRef<MemoryObject>>>,
+    /// The objects its mappings held once its last thread has ended, kept until its address
+    /// space has gone (the last reap), when [`Process::release_unmapped`] drops them before
+    /// `TERMINATED` (the independent review of task S4-3, finding B2).
+    unmapped: SpinLock<Vec<ObjectRef<MemoryObject>>>,
     /// Its budget for the unmaps and protects it asks for, in any process (T15, T16).
     pub(crate) changes: SpinLock<Budget>,
     /// Where its system calls may come from (P4, B2, ONBF §6.1). A plain field: written before
@@ -561,6 +571,7 @@ impl Process {
             handles: SpinLock::new(HandleTable::new(limits.handles)),
             account,
             mappings: SpinLock::new(Mappings::new(limits.memory.mappings)),
+            unmapped: SpinLock::new(Vec::new()),
             changes: SpinLock::new(Budget::new(limits.memory.changes)),
             origin,
             debug_calls: limits.debug_calls,
@@ -848,7 +859,7 @@ impl Process {
         // (G5): its figure paid for that many kernel stacks and FPU areas, no more.
         without_interrupts(|| {
             let mut life = process.lifecycle.lock();
-            if life.ended || life.unreaped as usize >= process.threads {
+            if !crate::quota::may_start(life.ended, life.unreaped as usize, process.threads) {
                 return Err(QueueError::Full);
             }
             life.running += 1;
@@ -905,6 +916,7 @@ impl Process {
             self.close_out(ending);
         }
         if done {
+            self.release_unmapped();
             self.termination.raise();
         }
     }
@@ -938,10 +950,13 @@ impl Process {
         // The bindings it made are cancelled before its handles close (F11).
         ipc::close_table(table, self.id);
         ipc::reap_closed();
-        // Its mappings' objects go with it, and no more can be made (P11): before it counts as
-        // ended, so whoever sees the ending sees their charges back.
+        // No more mappings can be made (P11). Their objects are kept until the address space has
+        // gone, in the last reap: their frames stay mapped in it until then, so their creators
+        // are repaid only once nothing can reach those frames, and before `TERMINATED`, so that
+        // whoever sees it sees the charges back (the independent review of task S4-3, finding
+        // B2).
         let objects = without_interrupts(|| self.mappings.lock().close());
-        drop(objects);
+        without_interrupts(|| *self.unmapped.lock() = objects);
         // "Ended" means its handles are closed and its peers can see that. (Ends that were only
         // reachable through an undelivered message another processor is reaping this instant
         // close a moment later: they are delayed, never lost.)
@@ -971,7 +986,18 @@ impl Process {
             life.ended && life.unreaped == 0
         });
         if done {
+            self.release_unmapped();
             self.termination.raise();
         }
+    }
+
+    /// The last thread has been reaped, and with it the last reference to the address space a
+    /// thread held: the objects its mappings held go now, and their creators are repaid, before
+    /// `TERMINATED` is raised (P11's order: handles, memory, signal). A kernel helper that took
+    /// a reference of its own to the space ([`Process::memory`]) is the kernel's own use, as the
+    /// module notes say.
+    fn release_unmapped(&self) {
+        let objects = without_interrupts(|| core::mem::take(&mut *self.unmapped.lock()));
+        drop(objects);
     }
 }

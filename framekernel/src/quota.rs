@@ -292,6 +292,11 @@ pub struct Costs {
     pub binding: u64,
     /// Each thread: its kernel stack, its FPU area and its kernel objects.
     pub thread: u64,
+    /// Each thread's system call: the most one call can make the kernel hold at once that no
+    /// quota has charged yet, or charges no longer ([`call_temporaries`]). A thread has one call
+    /// in flight at most, and a call that is preempted keeps what it holds, so each thread is
+    /// counted for the largest (the independent review of task S4-3, finding B1).
+    pub call: u64,
     /// Each page a launch maps into a process on a frame of its own (its image, its stack, its
     /// start record): the frame, and the page's share of the space's two tables of page records.
     /// Not in a figure: the creator pays it besides (the coordinating session's ruling (d)).
@@ -308,6 +313,49 @@ pub struct Costs {
 #[must_use]
 pub const fn eight_a_page(element: Element) -> Option<u64> {
     (element.size as u64).checked_mul(8)
+}
+
+/// What the largest system call can make the kernel hold at once, beside what any quota charges
+/// while it holds it: a message's bytes, up to `max_bytes`, in one exact allocation, and beside
+/// them one list of up to `max_handles` of the larger of `lists`' elements. Two calls do this
+/// (`ipc::call_temporaries` names them): `channel_write`, between the copy of its bytes and the
+/// charge to the sender's `message_bytes`, which D5's order puts after the handles are checked;
+/// and `channel_read`, between the refund of the message's charge and the copy out. `None` on
+/// overflow.
+#[must_use]
+pub const fn call_temporaries(
+    max_bytes: usize,
+    max_handles: usize,
+    lists: &[Element],
+) -> Option<u64> {
+    let Some(bytes) = footprint(max_bytes, 1) else {
+        return None;
+    };
+    let mut largest = 0;
+    let mut i = 0;
+    while i < lists.len() {
+        let element = lists[i];
+        let Some(size) = max_handles.checked_mul(element.size) else {
+            return None;
+        };
+        let Some(list) = footprint(size, element.align) else {
+            return None;
+        };
+        if list > largest {
+            largest = list;
+        }
+        i += 1;
+    }
+    bytes.checked_add(largest)
+}
+
+/// Whether a process may start one more thread: not once it has ended, and not while it has as
+/// many threads started and not yet reaped as its limits give (G5's "a kernel stack and an FPU
+/// area for each thread"). The count is of threads not yet *reaped*, not of threads running: a
+/// thread that has ended still holds its stack and FPU area until its processor reaps it.
+#[must_use]
+pub const fn may_start(ended: bool, unreaped: usize, threads: usize) -> bool {
+    !ended && unreaped < threads
 }
 
 /// A set of limits' figure, kind by kind, in bytes (G5).
@@ -419,7 +467,10 @@ impl Limits {
             times(self.objects.events, costs.event),
             times(self.objects.ports, costs.port),
             times(self.objects.bindings, costs.binding),
-            times(self.threads, costs.thread),
+            match costs.thread.checked_add(costs.call) {
+                Some(each) => times(self.threads, each),
+                None => None,
+            },
         )
         else {
             return None;
@@ -463,8 +514,11 @@ impl Limits {
 
 /// The reserve the kernel keeps for its own use when it sizes its root (G5): the larger of
 /// 64 MiB and an eighth of the free memory. A hypothesis, like a budget (CLAUDE.md §53, decision
-/// item 115): the kernel's own use after the root is sized (its drivers, its caches, the pages
-/// its launch path maps for each program, the slab table's slack) is not measured yet.
+/// item 115; budget B19, whose model lists what it takes): the kernel's own use after the root
+/// is sized, its drivers, its caches and its own threads; and what the root does not count, as
+/// row O11 of the system-call threat model lists it, the slab table's slack, the frames a stalled
+/// shootdown keeps and the kernel stacks kept or retired after their threads are reaped among
+/// it. None of it is measured yet.
 #[must_use]
 pub const fn reserve_for(free: u64) -> u64 {
     const FLOOR: u64 = 64 << 20;
@@ -870,6 +924,7 @@ mod tests {
         port: 768,
         binding: 448,
         thread: 17_920,
+        call: 66_560,
         page: 4096 + 512,
         shared_page: 512,
     };
@@ -984,7 +1039,7 @@ mod tests {
                 threads: 4,
                 ..NOTHING
             }),
-            4 * COSTS.thread
+            4 * (COSTS.thread + COSTS.call)
         );
         assert_eq!(
             alone(Limits {
@@ -1029,7 +1084,7 @@ mod tests {
                     + alone(committed(16 * PAGE as usize))
                     + alone(mappings(3))
                     + alone(objects(3, 2, 4))
-                    + 2 * COSTS.thread
+                    + 2 * (COSTS.thread + COSTS.call)
             )
         );
         assert_eq!(all.figure(&COSTS), parts.total());
@@ -1251,8 +1306,11 @@ mod tests {
 
     /// The coordinating session's ruling (c): a process's payment is held by its account and
     /// given back when the account goes, which is after every object charged to it, not when the
-    /// process object goes. Here as the kernel holds them: the process and a channel it created
-    /// each hold the account, and the channel outlives the process.
+    /// process object goes. **A model**, on `std::sync::Arc`: the kernel's `Account`, `Process`
+    /// and channel cannot be built on the host, so this shows the shape the kernel uses (each
+    /// holds the account through a counted reference, and the payment is the account's field),
+    /// not the kernel's own types. The boot proof's clause "the refund waits" shows the kernel's,
+    /// for a channel (the independent review of task S4-3, finding B9).
     #[test]
     fn the_refund_waits_for_an_object_charged_to_the_account_that_outlives_the_process() {
         use std::sync::Arc;
@@ -1291,5 +1349,62 @@ mod tests {
                 assert!(growing(pages, element).unwrap() <= pages as u64 * share);
             }
         }
+    }
+
+    /// The review's finding B1: a thread's part of a figure holds the largest call's temporaries,
+    /// a message's bytes at the most a message may have and the larger list beside them, as the
+    /// ABI's limits set them; each thread counts them once.
+    #[test]
+    fn a_thread_s_part_holds_the_largest_call_s_temporaries() {
+        use origin_abi::limits::{MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES};
+        let gone = Element { size: 40, align: 8 };
+        let received = Element { size: 16, align: 8 };
+        let call =
+            call_temporaries(MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES, &[gone, received]).unwrap();
+        let bytes = footprint(MAX_MESSAGE_BYTES, 1).unwrap();
+        assert_eq!(bytes, 65_536);
+        assert!(call >= bytes + footprint(MAX_MESSAGE_HANDLES * 40, 8).unwrap());
+        assert!(call >= bytes + footprint(MAX_MESSAGE_HANDLES * 16, 8).unwrap());
+        assert_eq!(
+            call,
+            bytes + footprint(MAX_MESSAGE_HANDLES * 40, 8).unwrap()
+        );
+        // No list at all still counts the bytes.
+        assert_eq!(
+            call_temporaries(MAX_MESSAGE_BYTES, MAX_MESSAGE_HANDLES, &[]),
+            Some(bytes)
+        );
+        // In a figure: each thread its stack and objects, and one call's temporaries.
+        let costs = Costs { call, ..COSTS };
+        let one = Limits {
+            threads: 1,
+            ..NOTHING
+        };
+        assert_eq!(
+            one.figure(&costs).unwrap() - costs.process,
+            COSTS.thread + call
+        );
+        assert!(one.figure(&costs).unwrap() - costs.process >= COSTS.thread + bytes);
+        assert_eq!(call_temporaries(usize::MAX, 1, &[]), None);
+        assert_eq!(call_temporaries(1, usize::MAX, &[gone]), None);
+    }
+
+    /// The review's finding B4: the threads count refuses one more than the limit, counts threads
+    /// not yet reaped, and nothing once the process has ended.
+    #[test]
+    fn a_start_past_the_threads_given_is_refused() {
+        // A limit of one: the first, then no second while it is unreaped, then one again once
+        // it is reaped (in a process that has not ended, which a step-4 program's never is).
+        assert!(may_start(false, 0, 1));
+        assert!(!may_start(false, 1, 1));
+        assert!(may_start(false, 0, 1));
+        // A limit of two.
+        assert!(may_start(false, 1, 2));
+        assert!(!may_start(false, 2, 2));
+        // None given: none at all.
+        assert!(!may_start(false, 0, 0));
+        // Once ended, never, whatever is left.
+        assert!(!may_start(true, 0, 1));
+        assert!(!may_start(true, 0, usize::MAX));
     }
 }
