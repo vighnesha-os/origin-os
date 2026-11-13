@@ -190,7 +190,12 @@ fn port_and_object(
 /// binder's own `bindings`, then the port's bound, its creator's `bindings_per_port` (ADR-0005
 /// Amendment 10, I1); the memory ([`Error::NoMemory`], with the charge given back). Under a race
 /// a bind can be refused at the port's bound while fewer are armed, because another bind is in
-/// flight; a retry after that one completes or fails can succeed. A handle closed by another thread
+/// flight; a retry after that one completes or fails can succeed. By the same reading, a port
+/// full of bindings armed refuses a bind whose signals already meet its mask, though it would
+/// queue its packet at once and arm nothing: its reservation holds a place in the port's index
+/// from before the signals are read, under the source's lock, at the bind, which is what keeps a
+/// raise between a look and the bind from being missed (row K7; the independent review of
+/// TASKS 57, finding T3). A handle closed by another thread
 /// during the call, either of the two, is [`Error::BadHandle`], and nothing stays bound.
 pub(crate) fn bind(
     table: &SpinLock<HandleTable<Object>>,

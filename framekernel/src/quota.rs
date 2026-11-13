@@ -506,16 +506,22 @@ impl Limits {
             times(pages, costs.memory_page),
             mapping_records(self.memory.mappings, costs),
             times(self.objects.events, costs.event),
-            match port_index(
-                self.objects.bindings_per_port,
-                costs.index_slot,
-                costs.index_first,
-            ) {
-                Some(index) => match costs.port.checked_add(index) {
-                    Some(each) => times(self.objects.ports, each),
+            // No port, no index to count: a bound with no port to bound costs nothing, however
+            // large (the independent review of TASKS 57, finding T12).
+            if self.objects.ports == 0 {
+                Some(0)
+            } else {
+                match port_index(
+                    self.objects.bindings_per_port,
+                    costs.index_slot,
+                    costs.index_first,
+                ) {
+                    Some(index) => match costs.port.checked_add(index) {
+                        Some(each) => times(self.objects.ports, each),
+                        None => None,
+                    },
                     None => None,
-                },
-                None => None,
+                }
             },
             times(self.objects.bindings, costs.binding),
             match costs.thread.checked_add(costs.call) {
@@ -1091,8 +1097,10 @@ mod tests {
         // A port whose bound is zero has no index; one with a bound pays for its index at it.
         assert_eq!(alone(objects(0, 2, 0, 0)), 2 * COSTS.port);
         assert_eq!(alone(objects(0, 2, 0, 3)), 2 * (COSTS.port + index(3)));
-        // The bound costs nothing without a port to bound.
+        // The bound costs nothing without a port to bound, however large (T12).
         assert_eq!(alone(objects(0, 0, 0, 1_000)), 0);
+        assert_eq!(alone(objects(0, 0, 0, usize::MAX)), 0);
+        assert!(objects(1, 1, 0, usize::MAX).figure(&COSTS).is_none());
         // A binding pays its own two allocations, and no slot of the index.
         assert_eq!(alone(objects(0, 0, 5, 0)), 5 * COSTS.binding);
         assert_eq!(

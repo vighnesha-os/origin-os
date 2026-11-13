@@ -573,7 +573,9 @@ fn objects_go_with_the_space(com1: &mut Console, bsp: CpuIndex, tsc_hz: u64) -> 
 /// A port's bound (ADR-0005 Amendment 10, I1): a port is bounded at its creator's
 /// `bindings_per_port`, counting bindings armed and reservations in flight, and its creator's
 /// figure pays for its index at that bound. Another process binds events to two ports, one whose
-/// creator was given two and one whose creator was given none.
+/// creator was given two and one whose creator was given none. The two creators differ in that
+/// alone, so what the first paid beyond the second is its port's index at two, to the byte, as
+/// this build's `costs` count it (the independent review of TASKS 57, finding T4).
 fn ports_bounded_by_their_creators(com1: &mut Console, tsc_hz: u64) -> bool {
     use crate::event::Event;
     use crate::handles::Need;
@@ -597,9 +599,19 @@ fn ports_bounded_by_their_creators(com1: &mut Console, tsc_hz: u64) -> bool {
         },
         ..holder(0)
     };
+    // With the root whole, nothing else pays or is repaid while the two are made.
+    let whole = settle(tsc_hz);
+    let index = process::costs()
+        .and_then(|c| crate::quota::port_index(2, c.index_slot, c.index_first))
+        .unwrap_or(0);
     let made = (|| {
+        let left = ROOT.left();
         let two = Process::proof(creator(2), (0, 0), BOOT_PROOF_PRINCIPAL)?;
+        let after_two = ROOT.left();
         let none = Process::proof(creator(0), (0, 0), BOOT_PROOF_PRINCIPAL)?;
+        let beyond = left
+            .checked_sub(after_two)?
+            .checked_sub(after_two.checked_sub(ROOT.left())?)?;
         let binder = Process::proof(binder_limits, (0, 0), BOOT_PROOF_PRINCIPAL)?;
         let bounded = port::create(&two.account).ok()?;
         let empty = port::create(&none.account).ok()?;
@@ -617,9 +629,11 @@ fn ports_bounded_by_their_creators(com1: &mut Console, tsc_hz: u64) -> bool {
             );
             events.push(event);
         }
-        Some((two, none, binder, watch, at_two, at_none, events, handles))
+        Some((
+            two, none, binder, watch, at_two, at_none, events, handles, beyond,
+        ))
     })();
-    let Some((two, none, binder, watch, at_two, at_none, events, handles)) = made else {
+    let Some((two, none, binder, watch, at_two, at_none, events, handles, beyond)) = made else {
         let _ = writeln!(
             com1,
             "origin-kernel: kernel bound: the bounded ports and their binder could not be made: kernel bound failed"
@@ -660,10 +674,11 @@ fn ports_bounded_by_their_creators(com1: &mut Console, tsc_hz: u64) -> bool {
     // cancelled and their charges given back.
     binder.abandon();
     drop((two, none, binder, watch, events));
-    let ok = two_armed && armed_two && third && nothing && again && zero;
+    let figured = whole && index > 0 && beyond == index;
+    let ok = two_armed && armed_two && third && nothing && again && zero && figured;
     let _ = writeln!(
         com1,
-        "origin-kernel: kernel bound: a port whose creator was given two bindings at once takes two from another process: {}; a third is refused with LIMIT: {third}; nothing is left of it, the binder's charge and the port's armed count with the rest: {nothing}; once one fires it takes another: {again}; a port whose creator was given none refuses the first: {zero}{}",
+        "origin-kernel: kernel bound: a port whose creator was given two bindings at once takes two from another process: {}; a third is refused with LIMIT: {third}; nothing is left of it, the binder's charge and the port's armed count with the rest: {nothing}; once one fires it takes another: {again}; a port whose creator was given none refuses the first: {zero}; the first creator paid beyond the second its port's index at two, to the byte: {figured} ({beyond} bytes, {index} counted){}",
         two_armed && armed_two,
         verdict(ok)
     );

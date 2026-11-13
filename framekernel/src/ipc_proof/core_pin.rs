@@ -296,8 +296,10 @@ fn every_call_limits() -> Limits {
             events: 1,
             ports: 1,
             bindings: 2,
-            // Its script arms both its bindings on its one port (ADR-0005 I1).
-            bindings_per_port: 2,
+            // One place on its one port at a time (ADR-0005 I1): its first bind queues at once,
+            // and it reads that packet before it binds again and cancels (the independent review
+            // of TASKS 57, finding T10).
+            bindings_per_port: 1,
         },
         ..LIMITS
     }
