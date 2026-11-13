@@ -4616,3 +4616,36 @@ On `claude/s4-1-rust-ring3-fde097`, from the third batch at `e51e098`. Each find
 - **Author / date:** Claude Code agent (local, M1 Max), 2026-11-13. Original code; `std` in the host tools, `core` and `alloc` in the kernel, `core` in ring 3.
 - **Review:** the report is one AI reviewer's; these answers are read by the coordinating session. No person has reviewed this task.
 - **Licensing:** MIT OR Apache-2.0.
+
+## Task S4-3: the kernel-wide bound, and O2 for step 4 (ADR-0005 Amendment 8, G2, G5 and G6; TASKS item 55; decision items 206, 209 and 210; 2026-11-13)
+
+- **What:** every process is paid for out of the kernel's root before it is made, and the payment comes back when everything it covers is gone: task S4-3 of ADR-0011 N14 step 4 (`docs/research/2026-11-11-n14-step4-scope.md`, section 4, whose exit tests were written before the code). On `claude/elegant-benz-1983ff`, cut from `main` at `803755c` and, on the coordinating session's word, reset to `land/s4-part2` at `793299a`, which holds task S4-2. The contract and the coordinating session's rulings are TASKS item 55. No ABI, format, call or status changes. Commits:
+  - `da6827f` the §78 contract; `d146b3b` the rulings that change it (the launch's own pages paid by the root, the port's index, the record tables' overestimate, the fix to `prepare_run`, the framework's read-only sizes, the V3 cost statement).
+  - `46880ba` `quota.rs`: `Limits` and `MemoryLimits`, a set of limits' figure kind by kind (`footprint`, `growing`, `Costs`, `Figure`), the `Purse` and its `Payment`, the reserve, and their host tests.
+  - `4595392` the definition test that holds row O2.
+  - `bbc15f5` the framework's read-only sizes, in one commit as the coordinating session asked: `ObjectRef::ALLOCATION`, `userspace::{MAX_TABLES, MAX_USER_PAGES, PAGE_RECORD, SHARED_FRAME}` and `ports::{Reservation::ALLOCATIONS, Port::INDEX_SLOT, Port::FIRST_INDEX_SLOTS}`. `MAX_TABLES` was private before: one keyword in the framework, made by this task.
+  - `7c7b099` a fix to S3-5b's `UserSpace::prepare_run`, found by this task, with `tablebound::ready_records` and its host tests.
+  - `fbe8c34` the kernel: the payment at creation and for a launch's pages, the threads count, the root sized at boot, `HandleTable::ELEMENTS`, `Mappings::RECORD`, `ipc::channel_cost`, `sched::THREAD_STACK` made `pub(crate)`, and `threads` on every limits value in the tree.
+  - `45d402a` and `16b5683` the boot proof "the kernel-wide bound", its table row and xtask's markers.
+  - the records: ADR-0013's row and controls, the two threat models, the budgets file, the matrix rows, STATUS and this entry.
+- **Specifications:** ADR-0005 P11, D4, F7, G2, G5 and G6 (G3 as a draft only); ADR-0013 R1, R6 and R7; ADR-0016 R8; ADR-0018 V3 to V5 and V8. No document outside the repository: the figure is arithmetic over the kernel's own types, and the heap's rounding and `Vec`'s growth are measured by host tests, not read from a document.
+- **Open-source references consulted (§3, §6):** none. No source code of any other system was read.
+- **`unsafe`:** none added or touched. The framework's three new constants are safe code in files that hold `unsafe` already; the kernel's files forbid it.
+- **How the figure is measured.** Every kind's cost is the sum of the blocks the kernel allocates for one of it, each through a `size_of` and `align_of` in the build and rounded as `origin_frame::heap` rounds it (`quota::footprint`, held to the real heap's own count of bytes in use for every size to 5,000 bytes and many above, at 13 alignments). A table that grows is counted at the most it holds while it grows, its new block and its old one together (`quota::growing`, held to `Vec` as the pinned compiler builds it). As the build measured them on the development Mac: a process 134,272 bytes (its page tables at their bound, 32 frames, are most of it); a handle table of 64 entries 13,056; a channel 4,608; a memory object 64, and 80 a page besides its frame; a space's page records once it may map 2,138,240; an event 512; a port 1,024; a binding 448, eight index slots among it; a thread 21,024, its 16 KiB stack among it. A private page a launch maps costs its frame and 384 bytes of record tables.
+- **Decisions this task did not take:** none of the owner's. With the coordinating session: the reserve's size, the threads count, where the payment is held, the launch's pages (changed by its ruling (d)), the growing tables, the framework's constants, the fix to `prepare_run`, and the port's index, which it put to the owner as decision item 282.
+- **Found, for other sessions:** the port's index (row K7, decision item 282); the heap's fixed slab table (row O10, TASKS item 56); `prepare_run`'s reservation before its bound (fixed here). The record tables' count is an overestimate on purpose, about 2 MiB a process that may map.
+- **Limits, stated plainly:**
+  - In step 4 the kernel is the only creator: the root pays for everything. A creator that is a process, paying out of its own figure, is step 5's (G3, G4).
+  - A port's index is counted per binding; the slots its growth leaves after their binders' payments come back are not (K7, item 282).
+  - The heap's 1,024 slabs (4 MiB of small blocks) are a resource the root does not count (O10, TASKS item 56).
+  - Frames a stalled shootdown keeps for ever, slab fragmentation, a thread object held after its thread is reaped, the concurrent growth of one port's index and undelivered messages between their refund and their reaping are each bounded otherwise, as row O11 says, and not by the root.
+  - The reserve is a hypothesis (budget B19). The kernel's own use after boot is not measured.
+  - No boot fills every quota of a process and compares what the kernel holds with the figure: each kind's cost rests on reading its allocations, an inventory made on 2026-11-13, and on the host tests of the heap's and `Vec`'s rules.
+  - Nothing has run under KVM or on a real processor, and CI has not built this.
+- **Test evidence (2026-11-13; Rust 1.100.0; QEMU 11.1.3 TCG + OVMF on the M1 Max):**
+  - *Host:* `quota`, 22 tests (the heap's rounding against the real heap; the growth bound against `Vec`; each kind's part, all together and overflow; paying, repaying and a payment that grows and gives part back, to the byte, from eight threads at once; the refund waiting for an object that outlives its process; a memory object's list of frames and a port's index against the bounds the costs assume; the reserve). `tablebound`, 5 (the fix). `oidl`, the definition test for O2. `bootproof`, the table at 67 rows.
+  - *Boot:* `cargo xtask boot-test` passed 11 of 11 on `45d402a`'s code; the kernel boot ended "degraded: 66 of 67 proofs passed; failed: speculation controls", with every clause of the bound's proof true.
+  - *Negative controls:* KB-1 to KB-6 in ADR-0013, on an export of `16b5683`, each failing where aimed; the file put back after each.
+- **Author / date:** Claude Code agent (local, M1 Max), 2026-11-13, on the coordinating session's contract and rulings. Original code; `std` in the host tests, `core` and `alloc` in the kernel.
+- **Review:** none yet. An independent review is arranged by the coordinating session. No person has reviewed this task.
+- **Licensing:** MIT OR Apache-2.0.
