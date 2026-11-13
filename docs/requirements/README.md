@@ -144,6 +144,7 @@ Every answered item of `docs/engineering/OWNER_DECISIONS.md` is named in the "De
 | Item | Rows | Why |
 |---|---|---|
 | 18, 145 | none | Each is a permission to download named specifications and test vectors once. |
+| 292 | none | The acceptance of an independent similarity check in place of CLAUDE.md §3's read-and-write split, for one test-only fixture (TASKS item 40). A record of a deviation. |
 | 22 | none | A permission to push one branch and open one pull request. |
 | 23 | none | A comparison of two AMD manuals with AMD's own copies, done once. |
 | 70, 161 | none | How pull requests are offered: at 100 commits, and pull request 15 at 76. A rule of process that no statement of the directive or decision of an ADR carries. |
