@@ -353,7 +353,7 @@ Each of the thirteen failed where it was aimed, CP-2 and CP-6(a) at an earlier p
 | KB-5 | The thread part left out of a figure (`Limits::parts`: no threads) | Host: `quota::tests::a_figure_is_its_kinds_added_kind_by_kind` and `limits_whose_figure_overflows_have_none`, 2 of 22 failed |
 | KB-6 | The bound left out of a run's records (`tablebound::ready_records` makes room for any run) | Host: `tablebound::tests::a_run_past_the_bound_is_refused_and_adds_no_room_to_either_table` (`0 mapped, a run of 14849`), 1 of 5 failed |
 
-Each of the six failed where it was aimed. KB-1 and KB-2 are the two the step-4 ledger asks for; KB-3 to KB-6 are this task's own: the threads count, the coordinating session's ruling (d), the figure's thread part and the fix to S3-5b's `prepare_run`.
+Each of the six failed where it was aimed. `16b5683` differs from the last commit that changes code, `8ca93c5`, only by `rustfmt`. KB-1 and KB-2 are the two the step-4 ledger asks for; KB-3 to KB-6 are this task's own: the threads count, the coordinating session's ruling (d), the figure's thread part and the fix to S3-5b's `prepare_run`.
 
 **The legacy-free machine (`boot-legacy-free`, in `boot-matrix`):** `-machine pit=off,i8042=off` boots the whole kernel. Before F3 it read the absent port 61h as 0xFF and reported `calibrated against the PIT: 0 kHz`, and failed. After, it calibrates against the ACPI PM timer (agreeing with one RTC second to 0.006 %), reports that it cannot prove the two PIT-based I/O APIC proofs, that the FADT says it has no 8042, and `boot verdict: 50 of 50 proofs passed`.
 
