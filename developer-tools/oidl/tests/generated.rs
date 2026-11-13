@@ -1141,10 +1141,25 @@ fn widen_definition() -> String {
         "/// Fixture: narrow parameters.\nlibrary origin.fixture.widen;\ntransport syscall;\nversion 1.0;\nuse origin.kernel;\n\
          /// Flags.\nbits flags: u16 {\n    /// A bit.\n    one = 0;\n}\n\
          /// A choice.\nenum choice: u8 {\n    /// One.\n    one = 1;\n}\n\
+         /// A signed choice, with a member below zero.\nenum sign: i8 {\n    /// Below.\n    minus = -1;\n    /// None.\n    none = 0;\n}\n\
+         /// A wider signed choice.\nenum wide_sign: i16 {\n    /// Below.\n    low = -300;\n}\n\
+         /// The widest narrow signed choice.\nenum far_sign: i32 {\n    /// Below.\n    far = -70000;\n}\n\
          /// Calls.\ninterface widen {\n",
     );
     for (number, ty) in [
-        "u8", "u16", "u32", "i8", "i16", "i32", "bool", "flags", "choice", "u64",
+        "u8",
+        "u16",
+        "u32",
+        "i8",
+        "i16",
+        "i32",
+        "bool",
+        "flags",
+        "choice",
+        "u64",
+        "sign",
+        "wide_sign",
+        "far_sign",
     ]
     .iter()
     .enumerate()
@@ -1164,9 +1179,15 @@ fn widen_definition() -> String {
 }
 
 /// L13, for each narrow type in each of the six registers, as the assembler wrote it: zero for an
-/// unsigned integer, a boolean, a bits type and an unsigned enumeration; the sign for a signed
-/// integer; the fourth argument through R10. The table is written out here by hand, apart from
-/// the generator's own.
+/// unsigned integer, a boolean and a bits type; the sign for a signed integer; an enumeration as
+/// its underlying integer, zero where that is unsigned and the sign where it is signed (decision
+/// item 277: an enumeration over `i8`, `i16` and `i32`, each with a member below zero, is
+/// sign-extended); the fourth argument through R10. The table is written out here by hand,
+/// apart from the generator's own.
+///
+/// What this shows is the instruction each stub holds, as assembled. That the kernel's decoder
+/// takes a member below zero only when its register is sign-extended is read from the decoder's
+/// generator and is not run here.
 #[test]
 fn a_stub_extends_each_narrow_type_in_each_register() {
     let inputs = vec![
@@ -1231,7 +1252,7 @@ fn a_stub_extends_each_narrow_type_in_each_register() {
         "movsxd r8, r8d",
         "movsxd r9, r9d",
     ];
-    let cases: [(&str, &[&str]); 10] = [
+    let cases: [(&str, &[&str]); 13] = [
         ("u8", &byte),
         ("u16", &word),
         ("u32", &double),
@@ -1243,6 +1264,10 @@ fn a_stub_extends_each_narrow_type_in_each_register() {
         ("choice", &byte),
         // A value that fills its register is passed as it is: only the fourth moves.
         ("u64", &["mov r10, rcx"]),
+        // An enumeration over a signed integer, each with a member below zero: the sign.
+        ("sign", &signed_byte),
+        ("wide_sign", &signed_word),
+        ("far_sign", &signed_double),
     ];
     for (number, (ty, extensions)) in cases.iter().enumerate() {
         let mut wanted: Vec<String> = extensions.iter().map(|i| i.to_string()).collect();

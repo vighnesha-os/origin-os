@@ -2058,11 +2058,14 @@ fn gen_sys_core_stubs(g: &Gen<'_>, interface: &Interface) -> String {
         t.line(
             "// convention and this signature. It changes only registers a C function may change:",
         );
-        t.line("// its own argument registers, R10, R11 and RAX. It touches no memory and no stack, and");
+        t.line("// its own argument registers, RCX and R11 (which `syscall` itself overwrites, in every");
+        t.line("// stub), R10 and RAX. It touches no memory and no stack, and");
         if method.never {
             t.line("// never returns: the kernel ends the thread, and `ud2` stops it if that ever failed.");
         } else {
-            t.line("// returns with the kernel's status in RAX, RFLAGS as the caller left them.");
+            t.line("// returns with the kernel's status in RAX. No instruction of the stub changes a flag;");
+            t.line("// what RFLAGS hold on return is the kernel's return path's, and a C caller may not");
+            t.line("// rely on the status flags across any call.");
         }
         t.line("#[unsafe(naked)]");
         t.line("#[unsafe(no_mangle)]");
@@ -2126,14 +2129,20 @@ fn gen_core_exports(lib: &Library) -> String {
         crate::fingerprint::hex(&release_fingerprint(lib))
     );
     let prefix = module(&lib.name);
-    for interface in &lib.interfaces {
-        for method in &interface.methods {
-            let _ = writeln!(
-                out,
-                "{} {prefix}_{} {} {}",
-                method.ordinal, method.name, method.name, method.since
-            );
-        }
+    // In number order across every interface of the library, as the comment above and the
+    // reader of this list (`onbf-pack corelib`) both say: a library's numbers are one space.
+    let mut methods: Vec<&Method> = lib
+        .interfaces
+        .iter()
+        .flat_map(|interface| &interface.methods)
+        .collect();
+    methods.sort_by_key(|method| method.ordinal);
+    for method in methods {
+        let _ = writeln!(
+            out,
+            "{} {prefix}_{} {} {}",
+            method.ordinal, method.name, method.name, method.since
+        );
     }
     out
 }
