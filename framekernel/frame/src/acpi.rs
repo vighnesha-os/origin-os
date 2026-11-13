@@ -20,9 +20,9 @@ pub const HEADER_REVISION: usize = 8;
 /// Offset of the first MADT interrupt controller structure.
 const MADT_ENTRIES: usize = 44;
 /// The first MADT revision whose Local APIC flags define bit 1, Online Capable: ACPI 6.3 (ECR
-/// 1948), MADT revision 5. Below it the bit is reserved, and is not read (ADR-0008 Amendment 1,
-/// D2; read from ACPI 6.5's release sources, research ledger
-/// `docs/research/2026-11-13-any-processor-count.md`).
+/// 1948), MADT revision 5; ACPI 6.6's MADT is revision 7 (§5.2.12, §5.2.12.2). Below it the bit is
+/// reserved, and is not read (ADR-0008 Amendment 1, D2; research ledger
+/// `docs/research/2026-11-13-any-processor-count.md`, §3a).
 pub const MADT_ONLINE_CAPABLE_REVISION: u8 = 5;
 /// Offset of the first SRAT resource-affinity structure (36-byte header + 12 reserved).
 const SRAT_ENTRIES: usize = 48;
