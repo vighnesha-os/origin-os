@@ -7,6 +7,28 @@
 | Reproduce | Heavy runs wait for their turn on the machine; `cargo xtask exclusive -- <command>` takes one for anything else. `cargo xtask check`, `cargo xtask boot-test` (Intel VT-d; `ORIGIN_QEMU_IOMMU=amd` for AMD-Vi), and `cargo xtask boot-matrix` (both IOMMUs at 1, 2 and 4 CPUs, then `boot-x2apic`: processors at APIC IDs 256 and 412 of 150 possible, on a CPU model with leaf 1Fh and on one without, then `boot-bridge`: both IOMMUs with the NIC behind a PCIe root port, then `boot-console`: the console on machines with no 16550 at `0x3F8`; `ORIGIN_QEMU_SMP=1`…`8` for other counts with `boot-test`) |
 | Rule | "Done" below means built, tested and committed, with a boot proof where it runs in the kernel. **Everything runs under QEMU 11.1.3 + OVMF: on its software CPU (TCG) and, in CI, on real AMD EPYC and Intel Xeon processors through KVM, with the devices and firmware still QEMU's. Nothing is qualified on physical hardware yet (CLAUDE.md §74).** |
 
+## Any processor count (ADR-0008 Amendment 1, D1 to D8; TASKS item 58; 2026-11-13 and 2026-11-14)
+
+On `claude/any-cpu-count`, from the fourth batch (`land/s4-part2`) with S4-3 merged; **not landed and not pushed, and not reviewed by a person or an independent session.** The owner asked on 2026-11-13 that the kernel use every processor a machine has, whatever the number.
+
+- **Sized at discovery.** Each of the kernel's 27 per-processor tables is a `PerCpu` (5,062 bytes an index): the boot processor's slot is in the image, and the rest are allocated once, after the MADT and before the first INIT. `cpu::count()` is then fixed. `MAX_CPUS` is gone, and `cargo xtask percpu-gate` keeps it and any array sized by a processor count out.
+- **The shootdown** keeps a record on its own cache line for each processor, behind a trait, and scans the indexed processors: fewer than 64 on a small machine.
+- **The kernel stacks' region** grows to 32 slots a processor inside a 1 TiB reserve (room for 262,144), and its base stays random.
+- **Online-capable processors** get reserved indexes, read from MADT revision 5 on. **NVMe** gives queues while the controller has them.
+- **One line** reports the indexes, the bytes and every bound that held a processor back. Start-up stays serial, and its total is printed.
+
+**What is shown, under QEMU's software processor on the development Mac only:**
+- the kernel boot at 1, 2, 3, 4 and 65 processors, under Intel VT-d and AMD-Vi: at 65, all online, 64 APs in about 2 s, and 62 with their own NVMe queue;
+- the discovery machine: 2 enabled of the 4,096 the MADT lists;
+- one boot that brought 288 processors online.
+
+**Not shown:** anything under KVM or on a real processor. CI has not built this. The new machines run in CI only once measured and accepted (D7).
+
+**Open:**
+- **The 288-processor machine is not in `boot-matrix`.** QEMU disturbs its timing on this host, and what replaces it is the coordinating session's call.
+- **The hot-plug task's gap:** a processor first seen through ACPI's namespace has no reserved index.
+- The boot checks now judge the serial log once per line; a 65-processor log had taken 48 minutes to judge.
+
 ## The kernel-wide bound, and O2 for step 4 (ADR-0005 Amendment 8, G2, G5 and G6; task S4-3 of ADR-0011 N14 step 4, TASKS item 55; 2026-11-13)
 
 On `claude/elegant-benz-1983ff`, from the fourth batch (`land/s4-part2`) at `793299a`; **not landed and not pushed. One AI reviewer has read it (`docs/engineering/REVIEW_S4-3_2026-11-13.md`: no High, two Medium, two Low, six informational), and every finding is answered on the branch; no person has reviewed it.** After the answers, under Rust 1.100.0, on `45bae7f` (code as at `5bad1b8`, the last commit that changes code), in one turn of the machine, a clean tree before and after: `cargo xtask check` passed in 387 s (1,827 host tests passed, none failed, 27 ignored; Loom, 53 models and 78 controls caught; every gate); `cargo xtask boot-test` passed 11 of 11 in 159 s; `cargo xtask boot-matrix` passed 124 scenarios with none failed in 3,037 s, every kernel boot with a generator ending "66 of 67; failed: speculation controls" and the one without ending "59 of 61; 6 did not run". Before them, on `f5f1829` (code as at `8ca93c5`), in one turn of the machine: `cargo xtask check` passed in 434 s (1,825 host tests passed, none failed, 27 ignored; Loom, 53 models and 78 controls caught; the names, unsafe, provenance, requirements, roadmap, progress, cost and reproducible-build gates among its steps); `cargo xtask boot-test` passed 11 of 11 in 166 s; `cargo xtask boot-matrix` passed 124 scenarios with none failed in 2,886 s, every kernel boot with a generator ending "66 of 67; failed: speculation controls" (decision item 154) and the one without ending "59 of 61; 6 did not run". No wire format, call number, status or C signature changes.

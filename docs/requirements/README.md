@@ -164,6 +164,7 @@ One line for each approved change to what the product covers (item 196): the dec
 | 82–87 | 2026-11-10 | Every device standard is reached through the SDK in three layers, with dangerous operations behind rights of their own. Thunderbolt is part of the USB4 interface, radio drivers wait for a legitimate source, and USB4, Thunderbolt, Wi-Fi and Bluetooth come at M10 on physical hardware (ADR-0015). | A15-*, S31-17, S31-18, S31-19, S35-14, S54-19, S54-20, S82-17 |
 | 88–90 | 2026-11-10 | The hardware scope narrows to Intel platforms of 2026 or later and AMD platforms of 2026 or later with Zen 5 or newer cores. Older machines are bench equipment. The kernel names the core generation and never refuses on it, which replaces ADR-0009 H2, and the installer's answer is decided at M9 (ADR-0009 Amendment 1). | A09-*, H-08, S24-18, S24-19, S24-20 |
 | 117 | 2026-11-10 | "Administration only through the GUI" becomes "the GUI is always enough, and nothing needs a terminal". Remote desktop must exist before the Server edition ships, and unattended installs apply a signed provisioning document (ADR-0014 Amendment 1). | A14-A*, S48-14, S48-15, S48-16, S48-18 |
+| 283–290 | 2026-11-13 | The kernel uses every processor the MADT enables, whatever the count: per-processor state is sized at discovery and no processor count is compiled in, which replaces C6's 64 indexes (ADR-0008 Amendment 1). | A08-C6, A08-D1, A08-D2, A08-D3, A08-D4, A08-D5, A08-D6, A08-D7, A08-D8 |
 
 ## What the gate checks, and what it does not
 
