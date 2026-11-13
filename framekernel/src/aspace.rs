@@ -174,7 +174,7 @@ impl Subject {
     fn new(program: &[u8]) -> Option<Self> {
         let mut process = Process::proof(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)?;
         let code = process.map_page(CODE, Access::ReadExecute).ok()?;
-        if !process.write_frame(code, 0, program) {
+        if !process.write_page(code, 0, program) {
             return None;
         }
         process.map_page(STACK, Access::ReadWrite).ok()?;

@@ -424,7 +424,7 @@ impl Image {
             let chunk = rest.len().min(PAGE as usize - offset);
             let (head, tail) = rest.split_at_checked(chunk)?;
             let &(_, frame) = self.pages.iter().find(|(v, _)| *v == page)?;
-            if !self.process.write_frame(frame, offset, head) {
+            if !self.process.write_page(frame, offset, head) {
                 return None;
             }
             at += chunk as u64;
@@ -734,7 +734,7 @@ fn build_pinger(image: Image, rounds: u64) -> Option<ObjectRef<Process>> {
 fn write_param(process: &Process, offset: usize, value: u64) -> bool {
     process
         .frame_of(DATA)
-        .is_some_and(|f| process.write_frame(f, offset, &value.to_le_bytes()))
+        .is_some_and(|f| process.write_page(f, offset, &value.to_le_bytes()))
 }
 
 /// The hostile script. `kernel` is an address of kernel data; `foreign` a handle value that
@@ -2192,7 +2192,7 @@ fn write_slot(process: &Process, k: u64, value: Handle) -> bool {
     let at = slot_addr(k);
     process
         .frame_of(at - at % PAGE)
-        .is_some_and(|f| process.write_frame(f, (at % PAGE) as usize, &value.to_le_bytes()))
+        .is_some_and(|f| process.write_page(f, (at % PAGE) as usize, &value.to_le_bytes()))
 }
 
 /// Handles name objects of a type, and each call asks for a type: a process or a thread is not a

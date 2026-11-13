@@ -1078,7 +1078,7 @@ fn shared_unmap(cpu: CpuIndex, tsc_hz: u64) -> Option<SharedUnmap> {
         );
     if reader.ending().is_none() {
         // Still reading: the unmap did not reach it. Let it exit.
-        let _ = reader.write_frame(data, 8, &1u64.to_le_bytes());
+        let _ = reader.write_page(data, 8, &1u64.to_le_bytes());
         let _ = await_end(&reader, tsc_hz, 5);
     }
     let kept = owner

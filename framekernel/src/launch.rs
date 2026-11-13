@@ -229,7 +229,7 @@ fn hand_over(
         return Err(Error::InvalidArgs);
     }
     for (frame, chunk) in placed.frames.iter().zip(bytes.chunks(PAGE as usize)) {
-        if !process.write_frame(*frame, 0, chunk) {
+        if !process.write_page(*frame, 0, chunk) {
             return Err(Error::NoMemory);
         }
     }
@@ -394,7 +394,7 @@ fn map_image(
                 .map_page(base + segment.rva + k * PAGE, access)
                 .map_err(map_refused)?;
             // A fresh frame is zero: only a page with bytes is written.
-            if page.iter().any(|&b| b != 0) && !child.write_frame(frame, 0, &page) {
+            if page.iter().any(|&b| b != 0) && !child.write_page(frame, 0, &page) {
                 return Err(Error::NoMemory);
             }
         }

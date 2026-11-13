@@ -8,6 +8,12 @@
 //!   creator names (ADR-0005 A6), not pinned per call. L8 keeps that for the kernel's own boot
 //!   proofs; every program is launched pinned (`launch::load_program`). Without a gate the rule
 //!   would rest on which constructor a later task picks.
+//! - **The framework's raw write into a process's page** (task S4-2; the review of 2026-11-13,
+//!   finding K1). `UserSpace::write_frame` writes through the kernel's direct map into any frame
+//!   a space maps, `origin.core`'s shared frames among them. The kernel's way in is
+//!   `Process::write_page`, which refuses those. Only the wrapper's file, and proofs that hold a
+//!   bare space and no process, may name `write_frame`, until a rule in the framework holds it
+//!   (TASKS item 51).
 //! - **The private call numbers in ring 3** (CLAUDE.md §42; ADR-0011 L3 and N13). A program
 //!   reaches the kernel through `origin.core`'s imports and names no call number. `origin_abi`
 //!   has a public `syscall` module of the numbers, for the kernel and for proofs. A ring-3 file
@@ -62,6 +68,18 @@ const PROOF_PROCESS_FILES: &[(&str, &str)] = &[
     ),
 ];
 
+/// The kernel files that may name `write_frame`, the framework's raw write into a page, and why.
+const RAW_WRITE_FILES: &[(&str, &str)] = &[
+    (
+        "framekernel/src/process.rs",
+        "`Process::write_page`, the kernel's one way into a process's pages, calls it after refusing a frame of `origin.core`",
+    ),
+    (
+        "framekernel/src/aspace.rs",
+        "the address-space proofs hold a bare `UserSpace` and no process, and write into a page while a thread of it runs; none of their spaces maps `origin.core`",
+    ),
+];
+
 /// The ring-3 files that may name `origin_abi::syscall`, and why.
 const CALL_NUMBER_FILES: &[(&str, &str)] = &[(
     "tests/kernel/pin-program/src/calls.rs",
@@ -83,6 +101,20 @@ fn names_proof_process(tokens: &[Token<'_>]) -> bool {
             && constructor(tokens.get(i + 3));
         let definition = token.is_ident("fn") && constructor(tokens.get(i + 1));
         path || definition
+    })
+}
+
+/// Whether `tokens` name `write_frame` as a call or a definition: the identifier followed by
+/// `(`, or after `fn`.
+fn names_raw_write(tokens: &[Token<'_>]) -> bool {
+    tokens.iter().enumerate().any(|(i, token)| {
+        token.is_ident("write_frame")
+            && (tokens
+                .get(i + 1)
+                .is_some_and(|t| t.kind == Kind::Punct && t.text == "(")
+                || i.checked_sub(1)
+                    .and_then(|k| tokens.get(k))
+                    .is_some_and(|t| t.is_ident("fn")))
     })
 }
 
@@ -176,6 +208,12 @@ pub(crate) fn gate() -> Result {
         names_proof_process,
     );
     found.extend(problems(
+        "`write_frame`, the framework's raw write into a page, which does not refuse `origin.core`'s frames (use `Process::write_page`)",
+        &kernel,
+        RAW_WRITE_FILES,
+        names_raw_write,
+    ));
+    found.extend(problems(
         "`origin_abi::syscall`, the private call numbers (CLAUDE.md §42; ADR-0011 L3)",
         &ring3,
         CALL_NUMBER_FILES,
@@ -189,9 +227,10 @@ pub(crate) fn gate() -> Result {
         ));
     }
     println!(
-        "xtask: names gate: the proof-process constructors are named in {} kernel files, each listed with its reason, and in none of the other {}; the call numbers in {} ring-3 file, listed, and in none of the other {}",
+        "xtask: names gate: the proof-process constructors are named in {} kernel files, each listed with its reason, and in none of the other {}; the framework's raw `write_frame` in {}, listed, and in no other; the call numbers in {} ring-3 file, listed, and in none of the other {}",
         PROOF_PROCESS_FILES.len(),
         kernel.len() - PROOF_PROCESS_FILES.len(),
+        RAW_WRITE_FILES.len(),
         CALL_NUMBER_FILES.len(),
         ring3.len() - CALL_NUMBER_FILES.len()
     );

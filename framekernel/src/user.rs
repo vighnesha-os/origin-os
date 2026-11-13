@@ -77,7 +77,7 @@ fn spinner(value: u8, stack_top: u64) -> Vec<u8> {
 fn build(program: &[u8]) -> Option<Process> {
     let mut p = Process::proof(LIMITS, (CODE, CODE + PAGE), BOOT_PROOF_PRINCIPAL)?;
     let frame = p.map_page(CODE, Access::ReadExecute).ok()?;
-    if !p.write_frame(frame, 0, program) {
+    if !p.write_page(frame, 0, program) {
         return None;
     }
     p.map_page(STACK, Access::ReadWrite).ok()?;

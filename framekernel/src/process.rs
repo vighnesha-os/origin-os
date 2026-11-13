@@ -482,8 +482,10 @@ impl Process {
     /// `core_image::install` alone, and every pinned process maps the same ones. `false` then,
     /// as for a frame this space does not map (the independent review of 2026-11-13, finding
     /// K1). The framework's own `UserSpace::write_frame` does not refuse it; a rule there is
-    /// TASKS item 51.
-    pub(crate) fn write_frame(&self, frame: UserFrame, offset: usize, bytes: &[u8]) -> bool {
+    /// TASKS item 51. Until then this is the kernel's only way into a process's pages: the names
+    /// gate in `cargo xtask check` lets `write_frame` be named in this file, for this function,
+    /// and in the address-space proofs alone, which hold a bare space and no process.
+    pub(crate) fn write_page(&self, frame: UserFrame, offset: usize, bytes: &[u8]) -> bool {
         if crate::core_image::is_core_frame(frame.phys()) {
             return false;
         }

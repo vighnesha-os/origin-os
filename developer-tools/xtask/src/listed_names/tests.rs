@@ -86,3 +86,23 @@ fn a_name_off_the_list_and_a_stale_list_entry_fail() {
 fn the_tree_passes() {
     assert_eq!(gate(), Ok(()));
 }
+
+#[test]
+fn the_raw_write_is_found_as_a_call_and_a_definition() {
+    for text in [
+        "self.memory.write_frame(self.talk, GO, &GO_ON.to_le_bytes())",
+        "process.memory()?.write_frame(frame, 0, bytes)",
+        "space.write_frame (frame, 0, bytes)",
+        "pub fn write_frame(&self, frame: UserFrame) -> bool { true }",
+    ] {
+        assert!(names_raw_write(&lex::tokens(text)), "{text}");
+    }
+    for text in [
+        "process.write_page(frame, 0, bytes)",
+        "// UserSpace::write_frame does not refuse it",
+        "let s = \"write_frame(\";",
+        "let write_frame_count = 0;",
+    ] {
+        assert!(!names_raw_write(&lex::tokens(text)), "{text}");
+    }
+}

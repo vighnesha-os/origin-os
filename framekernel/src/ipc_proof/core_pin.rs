@@ -24,7 +24,7 @@
 //!   `memory_protect` of its range, a fixed `memory_map` over it and one of two pages from a
 //!   page below it answer `invalid_args`, and its pages are still mapped read-execute on the
 //!   same frames afterwards; three processes hold it, each at a base of its own, on one set of
-//!   frames, writable in no space; and the kernel's own `Process::write_frame` refuses a page
+//!   frames, writable in no space; and the kernel's own `Process::write_page` refuses a page
 //!   of it;
 //! - **narrow parameters** (L13): through a stub, a call whose 32-bit parameter has bits set
 //!   above it is taken as the same call with them clear, where the same registers in a direct
@@ -876,7 +876,7 @@ fn prove_image(com1: &mut Console, creator: &Process, bsp: CpuIndex, tsc_hz: u64
             .image
             .process
             .frame_of(pa.core)
-            .is_some_and(|frame| !a.image.process.write_frame(frame, 0, &[byte]));
+            .is_some_and(|frame| !a.image.process.write_page(frame, 0, &[byte]));
     }
     let image_ok = write_faulted && refused && kept && shared && apart && write_refused;
     let _ = writeln!(

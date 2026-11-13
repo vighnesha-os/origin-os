@@ -486,14 +486,24 @@ fn compare_immediate(instruction: &str) -> Option<(&str, u64)> {
     Some((register, value))
 }
 
-/// Whether an instruction has a memory operand whose address takes a register times a scale:
-/// what reading a table at an index looks like (`[rax + 8*rcx]`).
-fn scaled_index(instruction: &str) -> bool {
+/// Whether an instruction has a memory operand indexed by a register: a register times a
+/// scale (`[rax + 8*rcx]`), or two registers added (`[rax + rcx]`, a byte table read at an
+/// index). One register and a displacement (`[rdi + 0x8]`), or `rip` and a displacement, is
+/// not.
+fn indexed(instruction: &str) -> bool {
     instruction.split('[').skip(1).any(|memory| {
-        memory
-            .split(']')
-            .next()
-            .is_some_and(|inside| inside.contains('*'))
+        let inside = memory.split(']').next().unwrap_or("");
+        let registers = inside
+            .split(['+', '-'])
+            .map(str::trim)
+            .map(|term| term.rsplit('*').next().unwrap_or(term))
+            .filter(|term| {
+                term.starts_with(|c: char| c.is_ascii_lowercase())
+                    && !term.starts_with("0x")
+                    && term.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+            .count();
+        inside.contains('*') || registers >= 2
     })
 }
 
@@ -505,8 +515,8 @@ fn scaled_index(instruction: &str) -> bool {
 ///   the same register, so that an offset that happens to equal a call number, which the same
 ///   function also compares, does not pass for it.
 /// - No indirect jump.
-/// - No memory operand indexed by a register before its first call (or anywhere, if it makes
-///   none).
+/// - No memory operand indexed by a register (a register times a scale, or two registers added)
+///   before its first call (or anywhere, if it makes none).
 pub(crate) fn pin_problems(listing: &str, pins: &BTreeMap<String, u64>) -> Vec<String> {
     let mut problems = Vec::new();
     let mut instructions: Vec<String> = Vec::new();
@@ -563,7 +573,7 @@ pub(crate) fn pin_problems(listing: &str, pins: &BTreeMap<String, u64>) -> Vec<S
         }
     }
     for instruction in instructions.iter().take_while(|i| mnemonic(i) != "call") {
-        if scaled_index(instruction) {
+        if indexed(instruction) {
             problems.push(format!(
                 "`{PIN_FUNCTION}` reads memory at an index before its first call: `{instruction}`"
             ));
@@ -1081,6 +1091,28 @@ mod tests {
                 .any(|p| p.contains("reads memory at an index")),
             "{problems:#?}"
         );
+        // A byte table read at an index: two registers added, and no scale (the coordinating
+        // session's tightening of K4).
+        let mut bytes = COMPARES.to_vec();
+        bytes.insert(7, "movzx eax, byte ptr [rax + rcx]");
+        let problems = pin_problems(&pin_function(&bytes), &three_pins());
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("reads memory at an index")),
+            "{problems:#?}"
+        );
+        // One register and a displacement, and `rip` and a displacement, are not an index.
+        for single in [
+            "mov rax, qword ptr [rdi + 0x10]",
+            "mov rax, qword ptr [rip + 0x95204]",
+            "cmp rax, qword ptr [rdi - 0x8]",
+            "cmp dword ptr [rdi], 0x1",
+        ] {
+            assert!(!indexed(single), "{single}");
+        }
+        assert!(indexed("mov rax, qword ptr [rax + 8*rcx]"));
+        assert!(indexed("movzx eax, byte ptr [rcx + rax + 0x10]"));
         // The offsets spread over two registers: `cmp rsi, 0x5`, the number's compare, does not
         // stand in for the offset's.
         let spread: Vec<&str> = COMPARES

@@ -36,9 +36,10 @@
 //!   maps the image holds a clone, which no kernel code asks for;
 //! - `UserSpace::write_frame`, through the `UserFrame` that `UserSpace::frame_of` or
 //!   `Process::frame_of` gives for any page a space maps, the image's among them. The kernel's
-//!   own `Process::write_frame` refuses a frame of `origin.core` ([`is_core_frame`]), and the
-//!   boot proof shows that refusal; a caller that went to the framework's function directly
-//!   would not be refused.
+//!   own `Process::write_page` refuses a frame of `origin.core` ([`is_core_frame`]), and the
+//!   boot proof shows that refusal. The framework's function is not refused, and the names gate
+//!   in `cargo xtask check` lets only `process.rs` (the wrapper) and the address-space proofs,
+//!   whose spaces never map `origin.core`, name it.
 //!
 //! That nothing writes them is held by reading, and shown after the fact by [`intact`] at the end
 //! of the boot proof. A rule in the framework that covers both paths, and the launch path's own
@@ -377,7 +378,7 @@ mod shared {
     }
 
     /// Whether `phys` is one of `origin.core`'s frames: the kernel's own write path into a
-    /// process's pages (`Process::write_frame`) refuses those.
+    /// process's pages (`Process::write_page`) refuses those.
     #[must_use]
     pub(crate) fn is_core_frame(phys: PhysAddr) -> bool {
         FRAMES
