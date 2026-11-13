@@ -2,6 +2,7 @@
 //! checked independently with `onbf-format`, `onbf-merkle` and the RELR decoder, RELR and
 //! OCBOR-1 encodings, and determinism.
 
+mod carried;
 mod convert;
 mod elf_writer;
 mod encodings;

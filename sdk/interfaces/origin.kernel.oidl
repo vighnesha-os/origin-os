@@ -170,11 +170,12 @@ sized struct read_sizes {
 }
 
 /// A handle channel_read moved into the caller's table: its value there, what it names and the
-/// rights it has, so a receiver can check both before using it (ADR-0005 B3, C3).
+/// rights it has, so a receiver can check both before using it (ADR-0005 B3, C3). 16 bytes: the
+/// handle is 64 bits (ADR-0005 Amendment 6, E1, from 0.7).
 @since(0.2)
 struct received_handle {
     /// Its value in the caller's table.
-    handle: u32;
+    handle: u64;
     /// The type of the object it names.
     object_type: object_type;
     /// Its rights in the caller's table.
@@ -232,11 +233,12 @@ struct start_header {
     env_bytes: u32;
 }
 
-/// One handle a start record names (ADR-0005 C4).
+/// One handle a start record names (ADR-0005 C4). 24 bytes, the last four padding: the handle
+/// is 64 bits (ADR-0005 Amendment 6, E1, from 0.7).
 @since(0.3)
 struct start_entry {
     /// Its value in the process's table.
-    handle: u32;
+    handle: u64;
     /// The type of the object it names.
     object_type: object_type;
     /// Its rights.

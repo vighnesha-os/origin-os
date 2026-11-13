@@ -6,8 +6,8 @@
 //! and a program can measure that. So a lookup whose index a program chose does two things:
 //! the check, and something that holds on the wrongly guessed path too.
 //!
-//! There are two forms of that something, and the kernel picks one at boot
-//! ([`choose`], [`set_form`]):
+//! There are two forms of that something, and the kernel picks one at boot from the CPU
+//! identification table's column for it ([`crate::cpuident`], [`set_form`]):
 //!
 //! - **[`Form::Mask`].** A conditional move that depends on the comparison itself puts 0 in
 //!   place of an out-of-range value. AMD says this holds on all its processors. Intel said so
@@ -42,40 +42,12 @@ pub enum Form {
     Fence,
 }
 
-/// Who made the processor, as far as the choice of form needs to know.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Maker {
-    /// CPUID leaf 0 reads "GenuineIntel".
-    Intel,
-    /// CPUID leaf 0 reads "AuthenticAMD".
-    Amd,
-    /// Anything else.
-    Other,
-}
-
 const MASK: u8 = 0;
 const FENCE: u8 = 1;
 
 /// The form in use. Fence until [`set_form`] says otherwise: LFENCE is in every x86-64
 /// processor and both vendors stand behind it.
 static FORM: AtomicU8 = AtomicU8::new(FENCE);
-
-/// The form for a processor, from its maker and family. No feature bit reports this, so it
-/// is the one choice ADR-0017 makes from a family number. It moves into the CPU
-/// identification table when that exists (ADR-0009 A2, TASKS item 16).
-///
-/// | Processor | Form | On whose word |
-/// |---|---|---|
-/// | AMD, any family | Mask | AMD: it applies to all its processors |
-/// | Intel, family 6 | Mask | Intel's statement of 2018 and 2021 |
-/// | Intel, any other family; anything else | Fence | Intel's statement does not reach them |
-#[must_use]
-pub const fn choose(maker: Maker, family: u32) -> Form {
-    match (maker, family) {
-        (Maker::Amd, _) | (Maker::Intel, 6) => Form::Mask,
-        _ => Form::Fence,
-    }
-}
 
 /// Sets the form every later lookup uses. The boot processor does this once, before any
 /// program runs.
@@ -191,35 +163,6 @@ mod tests {
     use crate::usercopy::USER_START;
 
     const FORMS: [Form; 2] = [Form::Mask, Form::Fence];
-
-    #[test]
-    fn the_form_follows_the_vendors_statements() {
-        // AMD's guidance covers every family, in and out of scope.
-        for family in [0x0F, 0x17, 0x19, 0x1A, 0x1B] {
-            assert_eq!(
-                choose(Maker::Amd, family),
-                Form::Mask,
-                "AMD family {family:#x}"
-            );
-        }
-        assert_eq!(choose(Maker::Intel, 6), Form::Mask);
-        // Nova Lake is family 18 and Diamond Rapids family 19: Intel's statement of 2018
-        // and 2021 does not reach them. Nor does anything say it for an unknown maker.
-        for family in [5, 15, 18, 19, 20] {
-            assert_eq!(
-                choose(Maker::Intel, family),
-                Form::Fence,
-                "Intel family {family}"
-            );
-        }
-        for family in [6, 18, 0x1A] {
-            assert_eq!(
-                choose(Maker::Other, family),
-                Form::Fence,
-                "unknown, family {family}"
-            );
-        }
-    }
 
     #[test]
     fn an_index_is_returned_only_in_range_in_both_forms() {

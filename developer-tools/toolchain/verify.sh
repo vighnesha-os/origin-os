@@ -4,10 +4,18 @@
 #   bash developer-tools/toolchain/verify.sh            check only; installs nothing
 #   bash developer-tools/toolchain/verify.sh --install  first add the pinned toolchain,
 #                                                       components and targets with rustup
+#   ... --report FILE                                   write the report to FILE instead of
+#                                                       docs/toolchain/VERIFICATION.md (CI does,
+#                                                       so a run leaves its checkout unchanged)
 #
-# Every result written to docs/toolchain/VERIFICATION.md comes from a command this script
-# ran on this machine. Exit status: 0 if no check failed, 1 if any failed, 2 on usage errors.
+# Every result written to the report comes from a command this script ran on this machine.
+# Exit status: 0 if no check failed, 1 if any failed, 2 on usage errors.
 # Written for the bash 3.2 that ships with macOS; also runs on Linux bash.
+#
+# A compiler upgrade (CLAUDE.md §15) changes four places together: `channel` in
+# rust-toolchain.toml, `rust-version` in Cargo.toml, EXPECTED below, and the commit in
+# developer-tools/toolchain/rustc-commit-hash. This script fails until all four agree: it compares
+# the first three as text, and the fourth with what the compiler reports.
 
 set -u
 
@@ -15,17 +23,28 @@ EXPECTED="1.99.1"
 TARGETS="x86_64-unknown-none x86_64-unknown-uefi x86_64-unknown-linux-gnu"
 COMPONENTS="rustfmt clippy rust-src llvm-tools"
 
+usage() { echo "usage: $0 [--install] [--report FILE]" >&2; exit 2; }
+
 MODE="check"
-case "${1:-}" in
-  "") ;;
-  --install) MODE="install" ;;
-  *) echo "usage: $0 [--install]" >&2; exit 2 ;;
-esac
+REPORT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --install) MODE="install" ;;
+    --report)
+      [ $# -ge 2 ] && [ -n "$2" ] || usage
+      REPORT="$2"; shift ;;
+    *) usage ;;
+  esac
+  shift
+done
+# A relative FILE is relative to where the script was started, not to the repository.
+case "$REPORT" in ""|/*) ;; *) REPORT="$PWD/$REPORT" ;; esac
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd) || exit 2
 REPO=$(cd "$SCRIPT_DIR/../.." && pwd) || exit 2
 TESTS="$REPO/tests/toolchain"
-REPORT="$REPO/docs/toolchain/VERIFICATION.md"
+PIN_FILE="$SCRIPT_DIR/rustc-commit-hash"
+if [ -z "$REPORT" ]; then REPORT="$REPO/docs/toolchain/VERIFICATION.md"; fi
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/origin-verify.XXXXXX") || exit 2
 trap 'rm -rf "$WORK"' EXIT
 cd "$REPO" || exit 2   # rustup reads rust-toolchain.toml from the current directory
@@ -122,6 +141,21 @@ if [ "$MODE" = "install" ]; then
   fi
 fi
 
+# The version is written in three places; an upgrade that changes one must change all three.
+out="$WORK/pin.txt"
+CHANNEL=$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$REPO/rust-toolchain.toml" 2>/dev/null)
+MSRV=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' "$REPO/Cargo.toml" 2>/dev/null)
+{
+  echo "rust-toolchain.toml, channel:    ${CHANNEL:-not found}"
+  echo "Cargo.toml, rust-version:        ${MSRV:-not found}"
+  echo "verify.sh, EXPECTED:             $EXPECTED"
+} > "$out"
+if [ "$CHANNEL" = "$EXPECTED" ] && [ "$MSRV" = "$EXPECTED" ]; then
+  record PASS "The pin is written the same in rust-toolchain.toml, Cargo.toml and this script ($EXPECTED)" "$out"
+else
+  record FAIL "The pin is written the same in rust-toolchain.toml, Cargo.toml and this script" "$out"
+fi
+
 out="$WORK/active.txt"
 rustup show active-toolchain > "$out" 2>&1
 if grep -q "^${EXPECTED}-" "$out"; then
@@ -142,6 +176,27 @@ if [ "$RELEASE" = "$EXPECTED" ]; then
   record PASS "rustc is $EXPECTED (host $HOST)" "$out"
 else
   record FAIL "rustc is $EXPECTED (found ${RELEASE:-unknown}; host ${HOST:-unknown})" "$out"
+fi
+
+# The version alone does not name one build. The commit the compiler reports must be the pinned
+# one (CLAUDE.md §8: an exact compiler). It is what the compiler says of itself: rustup's check of
+# what it downloaded against the channel's manifest is the only check of the binary.
+COMMIT=$(sed -n 's/^commit-hash: //p' "$WORK/rustc.txt")
+out="$WORK/commit.txt"
+PINNED=""
+if [ -r "$PIN_FILE" ]; then PINNED=$(sed -e 's/#.*$//' "$PIN_FILE" | tr -d ' \t\r\n'); fi
+{
+  echo "pinned:   ${PINNED:-none} (developer-tools/toolchain/rustc-commit-hash)"
+  echo "reported: ${COMMIT:-none} (rustc --version --verbose)"
+} > "$out"
+case "$PINNED" in *[!0-9a-f]*) PINNED_OK=0 ;; *) PINNED_OK=1 ;; esac
+if [ "${#PINNED}" -ne 40 ]; then PINNED_OK=0; fi
+if [ "$PINNED_OK" -ne 1 ]; then
+  record FAIL "The pinned commit is 40 hexadecimal digits in developer-tools/toolchain/rustc-commit-hash" "$out"
+elif [ "$COMMIT" = "$PINNED" ]; then
+  record PASS "rustc reports the pinned commit ($PINNED)" "$out"
+else
+  record FAIL "rustc reports the pinned commit (pinned $PINNED, reported ${COMMIT:-none})" "$out"
 fi
 
 out="$WORK/cargo.txt"
@@ -227,7 +282,7 @@ else
   record FAIL "Freestanding release build links (x86_64-unknown-none)" "$out"
 fi
 
-# ---------------------------------------------------------------- UEFI (§9) and wcslen (§10, #163614)
+# ---------------------------------------------------------------- UEFI (§9)
 UEFI_FLAGS="--edition 2024 --target x86_64-unknown-uefi -C opt-level=3 -C codegen-units=1 -C panic=abort"
 out="$WORK/uefi.txt"
 img="$WORK/uefi_smoke.efi"
@@ -252,24 +307,106 @@ else
   record FAIL "UEFI release build links (x86_64-unknown-uefi)" "$out"
 fi
 
+# ---------------------------------------------------------------- wcslen inside the loader (§10, #163614)
+# The test is `char16_len` in the loader's library (boot/uefi/src/uefi.rs): a length loop over a
+# NUL-terminated CHAR16 string, which nothing calls. The loader is built as a release builds it
+# (no feature, the release profile, the flags of .cargo/config.toml, the committed lock file),
+# from nothing, in this run's temporary directory.
+#
+# The loader linking is a test of #163614 only while two things hold, so both are checked on
+# every run, before the link is trusted:
+#   1. LLVM still turns the loop into a call to `wcslen`: the function's own code, in the
+#      library's object, names `wcslen`.
+#   2. That object reaches the link: the library is one object, which holds the loop beside
+#      everything else the loader takes from its library. The linker resolves every symbol of
+#      an object it loads, and only then drops what nothing calls. (Planted fault, recorded in
+#      docs/engineering/SOURCE_PROVENANCE.md: with the loop replaced by a call to a symbol
+#      nothing defines, the link fails with "undefined symbol".)
+# If either stops holding, the link would pass and prove nothing: that is a FAIL here.
 NM="$TOOLBIN/llvm-nm"
-if [ ! -x "$NM" ]; then if have llvm-nm; then NM="llvm-nm"; else NM="nm"; fi; fi
-out="$WORK/wcslen.txt"
-obj="$WORK/uefi_smoke.o"
-if rustc $UEFI_FLAGS --emit obj -o "$obj" "$TESTS/uefi_smoke.rs" > "$out" 2>&1 \
-   && "$NM" "$obj" > "$WORK/wcslen_nm.txt" 2>&1; then
-  cat "$WORK/wcslen_nm.txt" >> "$out"
-  if grep -q 'wcslen' "$WORK/wcslen_nm.txt"; then
-    if [ -s "$img" ]; then
-      record PASS "§10 wcslen: LLVM turned the CHAR16 loop into a wcslen call and the UEFI image still linked (#163614)" "$out"
-    else
-      record FAIL "§10 wcslen: LLVM turned the CHAR16 loop into a wcslen call and the UEFI image did not link (#163614)" "$out"
-    fi
+LLVM_OBJDUMP="$TOOLBIN/llvm-objdump"
+LOADER_TARGET="$WORK/loader"
+# RUSTFLAGS in the environment would replace the workspace's flags for the loader.
+loader_cargo() {
+  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u CARGO_BUILD_RUSTFLAGS -u CARGO_TARGET_DIR \
+    cargo build --locked --release --target x86_64-unknown-uefi \
+      --package origin-boot-uefi --target-dir "$LOADER_TARGET" "$@"
+}
+
+out="$WORK/wcslen_lib.txt"
+why=""
+if [ ! -x "$NM" ] || [ ! -x "$LLVM_OBJDUMP" ]; then
+  echo "llvm-nm or llvm-objdump is missing from $TOOLBIN (the llvm-tools component)." > "$out"
+  why="no llvm-tools to read the object with"
+elif ! loader_cargo --lib > "$out" 2>&1; then
+  why="the loader's library did not build"
+else
+  rlib=""; rlibs=0
+  for f in "$LOADER_TARGET"/x86_64-unknown-uefi/release/deps/liborigin_boot_uefi-*.rlib; do
+    if [ -f "$f" ]; then rlib="$f"; rlibs=$((rlibs + 1)); fi
+  done
+  : > "$out"
+  if [ "$rlibs" -ne 1 ]; then
+    echo "expected one liborigin_boot_uefi-*.rlib, found $rlibs" >> "$out"
+    why="the loader's library was not found as one archive"
   else
-    record INFO "§10 wcslen: LLVM kept the CHAR16 loop as a loop, so this run did not exercise #163614 (the UEFI link check above still applies)" "$out"
+    "$NM" "$rlib" > "$WORK/wcslen_nm.txt" 2> /dev/null
+    objects=$(grep -c '\.o:$' "$WORK/wcslen_nm.txt")
+    sym=$(sed -n 's/^[0-9a-fA-F]* T \(.*char16_len\)$/\1/p' "$WORK/wcslen_nm.txt")
+    syms=$(printf '%s\n' "$sym" | grep -c .)
+    {
+      echo "objects in the loader's library: $objects"
+      grep '\.o:$' "$WORK/wcslen_nm.txt"
+      grep -E ' T .*char16_len$| U wcslen$' "$WORK/wcslen_nm.txt"
+    } >> "$out"
+    if [ "$objects" -ne 1 ]; then
+      why="the loader's library is $objects objects, not one: the object that holds the loop may not reach the link"
+    elif [ "$syms" -ne 1 ]; then
+      why="the loader's library defines char16_len $syms times, not once"
+    else
+      "$LLVM_OBJDUMP" -d -r --no-show-raw-insn --disassemble-symbols="$sym" "$rlib" 2> /dev/null \
+        | grep -v '^$' | grep -v 'file format' > "$WORK/wcslen_dis.txt"
+      cat "$WORK/wcslen_dis.txt" >> "$out"
+      if ! grep -Eq 'IMAGE_REL_AMD64_REL32[[:space:]]+wcslen$' "$WORK/wcslen_dis.txt"; then
+        why="the code of char16_len names no wcslen: LLVM no longer makes the loop that call, or the function is no longer that loop"
+      fi
+    fi
+  fi
+fi
+if [ -z "$why" ]; then
+  record PASS "§10 wcslen: inside the loader's library, LLVM turned the CHAR16 length loop into a call to wcslen (#163614)" "$out"
+else
+  record FAIL "§10 wcslen: the loader no longer exercises #163614: $why" "$out"
+fi
+
+out="$WORK/wcslen_link.txt"
+img="$LOADER_TARGET/x86_64-unknown-uefi/release/origin-boot.efi"
+if loader_cargo --bin origin-boot > "$out" 2>&1; then
+  mz=$(hex "$img" 0 2); peoff=$(u32le "$img" 60)
+  pe=""; mach=""; magic=""; subsys=""
+  case "$peoff" in ''|*[!0-9]*) peoff="" ;; esac
+  if [ -n "$peoff" ]; then
+    pe=$(hex "$img" "$peoff" 4)
+    mach=$(hex "$img" $((peoff + 4)) 2)
+    magic=$(hex "$img" $((peoff + 24)) 2)
+    subsys=$(hex "$img" $((peoff + 92)) 2)
+  fi
+  {
+    echo "cargo build --locked --release --target x86_64-unknown-uefi --package origin-boot-uefi --bin origin-boot"
+    echo "PE: mz=$mz pe_offset=$peoff signature=$pe machine=$mach optional_magic=$magic subsystem=$subsys"
+  } > "$out"
+  if [ "$mz" != "4d5a" ] || [ "$pe" != "50450000" ] || [ "$mach" != "6486" ] \
+     || [ "$magic" != "0b02" ] || [ "$subsys" != "0a00" ]; then
+    record FAIL "§10 wcslen: the loader linked, with an unexpected PE header" "$out"
+  elif [ -z "$why" ]; then
+    record PASS "§10 wcslen: the loader links with that call in its library (origin-boot.efi, PE32+ x86-64 EFI application) (#163614)" "$out"
+  else
+    record INFO "§10 wcslen: the loader links, which shows nothing about #163614 in this run (see the FAIL above)" "$out"
   fi
 else
-  record FAIL "§10 wcslen: could not build or inspect the UEFI object" "$out"
+  # The linker's own lines, without the argument list rustc prints around them.
+  grep -E 'error|undefined symbol|referenced by' "$out" | cut -c1-400 | head -20 > "$WORK/wcslen_link_short.txt"
+  record FAIL "§10 wcslen: the loader did not build and link (#163614 if the linker names wcslen)" "$WORK/wcslen_link_short.txt"
 fi
 
 # ---------------------------------------------------------------- FFI bool (§10, #163911)

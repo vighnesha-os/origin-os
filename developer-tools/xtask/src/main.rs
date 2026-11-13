@@ -9,23 +9,30 @@
 mod asmflags;
 mod disk;
 mod documents;
+mod expected_warning;
 mod image;
+mod image_inputs;
 mod interfaces;
 mod lex;
 mod loom;
 mod mnemonics;
+mod progress;
+mod provenance;
 mod reproducible;
 mod requirements;
+mod ring3;
+mod roadmap;
 mod screen;
 mod serial;
 mod targetcfg;
+mod toolchain;
 mod turns;
 mod unsafety;
 
 use std::borrow::Cow;
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, ExitCode, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -45,7 +52,7 @@ commands:
               signature and tampered content, each with its own message
   boot-matrix boot-test with each IOMMU (Intel VT-d, AMD-Vi) and 1, 2 and 4 processors,
               one after another, then boot-x2apic, boot-bridge, boot-legacy-free,
-              boot-random and boot-console
+              boot-random, boot-identity and boot-console
   boot-bridge boot-test with the NIC behind a PCIe root port (both IOMMUs): bus mastering is
               cleared on the bridge too and opened again above the device its driver attached
   boot-legacy-free  the kernel boot on a machine with no 8254 and no 8042: the timers
@@ -55,6 +62,9 @@ commands:
               seeded from (ADR-0016): one with RDRAND and no RDSEED, which boots and says
               so; one with neither, which has no generator, launches nothing and still
               reaches its verdict
+  boot-identity the kernel boot on two processors QEMU is told to report (ADR-0009 A2): a
+              Panther Lake, in the declared scope, and rental A's Zen 4 EPYC, outside it;
+              each must print its own CPU identity line and still reach its verdict
   boot-x2apic boot-test on a sparse topology: the boot processor at APIC ID 0 and processors
               at APIC IDs 256 and 412, above what 8-bit APIC IDs reach (the MADT lists
               150 possible processors); twice, on a CPU model with CPUID leaf 1Fh and on
@@ -64,8 +74,14 @@ commands:
               UART at all (with a framebuffer the only way to see the boot)
   run         boot under QEMU with the serial console on this terminal (Ctrl-A X quits)
   reproducible-gate only the gate on reproducible builds: the loader, each way it is built,
-              and the kernel are built twice from nothing in two target directories, and the
-              two files of each must be the same bytes (part of check; CLAUDE.md §75)
+              and the kernel are built twice from nothing in two target directories; the
+              two files of each must be the same bytes, and hold no path of this machine
+              (part of check; CLAUDE.md §75)
+  reproducible-compare <directory>
+              compares a directory of the files that gate keeps, CI's artifact unpacked or
+              another checkout's target/xtask/reproducible/files, with this checkout's own,
+              file by file; the directory is read as untrusted data. Builds nothing; run
+              reproducible-gate first
   loom        the Loom models of origin-sync (SpinLock and the wait-queue protocol) and their
               negative controls, each applied to a scratch copy of the source; also part of
               check (CLAUDE.md §73)
@@ -82,7 +98,31 @@ commands:
               for every statement of CLAUDE.md and every decision of an accepted ADR, each
               true to the tree; prints the coverage figure (part of check; CLAUDE.md §1;
               quick)
-  regenerate  rewrites the kernel's generated system-call crate from sdk/interfaces
+  provenance-gate only the gate on the provenance table in
+              docs/engineering/SOURCE_PROVENANCE.md: one row for each crate, each of §6's
+              fields filled, its dependencies named and its licence stated (part of check;
+              CLAUDE.md §6; quick)
+  roadmap-gate only the gate on docs/ROADMAP.md: every counted build row of the
+              requirements matrix placed in one milestone or listed as in none, and
+              every row it names in the matrix (part of check; CLAUDE.md §82; quick)
+  progress    writes docs/PROGRESS.md from the requirements matrix, CLAUDE.md's and the
+              ADRs' headings and docs/ROADMAP.md: counts of rows by state, overall, by
+              milestone, by feature group, by ADR and for the standing rules. Run it when
+              a row's state changes (TASKS item 43; quick)
+  progress-gate only the gate on docs/PROGRESS.md: the committed page is the one the
+              tree generates, byte for byte (part of check; quick)
+  regenerate rewrites the kernel's generated system-call crate from sdk/interfaces
+  version     writes runtime/version/src/generated.rs, the release's constants, from
+              origin-version.toml (CLAUDE.md §62)
+  version-gate only the gate on that file: it is what origin-version.toml generates (part of
+              check; quick)
+  image-graph-gate only the gate on what the images are built from: no package under the
+              loader, the kernel or a carried program has a build script or is a
+              procedural macro (part of check; quick)
+  linker-text-gate <ELF>...
+              only the check the reproducible-build gate makes of each ELF it builds, on
+              files named here: `.comment` holds the line .cargo/config.toml fixes for the
+              linker, and not the linker's own, which differs between kinds of host
   image-gate [kernel ELF]
               only the gate on the kernel's image (ADR-0017 Z10): an INT3 after every return
               and no jump table, in the code this build compiled. Builds the kernel first, or
@@ -123,7 +163,16 @@ environment:
                                       an x86-64 host with /dev/kvm); the devices and firmware
                                       stay QEMU's
   ORIGIN_QEMU_DEBUG                   if set, QEMU logs interrupts and resets to
-                                      target/xtask/qemu-debug.log";
+                                      target/xtask/qemu-debug.log
+  RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS, CARGO_TARGET_<TRIPLE>_RUSTFLAGS for the kernel's, the
+  loader's and the ring-3 programs' triples; RUSTC, RUSTC_WRAPPER, RUSTC_WORKSPACE_WRAPPER
+  and their CARGO_BUILD_ forms; CARGO_TARGET_<TRIPLE>_LINKER for the kernel's and the
+  loader's triples
+                                      refused if set, even empty: they replace or add to the
+                                      repository's compiler flags, or put another compiler or
+                                      linker in the pinned one's place, so an image would not
+                                      be the one the repository describes. Only `exclusive`
+                                      runs with them, and what it runs may not";
 
 const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 const LOADER_PACKAGE: &str = "origin-boot-uefi";
@@ -671,6 +720,7 @@ fn boot_scenario() -> Scenario {
         (true, true) => no_generator_markers(&mut scenario),
         _ => {}
     }
+    cpu_identity_marker(&mut scenario);
     scenario
 }
 
@@ -720,13 +770,13 @@ fn no_generator_markers(scenario: &mut Scenario) {
         "origin-kernel: random: no generator: known-answer test passed; on the boot processor RDSEED is absent and RDRAND is absent. Nothing will be launched and nothing placed at a random address (ADR-0016 R8)".into(),
         "origin-kernel: random: processor 0: RDSEED absent (0 draws passed), RDRAND absent (0 draws passed); its generator NOT seeded".into(),
         "origin-kernel: random: no generator, so no request is answered; consistent false: random failed".into(),
-        "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, service-directory and memory-object proofs did not run".into(),
+        "origin-kernel: start: randomness is withheld, so no process is launched and no mapping is placed at a random address: the process-start, Rust-program, service-directory and memory-object proofs did not run".into(),
         "origin-kernel: kernel stacks: the region's base is 2 MiB-aligned with the whole region in PML4 slots 384-447: true; the loader handed over no random value: true, and the region is at its fixed base: true".into(),
         // The network asks for no lease: a transaction ID must not be guessable.
         "; DHCP lease 0.0.0.0 (".into(),
         "; no random value for a transaction ID or port; consistent false: virtio-net failed".into(),
         "origin-kernel: boot verdict: degraded: ".into(),
-        "; 3 did not run; failed: ".into(),
+        "; 4 did not run; failed: ".into(),
         "random-number generator (no randomness)".into(),
         HALT_LINE.into(),
     ];
@@ -1289,6 +1339,9 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
             // CPU features: QEMU's `max` CPU has every x86-64-v3 feature, so the kernel must
             // find the baseline met (CLAUDE.md §14); below it, the kernel refuses to boot.
             "origin-kernel: CPU: x86-64 level 3 (baseline v3 true)".into(),
+            // ADR-0009 A2: the core generation and the declared scope; what it says depends
+            // on the processor, so only its start is fixed (`boot-identity` fixes all of it).
+            "origin-kernel: CPU identity: ".into(),
             // A frame-pointer backtrace of a known call chain (CLAUDE.md §69).
             "origin-kernel: backtrace: 4 frames from a known call chain, all in the kernel image true".into(),
             "origin-kernel: frame allocator: ".into(),
@@ -1497,6 +1550,7 @@ fn boot_scenario_markers(machine: &Machine) -> Scenario {
         .chain(address_space_markers(cpus))
         .chain(identity_markers())
         .chain(launch_markers())
+        .chain(rust_program_markers())
         .chain(directory_markers())
         .chain(memory_markers())
         .chain(events_ports_markers())
@@ -1799,6 +1853,7 @@ fn boot_failures() -> Vec<&'static str> {
         ": PM timer failed",
         ": ipc failed",
         ": start failed",
+        ": rust program failed",
         ": directory failed",
         ": memory failed",
         ": events and ports failed",
@@ -2235,7 +2290,7 @@ fn ipc_markers(boot: String, far: String) -> Vec<String> {
         "origin-kernel: ipc: ping-pong round trip: ".into(),
     ];
     markers.extend([
-        "origin-kernel: ipc: bad handles: handle 0 -> BAD_HANDLE, never issued -> BAD_HANDLE, bits above 32 -> BAD_HANDLE, wait on a bad handle -> BAD_HANDLE, closed -> BAD_HANDLE, stale, slot reused -> BAD_HANDLE, another process's -> BAD_HANDLE, wait on another process's -> BAD_HANDLE".to_string(),
+        "origin-kernel: ipc: bad handles: handle 0 -> BAD_HANDLE, a live handle -> OK, its low 32 bits alone -> BAD_HANDLE, its slot at a generation never issued -> BAD_HANDLE, never issued -> BAD_HANDLE, bits above 32 -> BAD_HANDLE, wait on a bad handle -> BAD_HANDLE, closed -> BAD_HANDLE, stale, slot reused -> BAD_HANDLE, another process's -> BAD_HANDLE, wait on another process's -> BAD_HANDLE".to_string(),
         "origin-kernel: ipc: too few rights: write without WRITE -> ACCESS_DENIED, read without READ -> ACCESS_DENIED, wait without WAIT -> ACCESS_DENIED, duplicate without DUPLICATE -> ACCESS_DENIED, send without TRANSFER -> ACCESS_DENIED".into(),
         "origin-kernel: ipc: rights only shrink: adding WRITE -> INVALID_ARGS, an undefined right -> INVALID_ARGS, dropping DUPLICATE -> OK, the copy cannot write -> ACCESS_DENIED, the copy can read -> SHOULD_WAIT".into(),
         "origin-kernel: ipc: bad pointers: write from the kernel -> FAULT, from unmapped -> FAULT, across the end of mapped -> FAULT, from address 0 -> FAULT, wrapping past the top -> FAULT, from the top page -> FAULT, read into the kernel -> FAULT, into unmapped -> FAULT, into code -> FAULT, into read-only memory -> FAULT, sizes in the kernel -> FAULT, a handle record across the end of mapped -> FAULT, create out to the kernel -> FAULT, create out to read-only -> FAULT, duplicate out to the kernel -> FAULT, duplicate out to read-only -> FAULT, wait out to read-only -> FAULT, wait out to the kernel -> FAULT, handle list in the kernel -> FAULT, zero length names no memory -> OK, the empty message arrived -> 0x0".into(),
@@ -2321,6 +2376,17 @@ fn launch_markers() -> Vec<String> {
         "origin-kernel: start: two children launched from their creator found their start records in RDI, read-only at random addresses: each record, read back in ring 3, has its size, version, 4 entries with C6's rights, 2 arguments and 1 environment string: true; each start handle works: true; each child's message names it and its creator's principal: true; writing its record faulted there: true".into(),
         "origin-kernel: start: the two records are at different addresses: true; a record over 64 KiB is refused: true; a launch refused after its child held a handle gives everything back: true".into(),
         "origin-kernel: start: every launched process and all they held are gone: heap ".into(),
+    ]
+}
+
+/// The first Rust program in ring 3 (task S4-1; ADR-0011 L1, L8; `program_proof::prove`): the
+/// kernel carries it in its image, and launches it six times at random bases.
+fn rust_program_markers() -> Vec<String> {
+    vec![
+        "origin-kernel: rust program: first_program ran in ring 3 from the kernel's image at random bases, 6 times: each found its start record in RDI and read its header and 3 entries as written: true; ran at its base plus its entry: true; its tables mapped each page of its span as described, and its stack writable and never executable between two unmapped pages: true; every relocated slot held its value plus the base: true; read its data through relocated pointers: true; the runtime's mem functions copy, move, fill and compare: true; wrote on BOOTSTRAP, named as the writer: true; ended with its exit code: true".into(),
+        "origin-kernel: rust program: two launches differ in base and stack: true; a write to its code faulted there: true; a jump into its data faulted there as a fetch: true; a write to its relocated read-only data faulted there: true; a panic ended it with the runtime's exit code: true; a launch refused before anything was made took nothing: true; a launch refused part-way through mapping, at the bound on its page tables, gave back every frame, table and heap byte it took: true".into(),
+        "origin-kernel: rust program: loading and starting it took ".into(),
+        "origin-kernel: rust program: every launched process and all they held are gone: heap ".into(),
     ]
 }
 
@@ -2506,6 +2572,15 @@ fn parse_console_line(rest: &str) -> Option<(u64, usize)> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    // Nothing is built with compiler flags from the environment (`toolchain`). `exclusive`
+    // builds nothing itself, and what it runs makes this check for itself.
+    if let Some(command) = args.first()
+        && command != "exclusive"
+        && let Err(e) = toolchain::refuse_environment_flags()
+    {
+        eprintln!("xtask: error: {e}");
+        return ExitCode::FAILURE;
+    }
     let result = match args
         .iter()
         .map(String::as_str)
@@ -2518,7 +2593,16 @@ fn main() -> ExitCode {
         ["cfg-lint"] => linux_cfg_lint(),
         ["interface-gate"] => interfaces::gate(),
         ["requirements-gate"] => requirements::gate(),
+        ["provenance-gate"] => provenance::gate(),
+        ["roadmap-gate"] => roadmap::gate(),
+        ["progress"] => progress::write(),
+        ["progress-gate"] => progress::gate(),
         ["regenerate"] => interfaces::regenerate(),
+        ["version"] => image_inputs::write_version_file(),
+        ["version-gate"] => image_inputs::version_gate(),
+        ["image-graph-gate"] => image_inputs::graph_gate(),
+        ["linker-text-gate", files @ ..] => image_inputs::linker_text_gate(files),
+        ["reproducible-compare", directory] => reproducible::compare(Path::new(directory)),
         ["image-gate"] => in_turn("image-gate", image::build_and_gate),
         ["image-gate", elf] => image::gate(Path::new(elf)),
         ["build"] => in_turn("build", || {
@@ -2535,6 +2619,7 @@ fn main() -> ExitCode {
         ["boot-bridge"] => in_turn("boot-bridge", boot_bridge),
         ["boot-legacy-free"] => in_turn("boot-legacy-free", boot_legacy_free),
         ["boot-random"] => in_turn("boot-random", boot_random),
+        ["boot-identity"] => in_turn("boot-identity", boot_identity),
         ["run"] => in_turn("run", run),
         ["loom"] => in_turn("loom", loom::run),
         ["reproducible-gate"] => in_turn("reproducible-gate", reproducible::gate),
@@ -2607,6 +2692,7 @@ fn boot_matrix() -> Result {
     boot_bridge()?;
     boot_legacy_free()?;
     boot_random()?;
+    boot_identity()?;
     boot_console()?;
     // ADR-0004 Amendment 2, A6.4: the boots placed the kernel stacks' region apart.
     let recorded = fs::read_to_string(&bases).map_err(|e| format!("{}: {e}", bases.display()))?;
@@ -2615,7 +2701,7 @@ fn boot_matrix() -> Result {
         "xtask: boot-matrix: the kernel stacks' region was at {boots} distinct bases in {boots} kernel boots, read through QEMU's monitor; none is printed"
     );
     println!(
-        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, the two machines without the random-number instructions, and the console machines)"
+        "xtask: boot-matrix passed (Intel VT-d and AMD-Vi, each with 1, 2 and 4 processors, the sparse machine, the bridge machine, the legacy-free machine, the two machines without the random-number instructions, the two CPU identities, and the console machines)"
     );
     Ok(())
 }
@@ -2937,6 +3023,70 @@ fn boot_random() -> Result {
     Ok(())
 }
 
+/// The processors `boot-identity` has QEMU report (ADR-0009 A2; TASKS item 16): the `-cpu`
+/// value, what it is, and the whole line the kernel must print for it. The lines are written
+/// here from the vendors' documents (`docs/research/2026-11-12-cpu-identification-table.md`),
+/// not taken from the kernel's table, so the boot checks the table.
+const CPU_IDENTITIES: [(&str, &str, &str); 2] = [
+    (
+        // Intel's microcode notes: PTL-H, 06-CC-02.
+        "max,vendor=GenuineIntel,family=6,model=204,stepping=2",
+        "a Panther Lake, in the declared scope",
+        "origin-kernel: CPU identity: GenuineIntel family 06h (6) model CCh stepping 2 (leaf 1 EAX 000C06C2h): Panther Lake; in the declared scope: a 2026 Intel generation, listed by its family-6 model (ADR-0009 A2); reported under a hypervisor, which can report any identity; no erratum listed for it",
+    ),
+    (
+        // Rental A's AMD EPYC 4244P (docs/research/2026-11-12-rental-a-findings.md): Zen 4.
+        "max,vendor=AuthenticAMD,family=25,model=97,stepping=2",
+        "rental A's EPYC 4244P, outside it",
+        "origin-kernel: CPU identity: AuthenticAMD family 19h (25) model 61h stepping 2 (leaf 1 EAX 00A60F12h): older than Zen 5; outside the declared scope, a bench machine: AMD family below 1Ah, where Zen 5 begins (ADR-0009 A2); reported under a hypervisor, which can report any identity; no erratum listed for it",
+    ),
+];
+
+/// Where `ORIGIN_QEMU_CPU` is one of [`CPU_IDENTITIES`], the boot must print that identity's
+/// whole line in place of the line's start. The rest of the boot is held to every other
+/// marker, its verdict and the halt line among them: the kernel never refuses a machine for
+/// its identity (A2).
+fn cpu_identity_marker(scenario: &mut Scenario) {
+    let model = qemu_cpu_model();
+    if let Some((_, _, line)) = CPU_IDENTITIES.iter().find(|(cpu, _, _)| *cpu == model) {
+        swap_marker(
+            scenario,
+            "origin-kernel: CPU identity: ",
+            (*line).to_string(),
+        );
+    }
+}
+
+/// Runs the kernel boot on the two processors of [`CPU_IDENTITIES`], each set with QEMU's
+/// `family=` and `model=` (ADR-0009 A2: "QEMU can be told to report any family and model, so CI
+/// can boot an in-scope and an out-of-scope identity"). Under KVM a guest's vendor is not
+/// changed: those boots run on QEMU's software processor only, and the KVM jobs' own boots
+/// print the real processor's line.
+fn boot_identity() -> Result {
+    if Accel::from_env()? == Accel::Kvm {
+        println!(
+            "xtask: boot-identity: not run under KVM, where the guest's vendor stays the host's; QEMU's software processor runs it"
+        );
+        return Ok(());
+    }
+    let exe = env::current_exe().map_err(|e| format!("cannot find this xtask: {e}"))?;
+    for (model, what, _) in CPU_IDENTITIES {
+        println!("xtask: boot-identity: {what} (-cpu {model})");
+        let status = boot_test_child(&exe)
+            .env("ORIGIN_QEMU_CPU", model)
+            .env("ORIGIN_BOOT_TEST_ONLY", "kernel boot")
+            .status()
+            .map_err(|e| format!("cannot run boot-test: {e}"))?;
+        if !status.success() {
+            return Err(format!("boot-test as {what} failed ({status})"));
+        }
+    }
+    println!(
+        "xtask: boot-identity passed (a Panther Lake in the declared scope; a Zen 4 EPYC outside it)"
+    );
+    Ok(())
+}
+
 /// Runs `boot-test` in a child process with the NIC behind a PCIe root port
 /// (`ORIGIN_QEMU_BRIDGE=on`), under each IOMMU: bus mastering must be cleared on the bridge at
 /// the quiesce and opened again above the device its driver attached (ADR-0007 I12). QEMU
@@ -3015,7 +3165,9 @@ fn cargo() -> Command {
     c
 }
 
-/// Runs `cmd` with inherited stdio and fails unless it exits successfully.
+/// Runs `cmd` and fails unless it exits successfully. Its standard output is inherited. Its
+/// error output passes through line by line, except the one compiler warning `cargo xtask`
+/// expects, which is collapsed to a single note (`expected_warning.rs`, ADR-0017 Z10).
 fn run_step(cmd: &mut Command) -> Result {
     let shown = std::iter::once(cmd.get_program())
         .chain(cmd.get_args())
@@ -3023,9 +3175,44 @@ fn run_step(cmd: &mut Command) -> Result {
         .collect::<Vec<_>>()
         .join(" ");
     println!("xtask: $ {shown}");
-    let status = cmd
-        .status()
+    // Piped, cargo would drop its colours; keep them where a person is watching.
+    if env::var_os("CARGO_TERM_COLOR").is_none() && std::io::stderr().is_terminal() {
+        cmd.env("CARGO_TERM_COLOR", "always");
+    }
+    let mut child = cmd
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("cannot run `{shown}`: {e}"))?;
+    let mut filter = expected_warning::Filter::default();
+    if let Some(stderr) = child.stderr.take() {
+        let mut reader = BufReader::new(stderr);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            let read = reader
+                .read_until(b'\n', &mut bytes)
+                .map_err(|e| format!("reading the output of `{shown}`: {e}"))?;
+            if read == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let line = text.strip_suffix('\n').unwrap_or(&text);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            for out in filter.line(line) {
+                eprintln!("{out}");
+            }
+        }
+    }
+    let (rest, dropped) = filter.finish();
+    for out in rest {
+        eprintln!("{out}");
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("cannot run `{shown}`: {e}"))?;
+    if dropped != expected_warning::Dropped::default() {
+        println!("{}", expected_warning::note(&dropped));
+    }
     if status.success() {
         Ok(())
     } else {
@@ -3206,16 +3393,34 @@ fn check() -> Result {
         "-D",
         "warnings",
     ]))?;
+    // The bodies of the ring-3 runtime's `mem*` functions on the host, with their tests against
+    // `core` (S4-1's review, finding F6). `ring3::clippy` lints them for the userspace triple.
     run_step(cargo().args([
         "clippy",
         "--package",
-        KERNEL_PACKAGE,
-        "--target",
-        KERNEL_TARGET,
+        ring3::MEM_PACKAGE,
+        "--all-targets",
         "--",
         "-D",
         "warnings",
     ]))?;
+    run_step(cargo().args(["test", "--package", ring3::MEM_PACKAGE]))?;
+    // The ring-3 crates on their own target (task S4-1), then the kernel, which carries the
+    // programs they build.
+    ring3::clippy()?;
+    run_step(ring3::with_programs(
+        cargo().args([
+            "clippy",
+            "--package",
+            KERNEL_PACKAGE,
+            "--target",
+            KERNEL_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ]),
+        None,
+    )?)?;
     run_step(cargo().args(["test", "--package", KERNEL_PACKAGE, "--lib"]))?;
     // The loader in developer mode too (the boot test's variant).
     for loader in [Loader::Developer, Loader::Verifying] {
@@ -3239,8 +3444,13 @@ fn check() -> Result {
     linux_cfg_lint()?;
     documents::gate()?;
     requirements::gate()?;
+    provenance::gate()?;
+    roadmap::gate()?;
+    progress::gate()?;
     unsafety::gate()?;
     interfaces::gate()?;
+    image_inputs::version_gate()?;
+    image_inputs::graph_gate()?;
     manifest_version_lint()?;
     signing_stays_off_the_os_lint()?;
     signing_has_no_secret_branches()?;
@@ -3548,20 +3758,23 @@ fn build_kernel_object(package: &str, out_dir: &Path) -> Result<PathBuf> {
             KERNEL_TARGET,
         ]))?;
         let emit = format!("--emit=obj={}", obj.display());
-        run_step(cargo().args([
-            "rustc",
-            "--quiet",
-            "--package",
-            package,
-            "--lib",
-            "--release",
-            "--target",
-            KERNEL_TARGET,
-            "--",
-            &emit,
-            "-C",
-            "codegen-units=1",
-        ]))?;
+        // The same flags as the kernel's own build, so that Cargo does not compile the
+        // libraries they share again each time one follows the other.
+        run_step(
+            cargo()
+                .args([
+                    "rustc",
+                    "--quiet",
+                    "--package",
+                    package,
+                    "--lib",
+                    "--release",
+                    "--target",
+                    KERNEL_TARGET,
+                ])
+                .args(toolchain::image_config()?)
+                .args(["--", &emit, "-C", "codegen-units=1"]),
+        )?;
         if !obj.is_file() {
             return Err(format!(
                 "no-panic check: rustc did not write {}",
@@ -3797,22 +4010,11 @@ fn dependency_check() -> Result {
 
 /// A tool from the pinned toolchain's `llvm-tools` component.
 fn llvm_tool(name: &str) -> Result<PathBuf> {
-    let rustc = |args: &[&str]| -> Result<String> {
-        let out = Command::new("rustc")
-            .args(args)
-            .current_dir(repo_root())
-            .output()
-            .map_err(|e| format!("cannot run rustc: {e}"))?;
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    };
-    let sysroot = rustc(&["--print", "sysroot"])?.trim().to_string();
-    let host = rustc(&["-vV"])?
-        .lines()
-        .find_map(|l| l.strip_prefix("host: ").map(str::to_string))
-        .ok_or("cannot read the host triple from `rustc -vV`")?;
-    let path = Path::new(&sysroot)
+    let toolchain = toolchain::toolchain()?;
+    let path = toolchain
+        .sysroot
         .join("lib/rustlib")
-        .join(host)
+        .join(&toolchain.host)
         .join("bin")
         .join(name);
     if path.is_file() {
@@ -3894,9 +4096,12 @@ fn linux_cfg_lint() -> Result {
         &mut manifests,
     )
     .map_err(|e| format!("cfg lint: {e}"))?;
-    let cargo_config = root.join(".cargo").join("config.toml");
-    if cargo_config.is_file() {
-        manifests.push(cargo_config);
+    // `config.toml`, and the userspace flags xtask passes to the ring-3 builds (task S4-1).
+    for name in ["config.toml", "userspace.toml"] {
+        let cargo_config = root.join(".cargo").join(name);
+        if cargo_config.is_file() {
+            manifests.push(cargo_config);
+        }
     }
     if sources.is_empty() || manifests.is_empty() {
         return Err(format!(
@@ -3991,6 +4196,7 @@ fn build_loader_in(feature: Option<&str>, target: Option<&Path>) -> Result<PathB
     if let Some(target) = target {
         build.arg("--target-dir").arg(target);
     }
+    build.args(toolchain::image_config()?);
     run_step(&mut build)?;
     let efi = target
         .map_or_else(target_dir, Path::to_path_buf)
@@ -4029,12 +4235,17 @@ fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
     if let Some(target) = target {
         build.arg("--target-dir").arg(target);
     }
-    run_step(&mut build)?;
+    build.args(toolchain::image_config()?);
     let elf = target
         .map_or_else(target_dir, Path::to_path_buf)
         .join(KERNEL_TARGET)
         .join("release")
         .join(KERNEL_PACKAGE);
+    // The programs it carries in its image (task S4-1), built into the same directory.
+    let build = ring3::with_programs(&mut build, target)?;
+    // A kernel linked before `.cargo/config.toml` fixed the linker's line is linked again:
+    // Cargo does not do that by itself (TASKS item 44).
+    image_inputs::build_with_the_fixed_line(std::slice::from_ref(&elf), || run_step(build))?;
     if elf.is_file() {
         Ok(elf)
     } else {
@@ -4048,7 +4259,15 @@ fn build_kernel_in(target: Option<&Path>) -> Result<PathBuf> {
 /// Converts the kernel ELF into the KRN image with `onbf-pack`, which verifies its output
 /// before writing it.
 fn pack_kernel(elf: &Path) -> Result<PathBuf> {
-    let out = target_dir().join("xtask").join("KERNEL.ONBF");
+    pack_kernel_to(elf, &target_dir().join("xtask").join(KERNEL_IMAGE))
+}
+
+/// The file name of the converted kernel, under a target directory's `xtask/`.
+const KERNEL_IMAGE: &str = "KERNEL.ONBF";
+
+/// [`pack_kernel`] into `out`: the one command that makes the image the loader starts, for
+/// the boots and for the reproducible-build gate alike.
+fn pack_kernel_to(elf: &Path, out: &Path) -> Result<PathBuf> {
     if let Some(dir) = out.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -4068,7 +4287,7 @@ fn pack_kernel(elf: &Path) -> Result<PathBuf> {
         "--output",
         output,
     ]))?;
-    Ok(out)
+    Ok(out.to_path_buf())
 }
 
 /// A copy of `krn` with one byte flipped in the middle of the first SEGMENT's content.

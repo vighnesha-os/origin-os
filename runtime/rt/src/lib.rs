@@ -1,0 +1,33 @@
+//! The Origin runtime for Rust programs in ring 3 (task S4-1; CLAUDE.md §11, §44; ADR-0005 P6).
+//!
+//! What a `no_std` program needs from Origin before it can run, and nothing more:
+//!
+//! - `_start`, where the kernel starts the first thread with the start record's address in RDI
+//!   (P6). It aligns the stack, decodes the record with `origin-abi` and calls the program's
+//!   `main` (named with [`main!`]), then ends the thread with what `main` returned.
+//! - A panic handler that ends the thread with [`PANIC_EXIT`] (ONBF §6.1.1: `panic=abort`).
+//! - `memcpy`, `memmove`, `memset`, `memcmp` and `bcmp`, which the compiler calls and which no
+//!   C library supplies here (§11).
+//!
+//! The runtime ends a thread with three codes of its own: [`PANIC_EXIT`] (`u64::MAX`),
+//! [`BAD_RECORD_EXIT`] (`u64::MAX - 1`) and [`UNWIND_EXIT`] (`u64::MAX - 2`). They share the space
+//! of the codes a program's `main` returns: a program that returns one of them cannot be told
+//! from the runtime's ending by its code alone (S4-1's review, finding F11). The kernel's proof
+//! program never does; whether the ABI reserves them is for `origin.core` (task S4-2).
+//!
+//! No allocator, no thread-local storage and nothing that reads the environment (ADR-0005 E2).
+//! `unsafe` is only in `entry.rs` and `mem.rs`, the two files `cargo xtask check`'s gate lists for
+//! this crate; the rest denies it.
+#![no_std]
+// The `mem*` functions must not be compiled into calls to themselves.
+#![no_builtins]
+#![deny(unsafe_code)]
+
+#[allow(unsafe_code)]
+mod entry;
+#[allow(unsafe_code)]
+mod mem;
+mod panic;
+
+pub use entry::{BAD_RECORD_EXIT, Start, UNWIND_EXIT, entry_address};
+pub use panic::PANIC_EXIT;
